@@ -23,7 +23,11 @@ per operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`, `SubtasksWatch
   an existing, explicitly authorized development checkout or Git worktree as the
   group's capture and landing destination. Omitted or blank uses the parent
   session's working directory, preserving the default behavior; relative paths
-  resolve against that same parent session's working directory. The target is
+  resolve against that same parent session's working directory, never against
+  the process cwd. A leading `~` or `~/...` expands against the user's home
+  first (the same Pi-native rule as the built-in file tools); every other
+  spelling, including `~user`, is not reinterpreted and fails closed when it
+  does not name an existing directory. The target is
   resolved once at start (it must already exist; the extension never creates,
   clones, checks out, or repurposes directories) and persisted with the group:
   every capture, reviewed landing, restore, continuation, and recovery path uses

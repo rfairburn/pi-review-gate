@@ -328,7 +328,7 @@ consumes.
 | `enabled` | `true` | Disabled entries stay configured but are never dispatched. |
 | `kind` | `"execute"` | `execute` (write-capable subtask) or `research` (read-only subtask). |
 | `instructions` | (required) | Instructions carried verbatim to the scheduled subtask. |
-| `workspace` | (required) | Explicit authorized target workspace directory for the scheduled run. |
+| `workspace` | (required) | Explicit authorized target workspace directory for the scheduled run. A leading `~` or `~/...` expands against the user's home (the same Pi-native rule as the built-in file tools); every other spelling, including `~user`, is used verbatim. Save persists the expanded absolute spelling of a tilde workspace (the runtime separately resolves the target's realpath). |
 | `workerResourceId` | absent | Optional override naming an `execution.workerResources` entry. See below. |
 | `review` | absent | Task-local review choice. See below. |
 
@@ -420,10 +420,14 @@ than from any fire-time computation:
 Entries are created and edited under **Scheduled tasks** in `/review-settings`,
 staged like every other section behind **Save changes** / **Cancel**. Save
 validates every entry (a real cron expression, non-empty instructions, an
-existing workspace directory, a resolvable worker override, and a task-local
+existing workspace directory — a leading `~`/`~/...` is expanded against the
+user's home before that check — a resolvable worker override, and a task-local
 reviewer set that resolves like any global one) and persists the catalog while
-preserving unrelated JSON keys. Entries remain visible and editable regardless
-of the runtime switch described below, and a Save applies to the task
+preserving unrelated JSON keys. A tilde workspace entered in the editor or
+hand-edited into the config file is persisted in its expanded absolute form on
+Save; until then the `~/...` spelling remains valid, because dispatch expands
+it at run time against the same home directory. Entries remain visible and
+editable regardless of the runtime switch described below, and a Save applies to the task
 definitions only: an already-running subtask is never stopped or reconfigured
 by a Save, and stopping one is an explicit action.
 

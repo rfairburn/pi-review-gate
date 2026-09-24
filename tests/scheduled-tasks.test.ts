@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
@@ -152,6 +152,16 @@ test("scheduled task entries normalize with defaults, trimming, and cron validat
     mode: "selected",
     reviewers: [{ source: "pi", model: "openai/gpt-5" }],
   });
+});
+
+test("config loading keeps a hand-edited ~/ workspace verbatim for run-time expansion", () => {
+  // Load-time normalization is non-destructive: the tilde spelling stays in
+  // the catalog (and the file) and is expanded at dispatch time against the
+  // user's home, never baked in at load.
+  const config = normalizeConfig(configWithScheduledTasks({
+    "task-tilde": { ...validEntry, workspace: "~/prg/nightly" },
+  }));
+  assert.equal(config.scheduledTasks!["task-tilde"]!.workspace, "~/prg/nightly");
 });
 
 test("scheduled task entries reject invalid definitions strictly", () => {
@@ -943,6 +953,186 @@ test("a hand-edited task id that matches a former action key stays editable", as
   assert.equal(saved.scheduledTasks["add"].enabled, false);
   assert.equal(saved.scheduledTasks["back"].enabled, true);
   await rm(dir, { recursive: true, force: true });
+});
+
+// --- Tilde workspaces (issue #26) -------------------------------------------
+
+/**
+ * Point the platform's homedir() source at a synthetic home for the duration
+ * of fn and restore it afterwards (the same pattern apply-patch.test.ts uses),
+ * so tilde expansion is exercised without touching the real home.
+ */
+async function withSyntheticHome<T>(home: string, fn: () => Promise<T>): Promise<T> {
+  const savedHome = process.env.HOME;
+  const savedUserProfile = process.env.USERPROFILE;
+  try {
+    process.env.HOME = home;
+    process.env.USERPROFILE = home; // win32's homedir source
+    // Fail closed before any mutation if the override is not in effect.
+    assert.equal(homedir(), home, "synthetic home must be in effect before any mutation");
+    return await fn();
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
+  }
+}
+
+async function freshConfigWithScheduledTasks(json: Record<string, unknown>): Promise<{ dir: string; configPath: string; config: ReturnType<typeof normalizeConfig>; registered: { pi: unknown; handler: (args: string, ctx: unknown) => Promise<void> } }> {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-scheduled-tilde-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify(json), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+  return { dir, configPath, config, registered };
+}
+
+test("/review-settings expands an entered ~/ workspace to its absolute home path on Save", async () => {
+  const fakeHome = await realpath(await mkdtemp(join(tmpdir(), "pi-review-scheduled-tilde-home-")));
+  try {
+    await mkdir(join(fakeHome, "nightly"), { recursive: true });
+    const { dir, configPath, registered } = await freshConfigWithScheduledTasks({
+      enabled: true,
+      review: { primaryReviewers: [], subtaskReviewers: [] },
+    });
+    try {
+      await withSyntheticHome(fakeHome, () => registered.handler("", contextWithSelections([
+        rootSettingsRow("Scheduled tasks", "None"),
+        "Add scheduled task",
+        scheduledEditorRow("Schedule (cron)", "(not set)"),
+        scheduledEditorRow("Instructions", "(not set)"),
+        scheduledEditorRow("Workspace", "(not set)"),
+        "Back",
+        "Back",
+        "Save changes",
+      ], [
+        "Nightly docs check",
+        "30 2 * * *",
+        "Check the docs for staleness",
+        "~/nightly",
+      ])));
+
+      const saved = JSON.parse(await readFile(configPath, "utf8"));
+      const ids = Object.keys(saved.scheduledTasks);
+      assert.equal(ids.length, 1);
+      // The persisted workspace is the expanded absolute home spelling, not
+      // the entered tilde spelling: one representation in the saved file.
+      assert.equal(saved.scheduledTasks[ids[0]!].workspace, join(fakeHome, "nightly"));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  } finally {
+    await rm(fakeHome, { recursive: true, force: true });
+  }
+});
+
+test("/review-settings expands a hand-edited ~/ workspace on Save without re-entry", async () => {
+  const fakeHome = await realpath(await mkdtemp(join(tmpdir(), "pi-review-scheduled-tilde-home2-")));
+  try {
+    await mkdir(join(fakeHome, "prg", "nightly"), { recursive: true });
+    const { dir, configPath, registered } = await freshConfigWithScheduledTasks({
+      enabled: true,
+      review: { primaryReviewers: [], subtaskReviewers: [] },
+      scheduledTasks: {
+        "task-tilde12": {
+          name: "Tilde nightly",
+          cron: "30 2 * * *",
+          enabled: true,
+          kind: "execute",
+          instructions: "Check the docs",
+          workspace: "~/prg/nightly",
+        },
+      },
+    });
+    try {
+      // Open the section and save without touching the entry: the hand-edited
+      // tilde spelling is accepted (the directory exists) and persisted in its
+      // expanded absolute form.
+      await withSyntheticHome(fakeHome, () => registered.handler("", contextWithSelections([
+        rootSettingsRow("Scheduled tasks", "1 of 1 enabled"),
+        "Back",
+        "Save changes",
+      ])));
+
+      const saved = JSON.parse(await readFile(configPath, "utf8"));
+      assert.equal(saved.scheduledTasks["task-tilde12"].workspace, join(fakeHome, "prg", "nightly"));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  } finally {
+    await rm(fakeHome, { recursive: true, force: true });
+  }
+});
+
+test("a Save fails closed on a ~/ workspace that is not an existing directory", async () => {
+  const fakeHome = await realpath(await mkdtemp(join(tmpdir(), "pi-review-scheduled-tilde-home3-")));
+  try {
+    const { dir, configPath, registered } = await freshConfigWithScheduledTasks({
+      enabled: true,
+      review: { primaryReviewers: [], subtaskReviewers: [] },
+      scheduledTasks: {
+        "task-missing": {
+          name: "Missing target",
+          cron: "30 2 * * *",
+          enabled: true,
+          kind: "execute",
+          instructions: "Work",
+          workspace: "~/does-not-exist",
+        },
+      },
+    });
+    const before = await readFile(configPath, "utf8");
+    try {
+      // Validation rejects the entry; with no further selections the re-shown
+      // menu exits and nothing is written.
+      await withSyntheticHome(fakeHome, () => registered.handler("", contextWithSelections([
+        rootSettingsRow("Scheduled tasks", "1 of 1 enabled"),
+        "Back",
+        "Save changes",
+      ])));
+      assert.equal(await readFile(configPath, "utf8"), before, "a rejected ~/ workspace must not change the config file");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  } finally {
+    await rm(fakeHome, { recursive: true, force: true });
+  }
+});
+
+test("a Save fails closed when a ~/ workspace names an existing file, not a directory", async () => {
+  const fakeHome = await realpath(await mkdtemp(join(tmpdir(), "pi-review-scheduled-tilde-home4-")));
+  try {
+    await writeFile(join(fakeHome, "not-a-dir"), "a file\n", "utf8");
+    const { dir, configPath, registered } = await freshConfigWithScheduledTasks({
+      enabled: true,
+      review: { primaryReviewers: [], subtaskReviewers: [] },
+      scheduledTasks: {
+        "task-file": {
+          name: "File target",
+          cron: "30 2 * * *",
+          enabled: true,
+          kind: "execute",
+          instructions: "Work",
+          workspace: "~/not-a-dir",
+        },
+      },
+    });
+    const before = await readFile(configPath, "utf8");
+    try {
+      await withSyntheticHome(fakeHome, () => registered.handler("", contextWithSelections([
+        rootSettingsRow("Scheduled tasks", "1 of 1 enabled"),
+        "Back",
+        "Save changes",
+      ])));
+      assert.equal(await readFile(configPath, "utf8"), before, "a non-directory ~/ workspace must not change the config file");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  } finally {
+    await rm(fakeHome, { recursive: true, force: true });
+  }
 });
 
 test("the scheduler runtime row is a live process toggle and is never persisted", async () => {

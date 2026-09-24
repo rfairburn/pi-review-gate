@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
@@ -29,6 +29,14 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
 
 async function makeRepo(prefix: string, baseName: string, baseContent: string): Promise<string> {
   const root = await realpath(await mkdtemp(join(tmpdir(), prefix)));
+  await gitInitIn(root, baseName, baseContent);
+  return root;
+}
+
+/** Initialize a fresh single-commit repository in (creating if needed) a directory. */
+async function gitInitIn(dir: string, baseName: string, baseContent: string): Promise<string> {
+  await mkdir(dir, { recursive: true });
+  const root = await realpath(dir);
   await git(root, "init", "-q");
   await git(root, "config", "user.email", "test@example.com");
   await git(root, "config", "user.name", "Test");
@@ -36,6 +44,28 @@ async function makeRepo(prefix: string, baseName: string, baseContent: string): 
   await git(root, "add", baseName);
   await git(root, "commit", "-qm", "base");
   return root;
+}
+
+/**
+ * Point the platform's homedir() source at a synthetic home for the duration
+ * of fn and restore it afterwards (the same pattern apply-patch.test.ts uses),
+ * so tilde expansion is exercised without touching the real home.
+ */
+async function withSyntheticHome<T>(home: string, fn: () => Promise<T>): Promise<T> {
+  const savedHome = process.env.HOME;
+  const savedUserProfile = process.env.USERPROFILE;
+  try {
+    process.env.HOME = home;
+    process.env.USERPROFILE = home; // win32's homedir source
+    // Fail closed before any mutation if the override is not in effect.
+    assert.equal(homedir(), home, "synthetic home must be in effect before any mutation");
+    return await fn();
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
+  }
 }
 
 async function samePath(a: string, b: string): Promise<boolean> {
@@ -303,6 +333,133 @@ test("start resolves a relative workspace against the session input cwd, not pro
     await controller.shutdown().catch(() => undefined);
     await controller.detach().catch(() => undefined);
     await removeOwned(owned);
+  }
+});
+
+// --- Tilde workspaces (issue #26) -------------------------------------------
+
+test("start expands an existing ~/ workspace against the user's home and lands there", async () => {
+  const parent = await makeRepo("workspace-tilde-parent-", "base.txt", "parent base\n");
+  const fakeHome = await realpath(await mkdtemp(join(tmpdir(), "workspace-tilde-home-")));
+  try {
+    // The target repository lives inside the synthetic home; the session cwd
+    // is an unrelated checkout that has no such directory anywhere near it.
+    const workspace = await gitInitIn(join(fakeHome, "tilde-repo"), "base.txt", "target base\n");
+    const script = await writeExecutorScript(parent, [{ sentinel: "TILDE_SENTINEL", file: "tilde-landed.txt" }]);
+    const config = executionConfig(script);
+    await withSyntheticHome(fakeHome, async () => {
+      const controller = makeController(config, () => parent);
+      try {
+        const started = await controller.start([task("tilde", "TILDE_SENTINEL")], "execute", "~/tilde-repo");
+        assert.ok(
+          await samePath(started.cwd, workspace),
+          `~/ workspace group cwd ${started.cwd} should be the existing home-directory target`,
+        );
+        await waitUntil(
+          () => controller.inspect(started.executionId).tasks.every((t) => t.state === "landed"),
+          "tilde-workspace task to land in the home repo",
+        );
+        assert.equal(await readFile(join(workspace, "tilde-landed.txt"), "utf8"), "landed\n");
+        await assert.rejects(readFile(join(parent, "tilde-landed.txt"), "utf8"), /ENOENT/, "the session cwd must stay unchanged by the ~/ workspace task");
+      } finally {
+        await controller.shutdown().catch(() => undefined);
+        await controller.detach().catch(() => undefined);
+      }
+    });
+  } finally {
+    // The target repository lives inside fakeHome, so removing the home removes it.
+    await removeOwned([parent, fakeHome]);
+  }
+});
+
+test("start fails closed on a nonexistent ~/ workspace without creating a group", async () => {
+  const parent = await makeRepo("workspace-tilde-missing-parent-", "base.txt", "parent base\n");
+  const fakeHome = await realpath(await mkdtemp(join(tmpdir(), "workspace-tilde-missing-home-")));
+  try {
+    // The executor script is never reached: the workspace is rejected before
+    // any group state or filesystem resource exists.
+    const config = executionConfig(join(parent, "unused-executor.cjs"));
+    await withSyntheticHome(fakeHome, async () => {
+      const controller = makeController(config, () => parent);
+      try {
+        await assert.rejects(
+          controller.start([task("missing", "MISSING_SENTINEL")], "execute", "~/does-not-exist"),
+          /Execution workspace ~\/does-not-exist does not exist or is not accessible/,
+        );
+        assert.equal(controller.list().length, 0, "a rejected ~/ workspace must never leave a group behind");
+      } finally {
+        await controller.shutdown().catch(() => undefined);
+        await controller.detach().catch(() => undefined);
+      }
+    });
+  } finally {
+    await removeOwned([parent, fakeHome]);
+  }
+});
+
+test("start canonicalizes a symlinked ~/ workspace through its realpath", async (t) => {
+  if (process.platform === "win32") t.skip("symlink permissions vary on Windows");
+  const parent = await makeRepo("workspace-tilde-link-parent-", "base.txt", "parent base\n");
+  const fakeHome = await realpath(await mkdtemp(join(tmpdir(), "workspace-tilde-link-home-")));
+  const realTarget = await makeRepo("workspace-tilde-link-target-", "base.txt", "target base\n");
+  const owned = [parent, fakeHome, realTarget];
+  try {
+    const linkPath = join(fakeHome, "link-repo");
+    await symlink(realTarget, linkPath);
+    const script = await writeExecutorScript(parent, [{ sentinel: "LINK_SENTINEL", file: "link-landed.txt" }]);
+    const config = executionConfig(script);
+    try {
+      await withSyntheticHome(fakeHome, async () => {
+        const controller = makeController(config, () => parent);
+        try {
+          const started = await controller.start([task("linked", "LINK_SENTINEL")], "execute", "~/link-repo");
+          // The persisted target is the canonical realpath of the link's
+          // destination — later symlink redirection cannot move it.
+          assert.ok(await samePath(started.cwd, realTarget), `symlinked ~/ workspace group cwd ${started.cwd} should be the link's realpath`);
+          assert.notEqual(started.cwd, linkPath, "the group target must not keep the symlink spelling");
+          await waitUntil(
+            () => controller.inspect(started.executionId).tasks.every((t) => t.state === "landed"),
+            "symlinked-~/workspace task to land in the real target",
+          );
+          assert.equal(await readFile(join(realTarget, "link-landed.txt"), "utf8"), "landed\n");
+        } finally {
+          await controller.shutdown().catch(() => undefined);
+          await controller.detach().catch(() => undefined);
+        }
+      });
+    } finally {
+      await rm(linkPath, { force: true }).catch(() => undefined);
+    }
+  } finally {
+    await removeOwned(owned);
+  }
+});
+
+test("start does not reinterpret unsupported tilde spellings such as ~user", async () => {
+  const parent = await makeRepo("workspace-tilde-user-parent-", "base.txt", "parent base\n");
+  const fakeHome = await realpath(await mkdtemp(join(tmpdir(), "workspace-tilde-user-home-")));
+  try {
+    // A ~user spelling is not a home prefix (native parity): it stays relative
+    // to the session cwd, where no literal directory by that name exists.
+    const config = executionConfig(join(parent, "unused-executor.cjs"));
+    await withSyntheticHome(fakeHome, async () => {
+      const controller = makeController(config, () => parent);
+      try {
+        await assert.rejects(
+          controller.start([task("other-user", "OTHER_USER_SENTINEL")], "execute", "~nobody/some-repo"),
+          /Execution workspace ~nobody\/some-repo does not exist or is not accessible/,
+        );
+        assert.equal(controller.list().length, 0);
+      } finally {
+        await controller.shutdown().catch(() => undefined);
+        await controller.detach().catch(() => undefined);
+      }
+    });
+    // And the home directory itself was never consulted or created for it.
+    const entries = await readdir(fakeHome);
+    assert.deepEqual(entries, []);
+  } finally {
+    await removeOwned([parent, fakeHome]);
   }
 });
 

@@ -27,6 +27,17 @@ dates.
   dispatch through existing subtasks, with owner notifications and actionable
   overlap skips rather than catch-up or cross-process deduplication.
 
+### Changed
+
+- Accept a leading `~` or `~/...` as a scheduled-task workspace and as the
+  `SubtasksStart` workspace: settings Save and run-time dispatch both expand it
+  against the user's home through the shared Pi-native path rule, and Save
+  persists the expanded absolute spelling (runtime target realpath is separate). Nonexistent or non-directory targets
+  fail closed; unsupported tilde spellings (such as `~user`) are never
+  reinterpreted and fail closed unless a literal path of that name exists;
+  relative workspaces keep resolving against the parent session's working
+  directory.
+
 ## [0.1.0-dev.78]
 
 ### Changed

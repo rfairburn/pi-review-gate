@@ -943,7 +943,7 @@ function toolSchema(action: Action): Record<string, unknown> {
       // input that normalizes to "omitted" (parent session's working directory).
       properties.workspace = {
         type: "string",
-        description: "Optional existing directory (an explicitly authorized development checkout or Git worktree) that the group captures from and lands into. Omitted or blank uses the parent session's working directory. Resolved once at start; SubtasksAdd inherits it and steering never changes it.",
+        description: "Optional existing directory (an explicitly authorized development checkout or Git worktree) that the group captures from and lands into. Omitted or blank uses the parent session's working directory. A leading ~ or ~/... expands against the user's home; other relative paths resolve against the parent session's working directory. Resolved once at start; SubtasksAdd inherits it and steering never changes it.",
       };
       properties.tasks = tasks;
       required.push("tasks");

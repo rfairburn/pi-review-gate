@@ -11,6 +11,7 @@ import {
   resolvedWorkerRoute,
   workerResourceSupportsResearch,
 } from "../config";
+import { expandHomePath } from "../apply-patch/paths";
 import { createWorkspaceSnapshot, type FileSnapshot, type WorkspaceSnapshot } from "../capture";
 import { activeExchangeBaseline, checkpointReviewWindow, type ReviewGateState } from "../state";
 import { configDigest, type ExecutionAssociationsSnapshot } from "../session-state";
@@ -846,7 +847,10 @@ export class BackgroundExecutionController {
    * blank workspace defaults to the parent session's working directory,
    * preserving current behavior. A supplied workspace must be an existing,
    * accessible directory (an explicitly authorized development checkout or Git
-   * worktree); relative paths resolve against the parent session's working
+   * worktree). A leading `~`/`~/...` home prefix expands against the user's
+   * home through the shared Pi-native rule before any anchoring; every other
+   * spelling — relative, absolute, `~user` — keeps its existing semantics,
+   * with relative paths resolving against the parent session's working
    * directory like every other session-relative path in this feature. The
    * target is canonicalized through realpath so the persisted target is a
    * stable identity that later symlink redirection cannot move. The target
@@ -858,8 +862,10 @@ export class BackgroundExecutionController {
     const parentCwd = resolve(this.input.cwd());
     if (workspace === undefined || workspace.trim() === "") return parentCwd;
     // #25: session-relative, never anchored at the process cwd, which can
-    // diverge from the session's working directory.
-    const candidate = resolve(parentCwd, workspace);
+    // diverge from the session's working directory. A leading `~`/`~/...`
+    // (the Pi-native home prefix) expands against the user's home before the
+    // anchor; every other spelling resolves exactly as before.
+    const candidate = resolve(parentCwd, expandHomePath(workspace));
     let stats;
     try {
       stats = await stat(candidate);

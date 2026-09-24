@@ -44,6 +44,7 @@ import {
   type WorkerResourceValue,
   type WorkerRouteEntry,
 } from "../config";
+import { expandHomePath } from "../apply-patch/paths";
 import { parseCronExpression } from "../scheduling/cron";
 import { OPERATING_MODE_LABELS } from "../operating-mode";
 import { sendNotice } from "../pi";
@@ -358,6 +359,11 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       ));
       continue;
     }
+    // Expand a leading `~`/`~/...` — entered above or hand-edited into the
+    // config file — against the user's home before validation and persistence.
+    // This stores an absolute spelling, not a symlink-resolved path. Relative
+    // and other spellings keep their parent-session-cwd anchor at run time.
+    scheduledTasks = expandScheduledTaskWorkspaces(scheduledTasks);
     const error = (await validateSelection(workerResources, primaryReviewers, input.config, input.scoped, executeRoute, researchRoute))
       ?? (await validateSelection(workerResources, subtaskReviewers, input.config, input.scoped, executeRoute, researchRoute))
       ?? (await validateScheduledTasks(scheduledTasks, workerResources, input.config, input.scoped));
@@ -919,7 +925,9 @@ async function editScheduledTaskEntry(
         await notify(ui, "Workspace must be a non-empty string.", "error");
         continue;
       }
-      setCatalogKey(catalog, id, { ...entry, workspace: entered.trim() });
+      // Expand a leading `~`/`~/...` against the user's home and stage its
+      // absolute spelling for Save. Every other spelling is kept verbatim.
+      setCatalogKey(catalog, id, { ...entry, workspace: expandHomePath(entered.trim()) });
       continue;
     }
     if (choice === "worker") {
@@ -1031,11 +1039,28 @@ async function selectScheduledTaskReview(
 }
 
 /**
+ * Expand the staged catalog's home-prefixed workspaces before persistence
+ * (issue #26). A leading `~`/`~/...` becomes an absolute home path in the
+ * saved file; the runtime separately resolves the target's realpath. Every
+ * other spelling is untouched — relative paths keep their session-cwd anchor,
+ * and `~user` is never reinterpreted.
+ */
+function expandScheduledTaskWorkspaces(catalog: ScheduledTaskCatalog): ScheduledTaskCatalog {
+  const out: ScheduledTaskCatalog = {};
+  for (const [id, entry] of Object.entries(catalog)) {
+    out[id] = { ...entry, workspace: expandHomePath(entry.workspace) };
+  }
+  return out;
+}
+
+/**
  * Save-time validation for the staged scheduled-task catalog. Every entry
  * must be complete and consistent: a real cron expression, non-empty
- * instructions, an existing authorized workspace directory, a worker override
- * that resolves in the independent catalog (research-capable for research
- * tasks), and a task-local reviewer set that resolves like any global one.
+ * instructions, an existing authorized workspace directory (a leading
+ * `~`/`~/...` is already expanded to its absolute home path by the save
+ * boundary), a worker override that resolves in the independent catalog
+ * (research-capable for research tasks), and a task-local reviewer set that
+ * resolves like any global one.
  */
 async function validateScheduledTasks(
   catalog: ScheduledTaskCatalog,

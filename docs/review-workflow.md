@@ -194,7 +194,12 @@ instead of pretending to cancel.
 - `/ask-reviewer-interactive <question>` uses the same reviewer, session, evidence,
   answer formatting, two-stage interruption, and acceptance path, but opens the answer
   in an editable prompt first. Press Enter to submit it, edit it first if needed, or
-  press Escape/Ctrl+C to clear it without sending anything.
+  press Escape/Ctrl+C to clear it without sending anything. In the interactive Pi TUI
+  the answer opens in the host's own main-prompt editor through the shared native
+  editor field (issue #26), with the same native filesystem suggestions for
+  first-line leading-`/` tokens (never slash-command items); on non-interactive hosts
+  the public multi-line editor is used, and a host without an editing surface
+  delivers the answer as a notice instead of staging anything.
 
 `/ask-reviewer` uses a two-stage interruption when the implementing model is in a turn.
 It first steers a hold instruction that tells the model not to call more tools or modify

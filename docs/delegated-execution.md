@@ -23,7 +23,11 @@ per operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`, `SubtasksWatch
   an existing, explicitly authorized development checkout or Git worktree as the
   group's capture and landing destination. Omitted or blank uses the parent
   session's working directory, preserving the default behavior; relative paths
-  resolve against that same parent session's working directory. The target is
+  resolve against that same parent session's working directory, never against
+  the process cwd. A leading `~` or `~/...` expands against the user's home
+  first (the same Pi-native rule as the built-in file tools); every other
+  spelling, including `~user`, is not reinterpreted and fails closed when it
+  does not name an existing directory. The target is
   resolved once at start (it must already exist; the extension never creates,
   clones, checks out, or repurposes directories) and persisted with the group:
   every capture, reviewed landing, restore, continuation, and recovery path uses
@@ -105,6 +109,14 @@ confirmed, and cancellation — at any earlier stage or at that final step — c
 neither a task nor a group. A workspace is an existing, explicitly authorized
 development checkout or Git worktree used as the group's capture and landing
 destination; each task still executes in its own managed isolated worktree.
+In the interactive Pi TUI the form's text fields open through the same shared
+native editor bridge as every other extension-owned field (issue #26): the
+host's own main-prompt editor with an editable prefill, native path completion
+for relative/`~/...` tokens, and native filesystem suggestions for first-line
+leading-`/` tokens (`/`, `/se`, a nested absolute path) — never slash-command
+items, so a nonexistent token lists nothing and no command is offered or
+executed. On non-interactive hosts the public multi-line editor (with the legacy
+single-line input behind it) is used unchanged.
 
 ## Pi worker settlement and browser ownership
 
@@ -396,7 +408,13 @@ being reviewed. Queued instructions are durable, live instructions use the adapt
 acknowledged transport, and a steer during review cancels that review and resumes the
 executor with the changed request before a fresh review. If the current adapter cannot
 steer a long-running command, the instruction waits for that next executor handoff
-instead of being reported as rejected.
+instead of being reported as rejected. The no-argument `/subtask-steer` command
+picks a task interactively and collects the instruction through the same shared
+native editor field as every other extension-owned text field (issue #26): the
+host's own main-prompt editor in the interactive Pi TUI — including the native
+filesystem suggestions for first-line leading-`/` tokens, never slash-command
+items — and the established single-line input first, editor behind a cancelled
+input, on non-interactive hosts.
 
 `SubtasksSteer` accepts an optional `interrupt` boolean (omitted or `false` preserves
 the behavior above). When `true` on a live executor turn, the adapter first aborts the
@@ -715,6 +733,19 @@ that has not landed; only the final event invites aggregate verification. Comple
 failure, meaningful state changes, and workspace conflicts are delivered proactively;
 polling loops are neither required nor recommended, but purposeful `SubtasksInspect`
 calls are always supported.
+
+**Scheduled runs:** when the process-local scheduler switch is On, a due schedule
+entry starts through this same background subtask path — no model or orchestrator
+launch turn begins the run. Scheduled executions appear in the widget and receive
+the ordinary owner-scoped notifications described above, so their outcomes are
+delivered exactly like any other execution's. An overlap skip (a due occurrence
+while an earlier run of the same entry is still active) wakes the owning
+orchestrator with the schedule identity, the exact due time, and the active task
+handles. A due occurrence whose minute passed before its own dispatch could be
+admitted (a previous occurrence of the same entry had not yet settled) and no
+run is active is reported as not-run; it is never caught up. Configuration,
+per-entry inheritance, and daylight-saving semantics live in [Scheduled task
+fields](configuration.md#scheduled-task-fields).
 
 ## Review-readiness deferral
 

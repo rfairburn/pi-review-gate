@@ -214,6 +214,56 @@ test("persistent launcher honors the PI_REVIEW_GATE_DISABLED kill switch", async
   assert.equal(await readFile(join(fixture.capture, "config-env"), "utf8"), fixture.fallbackConfigPath);
 });
 
+test("persistent launcher clears an inherited scheduler flag and honors --scheduler", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-scheduler-");
+  await mkdir(join(fixture.fallbackConfigPath, ".."), { recursive: true });
+  await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
+  const piPath = join(fixture.bin, "pi");
+  await writeFile(piPath, [
+    "#!/usr/bin/env bash",
+    "printf '%s' \"${PI_REVIEW_GATE_SCHEDULER:-unset}\" > \"$CAPTURE_DIR/scheduler-env\"",
+    "printf '%s\\n' \"$@\" > \"$CAPTURE_DIR/args\"",
+  ].join("\n"), "utf8");
+  await chmod(piPath, 0o755);
+
+  // Hermetic base: the host environment never contributes the flag.
+  const envFor = (overrides: NodeJS.ProcessEnv = {}) => {
+    const base = launcherEnv(fixture);
+    delete base.PI_REVIEW_GATE_SCHEDULER;
+    return { ...base, ...overrides };
+  };
+
+  // Inherited from a parent launched with --scheduler: an unflagged launch
+  // must start Off — the inherited value is cleared, never forwarded.
+  await runLauncher(["--model", "example"], envFor({ PI_REVIEW_GATE_SCHEDULER: "1" }));
+  assert.equal(
+    await readFile(join(fixture.capture, "scheduler-env"), "utf8"),
+    "unset",
+    "an inherited scheduler flag must not leak into an unflagged launch",
+  );
+
+  // The explicit flag opts in for exactly this launch, with or without an
+  // inherited value, and is never forwarded to pi.
+  const assertFlaggedLaunch = async (label: string) => {
+    assert.equal(
+      await readFile(join(fixture.capture, "scheduler-env"), "utf8"),
+      "1",
+      `--scheduler exports the flag for this launch (${label})`,
+    );
+    assert.equal(
+      await readFile(join(fixture.capture, "args"), "utf8"),
+      `--extension\n${resolve("dist/src/index.js")}\n--model\nexample\n`,
+      "--scheduler is consumed by the launcher and never forwarded to pi",
+    );
+  };
+
+  await runLauncher(["--scheduler", "--model", "example"], envFor({ PI_REVIEW_GATE_SCHEDULER: "1" }));
+  await assertFlaggedLaunch("inherited value present");
+
+  await runLauncher(["--scheduler", "--model", "example"], envFor());
+  await assertFlaggedLaunch("no inherited value");
+});
+
 test("persistent launcher refreshes a stale installed orchestrator skill", async () => {
   const fixture = await makeLauncherFixture("pi-review-launcher-skill-");
   const installedSkill = join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator", "SKILL.md");

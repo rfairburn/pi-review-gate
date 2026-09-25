@@ -937,6 +937,24 @@ function main(argv) {
   const extensionPath = joinForPlatform(process.platform, root, "dist", "src", "index.js");
   const resolution = { homeDir: os.homedir(), platform: process.platform };
 
+  // Issue #26: --scheduler enables the process-local scheduled-execution
+  // runtime for this launch only. The flag is consumed here and handed to the
+  // extension through PI_REVIEW_GATE_SCHEDULER; it is never forwarded to pi,
+  // which would reject the unknown option. Processes started without the flag
+  // start Off (the live /review-settings toggle can still turn them on). An
+  // inherited PI_REVIEW_GATE_SCHEDULER (e.g. from a parent launched with
+  // --scheduler) is cleared before parsing so the explicit opt-in contract
+  // holds for nested and fresh launches: the variable reaches pi only when
+  // THIS launch passed the flag.
+  const forwardedArgs = [];
+  let schedulerEnabled = false;
+  for (const arg of argv) {
+    if (arg === "--scheduler") schedulerEnabled = true;
+    else forwardedArgs.push(arg);
+  }
+  delete process.env.PI_REVIEW_GATE_SCHEDULER;
+  if (schedulerEnabled) process.env.PI_REVIEW_GATE_SCHEDULER = "1";
+
   // Deliberate environment sanitization (POSIX launcher parity): the
   // persistent config is re-resolved below and re-exported, so an inherited
   // PI_REVIEW_GATE_CONFIG (e.g. from a parent pi session) cannot silently
@@ -1026,7 +1044,7 @@ function main(argv) {
   // Execute pi with the extension and the forwarded arguments, inheriting the
   // sanitized environment and stdio; the helper's exit status is pi's. pi is
   // spawned without any shell reparse of the arguments (see launchPi).
-  return launchPi(argv, extensionPath, process.env);
+  return launchPi(forwardedArgs, extensionPath, process.env);
 }
 
 if (require.main === module) {

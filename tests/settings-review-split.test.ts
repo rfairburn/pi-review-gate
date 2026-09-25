@@ -521,5 +521,6 @@ const ROOT_SETTING_LABELS = [
   "Subtask notifications",
   "Deferred Pi tools",
   "Subtasks view",
+  "Scheduled tasks",
   "Web",
 ] as const;

@@ -10,12 +10,12 @@
  *
  * - Creation: {@link createHostEditor} constructs the host Editor against
  *   the TUI the host injected into the custom component, styled with a
- *   minimal EditorTheme (the app's muted border color; the editor's
- *   autocomplete list never opens because no provider is set, so its
- *   select-list styling is identity-mapped). A TUI without terminal
- *   geometry, a missing Editor class (unit tests, SEA/binary hosts), or a
- *   failing constructor yields undefined so the caller keeps its own
- *   fallback editor.
+ *   minimal EditorTheme (the app's muted border color; no autocomplete
+ *   provider is set by this adapter, and a consumer that attaches one
+ *   through the editor's public seam gets its select-list styling
+ *   identity-mapped). A TUI without terminal geometry, a missing Editor
+ *   class (unit tests, SEA/binary hosts), or a failing constructor yields
+ *   undefined so the caller keeps its own fallback editor.
  * - Live keybindings: {@link pointHostEditorModuleAtLiveKeybindings} points
  *   the standalone pi-tui module's global keybinding state at the live
  *   manager the host injects into every custom component (since pi >= 0.86
@@ -31,7 +31,11 @@
  * chat editor, including user keybindings.json overrides.
  */
 
-/** Select-list styling the host editor theme requires (never visible: no autocomplete provider is set). */
+/**
+ * Select-list styling the host editor theme requires. Identity-mapped by
+ * default; only visible when a consumer attaches an autocomplete provider
+ * through the editor's public seam.
+ */
 export interface HostEditorSelectListTheme {
   selectedPrefix(text: string): string;
   selectedText(text: string): string;
@@ -64,6 +68,18 @@ export interface HostEditor {
   setText(text: string): void;
   /** Stored text with paste markers expanded to their actual content. */
   getExpandedText(): string;
+  /**
+   * Public pi-tui Editor seam for attaching an autocomplete provider (Tab
+   * completion). Optional: a host editor without it simply offers no
+   * completion, and the embedding field stays fully editable.
+   */
+  setAutocompleteProvider?(provider: unknown): void;
+  /**
+   * Public pi-tui Editor seam reporting whether the native completion list is
+   * currently visible. Embedding components use it to let the editor dismiss
+   * a visible list on Esc before treating the same key as cancel.
+   */
+  isShowingAutocomplete?(): boolean;
 }
 
 /**
@@ -74,6 +90,12 @@ export interface HostEditor {
 export interface HostEditorProvider {
   /** The pi-tui Editor class (host chat editor), when the module exposes it. */
   Editor?: new (tui: unknown, theme: HostEditorTheme) => HostEditor;
+  /**
+   * The pi-tui CombinedAutocompleteProvider class (native path completion),
+   * when the module exposes it. Consumers only ever construct it with an
+   * empty slash-command list and a base path; the host class may accept more.
+   */
+  CombinedAutocompleteProvider?: new (commands: never[], basePath: string) => unknown;
   /** The loaded module's public setKeybindings(); see pointHostEditorModuleAtLiveKeybindings. */
   setKeybindings?(keybindings: unknown): void;
   /** The module-global KeybindingsManager (default resolution). */
@@ -154,9 +176,9 @@ function isUsableTui(tui: unknown): boolean {
 }
 
 /**
- * EditorTheme for an embedded editor: the app's muted border color (its
- * autocomplete list never opens — no provider is set — so only the border
- * styling is ever visible).
+ * EditorTheme for an embedded editor: the app's muted border color. The
+ * adapter sets no autocomplete provider; a consumer-attached one renders its
+ * select list with the identity-mapped styling below.
  */
 function buildHostEditorTheme(theme: unknown): HostEditorTheme {
   const identity = (text: string): string => text;

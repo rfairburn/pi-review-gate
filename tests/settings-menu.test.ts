@@ -63,8 +63,9 @@ function tuiUi(harness: TuiSettingsHarness): RetainedUi {
   return { mode: "tui", select: ui.select as RetainedUi["select"], custom: ui.custom as RetainedUi["custom"] };
 }
 
-// Root menu row indices (15 sections + Save changes + Cancel).
-const ROOT = { resources: 2, routeExecute: 3, reviewers: 5, deferredTools: 12, web: 14, save: 15 } as const;
+// Root menu row indices (16 sections; the optional Scheduler runtime row adds
+// one more row only when the host provides the switch, then Save + Cancel).
+const ROOT = { resources: 2, routeExecute: 3, reviewers: 5, deferredTools: 12, web: 15, save: 16 } as const;
 // Web settings row indices.
 const WEB = { permissions: 5 } as const;
 // Browser permissions row indices (field order, then yolo, then Back).
@@ -379,7 +380,7 @@ test("reviewers menu keeps the toggled reviewer highlighted", async () => {
     [KEY_DOWN, KEY_ENTER],                      // toggle "two" on (row 1)
     [KEY_ESCAPE],                               // re-show: two retained; back to submenu
     [KEY_ESCAPE],                               // back to root
-    [...downs(10), KEY_ENTER],                  // save (reviewers row + 10)
+    [...downs(11), KEY_ENTER],                  // save (reviewers row + 11)
   ]);
   setMenuTuiHost(harness.host);
   await registered.handler("", harness.context);
@@ -432,7 +433,7 @@ test("worker resources keep the edited resource highlighted after a model switch
       [KEY_ENTER],                              // editor: Model
       [KEY_ESCAPE],                             // editor re-show (model retained): back to pool
       [KEY_ESCAPE],                             // pool re-show: a now sorted as "z"; back to root
-      [...downs(13), KEY_ENTER],                // save (resources row + 13)
+      [...downs(14), KEY_ENTER],                // save (resources row + 14)
     ],
     { selectScript: ["a [run-as-binary]", "1  current", "b [run-as-binary]", "1  current", "z [run-as-binary]"] },
   );
@@ -505,7 +506,7 @@ test("route Move up keeps editing the moved entry and the outer list retains it"
     [KEY_ENTER],                                // Move up (first action row)
     [KEY_ESCAPE],                               // inner re-show on the moved entry: back to list
     [KEY_ESCAPE],                               // outer re-show (a retained at new position): root
-    [...downs(12), KEY_ENTER],                  // save (route row + 12)
+    [...downs(13), KEY_ENTER],                  // save (route row + 13)
   ]);
   setMenuTuiHost(harness.host);
   await registered.handler("", harness.context);
@@ -600,11 +601,11 @@ test("plain-select hosts keep the legacy label flow for web permissions (fallbac
   assert.equal(saved.web.browserPermissions.modelCamera, true);
   // The root menu offered the legacy labels in order, ending with Save/Cancel.
   const rootOptions = menus[0]!.options;
-  assert.equal(rootOptions.length, 17);
+  assert.equal(rootOptions.length, 18);
   assert.ok(rootOptions[ROOT.web]!.startsWith("Web"));
   assert.ok(rootOptions[ROOT.web]!.includes("50 MiB max download · headless browser"));
-  assert.equal(rootOptions[15], "Save changes");
-  assert.equal(rootOptions[16], "Cancel");
+  assert.equal(rootOptions[16], "Save changes");
+  assert.equal(rootOptions[17], "Cancel");
   // The permissions menu kept the legacy 11 fields + YOLO + Back order.
   const permMenu = menus.find((menu) => menu.title === "Browser permissions")!;
   assert.equal(permMenu.options.length, 13);

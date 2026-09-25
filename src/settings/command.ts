@@ -1,6 +1,7 @@
 import { constants } from "node:fs";
-import { access } from "node:fs/promises";
-import { delimiter, isAbsolute, join } from "node:path";
+import { access, stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { delimiter, isAbsolute, join, resolve } from "node:path";
 import {
   BROWSER_PERMISSION_FIELDS,
   DEFAULT_BROWSER_PERMISSIONS,
@@ -10,6 +11,7 @@ import {
   DEFAULT_MAX_WORKERS,
   DEFAULT_SUBTASK_NOTIFICATION_MODE,
   MAX_EXECUTION_WORKERS,
+  cloneScheduledTaskCatalog,
   cloneWorkerCatalog,
   externalAgentCatalog,
   externalAgentSupportsExecution,
@@ -27,6 +29,10 @@ import {
   type ExecutorSelection,
   type ExternalAgentConfig,
   type ExecutionRetryPolicy,
+  type ScheduledTaskCatalog,
+  type ScheduledTaskEntryConfig,
+  type ScheduledTaskKind,
+  type ScheduledTaskReviewOverride,
   OPERATING_MODES,
   type OperatingMode,
   type RetainBundles,
@@ -38,12 +44,21 @@ import {
   type WorkerResourceValue,
   type WorkerRouteEntry,
 } from "../config";
+import { expandHomePath } from "../apply-patch/paths";
+import { parseCronExpression } from "../scheduling/cron";
 import { OPERATING_MODE_LABELS } from "../operating-mode";
-import { sendNotice } from "../pi";
+import { registerHook, sendNotice } from "../pi";
+import { abortActiveNativeEditorField } from "../native-editor-bridge";
 import { findOccupiedHostBindings } from "../host-keybindings";
 import { retainedSelect, type MenuCustomFactory } from "./menu";
 import { scopedModelChoices, type ScopedModelChoice } from "./models";
 import { persistReviewSettings, replaceConfig } from "./persistence";
+import { editSettingText } from "./text-input";
+import {
+  prepareScheduledImageAssets,
+  rollbackScheduledImageAssetsUnlessPersisted,
+  type PreparedScheduledImageAssets,
+} from "./scheduled-image-assets";
 
 interface RegisterSettingsInput {
   pi: unknown;
@@ -51,23 +66,47 @@ interface RegisterSettingsInput {
   configPath?: string;
   onSaved?: (config: ReviewGateConfig, previousMode: OperatingMode, context: unknown) => void | Promise<void>;
   onScopedModels?: (models: string[]) => void;
+  /**
+   * Process-local scheduled-task execution switch (issue #26). Live and
+   * current-process-only, with the settled retention contract: the host
+   * runtime holds the switch in a process-global holder that SURVIVES /reload
+   * in the same process (a live toggle is never reset by a reload), and only a
+   * fresh process startup derives the initial value from the scheduler launch
+   * flag (flag on, no flag off). It is never persisted in the config file and
+   * never becomes a shared default; this menu applies the flip through
+   * setEnabled(), which the host runtime wires to an immediate timer
+   * stop/start — no polling of the flag.
+   */
+  schedulerRuntime?: { enabled: boolean; setEnabled(next: boolean): void };
 }
 
 interface UiContext {
   select(title: string, options: string[]): Promise<string | undefined>;
   input?(title: string, placeholder?: string): Promise<string | undefined>;
+  /** Pi's public multi-line editor with editable prefill (issue #26). */
+  editor?(title: string, prefill?: string): Promise<string | undefined>;
   confirm?(title: string, message: string): Promise<boolean>;
   notify?(message: string, type?: "info" | "warning" | "error"): void;
   /** Host custom TUI component (Pi hosts only); guarded by `mode === "tui"`. */
   custom?(factory: MenuCustomFactory): Promise<string | undefined>;
   /** Host run mode ("tui" | "rpc" | ...); carried from the command context. */
   mode?: string;
+  /** The host session's working directory, carried from the command context. */
+  cwd?: string;
 }
 
 export function registerReviewSettings(input: RegisterSettingsInput): void {
   if (!isRecord(input.pi) || typeof input.pi.registerCommand !== "function") return;
+  // Session reset (/new, /resume, quit/fork) fires session_shutdown before the
+  // host clears its editor slot; settle any open native editor field as a
+  // cancel so it neither hangs nor leaks partial text into the next session's
+  // chat draft (issue #26). On /reload the host clears the slot first and the
+  // abort only prevents a hang — see src/native-editor-bridge.ts.
+  registerHook(input.pi, "session_shutdown", () => {
+    abortActiveNativeEditorField();
+  });
   input.pi.registerCommand("review-settings", {
-    description: "Configure delegated execution, deferred Pi tools, reviewers, review policy, the operating-mode cycle hotkey, web tools, and retention.",
+    description: "Configure delegated execution, deferred Pi tools, reviewers, review policy, scheduled tasks, the operating-mode cycle hotkey, web tools, and retention.",
     handler: async (_args: string, ctx: unknown) => {
       const ui = extractUi(ctx);
       if (!ui) {
@@ -124,6 +163,20 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
   // YOLO is a master override; the individual values beneath it are preserved
   // so disabling restores them exactly as saved.
   let browserPermissions = { ...(input.config.web!.browserPermissions ?? DEFAULT_BROWSER_PERMISSIONS) };
+  // Issue #26 scheduled tasks: the complete catalog is staged as its own
+  // canonical copy; Save persists it through the shared save boundary. Entry
+  // definitions stay visible and editable regardless of any runtime switch.
+  // The ids visible at open time let Save distinguish the user's own deletions
+  // from entries another process appended after this instance opened.
+  let scheduledTasks = cloneScheduledTaskCatalog(input.config.scheduledTasks ?? {});
+  const scheduledTasksStagedFrom = Object.keys(input.config.scheduledTasks ?? {});
+  // Native image pastes observed in scheduled instructions (issue: scheduled
+  // image assets). Provenance-carrying observation only, keyed by stable task
+  // id: Save verifies each observed token against the FINAL staged
+  // instructions and actual image content before copying anything. A cancel
+  // or entry removal discards that entry's observations; Save consumes them
+  // without clearing — the menu exits after a successful save.
+  const scheduledImageProvenance = new Map<string, string[]>();
 
   // Caller-local last selection for this loop only: the highlighted row is
   // re-shown after every staged change so a toggle can repeat without
@@ -142,43 +195,37 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       : !primaryEnabled && !subtaskEnabled
         ? " — automatic review off"
         : "";
-    const [modeRow, modeCycleRow, resourcesRow, executeRouteRow, researchRouteRow, reviewersRow, timeoutsRow, policyRow, retentionRow, workersRow, retryRow, notificationsRow, deferredToolsRow, subtasksViewRow, webRow] = alignedSettingsRows([
-      ["Operating mode", OPERATING_MODE_LABELS[operatingMode]],
-      ["Mode cycle hotkey", modeCycleShortcut],
-      ["Worker resources", executorPoolSummary(workerResources)],
-      ["Execution priority", workerRouteSummary(executeRoute, workerResources, input.config, input.scoped)],
-      ["Research priority", workerRouteSummary(researchRoute, workerResources, input.config, input.scoped)],
-      ["Reviewers", `primary ${layerSummary(primaryEnabled, primaryReviewers)} · subtask ${layerSummary(subtaskEnabled, subtaskReviewers)}${reviewStatus}`],
-      ["Timeouts", `review ${formatDuration(reviewerTimeoutMs)} · executor ${formatDuration(executorTimeoutMs)}`],
-      ["Review policy", `${maxCorrectionCycles} corrections · concrete after ${guidanceThreshold}`],
-      ["Bundle retention", retentionLabel(retainBundles)],
-      ["Global concurrency", String(maxWorkers)],
-      ["Retry policy", `${retryPolicy.maxRetries} retries · ${formatDuration(retryPolicy.baseDelayMs)} base`],
-      ["Subtask notifications", subtaskNotifications === "quiet" ? "Quiet" : "Noisy"],
-      ["Deferred Pi tools", `${deferredPiTools ? "On" : "Off"} · local now, new subtasks`],
-      ["Subtasks view", subtasksViewExpanded ? "Expanded" : "Collapsed"],
-      ["Web", `${formatByteSize(webMaxDownloadBytes)} max download · ${browserVisible ? "headed" : "headless"} browser${browserPermissions.yolo ? " · YOLO ON" : ""}`],
-    ]);
+    // Section definitions drive both the aligned rendering and the row keys,
+    // so a conditionally shown section (the live scheduler runtime toggle) can
+    // never shift another row's label or key binding (issue #140 stability).
+    const rootSections: Array<{ key: string; label: string; value: string }> = [
+      { key: "mode", label: "Operating mode", value: OPERATING_MODE_LABELS[operatingMode] },
+      { key: "modeCycle", label: "Mode cycle hotkey", value: modeCycleShortcut },
+      { key: "resources", label: "Worker resources", value: executorPoolSummary(workerResources) },
+      { key: "route.execute", label: "Execution priority", value: workerRouteSummary(executeRoute, workerResources, input.config, input.scoped) },
+      { key: "route.research", label: "Research priority", value: workerRouteSummary(researchRoute, workerResources, input.config, input.scoped) },
+      { key: "reviewers", label: "Reviewers", value: `primary ${layerSummary(primaryEnabled, primaryReviewers)} · subtask ${layerSummary(subtaskEnabled, subtaskReviewers)}${reviewStatus}` },
+      { key: "timeouts", label: "Timeouts", value: `review ${formatDuration(reviewerTimeoutMs)} · executor ${formatDuration(executorTimeoutMs)}` },
+      { key: "policy", label: "Review policy", value: `${maxCorrectionCycles} corrections · concrete after ${guidanceThreshold}` },
+      { key: "retention", label: "Bundle retention", value: retentionLabel(retainBundles) },
+      { key: "workers", label: "Global concurrency", value: String(maxWorkers) },
+      { key: "retry", label: "Retry policy", value: `${retryPolicy.maxRetries} retries · ${formatDuration(retryPolicy.baseDelayMs)} base` },
+      { key: "notifications", label: "Subtask notifications", value: subtaskNotifications === "quiet" ? "Quiet" : "Noisy" },
+      { key: "deferredTools", label: "Deferred Pi tools", value: `${deferredPiTools ? "On" : "Off"} · local now, new subtasks` },
+      { key: "subtasksView", label: "Subtasks view", value: subtasksViewExpanded ? "Expanded" : "Collapsed" },
+      { key: "scheduled", label: "Scheduled tasks", value: scheduledSummary(scheduledTasks) },
+      ...(input.schedulerRuntime
+        ? [{ key: "schedulerRuntime", label: "Scheduler runtime", value: input.schedulerRuntime.enabled ? "On" : "Off" }]
+        : []),
+      { key: "web", label: "Web", value: `${formatByteSize(webMaxDownloadBytes)} max download · ${browserVisible ? "headed" : "headless"} browser${browserPermissions.yolo ? " · YOLO ON" : ""}` },
+    ];
+    const renderedRootRows = alignedSettingsRows(rootSections.map((section) => [section.label, section.value] as const));
     // Rows are keyed by stable section names: every label re-renders with the
     // staged state, but the key never changes (issue #140).
     const choice = await retainedSelect(input.ui, {
       title: "Review settings",
       rows: [
-        { key: "mode", label: modeRow },
-        { key: "modeCycle", label: modeCycleRow },
-        { key: "resources", label: resourcesRow },
-        { key: "route.execute", label: executeRouteRow },
-        { key: "route.research", label: researchRouteRow },
-        { key: "reviewers", label: reviewersRow },
-        { key: "timeouts", label: timeoutsRow },
-        { key: "policy", label: policyRow },
-        { key: "retention", label: retentionRow },
-        { key: "workers", label: workersRow },
-        { key: "retry", label: retryRow },
-        { key: "notifications", label: notificationsRow },
-        { key: "deferredTools", label: deferredToolsRow },
-        { key: "subtasksView", label: subtasksViewRow },
-        { key: "web", label: webRow },
+        ...rootSections.map((section, index) => ({ key: section.key, label: renderedRootRows[index]! })),
         { key: "save", label: "Save changes" },
         { key: "cancel", label: "Cancel" },
       ],
@@ -319,46 +366,98 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       subtasksViewExpanded = !subtasksViewExpanded;
       continue;
     }
+    if (choice === "scheduled") {
+      scheduledTasks = await selectScheduledTasks(input.ui, scheduledTasks, workerResources, input.config, input.scoped, agents, scheduledImageProvenance);
+      continue;
+    }
+    if (choice === "schedulerRuntime") {
+      // Live, current-process-only switch (issue #26): applies immediately,
+      // never persists, and stays outside the staged settings transaction —
+      // cancelling other changes does not revert it.
+      // Real setter contract: the runtime reacts synchronously by stopping
+      // or starting its timers; nothing polls the flag afterwards.
+      if (input.schedulerRuntime) input.schedulerRuntime.setEnabled(!input.schedulerRuntime.enabled);
+      continue;
+    }
     if (choice === "web") {
       ({ maxDownloadBytes: webMaxDownloadBytes, browserInteractionApproval, browserIdleExpiryMinutes, browserDownloadRetention, browserVisible, browserPermissions } = await selectWebSettings(
         input.ui, webMaxDownloadBytes, browserInteractionApproval, browserIdleExpiryMinutes, browserDownloadRetention, browserVisible, browserPermissions,
       ));
       continue;
     }
+    // Expand a leading `~`/`~/...` — entered above or hand-edited into the
+    // config file — against the user's home before validation and persistence.
+    // This stores an absolute spelling, not a symlink-resolved path. Relative
+    // and other spellings keep their parent-session-cwd anchor at run time.
+    scheduledTasks = expandScheduledTaskWorkspaces(scheduledTasks);
     const error = (await validateSelection(workerResources, primaryReviewers, input.config, input.scoped, executeRoute, researchRoute))
-      ?? (await validateSelection(workerResources, subtaskReviewers, input.config, input.scoped, executeRoute, researchRoute));
+      ?? (await validateSelection(workerResources, subtaskReviewers, input.config, input.scoped, executeRoute, researchRoute))
+      ?? (await validateScheduledTasks(scheduledTasks, workerResources, input.config, input.scoped, input.ui.cwd));
     if (error) {
       await notify(input.ui, error, "error");
       continue;
     }
-    const next = await persistReviewSettings(input.configPath!, {
-      operatingMode,
-      modeCycleShortcut,
-      workerResources,
-      executeRoute,
-      researchRoute,
-      primaryReviewers,
-      subtaskReviewers,
-      primaryEnabled,
-      subtaskEnabled,
-      reviewLandedChanges,
-      reviewerTimeoutMs,
-      executorTimeoutMs,
-      maxCorrectionCycles,
-      implementationGuidanceAfterCorrectionAttempts: guidanceThreshold,
-      retainBundles,
-      maxWorkers,
-      retryPolicy,
-      subtaskNotifications,
-      deferredPiTools,
-      subtasksViewExpanded,
-      webMaxDownloadBytes,
-      browserInteractionApproval,
-      browserIdleExpiryMinutes,
-      browserDownloadRetention,
-      browserVisible,
-      webBrowserPermissions: browserPermissions,
-    });
+    // The Save-time transaction for images pasted through the native host
+    // editor (see src/settings/scheduled-image-assets.ts): every observed
+    // native insert is verified against the FINAL staged instructions and
+    // actual image content, copied into the private managed store, and the
+    // staged temporary path is replaced by the managed absolute path BEFORE
+    // the ordinary atomic config persistence. Any failure (missing,
+    // non-image, too large, or an unobserved Pi clipboard temp reference)
+    // fails closed with an actionable notice and leaves the config and the
+    // managed store untouched — the menu stays open, so the user can Cancel
+    // (which copies nothing) or fix the entry and Save again.
+    let prepared: PreparedScheduledImageAssets | undefined;
+    let catalogForSave = scheduledTasks;
+    try {
+      prepared = await prepareScheduledImageAssets(input.configPath!, scheduledTasks, scheduledImageProvenance);
+      catalogForSave = prepared.catalog;
+    } catch (error) {
+      await notify(input.ui, `review gate: ${error instanceof Error ? error.message : String(error)}`, "error");
+      continue;
+    }
+    let next: ReviewGateConfig;
+    try {
+      next = await persistReviewSettings(input.configPath!, {
+        operatingMode,
+        modeCycleShortcut,
+        workerResources,
+        executeRoute,
+        researchRoute,
+        primaryReviewers,
+        subtaskReviewers,
+        primaryEnabled,
+        subtaskEnabled,
+        reviewLandedChanges,
+        reviewerTimeoutMs,
+        executorTimeoutMs,
+        maxCorrectionCycles,
+        implementationGuidanceAfterCorrectionAttempts: guidanceThreshold,
+        retainBundles,
+        maxWorkers,
+        retryPolicy,
+        subtaskNotifications,
+        deferredPiTools,
+        subtasksViewExpanded,
+        scheduledTasks: catalogForSave,
+        scheduledTasksStagedFrom,
+        webMaxDownloadBytes,
+        browserInteractionApproval,
+        browserIdleExpiryMinutes,
+        browserDownloadRetention,
+        browserVisible,
+        webBrowserPermissions: browserPermissions,
+      });
+    } catch (error) {
+      // A failed Save mutates nothing — but the atomic config write can reject
+      // AFTER its rename already replaced the file, in which case the persisted
+      // text references the just-created copies. The rollback reads the config
+      // first and keeps any created copy the persisted text references (and
+      // everything when the config cannot be read); the staged catalog keeps
+      // the original temporary paths so a later Save can retry either way.
+      if (prepared) await rollbackScheduledImageAssetsUnlessPersisted(input.configPath!, prepared);
+      throw error;
+    }
     const previousMode = input.config.operatingMode;
     const previousModeCycleShortcut = input.config.modeCycleShortcut;
     replaceConfig(input.config, next);
@@ -439,12 +538,13 @@ async function selectWebSettings(
       if (entry) browserInteractionApproval = entry[0] as BrowserInteractionApproval;
       continue;
     }
-    if (!ui.input) {
-      await notify(ui, "This UI does not support numeric input.", "error");
-      continue;
-    }
     if (choice === "idleExpiry") {
-      const entered = await ui.input("Browser idle expiry in minutes (0 disables idle close)", String(browserIdleExpiryMinutes));
+      const entered = await editSettingText(
+        ui,
+        "Browser idle expiry in minutes (0 disables idle close)",
+        String(browserIdleExpiryMinutes),
+        "This UI does not support numeric input.",
+      );
       if (entered === undefined) continue;
       // Empty input must stay rejected: Number("") would otherwise stage 0.
       const trimmed = entered.trim();
@@ -458,7 +558,12 @@ async function selectWebSettings(
     }
     if (choice === "retention") {
       await notify(ui, "Maximum retained unsaved downloads per browser session. While the cap is reached, a new download cancels and releases the oldest retained one (after a live lowering, the next arrival may release more than one); saved files are never counted or affected. 0 disables count-based eviction entirely (normal save/close/revocation cleanup still applies). A lowered value takes effect when the next download arrives; editing this setting never deletes pending downloads.", "info");
-      const entered = await ui.input("Maximum retained unsaved downloads per browser session (0 = unlimited)", String(browserDownloadRetention));
+      const entered = await editSettingText(
+        ui,
+        "Maximum retained unsaved downloads per browser session (0 = unlimited)",
+        String(browserDownloadRetention),
+        "This UI does not support numeric input.",
+      );
       if (entered === undefined) continue;
       // Empty input must stay rejected: Number("") would otherwise stage 0.
       const trimmed = entered.trim();
@@ -470,7 +575,12 @@ async function selectWebSettings(
       browserDownloadRetention = retention;
       continue;
     }
-    const entered = await ui.input("Maximum download size in MiB", String(maxDownloadBytes / (1024 * 1024)));
+    const entered = await editSettingText(
+      ui,
+      "Maximum download size in MiB",
+      String(maxDownloadBytes / (1024 * 1024)),
+      "This UI does not support numeric input.",
+    );
     if (entered === undefined) continue;
     const mebibytes = Number(entered.trim());
     if (!Number.isSafeInteger(mebibytes) || mebibytes < 1 || mebibytes > 2_048) {
@@ -658,6 +768,459 @@ async function confirmYoloEnablement(ui: UiContext): Promise<boolean> {
   return true;
 }
 
+/** One-line state of the staged scheduled-task catalog for the root row. */
+function scheduledSummary(catalog: ScheduledTaskCatalog): string {
+  const ids = Object.keys(catalog);
+  if (ids.length === 0) return "None";
+  const enabled = ids.filter((id) => catalog[id]!.enabled).length;
+  return `${enabled} of ${ids.length} enabled`;
+}
+
+/** One-line state of one staged scheduled task for the list rows. */
+function scheduledTaskEntrySummary(entry: ScheduledTaskEntryConfig): string {
+  const name = entry.name.trim() || "(unnamed)";
+  const state = entry.enabled ? "enabled" : "disabled";
+  return `${name} — ${entry.cron || "(no schedule)"} — ${scheduledTaskKindLabel(entry.kind)} — ${state}`;
+}
+
+function scheduledTaskKindLabel(kind: ScheduledTaskKind): string {
+  return kind === "research" ? "research" : "execute";
+}
+
+/** Compact display preview; never persisted or interpreted. */
+function previewText(value: string): string {
+  const singleLine = value.replace(/\s+/g, " ").trim();
+  return singleLine.length > 48 ? `${singleLine.slice(0, 45)}…` : singleLine || "(not set)";
+}
+
+function scheduledTaskWorkerSummary(
+  entry: ScheduledTaskEntryConfig,
+  workerResources: WorkerResourceCatalog,
+  config: ReviewGateConfig,
+  scoped: ScopedModelChoice[],
+): string {
+  if (entry.workerResourceId === undefined) return "Inherit global route";
+  const resource = Object.prototype.hasOwnProperty.call(workerResources, entry.workerResourceId)
+    ? workerResources[entry.workerResourceId]
+    : undefined;
+  return resource
+    ? executorSelectionLabel(resource.selection, config, scoped)
+    : `${entry.workerResourceId} [unavailable]`;
+}
+
+function scheduledTaskReviewSummary(entry: ScheduledTaskEntryConfig): string {
+  if (entry.review === undefined) return "Inherit global subtask review";
+  if (entry.review.mode === "off") return "Off (no review)";
+  return `${entry.review.reviewers.length} reviewer${entry.review.reviewers.length === 1 ? "" : "s"} selected`;
+}
+
+/** Stable generated identity for a new scheduled task; uniqueness is checked. */
+function generateScheduledTaskId(catalog: ScheduledTaskCatalog): string {
+  let id = `task-${randomUUID().replace(/-/g, "").slice(0, 8)}`;
+  while (Object.prototype.hasOwnProperty.call(catalog, id)) {
+    id = `task-${randomUUID().replace(/-/g, "").slice(0, 8)}`;
+  }
+  return id;
+}
+
+/** Title shared by every surface of the scheduled-task workspace field. */
+const WORKSPACE_DIRECTORY_TITLE = "Authorized target workspace directory";
+
+/**
+ * Cron editor title (issue #26): a compact heading rendered above the
+ * editable prefilled cron text that maps all five fields in order, states
+ * the machine-local time basis, and explains the canonical wildcard line.
+ */
+const CRON_EXPRESSION_TITLE = [
+  "Cron expression — 5 fields, machine-local time",
+  "minute  hour  day-of-month  month  day-of-week",
+  "* * * * * = every minute",
+].join("\n");
+
+/**
+ * The Scheduled tasks submenu (issue #26): one staged entry per independent
+ * scheduled task, keyed by its stable generated identity. Entries are always
+ * visible and editable here regardless of the process-local scheduler runtime
+ * toggle — defining a schedule and executing it are independent decisions, and
+ * saving from an instance whose runtime is off preserves every entry.
+ */
+async function selectScheduledTasks(
+  ui: UiContext,
+  initial: ScheduledTaskCatalog,
+  workerResources: WorkerResourceCatalog,
+  config: ReviewGateConfig,
+  scoped: ScopedModelChoice[],
+  agents: ExternalAgentConfig[],
+  /** Native-paste provenance per task id; consumed at Save (image assets). */
+  imageProvenance: Map<string, string[]>,
+): Promise<ScheduledTaskCatalog> {
+  const catalog = cloneScheduledTaskCatalog(initial);
+  // Caller-local last selection for this loop only (issue #140): keys are the
+  // stable task ids, so an edited entry stays highlighted across re-shows.
+  let lastKey: string | undefined;
+  while (true) {
+    const ids = Object.keys(catalog);
+    const entryRows = ids.map((id, index) => `${index + 1}. ${scheduledTaskEntrySummary(catalog[id]!)}`);
+    const choice = await retainedSelect(ui, {
+      title: "Scheduled tasks",
+      rows: [
+        ...ids.map((id, index) => ({ key: id, label: entryRows[index]! })),
+        { key: "action:add", label: "Add scheduled task" },
+        { key: "action:back", label: "Back" },
+      ],
+      initialKey: lastKey,
+    });
+    if (!choice || choice === "action:back") return catalog;
+    lastKey = choice;
+    if (choice === "action:add") {
+      const entered = await editSettingText(
+        ui,
+        "Scheduled task name",
+        "",
+        "This UI does not support text input; scheduled tasks cannot be added here.",
+      );
+      if (entered === undefined) continue;
+      const name = entered.trim();
+      if (!name) {
+        await notify(ui, "Enter a non-empty name, or cancel.", "error");
+        continue;
+      }
+      // Required fields start unset so Save's validation names exactly what is
+      // still missing; no default schedule or workspace is ever invented.
+      const id = generateScheduledTaskId(catalog);
+      setCatalogKey(catalog, id, { name, cron: "", enabled: true, kind: "execute", instructions: "", workspace: "" });
+      await editScheduledTaskEntry(ui, catalog, id, workerResources, config, scoped, agents, imageProvenance);
+      continue;
+    }
+    // Action keys contain ":", which validateConfiguredId rejects, so a
+    // configured task id can never collide with them: a hand-edited id like
+    // "add" stays editable instead of being shadowed by the Add action, and
+    // an unknown value remains a no-op re-show.
+    if (Object.prototype.hasOwnProperty.call(catalog, choice)) {
+      await editScheduledTaskEntry(ui, catalog, choice, workerResources, config, scoped, agents, imageProvenance);
+    }
+  }
+}
+
+/**
+ * Edit one scheduled task by its stable identity. Name and schedule are
+ * display attributes; the identity never changes, so saved references stay
+ * valid across renames.
+ */
+async function editScheduledTaskEntry(
+  ui: UiContext,
+  catalog: ScheduledTaskCatalog,
+  id: string,
+  workerResources: WorkerResourceCatalog,
+  config: ReviewGateConfig,
+  scoped: ScopedModelChoice[],
+  agents: ExternalAgentConfig[],
+  imageProvenance: Map<string, string[]>,
+): Promise<void> {
+  // Caller-local last selection for this loop only (issue #140).
+  let lastKey: string | undefined;
+  while (Object.prototype.hasOwnProperty.call(catalog, id)) {
+    const entry = catalog[id]!;
+    const [nameRow, cronRow, kindRow, instructionsRow, workspaceRow, workerRow, reviewRow, enabledRow] = alignedSettingsRows([
+      ["Name", entry.name],
+      ["Schedule (cron)", entry.cron || "(not set)"],
+      ["Kind", scheduledTaskKindLabel(entry.kind)],
+      ["Instructions", previewText(entry.instructions)],
+      ["Workspace", entry.workspace || "(not set)"],
+      ["Worker", scheduledTaskWorkerSummary(entry, workerResources, config, scoped)],
+      ["Review", scheduledTaskReviewSummary(entry)],
+      ["Enabled", entry.enabled ? "On" : "Off"],
+    ]);
+    const choice = await retainedSelect(ui, {
+      title: `Scheduled task ${id}`,
+      rows: [
+        { key: "name", label: nameRow },
+        { key: "cron", label: cronRow },
+        { key: "kind", label: kindRow },
+        { key: "instructions", label: instructionsRow },
+        { key: "workspace", label: workspaceRow },
+        { key: "worker", label: workerRow },
+        { key: "review", label: reviewRow },
+        { key: "enabled", label: enabledRow },
+        { key: "remove", label: "Remove" },
+        { key: "back", label: "Back" },
+      ],
+      initialKey: lastKey,
+    });
+    if (!choice || choice === "back") return;
+    lastKey = choice;
+    if (choice === "name") {
+      const entered = await editSettingText(ui, "Scheduled task name", entry.name);
+      if (entered === undefined) continue;
+      const name = entered.trim();
+      if (!name) {
+        await notify(ui, "Name must be a non-empty string.", "error");
+        continue;
+      }
+      setCatalogKey(catalog, id, { ...entry, name });
+      continue;
+    }
+    if (choice === "cron") {
+      // The heading renders above the editable prefilled cron text: all five
+      // fields in order, the machine-local time basis, and the canonical
+      // wildcard line (issue #26).
+      const entered = await editSettingText(ui, CRON_EXPRESSION_TITLE, entry.cron);
+      if (entered === undefined) continue;
+      try {
+        setCatalogKey(catalog, id, { ...entry, cron: parseCronExpression(entered, "cron expression").expression });
+      } catch (error) {
+        await notify(ui, error instanceof Error ? error.message : String(error), "error");
+      }
+      continue;
+    }
+    if (choice === "kind") {
+      const options = ["Execute — write-capable subtask", "Research — read-only subtask"]
+        .map((option) => option.startsWith(entry.kind === "research" ? "Research" : "Execute") ? `${option}  current` : option);
+      const selected = await ui.select("Scheduled task kind", options);
+      if (selected?.startsWith("Execute")) setCatalogKey(catalog, id, { ...entry, kind: "execute" });
+      else if (selected?.startsWith("Research")) setCatalogKey(catalog, id, { ...entry, kind: "research" });
+      continue;
+    }
+    if (choice === "instructions") {
+      // Shared host-wired editor in the TUI, non-interactive editor fallback;
+      // the same seam as every other typed settings field (issue #26). In the
+      // TUI the bridge's observation-only onHostInsert seam records exactly
+      // what Pi's own handlers insert (an image paste inserts the temp file
+      // path), so Save can verify provenance, validate the actual image, and
+      // copy it into the durable managed store. Observation only: no
+      // clipboard access, no path interpretation, no asset copying here.
+      const pastedInserts: string[] = [];
+      const entered = await editSettingText(
+        ui,
+        "Instructions for the scheduled subtask",
+        entry.instructions,
+        undefined,
+        { onHostInsert: (text) => pastedInserts.push(text) },
+      );
+      if (entered === undefined) continue;
+      if (!entered.trim()) {
+        await notify(ui, "Instructions must be a non-empty string.", "error");
+        continue;
+      }
+      // Only accepted edits carry provenance forward: a cancelled field
+      // stages nothing, so its observations are discarded.
+      if (pastedInserts.length > 0) {
+        imageProvenance.set(id, [...(imageProvenance.get(id) ?? []), ...pastedInserts]);
+      }
+      setCatalogKey(catalog, id, { ...entry, instructions: entered.trim() });
+      continue;
+    }
+    if (choice === "workspace") {
+      // One shared field surface like every other text field: in the
+      // interactive TUI the host-wired native editor bridge, on
+      // non-interactive hosts the public editor prefill, then the legacy
+      // input (issue #26). Native absolute-path completion is shared by
+      // every field through the bridge: a first-line leading-slash token
+      // lists filesystem directories through the host's own provider —
+      // never slash commands; the main chat prompt is untouched.
+      const entered = await editSettingText(ui, WORKSPACE_DIRECTORY_TITLE, entry.workspace);
+      if (entered === undefined) continue;
+      if (!entered.trim()) {
+        await notify(ui, "Workspace must be a non-empty string.", "error");
+        continue;
+      }
+      // Expand a leading `~`/`~/...` against the user's home and stage its
+      // absolute spelling for Save. Every other spelling is kept verbatim.
+      setCatalogKey(catalog, id, { ...entry, workspace: expandHomePath(entered.trim()) });
+      continue;
+    }
+    if (choice === "worker") {
+      const next: ScheduledTaskEntryConfig = { ...entry, workerResourceId: await selectScheduledTaskWorker(ui, entry, workerResources, config, scoped) };
+      setCatalogKey(catalog, id, next);
+      continue;
+    }
+    if (choice === "review") {
+      const override = await selectScheduledTaskReview(ui, entry, agents, scoped);
+      if (override !== "unchanged") {
+        // Inherit is represented by absence, never by a stored null (issue #26).
+        const next: ScheduledTaskEntryConfig = { ...entry };
+        if (override === undefined) delete next.review;
+        else next.review = override;
+        setCatalogKey(catalog, id, next);
+      }
+      continue;
+    }
+    if (choice === "enabled") {
+      setCatalogKey(catalog, id, { ...entry, enabled: !entry.enabled });
+      continue;
+    }
+    if (choice === "remove") {
+      delete catalog[id];
+      // Removed entries keep no provenance: they cannot be saved, and a
+      // re-added entry gets a fresh identity and fresh observations.
+      imageProvenance.delete(id);
+      return;
+    }
+  }
+}
+
+/**
+ * Worker override picker. The choices come from the worker resource catalog —
+ * never from the global role routes: an explicit task-local selection must not
+ * require global-route membership (issue #26), because that would defeat the
+ * entry's independence. Research tasks can only pick research-capable
+ * resources, matching the stored-record validation.
+ */
+async function selectScheduledTaskWorker(
+  ui: UiContext,
+  entry: ScheduledTaskEntryConfig,
+  workerResources: WorkerResourceCatalog,
+  config: ReviewGateConfig,
+  scoped: ScopedModelChoice[],
+): Promise<string | undefined> {
+  // The staged catalog is authoritative for this staged session: a resource
+  // added earlier in the same unsaved visit is pickable, and one removed
+  // earlier is not offered, matching what Save will persist.
+  const eligible = Object.entries(workerResources)
+    .filter(([, value]) => entry.kind === "execute" || workerResourceSupportsResearch(config, value.selection));
+  const rows = sortedCatalogKeys(Object.fromEntries(eligible) as WorkerResourceCatalog, config, scoped);
+  const options = [
+    `Inherit global route (current at run time)${entry.workerResourceId === undefined ? "  current" : ""}`,
+    ...rows.map((resourceId) => {
+      const resource = workerResources[resourceId]!;
+      return `${executorSelectionLabel(resource.selection, config, scoped)}${entry.workerResourceId === resourceId ? "  current" : ""}`;
+    }),
+  ];
+  const selected = await ui.select(`Worker for scheduled task — ${entry.name}`, options);
+  if (selected === undefined) return entry.workerResourceId;
+  if (selected.startsWith("Inherit global route")) return undefined;
+  const index = options.indexOf(selected);
+  // Options 1..n map to the eligible resource rows in order.
+  return index >= 1 ? rows[index - 1]! : entry.workerResourceId;
+}
+
+/**
+ * Review override picker: inherit the live global subtask settings, run the
+ * task's subtasks without review (explicit Off, allowed for write-capable
+ * tasks too), or pick a task-local reviewer set. A chosen-but-empty reviewer
+ * set is rejected instead of being silently reinterpreted as inherit or Off.
+ * None of these choices touch the global or parent review state.
+ */
+async function selectScheduledTaskReview(
+  ui: UiContext,
+  entry: ScheduledTaskEntryConfig,
+  agents: ExternalAgentConfig[],
+  scoped: ScopedModelChoice[],
+): Promise<ScheduledTaskReviewOverride | undefined | "unchanged"> {
+  const inheritLabel = "Inherit global subtask review settings (current at run time)";
+  const offLabel = "Off — run this task's subtasks without review";
+  const reviewersLabel = "Select reviewers…";
+  const options = [
+    `${inheritLabel}${entry.review === undefined ? `  current` : ""}`,
+    `${offLabel}${entry.review?.mode === "off" ? `  current` : ""}`,
+    `${reviewersLabel} — ${scheduledTaskReviewSummary(entry)}`,
+  ];
+  const selected = await ui.select("Review for scheduled task — " + entry.name, options);
+  if (selected === undefined) return "unchanged";
+  if (selected.startsWith(inheritLabel)) return undefined;
+  if (selected.startsWith(offLabel)) return { mode: "off" };
+  if (selected.startsWith(reviewersLabel)) {
+    if (entry.review?.mode === "selected") {
+      // Keep the existing selections when the picker opens; a re-shown picker
+      // starts from what the task already stages.
+      const selectedReviewers = await selectReviewers(ui, entry.review.reviewers, agents, scoped);
+      if (selectedReviewers.length === 0) {
+        await notify(ui, "Select at least one reviewer, or choose Inherit or Off; the task's review override is unchanged.", "error");
+        return "unchanged";
+      }
+      return { mode: "selected", reviewers: selectedReviewers };
+    }
+    const selectedReviewers = await selectReviewers(ui, [], agents, scoped);
+    if (selectedReviewers.length === 0) {
+      await notify(ui, "Select at least one reviewer, or choose Inherit or Off; the task's review override is unchanged.", "error");
+      return "unchanged";
+    }
+    return { mode: "selected", reviewers: selectedReviewers };
+  }
+  return "unchanged";
+}
+
+/**
+ * Expand the staged catalog's home-prefixed workspaces before persistence
+ * (issue #26). A leading `~`/`~/...` becomes an absolute home path in the
+ * saved file; the runtime separately resolves the target's realpath. Every
+ * other spelling is untouched — relative paths keep their session-cwd anchor,
+ * and `~user` is never reinterpreted.
+ */
+function expandScheduledTaskWorkspaces(catalog: ScheduledTaskCatalog): ScheduledTaskCatalog {
+  const out: ScheduledTaskCatalog = {};
+  for (const [id, entry] of Object.entries(catalog)) {
+    // Prototype-safe own-key write (setCatalogKey): an id of "__proto__" (the
+    // id grammar accepts it; JSON.parse creates it as own data) must survive
+    // this Save-path boundary — a plain assignment would invoke the prototype
+    // setter, drop the entry from the staged catalog, and make the merge in
+    // persistReviewSettings classify it as staged-then-removed and delete it
+    // from the config file.
+    setCatalogKey(out, id, { ...entry, workspace: expandHomePath(entry.workspace) });
+  }
+  return out;
+}
+
+/**
+ * Save-time validation for the staged scheduled-task catalog. Every entry
+ * must be complete and consistent: a real cron expression, non-empty
+ * instructions, an existing authorized workspace directory (a leading
+ * `~`/`~/...` is already expanded to its absolute home path by the save
+ * boundary), a worker override that resolves in the independent catalog
+ * (research-capable for research tasks), and a task-local reviewer set that
+ * resolves like any global one.
+ */
+async function validateScheduledTasks(
+  catalog: ScheduledTaskCatalog,
+  workerResources: WorkerResourceCatalog,
+  config: ReviewGateConfig,
+  scoped: ScopedModelChoice[],
+  sessionCwd?: string,
+): Promise<string | undefined> {
+  for (const [id, entry] of Object.entries(catalog)) {
+    if (!entry.name.trim()) return `Scheduled task ${id} has no name`;
+    try {
+      parseCronExpression(entry.cron, `scheduled task "${entry.name}"`);
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+    if (!entry.instructions.trim()) return `Scheduled task ${id} has no instructions`;
+    const workspace = entry.workspace.trim();
+    if (!workspace) return `Scheduled task ${id} has no workspace`;
+    // Pi's native completion and the eventual subtask start both anchor
+    // relative paths to this session cwd, not the extension process cwd.
+    const candidate = sessionCwd && !isAbsolute(workspace) ? resolve(sessionCwd, workspace) : workspace;
+    if (!await directoryExists(candidate)) {
+      return `Scheduled task ${id} workspace is not an existing directory: ${entry.workspace}`;
+    }
+    if (entry.workerResourceId !== undefined) {
+      const resource = Object.prototype.hasOwnProperty.call(workerResources, entry.workerResourceId)
+        ? workerResources[entry.workerResourceId]
+        : undefined;
+      if (!resource) return `Scheduled task ${id} references missing worker resource: ${entry.workerResourceId}`;
+      if (entry.kind === "research" && !workerResourceSupportsResearch(config, resource.selection)) {
+        return `Scheduled task ${id} worker resource is not research-capable: ${entry.workerResourceId}`;
+      }
+    }
+    if (entry.review?.mode === "selected") {
+      if (entry.review.reviewers.length === 0) {
+        return `Scheduled task ${id} review override selects no reviewers; choose Inherit or Off`;
+      }
+      const reviewerError = await validateSelection(workerResources, entry.review.reviewers, config, scoped);
+      if (reviewerError) return `Scheduled task ${id}: ${reviewerError}`;
+    }
+  }
+  return undefined;
+}
+
+async function directoryExists(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 async function selectSubtaskNotifications(
   ui: UiContext,
   current: SubtaskNotificationMode,
@@ -678,12 +1241,13 @@ async function selectOperatingMode(ui: UiContext, current: OperatingMode): Promi
 }
 
 async function selectModeCycleShortcut(ui: UiContext, current: string): Promise<string> {
-  if (!ui.input) {
-    await notify(ui, "This UI does not support text input; the mode cycle hotkey cannot be edited here.", "error");
-    return current;
-  }
   while (true) {
-    const entered = await ui.input("Mode cycle hotkey (modifiers + key, e.g. alt+m)", current);
+    const entered = await editSettingText(
+      ui,
+      "Mode cycle hotkey (modifiers + key, e.g. alt+m)",
+      current,
+      "This UI does not support text input; the mode cycle hotkey cannot be edited here.",
+    );
     if (entered === undefined) return current;
     const trimmed = entered.trim();
     if (trimmed.length === 0) {
@@ -763,10 +1327,6 @@ async function selectRetryPolicy(ui: UiContext, initial: ExecutionRetryPolicy): 
       policy.jitter = !policy.jitter;
       continue;
     }
-    if (!ui.input) {
-      await notify(ui, "This UI does not support numeric input.", "error");
-      continue;
-    }
     const isDelay = choice === "base" || choice === "max";
     const current = choice === "retries"
       ? policy.maxRetries
@@ -775,7 +1335,12 @@ async function selectRetryPolicy(ui: UiContext, initial: ExecutionRetryPolicy): 
         : choice === "max"
           ? policy.maxDelayMs
           : policy.maxSameIncidentRepeats;
-    const entered = await ui.input(isDelay ? "Delay in milliseconds" : "Retry limit", String(current));
+    const entered = await editSettingText(
+      ui,
+      isDelay ? "Delay in milliseconds" : "Retry limit",
+      String(current),
+      "This UI does not support numeric input.",
+    );
     if (entered === undefined) continue;
     const parsed = Number(entered.trim());
     if (!Number.isSafeInteger(parsed) || parsed < 0) {
@@ -1084,7 +1649,7 @@ async function editExecutorPoolEntry(
 }
 
 /** Define an own data property even for keys like "__proto__" or "constructor". */
-function setCatalogKey(catalog: WorkerResourceCatalog, key: string, value: WorkerResourceValue): void {
+function setCatalogKey(catalog: Record<string, unknown>, key: string, value: unknown): void {
   Object.defineProperty(catalog, key, { value, enumerable: true, writable: true, configurable: true });
 }
 
@@ -1352,14 +1917,12 @@ async function selectReviewPolicy(
     });
     if (!choice || choice === "back") return { maxCorrectionCycles, guidanceThreshold };
     lastKey = choice;
-    if (!ui.input) {
-      await notify(ui, "This UI does not support numeric input.", "error");
-      continue;
-    }
     const current = choice === "cycles" ? maxCorrectionCycles : guidanceThreshold;
-    const entered = await ui.input(
+    const entered = await editSettingText(
+      ui,
       choice === "cycles" ? "Automatic correction attempts" : "Concrete guidance after correction attempts",
       String(current),
+      "This UI does not support numeric input.",
     );
     if (entered === undefined) continue;
     const parsed = Number(entered.trim());
@@ -1397,14 +1960,12 @@ async function selectTimeouts(
     });
     if (!choice || choice === "back") return { reviewerTimeoutMs, executorTimeoutMs };
     lastKey = choice;
-    if (!ui.input) {
-      await notify(ui, "This UI does not support numeric input.", "error");
-      continue;
-    }
     const currentMs = choice === "reviewer" ? reviewerTimeoutMs : executorTimeoutMs;
-    const entered = await ui.input(
+    const entered = await editSettingText(
+      ui,
       choice === "reviewer" ? "Reviewer timeout in minutes" : "Executor timeout in minutes",
       String(currentMs / 60_000),
+      "This UI does not support numeric input.",
     );
     if (entered === undefined) continue;
     const minutes = Number(entered.trim());
@@ -1634,6 +2195,9 @@ function extractUi(ctx: unknown): UiContext | undefined {
   // components (issue #140).
   const ui = Object.create(ctx.ui) as UiContext;
   if (typeof ctx.mode === "string") ui.mode = ctx.mode;
+  // The session cwd anchors the workspace field's native path completion
+  // against the host's own working directory, never process.cwd (issue #26).
+  if (typeof ctx.cwd === "string") ui.cwd = ctx.cwd;
   return ui;
 }
 

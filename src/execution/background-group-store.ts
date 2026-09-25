@@ -25,6 +25,7 @@ import { createHash } from "node:crypto";
 import { readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import type { ScheduledTaskReviewOverride } from "../config";
 import { atomicWrite } from "./durable-write";
 import {
   clipActivity,
@@ -82,6 +83,27 @@ export interface BackgroundExecutionGroup {
    * session's directory and remains the correct fallback.
    */
   sessionCwd?: string;
+  /**
+   * Issue #26: the stable scheduled-task entry id that dispatched this group.
+   * Persisted so overlap detection (skip every due occurrence while a prior
+   * run of the same entry is unsettled) survives restart and recovery.
+   */
+  scheduledTaskId?: string;
+  /**
+   * Issue #26: explicit worker resource id pinned for this group's runs.
+   * Resolved against the CURRENT catalog at dispatch time (inheritance is
+   * live); a pinned id that no longer resolves fails closed with an
+   * actionable notification instead of silently falling back to global routes.
+   */
+  scheduledWorkerResourceId?: string;
+  /**
+   * Issue #26: task-local review choice frozen per run. `off` disables the
+   * subtask review stage without fabricating a PASS verdict; `selected`
+   * uses exactly the listed reviewer set (resolved at worker launch like any
+   * other subtask reviewers). Omitted means inherit the global subtask
+   * settings in force when the run launches.
+   */
+  scheduledReviewOverride?: ScheduledTaskReviewOverride;
   createdAt: string;
   updatedAt: string;
   peakConcurrency?: number;

@@ -41,6 +41,7 @@ const ROOT_SETTING_LABELS = [
   "Subtask notifications",
   "Deferred Pi tools",
   "Subtasks view",
+  "Scheduled tasks",
   "Web",
 ] as const;
 const REVIEW_SETTING_LABELS = [

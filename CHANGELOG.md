@@ -15,6 +15,119 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.81]
+
+### Added
+
+- Persist images pasted through the native editor into scheduled-task
+  instructions durably at Save: Pi's image paste inserts a path to a temporary
+  clipboard file, so Save validates the referenced file by content (PNG,
+  JPEG, GIF, or WebP, at most 10 MiB — re-bounded during the read so a source
+  that grows after the size check cannot allocate unbounded memory), copies
+  it into a private managed store next to the config file (0700 directories,
+  0600 files, fsynced; each pasted image gets its own copy, kept per task id
+  across Saves; a store root or per-task directory that is a symbolic link
+  fails Save closed and its target is never chmod'ed or written through), and
+  replaces the temporary path in the instructions with the
+  managed absolute path before the ordinary atomic config write — a later
+  scheduled run reads the managed copy even after Pi deletes its temp file.
+  Only Pi's own paste output is treated as an image: candidates are bounded
+  to `pi-clipboard-<UUID>.<png|jpg|jpeg|gif|webp>` in the OS temp directory
+  (with content validated after path recognition), so ordinary clipboard
+  text — any other absolute path, real or missing, a sentence, or `@`
+  attachment text — stays verbatim as text and Save proceeds with native
+  text-paste behavior unchanged. Provenance comes only from the bridge's
+  observation-only paste seam, each
+  observed token is verified against the final staged instructions, an
+  unobserved `pi-clipboard-...` reference (any extension or name spelling)
+  fails Save with an actionable message instead of being copied or persisted,
+  and missing, non-image, too large, or failed copies fail the Save closed
+  with the config and store untouched (Cancel copies nothing; a persistence
+  failure that already landed keeps the copies the parsed saved config
+  references). Managed assets are never auto-deleted
+  (active or other-process scheduled runs may still read them); cleanup is
+  manual, and a missing asset fails its dispatch with an actionable wake
+  instead of silently starting a run against a dead path (the dispatch scan
+  checks the platform separator and the Windows backslash spelling).
+
+- Add opt-in process-local scheduled subtasks. Define independently enabled
+  local-time cron entries in `/review-settings`, with per-entry instructions,
+  workspaces, worker routes, and task-local review choices. A Pi process starts
+  scheduling only with `--scheduler`, or after its own live settings toggle;
+  definitions stay editable while scheduling is off. Future due occurrences
+  dispatch through existing subtasks, with owner notifications and actionable
+  overlap skips rather than catch-up or cross-process deduplication.
+
+### Changed
+
+- Complete leading-`/` tokens in every extension-owned interactive text field
+  using Pi's own file provider, not slash-command suggestions; no command
+  executes. The screenshot-reported AskUserQuestion answer case (`/se` showing
+  the slash-command menu) and every typeable `/review-settings` field — not
+  only the scheduled-task Workspace directory — now share the same
+  host-wired provider decoration through the native editor bridge, with no
+  per-field opt-in switch: `/`, `/se`, `/var`, and nested absolute paths list
+  filesystem entries (or nothing for a missing path), never slash commands.
+  The same shared routing covers the staged subtask form (title,
+  instructions, acceptance criteria, relevant context, target workspace), the
+  no-argument steering instruction, and the private reviewer answer editor;
+  the main Pi chat prompt itself keeps its ordinary slash-command context.
+  The decorator preserves native relative and `~/` completion, Ctrl+C clear,
+  Ctrl+G, multiline, paste, Esc list-first, and Enter field-only settle
+  semantics. Native absolute-path lists show the first item highlighted; the
+  first Tab may only show the list, with a further Tab applying its
+  selection. Save still rejects missing or non-directory workspaces.
+
+- Accept a leading `~` or `~/...` as a scheduled-task workspace and as the
+  `SubtasksStart` workspace: settings Save and run-time dispatch both expand it
+  against the user's home through the shared Pi-native path rule, and Save
+  persists the expanded absolute spelling (runtime target realpath is separate).
+  Nonexistent or non-directory targets fail closed; unsupported tilde spellings
+  (such as `~user`) are never reinterpreted and fail closed unless a literal
+  path of that name exists; relative workspaces keep resolving against the
+  parent session's working directory.
+
+### Fixed
+
+- Fail closed when an interactive host cannot assign and verify takeover of
+  the field editor's `onSubmit`: refuse field acquisition and restore the prior
+  editor factory instead of risking a chat send on Enter. This applies to
+  settings and AskUserQuestion alike.
+
+- Make every `/review-settings` text field truly editable through one shared
+  host-wired native editor bridge: in the interactive Pi TUI each field —
+  including the scheduled-task workspace — temporarily acquires the host's own
+  main-prompt editor through the public `setEditorComponent` seam and embeds
+  that same instance in the settings surface, so the current value arrives as
+  an editable prefill and the host's native controls apply unmodified: Tab path
+  completion for relative or `~/...` paths (`docs/` + first Tab lists the
+  folders *and* files under it; a single match is applied directly, exactly as
+  in the chat editor), the fd-backed `@` file picker, Ctrl+C clear, Ctrl+G
+  external editing for long values such as scheduled-task instructions, image
+  paste, and Shift+Enter newlines. Enter submits the field's own text — never a
+  chat message — and Esc first dismisses a visible completion list, then
+  cancels, leaving the staged value unchanged; the editor remains the single
+  draft, with the chat draft restored on every open/close. The workspace-only
+  bespoke editor/provider/matcher surface is removed: there is no duplicate
+  completion algorithm or editor state. Token recognition, relative/`~`/
+  absolute handling, platform behavior, the list UI, and selection keys are
+  inherited from the host as-is, except for the shared leading-`/`
+  file suggestion routing above; no universal absolute-path or Windows support
+  is claimed. An interactive host missing the required native seams
+  fails closed with an error notice instead of presenting a non-parity
+  fallback field; non-interactive hosts keep their clearly identified chain —
+  Pi's public editor with an editable prefill first, then the legacy single-line
+  input with its old title/placeholder semantics — and a host offering neither
+  seam fails closed with an error notice instead of silently staging nothing.
+  Completion is a convenience — Save checks relative workspaces against the
+  session working directory, matching completion and dispatch, and still
+  rejects nonexistent or non-directory targets, including a file selected from
+  the list. The cron field keeps its compact heading above the editable
+  prefilled text mapping all five fields in order (minute, hour, day-of-month,
+  month, day-of-week), stating machine-local time and `* * * * * = every
+  minute`. No scheduler policy change: grammar, dispatch, no-catch-up, overlap
+  handling, choices and toggles are unchanged.
+
 ## [0.1.0-dev.80]
 
 ### Fixed

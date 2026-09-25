@@ -6,6 +6,12 @@ import test, { afterEach, beforeEach } from "node:test";
 import { activate } from "../src/index";
 import { setHostKeybindingLoader } from "../src/host-keybindings";
 import { USER_QUESTION_PANEL_KEY, pendingQuestionPanelLine, questionShortcutLabel } from "../src/user-question";
+import { setUserQuestionTuiHost } from "../src/user-question/pi-tui-host";
+import {
+  setNativeEditorHost,
+  __resetActiveNativeEditorFieldForTest,
+} from "../src/native-editor-bridge";
+import { createBridgeUi, fakeHost, type FakeBridgeEditor } from "./bridge-fakes";
 
 const indexTestConfig = {
   enabled: true,
@@ -38,7 +44,34 @@ afterEach(() => {
   if (previousRuntimeRole === undefined) delete process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
   else process.env.PI_REVIEW_GATE_RUNTIME_ROLE = previousRuntimeRole;
   setHostKeybindingLoader(undefined);
+  setNativeEditorHost(undefined);
+  setUserQuestionTuiHost(undefined);
+  __resetActiveNativeEditorFieldForTest();
 });
+
+/** Poll until the condition holds (the custom factory runs after an await hop). */
+async function until(predicate: () => boolean, ms = 1000): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > ms) throw new Error("timed out waiting for the condition");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+/** The live keybinding manager the host passes to the custom/editor factories. */
+function liveKeybindings() {
+  const table: Record<string, string[]> = {
+    "tui.input.submit": ["\r"],
+    "tui.select.up": ["\x1b[A"],
+    "tui.select.down": ["\x1b[B"],
+    "tui.select.confirm": ["\r"],
+    "tui.select.cancel": ["\x1b", "\x03"],
+    "app.interrupt": ["\x1b"],
+    "app.exit": ["\x04"],
+    "app.clear": ["\x03"],
+  };
+  return { matches: (data: string, keybinding: string) => (table[keybinding] ?? []).includes(data) };
+}
 
 interface EntrypointFixture {
   dir: string;
@@ -363,46 +396,67 @@ function fakeKeybindings() {
 test("an answer submitted from the opened list is delivered through the host user-message path", async () => {
   const fixture = await makeFixture();
   try {
+    // The production free-text path: the host-wired native editor acquired
+    // through the shared bridge before the custom slot opens.
+    const instances: FakeBridgeEditor[] = [];
+    setNativeEditorHost(fakeHost(instances));
+    setUserQuestionTuiHost({ matchesKey: () => false });
+
     await trigger(fixture.hooks, "session_start", { cwd: fixture.dir }, tuiContext(fixture));
     const tool = fixture.tools.get("AskUserQuestion");
     await tool.execute("c1", { question: "Which database?", choices: ["SQLite", "Postgres"] }, undefined, undefined, { sessionManager: fixture.sessionManager });
 
-    let openedComponent: any;
-    const custom = (factory: (...args: unknown[]) => unknown) => {
-      openedComponent = factory({}, { fg: (_c: string, t: string) => t, bold: (t: string) => t }, fakeKeybindings(), () => undefined);
-      return Promise.resolve();
-    };
     const handler = fixture.shortcuts.get("ctrl+alt+up")!.handler;
-    // Busy at submission time → steering delivery.
-    await handler({ ui: { custom }, sessionManager: fixture.sessionManager, isIdle: () => false });
-    assert.ok(openedComponent, "the list component was opened through the factory");
+    // Busy at submission time → steering delivery. The fake's driver hook
+    // captures the component once the slot's factory has run.
+    let openedComponent: any;
+    const firstUi = createBridgeUi({
+      keybindings: liveKeybindings(),
+      draft: "chat draft",
+      drivers: [(component) => {
+        openedComponent = component;
+      }],
+    });
+    const openedFirst = handler({ ui: firstUi.ui, sessionManager: fixture.sessionManager, isIdle: () => false }) as Promise<void>;
+    await until(() => instances.length === 1);
+    assert.equal(instances[0]!.getText(), "", "prepare(\"\") emptied the field after the host's draft capture");
+    await until(() => openedComponent !== undefined);
     const rendered = openedComponent.render(80).join("\n");
     assert.match(rendered, /Pending questions \(1\)/);
 
-    openedComponent.handleInput("\r"); // open answer view (first question selected)
-    openedComponent.handleInput("\x1b[B"); // row 2: Postgres
-    openedComponent.handleInput("\r"); // confirm the choice
-    await new Promise((resolvePromise) => setImmediate(resolvePromise));
+    openedComponent.handleInput!("\r"); // open answer view (first question selected)
+    openedComponent.handleInput!("\x1b[B"); // row 2: Postgres
+    openedComponent.handleInput!("\r"); // confirm the choice
+    await openedFirst;
     assert.equal(fixture.sent.length, 1);
     assert.match(fixture.sent[0]!.message, /Answer to pending question "Which database\?": Postgres/);
     assert.deepEqual(fixture.sent[0]!.options, { deliverAs: "steer" }, "busy delivery uses steering");
+    assert.equal(firstUi.state.draft, "chat draft", "the chat draft survived the round trip exactly once");
 
-    // A second question answered while idle uses the plain path.
+    // A second question answered while idle uses the plain path — free text
+    // through the embedded native field.
     await tool.execute("c2", { question: "Include raw counts?" }, undefined, undefined, { sessionManager: fixture.sessionManager });
     let openedSecond: any;
-    const customSecond = (factory: (...args: unknown[]) => unknown) => {
-      openedSecond = factory({}, { fg: (_c: string, t: string) => t, bold: (t: string) => t }, fakeKeybindings(), () => undefined);
-      return Promise.resolve();
-    };
-    await handler({ ui: { custom: customSecond }, sessionManager: fixture.sessionManager, isIdle: () => true });
-    openedSecond.handleInput("\r"); // open answer view (no choices → Type row selected)
-    openedSecond.handleInput("\r"); // start editing
-    openedSecond.handleInput("yes");
-    openedSecond.handleInput("\r"); // submit
-    await new Promise((resolvePromise) => setImmediate(resolvePromise));
+    const secondUi = createBridgeUi({
+      keybindings: liveKeybindings(),
+      draft: "",
+      drivers: [(component) => {
+        openedSecond = component;
+      }],
+    });
+    const openedSecondPromise = handler({ ui: secondUi.ui, sessionManager: fixture.sessionManager, isIdle: () => true }) as Promise<void>;
+    await until(() => instances.length === 2);
+    await until(() => openedSecond !== undefined);
+    assert.equal(instances[1]!.getText(), "", "the second field instance started empty too");
+    openedSecond.handleInput!("\r"); // open answer view (no choices → Type row selected)
+    openedSecond.handleInput!("\r"); // start editing the native field
+    for (const ch of "yes") openedSecond.handleInput!(ch); // one keypress per call
+    openedSecond.handleInput!("\r"); // submit the whole answer
+    await openedSecondPromise;
     assert.equal(fixture.sent.length, 2);
     assert.match(fixture.sent[1]!.message, /Answer to pending question "Include raw counts\?": yes/);
     assert.equal(fixture.sent[1]!.options, undefined, "idle delivery uses the plain path");
+    assert.deepEqual(secondUi.state.chatSubmits, [], "no chat message was sent from the field");
   } finally {
     await rm(fixture.dir, { recursive: true, force: true });
   }

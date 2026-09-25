@@ -275,9 +275,64 @@ function isModuleRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Resolves the actually installed pi packages. Resolution order: direct
- * package resolution (host alias or dependency), then the global pi install
- * next to the node binary, plus the common macOS Homebrew and /usr/local
+ * Test-only explicit installed-agent directory (CI sets it for the locked Pi
+ * UI runtime installed in the runner temp; never a shipped or user-specific
+ * path in tracked files). An explicitly set but invalid path must not fall
+ * back to an ambient install.
+ */
+export function explicitInstalledAgentDir(): string | undefined {
+  const requested = process.env.PI_REVIEW_GATE_INSTALLED_AGENT;
+  if (!requested) return undefined;
+  return existsSync(join(requested, "package.json")) ? requested : undefined;
+}
+
+/**
+ * Finds every root directory of an installed pi-coding-agent package (each
+ * dir containing its package.json). When PI_REVIEW_GATE_INSTALLED_AGENT is
+ * set, it is the sole candidate (already a package dir, e.g. CI's locked
+ * runtime). Otherwise, search Node's global roots (nvm, asdf, system installs
+ * at <prefix>/lib/node_modules), plus the common macOS Homebrew and
+ * /usr/local prefixes where a separately installed pi may live. A
+ * multi-install environment can hold several of these; callers should try
+ * each until one yields loadable peer modules.
+ */
+export function findInstalledAgentDirs(): string[] {
+  // The env var names the package directory, not its enclosing node_modules.
+  // Never search ambient roots when the pinned CI install was requested.
+  if (process.env.PI_REVIEW_GATE_INSTALLED_AGENT) {
+    const explicit = explicitInstalledAgentDir();
+    return explicit ? [explicit] : [];
+  }
+  const roots: string[] = [];
+  let dir = dirname(process.execPath);
+  for (let depth = 0; depth < 6; depth += 1) {
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    roots.push(join(dir, "lib", "node_modules"));
+    dir = parent;
+  }
+  roots.push("/opt/homebrew/lib/node_modules", "/usr/local/lib/node_modules");
+  const dirs: string[] = [];
+  for (const root of roots) {
+    const agentDir = join(root, "@earendil-works", "pi-coding-agent");
+    if (existsSync(join(agentDir, "package.json"))) dirs.push(agentDir);
+  }
+  return [...new Set(dirs)];
+}
+
+/**
+ * The first resolvable installed pi-coding-agent root, or undefined when
+ * none is found. Prefer {@link findInstalledAgentDirs} when a later install
+ * may be usable even though an earlier one is partial.
+ */
+export function findInstalledAgentDir(): string | undefined {
+  return findInstalledAgentDirs()[0];
+}
+
+/**
+ * Resolves the actually installed pi packages. An explicitly pinned agent
+ * is the sole source; otherwise try direct package resolution, then global
+ * installs next to the node binary, plus common macOS Homebrew and /usr/local
  * prefixes where a separately installed pi may live. Returns undefined when
  * nothing is resolvable (test skips).
  */
@@ -302,6 +357,13 @@ async function resolveRealPiModules(): Promise<RealPiModules | undefined> {
     }
   };
 
+  // An explicitly pinned install is the only candidate, including when it
+  // is missing or its peer modules cannot be loaded.
+  if (process.env.PI_REVIEW_GATE_INSTALLED_AGENT) {
+    const explicit = explicitInstalledAgentDir();
+    return explicit ? fromModules(explicit) : undefined;
+  }
+
   try {
     const tui = (await import(TUI_PACKAGE_NAME)) as Record<string, unknown>;
     if (typeof tui?.SelectList === "function" && typeof tui?.Container === "function" && typeof tui?.Text === "function") {
@@ -315,24 +377,12 @@ async function resolveRealPiModules(): Promise<RealPiModules | undefined> {
       return { tui, agent };
     }
   } catch {
-    // Not resolvable from this tree; try the global install below.
+    // Not resolvable from this tree; try the install roots below.
   }
 
-  // Node's own global root (nvm, asdf, system installs all put it at
-  // <prefix>/lib/node_modules), plus the common macOS Homebrew and /usr/local
-  // prefixes where a separately installed pi may live.
-  const roots: string[] = [];
-  let dir = dirname(process.execPath);
-  for (let depth = 0; depth < 6; depth += 1) {
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    roots.push(join(dir, "lib", "node_modules"));
-    dir = parent;
-  }
-  roots.push("/opt/homebrew/lib/node_modules", "/usr/local/lib/node_modules");
-  for (const root of roots) {
-    const agentDir = join(root, "@earendil-works", "pi-coding-agent");
-    if (!existsSync(join(agentDir, "package.json"))) continue;
+  // Try every resolvable install root: a partial or broken first candidate
+  // must not suppress a working install in a later root.
+  for (const agentDir of findInstalledAgentDirs()) {
     const modules = await fromModules(agentDir);
     if (modules) return modules;
   }

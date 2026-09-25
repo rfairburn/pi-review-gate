@@ -1,32 +1,34 @@
 /**
- * Issue #26 follow-up: native absolute-path completion for the scheduled-task
- * Workspace field, plus the fail-closed submit-takeover hardening on the
- * shared host-wired native editor bridge (src/native-editor-bridge.ts).
+ * Issue #26 follow-up: native absolute-path completion for every interactive
+ * field presented through the shared host-wired native editor bridge
+ * (src/native-editor-bridge.ts) — settings text fields of every kind and the
+ * AskUserQuestion free-text row alike — plus the fail-closed submit-takeover
+ * hardening.
  *
  * Three tiers:
  *
- * 1. Decorator contract (always runs): a scripted provider pins that an
- *    opted-in field wraps the host-provided autocomplete provider — first-line
+ * 1. Decorator contract (always runs): a scripted provider pins that every
+ *    field wraps the host-provided autocomplete provider — first-line
  *    leading-slash tokens are forced to the provider's own file branch and
  *    their returned absolute prefix is masked with a same-length neutral
  *    sentinel — while relative/`~/@` tokens, command arguments, and later
- *    lines delegate untouched; non-opted-in fields keep the host provider by
- *    identity. No second completer or matcher: generation and application
- *    stay the wrapped provider's own code.
+ *    lines delegate untouched; the decoration is unconditional, with no
+ *    per-field opt-in. No second completer or matcher: generation and
+ *    application stay the wrapped provider's own code.
  * 2. Fail-closed takeover (always runs): a nonassignable onSubmit — or one
  *    whose setter silently no-ops — fails acquisition closed (no field
  *    presented, prior factory restored, no chat send) even with no live key
  *    matcher. The old degraded Enter-interception path could reach the host's
  *    chat submitter in exactly that situation; it is gone.
  * 3. Real-host integration (installed Pi; skipped unless resolvable, enforced
- *    via PI_REVIEW_GATE_REQUIRE_PI_HOST): `/` and nested absolute paths list
- *    filesystem entries in the ordinary file-list layout — never slash
- *    commands — Enter applies a visible path selection before submitting, a
- *    nonexistent absolute path shows no command suggestions, non-opted-in
- *    fields keep the chat editor's slash-command context, relative completion
- *    is unchanged in an opted-in field, and the full /review-settings
- *    menu/Save flow stages a completed existing directory while rejecting a
- *    missing target or a file selected from the list.
+ *    via PI_REVIEW_GATE_REQUIRE_PI_HOST): `/`, `/se`, and nested absolute
+ *    paths list filesystem entries in the ordinary file-list layout — never
+ *    slash commands — in the Workspace field AND in non-Workspace settings
+ *    text fields, Enter applies a visible path selection before submitting, a
+ *    nonexistent absolute path shows no command suggestions and raw text is
+ *    submitted verbatim, relative completion is unchanged, and the full
+ *    /review-settings menu/Save flow stages a completed existing directory
+ *    while rejecting a missing target or a file selected from the list.
  */
 
 import assert from "node:assert/strict";
@@ -93,7 +95,7 @@ function scriptedProvider(): { provider: unknown; calls: ScriptedCall[] } {
 }
 
 async function openFakeField(
-  options: { absolutePathSuggestions?: boolean; provider?: unknown },
+  options: { provider?: unknown } = {},
 ): Promise<{ instance: FakeBridgeEditor; result: Awaited<ReturnType<typeof editTextWithNativeEditor>> }> {
   const instances: FakeBridgeEditor[] = [];
   setNativeEditorHost(fakeHost(instances));
@@ -105,18 +107,17 @@ async function openFakeField(
   const result = await editTextWithNativeEditor(ui, {
     title: "T",
     prefill: "",
-    ...(options.absolutePathSuggestions === true ? { absolutePathSuggestions: true } : {}),
   });
   return { instance: instances[0]!, result };
 }
 
-test("opted-in field wraps the host provider: leading-slash tokens force the file branch and mask the prefix", async (t) => {
+test("every field wraps the host provider: leading-slash tokens force the file branch and mask the prefix", async (t) => {
   const { provider, calls } = scriptedProvider();
   t.after(() => {
     setNativeEditorHost(undefined);
     __resetActiveNativeEditorFieldForTest();
   });
-  const { instance, result } = await openFakeField({ absolutePathSuggestions: true, provider });
+  const { instance, result } = await openFakeField({ provider });
   assert.equal(result.kind, "value");
 
   const wrapped = instance.provider as {
@@ -156,7 +157,7 @@ test("opted-in field wraps the host provider: leading-slash tokens force the fil
   assert.equal(instance.provider, wrapped, "a decorated provider passes through unchanged");
 });
 
-test("non-opted-in fields keep the host provider by identity", async (t) => {
+test("a second field wraps the host provider too: the decoration is unconditional, with no opt-in switch", async (t) => {
   const { provider } = scriptedProvider();
   t.after(() => {
     setNativeEditorHost(undefined);
@@ -164,7 +165,15 @@ test("non-opted-in fields keep the host provider by identity", async (t) => {
   });
   const { instance, result } = await openFakeField({ provider });
   assert.equal(result.kind, "value");
-  assert.equal(instance.provider, provider, "no wrapping without the Workspace opt-in");
+  assert.notEqual(instance.provider, provider, "wrapping needs no opt-in: every field is decorated");
+  // A first-line leading-slash token routes to the file branch in a
+  // non-Workspace field exactly as in the Workspace one.
+  const wrapped = instance.provider as {
+    getSuggestions(lines: string[], cursorLine: number, cursorCol: number, options: { signal: AbortSignal; force?: boolean }): Promise<{ items: unknown[]; prefix: string } | null>;
+  };
+  const slash = await wrapped.getSuggestions(["/se"], 0, 3, { signal: new AbortController().signal });
+  assert.equal(slash?.prefix, "\u0000se", "the leading / is masked (same length)");
+  assert.deepEqual(slash?.items, [{ value: "/var/", label: "var/" }], "the file branch answered, not the command branch");
 });
 
 // ---------------------------------------------------------------------------
@@ -259,6 +268,15 @@ const HOST_COMMANDS = [
 /** pi-tui CombinedAutocompleteProvider's public constructor surface. */
 type HostProviderCtor = new (commands: Array<{ name: string; description?: string }>, basePath: string) => unknown;
 
+/** The rendered frame with the hardware-cursor marker and ANSI styles stripped. */
+function plainFrame(component: { render?(width: number): string[] }): string {
+  return component
+    .render!(200)
+    .join("\n")
+    .replace(/\x1b_pi:c\x07/g, "")
+    .replace(/\x1b\[[0-9;]*m/g, "");
+}
+
 async function makeAbsoluteFixture(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "pi-abs-ws-"));
   await mkdir(join(root, "alpha"), { recursive: true });
@@ -301,7 +319,7 @@ test("real host: Workspace / lists filesystem directories, never slash commands"
     ],
   });
 
-  const result = await editTextWithNativeEditor(ui, { title: "Workspace", prefill: "", absolutePathSuggestions: true });
+  const result = await editTextWithNativeEditor(ui, { title: "Workspace", prefill: "" });
   assert.deepEqual(result, { kind: "cancel" });
 });
 
@@ -334,7 +352,7 @@ test("real host: Workspace /subtasks (nonexistent) shows no command suggestions;
     ],
   });
 
-  const result = await editTextWithNativeEditor(ui, { title: "Workspace", prefill: "", absolutePathSuggestions: true });
+  const result = await editTextWithNativeEditor(ui, { title: "Workspace", prefill: "" });
   assert.deepEqual(result, { kind: "value", value: "/subtasks" });
 });
 
@@ -372,11 +390,11 @@ test("real host: Workspace nested absolute path — Enter applies the visible se
     ],
   });
 
-  const result = await editTextWithNativeEditor(ui, { title: "Workspace", prefill: "", absolutePathSuggestions: true });
+  const result = await editTextWithNativeEditor(ui, { title: "Workspace", prefill: "" });
   assert.deepEqual(result, { kind: "value", value: `${root}/alpha/` });
 });
 
-test("real host: a non-opted-in field keeps the chat editor's slash-command context", async (t) => {
+test("real host: `/se` in a non-Workspace settings field never lists slash commands and submits raw text", async (t) => {
   const loaded = await loadRealBridgeHost();
   if (!loaded) {
     skipOrFail(t, "no installed Pi is resolvable in this environment");
@@ -393,10 +411,49 @@ test("real host: a non-opted-in field keeps the chat editor's slash-command cont
     provider,
     drivers: [
       async (component) => {
-        typeText(component, "/rev");
+        typeText(component, "/se");
         await settle(300);
-        const frame = component.render!(200).join("\n");
-        assert.ok(frame.includes("review-settings"), `the shared main-chat command menu is intact: ${frame}`);
+        const frame = plainFrame(component);
+        assert.ok(frame.includes("/se"), `the typed token is the draft: ${frame}`);
+        assert.ok(!frame.includes("review-settings"), `no slash-command item offered: ${frame}`);
+        assert.ok(!frame.includes("Review gate settings"), `no command description offered: ${frame}`);
+        assert.ok(!frame.includes("Host settings"), `no host command offered: ${frame}`);
+        component.handleInput?.(ENTER); // submits the raw text as the field value
+      },
+    ],
+  });
+
+  const result = await editTextWithNativeEditor(ui, { title: "Other field", prefill: "" });
+  assert.deepEqual(result, { kind: "value", value: "/se" });
+});
+
+test("real host: `/` in a non-Workspace settings field lists filesystem entries, never slash commands", async (t) => {
+  const loaded = await loadRealBridgeHost();
+  if (!loaded) {
+    skipOrFail(t, "no installed Pi is resolvable in this environment");
+    return;
+  }
+  setNativeEditorHost(loaded.host);
+  realHostAfter(t);
+
+  const keybindings = createRealKeybindingsManager(loaded.tui);
+  const provider = new (loaded.tui.CombinedAutocompleteProvider as HostProviderCtor)(HOST_COMMANDS, process.cwd());
+  const { ui } = createBridgeUi({
+    theme: REAL_IDENTITY_THEME,
+    keybindings,
+    provider,
+    drivers: [
+      async (component) => {
+        typeText(component, "/");
+        await settle(300); // the natural trigger request completes
+        const frame = plainFrame(component);
+        assert.ok(
+          /(^|\n)[ \t]*(→|  )\S+\//.test(frame),
+          `a filesystem directory entry is listed in a non-Workspace field: ${frame}`,
+        );
+        assert.ok(!frame.includes("review-settings"), `no slash-command item leaked: ${frame}`);
+        assert.ok(!frame.includes("Review gate settings"), `no command description leaked: ${frame}`);
+        assert.ok(!frame.includes("Host settings"), `no host command leaked: ${frame}`);
         component.handleInput?.(ESCAPE);
         await settle();
         component.handleInput?.(ESCAPE);
@@ -404,11 +461,11 @@ test("real host: a non-opted-in field keeps the chat editor's slash-command cont
     ],
   });
 
-  const result = await editTextWithNativeEditor(ui, { title: "Other field", prefill: "" });
+  const result = await editTextWithNativeEditor(ui, { title: "Scheduled task name", prefill: "" });
   assert.deepEqual(result, { kind: "cancel" });
 });
 
-test("real host: an opted-in field keeps native relative completion unchanged", async (t) => {
+test("real host: native relative completion is unchanged in a non-Workspace field", async (t) => {
   const loaded = await loadRealBridgeHost();
   if (!loaded) {
     skipOrFail(t, "no installed Pi is resolvable in this environment");
@@ -437,7 +494,7 @@ test("real host: an opted-in field keeps native relative completion unchanged", 
     ],
   });
 
-  const result = await editTextWithNativeEditor(ui, { title: "Workspace", prefill: "", absolutePathSuggestions: true });
+  const result = await editTextWithNativeEditor(ui, { title: "Workspace", prefill: "" });
   assert.deepEqual(result, { kind: "value", value: "alpha/" });
 });
 

@@ -21,6 +21,7 @@ import { formatTokenUsage } from "./usage";
 import type { ReviewFinding, ReviewResult } from "./schema";
 import { createReviewTransmissionMessage, deliverReviewTransmission, type ReviewTransmissionAction } from "./transmission";
 import { dispatchModelDelivery, queueModelDelivery } from "./durable-delivery";
+import { editNativeTextField, type NativeTextFieldUi } from "./native-text-field";
 
 export interface RegisterCommandsInput {
   pi: unknown;
@@ -643,13 +644,55 @@ function createCommandReviewAbort(
   };
 }
 
+/**
+ * The private reviewer answer editor (issue #26): in an interactive TUI the
+ * host's own main-prompt editor through the shared extension-field seam
+ * (native path completion for leading `/` tokens, never slash-command items);
+ * on other hosts the public multi-line editor with the answer as an editable
+ * prefill. When no editing surface exists — or the TUI's native seams are
+ * unavailable — the answer is delivered as a notice and the edit settles
+ * undefined ("cleared"), exactly as before; no non-parity fallback field is
+ * presented.
+ */
 async function showPrivateReviewerAnswer(ctx: unknown, message: string): Promise<string | undefined> {
+  const ui = nativeTextFieldUi(ctx);
+  if (ui) {
+    return editNativeTextField(ui, "review gate: reviewer answer", message, {
+      // The TUI's native editor seams are unavailable: keep the existing
+      // degraded delivery (the answer text as a notice) instead of presenting
+      // a fallback field. The edit settles undefined either way.
+      onUnavailable: async () => {
+        await sendNotice(ctx, message);
+        return undefined;
+      },
+    });
+  }
   if (isRecord(ctx) && isRecord(ctx.ui) && typeof ctx.ui.editor === "function") {
     const result = await ctx.ui.editor("review gate: reviewer answer", message);
     return typeof result === "string" ? result : undefined;
   }
   await sendNotice(ctx, message);
   return undefined;
+}
+
+/**
+ * The host UI behind an interactive-TUI command context, carried to the
+ * shared text field seam through the prototype chain (the live host object
+ * keeps members beyond this view) with the command context's run mode. Only
+ * an interactive TUI returns a surface; a stale or non-interactive context
+ * reads as none, never as available.
+ */
+function nativeTextFieldUi(ctx: unknown): NativeTextFieldUi | undefined {
+  if (!isRecord(ctx) || !isRecord(ctx.ui)) return undefined;
+  try {
+    if ((ctx as { mode?: unknown }).mode !== "tui") return undefined;
+    const ui = Object.create(ctx.ui) as NativeTextFieldUi;
+    if (typeof ctx.mode === "string") ui.mode = ctx.mode;
+    return ui;
+  } catch {
+    // A stale/invalidated context throws on property access: not interactive.
+    return undefined;
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

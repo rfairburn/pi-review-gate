@@ -687,6 +687,9 @@ interface RealFixtureOptions {
   appHandlers?: Record<string, (editor: FakeBridgeEditor) => () => void>;
   onPasteImage?: (editor: FakeBridgeEditor) => () => void;
   withProvider?: boolean;
+  /** Host slash commands to expose through the real autocomplete provider
+   * (the leak sentinel for the shared leading-`/` file routing). */
+  commands?: Array<{ name: string; description?: string }>;
   /** Registered before the field is acquired and the list opens. */
   questions?: Array<{ question: string; choices?: string[] }>;
   driver: (component: BridgeComponent, fixture: RealFixture) => void | Promise<void>;
@@ -733,7 +736,7 @@ async function makeRealFixture(options: RealFixtureOptions): Promise<RealFixture
   if (options.withProvider !== false) {
     const root = await makeDocsFixture();
     const fdPath = findFdBinary();
-    provider = new (loaded.tui.CombinedAutocompleteProvider as new (commands: never[], basePath: string, fdPath?: string) => unknown)([], root, fdPath);
+    provider = new (loaded.tui.CombinedAutocompleteProvider as new (commands: Array<{ name: string; description?: string }>, basePath: string, fdPath?: string) => unknown)(options.commands ?? [], root, fdPath);
   }
   const { ui, state } = createBridgeUi({
     theme: REAL_IDENTITY_THEME,
@@ -806,6 +809,46 @@ function plainLines(tui: Record<string, unknown>, lines: string[]): string[] {
   const marker = typeof tui.CURSOR_MARKER === "string" ? (tui.CURSOR_MARKER as string) : "\x1b_pi:c\x07";
   return lines.map((line) => line.split(marker).join(""));
 }
+
+test("real host: `/se` in the question free-text row never lists slash commands and submits raw text", async (t) => {
+  const loaded = await loadRealBridgeHost();
+  if (!loaded) {
+    skipOrFail(t, "no installed Pi is resolvable in this environment");
+    return;
+  }
+  realHostAfter(t);
+
+  const fixture = await makeRealFixture({
+    withProvider: true,
+    // The host slash-command menu the screenshot showed for `/se` in
+    // AskUserQuestion answers — the leak sentinel.
+    commands: [
+      { name: "settings", description: "Host settings" },
+      { name: "session", description: "Session commands" },
+      { name: "subtasks", description: "Background subtasks" },
+      { name: "review-settings", description: "Review gate settings" },
+    ],
+    questions: [{ question: "Which file?", choices: ["none"] }],
+    driver: async (component, fixture) => {
+      enterEditing(component);
+      typeText(component, "/se");
+      await settle(300); // the natural trigger request completes
+      const frame = plainLines(loaded.tui, component.render!(200)).join("\n");
+      assert.ok(frame.includes("/se"), `the typed token is the draft: ${frame}`);
+      assert.ok(!frame.includes("review-settings"), `no review-settings command offered: ${frame}`);
+      assert.ok(!frame.includes("Host settings"), `no host command offered: ${frame}`);
+      assert.ok(!frame.includes("Session commands"), `no session command offered: ${frame}`);
+      assert.ok(!frame.includes("Background subtasks"), `no subtasks command offered: ${frame}`);
+      component.handleInput?.(ENTER_KEY); // submits the raw text as the answer
+    },
+  });
+  if (!fixture) return; // unreachable: the host was resolved above
+
+  await fixture.settled;
+  assert.equal(fixture.sent.length, 1);
+  assert.match(fixture.sent[0]!.message, /": \/se$/);
+  assert.deepEqual(fixture.state.chatSubmits, [], "no chat message was sent");
+});
 
 test("real host: Tab path completion works in the question field; Esc dismisses first, then returns to rows", async (t) => {
   const loaded = await loadRealBridgeHost();

@@ -349,8 +349,9 @@ export function fakeHost(instances: FakeBridgeEditor[]): NativeEditorHost {
 
 // ---------------------------------------------------------------------------
 // Real-host resolution (installed Pi's CustomEditor + pi-tui)
-// Resolution prefers the explicit test-only install (PI_REVIEW_GATE_INSTALLED_AGENT,
-// set by CI for the locked runtime) through findInstalledAgentDirs; under
+// Resolution uses only the explicit test-only install when set
+// (PI_REVIEW_GATE_INSTALLED_AGENT points to the package directory in CI),
+// otherwise discovers installed agents through findInstalledAgentDirs; under
 // PI_REVIEW_GATE_REQUIRE_PI_HOST=1 a missing host fails via skipOrFail.
 // ---------------------------------------------------------------------------
 export const REAL_IDENTITY_THEME: Record<string, unknown> = {
@@ -484,7 +485,11 @@ export const typeText = (component: BridgeComponent, text: string): void => {
 /** Skip-or-fail gate: PI_REVIEW_GATE_REQUIRE_PI_HOST=1 makes a missing host a hard failure. */
 export function skipOrFail(t: { skip(message?: string): void }, message: string): void {
   if (process.env.PI_REVIEW_GATE_REQUIRE_PI_HOST === "1") {
-    throw new Error(`required Pi host unavailable: ${message}`);
+    const pinned = process.env.PI_REVIEW_GATE_INSTALLED_AGENT;
+    const hint = pinned && message.includes("no installed Pi")
+      ? ` (pinned package: ${pinned}; check its package.json, dist/index.js, and pi-tui dependency)`
+      : "";
+    throw new Error(`required Pi host unavailable: ${message}${hint}`);
   }
   t.skip(message);
 }

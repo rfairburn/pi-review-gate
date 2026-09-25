@@ -109,6 +109,14 @@ confirmed, and cancellation — at any earlier stage or at that final step — c
 neither a task nor a group. A workspace is an existing, explicitly authorized
 development checkout or Git worktree used as the group's capture and landing
 destination; each task still executes in its own managed isolated worktree.
+In the interactive Pi TUI the form's text fields open through the same shared
+native editor bridge as every other extension-owned field (issue #26): the
+host's own main-prompt editor with an editable prefill, native path completion
+for relative/`~/...` tokens, and native filesystem suggestions for first-line
+leading-`/` tokens (`/`, `/se`, a nested absolute path) — never slash-command
+items, so a nonexistent token lists nothing and no command is offered or
+executed. On non-interactive hosts the public multi-line editor (with the legacy
+single-line input behind it) is used unchanged.
 
 ## Pi worker settlement and browser ownership
 
@@ -400,7 +408,13 @@ being reviewed. Queued instructions are durable, live instructions use the adapt
 acknowledged transport, and a steer during review cancels that review and resumes the
 executor with the changed request before a fresh review. If the current adapter cannot
 steer a long-running command, the instruction waits for that next executor handoff
-instead of being reported as rejected.
+instead of being reported as rejected. The no-argument `/subtask-steer` command
+picks a task interactively and collects the instruction through the same shared
+native editor field as every other extension-owned text field (issue #26): the
+host's own main-prompt editor in the interactive Pi TUI — including the native
+filesystem suggestions for first-line leading-`/` tokens, never slash-command
+items — and the established single-line input first, editor behind a cancelled
+input, on non-interactive hosts.
 
 `SubtasksSteer` accepts an optional `interrupt` boolean (omitted or `false` preserves
 the behavior above). When `true` on a live executor turn, the adapter first aborts the

@@ -1012,20 +1012,13 @@ async function editScheduledTaskEntry(
     }
     if (choice === "workspace") {
       // One shared field surface like every other text field: in the
-      // interactive TUI the host-wired native editor bridge (native path
-      // completion included), on non-interactive hosts the public editor
-      // prefill, then the legacy input (issue #26). This field alone opts
-      // into native absolute-path completion: a first-line leading-slash
-      // token lists filesystem directories through the host's own provider —
-      // never slash commands; every other settings field keeps the shared
-      // main-chat behavior.
-      const entered = await editSettingText(
-        ui,
-        WORKSPACE_DIRECTORY_TITLE,
-        entry.workspace,
-        undefined,
-        { absolutePathSuggestions: true },
-      );
+      // interactive TUI the host-wired native editor bridge, on
+      // non-interactive hosts the public editor prefill, then the legacy
+      // input (issue #26). Native absolute-path completion is shared by
+      // every field through the bridge: a first-line leading-slash token
+      // lists filesystem directories through the host's own provider —
+      // never slash commands; the main chat prompt is untouched.
+      const entered = await editSettingText(ui, WORKSPACE_DIRECTORY_TITLE, entry.workspace);
       if (entered === undefined) continue;
       if (!entered.trim()) {
         await notify(ui, "Workspace must be a non-empty string.", "error");

@@ -60,13 +60,23 @@ dates.
 
 ### Changed
 
-- Complete leading-`/` tokens in the scheduled-task Workspace field using
-  Pi's own file provider, not slash-command suggestions; no command executes.
-  The Workspace-only provider decorator preserves native relative and `~/`
-  completion and leaves all other fields and AskUserQuestion unchanged. Native
-  absolute-path lists show the first item highlighted; the first Tab may only
-  show the list, with a further Tab applying its selection. Save still rejects
-  missing or non-directory workspaces.
+- Complete leading-`/` tokens in every extension-owned interactive text field
+  using Pi's own file provider, not slash-command suggestions; no command
+  executes. The screenshot-reported AskUserQuestion answer case (`/se` showing
+  the slash-command menu) and every typeable `/review-settings` field — not
+  only the scheduled-task Workspace directory — now share the same
+  host-wired provider decoration through the native editor bridge, with no
+  per-field opt-in switch: `/`, `/se`, `/var`, and nested absolute paths list
+  filesystem entries (or nothing for a missing path), never slash commands.
+  The same shared routing covers the staged subtask form (title,
+  instructions, acceptance criteria, relevant context, target workspace), the
+  no-argument steering instruction, and the private reviewer answer editor;
+  the main Pi chat prompt itself keeps its ordinary slash-command context.
+  The decorator preserves native relative and `~/` completion, Ctrl+C clear,
+  Ctrl+G, multiline, paste, Esc list-first, and Enter field-only settle
+  semantics. Native absolute-path lists show the first item highlighted; the
+  first Tab may only show the list, with a further Tab applying its
+  selection. Save still rejects missing or non-directory workspaces.
 
 - Accept a leading `~` or `~/...` as a scheduled-task workspace and as the
   `SubtasksStart` workspace: settings Save and run-time dispatch both expand it
@@ -101,7 +111,7 @@ dates.
   bespoke editor/provider/matcher surface is removed: there is no duplicate
   completion algorithm or editor state. Token recognition, relative/`~`/
   absolute handling, platform behavior, the list UI, and selection keys are
-  inherited from the host as-is, except for the Workspace-only leading-`/`
+  inherited from the host as-is, except for the shared leading-`/`
   file suggestion routing above; no universal absolute-path or Windows support
   is claimed. An interactive host missing the required native seams
   fails closed with an error notice instead of presenting a non-parity

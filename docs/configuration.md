@@ -934,23 +934,29 @@ clipboard surface; recognition for this persistence stays bounded to Pi's
 clipboard temp naming and this config's own managed store root.
 Enter submits the field's own text (never a chat message); Esc first dismisses a
 visible completion list, then cancels the field, leaving the staged value
-unchanged. The scheduled-task **workspace** field uses this same surface with one
-field-scoped addition: it opts into native absolute-path completion. A first-line
-token that starts with `/` and contains no space (`/`, `/var`, a nested absolute
-path) gets the host provider's own filesystem suggestions in its ordinary
-file-list layout — never slash-command items, so a nonexistent token such as
-`/subtasks` simply lists nothing instead of offering commands. No second
-completer is involved: the field decorates only the host-provided autocomplete
-provider through the public `setAutocompleteProvider` seam, forcing that
-provider's own file branch for those tokens and masking the returned prefix's
-leading slash with a same-length neutral sentinel so the editor renders the file
-list (not the two-column command layout) and applies a path (never `/command `
-text). Everything else is unchanged: relative paths, `~/...`, the fd-backed `@`
-picker, Ctrl+C clear, Ctrl+G external editing, image paste, Shift+Enter
-newlines, Esc-dismisses-the-list-first, and the chat draft all behave exactly as
-in the shared main-chat editor, and every other settings field — and
-AskUserQuestion — keeps that shared behavior unchanged, where a line starting
-with `/` remains the host editor's slash-command context. Token recognition,
+unchanged. Every editable field shares the same native absolute-path behavior
+(no per-field opt-in remains): a first-line token that starts with `/` and
+contains no space (`/`, `/se`, `/var`, a nested absolute path) gets the host
+provider's own filesystem suggestions in its ordinary file-list layout —
+never slash-command items, so a nonexistent token such as `/subtasks` simply
+lists nothing instead of offering commands, and no command can be offered or
+executed in any extension-owned field. No second completer is involved: each
+field decorates only the host-provided autocomplete provider through the
+public `setAutocompleteProvider` seam, forcing that provider's own file
+branch for those tokens and masking the returned prefix's leading slash with
+a same-length neutral sentinel so the editor renders the file list (not the
+two-column command layout) and applies a path (never `/command ` text). The
+main chat prompt itself is untouched: a line starting with `/` there keeps
+the host editor's ordinary slash-command context. Everything else is
+unchanged: relative paths, `~/...`, the fd-backed `@` picker, Ctrl+C clear,
+Ctrl+G external editing, image paste, Shift+Enter newlines,
+Esc-dismisses-the-list-first, and the chat draft all behave exactly as in
+the shared main-chat editor. This shared behavior covers every
+`/review-settings` field, every other extension-owned interactive text field
+— the staged subtask form (title, instructions, acceptance criteria,
+relevant context, target workspace), the no-argument steering instruction,
+and the private reviewer answer editor — and the AskUserQuestion free-text
+answers. Token recognition,
 relative/`~` handling, platform behavior, the list UI, and selection keys are
 inherited from the host as-is, so no universal absolute-path or Windows support
 is claimed. Two host behaviors are not preserved for absolute-path tokens through

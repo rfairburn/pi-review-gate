@@ -1,18 +1,20 @@
 /**
  * The one editable text seam for every /review-settings field (issue #26).
  *
- * Every settings text field goes through {@link editSettingText}:
+ * Every settings text field goes through {@link editSettingText}, a thin
+ * settings-shaped wrapper over the shared extension-field seam
+ * (src/native-text-field.ts):
  *
  * - Interactive Pi TUI hosts present the field through the host-wired native
  *   editor bridge (src/native-editor-bridge.ts): the host's own main-prompt
  *   editor — acquired temporarily through the public setEditorComponent seam
  *   and embedded in a non-overlay custom slot — with native Tab completion,
  *   the fd-backed `@` picker, Ctrl+C clear, Ctrl+G external editing, image
- *   paste, and an editable prefill. A field that opts in through
- *   `absolutePathSuggestions` (the scheduled-task Workspace directory)
- *   additionally gets native filesystem suggestions for first-line
- *   leading-slash tokens — `/`, `/var`, nested absolute paths — in the host's
- *   ordinary file-list layout, never slash-command items. An interactive host missing the required
+ *   paste, and an editable prefill. Every field shares the same native
+ *   absolute-path completion for first-line leading-slash tokens — `/`,
+ *   `/se`, `/var`, nested absolute paths — through the host provider's own
+ *   file branch in its ordinary file-list layout, never slash-command items.
+ *   An interactive host missing the required
  *   native seams fails closed with an error notice: no non-parity fallback
  *   field is presented in the TUI.
  * - Non-interactive hosts (RPC/print) keep their clearly identified public
@@ -27,7 +29,7 @@
  * UI.
  */
 
-import { editTextWithNativeEditor } from "../native-editor-bridge";
+import { editNativeTextField } from "../native-text-field";
 import type { NativeEditorCustomFactory, NativeEditorFactory } from "../native-editor-bridge";
 
 /** The structural UI surface the text seam needs (host ctx.ui or a mock). */
@@ -47,10 +49,6 @@ export interface SettingTextInputUi {
   getEditorComponent?(): NativeEditorFactory | undefined;
 }
 
-/** Notice for an interactive TUI whose native editor seams are missing. */
-const NATIVE_EDITOR_UNAVAILABLE_MESSAGE =
-  "The native text editor is not available in this host; the value was left unchanged.";
-
 /** Per-field options for the shared text seam. */
 export interface SettingTextInputOptions {
   /**
@@ -63,15 +61,6 @@ export interface SettingTextInputOptions {
    * reports inserts.
    */
   onHostInsert?: (text: string) => void;
-  /**
-   * Opt into native absolute-path completion for this field (the
-   * scheduled-task Workspace directory only): first-line leading-slash
-   * tokens (`/`, `/var`, nested absolute paths) get the host provider's own
-   * file suggestions in its ordinary file-list layout — never slash-command
-   * items. Forwarded to the native editor bridge; the non-interactive
-   * editor/input fallback has no such seam and ignores it.
-   */
-  absolutePathSuggestions?: boolean;
 }
 
 /**
@@ -93,25 +82,12 @@ export async function editSettingText(
   unavailableMessage = "This UI does not support text input.",
   options: SettingTextInputOptions = {},
 ): Promise<string | undefined> {
-  if (ui.mode === "tui") {
-    const result = await editTextWithNativeEditor(ui, {
-      title,
-      prefill: currentValue,
-      ...(options.onHostInsert ? { onHostInsert: options.onHostInsert } : {}),
-      ...(options.absolutePathSuggestions === true ? { absolutePathSuggestions: true } : {}),
-    });
-    if (result.kind === "value") return result.value;
-    if (result.kind === "cancel") return undefined;
-    // Interactive host without the required native seams: fail closed. The
-    // per-field unavailableMessage describes a missing input capability and
-    // does not fit here, so the standard notice names the real situation.
-    ui.notify?.(`${NATIVE_EDITOR_UNAVAILABLE_MESSAGE} (${result.reason})`, "error");
-    return undefined;
-  }
-  if (typeof ui.editor === "function") return ui.editor(title, currentValue);
-  if (typeof ui.input !== "function") {
-    ui.notify?.(unavailableMessage, "error");
-    return undefined;
-  }
-  return ui.input(title, currentValue);
+  return editNativeTextField(ui, title, currentValue, {
+    ...(options.onHostInsert ? { onHostInsert: options.onHostInsert } : {}),
+    // The per-field unavailableMessage describes a missing input capability;
+    // it applies to the non-interactive no-seam case. An interactive host
+    // without the native editor seams fails closed with the shared seam's
+    // standard notice, which names the real situation.
+    missingSeamNotice: unavailableMessage,
+  });
 }

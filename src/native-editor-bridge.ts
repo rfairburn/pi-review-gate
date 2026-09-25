@@ -79,22 +79,22 @@
  *   non-parity fallback field is presented. Non-interactive hosts keep their
  *   clearly identified public `ui.editor`/`ui.input` chain (see
  *   src/settings/text-input.ts).
- * - Absolute-path completion (opt-in): a field that passes
- *   `absolutePathSuggestions` (the scheduled-task Workspace directory) gets
- *   one field-scoped decorator over the host-provided autocomplete provider,
- *   installed by overriding the public `setAutocompleteProvider` on the
- *   field's CustomEditor subclass. For first-line leading-slash tokens with
- *   no space (`/`, `/var`, nested absolute paths) it forces the provider's
- *   own native FILE branch — never the slash-command branch — and masks the
- *   returned prefix's leading `/` with a same-length neutral sentinel, so
- *   the editor renders its ordinary file-list layout and its own
- *   applyCompletion takes the file-path branch (no `/command ` insertion).
+ * - Absolute-path completion (always on): every interactive field this
+ *   bridge presents gets one decorator over the host-provided autocomplete
+ *   provider, installed by overriding the public `setAutocompleteProvider`
+ *   on the field's CustomEditor subclass. For first-line leading-slash
+ *   tokens with no space (`/`, `/se`, `/var`, nested absolute paths) it
+ *   forces the provider's own native FILE branch — never the
+ *   slash-command branch — and masks the returned prefix's leading `/` with
+ *   a same-length neutral sentinel, so the editor renders its ordinary
+ *   file-list layout and its own applyCompletion takes the file-path branch
+ *   (no `/command ` insertion, and no command is ever offered or executed).
  *   Every other token (relative, `~/`, `@`, command arguments, later lines)
  *   delegates untouched; all suggestion generation and application stays
- *   Pi's own code — no second completer, matcher, or enumeration. All other
- *   settings fields and the question free-text row keep the host provider
- *   exactly as wired (a leading `/` there remains the chat editor's
- *   slash-command context).
+ *   Pi's own code — no second completer, matcher, or enumeration. The main
+ *   chat prompt itself is untouched: the decoration lives only on the
+ *   field's subclass while a field is open, and the host's default editor
+ *   keeps its own provider exactly as wired.
  * - Paste observation: {@link NativeEditorFieldOptions.onHostInsert} is an
  *   observation-only seam of the settings entry point. The host's native
  *   image-paste handler inserts through the editor instance's public
@@ -160,14 +160,6 @@ export interface NativeEditorFieldOptions {
    * copying; it only reports what the native handler inserted.
    */
   onHostInsert?: (text: string) => void;
-  /**
-   * Opt into native absolute-path completion for this field (the
-   * scheduled-task Workspace directory only): first-line leading-slash
-   * tokens (`/`, `/var`, nested absolute paths) get the host provider's own
-   * file suggestions in its ordinary file-list layout — never slash-command
-   * items. See the module documentation for the field-scoped decorator.
-   */
-  absolutePathSuggestions?: boolean;
 }
 
 /** The outcome of one native editor field. */
@@ -295,7 +287,7 @@ type NativeEditorCtor = new (
 ) => FieldEditorInstance;
 
 // ---------------------------------------------------------------------------
-// Field-scoped absolute-path completion (Workspace opt-in)
+// Absolute-path completion for every field (shared decoration)
 // ---------------------------------------------------------------------------
 
 /** One public pi-tui autocomplete item. */
@@ -332,7 +324,7 @@ export interface NativeAutocompleteProvider {
 }
 
 /** Marker so a re-wired provider is not decorated twice. */
-const ABSOLUTE_WORKSPACE_PROVIDER_MARKER = "pi-review-gate:absolute-workspace-provider";
+const ABSOLUTE_PATH_PROVIDER_MARKER = "pi-review-gate:absolute-path-provider";
 
 /** Same-length neutral replacement for the leading `/` of an absolute prefix. */
 const MASKED_ABSOLUTE_PREFIX_LEAD = "\u0000";
@@ -355,24 +347,26 @@ function maskAbsolutePrefixLead(prefix: string): string {
 }
 
 /**
- * Wraps the host-provided autocomplete provider for a field opted into
- * absolute-path mode (the scheduled-task Workspace). For first-line
- * leading-slash tokens it forces the provider's own native FILE branch — so
- * `/`, `/var`, and nested absolute paths list filesystem entries instead of
- * slash commands — and masks the returned prefix's leading `/` with a
- * same-length neutral sentinel. The mask keeps the editor on its ordinary
- * file-list layout (never the two-column command layout), makes its own
- * applyCompletion take the file-path branch (never the slash-command
+ * Wraps the host-provided autocomplete provider for every interactive field
+ * this bridge presents. For first-line leading-slash tokens it forces the
+ * provider's own native FILE branch — so `/`, `/se`, `/var`, and nested
+ * absolute paths list filesystem entries (or nothing for a missing path)
+ * instead of slash commands — and masks the returned prefix's leading `/`
+ * with a same-length neutral sentinel. The mask keeps the editor on its
+ * ordinary file-list layout (never the two-column command layout), makes its
+ * own applyCompletion take the file-path branch (never the slash-command
  * insertion that would stage `/command ` text), and keeps its Enter-confirm
  * from falling through to a submit right after applying. Every other token —
  * relative paths, `~/`, `@`, command arguments, later lines — delegates
  * untouched, and all suggestion generation and application stays Pi's own
- * code: no second completer, matcher, or enumeration.
+ * code: no second completer, matcher, or enumeration. The main chat prompt
+ * itself keeps its undecorated provider: only the field's instance is
+ * decorated, through the public setAutocompleteProvider seam.
  */
-function wrapAbsoluteWorkspaceProvider(provider: unknown): unknown {
+function wrapAbsolutePathProvider(provider: unknown): unknown {
   if (!isRecord(provider) || typeof provider.getSuggestions !== "function") return provider;
   const base = provider as NativeAutocompleteProvider & Record<PropertyKey, unknown>;
-  if (base[ABSOLUTE_WORKSPACE_PROVIDER_MARKER] === true) return provider;
+  if (base[ABSOLUTE_PATH_PROVIDER_MARKER] === true) return provider;
   const decorated: NativeAutocompleteProvider = {
     // Forwarded live so the editor's trigger-character setup sees exactly
     // what the host provider advertises.
@@ -398,14 +392,8 @@ function wrapAbsoluteWorkspaceProvider(provider: unknown): unknown {
     decorated.shouldTriggerFileCompletion = (lines, cursorLine, cursorCol) =>
       base.shouldTriggerFileCompletion!(lines, cursorLine, cursorCol);
   }
-  Object.defineProperty(decorated, ABSOLUTE_WORKSPACE_PROVIDER_MARKER, { value: true });
+  Object.defineProperty(decorated, ABSOLUTE_PATH_PROVIDER_MARKER, { value: true });
   return decorated;
-}
-
-/** Per-class options for the field editor subclass. */
-interface FieldEditorClassOptions {
-  /** Opt into native absolute-path completion (the Workspace field only). */
-  absolutePathSuggestions?: boolean;
 }
 
 /**
@@ -414,15 +402,14 @@ interface FieldEditorClassOptions {
  * Ctrl+D) plus the settle callback; every other keystroke — including Enter —
  * reaches Pi's own editor code, whose submit path is taken over on the
  * captured instance (acquisition fails closed when that takeover cannot be
- * assigned and verified). With `absolutePathSuggestions` the class also
- * overrides the public setAutocompleteProvider to install the field-scoped
- * absolute-path decorator ({@link wrapAbsoluteWorkspaceProvider}).
+ * assigned and verified). The class also overrides the public
+ * setAutocompleteProvider to install the absolute-path decorator
+ * ({@link wrapAbsolutePathProvider}) on every field.
  */
 function createFieldEditorClass(
   Base: NativeEditorCtor,
   resolveKeyMatcher: () => KeyMatcher | undefined,
   semantics: NativeEditorFieldSemantics,
-  options: FieldEditorClassOptions,
 ): new (tui: unknown, theme: unknown, keybindings: unknown, options?: unknown) => FieldEditorInstance {
   class FieldEditor extends Base {
     fieldActive = false;
@@ -468,30 +455,27 @@ function createFieldEditorClass(
       this.onFieldSettle?.(value);
     }
   }
-  let fieldClass = FieldEditor as unknown as new (
+  // Every field: route the host's provider attachment (and any later
+  // re-attachment) through the absolute-path decorator. The base is typed
+  // with the public pi-tui seam required (the host CustomEditor always has
+  // it) without widening the structural instance contract other consumers
+  // check against.
+  const inner = FieldEditor as unknown as new (
+    tui: unknown,
+    theme: unknown,
+    keybindings: unknown,
+    options?: unknown,
+  ) => FieldEditorInstance & { setAutocompleteProvider(provider: unknown): void };
+  const fieldClass = class AbsolutePathFieldEditor extends inner {
+    setAutocompleteProvider(provider: unknown): void {
+      super.setAutocompleteProvider(wrapAbsolutePathProvider(provider));
+    }
+  } as unknown as new (
     tui: unknown,
     theme: unknown,
     keybindings: unknown,
     options?: unknown,
   ) => FieldEditorInstance;
-  if (options.absolutePathSuggestions) {
-    // Workspace path mode only: route the host's provider attachment
-    // (and any later re-attachment) through the absolute-path decorator.
-    // The base is typed with the public pi-tui seam required (the host
-    // CustomEditor always has it) without widening the structural instance
-    // contract other consumers check against.
-    const inner = fieldClass as unknown as new (
-      tui: unknown,
-      theme: unknown,
-      keybindings: unknown,
-      options?: unknown,
-    ) => FieldEditorInstance & { setAutocompleteProvider(provider: unknown): void };
-    fieldClass = class AbsoluteWorkspaceFieldEditor extends inner {
-      setAutocompleteProvider(provider: unknown): void {
-        super.setAutocompleteProvider(wrapAbsoluteWorkspaceProvider(provider));
-      }
-    } as unknown as typeof fieldClass;
-  }
   return fieldClass;
 }
 
@@ -585,14 +569,13 @@ interface InstallResult {
  * Installs the field editor factory through the host's public seam, captures
  * the synchronously created instance, and takes the native submit path over.
  * Shared by both entry points; on failure the prior factory is restored
- * before the reason is reported. `absolutePathSuggestions` opts this one
- * field into the Workspace absolute-path completion decorator.
+ * before the reason is reported. Every field gets the shared absolute-path
+ * completion decorator (see {@link wrapAbsolutePathProvider}).
  */
 function installFieldEditor(
   ui: NativeEditorFieldUi,
   host: NativeEditorHost,
   semantics: NativeEditorFieldSemantics,
-  absolutePathSuggestions: boolean,
 ): InstallResult {
   const getEditorComponent = ui.getEditorComponent!;
   const setEditorComponent = ui.setEditorComponent!;
@@ -631,7 +614,6 @@ function installFieldEditor(
     host.CustomEditor as unknown as NativeEditorCtor,
     resolveKeyMatcher,
     semantics,
-    { absolutePathSuggestions },
   );
   let captured: FieldEditorInstance | undefined;
   const ourFactory: NativeEditorFactory = (tui, theme, keybindings) => {
@@ -800,7 +782,7 @@ export async function editTextWithNativeEditor(
     return { kind: "unavailable", reason: "a native editor field is already open" };
   }
 
-  const installed = installFieldEditor(ui, host, SETTINGS_FIELD_SEMANTICS, options.absolutePathSuggestions === true);
+  const installed = installFieldEditor(ui, host, SETTINGS_FIELD_SEMANTICS);
   if (!installed.ok || !installed.session || !installed.captured) {
     return { kind: "unavailable", reason: installed.reason ?? "installing the field editor failed" };
   }
@@ -916,9 +898,7 @@ export async function acquireNativeEditorField(
     return { kind: "unavailable", reason: "a native editor field is already open" };
   }
 
-  // The question free-text row keeps the host's shared main-chat provider
-  // behavior exactly as wired — no absolute-path opt-in.
-  const installed = installFieldEditor(ui, host, options.semantics, false);
+  const installed = installFieldEditor(ui, host, options.semantics);
   if (!installed.ok || !installed.session || !installed.captured) {
     return { kind: "unavailable", reason: installed.reason ?? "installing the field editor failed" };
   }

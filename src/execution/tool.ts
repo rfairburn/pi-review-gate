@@ -1,4 +1,6 @@
 import { deferredPiToolsEnabled, externalAgentCatalog, externalAgentSupportsExecution, resolvedWorkerResources, type ReviewGateConfig, type ScheduledTaskReviewOverride } from "../config";
+import { editNativeTextField } from "../native-text-field";
+import type { NativeEditorCustomFactory, NativeEditorFactory } from "../native-editor-bridge";
 import type { ReviewGateState } from "../state";
 import { scopedModelChoices } from "../settings/models";
 import type { ExecutionAssociationsSnapshot } from "../session-state";
@@ -166,6 +168,14 @@ interface CommandUi {
   confirm?(title: string, message: string): Promise<boolean | undefined>;
   input?(title: string, placeholder?: string): Promise<string | undefined>;
   editor?(title: string, initial?: string): Promise<string | undefined>;
+  /** Host run mode ("tui" | "rpc" | ...), carried from the command context
+   * for the shared native text field seam (issue #26). */
+  mode?: string;
+  /** Native editor bridge seams (Pi TUI hosts); delegated to the host UI. */
+  custom?(factory: NativeEditorCustomFactory): Promise<string | undefined>;
+  setEditorComponent?(factory: NativeEditorFactory | undefined): void;
+  getEditorComponent?(): NativeEditorFactory | undefined;
+  notify?(message: string, type?: "info" | "warning" | "error"): void;
 }
 
 interface NormalizedInput {
@@ -354,7 +364,11 @@ export class ExecutionToolManager {
         taskId = selected.taskId;
         const ui = commandUi(ctx);
         if (!ui?.input && !ui?.editor) throw new Error("interactive input is unavailable; use /subtask-steer <executionId> <taskId> <instruction>");
-        instruction = (await ui.input?.("Steering instruction")) ?? (await ui.editor?.("Steering instruction", "")) ?? "";
+        // The pre-bridge steering chain preserved on non-interactive hosts:
+        // the single-line input first, the editor behind a cancelled input.
+        // In an interactive TUI the shared native field seam presents the
+        // host's own editor instead (issue #26).
+        instruction = (await editNativeTextField(ui, "Steering instruction", "", { preferInputFirst: true })) ?? "";
         if (!instruction.trim()) return undefined;
       }
       return this.controller.steer({ executionId, taskId, instructions: instruction, instructionId: `user-steer-${randomUUID()}`, actor: "user" });
@@ -558,11 +572,15 @@ export class ExecutionToolManager {
     return task;
   }
 
-  /** One staged form prompt: prefers the multiline editor and falls back to a
-   * single-line input only when no editor is available, so cancelling the
-   * available prompt (undefined) is never swallowed by a fallback prompt. */
+  /** One staged form prompt through the shared extension-field seam (issue
+   * #26): in an interactive TUI the host-wired native editor bridge (the
+   * host's own main-prompt editor, with native path completion for leading
+   * `/` tokens and never slash-command items); on other hosts the multiline
+   * editor, falling back to a single-line input only when no editor is
+   * available — so cancelling the available prompt (undefined) is never
+   * swallowed by a fallback prompt. */
   private async formPrompt(ui: CommandUi, title: string): Promise<string | undefined> {
-    return ui.editor ? await ui.editor(title, "") : await ui.input?.(title);
+    return editNativeTextField(ui, title, "");
   }
 
   private register(): void {
@@ -1539,9 +1557,14 @@ function plainTextSubtaskDefinition(prompt: string): BackgroundTaskDefinition {
 }
 
 function commandUi(ctx: unknown): CommandUi | undefined {
-  return isRecord(ctx) && isRecord(ctx.ui) && typeof ctx.ui.select === "function"
-    ? ctx.ui as CommandUi
-    : undefined;
+  if (!(isRecord(ctx) && isRecord(ctx.ui) && typeof ctx.ui.select === "function")) return undefined;
+  // Delegate to the live host UI object (prototype chain) so members beyond
+  // this interface — the native editor bridge seams the shared text field
+  // seam drives — keep working, and carry the command context's run mode for
+  // the interactive-TUI guard (issue #26).
+  const ui = Object.create(ctx.ui) as CommandUi;
+  if (typeof ctx.mode === "string") ui.mode = ctx.mode;
+  return ui;
 }
 
 function words(value: string): string[] {

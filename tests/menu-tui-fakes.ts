@@ -277,7 +277,8 @@ function isModuleRecord(value: unknown): value is Record<string, unknown> {
 /**
  * Test-only explicit installed-agent directory (CI sets it for the locked Pi
  * UI runtime installed in the runner temp; never a shipped or user-specific
- * path in tracked files). When set and valid, it is preferred over discovery.
+ * path in tracked files). An explicitly set but invalid path must not fall
+ * back to an ambient install.
  */
 export function explicitInstalledAgentDir(): string | undefined {
   const requested = process.env.PI_REVIEW_GATE_INSTALLED_AGENT;
@@ -287,18 +288,22 @@ export function explicitInstalledAgentDir(): string | undefined {
 
 /**
  * Finds every root directory of an installed pi-coding-agent package (each
- * dir containing its package.json), in resolution order: the explicit
- * test-only install (PI_REVIEW_GATE_INSTALLED_AGENT, e.g. the CI-locked
- * runtime), then Node's own global roots (nvm, asdf, system installs all put
- * it at <prefix>/lib/node_modules), plus the common macOS Homebrew and
+ * dir containing its package.json). When PI_REVIEW_GATE_INSTALLED_AGENT is
+ * set, it is the sole candidate (already a package dir, e.g. CI's locked
+ * runtime). Otherwise, search Node's global roots (nvm, asdf, system installs
+ * at <prefix>/lib/node_modules), plus the common macOS Homebrew and
  * /usr/local prefixes where a separately installed pi may live. A
  * multi-install environment can hold several of these; callers should try
  * each until one yields loadable peer modules.
  */
 export function findInstalledAgentDirs(): string[] {
+  // The env var names the package directory, not its enclosing node_modules.
+  // Never search ambient roots when the pinned CI install was requested.
+  if (process.env.PI_REVIEW_GATE_INSTALLED_AGENT) {
+    const explicit = explicitInstalledAgentDir();
+    return explicit ? [explicit] : [];
+  }
   const roots: string[] = [];
-  const explicit = explicitInstalledAgentDir();
-  if (explicit) roots.push(explicit);
   let dir = dirname(process.execPath);
   for (let depth = 0; depth < 6; depth += 1) {
     const parent = dirname(dir);
@@ -325,9 +330,9 @@ export function findInstalledAgentDir(): string | undefined {
 }
 
 /**
- * Resolves the actually installed pi packages. Resolution order: direct
- * package resolution (host alias or dependency), then the global pi install
- * next to the node binary, plus the common macOS Homebrew and /usr/local
+ * Resolves the actually installed pi packages. An explicitly pinned agent
+ * is the sole source; otherwise try direct package resolution, then global
+ * installs next to the node binary, plus common macOS Homebrew and /usr/local
  * prefixes where a separately installed pi may live. Returns undefined when
  * nothing is resolvable (test skips).
  */
@@ -352,12 +357,11 @@ async function resolveRealPiModules(): Promise<RealPiModules | undefined> {
     }
   };
 
-  // The explicit test-only install wins over bare-import resolution, so a
-  // pinned CI runtime is never silently shadowed by another tree.
-  const explicit = explicitInstalledAgentDir();
-  if (explicit) {
-    const modules = await fromModules(explicit);
-    if (modules) return modules;
+  // An explicitly pinned install is the only candidate, including when it
+  // is missing or its peer modules cannot be loaded.
+  if (process.env.PI_REVIEW_GATE_INSTALLED_AGENT) {
+    const explicit = explicitInstalledAgentDir();
+    return explicit ? fromModules(explicit) : undefined;
   }
 
   try {
@@ -379,7 +383,6 @@ async function resolveRealPiModules(): Promise<RealPiModules | undefined> {
   // Try every resolvable install root: a partial or broken first candidate
   // must not suppress a working install in a later root.
   for (const agentDir of findInstalledAgentDirs()) {
-    if (agentDir === explicit) continue;
     const modules = await fromModules(agentDir);
     if (modules) return modules;
   }

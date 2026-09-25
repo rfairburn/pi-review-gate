@@ -105,12 +105,11 @@ export function registerReviewSettings(input: RegisterSettingsInput): void {
   registerHook(input.pi, "session_shutdown", () => {
     abortActiveNativeEditorField();
   });
-  input.pi.registerCommand("review-settings", {
-    description: "Configure delegated execution, deferred Pi tools, reviewers, review policy, scheduled tasks, the operating-mode cycle hotkey, web tools, and retention.",
-    handler: async (_args: string, ctx: unknown) => {
+  const openSettings = (commandName: string, initialSection: SettingsMenuInitialSection) =>
+    async (_args: string, ctx: unknown): Promise<void> => {
       const ui = extractUi(ctx);
       if (!ui) {
-        await sendNotice(ctx, "review gate: /review-settings requires an interactive selector UI");
+        await sendNotice(ctx, `review gate: /${commandName} requires an interactive selector UI`);
         return;
       }
       if (!input.configPath) {
@@ -119,12 +118,30 @@ export function registerReviewSettings(input: RegisterSettingsInput): void {
       }
       const scoped = scopedModelChoices(ctx) ?? [];
       input.onScopedModels?.(scoped.map((choice) => choice.model));
-      await runSettingsMenu({ ...input, ui, scoped });
-    },
+      await runSettingsMenu({ ...input, ui, scoped }, initialSection);
+    };
+  input.pi.registerCommand("review-settings", {
+    description: "Configure delegated execution, deferred Pi tools, reviewers, review policy, scheduled tasks, the operating-mode cycle hotkey, web tools, and retention.",
+    handler: openSettings("review-settings", "root"),
+  });
+  // Issue #190: landing shortcut into the same staged settings transaction.
+  // It opens the existing Scheduled tasks submenu immediately; Esc or Back
+  // from it lands at this same root menu, so Save changes and Cancel behave
+  // exactly as for /review-settings. No second menu, state, or save path is
+  // introduced: the shortcut stages into the one canonical catalog.
+  input.pi.registerCommand("scheduled-tasks", {
+    description: "Open the Scheduled tasks settings submenu directly; Esc or Back returns to /review-settings with the same staged Save/Cancel transaction.",
+    handler: openSettings("scheduled-tasks", "scheduled"),
   });
 }
 
-async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; scoped: ScopedModelChoice[] }): Promise<void> {
+/** Where an opened settings menu shows first (issue #190). */
+type SettingsMenuInitialSection = "root" | "scheduled";
+
+async function runSettingsMenu(
+  input: RegisterSettingsInput & { ui: UiContext; scoped: ScopedModelChoice[] },
+  initialSection: SettingsMenuInitialSection = "root",
+): Promise<void> {
   // Derived list for menu enumeration only; identity lookups go straight to
   // the canonical keyed catalog via resolvedExternalAgent.
   const agents = externalAgentCatalog(input.config);
@@ -177,6 +194,15 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
   // or entry removal discards that entry's observations; Save consumes them
   // without clearing — the menu exits after a successful save.
   const scheduledImageProvenance = new Map<string, string[]>();
+
+  // Issue #190: /scheduled-tasks lands in the existing Scheduled tasks submenu
+  // before the root. It stages into this same canonical catalog through the
+  // shared readers/writers and returns here on Esc or Back, so Save/Cancel run
+  // through the identical transaction as the ordinary entry — no duplicate
+  // scheduler UI or state.
+  if (initialSection === "scheduled") {
+    scheduledTasks = await selectScheduledTasks(input.ui, scheduledTasks, workerResources, input.config, input.scoped, agents, scheduledImageProvenance);
+  }
 
   // Caller-local last selection for this loop only: the highlighted row is
   // re-shown after every staged change so a toggle can repeat without

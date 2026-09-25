@@ -498,8 +498,13 @@ than from any fire-time computation:
 
 ### Settings behavior and process visibility
 
-Entries are created and edited under **Scheduled tasks** in `/review-settings`,
-staged like every other section behind **Save changes** / **Cancel**. Save
+Entries are created and edited under **Scheduled tasks** in `/review-settings`
+— or directly through the `/scheduled-tasks` command, which opens that same
+submenu first; Esc or **Back** from it lands at the settings root with the
+**Scheduled tasks** row highlighted, where **Save changes** / **Cancel**
+behave exactly as for the ordinary entry.
+Either way entries are staged like every other section behind **Save changes**
+/ **Cancel**. Save
 validates every entry (a real cron expression, non-empty instructions, an
 existing workspace directory — relative paths are checked against the session
 working directory and a leading `~`/`~/...` is expanded against the user's
@@ -905,6 +910,14 @@ boundaries are owned by [Web tools](web-tools.md) and
   policy changes; the popup restriction override while enabled; and local
   networks at the interactive egress broker. Saved changes apply to the live
   session without a restart; see [Web fields](#web-fields).
+
+The `/scheduled-tasks` command is a landing shortcut into this same
+transaction: it opens the **Scheduled tasks** submenu immediately, and Esc or
+**Back** from there returns to the settings root with the **Scheduled tasks**
+row highlighted — the root's own retained-selection state. It introduces no
+second menu, state, or save path — staged edits use the identical Save
+validation and persistence, and Cancel discards them exactly as for
+`/review-settings`.
 
 Re-shown menus keep your position: after a staged change (a toggle, an add, a move),
 the next display of the same menu highlights the row you last selected — even when its

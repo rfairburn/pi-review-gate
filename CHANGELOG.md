@@ -15,6 +15,22 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.82]
+
+### Added
+
+- Add a `/scheduled-tasks` landing shortcut for the scheduled-task settings:
+  in an interactive session it opens the existing **Scheduled tasks** submenu
+  of `/review-settings` immediately, and Esc or **Back** from there lands at
+  the settings root with the **Scheduled tasks** row highlighted (the root's
+  retained-selection state, rendered by the interactive Pi TUI), where
+  **Save changes** persists staged edits through the same validation and
+  persistence and **Cancel** discards them. The shortcut
+  stages into the one canonical staged catalog through its existing
+  readers/writers — no duplicate scheduler UI or state, no implicit save,
+  and no change to scheduler runtime enablement, dispatch, or the ordinary
+  `/review-settings` entry behavior (which still opens at the settings root).
+
 ## [0.1.0-dev.81]
 
 ### Added

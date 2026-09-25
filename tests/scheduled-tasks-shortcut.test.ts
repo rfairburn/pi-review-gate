@@ -4,8 +4,10 @@
  *
  * Contract under test: in an interactive session, /scheduled-tasks opens the
  * existing Scheduled tasks submenu immediately (before the settings root);
- * Esc or Back from there lands at the /review-settings root, where the same
- * Save changes persists staged edits through the existing validation and
+ * Esc or Back from there lands at the /review-settings root with the
+ * Scheduled tasks row highlighted — the root's own retained-selection state,
+ * so the ordinary route keeps its retention behavior unchanged — where the
+ * same Save changes persists staged edits through the existing validation and
  * persistence and Cancel discards them. The shortcut stages into the one
  * canonical staged catalog through the shared readers/writers — no duplicate
  * scheduler UI or state, no implicit save, and no change to the ordinary
@@ -73,6 +75,11 @@ const SCHEDULED_EDITOR_LABELS = [
   "Review",
   "Enabled",
 ] as const;
+
+/** Row index of the Scheduled tasks section in the root menu. The
+ * conditionally shown Scheduler runtime row comes after it, so this holds
+ * with or without the injected seam. */
+const SCHEDULED_ROOT_INDEX = ROOT_SETTING_LABELS.indexOf("Scheduled tasks");
 
 function alignedRow(label: string, value: string, labels: readonly string[]): string {
   const width = Math.max(...labels.map((candidate) => candidate.length));
@@ -332,8 +339,8 @@ test("TUI: /scheduled-tasks lands in the scheduled list; Esc returns to root and
       [KEY_ENTER], // list → entry (row 0)
       [...downs(7), KEY_ENTER], // editor → Enabled (row 7)
       [KEY_ESCAPE], // editor → list
-      [KEY_ESCAPE], // list → root
-      [...downs(16), KEY_ENTER], // root → Save changes (row 16)
+      [KEY_ESCAPE], // list → root (Scheduled tasks row highlighted)
+      [...downs(2), KEY_ENTER], // root → Save changes (row 16, two below the highlight)
     ]);
     setMenuTuiHost(harness.host);
     try {
@@ -347,6 +354,8 @@ test("TUI: /scheduled-tasks lands in the scheduled list; Esc returns to root and
     assert.ok(harness.frames[0]!.join("\n").includes("Scheduled tasks"), "first frame shows the Scheduled tasks submenu");
     assert.ok(harness.frames[4]!.join("\n").includes("Review settings"), "after Esc/Esc the root menu is shown");
     assert.equal(harness.initialIndexes[0], 0, "the list opens at its first row");
+    // Menus shown: list, editor, editor re-show, list, root.
+    assert.equal(harness.initialIndexes[4], SCHEDULED_ROOT_INDEX, "returning from the list highlights the Scheduled tasks root row");
     assert.equal(harness.selectCalls.length, 0, "every menu used the custom TUI surface");
     assert.equal(harness.exhausted(), false);
 
@@ -384,6 +393,108 @@ test("TUI: /scheduled-tasks Esc lands at root and a second Esc exits without sav
   }
 });
 
+test("TUI: /scheduled-tasks Esc from the list highlights the Scheduled tasks root row", async () => {
+  const { dir, configPath, config, before } = await makeFixture();
+  try {
+    const registered = makeHarness();
+    const runtimeToggles: boolean[] = [];
+    registerReviewSettings({
+      pi: registered.pi,
+      config,
+      configPath,
+      schedulerRuntime: { enabled: false, setEnabled(next) { runtimeToggles.push(next); } },
+    });
+    const shortcut = registered.handlers.get("scheduled-tasks")!;
+    const harness = createTuiSettingsContext([
+      [KEY_ESCAPE], // list → root (Esc)
+      [KEY_ESCAPE], // root → exit (discard)
+    ]);
+    setMenuTuiHost(harness.host);
+    try {
+      await shortcut("", harness.context);
+    } finally {
+      setMenuTuiHost(undefined);
+    }
+
+    assert.equal(harness.lists.length, 2);
+    assert.equal(harness.initialIndexes[0], 0, "the list opens at its first row");
+    assert.equal(harness.initialIndexes[1], SCHEDULED_ROOT_INDEX, "Esc return preselects the Scheduled tasks root row");
+    const selectedLines = harness.frames[1]!.filter((line) => line.startsWith("→ "));
+    assert.equal(selectedLines.length, 1, `exactly one highlighted root row:\n${harness.frames[1]!.join("\n")}`);
+    assert.ok(selectedLines[0]!.includes("Scheduled tasks"), `the highlighted row is Scheduled tasks: ${selectedLines[0]}`);
+    assert.equal(harness.exhausted(), false);
+    assert.deepEqual(runtimeToggles, [], "opening and backing out does not touch the scheduler runtime");
+    assert.equal(await readFile(configPath, "utf8"), before, "backing out writes nothing");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("TUI: /scheduled-tasks Back from the list highlights the Scheduled tasks root row", async () => {
+  const { dir, configPath, config, before } = await makeFixture();
+  try {
+    const registered = makeHarness();
+    const runtimeToggles: boolean[] = [];
+    registerReviewSettings({
+      pi: registered.pi,
+      config,
+      configPath,
+      schedulerRuntime: { enabled: false, setEnabled(next) { runtimeToggles.push(next); } },
+    });
+    const shortcut = registered.handlers.get("scheduled-tasks")!;
+    const harness = createTuiSettingsContext([
+      [...downs(2), KEY_ENTER], // list → Back (rows: entry, Add scheduled task, Back)
+      [KEY_ESCAPE], // root → exit (discard)
+    ]);
+    setMenuTuiHost(harness.host);
+    try {
+      await shortcut("", harness.context);
+    } finally {
+      setMenuTuiHost(undefined);
+    }
+
+    assert.equal(harness.lists.length, 2);
+    assert.equal(harness.initialIndexes[0], 0, "the list opens at its first row");
+    assert.equal(harness.initialIndexes[1], SCHEDULED_ROOT_INDEX, "Back return preselects the Scheduled tasks root row");
+    const selectedLines = harness.frames[1]!.filter((line) => line.startsWith("→ "));
+    assert.equal(selectedLines.length, 1, `exactly one highlighted root row:\n${harness.frames[1]!.join("\n")}`);
+    assert.ok(selectedLines[0]!.includes("Scheduled tasks"), `the highlighted row is Scheduled tasks: ${selectedLines[0]}`);
+    assert.equal(harness.exhausted(), false);
+    assert.deepEqual(runtimeToggles, [], "opening and backing out does not touch the scheduler runtime");
+    assert.equal(await readFile(configPath, "utf8"), before, "backing out writes nothing");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("TUI: /review-settings still opens at the root head and retains the Scheduled tasks row on return", async () => {
+  const { dir, configPath, config } = await makeFixture();
+  try {
+    const registered = makeHarness();
+    registerReviewSettings({ pi: registered.pi, config, configPath });
+    const handler = registered.handlers.get("review-settings")!;
+    const harness = createTuiSettingsContext([
+      [...downs(SCHEDULED_ROOT_INDEX), KEY_ENTER], // root → Scheduled tasks
+      [KEY_ESCAPE], // list → root (retained)
+      [KEY_ESCAPE], // root → exit (discard)
+    ]);
+    setMenuTuiHost(harness.host);
+    try {
+      await handler("", harness.context);
+    } finally {
+      setMenuTuiHost(undefined);
+    }
+
+    assert.equal(harness.lists.length, 3);
+    assert.equal(harness.initialIndexes[0], 0, "the ordinary entry opens at the root head");
+    assert.equal(harness.initialIndexes[1], 0, "the list opens at its first row");
+    assert.equal(harness.initialIndexes[2], SCHEDULED_ROOT_INDEX, "returning from Scheduled tasks keeps its root row highlighted");
+    assert.equal(harness.exhausted(), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("installed Pi host: /scheduled-tasks lands in the scheduled list and saves through the real SelectList", async (t) => {
   const host = await loadRealMenuTuiHost();
   if (!host) {
@@ -399,8 +510,8 @@ test("installed Pi host: /scheduled-tasks lands in the scheduled list and saves 
       [KEY_ENTER], // list → entry (row 0)
       [...downs(7), KEY_ENTER], // editor → Enabled (row 7)
       [KEY_ESCAPE], // editor → list
-      [KEY_ESCAPE], // list → root
-      [...downs(16), KEY_ENTER], // root → Save changes (row 16)
+      [KEY_ESCAPE], // list → root (Scheduled tasks row highlighted)
+      [...downs(2), KEY_ENTER], // root → Save changes (row 16, two below the highlight)
     ]);
     setMenuTuiHost(host);
     try {
@@ -418,5 +529,48 @@ test("installed Pi host: /scheduled-tasks lands in the scheduled list and saves 
     assert.equal(saved.scheduledTasks[ENTRY_ID].enabled, false);
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// The real SelectList renders the selected row with the component's own
+// "→ " prefix (unselected rows get two spaces); strip ANSI styling first so
+// a host-provided colored theme cannot hide the prefix.
+const PLAIN_LINE = (line: string): string => line.replace(/\u001b\[[0-9;]*m/g, "");
+
+test("installed Pi host: /scheduled-tasks Esc and Back from the list highlight the Scheduled tasks root row", async (t) => {
+  const host = await loadRealMenuTuiHost();
+  if (!host) {
+    t.skip("no installed pi-tui resolvable in this environment");
+    return;
+  }
+  // Both return paths through the real SelectList: Esc and Back.
+  const firstSteps: Array<[string, string[]]> = [
+    ["Esc", [KEY_ESCAPE]],
+    ["Back", [...downs(2), KEY_ENTER]], // list rows: entry, Add scheduled task, Back
+  ];
+  for (const [name, firstStep] of firstSteps) {
+    const { dir, configPath, config } = await makeFixture();
+    try {
+      const registered = makeHarness();
+      registerReviewSettings({ pi: registered.pi, config, configPath });
+      const shortcut = registered.handlers.get("scheduled-tasks")!;
+      const harness = createTuiSettingsContext([firstStep, [KEY_ESCAPE]]);
+      setMenuTuiHost(host);
+      try {
+        await shortcut("", harness.context);
+      } finally {
+        setMenuTuiHost(undefined);
+      }
+
+      // The real component renders through frames (harness.lists collects fake
+      // instances only), so the preselection is proven from the root frame.
+      const rootFrame = harness.frames[1]!;
+      assert.ok(rootFrame.join("\n").includes("Review settings"), `${name}: second frame is the root menu`);
+      const selectedLines = rootFrame.map(PLAIN_LINE).filter((line) => line.startsWith("→ "));
+      assert.equal(selectedLines.length, 1, `${name}: exactly one highlighted root row:\n${rootFrame.join("\n")}`);
+      assert.ok(selectedLines[0]!.includes("Scheduled tasks"), `${name}: the highlighted row is Scheduled tasks: ${selectedLines[0]}`);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   }
 });

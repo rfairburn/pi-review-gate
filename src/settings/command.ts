@@ -207,7 +207,11 @@ async function runSettingsMenu(
   // Caller-local last selection for this loop only: the highlighted row is
   // re-shown after every staged change so a toggle can repeat without
   // navigating back to the top (issue #140). UI-only state, never persisted.
-  let rootLastKey: string | undefined;
+  // The /scheduled-tasks shortcut returns here from the Scheduled tasks
+  // submenu on Esc or Back (issue #190), so its first root show highlights
+  // the row the user just left instead of the menu head; the ordinary
+  // /review-settings entry still opens at the head.
+  let rootLastKey: string | undefined = initialSection === "scheduled" ? "scheduled" : undefined;
   while (true) {
     const totalReviewerChoices = input.scoped.length + agents.filter(externalAgentSupportsReview).length;
     const layerSummary = (enabled: boolean, reviewers: ActiveReviewerSelection[]): string =>

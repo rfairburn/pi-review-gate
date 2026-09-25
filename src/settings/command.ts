@@ -47,13 +47,13 @@ import {
 import { expandHomePath } from "../apply-patch/paths";
 import { parseCronExpression } from "../scheduling/cron";
 import { OPERATING_MODE_LABELS } from "../operating-mode";
-import { sendNotice } from "../pi";
+import { registerHook, sendNotice } from "../pi";
+import { abortActiveNativeEditorField } from "../native-editor-bridge";
 import { findOccupiedHostBindings } from "../host-keybindings";
 import { retainedSelect, type MenuCustomFactory } from "./menu";
 import { scopedModelChoices, type ScopedModelChoice } from "./models";
 import { persistReviewSettings, replaceConfig } from "./persistence";
 import { editSettingText } from "./text-input";
-import { editWorkspaceDirectory } from "./workspace-editor";
 
 interface RegisterSettingsInput {
   pi: unknown;
@@ -92,6 +92,14 @@ interface UiContext {
 
 export function registerReviewSettings(input: RegisterSettingsInput): void {
   if (!isRecord(input.pi) || typeof input.pi.registerCommand !== "function") return;
+  // Session reset (/new, /resume, quit/fork) fires session_shutdown before the
+  // host clears its editor slot; settle any open native editor field as a
+  // cancel so it neither hangs nor leaks partial text into the next session's
+  // chat draft (issue #26). On /reload the host clears the slot first and the
+  // abort only prevents a hang — see src/native-editor-bridge.ts.
+  registerHook(input.pi, "session_shutdown", () => {
+    abortActiveNativeEditorField();
+  });
   input.pi.registerCommand("review-settings", {
     description: "Configure delegated execution, deferred Pi tools, reviewers, review policy, scheduled tasks, the operating-mode cycle hotkey, web tools, and retention.",
     handler: async (_args: string, ctx: unknown) => {
@@ -772,6 +780,9 @@ function generateScheduledTaskId(catalog: ScheduledTaskCatalog): string {
   return id;
 }
 
+/** Title shared by every surface of the scheduled-task workspace field. */
+const WORKSPACE_DIRECTORY_TITLE = "Authorized target workspace directory";
+
 /**
  * Cron editor title (issue #26): a compact heading rendered above the
  * editable prefilled cron text that maps all five fields in order, states
@@ -925,8 +936,8 @@ async function editScheduledTaskEntry(
       continue;
     }
     if (choice === "instructions") {
-      // Ordinary field: the public Pi editor seam (native controls including
-      // Ctrl+G external editing), never a bespoke surface (issue #26).
+      // Shared host-wired editor in the TUI, non-interactive editor fallback;
+      // the same seam as every other typed settings field (issue #26).
       const entered = await editSettingText(ui, "Instructions for the scheduled subtask", entry.instructions);
       if (entered === undefined) continue;
       if (!entered.trim()) {
@@ -937,11 +948,11 @@ async function editScheduledTaskEntry(
       continue;
     }
     if (choice === "workspace") {
-      // The one field with a bespoke surface: an embedded host editor with
-      // Pi's native path completion anchored to the session cwd when the
-      // interactive TUI offers it, then the public editor prefill, then the
-      // legacy input (issue #26).
-      const entered = await editWorkspaceDirectory(ui, entry.workspace);
+      // One shared field surface like every other text field: in the
+      // interactive TUI the host-wired native editor bridge (native path
+      // completion included), on non-interactive hosts the public editor
+      // prefill, then the legacy input (issue #26).
+      const entered = await editSettingText(ui, WORKSPACE_DIRECTORY_TITLE, entry.workspace);
       if (entered === undefined) continue;
       if (!entered.trim()) {
         await notify(ui, "Workspace must be a non-empty string.", "error");

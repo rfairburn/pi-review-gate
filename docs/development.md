@@ -69,6 +69,16 @@ The complete suite (`npm run test:run`) executes up to four test files concurren
   `@earendil-works/pi-agent-core@0.87.0`, which needs Node >=22.19; the model stream is
   mocked, with no live model calls). Without it the test skips itself. See
   [Web tools](web-tools.md#interactive-browser).
+- **Optional: an installed Pi** (`@earendil-works/pi-coding-agent` plus its pi-tui
+  peer, resolved from the node binary's install tree or the common global locations)
+  enables the real-host tier of `tests/native-editor-bridge.test.ts` and the
+  scheduled-workspace flow test: they drive the installed Pi's actual `CustomEditor`
+  headlessly (Tab path completion, the fd-backed `@` picker, Ctrl+C clear, Ctrl+G
+  external editing, image paste, Shift+Enter newlines, draft survival). Without a
+  resolvable install those tests skip themselves; in an environment that has Pi,
+  set `PI_REVIEW_GATE_REQUIRE_PI_HOST=1` to turn those skips into hard failures.
+  The `@` picker test additionally needs `fd` on `PATH` and skips with a note when it
+  is absent.
 - **`python3` is not needed by the test suite**: DDGS interactions are mocked. In the
   runtime, Python is used only by `WebSearch` — launch-time venv creation/validation via
   `scripts/ensure-ddgs.sh` plus one Python process per search

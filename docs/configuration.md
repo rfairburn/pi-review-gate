@@ -829,30 +829,32 @@ installation when ordinary package-name loading is unavailable. Hosts without a 
 keep the plain selector that opens at the first row; retention is TUI-only, with no GUI
 planned.
 
-Text fields open in Pi's public editor surface with their current value as an
-editable prefill, so an existing value can be read, selected, and rewritten in
-place; native editing controls apply, including Ctrl+G external editing for long
-values such as scheduled-task instructions. Cancel leaves the staged value
-unchanged. Hosts without an editor keep the previous single-line input with its
-placeholder semantics, and a host offering neither seam reports an error instead
-of staging anything. In the interactive Pi TUI, the scheduled-task **workspace**
-field additionally embeds the host's own editor with Pi's native path
-completion: typing a relative or `~/...` path and pressing Tab opens the
-host's own selectable list (a single match is applied directly, exactly as in
-the chat editor) — for example, `docs/` + first Tab lists the
-folders *and* files under it — navigated with the host's standard selection
-keys. Token recognition, relative/`~`/absolute handling, platform behavior,
-the list UI, and selection keys are inherited from the host as-is, so no
-universal absolute-path or Windows support is claimed: a line starting with
-`/` remains the host editor's slash-command context, and completion there
-follows the host chat editor's own behavior. Enter submits the editor's own
-text; Esc first dismisses a visible completion list, then cancels the field.
-Hosts without the host editor or its native provider (or without working
-public completion seams) keep the public editor prefill above, then the legacy
-single-line input. Completion is a convenience — Save validates the workspace
-against the same session working directory used for relative completion and
-dispatch, and rejects nonexistent or non-directory targets, including a file
-selected from the list. The cron field shows
+In the interactive Pi TUI every text field opens as the host's own main-prompt
+editor: the extension temporarily acquires that editor through Pi's public
+`setEditorComponent` seam and embeds the same instance in the settings surface,
+so the current value arrives as an editable prefill and all of the host's native
+controls apply unmodified — Tab path completion for relative or `~/...` paths
+(typing `docs/` + Tab opens the host's own selectable list of folders *and*
+files; a single match is applied directly, exactly as in the chat editor), the
+fd-backed `@` file picker, Ctrl+C clear, Ctrl+G external editing for long values
+such as scheduled-task instructions, image paste, and Shift+Enter newlines.
+Enter submits the field's own text (never a chat message); Esc first dismisses a
+visible completion list, then cancels the field, leaving the staged value
+unchanged. The scheduled-task **workspace** field uses this same surface — there
+is no workspace-only editor or completion wiring of its own. Token recognition,
+relative/`~`/absolute handling, platform behavior, the list UI, and selection
+keys are inherited from the host as-is, so no universal absolute-path or Windows
+support is claimed: a line starting with `/` remains the host editor's
+slash-command context, and completion there follows the host chat editor's own
+behavior. An interactive host missing the required native seams fails closed
+with an error notice instead of presenting a non-parity fallback field.
+Completion is a convenience — Save validates the workspace against the same
+session working directory used for relative completion and dispatch, and rejects
+nonexistent or non-directory targets, including a file selected from the list.
+Non-interactive hosts (RPC/print) keep their clearly identified chain: Pi's
+public editor with the current value as an editable prefill first, then the
+legacy single-line input with its placeholder semantics; a host offering neither
+seam reports an error instead of staging anything. The cron field shows
 a compact heading above its editable prefilled text mapping all five fields in
 order (minute, hour, day-of-month, month, day-of-week), stating machine-local
 time and `* * * * * = every minute`.

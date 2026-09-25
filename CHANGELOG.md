@@ -40,37 +40,39 @@ dates.
 
 ### Fixed
 
-- Make every `/review-settings` text field truly editable: each field now opens
-  in Pi's public editor surface with its current value as an editable prefill —
-  native editing controls, including Ctrl+G external editing for long values
-  such as scheduled-task instructions — and cancel still leaves the staged value
-  unchanged. Hosts without an editor keep the previous input fallback with its
-  old title/placeholder semantics, and a host offering neither seam fails closed
-  with an error notice instead of silently staging nothing. The scheduled-task
-  workspace field additionally embeds the host's own editor in the interactive
-  TUI (host-provided pi-tui through the shared peer loader; no private Pi
-  member) with Pi's native path completion instead of a bespoke one: the host
-  module's own `CombinedAutocompleteProvider` is attached through the public
-  editor seam, anchored to the session working directory, so typing a relative
-  or `~/...` path and pressing Tab opens the host's own selectable list (a
-  single match is applied directly, exactly as in the chat editor) — `docs/`
-  + first Tab lists the folders *and* files under it — navigated with
-  the host's standard selection keys. Token recognition, relative/`~`/absolute
-  handling, platform behavior, the list UI, and selection keys are inherited
-  from the host as-is (a line starting with `/` remains the host editor's
-  slash-command context, so no universal absolute-path or Windows support is
-  claimed), and the editor remains the single draft. Esc first dismisses a
-  visible completion list, then cancels the field; hosts without the host
-  editor or its native provider (or without working public completion seams)
-  fall back to the public editor prefill above, then the legacy input.
+- Make every `/review-settings` text field truly editable through one shared
+  host-wired native editor bridge: in the interactive Pi TUI each field —
+  including the scheduled-task workspace — temporarily acquires the host's own
+  main-prompt editor through the public `setEditorComponent` seam and embeds
+  that same instance in the settings surface, so the current value arrives as
+  an editable prefill and the host's native controls apply unmodified: Tab path
+  completion for relative or `~/...` paths (`docs/` + first Tab lists the
+  folders *and* files under it; a single match is applied directly, exactly as
+  in the chat editor), the fd-backed `@` file picker, Ctrl+C clear, Ctrl+G
+  external editing for long values such as scheduled-task instructions, image
+  paste, and Shift+Enter newlines. Enter submits the field's own text — never a
+  chat message — and Esc first dismisses a visible completion list, then
+  cancels, leaving the staged value unchanged; the editor remains the single
+  draft, with the chat draft restored on every open/close. The workspace-only
+  bespoke editor/provider/matcher surface is removed: there is no duplicate
+  completion algorithm or editor state. Token recognition, relative/`~`/
+  absolute handling, platform behavior, the list UI, and selection keys are
+  inherited from the host as-is (a line starting with `/` remains the host
+  editor's slash-command context, so no universal absolute-path or Windows
+  support is claimed). An interactive host missing the required native seams
+  fails closed with an error notice instead of presenting a non-parity
+  fallback field; non-interactive hosts keep their clearly identified chain —
+  Pi's public editor with an editable prefill first, then the legacy single-line
+  input with its old title/placeholder semantics — and a host offering neither
+  seam fails closed with an error notice instead of silently staging nothing.
   Completion is a convenience — Save checks relative workspaces against the
   session working directory, matching completion and dispatch, and still
-  rejects nonexistent or non-directory targets, including a file selected
-  from the list. The cron field shows a compact heading above the
-  editable prefilled text mapping all five fields in order (minute, hour,
-  day-of-month, month, day-of-week), stating machine-local time and
-  `* * * * * = every minute`. No scheduler policy change: grammar, dispatch,
-  no-catch-up, overlap handling, choices and toggles are unchanged.
+  rejects nonexistent or non-directory targets, including a file selected from
+  the list. The cron field keeps its compact heading above the editable
+  prefilled text mapping all five fields in order (minute, hour, day-of-month,
+  month, day-of-week), stating machine-local time and `* * * * * = every
+  minute`. No scheduler policy change: grammar, dispatch, no-catch-up, overlap
+  handling, choices and toggles are unchanged.
 
 ## [0.1.0-dev.80]
 

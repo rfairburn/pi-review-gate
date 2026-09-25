@@ -3,21 +3,14 @@
  *
  * Pins the agreed UI correction at the seam level:
  *
- * - All twelve former `ui.input(title, placeholder)` seams now go through Pi's
- *   public `ctx.ui.editor(title, currentValue)` when the host offers it: the
- *   current value arrives as an *editable prefill* (asserted per field), a
- *   submitted value stages exactly like before, and cancel (`undefined`)
- *   leaves the staged value unchanged.
- * - Without an editor the legacy `ui.input` fallback keeps its old
- *   title/placeholder semantics byte-for-byte.
- * - A host with neither seam fails closed: an error notice, nothing staged.
- * - The cron field shows the compact heading above the editable prefilled
- *   text: all five fields in order, machine-local time, and
- *   `* * * * * = every minute`.
- * - Scheduled instructions (and every ordinary field) use the public editor
- *   seam even in an interactive TUI — that is where the host provides native
- *   controls such as Ctrl+G external editing; no bespoke surface or private
- *   Pi member stands in for it.
+ * - In an interactive TUI all twelve text fields use the shared host-wired
+ *   main-editor bridge, including scheduled instructions and workspace. The
+ *   bridge tests exercise native keys; these command tests check staging.
+ * - Non-interactive hosts prefer `ctx.ui.editor(title, currentValue)` with an
+ *   editable prefill, then the legacy `ui.input` placeholder fallback. Cancel
+ *   leaves the staged value unchanged; a host without input fails closed.
+ * - The cron field shows the five-field machine-local heading above its
+ *   editable prefill, including `* * * * * = every minute`.
  */
 
 import assert from "node:assert/strict";
@@ -28,7 +21,22 @@ import test from "node:test";
 import { normalizeConfig } from "../src/config";
 import { registerReviewSettings } from "../src/settings/command";
 import { setMenuTuiHost } from "../src/settings/menu";
-import { createFakeMenuTuiHost, IDENTITY_THEME } from "./menu-tui-fakes";
+import {
+  __resetActiveNativeEditorFieldForTest,
+  setNativeEditorHost,
+  setNativeEditorHostEntryProvider as setNativeEditorHostEntryProviderForTest,
+} from "../src/native-editor-bridge";
+import { KEY_DOWN, KEY_ENTER, createFakeMenuTuiHost } from "./menu-tui-fakes";
+import {
+  CTRL_U,
+  ENTER,
+  ESCAPE,
+  createBridgeUi,
+  fakeHost,
+  fakeKeybindingsManager,
+  typeText,
+} from "./bridge-fakes";
+import type { FakeBridgeEditor } from "./bridge-fakes";
 
 // ---------------------------------------------------------------------------
 // Aligned row helpers (must mirror the menu's alignedSettingsRows rendering)
@@ -439,73 +447,121 @@ test("cancel in the cron editor keeps the staged schedule", async () => {
   assert.equal(saved.scheduledTasks["task-abcdef12"].cron, "30 2 * * *");
 });
 
-test("scheduled instructions use the public editor seam (the host's Ctrl+G path), never a custom surface", async (t) => {
-  const fakeHost = createFakeMenuTuiHost();
-  setMenuTuiHost(fakeHost);
-  t.after(() => setMenuTuiHost(undefined));
+function tuiFlowContext(steps: Array<(component: { render?(width: number): string[]; handleInput?(data: string): void }) => void | Promise<void>>): {
+  ctx: unknown;
+  editorCalls: Array<{ title: string; prefill?: string }>;
+  notifyCalls: Array<{ message: string; type?: string }>;
+  customCount(): number;
+} {
+  const { ui } = createBridgeUi({ keybindings: fakeKeybindingsManager(), draft: "chat draft", drivers: steps });
+  const editorCalls: Array<{ title: string; prefill?: string }> = [];
+  const notifyCalls: Array<{ message: string; type?: string }> = [];
+  let customCount = 0;
+  const wrapped = {
+    ...ui,
+    custom(factory: Parameters<NonNullable<typeof ui.custom>>[0]): Promise<string | undefined> {
+      customCount += 1;
+      return ui.custom!(factory);
+    },
+    async select(): Promise<string | undefined> {
+      throw new Error("plain select must not be used in TUI mode with a loadable host");
+    },
+    async editor(title: string, prefill?: string): Promise<string | undefined> {
+      editorCalls.push({ title, prefill });
+      return undefined;
+    },
+    notify(message: string, type?: string): void {
+      notifyCalls.push({ message, type });
+    },
+  };
+  return { ctx: { mode: "tui", scopedModels: [], ui: wrapped }, editorCalls, notifyCalls, customCount: () => customCount };
+}
+
+const tuiKeys = (...sequence: string[]): ((component: { handleInput?(data: string): void }) => void) => (component) => {
+  for (const key of sequence) component.handleInput?.(key);
+};
+
+test("in the interactive TUI a text field opens through the native editor bridge, never a second draft surface", async (t) => {
+  const instances: FakeBridgeEditor[] = [];
+  const menuHost = createFakeMenuTuiHost();
+  setMenuTuiHost(menuHost);
+  setNativeEditorHost(fakeHost(instances));
+  t.after(() => {
+    setMenuTuiHost(undefined);
+    setNativeEditorHost(undefined);
+    __resetActiveNativeEditorFieldForTest();
+  });
 
   const { configPath } = await writeScheduledConfig();
   const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
   const registered = commandHarness();
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
-  // Interactive TUI context: menus render through ui.custom (fake host), but
-  // the instructions field must still open through the public ui.editor —
-  // that is where the host provides native controls such as Ctrl+G external
-  // editing. A custom component for this ordinary field would be a regression.
-  const KEY_DOWN = "\x1b[B";
-  const KEY_ENTER = "\r";
-  const editorCalls: Array<{ title: string; prefill?: string }> = [];
-  let customCount = 0;
-  let editorIndex = 0;
-  const steps: string[][] = [
-    // Root menu (16 sections): navigate to Scheduled tasks (index 14).
-    [...Array(14).fill(KEY_DOWN), KEY_ENTER],
-    // Scheduled list: row 0 is the task entry.
-    [KEY_ENTER],
-    // Entry editor: rows Name(0) cron(1) kind(2) instructions(3).
-    [KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER],
-    // Entry editor re-show (highlighted on instructions, row 3): Back is row 9.
-    [...Array(6).fill(KEY_DOWN), KEY_ENTER],
-    // Scheduled list re-show (entry row 0, Add row 1): Back is row 2.
-    [KEY_DOWN, KEY_DOWN, KEY_ENTER],
-    // Root re-show (highlighted on scheduled, index 14): Save is row 16.
-    [KEY_DOWN, KEY_DOWN, KEY_ENTER],
-  ];
-  let stepIndex = 0;
-  const ctx = {
-    mode: "tui",
-    scopedModels: [],
-    ui: {
-      custom(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: string | undefined) => void) => unknown): Promise<string | undefined> {
-        customCount += 1;
-        return new Promise<string | undefined>((resolve) => {
-          const component = factory({ requestRender(): void {} }, IDENTITY_THEME, null, resolve) as {
-            render?(width: number): string[];
-            handleInput?(data: string): void;
-          };
-          component.render?.(80);
-          for (const key of steps[stepIndex++] ?? []) component.handleInput?.(key);
-        });
-      },
-      async select() {
-        throw new Error("plain select must not be used in TUI mode with a loadable host");
-      },
-      async editor(title: string, prefill?: string) {
-        editorCalls.push({ title, prefill });
-        return ["Rewritten instructions"][editorIndex++];
-      },
-      notify() {},
+  // Interactive TUI context: menus render through ui.custom (fake host) and
+  // the instructions field opens through the host-wired native editor bridge
+  // — the same embedded host editor every other text field uses. The public
+  // ui.editor chain is a non-interactive fallback only.
+  const harness = tuiFlowContext([
+    tuiKeys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
+    tuiKeys(KEY_ENTER), // list → task entry (row 0)
+    tuiKeys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → instructions (row 3)
+    async (component) => {
+      const frame = component.render!(80).join("\n");
+      assert.ok(frame.includes("Check the docs for staleness"), `the current instructions are the field prefill: ${frame}`);
+      component.handleInput?.(CTRL_U); // clear the prefill
+      typeText(component, "Rewritten instructions");
+      component.handleInput?.(ENTER); // submit through the bridge
     },
-  };
+    tuiKeys(...Array(6).fill(KEY_DOWN), KEY_ENTER), // entry re-show (row 3) → Back (row 9)
+    tuiKeys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
+    tuiKeys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 16)
+  ]);
 
-  await registered.handler("", ctx);
+  await registered.handler("", harness.ctx);
 
-  assert.equal(editorCalls.length, 1, "exactly one text field opened during this flow");
-  assert.deepEqual(editorCalls[0], { title: "Instructions for the scheduled subtask", prefill: "Check the docs for staleness" });
-  // Six custom surfaces — all menus; none for the instructions edit itself.
-  assert.equal(customCount, 6, "menus use custom; the instructions field uses the public editor");
+  assert.equal(instances.length, 1, "exactly one embedded host editor instance for the field");
+  assert.equal(harness.editorCalls.length, 0, "the public editor chain is not used in the interactive TUI");
+  assert.equal(harness.customCount(), 7, "six menus plus the bridge field surface");
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
   assert.equal(saved.scheduledTasks["task-abcdef12"].instructions, "Rewritten instructions");
+});
+
+test("an interactive TUI without the native editor seams fails closed: error notice, nothing staged", async (t) => {
+  const menuHost = createFakeMenuTuiHost();
+  setMenuTuiHost(menuHost);
+  // No bridge host override, and entry discovery pointed at a non-existent
+  // file so host resolution fails deterministically in every environment.
+  setNativeEditorHostEntryProviderForTest(() => "/nonexistent/pi-entry.js");
+  t.after(() => {
+    setMenuTuiHost(undefined);
+    setNativeEditorHostEntryProviderForTest(undefined);
+    __resetActiveNativeEditorFieldForTest();
+  });
+
+  const { configPath } = await writeScheduledConfig();
+  const before = await readFile(configPath, "utf8");
+  const config = normalizeConfig(JSON.parse(before));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  // The field never opens a surface when the bridge is unavailable, so no
+  // driver is consumed for it; the entry editor re-shows after the notice.
+  const harness = tuiFlowContext([
+    tuiKeys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
+    tuiKeys(KEY_ENTER), // list → task entry (row 0)
+    tuiKeys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → instructions (row 3)
+    tuiKeys(...Array(6).fill(KEY_DOWN), KEY_ENTER), // entry re-show (row 3) → Back (row 9)
+    tuiKeys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
+    tuiKeys(ESCAPE), // root: leave without saving
+  ]);
+
+  await registered.handler("", harness.ctx);
+
+  assert.ok(
+    harness.notifyCalls.some((call) => call.type === "error" && /native text editor is not available/i.test(call.message)),
+    `expected the fail-closed notice: ${JSON.stringify(harness.notifyCalls)}`,
+  );
+  assert.equal(harness.editorCalls.length, 0, "no non-parity fallback field was presented");
+  assert.equal(await readFile(configPath, "utf8"), before, "nothing was staged from a missing native seam");
 });

@@ -1,19 +1,30 @@
 /**
  * The one editable text seam for every /review-settings field (issue #26).
  *
- * Every settings text field goes through {@link editSettingText}, which
- * prefers Pi's public `ctx.ui.editor(title, currentValue)` — a real multi-line
- * editor with an *editable* prefill and the host's native text controls
- * (including Ctrl+G external editing) — and falls back to the legacy
- * single-line `ui.input` when the host offers no editor. The legacy seam only
- * shows the current value as placeholder text; the editor seam makes it
- * editable content, which is the point of this correction.
+ * Every settings text field goes through {@link editSettingText}:
+ *
+ * - Interactive Pi TUI hosts present the field through the host-wired native
+ *   editor bridge (src/native-editor-bridge.ts): the host's own main-prompt
+ *   editor — acquired temporarily through the public setEditorComponent seam
+ *   and embedded in a non-overlay custom slot — with native Tab completion,
+ *   the fd-backed `@` picker, Ctrl+C clear, Ctrl+G external editing, image
+ *   paste, and an editable prefill. An interactive host missing the required
+ *   native seams fails closed with an error notice: no non-parity fallback
+ *   field is presented in the TUI.
+ * - Non-interactive hosts (RPC/print) keep their clearly identified public
+ *   chain: `ctx.ui.editor(title, currentValue)` — a real multi-line editor
+ *   with an *editable* prefill and the host's native text controls — first,
+ *   then the legacy single-line `ui.input`, which only shows the current
+ *   value as placeholder text.
  *
  * `undefined` always means cancel: the caller leaves the staged value
- * unchanged, exactly as with the old input seam. A host with neither seam
- * fails closed with an error notice and a `undefined` result — nothing is
- * ever staged from a missing UI.
+ * unchanged, exactly as with the old input seam. A host with no usable seam
+ * fails closed with an error notice — nothing is ever staged from a missing
+ * UI.
  */
+
+import { editTextWithNativeEditor } from "../native-editor-bridge";
+import type { NativeEditorCustomFactory, NativeEditorFactory } from "../native-editor-bridge";
 
 /** The structural UI surface the text seam needs (host ctx.ui or a mock). */
 export interface SettingTextInputUi {
@@ -22,14 +33,29 @@ export interface SettingTextInputUi {
   /** Pi's public multi-line editor with editable prefill. */
   editor?(title: string, prefill?: string): Promise<string | undefined>;
   notify?(message: string, type?: "info" | "warning" | "error"): void;
+  /** Host run mode ("tui" | "rpc" | ...); carried from the command context. */
+  mode?: string;
+  /** Non-overlay custom component slot (Pi TUI hosts only). */
+  custom?(factory: NativeEditorCustomFactory): Promise<string | undefined>;
+  /** Public Pi seam: install/replace the main editor factory (TUI hosts). */
+  setEditorComponent?(factory: NativeEditorFactory | undefined): void;
+  /** Public Pi seam: read the installed main editor factory (TUI hosts). */
+  getEditorComponent?(): NativeEditorFactory | undefined;
 }
 
+/** Notice for an interactive TUI whose native editor seams are missing. */
+const NATIVE_EDITOR_UNAVAILABLE_MESSAGE =
+  "The native text editor is not available in this host; the value was left unchanged.";
+
 /**
- * Edits one settings text value. Prefers the public editor (true editable
- * prefill plus native controls such as Ctrl+G external editing); falls back
- * to the legacy input seam with identical title/placeholder semantics when no
- * editor is available. Resolves `undefined` on cancel, or when neither seam
- * exists (with an error notice in the latter case).
+ * Edits one settings text value. In an interactive TUI the field opens through
+ * the host-wired native editor bridge (the host's own main-prompt editor with
+ * native completion and controls); on any unavailable outcome it fails closed
+ * with an error notice. Non-interactive hosts prefer the public editor (true
+ * editable prefill plus native controls such as Ctrl+G external editing) and
+ * fall back to the legacy input seam with identical title/placeholder
+ * semantics when no editor is available. Resolves `undefined` on cancel or
+ * when no usable seam exists.
  */
 export async function editSettingText(
   ui: SettingTextInputUi,
@@ -37,6 +63,16 @@ export async function editSettingText(
   currentValue: string,
   unavailableMessage = "This UI does not support text input.",
 ): Promise<string | undefined> {
+  if (ui.mode === "tui") {
+    const result = await editTextWithNativeEditor(ui, { title, prefill: currentValue });
+    if (result.kind === "value") return result.value;
+    if (result.kind === "cancel") return undefined;
+    // Interactive host without the required native seams: fail closed. The
+    // per-field unavailableMessage describes a missing input capability and
+    // does not fit here, so the standard notice names the real situation.
+    ui.notify?.(`${NATIVE_EDITOR_UNAVAILABLE_MESSAGE} (${result.reason})`, "error");
+    return undefined;
+  }
   if (typeof ui.editor === "function") return ui.editor(title, currentValue);
   if (typeof ui.input !== "function") {
     ui.notify?.(unavailableMessage, "error");

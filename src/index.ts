@@ -39,6 +39,7 @@ import {
 import { registerReviewSettings } from "./settings/command";
 import { scopedModelChoices } from "./settings/models";
 import { persistSubtasksViewPreference, replaceConfig } from "./settings/persistence";
+import { assertScheduledImagesPresent, managedScheduledImageRoot } from "./settings/scheduled-image-assets";
 import { registerStreamFailureReporting } from "./stream-failure-report";
 import { ExecutionToolManager } from "./execution/tool";
 import { combineTokenUsage, extractPiUsageFromMessages, formatTokenUsage, type TokenUsage } from "./usage";
@@ -330,8 +331,18 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       await wakeSchedulerOwner(formatScheduledOverdueDrop(entryId, entry, dueAt));
       return;
     }
+    // Fail closed for managed scheduled-image assets: an entry whose
+    // instructions reference a managed image (see
+    // src/settings/scheduled-image-assets.ts) that no longer exists is an
+    // actionable dispatch failure through the existing wake — never a silent
+    // run against a dead path. The check sits inside the try so the failure
+    // uses the standard dispatch-failure report; overlap/overdue semantics
+    // above are unchanged.
     let inspection: Awaited<ReturnType<typeof executionTools.startScheduled>>;
     try {
+      if (loaded.path) {
+        await assertScheduledImagesPresent(entry.instructions, managedScheduledImageRoot(loaded.path));
+      }
       inspection = await executionTools.startScheduled(
         scheduledTaskDefinition(entryId, entry),
         entry.kind,

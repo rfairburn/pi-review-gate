@@ -275,15 +275,30 @@ function isModuleRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Test-only explicit installed-agent directory (CI sets it for the locked Pi
+ * UI runtime installed in the runner temp; never a shipped or user-specific
+ * path in tracked files). When set and valid, it is preferred over discovery.
+ */
+export function explicitInstalledAgentDir(): string | undefined {
+  const requested = process.env.PI_REVIEW_GATE_INSTALLED_AGENT;
+  if (!requested) return undefined;
+  return existsSync(join(requested, "package.json")) ? requested : undefined;
+}
+
+/**
  * Finds every root directory of an installed pi-coding-agent package (each
- * dir containing its package.json), in resolution order: Node's own global
- * roots (nvm, asdf, system installs all put it at <prefix>/lib/node_modules)
- * plus the common macOS Homebrew and /usr/local prefixes where a separately
- * installed pi may live. A multi-install environment can hold several of
- * these; callers should try each until one yields loadable peer modules.
+ * dir containing its package.json), in resolution order: the explicit
+ * test-only install (PI_REVIEW_GATE_INSTALLED_AGENT, e.g. the CI-locked
+ * runtime), then Node's own global roots (nvm, asdf, system installs all put
+ * it at <prefix>/lib/node_modules), plus the common macOS Homebrew and
+ * /usr/local prefixes where a separately installed pi may live. A
+ * multi-install environment can hold several of these; callers should try
+ * each until one yields loadable peer modules.
  */
 export function findInstalledAgentDirs(): string[] {
   const roots: string[] = [];
+  const explicit = explicitInstalledAgentDir();
+  if (explicit) roots.push(explicit);
   let dir = dirname(process.execPath);
   for (let depth = 0; depth < 6; depth += 1) {
     const parent = dirname(dir);
@@ -337,6 +352,14 @@ async function resolveRealPiModules(): Promise<RealPiModules | undefined> {
     }
   };
 
+  // The explicit test-only install wins over bare-import resolution, so a
+  // pinned CI runtime is never silently shadowed by another tree.
+  const explicit = explicitInstalledAgentDir();
+  if (explicit) {
+    const modules = await fromModules(explicit);
+    if (modules) return modules;
+  }
+
   try {
     const tui = (await import(TUI_PACKAGE_NAME)) as Record<string, unknown>;
     if (typeof tui?.SelectList === "function" && typeof tui?.Container === "function" && typeof tui?.Text === "function") {
@@ -350,12 +373,13 @@ async function resolveRealPiModules(): Promise<RealPiModules | undefined> {
       return { tui, agent };
     }
   } catch {
-    // Not resolvable from this tree; try the global install below.
+    // Not resolvable from this tree; try the install roots below.
   }
 
   // Try every resolvable install root: a partial or broken first candidate
   // must not suppress a working install in a later root.
   for (const agentDir of findInstalledAgentDirs()) {
+    if (agentDir === explicit) continue;
     const modules = await fromModules(agentDir);
     if (modules) return modules;
   }

@@ -20,35 +20,25 @@
  *
  * Anything that cannot be resolved (unit tests, SEA/binary hosts) degrades:
  * the UI then renders with naive width handling and only the live keybinding
- * manager drives input. The host chat editor (`Editor`) is exposed for the
- * free-text answer row (issue #182); without it the component keeps its
- * built-in fallback editor. Editor creation, theming, and live-keybinding
- * wiring live in the shared host-agnostic adapter (src/host-editor.ts,
- * issue #185). No installed path is hard-coded.
+ * manager drives input. The free-text answer row embeds the host-wired native
+ * editor acquired through the shared bridge (src/native-editor-bridge.ts);
+ * this loader no longer exposes a standalone Editor for it — without the
+ * bridge's seams the row renders an unavailable line instead of a non-parity
+ * fallback. No installed path is hard-coded.
  */
 
 import { loadHostPeerModule } from "../host-peer-loader";
-import type { HostEditor, HostEditorProvider, HostEditorTheme } from "../host-editor";
 
 const PI_TUI_PACKAGE_NAME = "@earendil-works/pi-tui";
 
-/**
- * The host chat-editor surface the free-text answer row drives (issue #182).
- * The shared host-agnostic contract from the adapter (issue #185): the editor
- * is the single source of truth for the draft text and cursor — the component
- * never stores a copy.
- */
-export type QuestionAnswerEditor = HostEditor;
-
-/** Theme for the host editor component (border + select-list styling), shared adapter contract. */
-export type QuestionAnswerEditorTheme = HostEditorTheme;
-
 /** The pi-tui surface the question UI uses; every member is optional. */
-export interface QuestionTuiHost extends HostEditorProvider {
+export interface QuestionTuiHost {
   matchesKey?(data: string, keyId: string): boolean;
   visibleWidth?(text: string): number;
   truncateToWidth?(text: string, width: number, ellipsis?: string): string;
   wrapTextWithAnsi?(text: string, width: number): string[];
+  /** The module-global KeybindingsManager (default resolution). */
+  getKeybindings?(): { matches?(data: string, keybinding: string): boolean } | undefined;
 }
 
 let hostOverride: QuestionTuiHost | undefined;
@@ -86,8 +76,6 @@ async function doLoadQuestionTuiHost(): Promise<QuestionTuiHost | undefined> {
     | undefined;
   const wrapTextWithAnsi = mod.wrapTextWithAnsi as ((text: string, width: number) => string[]) | undefined;
   const getKeybindings = mod.getKeybindings as (() => unknown) | undefined;
-  const EditorCtor = mod.Editor as HostEditorProvider["Editor"];
-  const setKeybindings = mod.setKeybindings as ((keybindings: unknown) => void) | undefined;
   const host: QuestionTuiHost = {};
   if (typeof matchesKey === "function") {
     host.matchesKey = (data, keyId) => Boolean(matchesKey(data, keyId));
@@ -107,14 +95,6 @@ async function doLoadQuestionTuiHost(): Promise<QuestionTuiHost | undefined> {
       return isRecord(manager) && typeof manager.matches === "function"
         ? manager as unknown as { matches(data: string, keybinding: string): boolean }
         : undefined;
-    };
-  }
-  if (typeof EditorCtor === "function") {
-    host.Editor = EditorCtor;
-  }
-  if (typeof setKeybindings === "function") {
-    host.setKeybindings = (keybindings) => {
-      setKeybindings(keybindings);
     };
   }
   return Object.keys(host).length > 0 ? host : undefined;

@@ -1,288 +1,249 @@
 /**
- * Issue #182: AskUserQuestion free-text editor parity.
+ * AskUserQuestion free-text parity with the host-wired native editor.
  *
- * Two layers, mirroring the issue #140 menu test split:
+ * The free-text row embeds the SAME host-wired CustomEditor instance the
+ * /review-settings text fields use, acquired through the shared bridge
+ * (src/native-editor-bridge.ts) before the list's custom slot opens. Three
+ * tiers, mirroring the bridge test split:
  *
- * 1. Component tests drive the question component with a stateful fake host
- *    editor (same callback contract as pi-tui's Editor: onSubmit receives
- *    expanded trimmed text, onChange fires after every content change). They
- *    pin the wrapper coordination that must hold regardless of which editor
- *    backend answers: draft preservation across Escape, empty-submit no-op,
- *    answers beyond 4000 characters kept and submitted in full (no UI-side
- *    cap, issue #185), per-question draft ownership, focus
- *    propagation, width-correct multiline rendering, and the unchanged
- *    choice/decline lifecycle.
+ * 1. Wiring tier (always runs): createBridgeUi + structural CustomEditor
+ *    stand-in + acquireNativeEditorField drive the REAL question component
+ *    with the acquired instance. Pins: acquisition before the custom slot,
+ *    prepare("") after the host's draft capture (the field starts empty and
+ *    the displaced chat draft is recorded), Enter submits the whole answer
+ *    through the native submit path (never a chat message), empty Enter
+ *    stays open, Esc returns to the choice rows with the draft kept (both
+ *    through the component's cancel pre-check and through the bridge's
+ *    app.interrupt interception under a rebound cancel), Ctrl+D-empty
+ *    returns to the rows, list-first completion semantics, per-answer-view
+ *    draft reset on the shared instance, chat-draft survival exactly once,
+ *    ownership-checked restore (foreign factory by identity + notice), and
+ *    the session-reset abort.
  *
- * 2. Host-integration tests best-effort load the actually installed pi-tui
- *    (same resolution strategy as tests/menu-tui-fakes.ts) and drive the real
- *    Editor through the component with a real KeybindingsManager: multiline
- *    render/navigation, movement/edit/delete/undo/newline key chords, user
- *    keybinding overrides, unsupported escape input, and the choice/decline
- *    lifecycle. They skip where no host is resolvable.
+ * 2. Real-host tier (installed Pi; skip-or-fail via PI_REVIEW_GATE_REQUIRE_PI_HOST):
+ *    the installed CustomEditor + pi-tui with a real KeybindingsManager,
+ *    driven through the same component: native Tab path completion, the
+ *    fd-backed `@` picker, Ctrl+C clears (never cancels) through the host's
+ *    copied app handler, Ctrl+G external editing of the field instance,
+ *    Ctrl+V image paste to a temp path, Shift+Enter newlines with intact
+ *    multi-line submission, Esc list-first dismissal, and user keybinding
+ *    overrides. Both tiers drive through the createBridgeUi host simulator
+ *    and simulated app-handler bodies (the real-host tier additionally runs
+ *    the installed CustomEditor + pi-tui); every native behavior above is
+ *    observed against the installed host wherever it is resolvable.
  */
 
 import assert from "node:assert/strict";
 import test from "node:test";
 import { UserQuestionController } from "../src/user-question/controller";
+test.afterEach(() => {
+  setNativeEditorHost(undefined);
+  __resetActiveNativeEditorFieldForTest();
+});
 import { createQuestionListComponent, QUESTION_LIST_SHORTCUT_KEY } from "../src/user-question/components";
-import type { QuestionAnswerEditor } from "../src/user-question/pi-tui-host";
-import { loadRealPiTuiModule } from "./menu-tui-fakes";
+import {
+  acquireNativeEditorField,
+  abortActiveNativeEditorField,
+  editTextWithNativeEditor,
+  setNativeEditorHost,
+  __resetActiveNativeEditorFieldForTest,
+} from "../src/native-editor-bridge";
+import type {
+  NativeEditorFactory,
+  NativeEditorFieldHandle,
+  NativeEditorFieldResult,
+  NativeEditorFieldSemantics,
+} from "../src/native-editor-bridge";
+import {
+  APP_KEY_DEFAULTS,
+  CTRL_C,
+  CTRL_D,
+  CTRL_G,
+  CTRL_V,
+  ENTER,
+  ESCAPE,
+  SHIFT_ENTER,
+  TAB,
+  createBridgeUi,
+  fakeHost,
+  fakeKeybindingsManager,
+  createFakeCustomEditorClass,
+  findFdBinary,
+  loadRealBridgeHost,
+  makeDocsFixture,
+  realHostAfter,
+  REAL_IDENTITY_THEME,
+  settle,
+  skipOrFail,
+  typeText,
+  createRealKeybindingsManager,
+} from "./bridge-fakes";
+import type { BridgeComponent, BridgeUiState, FakeBridgeEditor } from "./bridge-fakes";
 
 // ---------------------------------------------------------------------------
-// Raw key sequences (pi-tui legacy terminal encodings)
+// Raw key sequences
 // ---------------------------------------------------------------------------
 
 const UP = "\x1b[A";
 const DOWN = "\x1b[B";
-const LEFT = "\x1b[D";
-const RIGHT = "\x1b[C";
-const ENTER = "\r";
-const ESCAPE = "\x1b";
-const BACKSPACE = "\x7f";
-const DELETE_FWD = "\x1b[3~";
-const HOME = "\x1b[H";
-const END = "\x1b[F";
-const PAGE_UP = "\x1b[5~";
-const PAGE_DOWN = "\x1b[6~";
-const ALT_LEFT = "\x1b[1;3D";
-const ALT_RIGHT = "\x1b[1;3C";
-const CTRL_LEFT = "\x1b[1;5D";
-const SHIFT_ENTER = "\x1b[13;2~";
-const CTRL_J = "\n";
-const CTRL_A = "\x01";
-const CTRL_E = "\x05";
-const CTRL_W = "\x17";
-const CTRL_U = "\x15";
-const CTRL_K = "\x0b";
-const CTRL_Y = "\x19";
-const CTRL_D = "\x04";
-// ctrl+- as Kitty CSI-u: in legacy terminals ctrl+- is indistinguishable
-// from Enter, so the binding only resolves through the Kitty protocol.
-const UNDO = "\x1b[45;5u";
+const ENTER_KEY = ENTER;
+const ESCAPE_KEY = ESCAPE;
 const F6 = "\x1b[17~";
 const F8 = "\x1b[19~";
 const CHORD = "\x1b[1;64A";
 
-interface KeybindingsLike {
-  matches(data: string, keybinding: string): boolean;
-}
+/** The question free-text row's field semantics (mirrors src/user-question/index.ts). */
+const QUESTION_SEMANTICS: NativeEditorFieldSemantics = {
+  onSubmitKey: (text) => (text.length > 0 ? text : null),
+};
 
-function makeKeybindings(): KeybindingsLike {
-  const bindings: Record<string, string[]> = {
+const THEME = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+
+/**
+ * The component-level key matcher. In production this is the host's live
+ * KeybindingsManager; here it mirrors the pi 0.87.1 defaults for the keys
+ * the component itself interprets (navigation + cancel/clear pre-checks).
+ */
+function componentKeys(overrides: Record<string, string[]> = {}) {
+  const table: Record<string, string[]> = {
     "tui.select.up": [UP],
     "tui.select.down": [DOWN],
-    "tui.select.confirm": [ENTER],
-    // The host default for cancel is escape + ctrl+c; both are exercised.
-    "tui.select.cancel": [ESCAPE, "\x03"],
-    "tui.input.submit": [ENTER],
-    "tui.input.newLine": [SHIFT_ENTER, CTRL_J],
-    "tui.editor.cursorUp": [UP],
-    "tui.editor.cursorDown": [DOWN],
-    "tui.editor.cursorLeft": [LEFT],
-    "tui.editor.cursorRight": [RIGHT],
-    "tui.editor.deleteCharBackward": [BACKSPACE],
+    "tui.select.confirm": [ENTER_KEY],
+    // The host default for cancel is escape + ctrl+c; the component's
+    // editing pre-check must let ctrl+c through to the native clear.
+    "tui.select.cancel": [ESCAPE_KEY, CTRL_C],
+    "app.clear": [CTRL_C],
+    ...overrides,
   };
   return {
     matches(data: string, keybinding: string): boolean {
-      return (bindings[keybinding] ?? []).includes(data);
+      return (table[keybinding] ?? []).includes(data);
     },
   };
 }
 
-const THEME = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
-
 // ---------------------------------------------------------------------------
-// Fake host editor: stateful stand-in with the real Editor's callback
-// contract (onSubmit receives expanded trimmed text and clears; onChange
-// fires after every content change).
+// Wiring-tier fixture: bridge acquisition + real component
 // ---------------------------------------------------------------------------
 
-class FakeAnswerEditor implements QuestionAnswerEditor {
-  focused = false;
-  onSubmit?: (text: string) => void;
-  onChange?: (text: string) => void;
-  /** Every raw sequence the component delegated, in order. */
-  readonly inputs: string[] = [];
-  private lines: string[] = [""];
-  private line = 0;
-  private col = 0;
-
-  constructor(private readonly keys: KeybindingsLike) {}
-
-  getExpandedText(): string {
-    return this.lines.join("\n");
-  }
-
-  setText(text: string): void {
-    this.lines = text.length === 0 ? [""] : text.split("\n");
-    this.line = this.lines.length - 1;
-    this.col = this.lines[this.line]!.length;
-    this.onChange?.(this.getExpandedText());
-  }
-
-  handleInput(data: string): void {
-    this.inputs.push(data);
-    const k = this.keys;
-    if (k.matches(data, "tui.input.submit")) {
-      // The real Editor clears its state before calling onSubmit.
-      const result = this.getExpandedText().trim();
-      this.lines = [""];
-      this.line = 0;
-      this.col = 0;
-      this.onChange?.("");
-      this.onSubmit?.(result);
-      return;
-    }
-    if (k.matches(data, "tui.input.newLine")) {
-      const current = this.lines[this.line]!;
-      this.lines.splice(this.line, 1, current.slice(0, this.col), current.slice(this.col));
-      this.line += 1;
-      this.col = 0;
-      this.onChange?.(this.getExpandedText());
-      return;
-    }
-    if (k.matches(data, "tui.editor.cursorLeft")) {
-      if (this.col > 0) this.col -= 1;
-      return;
-    }
-    if (k.matches(data, "tui.editor.cursorRight")) {
-      if (this.col < this.lines[this.line]!.length) this.col += 1;
-      return;
-    }
-    if (k.matches(data, "tui.editor.cursorUp")) {
-      if (this.line > 0) {
-        this.line -= 1;
-        this.clampCol();
-      }
-      return;
-    }
-    if (k.matches(data, "tui.editor.cursorDown")) {
-      if (this.line < this.lines.length - 1) {
-        this.line += 1;
-        this.clampCol();
-      }
-      return;
-    }
-    if (k.matches(data, "tui.editor.deleteCharBackward")) {
-      const current = this.lines[this.line]!;
-      if (this.col > 0) {
-        this.lines[this.line] = current.slice(0, this.col - 1) + current.slice(this.col);
-        this.col -= 1;
-        this.onChange?.(this.getExpandedText());
-      }
-      return;
-    }
-    if (data.includes("\x1b[200~")) {
-      // Bracketed paste: the real Editor strips the markers and inserts the
-      // payload at the cursor.
-      const payload = data.replace(/\x1b\[20[01]~/g, "");
-      const current = this.lines[this.line]!;
-      this.lines[this.line] = current.slice(0, this.col) + payload + current.slice(this.col);
-      this.col += payload.length;
-      this.onChange?.(this.getExpandedText());
-      return;
-    }
-    if (data.length === 1 && data.charCodeAt(0) >= 32) {
-      const current = this.lines[this.line]!;
-      this.lines[this.line] = current.slice(0, this.col) + data + current.slice(this.col);
-      this.col += 1;
-      this.onChange?.(this.getExpandedText());
-    }
-  }
-
-  /** Bordered box like the host editor: top/bottom rules plus padded lines. */
-  render(width: number): string[] {
-    const bounded = Math.max(1, width);
-    const border = "─".repeat(bounded);
-    return [
-      border,
-      ...this.lines.map((line) => line + " ".repeat(Math.max(0, bounded - line.length))),
-      border,
-    ];
-  }
-
-  invalidate(): void {}
-
-  private clampCol(): void {
-    const max = this.lines[this.line]!.length;
-    if (this.col > max) this.col = max;
-  }
+interface WiringFixtureOptions {
+  draft?: string;
+  priorFactory?: unknown;
+  appHandlers?: Record<string, (editor: FakeBridgeEditor) => () => void>;
+  onPasteImage?: (editor: FakeBridgeEditor) => () => void;
+  keys?: ReturnType<typeof componentKeys>;
+  /** Registered before the field is acquired and the list opens. */
+  questions?: Array<{ question: string; choices?: string[]; mode?: "async" | "sync" }>;
+  /** Drives the component once it is constructed (after prepare("")). */
+  driver: (component: BridgeComponent, fixture: WiringFixture) => void | Promise<void>;
 }
 
-// ---------------------------------------------------------------------------
-// Fixture: question controller + component wired to a fake host editor
-// ---------------------------------------------------------------------------
-
-interface EditorFixture {
+interface WiringFixture {
   controller: UserQuestionController;
   identity: object;
-  sent: Array<{ message: string; options?: { deliverAs?: "steer" | "followUp" } }>;
+  sent: Array<{ message: string; options?: unknown }>;
   done: unknown[];
-  component: ReturnType<typeof createQuestionListComponent>;
-  keys: KeybindingsLike;
-  /** The most recent answer-view session's editor (created on first edit entry). */
-  editor: FakeAnswerEditor;
-  /** Every editor instance the factory created, in creation order. */
-  editors: FakeAnswerEditor[];
+  state: BridgeUiState;
+  instances: FakeBridgeEditor[];
+  handle: NativeEditorFieldHandle;
+  /** Resolves when the custom slot closes (done called), after finish(). */
+  settled: Promise<void>;
 }
 
-function makeEditorFixture(): EditorFixture {
-  const sent: EditorFixture["sent"] = [];
+async function makeWiringFixture(options: WiringFixtureOptions): Promise<WiringFixture> {
+  // The driver runs as a microtask after this function returns; hand it the
+  // fixture through a reference that is assigned before any microtask runs.
+  let fixtureRef: WiringFixture | undefined;
+  const instances: FakeBridgeEditor[] = [];
+  setNativeEditorHost(fakeHost(instances));
+  const sent: WiringFixture["sent"] = [];
   const controller = new UserQuestionController({
     pi: {
-      sendUserMessage(message: string, options?: { deliverAs?: "steer" | "followUp" }) {
-        sent.push({ message, options });
+      sendUserMessage(message: string, opts?: unknown) {
+        sent.push({ message, options: opts });
         return Promise.resolve();
       },
     },
     uiAvailable: () => true,
   });
-  const identity = { sessionManager: "UI" };
+  const identity = { sessionManager: "wiring" };
   controller.beginSession(identity);
+  for (const q of options.questions ?? []) {
+    registerQuestion(controller, identity, q.question, q.choices, q.mode);
+  }
   const done: unknown[] = [];
-  const keys = makeKeybindings();
-  // The factory mirrors production: every call constructs a fresh host
-  // Editor (the component calls it once per answer-view session).
-  const editors: FakeAnswerEditor[] = [];
-  const component = createQuestionListComponent({
-    controller,
-    keybindings: keys,
-    theme: THEME,
-    shortcutLabel: "Ctrl+Alt+Up",
-    tuiHost: {
-      matchesKey: (data: string, keyId: string) => keyId === QUESTION_LIST_SHORTCUT_KEY && data === CHORD,
-    },
-    createAnswerEditor: () => {
-      const editor = new FakeAnswerEditor(keys);
-      editors.push(editor);
-      return editor;
-    },
-    onDone: (result) => done.push(result),
+
+  const { ui, state } = createBridgeUi({
+    keybindings: fakeKeybindingsManager(),
+    draft: options.draft ?? "chat draft",
+    priorFactory: options.priorFactory,
+    appHandlers: options.appHandlers,
+    onPasteImage: options.onPasteImage,
+    drivers: [(component) => { void options.driver(component, fixtureRef!); }],
   });
-  const fixture = {
-    controller,
-    identity,
-    sent,
-    done,
-    component,
-    keys,
-    editors,
-    get editor(): FakeAnswerEditor {
-      return editors[editors.length - 1]!;
+
+  // Production order (src/user-question/index.ts): acquire BEFORE the custom
+  // slot opens; prepare("") inside the factory; finish() in finally.
+  const acquired = await acquireNativeEditorField(ui, { semantics: QUESTION_SEMANTICS });
+  assert.equal(acquired.kind, "acquired", `acquisition succeeds: ${JSON.stringify(acquired)}`);
+  const handle = (acquired as { kind: "acquired"; handle: NativeEditorFieldHandle }).handle;
+
+  const opened = ui.custom!((_tui: unknown, _theme: unknown, _keybindings: unknown, close: (value: string | undefined) => void) => {
+    handle.prepare("");
+    return createQuestionListComponent({
+      controller,
+      keybindings: options.keys ?? componentKeys(),
+      theme: THEME,
+      shortcutLabel: "Ctrl+Alt+Up",
+      tuiHost: {
+        matchesKey: (data: string, keyId: string) => keyId === QUESTION_LIST_SHORTCUT_KEY && data === CHORD,
+      },
+      nativeField: handle.instance,
+      onDone: (result) => {
+        done.push(result);
+        close(undefined);
+      },
+    });
+  });
+  const settled = guardClose(opened.then(
+    () => {
+      handle.finish();
     },
-  };
-  return fixture;
+    (error: unknown) => {
+      handle.finish();
+      // Surface driver/factory failures instead of reading them as a clean close.
+      throw error;
+    },
+  ));
+
+  fixtureRef = { controller, identity, sent, done, state, instances, handle, settled };
+  return fixtureRef;
 }
 
-function register(fixture: EditorFixture, question: string, options: { choices?: string[]; mode?: "async" | "sync" } = {}) {
-  const result = fixture.controller.register(
+/** Race the close against a timer so an unclosed list fails fast instead of hanging on an empty event loop. */
+function guardClose(promise: Promise<void>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const guard = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("the question list never closed")), 5000);
+  });
+  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+}
+
+function registerQuestion(
+  controller: UserQuestionController,
+  identity: object,
+  question: string,
+  choices?: string[],
+  mode?: "async" | "sync",
+): string {
+  const result = controller.register(
     {
-      toolCallId: `t${fixture.controller.listPending().length + 1}`,
+      toolCallId: `t${controller.listPending().length + 1}`,
       question,
-      choices: options.choices,
-      mode: options.mode ?? "async",
+      choices,
+      mode: mode ?? "async",
     },
-    fixture.identity,
+    identity,
   );
   assert.ok(result.ok);
   if (!result.ok) throw new Error("registration failed");
@@ -290,590 +251,820 @@ function register(fixture: EditorFixture, question: string, options: { choices?:
 }
 
 /** Open the answer view and confirm the free-text row (one choice registered). */
-function enterEditing(fixture: EditorFixture): void {
-  fixture.component.handleInput(ENTER); // answer view (row 0 = the choice)
-  fixture.component.handleInput(DOWN); // row 1: Type something…
-  fixture.component.handleInput(ENTER); // start editing
+function enterEditing(component: BridgeComponent): void {
+  component.handleInput?.(ENTER_KEY); // answer view (row 0 = the choice)
+  component.handleInput?.(DOWN); // row 1: Type something…
+  component.handleInput?.(ENTER_KEY); // start editing
 }
 
-const flush = () => new Promise((resolve) => setImmediate(resolve));
-
 // ---------------------------------------------------------------------------
-// Component tests (fake host editor): wrapper coordination
+// Wiring tier
 // ---------------------------------------------------------------------------
 
-test("the host editor is embedded in the free-text row and renders a width-correct multiline box", () => {
-  const fixture = makeEditorFixture();
-  register(fixture, "Which database?", { choices: ["SQLite"] });
-  enterEditing(fixture);
-  for (const char of "alpha") fixture.component.handleInput(char);
-  fixture.component.handleInput(SHIFT_ENTER);
-  for (const char of "beta") fixture.component.handleInput(char);
+test("wiring: prepare empties the field after the host's draft capture; Enter submits the answer, not a chat message", async () => {
+  const fixture = await makeWiringFixture({
+    draft: "my chat draft",
+    questions: [{ question: "Which database?", choices: ["SQLite"] }],
+    driver: (component, fixture) => {
+      // The factory ran before this driver: prepare("") already applied.
+      assert.equal(fixture.instances[0]!.getText(), "", "the field starts empty, not with the chat draft");
+      enterEditing(component);
+      for (const ch of "yes please") component.handleInput?.(ch);
+      component.handleInput?.(ENTER_KEY); // submit the whole answer
+    },
+  });
 
-  assert.equal(fixture.editor.getExpandedText(), "alpha\nbeta", "the editor owns the multiline draft");
-  assert.equal(fixture.editor.focused, true, "focus is propagated to the host editor while editing");
-
-  const lines = fixture.component.render(40);
-  const text = lines.join("\n");
-  assert.match(text, /Which database\?/);
-  assert.ok(lines.findIndex((line) => line.includes("alpha")) < lines.findIndex((line) => line.includes("beta")));
-  for (const line of lines) {
-    assert.ok(line.length <= 40, `every rendered line fits the width: ${JSON.stringify(line)}`);
-  }
-  // The box is indented like the other rows and carries its own rules.
-  const alphaLine = lines.find((line) => line.includes("alpha"))!;
-  assert.ok(alphaLine.startsWith("  "), "the editor box is indented with the other rows");
-});
-
-test("Escape returns to the choices preserving the draft; re-entering resumes it", () => {
-  const fixture = makeEditorFixture();
-  register(fixture, "Which database?", { choices: ["SQLite"] });
-  enterEditing(fixture);
-  for (const char of "partial draft") fixture.component.handleInput(char);
-  fixture.component.handleInput(ESCAPE); // back to the option rows
-
-  assert.equal(fixture.editor.getExpandedText(), "partial draft", "the draft survives backing out");
-  assert.equal(fixture.editor.focused, false, "focus leaves the editor with editing mode");
-  const text = fixture.component.render(80).join("\n");
-  assert.match(text, /> Type something…/, "selection stays on the free-text row");
-
-  fixture.component.handleInput(ENTER); // resume editing
-  assert.equal(fixture.editor.focused, true);
-  for (const char of " done") fixture.component.handleInput(char);
-  fixture.component.handleInput(ENTER); // submit
-  assert.deepEqual(fixture.done, [{ kind: "submitted", result: { status: "delivered", empty: true } }]);
-  void flush();
-});
-
-test("empty or whitespace-only Enter does not submit and keeps the draft (editor path)", async () => {
-  const fixture = makeEditorFixture();
-  register(fixture, "Which database?", { choices: ["SQLite"] });
-  enterEditing(fixture);
-  fixture.component.handleInput(ENTER); // empty: no submission, editor untouched
-  assert.equal(fixture.done.length, 0);
-  assert.ok(!fixture.editor.inputs.includes(ENTER), "the empty submit never reaches the editor");
-  for (const char of "   ") fixture.component.handleInput(char);
-  fixture.component.handleInput(ENTER); // whitespace only: still no submission
-  assert.equal(fixture.done.length, 0);
-  assert.equal(fixture.editor.getExpandedText(), "   ", "the whitespace draft is kept");
-
-  for (const char of "ok") fixture.component.handleInput(char);
-  fixture.component.handleInput(ENTER); // trimmed to "ok" and submitted
-  assert.deepEqual(fixture.done, [{ kind: "submitted", result: { status: "delivered", empty: true } }]);
-  await flush();
+  await fixture.settled;
   assert.equal(fixture.sent.length, 1);
-  assert.match(fixture.sent[0]!.message, /Which database\?": ok$/);
+  assert.match(fixture.sent[0]!.message, /Answer to pending question "Which database\?": yes please/);
+  assert.equal(fixture.state.draft, "my chat draft", "the chat draft survives the round trip exactly once");
+  assert.equal(fixture.state.slotFactory, undefined, "the prior (default) factory was restored");
+  assert.deepEqual(fixture.state.chatSubmits, [], "no chat message was sent");
 });
 
-test("Enter submits through the host editor with embedded newlines preserved", async () => {
-  const fixture = makeEditorFixture();
-  register(fixture, "Which database?", { choices: ["SQLite"] });
-  enterEditing(fixture);
-  for (const char of "alpha") fixture.component.handleInput(char);
-  fixture.component.handleInput(SHIFT_ENTER);
-  for (const char of "beta") fixture.component.handleInput(char);
-  fixture.component.handleInput(ENTER); // submit
+test("wiring: empty Enter stays open in editing; a later non-empty Enter submits", async () => {
+  const fixture = await makeWiringFixture({
+    questions: [{ question: "Which database?", choices: ["SQLite"] }],
+    driver: (component, fixture) => {
+      enterEditing(component);
+      component.handleInput?.(ENTER_KEY); // empty draft: nothing to send
+      assert.equal(fixture.done.length, 0, "empty Enter does not submit or close");
+      for (const ch of "ok") component.handleInput?.(ch);
+      component.handleInput?.(ENTER_KEY); // trimmed and submitted
+    },
+  });
 
-  assert.deepEqual(fixture.done, [{ kind: "submitted", result: { status: "delivered", empty: true } }]);
-  await flush();
+  await fixture.settled;
   assert.equal(fixture.sent.length, 1);
-  assert.match(fixture.sent[0]!.message, /Answer to pending question "Which database\?": alpha\nbeta/);
+  assert.match(fixture.sent[0]!.message, /": ok$/);
 });
 
-test("answers beyond 4000 characters are kept and submit in full (no UI cap)", async () => {
-  const fixture = makeEditorFixture();
-  register(fixture, "Which database?", { choices: ["SQLite"] });
-  enterEditing(fixture);
-  // A large pre-set draft (equivalent to a big paste) is never trimmed or
-  // reverted — the component applies no length cap and neither does the
-  // controller.
-  const long = "a".repeat(4500);
-  fixture.editor.setText(long);
-  assert.equal(fixture.editor.getExpandedText(), long, "the over-4000 draft is kept in full");
-  // Typing beyond 4000 keeps appending; nothing is reverted.
-  fixture.component.handleInput("b");
-  assert.equal(fixture.editor.getExpandedText(), `${long}b`, "typing past 4000 keeps appending");
-  // The full draft survives backing out to the rows and re-entering.
-  fixture.component.handleInput(ESCAPE);
-  fixture.component.handleInput(ENTER);
-  assert.equal(fixture.editor.getExpandedText(), `${long}b`);
-  fixture.component.handleInput(ENTER); // submit
-  assert.deepEqual(fixture.done, [{ kind: "submitted", result: { status: "delivered", empty: true } }]);
-  await flush();
+test("wiring: Esc returns to the choice rows keeping the draft (component cancel pre-check)", async () => {
+  const fixture = await makeWiringFixture({
+    questions: [{ question: "Which database?", choices: ["SQLite"] }],
+    driver: (component, fixture) => {
+      enterEditing(component);
+      for (const ch of "partial draft") component.handleInput?.(ch);
+      component.handleInput?.(ESCAPE_KEY); // default cancel binding: back to the rows
+
+      assert.equal(fixture.instances[0]!.getText(), "partial draft", "the draft survives backing out");
+      const frame = component.render?.(80)?.join("\n") ?? "";
+      assert.ok(frame.includes("Type something"), `selection stays on the free-text row: ${frame}`);
+
+      component.handleInput?.(ENTER_KEY); // resume editing with the draft
+      for (const ch of " done") component.handleInput?.(ch);
+      component.handleInput?.(ENTER_KEY); // submit
+    },
+  });
+
+  await fixture.settled;
   assert.equal(fixture.sent.length, 1);
-  assert.ok(
-    fixture.sent[0]!.message.endsWith(`${long}b`),
-    "the submitted answer carries every character",
-  );
+  assert.match(fixture.sent[0]!.message, /": partial draft done$/);
 });
 
-test("a large bracketed paste is kept and submitted without data loss (host editor)", async () => {
-  const fixture = makeEditorFixture();
-  register(fixture, "Which database?", { choices: ["SQLite"] });
-  enterEditing(fixture);
-  fixture.component.handleInput(`\x1b[200~${"c".repeat(5000)}\x1b[201~`);
-  assert.equal(fixture.editor.getExpandedText(), "c".repeat(5000), "the pasted draft is kept in full");
-  fixture.component.handleInput(ENTER); // submit
-  assert.deepEqual(fixture.done, [{ kind: "submitted", result: { status: "delivered", empty: true } }]);
-  await flush();
-  assert.equal(fixture.sent.length, 1);
-  assert.ok(fixture.sent[0]!.message.endsWith("c".repeat(5000)));
-});
+test("wiring: with cancel rebound, Esc reaches the bridge and settles as cancel-equivalent", async () => {
+  const fixture = await makeWiringFixture({
+    keys: componentKeys({ "tui.select.cancel": [F6] }), // Esc is no longer the component's cancel
+    questions: [{ question: "Which database?", choices: ["SQLite"] }],
+    driver: (component, fixture) => {
+      enterEditing(component);
+      for (const ch of "kept") component.handleInput?.(ch);
+      component.handleInput?.(ESCAPE_KEY); // forwarded to the instance; the bridge intercepts app.interrupt
 
-test("the draft survives editing↔rows but a new answer view starts fresh (text and undo)", () => {
-  const fixture = makeEditorFixture();
-  register(fixture, "First question?", { choices: ["a"] });
-  register(fixture, "Second question?", { choices: ["b"] });
-  enterEditing(fixture); // q1's free-text row
-  for (const char of "draft one") fixture.component.handleInput(char);
-  fixture.component.handleInput(ESCAPE); // rows — draft kept within this session
-  assert.equal(fixture.editor.getExpandedText(), "draft one");
-  fixture.component.handleInput(ENTER); // resume editing
-  assert.equal(fixture.editor.getExpandedText(), "draft one");
+      assert.equal(fixture.instances[0]!.getText(), "kept", "the draft is kept");
+      const frame = component.render?.(80)?.join("\n") ?? "";
+      assert.ok(frame.includes("Type something"), `back on the option rows: ${frame}`);
+      // The rebound cancel still works from editing.
+      component.handleInput?.(ENTER_KEY); // resume editing
+      component.handleInput?.(F6); // back to the answer rows again
+      const frame2 = component.render?.(80)?.join("\n") ?? "";
+      assert.ok(frame2.includes("Type something"), `the rebound cancel returns to the rows: ${frame2}`);
+      // With cancel rebound, Esc no longer navigates either — F6 does.
+      component.handleInput?.(F6); // answer rows → list
+      component.handleInput?.(F6); // close the list
+    },
+  });
 
-  // Leaving the answer view back to the list starts the next session fresh —
-  // text, cursor and undo history all empty (the host Editor exposes no
-  // public undo-stack clear, so the previous session's instance is
-  // discarded and a new one is created on first edit entry).
-  fixture.component.handleInput(ESCAPE); // rows
-  fixture.component.handleInput(ESCAPE); // list (q1 selected)
-  fixture.component.handleInput(DOWN); // select q2
-  fixture.component.handleInput(ENTER); // q2's answer view: fresh session
-  assert.equal(fixture.editors.length, 1, "the previous session's editor is discarded; none exists yet");
-  fixture.component.handleInput(DOWN); // Type something…
-  fixture.component.handleInput(ENTER); // start editing q2
-  assert.equal(fixture.editors.length, 2, "a new answer view gets a fresh editor instance");
-  assert.equal(fixture.editor.getExpandedText(), "", "the previous draft never leaks into a new answer view");
-  for (const char of "draft two") fixture.component.handleInput(char);
-  assert.equal(fixture.editors[0]!.getExpandedText(), "draft one", "the old session's editor is no longer referenced");
-});
-
-test("Ctrl+C (tui.select.cancel) returns to the choices from editing without closing", () => {
-  const fixture = makeEditorFixture();
-  register(fixture, "Which database?", { choices: ["SQLite"] });
-  enterEditing(fixture);
-  for (const char of "x") fixture.component.handleInput(char);
-  fixture.component.handleInput("\x03"); // ctrl+c = cancel
-
-  assert.equal(fixture.done.length, 0, "cancel does not close the list");
-  const text = fixture.component.render(80).join("\n");
-  assert.match(text, /Which database\?/, "back on the option rows");
-  assert.equal(fixture.editor.getExpandedText(), "x", "the draft is kept");
-});
-
-test("the shortcut chord collapses from host-editor editing without submitting", () => {
-  const fixture = makeEditorFixture();
-  register(fixture, "Which database?", { choices: ["SQLite"] });
-  enterEditing(fixture);
-  for (const char of "partial") fixture.component.handleInput(char);
-  fixture.component.handleInput(CHORD);
-
+  await fixture.settled;
   assert.deepEqual(fixture.done, [{ kind: "closed" }]);
-  assert.equal(fixture.controller.listPending().length, 1, "the question stays pending");
   assert.equal(fixture.sent.length, 0);
 });
 
-test("choice and decline lifecycle is unchanged with the host editor available", async () => {
-  // Choice confirmation.
-  const choiceFixture = makeEditorFixture();
-  register(choiceFixture, "Which database?", { choices: ["SQLite", "Postgres"] });
-  choiceFixture.component.handleInput(ENTER); // answer view
-  choiceFixture.component.handleInput(DOWN); // 2. Postgres
-  choiceFixture.component.handleInput(ENTER); // confirm
-  assert.deepEqual(choiceFixture.done, [{ kind: "submitted", result: { status: "delivered", empty: true } }]);
-  await flush();
-  assert.match(choiceFixture.sent[0]!.message, /Which database\?": Postgres$/);
+test("wiring: Ctrl+D on an empty editor returns to the rows instead of exiting", async () => {
+  const fixture = await makeWiringFixture({
+    questions: [{ question: "Which database?", choices: ["SQLite"] }],
+    driver: (component, fixture) => {
+      enterEditing(component);
+      component.handleInput?.(CTRL_D); // empty field: cancel-equivalent, not a Pi exit
 
-  // Explicit decline.
-  const declineFixture = makeEditorFixture();
-  register(declineFixture, "Which database?", { choices: ["SQLite"] });
-  declineFixture.component.handleInput(ENTER); // answer view
-  declineFixture.component.handleInput(DOWN); // Type something…
-  declineFixture.component.handleInput(DOWN); // Decline row
-  declineFixture.component.handleInput(ENTER); // confirm decline
-  assert.deepEqual(declineFixture.done, [{ kind: "submitted", result: { status: "declined", empty: true } }]);
-  await flush();
-  assert.equal(declineFixture.sent.length, 0, "an async decline sends nothing to the model");
+      assert.equal(fixture.state.shutdowns, 0, "the host exit path never fired");
+      const frame = component.render?.(80)?.join("\n") ?? "";
+      assert.ok(frame.includes("Type something"), `back on the option rows: ${frame}`);
+      component.handleInput?.(ESCAPE_KEY); // answer rows → list
+      component.handleInput?.(ESCAPE_KEY); // close the list
+    },
+  });
+
+  await fixture.settled;
+  assert.deepEqual(fixture.done, [{ kind: "closed" }]);
 });
 
-// ---------------------------------------------------------------------------
-// Host-integration tests (real pi-tui Editor + real KeybindingsManager)
-// ---------------------------------------------------------------------------
+test("wiring: a visible completion list is dismissed first by Esc, then the field settles", async () => {
+  const fixture = await makeWiringFixture({
+    questions: [{ question: "Which database?", choices: ["SQLite"] }],
+    driver: (component, fixture) => {
+      enterEditing(component);
+      for (const ch of "docs/") component.handleInput?.(ch);
+      component.handleInput?.(TAB); // open the (fake) list
+      assert.equal(fixture.instances[0]!.showingList, true, "the list is visible");
+      component.handleInput?.(ESCAPE_KEY); // first Esc: dismiss the list only
+      assert.equal(fixture.instances[0]!.showingList, false, "the list was dismissed");
+      assert.equal(fixture.instances[0]!.getText(), "docs/", "the draft survives the dismissal");
+      const frame = component.render?.(80)?.join("\n") ?? "";
+      assert.ok(frame.includes("[field:docs/]"), `still editing after the dismissal: ${frame}`);
+      component.handleInput?.(ESCAPE_KEY); // second Esc: back to the rows
+      const frame2 = component.render?.(80)?.join("\n") ?? "";
+      assert.ok(frame2.includes("Type something"), `back on the option rows: ${frame2}`);
+      component.handleInput?.(ENTER_KEY); // resume editing with the kept draft
+      component.handleInput?.(ENTER_KEY); // submit it
+    },
+  });
 
-interface RealHost {
-  mod: Record<string, any>;
+  await fixture.settled;
+  assert.equal(fixture.sent.length, 1);
+  assert.match(fixture.sent[0]!.message, /": docs\/$/);
+});
+
+test("wiring: Ctrl+C is forwarded to the instance (native clear), never a cancel", async () => {
+  const fixture = await makeWiringFixture({
+    questions: [{ question: "Which database?", choices: ["SQLite"] }],
+    driver: (component, fixture) => {
+      enterEditing(component);
+      for (const ch of "x") component.handleInput?.(ch);
+      component.handleInput?.(CTRL_C); // default binding is BOTH cancel and clear
+
+      assert.equal(fixture.done.length, 0, "Ctrl+C does not close the list");
+      assert.ok(fixture.instances[0]!.received.includes(CTRL_C), "the key reached the instance for the native clear");
+      const frame = component.render?.(80)?.join("\n") ?? "";
+      assert.ok(frame.includes("[field:"), `still editing (the structural stand-in has no app handler): ${frame}`);
+      component.handleInput?.(ESCAPE_KEY); // editing → answer rows
+      component.handleInput?.(ESCAPE_KEY); // answer rows → list
+      component.handleInput?.(ESCAPE_KEY); // close the list
+    },
+  });
+
+  await fixture.settled;
+  assert.deepEqual(fixture.done, [{ kind: "closed" }]);
+});
+
+test("wiring: a new answer view clears the shared instance's text", async () => {
+  const fixture = await makeWiringFixture({
+    questions: [
+      { question: "First question?", choices: ["a"] },
+      { question: "Second question?", choices: ["b"] },
+    ],
+    driver: (component, fixture) => {
+      component.handleInput?.(ENTER_KEY); // q1's answer view
+      enterEditingFromRows(component);
+      for (const ch of "draft one") component.handleInput?.(ch);
+      component.handleInput?.(ESCAPE_KEY); // rows — draft kept within this session
+      assert.equal(fixture.instances[0]!.getText(), "draft one");
+
+      component.handleInput?.(ESCAPE_KEY); // list (q1 selected)
+      component.handleInput?.(DOWN); // select q2
+      component.handleInput?.(ENTER_KEY); // q2's answer view: fresh session
+      assert.equal(fixture.instances[0]!.getText(), "", "the previous draft never leaks into a new answer view");
+      component.handleInput?.(ESCAPE_KEY); // rows
+      component.handleInput?.(ESCAPE_KEY); // close the list
+    },
+  });
+
+  await fixture.settled;
+  assert.equal(fixture.sent.length, 0);
+  assert.equal(fixture.controller.listPending().length, 2);
+});
+
+function enterEditingFromRows(component: BridgeComponent): void {
+  component.handleInput?.(DOWN); // row 1: Type something…
+  component.handleInput?.(ENTER_KEY); // start editing
 }
 
-async function loadRealHost(): Promise<RealHost | undefined> {
-  const mod = await loadRealPiTuiModule();
-  if (!mod || typeof mod.Editor !== "function" || typeof mod.KeybindingsManager !== "function") return undefined;
-  return { mod };
-}
+test("wiring: the chat draft survives exactly once and the foreign prior factory is restored by identity", async () => {
+  const foreignFactory = (() => ({})) as never;
+  const fixture = await makeWiringFixture({
+    draft: "foreign-kept draft",
+    priorFactory: foreignFactory,
+    questions: [{ question: "Which database?", choices: ["SQLite"] }],
+    driver: (component, fixture) => {
+      enterEditing(component);
+      for (const ch of "answer") component.handleInput?.(ch);
+      component.handleInput?.(ENTER_KEY);
+    },
+  });
 
-function makeHostFixture(
-  host: RealHost,
-  userBindings: Record<string, string | string[]> = {},
-): EditorFixture {
-  const manager = new host.mod.KeybindingsManager(host.mod.TUI_KEYBINDINGS, userBindings);
-  // The standalone module's global keybinding state must point at the live
-  // manager (production does this in src/user-question/index.ts).
-  host.mod.setKeybindings(manager);
-  const sent: EditorFixture["sent"] = [];
+  await fixture.settled;
+  assert.equal(fixture.state.slotFactory, foreignFactory, "the foreign factory is restored by identity");
+  assert.equal(fixture.state.draft, "foreign-kept draft", "the displaced draft survived exactly once");
+  assert.ok(
+    fixture.state.notices.some((n) => n.type === "info" && /another extension/i.test(n.message)),
+    `foreign ownership is named: ${JSON.stringify(fixture.state.notices)}`,
+  );
+});
+
+test("wiring: a session-reset abort ends the episode and restores the draft into the instance", async () => {
+  const fixture = await makeWiringFixture({
+    draft: "precious draft",
+    questions: [{ question: "Which database?", choices: ["SQLite"] }],
+    driver: (component, fixture) => {
+      enterEditing(component);
+      for (const ch of "partial") component.handleInput?.(ch);
+      abortActiveNativeEditorField(); // the session_shutdown hook
+
+      assert.equal(fixture.instances[0]!.getText(), "precious draft", "the displaced chat draft is back in the instance");
+      assert.equal(fixture.handle.instance.fieldActive, false, "the open episode was ended");
+    },
+  });
+
+  // The list intentionally never closes here: the host owns the slot from the
+  // abort on, and finish() (already run) must be a no-op. Capture any
+  // driver/factory failure instead of swallowing it — the guard's late
+  // "never closed" rejection arrives after this assertion and is expected.
+  let failure: unknown;
+  void fixture.settled.catch((error: unknown) => {
+    failure = error;
+  });
+  await new Promise((resolve) => setImmediate(resolve)); // let an already-rejected settled land
+  assert.equal(failure, undefined, `driver/factory failure: ${String(failure)}`);
+  fixture.handle.finish();
+  assert.notEqual(fixture.state.slotFactory, undefined, "the bridge did not touch the slot after the abort");
+});
+
+test("wiring: a non-assignable onSubmit fails closed even without a live key matcher", async () => {
+  // Exotic host: onSubmit is a read-only accessor bound to the chat
+  // submitter, and there is no live key matcher. Intercepting Enter would
+  // be unreliable, so the bridge must refuse acquisition before any field
+  // input could reach the chat submitter.
+  const instances: FakeBridgeEditor[] = [];
+  const Base = createFakeCustomEditorClass(instances);
+  class LockedSubmitEditor extends Base {
+    private chatSubmit?: (text: string) => void;
+    constructor(tui: unknown, theme: unknown, keybindings: unknown) {
+      super(tui, theme, keybindings);
+      Object.defineProperty(this, "onSubmit", {
+        get: (): ((text: string) => void) | undefined => this.chatSubmit,
+        set: (_value: (text: string) => void): void => {
+          throw new Error("onSubmit is read-only on this host");
+        },
+        configurable: true,
+      });
+    }
+  }
+  const chatSubmits: string[] = [];
+  let slotFactory: NativeEditorFactory | undefined;
+  const ui = {
+    setEditorComponent(factory: NativeEditorFactory | undefined): void {
+      slotFactory = factory;
+      if (!factory) return;
+      const editor = factory({}, REAL_IDENTITY_THEME, null) as FakeBridgeEditor;
+      (editor as unknown as { chatSubmit?: (text: string) => void }).chatSubmit = (text: string) => {
+        chatSubmits.push(text);
+      };
+    },
+    getEditorComponent(): NativeEditorFactory | undefined {
+      return slotFactory;
+    },
+    notify(): void {},
+  };
+  setNativeEditorHost({ CustomEditor: LockedSubmitEditor as never });
+
+  assert.deepEqual(await acquireNativeEditorField(ui, { semantics: QUESTION_SEMANTICS }), {
+    kind: "unavailable",
+    reason: "the native submit path could not be taken over",
+  });
+  assert.equal(slotFactory, undefined, "the prior editor factory was restored");
+  assert.deepEqual(chatSubmits, [], "no field input reached the chat submitter");
+});
+
+test("wiring: overlapping acquisitions across the host-load await install only one field", async () => {
+  // Two opens that overlap across the awaited host load (e.g. a repeated
+  // shortcut chord during the cold host-module load) must not both install:
+  // the second would clobber the first's session and capture the bridge's
+  // own factory as "foreign" prior.
+  const instances: FakeBridgeEditor[] = [];
+  setNativeEditorHost(fakeHost(instances));
+  const ui1 = createBridgeUi({ keybindings: fakeKeybindingsManager(), draft: "draft one", drivers: [] });
+  const ui2 = createBridgeUi({ keybindings: fakeKeybindingsManager(), draft: "draft two", drivers: [] });
+
+  // Fire both without awaiting the first — the overlap across the await.
+  const first = acquireNativeEditorField(ui1.ui, { semantics: QUESTION_SEMANTICS });
+  const second = acquireNativeEditorField(ui2.ui, { semantics: QUESTION_SEMANTICS });
+  const [r1, r2] = (await Promise.all([first, second])) as Array<
+    | { kind: "acquired"; handle: NativeEditorFieldHandle }
+    | { kind: "unavailable"; reason: string }
+  >;
+
+  assert.deepEqual(
+    [r1.kind, r2.kind].sort(),
+    ["acquired", "unavailable"],
+    `exactly one installation: ${JSON.stringify([r1, r2])}`,
+  );
+  const loser = r1.kind === "acquired" ? r2 : r1;
+  assert.equal((loser as { kind: "unavailable"; reason: string }).reason, "a native editor field is already open");
+  assert.equal(instances.length, 1, "only one field instance was created");
+
+  // The winner's session is live and finishable; the loser's slot is untouched.
+  const winner = (r1.kind === "acquired" ? r1 : r2) as { kind: "acquired"; handle: NativeEditorFieldHandle };
+  const loserUi = r1.kind === "acquired" ? ui2 : ui1;
+  assert.equal(loserUi.state.slotFactory, undefined, "the refused open never touched its slot");
+  winner.handle.finish();
+});
+
+test("wiring: overlapping settings-field opens across the host-load await install only one field", async () => {
+  // The same one-field invariant on the settings entry point. With the
+  // post-await re-check, exactly one open installs and the other is refused
+  // before it touches its slot; without it, both would install (two
+  // instances) and the clobbered session could never be told apart.
+  const instances: FakeBridgeEditor[] = [];
+  setNativeEditorHost(fakeHost(instances));
+  const uiA = createBridgeUi({ keybindings: fakeKeybindingsManager(), draft: "draft A", drivers: [] });
+  const uiB = createBridgeUi({ keybindings: fakeKeybindingsManager(), draft: "draft B", drivers: [] });
+
+  // Fire both without awaiting the first — the overlap across the await.
+  const a = editTextWithNativeEditor(uiA.ui, { title: "T", prefill: "" });
+  const b = editTextWithNativeEditor(uiB.ui, { title: "T", prefill: "" });
+
+  // Let both continuations run; the refusal (when present) is immediate.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(instances.length, 1, "only one settings field instance was created");
+
+  // Settle the live field as a cancel and collect both outcomes.
+  abortActiveNativeEditorField();
+  const [ra, rb] = (await Promise.all([a, b])) as [NativeEditorFieldResult, NativeEditorFieldResult];
+  assert.deepEqual(
+    [ra.kind, rb.kind].sort(),
+    ["cancel", "unavailable"],
+    `one live field settled by the abort, one refused: ${JSON.stringify([ra, rb])}`,
+  );
+});
+
+test("wiring: unavailable native seams render an unavailable row; choices and Decline still work", async () => {
+  const sent: Array<{ message: string }> = [];
   const controller = new UserQuestionController({
     pi: {
-      sendUserMessage(message: string, options?: { deliverAs?: "steer" | "followUp" }) {
-        sent.push({ message, options });
+      sendUserMessage(message: string) {
+        sent.push({ message });
         return Promise.resolve();
       },
     },
     uiAvailable: () => true,
   });
-  const identity = { sessionManager: "HOST" };
+  const identity = { sessionManager: "unavailable" };
   controller.beginSession(identity);
   const done: unknown[] = [];
-  let editor: any;
-  const tui = { terminal: { rows: 40 }, requestRender(): void {} };
   const component = createQuestionListComponent({
     controller,
-    keybindings: manager,
+    keybindings: componentKeys(),
     theme: THEME,
     shortcutLabel: "Ctrl+Alt+Up",
-    tuiHost: {
-      matchesKey: (data: string, keyId: string) => keyId === QUESTION_LIST_SHORTCUT_KEY && data === CHORD,
-      visibleWidth: host.mod.visibleWidth as (text: string) => number,
-      wrapTextWithAnsi: host.mod.wrapTextWithAnsi as (text: string, width: number) => string[],
-    },
-    createAnswerEditor: () => {
-      editor = new host.mod.Editor(tui, {
-        borderColor: (text: string) => text,
-        selectList: {
-          selectedPrefix: (t: string) => t,
-          selectedText: (t: string) => t,
-          description: (t: string) => t,
-          scrollInfo: (t: string) => t,
-          noMatch: (t: string) => t,
-        },
-      });
-      return editor;
-    },
     onDone: (result) => done.push(result),
   });
-  // The real editor is created lazily; expose it through the fixture slot.
-  const fixture = {
-    controller,
+  const result = controller.register(
+    { toolCallId: "t1", question: "Which database?", choices: ["SQLite"], mode: "async" },
     identity,
-    sent,
-    done,
-    component,
-    keys: manager,
-    get editor() {
-      return editor as FakeAnswerEditor;
-    },
-  };
-  return fixture as EditorFixture;
-}
-
-function hostRegister(fixture: EditorFixture, question: string, choices?: string[]): void {
-  const result = fixture.controller.register(
-    { toolCallId: `t${fixture.controller.listPending().length + 1}`, question, choices, mode: "async" },
-    fixture.identity,
   );
   assert.ok(result.ok);
+
+  component.handleInput(ENTER_KEY); // answer view
+  const frame = component.render(80).join("\n").replace(/\n\s*/g, " ");
+  assert.match(frame, /Free text unavailable/, "the free-text row names the unavailable native editor");
+  assert.match(frame, /choices and\s+Decline still work/);
+
+  component.handleInput(DOWN); // Type something… (unavailable)
+  component.handleInput(ENTER_KEY); // confirming it is a no-op — nothing to edit
+  const frame2 = component.render(80).join("\n");
+  assert.ok(frame2.includes("Free text unavailable"), "still on the rows; editing was never entered");
+
+  component.handleInput(UP); // back to the choice
+  component.handleInput(ENTER_KEY); // confirm the choice
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sent.length, 1, "the choice still works");
+  assert.match(sent[0]!.message, /": SQLite$/);
+});
+
+test("wiring: acquisition is refused while another field is open", async () => {
+  const instances: FakeBridgeEditor[] = [];
+  setNativeEditorHost(fakeHost(instances));
+  const { ui } = createBridgeUi({ keybindings: fakeKeybindingsManager(), drivers: [] });
+  const first = await acquireNativeEditorField(ui, { semantics: QUESTION_SEMANTICS });
+  assert.equal(first.kind, "acquired");
+  try {
+    const second = await acquireNativeEditorField(ui, { semantics: QUESTION_SEMANTICS });
+    assert.deepEqual(second, { kind: "unavailable", reason: "a native editor field is already open" });
+  } finally {
+    (first as { kind: "acquired"; handle: NativeEditorFieldHandle }).handle.finish();
+  }
+});
+
+test("wiring: missing seams fail closed with an unavailable result", async () => {
+  const instances: FakeBridgeEditor[] = [];
+  setNativeEditorHost(fakeHost(instances));
+  const full = createBridgeUi({ keybindings: fakeKeybindingsManager(), drivers: [] });
+  const noSeams = { custom: full.ui.custom } as never;
+  const result = await acquireNativeEditorField(noSeams, { semantics: QUESTION_SEMANTICS });
+  assert.equal(result.kind, "unavailable");
+  if (result.kind === "unavailable") {
+    assert.match(result.reason, /setEditorComponent\/getEditorComponent/);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Real-host tier (installed Pi's CustomEditor + pi-tui, real keys)
+// ---------------------------------------------------------------------------
+
+interface RealFixtureOptions {
+  draft?: string;
+  userBindings?: Record<string, string | string[]>;
+  appHandlers?: Record<string, (editor: FakeBridgeEditor) => () => void>;
+  onPasteImage?: (editor: FakeBridgeEditor) => () => void;
+  withProvider?: boolean;
+  /** Registered before the field is acquired and the list opens. */
+  questions?: Array<{ question: string; choices?: string[] }>;
+  driver: (component: BridgeComponent, fixture: RealFixture) => void | Promise<void>;
 }
 
-function hostEnterEditing(fixture: EditorFixture): void {
-  enterEditing(fixture);
+interface RealFixture {
+  controller: UserQuestionController;
+  identity: object;
+  sent: Array<{ message: string; options?: unknown }>;
+  done: unknown[];
+  state: BridgeUiState;
+  instances: FakeBridgeEditor[];
+  handle: NativeEditorFieldHandle;
+  settled: Promise<void>;
+}
+
+async function makeRealFixture(options: RealFixtureOptions): Promise<RealFixture | undefined> {
+  const loaded = await loadRealBridgeHost();
+  if (!loaded) return undefined;
+  let fixtureRef: RealFixture | undefined;
+  setNativeEditorHost(loaded.host);
+  const instances: FakeBridgeEditor[] = [];
+  const sent: RealFixture["sent"] = [];
+  const controller = new UserQuestionController({
+    pi: {
+      sendUserMessage(message: string, opts?: unknown) {
+        sent.push({ message, options: opts });
+        return Promise.resolve();
+      },
+    },
+    uiAvailable: () => true,
+  });
+  const identity = { sessionManager: "real" };
+  controller.beginSession(identity);
+  for (const q of options.questions ?? []) {
+    registerQuestion(controller, identity, q.question, q.choices);
+  }
+  const done: unknown[] = [];
+
+  const keybindings = options.userBindings
+    ? createRealKeybindingsManagerWithOverrides(loaded.tui, options.userBindings)
+    : createRealKeybindingsManager(loaded.tui);
+  let provider: unknown;
+  if (options.withProvider !== false) {
+    const root = await makeDocsFixture();
+    const fdPath = findFdBinary();
+    provider = new (loaded.tui.CombinedAutocompleteProvider as new (commands: never[], basePath: string, fdPath?: string) => unknown)([], root, fdPath);
+  }
+  const { ui, state } = createBridgeUi({
+    theme: REAL_IDENTITY_THEME,
+    keybindings,
+    draft: options.draft ?? "chat draft",
+    provider,
+    appHandlers: options.appHandlers,
+    onPasteImage: options.onPasteImage,
+    drivers: [(component) => { void options.driver(component, fixtureRef!); }],
+  });
+
+  const acquired = await acquireNativeEditorField(ui, { semantics: QUESTION_SEMANTICS });
+  if (acquired.kind !== "acquired") throw new Error(`real acquisition failed: ${JSON.stringify(acquired)}`);
+  const handle = acquired.handle;
+
+  const opened = ui.custom!((_tui: unknown, _theme: unknown, _keybindings: unknown, close: (value: string | undefined) => void) => {
+    handle.prepare("");
+    return createQuestionListComponent({
+      controller,
+      keybindings, // the live manager drives both the component and the instance
+      theme: THEME,
+      shortcutLabel: "Ctrl+Alt+Up",
+      tuiHost: {
+        matchesKey: (data: string, keyId: string) => keyId === QUESTION_LIST_SHORTCUT_KEY && data === CHORD,
+      },
+      nativeField: handle.instance,
+      onDone: (result) => {
+        done.push(result);
+        close(undefined);
+      },
+    });
+  });
+  const settled = guardClose(opened.then(
+    () => {
+      handle.finish();
+    },
+    (error: unknown) => {
+      handle.finish();
+      // Surface driver/factory failures instead of reading them as a clean close.
+      throw error;
+    },
+  ));
+
+  fixtureRef = { controller, identity, sent, done, state, instances, handle, settled };
+  return fixtureRef;
+}
+
+/**
+ * A real KeybindingsManager with user overrides applied (the shared
+ * createRealKeybindingsManager hardcodes empty user bindings; bridge-fakes.ts
+ * is owned by another slice, so the override variant lives here).
+ */
+function createRealKeybindingsManagerWithOverrides(
+  tui: Record<string, unknown>,
+  userBindings: Record<string, string | string[]>,
+): { matches(data: string, keybinding: string): boolean } {
+  const definitions = {
+    ...(tui.TUI_KEYBINDINGS as Record<string, unknown>),
+    ...Object.fromEntries(Object.entries(APP_KEY_DEFAULTS).map(([id, keys]) => [id, { defaultKeys: keys, description: "" }])),
+  };
+  const manager = new (tui.KeybindingsManager as new (definitions: unknown, userBindings: unknown) => {
+    matches(data: string, keybinding: string): boolean;
+  })(definitions, userBindings);
+  (tui.setKeybindings as (keybindings: unknown) => void)(manager);
+  return manager;
 }
 
 /** Rendered lines with the hardware-cursor marker and ANSI styles removed. */
-function plainLines(host: RealHost, lines: string[]): string[] {
-  const marker = typeof host.mod.CURSOR_MARKER === "string" ? host.mod.CURSOR_MARKER : "\x1b_pi:c\x07";
+function plainLines(tui: Record<string, unknown>, lines: string[]): string[] {
+  const marker = typeof tui.CURSOR_MARKER === "string" ? (tui.CURSOR_MARKER as string) : "\x1b_pi:c\x07";
   return lines.map((line) => line.split(marker).join(""));
 }
 
-test("host integration: multiline draft renders width-correctly and navigates", async (t) => {
-  const host = await loadRealHost();
-  if (!host) {
-    t.skip("pi-tui is not resolvable in this environment");
+test("real host: Tab path completion works in the question field; Esc dismisses first, then returns to rows", async (t) => {
+  const loaded = await loadRealBridgeHost();
+  if (!loaded) {
+    skipOrFail(t, "no installed Pi is resolvable in this environment");
     return;
   }
-  const fixture = makeHostFixture(host);
-  hostRegister(fixture, "Which database?", ["SQLite"]);
-  hostEnterEditing(fixture);
-  for (const char of "alpha") fixture.component.handleInput(char);
-  fixture.component.handleInput(SHIFT_ENTER); // shift+enter inserts a newline
-  for (const char of "beta") fixture.component.handleInput(char);
+  realHostAfter(t);
 
-  const editor = fixture.editor as any;
-  assert.deepEqual(editor.getLines(), ["alpha", "beta"], "the real editor owns the multiline draft");
+  const fixture = await makeRealFixture({
+    withProvider: true,
+    questions: [{ question: "Which file?", choices: ["none"] }],
+    driver: async (component, fixture) => {
+      enterEditing(component);
+      typeText(component, "docs/");
+      await settle();
+      component.handleInput?.(TAB); // open the native list
+      await settle();
+      const frame = plainLines(loaded.tui, component.render!(200)).join("\n");
+      assert.ok(frame.includes("assets/"), `folder listed: ${frame}`);
+      assert.ok(frame.includes("guide.md"), `file listed: ${frame}`);
+      component.handleInput?.(TAB); // apply the highlighted folder natively
+      await settle();
+      assert.equal(fixture.handle.instance.getText(), "docs/assets/", "the completion was applied to the field");
 
-  const lines = plainLines(host, fixture.component.render(40));
-  for (const line of lines) {
-    assert.ok(host.mod.visibleWidth(line) <= 40, `line fits the width: ${JSON.stringify(line)}`);
-  }
-  assert.ok(lines.findIndex((line) => line.includes("alpha")) < lines.findIndex((line) => line.includes("beta")));
-
-  // Vertical navigation moves between the draft's lines (the cursor sits on
-  // the second line after typing it).
-  assert.equal(editor.getCursor().line, 1);
-  fixture.component.handleInput(UP);
-  assert.equal(editor.getCursor().line, 0, "up moves to the first line");
-  fixture.component.handleInput(DOWN);
-  assert.equal(editor.getCursor().line, 1, "down moves back to the second line");
-
-  // PageUp/PageDown are no-ops on a short draft but must not disturb it.
-  fixture.component.handleInput(PAGE_UP);
-  fixture.component.handleInput(PAGE_DOWN);
-  assert.deepEqual(editor.getLines(), ["alpha", "beta"]);
-});
-
-test("host integration: movement chords (word, line start/end, home/end) honor the live manager", async (t) => {
-  const host = await loadRealHost();
-  if (!host) {
-    t.skip("pi-tui is not resolvable in this environment");
-    return;
-  }
-  const fixture = makeHostFixture(host);
-  hostRegister(fixture, "Which database?", ["SQLite"]);
-  hostEnterEditing(fixture);
-  for (const char of "one two three") fixture.component.handleInput(char);
-  const editor = fixture.editor as any;
-  assert.equal(editor.getCursor().col, 13);
-
-  // Word movement: alt+left and ctrl+left.
-  fixture.component.handleInput(ALT_LEFT);
-  assert.equal(editor.getCursor().col, 8, "alt+left jumps to the start of 'three'");
-  fixture.component.handleInput(ALT_LEFT);
-  assert.equal(editor.getCursor().col, 4, "alt+left jumps to the start of 'two'");
-  fixture.component.handleInput(CTRL_LEFT);
-  assert.equal(editor.getCursor().col, 0, "ctrl+left jumps to the start of 'one'");
-
-  // Line start/end: ctrl+a / ctrl+e and home / end.
-  fixture.component.handleInput(CTRL_E);
-  assert.equal(editor.getCursor().col, 13, "ctrl+e moves to line end");
-  fixture.component.handleInput(HOME);
-  assert.equal(editor.getCursor().col, 0, "home moves to line start");
-  fixture.component.handleInput(END);
-  assert.equal(editor.getCursor().col, 13, "end moves to line end");
-  fixture.component.handleInput(CTRL_A);
-  assert.equal(editor.getCursor().col, 0, "ctrl+a moves to line start");
-
-  // Alt+right walks back toward the end.
-  for (let i = 0; i < 5; i += 1) fixture.component.handleInput(ALT_RIGHT);
-  assert.equal(editor.getCursor().col, 13, "alt+right reaches line end");
-
-  // Character jump forward (ctrl+]): the next key is the target character.
-  fixture.component.handleInput(CTRL_A); // from line start
-  fixture.component.handleInput("\x1d"); // ctrl+] = tui.editor.jumpForward
-  fixture.component.handleInput("t"); // jump to the next 't'
-  assert.equal(editor.getCursor().col, 4, "the jump landed on 'two'");
-});
-
-test("host integration: newline chords insert newlines; plain Enter submits", async (t) => {
-  const host = await loadRealHost();
-  if (!host) {
-    t.skip("pi-tui is not resolvable in this environment");
-    return;
-  }
-  const fixture = makeHostFixture(host);
-  hostRegister(fixture, "Which database?", ["SQLite"]);
-  hostEnterEditing(fixture);
-  for (const char of "first") fixture.component.handleInput(char);
-  fixture.component.handleInput(CTRL_J); // ctrl+j inserts a newline
-  for (const char of "second") fixture.component.handleInput(char);
-  const editor = fixture.editor as any;
-  assert.deepEqual(editor.getLines(), ["first", "second"], "ctrl+j inserted a newline");
-  fixture.component.handleInput(SHIFT_ENTER);
-  assert.equal(editor.getLines().length, 3, "shift+enter inserted another newline");
-
-  fixture.component.handleInput(ENTER); // plain Enter submits
-  assert.deepEqual(fixture.done, [{ kind: "submitted", result: { status: "delivered", empty: true } }]);
-  await flush();
-  assert.equal(fixture.sent.length, 1);
-  // Embedded newlines are preserved; only the ends are trimmed.
-  assert.match(fixture.sent[0]!.message, /": first\nsecond$/);
-});
-
-test("host integration: deletion, kill ring, and undo chords behave like the chat editor", async (t) => {
-  const host = await loadRealHost();
-  if (!host) {
-    t.skip("pi-tui is not resolvable in this environment");
-    return;
-  }
-  const fixture = makeHostFixture(host);
-  hostRegister(fixture, "Which database?", ["SQLite"]);
-  hostEnterEditing(fixture);
-  const editor = fixture.editor as any;
-
-  // ctrl+w deletes the word backward (host semantics: stops at the word
-  // start; a preceding space only goes with a word deleted from beyond it).
-  for (const char of "foo bar") fixture.component.handleInput(char);
-  fixture.component.handleInput(CTRL_W);
-  assert.equal(editor.getExpandedText(), "foo ", "ctrl+w deleted 'bar'");
-
-  // Forward delete: cursor before 'z', ctrl+d removes it.
-  for (const char of "baz") fixture.component.handleInput(char); // "foo baz"
-  fixture.component.handleInput(LEFT);
-  fixture.component.handleInput(CTRL_D);
-  assert.equal(editor.getExpandedText(), "foo ba", "ctrl+d deleted the character forward");
-
-  // ctrl+k deletes to line end; ctrl+y yanks it back.
-  fixture.component.handleInput(HOME);
-  for (let i = 0; i < 3; i += 1) fixture.component.handleInput(RIGHT); // after "foo"
-  fixture.component.handleInput(CTRL_K);
-  assert.equal(editor.getExpandedText(), "foo", "ctrl+k deleted to line end");
-  fixture.component.handleInput(CTRL_Y);
-  assert.equal(editor.getExpandedText(), "foo ba", "ctrl+y yanked the killed text back");
-
-  // ctrl+u deletes to line start.
-  fixture.component.handleInput(CTRL_U);
-  assert.equal(editor.getExpandedText(), "", "ctrl+u deleted to line start");
-
-  // Undo restores the last edit.
-  for (const char of "abc") fixture.component.handleInput(char);
-  fixture.component.handleInput(UNDO);
-  assert.equal(editor.getExpandedText(), "", "undo reverted the insertion");
-
-  // Delete key (forward) works too.
-  for (const char of "xy") fixture.component.handleInput(char);
-  fixture.component.handleInput(HOME);
-  fixture.component.handleInput(DELETE_FWD);
-  assert.equal(editor.getExpandedText(), "y", "delete removed the first character");
-});
-
-test("host integration: user keybinding overrides reach the embedded editor", async (t) => {
-  const host = await loadRealHost();
-  if (!host) {
-    t.skip("pi-tui is not resolvable in this environment");
-    return;
-  }
-  // Rebind submit to F8 and word-left to F6; the old keys must stop acting.
-  const fixture = makeHostFixture(host, {
-    "tui.input.submit": ["f8"],
-    "tui.editor.cursorWordLeft": ["f6"],
+      component.handleInput?.(ESCAPE_KEY); // back to the answer rows, draft kept
+      const frame2 = plainLines(loaded.tui, component.render!(200)).join("\n");
+      assert.ok(frame2.includes("Type something"), `back on the option rows: ${frame2}`);
+      component.handleInput?.(ENTER_KEY); // resume editing with the completed draft
+      component.handleInput?.(ENTER_KEY); // submit it
+    },
   });
-  hostRegister(fixture, "Which database?", ["SQLite"]);
-  // Row confirmation still uses tui.select.confirm (Enter) — unchanged.
-  fixture.component.handleInput(ENTER); // answer view
-  fixture.component.handleInput(DOWN); // Type something…
-  fixture.component.handleInput(ENTER); // start editing
-  const editor = fixture.editor as any;
-  for (const char of "one two three") fixture.component.handleInput(char);
+  if (!fixture) return; // unreachable: the host was resolved above
 
-  fixture.component.handleInput(ALT_LEFT);
-  assert.equal(editor.getCursor().col, 13, "the old word-left binding no longer acts");
-  fixture.component.handleInput(F6);
-  assert.equal(editor.getCursor().col, 8, "the user's F6 binding moves the word left");
+  await fixture.settled;
+  assert.equal(fixture.sent.length, 1);
+  assert.match(fixture.sent[0]!.message, /": docs\/assets\/$/);
+  assert.deepEqual(fixture.state.chatSubmits, [], "no chat message was sent");
+});
 
-  fixture.component.handleInput(ENTER);
-  assert.equal(fixture.done.length, 0, "Enter no longer submits after the rebind");
-  assert.equal(editor.getExpandedText(), "one two three", "the draft is untouched by the inert Enter");
-  fixture.component.handleInput(F8);
-  assert.deepEqual(fixture.done, [{ kind: "submitted", result: { status: "delivered", empty: true } }]);
-  await flush();
+test("real host: the fd-backed @ picker applies a fuzzy match into the answer", async (t) => {
+  const loaded = await loadRealBridgeHost();
+  if (!loaded) {
+    skipOrFail(t, "no installed Pi is resolvable in this environment");
+    return;
+  }
+  const fdPath = findFdBinary();
+  if (!fdPath) {
+    skipOrFail(t, "fd is not resolvable (PATH and PI_REVIEW_GATE_FD); the @ picker cannot be exercised");
+    return;
+  }
+  realHostAfter(t);
+
+  const fixture = await makeRealFixture({
+    questions: [{ question: "Which file?", choices: ["none"] }],
+    driver: async (component, fixture) => {
+      enterEditing(component);
+      typeText(component, "@gui"); // fuzzy prefix for docs/guide.md
+      component.handleInput?.(TAB); // forced fuzzy file search
+      await settle(400); // the fd round trip completes; a single match auto-applies
+      const frame = plainLines(loaded.tui, component.render!(200)).join("\n");
+      assert.ok(frame.includes("@docs/guide.md"), `the fuzzy match was applied natively: ${frame}`);
+      component.handleInput?.(ENTER_KEY); // submit the answer with the picked file
+    },
+  });
+  if (!fixture) return;
+
+  await fixture.settled;
+  assert.equal(fixture.sent.length, 1);
+  assert.match(fixture.sent[0]!.message, /@docs\/guide\.md/);
+});
+
+test("real host: Ctrl+C clears the field draft and never cancels", async (t) => {
+  const loaded = await loadRealBridgeHost();
+  if (!loaded) {
+    skipOrFail(t, "no installed Pi is resolvable in this environment");
+    return;
+  }
+  realHostAfter(t);
+
+  const fixture = await makeRealFixture({
+    questions: [{ question: "Which database?", choices: ["SQLite"] }],
+    driver: (component, fixture) => {
+      enterEditing(component);
+      typeText(component, "some text");
+      component.handleInput?.(CTRL_C); // the real key matches app.clear through the copied handler
+
+      assert.equal(fixture.state.shutdowns, 0, "a single Ctrl+C never exits");
+      const frame = plainLines(loaded.tui, component.render!(200)).join("\n");
+      assert.ok(!frame.includes("some text"), `the draft was cleared: ${frame}`);
+      assert.ok(frame.includes("Enter submit · Esc back to options"), `still editing after the clear: ${frame}`);
+
+      typeText(component, "again");
+      component.handleInput?.(ENTER_KEY); // submit what remains
+    },
+  });
+  if (!fixture) return;
+
+  await fixture.settled;
+  assert.equal(fixture.sent.length, 1);
+  assert.match(fixture.sent[0]!.message, /": again$/);
+});
+
+test("real host: Ctrl+G runs the external editor against the field instance", async (t) => {
+  const loaded = await loadRealBridgeHost();
+  if (!loaded) {
+    skipOrFail(t, "no installed Pi is resolvable in this environment");
+    return;
+  }
+  realHostAfter(t);
+
+  const externalEdits: string[] = [];
+  const fixture = await makeRealFixture({
+    questions: [{ question: "Which database?", choices: ["SQLite"] }],
+    appHandlers: {
+      "app.editor.external": (editor) => () => {
+        const content = editor.getExpandedText();
+        externalEdits.push(content);
+        editor.setText(`${content} [externally edited]`);
+      },
+    },
+    driver: (component, fixture) => {
+      enterEditing(component);
+      typeText(component, "base line");
+      component.handleInput?.(CTRL_G); // the real key matches app.editor.external
+      component.handleInput?.(ENTER_KEY);
+    },
+  });
+  if (!fixture) return;
+
+  await fixture.settled;
+  assert.deepEqual(externalEdits, ["base line"], "the external editor saw the field's expanded text exactly once");
+  assert.equal(fixture.sent.length, 1);
+  assert.match(fixture.sent[0]!.message, /": base line \[externally edited\]$/);
+});
+
+test("real host: Ctrl+V image paste inserts the temp path into the answer", async (t) => {
+  const loaded = await loadRealBridgeHost();
+  if (!loaded) {
+    skipOrFail(t, "no installed Pi is resolvable in this environment");
+    return;
+  }
+  realHostAfter(t);
+
+  const FAKE_IMAGE_PATH = "/tmp/pi-clipboard-question-1234.png";
+  const fixture = await makeRealFixture({
+    questions: [{ question: "Attach a screenshot?", choices: ["none"] }],
+    onPasteImage: (editor) => () => {
+      editor.insertTextAtCursor(FAKE_IMAGE_PATH);
+    },
+    driver: (component, fixture) => {
+      enterEditing(component);
+      component.handleInput?.(CTRL_V); // real keypress through the real editor
+      const frame = plainLines(loaded.tui, component.render!(200)).join("\n");
+      assert.ok(frame.includes(FAKE_IMAGE_PATH), `the temp path is in the field: ${frame}`);
+      component.handleInput?.(ENTER_KEY); // submit with the pasted path
+    },
+  });
+  if (!fixture) return;
+
+  await fixture.settled;
+  assert.equal(fixture.sent.length, 1);
+  assert.match(fixture.sent[0]!.message, new RegExp(FAKE_IMAGE_PATH.replace(/\//g, "\\/")));
+});
+
+test("real host: Shift+Enter inserts a newline and the multi-line answer submits intact", async (t) => {
+  const loaded = await loadRealBridgeHost();
+  if (!loaded) {
+    skipOrFail(t, "no installed Pi is resolvable in this environment");
+    return;
+  }
+  realHostAfter(t);
+
+  const fixture = await makeRealFixture({
+    questions: [{ question: "Which database?", choices: ["SQLite"] }],
+    driver: (component, fixture) => {
+      enterEditing(component);
+      typeText(component, "line one");
+      component.handleInput?.(SHIFT_ENTER); // native newline
+      typeText(component, "line two");
+      component.handleInput?.(ENTER_KEY);
+    },
+  });
+  if (!fixture) return;
+
+  await fixture.settled;
+  assert.equal(fixture.sent.length, 1);
+  assert.match(fixture.sent[0]!.message, /": line one\nline two$/);
+});
+
+test("real host: user keybinding overrides reach the question field", async (t) => {
+  const loaded = await loadRealBridgeHost();
+  if (!loaded) {
+    skipOrFail(t, "no installed Pi is resolvable in this environment");
+    return;
+  }
+  realHostAfter(t);
+
+  // Rebind submit to F8; Enter must stop submitting from the field.
+  const fixture = await makeRealFixture({
+    userBindings: { "tui.input.submit": ["f8"] },
+    questions: [{ question: "Which database?", choices: ["SQLite"] }],
+    driver: (component, fixture) => {
+      enterEditing(component);
+      typeText(component, "one two three");
+
+      component.handleInput?.(ENTER_KEY);
+      assert.equal(fixture.done.length, 0, "Enter no longer submits after the rebind");
+      const frame = plainLines(loaded.tui, component.render!(200)).join("\n");
+      assert.ok(frame.includes("one two three"), `the draft is untouched by the inert Enter: ${frame}`);
+
+      component.handleInput?.(F8); // the user's submit binding
+    },
+  });
+  if (!fixture) return;
+
+  await fixture.settled;
+  assert.equal(fixture.sent.length, 1);
   assert.match(fixture.sent[0]!.message, /": one two three$/);
 });
 
-test("host integration: unsupported escape input never leaks printable tails into the draft", async (t) => {
-  const host = await loadRealHost();
-  if (!host) {
-    t.skip("pi-tui is not resolvable in this environment");
+test("real host: Esc dismisses a visible completion list first, then returns to the rows", async (t) => {
+  const loaded = await loadRealBridgeHost();
+  if (!loaded) {
+    skipOrFail(t, "no installed Pi is resolvable in this environment");
     return;
   }
-  const fixture = makeHostFixture(host);
-  hostRegister(fixture, "Which database?", ["SQLite"]);
-  hostEnterEditing(fixture);
-  for (const char of "yes") fixture.component.handleInput(char);
-  const unknown = [
-    "\x1b[1;99A", // arrow with an unsupported modifier value
-    "\x1bOZ", // SS3 sequence the editor does not own
-    "\x1b[999~", // unknown parameterized sequence
-  ];
-  for (const sequence of unknown) fixture.component.handleInput(sequence);
+  realHostAfter(t);
 
-  const editor = fixture.editor as any;
-  assert.equal(editor.getExpandedText(), "yes", "unknown sequences change nothing");
-  const rendered = plainLines(host, fixture.component.render(80)).join("\n");
-  assert.ok(!/1;99A|OZ|999~/.test(rendered), "no printable tails reach the rendering");
+  const fixture = await makeRealFixture({
+    withProvider: true,
+    questions: [{ question: "Which file?", choices: ["none"] }],
+    driver: async (component, fixture) => {
+      enterEditing(component);
+      typeText(component, "docs/");
+      await settle();
+      component.handleInput?.(TAB); // open the list
+      await settle();
+      const frame = plainLines(loaded.tui, component.render!(200)).join("\n");
+      assert.ok(frame.includes("assets/"), "the list is visible");
 
-  // The draft remains fully editable afterwards.
-  for (const char of " and no") fixture.component.handleInput(char);
-  fixture.component.handleInput(ENTER);
-  assert.deepEqual(fixture.done, [{ kind: "submitted", result: { status: "delivered", empty: true } }]);
-  await flush();
-  assert.match(fixture.sent[0]!.message, /": yes and no$/);
-});
+      component.handleInput?.(ESCAPE_KEY); // first Esc: dismiss the list only
+      await settle();
+      const frame2 = plainLines(loaded.tui, component.render!(200)).join("\n");
+      assert.ok(!frame2.includes("assets/"), `the list was dismissed: ${frame2}`);
+      assert.ok(frame2.includes("docs/"), "the draft text survives the dismissal");
+      assert.ok(frame2.includes("Enter submit · Esc back to options"), `still editing after the dismissal: ${frame2}`);
 
-test("host integration: answers beyond 4000 characters are kept and submit in full", async (t) => {
-  const host = await loadRealHost();
-  if (!host) {
-    t.skip("pi-tui is not resolvable in this environment");
-    return;
-  }
-  const fixture = makeHostFixture(host);
-  hostRegister(fixture, "Which database?", ["SQLite"]);
-  hostEnterEditing(fixture);
-  const editor = fixture.editor as any;
+      component.handleInput?.(ESCAPE_KEY); // second Esc: back to the answer rows
+      const frame3 = plainLines(loaded.tui, component.render!(200)).join("\n");
+      assert.ok(frame3.includes("Type something"), `back on the option rows: ${frame3}`);
+      component.handleInput?.(ESCAPE_KEY); // answer rows → list
+      component.handleInput?.(ESCAPE_KEY); // close the list
+    },
+  });
+  if (!fixture) return;
 
-  // A large draft (paste or typed) is never clamped: the full content is
-  // stored, stays editable, and submits without data loss.
-  editor.setText("a".repeat(4500));
-  assert.equal(editor.getExpandedText(), "a".repeat(4500), "the over-4000 draft is kept in full");
-  fixture.component.handleInput("b");
-  assert.equal(editor.getExpandedText(), "a".repeat(4500) + "b", "typing past 4000 keeps appending");
-  fixture.component.handleInput(ENTER);
-  assert.deepEqual(fixture.done, [{ kind: "submitted", result: { status: "delivered", empty: true } }]);
-  await flush();
-  assert.equal(fixture.sent.length, 1);
-  assert.ok(fixture.sent[0]!.message.endsWith("a".repeat(4500) + "b"));
-
-  // A large bracketed paste from an empty draft is kept in full too.
-  const second = makeHostFixture(host);
-  hostRegister(second, "Which database?", ["SQLite"]);
-  hostEnterEditing(second);
-  second.component.handleInput(`\x1b[200~${"c".repeat(5000)}\x1b[201~`);
-  const expanded = (second.editor as any).getExpandedText();
-  assert.equal(expanded, "c".repeat(5000), "the pasted draft is kept in full");
-  second.component.handleInput(ENTER);
-  await flush();
-  assert.equal(second.sent.length, 1);
-  assert.ok(second.sent[0]!.message.endsWith("c".repeat(5000)));
-});
-
-test("host integration: choice and decline lifecycle is unchanged with the real editor", async (t) => {
-  const host = await loadRealHost();
-  if (!host) {
-    t.skip("pi-tui is not resolvable in this environment");
-    return;
-  }
-  // Choice.
-  const choiceFixture = makeHostFixture(host);
-  hostRegister(choiceFixture, "Which database?", ["SQLite", "Postgres"]);
-  choiceFixture.component.handleInput(ENTER); // answer view
-  choiceFixture.component.handleInput(DOWN); // 2. Postgres
-  choiceFixture.component.handleInput(ENTER); // confirm
-  assert.deepEqual(choiceFixture.done, [{ kind: "submitted", result: { status: "delivered", empty: true } }]);
-  await flush();
-  assert.match(choiceFixture.sent[0]!.message, /": Postgres$/);
-
-  // Decline.
-  const declineFixture = makeHostFixture(host);
-  hostRegister(declineFixture, "Which database?", ["SQLite"]);
-  declineFixture.component.handleInput(ENTER); // answer view
-  declineFixture.component.handleInput(DOWN); // Type something…
-  declineFixture.component.handleInput(DOWN); // Decline row
-  declineFixture.component.handleInput(ENTER); // confirm decline
-  assert.deepEqual(declineFixture.done, [{ kind: "submitted", result: { status: "declined", empty: true } }]);
-  await flush();
-  assert.equal(declineFixture.sent.length, 0);
-
-  // Escape from real-editor editing preserves the draft for re-entry.
-  const draftFixture = makeHostFixture(host);
-  hostRegister(draftFixture, "Which database?", ["SQLite"]);
-  hostEnterEditing(draftFixture);
-  for (const char of "kept") draftFixture.component.handleInput(char);
-  draftFixture.component.handleInput(ESCAPE);
-  assert.equal((draftFixture.editor as any).getExpandedText(), "kept");
-  draftFixture.component.handleInput(ENTER); // resume editing
-  assert.equal((draftFixture.editor as any).getCursor().col, 4, "the cursor position survives too");
+  await fixture.settled;
+  assert.deepEqual(fixture.done, [{ kind: "closed" }]);
+  assert.equal(fixture.sent.length, 0);
+  assert.equal(fixture.state.draft, "chat draft", "the chat draft survived");
 });

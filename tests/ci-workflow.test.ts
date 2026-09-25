@@ -262,6 +262,132 @@ test("full-suite always provides the Pi agent-core runtime for the native outer-
   assert.doesNotMatch(full, /continue-on-error/, "the runtime step must not be an optional skip");
 });
 
+// --- Pinned Pi UI runtime, real-host gate, and fd provisioning ---------------
+// The full suite must exercise the real Pi native UI (issue #26): a locked
+// full pi-coding-agent runtime installed in the runner temp, the real-host
+// helpers pointed at it, the required-host gate on, and the fd file-finder
+// provisioned for the native `@` picker. None of this ships as a package
+// dependency, and none of it may silently skip.
+
+const PI_PACKAGES = [
+  "@earendil-works/pi-coding-agent",
+  "@earendil-works/pi-tui",
+  "@earendil-works/pi-agent-core",
+] as const;
+
+function fullJobBlock(): string {
+  return blockOf(readWorkflow(), "full-tests", 2);
+}
+
+function readRootPackageJson(): Record<string, Record<string, string> | undefined> {
+  return JSON.parse(readFileSync(join(projectRoot, "package.json"), "utf8"));
+}
+
+function readRootLock(): { packages?: Record<string, unknown> } {
+  return JSON.parse(readFileSync(join(projectRoot, "package-lock.json"), "utf8"));
+}
+
+function readPiUiRuntimeManifest(): { dependencies?: Record<string, string> } {
+  return JSON.parse(readFileSync(join(projectRoot, "scripts", "ci", "pi-ui-runtime", "package.json"), "utf8"));
+}
+
+function readPiUiRuntimeLock(): { packages?: Record<string, { version?: string }> } {
+  return JSON.parse(readFileSync(join(projectRoot, "scripts", "ci", "pi-ui-runtime", "package-lock.json"), "utf8"));
+}
+
+test("full-suite installs the locked Pi UI runtime, provisions fd, and requires real Pi hosts", () => {
+  const full = fullJobBlock();
+
+  // The locked full UI runtime installs from the canonical manifest, exactly
+  // like the agent-core runtime, into the runner temp.
+  assert.match(full, /Install pinned full Pi UI runtime/);
+  assert.match(full, /cp scripts\/ci\/pi-ui-runtime\/package\.json scripts\/ci\/pi-ui-runtime\/package-lock\.json "\$RUNNER_TEMP\/pi-ui-runtime\/"/,
+    "the UI runtime must install from the canonical locked manifest, not an ad-hoc package.json");
+  assert.match(full, /npm ci --no-audit --no-fund/,
+    "the runtime install must be a lockfile-exact ci; live range re-resolution breaks on upstream publish races");
+  const manifest = readPiUiRuntimeManifest();
+  const pin = manifest.dependencies?.["@earendil-works/pi-coding-agent"];
+  assert.match(pin ?? "", /^\d+\.\d+\.\d+$/,
+    "the UI runtime must be pinned to an exact published version in the canonical manifest");
+  const lock = readPiUiRuntimeLock();
+  assert.equal(lock.packages?.["node_modules/@earendil-works/pi-coding-agent"]?.version, pin,
+    "the UI runtime lock must freeze the exact pinned version, not a drifted one");
+  assert.equal(lock.packages?.["node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui"]?.version, pin,
+    "the installed runtime must carry the pinned pi-tui peer for the real TUI components");
+
+  // Real-host helpers point at the locked runtime; a missing host fails the
+  // gated tests instead of silently skipping.
+  assert.match(full, /PI_REVIEW_GATE_INSTALLED_AGENT=\$RUNNER_TEMP\/pi-ui-runtime\/node_modules\/@earendil-works\/pi-coding-agent/,
+    "the real-host helpers must be pointed at the locked runtime, not ambient installs");
+  assert.match(full, /PI_REVIEW_GATE_REQUIRE_PI_HOST=1/,
+    "the full suite must require real Pi hosts: gated tests fail rather than skip when Pi is missing");
+  assert.doesNotMatch(full, /continue-on-error/, "the runtime steps must not be optional");
+
+  // The TUI smoke launches the built candidate through the public extension
+  // seam; the candidate must be compiled into the runner temp, never into the
+  // checkout's live dist.
+  assert.match(full, /--outDir "\$RUNNER_TEMP\/review-gate-candidate\/dist"/,
+    "the candidate extension must be built into scratch, never into the checkout's live dist");
+  assert.match(full, /ln -sfn "\$GITHUB_WORKSPACE\/node_modules" "\$RUNNER_TEMP\/review-gate-candidate\/node_modules"/,
+    "the candidate must reach the checkout's installed tree: the compiled entry resolves " +
+    "playwright/linkedom/undici/... with plain Node resolution, which fails outside the checkout");
+  assert.match(full, /ln -sfn "\$GITHUB_WORKSPACE\/scripts" "\$RUNNER_TEMP\/review-gate-candidate\/scripts"/,
+    "the candidate loads packaged mode prompts from scripts/ at extension activation");
+  assert.match(full, /PI_REVIEW_GATE_CANDIDATE_ENTRY=\$RUNNER_TEMP\/review-gate-candidate\/dist\/src\/index\.js/,
+    "the smoke resolves the built candidate through an explicit test-only path");
+
+  // The fd file-finder is provisioned for the native `@` picker; provisioning
+  // failure fails the job, and the resolved path is exported so the @ test
+  // never depends on ambient PATH variance.
+  assert.match(full, /apt-get install -y --no-install-recommends fd-find/,
+    "the full suite must provision the fd file-finder the native @ picker needs");
+  assert.match(full, /command -v fd >\/dev\/null 2>&1 \|\| command -v fdfind >\/dev\/null 2>&1/,
+    "the fd provisioning step must fail the job when no finder binary is available");
+  assert.match(full, /PI_REVIEW_GATE_FD=\$\(command -v fd \|\| command -v fdfind\)/,
+    "the resolved finder path must be exported so the @ test never depends on ambient PATH variance");
+
+  // The gate must be exported by the step that owns it, never preset as a
+  // job-level env: Windows coverage legitimately keeps skipping real-host
+  // cases, and a global preset would convert those skips into failures.
+  for (const jobId of topLevelJobIds(readWorkflow())) {
+    const job = blockOf(readWorkflow(), jobId, 2);
+    const envBlock = job.match(/^    env:\n((?:      .*\n?)*)/m);
+    if (!envBlock) continue;
+    assert.doesNotMatch(envBlock[1], /PI_REVIEW_GATE_REQUIRE_PI_HOST/,
+      `job ${jobId} must not preset PI_REVIEW_GATE_REQUIRE_PI_HOST; only the Linux full suite requires real hosts`);
+  }
+
+  // Nothing of the Pi runtime ships as a package dependency, and the root
+  // lock never gains a Pi runtime entry.
+  const pkg = readRootPackageJson();
+  for (const section of ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]) {
+    const deps = pkg[section] ?? {};
+    for (const name of PI_PACKAGES) {
+      assert.equal(deps[name], undefined,
+        `${section}.${name} would ship Pi as a package dependency; the UI runtime must stay a test-only CI install`);
+    }
+  }
+  const rootLock = readRootLock();
+  for (const name of PI_PACKAGES) {
+    assert.equal(rootLock.packages?.[`node_modules/${name}`], undefined,
+      `the root lock must not gain a Pi runtime entry (${name})`);
+  }
+});
+
+test("both real-host @ picker cases honor the required-host CI gate", () => {
+  for (const name of ["native-editor-bridge.test.ts", "user-question-editor-parity.test.ts"]) {
+    const source = readFileSync(join(projectRoot, "tests", name), "utf8");
+    const start = source.indexOf('test("real host: the fd-backed @ picker');
+    assert.ok(start >= 0, `${name} must exercise the real Pi @ picker`);
+    const next = source.indexOf("\ntest(", start + 5);
+    const pickerCase = source.slice(start, next < 0 ? undefined : next);
+    assert.match(pickerCase, /if \(!fdPath\) \{[\s\S]*?skipOrFail\(t,/,
+      `${name} must fail instead of skip when fd is absent under the required-host gate`);
+    assert.doesNotMatch(pickerCase, /\bt\.skip\(/,
+      `${name} must not silently skip the picker under the required-host gate`);
+  }
+});
+
 // --- Release publisher integration ------------------------------------------
 // CI is the sole caller of the reusable prerelease builder. These assertions pin
 // the caller's trust boundary: correct event/ref/repository, both required check

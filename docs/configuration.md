@@ -327,7 +327,7 @@ consumes.
 | `cron` | (required) | Standard five-field Unix cron expression (minute, hour, day-of-month, month, day-of-week), interpreted in the machine's local timezone. Ranges, lists, steps, and `jan`–`dec` / `sun`–`sat` names are accepted; `7` means Sunday. No seconds field and no `@` shorthands. |
 | `enabled` | `true` | Disabled entries stay configured but are never dispatched. |
 | `kind` | `"execute"` | `execute` (write-capable subtask) or `research` (read-only subtask). |
-| `instructions` | (required) | Instructions carried verbatim to the scheduled subtask. |
+| `instructions` | (required) | Instructions carried verbatim to the scheduled subtask. An image pasted through the native host editor is copied into a private managed store at Save and the instructions keep the managed absolute path — see [Scheduled instruction images](#scheduled-instruction-images). |
 | `workspace` | (required) | Explicit authorized target workspace directory for the scheduled run. A leading `~` or `~/...` expands against the user's home (the same Pi-native rule as the built-in file tools); every other spelling, including `~user`, is used verbatim. Save persists the expanded absolute spelling of a tilde workspace (the runtime separately resolves the target's realpath). |
 | `workerResourceId` | absent | Optional override naming an `execution.workerResources` entry. See below. |
 | `review` | absent | Task-local review choice. See below. |
@@ -386,6 +386,87 @@ any stored copy going stale:
 
 The two inheritances are independent: an entry may pin a worker while
 inheriting review policy, or the reverse.
+
+### Scheduled instruction images
+
+An image pasted through the native editor in a scheduled task's
+**Instructions** field (Ctrl+V in the interactive TUI) inserts a path to one
+of Pi's temporary clipboard files — a path, never image bytes, and Pi deletes
+those files, so a temporary path saved as instruction text would break on a
+later run. At Save, such a paste is made durable instead:
+
+- Save verifies each pasted path against the **final staged instructions**
+  (an observation of the paste is only provenance; a token that was deleted or
+  edited away copies nothing), opens the file and validates it by content
+  (PNG, JPEG, GIF, or WebP; regular file; at most 10 MiB), copies the bytes
+  into a private managed store next to the config file
+  (`<config dir>/scheduled-image-assets/<task id>/`), and replaces the
+  temporary path in the instructions with that managed absolute path before
+  the ordinary atomic config write. The config file never contains image
+  bytes.
+- Only text Pi's image paste itself could have produced is treated as a
+  pasted image: a single absolute path in the OS temp directory named
+  `pi-clipboard-<UUID>.<png|jpg|jpeg|gif|webp>` (Pi's own paste naming, with
+  the strict UUID basename, and the content still validated after that path
+  recognition). Pi's native Ctrl+V inserts ordinary clipboard text through
+  the same editor call, so a plain text paste — any other absolute path
+  (file, directory, real or nonexistent), a sentence, or `@` attachment text
+  — is never treated as an image: it stays verbatim in the instructions and
+  Save behaves exactly as native text paste always did, even when the named
+  file does not exist or its content happens to be an image. If the temp
+  directory's own name contains spaces (a Windows user or home directory), a
+  genuine UUID-named temp insert is still recognized.
+- The managed store is private (0700 directories, 0600 files, fsynced before
+  the rename) and append-only: assets are **never auto-deleted** when an entry
+  is edited, disabled, or removed, because an active run of that entry — or a
+  scheduled run in another Pi process sharing the config — may still read
+  them. After every run that could reference a file has settled (or the entry
+  and any sharing process are gone), delete unneeded files from the store
+  manually. A bounded garbage-collection pass is a possible follow-up, not
+  current behavior.
+- Fail closed: a pasted source that is missing (Pi's temp file already
+  deleted), not a supported image, or too large fails the whole Save with an
+  actionable notice, leaving the config and the store untouched; the same
+  applies if the copy fails, or if a source grows past the limit between the
+  size check and the read, and only copies that Save positively created are
+  removed (if a persistence failure lands after the config write, the copies
+  the persisted text references are kept, matched against the parsed saved
+  config). Cancel at any level copies
+  nothing, and a pasted path must remain separated by spaces from surrounding
+  text — a path glued to adjacent text fails Save with a message asking for
+  the separating space. A pasted image therefore has to
+  be re-pasted and Saved while its source still exists (paste, then Save — do
+  not close and reopen the settings menu in between without saving). Text
+  glued directly after a pasted path (for example a `.bak` suffix) also fails
+  Save: the saved reference would never resolve; trailing sentence punctuation
+  (`<path>.`, `<path>,`) is still accepted.
+- Provenance boundary: only inserts observed through the native editor's
+  public paste seam are ever considered. A `pi-clipboard-...` path that
+  appears in the instructions without such an observation — typed by hand,
+  edited into the config file, or entered through the non-interactive
+  editor/input fallback — cannot be verified and fails Save with an actionable
+  message instead of being copied or persisted; Pi deletes its clipboard temp
+  files, so persisting such a reference would promise image availability it
+  cannot keep. Save checks every staged scheduled entry, so a pre-existing
+  unobserved clipboard-temp reference also blocks an otherwise unrelated
+  settings Save until that reference is removed. This gate is broader than
+  the copy recognition: any `pi-clipboard-...` reference without an observed
+  paste fails Save, even
+  with a non-image extension or a non-UUID name. Ordinary typed paths and
+  commands are never touched, and
+  `@`-picker selections or terminal drops (whose image provenance is not
+  observable through public native seams) are left as ordinary text. If the
+  same image is needed in two entries, paste it into each entry; the pastes
+  get independent managed copies. If the managed store root or a per-task
+  directory exists as a symbolic link (for example pointed at a foreign
+  directory), Save fails closed with an actionable message: the store is
+  never chmod'ed or copied into through a symlink, and the link's target is
+  left untouched.
+- At dispatch, an entry whose instructions reference a managed image that no
+  longer exists fails that occurrence closed with the standard actionable
+  dispatch-failure report (naming the missing file) instead of silently
+  starting a run against a dead path; existing overlap, overdue, and review
+  semantics are unchanged.
 
 ### Local time and daylight saving
 
@@ -491,6 +572,12 @@ without replaying anything. A Save likewise drops occurrences that were
 sampled but not yet admitted: none of them starts afterwards with the old or
 the edited definition. Entries that fail validation at dispatch time are
 skipped with an actionable report instead of taking down the timer loop.
+
+**Managed images:** when a due entry's instructions reference a managed
+scheduled image (see [Scheduled instruction images](#scheduled-instruction-images))
+that no longer exists, the occurrence is not dispatched: it is reported
+through the standard actionable dispatch-failure wake naming the missing file,
+and the next due occurrence is evaluated independently.
 
 ## Web fields
 
@@ -838,15 +925,41 @@ controls apply unmodified — Tab path completion for relative or `~/...` paths
 files; a single match is applied directly, exactly as in the chat editor), the
 fd-backed `@` file picker, Ctrl+C clear, Ctrl+G external editing for long values
 such as scheduled-task instructions, image paste, and Shift+Enter newlines.
+For scheduled instructions, a native image paste is persisted durably at Save
+into the private managed store described in
+[Scheduled instruction images](#scheduled-instruction-images) — the pasted
+temporary path is validated by content, copied there, and replaced by the
+managed absolute path before the config write. There is no second editor or
+clipboard surface; recognition for this persistence stays bounded to Pi's
+clipboard temp naming and this config's own managed store root.
 Enter submits the field's own text (never a chat message); Esc first dismisses a
 visible completion list, then cancels the field, leaving the staged value
-unchanged. The scheduled-task **workspace** field uses this same surface — there
-is no workspace-only editor or completion wiring of its own. Token recognition,
-relative/`~`/absolute handling, platform behavior, the list UI, and selection
-keys are inherited from the host as-is, so no universal absolute-path or Windows
-support is claimed: a line starting with `/` remains the host editor's
-slash-command context, and completion there follows the host chat editor's own
-behavior. An interactive host missing the required native seams fails closed
+unchanged. The scheduled-task **workspace** field uses this same surface with one
+field-scoped addition: it opts into native absolute-path completion. A first-line
+token that starts with `/` and contains no space (`/`, `/var`, a nested absolute
+path) gets the host provider's own filesystem suggestions in its ordinary
+file-list layout — never slash-command items, so a nonexistent token such as
+`/subtasks` simply lists nothing instead of offering commands. No second
+completer is involved: the field decorates only the host-provided autocomplete
+provider through the public `setAutocompleteProvider` seam, forcing that
+provider's own file branch for those tokens and masking the returned prefix's
+leading slash with a same-length neutral sentinel so the editor renders the file
+list (not the two-column command layout) and applies a path (never `/command `
+text). Everything else is unchanged: relative paths, `~/...`, the fd-backed `@`
+picker, Ctrl+C clear, Ctrl+G external editing, image paste, Shift+Enter
+newlines, Esc-dismisses-the-list-first, and the chat draft all behave exactly as
+in the shared main-chat editor, and every other settings field — and
+AskUserQuestion — keeps that shared behavior unchanged, where a line starting
+with `/` remains the host editor's slash-command context. Token recognition,
+relative/`~` handling, platform behavior, the list UI, and selection keys are
+inherited from the host as-is, so no universal absolute-path or Windows support
+is claimed. Two host behaviors are not preserved for absolute-path tokens through
+this public seam: a first Tab never auto-applies a single match (the list shows
+instead; after Esc, Tab reopens it and a further Tab selects the highlighted
+entry), and best-match preselection does not apply within an absolute-path list
+(the first entry is highlighted; arrow keys navigate). A space ends the token and
+returns that position to the host's own completion behavior. An interactive host
+missing the required native seams fails closed
 with an error notice instead of presenting a non-parity fallback field.
 Completion is a convenience — Save validates the workspace against the same
 session working directory used for relative completion and dispatch, and rejects

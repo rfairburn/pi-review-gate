@@ -349,6 +349,9 @@ export function fakeHost(instances: FakeBridgeEditor[]): NativeEditorHost {
 
 // ---------------------------------------------------------------------------
 // Real-host resolution (installed Pi's CustomEditor + pi-tui)
+// Resolution prefers the explicit test-only install (PI_REVIEW_GATE_INSTALLED_AGENT,
+// set by CI for the locked runtime) through findInstalledAgentDirs; under
+// PI_REVIEW_GATE_REQUIRE_PI_HOST=1 a missing host fails via skipOrFail.
 // ---------------------------------------------------------------------------
 export const REAL_IDENTITY_THEME: Record<string, unknown> = {
   fg: (_color: unknown, text: string) => text,
@@ -443,7 +446,18 @@ export function createRealKeybindingsManager(
   return manager;
 }
 
+/**
+ * Resolves the real fd/fdfind binary pi-tui's `@` picker needs.
+ *
+ * Resolution order: the explicit test-only path (PI_REVIEW_GATE_FD, exported
+ * by CI from its own provisioning step so the check never depends on ambient
+ * PATH variance), then PATH. This helper only reads the environment — it
+ * never mutates PATH or any other variable, so a test cannot leak a skip (or
+ * a pass) into a later test through environment changes.
+ */
 export function findFdBinary(): string | undefined {
+  const explicit = process.env.PI_REVIEW_GATE_FD;
+  if (explicit && existsSync(explicit)) return explicit;
   for (const dir of (process.env.PATH ?? "").split(delimiter)) {
     if (!dir) continue;
     for (const name of ["fd", "fdfind"]) {

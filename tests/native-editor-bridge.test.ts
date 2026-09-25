@@ -621,7 +621,10 @@ test("real host: the fd-backed @ picker fuzzy-matches files and Tab applies the 
   }
   const fdPath = findFdBinary();
   if (!fdPath) {
-    t.skip("fd is not on PATH; the @ picker cannot be exercised (reported gap)");
+    // Gate-aware: locally (no required host) this stays an explicit reported
+    // skip; under PI_REVIEW_GATE_REQUIRE_PI_HOST=1 (CI full suite, which
+    // provisions fd) a missing finder is a hard failure, never a silent skip.
+    skipOrFail(t, "fd is not resolvable (PATH and PI_REVIEW_GATE_FD); the @ picker cannot be exercised");
     return;
   }
   setNativeEditorHost(loaded.host);

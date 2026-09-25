@@ -78,19 +78,29 @@ arrows select · Enter confirm · Esc back
 ```
 
 - Selecting a choice or submitting typed text delivers your answer.
-- The free-text row is Pi's own chat editor, so its standard text-entry
+- The free-text row embeds Pi's own main chat editor — the same host-wired
+  component `/review-settings` uses — inside the existing question modal; no
+  second window and no separate fallback buffer. Its standard text-entry
   keybindings work there: arrows (up/down move between the lines of a
   multiline draft), word movement (Alt/Option+←/→, Ctrl+←/→), line start/end
   (Home/End, Ctrl+A/Ctrl+E), PageUp/PageDown, Backspace/Delete, word deletion
   (Ctrl+W, Alt+Backspace, Alt+D), delete to line start/end (Ctrl+U/Ctrl+K),
   yank and yank-pop (Ctrl+Y, Alt+Y), undo (Ctrl+-), newlines (Shift+Enter or
   Ctrl+J), and bracketed paste. Your `keybindings.json` overrides apply exactly
-  as in the main editor. Enter submits the answer (ends trimmed, embedded
-  newlines preserved); Escape goes back to the choices with the draft kept.
-  There is no length cap on answers — a long paste or typed draft is kept in
-  full and can be submitted as-is. Tab does nothing in the answer field (there
-  is no autocomplete there), and transcript/session shortcuts do not apply
-  inside it.
+  as in the main editor, and so do its completions: **Tab** completes paths,
+  subpaths, and `~/`; **@** opens the fd-backed file picker; **Ctrl+G** edits
+  the draft in your external editor; **Ctrl+V** pastes an image from the
+  clipboard into the draft as a temp-file path. Slash commands never execute
+  from the field: Enter submits the whole answer to the question — never a
+  chat message or command — and there is no length cap, so a long paste or
+  typed draft is kept in full with embedded newlines preserved and only the
+  ends trimmed.
+- **Enter** submits a non-empty answer; an empty or whitespace-only draft does
+  not submit — it clears the draft and stays open, like the main editor. **Esc**
+  first dismisses a visible completion list, then goes back to the choices
+  with the draft kept. **Ctrl+C** clears the field draft (native parity) and
+  never cancels or closes the list; **Ctrl+D** on an empty field returns to
+  the choice rows instead of exiting Pi.
 - **Decline** is one deliberate action: select the Decline row and press
   Enter. There is no second confirmation, but Escape only goes back — it
   never declines.
@@ -136,9 +146,11 @@ is cleared when the session ends or is replaced.
   terminals negotiate it automatically). On terminals without that support
   the chord does not fire — questions remain pending and visible in the panel
   until you answer them from a supported environment.
-- **Editor fallback.** The free-text row reuses Pi's chat editor component.
-  On the rare host where Pi's TUI module cannot be loaded at all, it degrades
-  to a basic field (arrows, Backspace, Enter, Esc) rather than failing.
+- **Native editor required for free text.** The free-text row embeds Pi's
+  host-wired chat editor. On the rare host where that editor or its keybinding
+  surface cannot be loaded, the row shows an explicit "free text unavailable"
+  line instead of a second, non-parity editing engine: choices and Decline
+  still work, and no typeable fallback is offered.
 - **Operating modes.** Like other non-read-only tools, `AskUserQuestion`
   follows the standard tool visibility policy: it is hidden in plan/research
   mode and appears again in write-capable modes.

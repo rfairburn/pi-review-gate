@@ -5,8 +5,8 @@
  * modes, shown through `ctx.ui.custom()` from the pending-question shortcut.
  * The host's showExtensionCustom saves and restores the editor text around
  * the component, so opening and closing the list preserves the user's draft
- * without any work here; while it has focus, all input — including Escape —
- * is handled by this component, so it never triggers Pi's abort.
+ * without any work here; while it has focus, all input — including Escape
+ * — is handled by this component, so it never triggers Pi's abort.
  *
  * - List mode: every pending question of the current session, in creation
  *   order, read live from the controller on each render (a question that
@@ -14,7 +14,9 @@
  * - Answer mode: the selected question's supplied choices plus a free-text
  *   row and an explicit Decline row. Declining is one deliberate action
  *   (select Decline, confirm) with no second confirmation; Escape only goes
- *   back, so nothing declines by accident.
+ *   back, so nothing declines by accident. There is no length cap on
+ *   answers — a long paste or typed draft is kept in full and can be
+ *   submitted as-is (the controller applies no answer bound).
  *
  * Navigation, confirm, cancel, cursor movement, and deletion resolve through
  * the host's live KeybindingsManager (`tui.select.*`, `tui.editor.*`), so
@@ -22,28 +24,31 @@
  * chord (Ctrl+Alt+Up) is matched with the host pi-tui's matchesKey when
  * loadable; without it, Escape still closes the list.
  *
- * Free-text editing (issue #182): when the host chat editor is available
- * (the loader exposes pi-tui's `Editor`), the free-text row embeds a host
- * Editor created per answer-view session (lazily, on first entry into
- * editing) through the shared host-agnostic adapter (src/host-editor.ts,
- * issue #185). The editor is the single source of truth
- * for the draft text and cursor — movement, word/line edits, deletion,
- * kill-ring yank, undo, page scrolling, character jumps, bracketed paste,
- * and Shift+Enter/Ctrl+J newlines all resolve through the host's live
- * KeybindingsManager exactly as in the main chat editor, including user
- * keybindings.json overrides. Enter submits (ends trimmed, embedded newlines
- * preserved); Escape returns to the option rows with the draft kept. There
- * is no length cap on answers — a long paste or typed draft is kept in full
- * and can be submitted as-is (the controller applies no answer bound).
- * Without a loadable host editor (unit tests, SEA/
- * binary hosts) the built-in fallback editor keeps the original key set:
- * arrows, backspace, Enter, Esc, printable text, and bracketed paste — the
- * approved chord collapses it like every other mode (the question stays
- * pending), and unrecognized terminal escape sequences are rejected rather
- * than leaking their printable tails into the draft.
+ * Free-text editing: the free-text row embeds the SAME host-wired native
+ * editor instance the /review-settings text fields use — acquired through
+ * the shared host-wired bridge (src/native-editor-bridge.ts) before this
+ * component's `ctx.ui.custom` slot opens, so no nested second modal and no
+ * second editing engine exist. The instance is the single source of truth
+ * for the draft text and cursor: native main-chat Tab path/subpath/`~/`
+ * completion, the fd-backed `@` picker, Ctrl+C clears (never cancels),
+ * Ctrl+G external editing, image paste to a temp path, Shift+Enter/Ctrl+J
+ * newlines, cursor/history/kill-ring/undo — all of Pi's own editor code
+ * running unmodified under the live KeybindingsManager, including user
+ * keybindings.json overrides. Enter submits the whole answer through the
+ * native submit path (it is never executed as a chat message or command);
+ * Escape first dismisses a visible completion list, then returns to the
+ * option rows with the draft kept; Ctrl+D on an empty editor returns to the
+ * option rows instead of exiting Pi.
+ *
+ * When the host's native seams are unavailable (no
+ * setEditorComponent/getEditorComponent, or the agent module cannot be
+ * loaded) the free-text row renders an unavailable line: the question stays
+ * pending, and the choices and Decline still work. No non-parity fallback
+ * buffer is offered.
  */
 
-import type { QuestionAnswerEditor, QuestionTuiHost } from "./pi-tui-host";
+import type { FieldEditorInstance } from "../native-editor-bridge";
+import type { QuestionTuiHost } from "./pi-tui-host";
 import type { SubmitResult, UserQuestionController } from "./controller";
 
 /** The approved chord; the label shown to users is platform-specific. */
@@ -71,11 +76,12 @@ export interface QuestionListComponentOptions {
   /** Platform label for the shortcut, e.g. "Ctrl+Alt+Up" or "Ctrl+Option+Up". */
   shortcutLabel: string;
   /**
-   * Lazily creates the host chat editor for the free-text row (issue #182).
-   * Called once per answer-view session, on the first entry into editing;
-   * undefined — or a returned undefined — keeps the built-in fallback editor.
+   * The host-wired native editor instance for the free-text row, acquired
+   * through the shared bridge before this component's custom slot opened
+   * (undefined when the host's native seams are unavailable — the free-text
+   * row then renders an unavailable line and the question stays pending).
    */
-  createAnswerEditor?: () => QuestionAnswerEditor | undefined;
+  nativeField?: FieldEditorInstance;
   onDone: (result: QuestionListDone) => void;
 }
 
@@ -96,14 +102,6 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   let selectedId: string | undefined;
   let answerIndex = 0;
   let editing = false;
-  // Host chat editor for the free-text row (issue #182): one instance per
-  // answer-view session, created lazily on first entry into editing. It owns
-  // the draft text and cursor; the fallback buffer/cursor below is only used
-  // when no host editor exists.
-  let answerEditor: QuestionAnswerEditor | undefined;
-  let answerEditorAttempted = false;
-  let buffer = "";
-  let cursor = 0;
   let closed = false;
   let cachedLines: string[] | undefined;
   // The shortcut handler installs a live idle probe before the component is
@@ -152,55 +150,61 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       return;
     }
     mode = "list";
+    endEditingEpisode();
+  }
+
+  /** Open an editing episode around the shared native field instance. */
+  function beginEditingEpisode(): void {
+    const field = options.nativeField;
+    if (!field || editing) return;
+    // The bridge-owned flags gate the instance's intercepted keys and route
+    // its settled submit through this component.
+    field.fieldActive = true;
+    field.onFieldSettle = (value) => handleFieldSettle(value);
+    setEditing(true);
+  }
+
+  /** End the episode; idempotent (the bridge also clears fieldActive on settle). */
+  function endEditingEpisode(): void {
+    const field = options.nativeField;
+    if (field) {
+      field.fieldActive = false;
+      field.onFieldSettle = undefined;
+    }
     setEditing(false);
   }
 
-  /** Enter/leave editing, keeping the host editor's focus flag in step. */
-  function setEditing(value: boolean): void {
-    editing = value;
-    if (answerEditor) answerEditor.focused = value;
-    invalidate();
-  }
-
-  // ------------------------------------------------------------------
-  // Host chat editor for the free-text row (issue #182)
-  // ------------------------------------------------------------------
-
-  function wireAnswerEditor(): void {
-    const editor = answerEditor;
-    if (!editor) return;
-    // Only the editor's own submit action is consumed; the draft text and
-    // cursor stay wholly inside the editor (no length cap, no copies).
-    editor.onSubmit = (text) => handleEditorSubmit(text);
-  }
-
-  /** Create the host editor for this answer-view session, on first edit entry. */
-  function ensureAnswerEditor(): void {
-    if (answerEditorAttempted) return;
-    answerEditorAttempted = true;
-    try {
-      answerEditor = options.createAnswerEditor?.() ?? undefined;
-    } catch {
-      // A failing constructor degrades to the fallback editor.
-      answerEditor = undefined;
+  /** Settle of the native submit path or an intercepted cancel-equivalent. */
+  function handleFieldSettle(value: string | undefined): void {
+    if (value === undefined) {
+      // Esc (after any visible completion list) or empty-editor Ctrl+D:
+      // back to the option rows with the draft kept in the instance.
+      endEditingEpisode();
+      return;
     }
-    if (answerEditor) wireAnswerEditor();
-  }
-
-  /** The editor's own submit action (Enter): expanded, already trimmed. */
-  function handleEditorSubmit(text: string): void {
     const id = selectedId;
     if (!id || !controller.get(id)) {
       // Stale state (session changed or question vanished): leave the UI.
       close();
       return;
     }
-    if (text.length === 0) {
-      // Empty or whitespace-only: nothing to send; stay in editing.
-      return;
+    // The native submit path already cleared the instance's text.
+    endEditingEpisode();
+    submitFromAnswer(controller.submitAnswer(id, value, sourceProbe()));
+  }
+
+  /** Enter/leave editing, keeping the native field's focus flag in step. */
+  function setEditing(value: boolean): void {
+    editing = value;
+    const field = options.nativeField;
+    if (field) {
+      try {
+        field.focused = value;
+      } catch {
+        // Focus propagation is best-effort; input still reaches the editor.
+      }
     }
-    setEditing(false);
-    submitFromAnswer(controller.submitAnswer(id, text, sourceProbe()));
+    invalidate();
   }
 
   function handleListInput(data: string): void {
@@ -225,17 +229,19 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       mode = "answer";
       selectedId = id;
       answerIndex = 0;
-      // A new answer-view session starts fresh — text, cursor and undo
-      // history all empty. The host Editor exposes no public undo-stack
-      // clear, so the previous session's instance is discarded here and a
-      // new one is created on first entry into editing; the draft only
-      // survives between editing and the option rows of this session (the
-      // same reset the fallback path applies to its buffer).
-      answerEditor = undefined;
-      answerEditorAttempted = false;
-      setEditing(false);
-      buffer = "";
-      cursor = 0;
+      // A new answer-view session starts fresh — the shared instance's text
+      // is cleared so a previous question's draft never shows or submits as
+      // this one's (the host undo history has no public clear, so an earlier
+      // deliberate Ctrl+- could still surface prior text — same as settings).
+      const field = options.nativeField;
+      if (field) {
+        try {
+          field.setText("");
+        } catch {
+          // A failing clear must not block entering the answer view.
+        }
+      }
+      endEditingEpisode();
       invalidate();
       return;
     }
@@ -254,7 +260,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       return;
     }
     if (editing) {
-      handleEditingInput(data, id);
+      handleEditingInput(data);
       return;
     }
     const rows = answerRows();
@@ -272,8 +278,9 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       const row = rows[answerIndex];
       if (row === undefined) return;
       if (row === TYPE_ROW) {
-        ensureAnswerEditor();
-        setEditing(true);
+        // No-op when the native field is unavailable: the question stays
+        // pending and the choices/Decline remain usable.
+        beginEditingEpisode();
         return;
       }
       if (row === DECLINE_ROW) {
@@ -293,76 +300,39 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     }
   }
 
-  function handleEditingInput(data: string, id: string): void {
-    const editor = answerEditor;
-    if (editor) {
-      // Escape (and whatever tui.select.cancel is bound to) returns to the
-      // option rows with the draft kept — handled before the editor sees it.
-      if (keybindings.matches(data, "tui.select.cancel")) {
-        setEditing(false);
-        return;
-      }
-      // The approved collapse chord works in editing mode just like in list
-      // and answer modes: it closes the UI without submitting; the question
-      // stays pending.
-      if (matchesShortcut(data)) {
-        close();
-        return;
-      }
-      // Submitting an empty or whitespace-only draft is a no-op that keeps
-      // the draft (the host editor would clear it on submit).
-      if (keybindings.matches(data, "tui.input.submit") && editor.getExpandedText().trim() === "") {
-        return;
-      }
-      // Everything else is the host chat editor's own business: movement,
-      // word/line edits, deletion, yank, undo, newlines, paste — all through
-      // the live KeybindingsManager.
-      editor.focused = true;
-      editor.handleInput(data);
-      invalidate();
+  function handleEditingInput(data: string): void {
+    const field = options.nativeField;
+    if (!field) {
+      // Defensive: editing can only be entered with a native field.
+      endEditingEpisode();
       return;
     }
-    if (keybindings.matches(data, "tui.select.confirm")) {
-      const text = buffer.trim();
-      if (text.length === 0) return;
-      submitFromAnswer(controller.submitAnswer(id, text, sourceProbe()));
-      return;
-    }
-    if (keybindings.matches(data, "tui.select.cancel")) {
-      // Back to the option rows; the draft text is kept for this question.
-      editing = false;
-      invalidate();
-      return;
-    }
-    if (keybindings.matches(data, "tui.editor.cursorLeft")) {
-      if (cursor > 0) cursor -= 1;
-      invalidate();
-      return;
-    }
-    if (keybindings.matches(data, "tui.editor.cursorRight")) {
-      if (cursor < buffer.length) cursor += 1;
-      invalidate();
-      return;
-    }
-    if (keybindings.matches(data, "tui.editor.deleteCharBackward")) {
-      if (cursor > 0) {
-        buffer = buffer.slice(0, cursor - 1) + buffer.slice(cursor);
-        cursor -= 1;
-      }
-      invalidate();
-      return;
-    }
-    // The approved collapse chord works in editing mode just like in list and
-    // answer modes: it closes the UI without submitting; the question stays
-    // pending.
+    // The approved collapse chord works in editing mode just like in list
+    // and answer modes: it closes the UI without submitting; the question
+    // stays pending. Pre-checked so the chord never reaches the instance's
+    // extension-shortcut path (which would re-trigger this same surface).
     if (matchesShortcut(data)) {
       close();
       return;
     }
-    const printable = printableText(data);
-    if (printable.length === 0) return;
-    buffer = buffer.slice(0, cursor) + printable + buffer.slice(cursor);
-    cursor += printable.length;
+    // Back to the option rows with the draft kept — but only when no
+    // completion list is visible (while it is, the key belongs to the editor
+    // and dismisses the list first; the bridge then sees the next press as
+    // cancel-equivalent), and only for keys that are NOT also the native
+    // clear: tui.select.cancel defaults include ctrl+c, which must reach the
+    // instance so Pi's own app.clear handler clears the draft instead of
+    // cancelling. A rebound app.interrupt is still caught by the bridge.
+    const listVisible = typeof field.isShowingAutocomplete === "function" && field.isShowingAutocomplete();
+    if (!listVisible && keybindings.matches(data, "tui.select.cancel") && !keybindings.matches(data, "app.clear")) {
+      endEditingEpisode();
+      return;
+    }
+    // Everything else is the host-wired native editor's own business:
+    // completion, `@` picking, movement, word/line edits, deletion, yank,
+    // undo, newlines, paste, Ctrl+C clear, Ctrl+G external editing — all
+    // through the live KeybindingsManager, exactly as in the main chat.
+    field.focused = true;
+    field.handleInput(data);
     invalidate();
   }
 
@@ -430,12 +400,12 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     lines.push("");
     rows.forEach((row, index) => {
       const selected = index === answerIndex;
-      if (row === TYPE_ROW && editing && answerEditor) {
-        // The host editor renders its own bordered box (top/bottom rules and
+      if (row === TYPE_ROW && editing && options.nativeField) {
+        // The native editor renders its own bordered box (top/bottom rules and
         // word-wrapped lines with the hardware-cursor marker); indent it like
         // the other rows. Every line is padded to the box width, so each
         // total line stays within `width`.
-        const box = answerEditor.render(Math.max(1, width - 2));
+        const box = options.nativeField.render(Math.max(1, width - 2));
         lines.push(`  ${box[0] ?? ""}`);
         for (const rest of box.slice(1)) lines.push(`  ${rest}`);
         return;
@@ -443,10 +413,9 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       const prefix = selected ? theme.fg("accent", "> ") : "  ";
       let text: string;
       if (row === TYPE_ROW) {
-        // Fallback editor (no host pi-tui): single inverted-cursor line.
-        text = editing
-          ? renderEditorLine()
-          : theme.fg("muted", "Type something…");
+        text = options.nativeField
+          ? theme.fg("muted", "Type something…")
+          : theme.fg("dim", "Free text unavailable — the host's native editor is not loadable; choices and Decline still work");
       } else if (row === DECLINE_ROW) {
         text = theme.fg("warning", "Decline (no answer will be sent)");
       } else {
@@ -467,13 +436,6 @@ export function createQuestionListComponent(options: QuestionListComponentOption
 
   function linesOnce(line: string): void {
     cachedLines = [line];
-  }
-
-  function renderEditorLine(): string {
-    const atCursor = cursor < buffer.length ? buffer[cursor]! : " ";
-    const before = buffer.slice(0, cursor);
-    const after = buffer.slice(cursor + 1);
-    return theme.fg("muted", "Your answer: ") + before + "\x1b[7m" + atCursor + "\x1b[27m" + after;
   }
 
   // ------------------------------------------------------------------
@@ -538,25 +500,6 @@ export function createQuestionListComponent(options: QuestionListComponentOption
 
   function stripAnsi(text: string): string {
     return text.replace(/\x1b\[[0-9;]*m/g, "");
-  }
-
-  function printableText(data: string): string {
-    if (data.length === 0) return "";
-    // The host forwards bracketed-paste markers verbatim to the focused
-    // component; drop them so a paste inserts its payload, not escape text.
-    const cleaned = data.replace(/\x1b\[20[01]~/g, "");
-    // Unrecognized terminal escape sequences (arrows, Home/End/Delete,
-    // PageUp/PageDown, modifier chords) must never leak their printable tails
-    // — e.g. "[A" from Up — into the draft; reject any input where an ESC
-    // survives the marker strip.
-    if (cleaned.includes("\x1b")) return "";
-    let out = "";
-    for (const char of cleaned) {
-      const code = char.codePointAt(0)!;
-      if (code < 32 || code === 0x7f) continue;
-      out += char;
-    }
-    return out;
   }
 
   const setSourceProbe = (probe: { isIdle?: () => boolean } | undefined): void => {

@@ -18,9 +18,12 @@
  *   unavailable and AskUserQuestion fails closed with an explicit result —
  *   questions are never silently dropped or answered for the user.
  *
- * Host editor creation, theming, and live-keybinding wiring for the free-text
- * row are shared with other extension surfaces through the host-agnostic
- * adapter in src/host-editor.ts (issue #185).
+ * The free-text answer row embeds the SAME host-wired native editor instance
+ * the /review-settings text fields use, acquired through the shared bridge
+ * (src/native-editor-bridge.ts) BEFORE the list's `ctx.ui.custom` slot opens
+ * — no nested second modal, no second editing engine. When the host's native
+ * seams are unavailable the row renders an unavailable line: the question
+ * stays pending and the choices/Decline still work.
  *
  * Session isolation: the controller is bound to the session identity
  * (SessionManager object) at session_start; every registration, presentation,
@@ -30,12 +33,14 @@
  */
 
 import { findOccupiedHostBindings } from "../host-keybindings";
+import { resolveLiveKeybindings } from "../host-editor";
 import {
-  createHostEditor,
-  pointHostEditorModuleAtLiveKeybindings,
-  resolveLiveKeybindings,
-} from "../host-editor";
-import { sendNotice } from "../pi";
+  acquireNativeEditorField,
+  abortActiveNativeEditorField,
+  type NativeEditorFieldHandle,
+  type NativeEditorFieldSemantics,
+} from "../native-editor-bridge";
+import { registerHook, sendNotice } from "../pi";
 import { UserQuestionController, type QuestionSubmitSource } from "./controller";
 import {
   createQuestionListComponent,
@@ -180,6 +185,14 @@ export function registerUserQuestions(pi: unknown): UserQuestionSurface | undefi
     }
   };
 
+  // Session reset (/new, /resume, quit/fork) fires session_shutdown before
+  // the host's own resetExtensionUI() clears the editor slot; settle an open
+  // native field as a cancel and put the displaced chat draft back so the
+  // reset carries the draft — not a partial answer — into the default editor.
+  registerHook(pi, "session_shutdown", () => {
+    abortActiveNativeEditorField();
+  });
+
   pi.registerTool(createUserQuestionTool(controller, { shortcutLabel: questionShortcutLabel() }));
 
   if (typeof pi.registerShortcut === "function") {
@@ -253,23 +266,26 @@ async function openQuestionList(pi: unknown, controller: UserQuestionController,
   // Load the host pi-tui helpers (width-safe text + raw key matching). A
   // failure degrades rendering/input matching but never blocks the list.
   const tuiHost = await loadQuestionTuiHost().catch(() => undefined);
+  // Acquire the host-wired native editor BEFORE the custom slot opens:
+  // installing the factory mid-slot would make the host swap the visible
+  // component. Unavailable seams keep the list open with an unavailable
+  // free-text row (choices/Decline still work) — no non-parity fallback.
+  const acquired = await acquireNativeEditorField(ui, { semantics: QUESTION_FIELD_SEMANTICS });
+  const handle: NativeEditorFieldHandle | undefined =
+    acquired.kind === "acquired" ? acquired.handle : undefined;
   try {
-    await ui.custom((tui: unknown, theme: unknown, keybindings: unknown, done: (result?: unknown) => void) => {
-      // Point the standalone pi-tui module's global keybinding state at the
-      // app's live manager and resolve the effective manager through the
-      // shared host-agnostic adapter (src/host-editor.ts, issue #185). Since
-      // pi >= 0.86 the bundled chunk keeps its own inlined copy, so a loaded
-      // standalone module is a fresh default-only state; without this the
-      // embedded chat editor would not see the user's keybindings.json
-      // overrides (same strategy as src/settings/menu.ts).
-      pointHostEditorModuleAtLiveKeybindings(tuiHost, keybindings);
+    await ui.custom((_tui: unknown, theme: unknown, keybindings: unknown, done: (result?: unknown) => void) => {
+      // The host captured its saved text before this factory ran; record it
+      // and start the field empty so the displaced chat draft can never show
+      // or submit as an answer.
+      handle?.prepare("");
       const component = createQuestionListComponent({
         controller,
         keybindings: resolveLiveKeybindings(keybindings, tuiHost),
         theme: toUiTheme(theme),
         tuiHost,
         shortcutLabel: questionShortcutLabel(),
-        createAnswerEditor: () => createHostEditor(tuiHost, tui, theme),
+        nativeField: handle?.instance,
         onDone: () => done(undefined),
       });
       component.setSourceProbe(sourceProbeOf(ctx));
@@ -278,6 +294,10 @@ async function openQuestionList(pi: unknown, controller: UserQuestionController,
   } catch {
     // The host surfaced the failure itself (error banner); the questions
     // remain pending and the panel stays visible.
+  } finally {
+    // Ownership-checked restore of the prior editor factory; a no-op after a
+    // session-reset abort (the host owns the slot from that point on).
+    handle?.finish();
   }
 }
 
@@ -293,6 +313,17 @@ function toUiTheme(theme: unknown): QuestionUiTheme {
   // Degraded (non-Pi hosts, tests): plain text, no styling.
   return { fg: (_color, text) => text, bold: (text) => text };
 }
+
+/**
+ * The question free-text row's field semantics for the shared bridge: Enter
+ * settles with the submitted answer text, or stays open on an empty draft so
+ * nothing is ever submitted by accident (Esc/empty-Ctrl+D settle as
+ * cancel-equivalent through the bridge and return to the choice rows with
+ * the draft kept).
+ */
+const QUESTION_FIELD_SEMANTICS: NativeEditorFieldSemantics = {
+  onSubmitKey: (text) => (text.length > 0 ? text : null),
+};
 
 /** Live idle probe from the dispatch-time context; see QuestionSubmitSource. */
 function sourceProbeOf(ctx: unknown): QuestionSubmitSource | undefined {

@@ -54,6 +54,11 @@ import { retainedSelect, type MenuCustomFactory } from "./menu";
 import { scopedModelChoices, type ScopedModelChoice } from "./models";
 import { persistReviewSettings, replaceConfig } from "./persistence";
 import { editSettingText } from "./text-input";
+import {
+  prepareScheduledImageAssets,
+  rollbackScheduledImageAssetsUnlessPersisted,
+  type PreparedScheduledImageAssets,
+} from "./scheduled-image-assets";
 
 interface RegisterSettingsInput {
   pi: unknown;
@@ -165,6 +170,13 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
   // from entries another process appended after this instance opened.
   let scheduledTasks = cloneScheduledTaskCatalog(input.config.scheduledTasks ?? {});
   const scheduledTasksStagedFrom = Object.keys(input.config.scheduledTasks ?? {});
+  // Native image pastes observed in scheduled instructions (issue: scheduled
+  // image assets). Provenance-carrying observation only, keyed by stable task
+  // id: Save verifies each observed token against the FINAL staged
+  // instructions and actual image content before copying anything. A cancel
+  // or entry removal discards that entry's observations; Save consumes them
+  // without clearing — the menu exits after a successful save.
+  const scheduledImageProvenance = new Map<string, string[]>();
 
   // Caller-local last selection for this loop only: the highlighted row is
   // re-shown after every staged change so a toggle can repeat without
@@ -355,7 +367,7 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       continue;
     }
     if (choice === "scheduled") {
-      scheduledTasks = await selectScheduledTasks(input.ui, scheduledTasks, workerResources, input.config, input.scoped, agents);
+      scheduledTasks = await selectScheduledTasks(input.ui, scheduledTasks, workerResources, input.config, input.scoped, agents, scheduledImageProvenance);
       continue;
     }
     if (choice === "schedulerRuntime") {
@@ -385,36 +397,67 @@ async function runSettingsMenu(input: RegisterSettingsInput & { ui: UiContext; s
       await notify(input.ui, error, "error");
       continue;
     }
-    const next = await persistReviewSettings(input.configPath!, {
-      operatingMode,
-      modeCycleShortcut,
-      workerResources,
-      executeRoute,
-      researchRoute,
-      primaryReviewers,
-      subtaskReviewers,
-      primaryEnabled,
-      subtaskEnabled,
-      reviewLandedChanges,
-      reviewerTimeoutMs,
-      executorTimeoutMs,
-      maxCorrectionCycles,
-      implementationGuidanceAfterCorrectionAttempts: guidanceThreshold,
-      retainBundles,
-      maxWorkers,
-      retryPolicy,
-      subtaskNotifications,
-      deferredPiTools,
-      subtasksViewExpanded,
-      scheduledTasks,
-      scheduledTasksStagedFrom,
-      webMaxDownloadBytes,
-      browserInteractionApproval,
-      browserIdleExpiryMinutes,
-      browserDownloadRetention,
-      browserVisible,
-      webBrowserPermissions: browserPermissions,
-    });
+    // The Save-time transaction for images pasted through the native host
+    // editor (see src/settings/scheduled-image-assets.ts): every observed
+    // native insert is verified against the FINAL staged instructions and
+    // actual image content, copied into the private managed store, and the
+    // staged temporary path is replaced by the managed absolute path BEFORE
+    // the ordinary atomic config persistence. Any failure (missing,
+    // non-image, too large, or an unobserved Pi clipboard temp reference)
+    // fails closed with an actionable notice and leaves the config and the
+    // managed store untouched — the menu stays open, so the user can Cancel
+    // (which copies nothing) or fix the entry and Save again.
+    let prepared: PreparedScheduledImageAssets | undefined;
+    let catalogForSave = scheduledTasks;
+    try {
+      prepared = await prepareScheduledImageAssets(input.configPath!, scheduledTasks, scheduledImageProvenance);
+      catalogForSave = prepared.catalog;
+    } catch (error) {
+      await notify(input.ui, `review gate: ${error instanceof Error ? error.message : String(error)}`, "error");
+      continue;
+    }
+    let next: ReviewGateConfig;
+    try {
+      next = await persistReviewSettings(input.configPath!, {
+        operatingMode,
+        modeCycleShortcut,
+        workerResources,
+        executeRoute,
+        researchRoute,
+        primaryReviewers,
+        subtaskReviewers,
+        primaryEnabled,
+        subtaskEnabled,
+        reviewLandedChanges,
+        reviewerTimeoutMs,
+        executorTimeoutMs,
+        maxCorrectionCycles,
+        implementationGuidanceAfterCorrectionAttempts: guidanceThreshold,
+        retainBundles,
+        maxWorkers,
+        retryPolicy,
+        subtaskNotifications,
+        deferredPiTools,
+        subtasksViewExpanded,
+        scheduledTasks: catalogForSave,
+        scheduledTasksStagedFrom,
+        webMaxDownloadBytes,
+        browserInteractionApproval,
+        browserIdleExpiryMinutes,
+        browserDownloadRetention,
+        browserVisible,
+        webBrowserPermissions: browserPermissions,
+      });
+    } catch (error) {
+      // A failed Save mutates nothing — but the atomic config write can reject
+      // AFTER its rename already replaced the file, in which case the persisted
+      // text references the just-created copies. The rollback reads the config
+      // first and keeps any created copy the persisted text references (and
+      // everything when the config cannot be read); the staged catalog keeps
+      // the original temporary paths so a later Save can retry either way.
+      if (prepared) await rollbackScheduledImageAssetsUnlessPersisted(input.configPath!, prepared);
+      throw error;
+    }
     const previousMode = input.config.operatingMode;
     const previousModeCycleShortcut = input.config.modeCycleShortcut;
     replaceConfig(input.config, next);
@@ -808,6 +851,8 @@ async function selectScheduledTasks(
   config: ReviewGateConfig,
   scoped: ScopedModelChoice[],
   agents: ExternalAgentConfig[],
+  /** Native-paste provenance per task id; consumed at Save (image assets). */
+  imageProvenance: Map<string, string[]>,
 ): Promise<ScheduledTaskCatalog> {
   const catalog = cloneScheduledTaskCatalog(initial);
   // Caller-local last selection for this loop only (issue #140): keys are the
@@ -844,7 +889,7 @@ async function selectScheduledTasks(
       // still missing; no default schedule or workspace is ever invented.
       const id = generateScheduledTaskId(catalog);
       setCatalogKey(catalog, id, { name, cron: "", enabled: true, kind: "execute", instructions: "", workspace: "" });
-      await editScheduledTaskEntry(ui, catalog, id, workerResources, config, scoped, agents);
+      await editScheduledTaskEntry(ui, catalog, id, workerResources, config, scoped, agents, imageProvenance);
       continue;
     }
     // Action keys contain ":", which validateConfiguredId rejects, so a
@@ -852,7 +897,7 @@ async function selectScheduledTasks(
     // "add" stays editable instead of being shadowed by the Add action, and
     // an unknown value remains a no-op re-show.
     if (Object.prototype.hasOwnProperty.call(catalog, choice)) {
-      await editScheduledTaskEntry(ui, catalog, choice, workerResources, config, scoped, agents);
+      await editScheduledTaskEntry(ui, catalog, choice, workerResources, config, scoped, agents, imageProvenance);
     }
   }
 }
@@ -870,6 +915,7 @@ async function editScheduledTaskEntry(
   config: ReviewGateConfig,
   scoped: ScopedModelChoice[],
   agents: ExternalAgentConfig[],
+  imageProvenance: Map<string, string[]>,
 ): Promise<void> {
   // Caller-local last selection for this loop only (issue #140).
   let lastKey: string | undefined;
@@ -937,12 +983,29 @@ async function editScheduledTaskEntry(
     }
     if (choice === "instructions") {
       // Shared host-wired editor in the TUI, non-interactive editor fallback;
-      // the same seam as every other typed settings field (issue #26).
-      const entered = await editSettingText(ui, "Instructions for the scheduled subtask", entry.instructions);
+      // the same seam as every other typed settings field (issue #26). In the
+      // TUI the bridge's observation-only onHostInsert seam records exactly
+      // what Pi's own handlers insert (an image paste inserts the temp file
+      // path), so Save can verify provenance, validate the actual image, and
+      // copy it into the durable managed store. Observation only: no
+      // clipboard access, no path interpretation, no asset copying here.
+      const pastedInserts: string[] = [];
+      const entered = await editSettingText(
+        ui,
+        "Instructions for the scheduled subtask",
+        entry.instructions,
+        undefined,
+        { onHostInsert: (text) => pastedInserts.push(text) },
+      );
       if (entered === undefined) continue;
       if (!entered.trim()) {
         await notify(ui, "Instructions must be a non-empty string.", "error");
         continue;
+      }
+      // Only accepted edits carry provenance forward: a cancelled field
+      // stages nothing, so its observations are discarded.
+      if (pastedInserts.length > 0) {
+        imageProvenance.set(id, [...(imageProvenance.get(id) ?? []), ...pastedInserts]);
       }
       setCatalogKey(catalog, id, { ...entry, instructions: entered.trim() });
       continue;
@@ -951,8 +1014,18 @@ async function editScheduledTaskEntry(
       // One shared field surface like every other text field: in the
       // interactive TUI the host-wired native editor bridge (native path
       // completion included), on non-interactive hosts the public editor
-      // prefill, then the legacy input (issue #26).
-      const entered = await editSettingText(ui, WORKSPACE_DIRECTORY_TITLE, entry.workspace);
+      // prefill, then the legacy input (issue #26). This field alone opts
+      // into native absolute-path completion: a first-line leading-slash
+      // token lists filesystem directories through the host's own provider —
+      // never slash commands; every other settings field keeps the shared
+      // main-chat behavior.
+      const entered = await editSettingText(
+        ui,
+        WORKSPACE_DIRECTORY_TITLE,
+        entry.workspace,
+        undefined,
+        { absolutePathSuggestions: true },
+      );
       if (entered === undefined) continue;
       if (!entered.trim()) {
         await notify(ui, "Workspace must be a non-empty string.", "error");
@@ -985,6 +1058,9 @@ async function editScheduledTaskEntry(
     }
     if (choice === "remove") {
       delete catalog[id];
+      // Removed entries keep no provenance: they cannot be saved, and a
+      // re-added entry gets a fresh identity and fresh observations.
+      imageProvenance.delete(id);
       return;
     }
   }
@@ -1081,7 +1157,13 @@ async function selectScheduledTaskReview(
 function expandScheduledTaskWorkspaces(catalog: ScheduledTaskCatalog): ScheduledTaskCatalog {
   const out: ScheduledTaskCatalog = {};
   for (const [id, entry] of Object.entries(catalog)) {
-    out[id] = { ...entry, workspace: expandHomePath(entry.workspace) };
+    // Prototype-safe own-key write (setCatalogKey): an id of "__proto__" (the
+    // id grammar accepts it; JSON.parse creates it as own data) must survive
+    // this Save-path boundary — a plain assignment would invoke the prototype
+    // setter, drop the entry from the staged catalog, and make the merge in
+    // persistReviewSettings classify it as staged-then-removed and delete it
+    // from the config file.
+    setCatalogKey(out, id, { ...entry, workspace: expandHomePath(entry.workspace) });
   }
   return out;
 }

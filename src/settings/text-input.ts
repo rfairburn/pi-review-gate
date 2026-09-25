@@ -8,7 +8,11 @@
  *   editor — acquired temporarily through the public setEditorComponent seam
  *   and embedded in a non-overlay custom slot — with native Tab completion,
  *   the fd-backed `@` picker, Ctrl+C clear, Ctrl+G external editing, image
- *   paste, and an editable prefill. An interactive host missing the required
+ *   paste, and an editable prefill. A field that opts in through
+ *   `absolutePathSuggestions` (the scheduled-task Workspace directory)
+ *   additionally gets native filesystem suggestions for first-line
+ *   leading-slash tokens — `/`, `/var`, nested absolute paths — in the host's
+ *   ordinary file-list layout, never slash-command items. An interactive host missing the required
  *   native seams fails closed with an error notice: no non-parity fallback
  *   field is presented in the TUI.
  * - Non-interactive hosts (RPC/print) keep their clearly identified public
@@ -47,6 +51,29 @@ export interface SettingTextInputUi {
 const NATIVE_EDITOR_UNAVAILABLE_MESSAGE =
   "The native text editor is not available in this host; the value was left unchanged.";
 
+/** Per-field options for the shared text seam. */
+export interface SettingTextInputOptions {
+  /**
+   * Observation-only native paste seam (TUI bridge fields only): forwarded to
+   * the native editor bridge's `onHostInsert`, which reports exactly the text
+   * Pi's own handlers insert through the editor's public
+   * `insertTextAtCursor` (for an image paste: the temp file path). Pure
+   * observation — no clipboard access, no path interpretation, no copying;
+   * the non-interactive editor/input fallback has no such seam and never
+   * reports inserts.
+   */
+  onHostInsert?: (text: string) => void;
+  /**
+   * Opt into native absolute-path completion for this field (the
+   * scheduled-task Workspace directory only): first-line leading-slash
+   * tokens (`/`, `/var`, nested absolute paths) get the host provider's own
+   * file suggestions in its ordinary file-list layout — never slash-command
+   * items. Forwarded to the native editor bridge; the non-interactive
+   * editor/input fallback has no such seam and ignores it.
+   */
+  absolutePathSuggestions?: boolean;
+}
+
 /**
  * Edits one settings text value. In an interactive TUI the field opens through
  * the host-wired native editor bridge (the host's own main-prompt editor with
@@ -55,16 +82,24 @@ const NATIVE_EDITOR_UNAVAILABLE_MESSAGE =
  * editable prefill plus native controls such as Ctrl+G external editing) and
  * fall back to the legacy input seam with identical title/placeholder
  * semantics when no editor is available. Resolves `undefined` on cancel or
- * when no usable seam exists.
+ * when no usable seam exists. The optional options carry the observation-only
+ * paste seam for fields that must learn native paste provenance (scheduled
+ * instruction images); it is never a second editor, clipboard, or matcher.
  */
 export async function editSettingText(
   ui: SettingTextInputUi,
   title: string,
   currentValue: string,
   unavailableMessage = "This UI does not support text input.",
+  options: SettingTextInputOptions = {},
 ): Promise<string | undefined> {
   if (ui.mode === "tui") {
-    const result = await editTextWithNativeEditor(ui, { title, prefill: currentValue });
+    const result = await editTextWithNativeEditor(ui, {
+      title,
+      prefill: currentValue,
+      ...(options.onHostInsert ? { onHostInsert: options.onHostInsert } : {}),
+      ...(options.absolutePathSuggestions === true ? { absolutePathSuggestions: true } : {}),
+    });
     if (result.kind === "value") return result.value;
     if (result.kind === "cancel") return undefined;
     // Interactive host without the required native seams: fail closed. The

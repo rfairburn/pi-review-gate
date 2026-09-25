@@ -112,6 +112,62 @@ jobs:
           npm ci --no-audit --no-fund
       - name: Export Pi runtime path
         run: echo "PI_BROWSER_AGENT_RUNTIME=$RUNNER_TEMP/pi-agent-runtime/node_modules/@earendil-works/pi-agent-core/dist/index.js" >> "$GITHUB_ENV"
+      - name: Install fd file-finder (Pi native @ picker requirement)
+        # pi-tui's CombinedAutocompleteProvider backs the `@` file picker with
+        # fd/fdfind; the picker cannot list files without it. Ubuntu's fd-find
+        # package installs the binary as fdfind, which the real-host helper
+        # finds alongside fd. The @ smoke must exercise the real finder, so
+        # the step fails the job when neither binary is available afterwards —
+        # never a silent skip.
+        run: |
+          if ! command -v fd >/dev/null 2>&1 && ! command -v fdfind >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y --no-install-recommends fd-find
+          fi
+          command -v fd >/dev/null 2>&1 || command -v fdfind >/dev/null 2>&1
+          echo "PI_REVIEW_GATE_FD=$(command -v fd || command -v fdfind)" >> "$GITHUB_ENV"
+      - name: Install pinned full Pi UI runtime
+        # tests/pi-tui-live-settings-smoke.test.ts (and the bridge integration
+        # tier in tests/native-editor-bridge.test.ts) drive the real Pi TUI
+        # surface — CustomEditor, pi-tui components, and the pi CLI entry from
+        # @earendil-works/pi-coding-agent. 0.87.1 is verified against the
+        # current extension sources (and needs Node >=22.19.0, so this job
+        # pins Node 24). Install the locked tree into the runner temp exactly
+        # like the agent-core runtime above: a test-only install, never a
+        # shipping package dependency. When changing the pin, regenerate the
+        # lock in scripts/ci/pi-ui-runtime with `npm install --package-lock-only`.
+        run: |
+          mkdir -p "$RUNNER_TEMP/pi-ui-runtime"
+          cp scripts/ci/pi-ui-runtime/package.json scripts/ci/pi-ui-runtime/package-lock.json "$RUNNER_TEMP/pi-ui-runtime/"
+          cd "$RUNNER_TEMP/pi-ui-runtime"
+          npm ci --no-audit --no-fund
+      - name: Export Pi UI runtime path and require real Pi hosts
+        # PI_REVIEW_GATE_INSTALLED_AGENT points the real-host helpers at the
+        # locked runtime instead of ambient installs; PI_REVIEW_GATE_REQUIRE_PI_HOST=1
+        # turns a missing Pi host in any gated real-host test into a hard
+        # failure, so the coverage cannot silently degrade to skips in CI.
+        run: |
+          echo "PI_REVIEW_GATE_INSTALLED_AGENT=$RUNNER_TEMP/pi-ui-runtime/node_modules/@earendil-works/pi-coding-agent" >> "$GITHUB_ENV"
+          echo "PI_REVIEW_GATE_REQUIRE_PI_HOST=1" >> "$GITHUB_ENV"
+      - name: Build review-gate candidate extension into scratch (never live dist)
+        # The TUI smoke launches the built extension through pi's public
+        # --no-extensions --extension seam. The candidate is compiled into the
+        # runner temp so the disposable CI checkout's dist/ (and a developer
+        # checkout's live dist/) is never touched by CI. The compiled entry
+        # resolves its own runtime dependencies (playwright, linkedom, undici,
+        # ...) with plain Node resolution, so the checkout's installed tree is
+        # linked into the candidate directory — without it, pi outside the
+        # checkout cannot load the extension and the required smoke fails.
+        run: |
+          mkdir -p "$RUNNER_TEMP/review-gate-candidate"
+          npx tsc -p tsconfig.json --outDir "$RUNNER_TEMP/review-gate-candidate/dist"
+          ln -sfn "$GITHUB_WORKSPACE/node_modules" "$RUNNER_TEMP/review-gate-candidate/node_modules"
+          # The extension loads its packaged mode prompts from ../../scripts
+          # relative to the compiled entry; expose the packaged scripts to
+          # this disposable candidate root without touching checkout dist/.
+          ln -sfn "$GITHUB_WORKSPACE/scripts" "$RUNNER_TEMP/review-gate-candidate/scripts"
+      - name: Export candidate extension entry
+        run: echo "PI_REVIEW_GATE_CANDIDATE_ENTRY=$RUNNER_TEMP/review-gate-candidate/dist/src/index.js" >> "$GITHUB_ENV"
       # PI_REVIEW_GATE_RUNTIME_ROLE must stay unset so activation tests observe
       # the default (no executor role) behavior; test files manage it themselves.
       - name: Build test bundle

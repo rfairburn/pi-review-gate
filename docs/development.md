@@ -77,8 +77,63 @@ The complete suite (`npm run test:run`) executes up to four test files concurren
   external editing, image paste, Shift+Enter newlines, draft survival). Without a
   resolvable install those tests skip themselves; in an environment that has Pi,
   set `PI_REVIEW_GATE_REQUIRE_PI_HOST=1` to turn those skips into hard failures.
-  The `@` picker test additionally needs `fd` on `PATH` and skips with a note when it
-  is absent.
+  The `@` picker test additionally needs `fd` on `PATH` and fails (rather than
+  skipping) when the required-host gate is set and no finder is resolvable.
+- **Test-only explicit paths (never shipped, never user-specific in tracked files):**
+  CI's full suite installs a locked `@earendil-works/pi-coding-agent@0.87.1` UI
+  runtime (manifests: `scripts/ci/pi-ui-runtime/`) into the runner temp and exports
+  `PI_REVIEW_GATE_INSTALLED_AGENT` (the runtime root) plus
+  `PI_REVIEW_GATE_REQUIRE_PI_HOST=1`; the real-host helpers prefer that install over
+  ambient discovery. The same job compiles the review-gate candidate into the runner
+  temp (`npx tsc -p tsconfig.json --outDir ...`) and exports
+  `PI_REVIEW_GATE_CANDIDATE_ENTRY` for the live PTY smoke, and provisions `fd`
+  (Ubuntu's `fd-find`, exposed as `fdfind`) exporting the resolved binary as
+  `PI_REVIEW_GATE_FD` so the `@` test never depends on ambient `PATH` variance.
+  Locally, set `PI_REVIEW_GATE_INSTALLED_AGENT` to any installed pi-coding-agent
+  package root and `PI_REVIEW_GATE_CANDIDATE_ENTRY` to a built `dist/src/index.js`
+  to enable the smoke.
+- **Live PTY smoke (`tests/pi-tui-live-settings-smoke.test.ts`):** drives the built
+  candidate inside a real Pi TUI on a real PTY through the public
+  `pi --no-extensions --extension <candidate>` seam, under a throwaway sandbox
+  (synthetic `HOME` with a minimal `review-gate.json`, a synthetic workspace with a
+  `docs/` folder and a workspace-root fixture, a stub `$EDITOR`, allowlisted
+  environment with no `PI_REVIEW_GATE_*` variables and no provider API keys — no
+  model/API call is possible). It walks `/review-settings` → Scheduled tasks → a
+  task's workspace field and asserts, as screen-scraped observations: the native
+  editor bridge hint line, the real first-Tab `docs/` list, a leading-`/`
+  Workspace filesystem list (directory and file, no slash-command items), the
+  real fd-backed recursive `@` picker (asserted on a workspace-root fixture only that
+  picker can surface, frame-scoped so stale buffer content cannot satisfy it), Esc
+  list-first semantics (text retention via a printable probe key), Ctrl+G external
+  editing landing its content in the field, Enter staging the value into the task
+  catalog, the reopen prefill, no field text leaking into the chat draft, no
+  accidental chat/command submission, and the documented Ctrl+C-twice host exit.
+  Every wait is time-bounded; the driver kills the forked PTY child's process
+  group on exit, and on the overall timeout the driver's group is killed (the
+  PTY child then sees the closed master and hangs up).
+  Locally the smoke skips when a prerequisite is missing; under
+  `PI_REVIEW_GATE_REQUIRE_PI_HOST=1` (CI) a missing prerequisite is a hard failure.
+  CI additionally links the checkout's `node_modules` and `scripts` into the
+  disposable candidate directory (the compiled entry resolves dependencies with
+  plain Node resolution and loads its mode prompts from the adjacent scripts
+  directory; both are required outside the checkout).
+
+  **Reported gaps (not faked):** the live smoke does not seed or decode an OS
+  image clipboard or prove a pasted image's bytes were read by Pi. The
+  installed-host scheduled-image test instead simulates Pi's native clipboard
+  callback while exercising the real `CustomEditor` paste key handler, settings
+  Save/Cancel, and managed-asset persistence. The live smoke also asserts
+  nothing about a single-press Ctrl+C clear: a cleared editor row is only observable as an absence in the newest
+  redraw fragment, and the probes (raw `\x03` and the Kitty-protocol CSI-u form
+  `\x1b[99;5u`, in the main chat editor and in a bridge-opened field) could not
+  reproduce it through that heuristic. The double Ctrl+C host exit IS asserted and
+  proves the same `app.clear` handler ran — its first press calls the host's
+  `clearEditor()`, its second exits — so the clear code path is exercised even
+  though the cleared row is not screen-scraped. The bridge tiers exercise the
+  editor-level Ctrl+C handler directly. To close the gap deterministically, assert
+  the clear behaviourally: type `docs/` in the workspace field, press Ctrl+C once,
+  then Enter — the empty value is rejected with the unique
+  "Workspace must be a non-empty string." notice, and reopening shows no prefill.
 - **`python3` is not needed by the test suite**: DDGS interactions are mocked. In the
   runtime, Python is used only by `WebSearch` — launch-time venv creation/validation via
   `scripts/ensure-ddgs.sh` plus one Python process per search

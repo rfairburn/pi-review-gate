@@ -1,13 +1,20 @@
 /**
- * Issue #182: production host-peer loading for the free-text answer editor.
+ * Issue #182: production host-peer loading for the pending-question UI.
  *
- * The question UI's loader must expose pi-tui's Editor class (and the module's
- * public setKeybindings) from a running Pi install, using the same two-step
- * strategy as src/settings/menu.ts: soft require first, then host-relative
- * resolution discovered from the process entry. These tests exercise that
- * production load path against fake Pi install trees (no injected host): a
- * module that exposes the editor surface, and one that does not (the loader
- * must still resolve the width helpers so only editing degrades).
+ * The question UI's loader must expose pi-tui's width-safe text helpers, raw
+ * key matching, and the module-global KeybindingsManager from a running Pi
+ * install, using the same two-step strategy as src/settings/menu.ts: soft
+ * require first, then host-relative resolution discovered from the process
+ * entry. These tests exercise that production load path against fake Pi
+ * install trees (no injected host): a module that exposes the full surface,
+ * and one that does not (the loader must still resolve whatever it can).
+ *
+ * The free-text answer row no longer consumes a standalone Editor from this
+ * loader: it embeds the host-wired native editor acquired through the shared
+ * bridge (src/native-editor-bridge.ts), which loads its own seams. When those
+ * seams are unavailable the row renders an unavailable line instead of a
+ * non-parity fallback, so the loader deliberately no longer exposes an
+ * Editor class or setKeybindings.
  */
 
 import assert from "node:assert/strict";
@@ -21,7 +28,7 @@ import {
   setUserQuestionTuiHostEntryProvider,
 } from "../src/user-question/pi-tui-host";
 
-type TuiVariant = "with-editor" | "without-editor";
+type Variant = "full" | "width-only";
 
 interface FakePiInstall {
   base: string;
@@ -29,33 +36,30 @@ interface FakePiInstall {
 }
 
 /**
- * Fake pi-tui module source. Exposes the width helpers the loader always
- * captures, plus (for the with-editor variant) an Editor class and
- * setKeybindings that record their use on globalThis.
+ * Fake pi-tui module source. The full variant exposes the width helpers, raw
+ * key matching, and a getKeybindings that returns a recording manager; the
+ * width-only variant exposes just the width helpers (the loader must still
+ * resolve it).
  */
-function fakeTuiModuleSource(variant: TuiVariant): string {
-  const editor =
-    variant === "with-editor"
+function fakeTuiModuleSource(variant: Variant): string {
+  const extras =
+    variant === "full"
       ? [
-          "export class Editor {",
-          "  constructor(tui, theme) {",
-          "    this.tui = tui;",
-          "    this.theme = theme;",
-          "    globalThis.__fakeAnswerEditorConstructions = (globalThis.__fakeAnswerEditorConstructions ?? 0) + 1;",
-          "  }",
-          "}",
-          "export function setKeybindings(kb) { globalThis.__fakeAnswerEditorSetKeybindings = kb; }",
+          "export function matchesKey(data, keyId) { return data === '\\r' && keyId === 'enter'; }",
+          "const manager = { matches: (data, keybinding) => { globalThis.__fakeQuestionTuiMatchesCalls = (globalThis.__fakeQuestionTuiMatchesCalls ?? 0) + 1; return true; } };",
+          "export function getKeybindings() { return manager; }",
         ]
       : [];
   return [
     "globalThis.__fakeUserQuestionTuiEvals = (globalThis.__fakeUserQuestionTuiEvals ?? 0) + 1;",
-    "export function matchesKey(data, keyId) { return data === '\\r' && keyId === 'enter'; }",
     "export function visibleWidth(text) { return text.length; }",
-    ...editor,
+    "export function truncateToWidth(text, width, ellipsis) { return text.length > width ? text.slice(0, Math.max(0, width - (ellipsis?.length ?? 0))) + (ellipsis ?? '') : text; }",
+    "export function wrapTextWithAnsi(text, width) { return [text]; }",
+    ...extras,
   ].join("\n");
 }
 
-async function makeFakePiInstall(variant: TuiVariant): Promise<FakePiInstall> {
+async function makeFakePiInstall(variant: Variant): Promise<FakePiInstall> {
   const base = await mkdtemp(join(tmpdir(), "pi-review-question-host-"));
   const root = join(base, "@earendil-works", "pi-coding-agent");
   const tuiDir = join(root, "node_modules", "@earendil-works", "pi-tui");
@@ -87,7 +91,7 @@ function clearSeams(): void {
 }
 
 function clearFakeGlobals(): void {
-  for (const key of ["__fakeUserQuestionTuiEvals", "__fakeAnswerEditorConstructions", "__fakeAnswerEditorSetKeybindings"]) {
+  for (const key of ["__fakeUserQuestionTuiEvals", "__fakeQuestionTuiMatchesCalls"]) {
     delete (globalThis as Record<string, unknown>)[key];
   }
 }
@@ -96,8 +100,8 @@ function fakeGlobal(key: string): unknown {
   return (globalThis as Record<string, unknown>)[key];
 }
 
-test("production load path: exposes the host Editor class and setKeybindings", async (t) => {
-  const install = await makeFakePiInstall("with-editor");
+test("production load path: exposes the width helpers, key matching, and the live keybindings manager", async (t) => {
+  const install = await makeFakePiInstall("full");
   t.after(() => rm(install.base, { recursive: true, force: true }).catch(() => {}));
   clearSeams();
   clearFakeGlobals();
@@ -106,35 +110,40 @@ test("production load path: exposes the host Editor class and setKeybindings", a
   const host = await loadQuestionTuiHost();
   assert.ok(host, "the host resolves from the running Pi entry");
   assert.equal(typeof host?.visibleWidth, "function", "width helpers still resolve");
+  assert.equal(host!.visibleWidth!("abcd"), 4);
+  assert.equal(typeof host?.truncateToWidth, "function");
+  assert.equal(host!.truncateToWidth!("abcdef", 3, "…"), "ab…");
+  assert.deepEqual(host!.wrapTextWithAnsi!("one two", 80), ["one two"]);
   assert.equal(typeof host?.matchesKey, "function");
-  assert.equal(typeof host?.Editor, "function", "the Editor class is exposed for the answer row");
-  assert.equal(typeof host?.setKeybindings, "function", "the module's setKeybindings is exposed");
+  assert.equal(host!.matchesKey!("\r", "enter"), true);
+  assert.equal(host!.matchesKey!("\x1b", "enter"), false);
+  assert.equal(typeof host?.getKeybindings, "function", "the module-global keybindings manager is exposed");
 
-  // The exposed constructor is the module's own class.
-  const identity = (text: string): string => text;
-  const editor = new host!.Editor!(
-    { terminal: { rows: 40 } },
-    {
-      borderColor: (s) => s,
-      selectList: { selectedPrefix: identity, selectedText: identity, description: identity, scrollInfo: identity, noMatch: identity },
-    },
-  );
-  assert.equal(fakeGlobal("__fakeAnswerEditorConstructions"), 1);
-  void editor;
+  const manager = host!.getKeybindings!();
+  assert.ok(manager, "a manager is returned");
+  assert.equal(typeof manager?.matches, "function");
+  manager!.matches!("\r", "tui.input.submit");
+  assert.equal(fakeGlobal("__fakeQuestionTuiMatchesCalls"), 1, "the exposed manager is the module's own");
+
+  // The loader no longer exposes a standalone editor surface for the
+  // free-text row (that path now goes through the shared bridge).
+  const hostRecord = host as unknown as Record<string, unknown>;
+  assert.equal(hostRecord["Editor"], undefined, "no Editor class is exposed");
+  assert.equal(hostRecord["setKeybindings"], undefined, "no setKeybindings is exposed");
 });
 
-test("production load path: a module without an Editor still resolves the width helpers", async (t) => {
-  const install = await makeFakePiInstall("without-editor");
+test("production load path: a module without the key surface still resolves the width helpers", async (t) => {
+  const install = await makeFakePiInstall("width-only");
   t.after(() => rm(install.base, { recursive: true, force: true }).catch(() => {}));
   clearSeams();
   clearFakeGlobals();
   setUserQuestionTuiHostEntryProvider(() => install.entry);
 
   const host = await loadQuestionTuiHost();
-  assert.ok(host, "the host still resolves for rendering and key matching");
+  assert.ok(host, "the host still resolves for rendering");
   assert.equal(typeof host?.visibleWidth, "function");
-  assert.equal(host?.Editor, undefined, "no Editor surface: the component keeps its fallback editor");
-  assert.equal(host?.setKeybindings, undefined);
+  assert.equal(host?.matchesKey, undefined, "no key matching: the component falls back to its naive matcher");
+  assert.equal(host?.getKeybindings, undefined, "no manager: input is driven by the injected live manager only");
 });
 
 test("an injected host override short-circuits discovery", async () => {

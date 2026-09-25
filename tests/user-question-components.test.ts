@@ -6,21 +6,154 @@ import { createQuestionListComponent, QUESTION_LIST_SHORTCUT_KEY } from "../src/
 /** Raw sequence used by the fakes for the approved chord (Kitty-style). */
 const CHORD = "\x1b[1;64A";
 
+const UP = "\x1b[A";
+const DOWN = "\x1b[B";
+const ENTER = "\r";
+const ESCAPE = "\x1b";
+const LEFT = "\x1b[D";
+const RIGHT = "\x1b[C";
+const BACKSPACE = "\x7f";
+const CTRL_C = "\x03";
+const CTRL_D = "\x04";
+const TAB = "\t";
+
 function makeKeybindings() {
   const bindings: Record<string, string[]> = {
-    "tui.select.up": ["\x1b[A"],
-    "tui.select.down": ["\x1b[B"],
-    "tui.select.confirm": ["\r"],
-    "tui.select.cancel": ["\x1b"],
-    "tui.editor.cursorLeft": ["\x1b[D"],
-    "tui.editor.cursorRight": ["\x1b[C"],
-    "tui.editor.deleteCharBackward": ["\x7f"],
+    "tui.select.up": [UP],
+    "tui.select.down": [DOWN],
+    "tui.select.confirm": [ENTER],
+    // The pi 0.87.1 defaults: cancel is escape + ctrl+c; the component's
+    // editing pre-check must let ctrl+c through to the native clear.
+    "tui.select.cancel": [ESCAPE, CTRL_C],
+    "app.interrupt": [ESCAPE],
+    "app.clear": [CTRL_C],
+    "app.exit": [CTRL_D],
+    "tui.editor.cursorLeft": [LEFT],
+    "tui.editor.cursorRight": [RIGHT],
+    "tui.editor.deleteCharBackward": [BACKSPACE],
   };
   return {
     matches(data: string, keybinding: string): boolean {
       return (bindings[keybinding] ?? []).includes(data);
     },
   };
+}
+
+/**
+ * The post-bridge instance contract as seen by the component: a host-wired
+ * editor whose intercepted keys settle through onFieldSettle and whose native
+ * submit path (Enter) routes through the taken-over onSubmit. Emulates just
+ * enough of pi-tui's base Editor for the component tier; the bridge's own
+ * logic is pinned by the editor-parity and wiring tiers.
+ */
+class FakeNativeField {
+  fieldActive = false;
+  focused = false;
+  onFieldSettle?: (value: string | undefined) => void;
+  onSubmit?: (text: string) => void;
+  private text = "";
+  private cursor = 0;
+  private listItems: string[] | undefined;
+
+  constructor() {
+    // The bridge's native-submit takeover with the question semantics:
+    // non-empty submits, empty stays open (the draft was cleared natively).
+    this.onSubmit = (text: string) => this.nativeSubmit(text);
+  }
+
+  nativeSubmit(text: string): void {
+    const value = text.trim();
+    if (value.length === 0) return;
+    this.onFieldSettle?.(value);
+  }
+
+  getText(): string {
+    return this.text;
+  }
+
+  setText(text: string): void {
+    this.text = text;
+    this.cursor = text.length;
+  }
+
+  isShowingAutocomplete(): boolean {
+    return this.listItems !== undefined;
+  }
+
+  render(_width: number): string[] {
+    const lines = [`[field:${this.text}]`];
+    for (const item of this.listItems ?? []) lines.push(`  ${item}`);
+    return lines;
+  }
+
+  invalidate(): void {}
+
+  handleInput(data: string): void {
+    // The bridge's interceptions, emulated at the instance boundary.
+    if (data === ESCAPE && !this.listItems) {
+      this.onFieldSettle?.(undefined); // app.interrupt
+      return;
+    }
+    if (data === CTRL_D && this.text.length === 0) {
+      this.onFieldSettle?.(undefined); // app.exit, empty editor only
+      return;
+    }
+    // The host's copied app.clear handler: Ctrl+C clears the draft, never cancels.
+    if (data === CTRL_C) {
+      this.text = "";
+      this.cursor = 0;
+      return;
+    }
+    if (data === TAB) {
+      if (!this.listItems) this.listItems = ["assets/", "guide.md"];
+      return;
+    }
+    if (data === ESCAPE && this.listItems) {
+      this.listItems = undefined; // dismiss the visible list first
+      return;
+    }
+    if (data === ENTER && this.listItems) {
+      this.insert(this.listItems[0]!); // confirm the highlighted completion
+      this.listItems = undefined;
+      return;
+    }
+    // Bracketed paste: the base Editor strips the markers and inserts the payload.
+    if (data.startsWith("\x1b[200~") && data.endsWith("\x1b[201~")) {
+      this.insert(data.slice("\x1b[200~".length, -"\x1b[201~".length));
+      return;
+    }
+    if (data === LEFT) {
+      if (this.cursor > 0) this.cursor -= 1;
+      return;
+    }
+    if (data === RIGHT) {
+      if (this.cursor < this.text.length) this.cursor += 1;
+      return;
+    }
+    if (data === BACKSPACE) {
+      if (this.cursor > 0) {
+        this.text = this.text.slice(0, this.cursor - 1) + this.text.slice(this.cursor);
+        this.cursor -= 1;
+      }
+      return;
+    }
+    if (data === ENTER) {
+      // The native submitValue: trim, clear state, then the taken-over onSubmit.
+      const value = this.text.trim();
+      this.text = "";
+      this.cursor = 0;
+      this.onSubmit?.(value);
+      return;
+    }
+    // Unrecognized terminal sequences are ignored; printable runs (single
+    // keystrokes or coalesced chunks) insert at the cursor.
+    if ([...data].every((ch) => ch >= " ")) this.insert(data);
+  }
+
+  private insert(text: string): void {
+    this.text = this.text.slice(0, this.cursor) + text + this.text.slice(this.cursor);
+    this.cursor += text.length;
+  }
 }
 
 function makeTuiHost() {
@@ -58,9 +191,11 @@ interface Fixture {
   sent: Array<{ message: string; options?: { deliverAs?: "steer" | "followUp" } }>;
   done: Array<unknown>;
   component: ReturnType<typeof createQuestionListComponent>;
+  /** The host-wired native field instance (undefined when the seams are unavailable). */
+  field: FakeNativeField | undefined;
 }
 
-function makeFixture(): Fixture {
+function makeFixture(options: { field?: boolean } = {}): Fixture {
   const sent: Fixture["sent"] = [];
   const controller = new UserQuestionController({
     pi: {
@@ -74,15 +209,17 @@ function makeFixture(): Fixture {
   const identity = { sessionManager: "UI" };
   controller.beginSession(identity);
   const done: unknown[] = [];
+  const field = options.field === false ? undefined : new FakeNativeField();
   const component = createQuestionListComponent({
     controller,
     keybindings: makeKeybindings(),
     theme: THEME,
     tuiHost: makeTuiHost(),
     shortcutLabel: "Ctrl+Alt+Up",
+    nativeField: field,
     onDone: (result) => done.push(result),
   });
-  return { controller, identity, sent, done, component };
+  return { controller, identity, sent, done, component, field };
 }
 
 function register(fixture: Fixture, question: string, options: { choices?: string[]; mode?: "async" | "sync" } = {}) {
@@ -94,14 +231,6 @@ function register(fixture: Fixture, question: string, options: { choices?: strin
   if (!result.ok) throw new Error("registration failed");
   return result.question.id;
 }
-
-const UP = "\x1b[A";
-const DOWN = "\x1b[B";
-const ENTER = "\r";
-const ESCAPE = "\x1b";
-const LEFT = "\x1b[D";
-const RIGHT = "\x1b[C";
-const BACKSPACE = "\x7f";
 
 test("the list renders pending questions with the shortcut hint and waiting tags", () => {
   const fixture = makeFixture();
@@ -169,27 +298,81 @@ test("free-text answers support typing, cursor movement, and backspace", async (
   assert.match(fixture.sent[0]!.message, /Which database\?": yXes$/);
 });
 
-test("empty or whitespace-only free text does not submit; the draft survives backing out", async () => {
+test("empty or whitespace-only free text never submits; an empty Enter clears the draft like the main chat", async () => {
   const fixture = makeFixture();
   register(fixture, "Which database?", { choices: ["SQLite"], mode: "async" });
   fixture.component.handleInput(ENTER); // open answer view
   fixture.component.handleInput(DOWN); // Type something…
   fixture.component.handleInput(ENTER); // start editing
-  fixture.component.handleInput(ENTER); // empty buffer: no submission
+  fixture.component.handleInput(ENTER); // empty draft: nothing to send, still editing
   assert.equal(fixture.done.length, 0);
   fixture.component.handleInput("   "); // whitespace only: still no submission
   fixture.component.handleInput(ENTER);
   assert.equal(fixture.done.length, 0);
-  fixture.component.handleInput(ESCAPE); // back to the option rows; draft kept
-  const text = fixture.component.render(80).join("\n");
-  assert.match(text, /> Type something…/, "selection stays on the free-text row");
-  fixture.component.handleInput(ENTER); // resume editing with the draft
-  fixture.component.handleInput("ok"); // "   ok"
-  fixture.component.handleInput(ENTER); // trimmed to "ok" and submitted
+  assert.equal(fixture.field!.getText(), "", "the native submit path cleared the state before settling");
+  fixture.component.handleInput("ok");
+  fixture.component.handleInput(ENTER); // trimmed and submitted
   assert.deepEqual(fixture.done, [{ kind: "submitted", result: { status: "delivered", empty: true } }]);
   await new Promise((resolvePromise) => setImmediate(resolvePromise));
   assert.equal(fixture.sent.length, 1);
   assert.match(fixture.sent[0]!.message, /Which database\?": ok$/);
+});
+
+test("backing out of free text keeps the draft in the shared instance", async () => {
+  const fixture = makeFixture();
+  register(fixture, "Which database?", { choices: ["SQLite"], mode: "async" });
+  fixture.component.handleInput(ENTER); // open answer view
+  fixture.component.handleInput(DOWN); // Type something…
+  fixture.component.handleInput(ENTER); // start editing
+  for (const char of "partial draft") fixture.component.handleInput(char);
+  fixture.component.handleInput(ESCAPE); // back to the option rows; draft kept
+  const text = fixture.component.render(80).join("\n");
+  assert.match(text, /> Type something…/, "selection stays on the free-text row");
+  assert.equal(fixture.field!.getText(), "partial draft", "the draft survives backing out");
+  fixture.component.handleInput(ENTER); // resume editing with the draft
+  fixture.component.handleInput(" done");
+  fixture.component.handleInput(ENTER); // submit
+  await new Promise((resolvePromise) => setImmediate(resolvePromise));
+  assert.equal(fixture.sent.length, 1);
+  assert.match(fixture.sent[0]!.message, /Which database\?": partial draft done$/);
+});
+
+test("Ctrl+C clears the field draft and never cancels", async () => {
+  const fixture = makeFixture();
+  register(fixture, "Which database?", { choices: ["SQLite"], mode: "async" });
+  fixture.component.handleInput(ENTER); // open answer view
+  fixture.component.handleInput(DOWN); // Type something…
+  fixture.component.handleInput(ENTER); // start editing
+  for (const char of "some text") fixture.component.handleInput(char);
+  fixture.component.handleInput(CTRL_C); // the default binding is both cancel and clear
+  assert.equal(fixture.done.length, 0, "Ctrl+C does not close the list");
+  const text = fixture.component.render(80).join("\n");
+  assert.match(text, /\[field:\]/, `the draft was cleared: ${text}`);
+  assert.match(text, /Enter submit · Esc back to options/, "still editing after the clear");
+  for (const char of "again") fixture.component.handleInput(char);
+  fixture.component.handleInput(ENTER); // submit what remains
+  await new Promise((resolvePromise) => setImmediate(resolvePromise));
+  assert.equal(fixture.sent.length, 1);
+  assert.match(fixture.sent[0]!.message, /Which database\?": again$/);
+});
+
+test("Esc dismisses a visible completion list first, then returns to the rows", async () => {
+  const fixture = makeFixture();
+  register(fixture, "Which database?", { choices: ["SQLite"], mode: "async" });
+  fixture.component.handleInput(ENTER); // open answer view
+  fixture.component.handleInput(DOWN); // Type something…
+  fixture.component.handleInput(ENTER); // start editing
+  for (const char of "docs/") fixture.component.handleInput(char);
+  fixture.component.handleInput(TAB); // open the completion list
+  assert.equal(fixture.field!.isShowingAutocomplete(), true, "the list is visible");
+  fixture.component.handleInput(ESCAPE); // first Esc: dismiss the list only
+  assert.equal(fixture.field!.isShowingAutocomplete(), false, "the list was dismissed");
+  const text = fixture.component.render(80).join("\n");
+  assert.match(text, /\[field:docs\//, `still editing with the draft kept: ${text}`);
+  fixture.component.handleInput(ESCAPE); // second Esc: back to the option rows
+  const rows = fixture.component.render(80).join("\n");
+  assert.match(rows, /> Type something…/, "back on the option rows");
+  assert.equal(fixture.field!.getText(), "docs/", "the draft survived both presses");
 });
 
 test("bracketed paste inserts its payload without escape-marker residue", async () => {
@@ -208,7 +391,7 @@ test("bracketed paste inserts its payload without escape-marker residue", async 
   assert.ok(!/200~|201~/.test(fixture.sent[0]!.message), "no paste markers reach the model");
 });
 
-test("the fallback editor keeps and submits drafts beyond 4000 characters without data loss", async () => {
+test("the native field keeps and submits drafts beyond 4000 characters without data loss", async () => {
   const fixture = makeFixture();
   register(fixture, "Which database?", { choices: ["SQLite"], mode: "async" });
   fixture.component.handleInput(ENTER); // open answer view
@@ -226,6 +409,25 @@ test("the fallback editor keeps and submits drafts beyond 4000 characters withou
     fixture.sent[0]!.message.endsWith("p".repeat(4999) + "z"),
     "every character beyond 4000 reached the model",
   );
+});
+
+test("an unavailable native field renders an unavailable row; confirming it is a no-op", async () => {
+  const fixture = makeFixture({ field: false });
+  register(fixture, "Which database?", { choices: ["SQLite"], mode: "async" });
+  fixture.component.handleInput(ENTER); // open answer view
+  const text = fixture.component.render(80).join("\n");
+  const flat = text.replace(/\n\s*/g, " ");
+  assert.match(flat, /Free text unavailable/, "the free-text row names the unavailable native editor");
+  assert.match(flat, /choices and\s+Decline still work/);
+  fixture.component.handleInput(DOWN); // Type something… (unavailable)
+  fixture.component.handleInput(ENTER); // confirming it is a no-op
+  const still = fixture.component.render(80).join("\n");
+  assert.match(still, /Free text unavailable/, "editing was never entered");
+  fixture.component.handleInput(UP); // back to the choice
+  fixture.component.handleInput(ENTER); // choices keep working
+  await new Promise((resolvePromise) => setImmediate(resolvePromise));
+  assert.equal(fixture.sent.length, 1);
+  assert.match(fixture.sent[0]!.message, /Which database\?": SQLite$/);
 });
 
 test("unrecognized terminal sequences never insert printable tails into the draft", async () => {
@@ -249,7 +451,7 @@ test("unrecognized terminal sequences never insert printable tails into the draf
   ];
   for (const sequence of unknown) fixture.component.handleInput(sequence);
   const rendered = fixture.component.render(80).join("\n");
-  assert.match(rendered, /Your answer: yes/, "the draft is unchanged by unknown sequences");
+  assert.match(rendered, /\[field:yes\]/, "the draft is unchanged by unknown sequences");
   assert.ok(!/\[A|\[B|\[H|\[F|\[1~|\[4~|\[3~|\[5~|\[6~|;2A/.test(rendered), "no printable tails reach the draft");
   // Ordinary text and bracketed paste remain usable after rejected sequences.
   fixture.component.handleInput(" ");

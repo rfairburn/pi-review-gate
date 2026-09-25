@@ -19,6 +19,37 @@ dates.
 
 ### Added
 
+- Persist images pasted through the native editor into scheduled-task
+  instructions durably at Save: Pi's image paste inserts a path to a temporary
+  clipboard file, so Save validates the referenced file by content (PNG,
+  JPEG, GIF, or WebP, at most 10 MiB — re-bounded during the read so a source
+  that grows after the size check cannot allocate unbounded memory), copies
+  it into a private managed store next to the config file (0700 directories,
+  0600 files, fsynced; each pasted image gets its own copy, kept per task id
+  across Saves; a store root or per-task directory that is a symbolic link
+  fails Save closed and its target is never chmod'ed or written through), and
+  replaces the temporary path in the instructions with the
+  managed absolute path before the ordinary atomic config write — a later
+  scheduled run reads the managed copy even after Pi deletes its temp file.
+  Only Pi's own paste output is treated as an image: candidates are bounded
+  to `pi-clipboard-<UUID>.<png|jpg|jpeg|gif|webp>` in the OS temp directory
+  (with content validated after path recognition), so ordinary clipboard
+  text — any other absolute path, real or missing, a sentence, or `@`
+  attachment text — stays verbatim as text and Save proceeds with native
+  text-paste behavior unchanged. Provenance comes only from the bridge's
+  observation-only paste seam, each
+  observed token is verified against the final staged instructions, an
+  unobserved `pi-clipboard-...` reference (any extension or name spelling)
+  fails Save with an actionable message instead of being copied or persisted,
+  and missing, non-image, too large, or failed copies fail the Save closed
+  with the config and store untouched (Cancel copies nothing; a persistence
+  failure that already landed keeps the copies the parsed saved config
+  references). Managed assets are never auto-deleted
+  (active or other-process scheduled runs may still read them); cleanup is
+  manual, and a missing asset fails its dispatch with an actionable wake
+  instead of silently starting a run against a dead path (the dispatch scan
+  checks the platform separator and the Windows backslash spelling).
+
 - Add opt-in process-local scheduled subtasks. Define independently enabled
   local-time cron entries in `/review-settings`, with per-entry instructions,
   workspaces, worker routes, and task-local review choices. A Pi process starts
@@ -28,6 +59,14 @@ dates.
   overlap skips rather than catch-up or cross-process deduplication.
 
 ### Changed
+
+- Complete leading-`/` tokens in the scheduled-task Workspace field using
+  Pi's own file provider, not slash-command suggestions; no command executes.
+  The Workspace-only provider decorator preserves native relative and `~/`
+  completion and leaves all other fields and AskUserQuestion unchanged. Native
+  absolute-path lists show the first item highlighted; the first Tab may only
+  show the list, with a further Tab applying its selection. Save still rejects
+  missing or non-directory workspaces.
 
 - Accept a leading `~` or `~/...` as a scheduled-task workspace and as the
   `SubtasksStart` workspace: settings Save and run-time dispatch both expand it
@@ -39,6 +78,11 @@ dates.
   parent session's working directory.
 
 ### Fixed
+
+- Fail closed when an interactive host cannot assign and verify takeover of
+  the field editor's `onSubmit`: refuse field acquisition and restore the prior
+  editor factory instead of risking a chat send on Enter. This applies to
+  settings and AskUserQuestion alike.
 
 - Make every `/review-settings` text field truly editable through one shared
   host-wired native editor bridge: in the interactive Pi TUI each field —
@@ -57,9 +101,9 @@ dates.
   bespoke editor/provider/matcher surface is removed: there is no duplicate
   completion algorithm or editor state. Token recognition, relative/`~`/
   absolute handling, platform behavior, the list UI, and selection keys are
-  inherited from the host as-is (a line starting with `/` remains the host
-  editor's slash-command context, so no universal absolute-path or Windows
-  support is claimed). An interactive host missing the required native seams
+  inherited from the host as-is, except for the Workspace-only leading-`/`
+  file suggestion routing above; no universal absolute-path or Windows support
+  is claimed. An interactive host missing the required native seams
   fails closed with an error notice instead of presenting a non-parity
   fallback field; non-interactive hosts keep their clearly identified chain —
   Pi's public editor with an editable prefill first, then the legacy single-line

@@ -18,6 +18,7 @@ export function buildUnifiedPatch(changes: ChangedFile[], maxPatchBytes: number)
       omitted.push({ path: change.path, reason });
       section = [
         `diff --git a/${change.path} b/${change.path}`,
+        ...gitModeHeaders(change),
         `# Diff omitted for ${change.path}: ${reason}`,
         "",
       ].join("\n");
@@ -38,6 +39,15 @@ export function buildUnifiedPatch(changes: ChangedFile[], maxPatchBytes: number)
   return { patch, truncated, omitted };
 }
 
+function gitModeHeaders(change: ChangedFile): string[] {
+  const { oldGitMode, newGitMode } = change;
+  if (oldGitMode === newGitMode) return [];
+  if (oldGitMode && newGitMode) return [`old mode ${oldGitMode}`, `new mode ${newGitMode}`];
+  if (newGitMode) return [`new file mode ${newGitMode}`];
+  if (oldGitMode) return [`deleted file mode ${oldGitMode}`];
+  return [];
+}
+
 function buildFileDiff(change: ChangedFile): string {
   const oldContent = change.status === "added" ? "" : change.oldContent ?? "";
   const newContent = change.status === "deleted" ? "" : change.newContent ?? "";
@@ -50,6 +60,7 @@ function buildFileDiff(change: ChangedFile): string {
 
   return [
     `diff --git a/${sourcePath} b/${change.path}`,
+    ...gitModeHeaders(change),
     ...(change.renamedFrom ? [`rename from ${change.renamedFrom}`, `rename to ${change.path}`] : []),
     `--- ${oldPath}`,
     `+++ ${newPath}`,

@@ -120,6 +120,9 @@ export interface ChangedFile {
   status: ChangedFileStatus;
   binary: boolean;
   oversized: boolean;
+  /** Optional Git-style modes (e.g. 100644, 100755, 120000) for mode/type review. */
+  oldGitMode?: string;
+  newGitMode?: string;
   /** Original path for renames; rendered as `rename from`/`rename to` headers. */
   renamedFrom?: string;
   diffOmittedReason?: string;
@@ -1073,7 +1076,7 @@ function abortError(signal?: AbortSignal): Error {
   return error;
 }
 
-function looksBinary(buffer: Buffer, sampleCut = false): boolean {
+export function looksBinary(buffer: Buffer, sampleCut = false): boolean {
   if (hasKnownBinaryMagic(buffer)) return true;
   const sampleLength = Math.min(buffer.length, BINARY_SAMPLE_BYTES);
   for (let index = 0; index < sampleLength; index += 1) {

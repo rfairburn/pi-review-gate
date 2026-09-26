@@ -282,10 +282,15 @@ regardless of repository size.
 During task capture, `maxSnapshotBytes` limits only the cumulative size of non-ignored
 untracked files (50 MiB by default). For ordinary serial review snapshots, the same
 setting continues to bound the textual file content retained for diffing. Ordinary
-snapshots stream files once to retain an exact SHA-256 identity. Recognizable archives,
-executables, media, fonts, PDFs, and other binary data are classified from content
-signatures with a binary-content fallback; their bytes are not retained or decoded for
-textual diffs, and filename extensions alone never determine classification.
+snapshots stream files once to retain an exact SHA-256 identity. Within one session,
+the first capture of a new unseeded review exchange may reuse verified facts from the
+last completed same-root snapshot (see [Review windows and
+evidence](review-workflow.md#review-windows-and-evidence)); every entry is re-verified
+against the live filesystem and every retain/omit decision is recomputed against the
+current limits, so reuse never changes what a fresh capture would report. Recognizable
+archives, executables, media, fonts, PDFs, and other binary data are classified from
+content signatures with a binary-content fallback; their bytes are not retained or
+decoded for textual diffs, and filename extensions alone never determine classification.
 
 ## Landing and source preservation
 

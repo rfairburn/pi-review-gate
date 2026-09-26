@@ -5,6 +5,7 @@ import { deliverScheduledEvent, formatScheduledDispatchFailure, formatScheduledO
 import { getSchedulerRuntime } from "./scheduling/runtime";
 import { removeReviewBundle, removeTransientWindowBundle } from "./bundle";
 import { createWorkspaceSnapshot } from "./capture";
+import { CompletedSnapshotCache } from "./snapshot-reuse";
 import { registerCommands } from "./commands";
 import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "./correction-feedback";
 import {
@@ -86,6 +87,8 @@ const orchestratorBackgroundCompletionPrompt = [
 interface ActivationDependencies {
   /** Narrow injection seam used by lifecycle tests; production constructs it. */
   webTools?: Pick<WebToolManager, "register" | "cleanup" | "sync" | "applySavedSettings">;
+  /** #193: the session-local completed-snapshot reuse source; tests inject one to observe retained records. */
+  snapshotReuse?: Pick<CompletedSnapshotCache, "remember" | "reuseSourceFor" | "clear" | "current">;
 }
 
 export async function activate(pi: unknown, dependencies: ActivationDependencies = {}): Promise<void> {
@@ -240,6 +243,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   const userQuestions = registerUserQuestions(pi);
 
   const state = createState();
+  // #193: bounded session-local source for safe snapshot reuse across ordinary
+  // review-window close. Never persisted; cleared on every session boundary.
+  const snapshotReuse = dependencies.snapshotReuse ?? new CompletedSnapshotCache();
   let currentScopedModels: string[] = [];
   let sessionActive = true;
   let activeReviewAbort: ReviewAbortHandle | undefined;
@@ -499,6 +505,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
 
   registerHook(pi, "session_shutdown", async (...args) => {
     sessionActive = false;
+    // #193: the reuse source is session-local; a dying session must not leave
+    // its last snapshot available to anything that outlives it.
+    snapshotReuse.clear();
     setStatus(extractContext(args) ?? pi, "review-gate", undefined);
     setStatus(extractContext(args) ?? pi, "review-gate-mode", undefined);
     sessionAbortController.abort();
@@ -549,6 +558,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     executionTools.setScopedModels(currentScopedModels);
     executionTools.setUiContext(extractContext(args) ?? pi);
     discardSessionState(state);
+    // #193: a new session (including /new replacement and /reload) never
+    // inherits another session's completed-snapshot reuse source.
+    snapshotReuse.clear();
     const context = extractContext(args);
     const deferredSessionIdentity = typeof context === "object" && context !== null
       ? (context as { sessionManager?: unknown }).sessionManager
@@ -696,7 +708,18 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     const baseline = await createWorkspaceSnapshot(currentCwd, {
       maxFileBytes: config.maxFileBytes,
       maxSnapshotBytes: config.maxSnapshotBytes,
+      // #193: a new unseeded exchange reuses verified facts from the last
+      // completed same-root snapshot across ordinary window close. The cache
+      // holds only successfully completed captures (an aborted/failed capture
+      // rejects before remember runs), is cleared on every session boundary,
+      // and never crosses roots; the helper still enumerates and stats every
+      // current path and recomputes every retain/omit decision against the
+      // current limits, so this source can never hide additions or deletions.
+      reuseUnchangedFrom: snapshotReuse.reuseSourceFor(currentCwd),
     });
+    // Only a completed capture seeds the cache; on rejection this line is
+    // unreachable and the previous entry (or none) survives untouched.
+    snapshotReuse.remember(baseline);
     setReviewWindowBaseline(state, baseline);
     freezeReviewWindowConfig(state, config, currentScopedModels);
     await persistSessionState();

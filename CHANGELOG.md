@@ -15,6 +15,28 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.83]
+
+### Added
+
+- Speed up successive ordinary prompts with safe workspace-snapshot reuse: the
+  first baseline capture of a new unseeded review exchange now reuses verified
+  facts (hash, binary classification, retained content) from the last
+  successfully completed snapshot of the same resolved working directory,
+  retained in a bounded session-local reference across normal review-window
+  close. The capture still enumerates and stats every current path, re-verifies
+  each reused record against the live entry, and recomputes every retain/omit
+  decision against the current limits, so edits, additions, deletions, and limit
+  changes between turns produce exactly the baseline a fresh capture would; the
+  retained snapshot is a reuse source only and never becomes a review baseline.
+  Only completed captures seed the reference — an aborted or failed capture
+  leaves it untouched — and it is cleared on every session start and shutdown
+  (including `/new` and `/reload`) and never reused across different working
+  directories or persisted to disk. An exchange whose baseline is already
+  seeded still skips its baseline capture entirely, and reviewer inputs,
+  verdicts, corrections, cancellation, scheduling, and state restoration are
+  unchanged (Refs #193).
+
 ## [0.1.0-dev.82]
 
 ### Added

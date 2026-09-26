@@ -28,6 +28,21 @@ after seeing the passing observations, that response becomes a new exchange in t
 window and triggers another review. Later ordinary work starts a fresh window from
 current file contents and does not re-review changes that already passed.
 
+The first baseline capture of each new unseeded exchange reuses verified facts (hash,
+binary classification, retained content) from the last successfully completed snapshot
+of the same resolved working directory, held in a bounded session-local reference that
+survives ordinary review-window close. The capture still enumerates and stats every
+current path, re-verifies each reused record against the live entry, and recomputes
+every retain/omit decision against the current limits, so edits, additions, deletions,
+and limit changes between turns are reported exactly as a fresh capture would report
+them; the retained snapshot is a reuse source only and never becomes a review baseline.
+Only completed captures seed the reference — an aborted or failed capture leaves it
+untouched — and it is cleared on every session start and shutdown (including `/new`
+and `/reload`) and is never reused across different working directories or persisted to
+disk. An exchange whose baseline is already seeded still skips its baseline capture
+entirely, as before, and reviewer inputs, verdicts, corrections, cancellation,
+scheduling, and state restoration are unchanged by the reuse.
+
 ## Live browser during review
 
 Automatic reviews, `/review-now`, and `/ask-reviewer` settle model work without closing,

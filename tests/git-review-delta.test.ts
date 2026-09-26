@@ -61,6 +61,18 @@ test("binary, oversized and cumulative bounds omit content while preserving mode
   assert.equal(budget.changes[1]?.diffOmittedReason, "snapshot_limit");
 });
 
+test("a tracked-to-untracked transition is one visible review change even when bytes match", () => {
+  const result = buildGitReviewDelta(report({
+    trackedChanges: [{ path: "transition", status: "deleted", oldKind: "file", oldMode: 0o644, oldBytes: Buffer.from("same\n") }],
+    untrackedChanges: [{ path: "transition", change: "added", new: { kind: "file", mode: 0o100644, content: Buffer.from("same\n") } }],
+  }), limits);
+  assert.equal(result.changes.length, 1);
+  assert.equal(result.changes[0]?.status, "modified");
+  assert.equal(result.changes[0]?.oldTracking, "tracked");
+  assert.equal(result.changes[0]?.newTracking, "untracked");
+  assert.match(result.patch.patch, /# tracking changed from tracked to untracked/);
+});
+
 test("missing changed content and duplicate path fail closed", () => {
   assert.throws(() => buildGitReviewDelta(report({ trackedChanges: [
     { path: "tracked", status: "modified", oldKind: "file", newKind: "file", oldMode: 0o644, newMode: 0o644,

@@ -123,6 +123,9 @@ export interface ChangedFile {
   /** Optional Git-style modes (e.g. 100644, 100755, 120000) for mode/type review. */
   oldGitMode?: string;
   newGitMode?: string;
+  /** A tracked/untracked transition is reviewable even when bytes are equal. */
+  oldTracking?: "tracked" | "untracked";
+  newTracking?: "tracked" | "untracked";
   /** Original path for renames; rendered as `rename from`/`rename to` headers. */
   renamedFrom?: string;
   diffOmittedReason?: string;

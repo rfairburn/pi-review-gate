@@ -31,15 +31,27 @@ export function buildGitReviewDelta(report: GitCheckpointComparisonReport, limit
   if (!Array.isArray(report.trackedChanges) || !Array.isArray(report.untrackedChanges)) {
     throw new Error("Git checkpoint comparison is missing changed-entry details");
   }
-  const changed = [
-    ...report.trackedChanges.map(trackedReviewChange),
-    ...report.untrackedChanges.map(untrackedReviewChange),
-  ].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
-  for (let index = 0; index < changed.length; index += 1) {
-    if (!changed[index]!.path || (index > 0 && changed[index - 1]!.path === changed[index]!.path)) {
-      throw new Error("Git checkpoint comparison contains a missing or duplicate changed path");
+  const byPath = new Map<string, ReviewEntry>();
+  for (const entry of [...report.trackedChanges.map(trackedReviewChange), ...report.untrackedChanges.map(untrackedReviewChange)]) {
+    if (!entry.path) throw new Error("Git checkpoint comparison contains a missing changed path");
+    const prior = byPath.get(entry.path);
+    if (!prior) {
+      byPath.set(entry.path, entry);
+      continue;
     }
+    // A path can legitimately transition from tracked to untracked (or the
+    // reverse). Two old states or two new states at one path are inconsistent.
+    if (prior.old && entry.old || prior.next && entry.next) {
+      throw new Error("Git checkpoint comparison contains a duplicate changed path");
+    }
+    const old = prior.old ?? entry.old;
+    const next = prior.next ?? entry.next;
+    byPath.set(entry.path, {
+      path: entry.path, old, next,
+      status: old && next ? "modified" : old ? "deleted" : "added",
+    });
   }
+  const changed = [...byPath.values()].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
 
   let retained = 0;
   const changes: ChangedFile[] = changed.map((entry) => {
@@ -57,6 +69,8 @@ export function buildGitReviewDelta(report: GitCheckpointComparisonReport, limit
       oversized: old.reason === "oversized" || next.reason === "oversized",
       oldGitMode: entry.old?.mode,
       newGitMode: entry.next?.mode,
+      oldTracking: entry.old?.tracking,
+      newTracking: entry.next?.tracking,
     };
     if (reason) change.diffOmittedReason = reason;
     else {
@@ -70,6 +84,7 @@ export function buildGitReviewDelta(report: GitCheckpointComparisonReport, limit
 
 interface ReviewState {
   kind: "file" | "symlink";
+  tracking: "tracked" | "untracked";
   mode: string;
   bytes?: Buffer;
   target?: string;
@@ -106,8 +121,8 @@ function trackedReviewChange(change: GitCheckpointTrackedChange): ReviewEntry {
   return {
     path: change.path,
     status: change.status,
-    old: oldMode ? { kind: change.oldKind!, mode: oldMode, bytes: change.oldBytes } : undefined,
-    next: newMode ? { kind: change.newKind!, mode: newMode, bytes: change.newBytes } : undefined,
+    old: oldMode ? { kind: change.oldKind!, tracking: "tracked", mode: oldMode, bytes: change.oldBytes } : undefined,
+    next: newMode ? { kind: change.newKind!, tracking: "tracked", mode: newMode, bytes: change.newBytes } : undefined,
   };
 }
 
@@ -124,7 +139,7 @@ function untrackedState(state: GitCheckpointUntrackedState | undefined, path: st
   if (state.kind === "symlink" && typeof state.target !== "string") {
     throw new Error(`Git checkpoint comparison lacks untracked symlink target for ${path}`);
   }
-  return { kind: state.kind, mode: fileMode, bytes: state.content, target: state.target };
+  return { kind: state.kind, tracking: "untracked", mode: fileMode, bytes: state.content, target: state.target };
 }
 
 function untrackedReviewChange(change: GitCheckpointUntrackedChange): ReviewEntry {

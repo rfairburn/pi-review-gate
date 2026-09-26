@@ -19,6 +19,7 @@ export function buildUnifiedPatch(changes: ChangedFile[], maxPatchBytes: number)
       section = [
         `diff --git a/${change.path} b/${change.path}`,
         ...gitModeHeaders(change),
+        ...gitTrackingHeaders(change),
         `# Diff omitted for ${change.path}: ${reason}`,
         "",
       ].join("\n");
@@ -48,6 +49,13 @@ function gitModeHeaders(change: ChangedFile): string[] {
   return [];
 }
 
+function gitTrackingHeaders(change: ChangedFile): string[] {
+  if (change.oldTracking && change.newTracking && change.oldTracking !== change.newTracking) {
+    return [`# tracking changed from ${change.oldTracking} to ${change.newTracking}`];
+  }
+  return [];
+}
+
 function buildFileDiff(change: ChangedFile): string {
   const oldContent = change.status === "added" ? "" : change.oldContent ?? "";
   const newContent = change.status === "deleted" ? "" : change.newContent ?? "";
@@ -61,6 +69,7 @@ function buildFileDiff(change: ChangedFile): string {
   return [
     `diff --git a/${sourcePath} b/${change.path}`,
     ...gitModeHeaders(change),
+    ...gitTrackingHeaders(change),
     ...(change.renamedFrom ? [`rename from ${change.renamedFrom}`, `rename to ${change.path}`] : []),
     `--- ${oldPath}`,
     `+++ ${newPath}`,

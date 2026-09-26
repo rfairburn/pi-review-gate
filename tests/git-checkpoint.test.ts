@@ -10,6 +10,7 @@ import {
   armGitCheckpoint,
   advanceGitCheckpoint,
   compareToGitCheckpoint,
+  compareGitCheckpoints,
   checkpointRefForWindow,
   decodeGitCheckpointDescriptor,
   decodeGitCheckpointRecord,
@@ -68,6 +69,25 @@ async function collectFiles(dir: string, prefix = ""): Promise<Map<string, Buffe
     } else if (entry.isFile()) {
       out.set(rel, await readFile(join(dir, entry.name)));
     }
+  }
+  return out;
+}
+
+type WorktreeSnapshotEntry = { kind: "directory" | "file" | "symlink"; mode: number; bytes?: Buffer; target?: string };
+
+/** Snapshot exact non-.git worktree bytes, entry types, and modes for read-only checks. */
+async function snapshotWorktree(dir: string, prefix = ""): Promise<Map<string, WorktreeSnapshotEntry>> {
+  const out = new Map<string, WorktreeSnapshotEntry>();
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    if (prefix === "" && entry.name === ".git") continue;
+    const rel = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+    const absolute = join(dir, entry.name);
+    const info = await lstat(absolute);
+    if (info.isSymbolicLink()) out.set(rel, { kind: "symlink", mode: info.mode, target: await readlink(absolute) });
+    else if (info.isDirectory()) {
+      out.set(rel, { kind: "directory", mode: info.mode });
+      for (const [key, value] of await snapshotWorktree(absolute, rel)) out.set(key, value);
+    } else if (info.isFile()) out.set(rel, { kind: "file", mode: info.mode, bytes: await readFile(absolute) });
   }
   return out;
 }
@@ -1087,6 +1107,212 @@ test("compare keeps ignored untracked out and tracked-but-ignored in", async () 
   assert.deepEqual(cmp.value.untrackedRemoved, []);
   assert.deepEqual(cmp.value.untrackedModified, []);
   assert.deepEqual(cmp.value.untrackedChanges, []);
+});
+
+test("compareGitCheckpoints compares frozen dirty worktree baselines after live drift, HEAD movement, and GC", async () => {
+  const repo = await initRepo();
+  await writeFile(join(repo, ".gitignore"), "*.ignored\n");
+  await writeFile(join(repo, "f.txt"), "committed\n");
+  await commitAll(repo, "checkpoint comparison base");
+
+  const beforeTracked = Buffer.from("before staged\nbefore unstaged\n");
+  await writeFile(join(repo, "f.txt"), "before staged\n");
+  await git(repo, "add", "f.txt");
+  await writeFile(join(repo, "f.txt"), beforeTracked);
+  await writeFile(join(repo, "u.txt"), Buffer.from([0, 1, 2, 255]));
+  await writeFile(join(repo, "removed.txt"), "before only\n");
+  await writeFile(join(repo, "ignored.ignored"), "not in either record\n");
+  const beforeArm = await armGitCheckpoint(repo, "cmp-pair-before");
+  assert.equal(beforeArm.status, "ok");
+  if (beforeArm.status !== "ok") return;
+  assert.deepEqual(beforeArm.value.record.untracked.map((entry) => entry.path), ["removed.txt", "u.txt"]);
+
+  const afterTracked = Buffer.from("after staged\nafter worktree\n");
+  await writeFile(join(repo, "f.txt"), "after staged\n");
+  await git(repo, "add", "f.txt");
+  await writeFile(join(repo, "f.txt"), afterTracked);
+  const afterUntracked = Buffer.from([255, 4, 3, 2, 1]);
+  await writeFile(join(repo, "u.txt"), afterUntracked);
+  await rm(join(repo, "removed.txt"));
+  await writeFile(join(repo, "added.txt"), "after only\n");
+  const afterArm = await armGitCheckpoint(repo, "cmp-pair-after");
+  assert.equal(afterArm.status, "ok");
+  if (afterArm.status !== "ok") return;
+
+  const first = await compareGitCheckpoints(repo, beforeArm.value.descriptor, afterArm.value.descriptor, {}, true);
+  assert.equal(first.status, "ok");
+  if (first.status !== "ok") return;
+  assert.deepEqual(first.value.trackedChanges, [{
+    path: "f.txt", status: "modified",
+    oldBytes: beforeTracked, newBytes: afterTracked,
+    oldKind: "file", oldMode: 0o644, newKind: "file", newMode: 0o644,
+  }]);
+  assert.deepEqual(first.value.untrackedAdded, ["added.txt"]);
+  assert.deepEqual(first.value.untrackedRemoved, ["removed.txt"]);
+  assert.deepEqual(first.value.untrackedModified, ["u.txt"]);
+  assert.deepEqual(first.value.untrackedChanges, [
+    { path: "added.txt", change: "added", new: { kind: "file", mode: 0o100644, content: Buffer.from("after only\n") } },
+    { path: "removed.txt", change: "removed", old: { kind: "file", mode: 0o100644, content: Buffer.from("before only\n") } },
+    { path: "u.txt", change: "modified", old: { kind: "file", mode: 0o100644, content: Buffer.from([0, 1, 2, 255]) }, new: { kind: "file", mode: 0o100644, content: afterUntracked } },
+  ]);
+  assert.equal((await gitTolerant(repo, "rev-parse", "--verify", "--quiet", beforeArm.value.descriptor.ref)).code, 0);
+  assert.equal((await gitTolerant(repo, "rev-parse", "--verify", "--quiet", afterArm.value.descriptor.ref)).code, 0);
+
+  // Rewrite/stage the live state and move HEAD well beyond both frozen arms.
+  await writeFile(join(repo, "f.txt"), "live drift\n");
+  await git(repo, "add", "f.txt");
+  await rm(join(repo, "u.txt"));
+  await writeFile(join(repo, "live-only.txt"), "not in either checkpoint\n");
+  await commitAll(repo, "move live HEAD after checkpoints");
+  await git(repo, "gc", "--prune=now", "-q");
+
+  const indexBefore = await readFile(indexPath(repo));
+  const worktreeBefore = await snapshotWorktree(repo);
+  const frozenAgain = await compareGitCheckpoints(repo, beforeArm.value.descriptor, afterArm.value.descriptor, {}, true);
+  assert.equal(frozenAgain.status, "ok");
+  if (frozenAgain.status !== "ok") return;
+  assert.deepEqual(frozenAgain.value, first.value, "frozen comparison must not sample current HEAD or worktree state");
+  assert.deepEqual(await readFile(indexPath(repo)), indexBefore, "comparison must not read-modify-write the live index");
+  assert.deepEqual(await snapshotWorktree(repo), worktreeBefore, "comparison must leave live worktree bytes, types, and modes unchanged");
+  assert.equal((await gitTolerant(repo, "rev-parse", "--verify", "--quiet", beforeArm.value.descriptor.ref)).code, 0);
+  assert.equal((await gitTolerant(repo, "rev-parse", "--verify", "--quiet", afterArm.value.descriptor.ref)).code, 0);
+  const checkpointScratch = join(repo, ".git", "pi-review-gate", "checkpoints");
+  assert.deepEqual((await readdir(checkpointScratch)).sort(), ["cmp-pair-after", "cmp-pair-before"]);
+});
+
+test("compareGitCheckpoints preserves binary, mode, symlink, and trackedness transitions", async () => {
+  const repo = await initRepo();
+  const binaryBefore = randomBytes(257);
+  const binaryAfter = randomBytes(193);
+  const addedTracked = randomBytes(71);
+  const transitionBytes = Buffer.from("tracked then untracked\n");
+  await writeFile(join(repo, "binary.dat"), binaryBefore);
+  await writeFile(join(repo, "mode.sh"), "#!/bin/sh\necho mode\n");
+  await chmod(join(repo, "mode.sh"), 0o644);
+  await writeFile(join(repo, "tracked-to-untracked.txt"), transitionBytes);
+  await writeFile(join(repo, "target-a.txt"), "target a\n");
+  await writeFile(join(repo, "target-b.txt"), "target b\n");
+  await symlink("target-a.txt", join(repo, "tracked-link"));
+  await commitAll(repo, "tracked comparison entries");
+  await writeFile(join(repo, "untracked-to-tracked.bin"), addedTracked);
+  await symlink("before-target", join(repo, "u-link"));
+  const uLinkMode = (await lstat(join(repo, "u-link"))).mode;
+
+  const beforeArm = await armGitCheckpoint(repo, "cmp-transition-before");
+  assert.equal(beforeArm.status, "ok");
+  if (beforeArm.status !== "ok") return;
+
+  await writeFile(join(repo, "binary.dat"), binaryAfter);
+  await chmod(join(repo, "mode.sh"), 0o755);
+  await rm(join(repo, "tracked-link"));
+  await symlink("target-b.txt", join(repo, "tracked-link"));
+  await git(repo, "rm", "--cached", "-q", "tracked-to-untracked.txt");
+  await git(repo, "add", "untracked-to-tracked.bin");
+  await rm(join(repo, "u-link"));
+  await symlink("after-target", join(repo, "u-link"));
+
+  const afterArm = await armGitCheckpoint(repo, "cmp-transition-after");
+  assert.equal(afterArm.status, "ok");
+  if (afterArm.status !== "ok") return;
+  assert.ok(afterArm.value.record.untracked.some((entry) => entry.path === "tracked-to-untracked.txt"));
+  assert.ok(!afterArm.value.record.untracked.some((entry) => entry.path === "untracked-to-tracked.bin"));
+
+  const compared = await compareGitCheckpoints(repo, beforeArm.value.descriptor, afterArm.value.descriptor, {}, true);
+  assert.equal(compared.status, "ok");
+  if (compared.status !== "ok") return;
+  assert.deepEqual(compared.value.trackedChanges, [
+    { path: "binary.dat", status: "modified", oldBytes: binaryBefore, newBytes: binaryAfter, oldKind: "file", oldMode: 0o644, newKind: "file", newMode: 0o644 },
+    { path: "mode.sh", status: "modified", oldBytes: Buffer.from("#!/bin/sh\necho mode\n"), newBytes: Buffer.from("#!/bin/sh\necho mode\n"), oldKind: "file", oldMode: 0o644, newKind: "file", newMode: 0o755 },
+    { path: "tracked-link", status: "modified", oldBytes: Buffer.from("target-a.txt"), newBytes: Buffer.from("target-b.txt"), oldKind: "symlink", oldMode: 0, newKind: "symlink" },
+    { path: "tracked-to-untracked.txt", status: "deleted", oldBytes: transitionBytes, oldKind: "file", oldMode: 0o644 },
+    { path: "untracked-to-tracked.bin", status: "added", newBytes: addedTracked, newKind: "file", newMode: 0o644 },
+  ]);
+  assert.deepEqual(compared.value.untrackedAdded, ["tracked-to-untracked.txt"]);
+  assert.deepEqual(compared.value.untrackedRemoved, ["untracked-to-tracked.bin"]);
+  assert.deepEqual(compared.value.untrackedModified, ["u-link"]);
+  assert.deepEqual(compared.value.untrackedChanges, [
+    { path: "tracked-to-untracked.txt", change: "added", new: { kind: "file", mode: 0o100644, content: transitionBytes } },
+    { path: "u-link", change: "modified", old: { kind: "symlink", mode: uLinkMode, target: "before-target" }, new: { kind: "symlink", mode: uLinkMode, target: "after-target" } },
+    { path: "untracked-to-tracked.bin", change: "removed", old: { kind: "file", mode: 0o100644, content: addedTracked } },
+  ]);
+});
+
+test("compareGitCheckpoints fails closed on damaged input and missing pins without live mutation", async () => {
+  const repo = await initRepo();
+  await writeFile(join(repo, "f.txt"), "base\n");
+  await commitAll(repo, "comparison failure base");
+  await writeFile(join(repo, "f.txt"), "before\n");
+  const beforeArm = await armGitCheckpoint(repo, "cmp-fail-before");
+  assert.equal(beforeArm.status, "ok");
+  if (beforeArm.status !== "ok") return;
+  await writeFile(join(repo, "f.txt"), "after\n");
+  const afterArm = await armGitCheckpoint(repo, "cmp-fail-after");
+  assert.equal(afterArm.status, "ok");
+  if (afterArm.status !== "ok") return;
+
+  const indexBefore = await readFile(indexPath(repo));
+  const worktreeBefore = await snapshotWorktree(repo);
+  const beforeRecordPath = join(
+    beforeArm.value.descriptor.gitDir,
+    "pi-review-gate",
+    "checkpoints",
+    beforeArm.value.descriptor.windowId,
+    `arm-${beforeArm.value.descriptor.armId}`,
+    "record.json",
+  );
+  const beforeRecordBytes = await readFile(beforeRecordPath);
+
+  const corrupt = await compareGitCheckpoints(
+    repo,
+    beforeArm.value.descriptor,
+    { ...afterArm.value.descriptor, digest: "0".repeat(64) },
+  );
+  assert.equal(corrupt.status, "failed");
+  if (corrupt.status === "failed") assert.equal(corrupt.reason, "checkpoint_digest_mismatch");
+  assert.deepEqual(await readFile(indexPath(repo)), indexBefore);
+  assert.deepEqual(await snapshotWorktree(repo), worktreeBefore);
+
+  await rm(beforeRecordPath);
+  const missingRecord = await compareGitCheckpoints(repo, beforeArm.value.descriptor, afterArm.value.descriptor);
+  assert.equal(missingRecord.status, "failed");
+  if (missingRecord.status === "failed") assert.equal(missingRecord.reason, "checkpoint_data_missing");
+  await writeFile(beforeRecordPath, beforeRecordBytes);
+
+  // A digest-valid but internally overlapping state is still rejected after
+  // both records load and their worktree trees have been reconstructed.
+  const overlappingRecord = {
+    ...beforeArm.value.record,
+    untracked: [...beforeArm.value.record.untracked, {
+      path: "f.txt",
+      kind: "file" as const,
+      mode: 0o100644,
+      dev: 1,
+      ino: 1,
+      size: Buffer.byteLength("before\n"),
+      mtimeMs: 1,
+      ctimeMs: 1,
+      contentB64: Buffer.from("before\n").toString("base64"),
+    }],
+  };
+  const overlappingBytes = Buffer.from(encodeGitCheckpointRecord(overlappingRecord));
+  await writeFile(beforeRecordPath, overlappingBytes);
+  const overlappingDescriptor = {
+    ...beforeArm.value.descriptor,
+    digest: createHash("sha256").update(overlappingBytes).digest("hex"),
+  };
+  const overlap = await compareGitCheckpoints(repo, overlappingDescriptor, afterArm.value.descriptor);
+  assert.equal(overlap.status, "failed");
+  if (overlap.status === "failed") assert.equal(overlap.reason, "malformed_record");
+  await writeFile(beforeRecordPath, beforeRecordBytes);
+  assert.deepEqual(await readFile(indexPath(repo)), indexBefore);
+  assert.deepEqual(await snapshotWorktree(repo), worktreeBefore);
+
+  await git(repo, "update-ref", "-d", afterArm.value.descriptor.ref);
+  const missingPin = await compareGitCheckpoints(repo, beforeArm.value.descriptor, afterArm.value.descriptor);
+  assert.equal(missingPin.status, "failed");
+  if (missingPin.status === "failed") assert.equal(missingPin.reason, "pin_ref_missing");
+  assert.deepEqual(await readFile(indexPath(repo)), indexBefore);
+  assert.deepEqual(await snapshotWorktree(repo), worktreeBefore);
 });
 
 test("compare fails closed when new untracked content races or is unreadable", async () => {

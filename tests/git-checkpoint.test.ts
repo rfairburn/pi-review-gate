@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { after, test } from "node:test";
 import {
   armGitCheckpoint,
+  advanceGitCheckpoint,
   compareToGitCheckpoint,
   checkpointRefForWindow,
   decodeGitCheckpointDescriptor,
@@ -2192,4 +2193,294 @@ test("failed-arm cleanup never deletes a newer generation's same-base pin", asyn
   // The current owner can still release cleanly.
   const relD = await releaseGitCheckpointPin(repo, "window-cleanup-race", { expectedBase: d.base, armId: d.armId });
   assert.equal(relD.status, "ok");
+});
+
+test("selective advancement replaces only selected paths and keeps unrelated changes reviewable", async () => {
+  const repo = await initRepo();
+  await writeFile(join(repo, "a"), "a base\n");
+  await writeFile(join(repo, "ab"), "ab base\n");
+  await writeFile(join(repo, "unrelated.txt"), "unrelated base\n");
+  await writeFile(join(repo, "log.txt"), "log base\n");
+  const committedBinary = Buffer.concat([Buffer.from([0]), randomBytes(127)]);
+  await mkdir(join(repo, "landed"), { recursive: true });
+  await writeFile(join(repo, "landed/data.bin"), committedBinary);
+  await writeFile(join(repo, "landed/run.sh"), "#!/bin/sh\necho run\n");
+  await chmod(join(repo, "landed/run.sh"), 0o644);
+  await writeFile(join(repo, "landed/target-one"), "target one\n");
+  await writeFile(join(repo, "landed/target-two"), "target two\n");
+  await symlink("target-one", join(repo, "landed/link"));
+  await commitAll(repo, "selective base");
+  await writeFile(join(repo, ".gitignore"), "log.txt\nsecret*\n");
+  await commitAll(repo, "ignore tracked log");
+
+  // The old baseline includes complete staged+unstaged deltas that must
+  // survive for unselected paths, plus exact untracked state.
+  await writeFile(join(repo, "a"), "a staged\n");
+  await git(repo, "add", "a");
+  await writeFile(join(repo, "a"), "a armed\n");
+  await writeFile(join(repo, "unrelated.txt"), "unrelated staged\n");
+  await git(repo, "add", "unrelated.txt");
+  await writeFile(join(repo, "unrelated.txt"), "unrelated armed\n");
+  await writeFile(join(repo, "log.txt"), "log armed\n");
+  const oldOutside = randomBytes(73);
+  await writeFile(join(repo, "outside.bin"), oldOutside);
+  await writeFile(join(repo, "landed/old.txt"), "old landed untracked\n");
+  await writeFile(join(repo, "secret-before.txt"), "ignored\n");
+
+  const arm = await armGitCheckpoint(repo, "window-advance-old");
+  assert.equal(arm.status, "ok");
+  if (arm.status !== "ok") return;
+  const oldDescriptor = arm.value.descriptor;
+  const oldRecordPath = join(oldDescriptor.gitDir, "pi-review-gate", "checkpoints", oldDescriptor.windowId,
+    `arm-${oldDescriptor.armId}`, "record.json");
+  const oldRecordBytes = await readFile(oldRecordPath);
+
+  // Advance `a` and the `landed/` subtree through the current index and
+  // worktree, preserving staged/unstaged, binary, mode, symlink, and
+  // untracked distinctions. Unselected tracked/untracked paths drift too.
+  await writeFile(join(repo, "a"), "a selected staged\n");
+  await git(repo, "add", "a");
+  await writeFile(join(repo, "a"), "a selected worktree\n");
+  await writeFile(join(repo, "ab"), "ab newer\n");
+  await writeFile(join(repo, "unrelated.txt"), "unrelated newer\n");
+  await writeFile(join(repo, "log.txt"), "log newer\n");
+
+  const stagedBinary = Buffer.from(committedBinary);
+  stagedBinary.fill(0xa1, 20, 45);
+  await writeFile(join(repo, "landed/data.bin"), stagedBinary);
+  await git(repo, "add", "landed/data.bin");
+  const liveBinary = Buffer.from(stagedBinary);
+  liveBinary.fill(0xb2, 80, 111);
+  await writeFile(join(repo, "landed/data.bin"), liveBinary);
+  await chmod(join(repo, "landed/run.sh"), 0o755);
+  await git(repo, "add", "landed/run.sh");
+  await rm(join(repo, "landed/link"));
+  await symlink("target-two", join(repo, "landed/link"));
+  await git(repo, "add", "landed/link");
+  await writeFile(join(repo, "landed/old.txt"), "landed latest untracked\n");
+  const selectedRaw = randomBytes(257);
+  await writeFile(join(repo, "landed/new.bin"), selectedRaw);
+  await chmod(join(repo, "landed/new.bin"), 0o751);
+  await symlink("old.txt", join(repo, "landed/new-link"));
+
+  const currentOutside = randomBytes(41);
+  await writeFile(join(repo, "outside.bin"), currentOutside);
+  await writeFile(join(repo, "outside-late.txt"), "unrelated addition\n");
+  await writeFile(join(repo, "secret-after.txt"), "ignored\n");
+
+  const headBefore = await headOid(repo);
+  const indexBefore = await readFile(indexPath(repo));
+  const statusBefore = await git(repo, "status", "--porcelain");
+  const advanced = await advanceGitCheckpoint(repo, oldDescriptor, ["a", "landed"], "window-advance-new");
+  assert.equal(advanced.status, "ok", JSON.stringify(advanced));
+  if (advanced.status !== "ok") return;
+  const descriptor = advanced.value.descriptor;
+
+  // Selective advancement is strictly read-only with respect to the live
+  // checkout. The old descriptor's publication is byte-for-byte unchanged.
+  assert.equal(await headOid(repo), headBefore);
+  assert.deepEqual(await readFile(indexPath(repo)), indexBefore);
+  assert.equal(await git(repo, "status", "--porcelain"), statusBefore);
+  assert.deepEqual(await readFile(oldRecordPath), oldRecordBytes);
+  assert.equal(await readFile(join(repo, "a"), "utf8"), "a selected worktree\n");
+  assert.deepEqual(await readFile(join(repo, "landed/data.bin")), liveBinary);
+  assert.equal((await stat(join(repo, "landed/run.sh"))).mode & 0o777, 0o755);
+  assert.equal(await readlink(join(repo, "landed/link")), "target-two");
+
+  const loaded = await loadGitCheckpoint(repo, descriptor);
+  assert.equal(loaded.status, "ok");
+  if (loaded.status !== "ok") return;
+  const selectedBinaryEntry = loaded.value.record.untracked.find((entry) => entry.path === "landed/new.bin");
+  assert.equal(selectedBinaryEntry?.kind, "file");
+  assert.equal(selectedBinaryEntry?.mode & 0o777, 0o751);
+  assert.deepEqual(Buffer.from(selectedBinaryEntry?.contentB64 ?? "", "base64"), selectedRaw);
+  assert.equal(loaded.value.record.untracked.find((entry) => entry.path === "landed/new-link")?.target, "old.txt");
+  assert.deepEqual(
+    Buffer.from(loaded.value.record.untracked.find((entry) => entry.path === "outside.bin")?.contentB64 ?? "", "base64"),
+    oldOutside,
+    "unselected untracked bytes remain the old baseline despite a newer live edit",
+  );
+
+  const compared = await compareToGitCheckpoint(repo, loaded.value.encoded, {}, true);
+  assert.equal(compared.status, "ok");
+  if (compared.status !== "ok") return;
+  assert.deepEqual(compared.value.trackedChanges.map((change) => change.path), ["a", "ab", "landed/data.bin", "log.txt", "unrelated.txt"]);
+  assert.deepEqual(compared.value.untrackedAdded, ["outside-late.txt"]);
+  assert.deepEqual(compared.value.untrackedRemoved, []);
+  assert.deepEqual(compared.value.untrackedModified, ["outside.bin"]);
+  // `compareToGitCheckpoint` retains its changed-only behavior: staged and
+  // unstaged differences within an armed pair are still reviewable, while
+  // selected untracked entries match their newly captured baseline.
+  assert.ok(compared.value.trackedChanges.some((change) => change.path === "ab"));
+  assert.ok(compared.value.trackedChanges.some((change) => change.path === "unrelated.txt"));
+  assert.ok(!compared.value.untrackedChanges.some((change) => change.path.startsWith("landed/")));
+  assert.ok(!compared.value.untrackedChanges.some((change) => change.path.startsWith("secret-")));
+
+  // The old generation is still independently valid and owns its original ref.
+  const oldStillValid = await loadGitCheckpoint(repo, oldDescriptor);
+  assert.equal(oldStillValid.status, "ok");
+
+  // Restoring the new descriptor proves its staged and unstaged trees remain
+  // complete relative to the pinned commit, including the unselected dirty
+  // tracked baseline and tracked-but-ignored log.
+  const restored = await restoreGitCheckpoint(repo, loaded.value.encoded);
+  assert.equal(restored.status, "ok");
+  assert.equal(await git(repo, "show", ":a"), "a selected staged\n");
+  assert.equal(await readFile(join(repo, "a"), "utf8"), "a selected worktree\n");
+  assert.ok((await git(repo, "diff", "--cached", "--", "a")).length > 0);
+  assert.ok((await git(repo, "diff", "--", "a")).length > 0);
+  assert.deepEqual(await readFile(join(repo, "landed/data.bin")), liveBinary);
+  const stagedBinaryDiff = await git(repo, "diff", "--cached", "--binary", "--", "landed/data.bin");
+  const unstagedBinaryDiff = await git(repo, "diff", "--binary", "--", "landed/data.bin");
+  assert.ok(stagedBinaryDiff.includes("GIT binary patch"), stagedBinaryDiff);
+  assert.ok(unstagedBinaryDiff.includes("GIT binary patch"), unstagedBinaryDiff);
+  assert.equal(await readFile(join(repo, "unrelated.txt"), "utf8"), "unrelated armed\n");
+  assert.equal(await git(repo, "show", ":unrelated.txt"), "unrelated staged\n");
+  assert.equal(await readFile(join(repo, "log.txt"), "utf8"), "log armed\n");
+  assert.deepEqual(await readFile(join(repo, "outside.bin")), oldOutside);
+  assert.equal(await readFile(join(repo, "outside-late.txt"), "utf8"), "unrelated addition\n");
+});
+
+test("selective descriptor restores exact selected binary and symlink state after HEAD movement and GC", async () => {
+  const repo = await initRepo();
+  await writeFile(join(repo, "tracked.bin"), randomBytes(256));
+  await commitAll(repo, "binary base");
+  await mkdir(join(repo, "landed"), { recursive: true });
+  await writeFile(join(repo, "landed/blob.bin"), "old raw bytes\0\xff");
+  await writeFile(join(repo, "landed/run.sh"), "#!/bin/sh\necho old\n");
+  await chmod(join(repo, "landed/run.sh"), 0o644);
+  await writeFile(join(repo, "landed/target"), "target\n");
+  await symlink("target", join(repo, "landed/link"));
+  const arm = await armGitCheckpoint(repo, "window-advance-restart-old");
+  assert.equal(arm.status, "ok");
+  if (arm.status !== "ok") return;
+
+  const raw = Buffer.from([0, 1, 2, 0xff, 0x80, 0x0a]);
+  await writeFile(join(repo, "landed/blob.bin"), raw);
+  await chmod(join(repo, "landed/run.sh"), 0o751);
+  await writeFile(join(repo, "landed/run.sh"), "#!/bin/sh\necho newest\n");
+  await rm(join(repo, "landed/link"));
+  await symlink("../tracked.bin", join(repo, "landed/link"));
+  const advanced = await advanceGitCheckpoint(repo, arm.value.descriptor, ["landed"], "window-advance-restart-new");
+  assert.equal(advanced.status, "ok", JSON.stringify(advanced));
+  if (advanced.status !== "ok") return;
+  const descriptor = advanced.value.descriptor;
+
+  const descriptorFile = join(await mkTmp(), "descriptor.json");
+  const resultFile = join(await mkTmp(), "result.json");
+  await writeFile(descriptorFile, encodeGitCheckpointDescriptor(descriptor));
+  const base = descriptor.base;
+  await writeFile(join(repo, "future.txt"), "post-base commit\n");
+  await git(repo, "add", "future.txt");
+  await git(repo, "commit", "--only", "-q", "-m", "move HEAD", "--", "future.txt");
+  assert.notEqual(await headOid(repo), base);
+  await git(repo, "gc", "--prune=now", "-q");
+  assert.equal((await gitTolerant(repo, "cat-file", "-e", `${base}^{commit}`)).code, 0);
+
+  // Remove the selected baseline, then load by compact descriptor and restore
+  // from a fresh Node process as a restart would.
+  await rm(join(repo, "landed"), { recursive: true });
+  await git(repo, "reset", "-q");
+  const modulePath = join(__dirname, "..", "src", "git-checkpoint.js");
+  const childScript = [
+    "const m = require(process.argv[1]);",
+    "const fs = require('fs');",
+    "(async () => {",
+    "  const descriptor = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));",
+    "  const loaded = await m.loadGitCheckpoint(process.argv[3], descriptor);",
+    "  if (loaded.status !== 'ok') throw new Error(JSON.stringify(loaded));",
+    "  const restored = await m.restoreGitCheckpoint(process.argv[3], loaded.value.encoded);",
+    "  if (restored.status !== 'ok') throw new Error(JSON.stringify(restored));",
+    "  fs.writeFileSync(process.argv[4], JSON.stringify({ ok: true }));",
+    "})().catch((error) => { console.error(error); process.exit(2); });",
+  ].join("\n");
+  let childCode = 0;
+  try {
+    execFileSync(process.execPath, ["-e", childScript, modulePath, descriptorFile, repo, resultFile], { stdio: "pipe" });
+  } catch (error) {
+    const err = error as { code?: number | string };
+    childCode = typeof err.code === "number" ? err.code : 1;
+  }
+  assert.equal(childCode, 0, `fresh descriptor restore failed: ${await readFile(resultFile, "utf8").catch(() => "?")}`);
+  assert.deepEqual(await readFile(join(repo, "landed/blob.bin")), raw);
+  assert.equal(await readFile(join(repo, "landed/run.sh"), "utf8"), "#!/bin/sh\necho newest\n");
+  assert.equal((await stat(join(repo, "landed/run.sh"))).mode & 0o777, 0o751);
+  assert.equal(await readlink(join(repo, "landed/link")), "../tracked.bin");
+});
+
+test("selective advancement rejects unsafe paths and file/directory composition conflicts without damaging the old checkpoint", async () => {
+  const repo = await initRepo();
+  await writeFile(join(repo, "parent"), "tracked file\n");
+  await commitAll(repo, "tracked parent");
+  const arm = await armGitCheckpoint(repo, "window-advance-conflict-old");
+  assert.equal(arm.status, "ok");
+  if (arm.status !== "ok") return;
+  const oldDescriptor = arm.value.descriptor;
+
+  for (const unsafe of ["../escape", "/absolute", "a//b", "a/../b", "bad\0path", "bad\uFFFDpath"]) {
+    const invalid = await advanceGitCheckpoint(repo, oldDescriptor, [unsafe], "window-advance-invalid");
+    assert.equal(invalid.status, "failed");
+    if (invalid.status === "failed") assert.equal(invalid.reason, "unsafe_advance_path");
+  }
+
+  // The old baseline retains the tracked parent file, while the selected
+  // untracked child would require replacing it with a directory. Refuse the
+  // ambiguous composition rather than publishing an unrestorable checkpoint.
+  await rm(join(repo, "parent"));
+  await mkdir(join(repo, "parent"));
+  await writeFile(join(repo, "parent/child"), "new child\n");
+  const indexBefore = await readFile(indexPath(repo));
+  const fileBefore = await readFile(join(repo, "parent/child"));
+  const headBefore = await headOid(repo);
+  const failed = await advanceGitCheckpoint(repo, oldDescriptor, ["parent/child"], "window-advance-conflict-new");
+  assert.equal(failed.status, "failed");
+  if (failed.status === "failed") assert.equal(failed.reason, "restore_path_conflict");
+
+  assert.equal(await headOid(repo), headBefore);
+  assert.deepEqual(await readFile(indexPath(repo)), indexBefore);
+  assert.deepEqual(await readFile(join(repo, "parent/child")), fileBefore);
+  assert.equal((await loadGitCheckpoint(repo, oldDescriptor)).status, "ok");
+  assert.notEqual((await gitTolerant(repo, "rev-parse", "--verify", "--quiet", checkpointRefForWindow("window-advance-conflict-new"))).code, 0);
+  await assert.rejects(stat(join(repo, ".git", "pi-review-gate", "checkpoints", "window-advance-conflict-new")));
+});
+
+test("selective advancement rejects retained untracked file/descendant conflicts", async () => {
+  const repo = await initRepo();
+  await writeFile(join(repo, "parent"), "old untracked file\n");
+  const arm = await armGitCheckpoint(repo, "window-advance-untracked-conflict-old");
+  assert.equal(arm.status, "ok");
+  if (arm.status !== "ok") return;
+  const oldDescriptor = arm.value.descriptor;
+  assert.deepEqual(arm.value.record.untracked.map((entry) => entry.path), ["parent"]);
+
+  // The old baseline retains the untracked file `parent`, but the live
+  // selected state now has a child under a directory with that name.
+  await rm(join(repo, "parent"));
+  await mkdir(join(repo, "parent"));
+  await writeFile(join(repo, "parent/child"), "new child\n");
+  const indexBefore = await readFile(indexPath(repo));
+  const headBefore = await headOid(repo);
+  const statusBefore = await git(repo, "status", "--porcelain");
+  const worktreeBefore = await collectFiles(join(repo, "parent"));
+
+  const failed = await advanceGitCheckpoint(
+    repo,
+    oldDescriptor,
+    ["parent/child"],
+    "window-advance-untracked-conflict-new",
+  );
+  assert.equal(failed.status, "failed");
+  if (failed.status === "failed") assert.equal(failed.reason, "restore_path_conflict");
+
+  assert.equal(await headOid(repo), headBefore);
+  assert.deepEqual(await readFile(indexPath(repo)), indexBefore);
+  assert.equal(await git(repo, "status", "--porcelain"), statusBefore);
+  assert.deepEqual(await collectFiles(join(repo, "parent")), worktreeBefore);
+  assert.equal((await lstat(join(repo, "parent"))).isDirectory(), true);
+  assert.equal((await loadGitCheckpoint(repo, oldDescriptor)).status, "ok");
+  assert.notEqual(
+    (await gitTolerant(repo, "rev-parse", "--verify", "--quiet", checkpointRefForWindow("window-advance-untracked-conflict-new"))).code,
+    0,
+  );
+  await assert.rejects(stat(join(repo, ".git", "pi-review-gate", "checkpoints", "window-advance-untracked-conflict-new")));
 });

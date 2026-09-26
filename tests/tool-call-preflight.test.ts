@@ -68,8 +68,9 @@ function nativePiHarness(options: {
 }
 
 /** Simulates Pi 0.87.1's native batch seam: message_end, then for each member
- * tool_execution_start BEFORE tool_call preflight. Pi's validated hook input
- * drops optional nulls; blocked calls produce no extension tool_result. */
+ * tool_execution_start BEFORE tool_call preflight for each member, with ALL
+ * member preflights before any execution. Pi's validated hook input drops
+ * optional nulls; blocked calls produce no extension tool_result. */
 async function dispatchNativeBatch(
   runtime: ReturnType<typeof nativePiHarness>,
   calls: Array<Call | { id: string; name: string; input?: Record<string, unknown> }>,
@@ -99,6 +100,11 @@ async function dispatchNativeBatch(
     });
     const result = results.find((candidate) => candidate !== undefined) as { block?: boolean; reason?: string } | undefined;
     decisions.push({ block: result?.block === true, ...(result?.reason ? { reason: result.reason } : {}) });
+  }
+  // Pi completes the entire native batch preflight before running any member.
+  // A same-batch duplicate cannot claim an earlier result at block time.
+  for (let index = 0; index < calls.length; index += 1) {
+    const call = calls[index]!;
     if (decisions[index]!.block || !call.input) continue;
     const outcome = outcomes[index] ?? "success";
     // Another policy can block after this guard admits the call. It has no
@@ -190,11 +196,10 @@ test("native registered hooks block A→A→A after a completed operation withou
   assert.deepEqual(first.decisions.map((decision) => decision.block), [false]);
   const second = await onlyDecisionBatch(runtime, [a("a2")]);
   assert.deepEqual(second.decisions.map((decision) => decision.block), [true]);
-  assert.match(second.decisions[0]?.reason ?? "", /Duplicate bash blocked/);
-  assert.match(second.decisions[0]?.reason ?? "", /this member did not run/);
+  assert.equal(second.decisions[0]?.reason, "Duplicate bash blocked: member 1 (bash) of 1 matches an identical request in the immediately preceding native tool group; this member did not run. Review any existing command result and the current workspace state.");
   const third = await onlyDecisionBatch(runtime, [a("a3")]);
   assert.deepEqual(third.decisions.map((decision) => decision.block), [true]);
-  assert.match(third.decisions[0]?.reason ?? "", /follows a member that was itself blocked/);
+  assert.equal(third.decisions[0]?.reason, "Duplicate bash blocked: member 1 (bash) of 1 follows an identical request that was blocked before execution; this member did not run. Review any existing command result and the current workspace state.");
   assert.equal(first.ran.length + second.ran.length + third.ran.length, 1);
 });
 
@@ -210,12 +215,160 @@ test("an observed operation failure earns one adjacent retry, then reports repea
     const third = await onlyDecisionBatch(runtime, [a("third")]);
     assert.equal(third.decisions[0]?.block, true);
     if (retryOutcome === "error") {
-      assert.match(third.decisions[0]?.reason ?? "", /after two observed operation failures/);
+      assert.equal(third.decisions[0]?.reason, "Duplicate bash blocked after repeated failures: member 1 (bash) of 1 follows two identical executions that failed; this member did not run. Review any existing command result and the current workspace state.");
     } else {
-      assert.match(third.decisions[0]?.reason ?? "", /Repeated calls blocked/);
-      assert.doesNotMatch(third.decisions[0]?.reason ?? "", /previous (?:retry )?succeeded|prior success/i);
+      assert.equal(third.decisions[0]?.reason, "Repeated calls blocked: member 1 (bash) of 1 follows an identical execution that succeeded; this member did not run. Review any existing command result and the current workspace state.");
     }
   }
+});
+
+test("duplicate blockers name each approved request cause without changing member positions", async () => {
+  const batchInput = { command: "repeat-safe-check" };
+  const sameBatchRuntime = nativePiHarness();
+  const sameBatch = await onlyDecisionBatch(sameBatchRuntime, [
+    call("batch-first", "bash", batchInput),
+    call("batch-middle", "read", { path: "other.txt" }),
+    call("batch-duplicate", "bash", batchInput),
+  ]);
+  assert.equal(sameBatch.decisions[2]?.reason, "Duplicate bash blocked: member 3 (bash) of 3 matches an earlier identical request in this native batch; this member did not run. Review any existing command result and the current workspace state.");
+
+  const precedingRuntime = nativePiHarness();
+  await onlyDecisionBatch(precedingRuntime, [call("preceding-success", "bash", batchInput)]);
+  const preceding = await onlyDecisionBatch(precedingRuntime, [call("preceding-repeat", "bash", batchInput)]);
+  assert.equal(preceding.decisions[0]?.reason, "Duplicate bash blocked: member 1 (bash) of 1 matches an identical request in the immediately preceding native tool group; this member did not run. Review any existing command result and the current workspace state.");
+
+  const blockedRuntime = nativePiHarness();
+  await blockedRuntime.emit("message_end", {
+    message: { role: "assistant", content: [{ type: "toolCall", name: "bash", arguments: batchInput }] },
+  });
+  const missingIdentity = await blockedRuntime.emit("tool_call", { toolCallId: "missing", toolName: "bash", input: batchInput });
+  assert.equal((missingIdentity[0] as { block?: boolean }).block, true);
+  const afterBlocked = await onlyDecisionBatch(blockedRuntime, [call("after-blocked", "bash", batchInput)]);
+  assert.equal(afterBlocked.decisions[0]?.reason, "Duplicate bash blocked: member 1 (bash) of 1 follows an identical request that was blocked before execution; this member did not run. Review any existing command result and the current workspace state.");
+
+  const unknownRuntime = nativePiHarness();
+  await dispatchNativeBatch(unknownRuntime, [call("unknown-outcome", "bash", batchInput)], ["policy-blocked"]);
+  const afterUnknown = await onlyDecisionBatch(unknownRuntime, [call("after-unknown", "bash", batchInput)]);
+  assert.equal(afterUnknown.decisions[0]?.reason, "Duplicate bash blocked: member 1 (bash) of 1 matches an adjacent request whose execution outcome was not observed; this member did not run. Review any existing command result and the current workspace state.");
+});
+
+test("active start feedback omits unavailable job and execution identities", async () => {
+  let shellState: StartLiveness = "inactive";
+  const shellRuntime = nativePiHarness({ shellStart: () => ({ state: shellState }) });
+  const shell = (id: string) => call(id, "ShellStart", { command: "sleep safely" });
+  assert.equal((await onlyDecisionBatch(shellRuntime, [shell("shell-first")])).decisions[0]?.block, false);
+  shellState = "active";
+  const activeShell = await onlyDecisionBatch(shellRuntime, [shell("shell-again")]);
+  assert.equal(activeShell.decisions[0]?.reason, "Duplicate ShellStart blocked: member 1 (ShellStart) of 1 matches an earlier start with an active job; this member started no job.");
+
+  let subtaskState: StartLiveness = "inactive";
+  const subtaskRuntime = nativePiHarness({ subtaskStart: () => ({ state: subtaskState }) });
+  const subtasks = (id: string) => call(id, "SubtasksStart", {
+    tasks: [{ title: "bounded task", instructions: "work safely", acceptanceCriteria: ["done"] }],
+  });
+  assert.equal((await onlyDecisionBatch(subtaskRuntime, [subtasks("subtask-first")])).decisions[0]?.block, false);
+  subtaskState = "active";
+  const activeSubtasks = await onlyDecisionBatch(subtaskRuntime, [subtasks("subtask-again")]);
+  assert.equal(activeSubtasks.decisions[0]?.reason, "Duplicate SubtasksStart blocked: member 1 (SubtasksStart) of 1 matches an earlier identical start with active work; this member created no group or tasks.");
+});
+
+test("tool-specific duplicate feedback uses only observed results and approved next-step text", async () => {
+  const resultTools: Array<[string, Record<string, unknown>]> = [
+    ["read", { path: "RESULT-SECRET-read" }],
+    ["grep", { pattern: "RESULT-SECRET-grep" }],
+    ["find", { name: "RESULT-SECRET-find" }],
+    ["ls", { path: "RESULT-SECRET-ls" }],
+    ["WebFetch", { url: "https://example.test/RESULT-SECRET-fetch" }],
+    ["WebSearch", { query: "RESULT-SECRET-search" }],
+  ];
+  for (const [name, input] of resultTools) {
+    const sameBatchRuntime = nativePiHarness();
+    const sameBatch = await onlyDecisionBatch(sameBatchRuntime, [
+      call(`${name}-same-batch-first`, name, input),
+      call(`${name}-same-batch-repeat`, name, input),
+    ]);
+    assert.equal(sameBatch.decisions[1]?.reason, `Duplicate ${name} blocked: member 2 (${name}) of 2 matches an earlier identical request in this native batch; this member did not run. This blocked member produced no result.`);
+
+    const sameBatchNoResultRuntime = nativePiHarness();
+    const sameBatchNoResult = await dispatchNativeBatch(sameBatchNoResultRuntime, [
+      call(`${name}-same-batch-no-result`, name, input),
+      call(`${name}-same-batch-no-result-repeat`, name, input),
+    ], ["policy-blocked"]);
+    assert.equal(sameBatchNoResult.decisions[1]?.reason, `Duplicate ${name} blocked: member 2 (${name}) of 2 matches an earlier identical request in this native batch; this member did not run. This blocked member produced no result.`);
+
+    const observedRuntime = nativePiHarness();
+    await onlyDecisionBatch(observedRuntime, [call(`${name}-observed`, name, input)]);
+    const observed = await onlyDecisionBatch(observedRuntime, [call(`${name}-observed-repeat`, name, input)]);
+    assert.equal(observed.decisions[0]?.reason, `Duplicate ${name} blocked: member 1 (${name}) of 1 matches an identical request in the immediately preceding native tool group; this member did not run. Use the returned result.`);
+
+    const noResultRuntime = nativePiHarness();
+    await dispatchNativeBatch(noResultRuntime, [call(`${name}-no-result`, name, input)], ["policy-blocked"]);
+    const noResult = await onlyDecisionBatch(noResultRuntime, [call(`${name}-no-result-repeat`, name, input)]);
+    assert.equal(noResult.decisions[0]?.reason, `Duplicate ${name} blocked: member 1 (${name}) of 1 matches an adjacent request whose execution outcome was not observed; this member did not run. This blocked member produced no result.`);
+    assert.doesNotMatch(noResult.decisions[0]?.reason ?? "", /RESULT-SECRET/);
+  }
+
+  const tailored: Array<[string, Record<string, unknown>, string]> = [
+    ["bash", { command: "SECRET-bash" }, "Review any existing command result and the current workspace state."],
+    ["powershell", { command: "SECRET-powershell" }, "Review any existing command result and the current workspace state."],
+    ["ApplyPatch", { patch: "SECRET-patch" }, "Revalidate the intended patch against the current file contents and any prior patch outcome before making further edits."],
+    ["SubtasksInspect", { executionId: "SECRET-execution" }, "No inspection snapshot was taken by this member. Repeated polling is discouraged; rely on event-driven completion notifications, or use SubtasksWatch for one decision-relevant, one-shot callback while work continues."],
+    ["ShellList", {}, "Use the evidence already available."],
+    ["ShellStart", { command: "SECRET-start" }, ""],
+    ["SubtasksStart", { tasks: [] }, ""],
+  ];
+  for (const [name, input, nextStep] of tailored) {
+    const runtime = nativePiHarness({
+      shellStart: () => ({ state: "inactive" }),
+      subtaskStart: () => ({ state: "inactive" }),
+    });
+    const duplicate = await onlyDecisionBatch(runtime, [
+      call(`${name}-first`, name, input),
+      call(`${name}-duplicate`, name, input),
+    ]);
+    const base = `Duplicate ${name} blocked: member 2 (${name}) of 2 matches an earlier identical request in this native batch; this member did not run.`;
+    assert.equal(duplicate.decisions[1]?.reason, nextStep ? `${base} ${nextStep}` : base);
+    assert.doesNotMatch(duplicate.decisions[1]?.reason ?? "", /SECRET-|correction tool|retry/i);
+  }
+});
+
+test("runtime correlation feedback preserves earlier allowed decisions and does not invent results", async () => {
+  const uncorrelatedRuntime = nativePiHarness();
+  const uncorrelated = await uncorrelatedRuntime.emit("tool_call", {
+    toolCallId: "unmatched-read",
+    toolName: "read",
+    input: { path: "UNCORRELATED-SECRET" },
+  });
+  const uncorrelatedReason = (uncorrelated[0] as { block?: boolean; reason?: string }).reason ?? "";
+  assert.equal(uncorrelatedReason, "Tool group blocked before execution: member 1 (read) had no matching assistant batch. This call did not run; any other calls before the next assistant message_end will also be blocked. This blocked member produced no result.");
+  assert.doesNotMatch(uncorrelatedReason, /UNCORRELATED-SECRET|earlier result/);
+
+  const uncorrelatedStart = await uncorrelatedRuntime.emit("tool_call", {
+    toolCallId: "unmatched-start",
+    toolName: "SubtasksStart",
+    input: { tasks: [] },
+  });
+  const uncorrelatedStartReason = (uncorrelatedStart[0] as { block?: boolean; reason?: string }).reason ?? "";
+  assert.doesNotMatch(uncorrelatedStartReason, /earlier start|existing group|execution identity|worker usage/);
+
+  const runtime = nativePiHarness();
+  await runtime.emit("message_end", {
+    message: {
+      role: "assistant",
+      content: [
+        { type: "toolCall", id: "allowed-first", name: "bash", arguments: { command: "safe" } },
+        { type: "toolCall", id: "mismatched-second", name: "read", arguments: { path: "CORRELATION-SECRET" } },
+      ],
+    },
+  });
+  const allowed = await runtime.emit("tool_call", { toolCallId: "allowed-first", toolName: "bash", input: { command: "safe" } });
+  assert.equal((allowed[0] as { block?: boolean } | undefined)?.block, undefined);
+  const mismatched = await runtime.emit("tool_call", { toolCallId: "mismatched-second", toolName: "not-read", input: { path: "CORRELATION-SECRET" } });
+  const reason = (mismatched[0] as { block?: boolean; reason?: string }).reason ?? "";
+  assert.match(reason, /^Tool group blocked before execution: member 2 \(read\) did not match the submitted native batch\./);
+  assert.match(reason, /This member and any remaining calls before the next assistant message are blocked; earlier preflight decisions were not revoked\./);
+  assert.match(reason, /This blocked member produced no result\.$/);
+  assert.doesNotMatch(reason, /all 2 tool calls|earlier group|existing group|CORRELATION-SECRET/);
 });
 
 test("structured ShellStart and SubtasksStart return failures become truthful Pi errors and earn one retry", async () => {
@@ -246,7 +399,7 @@ test("structured ShellStart and SubtasksStart return failures become truthful Pi
 
     const third = await onlyDecisionBatch(runtime, [makeCall(`${name}-third`)]);
     assert.equal(third.decisions[0]?.block, true, `${name} blocks a third identical operation`);
-    assert.match(third.decisions[0]?.reason ?? "", /follows the one allowed retry/);
+    assert.match(third.decisions[0]?.reason ?? "", /follows an identical execution that succeeded; this member did not run\./);
   }
 });
 
@@ -275,7 +428,7 @@ test("structured returned errors from every non-start owned tool become Pi error
 
     const third = await onlyDecisionBatch(runtime, [makeCall(`${name}-third`)]);
     assert.equal(third.decisions[0]?.block, true, `${name} blocks a third identical operation`);
-    assert.match(third.decisions[0]?.reason ?? "", /follows the one allowed retry/);
+    assert.match(third.decisions[0]?.reason ?? "", /follows an identical execution that succeeded; this member did not run\./);
     assert.equal(third.toolResults, 0, `${name} third call never reaches execute`);
   }
 
@@ -385,9 +538,8 @@ test("later identical ShellStart and SubtasksStart members in one native batch a
   ]);
   assert.deepEqual(result.decisions.map((decision) => decision.block), [false, true, false, true]);
   assert.equal(result.ran.length, 2);
-  assert.match(result.decisions[1]?.reason ?? "", /no second job/i);
-  assert.match(result.decisions[3]?.reason ?? "", /no group or tasks/i);
-  assert.match(result.decisions[3]?.reason ?? "", /no worker usage/i);
+  assert.equal(result.decisions[1]?.reason, "Duplicate ShellStart blocked: member 2 (ShellStart) of 4 matches an earlier identical request in this native batch; this member did not run.");
+  assert.equal(result.decisions[3]?.reason, "Duplicate SubtasksStart blocked: member 4 (SubtasksStart) of 4 matches an earlier identical request in this native batch; this member did not run.");
   assert.doesNotMatch(result.decisions.map((decision) => decision.reason ?? "").join("\n"), /sleep 30|instructions|acceptanceCriteria/);
 });
 
@@ -419,7 +571,7 @@ test("raw submitted identity survives Pi null normalization, mixed batches, and 
   await onlyDecisionBatch(runtime, [call("gap", "WebFetch", { url: "https://example.test/" })]);
   const activeRepeat = await onlyDecisionBatch(runtime, [call("shell-active-repeat", "ShellStart", withNullReordered)]);
   assert.equal(activeRepeat.decisions[0]?.block, true);
-  assert.match(activeRepeat.decisions[0]?.reason ?? "", /still active \(job-raw\)/);
+  assert.equal(activeRepeat.decisions[0]?.reason, "Duplicate ShellStart blocked: member 1 (ShellStart) of 1 matches an earlier start with an active job job-raw; this member started no job.");
   assert.equal(activeRepeat.toolResults, 0);
 
   await onlyDecisionBatch(runtime, [call("second-gap", "WebFetch", { url: "https://example.test/other" })]);
@@ -451,7 +603,7 @@ test("SubtasksStart liveness uses the raw submitted fingerprint across an interv
   await onlyDecisionBatch(runtime, [call("subtask-gap", "WebFetch", { url: "https://example.test/" })]);
   const duplicate = await onlyDecisionBatch(runtime, [call("subtask-repeat", "SubtasksStart", reordered)]);
   assert.equal(duplicate.decisions[0]?.block, true);
-  assert.match(duplicate.decisions[0]?.reason ?? "", /active work \(exec-raw\)/);
+  assert.equal(duplicate.decisions[0]?.reason, "Duplicate SubtasksStart blocked: member 1 (SubtasksStart) of 1 matches an earlier identical start with active work in execution exec-raw; this member created no group or tasks.");
   assert.equal(duplicate.toolResults, 0);
 
   await onlyDecisionBatch(runtime, [call("subtask-gap-2", "WebFetch", { url: "https://example.test/other" })]);
@@ -474,14 +626,14 @@ test("active ShellStart survives intervening groups; unknown liveness blocks, se
   await onlyDecisionBatch(runtime, [call("edit", "edit", { path: "out.txt", content: "change" })]);
   const activeDuplicate = await onlyDecisionBatch(runtime, [shell()]);
   assert.equal(activeDuplicate.decisions[0]?.block, true);
-  assert.match(activeDuplicate.decisions[0]?.reason ?? "", /still active/);
-  assert.match(activeDuplicate.decisions[0]?.reason ?? "", /ShellStop only if stopping it is authorized/);
+  assert.match(activeDuplicate.decisions[0]?.reason ?? "", /matches an earlier start with an active job job:/);
+  assert.doesNotMatch(activeDuplicate.decisions[0]?.reason ?? "", /ShellStop|ShellList/);
 
   shellState = "unknown";
   await onlyDecisionBatch(runtime, [call("read-gap", "read", { path: "later.txt" })]);
   const unknown = await onlyDecisionBatch(runtime, [shell()]);
   assert.equal(unknown.decisions[0]?.block, true);
-  assert.match(unknown.decisions[0]?.reason ?? "", /liveness is unknown/);
+  assert.equal(unknown.decisions[0]?.reason, "Duplicate ShellStart blocked: member 1 (ShellStart) of 1 matches an earlier start whose job liveness could not be verified; this member started no job.");
   shellState = "inactive";
   await onlyDecisionBatch(runtime, [call("settled-gap", "WebFetch", { url: "https://example.test/b" })]);
   const afterSettle = await onlyDecisionBatch(runtime, [shell()]);
@@ -502,15 +654,13 @@ test("active and unknown SubtasksStart liveness blocks across unrelated groups, 
   await onlyDecisionBatch(runtime, [call("web", "WebFetch", { url: "https://example.test/" })]);
   const active = await onlyDecisionBatch(runtime, [start("start-active")]);
   assert.equal(active.decisions[0]?.block, true);
-  assert.match(active.decisions[0]?.reason ?? "", /active work \(exec-known\)/);
-  assert.match(active.decisions[0]?.reason ?? "", /no worker usage/i);
-  assert.match(active.decisions[0]?.reason ?? "", /SubtasksInspect/);
+  assert.equal(active.decisions[0]?.reason, "Duplicate SubtasksStart blocked: member 1 (SubtasksStart) of 1 matches an earlier identical start with active work in execution exec-known; this member created no group or tasks.");
 
   groupState = "unknown";
   await onlyDecisionBatch(runtime, [call("patch", "ApplyPatch", { patch: "different" })]);
   const unknown = await onlyDecisionBatch(runtime, [start("start-unknown")]);
   assert.equal(unknown.decisions[0]?.block, true);
-  assert.match(unknown.decisions[0]?.reason ?? "", /group liveness is unknown/);
+  assert.equal(unknown.decisions[0]?.reason, "Duplicate SubtasksStart blocked: member 1 (SubtasksStart) of 1 matches an earlier identical start whose work liveness could not be verified; this member created no group or tasks.");
 });
 
 test("an eight-task SubtasksStart and distinct starts remain admissible without quantity blocking", async () => {
@@ -566,7 +716,8 @@ test("uncorrelatable native batch blocks every member before execution without e
   assert.ok(reasons.every((reason) => reason.block));
   assert.ok(reasons.every((reason) => /all 2 tool calls in this group were blocked before execution/.test(reason.reason)));
   assert.match(feedback, /Offending submission: member 1 \(SubtasksStart\)/);
-  assert.match(feedback, /no worker usage/i);
+  assert.doesNotMatch(feedback, /worker usage|SubtasksInspect|SubtasksStart creates/);
+  assert.match(feedback, /This blocked member produced no result\./);
   assert.doesNotMatch(feedback, /SECRET-PATH|\"tasks\"/);
 });
 
@@ -594,5 +745,5 @@ test("innocent fallback siblings are retryable while the identified offender rem
     call("bad-retry", "SubtasksStart", badInput),
   ]);
   assert.deepEqual(next.decisions.map((decision) => decision.block), [false, true]);
-  assert.match(next.decisions[1]?.reason ?? "", /follows a member that was itself blocked/);
+  assert.equal(next.decisions[1]?.reason, "Duplicate SubtasksStart blocked: member 2 (SubtasksStart) of 2 follows an identical request that was blocked before execution; this member did not run.");
 });

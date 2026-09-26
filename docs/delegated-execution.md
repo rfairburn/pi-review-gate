@@ -32,18 +32,19 @@ groups and regardless of the earlier start result's error flag. Unknown liveness
 the new start rather than risking a duplicate spawn: for `ShellStart`, any running job
 without a recorded start identity keeps liveness unknown; for `SubtasksStart`, an
 unavailable or failing liveness lookup fails closed the same way. The guard never
-interrupts or cancels existing work. After work settles, a nonadjacent repeat is allowed. A blocked
-`ShellStart` creates no second job; inspect with `ShellList`, let the existing job
-finish, or use `ShellStop` only when stopping it is authorized. A blocked
-`SubtasksStart` member creates no group or tasks and incurs no new worker usage; use
-`SubtasksInspect` with a known handle to inspect existing work—`SubtasksStart` creates
-work, not a status snapshot. An older or restored active `SubtasksStart` group without
-a recorded start-call fingerprint is unidentifiable rather than unknown: it cannot match
+interrupts or cancels existing work. After work settles, a nonadjacent repeat is allowed.
+A blocked `ShellStart` creates no second job. A blocked `SubtasksStart` member
+creates no group or tasks and incurs no new worker usage. Its feedback describes
+the identical start and observed liveness without assuming why it was submitted.
+An older or restored active `SubtasksStart` group without a recorded start-call
+fingerprint is unidentifiable rather than unknown: it cannot match
 the submitted fingerprint and does not by itself block an otherwise admissible new
 start. The accepted duplicate risk is disclosed, not hidden: because that legacy group's
 original submitted identity is unavailable, an identical new start can duplicate its
 still-active work; the new start is not proven distinct or safe. A blocked
-`SubtasksInspect` takes no new snapshot.
+`SubtasksInspect` takes no new snapshot; repeated polling is discouraged in favor
+of event-driven completion notifications or a decision-relevant, one-shot
+`SubtasksWatch` callback.
 
 This is a native Pi extension-hook guard in the primary and Pi executor runtimes. It
 does not intercept calls made by an external API harness or wrapper such as

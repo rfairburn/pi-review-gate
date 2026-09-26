@@ -144,9 +144,14 @@ export class NativeToolCallPreflight {
     group.seenFingerprints.add(member.fingerprint);
     if (duplicateInBatch) {
       this.markBlocked(member);
+      const earlierResultObserved = group.members.some((candidate) =>
+        candidate.position < member.position
+        && candidate.fingerprint === member.fingerprint
+        && (candidate.outcome === "success" || candidate.outcome === "error"),
+      );
       return {
         block: true,
-        reason: this.targetedBlockReason(member, group, "same-batch", undefined),
+        reason: this.targetedBlockReason(member, group, "same-batch", undefined, undefined, earlierResultObserved),
       };
     }
 
@@ -167,9 +172,10 @@ export class NativeToolCallPreflight {
         return undefined;
       }
       this.markBlocked(member);
+      const earlierResultObserved = preceding.outcome === "success" || preceding.outcome === "error";
       return {
         block: true,
-        reason: this.targetedBlockReason(member, group, "previous-group", undefined, preceding),
+        reason: this.targetedBlockReason(member, group, "previous-group", undefined, preceding, earlierResultObserved),
       };
     }
 
@@ -375,31 +381,38 @@ export class NativeToolCallPreflight {
     cause: "same-batch" | "active" | "unknown" | "previous-group",
     status?: StartLiveness,
     preceding?: ToolCallMember,
+    earlierResultObserved = false,
   ): string {
     const location = `member ${member.position} (${member.name}) of ${group.members.length}`;
     let lead: string;
     if (member.name === "ShellStart" && cause === "active") {
-      lead = `Duplicate ShellStart blocked: ${location} matches a job that is still active${status?.state === "active" && status.identity ? ` (${status.identity})` : ""}; this member did not start a second job.`;
+      const identity = status?.state === "active" && status.identity ? ` ${status.identity}` : "";
+      lead = `Duplicate ShellStart blocked: ${location} matches an earlier start with an active job${identity}; this member started no job.`;
     } else if (member.name === "ShellStart" && cause === "unknown") {
-      lead = `Duplicate ShellStart blocked: ${location} could not be cleared because existing job liveness is unknown; this member did not start a second job.`;
+      lead = `Duplicate ShellStart blocked: ${location} matches an earlier start whose job liveness could not be verified; this member started no job.`;
     } else if (member.name === "SubtasksStart" && cause === "active") {
-      lead = `Duplicate SubtasksStart blocked: ${location} matches a group with active work${status?.state === "active" && status.identity ? ` (${status.identity})` : ""}; this member created no group or tasks.`;
+      const identity = status?.state === "active" && status.identity ? ` in execution ${status.identity}` : "";
+      lead = `Duplicate SubtasksStart blocked: ${location} matches an earlier identical start with active work${identity}; this member created no group or tasks.`;
     } else if (member.name === "SubtasksStart" && cause === "unknown") {
-      lead = `Duplicate SubtasksStart blocked: ${location} could not be cleared because existing group liveness is unknown; this member created no group or tasks.`;
+      lead = `Duplicate SubtasksStart blocked: ${location} matches an earlier identical start whose work liveness could not be verified; this member created no group or tasks.`;
     } else {
-      const source = cause === "same-batch" ? "an earlier identical member in this native batch" : "an identical call in the immediately preceding native tool group";
-      lead = `Duplicate ${member.name} blocked: ${location} matches ${source}; this member did not run.`;
+      if (cause === "same-batch") {
+        lead = `Duplicate ${member.name} blocked: ${location} matches an earlier identical request in this native batch; this member did not run.`;
+      } else {
+        lead = `Duplicate ${member.name} blocked: ${location} matches an identical request in the immediately preceding native tool group; this member did not run.`;
+      }
       if (preceding?.retryAttempt && preceding.outcome === "error") {
-        lead = `Duplicate ${member.name} blocked after repeated failures: ${location} would be a third identical attempt after two observed operation failures; this third operation did not run.`;
+        lead = `Duplicate ${member.name} blocked after repeated failures: ${location} follows two identical executions that failed; this member did not run.`;
       } else if (preceding?.retryAttempt && preceding.outcome === "success") {
-        lead = `Repeated calls blocked: ${location} follows the one allowed retry; this additional operation did not run.`;
+        lead = `Repeated calls blocked: ${location} follows an identical execution that succeeded; this member did not run.`;
       } else if (preceding?.admission === "blocked" || preceding?.outcome === "blocked") {
-        lead = `Duplicate ${member.name} blocked: ${location} follows a member that was itself blocked before execution; this member did not run.`;
+        lead = `Duplicate ${member.name} blocked: ${location} follows an identical request that was blocked before execution; this member did not run.`;
       } else if (preceding && preceding.outcome === "unknown") {
-        lead = `Duplicate ${member.name} blocked: ${location} matches an adjacent call whose execution outcome was not observed; this member did not run.`;
+        lead = `Duplicate ${member.name} blocked: ${location} matches an adjacent request whose execution outcome was not observed; this member did not run.`;
       }
     }
-    return `${lead} ${toolSpecificNextStep(member.name, cause, status)}`;
+    const nextStep = toolSpecificNextStep(member.name, earlierResultObserved);
+    return nextStep ? `${lead} ${nextStep}` : lead;
   }
 
   private wholeGroupFallbackReason(group: ToolCallGroup, member: ToolCallMember | undefined, eventName: string): string {
@@ -410,18 +423,21 @@ export class NativeToolCallPreflight {
       ? ` Offending submission: member ${group.fallbackOffender.position} (${group.fallbackOffender.name}).`
       : "";
     const reason = group.fallbackReason ?? "the native batch could not be safely correlated";
-    return `Tool group blocked before execution: ${current} could not be safely selected because ${reason}; all ${group.members.length} tool calls in this group were blocked before execution.${offender} ${toolSpecificNextStep(member?.name ?? eventName, "fallback")}`;
+    const nextStep = toolSpecificNextStep(member?.name ?? eventName, false);
+    return `Tool group blocked before execution: ${current} could not be safely selected because ${reason}; all ${group.members.length} tool calls in this group were blocked before execution.${offender}${nextStep ? ` ${nextStep}` : ""}`;
   }
 
   private runtimeCorrelationFailureReason(member: ToolCallMember | undefined, eventName: string): string {
     const current = member
       ? `member ${member.position} (${member.name})`
       : `an unrecognized member (${eventName || "unknown tool"})`;
-    return `Tool group blocked before execution: ${current} did not match the submitted native batch. This member and any remaining calls before the next assistant message are blocked; earlier preflight decisions were not revoked. ${toolSpecificNextStep(member?.name ?? eventName, "uncorrelated")}`;
+    const nextStep = toolSpecificNextStep(member?.name ?? eventName, false);
+    return `Tool group blocked before execution: ${current} did not match the submitted native batch. This member and any remaining calls before the next assistant message are blocked; earlier preflight decisions were not revoked.${nextStep ? ` ${nextStep}` : ""}`;
   }
 
   private uncorrelatedFallbackReason(name: string, position: number): string {
-    return `Tool group blocked before execution: member ${position} (${name || "unknown tool"}) had no matching assistant batch. This call did not run; any other calls before the next assistant message_end will also be blocked. ${toolSpecificNextStep(name, "uncorrelated")}`;
+    const nextStep = toolSpecificNextStep(name, false);
+    return `Tool group blocked before execution: member ${position} (${name || "unknown tool"}) had no matching assistant batch. This call did not run; any other calls before the next assistant message_end will also be blocked.${nextStep ? ` ${nextStep}` : ""}`;
   }
 }
 
@@ -477,39 +493,27 @@ function resultErrorFlag(args: unknown[], toolCallId: string, toolName: string):
   return undefined;
 }
 
-function toolSpecificNextStep(name: string, cause: "same-batch" | "active" | "unknown" | "previous-group" | "fallback" | "uncorrelated", status?: StartLiveness): string {
+function toolSpecificNextStep(name: string, earlierResultObserved: boolean): string | undefined {
   switch (name) {
     case "ShellStart":
-      if (cause === "active") return "No second job was started; check ShellList, let the existing job finish, or use ShellStop only if stopping it is authorized.";
-      if (cause === "unknown") return "No second job was started; check ShellList once, and do not start another job until liveness is known.";
-      if (cause === "fallback") return "No ShellStart member in this blocked group started a job; check ShellList, and let existing jobs finish or use ShellStop only when authorized.";
-      return "No second job was started by this member; check ShellList, let existing jobs finish, or use ShellStop only if stopping one is authorized.";
     case "SubtasksStart":
-      if (cause === "active" && status?.state === "active" && status.identity) {
-        return `No new group or tasks were created, so this member incurred no worker usage; use SubtasksInspect with the existing execution identity ${status.identity} to inspect it. SubtasksStart creates work, not a status snapshot.`;
-      }
-      if (cause === "active" || cause === "unknown") {
-        return "No new group or tasks were created by this member, so it incurred no worker usage; use SubtasksInspect with a known execution/task handle to inspect work. SubtasksStart creates work, not a status snapshot.";
-      }
-      if (cause === "fallback") return "No SubtasksStart member in this blocked group created a group or tasks, so no worker usage was started by this group; use SubtasksInspect with a known handle for status, not another start.";
-      return "This member created no group or tasks and incurred no worker usage; use SubtasksInspect with a known handle to inspect existing work. SubtasksStart creates work, not a status snapshot.";
+      return undefined;
     case "SubtasksInspect":
-      return "No new inspection snapshot was taken by this member; use an existing result, or take one new snapshot only when it is needed for a decision.";
+      return "No inspection snapshot was taken by this member. Repeated polling is discouraged; rely on event-driven completion notifications, or use SubtasksWatch for one decision-relevant, one-shot callback while work continues.";
     case "ApplyPatch":
-      return "Inspect the current workspace and the preceding result before submitting a changed patch.";
+      return "Revalidate the intended patch against the current file contents and any prior patch outcome before making further edits.";
     case "bash":
     case "powershell":
-      return "Inspect the preceding command result and current workspace before submitting another command; use the correction tool for a fix instead of repeating an unchanged test.";
+      return "Review any existing command result and the current workspace state.";
     case "read":
     case "grep":
     case "find":
     case "ls":
-      return "Use the returned result; repeat only if a new workspace state needs to be checked.";
     case "WebFetch":
     case "WebSearch":
-      return "Use the returned result; retry only after confirming that it failed or is insufficient for the current decision.";
+      return earlierResultObserved ? "Use the returned result." : "This blocked member produced no result.";
     default:
-      return "Review the preceding result and current state; submit a changed or still-needed operation only after confirming it was not already performed.";
+      return "Use the evidence already available.";
   }
 }
 

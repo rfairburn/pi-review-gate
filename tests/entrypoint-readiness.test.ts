@@ -221,7 +221,7 @@ test("entrypoint wiring preserves raw ShellStart identity through null normaliza
         validated,
       );
       assert.equal(repeated.isError, true);
-      assert.match(String((repeated.content as Array<{ text?: unknown }>)[0]?.text), /still active \(job\d+\)/);
+      assert.match(String((repeated.content as Array<{ text?: unknown }>)[0]?.text), /matches an earlier start with an active job job\d+; this member started no job\./);
       assert.equal(toolResultEvents, 1, "the preflight-blocked repeat emits no extension tool_result");
 
       const listed = await shellList.execute("shell-list", {}, undefined, undefined, context);

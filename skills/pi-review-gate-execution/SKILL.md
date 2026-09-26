@@ -139,5 +139,3 @@ HEAD are preserved for inspection. When continuing after one:
   remaining risks. Do not report work as done while its required checks are pending or
   failing, and do not claim review outcomes — acceptance and review belong to the
   parent and the review gate.
-- Recursive searches and scans: prune `.terraform` directories (and similar dependency
-  caches) at traversal time rather than filtering results afterward.

@@ -15,6 +15,13 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.83]
+
+### Changed
+
+- Remove workspace-specific recursive-search guidance from the shipped execution
+  skill; local agent policies remain outside the packaged skill.
+
 ## [0.1.0-dev.82]
 
 ### Added

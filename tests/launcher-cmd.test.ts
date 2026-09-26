@@ -856,9 +856,9 @@ test("launcher helper migrates proven pre-#151 generic skill copies and preserve
 
   const skillsDir = join(fixture.home, ".agents", "skills");
   // Proven unmodified package-owned copies at the pre-#151 generic
-  // locations: the immutable historical fixtures hold the byte-exact
-  // pre-namespacing content (digest-anchored), so this test establishes old
-  // installation behavior even after shipped skill edits.
+  // locations: historical fixtures are byte-exact except the redacted
+  // execution fixture, which must be preserved because its digest differs
+  // from the originally published execution copy.
   const priorOrchestrator = join(skillsDir, "orchestrator", "SKILL.md");
   const priorRecovery = join(skillsDir, "orchestrator", "references", "recovery.md");
   const priorExecution = join(skillsDir, "execution", "SKILL.md");
@@ -887,9 +887,11 @@ test("launcher helper migrates proven pre-#151 generic skill copies and preserve
       `the ${name} skill must be provisioned during the migration launch`,
     );
   }
-  for (const removed of [priorOrchestrator, priorRecovery, priorExecution]) {
+  for (const removed of [priorOrchestrator, priorRecovery]) {
     assert.equal(await pathExists(removed), false, `the proven prior copy must be migrated away: ${removed}`);
   }
+  assert.equal(await readFile(priorExecution, "utf8"), await historicalFixture("execution/SKILL.md"),
+    "the redacted fixture is not the originally published execution copy and must be preserved");
   assert.equal(await readFile(modifiedResearch, "utf8"), researchContent, "a modified generic copy must be preserved");
   assert.equal(await readFile(unrelatedFile, "utf8"), "user notes\n", "unrelated files under old skill directories must be preserved");
   assert.equal(await pathExists(join(skillsDir, "orchestrator")), true, "old directories are never removed");

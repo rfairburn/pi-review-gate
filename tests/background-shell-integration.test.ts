@@ -26,7 +26,10 @@ interface Sent {
   delivery: any;
 }
 
-function wire(options: { submittedFingerprintFor?: (toolCallId: string, toolName: string) => string | undefined } = {}) {
+function wire(options: {
+  submittedFingerprintFor?: (toolCallId: string, toolName: string) => string | undefined;
+  onNativeToolError?: (toolCallId: string, toolName: string) => void;
+} = {}) {
   const sent: Sent[] = [];
   const tools: Record<string, any> = {};
   const handlers: Record<string, any> = {};
@@ -35,7 +38,7 @@ function wire(options: { submittedFingerprintFor?: (toolCallId: string, toolName
     on: (n: string, h: any) => { handlers[n] = h; },
     sendMessage: (msg: any, delivery: any) => { sent.push({ content: msg.content, delivery }); },
   };
-  const controller = registerBackgroundShell(pi, options.submittedFingerprintFor);
+  const controller = registerBackgroundShell(pi, options.submittedFingerprintFor, options.onNativeToolError);
   const ctx = { hasUI: false, ui: {} };
   const call = (name: string, params: any, toolCallId = "id") =>
     tools[name].execute(toolCallId, params, undefined, undefined, ctx);
@@ -139,11 +142,39 @@ describe("bg-shell against real processes", () => {
     await call("ShellStop", { id });
     expect(await until(() => controller.snapshot().running.length === 0)).toBe(true);
 
-    const missing = wire({ submittedFingerprintFor: () => undefined });
+    const observedErrors: Array<[string, string]> = [];
+    const missing = wire({
+      submittedFingerprintFor: () => undefined,
+      onNativeToolError: (toolCallId, toolName) => observedErrors.push([toolCallId, toolName]),
+    });
     const rejected = await missing.call("ShellStart", validated, "missing-identity");
     expect(rejected.isError).toBe(true);
     expect(textOf(rejected)).toContain("submitted ShellStart identity could not be verified");
     expect(missing.controller.snapshot().running).toEqual([]);
+    expect(observedErrors).toEqual([["missing-identity", "ShellStart"]]);
+  });
+
+  it("reports explicit returned errors from non-start Shell tools without flagging successful results", async () => {
+    const observedErrors: Array<[string, string]> = [];
+    const { call } = wire({
+      onNativeToolError: (toolCallId, toolName) => observedErrors.push([toolCallId, toolName]),
+    });
+    const failures = [
+      ["shell-log-missing", "ShellLog", { id: "missing-log" }],
+      ["shell-send-missing", "ShellSend", { id: "missing-send", text: "hello" }],
+      ["shell-stop-missing", "ShellStop", { id: "missing-stop" }],
+    ] as const;
+    for (const [toolCallId, toolName, params] of failures) {
+      const result = await call(toolName, params, toolCallId);
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain("Error:");
+    }
+    expect(observedErrors).toEqual(failures.map(([toolCallId, toolName]) => [toolCallId, toolName]));
+
+    const listed = await call("ShellList", {}, "shell-list-success");
+    expect(listed.isError).toBe(false);
+    expect(textOf(listed)).toBe("No background jobs.");
+    expect(observedErrors).toEqual(failures.map(([toolCallId, toolName]) => [toolCallId, toolName]));
   });
 
   it("publishes authoritative typed lifecycle revisions", async () => {

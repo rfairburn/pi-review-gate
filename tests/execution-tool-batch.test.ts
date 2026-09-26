@@ -39,6 +39,7 @@ function harness(options: {
   omitActiveToolSnapshot?: boolean;
   deferredPiTools?: boolean;
   submittedFingerprintFor?: (toolCallId: string, toolName: string) => string | undefined;
+  onNativeToolError?: (toolCallId: string, toolName: string) => void;
 } = {}) {
   const tools: Array<Record<string, any>> = [];
   const commands: string[] = [];
@@ -100,6 +101,7 @@ function harness(options: {
     state: createState(),
     cwd: () => process.cwd(),
     submittedFingerprintFor: options.submittedFingerprintFor,
+    onNativeToolError: options.onNativeToolError,
     notify: (message) => { notices.push(message); },
     onExpandedViewChanged: (expanded) => { config.ui = { ...config.ui, subtasksViewExpanded: expanded }; },
   });
@@ -252,7 +254,11 @@ test("typed progress phases determine task state independently of display prose"
 });
 
 test("subtask launch fails closed when Pi cannot provide its native active-tool allowlist", async () => {
-  const { tools, manager } = harness({ omitActiveToolSnapshot: true });
+  const observedErrors: Array<[string, string]> = [];
+  const { tools, manager } = harness({
+    omitActiveToolSnapshot: true,
+    onNativeToolError: (toolCallId, toolName) => observedErrors.push([toolCallId, toolName]),
+  });
   try {
     const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
     const response = await start("missing-tool-snapshot", {
@@ -260,6 +266,7 @@ test("subtask launch fails closed when Pi cannot provide its native active-tool 
     }, undefined, undefined, {});
     assert.equal(response.isError, true);
     assert.match(response.content[0].text, /Execution requires an authoritative parent active-tool snapshot/);
+    assert.deepEqual(observedErrors, [["missing-tool-snapshot", "SubtasksStart"]]);
   } finally {
     await manager.shutdown();
     await manager.detach();
@@ -697,12 +704,17 @@ test("/subtasks-view toggles a live multiline widget without entering model cont
 });
 
 test("SubtasksStart result explains that queued work may have startup delay", async () => {
-  const { tools, manager } = harness();
+  const observedErrors: Array<[string, string]> = [];
+  const { tools, manager } = harness({
+    onNativeToolError: (toolCallId, toolName) => observedErrors.push([toolCallId, toolName]),
+  });
   const execute = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
   const inspect = executionTool(tools, "SubtasksInspect").execute as ExecuteTool;
   const result = await execute("start-delay", {
     tasks: [{ title: "Waiting work", instructions: "Do bounded work", acceptanceCriteria: ["Work is complete"] }],
   }, undefined, undefined, {});
+  assert.equal(result.isError, false);
+  assert.deepEqual(observedErrors, [], "successful async start is not later task-status evidence");
   assert.match(result.content[0].text, /Queued tasks may wait for executor startup or available pool capacity/);
   assert.match(result.content[0].text, /Scheduler at acceptance: 1 task\(s\) assigned and starting, 0 still pending dispatch/);
   assert.match(result.content[0].text, /Assignment is not proof that executor startup has completed/);
@@ -738,6 +750,42 @@ test("SubtasksStart result explains that queued work may have startup delay", as
   assert.match(diagnostic.content[0].text, /Scheduler: \d+\/4 workers active;/);
   assert.match(diagnostic.content[0].text, /timing \(ms\): total \d+; queued \d+; capture \d+; execution \d+; review \d+; landing \d+/);
   await manager.shutdown();
+});
+
+test("every registered Subtasks tool reports explicit returned errors, but not successful returns", async () => {
+  const observedErrors: Array<[string, string]> = [];
+  const { tools, manager } = harness({
+    onNativeToolError: (toolCallId, toolName) => observedErrors.push([toolCallId, toolName]),
+  });
+  try {
+    for (const [index, name] of executionToolNames.entries()) {
+      const toolCallId = `invalid-${name}`;
+      const response = await (executionTool(tools, name).execute as ExecuteTool)(
+        toolCallId,
+        { unsupported: true },
+        undefined,
+        undefined,
+        {},
+      );
+      assert.equal(response.isError, true, `${name} returns its explicit structured error`);
+      assert.match(response.content[0].text, /unsupported is not valid for action/);
+      assert.deepEqual(observedErrors.at(-1), [toolCallId, name], `${name} reports the exact native call identity`);
+      assert.equal(observedErrors.length, index + 1);
+    }
+
+    const success = await (executionTool(tools, "SubtasksMarkClean").execute as ExecuteTool)(
+      "mark-clean-success",
+      {},
+      undefined,
+      undefined,
+      {},
+    );
+    assert.equal(success.isError, false);
+    assert.equal(observedErrors.length, executionToolNames.length, "successful results are not reported as returned errors");
+  } finally {
+    await manager.shutdown();
+    await manager.detach();
+  }
 });
 
 test("native SubtasksStart persists only the admitted raw submitted fingerprint and fails closed without it", async () => {

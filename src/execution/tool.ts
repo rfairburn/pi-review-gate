@@ -161,6 +161,8 @@ interface ExecutionToolManagerInput {
   onExpandedViewChanged?: (expanded: boolean) => void | Promise<void>;
   /** Raw submitted identity for admitted native calls; UI/command starts synthesize it locally. */
   submittedFingerprintFor?: SubmittedToolCallFingerprint;
+  /** Internal outcome signal for explicit returned errors from owned native tools. */
+  onNativeToolError?: (toolCallId: string, toolName: string) => void;
 }
 
 interface CommandUi {
@@ -616,8 +618,11 @@ export class ExecutionToolManager {
         promptGuidelines: SHARED_PROMPT_GUIDELINES,
         executionMode: "sequential",
         parameters: toolSchema(action),
-        execute: async (toolCallId: string, params: unknown, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: unknown) =>
-          this.executeAction(action, name, toolCallId, params, ctx),
+        execute: async (toolCallId: string, params: unknown, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: unknown) => {
+          const result = await this.executeAction(action, name, toolCallId, params, ctx);
+          if (result.isError === true) this.input.onNativeToolError?.(toolCallId, name);
+          return result;
+        },
         renderCall: (args: unknown, theme: ThemeLike) => renderCall(name, action, args, theme),
         // #93: the canonical collapsed callback (subtask-result-collapsed.ts)
         // is the shared helper's first argument and owns every non-expanded

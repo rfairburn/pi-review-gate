@@ -4,12 +4,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { activate } from "../src/index";
+import registerBackgroundShell from "../src/background-shell";
+import { EXECUTION_TOOL_NAMES } from "../src/execution/tool";
 import { NativeToolCallPreflight } from "../src/tool-call-preflight";
 import { toolCallFingerprint } from "../src/tool-call-fingerprint";
 
 type Call = { id: string; name: string; input: Record<string, unknown> };
-type AttemptOutcome = "success" | "error" | "unknown" | "policy-blocked";
+type AttemptOutcome = "success" | "error" | "returned-error" | "text-error" | "unknown" | "policy-blocked";
 type StartLiveness = "active" | "unknown" | "inactive";
+type NativeBatchResult = {
+  decisions: Array<{ block: boolean; reason?: string }>;
+  ran: Call[];
+  toolResults: number;
+  nativeToolResults: Array<Record<string, unknown>>;
+};
 
 function nativePiHarness(options: {
   shellStart?: (fingerprint: string) => { state: StartLiveness; identity?: string };
@@ -36,8 +44,22 @@ function nativePiHarness(options: {
       for (const handler of hooks.get(name) ?? []) results.push(await handler(...args));
       return results;
     },
+    async emitToolResult(event: Record<string, unknown>): Promise<Record<string, unknown>> {
+      toolResultCount += 1;
+      let currentEvent = { ...event };
+      for (const handler of hooks.get("tool_result") ?? []) {
+        const result = await handler(currentEvent);
+        if (typeof result === "object" && result !== null && !Array.isArray(result)) {
+          currentEvent = { ...currentEvent, ...result as Record<string, unknown> };
+        }
+      }
+      return currentEvent;
+    },
     admittedSubmittedFingerprint(toolCallId: string, toolName: string): string | undefined {
       return preflight.admittedSubmittedFingerprint(toolCallId, toolName);
+    },
+    observeReturnedError(toolCallId: string, toolName: string): void {
+      preflight.observeReturnedError(toolCallId, toolName);
     },
     toolResultCount(): number {
       return toolResultCount;
@@ -52,7 +74,7 @@ async function dispatchNativeBatch(
   runtime: ReturnType<typeof nativePiHarness>,
   calls: Array<Call | { id: string; name: string; input?: Record<string, unknown> }>,
   outcomes: AttemptOutcome[] = [],
-): Promise<{ decisions: Array<{ block: boolean; reason?: string }>; ran: Call[]; toolResults: number }> {
+): Promise<NativeBatchResult> {
   const resultsBefore = runtime.toolResultCount();
   await runtime.emit("message_end", {
     message: {
@@ -63,6 +85,7 @@ async function dispatchNativeBatch(
 
   const decisions: Array<{ block: boolean; reason?: string }> = [];
   const ran: Call[] = [];
+  const nativeToolResults: Array<Record<string, unknown>> = [];
   for (let index = 0; index < calls.length; index += 1) {
     const call = calls[index]!;
     const input = call.input
@@ -82,13 +105,26 @@ async function dispatchNativeBatch(
     // observed result, so it earns no retry entitlement.
     if (outcome === "policy-blocked") continue;
     ran.push(call as Call);
-    if (outcome === "unknown") {
-      await runtime.emit("tool_result", { toolCallId: call.id, toolName: call.name, input: call.input });
-    } else {
-      await runtime.emit("tool_result", { toolCallId: call.id, toolName: call.name, input: call.input, isError: outcome === "error" });
-    }
+    const resultDetails = outcome === "returned-error"
+      ? { diagnostic: "the extension returned a structured error" }
+      : outcome === "text-error"
+        ? { diagnostic: "text looks like an error, but no structured failure was returned" }
+        : {};
+    const hookEvent: Record<string, unknown> = {
+      type: "tool_result",
+      toolCallId: call.id,
+      toolName: call.name,
+      input: call.input,
+      content: [{ type: "text", text: outcome === "success" ? "completed" : "Error: operation did not complete" }],
+      details: resultDetails,
+      // Pi 0.87.1's execute wrapper reports fulfilled calls as nonerrors and
+      // copies content/details (not the extension result's top-level isError).
+      ...(outcome === "unknown" ? {} : { isError: outcome === "error" }),
+    };
+    if (outcome === "returned-error") runtime.observeReturnedError(call.id, call.name);
+    nativeToolResults.push(await runtime.emitToolResult(hookEvent));
   }
-  return { decisions, ran, toolResults: runtime.toolResultCount() - resultsBefore };
+  return { decisions, ran, toolResults: runtime.toolResultCount() - resultsBefore, nativeToolResults };
 }
 
 function call(id: string, name: string, input: Record<string, unknown>): Call {
@@ -98,7 +134,7 @@ function call(id: string, name: string, input: Record<string, unknown>): Call {
 function onlyDecisionBatch(
   runtime: ReturnType<typeof nativePiHarness>,
   calls: Call[],
-): Promise<{ decisions: Array<{ block: boolean; reason?: string }>; ran: Call[]; toolResults: number }> {
+): Promise<NativeBatchResult> {
   return dispatchNativeBatch(runtime, calls);
 }
 
@@ -168,6 +204,7 @@ test("an observed operation failure earns one adjacent retry, then reports repea
     const a = (id: string) => call(id, "bash", { command: "run deterministic check" });
     const first = await dispatchNativeBatch(runtime, [a("first")], ["error"]);
     assert.equal(first.decisions[0]?.block, false);
+    assert.equal(first.nativeToolResults[0]?.isError, true, "Pi's wrapper error flag remains authoritative");
     const retry = await dispatchNativeBatch(runtime, [a("retry")], [retryOutcome]);
     assert.equal(retry.decisions[0]?.block, false, "one retry follows an observed execution error");
     const third = await onlyDecisionBatch(runtime, [a("third")]);
@@ -181,6 +218,104 @@ test("an observed operation failure earns one adjacent retry, then reports repea
   }
 });
 
+test("structured ShellStart and SubtasksStart return failures become truthful Pi errors and earn one retry", async () => {
+  const cases = [
+    {
+      name: "ShellStart",
+      input: { command: "sleep 30", label: "worker" },
+      runtime: () => nativePiHarness({ shellStart: () => ({ state: "inactive" }) }),
+    },
+    {
+      name: "SubtasksStart",
+      input: { tasks: [{ title: "one", instructions: "work", acceptanceCriteria: ["done"] }] },
+      runtime: () => nativePiHarness({ subtaskStart: () => ({ state: "inactive" }) }),
+    },
+  ];
+  for (const { name, input, runtime: createRuntime } of cases) {
+    const runtime = createRuntime();
+    const makeCall = (id: string) => call(id, name, input);
+    const first = await dispatchNativeBatch(runtime, [makeCall(`${name}-failed`)], ["returned-error"]);
+    assert.equal(first.decisions[0]?.block, false, `${name} runs before returning its error`);
+    assert.equal(first.nativeToolResults[0]?.isError, true, `${name} error is reflected in Pi's final tool result`);
+    assert.deepEqual(first.nativeToolResults[0]?.details, { diagnostic: "the extension returned a structured error" });
+    assert.match((first.nativeToolResults[0]?.content as Array<{ text: string }>)[0]?.text ?? "", /^Error:/);
+
+    const retry = await dispatchNativeBatch(runtime, [makeCall(`${name}-retry`)], ["success"]);
+    assert.equal(retry.decisions[0]?.block, false, `${name} permits exactly one adjacent retry`);
+    assert.equal(retry.nativeToolResults[0]?.isError, false, "a successful async start remains a success");
+
+    const third = await onlyDecisionBatch(runtime, [makeCall(`${name}-third`)]);
+    assert.equal(third.decisions[0]?.block, true, `${name} blocks a third identical operation`);
+    assert.match(third.decisions[0]?.reason ?? "", /follows the one allowed retry/);
+  }
+});
+
+test("structured returned errors from every non-start owned tool become Pi errors and permit only one retry", async () => {
+  const names = [
+    "ShellList", "ShellLog", "ShellSend", "ShellStop",
+    "SubtasksAdd", "SubtasksInspect", "SubtasksWatch", "SubtasksContinue",
+    "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean",
+  ];
+  for (const name of names) {
+    const runtime = nativePiHarness();
+    const makeCall = (id: string) => call(id, name, {});
+    const first = await dispatchNativeBatch(runtime, [makeCall(`${name}-failed`)], ["returned-error"]);
+    assert.equal(first.decisions[0]?.block, false, `${name} runs before returning its error`);
+    assert.equal(first.nativeToolResults[0]?.isError, true, `${name} explicit returned error reaches Pi's final result`);
+    assert.deepEqual(first.nativeToolResults[0]?.details, { diagnostic: "the extension returned a structured error" }, `${name} details are preserved`);
+    assert.equal(
+      (first.nativeToolResults[0]?.content as Array<{ text: string }>)[0]?.text,
+      "Error: operation did not complete",
+      `${name} content is preserved`,
+    );
+
+    const retry = await dispatchNativeBatch(runtime, [makeCall(`${name}-retry`)], ["success"]);
+    assert.equal(retry.decisions[0]?.block, false, `${name} permits one adjacent retry after its returned failure`);
+    assert.equal(retry.nativeToolResults[0]?.isError, false, `${name} retry success stays successful`);
+
+    const third = await onlyDecisionBatch(runtime, [makeCall(`${name}-third`)]);
+    assert.equal(third.decisions[0]?.block, true, `${name} blocks a third identical operation`);
+    assert.match(third.decisions[0]?.reason ?? "", /follows the one allowed retry/);
+    assert.equal(third.toolResults, 0, `${name} third call never reaches execute`);
+  }
+
+  const textRuntime = nativePiHarness();
+  const textualFailure = await dispatchNativeBatch(
+    textRuntime,
+    [call("shell-log-text-error", "ShellLog", { id: "missing" })],
+    ["text-error"],
+  );
+  assert.equal(textualFailure.nativeToolResults[0]?.isError, false, "error-looking content alone does not change Pi's result flag");
+  const repeatedText = await onlyDecisionBatch(textRuntime, [call("shell-log-text-repeat", "ShellLog", { id: "missing" })]);
+  assert.equal(repeatedText.decisions[0]?.block, true);
+  assert.doesNotMatch(repeatedText.decisions[0]?.reason ?? "", /after two observed operation failures/);
+});
+
+test("returned-error normalization covers every registered Shell and Subtasks tool name", async () => {
+  const shellNames: string[] = [];
+  registerBackgroundShell({
+    registerTool(tool) { shellNames.push(tool.name); },
+    on() {},
+    sendMessage() {},
+  });
+  const names = [...shellNames, ...Object.values(EXECUTION_TOOL_NAMES)];
+  assert.equal(new Set(names).size, names.length, "owned registration families have unique tool names");
+
+  const runtime = nativePiHarness({
+    shellStart: () => ({ state: "inactive" }),
+    subtaskStart: () => ({ state: "inactive" }),
+  });
+  for (const [index, name] of names.entries()) {
+    const result = await dispatchNativeBatch(
+      runtime,
+      [call(`owned-tool-${index}`, name, {})],
+      ["returned-error"],
+    );
+    assert.equal(result.decisions[0]?.block, false, `${name} is admissible`);
+    assert.equal(result.nativeToolResults[0]?.isError, true, `${name} is covered by returned-error normalization`);
+  }
+});
+
 test("unknown outcomes and policy-blocked calls do not create retry entitlement", async () => {
   const unknownRuntime = nativePiHarness();
   const a = (id: string) => call(id, "bash", { command: "uncertain operation" });
@@ -188,6 +323,12 @@ test("unknown outcomes and policy-blocked calls do not create retry entitlement"
   const afterUnknown = await onlyDecisionBatch(unknownRuntime, [a("unknown-2")]);
   assert.equal(afterUnknown.decisions[0]?.block, true);
   assert.match(afterUnknown.decisions[0]?.reason ?? "", /outcome was not observed/);
+
+  const textRuntime = nativePiHarness();
+  await dispatchNativeBatch(textRuntime, [a("text-only-error")], ["text-error"]);
+  const afterTextOnlyError = await onlyDecisionBatch(textRuntime, [a("after-text-only-error")]);
+  assert.equal(afterTextOnlyError.decisions[0]?.block, true);
+  assert.doesNotMatch(afterTextOnlyError.decisions[0]?.reason ?? "", /after two observed operation failures/);
 
   const policyRuntime = nativePiHarness();
   const first = await dispatchNativeBatch(policyRuntime, [a("policy-1")], ["error"]);
@@ -199,6 +340,20 @@ test("unknown outcomes and policy-blocked calls do not create retry entitlement"
   const afterPolicyBlock = await onlyDecisionBatch(policyRuntime, [a("policy-3")]);
   assert.equal(afterPolicyBlock.decisions[0]?.block, true);
   assert.doesNotMatch(afterPolicyBlock.decisions[0]?.reason ?? "", /after two observed operation failures/);
+
+  const ownedCall = (id: string) => call(id, "ShellLog", { id: "missing" });
+  const ownedUnknownRuntime = nativePiHarness();
+  await dispatchNativeBatch(ownedUnknownRuntime, [ownedCall("owned-unknown")], ["unknown"]);
+  const afterOwnedUnknown = await onlyDecisionBatch(ownedUnknownRuntime, [ownedCall("owned-after-unknown")]);
+  assert.equal(afterOwnedUnknown.decisions[0]?.block, true);
+  assert.match(afterOwnedUnknown.decisions[0]?.reason ?? "", /outcome was not observed/);
+
+  const ownedPolicyRuntime = nativePiHarness();
+  await dispatchNativeBatch(ownedPolicyRuntime, [ownedCall("owned-failed")], ["returned-error"]);
+  await dispatchNativeBatch(ownedPolicyRuntime, [ownedCall("owned-policy-blocked")], ["policy-blocked"]);
+  const afterOwnedPolicyBlock = await onlyDecisionBatch(ownedPolicyRuntime, [ownedCall("owned-after-policy-block")]);
+  assert.equal(afterOwnedPolicyBlock.decisions[0]?.block, true);
+  assert.doesNotMatch(afterOwnedPolicyBlock.decisions[0]?.reason ?? "", /after two observed operation failures/);
 });
 
 test("[A,B,C]→[B,D,F] blocks only the shared member in either direction", async () => {

@@ -1,6 +1,12 @@
 import { registerHook } from "./pi";
 import { isToolCallFingerprint, toolCallFingerprint, type StartLiveness } from "./tool-call-fingerprint";
 
+const OWNED_NATIVE_TOOL_NAMES = new Set([
+  "ShellStart", "ShellList", "ShellLog", "ShellSend", "ShellStop",
+  "SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksWatch", "SubtasksContinue",
+  "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean",
+]);
+
 interface ToolCallMember {
   id?: string;
   name: string;
@@ -10,6 +16,7 @@ interface ToolCallMember {
   admission?: "allowed" | "blocked";
   outcome: "unknown" | "success" | "error" | "blocked";
   started: boolean;
+  returnedErrorObserved: boolean;
   retryAttempt: boolean;
   /** Pi emits tool_execution_start before this member's tool_call preflight. */
   executionStartObserved: boolean;
@@ -182,6 +189,15 @@ export class NativeToolCallPreflight {
     return isToolCallFingerprint(member.fingerprint) ? member.fingerprint : undefined;
   }
 
+  /** Record an explicit isError:true returned by an admitted owned native tool. */
+  observeReturnedError(toolCallId: string, toolName: string): void {
+    if (!toolCallId || !OWNED_NATIVE_TOOL_NAMES.has(toolName)) return;
+    const member = this.membersById.get(toolCallId);
+    if (!member || member.id !== toolCallId || member.name !== toolName || member.admission !== "allowed" || !member.started) return;
+    member.returnedErrorObserved = true;
+    member.outcome = "error";
+  }
+
   private onMessageEnd(args: unknown[]): void {
     const message = findAssistantMessage(args);
     if (!message) return;
@@ -223,6 +239,7 @@ export class NativeToolCallPreflight {
         position: index + 1,
         outcome: "unknown",
         started: false,
+        returnedErrorObserved: false,
         executionStartObserved: false,
         retryAttempt: false,
         preflighted: false,
@@ -270,11 +287,12 @@ export class NativeToolCallPreflight {
     if (member.admission === "allowed") member.started = true;
   }
 
-  private onToolResult(args: unknown[]): void {
+  private onToolResult(args: unknown[]): { isError: true } | undefined {
     const id = eventCallId(args);
     if (!id) return;
     const member = this.membersById.get(id);
-    if (!member || member.admission === "blocked") return;
+    const name = eventToolName(args);
+    if (!member || (name !== undefined && name !== member.name) || member.admission === "blocked") return;
     if (!member.started) {
       // A preflight-start event alone is not execution evidence: this member
       // may have been blocked before its callback ran, so it never earns retry
@@ -282,12 +300,21 @@ export class NativeToolCallPreflight {
       member.outcome = "unknown";
       return;
     }
-    const isError = resultErrorFlag(args);
+    if (member.returnedErrorObserved) {
+      // Pi's fulfilled execute path sets its wrapper isError flag to false and
+      // drops the extension result's top-level isError. The execute callback
+      // reports that structured flag directly, so this hook can normalize the
+      // final Pi result without inferring from displayed text or changing details.
+      member.outcome = "error";
+      return { isError: true };
+    }
+    const isError = resultErrorFlag(args, id, member.name);
     if (isError === undefined) {
       if (member.outcome !== "error" && member.outcome !== "success") member.outcome = "unknown";
       return;
     }
     member.outcome = isError ? "error" : "success";
+    return undefined;
   }
 
   private findCurrentMember(group: ToolCallGroup, event: ToolCallEvent): ToolCallMember | undefined {
@@ -442,11 +469,10 @@ function eventToolName(args: unknown[]): string | undefined {
   return undefined;
 }
 
-function resultErrorFlag(args: unknown[]): boolean | undefined {
+function resultErrorFlag(args: unknown[], toolCallId: string, toolName: string): boolean | undefined {
   for (const value of args) {
-    if (!isRecord(value)) continue;
+    if (!isRecord(value) || value.toolCallId !== toolCallId || value.toolName !== toolName) continue;
     if (typeof value.isError === "boolean") return value.isError;
-    if (isRecord(value.result) && typeof value.result.isError === "boolean") return value.result.isError;
   }
   return undefined;
 }

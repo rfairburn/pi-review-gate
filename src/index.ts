@@ -161,6 +161,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       backgroundShellController = registerBackgroundShell(
         pi,
         (toolCallId, toolName) => nativeToolPreflight.admittedSubmittedFingerprint(toolCallId, toolName),
+        (toolCallId, toolName) => nativeToolPreflight.observeReturnedError(toolCallId, toolName),
       );
     }
     const deferredTools = new DeferredToolManager(pi);
@@ -255,6 +256,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     ? registerBackgroundShell(
       pi,
       (toolCallId, toolName) => nativeToolPreflight.admittedSubmittedFingerprint(toolCallId, toolName),
+      (toolCallId, toolName) => nativeToolPreflight.observeReturnedError(toolCallId, toolName),
     )
     : undefined;
 
@@ -305,6 +307,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     state,
     cwd: () => currentCwd,
     submittedFingerprintFor: (toolCallId, toolName) => nativeToolPreflight.admittedSubmittedFingerprint(toolCallId, toolName),
+    onNativeToolError: (toolCallId, toolName) => nativeToolPreflight.observeReturnedError(toolCallId, toolName),
     authorizedTools: () => deferredTools.authorizedToolNames(),
     notify: (message) => sendNotice(pi, message),
     onAssociationsChanged: () => persistSessionState(),

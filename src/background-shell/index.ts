@@ -738,8 +738,21 @@ function statusOf(job: Job): string {
 export function registerBackgroundShell(
   pi: BackgroundShellHost,
   submittedFingerprintFor?: SubmittedToolCallFingerprint,
+  onNativeToolError?: (toolCallId: string, toolName: string) => void,
 ): BackgroundShellController {
-  pi.registerTool({
+  const registerTool = (tool: BackgroundShellTool): void => {
+    const execute = tool.execute;
+    pi.registerTool({
+      ...tool,
+      execute: async (...args: Parameters<BackgroundShellTool["execute"]>) => {
+        const result = await execute(...args);
+        if (result.isError === true) onNativeToolError?.(args[0], tool.name);
+        return result;
+      },
+    });
+  };
+
+  registerTool({
     name: "ShellStart",
     label: "ShellStart",
     description:
@@ -864,7 +877,7 @@ export function registerBackgroundShell(
     renderResult: expandableResult(shellStartCollapsedView, renderShellStartResult),
   });
 
-  pi.registerTool({
+  registerTool({
     name: "ShellList",
     label: "ShellList",
     description: "List background jobs with their status, runtime, and what they are watched for.",
@@ -900,7 +913,7 @@ export function registerBackgroundShell(
     renderResult: expandableResult(shellListCollapsedView, renderShellListResult),
   });
 
-  pi.registerTool({
+  registerTool({
     name: "ShellLog",
     label: "ShellLog",
     description:
@@ -961,7 +974,7 @@ export function registerBackgroundShell(
     renderResult: expandableResult(shellLogCollapsedView, renderShellLogResult),
   });
 
-  pi.registerTool({
+  registerTool({
     name: "ShellSend",
     label: "ShellSend",
     description:
@@ -1062,7 +1075,7 @@ export function registerBackgroundShell(
     renderResult: expandableResult(shellSendCollapsedView, renderShellSendResult),
   });
 
-  pi.registerTool({
+  registerTool({
     name: "ShellStop",
     label: "ShellStop",
     description:

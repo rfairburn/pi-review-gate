@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,9 +10,9 @@ import {
   type ExternalAgentConfig,
   type ReviewGateConfig,
 } from "../src/config";
-import { createWorkspaceSnapshot } from "../src/capture";
+import { compareSnapshots, createWorkspaceSnapshot, type FileSnapshot, type WorkspaceSnapshot } from "../src/capture";
 import { createEvidenceState, recordAcceptedReviewerQuestion, recordToolCallEvidence } from "../src/evidence";
-import { runAskReviewer, runReview } from "../src/review";
+import { collectPausedReviewExchange, runAskReviewer, runReview } from "../src/review";
 import { SessionStateStore } from "../src/session-state";
 import {
   beginAgentRun,
@@ -1619,6 +1619,250 @@ test("runReview rejects malformed exactChange fields", async () => {
       exactChange: { changedPaths: ["a.ts"], patch: "x".repeat(baseConfig.maxPatchBytes + 1), truncated: false, omitted: [] },
     });
     assert.ok(out10.error?.includes("exceeds maxPatchBytes"), `expected maxPatchBytes error, got: ${out10.error}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #193: settle-time capture reuse. The three settlement paths (runReview,
+// collectPausedReviewExchange, and runAskReviewer via collectCurrentChanges)
+// must pass the completed same-root baseline they already hold as
+// reuseUnchangedFrom: unchanged entries are reused by reference after
+// re-verification, changes made between the baseline and settle remain fully
+// visible, and reviewer gate behavior is unchanged.
+// ---------------------------------------------------------------------------
+
+const settleSnapshotOptions = {
+  maxFileBytes: baseConfig.maxFileBytes,
+  maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+};
+
+/** Decision-relevant fields of a record — what a review consumer observes. */
+function settleDecisionFields(file: FileSnapshot | undefined) {
+  if (!file) return undefined;
+  return {
+    exists: file.exists,
+    size: file.size,
+    entryType: file.entryType,
+    sha256: file.sha256,
+    isBinary: file.isBinary,
+    content: file.content,
+    omittedReason: file.omittedReason,
+  };
+}
+
+/** Assert the settle capture is decision-equivalent to a fresh capture. */
+function assertSettleSnapshotsEquivalent(fresh: WorkspaceSnapshot, settled: WorkspaceSnapshot): void {
+  const freshPaths = [...fresh.files.keys()].sort();
+  assert.deepEqual([...settled.files.keys()].sort(), freshPaths, "settle must cover exactly the fresh path set");
+  for (const path of freshPaths) {
+    assert.deepEqual(
+      settleDecisionFields(settled.files.get(path)),
+      settleDecisionFields(fresh.files.get(path)),
+      `path ${path} must match the fresh capture`,
+    );
+  }
+}
+
+test("runReview settle on an unchanged workspace reports exactly the fresh result", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-settle-unchanged-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    await writeFile(join(dir, "notes.txt"), "notes\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, settleSnapshotOptions);
+
+    // Oracle: a fresh settle capture of the same state reports no changes.
+    const freshAfter = await createWorkspaceSnapshot(dir, settleSnapshotOptions);
+    assert.deepEqual(compareSnapshots(before, freshAfter), []);
+
+    const state = createState();
+    beginAgentRun(state);
+    setReviewWindowBaseline(state, before);
+    const window = state.reviewWindow!;
+
+    const output = await runReview({
+      cwd: dir,
+      request: "no changes",
+      before,
+      config: baseConfig,
+      window,
+    });
+
+    assert.equal(output.changed, false);
+    assert.equal(output.noReviewReason, "no_initial_changes");
+    assert.deepEqual(output.changes, []);
+    assert.equal(output.result, undefined, "the reviewer gate must not run without changes");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runReview settle reuses unchanged records and still reports every change made after the baseline", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-settle-changed-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    await writeFile(join(dir, "delete-me.txt"), "gone\n", "utf8");
+    await writeFile(join(dir, "mode.txt"), "mode\n", "utf8");
+    await writeFile(join(dir, "untouched.txt"), "keep\n", "utf8");
+    if (process.platform !== "win32") {
+      // A deterministic starting mode keeps the later chmod a real change
+      // under any umask.
+      await chmod(join(dir, "mode.txt"), 0o644);
+    }
+    const before = await createWorkspaceSnapshot(dir, settleSnapshotOptions);
+
+    // Changes between baseline and settle.
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    await writeFile(join(dir, "added.txt"), "new file\n", "utf8");
+    await rm(join(dir, "delete-me.txt"));
+    if (process.platform !== "win32") {
+      await chmod(join(dir, "mode.txt"), 0o600);
+    }
+
+    const state = createState();
+    beginAgentRun(state);
+    setReviewWindowBaseline(state, before);
+    const window = state.reviewWindow!;
+
+    const output = await runReview({
+      cwd: dir,
+      request: "change index",
+      before,
+      config: baseConfig,
+      window,
+    });
+
+    // Reviewer gate unchanged: the fake reviewer still blocks.
+    assert.equal(output.changed, true);
+    assert.equal(output.result?.verdict, "needs_changes");
+    assert.equal(output.result?.findings[0]?.issue, "missing test");
+
+    const byPath = new Map(output.changes.map((change) => [change.path, change]));
+    assert.equal(byPath.get("index.ts")?.status, "modified");
+    assert.equal(byPath.get("added.txt")?.status, "added");
+    assert.equal(byPath.get("delete-me.txt")?.status, "deleted");
+    if (process.platform !== "win32") {
+      assert.equal(byPath.get("mode.txt")?.status, "modified", "a mode-only change must stay visible");
+    }
+    assert.equal(byPath.has("untouched.txt"), false);
+
+    // The settle capture actually reused the verified unchanged record by
+    // reference (a fresh capture would allocate a new one)...
+    const settled = output.reviewedSnapshot;
+    assert.ok(settled, "a reviewed run returns its settle snapshot");
+    assert.equal(settled.files.get("untouched.txt"), before.files.get("untouched.txt"));
+    // ...and is decision-equivalent to a fresh capture of the same state.
+    const freshAfter = await createWorkspaceSnapshot(dir, settleSnapshotOptions);
+    assertSettleSnapshotsEquivalent(freshAfter, settled);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("collectPausedReviewExchange settle on an unchanged workspace records no changes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-paused-unchanged-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "same\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, settleSnapshotOptions);
+
+    const state = createState();
+    beginAgentRun(state);
+    setReviewWindowBaseline(state, before);
+    const window = state.reviewWindow!;
+
+    await collectPausedReviewExchange({ cwd: dir, config: baseConfig, window });
+
+    assert.equal(window.activeExchange, undefined, "the exchange must be settled");
+    const exchange = window.exchanges[0];
+    assert.ok(exchange);
+    assert.deepEqual(exchange.workspaceChanges, []);
+    assert.equal(exchange.workspacePatch, "");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("collectPausedReviewExchange settle reports every change made after the exchange baseline", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-paused-changed-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    await writeFile(join(dir, "delete-me.txt"), "gone\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, settleSnapshotOptions);
+
+    // Changes between the exchange baseline and settle.
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    await writeFile(join(dir, "added.txt"), "new file\n", "utf8");
+    await rm(join(dir, "delete-me.txt"));
+
+    const state = createState();
+    beginAgentRun(state);
+    setReviewWindowBaseline(state, before);
+    const window = state.reviewWindow!;
+
+    await collectPausedReviewExchange({ cwd: dir, config: baseConfig, window });
+
+    assert.equal(window.activeExchange, undefined, "the exchange must be settled");
+    const exchange = window.exchanges[0];
+    assert.ok(exchange);
+    const byPath = new Map(exchange.workspaceChanges.map((change) => [change.path, change]));
+    assert.equal(byPath.get("index.ts")?.status, "modified");
+    assert.equal(byPath.get("added.txt")?.status, "added");
+    assert.equal(byPath.get("delete-me.txt")?.status, "deleted");
+    assert.ok(exchange.workspacePatch.includes("+after"), "the settled patch must carry the new content");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runAskReviewer settle on an unchanged workspace reports no changes and still answers", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-settle-unchanged-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "same\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, settleSnapshotOptions);
+
+    const output = await runAskReviewer({
+      cwd: dir,
+      question: "is the workspace unchanged?",
+      request: "check the workspace",
+      before,
+      config: baseConfig,
+    });
+
+    assert.deepEqual(output.changes, []);
+    // Reviewer gate unchanged: the question still reaches a reviewer.
+    assert.equal(output.result?.verdict, "needs_changes");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runAskReviewer settle reports every change made after the provided baseline", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-ask-settle-changed-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    await writeFile(join(dir, "delete-me.txt"), "gone\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, settleSnapshotOptions);
+
+    // Changes between the provided baseline and settle.
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+    await writeFile(join(dir, "added.txt"), "new file\n", "utf8");
+    await rm(join(dir, "delete-me.txt"));
+
+    const output = await runAskReviewer({
+      cwd: dir,
+      question: "what changed?",
+      request: "check the workspace",
+      before,
+      config: baseConfig,
+    });
+
+    const byPath = new Map(output.changes.map((change) => [change.path, change]));
+    assert.equal(byPath.get("index.ts")?.status, "modified");
+    assert.equal(byPath.get("added.txt")?.status, "added");
+    assert.equal(byPath.get("delete-me.txt")?.status, "deleted");
+    // Reviewer gate unchanged: the question still reaches a reviewer.
+    assert.equal(output.result?.verdict, "needs_changes");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { promisify } from "node:util";
 import test from "node:test";
+import type { WorkspaceSnapshot } from "../src/capture";
 import { materializeReviewConfig, normalizeConfig, unresolvedReviewerSelectionsFor, type ReviewGateConfig } from "../src/config";
 import { queueModelDelivery } from "../src/durable-delivery";
 import { createEvidenceState } from "../src/evidence";
+import { armGitCheckpoint } from "../src/git-checkpoint";
 import {
   configDigest,
   replaceReviewGateState,
@@ -14,6 +18,8 @@ import {
   SESSION_STATE_ENTRY_TYPE,
   SESSION_STATE_QUARANTINE_MARKER,
   SessionStateCwdMismatchError,
+  SessionStateGitBaselineError,
+  SessionStateIntegrityError,
   SessionStateInvalidStateError,
   SessionStateParseError,
   SessionStateStore,
@@ -39,6 +45,8 @@ import {
   reconcileRestoredReviewWindows,
   rememberUserRequest,
   setReviewWindowBaseline,
+  snapshotOfReviewBaseline,
+  snapshotReviewBaseline,
 } from "../src/state";
 
 test("session state round-trips review evidence and associations only for the same conversation", async () => {
@@ -135,7 +143,7 @@ review: { activeReviewers: [
     assert.equal(restored.state.reviewInProgress, false, "a restarted process cannot retain in-process ownership");
     assert.deepEqual(restored.state.queuedUserInputsDuringReview, ["additional direction"]);
     assert.equal(restored.state.reviewWindow?.requestHistory[0]?.text, "implement the durable change");
-    assert.equal(restored.state.reviewWindow?.baseline?.files.get("tracked.txt")?.content, "base\n");
+    assert.equal(snapshotOfReviewBaseline(restored.state.reviewWindow?.baseline)?.files.get("tracked.txt")?.content, "base\n");
     assert.equal(restored.state.reviewWindow?.evidence.candidates.get(join(root, "outside.txt"))?.exchangeBaselines.get(1)?.error, "missing");
     assert.equal(restored.state.reviewWindow?.reviewerSessions.get("reviewer")?.id, "review-session");
     assert.equal(restored.execution.bundles[0]?.expectedRevision, 7);
@@ -212,7 +220,7 @@ review: { activeReviewers: [
 
     const restored = await store.restore(root);
     assert.ok(restored);
-    const baseline = restored.state.reviewWindow?.baseline;
+    const baseline = snapshotOfReviewBaseline(restored.state.reviewWindow?.baseline);
     assert.deepEqual(baseline?.omissions, [
       { path: "protected.txt", kind: "file", reason: "unreadable", errorCode: "EACCES" },
       { path: "gone.txt", kind: "file", reason: "missing", errorCode: "ENOENT" },
@@ -392,6 +400,209 @@ function stableJsonForTest(value: unknown): string {
   }
   return JSON.stringify(value) ?? "null";
 }
+
+function workspaceSnapshot(root: string, content: string, capturedAt: string): WorkspaceSnapshot {
+  return {
+    cwd: root,
+    capturedAt,
+    files: new Map([["snapshot.txt", {
+      relativePath: "snapshot.txt",
+      absolutePath: join(root, "snapshot.txt"),
+      exists: true,
+      size: content.length,
+      mtimeMs: 1,
+      sha256: createHash("sha256").update(content).digest("hex"),
+      isBinary: false,
+      content,
+    }]]),
+    omissions: [],
+    omissionsTruncated: false,
+  };
+}
+
+function stateWithActiveSnapshot(root: string, baseline: WorkspaceSnapshot) {
+  const state = createState();
+  rememberUserRequest(state, "persist this review window");
+  beginAgentRun(state);
+  setReviewWindowBaseline(state, baseline);
+  return state;
+}
+
+function signSidecarForTest(value: Record<string, any>): void {
+  const { integritySha256: _integrity, ...unsigned } = value;
+  value.integritySha256 = createHash("sha256").update(stableJsonForTest(unsigned)).digest("hex");
+}
+
+test("identical window and active-exchange baselines persist once through a versioned reference", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-session-shared-baseline-"));
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const content = "unique-baseline-content-sentinel";
+    const baseline = workspaceSnapshot(root, content, "2026-08-18T00:00:00.000Z");
+    const state = stateWithActiveSnapshot(root, baseline);
+    const store = new SessionStateStore({ sessionId: "conversation-shared", sessionFile, cwd: root });
+    const config = normalizeConfig({ enabled: true, review: { activeReviewers: [] } });
+
+    await store.save(state, { waveRoots: [], bundles: [] }, config);
+
+    const sidecarText = await readFile(store.path, "utf8");
+    const raw = JSON.parse(sidecarText);
+    assert.equal(raw.version, 3, "the changed schema must not be mistaken for v1 by older readers");
+    assert.ok(raw.state.reviewWindow.baseline, "the canonical window snapshot stays inline");
+    assert.deepEqual(raw.state.reviewWindow.activeExchange.baseline, {
+      $snapshotRef: {
+        format: "pi-review-gate-workspace-snapshot",
+        version: 1,
+        target: "window.baseline",
+      },
+    });
+    assert.equal(sidecarText.split(content).length - 1, 1, "the shared snapshot content is serialized only once");
+
+    const restored = await store.restore(root);
+    assert.ok(restored?.state.reviewWindow?.baseline);
+    assert.strictEqual(
+      restored.state.reviewWindow.baseline,
+      restored.state.reviewWindow.activeExchange?.baseline,
+      "the alias materializes as the exact same restored snapshot",
+    );
+    assert.deepEqual(snapshotOfReviewBaseline(restored.state.reviewWindow.baseline), baseline);
+    assert.equal(snapshotOfReviewBaseline(restored.state.reviewWindow.activeExchange?.baseline)?.files.get("snapshot.txt")?.content, content);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("distinct window and active-exchange baselines remain inline and restore independently", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-session-distinct-baselines-"));
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const windowBaseline = workspaceSnapshot(root, "window-baseline-content", "2026-08-18T00:00:00.000Z");
+    const exchangeBaseline = workspaceSnapshot(root, "exchange-baseline-content", "2026-08-18T00:01:00.000Z");
+    const state = stateWithActiveSnapshot(root, windowBaseline);
+    state.reviewWindow!.activeExchange!.baseline = snapshotReviewBaseline(exchangeBaseline);
+    // Positive control: snapshot windows keep persisting full exchange
+    // entries, including the inline content fields Git windows strip.
+    state.reviewWindow!.exchanges.push({
+      sequence: 1,
+      startedAt: "2026-08-19T00:00:00.000Z",
+      endedAt: "2026-08-19T00:01:00.000Z",
+      workspaceChanges: [{
+        path: "snapshot.txt",
+        status: "modified",
+        binary: false,
+        oversized: false,
+        oldContent: "sentinel-snapshot-exchange-old\n",
+        newContent: "sentinel-snapshot-exchange-new\n",
+      }],
+      sideEffectChanges: [],
+      workspacePatch: "diff --git a/snapshot.txt b/snapshot.txt\n+snapshot patch stays\n",
+      sideEffectPatch: "",
+      evidenceEvents: [],
+      assistantSummaries: [],
+      userRequests: [],
+    });
+    const store = new SessionStateStore({ sessionId: "conversation-distinct", sessionFile, cwd: root });
+    const config = normalizeConfig({ enabled: true, review: { activeReviewers: [] } });
+
+    await store.save(state, { waveRoots: [], bundles: [] }, config);
+
+    const raw = JSON.parse(await readFile(store.path, "utf8"));
+    assert.equal(raw.version, 3);
+    assert.equal(raw.state.reviewWindow.activeExchange.baseline.files[0][1].content, "exchange-baseline-content");
+    assert.equal("$snapshotRef" in raw.state.reviewWindow.activeExchange.baseline, false);
+    const snapshotChange = raw.state.reviewWindow.exchanges[0].workspaceChanges[0];
+    assert.equal(snapshotChange.oldContent, "sentinel-snapshot-exchange-old\n");
+    assert.equal(snapshotChange.newContent, "sentinel-snapshot-exchange-new\n");
+    const restored = await store.restore(root);
+    assert.ok(restored?.state.reviewWindow?.baseline);
+    assert.ok(restored.state.reviewWindow.activeExchange?.baseline);
+    assert.deepEqual(snapshotOfReviewBaseline(restored.state.reviewWindow.baseline), windowBaseline);
+    assert.deepEqual(snapshotOfReviewBaseline(restored.state.reviewWindow.activeExchange?.baseline), exchangeBaseline);
+    assert.equal(restored.state.reviewWindow.exchanges[0]?.workspaceChanges[0]?.oldContent, "sentinel-snapshot-exchange-old\n");
+    assert.notStrictEqual(restored.state.reviewWindow.baseline, restored.state.reviewWindow.activeExchange.baseline);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("version 1 sidecars with inline snapshots remain restorable", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-session-v1-snapshots-"));
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const baseline = workspaceSnapshot(root, "legacy-inline-baseline", "2026-08-18T00:00:00.000Z");
+    const state = stateWithActiveSnapshot(root, baseline);
+    const store = new SessionStateStore({ sessionId: "conversation-v1", sessionFile, cwd: root });
+    const config = normalizeConfig({ enabled: true, review: { activeReviewers: [] } });
+    await store.save(state, { waveRoots: [], bundles: [] }, config);
+
+    // Convert the new writer's canonical snapshot into the equivalent old v1
+    // shape, where the active-exchange baseline was duplicated inline.
+    const raw = JSON.parse(await readFile(store.path, "utf8"));
+    raw.version = 1;
+    raw.state.reviewWindow.activeExchange.baseline = JSON.parse(JSON.stringify(raw.state.reviewWindow.baseline));
+    signSidecarForTest(raw);
+    await writeFile(store.path, `${JSON.stringify(raw)}\n`, "utf8");
+
+    const restored = await store.restore(root);
+    assert.ok(restored?.state.reviewWindow?.baseline);
+    assert.ok(restored.state.reviewWindow.activeExchange?.baseline);
+    assert.deepEqual(snapshotOfReviewBaseline(restored.state.reviewWindow.baseline), baseline);
+    assert.deepEqual(snapshotOfReviewBaseline(restored.state.reviewWindow.activeExchange?.baseline), baseline);
+    assert.notStrictEqual(restored.state.reviewWindow.baseline, restored.state.reviewWindow.activeExchange.baseline);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("missing or malformed snapshot references fail closed, and snapshot digest tampering is rejected", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-session-bad-snapshot-ref-"));
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const baseline = workspaceSnapshot(root, "integrity-protected-content", "2026-08-18T00:00:00.000Z");
+    const state = stateWithActiveSnapshot(root, baseline);
+    const store = new SessionStateStore({ sessionId: "conversation-bad-ref", sessionFile, cwd: root });
+    const config = normalizeConfig({ enabled: true, review: { activeReviewers: [] } });
+    await store.save(state, { waveRoots: [], bundles: [] }, config);
+    const original = JSON.parse(await readFile(store.path, "utf8"));
+
+    const malformedReference = JSON.parse(JSON.stringify(original));
+    malformedReference.state.reviewWindow.activeExchange.baseline.$snapshotRef.version = 2;
+    signSidecarForTest(malformedReference);
+    await writeFile(store.path, `${JSON.stringify(malformedReference)}\n`, "utf8");
+    await assert.rejects(store.restore(root), SessionStateInvalidStateError);
+
+    const hybridReference = JSON.parse(JSON.stringify(original));
+    Object.assign(
+      hybridReference.state.reviewWindow.activeExchange.baseline,
+      JSON.parse(JSON.stringify(hybridReference.state.reviewWindow.baseline)),
+    );
+    signSidecarForTest(hybridReference);
+    await writeFile(store.path, `${JSON.stringify(hybridReference)}\n`, "utf8");
+    await assert.rejects(store.restore(root), SessionStateInvalidStateError);
+
+    const missingTarget = JSON.parse(JSON.stringify(original));
+    delete missingTarget.state.reviewWindow.baseline;
+    signSidecarForTest(missingTarget);
+    await writeFile(store.path, `${JSON.stringify(missingTarget)}\n`, "utf8");
+    await assert.rejects(store.restore(root), SessionStateInvalidStateError);
+
+    const tamperedContent = JSON.parse(JSON.stringify(original));
+    tamperedContent.state.reviewWindow.baseline.files[0][1].content = "tampered-content";
+    await writeFile(store.path, `${JSON.stringify(tamperedContent)}\n`, "utf8");
+    await assert.rejects(store.restore(root), SessionStateIntegrityError);
+
+    const tamperedDigest = JSON.parse(JSON.stringify(original));
+    tamperedDigest.integritySha256 = "0".repeat(64);
+    await writeFile(store.path, `${JSON.stringify(tamperedDigest)}\n`, "utf8");
+    await assert.rejects(store.restore(root), SessionStateIntegrityError);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("reviewerSelectionDigest is insensitive to unrelated settings but tracks reviewer changes", () => {
   const base = {
@@ -961,7 +1172,343 @@ review: { activeReviewers: [
       (restored.state.reviewWindow as unknown as Record<string, unknown>)["reviewConfigurationError"],
       undefined,
     );
-    assert.equal(restored.state.reviewWindow!.baseline?.cwd, root);
+    assert.equal(snapshotOfReviewBaseline(restored.state.reviewWindow!.baseline)?.cwd, root);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ── v3 Git checkpoint baselines ──────────────────────────────────────────────
+//
+// The v3 writer persists a Git baseline as a compact descriptor (no patch or
+// file content) and re-verifies every Git baseline against the repository on
+// restore, failing closed before any restored state is applied.
+
+const execFileAsync = promisify(execFile);
+
+const GIT_ENV: NodeJS.ProcessEnv = {
+  ...process.env,
+  GIT_OPTIONAL_LOCKS: "0",
+  GIT_PAGER: "cat",
+  PAGER: "cat",
+  GIT_AUTHOR_NAME: "Test",
+  GIT_AUTHOR_EMAIL: "test@test.com",
+  GIT_COMMITTER_NAME: "Test",
+  GIT_COMMITTER_EMAIL: "test@test.com",
+};
+
+async function gitForBaselineTest(repo: string, ...args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync("git", args, { cwd: repo, env: GIT_ENV });
+  return stdout;
+}
+
+/** Fresh repository with one commit. */
+async function initGitRepoForBaselineTest(): Promise<string> {
+  const repo = await mkdtemp(join(tmpdir(), "pi-review-session-git-baseline-"));
+  await gitForBaselineTest(repo, "init", "-q");
+  await writeFile(join(repo, "README.md"), "# baseline test\n", "utf8");
+  await gitForBaselineTest(repo, "add", ".");
+  await gitForBaselineTest(repo, "commit", "-q", "-m", "initial");
+  return repo;
+}
+
+async function armCheckpointIn(root: string, windowId: string) {
+  const arm = await armGitCheckpoint(root, windowId);
+  assert.equal(arm.status, "ok");
+  if (arm.status !== "ok") throw new Error("unreachable");
+  return arm.value.descriptor;
+}
+
+function gitBaseline(descriptor: import("../src/git-checkpoint").GitCheckpointDescriptor, cwd: string, capturedAt: string) {
+  return { kind: "git" as const, descriptor, cwd, capturedAt };
+}
+
+/** Save a sidecar whose review window holds the given Git baselines. */
+async function saveGitBaselineSidecar(root: string, sessionId: string, windowId: string) {
+  const sessionFile = join(root, "conversation.jsonl");
+  await writeFile(sessionFile, "", "utf8");
+  const descriptor = await armCheckpointIn(root, windowId);
+  const state = createState();
+  rememberUserRequest(state, "persist a git checkpoint baseline");
+  beginAgentRun(state);
+  const baseline = gitBaseline(descriptor, root, "2026-08-19T00:00:00.000Z");
+  state.reviewWindow!.baseline = baseline;
+  const store = new SessionStateStore({ sessionId, sessionFile, cwd: root });
+  const config = normalizeConfig({ enabled: true, review: { activeReviewers: [] } });
+  await store.save(state, { waveRoots: [], bundles: [] }, config);
+  return { store, descriptor, baseline };
+}
+
+test("v3 persists a Git baseline as a compact descriptor and restores it after reloading the checkpoint", async () => {
+  const root = await initGitRepoForBaselineTest();
+  try {
+    // A staged change whose payload must never reach the sidecar.
+    await writeFile(join(root, "staged.txt"), "sentinel-git-baseline-payload\n", "utf8");
+    await gitForBaselineTest(root, "add", "staged.txt");
+
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const descriptor = await armCheckpointIn(root, "win-git-shared");
+    const state = createState();
+    rememberUserRequest(state, "persist a git checkpoint baseline");
+    beginAgentRun(state);
+    // Share the Git baseline with the active exchange: it must dedupe.
+    const baseline = gitBaseline(descriptor, root, "2026-08-19T00:00:00.000Z");
+    state.reviewWindow!.baseline = baseline;
+    state.reviewWindow!.activeExchange!.baseline = baseline;
+    // A completed exchange whose unbounded inline content must be stripped
+    // from the sidecar while every decision field and the bounded patch stay.
+    state.reviewWindow!.exchanges.push({
+      sequence: 1,
+      startedAt: "2026-08-19T00:00:00.000Z",
+      endedAt: "2026-08-19T00:01:00.000Z",
+      workspaceChanges: [{
+        path: "staged.txt",
+        status: "modified",
+        binary: false,
+        oversized: false,
+        oldGitMode: "100644",
+        newGitMode: "100644",
+        oldTracking: "tracked",
+        newTracking: "tracked",
+        renamedFrom: "old-name.txt",
+        oldContent: "sentinel-git-exchange-old\n",
+        newContent: "sentinel-git-exchange-new\n",
+      }],
+      // Side effects have no Git checkpoint fallback: their inline content
+      // must be persisted even for Git windows.
+      sideEffectChanges: [{
+        path: "../outside/side-effect.txt",
+        status: "modified",
+        binary: false,
+        oversized: false,
+        oldContent: "sentinel-git-side-effect-old\n",
+        newContent: "sentinel-git-side-effect-new\n",
+      }],
+      workspacePatch: "diff --git a/staged.txt b/staged.txt\n+bounded patch stays\n",
+      sideEffectPatch: "",
+      evidenceEvents: [],
+      assistantSummaries: [],
+      userRequests: [],
+    });
+    const store = new SessionStateStore({ sessionId: "conversation-git-shared", sessionFile, cwd: root });
+    const config = normalizeConfig({ enabled: true, review: { activeReviewers: [] } });
+    await store.save(state, { waveRoots: [], bundles: [] }, config);
+
+    const sidecarText = await readFile(store.path, "utf8");
+    const raw = JSON.parse(sidecarText);
+    assert.equal(raw.version, 3);
+    // Descriptor-only: exactly the compact fields, nothing else.
+    assert.deepEqual(raw.state.reviewWindow.baseline, { kind: "git", descriptor, cwd: root, capturedAt: baseline.capturedAt });
+    assert.deepEqual(raw.state.reviewWindow.activeExchange.baseline, {
+      $gitCheckpointRef: { format: "pi-review-gate-git-checkpoint", version: 1, target: "window.baseline" },
+    });
+    // The checkpoint's patch payload never enters the sidecar.
+    assert.ok(!sidecarText.includes("sentinel-git-baseline-payload"), "staged patch content must not be persisted in the sidecar");
+
+    // Git windows strip exactly the unbounded content fields from persisted
+    // exchanges; path/status/mode/tracking/rename and the bounded patch stay.
+    const persistedChange = raw.state.reviewWindow.exchanges[0].workspaceChanges[0];
+    assert.equal(persistedChange.oldContent, undefined);
+    assert.equal(persistedChange.newContent, undefined);
+    assert.equal(persistedChange.path, "staged.txt");
+    assert.equal(persistedChange.status, "modified");
+    assert.equal(persistedChange.binary, false);
+    assert.equal(persistedChange.oversized, false);
+    assert.equal(persistedChange.oldGitMode, "100644");
+    assert.equal(persistedChange.newGitMode, "100644");
+    assert.equal(persistedChange.oldTracking, "tracked");
+    assert.equal(persistedChange.newTracking, "tracked");
+    assert.equal(persistedChange.renamedFrom, "old-name.txt");
+    assert.ok(raw.state.reviewWindow.exchanges[0].workspacePatch.includes("bounded patch stays"), "the bounded patch must be persisted");
+    assert.ok(!sidecarText.includes("sentinel-git-exchange-old"), "old file content must not be persisted for Git windows");
+    assert.ok(!sidecarText.includes("sentinel-git-exchange-new"), "new file content must not be persisted for Git windows");
+
+    // The deliberate asymmetry: side-effect content has no checkpoint
+    // fallback, so it stays in the sidecar even for Git windows.
+    const persistedSideEffect = raw.state.reviewWindow.exchanges[0].sideEffectChanges[0];
+    assert.equal(persistedSideEffect.oldContent, "sentinel-git-side-effect-old\n");
+    assert.equal(persistedSideEffect.newContent, "sentinel-git-side-effect-new\n");
+
+    const restored = await store.restore(root);
+    assert.ok(restored?.state.reviewWindow?.baseline);
+    assert.deepEqual(restored.state.reviewWindow.baseline, baseline);
+    // The stripping happens at the persistence boundary: the restored
+    // exchange carries no inline workspace content, but keeps its side effects.
+    assert.equal(restored.state.reviewWindow.exchanges[0]?.workspaceChanges[0]?.oldContent, undefined);
+    assert.equal(restored.state.reviewWindow.exchanges[0]?.workspaceChanges[0]?.newContent, undefined);
+    assert.equal(restored.state.reviewWindow.exchanges[0]?.sideEffectChanges[0]?.oldContent, "sentinel-git-side-effect-old\n");
+    assert.strictEqual(
+      restored.state.reviewWindow.baseline,
+      restored.state.reviewWindow.activeExchange?.baseline,
+      "the git alias materializes as the same restored baseline",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("distinct Git window and active-exchange baselines persist inline and restore independently", async () => {
+  const root = await initGitRepoForBaselineTest();
+  try {
+    const descriptorA = await armCheckpointIn(root, "win-distinct-a");
+    const descriptorB = await armCheckpointIn(root, "win-distinct-b");
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const state = createState();
+    rememberUserRequest(state, "persist distinct git baselines");
+    beginAgentRun(state);
+    const baselineA = gitBaseline(descriptorA, root, "2026-08-19T00:00:00.000Z");
+    const baselineB = gitBaseline(descriptorB, root, "2026-08-19T00:01:00.000Z");
+    state.reviewWindow!.baseline = baselineA;
+    state.reviewWindow!.activeExchange!.baseline = baselineB;
+    const store = new SessionStateStore({ sessionId: "conversation-git-distinct", sessionFile, cwd: root });
+    const config = normalizeConfig({ enabled: true, review: { activeReviewers: [] } });
+    await store.save(state, { waveRoots: [], bundles: [] }, config);
+
+    const raw = JSON.parse(await readFile(store.path, "utf8"));
+    assert.equal(raw.version, 3);
+    assert.deepEqual(raw.state.reviewWindow.baseline, baselineA);
+    assert.deepEqual(raw.state.reviewWindow.activeExchange.baseline, baselineB);
+    assert.ok(!("$gitCheckpointRef" in raw.state.reviewWindow.activeExchange.baseline), "distinct baselines must not be deduplicated");
+
+    const restored = await store.restore(root);
+    assert.ok(restored?.state.reviewWindow?.baseline);
+    assert.deepEqual(restored.state.reviewWindow.baseline, baselineA);
+    assert.deepEqual(restored.state.reviewWindow.activeExchange?.baseline, baselineB);
+    assert.notStrictEqual(
+      restored.state.reviewWindow.baseline,
+      restored.state.reviewWindow.activeExchange?.baseline,
+      "distinct baselines restore as distinct objects",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+async function expectGitBaselineRestoreFailure(
+  root: string,
+  mutate: (raw: Record<string, any>) => Promise<void> | void,
+  expectedReason: string,
+): Promise<void> {
+  const { store } = await saveGitBaselineSidecar(root, "conversation-git-failclosed", "win-failclosed");
+  const written = await readFile(store.path, "utf8");
+  const raw = JSON.parse(written);
+  await mutate(raw);
+  signSidecarForTest(raw);
+  await writeFile(store.path, `${JSON.stringify(raw)}\n`, "utf8");
+
+  await assert.rejects(
+    store.restore(root),
+    (error: unknown) => error instanceof SessionStateGitBaselineError && error.reason === expectedReason,
+  );
+  // A failed restore must leave the sidecar exactly as it found it.
+  assert.equal(await readFile(store.path, "utf8"), `${JSON.stringify(raw)}\n`);
+}
+
+test("a missing checkpoint record fails closed with checkpoint_data_missing", async () => {
+  const root = await initGitRepoForBaselineTest();
+  try {
+    await expectGitBaselineRestoreFailure(root, async (raw) => {
+      // The descriptor is intact; the durable record is what disappears.
+      const descriptor = raw.state.reviewWindow.baseline.descriptor;
+      const recordPath = join(root, ".git", "pi-review-gate", "checkpoints", descriptor.windowId, `arm-${descriptor.armId}`, "record.json");
+      await rm(recordPath);
+    }, "checkpoint_data_missing");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a deleted pin ref fails closed with pin_ref_missing", async () => {
+  const root = await initGitRepoForBaselineTest();
+  try {
+    const { store } = await saveGitBaselineSidecar(root, "conversation-git-pin", "win-pin");
+    const raw = JSON.parse(await readFile(store.path, "utf8"));
+    const descriptor = raw.state.reviewWindow.baseline.descriptor;
+    await gitForBaselineTest(root, "update-ref", "-d", descriptor.ref);
+    await assert.rejects(
+      store.restore(root),
+      (error: unknown) => error instanceof SessionStateGitBaselineError && error.reason === "pin_ref_missing",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a capture root pointing at a different repository fails closed with wrong_repository", async () => {
+  const root = await initGitRepoForBaselineTest();
+  const otherRepo = await initGitRepoForBaselineTest();
+  try {
+    await expectGitBaselineRestoreFailure(root, (raw) => {
+      raw.state.reviewWindow.baseline.cwd = otherRepo;
+    }, "wrong_repository");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(otherRepo, { recursive: true, force: true });
+  }
+});
+
+test("a malformed descriptor fails closed with malformed_descriptor", async () => {
+  const root = await initGitRepoForBaselineTest();
+  try {
+    await expectGitBaselineRestoreFailure(root, (raw) => {
+      // Break the object id format: gate 1 rejects before any I/O.
+      raw.state.reviewWindow.baseline.descriptor.base = `z${raw.state.reviewWindow.baseline.descriptor.base.slice(1)}`;
+    }, "malformed_descriptor");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("mixed baseline kinds in one window are rejected before restore completes", async () => {
+  const root = await initGitRepoForBaselineTest();
+  try {
+    const { store } = await saveGitBaselineSidecar(root, "conversation-git-mixed", "win-mixed");
+    const raw = JSON.parse(await readFile(store.path, "utf8"));
+    // Layer an inline snapshot baseline over the Git window baseline.
+    raw.state.reviewWindow.activeExchange = {
+      ...raw.state.reviewWindow.activeExchange,
+      baseline: { cwd: root, capturedAt: "2026-08-19T00:02:00.000Z", files: [] },
+    };
+    signSidecarForTest(raw);
+    await writeFile(store.path, `${JSON.stringify(raw)}\n`, "utf8");
+    await assert.rejects(
+      store.restore(root),
+      (error: unknown) => error instanceof SessionStateInvalidStateError,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a provisional v2 sidecar with a snapshot reference still restores under the v3 writer", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-session-v2-ref-"));
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const baseline = workspaceSnapshot(root, "v2-reference-content", "2026-08-18T00:00:00.000Z");
+    const state = stateWithActiveSnapshot(root, baseline);
+    const store = new SessionStateStore({ sessionId: "conversation-v2-ref", sessionFile, cwd: root });
+    const config = normalizeConfig({ enabled: true, review: { activeReviewers: [] } });
+    await store.save(state, { waveRoots: [], bundles: [] }, config);
+
+    // Downgrade the v3 document to the provisional v2 shape and re-sign.
+    const raw = JSON.parse(await readFile(store.path, "utf8"));
+    assert.equal(raw.version, 3);
+    assert.ok(raw.state.reviewWindow.activeExchange.baseline.$snapshotRef, "the shared snapshot must be a reference");
+    raw.version = 2;
+    signSidecarForTest(raw);
+    await writeFile(store.path, `${JSON.stringify(raw)}\n`, "utf8");
+
+    const restored = await store.restore(root);
+    assert.ok(restored?.state.reviewWindow?.baseline);
+    assert.deepEqual(snapshotOfReviewBaseline(restored.state.reviewWindow.baseline), baseline);
+    assert.strictEqual(
+      restored.state.reviewWindow.baseline,
+      restored.state.reviewWindow.activeExchange?.baseline,
+      "the v2 reference still materializes as one shared baseline",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

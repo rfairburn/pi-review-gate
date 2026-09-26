@@ -35,6 +35,7 @@ import {
   recordReviewerFeedbackAndArmExchange,
   rememberUserRequest,
   setReviewWindowBaseline,
+  snapshotOfReviewBaseline,
   type ReviewGateState,
 } from "./state";
 import { registerReviewSettings } from "./settings/command";
@@ -46,7 +47,7 @@ import { ExecutionToolManager } from "./execution/tool";
 import { combineTokenUsage, extractPiUsageFromMessages, formatTokenUsage, type TokenUsage } from "./usage";
 import { buildReviewAuthorizationMessage, createReviewTransmissionMessage, deliverReviewTransmission, hasReviewDeliveryReceipt, type ReviewTransmissionAction } from "./transmission";
 import { dispatchModelDelivery, queueModelDelivery } from "./durable-delivery";
-import { replaceReviewGateState, sessionPersistenceIdentity, SessionStateCwdMismatchError, SessionStateConversationMismatchError, SessionStateIntegrityError, SessionStateInvalidStateError, SessionStateMissingSelectionDigestError, SessionStateParseError, SessionStateStore, SessionStateUnsupportedFormatError, type PendingDeliverySummary } from "./session-state";
+import { replaceReviewGateState, sessionPersistenceIdentity, SessionStateCwdMismatchError, SessionStateConversationMismatchError, SessionStateGitBaselineError, SessionStateIntegrityError, SessionStateInvalidStateError, SessionStateMissingSelectionDigestError, SessionStateParseError, SessionStateStore, SessionStateUnsupportedFormatError, type PendingDeliverySummary } from "./session-state";
 import { BackgroundProcessReadiness } from "./background-process-readiness";
 import {
   registerBackgroundShell,
@@ -937,6 +938,15 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       closeReviewWindow(state);
       return;
     }
+    // A restored Git checkpoint baseline is persisted but not yet reviewable
+    // through the snapshot pipeline: narrow explicitly and fail closed with a
+    // clear error instead of comparing against a synthetic snapshot (Git
+    // review wiring is a later integration slice).
+    const reviewBefore = snapshotOfReviewBaseline(window.baseline);
+    if (!reviewBefore) {
+      closeReviewWindow(state);
+      return;
+    }
     const reviewConfig = window.reviewConfig ?? freezeReviewWindowConfig(state, config, currentScopedModels);
     if (!reviewConfig.enabled) {
       if (config.enabled) {
@@ -1021,7 +1031,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       output = await runReview({
         cwd: currentCwd,
         request: buildRequestContext(state, state.reviewWindow, { priorFeedback: "latest" }),
-        before: window.baseline,
+        before: reviewBefore,
         config: reviewConfig,
         evidence: window.evidence,
         correctionAttemptCount: getCorrectionAttemptCount(window),
@@ -1523,6 +1533,7 @@ function safeRestoreFailureDiagnostic(error: unknown): string {
   if (error instanceof SessionStateInvalidStateError) return "invalid persisted state";
   if (error instanceof SessionStateUnsupportedFormatError) return "unsupported pre-cutover session format (missing snapshot omission ledger)";
   if (error instanceof SessionStateMissingSelectionDigestError) return "unsupported pre-cutover session format (missing reviewer-selection digest)";
+  if (error instanceof SessionStateGitBaselineError) return `Git checkpoint baseline verification failed (${error.reason})`;
   if (error instanceof SessionStateIntegrityError) return "integrity check failed";
   if (error instanceof SessionStateConversationMismatchError) return "conversation mismatch";
   return "validation failed";

@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  armReviewResponseExchange,
   beginAgentRun,
   buildRequestContext,
+  checkpointReviewWindow,
   clearReviewState,
   closeReviewWindow,
   createState,
@@ -16,6 +18,7 @@ import {
   recordReviewerFeedback,
   rememberUserRequest,
   setReviewWindowBaseline,
+  snapshotOfReviewBaseline,
 } from "../src/state";
 import { duplicateReviewerSelectionsFor, materializeReviewConfig, normalizeConfig, resolveReviewers, unresolvedReviewerSelectionsFor } from "../src/config";
 import { reviewerSelectionDigest } from "../src/session-state";
@@ -273,7 +276,9 @@ test("beginAgentRun preserves the review-window baseline and evidence across con
   });
 
   assert.equal(beginAgentRun(state), "continuation");
-  assert.equal(state.reviewWindow!.baseline!.files.size, 0);
+  const preserved = snapshotOfReviewBaseline(state.reviewWindow!.baseline);
+  assert.ok(preserved, "the review-window baseline must survive a continuation");
+  assert.equal(preserved.files.size, 0);
   assert.equal(state.reviewWindow!.evidence.events.length, 1);
   assert.equal(state.reviewWindow!.evidence.events[0]?.summary, "edit before interrupt");
 });
@@ -873,4 +878,94 @@ test("correction attempt count survives correction-cap budget resets", () => {
   state.reviewWindow!.correctionCycles = 0;
 
   assert.equal(getCorrectionAttemptCount(state.reviewWindow), 2);
+});
+
+// ── Typed review baselines (issue #193 slice A) ─────────────────────────────
+//
+// Baselines are discriminated: a window holds either a completed workspace
+// snapshot or a Git checkpoint descriptor. Snapshot inputs wrap at the state
+// boundary; consumers that require a snapshot narrow explicitly and fail
+// closed on the Git variant instead of comparing against a synthetic one.
+
+const typedTestSnapshot = {
+  cwd: "/tmp/project",
+  capturedAt: "2026-08-19T00:00:00.000Z",
+  files: new Map<string, import("../src/capture").FileSnapshot>([["a.txt", {
+    relativePath: "a.txt",
+    absolutePath: "/tmp/project/a.txt",
+    exists: true,
+    size: 4,
+    mtimeMs: 0,
+    sha256: null,
+    isBinary: false,
+    content: "one\n",
+  }]]),
+  omissions: [],
+  omissionsTruncated: false,
+};
+
+const typedTestDescriptor: import("../src/git-checkpoint").GitCheckpointDescriptor = {
+  format: "prg-git-checkpoint-descriptor/v1",
+  windowId: "win-typed",
+  armId: "arm-0001",
+  gitDir: "/tmp/project/.git",
+  base: "a".repeat(40),
+  ref: "refs/pi-review-gate/checkpoints/win-typed/base",
+  objectFormat: "sha1" as const,
+  digest: "b".repeat(64),
+};
+
+test("setReviewWindowBaseline wraps the snapshot and shares it with an unbaselined active exchange", () => {
+  const state = createState();
+  beginAgentRun(state);
+  setReviewWindowBaseline(state, typedTestSnapshot);
+
+  assert.equal(state.reviewWindow!.baseline?.kind, "snapshot");
+  assert.strictEqual(snapshotOfReviewBaseline(state.reviewWindow!.baseline), typedTestSnapshot);
+  // The active exchange was unbaselined: it receives the same snapshot.
+  assert.strictEqual(snapshotOfReviewBaseline(state.reviewWindow!.activeExchange?.baseline), typedTestSnapshot);
+
+  // A second call must not replace an existing baseline.
+  const other = { ...typedTestSnapshot, capturedAt: "2026-08-19T00:01:00.000Z" };
+  setReviewWindowBaseline(state, other);
+  assert.strictEqual(snapshotOfReviewBaseline(state.reviewWindow!.baseline), typedTestSnapshot);
+});
+
+test("snapshotOfReviewBaseline narrows snapshots and fails closed on Git baselines", () => {
+  assert.equal(snapshotOfReviewBaseline(undefined), undefined);
+
+  const state = createState();
+  beginAgentRun(state);
+  setReviewWindowBaseline(state, typedTestSnapshot);
+  assert.strictEqual(snapshotOfReviewBaseline(state.reviewWindow!.baseline), typedTestSnapshot);
+
+  state.reviewWindow!.baseline = { kind: "git", descriptor: typedTestDescriptor, cwd: "/tmp/project", capturedAt: "2026-08-19T00:00:00.000Z" };
+  assert.throws(
+    () => snapshotOfReviewBaseline(state.reviewWindow!.baseline),
+    /Git checkpoint baseline.*refusing to fall back to a synthetic snapshot/,
+  );
+});
+
+test("snapshot-input mutation helpers refuse to layer over a Git baseline", () => {
+  const state = createState();
+  beginAgentRun(state);
+  state.reviewWindow!.baseline = { kind: "git", descriptor: typedTestDescriptor, cwd: "/tmp/project", capturedAt: "2026-08-19T00:00:00.000Z" };
+
+  assert.throws(
+    () => setReviewWindowBaseline(state, typedTestSnapshot),
+    /setReviewWindowBaseline.*refusing to mix baseline kinds/,
+  );
+  assert.throws(
+    () => checkpointReviewWindow(state, typedTestSnapshot),
+    /checkpointReviewWindow.*refusing to mix baseline kinds/,
+  );
+
+  // The guard also covers a Git baseline held only by the active exchange.
+  const state2 = createState();
+  beginAgentRun(state2);
+  state2.reviewWindow!.activeExchange!.baseline = { kind: "git", descriptor: typedTestDescriptor, cwd: "/tmp/project", capturedAt: "2026-08-19T00:00:00.000Z" };
+  assert.throws(
+    () => armReviewResponseExchange(state2, typedTestSnapshot),
+    /armReviewResponseExchange.*refusing to mix baseline kinds/,
+  );
 });

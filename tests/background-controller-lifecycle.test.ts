@@ -10,7 +10,7 @@ import {
 import type { BackgroundExecutionGroup, BackgroundStateTransition, BackgroundTaskRecord } from "../src/execution/background-controller";
 import { normalizeConfig } from "../src/config";
 import { compareSnapshots, createWorkspaceSnapshot } from "../src/capture";
-import { activeExchangeBaseline, beginAgentRun, rememberUserRequest, setReviewWindowBaseline, createState } from "../src/state";
+import { activeExchangeBaseline, beginAgentRun, rememberUserRequest, setReviewWindowBaseline, snapshotOfReviewBaseline, createState } from "../src/state";
 import { transitionTaskState } from "../src/execution/task-state";
 import {
   awaitBounded,
@@ -217,7 +217,8 @@ workerResources: { "default": { selection: { source: "external", id: "checkpoint
     ]);
     await waitFor(() => controller!.inspect(started.executionId).tasks.every((task) => task.state === "landed"), 30_000);
 
-    const checkpoint = activeExchangeBaseline(state);
+    // The lifecycle tests exercise snapshot baselines only: narrow explicitly.
+    const checkpoint = snapshotOfReviewBaseline(activeExchangeBaseline(state));
     assert.ok(checkpoint);
     const current = await createWorkspaceSnapshot(root, {
       maxFileBytes: config.maxFileBytes,

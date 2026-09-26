@@ -12,6 +12,7 @@ import {
   markCappedFeedbackSent,
   recordAcceptedReviewerQuestion,
   recordReviewerFeedbackAndArmExchange,
+  snapshotOfReviewBaseline,
   type ReviewGateState,
 } from "./state";
 import { runAskReviewer, runReview } from "./review";
@@ -163,6 +164,16 @@ export function registerCommands(input: RegisterCommandsInput): void {
         await sendCommandNotice(ctx, "review gate: no active review window with a baseline");
         return;
       }
+      // A Git checkpoint baseline is not yet reviewable through the snapshot
+      // pipeline: narrow explicitly and fail closed with a clear error before
+      // any review resources are started.
+      const before = snapshotOfReviewBaseline(window.baseline);
+      if (!before) {
+        // Unreachable while the guard above holds; kept so the narrowing stays
+        // total if the baseline shape ever changes.
+        await sendCommandNotice(ctx, "review gate: no active review window with a baseline");
+        return;
+      }
       const reviewConfig = window.reviewConfig ?? currentConfig();
       if (!automaticReviewEnabled(reviewConfig)) {
         await sendCommandNotice(ctx, input.config.enabled
@@ -188,7 +199,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
         output = await runReview({
           cwd: input.cwd(),
           request: buildRequestContext(input.state) || "Manual /review-now request",
-          before: window.baseline,
+          before,
           config: reviewConfig,
           evidence: window.evidence,
           correctionAttemptCount: getCorrectionAttemptCount(window),
@@ -348,7 +359,9 @@ export function registerCommands(input: RegisterCommandsInput): void {
           cwd: input.cwd(),
           question,
           request: buildRequestContext(input.state, contextWindow),
-          before: contextWindow?.baseline,
+          // A Git checkpoint baseline is not yet answerable through the
+          // snapshot pipeline: narrow explicitly and fail closed.
+          before: snapshotOfReviewBaseline(contextWindow?.baseline),
           config: reviewConfig,
           evidence: contextWindow?.evidence,
           correctionAttemptCount: getCorrectionAttemptCount(contextWindow),

@@ -13,7 +13,7 @@ import {
 } from "../config";
 import { expandHomePath } from "../apply-patch/paths";
 import { createWorkspaceSnapshot, type FileSnapshot, type WorkspaceSnapshot } from "../capture";
-import { activeExchangeBaseline, checkpointReviewWindow, type ReviewGateState } from "../state";
+import { activeExchangeBaseline, checkpointReviewWindow, snapshotOfReviewBaseline, type ReviewGateState } from "../state";
 import { configDigest, type ExecutionAssociationsSnapshot } from "../session-state";
 import { materializeLandingConflicts } from "./conflict-materialization";
 import { ConflictGateStore, cloneConflictGate, type ConflictGate as BackgroundConflictGate } from "./conflict-gate-store";
@@ -2071,7 +2071,10 @@ export class BackgroundExecutionController {
       rootWaveId: lineage.rootWaveId, continuationGeneration: generation,
     } : originalCapture;
     const reviewWindowId = this.input.state.reviewWindow?.id;
-    const parentBaseline = activeExchangeBaseline(this.input.state);
+    // A Git checkpoint baseline is not yet usable by delegated landing
+    // bookkeeping: narrow explicitly and fail closed instead of comparing
+    // against a synthetic snapshot.
+    const parentBaseline = snapshotOfReviewBaseline(activeExchangeBaseline(this.input.state));
     const preTaskSnapshot = parentBaseline ? await createWorkspaceSnapshot(group.cwd, {
       maxFileBytes: this.input.config.maxFileBytes,
       maxSnapshotBytes: this.input.config.maxSnapshotBytes,
@@ -2450,7 +2453,9 @@ export class BackgroundExecutionController {
     if (dirty.length > 0) {
       throw new Error(`Conflict markers remain in: ${dirty.join("; ")}`);
     }
-    const baseline = activeExchangeBaseline(this.input.state);
+    // A Git checkpoint baseline is not yet usable by delegated landing
+    // bookkeeping: narrow explicitly and fail closed.
+    const baseline = snapshotOfReviewBaseline(activeExchangeBaseline(this.input.state));
     const clearedPaths: string[] = [];
     for (const { key, gate, release } of entries) {
       const group = this.groups.get(gate.executionId);
@@ -3230,7 +3235,9 @@ export class BackgroundExecutionController {
     lease: ExecutorPoolLease,
   ): Promise<void> {
     const reviewWindowId = this.input.state.reviewWindow?.id;
-    const parentBaseline = activeExchangeBaseline(this.input.state);
+    // A Git checkpoint baseline is not yet usable by delegated execution:
+    // narrow explicitly and fail closed.
+    const parentBaseline = snapshotOfReviewBaseline(activeExchangeBaseline(this.input.state));
     const preTaskSnapshot = parentBaseline ? await createWorkspaceSnapshot(group.cwd, {
       maxFileBytes: this.input.config.maxFileBytes,
       maxSnapshotBytes: this.input.config.maxSnapshotBytes,
@@ -3393,7 +3400,9 @@ export class BackgroundExecutionController {
     lease: ExecutorPoolLease,
   ): Promise<void> {
     const reviewWindowId = this.input.state.reviewWindow?.id;
-    const parentBaseline = activeExchangeBaseline(this.input.state);
+    // A Git checkpoint baseline is not yet usable by delegated execution:
+    // narrow explicitly and fail closed.
+    const parentBaseline = snapshotOfReviewBaseline(activeExchangeBaseline(this.input.state));
     const preTaskSnapshot = parentBaseline ? await createWorkspaceSnapshot(group.cwd, {
       maxFileBytes: this.input.config.maxFileBytes,
       maxSnapshotBytes: this.input.config.maxSnapshotBytes,
@@ -3786,7 +3795,9 @@ export class BackgroundExecutionController {
       reuseUnchangedFrom: before,
     });
     if (this.input.state.reviewWindow?.id !== reviewWindowId) return;
-    const accumulatedBaseline = activeExchangeBaseline(this.input.state);
+    // A Git checkpoint baseline is not yet usable by delegated landing
+    // bookkeeping: narrow explicitly and fail closed.
+    const accumulatedBaseline = snapshotOfReviewBaseline(activeExchangeBaseline(this.input.state));
     if (!accumulatedBaseline) return;
     checkpointReviewWindow(this.input.state, selectiveCheckpoint(accumulatedBaseline, taskBaseline, before, after, landedPaths, sourceRoot));
   }

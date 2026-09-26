@@ -14,7 +14,7 @@ import { ClaudeCliAdapter } from "./adapters/claude-cli";
 import { PiModelAdapter } from "./adapters/pi-model";
 import type { ModelAdapter, ReviewerSession } from "./adapters/types";
 import type { TokenUsage } from "./usage";
-import { completeActiveExchange, hasUnresolvedReview, type ReviewWindow } from "./state";
+import { completeActiveExchange, hasUnresolvedReview, snapshotOfReviewBaseline, type ReviewWindow } from "./state";
 import { aggregateReviewDisposition } from "./review-report";
 
 export interface ReviewRunInput {
@@ -157,9 +157,22 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
   }
   const correctionAttemptCount = input.correctionAttemptCount ?? 0;
   const guidanceEscalation = buildGuidanceEscalation(input.config, correctionAttemptCount);
+  // #193: the settle capture reuses verified facts from the newest completed
+  // same-root baseline this run already holds — the active exchange's
+  // baseline (the prior settle's reviewed snapshot) when present, otherwise
+  // the review's own `before` baseline. Only completed captures are ever
+  // passed; the helper still enumerates and stats every current path,
+  // re-verifies each reused record against the live entry without following
+  // symlinks, and recomputes every retain/omit decision against the current
+  // limits, so paths changed between that baseline and settle are fully
+  // inspected exactly as a fresh capture would inspect them. A Git
+  // checkpoint baseline is not yet reviewable here: the narrowing throws a
+  // clear fail-closed error instead of comparing against a synthetic snapshot.
+  const exchangeBefore = snapshotOfReviewBaseline(input.window?.activeExchange?.baseline);
   const after = await createWorkspaceSnapshot(input.cwd, {
     maxFileBytes: input.config.maxFileBytes,
     maxSnapshotBytes: input.config.maxSnapshotBytes,
+    reuseUnchangedFrom: exchangeBefore ?? input.before,
   });
   const workspaceChanges = compareSnapshots(input.before, after);
   const evidenceChanges = input.evidence
@@ -174,7 +187,6 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
   // When exactChange is present with nonempty changedPaths, treat as reviewable
   // even if workspace snapshots show no content hash changes (e.g., mode-only or binary changes).
   const hasExactChanges = input.exactChange !== undefined && input.exactChange.changedPaths.length > 0;
-  const exchangeBefore = input.window?.activeExchange?.baseline;
   const exchangeSequence = input.window?.activeExchange?.sequence;
   const reviewResponseMode = input.window?.activeExchange?.reviewResponseMode;
   const exchangeWorkspaceChanges = exchangeBefore ? compareSnapshots(exchangeBefore, after) : workspaceChanges;
@@ -346,11 +358,20 @@ export async function collectPausedReviewExchange(input: PausedExchangeInput): P
   if (!active) {
     return;
   }
+  // #193: the paused-exchange settle capture reuses verified facts from the
+  // exchange's own completed baseline when one exists; unchanged entries are
+  // re-verified against the live entry and every retain/omit decision is
+  // recomputed, so changes made after the baseline are fully inspected
+  // exactly as a fresh capture would inspect them. A Git checkpoint baseline
+  // is not yet settleable here: the narrowing throws fail-closed instead of
+  // comparing against a synthetic snapshot.
+  const exchangeBaseline = snapshotOfReviewBaseline(active.baseline);
   const after = await createWorkspaceSnapshot(input.cwd, {
     maxFileBytes: input.config.maxFileBytes,
     maxSnapshotBytes: input.config.maxSnapshotBytes,
+    reuseUnchangedFrom: exchangeBaseline,
   });
-  const workspaceChanges = active.baseline ? compareSnapshots(active.baseline, after) : [];
+  const workspaceChanges = exchangeBaseline ? compareSnapshots(exchangeBaseline, after) : [];
   const evidenceChanges = input.evidence
     ? await collectEvidenceChanges(input.evidence, input.cwd, {
       maxFileBytes: input.config.maxFileBytes,
@@ -1017,9 +1038,15 @@ async function collectCurrentChanges(input: {
   if (!input.before) {
     return { changes: [], workspaceChanges: [], evidenceChanges: [], sideEffectChanges: [], snapshotOmissions: [], snapshotOmissionsTruncated: false };
   }
+  // #193: the reviewer-question settle capture reuses verified facts from
+  // the provided completed `before` baseline; unchanged entries are
+  // re-verified against the live entry and every retain/omit decision is
+  // recomputed, so changes made after the baseline are fully inspected
+  // exactly as a fresh capture would inspect them.
   const after = await createWorkspaceSnapshot(input.cwd, {
     maxFileBytes: input.config.maxFileBytes,
     maxSnapshotBytes: input.config.maxSnapshotBytes,
+    reuseUnchangedFrom: input.before,
   });
   const workspaceChanges = compareSnapshots(input.before, after);
   const evidenceChanges = input.evidence

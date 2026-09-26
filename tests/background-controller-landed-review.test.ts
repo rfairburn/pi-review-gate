@@ -31,7 +31,7 @@ import {
 } from "../src/execution/background-controller";
 import { inspectOperation } from "../src/execution/operation-actions";
 import { readOperationRecord, writeOperationRecord } from "../src/execution/operation-record";
-import { activeExchangeBaseline, beginAgentRun, createState, rememberUserRequest, setReviewWindowBaseline, type ReviewGateState } from "../src/state";
+import { activeExchangeBaseline, beginAgentRun, createState, rememberUserRequest, setReviewWindowBaseline, snapshotOfReviewBaseline, type ReviewGateState } from "../src/state";
 import { initGitRepo, waitFor, waitForAsync } from "./helpers/background-controller-fixtures";
 
 async function waitUntil(predicate: () => boolean | Promise<boolean>, what: string): Promise<void> {
@@ -135,7 +135,8 @@ async function windowDiffPaths(
   root: string,
   config: ReviewGateConfig,
 ): Promise<string[]> {
-  const windowBaseline = activeExchangeBaseline(state);
+  // These tests exercise snapshot baselines only: narrow explicitly.
+  const windowBaseline = snapshotOfReviewBaseline(activeExchangeBaseline(state));
   assert.ok(windowBaseline, "the review window must keep an active-exchange baseline");
   const current = await createWorkspaceSnapshot(root, {
     maxFileBytes: config.maxFileBytes,
@@ -209,7 +210,7 @@ test("unreviewed landed diffs stay in the primary review window across ordinary 
     // diff inside the ordinary review-window baseline.
     const landedTask = controller.inspect(started.executionId, taskId).tasks[0]!;
     assert.ok((landedTask.activity ?? []).every((event) => !/review/i.test(event.phase)), "landing must not trigger a review phase");
-    assert.equal(activeExchangeBaseline(state), baseline, "the review-window baseline must be untouched while the unreviewed diff stays in the window");
+    assert.equal(snapshotOfReviewBaseline(activeExchangeBaseline(state)), baseline, "the review-window baseline must be untouched while the unreviewed diff stays in the window");
     assert.deepEqual(
       await windowDiffPaths(state, root, config),
       ["first.txt", "parent.txt"],
@@ -404,7 +405,7 @@ test("force-merge salvage lands into the review window while the policy is on an
       (landed.tasks[0]?.activity ?? []).some((event) => /subtask-review status that could not be established/.test(event.message)),
       "an unestablishable force-merge outcome must report its uncertain review status while keeping the diff in the window",
     );
-    assert.equal(activeExchangeBaseline(state), baseline, "the review-window baseline must stay untouched by the unreviewed force-merge");
+    assert.equal(snapshotOfReviewBaseline(activeExchangeBaseline(state)), baseline, "the review-window baseline must stay untouched by the unreviewed force-merge");
     assert.deepEqual(
       await windowDiffPaths(state, root, config),
       ["draft.txt", "parent.txt"],
@@ -508,7 +509,7 @@ test("explicit salvage force-merge keeps the by-construction-unreviewed diff in 
       "salvage must establish unreviewed status by construction instead of reporting uncertainty",
     );
     assert.equal(await readFile(join(root, "draft.txt"), "utf8"), "salvage me\n");
-    assert.equal(activeExchangeBaseline(state), baseline, "the review-window baseline must stay untouched by the unreviewed salvage");
+    assert.equal(snapshotOfReviewBaseline(activeExchangeBaseline(state)), baseline, "the review-window baseline must stay untouched by the unreviewed salvage");
     assert.deepEqual(
       await windowDiffPaths(state, root, config),
       ["draft.txt", "parent.txt"],
@@ -570,7 +571,7 @@ test("materialized conflicts stay out of resolved-work review, and the cleared l
     const landedTask = controller.inspect(started.executionId).tasks[0]!;
     assert.equal(landedTask.state, "landed");
     assert.equal(controller.reviewReadiness().length, 0, "cleared conflicts must unblock review readiness");
-    assert.equal(activeExchangeBaseline(state), baseline, "the review-window baseline must stay untouched while the unreviewed conflict evidence stays in the window");
+    assert.equal(snapshotOfReviewBaseline(activeExchangeBaseline(state)), baseline, "the review-window baseline must stay untouched while the unreviewed conflict evidence stays in the window");
     assert.deepEqual(
       await windowDiffPaths(state, root, config),
       ["applied.txt", "parent.txt", "shared.txt"],

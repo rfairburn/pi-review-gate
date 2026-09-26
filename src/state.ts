@@ -1,5 +1,6 @@
 import type { ChangedFile, WorkspaceSnapshot } from "./capture";
 import type { CorrectionFeedbackMarker } from "./correction-feedback";
+import type { GitCheckpointDescriptor } from "./git-checkpoint";
 import {
   createEvidenceState,
   recordAcceptedReviewerQuestion as recordAcceptedQuestionEvidence,
@@ -29,6 +30,43 @@ export type ReviewFeedbackDisposition =
   | "sent_review_error"
   | "held_then_sent";
 
+/**
+ * Typed review baseline. A window (and its active exchange) is reviewed
+ * against either a completed workspace snapshot or a durable Git checkpoint.
+ * The two kinds are never mixed inside one window: every mutation helper and
+ * the session-state store enforce the same-kind invariant fail-closed.
+ *
+ * Git capture is not activated yet: current production paths only ever wrap
+ * snapshots, and consumers that require a snapshot narrow explicitly (see
+ * `snapshotOfReviewBaseline`) instead of comparing against a synthetic one.
+ */
+export type ReviewBaseline =
+  | { kind: "snapshot"; snapshot: WorkspaceSnapshot }
+  | { kind: "git"; descriptor: GitCheckpointDescriptor; cwd: string; capturedAt: string };
+
+/** Wrap a completed workspace capture as the snapshot variant of a typed review baseline. */
+export function snapshotReviewBaseline(snapshot: WorkspaceSnapshot): ReviewBaseline {
+  return { kind: "snapshot", snapshot };
+}
+
+/**
+ * Narrow a typed review baseline to its workspace snapshot for consumers that
+ * require a snapshot (review settlement, delegated execution bookkeeping).
+ * A Git checkpoint baseline is not yet wired into those consumers: rather than
+ * comparing against an empty pseudo-snapshot or silently dropping the Git
+ * state, this throws a clear fail-closed error until the Git review
+ * integration lands.
+ */
+export function snapshotOfReviewBaseline(baseline: ReviewBaseline | undefined): WorkspaceSnapshot | undefined {
+  if (baseline === undefined) return undefined;
+  if (baseline.kind !== "snapshot") {
+    throw new Error(
+      "review gate: this consumer requires a workspace-snapshot baseline but the review window holds a Git checkpoint baseline; Git review is not wired yet, refusing to fall back to a synthetic snapshot",
+    );
+  }
+  return baseline.snapshot;
+}
+
 export interface ReviewWindow {
   id: number;
   startedAt: string;
@@ -36,7 +74,7 @@ export interface ReviewWindow {
   correctionCycles: number;
   lastCappedFollowUp?: string;
   lastCorrectionFeedback?: CorrectionFeedbackMarker;
-  baseline?: WorkspaceSnapshot;
+  baseline?: ReviewBaseline;
   evidence: EvidenceState;
   reviewHistory: ReviewFeedbackContext[];
   exchanges: ReviewExchangeContext[];
@@ -53,7 +91,8 @@ export interface ReviewWindow {
 export interface ActiveReviewExchange {
   sequence: number;
   startedAt: string;
-  baseline?: WorkspaceSnapshot;
+  /** Same-kind invariant: when both this and the window baseline are set, they hold the same baseline kind. */
+  baseline?: ReviewBaseline;
   evidenceEventStart: number;
   assistantSummaryStart: number;
   requestHistoryStart: number;
@@ -172,11 +211,27 @@ export function beginAgentRun(state: ReviewGateState): "new" | "continuation" {
   return window.baseline ? "continuation" : "new";
 }
 
+/**
+ * Same-kind invariant guard for snapshot-input mutation helpers: a window
+ * that already holds a Git checkpoint baseline (restored from a v3 sidecar)
+ * must never be layered with a workspace-snapshot baseline — mixing kinds in
+ * one window would make the next restore fail closed. Until the Git review
+ * integration lands, refuse explicitly instead of guessing.
+ */
+function assertNoGitBaselineConflict(window: ReviewWindow, context: string): void {
+  if (window.baseline?.kind === "git" || window.activeExchange?.baseline?.kind === "git") {
+    throw new Error(
+      `review gate: ${context}: the review window already holds a Git checkpoint baseline; refusing to mix baseline kinds until Git review integration lands`,
+    );
+  }
+}
+
 export function setReviewWindowBaseline(state: ReviewGateState, baseline: WorkspaceSnapshot): void {
   const window = state.reviewWindow ?? openReviewWindow(state);
-  window.baseline ??= baseline;
+  assertNoGitBaselineConflict(window, "setReviewWindowBaseline");
+  window.baseline ??= snapshotReviewBaseline(baseline);
   if (window.activeExchange && !window.activeExchange.baseline) {
-    window.activeExchange.baseline = baseline;
+    window.activeExchange.baseline = snapshotReviewBaseline(baseline);
   }
 }
 
@@ -187,7 +242,8 @@ export function armReviewResponseExchange(state: ReviewGateState, reviewedSnapsh
   if (!active || !window) {
     return;
   }
-  active.baseline ??= reviewedSnapshot;
+  assertNoGitBaselineConflict(window, "armReviewResponseExchange");
+  active.baseline ??= snapshotReviewBaseline(reviewedSnapshot);
   const feedback = [...window.reviewHistory].reverse().find((item) => reviewResponseMode(item.disposition) !== undefined);
   if (feedback) {
     active.causedByReviewSequence = feedback.sequence;
@@ -200,7 +256,7 @@ export function activeExchangeHasBaseline(state: ReviewGateState): boolean {
   return Boolean(state.reviewWindow?.activeExchange?.baseline);
 }
 
-export function activeExchangeBaseline(state: ReviewGateState): WorkspaceSnapshot | undefined {
+export function activeExchangeBaseline(state: ReviewGateState): ReviewBaseline | undefined {
   return state.reviewWindow?.activeExchange?.baseline;
 }
 
@@ -314,9 +370,10 @@ export function checkpointReviewWindow(state: ReviewGateState, snapshot: Workspa
   if (!window) {
     return;
   }
-  window.baseline = snapshot;
+  assertNoGitBaselineConflict(window, "checkpointReviewWindow");
+  window.baseline = snapshotReviewBaseline(snapshot);
   if (window.activeExchange) {
-    window.activeExchange.baseline = snapshot;
+    window.activeExchange.baseline = snapshotReviewBaseline(snapshot);
     window.activeExchange.evidenceEventStart = window.evidence.events.length;
     window.activeExchange.assistantSummaryStart = window.evidence.finalAssistantSummaries.length;
     window.activeExchange.requestHistoryStart = window.requestHistory.length;

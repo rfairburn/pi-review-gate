@@ -163,13 +163,11 @@ test("executor role registers web tools and background shell without orchestrati
     for (const tool of executionToolNames) {
       assert.equal(captured.tools.has(tool), false, `executor child must not register ${tool}`);
     }
-    // Only the background shell's own lifecycle hooks (its session hooks plus
-    // agent_start/agent_settled, which gate nonurgent wake coalescing) and the
-    // #84 stream-failure diagnostic hooks (message_end, context,
-    // tool_execution_start, agent_end, session_start, session_tree, and its
-    // own session_shutdown — ShellStart failure diagnostics need these) may be
-    // present. The review machinery (before_agent_start, input, tool_call,
-    // tool_result) and command surface must stay out of executor children.
+    // Executor children keep the native duplicate preflight hooks (message_end,
+    // tool_call, tool_execution_start, tool_result, and session resets) plus
+    // the background-shell and #84 diagnostic lifecycle hooks. Orchestrator
+    // review machinery (before_agent_start, input) and its command surface
+    // must stay out of executor children.
     assert.deepEqual([...captured.hooks.keys()].sort(), [
       "agent_end",
       "agent_settled",
@@ -179,7 +177,9 @@ test("executor role registers web tools and background shell without orchestrati
       "session_shutdown",
       "session_start",
       "session_tree",
+      "tool_call",
       "tool_execution_start",
+      "tool_result",
     ]);
     // agent_end is the only name the #84 bridge shares with the orchestrator's
     // review machinery; pin its count so provenance stays exact (web tools and
@@ -256,9 +256,9 @@ test("executor role defers to the durable initial subset and activates authorize
       assert.ok(sessionTree, "the #84 bridge must register session_tree");
       const bridgeShutdown = shutdownHandlers.find((handler) => sequence(handler) === sequence(sessionTree!) + 1);
       assert.ok(bridgeShutdown, "the bridge's session_shutdown must directly follow its session_tree registration");
-      const settlementShutdown = sequence(shutdownHandlers[2]!);
-      assert.ok(settlementShutdown < sequence(bridgeShutdown!), "diagnostic bridge must register after the settlement retirement shutdown");
-      assert.ok(sequence(shutdownHandlers[1]!) < settlementShutdown, "settlement retirement must register after the background shell reaper");
+      assert.ok(shutdownHandlers.every((handler) =>
+        handler === bridgeShutdown || sequence(handler) < sequence(bridgeShutdown!),
+      ), "diagnostic bridge must be registered after web, shell, and settlement shutdown handlers");
       const latestSequence = Math.max(...[...hooks.values()].flat().map(sequence));
       assert.equal(sequence(bridgeShutdown!), latestSequence, "the diagnostic bridge is the last thing the full executor branch registers");
     }

@@ -43,6 +43,7 @@ import { assertScheduledImagesPresent, managedScheduledImageRoot } from "./setti
 import { registerStreamFailureReporting } from "./stream-failure-report";
 import { ExecutionToolManager } from "./execution/tool";
 import { combineTokenUsage, extractPiUsageFromMessages, formatTokenUsage, type TokenUsage } from "./usage";
+import { NativeToolCallPreflight } from "./tool-call-preflight";
 import { buildReviewAuthorizationMessage, createReviewTransmissionMessage, deliverReviewTransmission, hasReviewDeliveryReceipt, type ReviewTransmissionAction } from "./transmission";
 import { dispatchModelDelivery, queueModelDelivery } from "./durable-delivery";
 import { replaceReviewGateState, sessionPersistenceIdentity, SessionStateCwdMismatchError, SessionStateConversationMismatchError, SessionStateIntegrityError, SessionStateInvalidStateError, SessionStateMissingSelectionDigestError, SessionStateParseError, SessionStateStore, SessionStateUnsupportedFormatError, type PendingDeliverySummary } from "./session-state";
@@ -115,6 +116,23 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     return;
   }
 
+  // Install the native Pi preflight before registering any extension tools.
+  // The native batch event and execution lifecycle seams are required; without
+  // them the extension must not expose tools with only partial duplicate
+  // coverage. Runtime controllers are attached as each role initializes.
+  let backgroundShellController: ReturnType<typeof registerBackgroundShell> | undefined;
+  let executionTools: ExecutionToolManager | undefined;
+  const nativeToolPreflight = new NativeToolCallPreflight({
+    shellStartLiveness: (fingerprint) => backgroundShellController?.startLiveness(fingerprint) ?? { state: "unknown" },
+    subtaskStartLiveness: (fingerprint) => executionTools?.startLiveness(fingerprint) ?? { state: "unknown" },
+  });
+  const lifecycleHooksReady = nativeToolPreflight.registerLifecycleHooks(pi);
+  let toolCallObserver: (...args: unknown[]) => unknown = (...args) => nativeToolPreflight.preflight(args);
+  const preflightHookReady = nativeToolPreflight.registerToolCallHook(pi, (...args) => toolCallObserver(...args));
+  if (!lifecycleHooksReady || !preflightHookReady) {
+    throw new Error("review gate: native duplicate-call preflight requires Pi message_end, tool_call, tool_execution_start, tool_result, and session_tree hooks; no extension tools were registered");
+  }
+
   const webTools = dependencies.webTools ?? (canRegisterWebTools(pi) ? new WebToolManager(pi, loaded.config) : undefined);
   webTools?.register();
 
@@ -139,9 +157,18 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   }
 
   if (executorRole) {
-    if (canRegisterBackgroundShell(pi)) registerBackgroundShell(pi);
+    if (canRegisterBackgroundShell(pi)) {
+      backgroundShellController = registerBackgroundShell(
+        pi,
+        (toolCallId, toolName) => nativeToolPreflight.admittedSubmittedFingerprint(toolCallId, toolName),
+      );
+    }
     const deferredTools = new DeferredToolManager(pi);
     if (!deferredTools.register()) {
+      // This reduced executor has no bootstrap hooks below, so reset the
+      // preflight alongside its existing session lifecycle handlers.
+      registerHook(pi, "session_start", () => nativeToolPreflight.reset());
+      registerHook(pi, "session_shutdown", () => nativeToolPreflight.reset());
       // #84 diagnostics stay available even on this reduced executor host:
       // register the bridge after the background shell's own lifecycle hooks
       // so its shutdown reset can never be dispatched ahead of the reaper.
@@ -151,6 +178,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     const serializedToolCatalog = process.env[EXECUTOR_TOOL_CATALOG_ENV];
     const executorToolCatalog = executorBootstrapToolCatalog(serializedToolCatalog);
     registerHook(pi, "session_start", (...args) => {
+      nativeToolPreflight.reset();
       const context = extractContext(args);
       const sessionIdentity = typeof context === "object" && context !== null
         ? (context as { sessionManager?: unknown }).sessionManager
@@ -178,12 +206,13 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     // Bootstrap secrets are intentionally erased, not persisted across reload.
     // Pi logs most hook errors and continues: block tools explicitly, and never
     // publish a replacement receipt or reset a generation under the old identity.
-    registerHook(pi, "tool_call", () => {
+    toolCallObserver = (...args) => {
       const failure = acknowledgementFailure();
       if (failure) return { block: true, reason: failure.message };
-      return undefined;
-    });
+      return nativeToolPreflight.preflight(args);
+    };
     registerHook(pi, "session_shutdown", async () => {
+      nativeToolPreflight.reset();
       terminal = true;
       // Retire acknowledgements even if terminal browser cleanup fails. Wait
       // for any publication already in flight so it cannot recreate the file.
@@ -222,8 +251,11 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   // permanently appends orchestration instructions.
   const operatingModeSegments = loadOperatingModeSegments(join(__dirname, "..", "..", "scripts"));
 
-  const backgroundShellController = canRegisterBackgroundShell(pi)
-    ? registerBackgroundShell(pi)
+  backgroundShellController = canRegisterBackgroundShell(pi)
+    ? registerBackgroundShell(
+      pi,
+      (toolCallId, toolName) => nativeToolPreflight.admittedSubmittedFingerprint(toolCallId, toolName),
+    )
     : undefined;
 
   // Register the compact loader before session_start. Authorization capture
@@ -267,11 +299,12 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   const orchestratorBackgroundReadiness = new BackgroundProcessReadiness();
   const reviewerQuestionPauseWaiters = new Set<(error?: Error) => void>();
   const sessionAbortController = new AbortController();
-  const executionTools = new ExecutionToolManager({
+  executionTools = new ExecutionToolManager({
     pi,
     config,
     state,
     cwd: () => currentCwd,
+    submittedFingerprintFor: (toolCallId, toolName) => nativeToolPreflight.admittedSubmittedFingerprint(toolCallId, toolName),
     authorizedTools: () => deferredTools.authorizedToolNames(),
     notify: (message) => sendNotice(pi, message),
     onAssociationsChanged: () => persistSessionState(),
@@ -498,6 +531,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   unsubscribeBackgroundLifecycle = backgroundShellController?.subscribe(handleBackgroundLifecycle);
 
   registerHook(pi, "session_shutdown", async (...args) => {
+    nativeToolPreflight.reset();
     sessionActive = false;
     setStatus(extractContext(args) ?? pi, "review-gate", undefined);
     setStatus(extractContext(args) ?? pi, "review-gate-mode", undefined);
@@ -535,6 +569,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   });
 
   registerHook(pi, "session_start", async (...args) => {
+    nativeToolPreflight.reset();
     sessionActive = true;
     currentCwd = extractCwd(args, currentCwd);
     backgroundMonitorGeneration += 1;
@@ -703,25 +738,30 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     return executionPromptInjection(executionTools.criticalPrompt(), authorizedToolInventory, operatingModeSystemPrompt(args));
   });
 
-  registerHook(pi, "tool_call", async (...args) => {
+  toolCallObserver = async (...args) => {
+    const decision = nativeToolPreflight.preflight(args);
     const name = extractToolName(args);
     const toolArgs = extractToolArgs(args);
     const window = state.reviewWindow;
-    if (!window || !shouldRecordToolCallEvidence(name)) {
-      return;
+    if (window && shouldRecordToolCallEvidence(name)) {
+      try {
+        await trackEvidenceCapture(recordToolCallEvidence({
+          state: window.evidence,
+          cwd: currentCwd,
+          toolName: name,
+          toolInput: toolArgs,
+          snapshotOptions: {
+            maxFileBytes: config.maxFileBytes,
+            maxSnapshotBytes: config.maxSnapshotBytes,
+          },
+          exchangeSequence: window.activeExchange?.sequence,
+        }));
+      } catch (error) {
+        if (!decision) throw error;
+      }
     }
-    await trackEvidenceCapture(recordToolCallEvidence({
-      state: window.evidence,
-      cwd: currentCwd,
-      toolName: name,
-      toolInput: toolArgs,
-      snapshotOptions: {
-        maxFileBytes: config.maxFileBytes,
-        maxSnapshotBytes: config.maxSnapshotBytes,
-      },
-      exchangeSequence: window.activeExchange?.sequence,
-    }));
-  });
+    return decision;
+  };
 
   registerHook(pi, "tool_result", async (...args) => {
     // The next provider request can follow this hook immediately. Preserve

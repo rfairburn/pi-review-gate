@@ -37,6 +37,7 @@ import {
   resolveExecutorToolCatalog,
 } from "./tool-catalog";
 import { GIT_READ_TOOL_NAME } from "../git-read/tool";
+import { isToolCallFingerprint, toolCallFingerprint, type StartLiveness, type SubmittedToolCallFingerprint } from "../tool-call-fingerprint";
 
 const ACTIONS = ["start", "add", "inspect", "watch", "continue", "steer", "interrupt", "force_merge", "mark_clean"] as const;
 type Action = typeof ACTIONS[number];
@@ -158,6 +159,8 @@ interface ExecutionToolManagerInput {
   notify?: (message: string) => void | Promise<void>;
   onAssociationsChanged?: (associations: ExecutionAssociationsSnapshot) => void | Promise<void>;
   onExpandedViewChanged?: (expanded: boolean) => void | Promise<void>;
+  /** Raw submitted identity for admitted native calls; UI/command starts synthesize it locally. */
+  submittedFingerprintFor?: SubmittedToolCallFingerprint;
 }
 
 interface CommandUi {
@@ -255,17 +258,26 @@ export class ExecutionToolManager {
     workspace: string | undefined,
     options: { scheduledTaskId: string; workerResourceId?: string; reviewOverride?: ScheduledTaskReviewOverride },
   ): Promise<BackgroundInspection> {
+    const nativeInput = {
+      tasks: [definition],
+      ...(kind === "execute" ? {} : { kind }),
+      ...(workspace !== undefined ? { workspace } : {}),
+    };
     return this.controller.start(
       this.withParentTools([definition], kind),
       kind,
       workspace,
-      options,
+      { ...options, startCallFingerprint: toolCallFingerprint("SubtasksStart", nativeInput) },
     );
   }
 
   /** Issue #26: unsettled scheduled runs of one entry (overlap detection). */
   scheduledRuns(scheduledTaskId: string): ReturnType<BackgroundExecutionController["scheduledRuns"]> {
     return this.controller.scheduledRuns(scheduledTaskId);
+  }
+
+  startLiveness(fingerprint: string): StartLiveness {
+    return this.controller.startLiveness(fingerprint);
   }
 
   async shutdown(): Promise<void> {
@@ -340,9 +352,12 @@ export class ExecutionToolManager {
       // task submission stays on the model-facing SubtasksStart/SubtasksAdd
       // APIs, which are unchanged.
       await this.prepareCommandDispatch(ctx);
+      const definition = plainTextSubtaskDefinition(trimmed);
       return await this.controller.start(
-        this.withParentTools([plainTextSubtaskDefinition(trimmed)], "execute"),
+        this.withParentTools([definition], "execute"),
         "execute",
+        undefined,
+        { startCallFingerprint: toolCallFingerprint("SubtasksStart", { tasks: [definition] }) },
       );
     });
     register("subtask-steer", "Pick and steer a queued, active, or reviewing task; explicit arguments remain optional.", async (args, ctx) => {
@@ -511,10 +526,16 @@ export class ExecutionToolManager {
       task,
     });
     if (!confirmed) return undefined;
+    const nativeInput = {
+      kind,
+      tasks: [task],
+      ...(resolvedWorkspace ? { workspace: resolvedWorkspace } : {}),
+    };
     return await this.controller.start(
       this.withParentTools([task], kind),
       kind,
       resolvedWorkspace ? resolvedWorkspace : undefined,
+      { startCallFingerprint: toolCallFingerprint("SubtasksStart", nativeInput) },
     );
   }
 
@@ -726,7 +747,22 @@ export class ExecutionToolManager {
       switch (normalized.action) {
         case "start": {
           const kind = normalized.kind ?? "execute";
-          const inspection = await this.controller.start(this.withParentTools(normalized.tasks!, kind), kind, normalized.workspace);
+          const startCallFingerprint = this.input.submittedFingerprintFor
+            ? this.input.submittedFingerprintFor(toolCallId, toolName)
+            : toolCallFingerprint(toolName, params);
+          if (!isToolCallFingerprint(startCallFingerprint)) {
+            return result(
+              "SubtasksStart failed closed: the submitted native call identity could not be verified; no group or tasks were created.",
+              { diagnostic: "missing or invalid admitted native call identity" },
+              true,
+            );
+          }
+          const inspection = await this.controller.start(
+            this.withParentTools(normalized.tasks!, kind),
+            kind,
+            normalized.workspace,
+            { startCallFingerprint },
+          );
           return backgroundResult("start", inspection, false, this.input.config);
         }
         case "add": {

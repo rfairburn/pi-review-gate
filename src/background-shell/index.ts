@@ -5,6 +5,7 @@
  */
 import type { ChildProcess } from "node:child_process";
 import { expandableResult, type ToolResultRenderCallback } from "../tool-result-expansion";
+import { isToolCallFingerprint, toolCallFingerprint, type StartLiveness, type SubmittedToolCallFingerprint } from "../tool-call-fingerprint";
 import { spawnBackgroundJob } from "./shell";
 import {
   requestWindowsOwnershipStop,
@@ -100,6 +101,8 @@ export interface BackgroundShellLifecycleEvent {
 export interface BackgroundShellController {
   snapshot(): BackgroundShellLifecycleSnapshot;
   subscribe(listener: (event: BackgroundShellLifecycleEvent) => void): () => void;
+  /** Fail-closed liveness check keyed by the exact submitted ShellStart call. */
+  startLiveness(fingerprint: string): StartLiveness;
 }
 
 function objectSchema(
@@ -148,6 +151,8 @@ const STALL_TICK_MS = 30_000;
 
 interface Job {
   id: string;
+  /** Hashed exact native ShellStart name+arguments; never exposes command text. */
+  startCallFingerprint?: string;
   label: string;
   command: string;
   proc: ChildProcess;
@@ -261,6 +266,17 @@ const controller: BackgroundShellController = {
   subscribe(listener) {
     lifecycleListeners.add(listener);
     return () => lifecycleListeners.delete(listener);
+  },
+  startLiveness(fingerprint) {
+    let unknown = false;
+    for (const job of runningJobs()) {
+      if (!job.startCallFingerprint) {
+        unknown = true;
+      } else if (job.startCallFingerprint === fingerprint) {
+        return { state: "active", identity: job.id };
+      }
+    }
+    return unknown ? { state: "unknown" } : { state: "inactive" };
   },
 };
 
@@ -719,7 +735,10 @@ function statusOf(job: Job): string {
   return job.exitCode === 0 ? "done" : `failed(${job.exitCode})`;
 }
 
-export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShellController {
+export function registerBackgroundShell(
+  pi: BackgroundShellHost,
+  submittedFingerprintFor?: SubmittedToolCallFingerprint,
+): BackgroundShellController {
   pi.registerTool({
     name: "ShellStart",
     label: "ShellStart",
@@ -746,7 +765,13 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
         every_n_matches: integerSchema("Only wake on every Nth match, to throttle a chatty pattern"),
       }),
     }, ["command"]),
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
+    async execute(toolCallId, params, _signal, _onUpdate, _ctx) {
+      const startCallFingerprint = submittedFingerprintFor
+        ? submittedFingerprintFor(toolCallId, "ShellStart")
+        : toolCallFingerprint("ShellStart", params);
+      if (!isToolCallFingerprint(startCallFingerprint)) {
+        return errorResult("Error: the submitted ShellStart identity could not be verified; no job was started.");
+      }
       const command = String(params.command ?? "").trim();
       if (!command) return errorResult("Error: command is required");
 
@@ -785,6 +810,7 @@ export function registerBackgroundShell(pi: BackgroundShellHost): BackgroundShel
 
       const job: Job = {
         id,
+        startCallFingerprint,
         label,
         command,
         proc,

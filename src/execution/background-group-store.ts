@@ -104,6 +104,8 @@ export interface BackgroundExecutionGroup {
    * settings in force when the run launches.
    */
   scheduledReviewOverride?: ScheduledTaskReviewOverride;
+  /** Hashed SubtasksStart-equivalent name+arguments for active-call deduplication. */
+  startCallFingerprint?: string;
   createdAt: string;
   updatedAt: string;
   peakConcurrency?: number;

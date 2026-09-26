@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.83]
+## [0.1.0-dev.84]
 
 ### Added
 
@@ -38,6 +38,13 @@ dates.
   fails closed when the lookup itself is unavailable or throws, and `ShellStart` keeps
   liveness unknown while any running job lacks a recorded start identity; no cancellation
   of existing work, no new configuration option.
+
+## [0.1.0-dev.83]
+
+### Changed
+
+- Remove workspace-specific recursive-search guidance from the shipped execution
+  skill; local agent policies remain outside the packaged skill.
 
 ## [0.1.0-dev.82]
 

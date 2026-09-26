@@ -12,6 +12,7 @@ import { reapAll } from "../src/background-shell";
 import {
   executionToolNames,
   indexTestConfig,
+  invokeNativeToolCall,
   trigger,
   triggerAgentEnd,
   waitForCondition,
@@ -127,7 +128,7 @@ review: { activeReviewers: [
     delete process.env.PI_REVIEW_GATE_DISABLED;
 
     const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
-    const tools = new Map<string, { execute: (...args: any[]) => Promise<Record<string, unknown>> }>();
+    const tools = new Map<string, { name: string; execute: (...args: any[]) => Promise<Record<string, unknown>> }>();
     const notices: string[] = [];
     const messages: Array<{ customType?: unknown; content?: unknown }> = [];
     const pi = {
@@ -149,7 +150,7 @@ review: { activeReviewers: [
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     const shellStart = tools.get("ShellStart");
     assert.ok(shellStart);
-    await shellStart.execute("id", { command: "sleep 0.25", label: "native-tests" }, undefined, undefined, { hasUI: false });
+    await invokeNativeToolCall(hooks, { name: "ShellStart", execute: shellStart.execute }, "native-shell-start", { command: "sleep 0.25", label: "native-tests" }, { hasUI: false });
     await triggerAgentEnd(hooks, { cwd: dir, messages: [{ role: "assistant", content: "background still running" }] });
 
     assert.match(notices.join("\n"), /automatic review deferred while 1 background process group/);
@@ -162,6 +163,75 @@ review: { activeReviewers: [
     assert.equal(await readFile(invocationMarker, "utf8"), "invoked");
   } finally {
     reapAll();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("entrypoint wiring preserves raw ShellStart identity through null normalization and an active repeat", { skip: process.platform === "win32" }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-native-raw-shell-identity-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify(indexTestConfig), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const tools = new Map<string, { name: string; execute: (...args: any[]) => Promise<Record<string, unknown>> }>();
+    let toolResultEvents = 0;
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerTool(tool: { name: string; execute: (...args: any[]) => Promise<Record<string, unknown>> }) {
+        tools.set(tool.name, tool);
+      },
+      registerCommand() {},
+      notify() {},
+      sendMessage() {},
+      sendUserMessage() {},
+    };
+
+    await activate(pi);
+    hooks.set("tool_result", [...(hooks.get("tool_result") ?? []), () => { toolResultEvents += 1; }]);
+    const shellStart = tools.get("ShellStart");
+    const shellList = tools.get("ShellList");
+    assert.ok(shellStart);
+    assert.ok(shellList);
+    const context = { hasUI: false };
+    const submitted = { command: "sleep 30", label: null };
+    const validated = { command: "sleep 30" };
+    try {
+      const first = await invokeNativeToolCall(
+        hooks,
+        shellStart,
+        "nullable-shell-first",
+        submitted,
+        context,
+        validated,
+      );
+      assert.equal(first.isError, false);
+
+      const repeated = await invokeNativeToolCall(
+        hooks,
+        shellStart,
+        "nullable-shell-repeat",
+        submitted,
+        context,
+        validated,
+      );
+      assert.equal(repeated.isError, true);
+      assert.match(String((repeated.content as Array<{ text?: unknown }>)[0]?.text), /matches an earlier start with an active job job\d+; this member started no job\./);
+      assert.equal(toolResultEvents, 1, "the preflight-blocked repeat emits no extension tool_result");
+
+      const listed = await shellList.execute("shell-list", {}, undefined, undefined, context);
+      const jobs = (listed.details as { jobs?: Array<{ status?: string }> }).jobs;
+      assert.equal(jobs?.length, 1);
+      assert.equal(jobs?.[0]?.status, "running");
+    } finally {
+      reapAll();
+    }
+  } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -205,7 +275,7 @@ review: { activeReviewers: [
     delete process.env.PI_REVIEW_GATE_DISABLED;
 
     const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
-    const tools = new Map<string, { execute: (...args: any[]) => Promise<Record<string, unknown>> }>();
+    const tools = new Map<string, { name: string; execute: (...args: any[]) => Promise<Record<string, unknown>> }>();
     const messages: Array<{ customType?: unknown; content?: unknown }> = [];
     const pi = {
       on(name: string, handler: (...args: unknown[]) => unknown) {
@@ -227,7 +297,7 @@ review: { activeReviewers: [
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     const shellStart = tools.get("ShellStart");
     assert.ok(shellStart);
-    await shellStart.execute("id", { command: "exit 0", label: "clean-exit-order" }, undefined, undefined, { hasUI: false });
+    await invokeNativeToolCall(hooks, { name: "ShellStart", execute: shellStart.execute }, "clean-exit-order", { command: "exit 0", label: "clean-exit-order" }, { hasUI: false });
 
     await waitForCondition(() => messages.some((message) => message.customType === "pi-review-bg-shell"));
     assert.equal(messages.filter((message) => message.customType === "pi-review-bg-shell").length, 1);
@@ -275,7 +345,7 @@ review: { activeReviewers: [
     delete process.env.PI_REVIEW_GATE_DISABLED;
 
     const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
-    const tools = new Map<string, { execute: (...args: any[]) => Promise<Record<string, unknown>> }>();
+    const tools = new Map<string, { name: string; execute: (...args: any[]) => Promise<Record<string, unknown>> }>();
     const notices: string[] = [];
     const messages: Array<{ customType?: unknown; content?: unknown }> = [];
     const pi = {
@@ -297,11 +367,11 @@ review: { activeReviewers: [
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     const shellStart = tools.get("ShellStart");
     assert.ok(shellStart);
-    await shellStart.execute("id", {
+    await invokeNativeToolCall(hooks, { name: "ShellStart", execute: shellStart.execute }, "first-run", {
       command: "sleep 0.2",
       label: "first-run",
       wake_on: { exit: false },
-    }, undefined, undefined, { hasUI: false });
+    }, { hasUI: false });
     await triggerAgentEnd(hooks, { cwd: dir, messages: [{ role: "assistant", content: "first run active" }] });
 
     await waitForCondition(() => messages.filter((message) => message.customType === "pi-review-background-ready").length === 1);
@@ -312,11 +382,11 @@ review: { activeReviewers: [
     // The completion wake begins a new turn, which immediately replaces the
     // finished job. The old wake must not authorize review of this newer state.
     await trigger(hooks, "before_agent_start", { cwd: dir });
-    await shellStart.execute("id", {
+    await invokeNativeToolCall(hooks, { name: "ShellStart", execute: shellStart.execute }, "replacement-run", {
       command: "sleep 0.35",
       label: "replacement-run",
       wake_on: { exit: false },
-    }, undefined, undefined, { hasUI: false });
+    }, { hasUI: false });
     await triggerAgentEnd(hooks, { cwd: dir, messages: [{ role: "assistant", content: "replacement run active" }] });
     await assert.rejects(access(invocationMarker), /ENOENT/);
     assert.match(notices.at(-1) ?? "", /replacement-run/);
@@ -394,13 +464,16 @@ review: { activeReviewers: [
     await trigger(hooks, "input", { cwd: dir, text: "make a delegated change", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
-    await executionTool.execute("start-slow-task", {
+    await invokeNativeToolCall(hooks, {
+      name: "SubtasksStart",
+      execute: executionTool.execute,
+    }, "start-slow-task", {
       tasks: [{
         title: "slow delegated work",
         instructions: "Remain active while the readiness gate is tested.",
         acceptanceCriteria: ["The delegated task finishes."],
       }],
-    }, undefined, undefined, { cwd: dir });
+    }, { cwd: dir });
 
     await triggerAgentEnd(hooks, { cwd: dir, messages: [{ role: "assistant", content: "subtask still active" }] });
 

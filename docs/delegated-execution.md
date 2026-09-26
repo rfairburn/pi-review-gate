@@ -10,6 +10,46 @@ Delegated execution requires a Git executable on `PATH`: subtask capture, isolat
 worktrees, landing, recovery, and diff3 conflict materialization all invoke Git and fail
 closed without it. See [Getting started](getting-started.md#prerequisites).
 
+## Native Pi duplicate-call preflight
+
+For native Pi assistant tool-call groups, review-gate compares the exact submitted tool
+name and JSON argument values before any member runs. A later identical member in the
+same group is blocked, as is an identical call in the immediately preceding tool group.
+Distinct calls remain eligible, including a one-member group and one `SubtasksStart`
+request containing several independent tasks. If a batch cannot be safely correlated,
+every member is blocked before execution; feedback identifies the member without
+repeating its arguments.
+
+One identical retry is allowed only when Pi observed the earlier operation start and
+its matching result explicitly reported an error. That retry is the last automatic
+attempt: after two observed failures a third call is blocked as repeated failures; if
+the retry returned without an error, an additional call is blocked as a repeated call.
+Unknown results and preflight-policy blocks do not count as operation failures.
+
+`ShellStart` and `SubtasksStart` have an additional liveness check: an identical start
+is blocked while its earlier job or group remains active, even across intervening tool
+groups and regardless of the earlier start result's error flag. Unknown liveness blocks
+the new start rather than risking a duplicate spawn: for `ShellStart`, any running job
+without a recorded start identity keeps liveness unknown; for `SubtasksStart`, an
+unavailable or failing liveness lookup fails closed the same way. The guard never
+interrupts or cancels existing work. After work settles, a nonadjacent repeat is allowed.
+A blocked `ShellStart` creates no second job. A blocked `SubtasksStart` member
+creates no group or tasks and incurs no new worker usage. Its feedback describes
+the identical start and observed liveness without assuming why it was submitted.
+An older or restored active `SubtasksStart` group without a recorded start-call
+fingerprint is unidentifiable rather than unknown: it cannot match
+the submitted fingerprint and does not by itself block an otherwise admissible new
+start. The accepted duplicate risk is disclosed, not hidden: because that legacy group's
+original submitted identity is unavailable, an identical new start can duplicate its
+still-active work; the new start is not proven distinct or safe. A blocked
+`SubtasksInspect` takes no new snapshot; repeated polling is discouraged in favor
+of event-driven completion notifications or a decision-relevant, one-shot
+`SubtasksWatch` callback.
+
+This is a native Pi extension-hook guard in the primary and Pi executor runtimes. It
+does not intercept calls made by an external API harness or wrapper such as
+`multi_tool_use.parallel` unless that wrapper dispatches them as native Pi tool calls.
+
 ## Subtask tools
 
 With at least one worker resource selected, the extension exposes one exact-schema tool

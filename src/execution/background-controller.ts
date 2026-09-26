@@ -102,6 +102,7 @@ import {
 import { researchWorkspaceChanges, waveLineageOf } from "./wave-commits";
 import { pinCommit } from "./wave-worktrees";
 import { createWorkerWorktree, type WorkerWorktree } from "./wave-worktrees";
+import type { StartLiveness } from "../tool-call-fingerprint";
 
 /**
  * Finding 13: the controller no longer owns pure task-state/timing
@@ -494,6 +495,8 @@ export interface ScheduledStartOptions {
   workerResourceId?: string;
   /** Task-local review choice frozen per run (execute groups only). */
   reviewOverride?: ScheduledTaskReviewOverride;
+  /** Hashed SubtasksStart-equivalent input used to identify matching active groups. */
+  startCallFingerprint?: string;
 }
 
 export class BackgroundExecutionController {
@@ -826,6 +829,7 @@ export class BackgroundExecutionController {
       ...(options?.scheduledTaskId !== undefined ? { scheduledTaskId: options.scheduledTaskId } : {}),
       ...(options?.workerResourceId !== undefined ? { scheduledWorkerResourceId: options.workerResourceId } : {}),
       ...(options?.reviewOverride !== undefined ? { scheduledReviewOverride: options.reviewOverride } : {}),
+      ...(options?.startCallFingerprint !== undefined ? { startCallFingerprint: options.startCallFingerprint } : {}),
       createdAt: now,
       updatedAt: now,
       peakConcurrency: 0,
@@ -1162,6 +1166,34 @@ export class BackgroundExecutionController {
 
   list(): BackgroundInspection[] {
     return [...this.groups.values()].map((group) => this.inspect(group.executionId));
+  }
+
+  /**
+   * Liveness for the exact model-facing SubtasksStart request. A known active
+   * group whose recorded start-call fingerprint matches returns active, even
+   * when other legacy groups are present; known different active groups remain
+   * nonblocking. #195: an older/restored active group without a trustworthy
+   * fingerprint is unidentifiable rather than unknown — it cannot match the
+   * submitted fingerprint and no longer makes the answer unknown, so it does
+   * not by itself block an otherwise admissible start. The accepted duplicate
+   * risk is disclosed, not hidden: because that legacy group's original
+   * submitted identity is unavailable, an identical new start can duplicate its
+   * still-active work; the new start is not proven distinct or safe. `unknown`
+   * still fails closed at the preflight boundary when the liveness lookup
+   * itself is unavailable or throws. Settled groups do not participate.
+   */
+  startLiveness(fingerprint: string): StartLiveness {
+    for (const group of this.groups.values()) {
+      if (!group.tasks.some((task) => isActiveTaskState(task.state))) continue;
+      const recorded = group.startCallFingerprint;
+      // Unidentifiable legacy groups cannot match; skipping them is the
+      // accepted duplicate-risk tradeoff, not a liveness failure.
+      if (typeof recorded !== "string" || !/^[0-9a-f]{64}$/.test(recorded)) continue;
+      if (recorded === fingerprint) {
+        return { state: "active", identity: group.executionId };
+      }
+    }
+    return { state: "inactive" };
   }
 
   /**

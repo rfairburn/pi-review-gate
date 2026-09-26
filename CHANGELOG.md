@@ -15,6 +15,30 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.84]
+
+### Added
+
+- Add a native Pi assistant tool-call preflight that blocks later identical members in
+  a batch and adjacent repeated calls before execution, with one retry only after an
+  observed operation error. `ShellStart` and `SubtasksStart` also fail closed against an
+  identical active job/group across intervening groups; unknown liveness blocks the new
+  start rather than risking a duplicate spawn, and blocked starts do not cancel prior
+  work. Distinct calls and multi-task starts remain allowed, and external API wrappers
+  are not intercepted.
+
+- For that `SubtasksStart` liveness check, an older or restored active group without a
+  recorded start-call fingerprint (missing or malformed) is unidentifiable rather than
+  unknown: it cannot match the submitted fingerprint and does not by itself block an
+  otherwise admissible new start. The accepted duplicate risk is disclosed: because the
+  legacy group's original submitted identity is unavailable, an identical new start can
+  duplicate its still-active work — the new start is not proven distinct or safe. Known
+  identical active groups still block across intervening groups even with a legacy group
+  present, and known different active groups remain nonblocking. Unknown liveness still
+  fails closed when the lookup itself is unavailable or throws, and `ShellStart` keeps
+  liveness unknown while any running job lacks a recorded start identity; no cancellation
+  of existing work, no new configuration option.
+
 ## [0.1.0-dev.83]
 
 ### Changed

@@ -337,6 +337,39 @@ export interface GitCheckpointTrackedChange {
   oldBytes?: Buffer;
   /** Current content; present only with includeContents and when it exists now. */
   newBytes?: Buffer;
+  /** Armed entry kind from the armed worktree tree (absent when added). */
+  oldKind?: "file" | "symlink";
+  /** Current worktree entry kind (absent when deleted or replaced by a directory). */
+  newKind?: "file" | "symlink";
+  /** Armed file mode bits (0o777) from the armed tree; git stores no permission bits for symlinks, so they are 0 (absent when added). */
+  oldMode?: number;
+  /** Current worktree file mode bits (regular files only; symlinks carry no link mode). */
+  newMode?: number;
+}
+
+/**
+ * Exact no-follow state of one untracked worktree entry at a point in time
+ * (the armed baseline or the current worktree). Content is present only with
+ * includeContents: raw bytes for files, the exact target string for symlinks.
+ */
+export interface GitCheckpointUntrackedState {
+  kind: "file" | "symlink";
+  /** Full st_mode at observation time (0o12xxxx for symlinks). */
+  mode: number;
+  /** Exact raw file bytes (files only); present with includeContents. */
+  content?: Buffer;
+  /** Exact symlink target string (symlinks only); present with includeContents. */
+  target?: string;
+}
+
+/** One changed untracked path relative to the armed baseline. */
+export interface GitCheckpointUntrackedChange {
+  path: string;
+  change: "added" | "removed" | "modified";
+  /** Armed baseline state (absent for added paths). */
+  old?: GitCheckpointUntrackedState;
+  /** Current worktree state (absent for removed paths). */
+  new?: GitCheckpointUntrackedState;
 }
 
 export interface GitCheckpointComparisonReport {
@@ -344,6 +377,13 @@ export interface GitCheckpointComparisonReport {
   untrackedAdded: string[];
   untrackedRemoved: string[];
   untrackedModified: string[];
+  /**
+   * Typed detail for every changed untracked path — the union of the three
+   * lists above, sorted by path. Exact old/new bytes or symlink targets are
+   * present only with includeContents; kind and mode always are, so a
+   * mode-only change is reviewable without copying content.
+   */
+  untrackedChanges: GitCheckpointUntrackedChange[];
 }
 
 // ── Hardened Git execution ───────────────────────────────────────────────────
@@ -1666,6 +1706,7 @@ async function captureUntrackedEntry(
   root: string,
   path: string,
   beforeRead?: (absolutePath: string) => void | Promise<void>,
+  maxFileBytes?: number,
 ): Promise<GitCheckpointUntrackedEntry> {
   const absolute = join(root, ...path.split("/"));
   let pre;
@@ -1727,6 +1768,14 @@ async function captureUntrackedEntry(
     const stat = await handle.stat();
     if (!sameStatIdentity(statIdentityOf(stat), statIdentityOf(pre))) {
       throw new GitCheckpointError(`untracked path ${path} changed while being captured`, "untracked_capture_race");
+    }
+    // Fail before allocating: a single file over the cap can never fit in
+    // the bounded capture budget.
+    if (maxFileBytes !== undefined && stat.size > maxFileBytes) {
+      throw new GitCheckpointError(
+        `untracked path ${path} is ${stat.size} bytes, exceeding the ${maxFileBytes}-byte cap`,
+        "untracked_too_large",
+      );
     }
     bytes = Buffer.alloc(stat.size);
     let offset = 0;
@@ -2572,23 +2621,54 @@ async function materializeTrackedPath(
 }
 
 /** Read a worktree file no-follow, failing closed on races. */
-async function readWorktreeFile(absolute: string, path: string): Promise<Buffer> {
+async function readWorktreeFile(absolute: string, path: string, maxBytes?: number): Promise<Buffer> {
   const handle = await open(absolute, constants.O_RDONLY | constants.O_NOFOLLOW).catch((error): never => {
     throw new GitCheckpointError(`cannot open ${path} for comparison: ${messageOf(error)}`, "git_failed");
   });
+  let pre: Stats;
+  let bytes: Buffer;
   try {
-    const stat = await handle.stat();
-    const bytes = Buffer.alloc(stat.size);
+    pre = await handle.stat();
+    // Fail before allocating (at the allocation site, so a concurrent grow
+    // cannot slip past a caller-side size check): a file over the cap can
+    // never be materialized in the bounded review budget.
+    if (maxBytes !== undefined && pre.size > maxBytes) {
+      throw new GitCheckpointError(
+        `worktree file ${path} is ${pre.size} bytes, exceeding the ${maxBytes}-byte cap`,
+        "git_failed",
+      );
+    }
+    bytes = Buffer.alloc(pre.size);
     let offset = 0;
-    while (offset < stat.size) {
-      const { bytesRead } = await handle.read(bytes, offset, stat.size - offset, offset);
+    while (offset < pre.size) {
+      const { bytesRead } = await handle.read(bytes, offset, pre.size - offset, offset);
       if (bytesRead === 0) break;
       offset += bytesRead;
     }
-    return bytes;
+    // A short read means the file shrank under us: the buffer would be
+    // zero-padded garbage, so fail closed instead of returning it.
+    if (offset !== pre.size) {
+      throw new GitCheckpointError(`worktree file ${path} changed while being read`, "git_failed");
+    }
   } finally {
     await handle.close().catch(() => undefined);
   }
+  // Post-read identity check: a concurrent rewrite that preserved the
+  // open-time size (grow, truncate+rewrite) would otherwise yield stale
+  // bytes with no detectable gap.
+  let post: Stats;
+  try {
+    post = await lstat(absolute);
+  } catch (error) {
+    if (fsCodeOf(error) === "ENOENT") {
+      throw new GitCheckpointError(`worktree file ${path} vanished while being read`, "git_failed");
+    }
+    throw new GitCheckpointError(`cannot re-stat ${path} after reading: ${messageOf(error)}`, "git_failed");
+  }
+  if (!sameStatIdentity(statIdentityOf(post), statIdentityOf(pre))) {
+    throw new GitCheckpointError(`worktree file ${path} changed while being read`, "git_failed");
+  }
+  return bytes;
 }
 
 /** Read one blob from the object store, capped. */
@@ -2604,8 +2684,17 @@ async function catFileBlob(gitPath: string, root: string, oid: string, spec: Git
  * Diff the current repository state against the armed baseline without
  * mutating anything. Tracked changes are computed in object space; blob
  * contents are materialized only for paths that actually changed, and only
- * when `includeContents` is requested. Untracked deltas are reported by path
- * (modified = stat identity drift from the captured entry).
+ * when `includeContents` is requested. Every tracked change also carries
+ * armed/current kind and mode, so a mode-only change or a symlink retarget
+ * stays reviewable even when the bytes are equal (symlink content is its
+ * exact target, read no-follow). Untracked deltas are reported by path
+ * (modified = stat identity drift from the captured entry) AND as typed
+ * `untrackedChanges` with exact old/new bytes or symlink targets: new-side
+ * content is captured no-follow with pre/post stat identity, only for paths
+ * that actually changed, only with includeContents, and bounded by
+ * maxUntrackedBytes; the old side reuses the bytes already captured at arm
+ * time. Ignored untracked paths stay excluded (the ordinary baseline never
+ * includes them); tracked-but-ignored paths remain tracked changes.
  * The pin must also be owned by this record's generation (its latest reflog
  * entry names the record's armId) — a stale same-base record cannot be
  * compared against as if it were the current arm (`pin_generation_mismatch`).
@@ -2685,27 +2774,114 @@ export async function compareToGitCheckpoint(
       else if (!existsNow) status = "deleted";
       else status = "modified";
       const change: GitCheckpointTrackedChange = { path, status };
+      // Armed-side type/mode from the armed tree. Always reported — a
+      // mode-only change must stay reviewable even when the bytes are equal.
+      if (armed !== undefined) {
+        change.oldKind = armed.mode === "120000" ? "symlink" : "file";
+        change.oldMode = parseInt(armed.mode, 8) & 0o777;
+      }
+      // Current-side type/mode. Special files are not representable in the
+      // report — fail closed rather than mislabel them.
+      if (existsNow) {
+        if (currentStat!.isSymbolicLink()) {
+          change.newKind = "symlink";
+        } else if (currentStat!.isFile()) {
+          change.newKind = "file";
+          change.newMode = currentStat!.mode & 0o777;
+        } else {
+          return {
+            status: "failed",
+            reason: "git_failed",
+            detail: truncateDetail(`path ${path} is a special file in the worktree; comparison cannot represent it`),
+          };
+        }
+      }
       if (includeContents) {
         if (armed !== undefined) {
           change.oldBytes = await catFileBlob(gitPath, repo.root, armed.blob, spec);
         }
         if (existsNow) {
-          change.newBytes = await readWorktreeFile(absolute, path);
+          if (change.newKind === "symlink") {
+            // Symlink content IS its target: read it no-follow. A lossy
+            // UTF-8 decode (U+FFFD) cannot be represented byte-for-byte.
+            let target: string;
+            try {
+              target = await readlink(absolute);
+            } catch (error) {
+              return { status: "failed", reason: "git_failed", detail: truncateDetail(`cannot read symlink target for ${path}: ${messageOf(error)}`) };
+            }
+            if (target.includes("\uFFFD")) {
+              return { status: "failed", reason: "git_failed", detail: truncateDetail(`symlink ${path} has a target that is not valid UTF-8; its bytes cannot be represented`) };
+            }
+            change.newBytes = Buffer.from(target, "utf8");
+          } else {
+            // Bound the new-side worktree read like the old-side blob read
+            // (MAX_BLOB_BYTES: a single blob materialized during compare).
+            change.newBytes = await readWorktreeFile(absolute, path, MAX_BLOB_BYTES);
+          }
         }
       }
       trackedChanges.push(change);
     }
 
-    // Untracked deltas against the baseline.
+    // Untracked deltas against the baseline. Ignored untracked paths are
+    // excluded by --exclude-standard (the ordinary baseline never includes
+    // them); tracked-but-ignored paths stay tracked and surface through
+    // trackedChanges above.
     const nowUntracked = await listUntrackedPaths(gitPath, repo.root, spec);
     const baseline = new Map(record.untracked.map((e) => [e.path, e]));
     const untrackedAdded: string[] = [];
     const untrackedRemoved: string[] = [];
     const untrackedModified: string[] = [];
+    const untrackedChanges: GitCheckpointUntrackedChange[] = [];
+
+    // Old (baseline) side of a changed entry. Exact bytes/target only with
+    // includeContents — the content was already captured at arm time.
+    const baselineState = (entry: GitCheckpointUntrackedEntry): GitCheckpointUntrackedState => {
+      const state: GitCheckpointUntrackedState = { kind: entry.kind, mode: entry.mode };
+      if (includeContents) {
+        if (entry.kind === "file") state.content = Buffer.from(entry.contentB64 ?? "", "base64");
+        else state.target = entry.target;
+      }
+      return state;
+    };
+
+    const maxUntrackedBytes = options.maxUntrackedBytes ?? DEFAULT_MAX_UNTRACKED_BYTES;
+    let newUntrackedBytes = 0;
+    // Current-side state for a changed path: exact no-follow capture with
+    // pre/post stat identity when content is requested, otherwise kind/mode
+    // from the classification stat. Special files are not representable.
+    const currentStateOf = async (path: string, knownStat?: Stats): Promise<GitCheckpointUntrackedState> => {
+      if (includeContents) {
+        const captured = await captureUntrackedEntry(repo.root, path, options.faultHooks?.beforeUntrackedRead, maxUntrackedBytes);
+        if (captured.kind === "file") {
+          newUntrackedBytes += captured.size;
+          if (newUntrackedBytes > maxUntrackedBytes) {
+            throw new GitCheckpointError("compared untracked bytes exceeded the cap", "untracked_too_large");
+          }
+        }
+        const state: GitCheckpointUntrackedState = { kind: captured.kind, mode: captured.mode };
+        if (captured.kind === "file") state.content = Buffer.from(captured.contentB64 ?? "", "base64");
+        else state.target = captured.target;
+        return state;
+      }
+      const current = knownStat ?? await lstat(join(repo.root, ...path.split("/"))).catch((error): never => {
+        throw untrackedCaptureError(path, error, "could not stat");
+      });
+      if (current.isSymbolicLink()) return { kind: "symlink", mode: current.mode };
+      if (current.isFile()) return { kind: "file", mode: current.mode };
+      throw new GitCheckpointError(
+        `untracked path ${path} is a special file; only regular files and symlinks are checkpointable`,
+        "unsupported_untracked_entry",
+      );
+    };
+
     for (const path of nowUntracked.sort()) {
+      throwIfAborted(spec.signal);
       const expected = baseline.get(path);
       if (expected === undefined) {
         untrackedAdded.push(path);
+        untrackedChanges.push({ path, change: "added", new: await currentStateOf(path) });
         continue;
       }
       const absolute = join(repo.root, ...path.split("/"));
@@ -2715,19 +2891,27 @@ export async function compareToGitCheckpoint(
       } catch (error) {
         // Vanished between listing and stat — treat as removed.
         untrackedRemoved.push(path);
+        untrackedChanges.push({ path, change: "removed", old: baselineState(expected) });
         continue;
       }
       if (!sameStatIdentity(statIdentityOf(current), statIdentityOf(expected))) {
         untrackedModified.push(path);
+        untrackedChanges.push({ path, change: "modified", old: baselineState(expected), new: await currentStateOf(path, current) });
       }
     }
+    const nowUntrackedSet = new Set(nowUntracked);
     for (const entry of record.untracked) {
-      if (!nowUntracked.includes(entry.path)) untrackedRemoved.push(entry.path);
+      if (!nowUntrackedSet.has(entry.path)) {
+        untrackedRemoved.push(entry.path);
+        untrackedChanges.push({ path: entry.path, change: "removed", old: baselineState(entry) });
+      }
     }
+    untrackedRemoved.sort();
+    untrackedChanges.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 
     return {
       status: "ok",
-      value: { trackedChanges, untrackedAdded, untrackedRemoved, untrackedModified },
+      value: { trackedChanges, untrackedAdded, untrackedRemoved, untrackedModified, untrackedChanges },
     };
   } catch (error) {
     return resultFromError(error);

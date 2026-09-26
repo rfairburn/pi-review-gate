@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmod, copyFile, lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
@@ -811,6 +811,7 @@ test("fail-closed gates refuse unsafe repository states", async () => {
 test("compare reports tracked and untracked deltas lazily", async () => {
   const repo = await initRepo();
   await writeFile(join(repo, "f.txt"), "v1\n");
+  await chmod(join(repo, "f.txt"), 0o644);
   await commitAll(repo, "base f");
   await writeFile(join(repo, "u.txt"), "u1\n");
   await writeFile(join(repo, "m.txt"), "m1\n");
@@ -828,6 +829,7 @@ test("compare reports tracked and untracked deltas lazily", async () => {
     assert.deepEqual(clean.value.untrackedAdded, []);
     assert.deepEqual(clean.value.untrackedRemoved, []);
     assert.deepEqual(clean.value.untrackedModified, []);
+    assert.deepEqual(clean.value.untrackedChanges, []);
   }
 
   // Now: modify a tracked file, add/remove/modify untracked.
@@ -840,17 +842,23 @@ test("compare reports tracked and untracked deltas lazily", async () => {
   assert.equal(full.status, "ok");
   if (full.status !== "ok") return;
   assert.deepEqual(full.value.trackedChanges, [
-    { path: "f.txt", status: "modified", oldBytes: Buffer.from("v1\n"), newBytes: Buffer.from("v2\n") },
+    {
+      path: "f.txt", status: "modified",
+      oldBytes: Buffer.from("v1\n"), newBytes: Buffer.from("v2\n"),
+      oldKind: "file", oldMode: 0o644, newKind: "file", newMode: 0o644,
+    },
   ]);
   assert.deepEqual(full.value.untrackedAdded, ["n.txt"]);
   assert.deepEqual(full.value.untrackedRemoved, ["u.txt"]);
   assert.deepEqual(full.value.untrackedModified, ["m.txt"]);
 
-  // Without includeContents no blob bytes are materialized.
+  // Without includeContents no blob bytes are materialized; kind/mode still are.
   const namesOnly = await compareToGitCheckpoint(repo, encoded);
   assert.equal(namesOnly.status, "ok");
   if (namesOnly.status === "ok") {
-    assert.deepEqual(namesOnly.value.trackedChanges, [{ path: "f.txt", status: "modified" }]);
+    assert.deepEqual(namesOnly.value.trackedChanges, [
+      { path: "f.txt", status: "modified", oldKind: "file", oldMode: 0o644, newKind: "file", newMode: 0o644 },
+    ]);
   }
 
   // Compare must not mutate the repository.
@@ -860,6 +868,7 @@ test("compare reports tracked and untracked deltas lazily", async () => {
 test("compare leaves index bytes untouched and restore backs up the original index", async () => {
   const repo = await initRepo();
   await writeFile(join(repo, "f.txt"), "base\n");
+  await chmod(join(repo, "f.txt"), 0o644);
   await commitAll(repo, "add tracked file");
   const armed = await armGitCheckpoint(repo, "window-index-bytes");
   assert.equal(armed.status, "ok");
@@ -876,7 +885,9 @@ test("compare leaves index bytes untouched and restore backs up the original ind
   assert.equal(compared.status, "ok");
   if (compared.status === "ok") {
     assert.deepEqual(compared.value.trackedChanges, [{
-      path: "f.txt", status: "modified", oldBytes: Buffer.from("base\n"), newBytes: Buffer.from("staged change\n"),
+      path: "f.txt", status: "modified",
+      oldBytes: Buffer.from("base\n"), newBytes: Buffer.from("staged change\n"),
+      oldKind: "file", oldMode: 0o644, newKind: "file", newMode: 0o644,
     }]);
   }
   assert.deepEqual(await readFile(indexPath(repo)), before, "comparison must not refresh the live index");
@@ -887,6 +898,310 @@ test("compare leaves index bytes untouched and restore backs up the original ind
   assert.deepEqual(await readFile(join(restored.value.scratchDir, "index-backup")), before,
     "restore must back up the original live index bytes before its atomic swap");
   assert.equal(await readFile(join(repo, "f.txt"), "utf8"), "base\n");
+});
+
+test("compare exposes exact changed-untracked bytes, targets, and modes", async () => {
+  const repo = await initRepo();
+  // Ignored untracked paths must stay out of the ordinary baseline.
+  await writeFile(join(repo, ".gitignore"), "secret*\n");
+  await commitAll(repo, "ignore rules");
+  // Baseline untracked: text, binary, executable, symlink.
+  const binOld = randomBytes(300);
+  await writeFile(join(repo, "u-text.txt"), "untracked one\n");
+  await chmod(join(repo, "u-text.txt"), 0o644);
+  await writeFile(join(repo, "u-bin.dat"), binOld);
+  await chmod(join(repo, "u-bin.dat"), 0o644);
+  await writeFile(join(repo, "u-exec.sh"), "#!/bin/sh\necho hi\n");
+  await chmod(join(repo, "u-exec.sh"), 0o755);
+  await symlink("u-text.txt", join(repo, "u-link"));
+  // Symlink st_mode is platform-defined (0o120644 on macOS, 0o120777 on
+  // Linux); derive the expectation from the actual entry.
+  const linkMode = (await lstat(join(repo, "u-link"))).mode;
+
+  const arm = await armGitCheckpoint(repo, "window-review-data");
+  assert.equal(arm.status, "ok");
+  if (arm.status !== "ok") return;
+  const encoded = arm.value.encoded;
+
+  // Post-arm: add text/binary/symlink plus one ignored file, remove the text
+  // file, edit the binary and executable, retarget the symlink.
+  const binNew = randomBytes(180);
+  const aBin = randomBytes(256);
+  await writeFile(join(repo, "a-text.txt"), "added text\n");
+  await chmod(join(repo, "a-text.txt"), 0o644);
+  await writeFile(join(repo, "a-bin.dat"), aBin);
+  await chmod(join(repo, "a-bin.dat"), 0o644);
+  await symlink("a-text.txt", join(repo, "a-link"));
+  await writeFile(join(repo, "secret-new.txt"), "ignored addition\n");
+  await rm(join(repo, "u-text.txt"));
+  await writeFile(join(repo, "u-bin.dat"), binNew);
+  await writeFile(join(repo, "u-exec.sh"), "#!/bin/sh\necho changed\n");
+  await rm(join(repo, "u-link"));
+  await symlink("u-exec.sh", join(repo, "u-link"));
+
+  const indexBefore = await readFile(indexPath(repo));
+  const statusBefore = await git(repo, "status", "--porcelain");
+
+  const full = await compareToGitCheckpoint(repo, encoded, {}, true);
+  assert.equal(full.status, "ok");
+  if (full.status !== "ok") return;
+
+  // Compatibility lists (paths only).
+  assert.deepEqual(full.value.untrackedAdded, ["a-bin.dat", "a-link", "a-text.txt"]);
+  assert.deepEqual(full.value.untrackedRemoved, ["u-text.txt"]);
+  assert.deepEqual(full.value.untrackedModified, ["u-bin.dat", "u-exec.sh", "u-link"]);
+
+  // Typed detail: exact old/new bytes, targets, kind, and mode per path.
+  assert.deepEqual(full.value.untrackedChanges, [
+    { path: "a-bin.dat", change: "added", new: { kind: "file", mode: 0o100644, content: aBin } },
+    { path: "a-link", change: "added", new: { kind: "symlink", mode: linkMode, target: "a-text.txt" } },
+    { path: "a-text.txt", change: "added", new: { kind: "file", mode: 0o100644, content: Buffer.from("added text\n") } },
+    {
+      path: "u-bin.dat", change: "modified",
+      old: { kind: "file", mode: 0o100644, content: binOld },
+      new: { kind: "file", mode: 0o100644, content: binNew },
+    },
+    {
+      path: "u-exec.sh", change: "modified",
+      old: { kind: "file", mode: 0o100755, content: Buffer.from("#!/bin/sh\necho hi\n") },
+      new: { kind: "file", mode: 0o100755, content: Buffer.from("#!/bin/sh\necho changed\n") },
+    },
+    {
+      path: "u-link", change: "modified",
+      old: { kind: "symlink", mode: linkMode, target: "u-text.txt" },
+      new: { kind: "symlink", mode: linkMode, target: "u-exec.sh" },
+    },
+    { path: "u-text.txt", change: "removed", old: { kind: "file", mode: 0o100644, content: Buffer.from("untracked one\n") } },
+  ]);
+
+  // The ignored addition is invisible to the ordinary baseline.
+  for (const list of [full.value.untrackedAdded, full.value.untrackedRemoved, full.value.untrackedModified]) {
+    assert.ok(!list.includes("secret-new.txt"), "ignored untracked path must not appear");
+  }
+  assert.ok(!full.value.untrackedChanges.some((c) => c.path === "secret-new.txt"));
+
+  // Without includeContents: same lists, kind/mode only, no content copied.
+  const namesOnly = await compareToGitCheckpoint(repo, encoded);
+  assert.equal(namesOnly.status, "ok");
+  if (namesOnly.status === "ok") {
+    assert.deepEqual(namesOnly.value.untrackedAdded, ["a-bin.dat", "a-link", "a-text.txt"]);
+    assert.deepEqual(namesOnly.value.untrackedRemoved, ["u-text.txt"]);
+    assert.deepEqual(namesOnly.value.untrackedModified, ["u-bin.dat", "u-exec.sh", "u-link"]);
+    assert.deepEqual(namesOnly.value.untrackedChanges, [
+      { path: "a-bin.dat", change: "added", new: { kind: "file", mode: 0o100644 } },
+      { path: "a-link", change: "added", new: { kind: "symlink", mode: linkMode } },
+      { path: "a-text.txt", change: "added", new: { kind: "file", mode: 0o100644 } },
+      { path: "u-bin.dat", change: "modified", old: { kind: "file", mode: 0o100644 }, new: { kind: "file", mode: 0o100644 } },
+      { path: "u-exec.sh", change: "modified", old: { kind: "file", mode: 0o100755 }, new: { kind: "file", mode: 0o100755 } },
+      { path: "u-link", change: "modified", old: { kind: "symlink", mode: linkMode }, new: { kind: "symlink", mode: linkMode } },
+      { path: "u-text.txt", change: "removed", old: { kind: "file", mode: 0o100644 } },
+    ]);
+  }
+
+  // Comparison is read-only: live index bytes, status, and worktree content
+  // are exactly what they were before.
+  assert.deepEqual(await readFile(indexPath(repo)), indexBefore);
+  assert.equal(await git(repo, "status", "--porcelain"), statusBefore);
+  assert.deepEqual(await readFile(join(repo, "u-bin.dat")), binNew);
+  assert.equal(await readlink(join(repo, "u-link")), "u-exec.sh");
+});
+
+test("compare exposes tracked mode-only changes and symlink retargets", async () => {
+  const repo = await initRepo();
+  await writeFile(join(repo, "m.txt"), "mode only\n");
+  await chmod(join(repo, "m.txt"), 0o644);
+  await writeFile(join(repo, "target.txt"), "target\n");
+  await symlink("target.txt", join(repo, "t-link"));
+  await commitAll(repo, "tracked mode and link");
+
+  const arm = await armGitCheckpoint(repo, "window-tracked-modes");
+  assert.equal(arm.status, "ok");
+  if (arm.status !== "ok") return;
+  const encoded = arm.value.encoded;
+
+  // Mode-only change: identical bytes, different permission bits.
+  await chmod(join(repo, "m.txt"), 0o755);
+  // Symlink retarget: kind unchanged, target bytes differ.
+  await rm(join(repo, "t-link"));
+  await symlink("m.txt", join(repo, "t-link"));
+
+  const full = await compareToGitCheckpoint(repo, encoded, {}, true);
+  assert.equal(full.status, "ok");
+  if (full.status !== "ok") return;
+  // A mode-only change must not silently disappear just because the bytes
+  // are equal, and a symlink retarget is reviewable through its targets.
+  assert.deepEqual(full.value.trackedChanges, [
+    {
+      path: "m.txt", status: "modified",
+      oldBytes: Buffer.from("mode only\n"), newBytes: Buffer.from("mode only\n"),
+      oldKind: "file", oldMode: 0o644, newKind: "file", newMode: 0o755,
+    },
+    {
+      path: "t-link", status: "modified",
+      oldBytes: Buffer.from("target.txt"), newBytes: Buffer.from("m.txt"),
+      // Git stores no permission bits for symlinks (mode 120000).
+      oldKind: "symlink", oldMode: 0, newKind: "symlink",
+    },
+  ]);
+
+  // Kind/mode is reported without content too.
+  const namesOnly = await compareToGitCheckpoint(repo, encoded);
+  assert.equal(namesOnly.status, "ok");
+  if (namesOnly.status === "ok") {
+    assert.deepEqual(namesOnly.value.trackedChanges, [
+      { path: "m.txt", status: "modified", oldKind: "file", oldMode: 0o644, newKind: "file", newMode: 0o755 },
+      { path: "t-link", status: "modified", oldKind: "symlink", oldMode: 0, newKind: "symlink" },
+    ]);
+  }
+});
+
+test("compare keeps ignored untracked out and tracked-but-ignored in", async () => {
+  const repo = await initRepo();
+  // Tracked FIRST, then ignored: it stays tracked.
+  await writeFile(join(repo, "log.txt"), "log v1\n");
+  await chmod(join(repo, "log.txt"), 0o644);
+  await commitAll(repo, "add log");
+  await writeFile(join(repo, ".gitignore"), "secret*\nlog.txt\n");
+  await commitAll(repo, "ignore rules");
+
+  const arm = await armGitCheckpoint(repo, "window-ignore-cmp");
+  assert.equal(arm.status, "ok");
+  if (arm.status !== "ok") return;
+
+  // Post-arm: edit the tracked-but-ignored file; add an ignored untracked.
+  await writeFile(join(repo, "log.txt"), "log v2\n");
+  await writeFile(join(repo, "secret-new.txt"), "ignored addition\n");
+
+  const cmp = await compareToGitCheckpoint(repo, arm.value.encoded, {}, true);
+  assert.equal(cmp.status, "ok");
+  if (cmp.status !== "ok") return;
+  // Tracked-but-ignored stays tracked: a full tracked change with content.
+  assert.deepEqual(cmp.value.trackedChanges, [{
+    path: "log.txt", status: "modified",
+    oldBytes: Buffer.from("log v1\n"), newBytes: Buffer.from("log v2\n"),
+    oldKind: "file", oldMode: 0o644, newKind: "file", newMode: 0o644,
+  }]);
+  // Ignored untracked is excluded from the ordinary baseline entirely.
+  assert.deepEqual(cmp.value.untrackedAdded, []);
+  assert.deepEqual(cmp.value.untrackedRemoved, []);
+  assert.deepEqual(cmp.value.untrackedModified, []);
+  assert.deepEqual(cmp.value.untrackedChanges, []);
+});
+
+test("compare fails closed when new untracked content races or is unreadable", async () => {
+  const repo = await initRepo();
+  await writeFile(join(repo, "u.txt"), "baseline\n");
+  const arm = await armGitCheckpoint(repo, "window-cmp-race");
+  assert.equal(arm.status, "ok");
+  if (arm.status !== "ok") return;
+  const encoded = arm.value.encoded;
+  const indexBefore = await readFile(indexPath(repo));
+
+  // A new untracked file that vanishes between the listing and the read.
+  await writeFile(join(repo, "a-gone.txt"), "short lived\n");
+  const vanished = await compareToGitCheckpoint(repo, encoded, {
+    faultHooks: {
+      beforeUntrackedRead: async (absolutePath) => {
+        await rm(absolutePath);
+      },
+    },
+  }, true);
+  assert.equal(vanished.status, "failed");
+  if (vanished.status === "failed") assert.equal(vanished.reason, "untracked_capture_race");
+
+  // A new untracked file rewritten between its pre-stat and the read.
+  await writeFile(join(repo, "a-rewrite.txt"), "first\n");
+  const raced = await compareToGitCheckpoint(repo, encoded, {
+    faultHooks: {
+      beforeUntrackedRead: async (absolutePath) => {
+        await writeFile(absolutePath, "rewritten mid-read\n");
+      },
+    },
+  }, true);
+  assert.equal(raced.status, "failed");
+  if (raced.status === "failed") assert.equal(raced.reason, "untracked_capture_race");
+
+  // An unreadable new untracked file (skipped as root: root bypasses the
+  // permission bits, so the read would not fail).
+  if (typeof process.getuid === "function" && process.getuid() !== 0) {
+    await writeFile(join(repo, "a-locked.txt"), "locked\n");
+    await chmod(join(repo, "a-locked.txt"), 0);
+    const unreadable = await compareToGitCheckpoint(repo, encoded, {}, true);
+    assert.equal(unreadable.status, "failed");
+    if (unreadable.status === "failed") assert.equal(unreadable.reason, "untracked_unreadable");
+    await chmod(join(repo, "a-locked.txt"), 0o644);
+  }
+
+  // Every failed comparison left the live index bytes untouched and wrote no
+  // worktree content (the hook's own rewrites are the only writes).
+  assert.deepEqual(await readFile(indexPath(repo)), indexBefore);
+  assert.equal(await readFile(join(repo, "u.txt"), "utf8"), "baseline\n");
+  assert.equal(await readFile(join(repo, "a-rewrite.txt"), "utf8"), "rewritten mid-read\n");
+});
+
+test("compare bounds new untracked reads with the untracked cap", async () => {
+  const repo = await initRepo();
+  await writeFile(join(repo, "u.txt"), "baseline\n");
+  const arm = await armGitCheckpoint(repo, "window-cmp-cap");
+  assert.equal(arm.status, "ok");
+  if (arm.status !== "ok") return;
+
+  // A single new file over the cap fails before its bytes are read.
+  await writeFile(join(repo, "big-new.bin"), randomBytes(8 * 1024));
+  const perFile = await compareToGitCheckpoint(repo, arm.value.encoded, { maxUntrackedBytes: 1024 }, true);
+  assert.equal(perFile.status, "failed");
+  if (perFile.status === "failed") assert.equal(perFile.reason, "untracked_too_large");
+
+  // Two files within the per-file cap whose total exceeds it also fail.
+  await rm(join(repo, "big-new.bin"));
+  await writeFile(join(repo, "one.txt"), "x".repeat(600));
+  await writeFile(join(repo, "two.txt"), "y".repeat(600));
+  const total = await compareToGitCheckpoint(repo, arm.value.encoded, { maxUntrackedBytes: 1024 }, true);
+  assert.equal(total.status, "failed");
+  if (total.status === "failed") assert.equal(total.reason, "untracked_too_large");
+
+  // Within the cap the comparison succeeds with exact bytes.
+  const ok = await compareToGitCheckpoint(repo, arm.value.encoded, { maxUntrackedBytes: 4096 }, true);
+  assert.equal(ok.status, "ok");
+  if (ok.status === "ok") {
+    assert.deepEqual(ok.value.untrackedAdded, ["one.txt", "two.txt"]);
+    const one = ok.value.untrackedChanges.find((c) => c.path === "one.txt");
+    assert.deepEqual(one?.new?.content, Buffer.from("x".repeat(600)));
+  }
+});
+
+test("compare bounds the new-side tracked worktree read at the blob cap", async () => {
+  const repo = await initRepo();
+  await writeFile(join(repo, "big.txt"), "small base\n");
+  await chmod(join(repo, "big.txt"), 0o644);
+  await commitAll(repo, "small big");
+
+  const arm = await armGitCheckpoint(repo, "window-cmp-blobcap");
+  assert.equal(arm.status, "ok");
+  if (arm.status !== "ok") return;
+
+  // Grow the tracked file far past the cap without allocating it: a sparse
+  // truncation has a huge apparent size and ~zero disk usage.
+  const handle = await open(join(repo, "big.txt"), "r+");
+  await handle.truncate(600 * 1024 * 1024);
+  await handle.close();
+
+  // Content materialization is refused before any allocation...
+  const capped = await compareToGitCheckpoint(repo, arm.value.encoded, {}, true);
+  assert.equal(capped.status, "failed");
+  if (capped.status === "failed") {
+    assert.equal(capped.reason, "git_failed");
+    assert.match(capped.detail ?? "", /exceeding the/);
+  }
+
+  // ...while names-only comparison still reports the change with type/mode.
+  const namesOnly = await compareToGitCheckpoint(repo, arm.value.encoded);
+  assert.equal(namesOnly.status, "ok");
+  if (namesOnly.status === "ok") {
+    assert.deepEqual(namesOnly.value.trackedChanges, [
+      { path: "big.txt", status: "modified", oldKind: "file", oldMode: 0o644, newKind: "file", newMode: 0o644 },
+    ]);
+  }
 });
 
 test("release removes the pin and scratch idempotently", async () => {

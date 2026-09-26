@@ -679,9 +679,11 @@ const SKILL_PUBLISH_PLAN = [
  *
  * Ownership proof: the installed file is compared against the EXPECTED
  * HISTORICAL BYTES by digest — its own SHA-256 must equal `historicalSha256`,
- * the digest of the true pre-#151 package-owned bytes, which are preserved as
+ * the digest of the true pre-#151 package-owned bytes. Most are preserved as
  * immutable fixtures under tests/fixtures/skill-migration/ (mirroring the
- * generic install layout). The installed content is never normalized or
+ * generic install layout); the execution fixture has been redacted to remove
+ * workspace-specific guidance, while its original digest remains pinned here.
+ * The installed content is never normalized or
  * transformed: a transform before comparing would be non-injective and could
  * classify customized content (for example a file that already carries the
  * namespaced name, or a partially namespaced orchestrator) as unmodified. An
@@ -698,8 +700,8 @@ const SKILL_PUBLISH_PLAN = [
  * release edits a shipped skill file (as issue 179 did), degrading genuine old
  * installs to preservation forever. Anchoring on the immutable digest keeps
  * old-install migration working across future shipped-skill edits; the
- * fixtures and their digests are the identity, and the shipped-skills test
- * enforces that coupling so drift cannot pass silently.
+ * historical digests remain the identity. The shipped-skills test checks
+ * fixture coupling except for the explicitly redacted execution fixture.
  *
  * `renames` is documentary only: it records the namespacing diff between the
  * historical copy and the first namespaced release for human readers. The
@@ -812,8 +814,7 @@ function migrateGenericSkillFiles(homeDir, platform = process.platform) {
       continue; // missing, unreadable, or a directory: nothing proven to remove
     }
     // The installed bytes must hash to the entry's recorded historical digest.
-    // That digest is the immutable identity of the true pre-#151 package-owned
-    // bytes (preserved under tests/fixtures/skill-migration/), so an exact
+    // That digest identifies the true pre-#151 package-owned bytes, so an exact
     // match positively identifies an unmodified prior copy and nothing else.
     // The check never depends on the current packaged text — later releases
     // may edit shipped skill files without changing what a genuine old install

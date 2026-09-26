@@ -378,10 +378,11 @@ test("the pre-#151 migration has one canonical shipped implementation (#154)", a
   }));
 
   assert.ok(cjsEntries.length > 0, "the canonical migration manifest must list prior files");
-  // Each entry's recorded digest must be the SHA-256 of the immutable
-  // historical fixture — the true pre-#151 package-owned bytes, preserved
-  // under tests/fixtures/skill-migration/ mirroring the generic install
-  // layout. The identity is anchored to those bytes, not to derivations from
+  // Each recorded digest identifies the true pre-#151 package-owned bytes.
+  // Historical fixtures preserve those bytes except execution/SKILL.md:
+  // that fixture was redacted to remove workspace-specific guidance, but its
+  // original historical digest stays pinned in the migration manifest. The
+  // identity is anchored to those prior bytes, not to derivations from
   // the mutable packaged text: later releases may edit shipped skill files (as
   // issue 179 did) without changing what a genuine old install looks like,
   // and the launcher compares installed copies against this digest directly.
@@ -396,11 +397,16 @@ test("the pre-#151 migration has one canonical shipped implementation (#154)", a
     } catch {
       throw new Error(`historical fixture is missing for migration entry ${entry.installed}: ${fixturePath}`);
     }
-    assert.equal(
-      createHash("sha256").update(fixtureBytes).digest("hex"),
-      entry.historicalSha256,
-      `the historical fixture must hold exactly the recorded pre-#151 bytes for ${entry.installed}`,
-    );
+    const fixtureDigest = createHash("sha256").update(fixtureBytes).digest("hex");
+    if (entry.installed === "execution/SKILL.md") {
+      assert.equal(entry.historicalSha256, "d01c322f83c3b246d910aaa57f84ca8e5700a7e9f4dc8c8009491d304436b298",
+        "keep recognizing the originally published generic execution skill");
+      assert.notEqual(fixtureDigest, entry.historicalSha256,
+        "the redacted fixture must not masquerade as the original published bytes");
+    } else {
+      assert.equal(fixtureDigest, entry.historicalSha256,
+        `the historical fixture must hold exactly the recorded pre-#151 bytes for ${entry.installed}`);
+    }
     if (entry.installed.endsWith("SKILL.md")) {
       const genericName = entry.installed.slice(0, entry.installed.indexOf("/"));
       assert.match(

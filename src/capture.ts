@@ -11,7 +11,15 @@ export interface SnapshotOptions {
   maxFileBytes: number;
   maxSnapshotBytes: number;
   signal?: AbortSignal;
-  /** Reuse content and hashes only when stable filesystem identity is unchanged. */
+  /**
+   * Reuse verified facts (hash, binary classification, retained content) from
+   * a prior same-root snapshot when the current lstat identity matches and a
+   * no-read verification proves the entry still sits where it did. Every
+   * retain/omit decision (per-file limit, global budget walk) is recomputed
+   * against the current options; anything unproven falls back to the full
+   * no-follow/race-checked inspection. Only completed captures are valid
+   * sources: aborted or failed captures never produce a snapshot value.
+   */
   reuseUnchangedFrom?: WorkspaceSnapshot;
   /** Explicit opt-in for retaining contents of paths outside cwd. */
   captureOutsideWorkspaceContent?: boolean;
@@ -21,6 +29,8 @@ export interface SnapshotOptions {
 
 export interface SnapshotCaptureFaultHooks {
   beforeInspectFile?: (entry: { relativePath: string; absolutePath: string }) => void | Promise<void>;
+  /** @internal Runs after the first opened-file stat in no-read reuse verification. */
+  afterReusableEntryOpenStat?: (entry: { relativePath: string; absolutePath: string }) => void | Promise<void>;
 }
 
 export type SnapshotOmissionReason = "missing" | "unreadable";
@@ -135,6 +145,13 @@ const IGNORED_DIRS = new Set([
 export async function createWorkspaceSnapshot(cwd: string, options: SnapshotOptions): Promise<WorkspaceSnapshot> {
   throwIfAborted(options.signal);
   const root = resolve(cwd);
+  // A prior snapshot from a different capture root is never eligible for
+  // reuse. Per-file absolutePath equality would already block every entry,
+  // but the explicit guard keeps cwd drift (case or symlinked-root variants)
+  // fail-closed as a single decision.
+  const reuseSource = options.reuseUnchangedFrom && options.reuseUnchangedFrom.cwd === root
+    ? options.reuseUnchangedFrom
+    : undefined;
   const discovered = await discoverFiles(root, options.signal);
   const omissions: SnapshotOmission[] = [...discovered.omissions];
   let omissionsTruncated = discovered.omissionsTruncated;
@@ -197,24 +214,75 @@ export async function createWorkspaceSnapshot(cwd: string, options: SnapshotOpti
         continue;
       }
 
-      const reusable = options.reuseUnchangedFrom?.files.get(relativePath);
-      if (
-        reusable?.exists
-        // An unreadable record has no verified hash; re-inspect it so a
-        // transient read failure cannot become sticky across chained captures.
-        && reusable.omittedReason !== "unreadable"
-        && reusable.absolutePath === absolutePath
-        && reusable.size === fileStat.size
-        && reusable.mtimeMs === fileStat.mtimeMs
-        && reusable.ctimeMs === fileStat.ctimeMs
-        && reusable.dev === fileStat.dev
-        && reusable.ino === fileStat.ino
-        && reusable.mode === fileStat.mode
-        && reusable.entryType !== "symlink"
-      ) {
-        files.set(relativePath, reusable);
-        if (reusable.content !== undefined) capturedBytes += reusable.size;
+      // The fault seam fires once per regular file, before any open — whether
+      // the entry ends up verified for reuse or fully inspected, so a
+      // deterministic fault cannot be skipped by taking the fast path. A
+      // throwing seam is handled exactly like an inspection fault: omission
+      // plus presence record (or nothing when the entry verifiably vanished).
+      try {
+        await options.captureFaults?.beforeInspectFile?.({ relativePath, absolutePath });
+      } catch (error) {
+        throwIfAborted(options.signal);
+        omissionsTruncated = recordSnapshotOmission(omissions, omissionsTruncated, "file", relativePath, error);
+        if (fsFaultReason(error) === "missing") continue;
+        files.set(relativePath, unreadableSnapshot(relativePath, absolutePath, fileStat));
         continue;
+      }
+
+      const reusable = reuseSource?.files.get(relativePath);
+      if (reusable && reusableIdentityMatches(reusable, fileStat, absolutePath)) {
+        let verified = false;
+        try {
+          const afterReusableEntryOpenStat = options.captureFaults?.afterReusableEntryOpenStat;
+          await verifyReusableEntry(
+            root,
+            absolutePath,
+            fileStat,
+            options.signal,
+            afterReusableEntryOpenStat
+              ? () => afterReusableEntryOpenStat({ relativePath, absolutePath })
+              : undefined,
+          );
+          verified = true;
+        } catch (error) {
+          throwIfAborted(options.signal);
+          // Equivalence could not be proved (the path now escapes the
+          // workspace, the entry raced, or it is unreadable): fall through to
+          // the full no-follow/race-checked inspection below, which produces
+          // the same omission and presence records a fresh capture would.
+        }
+        if (verified) {
+          // Identity proves byte-identical content, but every retain/omit
+          // decision is recomputed against the CURRENT limits and the current
+          // cumulative budget walk — an old snapshot_limit or oversized verdict
+          // is never copied when earlier changes or new limits alter it.
+          if (reusable.isBinary) {
+            files.set(relativePath, reusable);
+            continue;
+          }
+          if (reusable.size > options.maxFileBytes) {
+            // The current per-file limit no longer allows retention: keep the
+            // proven hash, drop any previously retained content.
+            files.set(relativePath, { ...reusable, omittedReason: "oversized", content: undefined });
+            continue;
+          }
+          if (capturedBytes + reusable.size > options.maxSnapshotBytes) {
+            // The current global budget walk no longer allows retention: same
+            // treatment.
+            files.set(relativePath, { ...reusable, omittedReason: "snapshot_limit", content: undefined });
+            continue;
+          }
+          if (reusable.content !== undefined) {
+            // The current decision retains content and the prior record has
+            // it: the exact fresh result without a read.
+            files.set(relativePath, reusable);
+            capturedBytes += reusable.size;
+            continue;
+          }
+          // The prior record was budget-omitted but the current walk allows
+          // retention: fall through so the content is read exactly as fresh
+          // would.
+        }
       }
 
       const contentEligible = fileStat.size <= options.maxFileBytes
@@ -236,7 +304,6 @@ export async function createWorkspaceSnapshot(cwd: string, options: SnapshotOpti
 
       let inspected: InspectedFile;
       try {
-        await options.captureFaults?.beforeInspectFile?.({ relativePath, absolutePath });
         inspected = await inspectFile(absolutePath, contentEligible, options.signal, fileStat, root);
       } catch (error) {
         throwIfAborted(options.signal);
@@ -842,6 +909,70 @@ function sameCaptureStat(actual: Stats, expected: Stats): boolean {
     && actual.mtimeMs === expected.mtimeMs
     && actual.ctimeMs === expected.ctimeMs
     && actual.mode === expected.mode;
+}
+
+/**
+ * Identity gate for reuse: the current lstat must match every identity field
+ * of the prior record, which proves byte-identical content under the same
+ * trust assumptions as fresh capture. The positive entryType and non-null
+ * hash checks make the "verified file record" invariant load-bearing rather
+ * than implied (also excluding symlink/gitlink transitions), and absolutePath
+ * equality keeps a mismatched root from ever contributing a record.
+ */
+function reusableIdentityMatches(reusable: FileSnapshot, stat: Stats, absolutePath: string): boolean {
+  return reusable.exists
+    // An unreadable record has no verified hash; re-inspect it so a transient
+    // read failure cannot become sticky across chained captures.
+    && reusable.omittedReason !== "unreadable"
+    && reusable.entryType === "file"
+    && reusable.sha256 !== null
+    && reusable.absolutePath === absolutePath
+    && reusable.size === stat.size
+    && reusable.mtimeMs === stat.mtimeMs
+    && reusable.ctimeMs === stat.ctimeMs
+    && reusable.dev === stat.dev
+    && reusable.ino === stat.ino
+    && reusable.mode === stat.mode;
+}
+
+/**
+ * Prove a reuse candidate is still the exact entry the prior snapshot
+ * verified, without reading its content: the path must canonicalize inside
+ * the workspace (a symlinked intermediate directory introduced since the
+ * prior capture would otherwise redirect a trusted record outside it), and an
+ * O_NOFOLLOW open plus two fstat identity checks must match the fresh lstat:
+ * the first closes lstat-to-open and the second catches changes during
+ * verification before prior facts are accepted. As with inspectFile's
+ * post-read stat, changes after the final stat remain an unavoidable race.
+ * Any failure means equivalence is unproven; the caller falls back to full
+ * safe inspection rather than trusting or silently dropping the entry.
+ */
+async function verifyReusableEntry(
+  root: string,
+  path: string,
+  expectedStat: Stats,
+  signal?: AbortSignal,
+  afterOpenStat?: () => void | Promise<void>,
+): Promise<void> {
+  throwIfAborted(signal);
+  await assertCanonicalPathWithinWorkspace(root, path);
+  const noFollow = process.platform === "win32" ? 0 : constants.O_NOFOLLOW;
+  const handle = await open(path, constants.O_RDONLY | noFollow);
+  try {
+    const openedStat = await handle.stat();
+    if (!openedStat.isFile() || !sameCaptureStat(openedStat, expectedStat)) {
+      throw captureRaceError("workspace entry changed during capture");
+    }
+    if (afterOpenStat) await afterOpenStat();
+    throwIfAborted(signal);
+    const finalStat = await handle.stat();
+    throwIfAborted(signal);
+    if (!finalStat.isFile() || !sameCaptureStat(finalStat, expectedStat)) {
+      throw captureRaceError("workspace entry changed during capture");
+    }
+  } finally {
+    await handle.close();
+  }
 }
 
 async function inspectFileHandle(

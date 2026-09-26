@@ -389,12 +389,12 @@ export class NativeToolCallPreflight {
       const identity = status?.state === "active" && status.identity ? ` ${status.identity}` : "";
       lead = `Duplicate ShellStart blocked: ${location} matches an earlier start with an active job${identity}; this member started no job.`;
     } else if (member.name === "ShellStart" && cause === "unknown") {
-      lead = `Duplicate ShellStart blocked: ${location} matches an earlier start whose job liveness could not be verified; this member started no job.`;
+      lead = `Duplicate ShellStart blocked: ${location} could not verify whether an identical job is active; this member started no job.`;
     } else if (member.name === "SubtasksStart" && cause === "active") {
       const identity = status?.state === "active" && status.identity ? ` in execution ${status.identity}` : "";
       lead = `Duplicate SubtasksStart blocked: ${location} matches an earlier identical start with active work${identity}; this member created no group or tasks.`;
     } else if (member.name === "SubtasksStart" && cause === "unknown") {
-      lead = `Duplicate SubtasksStart blocked: ${location} matches an earlier identical start whose work liveness could not be verified; this member created no group or tasks.`;
+      lead = `Duplicate SubtasksStart blocked: ${location} could not verify whether identical work is active; this member created no group or tasks.`;
     } else {
       if (cause === "same-batch") {
         lead = `Duplicate ${member.name} blocked: ${location} matches an earlier identical request in this native batch; this member did not run.`;

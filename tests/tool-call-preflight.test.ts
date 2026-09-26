@@ -272,6 +272,18 @@ test("active start feedback omits unavailable job and execution identities", asy
   assert.equal(activeSubtasks.decisions[0]?.reason, "Duplicate SubtasksStart blocked: member 1 (SubtasksStart) of 1 matches an earlier identical start with active work; this member created no group or tasks.");
 });
 
+test("unknown start liveness does not invent an earlier identical start on a first call", async () => {
+  const shellRuntime = nativePiHarness();
+  const shell = await onlyDecisionBatch(shellRuntime, [call("shell-first", "ShellStart", { command: "sleep safely" })]);
+  assert.equal(shell.decisions[0]?.reason, "Duplicate ShellStart blocked: member 1 (ShellStart) of 1 could not verify whether an identical job is active; this member started no job.");
+  assert.deepEqual(shell.ran, []);
+
+  const subtaskRuntime = nativePiHarness();
+  const subtasks = await onlyDecisionBatch(subtaskRuntime, [call("subtasks-first", "SubtasksStart", { tasks: [] })]);
+  assert.equal(subtasks.decisions[0]?.reason, "Duplicate SubtasksStart blocked: member 1 (SubtasksStart) of 1 could not verify whether identical work is active; this member created no group or tasks.");
+  assert.deepEqual(subtasks.ran, []);
+});
+
 test("tool-specific duplicate feedback uses only observed results and approved next-step text", async () => {
   const resultTools: Array<[string, Record<string, unknown>]> = [
     ["read", { path: "RESULT-SECRET-read" }],
@@ -633,7 +645,7 @@ test("active ShellStart survives intervening groups; unknown liveness blocks, se
   await onlyDecisionBatch(runtime, [call("read-gap", "read", { path: "later.txt" })]);
   const unknown = await onlyDecisionBatch(runtime, [shell()]);
   assert.equal(unknown.decisions[0]?.block, true);
-  assert.equal(unknown.decisions[0]?.reason, "Duplicate ShellStart blocked: member 1 (ShellStart) of 1 matches an earlier start whose job liveness could not be verified; this member started no job.");
+  assert.equal(unknown.decisions[0]?.reason, "Duplicate ShellStart blocked: member 1 (ShellStart) of 1 could not verify whether an identical job is active; this member started no job.");
   shellState = "inactive";
   await onlyDecisionBatch(runtime, [call("settled-gap", "WebFetch", { url: "https://example.test/b" })]);
   const afterSettle = await onlyDecisionBatch(runtime, [shell()]);
@@ -660,7 +672,7 @@ test("active and unknown SubtasksStart liveness blocks across unrelated groups, 
   await onlyDecisionBatch(runtime, [call("patch", "ApplyPatch", { patch: "different" })]);
   const unknown = await onlyDecisionBatch(runtime, [start("start-unknown")]);
   assert.equal(unknown.decisions[0]?.block, true);
-  assert.equal(unknown.decisions[0]?.reason, "Duplicate SubtasksStart blocked: member 1 (SubtasksStart) of 1 matches an earlier identical start whose work liveness could not be verified; this member created no group or tasks.");
+  assert.equal(unknown.decisions[0]?.reason, "Duplicate SubtasksStart blocked: member 1 (SubtasksStart) of 1 could not verify whether identical work is active; this member created no group or tasks.");
 });
 
 test("an eight-task SubtasksStart and distinct starts remain admissible without quantity blocking", async () => {

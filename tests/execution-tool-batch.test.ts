@@ -403,13 +403,13 @@ test("unknown liveness from a failing or unavailable controller still fails clos
   const failing = makeRuntime(() => { throw new Error("liveness service unavailable"); });
   const thrown = await failing("subtask-liveness-throw");
   assert.equal(thrown?.block, true);
-  assert.match(thrown?.reason ?? "", /matches an earlier identical start whose work liveness could not be verified/);
+  assert.match(thrown?.reason ?? "", /could not verify whether identical work is active/);
 
   // A missing (unavailable) liveness service fails closed the same way.
   const unavailable = makeRuntime();
   const absent = await unavailable("subtask-liveness-absent");
   assert.equal(absent?.block, true);
-  assert.match(absent?.reason ?? "", /matches an earlier identical start whose work liveness could not be verified/);
+  assert.match(absent?.reason ?? "", /could not verify whether identical work is active/);
 
   // A healthy inactive lookup still admits the start.
   const healthy = makeRuntime(() => ({ state: "inactive" }));

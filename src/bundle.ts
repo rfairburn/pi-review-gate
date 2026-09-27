@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import type { ChangedFile, SnapshotOmission } from "./capture";
 import type { ChangeIdentity } from "./schema";
 import { summarizeReviewChanges } from "./change-context";
-import type { EvidenceBundle } from "./evidence";
+import { normalizeEvidenceEventPaths, type EvidenceBundle, type EvidencePathRoots } from "./evidence";
 import {
   buildReviewerPrompt,
   buildReviewerQuestionPrompt,
@@ -24,6 +24,7 @@ interface ReviewBundleContext {
   reviewSequence?: number;
   exchanges?: ReviewExchangeContext[];
   cwd: string;
+  workspaceRoot?: string;
   request: string;
   submittedChanges: ChangedFile[];
   sideEffectChanges?: ChangedFile[];
@@ -69,13 +70,17 @@ async function createBundle(input: CreateBundleInput): Promise<ReviewBundle> {
   const reviewSequence = input.reviewSequence ?? 1;
   const invocationDir = join(dir, question ? "questions" : "reviews", sequencePath(reviewSequence));
   await mkdir(invocationDir, { recursive: true });
+  const workspaceRoot = input.workspaceRoot ?? input.cwd;
+  const pathRoots: EvidencePathRoots | undefined = input.workspaceRoot
+    ? { selectedCwd: input.cwd, workspaceRoot: input.workspaceRoot }
+    : undefined;
   const promptContext = {
     request: input.request,
     submittedChanges: input.submittedChanges,
     sideEffectChanges: input.sideEffectChanges ?? [],
     patch: input.patch,
     sideEffectPatch: input.sideEffectPatch,
-    cwd: input.cwd,
+    cwd: workspaceRoot,
     bundleDir: dir,
     evidenceMarkdown: input.evidence?.markdown,
     guidanceEscalation: input.guidanceEscalation,
@@ -83,12 +88,13 @@ async function createBundle(input: CreateBundleInput): Promise<ReviewBundle> {
     snapshotOmissions: input.snapshotOmissions,
     snapshotOmissionsTruncated: input.snapshotOmissionsTruncated,
   };
-  const prompt = question
+  const prompt = `${question
     ? buildReviewerQuestionPrompt({ ...promptContext, question: input.question })
-    : buildReviewerPrompt(promptContext);
-
+    : buildReviewerPrompt(promptContext)}${workspaceRoot !== input.cwd
+      ? `\nSelected Pi/reviewer process cwd: ${input.cwd}\nSubmitted change paths are relative to the workspace root above.`
+      : ""}`;
   const changedFiles = summarizeReviewChanges({
-    cwd: input.cwd,
+    cwd: workspaceRoot,
     submittedChanges: input.submittedChanges,
     sideEffectChanges: input.sideEffectChanges ?? [],
   });
@@ -100,6 +106,7 @@ async function createBundle(input: CreateBundleInput): Promise<ReviewBundle> {
     writeFile(join(invocationDir, "side-effect.patch.diff"), input.sideEffectPatch ?? "", "utf8"),
     writeFile(join(invocationDir, "metadata.json"), JSON.stringify({
       cwd: input.cwd,
+      ...(workspaceRoot !== input.cwd ? { workspaceRoot } : {}),
       createdAt: new Date().toISOString(),
       ...(question ? { kind: "ask-reviewer" } : {}),
       ...(input.changeIdentity ? { changeIdentity: input.changeIdentity } : {}),
@@ -111,8 +118,8 @@ async function createBundle(input: CreateBundleInput): Promise<ReviewBundle> {
     writeFile(join(invocationDir, "evidence.md"), input.evidence?.markdown ?? "", "utf8"),
     writeReviewArtifacts(invocationDir, input.submittedChanges, input.sideEffectChanges ?? [], input.evidence),
     writeCurrentReviewFiles(dir, input.request, changedFiles, input.patch, input.sideEffectPatch ?? "", prompt, input.evidence, input.changeIdentity),
-    writeExchangeArtifacts(dir, input.dir ? (input.exchanges ?? []).slice(-1) : input.exchanges ?? []),
-    writeReviewIndex(dir, input.cwd, reviewSequence, input.exchanges ?? [], question),
+    writeExchangeArtifacts(dir, input.dir ? (input.exchanges ?? []).slice(-1) : input.exchanges ?? [], pathRoots),
+    writeReviewIndex(dir, workspaceRoot, input.cwd, reviewSequence, input.exchanges ?? [], question),
   ];
   if (question) {
     writes.push(writeFile(join(invocationDir, "question.md"), input.question, "utf8"));
@@ -143,12 +150,15 @@ export async function removeTransientWindowBundle(window: ReviewExchangeBundleOw
 export async function syncReviewWindowArtifacts(input: {
   dir: string;
   cwd: string;
+  workspaceRoot?: string;
   currentReviewSequence: number;
   exchanges: ReviewExchangeContext[];
 }): Promise<void> {
   await Promise.all([
-    writeExchangeArtifacts(input.dir, input.exchanges.slice(-1)),
-    writeReviewIndex(input.dir, input.cwd, input.currentReviewSequence, input.exchanges, false),
+    writeExchangeArtifacts(input.dir, input.exchanges.slice(-1), input.workspaceRoot
+      ? { selectedCwd: input.cwd, workspaceRoot: input.workspaceRoot }
+      : undefined),
+    writeReviewIndex(input.dir, input.workspaceRoot ?? input.cwd, input.cwd, input.currentReviewSequence, input.exchanges, false),
   ]);
 }
 
@@ -186,8 +196,12 @@ async function writeCurrentReviewFiles(
   await Promise.all(writes);
 }
 
-async function writeExchangeArtifacts(dir: string, exchanges: ReviewExchangeContext[]): Promise<void> {
+async function writeExchangeArtifacts(
+  dir: string, exchanges: ReviewExchangeContext[], pathRoots?: EvidencePathRoots,
+): Promise<void> {
   for (const exchange of exchanges) {
+    const evidenceEvents = normalizeEvidenceEventPaths(exchange.evidenceEvents, pathRoots);
+    const artifactExchange = { ...exchange, evidenceEvents };
     const exchangeDir = join(dir, "exchanges", sequencePath(exchange.sequence));
     const metadataPath = join(exchangeDir, "metadata.json");
     const completionPath = join(exchangeDir, ".complete");
@@ -206,8 +220,8 @@ async function writeExchangeArtifacts(dir: string, exchanges: ReviewExchangeCont
       }, null, 2), "utf8"),
       writeFile(join(exchangeDir, "submitted.patch"), exchange.workspacePatch || "(no submitted workspace changes)", "utf8"),
       writeFile(join(exchangeDir, "side-effects.patch"), exchange.sideEffectPatch || "(no captured side-effect changes)", "utf8"),
-      writeFile(join(exchangeDir, "tool-events.json"), JSON.stringify(exchange.evidenceEvents, null, 2), "utf8"),
-      writeFile(join(exchangeDir, "tool-events.md"), renderExchangeEvents(exchange), "utf8"),
+      writeFile(join(exchangeDir, "tool-events.json"), JSON.stringify(evidenceEvents, null, 2), "utf8"),
+      writeFile(join(exchangeDir, "tool-events.md"), renderExchangeEvents(artifactExchange), "utf8"),
       writeFile(join(exchangeDir, "assistant-summary.md"), exchange.assistantSummaries.join("\n\n---\n\n"), "utf8"),
       writeFile(join(exchangeDir, "user-guidance.md"), exchange.userRequests.map((request) => request.text).join("\n\n---\n\n"), "utf8"),
       writeFile(join(exchangeDir, "acting-model-usage.json"), JSON.stringify(exchange.actingUsage ?? null, null, 2), "utf8"),
@@ -219,6 +233,7 @@ async function writeExchangeArtifacts(dir: string, exchanges: ReviewExchangeCont
 
 async function writeReviewIndex(
   dir: string,
+  workspaceRoot: string,
   cwd: string,
   reviewSequence: number,
   exchanges: ReviewExchangeContext[],
@@ -227,7 +242,8 @@ async function writeReviewIndex(
   const latestExchange = exchanges.at(-1)?.sequence;
   const manifest = {
     version: 1,
-    workspace: cwd,
+    workspace: workspaceRoot,
+    ...(workspaceRoot !== cwd ? { selectedCwd: cwd } : {}),
     bundleDir: dir,
     currentReviewSequence: reviewSequence,
     kind: question ? "reviewer-question" : "review",
@@ -246,7 +262,8 @@ async function writeReviewIndex(
   const lines = [
     "# Review Evidence Bundle",
     "",
-    `Workspace: ${cwd}`,
+    `Workspace: ${workspaceRoot}`,
+    ...(workspaceRoot !== cwd ? [`Selected Pi cwd: ${cwd}`] : []),
     `Current ${question ? "question" : "review"}: ${reviewSequence}`,
     `Latest completed exchange: ${latestExchange ?? "none"}`,
     "",

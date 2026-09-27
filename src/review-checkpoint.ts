@@ -7,11 +7,11 @@ import { execFile, spawn } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import { lstat, mkdir, mkdtemp, open, readdir, readlink, realpath, rename, rm } from "node:fs/promises";
-import { dirname, join, resolve, relative } from "node:path";
+import { dirname, join, resolve, relative, isAbsolute, sep } from "node:path";
 import { promisify } from "node:util";
 import {
   armGitCheckpoint, loadGitCheckpoint, compareGitCheckpoints, releaseGitCheckpointPin,
-  isSafeWindowId, type GitCheckpointDescriptor, type GitCheckpointOptions,
+  gitCheckpointDiscoveryEnv, isSafeWindowId, type GitCheckpointDescriptor, type GitCheckpointOptions,
   type GitCheckpointResult, type GitCheckpointRecord, type GitCheckpointUntrackedEntry,
 } from "./git-checkpoint";
 
@@ -107,24 +107,48 @@ async function existingStore(root: string): Promise<string> {
   }
   return dir;
 }
-async function gitRoot(root: string): Promise<"git" | "raw" | "broken"> {
-  const out = await command(root, ["rev-parse", "--show-toplevel"]);
-  if (out.code === 0) return "git"; // includes subdirectories: Git core refuses non-root captures
-  if (process.env.GIT_DIR) return "broken";
+type GitRoot = { kind: "git"; root: string } | { kind: "raw" | "broken" };
+async function gitRoot(root: string): Promise<GitRoot> {
+  const out = await command(root, ["rev-parse", "--show-toplevel"], gitCheckpointDiscoveryEnv());
+  if (out.code === 0) {
+    const top = out.stdout.endsWith("\r\n") ? out.stdout.slice(0, -2)
+      : out.stdout.endsWith("\n") ? out.stdout.slice(0, -1)
+        : out.stdout;
+    if (!top) return { kind: "broken" };
+    const canonicalTop = await realpath(resolve(top));
+    const withinRepository = relative(canonicalTop, root);
+    // A misleading discovery result must never redirect a parent checkpoint
+    // to a different checkout and silently report local edits as unchanged.
+    if (withinRepository === ".." || withinRepository.startsWith(`..${sep}`) || isAbsolute(withinRepository))
+      return { kind: "broken" };
+    return { kind: "git", root: canonicalTop };
+  }
+  if (process.env.GIT_DIR) return { kind: "broken" };
   // A failed rev-parse is not evidence of a non-Git root: broken or
   // unreadable metadata may be in an ancestor, not only at this root.
   // Respect Git's explicit discovery ceilings (also used by isolated tests).
   const ceilings = new Set((process.env.GIT_CEILING_DIRECTORIES ?? "").split(":").map((part) => resolve(part)));
   let dir = root;
   while (true) {
-    try { await lstat(join(dir, ".git")); return "broken"; }
+    try { await lstat(join(dir, ".git")); return { kind: "broken" }; }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     const parent = dirname(dir);
     if (parent === dir || ceilings.has(parent)) break;
     dir = parent;
   }
-  return "raw";
+  return { kind: "raw" };
 }
+async function gitCheckpointRoot(root: string): Promise<string> {
+  const dir = await ensureRoot(root);
+  const repository = await gitRoot(dir);
+  return repository.kind === "git" ? repository.root : dir;
+}
+
+/** Resolve the review-tree root without changing the selected Pi/session cwd. */
+export async function reviewCheckpointWorkspaceRoot(root: string, descriptor: ReviewCheckpointDescriptor): Promise<string> {
+  return descriptor.kind === "git" ? gitCheckpointRoot(root) : ensureRoot(root);
+}
+
 async function walk(root: string, path: string, files: string[], ignores: string[], options: GitCheckpointOptions): Promise<void> {
   checkAbort(options);
   const dir = join(root, path);
@@ -252,9 +276,9 @@ export async function captureReviewCheckpoint(root: string, windowId: string, op
     if (!isSafeWindowId(windowId)) return fail("unsafe window id");
     const dir = await ensureRoot(root);
     const strategy = await gitRoot(dir);
-    if (strategy === "broken") return fail("broken Git metadata; refusing raw fallback");
-    if (strategy === "git") {
-      const armed = await armGitCheckpoint(dir, windowId, options);
+    if (strategy.kind === "broken") return fail("broken Git metadata; refusing raw fallback");
+    if (strategy.kind === "git") {
+      const armed = await armGitCheckpoint(strategy.root, windowId, options);
       return armed.status === "ok" ? { status: "ok", value: { kind: "git", checkpoint: armed.value.descriptor } } : armed;
     }
     const store = await storePath(dir);
@@ -326,7 +350,7 @@ export async function advanceRawReviewCheckpoint(
     if (old.status !== "ok") return old;
     if (old.value.kind !== "raw") throw new Error("expected raw checkpoint");
     const dir = await ensureRoot(root);
-    if (await gitRoot(dir) !== "raw") throw new Error("raw root became a Git repository during advancement");
+    if ((await gitRoot(dir)).kind !== "raw") throw new Error("raw root became a Git repository during advancement");
     const store = await existingStore(dir);
     const files: string[] = [], ignores: string[] = [];
     await walk(dir, "", files, ignores, options);
@@ -398,7 +422,7 @@ export async function changedRawCheckpointPaths(root: string, descriptor: Extrac
     if (old.status !== "ok") return old;
     if (old.value.kind !== "raw") throw new Error("expected raw checkpoint");
     const dir = await ensureRoot(root);
-    if (await gitRoot(dir) !== "raw") throw new Error("raw root became a Git repository");
+    if ((await gitRoot(dir)).kind !== "raw") throw new Error("raw root became a Git repository");
     const files: string[] = [], ignores: string[] = [];
     await walk(dir, "", files, ignores, options);
     const store = await existingStore(dir);
@@ -432,7 +456,10 @@ function validateDescriptor(value: ReviewCheckpointDescriptor): asserts value is
 /** Verify owner, root, stored digest, record schema and each raw entry before use. */
 export async function loadReviewCheckpoint(root: string, descriptor: ReviewCheckpointDescriptor, options: GitCheckpointOptions = {}): Promise<ReviewCheckpointResult<{ kind: "git"; record: GitCheckpointRecord } | { kind: "raw"; entries: GitCheckpointUntrackedEntry[] }>> {
   if (descriptor?.kind === "git") {
-    const result = await loadGitCheckpoint(root, descriptor.checkpoint, options);
+    let checkpointRoot: string;
+    try { checkpointRoot = await gitCheckpointRoot(root); }
+    catch { checkpointRoot = resolve(root); }
+    const result = await loadGitCheckpoint(checkpointRoot, descriptor.checkpoint, options);
     return result.status === "ok" ? { status: "ok", value: { kind: "git", record: result.value.record } } : result;
   }
   try {
@@ -495,7 +522,10 @@ function sameState(old: ReviewCheckpointState | undefined, next: ReviewCheckpoin
 /** Compare two independently verified frozen records, never the current worktree. */
 export async function compareReviewCheckpoints(root: string, before: ReviewCheckpointDescriptor, after: ReviewCheckpointDescriptor, options: GitCheckpointOptions = {}): Promise<ReviewCheckpointResult<ReviewCheckpointComparison>> {
   if (before.kind === "git" && after.kind === "git") {
-    const compared = await compareGitCheckpoints(root, before.checkpoint, after.checkpoint, options, true);
+    let checkpointRoot: string;
+    try { checkpointRoot = await gitCheckpointRoot(root); }
+    catch (error) { return fail(errorOf(error)); }
+    const compared = await compareGitCheckpoints(checkpointRoot, before.checkpoint, after.checkpoint, options, true);
     if (compared.status !== "ok") return compared;
     // Tracked symlinks are Git blobs, not necessarily UTF-8 text. Refuse a
     // lossy decode before sameState can collapse distinct targets to U+FFFD.
@@ -537,9 +567,12 @@ export async function compareReviewCheckpoints(root: string, before: ReviewCheck
 /** Release only the descriptor's verified owner. A failed verification deletes nothing. */
 export async function releaseReviewCheckpoint(root: string, descriptor: ReviewCheckpointDescriptor, options: GitCheckpointOptions = {}): Promise<ReviewCheckpointResult<void>> {
   if (descriptor.kind === "git") {
-    const loaded = await loadGitCheckpoint(root, descriptor.checkpoint, options);
+    const loaded = await loadReviewCheckpoint(root, descriptor, options);
     if (loaded.status !== "ok") return loaded;
-    const released = await releaseGitCheckpointPin(root, descriptor.checkpoint.windowId, { ...options, expectedBase: descriptor.checkpoint.base, armId: descriptor.checkpoint.armId });
+    let checkpointRoot: string;
+    try { checkpointRoot = await gitCheckpointRoot(root); }
+    catch (error) { return fail(errorOf(error)); }
+    const released = await releaseGitCheckpointPin(checkpointRoot, descriptor.checkpoint.windowId, { ...options, expectedBase: descriptor.checkpoint.base, armId: descriptor.checkpoint.armId });
     return released.status === "ok" ? { status: "ok", value: undefined } : released;
   }
   const loaded = await loadReviewCheckpoint(root, descriptor, options);

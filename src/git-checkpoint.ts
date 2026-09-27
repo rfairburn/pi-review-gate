@@ -454,6 +454,17 @@ function hardenedEnv(): NodeJS.ProcessEnv {
   };
 }
 
+/** Discover a parent review's Git root under the same isolated Git environment.
+ * Retain the caller's explicit discovery ceiling for non-Git workspaces and tests,
+ * but never inherit a repository/worktree redirect or ambient Git configuration.
+ */
+export function gitCheckpointDiscoveryEnv(): NodeJS.ProcessEnv {
+  return {
+    ...hardenedEnv(),
+    ...(process.env.GIT_CEILING_DIRECTORIES === undefined ? {} : { GIT_CEILING_DIRECTORIES: process.env.GIT_CEILING_DIRECTORIES }),
+  };
+}
+
 /**
  * core.filemode is platform-conditional. On NTFS the worktree permission
  * bits carry no Git-meaningful state, so `true` turns routine filesystem

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
@@ -26,6 +26,91 @@ async function capture(root: string, id: string): Promise<ReviewCheckpointDescri
   assert.equal(result.status, "ok", JSON.stringify(result));
   return result.value;
 }
+
+test("nested Git review checkpoints cover repository-relative sibling changes without following live bytes", async () => fixture(async (root) => {
+  const repository = join(root, "repo");
+  const cwd = join(repository, "nested", "selected");
+  await mkdir(cwd, { recursive: true });
+  await git(repository, "init", "-q");
+  await writeFile(join(repository, "sibling.txt"), "committed sibling baseline\n");
+  await git(repository, "add", "sibling.txt");
+  await git(repository, "commit", "-qm", "base");
+
+  const before = await capture(cwd, "nested-before");
+  assert.equal(before.kind, "git");
+  assert.equal((await loadReviewCheckpoint(cwd, before)).status, "ok");
+  await writeFile(join(repository, "sibling.txt"), "frozen sibling after\n");
+  await writeFile(join(repository, "eligible-sibling.txt"), Buffer.from([0, 255, 11]));
+  const after = await capture(cwd, "nested-after");
+  await writeFile(join(repository, "sibling.txt"), "later live sibling bytes\n");
+  await writeFile(join(repository, "eligible-sibling.txt"), "later live untracked bytes\n");
+
+  const compared = await compareReviewCheckpoints(cwd, before, after);
+  assert.equal(compared.status, "ok", JSON.stringify(compared));
+  if (compared.status === "ok") {
+    assert.deepEqual(compared.value.changes.map((change) => change.path), ["eligible-sibling.txt", "sibling.txt"]);
+    assert.equal(compared.value.changes.find((change) => change.path === "sibling.txt")?.old?.bytes?.toString(), "committed sibling baseline\n");
+    assert.equal(compared.value.changes.find((change) => change.path === "sibling.txt")?.new?.bytes?.toString(), "frozen sibling after\n");
+    assert.deepEqual(compared.value.changes.find((change) => change.path === "eligible-sibling.txt")?.new?.bytes, Buffer.from([0, 255, 11]));
+  }
+
+  const otherRepository = join(root, "other-repo");
+  await mkdir(otherRepository);
+  await git(otherRepository, "init", "-q");
+  await writeFile(join(otherRepository, "other.txt"), "other repository\n");
+  await git(otherRepository, "add", "other.txt");
+  await git(otherRepository, "commit", "-qm", "other");
+  const other = await capture(otherRepository, "nested-other");
+  assert.equal((await loadReviewCheckpoint(otherRepository, before)).status, "failed");
+  if (before.kind === "git" && other.kind === "git") {
+    const tampered = { ...before, checkpoint: { ...before.checkpoint, gitDir: other.checkpoint.gitDir } };
+    assert.equal((await loadReviewCheckpoint(cwd, tampered)).status, "failed");
+  }
+  assert.equal((await releaseReviewCheckpoint(cwd, before)).status, "ok");
+  assert.equal((await releaseReviewCheckpoint(cwd, after)).status, "ok");
+  assert.equal((await releaseReviewCheckpoint(otherRepository, other)).status, "ok");
+}));
+
+test("ambient Git repository redirects cannot hide nested parent-review changes", async () => fixture(async (root) => {
+  const actual = join(root, "actual");
+  const selected = join(actual, "nested");
+  const unrelated = join(root, "unrelated");
+  await mkdir(selected, { recursive: true });
+  await mkdir(unrelated);
+  for (const repository of [actual, unrelated]) {
+    await git(repository, "init", "-q");
+    await writeFile(join(repository, "tracked.txt"), "baseline\n");
+    await git(repository, "add", "tracked.txt");
+    await git(repository, "commit", "-qm", "baseline");
+  }
+
+  const priorDir = process.env.GIT_DIR;
+  const priorWorktree = process.env.GIT_WORK_TREE;
+  try {
+    process.env.GIT_DIR = join(unrelated, ".git");
+    process.env.GIT_WORK_TREE = unrelated;
+    const before = await capture(selected, "redirect-before");
+    assert.equal(before.kind, "git");
+    if (before.kind !== "git") throw new Error("expected Git checkpoint");
+    assert.equal(before.checkpoint.gitDir, await realpath(join(actual, ".git")));
+    await writeFile(join(actual, "tracked.txt"), "actual repository changed\n");
+    const after = await capture(selected, "redirect-after");
+    const compared = await compareReviewCheckpoints(selected, before, after);
+    assert.equal(compared.status, "ok", JSON.stringify(compared));
+    if (compared.status === "ok") {
+      assert.deepEqual(compared.value.changes.map((change) => change.path), ["tracked.txt"]);
+      assert.equal(compared.value.changes[0]?.new?.bytes?.toString(), "actual repository changed\n");
+    }
+    assert.equal((await loadReviewCheckpoint(selected, before)).status, "ok");
+    assert.equal((await releaseReviewCheckpoint(selected, before)).status, "ok");
+    assert.equal((await releaseReviewCheckpoint(selected, after)).status, "ok");
+  } finally {
+    if (priorDir === undefined) delete process.env.GIT_DIR;
+    else process.env.GIT_DIR = priorDir;
+    if (priorWorktree === undefined) delete process.env.GIT_WORK_TREE;
+    else process.env.GIT_WORK_TREE = priorWorktree;
+  }
+}));
 
 test("Git clean tracked bytes are referenced, while staged, unstaged and untracked bytes are recoverable", async () => fixture(async (root) => {
   await git(root, "init", "-q");

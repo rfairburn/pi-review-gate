@@ -20,7 +20,8 @@ dates.
 ### Fixed
 
 - Allow Git parent baselines on Windows when directory fsync reports `EPERM`,
-  while preserving record-file flushes and checkpoint verification.
+  and avoid a false untracked-file race when path stat omits the volume ID that
+  open-handle stat reports. Preserve file flushes and actual race checks.
 
 ## [0.1.0-dev.85]
 

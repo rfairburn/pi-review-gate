@@ -1985,7 +1985,11 @@ async function captureUntrackedEntry(
   });
   try {
     const stat = await handle.stat();
-    if (!sameStatIdentity(statIdentityOf(stat), statIdentityOf(pre))) {
+    const openedIdentity = statIdentityOf(stat);
+    // Windows path lstat may report dev=0 while fstat of the same inode
+    // reports a volume ID. Keep every other field and the path re-stat check.
+    if (process.platform === "win32" && pre.dev === 0) openedIdentity.dev = 0;
+    if (!sameStatIdentity(openedIdentity, statIdentityOf(pre))) {
       throw new GitCheckpointError(`untracked path ${path} changed while being captured`, "untracked_capture_race");
     }
     await assertUntrackedParents(root, path, parents);

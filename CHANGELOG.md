@@ -20,8 +20,20 @@ dates.
 ### Fixed
 
 - Allow Git parent baselines on Windows when directory fsync reports `EPERM`,
-  and avoid a false untracked-file race when path stat omits the volume ID that
-  open-handle stat reports. Preserve file flushes and actual race checks.
+  and avoid false untracked and tracked-file races when path stat omits the
+  volume ID that open-handle stat reports. Preserve file flushes and actual
+  race checks.
+- Preserve Windows Git's effective `core.autocrlf` normalization without
+  exposing other ambient Git settings; suppress worktree-only mode noise
+  while retaining staged mode changes. Reload large valid checkpoint records
+  without overflowing Base64 validation.
+- Avoid worktree-only mode noise in private Windows subtask capture while
+  retaining source-index staged executable modes and current worktree bytes;
+  use an opened directory's volume ID to bind capture, landing and recovery
+  when path stat omits it. Keep the POSIX capture behavior unchanged.
+- Contain synchronous reviewer and delegated executor process-kill errors,
+  including Windows `EINVAL`, without treating a still-live child as exited;
+  retain termination diagnostics and bounded kill escalation.
 
 ## [0.1.0-dev.85]
 

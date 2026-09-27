@@ -211,6 +211,15 @@ jobs:
         # The same npm script the launcher's development branch executes
         # (npm --prefix <root> run build), validating the toolchain natively.
         run: npm run build
+      # Issue #204: alias-independent Pi child launch. On this host the only
+      # `pi` PATH entry is npm's pi.cmd shim, and a shell:false spawn of the
+      # bare name cannot find an executable; these regressions start real
+      # child processes through the shared resolver (reviewer prompt, delegated
+      # RPC executor, compaction recovery) plus cross-platform resolver/argv
+      # safety cases. The bounded real-Pi registration check skips itself when
+      # no pi-coding-agent install is discoverable on the runner.
+      - name: Pi child launch tests (alias-independent, native Windows)
+        run: node --test dist-test/tests/pi-child-launch.test.js
       - name: Static docs validation
         run: node scripts/check-docs.cjs
       - name: Docs checker regression tests

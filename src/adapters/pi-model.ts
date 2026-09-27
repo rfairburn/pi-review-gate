@@ -67,6 +67,10 @@ export class PiModelAdapter implements ModelAdapter {
     const output = await (this.dependencies.runPromptProcess ?? runPromptProcess)({
       command: this.config.command ?? "pi",
       args,
+      // #204: only the Pi adapter opts into alias-independent default pi
+      // resolution; other adapters sharing runPromptProcess keep their exact
+      // configured command semantics.
+      resolveDefaultPi: true,
       cwd: req.cwd,
       prompt: req.prompt,
       timeoutMs: req.timeoutMs,

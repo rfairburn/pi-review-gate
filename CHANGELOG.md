@@ -36,6 +36,14 @@ dates.
 - Contain synchronous reviewer and delegated executor process-kill errors,
   including Windows `EINVAL`, without treating a still-live child as exited;
   retain termination diagnostics and bounded kill escalation.
+- Launch Pi child processes (reviewer prompts, the delegated Pi RPC executor,
+  and compaction recovery) alias-independently through one shared resolver:
+  on Windows the default `pi` resolves to an installed pi.exe or npm's
+  pi.cmd shim JavaScript entry executed by this Node binary without a shell,
+  because a shell-less spawn of the bare name cannot find the cmd shim; POSIX
+  keeps direct execution and configured custom commands keep their exact
+  spawn semantics. A missing or unresolvable default Pi CLI fails closed with
+  an actionable error instead of a raw spawn failure.
 
 ## [0.1.0-dev.85]
 

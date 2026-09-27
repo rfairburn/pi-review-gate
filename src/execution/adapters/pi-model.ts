@@ -3,6 +3,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { terminateProcessTree, type ProcessRunResult } from "../../adapters/process";
+import { DEFAULT_PI_COMMAND, resolvePiChildSpawn, translateDefaultPiSpawnError } from "../../pi-invocation";
 import { BoundedTextAccumulator, MEBIBYTE } from "../../jsonl";
 import { extractReviewTextFromPiJsonl, PiJsonlReviewExtractor } from "../../usage";
 import { writeExecutorArtifacts } from "../artifacts";
@@ -119,12 +120,21 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     // The identity is random, but remove only this exact parent-owned path so
     // an impossible stale collision can never satisfy the new child.
     await removePiSettlementReceipt(settlementBootstrap);
-    const proc = spawn(this.options.command ?? "pi", args, {
+    // #204: alias-independent default `pi` launch (the Windows npm pi.cmd
+    // shim resolves to its JavaScript entry through this Node binary; custom
+    // commands and POSIX direct spawns keep their exact semantics).
+    const childEnv = executorEnv(toolCatalog, settlementBootstrap);
+    const invocation = resolvePiChildSpawn(this.options.command ?? "pi", args, childEnv);
+    if (!invocation.ok) throw new Error(invocation.error);
+    // Only the POSIX pass-through keeps the bare `pi` name; a missing default
+    // Pi CLI there surfaces as an actionable diagnostic instead of raw ENOENT.
+    const isDefaultPiPassThrough = invocation.file === DEFAULT_PI_COMMAND;
+    const proc = spawn(invocation.file, invocation.args, {
       cwd: request.cwd,
       detached: process.platform !== "win32",
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
-      env: executorEnv(toolCatalog, settlementBootstrap),
+      env: childEnv,
     });
     const identity = proc.pid === undefined ? undefined : {
       pid: proc.pid,
@@ -136,7 +146,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     const rpc = new PiRpc(proc, backgroundReadiness, (chunk) => {
       extractor.push(chunk);
       activity.push(chunk);
-    });
+    }, (error) => translateDefaultPiSpawnError(error, isDefaultPiPassThrough));
     let timedOut = false;
     let aborted = false;
     let interruptedByControl = false;
@@ -477,6 +487,8 @@ export class PiRpc {
     private readonly proc: ChildProcess,
     private readonly backgroundReadiness: BackgroundProcessReadiness,
     private readonly onJsonl: (chunk: string) => void,
+    /** #204: translate a raw spawn ENOENT of the POSIX default-pi pass-through into the actionable missing-CLI diagnostic. */
+    private readonly translateSpawnError?: (error: Error) => Error,
   ) {
     proc.stdout?.on("data", (value: Buffer) => this.consume(value.toString("utf8")));
     proc.stderr?.on("data", (value: Buffer) => { this.stderr.append(value.toString("utf8")); });
@@ -506,7 +518,7 @@ export class PiRpc {
         this.settledWaiters = [];
         resolvePromise({ code, signal });
       });
-      proc.once("error", (error) => this.failTransport(error));
+      proc.once("error", (error) => this.failTransport(this.translateSpawnError ? this.translateSpawnError(error) : error));
     });
   }
 
@@ -684,12 +696,20 @@ async function compactInterruptedSession(input: {
   ];
 
   await new Promise<void>((resolve, reject) => {
-    const proc = spawn(input.command, args, {
+    // #204: the compaction recovery child uses the same alias-independent
+    // resolution as the main RPC executor launch.
+    const childEnv = { ...input.env, PWD: input.cwd };
+    const invocation = resolvePiChildSpawn(input.command, args, childEnv);
+    if (!invocation.ok) {
+      reject(new Error(invocation.error));
+      return;
+    }
+    const proc = spawn(invocation.file, invocation.args, {
       cwd: input.cwd,
       detached: process.platform !== "win32",
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...input.env, PWD: input.cwd },
+      env: childEnv,
     });
     const processIdentity = proc.pid === undefined
       ? undefined
@@ -754,7 +774,10 @@ async function compactInterruptedSession(input: {
     const onAbort = () => requestFinish(abortError(input.signal));
     input.signal?.addEventListener("abort", onAbort, { once: true });
 
-    proc.on("error", (error) => requestFinish(error));
+    // Only the POSIX pass-through keeps the bare `pi` name; a missing default
+    // Pi CLI there surfaces as an actionable diagnostic instead of raw ENOENT.
+    const isDefaultPiPassThrough = invocation.file === DEFAULT_PI_COMMAND;
+    proc.on("error", (error) => requestFinish(translateDefaultPiSpawnError(error, isDefaultPiPassThrough)));
     proc.stdin.on("error", (error) => requestFinish(error));
     // Output-pipe errors would otherwise surface as uncaught stream
     // exceptions; route them through the same fail-closed finish path.

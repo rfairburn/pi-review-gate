@@ -3,6 +3,7 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ReviewerInvocationTelemetry, ReviewResult } from "../schema";
 import { BoundedJsonlDecoder, MEBIBYTE, utf8Prefix } from "../jsonl";
+import { DEFAULT_PI_COMMAND, resolvePiChildSpawn, translateDefaultPiSpawnError } from "../pi-invocation";
 
 export interface ProcessRunResult {
   stdout: string;
@@ -170,6 +171,13 @@ export async function runPromptProcess(input: {
   maxRetainedOutputBytes?: number;
   /** Internal/test override for deterministic SIGKILL escalation coverage. */
   terminationEscalationMs?: number;
+  /**
+   * #204: alias-independent default `pi` resolution. This seam is shared by
+   * non-Pi adapters (generic-cli, run-as-binary, claude-cli, codex-cli), whose
+   * configured commands keep their exact spawn semantics; only the Pi model
+   * adapter opts in.
+   */
+  resolveDefaultPi?: boolean;
 }): Promise<ProcessRunResult> {
   const maxRetainedOutputBytes = input.maxRetainedOutputBytes ?? MAX_RETAINED_OUTPUT_BYTES;
   if (!Number.isSafeInteger(maxRetainedOutputBytes) || maxRetainedOutputBytes < 0) {
@@ -184,12 +192,29 @@ export async function runPromptProcess(input: {
   }
 
   return await new Promise((resolve, reject) => {
-    const proc = spawn(input.command, input.args, {
+    const childEnv = { ...(input.env ?? process.env), PWD: input.cwd };
+    // #204: alias-independent default `pi` launch, opt-in so non-Pi adapters
+    // sharing this seam keep their exact configured command/argv semantics.
+    let file = input.command;
+    let spawnArgs: string[] = [...input.args];
+    if (input.resolveDefaultPi) {
+      const invocation = resolvePiChildSpawn(input.command, input.args, childEnv);
+      if (!invocation.ok) {
+        reject(new Error(invocation.error));
+        return;
+      }
+      file = invocation.file;
+      spawnArgs = invocation.args;
+    }
+    // Only the POSIX pass-through keeps the bare `pi` name; a missing default
+    // Pi CLI there surfaces as an actionable diagnostic instead of raw ENOENT.
+    const isDefaultPiPassThrough = input.resolveDefaultPi === true && file === DEFAULT_PI_COMMAND;
+    const proc = spawn(file, spawnArgs, {
       cwd: input.cwd,
       detached: process.platform !== "win32",
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...(input.env ?? process.env), PWD: input.cwd },
+      env: childEnv,
     });
 
     let stdout = "";
@@ -285,7 +310,7 @@ export async function runPromptProcess(input: {
       if (forceKillTimer) {
         clearTimeout(forceKillTimer);
       }
-      reject(error);
+      reject(translateDefaultPiSpawnError(error, isDefaultPiPassThrough));
     });
     proc.stdout.setEncoding("utf8");
     proc.stdout.on("data", (chunk: string) => {
@@ -506,6 +531,12 @@ function cappedChunk(chunk: string, remainingBytes: number): { value: string; by
 }
 
 export function terminateProcessTree(proc: ChildProcess, signal: NodeJS.Signals): string | undefined {
+  // A child whose spawn failed never forked: pid stays undefined forever.
+  // Signaling it is not a no-op — on Node 24, kill() after a failed spawn
+  // delivers the signal to the caller's own process group (observed: the
+  // parent dies with SIGTERM). There is nothing to terminate; the spawn
+  // error itself is the failure that must surface.
+  if (proc.pid === undefined) return undefined;
   let processGroupError: unknown;
   if (proc.pid && process.platform !== "win32") {
     try {

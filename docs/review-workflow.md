@@ -7,10 +7,22 @@ layout. Field defaults are owned by [Configuration](configuration.md).
 ## Review windows and evidence
 
 Each review window uses one stable temporary evidence bundle. Every completed agent run
-is appended as a numbered exchange containing its snapshot-derived workspace diff,
-captured side-effect diff, tool calls and results, assistant summary, usage, and
-before/after artifacts. The bundle also maintains the cumulative baseline-to-current
-patch and numbered reviewer invocations.
+is appended as a numbered exchange containing its workspace diff, captured side-effect
+diff, tool calls and results, assistant summary, usage, and before/after artifacts.
+The bundle also maintains the cumulative baseline-to-current patch and numbered
+reviewer invocations.
+
+Parent review uses one durable checkpoint mechanism for Git and non-Git workspaces.
+Each settlement freezes one after-checkpoint. In a Git checkout, it pins clean committed content
+and captures both staged and unstaged Git differences plus raw non-ignored untracked
+entries. Tracked content follows Git-normalized newline semantics: the checkpoint is
+not a raw CRLF reproduction guarantee and does not run a separate EOL proof pass.
+Untracked entries, and eligible entries in a non-Git workspace, retain their raw bytes.
+For non-Git capture, `.gitignore` patterns apply within their directory subtree; if
+any `.gitignore` exists, global Git excludes apply throughout the capture root, while
+without one there are no global excludes. Comparisons use the frozen after-checkpoint
+against separate window and exchange baselines; a checkpoint is not itself a passing
+review or a substitute for either baseline.
 
 Exact `write` / `edit` paths and easy shell targets are pre-captured before execution,
 including absolute paths outside the current worktree. Repository baselines,
@@ -28,20 +40,12 @@ after seeing the passing observations, that response becomes a new exchange in t
 window and triggers another review. Later ordinary work starts a fresh window from
 current file contents and does not re-review changes that already passed.
 
-The first baseline capture of each new unseeded exchange reuses verified facts (hash,
-binary classification, retained content) from the last successfully completed snapshot
-of the same resolved working directory, held in a bounded session-local reference that
-survives ordinary review-window close. The capture still enumerates and stats every
-current path, re-verifies each reused record against the live entry, and recomputes
-every retain/omit decision against the current limits, so edits, additions, deletions,
-and limit changes between turns are reported exactly as a fresh capture would report
-them; the retained snapshot is a reuse source only and never becomes a review baseline.
-Only completed captures seed the reference — an aborted or failed capture leaves it
-untouched — and it is cleared on every session start and shutdown (including `/new`
-and `/reload`) and is never reused across different working directories or persisted to
-disk. An exchange whose baseline is already seeded still skips its baseline capture
-entirely, as before, and reviewer inputs, verdicts, corrections, cancellation,
-scheduling, and state restoration are unchanged by the reuse.
+At cutover, an active pre-checkpoint review window starts fresh with the existing
+workspace edits as its new baseline; no earlier verdict is migrated or represented as
+a pass on the new window. If a new checkpoint is damaged or cannot be verified, its
+evidence is preserved and the user is notified. Review starts fresh from the current
+workspace as baseline rather than claiming that edits under the damaged checkpoint
+passed. A fresh baseline cannot retroactively certify those earlier edits.
 
 ## Live browser during review
 

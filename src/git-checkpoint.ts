@@ -2,7 +2,7 @@
  * #193: Durable Git-backed workspace checkpoint core (Git-first strategy).
  *
  * A checkpoint arms a small, durable baseline for a Git checkout that is
- * exactly reconstructible later — across HEAD movement, index changes,
+ * reconstructible later under Git's tracked-content semantics — across HEAD movement, index changes,
  * `git gc --prune=now`, and process restarts — without ever retaining clean
  * tracked content:
  *
@@ -43,7 +43,7 @@
  *
  * Fail-closed contract: every Git uncertainty is refused with an explicit
  * reason rather than producing a silent gap — external diff/textconv/filter
- * programs, EOL normalization (autocrlf/core.eol/text attributes),
+ * programs and non-EOL clean/smudge transformations,
  * assume-unchanged and skip-worktree index flags, unmerged entries, sparse
  * checkout, tracked submodules, unborn HEAD, non-root capture paths,
  * enumeration warnings, capture races (an untracked entry changing under its
@@ -52,7 +52,9 @@
  * publishing), patch size overflow, malformed or missing pins.
  * `unsupported` results mean the Git strategy cannot be soundly applied to
  * this repository/state and callers may fall back to the existing filesystem
- * snapshot code; `failed` results are operational errors.
+ * snapshot code; `failed` results are operational errors. Tracked text follows
+ * Git-normalized semantics: CRLF/LF differences alone are not separately
+ * captured. Non-ignored untracked content remains raw-exact.
  *
  * **Compact descriptor and by-ID reload.** Arm publishes the exact encoded
  * record durably — owned scratch temp file, file fsync, atomic rename,
@@ -80,7 +82,10 @@
  * destructive step, and the pin's latest reflog entry must name that arm: a
  * stale prior generation armed at the SAME commit cannot release a newer arm
  * that reuses the window id, and a release whose generation proof is missing
- * or mismatched removes nothing. `loadGitCheckpoint` applies the same proof
+ * or mismatched removes nothing. An interprocess per-window lock serializes
+ * arm creation and failed-arm cleanup with release's proof, ref delete, and
+ * owned-record removal; base-only ref CAS cannot close that interval.
+ * `loadGitCheckpoint` applies the same proof
  * on the load side: a record directory that survived an interrupted release
  * (best-effort scratch removal, or a crash between the ref delete and the rm)
  * cannot be loaded after a same-base re-arm — the pin's current owner must be
@@ -96,7 +101,9 @@
  * recovery is an operator verifying ownership out-of-band and deleting only
  * this window's
  * owned ref (`git update-ref -d <ref> <expectedBase>`) and its owned scratch
- * directory — never another session's refs.
+ * directory — never another session's refs. A crashed process may leave a
+ * per-window mutex under `pi-review-gate/checkpoint-pin-locks`; removal is
+ * manual only after confirming no checkpoint process still holds it.
  *
  * Hardened execution (mirrors src/git-read/git.ts): argv-array spawn, no
  * shell, minimal fixed environment (user/system config replaced with
@@ -121,7 +128,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { constants, type Stats } from "node:fs";
-import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readlink, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readlink, rename, rm, rmdir, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
@@ -291,6 +298,14 @@ export interface GitCheckpointFaultHooks {
    * regression tests of the capture-consistency verification.
    */
   betweenPatchCaptures?: () => void | Promise<void>;
+  /** Runs after the initial repository audit, before an operation's capture window. */
+  afterInitialAudit?: () => void | Promise<void>;
+  /** Runs under the window pin lock after release verifies the owner, before deletion. */
+  beforePinReleaseDelete?: () => void | Promise<void>;
+  /** Runs under the window pin lock after release deletes the ref, before scratch cleanup. */
+  afterPinReleaseDelete?: () => void | Promise<void>;
+  /** Runs when an arm finds its window pin lock held (test synchronization). */
+  onPinLockContended?: () => void | Promise<void>;
 }
 
 export interface GitCheckpointOptions {
@@ -431,6 +446,9 @@ const SAFE_CONFIG_OVERRIDES = [
   // Mode capture must not depend on ambient config (repo convention: see
   // src/execution/wave-repository.ts).
   "core.filemode=true",
+  // Tracked text uses Git-normalized bytes; expected CRLF normalization must
+  // not emit safecrlf warnings that otherwise abort a valid diff capture.
+  "core.safecrlf=false",
   "commit.gpgsign=false",
   "submodule.recurse=false",
   // Never descend into submodule repositories for diff display.
@@ -1022,7 +1040,7 @@ async function auditRepository(
   gitPath: string,
   root: string,
   spec: GitRunSpec,
-): Promise<GitCheckpointResult<void>> {
+): Promise<GitCheckpointResult<string>> {
   let configOut: GitRunOutput;
   try {
     configOut = await runGit(gitPath, root, ["config", "--list", "--show-origin", "-z"], {
@@ -1037,14 +1055,13 @@ async function auditRepository(
   }
   // With --show-origin -z each entry is two NUL-separated records: an origin
   // record, then a "key\nvalue" record. Scan for keys that could execute
-  // programs or normalize bytes during diff/clean.
+  // programs or perform unsupported conversions during diff/clean.
   const records = configOut.stdout.toString("utf8").split("\0");
   for (let i = 1; i < records.length; i += 2) {
     const record = records[i] ?? "";
     if (!record) continue;
     const nl = record.indexOf("\n");
     const key = (nl >= 0 ? record.slice(0, nl) : record).toLowerCase();
-    const value = nl >= 0 ? record.slice(nl + 1) : "";
     // Driver names may contain dots: git splits the driver config key at the LAST dot.
     if (key === "diff.external" || /^diff\..+\.command$/.test(key) || /^diff\..+\.textconv$/.test(key)) {
       return {
@@ -1057,24 +1074,10 @@ async function auditRepository(
       return {
         status: "unsupported",
         reason: "filter_or_eol_configured",
-        detail: `repository config defines ${key}; clean/smudge filters are not trustworthy for exact bytes`,
+        detail: `repository config defines ${key}; external clean/smudge filters are unsupported`,
       };
     }
-    if (key === "core.autocrlf" && value !== "" && value !== "false") {
-      return {
-        status: "unsupported",
-        reason: "filter_or_eol_configured",
-        detail: `core.autocrlf=${value}; EOL normalization would corrupt exact bytes`,
-      };
-    }
-    if (key === "core.eol") {
-      return {
-        status: "unsupported",
-        reason: "filter_or_eol_configured",
-        detail: `core.eol=${value}; EOL normalization would corrupt exact bytes`,
-      };
-    }
-    if ((key === "core.sparsecheckout" || key === "core.sparsecheckoutcone") && value === "true") {
+    if ((key === "core.sparsecheckout" || key === "core.sparsecheckoutcone") && record.slice(nl + 1) === "true") {
       return {
         status: "unsupported",
         reason: "skip_worktree_entry",
@@ -1083,10 +1086,10 @@ async function auditRepository(
     }
   }
 
-  // Index entry flags, modes, stages, and effective EOL attributes in one pass.
+  // Index entry flags, modes, and stages (not worktree EOL state).
   let listOut: GitRunOutput;
   try {
-    listOut = await runGit(gitPath, root, ["ls-files", "-s", "-v", "--eol", "-z"], {
+    listOut = await runGit(gitPath, root, ["ls-files", "-s", "-v", "-z"], {
       ...spec,
       maxBytes: 32 * 1024 * 1024,
     });
@@ -1096,15 +1099,13 @@ async function auditRepository(
   if (listOut.code !== 0 || listOut.stderr.trim().length > 0) {
     return { status: "failed", reason: "git_warning", detail: truncateDetail(listOut.stderr || `git ls-files exit ${listOut.code}`) };
   }
-  const trackedPaths: string[] = [];
+  const trackedPaths: Array<{ path: string; mode: string }> = [];
   for (const record of listOut.stdout.toString("utf8").split("\0")) {
     if (!record) continue;
     const firstTab = record.indexOf("\t");
     if (firstTab < 0) return { status: "failed", reason: "git_failed", detail: "unparseable ls-files record" };
     const meta = record.slice(0, firstTab);
-    const eolInfoEnd = record.indexOf("\t", firstTab + 1);
-    const eolInfo = eolInfoEnd > 0 ? record.slice(firstTab + 1, eolInfoEnd) : "";
-    const path = eolInfoEnd > 0 ? record.slice(eolInfoEnd + 1) : record.slice(firstTab + 1);
+    const path = record.slice(firstTab + 1);
     if (!isSafeRelativePath(path)) {
       return { status: "failed", reason: "git_warning", detail: `unsafe tracked path from ls-files: ${JSON.stringify(path)}` };
     }
@@ -1127,33 +1128,22 @@ async function auditRepository(
     if (mode === "160000") {
       return { status: "unsupported", reason: "submodule_tracked", detail: `path ${path} is a tracked submodule (gitlink); subproject state cannot be captured in patches` };
     }
-    const attrMark = eolInfo.lastIndexOf("attr/");
-    if (attrMark >= 0) {
-      // Unset attributes are emitted as "attr/" followed by padding spaces.
-      const attr = eolInfo.slice(attrMark + "attr/".length).trim();
-      if (attr !== "" && attr !== "-" && attr !== "binary") {
-        return { status: "unsupported", reason: "text_attribute_in_use", detail: `path ${path} has EOL/text attribute '${attr}'; normalization would corrupt exact bytes` };
-      }
-    }
-    trackedPaths.push(path);
+    trackedPaths.push({ path, mode });
   }
 
-  // `--eol` only reports the text/eol/crlf attributes. Two further
-  // attribute-driven conversions change the raw worktree bytes without
-  // appearing there: `ident` ($Id$ expansion on checkout) and
-  // `working-tree-encoding` (worktree content re-encoded to UTF-8 in the
-  // index). Ask Git for the effective attributes of every tracked path in
-  // one batch and fail closed when either is set.
+  // Only non-EOL conversions remain unsupported. Fingerprint effective
+  // config too, so a mid-operation configuration change fails closed.
+  const auditHash = createHash("sha256").update(configOut.stdout);
   if (trackedPaths.length > 0) {
-    const attrInput = Buffer.from(`${trackedPaths.join("\0")}\0`, "utf8");
+    const attrInput = Buffer.from(`${trackedPaths.map((entry) => entry.path).join("\0")}\0`, "utf8");
     let attrOut: GitRunOutput;
     try {
       attrOut = await runGitWithInput(
         gitPath,
         root,
-        ["check-attr", "-z", "--stdin", "ident", "working-tree-encoding"],
+        ["check-attr", "-z", "--stdin", "filter", "ident", "working-tree-encoding"],
         attrInput,
-        // Two NUL-terminated triples per tracked path (path + attribute +
+        // One NUL-terminated triple per attribute/path (path + attribute +
         // value), so this output scales with the tracked-path count and needs
         // the same order of cap as the ls-files enumeration above (32 MiB)
         // rather than the 1 MiB base spec cap, which would fail closed with
@@ -1168,21 +1158,63 @@ async function auditRepository(
       return { status: "failed", reason: "git_warning", detail: truncateDetail(attrOut.stderr || `git check-attr exit ${attrOut.code}`) };
     }
     // `-z --stdin` output is a flat run of NUL-terminated
-    // <path> <attribute> <info> triples.
+    // <path> <attribute> <info> triples, in path/attribute argument order.
     const fields = attrOut.stdout.toString("utf8").split("\0");
-    for (let i = 0; i + 2 < fields.length; i += 3) {
-      const attribute = fields[i + 1] ?? "";
-      const value = fields[i + 2] ?? "";
-      if (value !== "unspecified" && value !== "unset") {
-        return {
-          status: "unsupported",
-          reason: "filter_or_eol_configured",
-          detail: `path ${fields[i]} has the ${attribute} attribute (${value}); raw worktree bytes would not be reconstructible`,
-        };
+    const attributeNames = ["filter", "ident", "working-tree-encoding"] as const;
+    const expectedFields = trackedPaths.length * attributeNames.length * 3;
+    if (fields.length !== expectedFields + 1 || fields[expectedFields] !== "") {
+      return { status: "failed", reason: "git_failed", detail: "incomplete git check-attr output" };
+    }
+    for (let pathIndex = 0; pathIndex < trackedPaths.length; pathIndex += 1) {
+      const tracked = trackedPaths[pathIndex]!;
+      const values: Record<(typeof attributeNames)[number], string> = {
+        filter: "",
+        ident: "",
+        "working-tree-encoding": "",
+      };
+      for (let attrIndex = 0; attrIndex < attributeNames.length; attrIndex += 1) {
+        const offset = (pathIndex * attributeNames.length + attrIndex) * 3;
+        const attribute = attributeNames[attrIndex]!;
+        if (fields[offset] !== tracked.path || fields[offset + 1] !== attribute || fields[offset + 2] === undefined) {
+          return { status: "failed", reason: "git_failed", detail: `unparseable git check-attr output for ${tracked.path}` };
+        }
+        values[attribute] = fields[offset + 2]!;
       }
+
+      for (const attribute of ["filter", "ident", "working-tree-encoding"] as const) {
+        const value = values[attribute];
+        if (value !== "unspecified" && value !== "unset") {
+          return {
+            status: "unsupported",
+            reason: "filter_or_eol_configured",
+            detail: `path ${tracked.path} has unsupported non-EOL ${attribute} conversion (${value})`,
+          };
+        }
+      }
+      auditHash.update(JSON.stringify([tracked.path, tracked.mode, values]));
+      auditHash.update("\0");
     }
   }
-  return { status: "ok", value: undefined };
+  return { status: "ok", value: auditHash.digest("hex") };
+}
+
+/** Fail closed if audited config, attributes, or index flags changed in-window. */
+function assertAuditProofStable(before: string, after: GitCheckpointResult<string>): void {
+  if (after.status !== "ok") {
+    throw new GitCheckpointError(after.detail ?? `post-capture repository audit was ${after.status}`, after.reason);
+  }
+  if (after.value !== before) {
+    throw new GitCheckpointError("audited config, attributes, or index flags changed during capture", "capture_inconsistent");
+  }
+}
+
+async function runAfterInitialAuditHook(options: GitCheckpointOptions): Promise<void> {
+  try {
+    await options.faultHooks?.afterInitialAudit?.();
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") throw error;
+    throw new GitCheckpointError(`initial-audit hook failed: ${messageOf(error)}`, "git_failed");
+  }
 }
 
 // ── Arm ──────────────────────────────────────────────────────────────────────
@@ -1252,6 +1284,8 @@ export async function armGitCheckpoint(
 
     const audit = await auditRepository(gitPath, repo.root, spec);
     if (audit.status !== "ok") return audit;
+    const initialAuditProof = audit.value;
+    await runAfterInitialAuditHook(options);
     throwIfAborted(spec.signal);
 
     let headOut: GitRunOutput;
@@ -1282,7 +1316,16 @@ export async function armGitCheckpoint(
     const armId = randomBytes(8).toString("hex");
     const ref = checkpointRefForWindow(windowId);
     const zeroOid = objectFormat === "sha1" ? ZERO_OID_SHA1 : ZERO_OID_SHA256;
-    const pinCreated = await createPinIfMissing(gitPath, repo.root, ref, base, zeroOid, armId, spec);
+    // Serialize ref creation against release's generation proof, deletion,
+    // and scratch cleanup. Git's base-only CAS cannot distinguish same-base
+    // generations once the old ref has been deleted.
+    const unlockPin = await acquireWindowPinLock(repo.gitDir, windowId, spec, options.faultHooks?.onPinLockContended);
+    let pinCreated: GitCheckpointResult<"created">;
+    try {
+      pinCreated = await createPinIfMissing(gitPath, repo.root, ref, base, zeroOid, armId, spec);
+    } finally {
+      await unlockPin();
+    }
     if (pinCreated.status !== "ok") return pinCreated;
 
     // Owned scratch for this arm: a per-arm subdirectory inside the shared
@@ -1329,8 +1372,14 @@ export async function armGitCheckpoint(
       // verified window; untracked entries carry their own pre/post stat
       // identity checks below.
       const indexTreeBefore = await snapshotIndexTree(gitPath, repo, join(scratchDir, "index-pre"), spec);
-      const preUnstagedDiff = await captureDiff(gitPath, repo.root, [], spec, maxPatchBytes);
-      stagedPatch = await captureDiff(gitPath, repo.root, ["--cached", base], spec, maxPatchBytes);
+      const preUnstagedDiff = await captureDiff(gitPath, repo.root, [], spec, maxPatchBytes, {
+        repo,
+        copyPath: join(scratchDir, "index-pre-diff"),
+      });
+      stagedPatch = await captureDiff(gitPath, repo.root, ["--cached", base], spec, maxPatchBytes, {
+        repo,
+        copyPath: join(scratchDir, "index-staged-diff"),
+      });
       throwIfAborted(spec.signal);
       // Deterministic fault seam between the two patch captures (tests only).
       try {
@@ -1341,7 +1390,10 @@ export async function armGitCheckpoint(
         }
         throw error;
       }
-      unstagedPatch = await captureDiff(gitPath, repo.root, [], spec, maxPatchBytes);
+      unstagedPatch = await captureDiff(gitPath, repo.root, [], spec, maxPatchBytes, {
+        repo,
+        copyPath: join(scratchDir, "index-unstaged-diff"),
+      });
       const indexTreeAfter = await snapshotIndexTree(gitPath, repo, join(scratchDir, "index-post"), spec);
       if (indexTreeBefore !== indexTreeAfter) {
         throw new GitCheckpointError(
@@ -1377,6 +1429,14 @@ export async function armGitCheckpoint(
         untracked.push(entry);
         throwIfAborted(spec.signal);
       }
+    } catch (error) {
+      await cleanupAfterFailedArm(gitPath, repo, windowId, base, armId, scratchDir, spec);
+      return resultFromError(error);
+    }
+
+    try {
+      const finalAudit = await auditRepository(gitPath, repo.root, spec);
+      assertAuditProofStable(initialAuditProof, finalAudit);
     } catch (error) {
       await cleanupAfterFailedArm(gitPath, repo, windowId, base, armId, scratchDir, spec);
       return resultFromError(error);
@@ -1484,6 +1544,36 @@ async function createPinIfMissing(
   return { status: "failed", reason: "git_failed", detail: truncateDetail(lastErrorDetail) };
 }
 
+/**
+ * Interprocess window mutex. The lock lives OUTSIDE window scratch so a
+ * release cannot remove it while held. Never steal an abandoned lock: a
+ * timed-out contender fails closed; an operator may remove the lock after
+ * establishing that no checkpoint process still holds it.
+ */
+async function acquireWindowPinLock(
+  gitDir: string, windowId: string, spec: GitRunSpec,
+  onContended?: () => void | Promise<void>,
+): Promise<() => Promise<void>> {
+  const locksDir = join(gitDir, "pi-review-gate", "checkpoint-pin-locks");
+  const lockDir = join(locksDir, windowId);
+  await mkdir(locksDir, { recursive: true });
+  const deadline = Date.now() + spec.timeoutMs;
+  while (true) {
+    throwIfAborted(spec.signal);
+    try {
+      await mkdir(lockDir);
+      return async () => { await rmdir(lockDir); };
+    } catch (error) {
+      if (fsCodeOf(error) !== "EEXIST") throw error;
+      await onContended?.();
+      if (Date.now() >= deadline) {
+        throw new GitCheckpointError(`checkpoint pin lock for ${windowId} is held or abandoned; refusing to mutate the pin`, "git_failed");
+      }
+      await sleepMs(PIN_SETTLE_MS);
+    }
+  }
+}
+
 function sleepMs(ms: number): Promise<void> {
   return new Promise((resolvePromise) => {
     setTimeout(resolvePromise, ms);
@@ -1576,35 +1666,71 @@ async function cleanupAfterFailedArm(
   // Generation proof first: the pin's LATEST reflog entry must name THIS
   // arm. The entry was written atomically with this arm's pin create, so a
   // mismatch means someone else now owns the ref — leave it alone.
-  let genOut: GitRunOutput | undefined;
+  // A cleanup racing another release/re-arm must hold the SAME interprocess
+  // lock. If the lock cannot be obtained, leave the pin in place: no proof
+  // can authorize deleting it later outside this critical section.
+  let unlockPin: (() => Promise<void>) | undefined;
   try {
-    genOut = await runGit(gitPath, repo.root, ["log", "-g", "-1", "--format=%gs", checkpointRefForWindow(windowId)], cleanupSpec);
-  } catch { /* best effort — no proof, so no delete */ }
-  if (genOut !== undefined && genOut.code === 0 && genOut.stdout.toString("utf8").trim() === pinGenerationMessage(armId)) {
+    unlockPin = await acquireWindowPinLock(repo.gitDir, windowId, cleanupSpec);
+    let genOut: GitRunOutput | undefined;
     try {
-      await runGit(
-        gitPath,
-        repo.root,
-        ["update-ref", "--no-deref", "-m", "prg-git-checkpoint cleanup", "-d", checkpointRefForWindow(windowId), base],
-        cleanupSpec,
-      );
-    } catch { /* best effort */ }
-  }
+      genOut = await runGit(gitPath, repo.root, ["log", "-g", "-1", "--format=%gs", checkpointRefForWindow(windowId)], cleanupSpec);
+    } catch { /* best effort — no proof, so no delete */ }
+    if (genOut !== undefined && genOut.code === 0 && genOut.stdout.toString("utf8").trim() === pinGenerationMessage(armId)) {
+      try {
+        await runGit(
+          gitPath,
+          repo.root,
+          ["update-ref", "--no-deref", "-m", "prg-git-checkpoint cleanup", "-d", checkpointRefForWindow(windowId), base],
+          cleanupSpec,
+        );
+      } catch { /* best effort */ }
+    }
 
+    try {
+      await rm(armScratchDir, { recursive: true, force: true });
+    } catch { /* best effort */ }
+    // Drop the shared window dir only if empty; never delete other arms.
+    try { await rmdir(dirname(armScratchDir)); } catch { /* non-empty */ }
+  } catch { /* no lock/proof: leave the pin for bounded manual recovery */ }
+  finally { await unlockPin?.(); }
+}
+
+/**
+ * Git's racy-clean test hashes a stat-matching entry only if its mtime is at
+ * least the index file's mtime. A freshly copied index has a NEW mtime, so a
+ * same-size edit made just after staging can be mistaken for clean on the
+ * copy even when the live index would have rehashed it. Backdate only the
+ * disposable copy (one second before the live index, covering coarse clock
+ * granularity); Git rehashes recently staged entries, but old clean entries
+ * retain its normal stat fast path. This cannot detect deliberately forged
+ * stat identities older than the live index; it is not a filesystem snapshot.
+ */
+async function copyIndexForWorktreeDiff(repo: ResolvedRepo, copyPath: string): Promise<void> {
+  let source: Stats;
   try {
-    await rm(armScratchDir, { recursive: true, force: true });
-  } catch { /* best effort */ }
-  // Best effort: drop the now-empty shared window dir. rmdir fails (and is
-  // ignored) when another same-id arm or an in-flight restore still occupies it.
+    source = await stat(repo.liveIndexPath);
+  } catch (error) {
+    if (fsCodeOf(error) === "ENOENT") return; // Git's empty index.
+    throw new GitCheckpointError(`cannot stat the live index for worktree diff: ${messageOf(error)}`, "git_failed");
+  }
   try {
-    await rmdir(dirname(armScratchDir));
-  } catch { /* non-empty or already gone — leave it */ }
+    await copyFile(repo.liveIndexPath, copyPath);
+    // A second of slack also covers Git/filesystems with second-resolution
+    // timestamps and floating-point rounding when setting the copy's mtime.
+    await utimes(copyPath, source.atime, new Date(source.mtimeMs - 1000));
+  } catch (error) {
+    throw new GitCheckpointError(`cannot snapshot the live index for worktree diff: ${messageOf(error)}`, "git_failed");
+  }
 }
 
 /**
  * Capture a COMPLETE binary patch with Git's own diff. `--no-ext-diff`
  * forbids external diff programs, `--no-textconv` forbids textconv drivers,
- * and the audited config guarantees no filters/EOL normalization are in play.
+ * and the audit rejects external filters and non-EOL conversions. Tracked
+ * line endings follow Git's normalization rules. When the
+ * diff reads the live index, it uses a private copy because Git may refresh
+ * that index's stat cache even when optional locks are disabled.
  */
 async function captureDiff(
   gitPath: string,
@@ -1612,13 +1738,32 @@ async function captureDiff(
   extraArgs: readonly string[],
   spec: GitRunSpec,
   maxBytes: number,
+  indexSnapshot?: { repo: ResolvedRepo; copyPath: string },
 ): Promise<Buffer> {
   const args = ["diff", "--no-ext-diff", "--no-textconv", "--binary", ...extraArgs];
+  let diffSpec = { ...spec, maxBytes, overflowReason: "patch_too_large" as const };
+  if (indexSnapshot !== undefined) {
+    try {
+      await copyIndexForWorktreeDiff(indexSnapshot.repo, indexSnapshot.copyPath);
+    } catch (error) {
+      await rm(indexSnapshot.copyPath, { force: true }).catch(() => undefined);
+      throw error;
+    }
+    diffSpec = {
+      ...diffSpec,
+      extraEnv: { ...spec.extraEnv, GIT_INDEX_FILE: indexSnapshot.copyPath },
+    };
+  }
   let out: GitRunOutput;
   try {
-    out = await runGit(gitPath, root, args, { ...spec, maxBytes, overflowReason: "patch_too_large" });
+    out = await runGit(gitPath, root, args, diffSpec);
   } catch (error) {
     throw error instanceof GitCheckpointError ? error : new GitCheckpointError(messageOf(error), "git_failed");
+  } finally {
+    if (indexSnapshot !== undefined) {
+      await rm(indexSnapshot.copyPath, { force: true }).catch(() => undefined);
+      await rm(`${indexSnapshot.copyPath}.lock`, { force: true }).catch(() => undefined);
+    }
   }
   if (out.code !== 0 && out.code !== 1) {
     throw new GitCheckpointError(`git diff exited ${out.code}: ${out.stderr}`, "git_failed");
@@ -2186,6 +2331,8 @@ export async function advanceGitCheckpoint(
 
     const audit = await auditRepository(gitPath, repo.root, spec);
     if (audit.status !== "ok") return audit;
+    const initialAuditProof = audit.value;
+    await runAfterInitialAuditHook(options);
     throwIfAborted(spec.signal);
 
     const armId = randomBytes(8).toString("hex");
@@ -2221,6 +2368,7 @@ export async function advanceGitCheckpoint(
       [],
       spec,
       options.maxPatchBytes ?? DEFAULT_MAX_PATCH_BYTES,
+      { repo, copyPath: join(scratchDir, "advance-index-pre-diff") },
     );
     const untrackedBefore = (await listUntrackedPaths(gitPath, repo.root, spec))
       .filter((path) => isPathSelected(path, selected))
@@ -2361,6 +2509,7 @@ export async function advanceGitCheckpoint(
       [],
       spec,
       options.maxPatchBytes ?? DEFAULT_MAX_PATCH_BYTES,
+      { repo, copyPath: join(scratchDir, "advance-index-final-diff") },
     );
     const untrackedAfter = (await listUntrackedPaths(gitPath, repo.root, spec))
       .filter((path) => isPathSelected(path, selected))
@@ -2397,6 +2546,10 @@ export async function advanceGitCheckpoint(
     const oldStillValid = await loadGitCheckpoint(root, validDescriptor, options);
     if (oldStillValid.status !== "ok") return oldStillValid;
 
+    // Recheck audited config/flags immediately before publication;
+    // worktree/index consistency was sampled immediately above.
+    const finalAudit = await auditRepository(gitPath, repo.root, spec);
+    assertAuditProofStable(initialAuditProof, finalAudit);
     await publishRecordDurable(scratchDir, encoded);
     const newDescriptor: GitCheckpointDescriptor = {
       format: GIT_CHECKPOINT_DESCRIPTOR_FORMAT,
@@ -2721,7 +2874,10 @@ async function runGitWithInput(
  * The pin must also be owned by this record's generation (its latest reflog
  * entry names the record's armId) — a stale same-base record, including one
  * persisted by the caller, cannot be restored over a newer arm's state
- * (`pin_generation_mismatch`).
+ * (`pin_generation_mismatch`). Failures after materialization begins may
+ * leave the worktree and/or index partially or fully changed; callers must
+ * not treat those failures as a no-mutation signal for fallback to another
+ * restore strategy.
  */
 export async function restoreGitCheckpoint(
   root: string,
@@ -2753,9 +2909,10 @@ export async function restoreGitCheckpoint(
     const genCheck = await verifyPinGeneration(gitPath, repo.root, record.ref, record.armId, spec);
     if (genCheck !== undefined) return genCheck;
 
-    // Re-audit: the repository may have gained filters/EOL config since arm.
+    // Re-audit: the repository may have gained external filters since arm.
     const audit = await auditRepository(gitPath, repo.root, spec);
     if (audit.status !== "ok") return audit;
+    await runAfterInitialAuditHook(options);
     throwIfAborted(spec.signal);
 
     const windowId = windowIdFromRef(record.ref);
@@ -2772,7 +2929,7 @@ export async function restoreGitCheckpoint(
 
     const [deltaVsIndex, deltaVsWorktree] = await Promise.all([
       diffTreePaths(gitPath, repo.root, trees.armedWorktreeTree, liveIndexTree, spec),
-      worktreeDeltaPaths(gitPath, repo.root, trees.armedWorktreeTree, spec),
+      worktreeDeltaPaths(gitPath, repo, trees.armedWorktreeTree, spec, join(trees.scratchDir, "restore-index-diff")),
     ]);
     const changed = new Set<string>([...deltaVsIndex, ...deltaVsWorktree]);
 
@@ -2846,6 +3003,18 @@ export async function restoreGitCheckpoint(
     } catch (error) {
       return resultFromError(error);
     }
+
+    // Restore may materialize Git-normalized tracked bytes, so require a
+    // final security/index audit rather than comparing worktree EOL state.
+    const postRestoreAudit = await auditRepository(gitPath, repo.root, spec);
+    if (postRestoreAudit.status === "unsupported") {
+      return {
+        status: "failed",
+        reason: "capture_inconsistent",
+        detail: postRestoreAudit.detail ?? "post-restore repository audit was unsupported",
+      };
+    }
+    if (postRestoreAudit.status === "failed") return postRestoreAudit;
 
     return {
       status: "ok",
@@ -2926,11 +3095,25 @@ async function diffTreePaths(
 }
 
 /** Paths where the live worktree deviates from the armed worktree tree. */
-async function worktreeDeltaPaths(gitPath: string, root: string, tree: string, spec: GitRunSpec): Promise<string[]> {
+async function worktreeDeltaPaths(gitPath: string, repo: ResolvedRepo, tree: string, spec: GitRunSpec, copyPath: string): Promise<string[]> {
   // --no-renames (and diff.renames=false above): a rename pair must report
   // BOTH sides; --name-only would otherwise print just the post-image name
   // and drop the deleted path from the changed set.
-  const out = await runGit(gitPath, root, ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", tree], { ...spec, maxBytes: 16 * 1024 * 1024 });
+  // Even read-style diff can refresh live index stat metadata. Read from a
+  // private copy, just as patch capture does; never write the target index.
+  // Concurrent comparisons must never reuse or remove one another's copy.
+  const uniqueCopyPath = `${copyPath}-${process.pid}-${randomBytes(6).toString("hex")}`;
+  let out: GitRunOutput;
+  try {
+    await copyIndexForWorktreeDiff(repo, uniqueCopyPath);
+    out = await runGit(gitPath, repo.root, ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", tree], {
+      ...spec, maxBytes: 16 * 1024 * 1024,
+      extraEnv: { ...spec.extraEnv, GIT_INDEX_FILE: uniqueCopyPath },
+    });
+  } finally {
+    await rm(uniqueCopyPath, { force: true }).catch(() => undefined);
+    await rm(`${uniqueCopyPath}.lock`, { force: true }).catch(() => undefined);
+  }
   if (out.code !== 0 && out.code !== 1) throw new GitCheckpointError(`worktree diff failed: ${out.stderr}`, "git_failed");
   if (out.stderr.trim().length > 0) throw new GitCheckpointError(`worktree diff warned: ${out.stderr}`, "git_warning");
   return out.stdout.toString("utf8").split("\0").filter((p) => p.length > 0);
@@ -3138,13 +3321,41 @@ async function catFileBlob(gitPath: string, root: string, oid: string, spec: Git
   return out.stdout;
 }
 
+/** Clean changed tracked bytes with Git, without writing into the repository's object store. */
+async function cleanTrackedComparisonBytes(
+  gitPath: string, repo: ResolvedRepo, path: string, bytes: Buffer, scratchDir: string, spec: GitRunSpec,
+): Promise<Buffer> {
+  // Git's text=auto binary detection and EOL rules cannot safely be
+  // duplicated by a blanket CRLF replacement. Write the filtered blob only
+  // to an owned, disposable object directory; never to the live object store
+  // or index. Unchanged paths never enter this function.
+  const objects = await mkdtemp(join(scratchDir, "compare-clean-"));
+  try {
+    const objectSpec = { ...spec, extraEnv: { ...spec.extraEnv, GIT_OBJECT_DIRECTORY: objects } };
+    const out = await runGitWithInput(
+      gitPath, repo.root, ["hash-object", "-w", "--stdin", `--path=${path}`], bytes,
+      { ...objectSpec, maxBytes: 1024 }, {},
+    );
+    const oid = out.stdout.toString("ascii").trim();
+    if (out.code !== 0 || out.stderr.trim() || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(oid)) {
+      throw new GitCheckpointError(`cannot clean tracked path ${path}: ${out.stderr || `hash-object exit ${out.code}`}`, "git_failed");
+    }
+    return await catFileBlob(gitPath, repo.root, oid, objectSpec);
+  } finally {
+    await rm(objects, { recursive: true, force: true });
+  }
+}
+
 // ── Compare (lazy changed-content materialization) ───────────────────────────
 
 /**
  * Diff the current repository state against the armed baseline without
  * mutating anything. Tracked changes are computed in object space; blob
  * contents are materialized only for paths that actually changed, and only
- * when `includeContents` is requested. Every tracked change also carries
+ * when `includeContents` is requested. New-side changed regular-file bytes
+ * pass through Git's clean pipeline in disposable scratch so review content
+ * follows the normalized old-side blobs; unchanged tracked paths are not read.
+ * Every tracked change also carries
  * armed/current kind and mode, so a mode-only change or a symlink retarget
  * stays reviewable even when the bytes are equal (symlink content is its
  * exact target, read no-follow). Untracked deltas are reported by path
@@ -3192,6 +3403,8 @@ export async function compareToGitCheckpoint(
 
     const audit = await auditRepository(gitPath, repo.root, spec);
     if (audit.status !== "ok") return audit;
+    const initialAuditProof = audit.value;
+    await runAfterInitialAuditHook(options);
     throwIfAborted(spec.signal);
 
     const windowId = windowIdFromRef(record.ref);
@@ -3207,7 +3420,7 @@ export async function compareToGitCheckpoint(
 
     const [deltaVsIndex, deltaVsWorktree] = await Promise.all([
       diffTreePaths(gitPath, repo.root, trees.armedWorktreeTree, liveIndexTree, spec),
-      worktreeDeltaPaths(gitPath, repo.root, trees.armedWorktreeTree, spec),
+      worktreeDeltaPaths(gitPath, repo, trees.armedWorktreeTree, spec, join(trees.scratchDir, "compare-index-diff")),
     ]);
     const changed = [...new Set([...deltaVsIndex, ...deltaVsWorktree])].sort();
 
@@ -3277,7 +3490,8 @@ export async function compareToGitCheckpoint(
           } else {
             // Bound the new-side worktree read like the old-side blob read
             // (MAX_BLOB_BYTES: a single blob materialized during compare).
-            change.newBytes = await readWorktreeFile(absolute, path, MAX_BLOB_BYTES);
+            const raw = await readWorktreeFile(absolute, path, MAX_BLOB_BYTES);
+            change.newBytes = await cleanTrackedComparisonBytes(gitPath, repo, path, raw, trees.scratchDir, spec);
           }
         }
       }
@@ -3368,6 +3582,9 @@ export async function compareToGitCheckpoint(
     }
     untrackedRemoved.sort();
     untrackedChanges.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+
+    const finalAudit = await auditRepository(gitPath, repo.root, spec);
+    assertAuditProofStable(initialAuditProof, finalAudit);
 
     return {
       status: "ok",
@@ -3740,9 +3957,9 @@ export interface GitCheckpointReleaseOptions extends GitCheckpointOptions {
  * directory under `<gitDir>/pi-review-gate/checkpoints/<windowId>`. Never
  * delete other sessions' refs or other windows' scratch.
  *
- * A release whose pin is already gone leaves the window scratch in place (it
- * may belong to a live same-id arm); a future successful owner release
- * reclaims it.
+ * A release whose pin is already gone leaves scratch in place (it may belong
+ * to a live same-id arm). Successful release removes only its own arm's
+ * directory; stale directories require bounded manual recovery.
  */
 export async function releaseGitCheckpointPin(
   root: string,
@@ -3780,6 +3997,8 @@ export async function releaseGitCheckpointPin(
     if (resolved.status !== "ok") return resolved;
     const repo = resolved.value;
 
+    const unlockPin = await acquireWindowPinLock(repo.gitDir, windowId, spec);
+    try {
     const ref = checkpointRefForWindow(windowId);
     let checkOut: GitRunOutput;
     try {
@@ -3819,9 +4038,9 @@ export async function releaseGitCheckpointPin(
           ),
         };
       }
-      // Conditional delete: the ref is removed only if it still matches the
-      // verified owner, so a same-id re-arm landing between the check and the
-      // delete cannot be destroyed.
+      // The per-window lock holds through proof, deletion, AND cleanup; the
+      // expected-base CAS alone cannot protect a same-base re-arm.
+      await options?.faultHooks?.beforePinReleaseDelete?.();
       let delOut: GitRunOutput;
       try {
         delOut = await runGit(gitPath, repo.root, ["update-ref", "--no-deref", "-m", "prg-git-checkpoint release", "-d", ref, expectedBase], spec);
@@ -3853,16 +4072,24 @@ export async function releaseGitCheckpointPin(
       // live same-id arm, so it is left in place as well.
       return { status: "ok", value: { released: false } };
     }
-    await removeWindowScratch(repo.gitDir, windowId);
+    await options?.faultHooks?.afterPinReleaseDelete?.();
+    // Remove only this arm's record. An older interrupted arm may still
+    // have scratch here; neither it nor a later arm is ours to delete.
+    await removeWindowScratch(repo.gitDir, windowId, armId);
     return { status: "ok", value: { released: hadRef } };
+    } finally {
+      await unlockPin();
+    }
   } catch (error) {
     return resultFromError(error);
   }
 }
 
 /** Remove the owned scratch directory for a window (idempotent). */
-async function removeWindowScratch(gitDir: string, windowId: string): Promise<void> {
+async function removeWindowScratch(gitDir: string, windowId: string, armId: string): Promise<void> {
+  const windowDir = join(gitDir, SCRATCH_SUBDIR, windowId);
   try {
-    await rm(join(gitDir, SCRATCH_SUBDIR, windowId), { recursive: true, force: true });
+    await rm(join(windowDir, `arm-${armId}`), { recursive: true, force: true });
+    await rmdir(windowDir); // only when no other generation has scratch
   } catch { /* best effort — release still succeeds if the ref is gone */ }
 }

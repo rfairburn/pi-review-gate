@@ -12,12 +12,14 @@ import {
   getReviewerQuestionWindow,
   getCorrectionAttemptCount,
   markCappedFeedbackSent,
+  ownedReviewCheckpointDescriptors,
   reconcileRestoredReviewWindows,
   reconcileWindowReviewerSelection,
   recordAcceptedReviewerQuestion,
   recordReviewerFeedback,
   rememberUserRequest,
   setReviewWindowBaseline,
+  setReviewWindowCheckpointBaseline,
   snapshotOfReviewBaseline,
 } from "../src/state";
 import { duplicateReviewerSelectionsFor, materializeReviewConfig, normalizeConfig, resolveReviewers, unresolvedReviewerSelectionsFor } from "../src/config";
@@ -944,6 +946,26 @@ test("snapshotOfReviewBaseline narrows snapshots and fails closed on Git baselin
     () => snapshotOfReviewBaseline(state.reviewWindow!.baseline),
     /Git checkpoint baseline.*refusing to fall back to a synthetic snapshot/,
   );
+});
+
+test("unified descriptor ownership includes window and exchange without releasing on state mutation", () => {
+  const state = createState();
+  beginAgentRun(state);
+  const descriptor = { kind: "raw" as const, format: "prg-parent-raw/v1" as const,
+    root: "/tmp/project", windowId: "win-owned", owner: "a".repeat(32), digest: "b".repeat(64) };
+  const baseline = { kind: "checkpoint" as const, descriptor, cwd: "/tmp/project", capturedAt: "now" };
+  setReviewWindowCheckpointBaseline(state, baseline);
+  assert.strictEqual(state.reviewWindow!.baseline, state.reviewWindow!.activeExchange!.baseline);
+  // Same descriptor, different insertion order and capture timestamp: one owner.
+  state.reviewWindow!.activeExchange!.baseline = { ...baseline, capturedAt: "later", descriptor: {
+    digest: descriptor.digest, owner: descriptor.owner, windowId: descriptor.windowId,
+    root: descriptor.root, format: descriptor.format, kind: descriptor.kind,
+  } };
+  assert.deepEqual(ownedReviewCheckpointDescriptors(state), [{ cwd: "/tmp/project", descriptor: state.reviewWindow!.activeExchange!.baseline.descriptor }]);
+  closeReviewWindow(state, true);
+  assert.equal(ownedReviewCheckpointDescriptors(state).length, 1);
+  rememberUserRequest(state, "new task");
+  assert.deepEqual(ownedReviewCheckpointDescriptors(state), []);
 });
 
 test("snapshot-input mutation helpers refuse to layer over a Git baseline", () => {

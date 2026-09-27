@@ -1,11 +1,11 @@
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { deferredPiToolsEnabled, effectiveReviewSettings, loadConfig, materializeReviewConfig, resolveReviewers, type OperatingMode, type ScheduledTaskEntryConfig } from "./config";
 import { ScheduledTaskRuntime } from "./scheduling/dispatcher";
 import { deliverScheduledEvent, formatScheduledDispatchFailure, formatScheduledOverdueDrop, formatScheduledSkipEvent, scheduledTaskDefinition } from "./scheduling/events";
 import { getSchedulerRuntime } from "./scheduling/runtime";
 import { removeReviewBundle, removeTransientWindowBundle } from "./bundle";
-import { createWorkspaceSnapshot } from "./capture";
-import { CompletedSnapshotCache } from "./snapshot-reuse";
+import { captureReviewCheckpoint, releaseReviewCheckpoint } from "./review-checkpoint";
 import { registerCommands } from "./commands";
 import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "./correction-feedback";
 import {
@@ -30,12 +30,12 @@ import {
   createState,
   freezeReviewWindowConfig,
   getCorrectionAttemptCount,
+  ownedReviewCheckpointDescriptors,
   reconcileRestoredReviewWindows,
   reconcileWindowReviewerSelection,
   recordReviewerFeedbackAndArmExchange,
   rememberUserRequest,
-  setReviewWindowBaseline,
-  snapshotOfReviewBaseline,
+  setReviewWindowCheckpointBaseline,
   type ReviewGateState,
 } from "./state";
 import { registerReviewSettings } from "./settings/command";
@@ -47,7 +47,7 @@ import { ExecutionToolManager } from "./execution/tool";
 import { combineTokenUsage, extractPiUsageFromMessages, formatTokenUsage, type TokenUsage } from "./usage";
 import { buildReviewAuthorizationMessage, createReviewTransmissionMessage, deliverReviewTransmission, hasReviewDeliveryReceipt, type ReviewTransmissionAction } from "./transmission";
 import { dispatchModelDelivery, queueModelDelivery } from "./durable-delivery";
-import { replaceReviewGateState, sessionPersistenceIdentity, SessionStateCwdMismatchError, SessionStateConversationMismatchError, SessionStateGitBaselineError, SessionStateIntegrityError, SessionStateInvalidStateError, SessionStateMissingSelectionDigestError, SessionStateParseError, SessionStateStore, SessionStateUnsupportedFormatError, type PendingDeliverySummary } from "./session-state";
+import { replaceReviewGateState, reviewCheckpointDescriptorIdentity, sessionPersistenceIdentity, SessionStateCheckpointBaselineError, SessionStateCwdMismatchError, SessionStateConversationMismatchError, SessionStateGitBaselineError, SessionStateIntegrityError, SessionStateInvalidStateError, SessionStateMissingSelectionDigestError, SessionStateParseError, SessionStateStore, SessionStateUnsupportedFormatError, type PendingDeliverySummary } from "./session-state";
 import { BackgroundProcessReadiness } from "./background-process-readiness";
 import {
   registerBackgroundShell,
@@ -88,8 +88,6 @@ const orchestratorBackgroundCompletionPrompt = [
 interface ActivationDependencies {
   /** Narrow injection seam used by lifecycle tests; production constructs it. */
   webTools?: Pick<WebToolManager, "register" | "cleanup" | "sync" | "applySavedSettings">;
-  /** #193: the session-local completed-snapshot reuse source; tests inject one to observe retained records. */
-  snapshotReuse?: Pick<CompletedSnapshotCache, "remember" | "reuseSourceFor" | "clear" | "current">;
 }
 
 export async function activate(pi: unknown, dependencies: ActivationDependencies = {}): Promise<void> {
@@ -244,9 +242,6 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   const userQuestions = registerUserQuestions(pi);
 
   const state = createState();
-  // #193: bounded session-local source for safe snapshot reuse across ordinary
-  // review-window close. Never persisted; cleared on every session boundary.
-  const snapshotReuse = dependencies.snapshotReuse ?? new CompletedSnapshotCache();
   let currentScopedModels: string[] = [];
   let sessionActive = true;
   let activeReviewAbort: ReviewAbortHandle | undefined;
@@ -264,6 +259,53 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   let pendingSettlementPausedForQuestion = false;
   let reviewerQuestionPausePending = false;
   let stateStore: SessionStateStore | undefined;
+  type Owner = ReturnType<typeof ownedReviewCheckpointDescriptors>[number];
+  const ownersOf = () => new Map(ownedReviewCheckpointDescriptors(state).map((owner) =>
+    [reviewCheckpointDescriptorIdentity(owner.cwd, owner.descriptor), owner]));
+  // Only verified, durably written owners enter this ledger. Retain failed
+  // releases for retry; a quarantined/damaged restore never enters it.
+  let durableOwners = new Map<string, Owner>();
+  let ownerSaveTail = Promise.resolve();
+  let latestSavedOwners = new Map<string, Owner>();
+  const retiredOwnerIds = new Set<string>();
+  const saveWithOwnerRetirement = (store: SessionStateStore): Promise<boolean> => {
+    // Admit saves one at a time, including the entire release. A new save
+    // cannot put a descriptor back on disk while its old pin is being removed.
+    // Sample state at admission (not invocation), when save() serializes it.
+    const operation = ownerSaveTail.then(async (): Promise<boolean> => {
+      if (store !== stateStore) return false;
+      const savedOwners = ownersOf();
+      if ([...savedOwners.keys()].some((id) => retiredOwnerIds.has(id))) {
+        await sendNoticeUnlessItThrows(pi, "review gate: a retired checkpoint was re-armed while its prior owner was being released; persistence blocked. Capture a fresh checkpoint before reviewing");
+        throw new Error("review gate: retired checkpoint re-armed; capture a fresh checkpoint before reviewing");
+      }
+      // Throws are not acknowledgements. The next queued save still runs;
+      // this operation never suppresses a previously confirmed retirement.
+      const saved = await store.save(state, executionTools.associations(), effectiveReviewConfig());
+      if (!saved) {
+        if ([...durableOwners.keys()].some((id) => !savedOwners.has(id))) {
+          await sendNoticeUnlessItThrows(pi, "review gate: checkpoint owners retained because the session-state save is unavailable; the prior sidecar still owns them. Repair persistence and restart before relying on a cleared window");
+        }
+        return false;
+      }
+      latestSavedOwners = savedOwners;
+      for (const [id, owner] of savedOwners) durableOwners.set(id, owner);
+      for (const [id, owner] of durableOwners) {
+        if (latestSavedOwners.has(id) || ownersOf().has(id)) continue;
+        const released = await releaseReviewCheckpoint(owner.cwd, owner.descriptor);
+        if (released.status !== "ok") {
+          await sendNoticeUnlessItThrows(pi, `review gate: retained checkpoint owner; release failed (${released.reason}). Inspect the checkpoint store and retry after repairing storage; no review success is implied`);
+          throw new Error(`review gate: retained checkpoint owner; release failed (${released.reason}): ${released.detail}`);
+        }
+        durableOwners.delete(id);
+        retiredOwnerIds.add(id);
+      }
+      return true;
+    });
+    ownerSaveTail = operation.then(() => undefined, () => undefined);
+    return operation;
+  };
+  let checkpointRestartBlocked: string | undefined;
   let backgroundCompletionMonitor: Promise<void> | undefined;
   let backgroundMonitorGeneration = 0;
   let backgroundReviewDeferred = false;
@@ -281,7 +323,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     cwd: () => currentCwd,
     authorizedTools: () => deferredTools.authorizedToolNames(),
     notify: (message) => sendNotice(pi, message),
-    onAssociationsChanged: () => persistSessionState(),
+    // ExecutionToolManager still types this callback as void; its controller
+    // observes the actual boolean result to gate checkpoint owner release.
+    onAssociationsChanged: () => persistConfirmedSessionState() as unknown as Promise<void>,
     onExpandedViewChanged: async (expanded) => {
       if (!loaded.path) {
         throw new Error("No persistent review-gate config file is loaded.");
@@ -392,7 +436,11 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   };
   const persistSessionState = async (force = false) => {
     if (!stateStore || (!sessionActive && !force)) return;
-    await stateStore.save(state, executionTools.associations(), effectiveReviewConfig());
+    await saveWithOwnerRetirement(stateStore);
+  };
+  const persistConfirmedSessionState = async (): Promise<boolean> => {
+    if (!stateStore || !sessionActive) return false;
+    return saveWithOwnerRetirement(stateStore);
   };
   // Automatic-delivery persistence reports whether a save actually happened:
   // persistSessionState deliberately resolves without writing when there is no
@@ -401,7 +449,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   // as proof of the uncertain transition.
   const persistAutomaticDeliveryState = async (): Promise<boolean> => {
     if (!stateStore || !sessionActive) return false;
-    return stateStore.save(state, executionTools.associations(), effectiveReviewConfig());
+    return saveWithOwnerRetirement(stateStore);
   };
 
   const trackEvidenceCapture = async (operation: Promise<void>): Promise<void> => {
@@ -506,9 +554,6 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
 
   registerHook(pi, "session_shutdown", async (...args) => {
     sessionActive = false;
-    // #193: the reuse source is session-local; a dying session must not leave
-    // its last snapshot available to anything that outlives it.
-    snapshotReuse.clear();
     setStatus(extractContext(args) ?? pi, "review-gate", undefined);
     setStatus(extractContext(args) ?? pi, "review-gate-mode", undefined);
     sessionAbortController.abort();
@@ -545,6 +590,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   });
 
   registerHook(pi, "session_start", async (...args) => {
+    await ownerSaveTail;
     sessionActive = true;
     currentCwd = extractCwd(args, currentCwd);
     backgroundMonitorGeneration += 1;
@@ -559,9 +605,10 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     executionTools.setScopedModels(currentScopedModels);
     executionTools.setUiContext(extractContext(args) ?? pi);
     discardSessionState(state);
-    // #193: a new session (including /new replacement and /reload) never
-    // inherits another session's completed-snapshot reuse source.
-    snapshotReuse.clear();
+    checkpointRestartBlocked = undefined;
+    durableOwners = new Map();
+    latestSavedOwners = new Map();
+    retiredOwnerIds.clear();
     const context = extractContext(args);
     const deferredSessionIdentity = typeof context === "object" && context !== null
       ? (context as { sessionManager?: unknown }).sessionManager
@@ -588,10 +635,25 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       ? new SessionStateStore(identity, appendEntry)
       : identity ? new SessionStateStore(identity) : undefined;
     let restoredRevision: number | undefined;
+    let damagedReviewRestart = false;
     if (stateStore) {
       try {
         const restored = await stateStore.restore(currentCwd);
         if (restored) {
+          if (restored.reviewCutover === "damaged_checkpoint") {
+            // Preserve the authentic prior review and its damaged record/pin
+            // before writing any fresh state. link+unlink quarantine is
+            // no-clobber; a failed move must never allow overwrite.
+            let preserved: string;
+            try {
+              preserved = await stateStore.quarantine();
+            } catch (error) {
+              checkpointRestartBlocked = `quarantine failed (${safeRestoreFailureDiagnostic(error)})`;
+              throw error;
+            }
+            await sendNoticeUnlessItThrows(context ?? pi,
+              `review gate: previous review cannot resume (checkpoint ${restored.damagedCheckpointReason}); preserved prior state at ${boundPath(preserved)} and its owned records in place. Already-present edits become the new baseline; prior edits were not reviewed. Starting a fresh checkpoint without confirmation.`);
+          }
           replaceReviewGateState(state, restored.state);
           await executionTools.restoreAssociations(restored.execution);
           // Persisted windows never carry their frozen reviewer configuration;
@@ -605,6 +667,33 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
             await sendNotice(context ?? pi, `review gate: review settings changed since the persisted state; reconciled ${reconciliation.windows} review window(s) with the current configuration (${reconciliation.reviewers} configured reviewer(s)); preserved evidence and history are unchanged`);
           }
           restoredRevision = restored.revision;
+          if (restored.reviewCutover === "damaged_checkpoint") {
+            damagedReviewRestart = true;
+            try {
+              // Arm immediately on restart, before another turn can edit the
+              // workspace; never reuse any verdict or evidence from the old
+              // window. before_agent_start will attach its exchange baseline.
+              const captured = await captureReviewCheckpoint(currentCwd, `window-${state.nextReviewWindowId}-${randomUUID()}`);
+              if (captured.status !== "ok") throw new Error(`checkpoint capture failed (${captured.reason})`);
+              beginAgentRun(state);
+              setReviewWindowCheckpointBaseline(state, {
+                kind: "checkpoint", descriptor: captured.value, cwd: currentCwd, capturedAt: new Date().toISOString(),
+              });
+              freezeReviewWindowConfig(state, config, currentScopedModels);
+              if (!await saveWithOwnerRetirement(stateStore)) {
+                throw new Error("fresh checkpoint state was not durably saved");
+              }
+              await sendNoticeUnlessItThrows(context ?? pi, "review gate: fresh checkpoint captured; only edits after this reset can receive a new review verdict");
+            } catch (captureError) {
+              checkpointRestartBlocked = safeRestoreFailureDiagnostic(captureError);
+              stateStore.markUnavailable("fresh checkpoint restart failed");
+              await sendNoticeUnlessItThrows(context ?? pi,
+                `review gate: fresh checkpoint could not be durably captured (${checkpointRestartBlocked}); prior review remains preserved; review is blocked. Repair the workspace or storage and restart`);
+            }
+          } else {
+            durableOwners = ownersOf();
+            latestSavedOwners = new Map(durableOwners);
+          }
         } else {
           await executionTools.restoreAssociations({ waveRoots: [], bundles: [] });
         }
@@ -642,7 +731,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
         isSessionActive: () => sessionActive,
         notify: (message) => sendNotice(context ?? pi, message),
       });
-      await sendNotice(context ?? pi, `review gate: restored conversation state revision ${restoredRevision}`);
+      if (!damagedReviewRestart) {
+        await sendNotice(context ?? pi, `review gate: restored conversation state revision ${restoredRevision}`);
+      }
     }
     // Issue #26: arm the scheduler only after restore completes, so overlap
     // detection sees restored groups before any due occurrence can fire.
@@ -693,6 +784,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     // Pi may auto-activate tools registered after session_start. Reassert the
     // captured boundary immediately before every new agent request.
     deferredTools.reapply();
+    if (checkpointRestartBlocked) throw new Error(`review gate: fresh checkpoint restart failed (${checkpointRestartBlocked}); repair and restart before review`);
     const authorizedToolInventory = deferredTools.startupGuidance();
     agentRunActive = true;
     currentCwd = extractCwd(args, currentCwd);
@@ -706,24 +798,34 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     if (activeExchangeHasBaseline(state)) {
       return executionPromptInjection(executionTools.criticalPrompt(), authorizedToolInventory, operatingModeSystemPrompt(args));
     }
-    const baseline = await createWorkspaceSnapshot(currentCwd, {
-      maxFileBytes: config.maxFileBytes,
-      maxSnapshotBytes: config.maxSnapshotBytes,
-      // #193: a new unseeded exchange reuses verified facts from the last
-      // completed same-root snapshot across ordinary window close. The cache
-      // holds only successfully completed captures (an aborted/failed capture
-      // rejects before remember runs), is cleared on every session boundary,
-      // and never crosses roots; the helper still enumerates and stats every
-      // current path and recomputes every retain/omit decision against the
-      // current limits, so this source can never hide additions or deletions.
-      reuseUnchangedFrom: snapshotReuse.reuseSourceFor(currentCwd),
-    });
-    // Only a completed capture seeds the cache; on rejection this line is
-    // unreachable and the previous entry (or none) survives untouched.
-    snapshotReuse.remember(baseline);
-    setReviewWindowBaseline(state, baseline);
-    freezeReviewWindowConfig(state, config, currentScopedModels);
-    await persistSessionState();
+    const existing = state.reviewWindow?.baseline;
+    if (existing && existing.kind !== "checkpoint") {
+      // Restored legacy windows retain their own typed baseline and settle
+      // through their existing fail-closed path until that window closes.
+      if (state.reviewWindow?.activeExchange) state.reviewWindow.activeExchange.baseline = existing;
+      freezeReviewWindowConfig(state, config, currentScopedModels);
+      await persistSessionState();
+      return executionPromptInjection(executionTools.criticalPrompt(), authorizedToolInventory, operatingModeSystemPrompt(args));
+    }
+    const captured = existing ? undefined : await captureReviewCheckpoint(currentCwd, `window-${state.reviewWindow?.id ?? 0}-${randomUUID()}`);
+    if (captured && captured.status !== "ok") throw new Error(`review gate: baseline capture failed (${captured.reason}): ${captured.detail}`);
+    const baseline = existing ?? (captured?.status === "ok"
+      ? { kind: "checkpoint" as const, descriptor: captured.value, cwd: currentCwd, capturedAt: new Date().toISOString() }
+      : undefined);
+    if (!baseline) throw new Error("review gate: checkpoint capture unavailable");
+    // Once the descriptor enters state, retain it on save failure: a future
+    // successful save can still recover the referenced checkpoint.
+    try {
+      setReviewWindowCheckpointBaseline(state, baseline);
+      freezeReviewWindowConfig(state, config, currentScopedModels);
+      await persistSessionState();
+    } catch (error) {
+      if (captured?.status === "ok" && state.reviewWindow?.baseline !== baseline && state.reviewWindow?.activeExchange?.baseline !== baseline) {
+        const released = await releaseReviewCheckpoint(currentCwd, captured.value);
+        if (released.status !== "ok") throw new Error(`review gate: baseline setup failed; orphan release failed (${released.reason}): ${released.detail}`);
+      }
+      throw error;
+    }
     return executionPromptInjection(executionTools.criticalPrompt(), authorizedToolInventory, operatingModeSystemPrompt(args));
   });
 
@@ -818,6 +920,11 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     agentRunActive = false;
     currentCwd = extractCwd(args, currentCwd);
     const noticeTarget = extractContext(args) ?? pi;
+    if (checkpointRestartBlocked) {
+      await sendNoticeUnlessItThrows(noticeTarget,
+        `review gate: review blocked (${checkpointRestartBlocked}); repair and restart before review`);
+      return;
+    }
     const prospectiveWindow = state.reviewWindow;
     // Issue #175: automatic primary review is a stored per-layer toggle. It
     // suppresses the settlement-time automatic review only; manual
@@ -938,15 +1045,11 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       closeReviewWindow(state);
       return;
     }
-    // A restored Git checkpoint baseline is persisted but not yet reviewable
-    // through the snapshot pipeline: narrow explicitly and fail closed with a
-    // clear error instead of comparing against a synthetic snapshot (Git
-    // review wiring is a later integration slice).
-    const reviewBefore = snapshotOfReviewBaseline(window.baseline);
-    if (!reviewBefore) {
-      closeReviewWindow(state);
-      return;
-    }
+    // #193 slice D: pass the typed baseline through. A Git checkpoint
+    // variant settles inside runReview through one frozen after-checkpoint
+    // (frozen-to-frozen compare, changed-only delta); a legacy snapshot keeps
+    // the existing settle semantics.
+    const reviewBefore = window.baseline;
     const reviewConfig = window.reviewConfig ?? freezeReviewWindowConfig(state, config, currentScopedModels);
     if (!reviewConfig.enabled) {
       if (config.enabled) {
@@ -1063,6 +1166,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     }
 
     if (!sessionActive) {
+      await output.releaseReviewedBaseline?.();
       return;
     }
 
@@ -1128,8 +1232,23 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       return;
     }
 
+    const transmit = async (details: Parameters<typeof transmitReviewPass>[0]): Promise<string> => {
+      try {
+        const message = await transmitReviewPass(details);
+        // The new after descriptor is reachable from state; save before
+        // retiring the previous response baseline. On save failure retain both.
+        await persistSessionState();
+        return message;
+      } catch (error) {
+        // A transmission that fails before recording feedback never hands off
+        // the after descriptor. Once reachable from state, retain on any save
+        // failure rather than deleting an in-memory or persisted reference.
+        if (window.activeExchange?.baseline !== output.reviewedBaseline) await output.releaseReviewedBaseline?.();
+        throw error;
+      }
+    };
     if (output.result?.verdict === "pass") {
-      const transmission = await transmitReviewPass({
+      const transmission = await transmit({
         state,
         output,
         source: "automatic",
@@ -1153,7 +1272,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
         changes: output.changes,
         evidenceEventCount: window.evidence.events.length,
       })) {
-        const transmission = await transmitReviewPass({
+        const transmission = await transmit({
           state,
           output,
           source: "automatic",
@@ -1180,7 +1299,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
         evidenceEventCount: window.evidence.events.length,
       });
       if (window.correctionCycles >= reviewConfig.maxCorrectionCycles) {
-        const deferredTransmission = await transmitReviewPass({
+        const deferredTransmission = await transmit({
           state,
           output,
           source: "automatic",
@@ -1206,7 +1325,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       }
       window.lastCappedFollowUp = undefined;
       window.correctionCycles += 1;
-      const transmission = await transmitReviewPass({
+      const transmission = await transmit({
         state,
         output,
         source: "automatic",
@@ -1225,7 +1344,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
 
     const failed = `review gate: reviewer failed (${formatTokenUsage(output.result?.usage)})`;
     if (output.result) {
-      const transmission = await transmitReviewPass({
+      const transmission = await transmit({
         state,
         output,
         source: "automatic",
@@ -1242,8 +1361,37 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     }
   });
 
+  // Command-driven reviews bypass before_agent_start. Guard their handlers at
+  // registration, before a reviewer, checkpoint, notice or delivery can run.
+  // Keep every other host API bound to the original Pi instance.
+  const reviewCommandNames = new Set(["review-now", "review-continue", "ask-reviewer", "ask-reviewer-interactive"]);
+  const commandRegister = typeof pi === "object" && pi !== null && "registerCommand" in pi && typeof pi.registerCommand === "function"
+    ? pi.registerCommand.bind(pi) as (name: string, options: { handler: (args: string, ctx: unknown) => unknown }) => void
+    : undefined;
+  const commandHost = commandRegister
+    ? new Proxy(pi as object, {
+      get(target, property) {
+        if (property === "registerCommand") {
+          return (name: string, options: { handler: (args: string, ctx: unknown) => unknown }) =>
+            commandRegister(name, {
+              ...options,
+              handler: async (args: string, ctx: unknown) => {
+                if (checkpointRestartBlocked && reviewCommandNames.has(name)) {
+                  await sendNoticeUnlessItThrows(ctx ?? pi,
+                    `review gate: /${name} blocked (${checkpointRestartBlocked}); repair and restart before review`);
+                  return;
+                }
+                return options.handler(args, ctx);
+              },
+            });
+        }
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    })
+    : pi;
   registerCommands({
-    pi,
+    pi: commandHost,
     cwd: () => currentCwd,
     config,
     getConfig: () => materializeReviewConfig(config, currentScopedModels),
@@ -1499,7 +1647,7 @@ async function transmitReviewPass(input: {
     reviewSequence: input.output.reviewSequence,
     source: input.source,
     disposition: input.disposition,
-    reviewedSnapshot: input.output.reviewedSnapshot!,
+    reviewedBaseline: input.output.reviewedBaseline!,
     displayLabels: input.output.reviewerDisplayLabels,
   });
   return message;
@@ -1534,6 +1682,7 @@ function safeRestoreFailureDiagnostic(error: unknown): string {
   if (error instanceof SessionStateUnsupportedFormatError) return "unsupported pre-cutover session format (missing snapshot omission ledger)";
   if (error instanceof SessionStateMissingSelectionDigestError) return "unsupported pre-cutover session format (missing reviewer-selection digest)";
   if (error instanceof SessionStateGitBaselineError) return `Git checkpoint baseline verification failed (${error.reason})`;
+  if (error instanceof SessionStateCheckpointBaselineError) return `checkpoint baseline verification failed (${error.reason})`;
   if (error instanceof SessionStateIntegrityError) return "integrity check failed";
   if (error instanceof SessionStateConversationMismatchError) return "conversation mismatch";
   return "validation failed";

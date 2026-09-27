@@ -11,6 +11,7 @@ import { materializeReviewConfig, normalizeConfig, unresolvedReviewerSelectionsF
 import { queueModelDelivery } from "../src/durable-delivery";
 import { createEvidenceState } from "../src/evidence";
 import { armGitCheckpoint } from "../src/git-checkpoint";
+import { captureReviewCheckpoint } from "../src/review-checkpoint";
 import {
   configDigest,
   replaceReviewGateState,
@@ -19,6 +20,7 @@ import {
   SESSION_STATE_QUARANTINE_MARKER,
   SessionStateCwdMismatchError,
   SessionStateGitBaselineError,
+  SessionStateCheckpointBaselineError,
   SessionStateIntegrityError,
   SessionStateInvalidStateError,
   SessionStateParseError,
@@ -45,6 +47,7 @@ import {
   reconcileRestoredReviewWindows,
   rememberUserRequest,
   setReviewWindowBaseline,
+  setReviewWindowCheckpointBaseline,
   snapshotOfReviewBaseline,
   snapshotReviewBaseline,
 } from "../src/state";
@@ -448,7 +451,7 @@ test("identical window and active-exchange baselines persist once through a vers
 
     const sidecarText = await readFile(store.path, "utf8");
     const raw = JSON.parse(sidecarText);
-    assert.equal(raw.version, 3, "the changed schema must not be mistaken for v1 by older readers");
+    assert.equal(raw.version, 4, "the changed schema must not be mistaken for v1 by older readers");
     assert.ok(raw.state.reviewWindow.baseline, "the canonical window snapshot stays inline");
     assert.deepEqual(raw.state.reviewWindow.activeExchange.baseline, {
       $snapshotRef: {
@@ -509,7 +512,7 @@ test("distinct window and active-exchange baselines remain inline and restore in
     await store.save(state, { waveRoots: [], bundles: [] }, config);
 
     const raw = JSON.parse(await readFile(store.path, "utf8"));
-    assert.equal(raw.version, 3);
+    assert.equal(raw.version, 4);
     assert.equal(raw.state.reviewWindow.activeExchange.baseline.files[0][1].content, "exchange-baseline-content");
     assert.equal("$snapshotRef" in raw.state.reviewWindow.activeExchange.baseline, false);
     const snapshotChange = raw.state.reviewWindow.exchanges[0].workspaceChanges[0];
@@ -527,7 +530,7 @@ test("distinct window and active-exchange baselines remain inline and restore in
   }
 });
 
-test("version 1 sidecars with inline snapshots remain restorable", async () => {
+test("version 1 sidecars with inline snapshots start a fresh review", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-session-v1-snapshots-"));
   try {
     const sessionFile = join(root, "conversation.jsonl");
@@ -547,11 +550,9 @@ test("version 1 sidecars with inline snapshots remain restorable", async () => {
     await writeFile(store.path, `${JSON.stringify(raw)}\n`, "utf8");
 
     const restored = await store.restore(root);
-    assert.ok(restored?.state.reviewWindow?.baseline);
-    assert.ok(restored.state.reviewWindow.activeExchange?.baseline);
-    assert.deepEqual(snapshotOfReviewBaseline(restored.state.reviewWindow.baseline), baseline);
-    assert.deepEqual(snapshotOfReviewBaseline(restored.state.reviewWindow.activeExchange?.baseline), baseline);
-    assert.notStrictEqual(restored.state.reviewWindow.baseline, restored.state.reviewWindow.activeExchange.baseline);
+    assert.equal(restored?.reviewCutover, "fresh_review_required");
+    assert.equal(restored.state.reviewWindow, undefined);
+    assert.equal(restored.state.lastQuestionWindow, undefined);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1066,6 +1067,32 @@ test("sidecars without a review window restore even without a selection digest",
   }
 });
 
+test("pre-cutover windowless state cancels queued review verdicts but keeps user input and execution", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-windowless-old-delivery-"));
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const state = createState();
+    state.pendingModelDeliveries.push(
+      { deliveryId: "old-pass", kind: "review_authorization", channel: "follow_up", message: "stale pass", status: "queued", createdAt: "old" },
+      { deliveryId: "old-feedback", kind: "review_transmission", channel: "steer", message: "stale verdict", status: "queued", createdAt: "old" },
+      { deliveryId: "user", kind: "queued_user_input", channel: "follow_up", message: "keep this", status: "queued", createdAt: "old" },
+    );
+    const store = new SessionStateStore({ sessionId: "old-windowless", sessionFile, cwd: root });
+    await store.save(state, { waveRoots: ["execution-root"], bundles: [] });
+    const old = JSON.parse(await readFile(store.path, "utf8"));
+    old.version = 3;
+    signSidecarForTest(old);
+    await writeFile(store.path, JSON.stringify(old));
+
+    const restored = await store.restore(root);
+    assert.equal(restored?.state.reviewWindow, undefined);
+    assert.deepEqual(restored?.state.pendingModelDeliveries.map((delivery) => delivery.status),
+      ["cancelled", "cancelled", "queued"]);
+    assert.deepEqual(restored?.execution.waveRoots, ["execution-root"]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("sidecars predating the omission ledger fail restore explicitly and are preserved", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-pre-ledger-"));
   try {
@@ -1297,7 +1324,7 @@ test("v3 persists a Git baseline as a compact descriptor and restores it after r
 
     const sidecarText = await readFile(store.path, "utf8");
     const raw = JSON.parse(sidecarText);
-    assert.equal(raw.version, 3);
+    assert.equal(raw.version, 4);
     // Descriptor-only: exactly the compact fields, nothing else.
     assert.deepEqual(raw.state.reviewWindow.baseline, { kind: "git", descriptor, cwd: root, capturedAt: baseline.capturedAt });
     assert.deepEqual(raw.state.reviewWindow.activeExchange.baseline, {
@@ -1367,7 +1394,7 @@ test("distinct Git window and active-exchange baselines persist inline and resto
     await store.save(state, { waveRoots: [], bundles: [] }, config);
 
     const raw = JSON.parse(await readFile(store.path, "utf8"));
-    assert.equal(raw.version, 3);
+    assert.equal(raw.version, 4);
     assert.deepEqual(raw.state.reviewWindow.baseline, baselineA);
     assert.deepEqual(raw.state.reviewWindow.activeExchange.baseline, baselineB);
     assert.ok(!("$gitCheckpointRef" in raw.state.reviewWindow.activeExchange.baseline), "distinct baselines must not be deduplicated");
@@ -1482,7 +1509,7 @@ test("mixed baseline kinds in one window are rejected before restore completes",
   }
 });
 
-test("a provisional v2 sidecar with a snapshot reference still restores under the v3 writer", async () => {
+test("a provisional v2 sidecar with a snapshot reference starts a fresh review", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-session-v2-ref-"));
   try {
     const sessionFile = join(root, "conversation.jsonl");
@@ -1495,21 +1522,165 @@ test("a provisional v2 sidecar with a snapshot reference still restores under th
 
     // Downgrade the v3 document to the provisional v2 shape and re-sign.
     const raw = JSON.parse(await readFile(store.path, "utf8"));
-    assert.equal(raw.version, 3);
+    assert.equal(raw.version, 4);
     assert.ok(raw.state.reviewWindow.activeExchange.baseline.$snapshotRef, "the shared snapshot must be a reference");
     raw.version = 2;
     signSidecarForTest(raw);
     await writeFile(store.path, `${JSON.stringify(raw)}\n`, "utf8");
 
     const restored = await store.restore(root);
-    assert.ok(restored?.state.reviewWindow?.baseline);
-    assert.deepEqual(snapshotOfReviewBaseline(restored.state.reviewWindow.baseline), baseline);
-    assert.strictEqual(
-      restored.state.reviewWindow.baseline,
-      restored.state.reviewWindow.activeExchange?.baseline,
-      "the v2 reference still materializes as one shared baseline",
-    );
+    assert.equal(restored?.reviewCutover, "fresh_review_required");
+    assert.equal(restored.state.reviewWindow, undefined);
+    rememberUserRequest(restored.state, "next request");
+    assert.equal((restored.state.reviewWindow as import("../src/state").ReviewWindow | undefined)?.requestHistory[0]?.text, "next request");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("unified raw checkpoint stays compact, deduplicates an equal descriptor, and verifies on restore", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-unified-raw-"));
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    await writeFile(join(root, "payload.txt"), "unified-raw-payload-sentinel", "utf8");
+    const captured = await captureReviewCheckpoint(root, "window-raw");
+    assert.equal(captured.status, "ok");
+    if (captured.status !== "ok") return;
+    assert.equal(captured.value.kind, "raw");
+    const state = createState();
+    beginAgentRun(state);
+    const baseline = { kind: "checkpoint" as const, descriptor: captured.value, cwd: root, capturedAt: "now" };
+    setReviewWindowCheckpointBaseline(state, baseline);
+    state.reviewWindow!.activeExchange!.baseline = { ...baseline, capturedAt: "later", descriptor:
+      captured.value.kind === "raw" ? {
+        digest: captured.value.digest, owner: captured.value.owner, windowId: captured.value.windowId,
+        root: captured.value.root, format: captured.value.format, kind: captured.value.kind,
+      } : captured.value };
+    const store = new SessionStateStore({ sessionId: "raw-session", sessionFile, cwd: root });
+    state.reviewsPaused = true;
+    state.pendingModelDeliveries.push(
+      { deliveryId: "old-pass", kind: "review_authorization", channel: "follow_up", message: "old verdict", status: "queued", createdAt: "old" },
+      { deliveryId: "user", kind: "queued_user_input", channel: "follow_up", message: "retain user input", status: "queued", createdAt: "old" },
+    );
+    await store.save(state, { waveRoots: ["execution-root"], bundles: [] }, normalizeConfig({ enabled: true }));
+    const text = await readFile(store.path, "utf8");
+    const raw = JSON.parse(text);
+    assert.deepEqual(raw.state.reviewWindow.baseline, baseline);
+    assert.deepEqual(raw.state.reviewWindow.activeExchange.baseline, {
+      $checkpointRef: { format: "pi-review-gate-review-checkpoint", version: 1, target: "window.baseline" },
+    });
+    assert.ok(!text.includes("unified-raw-payload-sentinel"));
+    const restored = await store.restore(root);
+    assert.strictEqual(restored?.state.reviewWindow?.baseline, restored?.state.reviewWindow?.activeExchange?.baseline);
+    assert.deepEqual(restored?.execution.waveRoots, ["execution-root"]);
+
+    const missing = JSON.parse(text);
+    delete missing.state.reviewWindow.baseline;
+    signSidecarForTest(missing);
+    await writeFile(store.path, JSON.stringify(missing));
+    await assert.rejects(store.restore(root), SessionStateInvalidStateError);
+    delete missing.state.reviewWindow.activeExchange.baseline;
+    signSidecarForTest(missing);
+    await writeFile(store.path, JSON.stringify(missing));
+    await assert.rejects(store.restore(root), SessionStateInvalidStateError, "armed marker rejects loss of both baseline fields");
+
+    const malformed = JSON.parse(text);
+    malformed.state.reviewWindow.baseline.descriptor.digest = "not-a-digest";
+    signSidecarForTest(malformed);
+    await writeFile(store.path, JSON.stringify(malformed));
+    await assert.rejects(store.restore(root), (error: unknown) =>
+      error instanceof SessionStateCheckpointBaselineError && error.reason === "raw_checkpoint_failed");
+
+    await writeFile(store.path, text);
+    if (captured.value.kind !== "raw") return;
+    await rm(join(root, ".pi-review-gate", "checkpoints", `${captured.value.windowId}-${captured.value.owner}`, "record.json"));
+    const damaged = await store.restore(root);
+    assert.equal(damaged?.reviewCutover, "damaged_checkpoint");
+    assert.equal(damaged?.state.reviewWindow, undefined);
+    assert.deepEqual(damaged?.execution.waveRoots, ["execution-root"]);
+    assert.equal(damaged?.state.reviewsPaused, true, "unrelated review preference survives");
+    assert.deepEqual(damaged?.state.pendingModelDeliveries.map((d) => d.status), ["cancelled", "queued"]);
+    assert.equal(damaged?.state.pendingAcceptedReviewerQuestions.length, 0);
+    assert.equal(await readFile(store.path, "utf8"), text);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("a signed foreign unified checkpoint and malformed execution association never qualify for damage cutover", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-foreign-unified-"));
+  const foreign = await mkdtemp(join(tmpdir(), "pi-review-foreign-root-"));
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "");
+    const captured = await captureReviewCheckpoint(root, "window-foreign-check");
+    assert.equal(captured.status, "ok");
+    if (captured.status !== "ok" || captured.value.kind !== "raw") return;
+    const state = createState();
+    beginAgentRun(state);
+    setReviewWindowCheckpointBaseline(state, { kind: "checkpoint", descriptor: captured.value, cwd: root, capturedAt: "now" });
+    const store = new SessionStateStore({ sessionId: "foreign-check", sessionFile, cwd: root });
+    await store.save(state, { waveRoots: ["valid"], bundles: [] }, normalizeConfig({ enabled: true }));
+    const original = JSON.parse(await readFile(store.path, "utf8"));
+
+    const foreignSidecar = JSON.parse(JSON.stringify(original));
+    foreignSidecar.state.reviewWindow.baseline.cwd = foreign;
+    foreignSidecar.state.reviewWindow.baseline.descriptor.root = foreign;
+    signSidecarForTest(foreignSidecar);
+    await writeFile(store.path, JSON.stringify(foreignSidecar));
+    await assert.rejects(store.restore(root), SessionStateCheckpointBaselineError);
+
+    const invalidExecution = JSON.parse(JSON.stringify(original));
+    invalidExecution.execution.bundles.push({ version: 1, operationId: 42 });
+    signSidecarForTest(invalidExecution);
+    await writeFile(store.path, JSON.stringify(invalidExecution));
+    await assert.rejects(store.restore(root), SessionStateInvalidStateError);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(foreign, { recursive: true, force: true });
+  }
+});
+
+test("unified Git checkpoint requires its pinned ref; pre-cutover verdict and deliveries do not survive", async () => {
+  const root = await initGitRepoForBaselineTest();
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "", "utf8");
+    const captured = await captureReviewCheckpoint(root, "window-unified-git");
+    assert.equal(captured.status, "ok");
+    if (captured.status !== "ok") return;
+    assert.equal(captured.value.kind, "git");
+    const state = createState();
+    rememberUserRequest(state, "old request");
+    beginAgentRun(state);
+    setReviewWindowCheckpointBaseline(state, { kind: "checkpoint", descriptor: captured.value, cwd: root, capturedAt: "now" });
+    const store = new SessionStateStore({ sessionId: "git-session", sessionFile, cwd: root });
+    await store.save(state, { waveRoots: ["execution-root"], bundles: [] }, normalizeConfig({ enabled: true }));
+    const original = await readFile(store.path, "utf8");
+    assert.equal((await store.restore(root))?.state.reviewWindow?.baseline?.kind, "checkpoint");
+    if (captured.value.kind !== "git") return;
+    await gitForBaselineTest(root, "update-ref", "-d", captured.value.checkpoint.ref);
+    const damaged = await store.restore(root);
+    assert.equal(damaged?.reviewCutover, "damaged_checkpoint");
+    assert.equal(damaged?.damagedCheckpointReason, "pin_ref_missing");
+    assert.equal(damaged?.state.reviewWindow, undefined);
+    assert.deepEqual(damaged?.execution.waveRoots, ["execution-root"]);
+    assert.equal(await readFile(store.path, "utf8"), original);
+
+    const legacy = JSON.parse(original);
+    legacy.version = 3;
+    legacy.state.reviewWindow.baseline = { cwd: root, capturedAt: "old", files: [], omissions: [], omissionsTruncated: false };
+    legacy.state.reviewWindow.reviewHistory = [{ sequence: 1, source: "automatic", disposition: "sent_for_observation", verdict: "pass", reviewerResults: [] }];
+    delete legacy.state.reviewWindow.baseline.omissions;
+    delete legacy.state.reviewWindow.baseline.omissionsTruncated;
+    delete legacy.reviewerSelectionDigest;
+    delete legacy.state.reviewWindow.activeExchange.baseline;
+    legacy.state.pendingModelDeliveries = [{ deliveryId: "old", kind: "review_authorization", channel: "follow_up", message: "old pass", status: "queued", createdAt: "now" }];
+    signSidecarForTest(legacy);
+    await writeFile(store.path, JSON.stringify(legacy));
+    const fresh = await store.restore(root);
+    assert.equal(fresh?.reviewCutover, "fresh_review_required");
+    assert.equal(fresh.state.reviewWindow, undefined);
+    assert.equal(fresh.state.pendingModelDeliveries[0]?.status, "cancelled");
+    assert.deepEqual(fresh.execution.waveRoots, ["execution-root"]);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

@@ -13,8 +13,10 @@ import {
 } from "../config";
 import { expandHomePath } from "../apply-patch/paths";
 import { createWorkspaceSnapshot, type FileSnapshot, type WorkspaceSnapshot } from "../capture";
-import { activeExchangeBaseline, checkpointReviewWindow, snapshotOfReviewBaseline, type ReviewGateState } from "../state";
-import { configDigest, type ExecutionAssociationsSnapshot } from "../session-state";
+import { activeExchangeBaseline, checkpointReviewWindow, ownedReviewCheckpointDescriptors, snapshotOfReviewBaseline, type ReviewBaseline, type ReviewGateState, type UnifiedReviewBaseline } from "../state";
+import { advanceGitCheckpoint, compareToGitCheckpoint, loadGitCheckpoint } from "../git-checkpoint";
+import { advanceRawReviewCheckpoint, changedRawCheckpointPaths, releaseReviewCheckpoint, type ReviewCheckpointDescriptor } from "../review-checkpoint";
+import { configDigest, reviewCheckpointDescriptorIdentity, type ExecutionAssociationsSnapshot } from "../session-state";
 import { materializeLandingConflicts } from "./conflict-materialization";
 import { ConflictGateStore, cloneConflictGate, type ConflictGate as BackgroundConflictGate } from "./conflict-gate-store";
 import {
@@ -370,7 +372,8 @@ interface BackgroundControllerInput {
   state: ReviewGateState;
   cwd: () => string;
   notify?: (message: string) => void | Promise<void>;
-  onAssociationsChanged?: (associations: ExecutionAssociationsSnapshot) => void | Promise<void>;
+  /** Only an explicit true confirms the parent session sidecar was durably saved. */
+  onAssociationsChanged?: (associations: ExecutionAssociationsSnapshot) => void | boolean | Promise<void | boolean>;
   onExpandedViewChanged?: (expanded: boolean) => void | Promise<void>;
   faults?: BackgroundFaultHooks;
 }
@@ -2071,15 +2074,15 @@ export class BackgroundExecutionController {
       rootWaveId: lineage.rootWaveId, continuationGeneration: generation,
     } : originalCapture;
     const reviewWindowId = this.input.state.reviewWindow?.id;
-    // A Git checkpoint baseline is not yet usable by delegated landing
-    // bookkeeping: narrow explicitly and fail closed instead of comparing
-    // against a synthetic snapshot.
-    const parentBaseline = snapshotOfReviewBaseline(activeExchangeBaseline(this.input.state));
-    const preTaskSnapshot = parentBaseline ? await createWorkspaceSnapshot(group.cwd, {
+    const parentBaseline = activeExchangeBaseline(this.input.state);
+    const snapshotBaseline = parentBaseline?.kind === "snapshot" ? parentBaseline.snapshot : undefined;
+    const preTaskSnapshot = parentBaseline?.kind === "checkpoint" ? await this.preTaskParentChanges(group.cwd)
+      : snapshotBaseline ? await createWorkspaceSnapshot(group.cwd, {
       maxFileBytes: this.input.config.maxFileBytes,
       maxSnapshotBytes: this.input.config.maxSnapshotBytes,
-      reuseUnchangedFrom: parentBaseline,
+      reuseUnchangedFrom: snapshotBaseline,
     }) : undefined;
+    let landingGuard = preTaskSnapshot;
     let release: (() => void) | undefined;
     try {
       release = await sourceMutationCoordinator.acquire(group.cwd, pending.abort.signal);
@@ -2110,11 +2113,12 @@ export class BackgroundExecutionController {
         // saved alongside, and other unrepresentable conflicts are preserved —
         // available worker bytes alongside, deletions recorded — while the
         // remaining identified work still merges in this same call.
+        landingGuard = await this.landingParentGuard(group.cwd, preTaskSnapshot) ?? (preTaskSnapshot instanceof Map ? undefined : preTaskSnapshot);
         const materialized = await materializeLandingConflicts(capture, plan, `forced subtask ${task.taskId}`, {
           binarySidecars: true,
           preserveUnrepresentable: true,
         });
-        await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task, source));
+        await this.checkpointParent(reviewWindowId, parentBaseline, landingGuard, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task, source));
         // #126 approved: conflicts that cannot carry markers are preserved
         // instead of represented, so the preserved target and any worker
         // version saved alongside (or a recorded deletion) must both be named.
@@ -2169,6 +2173,7 @@ export class BackgroundExecutionController {
         return this.inspect(group.executionId, task.taskId);
       }
       transitionTaskState(task, "landing");
+      landingGuard = await this.landingParentGuard(group.cwd, preTaskSnapshot) ?? (preTaskSnapshot instanceof Map ? undefined : preTaskSnapshot);
       const landing = await executeWaveLanding(plan, capture);
       if (landing.status !== "landed") throw new Error(`Force-merge landing ended in ${landing.status}.`);
       const paths = [...landing.appliedPaths, ...landing.alreadyAppliedPaths];
@@ -2196,7 +2201,7 @@ export class BackgroundExecutionController {
       // transition to landed unconditionally; save/publish/wake stay tolerated
       // so the landed outcome survives any of them failing.
       await this.completeLandedBookkeeping(task, "parent checkpoint", async () => {
-        await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task, source));
+        await this.checkpointParent(reviewWindowId, parentBaseline, landingGuard, group.cwd, paths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task, source));
       });
       if (command.salvage) {
         const salvageProvenance = command.salvage;
@@ -2453,9 +2458,6 @@ export class BackgroundExecutionController {
     if (dirty.length > 0) {
       throw new Error(`Conflict markers remain in: ${dirty.join("; ")}`);
     }
-    // A Git checkpoint baseline is not yet usable by delegated landing
-    // bookkeeping: narrow explicitly and fail closed.
-    const baseline = snapshotOfReviewBaseline(activeExchangeBaseline(this.input.state));
     const clearedPaths: string[] = [];
     for (const { key, gate, release } of entries) {
       const group = this.groups.get(gate.executionId);
@@ -2475,13 +2477,11 @@ export class BackgroundExecutionController {
       // resolution is unreviewed evidence, while the gate plus the #175
       // review-readiness blocker kept the unresolved markers out of review
       // until clearance. Only the post-resolution landed state is exposed.
-      if (!this.reviewLandedChangesEnabled() && baseline && gate.paths.length > 0 && await realpath(gate.sourceRoot) === await realpath(this.input.cwd())) {
-        const resolved = await createWorkspaceSnapshot(gate.sourceRoot, {
-          maxFileBytes: this.input.config.maxFileBytes,
-          maxSnapshotBytes: this.input.config.maxSnapshotBytes,
-          reuseUnchangedFrom: baseline,
-        });
-        checkpointReviewWindow(this.input.state, selectiveCheckpoint(baseline, baseline, baseline, resolved, gate.paths, gate.sourceRoot));
+      if (!this.reviewLandedChangesEnabled()) {
+        const baseline = activeExchangeBaseline(this.input.state);
+        await this.checkpointParent(this.input.state.reviewWindow?.id, baseline,
+          baseline?.kind === "snapshot" ? baseline.snapshot : undefined,
+          gate.sourceRoot, gate.paths, { executionId: gate.executionId, taskId: gate.taskId }, { reviewed: true }, true);
       }
       this.conflictGates.delete(key);
       release();
@@ -3235,14 +3235,15 @@ export class BackgroundExecutionController {
     lease: ExecutorPoolLease,
   ): Promise<void> {
     const reviewWindowId = this.input.state.reviewWindow?.id;
-    // A Git checkpoint baseline is not yet usable by delegated execution:
-    // narrow explicitly and fail closed.
-    const parentBaseline = snapshotOfReviewBaseline(activeExchangeBaseline(this.input.state));
-    const preTaskSnapshot = parentBaseline ? await createWorkspaceSnapshot(group.cwd, {
+    const parentBaseline = activeExchangeBaseline(this.input.state);
+    const snapshotBaseline = parentBaseline?.kind === "snapshot" ? parentBaseline.snapshot : undefined;
+    const preTaskSnapshot = parentBaseline?.kind === "checkpoint" ? await this.preTaskParentChanges(group.cwd)
+      : snapshotBaseline ? await createWorkspaceSnapshot(group.cwd, {
       maxFileBytes: this.input.config.maxFileBytes,
       maxSnapshotBytes: this.input.config.maxSnapshotBytes,
-      reuseUnchangedFrom: parentBaseline,
+      reuseUnchangedFrom: snapshotBaseline,
     }) : undefined;
+    let landingGuard = preTaskSnapshot;
     await this.incorporatePrestartSteering(group, task);
     task.generation += 1;
     const priorState = transitionTaskState(task, "capturing");
@@ -3273,6 +3274,11 @@ export class BackgroundExecutionController {
         task.summary = result.taskResults[0]?.summary;
         await this.save(group);
         await this.publishAssociations();
+        // The wave owns subsequent planning/clean landing; this is its last
+        // awaited controller callback before that path. The landing planner
+        // rejects a concurrently changed file as a whole (even disjoint
+        // lines), while its conflict callback refreshes again before writes.
+        landingGuard = await this.landingParentGuard(group.cwd, preTaskSnapshot) ?? (preTaskSnapshot instanceof Map ? undefined : preTaskSnapshot);
       },
       onProgress: (update) => this.progress(group, task, update),
       onLiveControl: (_taskId, control) => {
@@ -3292,8 +3298,9 @@ export class BackgroundExecutionController {
         // mutation (materializeLandingConflicts throws). Only ordinary text
         // conflicts reach here and are materialized as diff3 markers in the
         // source workspace.
+        landingGuard = await this.landingParentGuard(group.cwd, preTaskSnapshot) ?? (preTaskSnapshot instanceof Map ? undefined : preTaskSnapshot);
         const materialized = await materializeLandingConflicts(capture, plan, `subtask ${task.taskId}`);
-        await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task));
+        await this.checkpointParent(reviewWindowId, parentBaseline, landingGuard, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task));
         const conflictGate: BackgroundConflictGate = {
           executionId: group.executionId,
           taskId: task.taskId,
@@ -3337,7 +3344,7 @@ export class BackgroundExecutionController {
       // then transition to landed unconditionally — a checkpoint/save/publish/wake
       // failure can neither prevent nor reclassify the landing.
       await this.completeLandedBookkeeping(task, "parent checkpoint", async () => {
-        await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task));
+        await this.checkpointParent(reviewWindowId, parentBaseline, landingGuard, group.cwd, paths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task));
       });
       transitionTaskState(task, "landed");
       const completionSnapshot = transitionEventSnapshot(group, task);
@@ -3400,14 +3407,15 @@ export class BackgroundExecutionController {
     lease: ExecutorPoolLease,
   ): Promise<void> {
     const reviewWindowId = this.input.state.reviewWindow?.id;
-    // A Git checkpoint baseline is not yet usable by delegated execution:
-    // narrow explicitly and fail closed.
-    const parentBaseline = snapshotOfReviewBaseline(activeExchangeBaseline(this.input.state));
-    const preTaskSnapshot = parentBaseline ? await createWorkspaceSnapshot(group.cwd, {
+    const parentBaseline = activeExchangeBaseline(this.input.state);
+    const snapshotBaseline = parentBaseline?.kind === "snapshot" ? parentBaseline.snapshot : undefined;
+    const preTaskSnapshot = parentBaseline?.kind === "checkpoint" ? await this.preTaskParentChanges(group.cwd)
+      : snapshotBaseline ? await createWorkspaceSnapshot(group.cwd, {
       maxFileBytes: this.input.config.maxFileBytes,
       maxSnapshotBytes: this.input.config.maxSnapshotBytes,
-      reuseUnchangedFrom: parentBaseline,
+      reuseUnchangedFrom: snapshotBaseline,
     }) : undefined;
+    let landingGuard = preTaskSnapshot;
     const pending = task.pendingContinuation;
     if (!pending) throw new Error("Continuation was interrupted before executor dispatch.");
     pending.instructions = await this.incorporateContinuationSteering(group, task, pending.instructions);
@@ -3470,14 +3478,16 @@ export class BackgroundExecutionController {
           await this.applySettledExecutorIdentity(task);
           await this.save(group);
           await this.publishAssociations();
+          landingGuard = await this.landingParentGuard(group.cwd, preTaskSnapshot) ?? (preTaskSnapshot instanceof Map ? undefined : preTaskSnapshot);
         },
         onLandingConflict: async ({ capture, plan }) => {
           await this.input.faults?.materializeLandingConflicts?.({ executionId: group.executionId, taskId: task.taskId, taskState: task.state });
           // Ordinary reviewed continuation landing keeps the pre-#126 contract:
           // unrepresentable conflicts refuse the whole transfer before any
           // mutation; only text conflicts are materialized here.
+          landingGuard = await this.landingParentGuard(group.cwd, preTaskSnapshot) ?? (preTaskSnapshot instanceof Map ? undefined : preTaskSnapshot);
           const materialized = await materializeLandingConflicts(capture, plan, `continued subtask ${task.taskId}`);
-          await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task));
+          await this.checkpointParent(reviewWindowId, parentBaseline, landingGuard, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task));
           const conflictGate = this.activateConflictGate(
             group, task, materialized.paths, materialized.manifestPath,
             `Continued task ${task.taskId} requires immediate conflict resolution.`,
@@ -3506,7 +3516,7 @@ export class BackgroundExecutionController {
         // ordering where the checkpoint completes before the landed state becomes
         // visible), then transition to landed unconditionally.
         await this.completeLandedBookkeeping(task, "parent checkpoint", async () => {
-          await this.checkpointParent(reviewWindowId, parentBaseline, preTaskSnapshot, group.cwd, paths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task));
+          await this.checkpointParent(reviewWindowId, parentBaseline, landingGuard, group.cwd, paths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task));
         });
         transitionTaskState(task, "landed");
         const completionSnapshot = transitionEventSnapshot(group, task);
@@ -3739,17 +3749,69 @@ export class BackgroundExecutionController {
     return landedReviewStatusOf(task.result?.taskResults[0], forceMergeSource);
   }
 
+  /** Guard provenance, not a second parent baseline. At task admission record
+   * which paths already differed from EACH verified parent checkpoint. Only
+   * path identities are retained; no captured bytes replace checkpoint data. */
+  private async preTaskParentChanges(sourceRoot: string): Promise<Map<ReviewCheckpointDescriptor, Set<string>>> {
+    const changes = new Map<ReviewCheckpointDescriptor, Set<string>>();
+    if (await realpath(sourceRoot) !== await realpath(this.input.cwd())) return changes;
+    const window = this.input.state.reviewWindow;
+    for (const baseline of [window?.baseline, window?.activeExchange?.baseline]) {
+      if (!baseline || baseline.kind !== "checkpoint" || changes.has(baseline.descriptor)) continue;
+      if (await realpath(baseline.cwd) !== await realpath(sourceRoot)) throw new Error("Parent checkpoint belongs to a different workspace.");
+      if (baseline.descriptor.kind === "git") {
+        const loaded = await loadGitCheckpoint(sourceRoot, baseline.descriptor.checkpoint);
+        if (loaded.status !== "ok") throw new Error(`Parent checkpoint guard refused: ${loaded.reason} ${loaded.detail ?? ""}`);
+        const compared = await compareToGitCheckpoint(sourceRoot, loaded.value.encoded);
+        if (compared.status !== "ok") throw new Error(`Parent checkpoint guard refused: ${compared.reason} ${compared.detail ?? ""}`);
+        changes.set(baseline.descriptor, new Set([
+          ...compared.value.trackedChanges.map((change) => change.path),
+          ...compared.value.untrackedChanges.map((change) => change.path),
+        ]));
+      } else {
+        const compared = await changedRawCheckpointPaths(sourceRoot, baseline.descriptor);
+        if (compared.status !== "ok") throw new Error(`Parent checkpoint guard refused: ${compared.reason} ${compared.detail ?? ""}`);
+        changes.set(baseline.descriptor, compared.value);
+      }
+    }
+    return changes;
+  }
+
+  /** Refresh at the last controller-owned pre-landing boundary. A failed read
+   * cannot authorize advancement: leave all landed paths reviewable. Union
+   * with admission provenance so an edit later reverted is not silently
+   * treated as independently reviewed work. */
+  private async landingParentGuard(
+    sourceRoot: string,
+    admission: WorkspaceSnapshot | Map<ReviewCheckpointDescriptor, Set<string>> | undefined,
+  ): Promise<Map<ReviewCheckpointDescriptor, Set<string>> | undefined> {
+    if (!(admission instanceof Map)) return undefined;
+    try {
+      const latest = await this.preTaskParentChanges(sourceRoot);
+      const combined = new Map<ReviewCheckpointDescriptor, Set<string>>();
+      for (const [descriptor, paths] of admission) {
+        const now = latest.get(descriptor);
+        if (now) combined.set(descriptor, new Set([...paths, ...now]));
+      }
+      return combined;
+    } catch {
+      // Keep checkpointParent's eligibility empty on an uncertain read.
+      return undefined;
+    }
+  }
+
   private async checkpointParent(
     reviewWindowId: number | undefined,
-    taskBaseline: WorkspaceSnapshot | undefined,
-    before: WorkspaceSnapshot | undefined,
+    taskBaseline: ReviewBaseline | undefined,
+    before: WorkspaceSnapshot | Map<ReviewCheckpointDescriptor, Set<string>> | undefined,
     sourceRoot: string,
     landedPaths: string[],
     faultContext: BackgroundFaultContext = {},
     landedReview?: LandedReviewStatus,
+    conflictResolution = false,
   ): Promise<void> {
     await this.input.faults?.checkpointParent?.(faultContext);
-    if (!taskBaseline || !before || reviewWindowId === undefined || this.input.state.reviewWindow?.id !== reviewWindowId || landedPaths.length === 0) return;
+    if (!taskBaseline || reviewWindowId === undefined || this.input.state.reviewWindow?.id !== reviewWindowId || landedPaths.length === 0) return;
     // #25: the parent review baseline only covers the parent session's own
     // workspace. Snapshot file keys are relative to each snapshot's root, so
     // merging a different target repository's files into this baseline would
@@ -3789,17 +3851,120 @@ export class BackgroundExecutionController {
         return;
       }
     }
-    const after = await createWorkspaceSnapshot(sourceRoot, {
-      maxFileBytes: this.input.config.maxFileBytes,
-      maxSnapshotBytes: this.input.config.maxSnapshotBytes,
-      reuseUnchangedFrom: before,
-    });
-    if (this.input.state.reviewWindow?.id !== reviewWindowId) return;
-    // A Git checkpoint baseline is not yet usable by delegated landing
-    // bookkeeping: narrow explicitly and fail closed.
-    const accumulatedBaseline = snapshotOfReviewBaseline(activeExchangeBaseline(this.input.state));
-    if (!accumulatedBaseline) return;
-    checkpointReviewWindow(this.input.state, selectiveCheckpoint(accumulatedBaseline, taskBaseline, before, after, landedPaths, sourceRoot));
+    // A human-resolved conflict has no provable independently reviewed bytes.
+    // Marker/resolution content may contain parent edits made while the worker
+    // ran; retain that path for primary review even with landed review off.
+    if (conflictResolution) return;
+    const window = this.input.state.reviewWindow;
+    if (!window || window.id !== reviewWindowId) return;
+    if (taskBaseline.kind === "snapshot") {
+      // Legacy snapshot windows retain the original pre-task parent-change
+      // guard; no snapshot is used as a fallback for a checkpoint window.
+      if (!before || before instanceof Map) return;
+      const after = await createWorkspaceSnapshot(sourceRoot, {
+        maxFileBytes: this.input.config.maxFileBytes,
+        maxSnapshotBytes: this.input.config.maxSnapshotBytes,
+        reuseUnchangedFrom: before,
+      });
+      if (this.input.state.reviewWindow?.id !== reviewWindowId) return;
+      const accumulated = snapshotOfReviewBaseline(activeExchangeBaseline(this.input.state));
+      if (accumulated) checkpointReviewWindow(this.input.state, selectiveCheckpoint(accumulated, taskBaseline.snapshot, before, after, landedPaths, sourceRoot));
+      return;
+    }
+    if (taskBaseline.kind !== "checkpoint") throw new Error("Legacy Git parent baseline cannot be selectively advanced.");
+    // Window and active exchange may own distinct pinned descriptors. Compose
+    // each against its own verified old state, without folding parent edits
+    // into either or turning the task's internal capture into a parent base.
+    const oldWindow = window.baseline;
+    const oldExchange = window.activeExchange?.baseline;
+    if (oldWindow?.kind !== "checkpoint" || oldExchange?.kind !== "checkpoint") {
+      throw new Error("Parent review checkpoint owners are incomplete or mixed.");
+    }
+    // A missing/failed landing-boundary guard is not evidence of a clean
+    // parent: retain the landing in both owners rather than advancing it.
+    if (!conflictResolution && !(before instanceof Map)) return;
+    const updates = new Map<ReviewCheckpointDescriptor, UnifiedReviewBaseline>();
+    try {
+      for (const old of [oldWindow, oldExchange]) {
+        if (updates.has(old.descriptor)) continue;
+        if (await realpath(old.cwd) !== await realpath(sourceRoot)) throw new Error("Parent checkpoint belongs to a different workspace.");
+        const preExisting = conflictResolution ? new Set<string>() : before instanceof Map ? before.get(old.descriptor) : undefined;
+        // If another landing replaced this descriptor after task admission,
+        // provenance cannot be established: retain every selected path as
+        // review evidence instead of advancing it without an ownership guard.
+        if (!preExisting) continue;
+        const eligiblePaths = landedPaths.filter((path) => ![...preExisting].some((changed) =>
+          changed === path || changed.startsWith(`${path}/`) || path.startsWith(`${changed}/`)));
+        if (eligiblePaths.length === 0) continue;
+        const checkpointId = `parent-landed-${randomUUID()}`;
+        let descriptor: ReviewCheckpointDescriptor;
+        if (old.descriptor.kind === "git") {
+          const advanced = await advanceGitCheckpoint(sourceRoot, old.descriptor.checkpoint, eligiblePaths, checkpointId);
+          if (advanced.status !== "ok") throw new Error(`Parent checkpoint advance refused: ${advanced.reason} ${advanced.detail ?? ""}`);
+          descriptor = { kind: "git", checkpoint: advanced.value.descriptor };
+        } else {
+          const advanced = await advanceRawReviewCheckpoint(sourceRoot, old.descriptor, eligiblePaths, checkpointId);
+          if (advanced.status !== "ok") throw new Error(`Parent checkpoint advance refused: ${advanced.reason} ${advanced.detail ?? ""}`);
+          descriptor = advanced.value;
+        }
+        updates.set(old.descriptor, { kind: "checkpoint", descriptor, cwd: old.cwd, capturedAt: new Date().toISOString() });
+      }
+      if (this.input.state.reviewWindow !== window || window.id !== reviewWindowId
+        || window.baseline !== oldWindow || window.activeExchange?.baseline !== oldExchange) return;
+      if (updates.size === 0) return;
+      window.baseline = updates.get(oldWindow.descriptor) ?? oldWindow;
+      window.activeExchange!.baseline = updates.get(oldExchange.descriptor) ?? oldExchange;
+      window.activeExchange!.evidenceEventStart = window.evidence.events.length;
+      window.activeExchange!.assistantSummaryStart = window.evidence.finalAssistantSummaries.length;
+      window.activeExchange!.requestHistoryStart = window.requestHistory.length;
+      // Once reachable from state, new owners must survive even a failed save.
+      // The callback is the production session-sidecar writer, not the group
+      // association save; only its explicit durable acknowledgement permits
+      // retiring old owners. A missing/failed acknowledgement leaves both
+      // generations intact for restart recovery.
+      updates.clear();
+      let saved: void | boolean;
+      try {
+        saved = await this.input.onAssociationsChanged?.(this.associations());
+      } catch (error) {
+        await this.reportParentCheckpointRetention(faultContext, `session-sidecar save failed (${messageOf(error)})`);
+        return;
+      }
+      if (saved !== true) {
+        await this.reportParentCheckpointRetention(faultContext, "session-sidecar save was unavailable or did not confirm a durable write");
+        return;
+      }
+      // Check ALL live owners after the save (including last-question and an
+      // exchange with a distinct descriptor), not just the replaced slots.
+      const referenced = new Set(ownedReviewCheckpointDescriptors(this.input.state).map(({ cwd, descriptor }) =>
+        reviewCheckpointDescriptorIdentity(cwd, descriptor)));
+      const superseded = new Map<string, { cwd: string; descriptor: ReviewCheckpointDescriptor }>();
+      for (const old of [oldWindow, oldExchange]) {
+        const identity = reviewCheckpointDescriptorIdentity(old.cwd, old.descriptor);
+        if (!referenced.has(identity)) superseded.set(identity, { cwd: old.cwd, descriptor: old.descriptor });
+      }
+      for (const owner of superseded.values()) {
+        try {
+          const released = await releaseReviewCheckpoint(owner.cwd, owner.descriptor);
+          if (released.status !== "ok") await this.reportParentCheckpointRetention(faultContext, `owner release failed (${released.reason}): ${released.detail}`);
+        } catch (error) {
+          await this.reportParentCheckpointRetention(faultContext, `owner release failed (${messageOf(error)})`);
+        }
+      }
+    } finally {
+      // Failed or superseded compositions are not reachable from state.
+      for (const update of updates.values()) await releaseReviewCheckpoint(sourceRoot, update.descriptor);
+    }
+  }
+
+  /** A missing sidecar acknowledgement leaks conservatively; it must not
+   * turn already-landed work into a failed task or hide the recovery caveat. */
+  private async reportParentCheckpointRetention(context: BackgroundFaultContext, detail: string): Promise<void> {
+    const group = context.executionId ? this.groups.get(context.executionId) : undefined;
+    const task = context.taskId ? group?.tasks.find((candidate) => candidate.taskId === context.taskId) : undefined;
+    const message = `Parent checkpoint owners retained: ${detail}; review evidence remains intact.`;
+    if (task) this.addActivity(task, "bookkeeping", message);
+    try { await this.input.notify?.(`review gate: ${message}`); } catch { /* best effort; task activity remains */ }
   }
 
   /**

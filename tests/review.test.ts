@@ -1749,8 +1749,11 @@ test("runReview settle reuses unchanged records and still reports every change m
 
     // The settle capture actually reused the verified unchanged record by
     // reference (a fresh capture would allocate a new one)...
-    const settled = output.reviewedSnapshot;
-    assert.ok(settled, "a reviewed run returns its settle snapshot");
+    const settledBaseline = output.reviewedBaseline;
+    assert.ok(settledBaseline, "a reviewed run returns its settle baseline");
+    assert.equal(settledBaseline.kind, "snapshot", "a snapshot-baseline review returns a snapshot after-baseline");
+    const settled = settledBaseline.kind === "snapshot" ? settledBaseline.snapshot : undefined;
+    assert.ok(settled);
     assert.equal(settled.files.get("untouched.txt"), before.files.get("untouched.txt"));
     // ...and is decision-equivalent to a fresh capture of the same state.
     const freshAfter = await createWorkspaceSnapshot(dir, settleSnapshotOptions);

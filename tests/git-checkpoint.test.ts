@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
@@ -127,6 +127,26 @@ function indexPath(repo: string): string {
   return join(repo, ".git", "index");
 }
 
+/** Force a stat-identical same-size rewrite whose cached mtime predates a fresh index copy. */
+async function racyRewrite(repo: string, path: string, bytes: Buffer | string, beforeRewrite?: () => Promise<void>): Promise<void> {
+  const absolute = join(repo, path);
+  await git(repo, "config", "core.trustctime", "false");
+  // Git's cached stat must have exactly representable mtime on filesystems
+  // where fs.utimes rounds to milliseconds.
+  const fixed = new Date((Math.floor(Date.now() / 1000) - 60) * 1000);
+  await utimes(absolute, fixed, fixed);
+  await git(repo, "add", "--", path);
+  const cached = await stat(absolute);
+  assert.equal(Buffer.byteLength(bytes), cached.size);
+  await beforeRewrite?.();
+  // A deliberately old index mtime models the coarse-timestamp racy window,
+  // without depending on test runner scheduling or filesystem clock precision.
+  await utimes(indexPath(repo), new Date(cached.mtimeMs - 2000), new Date(cached.mtimeMs - 2000));
+  await writeFile(absolute, bytes);
+  await utimes(absolute, cached.atime, cached.mtime);
+  assert.equal((await stat(absolute)).mtimeMs, cached.mtimeMs);
+}
+
 /** Head of the current branch (full oid). */
 async function headOid(repo: string): Promise<string> {
   return (await git(repo, "rev-parse", "HEAD")).trim();
@@ -221,7 +241,7 @@ test("restore exactly reconstructs staged, unstaged, and untracked state", async
   await git(repo, "reset", "-q"); // index back to HEAD
 
   const result = await restoreGitCheckpoint(repo, encoded);
-  assert.equal(result.status, "ok");
+  assert.equal(result.status, "ok", result.status === "failed" || result.status === "unsupported" ? result.detail : "");
   if (result.status !== "ok") return;
   const report = result.value;
 
@@ -379,6 +399,95 @@ test("restore reconstructs staged and worktree-only renames", async () => {
   await assert.rejects(lstat(join(repo, "b.txt")));
 });
 
+test("copied-index racy-clean binary edits survive staged and unstaged capture, restore, and comparison", async () => {
+  const repo = await initRepo();
+  const base = Buffer.alloc(4096, 0x11);
+  const staged = Buffer.alloc(4096, 0x22);
+  const unstaged = Buffer.alloc(4096, 0x33);
+  // Git recognizes a NUL-containing blob as binary (without attributes).
+  for (const bytes of [base, staged, unstaged]) bytes[0] = 0;
+  await writeFile(join(repo, "racy.bin"), base);
+  await commitAll(repo, "racy base");
+  await writeFile(join(repo, "racy.bin"), staged);
+  await git(repo, "add", "racy.bin");
+  let stagedBaseline: string | undefined;
+  await racyRewrite(repo, "racy.bin", unstaged, async () => {
+    const before = await armGitCheckpoint(repo, "window-racy-binary-staged");
+    assert.equal(before.status, "ok", JSON.stringify(before));
+    if (before.status !== "ok") return;
+    assert.equal(before.value.stats.unstagedPatchBytes, 0);
+    stagedBaseline = before.value.encoded;
+  });
+  assert.ok(stagedBaseline);
+  const beforeIndex = await readFile(indexPath(repo));
+  // A fresh alternate index is newer than the cached entry, so an ordinary
+  // diff from that copy incorrectly claims this stat-identical edit is clean.
+  const staleCopy = join(await mkTmp(), "stale-index");
+  await copyFile(indexPath(repo), staleCopy);
+  const staleDiff = await execFileAsync("git", ["diff", "--binary"], {
+    cwd: repo, env: { ...GIT_ENV, GIT_INDEX_FILE: staleCopy }, encoding: "buffer",
+  });
+  assert.equal(staleDiff.stdout.length, 0, "fixture must reproduce the copied-index false negative");
+
+  const armed = await armGitCheckpoint(repo, "window-racy-bin");
+  assert.equal(armed.status, "ok", JSON.stringify(armed));
+  if (armed.status !== "ok") return;
+  assert.ok(armed.value.stats.stagedPatchBytes > 0);
+  assert.ok(armed.value.stats.unstagedPatchBytes > 0);
+  for (const patch of [armed.value.record.stagedPatchB64, armed.value.record.unstagedPatchB64]) {
+    assert.match(Buffer.from(patch, "base64").toString("utf8"), /GIT binary patch/);
+  }
+  // The armed-before-rewrite tree and current index both contain 'staged',
+  // so the reported change must come from the racy worktree diff alone.
+  const racyComparison = await compareToGitCheckpoint(repo, stagedBaseline, {}, true);
+  assert.equal(racyComparison.status, "ok", JSON.stringify(racyComparison));
+  if (racyComparison.status === "ok") {
+    assert.deepEqual(racyComparison.value.trackedChanges.map((c) => c.path), ["racy.bin"]);
+    assert.equal(racyComparison.value.trackedChanges[0]?.oldBytes?.toString("hex"), staged.toString("hex"));
+    assert.equal(racyComparison.value.trackedChanges[0]?.newBytes?.toString("hex"), unstaged.toString("hex"));
+  }
+  assert.deepEqual(await readFile(indexPath(repo)), beforeIndex);
+  await writeFile(join(repo, "racy.bin"), base);
+  const restored = await restoreGitCheckpoint(repo, armed.value.encoded);
+  assert.equal(restored.status, "ok", JSON.stringify(restored));
+  assert.equal((await readFile(join(repo, "racy.bin"))).toString("hex"), unstaged.toString("hex"));
+  // The restored index is still staged while the worktree is unstaged;
+  // comparison reports that index delta by design, even when worktree bytes
+  // match the armed worktree baseline.
+  const compared = await compareToGitCheckpoint(repo, armed.value.encoded, {}, true);
+  assert.equal(compared.status, "ok");
+  if (compared.status === "ok") {
+    assert.deepEqual(compared.value.trackedChanges.map((c) => c.path), ["racy.bin"]);
+    assert.equal(compared.value.trackedChanges[0]?.newBytes?.toString("hex"), unstaged.toString("hex"));
+  }
+});
+
+test("stat-identical same-size tracked edits are compared and selectively advanced", async () => {
+  const repo = await initRepo();
+  await writeFile(join(repo, "f.txt"), "v1\n");
+  await commitAll(repo, "base");
+  const baseline = await armGitCheckpoint(repo, "window-racy-compare");
+  assert.equal(baseline.status, "ok");
+  if (baseline.status !== "ok") return;
+  await racyRewrite(repo, "f.txt", "v2\n");
+  const indexBefore = await readFile(indexPath(repo));
+  const compared = await compareToGitCheckpoint(repo, baseline.value.encoded, {}, true);
+  assert.equal(compared.status, "ok", JSON.stringify(compared));
+  if (compared.status === "ok") assert.deepEqual(compared.value.trackedChanges.map((c) => [c.path, c.oldBytes?.toString(), c.newBytes?.toString()]), [["f.txt", "v1\n", "v2\n"]]);
+  assert.deepEqual(await readFile(indexPath(repo)), indexBefore);
+  const advanced = await advanceGitCheckpoint(repo, baseline.value.descriptor, ["f.txt"], "window-racy-advanced");
+  assert.equal(advanced.status, "ok", JSON.stringify(advanced));
+  if (advanced.status !== "ok") return;
+  const loaded = await loadGitCheckpoint(repo, advanced.value.descriptor);
+  assert.equal(loaded.status, "ok", JSON.stringify(loaded));
+  if (loaded.status !== "ok") return;
+  assert.deepEqual(await readFile(indexPath(repo)), indexBefore);
+  await writeFile(join(repo, "f.txt"), "v3\n");
+  const restored = await restoreGitCheckpoint(repo, loaded.value.encoded);
+  assert.equal(restored.status, "ok", JSON.stringify(restored));
+  assert.equal(await readFile(join(repo, "f.txt"), "utf8"), "v2\n", "selected tracked bytes must be part of the advanced baseline");
+});
+
 test("restore is byte-exact for staged and unstaged binary changes", async () => {
   const repo = await initRepo();
   const baseBin = randomBytes(1024 * 1024);
@@ -399,7 +508,7 @@ test("restore is byte-exact for staged and unstaged binary changes", async () =>
   await writeFile(join(repo, "untracked.bin"), armedUntrackedBin);
 
   const arm = await armGitCheckpoint(repo, "window-binary");
-  assert.equal(arm.status, "ok");
+  assert.equal(arm.status, "ok", arm.status !== "ok" ? arm.detail : "");
   if (arm.status !== "ok") return;
 
   // Destroy.
@@ -738,6 +847,9 @@ test("unsafe window ids are rejected", async () => {
 test("fail-closed gates refuse unsafe repository states", async () => {
   // not_a_git_repository: a plain directory.
   const plain = await mkTmp();
+  // Test temp roots may themselves be under this checkout. A broken local
+  // marker prevents Git from discovering that enclosing repository.
+  await writeFile(join(plain, ".git"), "gitdir: /definitely/missing\n");
   const notRepo = await armGitCheckpoint(plain, "w1");
   assert.equal(notRepo.status, "unsupported");
   if (notRepo.status === "unsupported") assert.equal(notRepo.reason, "not_a_git_repository");
@@ -763,12 +875,11 @@ test("fail-closed gates refuse unsafe repository states", async () => {
   assert.equal(diffResult.status, "unsupported");
   if (diffResult.status === "unsupported") assert.equal(diffResult.reason, "diff_program_configured");
 
-  // filter_or_eol_configured: autocrlf.
+  // Git-controlled EOL configuration is supported for tracked content.
   const crlfRepo = await initRepo();
   await git(crlfRepo, "config", "core.autocrlf", "true");
   const crlfResult = await armGitCheckpoint(crlfRepo, "w5");
-  assert.equal(crlfResult.status, "unsupported");
-  if (crlfResult.status === "unsupported") assert.equal(crlfResult.reason, "filter_or_eol_configured");
+  assert.equal(crlfResult.status, "ok");
 
   // filter_or_eol_configured: a clean/smudge filter.
   const filterRepo = await initRepo();
@@ -777,14 +888,13 @@ test("fail-closed gates refuse unsafe repository states", async () => {
   assert.equal(filterResult.status, "unsupported");
   if (filterResult.status === "unsupported") assert.equal(filterResult.reason, "filter_or_eol_configured");
 
-  // text_attribute_in_use: a tracked file with the text attribute.
+  // Text normalization is Git-controlled, not a raw-byte checkpoint gate.
   const attrRepo = await initRepo();
   await writeFile(join(attrRepo, ".gitattributes"), "*.txt text\n");
-  await writeFile(join(attrRepo, "doc.txt"), "text file\n");
+  await writeFile(join(attrRepo, "doc.txt"), "text file\r\n");
   await commitAll(attrRepo, "attrs");
   const attrResult = await armGitCheckpoint(attrRepo, "w7");
-  assert.equal(attrResult.status, "unsupported");
-  if (attrResult.status === "unsupported") assert.equal(attrResult.reason, "text_attribute_in_use");
+  assert.equal(attrResult.status, "ok");
 
   // assume_unchanged_entry.
   const assumeRepo = await initRepo();
@@ -919,6 +1029,33 @@ test("compare leaves index bytes untouched and restore backs up the original ind
   assert.deepEqual(await readFile(join(restored.value.scratchDir, "index-backup")), before,
     "restore must back up the original live index bytes before its atomic swap");
   assert.equal(await readFile(join(repo, "f.txt"), "utf8"), "base\n");
+});
+
+test("parallel comparisons isolate and remove their alternate index copies", async () => {
+  const repo = await initRepo();
+  await writeFile(join(repo, "tracked.txt"), "base\n");
+  await commitAll(repo, "tracked baseline");
+  const arm = await armGitCheckpoint(repo, "window-parallel-compare");
+  assert.equal(arm.status, "ok");
+  if (arm.status !== "ok") return;
+  await writeFile(join(repo, "tracked.txt"), "changed\n");
+  const before = await readFile(indexPath(repo));
+  const wrapperDir = await mkTmp();
+  const log = join(wrapperDir, "alternate-indexes.log");
+  const wrapper = join(wrapperDir, "git-wrapper");
+  await writeFile(wrapper, `#!/bin/sh\ncase "$GIT_INDEX_FILE" in\n  *compare-index-diff*) printf '%s\\n' "$GIT_INDEX_FILE" >> '${log}'; sleep 0.1 ;;\nesac\nexec git "$@"\n`);
+  await chmod(wrapper, 0o755);
+  const results = await Promise.all(Array.from({ length: 8 }, () =>
+    compareToGitCheckpoint(repo, arm.value.encoded, { gitPath: wrapper })));
+  for (const result of results) {
+    assert.equal(result.status, "ok", result.status !== "ok" ? result.detail : "");
+    if (result.status === "ok") assert.deepEqual(result.value.trackedChanges.map((entry) => entry.path), ["tracked.txt"]);
+  }
+  const paths = (await readFile(log, "utf8")).trim().split("\n");
+  assert.equal(paths.length, results.length, "each comparison must reach the worktree diff");
+  assert.equal(new Set(paths).size, results.length, "concurrent comparisons must never share an alternate index");
+  for (const path of paths) await assert.rejects(lstat(path), { code: "ENOENT" });
+  assert.deepEqual(await readFile(indexPath(repo)), before, "parallel comparisons must not write the live index");
 });
 
 test("compare exposes exact changed-untracked bytes, targets, and modes", async () => {
@@ -1642,6 +1779,207 @@ test("abort during capture removes the owned pin ref", async () => {
   assert.notEqual(refGone.code, 0, "owned pin ref must be removed after an aborted arm");
 });
 
+test("large text/EOL-attributed set needs no per-file Git processes or retained payloads", async () => {
+  const repo = await initRepo();
+  await writeFile(join(repo, ".gitattributes"), "auto/*.txt text=auto\nlf/*.txt text eol=lf\n");
+  await mkdir(join(repo, "auto"));
+  await mkdir(join(repo, "lf"));
+  for (let i = 0; i < 2000; i += 1) {
+    await writeFile(join(repo, i % 2 ? "auto" : "lf", `${i}.txt`), `safe LF ${i}\n`);
+  }
+  await commitAll(repo, "large clean EOL fixture");
+  const wrapperDir = await mkTmp();
+  const log = join(wrapperDir, "git-calls.log");
+  const wrapper = join(wrapperDir, "git-wrapper");
+  await writeFile(wrapper, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\nexec git "$@"\n`);
+  await chmod(wrapper, 0o755);
+  const indexBefore = await readFile(indexPath(repo));
+  const start = performance.now();
+  const arm = await armGitCheckpoint(repo, "window-large-lf", { gitPath: wrapper });
+  const elapsedMs = Math.round(performance.now() - start);
+  assert.equal(arm.status, "ok", arm.status !== "ok" ? arm.detail : "");
+  if (arm.status !== "ok") return;
+  const calls = (await readFile(log, "utf8")).trim().split("\n");
+  assert.equal(calls.filter((call) => call.includes("hash-object")).length, 0);
+  assert.equal(calls.filter((call) => call.includes("--eol")).length, 0);
+  assert.equal(calls.filter((call) => call.includes("check-attr") && /(?: text| eol| crlf)(?: |$)/.test(call)).length, 0);
+  assert.ok(calls.length < 65, `expected bounded Git calls for 2000 files; got ${calls.length}`);
+  assert.ok(arm.value.stats.recordBytes < 4096, "clean tracked bytes must not be retained");
+  assert.deepEqual(await readFile(indexPath(repo)), indexBefore);
+  // Evidence for synthetic timing/process-count comparisons on the host.
+  console.log(`synthetic 2000 attributed LF files: ${elapsedMs}ms, ${calls.length} git calls, 0 hash-object, 0 --eol`);
+});
+
+test("CR-bearing tracked files need no EOL subprocess and config drift fails closed", async () => {
+  const repo = await initRepo();
+  await writeFile(join(repo, ".gitattributes"), "*.txt text eol=lf\n");
+  await writeFile(join(repo, "fixture.txt"), "first\nsecond\n");
+  await commitAll(repo, "LF fixture");
+  await writeFile(join(repo, "fixture.txt"), "first\r\nsecond\r\n");
+  const wrapperDir = await mkTmp();
+  const log = join(wrapperDir, "git-calls.log");
+  const wrapper = join(wrapperDir, "git-wrapper");
+  await writeFile(wrapper, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\nexec git "$@"\n`);
+  await chmod(wrapper, 0o755);
+  const indexBefore = await readFile(indexPath(repo));
+  const arm = await armGitCheckpoint(repo, "window-crlf-normalized", { gitPath: wrapper });
+  assert.equal(arm.status, "ok", arm.status !== "ok" ? arm.detail : "");
+  if (arm.status !== "ok") return;
+  const calls = await readFile(log, "utf8");
+  assert.doesNotMatch(calls, /hash-object|--eol/);
+  assert.deepEqual(await readFile(indexPath(repo)), indexBefore);
+  assert.equal(arm.value.stats.unstagedPatchBytes, 0, "Git-normalized line endings are not a change");
+  await writeFile(join(repo, "fixture.txt"), "first\nsecond\n");
+  const compared = await compareToGitCheckpoint(repo, arm.value.encoded);
+  assert.equal(compared.status, "ok", compared.status !== "ok" ? compared.detail : "");
+  if (compared.status === "ok") assert.deepEqual(compared.value.trackedChanges, []);
+  assert.deepEqual(await readFile(indexPath(repo)), indexBefore, "comparison must not write the live index");
+
+  const indexBeforeRace = await readFile(indexPath(repo));
+  const configRace = await armGitCheckpoint(repo, "window-eol-config-race", {
+    faultHooks: { afterInitialAudit: async () => { await git(repo, "config", "core.autocrlf", "true"); } },
+  });
+  assert.equal(configRace.status, "failed");
+  if (configRace.status === "failed") assert.equal(configRace.reason, "capture_inconsistent");
+  assert.deepEqual(await readFile(indexPath(repo)), indexBeforeRace);
+  await git(repo, "config", "--unset", "core.autocrlf");
+  const attributeRace = await armGitCheckpoint(repo, "window-filter-attr-race", {
+    faultHooks: {
+      afterInitialAudit: async () => writeFile(join(repo, ".git", "info", "attributes"), "fixture.txt filter=unsafe\n"),
+    },
+  });
+  assert.equal(attributeRace.status, "unsupported");
+  if (attributeRace.status === "unsupported") assert.equal(attributeRace.reason, "filter_or_eol_configured");
+  assert.deepEqual(await readFile(indexPath(repo)), indexBeforeRace);
+});
+
+test("substantive CRLF tracked edit returns normalized review bytes without EOL churn", async () => {
+  const repo = await initRepo();
+  await writeFile(join(repo, ".gitattributes"), "doc.txt text eol=lf\n");
+  await writeFile(join(repo, "doc.txt"), "first\nsecond\nthird\n");
+  await commitAll(repo, "LF baseline");
+  const arm = await armGitCheckpoint(repo, "window-crlf-review");
+  assert.equal(arm.status, "ok", arm.status !== "ok" ? arm.detail : "");
+  if (arm.status !== "ok") return;
+  const indexBefore = await readFile(indexPath(repo));
+  await writeFile(join(repo, "doc.txt"), "first\r\nsecond edited\r\nthird\r\n");
+  const compared = await compareToGitCheckpoint(repo, arm.value.encoded, {}, true);
+  assert.equal(compared.status, "ok", compared.status !== "ok" ? compared.detail : "");
+  if (compared.status !== "ok") return;
+  assert.equal(compared.value.trackedChanges.length, 1);
+  const change = compared.value.trackedChanges[0]!;
+  assert.equal(change.path, "doc.txt");
+  assert.deepEqual(change.oldBytes, Buffer.from("first\nsecond\nthird\n"));
+  assert.deepEqual(change.newBytes, Buffer.from("first\nsecond edited\nthird\n"));
+  const patchDir = await mkTmp();
+  const oldPath = join(patchDir, "old.txt");
+  const newPath = join(patchDir, "new.txt");
+  await writeFile(oldPath, change.oldBytes!);
+  await writeFile(newPath, change.newBytes!);
+  const patch = await gitTolerant(repo, "diff", "--no-index", "--", oldPath, newPath);
+  assert.equal(patch.code, 1);
+  assert.match(patch.stdout, /-second\n\+second edited\n/);
+  assert.doesNotMatch(patch.stdout, /^[-+]first|^[-+]third/m);
+  assert.deepEqual(await readFile(indexPath(repo)), indexBefore, "comparison must not write the live index");
+  assert.ok(!(await readdir(join(repo, ".git", "pi-review-gate", "checkpoints", "window-crlf-review")))
+    .some((entry) => entry.startsWith("compare-clean-")), "comparison must remove its temporary clean blob");
+});
+
+test("Git-normalized tracked deltas and raw untracked bytes survive restart", async () => {
+  const repo = await initRepo();
+  await writeFile(join(repo, ".gitattributes"), "fixture.txt text eol=lf\n");
+  const baseText = Buffer.from("base first\nbase second\n");
+  const baseBinary = Buffer.from([0, 255, 1, 0, 2, 254]);
+  await writeFile(join(repo, "fixture.txt"), baseText);
+  await writeFile(join(repo, "data.bin"), baseBinary);
+  await commitAll(repo, "text eol fixture");
+
+  const stagedText = Buffer.from("base first\nstaged line\nbase second\n");
+  const armedText = Buffer.from("base first\nstaged line\nunstaged line\nbase second\n");
+  const stagedBinary = Buffer.from([0, 1, 2, 3, 4, 5, 6]);
+  const armedBinary = Buffer.from([0, 6, 5, 4, 3, 2, 1, 255]);
+  const untrackedBytes = Buffer.from([255, 0, 10, 13, 42]);
+  await writeFile(join(repo, "fixture.txt"), stagedText);
+  await writeFile(join(repo, "data.bin"), stagedBinary);
+  await git(repo, "add", "fixture.txt", "data.bin");
+  await writeFile(join(repo, "fixture.txt"), armedText);
+  await writeFile(join(repo, "data.bin"), armedBinary);
+  await writeFile(join(repo, "notes.bin"), untrackedBytes);
+
+  const stagedPatch = await git(repo, "diff", "--cached", "--binary");
+  const unstagedPatch = await git(repo, "diff", "--binary");
+  const indexBefore = await readFile(indexPath(repo));
+  const worktreeBefore = await snapshotWorktree(repo);
+  const arm = await armGitCheckpoint(repo, "window-text-eol-exact");
+  assert.equal(arm.status, "ok", arm.status === "unsupported" || arm.status === "failed" ? arm.detail : "");
+  if (arm.status !== "ok") return;
+
+  // Capture is read-only for the live index and worktree; clean tracked
+  // bytes are not included in the checkpoint record.
+  assert.deepEqual(await readFile(indexPath(repo)), indexBefore);
+  assert.deepEqual(await snapshotWorktree(repo), worktreeBefore);
+  assert.deepEqual(arm.value.record.untracked.map((entry) => entry.path), ["notes.bin"]);
+  const unchanged = await compareToGitCheckpoint(repo, arm.value.encoded);
+  assert.equal(unchanged.status, "ok");
+  if (unchanged.status === "ok") {
+    assert.deepEqual(unchanged.value.untrackedChanges, []);
+  }
+
+  // Destroy the current state, then restore from a separate Node process using
+  // only the durable record to cover by-value restart restoration.
+  await writeFile(join(repo, "fixture.txt"), "destroyed\n");
+  await writeFile(join(repo, "data.bin"), Buffer.alloc(8, 0xaa));
+  await rm(join(repo, "notes.bin"));
+  await git(repo, "reset", "-q");
+  const recordFile = join(await mkTmp(), "record.json");
+  const resultFile = join(await mkTmp(), "result.json");
+  await writeFile(recordFile, arm.value.encoded);
+  const modulePath = join(__dirname, "..", "src", "git-checkpoint.js");
+  const childScript = [
+    "const m = require(process.argv[1]);",
+    "const fs = require('fs');",
+    "(async () => {",
+    "  const encoded = fs.readFileSync(process.argv[2], 'utf8');",
+    "  const res = await m.restoreGitCheckpoint(process.argv[3], encoded);",
+    "  fs.writeFileSync(process.argv[4], JSON.stringify(res.status === 'ok' ? { ok: true } : res));",
+    "  process.exit(res.status === 'ok' ? 0 : 1);",
+    "})().catch((e) => { console.error(e); process.exit(2); });",
+  ].join("\n");
+  let childCode = 0;
+  try {
+    execFileSync(process.execPath, ["-e", childScript, modulePath, recordFile, repo, resultFile], { stdio: "pipe" });
+  } catch (error) {
+    const err = error as { code?: number | string };
+    childCode = typeof err.code === "number" ? err.code : 1;
+  }
+  assert.equal(childCode, 0, `fresh-process restore failed: ${await readFile(resultFile, "utf8").catch(() => "?")}`);
+  assert.deepEqual(await readFile(join(repo, "fixture.txt")), armedText);
+  assert.deepEqual(await readFile(join(repo, "data.bin")), armedBinary);
+  assert.deepEqual(await readFile(join(repo, "notes.bin")), untrackedBytes);
+  assert.equal(await git(repo, "diff", "--cached", "--binary"), stagedPatch);
+  assert.equal(await git(repo, "diff", "--binary"), unstagedPatch);
+});
+
+test("Git-normalized tracked deletions remain restorable; untracked CRLF stays exact", async () => {
+  const repo = await initRepo();
+  await writeFile(join(repo, ".gitattributes"), "missing.txt text eol=lf\n");
+  await writeFile(join(repo, "missing.txt"), "tracked then removed\n");
+  await commitAll(repo, "missing attributed path");
+  await rm(join(repo, "missing.txt"));
+  const raw = Buffer.from("untracked\r\nbytes\r\n");
+  await writeFile(join(repo, "notes.txt"), raw);
+  const arm = await armGitCheckpoint(repo, "window-eol-missing");
+  assert.equal(arm.status, "ok", arm.status !== "ok" ? arm.detail : "");
+  if (arm.status !== "ok") return;
+  assert.deepEqual(Buffer.from(arm.value.record.untracked[0]!.contentB64!, "base64"), raw);
+  await writeFile(join(repo, "missing.txt"), "newer bytes\n");
+  await writeFile(join(repo, "notes.txt"), "destroyed\n");
+  const restored = await restoreGitCheckpoint(repo, arm.value.encoded);
+  assert.equal(restored.status, "ok", restored.status !== "ok" ? restored.detail : "");
+  assert.equal((await lstat(join(repo, "missing.txt")).catch(() => undefined)), undefined);
+  assert.deepEqual(await readFile(join(repo, "notes.txt")), raw);
+});
+
 test("fail-closed gates refuse attribute-driven byte conversions", async () => {
   // ident: checkout expands $Id$ to $Id:<blob>$, so the armed worktree bytes
   // are not the stored blob and are not reconstructible from it.
@@ -2298,6 +2636,80 @@ test("stale same-base owner cannot release a newer arm reusing the window id", a
   });
   assert.equal(staleAfter.status, "ok");
   if (staleAfter.status === "ok") assert.equal(staleAfter.value.released, false);
+});
+
+test("same-base re-arm waits for release through deletion and owned scratch cleanup", async () => {
+  const repo = await initRepo();
+  const windowId = "window-release-race";
+  const first = await armGitCheckpoint(repo, windowId);
+  assert.equal(first.status, "ok");
+  if (first.status !== "ok") return;
+  const a = first.value.descriptor;
+  const windowDir = join(a.gitDir, "pi-review-gate", "checkpoints", windowId);
+  let signalDeleted!: () => void;
+  const deleted = new Promise<void>((resolve) => { signalDeleted = resolve; });
+  let resumeRelease!: () => void;
+  const resume = new Promise<void>((resolve) => { resumeRelease = resolve; });
+  const release = releaseGitCheckpointPin(repo, windowId, {
+    expectedBase: a.base, armId: a.armId,
+    faultHooks: { afterPinReleaseDelete: async () => { signalDeleted(); await resume; } },
+  });
+  await deleted;
+  // The pin is absent but release still owns the window mutex. Another
+  // process may already be attempting to create the same-base generation.
+  assert.notEqual((await gitTolerant(repo, "rev-parse", "--verify", "--quiet", a.ref)).code, 0);
+  let signalContended!: () => void;
+  const contended = new Promise<void>((resolve) => { signalContended = resolve; });
+  let armSettled = false;
+  const secondPromise = armGitCheckpoint(repo, windowId, {
+    faultHooks: { onPinLockContended: () => { signalContended(); } },
+  }).then((result) => { armSettled = true; return result; });
+  try {
+    await contended;
+    assert.equal(armSettled, false, "re-arm must wait for release cleanup after reaching the pin lock");
+  } finally {
+    resumeRelease();
+  }
+  const released = await release;
+  assert.equal(released.status, "ok");
+  if (released.status === "ok") assert.equal(released.value.released, true);
+  const second = await secondPromise;
+  assert.equal(second.status, "ok", second.status === "failed" ? second.detail : "");
+  if (second.status !== "ok") return;
+  const b = second.value.descriptor;
+  assert.equal(b.base, a.base);
+  assert.notEqual(b.armId, a.armId);
+  await assert.rejects(stat(join(windowDir, `arm-${a.armId}`)));
+  assert.deepEqual(await readFile(join(windowDir, `arm-${b.armId}`, "record.json"), "utf8"), second.value.encoded);
+  const stale = await releaseGitCheckpointPin(repo, windowId, { expectedBase: a.base, armId: a.armId });
+  assert.equal(stale.status, "failed");
+  if (stale.status === "failed") assert.equal(stale.reason, "release_owner_stale");
+  assert.equal((await git(repo, "rev-parse", "--verify", b.ref)).trim(), b.base);
+  assert.equal((await loadGitCheckpoint(repo, b)).status, "ok");
+  const relB = await releaseGitCheckpointPin(repo, windowId, { expectedBase: b.base, armId: b.armId });
+  assert.equal(relB.status, "ok");
+  await assert.rejects(stat(windowDir));
+});
+
+test("release removes only its generation's scratch when stale scratch survived", async () => {
+  const repo = await initRepo();
+  const first = await armGitCheckpoint(repo, "window-owned-cleanup");
+  assert.equal(first.status, "ok");
+  if (first.status !== "ok") return;
+  const a = first.value.descriptor;
+  const released = await releaseGitCheckpointPin(repo, a.windowId, { expectedBase: a.base, armId: a.armId });
+  assert.equal(released.status, "ok");
+  const staleDir = join(a.gitDir, "pi-review-gate", "checkpoints", a.windowId, `arm-${a.armId}`);
+  await mkdir(staleDir, { recursive: true });
+  await writeFile(join(staleDir, "record.json"), first.value.encoded);
+  const second = await armGitCheckpoint(repo, a.windowId);
+  assert.equal(second.status, "ok");
+  if (second.status !== "ok") return;
+  const b = second.value.descriptor;
+  const relB = await releaseGitCheckpointPin(repo, b.windowId, { expectedBase: b.base, armId: b.armId });
+  assert.equal(relB.status, "ok");
+  assert.equal(await readFile(join(staleDir, "record.json"), "utf8"), first.value.encoded);
+  await assert.rejects(stat(join(a.gitDir, "pi-review-gate", "checkpoints", a.windowId, `arm-${b.armId}`)));
 });
 
 test("load refuses a stale same-base record that survived an interrupted release", async () => {

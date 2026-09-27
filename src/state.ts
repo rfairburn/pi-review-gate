@@ -1,6 +1,7 @@
 import type { ChangedFile, WorkspaceSnapshot } from "./capture";
 import type { CorrectionFeedbackMarker } from "./correction-feedback";
 import type { GitCheckpointDescriptor } from "./git-checkpoint";
+import type { ReviewCheckpointDescriptor } from "./review-checkpoint";
 import {
   createEvidenceState,
   recordAcceptedReviewerQuestion as recordAcceptedQuestionEvidence,
@@ -20,7 +21,7 @@ import {
   resolveReviewers,
   type ReviewGateConfig,
 } from "./config";
-import { reviewerSelectionDigest } from "./session-state";
+import { reviewCheckpointDescriptorIdentity, reviewerSelectionDigest } from "./session-state";
 
 export type ReviewFeedbackSource = "automatic" | "manual";
 export type ReviewFeedbackDisposition =
@@ -32,17 +33,18 @@ export type ReviewFeedbackDisposition =
 
 /**
  * Typed review baseline. A window (and its active exchange) is reviewed
- * against either a completed workspace snapshot or a durable Git checkpoint.
- * The two kinds are never mixed inside one window: every mutation helper and
- * the session-state store enforce the same-kind invariant fail-closed.
- *
- * Git capture is not activated yet: current production paths only ever wrap
- * snapshots, and consumers that require a snapshot narrow explicitly (see
- * `snapshotOfReviewBaseline`) instead of comparing against a synthetic one.
+ * against one unified durable checkpoint. Snapshot and legacy Git variants
+ * remain typed only while the primary adapter is being replaced; new parent
+ * review windows use `checkpoint`. A window never mixes baseline kinds.
  */
 export type ReviewBaseline =
   | { kind: "snapshot"; snapshot: WorkspaceSnapshot }
-  | { kind: "git"; descriptor: GitCheckpointDescriptor; cwd: string; capturedAt: string };
+  | { kind: "git"; descriptor: GitCheckpointDescriptor; cwd: string; capturedAt: string }
+  | { kind: "checkpoint"; descriptor: ReviewCheckpointDescriptor; cwd: string; capturedAt: string };
+
+/** The Git checkpoint variant of a typed review baseline. */
+export type GitCheckpointBaseline = Extract<ReviewBaseline, { kind: "git" }>;
+export type UnifiedReviewBaseline = Extract<ReviewBaseline, { kind: "checkpoint" }>;
 
 /** Wrap a completed workspace capture as the snapshot variant of a typed review baseline. */
 export function snapshotReviewBaseline(snapshot: WorkspaceSnapshot): ReviewBaseline {
@@ -50,18 +52,28 @@ export function snapshotReviewBaseline(snapshot: WorkspaceSnapshot): ReviewBasel
 }
 
 /**
+ * Discriminate a typed review baseline from a raw workspace snapshot at the
+ * value level (review inputs accept both). A snapshot never carries a `kind`
+ * discriminator, so only the two typed variants match.
+ */
+export function isReviewBaseline(value: unknown): value is ReviewBaseline {
+  if (typeof value !== "object" || value === null) return false;
+  const kind = (value as { kind?: unknown }).kind;
+  return kind === "snapshot" || kind === "git" || kind === "checkpoint";
+}
+
+/**
  * Narrow a typed review baseline to its workspace snapshot for consumers that
- * require a snapshot (review settlement, delegated execution bookkeeping).
- * A Git checkpoint baseline is not yet wired into those consumers: rather than
- * comparing against an empty pseudo-snapshot or silently dropping the Git
- * state, this throws a clear fail-closed error until the Git review
- * integration lands.
+ * require a snapshot (delegated execution bookkeeping and other paths not yet
+ * wired for Git baselines). Rather than comparing against an empty
+ * pseudo-snapshot or silently dropping the Git state, this throws a clear
+ * fail-closed error.
  */
 export function snapshotOfReviewBaseline(baseline: ReviewBaseline | undefined): WorkspaceSnapshot | undefined {
   if (baseline === undefined) return undefined;
   if (baseline.kind !== "snapshot") {
     throw new Error(
-      "review gate: this consumer requires a workspace-snapshot baseline but the review window holds a Git checkpoint baseline; Git review is not wired yet, refusing to fall back to a synthetic snapshot",
+      `review gate: this consumer requires a workspace-snapshot baseline but the review window holds a ${baseline.kind === "git" ? "Git checkpoint" : "unified checkpoint"} baseline; refusing to fall back to a synthetic snapshot`,
     );
   }
   return baseline.snapshot;
@@ -215,14 +227,38 @@ export function beginAgentRun(state: ReviewGateState): "new" | "continuation" {
  * Same-kind invariant guard for snapshot-input mutation helpers: a window
  * that already holds a Git checkpoint baseline (restored from a v3 sidecar)
  * must never be layered with a workspace-snapshot baseline — mixing kinds in
- * one window would make the next restore fail closed. Until the Git review
- * integration lands, refuse explicitly instead of guessing.
+ * one window would make the next restore fail closed. Refuse explicitly.
  */
 function assertNoGitBaselineConflict(window: ReviewWindow, context: string): void {
-  if (window.baseline?.kind === "git" || window.activeExchange?.baseline?.kind === "git") {
+  if ((window.baseline && window.baseline.kind !== "snapshot")
+    || (window.activeExchange?.baseline && window.activeExchange.baseline.kind !== "snapshot")) {
     throw new Error(
-      `review gate: ${context}: the review window already holds a Git checkpoint baseline; refusing to mix baseline kinds until Git review integration lands`,
+      `review gate: ${context}: the review window already holds a checkpoint baseline; refusing to mix baseline kinds with a workspace-snapshot baseline`,
     );
+  }
+}
+
+/**
+ * Same-kind invariant for typed-baseline mutation helpers: a window that
+ * already holds one baseline kind must never be layered with the other —
+ * mixing kinds in one window would make the next restore fail closed.
+ */
+function assertNoMixedBaselineKind(window: ReviewWindow, incoming: ReviewBaseline, context: string): void {
+  for (const existing of [window.baseline, window.activeExchange?.baseline]) {
+    if (existing && existing.kind !== incoming.kind) {
+      throw new Error(
+        `review gate: ${context}: the review window already holds a ${existing.kind} baseline; refusing to mix baseline kinds with an ${incoming.kind} baseline`,
+      );
+    }
+  }
+}
+
+export function setReviewWindowCheckpointBaseline(state: ReviewGateState, baseline: UnifiedReviewBaseline): void {
+  const window = state.reviewWindow ?? openReviewWindow(state);
+  assertNoMixedBaselineKind(window, baseline, "setReviewWindowCheckpointBaseline");
+  window.baseline ??= baseline;
+  if (window.activeExchange && !window.activeExchange.baseline) {
+    window.activeExchange.baseline = window.baseline;
   }
 }
 
@@ -235,15 +271,24 @@ export function setReviewWindowBaseline(state: ReviewGateState, baseline: Worksp
   }
 }
 
-export function armReviewResponseExchange(state: ReviewGateState, reviewedSnapshot: WorkspaceSnapshot): void {
+/**
+ * Arm the feedback/response exchange with the reviewed after-baseline.
+ * Accepts either variant of a typed review baseline (or a raw completed
+ * snapshot, wrapped here): for a Git checkpoint review this is the single
+ * frozen after-checkpoint descriptor the review settled against, and storing
+ * it on the exchange is what transfers ownership of its pin to the persisted
+ * window state (a later lifecycle slice owns save-before-release).
+ */
+export function armReviewResponseExchange(state: ReviewGateState, reviewedBaseline: WorkspaceSnapshot | ReviewBaseline): void {
   beginAgentRun(state);
   const window = state.reviewWindow;
   const active = state.reviewWindow?.activeExchange;
   if (!active || !window) {
     return;
   }
-  assertNoGitBaselineConflict(window, "armReviewResponseExchange");
-  active.baseline ??= snapshotReviewBaseline(reviewedSnapshot);
+  const baseline = isReviewBaseline(reviewedBaseline) ? reviewedBaseline : snapshotReviewBaseline(reviewedBaseline);
+  assertNoMixedBaselineKind(window, baseline, "armReviewResponseExchange");
+  active.baseline ??= baseline;
   const feedback = [...window.reviewHistory].reverse().find((item) => reviewResponseMode(item.disposition) !== undefined);
   if (feedback) {
     active.causedByReviewSequence = feedback.sequence;
@@ -511,12 +556,13 @@ export function recordReviewerFeedbackAndArmExchange(
     reviewSequence?: number;
     source: ReviewFeedbackSource;
     disposition: ReviewFeedbackDisposition;
-    reviewedSnapshot: WorkspaceSnapshot;
+    /** The reviewed after-baseline (snapshot or Git checkpoint) the response exchange reviews against. */
+    reviewedBaseline: WorkspaceSnapshot | ReviewBaseline;
     displayLabels?: Record<string, string>;
   },
 ): void {
   recordReviewerFeedback(state, input);
-  armReviewResponseExchange(state, input.reviewedSnapshot);
+  armReviewResponseExchange(state, input.reviewedBaseline);
 }
 
 export function markCappedFeedbackSent(
@@ -616,6 +662,21 @@ function openReviewWindow(state: ReviewGateState): ReviewWindow {
   };
   state.reviewWindow = window;
   return window;
+}
+
+/** Enumerate live checkpoint owners once per descriptor (including exchange-only owners).
+ * Callers must persist the state after a mutation before releasing any owner
+ * no longer listed here; synchronous state mutations never release pins. */
+export function ownedReviewCheckpointDescriptors(state: ReviewGateState): Array<{ cwd: string; descriptor: ReviewCheckpointDescriptor }> {
+  const owned = new Map<string, { cwd: string; descriptor: ReviewCheckpointDescriptor }>();
+  for (const window of [state.reviewWindow, state.lastQuestionWindow]) {
+    for (const baseline of [window?.baseline, window?.activeExchange?.baseline]) {
+      if (baseline?.kind !== "checkpoint") continue;
+      const identity = reviewCheckpointDescriptorIdentity(baseline.cwd, baseline.descriptor);
+      owned.set(identity, { cwd: baseline.cwd, descriptor: baseline.descriptor });
+    }
+  }
+  return [...owned.values()];
 }
 
 function rememberOwnedBundle(state: ReviewGateState, window: ReviewWindow | undefined): void {

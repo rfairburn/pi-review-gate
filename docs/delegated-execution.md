@@ -322,7 +322,8 @@ On Windows, private Git capture ignores unreliable worktree-only executable-bit
 differences while retaining staged index modes and current worktree content;
 its root identity uses an opened directory's volume ID when path stat omits it,
 and landing and recovery verify that same identity. POSIX worktree mode
-handling is unchanged.
+handling is unchanged. Landing stages temporary files beside their destination
+on the same volume; recovery validates those native paths before acting.
 
 During task capture, `maxSnapshotBytes` limits only the cumulative size of non-ignored
 untracked files (50 MiB by default). This private task capture, candidate review, and

@@ -30,7 +30,9 @@ dates.
 - Avoid worktree-only mode noise in private Windows subtask capture while
   retaining source-index staged executable modes and current worktree bytes;
   use an opened directory's volume ID to bind capture, landing and recovery
-  when path stat omits it. Keep the POSIX capture behavior unchanged.
+  when path stat omits it. Stage landing temp files beside their destination
+  across Windows volumes and validate those paths during recovery. Keep the
+  POSIX capture behavior unchanged.
 - Contain synchronous reviewer and delegated executor process-kill errors,
   including Windows `EINVAL`, without treating a still-live child as exited;
   retain termination diagnostics and bounded kill escalation.

@@ -3,7 +3,7 @@ import type { ChildProcessByStdio } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { promises as fs, readlink as fsReadlink, Stats } from "node:fs";
-import { join, sep, isAbsolute, resolve } from "node:path";
+import { dirname, join, sep, isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
 import { atomicWrite } from "./durable-write";
 import { readSourceRootIdentity, type WaveCaptureResult } from "./wave-repository";
@@ -1226,7 +1226,7 @@ export async function executeWaveLanding(
       }
 
       const destPath = join(resolvedSourceRoot, lp.path);
-      const dir = destPath.substring(0, destPath.lastIndexOf("/"));
+      const dir = dirname(destPath);
 
       // Create parent directories if needed, tracking only newly-created ones.
       if (dir && dir !== resolvedSourceRoot) {
@@ -1939,7 +1939,7 @@ export async function recoverLandingManifest(
 
   // ── Step 1.5: Verify controller authentication (HMAC-SHA256) ──
   // The auth key is stored in the landing directory (parent of manifest).
-  const landingDir = manifestPath.substring(0, manifestPath.lastIndexOf("/"));
+  const landingDir = dirname(manifestPath);
   const authKey = await readAuthKey(landingDir);
   if (!authKey) {
     return {
@@ -2044,7 +2044,7 @@ export async function recoverLandingManifest(
 
     // Validate temp path: must be exactly the controller-generated path or empty/null.
     if (entry.temp) {
-      const expectedTemp = join(destPath.substring(0, destPath.lastIndexOf("/")), `.pi-landing-tmp-${txId}-${ak}`);
+      const expectedTemp = join(dirname(destPath), `.pi-landing-tmp-${txId}-${ak}`);
       if (entry.temp !== expectedTemp) {
         return {
           status: "rejected",

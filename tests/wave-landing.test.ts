@@ -5,7 +5,7 @@ import { EventEmitter } from "node:events";
 import type { Readable, Writable } from "node:stream";
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { captureWaveBase, WaveCaptureResult } from "../src/execution/wave-repository";
@@ -23,6 +23,7 @@ import {
   executeWaveLanding,
   gitCatFileBlob,
   planWaveLanding,
+  recoverLandingManifest,
   validatePathSafe,
   type LandingPlan,
   type LandingPath,
@@ -136,6 +137,16 @@ test("native Windows wave landing applies a worker edit with handle-bound source
     const landed = await executeWaveLanding(plan, capture);
     assert.equal(landed.status, "landed", `Landing result: ${JSON.stringify(landed)}`);
     assert.equal(await readFile(join(sourceDir, "readme.md"), "utf8"), "after\n");
+    if (landed.status !== "landed") return;
+    const manifest = JSON.parse(await readFile(landed.manifestPath, "utf8")) as {
+      paths: Array<{ destination: string; temp: string }>;
+    };
+    assert.equal(manifest.paths.length, 1);
+    assert.equal(dirname(manifest.paths[0]!.temp), dirname(manifest.paths[0]!.destination),
+      "landing temp must be staged in the destination directory, even across Windows volumes");
+    const recovery = await recoverLandingManifest(landed.manifestPath);
+    assert.equal(recovery.status, "terminal", `Recovery result: ${JSON.stringify(recovery)}`);
+    if (recovery.status === "terminal") assert.equal(recovery.state, "completed");
   } finally {
     await rm(sourceDir, { recursive: true, force: true });
     await rm(artifactDir, { recursive: true, force: true });

@@ -3,6 +3,7 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ReviewerInvocationTelemetry, ReviewResult } from "../schema";
 import { BoundedJsonlDecoder, MEBIBYTE, utf8Prefix } from "../jsonl";
+import { DEFAULT_PI_COMMAND, resolvePiChildSpawn, translateDefaultPiSpawnError } from "../pi-invocation";
 
 export interface ProcessRunResult {
   stdout: string;
@@ -19,6 +20,7 @@ export interface ProcessRunResult {
   timedOut: boolean;
   aborted: boolean;
   stdinError?: string;
+  terminationError?: string;
 }
 
 export interface ReviewerArtifactPaths {
@@ -67,6 +69,7 @@ export async function writeReviewerProcessArtifacts(input: {
       timedOut: input.output.timedOut,
       aborted: input.output.aborted,
       stdinError: input.output.stdinError,
+      terminationError: input.output.terminationError,
       stdoutTruncated: input.output.stdoutTruncated,
       stderrTruncated: input.output.stderrTruncated,
       stdoutBytes: input.output.stdoutBytes,
@@ -99,7 +102,11 @@ export function processFailureResult(input: {
 }): ReviewResult | undefined {
   const telemetry = processTelemetry(input.output);
   if (input.output.aborted) {
-    return { ...reviewerErrorResult(input.reviewerId, "Reviewer was aborted.", input.rawOutputPath, "aborted", input.usage), telemetry };
+    return {
+      ...reviewerErrorResult(input.reviewerId, "Reviewer was aborted.", input.rawOutputPath, "aborted", input.usage),
+      telemetry,
+      diagnostic: input.output.terminationError,
+    };
   }
   if (input.output.timedOut) {
     return { ...reviewerErrorResult(
@@ -108,7 +115,7 @@ export function processFailureResult(input: {
       input.rawOutputPath,
       "timeout",
       input.usage,
-    ), telemetry };
+    ), telemetry, diagnostic: input.output.terminationError };
   }
   if (input.output.stdinError) {
     return {
@@ -120,7 +127,7 @@ export function processFailureResult(input: {
         input.usage,
       ),
       telemetry,
-      diagnostic: input.output.stdinError,
+      diagnostic: joinDiagnostics(input.output.stdinError, input.output.terminationError),
     };
   }
   if (input.output.code !== 0) {
@@ -130,7 +137,7 @@ export function processFailureResult(input: {
       input.rawOutputPath,
       `exit_${input.output.code}`,
       input.usage,
-    ), telemetry, diagnostic: stderrDiagnostic(input.output.stderr) };
+    ), telemetry, diagnostic: joinDiagnostics(stderrDiagnostic(input.output.stderr), input.output.terminationError) };
   }
   return undefined;
 }
@@ -162,22 +169,52 @@ export async function runPromptProcess(input: {
   onPromptDelivery?: (delivery: { prompt: string }) => void;
   /** Internal/test override; production adapters use MAX_RETAINED_OUTPUT_BYTES. */
   maxRetainedOutputBytes?: number;
+  /** Internal/test override for deterministic SIGKILL escalation coverage. */
+  terminationEscalationMs?: number;
+  /**
+   * #204: alias-independent default `pi` resolution. This seam is shared by
+   * non-Pi adapters (generic-cli, run-as-binary, claude-cli, codex-cli), whose
+   * configured commands keep their exact spawn semantics; only the Pi model
+   * adapter opts in.
+   */
+  resolveDefaultPi?: boolean;
 }): Promise<ProcessRunResult> {
   const maxRetainedOutputBytes = input.maxRetainedOutputBytes ?? MAX_RETAINED_OUTPUT_BYTES;
   if (!Number.isSafeInteger(maxRetainedOutputBytes) || maxRetainedOutputBytes < 0) {
     throw new RangeError("maxRetainedOutputBytes must be a non-negative safe integer");
+  }
+  const terminationEscalationMs = input.terminationEscalationMs ?? 2_000;
+  if (!Number.isSafeInteger(terminationEscalationMs) || terminationEscalationMs < 0) {
+    throw new RangeError("terminationEscalationMs must be a non-negative safe integer");
   }
   if (input.signal?.aborted) {
     return emptyProcessResult({ aborted: true });
   }
 
   return await new Promise((resolve, reject) => {
-    const proc = spawn(input.command, input.args, {
+    const childEnv = { ...(input.env ?? process.env), PWD: input.cwd };
+    // #204: alias-independent default `pi` launch, opt-in so non-Pi adapters
+    // sharing this seam keep their exact configured command/argv semantics.
+    let file = input.command;
+    let spawnArgs: string[] = [...input.args];
+    if (input.resolveDefaultPi) {
+      const invocation = resolvePiChildSpawn(input.command, input.args, childEnv);
+      if (!invocation.ok) {
+        reject(new Error(invocation.error));
+        return;
+      }
+      file = invocation.file;
+      spawnArgs = invocation.args;
+    }
+    // Only the POSIX pass-through keeps the bare `pi` name; a missing default
+    // Pi CLI there surfaces as an actionable diagnostic instead of raw ENOENT.
+    const isDefaultPiPassThrough = input.resolveDefaultPi === true && file === DEFAULT_PI_COMMAND;
+    const proc = spawn(file, spawnArgs, {
       cwd: input.cwd,
       detached: process.platform !== "win32",
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...(input.env ?? process.env), PWD: input.cwd },
+      env: childEnv,
     });
 
     let stdout = "";
@@ -193,6 +230,7 @@ export async function runPromptProcess(input: {
     let timedOut = false;
     let aborted = false;
     let stdinError: string | undefined;
+    let terminationError: string | undefined;
     let forceKillTimer: NodeJS.Timeout | undefined;
     // #93: report delivery only when the stdin write actually flushed to the
     // transport pipe; an erroring child or pipe never reports delivery.
@@ -237,12 +275,22 @@ export async function runPromptProcess(input: {
       if (forceKillTimer) {
         return;
       }
-      terminateProcessTree(proc, "SIGTERM");
+      const attemptTermination = (signal: NodeJS.Signals) => {
+        try {
+          const failure = terminateProcessTree(proc, signal);
+          if (failure) terminationError = joinDiagnostics(terminationError, failure);
+        } catch (error) {
+          // Keep callback/timer termination fail-closed even if the shared
+          // helper itself encounters an unexpected synchronous exception.
+          terminationError = joinDiagnostics(terminationError, terminationFailure(signal, error));
+        }
+      };
+      attemptTermination("SIGTERM");
       forceKillTimer = setTimeout(() => {
         if (!settled) {
-          terminateProcessTree(proc, "SIGKILL");
+          attemptTermination("SIGKILL");
         }
-      }, 2_000);
+      }, terminationEscalationMs);
       forceKillTimer.unref?.();
     };
 
@@ -262,7 +310,7 @@ export async function runPromptProcess(input: {
       if (forceKillTimer) {
         clearTimeout(forceKillTimer);
       }
-      reject(error);
+      reject(translateDefaultPiSpawnError(error, isDefaultPiPassThrough));
     });
     proc.stdout.setEncoding("utf8");
     proc.stdout.on("data", (chunk: string) => {
@@ -297,6 +345,7 @@ export async function runPromptProcess(input: {
         timedOut,
         aborted,
         stdinError,
+        terminationError,
       }, code, signal);
     });
     proc.stdin.on("error", (error: NodeJS.ErrnoException) => {
@@ -481,16 +530,85 @@ function cappedChunk(chunk: string, remainingBytes: number): { value: string; by
   return { value, bytes: Buffer.byteLength(value), truncated: true };
 }
 
-export function terminateProcessTree(proc: ChildProcess, signal: NodeJS.Signals): void {
+export function terminateProcessTree(proc: ChildProcess, signal: NodeJS.Signals): string | undefined {
+  // A child whose spawn failed never forked: pid stays undefined forever.
+  // Signaling it is not a no-op — on Node 24, kill() after a failed spawn
+  // delivers the signal to the caller's own process group (observed: the
+  // parent dies with SIGTERM). There is nothing to terminate; the spawn
+  // error itself is the failure that must surface.
+  if (proc.pid === undefined) return undefined;
+  let processGroupError: unknown;
   if (proc.pid && process.platform !== "win32") {
     try {
       process.kill(-proc.pid, signal);
-      return;
-    } catch {
+      return undefined;
+    } catch (error) {
       // Fall back to killing the direct child below.
+      processGroupError = error;
     }
   }
-  proc.kill(signal);
+  // A POSIX leader may have exited while descendants still hold its process
+  // group's pipes open. Try the group signal first even in that state; only
+  // skip signaling the direct child once its exit is known. On Windows there
+  // is no group signal, so this guard avoids a redundant kill on a dead child.
+  if (hasExited(proc)) {
+    return processGroupError
+      ? terminationFailure(signal, processGroupError, undefined, true)
+      : undefined;
+  }
+  try {
+    const sent = proc.kill(signal);
+    if (sent) {
+      // Signaling the direct child does not prove descendants were terminated
+      // when the process-group attempt failed.
+      return processGroupError
+        ? terminationFailure(
+          signal,
+          new Error("direct-child fallback sent but group termination was not confirmed"),
+          processGroupError,
+        )
+        : undefined;
+    }
+    if (hasExited(proc)) {
+      return processGroupError
+        ? terminationFailure(signal, processGroupError, undefined, true)
+        : undefined;
+    }
+    return terminationFailure(signal, new Error("ChildProcess.kill returned false before child exit was observed."), processGroupError);
+  } catch (error) {
+    if (hasExited(proc)) {
+      return processGroupError
+        ? terminationFailure(signal, processGroupError, undefined, true)
+        : undefined;
+    }
+    return terminationFailure(signal, error, processGroupError);
+  }
+}
+
+function hasExited(proc: ChildProcess): boolean {
+  return proc.exitCode != null || proc.signalCode != null;
+}
+
+function terminationFailure(signal: NodeJS.Signals, error: unknown, processGroupError?: unknown, leaderExited = false): string {
+  const describe = (value: unknown): string => {
+    const code = typeof value === "object" && value !== null && "code" in value
+      ? String((value as { code?: unknown }).code ?? "")
+      : "";
+    const message = value instanceof Error ? value.message : String(value);
+    return boundedDiagnostic(code ? `${code}: ${message}` : message);
+  };
+  const groupDetail = processGroupError
+    ? `; process-group attempt also failed (${describe(processGroupError)})`
+    : "";
+  const status = leaderExited
+    ? "process leader exited but descendants may remain live"
+    : "child exit had not been observed";
+  return `${signal} termination failed (${describe(error)})${groupDetail}; ${status}`;
+}
+
+function joinDiagnostics(...values: Array<string | undefined>): string | undefined {
+  const diagnostic = values.filter((value): value is string => Boolean(value)).join("\n");
+  return diagnostic ? boundedDiagnostic(diagnostic) : undefined;
 }
 
 export function reviewerEnv(

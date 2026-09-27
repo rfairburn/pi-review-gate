@@ -303,6 +303,15 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
       if (identity) await request.onProcessExit?.({ ...identity, code: exit.code, signal: exit.signal });
     }
 
+    const terminationFailure = rpc.terminationError
+      ? `Codex app-server termination attempts failed before child close: ${rpc.terminationError}`
+      : undefined;
+    if (terminationFailure) {
+      failure = failure
+        ? { ...failure, message: `${failure.message} ${terminationFailure}` }
+        : { category: "process", message: terminationFailure };
+    }
+
     const text = agentTexts.join("\n").trim() || finalAgentText(completedTurn);
     const output = rpc.output(code, timedOut, aborted || interruptedByControl);
     const artifacts = await writeExecutorArtifacts({
@@ -379,6 +388,9 @@ class AppServerRpc {
   private buffer = "";
   private turnWaiters = new Map<string, Array<{ resolve: (turn: Record<string, unknown>) => void; reject: (error: Error) => void }>>();
   private completedTurns = new Map<string, Record<string, unknown>>();
+  private forceKillTimer: NodeJS.Timeout | undefined;
+  private terminationRequested = false;
+  private terminationFailures = new Map<NodeJS.Signals, string>();
   private exitPromise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   private readonly stdoutCapture = new BoundedTextAccumulator(100 * MEBIBYTE);
   private readonly stderrCapture = new BoundedTextAccumulator(16 * MEBIBYTE);
@@ -388,6 +400,8 @@ class AppServerRpc {
     proc.stderr?.on("data", (chunk: Buffer) => { this.stderrCapture.append(chunk.toString("utf8")); });
     this.exitPromise = new Promise((resolvePromise) => {
       proc.once("close", (code, signal) => {
+        if (this.forceKillTimer) clearTimeout(this.forceKillTimer);
+        this.forceKillTimer = undefined;
         const error = new Error(`Codex app-server exited before completing pending protocol work (${code ?? signal ?? "unknown"}).`);
         for (const pending of this.pending.values()) pending.reject(error);
         this.pending.clear();
@@ -421,6 +435,10 @@ class AppServerRpc {
     return this.completedTurns.has(`${threadId}:${turnId}`);
   }
 
+  get terminationError(): string | undefined {
+    return this.terminationFailures.size > 0 ? [...this.terminationFailures.values()].join("\n") : undefined;
+  }
+
   waitForTurn(threadId: string, turnId: string): Promise<Record<string, unknown>> {
     const key = `${threadId}:${turnId}`;
     const completed = this.completedTurns.get(key);
@@ -433,12 +451,16 @@ class AppServerRpc {
   }
 
   terminate(): void {
-    if (this.proc.exitCode !== null || this.proc.signalCode !== null) return;
-    terminateProcessTree(this.proc, "SIGTERM");
-    const timer = setTimeout(() => {
-      if (this.proc.exitCode === null && this.proc.signalCode === null) terminateProcessTree(this.proc, "SIGKILL");
+    if (this.proc.exitCode !== null || this.proc.signalCode !== null || this.terminationRequested) return;
+    this.terminationRequested = true;
+    this.recordTerminationFailure(terminateProcessTree(this.proc, "SIGTERM"));
+    this.forceKillTimer = setTimeout(() => {
+      this.forceKillTimer = undefined;
+      if (this.proc.exitCode === null && this.proc.signalCode === null) {
+        this.recordTerminationFailure(terminateProcessTree(this.proc, "SIGKILL"));
+      }
     }, 2_000);
-    timer.unref?.();
+    this.forceKillTimer.unref?.();
   }
 
   closed(): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
@@ -460,7 +482,14 @@ class AppServerRpc {
       code,
       timedOut,
       aborted,
+      terminationError: this.terminationError,
     };
+  }
+
+  private recordTerminationFailure(failure: string | undefined): void {
+    if (!failure) return;
+    const signal = failure.startsWith("SIGKILL ") ? "SIGKILL" : "SIGTERM";
+    this.terminationFailures.set(signal, failure);
   }
 
   private write(value: unknown): void {

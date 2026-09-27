@@ -258,6 +258,14 @@ modes (0700/0600/0644) are requested for parity
 and are no-ops under Windows ACLs. CI covers the native paths on `windows-latest`
 (`.github/workflows/ci.yml`, focused `launcher-cmd` tests); macOS/Linux behavior of the
 POSIX launcher is unchanged.
+The extension's own Pi child launches (reviewer prompts, the delegated Pi RPC
+executor, and compaction recovery) use the same alias-independent resolution
+(issue 204): on Windows the default `pi` resolves to an installed pi.exe or the
+npm shim's JavaScript entry spawned through Node without a shell, POSIX keeps
+direct execution, and configured custom commands keep their exact spawn
+semantics; a missing or unresolvable default Pi CLI fails closed with an
+actionable error. The focused `pi-child-launch` tests cover these launches
+natively on `windows-latest` alongside the launcher cases.
 
 The extension selects the configured [operating-mode prompt](configuration.md#operating-modes)
 for each new run; each prompt opens with a startup cue to read the matching shipped

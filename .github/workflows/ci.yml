@@ -200,12 +200,26 @@ jobs:
           PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"
       - name: Build test bundle
         run: npm run build:test
+      # Broad pattern on purpose: it selects EVERY "native Windows Git
+      # checkpoint …" regression in the file, so new win32-only checkpoint
+      # tests are exercised natively without further workflow edits.
+      - name: Windows Git checkpoint native smoke
+        run: node --test --test-name-pattern="native Windows Git checkpoint" dist-test/tests/git-checkpoint.test.js
       - name: Launcher tests (helper pipeline + native .cmd cases)
         run: node --test dist-test/tests/launcher-cmd.test.js
       - name: Launcher development-build seam on native Windows
         # The same npm script the launcher's development branch executes
         # (npm --prefix <root> run build), validating the toolchain natively.
         run: npm run build
+      # Issue #204: alias-independent Pi child launch. On this host the only
+      # `pi` PATH entry is npm's pi.cmd shim, and a shell:false spawn of the
+      # bare name cannot find an executable; these regressions start real
+      # child processes through the shared resolver (reviewer prompt, delegated
+      # RPC executor, compaction recovery) plus cross-platform resolver/argv
+      # safety cases. The bounded real-Pi registration check skips itself when
+      # no pi-coding-agent install is discoverable on the runner.
+      - name: Pi child launch tests (alias-independent, native Windows)
+        run: node --test dist-test/tests/pi-child-launch.test.js
       - name: Static docs validation
         run: node scripts/check-docs.cjs
       - name: Docs checker regression tests
@@ -229,6 +243,17 @@ jobs:
         run: npm ci
       - name: Build test bundle
         run: npm run build:test
+      # Same broad pattern as the launcher job: every "native Windows Git
+      # checkpoint …" regression runs natively on this Node version too.
+      - name: Windows Git checkpoint native smoke (Node 24)
+        run: node --test --test-name-pattern="native Windows Git checkpoint" dist-test/tests/git-checkpoint.test.js
+      - name: Windows private wave capture mode smoke (Node 24)
+        run: >-
+          node --test --test-name-pattern="native Windows wave"
+          dist-test/tests/wave-repository.test.js
+          dist-test/tests/wave-landing.test.js
+      - name: Windows prompt-process termination tests (Node 24)
+        run: node --test dist-test/tests/process-telemetry.test.js
       - name: Run Windows shell tests (native)
         run: >-
           node --test

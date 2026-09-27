@@ -3,6 +3,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { terminateProcessTree, type ProcessRunResult } from "../../adapters/process";
+import { DEFAULT_PI_COMMAND, resolvePiChildSpawn, translateDefaultPiSpawnError } from "../../pi-invocation";
 import { BoundedTextAccumulator, MEBIBYTE } from "../../jsonl";
 import { extractReviewTextFromPiJsonl, PiJsonlReviewExtractor } from "../../usage";
 import { writeExecutorArtifacts } from "../artifacts";
@@ -119,12 +120,21 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     // The identity is random, but remove only this exact parent-owned path so
     // an impossible stale collision can never satisfy the new child.
     await removePiSettlementReceipt(settlementBootstrap);
-    const proc = spawn(this.options.command ?? "pi", args, {
+    // #204: alias-independent default `pi` launch (the Windows npm pi.cmd
+    // shim resolves to its JavaScript entry through this Node binary; custom
+    // commands and POSIX direct spawns keep their exact semantics).
+    const childEnv = executorEnv(toolCatalog, settlementBootstrap);
+    const invocation = resolvePiChildSpawn(this.options.command ?? "pi", args, childEnv);
+    if (!invocation.ok) throw new Error(invocation.error);
+    // Only the POSIX pass-through keeps the bare `pi` name; a missing default
+    // Pi CLI there surfaces as an actionable diagnostic instead of raw ENOENT.
+    const isDefaultPiPassThrough = invocation.file === DEFAULT_PI_COMMAND;
+    const proc = spawn(invocation.file, invocation.args, {
       cwd: request.cwd,
       detached: process.platform !== "win32",
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
-      env: executorEnv(toolCatalog, settlementBootstrap),
+      env: childEnv,
     });
     const identity = proc.pid === undefined ? undefined : {
       pid: proc.pid,
@@ -136,7 +146,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     const rpc = new PiRpc(proc, backgroundReadiness, (chunk) => {
       extractor.push(chunk);
       activity.push(chunk);
-    });
+    }, (error) => translateDefaultPiSpawnError(error, isDefaultPiPassThrough));
     let timedOut = false;
     let aborted = false;
     let interruptedByControl = false;
@@ -408,7 +418,11 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     protocolFailure ??= rpc.shutdownFailure;
     await removePiSettlementReceipt(settlementBootstrap).catch(() => undefined);
     if (identity) await request.onProcessExit?.({ ...identity, code: exit.code, signal: exit.signal });
-    const output = rpc.output(protocolFailure ? 1 : 0, timedOut, aborted || interruptedByControl);
+    const terminationFailure = rpc.terminationError
+      ? `Pi RPC termination attempts failed before child close: ${rpc.terminationError}`
+      : undefined;
+    const failureMessage = [protocolFailure, terminationFailure].filter(Boolean).join(" ") || undefined;
+    const output = rpc.output(failureMessage ? 1 : 0, timedOut, aborted || interruptedByControl);
     activity.finish();
     const streamed = extractor.finish();
     const extracted = streamed.text.trim() ? streamed : extractReviewTextFromPiJsonl(output.stdout);
@@ -427,12 +441,14 @@ export class PiExecutorAdapter implements ExecutorAdapter {
       session: { adapter: this.kind, id: sessionId },
       usage: extracted.usage,
       ...artifacts,
-      code: protocolFailure ? 1 : output.code,
+      code: failureMessage ? 1 : output.code,
       timedOut: output.timedOut,
       aborted: output.aborted,
       lifecycle: extracted.lifecycle,
       failure: protocolFailure
-        ? { category: "protocol", message: protocolFailure }
+        ? { category: "protocol", message: failureMessage! }
+        : terminationFailure
+          ? { category: "process", message: terminationFailure }
         : interruptedByControl
           ? { category: "interruption", message: "Pi RPC turn was interrupted." }
         : extracted.lifecycle.compaction.status === "in_progress"
@@ -460,6 +476,9 @@ export class PiRpc {
   // transport as successful execution.
   private transportFailure?: Error;
   private exitStatus?: { code: number | null; signal: NodeJS.Signals | null };
+  private forceKillTimer: NodeJS.Timeout | undefined;
+  private terminationRequested = false;
+  private terminationFailures = new Map<NodeJS.Signals, string>();
   private readonly exitPromise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   private readonly stdout = new BoundedTextAccumulator(100 * MEBIBYTE);
   private readonly stderr = new BoundedTextAccumulator(16 * MEBIBYTE);
@@ -468,6 +487,8 @@ export class PiRpc {
     private readonly proc: ChildProcess,
     private readonly backgroundReadiness: BackgroundProcessReadiness,
     private readonly onJsonl: (chunk: string) => void,
+    /** #204: translate a raw spawn ENOENT of the POSIX default-pi pass-through into the actionable missing-CLI diagnostic. */
+    private readonly translateSpawnError?: (error: Error) => Error,
   ) {
     proc.stdout?.on("data", (value: Buffer) => this.consume(value.toString("utf8")));
     proc.stderr?.on("data", (value: Buffer) => { this.stderr.append(value.toString("utf8")); });
@@ -487,6 +508,8 @@ export class PiRpc {
     proc.stderr?.on("error", (error) => this.failTransport(error));
     this.exitPromise = new Promise((resolvePromise) => {
       proc.once("close", (code, signal) => {
+        if (this.forceKillTimer) clearTimeout(this.forceKillTimer);
+        this.forceKillTimer = undefined;
         this.exitStatus = { code, signal };
         const error = new Error(`Pi RPC exited before protocol completion (${code ?? signal ?? "unknown"}).`);
         for (const pending of this.pending.values()) pending.reject(error);
@@ -495,7 +518,7 @@ export class PiRpc {
         this.settledWaiters = [];
         resolvePromise({ code, signal });
       });
-      proc.once("error", (error) => this.failTransport(error));
+      proc.once("error", (error) => this.failTransport(this.translateSpawnError ? this.translateSpawnError(error) : error));
     });
   }
 
@@ -544,6 +567,10 @@ export class PiRpc {
 
   shutdownFailure?: string;
 
+  get terminationError(): string | undefined {
+    return this.terminationFailures.size > 0 ? [...this.terminationFailures.values()].join("\n") : undefined;
+  }
+
   get settledGeneration(): number {
     return this.settledCount;
   }
@@ -560,12 +587,16 @@ export class PiRpc {
   }
 
   terminate(): void {
-    if (this.proc.exitCode !== null || this.proc.signalCode !== null) return;
-    terminateProcessTree(this.proc, "SIGTERM");
-    const timer = setTimeout(() => {
-      if (this.proc.exitCode === null && this.proc.signalCode === null) terminateProcessTree(this.proc, "SIGKILL");
+    if (this.proc.exitCode !== null || this.proc.signalCode !== null || this.terminationRequested) return;
+    this.terminationRequested = true;
+    this.recordTerminationFailure(terminateProcessTree(this.proc, "SIGTERM"));
+    this.forceKillTimer = setTimeout(() => {
+      this.forceKillTimer = undefined;
+      if (this.proc.exitCode === null && this.proc.signalCode === null) {
+        this.recordTerminationFailure(terminateProcessTree(this.proc, "SIGKILL"));
+      }
     }, 2_000);
-    timer.unref?.();
+    this.forceKillTimer.unref?.();
   }
 
   closeInput(): void {
@@ -598,7 +629,14 @@ export class PiRpc {
       code,
       timedOut,
       aborted,
+      terminationError: this.terminationError,
     };
+  }
+
+  private recordTerminationFailure(failure: string | undefined): void {
+    if (!failure) return;
+    const signal = failure.startsWith("SIGKILL ") ? "SIGKILL" : "SIGTERM";
+    this.terminationFailures.set(signal, failure);
   }
 
   private consume(chunk: string): void {
@@ -658,12 +696,20 @@ async function compactInterruptedSession(input: {
   ];
 
   await new Promise<void>((resolve, reject) => {
-    const proc = spawn(input.command, args, {
+    // #204: the compaction recovery child uses the same alias-independent
+    // resolution as the main RPC executor launch.
+    const childEnv = { ...input.env, PWD: input.cwd };
+    const invocation = resolvePiChildSpawn(input.command, args, childEnv);
+    if (!invocation.ok) {
+      reject(new Error(invocation.error));
+      return;
+    }
+    const proc = spawn(invocation.file, invocation.args, {
       cwd: input.cwd,
       detached: process.platform !== "win32",
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...input.env, PWD: input.cwd },
+      env: childEnv,
     });
     const processIdentity = proc.pid === undefined
       ? undefined
@@ -676,15 +722,18 @@ async function compactInterruptedSession(input: {
     let finishing = false;
     let completionError: Error | undefined;
     let forceKillTimer: NodeJS.Timeout | undefined;
+    const terminationErrors: string[] = [];
     let phase: "state" | "compact" = "state";
 
     const stop = (signal: NodeJS.Signals) => {
+      // Preserve the existing POSIX escalation path after a signal-exited
+      // leader: descendants can still hold the group's stdio open.
       if (proc.exitCode !== null) return;
       try {
-        if (process.platform !== "win32" && proc.pid) process.kill(-proc.pid, signal);
-        else proc.kill(signal);
-      } catch {
-        // The process may have exited between the liveness check and signal.
+        const failure = terminateProcessTree(proc, signal);
+        if (failure) terminationErrors.push(failure);
+      } catch (error) {
+        terminationErrors.push(`${signal} termination failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     };
     const requestFinish = (error?: Error) => {
@@ -706,8 +755,12 @@ async function compactInterruptedSession(input: {
       try {
         await lifecycleStart?.catch(() => undefined);
         if (lifecycleStartInvoked && processIdentity) await input.onProcessExit?.({ ...processIdentity, code, signal });
-        if (completionError) reject(completionError);
-        else resolve();
+        if (completionError || terminationErrors.length > 0) {
+          const detail = terminationErrors.length > 0
+            ? ` Termination attempts failed before child close: ${terminationErrors.join("; ")}`
+            : "";
+          reject(new Error(`${completionError?.message ?? "Executor compaction cleanup failed."}${detail}`));
+        } else resolve();
       } catch (lifecycleError) {
         reject(lifecycleError);
       }
@@ -721,7 +774,10 @@ async function compactInterruptedSession(input: {
     const onAbort = () => requestFinish(abortError(input.signal));
     input.signal?.addEventListener("abort", onAbort, { once: true });
 
-    proc.on("error", (error) => requestFinish(error));
+    // Only the POSIX pass-through keeps the bare `pi` name; a missing default
+    // Pi CLI there surfaces as an actionable diagnostic instead of raw ENOENT.
+    const isDefaultPiPassThrough = invocation.file === DEFAULT_PI_COMMAND;
+    proc.on("error", (error) => requestFinish(translateDefaultPiSpawnError(error, isDefaultPiPassThrough)));
     proc.stdin.on("error", (error) => requestFinish(error));
     // Output-pipe errors would otherwise surface as uncaught stream
     // exceptions; route them through the same fail-closed finish path.

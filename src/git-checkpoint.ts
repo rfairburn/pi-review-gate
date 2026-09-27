@@ -116,9 +116,21 @@
  * configuration is audited up front and refused when it defines diff
  * programs or clean/smudge filters (the only commands that could run them).
  *
- * POSIX only, matching the rest of the extension. This module is
- * self-contained (node builtins only) and is NOT yet wired into the
- * extension entrypoint; it exposes a clear core API for later integration:
+ * EOL/mode fidelity (#204): the EFFECTIVE `core.autocrlf` (system/global/
+ * local precedence) is read once per operation by a shell-free, config-only
+ * probe that still sees ambient configuration, frozen as a final `-c`
+ * override for every capture command — so a native Windows checkout with
+ * system-level core.autocrlf=true diffs its CRLF worktree exactly as live
+ * Git does instead of emitting a false full-file patch — and mixed into the
+ * initial/final audit proof, so a mid-capture configuration change fails
+ * closed. `core.filemode` is pinned false on Windows, where worktree
+ * permission bits are noise (staged index mode changes remain fully captured
+ * in the base→index patch), and true elsewhere. Durable-record base64 fields
+ * are validated with a linear strict scan: the previous group-repetition
+ * regex stack-overflows on the 8+ MiB payloads this module reloads.
+ *
+ * Directory fsync `EPERM` is best-effort on Windows; other sync errors remain
+ * strict. This module is self-contained (node builtins only) and exposes:
  * `armGitCheckpoint`, `loadGitCheckpoint`, `verifyGitCheckpointPin`,
  * `restoreGitCheckpoint`, `compareToGitCheckpoint`, `compareGitCheckpoints`,
  * `releaseGitCheckpointPin`, `advanceGitCheckpoint`, plus record and
@@ -294,6 +306,8 @@ export interface GitCheckpointFaultHooks {
   afterUntrackedList?: () => void | Promise<void>;
   /** Runs after the pre-stat of an untracked path, before its read. */
   beforeUntrackedRead?: (absolutePath: string) => void | Promise<void>;
+  /** Runs after a tracked worktree file is fully read, before its post-read identity re-check. */
+  afterTrackedRead?: (absolutePath: string) => void | Promise<void>;
   /**
    * Runs after the staged (base → index) patch is captured and immediately
    * before the unstaged (index → worktree) patch. Deterministic seam for
@@ -440,14 +454,24 @@ function hardenedEnv(): NodeJS.ProcessEnv {
   };
 }
 
+/**
+ * core.filemode is platform-conditional. On NTFS the worktree permission
+ * bits carry no Git-meaningful state, so `true` turns routine filesystem
+ * noise into spurious mode-only diffs; `false` keeps the unstaged capture
+ * clean while STAGED (index) mode changes remain fully captured in the
+ * base→index patch — core.filemode only affects worktree↔index comparison.
+ * POSIX keeps the repo convention of true (see src/execution/wave-repository.ts).
+ */
+export function coreFilemodeOverrideFor(platform: NodeJS.Platform): string {
+  return platform === "win32" ? "core.filemode=false" : "core.filemode=true";
+}
+
 /** -c overrides prepended to every command (command line beats repo config). */
 const SAFE_CONFIG_OVERRIDES = [
   "core.fsmonitor=false",
   "core.untrackedCache=false",
   "core.pager=cat",
-  // Mode capture must not depend on ambient config (repo convention: see
-  // src/execution/wave-repository.ts).
-  "core.filemode=true",
+  coreFilemodeOverrideFor(process.platform),
   // Tracked text uses Git-normalized bytes; expected CRLF normalization must
   // not emit safecrlf warnings that otherwise abort a valid diff capture.
   "core.safecrlf=false",
@@ -473,6 +497,32 @@ const SAFE_CONFIG_OVERRIDES = [
   "core.logAllRefUpdates=always",
 ];
 
+/**
+ * Environment for the config-only effective-autocrlf probe. It inherits the
+ * caller's environment so the probe sees the SAME configuration ordinary Git
+ * in this process would (system, global, local — including
+ * GIT_CONFIG_SYSTEM/GIT_CONFIG_GLOBAL overrides), but drops every variable
+ * that could redirect it to a different repository, index, or object store.
+ * `git config <key>` reads and prints one value; it cannot execute filters,
+ * hooks, or diff helpers.
+ */
+function probeEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  ]) {
+    delete env[key];
+  }
+  env.LC_ALL = "C";
+  env.GIT_TERMINAL_PROMPT = "0";
+  return env;
+}
+
 interface GitRunSpec {
   timeoutMs: number;
   maxBytes: number;
@@ -481,6 +531,21 @@ interface GitRunSpec {
   overflowReason?: GitCheckpointFailureReason;
   /** Extra environment entries layered over the hardened base environment. */
   extraEnv?: NodeJS.ProcessEnv;
+  /**
+   * Config-only probe mode: run WITHOUT the -c safety overrides and with an
+   * environment that still sees ambient system/global/local configuration,
+   * so the effective core.autocrlf can be read with ordinary precedence.
+   * Only `git config <key>` ever runs in this mode (nothing it invokes can
+   * execute filters, hooks, or diff helpers); every other hardening — no
+   * shell, timeout, byte caps, abort — still applies.
+   */
+  probeConfig?: boolean;
+  /**
+   * Effective core.autocrlf frozen for this operation's capture commands:
+   * passed as a final -c override so the quarantined (system/global =
+   * /dev/null) environment keeps the live checkout's EOL semantics.
+   */
+  frozenAutocrlf?: string;
 }
 
 interface GitRunOutput {
@@ -504,13 +569,15 @@ function runGit(
   spec: GitRunSpec,
 ): Promise<GitRunOutput> {
   const hasAlternateIndex = typeof spec.extraEnv?.GIT_INDEX_FILE === "string" && spec.extraEnv.GIT_INDEX_FILE.length > 0;
-  const argv = ["--no-pager", "--no-replace-objects", ...configArgv(hasAlternateIndex), ...args];
+  // Probe mode reads ambient config with ordinary precedence and applies no
+  // -c overrides (they would change the very value being probed).
+  const argv = ["--no-pager", "--no-replace-objects", ...(spec.probeConfig ? [] : configArgv(hasAlternateIndex, spec.frozenAutocrlf)), ...args];
   return new Promise<GitRunOutput>((resolvePromise, reject) => {
     let child: ChildProcess;
     try {
       child = spawn(gitPath, argv, {
         cwd,
-        env: { ...hardenedEnv(), ...spec.extraEnv },
+        env: { ...(spec.probeConfig ? probeEnv() : hardenedEnv()), ...spec.extraEnv },
         stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (error) {
@@ -588,11 +655,14 @@ function runGit(
   });
 }
 
-function configArgv(disableSplitIndex = false): string[] {
+function configArgv(disableSplitIndex = false, frozenAutocrlf?: string): string[] {
   const argv: string[] = [];
   for (const override of SAFE_CONFIG_OVERRIDES) {
     argv.push("-c", override);
   }
+  // Last -c wins: the frozen effective value must beat any repo-local
+  // core.autocrlf, because it IS that value computed with full precedence.
+  if (frozenAutocrlf !== undefined) argv.push("-c", `core.autocrlf=${frozenAutocrlf}`);
   // Disposable alternate indexes must not publish sharedindex.* files outside
   // their owned scratch directory.
   if (disableSplitIndex) argv.push("-c", "core.splitIndex=false");
@@ -603,7 +673,39 @@ function configArgv(disableSplitIndex = false): string[] {
 
 const OID_RE_40 = /^[0-9a-f]{40}$/;
 const OID_RE_64 = /^[0-9a-f]{64}$/;
-const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+/** 6-bit base64 index of each ASCII character (-1 outside the alphabet). */
+const BASE64_INDEX: Int8Array = (() => {
+  const table = new Int8Array(256).fill(-1);
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  for (let i = 0; i < alphabet.length; i += 1) table[alphabet.charCodeAt(i)] = i;
+  return table;
+})();
+
+/**
+ * Linear-time strict base64 validation for durable record fields. The
+ * previous group-repetition regex stack-overflows on the multi-megabyte
+ * patch and untracked payloads this module reloads (8+ MiB base64); this
+ * scan accepts exactly what `Buffer.toString("base64")` emits: the empty
+ * string, or a multiple of four characters over [A-Za-z0-9+/] with at most
+ * two trailing "=" padding characters.
+ */
+export function isStrictBase64(value: string): boolean {
+  const len = value.length;
+  if (len % 4 !== 0) return false;
+  let i = 0;
+  for (; i < len; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code === 61 /* "=" */) break; // padding begins here
+    if (code >= BASE64_INDEX.length || BASE64_INDEX[code] < 0) return false;
+  }
+  // Padding may only occupy the final one or two positions.
+  if (i < len - 2) return false;
+  for (; i < len; i += 1) {
+    if (value.charCodeAt(i) !== 61 /* "=" */) return false;
+  }
+  return true;
+}
 
 function isObjectFormat(value: unknown): value is GitCheckpointObjectFormat {
   return value === "sha1" || value === "sha256";
@@ -970,7 +1072,7 @@ function decodeStrictBase64(
   label: string,
   malformed: (why: string) => never,
 ): string {
-  if (typeof value !== "string" || !BASE64_RE.test(value)) return malformed(`${label} is not valid base64`);
+  if (typeof value !== "string" || !isStrictBase64(value)) return malformed(`${label} is not valid base64`);
   return value;
 }
 
@@ -1034,19 +1136,87 @@ async function resolveRepo(
   return { status: "ok", value: { root: rootAbs, gitDir, liveIndexPath } };
 }
 
+/** Canonical core.autocrlf values Git accepts (git_parse_maybe_bool). */
+function normalizeAutocrlfValue(raw: string): "true" | "false" | "input" | undefined {
+  const value = raw.trim().toLowerCase();
+  if (value === "true" || value === "yes" || value === "on" || value === "1") return "true";
+  if (value === "false" || value === "no" || value === "off" || value === "0") return "false";
+  if (value === "input") return "input";
+  return undefined;
+}
+
+/**
+ * Read the EFFECTIVE core.autocrlf with ordinary system/global/local
+ * precedence — a shell-free, config-only Git probe that cannot execute
+ * filters, hooks, or diff helpers. The value is frozen for the operation's
+ * capture commands (GitRunSpec.frozenAutocrlf) and mixed into the audit
+ * proof, so a mid-capture configuration change fails closed.
+ */
+async function probeEffectiveAutocrlf(
+  gitPath: string,
+  root: string,
+  spec: GitRunSpec,
+): Promise<GitCheckpointResult<"true" | "false" | "input">> {
+  let out: GitRunOutput;
+  try {
+    out = await runGit(gitPath, root, ["config", "core.autocrlf"], { ...spec, maxBytes: 1024, probeConfig: true });
+  } catch (error) {
+    return resultFromError(error);
+  }
+  // `git config <key>` exits 1 with empty output when the key is unset at
+  // every level; the built-in default is then "false" (no conversion).
+  if (out.code === 1 && out.stdout.length === 0 && out.stderr.trim().length === 0) {
+    return { status: "ok", value: "false" };
+  }
+  if (out.code !== 0 || out.stderr.trim().length > 0) {
+    return { status: "failed", reason: "git_failed", detail: truncateDetail(out.stderr || `git config core.autocrlf exit ${out.code}`) };
+  }
+  const raw = out.stdout.toString("utf8");
+  const normalized = normalizeAutocrlfValue(raw);
+  if (normalized === undefined) {
+    return {
+      status: "unsupported",
+      reason: "filter_or_eol_configured",
+      detail: `core.autocrlf is set to an unrecognized value ${JSON.stringify(raw.trim())}; EOL semantics cannot be frozen safely`,
+    };
+  }
+  return { status: "ok", value: normalized };
+}
+
+/** Read-only repository audit proof for one operation's capture window. */
+interface AuditProof {
+  /** SHA-256 over the nulled-scope config listing, index flags/attributes, and the effective core.autocrlf. */
+  proof: string;
+  /** Effective core.autocrlf (system/global/local precedence) at audit time. */
+  effectiveAutocrlf: "true" | "false" | "input";
+}
+
 /**
  * Fail-closed audit of everything that could make Git diff/index output
- * untrustworthy or execute external programs. Returns the first violation.
+ * untrustworthy or execute external programs. Returns the first violation,
+ * or the proof plus the effective core.autocrlf to freeze for capture.
  */
 async function auditRepository(
   gitPath: string,
   root: string,
   spec: GitRunSpec,
-): Promise<GitCheckpointResult<string>> {
+): Promise<GitCheckpointResult<AuditProof>> {
+  // The audit observes pure ambient state: any frozen capture override is
+  // stripped, because a `-c core.autocrlf=...` value would appear in the
+  // `git config --list` output (origin "command line") and make the final
+  // proof differ from the initial one on every arm.
+  const auditSpec: GitRunSpec = { ...spec, frozenAutocrlf: undefined };
+  // Probe the effective EOL semantics with ambient configuration BEFORE
+  // anything else: every capture command below runs quarantined (system and
+  // global config replaced with /dev/null), so without freezing this value a
+  // native Windows checkout (system-level core.autocrlf=true) would diff its
+  // CRLF worktree as fully modified.
+  const autocrlf = await probeEffectiveAutocrlf(gitPath, root, auditSpec);
+  if (autocrlf.status !== "ok") return autocrlf;
   let configOut: GitRunOutput;
   try {
     configOut = await runGit(gitPath, root, ["config", "--list", "--show-origin", "-z"], {
-      ...spec,
+      ...auditSpec,
       maxBytes: 4 * 1024 * 1024,
     });
   } catch (error) {
@@ -1092,7 +1262,7 @@ async function auditRepository(
   let listOut: GitRunOutput;
   try {
     listOut = await runGit(gitPath, root, ["ls-files", "-s", "-v", "-z"], {
-      ...spec,
+      ...auditSpec,
       maxBytes: 32 * 1024 * 1024,
     });
   } catch (error) {
@@ -1136,6 +1306,10 @@ async function auditRepository(
   // Only non-EOL conversions remain unsupported. Fingerprint effective
   // config too, so a mid-operation configuration change fails closed.
   const auditHash = createHash("sha256").update(configOut.stdout);
+  // The effective value is part of the proof: a mid-capture change to
+  // system/global/local core.autocrlf (invisible to the nulled-scope listing
+  // above) must fail closed like any other audited change.
+  auditHash.update(`\0autocrlf=${autocrlf.value}`);
   if (trackedPaths.length > 0) {
     const attrInput = Buffer.from(`${trackedPaths.map((entry) => entry.path).join("\0")}\0`, "utf8");
     let attrOut: GitRunOutput;
@@ -1150,7 +1324,7 @@ async function auditRepository(
         // the same order of cap as the ls-files enumeration above (32 MiB)
         // rather than the 1 MiB base spec cap, which would fail closed with
         // git_failed on repos of the ~20k-path size this module targets.
-        { ...spec, maxBytes: 32 * 1024 * 1024 },
+        { ...auditSpec, maxBytes: 32 * 1024 * 1024 },
         {},
       );
     } catch (error) {
@@ -1197,15 +1371,15 @@ async function auditRepository(
       auditHash.update("\0");
     }
   }
-  return { status: "ok", value: auditHash.digest("hex") };
+  return { status: "ok", value: { proof: auditHash.digest("hex"), effectiveAutocrlf: autocrlf.value } };
 }
 
-/** Fail closed if audited config, attributes, or index flags changed in-window. */
-function assertAuditProofStable(before: string, after: GitCheckpointResult<string>): void {
+/** Fail closed if audited config, attributes, index flags, or the frozen EOL value changed in-window. */
+function assertAuditProofStable(before: AuditProof, after: GitCheckpointResult<AuditProof>): void {
   if (after.status !== "ok") {
     throw new GitCheckpointError(after.detail ?? `post-capture repository audit was ${after.status}`, after.reason);
   }
-  if (after.value !== before) {
+  if (after.value.proof !== before.proof || after.value.effectiveAutocrlf !== before.effectiveAutocrlf) {
     throw new GitCheckpointError("audited config, attributes, or index flags changed during capture", "capture_inconsistent");
   }
 }
@@ -1287,6 +1461,8 @@ export async function armGitCheckpoint(
     const audit = await auditRepository(gitPath, repo.root, spec);
     if (audit.status !== "ok") return audit;
     const initialAuditProof = audit.value;
+    // Freeze the probed EOL semantics for every capture command below.
+    spec.frozenAutocrlf = audit.value.effectiveAutocrlf;
     await runAfterInitialAuditHook(options);
     throwIfAborted(spec.signal);
 
@@ -1613,11 +1789,17 @@ async function publishRecordDurable(scratchDir: string, encoded: string): Promis
   }
 }
 
-/** fsync a directory so a rename into it is durable (POSIX). */
+/** fsync a directory so a rename into it is durable where supported. */
 async function syncDirectory(dir: string): Promise<void> {
   const dirHandle = await open(dir, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0));
   try {
-    await dirHandle.sync();
+    try {
+      await dirHandle.sync();
+    } catch (error) {
+      // Windows can reject directory fsync. File fsync remains required, but
+      // without this flush a newly created directory entry may not survive a crash.
+      if (process.platform !== "win32" || (error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+    }
   } finally {
     await dirHandle.close().catch(() => undefined);
   }
@@ -1980,7 +2162,11 @@ async function captureUntrackedEntry(
   });
   try {
     const stat = await handle.stat();
-    if (!sameStatIdentity(statIdentityOf(stat), statIdentityOf(pre))) {
+    const openedIdentity = statIdentityOf(stat);
+    // Windows path lstat may report dev=0 while fstat of the same inode
+    // reports a volume ID. Keep every other field and the path re-stat check.
+    if (process.platform === "win32" && pre.dev === 0) openedIdentity.dev = 0;
+    if (!sameStatIdentity(openedIdentity, statIdentityOf(pre))) {
       throw new GitCheckpointError(`untracked path ${path} changed while being captured`, "untracked_capture_race");
     }
     await assertUntrackedParents(root, path, parents);
@@ -2368,6 +2554,8 @@ export async function advanceGitCheckpoint(
     const audit = await auditRepository(gitPath, repo.root, spec);
     if (audit.status !== "ok") return audit;
     const initialAuditProof = audit.value;
+    // Freeze the probed EOL semantics for every capture command below.
+    spec.frozenAutocrlf = audit.value.effectiveAutocrlf;
     await runAfterInitialAuditHook(options);
     throwIfAborted(spec.signal);
 
@@ -2837,7 +3025,7 @@ async function runGitWithInput(
 ): Promise<GitRunOutput> {
   const hasAlternateIndex = (typeof spec.extraEnv?.GIT_INDEX_FILE === "string" && spec.extraEnv.GIT_INDEX_FILE.length > 0)
     || (typeof extraEnv.GIT_INDEX_FILE === "string" && extraEnv.GIT_INDEX_FILE.length > 0);
-  const argv = ["--no-pager", "--no-replace-objects", ...configArgv(hasAlternateIndex), ...args];
+  const argv = ["--no-pager", "--no-replace-objects", ...configArgv(hasAlternateIndex, spec.frozenAutocrlf), ...args];
   return new Promise<GitRunOutput>((resolvePromise, reject) => {
     let child: ChildProcess;
     try {
@@ -2948,6 +3136,8 @@ export async function restoreGitCheckpoint(
     // Re-audit: the repository may have gained external filters since arm.
     const audit = await auditRepository(gitPath, repo.root, spec);
     if (audit.status !== "ok") return audit;
+    // Freeze the probed EOL semantics for the worktree-diff commands below.
+    spec.frozenAutocrlf = audit.value.effectiveAutocrlf;
     await runAfterInitialAuditHook(options);
     throwIfAborted(spec.signal);
 
@@ -3300,7 +3490,12 @@ async function materializeTrackedPath(
 }
 
 /** Read a worktree file no-follow, failing closed on races. */
-async function readWorktreeFile(absolute: string, path: string, maxBytes?: number): Promise<Buffer> {
+async function readWorktreeFile(
+  absolute: string,
+  path: string,
+  maxBytes?: number,
+  afterRead?: (absolutePath: string) => void | Promise<void>,
+): Promise<Buffer> {
   const handle = await open(absolute, constants.O_RDONLY | constants.O_NOFOLLOW).catch((error): never => {
     throw new GitCheckpointError(`cannot open ${path} for comparison: ${messageOf(error)}`, "git_failed");
   });
@@ -3332,6 +3527,14 @@ async function readWorktreeFile(absolute: string, path: string, maxBytes?: numbe
   } finally {
     await handle.close().catch(() => undefined);
   }
+  // Deterministic fault seam (tests only): a mutation landing here must be
+  // caught by the post-read identity check below.
+  try {
+    await afterRead?.(absolute);
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") throw error;
+    throw new GitCheckpointError(`tracked-read hook failed for ${path}: ${messageOf(error)}`, "git_failed");
+  }
   // Post-read identity check: a concurrent rewrite that preserved the
   // open-time size (grow, truncate+rewrite) would otherwise yield stale
   // bytes with no detectable gap.
@@ -3344,7 +3547,13 @@ async function readWorktreeFile(absolute: string, path: string, maxBytes?: numbe
     }
     throw new GitCheckpointError(`cannot re-stat ${path} after reading: ${messageOf(error)}`, "git_failed");
   }
-  if (!sameStatIdentity(statIdentityOf(post), statIdentityOf(pre))) {
+  const preIdentity = statIdentityOf(pre);
+  // Windows path lstat may report dev=0 while fstat of the same inode
+  // reports a volume ID (the NTFS quirk already normalized for untracked
+  // capture): zero the open-time dev when the path re-stat sees 0, keeping
+  // every other identity field strict. POSIX behavior is unchanged.
+  if (process.platform === "win32" && post.dev === 0) preIdentity.dev = 0;
+  if (!sameStatIdentity(statIdentityOf(post), preIdentity)) {
     throw new GitCheckpointError(`worktree file ${path} changed while being read`, "git_failed");
   }
   return bytes;
@@ -3440,6 +3649,8 @@ export async function compareToGitCheckpoint(
     const audit = await auditRepository(gitPath, repo.root, spec);
     if (audit.status !== "ok") return audit;
     const initialAuditProof = audit.value;
+    // Freeze the probed EOL semantics for the worktree-diff commands below.
+    spec.frozenAutocrlf = audit.value.effectiveAutocrlf;
     await runAfterInitialAuditHook(options);
     throwIfAborted(spec.signal);
 
@@ -3526,7 +3737,7 @@ export async function compareToGitCheckpoint(
           } else {
             // Bound the new-side worktree read like the old-side blob read
             // (MAX_BLOB_BYTES: a single blob materialized during compare).
-            const raw = await readWorktreeFile(absolute, path, MAX_BLOB_BYTES);
+            const raw = await readWorktreeFile(absolute, path, MAX_BLOB_BYTES, options.faultHooks?.afterTrackedRead);
             change.newBytes = await cleanTrackedComparisonBytes(gitPath, repo, path, raw, trees.scratchDir, spec);
           }
         }
@@ -3754,16 +3965,24 @@ function checkpointUntrackedMap(
   return untracked;
 }
 
+/**
+ * Strict plus canonical: the unused low bits of the final data character
+ * must be zero, so the encoding is exactly what `Buffer.toString("base64")`
+ * would emit for its decoded bytes. Linear-time like isStrictBase64.
+ */
 function isCanonicalBase64(value: string): boolean {
-  if (!BASE64_RE.test(value)) return false;
-  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  if (value.endsWith("==")) {
-    return (alphabet.indexOf(value[value.length - 3] ?? "") & 0x0f) === 0;
+  if (!isStrictBase64(value)) return false;
+  const len = value.length;
+  if (len === 0) return true;
+  if (value.charCodeAt(len - 1) !== 61 /* "=" */) return true; // no padding: fully canonical
+  if (value.charCodeAt(len - 2) === 61 /* "=" */) {
+    // "XX==": the low 4 bits of the last data character must be zero.
+    const index = BASE64_INDEX[value.charCodeAt(len - 3)];
+    return index >= 0 && (index & 0x0f) === 0;
   }
-  if (value.endsWith("=")) {
-    return (alphabet.indexOf(value[value.length - 2] ?? "") & 0x03) === 0;
-  }
-  return true;
+  // "XXX=": the low 2 bits of the last data character must be zero.
+  const index = BASE64_INDEX[value.charCodeAt(len - 2)];
+  return index >= 0 && (index & 0x03) === 0;
 }
 
 function sameCheckpointUntrackedState(a: GitCheckpointUntrackedEntry, b: GitCheckpointUntrackedEntry): boolean {

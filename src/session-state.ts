@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { link, open, readFile, rename, unlink } from "node:fs/promises";
+import { link, open, readFile, realpath, rename, unlink } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import {
   duplicateReviewerSelectionsFor,
@@ -10,12 +10,21 @@ import {
 } from "./config";
 import type { EvidenceCandidate, EvidenceState } from "./evidence";
 import type { ReattachmentBundle } from "./execution/operation-record";
-import type { FileSnapshot, SnapshotOmission, WorkspaceSnapshot } from "./capture";
-import type { ReviewGateState, ReviewWindow } from "./state";
+import { decodeGitCheckpointDescriptor, GIT_CHECKPOINT_DESCRIPTOR_FORMAT, isSafeWindowId } from "./git-checkpoint";
+import type { GitCheckpointDescriptor } from "./git-checkpoint";
+import { loadReviewCheckpoint, type ReviewCheckpointDescriptor } from "./review-checkpoint";
+import type { ChangedFile, FileSnapshot, SnapshotOmission, WorkspaceSnapshot } from "./capture";
+import type { ReviewBaseline, ReviewGateState, ReviewWindow } from "./state";
 import type { ReviewerSession } from "./adapters/types";
 
 export const SESSION_STATE_ENTRY_TYPE = "pi-review-gate-session-state";
-const SESSION_STATE_VERSION = 1;
+const SESSION_STATE_VERSION = 4;
+const CHECKPOINT_REFERENCE_FORMAT = "pi-review-gate-review-checkpoint";
+const CHECKPOINT_REFERENCE_VERSION = 1;
+const SNAPSHOT_REFERENCE_FORMAT = "pi-review-gate-workspace-snapshot";
+const SNAPSHOT_REFERENCE_VERSION = 1;
+const GIT_CHECKPOINT_REFERENCE_FORMAT = "pi-review-gate-git-checkpoint";
+const GIT_CHECKPOINT_REFERENCE_VERSION = 1;
 
 /** Marker embedded in every quarantine sibling name; unique per quarantine. */
 export const SESSION_STATE_QUARANTINE_MARKER = ".quarantine-";
@@ -126,6 +135,34 @@ export class SessionStateMissingSelectionDigestError extends Error {
 }
 
 /**
+ * Typed restore failure: the sidecar is authentic and structurally valid, but
+ * one of its persisted Git checkpoint baselines failed fresh-process
+ * verification (missing/corrupt record, missing or mismatched pin ref, wrong
+ * repository, malformed descriptor). The restored state is never applied — a
+ * Git baseline is never silently turned into a fresh snapshot — and the
+ * sidecar is preserved untouched for manual recovery. Carries only the stable
+ * checkpoint failure reason plus its bounded diagnostic.
+ */
+export class SessionStateGitBaselineError extends Error {
+  readonly reason: string;
+  constructor(reason: string, detail?: string) {
+    super(`Persisted review-gate Git checkpoint baseline failed verification (${reason})${detail ? `: ${detail}` : ""}.`);
+    this.name = "SessionStateGitBaselineError";
+    this.reason = reason;
+  }
+}
+
+/** Unified checkpoint restore failure (raw or Git). The sidecar is untouched. */
+export class SessionStateCheckpointBaselineError extends Error {
+  readonly reason: string;
+  constructor(reason: string, detail?: string) {
+    super(`Persisted review-gate checkpoint baseline failed verification (${reason})${detail ? `: ${detail}` : ""}.`);
+    this.name = "SessionStateCheckpointBaselineError";
+    this.reason = reason;
+  }
+}
+
+/**
  * Atomically move a session-state sidecar to a unique sibling path without
  * clobbering any existing file. link() fails with EEXIST if the target already
  * exists (no-clobber) and is atomic; unlink() then removes the original so the
@@ -189,7 +226,7 @@ export interface SessionPersistenceIdentity {
 }
 
 interface PersistedSessionState {
-  version: 1;
+  version: 1 | 2 | 3 | 4;
   revision: number;
   sessionId: string;
   sessionFile: string;
@@ -223,14 +260,16 @@ interface PersistedReviewWindow {
   correctionCycles: number;
   lastCappedFollowUp?: string;
   lastCorrectionFeedback?: ReviewWindow["lastCorrectionFeedback"];
-  baseline?: PersistedWorkspaceSnapshot;
+  baseline?: PersistedBaseline;
+  /** v4 arming marker distinguishes a valid not-yet-captured window from lost baseline data. */
+  baselineArmed?: boolean;
   evidence: PersistedEvidenceState;
   reviewHistory: ReviewWindow["reviewHistory"];
   exchanges: ReviewWindow["exchanges"];
   activeExchange?: {
     sequence: number;
     startedAt: string;
-    baseline?: PersistedWorkspaceSnapshot;
+    baseline?: PersistedBaseline | PersistedWorkspaceSnapshotReference | PersistedGitCheckpointReference | PersistedCheckpointReference;
     evidenceEventStart: number;
     assistantSummaryStart: number;
     requestHistoryStart: number;
@@ -254,6 +293,60 @@ interface PersistedWorkspaceSnapshot {
   omissionsTruncated: boolean;
 }
 
+/**
+ * Compact persisted form of a Git checkpoint baseline (version 3): the
+ * durable descriptor plus the capture root and timestamp only. The full
+ * checkpoint record — patches and untracked content — stays in the
+ * repository's owned scratch directory and is reloaded and verified through
+ * `loadGitCheckpoint` on every restore before any state is applied.
+ */
+interface PersistedGitBaseline {
+  kind: "git";
+  descriptor: GitCheckpointDescriptor;
+  cwd: string;
+  capturedAt: string;
+}
+
+/** The new parent's compact unified descriptor, never an inline checkpoint payload. */
+interface PersistedCheckpointBaseline {
+  kind: "checkpoint";
+  descriptor: ReviewCheckpointDescriptor;
+  cwd: string;
+  capturedAt: string;
+}
+
+type PersistedBaseline = PersistedWorkspaceSnapshot | PersistedGitBaseline | PersistedCheckpointBaseline;
+
+interface PersistedWorkspaceSnapshotReference {
+  $snapshotRef: {
+    format: typeof SNAPSHOT_REFERENCE_FORMAT;
+    version: typeof SNAPSHOT_REFERENCE_VERSION;
+    target: "window.baseline";
+  };
+}
+
+/**
+ * Version-3 dedup reference for an active-exchange baseline that is identical
+ * to the window's Git checkpoint baseline: the descriptor is persisted once,
+ * on the window. Strictly validated (exact keys, exact format/version/target)
+ * and only accepted against a Git window baseline.
+ */
+interface PersistedGitCheckpointReference {
+  $gitCheckpointRef: {
+    format: typeof GIT_CHECKPOINT_REFERENCE_FORMAT;
+    version: typeof GIT_CHECKPOINT_REFERENCE_VERSION;
+    target: "window.baseline";
+  };
+}
+
+interface PersistedCheckpointReference {
+  $checkpointRef: {
+    format: typeof CHECKPOINT_REFERENCE_FORMAT;
+    version: typeof CHECKPOINT_REFERENCE_VERSION;
+    target: "window.baseline";
+  };
+}
+
 interface PersistedEvidenceState {
   nextSequence: number;
   events: EvidenceState["events"];
@@ -269,6 +362,11 @@ export interface RestoredSessionState {
   state: ReviewGateState;
   execution: ExecutionAssociationsSnapshot;
   reviewerSelectionDigest?: string;
+  /** Pre-cutover review context was discarded, not passed or migrated. Existing
+   * workspace edits become the next request's freshly captured baseline. */
+  reviewCutover?: "fresh_review_required" | "damaged_checkpoint";
+  /** Safe, fixed-category diagnostic for an authenticated damaged checkpoint. */
+  damagedCheckpointReason?: string;
 }
 
 export class SessionStateStore {
@@ -323,7 +421,7 @@ export class SessionStateStore {
     if (this.unavailableReason !== undefined) return false;
     const revision = ++this.revision;
     const unsigned = {
-      version: SESSION_STATE_VERSION as 1,
+      version: SESSION_STATE_VERSION as 4,
       revision,
       sessionId: this.identity.sessionId,
       sessionFile: this.identity.sessionFile,
@@ -402,17 +500,108 @@ export class SessionStateStore {
     // next save would rewrite it with a freshly computed digest). Records
     // without a persisted review window have nothing to verify and remain
     // restorable.
-    if ((isRecord(parsed.state.reviewWindow) || isRecord(parsed.state.lastQuestionWindow))
+    if (parsed.version === SESSION_STATE_VERSION
+      && (isRecord(parsed.state.reviewWindow) || isRecord(parsed.state.lastQuestionWindow))
       && parsed.reviewerSelectionDigest === undefined) {
       throw new SessionStateMissingSelectionDigestError();
+    }
+    // Authentic pre-cutover sidecars keep execution associations and unrelated
+    // state, but old review windows/verdicts are not migrated or deemed passed.
+    // The next request opens a fresh window: edits already in the workspace
+    // become its new baseline, with no old-review confirmation requirement.
+    const preCutover = parsed.version !== SESSION_STATE_VERSION;
+    const cutover = preCutover && Boolean(parsed.state.reviewWindow || parsed.state.lastQuestionWindow);
+    const state = deserializeState(cutover
+      ? { ...parsed.state, reviewWindow: undefined, lastQuestionWindow: undefined, pendingAcceptedReviewerQuestions: [] }
+      : parsed.state);
+    // Only an authentic current-format unified descriptor with a damaged
+    // owned record/pin qualifies. Malformed sidecars, foreign descriptors and
+    // legacy Git baselines remain fail-closed. No state is applied on failure.
+    let damagedCheckpointReason: string | undefined;
+    try {
+      await verifyCheckpointBaselines(state);
+    } catch (error) {
+      if (!(error instanceof SessionStateCheckpointBaselineError) || preCutover
+        || !await hasRecoverableCheckpointDamage(state, currentCwd, error)) throw error;
+      damagedCheckpointReason = error.reason;
+      state.reviewWindow = undefined;
+      state.lastQuestionWindow = undefined;
+      state.pendingAcceptedReviewerQuestions = [];
+    }
+    if (preCutover || damagedCheckpointReason) {
+      for (const delivery of state.pendingModelDeliveries) {
+        if (delivery.status === "queued" && delivery.kind !== "queued_user_input") {
+          delivery.status = "cancelled";
+          delivery.diagnostic = "Previous review delivery was cancelled; a fresh review is required.";
+        }
+      }
     }
     this.revision = parsed.revision;
     return {
       revision: parsed.revision,
-      state: deserializeState(parsed.state),
+      state,
       execution: cloneExecutionAssociations(parsed.execution),
-      reviewerSelectionDigest: parsed.reviewerSelectionDigest,
+      reviewerSelectionDigest: cutover || damagedCheckpointReason ? undefined : parsed.reviewerSelectionDigest,
+      reviewCutover: damagedCheckpointReason ? "damaged_checkpoint" : cutover ? "fresh_review_required" : undefined,
+      damagedCheckpointReason,
     };
+  }
+}
+
+/** Restrict fresh-start eligibility to well-formed local unified descriptors and
+ * owned evidence failures. Never treat a foreign/malformed descriptor as damage. */
+async function hasRecoverableCheckpointDamage(state: ReviewGateState, currentCwd: string, error: SessionStateCheckpointBaselineError): Promise<boolean> {
+  const baselines = [state.reviewWindow, state.lastQuestionWindow]
+    .flatMap((window) => [window?.baseline, window?.activeExchange?.baseline])
+    .filter((baseline) => baseline?.kind === "checkpoint");
+  if (!baselines.length) return false;
+  for (const baseline of baselines) {
+    if (!baseline || baseline.kind !== "checkpoint") return false;
+    const captureRoot = await realpath(baseline.cwd).catch(() => undefined);
+    if (captureRoot === undefined || captureRoot !== await realpath(currentCwd).catch(() => undefined)) return false;
+    if (baseline.descriptor.kind === "git") {
+      try { decodeGitCheckpointDescriptor(JSON.stringify(baseline.descriptor.checkpoint)); }
+      catch { return false; }
+    } else if (!isSafeWindowId(baseline.descriptor.windowId)
+      || !/^[0-9a-f]{32}$/.test(baseline.descriptor.owner)
+      || !/^[0-9a-f]{64}$/.test(baseline.descriptor.digest)
+      || baseline.descriptor.root !== captureRoot) return false;
+  }
+  if (error.reason === "raw_checkpoint_failed") {
+    // Raw loader reports one broad reason; exclude descriptor/root failures.
+    return !/malformed raw descriptor|wrong root/.test(error.message);
+  }
+  return new Set([
+    "checkpoint_data_missing", "checkpoint_digest_mismatch", "malformed_record",
+    "descriptor_record_mismatch", "pin_ref_missing", "pin_ref_mismatch", "pin_object_missing",
+    "pin_generation_mismatch",
+  ]).has(error.reason);
+}
+
+/**
+ * Reload and verify each distinct unified raw/Git descriptor before returning
+ * restored state. Snapshot and typed legacy Git compatibility remain only
+ * until the primary adapter has moved entirely to unified checkpoints.
+ */
+async function verifyCheckpointBaselines(state: ReviewGateState): Promise<void> {
+  const seen = new Set<string>();
+  for (const window of [state.reviewWindow, state.lastQuestionWindow]) {
+    if (!window) continue;
+    for (const baseline of [window.baseline, window.activeExchange?.baseline]) {
+      if (!baseline || (baseline.kind !== "checkpoint" && baseline.kind !== "git")) continue;
+      const identity = baseline.kind === "checkpoint"
+        ? reviewCheckpointDescriptorIdentity(baseline.cwd, baseline.descriptor)
+        : stableJson({ cwd: baseline.cwd, kind: baseline.kind, descriptor: baseline.descriptor });
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      if (baseline.kind === "git") {
+        const outcome = await loadReviewCheckpoint(baseline.cwd, { kind: "git", checkpoint: baseline.descriptor });
+        if (outcome.status !== "ok") throw new SessionStateGitBaselineError(outcome.reason, outcome.detail);
+      } else {
+        const outcome = await loadReviewCheckpoint(baseline.cwd, baseline.descriptor);
+        if (outcome.status !== "ok") throw new SessionStateCheckpointBaselineError(outcome.reason, outcome.detail);
+      }
+    }
   }
 }
 
@@ -511,6 +700,30 @@ function deserializeState(state: PersistedReviewGateState): ReviewGateState {
 }
 
 function serializeWindow(window: ReviewWindow): PersistedReviewWindow {
+  // Same-kind invariant at the persistence boundary: a window whose two
+  // baselines disagree on kind would restore as an invalid document (the
+  // store rejects it), so refuse to persist one rather than write a sidecar
+  // that fails closed on its own next read.
+  const exchangeBaseline = window.activeExchange?.baseline;
+  if (window.baseline && exchangeBaseline && window.baseline.kind !== exchangeBaseline.kind) {
+    throw new Error("review gate: refusing to persist a review window with mixed baseline kinds");
+  }
+  // A Git window's completed exchanges may carry Git-derived workspace change
+  // data: their inline old/new file contents are the very payloads a compact
+  // descriptor sidecar must not duplicate (the checkpoint record durably holds
+  // them). Path, status, omission, mode, tracking, and rename metadata plus
+  // the bounded patches stay; only the unbounded content fields are stripped.
+  //
+  // Deliberately asymmetric: `sideEffectChanges` are out-of-workspace changes
+  // with NO Git checkpoint fallback, so their inline content is preserved for
+  // Git windows exactly as for snapshot windows — dropping it would make a
+  // restored Git window unable to reconstruct side effects once the transient
+  // review bundle is gone.
+  const stripWorkspaceContent = window.baseline?.kind === "git" || window.baseline?.kind === "checkpoint";
+  const baseline = window.baseline ? serializeBaseline(window.baseline) : undefined;
+  const sharesWindowBaseline = window.baseline !== undefined
+    && exchangeBaseline !== undefined
+    && sameBaselineIdentity(window.baseline, exchangeBaseline);
   return {
     id: window.id,
     startedAt: window.startedAt,
@@ -518,7 +731,8 @@ function serializeWindow(window: ReviewWindow): PersistedReviewWindow {
     correctionCycles: window.correctionCycles,
     lastCappedFollowUp: window.lastCappedFollowUp,
     lastCorrectionFeedback: window.lastCorrectionFeedback ? { ...window.lastCorrectionFeedback } : undefined,
-    baseline: window.baseline ? serializeSnapshot(window.baseline) : undefined,
+    baseline,
+    baselineArmed: Boolean(window.baseline || exchangeBaseline),
     evidence: serializeEvidence(window.evidence),
     reviewHistory: window.reviewHistory.map((entry) => ({
       ...entry,
@@ -530,7 +744,9 @@ function serializeWindow(window: ReviewWindow): PersistedReviewWindow {
     })),
     exchanges: window.exchanges.map((entry) => ({
       ...entry,
-      workspaceChanges: entry.workspaceChanges.map((change) => ({ ...change })),
+      workspaceChanges: entry.workspaceChanges.map((change) => serializeChangedFile(change, stripWorkspaceContent)),
+      // Side effects are always persisted in full (see the asymmetry note
+      // above): they have no durable checkpoint fallback.
       sideEffectChanges: entry.sideEffectChanges.map((change) => ({ ...change })),
       evidenceEvents: entry.evidenceEvents.map((event) => ({ ...event, candidatePaths: [...event.candidatePaths], riskSignals: [...event.riskSignals] })),
       assistantSummaries: [...entry.assistantSummaries],
@@ -539,7 +755,10 @@ function serializeWindow(window: ReviewWindow): PersistedReviewWindow {
     })),
     activeExchange: window.activeExchange ? {
       ...window.activeExchange,
-      baseline: window.activeExchange.baseline ? serializeSnapshot(window.activeExchange.baseline) : undefined,
+      baseline: sharesWindowBaseline
+        ? (window.baseline?.kind === "checkpoint" ? createCheckpointReference()
+          : window.baseline?.kind === "git" ? createGitCheckpointReference() : createSnapshotReference())
+        : exchangeBaseline ? serializeBaseline(exchangeBaseline) : undefined,
     } : undefined,
     nextExchangeSequence: window.nextExchangeSequence,
     bundleDir: window.bundleDir,
@@ -551,6 +770,15 @@ function serializeWindow(window: ReviewWindow): PersistedReviewWindow {
 }
 
 function deserializeWindow(window: PersistedReviewWindow): ReviewWindow {
+  const baseline = window.baseline ? deserializeBaseline(window.baseline) : undefined;
+  const persistedExchangeBaseline = window.activeExchange?.baseline;
+  const exchangeBaseline = persistedExchangeBaseline === undefined
+    ? undefined
+    : isPersistedWorkspaceSnapshotReference(persistedExchangeBaseline)
+      || isPersistedGitCheckpointReference(persistedExchangeBaseline)
+      || isPersistedCheckpointReference(persistedExchangeBaseline)
+      ? baseline
+      : deserializeBaseline(persistedExchangeBaseline);
   return {
     id: window.id,
     startedAt: window.startedAt,
@@ -558,7 +786,7 @@ function deserializeWindow(window: PersistedReviewWindow): ReviewWindow {
     correctionCycles: window.correctionCycles,
     lastCappedFollowUp: window.lastCappedFollowUp,
     lastCorrectionFeedback: window.lastCorrectionFeedback ? { ...window.lastCorrectionFeedback } : undefined,
-    baseline: window.baseline ? deserializeSnapshot(window.baseline) : undefined,
+    baseline,
     evidence: deserializeEvidence(window.evidence),
     reviewHistory: window.reviewHistory.map((entry) => ({
       ...entry,
@@ -579,7 +807,7 @@ function deserializeWindow(window: PersistedReviewWindow): ReviewWindow {
     })),
     activeExchange: window.activeExchange ? {
       ...window.activeExchange,
-      baseline: window.activeExchange.baseline ? deserializeSnapshot(window.activeExchange.baseline) : undefined,
+      baseline: exchangeBaseline,
     } : undefined,
     nextExchangeSequence: window.nextExchangeSequence,
     bundleDir: window.bundleDir,
@@ -600,6 +828,65 @@ function serializeSnapshot(snapshot: WorkspaceSnapshot): PersistedWorkspaceSnaps
   };
 }
 
+function serializeBaseline(baseline: ReviewBaseline): PersistedBaseline {
+  if (baseline.kind === "snapshot") return serializeSnapshot(baseline.snapshot);
+  // Compact by contract: descriptor plus capture root/timestamp only.
+  if (baseline.kind === "checkpoint") {
+    return { kind: "checkpoint", descriptor: { ...baseline.descriptor }, cwd: baseline.cwd, capturedAt: baseline.capturedAt };
+  }
+  return { kind: "git", descriptor: { ...baseline.descriptor }, cwd: baseline.cwd, capturedAt: baseline.capturedAt };
+}
+
+function deserializeBaseline(baseline: PersistedBaseline): ReviewBaseline {
+  if (isPersistedCheckpointBaseline(baseline)) {
+    return { kind: "checkpoint", descriptor: { ...baseline.descriptor }, cwd: baseline.cwd, capturedAt: baseline.capturedAt };
+  }
+  if (isPersistedGitBaseline(baseline)) {
+    return {
+      kind: "git",
+      descriptor: { ...baseline.descriptor },
+      cwd: baseline.cwd,
+      capturedAt: baseline.capturedAt,
+    };
+  }
+  return { kind: "snapshot", snapshot: deserializeSnapshot(baseline) };
+}
+
+/**
+ * Identity used to deduplicate a window's active-exchange baseline against
+ * the window baseline itself. Snapshots keep the existing reference-identity
+ * rule; Git baselines are identical when descriptor, capture root, and
+ * timestamp all agree (the reference then aliases the window baseline on
+ * restore exactly like the snapshot reference does).
+ */
+function sameBaselineIdentity(a: ReviewBaseline, b: ReviewBaseline): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === "snapshot" && b.kind === "snapshot") return a.snapshot === b.snapshot;
+  if (a.kind === "checkpoint" && b.kind === "checkpoint") {
+    return reviewCheckpointDescriptorIdentity(a.cwd, a.descriptor)
+      === reviewCheckpointDescriptorIdentity(b.cwd, b.descriptor);
+  }
+  if (a.kind === "git" && b.kind === "git") {
+    return stableJson({ descriptor: a.descriptor, cwd: a.cwd, capturedAt: a.capturedAt })
+      === stableJson({ descriptor: b.descriptor, cwd: b.cwd, capturedAt: b.capturedAt });
+  }
+  return false;
+}
+
+/**
+ * Copy one persisted exchange WORKSPACE change entry. For Git windows the
+ * unbounded inline file contents are stripped because the durable checkpoint
+ * record already holds them (the bounded patch and every decision field —
+ * path, status, omission, mode, tracking, rename — are preserved); snapshot
+ * windows persist the full entry as before. Side-effect changes never pass
+ * through this strip: they have no checkpoint fallback (see serializeWindow).
+ */
+function serializeChangedFile(change: ChangedFile, stripContent: boolean): ChangedFile {
+  if (!stripContent) return { ...change };
+  const { oldContent: _oldContent, newContent: _newContent, ...rest } = change;
+  return rest;
+}
+
 function deserializeSnapshot(snapshot: PersistedWorkspaceSnapshot): WorkspaceSnapshot {
   // Sidecars predating the omission ledger are old-only and unsupported:
   // fail explicitly instead of guessing an empty ledger, so a preserved
@@ -613,6 +900,30 @@ function deserializeSnapshot(snapshot: PersistedWorkspaceSnapshot): WorkspaceSna
     files: new Map(snapshot.files.map(([key, value]) => [key, { ...value }])),
     omissions: snapshot.omissions.map((omission) => ({ ...omission })),
     omissionsTruncated: snapshot.omissionsTruncated,
+  };
+}
+
+function createSnapshotReference(): PersistedWorkspaceSnapshotReference {
+  return {
+    $snapshotRef: {
+      format: SNAPSHOT_REFERENCE_FORMAT,
+      version: SNAPSHOT_REFERENCE_VERSION,
+      target: "window.baseline",
+    },
+  };
+}
+
+function createCheckpointReference(): PersistedCheckpointReference {
+  return { $checkpointRef: { format: CHECKPOINT_REFERENCE_FORMAT, version: CHECKPOINT_REFERENCE_VERSION, target: "window.baseline" } };
+}
+
+function createGitCheckpointReference(): PersistedGitCheckpointReference {
+  return {
+    $gitCheckpointRef: {
+      format: GIT_CHECKPOINT_REFERENCE_FORMAT,
+      version: GIT_CHECKPOINT_REFERENCE_VERSION,
+      target: "window.baseline",
+    },
   };
 }
 
@@ -685,21 +996,154 @@ async function atomicWrite(path: string, body: string): Promise<void> {
 }
 
 function isPersistedSessionState(value: unknown): value is PersistedSessionState {
-  if (!isRecord(value) || value.version !== SESSION_STATE_VERSION) return false;
+  if (!isRecord(value) || (value.version !== 1 && value.version !== 2 && value.version !== 3 && value.version !== SESSION_STATE_VERSION)) return false;
   if (!Number.isInteger(value.revision) || typeof value.sessionId !== "string" || typeof value.sessionFile !== "string") return false;
   if (typeof value.cwd !== "string" || typeof value.savedAt !== "string" || typeof value.integritySha256 !== "string") return false;
   if (!isRecord(value.state) || !isRecord(value.execution)) return false;
+  if (value.state.reviewWindow !== undefined && !isValidPersistedReviewWindow(value.state.reviewWindow, value.version)) return false;
+  if (value.state.lastQuestionWindow !== undefined && !isValidPersistedReviewWindow(value.state.lastQuestionWindow, value.version)) return false;
   if (!Number.isInteger(value.state.nextReviewWindowId)
     || !Array.isArray(value.state.pendingAcceptedReviewerQuestions)
     || typeof value.state.reviewsPaused !== "boolean"
     || !Array.isArray(value.state.queuedUserInputsDuringReview)
     || (value.state.pendingModelDeliveries !== undefined && !Array.isArray(value.state.pendingModelDeliveries))) return false;
-  if (!Array.isArray(value.execution.waveRoots) || !Array.isArray(value.execution.bundles)) return false;
-  if (value.execution.groupRoots !== undefined && !Array.isArray(value.execution.groupRoots)) return false;
+  if (!Array.isArray(value.execution.waveRoots) || value.execution.waveRoots.some((root) => typeof root !== "string")
+    || !Array.isArray(value.execution.bundles) || value.execution.bundles.some((bundle) =>
+      !isRecord(bundle) || bundle.version !== 1 || typeof bundle.operationId !== "string"
+      || typeof bundle.waveId !== "string" || typeof bundle.taskId !== "string"
+      || typeof bundle.waveRoot !== "string" || !Number.isInteger(bundle.expectedRevision))) return false;
+  if (value.execution.groupRoots !== undefined
+    && (!Array.isArray(value.execution.groupRoots) || value.execution.groupRoots.some((root) => typeof root !== "string"))) return false;
   if (value.execution.conflictGate !== undefined && !isValidConflictGate(value.execution.conflictGate)) return false;
   if (value.execution.conflictGates !== undefined
     && (!Array.isArray(value.execution.conflictGates) || value.execution.conflictGates.some((gate) => !isValidConflictGate(gate)))) return false;
   return true;
+}
+
+function isValidPersistedReviewWindow(value: unknown, version: 1 | 2 | 3 | 4): boolean {
+  if (!isRecord(value)) return false;
+  if (value.baseline !== undefined && !isPersistedBaseline(value.baseline, version)) return false;
+  if (version === SESSION_STATE_VERSION && (typeof value.baselineArmed !== "boolean"
+    || (value.baselineArmed && value.baseline === undefined)
+    || (!value.baselineArmed && value.baseline !== undefined))) return false;
+  if (version === SESSION_STATE_VERSION && value.baseline === undefined
+    && (Array.isArray(value.reviewHistory) && value.reviewHistory.length > 0
+      || Array.isArray(value.exchanges) && value.exchanges.length > 0
+      || isRecord(value.evidence) && Array.isArray(value.evidence.events) && value.evidence.events.length > 0)) return false;
+  if (value.activeExchange === undefined) return true;
+  if (!isRecord(value.activeExchange)) return false;
+  const exchangeBaseline = value.activeExchange.baseline;
+  if (exchangeBaseline === undefined) return true;
+  if (isRecord(exchangeBaseline) && Object.hasOwn(exchangeBaseline, "$snapshotRef")) {
+    // The provisional v2 dedup reference remains restorable by the v3 writer.
+    return isPersistedWorkspaceSnapshotReference(exchangeBaseline)
+      && version !== 1
+      && isPersistedWorkspaceSnapshot(value.baseline);
+  }
+  if (isRecord(exchangeBaseline) && Object.hasOwn(exchangeBaseline, "$checkpointRef")) {
+    return isPersistedCheckpointReference(exchangeBaseline)
+      && version === SESSION_STATE_VERSION
+      && isPersistedCheckpointBaseline(value.baseline);
+  }
+  if (isRecord(exchangeBaseline) && Object.hasOwn(exchangeBaseline, "$gitCheckpointRef")) {
+    // Git dedup references only exist in v3 documents, and only against a
+    // Git window baseline of the same kind.
+    return isPersistedGitCheckpointReference(exchangeBaseline)
+      && (version === 3 || version === SESSION_STATE_VERSION)
+      && isPersistedGitBaseline(value.baseline);
+  }
+  if (!isPersistedBaseline(exchangeBaseline, version)) return false;
+  if (version === SESSION_STATE_VERSION && value.baseline === undefined) return false;
+  // Same-kind invariant: an inline exchange baseline must match the window
+  // baseline's kind (references pin their kind by construction above). A
+  // mixed pair is rejected before any restored state is applied.
+  return persistedBaselineKind(value.baseline) === persistedBaselineKind(exchangeBaseline);
+}
+
+function isPersistedBaseline(value: unknown, version: 1 | 2 | 3 | 4): value is PersistedBaseline {
+  if (isRecord(value) && value.kind === "checkpoint") {
+    return version === SESSION_STATE_VERSION && isPersistedCheckpointBaseline(value);
+  }
+  if (isRecord(value) && value.kind === "git") {
+    // Git baselines are a v3 shape; older documents never carried them.
+    return (version === 3 || version === SESSION_STATE_VERSION) && isPersistedGitBaseline(value);
+  }
+  return isPersistedWorkspaceSnapshot(value);
+}
+
+function persistedBaselineKind(baseline: PersistedBaseline): "snapshot" | "git" | "checkpoint" {
+  return isPersistedCheckpointBaseline(baseline) ? "checkpoint" : isPersistedGitBaseline(baseline) ? "git" : "snapshot";
+}
+
+/**
+ * Structural shape check for a persisted Git baseline. Deep descriptor
+ * validation (safe ids, oid/ref consistency, digest shape) happens in
+ * `loadGitCheckpoint`'s first gate on every restore; this rejects documents
+ * whose shape is wrong before any state is materialized.
+ */
+function isPersistedCheckpointBaseline(value: unknown): value is PersistedCheckpointBaseline {
+  if (!isRecord(value) || value.kind !== "checkpoint"
+    || typeof value.cwd !== "string" || typeof value.capturedAt !== "string" || !isRecord(value.descriptor)) return false;
+  const d = value.descriptor;
+  // Deeper descriptor validity, record digest and pin are verified by the
+  // backend. Reject absent/wrong-shaped descriptors before materialization.
+  if (d.kind === "git") return isRecord(d.checkpoint)
+    && d.checkpoint.format === GIT_CHECKPOINT_DESCRIPTOR_FORMAT
+    && typeof d.checkpoint.windowId === "string" && typeof d.checkpoint.armId === "string"
+    && typeof d.checkpoint.gitDir === "string" && typeof d.checkpoint.base === "string"
+    && typeof d.checkpoint.ref === "string" && typeof d.checkpoint.digest === "string"
+    && (d.checkpoint.objectFormat === "sha1" || d.checkpoint.objectFormat === "sha256");
+  return d.kind === "raw" && d.format === "prg-parent-raw/v1"
+    && typeof d.root === "string" && typeof d.windowId === "string"
+    && typeof d.owner === "string" && typeof d.digest === "string";
+}
+
+function isPersistedGitBaseline(value: unknown): value is PersistedGitBaseline {
+  if (!isRecord(value) || value.kind !== "git") return false;
+  if (typeof value.cwd !== "string" || typeof value.capturedAt !== "string") return false;
+  const descriptor = value.descriptor;
+  return isRecord(descriptor)
+    && descriptor.format === GIT_CHECKPOINT_DESCRIPTOR_FORMAT
+    && typeof descriptor.windowId === "string"
+    && typeof descriptor.armId === "string"
+    && typeof descriptor.gitDir === "string"
+    && typeof descriptor.base === "string"
+    && typeof descriptor.ref === "string"
+    && (descriptor.objectFormat === "sha1" || descriptor.objectFormat === "sha256")
+    && typeof descriptor.digest === "string";
+}
+
+function isPersistedWorkspaceSnapshot(value: unknown): value is PersistedWorkspaceSnapshot {
+  return isRecord(value)
+    && typeof value.cwd === "string"
+    && typeof value.capturedAt === "string"
+    && Array.isArray(value.files);
+}
+
+function isPersistedWorkspaceSnapshotReference(value: unknown): value is PersistedWorkspaceSnapshotReference {
+  if (!isRecord(value) || Object.keys(value).length !== 1 || !isRecord(value.$snapshotRef)) return false;
+  const reference = value.$snapshotRef;
+  return Object.keys(reference).length === 3
+    && reference.format === SNAPSHOT_REFERENCE_FORMAT
+    && reference.version === SNAPSHOT_REFERENCE_VERSION
+    && reference.target === "window.baseline";
+}
+
+/** Strict reference shape: exactly one key, exact format/version/target. */
+function isPersistedGitCheckpointReference(value: unknown): value is PersistedGitCheckpointReference {
+  if (!isRecord(value) || Object.keys(value).length !== 1 || !isRecord(value.$gitCheckpointRef)) return false;
+  const reference = value.$gitCheckpointRef;
+  return Object.keys(reference).length === 3
+    && reference.format === GIT_CHECKPOINT_REFERENCE_FORMAT
+    && reference.version === GIT_CHECKPOINT_REFERENCE_VERSION
+    && reference.target === "window.baseline";
+}
+
+function isPersistedCheckpointReference(value: unknown): value is PersistedCheckpointReference {
+  if (!isRecord(value) || Object.keys(value).length !== 1 || !isRecord(value.$checkpointRef)) return false;
+  const reference = value.$checkpointRef;
+  return Object.keys(reference).length === 3 && reference.format === CHECKPOINT_REFERENCE_FORMAT
+    && reference.version === CHECKPOINT_REFERENCE_VERSION && reference.target === "window.baseline";
 }
 
 function isValidConflictGate(value: unknown): value is PersistedConflictGate {
@@ -707,7 +1151,7 @@ function isValidConflictGate(value: unknown): value is PersistedConflictGate {
     && typeof value.executionId === "string"
     && typeof value.taskId === "string"
     && typeof value.sourceRoot === "string"
-    && Array.isArray(value.paths)
+    && Array.isArray(value.paths) && value.paths.every((path) => typeof path === "string")
     && typeof value.activatedAt === "string"
     && typeof value.manifestPath === "string"
     && typeof value.reason === "string"
@@ -760,6 +1204,12 @@ async function syncDirectoryBestEffort(path: string): Promise<void> {
   } catch {
     // Some supported platforms and filesystems reject directory handles/fsync.
   }
+}
+
+/** Canonical descriptor identity shared by persistence refs and runtime ownership.
+ * Field insertion order does not change ownership or create duplicate pins. */
+export function reviewCheckpointDescriptorIdentity(cwd: string, descriptor: ReviewCheckpointDescriptor): string {
+  return stableJson({ cwd, descriptor });
 }
 
 function stableJson(value: unknown): string {

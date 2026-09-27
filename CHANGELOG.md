@@ -15,6 +15,24 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.85]
+
+### Changed
+
+- Replace the ordinary parent-review snapshot baseline with one durable checkpoint
+  workflow for Git and non-Git workspaces. Git pins committed clean content and
+  records staged and unstaged differences plus exact non-ignored untracked entries
+  without copying clean tracked files; tracked text follows Git-normalized newline
+  semantics. Non-Git workspaces retain eligible raw entries. Window and exchange
+  reviews compare separately against one frozen after-checkpoint.
+- Preserve parent edits across reviewed subtask landings while leaving private
+  subtask capture, candidate review, and landing unchanged. Retire superseded
+  parent checkpoint owners only after the replacement state is durably saved.
+- Start a fresh review baseline for active pre-checkpoint windows on restart,
+  without migrating an old verdict. If a current checkpoint is damaged beyond
+  verified recovery, preserve its evidence, notify the user, and start a fresh
+  checkpoint with already-present edits as baseline; no prior edit is passed.
+
 ## [0.1.0-dev.84]
 
 ### Added

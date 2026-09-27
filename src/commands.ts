@@ -1,7 +1,8 @@
 import { automaticReviewEnabled, resolveReviewers, reviewerDisplayLabel, type ReviewGateConfig } from "./config";
 import { join } from "node:path";
 import { removeTransientWindowBundle } from "./bundle";
-import { createWorkspaceSnapshot } from "./capture";
+import { randomUUID } from "node:crypto";
+import { captureReviewCheckpoint, releaseReviewCheckpoint } from "./review-checkpoint";
 import {
   buildRequestContext,
   armReviewResponseExchange,
@@ -163,6 +164,10 @@ export function registerCommands(input: RegisterCommandsInput): void {
         await sendCommandNotice(ctx, "review gate: no active review window with a baseline");
         return;
       }
+      // #193 slice D: pass the typed baseline through. A Git checkpoint
+      // variant settles inside runReview through one frozen after-checkpoint;
+      // a legacy snapshot keeps the existing settle semantics.
+      const before = window.baseline;
       const reviewConfig = window.reviewConfig ?? currentConfig();
       if (!automaticReviewEnabled(reviewConfig)) {
         await sendCommandNotice(ctx, input.config.enabled
@@ -188,7 +193,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
         output = await runReview({
           cwd: input.cwd(),
           request: buildRequestContext(input.state) || "Manual /review-now request",
-          before: window.baseline,
+          before,
           config: reviewConfig,
           evidence: window.evidence,
           correctionAttemptCount: getCorrectionAttemptCount(window),
@@ -205,6 +210,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
 
       if (!isSessionActive()) {
+        await output.releaseReviewedBaseline?.();
         return;
       }
       if (!output.changed) {
@@ -217,15 +223,28 @@ export function registerCommands(input: RegisterCommandsInput): void {
         await reviewAbort.notifyCancellation();
         return;
       }
+      const prepareTransmission = async (action: ReviewTransmissionAction): Promise<string> => {
+        try { return await createCommandTransmission(output, action); }
+        catch (error) { await output.releaseReviewedBaseline?.(); throw error; }
+      };
+      const recordFeedback = async (details: Parameters<typeof recordReviewerFeedbackAndArmExchange>[1]): Promise<void> => {
+        try {
+          recordReviewerFeedbackAndArmExchange(input.state, details);
+          await input.onStateChanged?.();
+        } catch (error) {
+          if (window.activeExchange?.baseline !== output.reviewedBaseline) await output.releaseReviewedBaseline?.();
+          throw error;
+        }
+      };
       if (output.result?.verdict === "pass") {
-        const transmission = await createCommandTransmission(output, "passed");
-        recordReviewerFeedbackAndArmExchange(input.state, {
+        const transmission = await prepareTransmission("passed");
+        await recordFeedback({
           result: output.result,
           reviewerResults: output.reviewerResults,
           reviewSequence: output.reviewSequence,
           source: "manual",
           disposition: "sent_for_observation",
-          reviewedSnapshot: output.reviewedSnapshot!,
+          reviewedBaseline: output.reviewedBaseline!,
           displayLabels: output.reviewerDisplayLabels,
         });
         await sendCommandNotice(
@@ -234,31 +253,31 @@ export function registerCommands(input: RegisterCommandsInput): void {
         );
         await deliverCommandTransmission(input, output, "passed", transmission, isSessionActive);
       } else if (output.result?.verdict === "needs_changes") {
-        const transmission = await createCommandTransmission(output, "correction_required");
-        await sendCommandNotice(ctx, `review gate: changes requested (${formatTokenUsage(output.result.usage)})`);
+        const transmission = await prepareTransmission("correction_required");
         window.correctionCycles = 0;
         window.lastCappedFollowUp = undefined;
-        recordReviewerFeedbackAndArmExchange(input.state, {
+        await recordFeedback({
           result: output.result,
           reviewerResults: output.reviewerResults,
           reviewSequence: output.reviewSequence,
           source: "manual",
           disposition: "sent_for_correction",
-          reviewedSnapshot: output.reviewedSnapshot!,
+          reviewedBaseline: output.reviewedBaseline!,
           displayLabels: output.reviewerDisplayLabels,
         });
+        await sendCommandNotice(ctx, `review gate: changes requested (${formatTokenUsage(output.result.usage)})`);
         await deliverCommandTransmission(input, output, "correction_required", transmission, isSessionActive);
       } else {
         const failed = `review gate: reviewer failed (${formatTokenUsage(output.result?.usage)})`;
         if (output.result) {
-          const transmission = await createCommandTransmission(output, "review_error");
-          recordReviewerFeedbackAndArmExchange(input.state, {
+          const transmission = await prepareTransmission("review_error");
+          await recordFeedback({
             result: output.result,
             reviewerResults: output.reviewerResults,
             reviewSequence: output.reviewSequence,
             source: "manual",
             disposition: "sent_review_error",
-            reviewedSnapshot: output.reviewedSnapshot!,
+            reviewedBaseline: output.reviewedBaseline!,
             displayLabels: output.reviewerDisplayLabels,
           });
           await deliverCommandTransmission(input, output, "review_error", transmission, isSessionActive);
@@ -282,13 +301,44 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
       const followUp = window.lastCappedFollowUp;
       const reviewConfig = window.reviewConfig ?? currentConfig();
+      const captured = await captureReviewCheckpoint(input.cwd(), randomUUID());
+      if (captured.status !== "ok") throw new Error(`review gate: response checkpoint failed (${captured.reason}): ${captured.detail}`);
+      const responseBaseline = { kind: "checkpoint" as const, descriptor: captured.value, cwd: input.cwd(), capturedAt: new Date().toISOString() };
+      const oldCycles = window.correctionCycles;
       const feedback = markCappedFeedbackSent(input.state);
       window.lastCappedFollowUp = undefined;
       window.correctionCycles = 0;
-      armReviewResponseExchange(input.state, await createWorkspaceSnapshot(input.cwd(), {
-        maxFileBytes: reviewConfig.maxFileBytes,
-        maxSnapshotBytes: reviewConfig.maxSnapshotBytes,
-      }));
+      try {
+        armReviewResponseExchange(input.state, responseBaseline);
+        if (!window.activeExchange) throw new Error("review gate: response exchange was not armed");
+        // A capped review can already hold the previous after-checkpoint.
+        // Rebase the authorized response at this new capture, before saving.
+        window.activeExchange.baseline = responseBaseline;
+      } catch (error) {
+        if (window.activeExchange?.baseline !== responseBaseline) {
+          // Arming did not retain the descriptor: undo the authorization
+          // mutation so a retry can still send the capped feedback.
+          if (feedback) feedback.disposition = "sent_at_cap";
+          window.lastCappedFollowUp = followUp;
+          window.correctionCycles = oldCycles;
+          const released = await releaseReviewCheckpoint(input.cwd(), captured.value);
+          if (released.status !== "ok") throw new Error(`review gate: response arming failed; orphan release failed (${released.reason}): ${released.detail}`);
+        }
+        throw error;
+      }
+      try {
+        await input.onStateChanged?.();
+      } catch (error) {
+        if (window.activeExchange?.baseline !== responseBaseline) {
+          const unused = await releaseReviewCheckpoint(input.cwd(), captured.value);
+          if (unused.status !== "ok") throw new Error(`review gate: unused response checkpoint cleanup failed (${unused.reason}): ${unused.detail}`);
+        }
+        throw error;
+      }
+      if (window.activeExchange?.baseline !== responseBaseline) {
+        const unused = await releaseReviewCheckpoint(input.cwd(), captured.value);
+        if (unused.status !== "ok") throw new Error(`review gate: unused response checkpoint release failed (${unused.reason}): ${unused.detail}`);
+      }
       await sendCommandNotice(ctx, `review gate: continuing review; correction budget reset to ${reviewConfig.maxCorrectionCycles}`);
       await deliverDurableCommandMessage(input, {
         kind: "review_authorization",
@@ -348,6 +398,9 @@ export function registerCommands(input: RegisterCommandsInput): void {
           cwd: input.cwd(),
           question,
           request: buildRequestContext(input.state, contextWindow),
+          // #193 slice D: pass the typed baseline through; a Git checkpoint
+          // variant settles through one frozen ephemeral after-checkpoint and
+          // releases its pin after every artifact is written.
           before: contextWindow?.baseline,
           config: reviewConfig,
           evidence: contextWindow?.evidence,

@@ -6,7 +6,7 @@ import test from "node:test";
 import { createWorkspaceSnapshot } from "../src/capture";
 import { formatReviewerAnswer, registerCommands } from "../src/commands";
 import type { ReviewGateConfig } from "../src/config";
-import { createState, getReviewerQuestionWindow, recordReviewerFeedback, rememberUserRequest } from "../src/state";
+import { createState, getReviewerQuestionWindow, recordReviewerFeedback, rememberUserRequest, snapshotReviewBaseline } from "../src/state";
 import { createReviewCancellationCoordinator } from "../src/review-cancellation";
 import { fakeNeedsChangesConfig } from "./helpers";
 
@@ -102,10 +102,10 @@ test("/review-now retains persistence failure semantics without a browser teardo
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const state = createState();
     rememberUserRequest(state, "change index");
-    state.reviewWindow!.baseline = await createWorkspaceSnapshot(dir, {
+    state.reviewWindow!.baseline = snapshotReviewBaseline(await createWorkspaceSnapshot(dir, {
       maxFileBytes: 1_048_576,
       maxSnapshotBytes: 52_428_800,
-    });
+      }));
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
     registerCommands({
@@ -138,10 +138,10 @@ test("/review-clear starts the next prompt fresh without deleting retained revie
     const state = createState();
     rememberUserRequest(state, "old task");
     const oldWindow = state.reviewWindow!;
-    oldWindow.baseline = await createWorkspaceSnapshot(dir, {
+    oldWindow.baseline = snapshotReviewBaseline(await createWorkspaceSnapshot(dir, {
       maxFileBytes: 1_048_576,
       maxSnapshotBytes: 52_428_800,
-    });
+      }));
     oldWindow.lastCappedFollowUp = "old held feedback";
     oldWindow.correctionCycles = 2;
     oldWindow.evidence.events.push({
@@ -210,10 +210,10 @@ test("/review-now requested changes reset the automatic correction budget", asyn
     const state = createState();
     rememberUserRequest(state, "change index");
     state.reviewWindow!.correctionCycles = 2;
-    state.reviewWindow!.baseline = await createWorkspaceSnapshot(dir, {
+    state.reviewWindow!.baseline = snapshotReviewBaseline(await createWorkspaceSnapshot(dir, {
       maxFileBytes: 1_048_576,
       maxSnapshotBytes: 52_428_800,
-    });
+      }));
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
 
     const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
@@ -269,10 +269,10 @@ test("Escape immediately aborts an active /review-now", async () => {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const state = createState();
     rememberUserRequest(state, "change index");
-    state.reviewWindow!.baseline = await createWorkspaceSnapshot(dir, {
+    state.reviewWindow!.baseline = snapshotReviewBaseline(await createWorkspaceSnapshot(dir, {
       maxFileBytes: 1_048_576,
       maxSnapshotBytes: 52_428_800,
-    });
+      }));
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
     const terminalHandlers: Array<(input: unknown) => unknown> = [];
@@ -352,10 +352,10 @@ test("/review-cancel stops an active /review-now, reports quiescence, and works 
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const state = createState();
     rememberUserRequest(state, "change index");
-    state.reviewWindow!.baseline = await createWorkspaceSnapshot(dir, {
+    state.reviewWindow!.baseline = snapshotReviewBaseline(await createWorkspaceSnapshot(dir, {
       maxFileBytes: 1_048_576,
       maxSnapshotBytes: 52_428_800,
-    });
+      }));
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
     const notices: string[] = [];
@@ -449,10 +449,10 @@ test("/review-now delivers multi-reviewer results once and keeps its notice conc
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const state = createState();
     rememberUserRequest(state, "change index");
-    state.reviewWindow!.baseline = await createWorkspaceSnapshot(dir, {
+    state.reviewWindow!.baseline = snapshotReviewBaseline(await createWorkspaceSnapshot(dir, {
       maxFileBytes: 1_048_576,
       maxSnapshotBytes: 52_428_800,
-    });
+      }));
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
 
     const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
@@ -500,10 +500,10 @@ test("a passing /review-now transmits the complete pass and keeps its window ope
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const state = createState();
     rememberUserRequest(state, "change index");
-    state.reviewWindow!.baseline = await createWorkspaceSnapshot(dir, {
+    state.reviewWindow!.baseline = snapshotReviewBaseline(await createWorkspaceSnapshot(dir, {
       maxFileBytes: 1_048_576,
       maxSnapshotBytes: 52_428_800,
-    });
+      }));
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
 
     const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
@@ -548,10 +548,10 @@ test("/ask-reviewer-interactive retains a passing review's patch and evidence", 
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const state = createState();
     rememberUserRequest(state, "change index");
-    state.reviewWindow!.baseline = await createWorkspaceSnapshot(dir, {
+    state.reviewWindow!.baseline = snapshotReviewBaseline(await createWorkspaceSnapshot(dir, {
       maxFileBytes: 1_048_576,
       maxSnapshotBytes: 52_428_800,
-    });
+      }));
     state.reviewWindow!.evidence.events.push({
       sequence: 1,
       phase: "tool_call",
@@ -650,10 +650,10 @@ test("/ask-reviewer-interactive at the correction cap receives the complete unre
     const state = createState();
     rememberUserRequest(state, "change index with the existing API");
     const window = state.reviewWindow!;
-    window.baseline = await createWorkspaceSnapshot(dir, {
+    window.baseline = snapshotReviewBaseline(await createWorkspaceSnapshot(dir, {
       maxFileBytes: 1_048_576,
       maxSnapshotBytes: 52_428_800,
-    });
+      }));
     window.evidence.events.push({
       sequence: 1,
       phase: "tool_call",

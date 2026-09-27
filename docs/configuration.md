@@ -59,7 +59,7 @@ described only briefly here is owned by the linked page.
 | `implementationGuidanceAfterCorrectionAttempts` | `1` | Threshold that strengthens review requests with concrete implementation guidance (see [Review workflow](review-workflow.md#corrections-guidance-and-the-correction-cap)). |
 | `maxPatchBytes` | `200000` | Bound for retained patch content. |
 | `maxFileBytes` | `1048576` | Bound for retained individual file content. |
-| `maxSnapshotBytes` | `52428800` | Bounds the cumulative size of non-ignored untracked files during task capture (50 MiB) and the textual file content retained for ordinary review snapshots. |
+| `maxSnapshotBytes` | `52428800` | Bounds cumulative non-ignored untracked file bytes in private task capture (50 MiB) and textual content retained for parent review diffs; it does not truncate durable checkpoint content (see [Review workflow](review-workflow.md#review-windows-and-evidence)). |
 | `waveArtifactTtlMs` | `2592000000` (30 days) | Age after which completed non-recovery wave artifact roots are garbage-collected; `0` disables collection. |
 | `retainBundles` | `"on-failure"` | Review-bundle retention policy: `never`, `on-failure`, or `always`. `always` disables age-based wave GC while the application is running. |
 
@@ -215,9 +215,11 @@ session's own workspace that did **not** already complete a successful subtask r
 explicit force-merge/salvage or `SubtasksMarkClean` resolved-conflict handling where
 the landing path supports it — keeps its diff in the primary review window as ordinary
 evidence instead of being checkpointed out. A landing that already completed a
-successful subtask review keeps the existing checkpoint/bypass handling and is not
-re-reviewed in the primary window. The review itself always settles at the primary
-model's normal idle point, exactly like any other primary exchange; a landing never
+successful subtask review advances parent checkpoint bookkeeping for its independently
+reviewed paths at the landing boundary, without checkpointing away unrelated parent
+edits; it is not re-reviewed in the primary window. The private subtask capture,
+candidate review, and landing are unchanged. Primary review always settles at the
+primary model's normal idle point, exactly like any other primary exchange; a landing never
 triggers an immediate review. The existing conflict and salvage recovery warnings and
 fail-closed gates are unchanged: a forced merge is still a mechanical landing attempt,
 not verification. Landings into a target other than the parent session's workspace

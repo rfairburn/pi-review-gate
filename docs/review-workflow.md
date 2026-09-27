@@ -7,10 +7,22 @@ layout. Field defaults are owned by [Configuration](configuration.md).
 ## Review windows and evidence
 
 Each review window uses one stable temporary evidence bundle. Every completed agent run
-is appended as a numbered exchange containing its snapshot-derived workspace diff,
-captured side-effect diff, tool calls and results, assistant summary, usage, and
-before/after artifacts. The bundle also maintains the cumulative baseline-to-current
-patch and numbered reviewer invocations.
+is appended as a numbered exchange containing its workspace diff, captured side-effect
+diff, tool calls and results, assistant summary, usage, and before/after artifacts.
+The bundle also maintains the cumulative baseline-to-current patch and numbered
+reviewer invocations.
+
+Parent review uses one durable checkpoint mechanism for Git and non-Git workspaces.
+Each settlement freezes one after-checkpoint. In a Git checkout, it pins clean committed content
+and captures both staged and unstaged Git differences plus raw non-ignored untracked
+entries. Tracked content follows Git-normalized newline semantics: the checkpoint is
+not a raw CRLF reproduction guarantee and does not run a separate EOL proof pass.
+Untracked entries, and eligible entries in a non-Git workspace, retain their raw bytes.
+For non-Git capture, `.gitignore` patterns apply within their directory subtree; if
+any `.gitignore` exists, global Git excludes apply throughout the capture root, while
+without one there are no global excludes. Comparisons use the frozen after-checkpoint
+against separate window and exchange baselines; a checkpoint is not itself a passing
+review or a substitute for either baseline.
 
 Exact `write` / `edit` paths and easy shell targets are pre-captured before execution,
 including absolute paths outside the current worktree. Repository baselines,
@@ -27,6 +39,13 @@ immediate `/ask-reviewer` follow-up. If the implementing model makes another cha
 after seeing the passing observations, that response becomes a new exchange in the same
 window and triggers another review. Later ordinary work starts a fresh window from
 current file contents and does not re-review changes that already passed.
+
+At cutover, an active pre-checkpoint review window starts fresh with the existing
+workspace edits as its new baseline; no earlier verdict is migrated or represented as
+a pass on the new window. If a new checkpoint is damaged or cannot be verified, its
+evidence is preserved and the user is notified. Review starts fresh from the current
+workspace as baseline rather than claiming that edits under the damaged checkpoint
+passed. A fresh baseline cannot retroactively certify those earlier edits.
 
 ## Live browser during review
 

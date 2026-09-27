@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -360,6 +360,560 @@ test("snapshot cache does not miss a same-size rewrite with restored mtime", asy
       reuseUnchangedFrom: before,
     });
     assert.deepEqual(compareSnapshots(before, after).map((change) => change.path), ["value.txt"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// reuseUnchangedFrom: fresh-snapshot equality oracle.
+// The strongest guarantee is that a reuse capture makes exactly the same
+// content/hash/omission decisions a fresh capture makes on the same state,
+// across unchanged, edited, deleted, grown, and re-limited workspaces.
+// ---------------------------------------------------------------------------
+
+/** Decision-relevant fields of a record — what a review consumer observes. */
+function decisionFields(file: FileSnapshot | undefined) {
+  if (!file) return undefined;
+  return {
+    exists: file.exists,
+    size: file.size,
+    entryType: file.entryType,
+    sha256: file.sha256,
+    isBinary: file.isBinary,
+    content: file.content,
+    omittedReason: file.omittedReason,
+    linkTarget: file.linkTarget,
+    gitObjectId: file.gitObjectId,
+  };
+}
+
+function omissionKey(omission: SnapshotOmission): string {
+  return [omission.kind, omission.path, omission.reason, omission.errorCode ?? ""].join("|");
+}
+
+/** Assert the reuse capture is decision-equivalent to the fresh capture. */
+function assertSnapshotsEquivalent(fresh: WorkspaceSnapshot, reused: WorkspaceSnapshot): void {
+  const freshPaths = [...fresh.files.keys()].sort();
+  assert.deepEqual([...reused.files.keys()].sort(), freshPaths, "reuse must cover exactly the fresh path set");
+  for (const path of freshPaths) {
+    assert.deepEqual(
+      decisionFields(reused.files.get(path)),
+      decisionFields(fresh.files.get(path)),
+      `path ${path} must match the fresh capture`,
+    );
+  }
+  assert.deepEqual(
+    reused.omissions.map(omissionKey).sort(),
+    fresh.omissions.map(omissionKey).sort(),
+    "reuse must record exactly the fresh omissions",
+  );
+  assert.equal(reused.omissionsTruncated, fresh.omissionsTruncated);
+}
+
+for (const race of ["same-size rewrite", "chmod"] as const) {
+  test(`reuse rejects a ${race} between opened-file stat checks`, async (t) => {
+    if (race === "chmod" && process.platform === "win32") {
+      t.skip("Unix mode bits are required for deterministic chmod mutation");
+      return;
+    }
+    const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reuse-final-stat-"));
+    try {
+      const path = join(dir, "value.txt");
+      await writeFile(path, "before\n", "utf8");
+      await chmod(path, 0o644);
+      await writeFile(join(dir, "sibling.txt"), "sibling\n", "utf8");
+      const originalStat = await stat(path);
+      const prior = await createWorkspaceSnapshot(dir, snapshotOptions);
+      let mutationCount = 0;
+
+      const reused = await createWorkspaceSnapshot(dir, {
+        ...snapshotOptions,
+        reuseUnchangedFrom: prior,
+        captureFaults: {
+          afterReusableEntryOpenStat: async ({ relativePath }) => {
+            if (relativePath !== "value.txt") return;
+            mutationCount++;
+            if (race === "same-size rewrite") {
+              await writeFile(path, "after!\n", "utf8");
+              await utimes(path, originalStat.atime, new Date(originalStat.mtimeMs + 1000));
+            } else {
+              await chmod(path, 0o600);
+            }
+          },
+        },
+      });
+
+      assert.equal(mutationCount, 1, "mutation must occur after the first opened-file stat");
+      const raced = reused.files.get("value.txt");
+      assert.equal(raced?.exists, true, "the raced path remains represented as present");
+      assert.equal(raced?.sha256, null, "the prior hash must not be trusted after the final stat changes");
+      assert.equal(raced?.content, undefined, "the prior content must not be trusted after the final stat changes");
+      assert.equal(raced?.omittedReason, "unreadable");
+      assert.deepEqual(reused.omissions.map(omissionKey), ["file|value.txt|unreadable|"]);
+      assert.equal(reused.files.get("sibling.txt")?.content, "sibling\n");
+      assert.equal(reused.files.get("sibling.txt"), prior.files.get("sibling.txt"), "unraced siblings still reuse");
+
+      if (race === "same-size rewrite") {
+        assert.equal((await readFile(path, "utf8")), "after!\n");
+        assert.equal(raced?.size, prior.files.get("value.txt")?.size, "the rewrite preserves file size");
+      } else {
+        assert.notEqual((await stat(path)).mode & 0o777, originalStat.mode & 0o777);
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("reuse yields fresh-equivalent decisions for an unchanged workspace and actually reuses", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reuse-oracle-"));
+  try {
+    await mkdir(join(dir, "nested"));
+    await writeFile(join(dir, "f001.txt"), "one\n", "utf8");
+    await writeFile(join(dir, "f002.txt"), "two\n", "utf8");
+    await writeFile(join(dir, "nested", "f003.txt"), "three\n", "utf8");
+    await writeFile(join(dir, "blob.bin"), Buffer.from([0x1f, 0x8b, 0x08, 0x00, 1, 2]));
+
+    const prior = await createWorkspaceSnapshot(dir, snapshotOptions);
+    const fresh = await createWorkspaceSnapshot(dir, snapshotOptions);
+    const reused = await createWorkspaceSnapshot(dir, { ...snapshotOptions, reuseUnchangedFrom: prior });
+
+    assertSnapshotsEquivalent(fresh, reused);
+    // The fast path must actually have run: a retained unchanged record is
+    // reused by reference and the comparison stays empty.
+    assert.equal(reused.files.get("f001.txt"), prior.files.get("f001.txt"));
+    assert.deepEqual(compareSnapshots(prior, reused), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reuse re-evaluates the budget walk when an earlier file is deleted (f003 regression)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reuse-freed-budget-"));
+  try {
+    // Tight global budget: with all five files present, f003 onward are
+    // budget-omitted in the prior capture.
+    const options = { maxFileBytes: 1024, maxSnapshotBytes: 13 };
+    await writeFile(join(dir, "f001.txt"), "aaaa", "utf8");
+    await writeFile(join(dir, "f002.txt"), "bbbb", "utf8");
+    await writeFile(join(dir, "f003.txt"), "cccccc", "utf8");
+    await writeFile(join(dir, "f004.txt"), "dddddd", "utf8");
+    await writeFile(join(dir, "f005.txt"), "eeeeee", "utf8");
+    const prior = await createWorkspaceSnapshot(dir, options);
+    assert.equal(prior.files.get("f002.txt")?.content, "bbbb");
+    assert.equal(prior.files.get("f003.txt")?.omittedReason, "snapshot_limit");
+    assert.equal(prior.files.get("f003.txt")?.content, undefined);
+
+    // Deleting an earlier file frees budget: fresh retains f003.
+    await rm(join(dir, "f001.txt"));
+
+    const fresh = await createWorkspaceSnapshot(dir, options);
+    const reused = await createWorkspaceSnapshot(dir, { ...options, reuseUnchangedFrom: prior });
+
+    assert.equal(fresh.files.get("f003.txt")?.content, "cccccc");
+    assertSnapshotsEquivalent(fresh, reused);
+    // The measured regression: the stale snapshot_limit must not persist.
+    assert.equal(reused.files.get("f003.txt")?.omittedReason, undefined);
+    assert.equal(reused.files.get("f003.txt")?.content, "cccccc");
+    assert.equal(reused.files.get("f004.txt")?.omittedReason, "snapshot_limit");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reuse re-evaluates the budget walk when an earlier file grows (demotion)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reuse-consumed-budget-"));
+  try {
+    const options = { maxFileBytes: 1024, maxSnapshotBytes: 13 };
+    await writeFile(join(dir, "f001.txt"), "aaaa", "utf8");
+    await writeFile(join(dir, "f002.txt"), "bbbb", "utf8");
+    await writeFile(join(dir, "f003.txt"), "cccccc", "utf8");
+    const prior = await createWorkspaceSnapshot(dir, options);
+    assert.equal(prior.files.get("f002.txt")?.content, "bbbb");
+    assert.equal(prior.files.get("f003.txt")?.omittedReason, "snapshot_limit");
+
+    // Grow f001 to 10 bytes: fresh retains f001 (cumulative 10) and must
+    // demote both f002 (10+4=14 > 13) and f003.
+    await writeFile(join(dir, "f001.txt"), "a".repeat(10), "utf8");
+
+    const fresh = await createWorkspaceSnapshot(dir, options);
+    const reused = await createWorkspaceSnapshot(dir, { ...options, reuseUnchangedFrom: prior });
+
+    assertSnapshotsEquivalent(fresh, reused);
+    assert.equal(reused.files.get("f002.txt")?.omittedReason, "snapshot_limit");
+    assert.equal(reused.files.get("f002.txt")?.content, undefined, "over-retained content must be dropped");
+    assert.equal(
+      reused.files.get("f002.txt")?.sha256,
+      createHash("sha256").update("bbbb", "utf8").digest("hex"),
+      "the proven hash survives demotion",
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reuse detects in-place edits and shrinks instead of masking them with prior content", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reuse-edit-"));
+  try {
+    await writeFile(join(dir, "value.txt"), "before\n", "utf8");
+    await writeFile(join(dir, "kept.txt"), "kept\n", "utf8");
+    const prior = await createWorkspaceSnapshot(dir, snapshotOptions);
+
+    // Same-size rewrite: only mtime/ctime break the identity tuple.
+    await writeFile(join(dir, "value.txt"), "after!\n", "utf8");
+
+    const fresh = await createWorkspaceSnapshot(dir, snapshotOptions);
+    const reused = await createWorkspaceSnapshot(dir, { ...snapshotOptions, reuseUnchangedFrom: prior });
+
+    assertSnapshotsEquivalent(fresh, reused);
+    assert.equal(reused.files.get("value.txt")?.content, "after!\n");
+    assert.deepEqual(
+      compareSnapshots(prior, reused).map((change) => [change.path, change.status]),
+      [["value.txt", "modified"]],
+    );
+
+    // Shrink: a size change breaks identity the same way; the oracle must
+    // hold against the original prior as well.
+    await writeFile(join(dir, "value.txt"), "af\n", "utf8");
+
+    const freshShrunk = await createWorkspaceSnapshot(dir, snapshotOptions);
+    const reusedShrunk = await createWorkspaceSnapshot(dir, { ...snapshotOptions, reuseUnchangedFrom: prior });
+
+    assertSnapshotsEquivalent(freshShrunk, reusedShrunk);
+    assert.equal(reusedShrunk.files.get("value.txt")?.content, "af\n");
+    assert.deepEqual(
+      compareSnapshots(prior, reusedShrunk).map((change) => [change.path, change.status]),
+      [["value.txt", "modified"]],
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reuse re-reads when a raised maxFileBytes makes an oversized file eligible", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reuse-limit-up-"));
+  try {
+    await writeFile(join(dir, "doc.txt"), "x".repeat(100), "utf8");
+    const tight = { maxFileBytes: 32, maxSnapshotBytes: 4096 };
+    const prior = await createWorkspaceSnapshot(dir, tight);
+    assert.equal(prior.files.get("doc.txt")?.omittedReason, "oversized");
+    assert.equal(prior.files.get("doc.txt")?.content, undefined);
+
+    const generous = { maxFileBytes: 1024, maxSnapshotBytes: 4096 };
+    const fresh = await createWorkspaceSnapshot(dir, generous);
+    const reused = await createWorkspaceSnapshot(dir, { ...generous, reuseUnchangedFrom: prior });
+
+    assertSnapshotsEquivalent(fresh, reused);
+    assert.equal(reused.files.get("doc.txt")?.content, "x".repeat(100));
+    assert.equal(reused.files.get("doc.txt")?.omittedReason, undefined);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reuse demotes retained content when maxFileBytes is lowered", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reuse-limit-down-"));
+  try {
+    await writeFile(join(dir, "doc.txt"), "x".repeat(100), "utf8");
+    const generous = { maxFileBytes: 1024, maxSnapshotBytes: 4096 };
+    const prior = await createWorkspaceSnapshot(dir, generous);
+    assert.equal(prior.files.get("doc.txt")?.content, "x".repeat(100));
+
+    const tight = { maxFileBytes: 32, maxSnapshotBytes: 4096 };
+    const fresh = await createWorkspaceSnapshot(dir, tight);
+    const reused = await createWorkspaceSnapshot(dir, { ...tight, reuseUnchangedFrom: prior });
+
+    assertSnapshotsEquivalent(fresh, reused);
+    assert.equal(reused.files.get("doc.txt")?.omittedReason, "oversized");
+    assert.equal(reused.files.get("doc.txt")?.content, undefined, "content must be dropped when the limit no longer allows it");
+    assert.ok(reused.files.get("doc.txt")?.sha256, "the proven hash survives demotion");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reuse re-reads when a raised maxSnapshotBytes frees budget for an omitted file", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reuse-budget-up-"));
+  try {
+    await writeFile(join(dir, "a.txt"), "aaaaaaaaaa", "utf8");
+    await writeFile(join(dir, "b.txt"), "bbbbbbbbbb", "utf8");
+    const tight = { maxFileBytes: 1024, maxSnapshotBytes: 10 };
+    const prior = await createWorkspaceSnapshot(dir, tight);
+    assert.equal(prior.files.get("a.txt")?.content, "aaaaaaaaaa");
+    assert.equal(prior.files.get("b.txt")?.omittedReason, "snapshot_limit");
+
+    const generous = { maxFileBytes: 1024, maxSnapshotBytes: 64 };
+    const fresh = await createWorkspaceSnapshot(dir, generous);
+    const reused = await createWorkspaceSnapshot(dir, { ...generous, reuseUnchangedFrom: prior });
+
+    assertSnapshotsEquivalent(fresh, reused);
+    assert.equal(reused.files.get("b.txt")?.content, "bbbbbbbbbb");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reuse demotes retained content when maxSnapshotBytes is lowered", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reuse-budget-down-"));
+  try {
+    await writeFile(join(dir, "a.txt"), "aaaaaaaaaa", "utf8");
+    await writeFile(join(dir, "b.txt"), "bbbbbbbbbb", "utf8");
+    const generous = { maxFileBytes: 1024, maxSnapshotBytes: 64 };
+    const prior = await createWorkspaceSnapshot(dir, generous);
+    assert.equal(prior.files.get("b.txt")?.content, "bbbbbbbbbb");
+
+    const tight = { maxFileBytes: 1024, maxSnapshotBytes: 10 };
+    const fresh = await createWorkspaceSnapshot(dir, tight);
+    const reused = await createWorkspaceSnapshot(dir, { ...tight, reuseUnchangedFrom: prior });
+
+    assertSnapshotsEquivalent(fresh, reused);
+    assert.equal(reused.files.get("b.txt")?.omittedReason, "snapshot_limit");
+    assert.equal(reused.files.get("b.txt")?.content, undefined, "over-retained content must be dropped");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reuse never reuses symlink records and detects retargeting", async (t) => {
+  if (process.platform === "win32") t.skip("symlink creation varies on Windows");
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reuse-symlink-"));
+  try {
+    await writeFile(join(dir, "a"), "target-a\n", "utf8");
+    await writeFile(join(dir, "b"), "target-b\n", "utf8");
+    await symlink("a", join(dir, "link"));
+    const prior = await createWorkspaceSnapshot(dir, snapshotOptions);
+    assert.equal(prior.files.get("link")?.linkTarget, "a");
+
+    await rm(join(dir, "link"));
+    await symlink("b", join(dir, "link"));
+
+    const fresh = await createWorkspaceSnapshot(dir, snapshotOptions);
+    const reused = await createWorkspaceSnapshot(dir, { ...snapshotOptions, reuseUnchangedFrom: prior });
+
+    assertSnapshotsEquivalent(fresh, reused);
+    assert.equal(reused.files.get("link")?.linkTarget, "b");
+    assert.deepEqual(
+      compareSnapshots(prior, reused).map((change) => [change.path, change.status]),
+      [["link", "modified"]],
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reuse cannot leak retained content through a newly symlinked parent directory", async (t) => {
+  if (process.platform === "win32") t.skip("symlink creation varies on Windows");
+  const base = await mkdtemp(join(tmpdir(), "pi-review-gate-reuse-escape-"));
+  const dir = join(base, "ws");
+  const outside = join(base, "outside");
+  try {
+    await mkdir(dir);
+    await mkdir(outside);
+    await mkdir(join(dir, "a"));
+    await writeFile(join(dir, "a", "b.txt"), "retained content\n", "utf8");
+    await initGit(dir);
+    await gitAddCommit(dir, "seed");
+
+    const prior = await createWorkspaceSnapshot(dir, snapshotOptions);
+    assert.equal(prior.files.get("a/b.txt")?.content, "retained content\n");
+
+    // Move the parent directory outside the workspace and re-point the old
+    // name at it: rename touches none of b.txt's timestamps, so every lstat
+    // identity field still matches the prior record — only canonical path
+    // safety can tell the entry has escaped. (An unlink/recreate fixture
+    // would not work: removing a hardlink updates ctime and the identity
+    // gate alone would reject the candidate before the preflight runs.)
+    await rename(join(dir, "a"), join(outside, "a"));
+    await symlink("../outside/a", join(dir, "a"));
+
+    // Prove the premise: identity is genuinely unchanged, so this candidate
+    // reaches the no-read preflight instead of being rejected by the gate.
+    const before = prior.files.get("a/b.txt")!;
+    const afterStat = await stat(join(dir, "a", "b.txt"));
+    assert.equal(afterStat.dev, before.dev);
+    assert.equal(afterStat.ino, before.ino);
+    assert.equal(afterStat.size, before.size);
+    assert.equal(afterStat.mtimeMs, before.mtimeMs);
+    assert.equal(afterStat.ctimeMs, before.ctimeMs);
+    assert.equal(afterStat.mode, before.mode);
+
+    const fresh = await createWorkspaceSnapshot(dir, snapshotOptions);
+    const reused = await createWorkspaceSnapshot(dir, { ...snapshotOptions, reuseUnchangedFrom: prior });
+
+    assertSnapshotsEquivalent(fresh, reused);
+    const escaped = reused.files.get("a/b.txt");
+    assert.equal(escaped?.content, undefined, "previously retained content must not escape the workspace");
+    assert.equal(escaped?.omittedReason, "unreadable", "an escaped entry is unreadable, never deleted and never trusted");
+    assert.ok(reused.omissions.some((entry) => entry.path === "a/b.txt" && entry.reason === "unreadable"));
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("reuse re-inspects an identity-broken unreadable file instead of silently reusing", async (t) => {
+  if (process.platform === "win32" || process.getuid?.() === 0) {
+    t.skip("permission-based tests require a non-root POSIX user");
+  }
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reuse-unreadable-2-"));
+  try {
+    await writeFile(join(dir, "protected.txt"), "secret\n", "utf8");
+    await writeFile(join(dir, "sibling.txt"), "open\n", "utf8");
+    const prior = await createWorkspaceSnapshot(dir, snapshotOptions);
+    assert.equal(prior.files.get("protected.txt")?.content, "secret\n");
+
+    // chmod breaks mode and ctime identity, forcing re-inspection.
+    await chmod(join(dir, "protected.txt"), 0o000);
+
+    const fresh = await createWorkspaceSnapshot(dir, snapshotOptions);
+    const reused = await createWorkspaceSnapshot(dir, { ...snapshotOptions, reuseUnchangedFrom: prior });
+
+    assertSnapshotsEquivalent(fresh, reused);
+    assert.equal(reused.files.get("protected.txt")?.omittedReason, "unreadable");
+    assert.equal(reused.files.get("protected.txt")?.content, undefined, "prior content must not be served for an unreadable entry");
+    assert.ok(reused.omissions.some((entry) => entry.path === "protected.txt" && entry.reason === "unreadable"));
+    assert.equal(reused.files.get("sibling.txt")?.content, "open\n", "siblings stay captured");
+  } finally {
+    await chmod(join(dir, "protected.txt"), 0o644).catch(() => undefined);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reuse falls back to safe inspection when the entry races during verification", async (t) => {
+  if (process.platform === "win32") t.skip("symlink creation varies on Windows");
+  const base = await mkdtemp(join(tmpdir(), "pi-review-gate-reuse-race-"));
+  const dir = join(base, "ws");
+  const outside = join(base, "outside-secret.txt");
+  try {
+    await mkdir(dir);
+    await writeFile(outside, "outside secret\n", "utf8");
+    await writeFile(join(dir, "victim.txt"), "x", "utf8");
+    await writeFile(join(dir, "sibling.txt"), "sibling\n", "utf8");
+    const options = { maxFileBytes: 1024, maxSnapshotBytes: 1024 * 10 };
+    const prior = await createWorkspaceSnapshot(dir, options);
+
+    // The seam swaps the victim to an outside symlink after lstat but before
+    // any open; the reuse path must catch it during its no-read verification
+    // and fall back to the full race-checked inspection exactly like fresh.
+    const runWithRace = (reuseFrom?: WorkspaceSnapshot) => createWorkspaceSnapshot(dir, {
+      ...options,
+      ...(reuseFrom ? { reuseUnchangedFrom: reuseFrom } : {}),
+      captureFaults: {
+        beforeInspectFile: async ({ relativePath, absolutePath }) => {
+          if (relativePath !== "victim.txt") return;
+          await rm(absolutePath);
+          await symlink(outside, absolutePath);
+        },
+      },
+    });
+
+    const reused = await runWithRace(prior);
+    // Restore the pre-race state so the fresh run observes identical conditions.
+    await rm(join(dir, "victim.txt"));
+    await writeFile(join(dir, "victim.txt"), "x", "utf8");
+    const fresh = await runWithRace();
+
+    assertSnapshotsEquivalent(fresh, reused);
+    assert.equal(reused.files.get("victim.txt")?.omittedReason, "unreadable");
+    assert.equal(reused.files.get("victim.txt")?.content, undefined);
+    assert.ok(reused.omissions.some((entry) => entry.path === "victim.txt" && entry.reason === "unreadable"));
+    assert.equal(reused.files.get("sibling.txt")?.content, "sibling\n");
+    assert.doesNotMatch(JSON.stringify([...reused.files.values()]), /outside secret/);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("reuse honors an aborted signal mid-walk and never returns a partial snapshot", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reuse-abort-mid-"));
+  try {
+    for (const name of ["a.txt", "b.txt", "c.txt", "d.txt"]) {
+      await writeFile(join(dir, name), `${name}\n`, "utf8");
+    }
+    const prior = await createWorkspaceSnapshot(dir, snapshotOptions);
+    const controller = new AbortController();
+    let fired = 0;
+    await assert.rejects(
+      createWorkspaceSnapshot(dir, {
+        ...snapshotOptions,
+        signal: controller.signal,
+        reuseUnchangedFrom: prior,
+        captureFaults: {
+          beforeInspectFile: async () => {
+            fired += 1;
+            if (fired === 2) controller.abort();
+          },
+        },
+      }),
+      /abort|cancel/i,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reuse honors an already-aborted signal before discovery", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reuse-abort-pre-"));
+  try {
+    await writeFile(join(dir, "a.txt"), "a\n", "utf8");
+    const prior = await createWorkspaceSnapshot(dir, snapshotOptions);
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+      createWorkspaceSnapshot(dir, { ...snapshotOptions, signal: controller.signal, reuseUnchangedFrom: prior }),
+      /abort|cancel/i,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("reuse never reuses across a capture-root mismatch", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-review-gate-reuse-root-"));
+  const dirA = join(base, "a");
+  const dirB = join(base, "b");
+  try {
+    await mkdir(dirA);
+    await mkdir(dirB);
+    await writeFile(join(dirA, "x.txt"), "from-a\n", "utf8");
+    await writeFile(join(dirB, "x.txt"), "from-b\n", "utf8");
+    const prior = await createWorkspaceSnapshot(dirA, snapshotOptions);
+
+    const fresh = await createWorkspaceSnapshot(dirB, snapshotOptions);
+    const reused = await createWorkspaceSnapshot(dirB, { ...snapshotOptions, reuseUnchangedFrom: prior });
+
+    assertSnapshotsEquivalent(fresh, reused);
+    assert.equal(reused.files.get("x.txt")?.content, "from-b\n");
+    assert.ok(!JSON.stringify([...reused.files.values()]).includes("from-a"), "no record may leak across roots");
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("reuse re-evaluates the budget walk under git discovery after a deletion", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reuse-git-"));
+  await initGit(dir);
+  try {
+    const options = { maxFileBytes: 1024, maxSnapshotBytes: 13 };
+    for (const [name, content] of [["f001.txt", "aaaa"], ["f002.txt", "bbbb"], ["f003.txt", "cccccc"]]) {
+      await writeFile(join(dir, name), content, "utf8");
+    }
+    await gitAddCommit(dir, "seed");
+    const prior = await createWorkspaceSnapshot(dir, options);
+    assert.equal(prior.files.get("f002.txt")?.content, "bbbb");
+    assert.equal(prior.files.get("f003.txt")?.omittedReason, "snapshot_limit");
+
+    // Delete an earlier tracked file: git discovery still lists it (index),
+    // so both captures record the missing omission while the freed budget
+    // must let f003 be retained.
+    await rm(join(dir, "f001.txt"));
+
+    const fresh = await createWorkspaceSnapshot(dir, options);
+    const reused = await createWorkspaceSnapshot(dir, { ...options, reuseUnchangedFrom: prior });
+
+    assertSnapshotsEquivalent(fresh, reused);
+    assert.equal(reused.files.get("f003.txt")?.content, "cccccc");
+    assert.ok(reused.omissions.some((entry) => entry.path === "f001.txt" && entry.reason === "missing"));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

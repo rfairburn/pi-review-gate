@@ -1311,8 +1311,8 @@ export async function runWaveWorkerLifecycle(
         disposition,
         displayLabels: reviewOutput.reviewerDisplayLabels,
       });
-      if (reviewOutput.reviewedSnapshot) {
-        armReviewResponseExchange(reviewState, reviewOutput.reviewedSnapshot);
+      if (reviewOutput.reviewedBaseline) {
+        armReviewResponseExchange(reviewState, reviewOutput.reviewedBaseline);
       }
     }
 

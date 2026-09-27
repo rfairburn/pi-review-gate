@@ -320,12 +320,11 @@ will not see them. Files known to Git through `HEAD` or the index are always cap
 regardless of repository size.
 
 During task capture, `maxSnapshotBytes` limits only the cumulative size of non-ignored
-untracked files (50 MiB by default). For ordinary serial review snapshots, the same
-setting continues to bound the textual file content retained for diffing. Ordinary
-snapshots stream files once to retain an exact SHA-256 identity. Recognizable archives,
-executables, media, fonts, PDFs, and other binary data are classified from content
-signatures with a binary-content fallback; their bytes are not retained or decoded for
-textual diffs, and filename extensions alone never determine classification.
+untracked files (50 MiB by default). This private task capture, candidate review, and
+landing path remains separate from the parent review checkpoint. Parent review uses a
+single durable Git or non-Git checkpoint and compares its frozen after-state against
+distinct window and exchange baselines (see [Review windows and
+evidence](review-workflow.md#review-windows-and-evidence)).
 
 ## Landing and source preservation
 
@@ -340,11 +339,14 @@ state, and stash are preserved.
 **Automatic review layers**: the review around landing is configured per layer in
 `/review-settings` (see
 [Review layers](configuration.md#review-layers-and-the-legacy-activereviewers-import)).
-`review.subtaskEnabled` controls the pre-landing subtask review. With
-`review.reviewLandedChanges` on, a landing into the parent session's own workspace
+`review.subtaskEnabled` controls the private pre-landing subtask review. At the landing
+boundary, an independently reviewed landing advances parent checkpoint bookkeeping
+only for its eligible landed paths; edits made by the parent remain reviewable against
+their window baseline.
+With `review.reviewLandedChanges` on, a landing into the parent session's own workspace
 that did **not** already complete a successful subtask review keeps its diff in the
 parent's review window as ordinary evidence instead of being checkpointed out,
-reviewed at the primary model's normal idle settlement; a landing that already
+reviewed at the primary model's normal idle settlement. A landing that already
 completed a successful subtask review keeps the existing checkpoint/bypass handling.
 Landings into a foreign workspace target never enter the parent review window.
 

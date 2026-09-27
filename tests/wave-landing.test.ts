@@ -134,7 +134,7 @@ test("native Windows wave landing applies a worker edit with handle-bound source
     const plan = await planWaveLanding(capture, integrated.finalCommitSha, sourceDir);
     assert.deepEqual(plan.conflicts, []);
     const landed = await executeWaveLanding(plan, capture);
-    assert.equal(landed.status, "landed");
+    assert.equal(landed.status, "landed", `Landing result: ${JSON.stringify(landed)}`);
     assert.equal(await readFile(join(sourceDir, "readme.md"), "utf8"), "after\n");
   } finally {
     await rm(sourceDir, { recursive: true, force: true });

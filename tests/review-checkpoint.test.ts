@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
@@ -69,6 +69,47 @@ test("nested Git review checkpoints cover repository-relative sibling changes wi
   assert.equal((await releaseReviewCheckpoint(cwd, before)).status, "ok");
   assert.equal((await releaseReviewCheckpoint(cwd, after)).status, "ok");
   assert.equal((await releaseReviewCheckpoint(otherRepository, other)).status, "ok");
+}));
+
+test("ambient Git repository redirects cannot hide nested parent-review changes", async () => fixture(async (root) => {
+  const actual = join(root, "actual");
+  const selected = join(actual, "nested");
+  const unrelated = join(root, "unrelated");
+  await mkdir(selected, { recursive: true });
+  await mkdir(unrelated);
+  for (const repository of [actual, unrelated]) {
+    await git(repository, "init", "-q");
+    await writeFile(join(repository, "tracked.txt"), "baseline\n");
+    await git(repository, "add", "tracked.txt");
+    await git(repository, "commit", "-qm", "baseline");
+  }
+
+  const priorDir = process.env.GIT_DIR;
+  const priorWorktree = process.env.GIT_WORK_TREE;
+  try {
+    process.env.GIT_DIR = join(unrelated, ".git");
+    process.env.GIT_WORK_TREE = unrelated;
+    const before = await capture(selected, "redirect-before");
+    assert.equal(before.kind, "git");
+    if (before.kind !== "git") throw new Error("expected Git checkpoint");
+    assert.equal(before.checkpoint.gitDir, await realpath(join(actual, ".git")));
+    await writeFile(join(actual, "tracked.txt"), "actual repository changed\n");
+    const after = await capture(selected, "redirect-after");
+    const compared = await compareReviewCheckpoints(selected, before, after);
+    assert.equal(compared.status, "ok", JSON.stringify(compared));
+    if (compared.status === "ok") {
+      assert.deepEqual(compared.value.changes.map((change) => change.path), ["tracked.txt"]);
+      assert.equal(compared.value.changes[0]?.new?.bytes?.toString(), "actual repository changed\n");
+    }
+    assert.equal((await loadReviewCheckpoint(selected, before)).status, "ok");
+    assert.equal((await releaseReviewCheckpoint(selected, before)).status, "ok");
+    assert.equal((await releaseReviewCheckpoint(selected, after)).status, "ok");
+  } finally {
+    if (priorDir === undefined) delete process.env.GIT_DIR;
+    else process.env.GIT_DIR = priorDir;
+    if (priorWorktree === undefined) delete process.env.GIT_WORK_TREE;
+    else process.env.GIT_WORK_TREE = priorWorktree;
+  }
 }));
 
 test("Git clean tracked bytes are referenced, while staged, unstaged and untracked bytes are recoverable", async () => fixture(async (root) => {

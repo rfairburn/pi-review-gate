@@ -7,11 +7,11 @@ import { execFile, spawn } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import { lstat, mkdir, mkdtemp, open, readdir, readlink, realpath, rename, rm } from "node:fs/promises";
-import { dirname, join, resolve, relative } from "node:path";
+import { dirname, join, resolve, relative, isAbsolute, sep } from "node:path";
 import { promisify } from "node:util";
 import {
   armGitCheckpoint, loadGitCheckpoint, compareGitCheckpoints, releaseGitCheckpointPin,
-  isSafeWindowId, type GitCheckpointDescriptor, type GitCheckpointOptions,
+  gitCheckpointDiscoveryEnv, isSafeWindowId, type GitCheckpointDescriptor, type GitCheckpointOptions,
   type GitCheckpointResult, type GitCheckpointRecord, type GitCheckpointUntrackedEntry,
 } from "./git-checkpoint";
 
@@ -109,13 +109,19 @@ async function existingStore(root: string): Promise<string> {
 }
 type GitRoot = { kind: "git"; root: string } | { kind: "raw" | "broken" };
 async function gitRoot(root: string): Promise<GitRoot> {
-  const out = await command(root, ["rev-parse", "--show-toplevel"]);
+  const out = await command(root, ["rev-parse", "--show-toplevel"], gitCheckpointDiscoveryEnv());
   if (out.code === 0) {
     const top = out.stdout.endsWith("\r\n") ? out.stdout.slice(0, -2)
       : out.stdout.endsWith("\n") ? out.stdout.slice(0, -1)
         : out.stdout;
     if (!top) return { kind: "broken" };
-    return { kind: "git", root: await realpath(resolve(top)) };
+    const canonicalTop = await realpath(resolve(top));
+    const withinRepository = relative(canonicalTop, root);
+    // A misleading discovery result must never redirect a parent checkpoint
+    // to a different checkout and silently report local edits as unchanged.
+    if (withinRepository === ".." || withinRepository.startsWith(`..${sep}`) || isAbsolute(withinRepository))
+      return { kind: "broken" };
+    return { kind: "git", root: canonicalTop };
   }
   if (process.env.GIT_DIR) return { kind: "broken" };
   // A failed rev-parse is not evidence of a non-Git root: broken or

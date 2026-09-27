@@ -6,7 +6,7 @@ import { promises as fs, readlink as fsReadlink, Stats } from "node:fs";
 import { join, sep, isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
 import { atomicWrite } from "./durable-write";
-import { WaveCaptureResult } from "./wave-repository";
+import { readSourceRootIdentity, type WaveCaptureResult } from "./wave-repository";
 import { integrationRefName } from "./wave-worktrees";
 import { GIT_NO_LOCKS_ENV as GIT_ENV, validateSafeId } from "./wave-validation";
 
@@ -588,11 +588,11 @@ export async function planWaveLanding(
   // as the one captured. This rejects path retarget/replacement attacks where
   // the original directory is renamed and a symlink is planted at the old path.
   const resolvedSourceRoot = await fs.realpath(sourceRoot);
-  const currentRootStat = await fs.stat(resolvedSourceRoot);
+  const currentRootIdentity = await readSourceRootIdentity(resolvedSourceRoot);
   const capturedIdentity = capture.sourceIdentity;
-  if (currentRootStat.dev !== capturedIdentity.dev || currentRootStat.ino !== capturedIdentity.ino) {
+  if (currentRootIdentity.dev !== capturedIdentity.dev || currentRootIdentity.ino !== capturedIdentity.ino) {
     throw new Error(
-      `Source root identity mismatch: current dev=${currentRootStat.dev},ino=${currentRootStat.ino} ` +
+      `Source root identity mismatch: current dev=${currentRootIdentity.dev},ino=${currentRootIdentity.ino} ` +
       `does not match captured dev=${capturedIdentity.dev},ino=${capturedIdentity.ino}. ` +
       `Planning must be bound to the exact captured source root.`,
     );
@@ -1045,14 +1045,14 @@ export async function executeWaveLanding(
 
   // Verify source root identity still matches (dev+ino).
   const resolvedSourceRoot = await fs.realpath(sourceRoot);
-  const execRootStat = await fs.stat(resolvedSourceRoot);
+  const execRootIdentity = await readSourceRootIdentity(resolvedSourceRoot);
   const execCapturedIdentity = capture.sourceIdentity;
-  if (execRootStat.dev !== execCapturedIdentity.dev || execRootStat.ino !== execCapturedIdentity.ino) {
+  if (execRootIdentity.dev !== execCapturedIdentity.dev || execRootIdentity.ino !== execCapturedIdentity.ino) {
     return {
       status: "conflicted",
       conflicts: [{
         path: "<root>",
-        reason: `Source root identity mismatch: current dev=${execRootStat.dev},ino=${execRootStat.ino} ` +
+        reason: `Source root identity mismatch: current dev=${execRootIdentity.dev},ino=${execRootIdentity.ino} ` +
           `does not match captured dev=${execCapturedIdentity.dev},ino=${execCapturedIdentity.ino}.`,
       }],
     };
@@ -1966,8 +1966,8 @@ export async function recoverLandingManifest(
     };
   }
 
-  const currentRootStat = await fs.stat(resolvedSourceRoot).catch(() => null);
-  if (!currentRootStat) {
+  const currentRootIdentity = await readSourceRootIdentity(resolvedSourceRoot).catch(() => null);
+  if (!currentRootIdentity) {
     return {
       status: "rejected",
       reason: `Cannot stat source root: ${manifest.sourceRoot}`,
@@ -1975,10 +1975,10 @@ export async function recoverLandingManifest(
     };
   }
 
-  if (currentRootStat.dev !== manifest.sourceIdentity.dev || currentRootStat.ino !== manifest.sourceIdentity.ino) {
+  if (currentRootIdentity.dev !== manifest.sourceIdentity.dev || currentRootIdentity.ino !== manifest.sourceIdentity.ino) {
     return {
       status: "rejected",
-      reason: `Source root identity mismatch: current dev=${currentRootStat.dev},ino=${currentRootStat.ino} ` +
+      reason: `Source root identity mismatch: current dev=${currentRootIdentity.dev},ino=${currentRootIdentity.ino} ` +
         `does not match manifest dev=${manifest.sourceIdentity.dev},ino=${manifest.sourceIdentity.ino}.`,
       manifestPath,
     };

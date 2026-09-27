@@ -113,6 +113,35 @@ async function setupLanding(
   };
 }
 
+test("native Windows wave landing applies a worker edit with handle-bound source identity", {
+  skip: process.platform !== "win32",
+}, async () => {
+  const sourceDir = await mkTmp("pi-wl-win-src-");
+  const artifactDir = await mkTmp("pi-wl-win-artifact-");
+  try {
+    await git(["init", "--quiet"], sourceDir);
+    await writeFile(join(sourceDir, "readme.md"), "before\n", "utf8");
+    await git(["add", "readme.md"], sourceDir);
+    await git(["commit", "--quiet", "-m", "base"], sourceDir);
+    const capture = await captureWaveBase({ cwd: sourceDir, artifactDir, maxSnapshotBytes: 1_000_000, waveId: "native-win-landing" });
+    const worker = await createWorkerWorktree(capture, "task-win-edit");
+    await writeFile(join(worker.worktreeRoot, "readme.md"), "after\n", "utf8");
+    const candidate = await normalizeCandidate(capture, worker.worktreeRoot, "task-win-edit", "Windows edit");
+    await pinCommit(capture, candidate.commitSha, { type: "worker", taskId: "task-win-edit" });
+    const integrated = await integrateWave(capture, [{ taskId: "task-win-edit", commitSha: candidate.commitSha }]);
+    assert.equal(integrated.status, "integrated");
+    if (integrated.status !== "integrated") return;
+    const plan = await planWaveLanding(capture, integrated.finalCommitSha, sourceDir);
+    assert.deepEqual(plan.conflicts, []);
+    const landed = await executeWaveLanding(plan, capture);
+    assert.equal(landed.status, "landed");
+    assert.equal(await readFile(join(sourceDir, "readme.md"), "utf8"), "after\n");
+  } finally {
+    await rm(sourceDir, { recursive: true, force: true });
+    await rm(artifactDir, { recursive: true, force: true });
+  }
+});
+
 test("wave landing supports SHA-256 object-format repositories", async (t) => {
   const sourceDir = await mkTmp("pi-wl-sha256-src-");
   const artifactDir = await mkTmp("pi-wl-sha256-artifact-");

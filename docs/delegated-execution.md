@@ -318,6 +318,11 @@ dependencies installed in `node_modules`, secrets in `.env`, and other ignored p
 not captured or landed. If your task depends on files that are git-ignored, the worker
 will not see them. Files known to Git through `HEAD` or the index are always captured
 regardless of repository size.
+On Windows, private Git capture ignores unreliable worktree-only executable-bit
+differences while retaining staged index modes and current worktree content;
+its root identity uses an opened directory's volume ID when path stat omits it,
+and landing and recovery verify that same identity. POSIX worktree mode
+handling is unchanged.
 
 During task capture, `maxSnapshotBytes` limits only the cumulative size of non-ignored
 untracked files (50 MiB by default). This private task capture, candidate review, and

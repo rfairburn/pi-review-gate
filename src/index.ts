@@ -44,6 +44,7 @@ import { persistSubtasksViewPreference, replaceConfig } from "./settings/persist
 import { assertScheduledImagesPresent, managedScheduledImageRoot } from "./settings/scheduled-image-assets";
 import { registerStreamFailureReporting } from "./stream-failure-report";
 import { ExecutionToolManager } from "./execution/tool";
+import { acknowledgeOwnerRetiringSave } from "./execution/background-controller";
 import { combineTokenUsage, extractPiUsageFromMessages, formatTokenUsage, type TokenUsage } from "./usage";
 import { NativeToolCallPreflight } from "./tool-call-preflight";
 import { buildReviewAuthorizationMessage, createReviewTransmissionMessage, deliverReviewTransmission, hasReviewDeliveryReceipt, type ReviewTransmissionAction } from "./transmission";
@@ -360,9 +361,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     onNativeToolError: (toolCallId, toolName) => nativeToolPreflight.observeReturnedError(toolCallId, toolName),
     authorizedTools: () => deferredTools.authorizedToolNames(),
     notify: (message) => sendNotice(pi, message),
-    // ExecutionToolManager still types this callback as void; its controller
-    // observes the actual boolean result to gate checkpoint owner release.
-    onAssociationsChanged: () => persistConfirmedSessionState() as unknown as Promise<void>,
+    // The session writer serializes save AND owner retirement. Distinguish its
+    // completed retirement from a standalone controller's bare durable save.
+    onAssociationsChanged: () => acknowledgeOwnerRetiringSave(persistConfirmedSessionState),
     onExpandedViewChanged: async (expanded) => {
       if (!loaded.path) {
         throw new Error("No persistent review-gate config file is loaded.");

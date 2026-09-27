@@ -497,6 +497,14 @@ export async function compareReviewCheckpoints(root: string, before: ReviewCheck
   if (before.kind === "git" && after.kind === "git") {
     const compared = await compareGitCheckpoints(root, before.checkpoint, after.checkpoint, options, true);
     if (compared.status !== "ok") return compared;
+    // Tracked symlinks are Git blobs, not necessarily UTF-8 text. Refuse a
+    // lossy decode before sameState can collapse distinct targets to U+FFFD.
+    for (const item of compared.value.trackedChanges) {
+      for (const [kind, bytes] of [[item.oldKind, item.oldBytes], [item.newKind, item.newBytes]] as const) {
+        if (kind === "symlink" && (!bytes || !Buffer.from(bytes.toString("utf8"), "utf8").equals(bytes)))
+          return fail(`tracked symlink target is not valid UTF-8: ${item.path}`);
+      }
+    }
     const changes: ReviewCheckpointChange[] = compared.value.trackedChanges.map((item) => ({ path: item.path,
       old: item.oldKind ? { kind: item.oldKind, mode: item.oldKind === "file" ? 0o100000 | (item.oldMode ?? 0) : 0o120777, ...(item.oldKind === "file" ? { bytes: item.oldBytes } : { target: item.oldBytes?.toString("utf8") }) } : undefined,
       new: item.newKind ? { kind: item.newKind, mode: item.newKind === "file" ? 0o100000 | (item.newMode ?? 0) : 0o120777, ...(item.newKind === "file" ? { bytes: item.newBytes } : { target: item.newBytes?.toString("utf8") }) } : undefined }));

@@ -290,6 +290,8 @@ export type GitCheckpointResult<T> =
 
 /** @internal Deterministic fault seams for regression tests. */
 export interface GitCheckpointFaultHooks {
+  /** Runs after untracked enumeration, before the first capture stat. */
+  afterUntrackedList?: () => void | Promise<void>;
   /** Runs after the pre-stat of an untracked path, before its read. */
   beforeUntrackedRead?: (absolutePath: string) => void | Promise<void>;
   /**
@@ -1415,6 +1417,7 @@ export async function armGitCheckpoint(
     let untracked: GitCheckpointUntrackedEntry[];
     try {
       const paths = await listUntrackedPaths(gitPath, repo.root, spec);
+      await options.faultHooks?.afterUntrackedList?.();
       untracked = [];
       let totalBytes = 0;
       for (const path of paths) {
@@ -1877,6 +1880,33 @@ async function listUntrackedPaths(gitPath: string, root: string, spec: GitRunSpe
 }
 
 /**
+ * Sample the existing directory chain for a listed untracked path. A leaf
+ * O_NOFOLLOW does not protect against a parent redirected outside the root.
+ * Recheck identities around raw reads so a persistent rename/symlink swap
+ * cannot publish bytes reached through a different directory chain.
+ */
+async function assertUntrackedParents(root: string, path: string, expected?: readonly StatIdentity[]): Promise<StatIdentity[]> {
+  const parents = path.split("/").slice(0, -1);
+  const identities: StatIdentity[] = [];
+  let absolute = root;
+  for (let i = 0; i < parents.length; i += 1) {
+    absolute = join(absolute, parents[i]!);
+    let info: Stats;
+    try {
+      info = await lstat(absolute);
+    } catch (error) {
+      throw untrackedCaptureError(path, error, "could not stat parent of");
+    }
+    const identity = statIdentityOf(info);
+    if (!info.isDirectory() || (expected !== undefined && !sameStatIdentity(identity, expected[i]!))) {
+      throw new GitCheckpointError(`untracked parent of ${path} changed or is not a directory`, "untracked_capture_race");
+    }
+    identities.push(identity);
+  }
+  return identities;
+}
+
+/**
  * Capture one untracked path exactly: no-follow stat, pre/post identity
  * check around the read, raw bytes or symlink target. Special entries
  * (fifos, sockets, devices) are refused — they cannot be represented in a
@@ -1889,6 +1919,7 @@ async function captureUntrackedEntry(
   maxFileBytes?: number,
 ): Promise<GitCheckpointUntrackedEntry> {
   const absolute = join(root, ...path.split("/"));
+  const parents = await assertUntrackedParents(root, path);
   let pre;
   try {
     pre = await lstat(absolute);
@@ -1901,6 +1932,7 @@ async function captureUntrackedEntry(
     } catch (error) {
       throw untrackedCaptureError(path, error, "capture hook failed for");
     }
+    await assertUntrackedParents(root, path, parents);
     let target: string;
     try {
       target = await readlink(absolute);
@@ -1927,6 +1959,7 @@ async function captureUntrackedEntry(
     } catch (error) {
       throw untrackedCaptureError(path, error, "could not re-stat after reading the symlink target for");
     }
+    await assertUntrackedParents(root, path, parents);
     if (!sameStatIdentity(statIdentityOf(post), statIdentityOf(pre))) {
       throw new GitCheckpointError(`untracked path ${path} changed while being captured`, "untracked_capture_race");
     }
@@ -1940,6 +1973,7 @@ async function captureUntrackedEntry(
   } catch (error) {
     throw untrackedCaptureError(path, error, "capture hook failed for");
   }
+  await assertUntrackedParents(root, path, parents);
   let bytes: Buffer;
   const handle = await open(absolute, constants.O_RDONLY | constants.O_NOFOLLOW).catch((error): never => {
     throw untrackedCaptureError(path, error, "could not open");
@@ -1949,6 +1983,7 @@ async function captureUntrackedEntry(
     if (!sameStatIdentity(statIdentityOf(stat), statIdentityOf(pre))) {
       throw new GitCheckpointError(`untracked path ${path} changed while being captured`, "untracked_capture_race");
     }
+    await assertUntrackedParents(root, path, parents);
     // Fail before allocating: a single file over the cap can never fit in
     // the bounded capture budget.
     if (maxFileBytes !== undefined && stat.size > maxFileBytes) {
@@ -1976,6 +2011,7 @@ async function captureUntrackedEntry(
   } catch (error) {
     throw untrackedCaptureError(path, error, "could not re-stat after read");
   }
+  await assertUntrackedParents(root, path, parents);
   if (!sameStatIdentity(statIdentityOf(post), statIdentityOf(pre))) {
     throw new GitCheckpointError(`untracked path ${path} changed while being captured`, "untracked_capture_race");
   }

@@ -13,6 +13,7 @@ import {
   type BackgroundReviewReadinessTask,
   type BackgroundTaskDefinition,
   type BackgroundTaskKind,
+  type ParentCheckpointSaveResult,
 } from "./background-controller";
 import type { ReattachmentBundle } from "./operation-record";
 import { EVIDENCE_FILTERS, EVIDENCE_LIMIT_DEFAULT, EVIDENCE_LIMIT_MAX, EvidenceCursorError, EvidenceNavigationError, type SubtaskEvidenceSelector } from "./subtask-evidence";
@@ -157,7 +158,7 @@ interface ExecutionToolManagerInput {
   /** Full parent authorization when the top-level active schema is deferred. */
   authorizedTools?: () => string[] | undefined;
   notify?: (message: string) => void | Promise<void>;
-  onAssociationsChanged?: (associations: ExecutionAssociationsSnapshot) => void | Promise<void>;
+  onAssociationsChanged?: (associations: ExecutionAssociationsSnapshot) => ParentCheckpointSaveResult | Promise<ParentCheckpointSaveResult>;
   onExpandedViewChanged?: (expanded: boolean) => void | Promise<void>;
   /** Raw submitted identity for admitted native calls; UI/command starts synthesize it locally. */
   submittedFingerprintFor?: SubmittedToolCallFingerprint;

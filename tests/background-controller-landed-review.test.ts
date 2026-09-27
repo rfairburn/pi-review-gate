@@ -28,12 +28,13 @@ import { advanceRawReviewCheckpoint, captureReviewCheckpoint, compareReviewCheck
 import { SessionStateStore } from "../src/session-state";
 import {
   BackgroundExecutionController,
+  acknowledgeOwnerRetiringSave,
   type BackgroundInspection,
   type BackgroundTaskDefinition,
 } from "../src/execution/background-controller";
 import { inspectOperation } from "../src/execution/operation-actions";
 import { readOperationRecord, writeOperationRecord } from "../src/execution/operation-record";
-import { activeExchangeBaseline, beginAgentRun, createState, rememberUserRequest, setReviewWindowBaseline, setReviewWindowCheckpointBaseline, snapshotOfReviewBaseline, type ReviewGateState } from "../src/state";
+import { activeExchangeBaseline, beginAgentRun, createState, ownedReviewCheckpointDescriptors, rememberUserRequest, setReviewWindowBaseline, setReviewWindowCheckpointBaseline, snapshotOfReviewBaseline, type ReviewGateState } from "../src/state";
 import { initGitRepo, waitFor, waitForAsync } from "./helpers/background-controller-fixtures";
 
 async function waitUntil(predicate: () => boolean | Promise<boolean>, what: string): Promise<void> {
@@ -894,11 +895,11 @@ for (const strategy of ["git", "raw"] as const) {
         const store = new SessionStateStore({ sessionId: `unsaved-${strategy}-${failure}`, sessionFile, cwd: root });
         await store.save(state, { waveRoots: [], bundles: [] }, config);
         controller = new BackgroundExecutionController({ config, state, cwd: () => root, pi: {},
-          ...(failure === "unavailable" ? {} : { onAssociationsChanged: async () => {
+          ...(failure === "unavailable" ? {} : { onAssociationsChanged: () => acknowledgeOwnerRetiringSave(async () => {
             if (failure === "throws" && state.reviewWindow?.baseline?.kind === "checkpoint"
               && state.reviewWindow.baseline.descriptor !== old) throw new Error("sidecar write failed");
             return false;
-          } }),
+          }) }),
         });
         const started = await controller.start([task("unsaved landing", "UNSAVED_LANDING")]);
         await waitFor(() => controller!.inspect(started.executionId).tasks[0]?.state === "landed", 30_000);
@@ -917,6 +918,103 @@ for (const strategy of ["git", "raw"] as const) {
         assert.deepEqual(restored?.state.reviewWindow?.baseline?.kind === "checkpoint"
           ? restored.state.reviewWindow.baseline.descriptor : undefined, old, "restart recovers the last durable owner");
       } finally {
+        await controller?.shutdown().catch(() => undefined);
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+}
+
+// The real extension passes acknowledgeOwnerRetiringSave(persistConfirmedSessionState)
+// to the controller. Its serialized session writer is covered by the entrypoint
+// owner-retirement tests; here the same receipt seam is driven by a real
+// Git landing/sidecar with retirement inside the callback. The controller must
+// not try to release the already-retired owner again. A raw parent cannot
+// enter this real landing path: worker capture requires a Git source root and
+// raw advancement refuses one. Raw session-owner saves are exercised by the
+// entrypoint owner-retirement tests. The bare-save cases above exercise the
+// other half of the contract (controller-owned retirement).
+for (const strategy of ["git"] as const) {
+  for (const distinct of [false, true]) {
+    test(`${strategy} production save-and-retire receipt avoids duplicate release (${distinct ? "distinct" : "shared"} owners)`, async () => {
+      const root = await mkdtemp(join(tmpdir(), `pi-review-parent-receipt-${strategy}-`));
+      const checkpointModule = require("../src/review-checkpoint") as typeof import("../src/review-checkpoint");
+      const originalRelease = checkpointModule.releaseReviewCheckpoint;
+      let controller: BackgroundExecutionController | undefined;
+      try {
+        await initGitRepo(root);
+        const script = await writeLandingExecutorScript(root, [{ sentinel: "RECEIPT_LANDING", file: "landed.txt" }]);
+        const sessionFile = join(root, "conversation.jsonl");
+        await writeFile(sessionFile, "");
+        const config = executionConfig(script);
+        const state = createState();
+        rememberUserRequest(state, "land with a session-owned save and retirement");
+        beginAgentRun(state);
+        const captured = await captureReviewCheckpoint(root, `receipt-${strategy}`);
+        assert.equal(captured.status, "ok");
+        if (captured.status !== "ok") throw new Error("capture failed");
+        const old = captured.value;
+        setReviewWindowCheckpointBaseline(state, { kind: "checkpoint", descriptor: old, cwd: root, capturedAt: new Date().toISOString() });
+        let exchangeOld = old;
+        if (distinct) {
+          const exchange = await captureReviewCheckpoint(root, `receipt-exchange-${strategy}`);
+          assert.equal(exchange.status, "ok");
+          if (exchange.status !== "ok") throw new Error("exchange capture failed");
+          exchangeOld = exchange.value;
+          state.reviewWindow!.activeExchange!.baseline = { kind: "checkpoint", descriptor: exchangeOld, cwd: root, capturedAt: new Date().toISOString() };
+          state.lastQuestionWindow = { ...state.reviewWindow!, id: 99, activeExchange: undefined };
+        }
+        const store = new SessionStateStore({ sessionId: `receipt-${strategy}-${distinct}`, sessionFile, cwd: root });
+        const associations = { waveRoots: [], bundles: [] };
+        assert.equal(await store.save(state, associations, config), true);
+        const releases = new Map<string, number>();
+        const retired = new Set<object>();
+        checkpointModule.releaseReviewCheckpoint = async (cwd, descriptor) => {
+          const id = JSON.stringify(descriptor);
+          releases.set(id, (releases.get(id) ?? 0) + 1);
+          return originalRelease(cwd, descriptor);
+        };
+        const notices: string[] = [];
+        controller = new BackgroundExecutionController({ config, state, cwd: () => root, pi: {}, notify: (message) => { notices.push(message); },
+          onAssociationsChanged: (snapshot) => acknowledgeOwnerRetiringSave(async () => {
+            const saved = await store.save(state, snapshot, config);
+            if (!saved) return false;
+            // Session owner ledger semantics: retire only descriptors absent
+            // from ALL live windows, including lastQuestionWindow.
+            const live = ownedReviewCheckpointDescriptors(state).some(({ descriptor }) => descriptor === old);
+            if (!live && !retired.has(old)) {
+              assert.equal((await checkpointModule.releaseReviewCheckpoint(root, old)).status, "ok");
+              retired.add(old);
+            }
+            if (exchangeOld !== old && !retired.has(exchangeOld)
+              && !ownedReviewCheckpointDescriptors(state).some(({ descriptor }) => descriptor === exchangeOld)) {
+              assert.equal((await checkpointModule.releaseReviewCheckpoint(root, exchangeOld)).status, "ok");
+              retired.add(exchangeOld);
+            }
+            return true;
+          }),
+        });
+        const started = await controller.start([task("receipt landing", "RECEIPT_LANDING")]);
+        await waitUntil(() => {
+          const status = controller!.inspect(started.executionId).tasks[0];
+          if (status?.state === "failed" || status?.state === "conflicted") throw new Error(`landing failed: ${JSON.stringify(status)}`);
+          return status?.state === "landed";
+        }, "production-receipt landing");
+        const landed = controller.inspect(started.executionId).tasks[0]!;
+        assert.equal(landed.activity.some((entry) => /Parent checkpoint owners retained/.test(entry.message)), false);
+        assert.equal(notices.some((message) => /Parent checkpoint owners retained/.test(message)), false);
+        assert.equal(releases.get(JSON.stringify(old)) ?? 0, distinct ? 0 : 1, "shared superseded owner released exactly once");
+        if (distinct) assert.equal(releases.get(JSON.stringify(exchangeOld)), 1, "distinct superseded exchange released exactly once");
+        assert.equal((await loadReviewCheckpoint(root, old)).status, distinct ? "ok" : "failed");
+        if (distinct) assert.equal((await loadReviewCheckpoint(root, exchangeOld)).status, "failed");
+        const restored = await store.restore(root);
+        assert.deepEqual(restored?.state.reviewWindow?.baseline, state.reviewWindow?.baseline);
+        assert.deepEqual(restored?.state.reviewWindow?.activeExchange?.baseline, state.reviewWindow?.activeExchange?.baseline);
+        for (const owner of ownedReviewCheckpointDescriptors(restored!.state)) {
+          assert.equal((await loadReviewCheckpoint(owner.cwd, owner.descriptor)).status, "ok", "every persisted owner remains restorable");
+        }
+      } finally {
+        checkpointModule.releaseReviewCheckpoint = originalRelease;
         await controller?.shutdown().catch(() => undefined);
         await rm(root, { recursive: true, force: true });
       }

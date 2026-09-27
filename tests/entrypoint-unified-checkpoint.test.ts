@@ -187,6 +187,27 @@ for (const gitRoot of [true, false]) {
     }
   });
 
+  test(`${backend} root: a real session-owner release failure stays visible after the durable save`, async () => {
+    const f = await fixture(gitRoot);
+    const checkpointModule = require("../src/review-checkpoint") as typeof import("../src/review-checkpoint");
+    const originalRelease = checkpointModule.releaseReviewCheckpoint;
+    try {
+      const { rt, store, commands } = await start(f);
+      const baseline = (await store.restore(f.cwd))?.state.reviewWindow?.baseline;
+      assert.equal(baseline?.kind, "checkpoint");
+      if (baseline?.kind !== "checkpoint") throw new Error("checkpoint missing");
+      checkpointModule.releaseReviewCheckpoint = async () => ({ status: "failed", reason: "raw_checkpoint_failed", detail: "injected" });
+      await assert.rejects(async () => { await commands.get("review-clear")?.("", rt.ctx); }, /retained checkpoint owner; release failed/);
+      assert.equal((await store.restore(f.cwd))?.state.reviewWindow, undefined, "sidecar was saved before attempting release");
+      assert.equal(await ownerExists(f.cwd, baseline.descriptor), true, "failed release remains pinned for retry");
+      assert.match(rt.notices.join("\n"), /retained checkpoint owner; release failed/);
+    } finally {
+      checkpointModule.releaseReviewCheckpoint = originalRelease;
+      f.restoreGitCeiling();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
   for (const failure of ["unavailable", "throw"] as const) {
     test(`${backend} root: ${failure} sidecar save retains discarded owners`, async () => {
       const f = await fixture(gitRoot);

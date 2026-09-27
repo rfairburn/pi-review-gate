@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
@@ -692,6 +692,97 @@ test("capture races and aborts fail closed and clean up the pin", async () => {
   const aborted = await armGitCheckpoint(repo, "window-abort", { signal: controller.signal });
   assert.equal(aborted.status, "failed");
   if (aborted.status === "failed") assert.equal(aborted.reason, "aborted");
+});
+
+test("nested untracked capture refuses an outside parent before its first stat", async () => {
+  const repo = await initRepo();
+  const outside = await mkTmp();
+  await mkdir(join(repo, "d"));
+  await writeFile(join(repo, "d", "file"), "inside bytes");
+  await writeFile(join(outside, "file"), "outside secret bytes");
+  const windowId = "window-parent-prestat";
+  let listed = false;
+  const result = await armGitCheckpoint(repo, windowId, {
+    faultHooks: {
+      afterUntrackedList: async () => {
+        listed = true;
+        await rename(join(repo, "d"), join(repo, "d-old"));
+        await symlink(outside, join(repo, "d"));
+      },
+      beforeUntrackedRead: () => assert.fail("outside path must be refused before leaf stat/read"),
+    },
+  });
+  assert.ok(listed);
+  assert.equal(result.status, "failed");
+  if (result.status === "failed") assert.equal(result.reason, "untracked_capture_race");
+  assert.notEqual((await gitTolerant(repo, "rev-parse", "--verify", "--quiet", checkpointRefForWindow(windowId))).code, 0);
+  await assert.rejects(stat(join(repo, ".git", "pi-review-gate", "checkpoints", windowId)));
+  assert.equal(await readFile(join(outside, "file"), "utf8"), "outside secret bytes");
+});
+
+test("nested untracked capture refuses a parent redirected outside after listing", async () => {
+  const repo = await initRepo();
+  const outside = await mkTmp();
+  await mkdir(join(repo, "d"));
+  await writeFile(join(repo, "d", "file"), "inside bytes");
+  await writeFile(join(outside, "file"), "outside secret bytes");
+  const windowId = "window-parent-race";
+  let hooked = false;
+  const result = await armGitCheckpoint(repo, windowId, {
+    faultHooks: {
+      beforeUntrackedRead: async (absolute) => {
+        assert.equal(absolute, join(repo, "d", "file"));
+        hooked = true;
+        await rename(join(repo, "d"), join(repo, "d-old"));
+        await symlink(outside, join(repo, "d"));
+      },
+    },
+  });
+  assert.ok(hooked, "the listed nested file must reach the read seam");
+  assert.equal(result.status, "failed");
+  if (result.status === "failed") {
+    assert.equal(result.reason, "untracked_capture_race");
+    assert.ok(!result.detail?.includes("outside secret bytes"));
+  }
+  assert.equal((await gitTolerant(repo, "rev-parse", "--verify", "--quiet", checkpointRefForWindow(windowId))).code !== 0, true);
+  await assert.rejects(stat(join(repo, ".git", "pi-review-gate", "checkpoints", windowId)));
+  assert.equal(await readFile(join(outside, "file"), "utf8"), "outside secret bytes");
+});
+
+test("nested untracked capture detects persistent parent swap even when leaf identity is unchanged", async () => {
+  const repo = await initRepo();
+  const outside = await mkTmp();
+  await mkdir(join(repo, "d"));
+  await writeFile(join(repo, "d", "file"), "same inode bytes");
+  await link(join(repo, "d", "file"), join(outside, "file"));
+  const windowId = "window-parent-identity";
+  const result = await armGitCheckpoint(repo, windowId, {
+    faultHooks: {
+      beforeUntrackedRead: async () => {
+        await rename(join(repo, "d"), join(repo, "d-old"));
+        await symlink(outside, join(repo, "d"));
+      },
+    },
+  });
+  assert.equal(result.status, "failed");
+  if (result.status === "failed") assert.equal(result.reason, "untracked_capture_race");
+  assert.notEqual((await gitTolerant(repo, "rev-parse", "--verify", "--quiet", checkpointRefForWindow(windowId))).code, 0);
+  await assert.rejects(stat(join(repo, ".git", "pi-review-gate", "checkpoints", windowId)));
+});
+
+test("clean nested untracked raw bytes and nested leaf symlinks still arm", async () => {
+  const repo = await initRepo();
+  await mkdir(join(repo, "d"));
+  const raw = Buffer.from([0, 255, 13, 10]);
+  await writeFile(join(repo, "d", "file"), raw);
+  await symlink("file", join(repo, "d", "link"));
+  const result = await armGitCheckpoint(repo, "window-nested-clean");
+  assert.equal(result.status, "ok");
+  if (result.status === "ok") {
+    assert.deepEqual(result.value.record.untracked.map((entry) => entry.path), ["d/file", "d/link"]);
+    assert.deepEqual(Buffer.from(result.value.record.untracked[0]!.contentB64!, "base64"), raw);
+    assert.equal(result.value.record.untracked[1]!.target, "file");
+  }
 });
 
 test("interleaved git add between the two diffs fails closed instead of publishing an empty-patch baseline", async () => {

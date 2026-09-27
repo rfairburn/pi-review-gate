@@ -367,14 +367,24 @@ function isSettledScheduledState(state: BackgroundTaskState): boolean {
   return SCHEDULED_SETTLED_STATES.has(state);
 }
 
+/** A session-sidecar save that also retired every unreferenced checkpoint owner.
+ * Bare `true` means durable save only: the controller must retire its own old owners. */
+export type ParentCheckpointSaveResult = void | boolean | { saved: true; ownersRetired: true };
+
+/** The session writer uses this only after its serialized save-and-retire
+ * operation finishes. A failed/unavailable save cannot issue a receipt. */
+export async function acknowledgeOwnerRetiringSave(saveAndRetire: () => Promise<boolean>): Promise<ParentCheckpointSaveResult> {
+  return await saveAndRetire() ? { saved: true, ownersRetired: true } : false;
+}
+
 interface BackgroundControllerInput {
   pi: unknown;
   config: ReviewGateConfig;
   state: ReviewGateState;
   cwd: () => string;
   notify?: (message: string) => void | Promise<void>;
-  /** Only an explicit true confirms the parent session sidecar was durably saved. */
-  onAssociationsChanged?: (associations: ExecutionAssociationsSnapshot) => void | boolean | Promise<void | boolean>;
+  /** Only true or a save-and-retirement receipt confirms a durable parent sidecar write. */
+  onAssociationsChanged?: (associations: ExecutionAssociationsSnapshot) => ParentCheckpointSaveResult | Promise<ParentCheckpointSaveResult>;
   onExpandedViewChanged?: (expanded: boolean) => void | Promise<void>;
   faults?: BackgroundFaultHooks;
 }
@@ -3955,17 +3965,21 @@ export class BackgroundExecutionController {
       // retiring old owners. A missing/failed acknowledgement leaves both
       // generations intact for restart recovery.
       updates.clear();
-      let saved: void | boolean;
+      let saved: ParentCheckpointSaveResult;
       try {
         saved = await this.input.onAssociationsChanged?.(this.associations());
       } catch (error) {
         await this.reportParentCheckpointRetention(faultContext, `session-sidecar save failed (${messageOf(error)})`);
         return;
       }
-      if (saved !== true) {
+      if (saved !== true && !(saved && typeof saved === "object" && saved.saved === true && saved.ownersRetired === true)) {
         await this.reportParentCheckpointRetention(faultContext, "session-sidecar save was unavailable or did not confirm a durable write");
         return;
       }
+      // The production session writer saves and retires through one serialized
+      // owner ledger. A receipt means its release has already completed; doing
+      // it again here would report a false failure (or race a later owner).
+      if (saved !== true) return;
       // Check ALL live owners after the save (including last-question and an
       // exchange with a distinct descriptor), not just the replaced slots.
       const referenced = new Set(ownedReviewCheckpointDescriptors(this.input.state).map(({ cwd, descriptor }) =>

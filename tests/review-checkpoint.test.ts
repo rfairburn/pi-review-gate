@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
@@ -83,6 +83,47 @@ test("Git tracked/untracked transitions with identical worktree content are not 
   assert.equal(toTracked.status, "ok", JSON.stringify(toTracked));
   if (toTracked.status === "ok") assert.deepEqual(toTracked.value.changes, []);
   for (const checkpoint of [tracked, untracked, trackedAgain]) assert.equal((await releaseReviewCheckpoint(root, checkpoint)).status, "ok");
+}));
+
+test("Git tracked symlinks retain valid targets and reject lossy non-UTF-8 parent comparisons", async () => fixture(async (root) => {
+  await git(root, "init", "-q");
+  await symlink("original", join(root, "link"));
+  await git(root, "add", "link");
+  await git(root, "commit", "-qm", "base");
+  const original = await capture(root, "original");
+  await rm(join(root, "link"));
+  await symlink("updated", join(root, "link"));
+  const valid = await capture(root, "valid");
+  const validComparison = await compareReviewCheckpoints(root, original, valid);
+  assert.equal(validComparison.status, "ok", JSON.stringify(validComparison));
+  if (validComparison.status === "ok") {
+    assert.deepEqual(validComparison.value.changes.map((change) => change.path), ["link"]);
+    assert.equal(validComparison.value.changes[0]?.old?.target, "original");
+    assert.equal(validComparison.value.changes[0]?.new?.target, "updated");
+  }
+
+  // Install raw blob bytes through Git's index and checkout; no text decoding
+  // by Node or the shell is involved in creating either actual symlink.
+  const installTarget = async (byte: number): Promise<void> => {
+    const blobPath = join(root, ".git", "target-bytes");
+    await writeFile(blobPath, Buffer.from([byte]));
+    const { stdout } = await exec("git", ["hash-object", "-w", blobPath], { cwd: root });
+    await git(root, "update-index", "--add", "--cacheinfo", `120000,${stdout.trim()},link`);
+    await git(root, "checkout-index", "-f", "--", "link");
+    assert.deepEqual(await readlink(join(root, "link"), { encoding: "buffer" }), Buffer.from([byte]));
+  };
+  await installTarget(0xff);
+  const invalidFirst = await capture(root, "invalid-first");
+  await installTarget(0xfe);
+  const invalidSecond = await capture(root, "invalid-second");
+  const compared = await compareReviewCheckpoints(root, invalidFirst, invalidSecond);
+  assert.equal(compared.status, "failed", JSON.stringify(compared));
+  if (compared.status === "failed") {
+    assert.equal(compared.reason, "raw_checkpoint_failed");
+    assert.match(compared.detail, /tracked symlink target is not valid UTF-8: link/);
+  }
+  for (const checkpoint of [original, valid, invalidFirst, invalidSecond])
+    assert.equal((await releaseReviewCheckpoint(root, checkpoint)).status, "ok");
 }));
 
 test("raw global excludes only with any project .gitignore; nested patterns stay local", async () => fixture(async (root) => {

@@ -18,11 +18,20 @@ and captures both staged and unstaged Git differences plus raw non-ignored untra
 entries. Tracked content follows Git-normalized newline semantics: the checkpoint is
 not a raw CRLF reproduction guarantee and does not run a separate EOL proof pass.
 Untracked entries, and eligible entries in a non-Git workspace, retain their raw bytes.
+On Windows, checkpoint Git commands use the effective `core.autocrlf` value
+without enabling other system/global Git settings. Unreliable worktree-only
+executable-bit differences are ignored; staged mode changes remain captured.
+For a Windows path stat that omits the volume ID, only that device-ID mismatch
+against an open file handle is normalized; other read/race checks remain strict.
 For non-Git capture, `.gitignore` patterns apply within their directory subtree; if
 any `.gitignore` exists, global Git excludes apply throughout the capture root, while
 without one there are no global excludes. Comparisons use the frozen after-checkpoint
 against separate window and exchange baselines; a checkpoint is not itself a passing
 review or a substitute for either baseline.
+
+On Windows, Git checkpoint record files are still flushed, but an unsupported
+directory fsync is best-effort: a power loss may lose a newly created directory
+entry. Restart verifies the surviving checkpoint rather than assuming it survived.
 
 Exact `write` / `edit` paths and easy shell targets are pre-captured before execution,
 including absolute paths outside the current worktree. Repository baselines,

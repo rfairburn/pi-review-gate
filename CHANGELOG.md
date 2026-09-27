@@ -15,6 +15,36 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.86]
+
+### Fixed
+
+- Allow Git parent baselines on Windows when directory fsync reports `EPERM`,
+  and avoid false untracked and tracked-file races when path stat omits the
+  volume ID that open-handle stat reports. Preserve file flushes and actual
+  race checks.
+- Preserve Windows Git's effective `core.autocrlf` normalization without
+  exposing other ambient Git settings; suppress worktree-only mode noise
+  while retaining staged mode changes. Reload large valid checkpoint records
+  without overflowing Base64 validation.
+- Avoid worktree-only mode noise in private Windows subtask capture while
+  retaining source-index staged executable modes and current worktree bytes;
+  use an opened directory's volume ID to bind capture, landing and recovery
+  when path stat omits it. Stage landing temp files beside their destination
+  across Windows volumes and validate those paths during recovery. Keep the
+  POSIX capture behavior unchanged.
+- Contain synchronous reviewer and delegated executor process-kill errors,
+  including Windows `EINVAL`, without treating a still-live child as exited;
+  retain termination diagnostics and bounded kill escalation.
+- Launch Pi child processes (reviewer prompts, the delegated Pi RPC executor,
+  and compaction recovery) alias-independently through one shared resolver:
+  on Windows the default `pi` resolves to an installed pi.exe or npm's
+  pi.cmd shim JavaScript entry executed by this Node binary without a shell,
+  because a shell-less spawn of the bare name cannot find the cmd shim; POSIX
+  keeps direct execution and configured custom commands keep their exact
+  spawn semantics. A missing or unresolvable default Pi CLI fails closed with
+  an actionable error instead of a raw spawn failure.
+
 ## [0.1.0-dev.85]
 
 ### Changed

@@ -15,6 +15,8 @@ import {
   type WaveEntry,
   type WaveSourceDiscovery,
 } from "../src/execution/wave-repository";
+import { executeWaveLanding, planWaveLanding } from "../src/execution/wave-landing";
+import { integrationRefName } from "../src/execution/wave-worktrees";
 
 const execFileAsync = promisify(execFile);
 
@@ -189,6 +191,9 @@ test("capture — committed Git source produces base commit with parent", async 
     // Verify the base commit has a parent (the source HEAD).
     const parentSha = await gitInRepo(["rev-parse", `${result.baseCommit}^`], result.repositoryPath);
     assert.equal(parentSha, result.discovery.headCommit, "parent should be source HEAD");
+    const sourceTree = (await git(["rev-parse", "HEAD^{tree}"], dir)).trim();
+    const baseTree = await gitInRepo(["rev-parse", `${result.baseCommit}^{tree}`], result.repositoryPath);
+    assert.equal(baseTree, sourceTree, "a clean source must not gain synthetic base-tree changes");
 
     // Verify the tree contains the expected files.
     const treePaths = await gitInRepo(
@@ -198,6 +203,46 @@ test("capture — committed Git source produces base commit with parent", async 
     const paths = treePaths.split("\n").filter(Boolean);
     assert.ok(paths.includes("readme.md"), "tree should contain readme.md");
     assert.ok(paths.includes("app.js"), "tree should contain app.js");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("native Windows wave capture ignores worktree mode noise but preserves staged chmod and worktree content", {
+  skip: process.platform !== "win32",
+}, async () => {
+  const dir = await mkTmp("pi-wave-windows-mode-");
+  try {
+    await git(["init", "--quiet"], dir);
+    await writeFile(join(dir, "mode.txt"), "original\n", "utf8");
+    await git(["add", "mode.txt"], dir);
+    await git(["update-index", "--chmod=+x", "mode.txt"], dir);
+    await git(["commit", "--quiet", "-m", "executable baseline"], dir);
+
+    const clean = await captureWaveBase({ cwd: dir, maxSnapshotBytes: 1_000_000, waveId: "native-win-clean" });
+    const sourceTree = (await git(["rev-parse", "HEAD^{tree}"], dir)).trim();
+    const cleanTree = await gitInRepo(["rev-parse", `${clean.baseCommit}^{tree}`], clean.repositoryPath);
+    assert.equal(cleanTree, sourceTree, "Windows stat must not flip a clean tracked executable mode");
+    assert.ok(clean.sourceIdentity.dev > 0 && clean.sourceIdentity.ino > 0,
+      "capture must bind to an opened directory's strong NTFS volume and inode identity");
+    await gitInRepo(["update-ref", integrationRefName(clean.waveId), clean.baseCommit], clean.repositoryPath);
+    const emptyPlan = await planWaveLanding(clean, clean.baseCommit, dir);
+    assert.deepEqual(emptyPlan.paths, [], "landing planning must verify the same NTFS root identity");
+    const emptyLanding = await executeWaveLanding(emptyPlan, clean);
+    assert.equal(emptyLanding.status, "landed", "landing execution must verify the same NTFS root identity");
+
+    await git(["update-index", "--chmod=-x", "mode.txt"], dir);
+    await writeFile(join(dir, "mode.txt"), "worktree minus\n", "utf8");
+    const minus = await captureWaveBase({ cwd: dir, maxSnapshotBytes: 1_000_000, waveId: "native-win-minus" });
+    assert.match(await gitInRepo(["ls-tree", minus.baseCommit, "mode.txt"], minus.repositoryPath), /^100644 blob /);
+    assert.equal(await gitInRepo(["show", `${minus.baseCommit}:mode.txt`], minus.repositoryPath), "worktree minus");
+
+    await git(["commit", "--quiet", "-m", "nonexecutable baseline"], dir);
+    await git(["update-index", "--chmod=+x", "mode.txt"], dir);
+    await writeFile(join(dir, "mode.txt"), "worktree plus\n", "utf8");
+    const plus = await captureWaveBase({ cwd: dir, maxSnapshotBytes: 1_000_000, waveId: "native-win-plus" });
+    assert.match(await gitInRepo(["ls-tree", plus.baseCommit, "mode.txt"], plus.repositoryPath), /^100755 blob /);
+    assert.equal(await gitInRepo(["show", `${plus.baseCommit}:mode.txt`], plus.repositoryPath), "worktree plus");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

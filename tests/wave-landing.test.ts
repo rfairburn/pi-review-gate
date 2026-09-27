@@ -5,7 +5,7 @@ import { EventEmitter } from "node:events";
 import type { Readable, Writable } from "node:stream";
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { captureWaveBase, WaveCaptureResult } from "../src/execution/wave-repository";
@@ -23,6 +23,7 @@ import {
   executeWaveLanding,
   gitCatFileBlob,
   planWaveLanding,
+  recoverLandingManifest,
   validatePathSafe,
   type LandingPlan,
   type LandingPath,
@@ -112,6 +113,45 @@ async function setupLanding(
     integration: result as WaveIntegrationSuccess,
   };
 }
+
+test("native Windows wave landing applies a worker edit with handle-bound source identity", {
+  skip: process.platform !== "win32",
+}, async () => {
+  const sourceDir = await mkTmp("pi-wl-win-src-");
+  const artifactDir = await mkTmp("pi-wl-win-artifact-");
+  try {
+    await git(["init", "--quiet"], sourceDir);
+    await writeFile(join(sourceDir, "readme.md"), "before\n", "utf8");
+    await git(["add", "readme.md"], sourceDir);
+    await git(["commit", "--quiet", "-m", "base"], sourceDir);
+    const capture = await captureWaveBase({ cwd: sourceDir, artifactDir, maxSnapshotBytes: 1_000_000, waveId: "native-win-landing" });
+    const worker = await createWorkerWorktree(capture, "task-win-edit");
+    await writeFile(join(worker.worktreeRoot, "readme.md"), "after\n", "utf8");
+    const candidate = await normalizeCandidate(capture, worker.worktreeRoot, "task-win-edit", "Windows edit");
+    await pinCommit(capture, candidate.commitSha, { type: "worker", taskId: "task-win-edit" });
+    const integrated = await integrateWave(capture, [{ taskId: "task-win-edit", commitSha: candidate.commitSha }]);
+    assert.equal(integrated.status, "integrated");
+    if (integrated.status !== "integrated") return;
+    const plan = await planWaveLanding(capture, integrated.finalCommitSha, sourceDir);
+    assert.deepEqual(plan.conflicts, []);
+    const landed = await executeWaveLanding(plan, capture);
+    assert.equal(landed.status, "landed", `Landing result: ${JSON.stringify(landed)}`);
+    assert.equal(await readFile(join(sourceDir, "readme.md"), "utf8"), "after\n");
+    if (landed.status !== "landed") return;
+    const manifest = JSON.parse(await readFile(landed.manifestPath, "utf8")) as {
+      paths: Array<{ destination: string; temp: string }>;
+    };
+    assert.equal(manifest.paths.length, 1);
+    assert.equal(dirname(manifest.paths[0]!.temp), dirname(manifest.paths[0]!.destination),
+      "landing temp must be staged in the destination directory, even across Windows volumes");
+    const recovery = await recoverLandingManifest(landed.manifestPath);
+    assert.equal(recovery.status, "terminal", `Recovery result: ${JSON.stringify(recovery)}`);
+    if (recovery.status === "terminal") assert.equal(recovery.state, "completed");
+  } finally {
+    await rm(sourceDir, { recursive: true, force: true });
+    await rm(artifactDir, { recursive: true, force: true });
+  }
+});
 
 test("wave landing supports SHA-256 object-format repositories", async (t) => {
   const sourceDir = await mkTmp("pi-wl-sha256-src-");

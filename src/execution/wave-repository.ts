@@ -4,6 +4,7 @@ import { promises as fs, readlink as fsReadlink, Stats } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
+import { coreFilemodeOverrideFor } from "../git-checkpoint";
 import { GIT_NO_LOCKS_ENV as GIT_ENV, isAbortError, validateSafeId } from "./wave-validation";
 
 const readlinkBuffer = promisify(fsReadlink);
@@ -481,6 +482,52 @@ export interface SourceIdentity {
   ino: number;
 }
 
+/** Obtain the same strong root identity at capture, landing and recovery.
+ * On NTFS, a path stat can omit the volume ID (dev=0) even though an opened
+ * directory handle reports it. Never persist the incomplete path identity. */
+export async function readSourceRootIdentity(root: string): Promise<SourceIdentity> {
+  const before = await fs.lstat(root);
+  if (!before.isDirectory() || before.isSymbolicLink()) {
+    throw new Error(`Source root is not a non-symlink directory: ${root}`);
+  }
+  if (process.platform !== "win32") {
+    if (!Number.isSafeInteger(before.dev) || before.dev <= 0 || !Number.isSafeInteger(before.ino) || before.ino <= 0) {
+      throw new Error(`Source root identity (dev=${before.dev}, ino=${before.ino}) is not stable on this platform. Refusing to capture without a strong directory identity.`);
+    }
+    return { dev: before.dev, ino: before.ino };
+  }
+
+  const held = await fs.open(root, "r");
+  try {
+    const opened = await held.stat();
+    const after = await fs.lstat(root);
+    if (!after.isDirectory() || after.isSymbolicLink()) {
+      throw new Error(`Source root changed while reading its identity: ${root}`);
+    }
+    // Reopen the path while retaining the first handle. This also detects a
+    // cross-volume retarget where both path stats omit dev and inode numbers
+    // happen to coincide; a second handle must name the original volume.
+    const reopened = await fs.open(root, "r");
+    try {
+      const current = await reopened.stat();
+      if (!opened.isDirectory() || !current.isDirectory()
+        || !Number.isSafeInteger(opened.dev) || opened.dev <= 0
+        || !Number.isSafeInteger(opened.ino) || opened.ino <= 0
+        || opened.dev !== current.dev || opened.ino !== current.ino
+        || before.ino !== opened.ino || after.ino !== opened.ino
+        || (before.dev !== 0 && before.dev !== opened.dev)
+        || (after.dev !== 0 && after.dev !== opened.dev)) {
+        throw new Error(`Source root identity changed or is incomplete: ${root}`);
+      }
+      return { dev: opened.dev, ino: opened.ino };
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await held.close();
+  }
+}
+
 /** Provenance returned after a successful wave base capture. */
 export interface WaveCaptureResult {
   /** The wave identifier. */
@@ -596,6 +643,7 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
     throwIfAborted(signal);
     // Re-discover the source on each attempt.
     const discovery = await discoverWaveSource(cwd, signal);
+    const sourceIdentity = await readSourceRootIdentity(discovery.captureRoot);
     const enumeratedPaths = await enumerateWaveSourcePathSet(discovery, signal);
     // Containment check: reject if artifactParent is inside or equal to sourceRoot.
     const sourceRoot = await fs.realpath(discovery.captureRoot);
@@ -680,28 +728,16 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
         // Consistency mismatch — clean up and retry.
         throw new Error(`Capture consistency check failed: ${verification.reason}`);
       }
+      const verifiedIdentity = await readSourceRootIdentity(discovery.captureRoot);
+      if (verifiedIdentity.dev !== sourceIdentity.dev || verifiedIdentity.ino !== sourceIdentity.ino) {
+        throw new Error("Capture consistency check failed: source root identity changed during capture.");
+      }
 
       // Pin the already-created synthetic commit only after consistency passes.
       const baseCommit = staged.commitSha;
       const baseRef = `refs/pi-review-gate/waves/${waveId}/base`;
       await gitCmd("update-ref", [baseRef, baseCommit], repoPath, signal);
       await fs.rm(staged.indexFile, { force: true }).catch(() => {});
-
-      // 8. Capture the immutable source identity (dev+ino).
-      const rootStat = await fs.stat(discovery.captureRoot);
-      // Explicit conservative fallback: on platforms without stable inode
-      // (e.g., Windows where ino=0), refuse to capture rather than silently
-      // weakening the identity binding.
-      if (rootStat.ino === 0 || rootStat.dev === 0) {
-        throw new Error(
-          `Source root identity (dev=${rootStat.dev}, ino=${rootStat.ino}) is not stable on this platform. ` +
-          `Refusing to capture without a strong directory identity.`,
-        );
-      }
-      const sourceIdentity: SourceIdentity = {
-        dev: rootStat.dev,
-        ino: rootStat.ino,
-      };
 
       const capture: WaveCaptureResult = {
         waveId,
@@ -1125,7 +1161,7 @@ async function stageFilesystemTree(
     await gitSpawn(
       [
         "--literal-pathspecs",
-        "-c", "core.filemode=true",
+        "-c", coreFilemodeOverrideFor(process.platform),
         "add", "-A", "-f",
         "--pathspec-from-file=-",
         "--pathspec-file-nul",
@@ -1136,6 +1172,40 @@ async function stageFilesystemTree(
       120_000,
       signal,
     );
+    if (process.platform === "win32" && discovery.gitTopLevel) {
+      // Windows worktree stat cannot reliably supply executable bits. The
+      // private index starts from HEAD, so core.filemode=false avoids spurious
+      // worktree-only modes but would otherwise lose staged index chmods.
+      // Restore only regular-file modes from the source index *after* git add:
+      // the private index still owns the actual current worktree blob bytes.
+      const sourceModes = await readRegularIndexModes(
+        discovery.gitTopLevel,
+        { ...process.env, ...GIT_ENV },
+        signal,
+      );
+      const capturedModes = await readRegularIndexModes(repoPath, env, signal);
+      const executable: string[] = [];
+      const nonExecutable: string[] = [];
+      for (const path of overlayPaths) {
+        const sourceMode = sourceModes.get(path);
+        const capturedMode = capturedModes.get(path);
+        // Deletions, symlinks, gitlinks and unmerged source entries have no
+        // regular stage-0 mode to copy. Never invent one from worktree stat.
+        if (!sourceMode || !capturedMode || sourceMode === capturedMode) continue;
+        (sourceMode === "100755" ? executable : nonExecutable).push(path);
+      }
+      for (const [mode, paths] of [["+x", executable], ["-x", nonExecutable]] as const) {
+        if (paths.length === 0) continue;
+        await gitSpawn(
+          ["update-index", `--chmod=${mode}`, "-z", "--stdin"],
+          repoPath,
+          env,
+          Buffer.from(`${paths.join("\0")}\0`, "utf8"),
+          30_000,
+          signal,
+        );
+      }
+    }
   }
 
   return gitSpawn(["write-tree"], repoPath, env, "", 30_000, signal);
@@ -1152,7 +1222,7 @@ async function determineOverlayPaths(
 
   const changed = await gitNulOutput(
     [
-      "-c", "core.filemode=true",
+      "-c", coreFilemodeOverrideFor(process.platform),
       "diff", "--no-ext-diff", "--ignore-submodules=none",
       "--name-only", "-z", "HEAD", "--",
     ],
@@ -1185,6 +1255,35 @@ async function determineOverlayPaths(
   }
 
   return filterAndSort([...overlay]);
+}
+
+async function readRegularIndexModes(
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  signal?: AbortSignal,
+): Promise<Map<string, "100644" | "100755">> {
+  const { stdout } = await execFileAsync("git", ["ls-files", "--stage", "-z"], {
+    cwd,
+    env,
+    timeout: 30_000,
+    maxBuffer: 64 * 1024 * 1024,
+    signal,
+  });
+  const modes = new Map<string, "100644" | "100755">();
+  for (const entry of stdout.split("\0")) {
+    if (!entry) continue;
+    const tab = entry.indexOf("\t");
+    const header = tab < 0 ? "" : entry.slice(0, tab);
+    const parsed = /^(100644|100755|120000|160000) [0-9a-f]{40}(?:[0-9a-f]{24})? ([0-3])$/.exec(header);
+    if (!parsed || tab === entry.length - 1) {
+      throw new Error("Malformed Git stage entry during Windows wave capture.");
+    }
+    // Unmerged stages cannot represent a source-index mode for worktree
+    // content. Git paths follow the first tab, so embedded tabs remain safe.
+    if (parsed[2] !== "0" || (parsed[1] !== "100644" && parsed[1] !== "100755")) continue;
+    modes.set(normalizeRelative(entry.slice(tab + 1)), parsed[1]);
+  }
+  return modes;
 }
 
 async function createCommitFromTree(

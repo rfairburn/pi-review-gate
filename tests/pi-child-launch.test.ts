@@ -443,17 +443,24 @@ test("delegated Pi RPC executor translates a missing default pi CLI into the act
     await mkdir(artifactDir);
     await withReplacedPath(emptyBin, async () => {
       const adapter = new PiExecutorAdapter({ model: "provider/model", timeoutMs: 30_000, settlementTimeoutMs: 5_000 });
-      const result = await adapter.run({
+      const message = await adapter.run({
         cwd: root,
         prompt: "research task",
         artifactDir,
         turn: 1,
         executorToolCatalog,
+      }).then((result) => {
+        assert.equal(result.code, 1, "a missing default pi CLI must fail the turn");
+        assert.ok(result.failure, "the failure must be reported, not swallowed");
+        return result.failure.message;
+      }, (error: unknown) => {
+        // Windows resolves the default CLI before spawn, so it fails during
+        // adapter initialization; POSIX detects a missing executable on spawn.
+        assert.equal(process.platform, "win32");
+        return error instanceof Error ? error.message : String(error);
       });
-      assert.equal(result.code, 1, "a missing default pi CLI must fail the turn");
-      assert.ok(result.failure, "the failure must be reported, not swallowed");
-      assert.match(result.failure.message, /not found on PATH/);
-      assert.match(result.failure.message, /npm install -g @earendil-works\/pi/);
+      assert.match(message, /not found on PATH/);
+      assert.match(message, /npm install -g @earendil-works\/pi/);
     });
   } finally {
     await rm(root, { recursive: true, force: true });

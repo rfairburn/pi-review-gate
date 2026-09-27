@@ -3345,6 +3345,11 @@ test("repo-local core.autocrlf overrides the system value for the frozen checkpo
     await gitLive(repo, "commit", "-q", "-m", "crlf file");
     // Local override beats system: the effective core.autocrlf is now false.
     await gitLive(repo, "config", "core.autocrlf", "false");
+    // The content is unchanged, but Git may reuse the clean index stat cache
+    // after a config-only change on a fast filesystem. Force a recheck of the
+    // same CRLF bytes so the assertion tests the effective setting, not timing.
+    const recheckTime = new Date(Date.now() + 5_000);
+    await utimes(join(repo, "win.txt"), recheckTime, recheckTime);
     // Live Git (effective false) sees the CRLF worktree as modified...
     assert.match(await gitLive(repo, "status", "--porcelain"), /win\.txt/);
 

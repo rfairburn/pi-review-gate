@@ -253,6 +253,44 @@ export async function triggerResults(hooks: Map<string, Array<(...args: unknown[
   return results.filter((result) => result !== undefined);
 }
 
+/** Invoke a registered tool through Pi's native order: assistant message_end,
+ * tool_execution_start, per-member tool_call preflight, execute callback, and
+ * finally tool_result only when the callback ran. */
+export async function invokeNativeToolCall(
+  hooks: Map<string, Array<(...args: unknown[]) => unknown>>,
+  tool: { name: string; execute: (...args: any[]) => Promise<unknown> },
+  toolCallId: string,
+  params: Record<string, unknown>,
+  ctx?: unknown,
+  validatedParams: Record<string, unknown> = params,
+): Promise<Record<string, unknown>> {
+  await trigger(hooks, "message_end", {
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", id: toolCallId, name: tool.name, arguments: params }],
+    },
+  }, ctx);
+  await trigger(hooks, "tool_execution_start", { toolCallId, toolName: tool.name, args: validatedParams }, ctx);
+  const decisions = await triggerResults(hooks, "tool_call", { toolCallId, toolName: tool.name, input: validatedParams }, ctx);
+  const block = decisions.find((result) => isRecord(result) && result.block === true) as { reason?: string } | undefined;
+  if (block) return { isError: true, content: [{ type: "text", text: block.reason ?? "Blocked before execution." }] };
+
+  const value = await tool.execute(toolCallId, validatedParams, undefined, undefined, ctx);
+  const result = isRecord(value) ? value : {};
+  await trigger(hooks, "tool_result", {
+    toolCallId,
+    toolName: tool.name,
+    input: validatedParams,
+    result,
+    isError: result.isError === true,
+  }, ctx);
+  return result;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export async function waitForFile(path: string): Promise<void> {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {

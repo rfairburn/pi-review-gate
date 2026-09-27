@@ -1489,6 +1489,7 @@ test("salvage — a verified checkpoint is superseded by provably newer committe
       "fs.writeFileSync('ignored/junk.txt','junk\\n');",
       "fs.writeFileSync('base.txt','worker v1\\n');",
       "git('add','.'); git('commit','-qm','session one');",
+      "fs.writeFileSync('ignored/commit-complete.txt','ready\\n');",
       sessionLine("salvage-supersede-newer"),
       HANG_LINE,
     ].join("\n"),
@@ -1501,6 +1502,11 @@ test("salvage — a verified checkpoint is superseded by provably newer committe
   try {
     await waitFor(() => scenario.controller.inspect(scenario.executionId, scenario.taskId).tasks[0]?.state === "running");
     await worktreeFileContentVisible(scenario, "base.txt", "worker v1\n");
+    // The base edit is visible before the executor's synchronous git add/commit
+    // has necessarily finished. Wait for a marker written after git returns, or
+    // interrupting now can kill that child mid-index update and make the
+    // cancellation checkpoint fail on a stale index.lock.
+    await worktreeFileContentVisible(scenario, "ignored/commit-complete.txt", "ready\n");
     await scenario.controller.interrupt({
       executionId: scenario.executionId,
       taskId: scenario.taskId,

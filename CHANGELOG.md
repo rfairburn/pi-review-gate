@@ -37,23 +37,25 @@ dates.
 
 ### Added
 
-- Speed up successive ordinary prompts with safe workspace-snapshot reuse: the
-  first baseline capture of a new unseeded review exchange now reuses verified
-  facts (hash, binary classification, retained content) from the last
-  successfully completed snapshot of the same resolved working directory,
-  retained in a bounded session-local reference across normal review-window
-  close. The capture still enumerates and stats every current path, re-verifies
-  each reused record against the live entry, and recomputes every retain/omit
-  decision against the current limits, so edits, additions, deletions, and limit
-  changes between turns produce exactly the baseline a fresh capture would; the
-  retained snapshot is a reuse source only and never becomes a review baseline.
-  Only completed captures seed the reference — an aborted or failed capture
-  leaves it untouched — and it is cleared on every session start and shutdown
-  (including `/new` and `/reload`) and never reused across different working
-  directories or persisted to disk. An exchange whose baseline is already
-  seeded still skips its baseline capture entirely, and reviewer inputs,
-  verdicts, corrections, cancellation, scheduling, and state restoration are
-  unchanged (Refs #193).
+- Add a native Pi assistant tool-call preflight that blocks later identical members in
+  a batch and adjacent repeated calls before execution, with one retry only after an
+  observed operation error. `ShellStart` and `SubtasksStart` also fail closed against an
+  identical active job/group across intervening groups; unknown liveness blocks the new
+  start rather than risking a duplicate spawn, and blocked starts do not cancel prior
+  work. Distinct calls and multi-task starts remain allowed, and external API wrappers
+  are not intercepted.
+
+- For that `SubtasksStart` liveness check, an older or restored active group without a
+  recorded start-call fingerprint (missing or malformed) is unidentifiable rather than
+  unknown: it cannot match the submitted fingerprint and does not by itself block an
+  otherwise admissible new start. The accepted duplicate risk is disclosed: because the
+  legacy group's original submitted identity is unavailable, an identical new start can
+  duplicate its still-active work — the new start is not proven distinct or safe. Known
+  identical active groups still block across intervening groups even with a legacy group
+  present, and known different active groups remain nonblocking. Unknown liveness still
+  fails closed when the lookup itself is unavailable or throws, and `ShellStart` keeps
+  liveness unknown while any running job lacks a recorded start identity; no cancellation
+  of existing work, no new configuration option.
 
 ## [0.1.0-dev.83]
 

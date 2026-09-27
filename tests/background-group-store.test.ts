@@ -119,6 +119,7 @@ test("writeGroupSnapshot writes exact JSON bytes and readGroup restores them", a
   try {
     const group = makeGroup();
     group.root = await realpath(root);
+    group.startCallFingerprint = "a".repeat(64);
     const active = serializeGroupSnapshot(group, new Map());
     await writeGroupSnapshot(root, active);
 
@@ -136,6 +137,7 @@ test("writeGroupSnapshot writes exact JSON bytes and readGroup restores them", a
     assert.equal(restored.group.executionId, group.executionId);
     assert.equal(restored.group.revision, settled.snapshot.revision);
     assert.equal(restored.group.integritySha256, settled.snapshot.integritySha256);
+    assert.equal(restored.group.startCallFingerprint, group.startCallFingerprint);
     assert.equal(restored.group.tasks[0]!.state, "landed");
     assert.equal(restored.archives.size, 1);
     assert.ok(restored.archives.get(group.tasks[0]!.taskId));

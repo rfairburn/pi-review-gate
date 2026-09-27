@@ -53,10 +53,16 @@ test("unsupported configuration warns and still registers normal tools and setti
     assert.ok(commands.includes("review-settings"));
     assert.ok(tools.includes("ApplyPatch"));
     assert.ok(hooks.has("session_start"));
+    const callId = "config-warning-read";
+    const input = { path: configPath };
+    await trigger(hooks, "message_end", {
+      message: { role: "assistant", content: [{ type: "toolCall", id: callId, name: "read", arguments: input }] },
+    });
     const results = await triggerResults(hooks, "tool_call", {
       cwd: dir,
+      toolCallId: callId,
       toolName: "read",
-      args: { path: configPath },
+      input,
     });
     assert.ok(results.every((result) => !(result as { block?: boolean } | undefined)?.block));
   } finally {

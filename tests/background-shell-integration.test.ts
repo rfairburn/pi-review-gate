@@ -14,6 +14,7 @@ import {
   TRUNCATION_MARKER,
 } from "../src/background-shell/jobs";
 import { BackgroundProcessReadiness } from "../src/background-process-readiness";
+import { toolCallFingerprint } from "../src/tool-call-fingerprint";
 
 // Drives the real extension against real processes. The pure-logic tests in
 // jobs.test.ts cover the wake rules; everything that can only break against an
@@ -25,7 +26,10 @@ interface Sent {
   delivery: any;
 }
 
-function wire() {
+function wire(options: {
+  submittedFingerprintFor?: (toolCallId: string, toolName: string) => string | undefined;
+  onNativeToolError?: (toolCallId: string, toolName: string) => void;
+} = {}) {
   const sent: Sent[] = [];
   const tools: Record<string, any> = {};
   const handlers: Record<string, any> = {};
@@ -34,10 +38,10 @@ function wire() {
     on: (n: string, h: any) => { handlers[n] = h; },
     sendMessage: (msg: any, delivery: any) => { sent.push({ content: msg.content, delivery }); },
   };
-  const controller = registerBackgroundShell(pi);
+  const controller = registerBackgroundShell(pi, options.submittedFingerprintFor, options.onNativeToolError);
   const ctx = { hasUI: false, ui: {} };
-  const call = (name: string, params: any) =>
-    tools[name].execute("id", params, undefined, undefined, ctx);
+  const call = (name: string, params: any, toolCallId = "id") =>
+    tools[name].execute(toolCallId, params, undefined, undefined, ctx);
   return { sent, tools, handlers, call, controller };
 }
 
@@ -102,6 +106,75 @@ describe("bg-shell against real processes", () => {
     // A clean exit is worth delivering, not worth interrupting a tool call for.
     expect(wake.delivery).toEqual({ deliverAs: "followUp", triggerTurn: true });
     expect(await until(() => readiness.snapshot().running.length === 0, T)).toBe(true);
+  });
+
+  it("tracks exact ShellStart call liveness until the job settles", async () => {
+    const { call, controller } = wire();
+    const params = {
+      command: process.platform === "win32" ? "Start-Sleep -Seconds 30" : "sleep 30",
+      label: "duplicate-preflight",
+    };
+    const fingerprint = toolCallFingerprint("ShellStart", params)!;
+    const different = toolCallFingerprint("ShellStart", { ...params, label: "other" })!;
+    const started = await call("ShellStart", params);
+    const id = textOf(started).match(/as (job\d+)/)![1]!;
+    expect(controller.startLiveness(fingerprint)).toEqual({ state: "active", identity: id });
+    expect(controller.startLiveness(different)).toEqual({ state: "inactive" });
+
+    await call("ShellStop", { id });
+    expect(await until(() => controller.snapshot().running.length === 0)).toBe(true);
+    expect(controller.startLiveness(fingerprint)).toEqual({ state: "inactive" });
+  });
+
+  it("persists the admitted raw ShellStart identity after null normalization and refuses missing identity", async () => {
+    const submitted = { command: "sleep 30", label: null };
+    const submittedFingerprint = toolCallFingerprint("ShellStart", submitted)!;
+    const validated = { command: "sleep 30" };
+    const { call, controller } = wire({
+      submittedFingerprintFor: (toolCallId, toolName) =>
+        toolCallId === "native-shell" && toolName === "ShellStart" ? submittedFingerprint : undefined,
+    });
+    const started = await call("ShellStart", validated, "native-shell");
+    expect(started.isError).toBe(false);
+    const id = textOf(started).match(/as (job\d+)/)![1]!;
+    expect(controller.startLiveness(submittedFingerprint)).toEqual({ state: "active", identity: id });
+    expect(controller.startLiveness(toolCallFingerprint("ShellStart", validated)!)).toEqual({ state: "inactive" });
+    await call("ShellStop", { id });
+    expect(await until(() => controller.snapshot().running.length === 0)).toBe(true);
+
+    const observedErrors: Array<[string, string]> = [];
+    const missing = wire({
+      submittedFingerprintFor: () => undefined,
+      onNativeToolError: (toolCallId, toolName) => observedErrors.push([toolCallId, toolName]),
+    });
+    const rejected = await missing.call("ShellStart", validated, "missing-identity");
+    expect(rejected.isError).toBe(true);
+    expect(textOf(rejected)).toContain("submitted ShellStart identity could not be verified");
+    expect(missing.controller.snapshot().running).toEqual([]);
+    expect(observedErrors).toEqual([["missing-identity", "ShellStart"]]);
+  });
+
+  it("reports explicit returned errors from non-start Shell tools without flagging successful results", async () => {
+    const observedErrors: Array<[string, string]> = [];
+    const { call } = wire({
+      onNativeToolError: (toolCallId, toolName) => observedErrors.push([toolCallId, toolName]),
+    });
+    const failures = [
+      ["shell-log-missing", "ShellLog", { id: "missing-log" }],
+      ["shell-send-missing", "ShellSend", { id: "missing-send", text: "hello" }],
+      ["shell-stop-missing", "ShellStop", { id: "missing-stop" }],
+    ] as const;
+    for (const [toolCallId, toolName, params] of failures) {
+      const result = await call(toolName, params, toolCallId);
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain("Error:");
+    }
+    expect(observedErrors).toEqual(failures.map(([toolCallId, toolName]) => [toolCallId, toolName]));
+
+    const listed = await call("ShellList", {}, "shell-list-success");
+    expect(listed.isError).toBe(false);
+    expect(textOf(listed)).toBe("No background jobs.");
+    expect(observedErrors).toEqual(failures.map(([toolCallId, toolName]) => [toolCallId, toolName]));
   });
 
   it("publishes authoritative typed lifecycle revisions", async () => {

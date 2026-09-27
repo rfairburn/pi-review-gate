@@ -14,6 +14,8 @@ import {
 } from "../src/execution/background-controller";
 import { ExecutionToolManager } from "../src/execution/tool";
 import { createState } from "../src/state";
+import { NativeToolCallPreflight } from "../src/tool-call-preflight";
+import { toolCallFingerprint } from "../src/tool-call-fingerprint";
 
 const executionToolNames = [
   "SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksWatch", "SubtasksContinue",
@@ -28,7 +30,17 @@ function executionTool(tools: Array<Record<string, any>>, name: string): Record<
   return tool;
 }
 
-function harness(options: { slowExecutor?: boolean; expandedView?: boolean; researchCapable?: boolean; resourceCapacity?: number; activeTools?: string[]; omitActiveToolSnapshot?: boolean; deferredPiTools?: boolean } = {}) {
+function harness(options: {
+  slowExecutor?: boolean;
+  expandedView?: boolean;
+  researchCapable?: boolean;
+  resourceCapacity?: number;
+  activeTools?: string[];
+  omitActiveToolSnapshot?: boolean;
+  deferredPiTools?: boolean;
+  submittedFingerprintFor?: (toolCallId: string, toolName: string) => string | undefined;
+  onNativeToolError?: (toolCallId: string, toolName: string) => void;
+} = {}) {
   const tools: Array<Record<string, any>> = [];
   const commands: string[] = [];
   const commandHandlers = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
@@ -88,6 +100,8 @@ function harness(options: { slowExecutor?: boolean; expandedView?: boolean; rese
     config,
     state: createState(),
     cwd: () => process.cwd(),
+    submittedFingerprintFor: options.submittedFingerprintFor,
+    onNativeToolError: options.onNativeToolError,
     notify: (message) => { notices.push(message); },
     onExpandedViewChanged: (expanded) => { config.ui = { ...config.ui, subtasksViewExpanded: expanded }; },
   });
@@ -240,7 +254,11 @@ test("typed progress phases determine task state independently of display prose"
 });
 
 test("subtask launch fails closed when Pi cannot provide its native active-tool allowlist", async () => {
-  const { tools, manager } = harness({ omitActiveToolSnapshot: true });
+  const observedErrors: Array<[string, string]> = [];
+  const { tools, manager } = harness({
+    omitActiveToolSnapshot: true,
+    onNativeToolError: (toolCallId, toolName) => observedErrors.push([toolCallId, toolName]),
+  });
   try {
     const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
     const response = await start("missing-tool-snapshot", {
@@ -248,10 +266,154 @@ test("subtask launch fails closed when Pi cannot provide its native active-tool 
     }, undefined, undefined, {});
     assert.equal(response.isError, true);
     assert.match(response.content[0].text, /Execution requires an authoritative parent active-tool snapshot/);
+    assert.deepEqual(observedErrors, [["missing-tool-snapshot", "SubtasksStart"]]);
   } finally {
     await manager.shutdown();
     await manager.detach();
   }
+});
+
+type LivenessGroupFixture = { executionId: string; startCallFingerprint?: string; tasks: Array<{ state: string }> };
+
+function controllerGroups(manager: ExecutionToolManager): Map<string, LivenessGroupFixture> {
+  return (manager as unknown as { controller: { groups: Map<string, LivenessGroupFixture> } }).controller.groups;
+}
+
+test("SubtasksStart liveness covers queued/reviewing work, unidentifiable legacy identity, and settled groups", async () => {
+  const { manager } = harness();
+  const params = {
+    tasks: [{ title: "liveness task", instructions: "remain active", acceptanceCriteria: ["eventually settle"] }],
+  };
+  const fingerprint = toolCallFingerprint("SubtasksStart", params)!;
+  const other = toolCallFingerprint("SubtasksStart", { tasks: [{ title: "different", instructions: "different", acceptanceCriteria: ["different"] }] })!;
+  const groups = controllerGroups(manager);
+  const group: LivenessGroupFixture = {
+    executionId: "exec-liveness-fixture",
+    startCallFingerprint: fingerprint,
+    tasks: [{ state: "queued" }],
+  };
+  groups.set(group.executionId, group);
+  try {
+    for (const state of ["queued", "reviewing"]) {
+      group.tasks[0]!.state = state;
+      assert.deepEqual(manager.startLiveness(fingerprint), { state: "active", identity: group.executionId }, `${state} remains live`);
+    }
+    assert.deepEqual(manager.startLiveness(other), { state: "inactive" });
+
+    delete group.startCallFingerprint; // #195: legacy/restored active group with no trustworthy identity
+    assert.deepEqual(manager.startLiveness(other), { state: "inactive" },
+      "an unidentifiable legacy group does not by itself block a new start (accepted duplicate risk)");
+    group.tasks[0]!.state = "failed";
+    assert.deepEqual(manager.startLiveness(other), { state: "inactive" }, "settled groups do not block nonadjacent starts");
+  } finally {
+    groups.clear();
+    await manager.shutdown();
+    await manager.detach();
+  }
+});
+
+test("unidentifiable legacy active groups alone do not block otherwise admissible SubtasksStart", async () => {
+  const { manager } = harness();
+  const other = toolCallFingerprint("SubtasksStart", { tasks: [{ title: "fresh", instructions: "fresh work", acceptanceCriteria: ["finish fresh"] }] })!;
+  const groups = controllerGroups(manager);
+  try {
+    // A missing fingerprint (pre-fingerprint build) and a malformed one are
+    // both unidentifiable legacy identities, active or not.
+    const missing: LivenessGroupFixture = { executionId: "exec-legacy-missing", tasks: [{ state: "running" }] };
+    groups.set(missing.executionId, missing);
+    assert.deepEqual(manager.startLiveness(other), { state: "inactive" },
+      "a legacy active group with no recorded fingerprint alone does not block a new start");
+
+    const malformed: LivenessGroupFixture = {
+      executionId: "exec-legacy-malformed",
+      startCallFingerprint: "not-a-fingerprint",
+      tasks: [{ state: "queued" }],
+    };
+    groups.set(malformed.executionId, malformed);
+    assert.deepEqual(manager.startLiveness(other), { state: "inactive" },
+      "unidentifiable legacy groups do not produce unknown and cannot block by themselves");
+  } finally {
+    groups.clear();
+    await manager.shutdown();
+    await manager.detach();
+  }
+});
+
+test("a known matching active group still blocks in the presence of unidentifiable legacy groups", async () => {
+  const { manager } = harness();
+  const fingerprint = toolCallFingerprint("SubtasksStart", {
+    tasks: [{ title: "known identity", instructions: "remain active", acceptanceCriteria: ["eventually settle"] }],
+  })!;
+  const other = toolCallFingerprint("SubtasksStart", { tasks: [{ title: "different", instructions: "different", acceptanceCriteria: ["different"] }] })!;
+  const groups = controllerGroups(manager);
+  // Inserted first, so the liveness scan visits the legacy group before the
+  // matching one: it must not shadow or short-circuit the known match.
+  const legacy: LivenessGroupFixture = { executionId: "exec-legacy-first", tasks: [{ state: "running" }] };
+  const known: LivenessGroupFixture = {
+    executionId: "exec-known-second",
+    startCallFingerprint: fingerprint,
+    tasks: [{ state: "queued" }],
+  };
+  groups.set(legacy.executionId, legacy);
+  groups.set(known.executionId, known);
+  try {
+    assert.deepEqual(manager.startLiveness(fingerprint), { state: "active", identity: known.executionId },
+      "a known identical active group blocks across an intervening legacy group");
+    assert.deepEqual(manager.startLiveness(other), { state: "inactive" }, "distinct starts remain admissible");
+  } finally {
+    groups.clear();
+    await manager.shutdown();
+    await manager.detach();
+  }
+});
+
+test("unknown liveness from a failing or unavailable controller still fails closed at preflight", async () => {
+  const emit = async (
+    hooks: Map<string, Array<(...args: unknown[]) => unknown>>,
+    name: string,
+    ...args: unknown[]
+  ): Promise<unknown[]> => {
+    const results: unknown[] = [];
+    for (const handler of hooks.get(name) ?? []) results.push(await handler(...args));
+    return results;
+  };
+  type StartDecision = { block?: boolean; reason?: string } | undefined;
+  const makeRuntime = (subtaskStart?: (fingerprint: string) => { state: "active" | "unknown" | "inactive"; identity?: string }) => {
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const preflight = new NativeToolCallPreflight({ subtaskStartLiveness: subtaskStart });
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+    };
+    assert.equal(preflight.registerLifecycleHooks(pi), true);
+    assert.equal(preflight.registerToolCallHook(pi), true);
+    return async (id: string): Promise<StartDecision> => {
+      const input = { tasks: [{ title: "Failing liveness", instructions: "remain active", acceptanceCriteria: ["eventually finish"] }] };
+      await emit(hooks, "message_end", {
+        message: { role: "assistant", content: [{ type: "toolCall", id, name: "SubtasksStart", arguments: input }] },
+      });
+      await emit(hooks, "tool_execution_start", { toolCallId: id, toolName: "SubtasksStart", args: input });
+      const results = await emit(hooks, "tool_call", { toolCallId: id, toolName: "SubtasksStart", input });
+      return results.find((value) => value !== undefined) as StartDecision;
+    };
+  };
+
+  // A throwing liveness lookup fails closed.
+  const failing = makeRuntime(() => { throw new Error("liveness service unavailable"); });
+  const thrown = await failing("subtask-liveness-throw");
+  assert.equal(thrown?.block, true);
+  assert.match(thrown?.reason ?? "", /could not verify whether identical work is active/);
+
+  // A missing (unavailable) liveness service fails closed the same way.
+  const unavailable = makeRuntime();
+  const absent = await unavailable("subtask-liveness-absent");
+  assert.equal(absent?.block, true);
+  assert.match(absent?.reason ?? "", /could not verify whether identical work is active/);
+
+  // A healthy inactive lookup still admits the start.
+  const healthy = makeRuntime(() => ({ state: "inactive" }));
+  assert.equal(await healthy("subtask-liveness-healthy"), undefined);
 });
 
 test("execution review readiness reports every unfinished task and omits terminal tasks", async () => {
@@ -542,12 +704,17 @@ test("/subtasks-view toggles a live multiline widget without entering model cont
 });
 
 test("SubtasksStart result explains that queued work may have startup delay", async () => {
-  const { tools, manager } = harness();
+  const observedErrors: Array<[string, string]> = [];
+  const { tools, manager } = harness({
+    onNativeToolError: (toolCallId, toolName) => observedErrors.push([toolCallId, toolName]),
+  });
   const execute = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
   const inspect = executionTool(tools, "SubtasksInspect").execute as ExecuteTool;
   const result = await execute("start-delay", {
     tasks: [{ title: "Waiting work", instructions: "Do bounded work", acceptanceCriteria: ["Work is complete"] }],
   }, undefined, undefined, {});
+  assert.equal(result.isError, false);
+  assert.deepEqual(observedErrors, [], "successful async start is not later task-status evidence");
   assert.match(result.content[0].text, /Queued tasks may wait for executor startup or available pool capacity/);
   assert.match(result.content[0].text, /Scheduler at acceptance: 1 task\(s\) assigned and starting, 0 still pending dispatch/);
   assert.match(result.content[0].text, /Assignment is not proof that executor startup has completed/);
@@ -583,6 +750,80 @@ test("SubtasksStart result explains that queued work may have startup delay", as
   assert.match(diagnostic.content[0].text, /Scheduler: \d+\/4 workers active;/);
   assert.match(diagnostic.content[0].text, /timing \(ms\): total \d+; queued \d+; capture \d+; execution \d+; review \d+; landing \d+/);
   await manager.shutdown();
+});
+
+test("every registered Subtasks tool reports explicit returned errors, but not successful returns", async () => {
+  const observedErrors: Array<[string, string]> = [];
+  const { tools, manager } = harness({
+    onNativeToolError: (toolCallId, toolName) => observedErrors.push([toolCallId, toolName]),
+  });
+  try {
+    for (const [index, name] of executionToolNames.entries()) {
+      const toolCallId = `invalid-${name}`;
+      const response = await (executionTool(tools, name).execute as ExecuteTool)(
+        toolCallId,
+        { unsupported: true },
+        undefined,
+        undefined,
+        {},
+      );
+      assert.equal(response.isError, true, `${name} returns its explicit structured error`);
+      assert.match(response.content[0].text, /unsupported is not valid for action/);
+      assert.deepEqual(observedErrors.at(-1), [toolCallId, name], `${name} reports the exact native call identity`);
+      assert.equal(observedErrors.length, index + 1);
+    }
+
+    const success = await (executionTool(tools, "SubtasksMarkClean").execute as ExecuteTool)(
+      "mark-clean-success",
+      {},
+      undefined,
+      undefined,
+      {},
+    );
+    assert.equal(success.isError, false);
+    assert.equal(observedErrors.length, executionToolNames.length, "successful results are not reported as returned errors");
+  } finally {
+    await manager.shutdown();
+    await manager.detach();
+  }
+});
+
+test("native SubtasksStart persists only the admitted raw submitted fingerprint and fails closed without it", async () => {
+  const rawInput = {
+    tasks: [{ title: "Raw identity", instructions: "Remain active", acceptanceCriteria: ["Eventually finish"] }],
+    kind: null,
+  };
+  const validatedInput = { tasks: rawInput.tasks };
+  const submittedFingerprint = toolCallFingerprint("SubtasksStart", rawInput)!;
+  const validatedFingerprint = toolCallFingerprint("SubtasksStart", validatedInput)!;
+  const { tools, manager } = harness({
+    slowExecutor: true,
+    submittedFingerprintFor: (toolCallId, toolName) =>
+      toolCallId === "native-raw-start" && toolName === "SubtasksStart" ? submittedFingerprint : undefined,
+  });
+  try {
+    const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+    const started = await start("native-raw-start", validatedInput, undefined, undefined, {});
+    assert.equal(started.isError, false);
+    assert.equal(manager.startLiveness(submittedFingerprint).state, "active");
+    assert.equal(manager.startLiveness(validatedFingerprint).state, "inactive", "normalized callback params are not the persisted identity");
+  } finally {
+    await manager.shutdown();
+    await manager.detach();
+  }
+
+  const missing = harness({ submittedFingerprintFor: () => undefined });
+  try {
+    const start = executionTool(missing.tools, "SubtasksStart").execute as ExecuteTool;
+    const result = await start("native-identity-missing", validatedInput, undefined, undefined, {});
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /identity could not be verified/);
+    assert.match(result.content[0].text, /no group or tasks were created/);
+    assert.deepEqual(missing.manager.associations().groupRoots, []);
+  } finally {
+    await missing.manager.shutdown();
+    await missing.manager.detach();
+  }
 });
 
 test("new downstream tasks start full-active when deferred Pi tools are disabled", async () => {

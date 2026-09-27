@@ -517,20 +517,26 @@ test("session_shutdown runs review cleanup before the #84 diagnostic reset", asy
     };
     const shutdownHandlers = hooks.get("session_shutdown")!;
     const sessionStartHandlers = hooks.get("session_start")!;
-    // Pin the exact counts for this minimal host (no web tools, no background
-    // shell): review shutdown + diagnostic reset, review session_start +
-    // diagnostic rebuild. An earlier registration must fail loudly here
-    // instead of silently shifting the positional references below.
+    // The minimal host has the review lifecycle and #84 bridge on both
+    // session hooks. Anchor the bridge to its exclusive session_tree
+    // registration, then identify the review hooks by exclusion rather than
+    // relying on handler-array positions.
+    const sessionTree = (hooks.get("session_tree") ?? []).at(-1);
+    assert.ok(sessionTree, "the #84 bridge must register session_tree");
+    const diagnosticShutdown = shutdownHandlers.find((handler) => sequence(handler) === sequence(sessionTree!) + 1);
+    const diagnosticSessionStart = sessionStartHandlers.find((handler) => sequence(handler) === sequence(sessionTree!) - 1);
+    assert.ok(diagnosticShutdown, "the bridge's shutdown reset must follow its session_tree registration");
+    assert.ok(diagnosticSessionStart, "the bridge's session_start rebuild must precede its session_tree registration");
     assert.equal(shutdownHandlers.length, 2, "review shutdown + diagnostic reset");
     assert.equal(sessionStartHandlers.length, 2, "review session_start + diagnostic rebuild");
-    const reviewShutdown = sequence(shutdownHandlers[0]!);
-    const diagnosticShutdown = sequence(shutdownHandlers[shutdownHandlers.length - 1]!);
-    const mainSessionStart = sequence(sessionStartHandlers[0]!);
-    const diagnosticSessionStart = sequence(sessionStartHandlers[sessionStartHandlers.length - 1]!);
-    assert.ok(reviewShutdown < mainSessionStart, "review shutdown must be registered before the main session_start lifecycle hook");
-    assert.ok(mainSessionStart < diagnosticShutdown, "diagnostic bridge must register after the critical lifecycle hooks");
-    assert.ok(reviewShutdown < diagnosticShutdown, "review cleanup must be dispatched before the diagnostic shutdown reset");
-    assert.ok(diagnosticSessionStart < diagnosticShutdown, "diagnostic bridge registers its own hooks before its shutdown reset");
+    const reviewShutdown = shutdownHandlers.find((handler) => handler !== diagnosticShutdown);
+    const mainSessionStart = sessionStartHandlers.find((handler) => handler !== diagnosticSessionStart);
+    assert.ok(reviewShutdown, "the review shutdown handler must remain distinct from the diagnostic reset");
+    assert.ok(mainSessionStart, "the review session_start handler must remain distinct from the diagnostic rebuild");
+    assert.ok(sequence(reviewShutdown!) < sequence(mainSessionStart!), "review shutdown must be registered before the main session_start lifecycle hook");
+    assert.ok(sequence(mainSessionStart!) < sequence(diagnosticShutdown!), "diagnostic bridge must register after the critical lifecycle hooks");
+    assert.ok(sequence(reviewShutdown!) < sequence(diagnosticShutdown!), "review cleanup must be dispatched before the diagnostic shutdown reset");
+    assert.ok(sequence(diagnosticSessionStart!) < sequence(diagnosticShutdown!), "diagnostic bridge registers its own hooks before its shutdown reset");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

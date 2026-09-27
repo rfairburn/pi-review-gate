@@ -231,6 +231,8 @@ jobs:
         run: npm ci
       - name: Build test bundle
         run: npm run build:test
+      - name: Windows Git checkpoint smoke (Node 24)
+        run: node --test --test-name-pattern="native Windows Git checkpoint arms and reloads" dist-test/tests/git-checkpoint.test.js
       - name: Run Windows shell tests (native)
         run: >-
           node --test

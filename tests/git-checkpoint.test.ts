@@ -224,6 +224,11 @@ test("native Windows Git checkpoint arms and reloads after a new untracked file"
   }
   assert.deepEqual(after.value.record.untracked.map((entry) => entry.path), ["test.txt"]);
   assert.equal(Buffer.from(after.value.record.untracked[0]!.contentB64!, "base64").toString("utf8"), text);
+  const next = await armGitCheckpoint(repo, "windows-next-prompt");
+  assert.equal(next.status, "ok", next.status !== "ok" ? next.detail : "");
+  if (next.status === "ok") {
+    assert.equal(Buffer.from(next.value.record.untracked[0]!.contentB64!, "base64").toString("utf8"), text);
+  }
 });
 
 test("restore exactly reconstructs staged, unstaged, and untracked state", async () => {

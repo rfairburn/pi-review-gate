@@ -116,9 +116,8 @@
  * configuration is audited up front and refused when it defines diff
  * programs or clean/smudge filters (the only commands that could run them).
  *
- * POSIX only, matching the rest of the extension. This module is
- * self-contained (node builtins only) and is NOT yet wired into the
- * extension entrypoint; it exposes a clear core API for later integration:
+ * Directory fsync `EPERM` is best-effort on Windows; other sync errors remain
+ * strict. This module is self-contained (node builtins only) and exposes:
  * `armGitCheckpoint`, `loadGitCheckpoint`, `verifyGitCheckpointPin`,
  * `restoreGitCheckpoint`, `compareToGitCheckpoint`, `compareGitCheckpoints`,
  * `releaseGitCheckpointPin`, `advanceGitCheckpoint`, plus record and
@@ -1613,11 +1612,17 @@ async function publishRecordDurable(scratchDir: string, encoded: string): Promis
   }
 }
 
-/** fsync a directory so a rename into it is durable (POSIX). */
+/** fsync a directory so a rename into it is durable where supported. */
 async function syncDirectory(dir: string): Promise<void> {
   const dirHandle = await open(dir, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0));
   try {
-    await dirHandle.sync();
+    try {
+      await dirHandle.sync();
+    } catch (error) {
+      // Windows can reject directory fsync. File fsync remains required, but
+      // without this flush a newly created directory entry may not survive a crash.
+      if (process.platform !== "win32" || (error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+    }
   } finally {
     await dirHandle.close().catch(() => undefined);
   }

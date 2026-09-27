@@ -200,6 +200,8 @@ jobs:
           PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"
       - name: Build test bundle
         run: npm run build:test
+      - name: Windows Git checkpoint directory-fsync smoke
+        run: node --test --test-name-pattern="native Windows Git checkpoint arms and reloads" dist-test/tests/git-checkpoint.test.js
       - name: Launcher tests (helper pipeline + native .cmd cases)
         run: node --test dist-test/tests/launcher-cmd.test.js
       - name: Launcher development-build seam on native Windows

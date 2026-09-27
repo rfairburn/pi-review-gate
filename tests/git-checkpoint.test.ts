@@ -196,6 +196,15 @@ test("arm produces a small durable record and leaves index/worktree untouched", 
   assert.equal(await git(repo, "status", "--porcelain"), statusBefore);
 });
 
+test("native Windows Git checkpoint arms and reloads despite directory fsync EPERM", { skip: process.platform !== "win32" }, async () => {
+  const repo = await initRepo();
+  const arm = await armGitCheckpoint(repo, "windows-directory-fsync");
+  assert.equal(arm.status, "ok", arm.status !== "ok" ? arm.detail : "");
+  if (arm.status !== "ok") return;
+  const loaded = await loadGitCheckpoint(repo, arm.value.descriptor);
+  assert.equal(loaded.status, "ok", loaded.status !== "ok" ? loaded.detail : "");
+});
+
 test("restore exactly reconstructs staged, unstaged, and untracked state", async () => {
   const repo = await initRepo();
   await writeFile(join(repo, "f1.txt"), "one\n");

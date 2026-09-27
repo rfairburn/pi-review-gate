@@ -205,6 +205,27 @@ test("native Windows Git checkpoint arms and reloads despite directory fsync EPE
   assert.equal(loaded.status, "ok", loaded.status !== "ok" ? loaded.detail : "");
 });
 
+test("native Windows Git checkpoint arms and reloads after a new untracked file", { skip: process.platform !== "win32" }, async () => {
+  const repo = await initRepo();
+  const before = await armGitCheckpoint(repo, "windows-before-edit");
+  assert.equal(before.status, "ok", before.status !== "ok" ? before.detail : "");
+  const path = join(repo, "test.txt");
+  const text = "Lorem ipsum dolor sit amet.\n\nConsectetur adipiscing elit.\n";
+  await writeFile(path, text);
+  const after = await armGitCheckpoint(repo, "windows-after-edit");
+  if (after.status !== "ok") {
+    const pre = await lstat(path);
+    const handle = await open(path, "r");
+    let opened;
+    try { opened = await handle.stat(); } finally { await handle.close(); }
+    const post = await lstat(path);
+    const identities = [pre, opened, post].map(({ dev, ino, size, mtimeMs, ctimeMs, mode }) => ({ dev, ino, size, mtimeMs, ctimeMs, mode }));
+    assert.fail(`${after.reason}: ${after.detail}; stat identities: ${JSON.stringify(identities)}`);
+  }
+  assert.deepEqual(after.value.record.untracked.map((entry) => entry.path), ["test.txt"]);
+  assert.equal(Buffer.from(after.value.record.untracked[0]!.contentB64!, "base64").toString("utf8"), text);
+});
+
 test("restore exactly reconstructs staged, unstaged, and untracked state", async () => {
   const repo = await initRepo();
   await writeFile(join(repo, "f1.txt"), "one\n");

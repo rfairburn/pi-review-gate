@@ -12,10 +12,14 @@ import {
   compareToGitCheckpoint,
   compareGitCheckpoints,
   checkpointRefForWindow,
+  coreFilemodeOverrideFor,
   decodeGitCheckpointDescriptor,
   decodeGitCheckpointRecord,
   encodeGitCheckpointDescriptor,
   encodeGitCheckpointRecord,
+  GIT_CHECKPOINT_RECORD_FORMAT,
+  GitCheckpointError,
+  isStrictBase64,
   loadGitCheckpoint,
   restoreGitCheckpoint,
   releaseGitCheckpointPin,
@@ -51,6 +55,25 @@ async function gitTolerant(repo: string, ...args: string[]): Promise<{ code: num
     const err = error as { code?: number | string; stdout?: string; stderr?: string };
     return { code: typeof err.code === "number" ? err.code : 1, stdout: err.stdout ?? "", stderr: err.stderr ?? "" };
   }
+}
+
+/**
+ * Like git(), but re-reads process.env on every call so GIT_CONFIG_* values
+ * pinned mid-test (see withPinnedSystemConfig) actually reach the command.
+ */
+async function gitLive(repo: string, ...args: string[]): Promise<string> {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    GIT_OPTIONAL_LOCKS: "0",
+    GIT_PAGER: "cat",
+    PAGER: "cat",
+    GIT_AUTHOR_NAME: "Test",
+    GIT_AUTHOR_EMAIL: "test@test.com",
+    GIT_COMMITTER_NAME: "Test",
+    GIT_COMMITTER_EMAIL: "test@test.com",
+  };
+  const { stdout } = await execFileAsync("git", args, { cwd: repo, env });
+  return stdout;
 }
 
 /** Recursively collect file bytes under a directory as relative path → Buffer. */
@@ -3247,4 +3270,326 @@ test("selective advancement rejects retained untracked file/descendant conflicts
     0,
   );
   await assert.rejects(stat(join(repo, ".git", "pi-review-gate", "checkpoints", "window-advance-untracked-conflict-new")));
+});
+
+// ── #204: safe Windows Git EOL/mode handling and linear base64 validation ───
+
+/**
+ * Run `fn` with the ambient Git configuration pinned: system config replaced
+ * by `systemConfigPath`, global config disabled, so the effective
+ * core.autocrlf comes from exactly one deterministic source (repo-local
+ * overrides still win, as in real precedence).
+ */
+async function withPinnedSystemConfig(systemConfigPath: string, fn: () => Promise<void>): Promise<void> {
+  const previousSystem = process.env.GIT_CONFIG_SYSTEM;
+  const previousGlobal = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_SYSTEM = systemConfigPath;
+  process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+  try {
+    await fn();
+  } finally {
+    if (previousSystem === undefined) delete process.env.GIT_CONFIG_SYSTEM;
+    else process.env.GIT_CONFIG_SYSTEM = previousSystem;
+    if (previousGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+    else process.env.GIT_CONFIG_GLOBAL = previousGlobal;
+  }
+}
+
+/** ~285 KiB of CRLF text: large enough that a false full-file diff is obvious. */
+function crlfFixture(): string {
+  return Array.from({ length: 20_000 }, (_, i) => `line ${i}\r\n`).join("");
+}
+
+test("system-level core.autocrlf is frozen for capture: CRLF checkout arms without a false full-file patch", async () => {
+  const repo = await initRepo();
+  const wrapperDir = await mkTmp();
+  const systemConfig = join(wrapperDir, "system-gitconfig");
+  await writeFile(systemConfig, "[core]\n\tautocrlf = true\n");
+  await withPinnedSystemConfig(systemConfig, async () => {
+    // CRLF worktree content committed through the same ambient config: blobs are LF.
+    await writeFile(join(repo, "win.txt"), crlfFixture());
+    await gitLive(repo, "add", "win.txt");
+    await gitLive(repo, "commit", "-q", "-m", "crlf file");
+    // Sanity: with the ambient config visible, live Git sees the worktree as clean.
+    assert.equal((await gitLive(repo, "status", "--porcelain")).trim(), "");
+
+    const indexBefore = await readFile(indexPath(repo));
+    const arm = await armGitCheckpoint(repo, "window-sys-autocrlf");
+    assert.equal(arm.status, "ok", arm.status !== "ok" ? `${arm.reason}: ${arm.detail ?? ""}` : "");
+    if (arm.status !== "ok") return;
+    // The frozen effective value (true) must suppress the false CRLF diff:
+    // no tracked changes at all → both patches empty, small record.
+    assert.equal(arm.value.stats.stagedPatchBytes, 0);
+    assert.equal(arm.value.stats.unstagedPatchBytes, 0);
+    assert.ok(arm.value.stats.recordBytes < 4096, `record too large: ${arm.value.stats.recordBytes}`);
+
+    // Fresh-process reload path: descriptor load re-validates everything.
+    const loaded = await loadGitCheckpoint(repo, arm.value.descriptor);
+    assert.equal(loaded.status, "ok", loaded.status !== "ok" ? `${loaded.reason}: ${loaded.detail ?? ""}` : "");
+    if (loaded.status === "ok") {
+      assert.equal(loaded.value.record.stagedPatchB64, "");
+      assert.equal(loaded.value.record.unstagedPatchB64, "");
+    }
+    assert.deepEqual(await readFile(indexPath(repo)), indexBefore);
+  });
+});
+
+test("repo-local core.autocrlf overrides the system value for the frozen checkpoint", async () => {
+  const repo = await initRepo();
+  const wrapperDir = await mkTmp();
+  const systemConfig = join(wrapperDir, "system-gitconfig");
+  await writeFile(systemConfig, "[core]\n\tautocrlf = true\n");
+  await withPinnedSystemConfig(systemConfig, async () => {
+    await writeFile(join(repo, "win.txt"), crlfFixture());
+    await gitLive(repo, "add", "win.txt");
+    await gitLive(repo, "commit", "-q", "-m", "crlf file");
+    // Local override beats system: the effective core.autocrlf is now false.
+    await gitLive(repo, "config", "core.autocrlf", "false");
+    // Live Git (effective false) sees the CRLF worktree as modified...
+    assert.match(await gitLive(repo, "status", "--porcelain"), /win\.txt/);
+
+    const arm = await armGitCheckpoint(repo, "window-local-autocrlf");
+    assert.equal(arm.status, "ok", arm.status !== "ok" ? `${arm.reason}: ${arm.detail ?? ""}` : "");
+    if (arm.status !== "ok") return;
+    // ...and the capture must use that effective value: the CRLF deviation is
+    // captured as a real unstaged change. Had the probe used the system value
+    // (true) instead, both patches would be empty.
+    assert.equal(arm.value.stats.stagedPatchBytes, 0);
+    assert.ok(
+      arm.value.stats.unstagedPatchBytes > 0,
+      "effective local core.autocrlf=false must not normalize the CRLF worktree",
+    );
+    const unstaged = Buffer.from(arm.value.record.unstagedPatchB64, "base64").toString("utf8");
+    assert.match(unstaged, /win\.txt/);
+
+    const loaded = await loadGitCheckpoint(repo, arm.value.descriptor);
+    assert.equal(loaded.status, "ok", loaded.status !== "ok" ? `${loaded.reason}: ${loaded.detail ?? ""}` : "");
+  });
+});
+
+test("mid-capture ambient core.autocrlf change is detected by the final audit", async () => {
+  const repo = await initRepo();
+  const wrapperDir = await mkTmp();
+  const systemConfig = join(wrapperDir, "system-gitconfig");
+  await writeFile(systemConfig, "[core]\n\tautocrlf = false\n");
+  const indexBefore = await readFile(indexPath(repo));
+  await withPinnedSystemConfig(systemConfig, async () => {
+    const race = await armGitCheckpoint(repo, "window-ambient-autocrlf-race", {
+      faultHooks: {
+        afterInitialAudit: async () => {
+          // Rewrite the SYSTEM config mid-capture: invisible to the nulled-scope
+          // config listing, visible only through the effective-value probe that
+          // is mixed into the audit proof.
+          await writeFile(systemConfig, "[core]\n\tautocrlf = true\n");
+        },
+      },
+    });
+    assert.equal(race.status, "failed");
+    if (race.status === "failed") assert.equal(race.reason, "capture_inconsistent");
+  });
+  assert.deepEqual(await readFile(indexPath(repo)), indexBefore);
+});
+
+test("checkpoint core.filemode override is Windows-only; staged mode changes stay captured", async () => {
+  assert.equal(coreFilemodeOverrideFor("win32"), "core.filemode=false");
+  assert.equal(coreFilemodeOverrideFor("darwin"), "core.filemode=true");
+  assert.equal(coreFilemodeOverrideFor("linux"), "core.filemode=true");
+
+  const repo = await initRepo();
+  await writeFile(join(repo, "tool.sh"), "#!/bin/sh\necho ok\n");
+  await git(repo, "add", "tool.sh");
+  await git(repo, "commit", "-q", "-m", "tool");
+  // Staged mode-only change: index 755, worktree brought along to 755 so the
+  // only delta is base→index (the staged patch must keep it on every platform).
+  await git(repo, "update-index", "--chmod=+x", "tool.sh");
+  await chmod(join(repo, "tool.sh"), 0o755);
+
+  const arm = await armGitCheckpoint(repo, "window-filemode-staged");
+  assert.equal(arm.status, "ok", arm.status !== "ok" ? `${arm.reason}: ${arm.detail ?? ""}` : "");
+  if (arm.status !== "ok") return;
+  const staged = Buffer.from(arm.value.record.stagedPatchB64, "base64").toString("utf8");
+  assert.match(staged, /old mode 100644/);
+  assert.match(staged, /new mode 100755/);
+  // Worktree agrees with the index: no unstaged delta on any platform.
+  assert.equal(arm.value.stats.unstagedPatchBytes, 0);
+});
+
+test("native Windows Git checkpoint ignores worktree permission noise but keeps staged mode changes", { skip: process.platform !== "win32" }, async () => {
+  const repo = await initRepo();
+  await writeFile(join(repo, "tool.sh"), "echo ok\n");
+  await git(repo, "add", "tool.sh");
+  await git(repo, "commit", "-q", "-m", "tool");
+  // Staged mode-only change (644 → 755 in the index; worktree untouched).
+  await git(repo, "update-index", "--chmod=+x", "tool.sh");
+  try {
+    // Worktree permission noise: flip the NTFS read-only attribute. With the
+    // Windows-pinned core.filemode=false this must not produce an unstaged diff.
+    await chmod(join(repo, "tool.sh"), 0o444);
+    const arm = await armGitCheckpoint(repo, "window-ntfs-filemode");
+    assert.equal(arm.status, "ok", arm.status !== "ok" ? `${arm.reason}: ${arm.detail ?? ""}` : "");
+    if (arm.status !== "ok") return;
+    const staged = Buffer.from(arm.value.record.stagedPatchB64, "base64").toString("utf8");
+    assert.match(staged, /old mode 100644/);
+    assert.match(staged, /new mode 100755/);
+    assert.equal(arm.value.stats.unstagedPatchBytes, 0, "worktree permission noise must not leak into the unstaged capture");
+  } finally {
+    await chmod(join(repo, "tool.sh"), 0o644).catch(() => undefined);
+  }
+});
+
+test("native Windows Git checkpoint compare survives the NTFS lstat/fstat dev mismatch", { skip: process.platform !== "win32" }, async () => {
+  const repo = await initRepo();
+  await writeFile(join(repo, "README.md"), "first line\nsecond line\n");
+  await commitAll(repo, "readme");
+  const arm = await armGitCheckpoint(repo, "window-ntfs-compare");
+  assert.equal(arm.status, "ok", arm.status !== "ok" ? `${arm.reason}: ${arm.detail ?? ""}` : "");
+  if (arm.status !== "ok") return;
+  // Modified README + includeContents: the tracked worktree read pairs an
+  // open-time fstat (dev = volume ID on NTFS) with a post-read path lstat
+  // (dev = 0). Without the dev-only normalization this false-fails with
+  // "changed while being read".
+  await writeFile(join(repo, "README.md"), "first line\nedited line\nthird line\n");
+  const compared = await compareToGitCheckpoint(repo, arm.value.encoded, {}, true);
+  assert.equal(compared.status, "ok", compared.status !== "ok" ? `${compared.reason}: ${compared.detail ?? ""}` : "");
+  if (compared.status !== "ok") return;
+  assert.deepEqual(compared.value.trackedChanges.map((c) => c.path), ["README.md"]);
+  const change = compared.value.trackedChanges[0]!;
+  assert.equal(change.status, "modified");
+  assert.deepEqual(change.newBytes, Buffer.from("first line\nedited line\nthird line\n"));
+});
+
+test("tracked compare reads fail closed when the file mutates inside the read window", async () => {
+  const repo = await initRepo();
+  await writeFile(join(repo, "doc.txt"), "base\n");
+  await commitAll(repo, "doc");
+  const arm = await armGitCheckpoint(repo, "window-read-race");
+  assert.equal(arm.status, "ok", arm.status !== "ok" ? `${arm.reason}: ${arm.detail ?? ""}` : "");
+  if (arm.status !== "ok") return;
+  // Make doc.txt a tracked change so includeContents reads it from the worktree.
+  await writeFile(join(repo, "doc.txt"), "changed\n");
+  let raced = false;
+  const compared = await compareToGitCheckpoint(
+    repo,
+    arm.value.encoded,
+    {
+      faultHooks: {
+        afterTrackedRead: async (absolutePath) => {
+          if (!raced && absolutePath.endsWith("doc.txt")) {
+            raced = true;
+            // Mutation landing between the read and the post-read identity check.
+            await writeFile(absolutePath, "mutated!\n");
+          }
+        },
+      },
+    },
+    true,
+  );
+  assert.equal(raced, true, "the tracked read seam must fire for the changed file");
+  assert.equal(compared.status, "failed");
+  if (compared.status === "failed") {
+    assert.equal(compared.reason, "git_failed");
+    assert.match(compared.detail ?? "", /changed while being read/);
+  }
+});
+
+test("large durable records reload through linear strict base64; malformed large payloads are rejected", async () => {
+  // Unit: 8+ MiB payloads — the previous group-repetition regex stack-overflows here.
+  const big = randomBytes(9 * 1024 * 1024);
+  const validB64 = big.toString("base64");
+  assert.ok(validB64.length > 8 * 1024 * 1024, `expected an 8+ MiB base64 payload, got ${validB64.length}`);
+  assert.equal(isStrictBase64(validB64), true);
+  // Structural rejections at scale and in miniature.
+  assert.equal(isStrictBase64(validB64.slice(0, 5_000_000) + "!" + validB64.slice(5_000_001)), false);
+  assert.equal(isStrictBase64(validB64.slice(0, validB64.length - 1)), false);
+  for (const ok of ["", "ABCD", "ABC=", "AB=="]) {
+    assert.equal(isStrictBase64(ok), true, `should accept ${JSON.stringify(ok)}`);
+  }
+  for (const bad of ["AAA", "AAAA=", "A===", "=AAA", "AB=C", "AB CD", "A=B=CDAB"]) {
+    assert.equal(isStrictBase64(bad), false, `should reject ${JSON.stringify(bad)}`);
+  }
+
+  // Record boundary: a genuinely large valid record decodes; one corrupted
+  // character in the large field is rejected as malformed.
+  const crafted = {
+    format: GIT_CHECKPOINT_RECORD_FORMAT,
+    armId: randomBytes(8).toString("hex"),
+    base: "0".repeat(40),
+    ref: checkpointRefForWindow("window-linear-b64"),
+    objectFormat: "sha1",
+    unstagedPatchB64: "",
+    untracked: [],
+  };
+  const validRecord = decodeGitCheckpointRecord(JSON.stringify({ ...crafted, stagedPatchB64: validB64 }));
+  assert.equal(validRecord.stagedPatchB64, validB64);
+  const corrupted = validB64.slice(0, 6_000_000) + "!" + validB64.slice(6_000_001);
+  assert.throws(
+    () => decodeGitCheckpointRecord(JSON.stringify({ ...crafted, stagedPatchB64: corrupted })),
+    (error: unknown) => error instanceof GitCheckpointError && error.reason === "malformed_record",
+  );
+
+  // End-to-end: stage a ~9 MiB binary, arm, and reload through the descriptor
+  // (stat/size gate → digest gate → linear strict decode).
+  const repo = await initRepo();
+  await writeFile(join(repo, "big.bin"), big);
+  await git(repo, "add", "big.bin");
+  const arm = await armGitCheckpoint(repo, "window-big-record");
+  assert.equal(arm.status, "ok", arm.status !== "ok" ? `${arm.reason}: ${arm.detail ?? ""}` : "");
+  if (arm.status !== "ok") return;
+  assert.ok(
+    arm.value.record.stagedPatchB64.length > 8 * 1024 * 1024,
+    `staged patch b64 too small: ${arm.value.record.stagedPatchB64.length}`,
+  );
+  const loaded = await loadGitCheckpoint(repo, arm.value.descriptor);
+  assert.equal(loaded.status, "ok", loaded.status !== "ok" ? `${loaded.reason}: ${loaded.detail ?? ""}` : "");
+  if (loaded.status === "ok") {
+    assert.equal(loaded.value.record.stagedPatchB64, arm.value.record.stagedPatchB64);
+  }
+});
+
+test("non-canonical base64 in a published record fails closed at frozen comparison", async () => {
+  const repo = await initRepo();
+  // 5 bytes → 8-char base64 ending in a single "=" padding character.
+  const raw = Buffer.from([0x00, 0x01, 0x02, 0x03, 0x04]);
+  await writeFile(join(repo, "notes.bin"), raw);
+  const arm = await armGitCheckpoint(repo, "window-noncanonical");
+  assert.equal(arm.status, "ok", arm.status !== "ok" ? `${arm.reason}: ${arm.detail ?? ""}` : "");
+  if (arm.status !== "ok") return;
+
+  const recordPath = join(
+    repo,
+    ".git",
+    "pi-review-gate",
+    "checkpoints",
+    "window-noncanonical",
+    `arm-${arm.value.record.armId}`,
+    "record.json",
+  );
+  const original = JSON.parse(await readFile(recordPath, "utf8"));
+  // The original published record must still load cleanly before tampering.
+  assert.equal((await loadGitCheckpoint(repo, arm.value.descriptor)).status, "ok");
+
+  // Tamper the last data character so its unused low bits are non-zero:
+  // same decoded byte count (size gate passes), structurally valid base64,
+  // but not what Buffer.toString("base64") would emit.
+  const entry = original.untracked.find((e: { path: string }) => e.path === "notes.bin");
+  assert.ok(entry && typeof entry.contentB64 === "string" && entry.contentB64.endsWith("="),
+    `unexpected captured encoding: ${JSON.stringify(entry)}`);
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const b64 = entry.contentB64 as string;
+  const index = alphabet.indexOf(b64[b64.length - 2]!);
+  assert.ok(index >= 0 && (index & 0x03) === 0, "captured encoding must start canonical");
+  entry.contentB64 = `${b64.slice(0, b64.length - 2)}${alphabet[(index + 1) % 64]}=`;
+  const tamperedBytes = Buffer.from(JSON.stringify(original), "utf8");
+  const tamperedDescriptor: GitCheckpointDescriptor = {
+    ...arm.value.descriptor,
+    digest: createHash("sha256").update(tamperedBytes).digest("hex"),
+  };
+  await writeFile(recordPath, tamperedBytes);
+
+  const compared = await compareGitCheckpoints(repo, tamperedDescriptor, tamperedDescriptor);
+  assert.equal(compared.status, "failed");
+  if (compared.status === "failed") {
+    assert.equal(compared.reason, "malformed_record");
+    assert.match(compared.detail ?? "", /non-canonical/);
+  }
 });

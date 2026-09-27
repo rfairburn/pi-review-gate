@@ -30,23 +30,25 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
 // Everything created by this fixture stays in the compiled test's ignored
 // directory. A fresh activate() and new hook map model process restart without
 // replacing the persistent Pi session identity or reusing in-memory state.
-async function fixture(gitRoot: boolean) {
+async function fixture(gitRoot: boolean, nestedCwd = false) {
   const root = await mkdtemp(join(__dirname, "unified-restart-smoke-"));
   const priorCeiling = process.env.GIT_CEILING_DIRECTORIES;
   process.env.GIT_CEILING_DIRECTORIES = root;
-  const cwd = join(root, "workspace");
+  const repoRoot = join(root, "workspace");
+  const cwd = nestedCwd ? join(repoRoot, "nested") : repoRoot;
   const sessionDir = join(root, "session");
-  await mkdir(cwd);
+  await mkdir(cwd, { recursive: true });
   await mkdir(sessionDir);
   const sessionFile = join(sessionDir, "conversation.jsonl");
   await writeFile(sessionFile, "");
   const callsPath = join(sessionDir, "calls.txt");
   const promptPath = join(sessionDir, "prompt.txt");
+  const reviewerCwdPath = join(sessionDir, "reviewer-cwd.txt");
   const configPath = join(sessionDir, "config.json");
   await writeFile(configPath, JSON.stringify({
     ...indexTestConfig,
     retainBundles: "always",
-    externalAgents: agentCatalog(countingPassReviewerWithPromptDump("fake", callsPath, promptPath)),
+    externalAgents: agentCatalog(countingPassReviewerWithPromptDump("fake", callsPath, promptPath, nestedCwd ? reviewerCwdPath : undefined)),
     review: {
       primaryReviewers: [{ source: "external", id: "fake" }],
       subtaskReviewers: [{ source: "external", id: "fake" }],
@@ -56,21 +58,28 @@ async function fixture(gitRoot: boolean) {
   process.env.PI_REVIEW_GATE_CONFIG = configPath;
   delete process.env.PI_REVIEW_GATE_DISABLED;
   if (gitRoot) {
-    await git(cwd, "init", "-q");
-    await git(cwd, "config", "core.autocrlf", "false");
+    await git(repoRoot, "init", "-q");
+    await git(repoRoot, "config", "core.autocrlf", "false");
   }
-  await writeFile(join(cwd, "keep.txt"), "untouched clean tracked\n");
+  await writeFile(join(repoRoot, "keep.txt"), "untouched clean tracked\n");
   await writeFile(join(cwd, "work.txt"), "original\n");
+  const workPath = nestedCwd ? "nested/work.txt" : "work.txt";
+  const trackedBaselinePaths = ["keep.txt", workPath];
+  if (nestedCwd) {
+    await writeFile(join(repoRoot, ".gitignore"), "ignored-parent.txt\n");
+    await writeFile(join(repoRoot, "sibling.txt"), "committed sibling baseline\n");
+    trackedBaselinePaths.push(".gitignore", "sibling.txt");
+  }
   if (gitRoot) {
-    await git(cwd, "add", "keep.txt", "work.txt");
-    await git(cwd, "commit", "-q", "-m", "seed");
+    await git(repoRoot, "add", ...trackedBaselinePaths);
+    await git(repoRoot, "commit", "-q", "-m", "seed");
     await writeFile(join(cwd, "work.txt"), "staged baseline\n");
-    await git(cwd, "add", "work.txt");
+    await git(repoRoot, "add", workPath);
     await writeFile(join(cwd, "work.txt"), "staged baseline\nunstaged baseline\n");
   }
   await writeFile(join(cwd, "loose.bin"), Buffer.from([0, 255, 3, 8]));
   const store = new SessionStateStore({ sessionId, sessionFile, cwd });
-  return { root, cwd, sessionFile, callsPath, promptPath, store, async cleanup() {
+  return { root, repoRoot, cwd, sessionFile, callsPath, promptPath, reviewerCwdPath, store, async cleanup() {
     if (priorCeiling === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
     else process.env.GIT_CEILING_DIRECTORIES = priorCeiling;
     await rm(root, { recursive: true, force: true });
@@ -147,6 +156,82 @@ for (const kind of ["git", "raw"] as const) {
     } finally { await f.cleanup(); }
   });
 }
+
+test("nested Git cwd restores its selected Pi root and reviews frozen repository-wide paths", async () => {
+  const f = await fixture(true, true);
+  try {
+    const first = await activateSession(f);
+    await trigger(first.hooks, "input", { cwd: f.cwd, source: "user", text: "edit sibling files" }, first.ctx);
+    await trigger(first.hooks, "before_agent_start", { cwd: f.cwd }, first.ctx);
+    const initial = (await f.store.restore(f.cwd))?.state.reviewWindow?.baseline;
+    assert.equal(initial?.kind, "checkpoint");
+    if (initial?.kind !== "checkpoint") throw new Error("missing nested Git checkpoint");
+    assert.equal(initial.cwd, f.cwd, "persisted session baseline keeps the selected nested cwd");
+    assert.equal(initial.descriptor.kind, "git");
+
+    const resumed = await activateSession(f, "reload");
+    assert.match(resumed.notices.join("\n"), /restored conversation state revision/);
+    const restored = (await f.store.restore(f.cwd))?.state.reviewWindow?.baseline;
+    assert.equal(restored?.kind === "checkpoint" ? restored.cwd : undefined, f.cwd);
+    assert.deepEqual(restored?.kind === "checkpoint" ? restored.descriptor : undefined, initial.descriptor);
+    await trigger(resumed.hooks, "before_agent_start", { cwd: f.cwd }, resumed.ctx);
+    await trigger(resumed.hooks, "tool_call", {
+      cwd: f.cwd, toolName: "bash", input: { command: "printf changed > work.txt && printf changed > ../sibling.txt && touch ../eligible-sibling.txt" },
+    }, resumed.ctx);
+    await writeFile(join(f.cwd, "work.txt"), "nested work after restart sentinel\n");
+    await writeFile(join(f.repoRoot, "sibling.txt"), "tracked sibling after restart sentinel\n");
+    await writeFile(join(f.repoRoot, "eligible-sibling.txt"), "eligible sibling frozen sentinel\n");
+    await writeFile(join(f.repoRoot, "ignored-parent.txt"), "ignored sibling must stay out\n");
+    await triggerAgentEnd(resumed.hooks, {
+      cwd: f.cwd, messages: [{ role: "assistant", content: "edited repository siblings" }],
+    }, resumed.ctx);
+
+    assert.equal(await readFile(f.callsPath, "utf8"), "1");
+    assert.equal(await readFile(f.reviewerCwdPath, "utf8"), f.cwd, "reviewer child process stays in the selected nested cwd");
+    assert.match(resumed.notices.join("\n"), /review gate: passed/);
+    const window = (await f.store.restore(f.cwd))?.state.reviewWindow;
+    const exchange = window?.exchanges.at(-1);
+    assert.deepEqual(exchange?.workspaceChanges.map((change) => change.path).sort(), ["eligible-sibling.txt", "nested/work.txt", "sibling.txt"]);
+    assert.match(exchange?.workspacePatch ?? "", /nested work after restart sentinel/);
+    assert.match(exchange?.workspacePatch ?? "", /tracked sibling after restart sentinel/);
+    assert.match(exchange?.workspacePatch ?? "", /eligible sibling frozen sentinel/);
+    assert.doesNotMatch(exchange?.workspacePatch ?? "", /ignored-parent\.txt/);
+    const prompt = await readFile(f.promptPath, "utf8");
+    assert.ok(prompt.includes(`Workspace:\n${f.repoRoot}`));
+    assert.ok(prompt.includes(`Selected Pi/reviewer process cwd: ${f.cwd}`));
+    assert.match(prompt, /nested\/work\.txt/);
+    assert.match(prompt, /nested work after restart sentinel/);
+    assert.match(prompt, /sibling\.txt/);
+    assert.match(prompt, /tracked sibling after restart sentinel/);
+    assert.match(prompt, /eligible-sibling\.txt/);
+    assert.match(prompt, /eligible sibling frozen sentinel/);
+    assert.doesNotMatch(prompt, /ignored sibling must stay out/);
+    assert.ok(window?.bundleDir);
+    const manifest = JSON.parse(await readFile(join(window!.bundleDir!, "manifest.json"), "utf8"));
+    assert.equal(manifest.workspace, f.repoRoot);
+    assert.equal(manifest.selectedCwd, f.cwd);
+    const metadata = JSON.parse(await readFile(join(window!.bundleDir!, "reviews", "0001", "metadata.json"), "utf8"));
+    assert.equal(metadata.cwd, f.cwd);
+    assert.equal(metadata.workspaceRoot, f.repoRoot);
+    const evidence = JSON.parse(await readFile(join(window!.bundleDir!, "reviews", "0001", "evidence.json"), "utf8"));
+    assert.ok(evidence.changedCandidatePaths.includes("nested/work.txt"));
+    assert.ok(evidence.changedCandidatePaths.includes("sibling.txt"));
+    assert.ok(evidence.changedCandidatePaths.includes("eligible-sibling.txt"));
+    assert.ok(evidence.candidates.some((candidate: { path: string }) => candidate.path === "nested/work.txt"));
+    assert.ok(evidence.candidates.some((candidate: { path: string }) => candidate.path === "sibling.txt"));
+    assert.ok(evidence.candidates.some((candidate: { path: string }) => candidate.path === "eligible-sibling.txt"));
+    const expectedEventPaths = ["eligible-sibling.txt", "nested/work.txt", "sibling.txt"];
+    const evidenceEvent = evidence.events.find((event: { phase: string; toolName: string }) => event.phase === "tool_call" && event.toolName === "bash");
+    assert.deepEqual(evidenceEvent?.candidatePaths.slice().sort(), expectedEventPaths);
+    assert.match(evidenceEvent?.detail ?? "", /\.\.\/sibling\.txt/, "the original command remains in audit detail");
+    const exchangeEvents = JSON.parse(await readFile(join(window!.bundleDir!, "exchanges", "0001", "tool-events.json"), "utf8"));
+    const exchangeEvent = exchangeEvents.find((event: { phase: string; toolName: string }) => event.phase === "tool_call" && event.toolName === "bash");
+    assert.deepEqual(exchangeEvent?.candidatePaths.slice().sort(), expectedEventPaths);
+    assert.match(exchangeEvent?.detail ?? "", /\.\.\/sibling\.txt/, "exchange tool-event detail preserves the original command");
+    const exchangeMarkdown = await readFile(join(window!.bundleDir!, "exchanges", "0001", "tool-events.md"), "utf8");
+    assert.match(exchangeMarkdown, /paths=nested\/work\.txt,sibling\.txt,eligible-sibling\.txt/);
+  } finally { await f.cleanup(); }
+});
 
 for (const [kind, damage] of [
   ["raw", "corrupt record"], ["raw", "missing record"],

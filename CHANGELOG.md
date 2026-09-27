@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.86]
+
+### Fixed
+
+- When Pi runs below the top level of a Git repository, parent review now pins the
+  enclosing repository instead of failing at the checkpoint root guard. Frozen
+  tracked and eligible untracked sibling changes and review evidence use
+  repository-relative paths across restart. Pi and reviewer process directories,
+  delegated task capture and landing, and non-Git review remain unchanged.
+
 ## [0.1.0-dev.85]
 
 ### Changed

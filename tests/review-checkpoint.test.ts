@@ -27,6 +27,50 @@ async function capture(root: string, id: string): Promise<ReviewCheckpointDescri
   return result.value;
 }
 
+test("nested Git review checkpoints cover repository-relative sibling changes without following live bytes", async () => fixture(async (root) => {
+  const repository = join(root, "repo");
+  const cwd = join(repository, "nested", "selected");
+  await mkdir(cwd, { recursive: true });
+  await git(repository, "init", "-q");
+  await writeFile(join(repository, "sibling.txt"), "committed sibling baseline\n");
+  await git(repository, "add", "sibling.txt");
+  await git(repository, "commit", "-qm", "base");
+
+  const before = await capture(cwd, "nested-before");
+  assert.equal(before.kind, "git");
+  assert.equal((await loadReviewCheckpoint(cwd, before)).status, "ok");
+  await writeFile(join(repository, "sibling.txt"), "frozen sibling after\n");
+  await writeFile(join(repository, "eligible-sibling.txt"), Buffer.from([0, 255, 11]));
+  const after = await capture(cwd, "nested-after");
+  await writeFile(join(repository, "sibling.txt"), "later live sibling bytes\n");
+  await writeFile(join(repository, "eligible-sibling.txt"), "later live untracked bytes\n");
+
+  const compared = await compareReviewCheckpoints(cwd, before, after);
+  assert.equal(compared.status, "ok", JSON.stringify(compared));
+  if (compared.status === "ok") {
+    assert.deepEqual(compared.value.changes.map((change) => change.path), ["eligible-sibling.txt", "sibling.txt"]);
+    assert.equal(compared.value.changes.find((change) => change.path === "sibling.txt")?.old?.bytes?.toString(), "committed sibling baseline\n");
+    assert.equal(compared.value.changes.find((change) => change.path === "sibling.txt")?.new?.bytes?.toString(), "frozen sibling after\n");
+    assert.deepEqual(compared.value.changes.find((change) => change.path === "eligible-sibling.txt")?.new?.bytes, Buffer.from([0, 255, 11]));
+  }
+
+  const otherRepository = join(root, "other-repo");
+  await mkdir(otherRepository);
+  await git(otherRepository, "init", "-q");
+  await writeFile(join(otherRepository, "other.txt"), "other repository\n");
+  await git(otherRepository, "add", "other.txt");
+  await git(otherRepository, "commit", "-qm", "other");
+  const other = await capture(otherRepository, "nested-other");
+  assert.equal((await loadReviewCheckpoint(otherRepository, before)).status, "failed");
+  if (before.kind === "git" && other.kind === "git") {
+    const tampered = { ...before, checkpoint: { ...before.checkpoint, gitDir: other.checkpoint.gitDir } };
+    assert.equal((await loadReviewCheckpoint(cwd, tampered)).status, "failed");
+  }
+  assert.equal((await releaseReviewCheckpoint(cwd, before)).status, "ok");
+  assert.equal((await releaseReviewCheckpoint(cwd, after)).status, "ok");
+  assert.equal((await releaseReviewCheckpoint(otherRepository, other)).status, "ok");
+}));
+
 test("Git clean tracked bytes are referenced, while staged, unstaged and untracked bytes are recoverable", async () => fixture(async (root) => {
   await git(root, "init", "-q");
   await writeFile(join(root, "clean"), Buffer.alloc(1024 * 1024, 0x51));

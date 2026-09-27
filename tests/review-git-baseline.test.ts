@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmod, lstat, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { createWorkspaceSnapshot } from "../src/capture";
 import { registerCommands } from "../src/commands";
-import { captureReviewCheckpoint, loadReviewCheckpoint } from "../src/review-checkpoint";
+import { captureReviewCheckpoint, loadReviewCheckpoint, releaseReviewCheckpoint } from "../src/review-checkpoint";
 import { createEvidenceState, recordToolCallEvidence } from "../src/evidence";
 import { armGitCheckpoint, type GitCheckpointDescriptor } from "../src/git-checkpoint";
 import { collectPausedReviewExchange, runAskReviewer, runReview } from "../src/review";
@@ -110,6 +110,69 @@ test("Git-ignored in-root evidence remains reviewable using its pre-checkpoint f
     assert.equal(output.changes[0]?.newContent, "after\n");
   } finally { await rm(repo, { recursive: true, force: true }); }
 });
+test("nested Git-ignored evidence deletion reports a repository-root-relative path", async () => {
+  const repo = await mkdtemp(join(process.cwd(), ".nested-ignored-evidence-"));
+  const cwd = join(repo, "app");
+  try {
+    await mkdir(cwd, { recursive: true });
+    await git(repo, "init", "-q");
+    await writeFile(join(repo, ".gitignore"), "ignored.txt\n");
+    await writeFile(join(repo, "tracked.txt"), "base\n");
+    await git(repo, "add", ".");
+    await git(repo, "commit", "-qm", "base");
+    await writeFile(join(repo, "ignored.txt"), "before\n");
+    const captured = await captureReviewCheckpoint(cwd, "nested-ignored-deletion");
+    assert.equal(captured.status, "ok", JSON.stringify(captured));
+    if (captured.status !== "ok") return;
+
+    const evidence = createEvidenceState();
+    await recordToolCallEvidence({
+      state: evidence, cwd, toolName: "write", toolInput: { path: "../ignored.txt" },
+      snapshotOptions: { maxFileBytes: config.maxFileBytes, maxSnapshotBytes: config.maxSnapshotBytes },
+    });
+    await rm(join(repo, "ignored.txt"));
+    const output = await runReview({
+      cwd, request: "delete ignored file", config, evidence,
+      before: { kind: "checkpoint", descriptor: captured.value, cwd, capturedAt: new Date().toISOString() },
+    });
+    assert.equal(output.changed, true);
+    assert.deepEqual(output.changes.map((change) => [change.path, change.status]), [["ignored.txt", "deleted"]]);
+  } finally { await rm(repo, { recursive: true, force: true }); }
+});
+
+test("/review-continue captures a repository-root checkpoint while preserving nested session cwd", async () => {
+  const repo = await mkdtemp(join(process.cwd(), ".review-continue-nested-"));
+  const cwd = join(repo, "nested");
+  await mkdir(cwd);
+  try {
+    await git(repo, "init", "-q");
+    await writeFile(join(repo, "baseline.txt"), "base\n");
+    await git(repo, "add", "baseline.txt");
+    await git(repo, "commit", "-qm", "base");
+    const state = createState();
+    beginAgentRun(state);
+    const window = state.reviewWindow!;
+    window.lastCappedFollowUp = "capped feedback";
+    const commands = new Map<string, (args: string, ctx: unknown) => Promise<unknown>>();
+    registerCommands({
+      pi: {
+        registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => Promise<unknown> }) { commands.set(name, options.handler); },
+        sendUserMessage: async () => undefined,
+      },
+      cwd: () => cwd, config, state,
+      onStateChanged: async () => undefined,
+    });
+    await commands.get("review-continue")!("", {});
+    const response = window.activeExchange?.baseline;
+    assert.equal(response?.kind, "checkpoint");
+    if (response?.kind !== "checkpoint") throw new Error("missing response checkpoint");
+    assert.equal(response.cwd, cwd);
+    assert.equal(response.descriptor.kind, "git");
+    assert.equal((await loadReviewCheckpoint(cwd, response.descriptor)).status, "ok");
+    assert.equal((await releaseReviewCheckpoint(cwd, response.descriptor)).status, "ok");
+  } finally { await rm(repo, { recursive: true, force: true }); }
+});
+
 test("/review-continue capture failure preserves capped authorization for retry", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-continue-capture-"));
   try {

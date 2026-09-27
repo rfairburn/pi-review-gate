@@ -5,7 +5,7 @@ import { basename, join, relative, resolve, isAbsolute, sep } from "node:path";
 import { resolveReviewers, reviewerConfigFingerprint, reviewerDisplayLabel, reviewerDisplayLabels, unresolvedReviewerSelectionsFor, type DeciderConfig, type ReviewGateConfig } from "./config";
 import { createReviewerQuestionBundle, createReviewBundle, removeReviewBundle, syncReviewWindowArtifacts, type ReviewBundle } from "./bundle";
 import { BINARY_SAMPLE_BYTES, looksBinary, compareFileSnapshots, compareSnapshots, createPathSnapshot, createWorkspaceSnapshot, type ChangedFile, type FileSnapshot, type SnapshotOmission, type WorkspaceSnapshot } from "./capture";
-import { captureReviewCheckpoint, compareReviewCheckpoints, loadReviewCheckpoint, releaseReviewCheckpoint, type ReviewCheckpointDescriptor, type ReviewCheckpointChange, type ReviewCheckpointState } from "./review-checkpoint";
+import { captureReviewCheckpoint, compareReviewCheckpoints, loadReviewCheckpoint, releaseReviewCheckpoint, reviewCheckpointWorkspaceRoot, type ReviewCheckpointDescriptor, type ReviewCheckpointChange, type ReviewCheckpointState } from "./review-checkpoint";
 import { buildUnifiedPatch, type PatchBuildResult } from "./diff";
 import { buildEvidenceBundle, collectEvidenceChanges, type EvidenceState } from "./evidence";
 import {
@@ -206,7 +206,7 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
   const guidanceEscalation = buildGuidanceEscalation(input.config, correctionAttemptCount);
   const workspaceChanges = settled.workspaceChanges;
   const evidenceChanges = input.evidence
-    ? await collectSettledEvidence(input.evidence, input.cwd, input.config, workspaceChanges, undefined, Boolean(settled.reviewedBaseline && settled.reviewedBaseline.kind !== "snapshot"), settled.frozenCandidateAfter)
+    ? await collectSettledEvidence(input.evidence, input.cwd, input.config, workspaceChanges, undefined, Boolean(settled.reviewedBaseline && settled.reviewedBaseline.kind !== "snapshot"), settled.frozenCandidateAfter, settled.evidenceRoot)
     : [];
   const split = splitReviewChanges(workspaceChanges, evidenceChanges);
   const { changes, sideEffectChanges } = split;
@@ -218,7 +218,7 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
   const reviewResponseMode = input.window?.activeExchange?.reviewResponseMode;
   const exchangeWorkspaceChanges = settled.exchangeWorkspaceChanges;
   const exchangeEvidenceChanges = input.evidence && exchangeSequence !== undefined
-    ? await collectSettledEvidence(input.evidence, input.cwd, input.config, exchangeWorkspaceChanges, exchangeSequence, Boolean(settled.reviewedBaseline && settled.reviewedBaseline.kind !== "snapshot"), settled.frozenCandidateAfter)
+    ? await collectSettledEvidence(input.evidence, input.cwd, input.config, exchangeWorkspaceChanges, exchangeSequence, Boolean(settled.reviewedBaseline && settled.reviewedBaseline.kind !== "snapshot"), settled.frozenCandidateAfter, settled.evidenceRoot)
     : evidenceChanges;
   const exchangeSplit = splitReviewChanges(exchangeWorkspaceChanges, exchangeEvidenceChanges);
   const exchangeWorkspacePatch = exchangeWorkspaceChanges.length > 0
@@ -242,6 +242,7 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
       await syncReviewWindowArtifacts({
         dir: input.window.bundleDir,
         cwd: input.cwd,
+        workspaceRoot: settled.evidenceRoot,
         currentReviewSequence: Math.max(1, input.window.nextReviewSequence - 1),
         exchanges: input.window.exchanges,
       });
@@ -294,6 +295,7 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
     reviewSequence,
     exchanges: input.window?.exchanges,
     cwd: input.cwd,
+    workspaceRoot: settled.evidenceRoot,
     request: input.request,
     submittedChanges: split.workspaceChanges,
     sideEffectChanges,
@@ -320,6 +322,7 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
               ),
             }
           : undefined,
+        settled.evidenceRoot ? { selectedCwd: input.cwd, workspaceRoot: settled.evidenceRoot } : undefined,
       )
       : undefined,
     actingUsage: input.actingUsage,
@@ -401,7 +404,7 @@ export async function collectPausedReviewExchange(input: PausedExchangeInput): P
       : await settleGitReview({ cwd: input.cwd, before: gitBaseline!, config: input.config });
     try {
       const evidenceChanges = input.evidence
-        ? await collectSettledEvidence(input.evidence, input.cwd, input.config, settled.workspaceChanges, active.sequence, true, settled.frozenCandidateAfter)
+        ? await collectSettledEvidence(input.evidence, input.cwd, input.config, settled.workspaceChanges, active.sequence, true, settled.frozenCandidateAfter, settled.evidenceRoot)
         : [];
       const split = splitReviewChanges(settled.workspaceChanges, evidenceChanges);
       completeActiveExchange(input.window, {
@@ -417,6 +420,7 @@ export async function collectPausedReviewExchange(input: PausedExchangeInput): P
         await syncReviewWindowArtifacts({
           dir: input.window.bundleDir,
           cwd: input.cwd,
+          workspaceRoot: settled.evidenceRoot,
           currentReviewSequence: Math.max(1, input.window.nextReviewSequence - 1),
           exchanges: input.window.exchanges,
         });
@@ -518,6 +522,7 @@ async function runAskReviewerSettled(input: AskReviewerInput, collected: Current
     reviewSequence,
     exchanges: input.window?.exchanges,
     cwd: input.cwd,
+    workspaceRoot: collected.evidenceRoot,
     question: input.question,
     request: input.request,
     submittedChanges: workspaceChanges,
@@ -527,7 +532,8 @@ async function runAskReviewerSettled(input: AskReviewerInput, collected: Current
     snapshotOmissions,
     snapshotOmissionsTruncated,
     evidence: input.evidence
-      ? buildEvidenceBundle(input.evidence, evidenceChanges.map((change) => change.path))
+      ? buildEvidenceBundle(input.evidence, evidenceChanges.map((change) => change.path), undefined,
+        collected.evidenceRoot ? { selectedCwd: input.cwd, workspaceRoot: collected.evidenceRoot } : undefined)
       : undefined,
     guidanceEscalation,
     changeIdentity: input.changeIdentity,
@@ -1119,6 +1125,8 @@ function createAdapter(decider: DeciderConfig): ModelAdapter {
 // inputs keep the existing settle semantics unchanged.
 
 interface SettledBaseline {
+  /** Root used by the checkpoint and its repository-relative change paths. */
+  evidenceRoot?: string;
   /** Candidate values captured once before arming the frozen after-checkpoint. */
   frozenCandidateAfter?: Map<string, FileSnapshot>;
   /** Changes against the review's own `before` baseline (window view). */
@@ -1211,17 +1219,21 @@ async function settleCheckpointReview(input: {
     const loaded = await loadReviewCheckpoint(cwd, descriptor, options);
     if (loaded.status !== "ok") throw checkpointFailure("verifying baseline", loaded);
   }
+  const checkpointRoot = before.descriptor.kind === "git"
+    ? await reviewCheckpointWorkspaceRoot(cwd, before.descriptor)
+    : resolve(cwd);
+  const evidenceRoot = before.descriptor.kind === "git" ? checkpointRoot : undefined;
   // Freeze in-root evidence candidates before the checkpoint. Included paths
   // use the checkpoint's authoritative changed entries; only excluded paths
   // (e.g. Git-ignored files) use this separately captured after-value. This
   // map is shared by the window and exchange comparisons, never reread later.
   const frozenCandidateAfter = new Map<string, FileSnapshot>();
-  const root = resolve(cwd);
+  const root = resolve(checkpointRoot);
   for (const candidate of input.evidence?.candidates.values() ?? []) {
     const path = relative(root, resolve(candidate.absolutePath));
     if (!path || isAbsolute(path) || path === ".." || path.startsWith(`..${sep}`)) continue;
     try {
-      frozenCandidateAfter.set(candidate.absolutePath, await createPathSnapshot(cwd, candidate.absolutePath, {
+      frozenCandidateAfter.set(candidate.absolutePath, await createPathSnapshot(checkpointRoot, candidate.absolutePath, {
         maxFileBytes: config.maxFileBytes, maxSnapshotBytes: config.maxSnapshotBytes, ...options,
       }));
     } catch (error) {
@@ -1247,6 +1259,7 @@ async function settleCheckpointReview(input: {
       windowPatch: windowDelta.patch, exchangePatch: exchangeDelta.patch,
       snapshotOmissions: [], snapshotOmissionsTruncated: false, ownershipTransferred: false,
       reviewedBaseline: { kind: "checkpoint", descriptor, cwd, capturedAt: new Date().toISOString() },
+      evidenceRoot,
       frozenCandidateAfter,
       releaseOrphan,
     };
@@ -1436,6 +1449,7 @@ async function settleSnapshotReview(input: ReviewRunInput): Promise<SettledBasel
 }
 
 interface CurrentChanges {
+  evidenceRoot?: string;
   changes: ChangedFile[];
   workspaceChanges: ChangedFile[];
   evidenceChanges: ChangedFile[];
@@ -1466,13 +1480,14 @@ async function collectCurrentChanges(input: {
       : await settleGitReview({ cwd: input.cwd, before: gitBefore!, config: input.config });
     try {
       const evidenceChanges = input.evidence
-        ? await collectSettledEvidence(input.evidence, input.cwd, input.config, settled.workspaceChanges, undefined, true, settled.frozenCandidateAfter)
+        ? await collectSettledEvidence(input.evidence, input.cwd, input.config, settled.workspaceChanges, undefined, true, settled.frozenCandidateAfter, settled.evidenceRoot)
         : [];
       return {
         ...splitReviewChanges(settled.workspaceChanges, evidenceChanges),
         windowPatch: settled.windowPatch,
         snapshotOmissions: [],
         snapshotOmissionsTruncated: false,
+        evidenceRoot: settled.evidenceRoot,
         releaseOrphan: settled.releaseOrphan,
       };
     } catch (error) {
@@ -1514,11 +1529,11 @@ async function collectCurrentChanges(input: {
 async function collectSettledEvidence(
   evidence: EvidenceState, cwd: string, config: ReviewGateConfig,
   frozenChanges: ChangedFile[], exchangeSequence?: number, typed = false,
-  frozenCandidateAfter?: Map<string, FileSnapshot>,
+  frozenCandidateAfter?: Map<string, FileSnapshot>, evidenceRoot?: string,
 ): Promise<ChangedFile[]> {
   const options = { maxFileBytes: config.maxFileBytes, maxSnapshotBytes: config.maxSnapshotBytes };
   if (!typed || !frozenCandidateAfter) return collectEvidenceChanges(evidence, cwd, options, exchangeSequence);
-  const root = resolve(cwd);
+  const root = resolve(evidenceRoot ?? cwd);
   const inside = (absolute: string): string | undefined => {
     const path = relative(root, resolve(absolute));
     return path && !isAbsolute(path) && path !== ".." && !path.startsWith(`..${sep}`) ? path.split(sep).join("/") : undefined;
@@ -1531,7 +1546,9 @@ async function collectSettledEvidence(
     const change = changed.get(path);
     if (change) return [change];
     const after = frozenCandidateAfter.get(candidate.absolutePath);
-    const sideEffect = after && compareFileSnapshots(baseline, after);
+    const sideEffect = after && compareFileSnapshots(
+      { ...baseline, relativePath: path }, { ...after, relativePath: path },
+    );
     return sideEffect ? [sideEffect] : [];
   });
   const external = new Map([...evidence.candidates].filter(([, candidate]) => inside(candidate.absolutePath) === undefined));

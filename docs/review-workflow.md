@@ -13,9 +13,14 @@ The bundle also maintains the cumulative baseline-to-current patch and numbered
 reviewer invocations.
 
 Parent review uses one durable checkpoint mechanism for Git and non-Git workspaces.
-Each settlement freezes one after-checkpoint. In a Git checkout, it pins clean committed content
-and captures both staged and unstaged Git differences plus raw non-ignored untracked
-entries. Tracked content follows Git-normalized newline semantics: the checkpoint is
+Each settlement freezes one after-checkpoint. In a Git checkout, even when Pi starts in a
+subdirectory, the parent checkpoint covers the enclosing repository: tracked changes
+and non-ignored untracked entries in sibling directories are included, and review
+changes and evidence paths within that repository are repository-relative. Pi and
+reviewer processes keep the selected subdirectory as their cwd; delegated task capture
+and landing remain separate and unchanged. Non-Git review still uses the selected cwd.
+The Git checkpoint pins clean committed content and captures both staged and unstaged
+Git differences plus raw non-ignored untracked entries. Tracked content follows Git-normalized newline semantics: the checkpoint is
 not a raw CRLF reproduction guarantee and does not run a separate EOL proof pass.
 Untracked entries, and eligible entries in a non-Git workspace, retain their raw bytes.
 For non-Git capture, `.gitignore` patterns apply within their directory subtree; if

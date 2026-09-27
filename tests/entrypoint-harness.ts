@@ -79,7 +79,7 @@ export function countingPassReviewer(id: string, invocationPath: string) {
 
 /** countingPassReviewer that also appends the full review prompt (the
  *  request context included) so tests can inspect what a reviewer saw. */
-export function countingPassReviewerWithPromptDump(id: string, invocationPath: string, promptPath: string) {
+export function countingPassReviewerWithPromptDump(id: string, invocationPath: string, promptPath: string, cwdPath?: string) {
   return {
     id,
     adapter: "generic-cli" as const,
@@ -90,6 +90,7 @@ export function countingPassReviewerWithPromptDump(id: string, invocationPath: s
         "-e",
         [
           "const fs=require('node:fs');",
+          ...(cwdPath ? [`fs.writeFileSync(${JSON.stringify(cwdPath)},process.cwd());`] : []),
           `const invocationPath=${JSON.stringify(invocationPath)};`,
           "const count=fs.existsSync(invocationPath)?Number(fs.readFileSync(invocationPath,'utf8')):0;",
           "fs.writeFileSync(invocationPath,String(count+1));",

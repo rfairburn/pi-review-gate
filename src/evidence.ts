@@ -1,4 +1,4 @@
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import {
   compareFileSnapshots,
   createPathSnapshot,
@@ -45,6 +45,11 @@ export interface EvidenceCandidate {
   baseline?: FileSnapshot;
   baselineError?: string;
   exchangeBaselines: Map<number, { snapshot?: FileSnapshot; error?: string }>;
+}
+
+export interface EvidencePathRoots {
+  selectedCwd: string;
+  workspaceRoot: string;
 }
 
 export interface EvidenceBundle {
@@ -195,25 +200,32 @@ export function buildEvidenceBundle(
   state: EvidenceState,
   changedCandidatePaths: string[],
   focus?: { events?: EvidenceEvent[]; finalAssistantSummaries?: string[] },
+  pathRoots?: EvidencePathRoots,
 ): EvidenceBundle {
-  const candidates = [...state.candidates.values()].map((candidate) => ({
-    path: candidate.path,
-    absolutePath: candidate.absolutePath,
-    sources: candidate.sources,
-    baseline: candidate.baselineError
-      ? "error" as const
-      : candidate.baseline?.exists
-        ? candidate.baseline.omittedReason === "unreadable"
-          ? "unreadable" as const
-          : "captured" as const
-        : candidate.baseline?.omittedReason === "unreadable"
-          ? "unreadable" as const
-          : "missing" as const,
-    baselineSnapshot: candidate.baseline,
-  }));
+  const candidates = [...state.candidates.values()].map((candidate) => {
+    const path = evidenceCandidatePath(candidate, pathRoots);
+    const baselineSnapshot = candidate.baseline && path !== candidate.path
+      ? { ...candidate.baseline, relativePath: path }
+      : candidate.baseline;
+    return {
+      path,
+      absolutePath: candidate.absolutePath,
+      sources: candidate.sources,
+      baseline: candidate.baselineError
+        ? "error" as const
+        : candidate.baseline?.exists
+          ? candidate.baseline.omittedReason === "unreadable"
+            ? "unreadable" as const
+            : "captured" as const
+          : candidate.baseline?.omittedReason === "unreadable"
+            ? "unreadable" as const
+            : "missing" as const,
+      baselineSnapshot,
+    };
+  });
 
   const bundle: Omit<EvidenceBundle, "markdown"> = {
-    events: focus?.events ?? state.events,
+    events: normalizeEvidenceEventPaths(focus?.events ?? state.events, pathRoots),
     candidates,
     finalAssistantSummaries: focus?.finalAssistantSummaries ?? state.finalAssistantSummaries,
     acceptedReviewerQuestions: state.acceptedReviewerQuestions,
@@ -224,6 +236,39 @@ export function buildEvidenceBundle(
     ...bundle,
     markdown: renderEvidenceMarkdown(bundle),
   };
+}
+
+export function normalizeEvidenceEventPaths(events: readonly EvidenceEvent[], roots?: EvidencePathRoots): EvidenceEvent[] {
+  if (!roots) return events.map((event) => ({ ...event, candidatePaths: [...event.candidatePaths] }));
+  return events.map((event) => ({
+    ...event,
+    candidatePaths: event.candidatePaths.map((path) => evidenceEventPath(path, roots)),
+  }));
+}
+
+function evidenceEventPath(path: string, roots: EvidencePathRoots): string {
+  const expanded = expandHomePath(path);
+  const absolute = isAbsolute(expanded) ? resolve(expanded) : resolve(roots.selectedCwd, expanded);
+  return workspaceRelativePath(absolute, roots.workspaceRoot) ?? path;
+}
+
+function evidenceCandidatePath(
+  candidate: EvidenceCandidate,
+  roots?: EvidencePathRoots,
+): string {
+  if (!roots) return candidate.path;
+  return workspaceRelativePath(resolve(candidate.absolutePath), roots.workspaceRoot) ?? candidate.path;
+}
+
+function workspaceRelativePath(absolute: string, workspaceRoot: string): string | undefined {
+  const workspaceRelative = relative(resolve(workspaceRoot), absolute);
+  return isWithinRoot(workspaceRelative) && workspaceRelative !== ""
+    ? workspaceRelative.split(sep).join("/")
+    : undefined;
+}
+
+function isWithinRoot(path: string): boolean {
+  return path === "" || (!isAbsolute(path) && path !== ".." && !path.startsWith(`..${sep}`));
 }
 
 export function rememberFinalAssistantSummary(state: EvidenceState, args: unknown[]): void {

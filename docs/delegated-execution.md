@@ -330,7 +330,11 @@ untracked files (50 MiB by default). This private task capture, candidate review
 landing path remains separate from the parent review checkpoint. Parent review uses a
 single durable Git or non-Git checkpoint and compares its frozen after-state against
 distinct window and exchange baselines (see [Review windows and
-evidence](review-workflow.md#review-windows-and-evidence)).
+evidence](review-workflow.md#review-windows-and-evidence)). When the parent Pi
+session runs below a Git repository's top level, its parent checkpoint still
+covers the whole repository. Starting a same-workspace execute subtask verifies
+that top-level checkpoint before private capture; this does not change the
+session or worker cwd, or the delegated capture and landing target.
 
 ## Landing and source preservation
 
@@ -347,8 +351,9 @@ state, and stash are preserved.
 [Review layers](configuration.md#review-layers-and-the-legacy-activereviewers-import)).
 `review.subtaskEnabled` controls the private pre-landing subtask review. At the landing
 boundary, an independently reviewed landing advances parent checkpoint bookkeeping
-only for its eligible landed paths; edits made by the parent remain reviewable against
-their window baseline.
+only for its eligible repository-relative landed paths; edits made by the parent,
+including siblings above a nested session cwd, remain reviewable against their
+window baseline.
 With `review.reviewLandedChanges` on, a landing into the parent session's own workspace
 that did **not** already complete a successful subtask review keeps its diff in the
 parent's review window as ordinary evidence instead of being checkpointed out,

@@ -15,7 +15,7 @@ import { expandHomePath } from "../apply-patch/paths";
 import { createWorkspaceSnapshot, type FileSnapshot, type WorkspaceSnapshot } from "../capture";
 import { activeExchangeBaseline, checkpointReviewWindow, ownedReviewCheckpointDescriptors, snapshotOfReviewBaseline, type ReviewBaseline, type ReviewGateState, type UnifiedReviewBaseline } from "../state";
 import { advanceGitCheckpoint, compareToGitCheckpoint, loadGitCheckpoint } from "../git-checkpoint";
-import { advanceRawReviewCheckpoint, changedRawCheckpointPaths, releaseReviewCheckpoint, type ReviewCheckpointDescriptor } from "../review-checkpoint";
+import { advanceRawReviewCheckpoint, changedRawCheckpointPaths, releaseReviewCheckpoint, reviewCheckpointWorkspaceRoot, type ReviewCheckpointDescriptor } from "../review-checkpoint";
 import { configDigest, reviewCheckpointDescriptorIdentity, type ExecutionAssociationsSnapshot } from "../session-state";
 import { materializeLandingConflicts } from "./conflict-materialization";
 import { ConflictGateStore, cloneConflictGate, type ConflictGate as BackgroundConflictGate } from "./conflict-gate-store";
@@ -3802,9 +3802,14 @@ export class BackgroundExecutionController {
       if (!baseline || baseline.kind !== "checkpoint" || changes.has(baseline.descriptor)) continue;
       if (await realpath(baseline.cwd) !== await realpath(sourceRoot)) throw new Error("Parent checkpoint belongs to a different workspace.");
       if (baseline.descriptor.kind === "git") {
-        const loaded = await loadGitCheckpoint(sourceRoot, baseline.descriptor.checkpoint);
+        // A nested session still owns the same workspace, but its Git review
+        // checkpoint is rooted at the enclosing repository. Keep the session
+        // cwd and repo-relative change paths unchanged; the Git loader checks
+        // the descriptor's repository identity before comparison.
+        const checkpointRoot = await reviewCheckpointWorkspaceRoot(sourceRoot, baseline.descriptor);
+        const loaded = await loadGitCheckpoint(checkpointRoot, baseline.descriptor.checkpoint);
         if (loaded.status !== "ok") throw new Error(`Parent checkpoint guard refused: ${loaded.reason} ${loaded.detail ?? ""}`);
-        const compared = await compareToGitCheckpoint(sourceRoot, loaded.value.encoded);
+        const compared = await compareToGitCheckpoint(checkpointRoot, loaded.value.encoded);
         if (compared.status !== "ok") throw new Error(`Parent checkpoint guard refused: ${compared.reason} ${compared.detail ?? ""}`);
         changes.set(baseline.descriptor, new Set([
           ...compared.value.trackedChanges.map((change) => change.path),
@@ -3941,7 +3946,10 @@ export class BackgroundExecutionController {
         const checkpointId = `parent-landed-${randomUUID()}`;
         let descriptor: ReviewCheckpointDescriptor;
         if (old.descriptor.kind === "git") {
-          const advanced = await advanceGitCheckpoint(sourceRoot, old.descriptor.checkpoint, eligiblePaths, checkpointId);
+          // The selector paths are already repository-relative, as are the
+          // comparison results; only the checkpoint root needs resolution.
+          const checkpointRoot = await reviewCheckpointWorkspaceRoot(sourceRoot, old.descriptor);
+          const advanced = await advanceGitCheckpoint(checkpointRoot, old.descriptor.checkpoint, eligiblePaths, checkpointId);
           if (advanced.status !== "ok") throw new Error(`Parent checkpoint advance refused: ${advanced.reason} ${advanced.detail ?? ""}`);
           descriptor = { kind: "git", checkpoint: advanced.value.descriptor };
         } else {

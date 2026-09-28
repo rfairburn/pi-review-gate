@@ -15,6 +15,12 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.89]
+
+### Fixed
+
+- Execute subtasks started from a nested Git working directory now verify the parent review checkpoint at the enclosing repository root instead of failing before worker capture. Selective parent checkpoint advancement uses that same root while preserving repository-relative landing paths, sibling parent edits, and delegated capture and landing scope across all executor routes.
+
 ## [0.1.0-dev.88]
 
 ### Changed

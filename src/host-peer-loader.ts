@@ -90,11 +90,27 @@ export async function loadHostPeerModule(
     // MODULE_NOT_FOUND for compiled CJS entries under pi >= 0.86: the native
     // import bypasses the jiti aliases. Try host-relative resolution.
   }
-  const piRoot = findRunningPiRoot(options.entryProvider);
-  if (!piRoot) return undefined;
-  const entry = resolvePeerEntry(piRoot, name, options.packageMainFallback === true);
+  const entry = resolveHostPeerFile(name, options);
   if (!entry) return undefined;
   return loadPeerFile(entry);
+}
+
+/**
+ * Resolves one peer package to a loadable file inside the running Pi install
+ * WITHOUT loading it (issue #213). The interactive-startup prewarm uses this
+ * import-first, host-relative path so it warms exactly the module record the
+ * on-demand loads later consume — never a bare-name require that could pick
+ * up a bundled repo copy or any other resolvable duplicate. Returns undefined
+ * when the process was not started from a Pi install or the peer cannot be
+ * resolved; nothing is loaded and nothing is cached.
+ */
+export function resolveHostPeerFile(
+  name: string,
+  options: HostPeerLoadOptions = {},
+): string | undefined {
+  const piRoot = findRunningPiRoot(options.entryProvider);
+  if (!piRoot) return undefined;
+  return resolvePeerEntry(piRoot, name, options.packageMainFallback === true);
 }
 
 /**
@@ -156,15 +172,22 @@ function resolvePeerEntry(piRoot: RunningPiRoot, name: string, mainFieldFallback
 /**
  * Loads a resolved peer file. `require()` covers CJS and, on Node >= 22.12,
  * ESM via require(esm); older Node throws ERR_REQUIRE_ESM, in which case a
- * native dynamic import loads the ESM module. Both hit Node's module cache,
- * so repeated loads share one instance inside the extension process.
+ * native dynamic import loads the ESM module. A require() that races an
+ * in-flight native import of the same file (an early /review-settings open
+ * against the issue #213 startup prewarm) throws
+ * ERR_REQUIRE_ESM_RACE_CONDITION and falls through to the same native
+ * import, which joins the in-flight record: coalesced, never re-evaluated.
+ * Both load paths hit Node's module cache, so repeated loads share one
+ * instance inside the extension process.
  */
 async function loadPeerFile(filePath: string): Promise<Record<string, unknown> | undefined> {
   try {
     const mod = require(filePath) as unknown;
     if (isRecord(mod)) return mod;
   } catch {
-    // ERR_REQUIRE_ESM on Node < 22.12 (or any load failure): use import().
+    // ERR_REQUIRE_ESM on Node < 22.12, ERR_REQUIRE_ASYNC_MODULE for
+    // top-level-await ESM, or ERR_REQUIRE_ESM_RACE_CONDITION while a native
+    // import of the same file is in flight: use import().
   }
   try {
     const mod = await nativeDynamicImport(pathToFileURL(filePath).href);

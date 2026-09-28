@@ -15,6 +15,12 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.88]
+
+### Changed
+
+- Interactive TUI sessions now prewarm the running Pi agent peer immediately on session start (a fire-and-forget native import with no timer and no visible UI), so the first `/review-settings` menu and native textbox consume an already-cached module instead of pausing on a cold load. Non-interactive modes are unaffected, early opens safely coalesce with an in-flight prewarm into one evaluation, and a failed prewarm preserves the existing on-demand, fail-closed behavior.
+
 ## [0.1.0-dev.87]
 
 ### Fixed

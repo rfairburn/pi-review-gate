@@ -63,6 +63,7 @@ import { DeferredToolManager } from "./deferred-tools";
 import { loadOperatingModeSegments, OPERATING_MODE_LABELS } from "./operating-mode";
 import { registerModeCycleShortcut } from "./mode-cycle";
 import { contextIsInteractiveTui, registerUserQuestions, userQuestionsBeginSession, userQuestionsEndSession } from "./user-question";
+import { prewarmPiAgentPeer } from "./peer-prewarm";
 import {
   EXECUTOR_TOOL_CATALOG_ENV,
   createExecutorToolCatalog,
@@ -629,6 +630,16 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   });
 
   registerHook(pi, "session_start", async (...args) => {
+    // Issue #213: interactive TUI sessions prewarm the running Pi agent peer
+    // immediately — a fire-and-forget native import that overlaps the rest of
+    // this hook (no timer, no visible UI) so the first /review-settings menu
+    // and native textbox consume an already-cached module instead of pausing
+    // on a cold load. Non-TUI modes never prewarm, and any failure keeps
+    // today's on-demand/fail-closed behavior. Never awaited here: the hook
+    // must not block on it.
+    if (contextIsInteractiveTui(extractContext(args))) {
+      void prewarmPiAgentPeer();
+    }
     await ownerSaveTail;
     nativeToolPreflight.reset();
     sessionActive = true;

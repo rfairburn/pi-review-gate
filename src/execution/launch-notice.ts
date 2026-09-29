@@ -15,7 +15,8 @@
  * (see launchNoticeGate), so a subtask that settles in milliseconds can never
  * deliver a completion or failure event before the launch notice that names
  * it. The notice itself never dispatches a duplicate task and never implies
- * progress or completion — it reports only the admission and the handles.
+ * progress, completion, or a running state — it reports only the admission
+ * and the handles, with a single short acknowledgement cue (issue #220).
  */
 import type { BackgroundTaskKind } from "./task-state";
 import { capNotificationText } from "./subtask-notifications";
@@ -94,12 +95,19 @@ function clipRedacted(value: string, max: number): string {
  * Pure renderer for the shared notice: bounded and redacted on every
  * model-controlled field, with origin metadata carried structurally in
  * `details`. Completes without I/O so tests can inspect the exact content.
+ *
+ * The content is deliberately concise (issue #220): factual admission
+ * identity — origin, execution id and kind, task handles, and the scheduled
+ * or human-command origin context — followed by one short acknowledgement
+ * cue. No narrative about outcomes, required actions, duplicates, or the
+ * delivery mechanics: those facts are either carried structurally in
+ * `details` or belong to the ordinary result notifications.
  */
 export function formatSubtaskLaunchNotice(notice: SubtaskLaunchNotice): { content: string; details: Record<string, unknown> } {
   const scheduled = notice.origin === "scheduled" && notice.scheduled !== undefined;
   const lines: string[] = scheduled
     ? [
-      `Scheduled task ${notice.scheduled!.entryId} (${clipRedacted(notice.scheduled!.entryName, 160)}) was dispatched as execution ${notice.executionId} (${notice.kind}).`,
+      `Scheduled task ${notice.scheduled!.entryId} (${clipRedacted(notice.scheduled!.entryName, 160)}) was admitted as execution ${notice.executionId} (${notice.kind}).`,
       `Due occurrence: ${formatLaunchDueLabel(notice.scheduled!.dueAt)} for cron "${notice.scheduled!.cron}".`,
     ]
     : [
@@ -113,10 +121,11 @@ export function formatSubtaskLaunchNotice(notice: SubtaskLaunchNotice): { conten
   if (!scheduled && notice.addedTaskIds !== undefined) {
     lines.push(`Added in this submission: ${notice.addedTaskIds.slice(0, SUBTASK_LAUNCH_NOTICE_MAX_TASKS).join(", ")}`);
   }
-  lines.push(
-    "This notice only reports the launch. No outcome is known yet: ordinary subtask notifications will report completion, failure, or conflicts, and quiet/noisy policy still applies to them.",
-    "Do not treat this launch as progress or completion, and do not start a duplicate of this task. No tool action is necessary for this notice; this delivery triggered a turn, so reply briefly instead of returning an empty response.",
-  );
+  // The delivery still triggers a turn, so one brief cue replaces the former
+  // no-outcome/lifecycle/quiet-noisy/progress/duplicate/empty-response prose:
+  // the model must not return an empty response, and nothing else is known
+  // here beyond the admission itself.
+  lines.push("Acknowledge briefly.");
   const content = capNotificationText(lines.join("\n"), SUBTASK_LAUNCH_NOTICE_MAX_CHARS);
   const details: Record<string, unknown> = {
     origin: notice.origin,

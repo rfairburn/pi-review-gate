@@ -621,9 +621,12 @@ export function extractCandidatePaths(
   const normalizedName = normalizedToolName(toolName);
 
   if (PATH_MUTATION_TOOLS.has(normalizedName)) {
+    // Writing directly to /dev/null drops output. Other mutation tools keep
+    // the device path as a candidate rather than assuming a discard write.
+    const omitSinkTarget = normalizedName === "write";
     for (const key of ["path", "file_path", "filePath", "target", "dest", "destination"]) {
       const value = input[key];
-      if (typeof value === "string" && value.trim()) {
+      if (typeof value === "string" && value.trim() && !(omitSinkTarget && isNullSinkCandidatePath(value.trim()))) {
         paths.push({ path: value.trim(), source: `${toolName}:${key}` });
       }
     }
@@ -632,7 +635,7 @@ export function extractCandidatePaths(
       const value = input[key];
       if (Array.isArray(value)) {
         for (const item of value) {
-          if (typeof item === "string" && item.trim()) {
+          if (typeof item === "string" && item.trim() && !(omitSinkTarget && isNullSinkCandidatePath(item.trim()))) {
             paths.push({ path: item.trim(), source: `${toolName}:${key}` });
           }
         }
@@ -750,7 +753,9 @@ function extractShellCandidatePaths(command: string): { paths: string[]; riskSig
   for (const match of command.matchAll(redirectionPattern)) {
     const path = match[1] ?? match[2] ?? match[3];
     if (path) {
-      paths.push(path);
+      // Redirecting output at the null sink is an output drop, not a real
+      // write target; the redirection itself stays a recorded risk signal.
+      if (!isNullSinkCandidatePath(path)) paths.push(path);
       riskSignals.push("shell_redirection");
     }
   }
@@ -759,7 +764,9 @@ function extractShellCandidatePaths(command: string): { paths: string[]; riskSig
   for (const match of command.matchAll(appendHerePattern)) {
     const path = match[1] ?? match[2] ?? match[3];
     if (path && !path.startsWith("-")) {
-      paths.push(path);
+      // A tee into the null sink only drops its copy of the stream; the
+      // tee write itself stays a recorded risk signal.
+      if (!isNullSinkCandidatePath(path)) paths.push(path);
       riskSignals.push("tee_write");
     }
   }
@@ -801,6 +808,27 @@ function extractShellCandidatePaths(command: string): { paths: string[]; riskSig
     paths: unique(paths.filter(isUsefulPathToken)),
     riskSignals: unique(riskSignals),
   };
+}
+
+/**
+ * Whether a candidate path is the POSIX /dev/null discard sink. Callers apply
+ * this only at discard-write extraction sites (shell output redirection, tee
+ * writes, and the full-overwrite write tool), where the sink is a common
+ * no-op output drop. Destructive or unknown operations — rm, mv, cp, touch,
+ * mkdir, edit, and ApplyPatch envelope mutations — must keep the device as
+ * an evidenced candidate, including inside mixed commands, because they can
+ * delete, rename, replace, or alter it rather than write past it.
+ *
+ * Only the canonical absolute sink matches; it is compared against the same
+ * normalized form the candidate machinery itself uses to key paths, and a
+ * relative, task-rooted, or other-spelling lookalike still resolves to some
+ * real path and keeps its evidence. On non-POSIX resolvers nothing can equal
+ * the literal "/dev/null", so real (drive-qualified) paths and Windows NUL
+ * keep their evidence too.
+ */
+function isNullSinkCandidatePath(path: string): boolean {
+  if (!path || !isAbsolute(path)) return false;
+  return resolve(expandHomePath(path)) === "/dev/null";
 }
 
 function commandText(input: Record<string, unknown>): string {

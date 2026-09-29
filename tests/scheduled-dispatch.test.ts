@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { ScheduledTaskEntryConfig } from "../src/config";
 import type { BackgroundInspection } from "../src/execution/background-controller";
+import type { BackgroundTaskKind } from "../src/execution/task-state";
 import type { ScheduledEntryDispatchHost } from "../src/scheduling/dispatch";
 import { deliverSubtaskLaunchNotice } from "../src/execution/launch-notice";
 import type { SubtaskLaunchNotice } from "../src/execution/launch-notice";
@@ -44,7 +45,7 @@ function orchestratorEntry(overrides: Partial<ScheduledTaskEntryConfig> = {}): S
 }
 
 interface HarnessOptions {
-  runs?: Array<{ executionId: string; kind: "execute" | "research"; tasks: Array<{ taskId: string; title: string; state: string }> }>;
+  runs?: Array<{ executionId: string; kind: BackgroundTaskKind; tasks: Array<{ taskId: string; title: string; state: string }> }>;
   startError?: Error;
   piMessage?: boolean;
   turnEndTracking?: "host-lifecycle-hooks" | "unavailable";
@@ -54,7 +55,7 @@ interface HarnessOptions {
 }
 
 function harness(options: HarnessOptions = {}) {
-  const started: Array<{ definition: unknown; kind: "execute" | "research"; workspace: string | undefined; options: Record<string, unknown> }> = [];
+  const started: Array<{ definition: unknown; kind: BackgroundTaskKind; workspace: string | undefined; options: Record<string, unknown> }> = [];
   const ownerEvents: string[] = [];
   const uiNotices: string[] = [];
   const consoleWarnings: string[] = [];
@@ -154,6 +155,41 @@ test("an idle subtask entry admits through startScheduled with its overrides, it
   // The UI notice stays, and it does not claim any outcome.
   assert.ok(host.uiNotices[0]!.includes("dispatched as exec-admitted"));
   assert.equal(host.ownerEvents.length, 0);
+});
+
+test("an in-place schedule preserves its workspace, worker, review override and shared launch gate", async () => {
+  const { dispatch, host } = harness();
+  await dispatch("task-inplace", subtaskEntry({
+    kind: "inplace",
+    workerResourceId: "local",
+    review: { mode: "off" },
+  }), new Date(dueBase), false);
+  assert.equal(host.started.length, 1);
+  const start = host.started[0]!;
+  assert.equal(start.kind, "inplace");
+  assert.equal(start.workspace, "/tmp/prg-dispatch");
+  assert.equal(start.options.workerResourceId, "local");
+  assert.deepEqual(start.options.reviewOverride, { mode: "off" });
+  assert.equal(start.options.scheduledTaskId, "task-inplace");
+  assert.equal(host.launches.length, 1);
+  const notice = host.launches[0]!.notice as SubtaskLaunchNotice;
+  assert.equal(notice.kind, "inplace");
+  assert.equal(notice.origin, "scheduled");
+  assert.equal(notice.tasks[0]!.taskId, "task-admitted");
+  await (start.options.launchNoticeGate as Promise<void>);
+  assert.equal(host.ownerEvents.length, 0);
+});
+
+test("an active in-place schedule keeps the one-unsettled-run overlap rule", async () => {
+  const { dispatch, host } = harness({
+    runs: [{ executionId: "exec-inplace", kind: "inplace", tasks: [{ taskId: "task-active", title: "T", state: "running" }] }],
+  });
+  await dispatch("task-inplace", subtaskEntry({ kind: "inplace" }), new Date(dueBase), false);
+  assert.equal(host.started.length, 0);
+  assert.equal(host.launches.length, 0);
+  assert.equal(host.ownerEvents.length, 1);
+  assert.match(host.ownerEvents[0]!, /was SKIPPED/);
+  assert.match(host.ownerEvents[0]!, /exec-inplace.*task-active/s);
 });
 
 test("subtask notices remain causally ordered: the gate resolves only after the delivery attempt", async () => {

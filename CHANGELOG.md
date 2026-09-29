@@ -36,8 +36,13 @@ dates.
   The selected root and original launch baseline survive continuation and ordinary
   executor failover; prior direct effects are disclosed to the replacement worker.
   Settled in-place tasks end `reported` with the review outcome and workspace delta;
-  review-disabled runs settle completed-unreviewed in place. Existing execute/research
-  behavior, routes-as-configured, and defaults are unchanged.
+  review-disabled runs settle completed-unreviewed in place. Concise completion notices
+  name workspace changes separately from additional observed paths outside the
+  workspace; shared human and scheduled launch notices report admission facts with a
+  brief acknowledgement cue. Discard-output writes to `/dev/null` are excluded from
+  evidence candidates, while destructive operations on that path remain evidenced.
+  Existing execute/research workspace isolation, configured routes, and defaults are
+  unchanged.
 
 ## [0.1.0-dev.90]
 

@@ -253,26 +253,29 @@ Attribution and review:
   continuations. The run-as-binary adapter does not expose structured tool events, and all
   adapters may omit actions: missing events never establish that no external effect
   occurred. Tool observations and candidate paths are bounded and persisted with the
-  task evidence for continuations.
+  task evidence for continuations. Discard-output writes to `/dev/null` are excluded
+  from path candidates; the original command remains in tool history. Destructive
+  operations on that path remain evidence candidates.
 - `no_changes` means only that the bounded selected-root snapshot contains no recorded
-  workspace delta since launch. It does not mean that no external side effect occurred;
-  summaries disclose ignored-directory and bounded-snapshot exclusions plus any
-  adapter-specific tool-observation limits.
+  workspace delta since launch. It does not mean that no external side effect occurred.
+  Detailed baseline and tool evidence retain snapshot exclusions and observation limits.
 - A review verdict is explicitly post-hoc: a passing verdict reports that the recorded
   workspace delta satisfies the task; it never represents a pre-write gate, a rollback,
   or an undo of network, API, process, or out-of-workspace side effects, and settled
-  in-place tasks never claim their writes were undone. Task summaries and completion
-  notices state the attribution limitation themselves — concurrent writers' changes
-  appear in the delta indistinguishably from the worker's own.
+  in-place tasks never claim their writes were undone. Routine completion messages
+  report status, review outcome, and named workspace changes since launch. A separate
+  **Additional observed paths outside workspace** list supplements that snapshot
+  evidence. Detailed attribution and observation limits remain in the review context
+  and evidence rather than repeated in routine notices.
 - Durable per-cycle reviewer records are written under the task's artifact directory as
   `reviews/inplace/cycle-NNNN.json` in an in-place record shape that carries the
   attribution basis instead of a fabricated commit identity. Subtask evidence indexes
   these records; a failing publication still leaves the bounded unpublished marker
   instead of silently presenting an older readable cycle as current.
 - Settled in-place tasks end `reported` (like research groups) with the review outcome,
-  the workspace path, and the count of changed-since-launch paths in the summary. A
-  failed, timed-out, or interrupted lifecycle also re-checks the recorded workspace
-  delta at settlement — writes the worker already performed are reflected in the
+  the workspace path, and a bounded named list of changed-since-launch paths in the
+  summary. A failed, timed-out, or interrupted lifecycle also re-checks the recorded
+  workspace delta at settlement — writes the worker already performed are reflected in the
   durable result, durable summaries, and notices instead of a false no-changes claim;
   if the delta cannot be inspected, result and notices report it as unknown
   (`attributionError`) rather than zero. With

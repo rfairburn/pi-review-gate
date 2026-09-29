@@ -286,7 +286,7 @@ function escapeForRegex(value: string): string {
   return value.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
 }
 
-/** Phrases the user rejected from routine in-place completion prose (#220/PR226). */
+/** Narrative omitted from routine in-place completion prose (#220/PR226). */
 const REJECTED_COMPLETION_NARRATIVE = [
   "cannot prove which post-launch changes",
   "no verdict was fabricated",
@@ -959,7 +959,7 @@ test("in-place tasks write directly in a non-Git workspace, settle reported, and
     assert.match(completion!, / Review: disabled\./);
     assert.match(completion!, /^Workspace changes since launch: added made\.txt$/m);
     assert.match(completion!, new RegExp(`In-place ${escapeForRegex(started.executionId)} COMPLETE: 1/1 tasks settled in place\\.`));
-    assert.match(completion!, /All requested in-place work settled where it was performed in the selected workspace\./);
+    assert.doesNotMatch(completion!, /All requested in-place work settled/, "the group result is one line");
     for (const rejected of REJECTED_COMPLETION_NARRATIVE) {
       assert.doesNotMatch(completion!, new RegExp(rejected, "i"), `routine completion carries no rejected narrative: ${rejected}`);
     }
@@ -1072,7 +1072,7 @@ test("an in-place task reviews through the subtask reviewer configuration and se
   }
 });
 
-// Regression (#220/PR226, user report): a root hello.txt with a passing review
+// Regression (#220/PR226): a root hello.txt with a passing review
 // must be reported as the named delta plus the actual review disposition and
 // the group aggregate — never a count-only note or repeated narrative. The
 // separate external-path category (e.g. /dev/null) is exercised through the
@@ -1112,7 +1112,7 @@ test("in-place completion names the root delta and reports the actual review dis
     assert.match(completion!, / Review: passed\./);
     assert.match(completion!, /^Workspace changes since launch: added hello\.txt$/m);
     assert.match(completion!, new RegExp(`In-place ${escapeForRegex(started.executionId)} COMPLETE: 1/1 tasks settled in place\\.`));
-    assert.match(completion!, /All requested in-place work settled where it was performed in the selected workspace\./);
+    assert.doesNotMatch(completion!, /All requested in-place work settled/, "the group result is one line");
     for (const rejected of REJECTED_COMPLETION_NARRATIVE) {
       assert.doesNotMatch(completion!, new RegExp(rejected, "i"), `routine completion carries no rejected narrative: ${rejected}`);
     }

@@ -138,7 +138,7 @@ test("shared lifecycle guidance is derived from the wake state tables", () => {
 
 test("completion guidance is kind-neutral and covers reported research completion", () => {
   const line = completionNotificationGuidanceLine();
-  assert.ok(line.includes("Every task completion (an execute task landing or a research task reporting) triggers a notification"));
+  assert.ok(line.includes("Every task completion (an execute task landing, a research task reporting, or an in-place task settling where its writes were performed) triggers a notification"), "guidance covers all three worker kinds (#220)");
   assert.ok(line.includes("lists every sibling that has not completed, even in quiet mode"));
   // #117: the unconditional promise is carved out for synchronous landings
   // already confirmed by the caller's own tool result.

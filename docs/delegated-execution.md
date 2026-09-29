@@ -58,10 +58,14 @@ per operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`, `SubtasksWatch
 `SubtasksMarkClean`. No singular or snake_case compatibility tool is registered.
 
 - `SubtasksStart` accepts an optional immutable group-level `kind`: `execute` (the
-  default) or `research`.
+  default), `research`, or `inplace` (#220, described below).
 - `SubtasksStart` also accepts an optional top-level `workspace` string selecting
-  an existing, explicitly authorized development checkout or Git worktree as the
-  group's capture and landing destination. Omitted or blank uses the parent
+  the group's target. For `execute` groups this is an existing, explicitly
+  authorized development checkout or Git worktree used as the capture and
+  landing destination; for `inplace` groups it is the existing directory the
+  workers run and write in directly — any directory the explicit launch
+  authorizes, including an empty one and one outside any Git repository.
+  Omitted or blank uses the parent
   session's working directory, preserving the default behavior; relative paths
   resolve against that same parent session's working directory, never against
   the process cwd. A leading `~` or `~/...` expands against the user's home
@@ -70,16 +74,14 @@ per operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`, `SubtasksWatch
   does not name an existing directory. The target is
   resolved once at start (it must already exist; the extension never creates,
   clones, checks out, or repurposes directories) and persisted with the group:
-  every capture, reviewed landing, restore, continuation, and recovery path uses
-  that target, `SubtasksAdd` inherits the group's target, and steering never
-  retargets it. The target is a landing destination, not worker scratch: each
-  task still receives its own isolated worktree captured from the target, several
-  workers may independently land reviewed changes into the same target, and
-  separate groups may target different repositories concurrently under the
-  unchanged shared global capacity limits. Parent-session identity checks remain
-  in force independently of the selected target, and a landing into a target
-  other than the parent session's workspace never enters the parent review
-  baseline.
+  `SubtasksAdd` inherits the group's target, and steering never retargets it.
+  Execute tasks still receive their own isolated worktree captured from the
+  target, several workers may independently land reviewed changes into the same
+  target, and separate groups may target different repositories concurrently
+  under the unchanged shared global capacity limits. Parent-session identity
+  checks remain in force independently of the selected target, and a landing
+  into a target other than the parent session's workspace never enters the
+  parent review baseline.
 - Start and add accept 1–16 bounded tasks and return stable execution/task handles
   immediately. Work continues in the background up to the configured global and
   per-model capacities.
@@ -137,7 +139,8 @@ structured task submission stays on the model-facing `SubtasksStart` and
 `SubtasksAdd` APIs, which keep their interfaces and batching unchanged.
 
 With no arguments, `/subtask-add` opens a staged multi-field form: choose **Create a
-new execution group** (choosing the `execute` or `research` kind and optionally a
+new execution group** (choosing the `execute`, `research`, or `inplace` kind and, for
+in-place, the directory its worker writes in directly — otherwise an optional
 target workspace, blank meaning the current session workspace) or **Add to an
 existing execution group** (picking a group by its id, kind, and workspace; the added
 task inherits that immutable kind and target). The form collects a required title,
@@ -146,9 +149,10 @@ relevant context, validates them, and stages everything behind an explicit final
 submission step: the staged destination, kind, workspace, and task fields are shown
 for confirmation, nothing is dispatched until the staged submission is explicitly
 confirmed, and cancellation — at any earlier stage or at that final step — creates
-neither a task nor a group. A workspace is an existing, explicitly authorized
-development checkout or Git worktree used as the group's capture and landing
-destination; each task still executes in its own managed isolated worktree.
+neither a task nor a group. For execute groups a workspace is an existing, explicitly
+authorized development checkout or Git worktree used as the group's capture and
+landing destination; each task still executes in its own managed isolated worktree.
+For in-place groups the workspace is the directory the worker writes in directly.
 In the interactive Pi TUI the form's text fields open through the same shared
 native editor bridge as every other extension-owned field (issue #26): the
 host's own main-prompt editor with an editable prefill, native path completion
@@ -157,6 +161,122 @@ leading-`/` tokens (`/`, `/se`, a nested absolute path) — never slash-command
 items, so a nonexistent token lists nothing and no command is offered or
 executed. On non-interactive hosts the public multi-line editor (with the legacy
 single-line input behind it) is used unchanged.
+
+## In-place subtask kind
+
+The `inplace` kind (#220) is a third, explicitly selected worker kind alongside `execute`
+and `research`. It exists for work that genuinely must happen in one specific existing
+directory — the primary workspace, a checkout prepared for a ticket, or an empty folder.
+Git is never required: the selected workspace may be non-Git, and the worker may create a
+repository there when the task genuinely calls for one.
+
+Launch paths and semantics:
+
+- Selectable wherever `kind` is: the model-facing `SubtasksStart`/`SubtasksAdd` schema,
+  the `/subtask-add` staged form, and scheduled task entries (which pass their kind
+  through the same start path, including their worker pin and review override). An
+  in-place group's selected workspace is the directory its workers run and write in
+  directly, resolved once at start exactly like an execute group's target. This root
+  selects the executor cwd and workspace-snapshot scope; it is not a filesystem
+  boundary, and tools may still act on paths outside it.
+- The executor runs with the same authorized file/CLI/API capabilities an execute worker
+  receives, except that it cannot launch subtasks: every `Subtasks*`-prefixed tool is
+  removed from its durable tool catalog. In-place workers draw from the write-capable
+  executor pool (the `execute` priority route and per-entry worker pins); no separate
+  route is configured for them. When the selected workspace contains the system temp
+  directory, the group's artifact root is created at the nearest writable directory
+  outside the workspace instead (recorded as the group's storage base and validated by
+  the guarded cleanup) so task artifacts never live inside the selected directory; a
+  workspace that contains every candidate location is refused at launch.
+- There is no wave capture, no managed worker worktree, no candidate commit, no
+  integration, and no landing. Writes and external side effects happen where the worker
+  performs them and are never gated, rolled back, or landed by this extension.
+- In-place tasks have no mergeable checkpoint, so `SubtasksForceMerge`,
+  `SubtasksMarkClean`, and interrupt-with-merge are refused for them; ordinary
+  `SubtasksContinue` resumes a stopped task in the same workspace (with an explicit
+  disclosure that prior writes were not verified or rolled back), and the controller
+  re-queued auto-resume after an application restart works the same way.
+- In-place executors use the configured `execute` route's existing retry and pool
+  failover policy. After same-adapter recovery is exhausted, a replacement may take
+  over only after every child started during that assignment has reported exit and
+  every tracked process group is confirmed absent where supported. It continues in
+  the same selected workspace against the original launch baseline; no new baseline
+  or wave capture, workspace reset, checkpoint, rollback, or landing occurs. The
+  replacement starts a fresh session and
+  is told that prior direct writes and external effects may already have happened, so
+  it must inspect current state rather than assume the previous attempt left nothing.
+
+Attribution and review:
+
+- At dispatch the task records a bounded content snapshot of the selected workspace plus
+  the observed Git HEAD when the root is inside a repository (and nothing when it is
+  not), and persists that launch baseline durably (write-once) in the task's artifact
+  directory before any executor runs. Every continuation restores and verifies that
+  same basis — a persisted basis that is missing, malformed, fails its integrity check,
+  or is rooted elsewhere fails closed instead of silently re-baselining, so writes made
+  before a pause stay inside the original attribution window. This detects integrity
+  mismatches; it is not a guarantee against a writer who can rewrite both the artifact
+  and its integrity metadata.
+- A task's own reviewer reviews the content-anchored recorded delta of that workspace
+  since launch — the same workspace-snapshot review scope direct orchestrator work would
+  receive in that workspace — and follows the ordinary correction loop
+  (`needs_changes` resumes the same worker there). Identity binds status, path, and
+  CONTENT (file hashes and snapshot-entry metadata): a turn that rewrites the content
+  of an already-changed path is always observable, no-progress detection cannot be
+  fooled by a same-path content rewrite. A passing verdict is bound to the reviewed
+  content plus the bounded external-observation revision and truncation state; a pass
+  confirmation that changes reviewed contents or records a new outside-root observation
+  re-enters review. For no-progress detection, a new external observation also distinguishes
+  correction cycles when the workspace delta is unchanged; it is evidence of an observed
+  path, not proof of a particular external content change. The observation revision detects
+  new evidence, not a verified file diff. Each durable cycle record carries the reviewed
+  workspace identity's hash instead of a fabricated commit identity. Cycle numbering is
+  allocated from the task's durable review artifacts (records and unpublished markers), so a paused-then-continued task
+  never recycles a settled cycle number, and publication of a genuinely new cycle never
+  silently accepts an existing record: a numbered collision fails the task closed as a
+  review error.
+- The recorded delta is a change-since-launch record, not proof of authorship: changes
+  by concurrent writers appear indistinguishably from the worker's own. Reviewers are
+  instructed not to credit unattributable changes to the worker, not to present unrelated
+  concurrent changes as reviewed worker output, and to disclose uncertain attribution
+  explicitly. Snapshot-policy omissions (ignored directories, oversized files) are
+  disclosed the same way.
+- The selected root bounds only the workspace snapshot, not tool reach. Structured
+  Pi RPC, Claude Agent SDK, and Codex app-server tool events are forwarded as bounded
+  evidence. When those events identify an absolute mutation path outside the selected
+  root, that path is shown separately as an external side-effect candidate and reaches
+  the task's reviewer even when the selected-root delta is empty. Its pre-state is
+  explicitly unverified because parent-side event delivery may race the mutation; a
+  bounded after-turn observation is not a diff and does not prove which writer caused
+  the state. The observation revision is persisted with the evidence across
+  continuations. The run-as-binary adapter does not expose structured tool events, and all
+  adapters may omit actions: missing events never establish that no external effect
+  occurred. Tool observations and candidate paths are bounded and persisted with the
+  task evidence for continuations.
+- `no_changes` means only that the bounded selected-root snapshot contains no recorded
+  workspace delta since launch. It does not mean that no external side effect occurred;
+  summaries disclose ignored-directory and bounded-snapshot exclusions plus any
+  adapter-specific tool-observation limits.
+- A review verdict is explicitly post-hoc: a passing verdict reports that the recorded
+  workspace delta satisfies the task; it never represents a pre-write gate, a rollback,
+  or an undo of network, API, process, or out-of-workspace side effects, and settled
+  in-place tasks never claim their writes were undone. Task summaries and completion
+  notices state the attribution limitation themselves — concurrent writers' changes
+  appear in the delta indistinguishably from the worker's own.
+- Durable per-cycle reviewer records are written under the task's artifact directory as
+  `reviews/inplace/cycle-NNNN.json` in an in-place record shape that carries the
+  attribution basis instead of a fabricated commit identity. Subtask evidence indexes
+  these records; a failing publication still leaves the bounded unpublished marker
+  instead of silently presenting an older readable cycle as current.
+- Settled in-place tasks end `reported` (like research groups) with the review outcome,
+  the workspace path, and the count of changed-since-launch paths in the summary. A
+  failed, timed-out, or interrupted lifecycle also re-checks the recorded workspace
+  delta at settlement — writes the worker already performed are reflected in the
+  durable result, durable summaries, and notices instead of a false no-changes claim;
+  if the delta cannot be inspected, result and notices report it as unknown
+  (`attributionError`) rather than zero. With
+  subtask review disabled they settle as completed-unreviewed in place — no verdict is
+  fabricated, and nothing is attributed beyond the recorded delta.
 
 ## Pi worker settlement and browser ownership
 

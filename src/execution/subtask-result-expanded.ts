@@ -622,8 +622,14 @@ function renderDispatchRecord(
 ): void {
   const turn = typeof dispatch.executorTurn === "number" ? dispatch.executorTurn : "?";
   lines.add(`Dispatch: dispatched to executor transport (turn ${turn})`);
-  lines.add(`Captured base commit: ${stringOr(dispatch.baseCommit, "(unrecorded)")}`);
-  lines.add(`Worker worktree: ${stringOr(dispatch.worktreeRoot, "(unrecorded)")}`);
+  // #220: an in-place dispatch records the in-place workspace and no captured
+  // base commit (there is none; writes happen directly in that workspace).
+  if (dispatch.inPlace === true) {
+    lines.add(`In-place workspace (no captured base commit): ${stringOr(dispatch.worktreeRoot, "(unrecorded)")}`);
+  } else {
+    lines.add(`Captured base commit: ${stringOr(dispatch.baseCommit, "(unrecorded)")}`);
+    lines.add(`Worker worktree: ${stringOr(dispatch.worktreeRoot, "(unrecorded)")}`);
+  }
   lines.add("Prompt provenance: captured at dispatch", "muted");
   const sentPrompt = typeof dispatch.sentPrompt === "string" ? dispatch.sentPrompt : undefined;
   const initialSentPrompt = initial && typeof initial.sentPrompt === "string" ? initial.sentPrompt : undefined;

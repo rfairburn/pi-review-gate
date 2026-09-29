@@ -1,15 +1,20 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  captureObservedToolPathAfterStates,
   collectEvidenceChanges,
   buildEvidenceBundle,
   createEvidenceState,
   extractCandidatePaths,
   recordAcceptedReviewerQuestion,
+  recordObservedToolEventEvidence,
   recordToolCallEvidence,
+  recordToolEventObservability,
+  restoreEvidenceState,
+  serializeEvidenceState,
   rememberFinalAssistantSummary,
   rememberFinalAssistantSummaryText,
   shouldRecordToolCallEvidence,
@@ -20,6 +25,145 @@ const snapshotOptions = {
   maxFileBytes: 1024 * 1024,
   maxSnapshotBytes: 10 * 1024 * 1024,
 };
+
+test("post-hoc outside-root tool observations are separate evidence with an unverified pre-state", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "pi-review-gate-inplace-observed-"));
+  const workspace = join(scratch, "selected-root");
+  const external = join(scratch, "outside.txt");
+  await mkdir(workspace, { recursive: true });
+  const state = createEvidenceState();
+  try {
+    await writeFile(external, "written before the parent event was delivered\n", "utf8");
+    // Deliberately observe after mutation to exercise the race: no pre-event
+    // snapshot is invented from the stream callback.
+    for (const stage of ["start", "end"] as const) {
+      recordObservedToolEventEvidence({
+        state,
+        cwd: workspace,
+        selectedRoot: workspace,
+        adapter: "pi-model",
+        stage,
+        toolName: "write",
+        toolInput: { path: external },
+        ...(stage === "end" ? { result: "wrote file" } : {}),
+      });
+    }
+    await captureObservedToolPathAfterStates(state, workspace, snapshotOptions);
+    const bundle = buildEvidenceBundle(state, [], undefined, { selectedCwd: workspace, workspaceRoot: workspace });
+    assert.equal(state.requiresReview, true);
+    assert.equal(state.externalObservationRevision, 2, "each external tool observation advances the bounded revision");
+    assert.equal(bundle.changedCandidatePaths.length, 0, "external observations are not in-root delta entries");
+    assert.equal(bundle.candidates.length, 1);
+    assert.equal(bundle.candidates[0]?.baseline, "unverified");
+    assert.equal(bundle.candidates[0]?.externalSideEffect, true);
+    assert.equal(bundle.candidates[0]?.afterSnapshot?.content, "written before the parent event was delivered\n");
+    assert.match(bundle.markdown, /outside the selected workspace/);
+    assert.match(bundle.markdown, /prior state is unverified/);
+    assert.match(bundle.markdown, /not a diff/);
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test("observed external evidence persists across continuations and stays bounded to the selected-root choice", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "pi-review-gate-inplace-observed-restore-"));
+  const workspace = join(scratch, "root");
+  const narrowerRoot = join(workspace, "selected-subdir");
+  const external = join(scratch, "external.txt");
+  await mkdir(narrowerRoot, { recursive: true });
+  const original = createEvidenceState();
+  const restored = createEvidenceState();
+  try {
+    await writeFile(external, "current\n", "utf8");
+    recordObservedToolEventEvidence({
+      state: original,
+      cwd: workspace,
+      selectedRoot: workspace,
+      adapter: "codex-cli",
+      stage: "start",
+      toolName: "write",
+      toolInput: { files: [external] },
+    });
+    await captureObservedToolPathAfterStates(original, workspace, snapshotOptions);
+    restoreEvidenceState(restored, JSON.parse(JSON.stringify(serializeEvidenceState(original))) as unknown, workspace);
+    assert.equal(restored.requiresReview, true);
+    assert.equal(restored.events.length, 1);
+    assert.equal(original.externalObservationRevision, 1);
+    assert.equal(restored.externalObservationRevision, 1, "the observation revision survives evidence restoration");
+    await writeFile(external, "changed after continuation\n", "utf8");
+    await captureObservedToolPathAfterStates(restored, workspace, snapshotOptions);
+    assert.equal([...restored.candidates.values()][0]?.prestateUnverified, true);
+    assert.equal([...restored.candidates.values()][0]?.afterSnapshot?.content, "changed after continuation\n");
+
+    const narrower = createEvidenceState();
+    recordObservedToolEventEvidence({
+      state: narrower,
+      cwd: workspace,
+      selectedRoot: narrowerRoot,
+      adapter: "codex-cli",
+      stage: "start",
+      toolName: "write",
+      toolInput: { path: external },
+    });
+    assert.equal(narrower.requiresReview, true, "the explicitly selected narrower root is the comparison boundary");
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test("an unavailable event stream is disclosed without inventing a tool observation", () => {
+  const state = createEvidenceState();
+  recordToolEventObservability(state, "run-as-binary", {
+    mode: "unavailable",
+    description: "No structured tool calls are forwarded.",
+  });
+  const bundle = buildEvidenceBundle(state, []);
+  assert.equal(bundle.requiresReview, false);
+  assert.deepEqual(bundle.events, []);
+  assert.match(bundle.markdown, /No structured tool calls are forwarded/);
+  assert.match(bundle.markdown, /Missing events do not prove/);
+});
+
+test("tool path and event limits stay bounded and force review when evidence is truncated", async () => {
+  const scratch = await mkdtemp(join(process.cwd(), ".pi-review-gate-inplace-bounds-"));
+  const workspace = join(scratch, "root");
+  await mkdir(workspace, { recursive: true });
+  const state = createEvidenceState();
+  try {
+    const paths = Array.from({ length: 30 }, (_, index) => join(scratch, `outside-${index}.txt`));
+    recordObservedToolEventEvidence({
+      state,
+      cwd: workspace,
+      selectedRoot: workspace,
+      adapter: "codex-cli",
+      stage: "start",
+      toolName: "write",
+      toolInput: { files: paths },
+    });
+    assert.equal(state.events[0]?.candidatePaths.length, 25);
+    assert.equal(state.candidates.size, 25);
+    assert.equal(state.toolObservationsTruncated, true);
+    assert.equal(state.requiresReview, true);
+
+    for (let index = 1; index < 205; index += 1) {
+      recordObservedToolEventEvidence({
+        state,
+        cwd: workspace,
+        selectedRoot: workspace,
+        adapter: "codex-cli",
+        stage: "end",
+        toolName: "write",
+        toolInput: { path: paths[0] },
+        result: "observed",
+      });
+    }
+    assert.equal(state.events.length, 200);
+    assert.equal(state.toolObservationsTruncated, true);
+    assert.equal(state.requiresReview, true);
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
 
 test("extractCandidatePaths finds shell redirection and tee targets", () => {
   const result = extractCandidatePaths("bash", {

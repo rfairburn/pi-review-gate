@@ -814,7 +814,7 @@ function scheduledTaskEntrySummary(entry: ScheduledTaskEntryConfig): string {
 }
 
 function scheduledTaskKindLabel(kind: ScheduledTaskKind): string {
-  return kind === "research" ? "research" : "execute";
+  return kind === "research" ? "research" : kind === "inplace" ? "in-place" : "execute";
 }
 
 /** Compact display preview; never persisted or interpreted. */
@@ -1004,11 +1004,13 @@ async function editScheduledTaskEntry(
       continue;
     }
     if (choice === "kind") {
-      const options = ["Execute — write-capable subtask", "Research — read-only subtask"]
-        .map((option) => option.startsWith(entry.kind === "research" ? "Research" : "Execute") ? `${option}  current` : option);
+      const currentPrefix = entry.kind === "research" ? "Research" : entry.kind === "inplace" ? "In-place" : "Execute";
+      const options = ["Execute — write-capable subtask", "Research — read-only subtask", "In-place — write in a selected directory (no capture/landing)"]
+        .map((option) => option.startsWith(currentPrefix) ? `${option}  current` : option);
       const selected = await ui.select("Scheduled task kind", options);
       if (selected?.startsWith("Execute")) setCatalogKey(catalog, id, { ...entry, kind: "execute" });
       else if (selected?.startsWith("Research")) setCatalogKey(catalog, id, { ...entry, kind: "research" });
+      else if (selected?.startsWith("In-place")) setCatalogKey(catalog, id, { ...entry, kind: "inplace" });
       continue;
     }
     if (choice === "instructions") {
@@ -1107,7 +1109,7 @@ async function selectScheduledTaskWorker(
   // added earlier in the same unsaved visit is pickable, and one removed
   // earlier is not offered, matching what Save will persist.
   const eligible = Object.entries(workerResources)
-    .filter(([, value]) => entry.kind === "execute" || workerResourceSupportsResearch(config, value.selection));
+    .filter(([, value]) => entry.kind === "execute" || entry.kind === "inplace" || workerResourceSupportsResearch(config, value.selection));
   const rows = sortedCatalogKeys(Object.fromEntries(eligible) as WorkerResourceCatalog, config, scoped);
   const options = [
     `Inherit global route (current at run time)${entry.workerResourceId === undefined ? "  current" : ""}`,

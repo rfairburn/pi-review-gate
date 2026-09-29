@@ -394,21 +394,24 @@ test("a source change around recovery cannot surface a selector error after the 
     const cursor = page.details.evidence.cursor;
     assert.ok(typeof cursor === "string" && cursor.length > 0, "the unfiltered ranged read must issue a cursor");
 
-    // Narrow instrumentation at the real buildEvidenceRead boundary: after the
+    // Narrow instrumentation at the real buildEvidenceRead boundary (#220:
+    // the method now receives the owning group first, so in-place tasks can
+    // locate their execution-root artifacts; the seam follows the same shape).
+    // After the
     // next evidence build returns (the preflight), replace the source file with
     // different records — the controlled interleaving an external writer
     // (append/rotation, retention GC) would cause between two separate reads of
     // the same task. In the old two-read path the second build then ran after
     // the recovery save and failed with a stale-cursor selector error.
     const seam = controller as unknown as {
-      buildEvidenceRead: (task: unknown, selector: unknown) => Promise<unknown>;
+      buildEvidenceRead: (group: unknown, task: unknown, selector: unknown) => Promise<unknown>;
     };
     const originalBuild = seam.buildEvidenceRead.bind(controller);
     let builds = 0;
     let replacementArmed = true;
-    seam.buildEvidenceRead = async (task: unknown, selector: unknown) => {
+    seam.buildEvidenceRead = async (group: unknown, task: unknown, selector: unknown) => {
       builds += 1;
-      const read = await originalBuild(task, selector);
+      const read = await originalBuild(group, task, selector);
       if (replacementArmed) {
         replacementArmed = false;
         // Same source id, different records: the cursor's covered last record

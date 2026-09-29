@@ -147,7 +147,7 @@ export interface WaveWorkerTask {
   acceptanceCriteria: string[];
   relevantContext?: string;
   /** Persisted background role for recovery-bundle adoption. */
-  backgroundKind?: "execute" | "research";
+  backgroundKind?: "execute" | "research" | "inplace";
   /** Canonical durable authorization and initial-activation contract. */
   executorToolCatalog?: ExecutorToolCatalog;
   /** Acknowledged steering in delivery order. Later entries supersede conflicting earlier task text. */

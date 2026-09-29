@@ -89,12 +89,13 @@ function subscribeWeakRow(executionId: string, owner: WeakRef<object>): () => vo
 }
 
 const SHARED_PROMPT_GUIDELINES = [
-  "Use SubtasksStart with an array of one or more bounded tasks and kind execute or research; retain the stable execution/task handles returned for every task.",
+  "Use SubtasksStart with an array of one or more bounded tasks and kind execute, research, or inplace; retain the stable execution/task handles returned for every task.",
+  "Use kind inplace (#220) only when work genuinely must happen in a specific existing directory — the workspace can be the primary workspace, an empty folder, or a checkout prepared for the task, with or without Git. An inplace worker writes directly in that selected workspace with no wave capture, no candidate commit, and no landing: its writes and any external side effects happen where performed and are not gated, rolled back, or undone by review. Its own reviewer reports on the recorded workspace delta since launch and cannot prove which post-launch changes were made by concurrent writers. Inplace workers cannot launch subtasks.",
   "Prefer beneficial parallelism over idle capacity: launch independent ready work concurrently when its expected time or primary-context benefit outweighs dispatch, review, and integration costs. Capacity is an opportunity, not a utilization target — there is no minimum task count or obligation to manufacture work, and waiting or serial execution is correct when nothing useful and independent is ready.",
   "Construct bounded tasks: one concrete, coherent outcome per subtask with explicit boundaries, invariants, and observable acceptance criteria. Minimize simultaneous unresolved decisions without assuming which model serves the worker; resolve architectural uncertainty before dispatching dependent implementation slices; keep genuinely dependent source-writing slices sequential and parallelize independent slices only when shared contracts are settled; do not fragment tightly coupled work merely to create more tasks.",
-  "SubtasksStart accepts an optional top-level workspace string selecting an existing, explicitly authorized development checkout or Git worktree as the group's capture and landing destination; omitted or blank uses the parent session's working directory. The target is resolved once at start: every capture, reviewed landing, restore, continuation, and recovery path uses it, SubtasksAdd inherits the group's target, and steering never retargets it. Each task still gets its own isolated worktree captured from the target; several workers may land into the same target, and separate groups may target different repositories concurrently under the shared global capacity limits.",
+  "SubtasksStart accepts an optional top-level workspace string selecting the group's target workspace. For execute groups it is an existing, explicitly authorized development checkout or Git worktree that is captured from and landed into; for inplace groups it is the directory the workers run and write directly in — any existing directory, including non-Git or empty. Omitted or blank uses the parent session's working directory in both cases. The target is resolved once at start: SubtasksAdd inherits the group's target, and steering never retargets it. Execute tasks each get their own isolated worktree captured from the target and land reviewed changes back into it; inplace tasks have no capture or landing, several may share one workspace, and concurrent writers' changes are not attributable to them.",
   "Use kind research for substantial independent read-only discovery that can proceed in the background. Use concurrent foreground read/web/shell calls for quick, shallow, or tightly coupled investigation, and continue useful foreground work while research runs.",
-  "Research groups return reports and never land workspace changes. Execution groups review and land accepted changes.",
+  "Research groups return reports and never land workspace changes. Execute groups review and land accepted changes into their target. Inplace groups leave every write where the worker performed it, with the worker's own review outcome reported in place.",
   "Use SubtasksAdd to top off a running execution without waiting for slower tasks.",
   "Each task captures main independently when dispatched and lands independently when accepted.",
   "Use SubtasksInspect for durable state and recent activity; artifact paths permit deeper rg-based investigation.",
@@ -108,7 +109,7 @@ const SHARED_PROMPT_GUIDELINES = [
   completionNotificationGuidanceLine(),
   "Start/add distinguish tasks already assigned for executor startup from tasks still waiting for capacity. Completion events report the COMPLETE verdict or not-yet-complete sibling list, plus the estimated top-off opportunity for SubtasksAdd when scheduling information is available. Use SubtasksInspect for the durable execution revision, peak concurrency, and per-phase task timing instead of expecting them in completion notifications.",
   "A conflicted result means main contains conflict markers and automatic landings are blocked. Resolve it immediately and call SubtasksMarkClean.",
-  "Use SubtasksForceMerge on a stopped execute task to land its verified checkpoint, or — when no ordinary checkpoint exists (for example after an attached-HEAD checkpoint failure, interruption, or failed critical state) — to salvage an identified snapshot of the worker's actual work from its retained worktree or surviving refs. An explicit force-merge merges ALL identified work in one call for every source kind: clean paths apply and ordinary text conflicts materialize standard diff3 markers that you then resolve and clear with SubtasksMarkClean; there is no clean-only mode and no second force option. A verified checkpoint is landed only when it carries all identified retained work; newer retained work supersedes it, and unorderable sources are surfaced as ambiguous instead of guessed. Salvage transfers only evidence-backed content, preserves conflicting and ambiguous target content, records forced-salvage provenance without fabricating review or a normal checkpoint, and never auto-lands deferred work afterward. Every force-merge outcome requires manual inspection of the main workspace and never proves the requested changes are present or correct.",
+  "Use SubtasksForceMerge on a stopped execute task to land its verified checkpoint, or — when no ordinary checkpoint exists (for example after an attached-HEAD checkpoint failure, interruption, or failed critical state) — to salvage an identified snapshot of the worker's actual work from its retained worktree or surviving refs. Force-merge, interrupt-with-merge, and SubtasksMarkClean do not exist for inplace or research tasks: inplace writes already happened where the worker performed them (inspect that workspace directly) and research has no mergeable workspace output. An explicit force-merge merges ALL identified work in one call for every source kind: clean paths apply and ordinary text conflicts materialize standard diff3 markers that you then resolve and clear with SubtasksMarkClean; there is no clean-only mode and no second force option. A verified checkpoint is landed only when it carries all identified retained work; newer retained work supersedes it, and unorderable sources are surfaced as ambiguous instead of guessed. Salvage transfers only evidence-backed content, preserves conflicting and ambiguous target content, records forced-salvage provenance without fabricating review or a normal checkpoint, and never auto-lands deferred work afterward. Every force-merge outcome requires manual inspection of the main workspace and never proves the requested changes are present or correct.",
   "A request to cancel or stop without landing means interrupt_as_failure. Use interrupt_with_merge only when the user explicitly wants a mechanical checkpoint landing; it never guarantees the requested changes are present or correct, so inspect the main workspace manually afterward in every case.",
   terminalWakeGuidanceLine(),
 ];
@@ -116,7 +117,7 @@ const SHARED_PROMPT_GUIDELINES = [
 function toolDescription(action: Action): string {
   switch (action) {
     case "start":
-      return "Start 1–16 durable background execution or read-only research subtasks, optionally targeting an existing authorized checkout/worktree via workspace, and return stable execution/task handles immediately.";
+      return "Start 1–16 durable background execute, research, or in-place subtasks — optionally selecting an existing authorized checkout/worktree (execute) or any directory the workers write in directly (inplace) via workspace — and return stable handles immediately.";
     case "add":
       return "Add 1–16 durable background subtasks to an existing execution so freed capacity can be topped off.";
     case "inspect":
@@ -403,7 +404,11 @@ export class ExecutionToolManager {
         const ui = commandUi(ctx);
         if (!ui) throw new Error("interactive selector is unavailable; use /subtask-interrupt <executionId> <taskId> <failure|merge>");
         const kind = this.controller.inspect(executionId, taskId).kind;
-        const options = kind === "research"
+        // Interrupt-with-merge exists for execute tasks only: research groups
+        // never land, and inplace groups (#220) hold no captured checkpoint —
+        // their writes already happened in the workspace and are not rolled
+        // back or gated by an interrupt.
+        const options = kind === "research" || kind === "inplace"
           ? ["Interrupt as failure"]
           : ["Interrupt as failure", "Interrupt and merge checkpoint"];
         const selectedMode = await ui.select("Interrupt outcome", options);
@@ -513,10 +518,13 @@ export class ExecutionToolManager {
 
     const task = await this.formTaskFields(ui);
     if (!task) return undefined;
-    const kind = await ui.select("Execution kind", ["execute", "research"]);
+    const kind = await ui.select("Execution kind", ["execute", "research", "inplace — write in a selected directory (no capture/landing)"]);
     if (!kind) return undefined;
-    if (kind !== "execute" && kind !== "research") throw new Error("kind must be execute or research");
-    const workspace = await this.formPrompt(ui, "Target workspace (optional; leave blank to use the current session workspace)");
+    const resolvedKind = kind.startsWith("inplace") ? "inplace" : kind === "research" ? "research" : "execute";
+    if (kind !== "execute" && kind !== "research" && !kind.startsWith("inplace")) throw new Error("kind must be execute, research, or inplace");
+    const workspace = await this.formPrompt(ui, resolvedKind === "inplace"
+      ? "In-place workspace directory (required path; may be an existing non-Git or empty directory; leave blank to use the current session workspace)"
+      : "Target workspace (optional; leave blank to use the current session workspace)");
     if (workspace === undefined) return undefined;
     const resolvedWorkspace = workspace.trim();
     // Explicit final submission step: the staged destination, kind, workspace,
@@ -524,19 +532,19 @@ export class ExecutionToolManager {
     // the user explicitly submits, and cancellation creates no group.
     const confirmed = await this.confirmStagedSubmission(ui, {
       destination: "a new execution group",
-      kind,
+      kind: resolvedKind,
       workspace: resolvedWorkspace ? resolvedWorkspace : this.input.cwd(),
       task,
     });
     if (!confirmed) return undefined;
     const nativeInput = {
-      kind,
+      kind: resolvedKind,
       tasks: [task],
       ...(resolvedWorkspace ? { workspace: resolvedWorkspace } : {}),
     };
     return await this.controller.start(
-      this.withParentTools([task], kind),
-      kind,
+      this.withParentTools([task], resolvedKind),
+      resolvedKind,
       resolvedWorkspace ? resolvedWorkspace : undefined,
       { startCallFingerprint: toolCallFingerprint("SubtasksStart", nativeInput) },
     );
@@ -905,7 +913,7 @@ export class ExecutionToolManager {
   private withParentTools(tasks: BackgroundTaskDefinition[], kind: BackgroundTaskKind): BackgroundTaskDefinition[] {
     const allowedTools = this.input.authorizedTools?.() ?? activeToolSnapshot(this.input.pi);
     if (!allowedTools) {
-      throw new Error(`${kind === "research" ? "Research" : "Execution"} requires an authoritative parent active-tool snapshot; the current Pi host did not provide one.`);
+      throw new Error(`${kind === "research" ? "Research" : kind === "inplace" ? "In-place" : "Execution"} requires an authoritative parent active-tool snapshot; the current Pi host did not provide one.`);
     }
     // #73: GitRead is a research-role capability. Research children inherit it
     // through the read-only intersection (and its conservative initial-active
@@ -913,9 +921,14 @@ export class ExecutionToolManager {
     // never carry it in the durable allowed ceiling or initial set, and an
     // explicit child catalog naming it for an execute task fails closed at
     // subset validation below.
+    // #220: inplace children additionally lose every Subtasks*-prefixed
+    // delegation control — the parent's other authorized capabilities stay
+    // intact, but an in-place worker cannot launch recursive subtasks.
     const childTools = kind === "research"
       ? researchToolIntersection(allowedTools)
-      : allowedTools.filter((tool) => tool !== GIT_READ_TOOL_NAME);
+      : (kind === "inplace"
+        ? allowedTools.filter((tool) => tool !== GIT_READ_TOOL_NAME && !tool.startsWith("Subtasks"))
+        : allowedTools.filter((tool) => tool !== GIT_READ_TOOL_NAME));
     return tasks.map((task) => {
       // Validate any supplied contract, but preserve only an explicitly named
       // initial set. The authoritative parent snapshot always determines the
@@ -996,8 +1009,8 @@ function toolSchema(action: Action): Record<string, unknown> {
     case "start":
       properties.kind = {
         type: "string",
-        enum: ["execute", "research"],
-        description: "execute produces reviewed workspace changes that land; research is read-only and returns a report. Defaults to execute.",
+        enum: ["execute", "research", "inplace"],
+        description: "execute produces reviewed workspace changes that land; research is read-only and returns a report; inplace (#220) runs a write-capable worker directly in the selected workspace (any existing directory, Git or not) with no capture or landing — writes stay where performed, it cannot launch subtasks, and its own reviewer reports on the recorded workspace delta without gating or undoing anything. Defaults to execute.",
       };
       // #25: no minLength — an empty or whitespace-only string is a valid
       // input that normalizes to "omitted" (parent session's working directory).
@@ -1131,7 +1144,7 @@ function normalizeInput(action: Action, value: unknown): NormalizedInput {
     normalized.afterMs = afterMs;
   }
   if (value.kind !== undefined) {
-    if (value.kind !== "execute" && value.kind !== "research") throw new Error("kind must be execute or research");
+    if (value.kind !== "execute" && value.kind !== "research" && value.kind !== "inplace") throw new Error("kind must be execute, research, or inplace");
     normalized.kind = value.kind;
   }
   if (value.workspace !== undefined) {
@@ -1261,7 +1274,7 @@ function backgroundResult(
     ? " Queued tasks may wait for executor startup or available pool capacity."
     : "";
   const notificationMode = subtaskNotificationMode(config ?? {} as ReviewGateConfig);
-  const successVerb = inspection.kind === "research" ? "reports" : "lands";
+  const successVerb = inspection.kind === "research" ? "reports" : inspection.kind === "inplace" ? "settles in place" : "lands";
   const notificationContract = notificationModeContractProse(notificationMode, successVerb);
   const scheduling = inspection.scheduling;
   const schedulingSummary = action === "start" || action === "add"

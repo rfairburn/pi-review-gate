@@ -201,8 +201,11 @@ export function reviewerProgressLabel(reviewer: DeciderConfig): string {
  * external agent definitions it needs, or throws on blockage. With subtask
  * review off, no selection is resolved or validated and no reviewer runs:
  * a changed task takes the explicit `completed_unreviewed` path.
+ *
+ * Exported for the #220 in-place worker lifecycle: the in-place kind reviews
+ * with the same subtask reviewer selection rules as execute/research.
  */
-function freezeReviewers(
+export function freezeReviewers(
   config: ReviewGateConfig,
   scopedModels: string[] = [],
 ): { frozenConfig: ReviewGateConfig; enabled: boolean } {
@@ -241,8 +244,12 @@ function freezeReviewers(
  * Create a worker-local ReviewWindow with a minimal ReviewGateState wrapper
  * so that state helpers (recordReviewerFeedback, armReviewResponseExchange)
  * can be used to maintain serial behavior.
+ *
+ * Also reused by the #220 in-place worker lifecycle, which keeps the same
+ * serial review-window mechanics while settling against workspace snapshots
+ * instead of candidate commits.
  */
-function createWorkerReviewState(): { state: ReviewGateState; window: ReviewWindow } {
+export function createWorkerReviewState(): { state: ReviewGateState; window: ReviewWindow } {
   const state = createState();
   const window: ReviewWindow = {
     id: state.nextReviewWindowId++,
@@ -267,8 +274,11 @@ function createWorkerReviewState(): { state: ReviewGateState; window: ReviewWind
 /**
  * Build the complete review transmission message for correction or pass.
  * Uses the standard transmission format with all reviewer results.
+ *
+ * Exported for the #220 in-place worker lifecycle, which reuses the exact
+ * correction/pass transmission behavior for its own review cycles.
  */
-async function buildReviewTransmission(
+export async function buildReviewTransmission(
   reviewOutput: ReviewRunOutput,
   invocationDir: string,
   bundleDir: string,
@@ -392,7 +402,11 @@ async function runCandidateReview(
   });
 }
 
-async function runCandidateReviewWithRecovery(
+/**
+ * Run a review invocation with the shared retry policy; shared by the execute
+ * and #220 in-place lifecycles.
+ */
+export async function runCandidateReviewWithRecovery(
   invoke: () => Promise<ReviewRunOutput>,
   artifactDir: string,
   config: ReviewGateConfig,
@@ -435,7 +449,8 @@ async function runCandidateReviewWithRecovery(
   }
 }
 
-async function resolveReviewIncidents(artifactDir: string): Promise<void> {
+/** Review-retry incident diagnostics; shared by the execute and #220 in-place lifecycles. */
+export async function resolveReviewIncidents(artifactDir: string): Promise<void> {
   try {
     const operation = await readOperationRecord(join(artifactDir, "operation.json"));
     let changed = false;
@@ -452,7 +467,8 @@ async function resolveReviewIncidents(artifactDir: string): Promise<void> {
   }
 }
 
-async function recordReviewIncident(artifactDir: string, message: string, attempt: number, retryable: boolean): Promise<void> {
+/** Record one review-retry incident; shared by the execute and #220 in-place lifecycles. */
+export async function recordReviewIncident(artifactDir: string, message: string, attempt: number, retryable: boolean): Promise<void> {
   try {
     const operation = await readOperationRecord(join(artifactDir, "operation.json"));
     operation.state = retryable ? "retrying" : "paused_recoverable";
@@ -471,7 +487,8 @@ async function recordReviewIncident(artifactDir: string, message: string, attemp
   }
 }
 
-async function executionRetryDelay(base: number, max: number, jitter: boolean, retry: number, signal?: AbortSignal): Promise<void> {
+/** Retry-backoff delay; shared by the execute and #220 in-place lifecycles. */
+export async function executionRetryDelay(base: number, max: number, jitter: boolean, retry: number, signal?: AbortSignal): Promise<void> {
   if (base === 0) return;
   const ceiling = Math.min(max, base * 2 ** Math.max(0, retry - 1));
   const delay = jitter ? Math.floor(ceiling * (0.5 + Math.random() * 0.5)) : ceiling;

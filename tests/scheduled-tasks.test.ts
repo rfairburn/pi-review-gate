@@ -170,7 +170,7 @@ test("scheduled task entries reject invalid definitions strictly", () => {
     [{ "task-a": { ...validEntry, cron: "" } }, /scheduledTasks\.task-a\.cron must be a non-empty/],
     [{ "task-a": { ...validEntry, cron: "99 * * * *" } }, /minute value "99" is out of range/],
     [{ "task-a": { ...validEntry, enabled: "yes" } }, /scheduledTasks\.task-a\.enabled must be a boolean/],
-    [{ "task-a": { ...validEntry, kind: "deploy" } }, /scheduledTasks\.task-a\.kind must be execute or research/],
+    [{ "task-a": { ...validEntry, kind: "deploy" } }, /scheduledTasks\.task-a\.kind must be execute, research, or inplace/],
     [{ "task-a": { ...validEntry, instructions: "" } }, /scheduledTasks\.task-a\.instructions must be a non-empty string/],
     [{ "task-a": { ...validEntry, workspace: "" } }, /scheduledTasks\.task-a\.workspace must be a non-empty string/],
     [{ "task-a": { ...validEntry, workerResourceId: "no such id" } }, /scheduled task worker resource id may contain only/],

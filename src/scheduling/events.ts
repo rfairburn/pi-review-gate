@@ -21,7 +21,7 @@ export function scheduledTaskDefinition(entryId: string, entry: ScheduledTaskEnt
 
 export interface ScheduledRunView {
   executionId: string;
-  kind: "execute" | "research";
+  kind: "execute" | "research" | "inplace";
   tasks: Array<{ taskId: string; title: string; state: string }>;
 }
 

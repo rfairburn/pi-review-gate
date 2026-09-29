@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { mkdtemp, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ExecutorPoolEntry, ExecutorSelection, ReviewGateConfig, ScheduledTaskReviewOverride } from "../config";
 import {
   effectiveReviewSettings,
@@ -44,6 +44,8 @@ import {
   cloneTask,
   isActiveTaskState,
   isArchivableTaskState,
+  isInPlaceKind,
+  isWriteCapableKind,
   MAX_ACTIVITY,
   newTask,
   salvageEvidenceRequiresRetention,
@@ -51,6 +53,7 @@ import {
   stateFromWaveProgress,
   taskTiming,
   transitionTaskState,
+  workerRouteKeyForKind,
   isStoppedForExit,
   type BackgroundActivityEvent,
   type ForceMergeSalvageProvenance,
@@ -84,8 +87,9 @@ import {
 } from "./subtask-notifications";
 import { notifyDispatchCards } from "./dispatch-cards";
 import type { ContinuationProgressUpdate, ExecutorInteractionAcknowledgement, ExecutorLiveControl, SubtaskDispatchRecord } from "./types";
-import { executeWave, type WaveProgressUpdate } from "./wave-controller";
+import { executeWave, type WaveProgressUpdate, type WaveResult, type WaveTaskResult } from "./wave-controller";
 import { resumeWaveWorker, runWaveWorker, type WaveWorkerResult } from "./wave-worker";
+import { runInplaceLifecycle, type InPlaceLifecycleResult } from "./inplace-worker";
 import { captureWaveBase, discoverWaveSource, readWaveCaptureRecord, type WaveCaptureResult } from "./wave-repository";
 import { executeWaveLanding, planWaveLanding } from "./wave-landing";
 import {
@@ -722,7 +726,9 @@ export class BackgroundExecutionController {
           } else if (task.state === "stopped_for_application_exit" && task.bundle) {
             const instructionId = `application-resume-${randomUUID()}`;
             task.pendingContinuation = {
-              instructions: "Resume after the owning application restarted. Reinspect the preserved worktree and finish the original task without repeating completed work.",
+              instructions: group.kind === "inplace"
+                ? "Resume after the owning application restarted. Reinspect the selected workspace in place and finish the original task without repeating completed work; writes already performed there were not rolled back."
+                : "Resume after the owning application restarted. Reinspect the preserved worktree and finish the original task without repeating completed work.",
               instructionId,
             };
             task.commands.push({
@@ -735,6 +741,26 @@ export class BackgroundExecutionController {
             });
             transitionTaskState(task, "queued");
             task.summary = "Exact parent conversation restored; durable continuation queued automatically.";
+            task.updatedAt = new Date().toISOString();
+          } else if (task.state === "stopped_for_application_exit" && isInPlaceKind(group.kind) && task.inplaceResult?.session) {
+            // #220: a stopped in-place task preserves its executor session and
+            // workspace; resume it in place with a system continuation that
+            // discloses that prior writes were performed and not rolled back.
+            const instructionId = `application-resume-${randomUUID()}`;
+            task.pendingContinuation = {
+              instructions: "Resume after the owning application restarted. Reinspect the selected workspace in place and finish the original task without repeating completed work; writes already performed there were not rolled back.",
+              instructionId,
+            };
+            task.commands.push({
+              instructionId,
+              action: "continue",
+              actor: "system",
+              text: task.pendingContinuation.instructions,
+              status: "queued",
+              createdAt: new Date().toISOString(),
+            });
+            transitionTaskState(task, "queued");
+            task.summary = "Exact parent conversation restored; in-place continuation queued automatically.";
             task.updatedAt = new Date().toISOString();
           } else if (task.state === "stopped_for_application_exit" && !task.waveRoot) {
             transitionTaskState(task, "queued");
@@ -802,8 +828,12 @@ export class BackgroundExecutionController {
       if (kind === "research" && !workerResourceSupportsResearch(this.input.config, pinned.selection)) {
         throw new Error(`Scheduled worker resource ${options.workerResourceId} cannot run research tasks; choose a research-capable resource for this entry.`);
       }
-    } else if (resolvedWorkerRoute(this.input.config, kind).length === 0) {
-      throw new Error(`No ${kind} worker route is configured. Add at least one eligible resource in /review-settings.`);
+    } else if (resolvedWorkerRoute(this.input.config, workerRouteKeyForKind(kind)).length === 0) {
+      throw new Error(
+        kind === "inplace"
+          ? "No execution worker route is configured for in-place tasks. Add at least one eligible resource to the execution priority in /review-settings."
+          : `No ${kind} worker route is configured. Add at least one eligible resource in /review-settings.`,
+      );
     }
     if (kind === "research" && options?.reviewOverride?.mode === "selected") {
       // Issue #26: research runs have no review stage, so a selected-reviewer
@@ -819,10 +849,14 @@ export class BackgroundExecutionController {
         `At most ${MAX_UNSETTLED_TASKS_PER_EXECUTION} unsettled tasks are admitted per execution; ${tasks.length} were requested. Split the work across sequential top-offs after tasks settle.`,
       );
     }
-    const root = await realpath(await mkdtemp(join(tmpdir(), "pi-review-execution-")));
+    // #220 pass-1: the in-place workspace may contain the system temp tree;
+    // place the group's artifact root OUTSIDE the selected directory (or fail
+    // closed at start when no writable outside location exists). The kind is
+    // passed through; execute/research keep the default temp root.
+    const { root, tempBase } = await createExecutionRoot(cwd, kind);
     // Group creation awaited the filesystem: a detach/shutdown may have begun
     // (and completed its quiescence) meanwhile. Never attach a group — and
-    // never register a save tail — after lifecycle completion; discard the
+    // // never register a save tail — after lifecycle completion; discard the
     // unused root instead.
     if (this.shuttingDown || this.detaching > 0 || this.detachEpoch !== detachEpoch) {
       await rm(root, { recursive: true, force: true });
@@ -837,6 +871,7 @@ export class BackgroundExecutionController {
       executionId,
       kind,
       root,
+      ...(tempBase ? { tempBase } : {}),
       cwd,
       sessionCwd: resolve(this.input.cwd()),
       ...(options?.scheduledTaskId !== undefined ? { scheduledTaskId: options.scheduledTaskId } : {}),
@@ -1051,7 +1086,7 @@ export class BackgroundExecutionController {
       // One coherent read: confined artifact scan and selector navigation over
       // the same snapshot. Confinement and cursor checks are unchanged; any
       // scoped selector error is thrown before any mutation.
-      evidenceRead = await this.buildEvidenceRead(task, evidence);
+      evidenceRead = await this.buildEvidenceRead(group, task, evidence);
     }
     for (const task of group.tasks.filter((task) => !taskId || task.taskId === taskId)) {
       if (group.kind !== "execute" || !task.waveRoot || isArchivableTaskState(task.state)
@@ -1092,16 +1127,21 @@ export class BackgroundExecutionController {
    * paths); all content is redacted before retention or display. Cursor and
    * navigation failures propagate as explicit errors.
    */
-  private async buildEvidenceRead(task: BackgroundTaskRecord, selector: SubtaskEvidenceSelector): Promise<SubtaskEvidenceRead> {
-    const artifactDir = task.waveRoot ? join(task.waveRoot, "artifacts", task.taskId) : undefined;
+  private async buildEvidenceRead(
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    selector: SubtaskEvidenceSelector,
+  ): Promise<SubtaskEvidenceRead> {
+    const artifactDir = this.durableArtifactDirOf(group, task);
     let operation: OperationRecord | undefined;
     const contextUnavailable: SubtaskEvidenceUnavailable[] = [];
     if (artifactDir) {
-      // Validate the artifact root against the authorized wave root BEFORE
-      // reading anything through it: a symlinked or moved artifact directory
-      // must not become a read path outside the wave. Escapes throw
-      // (fail closed); missing/non-directory roots are noted and skipped.
-      const authorizedRoot = await resolveArtifactRoot(task.waveRoot, artifactDir, contextUnavailable);
+      // Validate the artifact root against the authorized root (wave root for
+      // execute/research, the execution root for in-place, #220) BEFORE reading
+      // anything through it: a symlinked or moved artifact directory must not
+      // become a read path outside the owned tree. Escapes throw (fail closed);
+      // missing/non-directory roots are noted and skipped.
+      const authorizedRoot = await resolveArtifactRoot(task.waveRoot ?? group.root, artifactDir, contextUnavailable);
       if (authorizedRoot) {
         // The operation record is optional evidence context. It is read through
         // the same bounded, confined regular-file reader as every other
@@ -1164,7 +1204,7 @@ export class BackgroundExecutionController {
           ? this.runtimes.has(task.taskId) ? "assigned_starting" : "waiting_for_capacity"
           : undefined,
         activity: task.activity.slice(offset === undefined ? Math.max(0, task.activity.length - count) : from, offset === undefined ? undefined : from + count),
-        artifactDir: task.waveRoot ? join(task.waveRoot, "artifacts", task.taskId) : undefined,
+        artifactDir: this.durableArtifactDirOf(group, task),
         liveControl: this.runtimes.get(task.taskId)?.control
           ? {
               adapter: this.runtimes.get(task.taskId)!.control!.adapter,
@@ -1367,6 +1407,31 @@ export class BackgroundExecutionController {
     const { group, task } = target;
     const archiveOnly = target.archiveOnly === true;
     this.assertContinuationAdmission(task, epoch);
+    // #220: an in-place task continues by resuming its retained session in the
+    // same workspace — there is no wave bundle, capture, or checkpoint, so the
+    // bundle-required strict path must never claim otherwise. Recovery for a
+    // task that never dispatched stays bundle-less by design.
+    if (isInPlaceKind(group.kind)) {
+      const duplicate = task.commands.find((command) => command.instructionId === input.instructionId);
+      if (duplicate) return this.inspect(group.executionId, task.taskId);
+      if (isArchivableTaskState(task.state)) {
+        throw new Error(`In-place continuation refused: task ${task.taskId} is ${task.state}; settled in-place work stays where the worker made it and cannot be re-run through this handle. Launch a new in-place task instead.`);
+      }
+      task.pendingContinuation = { instructions: input.instructions, instructionId: input.instructionId };
+      task.commands.push({
+        instructionId: input.instructionId,
+        action: "continue",
+        actor: input.actor,
+        text: input.instructions,
+        status: "queued",
+        createdAt: new Date().toISOString(),
+      });
+      transitionTaskState(task, "queued");
+      this.addActivity(task, "continue", `In-place continuation admitted (${input.instructionId}): the same workspace is reused without a captured base or checkpoint; prior writes remain.`);
+      await this.save(group);
+      void this.pump();
+      return this.inspect(group.executionId, task.taskId);
+    }
     if (group.kind === "execute" && (!task.bundle || input.bundle
       || (!isArchivableTaskState(task.state) && task.result?.taskResults[0]?.acceptedCommitSha))) {
       await this.recoverTaskAssociation(group, task, input.bundle);
@@ -1843,6 +1908,9 @@ export class BackgroundExecutionController {
     actor: "model" | "user";
   }): Promise<BackgroundInspection> {
     const { group, task } = this.resolveTask(input.executionId, input.taskId);
+    if (isInPlaceKind(group.kind) && input.mode === "interrupt_with_merge") {
+      throw new Error("In-place tasks cannot use interrupt_with_merge: writes were performed directly in the workspace, so there is no captured checkpoint to merge and no rollback of what already ran. Use interrupt_as_failure.");
+    }
     if (group.kind === "research" && input.mode === "interrupt_with_merge") {
       throw new Error("Research tasks cannot use interrupt_with_merge because research workspaces are never eligible to land. Use interrupt_as_failure.");
     }
@@ -1958,6 +2026,9 @@ export class BackgroundExecutionController {
   async forceMerge(input: BackgroundForceMergeInput): Promise<BackgroundInspection> {
     if (this.shuttingDown) throw new Error("Application shutdown is in progress.");
     const { group, task } = this.resolveTask(input.executionId, input.taskId);
+    if (isInPlaceKind(group.kind)) {
+      throw new Error("In-place tasks have no mergeable checkpoint: the worker wrote directly in its selected workspace, so there is nothing to land and no rollback of anything already written. Inspect that workspace directly.");
+    }
     if (group.kind === "research") throw new Error("Research tasks have reports, not mergeable checkpoints; force-merge is unavailable.");
     if (this.continuationAdmissions.has(task.taskId)) throw new Error(`Task ${task.taskId} has a continuation admission in progress.`);
     if (this.runtimes.has(task.taskId) || isActiveTaskState(task.state)) {
@@ -2701,7 +2772,7 @@ export class BackgroundExecutionController {
         }
       }
       if (settled.length === group.tasks.length && !archivedRetention) {
-        await removeOwnedExecutionRoot(group.root);
+        await removeOwnedExecutionRoot(group.root, group.tempBase);
         this.groups.delete(executionId);
         this.dropActiveTasks(executionId);
         // Finding 15: retire every archive handle owned by the removed group,
@@ -2791,7 +2862,8 @@ export class BackgroundExecutionController {
 
   /**
    * Issue #26: the effective configuration for one group's worker launch.
-   * A scheduled execute group with a review override derives a
+   * A scheduled write-capable group (execute or in-place, #220) with a
+   * review override derives a
    * task-local config: `off` disables automatic subtask review (no PASS is
    * ever fabricated), `selected` replaces exactly the subtask reviewer set
    * while preserving the primary layer. The derivation is pure — the
@@ -2801,7 +2873,7 @@ export class BackgroundExecutionController {
   private groupConfig(group: BackgroundExecutionGroup): ReviewGateConfig {
     const override = group.scheduledReviewOverride;
     const pinned = group.scheduledWorkerResourceId;
-    if (pinned === undefined && (!override || group.kind !== "execute")) return this.input.config;
+    if (pinned === undefined && (!override || !isWriteCapableKind(group.kind))) return this.input.config;
     const base = this.input.config;
     // Issue #26: a pinned entry resolves exactly its pinned resource in every
     // downstream route derivation too — the wave's executor-pool guard and
@@ -2809,11 +2881,12 @@ export class BackgroundExecutionController {
     // whole run even when the kind's global route is empty, and failover can
     // never silently switch a pinned task onto a global-route worker (a
     // single-entry route fails closed instead). The base config is cloned,
-    // never mutated.
+    // never mutated. #220: the in-place kind draws its route key from the
+    // write-capable executor pool (the execute route).
     const execution = pinned === undefined || base.execution === undefined
       ? base.execution
-      : { ...base.execution, routes: { ...base.execution.routes, [group.kind]: [{ resourceId: pinned }] } };
-    if (override === undefined || group.kind !== "execute") {
+      : { ...base.execution, routes: { ...base.execution.routes, [workerRouteKeyForKind(group.kind)]: [{ resourceId: pinned }] } };
+    if (override === undefined || !isWriteCapableKind(group.kind)) {
       return execution === base.execution ? this.input.config : { ...base, execution };
     }
     // Materialize both layers explicitly: a legacy (activeReviewers-only)
@@ -2940,9 +3013,13 @@ export class BackgroundExecutionController {
       ? task.pendingContinuation
         ? this.runResearchContinuation(group, task, abort, lease)
         : this.runResearchFresh(group, task, abort, lease)
-      : task.pendingContinuation
-        ? this.runContinuation(group, task, abort, lease)
-        : this.runFresh(group, task, abort, lease))
+      : isInPlaceKind(group.kind)
+        ? task.pendingContinuation
+          ? this.runInplaceContinuation(group, task, abort, lease)
+          : this.runInplaceFresh(group, task, abort, lease)
+        : task.pendingContinuation
+          ? this.runContinuation(group, task, abort, lease)
+          : this.runFresh(group, task, abort, lease))
       .catch((error) => this.handleLaunchRejection(group, task, error))
       .finally(() => {
         // executeWave/continuation owns normal lease release. This is idempotent
@@ -3263,6 +3340,265 @@ export class BackgroundExecutionController {
         : result.error ?? "Research worker did not produce a usable report.";
       task.summary = task.error;
       await this.wake(task, "failure", `Research task ${task.taskId} stopped without a usable report: ${task.error}`);
+    }
+    task.updatedAt = new Date().toISOString();
+    await this.save(group);
+    await this.publishAssociations();
+    this.updateIndicator();
+  }
+
+  // ── #220 in-place worker kind ──
+
+  /** Durable artifact directory for an in-place task: the execution root's artifacts tree, kept OUTSIDE the workspace. */
+  private inplaceArtifactDir(group: BackgroundExecutionGroup, task: BackgroundTaskRecord): string {
+    return join(group.root, "artifacts", task.taskId);
+  }
+
+  /** Durable artifact directory of any task kind (wave root or execution root). */
+  private durableArtifactDirOf(group: BackgroundExecutionGroup, task: BackgroundTaskRecord): string | undefined {
+    return task.waveRoot ? join(task.waveRoot, "artifacts", task.taskId) : isInPlaceKind(group.kind) ? this.inplaceArtifactDir(group, task) : undefined;
+  }
+
+  private async runInplaceFresh(
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    abort: AbortController,
+    lease: ExecutorPoolLease,
+  ): Promise<void> {
+    await this.incorporatePrestartSteering(group, task);
+    task.generation += 1;
+    const priorState = transitionTaskState(task, "running");
+    this.addActivity(task, "running", `In-place worker starting in ${group.cwd}: writes go directly to that workspace; there is no wave capture, candidate, or landing.`);
+    await this.save(group);
+    const activation = stateTransitionNotice(task, priorState, task.state);
+    if (activation) await this.wake(task, "state", activation);
+    const artifactDir = this.inplaceArtifactDir(group, task);
+    const result = await this.runInplaceWorker(group, task, abort, lease, artifactDir, false, undefined);
+    await this.finishInplace(group, task, result, artifactDir);
+  }
+
+  private async runInplaceContinuation(
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    abort: AbortController,
+    lease: ExecutorPoolLease,
+  ): Promise<void> {
+    const pending = task.pendingContinuation;
+    if (!pending) throw new Error("In-place continuation was interrupted before executor dispatch.");
+    pending.instructions = await this.incorporateContinuationSteering(group, task, pending.instructions);
+    const command = task.commands.find((candidate) => candidate.instructionId === pending.instructionId);
+    // An interrupt during preprocessing terminalizes the queued continuation
+    // and clears pendingContinuation; never dispatch a failed continuation.
+    if (!command || task.pendingContinuation !== pending || command.status !== "queued") {
+      throw new Error("In-place continuation was interrupted before executor dispatch.");
+    }
+    task.pendingContinuation = undefined;
+    task.generation += 1;
+    const previous = transitionTaskState(task, "running");
+    command.status = "delivered";
+    command.deliveredAt = new Date().toISOString();
+    this.addActivity(task, "running", `Continuing in place in ${group.cwd} (${pending.instructionId}); prior writes remain and are not rolled back.`);
+    await this.save(group);
+    const activation = stateTransitionNotice(task, previous, task.state);
+    if (activation) await this.wake(task, "state", activation);
+    try {
+      const artifactDir = this.inplaceArtifactDir(group, task);
+      const result = await this.runInplaceWorker(
+        group,
+        task,
+        abort,
+        lease,
+        artifactDir,
+        true,
+        pending.instructions,
+      );
+      command.status = "acknowledged";
+      command.acknowledgedAt = new Date().toISOString();
+      await this.finishInplace(group, task, result, artifactDir);
+    } catch (error) {
+      command.status = "failed";
+      command.error = messageOf(error);
+      throw error;
+    }
+  }
+
+  /** Drive one full in-place lifecycle (turns, review, correction) for one task. */
+  private async runInplaceWorker(
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    abort: AbortController,
+    lease: ExecutorPoolLease,
+    artifactDir: string,
+    continuation: boolean,
+    feedback?: string,
+  ): Promise<InPlaceLifecycleResult> {
+    let currentLease = lease;
+    try {
+      return await runInplaceLifecycle({
+        taskId: task.taskId,
+        task: task.definition,
+        workspaceRoot: group.cwd,
+        artifactDir,
+        config: this.groupConfig(group),
+        scopedModels: this.scopedModels,
+        signal: abort.signal,
+        executorAssignment: currentLease,
+        acquireFailover: async (currentAssignment: ExecutorPoolAssignment) => {
+          currentLease.release();
+          const next = await this.pool.acquireAfterRoute(
+            currentAssignment,
+            () => this.routeForGroup(group),
+            abort.signal,
+          );
+          if (next) currentLease = next;
+          return next;
+        },
+        onLiveControl: (control) => {
+          const runtime = this.runtimes.get(task.taskId);
+          if (!runtime) return;
+          runtime.control = control;
+          runtime.controlStatus = control ? "registered" : "closed";
+          if (control) void this.flushQueuedSteering(group, task, runtime, control).catch((error) => {
+            void this.input.notify?.(`review gate: queued in-place steering delivery failed: ${messageOf(error)}`);
+          });
+        },
+        takeDeferredSteering: () => this.takeDeferredSteering(group, task),
+        onUpdate: (update) => this.inplaceProgress(group, task, update),
+        ...(continuation ? {
+          initialResult: task.inplaceResult,
+          continuation: { instructions: feedback ?? "" },
+        } : {}),
+      });
+    } finally {
+      currentLease.release();
+    }
+  }
+
+  private inplaceProgress(
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    update: import("./types").SubtaskProgressUpdate,
+  ): void {
+    const isDispatchCapture = Boolean(
+      update.dispatch
+      && (update.subtaskId === undefined || update.subtaskId === task.taskId),
+    );
+    const next = isDispatchCapture
+      ? undefined
+      : update.phase === "reviewing"
+        ? "reviewing"
+        : ["starting", "executing", "correcting", "confirming", "completing"].includes(update.phase)
+          ? "running"
+          : undefined;
+    const previous = next ? transitionTaskState(task, next) : task.state;
+    this.addActivity(task, `inplace:${update.phase}`, update.message);
+    this.applyExecutorIdentity(task, update as import("./types").SubtaskProgressUpdate);
+    if (isDispatchCapture && update.dispatch) {
+      this.recordDispatch(group, task, update.dispatch);
+    }
+    const saved = this.save(group);
+    void saved.catch((error) => this.input.notify?.(`review gate: failed to persist in-place progress: ${messageOf(error)}`));
+    const transition = next ? stateTransitionNotice(task, previous, next) : undefined;
+    const snapshot = transition ? transitionEventSnapshot(group, task) : undefined;
+    if (transition) void saved.then((persisted) => {
+      synchronizeEventSnapshot(snapshot!, persisted);
+      return this.wake(task, "state", transition, snapshot);
+    }).catch(() => undefined);
+    this.updateIndicator();
+  }
+
+  /** Settle one in-place task from its lifecycle result. No landing ever happens. */
+  private async finishInplace(
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    result: InPlaceLifecycleResult,
+    artifactDir: string,
+  ): Promise<void> {
+    task.inplaceResult = {
+      status: result.status === "cancelled" ? "cancelled" : result.status === "timeout" ? "timeout" : result.status === "executor_error" || result.status === "review_error" ? "executor_error" : "completed",
+      taskId: task.taskId,
+      title: task.definition.title,
+      summary: result.summary,
+      session: result.session,
+      adapter: result.adapter,
+      model: result.model,
+      usage: result.usage,
+      error: result.error,
+      operationRecord: result.operationRecord,
+      incidents: result.incidents ?? [],
+      attempts: result.attempts ?? 0,
+      lastExecutorTurn: result.lastExecutorTurn,
+    };
+    task.bundle = undefined;
+    const undelivered = this.failUndeliveredSteering(task, "The in-place task ended before queued steering reached a verified transport.");
+    // #220 pass-2 (finding 1): a stopped lifecycle carries the REAL workspace
+    // delta; when the delta could not be inspected it is UNKNOWN and the
+    // summaries/notices say so instead of claiming "no paths changed".
+    const changedNote = result.attributionError
+      ? `workspace delta could not be verified (${result.attributionError})`
+      : result.changedSinceLaunch.length > 0
+        ? `${result.changedSinceLaunch.length} path(s) changed since launch`
+        : "no workspace paths changed within the recorded bounded snapshot since launch";
+    const externalNote = result.observedExternalPaths?.length
+      ? `Tool-observed external side-effect candidate(s), prior state unverified: ${result.observedExternalPaths.join(", ")}.`
+      : "";
+    const observabilityLimits = [
+      ...(result.toolObservabilityNotes ?? []),
+      ...(result.toolObservationsTruncated ? ["the bounded event/path limit was reached and additional observations were omitted"] : []),
+    ];
+    const observabilityNote = observabilityLimits.length > 0
+      ? `Tool-event observability limits: ${observabilityLimits.join("; ")}. Missing events do not establish that no external action occurred.`
+      : "";
+    const snapshotPolicyNote = `Snapshot policy excludes ignored directories (including .git, node_modules, and dist) and may omit content for oversized or unreadable files; ${result.baseline.snapshot.omissions.length} omission(s) were recorded${result.baseline.snapshot.omissionsTruncated ? "; the omission list was truncated" : ""}.`;
+    const attributionNote = `Workspace ${result.workspaceRoot}; ${changedNote}. ${externalNote} ${observabilityNote} In-place review is post-hoc: no writes were gated, rolled back, or landed.`;
+    // #220 pass-1 (finding 5): the concurrent-writer attribution limitation is
+    // part of the DURABLE summary and completion prose itself — a passing
+    // reviewer that happens to stay silent still leaves consumers with the
+    // explicit warning that the recorded delta cannot prove authorship.
+    const attributionCaveat = " Attribution (authoritative): the recorded delta since launch names WHAT changed, not WHO changed it — the harness cannot prove which post-launch changes the worker made versus concurrent writers' changes; do not credit uncertain changes to the worker or treat them as reviewed worker output.";
+    if (isStoppedForExit(task)) {
+      task.summary = "In-place worker stopped for application shutdown; inspect the workspace and continue after restore.";
+      task.updatedAt = new Date().toISOString();
+      await this.save(group);
+      await this.publishAssociations();
+      return;
+    }
+    if (result.status === "reviewed" || result.status === "unreviewed" || result.status === "no_changes") {
+      task.result = synthesizeInPlaceWaveResult(group, task, result, artifactDir);
+      task.summary = result.status === "reviewed"
+        ? `${result.summary}\n\nIn-place task finished in place (reviewed): workspace ${result.workspaceRoot}; ${changedNote}. ${externalNote} ${observabilityNote} In-place review is post-hoc: no writes were gated, rolled back, or landed.\n${attributionCaveat}`
+        : result.status === "unreviewed"
+          ? `${result.summary}\n\nIn-place task finished in place (completed without review): workspace ${result.workspaceRoot}; ${changedNote}. ${externalNote} ${observabilityNote} Nothing was attributed beyond the recorded workspace delta, no verdict was fabricated, and concurrent writers' changes cannot be distinguished from the worker's.\n${attributionCaveat}`
+          : `In-place task finished in place with no recorded workspace delta within the bounded launch snapshot: workspace ${result.workspaceRoot}. ${snapshotPolicyNote} ${externalNote} ${observabilityNote} This does not establish that no external side effects occurred. If changes were expected, inspect the workspace.\n${attributionCaveat}`;
+      task.report = result.summary;
+      task.error = undefined;
+      transitionTaskState(task, "reported");
+      const snapshot = transitionEventSnapshot(group, task);
+      const persisted = await this.save(group);
+      await this.publishAssociations();
+      synchronizeEventSnapshot(snapshot, persisted);
+      const verdictLine = result.status === "unreviewed"
+        ? `In-place task ${task.taskId} finished in ${result.workspaceRoot} without review (subtask review disabled): no verdict was fabricated, the workspace changes were not gated, and they remain in place. ${changedNote}. ${externalNote} ${observabilityNote}${attributionCaveat}`
+        : result.status === "no_changes"
+          ? `In-place task ${task.taskId} finished in ${result.workspaceRoot} with no recorded workspace delta within the bounded launch snapshot. ${snapshotPolicyNote} ${externalNote} ${observabilityNote} This does not establish that no external side effects occurred; nothing was landed or attributed. If changes were expected, inspect the workspace.${attributionCaveat}`
+          : `In-place task ${task.taskId} finished in ${result.workspaceRoot}: its own review outcome and the recorded workspace delta are reported; nothing was gated, rolled back, or landed. ${changedNote}. ${externalNote} ${observabilityNote}${attributionCaveat}`;
+      await this.wake(task, undelivered.length > 0 ? "failure" : "completion", undelivered.length > 0
+        ? `${verdictLine} ${undelivered.length} queued steering instruction(s) were not applied.`
+        : verdictLine);
+      this.updateIndicator();
+      return;
+    }
+    if (result.status === "cancelled" || task.interruptionMode) {
+      transitionTaskState(task, "interrupted");
+      task.summary = `In-place worker was interrupted; writes it already performed in ${result.workspaceRoot} were NOT rolled back. ${changedNote}.${attributionCaveat}`;
+      await this.acknowledgeInterrupt(task);
+    } else {
+      transitionTaskState(task, "paused_recoverable");
+      task.error = undelivered.length > 0
+        ? `${undelivered.length} queued steering instruction(s) were not applied.`
+        : result.error ?? result.summary;
+      task.summary = `In-place task stopped before settlement (${result.status}). ${attributionNote} ${attributionCaveat} ${result.error ?? ""}`.trim();
+      await this.wake(task, "failure", `In-place task ${task.taskId} stopped before settlement: ${task.summary}`);
     }
     task.updatedAt = new Date().toISOString();
     await this.save(group);
@@ -4681,6 +5017,115 @@ function researchWorktree(capture: WaveCaptureResult, taskId: string): WorkerWor
       ? worktreeRoot
       : join(worktreeRoot, capture.discovery.relativeCwd),
   };
+}
+
+/**
+ * Create the durable execution group's root directory. Default storage stays
+ * under the system temp directory. For the #220 in-place kind the selected
+ * workspace may BE that temp tree (or contain it), so this resolves the
+ * nearest writable directory OUTSIDE the workspace and creates the root
+ * there, recording the non-default storage base on the group for guarded
+ * cleanup. A workspace that contains every candidate location fails closed
+ * before any group state exists.
+ */
+async function createExecutionRoot(workspace: string, kind: BackgroundTaskKind): Promise<{ root: string; tempBase?: string }> {
+  const namePrefix = "pi-review-execution-";
+  const tempRoot = await realpath(tmpdir());
+  if (!isInPlaceKind(kind) || !isInsideDirectory(workspace, tempRoot)) {
+    return { root: await realpath(await mkdtemp(join(tempRoot, namePrefix))), tempBase: undefined };
+  }
+  // Walk upward from the temp root: the nearest ancestor outside the selected
+  // workspace that this process can create and write. Every owned path keeps
+  // the pi-review-execution- name and is removed only through the guarded
+  // execution-root cleanup.
+  let candidate = tempRoot;
+  for (;;) {
+    const parent = dirname(candidate);
+    if (parent === candidate) break;
+    let parentReal: string | undefined;
+    try {
+      parentReal = await realpath(parent);
+    } catch {
+      parentReal = undefined;
+    }
+    if (parentReal === undefined) {
+      candidate = dirname(candidate);
+      continue;
+    }
+    if (isInsideDirectory(workspace, parentReal)) {
+      candidate = parentReal;
+      continue;
+    }
+    try {
+      const root = await realpath(await mkdtemp(join(parentReal, namePrefix)));
+      return { root, tempBase: parentReal };
+    } catch {
+      // Not a writable base: continue upward.
+      candidate = parentReal;
+      continue;
+    }
+  }
+  throw new Error(
+    `The in-place workspace ${workspace} contains every system temp location this extension can use for task artifacts; refusing to launch. Select a workspace that does not contain the system temp directory (in-place task artifacts must live outside the selected workspace).`,
+  );
+}
+
+/** Relative containment: true when `candidate` is inside or equal to `directory`. */
+function isInsideDirectory(directory: string, candidate: string): boolean {
+  const rel = relative(resolve(directory), resolve(candidate));
+  return !isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`);
+}
+
+/**
+ * #220: synthesize the task's result view for an in-place settlement. There
+ * is no wave capture or landing, so the result names the in-place source and
+ * carries no landing outcome at all. Review cycle identity stays in the
+ * artifact records (commit-identity fields are never invented here); the
+ * settled verdict and reviewer evidence travel through the review report.
+ */
+function synthesizeInPlaceWaveResult(
+  group: BackgroundExecutionGroup,
+  task: BackgroundTaskRecord,
+  result: InPlaceLifecycleResult,
+  artifactDir: string,
+): WaveResult {
+  const status = statusMapping(result.status);
+  return {
+    waveId: `inplace-${group.executionId}`,
+    waveRoot: group.root,
+    sourceRoot: result.workspaceRoot,
+    phase: "completed",
+    taskResults: [{
+      taskId: task.taskId,
+      title: task.definition.title,
+      status,
+      summary: result.summary,
+      error: result.error,
+      unreviewed: result.status === "unreviewed",
+      reviewReport: result.reviewReport,
+      operationRecord: result.operationRecord,
+      diagnostics: result.diagnostics,
+      incidents: result.incidents,
+      attempts: result.attempts,
+      artifactDir,
+      taskDefinition: task.definition,
+    }],
+  };
+}
+
+/** In-place lifecycle status expressed through the shared task-result status vocabulary. */
+function statusMapping(status: InPlaceLifecycleResult["status"]): WaveTaskResult["status"] {
+  switch (status) {
+    case "reviewed": return "accepted";
+    case "unreviewed": return "completed_unreviewed";
+    case "no_changes": return "no_changes";
+    case "review_error": return "review_error";
+    case "correction_cap": return "correction_cap";
+    case "executor_error": return "executor_error";
+    case "timeout": return "timeout";
+    case "cancelled": return "cancelled";
+    case "reviewer_blocked": return "reviewer_blocked";
+  }
 }
 
 async function continuationEntryId(task: BackgroundTaskRecord): Promise<string | undefined> {

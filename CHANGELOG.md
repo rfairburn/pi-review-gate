@@ -15,6 +15,26 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.91]
+
+### Added
+
+- In-place subtask kind (#220): a third, explicitly selected worker kind alongside
+  `execute` and `research` that runs a write-capable executor directly in a
+  launch-selected workspace — any existing directory, including an empty one or one
+  outside any Git repository — with no wave capture, candidate commit, or landing:
+  writes and external side effects happen where performed and are never gated, rolled
+  back, or landed. Selectable from `SubtasksStart`/`SubtasksAdd`, `/subtask-add`, and
+  scheduled entries (with their worker pin and review override); in-place workers cannot
+  launch subtasks, draw from the write-capable executor pool (the `execute` priority
+  route), review with the ordinary subtask review configuration, and cannot be
+  force-merged or interrupt-with-merge (their own reviewer reports on the recorded
+  workspace delta since launch, disclosing concurrent-writer uncertainty instead of
+  crediting unattributable changes to the worker or pretending writes were undone).
+  Settled in-place tasks end `reported` with the review outcome and workspace delta;
+  review-disabled runs settle completed-unreviewed in place. Existing execute/research
+  behavior, routes-as-configured, and defaults are unchanged.
+
 ## [0.1.0-dev.89]
 
 ### Fixed

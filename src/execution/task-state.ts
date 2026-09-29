@@ -37,7 +37,34 @@ export const BACKGROUND_TASK_STATES = [
 ] as const;
 
 export type BackgroundTaskState = typeof BACKGROUND_TASK_STATES[number];
-export type BackgroundTaskKind = "execute" | "research";
+/**
+ * The subtask worker kinds. `execute` isolates each task in a managed wave
+ * worktree and lands reviewed changes; `research` is read-only and reports;
+ * `inplace` (#220) runs a write-capable executor directly in the group's
+ * launch-selected workspace — any existing directory, Git or not — with no
+ * capture/landing and an own reviewer of attributable changes.
+ */
+export type BackgroundTaskKind = "execute" | "research" | "inplace";
+
+/** Kinds whose executor writes directly into the selected workspace without wave capture/landing. */
+export function isInPlaceKind(kind: BackgroundTaskKind): boolean {
+  return kind === "inplace";
+}
+
+/**
+ * The route key a kind draws its worker resources from. In-place workers share
+ * the write-capable executor pool (`execute` route) by design (#220): they run
+ * with the same authorized file/CLI/API capabilities an execute worker gets,
+ * just directly in the selected workspace instead of a managed worktree.
+ */
+export function workerRouteKeyForKind(kind: BackgroundTaskKind): "execute" | "research" {
+  return kind === "research" ? "research" : "execute";
+}
+
+/** True when the kind is write-capable (execute, in-place) for review/landing semantics. */
+export function isWriteCapableKind(kind: BackgroundTaskKind): boolean {
+  return kind === "execute" || kind === "inplace";
+}
 
 const ACTIVE_TASK_STATES: ReadonlySet<BackgroundTaskState> = new Set([
   "queued",
@@ -187,6 +214,12 @@ export interface BackgroundTaskRecord {
   dispatch?: SubtaskDispatchRecord;
   result?: WaveResult;
   researchResult?: WaveWorkerResult;
+  /**
+   * #220 in-place task only: the latest durable executor turn result. Holds
+   * the resumable executor session and the last turn summary; it never carries
+   * a candidate or checkpoint because in-place work has neither.
+   */
+  inplaceResult?: import("./inplace-worker").InPlaceWorkerResult;
   report?: string;
   reportPath?: string;
   summary?: string;

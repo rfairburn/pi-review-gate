@@ -601,7 +601,7 @@ export class ExecutionToolManager {
     const resolvedKind = kind.startsWith("inplace") ? "inplace" : kind === "research" ? "research" : "execute";
     if (kind !== "execute" && kind !== "research" && !kind.startsWith("inplace")) throw new Error("kind must be execute, research, or inplace");
     const workspace = await this.formPrompt(ui, resolvedKind === "inplace"
-      ? "In-place workspace directory (optional; may be an existing non-Git or empty directory; leave blank to use the current session workspace)"
+      ? "In-place workspace directory (optional; leave blank to use the current session workspace)"
       : "Target workspace (optional; leave blank to use the current session workspace)");
     if (workspace === undefined) return undefined;
     const resolvedWorkspace = workspace.trim();

@@ -569,6 +569,31 @@ test("the staged form cancels without creating a task or a group at any stage", 
     assert.deepEqual(manager.reviewReadiness(), []);
     assert.equal(kindCancel.notifications.length, 0);
 
+    // Cancel at the in-place workspace prompt after staging all task fields
+    // and the in-place kind: the exact in-place workspace label is offered,
+    // and dismissal creates neither a task nor a group.
+    const inplaceWorkspaceCancel = scriptedUi({
+      "Submit a subtask": "Create a new execution group",
+      "Task title": "Staged title",
+      "Task instructions": "Staged instructions",
+      "Acceptance criteria (one per line)": "criterion",
+      "Relevant context (optional; leave blank to omit)": "",
+      "Execution kind": "inplace — write in a selected directory (no capture/landing)",
+      "In-place workspace directory (optional; leave blank to use the current session workspace)": undefined,
+    });
+    await commandHandlers.get("subtask-add")!("", { ui: inplaceWorkspaceCancel.ui });
+    assert.deepEqual(inplaceWorkspaceCancel.prompts.map((entry) => entry.title), [
+      "Submit a subtask",
+      "Task title",
+      "Task instructions",
+      "Acceptance criteria (one per line)",
+      "Relevant context (optional; leave blank to omit)",
+      "Execution kind",
+      "In-place workspace directory (optional; leave blank to use the current session workspace)",
+    ]);
+    assert.deepEqual(manager.reviewReadiness(), []);
+    assert.equal(inplaceWorkspaceCancel.notifications.length, 0);
+
     // Cancel at the explicit final submission step after staging ALL fields
     // and settings (new-group destination): neither a task nor a group.
     const submitCancel = scriptedUi({

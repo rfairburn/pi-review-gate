@@ -30,6 +30,7 @@ import {
   type ExternalAgentConfig,
   type ExecutionRetryPolicy,
   type ScheduledTaskCatalog,
+  type ScheduledTaskDestination,
   type ScheduledTaskEntryConfig,
   type ScheduledTaskKind,
   type ScheduledTaskReviewOverride,
@@ -810,11 +811,40 @@ function scheduledSummary(catalog: ScheduledTaskCatalog): string {
 function scheduledTaskEntrySummary(entry: ScheduledTaskEntryConfig): string {
   const name = entry.name.trim() || "(unnamed)";
   const state = entry.enabled ? "enabled" : "disabled";
+  // Issue #222: the destination is shown in place of the subtask kind for
+  // orchestrator-turn entries, since the existing agent performs the turn
+  // itself; the staged kind still applies if the entry is switched back.
+  if ((entry.destination ?? "subtask") !== "subtask") {
+    return `${name} — ${entry.cron || "(no schedule)"} — orchestrator turn — ${state}`;
+  }
   return `${name} — ${entry.cron || "(no schedule)"} — ${scheduledTaskKindLabel(entry.kind)} — ${state}`;
 }
 
 function scheduledTaskKindLabel(kind: ScheduledTaskKind): string {
   return kind === "research" ? "research" : kind === "inplace" ? "in-place" : "execute";
+}
+
+/** Issue #222: editor row label for the per-entry schedule destination. */
+function scheduledTaskDestinationLabel(destination: ScheduledTaskDestination | undefined): string {
+  return destination === "orchestrator-turn" ? "Orchestrator turn" : "Subtask";
+}
+
+/** Issue #222 (correction): workspace row summary for the editor. */
+function scheduledTaskWorkspaceSummary(entry: ScheduledTaskEntryConfig): string {
+  if ((entry.destination ?? "subtask") !== "subtask") {
+    const workspace = entry.workspace ?? "";
+    return workspace.trim() ? `${workspace} (unused for orchestrator turns)` : "(not needed for orchestrator turns)";
+  }
+  return entry.workspace || "(not set)";
+}
+
+/** Selection options for the destination picker, with the current marked. */
+function scheduledTaskDestinationOptions(entry: ScheduledTaskEntryConfig): string[] {
+  const orchestrator = (entry.destination ?? "subtask") === "orchestrator-turn";
+  return [
+    `Subtask — isolated scheduled subtask (default)${orchestrator ? "" : "  current"}`,
+    `Orchestrator turn — deliver to the existing agent${orchestrator ? "  current" : ""}`,
+  ];
 }
 
 /** Compact display preview; never persisted or interpreted. */
@@ -829,6 +859,7 @@ function scheduledTaskWorkerSummary(
   config: ReviewGateConfig,
   scoped: ScopedModelChoice[],
 ): string {
+  if ((entry.destination ?? "subtask") !== "subtask") return "unused for orchestrator turns";
   if (entry.workerResourceId === undefined) return "Inherit global route";
   const resource = Object.prototype.hasOwnProperty.call(workerResources, entry.workerResourceId)
     ? workerResources[entry.workerResourceId]
@@ -839,6 +870,7 @@ function scheduledTaskWorkerSummary(
 }
 
 function scheduledTaskReviewSummary(entry: ScheduledTaskEntryConfig): string {
+  if ((entry.destination ?? "subtask") !== "subtask") return "unused for orchestrator turns";
   if (entry.review === undefined) return "Inherit global subtask review";
   if (entry.review.mode === "off") return "Off (no review)";
   return `${entry.review.reviewers.length} reviewer${entry.review.reviewers.length === 1 ? "" : "s"} selected`;
@@ -951,12 +983,13 @@ async function editScheduledTaskEntry(
   let lastKey: string | undefined;
   while (Object.prototype.hasOwnProperty.call(catalog, id)) {
     const entry = catalog[id]!;
-    const [nameRow, cronRow, kindRow, instructionsRow, workspaceRow, workerRow, reviewRow, enabledRow] = alignedSettingsRows([
+    const [nameRow, cronRow, kindRow, destinationRow, instructionsRow, workspaceRow, workerRow, reviewRow, enabledRow] = alignedSettingsRows([
       ["Name", entry.name],
       ["Schedule (cron)", entry.cron || "(not set)"],
       ["Kind", scheduledTaskKindLabel(entry.kind)],
+      ["Destination", scheduledTaskDestinationLabel(entry.destination)],
       ["Instructions", previewText(entry.instructions)],
-      ["Workspace", entry.workspace || "(not set)"],
+      ["Workspace", scheduledTaskWorkspaceSummary(entry)],
       ["Worker", scheduledTaskWorkerSummary(entry, workerResources, config, scoped)],
       ["Review", scheduledTaskReviewSummary(entry)],
       ["Enabled", entry.enabled ? "On" : "Off"],
@@ -967,6 +1000,7 @@ async function editScheduledTaskEntry(
         { key: "name", label: nameRow },
         { key: "cron", label: cronRow },
         { key: "kind", label: kindRow },
+        { key: "destination", label: destinationRow },
         { key: "instructions", label: instructionsRow },
         { key: "workspace", label: workspaceRow },
         { key: "worker", label: workerRow },
@@ -1004,13 +1038,31 @@ async function editScheduledTaskEntry(
       continue;
     }
     if (choice === "kind") {
-      const currentPrefix = entry.kind === "research" ? "Research" : entry.kind === "inplace" ? "In-place" : "Execute";
-      const options = ["Execute — write-capable subtask", "Research — read-only subtask", "In-place — write in a selected directory (no capture/landing)"]
-        .map((option) => option.startsWith(currentPrefix) ? `${option}  current` : option);
-      const selected = await ui.select("Scheduled task kind", options);
+      const kindOptions = [
+        `Execute — write-capable subtask${entry.kind === "execute" ? "  current" : ""}`,
+        `Research — read-only subtask${entry.kind === "research" ? "  current" : ""}`,
+        `In-place — write in a selected directory (no capture/landing)${entry.kind === "inplace" ? "  current" : ""}`,
+      ];
+      const selected = await ui.select((entry.destination ?? "subtask") === "subtask"
+        ? "Scheduled task kind"
+        : "Scheduled task kind (used when the destination is Subtask)", kindOptions);
       if (selected?.startsWith("Execute")) setCatalogKey(catalog, id, { ...entry, kind: "execute" });
       else if (selected?.startsWith("Research")) setCatalogKey(catalog, id, { ...entry, kind: "research" });
       else if (selected?.startsWith("In-place")) setCatalogKey(catalog, id, { ...entry, kind: "inplace" });
+      continue;
+    }
+    if (choice === "destination") {
+      const options = scheduledTaskDestinationOptions(entry);
+      const selected = await ui.select("Schedule destination", options);
+      if (selected?.startsWith("Subtask")) {
+        // Absence is the subtask default: the stored entry never carries a
+        // redundant "subtask" destination key (issue #26 inheritance rule).
+        const next: ScheduledTaskEntryConfig = { ...entry };
+        delete next.destination;
+        setCatalogKey(catalog, id, next);
+      } else if (selected?.startsWith("Orchestrator turn")) {
+        setCatalogKey(catalog, id, { ...entry, destination: "orchestrator-turn" });
+      }
       continue;
     }
     if (choice === "instructions") {
@@ -1050,9 +1102,13 @@ async function editScheduledTaskEntry(
       // every field through the bridge: a first-line leading-slash token
       // lists filesystem directories through the host's own provider —
       // never slash commands; the main chat prompt is untouched.
-      const entered = await editSettingText(ui, WORKSPACE_DIRECTORY_TITLE, entry.workspace);
+      // Issue #222 (correction): an orchestrator-turn entry never dispatches
+      // into a workspace, so its field may be cleared; a subtask entry
+      // still requires a non-empty path (Save validates it exists).
+      const orchestratorDestination = (entry.destination ?? "subtask") !== "subtask";
+      const entered = await editSettingText(ui, WORKSPACE_DIRECTORY_TITLE, entry.workspace ?? "");
       if (entered === undefined) continue;
-      if (!entered.trim()) {
+      if (!entered.trim() && !orchestratorDestination) {
         await notify(ui, "Workspace must be a non-empty string.", "error");
         continue;
       }
@@ -1188,7 +1244,7 @@ function expandScheduledTaskWorkspaces(catalog: ScheduledTaskCatalog): Scheduled
     // setter, drop the entry from the staged catalog, and make the merge in
     // persistReviewSettings classify it as staged-then-removed and delete it
     // from the config file.
-    setCatalogKey(out, id, { ...entry, workspace: expandHomePath(entry.workspace) });
+    setCatalogKey(out, id, { ...entry, workspace: expandHomePath(entry.workspace ?? "") });
   }
   return out;
 }
@@ -1196,11 +1252,12 @@ function expandScheduledTaskWorkspaces(catalog: ScheduledTaskCatalog): Scheduled
 /**
  * Save-time validation for the staged scheduled-task catalog. Every entry
  * must be complete and consistent: a real cron expression, non-empty
- * instructions, an existing authorized workspace directory (a leading
- * `~`/`~/...` is already expanded to its absolute home path by the save
- * boundary), a worker override that resolves in the independent catalog
- * (research-capable for research tasks), and a task-local reviewer set that
- * resolves like any global one.
+ * instructions, an existing authorized workspace directory for the subtask
+ * destination (a leading `~`/`~/...` is already expanded to its absolute home
+ * path by the save boundary; an orchestrator-turn entry never dispatches into
+ * a workspace, so it saves without one), a worker override that resolves in
+ * the independent catalog (research-capable for research tasks), and a
+ * task-local reviewer set that resolves like any global one.
  */
 async function validateScheduledTasks(
   catalog: ScheduledTaskCatalog,
@@ -1217,7 +1274,13 @@ async function validateScheduledTasks(
       return error instanceof Error ? error.message : String(error);
     }
     if (!entry.instructions.trim()) return `Scheduled task ${id} has no instructions`;
-    const workspace = entry.workspace.trim();
+    // Issue #222: orchestrator-turn entries resolve no workspace, worker
+    // resource, or task-local review at dispatch time (the existing agent
+    // runs in its current Pi cwd and brings its own model/tools/review), so
+    // those stored values are validated only when the entry is dispatched as
+    // (or switched back to) the subtask destination.
+    if ((entry.destination ?? "subtask") !== "subtask") continue;
+    const workspace = entry.workspace?.trim() ?? "";
     if (!workspace) return `Scheduled task ${id} has no workspace`;
     // Pi's native completion and the eventual subtask start both anchor
     // relative paths to this session cwd, not the extension process cwd.

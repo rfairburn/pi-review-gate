@@ -405,8 +405,23 @@ export interface ExecutionConfig {
   deferredPiTools?: boolean;
 }
 
-/** What a scheduled task runs: a write-capable subtask, a read-only research one, or an in-place worker (#220). */
+/**
+ * What a scheduled subtask runs: an isolated write-capable task, read-only
+ * research, or an in-place worker (#220). Kind is independent of the
+ * schedule destination; orchestrator turns do not dispatch a worker.
+ */
 export type ScheduledTaskKind = "execute" | "research" | "inplace";
+
+/**
+ * Where a due scheduled entry is delivered (issue #222). "subtask" is the
+ * existing isolated-subtask dispatch and the default for every entry
+ * (absence of the field is the default, so existing configs never migrate
+ * implicitly). "orchestrator-turn" delivers the due entry's instructions and
+ * occurrence identity as a new turn to the existing primary agent instead of
+ * starting a subtask: no second Pi, no workspace override, and the occurrence
+ * completes when its initiating turn ends.
+ */
+export type ScheduledTaskDestination = "subtask" | "orchestrator-turn";
 
 /**
  * A task-local review override (issue #26). `off` runs the task's subtasks
@@ -432,10 +447,23 @@ export interface ScheduledTaskEntryConfig {
   /** Disabled entries stay configured but are never dispatched. */
   enabled: boolean;
   kind: ScheduledTaskKind;
-  /** Instructions carried verbatim to the scheduled subtask. */
+  /**
+   * Schedule destination (issue #222). Absent means "subtask" — the existing
+   * isolated scheduled-subtask dispatch. The field is per-entry; the catalog
+   * holds the only copy.
+   */
+  destination?: ScheduledTaskDestination;
+  /** Instructions carried verbatim to the scheduled subtask or orchestrator turn. */
   instructions: string;
-  /** Explicit authorized target workspace directory for the scheduled run. */
-  workspace: string;
+  /**
+   * Explicit authorized target workspace directory for a scheduled SUBTASK
+   * run (required and validated for subtask-destination entries). An
+   * orchestrator-turn entry runs in the current Pi cwd, so the field is never
+   * interpreted for that destination: it may be omitted (or empty), and any
+   * stored value has no effect until the entry is switched back to subtask —
+   * it is never a per-entry cwd override for orchestrator turns.
+   */
+  workspace?: string;
   /**
    * Explicit worker resource id override from `execution.workerResources`.
    * Never requires a global-route membership: the independent catalog is the
@@ -702,12 +730,20 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
  * because a scheduled research task must not dispatch to an executor resource
  * that cannot perform research. In-place entries (#220) dispatch to the same
  * write-capable executor pool as execute entries and need no extra capability.
+ *
+ * Issue #222: worker-resource references are validated only for entries that
+ * still dispatch as scheduled subtasks. An orchestrator-turn entry resolves
+ * neither a worker nor a task-local review at dispatch time (the existing
+ * primary agent uses its own model, tools, and review behavior), so its
+ * stored overrides are validated when the entry is switched back to the
+ * subtask destination instead of failing config load for an unused field.
  */
 function validateScheduledTaskReferences(config: ReviewGateConfig): void {
   const scheduledTasks = config.scheduledTasks;
   if (!scheduledTasks) return;
   for (const [id, entry] of Object.entries(scheduledTasks)) {
     if (entry.workerResourceId === undefined) continue;
+    if ((entry.destination ?? "subtask") !== "subtask") continue;
     const resource = resolvedWorkerResource(config, entry.workerResourceId);
     if (!resource) {
       throw new Error(`scheduledTasks.${id} references unknown worker resource ${entry.workerResourceId}`);
@@ -741,8 +777,21 @@ function normalizeScheduledTasks(value: unknown): ScheduledTaskCatalog {
     if (kind !== "execute" && kind !== "research" && kind !== "inplace") {
       throw new Error(`scheduledTasks.${id}.kind must be execute, research, or inplace`);
     }
+    const destination = entry.destination === undefined ? undefined : entry.destination;
+    if (destination !== undefined && destination !== "subtask" && destination !== "orchestrator-turn") {
+      throw new Error(`scheduledTasks.${id}.destination must be "subtask" or "orchestrator-turn"`);
+    }
     const instructions = requireNonEmptyString(entry.instructions, `scheduledTasks.${id}.instructions`);
-    const workspace = requireNonEmptyString(entry.workspace, `scheduledTasks.${id}.workspace`);
+    // Issue #222 (correction): the workspace is required and validated only
+    // for subtask-destination entries. An orchestrator-turn entry runs in the
+    // current Pi cwd and never interprets the field, so it may be omitted
+    // entirely (a stored value stays, ready for a later subtask switch).
+    if (entry.workspace !== undefined && typeof entry.workspace !== "string") {
+      throw new Error(`scheduledTasks.${id}.workspace must be a string`);
+    }
+    const workspace = destination === "orchestrator-turn"
+      ? (typeof entry.workspace === "string" ? entry.workspace.trim() : "")
+      : requireNonEmptyString(entry.workspace, `scheduledTasks.${id}.workspace`);
     let workerResourceId: string | undefined;
     if (entry.workerResourceId !== undefined) {
       workerResourceId = normalizeOptionalNonEmptyString(entry.workerResourceId, `scheduledTasks.${id}.workerResourceId`);
@@ -756,6 +805,7 @@ function normalizeScheduledTasks(value: unknown): ScheduledTaskCatalog {
       cron,
       enabled: entry.enabled ?? true,
       kind,
+      ...(destination !== undefined ? { destination } : {}),
       instructions,
       workspace,
       ...(workerResourceId !== undefined ? { workerResourceId } : {}),

@@ -6,9 +6,10 @@ tools, and the external executor protocol. Field defaults live in
 [Configuration](configuration.md); crash and restart behavior lives in
 [Recovery](recovery.md).
 
-Delegated execution requires a Git executable on `PATH`: subtask capture, isolated
-worktrees, landing, recovery, and diff3 conflict materialization all invoke Git and fail
-closed without it. See [Getting started](getting-started.md#prerequisites).
+The `execute` and `research` kinds require a Git executable on `PATH`: subtask
+capture, isolated worktrees, landing, recovery, and diff3 conflict materialization
+invoke Git and fail closed without it. The `inplace` kind does not require Git or a
+repository. See [Getting started](getting-started.md#prerequisites).
 
 ## Native Pi duplicate-call preflight
 
@@ -911,14 +912,23 @@ calls are always supported.
 entry starts through this same background subtask path — no model or orchestrator
 launch turn begins the run. Scheduled executions appear in the widget and receive
 the ordinary owner-scoped notifications described above, so their outcomes are
-delivered exactly like any other execution's. An overlap skip (a due occurrence
+delivered exactly like any other execution's. After a successful dispatch, the top-level
+model also receives a launch notice through the same shared mechanism as a human
+`/subtask-add` — origin metadata, identical delivery lane, bounds, and causal
+ordering included. Subtask outcome notifications wait for the bounded notice
+attempt; if the model send remains unacknowledged, delivery is reported as
+uncertain and the notice may arrive later, so model-visible ordering cannot be
+guaranteed in that case. An overlap skip (a due occurrence
 while an earlier run of the same entry is still active) wakes the owning
 orchestrator with the schedule identity, the exact due time, and the active task
 handles. A due occurrence whose minute passed before its own dispatch could be
 admitted (a previous occurrence of the same entry had not yet settled) and no
 run is active is reported as not-run; it is never caught up. Configuration,
 per-entry inheritance, and daylight-saving semantics live in [Scheduled task
-fields](configuration.md#scheduled-task-fields).
+fields](configuration.md#scheduled-task-fields). Entries can instead target a
+turn of the existing orchestrator — see [Schedule
+destinations](configuration.md#schedule-destinations) — in which case no subtask
+starts for the occurrence.
 
 ## Review-readiness deferral
 

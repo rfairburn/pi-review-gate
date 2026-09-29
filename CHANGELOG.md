@@ -31,6 +31,10 @@ dates.
   force-merged or interrupt-with-merge (their own reviewer reports on the recorded
   workspace delta since launch, disclosing concurrent-writer uncertainty instead of
   crediting unattributable changes to the worker or pretending writes were undone).
+  Tool-observed outside-root writes reach review even with no in-root delta, with
+  unverified prior states and bounded after-content rather than fabricated diffs.
+  The selected root and original launch baseline survive continuation and ordinary
+  executor failover; prior direct effects are disclosed to the replacement worker.
   Settled in-place tasks end `reported` with the review outcome and workspace delta;
   review-disabled runs settle completed-unreviewed in place. Existing execute/research
   behavior, routes-as-configured, and defaults are unchanged.

@@ -16,6 +16,7 @@ import {
   type ParentCheckpointSaveResult,
 } from "./background-controller";
 import type { ReattachmentBundle } from "./operation-record";
+import { deliverSubtaskLaunchNotice, launchNoticeGate, type LaunchNoticeGate, type SubtaskLaunchNotice } from "./launch-notice";
 import { EVIDENCE_FILTERS, EVIDENCE_LIMIT_DEFAULT, EVIDENCE_LIMIT_MAX, EvidenceCursorError, EvidenceNavigationError, type SubtaskEvidenceSelector } from "./subtask-evidence";
 import { redactSensitiveText } from "../redaction";
 import { renderSubtaskResultCollapsed } from "./subtask-result-collapsed";
@@ -259,7 +260,7 @@ export class ExecutionToolManager {
     definition: BackgroundTaskDefinition,
     kind: BackgroundTaskKind,
     workspace: string | undefined,
-    options: { scheduledTaskId: string; workerResourceId?: string; reviewOverride?: ScheduledTaskReviewOverride },
+    options: { scheduledTaskId: string; workerResourceId?: string; reviewOverride?: ScheduledTaskReviewOverride; launchNoticeGate?: Promise<void> },
   ): Promise<BackgroundInspection> {
     const nativeInput = {
       tasks: [definition],
@@ -272,6 +273,83 @@ export class ExecutionToolManager {
       workspace,
       { ...options, startCallFingerprint: toolCallFingerprint("SubtasksStart", nativeInput) },
     );
+  }
+
+  /**
+   * Issue #222 (partial #215 integration): one human /subtask-submission path
+   * through the shared non-model-initiated launch-notice mechanism — the same
+   * delivery module, lane, bounds, redaction, and gate ordering the scheduler
+   * rides; only the origin metadata differs. The gate is registered with the
+   * admission so even a subtask that settles in milliseconds cannot deliver
+   * an outcome before the notice naming it, and a failed notice delivery is
+   * reported best-effort without turning an admitted execution into a failed
+   * command result.
+   */
+  private async startWithSharedLaunchNotice(
+    tasks: Parameters<BackgroundExecutionController["start"]>[0],
+    kind: Parameters<BackgroundExecutionController["start"]>[1],
+    workspace: string | undefined,
+    options: { startCallFingerprint?: string },
+  ): Promise<BackgroundInspection> {
+    const gate = launchNoticeGate();
+    let inspection: BackgroundInspection;
+    try {
+      inspection = await this.controller.start(tasks, kind, workspace, { ...options, launchNoticeGate: gate.pending });
+    } catch (error) {
+      gate.resolve(); // Nothing was admitted; no notification can be gated.
+      throw error;
+    }
+    await this.deliverSharedLaunchNotice(gate, {
+      origin: "human-command",
+      executionId: inspection.executionId,
+      kind: inspection.kind,
+      tasks: inspection.tasks.map((task) => ({ taskId: task.taskId, title: task.definition.title })),
+    });
+    return inspection;
+  }
+
+  /** Human /subtask-add of one task into an existing group (issue #222). */
+  private async addWithSharedLaunchNotice(
+    executionId: string | undefined,
+    tasks: Parameters<BackgroundExecutionController["add"]>[1],
+  ): Promise<BackgroundInspection> {
+    const gate = launchNoticeGate();
+    let inspection: BackgroundInspection;
+    try {
+      inspection = await this.controller.add(executionId, tasks, { launchNoticeGate: gate.pending });
+    } catch (error) {
+      gate.resolve(); // Nothing was added; no notification can be gated.
+      throw error;
+    }
+    const addedTaskIds = inspection.addedTaskIds ?? inspection.tasks.map((task) => task.taskId);
+    const addedTasks = inspection.tasks.filter((task) => addedTaskIds.includes(task.taskId));
+    await this.deliverSharedLaunchNotice(gate, {
+      origin: "human-command",
+      executionId: inspection.executionId,
+      kind: inspection.kind,
+      tasks: addedTasks.map((task) => ({ taskId: task.taskId, title: task.definition.title })),
+      addedTaskIds: addedTaskIds,
+    });
+    return inspection;
+  }
+
+  /**
+   * Shared notice delivery for a non-model-initiated admission. Resolves the
+   * gate in every outcome so result notifications can never be stranded;
+   * an unavailable model channel is reported best-effort (the admission
+   * itself still succeeded and its ordinary notifications stay active).
+   */
+  private async deliverSharedLaunchNotice(gate: LaunchNoticeGate, notice: SubtaskLaunchNotice): Promise<void> {
+    try {
+      const outcome = await deliverSubtaskLaunchNotice(this.input.pi, notice);
+      if (outcome === "unavailable") {
+        console.warn(`review gate: ${notice.origin === "scheduled" ? "scheduled" : "/subtask-add"} launch notice could not be delivered to the model; execution ${notice.executionId} was admitted and its ordinary notifications remain active`);
+      } else if (outcome === "uncertain") {
+        console.warn(`review gate: ${notice.origin === "scheduled" ? "scheduled" : "/subtask-add"} launch notice for execution ${notice.executionId} was accepted by the host but did not acknowledge within its bounded window; whether it was enqueued is UNKNOWN and it may still arrive`);
+      }
+    } finally {
+      gate.resolve();
+    }
   }
 
   /** Issue #26: unsettled scheduled runs of one entry (overlap detection). */
@@ -356,7 +434,7 @@ export class ExecutionToolManager {
       // APIs, which are unchanged.
       await this.prepareCommandDispatch(ctx);
       const definition = plainTextSubtaskDefinition(trimmed);
-      return await this.controller.start(
+      return await this.startWithSharedLaunchNotice(
         this.withParentTools([definition], "execute"),
         "execute",
         undefined,
@@ -508,7 +586,7 @@ export class ExecutionToolManager {
         task,
       });
       if (!confirmed) return undefined;
-      return await this.controller.add(target.executionId, this.withParentTools([task], target.kind));
+      return await this.addWithSharedLaunchNotice(target.executionId, this.withParentTools([task], target.kind));
     }
 
     const task = await this.formTaskFields(ui);
@@ -534,7 +612,7 @@ export class ExecutionToolManager {
       tasks: [task],
       ...(resolvedWorkspace ? { workspace: resolvedWorkspace } : {}),
     };
-    return await this.controller.start(
+    return await this.startWithSharedLaunchNotice(
       this.withParentTools([task], kind),
       kind,
       resolvedWorkspace ? resolvedWorkspace : undefined,

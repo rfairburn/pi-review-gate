@@ -932,9 +932,9 @@ async function runImageFlow(
       keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks
       keys(KEY_ENTER), // list → task entry (row 0)
       ...(options.skipField
-        ? [keys(...Array(9).fill(KEY_DOWN), KEY_ENTER)] // entry editor → Back (row 9)
+        ? [keys(...Array(10).fill(KEY_DOWN), KEY_ENTER)] // entry editor → Back (row 10)
         : [
-            keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → instructions (row 3)
+            keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → instructions (row 4)
             async (component: { handleInput?(data: string): void }): Promise<void> => {
               const editor = instances[0];
               assert.ok(editor, "the bridge editor instance exists");
@@ -950,7 +950,7 @@ async function runImageFlow(
               // cancels).
               component.handleInput?.(options.fieldDriver === "cancel" ? KEY_ESCAPE : ENTER);
             },
-            keys(...Array(6).fill(KEY_DOWN), KEY_ENTER), // entry re-show (instructions, row 3) → Back (row 9)
+            keys(...Array(6).fill(KEY_DOWN), KEY_ENTER), // entry re-show (instructions, row 4) → Back (row 10)
           ]),
       keys(...Array(3).fill(KEY_DOWN), KEY_ENTER), // list re-show (two entries) → Back (row 3)
       ...(options.outcome === "cancel"

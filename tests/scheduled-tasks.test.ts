@@ -537,6 +537,7 @@ const SCHEDULED_EDITOR_LABELS = [
   "Name",
   "Schedule (cron)",
   "Kind",
+  "Destination",
   "Instructions",
   "Workspace",
   "Worker",
@@ -1221,5 +1222,246 @@ test("the scheduler runtime row is a live process toggle and is never persisted"
   await plain.handler("", ctx);
   assert.equal(optionsSeen[0]!.some((option) => option.startsWith("Scheduler runtime")), false);
   resetSchedulerRuntimeForTests();
+  await rm(dir, { recursive: true, force: true });
+});
+// --- Issue #222: per-entry schedule destination ------------------------------
+
+/**
+ * Selection harness that also captures every (title, options) pair so tests
+ * can assert editor and list row text without consuming an extra selection.
+ */
+function capturingSelections(values: Array<string | undefined>, inputs: Array<string | undefined> = []): unknown {
+  let index = 0;
+  let inputIndex = 0;
+  const captured: Array<{ title: string; options: string[] }> = [];
+  return {
+    captured,
+    scopedModels: [],
+    ui: {
+      select: async (title: string, options: string[]) => {
+        captured.push({ title, options });
+        const value = values[index++];
+        if (value !== undefined) assert.ok(options.includes(value), `missing selection ${value}: ${options.join(" | ")}`);
+        return value;
+      },
+      input: async () => inputs[inputIndex++],
+      confirm: async () => false,
+      notify: () => {},
+    },
+  };
+}
+
+function capturedUiOf(ctx: unknown): Array<{ title: string; options: string[] }> {
+  return (ctx as { captured: Array<{ title: string; options: string[] }> }).captured;
+}
+
+test("a scheduled entry accepts the orchestrator-turn destination and keeps subtask entries unset", () => {
+  const catalog = configWithScheduledTasks({
+    "task-turn": {
+      name: "Daily summary",
+      cron: "0 8 * * *",
+      enabled: true,
+      kind: "execute",
+      destination: "orchestrator-turn",
+      instructions: "Produce the daily summary",
+      workspace: "/tmp/prg-turn",
+    },
+    "task-subtask": {
+      name: "Nightly docs check",
+      cron: "30 2 * * *",
+      enabled: true,
+      kind: "execute",
+      instructions: "Check the docs",
+      workspace: "/tmp/prg-nightly",
+    },
+  });
+  const config = normalizeConfig(catalog);
+  assert.equal(config.scheduledTasks?.["task-turn"]?.destination, "orchestrator-turn");
+  // Absence stays the single discriminator for the subtask default.
+  assert.equal(config.scheduledTasks?.["task-subtask"] && "destination" in config.scheduledTasks["task-subtask"], false);
+  // Cloning preserves the destination choice.
+  const cloned = cloneScheduledTaskCatalog(config.scheduledTasks!);
+  assert.equal(cloned["task-turn"]!.destination, "orchestrator-turn");
+});
+
+test("an unknown schedule destination is rejected with an actionable error", () => {
+  assert.throws(
+    () => normalizeConfig(configWithScheduledTasks({
+      "task-turn": { ...validEntry, destination: "delegate-to-peers" },
+    })),
+    /scheduledTasks\.task-turn\.destination must be "subtask" or "orchestrator-turn"/,
+  );
+  assert.throws(
+    () => normalizeConfig(configWithScheduledTasks({
+      "task-turn": { ...validEntry, destination: 7 },
+    })),
+    /scheduledTasks\.task-turn\.destination must be "subtask" or "orchestrator-turn"/,
+  );
+});
+
+test("an orchestrator-turn entry loads without a workspace while subtask entries still require one", () => {
+  const orchestrator = normalizeConfig(configWithScheduledTasks({
+    "task-turn": {
+      name: "Daily summary",
+      cron: "0 8 * * *",
+      enabled: true,
+      kind: "execute",
+      destination: "orchestrator-turn",
+      instructions: "Summarize the day",
+    },
+  }));
+  assert.equal(orchestrator.scheduledTasks?.["task-turn"]?.workspace, "");
+
+  assert.throws(
+    () => normalizeConfig(configWithScheduledTasks({ "task-subtask": { ...validEntry, workspace: undefined } })),
+    /scheduledTasks\.task-subtask\.workspace must be a non-empty string/,
+  );
+});
+
+test("worker-resource validation is skipped for orchestrator-turn entries and applies again for subtask entries", () => {
+  // An orchestrator-turn entry may keep a worker reference the catalog no
+  // longer has: dispatch never resolves it, so config load must not fail.
+  const orchestrator = normalizeConfig(configWithScheduledTasks({
+    "task-turn": { ...validEntry, workerResourceId: "removed-worker", destination: "orchestrator-turn" },
+  }));
+  assert.equal(orchestrator.scheduledTasks?.["task-turn"]?.destination, "orchestrator-turn");
+
+  assert.throws(
+    () => normalizeConfig(configWithScheduledTasks({
+      "task-subtask": { ...validEntry, workerResourceId: "removed-worker" },
+    })),
+    /scheduledTasks\.task-subtask references unknown worker resource removed-worker/,
+  );
+});
+
+test("/review-settings stages the orchestrator-turn destination with unused worker/review rows and saves it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-scheduled-destination-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    review: { primaryReviewers: [], subtaskReviewers: [] },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+  const ctx = capturingSelections([
+    rootSettingsRow("Scheduled tasks", "None"),
+    "Add scheduled task",
+    scheduledEditorRow("Schedule (cron)", "(not set)"),
+    scheduledEditorRow("Destination", "Subtask"),
+    "Orchestrator turn — deliver to the existing agent",
+    scheduledEditorRow("Instructions", "(not set)"),
+    "Back",
+    "Back",
+    "Save changes",
+  ], [
+    "Daily summary",
+    "0 8 * * *",
+    "Produce the daily summary",
+  ]);
+  await registered.handler("", ctx);
+
+  // The editor annotates the worker and review rows as unused under this
+  // destination; the destination row shows the staged choice.
+  const editorRows = capturedUiOf(ctx).map((capture) => capture.options)
+    .filter((options) => options.some((option) => option.startsWith("Destination")))
+    .at(-1);
+  assert.ok(editorRows, "the scheduled-task editor was shown");
+  assert.ok(editorRows!.some((row) => /^Worker\s+unused for orchestrator turns$/.test(row)), `worker row: ${editorRows!.join(" | ")}`);
+  assert.ok(editorRows!.some((row) => /^Review\s+unused for orchestrator turns$/.test(row)), `review row: ${editorRows!.join(" | ")}`);
+
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  const ids = Object.keys(saved.scheduledTasks);
+  assert.equal(ids.length, 1);
+  assert.equal(saved.scheduledTasks[ids[0]!].destination, "orchestrator-turn");
+  assert.equal(saved.scheduledTasks[ids[0]!].name, "Daily summary");
+  assert.equal(saved.scheduledTasks[ids[0]!].workspace, "", "the turn saves without a dummy workspace path");
+
+  // The scheduler list row shows the destination in place of the subtask kind.
+  const savedConfig = normalizeConfig(saved);
+  const listRegistered = commandHarness();
+  registerReviewSettings({ pi: listRegistered.pi, config: savedConfig, configPath });
+  const listCtx = capturingSelections([rootSettingsRow("Scheduled tasks", "1 of 1 enabled"), undefined]);
+  await listRegistered.handler("", listCtx);
+  const listRows = capturedUiOf(listCtx).flatMap((capture) => capture.options)
+    .find((option) => option.startsWith("1."));
+  assert.ok(listRows, "the scheduled-task list was shown");
+  assert.match(listRows!, /— orchestrator turn — enabled$/);
+
+  // Switching this workspace-free entry back to a subtask must not silently
+  // run in the orchestrator's cwd or save without an authorized workspace.
+  const previous = await readFile(configPath, "utf8");
+  const switchRegistered = commandHarness();
+  registerReviewSettings({ pi: switchRegistered.pi, config: savedConfig, configPath });
+  await switchRegistered.handler("", capturingSelections([
+    rootSettingsRow("Scheduled tasks", "1 of 1 enabled"),
+    "1. Daily summary — 0 8 * * * — orchestrator turn — enabled",
+    scheduledEditorRow("Destination", "Orchestrator turn"),
+    "Subtask — isolated scheduled subtask (default)",
+    "Back",
+    "Back",
+    "Save changes",
+    undefined,
+  ]));
+  assert.equal(await readFile(configPath, "utf8"), previous, "a switch to subtask without a workspace must leave saved config untouched");
+
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("/review-settings saves an orchestrator-turn entry with a stale worker reference and blocks the same entry once switched back", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-scheduled-destination-validate-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    review: { primaryReviewers: [], subtaskReviewers: [] },
+    scheduledTasks: {
+      "task-abcdef12": {
+        name: "Turn entry",
+        cron: "0 8 * * *",
+        enabled: true,
+        kind: "execute",
+        destination: "orchestrator-turn",
+        workerResourceId: "never-existed",
+        instructions: "Summarize the day",
+        workspace: dir,
+      },
+    },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  // Orchestrator-turn: the stale worker reference is inert and Save succeeds
+  // (the pass-through edit stages nothing but still exercises Save).
+  await registered.handler("", capturingSelections([
+    rootSettingsRow("Scheduled tasks", "1 of 1 enabled"),
+    "1. Turn entry — 0 8 * * * — orchestrator turn — enabled",
+    "Back",
+    "Back",
+    "Save changes",
+  ]));
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.scheduledTasks["task-abcdef12"].destination, "orchestrator-turn");
+  assert.equal(saved.scheduledTasks["task-abcdef12"].enabled, true);
+
+  // Switch the entry to the subtask destination in the menu: the same stored
+  // reference is re-validated and fails the Save closed. The menu stays up
+  // (values exhausted cancel it) and the file keeps the orchestrator staging.
+  const previous = await readFile(configPath, "utf8");
+  const config2 = normalizeConfig(saved);
+  const registered2 = commandHarness();
+  registerReviewSettings({ pi: registered2.pi, config: config2, configPath });
+  await registered2.handler("", capturingSelections([
+    rootSettingsRow("Scheduled tasks", "1 of 1 enabled"),
+    "1. Turn entry — 0 8 * * * — orchestrator turn — enabled",
+    scheduledEditorRow("Destination", "Orchestrator turn"),
+    "Subtask — isolated scheduled subtask (default)",
+    "Back",
+    "Back",
+    "Save changes",
+    undefined,
+  ]));
+  assert.equal(await readFile(configPath, "utf8"), previous, "the failed subtask re-validation save must mutate nothing");
+
   await rm(dir, { recursive: true, force: true });
 });

@@ -15,6 +15,42 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.90]
+
+### Added
+
+- Scheduled task entries gain a per-entry **schedule destination** (issue #222).
+  The existing `subtask` destination remains the default and every pre-existing
+  entry stays subtask-dispatched without migration: kind, workspace, worker
+  resource, task-local review, the one-unsettled-run-per-entry overlap rule,
+  and quiet/noisy completion behavior are unchanged. After a successful
+  scheduled-subtask dispatch, the top-level model now also receives a launch
+  notice with the schedule identity and execution/task handles through the
+  shared non-model-initiated subtask-launch mechanism used by human
+  `/subtask-add` (partial #215 integration): the same follow-up delivery lane,
+  redaction and bounds, origin metadata, and causal ordering, so a
+  fast-settling subtask's notifications wait for the bounded launch-notice
+  attempt. A definite rejection is reported as a failure; an unacknowledged
+  send is reported as uncertain and may still arrive, so later model delivery
+  cannot be guaranteed in that case. The notice never dispatches a duplicate
+  or implies completion.
+- Add the optional `orchestrator-turn` destination: the due entry's
+  instructions and occurrence identity are delivered as a new turn to the
+  existing primary agent — no second Pi, no workspace override, current
+  tools/model/review — the occurrence completes when its initiating turn ends
+  (optional subtasks started during the turn keep their own lifecycle and
+  never hold the occurrence open), later due occurrences are independent, and
+  a host without required run-lifecycle hooks refuses delivery rather than
+  starting an unreviewed turn, while a send
+  accepted but never acknowledged within its bounded window is reported as
+  uncertain (the turn may still arrive; never counted as executed). A
+  delivery that definitively cannot be performed fails closed with an
+  actionable scheduler wake.
+- `/review-settings` scheduled-entry editing gains a **Destination** row;
+  worker and review rows display as unused while an entry targets
+  orchestrator turns and their stored values are validated again when the
+  entry is switched back to the subtask destination.
+
 ## [0.1.0-dev.89]
 
 ### Fixed

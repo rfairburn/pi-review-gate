@@ -2,7 +2,10 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { deferredPiToolsEnabled, effectiveReviewSettings, loadConfig, materializeReviewConfig, resolveReviewers, type OperatingMode, type ScheduledTaskEntryConfig } from "./config";
 import { ScheduledTaskRuntime } from "./scheduling/dispatcher";
-import { deliverScheduledEvent, formatScheduledDispatchFailure, formatScheduledOverdueDrop, formatScheduledSkipEvent, scheduledTaskDefinition } from "./scheduling/events";
+import { createScheduledEntryDispatcher } from "./scheduling/dispatch";
+import { deliverScheduledEvent } from "./scheduling/events";
+import { ScheduledOrchestratorTurnTracker, findTriggeringCustomMessage } from "./scheduling/orchestrator-turn";
+import { deliverSubtaskLaunchNotice, type SubtaskLaunchNotice } from "./execution/launch-notice";
 import { getSchedulerRuntime } from "./scheduling/runtime";
 import { removeReviewBundle, removeTransientWindowBundle } from "./bundle";
 import { captureReviewCheckpoint, releaseReviewCheckpoint } from "./review-checkpoint";
@@ -15,7 +18,7 @@ import {
   shouldRecordToolCallEvidence,
   shouldRecordToolResultEvidence,
 } from "./evidence";
-import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, isEscapeTerminalInput, onTerminalInput, sendFollowUp, sendNotice, sendSteeringPrompt, sendTriggeredFollowUp, createStatusTracker, setStatus } from "./pi";
+import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, isEscapeTerminalInput, onTerminalInput, sendFollowUp, sendNotice, sendSteeringPrompt, sendTriggeredFollowUp, createStatusTracker, setStatus, type HookHandler } from "./pi";
 import { collectPausedReviewExchange, runReview, type ReviewRunOutput } from "./review";
 import {
   createReviewCancellationCoordinator,
@@ -91,6 +94,15 @@ const orchestratorBackgroundCompletionPrompt = [
 interface ActivationDependencies {
   /** Narrow injection seam used by lifecycle tests; production constructs it. */
   webTools?: Pick<WebToolManager, "register" | "cleanup" | "sync" | "applySavedSettings">;
+  /**
+   * Issue #222 lifecycle-test seams: a controlled scheduler clock/tick so a
+   * due occurrence can be exercised at a deterministic minute, and an access
+   * hook for the live orchestrator-turn tracker (occurrence attribution and
+   * settlement are observable in tests through its own state).
+   * Production constructs neither.
+   */
+  schedulerTimer?: { now?: () => number; tickIntervalMs?: number };
+  orchestratorTurnsTestAccess?: (tracker: ScheduledOrchestratorTurnTracker) => void;
 }
 
 export async function activate(pi: unknown, dependencies: ActivationDependencies = {}): Promise<void> {
@@ -343,6 +355,13 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     return operation;
   };
   let checkpointRestartBlocked: string | undefined;
+  /**
+   * A message_start-triggered run cannot be cancelled by this host after the
+   * message is admitted. If review/auth re-arming fails, fail closed at the
+   * native tool boundary for the rest of this session and refuse later
+   * scheduled orchestrator turns rather than allowing an unreviewed change.
+   */
+  let triggeringMessageReviewFailure: string | undefined;
   let backgroundCompletionMonitor: Promise<void> | undefined;
   let backgroundMonitorGeneration = 0;
   let backgroundReviewDeferred = false;
@@ -380,83 +399,12 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   // its state across reloads. Dispatch goes straight through the ordinary
   // subtask start path — no model or orchestrator launch turn — and every
   // outcome flows through the existing owner-scoped notification policy.
-  const schedulerSwitch = getSchedulerRuntime();
-  const scheduledRuntime = new ScheduledTaskRuntime({
-    switchState: schedulerSwitch,
-    catalog: () => config.scheduledTasks,
-    onDue: (entryId, entry, dueAt, overdue) => dispatchScheduledEntry(entryId, entry, dueAt, overdue),
-    onError: (message) => sendNotice(pi, `review gate: ${message}`),
-  });
-
-  /**
-   * Issue #26: one due occurrence of one scheduled entry. `dueAt` is the
-   * exact absolute minute the runtime sampled, so every skip and failure
-   * wake reports the scheduled due time — never the (possibly late)
-   * dispatch instant. Overlap is checked against the controller's live
-   * (and restored) groups: while any prior run of this entry still has
-   * unsettled tasks, EVERY due occurrence is skipped and reported with
-   * actionable identity/handle data — never queued, interrupted, or implied
-   * complete — including one whose admission was delayed past its due minute
-   * within the same On/Save epoch. An overdue occurrence with no active run
-   * is reported as not-run instead of launching a catch-up run. Otherwise the
-   * entry dispatches through the ordinary subtask start path with its
-   * independent per-entry worker/review overrides; a failed dispatch fails
-   * closed with an actionable wake instead of retrying silently.
-   */
-  const dispatchScheduledEntry = async (
-    entryId: string,
-    entry: ScheduledTaskEntryConfig,
-    dueAt: Date,
-    overdue: boolean,
-  ): Promise<void> => {
-    const activeRuns = executionTools.scheduledRuns(entryId);
-    if (activeRuns.length > 0) {
-      await wakeSchedulerOwner(formatScheduledSkipEvent(entryId, entry, dueAt, activeRuns));
-      return;
-    }
-    if (overdue) {
-      // No catch-up: the due minute passed before this entry's previous
-      // dispatch settled and no run is active — report the drop instead of
-      // launching a late run. The next due occurrence is evaluated independently.
-      await wakeSchedulerOwner(formatScheduledOverdueDrop(entryId, entry, dueAt));
-      return;
-    }
-    // Fail closed for managed scheduled-image assets: an entry whose
-    // instructions reference a managed image (see
-    // src/settings/scheduled-image-assets.ts) that no longer exists is an
-    // actionable dispatch failure through the existing wake — never a silent
-    // run against a dead path. The check sits inside the try so the failure
-    // uses the standard dispatch-failure report; overlap/overdue semantics
-    // above are unchanged.
-    let inspection: Awaited<ReturnType<typeof executionTools.startScheduled>>;
-    try {
-      if (loaded.path) {
-        await assertScheduledImagesPresent(entry.instructions, managedScheduledImageRoot(loaded.path));
-      }
-      inspection = await executionTools.startScheduled(
-        scheduledTaskDefinition(entryId, entry),
-        entry.kind,
-        entry.workspace,
-        {
-          scheduledTaskId: entryId,
-          ...(entry.workerResourceId !== undefined ? { workerResourceId: entry.workerResourceId } : {}),
-          ...(entry.review !== undefined ? { reviewOverride: entry.review } : {}),
-        },
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      await wakeSchedulerOwner(formatScheduledDispatchFailure(entryId, entry, dueAt, message));
-      return;
-    }
-    // A notice failure after start() returned cannot turn a real execution
-    // into a dispatch failure. Its ordinary outcome still uses the controller's
-    // owner notification path; report the missing start notice best-effort.
-    try {
-      await sendNotice(pi, `review gate: scheduled task ${entryId} (${entry.name}) dispatched as ${inspection.executionId} (${entry.kind}); ordinary subtask notifications will report its outcome`);
-    } catch {
-      console.warn(`review gate: scheduled task ${entryId} dispatched as ${inspection.executionId}, but its start notice could not be delivered; inspect that execution for its outcome`);
-    }
-  };
+  //
+  // Issue #222: the per-entry schedule destination is resolved by the shared
+  // dispatch layer. Scheduled subtask admissions additionally wake the model
+  // through the shared non-model-initiated launch notice (partial #215),
+  // held causally ordered by the controller's launch-notice gate so a fast
+  // completion can never precede the notice naming it.
 
   /** Issue #26: owner wake for scheduler-only events (skip/overdue drop/dispatch failure). */
   const wakeSchedulerOwner = async (content: string): Promise<void> => {
@@ -464,6 +412,90 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       await sendNotice(pi, content);
     }
   };
+
+  /**
+   * Issue #222: truthful turn-end observability for scheduled orchestrator
+   * turns. Its attribution hooks observe run and message boundaries before
+   * model work. The tracker's agent_settled handler is registered after the
+   * review gate's own handler, so review settlement finishes before the
+   * tracker marks an attributed occurrence complete. A host without hooks
+   * is rejected before an orchestrator turn is sent, and the limitation is
+   * reported instead.
+   */
+  const orchestratorTurnTracker = new ScheduledOrchestratorTurnTracker();
+  // Lifecycle-test seam: exposes the live tracker so host-faithful tests can
+  // observe attribution and settlement state.
+  dependencies.orchestratorTurnsTestAccess?.(orchestratorTurnTracker);
+
+  /**
+   * Issue #222: fail-closed orchestrator-turn admission guard, read at each
+   * dispatch: a host without every essential run-lifecycle hook can neither
+   * arm the review gate before a scheduled turn's model request (nothing on
+   * the idle path emits before_agent_start) nor attribute and settle the
+   * occurrence, and a blocked review restart cannot settle reviews at all.
+   * The unsafe scheduled turn is never delivered.
+   */
+  const orchestratorTurnUnsafeReason = (): string | undefined => {
+    if (orchestratorTurnTracker.turnEndTracking === "unavailable") {
+      return "the host does not expose the agent run-lifecycle hooks (agent_start, message_start, agent_end, agent_settled) this destination requires to arm review before the scheduled turn's model request and to attribute and settle the occurrence";
+    }
+    if (checkpointRestartBlocked) {
+      return `the review gate is blocked for this session (fresh checkpoint restart failed: ${checkpointRestartBlocked}), so the scheduled turn could not be reviewed; nothing was delivered`;
+    }
+    if (triggeringMessageReviewFailure) {
+      return `${triggeringMessageReviewFailure}; scheduled orchestrator turns are blocked for this session`;
+    }
+    return undefined;
+  };
+
+  const schedulerSwitch = getSchedulerRuntime();
+  /**
+   * Issue #222: one due occurrence of one scheduled entry, routed by the
+   * entry's destination through src/scheduling/dispatch.ts. `dueAt` is the
+   * exact absolute minute the runtime sampled, so every skip and failure wake
+   * reports the scheduled due time — never the (possibly late) dispatch
+   * instant. Subtask entries keep the ordinary subtask dispatch path (with
+   * its overlap skip, overdue drop, and fail-closed failure reporting) plus
+   * the shared model-facing launch notice; orchestrator-turn entries deliver
+   * into the existing agent and complete when the initiating turn ends.
+   */
+  const dispatchScheduledEntry = createScheduledEntryDispatcher({
+    pi,
+    executionTools,
+    reportOwnerEvent: wakeSchedulerOwner,
+    uiNotice: (message) => sendNotice(pi, message),
+    consoleWarn: (message) => console.warn(message),
+    deliverLaunchNotice: async (notice: SubtaskLaunchNotice) => {
+      // The bounded attempt is inside the shared module; an unavailable
+      // channel is never a silent launch: the execution stays admitted and
+      // the missing model wake is reported through the honest UI channel (a
+      // console report follows in the dispatch layer, which holds the
+      // outcome, so the UI notice carries only the user-visible part, and an
+      // uncertain window is never claimed either way).
+      const outcome = await deliverSubtaskLaunchNotice(pi, notice);
+      if (outcome === "unavailable") {
+        await sendNotice(pi, `review gate: scheduled launch notice for execution ${notice.executionId} could not be delivered to the model; the execution was admitted and its ordinary notifications remain active`);
+      } else if (outcome === "uncertain") {
+        await sendNotice(pi, `review gate: scheduled launch notice for execution ${notice.executionId} was accepted by the host but did not acknowledge within its bounded window; whether it was enqueued is UNKNOWN and it may still arrive`);
+      }
+      return outcome;
+    },
+    checkScheduledImages: async (entry: ScheduledTaskEntryConfig) => {
+      if (loaded.path) {
+        await assertScheduledImagesPresent(entry.instructions, managedScheduledImageRoot(loaded.path));
+      }
+    },
+    orchestratorTurns: orchestratorTurnTracker,
+    orchestratorTurnUnsafeReason,
+  });
+  const scheduledRuntime = new ScheduledTaskRuntime({
+    switchState: schedulerSwitch,
+    catalog: () => config.scheduledTasks,
+    onDue: (entryId, entry, dueAt, overdue) => dispatchScheduledEntry(entryId, entry, dueAt, overdue),
+    onError: (message) => sendNotice(pi, `review gate: ${message}`),
+    ...(dependencies.schedulerTimer?.now !== undefined ? { now: dependencies.schedulerTimer.now } : {}),
+    ...(dependencies.schedulerTimer?.tickIntervalMs !== undefined ? { tickIntervalMs: dependencies.schedulerTimer.tickIntervalMs } : {}),
+  });
 
   const effectiveReviewConfig = () => {
     if (state.reviewWindow && !state.reviewWindow.reviewConfig) {
@@ -619,6 +651,10 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     // scheduled subtasks are NOT interrupted — they settle through the
     // controller's own shutdown/recovery semantics below.
     scheduledRuntime.detach();
+    // Issue #222: a new session can never complete (or settle) the previous
+    // session's orchestrator-turn occurrences; correlation state is per
+    // session and cleared at both boundaries.
+    orchestratorTurnTracker.resetSession();
     await executionTools.shutdown();
     await webTools?.cleanup();
     await cleanupReviewBundles(state);
@@ -630,6 +666,10 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   });
 
   registerHook(pi, "session_start", async (...args) => {
+    // Issue #222: session boundaries reset orchestrator-turn correlation —
+    // only runs of the CURRENT session may settle its deliveries.
+    orchestratorTurnTracker.resetSession();
+    triggeringMessageReviewFailure = undefined;
     // Issue #213: interactive TUI sessions prewarm the running Pi agent peer
     // immediately — a fire-and-forget native import that overlaps the rest of
     // this hook (no timer, no visible UI) so the first /review-settings menu
@@ -831,24 +871,131 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     return undefined;
   });
 
-  registerHook(pi, "before_agent_start", async (...args) => {
+  /**
+   * Issue #222 (corrected): scheduled orchestrator-turn lifecycle observation
+   * and review arming against the real host's event machine. On an idle host
+   * a scheduled custom send starts its run directly (before_agent_start is
+   * never emitted for it); on a busy host the queued message is consumed by
+   * the running cycle's loop. Both host paths emit agent_start before the
+   * consuming run's message_start, whose message_start handler runs before
+   * that message's model request — so here:
+   *
+   * - agent_start/agent_end track the run-lifecycle sequences the tracker
+   *   uses to bind an observation to its consuming run and to know when that
+   *   run has ended;
+   * - message_start both attributes the scheduled occurrence (opaque
+   *   identity in the message details — never an unrelated
+   *   before_agent_start) and arms the review gate BEFORE the model request
+   *   for any triggering custom message delivered by this extension (idle
+   *   scheduled turn, launch notice, scheduler wake, or background-completion
+   *   wake).
+   *
+   * The agent_settled counterpart stays after the review settlement
+   * registration (the end of this activation), so the tracker only ever
+   * observes completed boundaries. Handlers are exception-safe; they fire
+   * for every run and message, including human-initiated ones, and only ever
+   * advance the occurrence lifecycle or arm the review gate (never dispatch
+   * or steer anything).
+   */
+  const registerObservabilityHook = (event: string, handler: HookHandler): boolean => {
+    try {
+      return registerHook(pi, event, handler);
+    } catch {
+      // A host that cannot provide this hook is rejected at dispatch time.
+      return false;
+    }
+  };
+  const orchestratorTurnHookRegistered = {
+    agentStart: registerObservabilityHook("agent_start", () => {
+      try {
+        orchestratorTurnTracker.agentRunStarted();
+      } catch {
+        // Observability must never break a run.
+      }
+    }),
+    agentEnd: registerObservabilityHook("agent_end", () => {
+      try {
+        orchestratorTurnTracker.agentRunEnded();
+      } catch {
+        // Observability must never break a run.
+      }
+    }),
+    messageStart: registerObservabilityHook("message_start", async (...args: unknown[]) => {
+      const message = findTriggeringCustomMessage(args);
+      if (!message) return;
+      const occurrenceId = message.customType === "pi-review-scheduled-orchestrator-turn"
+        ? message.details?.occurrenceId
+        : undefined;
+      if (!orchestratorTurnTracker.hasRunsInFlight()) {
+        // Real Pi emits agent_start before consuming a trigger-turn custom
+        // message. If that contract is absent at runtime, do not arm or
+        // attribute the message as though a real consuming run existed.
+        triggeringMessageReviewFailure ??= "a triggering custom message arrived without an observable agent run";
+        orchestratorTurnTracker.noteMessageArmingFailed(occurrenceId);
+        await sendNoticeUnlessItThrows(extractContext(args) ?? pi,
+          "review gate: a triggering custom message could not be correlated with an agent run; all Pi tool calls are blocked for this session, and scheduled orchestrator turns are disabled until a new session");
+        return;
+      }
+      // Attribute FIRST (cheap and synchronous): a send promise may reject
+      // while the async review baseline is being persisted. This identity is
+      // the host's exact message_start, never an unrelated before_agent_start.
+      const observed = occurrenceId !== undefined && orchestratorTurnTracker.noteMessageObserved(occurrenceId);
+      try {
+        // The scheduled instructions are the request the reviewer must
+        // evaluate, not merely an unattributed custom message in the session.
+        // A busy follow-up adds them to the current exchange; an idle custom
+        // turn opens a new review window before its baseline is captured.
+        if (observed) {
+          if (!message.content?.trim()) throw new Error("scheduled request text is unavailable");
+          rememberUserRequest(state, message.content);
+        }
+        // Fail-closed arming: this model request starts work this extension
+        // initiated outside the normal prompt path. For a busy queued turn the
+        // run already has an armed exchange baseline (shared window, no
+        // re-capture); for an idle run this captures the baseline HERE, before
+        // that message's model request.
+        const armed = await armAgentRun(args);
+        if (armed === "blocked") {
+          throw new Error("the review gate's checkpoint restart is blocked");
+        }
+        if (observed) await persistSessionState();
+      } catch (error) {
+        // Pi may continue the provider request after a message_start handler
+        // fails. Do not count this occurrence, block every native tool call
+        // before execution, and refuse later scheduled turns until a new
+        // session restores a trustworthy review/auth boundary.
+        triggeringMessageReviewFailure ??= "a triggering custom message could not reassert its review baseline and deferred-tool authorization";
+        orchestratorTurnTracker.noteMessageArmingFailed(occurrenceId);
+        console.warn(`review gate: ${triggeringMessageReviewFailure}: ${error instanceof Error ? error.message : String(error)}`);
+        await sendNoticeUnlessItThrows(extractContext(args) ?? pi,
+          "review gate: a triggering custom message could not reassert the review baseline and deferred-tool authorization; all Pi tool calls are blocked for this session, and scheduled orchestrator turns are disabled until a new session");
+      }
+    }),
+  };
+  /**
+   * Issue #222 (corrected lifecycle): the shared fail-closed run-arming body
+   * for every agent run this extension observes. The review gate's
+   * before_agent_start calls it for every normal user turn; the scheduled
+   * custom-message observation (message_start) calls it for the idle and
+   * queued scheduled runs whose submit path on real Pi hosts bypasses
+   * before_agent_start entirely. Idempotent for an already-armed run (a busy
+   * queued turn shares the exchange window the running cycle armed) and
+   * capturing a fresh checkpoint baseline for an idle run. It cannot modify
+   * the system prompt (message_start has no prompt result): the model-facing
+   * injection stays on the before_agent_start path only.
+   */
+  const armAgentRun = async (args: unknown[]): Promise<"armed" | "blocked"> => {
     // Pi may auto-activate tools registered after session_start. Reassert the
     // captured boundary immediately before every new agent request.
     deferredTools.reapply();
-    if (checkpointRestartBlocked) throw new Error(`review gate: fresh checkpoint restart failed (${checkpointRestartBlocked}); repair and restart before review`);
-    const authorizedToolInventory = deferredTools.startupGuidance();
+    if (checkpointRestartBlocked) return "blocked";
     agentRunActive = true;
     currentCwd = extractCwd(args, currentCwd);
-    pendingSettlementUsage = undefined;
-    pendingSettlementAborted = false;
-    pendingSettlementPausedForQuestion = false;
     updateScopedModels(args);
     executionTools.setScopedModels(currentScopedModels);
     executionTools.setUiContext(extractContext(args) ?? pi);
     beginAgentRun(state);
-    if (activeExchangeHasBaseline(state)) {
-      return executionPromptInjection(executionTools.criticalPrompt(), authorizedToolInventory, operatingModeSystemPrompt(args));
-    }
+    if (activeExchangeHasBaseline(state)) return "armed";
     const existing = state.reviewWindow?.baseline;
     if (existing && existing.kind !== "checkpoint") {
       // Restored legacy windows retain their own typed baseline and settle
@@ -856,7 +1003,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       if (state.reviewWindow?.activeExchange) state.reviewWindow.activeExchange.baseline = existing;
       freezeReviewWindowConfig(state, config, currentScopedModels);
       await persistSessionState();
-      return executionPromptInjection(executionTools.criticalPrompt(), authorizedToolInventory, operatingModeSystemPrompt(args));
+      return "armed";
     }
     const captured = existing ? undefined : await captureReviewCheckpoint(currentCwd, `window-${state.reviewWindow?.id ?? 0}-${randomUUID()}`);
     if (captured && captured.status !== "ok") throw new Error(`review gate: baseline capture failed (${captured.reason}): ${captured.detail}`);
@@ -877,10 +1024,27 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       }
       throw error;
     }
-    return executionPromptInjection(executionTools.criticalPrompt(), authorizedToolInventory, operatingModeSystemPrompt(args));
+    return "armed";
+  };
+
+  /**
+   * Issue #222 (corrected): the review gate's run-arming for normal user
+   * turns. Unchanged in behavior; the arming body is shared with the
+   * scheduled custom-message observation below.
+   */
+  registerHook(pi, "before_agent_start", async (...args) => {
+    const armed = await armAgentRun(args);
+    if (armed === "blocked") throw new Error(`review gate: fresh checkpoint restart failed (${checkpointRestartBlocked}); repair and restart before review`);
+    return executionPromptInjection(executionTools.criticalPrompt(), deferredTools.startupGuidance(), operatingModeSystemPrompt(args));
   });
 
   toolCallObserver = async (...args) => {
+    if (triggeringMessageReviewFailure) {
+      return {
+        block: true,
+        reason: `review gate: ${triggeringMessageReviewFailure}; no tool call may execute until the review/auth boundary is restored in a new session`,
+      };
+    }
     const decision = nativeToolPreflight.preflight(args);
     const name = extractToolName(args);
     const toolArgs = extractToolArgs(args);
@@ -1586,6 +1750,38 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     configPath: loaded.path,
     applyModeTransition: applyOperatingModeTransition,
   });
+
+  /**
+   * Issue #222 (corrected): scheduled orchestrator-turn settlement
+   * observation. Registered LAST so this tracker's settlement lands after
+   * the review gate's own agent_settled handler in the host's
+   * registration-ordered handler lists — the review settlement completes
+   * first, and the tracker only ever observes completed boundaries.
+   * Availability is decided from ACTUAL registration results: a host that
+   * cannot observe these events never has an unsafe scheduled orchestrator
+   * turn delivered (the dispatch-time guard rejects the occurrence instead
+   * of allowing an unreviewed turn).
+   */
+  let agentSettledRegistered = false;
+  try {
+    agentSettledRegistered = registerHook(pi, "agent_settled", () => {
+      try {
+        orchestratorTurnTracker.agentRunSettled();
+      } catch {
+        // Observability must never break a settlement.
+      }
+    });
+  } catch {
+    agentSettledRegistered = false;
+  }
+  orchestratorTurnTracker.setTurnEndTracking(
+    orchestratorTurnHookRegistered.messageStart
+      && orchestratorTurnHookRegistered.agentStart
+      && orchestratorTurnHookRegistered.agentEnd
+      && agentSettledRegistered
+      ? "host-lifecycle-hooks"
+      : "unavailable",
+  );
 }
 
 async function cleanupReviewBundles(state: ReviewGateState): Promise<void> {

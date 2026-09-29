@@ -328,11 +328,12 @@ consumes.
 | `name` | (required) | Human label, editable without changing the entry's stable key. |
 | `cron` | (required) | Standard five-field Unix cron expression (minute, hour, day-of-month, month, day-of-week), interpreted in the machine's local timezone. Ranges, lists, steps, and `jan`–`dec` / `sun`–`sat` names are accepted; `7` means Sunday. No seconds field and no `@` shorthands. |
 | `enabled` | `true` | Disabled entries stay configured but are never dispatched. |
-| `kind` | `"execute"` | `execute` (write-capable subtask) or `research` (read-only subtask). |
-| `instructions` | (required) | Instructions carried verbatim to the scheduled subtask. An image pasted through the native host editor is copied into a private managed store at Save and the instructions keep the managed absolute path — see [Scheduled instruction images](#scheduled-instruction-images). |
-| `workspace` | (required) | Explicit authorized target workspace directory for the scheduled run. A leading `~` or `~/...` expands against the user's home (the same Pi-native rule as the built-in file tools); every other spelling, including `~user`, is used verbatim. Save persists the expanded absolute spelling of a tilde workspace (the runtime separately resolves the target's realpath). |
-| `workerResourceId` | absent | Optional override naming an `execution.workerResources` entry. See below. |
-| `review` | absent | Task-local review choice. See below. |
+| `kind` | `"execute"` | `execute` (write-capable subtask) or `research` (read-only subtask). Applies to the subtask destination; see [Schedule destinations](#schedule-destinations). |
+| `destination` | `"subtask"` | Where a due occurrence is delivered: `"subtask"` (the existing isolated scheduled-subtask dispatch) or `"orchestrator-turn"` (a turn to the existing primary agent). See [Schedule destinations](#schedule-destinations). |
+| `instructions` | (required) | Instructions carried verbatim to the scheduled subtask or orchestrator turn. An image pasted through the native host editor is copied into a private managed store at Save and the instructions keep the managed absolute path — see [Scheduled instruction images](#scheduled-instruction-images). |
+| `workspace` | required for `subtask`; otherwise absent | Explicit authorized target directory for a scheduled subtask. A leading `~` or `~/...` expands against the user's home (the same Pi-native rule as the built-in file tools); every other spelling, including `~user`, is used verbatim. Save persists the expanded absolute spelling of a tilde workspace (the runtime separately resolves the target's realpath). Orchestrator-turn entries may omit it or leave it empty; any stored value is unused and never overrides the existing agent's current Pi launch workspace. Switching an entry back to `subtask` requires a valid workspace. |
+| `workerResourceId` | absent | Optional override naming an `execution.workerResources` entry. See below. Unused while the destination is `orchestrator-turn`. |
+| `review` | absent | Task-local review choice. See below. Unused while the destination is `orchestrator-turn`. |
 
 Example:
 
@@ -388,6 +389,65 @@ any stored copy going stale:
 
 The two inheritances are independent: an entry may pin a worker while
 inheriting review policy, or the reverse.
+
+### Schedule destinations
+
+Each scheduled entry selects where its due occurrences are delivered
+(issue #222). The choice is per-entry and never a global replacement for
+scheduled subtasks; existing entries stay subtask-dispatched without an
+implicit migration.
+
+**`subtask` (default; absence of the field has this meaning):** the entry
+dispatches through the ordinary scheduled-subtask path exactly as before —
+its kind, workspace, worker resource, and task-local review choice apply,
+the one-unsettled-run-per-entry overlap rule applies (a later due occurrence
+is skipped while a previous run of the entry is still unsettled and reported
+with the active handles, and an overdue occurrence is reported as not-run
+instead of catching up), and completion/failure delivery follows the
+`execution.subtaskNotifications` quiet/noisy policy. After a successful
+dispatch the top-level model is additionally woken with a model-facing
+launch notice carrying the schedule identity (entry id, name, exact due
+minute, cron expression) and the execution/task handles. It uses the same
+shared, non-model-initiated subtask-launch mechanism as a human
+`/subtask-add`: the same non-interrupting follow-up delivery lane, the same
+redaction and character bounds, the same origin metadata, and the same
+causal ordering that keeps a fast-settling outcome behind the notice — only
+the origin-specific context differs. The notice never dispatches a duplicate
+of the task and never implies it has progressed or completed.
+
+**`orchestrator-turn`:** the due entry's instructions and opaque occurrence
+identity are delivered as a NEW TURN to the EXISTING primary agent instead of
+starting a subtask. No second Pi instance is launched, and there is no
+workspace-root override for this destination: the agent acts in its current
+Pi launch workspace with its current tools, model, and review behavior, and
+may act directly or start subtasks. The `workspace` field may be omitted or
+empty; any stored value is unused. Delivery is a non-interrupting follow-up
+that still triggers a turn — a busy orchestrator is never interrupted; the
+queued turn runs after its current turn. The scheduled occurrence completes
+when its initiating turn ends. Subtasks or other background work the turn
+started continue under their own existing lifecycle and notifications; they
+never keep the schedule occurrence open, and later due occurrences of the
+entry are evaluated independently (there is no per-entry overlap gate in this
+destination).
+
+Installed Pi starts an idle custom-message turn without emitting
+`before_agent_start`; for both idle and queued custom messages, the extension
+therefore arms the fail-closed review baseline and reasserts the deferred-tool
+authorization at the host's `message_start`, before that message's model
+request. A busy queued message shares the already-armed review window. The
+occurrence is correlated only by its opaque id on that exact `message_start`,
+then completed after its consuming run ends and the submit-cycle settles; an
+unrelated human turn, message delivery, or downstream subtask completion
+cannot settle it. If review/auth re-arming fails, native tool calls are
+blocked for the session and the occurrence is not counted. A host without the
+required run/message lifecycle hooks rejects scheduled orchestrator delivery
+before sending it, with an actionable limitation report. A definitely
+rejected send fails closed with an actionable scheduler wake; nothing was
+triggered. A send the host accepts but never acknowledges within its bounded
+window is reported as **uncertain**: whether the turn was queued is UNKNOWN,
+it may still arrive, the occurrence is not counted as executed, and the report
+warns the owner to inspect the conversation before retrying so a pending turn
+is never duplicated.
 
 ### Scheduled instruction images
 
@@ -870,16 +930,18 @@ boundaries are owned by [Web tools](web-tools.md) and
 - **Scheduled tasks** opens the scheduled-task submenu (issue #26): one staged entry
   per independent scheduled task, keyed by its stable identity, with name,
   five-field Unix cron schedule in machine-local time, execute/research kind,
+  schedule destination (**Subtask** — the default isolated scheduled subtask, or
+  **Orchestrator turn** — see [Schedule destinations](#schedule-destinations)),
   instructions, explicit authorized workspace directory, an optional worker
   override picked from the worker-resource catalog (never from the global role
-  routes; research-capable only for research tasks), an optional task-local
-  review choice (**Inherit global subtask review settings**, **Off — run this
-  task's subtasks without review**, or a selected reviewer set), and an
-  enabled/disabled toggle. Adding prompts for a name and generates a stable
-  identity; required-but-unset fields block Save with a named validation error.
-  Entries stay visible and editable regardless of the **Scheduler runtime**
-  switch, and saving never clears entries. See
-  [Scheduled task fields](#scheduled-task-fields).
+  routes; research-capable only for research tasks; unused for orchestrator
+  turns), an optional task-local review choice (**Inherit global subtask review
+  settings**, **Off — run this task's subtasks without review**, or a selected
+  reviewer set; unused for orchestrator turns), and an enabled/disabled toggle.
+  Adding prompts for a name and generates a stable identity; required-but-unset
+  fields block Save with a named validation error. Entries stay visible and
+  editable regardless of the **Scheduler runtime** switch, and saving never
+  clears entries. See [Scheduled task fields](#scheduled-task-fields).
 - **Scheduler runtime** (shown when the host runtime provides the switch) is a
   live, current-process-only On/Off toggle for scheduled execution: it applies
   immediately, is never persisted in the config file, and stays outside the

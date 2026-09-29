@@ -153,7 +153,7 @@ for (const targetKind of ["missing", "existing file"] as const) {
     const harness = flowHarness([
       keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
       keys(KEY_ENTER), // list → task entry (row 0)
-      keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 4)
+      keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 5)
       async (component) => {
         const frame = component.render!(80).join("\n");
         assert.ok(frame.includes(dir), `the staged workspace is the field prefill: ${frame}`);
@@ -161,7 +161,7 @@ for (const targetKind of ["missing", "existing file"] as const) {
         typeText(component, invalid);
         component.handleInput?.(ENTER);
       },
-      keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (row 4) → Back (row 9)
+      keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 10)
       keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
       keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 16)
       keys(ESCAPE), // failed save re-shows the root menu; Esc leaves without saving
@@ -198,13 +198,13 @@ test("full TUI flow: a typed existing workspace stages through Save", async (t) 
   const harness = flowHarness([
     keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
     keys(KEY_ENTER), // list → task entry (row 0)
-    keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 4)
+    keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 5)
     async (component) => {
       component.handleInput?.(CTRL_U); // clear the prefilled staged value
       typeText(component, target);
       component.handleInput?.(ENTER); // submit the existing directory
     },
-    keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (row 4) → Back (row 9)
+    keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 10)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 16)
   ], { cwd: dir });
@@ -233,14 +233,14 @@ test("full TUI flow: cancel in the workspace field leaves the staged value uncha
   const harness = flowHarness([
     keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
     keys(KEY_ENTER), // list → task entry (row 0)
-    keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 4)
+    keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 5)
     async (component) => {
       const frame = component.render!(80).join("\n");
       assert.ok(frame.includes(dir), `the staged workspace is the field prefill: ${frame}`);
       typeText(component, "-partial"); // a partial edit that must not survive
       component.handleInput?.(ESCAPE); // cancel the field
     },
-    keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (row 4) → Back (row 9)
+    keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 10)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
     keys(ESCAPE), // root: leave without saving
   ], { cwd: dir });
@@ -291,7 +291,7 @@ test("full TUI flow (real host): native Tab completion stages an existing direct
   const harness = flowHarness([
     keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
     keys(KEY_ENTER), // list → task entry (row 0)
-    keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 4)
+    keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 5)
     async (component) => {
       component.handleInput?.(CTRL_U); // clear the prefilled staged value
       typeText(component, "~/a");
@@ -300,7 +300,7 @@ test("full TUI flow (real host): native Tab completion stages an existing direct
       assert.ok(component.render!(200).join("\n").includes("~/alpha/"), "the folder completion is in the draft");
       component.handleInput?.(ENTER); // submit
     },
-    keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (row 4) → Back (row 9)
+    keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 10)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 16)
   ], { cwd: home, keybindings: createRealKeybindingsManager(loaded.tui), theme: REAL_IDENTITY_THEME, provider: new providerCtor([], home) });

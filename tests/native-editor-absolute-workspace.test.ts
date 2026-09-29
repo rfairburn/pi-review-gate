@@ -600,7 +600,7 @@ test("real host: full flow stages a completed existing absolute directory throug
   const harness = flowHarness([
     keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
     keys(KEY_ENTER), // list → task entry (row 0)
-    keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 4)
+    keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 5)
     async (component) => {
       component.handleInput?.(CTRL_U); // clear the prefilled staged value
       typeText(component, `${root}/a`);
@@ -614,7 +614,7 @@ test("real host: full flow stages a completed existing absolute directory throug
       assert.ok(applied.includes(`${root}/alpha/`), `the completed path is the draft: ${applied}`);
       component.handleInput?.(ENTER); // submit the field
     },
-    keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (row 4) → Back (row 9)
+    keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 10)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 16)
   ], { cwd: dir, keybindings: createRealKeybindingsManager(loaded.tui), theme: REAL_IDENTITY_THEME, provider: new providerCtor(HOST_COMMANDS, dir) });
@@ -652,7 +652,7 @@ for (const target of ["missing", "file"] as const) {
     const harness = flowHarness([
       keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
       keys(KEY_ENTER), // list → task entry (row 0)
-      keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 4)
+      keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 5)
       async (component) => {
         component.handleInput?.(CTRL_U); // clear the prefilled staged value
         if (target === "missing") {
@@ -670,7 +670,7 @@ for (const target of ["missing", "file"] as const) {
         }
         component.handleInput?.(ENTER); // submit the field
       },
-      keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (row 4) → Back (row 9)
+      keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 10)
       keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
       keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 16)
       keys(ESCAPE), // failed save re-shows the root menu; Esc leaves without saving

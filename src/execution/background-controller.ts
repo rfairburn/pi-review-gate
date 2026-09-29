@@ -510,6 +510,16 @@ export interface ScheduledStartOptions {
   reviewOverride?: ScheduledTaskReviewOverride;
   /** Hashed SubtasksStart-equivalent input used to identify matching active groups. */
   startCallFingerprint?: string;
+  /**
+   * Issue #222 (partial #215): causal-ordering gate for the shared
+   * non-model-initiated launch notice. The controller holds every result
+   * notification for this execution behind this promise until the launch
+   * notice resolves, so a subtask that settles milliseconds after admission
+   * can never deliver its outcome before the notice naming it. The gate is
+   * process-local, never persisted, and resolved by the dispatcher after its
+   * bounded delivery attempt, including an uncertain or failed send.
+   */
+  launchNoticeGate?: Promise<void>;
 }
 
 export class BackgroundExecutionController {
@@ -520,6 +530,14 @@ export class BackgroundExecutionController {
   private readonly continuationAdmissions = new Set<string>();
   private readonly saveTails = new Map<string, Promise<void>>();
   private readonly steeringTails = new Map<string, Promise<void>>();
+  /**
+   * Issue #222: pending launch-notice gates by execution id. Set only by a
+   * non-model-initiated start/add (human command or scheduler) that carries
+   * the shared notice; process-local and never persisted, cleared when the
+   * group retires or the controller detaches. A restored group never resurrects
+   * its gate — restarts deliver the ordinary notifications without one.
+   */
+  private readonly launchNoticeGates = new Map<string, Promise<void>>();
   private readonly archivedTasks = new Map<string, { updatedAt: string; integritySha256: string; executionId?: string; legacy?: boolean }>();
   /**
    * Finding 15: authenticated membership handles for legacy settled stubs that
@@ -853,6 +871,10 @@ export class BackgroundExecutionController {
       settledArchivedCount: 0,
     };
     this.groups.set(executionId, group);
+    // Issue #222: register the launch-notice gate before the group becomes
+    // schedulable, so even a task that settles while this start call is still
+    // finishing cannot deliver a result wake before the notice.
+    if (options?.launchNoticeGate !== undefined) this.launchNoticeGates.set(executionId, options.launchNoticeGate);
     await this.save(group);
     await this.publishAssociations();
     void this.pump();
@@ -991,7 +1013,11 @@ export class BackgroundExecutionController {
     return readOwnedTaskArchive(group.root, taskId, this.archivedTaskAuth(group, taskId));
   }
 
-  async add(executionId: string | undefined, tasks: BackgroundTaskDefinition[]): Promise<BackgroundInspection> {
+  async add(
+    executionId: string | undefined,
+    tasks: BackgroundTaskDefinition[],
+    options?: { launchNoticeGate?: Promise<void> },
+  ): Promise<BackgroundInspection> {
     const group = this.resolveGroup(executionId);
     // #25: SubtasksAdd inherits the group's selected target; only the parent
     // session identity is checked here.
@@ -1001,6 +1027,10 @@ export class BackgroundExecutionController {
     group.tasks.push(...created);
     group.totalTaskCount = (group.totalTaskCount ?? group.tasks.length - created.length) + created.length;
     group.updatedAt = new Date().toISOString();
+    // Issue #222: a non-model-initiated add registers its launch-notice gate
+    // before the added tasks can be dispatched, so their result wakes stay
+    // causally ordered behind the notice as with any other admission.
+    if (options?.launchNoticeGate !== undefined) this.launchNoticeGates.set(group.executionId, options.launchNoticeGate);
     await this.save(group);
     void this.pump();
     // The inspection carries the whole execution inventory; the exact newly
@@ -2704,6 +2734,9 @@ export class BackgroundExecutionController {
         await removeOwnedExecutionRoot(group.root);
         this.groups.delete(executionId);
         this.dropActiveTasks(executionId);
+        // Issue #222: the launch-notice gate retires with the group; every
+        // notification that could be held behind it has already delivered.
+        this.launchNoticeGates.delete(executionId);
         // Finding 15: retire every archive handle owned by the removed group,
         // including handles for tasks whose records were already evicted to
         // their compacted archives, and its membership-index bookkeeping.
@@ -2738,6 +2771,9 @@ export class BackgroundExecutionController {
         this.pendingForceMerges.clear();
         this.archivedTasks.clear();
         this.legacyArchiveHandles.clear();
+        // Issue #222: no pending launch-notice gate survives detach; a later
+        // session's notifications are never held behind this session's notice.
+        this.launchNoticeGates.clear();
         this.recentActivity = [];
         this.active = 0;
         this.shuttingDown = false;
@@ -4235,6 +4271,10 @@ export class BackgroundExecutionController {
         ? formatExecutionEvent(eventOwner, eventTask, kind, content, scheduling)
         : content;
     const delivery = deliveryForLane(lane);
+    // Issue #222: every result notification for a non-model-initiated launch
+    // waits behind that launch's notice first (auto-resolving bounded gate),
+    // so a fast completion can never precede the notice that names the task.
+    await this.launchNoticeGateOf(eventOwner ?? owner);
     if (!isRecord(this.input.pi) || typeof this.input.pi.sendMessage !== "function") {
       await this.input.notify?.(deliveredContent);
       return;
@@ -4249,6 +4289,17 @@ export class BackgroundExecutionController {
     } catch (error) {
       await this.input.notify?.(`review gate: task notification could not be delivered: ${messageOf(error)}`);
     }
+  }
+
+  /**
+   * Issue #222: the pending launch-notice gate of one execution, undefined
+   * when the execution was launched by the model (no notice) or its notice
+   * already resolved. Always resolves; the bounded window guarantees a wedged
+   * or failed delivery can never strand result notifications.
+   */
+  private launchNoticeGateOf(group: BackgroundExecutionGroup | undefined): Promise<void> | undefined {
+    if (!group) return undefined;
+    return this.launchNoticeGates.get(group.executionId);
   }
 
   /**

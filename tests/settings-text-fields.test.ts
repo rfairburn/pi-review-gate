@@ -361,6 +361,7 @@ const SCHEDULED_EDITOR_LABELS = [
   "Name",
   "Schedule (cron)",
   "Kind",
+  "Destination",
   "Instructions",
   "Workspace",
   "Worker",
@@ -504,7 +505,7 @@ test("in the interactive TUI a text field opens through the native editor bridge
   const harness = tuiFlowContext([
     tuiKeys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
     tuiKeys(KEY_ENTER), // list → task entry (row 0)
-    tuiKeys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → instructions (row 3)
+    tuiKeys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → instructions (row 4)
     async (component) => {
       const frame = component.render!(80).join("\n");
       assert.ok(frame.includes("Check the docs for staleness"), `the current instructions are the field prefill: ${frame}`);
@@ -512,7 +513,7 @@ test("in the interactive TUI a text field opens through the native editor bridge
       typeText(component, "Rewritten instructions");
       component.handleInput?.(ENTER); // submit through the bridge
     },
-    tuiKeys(...Array(6).fill(KEY_DOWN), KEY_ENTER), // entry re-show (row 3) → Back (row 9)
+    tuiKeys(...Array(6).fill(KEY_DOWN), KEY_ENTER), // entry re-show (instructions, row 4) → Back (row 10)
     tuiKeys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
     tuiKeys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 16)
   ]);
@@ -550,8 +551,8 @@ test("an interactive TUI without the native editor seams fails closed: error not
   const harness = tuiFlowContext([
     tuiKeys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
     tuiKeys(KEY_ENTER), // list → task entry (row 0)
-    tuiKeys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → instructions (row 3)
-    tuiKeys(...Array(6).fill(KEY_DOWN), KEY_ENTER), // entry re-show (row 3) → Back (row 9)
+    tuiKeys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → instructions (row 4)
+    tuiKeys(...Array(6).fill(KEY_DOWN), KEY_ENTER), // entry re-show (instructions, row 4) → Back (row 10)
     tuiKeys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
     tuiKeys(ESCAPE), // root: leave without saving
   ]);

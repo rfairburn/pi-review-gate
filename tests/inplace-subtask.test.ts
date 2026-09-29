@@ -34,6 +34,15 @@ import { ExecutionToolManager } from "../src/execution/tool";
 import { createState } from "../src/state";
 import { waitFor } from "./helpers/background-controller-fixtures";
 
+/** Restore an env var to its exact prior state: assigned when it was present, deleted when absent. */
+function restoreEnvSetting(name: string, previous: string | undefined): void {
+  if (previous === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = previous;
+  }
+}
+
 /** Wait for a truthy value; returns it once present (bounded). */
 async function createInPlaceScratch(prefix: string): Promise<string> {
   return mkdtemp(join(process.cwd(), `.pi-review-inplace-${prefix}-`));
@@ -1431,6 +1440,25 @@ test("a continuation after an executor failure still dispatches the requested tu
   }
 });
 
+// Regression (finding-4 follow-up): restoring an env var by plain assignment
+// materializes the literal string "undefined" when the variable was originally
+// absent, which corrupted TMPDIR for every later test in the file (CI runs with
+// TMPDIR unset). The restore helper below must keep an absent variable absent.
+test("restoring an env setting keeps its exact prior state in both branches", () => {
+  const name = "PI_REVIEW_RESTORE_PROBE";
+  // Originally absent: stays absent, never materialized as a value.
+  delete process.env[name];
+  restoreEnvSetting(name, undefined);
+  assert.ok(!Object.hasOwn(process.env, name), "an absent variable must stay absent, not become the literal 'undefined'");
+  assert.equal(process.env[name], undefined);
+  // Originally present: the previous value is restored unchanged.
+  process.env[name] = "prior-value";
+  restoreEnvSetting(name, "prior-value");
+  assert.ok(Object.hasOwn(process.env, name));
+  assert.equal(process.env[name], "prior-value");
+  delete process.env[name];
+});
+
 test("a workspace containing the system temp directory launches with artifacts stored outside it (finding-4)", async () => {
   const realTmp = await realpath(tmpdir());
   const scratch = await mkdtemp(join(tmpdir(), "pi-review-inplace-tmpdir-scratch-"));
@@ -1492,7 +1520,7 @@ test("a workspace containing the system temp directory launches with artifacts s
       }
     }
   } finally {
-    process.env.TMPDIR = previousTmpDir;
+    restoreEnvSetting("TMPDIR", previousTmpDir);
     await instance?.shutdown();
     await instance?.detach();
     await rm(scratch, { recursive: true, force: true });

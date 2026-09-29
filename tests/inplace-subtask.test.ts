@@ -286,6 +286,16 @@ function escapeForRegex(value: string): string {
   return value.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
 }
 
+/** Phrases the user rejected from routine in-place completion prose (#220/PR226). */
+const REJECTED_COMPLETION_NARRATIVE = [
+  "cannot prove which post-launch changes",
+  "no verdict was fabricated",
+  "Missing events do not establish",
+  "nothing was gated, rolled back, or landed",
+  "Attribution (authoritative)",
+  "Attribution remains bounded",
+];
+
 // ── controller lifecycle (fake run-as-binary executor) ──────────────────────
 
 interface InPlaceExecutorSpec {
@@ -932,7 +942,8 @@ test("in-place tasks write directly in a non-Git workspace, settle reported, and
     assert.equal(settled.state, "reported");
     assert.equal(settled.waveRoot, undefined);
     assert.match(settled.summary ?? "", /in place/i);
-    assert.match(settled.summary ?? "", /1 path\(s\) changed since launch/i);
+    assert.match(settled.summary ?? "", / Review: disabled\./, "the actual review disposition is reported");
+    assert.match(settled.summary ?? "", /^Workspace changes since launch: added made\.txt$/m, "the recorded delta is named, not counted");
     assert.equal(settled.result?.phase, "completed");
     assert.equal(settled.result?.landing, undefined);
     assert.equal(settled.result?.taskResults[0]?.status, "completed_unreviewed");
@@ -941,11 +952,17 @@ test("in-place tasks write directly in a non-Git workspace, settle reported, and
     assert.equal(settled.dispatch?.inPlace, true);
     assert.equal(settled.dispatch?.baseCommit, "");
     assert.equal(settled.dispatch?.worktreeRoot, await realpath(workspace));
-    // The completion wake names the in-place settlement truthfully.
+    // The completion wake names the in-place settlement as concise positive
+    // fact (#220/PR226): actual review disposition, the named recorded delta,
+    // and the group aggregate — no repeated narrative.
     const completion = await waitForValue(() => messages.find((message) => message.includes(settled.taskId) && /finished in/.test(message)), 10_000);
-    assert.match(completion!, /without review/);
-    assert.match(completion!, /nothing was gated, rolled back, or landed|workspace changes were not gated|no verdict was fabricated/);
-    assert.match(completion!, /cannot prove which post-launch changes the worker made versus concurrent writers/, "completion wakes disclose the attribution limitation");
+    assert.match(completion!, / Review: disabled\./);
+    assert.match(completion!, /^Workspace changes since launch: added made\.txt$/m);
+    assert.match(completion!, new RegExp(`In-place ${escapeForRegex(started.executionId)} COMPLETE: 1/1 tasks settled in place\\.`));
+    assert.match(completion!, /All requested in-place work settled where it was performed in the selected workspace\./);
+    for (const rejected of REJECTED_COMPLETION_NARRATIVE) {
+      assert.doesNotMatch(completion!, new RegExp(rejected, "i"), `routine completion carries no rejected narrative: ${rejected}`);
+    }
 
     // Landing-only operations are refused with actionable diagnostics; the
     // settled task keeps its reported state.
@@ -1041,11 +1058,64 @@ test("an in-place task reviews through the subtask reviewer configuration and se
     const resultJson = JSON.parse(await readFile(join(task.artifactDir!, "result.json"), "utf8")) as Record<string, unknown>;
     assert.equal(resultJson.inPlace, true);
     assert.deepEqual(resultJson.changedSinceLaunch, [{ status: "added", path: "reviewed.txt" }]);
-    // The settled wake says reviewed in place, never landed, and — pass-1
-    // finding-5 — always carries the concurrent-writer attribution caveat.
-    assert.match(task.summary ?? "", /review passed/i);
-    assert.match(task.summary ?? "", /remain in place|changes remain/i);
-    assert.match(task.summary ?? "", /cannot prove which post-launch changes the worker made versus concurrent writers/i);
+    // The settled summary reports the actual review disposition and names the
+    // recorded delta (#220/PR226) — no repeated attribution narrative.
+    assert.match(task.summary ?? "", / Review: passed\./);
+    assert.match(task.summary ?? "", /^Workspace changes since launch: added reviewed\.txt$/m);
+    for (const rejected of REJECTED_COMPLETION_NARRATIVE) {
+      assert.doesNotMatch(task.summary ?? "", new RegExp(rejected, "i"), `routine completion carries no rejected narrative: ${rejected}`);
+    }
+  } finally {
+    await instance?.shutdown();
+    await instance?.detach();
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+// Regression (#220/PR226, user report): a root hello.txt with a passing review
+// must be reported as the named delta plus the actual review disposition and
+// the group aggregate — never a count-only note or repeated narrative. The
+// separate external-path category (e.g. /dev/null) is exercised through the
+// same builder finishInplace uses in tests/inplace-completion-reporting.test.ts;
+// this e2e pins the controller wiring for the exact hello.txt scenario.
+test("in-place completion names the root delta and reports the actual review disposition", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "pi-review-inplace-hello-"));
+  const workspace = join(scratch, "workspace");
+  await mkdir(workspace, { recursive: true });
+  let instance: BackgroundExecutionController | undefined;
+  try {
+    const messages: string[] = [];
+    const script = await writeInPlaceExecutorScript(scratch, { file: join(workspace, "hello.txt") });
+    instance = new BackgroundExecutionController({
+      pi: { sendMessage: (message: { content: string }) => messages.push(message.content) },
+      config: inplaceExternalConfig({ script }, { passingReviewer: true }),
+      state: createState(),
+      cwd: () => scratch,
+    });
+    const started = await instance.start(
+      [{ title: "hello in place", instructions: "INPLACE_SENTINEL", acceptanceCriteria: ["hello.txt written at the workspace root"] }],
+      "inplace",
+      workspace,
+    );
+    await waitFor(() => instance!.inspect(started.executionId).tasks.every((task) => task.state === "reported"), 45_000);
+    const settled = instance.inspect(started.executionId).tasks[0]!;
+    assert.equal(await readFile(join(workspace, "hello.txt"), "utf8"), "written in place\n");
+    // The durable summary is the concise factual shape: identity/workspace,
+    // actual review disposition, and the named recorded delta.
+    assert.match(settled.summary ?? "", new RegExp(`^In-place task ${escapeForRegex(settled.taskId)} finished in place in .*\. Review: passed\.$`, "m"));
+    assert.match(settled.summary ?? "", /^Workspace changes since launch: added hello\.txt$/m);
+    for (const rejected of REJECTED_COMPLETION_NARRATIVE) {
+      assert.doesNotMatch(settled.summary ?? "", new RegExp(rejected, "i"), `routine completion carries no rejected narrative: ${rejected}`);
+    }
+    // The completion wake adds the concise group aggregate, nothing more.
+    const completion = await waitForValue(() => messages.find((message) => message.includes(settled.taskId) && /finished in/.test(message)), 10_000);
+    assert.match(completion!, / Review: passed\./);
+    assert.match(completion!, /^Workspace changes since launch: added hello\.txt$/m);
+    assert.match(completion!, new RegExp(`In-place ${escapeForRegex(started.executionId)} COMPLETE: 1/1 tasks settled in place\\.`));
+    assert.match(completion!, /All requested in-place work settled where it was performed in the selected workspace\./);
+    for (const rejected of REJECTED_COMPLETION_NARRATIVE) {
+      assert.doesNotMatch(completion!, new RegExp(rejected, "i"), `routine completion carries no rejected narrative: ${rejected}`);
+    }
   } finally {
     await instance?.shutdown();
     await instance?.detach();
@@ -1109,8 +1179,8 @@ test("interrupt-with-merge is refused for in-place tasks and interruption leaves
     assert.equal(interruptedResult.status, "cancelled");
     assert.deepEqual(interruptedResult.changedSinceLaunch, [{ status: "added", path: "prior.txt" }], "the partial write is recorded against the launch baseline");
     assert.equal(interruptedResult.attributionError, undefined);
-    assert.match(settledTask.summary ?? "", /1 path\(s\) changed since launch/, "the interrupted summary records the inspected delta");
-    assert.match(settledTask.summary ?? "", /NOT rolled back/);
+    assert.match(settledTask.summary ?? "", /^Workspace changes since launch: added prior\.txt$/m, "the interrupted summary names the inspected delta");
+    assert.match(settledTask.summary ?? "", /not rolled back/i);
     assert.doesNotMatch(settledTask.summary ?? "", /workspace delta could not be verified/);
     await writeFile(gate, "release\n", "utf8");
     // The already-performed write stays in the workspace; no rollback exists.
@@ -1414,11 +1484,11 @@ test("a continuation after an executor failure still dispatches the requested tu
     assert.equal(pausedResultJson.status, "timeout");
     assert.deepEqual(pausedResultJson.changedSinceLaunch, [{ status: "added", path: "after-failure.txt" }], "the pre-timeout partial write is the recorded delta, not an empty one");
     assert.equal(pausedResultJson.attributionError, undefined);
-    assert.match(paused.summary ?? "", /1 path\(s\) changed since launch/);
-    assert.doesNotMatch(paused.summary ?? "", /no workspace paths changed since launch/);
-    assert.match(paused.summary ?? "", /cannot prove which post-launch changes the worker made versus concurrent writers/i, "stopped summaries disclose the attribution limitation");
+    assert.match(paused.summary ?? "", /^Workspace changes since launch: added after-failure\.txt$/m);
+    assert.doesNotMatch(paused.summary ?? "", /no recorded workspace changes/);
+    assert.doesNotMatch(paused.summary ?? "", /cannot prove which post-launch changes/i, "stopped summaries carry no repeated attribution narrative");
     const failureWake = await waitForValue(() => messages.find((message) => message.includes("stopped before settlement")), 10_000);
-    assert.match(failureWake!, /1 path\(s\) changed since launch/);
+    assert.match(failureWake!, /added after-failure\.txt/, "the failure diagnostic carries the named delta");
     const artifacts = paused.artifactDir!;
     const baselineBefore = await readFile(join(artifacts, INPLACE_BASELINE_FILE), "utf8");
     await continueWhenSettled(instance, started.executionId, {

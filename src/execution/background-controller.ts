@@ -89,7 +89,7 @@ import { notifyDispatchCards } from "./dispatch-cards";
 import type { ContinuationProgressUpdate, ExecutorInteractionAcknowledgement, ExecutorLiveControl, SubtaskDispatchRecord } from "./types";
 import { executeWave, type WaveProgressUpdate, type WaveResult, type WaveTaskResult } from "./wave-controller";
 import { resumeWaveWorker, runWaveWorker, type WaveWorkerResult } from "./wave-worker";
-import { runInplaceLifecycle, type InPlaceLifecycleResult } from "./inplace-worker";
+import { runInplaceLifecycle, type InPlaceLifecycleResult, type InPlaceLifecycleStatus } from "./inplace-worker";
 import { captureWaveBase, discoverWaveSource, readWaveCaptureRecord, type WaveCaptureResult } from "./wave-repository";
 import { executeWaveLanding, planWaveLanding } from "./wave-landing";
 import {
@@ -3567,31 +3567,11 @@ export class BackgroundExecutionController {
     };
     task.bundle = undefined;
     const undelivered = this.failUndeliveredSteering(task, "The in-place task ended before queued steering reached a verified transport.");
-    // #220 pass-2 (finding 1): a stopped lifecycle carries the REAL workspace
-    // delta; when the delta could not be inspected it is UNKNOWN and the
-    // summaries/notices say so instead of claiming "no paths changed".
-    const changedNote = result.attributionError
-      ? `workspace delta could not be verified (${result.attributionError})`
-      : result.changedSinceLaunch.length > 0
-        ? `${result.changedSinceLaunch.length} path(s) changed since launch`
-        : "no workspace paths changed within the recorded bounded snapshot since launch";
-    const externalNote = result.observedExternalPaths?.length
-      ? `Tool-observed external side-effect candidate(s), prior state unverified: ${result.observedExternalPaths.join(", ")}.`
-      : "";
-    const observabilityLimits = [
-      ...(result.toolObservabilityNotes ?? []),
-      ...(result.toolObservationsTruncated ? ["the bounded event/path limit was reached and additional observations were omitted"] : []),
-    ];
-    const observabilityNote = observabilityLimits.length > 0
-      ? `Tool-event observability limits: ${observabilityLimits.join("; ")}. Missing events do not establish that no external action occurred.`
-      : "";
-    const snapshotPolicyNote = `Snapshot policy excludes ignored directories (including .git, node_modules, and dist) and may omit content for oversized or unreadable files; ${result.baseline.snapshot.omissions.length} omission(s) were recorded${result.baseline.snapshot.omissionsTruncated ? "; the omission list was truncated" : ""}.`;
-    const attributionNote = `Workspace ${result.workspaceRoot}; ${changedNote}. ${externalNote} ${observabilityNote} In-place review is post-hoc: no writes were gated, rolled back, or landed.`;
-    // #220 pass-1 (finding 5): the concurrent-writer attribution limitation is
-    // part of the DURABLE summary and completion prose itself — a passing
-    // reviewer that happens to stay silent still leaves consumers with the
-    // explicit warning that the recorded delta cannot prove authorship.
-    const attributionCaveat = " Attribution (authoritative): the recorded delta since launch names WHAT changed, not WHO changed it — the harness cannot prove which post-launch changes the worker made versus concurrent writers' changes; do not credit uncertain changes to the worker or treat them as reviewed worker output.";
+    // #220/PR226: model-facing completion prose is concise positive fact —
+    // the recorded delta and the observed external paths as separate named
+    // categories plus the actual review disposition. The full baseline,
+    // observation evidence, limits, and review context stay durable in
+    // result.json, the review cycle records, and the reviewer request.
     if (isStoppedForExit(task)) {
       task.summary = "In-place worker stopped for application shutdown; inspect the workspace and continue after restore.";
       task.updatedAt = new Date().toISOString();
@@ -3601,11 +3581,8 @@ export class BackgroundExecutionController {
     }
     if (result.status === "reviewed" || result.status === "unreviewed" || result.status === "no_changes") {
       task.result = synthesizeInPlaceWaveResult(group, task, result, artifactDir);
-      task.summary = result.status === "reviewed"
-        ? `${result.summary}\n\nIn-place task finished in place (reviewed): workspace ${result.workspaceRoot}; ${changedNote}. ${externalNote} ${observabilityNote} In-place review is post-hoc: no writes were gated, rolled back, or landed.\n${attributionCaveat}`
-        : result.status === "unreviewed"
-          ? `${result.summary}\n\nIn-place task finished in place (completed without review): workspace ${result.workspaceRoot}; ${changedNote}. ${externalNote} ${observabilityNote} Nothing was attributed beyond the recorded workspace delta, no verdict was fabricated, and concurrent writers' changes cannot be distinguished from the worker's.\n${attributionCaveat}`
-          : `In-place task finished in place with no recorded workspace delta within the bounded launch snapshot: workspace ${result.workspaceRoot}. ${snapshotPolicyNote} ${externalNote} ${observabilityNote} This does not establish that no external side effects occurred. If changes were expected, inspect the workspace.\n${attributionCaveat}`;
+      const completionLines = buildInPlaceCompletionLines(result);
+      task.summary = completionLines.join("\n");
       task.report = result.summary;
       task.error = undefined;
       transitionTaskState(task, "reported");
@@ -3613,28 +3590,34 @@ export class BackgroundExecutionController {
       const persisted = await this.save(group);
       await this.publishAssociations();
       synchronizeEventSnapshot(snapshot, persisted);
-      const verdictLine = result.status === "unreviewed"
-        ? `In-place task ${task.taskId} finished in ${result.workspaceRoot} without review (subtask review disabled): no verdict was fabricated, the workspace changes were not gated, and they remain in place. ${changedNote}. ${externalNote} ${observabilityNote}${attributionCaveat}`
-        : result.status === "no_changes"
-          ? `In-place task ${task.taskId} finished in ${result.workspaceRoot} with no recorded workspace delta within the bounded launch snapshot. ${snapshotPolicyNote} ${externalNote} ${observabilityNote} This does not establish that no external side effects occurred; nothing was landed or attributed. If changes were expected, inspect the workspace.${attributionCaveat}`
-          : `In-place task ${task.taskId} finished in ${result.workspaceRoot}: its own review outcome and the recorded workspace delta are reported; nothing was gated, rolled back, or landed. ${changedNote}. ${externalNote} ${observabilityNote}${attributionCaveat}`;
+      const verdictLine = completionLines.join("\n");
       await this.wake(task, undelivered.length > 0 ? "failure" : "completion", undelivered.length > 0
-        ? `${verdictLine} ${undelivered.length} queued steering instruction(s) were not applied.`
+        ? `${verdictLine}\n${undelivered.length} queued steering instruction(s) were not applied.`
         : verdictLine);
       this.updateIndicator();
       return;
     }
     if (result.status === "cancelled" || task.interruptionMode) {
       transitionTaskState(task, "interrupted");
-      task.summary = `In-place worker was interrupted; writes it already performed in ${result.workspaceRoot} were NOT rolled back. ${changedNote}.${attributionCaveat}`;
+      const externalLine = inPlaceExternalLine(result);
+      task.summary = [
+        `In-place worker was interrupted in ${result.workspaceRoot}; prior writes remain and were not rolled back.`,
+        inPlaceChangedLine(result),
+        ...(externalLine ? [externalLine] : []),
+        ...inPlaceLimitLines(result),
+      ].join("\n");
       await this.acknowledgeInterrupt(task);
     } else {
       transitionTaskState(task, "paused_recoverable");
-      task.error = undelivered.length > 0
-        ? `${undelivered.length} queued steering instruction(s) were not applied.`
-        : result.error ?? result.summary;
-      task.summary = `In-place task stopped before settlement (${result.status}). ${attributionNote} ${attributionCaveat} ${result.error ?? ""}`.trim();
-      await this.wake(task, "failure", `In-place task ${task.taskId} stopped before settlement: ${task.summary}`);
+      task.error = inPlaceFailureError(undelivered.length, result);
+      const externalLine = inPlaceExternalLine(result);
+      task.summary = [
+        `In-place task ${task.taskId} stopped before settlement (${result.status}).`,
+        inPlaceChangedLine(result),
+        ...(externalLine ? [externalLine] : []),
+        ...inPlaceLimitLines(result),
+      ].join("\n");
+      await this.wake(task, "failure", `In-place task ${task.taskId} stopped before settlement (${result.status}).`);
     }
     task.updatedAt = new Date().toISOString();
     await this.save(group);
@@ -5162,6 +5145,122 @@ function synthesizeInPlaceWaveResult(
       taskDefinition: task.definition,
     }],
   };
+}
+
+// ── #220/PR226: bounded, named in-place completion reporting ────────────────
+
+/** Maximum number of paths named in one model-facing in-place completion line. */
+export const INPLACE_COMPLETION_MAX_NAMED_PATHS = 10;
+
+/** Bounded "status path" list for the recorded workspace delta since launch. */
+export function formatInPlaceChangedPaths(changes: Array<{ status: string; path: string }>): string {
+  if (changes.length === 0) return "no recorded workspace changes";
+  const shown = changes.slice(0, INPLACE_COMPLETION_MAX_NAMED_PATHS);
+  const more = changes.length - shown.length;
+  const text = shown.map((change) => `${change.status} ${change.path}`).join(", ");
+  return more > 0 ? `${text} (+${more} more)` : text;
+}
+
+/** Bounded list of observed external paths, or undefined when none were observed. */
+export function formatInPlaceExternalPaths(paths: string[] | undefined): string | undefined {
+  if (!paths || paths.length === 0) return undefined;
+  const shown = paths.slice(0, INPLACE_COMPLETION_MAX_NAMED_PATHS);
+  const more = paths.length - shown.length;
+  const overflow = more > 0 ? ` (+${more} more)` : "";
+  return `${shown.join(", ")}${overflow}`;
+}
+
+/**
+ * The review disposition a settled in-place task actually has, derived from the
+ * lifecycle result and its official review report/cycles — never invented. A
+ * passing aggregate with partial reviewer failure keeps its warning; a no-delta
+ * settlement after earlier cycles names those verdicts instead of claiming the
+ * final state passed or that no review occurred.
+ */
+export function inPlaceReviewDisposition(result: {
+  status: InPlaceLifecycleStatus;
+  reviewReport?: InPlaceLifecycleResult["reviewReport"];
+  reviewCycles: InPlaceLifecycleResult["reviewCycles"];
+}): string {
+  switch (result.status) {
+    case "reviewed":
+      return result.reviewReport?.aggregate === "pass_with_warnings"
+        ? "passed with reviewer infrastructure warnings"
+        : "passed";
+    case "unreviewed": return "disabled";
+    case "no_changes": {
+      if (result.reviewCycles.length === 0) return "not run";
+      const verdicts = [...new Set(result.reviewCycles.map((cycle) => cycle.verdict))].join(", ");
+      return `not run on the final empty delta (earlier cycle verdicts: ${verdicts})`;
+    }
+    default: return result.status;
+  }
+}
+
+/** Short factual limit lines for in-place completion prose; empty when no limits apply. */
+export function inPlaceLimitLines(result: {
+  toolObservationsTruncated?: boolean;
+  baseline?: InPlaceLifecycleResult["baseline"];
+}): string[] {
+  const lines: string[] = [];
+  if (result.toolObservationsTruncated === true) lines.push("Tool-event observations truncated.");
+  const snapshot = result.baseline?.snapshot;
+  const omissions = snapshot?.omissions.length ?? 0;
+  if (omissions > 0) {
+    lines.push(`Snapshot omissions recorded: ${omissions}${snapshot?.omissionsTruncated ? " (omission list truncated)" : ""}`);
+  }
+  return lines;
+}
+
+/**
+ * The concise failure diagnostic for a stopped in-place task: the actual
+ * lifecycle failure reason plus the undelivered-steering count, when both exist.
+ */
+export function inPlaceFailureError(undeliveredCount: number, result: {
+  status: InPlaceLifecycleStatus;
+  error?: string;
+  summary: string;
+}): string | undefined {
+  const parts: string[] = [];
+  if (undeliveredCount > 0) parts.push(`${undeliveredCount} queued steering instruction(s) were not applied.`);
+  const reason = result.error ?? result.summary;
+  if (reason) parts.push(reason);
+  return parts.length > 0 ? parts.join("; ") : undefined;
+}
+
+/** The recorded-delta line for model-facing in-place prose. */
+export function inPlaceChangedLine(result: {
+  attributionError?: string;
+  changedSinceLaunch: Array<{ status: string; path: string }>;
+}): string {
+  return `Workspace changes since launch: ${result.attributionError
+    ? `could not be verified (${result.attributionError})`
+    : formatInPlaceChangedPaths(result.changedSinceLaunch)}`;
+}
+
+/** The separate external-path category line, or undefined when nothing was observed. */
+export function inPlaceExternalLine(result: {
+  observedExternalPaths?: string[];
+}): string | undefined {
+  const text = formatInPlaceExternalPaths(result.observedExternalPaths);
+  return text !== undefined ? `Additional observed paths outside workspace: ${text}` : undefined;
+}
+
+/**
+ * The concise factual completion lines for a settled in-place task (#220/PR226):
+ * identity/workspace plus the actual review disposition, then the recorded
+ * delta and the observed external paths as separate named categories. No
+ * rollback/attribution/observability narrative; the detailed evidence stays
+ * durable in result.json, the review cycle records, and the reviewer request.
+ */
+export function buildInPlaceCompletionLines(result: InPlaceLifecycleResult): string[] {
+  const externalLine = inPlaceExternalLine(result);
+  return [
+    `In-place task ${result.taskId} finished in place in ${result.workspaceRoot}. Review: ${inPlaceReviewDisposition(result)}.`,
+    inPlaceChangedLine(result),
+    ...(externalLine ? [externalLine] : []),
+    ...inPlaceLimitLines(result),
+  ];
 }
 
 /** In-place lifecycle status expressed through the shared task-result status vocabulary. */

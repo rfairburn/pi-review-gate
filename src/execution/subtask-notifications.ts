@@ -311,11 +311,11 @@ export function completionGroupAggregateLines(
   }
   if (incomplete.length === 0) {
     lines.push(`${subtaskGroupLabel(group.kind)} ${group.executionId} COMPLETE: ${successful}/${total} tasks ${successVerb}.`);
-    lines.push(group.kind === "research"
-      ? "All requested research reports are available; synthesis is now appropriate. Main was not modified by this research group."
-      : group.kind === "inplace"
-        ? "All requested in-place work settled where it was performed in the selected workspace; nothing was gated, rolled back, or landed, and each task's own review outcome and recorded workspace delta were reported. Attribution remains bounded: the recorded delta since launch cannot prove which post-launch changes were made by the workers versus any concurrent writers — inspect tasks' durable summaries and the workspace before crediting specific changes."
-        : "All requested task outputs have landed; aggregate verification is now appropriate.");
+    if (group.kind === "research") {
+      lines.push("All requested research reports are available; synthesis is now appropriate. Main was not modified by this research group.");
+    } else if (group.kind === "execute") {
+      lines.push("All requested task outputs have landed; aggregate verification is now appropriate.");
+    }
   } else {
     const disposition = active.length > 0 ? "IN PROGRESS" : "INCOMPLETE";
     lines.push(`${subtaskGroupLabel(group.kind)} ${group.executionId} ${disposition}: ${successful}/${total} ${successVerb}; ${incomplete.length} not ${successVerb}.`);

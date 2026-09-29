@@ -223,6 +223,22 @@ test("completionGroupAggregateLines lists not-yet-complete siblings when the gro
   ]);
 });
 
+test("inplace completion aggregate is the concise COMPLETE verdict without repeated narrative (#220/PR226)", () => {
+  const group = fixtureGroup({ kind: "inplace", tasks: [fixtureTask({ state: "reported" })] });
+  const lines = completionGroupAggregateLines(group);
+  assert.deepEqual(lines, [
+    `In-place ${group.executionId} COMPLETE: 1/1 tasks settled in place.`,
+  ]);
+  const text = lines.join("\n");
+  for (const rejected of [
+    "cannot prove which post-launch changes",
+    "nothing was gated, rolled back, or landed",
+    "Attribution remains bounded",
+  ]) {
+    assert.doesNotMatch(text, new RegExp(rejected, "i"), `group aggregate carries no repeated narrative: ${rejected}`);
+  }
+});
+
 test("completionGroupAggregateLines matches the aggregate section of formatExecutionEvent", () => {
   const group = fixtureGroup({
     tasks: [

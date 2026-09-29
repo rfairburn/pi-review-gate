@@ -190,13 +190,13 @@ async function runNativeImageFlow(
     drivers: [
       keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (row 14)
       keys(KEY_ENTER), // list → task entry (row 0)
-      keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → instructions (row 3)
+      keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → instructions (row 4)
       async (component: { handleInput?(data: string): void }): Promise<void> => {
         component.handleInput?.(" "); // a real space keystroke: delimiter before the paste
         component.handleInput?.(CTRL_V); // real keypress through the native editor
         component.handleInput?.(options.fieldSettle === "cancel" ? KEY_ESCAPE : ENTER);
       },
-      keys(...Array(6).fill(KEY_DOWN), KEY_ENTER), // entry re-show (instructions, row 3) → Back (row 9)
+      keys(...Array(6).fill(KEY_DOWN), KEY_ENTER), // entry re-show (instructions, row 4) → Back (row 10)
       keys(...Array(3).fill(KEY_DOWN), KEY_ENTER), // list re-show (two entries) → Back (row 3)
       ...(options.outcome === "cancel"
         ? [keys(KEY_ESCAPE)] // root: leave without saving

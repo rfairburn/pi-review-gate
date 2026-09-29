@@ -69,6 +69,7 @@ const SCHEDULED_EDITOR_LABELS = [
   "Name",
   "Schedule (cron)",
   "Kind",
+  "Destination",
   "Instructions",
   "Workspace",
   "Worker",
@@ -337,7 +338,7 @@ test("TUI: /scheduled-tasks lands in the scheduled list; Esc returns to root and
     const shortcut = registered.handlers.get("scheduled-tasks")!;
     const harness = createTuiSettingsContext([
       [KEY_ENTER], // list → entry (row 0)
-      [...downs(7), KEY_ENTER], // editor → Enabled (row 7)
+      [...downs(8), KEY_ENTER], // editor → Enabled (row 8)
       [KEY_ESCAPE], // editor → list
       [KEY_ESCAPE], // list → root (Scheduled tasks row highlighted)
       [...downs(2), KEY_ENTER], // root → Save changes (row 16, two below the highlight)
@@ -508,7 +509,7 @@ test("installed Pi host: /scheduled-tasks lands in the scheduled list and saves 
     const shortcut = registered.handlers.get("scheduled-tasks")!;
     const harness = createTuiSettingsContext([
       [KEY_ENTER], // list → entry (row 0)
-      [...downs(7), KEY_ENTER], // editor → Enabled (row 7)
+      [...downs(8), KEY_ENTER], // editor → Enabled (row 8)
       [KEY_ESCAPE], // editor → list
       [KEY_ESCAPE], // list → root (Scheduled tasks row highlighted)
       [...downs(2), KEY_ENTER], // root → Save changes (row 16, two below the highlight)

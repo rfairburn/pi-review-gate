@@ -37,6 +37,8 @@ function dueTimeLabel(dueAt: Date): string {
     + `${pad(dueAt.getHours())}:${pad(dueAt.getMinutes())} ${offset} (local)`;
 }
 
+export { dueTimeLabel };
+
 /**
  * Actionable overlap-skip wake: the schedule identity, the exact due time, and
  * every active execution with its task handles — enough for the owner to act
@@ -94,6 +96,49 @@ export function formatScheduledDispatchFailure(
     `Scheduled task ${entryId} (${entry.name}) was due at ${dueTimeLabel(dueAt)} for cron "${entry.cron}", but dispatch failed:`,
     message,
     "The occurrence was not run. Fix the entry or its worker/review choices in /review-settings; the next due occurrence is evaluated independently.",
+  ].join("\n");
+}
+
+/**
+ * Issue #222: truthful orchestrator-turn delivery-failure report. Delivery
+ * is the admission for the orchestrator-turn destination, so an unavailable
+ * host message channel never becomes a silently "delivered" occurrence:
+ * nothing executed, nothing was queued as a subtask, and the turn was never
+ * triggered.
+ */
+export function formatScheduledOrchestratorDeliveryFailure(
+  entryId: string,
+  entry: ScheduledTaskEntryConfig,
+  dueAt: Date,
+  message: string,
+): string {
+  return [
+    `Scheduled task ${entryId} (${entry.name}) was due at ${dueTimeLabel(dueAt)} for cron "${entry.cron}", but its scheduled orchestrator turn could not be delivered to the existing agent:`,
+    message,
+    "The occurrence was NOT delivered: no model turn was triggered, no subtask was started, and nothing was queued or executed. Repair the delivery channel (or switch the entry to the subtask destination in /review-settings); the next due occurrence is evaluated independently.",
+  ].join("\n");
+}
+
+/**
+ * Issue #222: truthful report for an orchestrator turn whose send was
+ * accepted but did not acknowledge within its bounded window. The outcome is
+ * genuinely unknown — the host may still enqueue (or acknowledge) the turn —
+ * so this never claims the turn was triggered, and it never claims it was
+ * not: the owner is told exactly what is unknown and what to check, which is
+ * what keeps a retry from dispatching a duplicate of a turn that may still
+ * arrive. If the turn DOES arrive, the per-occurrence identity in its
+ * details is observed by the host's message_start and only then tracked, so
+ * it can never be counted on faith.
+ */
+export function formatScheduledOrchestratorDeliveryUncertain(
+  entryId: string,
+  entry: ScheduledTaskEntryConfig,
+  dueAt: Date,
+): string {
+  return [
+    `Scheduled task ${entryId} (${entry.name}) was due at ${dueTimeLabel(dueAt)} for cron "${entry.cron}" and its orchestrator-turn send was accepted by the host, but it did not acknowledge within its bounded delivery window.`,
+    "Whether the host queued the turn is UNKNOWN: it may still arrive. This occurrence is NOT counted as executed, and no subtask was started by the scheduler. Should it arrive, the extension counts it only when the host's own message lifecycle shows this exact scheduled message was processed and its turn ended.",
+    "Inspect the conversation before retrying; a manual retry could duplicate a turn that is still pending. The next due occurrence is evaluated independently.",
   ].join("\n");
 }
 

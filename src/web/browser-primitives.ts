@@ -19,3 +19,10 @@ export function bounded(value: string, maxChars: number): string {
 export function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw asError(signal.reason ?? new Error("Browser operation cancelled."));
 }
+
+/** Read through a fallible accessor with a fixed fallback; used for untrusted
+ * browser-side metadata where a throwing getter is not an operation failure. */
+export function safely<T>(operation: () => T, fallback: T): T {
+  try { return operation(); }
+  catch { return fallback; }
+}

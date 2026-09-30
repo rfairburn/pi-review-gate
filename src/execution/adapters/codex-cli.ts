@@ -74,8 +74,11 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
       pid: proc.pid,
       processGroupId: process.platform === "win32" ? undefined : proc.pid,
     };
-    if (identity) await request.onProcessStart?.(identity);
-
+    // The close observer must exist before the PID-persistence await: a real
+    // child can exit while onProcessStart is still pending, and a late-attached
+    // 'close' listener would miss the event and hang run() in finally (#234).
+    // The PID/prompt barrier is preserved — initialize/prompt are still issued
+    // only after the await below.
     const agentTexts: string[] = [];
     const rpc = new AppServerRpc(proc, (method, params) => {
       request.onUpdate?.(summarizeNotification(method, params));
@@ -85,6 +88,7 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
         agentTexts.push(params.item.text);
       }
     });
+    if (identity) await request.onProcessStart?.(identity);
     let threadId = request.session?.id;
     // The turn run() currently tracks. Turn-interrupt steering republishes it
     // to the replacement turn, and default steering plus terminal controls

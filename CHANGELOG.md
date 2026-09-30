@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.96]
+
+### Fixed
+
+- Observe Codex executor child closure before awaiting durable PID persistence
+  so an early failing exit cannot strand finalization (#234, audit #46).
+  Initialization and prompt transport remain behind PID persistence; existing
+  failure classification, shutdown policy and transport limits are unchanged.
+  A causally gated real-child regression records the actual exit exactly once.
+
 ## [0.1.0-dev.95]
 
 ### Fixed

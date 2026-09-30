@@ -64,7 +64,7 @@ engine declaration; do not interpret that absence as verification of every versi
 
 - **The `WebSearch` DDGS environment** — the launcher and the `pi-review-web.sh`
   wrapper automatically create, validate, and repair a per-user venv containing the
-  pinned `ddgs==9.15.0` (the Windows launcher performs equivalent native provisioning
+  pinned `ddgs==9.16.0` (the Windows launcher performs equivalent native provisioning
   with a `Scripts\\python.exe` venv; the `.sh` helpers use `bin/python`). The cache is
   `~/.cache/pi-review-gate` by default, relocatable via
   `PI_REVIEW_GATE_DDGS_VENV` and `XDG_CACHE_HOME`. Creating or repairing that venv

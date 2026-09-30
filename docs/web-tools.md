@@ -31,7 +31,7 @@ design. These interpreter, environment, and cache controls are trusted-user boun
 not safe inputs to accept from an untrusted repository, task, or process environment —
 see [Security model](security-model.md#trust-boundaries).
 
-DDGS setup fails closed: `scripts/ensure-ddgs.sh` provisions exactly `ddgs==9.15.0`,
+DDGS setup fails closed: `scripts/ensure-ddgs.sh` provisions exactly `ddgs==9.16.0`,
 resolves all of its dependencies through pip, requires binary distributions, avoids
 pip's reusable download cache, runs every Python invocation (venv creation, pip, version
 validation) in isolated mode (`-I`) so a reviewed repository's local modules cannot

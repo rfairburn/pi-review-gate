@@ -79,7 +79,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const DDGS_VERSION = "9.15.0";
+const DDGS_VERSION = "9.16.0";
 
 /** The exact zero-model default the launcher writes on first launch (issue 32). */
 const DEFAULT_CONFIG_CONTENT = `{

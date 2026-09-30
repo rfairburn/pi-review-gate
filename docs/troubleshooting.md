@@ -91,7 +91,7 @@ underlying behavior.
   works. Use bounded console/network observations without disabling generation, CSP,
   CORS, TLS or egress guards.
 - **DDGS provisioning fails during install or launch.** `scripts/ensure-ddgs.sh`
-  requires the pinned `ddgs==9.15.0`, binary distributions, and a clean `pip check`; the
+  requires the pinned `ddgs==9.16.0`, binary distributions, and a clean `pip check`; the
   configured PyPI/index source and local pip configuration are part of the trusted setup
   boundary. The launcher creates and validates the venv at startup and fails closed:
   creating or repairing it needs a `python3` interpreter (with `venv`/`pip`) and

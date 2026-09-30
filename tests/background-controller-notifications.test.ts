@@ -1011,11 +1011,15 @@ test("#117 a suppressed model force-merge cancels the group's armed watch instea
       // timer handle was cleared and the subscription plus any queued
       // checkpoint snapshot are gone.
       assert.equal(arm.wasCleared(), true, "production cancelWatch cleared the armed timer handle");
-      const internals = controller as unknown as {
-        watches: Map<string, unknown>;
-        pendingWatchInspections: Array<{ executionId: string }>;
-        watchDeliveryTimer?: unknown;
-      };
+      // #237: watch/launch-notice state lives in ./wake-delivery; read the
+      // owning module's live state through the wake-delivery seam.
+      const internals = (controller as unknown as {
+        wakes: {
+          watches: Map<string, unknown>;
+          pendingWatchInspections: Array<{ executionId: string }>;
+          watchDeliveryTimer?: unknown;
+        };
+      }).wakes;
       assert.equal(internals.watches.has(started.executionId), false, "the armed watch subscription was retired");
       assert.ok(!internals.pendingWatchInspections.some((entry) => entry.executionId === started.executionId), "no queued checkpoint snapshot survives the suppressed completion");
 
@@ -1069,11 +1073,15 @@ test("#117 a suppressed model mark-clean cancels the group's armed watch instead
       // timer handle was cleared and the subscription plus any queued
       // checkpoint snapshot are gone.
       assert.equal(arm.wasCleared(), true, "production cancelWatch cleared the armed timer handle");
-      const internals = controller as unknown as {
-        watches: Map<string, unknown>;
-        pendingWatchInspections: Array<{ executionId: string }>;
-        watchDeliveryTimer?: unknown;
-      };
+      // #237: watch/launch-notice state lives in ./wake-delivery; read the
+      // owning module's live state through the wake-delivery seam.
+      const internals = (controller as unknown as {
+        wakes: {
+          watches: Map<string, unknown>;
+          pendingWatchInspections: Array<{ executionId: string }>;
+          watchDeliveryTimer?: unknown;
+        };
+      }).wakes;
       assert.equal(internals.watches.has(started.executionId), false, "the armed watch subscription was retired");
       assert.ok(!internals.pendingWatchInspections.some((entry) => entry.executionId === started.executionId), "no queued checkpoint snapshot survives the suppressed completion");
 
@@ -1118,7 +1126,9 @@ test("#160 a checkpoint released before the suppressed landing is a legitimate p
       const checkpoint = watchEvents(messages)[0]!;
       assert.ok(checkpoint.content.includes(started.executionId), "the checkpoint names the execution");
       assert.ok(checkpoint.content.includes(taskB), "the checkpoint reports the still-active sibling");
-      const internals = controller as unknown as { watches: Map<string, unknown> };
+      // #237: watch state lives in ./wake-delivery; read the owning
+      // module's live state through the wake-delivery seam.
+      const internals = (controller as unknown as { wakes: { watches: Map<string, unknown> } }).wakes;
       assert.equal(internals.watches.has(started.executionId), false, "the one-shot subscription was consumed by its own firing");
       assert.equal(arm.wasCleared(), false, "the pre-completion firing was a legitimate delivery, not a cancellation");
       // A second release is inert: the consumed subscription cannot fire
@@ -1166,11 +1176,15 @@ test("#160 a queued checkpoint snapshot is retired by the suppressed completion 
       assert.equal(arm.armed.replaced, false);
       arm.fireDeadline();
       assert.equal(arm.deliveryTimers.length, 1, "the production delivery window was captured");
-      const internals = controller as unknown as {
-        watches: Map<string, unknown>;
-        pendingWatchInspections: Array<{ executionId: string }>;
-        watchDeliveryTimer?: unknown;
-      };
+      // #237: watch/launch-notice state lives in ./wake-delivery; read the
+      // owning module's live state through the wake-delivery seam.
+      const internals = (controller as unknown as {
+        wakes: {
+          watches: Map<string, unknown>;
+          pendingWatchInspections: Array<{ executionId: string }>;
+          watchDeliveryTimer?: unknown;
+        };
+      }).wakes;
       assert.equal(internals.watches.has(started.executionId), false, "the firing consumed the one-shot subscription");
       assert.ok(internals.pendingWatchInspections.some((entry) => entry.executionId === started.executionId), "a checkpoint snapshot is genuinely queued before the landing");
       assert.equal(internals.watchDeliveryTimer, arm.deliveryTimers[0]!.handle, "the captured delivery window is the production watchDeliveryTimer");
@@ -1221,7 +1235,9 @@ test("#160 without watch cancellation the released deadline delivers a stale che
       // Bounded private mutation, test-side only and never landed in
       // production: remove the cancellation to demonstrate that the
       // suppression tests above are genuinely sensitive to it.
-      const internals = controller as unknown as { cancelWatch: (executionId: string) => boolean };
+      const internals = (controller as unknown as {
+        wakes: { cancelWatch(executionId: string): boolean };
+      }).wakes;
       const productionCancelWatch = internals.cancelWatch;
       internals.cancelWatch = () => false;
       try {

@@ -1,42 +1,29 @@
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { deferredPiToolsEnabled, effectiveReviewSettings, loadConfig, materializeReviewConfig, resolveReviewers, type OperatingMode, type ScheduledTaskEntryConfig } from "./config";
+import { deferredPiToolsEnabled, loadConfig, materializeReviewConfig, resolveReviewers, type OperatingMode, type ScheduledTaskEntryConfig } from "./config";
 import { ScheduledTaskRuntime } from "./scheduling/dispatcher";
 import { createScheduledEntryDispatcher } from "./scheduling/dispatch";
 import { deliverScheduledEvent } from "./scheduling/events";
-import { ScheduledOrchestratorTurnTracker, findTriggeringCustomMessage } from "./scheduling/orchestrator-turn";
+import { ScheduledOrchestratorTurnTracker } from "./scheduling/orchestrator-turn";
 import { deliverSubtaskLaunchNotice, type SubtaskLaunchNotice } from "./execution/launch-notice";
 import { getSchedulerRuntime } from "./scheduling/runtime";
 import { removeReviewBundle, removeTransientWindowBundle } from "./bundle";
-import { captureReviewCheckpoint, releaseReviewCheckpoint } from "./review-checkpoint";
+import { captureReviewCheckpoint } from "./review-checkpoint";
 import { registerCommands } from "./commands";
-import { createCorrectionFeedbackMarker, isRepeatedNoProgressFeedback } from "./correction-feedback";
 import {
   recordToolCallEvidence,
   recordToolResultEvidence,
-  rememberFinalAssistantSummary,
   shouldRecordToolCallEvidence,
   shouldRecordToolResultEvidence,
 } from "./evidence";
-import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractSignal, extractToolArgs, extractToolName, isEscapeTerminalInput, onTerminalInput, sendFollowUp, sendNotice, sendSteeringPrompt, sendTriggeredFollowUp, createStatusTracker, setStatus, type HookHandler } from "./pi";
-import { collectPausedReviewExchange, runReview, type ReviewRunOutput } from "./review";
+import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractToolArgs, extractToolName, sendNotice, setStatus, type HookHandler } from "./pi";
+import { createReviewCancellationCoordinator } from "./review-cancellation";
 import {
-  createReviewCancellationCoordinator,
-  type ActiveReviewCancellation,
-  type ReviewCancelReason,
-} from "./review-cancellation";
-import {
-  activeExchangeHasBaseline,
   beginAgentRun,
-  buildRequestContext,
-  closeReviewWindow,
   createState,
   freezeReviewWindowConfig,
-  getCorrectionAttemptCount,
-  ownedReviewCheckpointDescriptors,
   reconcileRestoredReviewWindows,
   reconcileWindowReviewerSelection,
-  recordReviewerFeedbackAndArmExchange,
   rememberUserRequest,
   setReviewWindowCheckpointBaseline,
   type ReviewGateState,
@@ -48,17 +35,18 @@ import { assertScheduledImagesPresent, managedScheduledImageRoot } from "./setti
 import { registerStreamFailureReporting } from "./stream-failure-report";
 import { ExecutionToolManager } from "./execution/tool";
 import { acknowledgeOwnerRetiringSave } from "./execution/background-controller";
-import { combineTokenUsage, extractPiUsageFromMessages, formatTokenUsage, type TokenUsage } from "./usage";
 import { NativeToolCallPreflight } from "./tool-call-preflight";
-import { buildReviewAuthorizationMessage, createReviewTransmissionMessage, deliverReviewTransmission, hasReviewDeliveryReceipt, type ReviewTransmissionAction } from "./transmission";
-import { dispatchModelDelivery, queueModelDelivery } from "./durable-delivery";
-import { replaceReviewGateState, reviewCheckpointDescriptorIdentity, sessionPersistenceIdentity, SessionStateCheckpointBaselineError, SessionStateCwdMismatchError, SessionStateConversationMismatchError, SessionStateGitBaselineError, SessionStateIntegrityError, SessionStateInvalidStateError, SessionStateMissingSelectionDigestError, SessionStateParseError, SessionStateStore, SessionStateUnsupportedFormatError, type PendingDeliverySummary } from "./session-state";
-import { BackgroundProcessReadiness } from "./background-process-readiness";
+import { queueModelDelivery } from "./durable-delivery";
+import { replaceReviewGateState, sessionPersistenceIdentity, SessionStateCwdMismatchError, SessionStateStore } from "./session-state";
 import {
   registerBackgroundShell,
   type BackgroundShellHost,
-  type BackgroundShellLifecycleEvent,
 } from "./background-shell";
+import { boundPath, handleCwdMismatchRestore, safeRestoreFailureDiagnostic, sendNoticeUnlessItThrows } from "./activation/diagnostics";
+import { createSessionPersistence } from "./activation/persistence";
+import { deferredToolPromptInjection, executionPromptInjection, extractSystemPrompt } from "./activation/prompt-composition";
+import { recoverPendingModelDeliveries, releaseQueuedUserInputs } from "./activation/pending-delivery";
+import { createReviewTurnCoordinator, isToolError } from "./activation/review-turn";
 import { registerApplyPatchTool } from "./apply-patch/tool";
 import { registerGitReadTool, type GitReadHost } from "./git-read/tool";
 import { WebToolManager, type PiWebHost } from "./web/tools";
@@ -82,14 +70,6 @@ import {
 declare const module: {
   exports: unknown;
 };
-
-const orchestratorBackgroundCompletionPrompt = [
-  "[pi-review-background-ready] ShellStart work that previously blocked review reached an idle transition.",
-  "Automatic review was deliberately deferred while they were active.",
-  "Re-check ShellList because a newer job may have started after this event was queued.",
-  "Inspect the completed results and workspace, address any failure, and finish the original request when current background readiness permits.",
-  "Do not claim success from process exit alone; verify the requested outcome before completing this turn.",
-].join(" ");
 
 interface ActivationDependencies {
   /** Narrow injection seam used by lifecycle tests; production constructs it. */
@@ -292,86 +272,23 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   const state = createState();
   let currentScopedModels: string[] = [];
   let sessionActive = true;
-  let activeReviewAbort: ReviewAbortHandle | undefined;
-  let activeReviewSettled: Promise<void> | undefined;
-  let activeStatusTracker: ReturnType<typeof createStatusTracker> | undefined;
-  let agentRunActive = false;
-  let agentSettlementInputHold = false;
-  // Records accumulated from each low-level run's agent_end until Pi confirms
-  // via agent_settled that no automatic retry, compaction retry, or queued
-  // continuation remains. Finalization must not happen at agent_end: Pi can
-  // still mutate the workspace after it (e.g. a retried provider overload),
-  // so closing or reviewing the window there would race the real outcome.
-  let pendingSettlementUsage: TokenUsage | undefined;
-  let pendingSettlementAborted = false;
-  let pendingSettlementPausedForQuestion = false;
-  let reviewerQuestionPausePending = false;
-  let stateStore: SessionStateStore | undefined;
-  type Owner = ReturnType<typeof ownedReviewCheckpointDescriptors>[number];
-  const ownersOf = () => new Map(ownedReviewCheckpointDescriptors(state).map((owner) =>
-    [reviewCheckpointDescriptorIdentity(owner.cwd, owner.descriptor), owner]));
-  // Only verified, durably written owners enter this ledger. Retain failed
-  // releases for retry; a quarantined/damaged restore never enters it.
-  let durableOwners = new Map<string, Owner>();
-  let ownerSaveTail = Promise.resolve();
-  let latestSavedOwners = new Map<string, Owner>();
-  const retiredOwnerIds = new Set<string>();
-  const saveWithOwnerRetirement = (store: SessionStateStore): Promise<boolean> => {
-    // Admit saves one at a time, including the entire release. A new save
-    // cannot put a descriptor back on disk while its old pin is being removed.
-    // Sample state at admission (not invocation), when save() serializes it.
-    const operation = ownerSaveTail.then(async (): Promise<boolean> => {
-      if (store !== stateStore) return false;
-      const savedOwners = ownersOf();
-      if ([...savedOwners.keys()].some((id) => retiredOwnerIds.has(id))) {
-        await sendNoticeUnlessItThrows(pi, "review gate: a retired checkpoint was re-armed while its prior owner was being released; persistence blocked. Capture a fresh checkpoint before reviewing");
-        throw new Error("review gate: retired checkpoint re-armed; capture a fresh checkpoint before reviewing");
-      }
-      // Throws are not acknowledgements. The next queued save still runs;
-      // this operation never suppresses a previously confirmed retirement.
-      if (!executionTools) throw new Error("review gate: execution tools unavailable during session save");
-      const saved = await store.save(state, executionTools.associations(), effectiveReviewConfig());
-      if (!saved) {
-        if ([...durableOwners.keys()].some((id) => !savedOwners.has(id))) {
-          await sendNoticeUnlessItThrows(pi, "review gate: checkpoint owners retained because the session-state save is unavailable; the prior sidecar still owns them. Repair persistence and restart before relying on a cleared window");
-        }
-        return false;
-      }
-      latestSavedOwners = savedOwners;
-      for (const [id, owner] of savedOwners) durableOwners.set(id, owner);
-      for (const [id, owner] of durableOwners) {
-        if (latestSavedOwners.has(id) || ownersOf().has(id)) continue;
-        const released = await releaseReviewCheckpoint(owner.cwd, owner.descriptor);
-        if (released.status !== "ok") {
-          await sendNoticeUnlessItThrows(pi, `review gate: retained checkpoint owner; release failed (${released.reason}). Inspect the checkpoint store and retry after repairing storage; no review success is implied`);
-          throw new Error(`review gate: retained checkpoint owner; release failed (${released.reason}): ${released.detail}`);
-        }
-        durableOwners.delete(id);
-        retiredOwnerIds.add(id);
-      }
-      return true;
-    });
-    ownerSaveTail = operation.then(() => undefined, () => undefined);
-    return operation;
-  };
   let checkpointRestartBlocked: string | undefined;
-  /**
-   * A message_start-triggered run cannot be cancelled by this host after the
-   * message is admitted. If review/auth re-arming fails, fail closed at the
-   * native tool boundary for the rest of this session and refuse later
-   * scheduled orchestrator turns rather than allowing an unreviewed change.
-   */
-  let triggeringMessageReviewFailure: string | undefined;
-  let backgroundCompletionMonitor: Promise<void> | undefined;
-  let backgroundMonitorGeneration = 0;
-  let backgroundReviewDeferred = false;
-  let pendingNativeCompletionRevision: number | undefined;
   const reviewCancellation = createReviewCancellationCoordinator();
-  let unsubscribeBackgroundLifecycle: (() => void) | undefined;
-  const pendingEvidenceCaptures = new Set<Promise<void>>();
-  const orchestratorBackgroundReadiness = new BackgroundProcessReadiness();
-  const reviewerQuestionPauseWaiters = new Set<(error?: Error) => void>();
   const sessionAbortController = new AbortController();
+
+  // The session persistence owner holds the late-bound store, the serialized
+  // save-and-release tail, and the checkpoint-owner ledger. It is constructed
+  // before the execution manager so the manager's association callback can be
+  // wired to its confirmed-save operation; the root mediates both directions
+  // of that binding (the live association snapshot sampled at save admission,
+  // and onAssociationsChanged below).
+  const sessionPersistence = createSessionPersistence({
+    pi,
+    state,
+    isSessionActive: () => sessionActive,
+    associations: () => executionTools?.associations(),
+    reviewConfig: () => effectiveReviewConfig(),
+  });
   executionTools = new ExecutionToolManager({
     pi,
     config,
@@ -383,7 +300,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     notify: (message) => sendNotice(pi, message),
     // The session writer serializes save AND owner retirement. Distinguish its
     // completed retirement from a standalone controller's bare durable save.
-    onAssociationsChanged: () => acknowledgeOwnerRetiringSave(persistConfirmedSessionState),
+    onAssociationsChanged: () => acknowledgeOwnerRetiringSave(() => sessionPersistence.persistConfirmed()),
     onExpandedViewChanged: async (expanded) => {
       if (!loaded.path) {
         throw new Error("No persistent review-gate config file is loaded.");
@@ -427,6 +344,37 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   // observe attribution and settlement state.
   dependencies.orchestratorTurnsTestAccess?.(orchestratorTurnTracker);
 
+  // The review-turn coordinator owns the automatic review protocol's mutable
+  // state: active abort/settled/status references, agent-run activity and the
+  // settlement input hold, per-cycle usage/abort/question accumulators and the
+  // reviewer-question pause waiters, the evidence-capture barrier, the
+  // background-completion monitor/deferral state, and the triggering-message
+  // failure flag. It returns handler bodies and narrow operations; every hook
+  // registration stays in this root's manifest.
+  const reviewTurn = createReviewTurnCoordinator({
+    pi,
+    state,
+    config,
+    scopedModels: () => currentScopedModels,
+    isSessionActive: () => sessionActive,
+    observeCwd: (args) => { currentCwd = extractCwd(args, currentCwd); },
+    cwd: () => currentCwd,
+    syncExecutionContext: (args) => {
+      updateScopedModels(args);
+      executionTools.setScopedModels(currentScopedModels);
+      executionTools.setUiContext(extractContext(args) ?? pi);
+    },
+    checkpointRestartBlocked: () => checkpointRestartBlocked,
+    effectiveReviewConfig: () => effectiveReviewConfig(),
+    persist: () => sessionPersistence.persist(),
+    persistAutomaticDelivery: () => sessionPersistence.persistAutomaticDelivery(),
+    backgroundShell: () => backgroundShellController,
+    reviewReadiness: () => executionTools.reviewReadiness(),
+    reapplyDeferredTools: () => deferredTools.reapply(),
+    cancellation: reviewCancellation,
+    orchestratorTurns: orchestratorTurnTracker,
+  });
+
   /**
    * Issue #222: fail-closed orchestrator-turn admission guard, read at each
    * dispatch: a host without every essential run-lifecycle hook can neither
@@ -442,8 +390,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     if (checkpointRestartBlocked) {
       return `the review gate is blocked for this session (fresh checkpoint restart failed: ${checkpointRestartBlocked}), so the scheduled turn could not be reviewed; nothing was delivered`;
     }
-    if (triggeringMessageReviewFailure) {
-      return `${triggeringMessageReviewFailure}; scheduled orchestrator turns are blocked for this session`;
+    const triggeringFailure = reviewTurn.triggeringFailure();
+    if (triggeringFailure) {
+      return `${triggeringFailure}; scheduled orchestrator turns are blocked for this session`;
     }
     return undefined;
   };
@@ -505,123 +454,10 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       ?? state.lastQuestionWindow?.reviewConfig
       ?? materializeReviewConfig(config, currentScopedModels);
   };
-  const persistSessionState = async (force = false) => {
-    if (!stateStore || (!sessionActive && !force)) return;
-    await saveWithOwnerRetirement(stateStore);
-  };
-  const persistConfirmedSessionState = async (): Promise<boolean> => {
-    if (!stateStore || !sessionActive) return false;
-    return saveWithOwnerRetirement(stateStore);
-  };
-  // Automatic-delivery persistence reports whether a save actually happened:
-  // persistSessionState deliberately resolves without writing when there is no
-  // state store or the session has gone inactive, and the uncertain-delivery
-  // gate in deliverAutomaticTransmission must only treat a real durable write
-  // as proof of the uncertain transition.
-  const persistAutomaticDeliveryState = async (): Promise<boolean> => {
-    if (!stateStore || !sessionActive) return false;
-    return saveWithOwnerRetirement(stateStore);
-  };
-
-  const trackEvidenceCapture = async (operation: Promise<void>): Promise<void> => {
-    pendingEvidenceCaptures.add(operation);
-    try {
-      await operation;
-    } finally {
-      pendingEvidenceCaptures.delete(operation);
-    }
-  };
-
-  const drainEvidenceCaptures = async (): Promise<void> => {
-    while (pendingEvidenceCaptures.size > 0) {
-      await Promise.allSettled([...pendingEvidenceCaptures]);
-    }
-  };
-
-  const releaseReviewerQuestionPauseWaiters = (error?: Error) => {
-    for (const resolve of reviewerQuestionPauseWaiters) {
-      resolve(error);
-    }
-    reviewerQuestionPauseWaiters.clear();
-  };
-
-  const currentBackgroundReadiness = () => {
-    if (!backgroundShellController) return orchestratorBackgroundReadiness.snapshot();
-    const snapshot = backgroundShellController.snapshot();
-    return { revision: snapshot.revision, running: snapshot.running, unverifiable: [] as string[] };
-  };
-
-  const scheduleBackgroundCompletion = (noticeTarget: unknown) => {
-    if (backgroundCompletionMonitor) return;
-    const generation = backgroundMonitorGeneration;
-    backgroundCompletionMonitor = (async () => {
-      while (sessionActive && generation === backgroundMonitorGeneration) {
-        const readiness = currentBackgroundReadiness();
-        if (readiness.unverifiable.length > 0 || readiness.running.length === 0) break;
-        await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 100));
-      }
-      if (!sessionActive || generation !== backgroundMonitorGeneration) return;
-      const readiness = currentBackgroundReadiness();
-      if (readiness.unverifiable.length > 0) {
-        await sendNotice(
-          noticeTarget,
-          `review gate: review remains blocked because ShellStart background readiness could not be verified: ${readiness.unverifiable.join("; ")}`,
-        );
-        return;
-      }
-      if (executionTools.reviewReadiness().length > 0) return;
-      const idleRevision = readiness.revision;
-      await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 250));
-      const confirmed = currentBackgroundReadiness();
-      if (
-        !sessionActive
-        || generation !== backgroundMonitorGeneration
-        || confirmed.revision !== idleRevision
-        || confirmed.running.length > 0
-        || confirmed.unverifiable.length > 0
-        || agentRunActive
-        || state.reviewInProgress
-        || !state.reviewWindow
-        || executionTools.reviewReadiness().length > 0
-      ) return;
-      const delivered = await sendTriggeredFollowUp(pi, orchestratorBackgroundCompletionPrompt);
-      if (!delivered) {
-        await sendNotice(noticeTarget, "review gate: background work completed, but the orchestrator could not be resumed automatically; review remains deferred until the next turn");
-      }
-    })().finally(() => {
-      backgroundCompletionMonitor = undefined;
-    });
-  };
-
-  const handleBackgroundLifecycle = (event: BackgroundShellLifecycleEvent) => {
-    if (event.type === "started") {
-      pendingNativeCompletionRevision = undefined;
-      return;
-    }
-    if (
-      !sessionActive
-      || !backgroundReviewDeferred
-      || event.running.length > 0
-      || event.exitWakeScheduled
-    ) return;
-
-    const revision = event.revision;
-    pendingNativeCompletionRevision = revision;
-    queueMicrotask(() => {
-      void (async () => {
-        if (!sessionActive || pendingNativeCompletionRevision !== revision) return;
-        const current = backgroundShellController?.snapshot();
-        if (!current || current.revision !== revision || current.running.length > 0) return;
-        if (!state.reviewWindow || state.reviewInProgress || executionTools.reviewReadiness().length > 0) return;
-        const delivered = await sendTriggeredFollowUp(pi, orchestratorBackgroundCompletionPrompt);
-        if (!delivered) {
-          await sendNotice(pi, "review gate: background work completed, but the orchestrator could not be resumed automatically; review remains deferred until the next turn");
-        }
-      })();
-    });
-  };
-
-  unsubscribeBackgroundLifecycle = backgroundShellController?.subscribe(handleBackgroundLifecycle);
+  // The construction-time subscription slot is preserved exactly: attach the
+  // coordinator's lifecycle handler to the controller now (a no-op when the
+  // host has no ShellStart), and re-attach after every session_start reset.
+  reviewTurn.attachBackgroundLifecycle();
 
   registerHook(pi, "session_shutdown", async (...args) => {
     nativeToolPreflight.reset();
@@ -632,21 +468,12 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     // Settle every pending question and sync waiter for the dying session so
     // nothing can outlive it; the abort above already interrupted active runs.
     userQuestionsEndSession(userQuestions?.controller);
-    const reviewSettled = activeReviewSettled;
-    activeReviewAbort?.shutdown();
-    activeReviewAbort = undefined;
-    await reviewSettled;
-    await activeStatusTracker?.clear({ immediate: true });
-    activeStatusTracker = undefined;
-    agentRunActive = false;
-    reviewerQuestionPausePending = false;
-    backgroundMonitorGeneration += 1;
-    backgroundReviewDeferred = false;
-    pendingNativeCompletionRevision = undefined;
-    orchestratorBackgroundReadiness.clear();
-    unsubscribeBackgroundLifecycle?.();
-    unsubscribeBackgroundLifecycle = undefined;
-    releaseReviewerQuestionPauseWaiters();
+    // Coordinator shutdown preserves the original order: abort and await the
+    // active review first, then clear the status tracker, then reset run,
+    // settlement, monitor, and question-pause state.
+    await reviewTurn.shutdownReview();
+    await reviewTurn.clearStatusTracker();
+    reviewTurn.resetForShutdown();
     // Issue #26: stop future dispatches for the dying session first; active
     // scheduled subtasks are NOT interrupted — they settle through the
     // controller's own shutdown/recovery semantics below.
@@ -658,9 +485,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     await executionTools.shutdown();
     await webTools?.cleanup();
     await cleanupReviewBundles(state);
-    await drainEvidenceCaptures();
-    await persistSessionState(true);
-    await stateStore?.drain();
+    await reviewTurn.drainEvidenceCaptures();
+    await sessionPersistence.persist(true);
+    await sessionPersistence.drain();
     await executionTools.detach();
     discardSessionState(state);
   });
@@ -669,7 +496,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     // Issue #222: session boundaries reset orchestrator-turn correlation —
     // only runs of the CURRENT session may settle its deliveries.
     orchestratorTurnTracker.resetSession();
-    triggeringMessageReviewFailure = undefined;
+    reviewTurn.clearTriggeringFailure();
     // Issue #213: interactive TUI sessions prewarm the running Pi agent peer
     // immediately — a fire-and-forget native import that overlaps the rest of
     // this hook (no timer, no visible UI) so the first /review-settings menu
@@ -680,26 +507,17 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     if (contextIsInteractiveTui(extractContext(args))) {
       void prewarmPiAgentPeer();
     }
-    await ownerSaveTail;
+    await sessionPersistence.awaitSaveTail();
     nativeToolPreflight.reset();
     sessionActive = true;
     currentCwd = extractCwd(args, currentCwd);
-    backgroundMonitorGeneration += 1;
-    backgroundCompletionMonitor = undefined;
-    backgroundReviewDeferred = false;
-    pendingNativeCompletionRevision = undefined;
-    orchestratorBackgroundReadiness.clear();
-    if (backgroundShellController && !unsubscribeBackgroundLifecycle) {
-      unsubscribeBackgroundLifecycle = backgroundShellController.subscribe(handleBackgroundLifecycle);
-    }
+    reviewTurn.resetForSessionStart();
     updateScopedModels(args);
     executionTools.setScopedModels(currentScopedModels);
     executionTools.setUiContext(extractContext(args) ?? pi);
     discardSessionState(state);
     checkpointRestartBlocked = undefined;
-    durableOwners = new Map();
-    latestSavedOwners = new Map();
-    retiredOwnerIds.clear();
+    sessionPersistence.resetLedger();
     const context = extractContext(args);
     const deferredSessionIdentity = typeof context === "object" && context !== null
       ? (context as { sessionManager?: unknown }).sessionManager
@@ -722,9 +540,12 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     const appendEntry = typeof pi === "object" && pi !== null && "appendEntry" in pi && typeof pi.appendEntry === "function"
       ? pi.appendEntry.bind(pi) as (customType: string, data: unknown) => void
       : undefined;
-    stateStore = identity && appendEntry
+    const stateStore = identity && appendEntry
       ? new SessionStateStore(identity, appendEntry)
       : identity ? new SessionStateStore(identity) : undefined;
+    // The persistence owner keeps its own late-bound reference to the store
+    // for the save tail and the stale-store check.
+    sessionPersistence.bindStore(stateStore);
     let restoredRevision: number | undefined;
     let damagedReviewRestart = false;
     if (stateStore) {
@@ -771,7 +592,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
                 kind: "checkpoint", descriptor: captured.value, cwd: currentCwd, capturedAt: new Date().toISOString(),
               });
               freezeReviewWindowConfig(state, config, currentScopedModels);
-              if (!await saveWithOwnerRetirement(stateStore)) {
+              if (!await sessionPersistence.saveAndRetire(stateStore)) {
                 throw new Error("fresh checkpoint state was not durably saved");
               }
               await sendNoticeUnlessItThrows(context ?? pi, "review gate: fresh checkpoint captured; only edits after this reset can receive a new review verdict");
@@ -782,8 +603,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
                 `review gate: fresh checkpoint could not be durably captured (${checkpointRestartBlocked}); prior review remains preserved; review is blocked. Repair the workspace or storage and restart`);
             }
           } else {
-            durableOwners = ownersOf();
-            latestSavedOwners = new Map(durableOwners);
+            sessionPersistence.adoptRestoredOwners();
           }
         } else {
           await executionTools.restoreAssociations({ waveRoots: [], bundles: [] });
@@ -818,7 +638,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       await recoverPendingModelDeliveries({
         pi,
         state,
-        persist: () => persistSessionState(),
+        persist: () => sessionPersistence.persist(),
         isSessionActive: () => sessionActive,
         notify: (message) => sendNotice(context ?? pi, message),
       });
@@ -829,7 +649,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     // Issue #26: arm the scheduler only after restore completes, so overlap
     // detection sees restored groups before any due occurrence can fire.
     scheduledRuntime.attach();
-    await persistSessionState();
+    await sessionPersistence.persist();
     await sendNotice(extractContext(args) ?? pi, `review gate: loaded (${loaded.path ?? "no config path"})`);
   });
 
@@ -851,7 +671,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       return;
     }
     const text = extractInputText(args);
-    if ((state.reviewInProgress || agentSettlementInputHold) && text.trim()) {
+    if ((state.reviewInProgress || reviewTurn.isSettlementInputHoldActive()) && text.trim()) {
       const queued = text.trim();
       state.queuedUserInputsDuringReview.push(queued);
       const deliverySequence = state.pendingModelDeliveries.filter((delivery) => delivery.kind === "queued_user_input").length + 1;
@@ -861,13 +681,13 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
         channel: "follow_up",
         message: queued,
       });
-      await persistSessionState();
+      await sessionPersistence.persist();
       return { action: "handled" };
     }
     const expiredQuestionWindow = state.reviewWindow ? undefined : state.lastQuestionWindow;
     rememberUserRequest(state, text);
     await removeTransientWindowBundle(expiredQuestionWindow);
-    await persistSessionState();
+    await sessionPersistence.persist();
     return undefined;
   });
 
@@ -920,129 +740,29 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
         // Observability must never break a run.
       }
     }),
-    messageStart: registerObservabilityHook("message_start", async (...args: unknown[]) => {
-      const message = findTriggeringCustomMessage(args);
-      if (!message) return;
-      const occurrenceId = message.customType === "pi-review-scheduled-orchestrator-turn"
-        ? message.details?.occurrenceId
-        : undefined;
-      if (!orchestratorTurnTracker.hasRunsInFlight()) {
-        // Real Pi emits agent_start before consuming a trigger-turn custom
-        // message. If that contract is absent at runtime, do not arm or
-        // attribute the message as though a real consuming run existed.
-        triggeringMessageReviewFailure ??= "a triggering custom message arrived without an observable agent run";
-        orchestratorTurnTracker.noteMessageArmingFailed(occurrenceId);
-        await sendNoticeUnlessItThrows(extractContext(args) ?? pi,
-          "review gate: a triggering custom message could not be correlated with an agent run; all Pi tool calls are blocked for this session, and scheduled orchestrator turns are disabled until a new session");
-        return;
-      }
-      // Attribute FIRST (cheap and synchronous): a send promise may reject
-      // while the async review baseline is being persisted. This identity is
-      // the host's exact message_start, never an unrelated before_agent_start.
-      const observed = occurrenceId !== undefined && orchestratorTurnTracker.noteMessageObserved(occurrenceId);
-      try {
-        // The scheduled instructions are the request the reviewer must
-        // evaluate, not merely an unattributed custom message in the session.
-        // A busy follow-up adds them to the current exchange; an idle custom
-        // turn opens a new review window before its baseline is captured.
-        if (observed) {
-          if (!message.content?.trim()) throw new Error("scheduled request text is unavailable");
-          rememberUserRequest(state, message.content);
-        }
-        // Fail-closed arming: this model request starts work this extension
-        // initiated outside the normal prompt path. For a busy queued turn the
-        // run already has an armed exchange baseline (shared window, no
-        // re-capture); for an idle run this captures the baseline HERE, before
-        // that message's model request.
-        const armed = await armAgentRun(args);
-        if (armed === "blocked") {
-          throw new Error("the review gate's checkpoint restart is blocked");
-        }
-        if (observed) await persistSessionState();
-      } catch (error) {
-        // Pi may continue the provider request after a message_start handler
-        // fails. Do not count this occurrence, block every native tool call
-        // before execution, and refuse later scheduled turns until a new
-        // session restores a trustworthy review/auth boundary.
-        triggeringMessageReviewFailure ??= "a triggering custom message could not reassert its review baseline and deferred-tool authorization";
-        orchestratorTurnTracker.noteMessageArmingFailed(occurrenceId);
-        console.warn(`review gate: ${triggeringMessageReviewFailure}: ${error instanceof Error ? error.message : String(error)}`);
-        await sendNoticeUnlessItThrows(extractContext(args) ?? pi,
-          "review gate: a triggering custom message could not reassert the review baseline and deferred-tool authorization; all Pi tool calls are blocked for this session, and scheduled orchestrator turns are disabled until a new session");
-      }
-    }),
+    // The coordinator's handler body (verbatim move): it attributes the
+    // scheduled occurrence on the host's exact message_start, re-asserts the
+    // review baseline and deferred-tool authorization before that message's
+    // model request, and fails closed on any arming error.
+    messageStart: registerObservabilityHook("message_start", (...args: unknown[]) => reviewTurn.onMessageStart(args)),
   };
-  /**
-   * Issue #222 (corrected lifecycle): the shared fail-closed run-arming body
-   * for every agent run this extension observes. The review gate's
-   * before_agent_start calls it for every normal user turn; the scheduled
-   * custom-message observation (message_start) calls it for the idle and
-   * queued scheduled runs whose submit path on real Pi hosts bypasses
-   * before_agent_start entirely. Idempotent for an already-armed run (a busy
-   * queued turn shares the exchange window the running cycle armed) and
-   * capturing a fresh checkpoint baseline for an idle run. It cannot modify
-   * the system prompt (message_start has no prompt result): the model-facing
-   * injection stays on the before_agent_start path only.
-   */
-  const armAgentRun = async (args: unknown[]): Promise<"armed" | "blocked"> => {
-    // Pi may auto-activate tools registered after session_start. Reassert the
-    // captured boundary immediately before every new agent request.
-    deferredTools.reapply();
-    if (checkpointRestartBlocked) return "blocked";
-    agentRunActive = true;
-    currentCwd = extractCwd(args, currentCwd);
-    updateScopedModels(args);
-    executionTools.setScopedModels(currentScopedModels);
-    executionTools.setUiContext(extractContext(args) ?? pi);
-    beginAgentRun(state);
-    if (activeExchangeHasBaseline(state)) return "armed";
-    const existing = state.reviewWindow?.baseline;
-    if (existing && existing.kind !== "checkpoint") {
-      // Restored legacy windows retain their own typed baseline and settle
-      // through their existing fail-closed path until that window closes.
-      if (state.reviewWindow?.activeExchange) state.reviewWindow.activeExchange.baseline = existing;
-      freezeReviewWindowConfig(state, config, currentScopedModels);
-      await persistSessionState();
-      return "armed";
-    }
-    const captured = existing ? undefined : await captureReviewCheckpoint(currentCwd, `window-${state.reviewWindow?.id ?? 0}-${randomUUID()}`);
-    if (captured && captured.status !== "ok") throw new Error(`review gate: baseline capture failed (${captured.reason}): ${captured.detail}`);
-    const baseline = existing ?? (captured?.status === "ok"
-      ? { kind: "checkpoint" as const, descriptor: captured.value, cwd: currentCwd, capturedAt: new Date().toISOString() }
-      : undefined);
-    if (!baseline) throw new Error("review gate: checkpoint capture unavailable");
-    // Once the descriptor enters state, retain it on save failure: a future
-    // successful save can still recover the referenced checkpoint.
-    try {
-      setReviewWindowCheckpointBaseline(state, baseline);
-      freezeReviewWindowConfig(state, config, currentScopedModels);
-      await persistSessionState();
-    } catch (error) {
-      if (captured?.status === "ok" && state.reviewWindow?.baseline !== baseline && state.reviewWindow?.activeExchange?.baseline !== baseline) {
-        const released = await releaseReviewCheckpoint(currentCwd, captured.value);
-        if (released.status !== "ok") throw new Error(`review gate: baseline setup failed; orphan release failed (${released.reason}): ${released.detail}`);
-      }
-      throw error;
-    }
-    return "armed";
-  };
-
   /**
    * Issue #222 (corrected): the review gate's run-arming for normal user
    * turns. Unchanged in behavior; the arming body is shared with the
    * scheduled custom-message observation below.
    */
   registerHook(pi, "before_agent_start", async (...args) => {
-    const armed = await armAgentRun(args);
+    const armed = await reviewTurn.armAgentRun(args);
     if (armed === "blocked") throw new Error(`review gate: fresh checkpoint restart failed (${checkpointRestartBlocked}); repair and restart before review`);
     return executionPromptInjection(executionTools.criticalPrompt(), deferredTools.startupGuidance(), operatingModeSystemPrompt(args));
   });
 
   toolCallObserver = async (...args) => {
-    if (triggeringMessageReviewFailure) {
+    const triggeringFailure = reviewTurn.triggeringFailure();
+    if (triggeringFailure) {
       return {
         block: true,
-        reason: `review gate: ${triggeringMessageReviewFailure}; no tool call may execute until the review/auth boundary is restored in a new session`,
+        reason: `review gate: ${triggeringFailure}; no tool call may execute until the review/auth boundary is restored in a new session`,
       };
     }
     const decision = nativeToolPreflight.preflight(args);
@@ -1051,7 +771,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     const window = state.reviewWindow;
     if (window && shouldRecordToolCallEvidence(name)) {
       try {
-        await trackEvidenceCapture(recordToolCallEvidence({
+        await reviewTurn.trackEvidenceCapture(recordToolCallEvidence({
           state: window.evidence,
           cwd: currentCwd,
           toolName: name,
@@ -1076,9 +796,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     deferredTools.reapply();
     const name = extractToolName(args);
     const toolArgs = extractToolArgs(args);
-    if (!backgroundShellController) {
-      orchestratorBackgroundReadiness.observeToolResult(name, args[0], isToolError(args[0]));
-    }
+    reviewTurn.observeBackgroundToolResult(name, args[0]);
     const window = state.reviewWindow;
     const toolError = isToolError(args[0]);
     if (!window || !shouldRecordToolResultEvidence(name, toolError)) {
@@ -1094,492 +812,12 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     });
   });
 
-  registerHook(pi, "agent_end", async (...args) => {
-    try {
-    // Pi emits agent_end for every low-level run and may still auto-retry,
-    // auto-compact and retry, or continue with queued follow-up messages
-    // afterwards. This hook therefore only records what the finished run
-    // produced; review finalization happens once at agent_settled, where Pi
-    // guarantees no automatic continuation remains (docs/extensions.md).
-    // Detecting "this end is retryable" from provider error strings would be
-    // brittle — the lifecycle boundary is the source of truth.
-    currentCwd = extractCwd(args, currentCwd);
-    const signal = extractSignal(args);
-    const window = state.reviewWindow;
-    if (window) {
-      rememberFinalAssistantSummary(window.evidence, args);
-    }
-    pendingSettlementUsage = combineTokenUsage(pendingSettlementUsage, extractPiUsageFromMessages(args));
-    if (signal?.aborted) {
-      pendingSettlementAborted = true;
-    }
+  registerHook(pi, "agent_end", (...args) => reviewTurn.onAgentEnd(args));
 
-    // The consultation can be identified here, but cannot be reviewed or
-    // released until agent_settled has run the browser ownership barrier.
-    const pauseForReviewerQuestion = reviewerQuestionPausePending;
-    reviewerQuestionPausePending = false;
-    if (pauseForReviewerQuestion) pendingSettlementPausedForQuestion = true;
-    } finally {
-      await persistSessionState();
-    }
-  });
-
-  registerHook(pi, "agent_settled", async (...args) => {
-    try {
-    // agent_settled is the only point where Pi guarantees that no automatic
-    // retry, compaction retry, or queued continuation remains for this turn,
-    // so the review window may be finalized here and only here. Consume this
-    // cycle's accumulated records first: running a review can queue follow-up
-    // runs, whose before_agent_start resets the accumulators.
-    const actingUsage = pendingSettlementUsage;
-    const runAborted = pendingSettlementAborted;
-    const pausedForReviewerQuestion = pendingSettlementPausedForQuestion;
-    pendingSettlementUsage = undefined;
-    pendingSettlementAborted = false;
-    pendingSettlementPausedForQuestion = false;
-    agentRunActive = false;
-    currentCwd = extractCwd(args, currentCwd);
-    const noticeTarget = extractContext(args) ?? pi;
-    if (checkpointRestartBlocked) {
-      await sendNoticeUnlessItThrows(noticeTarget,
-        `review gate: review blocked (${checkpointRestartBlocked}); repair and restart before review`);
-      return;
-    }
-    const prospectiveWindow = state.reviewWindow;
-    // Issue #175: automatic primary review is a stored per-layer toggle. It
-    // suppresses the settlement-time automatic review only; manual
-    // /review-now and /ask-reviewer stay gated by the selected reviewers and
-    // the master setting. The hold must track whether an automatic review
-    // will actually run, so queued user input is never stranded behind a
-    // review that was switched off.
-    const primaryEnabled = effectiveReviewSettings(config).primaryEnabled;
-    agentSettlementInputHold = Boolean(
-      prospectiveWindow?.baseline
-      && !runAborted
-      && !pausedForReviewerQuestion
-      && !state.reviewsPaused
-      && primaryEnabled
-      && (prospectiveWindow.reviewConfig?.enabled ?? config.enabled),
-    );
-    // Reviews settle model work, not the live browser. Page scripts and
-    // authenticated broker traffic may continue throughout a review.
-    if (pausedForReviewerQuestion) {
-      // /ask-reviewer waits for this exact model settlement boundary, without
-      // closing or suspending the browser. Web effects may continue.
-      const window = state.reviewWindow;
-      try {
-        if (window?.baseline && !runAborted) {
-          await collectPausedReviewExchange({
-            cwd: currentCwd,
-            config: window.reviewConfig ?? config,
-            evidence: window.evidence,
-            actingUsage,
-            window,
-          });
-        }
-        releaseReviewerQuestionPauseWaiters();
-      } catch (error) {
-        releaseReviewerQuestionPauseWaiters(error instanceof Error ? error : new Error("Reviewer consultation settlement failed."));
-        throw error;
-      }
-      return;
-    }
-    const window = state.reviewWindow;
-    if (!window) {
-      return;
-    }
-    if (!primaryEnabled) {
-      // Automatic primary review is off (issue #175): no reviewer runs at
-      // settlement. Nothing is deferred on background readiness — there is no
-      // automatic review for active background work to block — and the window
-      // stays open so the baseline, exchanges, evidence, and history keep
-      // accumulating across quick turns for a manual /review-now. The turn's
-      // exchange is settled without any verdict, so no synthetic PASS ever
-      // enters the persisted review history.
-      // A background-completion wake armed by an earlier deferral while
-      // automatic review was on may still resume the model after the toggle:
-      // it finishes the original request, and this same off path settles that
-      // resumed turn without running reviewers.
-      backgroundReviewDeferred = false;
-      pendingNativeCompletionRevision = undefined;
-      if (!window.baseline) {
-        closeReviewWindow(state);
-        return;
-      }
-      if (!config.enabled) {
-        // Master setting off keeps its existing settlement semantics: the
-        // window is preserved for reviewer questions but not kept open.
-        closeReviewWindow(state, true);
-        return;
-      }
-      if (runAborted) {
-        // A user abort of the run supersedes automatic review; the window and
-        // its baseline survive for the next turn, exactly as before.
-        state.reviewInProgress = false;
-        state.queuedUserInputsDuringReview = [];
-        return;
-      }
-      await collectPausedReviewExchange({
-        cwd: currentCwd,
-        config: window.reviewConfig ?? freezeReviewWindowConfig(state, config, currentScopedModels),
-        evidence: window.evidence,
-        actingUsage,
-        window,
-      });
-      await persistSessionState();
-      return;
-    }
-    const backgroundReadiness = currentBackgroundReadiness();
-    const executionReadiness = executionTools.reviewReadiness();
-    if (backgroundReadiness.unverifiable.length > 0) {
-      await sendNotice(
-        noticeTarget,
-        `review gate: automatic review blocked because ShellStart background readiness could not be verified: ${backgroundReadiness.unverifiable.join("; ")}`,
-      );
-      await persistSessionState();
-      return;
-    }
-    if (backgroundReadiness.running.length > 0 || executionReadiness.length > 0) {
-      if (backgroundReadiness.running.length > 0) backgroundReviewDeferred = true;
-      const blockers = [
-        backgroundReadiness.running.length > 0
-          ? `${backgroundReadiness.running.length} background process group(s) remain active (${backgroundReadiness.running.map((job) => `${job.id}: ${job.label}`).join(", ")})`
-          : undefined,
-        executionReadiness.length > 0
-          ? `${executionReadiness.length} background subtask(s) remain active (${executionReadiness.map((task) => `${task.taskId}: ${task.kind} · ${task.title} [${task.state}]`).join(", ")})`
-          : undefined,
-      ].filter((value): value is string => Boolean(value));
-      await sendNotice(
-        noticeTarget,
-        `review gate: automatic review deferred while ${blockers.join(" and ")}`,
-      );
-      if (backgroundReadiness.running.length > 0 && !backgroundShellController) {
-        scheduleBackgroundCompletion(noticeTarget);
-      }
-      await persistSessionState();
-      return;
-    }
-    backgroundReviewDeferred = false;
-    pendingNativeCompletionRevision = undefined;
-    if (!window.baseline) {
-      closeReviewWindow(state);
-      return;
-    }
-    // #193 slice D: pass the typed baseline through. A Git checkpoint
-    // variant settles inside runReview through one frozen after-checkpoint
-    // (frozen-to-frozen compare, changed-only delta); a legacy snapshot keeps
-    // the existing settle semantics.
-    const reviewBefore = window.baseline;
-    const reviewConfig = window.reviewConfig ?? freezeReviewWindowConfig(state, config, currentScopedModels);
-    if (!reviewConfig.enabled) {
-      if (config.enabled) {
-        // The gate is enabled but no configured reviewer is currently
-        // resolvable. Fail closed without clearing the preserved window: the
-        // evidence stays open until a reviewer can run.
-        await sendNoticeWhileSessionActive(
-          noticeTarget,
-          "review gate: automatic review deferred because no configured reviewer is currently available; the preserved review window stays open until a reviewer can run; use /review-settings",
-          () => sessionActive,
-        );
-        await persistSessionState();
-        return;
-      }
-      closeReviewWindow(state, true);
-      return;
-    }
-    if (runAborted) {
-      // A user abort of the run supersedes automatic review; the window and
-      // its baseline survive for the next turn, exactly as before.
-      state.reviewInProgress = false;
-      state.queuedUserInputsDuringReview = [];
-      return;
-    }
-    if (state.reviewsPaused) {
-      await collectPausedReviewExchange({
-        cwd: currentCwd,
-        config: reviewConfig,
-        evidence: window.evidence,
-        actingUsage,
-        window,
-      });
-      return;
-    }
-
-    state.reviewInProgress = true;
-    let settleReview!: () => void;
-    const reviewSettled = new Promise<void>((resolvePromise) => { settleReview = resolvePromise; });
-    activeReviewSettled = reviewSettled;
-    // The terminal-input listener must be installed before any await so Escape
-    // (and /review-cancel) can abort while evidence drains or state persists;
-    // the handler itself gates on reviewInProgress.
-    const reviewAbort = createReviewAbortController({
-      signal: undefined,
-      noticeTarget,
-      state,
-      isSessionActive: () => sessionActive,
-      cancellation: reviewCancellation,
-      settled: reviewSettled,
-      describe: () => "the automatic review",
-    });
-    activeReviewAbort = reviewAbort;
-    try {
-      await drainEvidenceCaptures();
-      await persistSessionState();
-    } catch (error) {
-      // Any failure after listener/coordinator registration must still
-      // unregister, settle the review, and clear active references so session
-      // shutdown and /review-cancel never observe stale state.
-      state.reviewInProgress = false;
-      reviewAbort.cleanup();
-      if (activeReviewAbort === reviewAbort) activeReviewAbort = undefined;
-      settleReview();
-      if (activeReviewSettled === reviewSettled) activeReviewSettled = undefined;
-      throw error;
-    }
-    if (!sessionActive) {
-      state.reviewInProgress = false;
-      reviewAbort.cleanup();
-      if (activeReviewAbort === reviewAbort) activeReviewAbort = undefined;
-      settleReview();
-      if (activeReviewSettled === reviewSettled) activeReviewSettled = undefined;
-      return;
-    }
-    // No run signal exists at settlement time (the last low-level run has
-    // already finished); cancellation still flows through escape terminal
-    // input, /review-cancel, and session shutdown.
-    const statusTracker = createStatusTracker(noticeTarget, "review-gate", "reviewing changes");
-    activeStatusTracker = statusTracker;
-    let output: ReviewRunOutput;
-    try {
-      output = await runReview({
-        cwd: currentCwd,
-        request: buildRequestContext(state, state.reviewWindow, { priorFeedback: "latest" }),
-        before: reviewBefore,
-        config: reviewConfig,
-        evidence: window.evidence,
-        correctionAttemptCount: getCorrectionAttemptCount(window),
-        actingUsage,
-        window,
-        signal: reviewAbort.signal,
-        notify: (message) => sendNoticeWhileSessionActive(noticeTarget, message, () => sessionActive),
-        onUpdate: (message) => statusTracker.update(message),
-        onInvocationPrepared: persistSessionState,
-      });
-    } catch (error) {
-      if (!sessionActive) {
-        return;
-      }
-      await releaseQueuedUserInputs(pi, state, () => sessionActive, persistSessionState);
-      throw error;
-    } finally {
-      await statusTracker.clear({ immediate: reviewAbort.signal.aborted, signal: reviewAbort.signal });
-      if (activeStatusTracker === statusTracker) {
-        activeStatusTracker = undefined;
-      }
-      reviewAbort.cleanup();
-      if (activeReviewAbort === reviewAbort) {
-        activeReviewAbort = undefined;
-      }
-      settleReview();
-      if (activeReviewSettled === reviewSettled) activeReviewSettled = undefined;
-      // A resumed conversation may need the active review artifacts.
-    }
-
-    if (!sessionActive) {
-      await output.releaseReviewedBaseline?.();
-      return;
-    }
-
-    if (!output.changed) {
-      if (output.noReviewReason === "unchanged_deferred_response") {
-        await releaseQueuedUserInputs(pi, state, () => sessionActive, persistSessionState);
-        return;
-      }
-      closeReviewWindow(state, true);
-      await releaseQueuedUserInputs(pi, state, () => sessionActive, persistSessionState);
-      return;
-    }
-
-    if (reviewAbort.signal.aborted || output.result?.error === "aborted") {
-      if (reviewAbort.getReason() === "escape" || reviewAbort.getReason() === "manual") {
-        await reviewAbort.notifyCancellation();
-      }
-      state.reviewInProgress = false;
-      // Count the queued user inputs that are deliberately dropped with this
-      // cancellation so the notice below never invents or leaks content. The
-      // ledger is the source of truth for what is cleared: every reachable
-      // current entry carries its durable delivery record, old-only entries
-      // without one are still counted (never silently dropped), and ledger
-      // occurrences whose only record is an in-flight delivery
-      // (dispatching/uncertain) may still land and are never counted as
-      // definitely dropped. The count is computed before the deliveries below
-      // are cancelled and the queued-input ledger is cleared.
-      const inFlightByMessage = new Map<string, number>();
-      for (const delivery of state.pendingModelDeliveries) {
-        if (delivery.kind === "queued_user_input" && (delivery.status === "dispatching" || delivery.status === "uncertain")) {
-          inFlightByMessage.set(delivery.message, (inFlightByMessage.get(delivery.message) ?? 0) + 1);
-        }
-      }
-      let droppedInputCount = 0;
-      for (const message of state.queuedUserInputsDuringReview) {
-        const inFlight = inFlightByMessage.get(message) ?? 0;
-        if (inFlight > 0) {
-          inFlightByMessage.set(message, inFlight - 1);
-          continue;
-        }
-        droppedInputCount += 1;
-      }
-      for (const delivery of state.pendingModelDeliveries) {
-        if (delivery.kind === "queued_user_input" && delivery.status === "queued") {
-          delivery.status = "cancelled";
-          delivery.diagnostic = "The review was explicitly cancelled before this queued input was released.";
-        }
-      }
-      state.queuedUserInputsDuringReview.splice(0);
-      // Make the cancellation durable immediately: cancelled deliveries must
-      // never be re-dispatched by a later restore, and the cleared ledger must
-      // not be resurrected.
-      await persistSessionState();
-      if (droppedInputCount > 0) {
-        // Explicit count-only notice: dropped input is never resent
-        // automatically and its content is never echoed.
-        await sendNoticeWhileSessionActive(
-          noticeTarget,
-          `review gate: ${droppedInputCount} queued user input(s) were dropped when the review was cancelled and will not be sent automatically; resend them if still needed`,
-          () => sessionActive,
-        );
-      }
-      return;
-    }
-
-    const transmit = async (details: Parameters<typeof transmitReviewPass>[0]): Promise<string> => {
-      try {
-        const message = await transmitReviewPass(details);
-        // The new after descriptor is reachable from state; save before
-        // retiring the previous response baseline. On save failure retain both.
-        await persistSessionState();
-        return message;
-      } catch (error) {
-        // A transmission that fails before recording feedback never hands off
-        // the after descriptor. Once reachable from state, retain on any save
-        // failure rather than deleting an in-memory or persisted reference.
-        if (window.activeExchange?.baseline !== output.reviewedBaseline) await output.releaseReviewedBaseline?.();
-        throw error;
-      }
-    };
-    if (output.result?.verdict === "pass") {
-      const transmission = await transmit({
-        state,
-        output,
-        source: "automatic",
-        disposition: "sent_for_observation",
-        action: "passed",
-      });
-      await sendNoticeWhileSessionActive(
-        noticeTarget,
-        `review gate: ${output.result.error === "partial_reviewer_error" ? "passed with reviewer warnings" : "passed"} (${formatTokenUsage(output.result.usage)})`,
-        () => sessionActive,
-      );
-      await deliverAutomaticTransmission(pi, noticeTarget, state, output, "passed", transmission, () => sessionActive, persistAutomaticDeliveryState);
-      await releaseQueuedUserInputs(pi, state, () => sessionActive, persistSessionState);
-      return;
-    }
-
-    if (output.result?.verdict === "needs_changes") {
-      if (isRepeatedNoProgressFeedback({
-        previous: window.lastCorrectionFeedback,
-        result: output.result,
-        changes: output.changes,
-        evidenceEventCount: window.evidence.events.length,
-      })) {
-        const transmission = await transmit({
-          state,
-          output,
-          source: "automatic",
-          disposition: "sent_at_cap",
-          action: "deferred",
-        });
-        await sendNoticeWhileSessionActive(
-          noticeTarget,
-          [
-            `review gate: repeated changes requested with no new correction evidence (${formatTokenUsage(output.result.usage)})`,
-            "Reviewer feedback matched the previous blocking feedback, and the correction turn produced no new tool evidence or file-change fingerprint.",
-            "Stopping automatic correction to avoid a loop.",
-          ].join("\n"),
-          () => sessionActive,
-        );
-        await deliverAutomaticTransmission(pi, noticeTarget, state, output, "deferred", transmission, () => sessionActive, persistAutomaticDeliveryState);
-        await releaseQueuedUserInputs(pi, state, () => sessionActive, persistSessionState);
-        return;
-      }
-
-      window.lastCorrectionFeedback = createCorrectionFeedbackMarker({
-        result: output.result,
-        changes: output.changes,
-        evidenceEventCount: window.evidence.events.length,
-      });
-      if (window.correctionCycles >= reviewConfig.maxCorrectionCycles) {
-        const deferredTransmission = await transmit({
-          state,
-          output,
-          source: "automatic",
-          disposition: "sent_at_cap",
-          action: "deferred",
-        });
-        window.lastCappedFollowUp = buildReviewAuthorizationMessage({
-          reviewSequence: output.reviewSequence!,
-          bundleDir: output.bundleDir!,
-        });
-        await sendNoticeWhileSessionActive(
-          noticeTarget,
-          [
-            `review gate: changes requested, automatic correction cap reached (${formatTokenUsage(output.result.usage)})`,
-            "Complete reviewer feedback was transmitted to the implementing model, but automatic correction is deferred.",
-            `Use /review-continue to authorize another ${reviewConfig.maxCorrectionCycles} automatic correction cycle(s).`,
-          ].join("\n"),
-          () => sessionActive,
-        );
-        await deliverAutomaticTransmission(pi, noticeTarget, state, output, "deferred", deferredTransmission, () => sessionActive, persistAutomaticDeliveryState);
-        await releaseQueuedUserInputs(pi, state, () => sessionActive, persistSessionState);
-        return;
-      }
-      window.lastCappedFollowUp = undefined;
-      window.correctionCycles += 1;
-      const transmission = await transmit({
-        state,
-        output,
-        source: "automatic",
-        disposition: "sent_for_correction",
-        action: "correction_required",
-      });
-      await sendNoticeWhileSessionActive(
-        noticeTarget,
-        `review gate: changes requested (${formatTokenUsage(output.result.usage)})`,
-        () => sessionActive,
-      );
-      await deliverAutomaticTransmission(pi, noticeTarget, state, output, "correction_required", transmission, () => sessionActive, persistAutomaticDeliveryState);
-      await releaseQueuedUserInputs(pi, state, () => sessionActive, persistSessionState);
-      return;
-    }
-
-    const failed = `review gate: reviewer failed (${formatTokenUsage(output.result?.usage)})`;
-    if (output.result) {
-      const transmission = await transmit({
-        state,
-        output,
-        source: "automatic",
-        disposition: "sent_review_error",
-        action: "review_error",
-      });
-      await deliverAutomaticTransmission(pi, noticeTarget, state, output, "review_error", transmission, () => sessionActive, persistAutomaticDeliveryState);
-    }
-    await sendNoticeWhileSessionActive(noticeTarget, failed, () => sessionActive);
-    await releaseQueuedUserInputs(pi, state, () => sessionActive, persistSessionState);
-    } finally {
-      agentSettlementInputHold = false;
-      await persistSessionState();
-    }
-  });
+  // The coordinator settlement handler (verbatim move): agent_settled is the
+  // only boundary where Pi guarantees no automatic continuation remains, so
+  // the review window is finalized there and only there.
+  registerHook(pi, "agent_settled", (...args) => reviewTurn.onAgentSettled(args));
 
   // Command-driven reviews bypass before_agent_start. Guard their handlers at
   // registration, before a reviewer, checkpoint, notice or delivery can run.
@@ -1619,30 +857,12 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     isSessionActive: () => sessionActive,
     sessionSignal: sessionAbortController.signal,
     cancellation: reviewCancellation,
-    onStateChanged: persistSessionState,
-    releaseQueuedUserInputs: () => releaseQueuedUserInputs(pi, state, () => sessionActive, persistSessionState),
-    prepareReviewerQuestion: async (commandName, ctx) => {
-      if (!agentRunActive && commandContextIsIdle(ctx)) {
-        return;
-      }
-
-      reviewerQuestionPausePending = true;
-      const paused = new Promise<void>((resolve, reject) => reviewerQuestionPauseWaiters.add((error) => error ? reject(error) : resolve()));
-      const delivered = await sendSteeringPrompt(
-        pi,
-        [
-          `Reviewer consultation requested by /${commandName}.`,
-          "Pause implementation at this steering boundary. Do not call any more tools or modify files after receiving this message.",
-          "End this turn so the reviewer can inspect the workspace; its response will be provided next. The browser remains live during review and page effects may continue.",
-        ].join(" "),
-      );
-      if (!delivered) {
-        reviewerQuestionPausePending = false;
-        releaseReviewerQuestionPauseWaiters();
-        throw new Error("review gate: cannot pause the active turn because sendUserMessage is unavailable");
-      }
-      await paused;
-    },
+    onStateChanged: () => sessionPersistence.persist(),
+    releaseQueuedUserInputs: () => releaseQueuedUserInputs(pi, state, () => sessionActive, () => sessionPersistence.persist()),
+    // The coordinator question-pause preparation (verbatim move): it holds
+    // the settlement input hold, steers the model to pause, and waits for
+    // the agent_settled boundary that collects the paused exchange.
+    prepareReviewerQuestion: (commandName, ctx) => reviewTurn.prepareReviewerQuestion(commandName, ctx),
   });
 
   registerReviewSettings({
@@ -1688,7 +908,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       if (reconciled > 0) {
         const reviewerCount = resolveReviewers(config, currentScopedModels).reviewers.length;
         await sendNotice(pi, `review gate: ${reconciled} review window(s) reconciled to the updated reviewer settings (${reviewerCount} configured reviewer(s)); preserved evidence and history are unchanged`);
-        await persistSessionState();
+        await sessionPersistence.persist();
       }
     },
     onScopedModels: (models) => {
@@ -1728,7 +948,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     const next = config.operatingMode;
     if (previous === next) return;
     setStatus(noticeTarget, "review-gate-mode", operatingModeStatusText(next));
-    const capturedWork = executionTools.reviewReadiness().length + currentBackgroundReadiness().running.length;
+    const capturedWork = executionTools.reviewReadiness().length + reviewTurn.currentBackgroundReadiness().running.length;
     const detail = next === "plan-research"
       ? "write-capable tools are hidden until you switch to a write-capable mode"
       : "previously authorized tools are available again";
@@ -1784,6 +1004,11 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   );
 }
 
+export default activate;
+
+module.exports = activate;
+Object.assign(module.exports as Record<string, unknown>, { activate });
+
 async function cleanupReviewBundles(state: ReviewGateState): Promise<void> {
   const windows = [state.reviewWindow, state.lastQuestionWindow].filter((window) => window !== undefined);
   const directories = [...new Set([
@@ -1833,522 +1058,6 @@ function executorBootstrapToolCatalog(serialized: string | undefined): ExecutorT
     // catalog. Fresh worker startup will fail closed.
     return undefined;
   }
-}
-
-function extractSystemPrompt(args: unknown[]): string | undefined {
-  for (const arg of args) {
-    if (typeof arg === "object" && arg !== null && "systemPrompt" in arg
-      && typeof (arg as { systemPrompt?: unknown }).systemPrompt === "string") {
-      return (arg as { systemPrompt: string }).systemPrompt;
-    }
-  }
-  return undefined;
-}
-
-function withAuthorizedToolInventory(systemPrompt: string | undefined, inventory: string): string {
-  return systemPrompt ? `${systemPrompt}\n\n${inventory}` : inventory;
-}
-
-function deferredToolPromptInjection(
-  content: string | undefined,
-  systemPrompt: string | undefined,
-): { systemPrompt: string } | undefined {
-  if (!content) return undefined;
-  return { systemPrompt: withAuthorizedToolInventory(systemPrompt, content) };
-}
-
-function executionPromptInjection(
-  content: string | undefined,
-  authorizedToolInventory?: string,
-  systemPrompt?: string,
-): { message?: { customType: string; content: string; display: boolean }; systemPrompt?: string } | undefined {
-  const composedSystemPrompt = authorizedToolInventory
-    ? withAuthorizedToolInventory(systemPrompt, authorizedToolInventory)
-    : systemPrompt;
-  if (!content && composedSystemPrompt === undefined) return undefined;
-  return {
-    ...(content ? {
-      message: {
-        customType: "pi-review-subtask-critical",
-        content,
-        display: false,
-      },
-    } : {}),
-    ...(composedSystemPrompt !== undefined ? { systemPrompt: composedSystemPrompt } : {}),
-  };
-}
-
-async function transmitReviewPass(input: {
-  state: ReviewGateState;
-  output: ReviewRunOutput;
-  source: "automatic" | "manual";
-  disposition: "sent_for_correction" | "sent_for_observation" | "sent_at_cap" | "sent_review_error";
-  action: ReviewTransmissionAction;
-}): Promise<string> {
-  const message = await createReviewTransmissionMessage({
-    invocationDir: input.output.invocationDir!,
-    reviewSequence: input.output.reviewSequence!,
-    gateVerdict: input.output.result!.verdict,
-    reviewerResults: input.output.reviewerResults!,
-    bundleDir: input.output.bundleDir!,
-    action: input.action,
-  });
-  recordReviewerFeedbackAndArmExchange(input.state, {
-    result: input.output.result!,
-    reviewerResults: input.output.reviewerResults,
-    reviewSequence: input.output.reviewSequence,
-    source: input.source,
-    disposition: input.disposition,
-    reviewedBaseline: input.output.reviewedBaseline!,
-    displayLabels: input.output.reviewerDisplayLabels,
-  });
-  return message;
-}
-
-const MAX_DELIVERY_DIAGNOSTIC_CHARS = 200;
-
-function boundDeliveryDiagnostic(error: unknown): string {
-  const raw = error instanceof Error ? error.message : String(error);
-  const singleLine = raw.replace(/\s+/g, " ").trim();
-  if (singleLine.length <= MAX_DELIVERY_DIAGNOSTIC_CHARS) {
-    return singleLine;
-  }
-  const marker = "… (truncated)";
-  return `${singleLine.slice(0, MAX_DELIVERY_DIAGNOSTIC_CHARS - marker.length)}${marker}`;
-}
-
-const SAFE_DIAGNOSTIC_ERRNO_PATTERN = /^[A-Z][A-Z0-9_]{0,39}$/;
-
-/**
- * A trusted diagnostic for session-state restore/quarantine failures, derived
- * only from fixed categories or Node errno codes. Raw error message text is
- * never used: JSON.parse errors may quote sidecar content (including pending
- * message text) and filesystem/validation errors may repeat unbounded paths.
- * Paths must be disclosed separately, only through boundPath.
- */
-function safeRestoreFailureDiagnostic(error: unknown): string {
-  const code = (error as NodeJS.ErrnoException | null | undefined)?.code;
-  if (typeof code === "string" && SAFE_DIAGNOSTIC_ERRNO_PATTERN.test(code)) return `errno ${code}`;
-  if (error instanceof SessionStateParseError) return "invalid JSON";
-  if (error instanceof SessionStateInvalidStateError) return "invalid persisted state";
-  if (error instanceof SessionStateUnsupportedFormatError) return "unsupported pre-cutover session format (missing snapshot omission ledger)";
-  if (error instanceof SessionStateMissingSelectionDigestError) return "unsupported pre-cutover session format (missing reviewer-selection digest)";
-  if (error instanceof SessionStateGitBaselineError) return `Git checkpoint baseline verification failed (${error.reason})`;
-  if (error instanceof SessionStateCheckpointBaselineError) return `checkpoint baseline verification failed (${error.reason})`;
-  if (error instanceof SessionStateIntegrityError) return "integrity check failed";
-  if (error instanceof SessionStateConversationMismatchError) return "conversation mismatch";
-  return "validation failed";
-}
-
-/**
- * Send a notice best-effort: notification failures must never propagate into
- * persistence decisions (e.g. disabling a store whose quarantine succeeded).
- */
-async function sendNoticeUnlessItThrows(target: unknown, message: string): Promise<void> {
-  try {
-    await sendNotice(target, message);
-  } catch {
-    // Notification is best-effort; never let it affect persistence state.
-  }
-}
-
-const MAX_NOTICE_PATH_CHARS = 160;
-const MAX_NOTICE_TOKEN_CHARS = 40;
-const MAX_NOTICE_COUNT_ENTRIES = 8;
-
-/** Bound a path disclosed in a notice so notices stay concise. */
-function boundPath(path: string): string {
-  if (path.length <= MAX_NOTICE_PATH_CHARS) return path;
-  const marker = "… (truncated)";
-  return `${path.slice(0, MAX_NOTICE_PATH_CHARS - marker.length)}${marker}`;
-}
-
-/** Bound an arbitrary token (e.g. a status/kind label from a sidecar). */
-function boundToken(token: string): string {
-  if (token.length <= MAX_NOTICE_TOKEN_CHARS) return token;
-  return `${token.slice(0, MAX_NOTICE_TOKEN_CHARS - 1)}…`;
-}
-
-/** Render aggregate counts with bounded entry count and token length. */
-function formatCountEntries(counts: Record<string, number>): string {
-  const entries = Object.entries(counts)
-    .sort(([a], [b]) => a.localeCompare(b))
-    .slice(0, MAX_NOTICE_COUNT_ENTRIES)
-    .map(([key, count]) => `${boundToken(key)} ${count}`);
-  const total = Object.keys(counts).length;
-  if (total > MAX_NOTICE_COUNT_ENTRIES) entries.push(`+${total - MAX_NOTICE_COUNT_ENTRIES} more`);
-  return entries.join(", ");
-}
-
-/**
- * Render the safe pending-delivery summary for a notice: counts only, never
- * message text or delivery identifiers.
- */
-function formatPendingDeliverySummary(summary: PendingDeliverySummary): string {
-  const parts = [`${summary.total} pending delivery record(s) preserved`];
-  const statuses = formatCountEntries(summary.byStatus);
-  if (statuses) parts.push(`status: ${statuses}`);
-  const kinds = formatCountEntries(summary.byKind);
-  if (kinds) parts.push(`kinds: ${kinds}`);
-  return parts.join("; ");
-}
-
-/**
- * Handle a same-conversation/different-cwd restore rejection: quarantine the
- * authoritative sidecar to a unique sibling path before any fresh-state save,
- * then notify with the mismatch, quarantine path, and safe pending-record
- * summary. If quarantine fails, fail closed: leave the prior sidecar in place,
- * disable the store so the unconditional save cannot overwrite it, and emit an
- * actionable preservation notice.
- */
-async function handleCwdMismatchRestore(
-  noticeTarget: unknown,
-  stateStore: SessionStateStore,
-  error: SessionStateCwdMismatchError,
-  currentCwd: string,
-): Promise<void> {
-  let quarantinePath: string;
-  try {
-    // Only the quarantine operation is guarded: once it succeeds the prior
-    // sidecar is safely preserved and persistence must stay enabled so the
-    // unconditional fresh save for the new cwd can proceed.
-    quarantinePath = await stateStore.quarantine();
-  } catch (quarantineError) {
-    stateStore.markUnavailable(`quarantine failed: ${safeRestoreFailureDiagnostic(quarantineError)}`);
-    await sendNoticeUnlessItThrows(
-      noticeTarget,
-      `review gate: persisted conversation state belongs to a different working directory (stored: ${boundPath(error.storedCwd)}, current: ${boundPath(error.currentCwd)}) and could not be quarantined (${safeRestoreFailureDiagnostic(quarantineError)}); the prior state file was left untouched at ${boundPath(stateStore.path)}; review-gate persistence is disabled for this session to avoid overwriting it; resolve the mismatch manually and restart`,
-    );
-    return;
-  }
-  await sendNoticeUnlessItThrows(
-    noticeTarget,
-    `review gate: persisted conversation state belongs to a different working directory (stored: ${boundPath(error.storedCwd)}, current: ${boundPath(error.currentCwd)}); quarantined to ${boundPath(quarantinePath)}; ${formatPendingDeliverySummary(error.pendingDeliveries)}; starting fresh state for ${boundPath(currentCwd)}`,
-  );
-}
-
-async function deliverAutomaticTransmission(
-  pi: unknown,
-  noticeTarget: unknown,
-  state: ReviewGateState,
-  output: ReviewRunOutput,
-  action: ReviewTransmissionAction,
-  message: string,
-  isSessionActive: () => boolean,
-  persist: () => boolean | Promise<boolean>,
-): Promise<void> {
-  if (!output.invocationDir) return;
-  const delivery = queueModelDelivery(state, {
-    kind: "review_transmission",
-    channel: "follow_up",
-    invocationDir: output.invocationDir,
-    action,
-    message,
-  });
-  await persist();
-  if (!isSessionActive()) return;
-  // dispatchModelDelivery mutates the in-memory status to uncertain before
-  // awaiting persistence, so only a persist that resolves while the record is
-  // uncertain proves this dispatch durably established the uncertain state.
-  // Without that proof the exception must keep propagating: queue/persist
-  // failures and pre-existing uncertain records are never masked as
-  // transport uncertainty, never noticed as a new uncertainty, and never
-  // retried or reverted to queued.
-  let durablyUncertain = false;
-  try {
-    await dispatchModelDelivery({
-      delivery,
-      persist: async () => {
-        const persisted = await persist();
-        if (persisted && delivery.status === "uncertain") durablyUncertain = true;
-      },
-      deliver: () => deliverReviewTransmission({
-        invocationDir: output.invocationDir!,
-        action,
-        message,
-        idempotencyKey: delivery.deliveryId,
-        deliver: () => isSessionActive() ? sendFollowUp(pi, message) : Promise.resolve(false),
-      }),
-    });
-  } catch (error) {
-    if (!durablyUncertain) {
-      throw error;
-    }
-    await sendNoticeWhileSessionActive(
-      noticeTarget,
-      `review gate: delivery ${delivery.deliveryId} is uncertain and was not retried automatically: ${boundDeliveryDiagnostic(error)}; inspect ${delivery.invocationDir ?? "the resumed session"}`,
-      isSessionActive,
-    );
-  }
-}
-
-async function recoverPendingModelDeliveries(input: {
-  pi: unknown;
-  state: ReviewGateState;
-  persist: () => void | Promise<void>;
-  isSessionActive: () => boolean;
-  notify: (message: string) => void | Promise<void>;
-}): Promise<void> {
-  for (const delivery of input.state.pendingModelDeliveries) {
-    if (delivery.status === "delivered" || delivery.status === "cancelled") continue;
-    if (delivery.kind === "queued_user_input") continue;
-    if (delivery.invocationDir && await hasReviewDeliveryReceipt(delivery.invocationDir, delivery.deliveryId)) {
-      delivery.status = "delivered";
-      delivery.deliveredAt ??= new Date().toISOString();
-      delivery.diagnostic = undefined;
-      await input.persist();
-      continue;
-    }
-    if (delivery.status === "dispatching" || delivery.status === "uncertain") {
-      delivery.status = "uncertain";
-      delivery.diagnostic ??= "The prior application ended after dispatch began but before a durable acknowledgement was found.";
-      await input.persist();
-      await input.notify(`review gate: delivery ${delivery.deliveryId} is uncertain and was not duplicated automatically; inspect ${delivery.invocationDir ?? "the resumed session"}`);
-      continue;
-    }
-    if (!input.isSessionActive()) return;
-    try {
-      await dispatchModelDelivery({
-        delivery,
-        persist: input.persist,
-        deliver: () => delivery.invocationDir && delivery.action
-          ? deliverReviewTransmission({
-              invocationDir: delivery.invocationDir,
-              action: delivery.action,
-              message: delivery.message,
-              idempotencyKey: delivery.deliveryId,
-              deliver: () => delivery.channel === "steer"
-                ? sendSteeringPrompt(input.pi, delivery.message)
-                : sendFollowUp(input.pi, delivery.message),
-            })
-          : delivery.channel === "steer"
-            ? sendSteeringPrompt(input.pi, delivery.message)
-            : sendFollowUp(input.pi, delivery.message),
-      });
-    } catch (error) {
-      await input.notify(`review gate: pending delivery ${delivery.deliveryId} could not be recovered: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-  if (input.state.queuedUserInputsDuringReview.length > 0) {
-    // Occurrence-aware split: only ledger occurrences backed by an active
-    // (non-terminal) durable delivery record can be released when the review
-    // finishes; old-only occurrences without one must never be promised a
-    // release — they stay preserved until explicitly cancelled.
-    const total = input.state.queuedUserInputsDuringReview.length;
-    const { releasable, unreleasable } = splitReleasableQueuedInputs(input.state);
-    if (unreleasable === 0) {
-      await input.notify(`review gate: ${total} user input(s) remain queued from an interrupted review and were not reordered automatically; use /review-now to finish the interrupted review and release them, or /review-clear to cancel them`);
-    } else if (releasable === 0) {
-      await input.notify(`review gate: ${total} user input(s) remain queued from an interrupted review and were not reordered automatically; none can be released by /review-now because no active durable delivery record exists for them; they stay preserved until cancelled with /review-clear`);
-    } else {
-      await input.notify(`review gate: ${total} user input(s) remain queued from an interrupted review and were not reordered automatically; ${releasable} of them can be released by finishing the interrupted review with /review-now, but ${unreleasable} cannot be released automatically because no active durable delivery record exists for them; all of them stay preserved until cancelled with /review-clear`);
-    }
-  }
-}
-
-/**
- * Split queued-input ledger occurrences into those backed by an active
- * (non-terminal) durable delivery record — releasable when the review
- * finishes — and old-only occurrences without one, which can never be
- * dispatched. Occurrence-based so repeated texts count correctly.
- */
-function splitReleasableQueuedInputs(state: ReviewGateState): { releasable: number; unreleasable: number } {
-  const activeByMessage = new Map<string, number>();
-  for (const delivery of state.pendingModelDeliveries) {
-    if (delivery.kind === "queued_user_input" && delivery.status !== "delivered" && delivery.status !== "cancelled") {
-      activeByMessage.set(delivery.message, (activeByMessage.get(delivery.message) ?? 0) + 1);
-    }
-  }
-  let releasable = 0;
-  for (const message of state.queuedUserInputsDuringReview) {
-    const active = activeByMessage.get(message) ?? 0;
-    if (active > 0) {
-      activeByMessage.set(message, active - 1);
-      releasable += 1;
-    }
-  }
-  return { releasable, unreleasable: state.queuedUserInputsDuringReview.length - releasable };
-}
-
-export default activate;
-
-module.exports = activate;
-Object.assign(module.exports as Record<string, unknown>, { activate });
-
-function commandContextIsIdle(ctx: unknown): boolean {
-  if (typeof ctx === "object" && ctx !== null && "isIdle" in ctx && typeof ctx.isIdle === "function") {
-    return Boolean(ctx.isIdle());
-  }
-  return true;
-}
-
-function isToolError(value: unknown): boolean {
-  return typeof value === "object" && value !== null && "isError" in value && Boolean((value as { isError?: unknown }).isError);
-}
-
-async function releaseQueuedUserInputs(
-  pi: unknown,
-  state: ReviewGateState,
-  isSessionActive: () => boolean,
-  persist: () => void | Promise<void>,
-): Promise<void> {
-  state.reviewInProgress = false;
-  // Old-only ledger occurrences without an active durable delivery record can
-  // never be dispatched; identify them explicitly instead of silently
-  // skipping — their contents stay preserved until the user cancels them.
-  if (isSessionActive()) {
-    const { unreleasable } = splitReleasableQueuedInputs(state);
-    if (unreleasable > 0) {
-      await sendNotice(
-        pi,
-        `review gate: ${unreleasable} queued user input(s) were not released because no active durable delivery record exists for them; they stay preserved and can be cancelled with /review-clear`,
-      );
-    }
-  }
-  for (const delivery of state.pendingModelDeliveries.filter((candidate) =>
-    candidate.kind === "queued_user_input" && candidate.status !== "delivered" && candidate.status !== "cancelled")) {
-    if (!isSessionActive()) return;
-    rememberUserRequest(state, delivery.message);
-    try {
-      const delivered = await dispatchModelDelivery({
-        delivery,
-        persist,
-        deliver: () => isSessionActive() ? sendFollowUp(pi, delivery.message) : Promise.resolve(false),
-      });
-      if (!delivered) return;
-      const index = state.queuedUserInputsDuringReview.indexOf(delivery.message);
-      if (index >= 0) state.queuedUserInputsDuringReview.splice(index, 1);
-      await persist();
-    } catch {
-      return;
-    }
-  }
-}
-
-type ReviewAbortReason = "parent" | "escape" | "manual" | "session_shutdown";
-
-interface ReviewAbortHandle {
-  signal: AbortSignal;
-  cleanup: () => void;
-  getReason: () => ReviewAbortReason | undefined;
-  notifyCancellation: () => Promise<void>;
-  shutdown: () => void;
-}
-
-function createReviewAbortController(input: {
-  signal: AbortSignal | undefined;
-  noticeTarget: unknown;
-  state: ReviewGateState;
-  isSessionActive: () => boolean;
-  cancellation: ReturnType<typeof createReviewCancellationCoordinator>;
-  settled: Promise<void>;
-  describe: () => string;
-}): ReviewAbortHandle {
-  const controller = new AbortController();
-  let abortReason: ReviewAbortReason | undefined;
-  let cancellationNotice: Promise<void> | undefined;
-  let cancellationAcknowledgement: Promise<void> | undefined;
-  let cleanedUp = false;
-
-  const abortReview = (reason: ReviewAbortReason) => {
-    if (!controller.signal.aborted) {
-      abortReason = reason;
-      controller.abort(reason);
-    }
-  };
-  const acknowledgeCancellation = () => {
-    if (!input.isSessionActive()) {
-      return Promise.resolve();
-    }
-    if (!cancellationAcknowledgement) {
-      cancellationAcknowledgement = sendNotice(
-        input.noticeTarget,
-        `review gate: cancelling ${input.describe()}; waiting for reviewer processes to stop`,
-      ).catch(() => undefined);
-    }
-    return cancellationAcknowledgement;
-  };
-  const notifyCancellation = () => {
-    if (abortReason !== "escape" && abortReason !== "manual") {
-      return Promise.resolve();
-    }
-    if (!input.isSessionActive()) {
-      return Promise.resolve();
-    }
-    if (!cancellationNotice) {
-      cancellationNotice = sendNotice(input.noticeTarget, "review gate: review cancelled; reviewer processes stopped").catch(() => undefined);
-    }
-    return cancellationNotice;
-  };
-  const abortFromParent = () => abortReview("parent");
-
-  if (input.signal?.aborted) {
-    abortFromParent();
-  }
-  input.signal?.addEventListener("abort", abortFromParent, { once: true });
-
-  const unsubscribeTerminalInput = onTerminalInput(input.noticeTarget, (terminalInput) => {
-    if (!input.state.reviewInProgress || !isEscapeTerminalInput(terminalInput)) {
-      return undefined;
-    }
-    abortReview("escape");
-    // Immediate acknowledgement only; the completion notice claims reviewer
-    // quiescence only after runReview has returned and cleanup ran.
-    void acknowledgeCancellation();
-    return { action: "handled", consume: true };
-  });
-  if (!unsubscribeTerminalInput) {
-    input.cancellation.noteTerminalInterceptionUnavailable((message) => sendNotice(input.noticeTarget, message));
-  }
-
-  const cancellationHandle: ActiveReviewCancellation = {
-    requestCancel: (reason: ReviewCancelReason = "manual") => abortReview(reason),
-    acknowledgeCancellation,
-    settled: input.settled,
-    describe: input.describe,
-    notifyCancellation,
-  };
-  const unregisterCancellation = input.cancellation.register(cancellationHandle);
-
-  const cleanup = () => {
-    if (cleanedUp) {
-      return;
-    }
-    cleanedUp = true;
-    unregisterCancellation();
-    try {
-      input.signal?.removeEventListener("abort", abortFromParent);
-    } catch {
-      // Listener removal must never mask the review outcome.
-    }
-    try {
-      unsubscribeTerminalInput?.();
-    } catch {
-      // The UI context may already be stale; the review is settled either way.
-    }
-  };
-
-  return {
-    signal: controller.signal,
-    cleanup,
-    getReason: () => abortReason,
-    notifyCancellation,
-    shutdown: () => {
-      abortReview("session_shutdown");
-      cleanup();
-    },
-  };
-}
-
-async function sendNoticeWhileSessionActive(
-  target: unknown,
-  message: string,
-  isSessionActive: () => boolean,
-): Promise<void> {
-  if (!isSessionActive()) {
-    return;
-  }
-  await sendNotice(target, message);
 }
 
 function discardSessionState(state: ReviewGateState): void {

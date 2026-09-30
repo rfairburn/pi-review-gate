@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { promisify } from "node:util";
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import type { AddressInfo } from "node:net";
@@ -324,6 +325,83 @@ function rawHeadOrigin(emit: (socket: net.Socket) => void | Promise<void>): Prom
   return listen(server).then((port) => ({ server, port, connections: () => connections }));
 }
 
+/**
+ * Deterministic split-delivery echo origin for listener-lifecycle regressions:
+ * writes the 101 head ALONE, then — only when the test releases it — exactly
+ * one initial-state frame in its own write, then echoes like the ordinary
+ * origin. Every piece is written only after the previous one was fully
+ * received and processed by the client (causal gates driven by the test, not
+ * sleeps or lucky segmentation), so the client's data events have known legal
+ * boundaries: a header-only event, then one frame, then the echo.
+ */
+interface GatedEchoOrigin {
+  server: net.Server;
+  port: number;
+  /** Release the test's initial-state frame after handshake completion. */
+  releaseInitialFrame(): void;
+}
+
+function gatedEchoOrigin(initialFrameText: string): Promise<GatedEchoOrigin> {
+  const origin: GatedEchoOrigin = {
+    server: undefined as unknown as net.Server,
+    port: 0,
+    releaseInitialFrame: () => undefined,
+  };
+  let socket: net.Socket | undefined;
+  origin.releaseInitialFrame = () => {
+    if (socket && !socket.destroyed) socket.write(encodeFrame(0x1, Buffer.from(initialFrameText, "utf8")));
+  };
+  origin.server = net.createServer((client) => {
+    socket = client;
+    let buffer = Buffer.alloc(0);
+    let established = false;
+    client.on("error", () => undefined);
+    client.on("data", (chunk: Buffer) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (!established) {
+        const headEnd = buffer.indexOf("\r\n\r\n");
+        if (headEnd === -1) return;
+        const head = buffer.subarray(0, headEnd).toString("utf8");
+        buffer = buffer.subarray(headEnd + 4);
+        const keyLine = head.split("\r\n").find((line) => line.toLowerCase().startsWith("sec-websocket-key:"));
+        const key = keyLine ? keyLine.slice(keyLine.indexOf(":") + 1).trim() : undefined;
+        if (!key) {
+          client.destroy();
+          return;
+        }
+        const accept = createHash("sha1").update(`${key}${WS_GUID}`, "utf8").digest("base64");
+        // Head ONLY: the initial frame is a separate, test-released write.
+        client.write(
+          `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n`
+          + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+        );
+        established = true;
+      }
+      for (;;) {
+        const frame = readFrame(buffer);
+        if (!frame) break;
+        buffer = buffer.subarray(frame.consumed);
+        if (frame.opcode === 0x8) {
+          client.write(encodeFrame(0x8, frame.payload));
+          client.destroy();
+          return;
+        }
+        if (frame.opcode === 0x9) {
+          client.write(encodeFrame(0xA, frame.payload));
+          continue;
+        }
+        if (frame.opcode === 0x1 || frame.opcode === 0x2) {
+          client.write(encodeFrame(frame.opcode, frame.payload));
+        }
+      }
+    });
+  });
+  return listen(origin.server).then((port) => {
+    origin.port = port;
+    return origin;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Minimal raw ws client through the broker (absolute-form upgrade requests,
 // exactly what a browser sends to an HTTP proxy for ws://).
@@ -335,8 +413,9 @@ class TestWsClient {
   private readonly pendingFrames: WsFrame[] = [];
   private readonly waiters: Array<(frame: WsFrame) => void> = [];
 
-  constructor(port: number) {
-    this.socket = net.connect({ host: "127.0.0.1", port });
+  /** Optional preconnected (or scripted) socket; when omitted, dials the broker port. */
+  constructor(port: number, socket?: net.Socket) {
+    this.socket = socket ?? net.connect({ host: "127.0.0.1", port });
     this.socket.on("error", () => undefined);
     this.socket.on("data", (chunk: Buffer) => {
       // Frame parsing starts only once the HTTP handshake head is consumed.
@@ -372,6 +451,12 @@ class TestWsClient {
         this.buffer = Buffer.concat([this.buffer, chunk]);
         const end = this.buffer.indexOf("\r\n\r\n");
         if (end === -1) return;
+        // Completed handshake: detach THIS temporary data listener so the
+        // permanent frame parser (constructor) is the only "data" listener.
+        // Leaving it attached would re-append every later chunk to the parser
+        // buffer after the permanent listener already parsed it, replaying
+        // stale bytes on the next frame event.
+        this.socket.off("data", onChunk);
         this.socket.off("close", onClose);
         const head = this.buffer.subarray(0, end).toString("latin1");
         const rest = this.buffer.subarray(end + 4);
@@ -938,6 +1023,108 @@ test("a 101 coalesced with an initial server frame in one write is relayed exact
     client.destroy();
     await harness.stop();
     await close(origin.server);
+  }
+});
+
+test("a header-only handshake event followed by a separate initial frame is parsed exactly once", async () => {
+  // Deterministic split delivery (causal gates, no sleeps or retries): the
+  // origin writes the 101 head ALONE; only after the client has fully consumed
+  // that event does the test release the single initial-state frame in its own
+  // write; only after the client received it does the client send the echo
+  // probe. The client's data events therefore have known legal boundaries —
+  // header-only, then one frame, then the echo — exactly the sequence under
+  // which a stale temporary handshake listener re-appends already-parsed
+  // frame bytes and replays them on the next event.
+  const origin = await gatedEchoOrigin("initial-state");
+  const { auth, credentials } = testAuth();
+  const harness = await startBroker(testResolver({ "ws.test": [publicAnswer] }), {
+    auth,
+    websockets: { enabled: true },
+  });
+  const client = new TestWsClient(harness.port);
+  try {
+    const handshake = await client.handshake("ws.test", origin.port, credentials);
+    assert.equal(handshake.status, 101, "the split 101 must still complete the handshake");
+    // The completed handshake detaches its temporary data listener: only the
+    // permanent frame parser remains on the socket.
+    assert.equal(
+      client.socket.listenerCount("data"),
+      1,
+      "only the permanent frame parser may remain after the handshake",
+    );
+    origin.releaseInitialFrame();
+    const initial = await client.receive();
+    assert.equal(initial.payload.toString("utf8"), "initial-state");
+    // No stale re-parse of the initial frame: the next receive is exactly the
+    // echo, not a duplicate of the bytes already parsed above.
+    client.send("after-coalesce");
+    const echoed = await client.receive();
+    assert.equal(
+      echoed.payload.toString("utf8"),
+      "after-coalesce",
+      "no initial-frame bytes may linger in the parser buffer",
+    );
+  } finally {
+    client.destroy();
+    await harness.stop();
+    await close(origin.server);
+  }
+});
+
+/**
+ * Minimal controllable stand-in for a connected TCP socket, used only to force
+ * exact client-side data-event boundaries by construction (no reliance on
+ * segmentation or coalescing). Implements just the surface TestWsClient uses;
+ * the test emits precise "data" events and inspects what was written.
+ */
+class ScriptedSocket extends EventEmitter {
+  /** Everything the client wrote (upgrade request, masked frames), in order. */
+  readonly written: Buffer[] = [];
+  destroyed = false;
+  readyState = "open";
+  write(chunk: Buffer): boolean {
+    this.written.push(Buffer.from(chunk));
+    return true;
+  }
+  destroy(): void {
+    if (!this.destroyed) this.destroyed = true;
+  }
+}
+
+test("a single data event carrying the 101 head plus initial frame is ingested exactly once", async () => {
+  // Controlled delivery by construction (no TCP, no broker relay): the
+  // scripted socket emits EXACTLY one data event containing the complete 101
+  // head and the initial-state frame together, then a separate echo event.
+  // This forces the handshake's remainder-ingestion path deterministically —
+  // segmentation or lucky coalescing cannot change what the client sees.
+  const scripted = new ScriptedSocket();
+  const client = new TestWsClient(0, scripted as unknown as net.Socket);
+  try {
+    const key = "dGhlIHNhbXBsZSBub25jZQ=="; // fixed Sec-WebSocket-Key TestWsClient sends
+    const accept = createHash("sha1").update(`${key}${WS_GUID}`, "utf8").digest("base64");
+    const head101 = `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`;
+    const coalesced = Buffer.concat([Buffer.from(head101, "latin1"), encodeFrame(0x1, Buffer.from("initial-state", "utf8"))]);
+    const handshakePromise = client.handshake("ws.test", 80, undefined);
+    assert.equal(scripted.written.length, 1, "the upgrade request is written before any response event");
+    scripted.emit("data", coalesced); // exactly one client data event: head + frame
+    const handshake = await handshakePromise;
+    assert.equal(handshake.status, 101, "the coalesced 101 must still complete the handshake");
+    // The completed handshake detaches its temporary data listener: only the
+    // permanent frame parser remains on the socket.
+    assert.equal(
+      client.socket.listenerCount("data"),
+      1,
+      "only the permanent frame parser may remain after the handshake",
+    );
+    const initial = await client.receive();
+    assert.equal(initial.payload.toString("utf8"), "initial-state", "the coalesced remainder is ingested exactly once");
+    // A separate echo event afterwards: no duplicate of the coalesced frame.
+    client.send("after-coalesce");
+    scripted.emit("data", encodeFrame(0x1, Buffer.from("after-coalesce", "utf8")));
+    const echoed = await client.receive();
+    assert.equal(echoed.payload.toString("utf8"), "after-coalesce", "no coalesced-frame bytes may linger in the parser buffer");
+  } finally {
+    client.destroy();
   }
 });
 

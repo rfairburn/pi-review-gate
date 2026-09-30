@@ -15,6 +15,17 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.98]
+
+### Changed
+
+- Decompose the checkpoint engine into cohesive record, Git execution, audit,
+  capture, pin, durability and operation owners behind its unchanged public
+  facade (#233, audit #46). Record bytes and digests, error identities, frozen
+  comparisons, selective advancement, pin ownership and release proofs,
+  hardened Git execution, durability, platform handling and fail-closed
+  recovery behavior remain unchanged.
+
 ## [0.1.0-dev.97]
 
 ### Changed

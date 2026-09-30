@@ -76,12 +76,13 @@ function recordingPi() {
   };
 }
 
-test("the shared launch notice formats both origins with origin metadata and no completion implication", () => {
+test("the shared launch notice formats both origins with origin metadata and only a concise acknowledgement cue", () => {
   const scheduled = formatSubtaskLaunchNotice(scheduledNotice);
-  assert.match(scheduled.content, /^Scheduled task task-nightly \(Nightly docs check\) was dispatched as execution exec-1 \(execute\)\./);
+  assert.match(scheduled.content, /^Scheduled task task-nightly \(Nightly docs check\) was admitted as execution exec-1 \(execute\)\./);
   assert.match(scheduled.content, /Due occurrence: 2024-01-15 02:30 .* for cron "30 2 \* \* \*"\./);
   assert.match(scheduled.content, /- task-1 · Scheduled execute task task-nightly: Nightly docs check/);
-  assert.match(scheduled.content, /ordinary subtask notifications will report completion, failure, or conflicts/);
+  assert.match(scheduled.content, /^Acknowledge briefly\.$/m, "the only prose is the short acknowledgement cue");
+  assert.ok(!scheduled.content.includes("dispatched"), "the notice says admitted, never a dispatched/running state");
   assert.equal(scheduled.details.origin, "scheduled");
   assert.equal(scheduled.details.executionId, "exec-1");
   assert.equal((scheduled.details.scheduled as { entryId: string }).entryId, "task-nightly");
@@ -91,11 +92,33 @@ test("the shared launch notice formats both origins with origin metadata and no 
   assert.ok(!human.content.includes("cron"), "a human notice carries no schedule identity");
   assert.equal(human.details.origin, "human-command");
   assert.equal(human.details.kind, "research");
-  // Both origins share the no-action contract from the same mechanism.
-  assert.match(scheduled.content, /Do not treat this launch as progress or completion/);
-  assert.match(human.content, /Do not treat this launch as progress or completion/);
-  assert.match(scheduled.content, /No tool action is necessary for this notice/);
-  assert.match(human.content, /No tool action is necessary for this notice/);
+  // Both origins share the same concise close from the same mechanism.
+  assert.match(scheduled.content, /Acknowledge briefly\./);
+  assert.match(human.content, /Acknowledge briefly\./);
+});
+
+test("the shared launch notice carries no narrative boilerplate", () => {
+  for (const formatted of [formatSubtaskLaunchNotice(scheduledNotice), formatSubtaskLaunchNotice(humanNotice)]) {
+    assert.ok(!formatted.content.includes("This notice only reports the launch"));
+    assert.ok(!formatted.content.includes("No outcome is known"));
+    assert.ok(!formatted.content.includes("ordinary subtask notifications"));
+    assert.ok(!formatted.content.includes("Do not treat this launch"));
+    assert.ok(!formatted.content.includes("duplicate"));
+    assert.ok(!formatted.content.includes("No tool action is necessary"));
+    assert.ok(!formatted.content.includes("quiet/noisy"));
+    assert.ok(!formatted.content.includes("triggered a turn"));
+    assert.ok(!formatted.content.includes("empty response"));
+  }
+});
+
+test("a human add-to-existing notice keeps the factual added-task ids line", () => {
+  const notice = formatSubtaskLaunchNotice({
+    ...humanNotice,
+    tasks: [{ taskId: "task-9", title: "Follow-up scan" }],
+    addedTaskIds: ["task-9"],
+  });
+  assert.match(notice.content, /Added in this submission: task-9/);
+  assert.match(notice.content, /^Acknowledge briefly\.$/m);
 });
 
 test("the shared launch notice redacts sensitive token material from model-controlled fields", () => {

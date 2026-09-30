@@ -236,7 +236,7 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
       actingUsage: input.actingUsage,
     })
     : undefined;
-  const exchangeHasReviewableChanges = exchangeWorkspaceChanges.length > 0 || exchangeSplit.sideEffectChanges.length > 0 || hasExactChanges;
+  const exchangeHasReviewableChanges = exchangeWorkspaceChanges.length > 0 || exchangeSplit.sideEffectChanges.length > 0 || hasExactChanges || input.evidence?.requiresReview === true;
   if ((reviewResponseMode === "observation" || reviewResponseMode === "deferred") && !exchangeHasReviewableChanges) {
     if (input.window?.bundleDir) {
       await syncReviewWindowArtifacts({
@@ -256,7 +256,7 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
     };
   }
   const isCorrectionValidation = hasUnresolvedReview(input.window) || correctionAttemptCount > 0;
-  if (changes.length === 0 && !isCorrectionValidation && !hasExactChanges) {
+  if (changes.length === 0 && !isCorrectionValidation && !hasExactChanges && input.evidence?.requiresReview !== true) {
     return { changed: false, changes, noReviewReason: "no_initial_changes" };
   }
 

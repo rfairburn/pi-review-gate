@@ -170,7 +170,7 @@ test("scheduled task entries reject invalid definitions strictly", () => {
     [{ "task-a": { ...validEntry, cron: "" } }, /scheduledTasks\.task-a\.cron must be a non-empty/],
     [{ "task-a": { ...validEntry, cron: "99 * * * *" } }, /minute value "99" is out of range/],
     [{ "task-a": { ...validEntry, enabled: "yes" } }, /scheduledTasks\.task-a\.enabled must be a boolean/],
-    [{ "task-a": { ...validEntry, kind: "deploy" } }, /scheduledTasks\.task-a\.kind must be execute or research/],
+    [{ "task-a": { ...validEntry, kind: "deploy" } }, /scheduledTasks\.task-a\.kind must be execute, research, or inplace/],
     [{ "task-a": { ...validEntry, instructions: "" } }, /scheduledTasks\.task-a\.instructions must be a non-empty string/],
     [{ "task-a": { ...validEntry, workspace: "" } }, /scheduledTasks\.task-a\.workspace must be a non-empty string/],
     [{ "task-a": { ...validEntry, workerResourceId: "no such id" } }, /scheduled task worker resource id may contain only/],
@@ -609,6 +609,39 @@ test("/review-settings creates a scheduled task entry and saves it with staged s
     review: { mode: "off" },
   });
   assert.deepEqual(saved.customFutureKey, { keep: true });
+});
+
+test("/review-settings selects and saves the in-place scheduled subtask kind", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-scheduled-inplace-menu-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    review: { primaryReviewers: [], subtaskReviewers: [] },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Scheduled tasks", "None"),
+    "Add scheduled task",
+    scheduledEditorRow("Schedule (cron)", "(not set)"),
+    scheduledEditorRow("Kind", "execute"),
+    "In-place — write in a selected directory (no capture/landing)",
+    scheduledEditorRow("Instructions", "(not set)"),
+    scheduledEditorRow("Workspace", "(not set)"),
+    "Back",
+    "Back",
+    "Save changes",
+  ], ["Direct task", "30 2 * * *", "Work directly in the selected directory", dir]));
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  const ids = Object.keys(saved.scheduledTasks);
+  assert.equal(ids.length, 1);
+  const entry = saved.scheduledTasks[ids[0]!];
+  assert.equal(entry.kind, "inplace");
+  assert.equal(entry.workspace, dir);
+  assert.equal(entry.destination, undefined, "the ordinary subtask destination stays the default");
+  assert.equal(normalizeConfig(saved).scheduledTasks?.[ids[0]!]?.kind, "inplace");
 });
 
 test("/review-settings validates a relative completed workspace against the session cwd", async () => {

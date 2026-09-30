@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
@@ -209,7 +209,8 @@ test("full-tests job runs for pull requests, default-branch pushes, and manual d
     "the condition must run the suite on every enforced trigger path with no hidden push-only skip",
   );
   assert.match(full, /name: Full suite \(Node 24\)/);
-  assert.match(full, /timeout-minutes: \d+/);
+  assert.match(full, /^    timeout-minutes: 15\s*$/m,
+    "the Linux full-suite job must keep an active, job-scoped 15-minute runtime cap (a commented-out value or a 15 on a prerequisite step must not pass)");
   assert.match(full, /node-version: 24\.x/);
 });
 
@@ -227,16 +228,81 @@ test("full-suite provisions Chromium with Linux OS dependencies, narrowly", () =
     "the skip flag must stay scoped to the jobs/steps that want it, never global");
 });
 
+/**
+ * The exact full-suite command line CI runs. Its coverage is the local
+ * `npm run test:run` command — same dist-test/tests/*.test.js glob, same
+ * four-file concurrency — plus two additive, CI-only diagnostics: a 5-minute
+ * built-in per-test bound and the stderr-bound per-file progress reporter.
+ */
+const FULL_SUITE_COMMAND = "node --test --test-concurrency=4 --test-timeout=300000 --test-reporter=spec --test-reporter=./scripts/ci/test-file-progress.cjs --test-reporter-destination=stdout --test-reporter-destination=stderr dist-test/tests/*.test.js";
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** The body of the named `Full test suite` step: from its entry to the next step entry of any kind. */
+function suiteStepOf(full: string): string {
+  const stepIndex = full.indexOf("      - name: Full test suite");
+  assert.ok(stepIndex !== -1, "the named Full test suite step must exist");
+  const afterStepEntry = full.slice(stepIndex + 1);
+  const nextStep = afterStepEntry.search(/^      - /m);
+  return nextStep === -1 ? afterStepEntry : afterStepEntry.slice(0, nextStep);
+}
+
+/** The suite step must run exactly the documented command: unchanged coverage plus only the two CI-only diagnostics. */
+function assertExactSuiteCommand(scope: string): void {
+  assert.match(scope, new RegExp(`^        run: ${escapeRegExp(FULL_SUITE_COMMAND)}\\s*$`, "m"),
+    "the Full test suite step must keep the exact suite command line: the same dist-test/tests/*.test.js glob and four-file concurrency as npm run test:run, plus only --test-timeout=300000 and the spec+progress reporter/destination pair; any other change alters coverage or diagnostics");
+}
+
 test("full-suite compiles the test bundle and runs the compiled suite without mutating live dist", () => {
   const source = readWorkflow();
   const full = blockOf(source, "full-tests", 2);
   assert.match(full, /run: npm run build:test/);
-  assert.match(full, /run: npm run test:run/);
+  assertExactSuiteCommand(suiteStepOf(full));
+  // The CI-only diagnostics must be the built-in bound and the real in-repo
+  // reporter, and the selection must stay exactly the local full suite's.
+  assert.ok(existsSync(join(projectRoot, "scripts", "ci", "test-file-progress.cjs")),
+    "the stderr-bound progress reporter must exist in the repository");
+  const pkg = JSON.parse(readFileSync(join(projectRoot, "package.json"), "utf8")) as { scripts?: Record<string, string> };
+  const localRun = pkg.scripts?.["test:run"] ?? "";
+  assert.match(localRun, /^node --test --test-concurrency=4 dist-test\/tests\/\*\.test\.js$/,
+    "the local full-suite command these assertions compare against must stay the plain glob run");
+  for (const fragment of ["--test-concurrency=4", "dist-test/tests/*.test.js"]) {
+    assert.ok(FULL_SUITE_COMMAND.includes(fragment), `the CI command must keep the local suite's ${fragment}`);
+  }
   for (const line of full.split("\n").filter((candidate) => candidate.includes("run:"))) {
     assert.doesNotMatch(line, /npm (?:run )?test(?![\w:-])/, `unsafe full-suite command: ${line.trim()}`);
     assert.doesNotMatch(line, /npm run build(?![\w:-])/, "CI must not rebuild live dist; use build:test");
     assert.doesNotMatch(line, /npm run test:integration|npm run test:serial/, `unexpected full-suite command: ${line.trim()}`);
   }
+});
+
+test("full-suite runtime is bounded by independent job and step timeouts", () => {
+  const source = readWorkflow();
+  const full = blockOf(source, "full-tests", 2);
+
+  // Job-level cap: the exact active job property line at the 4-space YAML
+  // mapping indent. Commented-out caps and a 15 scoped to a prerequisite
+  // step's own timeout property must not satisfy the job guard.
+  assert.match(full, /^    timeout-minutes: 15\s*$/m,
+    "the Linux full-suite job must carry an active, job-scoped 15-minute cap");
+  assert.doesNotMatch(full, /^ *timeout-minutes: 45\s*$/m,
+    "the over-generous 45-minute cap must not return at job or step level");
+
+  // Step-level cap scoped to the named suite step itself: a hang stops at 10
+  // minutes without waiting on the job-level budget, while the other steps of
+  // this job keep their own provisioning budget. The step body extends to the
+  // next step entry of any kind (named or uses), not just another named step.
+  const suiteStep = suiteStepOf(full);
+  assert.match(suiteStep, /^        timeout-minutes: 10\s*$/m,
+    "the Full test suite step must carry its own active 10-minute cap, scoped to that step only");
+  // The timeouts bound runtime, not coverage: the bounded step must keep the
+  // exact documented command line (same glob/concurrency as the local suite,
+  // plus only the two CI-only diagnostics).
+  assertExactSuiteCommand(suiteStep);
+  assert.doesNotMatch(suiteStep, /continue-on-error/,
+    "the bounded suite step must fail loudly instead of tolerating failure");
 });
 
 test("full-suite always provides the Pi agent-core runtime for the native outer-error regression", () => {

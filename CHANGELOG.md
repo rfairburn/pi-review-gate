@@ -15,6 +15,44 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.91]
+
+### Added
+
+- In-place subtask kind (#220): a third, explicitly selected worker kind alongside
+  `execute` and `research` that runs a write-capable executor directly in a
+  launch-selected workspace — any existing directory, including an empty one or one
+  outside any Git repository — with no wave capture, candidate commit, or landing:
+  writes and external side effects happen where performed and are never gated, rolled
+  back, or landed. Selectable from `SubtasksStart`/`SubtasksAdd`, `/subtask-add`, and
+  scheduled entries (with their worker pin and review override); in-place workers cannot
+  launch subtasks, draw from the write-capable executor pool (the `execute` priority
+  route), review with the ordinary subtask review configuration, and cannot be
+  force-merged or interrupt-with-merge (their own reviewer reports on the recorded
+  workspace delta since launch, disclosing concurrent-writer uncertainty instead of
+  crediting unattributable changes to the worker or pretending writes were undone).
+  Tool-observed outside-root writes reach review even with no in-root delta, with
+  unverified prior states and bounded after-content rather than fabricated diffs.
+  The selected root and original launch baseline survive continuation and ordinary
+  executor failover; prior direct effects are disclosed to the replacement worker.
+  Settled in-place tasks end `reported` with the review outcome and workspace delta;
+  review-disabled runs settle completed-unreviewed in place. Concise completion notices
+  name workspace changes separately from additional observed paths outside the
+  workspace; shared human and scheduled launch notices report admission facts with a
+  brief acknowledgement cue. Discard-output writes to `/dev/null` are excluded from
+  evidence candidates, while destructive operations on that path remain evidenced.
+  Existing execute/research workspace isolation, configured routes, and defaults are
+  unchanged.
+
+### Changed
+
+- Bound Linux full-suite CI with a five-minute per-test timeout, ten-minute
+  test-step limit, and fifteen-minute job limit. Add immediate file start and
+  completion diagnostics alongside the usual test output, identifying files
+  without observed completion if a run stalls. Test selection, concurrency,
+  prerequisites, release gates, and local commands are unchanged; the original
+  hang's cause remains unconfirmed.
+
 ## [0.1.0-dev.90]
 
 ### Added

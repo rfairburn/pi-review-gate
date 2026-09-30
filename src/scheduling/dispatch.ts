@@ -28,6 +28,7 @@
 import type { ScheduledTaskEntryConfig } from "../config";
 import type { BackgroundInspection, ScheduledStartOptions } from "../execution/background-controller";
 import type { BackgroundTaskDefinition } from "../execution/background-controller";
+import type { BackgroundTaskKind } from "../execution/task-state";
 import type { SubtaskLaunchNotice } from "../execution/launch-notice";
 import { launchNoticeGate } from "../execution/launch-notice";
 import {
@@ -61,7 +62,7 @@ export interface ScheduledEntryDispatchHost {
   executionTools: {
     startScheduled(
       definition: BackgroundTaskDefinition,
-      kind: "execute" | "research",
+      kind: BackgroundTaskKind,
       workspace: string | undefined,
       options: ScheduledStartOptions & { scheduledTaskId: string },
     ): Promise<BackgroundInspection>;
@@ -94,7 +95,7 @@ export interface ScheduledEntryDispatchHost {
 interface BackgroundInspectionHost {
   scheduledRuns(scheduledTaskId: string): Array<{
     executionId: string;
-    kind: "execute" | "research";
+    kind: BackgroundTaskKind;
     tasks: Array<{ taskId: string; title: string; state: string }>;
   }>;
 }

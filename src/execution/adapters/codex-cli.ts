@@ -7,6 +7,7 @@ import type {
   ExecutorAdapter,
   ExecutorInteractionAcknowledgement,
   ExecutorRequest,
+  ExecutorToolObservation,
   ExecutorTurn,
 } from "../types";
 import { createExecutorToolCatalog, rejectPreCutoverRequestFields } from "../tool-catalog";
@@ -34,6 +35,10 @@ const CODEX_RESEARCH_CONFIG_KEYS = new Set([
 /** Codex executor backed by the official long-lived app-server protocol. */
 export class CodexExecutorAdapter implements ExecutorAdapter {
   readonly kind = "codex-cli";
+  readonly toolEventObservability = {
+    mode: "structured",
+    description: "Codex app-server item/started and item/completed events expose command_execution, file_change, and mcp_tool_call data; delivery may race the child mutation, so prior state is not verified.",
+  } as const;
   readonly model?: string;
 
   constructor(private readonly config: CodexExecutorConfig) {
@@ -74,6 +79,7 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
     const agentTexts: string[] = [];
     const rpc = new AppServerRpc(proc, (method, params) => {
       request.onUpdate?.(summarizeNotification(method, params));
+      for (const observation of codexToolObservations(method, params)) request.onToolObservation?.(observation);
       if (method === "item/completed" && isRecord(params) && isRecord(params.item)
         && params.item.type === "agentMessage" && typeof params.item.text === "string") {
         agentTexts.push(params.item.text);
@@ -557,6 +563,49 @@ function summarizeNotification(method: string, params: unknown): string {
   if (method === "context/compacted") return "codex context compacted";
   if (method.includes("error") || method.includes("warning")) return `codex ${method}`;
   return `codex ${method}`;
+}
+
+function codexToolObservations(method: string, params: unknown): ExecutorToolObservation[] {
+  if (method !== "item/started" && method !== "item/completed") return [];
+  if (!isRecord(params) || !isRecord(params.item)) return [];
+  const item = params.item;
+  if (typeof item.type !== "string") return [];
+  const stage = method === "item/started" ? "start" as const : "end" as const;
+  const type = item.type.toLowerCase().replace(/[_-]/g, "");
+  if (type === "commandexecution") {
+    const toolInput = typeof item.command === "string" ? { command: item.command } : undefined;
+    return [{
+      stage,
+      toolName: "bash",
+      ...(toolInput ? { toolInput } : {}),
+      ...(typeof item.id === "string" ? { observationId: item.id } : {}),
+      ...(stage === "end" ? { result: { output: item.aggregated_output ?? item.aggregatedOutput, exitCode: item.exit_code ?? item.exitCode, status: item.status }, isError: item.status === "failed" || typeof (item.exit_code ?? item.exitCode) === "number" && (item.exit_code ?? item.exitCode) !== 0 } : {}),
+    }];
+  }
+  if (type === "filechange") {
+    const changes = Array.isArray(item.changes) ? item.changes : [];
+    const paths = changes.flatMap((change) => isRecord(change) && typeof change.path === "string" ? [change.path] : []);
+    const toolInput = paths.length > 0 ? { files: paths } : undefined;
+    return [{
+      stage,
+      toolName: "write",
+      ...(toolInput ? { toolInput } : {}),
+      ...(typeof item.id === "string" ? { observationId: item.id } : {}),
+      ...(stage === "end" ? { result: item, isError: item.status === "failed" } : {}),
+    }];
+  }
+  if (type === "mcptoolcall") {
+    const toolName = typeof item.tool === "string" ? item.tool : "mcp_tool_call";
+    const toolInput = isRecord(item.arguments) ? item.arguments : isRecord(item.input) ? item.input : undefined;
+    return [{
+      stage,
+      toolName,
+      ...(toolInput ? { toolInput } : {}),
+      ...(stage === "end" ? { result: item.result ?? item.error, isError: item.status === "failed" || item.error !== undefined } : {}),
+      ...(typeof item.id === "string" ? { observationId: item.id } : {}),
+    }];
+  }
+  return [];
 }
 
 function stringAt(value: unknown, ...path: string[]): string | undefined {

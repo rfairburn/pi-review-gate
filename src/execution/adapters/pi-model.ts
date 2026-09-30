@@ -49,6 +49,10 @@ const PI_EXECUTOR_TERMINAL_SHUTDOWN_MS = 15_000;
 
 export class PiExecutorAdapter implements ExecutorAdapter {
   readonly kind = "pi-model";
+  readonly toolEventObservability = {
+    mode: "structured",
+    description: "Pi RPC tool_execution_start/end events expose named tool inputs and results; delivery may race the child mutation, so prior state is not verified.",
+  } as const;
   readonly model: string;
 
   constructor(private readonly options: PiExecutorOptions) {
@@ -146,7 +150,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     const rpc = new PiRpc(proc, backgroundReadiness, (chunk) => {
       extractor.push(chunk);
       activity.push(chunk);
-    }, (error) => translateDefaultPiSpawnError(error, isDefaultPiPassThrough));
+    }, (error) => translateDefaultPiSpawnError(error, isDefaultPiPassThrough), request.onToolObservation);
     let timedOut = false;
     let aborted = false;
     let interruptedByControl = false;
@@ -489,6 +493,7 @@ export class PiRpc {
     private readonly onJsonl: (chunk: string) => void,
     /** #204: translate a raw spawn ENOENT of the POSIX default-pi pass-through into the actionable missing-CLI diagnostic. */
     private readonly translateSpawnError?: (error: Error) => Error,
+    private readonly onToolObservation?: ExecutorRequest["onToolObservation"],
   ) {
     proc.stdout?.on("data", (value: Buffer) => this.consume(value.toString("utf8")));
     proc.stderr?.on("data", (value: Buffer) => { this.stderr.append(value.toString("utf8")); });
@@ -661,6 +666,21 @@ export class PiRpc {
         this.shutdownFailure = "Pi executor terminal session cleanup failed; completion cannot confirm resource cleanup.";
       } else if (event.type === "tool_execution_end" && typeof event.toolName === "string") {
         this.backgroundReadiness.observeToolResult(event.toolName, event.result, event.isError === true);
+        this.onToolObservation?.({
+          stage: "end",
+          toolName: event.toolName,
+          ...(isRecord(event.args) ? { toolInput: event.args } : {}),
+          result: event.result,
+          isError: event.isError === true,
+          ...(typeof event.toolCallId === "string" ? { observationId: event.toolCallId } : {}),
+        });
+      } else if (event.type === "tool_execution_start" && typeof event.toolName === "string") {
+        this.onToolObservation?.({
+          stage: "start",
+          toolName: event.toolName,
+          ...(isRecord(event.args) ? { toolInput: event.args } : {}),
+          ...(typeof event.toolCallId === "string" ? { observationId: event.toolCallId } : {}),
+        });
       } else if (event.type === "agent_end") {
         this.settledCount += 1;
         const ready = this.settledWaiters.filter((waiter) => waiter.after < this.settledCount);

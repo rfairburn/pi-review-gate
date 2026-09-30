@@ -79,7 +79,11 @@ jobs:
     # enforced trigger paths).
     if: github.event_name != 'push' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Deliberately bounded: a runaway Linux full-suite run must fail instead of
+    # occupying the runner for close to an hour. The suite step below carries a
+    # tighter cap of its own; raise these only alongside the focused workflow
+    # contract test that asserts both limits.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
@@ -173,7 +177,21 @@ jobs:
       - name: Build test bundle
         run: npm run build:test
       - name: Full test suite
-        run: npm run test:run
+        # Step-level cap inside the 15-minute job cap above: a hung suite step
+        # fails here at 10 minutes instead of consuming the whole job budget.
+        # The suite coverage is exactly the local `npm run test:run` command —
+        # same dist-test/tests/*.test.js glob, same four-file concurrency — with
+        # two additive, CI-only diagnostics and nothing else:
+        # - --test-timeout=300000 bounds any single hung test at 5 minutes so it
+        #   fails the run instead of stalling; module-load hangs, parent-runner
+        #   stalls, and leaked exit handles still need the 10-minute step cap.
+        # - a second, stderr-bound reporter (scripts/ci/test-file-progress.cjs)
+        #   prints one immediate start/complete line per test file while the spec
+        #   reporter keeps writing stdout. Unmatched start lines identify files
+        #   with no observed completion, not proof their processes remain alive.
+        #   Local commands in package.json are unchanged.
+        timeout-minutes: 10
+        run: node --test --test-concurrency=4 --test-timeout=300000 --test-reporter=spec --test-reporter=./scripts/ci/test-file-progress.cjs --test-reporter-destination=stdout --test-reporter-destination=stderr dist-test/tests/*.test.js
 
   windows-launcher:
     # Native Windows coverage for the .cmd entry point and its Node helper

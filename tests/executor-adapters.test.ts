@@ -57,6 +57,65 @@ for (const [name, runLegacyRequest] of [
   });
 }
 
+test("Claude executor forwards SDK tool_use and tool_result blocks with their call identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-claude-observations-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    await mkdir(artifactDir);
+    const messages = [
+      {
+        type: "assistant",
+        session_id: "claude-session",
+        message: { content: [{ type: "tool_use", id: "tool-1", name: "Write", input: { file_path: "/tmp/claude-outside.txt", content: "external" } }] },
+      },
+      {
+        type: "user",
+        session_id: "claude-session",
+        message: { content: [{ type: "tool_result", tool_use_id: "tool-1", content: "file written", is_error: false }] },
+      },
+      { type: "result", subtype: "success", result: "completed", session_id: "claude-session" },
+    ];
+    const query = {
+      async initializationResult() {},
+      async enqueue() {},
+      async interrupt() { return { still_queued: [] }; },
+      close() {},
+      [Symbol.asyncIterator]() {
+        return (async function* () {
+          for (const message of messages) yield message as never;
+        })();
+      },
+    };
+    const adapter = new ClaudeExecutorAdapter(
+      { id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet", timeoutMs: 5_000 },
+      {
+        loadSdk: async () => ({
+          query: ((request: { prompt: AsyncIterable<unknown> }) => {
+            void request.prompt[Symbol.asyncIterator]().next();
+            return query;
+          }) as never,
+        }),
+      },
+    );
+    const observations: Array<{ stage: string; toolName: string; toolInput?: Record<string, unknown>; result?: unknown; observationId?: string }> = [];
+    const result = await adapter.run({
+      cwd: root,
+      prompt: "write the external file",
+      artifactDir,
+      turn: 1,
+      onToolObservation: (event) => observations.push(event),
+    });
+    assert.equal(result.text, "completed");
+    assert.deepEqual(observations.map((event) => [event.stage, event.toolName, event.toolInput?.file_path, event.observationId]), [
+      ["start", "Write", "/tmp/claude-outside.txt", "tool-1"],
+      ["end", "Write", "/tmp/claude-outside.txt", "tool-1"],
+    ]);
+    assert.equal(observations[1]?.result, "file written");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Pi executor child loads the review-gate extension in executor role without inheriting disablement", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-executor-env-"));
   try {
@@ -339,6 +398,22 @@ test("PiRpc latches a transport error that arrives with no pending request and f
   // The child's exit still settles so the adapter can finish truthfully.
   proc.emit("close", 0, null);
   assert.deepEqual(await rpc.closed(), { code: 0, signal: null });
+});
+
+test("PiRpc forwards structured tool start/end observations without treating them as pre-write snapshots", () => {
+  const { proc, stdout } = createFakePiChild();
+  const observations: Array<{ stage: string; toolName: string; toolInput?: Record<string, unknown>; observationId?: string }> = [];
+  new PiRpc(proc, new BackgroundProcessReadiness(), () => undefined, undefined, (event) => observations.push(event));
+  const externalPath = "/tmp/pi-observed-outside-root.txt";
+  stdout.emit("data", Buffer.from([
+    JSON.stringify({ type: "tool_execution_start", toolName: "write", toolCallId: "tool-1", args: { path: externalPath } }),
+    JSON.stringify({ type: "tool_execution_end", toolName: "write", toolCallId: "tool-1", args: { path: externalPath }, result: "written", isError: false }),
+  ].join("\n") + "\n"));
+  proc.emit("close", 0, null);
+  assert.deepEqual(observations.map((event) => [event.stage, event.toolName, event.toolInput?.path, event.observationId]), [
+    ["start", "write", externalPath, "tool-1"],
+    ["end", "write", externalPath, "tool-1"],
+  ]);
 });
 
 test("PiRpc latches output-pipe errors through the same transport failure path", async () => {
@@ -1055,6 +1130,43 @@ test("Codex research executor preserves the full allowed catalog with app-server
     assert.deepEqual(threadStart.params.environments, []);
     assert.deepEqual(threadStart.params.dynamicTools, []);
     assert.ok(calls.some((call) => call.method === "initialized"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex app-server forwards command, file-change, and MCP tool observations", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-codex-observations-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const command = join(root, "codex-observations.cjs");
+    await mkdir(artifactDir);
+    const externalPath = "/tmp/codex-observed-outside.txt";
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "let input='';process.stdin.setEncoding('utf8');const send=(value)=>console.log(JSON.stringify(value));",
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);if(!c.id)continue;",
+      "if(c.method==='initialize')send({jsonrpc:'2.0',id:c.id,result:{userAgent:'codex-test/1.0'}});",
+      "else if(c.method==='thread/start')send({jsonrpc:'2.0',id:c.id,result:{thread:{id:'thread-observe'}}});",
+      `else if(c.method==='turn/start'){send({jsonrpc:'2.0',id:c.id,result:{turn:{id:'turn-observe'}}});const command={type:'commandExecution',id:'cmd-1',command:${JSON.stringify(`printf value > ${externalPath}`)},status:'completed',exit_code:0,aggregated_output:'ok'};send({jsonrpc:'2.0',method:'item/started',params:{item:command}});send({jsonrpc:'2.0',method:'item/completed',params:{item:command}});const change={type:'fileChange',id:'change-1',changes:[{path:${JSON.stringify(externalPath)},kind:'add'}]};send({jsonrpc:'2.0',method:'item/started',params:{item:change}});send({jsonrpc:'2.0',method:'item/completed',params:{item:change}});const mcp={type:'mcpToolCall',id:'mcp-1',tool:'write',arguments:{path:${JSON.stringify(externalPath)}}};send({jsonrpc:'2.0',method:'item/started',params:{item:mcp}});send({jsonrpc:'2.0',method:'item/completed',params:{item:{...mcp,result:'ok'}}});send({jsonrpc:'2.0',method:'item/completed',params:{item:{type:'agentMessage',text:'codex completed'}}});send({jsonrpc:'2.0',method:'turn/completed',params:{threadId:'thread-observe',turn:{id:'turn-observe',status:'completed'}}});}`,
+      "}});",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+    const observations: Array<{ stage: string; toolName: string; toolInput?: Record<string, unknown>; observationId?: string }> = [];
+    const adapter = new CodexExecutorAdapter({ id: "codex", adapter: "codex-cli", command, model: "gpt-test" });
+    const result = await adapter.run({
+      cwd: root,
+      prompt: "write the external file",
+      artifactDir,
+      turn: 1,
+      onToolObservation: (event) => observations.push(event),
+    });
+    assert.equal(result.text, "codex completed");
+    assert.ok(observations.some((event) => event.stage === "start" && event.toolName === "bash" && event.observationId === "cmd-1" && typeof event.toolInput?.command === "string" && event.toolInput.command.includes(externalPath)));
+    assert.ok(observations.some((event) => event.stage === "end" && event.toolName === "bash" && event.observationId === "cmd-1"));
+    assert.ok(observations.some((event) => event.stage === "start" && event.toolName === "write" && event.observationId === "change-1" && Array.isArray(event.toolInput?.files) && event.toolInput.files.includes(externalPath)));
+    assert.ok(observations.some((event) => event.stage === "end" && event.toolName === "write" && event.observationId === "change-1"));
+    assert.ok(observations.some((event) => event.stage === "start" && event.toolName === "write" && event.observationId === "mcp-1"));
   } finally {
     await rm(root, { recursive: true, force: true });
   }

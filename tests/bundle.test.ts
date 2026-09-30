@@ -42,6 +42,9 @@ test("artifact publication keeps colliding sanitized paths distinct", async () =
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-bundle-collision-"));
   const evidence: EvidenceBundle = {
     events: [],
+    toolObservabilityNotes: [],
+    toolObservationsTruncated: false,
+    requiresReview: false,
     finalAssistantSummaries: [],
     acceptedReviewerQuestions: [],
     changedCandidatePaths: [],

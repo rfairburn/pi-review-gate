@@ -84,6 +84,13 @@ export interface BackgroundExecutionGroup {
    */
   sessionCwd?: string;
   /**
+   * #220: the storage base of this group's root when the selected workspace
+   * contained the system temp directory and the root was created outside it
+   * (nearest writable ancestor of the temp root). Absent means the default
+   * temp root; the guarded execution-root cleanup validates it.
+   */
+  tempBase?: string;
+  /**
    * Issue #26: the stable scheduled-task entry id that dispatched this group.
    * Persisted so overlap detection (skip every due occurrence while a prior
    * run of the same entry is unsettled) survives restart and recovery.
@@ -624,10 +631,18 @@ export async function removeOwnedWaveRoot(root: string): Promise<void> {
   await rm(resolved, { recursive: true, force: true });
 }
 
-export async function removeOwnedExecutionRoot(root: string): Promise<void> {
-  const resolved = resolve(root);
+export async function removeOwnedExecutionRoot(root: string, tempBase?: string): Promise<void> {
+  const resolved = await realpath(resolve(root)).catch(() => resolve(root));
   const temporaryRoot = await realpath(resolve(tmpdir()));
-  if (!basename(resolved).startsWith("pi-review-execution-") || dirname(resolved) !== temporaryRoot) {
+  const resolvedBase = dirname(resolved);
+  // #220: a relocated in-place root validates against its recorded non-default
+  // storage base instead of the default temp root; the base of record comes
+  // only from the owning group's durable field.
+  const allowedBase = tempBase
+    ? await realpath(resolve(tempBase)).catch(() => undefined)
+    : undefined;
+  if (!basename(resolved).startsWith("pi-review-execution-")
+    || (resolvedBase !== temporaryRoot && (allowedBase === undefined || resolvedBase !== allowedBase))) {
     throw new Error(`Refusing to remove unrecognized execution root: ${resolved}`);
   }
   await rm(resolved, { recursive: true, force: true });

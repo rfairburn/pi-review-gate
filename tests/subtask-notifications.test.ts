@@ -138,7 +138,7 @@ test("shared lifecycle guidance is derived from the wake state tables", () => {
 
 test("completion guidance is kind-neutral and covers reported research completion", () => {
   const line = completionNotificationGuidanceLine();
-  assert.ok(line.includes("Every task completion (an execute task landing or a research task reporting) triggers a notification"));
+  assert.ok(line.includes("Every task completion (an execute task landing, a research task reporting, or an in-place task settling where its writes were performed) triggers a notification"), "guidance covers all three worker kinds (#220)");
   assert.ok(line.includes("lists every sibling that has not completed, even in quiet mode"));
   // #117: the unconditional promise is carved out for synchronous landings
   // already confirmed by the caller's own tool result.
@@ -221,6 +221,22 @@ test("completionGroupAggregateLines lists not-yet-complete siblings when the gro
     "Tasks not yet landed:",
     "- task-2 · Second task · running",
   ]);
+});
+
+test("inplace completion aggregate is the concise COMPLETE verdict without repeated narrative (#220/PR226)", () => {
+  const group = fixtureGroup({ kind: "inplace", tasks: [fixtureTask({ state: "reported" })] });
+  const lines = completionGroupAggregateLines(group);
+  assert.deepEqual(lines, [
+    `In-place ${group.executionId} COMPLETE: 1/1 tasks settled in place.`,
+  ]);
+  const text = lines.join("\n");
+  for (const rejected of [
+    "cannot prove which post-launch changes",
+    "nothing was gated, rolled back, or landed",
+    "Attribution remains bounded",
+  ]) {
+    assert.doesNotMatch(text, new RegExp(rejected, "i"), `group aggregate carries no repeated narrative: ${rejected}`);
+  }
 });
 
 test("completionGroupAggregateLines matches the aggregate section of formatExecutionEvent", () => {

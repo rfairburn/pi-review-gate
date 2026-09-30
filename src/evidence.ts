@@ -13,10 +13,17 @@ import { redactBrowserToolInput, redactSensitiveText, redactSensitiveValue } fro
 
 export interface EvidenceState {
   nextSequence: number;
+  /** Bounded monotonic count of external-path observations; not a verified diff. */
+  externalObservationRevision?: number;
   events: EvidenceEvent[];
   candidates: Map<string, EvidenceCandidate>;
   finalAssistantSummaries: string[];
   acceptedReviewerQuestions: AcceptedReviewerQuestion[];
+  /** Adapter-specific limits on what tool activity this evidence can observe. */
+  toolObservabilityNotes?: string[];
+  toolObservationsTruncated?: boolean;
+  /** Observed external tool writes must reach a reviewer even without an in-root delta. */
+  requiresReview?: boolean;
 }
 
 export interface AcceptedReviewerQuestion {
@@ -31,6 +38,8 @@ export interface EvidenceEvent {
   exchangeSequence?: number;
   phase: "tool_call" | "tool_result";
   toolName: string;
+  adapter?: string;
+  observationId?: string;
   summary: string;
   detail?: string;
   candidatePaths: string[];
@@ -44,6 +53,14 @@ export interface EvidenceCandidate {
   sources: string[];
   baseline?: FileSnapshot;
   baselineError?: string;
+  /** The adapter stream is not a verified pre-execution acknowledgement. */
+  prestateUnverified?: true;
+  /** This candidate is outside the immutable selected-root snapshot. */
+  externalSideEffect?: true;
+  /** Bounded current observation only; never compared against a fabricated baseline. */
+  afterSnapshot?: FileSnapshot;
+  afterContentTruncated?: true;
+  afterError?: string;
   exchangeBaselines: Map<number, { snapshot?: FileSnapshot; error?: string }>;
 }
 
@@ -58,11 +75,18 @@ export interface EvidenceBundle {
     path: string;
     absolutePath: string;
     sources: string[];
-    baseline: "captured" | "missing" | "unreadable" | "error";
+    baseline: "captured" | "missing" | "unreadable" | "error" | "unverified";
     baselineSnapshot?: FileSnapshot;
+    externalSideEffect?: true;
+    afterSnapshot?: FileSnapshot;
+    afterContentTruncated?: true;
+    afterError?: string;
   }>;
   finalAssistantSummaries: string[];
   acceptedReviewerQuestions: AcceptedReviewerQuestion[];
+  toolObservabilityNotes: string[];
+  toolObservationsTruncated: boolean;
+  requiresReview: boolean;
   changedCandidatePaths: string[];
   markdown: string;
 }
@@ -92,11 +116,289 @@ export function shouldRecordToolResultEvidence(toolName: string, isError: boolea
 export function createEvidenceState(): EvidenceState {
   return {
     nextSequence: 1,
+    externalObservationRevision: 0,
     events: [],
     candidates: new Map(),
     finalAssistantSummaries: [],
     acceptedReviewerQuestions: [],
+    toolObservabilityNotes: [],
+    toolObservationsTruncated: false,
+    requiresReview: false,
   };
+}
+
+export interface PersistedEvidenceState {
+  version: 1;
+  nextSequence: number;
+  externalObservationRevision?: number;
+  events: EvidenceEvent[];
+  candidates: Array<Omit<EvidenceCandidate, "exchangeBaselines">>;
+  finalAssistantSummaries: string[];
+  acceptedReviewerQuestions: AcceptedReviewerQuestion[];
+  toolObservabilityNotes: string[];
+  toolObservationsTruncated: boolean;
+  requiresReview: boolean;
+}
+
+/** JSON-safe evidence checkpoint for durable in-place continuations. */
+export function serializeEvidenceState(state: EvidenceState): PersistedEvidenceState {
+  return {
+    version: 1,
+    nextSequence: state.nextSequence,
+    externalObservationRevision: state.externalObservationRevision ?? 0,
+    events: state.events.slice(-MAX_OBSERVED_TOOL_EVENTS),
+    candidates: [...state.candidates.values()].map((candidate) => {
+      const { exchangeBaselines, ...serialized } = candidate;
+      void exchangeBaselines;
+      return serialized;
+    }),
+    finalAssistantSummaries: state.finalAssistantSummaries.slice(-10),
+    acceptedReviewerQuestions: state.acceptedReviewerQuestions.slice(-20),
+    toolObservabilityNotes: state.toolObservabilityNotes ?? [],
+    toolObservationsTruncated: state.toolObservationsTruncated === true,
+    requiresReview: state.requiresReview === true,
+  };
+}
+
+/** Restore bounded evidence without accepting paths inside the selected root. */
+export function restoreEvidenceState(state: EvidenceState, value: unknown, selectedRoot: string): void {
+  if (!isRecord(value) || value.version !== 1 || !Array.isArray(value.events) || !Array.isArray(value.candidates)) {
+    state.requiresReview = true;
+    state.toolObservabilityNotes ??= [];
+    state.toolObservabilityNotes.push("Persisted tool evidence was unreadable; prior observations are incomplete.");
+    return;
+  }
+  const root = resolve(selectedRoot);
+  const events = value.events.filter((event): event is EvidenceEvent => isRecord(event)
+    && typeof event.sequence === "number"
+    && Number.isSafeInteger(event.sequence)
+    && (event.phase === "tool_call" || event.phase === "tool_result")
+    && typeof event.toolName === "string"
+    && (event.adapter === undefined || typeof event.adapter === "string")
+    && (event.observationId === undefined || typeof event.observationId === "string")
+    && typeof event.summary === "string"
+    && (event.detail === undefined || typeof event.detail === "string")
+    && Array.isArray(event.candidatePaths)
+    && event.candidatePaths.every((path) => typeof path === "string")
+    && Array.isArray(event.riskSignals)
+    && event.riskSignals.every((signal) => typeof signal === "string")
+    && (event.isError === undefined || typeof event.isError === "boolean"));
+  state.events.push(...events.slice(0, MAX_OBSERVED_TOOL_EVENTS));
+  if (events.length > MAX_OBSERVED_TOOL_EVENTS || events.length !== value.events.length) state.toolObservationsTruncated = true;
+  state.nextSequence = Math.max(state.nextSequence, typeof value.nextSequence === "number" && Number.isSafeInteger(value.nextSequence) ? value.nextSequence : 1);
+  if (value.externalObservationRevision !== undefined) {
+    if (typeof value.externalObservationRevision === "number"
+      && Number.isSafeInteger(value.externalObservationRevision)
+      && value.externalObservationRevision >= 0) {
+      state.externalObservationRevision = Math.max(state.externalObservationRevision ?? 0, value.externalObservationRevision);
+    } else {
+      state.toolObservationsTruncated = true;
+      state.requiresReview = true;
+    }
+  }
+  for (const candidate of value.candidates) {
+    if (state.candidates.size >= MAX_OBSERVED_TOOL_EVENTS / 2) {
+      state.toolObservationsTruncated = true;
+      state.requiresReview = true;
+      break;
+    }
+    if (!isRecord(candidate) || candidate.externalSideEffect !== true || typeof candidate.path !== "string" || typeof candidate.absolutePath !== "string") continue;
+    if (candidate.absolutePath.length > MAX_OBSERVED_PATH_LENGTH) {
+      state.toolObservationsTruncated = true;
+      state.requiresReview = true;
+      continue;
+    }
+    const absolutePath = resolve(candidate.absolutePath);
+    if (!isAbsolute(candidate.absolutePath) || !isOutsidePath(absolutePath, root)) continue;
+    const path = truncate(redactSensitiveText(candidate.path), MAX_OBSERVED_PATH_LENGTH);
+    const existing = state.candidates.get(absolutePath);
+    if (existing) {
+      if (Array.isArray(candidate.sources)) existing.sources = unique([...existing.sources, ...candidate.sources.filter((source): source is string => typeof source === "string").slice(0, 20)]);
+      existing.afterSnapshot ??= isRecord(candidate.afterSnapshot) ? candidate.afterSnapshot as unknown as FileSnapshot : undefined;
+      if (candidate.afterContentTruncated === true) existing.afterContentTruncated = true;
+      existing.afterError ??= typeof candidate.afterError === "string" ? truncate(redactSensitiveText(candidate.afterError), 500) : undefined;
+      continue;
+    }
+    state.candidates.set(absolutePath, {
+      path,
+      absolutePath,
+      sources: Array.isArray(candidate.sources) ? candidate.sources.filter((source): source is string => typeof source === "string").slice(0, 20) : ["persisted tool observation"],
+      prestateUnverified: true,
+      externalSideEffect: true,
+      ...(isRecord(candidate.afterSnapshot) ? { afterSnapshot: candidate.afterSnapshot as unknown as FileSnapshot } : {}),
+      ...(candidate.afterContentTruncated === true ? { afterContentTruncated: true as const } : {}),
+      ...(typeof candidate.afterError === "string" ? { afterError: truncate(redactSensitiveText(candidate.afterError), 500) } : {}),
+      exchangeBaselines: new Map(),
+    });
+  }
+  if (Array.isArray(value.finalAssistantSummaries)) {
+    state.finalAssistantSummaries.push(...value.finalAssistantSummaries.filter((item): item is string => typeof item === "string").slice(0, 10));
+  }
+  if (Array.isArray(value.acceptedReviewerQuestions)) {
+    state.acceptedReviewerQuestions.push(...value.acceptedReviewerQuestions.filter((item): item is AcceptedReviewerQuestion => isRecord(item)
+      && typeof item.sequence === "number"
+      && Number.isSafeInteger(item.sequence)
+      && typeof item.question === "string"
+      && typeof item.acceptedAnswer === "string"
+      && typeof item.acceptedAt === "string").slice(0, 20));
+  }
+  state.toolObservabilityNotes ??= [];
+  if (Array.isArray(value.toolObservabilityNotes)) {
+    state.toolObservabilityNotes = unique([...state.toolObservabilityNotes, ...value.toolObservabilityNotes.filter((item): item is string => typeof item === "string")])
+      .slice(0, MAX_OBSERVABILITY_NOTES)
+      .map((note) => truncate(redactSensitiveText(note), 1000));
+  }
+  state.toolObservationsTruncated ||= value.toolObservationsTruncated === true;
+  state.requiresReview ||= value.requiresReview === true || state.candidates.size > 0 || state.toolObservationsTruncated;
+}
+
+const MAX_OBSERVED_TOOL_EVENTS = 200;
+const MAX_OBSERVED_PATHS_PER_EVENT = 25;
+const MAX_CANDIDATE_SOURCES = 20;
+const MAX_OBSERVABILITY_NOTES = 20;
+const MAX_OBSERVED_PATH_LENGTH = 2000;
+const MAX_OBSERVED_CONTENT_CHARS = 20_000;
+const MAX_EXTERNAL_OBSERVATION_REVISION = Number.MAX_SAFE_INTEGER;
+
+/** Record an adapter's declared tool-event coverage without implying completeness. */
+export function recordToolEventObservability(
+  state: EvidenceState,
+  adapter: string,
+  input: { mode: "structured" | "unavailable"; description: string },
+): void {
+  const note = truncate(redactSensitiveText(`${adapter}: ${input.description}`), 1000);
+  state.toolObservabilityNotes ??= [];
+  if (!state.toolObservabilityNotes.includes(note) && state.toolObservabilityNotes.length < MAX_OBSERVABILITY_NOTES) {
+    state.toolObservabilityNotes.push(note);
+  }
+}
+
+/**
+ * Record structured executor observations without taking a pre-event snapshot.
+ * Parent-side stream delivery is not a reliable pre-write acknowledgement, so
+ * candidate paths outside the selected-root snapshot retain an explicitly
+ * unverified prior state and receive only a later, bounded after observation.
+ */
+export function recordObservedToolEventEvidence(input: {
+  state: EvidenceState;
+  cwd: string;
+  selectedRoot: string;
+  adapter: string;
+  stage: "start" | "end";
+  toolName: string;
+  observationId?: string;
+  toolInput?: Record<string, unknown>;
+  result?: unknown;
+  isError?: boolean;
+}): void {
+  const boundedInput = boundObservedInput(input.toolInput);
+  const extracted = extractCandidatePaths(input.toolName, boundedInput);
+  const root = resolve(input.selectedRoot);
+  const observedExternal = extracted.paths.some(({ path }) => {
+    const expanded = expandHomePath(path);
+    const absolutePath = isAbsolute(expanded) ? resolve(expanded) : resolve(input.cwd, expanded);
+    return isOutsidePath(absolutePath, root);
+  });
+  if (observedExternal) {
+    const revision = input.state.externalObservationRevision ?? 0;
+    if (revision < MAX_EXTERNAL_OBSERVATION_REVISION) input.state.externalObservationRevision = revision + 1;
+    else input.state.toolObservationsTruncated = true;
+  }
+  if (input.state.events.filter((event) => event.adapter !== undefined).length >= MAX_OBSERVED_TOOL_EVENTS) {
+    input.state.toolObservationsTruncated = true;
+    input.state.requiresReview = true;
+    return;
+  }
+
+  const boundedResult = redactLargeValues(redactSensitiveValue(input.result));
+  const observedPaths = extracted.paths.slice(0, MAX_OBSERVED_PATHS_PER_EVENT);
+  if (extracted.paths.length > observedPaths.length) {
+    input.state.toolObservationsTruncated = true;
+    input.state.requiresReview = true;
+  }
+  const candidatePaths = unique(observedPaths.map(({ path }) => truncate(redactSensitiveText(path), MAX_OBSERVED_PATH_LENGTH)));
+  const event: EvidenceEvent = {
+    sequence: input.state.nextSequence++,
+    phase: input.stage === "start" ? "tool_call" : "tool_result",
+    toolName: truncate(redactSensitiveText(input.toolName || "unknown"), 200),
+    adapter: truncate(redactSensitiveText(input.adapter), 100),
+    ...(input.observationId ? { observationId: truncate(redactSensitiveText(input.observationId), 200) } : {}),
+    summary: input.stage === "start"
+      ? summarizeToolInput(input.toolName, boundedInput)
+      : summarizeToolResult(boundedResult, input.isError),
+    detail: input.stage === "start"
+      ? detailedToolInput(input.toolName, boundedInput)
+      : detailedToolResult(boundedResult),
+    candidatePaths,
+    riskSignals: unique([...extracted.riskSignals, ...(input.isError && input.stage === "end" ? ["tool_result_error"] : [])]),
+    ...(input.stage === "end" ? { isError: input.isError } : {}),
+  };
+  input.state.events.push(event);
+
+  for (const candidate of observedPaths) {
+    const expanded = expandHomePath(candidate.path);
+    const absolutePath = isAbsolute(expanded) ? resolve(expanded) : resolve(input.cwd, expanded);
+    const rootRelative = relative(root, absolutePath);
+    const isOutside = !isWithinRoot(rootRelative) || rootRelative === "";
+    if (!isOutside) continue;
+
+    const key = absolutePath;
+    const existing = input.state.candidates.get(key);
+    if (!existing && [...input.state.candidates.values()].filter((candidatePath) => candidatePath.externalSideEffect).length >= MAX_OBSERVED_TOOL_EVENTS / 2) {
+      input.state.toolObservationsTruncated = true;
+      input.state.requiresReview = true;
+      continue;
+    }
+    const evidence = existing ?? {
+      path: candidate.path,
+      absolutePath,
+      sources: [],
+      prestateUnverified: true as const,
+      externalSideEffect: true as const,
+      exchangeBaselines: new Map<number, { snapshot?: FileSnapshot; error?: string }>(),
+    };
+    const source = truncate(redactSensitiveText(candidate.source), 300);
+    if (!evidence.sources.includes(source) && evidence.sources.length < MAX_CANDIDATE_SOURCES) evidence.sources.push(source);
+    else if (!evidence.sources.includes(source)) input.state.toolObservationsTruncated = true;
+    input.state.candidates.set(key, evidence);
+    input.state.requiresReview = true;
+  }
+}
+
+/** Capture exact candidate paths only after the executor turn; never infer a diff from this snapshot. */
+export async function captureObservedToolPathAfterStates(
+  state: EvidenceState,
+  selectedRoot: string,
+  snapshotOptions: SnapshotOptions,
+): Promise<void> {
+  let remainingBytes = snapshotOptions.maxSnapshotBytes;
+  for (const evidence of state.candidates.values()) {
+    if (!evidence.externalSideEffect) continue;
+    try {
+      const snapshot = await createPathSnapshot(selectedRoot, evidence.absolutePath, {
+        ...snapshotOptions,
+        maxFileBytes: Math.min(snapshotOptions.maxFileBytes, Math.max(0, remainingBytes)),
+        maxSnapshotBytes: Math.max(0, remainingBytes),
+        captureOutsideWorkspaceContent: true,
+      });
+      let content = snapshot.content === undefined ? undefined : redactSensitiveText(snapshot.content);
+      const contentTruncated = content !== undefined && content.length > MAX_OBSERVED_CONTENT_CHARS;
+      if (contentTruncated) content = `${content!.slice(0, MAX_OBSERVED_CONTENT_CHARS)}\n[... truncated ...]`;
+      if (snapshot.content !== undefined) remainingBytes = Math.max(0, remainingBytes - Buffer.byteLength(snapshot.content, "utf8"));
+      evidence.afterSnapshot = {
+        ...snapshot,
+        ...(snapshot.linkTarget !== undefined ? { linkTarget: truncate(redactSensitiveText(snapshot.linkTarget), MAX_OBSERVED_CONTENT_CHARS) } : {}),
+        ...(content !== undefined ? { content } : {}),
+      };
+      if (contentTruncated) evidence.afterContentTruncated = true;
+      else delete evidence.afterContentTruncated;
+      delete evidence.afterError;
+    } catch (error) {
+      evidence.afterError = truncate(redactSensitiveText(error instanceof Error ? error.message : String(error)), 500);
+      delete evidence.afterSnapshot;
+      delete evidence.afterContentTruncated;
+    }
+  }
 }
 
 export function recordAcceptedReviewerQuestion(
@@ -208,10 +510,12 @@ export function buildEvidenceBundle(
       ? { ...candidate.baseline, relativePath: path }
       : candidate.baseline;
     return {
-      path,
-      absolutePath: candidate.absolutePath,
+      path: candidate.externalSideEffect ? redactSensitiveText(path) : path,
+      absolutePath: candidate.externalSideEffect ? redactSensitiveText(candidate.absolutePath) : candidate.absolutePath,
       sources: candidate.sources,
-      baseline: candidate.baselineError
+      baseline: candidate.prestateUnverified
+        ? "unverified" as const
+        : candidate.baselineError
         ? "error" as const
         : candidate.baseline?.exists
           ? candidate.baseline.omittedReason === "unreadable"
@@ -221,6 +525,18 @@ export function buildEvidenceBundle(
             ? "unreadable" as const
             : "missing" as const,
       baselineSnapshot,
+      ...(candidate.externalSideEffect ? { externalSideEffect: true as const } : {}),
+      ...(candidate.afterSnapshot ? {
+        afterSnapshot: {
+          ...candidate.afterSnapshot,
+          absolutePath: redactSensitiveText(candidate.absolutePath),
+          relativePath: redactSensitiveText(path),
+          ...(candidate.afterSnapshot.content !== undefined ? { content: redactSensitiveText(candidate.afterSnapshot.content) } : {}),
+          ...(candidate.afterSnapshot.linkTarget !== undefined ? { linkTarget: redactSensitiveText(candidate.afterSnapshot.linkTarget) } : {}),
+        },
+      } : {}),
+      ...(candidate.afterContentTruncated ? { afterContentTruncated: true as const } : {}),
+      ...(candidate.afterError ? { afterError: redactSensitiveText(candidate.afterError) } : {}),
     };
   });
 
@@ -229,6 +545,9 @@ export function buildEvidenceBundle(
     candidates,
     finalAssistantSummaries: focus?.finalAssistantSummaries ?? state.finalAssistantSummaries,
     acceptedReviewerQuestions: state.acceptedReviewerQuestions,
+    toolObservabilityNotes: [...(state.toolObservabilityNotes ?? [])],
+    toolObservationsTruncated: state.toolObservationsTruncated === true,
+    requiresReview: state.requiresReview === true,
     changedCandidatePaths,
   };
 
@@ -257,6 +576,7 @@ function evidenceCandidatePath(
   roots?: EvidencePathRoots,
 ): string {
   if (!roots) return candidate.path;
+  if (candidate.externalSideEffect) return redactSensitiveText(candidate.absolutePath);
   return workspaceRelativePath(resolve(candidate.absolutePath), roots.workspaceRoot) ?? candidate.path;
 }
 
@@ -269,6 +589,11 @@ function workspaceRelativePath(absolute: string, workspaceRoot: string): string 
 
 function isWithinRoot(path: string): boolean {
   return path === "" || (!isAbsolute(path) && path !== ".." && !path.startsWith(`..${sep}`));
+}
+
+function isOutsidePath(path: string, root: string): boolean {
+  const relativePath = relative(root, path);
+  return relativePath === "" || !isWithinRoot(relativePath);
 }
 
 export function rememberFinalAssistantSummary(state: EvidenceState, args: unknown[]): void {
@@ -296,9 +621,12 @@ export function extractCandidatePaths(
   const normalizedName = normalizedToolName(toolName);
 
   if (PATH_MUTATION_TOOLS.has(normalizedName)) {
+    // Writing directly to /dev/null drops output. Other mutation tools keep
+    // the device path as a candidate rather than assuming a discard write.
+    const omitSinkTarget = normalizedName === "write";
     for (const key of ["path", "file_path", "filePath", "target", "dest", "destination"]) {
       const value = input[key];
-      if (typeof value === "string" && value.trim()) {
+      if (typeof value === "string" && value.trim() && !(omitSinkTarget && isNullSinkCandidatePath(value.trim()))) {
         paths.push({ path: value.trim(), source: `${toolName}:${key}` });
       }
     }
@@ -307,7 +635,7 @@ export function extractCandidatePaths(
       const value = input[key];
       if (Array.isArray(value)) {
         for (const item of value) {
-          if (typeof item === "string" && item.trim()) {
+          if (typeof item === "string" && item.trim() && !(omitSinkTarget && isNullSinkCandidatePath(item.trim()))) {
             paths.push({ path: item.trim(), source: `${toolName}:${key}` });
           }
         }
@@ -425,7 +753,9 @@ function extractShellCandidatePaths(command: string): { paths: string[]; riskSig
   for (const match of command.matchAll(redirectionPattern)) {
     const path = match[1] ?? match[2] ?? match[3];
     if (path) {
-      paths.push(path);
+      // Redirecting output at the null sink is an output drop, not a real
+      // write target; the redirection itself stays a recorded risk signal.
+      if (!isNullSinkCandidatePath(path)) paths.push(path);
       riskSignals.push("shell_redirection");
     }
   }
@@ -434,7 +764,9 @@ function extractShellCandidatePaths(command: string): { paths: string[]; riskSig
   for (const match of command.matchAll(appendHerePattern)) {
     const path = match[1] ?? match[2] ?? match[3];
     if (path && !path.startsWith("-")) {
-      paths.push(path);
+      // A tee into the null sink only drops its copy of the stream; the
+      // tee write itself stays a recorded risk signal.
+      if (!isNullSinkCandidatePath(path)) paths.push(path);
       riskSignals.push("tee_write");
     }
   }
@@ -476,6 +808,27 @@ function extractShellCandidatePaths(command: string): { paths: string[]; riskSig
     paths: unique(paths.filter(isUsefulPathToken)),
     riskSignals: unique(riskSignals),
   };
+}
+
+/**
+ * Whether a candidate path is the POSIX /dev/null discard sink. Callers apply
+ * this only at discard-write extraction sites (shell output redirection, tee
+ * writes, and the full-overwrite write tool), where the sink is a common
+ * no-op output drop. Destructive or unknown operations — rm, mv, cp, touch,
+ * mkdir, edit, and ApplyPatch envelope mutations — must keep the device as
+ * an evidenced candidate, including inside mixed commands, because they can
+ * delete, rename, replace, or alter it rather than write past it.
+ *
+ * Only the canonical absolute sink matches; it is compared against the same
+ * normalized form the candidate machinery itself uses to key paths, and a
+ * relative, task-rooted, or other-spelling lookalike still resolves to some
+ * real path and keeps its evidence. On non-POSIX resolvers nothing can equal
+ * the literal "/dev/null", so real (drive-qualified) paths and Windows NUL
+ * keep their evidence too.
+ */
+function isNullSinkCandidatePath(path: string): boolean {
+  if (!path || !isAbsolute(path)) return false;
+  return resolve(expandHomePath(path)) === "/dev/null";
 }
 
 function commandText(input: Record<string, unknown>): string {
@@ -575,9 +928,10 @@ function renderEvidenceMarkdown(bundle: Omit<EvidenceBundle, "markdown">): strin
     }
   }
 
-  if (bundle.candidates.length > 0) {
+  const precapturedCandidates = bundle.candidates.filter((candidate) => !candidate.externalSideEffect);
+  if (precapturedCandidates.length > 0) {
     lines.push("### Pre-captured candidate files");
-    for (const candidate of bundle.candidates) {
+    for (const candidate of precapturedCandidates) {
       lines.push(`- ${candidate.path} (${candidate.baseline}; ${candidate.sources.join(", ")})`);
     }
     lines.push("");
@@ -591,12 +945,41 @@ function renderEvidenceMarkdown(bundle: Omit<EvidenceBundle, "markdown">): strin
     lines.push("");
   }
 
+  if (bundle.toolObservabilityNotes.length > 0 || bundle.toolObservationsTruncated) {
+    lines.push("### Executor tool-event observability limits");
+    for (const note of bundle.toolObservabilityNotes) lines.push(`- ${note}`);
+    if (bundle.toolObservationsTruncated) lines.push("- The bounded tool-event/path evidence limit was reached; additional observations were omitted. Review is required.");
+    lines.push("- These adapter stream observations are not pre-execution acknowledgements. Missing events do not prove that no external action occurred.", "");
+  }
+
+  const externalCandidates = bundle.candidates.filter((candidate) => candidate.externalSideEffect);
+  if (externalCandidates.length > 0) {
+    lines.push("### Tool-observed external side-effect candidates");
+    lines.push("These paths are outside the selected workspace and are evidence of tool-observed side effects, not in-root delta entries. Their prior state is unverified because parent stream delivery may race the child's mutation; no exact diff is claimed.");
+    for (const candidate of externalCandidates) {
+      lines.push(`- ${candidate.path} (prior state unverified; ${candidate.sources.join(", ")})`);
+      if (candidate.afterSnapshot) {
+        const after = candidate.afterSnapshot;
+        lines.push(`  - Bounded current after-turn observation: ${after.exists ? `${after.entryType ?? "entry"}, ${after.size} byte(s), sha256=${after.sha256 ?? "unavailable"}` : "not present or not readable as a file"}${after.omittedReason ? `; content=${after.omittedReason}` : ""}.`);
+        if (after.linkTarget !== undefined) lines.push(`  - Link target: ${after.linkTarget}`);
+        if (after.content !== undefined) lines.push("  - Redacted after-content (not a diff):", "```text", after.content, "```");
+        if (candidate.afterContentTruncated) lines.push("  - After-content preview truncated.");
+      } else if (candidate.afterError) {
+        lines.push(`  - After-turn observation unavailable: ${candidate.afterError}`);
+      } else {
+        lines.push("  - No after-turn snapshot was captured.");
+      }
+    }
+    lines.push("");
+  }
+
   if (bundle.events.length > 0) {
     lines.push("### Tool event digest");
     for (const event of bundle.events) {
       const risks = event.riskSignals.length > 0 ? ` risks=${event.riskSignals.join(",")}` : "";
       const paths = event.candidatePaths.length > 0 ? ` paths=${event.candidatePaths.join(",")}` : "";
-      lines.push(`- #${event.sequence} ${event.phase} ${event.toolName}${event.isError ? " ERROR" : ""}${paths}${risks}: ${event.summary}`);
+      const observationId = event.observationId ? ` id=${event.observationId}` : "";
+      lines.push(`- #${event.sequence} ${event.phase} ${event.adapter ? `${event.adapter}/` : ""}${event.toolName}${observationId}${event.isError ? " ERROR" : ""}${paths}${risks}: ${event.summary}`);
     }
   }
 
@@ -649,6 +1032,27 @@ function redactLargeValues(value: unknown): unknown {
     return result;
   }
   return value;
+}
+
+function boundObservedInput(input: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!input) return undefined;
+  const redacted = redactLargeValues(redactBrowserToolInput("executor", input)) as Record<string, unknown>;
+  for (const key of ["command", "cmd", "script", "chars", "patch"]) {
+    const value = input[key];
+    if (typeof value === "string") redacted[key] = truncate(redactSensitiveText(value), 20_000);
+  }
+  for (const key of ["path", "file_path", "filePath", "target", "dest", "destination"]) {
+    const value = input[key];
+    if (typeof value === "string") redacted[key] = truncate(redactSensitiveText(value), MAX_OBSERVED_PATH_LENGTH);
+  }
+  for (const key of ["paths", "files"]) {
+    const value = input[key];
+    if (Array.isArray(value)) {
+      redacted[key] = value.slice(0, MAX_OBSERVED_TOOL_EVENTS / 2).map((item) =>
+        typeof item === "string" ? truncate(redactSensitiveText(item), MAX_OBSERVED_PATH_LENGTH) : redactLargeValues(item));
+    }
+  }
+  return redacted;
 }
 
 function isUsefulPathToken(path: string): boolean {

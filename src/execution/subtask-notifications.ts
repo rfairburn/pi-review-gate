@@ -200,16 +200,32 @@ export function terminalWakeGuidanceLine(): string {
 
 /**
  * Kind-neutral completion guidance: execute groups land, research groups
- * report, and both completions wake the orchestrator even in quiet mode and
- * list incomplete siblings — except synchronous landings already confirmed by
- * the caller's own tool result (#117).
+ * report, in-place groups (#220) settle where their writes were performed; all
+ * completions wake the orchestrator even in quiet mode and list incomplete
+ * siblings — except synchronous landings already confirmed by the caller's own
+ * tool result (#117).
  */
 export function completionNotificationGuidanceLine(): string {
   return [
-    `Every task completion (an execute task landing or a research task reporting) triggers a notification and lists every sibling that has not completed, even in quiet mode, so freed capacity can be topped off immediately.`,
+    `Every task completion (an execute task landing, a research task reporting, or an in-place task settling where its writes were performed) triggers a notification and lists every sibling that has not completed, even in quiet mode, so freed capacity can be topped off immediately.`,
     synchronousLandingNotificationCarveOut(),
     "Do not verify aggregate outputs until the execution-complete verdict arrives, whether as a completion notification or folded into one of those direct results.",
   ].join(" ");
+}
+
+/** Kind display label used across subtask notifications and widgets (#220). */
+export function subtaskGroupLabel(kind: BackgroundTaskKind): string {
+  return kind === "research" ? "Research" : kind === "inplace" ? "In-place" : "Execution";
+}
+
+/** The task state a successful task of this kind settles to (execute lands; the others report). */
+export function subtaskSuccessState(kind: BackgroundTaskKind): BackgroundTaskState {
+  return kind === "execute" ? "landed" : "reported";
+}
+
+/** The success verb used across notification prose for each kind. */
+export function subtaskSuccessVerb(kind: BackgroundTaskKind): string {
+  return kind === "execute" ? "landed" : kind === "inplace" ? "settled in place" : "reported";
 }
 
 /**
@@ -277,8 +293,8 @@ export function completionGroupAggregateLines(
   group: BackgroundExecutionGroup,
   scheduling?: SubtaskEventScheduling,
 ): string[] {
-  const successState: BackgroundTaskState = group.kind === "research" ? "reported" : "landed";
-  const successVerb = group.kind === "research" ? "reported" : "landed";
+  const successState: BackgroundTaskState = subtaskSuccessState(group.kind);
+  const successVerb = subtaskSuccessVerb(group.kind);
   // Finding 15: totals come from the persisted aggregate counts so they stay
   // truthful after settled tasks are evicted from the bounded inline window;
   // the inline incomplete list is exhaustive because every unsettled task
@@ -294,13 +310,15 @@ export function completionGroupAggregateLines(
     lines.push(`Top-off opportunity: up to ${topOff} additional task(s) may be submitted with SubtasksAdd if planned work remains.`);
   }
   if (incomplete.length === 0) {
-    lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} COMPLETE: ${successful}/${total} tasks ${successVerb}.`);
-    lines.push(group.kind === "research"
-      ? "All requested research reports are available; synthesis is now appropriate. Main was not modified by this research group."
-      : "All requested task outputs have landed; aggregate verification is now appropriate.");
+    lines.push(`${subtaskGroupLabel(group.kind)} ${group.executionId} COMPLETE: ${successful}/${total} tasks ${successVerb}.`);
+    if (group.kind === "research") {
+      lines.push("All requested research reports are available; synthesis is now appropriate. Main was not modified by this research group.");
+    } else if (group.kind === "execute") {
+      lines.push("All requested task outputs have landed; aggregate verification is now appropriate.");
+    }
   } else {
     const disposition = active.length > 0 ? "IN PROGRESS" : "INCOMPLETE";
-    lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} ${disposition}: ${successful}/${total} ${successVerb}; ${incomplete.length} not ${successVerb}.`);
+    lines.push(`${subtaskGroupLabel(group.kind)} ${group.executionId} ${disposition}: ${successful}/${total} ${successVerb}; ${incomplete.length} not ${successVerb}.`);
     lines.push(`This is a partial task completion, not completion of the whole group. Do not claim outputs from tasks that have not ${successVerb}.`);
     lines.push(`Tasks not yet ${successVerb}:`);
     for (const candidate of incomplete) {
@@ -317,8 +335,8 @@ export function formatExecutionEvent(
   content: string,
   scheduling?: SubtaskEventScheduling,
 ): string {
-  const successState: BackgroundTaskState = group.kind === "research" ? "reported" : "landed";
-  const successVerb = group.kind === "research" ? "reported" : "landed";
+  const successState: BackgroundTaskState = subtaskSuccessState(group.kind);
+  const successVerb = subtaskSuccessVerb(group.kind);
   // Finding 15: totals come from the persisted aggregate counts so they stay
   // truthful after settled tasks are evicted from the bounded inline window.
   const archivedSettled = group.settledArchivedCount ?? 0;
@@ -349,17 +367,17 @@ export function formatExecutionEvent(
   const active = group.tasks.filter((candidate) => isActiveTaskState(candidate.state));
   if (incomplete.length === 0) {
     if (kind === "failure") {
-      lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} has ${successful}/${total} tasks ${successVerb}, but this interaction reported a failure.`);
-      lines.push(`Inspect the failed command and verify the ${group.kind === "research" ? "reports" : "landed output"} before treating the group as successful.`);
+      lines.push(`${subtaskGroupLabel(group.kind)} ${group.executionId} has ${successful}/${total} tasks ${successVerb}, but this interaction reported a failure.`);
+      lines.push(`Inspect the failed command and verify the ${group.kind === "research" ? "reports" : group.kind === "inplace" ? "workspace changes" : "landed output"} before treating the group as successful.`);
     } else {
-      lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} currently has ${successful}/${total} tasks ${successVerb}.`);
+      lines.push(`${subtaskGroupLabel(group.kind)} ${group.executionId} currently has ${successful}/${total} tasks ${successVerb}.`);
       lines.push("This is an informational state update; rely on the separate completion or failure event for the execution outcome.");
     }
     if (kind === "state") lines.push(noActionResponseNotice(task));
     return lines.join("\n");
   }
   const disposition = active.length > 0 ? "IN PROGRESS" : "INCOMPLETE";
-  lines.push(`${group.kind === "research" ? "Research" : "Execution"} ${group.executionId} ${disposition}: ${successful}/${total} ${successVerb}; ${incomplete.length} not ${successVerb}.`);
+  lines.push(`${subtaskGroupLabel(group.kind)} ${group.executionId} ${disposition}: ${successful}/${total} ${successVerb}; ${incomplete.length} not ${successVerb}.`);
   if (kind === "failure") {
     lines.push("The whole execution is not successfully complete. Use the task handles and states below to recover deliberately.");
   }
@@ -435,7 +453,7 @@ export function formatWatchEvent(inspections: SubtaskWatchInspectionSnapshot[], 
   const now = Date.now();
   for (const inspection of inspections) {
     const active = inspection.tasks.filter((task) => isActiveTaskState(task.state));
-    lines.push("", `${inspection.kind === "research" ? "Research" : "Execution"} ${inspection.executionId}: ${active.length} active task(s), revision ${inspection.revision}.`);
+    lines.push("", `${subtaskGroupLabel(inspection.kind)} ${inspection.executionId}: ${active.length} active task(s), revision ${inspection.revision}.`);
     for (const task of active) {
       const lastActivity = task.activity.at(-1);
       const lastAt = lastActivity?.at ?? task.updatedAt;
@@ -537,7 +555,7 @@ export interface WakeFailureDiagnosticInput {
 export function buildWakeFailureDiagnostic(input: WakeFailureDiagnosticInput): WakeFailureDiagnostic {
   const { group, task, content, conflictGate } = input;
   const live = group.tasks.find((candidate) => candidate.taskId === task.taskId) ?? task;
-  const successState: BackgroundTaskState = group.kind === "research" ? "reported" : "landed";
+  const successState: BackgroundTaskState = subtaskSuccessState(group.kind);
   const conflictManifestPath = conflictGate
     ? boundDiagnosticText(conflictGate.manifestPath, WAKE_FAILURE_MAX_CONFLICT_PATH) ?? ""
     : undefined;
@@ -554,6 +572,10 @@ export function buildWakeFailureDiagnostic(input: WakeFailureDiagnosticInput): W
     }
   } else if (group.kind === "execute" && !isActiveTaskState(live.state)) {
     suggestedActions.push(`No durable continuation bundle is available; SubtasksForceMerge (executionId ${group.executionId}, taskId ${task.taskId}) may still salvage an identified snapshot of the worker's retained work without a checkpoint — manual inspection required — or restart the task with SubtasksAdd if its outcome is still needed`);
+  } else if (group.kind === "inplace" && !isActiveTaskState(live.state)) {
+    // #220: an in-place task holds no checkpoint to force-merge — recovery is
+    // a same-workspace continuation or a fresh task, with manual inspection.
+    suggestedActions.push(`SubtasksContinue (executionId ${group.executionId}, taskId ${task.taskId}) to resume the worker in the same workspace (prior writes are NOT rolled back or verified), or inspect the workspace directly and restart with SubtasksAdd if the outcome is still needed`);
   } else {
     suggestedActions.push("No durable continuation bundle is available; inspect the execution record and restart the task with SubtasksAdd if its outcome is still needed");
   }
@@ -654,7 +676,7 @@ export function formatWakeFailureDiagnostic(diagnostic: WakeFailureDiagnostic): 
 
 /** Dedicated bounded preamble for failure notifications; built only from the curated diagnostic. */
 export function formatWakeFailurePreamble(diagnostic: WakeFailureDiagnostic): string {
-  const successVerb = diagnostic.kind === "research" ? "reported" : "landed";
+  const successVerb = subtaskSuccessVerb(diagnostic.kind);
   const lines = [
     `Task ${diagnostic.taskId} requires recovery attention at state ${diagnostic.taskState.toUpperCase()} in ${diagnostic.kind} execution ${diagnostic.executionId} (revision ${diagnostic.revision}).`,
     `Execution progress: ${diagnostic.groupSummary.settled}/${diagnostic.groupSummary.taskCount} task(s) ${successVerb}, ${diagnostic.groupSummary.active} active.`,

@@ -821,7 +821,7 @@ function scheduledTaskEntrySummary(entry: ScheduledTaskEntryConfig): string {
 }
 
 function scheduledTaskKindLabel(kind: ScheduledTaskKind): string {
-  return kind === "research" ? "research" : "execute";
+  return kind === "research" ? "research" : kind === "inplace" ? "in-place" : "execute";
 }
 
 /** Issue #222: editor row label for the per-entry schedule destination. */
@@ -1041,12 +1041,14 @@ async function editScheduledTaskEntry(
       const kindOptions = [
         `Execute — write-capable subtask${entry.kind === "execute" ? "  current" : ""}`,
         `Research — read-only subtask${entry.kind === "research" ? "  current" : ""}`,
+        `In-place — write in a selected directory (no capture/landing)${entry.kind === "inplace" ? "  current" : ""}`,
       ];
       const selected = await ui.select((entry.destination ?? "subtask") === "subtask"
         ? "Scheduled task kind"
         : "Scheduled task kind (used when the destination is Subtask)", kindOptions);
       if (selected?.startsWith("Execute")) setCatalogKey(catalog, id, { ...entry, kind: "execute" });
       else if (selected?.startsWith("Research")) setCatalogKey(catalog, id, { ...entry, kind: "research" });
+      else if (selected?.startsWith("In-place")) setCatalogKey(catalog, id, { ...entry, kind: "inplace" });
       continue;
     }
     if (choice === "destination") {
@@ -1163,7 +1165,7 @@ async function selectScheduledTaskWorker(
   // added earlier in the same unsaved visit is pickable, and one removed
   // earlier is not offered, matching what Save will persist.
   const eligible = Object.entries(workerResources)
-    .filter(([, value]) => entry.kind === "execute" || workerResourceSupportsResearch(config, value.selection));
+    .filter(([, value]) => entry.kind === "execute" || entry.kind === "inplace" || workerResourceSupportsResearch(config, value.selection));
   const rows = sortedCatalogKeys(Object.fromEntries(eligible) as WorkerResourceCatalog, config, scoped);
   const options = [
     `Inherit global route (current at run time)${entry.workerResourceId === undefined ? "  current" : ""}`,

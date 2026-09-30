@@ -8,6 +8,10 @@ import type { ExecutorAdapter, ExecutorRequest, ExecutorTurn } from "../types";
 
 export class RunAsBinaryExecutorAdapter implements ExecutorAdapter {
   readonly kind = "run-as-binary";
+  readonly toolEventObservability = {
+    mode: "unavailable",
+    description: "The run-as-binary protocol does not forward structured tool calls; tool-level write paths are not observed by this adapter.",
+  } as const;
   /**
    * The effective model of the actual invocation (execution-role override,
    * else the agent-level model). External agent ids are mutable handles, so

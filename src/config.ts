@@ -406,13 +406,11 @@ export interface ExecutionConfig {
 }
 
 /**
- * What a scheduled subtask runs: a write-capable subtask or a read-only
- * research one. The catalog stores the kind independently of the schedule
- * destination; additional scheduled subtask kinds may be introduced later
- * (for example an in-place worker kind) without changing either the
- * destination type or the subtask dispatch path.
+ * What a scheduled subtask runs: an isolated write-capable task, read-only
+ * research, or an in-place worker (#220). Kind is independent of the
+ * schedule destination; orchestrator turns do not dispatch a worker.
  */
-export type ScheduledTaskKind = "execute" | "research";
+export type ScheduledTaskKind = "execute" | "research" | "inplace";
 
 /**
  * Where a due scheduled entry is delivered (issue #222). "subtask" is the
@@ -730,7 +728,8 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
  * what authorizes the selection — route membership would defeat the entry's
  * independence from later route edits. Research capability is still enforced,
  * because a scheduled research task must not dispatch to an executor resource
- * that cannot perform research.
+ * that cannot perform research. In-place entries (#220) dispatch to the same
+ * write-capable executor pool as execute entries and need no extra capability.
  *
  * Issue #222: worker-resource references are validated only for entries that
  * still dispatch as scheduled subtasks. An orchestrator-turn entry resolves
@@ -775,8 +774,8 @@ function normalizeScheduledTasks(value: unknown): ScheduledTaskCatalog {
       throw new Error(`scheduledTasks.${id}.enabled must be a boolean`);
     }
     const kind = entry.kind === undefined ? "execute" : entry.kind;
-    if (kind !== "execute" && kind !== "research") {
-      throw new Error(`scheduledTasks.${id}.kind must be execute or research`);
+    if (kind !== "execute" && kind !== "research" && kind !== "inplace") {
+      throw new Error(`scheduledTasks.${id}.kind must be execute, research, or inplace`);
     }
     const destination = entry.destination === undefined ? undefined : entry.destination;
     if (destination !== undefined && destination !== "subtask" && destination !== "orchestrator-turn") {
@@ -1225,11 +1224,16 @@ export function resolvedWorkerResources(config: ReviewGateConfig): ExecutorPoolE
 /**
  * Resolve one role's ordered route against the keyed catalog. Missing or empty
  * routes mean no models for that role; there is no fallback to catalog order.
+ * The `inplace` kind (#220) intentionally resolves through the `execute`
+ * route: in-place workers are write-capable executors drawn from the same
+ * execution priority in the same shared pool, running directly in the
+ * selected workspace instead of a managed worktree.
  * Research additionally enforces capability: an explicit route entry cannot
  * widen what the research role may use, so unsupported selections are omitted
  * even when a route names them directly.
  */
-export function resolvedWorkerRoute(config: ReviewGateConfig, kind: "execute" | "research"): ExecutorPoolEntry[] {
+export function resolvedWorkerRoute(config: ReviewGateConfig, kind: "execute" | "research" | "inplace"): ExecutorPoolEntry[] {
+  if (kind === "inplace") return resolvedWorkerRoute(config, "execute");
   const configured = config.execution?.routes?.[kind];
   if (!configured || configured.length === 0) return [];
   return configured.flatMap((route) => {

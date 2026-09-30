@@ -24,6 +24,20 @@ export interface ExecutorTurn {
   };
 }
 
+export interface ExecutorToolObservation {
+  stage: "start" | "end";
+  toolName: string;
+  toolInput?: Record<string, unknown>;
+  result?: unknown;
+  isError?: boolean;
+  /** Adapter-local tool-use id when its stream supplies one. */
+  observationId?: string;
+}
+
+export type ExecutorToolEventObservability =
+  | { mode: "structured"; description: string }
+  | { mode: "unavailable"; description: string };
+
 export interface ExecutorRequest {
   cwd: string;
   prompt: string;
@@ -41,6 +55,8 @@ export interface ExecutorRequest {
     compactBeforePrompt?: boolean;
   };
   onUpdate?: (text: string) => void;
+  /** Optional structured adapter event stream; observational only, not a pre-write acknowledgement. */
+  onToolObservation?: (event: ExecutorToolObservation) => void;
   onProcessStart?: (process: { pid: number; processGroupId?: number }) => void | Promise<void>;
   onProcessExit?: (process: { pid: number; processGroupId?: number; code: number | null; signal: NodeJS.Signals | null }) => void | Promise<void>;
   /**
@@ -87,6 +103,7 @@ export interface ExecutorLiveControl {
 export interface ExecutorAdapter {
   readonly kind: string;
   readonly model?: string;
+  readonly toolEventObservability?: ExecutorToolEventObservability;
   run(request: ExecutorRequest): Promise<ExecutorTurn>;
 }
 
@@ -144,10 +161,17 @@ export interface SubtaskDispatchRecord {
   dispatchedAt: string;
   /** Exact prompt text handed to the executor transport. */
   sentPrompt: string;
-  /** Isolated worker worktree the dispatched prompt's paths were rewritten to. */
+  /**
+   * Isolated worker worktree the dispatched prompt's paths were rewritten to.
+   * #220: for an in-place dispatch this is the launch-selected workspace the
+   * worker runs and writes in directly (never a managed worktree), and
+   * `inPlace` is set while `baseCommit` stays empty — no capture exists.
+   */
   worktreeRoot: string;
   /** Captured base commit the isolated worktree was created from (target checkout captured this base). */
   baseCommit: string;
+  /** #220: true only for dispatches that run an in-place worker (no capture/landing, no base commit). */
+  inPlace?: true;
   /** Executor turn this prompt was sent for (1 for the initial dispatch). */
   executorTurn: number;
   /** Adapter that delivered the prompt, when known at the boundary. */

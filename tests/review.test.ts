@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,7 +11,7 @@ import {
   type ReviewGateConfig,
 } from "../src/config";
 import { compareSnapshots, createWorkspaceSnapshot, type FileSnapshot, type WorkspaceSnapshot } from "../src/capture";
-import { createEvidenceState, recordAcceptedReviewerQuestion, recordToolCallEvidence } from "../src/evidence";
+import { createEvidenceState, recordAcceptedReviewerQuestion, recordObservedToolEventEvidence, recordToolCallEvidence } from "../src/evidence";
 import { collectPausedReviewExchange, runAskReviewer, runReview } from "../src/review";
 import { SessionStateStore } from "../src/session-state";
 import {
@@ -111,6 +111,67 @@ test("runReview skips reviewer when no files changed", async () => {
     assert.equal(output.result, undefined);
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("runReview invokes a reviewer for external evidence on an unchanged observation exchange", async () => {
+  const scratch = await mkdtemp(join(process.cwd(), ".pi-review-external-evidence-"));
+  const workspace = join(scratch, "workspace");
+  const externalPath = join(scratch, "outside-write.txt");
+  const reviewerPrompt = join(scratch, "reviewer-prompt.txt");
+  try {
+    await mkdir(workspace, { recursive: true });
+    await writeFile(externalPath, "outside-root write\n", "utf8");
+    const before = await createWorkspaceSnapshot(workspace, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    const evidence = createEvidenceState();
+    recordObservedToolEventEvidence({
+      state: evidence,
+      cwd: workspace,
+      selectedRoot: workspace,
+      adapter: "pi-model",
+      stage: "end",
+      toolName: "write",
+      toolInput: { path: externalPath },
+      result: "wrote outside file",
+    });
+    const state = createState();
+    beginAgentRun(state);
+    setReviewWindowBaseline(state, before);
+    state.reviewWindow!.activeExchange!.reviewResponseMode = "observation";
+    const config: ReviewGateConfig = {
+      ...baseConfig,
+      externalAgents: {
+        "external-evidence": {
+          adapter: "generic-cli",
+          command: process.execPath,
+          args: [],
+          review: {
+            args: ["-e", [
+              "const fs=require('node:fs');let prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>prompt+=c);",
+              `process.stdin.on('end',()=>{fs.writeFileSync(${JSON.stringify(reviewerPrompt)},prompt);process.stdout.write(JSON.stringify({verdict:'pass',summary:'external evidence reviewed',findings:[]}));});`,
+            ].join("\n")],
+            timeoutMs: 15_000,
+          },
+        },
+      },
+      review: { activeReviewers: [{ source: "external", id: "external-evidence" }] },
+    };
+    const output = await runReview({
+      cwd: workspace,
+      request: "review the observed outside-root write",
+      before,
+      config,
+      evidence,
+      window: state.reviewWindow,
+    });
+    assert.equal(output.result?.verdict, "pass");
+    assert.equal(output.noReviewReason, undefined);
+    assert.ok((await readFile(reviewerPrompt, "utf8")).includes(externalPath));
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
   }
 });
 

@@ -21,6 +21,9 @@ import { EVIDENCE_REVIEW_RECORD_BYTES, type IndexedSource, type RawEvidenceRecor
 
 const REVIEW_AGGREGATES = new Set(["pass", "pass_with_warnings", "needs_changes", "error"]);
 
+/** The only wave identity an in-place review record may carry (#220). */
+export const INPLACE_REVIEW_WAVE_ID = "inplace";
+
 /** File name of one durable review cycle record under reviews/<waveId>/. */
 export const REVIEW_CYCLE_RECORD_NAME = /^cycle-\d{6}\.json$/;
 /** File name of a publication-failure marker for one completed cycle. */
@@ -34,7 +37,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * Structural validation and ownership check for one durable review cycle
  * record. Returns the record only when it is a valid v1 record that belongs
  * to this task AND whose wave identity matches the directory it was found
- * in; anything else is refused, never guessed at.
+ * in; anything else is refused, never guessed at. In-place records (#220)
+ * are accepted when they replace the commit identity with the in-place
+ * marker, the "inplace" wave identity, and a bounded attribution basis.
  */
 function validateReviewCycleRecord(
   value: unknown,
@@ -48,10 +53,34 @@ function validateReviewCycleRecord(
   if (!Number.isInteger(value.reviewSequence) || (value.reviewSequence as number) < 1) return undefined;
   if (typeof value.completedAt !== "string" || Number.isNaN(Date.parse(value.completedAt))) return undefined;
   const candidate = value.candidate;
-  if (!isRecord(candidate)
-    || typeof candidate.commitSha !== "string"
-    || typeof candidate.treeSha !== "string"
-    || typeof candidate.ref !== "string") return undefined;
+  const hasCandidateIdentity = isRecord(candidate)
+    && typeof candidate.commitSha === "string"
+    && typeof candidate.treeSha === "string"
+    && typeof candidate.ref === "string";
+  // #220: an in-place cycle record carries the recorded attribution basis
+  // (workspace root, launch baseline, workspace delta since launch) instead of
+  // a candidate commit identity; in-place tasks have no candidate by design.
+  const isPlaceRecord = value.inPlace === true && waveName === INPLACE_REVIEW_WAVE_ID;
+  if (isPlaceRecord) {
+    const attribution = value.attribution;
+    const baseline = isRecord(attribution) ? attribution.baseline : undefined;
+    const attributionEntries = isRecord(attribution) && Array.isArray(attribution.changedSinceLaunch)
+      ? attribution.changedSinceLaunch as unknown[]
+      : undefined;
+    const hasAttributionIdentity = isRecord(attribution)
+      && typeof attribution.workspaceRoot === "string"
+      && isRecord(baseline)
+      && typeof baseline.mode === "string"
+      && typeof baseline.capturedAt === "string"
+      && attributionEntries !== undefined
+      && attributionEntries.every((entry) =>
+        isRecord(entry)
+        && typeof (entry as Record<string, unknown>).status === "string"
+        && typeof (entry as Record<string, unknown>).path === "string");
+    if (!hasAttributionIdentity) return undefined;
+  } else if (!hasCandidateIdentity) {
+    return undefined;
+  }
   if (typeof value.aggregate !== "string" || !REVIEW_AGGREGATES.has(value.aggregate)) return undefined;
   if (typeof value.summary !== "string") return undefined;
   if (!Array.isArray(value.reviewers) || value.reviewers.length === 0) return undefined;
@@ -149,7 +178,13 @@ export async function indexReviewCycleSource(
   }
 
   const at = record.completedAt as string;
-  const candidate = record.candidate as Record<string, unknown>;
+  // #220: in-place records carry the attribution basis instead of a candidate
+  // identity; wave records keep their own provenance fields untouched.
+  const isPlaceRecord = record.inPlace === true;
+  const candidate = record.candidate as Record<string, unknown> | undefined;
+  const attribution = isPlaceRecord ? record.attribution as Record<string, unknown> : undefined;
+  const candidateRef = candidate?.ref;
+  const candidateCommit = candidate?.commitSha;
   retain("cycle", "lifecycle", at, compactJson({
     source: "official_review",
     cycle: record.cycle,
@@ -158,8 +193,15 @@ export async function indexReviewCycleSource(
     aggregate: record.aggregate,
     summary: record.summary,
     completedAt: at,
-    candidateRef: candidate.ref,
-    candidateCommit: candidate.commitSha,
+    ...(candidateRef !== undefined ? { candidateRef } : {}),
+    ...(candidateCommit !== undefined ? { candidateCommit } : {}),
+    ...(attribution !== undefined ? {
+      attribution: {
+        workspaceRoot: attribution.workspaceRoot,
+        baseline: attribution.baseline,
+        changedSinceLaunch: attribution.changedSinceLaunch,
+      },
+    } : {}),
   }));
   for (const reviewer of record.reviewers as Array<Record<string, unknown>>) {
     const findings = (reviewer.findings as Array<Record<string, unknown>>).map((finding, index) => ({
@@ -175,8 +217,11 @@ export async function indexReviewCycleSource(
       cycle: record.cycle,
       waveId: record.waveId,
       reviewSequence: record.reviewSequence,
-      candidateRef: candidate.ref,
-      candidateCommit: candidate.commitSha,
+      ...(candidateRef !== undefined ? { candidateRef } : {}),
+      ...(candidateCommit !== undefined ? { candidateCommit } : {}),
+      ...(attribution !== undefined ? {
+        attribution: attribution.workspaceRoot,
+      } : {}),
       aggregate: record.aggregate,
       reviewer: {
         id: reviewer.reviewerId,

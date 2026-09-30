@@ -188,7 +188,7 @@ function startAddCard(details: Record<string, any>, args: Record<string, any> | 
   const tasks = details.action === "add" && addedIds && addedIds.length > 0
     ? allTasks.filter((task) => addedIds.includes(task.taskId))
     : allTasks;
-  const kind = details.kind === "research" ? "research" : "execution";
+  const kind = details.kind === "research" ? "research" : details.kind === "inplace" ? "in-place" : "execution";
   const dispatchView = isRecord(details.dispatchView) ? details.dispatchView : undefined;
   // The target checkout, never the execution's temporary record-storage
   // directory (details.root): the live projection carries the resolved target,
@@ -227,8 +227,10 @@ function startAddCard(details: Record<string, any>, args: Record<string, any> | 
       );
       const base = typeof dispatch.baseCommit === "string" ? dispatch.baseCommit.slice(0, 12) : "";
       lines.push(...bodyLines([
-        `dispatch: prompt delivered to transport · worker worktree ${stringOr(dispatch.worktreeRoot, "(unrecorded)")}`
-        + ` · captured base ${base || "(unrecorded)"} · turn ${typeof dispatch.executorTurn === "number" ? dispatch.executorTurn : "?"}`
+        dispatch.inPlace === true
+          ? `dispatch: prompt delivered to transport · in-place workspace ${stringOr(dispatch.worktreeRoot, "(unrecorded)")} (no captured base commit) · turn ${typeof dispatch.executorTurn === "number" ? dispatch.executorTurn : "?"}`
+          : `dispatch: prompt delivered to transport · worker worktree ${stringOr(dispatch.worktreeRoot, "(unrecorded)")}`
+            + ` · captured base ${base || "(unrecorded)"} · turn ${typeof dispatch.executorTurn === "number" ? dispatch.executorTurn : "?"}`
         + (redispatched ? " · re-dispatched after recovery (latest actual dispatch shown)" : ""),
       ], undefined, 2));
     } else if ((live?.state ?? task.state) === "queued") {

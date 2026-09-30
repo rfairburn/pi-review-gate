@@ -65,6 +65,10 @@ export interface ClaudeExecutorDependencies {
 /** Claude executor using the official Agent SDK streaming control surface. */
 export class ClaudeExecutorAdapter implements ExecutorAdapter {
   readonly kind = "claude-cli";
+  readonly toolEventObservability = {
+    mode: "structured",
+    description: "Claude Agent SDK assistant tool_use and user tool_result blocks are forwarded; delivery may race the child mutation, so prior state is not verified.",
+  } as const;
   readonly model?: string;
 
   constructor(
@@ -180,6 +184,7 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
     query = sdk.query({ prompt: input, options });
     const activeQuery = query;
     const unmatchedResults = new Map<string, SDKResultMessage>();
+    const toolUses = new Map<string, { toolName: string; toolInput: Record<string, unknown> }>();
     let settleNow: (() => void) | undefined;
     const resultPromise = new Promise<void>((resolveSettlement) => {
       settleNow = resolveSettlement;
@@ -190,6 +195,7 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
             stdout.append(line);
             parser.push(line);
             activity.push(line);
+            forwardClaudeToolObservations(message, request.onToolObservation, toolUses);
             if (typeof message.session_id === "string") effectiveSessionId = message.session_id;
             if (message.type === "result") {
               const resultUuid = "user_message_uuid" in message && typeof message.user_message_uuid === "string"
@@ -491,6 +497,53 @@ async function consumeMessages(
     const line = `${JSON.stringify(message)}\n`;
     if (onMessage(message, line)) return;
   }
+}
+
+function forwardClaudeToolObservations(
+  message: SDKMessage,
+  onObservation: ExecutorRequest["onToolObservation"],
+  toolUses: Map<string, { toolName: string; toolInput: Record<string, unknown> }>,
+): void {
+  if (!onObservation) return;
+  const value = message as unknown as Record<string, unknown>;
+  const payload = isRecord(value.message) ? value.message : undefined;
+  const content = payload?.content;
+  if (!Array.isArray(content)) return;
+  if (value.type === "assistant") {
+    for (const block of content) {
+      if (!isRecord(block) || block.type !== "tool_use" || typeof block.name !== "string") continue;
+      const toolInput = isRecord(block.input) ? block.input : {};
+      const id = typeof block.id === "string" ? block.id : undefined;
+      if (id) toolUses.set(id, { toolName: block.name, toolInput });
+      onObservation({
+        stage: "start",
+        toolName: block.name,
+        toolInput,
+        ...(id ? { observationId: id } : {}),
+      });
+    }
+    return;
+  }
+  if (value.type === "user") {
+    for (const block of content) {
+      if (!isRecord(block) || block.type !== "tool_result") continue;
+      const id = typeof block.tool_use_id === "string" ? block.tool_use_id : undefined;
+      const prior = id ? toolUses.get(id) : undefined;
+      onObservation({
+        stage: "end",
+        toolName: prior?.toolName ?? "tool_result",
+        ...(prior ? { toolInput: prior.toolInput } : {}),
+        result: block.content,
+        isError: block.is_error === true,
+        ...(id ? { observationId: id } : {}),
+      });
+      if (id) toolUses.delete(id);
+    }
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function messageOf(error: unknown): string {

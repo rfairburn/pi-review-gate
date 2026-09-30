@@ -15,6 +15,19 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.92]
+
+### Changed
+
+- Update the pinned `ddgs` web-search dependency from `9.15.0` to `9.16.0`
+  (issue #206). Both launch paths — the Unix `scripts/ensure-ddgs.sh` and the
+  native Windows launcher — now provision, validate, and export the same exact
+  version in the versioned managed venv (`ddgs-9.16.0`). The isolated-mode
+  Python invocation, exact-version validation, `pip check`, binary-only
+  installation, fail-closed provisioning, and the search helper's query and
+  result contract are unchanged; no code or configuration changes beyond the
+  synchronized version pin, documentation, and test expectations were required.
+
 ## [0.1.0-dev.91]
 
 ### Added

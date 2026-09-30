@@ -1674,12 +1674,12 @@ test("launcher initialization rejects a destination occupied by a directory", as
 
 test("helper ddgs python path follows the platform venv layout", () => {
   assert.equal(
-    helperModule.ddgsPythonPath("C:\\cache\\ddgs-9.15.0", "win32"),
-    "C:\\cache\\ddgs-9.15.0\\Scripts\\python.exe",
+    helperModule.ddgsPythonPath("C:\\cache\\ddgs-9.16.0", "win32"),
+    "C:\\cache\\ddgs-9.16.0\\Scripts\\python.exe",
   );
   assert.equal(
-    helperModule.ddgsPythonPath("/home/r/.cache/ddgs-9.15.0", "linux"),
-    "/home/r/.cache/ddgs-9.15.0/bin/python",
+    helperModule.ddgsPythonPath("/home/r/.cache/ddgs-9.16.0", "linux"),
+    "/home/r/.cache/ddgs-9.16.0/bin/python",
   );
 });
 

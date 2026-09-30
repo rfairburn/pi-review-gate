@@ -15,6 +15,17 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.97]
+
+### Changed
+
+- Decompose the in-place worker into cohesive lifecycle, baseline, evidence,
+  prompt, review-record and settlement owners behind its unchanged public
+  facade (#252, audit #46). The coordinator retains branch-specific settlement
+  and review catch/finally ordering; immediate writes, original-root/baseline
+  continuity, retry/failover, serialized records, review policy and recovery
+  behavior remain unchanged.
+
 ## [0.1.0-dev.96]
 
 ### Fixed

@@ -15,6 +15,17 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.100]
+
+### Changed
+
+- Decompose background execution into cohesive lifecycle, parent-checkpoint,
+  wake-delivery, salvage, scheduling and indicator owners (#237, audit #46).
+  The controller retains authoritative records, leases, serialization tails,
+  command transitions and transaction boundaries. Public APIs, task-kind
+  distinctions, launch/outcome ordering, cancellation and settlement, durable
+  recovery, scoped gates, notices and review/retirement proofs are unchanged.
+
 ## [0.1.0-dev.99]
 
 ### Changed

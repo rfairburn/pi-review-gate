@@ -1,22 +1,19 @@
 import { randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
-import { mkdtemp, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import type { ExecutorPoolEntry, ExecutorSelection, ReviewGateConfig, ScheduledTaskReviewOverride } from "../config";
+import type { ExecutorPoolEntry, ReviewGateConfig, ScheduledTaskReviewOverride } from "../config";
 import {
-  effectiveReviewSettings,
   resolvedWorkerResource,
   resolvedWorkerResources,
   resolvedWorkerRoute,
   workerResourceSupportsResearch,
 } from "../config";
 import { expandHomePath } from "../apply-patch/paths";
-import { createWorkspaceSnapshot, type FileSnapshot, type WorkspaceSnapshot } from "../capture";
-import { activeExchangeBaseline, checkpointReviewWindow, ownedReviewCheckpointDescriptors, snapshotOfReviewBaseline, type ReviewBaseline, type ReviewGateState, type UnifiedReviewBaseline } from "../state";
-import { advanceGitCheckpoint, compareToGitCheckpoint, loadGitCheckpoint } from "../git-checkpoint";
-import { advanceRawReviewCheckpoint, changedRawCheckpointPaths, releaseReviewCheckpoint, reviewCheckpointWorkspaceRoot, type ReviewCheckpointDescriptor } from "../review-checkpoint";
-import { configDigest, reviewCheckpointDescriptorIdentity, type ExecutionAssociationsSnapshot } from "../session-state";
+import { createWorkspaceSnapshot, type WorkspaceSnapshot } from "../capture";
+import { activeExchangeBaseline, type ReviewBaseline, type ReviewGateState } from "../state";
+import { type ReviewCheckpointDescriptor } from "../review-checkpoint";
+import { configDigest, type ExecutionAssociationsSnapshot } from "../session-state";
 import { materializeLandingConflicts } from "./conflict-materialization";
 import { ConflictGateStore, cloneConflictGate, type ConflictGate as BackgroundConflictGate } from "./conflict-gate-store";
 import {
@@ -32,10 +29,10 @@ import {
   type BackgroundExecutionGroup,
   type PriorArchiveRecord,
 } from "./background-group-store";
-import { ExecutorPoolScheduler, type ExecutorPoolAssignment, type ExecutorPoolLease } from "./executor-pool";
-import { continueOperation, inspectOperation, readVerifiedAcceptedResult, verifyInPlaceContinuation, verifyRecoveryCheckpoint } from "./operation-actions";
+import { ExecutorPoolScheduler, type ExecutorPoolLease } from "./executor-pool";
+import { inspectOperation, readVerifiedAcceptedResult, verifyInPlaceContinuation, verifyRecoveryCheckpoint } from "./operation-actions";
 import type { OperationRecord, ReattachmentBundle } from "./operation-record";
-import { createIncident, createReattachmentBundle, operationOwnershipStatus, readOperationRecord, writeOperationRecord } from "./operation-record";
+import { createReattachmentBundle, operationOwnershipStatus, readOperationRecord } from "./operation-record";
 import { resolveArtifactRoot } from "./evidence/sources";
 import { buildSubtaskEvidence, readConfinedOperationRecord, readSubtaskEvidence, type SubtaskEvidenceRead, type SubtaskEvidenceSelector, type SubtaskEvidenceUnavailable } from "./subtask-evidence";
 import { sourceMutationCoordinator } from "./source-mutation-lease";
@@ -45,18 +42,13 @@ import {
   isActiveTaskState,
   isArchivableTaskState,
   isInPlaceKind,
-  isWriteCapableKind,
   MAX_ACTIVITY,
   newTask,
   salvageEvidenceRequiresRetention,
-  stateFromContinuationProgress,
-  stateFromWaveProgress,
   taskTiming,
   transitionTaskState,
   workerRouteKeyForKind,
-  isStoppedForExit,
   type BackgroundActivityEvent,
-  type ForceMergeSalvageProvenance,
   type BackgroundCommandRecord,
   type BackgroundTaskDefinition,
   type BackgroundTaskKind,
@@ -64,50 +56,54 @@ import {
   type BackgroundTaskState,
   type BackgroundTaskTimingSummary,
 } from "./task-state";
-import { renderSubtaskWidget } from "./subtask-widget";
 import {
-  buildWakeFailureDiagnostic,
-  capNotificationText,
+  captureSalvageSource,
+  describeSalvageSource,
+  identifyWorkBeyondCheckpoint,
+  landedReviewStatusOf,
+  recordSalvageProvenanceIncident,
+  resolveUnverifiedForceMergeBundle,
+  salvageProvenanceFor,
+  sameWorkspaceGate,
+  type ForceMergeLandingSource,
+  type LandedReviewStatus,
+} from "./force-merge-salvage";
+import { deriveGroupConfig, resolveGroupRoute } from "./scheduled-group-config";
+import { ParentCheckpointLedger, type ParentCheckpointSaveResult } from "./parent-checkpoint-ledger";
+import { WakeDelivery } from "./wake-delivery";
+import { SubtaskIndicator } from "./subtask-indicator";
+import { runResearchContinuation, runResearchFresh, researchWorktree } from "./research-task-lifecycle";
+import { runInPlaceTaskContinuation, runInPlaceTaskFresh } from "./inplace-task-lifecycle";
+import { runWaveTaskContinuation, runWaveTaskFresh } from "./wave-task-lifecycle";
+import type {
+  LifecycleActivity,
+  LifecycleBookkeeping,
+  LifecycleConfig,
+  LifecycleDispatch,
+  LifecycleExecutor,
+  LifecycleGates,
+  LifecycleIndicator,
+  LifecycleLiveControl,
+  LifecyclePersistence,
+  LifecycleSteering,
+  LifecycleWake,
+  PersistedGroupRevision,
+  RuntimeTaskHandle,
+} from "./task-lifecycle-services";
+import type { InPlaceLifecycleDeps } from "./inplace-task-lifecycle";
+import type { ResearchLifecycleDeps } from "./research-task-lifecycle";
+import type { WaveLifecycleDeps } from "./wave-task-lifecycle";
+import {
   completionGroupAggregateLines,
-  formatExecutionEvent,
-  formatResearchCompletion,
-  formatWakeFailureDiagnostic,
-  formatWakeFailurePreamble,
-  formatWatchEvent,
-  isActionableWakeKind,
-  isQuietSuppressedWake,
   isToolResultConfirmedCompletionWake,
-  notificationLane,
-  deliveryForLane,
-  stateTransitionNotice,
-  subtaskNotificationMode,
-  watchCheckpointDelivery,
-  WAKE_FAILURE_NOTIFICATION_CAP,
   type SubtaskWakeActor,
 } from "./subtask-notifications";
 import { notifyDispatchCards } from "./dispatch-cards";
-import type { ContinuationProgressUpdate, ExecutorInteractionAcknowledgement, ExecutorLiveControl, SubtaskDispatchRecord } from "./types";
-import { executeWave, type WaveProgressUpdate, type WaveResult, type WaveTaskResult } from "./wave-controller";
-import { resumeWaveWorker, runWaveWorker, type WaveWorkerResult } from "./wave-worker";
-import { runInplaceLifecycle, type InPlaceLifecycleResult, type InPlaceLifecycleStatus } from "./inplace-worker";
-import { captureWaveBase, discoverWaveSource, readWaveCaptureRecord, type WaveCaptureResult } from "./wave-repository";
+import type { ExecutorInteractionAcknowledgement, ExecutorLiveControl, SubtaskDispatchRecord } from "./types";
+import { readWaveCaptureRecord } from "./wave-repository";
 import { executeWaveLanding, planWaveLanding } from "./wave-landing";
-import {
-  buildAttributedCandidateTree,
-  buildSalvageCommit,
-  captureWorktreeSnapshot,
-  evaluateCandidateAgainstCheckpoint,
-  incidentBranchNames,
-  listSalvageRefCandidates,
-  salvageRefCandidate,
-  salvageWorktreeCandidate,
-  selectSalvageSource,
-  treeShaOf,
-  type SalvageCandidateIdentity,
-} from "./salvage";
-import { researchWorkspaceChanges, waveLineageOf } from "./wave-commits";
+import { waveLineageOf } from "./wave-commits";
 import { pinCommit } from "./wave-worktrees";
-import { createWorkerWorktree, type WorkerWorktree } from "./wave-worktrees";
 import type { StartLiveness } from "../tool-call-fingerprint";
 
 /**
@@ -149,10 +145,32 @@ export type {
   BackgroundTaskTimingSummary,
 } from "./task-state";
 export type { BackgroundExecutionGroup } from "./background-group-store";
+// #237: the parent-checkpoint ownership ledger lives in
+// ./parent-checkpoint-ledger; the session writer's receipt protocol keeps its
+// original public surface via the re-exports below.
+export { acknowledgeOwnerRetiringSave } from "./parent-checkpoint-ledger";
+export type { ParentCheckpointSaveResult } from "./parent-checkpoint-ledger";
+// #237: the in-place completion prose helpers ship from their lifecycle home
+// (./inplace-task-lifecycle); the original public surface is preserved here.
+export {
+  INPLACE_COMPLETION_MAX_NAMED_PATHS,
+  buildInPlaceCompletionLines,
+  formatInPlaceChangedPaths,
+  formatInPlaceExternalPaths,
+  inPlaceChangedLine,
+  inPlaceExternalLine,
+  inPlaceFailureError,
+  inPlaceLimitLines,
+  inPlaceReviewDisposition,
+} from "./inplace-task-lifecycle";
 // #154: conflict-gate storage/validation moved to ./conflict-gate-store; the
 // original public surface of this module is preserved via the re-export below.
 export type { ConflictGate as BackgroundConflictGate } from "./conflict-gate-store";
 
+/** Durable forced-salvage provenance and landing-source identity live in
+ *  ./force-merge-salvage; pure scheduled route/config derivations live in
+ *  ./scheduled-group-config. The controller keeps consuming them at their
+ *  existing call points. */
 const RECENT_ACTIVITY_LIMIT = 10;
 
 export interface BackgroundForceMergeInput {
@@ -203,13 +221,6 @@ interface RecentBackgroundActivity {
   event: BackgroundActivityEvent;
 }
 
-interface RuntimeTask {
-  abort: AbortController;
-  promise: Promise<void>;
-  control?: ExecutorLiveControl;
-  controlStatus: "pending" | "registered" | "closed";
-}
-
 /** A force-merge request that is not a runtime task but must stay cancellable. */
 interface PendingForceMerge {
   abort: AbortController;
@@ -217,139 +228,6 @@ interface PendingForceMerge {
   done: Promise<void>;
   /** True once the source mutation lease has been acquired. */
   acquired: boolean;
-}
-
-/**
- * #126: the landing source an explicit force-merge resolved to.
- * `checkpoint` is the ordinary verified-checkpoint path (unchanged behavior);
- * `forced_checkpoint` is an explicit override of a lifecycle refusal against a
- * genuinely verified checkpoint; `salvage` is an identified snapshot of actual
- * worker work captured without any ordinary checkpoint, or — when newer
- * retained work provably subsumes one — the snapshot that supersedes it.
- */
-type ForceMergeLandingSource =
-  | { kind: "checkpoint"; commitSha: string; ref: string }
-  | { kind: "forced_checkpoint"; commitSha: string; ref: string; reason: string }
-  | { kind: "salvage"; candidate: SalvageCandidateIdentity; supersededCheckpoint?: { commitSha: string; ref: string } };
-
-/** Human-readable description of where a salvaged landing came from. */
-function describeSalvageSource(source: ForceMergeLandingSource): string {
-  if (source.kind !== "salvage") return "its verified checkpoint";
-  const candidate = source.candidate;
-  if (candidate.sourceKind === "worktree") {
-    const where = candidate.branchName
-      ? `branch "${candidate.branchName}"`
-      : `head ${candidate.headSha?.slice(0, 12) ?? "unknown"}`;
-    return `the retained worker worktree (${where})`;
-  }
-  return `retained ref ${candidate.refName ?? "unknown"}`;
-}
-
-/**
- * #175: subtask-review status established from a landing's settled outcome.
- * `reviewed` is true only when the outcome provably carries a successful
- * subtask review (an accepted/accepted_with_warnings result whose final
- * recorded review cycle passed). `uncertain` marks outcomes whose review
- * status cannot be established from the evidence: callers fail closed by
- * keeping the landed diff in the primary review window and reporting the
- * uncertainty, never by guessing a review status or fabricating a PASS.
- */
-interface LandedReviewStatus {
-  reviewed: boolean;
-  uncertain?: boolean;
-  detail?: string;
-}
-
-/**
- * #175: establish the subtask-review status of a landing outcome from the
- * settled subtask result (status, explicit unreviewed flag, review cycles)
- * and, for explicit force-merges, the landing source: a forced checkpoint or
- * salvage carries no review success by construction, while an ordinary
- * verified-checkpoint force-merge inherits the settled result's review
- * status. Unknown evidence fails closed (unreviewed + uncertain).
- */
-function landedReviewStatusOf(
-  result:
-    | { status?: string; unreviewed?: boolean; reviewCycles?: ReadonlyArray<{ verdict?: string }> }
-    | undefined,
-  forceMergeSource?: ForceMergeLandingSource,
-): LandedReviewStatus {
-  if (forceMergeSource && forceMergeSource.kind !== "checkpoint") {
-    return {
-      reviewed: false,
-      detail: forceMergeSource.kind === "forced_checkpoint"
-        ? "explicitly forced checkpoint landing; no review success is asserted"
-        : "salvage landing; no ordinary checkpoint or review behind it",
-    };
-  }
-  if (!result) {
-    return { reviewed: false, uncertain: true, detail: "no settled subtask result evidence" };
-  }
-  if (result.status === "completed_unreviewed" || result.unreviewed === true) {
-    return { reviewed: false, detail: "subtask completed unreviewed" };
-  }
-  if (result.status === "accepted" || result.status === "accepted_with_warnings") {
-    const finalCycle = result.reviewCycles?.at(-1);
-    if (finalCycle?.verdict === "pass") return { reviewed: true };
-    return {
-      reviewed: false,
-      uncertain: true,
-      detail: "accepted result without a passing final review cycle",
-    };
-  }
-  return {
-    reviewed: false,
-    uncertain: true,
-    detail: `unrecognized subtask outcome status ${typeof result.status === "string" ? result.status : "missing"}`,
-  };
-}
-
-/** #175: synchronous same-workspace identity test for conflict-gate review
- *  readiness (the sync twin of checkpointParent's realpath guard). An
- *  identity-resolution error fails closed by treating the gate as
- *  same-workspace, keeping the review blocker. */
-function sameWorkspaceGate(sourceRoot: string, cwd: string): boolean {
-  try {
-    return realpathSync(sourceRoot) === realpathSync(cwd);
-  } catch {
-    return true;
-  }
-}
-
-/** Durable forced-salvage provenance for a force-merge whose source is not the
- * ordinary verified checkpoint. Undefined for that ordinary path, which
- * records no salvage. */
-function salvageProvenanceFor(
-  source: ForceMergeLandingSource,
-  commitSha: string,
-  checkpoint?: { changedPaths?: string[] },
-): ForceMergeSalvageProvenance | undefined {
-  if (source.kind === "checkpoint") return undefined;
-  const superseded = source.kind === "salvage" ? source.supersededCheckpoint : undefined;
-  return {
-    reason: source.kind === "forced_checkpoint"
-      ? source.reason
-      : superseded
-        ? `verified checkpoint ${superseded.ref} (${superseded.commitSha.slice(0, 12)}) superseded by identified newer retained work; salvaged from ${describeSalvageSource(source)}`
-        : `no ordinary verified checkpoint; salvaged from ${describeSalvageSource(source)}`,
-    sourceKind: source.kind === "forced_checkpoint" ? "verified_checkpoint" : source.candidate.sourceKind,
-    ...(superseded ? { supersededCheckpoint: superseded } : {}),
-    ...(source.kind === "salvage" && source.candidate.branchName ? { branchName: source.candidate.branchName } : {}),
-    ...(source.kind === "salvage" && source.candidate.headSha ? { headSha: source.candidate.headSha } : {}),
-    ...(source.kind === "salvage" && source.candidate.refName ? { refName: source.candidate.refName } : {}),
-    candidateCommit: commitSha,
-    candidateRef: source.kind === "salvage" ? source.candidate.candidateRef : source.ref,
-    attributedPaths: source.kind === "salvage" ? [...source.candidate.attributedPaths] : [...(checkpoint?.changedPaths ?? [])],
-    baselineOnlyPaths: source.kind === "salvage" ? [...source.candidate.baselineOnlyPaths] : [],
-    ambiguousPaths: source.kind === "salvage" ? [...source.candidate.ambiguousPaths] : [],
-  };
-}
-
-interface PersistedGroupRevision {
-  revision: number;
-  updatedAt: string;
-  peakConcurrency: number;
-  integritySha256: string;
 }
 
 /**
@@ -369,16 +247,6 @@ const SCHEDULED_SETTLED_STATES: ReadonlySet<BackgroundTaskState> = new Set([
 
 function isSettledScheduledState(state: BackgroundTaskState): boolean {
   return SCHEDULED_SETTLED_STATES.has(state);
-}
-
-/** A session-sidecar save that also retired every unreferenced checkpoint owner.
- * Bare `true` means durable save only: the controller must retire its own old owners. */
-export type ParentCheckpointSaveResult = void | boolean | { saved: true; ownersRetired: true };
-
-/** The session writer uses this only after its serialized save-and-retire
- * operation finishes. A failed/unavailable save cannot issue a receipt. */
-export async function acknowledgeOwnerRetiringSave(saveAndRetire: () => Promise<boolean>): Promise<ParentCheckpointSaveResult> {
-  return await saveAndRetire() ? { saved: true, ownersRetired: true } : false;
 }
 
 interface BackgroundControllerInput {
@@ -528,20 +396,12 @@ export interface ScheduledStartOptions {
 
 export class BackgroundExecutionController {
   private readonly groups = new Map<string, BackgroundExecutionGroup>();
-  private readonly runtimes = new Map<string, RuntimeTask>();
+  private readonly runtimes = new Map<string, RuntimeTaskHandle>();
   private readonly pendingForceMerges = new Map<string, PendingForceMerge>();
   /** Reserve command admission before recovery's first await, including bundle adoption. */
   private readonly continuationAdmissions = new Set<string>();
   private readonly saveTails = new Map<string, Promise<void>>();
   private readonly steeringTails = new Map<string, Promise<void>>();
-  /**
-   * Issue #222: pending launch-notice gates by execution id. Set only by a
-   * non-model-initiated start/add (human command or scheduler) that carries
-   * the shared notice; process-local and never persisted, cleared when the
-   * group retires or the controller detaches. A restored group never resurrects
-   * its gate — restarts deliver the ordinary notifications without one.
-   */
-  private readonly launchNoticeGates = new Map<string, Promise<void>>();
   private readonly archivedTasks = new Map<string, { updatedAt: string; integritySha256: string; executionId?: string; legacy?: boolean }>();
   /**
    * Finding 15: authenticated membership handles for legacy settled stubs that
@@ -554,6 +414,38 @@ export class BackgroundExecutionController {
     /** True once the membership index covering these handles is durably written. */
     persisted: boolean;
   }>();
+  /** #175/#25: the one authoritative parent-checkpoint ledger (guards,
+   * selective checkpointing, review disposition, two-owner composition and
+   * receipt-gated retirement). Wave runners consume this same instance. */
+  private readonly ledger: ParentCheckpointLedger;
+  /** Issue #222/#117/#222: wake, watch, and launch-notice delivery state and
+   *  sequencing (./wake-delivery); the controller keeps admission and every
+   *  durable authority. */
+  private readonly wakes: WakeDelivery;
+  /**
+   * Narrow lifecycle capabilities (./task-lifecycle-services) handed to the
+   * extracted per-kind runners. Every durable authority — admission, the
+   * group/task records, runtimes and leases, save/steering tails, command
+   * transitions, gate installation, checkpoints, force-merge/markClean —
+   * stays in this controller; each capability is a live projection.
+   */
+  private readonly caps: {
+    persistence: LifecyclePersistence;
+    notify: (message: string) => void | Promise<void>;
+    wake: LifecycleWake;
+    activity: LifecycleActivity;
+    dispatch: LifecycleDispatch;
+    indicator: LifecycleIndicator;
+    config: LifecycleConfig;
+    executor: LifecycleExecutor;
+    steering: LifecycleSteering;
+    live: LifecycleLiveControl;
+    gates: LifecycleGates;
+    bookkeeping: LifecycleBookkeeping;
+  };
+  private readonly researchDeps: ResearchLifecycleDeps;
+  private readonly inplaceDeps: InPlaceLifecycleDeps;
+  private readonly waveDeps: WaveLifecycleDeps;
   private recentActivity: RecentBackgroundActivity[] = [];
   private pool: ExecutorPoolScheduler;
   private active = 0;
@@ -576,15 +468,145 @@ export class BackgroundExecutionController {
    * notifications, force-merge) and sequences the store.
    */
   private readonly conflictGates = new ConflictGateStore();
-  private uiContext: unknown;
-  private expandedView = false;
-  private readonly watches = new Map<string, { timer: ReturnType<typeof setTimeout>; subscription: BackgroundWatchSubscription }>();
-  private pendingWatchInspections: BackgroundInspection[] = [];
-  private watchDeliveryTimer?: ReturnType<typeof setTimeout>;
+  /** Indicator presentation state (./subtask-indicator); the controller
+   *  feeds live projections only. */
+  private readonly indicator: SubtaskIndicator;
 
   constructor(private readonly input: BackgroundControllerInput) {
     this.pool = new ExecutorPoolScheduler(resolvedWorkerResources(input.config));
-    this.expandedView = input.config.ui?.subtasksViewExpanded === true;
+    this.ledger = new ParentCheckpointLedger({
+      config: () => this.input.config,
+      state: () => this.input.state,
+      cwd: () => this.input.cwd(),
+      notify: (message) => this.input.notify?.(message),
+      onAssociationsChanged: (associations) => this.input.onAssociationsChanged?.(associations),
+      associationsSnapshot: () => this.associations(),
+      addActivityContext: (context, phase, message) => {
+        const group = context.executionId ? this.groups.get(context.executionId) : undefined;
+        const task = context.taskId ? group?.tasks.find((candidate) => candidate.taskId === context.taskId) : undefined;
+        if (task) this.addActivity(task, phase, message);
+      },
+      faults: () => this.input.faults,
+    });
+    this.wakes = new WakeDelivery({
+      config: () => this.input.config,
+      pi: () => this.input.pi,
+      notify: (message) => this.input.notify?.(message),
+      faults: () => this.input.faults,
+      groupOf: (taskId) => [...this.groups.values()].find((group) => group.tasks.some((candidate) => candidate.taskId === taskId)),
+      schedulingSnapshot: (group, releasingTask) => this.schedulingSnapshot(group, releasingTask),
+      inspect: (executionId) => this.inspect(executionId),
+      gateForTask: (executionId, taskId) => this.gateForTask(executionId, taskId),
+    });
+    // Narrow per-kind lifecycle capabilities (no host bag): the extracted
+    // runners receive exactly the members their deps interfaces declare,
+    // all evaluated live against this controller's state.
+    this.caps = {
+      persistence: { save: (group) => this.save(group), publishAssociations: () => this.publishAssociations() },
+      notify: (message) => this.input.notify?.(message),
+      wake: { wake: (task, kind, content, snapshot) => this.wake(task, kind, content, snapshot) },
+      activity: { add: (task, phase, message) => this.addActivity(task, phase, message) },
+      dispatch: { record: (group, task, record) => this.recordDispatch(group, task, record) },
+      indicator: { update: () => this.updateIndicator() },
+      config: {
+        base: () => this.input.config,
+        forGroup: (group) => this.groupConfig(group),
+        scopedModels: () => this.scopedModels,
+      },
+      executor: {
+        routeOf: (group) => this.routeForGroup(group),
+        pool: () => this.pool,
+        acquireAfterRoute: (current, routeOf, signal) => this.pool.acquireAfterRoute(current, routeOf, signal),
+      },
+      steering: {
+        prestart: (group, task) => this.incorporatePrestartSteering(group, task),
+        continuation: (group, task, instructions) => this.incorporateContinuationSteering(group, task, instructions),
+        claimDeferred: (group, task) => this.takeDeferredSteering(group, task),
+        failUndelivered: (task, reason) => this.failUndeliveredSteering(task, reason),
+        failUndeliveredContinuation: (task, reason) => this.failUndeliveredContinuation(task, reason),
+        acknowledgeInterrupt: (task) => this.acknowledgeInterrupt(task),
+        flushQueued: (group, task, runtime, control) => this.flushQueuedSteering(group, task, runtime, control),
+      },
+      live: { runtime: (taskId) => this.runtimes.get(taskId) },
+      gates: {
+        install: (gate) => this.setConflictGate(gate),
+        gateForTask: (executionId, taskId) => this.gateForTask(executionId, taskId),
+        criticalPrompt: (gate) => this.criticalPrompt(gate),
+      },
+      bookkeeping: { tolerate: (task, step, run, outcome) => this.completeLandedBookkeeping(task, step, run, outcome) },
+    };
+    this.researchDeps = {
+      persistence: this.caps.persistence,
+      notify: this.caps.notify,
+      wake: this.caps.wake,
+      activity: this.caps.activity,
+      dispatch: this.caps.dispatch,
+      indicator: this.caps.indicator,
+      config: { base: this.caps.config.base, scopedModels: this.caps.config.scopedModels },
+      executor: { acquireAfterRoute: this.caps.executor.acquireAfterRoute, routeOf: this.caps.executor.routeOf },
+      steering: {
+        prestart: this.caps.steering.prestart,
+        continuation: this.caps.steering.continuation,
+        claimDeferred: this.caps.steering.claimDeferred,
+        failUndelivered: this.caps.steering.failUndelivered,
+        acknowledgeInterrupt: this.caps.steering.acknowledgeInterrupt,
+        flushQueued: this.caps.steering.flushQueued,
+      },
+      live: this.caps.live,
+    };
+    this.inplaceDeps = {
+      persistence: this.caps.persistence,
+      notify: this.caps.notify,
+      wake: this.caps.wake,
+      activity: this.caps.activity,
+      dispatch: this.caps.dispatch,
+      indicator: this.caps.indicator,
+      config: { forGroup: this.caps.config.forGroup, scopedModels: this.caps.config.scopedModels },
+      executor: { acquireAfterRoute: this.caps.executor.acquireAfterRoute, routeOf: this.caps.executor.routeOf },
+      steering: {
+        prestart: this.caps.steering.prestart,
+        continuation: this.caps.steering.continuation,
+        claimDeferred: this.caps.steering.claimDeferred,
+        failUndelivered: this.caps.steering.failUndelivered,
+        acknowledgeInterrupt: this.caps.steering.acknowledgeInterrupt,
+        flushQueued: this.caps.steering.flushQueued,
+      },
+      live: this.caps.live,
+      artifactDir: (group, task) => this.inplaceArtifactDir(group, task),
+    };
+    this.waveDeps = {
+      persistence: this.caps.persistence,
+      notify: this.caps.notify,
+      wake: this.caps.wake,
+      activity: this.caps.activity,
+      dispatch: this.caps.dispatch,
+      indicator: this.caps.indicator,
+      config: { base: this.caps.config.base, forGroup: this.caps.config.forGroup, scopedModels: this.caps.config.scopedModels },
+      executor: { pool: this.caps.executor.pool },
+      steering: {
+        prestart: this.caps.steering.prestart,
+        continuation: this.caps.steering.continuation,
+        claimDeferred: this.caps.steering.claimDeferred,
+        failUndelivered: this.caps.steering.failUndelivered,
+        acknowledgeInterrupt: this.caps.steering.acknowledgeInterrupt,
+        flushQueued: this.caps.steering.flushQueued,
+      },
+      live: this.caps.live,
+      gates: this.caps.gates,
+      bookkeeping: this.caps.bookkeeping,
+      ledger: this.ledger,
+      state: () => this.input.state,
+      faults: () => this.input.faults,
+    };
+    this.indicator = new SubtaskIndicator({
+      config: () => this.input.config,
+      activeTaskEntries: () => [...this.activeTasks.values()],
+      isRuntimeActive: (taskId) => this.runtimes.has(taskId),
+      conflictGatePaths: () => this.conflictGates.size > 0
+        ? this.conflictGates.list().flatMap((gate) => [...gate.paths])
+        : undefined,
+      recentActivity: () => this.recentActivity,
+    }, input.config.ui?.subtasksViewExpanded === true);
   }
 
   /**
@@ -601,20 +623,20 @@ export class BackgroundExecutionController {
   }
 
   setUiContext(ctx: unknown): void {
-    this.uiContext = ctx;
-    this.updateIndicator();
+    this.indicator.setContext(ctx);
   }
 
   async toggleExpandedView(ctx: unknown): Promise<boolean> {
     if (!isRecord(ctx) || !isRecord(ctx.ui) || typeof ctx.ui.setWidget !== "function") {
       throw new Error("The current harness does not provide a below-editor widget UI.");
     }
-    this.uiContext = ctx;
-    const expanded = !this.expandedView;
+    // #25 presentation ownership: the adopted context renders only after the
+    // persisted toggle completes, exactly one render, as before.
+    this.indicator.useContext(ctx);
+    const expanded = !this.indicator.expanded;
     await this.input.onExpandedViewChanged?.(expanded);
-    this.expandedView = expanded;
-    this.updateIndicator();
-    return this.expandedView;
+    this.indicator.setExpanded(expanded);
+    return this.indicator.expanded;
   }
 
   refreshPool(): void {
@@ -623,8 +645,7 @@ export class BackgroundExecutionController {
   }
 
   syncUiPreferences(): void {
-    this.expandedView = this.input.config.ui?.subtasksViewExpanded === true;
-    this.updateIndicator();
+    this.indicator.setExpanded(this.input.config.ui?.subtasksViewExpanded === true);
   }
 
   associations(): ExecutionAssociationsSnapshot {
@@ -909,7 +930,7 @@ export class BackgroundExecutionController {
     // Issue #222: register the launch-notice gate before the group becomes
     // schedulable, so even a task that settles while this start call is still
     // finishing cannot deliver a result wake before the notice.
-    if (options?.launchNoticeGate !== undefined) this.launchNoticeGates.set(executionId, options.launchNoticeGate);
+    if (options?.launchNoticeGate !== undefined) this.wakes.setLaunchNoticeGate(executionId, options.launchNoticeGate);
     await this.save(group);
     await this.publishAssociations();
     void this.pump();
@@ -1065,7 +1086,7 @@ export class BackgroundExecutionController {
     // Issue #222: a non-model-initiated add registers its launch-notice gate
     // before the added tasks can be dispatched, so their result wakes stay
     // causally ordered behind the notice as with any other admission.
-    if (options?.launchNoticeGate !== undefined) this.launchNoticeGates.set(group.executionId, options.launchNoticeGate);
+    if (options?.launchNoticeGate !== undefined) this.wakes.setLaunchNoticeGate(group.executionId, options.launchNoticeGate);
     await this.save(group);
     void this.pump();
     // The inspection carries the whole execution inventory; the exact newly
@@ -1346,19 +1367,9 @@ export class BackgroundExecutionController {
     if (!group.tasks.some((task) => isActiveTaskState(task.state))) {
       throw new Error(`Execution ${group.executionId} has no active tasks to watch.`);
     }
-    const replaced = this.cancelWatch(group.executionId);
-    const armedAt = new Date().toISOString();
-    const subscription: BackgroundWatchSubscription = {
-      executionId: group.executionId,
-      afterMs,
-      armedAt,
-      dueAt: new Date(Date.parse(armedAt) + afterMs).toISOString(),
-      replaced,
-    };
-    const timer = setTimeout(() => this.queueWatchDelivery(group.executionId, subscription), afterMs);
-    timer.unref?.();
-    this.watches.set(group.executionId, { timer, subscription });
-    return subscription;
+    // The armed subscription, its timer, and queued checkpoint inspections
+    // live in ./wake-delivery (Issue #222 sequencing owned there).
+    return this.wakes.armWatch(group.executionId, afterMs);
   }
 
   reviewReadiness(): BackgroundReviewReadinessTask[] {
@@ -2108,7 +2119,7 @@ export class BackgroundExecutionController {
       throw new Error(`Task ${task.taskId} has no durable wave ownership anchor; there is no recoverable work to force-merge.`);
     }
     await this.recoverTaskAssociation(group, task, undefined, { tolerateUnverifiedCheckpoint: true });
-    const bundle = task.bundle ?? (await this.resolveUnverifiedForceMergeBundle(task));
+    const bundle = task.bundle ?? (await resolveUnverifiedForceMergeBundle(task));
     if (!bundle) throw new Error(`Task ${task.taskId} has no durable wave/operation anchor; there is no recoverable work to force-merge.`);
     // #126 correction: an explicit force-merge always merges all identified
     // work in one call, so the request carries no mode; `input.mergeAnyhow`
@@ -2170,7 +2181,7 @@ export class BackgroundExecutionController {
       // runs before the source-mutation lease.
       let supersession;
       try {
-        supersession = await this.identifyWorkBeyondCheckpoint(task, inspection.record, checkpoint!);
+        supersession = await identifyWorkBeyondCheckpoint(task, inspection.record, checkpoint!);
       } catch (error) {
         command.status = "failed";
         command.error = messageOf(error);
@@ -2200,7 +2211,7 @@ export class BackgroundExecutionController {
       // and runs before the source-mutation lease; a refusal marks the command
       // failed durably, matching the other pre-acquisition refusals.
       try {
-        source = await this.captureSalvageSource(group, task, inspection.record);
+        source = await captureSalvageSource(task, inspection.record, group.tasks.filter((candidate) => candidate.taskId !== task.taskId && candidate.waveRoot === task.waveRoot));
       } catch (error) {
         command.status = "failed";
         command.error = messageOf(error);
@@ -2306,7 +2317,7 @@ export class BackgroundExecutionController {
         if (command.salvage) {
           const salvageProvenance = command.salvage;
           await this.completeLandedBookkeeping(task, "salvage provenance", () =>
-            this.recordSalvageProvenanceIncident(task, salvageProvenance, {
+            recordSalvageProvenanceIncident(task, salvageProvenance, {
               appliedPaths: materialized.appliedPaths,
               conflictPaths: materialized.paths,
             }), "conflicted");
@@ -2349,7 +2360,7 @@ export class BackgroundExecutionController {
       if (command.salvage) {
         const salvageProvenance = command.salvage;
         await this.completeLandedBookkeeping(task, "salvage provenance", () =>
-          this.recordSalvageProvenanceIncident(task, salvageProvenance));
+          recordSalvageProvenanceIncident(task, salvageProvenance));
       }
       transitionTaskState(task, "landed");
       await this.completeLandedBookkeeping(task, "durable save", async () => {
@@ -2364,7 +2375,7 @@ export class BackgroundExecutionController {
         // #117 review fix: suppression removes only the notification. The
         // actionable-completion watch housekeeping still runs so a stale
         // checkpoint can never fire after this direct-result-confirmed landing.
-        this.retireWakeWatch(task, "completion", { group, task });
+        this.wakes.retireWakeWatch(task, "completion", { group, task });
         completionAggregate = this.completionAggregateFor(group, task);
       } else {
         await this.completeLandedBookkeeping(task, "completion wake", () =>
@@ -2406,180 +2417,6 @@ export class BackgroundExecutionController {
       release?.();
       this.updateIndicator();
     }
-  }
-
-  /** #126: resolve the operation bundle when no verified bundle is published on
-   * the task (the salvage path). A missing wave root or record means there is
-   * no recoverable anchor; other read errors are surfaced as-is. */
-  private async resolveUnverifiedForceMergeBundle(task: BackgroundTaskRecord): Promise<ReattachmentBundle | undefined> {
-    if (!task.waveRoot) return undefined;
-    let ownedRoot: string;
-    try {
-      ownedRoot = await realpath(task.waveRoot);
-    } catch {
-      return undefined;
-    }
-    try {
-      const record = await readOperationRecord(join(ownedRoot, "artifacts", task.taskId, "operation.json"));
-      return createReattachmentBundle(record, ownedRoot);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
-      throw error;
-    }
-  }
-
-  /**
-   * #126: identify and capture a salvage snapshot of the task's actual worker
-   * work when no ordinary verified checkpoint is available. A retained
-   * worktree is the authoritative source (it holds dirty work no ref can);
-   * only when it is gone are surviving refs in the private repository
-   * identified, with durable incident evidence breaking ties. Refusals throw
-   * an explicit unresolved status; nothing is transferred and the task state
-   * is left for inspection.
-   */
-  private async captureSalvageSource(
-    group: BackgroundExecutionGroup,
-    task: BackgroundTaskRecord,
-    record: OperationRecord,
-  ): Promise<ForceMergeLandingSource> {
-    const capture = await readWaveCaptureRecord(task.waveRoot!);
-    const worktreeStat = await stat(record.worktreeRoot).catch(() => undefined);
-    if (worktreeStat?.isDirectory()) {
-      // The retained worktree is this task's own checkout (identity-checked
-      // against the private repository); sibling tasks cannot claim it.
-      const candidate = await salvageWorktreeCandidate(capture, task.taskId, record.title, record.worktreeRoot);
-      if (!candidate.differsFromBase) {
-        throw new Error(`No provably worker-owned content identified in the retained work for task ${task.taskId}; nothing was transferred.`);
-      }
-      return { kind: "salvage", candidate };
-    }
-    const candidates = await listSalvageRefCandidates(capture, record, task.taskId);
-    // #126 review: the wave's private repository is shared by every task of
-    // this group, so a surviving branch-head ref may belong to a sibling task.
-    // Durable incident evidence naming refs and proven task-owned namespaces
-    // are the only ownership proofs; with siblings present, an unnamed sole
-    // branch-head candidate cannot be excluded and selection falls through to
-    // ambiguous rather than transferring another task's work.
-    const siblings = group.tasks.filter((candidate) => candidate.taskId !== task.taskId && candidate.waveRoot === task.waveRoot);
-    const siblingNamedRefs = new Set<string>();
-    for (const sibling of siblings) {
-      try {
-        const siblingRecord = await readOperationRecord(join(task.waveRoot!, "artifacts", sibling.taskId, "operation.json"));
-        for (const name of incidentBranchNames(siblingRecord)) siblingNamedRefs.add(name);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
-      }
-    }
-    const selection = selectSalvageSource(candidates, { hasSiblingTasks: siblings.length > 0 });
-    if (selection.kind === "none") {
-      throw new Error(`No recoverable worker work identified for task ${task.taskId}: ${selection.reason}.`);
-    }
-    if (selection.kind === "ambiguous") {
-      // Ambiguity-only candidates are named here too: surviving evidence with
-      // unproven ownership is reported, never called nonexistent.
-      const listing = selection.candidates.map((c) => {
-        const shortName = c.refName.replace(/^refs\/heads\//, "");
-        return `${c.refName} (tip ${c.tipSha.slice(0, 12)}; attributed ${c.attributedPaths.length}, ambiguous ${c.ambiguousPaths.length}${c.taskOwned ? "; task-owned immutable ref" : ""}${c.incidentNamed ? "; named in this task's checkpoint-failure incident" : ""}${siblingNamedRefs.has(shortName) ? "; also named in another task's incidents" : ""})`;
-      }).join("; ");
-      const ownershipNote = siblings.length > 0 && !selection.candidates.some((c) => c.incidentNamed)
-        ? " The wave's private repository is shared by this group's tasks and no durable evidence attributes exactly one ref to this task."
-        : "";
-      throw new Error(`Multiple plausible salvage sources for task ${task.taskId} and no durable evidence identifies exactly one; none was transferred: ${listing}.${ownershipNote}`);
-    }
-    const candidate = await salvageRefCandidate(capture, task.taskId, record.title, selection.candidate);
-    return { kind: "salvage", candidate };
-  }
-
-  /**
-   * #126 correction: a verified checkpoint must not silently hide newer
-   * retained work. The retained worktree is inspected for committed/staged/
-   * unstaged/task-created content the checkpoint's tree does not carry; when
-   * it provably subsumes the checkpoint it supersedes it, and anything that
-   * cannot be ordered is surfaced rather than guessed.
-   *
-   * The worktree is never assumed to be a superset of the checkpoint: a branch
-   * switch can abandon older worker commits or the captured uncommitted
-   * baseline. It supersedes only when every checkpoint delta is preserved with
-   * identical content or provably newer content (its head descends from a
-   * commit carrying the checkpoint's tree). Surviving refs — branch heads and
-   * this task's own candidate/review namespaces — are superseded review
-   * history: their candidate commits all share the wave base as parent, so
-   * they pass identity verification but cannot be ordered against the accepted
-   * checkpoint. Landing one would regress to an older cycle's tree and refusing
-   * on one would block an ordinary reviewed landing, so refs are excluded from
-   * this decision entirely. The inspection is read-only; on ambiguity nothing
-   * is transferred, no stale checkpoint is regressed to, and no prior work is
-   * dropped.
-   */
-  private async identifyWorkBeyondCheckpoint(
-    task: BackgroundTaskRecord,
-    record: OperationRecord,
-    checkpoint: { commitSha: string; ref: string },
-  ): Promise<
-    | { kind: "none" }
-    | { kind: "salvage"; candidate: SalvageCandidateIdentity }
-    | { kind: "ambiguous"; message: string }
-  > {
-    const capture = await readWaveCaptureRecord(task.waveRoot!);
-    const repoPath = capture.repositoryPath;
-    const checkpointTree = await treeShaOf(repoPath, checkpoint.commitSha);
-
-    const worktreeStat = await stat(record.worktreeRoot).catch(() => undefined);
-    if (!worktreeStat?.isDirectory()) return { kind: "none" };
-    const snapshot = await captureWorktreeSnapshot(capture, record.worktreeRoot);
-    if (snapshot.finalTree === checkpointTree) return { kind: "none" };
-    const candidateTree = await buildAttributedCandidateTree(capture, snapshot.finalTree, snapshot.classification);
-    const supersession = await evaluateCandidateAgainstCheckpoint(
-      capture, checkpointTree, candidateTree, snapshot.classification, snapshot.headSha,
-    );
-    if (supersession.beyondPaths.length === 0) return { kind: "none" };
-    if (!supersession.subsumesCheckpoint) {
-      const message = `Verified checkpoint ${checkpoint.ref} (${checkpoint.commitSha.slice(0, 12)}) and the retained worker worktree both carry identified changes; the worktree does not preserve every checkpoint delta with identical or provably newer content, so it is not a provable superset; nothing was transferred. The worktree carries beyond-checkpoint path(s) ${supersession.beyondPaths.join(", ")}. Manual inspection of the retained worktree is required before choosing a recovery.`;
-      return { kind: "ambiguous", message };
-    }
-    const commit = await buildSalvageCommit(capture, task.taskId, record.title, candidateTree, resolve(record.worktreeRoot));
-    return {
-      kind: "salvage",
-      candidate: {
-        ...commit,
-        ...snapshot.classification,
-        sourceKind: "worktree",
-        headSha: snapshot.headSha,
-        ...(snapshot.branchName ? { branchName: snapshot.branchName } : {}),
-      },
-    };
-  }
-
-  /** #126: durable operation-record provenance for a salvaged force-merge.
-   * This is tolerated bookkeeping: it records what happened to the source
-   * evidence and never changes the truthful operation state or asserts review
-   * success. `conflicted` reports an outcome where only the non-conflicting
-   * paths were transferred and materialized markers await resolution. */
-  private async recordSalvageProvenanceIncident(
-    task: BackgroundTaskRecord,
-    provenance: ForceMergeSalvageProvenance,
-    conflicted?: { appliedPaths: string[]; conflictPaths: string[] },
-  ): Promise<void> {
-    if (!task.waveRoot) return;
-    const ownedRoot = await realpath(task.waveRoot);
-    const record = await readOperationRecord(join(ownedRoot, "artifacts", task.taskId, "operation.json"));
-    const outcome = conflicted
-      ? `Transferred ${conflicted.appliedPaths.length} non-conflicting path(s); ${conflicted.conflictPaths.length} conflict(s) await resolution (${conflicted.conflictPaths.join(", ")});`
-      : `Landed all attributed paths;`;
-    const checkpointNote = provenance.sourceKind === "verified_checkpoint"
-      ? "despite the operation lifecycle state"
-      : provenance.supersededCheckpoint
-        ? `superseding verified checkpoint ${provenance.supersededCheckpoint.ref} (${provenance.supersededCheckpoint.commitSha.slice(0, 12)})`
-        : "without an ordinary verified checkpoint";
-    record.incidents.push(createIncident({
-      attempt: record.attempts.length,
-      generation: record.generation,
-      cause: "salvage",
-      stage: "force_merge",
-      message: `Explicit force-merge ${conflicted ? "materialized conflicts from" : "landed"} candidate ${provenance.candidateCommit} from ${provenance.sourceKind} ${checkpointNote}; no review status was asserted. ${outcome} ${provenance.baselineOnlyPaths.length} baseline-only and ${provenance.ambiguousPaths.length} ambiguous path(s) were not transferred.`,
-      retryable: false,
-    }));
-    await writeOperationRecord(record);
   }
 
   /**
@@ -2645,7 +2482,7 @@ export class BackgroundExecutionController {
           // #117 review fix: same watch housekeeping as the delivered wake
           // path — folding the aggregate into this result never leaves a stale
           // checkpoint armed or queued for this group.
-          this.retireWakeWatch(task, "completion", { group: group!, task });
+          this.wakes.retireWakeWatch(task, "completion", { group: group!, task });
           completionAggregates.push({
             executionId: group!.executionId,
             taskId: task.taskId,
@@ -2698,7 +2535,7 @@ export class BackgroundExecutionController {
 
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
-    this.clearWatches();
+    this.wakes.clearWatches();
     // Quiesce force-merges that are waiting for source workspace access so
     // shutdown cannot hang behind another mutation or conflict gate.
     for (const pending of this.pendingForceMerges.values()) {
@@ -2807,7 +2644,7 @@ export class BackgroundExecutionController {
         this.dropActiveTasks(executionId);
         // Issue #222: the launch-notice gate retires with the group; every
         // notification that could be held behind it has already delivered.
-        this.launchNoticeGates.delete(executionId);
+        this.wakes.clearLaunchNoticeGate(executionId);
         // Finding 15: retire every archive handle owned by the removed group,
         // including handles for tasks whose records were already evicted to
         // their compacted archives, and its membership-index bookkeeping.
@@ -2827,7 +2664,7 @@ export class BackgroundExecutionController {
   async detach(): Promise<void> {
     this.detaching += 1;
     this.detachEpoch += 1;
-    this.clearWatches();
+    this.wakes.clearWatches();
     // L9: let in-flight save tails finish their durable writes (preserving
     // write ordering) before dropping the group state and tail bookkeeping, so
     // no stale save-tail entry survives detach and no later write can overtake
@@ -2844,7 +2681,7 @@ export class BackgroundExecutionController {
         this.legacyArchiveHandles.clear();
         // Issue #222: no pending launch-notice gate survives detach; a later
         // session's notifications are never held behind this session's notice.
-        this.launchNoticeGates.clear();
+        this.wakes.clearLaunchNoticeGates();
         this.recentActivity = [];
         this.active = 0;
         this.shuttingDown = false;
@@ -2867,13 +2704,7 @@ export class BackgroundExecutionController {
    * subtask behavior is byte-for-byte unchanged.
    */
   private routeForGroup(group: BackgroundExecutionGroup): ExecutorPoolEntry[] {
-    if (group.scheduledWorkerResourceId === undefined) {
-      return resolvedWorkerRoute(this.input.config, group.kind);
-    }
-    const pinned = resolvedWorkerResource(this.input.config, group.scheduledWorkerResourceId);
-    if (!pinned) return [];
-    if (group.kind === "research" && !workerResourceSupportsResearch(this.input.config, pinned.selection)) return [];
-    return [pinned];
+    return resolveGroupRoute(group, this.input.config);
   }
 
   /**
@@ -2907,38 +2738,7 @@ export class BackgroundExecutionController {
    * ordinary subtasks keep their own settings.
    */
   private groupConfig(group: BackgroundExecutionGroup): ReviewGateConfig {
-    const override = group.scheduledReviewOverride;
-    const pinned = group.scheduledWorkerResourceId;
-    if (pinned === undefined && (!override || !isWriteCapableKind(group.kind))) return this.input.config;
-    const base = this.input.config;
-    // Issue #26: a pinned entry resolves exactly its pinned resource in every
-    // downstream route derivation too — the wave's executor-pool guard and
-    // failover both read the derived role route, so the pin holds for the
-    // whole run even when the kind's global route is empty, and failover can
-    // never silently switch a pinned task onto a global-route worker (a
-    // single-entry route fails closed instead). The base config is cloned,
-    // never mutated. #220: the in-place kind draws its route key from the
-    // write-capable executor pool (the execute route).
-    const execution = pinned === undefined || base.execution === undefined
-      ? base.execution
-      : { ...base.execution, routes: { ...base.execution.routes, [workerRouteKeyForKind(group.kind)]: [{ resourceId: pinned }] } };
-    if (override === undefined || !isWriteCapableKind(group.kind)) {
-      return execution === base.execution ? this.input.config : { ...base, execution };
-    }
-    // Materialize both layers explicitly: a legacy (activeReviewers-only)
-    // base config must not lose its primary set when the derived config
-    // becomes split-shaped for this run.
-    const effective = effectiveReviewSettings(base);
-    return {
-      ...base,
-      ...(execution !== base.execution ? { execution } : {}),
-      review: {
-        ...base.review,
-        primaryReviewers: effective.primaryReviewers.map((selection) => ({ ...selection })),
-        subtaskEnabled: override.mode === "off" ? false : true,
-        subtaskReviewers: (override.mode === "selected" ? override.reviewers : effective.subtaskReviewers).map((selection) => ({ ...selection })),
-      },
-    };
+    return deriveGroupConfig(group, this.input.config);
   }
 
   /**
@@ -3045,17 +2845,20 @@ export class BackgroundExecutionController {
     const executionActiveBeforeLaunch = group.tasks.filter((candidate) => this.runtimes.has(candidate.taskId)).length;
     group.peakConcurrency = Math.max(group.peakConcurrency ?? 0, executionActiveBeforeLaunch + 1);
     task.executorEntryId = lease.entry.entryId;
+    // #237: per-kind lifecycle runners (research/in-place/wave) receive only
+    // their narrow capability slices; the controller keeps admission, runtime
+    // registration, lease lifecycle, and handleLaunchRejection terminalization.
     const promise = (group.kind === "research"
       ? task.pendingContinuation
-        ? this.runResearchContinuation(group, task, abort, lease)
-        : this.runResearchFresh(group, task, abort, lease)
+        ? runResearchContinuation(group, task, abort, lease, this.researchDeps)
+        : runResearchFresh(group, task, abort, lease, this.researchDeps)
       : isInPlaceKind(group.kind)
         ? task.pendingContinuation
-          ? this.runInplaceContinuation(group, task, abort, lease)
-          : this.runInplaceFresh(group, task, abort, lease)
+          ? runInPlaceTaskContinuation(group, task, abort, lease, this.inplaceDeps)
+          : runInPlaceTaskFresh(group, task, abort, lease, this.inplaceDeps)
         : task.pendingContinuation
-          ? this.runContinuation(group, task, abort, lease)
-          : this.runFresh(group, task, abort, lease))
+          ? runWaveTaskContinuation(group, task, abort, lease, this.waveDeps)
+          : runWaveTaskFresh(group, task, abort, lease, this.waveDeps))
       .catch((error) => this.handleLaunchRejection(group, task, error))
       .finally(() => {
         // executeWave/continuation owns normal lease release. This is idempotent
@@ -3116,273 +2919,6 @@ export class BackgroundExecutionController {
     }
   }
 
-  private async runResearchFresh(
-    group: BackgroundExecutionGroup,
-    task: BackgroundTaskRecord,
-    abort: AbortController,
-    lease: ExecutorPoolLease,
-  ): Promise<void> {
-    await this.incorporatePrestartSteering(group, task);
-    task.generation += 1;
-    const priorState = transitionTaskState(task, "capturing");
-    this.addActivity(task, "capturing", "Capturing a stable private workspace for read-only research.");
-    await this.save(group);
-    const activation = stateTransitionNotice(task, priorState, task.state);
-    if (activation) await this.wake(task, "state", activation);
-
-    const discovery = await discoverWaveSource(group.cwd, abort.signal);
-    const releaseCapture = await sourceMutationCoordinator.acquire(discovery.captureRoot, abort.signal);
-    let capture;
-    try {
-      capture = await captureWaveBase({
-        cwd: group.cwd,
-        maxSnapshotBytes: this.input.config.maxSnapshotBytes,
-        artifactTtlMs: this.input.config.retainBundles === "always" ? 0 : this.input.config.waveArtifactTtlMs,
-        signal: abort.signal,
-      });
-    } finally {
-      releaseCapture();
-    }
-    task.waveRoot = capture.waveRoot;
-    await this.save(group);
-    await this.publishAssociations();
-    const worktree = await createWorkerWorktree(capture, task.taskId, abort.signal);
-    const artifactDir = join(capture.waveRoot, "artifacts", task.taskId);
-    const result = await this.runResearchWorker(group, task, abort, lease, worktree, artifactDir, false);
-    await this.finishResearch(group, task, result, artifactDir);
-  }
-
-  private async runResearchContinuation(
-    group: BackgroundExecutionGroup,
-    task: BackgroundTaskRecord,
-    abort: AbortController,
-    lease: ExecutorPoolLease,
-  ): Promise<void> {
-    if (!task.waveRoot || !task.researchResult) {
-      throw new Error("Research continuation requires its persisted private workspace and prior durable result.");
-    }
-    const pending = task.pendingContinuation;
-    if (!pending) throw new Error("Continuation was interrupted before executor dispatch.");
-    pending.instructions = await this.incorporateContinuationSteering(group, task, pending.instructions);
-    const command = task.commands.find((candidate) => candidate.instructionId === pending.instructionId);
-    // An interrupt during preprocessing terminalizes the queued continuation
-    // and clears pendingContinuation; never dispatch a failed continuation.
-    if (!command || task.pendingContinuation !== pending || command.status !== "queued") {
-      throw new Error("Continuation was interrupted before executor dispatch.");
-    }
-    task.pendingContinuation = undefined;
-    task.generation += 1;
-    const previous = transitionTaskState(task, "running");
-    command.status = "delivered";
-    command.deliveredAt = new Date().toISOString();
-    this.addActivity(task, "running", `Continuing research from its durable session (${pending.instructionId}).`);
-    await this.save(group);
-    const activation = stateTransitionNotice(task, previous, task.state);
-    if (activation) await this.wake(task, "state", activation);
-    try {
-      const capture = await readWaveCaptureRecord(task.waveRoot);
-      const worktree = researchWorktree(capture, task.taskId);
-      const artifactDir = join(capture.waveRoot, "artifacts", task.taskId);
-      const result = await this.runResearchWorker(
-        group,
-        task,
-        abort,
-        lease,
-        worktree,
-        artifactDir,
-        true,
-        researchContinuationInstruction(pending.instructions),
-      );
-      command.status = "acknowledged";
-      command.acknowledgedAt = new Date().toISOString();
-      await this.finishResearch(group, task, result, artifactDir);
-    } catch (error) {
-      command.status = "failed";
-      command.error = messageOf(error);
-      throw error;
-    }
-  }
-
-  private async runResearchWorker(
-    group: BackgroundExecutionGroup,
-    task: BackgroundTaskRecord,
-    abort: AbortController,
-    lease: ExecutorPoolLease,
-    worktree: WorkerWorktree,
-    artifactDir: string,
-    continuation: boolean,
-    feedback?: string,
-  ): Promise<WaveWorkerResult> {
-    const capture = await readWaveCaptureRecord(task.waveRoot!);
-    let currentLease = lease;
-    const common = {
-      taskId: task.taskId,
-      task: researchTaskDefinition(task.definition),
-      capture,
-      worktree,
-      artifactDir,
-      config: this.input.config,
-      sourceRoot: capture.discovery.captureRoot,
-      sourceRootAliases: [group.cwd],
-      scopedModels: this.scopedModels,
-      signal: abort.signal,
-      executorAssignment: currentLease,
-      acquireFailover: async (currentAssignment: ExecutorPoolAssignment) => {
-        currentLease.release();
-        const next = await this.pool.acquireAfterRoute(
-          currentAssignment,
-          () => this.routeForGroup(group),
-          abort.signal,
-        );
-        if (next) currentLease = next;
-        return next;
-      },
-      onLiveControl: (control: ExecutorLiveControl | undefined) => {
-        const runtime = this.runtimes.get(task.taskId);
-        if (!runtime) return;
-        runtime.control = control;
-        runtime.controlStatus = control ? "registered" : "closed";
-        if (control) void this.flushQueuedSteering(group, task, runtime, control).catch((error) => {
-          void this.input.notify?.(`review gate: queued research steering delivery failed: ${messageOf(error)}`);
-        });
-      },
-      takeDeferredSteering: () => this.takeDeferredSteering(group, task),
-      onUpdate: (update: import("./types").SubtaskProgressUpdate) => this.researchProgress(group, task, update),
-    };
-    try {
-      return continuation
-        ? await resumeWaveWorker({
-            ...common,
-            priorResult: task.researchResult!,
-            feedback: feedback!,
-            turn: (task.researchResult?.lastExecutorTurn ?? 1) + 1,
-          })
-        : await runWaveWorker(common);
-    } finally {
-      currentLease.release();
-    }
-  }
-
-  /**
-   * Stamp the authoritative final executor identity from the settled operation
-   * record so display labels reflect failovers and settings changes instead of
-   * the entry id captured at launch.
-   */
-  private async applySettledExecutorIdentity(task: BackgroundTaskRecord): Promise<void> {
-    if (!task.waveRoot) return;
-    try {
-      const record = await readOperationRecord(join(task.waveRoot, "artifacts", task.taskId, "operation.json"));
-      if (record.executorEntryId) task.executorEntryId = record.executorEntryId;
-      // Same semantics as the live path: the recorded selection re-establishes
-      // the model identity, clearing a stale value when the final executor has
-      // no configured model.
-      if (record.executorSelection) {
-        task.executorSelection = record.executorSelection;
-        task.executorModel = record.model;
-      }
-    } catch {
-      // Best effort: the label falls back to the entry-id lookup.
-    }
-  }
-
-  private researchProgress(
-    group: BackgroundExecutionGroup,
-    task: BackgroundTaskRecord,
-    update: import("./types").SubtaskProgressUpdate,
-  ): void {
-    // #93: dispatch captures are provenance facts; adjacent phases carry state.
-    const isDispatchCapture = Boolean(
-      update.dispatch
-      && (update.subtaskId === undefined || update.subtaskId === task.taskId),
-    );
-    const next = isDispatchCapture
-      ? undefined
-      : update.phase === "starting" || update.phase === "executing" || update.phase === "correcting"
-        ? "running"
-        : undefined;
-    const previous = next ? transitionTaskState(task, next) : task.state;
-    this.addActivity(task, `research:${update.phase}`, update.message);
-    this.applyExecutorIdentity(task, update);
-    // #93: dispatch captures flow through research workers identically.
-    if (isDispatchCapture && update.dispatch) {
-      this.recordDispatch(group, task, update.dispatch);
-    }
-    const saved = this.save(group);
-    void saved.catch((error) => this.input.notify?.(`review gate: failed to persist research progress: ${messageOf(error)}`));
-    const transition = next ? stateTransitionNotice(task, previous, next) : undefined;
-    const snapshot = transition ? transitionEventSnapshot(group, task) : undefined;
-    if (transition) void saved.then((persisted) => {
-      synchronizeEventSnapshot(snapshot!, persisted);
-      return this.wake(task, "state", transition, snapshot);
-    }).catch(() => undefined);
-    this.updateIndicator();
-  }
-
-  private async finishResearch(
-    group: BackgroundExecutionGroup,
-    task: BackgroundTaskRecord,
-    result: WaveWorkerResult,
-    artifactDir: string,
-  ): Promise<void> {
-    task.researchResult = result;
-    task.bundle = result.bundle;
-    task.summary = result.summary;
-    task.error = result.error;
-    const undelivered = this.failUndeliveredSteering(task, "The research turn ended before queued steering reached a verified transport.");
-    const capture = await readWaveCaptureRecord(task.waveRoot!);
-    const workspaceChanges = await researchWorkspaceChanges(researchWorktree(capture, task.taskId).worktreeRoot);
-    const changed = result.candidate?.differsFromBase === true || workspaceChanges.length > 0;
-    const report = result.turn?.text.trim() ?? result.summary.trim();
-    if (isStoppedForExit(task)) {
-      task.summary = "Research worker stopped for application shutdown; continue it from the retained session and workspace after restore.";
-    } else if (changed) {
-      transitionTaskState(task, "failed");
-      task.error = `Research worker modified its private workspace in violation of the read-only contract; nothing was landed. Detected entries: ${workspaceChanges.slice(0, 20).join(", ") || "candidate tree changed"}`;
-      task.summary = task.error;
-      this.addActivity(task, "research:policy_failure", task.error);
-      await this.wake(task, "failure", `Research task ${task.taskId} violated its read-only workspace contract. Its private changes were quarantined and main is unchanged.`);
-    } else if ((result.status === "no_changes" || result.status === "completed") && report && undelivered.length === 0) {
-      task.report = report;
-      task.reportPath = join(artifactDir, "research-report.md");
-      await writeFile(task.reportPath, [
-        `# ${task.definition.title}`,
-        "",
-        `- Task: ${task.taskId}`,
-        `- Captured source commit: ${capture.baseCommit}`,
-        `- Source workspace: ${group.cwd}`,
-        "- Workspace disposition: unchanged; nothing from this research task was landed",
-        "",
-        report,
-        "",
-      ].join("\n"), "utf8");
-      transitionTaskState(task, "reported");
-      task.summary = report;
-      task.error = undefined;
-      const snapshot = transitionEventSnapshot(group, task);
-      const persisted = await this.save(group);
-      await this.publishAssociations();
-      synchronizeEventSnapshot(snapshot, persisted);
-      await this.wake(task, "completion", formatResearchCompletion(task.taskId, report, task.reportPath), snapshot);
-      this.updateIndicator();
-      return;
-    } else if (result.status === "cancelled" || task.interruptionMode) {
-      transitionTaskState(task, "interrupted");
-      task.summary = "Research worker was interrupted; its private workspace was not landed.";
-      await this.acknowledgeInterrupt(task);
-    } else {
-      transitionTaskState(task, result.bundle ? "paused_recoverable" : "failed");
-      task.error = undelivered.length > 0
-        ? `${undelivered.length} queued steering instruction(s) were not applied.`
-        : result.error ?? "Research worker did not produce a usable report.";
-      task.summary = task.error;
-      await this.wake(task, "failure", `Research task ${task.taskId} stopped without a usable report: ${task.error}`);
-    }
-    task.updatedAt = new Date().toISOString();
-    await this.save(group);
-    await this.publishAssociations();
-    this.updateIndicator();
-  }
-
   // ── #220 in-place worker kind ──
 
   /** Durable artifact directory for an in-place task: the execution root's artifacts tree, kept OUTSIDE the workspace. */
@@ -3393,603 +2929,6 @@ export class BackgroundExecutionController {
   /** Durable artifact directory of any task kind (wave root or execution root). */
   private durableArtifactDirOf(group: BackgroundExecutionGroup, task: BackgroundTaskRecord): string | undefined {
     return task.waveRoot ? join(task.waveRoot, "artifacts", task.taskId) : isInPlaceKind(group.kind) ? this.inplaceArtifactDir(group, task) : undefined;
-  }
-
-  private async runInplaceFresh(
-    group: BackgroundExecutionGroup,
-    task: BackgroundTaskRecord,
-    abort: AbortController,
-    lease: ExecutorPoolLease,
-  ): Promise<void> {
-    await this.incorporatePrestartSteering(group, task);
-    task.generation += 1;
-    const priorState = transitionTaskState(task, "running");
-    this.addActivity(task, "running", `In-place worker starting in ${group.cwd}: writes go directly to that workspace; there is no wave capture, candidate, or landing.`);
-    await this.save(group);
-    const activation = stateTransitionNotice(task, priorState, task.state);
-    if (activation) await this.wake(task, "state", activation);
-    const artifactDir = this.inplaceArtifactDir(group, task);
-    const result = await this.runInplaceWorker(group, task, abort, lease, artifactDir, false, undefined);
-    await this.finishInplace(group, task, result, artifactDir);
-  }
-
-  private async runInplaceContinuation(
-    group: BackgroundExecutionGroup,
-    task: BackgroundTaskRecord,
-    abort: AbortController,
-    lease: ExecutorPoolLease,
-  ): Promise<void> {
-    const pending = task.pendingContinuation;
-    if (!pending) throw new Error("In-place continuation was interrupted before executor dispatch.");
-    pending.instructions = await this.incorporateContinuationSteering(group, task, pending.instructions);
-    const command = task.commands.find((candidate) => candidate.instructionId === pending.instructionId);
-    // An interrupt during preprocessing terminalizes the queued continuation
-    // and clears pendingContinuation; never dispatch a failed continuation.
-    if (!command || task.pendingContinuation !== pending || command.status !== "queued") {
-      throw new Error("In-place continuation was interrupted before executor dispatch.");
-    }
-    task.pendingContinuation = undefined;
-    task.generation += 1;
-    const previous = transitionTaskState(task, "running");
-    command.status = "delivered";
-    command.deliveredAt = new Date().toISOString();
-    this.addActivity(task, "running", `Continuing in place in ${group.cwd} (${pending.instructionId}); prior writes remain and are not rolled back.`);
-    await this.save(group);
-    const activation = stateTransitionNotice(task, previous, task.state);
-    if (activation) await this.wake(task, "state", activation);
-    try {
-      const artifactDir = this.inplaceArtifactDir(group, task);
-      const result = await this.runInplaceWorker(
-        group,
-        task,
-        abort,
-        lease,
-        artifactDir,
-        true,
-        pending.instructions,
-      );
-      command.status = "acknowledged";
-      command.acknowledgedAt = new Date().toISOString();
-      await this.finishInplace(group, task, result, artifactDir);
-    } catch (error) {
-      command.status = "failed";
-      command.error = messageOf(error);
-      throw error;
-    }
-  }
-
-  /** Drive one full in-place lifecycle (turns, review, correction) for one task. */
-  private async runInplaceWorker(
-    group: BackgroundExecutionGroup,
-    task: BackgroundTaskRecord,
-    abort: AbortController,
-    lease: ExecutorPoolLease,
-    artifactDir: string,
-    continuation: boolean,
-    feedback?: string,
-  ): Promise<InPlaceLifecycleResult> {
-    let currentLease = lease;
-    try {
-      return await runInplaceLifecycle({
-        taskId: task.taskId,
-        task: task.definition,
-        workspaceRoot: group.cwd,
-        artifactDir,
-        config: this.groupConfig(group),
-        scopedModels: this.scopedModels,
-        signal: abort.signal,
-        executorAssignment: currentLease,
-        acquireFailover: async (currentAssignment: ExecutorPoolAssignment) => {
-          currentLease.release();
-          const next = await this.pool.acquireAfterRoute(
-            currentAssignment,
-            () => this.routeForGroup(group),
-            abort.signal,
-          );
-          if (next) currentLease = next;
-          return next;
-        },
-        onLiveControl: (control) => {
-          const runtime = this.runtimes.get(task.taskId);
-          if (!runtime) return;
-          runtime.control = control;
-          runtime.controlStatus = control ? "registered" : "closed";
-          if (control) void this.flushQueuedSteering(group, task, runtime, control).catch((error) => {
-            void this.input.notify?.(`review gate: queued in-place steering delivery failed: ${messageOf(error)}`);
-          });
-        },
-        takeDeferredSteering: () => this.takeDeferredSteering(group, task),
-        onUpdate: (update) => this.inplaceProgress(group, task, update),
-        ...(continuation ? {
-          initialResult: task.inplaceResult,
-          continuation: { instructions: feedback ?? "" },
-        } : {}),
-      });
-    } finally {
-      currentLease.release();
-    }
-  }
-
-  private inplaceProgress(
-    group: BackgroundExecutionGroup,
-    task: BackgroundTaskRecord,
-    update: import("./types").SubtaskProgressUpdate,
-  ): void {
-    const isDispatchCapture = Boolean(
-      update.dispatch
-      && (update.subtaskId === undefined || update.subtaskId === task.taskId),
-    );
-    const next = isDispatchCapture
-      ? undefined
-      : update.phase === "reviewing"
-        ? "reviewing"
-        : ["starting", "executing", "correcting", "confirming", "completing"].includes(update.phase)
-          ? "running"
-          : undefined;
-    const previous = next ? transitionTaskState(task, next) : task.state;
-    this.addActivity(task, `inplace:${update.phase}`, update.message);
-    this.applyExecutorIdentity(task, update as import("./types").SubtaskProgressUpdate);
-    if (isDispatchCapture && update.dispatch) {
-      this.recordDispatch(group, task, update.dispatch);
-    }
-    const saved = this.save(group);
-    void saved.catch((error) => this.input.notify?.(`review gate: failed to persist in-place progress: ${messageOf(error)}`));
-    const transition = next ? stateTransitionNotice(task, previous, next) : undefined;
-    const snapshot = transition ? transitionEventSnapshot(group, task) : undefined;
-    if (transition) void saved.then((persisted) => {
-      synchronizeEventSnapshot(snapshot!, persisted);
-      return this.wake(task, "state", transition, snapshot);
-    }).catch(() => undefined);
-    this.updateIndicator();
-  }
-
-  /** Settle one in-place task from its lifecycle result. No landing ever happens. */
-  private async finishInplace(
-    group: BackgroundExecutionGroup,
-    task: BackgroundTaskRecord,
-    result: InPlaceLifecycleResult,
-    artifactDir: string,
-  ): Promise<void> {
-    task.inplaceResult = {
-      status: result.status === "cancelled" ? "cancelled" : result.status === "timeout" ? "timeout" : result.status === "executor_error" || result.status === "review_error" ? "executor_error" : "completed",
-      taskId: task.taskId,
-      title: task.definition.title,
-      summary: result.summary,
-      session: result.session,
-      adapter: result.adapter,
-      model: result.model,
-      usage: result.usage,
-      error: result.error,
-      operationRecord: result.operationRecord,
-      incidents: result.incidents ?? [],
-      attempts: result.attempts ?? 0,
-      lastExecutorTurn: result.lastExecutorTurn,
-    };
-    task.bundle = undefined;
-    const undelivered = this.failUndeliveredSteering(task, "The in-place task ended before queued steering reached a verified transport.");
-    // #220/PR226: model-facing completion prose is concise positive fact —
-    // the recorded delta and the observed external paths as separate named
-    // categories plus the actual review disposition. The full baseline,
-    // observation evidence, limits, and review context stay durable in
-    // result.json, the review cycle records, and the reviewer request.
-    if (isStoppedForExit(task)) {
-      task.summary = "In-place worker stopped for application shutdown; inspect the workspace and continue after restore.";
-      task.updatedAt = new Date().toISOString();
-      await this.save(group);
-      await this.publishAssociations();
-      return;
-    }
-    if (result.status === "reviewed" || result.status === "unreviewed" || result.status === "no_changes") {
-      task.result = synthesizeInPlaceWaveResult(group, task, result, artifactDir);
-      const completionLines = buildInPlaceCompletionLines(result);
-      task.summary = completionLines.join("\n");
-      task.report = result.summary;
-      task.error = undefined;
-      transitionTaskState(task, "reported");
-      const snapshot = transitionEventSnapshot(group, task);
-      const persisted = await this.save(group);
-      await this.publishAssociations();
-      synchronizeEventSnapshot(snapshot, persisted);
-      const verdictLine = completionLines.join("\n");
-      await this.wake(task, undelivered.length > 0 ? "failure" : "completion", undelivered.length > 0
-        ? `${verdictLine}\n${undelivered.length} queued steering instruction(s) were not applied.`
-        : verdictLine);
-      this.updateIndicator();
-      return;
-    }
-    if (result.status === "cancelled" || task.interruptionMode) {
-      transitionTaskState(task, "interrupted");
-      const externalLine = inPlaceExternalLine(result);
-      task.summary = [
-        `In-place worker was interrupted in ${result.workspaceRoot}; prior writes remain and were not rolled back.`,
-        inPlaceChangedLine(result),
-        ...(externalLine ? [externalLine] : []),
-        ...inPlaceLimitLines(result),
-      ].join("\n");
-      await this.acknowledgeInterrupt(task);
-    } else {
-      transitionTaskState(task, "paused_recoverable");
-      task.error = inPlaceFailureError(undelivered.length, result);
-      const externalLine = inPlaceExternalLine(result);
-      task.summary = [
-        `In-place task ${task.taskId} stopped before settlement (${result.status}).`,
-        inPlaceChangedLine(result),
-        ...(externalLine ? [externalLine] : []),
-        ...inPlaceLimitLines(result),
-      ].join("\n");
-      await this.wake(task, "failure", `In-place task ${task.taskId} stopped before settlement (${result.status}).`);
-    }
-    task.updatedAt = new Date().toISOString();
-    await this.save(group);
-    await this.publishAssociations();
-    this.updateIndicator();
-  }
-
-  private async runFresh(
-    group: BackgroundExecutionGroup,
-    task: BackgroundTaskRecord,
-    abort: AbortController,
-    lease: ExecutorPoolLease,
-  ): Promise<void> {
-    const reviewWindowId = this.input.state.reviewWindow?.id;
-    const parentBaseline = activeExchangeBaseline(this.input.state);
-    const snapshotBaseline = parentBaseline?.kind === "snapshot" ? parentBaseline.snapshot : undefined;
-    const preTaskSnapshot = parentBaseline?.kind === "checkpoint" ? await this.preTaskParentChanges(group.cwd)
-      : snapshotBaseline ? await createWorkspaceSnapshot(group.cwd, {
-      maxFileBytes: this.input.config.maxFileBytes,
-      maxSnapshotBytes: this.input.config.maxSnapshotBytes,
-      reuseUnchangedFrom: snapshotBaseline,
-    }) : undefined;
-    let landingGuard = preTaskSnapshot;
-    await this.incorporatePrestartSteering(group, task);
-    task.generation += 1;
-    const priorState = transitionTaskState(task, "capturing");
-    this.addActivity(task, "capturing", "Capturing an independent task base from current main.");
-    await this.save(group);
-    const activation = stateTransitionNotice(task, priorState, task.state);
-    if (activation) await this.wake(task, "state", activation);
-
-    const result = await executeWave({
-      cwd: group.cwd,
-      tasks: [task.definition],
-      taskIds: [task.taskId],
-      config: this.groupConfig(group),
-      scopedModels: this.scopedModels,
-      maxWorkers: 1,
-      independentLanding: true,
-      signal: abort.signal,
-      executorPool: this.pool,
-      initialExecutorLeases: [lease],
-      onWaveCreated: async (waveRoot) => {
-        task.waveRoot = waveRoot;
-        await this.save(group);
-        await this.publishAssociations();
-      },
-      onWorkersSettled: async (result) => {
-        task.result = result;
-        task.bundle = result.taskResults[0]?.bundle;
-        task.summary = result.taskResults[0]?.summary;
-        await this.save(group);
-        await this.publishAssociations();
-        // The wave owns subsequent planning/clean landing; this is its last
-        // awaited controller callback before that path. The landing planner
-        // rejects a concurrently changed file as a whole (even disjoint
-        // lines), while its conflict callback refreshes again before writes.
-        landingGuard = await this.landingParentGuard(group.cwd, preTaskSnapshot) ?? (preTaskSnapshot instanceof Map ? undefined : preTaskSnapshot);
-      },
-      onProgress: (update) => this.progress(group, task, update),
-      onLiveControl: (_taskId, control) => {
-        const runtime = this.runtimes.get(task.taskId);
-        if (!runtime) return;
-        runtime.control = control;
-        runtime.controlStatus = control ? "registered" : "closed";
-        if (control) void this.flushQueuedSteering(group, task, runtime, control).catch((error) => {
-          void this.input.notify?.(`review gate: queued steering delivery failed: ${messageOf(error)}`);
-        });
-      },
-      takeDeferredSteering: () => this.takeDeferredSteering(group, task),
-      onLandingConflict: async ({ capture, plan }) => {
-        await this.input.faults?.materializeLandingConflicts?.({ executionId: group.executionId, taskId: task.taskId, taskState: task.state });
-        // Ordinary reviewed landing keeps the pre-#126 contract: every conflict
-        // that cannot carry text markers refuses the whole transfer before any
-        // mutation (materializeLandingConflicts throws). Only ordinary text
-        // conflicts reach here and are materialized as diff3 markers in the
-        // source workspace.
-        landingGuard = await this.landingParentGuard(group.cwd, preTaskSnapshot) ?? (preTaskSnapshot instanceof Map ? undefined : preTaskSnapshot);
-        const materialized = await materializeLandingConflicts(capture, plan, `subtask ${task.taskId}`);
-        await this.checkpointParent(reviewWindowId, parentBaseline, landingGuard, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task));
-        const conflictGate: BackgroundConflictGate = {
-          executionId: group.executionId,
-          taskId: task.taskId,
-          sourceRoot: group.cwd,
-          paths: materialized.paths,
-          activatedAt: new Date().toISOString(),
-          manifestPath: materialized.manifestPath,
-          reason: `Task ${task.taskId} requires immediate conflict resolution.`,
-        };
-        this.setConflictGate(conflictGate);
-        transitionTaskState(task, "conflicted");
-        this.addActivity(task, "conflicted", `Conflicts materialized in ${materialized.paths.join(", ")}.`);
-        await this.save(group);
-        await this.publishAssociations();
-        await this.wake(task, "failure", this.criticalPrompt(conflictGate)!);
-        return { materialized: true };
-      },
-    });
-    task.result = result;
-    await this.applySettledExecutorIdentity(task);
-    const undeliveredSteering = this.failUndeliveredSteering(task, "The executor turn ended before the queued steering instruction reached a verified transport.");
-    const worker = result.taskResults[0];
-    task.bundle = worker?.bundle;
-    // #25 settlement race: markClean may have already landed this task while
-    // executeWave settled; keep its validated-resolution summary instead of
-    // letting the executor's own turn summary overwrite it.
-    if (task.state !== "landed") task.summary = worker?.summary;
-    task.error = worker?.error;
-    if (isStoppedForExit(task) && result.landing?.status !== "landed") {
-      task.summary = "Executor stopped for application shutdown; the durable checkpoint must be verified before resume.";
-      task.updatedAt = new Date().toISOString();
-      await this.save(group);
-      await this.publishAssociations();
-      return;
-    }
-    if (result.landing?.status === "landed") {
-      const paths = [...(result.landing.appliedPaths ?? []), ...(result.landing.alreadyAppliedPaths ?? [])];
-      // The source workspace was mutated successfully (finding 2): run the parent
-      // checkpoint as tolerated bookkeeping (preserving the success-path ordering
-      // where the checkpoint completes before the landed state becomes visible),
-      // then transition to landed unconditionally — a checkpoint/save/publish/wake
-      // failure can neither prevent nor reclassify the landing.
-      await this.completeLandedBookkeeping(task, "parent checkpoint", async () => {
-        await this.checkpointParent(reviewWindowId, parentBaseline, landingGuard, group.cwd, paths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task));
-      });
-      transitionTaskState(task, "landed");
-      const completionSnapshot = transitionEventSnapshot(group, task);
-      this.updateIndicator();
-      let persisted: PersistedGroupRevision | undefined;
-      await this.completeLandedBookkeeping(task, "durable save", async () => {
-        persisted = await this.save(group);
-      });
-      await this.completeLandedBookkeeping(task, "association publish", () => this.publishAssociations());
-      if (persisted) synchronizeEventSnapshot(completionSnapshot, persisted);
-      await this.completeLandedBookkeeping(task, "completion wake", () =>
-        this.wake(
-          task,
-          undeliveredSteering.length > 0 ? "failure" : "completion",
-          undeliveredSteering.length > 0
-            ? `Task ${task.taskId} landed, but ${undeliveredSteering.length} queued steering instruction(s) were not applied.`
-            : `Task ${task.taskId} landed independently in the main workspace.`,
-          completionSnapshot,
-        ));
-    } else if (result.landing?.status === "conflicted") {
-      // #25 settlement race: markClean may have validated the materialized
-      // conflict and landed this task while executeWave was still settling;
-      // its gate is then already removed. Never regress that resolved landing
-      // back to conflicted — the durable landed outcome stays authoritative.
-      if (task.state !== "landed") {
-        transitionTaskState(task, "conflicted");
-        // #25 multi-target: this task's own gate, never another target's.
-        const conflictGate = this.gateForTask(group.executionId, task.taskId);
-        task.summary = conflictGate
-          ? `Merge conflict requires immediate resolution: ${conflictGate.paths.join(", ")}.`
-          : "Landing conflict could not be materialized automatically; inspect full diagnostics before modifying main.";
-      }
-    } else if (result.phase === "aborted") {
-      transitionTaskState(task, task.interruptionMode ? "interrupted" : "paused_recoverable");
-      task.summary = task.interruptionMode
-        ? `Executor acknowledged ${task.interruptionMode}.`
-        : "Executor stopped with a recoverable checkpoint.";
-      await this.acknowledgeInterrupt(task);
-    } else {
-      transitionTaskState(task, worker?.bundle ? "paused_recoverable" : "failed");
-      await this.wake(task, "failure", `Task ${task.taskId} failed: ${task.error ?? task.summary ?? "unknown failure"}`);
-    }
-    task.updatedAt = new Date().toISOString();
-    if (task.state === "landed") {
-      await this.completeLandedBookkeeping(task, "durable save", async () => {
-        await this.save(group);
-      });
-      await this.completeLandedBookkeeping(task, "association publish", () => this.publishAssociations());
-    } else {
-      await this.save(group);
-      await this.publishAssociations();
-    }
-    this.updateIndicator();
-  }
-
-  private async runContinuation(
-    group: BackgroundExecutionGroup,
-    task: BackgroundTaskRecord,
-    abort: AbortController,
-    lease: ExecutorPoolLease,
-  ): Promise<void> {
-    const reviewWindowId = this.input.state.reviewWindow?.id;
-    const parentBaseline = activeExchangeBaseline(this.input.state);
-    const snapshotBaseline = parentBaseline?.kind === "snapshot" ? parentBaseline.snapshot : undefined;
-    const preTaskSnapshot = parentBaseline?.kind === "checkpoint" ? await this.preTaskParentChanges(group.cwd)
-      : snapshotBaseline ? await createWorkspaceSnapshot(group.cwd, {
-      maxFileBytes: this.input.config.maxFileBytes,
-      maxSnapshotBytes: this.input.config.maxSnapshotBytes,
-      reuseUnchangedFrom: snapshotBaseline,
-    }) : undefined;
-    let landingGuard = preTaskSnapshot;
-    const pending = task.pendingContinuation;
-    if (!pending) throw new Error("Continuation was interrupted before executor dispatch.");
-    pending.instructions = await this.incorporateContinuationSteering(group, task, pending.instructions);
-    const command = task.commands.find((candidate) => candidate.instructionId === pending.instructionId);
-    // An interrupt during preprocessing terminalizes the queued continuation
-    // and clears pendingContinuation; never dispatch a failed continuation.
-    if (!command || task.pendingContinuation !== pending || command.status !== "queued") {
-      throw new Error("Continuation was interrupted before executor dispatch.");
-    }
-    task.pendingContinuation = undefined;
-    task.generation += 1;
-    const priorState = transitionTaskState(task, "running");
-    command.status = "delivered";
-    command.deliveredAt = new Date().toISOString();
-    const inPlace = command.inPlace === true;
-    this.addActivity(task, "running", inPlace
-      ? `Continuing in place in the retained worktree (${pending.instructionId}).`
-      : `Continuing from durable checkpoint (${pending.instructionId}).`);
-    await this.save(group);
-    const activation = stateTransitionNotice(task, priorState, task.state);
-    if (activation) await this.wake(task, "state", activation);
-    try {
-      const result = await continueOperation({
-        bundle: task.bundle!,
-        instructions: pending.instructions,
-        instructionId: pending.instructionId,
-        ...(inPlace ? { inPlace: true } : {}),
-        config: this.groupConfig(group),
-        scopedModels: this.scopedModels,
-        signal: abort.signal,
-        executorAssignment: lease,
-        executorPool: this.pool,
-        onLiveControl: (control) => {
-          const runtime = this.runtimes.get(task.taskId);
-          if (!runtime) return;
-          runtime.control = control;
-          runtime.controlStatus = control ? "registered" : "closed";
-          if (control) void this.flushQueuedSteering(group, task, runtime, control).catch((error) => {
-            void this.input.notify?.(`review gate: queued steering delivery failed: ${messageOf(error)}`);
-          });
-        },
-        takeDeferredSteering: () => this.takeDeferredSteering(group, task),
-        onWorkerSettled: async (lifecycle) => {
-          task.bundle = lifecycle.bundle ?? task.bundle;
-          task.result = {
-            waveId: task.bundle!.waveId, waveRoot: task.waveRoot!, sourceRoot: group.cwd,
-            phase: "working", taskResults: [{
-              taskId: lifecycle.taskId, title: lifecycle.title, status: lifecycle.status,
-              summary: lifecycle.summary, error: lifecycle.error,
-              acceptedRef: lifecycle.acceptedRef, acceptedCommitSha: lifecycle.acceptedCommitSha,
-              unreviewed: lifecycle.unreviewed, reviewReport: lifecycle.reviewReport,
-              reviewCycles: lifecycle.reviewCycles.map(({ cycle, baseCommit, candidateCommit, candidateTreeSha, candidateRef, verdict }) =>
-                ({ cycle, baseCommit, candidateCommit, candidateTreeSha, candidateRef, verdict })),
-              bundle: lifecycle.bundle, checkpoint: lifecycle.checkpoint,
-              operationRecord: lifecycle.operationRecord, diagnostics: lifecycle.diagnostics,
-              incidents: lifecycle.incidents, attempts: lifecycle.attempts,
-            }],
-          };
-          if (task.state !== "landed") task.summary = lifecycle.summary;
-          await this.applySettledExecutorIdentity(task);
-          await this.save(group);
-          await this.publishAssociations();
-          landingGuard = await this.landingParentGuard(group.cwd, preTaskSnapshot) ?? (preTaskSnapshot instanceof Map ? undefined : preTaskSnapshot);
-        },
-        onLandingConflict: async ({ capture, plan }) => {
-          await this.input.faults?.materializeLandingConflicts?.({ executionId: group.executionId, taskId: task.taskId, taskState: task.state });
-          // Ordinary reviewed continuation landing keeps the pre-#126 contract:
-          // unrepresentable conflicts refuse the whole transfer before any
-          // mutation; only text conflicts are materialized here.
-          landingGuard = await this.landingParentGuard(group.cwd, preTaskSnapshot) ?? (preTaskSnapshot instanceof Map ? undefined : preTaskSnapshot);
-          const materialized = await materializeLandingConflicts(capture, plan, `continued subtask ${task.taskId}`);
-          await this.checkpointParent(reviewWindowId, parentBaseline, landingGuard, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task));
-          const conflictGate = this.activateConflictGate(
-            group, task, materialized.paths, materialized.manifestPath,
-            `Continued task ${task.taskId} requires immediate conflict resolution.`,
-          );
-          this.addActivity(task, "conflicted", `Conflicts materialized in ${materialized.paths.join(", ")}.`);
-          await this.save(group);
-          await this.publishAssociations();
-          await this.wake(task, "failure", this.criticalPrompt(conflictGate)!);
-          return { materialized: true };
-        },
-        onUpdate: (update) => this.continuationProgress(group, task, update),
-      });
-      task.bundle = result.inspection.bundle;
-      const undeliveredSteering = this.failUndeliveredSteering(task, "The continuation ended before the queued steering instruction reached a verified transport.");
-      command.status = "acknowledged";
-      command.acknowledgedAt = new Date().toISOString();
-      if (isStoppedForExit(task) && result.landing?.status !== "landed") {
-        task.summary = "Continued executor stopped for application shutdown; inspect its checkpoint after restore.";
-        return;
-      }
-      if (result.landing?.status === "landed") {
-        task.summary = "Continued task landed independently in the main workspace.";
-        const paths = [...(result.landing.appliedPaths ?? []), ...(result.landing.alreadyAppliedPaths ?? [])];
-        // The source workspace was mutated successfully (finding 2): run the
-        // parent checkpoint as tolerated bookkeeping (preserving the success-path
-        // ordering where the checkpoint completes before the landed state becomes
-        // visible), then transition to landed unconditionally.
-        await this.completeLandedBookkeeping(task, "parent checkpoint", async () => {
-          await this.checkpointParent(reviewWindowId, parentBaseline, landingGuard, group.cwd, paths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task));
-        });
-        transitionTaskState(task, "landed");
-        const completionSnapshot = transitionEventSnapshot(group, task);
-        this.updateIndicator();
-        let persisted: PersistedGroupRevision | undefined;
-        await this.completeLandedBookkeeping(task, "durable save", async () => {
-          persisted = await this.save(group);
-        });
-        await this.completeLandedBookkeeping(task, "association publish", () => this.publishAssociations());
-        if (persisted) synchronizeEventSnapshot(completionSnapshot, persisted);
-        await this.completeLandedBookkeeping(task, "completion wake", () =>
-          this.wake(
-            task,
-            undeliveredSteering.length > 0 ? "failure" : "completion",
-            undeliveredSteering.length > 0
-              ? `Task ${task.taskId} continuation landed, but ${undeliveredSteering.length} queued steering instruction(s) were not applied.`
-              : `Task ${task.taskId} continuation landed.`,
-            completionSnapshot,
-          ));
-      } else if (result.landing?.status === "conflicted") {
-        // Same settlement race as runFresh: never regress a task that markClean
-        // already landed while the continuation was still settling.
-        if (task.state !== "landed") {
-          transitionTaskState(task, "conflicted");
-          // #25 multi-target: this task's own gate, never another target's.
-          const conflictGate = this.gateForTask(group.executionId, task.taskId);
-          task.summary = conflictGate
-            ? `Merge conflict requires immediate resolution: ${conflictGate.paths.join(", ")}.`
-            : "Continuation landing conflict could not be materialized automatically; inspect full diagnostics.";
-        }
-      } else {
-        transitionTaskState(task, result.lifecycle?.status === "cancelled" ? "interrupted" : "paused_recoverable");
-        task.summary = result.lifecycle?.summary ?? result.inspection.record.state;
-        task.error = result.lifecycle?.error;
-        if (task.state !== "interrupted") await this.wake(task, "failure", `Task ${task.taskId} continuation stopped: ${task.error ?? task.summary}`);
-      }
-    } catch (error) {
-      command.status = "failed";
-      command.error = messageOf(error);
-      throw error;
-    } finally {
-      task.updatedAt = new Date().toISOString();
-      if (task.state === "landed") {
-        await this.completeLandedBookkeeping(task, "durable save", async () => {
-          await this.save(group);
-        });
-        await this.completeLandedBookkeeping(task, "association publish", () => this.publishAssociations());
-      } else {
-        await this.save(group);
-        await this.publishAssociations();
-      }
-      this.updateIndicator();
-    }
-  }
-
-  private activateConflictGate(
-    group: BackgroundExecutionGroup,
-    task: BackgroundTaskRecord,
-    paths: string[],
-    manifestPath: string,
-    reason: string,
-  ): BackgroundConflictGate {
-    // Ordinary reviewed landing never produces sidecars (unrepresentable
-    // conflicts refuse before mutation), so no sidecar pairing is recorded.
-    const gate: BackgroundConflictGate = {
-      executionId: group.executionId,
-      taskId: task.taskId,
-      sourceRoot: group.cwd,
-      paths,
-      activatedAt: new Date().toISOString(),
-      manifestPath,
-      reason,
-    };
-    this.setConflictGate(gate);
-    transitionTaskState(task, "conflicted");
-    return gate;
   }
 
   /**
@@ -4012,128 +2951,11 @@ export class BackgroundExecutionController {
     return this.conflictGates.forTask(executionId, taskId);
   }
 
-  /**
-   * Apply the live executor identity from a progress update before persistence,
-   * transition snapshots, and indicator updates so widget/watch labels track
-   * failovers while the task is still active — not only after it settles. The
-   * model comes from the actual adapter invocation, which is immutable
-   * identity: later catalog or settings changes can never relabel a task that
-   * already ran.
-   */
-  private applyExecutorIdentity(
-    task: BackgroundTaskRecord,
-    update: { executorEntryId?: string; executorSelection?: ExecutorSelection; model?: string },
-  ): void {
-    if (update.executorEntryId) task.executorEntryId = update.executorEntryId;
-    // An authoritative selection always re-establishes the model identity —
-    // including clearing it: models are optional for external executors, so a
-    // model-less successor must not keep displaying the predecessor's model.
-    if (update.executorSelection) {
-      task.executorSelection = update.executorSelection;
-      task.executorModel = update.model;
-    }
-    if (update.model) task.executorModel = update.model;
-  }
-
-  private progress(group: BackgroundExecutionGroup, task: BackgroundTaskRecord, update: WaveProgressUpdate): void {
-    // #93: a dispatch capture is a provenance fact, not a lifecycle
-    // transition. Adjacent progress events (starting/executing) already carry
-    // the task state; letting the transport-boundary capture — which is the
-    // LAST event of the dispatch sequence — drive a transition would regress
-    // states set concurrently (for example an injected launch failure).
-    const isDispatchCapture = Boolean(
-      update.subtask?.dispatch
-      && (update.subtask.subtaskId === undefined || update.subtask.subtaskId === task.taskId),
-    );
-    const next = isDispatchCapture ? undefined : stateFromWaveProgress(update);
-    const previous = next ? transitionTaskState(task, next) : task.state;
-    if (!next) task.updatedAt = new Date().toISOString();
-    this.updateReviewStatus(task, update, next);
-    for (const message of update.activity ?? [update.message]) this.addActivity(task, update.phase, message);
-    if (update.subtask) this.applyExecutorIdentity(task, update.subtask);
-    // #93: actual transport-boundary dispatch capture drives the original
-    // card update through the dispatch event path (no inspection needed).
-    if (isDispatchCapture && update.subtask?.dispatch) {
-      this.recordDispatch(group, task, update.subtask.dispatch);
-    }
-    const saved = this.save(group);
-    void saved.catch((error) => this.input.notify?.(`review gate: failed to persist task progress: ${messageOf(error)}`));
-    const transition = next ? stateTransitionNotice(task, previous, next) : undefined;
-    const snapshot = transition ? transitionEventSnapshot(group, task) : undefined;
-    if (transition) void saved.then((persisted) => {
-      synchronizeEventSnapshot(snapshot!, persisted);
-      return this.wake(task, "state", transition, snapshot);
-    }).catch(() => undefined);
-    this.updateIndicator();
-  }
-
-  private updateReviewStatus(
-    task: BackgroundTaskRecord,
-    update: WaveProgressUpdate,
-    next: BackgroundTaskState | undefined,
-  ): void {
-    const taskStatus = update.taskStatuses?.find((candidate) => candidate.taskId === task.taskId);
-    const reviewers = update.subtask?.reviewers
-      ?? taskStatus?.reviewer?.split(",").map((reviewer) => reviewer.trim()).filter(Boolean);
-    const subtaskPhase = update.subtask?.phase;
-    const isReviewActivity = subtaskPhase !== undefined
-      && ["reviewing", "correcting", "confirming"].includes(subtaskPhase);
-    const phase = next === "accepted"
-      ? "accepted"
-      : isReviewActivity
-        ? subtaskPhase
-        : task.reviewStatus?.phase ?? taskStatus?.phase;
-    if (!task.reviewStatus && !reviewers?.length && phase !== "reviewing") return;
-    task.reviewStatus ??= {
-      phase: phase ?? task.state,
-      reviewers: [],
-      activity: [],
-      updatedAt: new Date().toISOString(),
-    };
-    if (reviewers?.length) task.reviewStatus.reviewers = [...reviewers];
-    if (phase) task.reviewStatus.phase = phase;
-    if (isReviewActivity || next === "accepted") {
-      if (task.reviewStatus.activity.at(-1) !== update.message) task.reviewStatus.activity.push(update.message);
-      if (task.reviewStatus.activity.length > 20) task.reviewStatus.activity.splice(0, task.reviewStatus.activity.length - 20);
-    }
-    task.reviewStatus.updatedAt = new Date().toISOString();
-  }
-
-  private continuationProgress(group: BackgroundExecutionGroup, task: BackgroundTaskRecord, update: ContinuationProgressUpdate): void {
-    // #93: dispatch captures are provenance facts; adjacent phases carry state.
-    const isDispatchCapture = Boolean(
-      update.dispatch
-      && (update.subtaskId === undefined || update.subtaskId === task.taskId),
-    );
-    const next = isDispatchCapture ? undefined : stateFromContinuationProgress(update);
-    const previous = next ? transitionTaskState(task, next) : task.state;
-    this.addActivity(task, update.phase, update.message);
-    this.applyExecutorIdentity(task, update);
-    // #93: dispatch captures flow through continuations identically.
-    if (isDispatchCapture && update.dispatch) {
-      this.recordDispatch(group, task, update.dispatch);
-    }
-    task.updatedAt = new Date().toISOString();
-    const saved = this.save(group);
-    void saved.catch(() => undefined);
-    const transition = stateTransitionNotice(task, previous, task.state);
-    const snapshot = transition ? transitionEventSnapshot(group, task) : undefined;
-    if (transition) void saved.then((persisted) => {
-      synchronizeEventSnapshot(snapshot!, persisted);
-      return this.wake(task, "state", transition, snapshot);
-    }).catch(() => undefined);
-    this.updateIndicator();
-  }
-
-  /**
-   * #175: the human-selected landed-change review policy. Landed diffs stay
-   * in the primary review window only when the master gate, automatic primary
-   * review and the landed option are all on; any off keeps selective-checkpoint
-   * behavior (the primary window persists for later manual own-edit review).
-   */
+  /** #175: the landed-change review policy ledger (./parent-checkpoint-ledger)
+   *  owns the parent-checkpoint invariants; these remain the single delegate
+   *  seam for the staying force-merge/mark-clean transactions and tests. */
   private reviewLandedChangesEnabled(): boolean {
-    const review = effectiveReviewSettings(this.input.config);
-    return this.input.config.enabled && review.primaryEnabled && review.reviewLandedChanges;
+    return this.ledger.reviewLandedChangesEnabled();
   }
 
   /** #175: establish the subtask-review status of this task's landing
@@ -4146,60 +2968,15 @@ export class BackgroundExecutionController {
     return landedReviewStatusOf(task.result?.taskResults[0], forceMergeSource);
   }
 
-  /** Guard provenance, not a second parent baseline. At task admission record
-   * which paths already differed from EACH verified parent checkpoint. Only
-   * path identities are retained; no captured bytes replace checkpoint data. */
   private async preTaskParentChanges(sourceRoot: string): Promise<Map<ReviewCheckpointDescriptor, Set<string>>> {
-    const changes = new Map<ReviewCheckpointDescriptor, Set<string>>();
-    if (await realpath(sourceRoot) !== await realpath(this.input.cwd())) return changes;
-    const window = this.input.state.reviewWindow;
-    for (const baseline of [window?.baseline, window?.activeExchange?.baseline]) {
-      if (!baseline || baseline.kind !== "checkpoint" || changes.has(baseline.descriptor)) continue;
-      if (await realpath(baseline.cwd) !== await realpath(sourceRoot)) throw new Error("Parent checkpoint belongs to a different workspace.");
-      if (baseline.descriptor.kind === "git") {
-        // A nested session still owns the same workspace, but its Git review
-        // checkpoint is rooted at the enclosing repository. Keep the session
-        // cwd and repo-relative change paths unchanged; the Git loader checks
-        // the descriptor's repository identity before comparison.
-        const checkpointRoot = await reviewCheckpointWorkspaceRoot(sourceRoot, baseline.descriptor);
-        const loaded = await loadGitCheckpoint(checkpointRoot, baseline.descriptor.checkpoint);
-        if (loaded.status !== "ok") throw new Error(`Parent checkpoint guard refused: ${loaded.reason} ${loaded.detail ?? ""}`);
-        const compared = await compareToGitCheckpoint(checkpointRoot, loaded.value.encoded);
-        if (compared.status !== "ok") throw new Error(`Parent checkpoint guard refused: ${compared.reason} ${compared.detail ?? ""}`);
-        changes.set(baseline.descriptor, new Set([
-          ...compared.value.trackedChanges.map((change) => change.path),
-          ...compared.value.untrackedChanges.map((change) => change.path),
-        ]));
-      } else {
-        const compared = await changedRawCheckpointPaths(sourceRoot, baseline.descriptor);
-        if (compared.status !== "ok") throw new Error(`Parent checkpoint guard refused: ${compared.reason} ${compared.detail ?? ""}`);
-        changes.set(baseline.descriptor, compared.value);
-      }
-    }
-    return changes;
+    return this.ledger.preTaskParentChanges(sourceRoot);
   }
 
-  /** Refresh at the last controller-owned pre-landing boundary. A failed read
-   * cannot authorize advancement: leave all landed paths reviewable. Union
-   * with admission provenance so an edit later reverted is not silently
-   * treated as independently reviewed work. */
   private async landingParentGuard(
     sourceRoot: string,
     admission: WorkspaceSnapshot | Map<ReviewCheckpointDescriptor, Set<string>> | undefined,
   ): Promise<Map<ReviewCheckpointDescriptor, Set<string>> | undefined> {
-    if (!(admission instanceof Map)) return undefined;
-    try {
-      const latest = await this.preTaskParentChanges(sourceRoot);
-      const combined = new Map<ReviewCheckpointDescriptor, Set<string>>();
-      for (const [descriptor, paths] of admission) {
-        const now = latest.get(descriptor);
-        if (now) combined.set(descriptor, new Set([...paths, ...now]));
-      }
-      return combined;
-    } catch {
-      // Keep checkpointParent's eligibility empty on an uncertain read.
-      return undefined;
-    }
+    return this.ledger.landingParentGuard(sourceRoot, admission);
   }
 
   private async checkpointParent(
@@ -4212,168 +2989,7 @@ export class BackgroundExecutionController {
     landedReview?: LandedReviewStatus,
     conflictResolution = false,
   ): Promise<void> {
-    await this.input.faults?.checkpointParent?.(faultContext);
-    if (!taskBaseline || reviewWindowId === undefined || this.input.state.reviewWindow?.id !== reviewWindowId || landedPaths.length === 0) return;
-    // #25: the parent review baseline only covers the parent session's own
-    // workspace. Snapshot file keys are relative to each snapshot's root, so
-    // merging a different target repository's files into this baseline would
-    // surface them as phantom parent changes (or corrupt colliding paths).
-    // A landing into an explicitly selected foreign target therefore never
-    // checkpoints the parent; same-directory targets keep current behavior.
-    if (await realpath(sourceRoot) !== await realpath(this.input.cwd())) return;
-    // #175: with the landed-change review policy on (and automatic primary
-    // review on), an UNREVIEWED same-workspace landing keeps its diff in the
-    // primary review window's ordinary evidence for the model's normal idle
-    // settlement (never an immediate or separate review); a landing whose
-    // content already carries a successful subtask review is not
-    // double-reviewed and keeps the exact existing selective checkpoint. An
-    // outcome whose review status cannot be established fails closed: the
-    // diff stays in the review window and the uncertainty is reported rather
-    // than guessed or treated as reviewed. The foreign-target identity guard
-    // above still keeps unrelated target landings out of the parent window,
-    // and the policy off (or primary review off) keeps the exact prior
-    // checkpointing behavior.
-    if (this.reviewLandedChangesEnabled()) {
-      const status = landedReview
-        ?? { reviewed: false, uncertain: true, detail: "no review-status evidence supplied for this landing path" };
-      if (!status.reviewed) {
-        if (status.uncertain) {
-          const group = faultContext.executionId ? this.groups.get(faultContext.executionId) : undefined;
-          const task = faultContext.taskId
-            ? group?.tasks.find((candidate) => candidate.taskId === faultContext.taskId)
-            : undefined;
-          if (task) {
-            this.addActivity(
-              task,
-              "bookkeeping",
-              `Task ${task.taskId} landed with subtask-review status that could not be established from its outcome (${status.detail}); the landed diff stays in the primary review window for the next model-idle review instead of being treated as reviewed.`,
-            );
-          }
-        }
-        return;
-      }
-    }
-    // A human-resolved conflict has no provable independently reviewed bytes.
-    // Marker/resolution content may contain parent edits made while the worker
-    // ran; retain that path for primary review even with landed review off.
-    if (conflictResolution) return;
-    const window = this.input.state.reviewWindow;
-    if (!window || window.id !== reviewWindowId) return;
-    if (taskBaseline.kind === "snapshot") {
-      // Legacy snapshot windows retain the original pre-task parent-change
-      // guard; no snapshot is used as a fallback for a checkpoint window.
-      if (!before || before instanceof Map) return;
-      const after = await createWorkspaceSnapshot(sourceRoot, {
-        maxFileBytes: this.input.config.maxFileBytes,
-        maxSnapshotBytes: this.input.config.maxSnapshotBytes,
-        reuseUnchangedFrom: before,
-      });
-      if (this.input.state.reviewWindow?.id !== reviewWindowId) return;
-      const accumulated = snapshotOfReviewBaseline(activeExchangeBaseline(this.input.state));
-      if (accumulated) checkpointReviewWindow(this.input.state, selectiveCheckpoint(accumulated, taskBaseline.snapshot, before, after, landedPaths, sourceRoot));
-      return;
-    }
-    if (taskBaseline.kind !== "checkpoint") throw new Error("Legacy Git parent baseline cannot be selectively advanced.");
-    // Window and active exchange may own distinct pinned descriptors. Compose
-    // each against its own verified old state, without folding parent edits
-    // into either or turning the task's internal capture into a parent base.
-    const oldWindow = window.baseline;
-    const oldExchange = window.activeExchange?.baseline;
-    if (oldWindow?.kind !== "checkpoint" || oldExchange?.kind !== "checkpoint") {
-      throw new Error("Parent review checkpoint owners are incomplete or mixed.");
-    }
-    // A missing/failed landing-boundary guard is not evidence of a clean
-    // parent: retain the landing in both owners rather than advancing it.
-    if (!conflictResolution && !(before instanceof Map)) return;
-    const updates = new Map<ReviewCheckpointDescriptor, UnifiedReviewBaseline>();
-    try {
-      for (const old of [oldWindow, oldExchange]) {
-        if (updates.has(old.descriptor)) continue;
-        if (await realpath(old.cwd) !== await realpath(sourceRoot)) throw new Error("Parent checkpoint belongs to a different workspace.");
-        const preExisting = conflictResolution ? new Set<string>() : before instanceof Map ? before.get(old.descriptor) : undefined;
-        // If another landing replaced this descriptor after task admission,
-        // provenance cannot be established: retain every selected path as
-        // review evidence instead of advancing it without an ownership guard.
-        if (!preExisting) continue;
-        const eligiblePaths = landedPaths.filter((path) => ![...preExisting].some((changed) =>
-          changed === path || changed.startsWith(`${path}/`) || path.startsWith(`${changed}/`)));
-        if (eligiblePaths.length === 0) continue;
-        const checkpointId = `parent-landed-${randomUUID()}`;
-        let descriptor: ReviewCheckpointDescriptor;
-        if (old.descriptor.kind === "git") {
-          // The selector paths are already repository-relative, as are the
-          // comparison results; only the checkpoint root needs resolution.
-          const checkpointRoot = await reviewCheckpointWorkspaceRoot(sourceRoot, old.descriptor);
-          const advanced = await advanceGitCheckpoint(checkpointRoot, old.descriptor.checkpoint, eligiblePaths, checkpointId);
-          if (advanced.status !== "ok") throw new Error(`Parent checkpoint advance refused: ${advanced.reason} ${advanced.detail ?? ""}`);
-          descriptor = { kind: "git", checkpoint: advanced.value.descriptor };
-        } else {
-          const advanced = await advanceRawReviewCheckpoint(sourceRoot, old.descriptor, eligiblePaths, checkpointId);
-          if (advanced.status !== "ok") throw new Error(`Parent checkpoint advance refused: ${advanced.reason} ${advanced.detail ?? ""}`);
-          descriptor = advanced.value;
-        }
-        updates.set(old.descriptor, { kind: "checkpoint", descriptor, cwd: old.cwd, capturedAt: new Date().toISOString() });
-      }
-      if (this.input.state.reviewWindow !== window || window.id !== reviewWindowId
-        || window.baseline !== oldWindow || window.activeExchange?.baseline !== oldExchange) return;
-      if (updates.size === 0) return;
-      window.baseline = updates.get(oldWindow.descriptor) ?? oldWindow;
-      window.activeExchange!.baseline = updates.get(oldExchange.descriptor) ?? oldExchange;
-      window.activeExchange!.evidenceEventStart = window.evidence.events.length;
-      window.activeExchange!.assistantSummaryStart = window.evidence.finalAssistantSummaries.length;
-      window.activeExchange!.requestHistoryStart = window.requestHistory.length;
-      // Once reachable from state, new owners must survive even a failed save.
-      // The callback is the production session-sidecar writer, not the group
-      // association save; only its explicit durable acknowledgement permits
-      // retiring old owners. A missing/failed acknowledgement leaves both
-      // generations intact for restart recovery.
-      updates.clear();
-      let saved: ParentCheckpointSaveResult;
-      try {
-        saved = await this.input.onAssociationsChanged?.(this.associations());
-      } catch (error) {
-        await this.reportParentCheckpointRetention(faultContext, `session-sidecar save failed (${messageOf(error)})`);
-        return;
-      }
-      if (saved !== true && !(saved && typeof saved === "object" && saved.saved === true && saved.ownersRetired === true)) {
-        await this.reportParentCheckpointRetention(faultContext, "session-sidecar save was unavailable or did not confirm a durable write");
-        return;
-      }
-      // The production session writer saves and retires through one serialized
-      // owner ledger. A receipt means its release has already completed; doing
-      // it again here would report a false failure (or race a later owner).
-      if (saved !== true) return;
-      // Check ALL live owners after the save (including last-question and an
-      // exchange with a distinct descriptor), not just the replaced slots.
-      const referenced = new Set(ownedReviewCheckpointDescriptors(this.input.state).map(({ cwd, descriptor }) =>
-        reviewCheckpointDescriptorIdentity(cwd, descriptor)));
-      const superseded = new Map<string, { cwd: string; descriptor: ReviewCheckpointDescriptor }>();
-      for (const old of [oldWindow, oldExchange]) {
-        const identity = reviewCheckpointDescriptorIdentity(old.cwd, old.descriptor);
-        if (!referenced.has(identity)) superseded.set(identity, { cwd: old.cwd, descriptor: old.descriptor });
-      }
-      for (const owner of superseded.values()) {
-        try {
-          const released = await releaseReviewCheckpoint(owner.cwd, owner.descriptor);
-          if (released.status !== "ok") await this.reportParentCheckpointRetention(faultContext, `owner release failed (${released.reason}): ${released.detail}`);
-        } catch (error) {
-          await this.reportParentCheckpointRetention(faultContext, `owner release failed (${messageOf(error)})`);
-        }
-      }
-    } finally {
-      // Failed or superseded compositions are not reachable from state.
-      for (const update of updates.values()) await releaseReviewCheckpoint(sourceRoot, update.descriptor);
-    }
-  }
-
-  /** A missing sidecar acknowledgement leaks conservatively; it must not
-   * turn already-landed work into a failed task or hide the recovery caveat. */
-  private async reportParentCheckpointRetention(context: BackgroundFaultContext, detail: string): Promise<void> {
-    const group = context.executionId ? this.groups.get(context.executionId) : undefined;
-    const task = context.taskId ? group?.tasks.find((candidate) => candidate.taskId === context.taskId) : undefined;
-    const message = `Parent checkpoint owners retained: ${detail}; review evidence remains intact.`;
-    if (task) this.addActivity(task, "bookkeeping", message);
-    try { await this.input.notify?.(`review gate: ${message}`); } catch { /* best effort; task activity remains */ }
+    return this.ledger.checkpointParent(reviewWindowId, taskBaseline, before, sourceRoot, landedPaths, faultContext, landedReview, conflictResolution);
   }
 
   /**
@@ -4495,7 +3111,7 @@ export class BackgroundExecutionController {
   private async flushQueuedSteering(
     group: BackgroundExecutionGroup,
     task: BackgroundTaskRecord,
-    runtime: RuntimeTask,
+    runtime: RuntimeTaskHandle,
     control: ExecutorLiveControl,
   ): Promise<void> {
     const prior = this.steeringTails.get(task.taskId) ?? Promise.resolve();
@@ -4547,153 +3163,20 @@ export class BackgroundExecutionController {
     }
   }
 
+  /**
+   * Finding 14: wake eligibility, lanes, and delivery shapes are policy owned
+   * by ./subtask-notifications; ./wake-delivery sequences the fault seam,
+   * watch housekeeping (retireWakeWatch), persistence-aware snapshots, and
+   * delivery. This delegate keeps the single controller-side wake identity
+   * used by every lifecycle and command path.
+   */
   private async wake(
     task: BackgroundTaskRecord,
     kind: "completion" | "failure" | "state",
     content: string,
     eventSnapshot?: { group: BackgroundExecutionGroup; task: BackgroundTaskRecord },
   ): Promise<void> {
-    await this.input.faults?.wake?.({ taskId: task.taskId, taskState: task.state, kind });
-    // Finding 14: wake eligibility, lanes, and delivery shapes are policy owned
-    // by ./subtask-notifications; this method only sequences the fault seam,
-    // watch housekeeping (retireWakeWatch), persistence-aware snapshots, and
-    // delivery.
-    this.retireWakeWatch(task, kind, eventSnapshot);
-    const mode = subtaskNotificationMode(this.input.config);
-    if (isQuietSuppressedWake(kind, mode)) return;
-    const lane = notificationLane(kind);
-    const owner = [...this.groups.values()].find((group) => group.tasks.some((candidate) => candidate.taskId === task.taskId));
-    const eventOwner = eventSnapshot?.group ?? owner;
-    const eventTask = eventSnapshot?.task ?? task;
-    const scheduling = eventOwner
-      ? this.schedulingSnapshot(eventOwner, kind === "completion" ? eventTask : undefined)
-      : undefined;
-    // Failures never reuse the generic event body: it embeds raw wake content,
-    // task titles, landed paths, and the incomplete-task list. Failures get a
-    // dedicated preamble built only from the curated diagnostic, so every
-    // model-controlled character passes through field-level bounding first.
-    const diagnostic = kind === "failure" && owner
-      ? buildWakeFailureDiagnostic({
-        group: owner,
-        task: eventTask,
-        content,
-        // #25 multi-target: only this exact task's own gate.
-        conflictGate: this.gateForTask(owner.executionId, eventTask.taskId),
-      })
-      : undefined;
-    const deliveredContent = diagnostic
-      ? capNotificationText(
-        `${formatWakeFailurePreamble(diagnostic)}\n\nFailure recovery diagnostic (curated and bounded; use SubtasksInspect for the full current snapshot):\n${formatWakeFailureDiagnostic(diagnostic)}`,
-        WAKE_FAILURE_NOTIFICATION_CAP,
-      )
-      : eventOwner
-        ? formatExecutionEvent(eventOwner, eventTask, kind, content, scheduling)
-        : content;
-    const delivery = deliveryForLane(lane);
-    // Issue #222: every result notification for a non-model-initiated launch
-    // waits behind that launch's notice first (auto-resolving bounded gate),
-    // so a fast completion can never precede the notice that names the task.
-    await this.launchNoticeGateOf(eventOwner ?? owner);
-    if (!isRecord(this.input.pi) || typeof this.input.pi.sendMessage !== "function") {
-      await this.input.notify?.(deliveredContent);
-      return;
-    }
-    try {
-      this.input.pi.sendMessage({
-        customType: "pi-review-subtask-event",
-        content: deliveredContent,
-        display: true,
-        details: { executionId: eventOwner?.executionId, taskId: eventTask.taskId, state: eventTask.state, diagnostic },
-      }, delivery);
-    } catch (error) {
-      await this.input.notify?.(`review gate: task notification could not be delivered: ${messageOf(error)}`);
-    }
-  }
-
-  /**
-   * Issue #222: the pending launch-notice gate of one execution, undefined
-   * when the execution was launched by the model (no notice) or its notice
-   * already resolved. Always resolves; the bounded window guarantees a wedged
-   * or failed delivery can never strand result notifications.
-   */
-  private launchNoticeGateOf(group: BackgroundExecutionGroup | undefined): Promise<void> | undefined {
-    if (!group) return undefined;
-    return this.launchNoticeGates.get(group.executionId);
-  }
-
-  /**
-   * #117 review fix: wake-side watch housekeeping, separated from notification
-   * delivery. An actionable wake kind retires the owning group's one-shot
-   * watch — both the armed checkpoint timer and any queued checkpoint
-   * inspection — so a stale checkpoint can never fire after the event it was
-   * watching for. Tool-result-suppressed completions (model force-merge /
-   * mark-clean) run this same housekeeping; only the notification itself is
-   * folded into the caller's direct result instead of being delivered.
-   */
-  private retireWakeWatch(
-    task: BackgroundTaskRecord,
-    kind: "completion" | "failure" | "state",
-    eventSnapshot?: { group: BackgroundExecutionGroup; task: BackgroundTaskRecord },
-  ): void {
-    if (!isActionableWakeKind(kind)) return;
-    const owner = eventSnapshot?.group
-      ?? [...this.groups.values()].find((group) => group.tasks.some((candidate) => candidate.taskId === task.taskId));
-    if (owner) this.cancelWatch(owner.executionId);
-  }
-
-  private cancelWatch(executionId: string): boolean {
-    const current = this.watches.get(executionId);
-    if (current) clearTimeout(current.timer);
-    this.watches.delete(executionId);
-    this.pendingWatchInspections = this.pendingWatchInspections.filter((inspection) => inspection.executionId !== executionId);
-    return current !== undefined;
-  }
-
-  private clearWatches(): void {
-    for (const watch of this.watches.values()) clearTimeout(watch.timer);
-    this.watches.clear();
-    this.pendingWatchInspections = [];
-    if (this.watchDeliveryTimer) clearTimeout(this.watchDeliveryTimer);
-    this.watchDeliveryTimer = undefined;
-  }
-
-  private queueWatchDelivery(executionId: string, expected: BackgroundWatchSubscription): void {
-    const current = this.watches.get(executionId);
-    if (!current || current.subscription !== expected) return;
-    this.watches.delete(executionId);
-    let inspection: BackgroundInspection;
-    try {
-      inspection = this.inspect(executionId);
-    } catch {
-      return;
-    }
-    if (inspection.activeCount === 0) return;
-    this.pendingWatchInspections.push(inspection);
-    if (this.watchDeliveryTimer) return;
-    this.watchDeliveryTimer = setTimeout(() => {
-      this.watchDeliveryTimer = undefined;
-      const pending = this.pendingWatchInspections.splice(0);
-      if (pending.length > 0) void this.deliverWatchInspections(pending);
-    }, 25);
-    this.watchDeliveryTimer.unref?.();
-  }
-
-  private async deliverWatchInspections(inspections: BackgroundInspection[]): Promise<void> {
-    const content = formatWatchEvent(inspections, this.input.config);
-    if (!isRecord(this.input.pi) || typeof this.input.pi.sendMessage !== "function") {
-      await this.input.notify?.(content);
-      return;
-    }
-    try {
-      this.input.pi.sendMessage({
-        customType: "pi-review-subtask-watch",
-        content,
-        display: true,
-        details: { executions: inspections },
-      }, watchCheckpointDelivery());
-    } catch (error) {
-      await this.input.notify?.(`review gate: subtask watch notification could not be delivered: ${messageOf(error)}`);
-    }
+    return this.wakes.wake(task, kind, content, eventSnapshot);
   }
 
   /**
@@ -4947,110 +3430,8 @@ export class BackgroundExecutionController {
   }
 
   private updateIndicator(): void {
-    const ctx = this.uiContext;
-    if (!isRecord(ctx) || !isRecord(ctx.ui) || typeof ctx.ui.setWidget !== "function") return;
-    // The controller only assembles the snapshot (active tasks, runtime
-    // assignment, conflict gate, recent activity); all rendering details live
-    // in the subtask-widget module. Finding 15 (review pass 3): widget work
-    // reads the controller-wide active-task index — bounded by the live
-    // population across all attached groups — and never traverses settled
-    // history or detached groups.
-    const tasks = [...this.activeTasks.values()]
-      .filter(({ task }) => isActiveTaskState(task.state))
-      .map(({ group, task }) => ({
-        kind: group.kind,
-        taskId: task.taskId,
-        title: task.definition.title,
-        state: task.state,
-        updatedAt: task.updatedAt,
-        executorEntryId: task.executorEntryId,
-        executorSelection: task.executorSelection,
-        executorModel: task.executorModel,
-        reviewStatus: task.reviewStatus
-          ? { phase: task.reviewStatus.phase, reviewers: [...task.reviewStatus.reviewers] }
-          : undefined,
-        latestCommand: task.commands.at(-1)
-          ? { action: task.commands.at(-1)!.action, status: task.commands.at(-1)!.status }
-          : undefined,
-        queuedExecutorAssigned: this.runtimes.has(task.taskId),
-      }));
-    try {
-      const rendered = renderSubtaskWidget({
-        expanded: this.expandedView,
-        // #25 multi-target: the indicator flattens every active gate's paths;
-        // per-target ownership stays in inspect and the persisted snapshot.
-        conflictPaths: this.conflictGates.size > 0
-          ? this.conflictGates.list().flatMap((gate) => [...gate.paths])
-          : undefined,
-        tasks,
-        recent: this.recentActivity.map((entry) => ({ title: entry.title, event: entry.event })),
-      }, this.input.config);
-      if (rendered.component) {
-        ctx.ui.setWidget("review-gate-subtasks", rendered.component, { placement: "belowEditor" });
-      } else {
-        ctx.ui.setWidget("review-gate-subtasks", rendered.lines, { placement: "belowEditor" });
-      }
-    } catch {
-      // UI surfaces are optional in print/headless harnesses.
-    }
+    this.indicator.render();
   }
-}
-
-function transitionEventSnapshot(
-  group: BackgroundExecutionGroup,
-  task: BackgroundTaskRecord,
-): { group: BackgroundExecutionGroup; task: BackgroundTaskRecord } {
-  const tasks = group.tasks.map((candidate) => ({ ...candidate }));
-  return {
-    group: { ...group, tasks },
-    task: tasks.find((candidate) => candidate.taskId === task.taskId)!,
-  };
-}
-
-function synchronizeEventSnapshot(
-  snapshot: { group: BackgroundExecutionGroup; task: BackgroundTaskRecord },
-  persisted: PersistedGroupRevision,
-): void {
-  snapshot.group.revision = persisted.revision;
-  snapshot.group.updatedAt = persisted.updatedAt;
-  snapshot.group.peakConcurrency = persisted.peakConcurrency;
-  snapshot.group.integritySha256 = persisted.integritySha256;
-}
-
-function researchTaskDefinition(definition: BackgroundTaskDefinition): BackgroundTaskDefinition {
-  return {
-    ...definition,
-    backgroundKind: "research",
-    acceptanceCriteria: [...definition.acceptanceCriteria],
-    instructions: [
-      definition.instructions,
-      "",
-      "Research mode (authoritative):",
-      "Inspect and synthesize evidence only. Do not edit, create, delete, rename, format, or otherwise modify project files.",
-      "Do not run commands or browser actions with persistent side effects. Do not start other agents or background subtasks.",
-      "Return a concise, self-contained report addressing every acceptance criterion, with file paths/line references and web sources where applicable.",
-      "This worker runs in a disposable private worktree. Any workspace modification is treated as a policy failure and will never be landed.",
-    ].join("\n"),
-  };
-}
-
-function researchContinuationInstruction(instruction: string): string {
-  return [
-    instruction,
-    "",
-    "Research mode remains authoritative: inspect and report only. Do not modify project files or perform actions with persistent side effects.",
-    "Any workspace change fails this task and is never landed, even if the continuation instruction or steering requests a write.",
-  ].join("\n");
-}
-
-function researchWorktree(capture: WaveCaptureResult, taskId: string): WorkerWorktree {
-  const worktreeRoot = join(capture.waveRoot, "workers", taskId);
-  return {
-    worktreeRoot,
-    effectiveCwd: capture.discovery.relativeCwd === "."
-      ? worktreeRoot
-      : join(worktreeRoot, capture.discovery.relativeCwd),
-  };
 }
 
 /**
@@ -5110,207 +3491,12 @@ function isInsideDirectory(directory: string, candidate: string): boolean {
   return !isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`);
 }
 
-/**
- * #220: synthesize the task's result view for an in-place settlement. There
- * is no wave capture or landing, so the result names the in-place source and
- * carries no landing outcome at all. Review cycle identity stays in the
- * artifact records (commit-identity fields are never invented here); the
- * settled verdict and reviewer evidence travel through the review report.
- */
-function synthesizeInPlaceWaveResult(
-  group: BackgroundExecutionGroup,
-  task: BackgroundTaskRecord,
-  result: InPlaceLifecycleResult,
-  artifactDir: string,
-): WaveResult {
-  const status = statusMapping(result.status);
-  return {
-    waveId: `inplace-${group.executionId}`,
-    waveRoot: group.root,
-    sourceRoot: result.workspaceRoot,
-    phase: "completed",
-    taskResults: [{
-      taskId: task.taskId,
-      title: task.definition.title,
-      status,
-      summary: result.summary,
-      error: result.error,
-      unreviewed: result.status === "unreviewed",
-      reviewReport: result.reviewReport,
-      operationRecord: result.operationRecord,
-      diagnostics: result.diagnostics,
-      incidents: result.incidents,
-      attempts: result.attempts,
-      artifactDir,
-      taskDefinition: task.definition,
-    }],
-  };
-}
-
-// ── #220/PR226: bounded, named in-place completion reporting ────────────────
-
-/** Maximum number of paths named in one model-facing in-place completion line. */
-export const INPLACE_COMPLETION_MAX_NAMED_PATHS = 10;
-
-/** Bounded "status path" list for the recorded workspace delta since launch. */
-export function formatInPlaceChangedPaths(changes: Array<{ status: string; path: string }>): string {
-  if (changes.length === 0) return "no recorded workspace changes";
-  const shown = changes.slice(0, INPLACE_COMPLETION_MAX_NAMED_PATHS);
-  const more = changes.length - shown.length;
-  const text = shown.map((change) => `${change.status} ${change.path}`).join(", ");
-  return more > 0 ? `${text} (+${more} more)` : text;
-}
-
-/** Bounded list of observed external paths, or undefined when none were observed. */
-export function formatInPlaceExternalPaths(paths: string[] | undefined): string | undefined {
-  if (!paths || paths.length === 0) return undefined;
-  const shown = paths.slice(0, INPLACE_COMPLETION_MAX_NAMED_PATHS);
-  const more = paths.length - shown.length;
-  const overflow = more > 0 ? ` (+${more} more)` : "";
-  return `${shown.join(", ")}${overflow}`;
-}
-
-/**
- * The review disposition a settled in-place task actually has, derived from the
- * lifecycle result and its official review report/cycles — never invented. A
- * passing aggregate with partial reviewer failure keeps its warning; a no-delta
- * settlement after earlier cycles names those verdicts instead of claiming the
- * final state passed or that no review occurred.
- */
-export function inPlaceReviewDisposition(result: {
-  status: InPlaceLifecycleStatus;
-  reviewReport?: InPlaceLifecycleResult["reviewReport"];
-  reviewCycles: InPlaceLifecycleResult["reviewCycles"];
-}): string {
-  switch (result.status) {
-    case "reviewed":
-      return result.reviewReport?.aggregate === "pass_with_warnings"
-        ? "passed with reviewer infrastructure warnings"
-        : "passed";
-    case "unreviewed": return "disabled";
-    case "no_changes": {
-      if (result.reviewCycles.length === 0) return "not run";
-      const verdicts = [...new Set(result.reviewCycles.map((cycle) => cycle.verdict))].join(", ");
-      return `not run on the final empty delta (earlier cycle verdicts: ${verdicts})`;
-    }
-    default: return result.status;
-  }
-}
-
-/** Short factual limit lines for in-place completion prose; empty when no limits apply. */
-export function inPlaceLimitLines(result: {
-  toolObservationsTruncated?: boolean;
-  baseline?: InPlaceLifecycleResult["baseline"];
-}): string[] {
-  const lines: string[] = [];
-  if (result.toolObservationsTruncated === true) lines.push("Tool-event observations truncated.");
-  const snapshot = result.baseline?.snapshot;
-  const omissions = snapshot?.omissions.length ?? 0;
-  if (omissions > 0) {
-    lines.push(`Snapshot omissions recorded: ${omissions}${snapshot?.omissionsTruncated ? " (omission list truncated)" : ""}`);
-  }
-  return lines;
-}
-
-/**
- * The concise failure diagnostic for a stopped in-place task: the actual
- * lifecycle failure reason plus the undelivered-steering count, when both exist.
- */
-export function inPlaceFailureError(undeliveredCount: number, result: {
-  status: InPlaceLifecycleStatus;
-  error?: string;
-  summary: string;
-}): string | undefined {
-  const parts: string[] = [];
-  if (undeliveredCount > 0) parts.push(`${undeliveredCount} queued steering instruction(s) were not applied.`);
-  const reason = result.error ?? result.summary;
-  if (reason) parts.push(reason);
-  return parts.length > 0 ? parts.join("; ") : undefined;
-}
-
-/** The recorded-delta line for model-facing in-place prose. */
-export function inPlaceChangedLine(result: {
-  attributionError?: string;
-  changedSinceLaunch: Array<{ status: string; path: string }>;
-}): string {
-  return `Workspace changes since launch: ${result.attributionError
-    ? `could not be verified (${result.attributionError})`
-    : formatInPlaceChangedPaths(result.changedSinceLaunch)}`;
-}
-
-/** The separate external-path category line, or undefined when nothing was observed. */
-export function inPlaceExternalLine(result: {
-  observedExternalPaths?: string[];
-}): string | undefined {
-  const text = formatInPlaceExternalPaths(result.observedExternalPaths);
-  return text !== undefined ? `Additional observed paths outside workspace: ${text}` : undefined;
-}
-
-/**
- * The concise factual completion lines for a settled in-place task (#220/PR226):
- * identity/workspace plus the actual review disposition, then the recorded
- * delta and the observed external paths as separate named categories. No
- * rollback/attribution/observability narrative; the detailed evidence stays
- * durable in result.json, the review cycle records, and the reviewer request.
- */
-export function buildInPlaceCompletionLines(result: InPlaceLifecycleResult): string[] {
-  const externalLine = inPlaceExternalLine(result);
-  return [
-    `In-place task ${result.taskId} finished in place in ${result.workspaceRoot}. Review: ${inPlaceReviewDisposition(result)}.`,
-    inPlaceChangedLine(result),
-    ...(externalLine ? [externalLine] : []),
-    ...inPlaceLimitLines(result),
-  ];
-}
-
-/** In-place lifecycle status expressed through the shared task-result status vocabulary. */
-function statusMapping(status: InPlaceLifecycleResult["status"]): WaveTaskResult["status"] {
-  switch (status) {
-    case "reviewed": return "accepted";
-    case "unreviewed": return "completed_unreviewed";
-    case "no_changes": return "no_changes";
-    case "review_error": return "review_error";
-    case "correction_cap": return "correction_cap";
-    case "executor_error": return "executor_error";
-    case "timeout": return "timeout";
-    case "cancelled": return "cancelled";
-    case "reviewer_blocked": return "reviewer_blocked";
-  }
-}
-
 async function continuationEntryId(task: BackgroundTaskRecord): Promise<string | undefined> {
   if (task.executorEntryId) return task.executorEntryId;
   if (!task.bundle) return undefined;
   const inspection = await inspectOperation(task.bundle);
   const operation = await readOperationRecord(inspection.record.artifactDir + "/operation.json");
   return operation.assignments.at(-1)?.entryId;
-}
-
-function selectiveCheckpoint(
-  accumulatedBaseline: WorkspaceSnapshot,
-  taskBaseline: WorkspaceSnapshot,
-  before: WorkspaceSnapshot,
-  after: WorkspaceSnapshot,
-  paths: string[],
-  sourceRoot: string,
-): WorkspaceSnapshot {
-  const absolute = new Set(paths.map((path) => resolve(sourceRoot, path)));
-  const files = new Map(accumulatedBaseline.files);
-  for (const [key, afterFile] of after.files) {
-    if (!absolute.has(afterFile.absolutePath)) continue;
-    if (!parentChanged(taskBaseline.files.get(key), before.files.get(key))) files.set(key, afterFile);
-  }
-  for (const [key, baselineFile] of accumulatedBaseline.files) {
-    if (!absolute.has(baselineFile.absolutePath) || after.files.has(key)) continue;
-    if (!parentChanged(taskBaseline.files.get(key), before.files.get(key))) files.delete(key);
-  }
-  return { cwd: accumulatedBaseline.cwd, capturedAt: after.capturedAt, files, omissions: after.omissions, omissionsTruncated: after.omissionsTruncated };
-}
-
-function parentChanged(a: FileSnapshot | undefined, b: FileSnapshot | undefined): boolean {
-  if (!a && !b) return false;
-  if (!a || !b) return true;
-  return a.content !== b.content || a.sha256 !== b.sha256 || a.isBinary !== b.isBinary;
 }
 
 function messageOf(error: unknown): string {

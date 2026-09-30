@@ -20,8 +20,9 @@ import test from "node:test";
 //   - CHANGELOG.md stays truthful pre-1.0 (per-build candidate sections, preserved aggregate
 //     history, no fake dated releases);
 //   - the governance surface contains no private work-artifact references;
-//   - the docs checker accepts a new public doc in repo and installed layouts while
-//     arbitrary local planning doc references still fail.
+//   - the docs checker accepts a new public doc in repo and installed layouts,
+//     rejects a disconnected newly added docs page until it gains a README-reachable
+//     inbound link, and still fails arbitrary local planning doc references.
 
 const repoRoot = process.cwd();
 const read = (relPath: string): string => fs.readFileSync(path.join(repoRoot, relPath), "utf8");
@@ -547,8 +548,10 @@ test("governance surface contains no private artifact references", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Docs-checker regression: a new public doc must validate in both the repo and
-// installed layouts while arbitrary local planning doc references still fail.
+// Docs-checker regression: a new public doc must validate in both the repo and installed
+// layouts, required reachability must derive from the discovered docs inventory (an
+// orphaned new docs page fails until it gains a reachable inbound link), and arbitrary
+// local planning doc references still fail.
 // Sparse markdown fixtures are built in a temp dir and validated by running
 // scripts/check-docs.cjs against them; no external dependencies.
 // ---------------------------------------------------------------------------
@@ -565,6 +568,7 @@ const FIXTURE_DOCS: Array<[string, string]> = [
   ["docs/review-workflow.md", "# Review workflow\n"],
   ["docs/delegated-execution.md", "# Delegated execution\n"],
   ["docs/web-tools.md", "# Web tools\n"],
+  ["docs/user-questions.md", "# User questions\n"],
   ["docs/security-model.md", "# Security model\n"],
   ["docs/recovery.md", "# Recovery\n"],
   ["docs/development.md", "# Development\n"],
@@ -579,8 +583,10 @@ function makeDocsFixture(opts: { sourceOnly: boolean }): string {
     fs.writeFileSync(abs, body, "utf8");
   };
   for (const [relPath, body] of FIXTURE_DOCS) write(relPath, body);
-  // A new public doc that is linked from the README and named in prose; it must
-  // validate even though it is not part of any hardcoded required-docs list.
+  // A current core public page (now covered by required-existence) that is linked
+  // from the README and named in prose; it must validate in both repo and installed
+  // layouts. Genuinely new pages are covered without hardcoding by the
+  // discovered-inventory reachability regression below.
   write("docs/releases.md", "# Releases\n\nPer-merge prereleases.\n");
   const links = [
     "- [Contributing](CONTRIBUTING.md)",
@@ -592,6 +598,7 @@ function makeDocsFixture(opts: { sourceOnly: boolean }): string {
     "- [Review workflow](docs/review-workflow.md)",
     "- [Delegated execution](docs/delegated-execution.md)",
     "- [Web tools](docs/web-tools.md)",
+    "- [User questions](docs/user-questions.md)",
     "- [Security model](docs/security-model.md)",
     "- [Recovery](docs/recovery.md)",
     "- [Development](docs/development.md)",
@@ -654,6 +661,43 @@ test("docs checker resolves cross-page anchors with platform-independent invento
       assert.doesNotMatch(invalid.stderr, /not a validated markdown page/);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("docs checker rejects a disconnected new docs page until a reachable link lands", () => {
+  for (const sourceOnly of [true, false]) {
+    // Root README link: a newly added flat docs page with no README-reachable inbound
+    // link must fail, while adding that link makes it pass (required reachability
+    // derives from the discovered docs inventory, so new pages need no per-page
+    // hardcoding but cannot stay orphaned).
+    {
+      const root = makeDocsFixture({ sourceOnly });
+      try {
+        fs.writeFileSync(path.join(root, "docs", "roadmap.md"), "# Roadmap\n\nUnlinked draft.\n", "utf8");
+        const disconnected = runDocsChecker(root);
+        assert.notEqual(disconnected.status, 0, "an orphaned new docs page must fail the docs checker");
+        assert.match(disconnected.stderr, /not reachable from README\.md: docs\/roadmap\.md/);
+
+        fs.appendFileSync(path.join(root, "README.md"), "\n- [Roadmap](docs/roadmap.md)\n");
+        const linked = runDocsChecker(root);
+        assert.equal(linked.status, 0, `a README-reachable new docs page must validate: ${linked.stderr}`);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
+    // Docs-index-only link: the README-reachable traversal follows links through
+    // other already-reachable pages (docs/README.md), not just direct README links.
+    {
+      const root = makeDocsFixture({ sourceOnly });
+      try {
+        fs.writeFileSync(path.join(root, "docs", "roadmap.md"), "# Roadmap\n\nLinked from the docs index only.\n", "utf8");
+        fs.appendFileSync(path.join(root, "docs", "README.md"), "\n- [Roadmap](roadmap.md)\n");
+        const linked = runDocsChecker(root);
+        assert.equal(linked.status, 0, `a docs-index-reachable new docs page must validate: ${linked.stderr}`);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
     }
   }
 });

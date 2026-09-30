@@ -650,7 +650,7 @@ async function fsyncDirectory(dir: string): Promise<void> {
 /**
  * Define a rewritten entry as an own enumerable, writable, configurable data
  * property — prototype-safe exactly like `defineOwnKey` (src/config.ts) and
- * `setCatalogKey` (src/settings/command.ts): a scheduled-task id of
+ * `setCatalogKey` (src/settings/catalog-key.ts): a scheduled-task id of
  * `__proto__` (accepted by the config id grammar and created as an own JSON
  * key) must stay data, never become a prototype assignment that silently
  * drops the entry from the catalog Save persists.

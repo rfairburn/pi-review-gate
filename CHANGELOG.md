@@ -44,6 +44,15 @@ dates.
   Existing execute/research workspace isolation, configured routes, and defaults are
   unchanged.
 
+### Changed
+
+- Bound Linux full-suite CI with a five-minute per-test timeout, ten-minute
+  test-step limit, and fifteen-minute job limit. Add immediate file start and
+  completion diagnostics alongside the usual test output, identifying files
+  without observed completion if a run stalls. Test selection, concurrency,
+  prerequisites, release gates, and local commands are unchanged; the original
+  hang's cause remains unconfirmed.
+
 ## [0.1.0-dev.90]
 
 ### Added

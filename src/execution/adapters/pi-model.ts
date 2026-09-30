@@ -145,12 +145,18 @@ export class PiExecutorAdapter implements ExecutorAdapter {
       processGroupId: process.platform === "win32" ? undefined : proc.pid,
     };
     settlementBootstrap.pid = proc.pid;
-    if (identity) await request.onProcessStart?.(identity);
+    // Observe the child lifecycle before awaiting durable PID persistence
+    // (#231): a fast-exiting child can emit 'close' while onProcessStart is
+    // still pending, and PiRpc must already be listening for that event so
+    // the turn settles from the real exit instead of hanging. The delivery
+    // barrier is retained: no prompt is written until after onProcessStart
+    // resolves (the first RPC write happens below).
     const backgroundReadiness = new BackgroundProcessReadiness();
     const rpc = new PiRpc(proc, backgroundReadiness, (chunk) => {
       extractor.push(chunk);
       activity.push(chunk);
     }, (error) => translateDefaultPiSpawnError(error, isDefaultPiPassThrough), request.onToolObservation);
+    if (identity) await request.onProcessStart?.(identity);
     let timedOut = false;
     let aborted = false;
     let interruptedByControl = false;

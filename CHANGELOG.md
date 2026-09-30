@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.93]
+
+### Fixed
+
+- Observe Pi executor child exit before awaiting durable PID persistence, so
+  a fast-exiting child settles as a failure instead of missing its exit and
+  hanging (#231). Prompt delivery still waits for PID persistence; shutdown
+  bounds and fail-closed settlement remain unchanged. Deterministic regression
+  coverage exercises actual child exit while the PID callback is pending.
+
 ## [0.1.0-dev.92]
 
 ### Changed

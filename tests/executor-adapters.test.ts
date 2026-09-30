@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import type { ChildProcess } from "node:child_process";
+import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -534,6 +534,103 @@ test("Pi executor fails a final-response/shutdown race when the child exits zero
       exits[0]!.code === 0 || exits[0]!.signal === "SIGTERM",
       `the child either exited zero on its own or was contained by the adapter's SIGTERM, got ${JSON.stringify(exits[0])}`,
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Pi executor settles from a real child close that lands while durable PID persistence is pending (#231)", {
+  skip: process.platform === "win32",
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-startup-close-race-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const command = join(root, "startup-exit.cjs");
+    await mkdir(artifactDir);
+    // Synthetic failing child: no model and no protocol — it exits 3 as fast
+    // as the runtime allows, so its real 'close' can land while the parent is
+    // still awaiting durable PID persistence (onProcessStart).
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "process.exit(3);",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+
+    const started = Date.now();
+    const now = () => Date.now() - started;
+    // Independent close observer / control barrier: hold the PID callback
+    // until the real owned child has emitted 'close', without notifying PiRpc.
+    let releaseCloseBarrier: (() => void) | undefined;
+    const closeBarrier = new Promise<void>((resolvePromise) => { releaseCloseBarrier = resolvePromise; });
+    // The raw CJS exports object (not a namespace import, whose bindings are
+    // getter-only): the adapter resolves spawn through this shared module at
+    // call time, so a scoped wrapper observes the real child it spawns.
+    type TestSpawn = (file: string, args?: readonly string[], options?: SpawnOptions) => ChildProcess;
+    const childProcessExports = require("node:child_process") as { spawn: TestSpawn };
+    const realSpawn = childProcessExports.spawn;
+    let closeSeen: { code: number | null; signal: NodeJS.Signals | null; atMs: number } | undefined;
+    childProcessExports.spawn = ((file: string, args?: readonly string[], options?: SpawnOptions) => {
+      const proc = realSpawn(file, args ?? [], options ?? {});
+      proc.on("close", (code, signal) => {
+        closeSeen ??= { code, signal, atMs: now() };
+        releaseCloseBarrier?.();
+      });
+      return proc;
+    }) as TestSpawn;
+
+    let startEnteredAtMs: number | undefined;
+    let startResolvedAtMs: number | undefined;
+    let promptDelivered = false;
+    const exits: Array<{ pid: number; code: number | null; signal: string | null }> = [];
+    try {
+      const adapter = new PiExecutorAdapter({ model: "provider/model", command });
+      const runPromise = adapter.run({
+        cwd: root,
+        prompt: "must not be delivered before PID persistence completes",
+        artifactDir,
+        turn: 1,
+        executorToolCatalog: {
+          allowedToolCatalog: ["read"],
+          initialActiveTools: ["read"],
+        },
+        onProcessStart: async (identity) => {
+          startEnteredAtMs = now();
+          // Hold durable PID recording until the independent observer has seen
+          // the real child's 'close' — exactly the startup window the adapter
+          // must survive instead of hanging (#231).
+          await closeBarrier;
+          startResolvedAtMs = now();
+        },
+        onProcessExit: (exit) => { exits.push(exit); },
+        onPromptDelivery: () => { promptDelivered = true; },
+      });
+      let guard: NodeJS.Timeout | undefined;
+      const result = await Promise.race([
+        runPromise,
+        new Promise<never>((_, rejectPromise) => {
+          guard = setTimeout(() => rejectPromise(new Error("Pi executor did not settle within the bounded startup-race guard")), 20_000);
+          guard.unref?.();
+        }),
+      ]).finally(() => clearTimeout(guard));
+      assert.ok(closeSeen, "the independent observer must have seen the real child close");
+      assert.equal(closeSeen.code, 3, "the synthetic child really exited failing");
+      assert.ok(
+        startEnteredAtMs !== undefined && startResolvedAtMs !== undefined
+        && closeSeen.atMs >= startEnteredAtMs && closeSeen.atMs <= startResolvedAtMs,
+        `the real close must land while onProcessStart is still pending: entered=${startEnteredAtMs}ms close=${closeSeen.atMs}ms resolved=${startResolvedAtMs}ms`,
+      );
+      assert.equal(result.code, 1, "a child that exits failing before any protocol traffic must settle as a failure");
+      assert.equal(result.failure?.category, "protocol");
+      // With the close already observed, the prompt write finds the child's
+      // stdin closed: the deterministic fail-closed transport refusal.
+      assert.match(result.failure?.message ?? "", /stdin is not writable/);
+      assert.equal(exits.length, 1, "the real exit must be settled exactly once through onProcessExit");
+      assert.equal(exits[0]!.code, 3, "onProcessExit must carry the child's real exit code");
+      assert.equal(exits[0]!.signal, null);
+      assert.equal(promptDelivered, false, "no prompt may be delivered before PID persistence completes (here: at all)");
+    } finally {
+      childProcessExports.spawn = realSpawn;
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -25,6 +25,17 @@ import { BrowserDiagnosticQuota as DiagnosticsQuota, DiagnosticRing as Diagnosti
 import { OperationDeadline } from "../src/web/browser-operations";
 import { asError, bounded, throwIfAborted } from "../src/web/browser-primitives";
 import { interactiveRouteDecision as urlPolicyRouteDecision } from "../src/web/browser-url-policy";
+import {
+  BROWSER_FILL_MAX_CHARS,
+  BROWSER_TYPE_MAX_CHARS,
+  BROWSER_TYPE_MAX_DELAY_MS,
+  BROWSER_SELECT_MAX_OPTIONS,
+  DEFAULT_BROWSER_DOWNLOAD_RETENTION,
+} from "../src/web/browser-limits";
+import { interactiveChromiumArgs } from "../src/web/browser-session-cleanup";
+import * as limitsModule from "../src/web/browser-limits";
+import * as cleanupModule from "../src/web/browser-session-cleanup";
+import * as managerModule from "../src/web/interactive-browser";
 
 // Issue #153: the helper families moved into sibling modules. These tests pin
 // the extraction invariants the existing suite cannot see: the manager module
@@ -115,4 +126,57 @@ test("moved error constructors keep their fixed recovery text", () => {
   const open = openCancellationError("visibility", false);
   assert.ok(open.message.startsWith("BrowserOpen was cancelled by a browser visibility settings change before navigation dispatch"));
   assert.equal(classifyNavigationError(new Error("net::ERR_NAME_NOT_RESOLVED while fetching https://example.com/")), "dns_resolution_failed");
+});
+
+// Issue #46 browser responsibility decomposition: the remaining extracted
+// browser modules keep the same invariants as the #153 helpers above. The
+// facade must keep re-exporting the exact same value identities, and the
+// moved interaction-input bounds must behave identically at their new home.
+test("decomposed browser modules keep the historical facade identities", () => {
+  const limitsHome = limitsModule;
+  const cleanupHome = cleanupModule;
+  assert.equal(managerModule.BROWSER_FILL_MAX_CHARS, limitsHome.BROWSER_FILL_MAX_CHARS);
+  assert.equal(managerModule.BROWSER_TYPE_MAX_CHARS, limitsHome.BROWSER_TYPE_MAX_CHARS);
+  assert.equal(managerModule.BROWSER_UPLOAD_MAX_FILES, limitsHome.BROWSER_UPLOAD_MAX_FILES);
+  assert.equal(managerModule.BROWSER_CLIPBOARD_READ_MAX_CHARS, limitsHome.BROWSER_CLIPBOARD_READ_MAX_CHARS);
+  assert.equal(managerModule.DEFAULT_BROWSER_DOWNLOAD_RETENTION, limitsHome.DEFAULT_BROWSER_DOWNLOAD_RETENTION);
+  assert.equal(managerModule.BROWSER_DIAGNOSTIC_READ_MAX_EVENTS, limitsHome.BROWSER_DIAGNOSTIC_READ_MAX_EVENTS);
+  assert.equal(managerModule.INTERACTIVE_BROWSER_LIMITS, limitsHome.INTERACTIVE_BROWSER_LIMITS);
+  assert.equal(managerModule.DEFAULT_VIEWPORT_WIDTH, limitsHome.DEFAULT_VIEWPORT_WIDTH);
+  assert.equal(managerModule.DEFAULT_VIEWPORT_HEIGHT, limitsHome.DEFAULT_VIEWPORT_HEIGHT);
+  // Moved pure helpers keep one authoritative function object through the facade.
+  assert.equal(managerModule.normalizeBrowserPressKey, limitsHome.normalizeBrowserPressKey);
+  // interactiveChromiumArgs keeps its exact argument list (shared hardening).
+  assert.deepEqual(
+    interactiveChromiumArgs(4321),
+    cleanupHome.interactiveChromiumArgs(4321),
+  );
+  // Facade value identity for interactiveChromiumArgs and the manager class.
+  assert.equal(managerModule.interactiveChromiumArgs, cleanupHome.interactiveChromiumArgs);
+  assert.equal(typeof managerModule.InteractiveBrowserManager, "function");
+  assert.equal(managerModule.InteractiveBrowserManager.name, "InteractiveBrowserManager");
+  for (const internalName of [
+    "cleanupSession",
+    "captureVisibilityPlan",
+    "handleLiveWebSocket",
+    "readTargetStructure",
+    "readSemanticDetail",
+    "confirmationBinding",
+  ]) {
+    assert.equal(internalName in managerModule, false, `facade must not leak ${internalName}`);
+  }
+});
+
+test("moved interaction bounds keep the facade's public values", () => {
+  assert.equal(BROWSER_FILL_MAX_CHARS, 4_096);
+  assert.equal(BROWSER_TYPE_MAX_CHARS, 1_000);
+  assert.equal(BROWSER_TYPE_MAX_DELAY_MS, 5);
+  assert.equal(BROWSER_SELECT_MAX_OPTIONS, 32);
+  assert.equal(DEFAULT_BROWSER_DOWNLOAD_RETENTION, 8);
+  assert.equal(
+    typeof managerModule.normalizeBrowserPressKey,
+    "function",
+  );
+  assert.throws(() => managerModule.normalizeBrowserPressKey("Enter "), /BrowserPress key/);
+  assert.equal(managerModule.normalizeBrowserPressKey("Shift+Tab"), "Shift+Tab");
 });

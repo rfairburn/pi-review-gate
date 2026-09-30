@@ -15,6 +15,17 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.99]
+
+### Changed
+
+- Decompose browser limits, approval bindings, isolated readers, diagnostics,
+  WebSocket admission, interaction effects, permissions, clipboard, file
+  transfer, cleanup and visibility replacement into cohesive owners (#236,
+  audit #46). The browser manager retains authoritative session/security state
+  and live callbacks; public APIs, output, approvals, egress policy, retention,
+  host-write semantics, generation fences and fail-closed behavior are unchanged.
+
 ## [0.1.0-dev.98]
 
 ### Changed

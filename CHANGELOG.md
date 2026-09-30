@@ -15,6 +15,17 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.101]
+
+### Changed
+
+- Decompose activation diagnostics, pending delivery, persistence/owner
+  retirement, prompt composition, review cancellation and review-turn mechanics
+  into cohesive internal owners (#254, audit #46). The composition root retains
+  ordered host registrations, bootstrap, live session state and orchestration;
+  entry identity, prompts/notices, durable proof, restore/cutover, cancellation,
+  settings-save/shutdown order and fail-closed behavior are unchanged.
+
 ## [0.1.0-dev.100]
 
 ### Changed

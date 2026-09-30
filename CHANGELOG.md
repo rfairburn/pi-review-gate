@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.94]
+
+### Changed
+
+- Split the settings command into cohesive section owners while retaining
+  `registerReviewSettings` as its compatibility facade (#251, audit #46).
+  The staged draft, ordered Save transaction, validation, persistence and
+  rollback behavior, native editors, resource enrollment, and Cancel behavior
+  are unchanged. Scheduler runtime controls retain their immediate effect.
+
 ## [0.1.0-dev.93]
 
 ### Fixed

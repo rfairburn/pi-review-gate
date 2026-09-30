@@ -151,10 +151,26 @@ Multi-reviewer example:
   "maxCorrectionCycles": 3,
   "implementationGuidanceAfterCorrectionAttempts": 1,
   "retainBundles": "on-failure",
-  "reviewers": [
-    { "id": "codex", "adapter": "codex-cli", "timeoutMs": 600000 },
-    { "id": "claude", "adapter": "claude-cli", "timeoutMs": 600000 }
-  ]
+  "externalAgents": {
+    "codex": {
+      "adapter": "codex-cli",
+      "review": { "timeoutMs": 600000 }
+    },
+    "claude": {
+      "adapter": "claude-cli",
+      "review": { "timeoutMs": 600000 }
+    }
+  },
+  "review": {
+    "primaryReviewers": [
+      { "source": "external", "id": "codex" },
+      { "source": "external", "id": "claude" }
+    ],
+    "subtaskReviewers": [
+      { "source": "external", "id": "codex" },
+      { "source": "external", "id": "claude" }
+    ]
+  }
 }
 ```
 
@@ -184,6 +200,10 @@ through `/review-settings` materializes an explicit model-supported level.
   }
 }
 ```
+
+That block shows the selection layer only, not a standalone config: it assumes an
+`externalAgents.codex-sol` catalog entry (see [The `externalAgents` catalog](#the-externalagents-catalog))
+and, for live resolution, that the Pi model is currently scoped.
 
 ### Review layers and the legacy `activeReviewers` import
 
@@ -328,14 +348,17 @@ consumes.
 | `name` | (required) | Human label, editable without changing the entry's stable key. |
 | `cron` | (required) | Standard five-field Unix cron expression (minute, hour, day-of-month, month, day-of-week), interpreted in the machine's local timezone. Ranges, lists, steps, and `jan`–`dec` / `sun`–`sat` names are accepted; `7` means Sunday. No seconds field and no `@` shorthands. |
 | `enabled` | `true` | Disabled entries stay configured but are never dispatched. |
-| `kind` | `"execute"` | `execute` (write-capable subtask) or `research` (read-only subtask). Applies to the subtask destination; see [Schedule destinations](#schedule-destinations). |
+| `kind` | `"execute"` | `execute` (write-capable subtask), `research` (read-only subtask), or `inplace` (writes directly in its scoped directory through the `execute` worker route, with no capture or landing; the directory is not a sandbox and review is post-hoc, never a rollback). Applies to the subtask destination; see [Schedule destinations](#schedule-destinations) and [In-place kind](delegated-execution.md#in-place-subtask-kind). |
 | `destination` | `"subtask"` | Where a due occurrence is delivered: `"subtask"` (the existing isolated scheduled-subtask dispatch) or `"orchestrator-turn"` (a turn to the existing primary agent). See [Schedule destinations](#schedule-destinations). |
 | `instructions` | (required) | Instructions carried verbatim to the scheduled subtask or orchestrator turn. An image pasted through the native host editor is copied into a private managed store at Save and the instructions keep the managed absolute path — see [Scheduled instruction images](#scheduled-instruction-images). |
 | `workspace` | required for `subtask`; otherwise absent | Explicit authorized target directory for a scheduled subtask. A leading `~` or `~/...` expands against the user's home (the same Pi-native rule as the built-in file tools); every other spelling, including `~user`, is used verbatim. Save persists the expanded absolute spelling of a tilde workspace (the runtime separately resolves the target's realpath). Orchestrator-turn entries may omit it or leave it empty; any stored value is unused and never overrides the existing agent's current Pi launch workspace. Switching an entry back to `subtask` requires a valid workspace. |
 | `workerResourceId` | absent | Optional override naming an `execution.workerResources` entry. See below. Unused while the destination is `orchestrator-turn`. |
 | `review` | absent | Task-local review choice. See below. Unused while the destination is `orchestrator-turn`. |
 
-Example:
+Illustrative fragment, not a standalone config: it assumes a research-capable
+`execution.workerResources.local-research` entry and usable routes are already
+configured — see [Delegated execution](delegated-execution.md#worker-resources-routes-and-concurrency);
+on its own the pinned `local-research` reference does not resolve.
 
 ```json
 {
@@ -382,7 +405,7 @@ any stored copy going stale:
   reviews that task's runs with exactly the listed set. An explicit choice
   never mutates the global or parent review state, and an unreviewed run is
   recorded as an ordinary unreviewed outcome; no pass verdict is ever
-  fabricated. Review overrides apply to `execute` entries: research runs have
+  fabricated. Review overrides apply to `execute` and `inplace` entries: research runs have
   no review stage, so a `selected` override on a `research` entry fails closed
   at dispatch time instead of being silently ignored (`off` is a consistent
   no-op there).
@@ -877,8 +900,18 @@ boundaries are owned by [Web tools](web-tools.md) and
 
 ## `/review-settings`
 
-`/review-settings` opens one staged settings transaction with fourteen sections:
+`/review-settings` opens one staged settings transaction with sixteen ordinary rows —
+Operating mode, Mode cycle hotkey, Worker resources, Execution priority, Research
+priority, Reviewers, Timeouts, Review policy, Bundle retention, Global concurrency,
+Retry policy, Subtask notifications, Deferred Pi tools, Subtasks view, Scheduled
+tasks, and Web — plus a conditional **Scheduler runtime** row when the host runtime
+supplies the live switch (the ordinary extension entry point always does):
 
+- **Operating mode** stages the primary assistant posture; **Save changes** persists it
+  ([Operating modes](#operating-modes)).
+- **Mode cycle hotkey** edits the `modeCycleShortcut` binding in the same staged
+  transaction; a changed hotkey takes effect after `/reload`
+  ([Direct mode-cycle hotkey](#direct-mode-cycle-hotkey)).
 - **Worker resources** defines Pi-scoped models and execution-capable entries from
   `externalAgents`, each with one physical maximum concurrency shared by every
   background-task kind. The catalog displays alphabetically and edits by stable key —
@@ -929,7 +962,7 @@ boundaries are owned by [Web tools](web-tools.md) and
 - **Subtasks view** stores the expanded/collapsed live-panel preference globally.
 - **Scheduled tasks** opens the scheduled-task submenu (issue #26): one staged entry
   per independent scheduled task, keyed by its stable identity, with name,
-  five-field Unix cron schedule in machine-local time, execute/research kind,
+  five-field Unix cron schedule in machine-local time, execute/research/inplace kind,
   schedule destination (**Subtask** — the default isolated scheduled subtask, or
   **Orchestrator turn** — see [Schedule destinations](#schedule-destinations)),
   instructions, explicit authorized workspace directory, an optional worker
@@ -942,7 +975,8 @@ boundaries are owned by [Web tools](web-tools.md) and
   fields block Save with a named validation error. Entries stay visible and
   editable regardless of the **Scheduler runtime** switch, and saving never
   clears entries. See [Scheduled task fields](#scheduled-task-fields).
-- **Scheduler runtime** (shown when the host runtime provides the switch) is a
+- **Scheduler runtime** (the conditional row, shown when the host runtime provides
+  the switch; the ordinary extension entry point supplies it) is a
   live, current-process-only On/Off toggle for scheduled execution: it applies
   immediately, is never persisted in the config file, and stays outside the
   staged Save/Cancel transaction. See

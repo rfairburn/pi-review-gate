@@ -15,7 +15,20 @@ underlying behavior.
     exported `PI_REVIEW_GATE_CONFIG`; it creates a zero-model default config at the
     default location on first launch instead of failing. See
     [Configuration](configuration.md#config-discovery).
-  - The config file must be a JSON object; malformed JSON fails with an error.
+  - The config file is malformed JSON, not a JSON object, or unreadable. Startup
+    does not fail and the original file is never overwritten: the extension reports a
+    warning, continues ordinary initialization with built-in zero-model defaults (no
+    reviewers or workers selected), and — when the document parses but carries invalid
+    fields — field-wise recovery keeps every valid sibling setting while reporting
+    selections that cannot be resolved as unavailable instead of inventing
+    replacements. Those defaults select no reviewers or workers; recovery is not a
+    successful review or an implicit model choice. This is distinct from strict
+    validation, which still applies to explicit configuration writes and
+    `/review-settings` Save (an invalid config is never written; the write or save
+    fails with an actionable error), and from the launcher's first-launch
+    default-config publication, which fails closed on its own errors without touching
+    anything else (next entry). See
+    [Configuration](configuration.md#config-discovery).
 - **First launch reports it could not create the default config.** The launcher
   initializes the default config in the Pi agent directory (`~/.pi/agent/review-gate.json`,
   following `PI_CODING_AGENT_DIR`) only when neither persistent path exists, and fails

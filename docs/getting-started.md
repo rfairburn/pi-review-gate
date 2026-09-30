@@ -133,11 +133,15 @@ A minimal example using Codex as the reviewer:
   "retainBundles": "on-failure",
   "externalAgents": {
     "codex": {
-      "adapter": "codex-cli"
+      "adapter": "codex-cli",
+      "review": { "timeoutMs": 600000 }
     }
   },
   "review": {
-    "activeReviewers": [
+    "primaryReviewers": [
+      { "source": "external", "id": "codex" }
+    ],
+    "subtaskReviewers": [
       { "source": "external", "id": "codex" }
     ]
   }

@@ -285,9 +285,12 @@ to limit the orchestrator, pass Pi's native allowlist through the wrapper, for e
   [Delegated execution](delegated-execution.md#external-harness-protocol).
 - Pre-cutover configuration fields (`decider`, `reviewers`, `enabledReviewerIds`,
   `execution.activeExecutor`, `execution.executorPool`, `execution.externalExecutors`)
-  are no longer accepted: old-only records fail to load with an actionable diagnostic,
-  and doubled records consume the canonical shape alone without rewriting the stored
-  record ([Configuration](configuration.md#pre-cutover-configuration-fields)).
+  are no longer accepted: strict validation (explicit configuration writes and
+  `/review-settings` Save) rejects an old-only record with an actionable diagnostic,
+  while startup recovery warns about and omits the unsupported fields — never
+  converting them into reviewer or worker selections — and doubled records consume the
+  canonical shape alone without rewriting the stored record
+  ([Configuration](configuration.md#pre-cutover-configuration-fields)).
 
 ## Shared native tool-result expansion
 
@@ -382,7 +385,7 @@ self-describing text rendered through Pi's default text display:
   snapshot. Expansion never re-reads, re-fetches, or reconstructs from live job state;
   restored results without structured details degrade to the retained text preview
   (bounded collapsed, complete expanded).
-- The eighteen interactive `Browser*` tools from `BrowserOpen` through `BrowserClose`
+- The twenty-one interactive `Browser*` tools from `BrowserOpen` through `BrowserClose`
   (`src/web/browser-renderer.ts`) share one wrapper (`browserRenderResult`): the
   collapsed view presents concise, tool-specific operation/outcome summaries rather
   than previews of returned diagnostic text (opened/navigated titles and URLs, snapshot

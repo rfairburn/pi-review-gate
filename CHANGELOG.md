@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.95]
+
+### Fixed
+
+- Detach the WebSocket test client's completed HTTP-handshake listener so
+  legal split header/frame delivery cannot fabricate a duplicate initial frame
+  (#256, audit #46). Deterministic split/coalesced delivery regressions preserve
+  the existing broker assertions and deadlines; production broker behavior and
+  network policy remain unchanged.
+
 ## [0.1.0-dev.94]
 
 ### Changed

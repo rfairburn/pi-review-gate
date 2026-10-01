@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.103]
+
+### Changed
+
+- Share the explicit-Add worker-resource enrollment rule between its immediate
+  Add action and final-model reconciliation (#249, audit #46). Preserve route
+  membership, ordering, research eligibility, reasoning, and staged Save/Cancel
+  behavior; passive loading or saving still never activates unused resources.
+
 ## [0.1.0-dev.102]
 
 ### Fixed

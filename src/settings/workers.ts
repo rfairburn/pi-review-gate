@@ -37,8 +37,9 @@ export interface WorkerResourceVisitResult {
 /**
  * The root menu's Worker resources visit: pool editing plus the visit-scoped
  * enrollment and re-pairing bookkeeping that previously lived in the root
- * dispatch (moved verbatim, with its duplicated Add-time and changed-model
- * enrollment blocks preserved as-is). Takes the staged slices as plain
+ * dispatch (moved verbatim). Its explicit-Add enrollment rule is implemented
+ * once in enrollResourceInRoleRoutes and invoked at both the Add action and
+ * the changed-final-model reconciliation. Takes the staged slices as plain
  * values and returns the updated slice.
  */
 export async function visitWorkerResources(
@@ -67,16 +68,9 @@ export async function visitWorkerResources(
       workerResources = await selectExecutorPool(ui, workerResources, agents, config, scoped, (id, value) => {
         // Explicit Add enrolls the new resource in each supported role priority
         // directly at the action, in addition order, with the model's default
-        // reasoning. The membership guard keeps add/remove/re-add of one
-        // identity from producing duplicate route references. Passive load/save
-        // never enrolls: missing or empty routes stay empty.
-        if (!executeRoute.some((entry) => entry.resourceId === id)) {
-          executeRoute.push({ ...defaultWorkerRouteEntry(id, value.selection, scoped) });
-        }
-        if (workerResourceSupportsResearch(config, value.selection)
-            && !researchRoute.some((entry) => entry.resourceId === id)) {
-          researchRoute.push({ ...defaultWorkerRouteEntry(id, value.selection, scoped) });
-        }
+        // reasoning. Passive load/save never enrolls: missing or empty routes
+        // stay empty.
+        enrollResourceInRoleRoutes(id, value.selection, executeRoute, researchRoute, config, scoped);
         enrolledSelectionKeys.set(id, executorSelectionKey(value.selection));
       });
       executeRoute = reconcileWorkerRoute(executeRoute, workerResources);
@@ -94,17 +88,8 @@ export async function visitWorkerResources(
         if (baselineKey === currentKey) continue;
         if (!priorResourceIds.has(id)) {
           // Added by explicit Add during this visit: enrollment follows the
-          // final selection, not the model chosen at Add time. Enroll in each
-          // supported role the resource is not currently listed in; the
-          // membership guards keep add/remove/re-add of one identity
-          // duplicate-free.
-          if (!executeRoute.some((entry) => entry.resourceId === id)) {
-            executeRoute.push({ ...defaultWorkerRouteEntry(id, value.selection, scoped) });
-          }
-          if (workerResourceSupportsResearch(config, value.selection)
-              && !researchRoute.some((entry) => entry.resourceId === id)) {
-            researchRoute.push({ ...defaultWorkerRouteEntry(id, value.selection, scoped) });
-          }
+          // final selection, not the model chosen at Add time.
+          enrollResourceInRoleRoutes(id, value.selection, executeRoute, researchRoute, config, scoped);
           enrolledSelectionKeys.set(id, currentKey);
         }
         // Re-pair retained entries with the new model's reasoning; this runs
@@ -240,6 +225,30 @@ function defaultWorkerRouteEntry(resourceId: string, selection: ExecutorSelectio
     resourceId,
     thinkingLevel: choice ? effectiveThinkingLevel(undefined, choice) : undefined,
   };
+}
+
+/**
+ * The explicit-Add enrollment rule shared by the Add action and the
+ * changed-final-model reconciliation: list the resource in each role route it
+ * is not already listed in — execute unconditionally, research only when its
+ * selection supports research — with the model's default reasoning. The
+ * membership guards keep add/remove/re-add of one identity duplicate-free.
+ */
+function enrollResourceInRoleRoutes(
+  resourceId: string,
+  selection: ExecutorSelection,
+  executeRoute: WorkerRouteEntry[],
+  researchRoute: WorkerRouteEntry[],
+  config: ReviewGateConfig,
+  scoped: ScopedModelChoice[],
+): void {
+  if (!executeRoute.some((entry) => entry.resourceId === resourceId)) {
+    executeRoute.push({ ...defaultWorkerRouteEntry(resourceId, selection, scoped) });
+  }
+  if (workerResourceSupportsResearch(config, selection)
+      && !researchRoute.some((entry) => entry.resourceId === resourceId)) {
+    researchRoute.push({ ...defaultWorkerRouteEntry(resourceId, selection, scoped) });
+  }
 }
 
 export async function selectWorkerRoute(

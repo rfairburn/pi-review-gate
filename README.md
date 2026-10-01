@@ -78,11 +78,13 @@ receipts of exactly what the model was told.
 - Node.js 20 or newer for this extension; your installed Pi version may require a
   newer Node.js (see [Getting started](docs/getting-started.md#prerequisites)).
 - Pi, installed independently.
-- Git on `PATH` — required for delegated execution (worker worktrees, capture,
-  landing, recovery, and diff3 conflict materialization); ordinary review evidence
-  capture uses Git when available and falls back to a filesystem walk without it.
-- At least one harness installed and authenticated by its own login/configuration
-  (Codex CLI, Claude CLI, a Pi-scoped model, or a generic CLI program). Do not put
+- Git on `PATH` for captured/worktree-based delegated execution (capture, landing,
+  recovery, and diff3 conflict materialization). Opt-in in-place work also supports
+  non-Git directories. Ordinary review evidence capture uses Git when available
+  and falls back to a filesystem walk without it.
+- For reviews or worker execution, the chosen harness installed and authenticated
+  through its own login/configuration (Codex CLI, Claude CLI, a Pi-scoped model, or
+  a generic CLI program). Do not put
   OAuth tokens or API keys in the review-gate config file — see
   [Security model](docs/security-model.md#secrets-and-authentication).
 
@@ -96,6 +98,8 @@ automatic, lives in [Getting started](docs/getting-started.md#prerequisites), al
 with the current Bash/Unix requirements of the shell launcher and `ShellStart`.
 
 ## Installation
+
+From a source checkout:
 
 ```bash
 npm install
@@ -114,47 +118,28 @@ Chromium is missing.
 
 ## Minimal configuration and launch
 
-The persistent launcher reads its config from a fixed location and deliberately ignores
-an exported `PI_REVIEW_GATE_CONFIG`, so a parent pi session cannot redirect it. On every
-platform it uses the first path that exists:
-
-- `review-gate.json` in the Pi agent directory — `~/.pi/agent/review-gate.json` by
-  default (`%USERPROFILE%\.pi\agent\review-gate.json` on Windows), following Pi's
-  native `PI_CODING_AGENT_DIR` override when set
-- `~/.config/pi-review-gate/config.json` — an implicit compatibility fallback
-
-On its first launch, when neither is present, the launcher creates a private zero-model
-default config at the default location (no reviewers or workers selected) and continues;
-you then configure models through `/review-settings` or by editing the file. A config
-that exists only at the fallback location stays selected unchanged; nothing is copied,
-rewritten, or migrated between the two locations. To start from an existing config
-instead, place (or copy) it before launching:
+Launch from the checkout on macOS/Linux:
 
 ```bash
-mkdir -p ~/.pi/agent
-cp /path/to/review-gate.json ~/.pi/agent/review-gate.json
 ./scripts/pi-review-gate.sh
 ```
 
-On Windows, the same launcher is available natively for cmd.exe and PowerShell — no
-Bash, WSL, or PowerShell script execution:
+On Windows, use the native cmd.exe/PowerShell entry point (no Bash or WSL required):
 
 ```bat
 scripts\pi-review-gate.cmd
 ```
 
-From an npm installation, the Windows entry point is `pi-review-gate-cmd`. The native
-entry pairs a thin `.cmd` file with a Node helper (`scripts/pi-review-gate-launcher.cjs`)
-that mirrors the POSIX launcher end to end: the same configuration discovery and
-first-launch initialization (deliberately ignoring an inherited `PI_REVIEW_GATE_CONFIG`),
-development rebuilds versus the packaged artifact, the pinned DDGS web-search dependency
-(provisioned natively in a `Scripts\python.exe` virtual environment — no `.sh` execution),
-the shipped-skill refresh, launch diagnostics, argument forwarding, and exit codes.
-The helper requires Node.js 20+ and Python 3 for web-search provisioning on PATH;
-Pi's own Node.js requirement still applies (see [Prerequisites](#prerequisites)).
+The persistent launcher selects the Pi agent directory's `review-gate.json`
+(`~/.pi/agent/review-gate.json` by default, following `PI_CODING_AGENT_DIR`), then
+`~/.config/pi-review-gate/config.json` as a compatibility fallback. It ignores an
+inherited `PI_REVIEW_GATE_CONFIG`. If neither file exists, first launch creates a
+private zero-model config and prints a notice; existing files are not overwritten
+or migrated. No reviewer or worker model is selected implicitly. Configure selections
+through `/review-settings` or edit the selected file.
 
-The first launch prints a notice when it creates the default config; automatic review
-stays off until at least one reviewer is selected.
+Installation from a release tarball, configuration discovery, native launcher details,
+and argument forwarding are covered in [Getting started](docs/getting-started.md).
 
 A minimal config using Codex as the reviewer:
 
@@ -181,41 +166,29 @@ A minimal config using Codex as the reviewer:
 }
 ```
 
-The launcher builds the extension when sources are present, selects the first existing
-persistent config, refreshes the shipped skills under
-`~/.agents/skills/` (pi-review-gate-orchestrator, pi-review-gate-execution, and pi-review-gate-research), and forwards all remaining
-arguments to `pi`.
-For development you can load the built extension directly instead; in that path
-`PI_REVIEW_GATE_CONFIG` is honored because it reaches the extension itself rather than
-goes through the launcher:
+The launcher builds when sources are present, refreshes the shipped skills, and
+forwards remaining arguments to Pi. For direct extension loading (where
+`PI_REVIEW_GATE_CONFIG` is honored), see [Launch paths](docs/getting-started.md#launching).
+To disable everything, set `PI_REVIEW_GATE_DISABLED=1`.
 
-```bash
-PI_REVIEW_GATE_CONFIG=/path/to/review-gate.json \
-pi -e /path/to/pi-review-gate/dist/src/index.js
-```
-
-To disable everything, set `PI_REVIEW_GATE_DISABLED=1`. The complete field reference,
-multi-reviewer setups, `/review-settings`, and legacy compatibility live in
-[Configuration](docs/configuration.md); ready-to-run examples are in
-[examples/](examples/).
+See [Configuration](docs/configuration.md) for fields and compatibility,
+[Settings](docs/settings.md) for the staged menu, and [examples/](examples/) for
+ready-to-run configurations.
 
 ## Platform and shell compatibility
 
-`ShellStart` runs commands in this platform's fixed shell: Bash on macOS/Linux,
-PowerShell on Windows (`pwsh.exe` first, then the built-in `powershell.exe`; there is
-no shell selection). On a Windows host without either executable, `ShellStart` fails
-with a clear error before starting any job. Pi ships its native `bash` tool on every
-platform and an optional `powershell` tool on Windows; wherever review-gate handles
-shell commands — side-effect evidence and worker shell-tool authorization —
-`powershell` receives the same treatment as `bash`, subject to actual host availability
-and authorization: a tool the host has not registered or authorized is simply not
-exposed, and neither name widens a tool catalog on its own. Plan/research posture
-removes arbitrary shell entirely. The persistent launcher has a native Windows entry
-point (`scripts\pi-review-gate.cmd`, or `pi-review-gate-cmd` from an npm installation).
-Broader native Windows worktree/landing/recovery validation remains incomplete. See
-[Delegated execution](docs/delegated-execution.md#background-shell-tools).
+`ShellStart` uses a fixed shell: Bash on macOS/Linux; PowerShell on Windows
+(`pwsh.exe`, then `powershell.exe`). There is no shell selector; a missing Windows
+shell fails before any job starts. Host shell-tool availability and authorization
+remain ceilings, and plan/research posture exposes no arbitrary shell.
+
+The launcher has a native Windows entry point, but broader native Windows
+worktree/landing/recovery validation remains incomplete. The complete shell and
+ownership contract is in [Background shell tools](docs/delegated-execution.md#background-shell-tools).
 
 ## How a review turn works
+
+With automatic primary review enabled and usable reviewers selected:
 
 1. An agent turn completes and is appended to the review window's evidence bundle as a
    numbered exchange (workspace diff, side effects, tool evidence, summary, usage).
@@ -236,51 +209,45 @@ The full lifecycle, including commands (`/review-now`, `/review-cancel`, `/revie
 ## Delegated execution in one paragraph
 
 With a worker route configured, the orchestrator can start 1–16 bounded background tasks
-per group. Each task captures the source workspace independently (git-ignored files are
-never captured or landed), works in an isolated worktree, and lands on its own: accepted
-tasks acquire the source-mutation lease, replan against current main, and leave landed
-changes uncommitted without touching source HEAD, index, staging state, or stash.
-Three-way conflicts materialize ordinary diff3 markers plus a durable gate that blocks
-later landings until `SubtasksMarkClean` verifies the resolution. Details live in
-[Delegated execution](docs/delegated-execution.md); recovery semantics live in
-[Recovery](docs/recovery.md).
+per group. An `execute` task captures the source workspace independently (git-ignored
+files are never captured or landed), works in an isolated worktree, and lands on its
+own: accepted tasks acquire the source-mutation lease, replan against current main,
+and leave landed changes uncommitted without touching source HEAD, index, staging
+state, or stash. Three-way conflicts materialize ordinary diff3 markers plus a durable
+gate that blocks later landings until `SubtasksMarkClean` verifies the resolution.
+
+`research` returns a read-only report without landing. Opt-in `inplace` writes
+immediately in an existing directory, including non-Git directories; the root is
+cwd/snapshot scope, not a sandbox, and post-hoc review never gates or rolls back those
+writes. See [Delegated execution](docs/delegated-execution.md) for kinds and lifecycle,
+[Subtask evidence](docs/subtask-evidence.md) for inspection, and [Recovery](docs/recovery.md)
+for durable recovery.
 
 ## Documentation
 
-| Topic | Page |
+The [documentation index](docs/README.md) maps every topic and suggests reading paths.
+Start with the guide for your task:
+
+| Task | Guides |
 | --- | --- |
-| Overview and index | [docs/README.md](docs/README.md) |
-| Prerequisites, install, first launch | [docs/getting-started.md](docs/getting-started.md) |
-| Config reference, defaults, `/review-settings` | [docs/configuration.md](docs/configuration.md) |
-| Review lifecycle, commands, cancellation | [docs/review-workflow.md](docs/review-workflow.md) |
-| Subtask workers, capture/landing, shell tools | [docs/delegated-execution.md](docs/delegated-execution.md) |
-| WebSearch / WebFetch / BrowserExtract | [docs/web-tools.md](docs/web-tools.md) |
-| AskUserQuestion, pending list, decline semantics | [docs/user-questions.md](docs/user-questions.md) |
-| Trust boundaries, egress hardening, read-only enforcement | [docs/security-model.md](docs/security-model.md) |
-| Crash recovery, restart, retry/failover | [docs/recovery.md](docs/recovery.md) |
-| Build, tests, static checks, launcher internals | [docs/development.md](docs/development.md) |
-| Numbered prereleases, artifacts, publication recovery | [docs/releases.md](docs/releases.md) |
-| Symptom-to-fix troubleshooting | [docs/troubleshooting.md](docs/troubleshooting.md) |
+| Install and configure | [Getting started](docs/getting-started.md), [Configuration](docs/configuration.md), [Settings](docs/settings.md) |
+| Review and delegate | [Review workflow](docs/review-workflow.md), [Delegated execution](docs/delegated-execution.md), [Scheduled tasks](docs/scheduled-tasks.md) |
+| Research and browse | [Web tools](docs/web-tools.md), [Browser guide](docs/browser.md), [Browser permissions](docs/browser-permissions.md) |
+| Inspect and recover | [Subtask evidence](docs/subtask-evidence.md), [Recovery](docs/recovery.md), [Troubleshooting](docs/troubleshooting.md) |
+| Assess and extend | [Security model](docs/security-model.md), [Development](docs/development.md), [Releases](docs/releases.md) |
 
 ## Development
 
 ```bash
-npm install              # dependencies (downloads Chromium unless skipped)
-npm run build:test      # compile tests without touching the live dist/
-npm run test:run        # full compiled suite (up to four test files concurrently)
-npm run test:run:serial # full serial fallback after npm run build:test, for resource/ordering-sensitive diagnosis
-npm test                # build + full suite; rebuilds the live dist/, so reserve it for CI or an explicitly owned isolated build
-npm run test:fast       # short pure/unit development loop
-npm run test:execution  # serial background/recovery/pool/session/tool-contract tier
-npm run test:serial     # build + serial suite; rebuilds the live dist/, so reserve it for CI or an explicitly owned isolated build
-npm run check:static    # tsc --noEmit + shellcheck + docs link/anchor/JSON validation
-npm run test:package    # pack, install into a scratch consumer, assert required files
+npm run build:test    # compile tests without touching the live dist/
+npm run test:run      # full compiled suite (up to four test files concurrently)
+npm run check:static  # types, shell lint, docs links/anchors/JSON/privacy
+npm run test:package  # scratch build, install, docs/example byte-fidelity smoke
 ```
 
-In a working checkout, run `npm run build:test` followed by `npm run test:run` for the
-process, Git, filesystem, and end-to-end suite before finalizing a phase; `npm test`
-rebuilds the live `dist/`, so reserve it for CI or an explicitly owned isolated build.
-Build and workflow details live in [docs/development.md](docs/development.md).
+Use an owned isolated build for commands that rebuild `dist/` (including `npm test`).
+The [development guide](docs/development.md) owns prerequisites, fast/execution tiers,
+serial diagnosis, launcher internals, and verification limits.
 
 ## Contributing and governance
 

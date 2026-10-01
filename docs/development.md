@@ -68,7 +68,7 @@ The complete suite (`npm run test:run`) executes up to four test files concurren
   0.87.0-or-newer `dist/index.js` enables `tests/browser-native-error.test.ts` (CI uses
   `@earendil-works/pi-agent-core@0.87.0`, which needs Node >=22.19; the model stream is
   mocked, with no live model calls). Without it the test skips itself. See
-  [Web tools](web-tools.md#interactive-browser).
+  [Browser guide](browser.md#interactive-browser).
 - **Optional: an installed Pi** (`@earendil-works/pi-coding-agent` plus its pi-tui
   peer, resolved from the node binary's install tree or the common global locations)
   enables the real-host tier of `tests/native-editor-bridge.test.ts` and the
@@ -154,8 +154,16 @@ rebuilds the live `dist/`, so reserve it for CI or an explicitly owned isolated 
 into a scratch staging tree without touching live `dist`, packs that tree with lifecycle
 scripts disabled, installs the tarball into a scratch consumer, asserts that required
 files (including the public `docs/` tree) are present, checks that the `pi-review-gate`
-bin is executable, and runs the deterministic docs validation against the installed
-package layout.
+bin is executable, requires every actual flat `docs/*.md` page and standalone
+`examples/*.json` configuration in the source tree to install byte-identically into the
+packaged tarball (derived coverage with no hardcoded file list, so newly added pages and
+example configs are validated automatically when the shipped tree moves or grows), and
+runs the deterministic docs validation against the installed package layout.
+
+The focused shipped-config tests (`tests/example-configs.test.ts`) normalize the shipped
+standalone example configs and the runnable JSON blocks in the documentation through the
+production strict validator and check intended reviewer selections/resolution and worker
+routes using hermetic fixtures, without invoking providers or reviewer/executor commands.
 
 ## Static checks and docs validation
 
@@ -167,10 +175,12 @@ package layout.
   resolves to an existing file.
 - Every local anchor (`#fragment`, including `page.md#fragment`) matches a heading in
   the target page (GitHub-style slug matching).
-- The required public docs set exists, every docs page is reachable from the root
-  `README.md` through relative links, and the shipped root docs (`CONTRIBUTING.md`,
-  `SECURITY.md`, `CHANGELOG.md`) are linked directly from `README.md` (core
-  reachability).
+- The required public docs set exists, every discovered flat `docs/*.md` page is
+  reachable from the root `README.md` through relative links (required reachability
+  derives from the discovered docs inventory, not merely the fixed core list, so a newly
+  added page must gain a README-reachable inbound link), and the shipped root docs
+  (`CONTRIBUTING.md`, `SECURITY.md`, `CHANGELOG.md`) are linked directly from
+  `README.md` (core reachability).
 - Every fenced `json` code block parses as JSON.
 - Referenced repository paths (examples, scripts, license files) exist.
 - The public governance/docs surface (validated markdown plus `.github/**` when

@@ -30,7 +30,7 @@ import {
 const ROOT = join(__dirname, "..", "..");
 
 /** Canonical page for the scheduledTasks fragment, classified by fence content. */
-const SCHEDULED_FRAGMENT_PAGE = "docs/configuration.md";
+const SCHEDULED_FRAGMENT_PAGE = "docs/scheduled-tasks.md";
 
 type SelectionExpectation =
   | { source: "pi"; model: string; thinkingLevel?: string }
@@ -572,7 +572,7 @@ test("configuration legacy activeReviewers fragment normalizes and imports into 
   assert.deepEqual(effective.subtaskReviewers, imported, "legacy fragment: subtask import");
 });
 
-test("configuration scheduledTasks fragment is illustrative and needs its documented worker context", async () => {
+test("scheduled-tasks scheduledTasks fragment is illustrative and needs its documented worker context", async () => {
   const markdown = await readFile(join(ROOT, SCHEDULED_FRAGMENT_PAGE), "utf8");
   const fences = extractJsonFences(markdown);
   const fragment = findUniqueFence(

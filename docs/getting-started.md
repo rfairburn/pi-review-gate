@@ -14,14 +14,15 @@ Behavioral detail lives in the linked pages.
   installed and upgradeable. Use a Node version meeting both packages' requirements:
   for example, Pi 0.87.0 requires Node.js 22.19.0 or newer even though this extension's
   own declared minimum is Node.js 20.
-- **A reviewer or executor harness**, installed and authenticated by its own
-  login/configuration: the Codex CLI (`codex` by default), the Claude CLI (`claude`),
+- **For reviews or worker execution: the chosen harness**, installed and
+  authenticated through its own login/configuration: the Codex CLI (`codex` by default), the Claude CLI (`claude`),
   a Pi-scoped model (the `pi` CLI), or a generic CLI program. Do not put OAuth tokens
   or API keys in the review-gate config file — see
   [Security model](security-model.md#secrets-and-authentication).
-- **Git on `PATH`** — required for delegated execution, recommended for review-only
-  use:
-  - Delegated execution invokes Git directly and fails closed without it. Subtask
+- **Git on `PATH`** — required for captured/worktree-based delegated execution,
+  recommended for review-only use. Opt-in [in-place work](delegated-execution.md#in-place-subtask-kind)
+  also supports non-Git directories without capture or landing:
+  - Captured/worktree-based execution invokes Git directly and fails closed without it. Subtask
     capture builds a private bare repository, workers run in detached-HEAD worktrees
     (`git worktree add`/`remove`/`prune`), candidate snapshots are committed with
     plumbing commands (`write-tree`, `commit-tree`, `update-ref`), landing, integration,
@@ -122,7 +123,7 @@ Windows, following Pi's `PI_CODING_AGENT_DIR` override) — with a valid zero-mo
 default — no reviewers or workers selected — so a fresh install starts without any
 hand-created config. You then
 add reviewers and workers through `/review-settings` or by editing the file; until you
-do, automatic review stays off and nothing is invoked.
+do, no reviewer or worker model is invoked implicitly; no usable review is configured.
 A minimal example using Codex as the reviewer:
 
 ```json

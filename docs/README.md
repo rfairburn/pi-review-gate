@@ -14,10 +14,15 @@ each other instead of duplicating detail.
 | Page | Owns |
 | --- | --- |
 | [Getting started](getting-started.md) | Prerequisites, installation, first configuration, launch paths, first review walkthrough. |
-| [Configuration](configuration.md) | The complete JSON config reference, defaults, legacy compatibility, and the `/review-settings` UI. |
+| [Configuration](configuration.md) | Config discovery, core JSON fields and defaults, operating modes, reviewer catalogs/layers, legacy compatibility, and web settings. |
+| [Settings menu](settings.md) | `/review-settings` sections, staged edits, Save/Cancel, reload requirements, and separate live runtime actions. |
+| [Scheduled tasks](scheduled-tasks.md) | Schedule catalog, destinations, worker/review overrides, instruction images, local time/DST, and runtime dispatch. |
 | [Review workflow](review-workflow.md) | Review windows, evidence bundles, reviewer adapters, corrections, transmission, commands, cancellation. |
-| [Delegated execution](delegated-execution.md) | Subtask tools, worker resources and routes, capture and landing, conflicts, steering, background shell tools. |
-| [Web tools](web-tools.md) | `WebSearch`, `WebFetch`, `BrowserExtract`, bounded semantic browser sessions, click confirmation policy, cache behavior, and the standalone web CLI. |
+| [Delegated execution](delegated-execution.md) | Subtask kinds and tools, worker resources/routes, capture and landing, conflicts, steering, notifications, background shell tools. |
+| [Subtask evidence](subtask-evidence.md) | Inspection, bounded indexed reads, review-cycle history, evidence provenance, and retention/redaction limits. |
+| [Web tools](web-tools.md) | `WebSearch`, `WebFetch`, `BrowserExtract`, page cache, and the standalone web CLI. |
+| [Browser guide](browser.md) | Interactive sessions and tools, semantic observations, browser visibility, ownership and cleanup. |
+| [Browser approvals and permissions](browser-permissions.md) | Human interaction approval and opt-in capability permissions, their distinct lifetimes, limits and failure boundaries. |
 | [User questions](user-questions.md) | The `AskUserQuestion` tool: async/sync modes, the persistent pending panel above the editor and question list (Ctrl+Alt+Up), answer/decline semantics, session isolation, availability limits. |
 | [Security model](security-model.md) | Trust boundaries, egress hardening, read-only enforcement, isolation limits, secrets handling. |
 | [Recovery](recovery.md) | Crash recovery for landing manifests, exact-session restart, executor retry and failover. |
@@ -29,10 +34,15 @@ each other instead of duplicating detail.
 
 - **Evaluate the project:** root [README](../README.md), then
   [Getting started](getting-started.md).
-- **Operate reviews day to day:** [Configuration](configuration.md) and
-  [Review workflow](review-workflow.md).
-- **Run background workers:** [Delegated execution](delegated-execution.md) and
-  [Recovery](recovery.md).
+- **Configure reviews day to day:** [Settings menu](settings.md),
+  [Configuration](configuration.md) for raw fields, then [Review workflow](review-workflow.md).
+- **Run background workers:** [Delegated execution](delegated-execution.md),
+  [Subtask evidence](subtask-evidence.md), then [Recovery](recovery.md).
+- **Schedule work:** [Scheduled tasks](scheduled-tasks.md) with the
+  [Settings menu](settings.md) for staged setup.
+- **Research and browse:** [Web tools](web-tools.md), [Browser guide](browser.md),
+  then [Browser approvals and permissions](browser-permissions.md) before enabling capabilities.
+- **Ask for user decisions:** [User questions](user-questions.md).
 - **Assess risk:** [Security model](security-model.md).
 - **Extend or verify the codebase:** [Development](development.md).
 

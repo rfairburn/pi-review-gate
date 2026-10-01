@@ -27,8 +27,10 @@ closed before any write:
   Reusable workflow runs inherit the caller's original event context, and both the
   workflow-level conditions and the scripts re-validate the environment, so
   `workflow_dispatch`, forks, and other refs are refused. CI additionally invokes the
-  builder only after both required check jobs (`verify` and `full-tests`) succeeded:
-  GitHub's implicit `success()` guard on `needs` skips publication when either check
+  builder only after all verification dependencies (`verify`, `full-tests`,
+  `windows-launcher`, and `windows-shell`) succeeded. The `verify` matrix runs on
+  Node 20 and Node 24; both Windows jobs gate publication as well as the full suite.
+  GitHub's implicit `success()` guard on `needs` skips publication when any dependency
   failed or was skipped. There is no `workflow_run`
   privilege chain, no custom PAT, and no GitHub App; the only write permission anywhere
   is `contents: write` on the single publish job.

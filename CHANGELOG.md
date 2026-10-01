@@ -15,6 +15,26 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.102]
+
+### Fixed
+
+- Correct reviewer configuration examples and onboarding review roles, retaining
+  the advertised models, timeouts, limits and correction settings (#250, audit
+  #46). Clarify startup recovery warnings versus strict configuration writes,
+  all settings sections, scheduled in-place work and the browser-tool inventory.
+
+### Changed
+
+- Organize scheduling, settings, interactive browsing, browser approvals and
+  permissions, and subtask evidence into linked canonical guides. Keep the
+  README focused on setup, essential limits and task-oriented navigation.
+- Validate shipped JSON configurations and runnable documentation examples
+  through production normalization and hermetic reviewer resolution. Require
+  every discovered documentation page to be reachable and verify installed
+  documentation and examples byte-for-byte against source. Runtime behavior,
+  configuration policy, reviewer/model choices and safety boundaries are unchanged.
+
 ## [0.1.0-dev.101]
 
 ### Changed

@@ -97,20 +97,39 @@ try {
     "CONTRIBUTING.md",
     "SECURITY.md",
     "CHANGELOG.md",
-    // Public documentation tree (required to ship in the npm package).
-    "docs/README.md",
-    "docs/getting-started.md",
-    "docs/configuration.md",
-    "docs/review-workflow.md",
-    "docs/delegated-execution.md",
-    "docs/web-tools.md",
-    "docs/security-model.md",
-    "docs/recovery.md",
-    "docs/development.md",
-    "docs/troubleshooting.md",
   ]) {
     assert.ok(fs.statSync(path.join(installed, required)).isFile(), `missing packed file: ${required}`);
   }
+  // Derived flat-page coverage (no per-file hardcoded list): every flat docs/*.md page
+  // and every standalone examples/*.json configuration in the source tree must exist in
+  // the packed install with identical file bytes, so later docs edits, newly added
+  // pages, and canonical example configs are validated automatically when the shipped
+  // tree moves or grows. Subdirectories (docs/assets) are not byte-diffed here; the
+  // docs checker validates the installed markdown layout.
+  const assertShippedByteIdentical = (sourceDir, shippedPrefix, ext) => {
+    assert.ok(
+      fs.statSync(sourceDir, { throwIfNoEntry: false })?.isDirectory(),
+      `expected source directory to ship is missing: ${shippedPrefix}/`,
+    );
+    for (const entry of fs.readdirSync(sourceDir).sort()) {
+      if (!entry.endsWith(ext)) continue;
+      const sourceFile = path.join(sourceDir, entry);
+      if (!fs.statSync(sourceFile).isFile()) continue;
+      const shippedFile = path.join(installed, shippedPrefix, entry);
+      assert.ok(
+        fs.statSync(shippedFile, { throwIfNoEntry: false })?.isFile(),
+        `missing packed file: ${shippedPrefix}/${entry}`,
+      );
+      assert.ok(
+        fs.readFileSync(shippedFile).equals(fs.readFileSync(sourceFile)),
+        `packed file differs byte-wise from source: ${shippedPrefix}/${entry}`,
+      );
+    }
+  };
+  // Flat docs pages (docs/*.md only; subdirectories such as assets ship unchanged).
+  assertShippedByteIdentical(path.join(projectRoot, "docs"), "docs", ".md");
+  // Standalone example configs (examples/*.json only).
+  assertShippedByteIdentical(path.join(projectRoot, "examples"), "examples", ".json");
   // Validate the installed package layout with the same deterministic docs rules
   // (links, anchors, reachability, fenced JSON, referenced paths) used in-repo.
   execFileSync(

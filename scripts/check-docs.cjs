@@ -18,9 +18,11 @@
 //      skipped).
 //   2. Every local anchor (#fragment, including page.md#fragment) matches a heading
 //      in the target page using GitHub-style slug matching.
-//   3. The required public docs set exists, every docs page is reachable from the root
-//      README.md through relative links, and the shipped root governance docs are linked
-//      directly from README.md (core reachability).
+//   3. The required public docs set exists, every discovered docs/*.md page (required
+//      reachability derived from the inventory actually parsed, so a newly added page
+//      must gain a README-reachable inbound link) is reachable from the root README.md
+//      through relative links, and the shipped root governance docs are linked directly
+//      from README.md (core reachability).
 //   4. Every fenced `json` code block parses as JSON.
 //   5. Referenced repository paths (examples, scripts, license files) exist.
 //   6. The public governance/docs surface (validated markdown plus .github/** when
@@ -64,11 +66,13 @@ const REQUIRED_DOCS = [
   "docs/security-model.md",
   "docs/recovery.md",
   "docs/development.md",
+  "docs/user-questions.md",
+  "docs/releases.md",
   "docs/troubleshooting.md",
 ];
-
-// The docs-tree pages that must each be reachable from the root README.
-const DOCS_PAGES = REQUIRED_DOCS.filter((p) => p.startsWith("docs/"));
+// docs/user-questions.md and docs/releases.md are current core public pages now covered
+// by required existence; genuinely new pages need no per-page hardcoding because the
+// reachability check below derives from the discovered docs inventory.
 
 // Referenced repository paths that must exist relative to the package/repo root.
 // These are the resources the public documentation points users at and that the
@@ -285,7 +289,13 @@ function main() {
         }
       }
     }
-    for (const page of [...DOCS_PAGES, ...ROOT_LINKED_DOCS]) {
+    // Required reachability derives from the markdown inventory actually parsed
+    // (every discovered flat docs/*.md page) plus the shipped root governance docs,
+    // so a later docs addition must gain a README-reachable inbound link instead of
+    // slipping past a hardcoded page list. The required-page existence checks above
+    // are unchanged.
+    const discoveredDocsPages = [...parsed.keys()].filter((p) => p.startsWith("docs/")).sort();
+    for (const page of [...discoveredDocsPages, ...ROOT_LINKED_DOCS]) {
       if (!reachable.has(page)) {
         fail(`docs page not reachable from README.md: ${page}`);
       }

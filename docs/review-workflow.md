@@ -69,7 +69,7 @@ activity can continue during review; a passing review is not an attestation of z
 browser resources or absence of later web effects. The same session/tab handles work
 in later turns. Use `BrowserClose` to stop those effects explicitly. Terminal session
 shutdown/replacement/reload still closes browser resources. See
-[Interactive browser](web-tools.md#interactive-browser) for limits and closure behavior.
+[Interactive browser](browser.md#interactive-browser) for limits and closure behavior.
 
 ## Reviewer execution
 

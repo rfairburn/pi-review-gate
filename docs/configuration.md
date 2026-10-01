@@ -1,7 +1,11 @@
 # Configuration
 
-This page owns the complete configuration reference: config discovery, every JSON field
-with its default, the `/review-settings` UI, and legacy compatibility. Runtime behavior
+This page owns the raw configuration reference: config discovery, kill switches, every
+JSON field with its default, operating modes and the mode-cycle hotkey, reviewer
+selections, catalogs, and imports, delegated-execution defaults, Web fields, and legacy
+compatibility. The staged `/review-settings` menu is documented on the
+[Settings menu](settings.md#review-settings) page, and the scheduled-task feature guide
+lives on [Scheduled tasks](scheduled-tasks.md#scheduled-task-fields). Runtime behavior
 described only briefly here is owned by the linked page.
 
 ## Config discovery
@@ -151,10 +155,26 @@ Multi-reviewer example:
   "maxCorrectionCycles": 3,
   "implementationGuidanceAfterCorrectionAttempts": 1,
   "retainBundles": "on-failure",
-  "reviewers": [
-    { "id": "codex", "adapter": "codex-cli", "timeoutMs": 600000 },
-    { "id": "claude", "adapter": "claude-cli", "timeoutMs": 600000 }
-  ]
+  "externalAgents": {
+    "codex": {
+      "adapter": "codex-cli",
+      "review": { "timeoutMs": 600000 }
+    },
+    "claude": {
+      "adapter": "claude-cli",
+      "review": { "timeoutMs": 600000 }
+    }
+  },
+  "review": {
+    "primaryReviewers": [
+      { "source": "external", "id": "codex" },
+      { "source": "external", "id": "claude" }
+    ],
+    "subtaskReviewers": [
+      { "source": "external", "id": "codex" },
+      { "source": "external", "id": "claude" }
+    ]
+  }
 }
 ```
 
@@ -184,6 +204,10 @@ through `/review-settings` materializes an explicit model-supported level.
   }
 }
 ```
+
+That block shows the selection layer only, not a standalone config: it assumes an
+`externalAgents.codex-sol` catalog entry (see [The `externalAgents` catalog](#the-externalagents-catalog))
+and, for live resolution, that the Pi model is currently scoped.
 
 ### Review layers and the legacy `activeReviewers` import
 
@@ -316,335 +340,42 @@ defaults to `true`. The default retry policy is
 
 ## Scheduled task fields
 
-`scheduledTasks` is an unordered catalog keyed by each task's stable identity.
-Every schedule entry is stored exactly once, in this catalog — there is no
-second copy, no parallel mirror, and no copied global setting inside an entry.
-The cron timer and dispatch that run these entries are part of the scheduled-run
-runtime; this section defines, validates, and persists the entries that runtime
-consumes.
-
-| Field | Default | Meaning |
-| --- | --- | --- |
-| `name` | (required) | Human label, editable without changing the entry's stable key. |
-| `cron` | (required) | Standard five-field Unix cron expression (minute, hour, day-of-month, month, day-of-week), interpreted in the machine's local timezone. Ranges, lists, steps, and `jan`–`dec` / `sun`–`sat` names are accepted; `7` means Sunday. No seconds field and no `@` shorthands. |
-| `enabled` | `true` | Disabled entries stay configured but are never dispatched. |
-| `kind` | `"execute"` | `execute` (write-capable subtask) or `research` (read-only subtask). Applies to the subtask destination; see [Schedule destinations](#schedule-destinations). |
-| `destination` | `"subtask"` | Where a due occurrence is delivered: `"subtask"` (the existing isolated scheduled-subtask dispatch) or `"orchestrator-turn"` (a turn to the existing primary agent). See [Schedule destinations](#schedule-destinations). |
-| `instructions` | (required) | Instructions carried verbatim to the scheduled subtask or orchestrator turn. An image pasted through the native host editor is copied into a private managed store at Save and the instructions keep the managed absolute path — see [Scheduled instruction images](#scheduled-instruction-images). |
-| `workspace` | required for `subtask`; otherwise absent | Explicit authorized target directory for a scheduled subtask. A leading `~` or `~/...` expands against the user's home (the same Pi-native rule as the built-in file tools); every other spelling, including `~user`, is used verbatim. Save persists the expanded absolute spelling of a tilde workspace (the runtime separately resolves the target's realpath). Orchestrator-turn entries may omit it or leave it empty; any stored value is unused and never overrides the existing agent's current Pi launch workspace. Switching an entry back to `subtask` requires a valid workspace. |
-| `workerResourceId` | absent | Optional override naming an `execution.workerResources` entry. See below. Unused while the destination is `orchestrator-turn`. |
-| `review` | absent | Task-local review choice. See below. Unused while the destination is `orchestrator-turn`. |
-
-Example:
-
-```json
-{
-  "scheduledTasks": {
-    "task-nightly": {
-      "name": "Nightly docs check",
-      "cron": "30 2 * * *",
-      "enabled": true,
-      "kind": "execute",
-      "instructions": "Check the docs for staleness and report any findings",
-      "workspace": "/work/pi-review-gate"
-    },
-    "task-research": {
-      "name": "Morning research digest",
-      "cron": "0 9 * * mon-fri",
-      "enabled": true,
-      "kind": "research",
-      "instructions": "Summarize upstream releases",
-      "workspace": "/work/pi-review-gate",
-      "workerResourceId": "local-research",
-      "review": { "mode": "off" }
-    }
-  }
-}
-```
+`scheduledTasks` is an unordered catalog keyed by each task's stable identity; every
+schedule entry is stored exactly once in this catalog, and the cron timer and dispatch
+that run these entries are part of the scheduled-run runtime. The complete field
+reference — catalog shape and defaults, inheritance and overrides, schedule destinations,
+scheduled instruction images, local time and daylight saving, settings behavior and
+process visibility, and runtime dispatch — is owned by the
+[Scheduled tasks](scheduled-tasks.md#scheduled-task-fields) page.
 
 ### Inheritance and overrides
 
-Inheritance is per-field and resolved live at each future run; absence is the
-only marker, so a global change flows into every still-inheriting entry without
-any stored copy going stale:
-
-- **Worker:** an entry with no `workerResourceId` uses the current global route
-  for its kind when it runs. An entry with `workerResourceId` uses exactly that
-  worker resource, selected from the independent `execution.workerResources`
-  catalog — it does not have to appear on the kind's global route, because
-  route membership would defeat the entry's independence from later route
-  edits. Research capability is still enforced: a `research` entry may only
-  name a research-capable resource.
-- **Review:** an entry with no `review` inherits the current global subtask
-  review settings at run time. An explicit choice is task-local and frozen per
-  run: `{ "mode": "off" }` runs the task's subtasks without review — allowed
-  for write-capable tasks too — and `{ "mode": "selected", "reviewers": [...] }`
-  reviews that task's runs with exactly the listed set. An explicit choice
-  never mutates the global or parent review state, and an unreviewed run is
-  recorded as an ordinary unreviewed outcome; no pass verdict is ever
-  fabricated. Review overrides apply to `execute` entries: research runs have
-  no review stage, so a `selected` override on a `research` entry fails closed
-  at dispatch time instead of being silently ignored (`off` is a consistent
-  no-op there).
-
-The two inheritances are independent: an entry may pin a worker while
-inheriting review policy, or the reverse.
+See [Inheritance and overrides](scheduled-tasks.md#inheritance-and-overrides) on the
+Scheduled tasks page.
 
 ### Schedule destinations
 
-Each scheduled entry selects where its due occurrences are delivered
-(issue #222). The choice is per-entry and never a global replacement for
-scheduled subtasks; existing entries stay subtask-dispatched without an
-implicit migration.
-
-**`subtask` (default; absence of the field has this meaning):** the entry
-dispatches through the ordinary scheduled-subtask path exactly as before —
-its kind, workspace, worker resource, and task-local review choice apply,
-the one-unsettled-run-per-entry overlap rule applies (a later due occurrence
-is skipped while a previous run of the entry is still unsettled and reported
-with the active handles, and an overdue occurrence is reported as not-run
-instead of catching up), and completion/failure delivery follows the
-`execution.subtaskNotifications` quiet/noisy policy. After a successful
-dispatch the top-level model is additionally woken with a model-facing
-launch notice carrying the schedule identity (entry id, name, exact due
-minute, cron expression) and the execution/task handles. It uses the same
-shared, non-model-initiated subtask-launch mechanism as a human
-`/subtask-add`: the same non-interrupting follow-up delivery lane, the same
-redaction and character bounds, the same origin metadata, and the same
-causal ordering that keeps a fast-settling outcome behind the notice — only
-the origin-specific context differs. The notice never dispatches a duplicate
-of the task and never implies it has progressed or completed.
-
-**`orchestrator-turn`:** the due entry's instructions and opaque occurrence
-identity are delivered as a NEW TURN to the EXISTING primary agent instead of
-starting a subtask. No second Pi instance is launched, and there is no
-workspace-root override for this destination: the agent acts in its current
-Pi launch workspace with its current tools, model, and review behavior, and
-may act directly or start subtasks. The `workspace` field may be omitted or
-empty; any stored value is unused. Delivery is a non-interrupting follow-up
-that still triggers a turn — a busy orchestrator is never interrupted; the
-queued turn runs after its current turn. The scheduled occurrence completes
-when its initiating turn ends. Subtasks or other background work the turn
-started continue under their own existing lifecycle and notifications; they
-never keep the schedule occurrence open, and later due occurrences of the
-entry are evaluated independently (there is no per-entry overlap gate in this
-destination).
-
-Installed Pi starts an idle custom-message turn without emitting
-`before_agent_start`; for both idle and queued custom messages, the extension
-therefore arms the fail-closed review baseline and reasserts the deferred-tool
-authorization at the host's `message_start`, before that message's model
-request. A busy queued message shares the already-armed review window. The
-occurrence is correlated only by its opaque id on that exact `message_start`,
-then completed after its consuming run ends and the submit-cycle settles; an
-unrelated human turn, message delivery, or downstream subtask completion
-cannot settle it. If review/auth re-arming fails, native tool calls are
-blocked for the session and the occurrence is not counted. A host without the
-required run/message lifecycle hooks rejects scheduled orchestrator delivery
-before sending it, with an actionable limitation report. A definitely
-rejected send fails closed with an actionable scheduler wake; nothing was
-triggered. A send the host accepts but never acknowledges within its bounded
-window is reported as **uncertain**: whether the turn was queued is UNKNOWN,
-it may still arrive, the occurrence is not counted as executed, and the report
-warns the owner to inspect the conversation before retrying so a pending turn
-is never duplicated.
+See [Schedule destinations](scheduled-tasks.md#schedule-destinations) on the Scheduled
+tasks page.
 
 ### Scheduled instruction images
 
-An image pasted through the native editor in a scheduled task's
-**Instructions** field (Ctrl+V in the interactive TUI) inserts a path to one
-of Pi's temporary clipboard files — a path, never image bytes, and Pi deletes
-those files, so a temporary path saved as instruction text would break on a
-later run. At Save, such a paste is made durable instead:
-
-- Save verifies each pasted path against the **final staged instructions**
-  (an observation of the paste is only provenance; a token that was deleted or
-  edited away copies nothing), opens the file and validates it by content
-  (PNG, JPEG, GIF, or WebP; regular file; at most 10 MiB), copies the bytes
-  into a private managed store next to the config file
-  (`<config dir>/scheduled-image-assets/<task id>/`), and replaces the
-  temporary path in the instructions with that managed absolute path before
-  the ordinary atomic config write. The config file never contains image
-  bytes.
-- Only text Pi's image paste itself could have produced is treated as a
-  pasted image: a single absolute path in the OS temp directory named
-  `pi-clipboard-<UUID>.<png|jpg|jpeg|gif|webp>` (Pi's own paste naming, with
-  the strict UUID basename, and the content still validated after that path
-  recognition). Pi's native Ctrl+V inserts ordinary clipboard text through
-  the same editor call, so a plain text paste — any other absolute path
-  (file, directory, real or nonexistent), a sentence, or `@` attachment text
-  — is never treated as an image: it stays verbatim in the instructions and
-  Save behaves exactly as native text paste always did, even when the named
-  file does not exist or its content happens to be an image. If the temp
-  directory's own name contains spaces (a Windows user or home directory), a
-  genuine UUID-named temp insert is still recognized.
-- The managed store is private (0700 directories, 0600 files, fsynced before
-  the rename) and append-only: assets are **never auto-deleted** when an entry
-  is edited, disabled, or removed, because an active run of that entry — or a
-  scheduled run in another Pi process sharing the config — may still read
-  them. After every run that could reference a file has settled (or the entry
-  and any sharing process are gone), delete unneeded files from the store
-  manually. A bounded garbage-collection pass is a possible follow-up, not
-  current behavior.
-- Fail closed: a pasted source that is missing (Pi's temp file already
-  deleted), not a supported image, or too large fails the whole Save with an
-  actionable notice, leaving the config and the store untouched; the same
-  applies if the copy fails, or if a source grows past the limit between the
-  size check and the read, and only copies that Save positively created are
-  removed (if a persistence failure lands after the config write, the copies
-  the persisted text references are kept, matched against the parsed saved
-  config). Cancel at any level copies
-  nothing, and a pasted path must remain separated by spaces from surrounding
-  text — a path glued to adjacent text fails Save with a message asking for
-  the separating space. A pasted image therefore has to
-  be re-pasted and Saved while its source still exists (paste, then Save — do
-  not close and reopen the settings menu in between without saving). Text
-  glued directly after a pasted path (for example a `.bak` suffix) also fails
-  Save: the saved reference would never resolve; trailing sentence punctuation
-  (`<path>.`, `<path>,`) is still accepted.
-- Provenance boundary: only inserts observed through the native editor's
-  public paste seam are ever considered. A `pi-clipboard-...` path that
-  appears in the instructions without such an observation — typed by hand,
-  edited into the config file, or entered through the non-interactive
-  editor/input fallback — cannot be verified and fails Save with an actionable
-  message instead of being copied or persisted; Pi deletes its clipboard temp
-  files, so persisting such a reference would promise image availability it
-  cannot keep. Save checks every staged scheduled entry, so a pre-existing
-  unobserved clipboard-temp reference also blocks an otherwise unrelated
-  settings Save until that reference is removed. This gate is broader than
-  the copy recognition: any `pi-clipboard-...` reference without an observed
-  paste fails Save, even
-  with a non-image extension or a non-UUID name. Ordinary typed paths and
-  commands are never touched, and
-  `@`-picker selections or terminal drops (whose image provenance is not
-  observable through public native seams) are left as ordinary text. If the
-  same image is needed in two entries, paste it into each entry; the pastes
-  get independent managed copies. If the managed store root or a per-task
-  directory exists as a symbolic link (for example pointed at a foreign
-  directory), Save fails closed with an actionable message: the store is
-  never chmod'ed or copied into through a symlink, and the link's target is
-  left untouched.
-- At dispatch, an entry whose instructions reference a managed image that no
-  longer exists fails that occurrence closed with the standard actionable
-  dispatch-failure report (naming the missing file) instead of silently
-  starting a run against a dead path; existing overlap, overdue, and review
-  semantics are unchanged.
+See [Scheduled instruction images](scheduled-tasks.md#scheduled-instruction-images) on
+the Scheduled tasks page.
 
 ### Local time and daylight saving
 
-The cron expression is stored and interpreted only in the machine's local
-timezone. No UTC representation is stored or displayed alongside it.
-
-The runtime samples the host's actual local wall clock once per distinct
-absolute minute and dispatches every enabled entry whose expression matches
-the sampled minute. Daylight-saving behavior falls out of that sampling rather
-than from any fire-time computation:
-
-- **Spring-forward gap:** local minutes that do not exist on the transition
-  day (for example 02:00–02:59 when the clock jumps forward) are never
-  observed by the host clock, so an entry due in that window is missed for
-  that day. It runs again on its next ordinary due time.
-- **Fall-back repeat:** a local minute that occurs twice (for example 01:00–
-  01:59 when the clock repeats) is evaluated once per distinct absolute due
-  minute. An entry due at 01:30 can run on both passes; if its first run is
-  still active on the second pass, that occurrence is skipped with an
-  actionable overlap wake instead.
-- **No catch-up:** time that passes while the process is not running, while
-  the switch is Off, or while a host sleeps is never replayed. Starting,
-  re-enabling, or replanning makes the next full minute the first possible
-  dispatch. The same rule applies inside one enabled session: a due occurrence
-  whose minute passes before its own dispatch could be admitted (a previous
-  occurrence of the same entry had not yet settled) is never run late — it is
-  reported (an overlap skip when a run of the entry is active, otherwise as
-  not-run) and the next due occurrence is evaluated independently.
+See [Local time and daylight saving](scheduled-tasks.md#local-time-and-daylight-saving)
+on the Scheduled tasks page.
 
 ### Settings behavior and process visibility
 
-Entries are created and edited under **Scheduled tasks** in `/review-settings`
-— or directly through the `/scheduled-tasks` command, which opens that same
-submenu first; Esc or **Back** from it lands at the settings root with the
-**Scheduled tasks** row highlighted, where **Save changes** / **Cancel**
-behave exactly as for the ordinary entry.
-Either way entries are staged like every other section behind **Save changes**
-/ **Cancel**. Save
-validates every entry (a real cron expression, non-empty instructions, an
-existing workspace directory — relative paths are checked against the session
-working directory and a leading `~`/`~/...` is expanded against the user's
-home before that check — a resolvable worker override, and a task-local
-reviewer set that resolves like any global one) and persists the catalog while
-preserving unrelated JSON keys. A tilde workspace entered in the editor or
-hand-edited into the config file is persisted in its expanded absolute form on
-Save; until then the `~/...` spelling remains valid, because dispatch expands
-it at run time against the same home directory. Entries remain visible and
-editable regardless of the runtime switch described below, and a Save applies to the task
-definitions only: an already-running subtask is never stopped or reconfigured
-by a Save, and stopping one is an explicit action.
-
-Save also preserves schedule entries that another Pi process appended to the
-config after this instance's menu opened; entries this instance explicitly
-removed are still removed. A Pi process reads schedule definitions from its own
-loaded configuration: it sees another process's saved edits only on its own
-`/reload` or restart.
-
-Scheduled execution has a live, current-process-only On/Off switch in
-`/review-settings`. It is never stored in the config file and is never a shared
-default: a launcher process starts with scheduled execution **On only when that
-launch passed the `--scheduler` flag** — the launchers export
-`PI_REVIEW_GATE_SCHEDULER=1` for exactly that launch and clear any inherited
-value, so a nested or fresh launch without the flag starts **Off** even under a
-flagged parent. A directly loaded Pi process (no launcher) instead seeds its
-initial state from `PI_REVIEW_GATE_SCHEDULER=1` in its own environment. Either
-way, a live toggle survives `/reload` in the same process exactly as it was set.
-Because several enabled Pi processes may share one config file, two enabled
-instances can independently run the same due task — treat accidental concurrent
-runs as a real possibility and enable more than one instance only deliberately.
-If independently differing schedule sets are wanted, point the instances at
-separate config files: launcher launches follow Pi's `PI_CODING_AGENT_DIR`
-agent-directory override (the launchers deliberately ignore an inherited
-`PI_REVIEW_GATE_CONFIG`, see [Config discovery](#config-discovery)), while
-direct loads honor `PI_REVIEW_GATE_CONFIG`; there is no per-instance, per-task
-filtering.
+See [Settings behavior and process visibility](scheduled-tasks.md#settings-behavior-and-process-visibility)
+on the Scheduled tasks page.
 
 ### Runtime dispatch
 
-When the switch is On, a due entry dispatches directly through the ordinary
-background subtask start path — no model turn and no orchestrator launch turn
-are involved in starting the run. The launching orchestrator then receives the
-same ordinary owner-scoped completion, failure, and recovery notifications it
-receives for any subtask; a successful dispatch itself is reported with a
-lightweight notice.
-
-**Overlap:** while any earlier run of an entry still has unsettled tasks (the
-entry's stable id is persisted on each run's execution group, so overlap
-detection survives restarts), **every** due occurrence is skipped and the
-owning orchestrator is woken with actionable data: the schedule identity,
-the exact due time, and the active executions with their task handles. A skip
-never implies completion or cancellation, never queues a later run, and never
-interrupts the active run. Editing an entry does not proactively wake its
-orchestrator; a later due occurrence that overlaps the still-active run does.
-
-**Stopping:** turning the switch Off (or ending the session) stops future
-dispatch only — active scheduled subtasks keep running under the controller's
-own recovery semantics and are never interrupted by the scheduler. Occurrences
-that were sampled but not yet admitted when the switch went Off or the session
-ended are dropped: they can never start after a re-enable, and no catch-up run
-is started for them. Process exit stops the timers the same way; a run in
-flight settles through the existing subtask recovery rather than any
-notification to an exited process.
-
-**Save replan:** saving `/review-settings` replans the current process's
-timers immediately: future-only sampling restarts from the next full minute
-against the saved catalog, so edits apply at the very next due occurrence
-without replaying anything. A Save likewise drops occurrences that were
-sampled but not yet admitted: none of them starts afterwards with the old or
-the edited definition. Entries that fail validation at dispatch time are
-skipped with an actionable report instead of taking down the timer loop.
-
-**Managed images:** when a due entry's instructions reference a managed
-scheduled image (see [Scheduled instruction images](#scheduled-instruction-images))
-that no longer exists, the occurrence is not dispatched: it is reported
-through the standard actionable dispatch-failure wake naming the missing file,
-and the next due occurrence is evaluated independently.
+See [Runtime dispatch](scheduled-tasks.md#runtime-dispatch) on the Scheduled tasks page.
 
 ## Web fields
 
@@ -727,7 +458,7 @@ handles are replaced and the old ones are rejected). With no open browser it app
 at the next `BrowserOpen`, and saving the already-active value restarts nothing.
 Cancel in the settings menu never relaunches. For hands-on human use of a headed
 window, prefer also setting `browserIdleExpiryMinutes` to `0`. See
-[Web tools](web-tools.md#browser-visibility) for the full replacement semantics and
+[Browser guide](browser.md#browser-visibility) for the full replacement semantics and
 their limits.
 
 `web.browserInteractionApproval` accepts exactly `"ask"` (default),
@@ -738,7 +469,7 @@ confirmation-required branch of authorized native `BrowserClick`, `BrowserFill`,
 `BrowserType`, `BrowserSelect`, `BrowserPress`, `BrowserUpload`, `BrowserDownloadSave`,
 and `BrowserClipboard`; it does not turn off hard-denied
 actions, role authorization, SSRF controls, ref/target/value-digest revalidation, or
-value-secrecy protections. See [approval behavior](web-tools.md#browser-interaction-approval).
+value-secrecy protections. See [approval behavior](browser-permissions.md#browser-interaction-approval).
 
 `web.browserPermissions` holds the independently selectable managed-browser
 permission toggles from
@@ -866,7 +597,7 @@ The popup restriction override (`modelPopupRestrictionOverride`) lifts the
 four-tab session limit for page-created popups while enabled; disabling it
 closes nothing already adopted and only refuses further over-limit adoptions.
 Full semantics, including the service-worker WebSocket admission limitation,
-are documented in [Web tools](web-tools.md#browser-permissions-issue-27).
+are documented in [Browser approvals and permissions](browser-permissions.md#browser-permissions-issue-27).
 The effective policy is computed by `effectiveBrowserPolicy` in `src/web/browser-capabilities.ts`;
 YOLO-approved actions are automatic approvals and must never be reported as human-confirmed.
 
@@ -877,198 +608,10 @@ boundaries are owned by [Web tools](web-tools.md) and
 
 ## `/review-settings`
 
-`/review-settings` opens one staged settings transaction with fourteen sections:
-
-- **Worker resources** defines Pi-scoped models and execution-capable entries from
-  `externalAgents`, each with one physical maximum concurrency shared by every
-  background-task kind. The catalog displays alphabetically and edits by stable key —
-  it has no reorder controls, because row order never defines identity or scheduling.
-- **Execution priority** and **Research priority** are independently ordered subsets of
-  those resources, referenced by key. Either route can exclude a resource; a missing or
-  empty route means no models for that role. Per-route reasoning lets the same local
-  model use different effort without creating a second capacity bucket.
-- **Reviewers** opens the **Review** submenu: **Automatic primary review**,
-  **Automatic subtask review**, and **Review landed changes** toggles, plus one
-  multi-selection, `/scoped-models`-style reviewer picker per layer (**Primary
-  reviewers** and **Subtask reviewers**) over the same Pi-scoped models plus
-  review-capable entries from `externalAgents`. Each layer may be off. Saving a layer
-  Off stops that layer's automatic review from that point on (already-running reviewer
-  and executor processes finish with their launch values), while manual `/review-now`
-  and `/ask-reviewer` stay usable with selected primary reviewers either way, and
-  `/review-pause` remains unchanged. The landed-changes choice is inactive while
-  automatic primary review is off. Clearing every reviewer for a layer is valid and
-  disables that layer's automatic review without disabling delegated execution (a
-  layer with no reviewers cannot run
-  one). Each selected internal reviewer has its own **Reasoning** row per set. A legacy
-  `review.activeReviewers` record displays in both
-  sets immediately; see
-  [Review layers](#review-layers-and-the-legacy-activereviewers-import).
-- **Timeouts** edits the default reviewer and executor timeouts in minutes. Explicit
-  `review.timeoutMs` and `execution.timeoutMs` values on an `externalAgents` entry
-  override these defaults for that external harness role.
-- **Review policy** edits `maxCorrectionCycles` and
-  `implementationGuidanceAfterCorrectionAttempts` as non-negative whole numbers.
-- **Bundle retention** selects `never`, `on-failure`, or `always`.
-- **Global concurrency** sets `execution.maxWorkers` (1–16, default 4). This is the
-  total worker ceiling; each worker resource also has its own shared `maxConcurrent`
-  capacity.
-- **Retry policy** configures bounded executor/reviewer recovery: retry count,
-  exponential-backoff bounds, jitter, and the repeated-incident guard.
-- **Subtask notifications** defaults to **Quiet**. See
-  [Delegated execution](delegated-execution.md#notifications-and-ui).
-- **Deferred Pi tools** defaults to **On**. Saving **Off** immediately exposes every
-  authorized tool in the current top-level Pi session; saving **On** immediately restores
-  the conservative active subset plus `search_tools`. For new mutation-authorized
-  sessions/tasks, `write` starts active alongside `edit` and `ApplyPatch`; planning
-  still hides it, explicit exclusions still apply, and previously captured worker
-  catalogs retain their recorded initial subsets. The conservative subset always
-  includes launch-authorized native read-only discovery (`grep`, `find`, `ls`), so
-  discovery needs no deferred activation in any mode, including delegated subtasks.
-  Newly launched Pi subtasks use the saved value, while already-running subtask
-  sessions keep their launch behavior.
-- **Subtasks view** stores the expanded/collapsed live-panel preference globally.
-- **Scheduled tasks** opens the scheduled-task submenu (issue #26): one staged entry
-  per independent scheduled task, keyed by its stable identity, with name,
-  five-field Unix cron schedule in machine-local time, execute/research kind,
-  schedule destination (**Subtask** — the default isolated scheduled subtask, or
-  **Orchestrator turn** — see [Schedule destinations](#schedule-destinations)),
-  instructions, explicit authorized workspace directory, an optional worker
-  override picked from the worker-resource catalog (never from the global role
-  routes; research-capable only for research tasks; unused for orchestrator
-  turns), an optional task-local review choice (**Inherit global subtask review
-  settings**, **Off — run this task's subtasks without review**, or a selected
-  reviewer set; unused for orchestrator turns), and an enabled/disabled toggle.
-  Adding prompts for a name and generates a stable identity; required-but-unset
-  fields block Save with a named validation error. Entries stay visible and
-  editable regardless of the **Scheduler runtime** switch, and saving never
-  clears entries. See [Scheduled task fields](#scheduled-task-fields).
-- **Scheduler runtime** (shown when the host runtime provides the switch) is a
-  live, current-process-only On/Off toggle for scheduled execution: it applies
-  immediately, is never persisted in the config file, and stays outside the
-  staged Save/Cancel transaction. See
-  [Scheduled task fields](#settings-behavior-and-process-visibility).
-- **Web** includes maximum acquisition size and **Browser interaction approval**:
-  **Ask**, **Automatically Accept**, or **Automatically Deny**. Ask prompts when
-  approval is required and rejects without UI; Accept supplies automatic approval
-  without prompting; Deny rejects the approval-required branch. Already-permitted
-  observations and structurally proven local actions remain permitted in every mode.
-  Saves apply immediately to subsequent local approval decisions and acquisitions
-  without restarting. Newly launched Pi workers load the saved policy; running workers
-  keep the configuration loaded at launch. Research roles still cannot click or use
-  form-action tools. It also opens the **Browser permissions** submenu (#27) with
-  the independently selectable capability toggles — model credential entry and
-  submission, uploads, download saving, clipboard read/write, camera, microphone,
-  geolocation, service workers, popup restriction override, local networks (human
-  and model), and **YOLO / allow everything** — each staged like every other
-  section until **Save changes**. Enabling a capability presents its risk-appropriate
-  notice; enabling YOLO additionally requires an explicit interactive confirmation
-  after a prominent warning (cancellation or an unavailable dialog leaves it off),
-  shows the enabled state prominently on the Web row, and disables straightforwardly
-  with the saved individual values restored as effective. Every capability is
-  enforced: credential entry and submission, uploads, download saving, and
-  clipboard read/write by the interactive-browser tool actions; camera,
-  microphone, and geolocation as per-origin device permission grants issued on
-  navigation commits and cleared live on disable (an unconfirmable engine clear
-  fails the affected session closed); service workers at browser
-  launch, with a controlled replacement of the live browser when the saved
-  policy changes; the popup restriction override while enabled; and local
-  networks at the interactive egress broker. Saved changes apply to the live
-  session without a restart; see [Web fields](#web-fields).
-
-The `/scheduled-tasks` command is a landing shortcut into this same
-transaction: it opens the **Scheduled tasks** submenu immediately, and Esc or
-**Back** from there returns to the settings root with the **Scheduled tasks**
-row highlighted — the root's own retained-selection state. It introduces no
-second menu, state, or save path — staged edits use the identical Save
-validation and persistence, and Cancel discards them exactly as for
-`/review-settings`.
-
-Re-shown menus keep your position: after a staged change (a toggle, an add, a move),
-the next display of the same menu highlights the row you last selected — even when its
-label or position changed. In the interactive Pi TUI this renders as the host's native
-selector list, preselected through its public component API, so arrow keys, Enter, and
-Esc use Pi's supplied live keybindings manager, including configured selection-key
-remaps. Compiled extension builds resolve these TUI components from the running Pi
-installation when ordinary package-name loading is unavailable. Hosts without a terminal UI (RPC/print)
-keep the plain selector that opens at the first row; retention is TUI-only, with no GUI
-planned.
-
-In the interactive Pi TUI every text field opens as the host's own main-prompt
-editor: the extension temporarily acquires that editor through Pi's public
-`setEditorComponent` seam and embeds the same instance in the settings surface,
-so the current value arrives as an editable prefill and all of the host's native
-controls apply unmodified — Tab path completion for relative or `~/...` paths
-(typing `docs/` + Tab opens the host's own selectable list of folders *and*
-files; a single match is applied directly, exactly as in the chat editor), the
-fd-backed `@` file picker, Ctrl+C clear, Ctrl+G external editing for long values
-such as scheduled-task instructions, image paste, and Shift+Enter newlines.
-For scheduled instructions, a native image paste is persisted durably at Save
-into the private managed store described in
-[Scheduled instruction images](#scheduled-instruction-images) — the pasted
-temporary path is validated by content, copied there, and replaced by the
-managed absolute path before the config write. There is no second editor or
-clipboard surface; recognition for this persistence stays bounded to Pi's
-clipboard temp naming and this config's own managed store root.
-Enter submits the field's own text (never a chat message); Esc first dismisses a
-visible completion list, then cancels the field, leaving the staged value
-unchanged. Every editable field shares the same native absolute-path behavior
-(no per-field opt-in remains): a first-line token that starts with `/` and
-contains no space (`/`, `/se`, `/var`, a nested absolute path) gets the host
-provider's own filesystem suggestions in its ordinary file-list layout —
-never slash-command items, so a nonexistent token such as `/subtasks` simply
-lists nothing instead of offering commands, and no command can be offered or
-executed in any extension-owned field. No second completer is involved: each
-field decorates only the host-provided autocomplete provider through the
-public `setAutocompleteProvider` seam, forcing that provider's own file
-branch for those tokens and masking the returned prefix's leading slash with
-a same-length neutral sentinel so the editor renders the file list (not the
-two-column command layout) and applies a path (never `/command ` text). The
-main chat prompt itself is untouched: a line starting with `/` there keeps
-the host editor's ordinary slash-command context. Everything else is
-unchanged: relative paths, `~/...`, the fd-backed `@` picker, Ctrl+C clear,
-Ctrl+G external editing, image paste, Shift+Enter newlines,
-Esc-dismisses-the-list-first, and the chat draft all behave exactly as in
-the shared main-chat editor. This shared behavior covers every
-`/review-settings` field, every other extension-owned interactive text field
-— the staged subtask form (title, instructions, acceptance criteria,
-relevant context, target workspace), the no-argument steering instruction,
-and the private reviewer answer editor — and the AskUserQuestion free-text
-answers. Token recognition,
-relative/`~` handling, platform behavior, the list UI, and selection keys are
-inherited from the host as-is, so no universal absolute-path or Windows support
-is claimed. Two host behaviors are not preserved for absolute-path tokens through
-this public seam: a first Tab never auto-applies a single match (the list shows
-instead; after Esc, Tab reopens it and a further Tab selects the highlighted
-entry), and best-match preselection does not apply within an absolute-path list
-(the first entry is highlighted; arrow keys navigate). A space ends the token and
-returns that position to the host's own completion behavior. An interactive host
-missing the required native seams fails closed
-with an error notice instead of presenting a non-parity fallback field.
-Completion is a convenience — Save validates the workspace against the same
-session working directory used for relative completion and dispatch, and rejects
-nonexistent or non-directory targets, including a file selected from the list.
-Non-interactive hosts (RPC/print) keep their clearly identified chain: Pi's
-public editor with the current value as an editable prefill first, then the
-legacy single-line input with its placeholder semantics; a host offering neither
-seam reports an error instead of staging anything. The cron field shows
-a compact heading above its editable prefilled text mapping all five fields in
-order (minute, hour, day-of-month, month, day-of-week), stating machine-local
-time and `* * * * * = every minute`.
-
-Escape from a submenu returns to the settings root. Escape or **Cancel** at the root
-discards all staged changes; **Save changes** atomically persists every section while
-preserving unrelated JSON keys.
-
-Saved values are authoritative for execution stages that have not started.
-Already-running executor and reviewer processes finish with their launch values, while
-queued dispatch, waiting failover, later continuation turns, and later review cycles use
-the current routes, capacities, policies, and reviewer selection. Open review windows
-reconcile to the new reviewer selection immediately on save: the preserved baseline,
-evidence, and completed history are unchanged, a review already in flight finishes under
-its original selection, and later reviews use the new one (a window frozen with no
-usable reviewers becomes reviewable as soon as its settings are fixed). Subtask notification
-mode is a delivery preference and takes effect immediately for subsequent events from
-already-running tasks. Running capacity leases survive pool edits; removed entries
-receive no new work. A restarted task warns when its prior runtime configuration
-differs, and an executor-selection change starts a fresh native session from the durable
-checkpoint instead of attaching an incompatible conversation.
+The staged settings menu is documented on the [Settings menu](settings.md#review-settings)
+page: its sixteen ordinary rows, the conditional **Scheduler runtime** row, Save/Cancel
+staging and apply semantics, and the shared native text-field behavior. Raw field values
+and defaults stay in this reference — see [Top-level fields](#top-level-fields),
+[Operating modes](#operating-modes), [Reviewers](#reviewers), and
+[Web fields](#web-fields) — and scheduled-task semantics are owned by
+[Scheduled tasks](scheduled-tasks.md#scheduled-task-fields).

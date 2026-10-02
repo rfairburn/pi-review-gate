@@ -15,6 +15,12 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.105]
+
+### Changed
+
+- Use synthetic names in test fixtures; preserve test behavior.
+
 ## [0.1.0-dev.104]
 
 ### Fixed
@@ -1625,7 +1631,7 @@ dates.
 - Real QA regressions cover painted network-image pixels, valid fonts/audio,
   dedicated/shared workers, SSE beyond 32 MiB, approved synthetic search submission,
   sustained navigation beyond former quotas, and owner-alive forced Chromium-tree
-  cleanup. Fleet tool navigation/screenshots show the graphical homepage; CNN captures
+  cleanup. Sample-client-alpha tool navigation/screenshots show the graphical homepage; CNN captures
   expose advertising-frame settling and remaining third-party ad/player errors rather
   than claiming unrestricted site fidelity. Visibility, password/upload overrides and
   service-worker support are not added by this candidate (Refs #35).

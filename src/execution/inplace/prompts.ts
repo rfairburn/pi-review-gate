@@ -64,7 +64,20 @@ export function buildInPlaceReviewRequest(task: WaveWorkerTask, attribution: InP
     "Workspace snapshot disclosure:",
     "The recorded baseline is a bounded content snapshot of the launch workspace; files the snapshot policy skips (ignored directories, oversized files) are excluded from the delta.",
   );
-  if (evidence && (evidence.events.length > 0 || (evidence.toolObservabilityNotes?.length ?? 0) > 0 || evidence.candidates.size > 0)) {
+  // #266: the evidence bundle — including the worker's completed final
+  // summaries — belongs in the request whenever review was admitted with
+  // evidence. A summary-only deliverable (empty recorded delta, no tool
+  // observations) must still reach the reviewer through the request and
+  // evidence channels; it never substitutes for tool observations, and
+  // genuine zero-delta/no-evidence tasks still skip review before this
+  // request is ever built.
+  if (
+    evidence
+    && (evidence.events.length > 0
+      || (evidence.toolObservabilityNotes?.length ?? 0) > 0
+      || evidence.candidates.size > 0
+      || evidence.finalAssistantSummaries.length > 0)
+  ) {
     const bundle = buildEvidenceBundle(evidence, [], undefined, {
       selectedCwd: baseline.workspaceRoot,
       workspaceRoot: baseline.workspaceRoot,

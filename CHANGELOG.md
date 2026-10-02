@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.104]
+
+### Fixed
+
+- Preserve completed in-place worker summaries in the normal bounded, redacted
+  review evidence, including the initial turn, retries and restored context
+  (#266). Summary-only deliverables need no report file; review admission,
+  zero-delta skipping, authorization and retry limits remain unchanged.
+
 ## [0.1.0-dev.103]
 
 ### Changed

@@ -401,6 +401,12 @@ class AppServerRpc {
   private forceKillTimer: NodeJS.Timeout | undefined;
   private terminationRequested = false;
   private terminationFailures = new Map<NodeJS.Signals, string>();
+  // Latched stdin transport failure (#268): once the input channel fails, the
+  // error is remembered so work registered after the failure (e.g. a turn
+  // wait installed by a continuation that ran after the error event) also
+  // settles with it, and no further writes are attempted against the dead
+  // channel.
+  private stdinFailure: Error | undefined;
   private exitPromise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   private readonly stdoutCapture = new BoundedTextAccumulator(100 * MEBIBYTE);
   private readonly stderrCapture = new BoundedTextAccumulator(16 * MEBIBYTE);
@@ -408,6 +414,13 @@ class AppServerRpc {
   constructor(private readonly proc: ChildProcess, private readonly onNotification: (method: string, params: unknown) => void) {
     proc.stdout?.on("data", (chunk: Buffer) => this.consume(chunk.toString("utf8")));
     proc.stderr?.on("data", (chunk: Buffer) => { this.stderrCapture.append(chunk.toString("utf8")); });
+    // Contain failures of the app-server's stdin transport (e.g. EPIPE when
+    // the child closes its input channel while still alive) through the
+    // existing failure path: outstanding protocol work settles as a failure
+    // exactly like child close, instead of escaping as an uncaught stream
+    // error that would crash the host (#268). The ChildProcess 'error' event
+    // below covers spawn failures only, not stdio streams.
+    proc.stdin?.on("error", (error) => this.failTransport(error));
     this.exitPromise = new Promise((resolvePromise) => {
       proc.once("close", (code, signal) => {
         if (this.forceKillTimer) clearTimeout(this.forceKillTimer);
@@ -430,14 +443,39 @@ class AppServerRpc {
 
   request(method: string, params: unknown): Promise<unknown> {
     const id = this.nextId++;
+    if (this.stdinFailure) return Promise.reject(this.stdinFailure);
     return new Promise((resolvePromise, reject) => {
       this.pending.set(id, { resolve: resolvePromise, reject });
-      this.write({ jsonrpc: "2.0", id, method, params });
+      try {
+        this.write({ jsonrpc: "2.0", id, method, params });
+      } catch (error) {
+        // A synchronous transport refusal settles like the async one.
+        const failure = error instanceof Error ? error : new Error(String(error));
+        this.pending.delete(id);
+        reject(failure);
+        this.failTransport(failure);
+      }
     });
   }
 
   notify(method: string, params: unknown): void {
-    this.write({ jsonrpc: "2.0", method, params });
+    if (this.stdinFailure) return;
+    try {
+      this.write({ jsonrpc: "2.0", method, params });
+    } catch (error) {
+      this.failTransport(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  /** Latch a stdin transport failure and settle all outstanding protocol work with it. */
+  private failTransport(error: Error): void {
+    this.stdinFailure ??= error;
+    for (const pending of this.pending.values()) pending.reject(this.stdinFailure);
+    this.pending.clear();
+    for (const waiters of this.turnWaiters.values()) {
+      for (const waiter of waiters) waiter.reject(this.stdinFailure);
+    }
+    this.turnWaiters.clear();
   }
 
   /** True once the app-server reported a terminal status for this turn. */
@@ -451,8 +489,11 @@ class AppServerRpc {
 
   waitForTurn(threadId: string, turnId: string): Promise<Record<string, unknown>> {
     const key = `${threadId}:${turnId}`;
+    // Already-completed results stay authoritative even after a transport
+    // failure; only unfinished waits settle with the latched error (#268).
     const completed = this.completedTurns.get(key);
     if (completed) return Promise.resolve(completed);
+    if (this.stdinFailure) return Promise.reject(this.stdinFailure);
     return new Promise((resolvePromise, reject) => {
       const waiters = this.turnWaiters.get(key) ?? [];
       waiters.push({ resolve: resolvePromise, reject });
@@ -529,7 +570,17 @@ class AppServerRpc {
         continue;
       }
       if (typeof value.id === "number" && typeof value.method === "string") {
-        this.write({ jsonrpc: "2.0", id: value.id, error: { code: -32601, message: `Client does not support server request ${value.method}.` } });
+        // A reply write can fail synchronously once the input channel is
+        // dead; contain it through the same settlement path instead of letting
+        // it escape the stdout callback as an uncaught exception (#268). No
+        // further replies are attempted after the transport has failed.
+        if (!this.stdinFailure) {
+          try {
+            this.write({ jsonrpc: "2.0", id: value.id, error: { code: -32601, message: `Client does not support server request ${value.method}.` } });
+          } catch (error) {
+            this.failTransport(error instanceof Error ? error : new Error(String(error)));
+          }
+        }
         continue;
       }
       if (typeof value.method !== "string") continue;

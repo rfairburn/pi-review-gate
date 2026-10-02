@@ -15,6 +15,22 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.106]
+
+### Fixed
+
+- Contain a Codex executor's dead stdin transport through the existing
+  failed-executor outcome (#268). When the app-server child closes its stdin read
+  side while still alive, stdin stream errors and synchronous dead-channel refusals
+  of request, notification, and reply writes are remembered as a transport failure:
+  pending and later-registered protocol requests and turn waits settle with it as the
+  executor's ordinary failure — not as an uncaught stream error, a forced completion,
+  or a wait that never settles — and no further writes are attempted against the dead
+  channel, while already-completed turn results remain authoritative. Healthy protocol
+  framing and decoding, retained stream and evidence caps, startup observation order,
+  cancellation precedence, termination and child settlement, review admission, retry
+  limits, provider routing, and configuration are unchanged.
+
 ## [0.1.0-dev.105]
 
 ### Changed

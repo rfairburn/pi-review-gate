@@ -15,6 +15,21 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.108]
+
+### Fixed
+
+- Make both real-host tool-card integration suites honor the established
+  required-host gate and the installed Pi package pin (test-only; #247, audit
+  #46). When PI_REVIEW_GATE_REQUIRE_PI_HOST is exactly "1", a missing or
+  unloadable host fails clearly with the required-host diagnostic instead of
+  skipping; optional environments keep their honest reason-bearing skips. A
+  set PI_REVIEW_GATE_INSTALLED_AGENT pin is the sole discovery candidate and
+  never falls back to an ambient installation, while unpinned runs retain the
+  PI_CODING_AGENT_DIR node_modules-root override and standard global-root
+  discovery. Existing native-host assertions, test registration, Windows/CI
+  policy, host versions, and production behavior are unchanged.
+
 ## [0.1.0-dev.107]
 
 ### Fixed

@@ -15,6 +15,22 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.107]
+
+### Fixed
+
+- Decode the Codex executor's stdout and stderr incrementally as UTF-8 so a
+  valid multibyte character split across transport chunks no longer becomes a
+  replacement character in the JSON-RPC line buffer or the retained captures,
+  preserving agent text summaries, tool-event paths, and diagnostics (#238,
+  audit #46). Each channel's decoder holds a trailing partial sequence until
+  the chunk that completes it, and held tails flush at close; a genuinely
+  incomplete final sequence still decodes with the replacement character, as
+  full-stream decoding always did. RPC routing and framing, retained-output
+  caps, malformed-line handling, abort behavior, and startup/shutdown
+  settlement are unchanged. Focused controlled-child regressions require split
+  and intact chunk delivery to receive byte-identical results.
+
 ## [0.1.0-dev.106]
 
 ### Fixed

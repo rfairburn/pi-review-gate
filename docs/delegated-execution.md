@@ -267,6 +267,11 @@ Attribution and review:
   **Additional observed paths outside workspace** list supplements that snapshot
   evidence. Detailed attribution and observation limits remain in the review context
   and evidence rather than repeated in routine notices.
+- When existing policy invokes review, completed worker summaries—including the
+  initial turn—reach the reviewer through the normal bounded, redacted evidence
+  and request channels. The summaries are persisted with task evidence for retries
+  and restored context; a summary-only deliverable needs no extra report file.
+  Summary capture does not change zero-delta review skipping or retry limits.
 - Durable per-cycle reviewer records are written under the task's artifact directory as
   `reviews/inplace/cycle-NNNN.json` in an in-place record shape that carries the
   attribution basis instead of a fabricated commit identity. Subtask evidence indexes

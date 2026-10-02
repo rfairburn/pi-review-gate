@@ -128,6 +128,19 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
         baseline,
       });
       effectiveAssignment = result.effectiveAssignment ?? effectiveAssignment;
+      if (result.status === "completed") {
+        // #266: record the completed turn's final summary BEFORE this turn's
+        // durable evidence checkpoint in the finally block below. Reviewers
+        // cannot inspect runtime session artifacts, so every lifecycle branch
+        // (initial, continuation, steering, correction, confirmation) shares
+        // this one recording point through the normal bounded/redacting
+        // evidence channel — including when the recorded workspace delta is
+        // empty and the summary is the only deliverable. A checkpoint failure
+        // here rejects the turn through the existing persistence-failure
+        // error path (fail closed: no review and no successful settlement on
+        // a stale checkpoint); it is never converted into a continue.
+        rememberFinalAssistantSummaryText(window.evidence, result.summary);
+      }
       return result;
     } finally {
       await persistInPlaceObservedEvidence(window.evidence, resolvedArtifactDir);
@@ -304,7 +317,6 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
         session: resumed.session,
       });
     }
-    rememberFinalAssistantSummaryText(window.evidence, resumed.summary);
     currentResult = resumed;
   } else {
     if (input.initialResult) {
@@ -435,7 +447,6 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
             session: resumed.session,
           });
         }
-        rememberFinalAssistantSummaryText(window.evidence, resumed.summary);
         currentResult = resumed;
         attribution = await baselineFor();
       }
@@ -682,7 +693,6 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
           session: steered.session,
         });
       }
-      rememberFinalAssistantSummaryText(window.evidence, steered.summary);
       currentResult = steered;
       attribution = await baselineFor();
       continue;
@@ -875,7 +885,6 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
           session: corrected.session,
         });
       }
-      rememberFinalAssistantSummaryText(window.evidence, corrected.summary);
       currentResult = corrected;
       attribution = await baselineFor();
       continue;
@@ -1015,7 +1024,6 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
     // The workspace changed after the pass: the old pass is invalid and the
     // new delta must be reviewed (the review verdict is post-hoc; the writes
     // that produced this new delta were already performed either way).
-    rememberFinalAssistantSummaryText(window.evidence, confirmed.summary);
     currentResult = confirmed;
     attribution = confirmAttribution;
     continue;

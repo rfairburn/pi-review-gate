@@ -651,6 +651,16 @@ and continuations — follows the successor that actually served the previous tu
 full recovery story — compaction lifecycle, protected refs, restart behavior, and the
 `recoverLandingManifest` API — is owned by [Recovery](recovery.md).
 
+**Input-channel failures**: A Codex app-server executor child can close its stdin read
+side while still alive. When its input channel then fails — a stdin stream error such
+as `EPIPE`, or a synchronous refusal of a request, notification, or reply write — the
+first failure is remembered and no further writes are attempted against the dead
+channel: outstanding protocol requests and turn waits, and any registered afterwards,
+settle with that transport error, and the executor settles through the ordinary
+failure story above, while already-delivered turn results remain authoritative and
+cancellation and child settlement keep their existing behavior. This describes
+containment of a dead stdin transport, not a broader crash or resilience guarantee.
+
 Every failed or non-landed execution-tool operation returns the complete group and task
 inspection: durable handles, current source disposition, commands and acknowledgements,
 incidents, checkpoint/bundle data, artifact paths, conflicts, and concrete recovery

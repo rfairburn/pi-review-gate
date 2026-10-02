@@ -28,7 +28,7 @@ import { reviewerSelectionDigest } from "../src/session-state";
 test("rememberUserRequest appends guidance to the active review window without clearing evidence", () => {
   const state = createState();
 
-  rememberUserRequest(state, "update Fleet release bits");
+  rememberUserRequest(state, "update sample-client-alpha release bits");
   const window = state.reviewWindow!;
   window.correctionCycles = 1;
   window.evidence.events.push({
@@ -40,10 +40,10 @@ test("rememberUserRequest appends guidance to the active review window without c
     riskSignals: [],
   });
 
-  rememberUserRequest(state, "the -geolite2 needs to go back for pinterest");
+  rememberUserRequest(state, "the -geolite2 needs to go back for sample-client-beta");
 
   assert.equal(state.reviewWindow, window);
-  assert.equal(window.requestHistory.at(-1)?.text, "the -geolite2 needs to go back for pinterest");
+  assert.equal(window.requestHistory.at(-1)?.text, "the -geolite2 needs to go back for sample-client-beta");
   assert.equal(window.requestHistory.length, 2);
   assert.equal(window.requestHistory[0]?.phase, "initial");
   assert.equal(window.requestHistory[1]?.phase, "mid_run");
@@ -201,8 +201,8 @@ test("a no-change window can retain context for reviewer questions without remai
 
 test("buildRequestContext preserves user guidance and prior capped reviewer feedback", () => {
   const state = createState();
-  rememberUserRequest(state, "update Fleet release bits");
-  rememberUserRequest(state, "the -geolite2 needs to go back for pinterest");
+  rememberUserRequest(state, "update sample-client-alpha release bits");
+  rememberUserRequest(state, "the -geolite2 needs to go back for sample-client-beta");
   recordReviewerFeedback(state, {
     source: "automatic",
     disposition: "sent_at_cap",
@@ -222,9 +222,9 @@ test("buildRequestContext preserves user guidance and prior capped reviewer feed
 
   const context = buildRequestContext(state);
 
-  assert.match(context, /Initial user request:\nupdate Fleet release bits/);
+  assert.match(context, /Initial user request:\nupdate sample-client-alpha release bits/);
   assert.match(context, /Additional user guidance during the same review window:/);
-  assert.match(context, /2\. the -geolite2 needs to go back for pinterest/);
+  assert.match(context, /2\. the -geolite2 needs to go back for sample-client-beta/);
   assert.match(context, /complete feedback transmitted to the implementing model with correction deferred at the cap/);
   assert.match(context, /Historical prior review feedback/);
   assert.match(context, /Do not assume they remain unresolved/);

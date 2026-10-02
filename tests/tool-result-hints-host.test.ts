@@ -16,8 +16,13 @@
 //
 // The installed host is discovered from standard global package roots (or an
 // explicit PI_CODING_AGENT_DIR override pointing at a node_modules root that
-// contains @earendil-works/pi-coding-agent). When no installation is found the
-// whole file skips with a reason instead of fabricating coverage.
+// contains @earendil-works/pi-coding-agent); the CI-locked runtime pinned
+// through PI_REVIEW_GATE_INSTALLED_AGENT (an agent package directory, as in
+// tests/menu-tui-fakes.ts findInstalledAgentDirs) is the sole candidate when
+// it is set. When no installation is found the whole file skips with a reason
+// (or, under the established required-host gate PI_REVIEW_GATE_REQUIRE_PI_HOST=1,
+// fails naming the required missing Pi host — tests/tool-host-gate.ts, the
+// tests/bridge-fakes.ts skipOrFail semantics) instead of fabricating coverage.
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import fs from "node:fs";
@@ -28,6 +33,7 @@ import { expandableResult, type ToolResultRenderCallback } from "../src/tool-res
 import { setNativeExpansionHost, withExpansionHint, type ToolResultViewComponent } from "../src/tool-result-hints";
 import { WebToolManager } from "../src/web/tools";
 import { normalizeConfig } from "../src/config";
+import { registerMissingHostPlaceholder } from "./tool-host-gate";
 
 // ── Installed-host discovery (read-only) ─────────────────────────────────
 
@@ -71,19 +77,31 @@ interface HostBundle {
 }
 
 function discoverInstalledHost(): HostBundle | undefined {
-  const candidates = [
-    process.env.PI_CODING_AGENT_DIR,
-    "/opt/homebrew/lib/node_modules",
-    "/usr/local/lib/node_modules",
-    path.join(os.homedir(), ".npm-global", "lib", "node_modules"),
-  ].filter((dir): dir is string => typeof dir === "string" && dir.length > 0);
-  for (const root of candidates) {
-    const agentDir = path.join(root, "@earendil-works", "pi-coding-agent");
+  // A set PI_REVIEW_GATE_INSTALLED_AGENT names the agent package directory
+  // directly and is the sole candidate: an explicitly pinned (CI-locked)
+  // install is never silently replaced by an ambient global root, the same
+  // established semantics as tests/menu-tui-fakes.ts findInstalledAgentDirs.
+  // A relative pin resolves against the test process's working directory so
+  // discovery always holds an absolute anchor for createRequire.
+  const pinned = process.env.PI_REVIEW_GATE_INSTALLED_AGENT;
+  const agentDirs = pinned
+    ? [path.resolve(pinned)]
+    : [
+        process.env.PI_CODING_AGENT_DIR,
+        "/opt/homebrew/lib/node_modules",
+        "/usr/local/lib/node_modules",
+        path.join(os.homedir(), ".npm-global", "lib", "node_modules"),
+      ]
+        .filter((dir): dir is string => typeof dir === "string" && dir.length > 0)
+        .map((root) => path.join(root, "@earendil-works", "pi-coding-agent"));
+  for (const agentDir of agentDirs) {
     if (!fs.existsSync(path.join(agentDir, "package.json"))) continue;
-    // Anchor inside the agent package so both the agent and its own nested
-    // pi-tui resolve to the installed host's copies (same module instances).
-    const req = createRequire(path.join(agentDir, "node_modules", "__pi_host_anchor__.js"));
     try {
+      // Anchor inside the agent package so both the agent and its own nested
+      // pi-tui resolve to the installed host's copies (same module instances).
+      // createRequire stays inside this catch: an unusable anchor must reach
+      // the missing-host placeholder, not crash discovery.
+      const req = createRequire(path.join(agentDir, "node_modules", "__pi_host_anchor__.js"));
       // The package exports map has no require condition for ".", so the main
       // entry is loaded by file path; subpaths likewise.
       const agent = req(path.join(agentDir, "dist", "index.js"));
@@ -107,7 +125,7 @@ function stripAnsi(text: string): string {
 }
 
 if (!host) {
-  test("real-host integration coverage", { skip: SKIP_REASON }, () => {});
+  registerMissingHostPlaceholder("real-host integration coverage", SKIP_REASON);
 } else {
   // ── One-time real-host setup (this file runs in its own process) ───────
   const h = host; // narrowed for the closures below

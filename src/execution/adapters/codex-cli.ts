@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import type { CodexExecutorConfig } from "../../config";
 import { reviewerEnv, terminateProcessTree, type ProcessRunResult } from "../../adapters/process";
 import { BoundedTextAccumulator, MEBIBYTE } from "../../jsonl";
@@ -410,10 +411,16 @@ class AppServerRpc {
   private exitPromise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   private readonly stdoutCapture = new BoundedTextAccumulator(100 * MEBIBYTE);
   private readonly stderrCapture = new BoundedTextAccumulator(16 * MEBIBYTE);
+  // Incremental UTF-8 decoders: a valid multibyte sequence may straddle two
+  // 'data' chunks, and per-chunk toString("utf8") would replace it with U+FFFD
+  // in the retained captures and the JSON-RPC line buffer (#238). Each decoder
+  // holds back a trailing partial sequence until the next chunk completes it.
+  private readonly stdoutDecoder = new StringDecoder("utf8");
+  private readonly stderrDecoder = new StringDecoder("utf8");
 
   constructor(private readonly proc: ChildProcess, private readonly onNotification: (method: string, params: unknown) => void) {
-    proc.stdout?.on("data", (chunk: Buffer) => this.consume(chunk.toString("utf8")));
-    proc.stderr?.on("data", (chunk: Buffer) => { this.stderrCapture.append(chunk.toString("utf8")); });
+    proc.stdout?.on("data", (chunk: Buffer) => this.consume(this.stdoutDecoder.write(chunk)));
+    proc.stderr?.on("data", (chunk: Buffer) => { this.stderrCapture.append(this.stderrDecoder.write(chunk)); });
     // Contain failures of the app-server's stdin transport (e.g. EPIPE when
     // the child closes its input channel while still alive) through the
     // existing failure path: outstanding protocol work settles as a failure
@@ -423,6 +430,14 @@ class AppServerRpc {
     proc.stdin?.on("error", (error) => this.failTransport(error));
     this.exitPromise = new Promise((resolvePromise) => {
       proc.once("close", (code, signal) => {
+        // 'close' follows every delivered 'data' event; flush any torn
+        // trailing sequence so retained captures match full-stream decoding
+        // (a genuinely incomplete final sequence decodes to U+FFFD, as a
+        // single-chunk decode always did).
+        const stdoutTail = this.stdoutDecoder.end();
+        if (stdoutTail) this.consume(stdoutTail);
+        const stderrTail = this.stderrDecoder.end();
+        if (stderrTail) this.stderrCapture.append(stderrTail);
         if (this.forceKillTimer) clearTimeout(this.forceKillTimer);
         this.forceKillTimer = undefined;
         const error = new Error(`Codex app-server exited before completing pending protocol work (${code ?? signal ?? "unknown"}).`);

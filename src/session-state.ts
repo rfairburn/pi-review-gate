@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { link, open, readFile, realpath, rename, unlink } from "node:fs/promises";
+import { link, open, readFile, realpath, rename, unlink, type FileHandle } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import {
   duplicateReviewerSelectionsFor,
@@ -973,16 +973,43 @@ function cloneExecutionAssociations(value: ExecutionAssociationsSnapshot): Execu
   };
 }
 
+/**
+ * Atomically publish the sidecar: stage it in a same-directory exclusive temp
+ * file (mode 0600), write and fsync it, close, then rename it over the final
+ * path with a best-effort directory fsync.
+ *
+ * The temporary file is removed on any pre-publication failure — and only
+ * when this invocation created it: ownership begins when the exclusive open
+ * succeeds (a pre-existing collision at the temp path fails before ownership
+ * and is never removed), the rename is the commit point, and another
+ * writer's temp files are never touched. Cleanup is best-effort so it never
+ * masks or replaces the publication failure. If cleanup succeeds, the owned
+ * unpublished temp is gone; if it fails, the publication still fails truthfully.
+ * The previous committed sidecar stays intact before rename succeeds.
+ */
 async function atomicWrite(path: string, body: string): Promise<void> {
   const temporary = `${path}.tmp.${randomUUID()}`;
-  const file = await open(temporary, "wx", 0o600);
+  let file: FileHandle | undefined;
+  let ownsTemp = false;
   try {
-    await file.writeFile(body, "utf8");
-    await file.sync();
-  } finally {
-    await file.close();
+    file = await open(temporary, "wx", 0o600);
+    ownsTemp = true;
+    try {
+      await file.writeFile(body, "utf8");
+      await file.sync();
+    } finally {
+      // Preserve the existing close-error precedence if writing or syncing
+      // also failed. Cleanup must not change which publication error escapes.
+      await file.close();
+      file = undefined;
+    }
+    await rename(temporary, path);
+    ownsTemp = false;
+  } catch (error) {
+    if (file) await file.close().catch(() => undefined);
+    if (ownsTemp) await unlink(temporary).catch(() => undefined);
+    throw error;
   }
-  await rename(temporary, path);
   try {
     const directory = await open(dirname(path), "r");
     try {

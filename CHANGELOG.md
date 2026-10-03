@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.109]
+
+### Fixed
+
+- Clean only the session-sidecar writer's owned unpublished temporary file after
+  a failed write, sync, close or rename (#243, audit #46). Preserve committed
+  data, exclusive-create permissions, successful publication order and existing
+  error precedence; cleanup remains best-effort and never hides the failure or
+  removes another writer's file or a pre-existing collision.
+
 ## [0.1.0-dev.108]
 
 ### Fixed

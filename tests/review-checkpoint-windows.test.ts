@@ -64,7 +64,13 @@ async function injected(plan: Plan, run: (events: string[]) => Promise<void>): P
           if (key === "stat") return async () => {
             const stat = await target.stat();
             if (plan.windowsDeviceMismatch) stat.dev = 123;
-            if (plan.statFault && ++stats === (plan.statFaultAt ?? 1)) stat[plan.statFault] += 1;
+            if (plan.statFault && ++stats === (plan.statFaultAt ?? 1)) {
+              const previous = stat[plan.statFault];
+              // NTFS inode numbers can exceed MAX_SAFE_INTEGER: +1 may round
+              // back to the same Number. Prove the injected drift is distinct.
+              stat[plan.statFault] += Math.max(1, Math.abs(previous) * Number.EPSILON * 2);
+              assert.notEqual(stat[plan.statFault], previous, "stat fault must change the observed value");
+            }
             return stat;
           };
           const value = Reflect.get(target, key, target);

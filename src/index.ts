@@ -51,7 +51,7 @@ import { createReviewTurnCoordinator, isToolError } from "./activation/review-tu
 import { registerApplyPatchTool } from "./apply-patch/tool";
 import { registerGitReadTool, type GitReadHost } from "./git-read/tool";
 import { WebToolManager, type PiWebHost } from "./web/tools";
-import { DeferredToolManager } from "./deferred-tools";
+import { DeferredToolManager, isDeferredToolHost } from "./deferred-tools";
 import { loadOperatingModeSegments, OPERATING_MODE_LABELS } from "./operating-mode";
 import { registerModeCycleShortcut } from "./mode-cycle";
 import { contextIsInteractiveTui, registerUserQuestions, userQuestionsBeginSession, userQuestionsEndSession } from "./user-question";
@@ -184,9 +184,10 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       if (!deferredTools.toolCallAllowed(name, nested)) return nativeToolAuthorizationBlock(name, nested);
       return nativeToolPreflight.preflight(args);
     };
-    if (!deferredTools.register()) {
+    if (!isDeferredToolHost(pi)) {
       // This reduced executor has no bootstrap hooks below, so reset the
-      // preflight alongside its existing session lifecycle handlers.
+      // preflight alongside its existing session lifecycle handlers. The
+      // loader itself registers late (session_start) on supported hosts.
       registerHook(pi, "session_start", () => nativeToolPreflight.reset());
       registerHook(pi, "session_shutdown", () => nativeToolPreflight.reset());
       // #84 diagnostics stay available even on this reduced executor host:
@@ -197,12 +198,15 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     }
     const serializedToolCatalog = process.env[EXECUTOR_TOOL_CATALOG_ENV];
     const executorToolCatalog = executorBootstrapToolCatalog(serializedToolCatalog);
-    registerHook(pi, "session_start", (...args) => {
+    registerHook(pi, "session_start", async (...args) => {
       nativeToolPreflight.reset();
       const context = extractContext(args);
       const sessionIdentity = typeof context === "object" && context !== null
         ? (context as { sessionManager?: unknown }).sessionManager
         : undefined;
+      // Late loader registration with the host-native parameter schema, before
+      // the authorization capture that pins this worker's boundary.
+      await deferredTools.registerWithNativeSchema();
       deferredTools.sessionStart(sessionIdentity, executorToolCatalog, true);
       // Keep the one-shot bootstrap only until session_start so extension
       // reloads during initialization can still consume it. Worker tools and
@@ -269,11 +273,13 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     )
     : undefined;
 
-  // Register the compact loader before session_start. Authorization capture
-  // is deliberately delayed until executionTools.sync() has registered and
-  // reconciled every legitimately available top-level execution tool.
+  // The compact loader registers at session start — after executionTools.sync()
+  // has registered and reconciled every legitimately available top-level
+  // execution tool and before the authorization capture that pins this
+  // session's boundary. Late registration keeps Pi's load-time replaceable-
+  // builtin collision pass from seeing a competing tool_search definition, and
+  // registerWithNativeSchema reuses the host-native parameter schema.
   const deferredTools = new DeferredToolManager(pi, () => config.operatingMode, wrapperCodemodeDefault);
-  deferredTools.register();
   registerDeferredToolLifecycleHooks(pi, deferredTools);
 
   // Pending questions (issue #95): AskUserQuestion registers before
@@ -641,6 +647,12 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       await executionTools.restoreAssociations({ waveRoots: [], bundles: [] });
     }
     executionTools.sync();
+    // Late loader registration: after every legitimately available top-level
+    // execution tool is registered and reconciled, before the authorization
+    // capture below. The host-native parameter schema is resolved here so the
+    // descriptor identity Pi's own tool_search recognition requires holds for
+    // this session incarnation.
+    await deferredTools.registerWithNativeSchema();
     deferredTools.sessionStart(
       deferredSessionIdentity,
       undefined,

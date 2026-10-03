@@ -249,15 +249,20 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     };
 
     await activate(pi);
+    // Late registration (#279 follow-up): the loader is NOT registered at
+    // factory time, so Pi's load-time replaceable-builtin collision pass sees
+    // no competing tool_search definition.
     assert.deepEqual(registeredTools.map((tool) => tool.name), [
-      ...webToolNames, "ApplyPatch", "GitRead", ...backgroundShellToolNames, "tool_search", "AskUserQuestion",
+      ...webToolNames, "ApplyPatch", "GitRead", ...backgroundShellToolNames, "AskUserQuestion",
     ]);
 
     runtimeInitialized = true;
     const sessionContext = { cwd: dir, ui: {}, sessionManager: {} };
     await trigger(hooks, "session_start", { cwd: dir }, sessionContext);
+    // The loader joins at session start after the execution tools are synced
+    // and before the authorization capture.
     assert.deepEqual(registeredTools.map((tool) => tool.name), [
-      ...webToolNames, "ApplyPatch", "GitRead", ...backgroundShellToolNames, "tool_search", "AskUserQuestion", ...executionToolNames,
+      ...webToolNames, "ApplyPatch", "GitRead", ...backgroundShellToolNames, "AskUserQuestion", ...executionToolNames, "tool_search",
     ]);
     const deferredActive = ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "tool_search"];
     assert.deepEqual(activeTools, deferredActive);

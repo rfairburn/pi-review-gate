@@ -52,14 +52,37 @@ withdrawal or a hidden exposure prunes it.
 ## One loader replaces Pi's builtin tool search
 
 Review-gate registers its discovery/activation loader under Pi's replaceable
-builtin name `tool_search`, so Pi does not load its own tool-search extension and
-there is exactly one model-facing discovery tool. The loader activates authorized
-matches — ordinary, codemode- and deferred-exposed (including MCP), and model-only
-tools alike — within the session's review-gate authorization at live permissions:
-the reconciled authorized/exposed registry at the top level, the captured catalog in
-a delegated Pi worker. Activation declares the matched schemas for the next model
-call; it never executes the matched operation, and codemode/deferred tools remain
-callable from scripts while inactive exactly as before.
+builtin name `tool_search`, so there is exactly one model-facing discovery tool.
+Registration happens at session start — after every legitimately available
+top-level execution tool is registered and before the session's authorization
+capture — never at extension load time, so Pi's builtin collision pass sees no
+competing definition whether the builtin tool search is enabled, disabled, or
+toggled across a reload. The descriptor reuses the host-native `tool_search`
+parameter schema by exact reference (borrowed from the live registry when the
+builtin is loaded, otherwise captured from the running install's own bundled
+factory), so Pi's identity-based tool-search recognition accepts it and its
+genuine diagnostics — including the warning for a truly missing discovery path —
+remain intact. When no running Pi host resolves (unit tests, non-Pi processes),
+the loader keeps its local fallback schema and startup proceeds unchanged; when
+a host resolves but its native schema cannot be acquired, session start fails
+explicitly instead of registering an incompatible descriptor that would silently
+defeat Pi's recognition.
+
+The loader honors the native limit contract: a search call returns at most the
+supplied positive integer of strongest-tier matches, or eight when none is
+supplied (any other limit value is rejected as an invalid request), and reports
+how many strongest-tier matches the limit withheld from that call. Matching,
+tiering, and authorization are untouched by the cap, and the discovery
+inventory in the tool description and startup prompt stays complete — it lists
+every authorized name and is never capped.
+
+The loader activates authorized matches — ordinary, codemode- and
+deferred-exposed (including MCP), and model-only tools alike — within the
+session's review-gate authorization at live permissions: the reconciled
+authorized/exposed registry at the top level, the captured catalog in a
+delegated Pi worker. Activation declares the matched schemas for the next model
+call; it never executes the matched operation, and codemode/deferred tools
+remain callable from scripts while inactive exactly as before.
 
 ## Reconciliation during a running session
 

@@ -34,6 +34,23 @@ dates.
   enablement/exposure changes, and server tool-list notifications) update
   discovery at Pi's real reconciliation seams without a reload; removed, hidden,
   or withdrawn tools are pruned from inventory and activation (#279).
+- The loader now registers at session start (after top-level execution tools are
+  synced and before authorization capture) instead of at extension load time, and
+  reuses the host-native `tool_search` parameter schema by exact object reference —
+  borrowed from the live registry when Pi's builtin is loaded, otherwise captured
+  from the running install's own bundled factory. Pi's replaceable-builtin
+  collision pass therefore sees no competing definition, its identity-based
+  tool-search recognition accepts the replacement with the builtin enabled,
+  disabled, or toggled across a reload, and both misleading startup warnings are
+  gone while genuine diagnostics (including the truly-missing discovery warning)
+  remain visible. When no running host resolves the local fallback schema is
+  kept; when a resolved host's native schema cannot be acquired, session start
+  fails explicitly instead of registering the incompatible fallback (#279).
+- `tool_search` honors the native limit contract: a supplied positive integer or
+  the default of eight caps strongest-tier matched/activated results per call,
+  invalid limit values fail explicitly, the omitted count reports exactly what
+  the cap withheld from that call, and the discovery inventory in the loader
+  description and startup prompt stays complete and uncapped (#279).
 
 ## [0.1.0-dev.110]
 

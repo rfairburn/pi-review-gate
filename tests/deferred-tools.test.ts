@@ -417,7 +417,7 @@ test("large Unicode term sets cannot cross exact, split-name, and description ti
   assert.equal(fixture.active().includes("DescriptionHeavy"), false);
 });
 
-test("every authorized tool in a strongest tier is activated and reported alphabetically", async () => {
+test("every authorized tool in a strongest tier is activated and reported alphabetically within the native limit", async () => {
   const fixture = hostFixture();
   const strongest = Array.from({ length: 10 }, (_unused, index) => `BatchTool${String(index).padStart(2, "0")}`);
   for (const name of [...strongest].reverse()) fixture.pi.registerTool(tool(name, "Run one grouped operation."));
@@ -431,18 +431,35 @@ test("every authorized tool in a strongest tier is activated and reported alphab
     initialActiveTools: ["read"],
   });
 
+  // The native default limit (8) caps the strongest-tier results of one call:
+  // matching and tiering are untouched, the cap keeps the first entries in the
+  // existing order, and the omitted count reports exactly what it withheld.
   const result = await fixture.search()("wide-tier", { query: "batch" });
   const details = result.details as { matched: string[]; activated: string[]; omitted: number };
   assert.equal(result.isError, false);
-  assert.deepEqual(details.matched, strongest);
-  assert.deepEqual(details.activated, strongest);
-  assert.equal(details.omitted, 0);
-  assert.deepEqual(fixture.active(), ["read", "tool_search", ...strongest]);
+  assert.deepEqual(details.matched, strongest.slice(0, 8));
+  assert.deepEqual(details.activated, strongest.slice(0, 8));
+  assert.equal(details.omitted, 2);
+  assert.deepEqual(fixture.active(), ["read", "tool_search", ...strongest.slice(0, 8)]);
   const text = String((result.content as Array<{ text: string }>)[0]?.text);
   assert.equal(text.includes("BatchPrivate"), false, "unauthorized names are not disclosed");
   assert.equal(text.includes("DescriptionOnly"), false, "weaker matches are not reported or activated");
-  assert.match(text, new RegExp(`Matched authorized tools: ${strongest.join(", ")}\\.`));
+  assert.match(text, new RegExp(`Matched authorized tools: ${strongest.slice(0, 8).join(", ")}\\.`));
+  assert.match(text, /2 additional strongest-tier match\(es\) were omitted by the limit/);
   assert.match(text, /next turn/);
+
+  // A supplied positive integer lifts the cap for that call only: every
+  // remaining strongest-tier tool activates and nothing is omitted.
+  const uncapped = await fixture.search()("wide-tier-uncapped", { query: "batch", limit: 10 });
+  const uncappedDetails = uncapped.details as {
+    matched: string[]; activated: string[]; alreadyActive: string[]; omitted: number;
+  };
+  assert.equal(uncapped.isError, false);
+  assert.deepEqual(uncappedDetails.matched, strongest);
+  assert.deepEqual(uncappedDetails.activated, ["BatchTool08", "BatchTool09"]);
+  assert.deepEqual(uncappedDetails.alreadyActive, strongest.slice(0, 8));
+  assert.equal(uncappedDetails.omitted, 0);
+  assert.deepEqual(fixture.active(), ["read", "tool_search", ...strongest]);
 });
 
 test("exact tool names suppress weaker generic-word matches", async () => {
@@ -2579,3 +2596,257 @@ function renderSearchCards(
   assert.ok(typeof component.render === "function");
   return component.render(200).join("\n");
 }
+
+// #279 follow-up: late registration, host-native parameter schema identity,
+// and the approved native limit contract.
+
+test("late registration borrows the live host tool_search parameter schema by exact reference (#279)", async () => {
+  const fixture = hostFixture();
+  // The host's own builtin tool_search is already in the registry (builtin
+  // enabled) with its native parameter schema.
+  const nativeParameters = {
+    type: "object",
+    required: ["query"],
+    properties: {
+      query: { type: "string", description: "Search query for deferred tools." },
+      limit: { type: "number", description: "Maximum number of tools to return. Defaults to 8." },
+    },
+  };
+  fixture.registerInactive({ name: "tool_search", description: "native builtin", parameters: nativeParameters });
+
+  let registerCalls = 0;
+  const originalRegister = fixture.pi.registerTool.bind(fixture.pi);
+  fixture.pi.registerTool = (definition: RegisteredTool) => {
+    if (definition.name === "tool_search") registerCalls++;
+    return originalRegister(definition);
+  };
+  let mode: OperatingMode = "orchestrate";
+  const manager = new DeferredToolManager(fixture.pi, () => mode);
+
+  // Late registration at session start: one loader, the live native schema by
+  // exact object reference (Pi's identity-based recognition requirement).
+  assert.equal(await manager.registerWithNativeSchema(), true);
+  const descriptor = () => fixture.definitions.find((definition) => definition.name === "tool_search")!;
+  assert.equal(descriptor().parameters, nativeParameters, "the live native schema is reused by exact reference");
+  assert.equal(registerCalls, 1, "registered once, at session start");
+
+  // The reference persists across every descriptor refresh: boundary capture
+  // and mode changes re-register the descriptor without cloning the schema.
+  assert.equal(manager.sessionStart(fixture.sessionIdentity), true);
+  assert.equal(descriptor().parameters, nativeParameters, "identity survives the boundary-capture refresh");
+  mode = "plan-research";
+  manager.reapply();
+  assert.equal(descriptor().parameters, nativeParameters, "identity survives a mode-change refresh");
+
+  // A second late registration is rejected: one loader per session incarnation.
+  const callsBefore = registerCalls;
+  assert.equal(await manager.registerWithNativeSchema(), false);
+  assert.equal(registerCalls, callsBefore, "no competing re-registration");
+});
+
+/**
+ * A synthetic running-Pi install under a fresh temp root: package root naming
+ * the agent package plus a main entry; `bundleSource` writes the bundled SDK
+ * entry next to it (undefined omits the file). Layout of the installed Pi 1.0
+ * host.
+ */
+async function syntheticPiHost(bundleSource: string | undefined): Promise<{ root: string; entryFile: string }> {
+  const root = await mkdtemp(join(tmpdir(), "prg-native-schema-"));
+  const pkgRoot = join(root, "node_modules", "@earendil-works", "pi-coding-agent");
+  await mkdir(join(pkgRoot, "dist"), { recursive: true });
+  await writeFile(join(pkgRoot, "package.json"), JSON.stringify({
+    name: "@earendil-works/pi-coding-agent",
+    main: "./dist/index.js",
+  }));
+  await writeFile(join(pkgRoot, "dist", "index.js"), "module.exports = {};\n");
+  if (bundleSource !== undefined) {
+    await mkdir(join(pkgRoot, "dist", "bundle"), { recursive: true });
+    await writeFile(join(pkgRoot, "dist", "bundle", "index.js"), bundleSource);
+  }
+  return { root, entryFile: join(pkgRoot, "dist", "index.js") };
+}
+
+/** Run one async call with process.argv[1] pointed at the synthetic host. */
+async function underSyntheticHost<T>(entryFile: string, run: () => Promise<T>): Promise<T> {
+  const previousArgv1 = process.argv[1];
+  process.argv[1] = entryFile;
+  try {
+    return await run();
+  } finally {
+    process.argv[1] = previousArgv1;
+  }
+}
+
+const FACTORY_BUNDLE_SOURCE = [
+  "const parameters = {",
+  '  type: "object",',
+  '  required: ["query"],',
+  "  properties: {",
+  '    query: { type: "string", description: "Search query for deferred tools." },',
+  '    limit: { type: "number", description: "Maximum number of tools to return. Defaults to 8." },',
+  "  },",
+  "};",
+  "module.exports = {",
+  "  createToolSearchExtension: () => (api) => api.registerTool({ name: 'tool_search', parameters }),",
+  "  __parameters: parameters,",
+  "};",
+].join("\n");
+
+test("late registration captures the bundled-factory schema when no live builtin is present (#279)", async () => {
+  const host = await syntheticPiHost(FACTORY_BUNDLE_SOURCE);
+  try {
+    const factoryModule = require(join(host.root, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "bundle", "index.js")) as { __parameters: Record<string, unknown> };
+
+    const fixture = hostFixture();
+    const manager = new DeferredToolManager(fixture.pi);
+    assert.equal(await underSyntheticHost(host.entryFile, () => manager.registerWithNativeSchema()), true);
+    const descriptor = fixture.definitions.find((definition) => definition.name === "tool_search")!;
+    // Same module record through the loader's require: exact reference.
+    assert.equal(descriptor.parameters, factoryModule.__parameters,
+      "the bundled factory's exact parameters reference is reused");
+  } finally {
+    await rm(host.root, { recursive: true, force: true });
+  }
+});
+
+// A resolved host whose native schema cannot be acquired is a concrete
+// compatibility failure: session-start registration must reject and NO
+// fallback descriptor may be registered (the incompatible fallback would fail
+// Pi's identity-based recognition and restore the false discovery warning).
+test("a resolved host without a loadable bundled SDK entry fails explicitly instead of falling back (#279)", async () => {
+  const host = await syntheticPiHost(undefined);
+  try {
+    const fixture = hostFixture();
+    const manager = new DeferredToolManager(fixture.pi);
+    await assert.rejects(underSyntheticHost(host.entryFile, () => manager.registerWithNativeSchema()),
+      /bundled SDK entry could not be loaded/);
+    assert.equal(fixture.definitions.some((definition) => definition.name === "tool_search"), false,
+      "no fallback descriptor is registered on a resolved host");
+  } finally {
+    await rm(host.root, { recursive: true, force: true });
+  }
+});
+
+test("a resolved host whose bundled factory is missing fails explicitly instead of falling back (#279)", async () => {
+  const host = await syntheticPiHost("module.exports = {};\n");
+  try {
+    const fixture = hostFixture();
+    const manager = new DeferredToolManager(fixture.pi);
+    await assert.rejects(underSyntheticHost(host.entryFile, () => manager.registerWithNativeSchema()),
+      /exports no createToolSearchExtension factory/);
+    assert.equal(fixture.definitions.some((definition) => definition.name === "tool_search"), false,
+      "no fallback descriptor is registered on a resolved host");
+  } finally {
+    await rm(host.root, { recursive: true, force: true });
+  }
+});
+
+test("a resolved host whose tool-search factory throws fails explicitly instead of falling back (#279)", async () => {
+  const host = await syntheticPiHost(
+    "module.exports = { createToolSearchExtension: () => { throw new Error('synthetic factory failure'); } };\n",
+  );
+  try {
+    const fixture = hostFixture();
+    const manager = new DeferredToolManager(fixture.pi);
+    await assert.rejects(underSyntheticHost(host.entryFile, () => manager.registerWithNativeSchema()),
+      /tool-search factory threw: synthetic factory failure/);
+    assert.equal(fixture.definitions.some((definition) => definition.name === "tool_search"), false,
+      "no fallback descriptor is registered on a resolved host");
+  } finally {
+    await rm(host.root, { recursive: true, force: true });
+  }
+});
+
+test("a resolved host whose factory registers no valid parameters schema fails explicitly instead of falling back (#279)", async () => {
+  const host = await syntheticPiHost(
+    "module.exports = { createToolSearchExtension: () => (api) => api.registerTool({ name: 'tool_search' }) };\n",
+  );
+  try {
+    const fixture = hostFixture();
+    const manager = new DeferredToolManager(fixture.pi);
+    await assert.rejects(underSyntheticHost(host.entryFile, () => manager.registerWithNativeSchema()),
+      /registered no valid parameters schema/);
+    assert.equal(fixture.definitions.some((definition) => definition.name === "tool_search"), false,
+      "no fallback descriptor is registered on a resolved host");
+  } finally {
+    await rm(host.root, { recursive: true, force: true });
+  }
+});
+
+test("late registration keeps the local fallback schema when no running host resolves (#279)", async () => {
+  // process.argv[1] is not inside any Pi install here: the host does not
+  // resolve, so the local fallback schema applies and startup proceeds.
+  const fixture = hostFixture();
+  const manager = new DeferredToolManager(fixture.pi);
+  assert.equal(await manager.registerWithNativeSchema(), true);
+  const descriptor = fixture.definitions.find((definition) => definition.name === "tool_search")!;
+  assert.ok(descriptor.parameters, "the loader still registers when no running host resolves");
+  const parameters = descriptor.parameters as { properties: Record<string, unknown> };
+  assert.ok(parameters.properties.query, "the local fallback keeps the query property");
+  assert.equal(parameters.properties.limit, undefined, "no native limit property is invented");
+
+  // Unsupported hosts are rejected exactly like the sync register.
+  const unsupported = new DeferredToolManager({});
+  assert.equal(await unsupported.registerWithNativeSchema(), false);
+});
+
+test("the native limit caps strongest-tier results with truthful omission and fails invalid values (#279)", async () => {
+  const fixture = hostFixture();
+  for (const name of ["CapTool03", "CapTool02", "CapTool01"]) {
+    fixture.pi.registerTool(tool(name, "Run one capped operation."));
+  }
+  const manager = new DeferredToolManager(fixture.pi);
+  assert.equal(await manager.registerWithNativeSchema(), true);
+  manager.sessionStart(fixture.sessionIdentity);
+
+  // Default limit (8): fewer than eight matches are all returned, uncapped.
+  const defaultResult = await fixture.search()("default-limit", { query: "cap" });
+  assert.equal(defaultResult.isError, false);
+  assert.deepEqual((defaultResult.details as { matched: string[]; omitted: number }).matched,
+    ["CapTool01", "CapTool02", "CapTool03"]);
+  assert.equal((defaultResult.details as { omitted: number }).omitted, 0);
+
+  // A supplied positive integer caps the strongest tier for that call only.
+  const capped = await fixture.search()("capped", { query: "cap", limit: 2 });
+  const cappedDetails = capped.details as {
+    matched: string[]; activated: string[]; alreadyActive: string[]; omitted: number;
+  };
+  assert.equal(capped.isError, false);
+  assert.deepEqual(cappedDetails.matched, ["CapTool01", "CapTool02"]);
+  assert.deepEqual(cappedDetails.activated, []);
+  assert.deepEqual(cappedDetails.alreadyActive, ["CapTool01", "CapTool02"]);
+  assert.equal(cappedDetails.omitted, 1);
+  const cappedText = String((capped.content as Array<{ text: string }>)[0]?.text);
+  assert.match(cappedText, /1 additional strongest-tier match\(es\) were omitted by the limit/);
+
+  // Invalid limits fail explicitly like an invalid query; nothing activates.
+  for (const limit of [0, -1, 1.5, "2", true]) {
+    const invalid = await fixture.search()("invalid-limit", { query: "cap", limit });
+    assert.equal(invalid.isError, true, `limit ${JSON.stringify(limit)} fails explicitly`);
+    assert.match(String((invalid.content as Array<{ text: string }>)[0]?.text), /limit must be a positive integer/);
+    assert.deepEqual((invalid.details as { outcome: string }).outcome, "invalid");
+  }
+});
+
+test("the startup inventory stays complete beyond the search limit (#279)", async () => {
+  const fixture = hostFixture();
+  const names = Array.from({ length: 10 }, (_unused, index) => `InventoryTool${String(index).padStart(2, "0")}`);
+  for (const name of [...names].reverse()) fixture.pi.registerTool(tool(name, "Run one inventory operation."));
+  const manager = new DeferredToolManager(fixture.pi);
+  assert.equal(await manager.registerWithNativeSchema(), true);
+  manager.sessionStart(fixture.sessionIdentity, {
+    allowedToolCatalog: ["read", ...[...names].reverse()],
+    initialActiveTools: ["read"],
+  });
+
+  // The search result is capped at the native default of eight...
+  const result = await fixture.search()("capped-inventory", { query: "inventory" });
+  assert.equal((result.details as { matched: string[] }).matched.length, 8);
+  assert.equal((result.details as { omitted: number }).omitted, 2);
+
+  // ...while the loader description and startup inventory list every
+  // authorized name: complete, stable, never capped.
+  const description = searchDescription(fixture);
+  for (const name of names) assert.ok(description.includes(name), `description lists ${name}`);
+  for (const name of names) assert.ok(guidanceListsName(manager, name), `inventory lists ${name}`);
+});

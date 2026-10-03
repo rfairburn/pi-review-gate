@@ -1,3 +1,4 @@
+import { dirname, join } from "node:path";
 import {
   DEFERRED_TOOL_SEARCH_NAME,
   DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER,
@@ -5,6 +6,7 @@ import {
   createExecutorToolCatalog,
   type ExecutorToolCatalog,
 } from "./execution/tool-catalog";
+import { loadHostPeerModule, resolveHostPeerFile } from "./host-peer-loader";
 import { RESEARCH_ALLOWED_TOOLS } from "./execution/tool";
 import { GIT_READ_TOOL_NAME } from "./git-read/tool";
 import { DEFAULT_OPERATING_MODE, type OperatingMode } from "./config";
@@ -12,6 +14,13 @@ import { renderAuthorizedToolInventory } from "./tool-inventory";
 import { deferredToolSearchRenderResult } from "./deferred-tools-result-renderer";
 
 const MAX_QUERY_CHARS = 256;
+/**
+ * The approved native limit for one search call: the host's own
+ * tool_search default (Pi 1.0), applied when no positive integer is supplied.
+ */
+const DEFAULT_SEARCH_LIMIT = 8;
+/** The running host package resolved through the existing peer loader. */
+const PI_AGENT_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 
 /**
  * Native Pi tool that runs codemode scripts (Pi 1.0 `builtin:codemode`).
@@ -170,6 +179,20 @@ const BOUNDARY_REGISTRY_KEY = Symbol.for("pi-review-gate.deferred-tool-authoriza
  * including codemode/deferred-exposure and MCP tools — is declared for the
  * next model call by this loader; native script callability of those exposures
  * is unchanged.
+ *
+ * #279 follow-up: registration happens at session start (registerWithNativeSchema),
+ * never at factory time, so Pi's load-time replaceable-builtin collision pass
+ * sees no competing definition. The descriptor reuses the host-native
+ * tool_search parameter schema by exact object reference — borrowed from the
+ * live registry when the builtin is loaded, otherwise captured from the
+ * running install's own bundled factory — and honors the native limit
+ * contract (default 8 or a supplied positive integer) capping strongest-tier
+ * matched/activated results per call; the discovery inventory surfaces stay
+ * complete and uncapped. When no running Pi host resolves (fake hosts, unit
+ * tests), the local fallback schema is kept and startup proceeds unchanged;
+ * when a host DOES resolve but its native schema cannot be acquired, session
+ * start fails explicitly — a concrete compatibility failure, never a silent
+ * registration of the known-incompatible fallback.
  */
 export class DeferredToolManager {
   private boundary: AuthorizationBoundary | undefined;
@@ -189,6 +212,12 @@ export class DeferredToolManager {
   private registered = false;
   private lastSearchDescription: string | undefined;
   private lastSearchSnippet: string | undefined;
+  /**
+   * The exact host-native tool_search parameter schema reference, resolved
+   * once at late registration and reused by every descriptor re-registration
+   * (never cloned or mutated); undefined keeps the local fallback schema.
+   */
+  private nativeSearchParameters: Record<string, unknown> | undefined;
   constructor(
     private readonly pi: unknown,
     private readonly getOperatingMode: () => OperatingMode = () => DEFAULT_OPERATING_MODE,
@@ -201,14 +230,107 @@ export class DeferredToolManager {
     private readonly enableCodemodeDefault = false,
   ) {}
 
-  register(): boolean {
+  register(parameters?: Record<string, unknown>): boolean {
     if (this.registered || !isDeferredToolHost(this.pi)) return false;
+    if (parameters !== undefined) this.nativeSearchParameters = parameters;
     const definition = this.buildSearchToolDefinition();
     this.lastSearchDescription = definition.description;
     this.lastSearchSnippet = definition.promptSnippet;
     this.pi.registerTool(definition);
     this.registered = true;
     return true;
+  }
+
+  /**
+   * Session-start registration with the host-native parameter schema (#279
+   * follow-up). Resolving the exact native reference is asynchronous (the
+   * bundled-factory fallback loads a module), so the parent owns the await in
+   * its session_start handler before authorization capture. When no running
+   * Pi host resolves, the local fallback schema is kept and startup proceeds
+   * unchanged; when a host resolves but its native schema cannot be acquired,
+   * this rejects with an explicit compatibility failure instead of registering
+   * the known-incompatible fallback (which would fail Pi's identity-based
+   * tool_search recognition and restore the false discovery warning).
+   */
+  async registerWithNativeSchema(): Promise<boolean> {
+    if (this.registered || !isDeferredToolHost(this.pi)) return false;
+    this.nativeSearchParameters = await this.resolveNativeSearchParameters();
+    return this.register();
+  }
+
+  private async resolveNativeSearchParameters(): Promise<Record<string, unknown> | undefined> {
+    const live = this.liveToolSearchParameters();
+    if (live !== undefined) return live;
+    return this.factoryToolSearchParameters();
+  }
+
+  /** The exact `parameters` object of the tool_search entry currently in the host registry. */
+  private liveToolSearchParameters(): Record<string, unknown> | undefined {
+    if (!isDeferredToolHost(this.pi)) return undefined;
+    let tools: unknown;
+    try {
+      tools = this.pi.getAllTools();
+    } catch {
+      return undefined;
+    }
+    if (!Array.isArray(tools)) return undefined;
+    for (const entry of tools) {
+      if (!isRecord(entry) || entry.name !== DEFERRED_TOOL_SEARCH_NAME) continue;
+      const parameters = entry.parameters;
+      return isRecord(parameters) ? parameters : undefined;
+    }
+    return undefined;
+  }
+
+  /**
+   * The host-native schema captured from the running install's own bundled
+   * SDK entry: the existing peer loader resolves the package (it follows
+   * realpath(process.argv[1]) and validates the host), the bundled entry is
+   * derived next to it, and the exported tool-search factory is invoked with
+   * a tiny registerTool capture to obtain its exact parameters reference.
+   * No resolved host yields undefined (the caller keeps the local fallback
+   * schema); a RESOLVED host whose bundle, factory, or captured schema cannot
+   * be acquired throws — registering the incompatible fallback there would
+   * fail Pi's identity-based recognition and restore the false discovery
+   * warning, so this is an explicit compatibility failure instead.
+   */
+  private async factoryToolSearchParameters(): Promise<Record<string, unknown> | undefined> {
+    const sdkFile = resolveHostPeerFile(PI_AGENT_PACKAGE_NAME, { packageMainFallback: true });
+    if (!sdkFile) return undefined;
+    const entry = join(dirname(sdkFile), "bundle", "index.js");
+    const sdk = await loadHostPeerModule(entry);
+    if (!isRecord(sdk)) {
+      throw new Error(
+        `tool_search native schema unavailable: the running host resolved to ${sdkFile} ` +
+        `but its bundled SDK entry could not be loaded: ${entry}`,
+      );
+    }
+    const factory = sdk.createToolSearchExtension;
+    if (typeof factory !== "function") {
+      throw new Error(
+        `tool_search native schema unavailable: the running host's bundled SDK entry ${entry} ` +
+        "exports no createToolSearchExtension factory",
+      );
+    }
+    let captured: unknown;
+    try {
+      (factory as () => (api: { registerTool: (definition: unknown) => void }) => void)()({
+        registerTool: (definition: unknown) => { captured = definition; },
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `tool_search native schema unavailable: the running host's tool-search factory threw: ${reason}`,
+      );
+    }
+    const parameters = isRecord(captured) ? captured.parameters : undefined;
+    if (!isRecord(parameters)) {
+      throw new Error(
+        `tool_search native schema unavailable: the running host's tool-search factory registered ` +
+        "no valid parameters schema",
+      );
+    }
+    return parameters;
   }
 
   /** Capture authorization before the first shrink, or install a durable worker boundary. */
@@ -491,7 +613,10 @@ export class DeferredToolManager {
       description: this.renderSearchToolDescription(),
       promptSnippet: this.renderSearchToolSnippet(),
       executionMode: "sequential" as const,
-      parameters: {
+      // The host-native schema reference when one was resolved at late
+      // registration (identity Pi's own tool_search recognition requires);
+      // the local fallback otherwise. Never cloned or mutated.
+      parameters: this.nativeSearchParameters ?? {
         type: "object",
         properties: {
           query: {
@@ -856,6 +981,14 @@ export class DeferredToolManager {
         outcome: "invalid",
       });
     }
+    // The approved native limit contract: a supplied positive integer or the
+    // native default of 8; anything else fails explicitly like an invalid query.
+    const limit = searchLimit(params);
+    if (limit === undefined) {
+      return textResult("Invalid tool_search request: limit must be a positive integer.", true, {
+        outcome: "invalid",
+      });
+    }
 
     // Planning mode makes forbidden tools absent from discovery as well: they
     // cannot be matched, reported, or activated while the mode is applied.
@@ -892,6 +1025,12 @@ export class DeferredToolManager {
         outcome: "no-match",
       });
     }
+    // The limit caps the strongest-tier results of this call only (matching
+    // and tiering above are untouched): the withheld strongest-tier matches
+    // are reported truthfully through the omitted count, while the discovery
+    // inventory surfaces stay complete and uncapped.
+    const limited = selected.slice(0, limit);
+    const omittedCount = selected.length - limited.length;
 
     const active = new Set(this.computeActiveNames());
     // #73: a visible GitRead is host-active by the mode/catalog pin, not by
@@ -900,7 +1039,7 @@ export class DeferredToolManager {
     if (this.gitReadVisible()) active.add(GIT_READ_TOOL_NAME);
     const activated: string[] = [];
     const alreadyActive: string[] = [];
-    for (const match of selected) {
+    for (const match of limited) {
       // The catalog is already authorization-filtered. Keep this explicit
       // guard so a future catalog refactor cannot turn metadata into authority.
       if (!this.boundary.authorizedNames.has(match.name)) continue;
@@ -923,8 +1062,11 @@ export class DeferredToolManager {
     }
     this.reapply();
 
-    const matchedNames = selected.map((match) => match.name);
+    const matchedNames = limited.map((match) => match.name);
     const lines: string[] = [`Matched authorized tools: ${matchedNames.join(", ")}.`];
+    if (omittedCount > 0) {
+      lines.push(`${omittedCount} additional strongest-tier match(es) were omitted by the limit.`);
+    }
     if (activated.length > 0) {
       lines.push(
         `Activated: ${activated.join(", ")}. Call the required tool on the next turn; tool_search did not perform the operation.`,
@@ -936,7 +1078,7 @@ export class DeferredToolManager {
       activated,
       alreadyActive,
       matched: matchedNames,
-      omitted: 0,
+      omitted: omittedCount,
       outcome: activated.length > 0 ? "activated" : "already-active",
     });
   }
@@ -1315,6 +1457,13 @@ function searchQuery(params: unknown): string | undefined {
   return query && query.length <= MAX_QUERY_CHARS ? query : undefined;
 }
 
+/** The approved native limit: a supplied positive integer, else the native default of 8. */
+function searchLimit(params: unknown): number | undefined {
+  if (!isRecord(params) || params.limit === undefined) return DEFAULT_SEARCH_LIMIT;
+  const value = params.limit;
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
 function searchTerms(query: string): string[] {
   return [...new Set(query.match(/[\p{L}\p{N}_-]+/gu) ?? [])];
 }
@@ -1327,7 +1476,12 @@ function compareToolNames(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function isDeferredToolHost(value: unknown): value is DeferredToolHost {
+/**
+ * The narrow host capability the deferred manager needs (exported so the
+ * entrypoint can preserve its unsupported-host early return without a
+ * factory-time tool registration).
+ */
+export function isDeferredToolHost(value: unknown): value is DeferredToolHost {
   return isRecord(value)
     && typeof value.registerTool === "function"
     && typeof value.getActiveTools === "function"

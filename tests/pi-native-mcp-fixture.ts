@@ -438,6 +438,12 @@ export interface NativeMcpFixtureOptions {
 	/** Start with an empty project mcpServers object instead of the default fixture server. Default false. */
 	noMcpServers?: boolean;
 	/**
+	 * Written to `<scratch agent dir>/settings.json` before spawn, so a run can
+	 * exercise real user-level Pi settings (for example toggling the builtin
+	 * tool-search extension with `"extensions": ["-builtin:tool-search"]`).
+	 */
+	agentSettings?: object;
+	/**
 	 * Launch the ACTUAL gate executor role exactly like the production Pi
 	 * executor adapter (`src/execution/adapters/pi-model.ts`): sets
 	 * `PI_REVIEW_GATE_RUNTIME_ROLE="executor"` and
@@ -515,6 +521,11 @@ export class NativeMcpFixture {
 	/** The pi child's OS pid once spawned (undefined before start() or after a spawn failure). */
 	get childPid(): number | undefined {
 		return this.child?.pid;
+	}
+
+	/** Bounded tail of the pi child's stderr (load-time diagnostics surface). */
+	stderrTailText(): string {
+		return this.stderrTail;
 	}
 
 	// -- Lifecycle -----------------------------------------------------------
@@ -837,6 +848,9 @@ export class NativeMcpFixture {
 		const gateConfig = this.options.gateConfig === null ? undefined : this.options.gateConfig ?? ZERO_MODEL_GATE_CONFIG;
 		if (gateConfig !== undefined) {
 			await writeFile(join(piAgentDir, "review-gate.json"), `${JSON.stringify(gateConfig, null, "\t")}\n`, "utf8");
+		}
+		if (this.options.agentSettings !== undefined) {
+			await writeFile(join(piAgentDir, "settings.json"), `${JSON.stringify(this.options.agentSettings, null, "\t")}\n`, "utf8");
 		}
 		this.paths = paths;
 	}

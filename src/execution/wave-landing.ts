@@ -6,6 +6,8 @@ import { promises as fs, readlink as fsReadlink, Stats } from "node:fs";
 import { dirname, join, sep, isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
 import { atomicWrite } from "./durable-write";
+import { isSourceIdentity, sourceIdentitiesEqual, type SourceIdentity } from "./source-identity";
+export type { SourceIdentity } from "./source-identity";
 import { readSourceRootIdentity, type WaveCaptureResult } from "./wave-repository";
 import { integrationRefName } from "./wave-worktrees";
 import { GIT_NO_LOCKS_ENV as GIT_ENV, validateSafeId } from "./wave-validation";
@@ -100,14 +102,6 @@ export interface RecoveryPathEntry {
   blobId: string;
   /** Blob SHA of the base content (for modifications/deletions), or null for additions. */
   baseBlobId: string | null;
-}
-
-/** Immutable identity of the source capture root (dev + ino). */
-export interface SourceIdentity {
-  /** Device ID of the filesystem containing the capture root. */
-  dev: number;
-  /** Inode number of the capture root directory. */
-  ino: number;
 }
 
 /** Recovery manifest written atomically before any mutations. */
@@ -281,6 +275,7 @@ export async function inspectLandingRecoveryManifests(waveRoot: string): Promise
       const parsed = JSON.parse(await fs.readFile(manifestPath, "utf8")) as Partial<RecoveryManifest>;
       const structurallyValid = parsed.version === 1
         && typeof parsed.sourceRoot === "string"
+        && isSourceIdentity(parsed.sourceIdentity)
         && ["in_progress", "completed", "rolled_back", "recovery_required"].includes(String(parsed.state))
         && Array.isArray(parsed.paths)
         && parsed.paths.every((path) => path && typeof path.path === "string" && typeof path.phase === "string");
@@ -590,7 +585,7 @@ export async function planWaveLanding(
   const resolvedSourceRoot = await fs.realpath(sourceRoot);
   const currentRootIdentity = await readSourceRootIdentity(resolvedSourceRoot);
   const capturedIdentity = capture.sourceIdentity;
-  if (currentRootIdentity.dev !== capturedIdentity.dev || currentRootIdentity.ino !== capturedIdentity.ino) {
+  if (!sourceIdentitiesEqual(currentRootIdentity, capturedIdentity)) {
     throw new Error(
       `Source root identity mismatch: current dev=${currentRootIdentity.dev},ino=${currentRootIdentity.ino} ` +
       `does not match captured dev=${capturedIdentity.dev},ino=${capturedIdentity.ino}. ` +
@@ -1047,7 +1042,7 @@ export async function executeWaveLanding(
   const resolvedSourceRoot = await fs.realpath(sourceRoot);
   const execRootIdentity = await readSourceRootIdentity(resolvedSourceRoot);
   const execCapturedIdentity = capture.sourceIdentity;
-  if (execRootIdentity.dev !== execCapturedIdentity.dev || execRootIdentity.ino !== execCapturedIdentity.ino) {
+  if (!sourceIdentitiesEqual(execRootIdentity, execCapturedIdentity)) {
     return {
       status: "conflicted",
       conflicts: [{
@@ -1860,7 +1855,7 @@ export async function recoverLandingManifest(
     }
 
     // Validate sourceIdentity.
-    if (!parsed.sourceIdentity || typeof parsed.sourceIdentity.dev !== "number" || typeof parsed.sourceIdentity.ino !== "number") {
+    if (!isSourceIdentity(parsed.sourceIdentity)) {
       return {
         status: "rejected",
         reason: "Manifest is missing or has invalid sourceIdentity (dev/ino).",
@@ -1975,7 +1970,7 @@ export async function recoverLandingManifest(
     };
   }
 
-  if (currentRootIdentity.dev !== manifest.sourceIdentity.dev || currentRootIdentity.ino !== manifest.sourceIdentity.ino) {
+  if (!sourceIdentitiesEqual(currentRootIdentity, manifest.sourceIdentity)) {
     return {
       status: "rejected",
       reason: `Source root identity mismatch: current dev=${currentRootIdentity.dev},ino=${currentRootIdentity.ino} ` +

@@ -19,6 +19,11 @@ dates.
 
 ### Fixed
 
+- Preserve exact large NTFS wave-root inode and volume identities through capture,
+  persisted reload, landing, and authenticated recovery. Safe numeric identity
+  fields keep their existing version-1 encoding; larger unsigned 64-bit fields
+  use canonical decimal strings, requiring an updated build to reload/recover
+  those records. Root replacement and retarget checks remain fail-closed (#282).
 - Restore native Windows raw parent-review baseline capture when directory-handle
   fsync returns `EPERM`, matching the existing Git checkpoint exception. File
   flushes and other filesystem failures remain mandatory; mocked Windows tests

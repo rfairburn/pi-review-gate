@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { coreFilemodeOverrideFor } from "../git-checkpoint";
+import { encodeSourceIdentityComponent, isSourceIdentity, sourceIdentitiesEqual, type SourceIdentity } from "./source-identity";
+export type { SourceIdentity } from "./source-identity";
 import { GIT_NO_LOCKS_ENV as GIT_ENV, isAbortError, validateSafeId } from "./wave-validation";
 
 const readlinkBuffer = promisify(fsReadlink);
@@ -474,33 +476,26 @@ export interface WaveCaptureHooks {
   ) => Promise<void> | void;
 }
 
-/** Immutable identity of the source capture root (dev + ino). */
-export interface SourceIdentity {
-  /** Device ID of the filesystem containing the capture root. */
-  dev: number;
-  /** Inode number of the capture root directory. */
-  ino: number;
-}
-
 /** Obtain the same strong root identity at capture, landing and recovery.
  * On NTFS, a path stat can omit the volume ID (dev=0) even though an opened
  * directory handle reports it. Never persist the incomplete path identity. */
 export async function readSourceRootIdentity(root: string): Promise<SourceIdentity> {
-  const before = await fs.lstat(root);
+  const windows = process.platform === "win32";
+  const before = windows ? await fs.lstat(root, { bigint: true }) : await fs.lstat(root);
   if (!before.isDirectory() || before.isSymbolicLink()) {
     throw new Error(`Source root is not a non-symlink directory: ${root}`);
   }
   if (process.platform !== "win32") {
-    if (!Number.isSafeInteger(before.dev) || before.dev <= 0 || !Number.isSafeInteger(before.ino) || before.ino <= 0) {
+    if (!isSourceIdentity({ dev: before.dev, ino: before.ino })) {
       throw new Error(`Source root identity (dev=${before.dev}, ino=${before.ino}) is not stable on this platform. Refusing to capture without a strong directory identity.`);
     }
-    return { dev: before.dev, ino: before.ino };
+    return { dev: before.dev as number, ino: before.ino as number };
   }
 
   const held = await fs.open(root, "r");
   try {
-    const opened = await held.stat();
-    const after = await fs.lstat(root);
+    const opened = await held.stat({ bigint: true });
+    const after = await fs.lstat(root, { bigint: true });
     if (!after.isDirectory() || after.isSymbolicLink()) {
       throw new Error(`Source root changed while reading its identity: ${root}`);
     }
@@ -509,17 +504,16 @@ export async function readSourceRootIdentity(root: string): Promise<SourceIdenti
     // happen to coincide; a second handle must name the original volume.
     const reopened = await fs.open(root, "r");
     try {
-      const current = await reopened.stat();
+      const current = await reopened.stat({ bigint: true });
       if (!opened.isDirectory() || !current.isDirectory()
-        || !Number.isSafeInteger(opened.dev) || opened.dev <= 0
-        || !Number.isSafeInteger(opened.ino) || opened.ino <= 0
+        || opened.dev <= 0n || opened.ino <= 0n
         || opened.dev !== current.dev || opened.ino !== current.ino
         || before.ino !== opened.ino || after.ino !== opened.ino
-        || (before.dev !== 0 && before.dev !== opened.dev)
-        || (after.dev !== 0 && after.dev !== opened.dev)) {
+        || (before.dev !== 0n && before.dev !== opened.dev)
+        || (after.dev !== 0n && after.dev !== opened.dev)) {
         throw new Error(`Source root identity changed or is incomplete: ${root}`);
       }
-      return { dev: opened.dev, ino: opened.ino };
+      return { dev: encodeSourceIdentityComponent(opened.dev), ino: encodeSourceIdentityComponent(opened.ino) };
     } finally {
       await reopened.close();
     }
@@ -729,7 +723,7 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
         throw new Error(`Capture consistency check failed: ${verification.reason}`);
       }
       const verifiedIdentity = await readSourceRootIdentity(discovery.captureRoot);
-      if (verifiedIdentity.dev !== sourceIdentity.dev || verifiedIdentity.ino !== sourceIdentity.ino) {
+      if (!sourceIdentitiesEqual(verifiedIdentity, sourceIdentity)) {
         throw new Error("Capture consistency check failed: source root identity changed during capture.");
       }
 
@@ -805,7 +799,7 @@ export async function readWaveCaptureRecord(waveRoot: string): Promise<WaveCaptu
     || !record.discovery
     || !Array.isArray(record.entries)
     || !Array.isArray(record.paths)
-    || !record.sourceIdentity) {
+    || !isSourceIdentity(record.sourceIdentity)) {
     throw new Error("Invalid wave capture record.");
   }
   if (await fs.realpath(resolve(record.waveRoot)) !== resolvedRoot) {

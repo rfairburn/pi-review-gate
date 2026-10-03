@@ -16,6 +16,12 @@ conversation in a fresh extension runtime and restores only that conversation's
 integrity-checked sidecar state. The temporary startup session is shut down and cannot
 leak its review window or execution associations into the resumed session.
 
+A failed session-sidecar publication attempts to remove only the unpublished temporary
+file created by that write. Cleanup is best-effort: removal failure never hides the
+publication error, and the previous committed sidecar, pre-existing collisions, and
+other writers' temporary files are preserved. Successful publication and restore are
+unchanged; this is not post-crash cleanup of unknown retained files.
+
 Restored state includes review baselines/evidence, pending model deliveries, execution
 groups, operation bundles, task definitions, activity, commands, incidents, checkpoints,
 and conflict gates. A live or uncertain owner blocks another writer; a confirmed-dead

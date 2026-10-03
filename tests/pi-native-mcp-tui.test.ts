@@ -37,6 +37,7 @@ type LifecycleAction =
   | { type: "dump"; name: string }
   | { type: "turn"; name: string; message: string; marker: string; script: { steps: unknown[] } }
   | { type: "manager_toggle"; server: string; desired: "enable" | "disable" }
+  | { type: "manager_exposure"; server: string; desired: "codemode" | "deferred" | "direct" }
   | { type: "command"; command: string; initializeCount: number; toolsListCount: number };
 
 function hasPython3(): boolean {
@@ -132,7 +133,7 @@ function turnScript(
   return {
     steps: [
       ...[...preludeQueries, query].map((item) => ({
-        toolCalls: [{ toolName: "search_tools", arguments: { query: item } }],
+        toolCalls: [{ toolName: "tool_search", arguments: { query: item } }],
       })),
       { codemode: code },
       { text: marker },
@@ -220,7 +221,7 @@ function assertSearchAlreadyActive(record: FixtureEvent, name: string): void {
 }
 
 function assertSearchMatched(record: FixtureEvent, name: string, label: string): void {
-  assert.equal(resultIsError(record), false, `${label} search_tools must succeed`);
+  assert.equal(resultIsError(record), false, `${label} tool_search must succeed`);
   const details = resultDetails(record);
   const content = resultContent(record);
   if (Array.isArray(details?.matched)) {
@@ -228,25 +229,44 @@ function assertSearchMatched(record: FixtureEvent, name: string, label: string):
   } else {
     assert.ok(content.includes(name) && content.includes("Matched authorized tools:"), `${label} result content must report a real match for ${name}`);
   }
-  if (Array.isArray(details?.nativeAvailable)) {
-    assert.ok(details.nativeAvailable.includes(name), `${label} nativeAvailable details must contain ${name}`);
-    assert.ok(!Array.isArray(details.activated) || !details.activated.includes(name),
-      `${label} search must not flatten native exposure by activating ${name}`);
+  if (Array.isArray(details?.activated)) {
+    assert.ok(details.activated.includes(name), `${label} activated details must contain ${name}`);
     assert.ok(!Array.isArray(details.alreadyActive) || !details.alreadyActive.includes(name),
-      `${label} native exposure must not be reported as a direct declaration for ${name}`);
+      `${label} search must not report a fresh activation as already active for ${name}`);
   } else {
-    assert.ok(content.includes("native tool_search") && content.includes("No direct declaration changed"),
-      `${label} result content must preserve native availability for ${name}`);
+    assert.ok(content.includes("Activated:") && content.includes(name),
+      `${label} result content must report the activation of ${name}`);
+  }
+}
+
+/**
+ * The tool is declared and available after the search: either freshly
+ * activated by this loader or still active from an earlier loader selection.
+ * A same-name reconnect does not withdraw a prior declaration, so both
+ * outcomes are correct for a post-reconnect discovery probe.
+ */
+function assertSearchDeclared(record: FixtureEvent, name: string, label: string): void {
+  assert.equal(resultIsError(record), false, `${label} tool_search must succeed`);
+  const details = resultDetails(record);
+  const content = resultContent(record);
+  if (Array.isArray(details?.matched)) {
+    assert.ok(details.matched.includes(name), `${label} matched details must contain ${name}`);
+    const activated = Array.isArray(details.activated) ? details.activated : [];
+    const alreadyActive = Array.isArray(details.alreadyActive) ? details.alreadyActive : [];
+    assert.ok(activated.includes(name) || alreadyActive.includes(name),
+      `${label} search must leave ${name} declared (activated or already active); got ${JSON.stringify(details)}`);
+  } else {
+    assert.ok(content.includes(name) && content.includes("Matched authorized tools:"), `${label} result content must report a real match for ${name}`);
   }
 }
 
 function assertSearchMissing(record: FixtureEvent, name: string): void {
-  assert.equal(resultIsError(record), false, "disabled search_tools must complete without a tool error");
+  assert.equal(resultIsError(record), false, "disabled tool_search must complete without a tool error");
   const details = resultDetails(record);
   const content = resultContent(record);
   if (Array.isArray(details?.matched)) assert.deepEqual(details.matched, [], "disabled candidate search must have no matches");
   else assert.ok(content.includes("No authorized tools matched"), "disabled result content must report no authorized matches");
-  if (Array.isArray(details?.nativeAvailable)) assert.deepEqual(details.nativeAvailable, [], "disabled nativeAvailable must be empty");
+  if (Array.isArray(details?.activated)) assert.deepEqual(details.activated, [], "disabled search must activate nothing");
   else assert.ok(!content.includes(name), "disabled result content must omit the withdrawn tool name");
 }
 
@@ -301,25 +321,67 @@ async function runDriver(
   });
 }
 
-test("native MCP disable/enable/reconnect are observed in one candidate Pi TUI session", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+/**
+ * Prerequisites shared by every candidate TUI session test. Returns the host
+ * and compiled-candidate prerequisites, or skips with the real reasons.
+ */
+function tuiPrerequisites(t: { skip(message?: string): void }): {
+  host: NonNullable<ReturnType<typeof describeFixturePrerequisites>["host"]>;
+  compiler: string;
+  driverPath: string;
+} | undefined {
   const prerequisites = describeFixturePrerequisites({ candidateEntry: null });
   if (!prerequisites.ok || !prerequisites.host) {
     skipOrFail(t, `native Pi 1.x TUI prerequisites unavailable: ${prerequisites.problems.join("; ")}`);
-    return;
+    return undefined;
   }
   const host = prerequisites.host;
   if (!hasPython3()) {
     skipOrFail(t, "native MCP TUI smoke prerequisite unavailable: python3");
-    return;
+    return undefined;
   }
   const compiler = resolveCompiler();
   if (!compiler || !existsSync(join(projectRoot, "node_modules"))) {
     skipOrFail(t, "native MCP TUI scratch-build prerequisite unavailable: repository TypeScript/node_modules");
-    return;
+    return undefined;
   }
   const driverPath = join(projectRoot, "tests", "fixtures", "pi-native-mcp-tui-driver.py");
   assert.ok(existsSync(driverPath), `dedicated PTY driver missing: ${driverPath}`);
+  return { host, compiler, driverPath };
+}
 
+/**
+ * One isolated candidate TUI sandbox: synthetic home/agent dir with the
+ * zero-model deferred-off gate config, a trusted scratch Git project carrying
+ * the fixture MCP server (optional explicit `exposure`), and every file the
+ * PTY driver reads or writes. The caller owns the lifecycle actions.
+ */
+async function prepareTuiSandbox(
+  t: { after(callback: () => void | Promise<void>): void },
+  compiler: string,
+  options: { serverExposure?: "codemode" | "deferred" | "direct" } = {},
+): Promise<{
+  sandbox: string;
+  home: string;
+  agentDir: string;
+  workspace: string;
+  stateDir: string;
+  candidateEntry: string;
+  probeEntry: string;
+  serverEntry: string;
+  observerEntry: string;
+  eventLog: string;
+  counterFile: string;
+  generationFile: string;
+  controlFile: string;
+  turnScriptPath: string;
+  toolObservationPath: string;
+  gitGlobalConfig: string;
+  gitTemplate: string;
+  runTag: string;
+  echoName: string;
+  counterName: string;
+}> {
   const sandbox = await mkdtemp(join(tmpdir(), "prg-native-mcp-tui-"));
   t.after(() => rm(sandbox, { recursive: true, force: true }));
   const home = join(sandbox, "home");
@@ -365,20 +427,22 @@ test("native MCP disable/enable/reconnect are observed in one candidate Pi TUI s
   // authoritative; the real registry and search results below assert that the
   // wrapper does not directly activate or flatten those native tools. This
   // does not test reviewer decisions.
+  const serverConfig: Record<string, unknown> = {
+    command: process.execPath,
+    args: [serverEntry],
+    description: "Credential-free native MCP lifecycle fixture for the real Pi TUI.",
+    timeout: 30,
+    env: {
+      PRG_FIXTURE_EVENT_LOG: eventLog,
+      PRG_FIXTURE_CONTROL_FILE: controlFile,
+      PRG_FIXTURE_GENERATION_FILE: generationFile,
+      PRG_FIXTURE_COUNTER_FILE: counterFile,
+    },
+  };
+  if (options.serverExposure) serverConfig.exposure = options.serverExposure;
   await writeFile(join(workspace, ".pi", "mcp.json"), `${JSON.stringify({
     mcpServers: {
-      [DEFAULT_SERVER_NAME]: {
-        command: process.execPath,
-        args: [serverEntry],
-        description: "Credential-free native MCP lifecycle fixture for the real Pi TUI.",
-        timeout: 30,
-        env: {
-          PRG_FIXTURE_EVENT_LOG: eventLog,
-          PRG_FIXTURE_CONTROL_FILE: controlFile,
-          PRG_FIXTURE_GENERATION_FILE: generationFile,
-          PRG_FIXTURE_COUNTER_FILE: counterFile,
-        },
-      },
+      [DEFAULT_SERVER_NAME]: serverConfig,
     },
   }, null, 2)}\n`);
 
@@ -391,6 +455,23 @@ test("native MCP disable/enable/reconnect are observed in one candidate Pi TUI s
     timeout: 10_000,
   });
   assert.equal(gitInit.status, 0, `could not initialize isolated fixture project: ${gitInit.stderr ?? gitInit.error ?? "unknown error"}`);
+
+  return {
+    sandbox, home, agentDir, workspace, stateDir,
+    candidateEntry, probeEntry, serverEntry, observerEntry,
+    eventLog, counterFile, generationFile, controlFile, turnScriptPath, toolObservationPath,
+    gitGlobalConfig, gitTemplate, runTag, echoName, counterName,
+  };
+}
+
+test("native MCP disable/enable/reconnect are observed in one candidate Pi TUI session", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+  const prerequisites = tuiPrerequisites(t);
+  if (!prerequisites) return;
+  const { host, compiler, driverPath } = prerequisites;
+
+  const paths = await prepareTuiSandbox(t, compiler);
+  const { sandbox, home, agentDir, workspace, stateDir, candidateEntry, probeEntry, observerEntry,
+    eventLog, counterFile, toolObservationPath, runTag, echoName, counterName } = paths;
 
   const phases = {
     initial: {
@@ -557,14 +638,17 @@ test("native MCP disable/enable/reconnect are observed in one candidate Pi TUI s
     "initial connection, UI enable, and same-session native reconnect must each initialize the real server");
 
   const observations = parseJsonLines(toolObservationPath);
-  const searchResults = observations.filter((record) => record.hook === "tool_result" && eventToolName(record) === "search_tools");
-  assert.equal(searchResults.length, 5, "search_tools must return codemode state plus one lifecycle discovery result per phase");
+  const searchResults = observations.filter((record) => record.hook === "tool_result" && eventToolName(record) === "tool_search");
+  assert.equal(searchResults.length, 5, "tool_search must return codemode state plus one lifecycle discovery result per phase");
   assertSearchAlreadyActive(searchResults[0]!, "codemode");
   assertSearchMatched(searchResults[1]!, echoName, "initial");
   assertSearchMatched(searchResults[1]!, counterName, "initial");
   assertSearchMissing(searchResults[2]!, echoName);
   assertSearchMatched(searchResults[3]!, echoName, "re-enabled");
-  assertSearchMatched(searchResults[4]!, counterName, "post-reconnect");
+  // The enabled-phase loader selection survives a same-name reconnect (no
+  // withdrawal), so the post-reconnect search may report either a fresh
+  // activation or the surviving already-active declaration.
+  assertSearchDeclared(searchResults[4]!, counterName, "post-reconnect");
 
   const codemodeCalls = observations.filter((record) => record.hook === "tool_call" && eventToolName(record) === "codemode");
   const codemodeResults = observations.filter((record) => record.hook === "tool_result" && eventToolName(record) === "codemode");
@@ -579,4 +663,157 @@ test("native MCP disable/enable/reconnect are observed in one candidate Pi TUI s
   assert.equal(resultIsError(codemodeResults[1]!), true,
     `the disabled native callee must fail inside the active codemode call; observed content: ${resultContent(codemodeResults[1]!)}`);
   assert.ok(driver.pid && driver.pid > 0, "PTY driver must report the single TUI process it kept through all manager operations");
+});
+
+test("live direct-to-codemode exposure change is not re-declared without a search (#279)", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+  const prerequisites = tuiPrerequisites(t);
+  if (!prerequisites) return;
+  const { host, compiler, driverPath } = prerequisites;
+
+  // The fixture server starts with DIRECT exposure: its tools are ordinary,
+  // so the deferred-off candidate declares them in the full active base and
+  // Pi declares them natively as well.
+  const paths = await prepareTuiSandbox(t, compiler, { serverExposure: "direct" });
+  const { sandbox, home, agentDir, workspace, stateDir, candidateEntry, probeEntry, observerEntry,
+    eventLog, counterFile, toolObservationPath, runTag, echoName, counterName } = paths;
+
+  const preMessage = `native-mcp-ui-direct-pre-${runTag}`;
+  const scriptMessage = `native-mcp-ui-direct-script-${runTag}`;
+  const searchMessage = `native-mcp-ui-direct-search-${runTag}`;
+  const actions: LifecycleAction[] = [
+    { type: "dump", name: "initial" },
+    {
+      // First model turn: the candidate's first reconcile seam adopts the
+      // still-direct tools into authority and declares them in the deferred-off
+      // full base. Without this, adoption would happen after the exposure flip
+      // and the retention path under test would never run.
+      type: "turn",
+      name: "pre-change",
+      message: `native-mcp-ui-turn-pre-${runTag}`,
+      marker: `NATIVE_MCP_UI_DIRECT_PRE_DONE_${runTag}`,
+      script: {
+        steps: [
+          {
+            codemode: successfulCode(echoName, counterName, preMessage, `pre-${runTag}`),
+          },
+          { text: `NATIVE_MCP_UI_DIRECT_PRE_DONE_${runTag}` },
+        ],
+      },
+    },
+    {
+      // The real /mcp manager re-registers the server's tools with the new
+      // exposure and strips its own direct declarations. The candidate's next
+      // managed write must not restore them without a search.
+      type: "manager_exposure",
+      server: DEFAULT_SERVER_NAME,
+      desired: "codemode",
+    },
+    { type: "dump", name: "after-exposure-change" },
+    {
+      // Undeclared native-callable tools remain script-callable through the
+      // real codemode pipeline; no search step precedes this turn.
+      type: "turn",
+      name: "script-callable",
+      message: `native-mcp-ui-turn-script-${runTag}`,
+      marker: `NATIVE_MCP_UI_DIRECT_SCRIPT_DONE_${runTag}`,
+      script: {
+        steps: [
+          {
+            codemode: successfulCode(echoName, counterName, scriptMessage, `script-${runTag}`),
+          },
+          { text: `NATIVE_MCP_UI_DIRECT_SCRIPT_DONE_${runTag}` },
+        ],
+      },
+    },
+    {
+      type: "turn",
+      name: "search-activates",
+      message: `native-mcp-ui-turn-search-${runTag}`,
+      marker: `NATIVE_MCP_UI_DIRECT_SEARCH_DONE_${runTag}`,
+      script: turnScript(
+        counterName,
+        successfulCode(echoName, counterName, searchMessage, `search-${runTag}`),
+        `NATIVE_MCP_UI_DIRECT_SEARCH_DONE_${runTag}`,
+      ),
+    },
+    { type: "dump", name: "after-search" },
+  ];
+  await writeFile(join(sandbox, "lifecycle.json"), JSON.stringify(actions, null, 2));
+
+  const resultPath = join(sandbox, "driver-result.json");
+  const driver = await runDriver(driverPath, sandbox, resultPath, {
+    PATH: process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin",
+    LANG: process.env.LANG ?? "C.UTF-8",
+    LC_ALL: process.env.LC_ALL,
+    TMPDIR: sandbox,
+    NODE_BIN: process.execPath,
+    PRG_PI_CLI: host.cliEntry,
+    PRG_CANDIDATE: candidateEntry,
+    PRG_PROBE: probeEntry,
+    PRG_OBSERVER: observerEntry,
+    PRG_PROJECT: workspace,
+    PRG_HOME: home,
+    PRG_AGENT_DIR: agentDir,
+    PRG_HOST_AGENT_DIR: host.agentDir,
+    PRG_FIXTURE_STATE_DIR: stateDir,
+    PRG_FIXTURE_TOOL_OBSERVATIONS: toolObservationPath,
+  });
+  const failures = driver.steps.filter((step) => !step.ok);
+  assert.ok(
+    driver.ok,
+    `direct-exposure TUI lifecycle failed${driver.error ? `: ${driver.error}` : ""}\n`
+      + `${failures.map((step) => `step ${step.index} (${step.type ?? "?"}): ${step.error ?? step.detail ?? "failed"}\n${step.screen ?? ""}`).join("\n---\n")}`
+      + `\nlast screen:\n${driver.lastScreen}`,
+  );
+  assert.equal(driver.alive, false, "PTY cleanup must leave no live Pi TUI process");
+  assert.equal(driver.exitedNormally, true, "the real Pi TUI must exit on the scripted Ctrl+C-twice shutdown");
+
+  const snapshots = new Map<string, ProbeDump>();
+  for (const name of ["initial", "after-exposure-change", "after-search"]) {
+    const path = join(stateDir, `snapshot-${name}.json`);
+    snapshots.set(name, JSON.parse(await readFile(path, "utf8")) as ProbeDump);
+  }
+  const initial = snapshots.get("initial")!;
+  assert.ok(matchingTools(initial, echoName).every((tool) => tool.exposure === "direct"),
+    "the direct-exposure server registers its tools with Pi's direct exposure");
+  assert.ok(initial.activeTools?.includes(echoName), "deferred-off declares the direct tool in the full base");
+  assert.ok(initial.activeTools?.includes(counterName));
+
+  const changed = snapshots.get("after-exposure-change")!;
+  assert.ok(matchingTools(changed, echoName).every((tool) => tool.exposure === REGISTERED_EXPOSURE_FOR_CODENAME_SERVER),
+    "the manager change re-registers the tools with the codemode server's native exposure");
+  assert.equal(changed.activeTools?.includes(echoName), false,
+    "Pi strips its direct declaration and the candidate must not restore it without a search");
+  assert.equal(changed.activeTools?.includes(counterName), false,
+    "the managed reapply after the native change event keeps every unsearched tool undeclared");
+  assert.ok(changed.activeTools?.includes("codemode"), "ordinary session tools survive the exposure change");
+
+  // The undeclared tools remain script-callable through the real pipeline.
+  const serverEvents = parseJsonLines(eventLog);
+  const protocolCalls = serverEvents.filter((event) => event.event === "tool_call");
+  assert.deepEqual(protocolCalls.map((event) => [event.tool, event.arguments]), [
+    ["echo", { message: preMessage }],
+    ["counter", { label: `pre-${runTag}` }],
+    ["echo", { message: scriptMessage }],
+    ["counter", { label: `script-${runTag}` }],
+    ["echo", { message: searchMessage }],
+    ["counter", { label: `search-${runTag}` }],
+  ], "all three turns reach the real MCP protocol server; only the searched tool is declared after the change");
+  assert.equal(Number.parseInt((await readFile(counterFile, "utf8")).trim(), 10), 3,
+    "the real server counter must record pre-change, script, and post-search effects");
+
+  const observations = parseJsonLines(toolObservationPath);
+  const searchResults = observations.filter((record) => record.hook === "tool_result" && eventToolName(record) === "tool_search");
+  assert.equal(searchResults.length, 1, "exactly one discovery result: the explicit post-change search");
+  assertSearchMatched(searchResults[0]!, counterName, "post-exposure-change");
+
+  const codemodeResults = observations.filter((record) => record.hook === "tool_result" && eventToolName(record) === "codemode");
+  assert.equal(codemodeResults.length, 3, "all three native script turns must return real codemode results");
+  for (const result of codemodeResults) assert.equal(resultIsError(result), false, `codemode turn must succeed: ${resultContent(result)}`);
+  assert.match(resultContent(codemodeResults[1]!), /echo:.*native-mcp-ui-direct-script-/, "the undeclared tools are script-callable before any search");
+
+  const afterSearch = snapshots.get("after-search")!;
+  assert.ok(afterSearch.activeTools?.includes(counterName), "the searched tool is declared for the next call");
+  assert.equal(afterSearch.activeTools?.includes(echoName), false,
+    "exact-name search declares only the matched tool; the unsearched sibling stays script-only");
 });

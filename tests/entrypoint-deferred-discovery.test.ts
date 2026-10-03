@@ -1,6 +1,6 @@
 // Extension entrypoint activation and deferred-discovery suites: fail-closed
 // startup registration, the conservative active tool set, the deferred
-// discovery surface (search_tools inventory and activations), and per-session
+// discovery surface (tool_search inventory and activations), and per-session
 // isolation of deferred authorization across API recreation.
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -176,7 +176,7 @@ test("session_start keeps launch-authorized native discovery active in the conse
     // The conservative set keeps the discovery trio alongside the loader and
     // execution controls; a mode switch retains them (covered role-level).
     assert.deepEqual(activeTools, [
-      "read", "grep", "find", "ls", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools",
+      "read", "grep", "find", "ls", "bash", "edit", "ApplyPatch", "SubtasksStart", "tool_search",
     ]);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -250,21 +250,21 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
 
     await activate(pi);
     assert.deepEqual(registeredTools.map((tool) => tool.name), [
-      ...webToolNames, "ApplyPatch", "GitRead", ...backgroundShellToolNames, "search_tools", "AskUserQuestion",
+      ...webToolNames, "ApplyPatch", "GitRead", ...backgroundShellToolNames, "tool_search", "AskUserQuestion",
     ]);
 
     runtimeInitialized = true;
     const sessionContext = { cwd: dir, ui: {}, sessionManager: {} };
     await trigger(hooks, "session_start", { cwd: dir }, sessionContext);
     assert.deepEqual(registeredTools.map((tool) => tool.name), [
-      ...webToolNames, "ApplyPatch", "GitRead", ...backgroundShellToolNames, "search_tools", "AskUserQuestion", ...executionToolNames,
+      ...webToolNames, "ApplyPatch", "GitRead", ...backgroundShellToolNames, "tool_search", "AskUserQuestion", ...executionToolNames,
     ]);
-    const deferredActive = ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools"];
+    const deferredActive = ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "tool_search"];
     assert.deepEqual(activeTools, deferredActive);
 
-    // The registered search_tools description itself discloses the deferred
+    // The registered tool_search description itself discloses the deferred
     // discovery set — authorized minus baseline-loaded — comma-delimited.
-    const searchDefinition = registeredTools.find((tool) => tool.name === "search_tools");
+    const searchDefinition = registeredTools.find((tool) => tool.name === "tool_search");
     const expectedDiscovery = [
       "AskUserQuestion", ...webToolNames, ...backgroundShellToolNames,
       ...executionToolNames.filter((name) => name !== "SubtasksStart"),
@@ -294,7 +294,7 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
       "read", "bash", "edit", ...webToolNames, "ApplyPatch", ...backgroundShellToolNames,
       "AskUserQuestion", ...executionToolNames,
     ];
-    assert.deepEqual(activeTools, [...fullAuthorized, "search_tools"], "saving Off immediately activates the complete local catalog");
+    assert.deepEqual(activeTools, [...fullAuthorized, "tool_search"], "saving Off immediately activates the complete local catalog");
     await toggleDeferredTools();
     assert.deepEqual(activeTools, deferredActive, "saving On immediately restores the conservative local catalog");
 
@@ -306,7 +306,7 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     assert.match(inventory, /native orchestrator prompt/);
     // The startup inventory is the stable deferred discovery set only:
     // baseline-loaded tools (read/bash/edit/ApplyPatch/SubtasksStart) and
-    // search_tools itself are omitted, every deferred discovery tool is
+    // tool_search itself are omitted, every deferred discovery tool is
     // listed with its compact canonical purpose.
     const discoveryNames = [
       "AskUserQuestion", ...webToolNames, ...backgroundShellToolNames,
@@ -317,14 +317,14 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     }
     // GitRead is mode-pinned (absent outside plan/research), never a deferred
     // discovery target in either state.
-    for (const baselineName of ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools", "GitRead"]) {
+    for (const baselineName of ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "tool_search", "GitRead"]) {
       assert.doesNotMatch(inventory, new RegExp(escapeRegExp(`\\"${baselineName}\\"`)));
     }
     assert.match(inventory, /exact name/);
     assert.match(inventory, /next turn/);
     // Compact canonical purposes are part of the inventory; schemas never
     // appear. A newly registered live registry name joins top-level discovery,
-    // but remains inactive until search_tools explicitly loads it.
+    // but remains inactive until tool_search explicitly loads it.
     assert.match(inventory, /Search the public web/);
     assert.match(inventory, /LateIdleTool/);
     assert.doesNotMatch(inventory, /parameters|properties/);
@@ -334,16 +334,16 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     assert.ok(activeTools.includes("LateToolResultTool"));
     await trigger(hooks, "tool_result", { cwd: dir, toolName: "read", input: {}, isError: false });
     assert.equal(activeTools.includes("LateToolResultTool"), false, "tool-result boundary removes widening before the next request");
-    const executeDescription = registeredTools.find((tool) => tool.name === "search_tools")?.description ?? "";
+    const executeDescription = registeredTools.find((tool) => tool.name === "tool_search")?.description ?? "";
 
-    const searchTools = registeredTools.find((tool) => tool.name === "search_tools") as {
+    const searchTools = registeredTools.find((tool) => tool.name === "tool_search") as {
       execute?: (id: string, params: unknown) => Promise<Record<string, unknown>>;
     } | undefined;
     assert.ok(searchTools?.execute);
     const result = await searchTools.execute("load-add", { query: "add tasks to existing execution" });
     assert.equal(result.isError, false);
     assert.deepEqual((result.details as { activated: string[] }).activated, ["SubtasksAdd"]);
-    assert.deepEqual(activeTools, ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "search_tools", "SubtasksAdd"]);
+    assert.deepEqual(activeTools, ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "tool_search", "SubtasksAdd"]);
 
     // A mode switch is a legitimate permission-boundary change: both discovery
     // surfaces rebuild from the live mode ceiling (write-capable and
@@ -377,8 +377,8 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     // discovery target; the search loader agrees.
     assert.ok(activeTools.includes("GitRead"), "GitRead is active in plan/research without search activation");
     assert.doesNotMatch(researchSegment, /GitRead/);
-    assert.doesNotMatch(registeredTools.find((tool) => tool.name === "search_tools")?.description ?? "", /GitRead/);
-    const researchSearch = registeredTools.find((tool) => tool.name === "search_tools");
+    assert.doesNotMatch(registeredTools.find((tool) => tool.name === "tool_search")?.description ?? "", /GitRead/);
+    const researchSearch = registeredTools.find((tool) => tool.name === "tool_search");
     assert.doesNotMatch(researchSearch?.description ?? "", /SubtasksAdd|ShellStart|BrowserClick/);
     assert.match(researchSearch?.description ?? "", /SubtasksInspect, SubtasksWatch, WebFetch, WebSearch\.$/);
 
@@ -386,7 +386,7 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     const restoredInventory = JSON.stringify(await triggerResults(hooks, "before_agent_start", { cwd: dir }));
     const restoredSegment = restoredInventory.match(/Authorized tool names with purpose:.*?If an authorized/)?.[0] ?? "";
     assert.match(restoredSegment, new RegExp(escapeRegExp(`\\"SubtasksAdd\\" (`)));
-    assert.equal(registeredTools.find((tool) => tool.name === "search_tools")?.description, executeDescription);
+    assert.equal(registeredTools.find((tool) => tool.name === "tool_search")?.description, executeDescription);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -436,7 +436,7 @@ test("deferred authorization survives API recreation and remains isolated per Pi
       return { hooks, pi };
     };
     const executeSearch = async (backing: ReturnType<typeof createBacking>, query: string) => {
-      const search = backing.definitions.get("search_tools");
+      const search = backing.definitions.get("tool_search");
       assert.ok(search?.execute);
       return search.execute("search", { query });
     };
@@ -547,12 +547,12 @@ test("GitRead registers in the top-level runtime and follows the operating mode 
 
     // plan/research (from config): active from the first request even with
     // deferred tools enabled, and never disclosed as a deferred target.
-    assert.deepEqual(activeTools, ["read", "search_tools", "GitRead"]);
+    assert.deepEqual(activeTools, ["read", "tool_search", "GitRead"]);
     const beforePlan = await triggerResults(hooks, "before_agent_start", { cwd: dir });
     const planInventory = JSON.stringify(beforePlan);
     assert.doesNotMatch(planInventory, /\\\"GitRead\\\"/);
 
-    const searchTools = () => registeredTools.find((tool) => tool.name === "search_tools") as {
+    const searchTools = () => registeredTools.find((tool) => tool.name === "tool_search") as {
       execute?: (id: string, params: unknown) => Promise<Record<string, unknown>>;
       description?: string;
     };

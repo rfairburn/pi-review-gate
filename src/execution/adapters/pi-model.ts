@@ -71,7 +71,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
       request.executorToolCatalog.initialActiveTools,
     );
     const toolCatalog = createPiWorkerToolCatalog(durableToolCatalog);
-    // The native CLI allowlist remains the hard launch boundary. search_tools
+    // The native CLI allowlist remains the hard launch boundary. tool_search
     // is the sole control tool added outside the durable capability catalog;
     // the extension receives the validated initial subset through a private
     // child environment bootstrap.

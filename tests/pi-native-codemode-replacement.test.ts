@@ -159,11 +159,11 @@ function searchDetails(value: unknown): Record<string, unknown> | undefined {
 async function searchCodemode(fixture: NativeMcpFixture): Promise<FixtureEvent> {
   const start = fixture.sessionEvents.length;
   await fixture.setTurnScript([
-    { toolCalls: [{ toolName: "search_tools", arguments: { query: CODEMODE } }] },
+    { toolCalls: [{ toolName: "tool_search", arguments: { query: CODEMODE } }] },
     { text: "zero-MCP codemode search completed" },
   ]);
   await fixture.promptTurn("Find and load the authorized codemode tool.");
-  return rootToolResult(fixture.sessionEvents.slice(start), "search_tools");
+  return rootToolResult(fixture.sessionEvents.slice(start), "tool_search");
 }
 
 async function executeBoundedCodemodeScript(fixture: NativeMcpFixture): Promise<FixtureEvent> {
@@ -271,11 +271,11 @@ test("wrapper codemode discovery survives real zero-MCP /new factory and Session
   assert.equal(initial.allTools?.some((tool) => tool.name.startsWith("mcp__")), false);
   assert.equal(requireTool(initial, CODEMODE).exposure, "model-only");
   assert.ok(!initial.activeTools?.includes(CODEMODE), "native Pi registered codemode but left it initially inactive");
-  assert.ok(requireTool(initial, "search_tools"), "the review-gate loader is registered");
+  assert.ok(requireTool(initial, "tool_search"), "the review-gate loader is registered");
 
   const initialSearch = await searchCodemode(fixture);
   const initialDetails = searchDetails(initialSearch.result);
-  assert.ok(initialDetails, `search_tools must return actual structured details: ${JSON.stringify(initialSearch)}`);
+  assert.ok(initialDetails, `tool_search must return actual structured details: ${JSON.stringify(initialSearch)}`);
   assert.deepEqual(initialDetails.matched, [CODEMODE]);
   assert.deepEqual(initialDetails.activated, [CODEMODE], "deferred ON loads Pi's model-only codemode root");
   assert.ok((await fixture.probeDump()).activeTools?.includes(CODEMODE));
@@ -286,11 +286,11 @@ test("wrapper codemode discovery survives real zero-MCP /new factory and Session
   const afterNew = await fixture.probeDump();
   assert.equal(requireTool(afterNew, CODEMODE).exposure, "model-only");
   assert.ok(!afterNew.activeTools?.includes(CODEMODE), "replacement starts with codemode inactive again");
-  assert.ok(requireTool(afterNew, "search_tools"), "the replacement review-gate loader remains registered");
+  assert.ok(requireTool(afterNew, "tool_search"), "the replacement review-gate loader remains registered");
 
   const replacementSearch = await searchCodemode(fixture);
   const replacementDetails = searchDetails(replacementSearch.result);
-  assert.ok(replacementDetails, `replacement search_tools result must be observable: ${JSON.stringify(replacementSearch)}`);
+  assert.ok(replacementDetails, `replacement tool_search result must be observable: ${JSON.stringify(replacementSearch)}`);
   assert.deepEqual(replacementDetails.matched, [CODEMODE]);
   assert.deepEqual(replacementDetails.activated, [CODEMODE]);
   const loaded = await fixture.probeDump();
@@ -322,8 +322,8 @@ test("deferred OFF exposes and executes ordinary codemode after zero-MCP /new wi
   const newEvents = collectTypedRecords(fixture.sessionEvents.slice(beforeEvents));
   assert.ok(newEvents.some((event) => event.type === "tool_execution_end" && event.toolName === CODEMODE
     && JSON.stringify(event.result ?? event).includes(SESSION_REPLACEMENT_MARKER)));
-  assert.equal(newEvents.some((event) => event.toolName === "search_tools"), false,
-    "deferred OFF executes codemode without a search_tools activation step");
+  assert.equal(newEvents.some((event) => event.toolName === "tool_search"), false,
+    "deferred OFF executes codemode without a tool_search activation step");
 });
 
 test("native --exclude-tools codemode remains authoritative across zero-MCP /new", { timeout: 180_000 }, async (t) => {
@@ -340,14 +340,14 @@ test("native --exclude-tools codemode remains authoritative across zero-MCP /new
   assert.equal(afterNew.allTools?.some((tool) => tool.name === CODEMODE), false,
     "the native CLI exclusion survives extension and session replacement");
   assert.equal(afterNew.activeTools?.includes(CODEMODE), false);
-  assert.doesNotMatch(requireTool(afterNew, "search_tools").description ?? "", /codemode/);
+  assert.doesNotMatch(requireTool(afterNew, "tool_search").description ?? "", /codemode/);
 
   await fixture.setTurnScript([
-    { toolCalls: [{ toolName: "search_tools", arguments: { query: CODEMODE } }] },
+    { toolCalls: [{ toolName: "tool_search", arguments: { query: CODEMODE } }] },
     { text: "excluded codemode search completed" },
   ]);
   await fixture.promptTurn("Try searching for the native-excluded codemode tool.");
-  const result = rootToolResult(fixture.sessionEvents.slice(beforeEvents), "search_tools");
+  const result = rootToolResult(fixture.sessionEvents.slice(beforeEvents), "tool_search");
   const details = searchDetails(result.result);
   assert.ok(details);
   assert.deepEqual(details.matched, [], "the wrapper default cannot reintroduce native-excluded codemode");

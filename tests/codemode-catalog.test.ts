@@ -15,7 +15,7 @@ import {
 /**
  * Dedicated codemode catalog regression (#224): the tool follows the ordinary
  * existing deferred-tools setting — deferred ON keeps it in the allowed
- * execute/orchestrate ceilings for search_tools activation but never in the
+ * execute/orchestrate ceilings for tool_search activation but never in the
  * conservative initial subset; deferred OFF runs the full-active contract;
  * read-only research catalogs always exclude it, with no special exceptions.
  * Unsupported external adapter mappings preserve no authorization widening.
@@ -100,7 +100,7 @@ test("Pi worker launch catalogs keep authorized codemode deferred, never initial
     createExecutorToolCatalog(authorized, defaultExecutorInitialActiveTools(authorized)),
   );
   // The tool stays launchable in the allowed ceiling: the existing Pi adapter
-  // derives --tools from exactly this set, so search_tools activation works
+  // derives --tools from exactly this set, so tool_search activation works
   // with no adapter change; delegation controls alone are stripped, and
   // recursive delegation stays unregistered.
   assert.deepEqual(worker.initialActiveTools, ["read", "bash"]);

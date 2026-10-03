@@ -15,6 +15,26 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.111]
+
+### Changed
+
+- Replace Pi's builtin `tool_search` with review-gate's own inventory-backed
+  loader registered under the same replaceable name: there is now one
+  model-facing discovery/activation tool, and `search_tools` is no longer part
+  of the tool, prompt, or documentation contract (#279).
+- The loader directly activates authorized matches — ordinary, codemode- and
+  deferred-exposed (including MCP), and model-only tools — declaring their
+  schemas for the next model call without ever executing the matched operation.
+  Exact-name-first matching, the compact discovery inventory in the tool
+  description and startup prompt, native script callability of codemode/deferred
+  exposures, permission gates, the deferred-off setting, operating modes,
+  research visibility, and fixed worker ceilings are unchanged (#279).
+- Supported live MCP changes (server connect/disconnect, `/mcp reconnect`,
+  enablement/exposure changes, and server tool-list notifications) update
+  discovery at Pi's real reconciliation seams without a reload; removed, hidden,
+  or withdrawn tools are pruned from inventory and activation (#279).
+
 ## [0.1.0-dev.110]
 
 ### Changed

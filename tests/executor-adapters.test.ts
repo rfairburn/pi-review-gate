@@ -177,7 +177,7 @@ test("Pi executor child loads the review-gate extension in executor role without
       assert.equal(captured.env.PI_REVIEW_GATE_RUNTIME_ROLE, "executor");
       assert.equal(captured.env.PI_EXTRA_EXTENSIONS, undefined);
       const tools = captured.argv[captured.argv.indexOf("--tools") + 1];
-      assert.equal(tools, "read,WebSearch,WebFetch,BrowserExtract,search_tools");
+      assert.equal(tools, "read,WebSearch,WebFetch,BrowserExtract,tool_search");
       assert.deepEqual(JSON.parse(captured.env.PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG!), {
         allowedToolCatalog: ["read", "WebSearch", "WebFetch", "BrowserExtract"],
         initialActiveTools: ["read", "WebFetch"],
@@ -233,8 +233,8 @@ test("Pi executor launches research workers with authorized native discovery act
     const argv: string[] = JSON.parse(await readFile(capture, "utf8"));
     // The native --tools allowlist carries the full inherited catalog plus the
     // loader; the durable initial subset starts the discovery trio active so
-    // the worker never needs search_tools before its first discovery call.
-    assert.equal(argv[argv.indexOf("--tools") + 1], "read,grep,find,ls,WebSearch,search_tools");
+    // the worker never needs tool_search before its first discovery call.
+    assert.equal(argv[argv.indexOf("--tools") + 1], "read,grep,find,ls,WebSearch,tool_search");
     const environment = JSON.parse(await readFile(environmentCapture, "utf8"));
     assert.deepEqual(JSON.parse(environment.toolCatalog), {
       allowedToolCatalog: ["read", "grep", "find", "ls", "WebSearch"],
@@ -875,7 +875,7 @@ test("Pi executor uses acknowledged RPC steering and a durable session", async (
     assert.equal(result.session.adapter, "pi-model");
     const argv: string[] = JSON.parse(await readFile(capture, "utf8"));
     assert.equal(argv[argv.indexOf("--mode") + 1], "rpc");
-    assert.equal(argv[argv.indexOf("--tools") + 1], "read,bash,search_tools");
+    assert.equal(argv[argv.indexOf("--tools") + 1], "read,bash,tool_search");
     const environment = JSON.parse(await readFile(environmentCapture, "utf8"));
     assert.deepEqual(JSON.parse(environment.toolCatalog), {
       allowedToolCatalog: ["read", "bash"],

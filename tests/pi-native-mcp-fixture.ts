@@ -63,7 +63,7 @@
  * executor role exactly like the production Pi executor adapter — the fixed
  * provided catalog through `PI_REVIEW_GATE_RUNTIME_ROLE` +
  * `PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG`, one native `--tools` allowlist of
- * the captured allowed capabilities + `search_tools`, and a fresh synthetic
+ * the captured allowed capabilities + `tool_search`, and a fresh synthetic
  * settlement bootstrap created under the fixture scratch through the
  * production settlement helpers. All role values are synthetic and declared;
  * no inherited `PI_REVIEW_GATE_*` variable or provider key is ever copied,
@@ -335,7 +335,7 @@ function prepareExecutorToolCatalog(catalog: ExecutorToolCatalog): ExecutorToolC
 /**
  * The single native `--tools` allowlist the helper owns for executor-role
  * launches, byte-for-byte like the production adapter's childArgs: every
- * captured allowed capability plus `search_tools` (the sole control tool
+ * captured allowed capability plus `tool_search` (the sole control tool
  * outside the durable capability catalog), deduplicated, never auto-widened.
  */
 function executorLaunchToolList(catalog: ExecutorToolCatalog): string[] {
@@ -445,7 +445,7 @@ export interface NativeMcpFixtureOptions {
 	 * through the same production helpers (createExecutorToolCatalog +
 	 * createPiWorkerToolCatalog; never auto-widened; Subtasks* names dropped
 	 * by the shared Pi worker normalization), emits ONE `--tools` allowlist of
-	 * the captured allowed capabilities + `search_tools`, launches with a
+	 * the captured allowed capabilities + `tool_search`, launches with a
 	 * synthetic session id (`--session-id`), and creates a fresh AUTHENTIC
 	 * synthetic settlement bootstrap under the fixture scratch via the production
 	 * createPiSettlementBootstrap/piSettlementEnvironment (random identity +
@@ -919,7 +919,7 @@ export class NativeMcpFixture {
 		// Executor-role launch shape, byte-for-byte like the production adapter's
 		// childArgs: the synthetic session id is the settlement identity's
 		// session anchor, and ONE --tools allowlist carries the captured allowed
-		// capabilities plus search_tools (the catalog is authoritative; nothing
+		// capabilities plus tool_search (the catalog is authoritative; nothing
 		// is auto-widened).
 		if (executorLaunch) {
 			args.push("--session-id", executorLaunch.sessionId);

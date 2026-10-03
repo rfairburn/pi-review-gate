@@ -6,7 +6,7 @@
  * - The AskUserQuestion tool, registered before session_start so it enters
  *   the deferred-tool authorization boundary like every other top-level tool
  *   (active by default under Pi's registered-tool policy, discoverable through
- *   search_tools, reasserted by the deferred manager).
+ *   tool_search, reasserted by the deferred manager).
  * - A persistent collapsed panel above the chat editor (a widget): it shows
  *   only "Pending questions · Press <chord>" — never question text — while
  *   questions are pending, stays visible through chat output without taking

@@ -273,7 +273,7 @@ test("web and discovery registrations all use the shared expansion mechanism", (
     getAllTools: () => [],
     setActiveTools: () => {},
   }).register();
-  const expectedNames = [...INTERACTIVE_BROWSER_TOOL_NAMES, "WebFetch", "BrowserExtract", "WebSearch", "search_tools"];
+  const expectedNames = [...INTERACTIVE_BROWSER_TOOL_NAMES, "WebFetch", "BrowserExtract", "WebSearch", "tool_search"];
   const registered = [...webTools, ...deferredTools] as Array<Record<string, any>>;
   const registeredNames = new Set(registered.map((tool) => String(tool.name)));
   for (const name of expectedNames) {

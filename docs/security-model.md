@@ -189,10 +189,10 @@ For delegated workers and research subtasks:
   activity; they do not exclude registered tools. Consequently, those settings alone
   do not keep `grep`, `find`, or `ls` inactive in review-gate. Use `--exclude-tools`
   or an explicit `--tools` allowlist to withhold them. Other inactive tools are not
-  promoted by review-gate's own loader. The qualified exception is Pi's native MCP and
-  codemode exposure, which remains reachable through its native channels, is reconciled
-  into the gate's discovery and activation view rather than declared or hidden by it
-  (see [Native Pi tools](native-pi-tools.md#reconciliation-during-a-running-session)),
+  promoted except through an explicit `tool_search` activation by review-gate's own
+  loader. Pi's native MCP and codemode exposure remains reachable through its native
+  channels while undeclared, is reconciled into the gate's discovery and activation
+  view (see [Native Pi tools](native-pi-tools.md#reconciliation-during-a-running-session)),
   and never overrides an explicit restriction. Configured worker catalogs are never
   expanded beyond the inherited durable catalog: a later MCP registration, `/mcp`
   re-enablement, or reconfiguration inside a worker session applies only within it —
@@ -212,7 +212,7 @@ For delegated workers and research subtasks:
 The structured read-only Git history tool `GitRead` is registered in both the
 top-level and Pi executor runtimes, and its visibility is pinned to role rather than
 left to activation state: at the top level it is active only while the operating mode
-is plan/research (removed from the active set, inventory, and `search_tools` results
+is plan/research (removed from the active set, inventory, and `tool_search` results
 in every other mode), Pi research workers receive it through the durable initial-active
 subset, and execute-kind worker catalogs never contain it. It reads stored repository
 objects only — history, trees, and blobs at pinned revisions — through structured

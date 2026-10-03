@@ -86,7 +86,7 @@ function hostFixture(options: { disabled?: string[]; omit?: string[] } = {}) {
     removeFromRegistry,
     active: () => [...active],
     search: () => {
-      const registered = definitions.find((definition) => definition.name === "search_tools");
+      const registered = definitions.find((definition) => definition.name === "tool_search");
       assert.ok(registered?.execute);
       return registered.execute;
     },
@@ -111,7 +111,7 @@ test("a captured worker catalog does not gain initial write activation on restor
   manager.register();
   const catalog = { allowedToolCatalog: ["read", "write"], initialActiveTools: ["read"] };
   manager.sessionStart(fixture.sessionIdentity, catalog, true);
-  assert.deepEqual(fixture.active(), ["read", "search_tools"]);
+  assert.deepEqual(fixture.active(), ["read", "tool_search"]);
   assert.deepEqual(catalog.initialActiveTools, ["read"]);
 });
 
@@ -127,7 +127,7 @@ test("planning unloads activated write tools and hides them from discovery and i
 
   mode = "plan-research";
   manager.reapply();
-  assert.deepEqual(fixture.active(), ["read", "search_tools"]);
+  assert.deepEqual(fixture.active(), ["read", "tool_search"]);
   for (const name of ["write", "edit", "bash", "ApplyPatch", "SubtasksStart", "SubtasksAdd"]) {
     assert.ok(!manager.startupGuidance()?.includes(`"${name}"`));
     const result = await fixture.search()("try-removed", { query: name });
@@ -135,7 +135,7 @@ test("planning unloads activated write tools and hides them from discovery and i
     assert.ok(!fixture.active().includes(name));
   }
   await fixture.search()("load-read-only", { query: "WebSearch" });
-  assert.deepEqual(fixture.active(), ["read", "search_tools", "WebSearch"]);
+  assert.deepEqual(fixture.active(), ["read", "tool_search", "WebSearch"]);
   mode = "execute";
   manager.reapply();
   assert.deepEqual(fixture.active(), [...before, "WebSearch"]);
@@ -148,9 +148,9 @@ test("planning filters full-active settings and repeated host reapplication", ()
   const manager = new DeferredToolManager(fixture.pi, () => mode);
   manager.register();
   manager.sessionStart(fixture.sessionIdentity);
-  assert.deepEqual(fixture.active(), ["read", "search_tools"]);
+  assert.deepEqual(fixture.active(), ["read", "tool_search"]);
   manager.setDeferredEnabled(false);
-  assert.deepEqual(fixture.active(), ["read", "SubtasksInspect", "WebSearch", "search_tools"]);
+  assert.deepEqual(fixture.active(), ["read", "SubtasksInspect", "WebSearch", "tool_search"]);
   fixture.pi.setActiveTools(["write"]);
   manager.reapply();
   assert.ok(!fixture.active().includes("write"));
@@ -165,7 +165,7 @@ test("first session request is shrunk to the authorized conservative set and loa
   const manager = new DeferredToolManager(fixture.pi);
 
   assert.equal(manager.register(), true);
-  const searchDefinition = fixture.definitions.find((definition) => definition.name === "search_tools")!;
+  const searchDefinition = fixture.definitions.find((definition) => definition.name === "tool_search")!;
   assert.match(searchDefinition.description ?? "", /query only exact tool names/);
   assert.match(searchDefinition.promptSnippet ?? "", /only exact tool names when known, without descriptive words/);
   assert.match(
@@ -175,7 +175,7 @@ test("first session request is shrunk to the authorized conservative set and loa
   assert.ok(fixture.active().includes("WebSearch"), "registration alone does not shrink before session_start");
   assert.equal(manager.sessionStart(fixture.sessionIdentity), true);
 
-  assert.deepEqual(fixture.active(), ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "search_tools"]);
+  assert.deepEqual(fixture.active(), ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "tool_search"]);
   assert.deepEqual(manager.authorizedToolNames(), [
     "read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "SubtasksAdd", "SubtasksInspect", "WebSearch",
   ], "worker authorization remains the complete pre-shrink catalog");
@@ -190,10 +190,10 @@ test("first session request is shrunk to the authorized conservative set and loa
   const reloaded = new DeferredToolManager(recreatedPi);
   reloaded.register();
   reloaded.sessionStart(fixture.sessionIdentity);
-  assert.deepEqual(fixture.active(), ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "search_tools"]);
+  assert.deepEqual(fixture.active(), ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "tool_search"]);
   // #224: a Pi-permitted tool registered after capture joins the authority at
   // the next reconciliation (registry diff) but never the declared set until
-  // search_tools loads it.
+  // tool_search loads it.
   assert.ok(reloaded.authorizedToolNames()?.includes("post_capture"), "top-level reconcile adopts late registrations");
   assert.ok(!fixture.active().includes("post_capture"), "host auto-activation is not promoted to declaration");
 });
@@ -207,15 +207,15 @@ test("configured worker catalogs use the durable initial subset without narrowin
     allowedToolCatalog: ["read", "write", "WebSearch"],
     initialActiveTools: ["read"],
   }), true);
-  assert.deepEqual(fixture.active(), ["read", "search_tools"]);
+  assert.deepEqual(fixture.active(), ["read", "tool_search"]);
   assert.deepEqual(manager.authorizedToolNames(), ["read", "write", "WebSearch"]);
   // Stable discovery set: authorized catalog minus baseline-loaded role tools
-  // ("read" and search_tools itself). Baseline omission keeps the inventory
+  // ("read" and tool_search itself). Baseline omission keeps the inventory
   // byte-stable while deferred tools activate.
   const inventory = manager.startupGuidance() ?? "";
   assert.match(inventory, /"write" \(Create or overwrite a file\)/);
   assert.match(inventory, /"WebSearch" \(Search the public web for current sources\)/);
-  assert.doesNotMatch(inventory, /"read"|"search_tools"/);
+  assert.doesNotMatch(inventory, /"read"|"tool_search"/);
   assert.match(inventory, /exact name/);
   assert.match(inventory, /next turn/);
   assert.doesNotMatch(inventory, /parameters|properties|Supports images/);
@@ -227,11 +227,11 @@ test("configured worker catalogs use the durable initial subset without narrowin
     true,
     "same-session extension reload reuses the captured one-shot bootstrap",
   );
-  assert.deepEqual(fixture.active(), ["read", "search_tools"]);
+  assert.deepEqual(fixture.active(), ["read", "tool_search"]);
 
   const result = await fixture.search()("search", { query: "public web" });
   assert.deepEqual((result.details as { activated: string[] }).activated, ["WebSearch"]);
-  assert.deepEqual(fixture.active(), ["read", "search_tools", "WebSearch"]);
+  assert.deepEqual(fixture.active(), ["read", "tool_search", "WebSearch"]);
 });
 
 test("a retained dynamic host boundary cannot become a configured worker ceiling", () => {
@@ -270,9 +270,9 @@ test("role-filtered research inventory lists only deferred discovery names witho
   });
 
   const inventory = manager.startupGuidance() ?? "";
-  // "read" is baseline-loaded for this role and search_tools is baseline:
+  // "read" is baseline-loaded for this role and tool_search is baseline:
   // neither may appear; every deferred discovery tool does.
-  assert.doesNotMatch(inventory, /"read"|"search_tools"/);
+  assert.doesNotMatch(inventory, /"read"|"tool_search"/);
   for (const name of ["WebSearch", ...browserNames]) {
     assert.match(inventory, new RegExp(`"${name}" \\(`));
   }
@@ -298,7 +298,7 @@ test("configured worker boundaries reject unavailable and unauthorized tools", a
     initialActiveTools: ["read"],
   }), false, "a durable name absent from the native launch allowlist fails closed");
   assert.equal(manager.authorizedToolNames(), undefined);
-  assert.equal(fixture.active().includes("search_tools"), false);
+  assert.equal(fixture.active().includes("tool_search"), false);
 
   const result = await fixture.search()("unauthorized", { query: "private disabled" });
   assert.equal(result.isError, true);
@@ -312,11 +312,11 @@ test("disabled deferred mode starts full-active and local toggles apply immediat
   manager.sessionStart(fixture.sessionIdentity, undefined, false, false);
 
   const authorized = manager.authorizedToolNames()!;
-  assert.deepEqual(fixture.active(), [...authorized, "search_tools"]);
+  assert.deepEqual(fixture.active(), [...authorized, "tool_search"]);
   assert.doesNotMatch(manager.startupGuidance() ?? "", /inactive|next turn/);
 
   assert.equal(manager.setDeferredEnabled(true), true);
-  assert.deepEqual(fixture.active(), ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "search_tools"]);
+  assert.deepEqual(fixture.active(), ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "tool_search"]);
   assert.match(manager.startupGuidance() ?? "", /inactive.*exact name.*next turn/);
 
   await fixture.search()("load-web", { query: "WebSearch" });
@@ -325,7 +325,7 @@ test("disabled deferred mode starts full-active and local toggles apply immediat
   assert.ok(fixture.active().includes("WebSearch"), "saving unrelated settings does not unload activated tools");
 
   assert.equal(manager.setDeferredEnabled(false), true);
-  assert.deepEqual(fixture.active(), [...authorized, "search_tools"]);
+  assert.deepEqual(fixture.active(), [...authorized, "tool_search"]);
 });
 
 test("configured worker with deferred mode disabled starts every durable authorized tool", () => {
@@ -337,7 +337,7 @@ test("configured worker with deferred mode disabled starts every durable authori
     initialActiveTools: ["read", "write", "WebSearch"],
   }, true);
 
-  assert.deepEqual(fixture.active(), ["read", "write", "WebSearch", "search_tools"]);
+  assert.deepEqual(fixture.active(), ["read", "write", "WebSearch", "tool_search"]);
   assert.doesNotMatch(manager.startupGuidance() ?? "", /inactive|next turn/);
 });
 
@@ -355,7 +355,7 @@ test("search deterministically and additively activates authorized matches only"
   ]);
   assert.deepEqual((result.details as { activated: string[] }).activated, ["SubtasksAdd", "SubtasksInspect"]);
   assert.deepEqual(fixture.active(), [
-    "read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "search_tools", "SubtasksAdd", "SubtasksInspect",
+    "read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "tool_search", "SubtasksAdd", "SubtasksInspect",
   ]);
   assert.match(String((result.content as Array<{ text: string }>)[0]?.text), /did not perform the operation/);
 });
@@ -437,7 +437,7 @@ test("every authorized tool in a strongest tier is activated and reported alphab
   assert.deepEqual(details.matched, strongest);
   assert.deepEqual(details.activated, strongest);
   assert.equal(details.omitted, 0);
-  assert.deepEqual(fixture.active(), ["read", "search_tools", ...strongest]);
+  assert.deepEqual(fixture.active(), ["read", "tool_search", ...strongest]);
   const text = String((result.content as Array<{ text: string }>)[0]?.text);
   assert.equal(text.includes("BatchPrivate"), false, "unauthorized names are not disclosed");
   assert.equal(text.includes("DescriptionOnly"), false, "weaker matches are not reported or activated");
@@ -579,7 +579,7 @@ test("session restart and a recreated ExtensionAPI wrapper reuse the session aut
   assert.ok(fixture.active().includes("WebSearch"));
 
   first.sessionStart(fixture.sessionIdentity);
-  const initial = ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "search_tools"];
+  const initial = ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "tool_search"];
   assert.deepEqual(fixture.active(), initial, "another session_start resets to the same initial set");
 
   fixture.pi.registerTool(tool("reload_private", "A tool registered only after the original authorization capture."));
@@ -705,7 +705,7 @@ test("launch-authorized native discovery is active from the first request in eve
   manager.register();
   manager.sessionStart(fixture.sessionIdentity);
 
-  // Active from the first request, with no search_tools activation step.
+  // Active from the first request, with no tool_search activation step.
   assert.ok(fixture.active().includes("grep"));
   assert.ok(fixture.active().includes("find"));
   assert.ok(fixture.active().includes("ls"));
@@ -796,9 +796,9 @@ test("configured worker catalogs activate authorized discovery from the first re
     initialActiveTools: ["read", "grep", "find", "ls"],
   }, true), true);
 
-  // The durable initial subset is active at startup; no search_tools call is
+  // The durable initial subset is active at startup; no tool_search call is
   // needed before the first discovery call.
-  assert.deepEqual(fixture.active(), ["read", "grep", "find", "ls", "search_tools"]);
+  assert.deepEqual(fixture.active(), ["read", "grep", "find", "ls", "tool_search"]);
   assert.deepEqual(manager.authorizedToolNames(), ["read", "grep", "find", "ls", "WebSearch"]);
 });
 
@@ -886,13 +886,13 @@ test("synthetic nested repository: discovery tools are active and callable witho
   }
 });
 
-test("search_tools description tracks the stable discovery set across mode and permission changes only", async () => {
+test("tool_search description tracks the stable discovery set across mode and permission changes only", async () => {
   const fixture = hostFixture();
   fixture.pi.registerTool(tool("grep", "Search file contents for a pattern."));
   let registerCalls = 0;
   const originalRegister = fixture.pi.registerTool.bind(fixture.pi);
   fixture.pi.registerTool = (definition: RegisteredTool) => {
-    if (definition.name === "search_tools") registerCalls++;
+    if (definition.name === "tool_search") registerCalls++;
     return originalRegister(definition);
   };
   let mode: OperatingMode = "orchestrate";
@@ -908,9 +908,9 @@ test("search_tools description tracks the stable discovery set across mode and p
   const writeMode = searchDescription(fixture);
   assert.match(writeMode, /Activate authorized tools\. If names are known, query only exact tool names/);
   // Discovery set = authorized minus baseline-loaded (read/bash/edit/write/
-  // ApplyPatch/SubtasksStart) minus search_tools itself.
+  // ApplyPatch/SubtasksStart) minus tool_search itself.
   assert.match(writeMode, /Authorized tool names: SubtasksAdd, SubtasksInspect, WebSearch./);
-  assert.doesNotMatch(writeMode, /read, bash|search_tools\./);
+  assert.doesNotMatch(writeMode, /read, bash|tool_search\./);
   assert.equal(registerCalls, 2, "exactly one refresh after boundary capture");
   // Names only: no per-name purposes or schema text in the description.
   assert.doesNotMatch(writeMode, /Execute a shell command|Read file contents|parameters|properties/);
@@ -969,7 +969,7 @@ test("search_tools description tracks the stable discovery set across mode and p
   const guidance = manager.startupGuidance() ?? "";
   assert.match(guidance, /"SubtasksAdd" \(/);
   assert.doesNotMatch(guidance, /Authorized tool names:/);
-  assert.doesNotMatch(guidance, /"search_tools"|"read"|"bash"/);
+  assert.doesNotMatch(guidance, /"tool_search"|"read"|"bash"/);
 });
 
 test("deferred-disabled sessions render no redundant inventory and the description lists no names", () => {
@@ -1023,7 +1023,7 @@ test("GitRead is active from the first plan/research request and never a deferre
 
   // Active immediately even though deferred tools are enabled: the mode pin,
   // not search activation, owns it.
-  assert.deepEqual(fixture.active(), ["read", "search_tools", GIT_READ_TOOL_NAME]);
+  assert.deepEqual(fixture.active(), ["read", "tool_search", GIT_READ_TOOL_NAME]);
 
   // Never disclosed as a deferred discovery target in either surface.
   assert.doesNotMatch(manager.startupGuidance() ?? "", /GitRead/);
@@ -1049,7 +1049,7 @@ test("GitRead is absent from the active set, inventory, and search outside plan/
 
   assert.deepEqual(
     fixture.active(),
-    ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "search_tools"],
+    ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "tool_search"],
   );
   assert.doesNotMatch(manager.startupGuidance() ?? "", /GitRead/);
   assert.doesNotMatch(searchDescription(fixture), /GitRead/);
@@ -1104,7 +1104,7 @@ test("GitRead follows the operating mode with deferred tools off (#73)", async (
   assert.deepEqual(
     fixture.active(),
     ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "SubtasksAdd",
-      "SubtasksInspect", "WebSearch", "search_tools"],
+      "SubtasksInspect", "WebSearch", "tool_search"],
   );
 
   mode = "plan-research";
@@ -1113,7 +1113,7 @@ test("GitRead follows the operating mode with deferred tools off (#73)", async (
   // GitRead back in.
   assert.deepEqual(
     fixture.active(),
-    ["read", "SubtasksInspect", "WebSearch", GIT_READ_TOOL_NAME, "search_tools"],
+    ["read", "SubtasksInspect", "WebSearch", GIT_READ_TOOL_NAME, "tool_search"],
   );
 });
 
@@ -1131,7 +1131,7 @@ test("a durable research catalog keeps GitRead active from the first request und
   assert.equal(manager.register(), true);
   assert.equal(manager.sessionStart({}, catalog), true);
 
-  assert.deepEqual(fixture.active(), ["read", GIT_READ_TOOL_NAME, "search_tools"]);
+  assert.deepEqual(fixture.active(), ["read", GIT_READ_TOOL_NAME, "tool_search"]);
   // The deferred discovery set is the allowed ceiling minus the baseline;
   // GitRead is never listed as a discovery target.
   const guidance = manager.startupGuidance() ?? "";
@@ -1161,7 +1161,7 @@ test("an execute-kind durable catalog removes a registered GitRead from the work
 
   assert.deepEqual(
     fixture.active(),
-    ["read", "bash", "edit", "write", "ApplyPatch", "search_tools"],
+    ["read", "bash", "edit", "write", "ApplyPatch", "tool_search"],
     "stripped at session_start despite registration",
   );
   assert.doesNotMatch(manager.startupGuidance() ?? "", /GitRead/);
@@ -1339,7 +1339,7 @@ test("full-off worker retains pending native MCP slots but not ordinary startup 
   assert.ok(fixture.active().includes("read"));
   assert.ok(fixture.active().includes("write"));
   assert.ok(fixture.active().includes(CODEMODE_TOOL_NAME), "ordinary authorized model-only controls retain full-OFF activation");
-  assert.ok(fixture.active().includes("search_tools"), "the mandatory loader remains active");
+  assert.ok(fixture.active().includes("tool_search"), "the mandatory loader remains active");
   for (const name of nativeSlots) {
     assert.ok(manager.authorizedToolNames()?.includes(name), `${name} remains inside the frozen catalog`);
     assert.equal(fixture.active().includes(name), false, `${name} is not synthesized from initial membership`);
@@ -1363,18 +1363,17 @@ test("full-off worker retains pending native MCP slots but not ordinary startup 
     assert.equal(manager.toolCallAllowed(name, true), true, `${name} is callable through its native exposure`);
   }
   const nativeSearch = await fixture.search()("restored-native-slots", { query: `${pendingMcp} ${hiddenMcp}` });
-  assert.deepEqual((nativeSearch.details as { nativeAvailable: string[] }).nativeAvailable, [hiddenMcp, pendingMcp]);
-  assert.deepEqual((nativeSearch.details as { activated: string[] }).activated, []);
+  assert.deepEqual((nativeSearch.details as { activated: string[] }).activated, [hiddenMcp, pendingMcp]);
+  assert.ok(fixture.active().includes(pendingMcp), "the loader declares the restored deferred-exposure slot");
+  assert.ok(fixture.active().includes(hiddenMcp), "the loader declares the restored codemode-exposure slot");
+  manager.reapply();
+  assert.ok(fixture.active().includes(pendingMcp), "the loader activation survives reapply inside the frozen ceiling");
+  assert.equal(manager.toolCallAllowed(pendingMcp), true);
 
   for (const name of [missingResources, hiddenResourceTemplates, missingResourceRead]) {
     assert.ok(fixture.active().includes(name), `${name} becomes normally available inside the full OFF catalog`);
     assert.equal(manager.toolCallAllowed(name), true);
   }
-
-  fixture.pi.setActiveTools([...fixture.active(), pendingMcp]);
-  manager.reapply();
-  assert.ok(fixture.active().includes(pendingMcp), "a genuine Pi selection becomes directly usable within the frozen ceiling");
-  assert.equal(manager.toolCallAllowed(pendingMcp), true);
 
   const missingOrdinaryFixture = hostFixture({ omit: ["WebSearch"] });
   const missingOrdinaryManager = new DeferredToolManager(missingOrdinaryFixture.pi);
@@ -1394,7 +1393,7 @@ test("full-off worker retains pending native MCP slots but not ordinary startup 
   }, true), false, "the native slot exception does not weaken ordinary hidden-tool validation");
 });
 
-test("search explains native codemode/deferred exposure without activating them (#224)", async () => {
+test("search activates authorized native codemode/deferred exposures directly (#279)", async () => {
   const fixture = hostFixture();
   fixture.registerInactive(tool("mcp__docs__search", "Search remote docs entries.", { exposure: "codemode" }));
   fixture.registerInactive(tool("DeferredRunner", "Run a deferred deferred-capable operation.", { exposure: "deferred" }));
@@ -1411,44 +1410,44 @@ test("search explains native codemode/deferred exposure without activating them 
   assert.ok(guidanceListsName(manager, "DeferredRunner"));
 
   const native = await fixture.search()("native", { query: "mcp__docs__search DeferredRunner" });
-  const details = native.details as { matched: string[]; activated: string[]; alreadyActive: string[]; nativeAvailable: string[]; outcome: string };
+  const details = native.details as { matched: string[]; activated: string[]; alreadyActive: string[]; outcome: string };
   assert.equal(native.isError, false);
   assert.deepEqual(details.matched, ["DeferredRunner", "mcp__docs__search"]);
-  assert.deepEqual(details.activated, []);
+  assert.deepEqual(details.activated, ["DeferredRunner", "mcp__docs__search"]);
   assert.deepEqual(details.alreadyActive, []);
-  assert.deepEqual(details.nativeAvailable, ["DeferredRunner", "mcp__docs__search"]);
-  assert.equal(details.outcome, "native-available");
+  assert.equal(details.outcome, "activated");
   const text = String((native.content as Array<{ text: string }>)[0]?.text);
-  assert.doesNotMatch(text, /Activated:/, "native exposure is never activated by the loader");
-  assert.match(text, /callable from codemode scripts while it is inactive/);
-  assert.match(text, /native tool_search can find, load, and declare it/);
-  assert.equal(fixture.active().includes("mcp__docs__search"), false, "no direct declaration promotion");
+  assert.match(text, /Activated:/, "authorized native exposures are activated by the loader");
+  assert.match(text, /tool_search did not perform the operation/);
+  assert.ok(fixture.active().includes("mcp__docs__search"), "the codemode-exposure tool is declared for the next call");
+  assert.ok(fixture.active().includes("DeferredRunner"));
 
-  // Native availability is callable nested while inactive, never direct.
-  assert.equal(manager.toolCallAllowed("mcp__docs__search"), false);
-  assert.ok(manager.toolCallAllowed("mcp__docs__search", true), "codemode exposure stays script-callable while inactive");
-  assert.equal(manager.toolCallAllowed("DeferredRunner"), false);
+  // Script callability while inactive was already available; after activation
+  // the tools are directly callable as well.
+  assert.equal(manager.toolCallAllowed("mcp__docs__search"), true);
+  assert.ok(manager.toolCallAllowed("mcp__docs__search", true));
+  assert.equal(manager.toolCallAllowed("DeferredRunner"), true);
   assert.ok(manager.toolCallAllowed("DeferredRunner", true));
 
-  // Mixed query: the direct match activates, the native match is explained.
+  // Mixed query: the direct match activates, the previously activated native
+  // match is reported as already active.
   const mixed = await fixture.search()("mixed", { query: "WebSearch mcp__docs__search" });
-  const mixedDetails = mixed.details as { activated: string[]; nativeAvailable: string[] };
+  const mixedDetails = mixed.details as { activated: string[]; alreadyActive: string[] };
   assert.deepEqual(mixedDetails.activated, ["WebSearch"]);
-  assert.deepEqual(mixedDetails.nativeAvailable, ["mcp__docs__search"]);
+  assert.deepEqual(mixedDetails.alreadyActive, ["mcp__docs__search"]);
   assert.equal(fixture.active().includes("WebSearch"), true);
-  assert.equal(fixture.active().includes("mcp__docs__search"), false);
+  assert.equal(fixture.active().includes("mcp__docs__search"), true);
 
-  // The renderer keeps the native outcome truthful in both arms.
+  // The renderer keeps the activated outcome truthful in both arms.
   const card = fixture.definitions.find((definition) => definition.name === DEFERRED_TOOL_SEARCH_NAME)!;
   const renderCard = (expanded: boolean) => renderSearchCards(card!, native, expanded);
-  assert.equal(renderCard(false), 'search_tools \u00b7 "mcp__docs__search DeferredRunner" \u00b7 native available DeferredRunner, mcp__docs__search');
+  assert.equal(renderCard(false), 'tool_search \u00b7 "mcp__docs__search DeferredRunner" \u00b7 activated DeferredRunner, mcp__docs__search');
   const expanded = renderCard(true);
-  assert.ok(expanded.includes("Native availability (not activated by this search):"));
-  assert.ok(expanded.includes("Native exposure left as registered"));
+  assert.ok(expanded.includes("Newly activated:"));
   assert.ok(expanded.includes("No discovered tool operation was executed by this search."));
 });
 
-test("deferred-off does not promote native exposures into the full direct declaration (#224)", async () => {
+test("deferred-off keeps native exposures undeclared by default but search activates them (#279)", async () => {
   const fixture = hostFixture();
   fixture.registerInactive(tool("mcp__docs__search", "Search remote docs entries.", { exposure: "codemode" }));
   fixture.registerInactive(tool("DeferredRunner", "Run a native deferred operation.", { exposure: "deferred" }));
@@ -1456,8 +1455,8 @@ test("deferred-off does not promote native exposures into the full direct declar
   manager.register();
   manager.sessionStart(fixture.sessionIdentity, undefined, false, false);
   assert.ok(fixture.active().includes("WebSearch"), "ordinary permitted tools remain fully active");
-  assert.equal(fixture.active().includes("mcp__docs__search"), false);
-  assert.equal(fixture.active().includes("DeferredRunner"), false);
+  assert.equal(fixture.active().includes("mcp__docs__search"), false, "native codemode exposure stays script-only by default");
+  assert.equal(fixture.active().includes("DeferredRunner"), false, "native deferred exposure stays script-only by default");
   assert.ok(manager.toolCallAllowed("mcp__docs__search", true));
   assert.ok(manager.toolCallAllowed("DeferredRunner", true));
 
@@ -1467,18 +1466,17 @@ test("deferred-off does not promote native exposures into the full direct declar
   const details = result.details as {
     activated: string[];
     alreadyActive: string[];
-    nativeAvailable: string[];
   };
-  assert.deepEqual(details.activated, []);
+  assert.deepEqual(details.activated, ["DeferredRunner", "mcp__docs__search"]);
   assert.deepEqual(details.alreadyActive, []);
-  assert.deepEqual(details.nativeAvailable, ["DeferredRunner", "mcp__docs__search"]);
-  assert.match(String((result.content as Array<{ text: string }>)[0]?.text), /No direct declaration changed/);
+  assert.ok(fixture.active().includes("mcp__docs__search"), "the loader declares the codemode-exposure tool");
+  assert.ok(fixture.active().includes("DeferredRunner"));
   manager.reapply();
-  assert.equal(fixture.active().includes("mcp__docs__search"), false, "reapply does not turn native reachability into a declaration");
-  assert.equal(fixture.active().includes("DeferredRunner"), false);
+  assert.ok(fixture.active().includes("mcp__docs__search"), "the loader activation persists across reapply");
+  assert.ok(fixture.active().includes("DeferredRunner"));
 });
 
-test("native tool_search declarations survive manager reapply only inside live authority (#224)", () => {
+test("external declarations of native exposures are stripped; loader activations survive reapply (#279)", async () => {
   const fixture = hostFixture();
   fixture.registerInactive(tool("mcp__docs__search", "Search remote docs entries.", { exposure: "codemode" }));
   const manager = new DeferredToolManager(fixture.pi);
@@ -1486,22 +1484,86 @@ test("native tool_search declarations survive manager reapply only inside live a
   manager.sessionStart(fixture.sessionIdentity);
   assert.equal(fixture.active().includes("mcp__docs__search"), false);
 
-  // Model Pi's native tool_search declaring this already-authorized native
-  // exposure. The manager must preserve that selection without adopting other
-  // unmanaged tools or treating the native tool as a search_tools activation.
+  // A non-loader activation of a native-callable exposure is not adopted:
+  // the loader is the sole declaration path for these tools, and the next
+  // managed write strips it. Script callability is unaffected.
   fixture.pi.setActiveTools([...fixture.active(), "mcp__docs__search"]);
-  assert.ok(manager.toolCallAllowed("mcp__docs__search"));
+  assert.ok(manager.toolCallAllowed("mcp__docs__search", true));
   manager.reapply();
-  assert.ok(fixture.active().includes("mcp__docs__search"));
+  assert.equal(fixture.active().includes("mcp__docs__search"), false, "the managed write strips the external declaration");
+  assert.ok(manager.toolCallAllowed("mcp__docs__search", true), "script callability is preserved");
+
+  // A loader activation of the same tool survives reapply while authorized.
+  const loaded = await fixture.search()("activate-via-loader", { query: "mcp__docs__search" });
+  assert.deepEqual((loaded.details as { activated: string[] }).activated, ["mcp__docs__search"]);
+  manager.reapply();
+  assert.ok(fixture.active().includes("mcp__docs__search"), "the loader activation persists inside live authority");
   assert.ok(manager.toolCallAllowed("mcp__docs__search"));
 
   fixture.removeFromRegistry("mcp__docs__search");
   manager.reapply();
-  assert.equal(fixture.active().includes("mcp__docs__search"), false, "withdrawal removes the native declaration");
+  assert.equal(fixture.active().includes("mcp__docs__search"), false, "withdrawal removes the loader declaration");
   assert.equal(manager.toolCallAllowed("mcp__docs__search"), false);
 });
 
-test("native declarations respect worker startup subsets and deferred resets (#224)", () => {
+test("direct-to-native exposure change is not re-declared without a search (#279)", async () => {
+  const fixture = hostFixture();
+  const name = "mcp__docs__search";
+  // Pi activates direct-exposure tools on registration, so the launch-active
+  // capture authorizes them; deferred-off then declares them in its full base.
+  fixture.pi.registerTool(tool(name, "Search remote docs entries.", { exposure: "direct" }));
+  const manager = new DeferredToolManager(fixture.pi);
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity, undefined, false, false);
+  assert.ok(fixture.active().includes(name), "deferred-off declares the direct-exposure tool automatically");
+
+  // A supported live exposure change re-registers the tool with a
+  // native-callable exposure; Pi's own declaration policy no longer covers it.
+  // The next managed write must not restore the removed declaration.
+  fixture.pi.registerTool(tool(name, "Search remote docs entries.", { exposure: "codemode" }));
+  manager.setDeferredEnabled(false);
+  assert.equal(fixture.active().includes(name), false,
+    "the auto-declaration is not restored once the exposure becomes native-callable");
+  assert.ok(manager.toolCallAllowed(name, true), "native script callability is unaffected by the strip");
+
+  // Only an explicit tool_search activation re-declares it, and that
+  // selection then survives subsequent managed writes.
+  const loaded = await fixture.search()("redeclare-after-exposure-change", { query: name });
+  assert.deepEqual((loaded.details as { activated: string[] }).activated, [name]);
+  manager.setDeferredEnabled(false);
+  assert.ok(fixture.active().includes(name), "the loader selection survives subsequent managed writes");
+});
+
+test("ordinary search activations reset on deferred toggles while native selections persist (#279)", async () => {
+  const fixture = hostFixture();
+  const name = "mcp__docs__search";
+  fixture.registerInactive(tool(name, "Search remote docs entries.", { exposure: "codemode" }));
+  const manager = new DeferredToolManager(fixture.pi);
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity);
+
+  await fixture.search()("load-ordinary", { query: "WebSearch" });
+  assert.ok(fixture.active().includes("WebSearch"));
+  await fixture.search()("load-native", { query: name });
+  assert.ok(fixture.active().includes(name));
+
+  // OFF: the full authorized base rejoins; both stay declared.
+  assert.equal(manager.setDeferredEnabled(false), true);
+  assert.ok(fixture.active().includes("WebSearch"), "deferred-off rejoins the ordinary tool through its base");
+  assert.ok(fixture.active().includes(name), "the native loader selection survives OFF");
+
+  // ON: the conservative baseline returns; the ordinary activation is demoted
+  // back to discovery while the explicit native selection persists.
+  assert.equal(manager.setDeferredEnabled(true), true);
+  assert.equal(fixture.active().includes("WebSearch"), false, "switching on restores the conservative subset");
+  assert.ok(fixture.active().includes(name), "the native loader selection survives ON");
+
+  // The demoted ordinary tool is re-discoverable and re-activatable.
+  const reloaded = await fixture.search()("reload-ordinary", { query: "WebSearch" });
+  assert.deepEqual((reloaded.details as { activated: string[] }).activated, ["WebSearch"]);
+});
+
+test("loader activations respect worker startup subsets and survive deferred resets (#279)", async () => {
   for (const exposure of ["codemode", "deferred"]) {
     const fixture = hostFixture();
     const name = "mcp__docs__search";
@@ -1512,19 +1574,21 @@ test("native declarations respect worker startup subsets and deferred resets (#2
       allowedToolCatalog: ["read", name],
       initialActiveTools: ["read"],
     }, true), true);
-    assert.deepEqual(fixture.active(), ["read", "search_tools"]);
+    assert.deepEqual(fixture.active(), ["read", "tool_search"]);
     assert.equal(manager.toolCallAllowed(name), false);
     assert.equal(manager.toolCallAllowed(name, true), true);
 
-    fixture.pi.setActiveTools([...fixture.active(), name]);
+    const loaded = await fixture.search()("load-worker-native", { query: name });
+    assert.deepEqual((loaded.details as { activated: string[] }).activated, [name]);
+    assert.ok(fixture.active().includes(name), "the loader declares the authorized native exposure");
     manager.reapply();
-    assert.equal(manager.toolCallAllowed(name), true);
+    assert.ok(fixture.active().includes(name), "the activation survives reapply");
 
     assert.equal(manager.setDeferredEnabled(false), true);
-    assert.ok(fixture.active().includes(name), "Pi's existing native declaration survives deferred-off");
+    assert.ok(fixture.active().includes(name), "the loader declaration survives deferred-off");
     assert.equal(manager.setDeferredEnabled(true), true);
-    assert.deepEqual(fixture.active(), ["read", "search_tools", name], "the native declaration survives a deferred-mode transition");
-    assert.equal(manager.toolCallAllowed(name), true, "Pi's declared native tool remains directly available");
+    assert.deepEqual(fixture.active(), ["read", "tool_search", name], "the loader declaration survives a deferred-mode transition");
+    assert.equal(manager.toolCallAllowed(name), true, "the declared native tool remains directly available");
     assert.equal(manager.toolCallAllowed(name, true), true);
   }
 });
@@ -1552,11 +1616,6 @@ test("deferred-off keeps native callees undeclared across toggles and late regis
   assert.ok(manager.toolCallAllowed(nativeDeferred, true));
   assert.equal(manager.toolCallAllowed(hidden, true), false);
 
-  const nativeSearch = await fixture.search()("search-native-off", { query: nativeCode });
-  assert.deepEqual((nativeSearch.details as { matched: string[]; nativeAvailable: string[] }).matched, [nativeCode]);
-  assert.deepEqual((nativeSearch.details as { nativeAvailable: string[] }).nativeAvailable, [nativeCode]);
-  assert.equal(fixture.active().includes(nativeCode), false, "search_tools discovery does not declare a native callee");
-
   fixture.registerInactive(tool("mcp__late__search", "A late native search tool.", { exposure: "deferred" }));
   manager.reapply();
   manager.reapply();
@@ -1577,12 +1636,21 @@ test("deferred-off keeps native callees undeclared across toggles and late regis
   const codeLoad = await fixture.search()("load-root-codemode", { query: CODEMODE_TOOL_NAME });
   assert.deepEqual((codeLoad.details as { activated: string[] }).activated, [CODEMODE_TOOL_NAME]);
   assert.ok(fixture.active().includes(CODEMODE_TOOL_NAME));
+
+  // In deferred-on mode the loader also activates authorized native callees.
+  const nativeLoad = await fixture.search()("load-native-on", { query: nativeCode });
+  assert.deepEqual((nativeLoad.details as { activated: string[] }).activated, [nativeCode]);
+  assert.ok(fixture.active().includes(nativeCode), "the loader declares the codemode-exposure callee");
+  manager.reapply();
+  assert.ok(fixture.active().includes(nativeCode), "the activation survives reapply in deferred-on mode");
+
   assert.equal(manager.setDeferredEnabled(false), true);
   assert.ok(fixture.active().includes(CODEMODE_TOOL_NAME), "deferred-off restores ordinary model-only codemode");
-  for (const name of [nativeCode, nativeDeferred, "mcp__late__search"]) assert.equal(fixture.active().includes(name), false);
+  assert.ok(fixture.active().includes(nativeCode), "the loader activation survives the deferred-off transition");
+  for (const name of [nativeDeferred, "mcp__late__search"]) assert.equal(fixture.active().includes(name), false);
 });
 
-test("native Pi declarations survive managed writes and reload only within a frozen worker ceiling (#224)", () => {
+test("loader activations survive managed writes and reload only within a frozen worker ceiling (#279)", async () => {
   const fixture = hostFixture();
   const allowedNative = "mcp__docs__search";
   const outsideNative = "mcp__private__search";
@@ -1597,33 +1665,42 @@ test("native Pi declarations survive managed writes and reload only within a fro
   };
   assert.equal(manager.sessionStart(fixture.sessionIdentity, catalog, true, false), true,
     "native deferred callees may remain undeclared inside the immutable ceiling");
-  assert.deepEqual(fixture.active(), ["read", "search_tools"]);
+  assert.deepEqual(fixture.active(), ["read", "tool_search"]);
   assert.equal(manager.toolCallAllowed(allowedNative), false);
   assert.ok(manager.toolCallAllowed(allowedNative, true));
   assert.equal(manager.toolCallAllowed(outsideNative, true), false);
 
-  // Simulate a native tool_search declaration. The manager must carry it
-  // across reapplication and extension reload, but never adopt the out-of-
-  // ceiling native name.
-  fixture.pi.setActiveTools([...fixture.active(), allowedNative, outsideNative]);
-  manager.reapply();
+  // The loader declares the in-ceiling native callee; an out-of-ceiling name
+  // is never matched or declared.
+  const loaded = await fixture.search()("load-in-ceiling", { query: allowedNative });
+  assert.deepEqual((loaded.details as { activated: string[] }).activated, [allowedNative]);
   assert.ok(fixture.active().includes(allowedNative));
+  const outside = await fixture.search()("load-outside", { query: outsideNative });
+  assert.deepEqual((outside.details as { matched: string[] }).matched, [], "the frozen ceiling withholds the out-of-ceiling name from discovery");
   assert.equal(fixture.active().includes(outsideNative), false);
+
+  manager.reapply();
+  assert.ok(fixture.active().includes(allowedNative), "the loader activation survives reapplication");
 
   const reloaded = new DeferredToolManager(fixture.pi);
   reloaded.register();
   assert.equal(reloaded.sessionStart(fixture.sessionIdentity, catalog, true, false), true);
-  assert.ok(fixture.active().includes(allowedNative), "the selected native declaration survives same-session reload");
   assert.equal(fixture.active().includes(outsideNative), false, "the native CLI/worker ceiling remains authoritative");
   assert.deepEqual(reloaded.authorizedToolNames(), ["read", allowedNative]);
 
-  fixture.pi.setActiveTools(fixture.active().filter((name) => name !== allowedNative));
+  // A full extension reload re-establishes the base set: the in-ceiling
+  // callee is authorized again but requires a fresh loader activation.
+  assert.equal(fixture.active().includes(allowedNative), false, "reload does not resurrect a prior incarnation's selection");
+  const reloadedSearch = await fixture.search()("load-after-reload", { query: allowedNative });
+  assert.deepEqual((reloadedSearch.details as { activated: string[] }).activated, [allowedNative]);
+
+  fixture.removeFromRegistry(allowedNative);
   reloaded.reapply();
-  assert.equal(fixture.active().includes(allowedNative), false, "a native deselection is not resurrected by reapply");
+  assert.equal(fixture.active().includes(allowedNative), false, "withdrawal removes the loader declaration");
   assert.equal(reloaded.toolCallAllowed(allowedNative), false);
 });
 
-test("late native selections and restored pending declarations are observed outside managed loadouts (#224)", () => {
+test("late registrations join discovery and activate through the loader (#279)", async () => {
   const lateFixture = hostFixture();
   const lateNative = "mcp__late__deferred";
   const lateManager = new DeferredToolManager(lateFixture.pi);
@@ -1633,14 +1710,18 @@ test("late native selections and restored pending declarations are observed outs
   lateFixture.registerInactive(tool(lateNative, "A newly registered native MCP tool.", { exposure: "deferred" }));
   lateManager.reapply();
   assert.equal(lateFixture.active().includes(lateNative), false, "late inactive registration is not auto-promoted");
-  lateFixture.pi.setActiveTools([...lateFixture.active(), lateNative]);
+  assert.ok(lateManager.authorizedToolNames()?.includes(lateNative), "the late registration joins dynamic authority");
+
+  const loaded = await lateFixture.search()("load-late", { query: lateNative });
+  assert.deepEqual((loaded.details as { activated: string[] }).activated, [lateNative]);
   lateManager.reapply();
-  assert.equal(lateFixture.active().includes(lateNative), true, "an explicit native selection after registration survives reapply");
+  assert.equal(lateFixture.active().includes(lateNative), true, "the loader activation after registration survives reapply");
   assert.equal(lateManager.toolCallAllowed(lateNative), true);
 
   const restoredFixture = hostFixture();
   const pendingNative = "mcp__restored__pending";
-  // Pi can retain this declaration as pending while the MCP server is absent.
+  // The name is absent while the MCP server is down; an external pending
+  // entry for it must not become a managed declaration.
   restoredFixture.pi.setActiveTools([...restoredFixture.active(), pendingNative]);
   const restoredManager = new DeferredToolManager(restoredFixture.pi);
   restoredManager.register();
@@ -1648,69 +1729,51 @@ test("late native selections and restored pending declarations are observed outs
   assert.equal(restoredFixture.active().includes(pendingNative), false, "unavailable pending names stay out of managed live tools");
 
   restoredFixture.registerInactive(tool(pendingNative, "A restored native MCP tool.", { exposure: "codemode" }));
-  // The native host resolves its saved pending declaration when MCP registers.
-  restoredFixture.pi.setActiveTools([...restoredFixture.active(), pendingNative]);
   restoredManager.reapply();
-  assert.equal(restoredFixture.active().includes(pendingNative), true, "a restored pending native declaration is not mistaken for registration noise");
+  assert.equal(restoredFixture.active().includes(pendingNative), false, "restoration alone does not declare the pending name");
+  const restoredSearch = await restoredFixture.search()("load-restored", { query: pendingNative });
+  assert.deepEqual((restoredSearch.details as { activated: string[] }).activated, [pendingNative]);
   assert.equal(restoredManager.toolCallAllowed(pendingNative), true);
 });
 
-test("native tool_search stays Pi-selected and gains only late dynamic or in-ceiling authority (#224)", async () => {
-  const nativeSearch = "tool_search";
+test("the managed loader is always gate-written; external writes cannot control it (#279)", () => {
   const fixture = hostFixture();
-  fixture.registerInactive(tool(nativeSearch, "Pi's native MCP tool loader.", { exposure: "model-only" }));
   const manager = new DeferredToolManager(fixture.pi);
   manager.register();
   assert.equal(manager.sessionStart(fixture.sessionIdentity, undefined, false, false), true, "top-level session captures successfully");
-  assert.equal(manager.authorizedToolNames()?.includes(nativeSearch), false, "inactive ordinary model-only names stay excluded at capture");
-  assert.equal(fixture.active().includes(nativeSearch), false, "deferred-off does not promote Pi's inactive native loader");
+  assert.ok(fixture.active().includes("tool_search"), "the loader is part of the managed set from startup");
+  assert.equal(manager.toolCallAllowed("tool_search"), true);
 
-  fixture.pi.setActiveTools([...fixture.active(), nativeSearch]);
+  // An external deselection cannot disable the loader: the next managed write
+  // reasserts it, and an external activation of other names is not adopted.
+  fixture.pi.setActiveTools(fixture.active().filter((name) => name !== "tool_search"));
   manager.reapply();
-  assert.equal(manager.authorizedToolNames()?.includes(nativeSearch), true, "a live native host selection grants only this selected builtin");
-  assert.equal(fixture.active().includes(nativeSearch), true, "managed reapply preserves Pi's late native selection");
-  assert.equal(manager.toolCallAllowed(nativeSearch), true, "the newly selected helper is callable within dynamic host authority");
-  const selectedSearch = await fixture.search()("find-native-helper", { query: nativeSearch });
-  assert.deepEqual((selectedSearch.details as { alreadyActive: string[] }).alreadyActive, [nativeSearch]);
+  assert.ok(fixture.active().includes("tool_search"), "the managed write restores the loader");
 
-  fixture.pi.setActiveTools(fixture.active().filter((name) => name !== nativeSearch));
-  manager.reapply();
-  assert.equal(fixture.active().includes(nativeSearch), false, "Pi's explicit native deselection is preserved");
-  assert.equal(manager.toolCallAllowed(nativeSearch), false, "Pi's native deselection makes the builtin non-callable");
-
+  // A durable worker catalog can never carry the loader: it is added outside
+  // the capability catalog by the wrapper, and a catalog naming it fails closed.
   const workerFixture = hostFixture();
-  workerFixture.registerInactive(tool(nativeSearch, "Pi's native MCP tool loader.", { exposure: "model-only" }));
   const workerManager = new DeferredToolManager(workerFixture.pi);
   workerManager.register();
-  const ceiling = { allowedToolCatalog: ["read", nativeSearch], initialActiveTools: ["read"] };
-  assert.equal(workerManager.sessionStart(workerFixture.sessionIdentity, ceiling, true, false), true, "worker startup accepts its fixed helper ceiling");
-  assert.equal(workerFixture.active().includes(nativeSearch), false, "deferred-off never widens a worker's initial subset automatically");
-  const workerSearch = await workerFixture.search()("load-native-helper", { query: nativeSearch });
-  assert.deepEqual((workerSearch.details as { activated: string[] }).activated, [nativeSearch]);
-  assert.equal(workerFixture.active().includes(nativeSearch), true);
-  workerFixture.pi.setActiveTools(workerFixture.active().filter((name) => name !== nativeSearch));
-  workerManager.reapply();
-  assert.equal(workerFixture.active().includes(nativeSearch), false, "native deselection survives gate loading");
-  assert.equal(workerManager.toolCallAllowed(nativeSearch), false);
-  workerFixture.pi.setActiveTools([...workerFixture.active(), nativeSearch]);
-  workerManager.reapply();
-  assert.equal(workerFixture.active().includes(nativeSearch), true, "a native selection inside the immutable worker ceiling is retained");
-  assert.equal(workerManager.toolCallAllowed(nativeSearch), true, "a selected helper is callable inside the frozen worker ceiling");
+  const ceiling = { allowedToolCatalog: ["read", "tool_search"], initialActiveTools: ["read"] };
+  assert.equal(workerManager.sessionStart(workerFixture.sessionIdentity, ceiling, true, false), false,
+    "a catalog naming the loader fails closed");
 
+  // And an external write cannot widen a frozen worker ceiling either.
   const restrictedFixture = hostFixture();
-  restrictedFixture.registerInactive(tool(nativeSearch, "Pi's native MCP tool loader.", { exposure: "model-only" }));
   const restrictedManager = new DeferredToolManager(restrictedFixture.pi);
   restrictedManager.register();
   const restrictedCeiling = { allowedToolCatalog: ["read"], initialActiveTools: ["read"] };
-  assert.equal(restrictedManager.sessionStart(restrictedFixture.sessionIdentity, restrictedCeiling, true, false), true, "restricted worker startup accepts its narrow ceiling");
-  restrictedFixture.pi.setActiveTools([...restrictedFixture.active(), nativeSearch]);
+  assert.equal(restrictedManager.sessionStart(restrictedFixture.sessionIdentity, restrictedCeiling, true, false), true,
+    "restricted worker startup accepts its narrow ceiling");
+  restrictedFixture.pi.setActiveTools([...restrictedFixture.active(), "WebSearch"]);
   restrictedManager.reapply();
-  assert.equal(restrictedFixture.active().includes(nativeSearch), false, "a native choice cannot widen a frozen worker ceiling");
-  assert.equal(restrictedManager.authorizedToolNames()?.includes(nativeSearch), false);
-  assert.equal(restrictedManager.toolCallAllowed(nativeSearch), false);
+  assert.equal(restrictedFixture.active().includes("WebSearch"), false, "an external choice cannot widen a frozen worker ceiling");
+  assert.equal(restrictedManager.authorizedToolNames()?.includes("WebSearch"), false);
+  assert.equal(restrictedManager.toolCallAllowed("WebSearch"), false);
 });
 
-test("native Pi reselection survives a deselection observed by toolCallAllowed (#224)", () => {
+test("loader activations are revoked by withdrawal and restored only by search (#279)", async () => {
   const fixture = hostFixture();
   const nativeCallee = "mcp__docs__reselect_after_query";
   fixture.registerInactive(tool(nativeCallee, "A Pi-native MCP callee.", { exposure: "deferred" }));
@@ -1718,21 +1781,25 @@ test("native Pi reselection survives a deselection observed by toolCallAllowed (
   manager.register();
   manager.sessionStart(fixture.sessionIdentity);
 
-  fixture.pi.setActiveTools([...fixture.active(), nativeCallee]);
-  manager.reapply();
-  assert.ok(fixture.active().includes(nativeCallee), "Pi's initial native selection is retained");
+  const loaded = await fixture.search()("load-callee", { query: nativeCallee });
+  assert.deepEqual((loaded.details as { activated: string[] }).activated, [nativeCallee]);
+  assert.ok(fixture.active().includes(nativeCallee), "the loader declares the authorized callee");
   assert.equal(manager.toolCallAllowed(nativeCallee), true);
 
-  fixture.pi.setActiveTools(fixture.active().filter((name) => name !== nativeCallee));
-  assert.equal(manager.toolCallAllowed(nativeCallee), false, "the call query observes and respects Pi's deselection");
-
-  fixture.pi.setActiveTools([...fixture.active(), nativeCallee]);
+  fixture.registerInactive(tool(nativeCallee, "Withdrawn callee.", { exposure: "hidden" }));
   manager.reapply();
-  assert.ok(fixture.active().includes(nativeCallee), "Pi's later selection is observed independently of the prior managed write");
-  assert.equal(manager.toolCallAllowed(nativeCallee), true, "the reselection remains directly callable");
+  assert.equal(fixture.active().includes(nativeCallee), false, "withdrawal removes the declaration");
+  assert.equal(manager.toolCallAllowed(nativeCallee), false);
+
+  fixture.registerInactive(tool(nativeCallee, "Restored callee.", { exposure: "deferred" }));
+  manager.reapply();
+  assert.equal(fixture.active().includes(nativeCallee), false, "restoration alone does not redeclare it");
+  const reloaded = await fixture.search()("reload-callee", { query: nativeCallee });
+  assert.deepEqual((reloaded.details as { activated: string[] }).activated, [nativeCallee]);
+  assert.equal(manager.toolCallAllowed(nativeCallee), true, "the re-activation remains directly callable");
 });
 
-test("native reselection survives registry-only withdrawal reconciliation (#224)", () => {
+test("loader retention is pruned by withdrawal and never resurrected without search (#279)", async () => {
   for (const frozen of [false, true]) {
     const fixture = hostFixture();
     const nativeCallee = "mcp__docs__restored_selection";
@@ -1744,22 +1811,22 @@ test("native reselection survives registry-only withdrawal reconciliation (#224)
       : undefined;
     assert.equal(manager.sessionStart(fixture.sessionIdentity, catalog, frozen, false), true);
 
-    fixture.pi.setActiveTools([...fixture.active(), nativeCallee]);
-    manager.reapply();
+    const loaded = await fixture.search()("load-selection", { query: nativeCallee });
+    assert.deepEqual((loaded.details as { activated: string[] }).activated, [nativeCallee]);
     assert.ok(fixture.active().includes(nativeCallee));
 
     fixture.registerInactive(tool(nativeCallee, "Withdrawn callee.", { exposure: "hidden" }));
-    fixture.pi.setActiveTools(fixture.active().filter((name) => name !== nativeCallee));
     const writes = fixture.setCalls.length;
     manager.authorizedToolNames();
     assert.equal(manager.toolCallAllowed(nativeCallee, true), false);
     assert.equal(fixture.setCalls.length, writes, "withdrawal was observed without a managed write");
 
     fixture.registerInactive(tool(nativeCallee, "Restored callee.", { exposure: "deferred" }));
-    assert.equal(fixture.active().includes(nativeCallee), false, "restoration alone does not declare it");
-    fixture.pi.setActiveTools([...fixture.active(), nativeCallee]);
     manager.reapply();
-    assert.ok(fixture.active().includes(nativeCallee), "Pi's new selection survives reconciliation");
+    assert.equal(fixture.active().includes(nativeCallee), false, "restoration alone does not declare it");
+    const reloaded = await fixture.search()("restore-selection", { query: nativeCallee });
+    assert.deepEqual((reloaded.details as { activated: string[] }).activated, [nativeCallee]);
+    assert.ok(fixture.active().includes(nativeCallee), "the loader re-activation survives reconciliation");
     assert.equal(manager.toolCallAllowed(nativeCallee), true);
   }
 });
@@ -1785,8 +1852,8 @@ test("dynamic host adopts a canonical native MCP name on hidden-to-visible expos
   assert.equal(manager.toolCallAllowed(hiddenNative), false);
   assert.equal(manager.toolCallAllowed(hiddenNative, true), true, "the restored native exposure is callable from the permitted nested channel");
   const afterExposure = await fixture.search()("visible-native", { query: hiddenNative });
-  assert.deepEqual((afterExposure.details as { nativeAvailable: string[] }).nativeAvailable, [hiddenNative]);
-  assert.deepEqual((afterExposure.details as { activated: string[] }).activated, []);
+  assert.deepEqual((afterExposure.details as { activated: string[] }).activated, [hiddenNative]);
+  assert.ok(fixture.active().includes(hiddenNative), "the loader declares the newly visible native exposure");
 });
 
 test("first recovered registry snapshot can establish a hidden native MCP transition marker (#224)", () => {
@@ -1818,7 +1885,7 @@ test("wrapper codemode default authorizes discoverable codemode without activati
   manager.sessionStart(fixture.sessionIdentity);
 
   // Discovery only: never in the conservative initial/base active set.
-  assert.equal(fixture.active().includes(CODEMODE_TOOL_NAME), false, "search_tools is required before use");
+  assert.equal(fixture.active().includes(CODEMODE_TOOL_NAME), false, "tool_search is required before use");
   assert.ok(fixture.active().includes("write"), "the conservative base is unchanged");
   assert.ok(manager.authorizedToolNames()?.includes(CODEMODE_TOOL_NAME), "the wrapper default authorizes registry-permitted codemode");
   assert.ok(guidanceListsName(manager, CODEMODE_TOOL_NAME));
@@ -1860,10 +1927,10 @@ test("an already-active codemode stays captured as usual regardless of the wrapp
   // Authoritative capture: a launch-active codemode is authorized like any
   // other launch-active tool, and the conservative base strips its declaration
   // exactly like every other non-baseline tool — deferred-on sessions load it
-  // through search_tools first, wrapper flag or not.
+  // through tool_search first, wrapper flag or not.
   assert.ok(manager.authorizedToolNames()?.includes(CODEMODE_TOOL_NAME), "launch-active codemode is captured as usual");
   assert.equal(fixture.active().includes(CODEMODE_TOOL_NAME), false, "the conservative base applies to codemode like every other tool");
-  assert.equal(manager.toolCallAllowed(CODEMODE_TOOL_NAME), false, "search_tools is required before use");
+  assert.equal(manager.toolCallAllowed(CODEMODE_TOOL_NAME), false, "tool_search is required before use");
 
   const loaded = await fixture.search()("load", { query: CODEMODE_TOOL_NAME });
   assert.deepEqual((loaded.details as { activated: string[] }).activated, [CODEMODE_TOOL_NAME]);
@@ -2011,7 +2078,7 @@ test("toolCallAllowed gates declared direct calls, nested native exposure, and u
   assert.ok(manager.toolCallAllowed(DEFERRED_TOOL_SEARCH_NAME, true), "the loader is script-callable after startup");
 });
 
-test("search_tools and tool calls fail closed before startup completes (#224)", async () => {
+test("tool_search and tool calls fail closed before startup completes (#224)", async () => {
   const fixture = hostFixture();
   const manager = new DeferredToolManager(fixture.pi);
   manager.register();
@@ -2093,7 +2160,7 @@ test("a successful empty registry read makes every tool unavailable live (#224/r
   // baseline resumes; the pruned activation still requires search loading.
   fixture.pi.getAllTools = healthyGetAllTools;
   manager.reapply();
-  assert.deepEqual(fixture.active(), ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "search_tools"], "the baseline resumes on re-enable");
+  assert.deepEqual(fixture.active(), ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "tool_search"], "the baseline resumes on re-enable");
   assert.equal(manager.toolCallAllowed("WebSearch"), false, "the pruned activation does not silently return");
   const recovered = await fixture.search()("recover", { query: "public web" });
   assert.deepEqual((recovered.details as { activated: string[] }).activated, ["WebSearch"]);
@@ -2124,7 +2191,7 @@ test("an unreadable registry denies live discovery and calls while retaining the
   assert.match(String((deniedSearch.content as Array<{ text: string }>)[0]?.text), /unavailable/);
   assert.deepEqual(
     fixture.active(),
-    ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "search_tools", "WebSearch"],
+    ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "tool_search", "WebSearch"],
     "the retained active set is neither widened nor thrashed while no write runs",
   );
 
@@ -2139,7 +2206,7 @@ test("an unreadable registry denies live discovery and calls while retaining the
   manager.reapply();
   assert.deepEqual(
     fixture.setCalls.at(-1),
-    ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "search_tools", "WebSearch"],
+    ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart", "tool_search", "WebSearch"],
     "the authoritative read restores the whole retained loadout",
   );
   assert.ok(manager.toolCallAllowed("WebSearch"), "recovery restores live permission");
@@ -2226,7 +2293,7 @@ test("an empty launch set legitimately captures an empty boundary (#224)", async
   assert.equal(failingManager.toolCallAllowed(DEFERRED_TOOL_SEARCH_NAME), false, "no capture, no loader permission");
   assert.equal(failingManager.sessionStart({}), true, "an empty launch set legitimately captures an empty boundary");
   assert.deepEqual(failingManager.authorizedToolNames(), []);
-  assert.equal(fixture.active().includes("search_tools"), true);
+  assert.equal(fixture.active().includes("tool_search"), true);
 });
 
 test("configured worker withdrawal prunes loaded selections and restoration requires loading (#224/review-0002)", async () => {
@@ -2247,7 +2314,7 @@ test("configured worker withdrawal prunes loaded selections and restoration requ
   fixture.removeFromRegistry("WebSearch");
   manager.reapply();
   assert.equal(fixture.active().includes("WebSearch"), false);
-  assert.deepEqual(fixture.setCalls.at(-1), ["read", "search_tools"], "the managed write intersects live availability");
+  assert.deepEqual(fixture.setCalls.at(-1), ["read", "tool_search"], "the managed write intersects live availability");
   assert.equal(manager.toolCallAllowed("WebSearch"), false, "a withdrawn selection cannot claim activation");
   const gone = await fixture.search()("gone", { query: "public web" });
   assert.match(JSON.stringify(gone), /No authorized tools matched/);
@@ -2256,7 +2323,7 @@ test("configured worker withdrawal prunes loaded selections and restoration requ
   fixture.pi.registerTool(tool("WebSearch", "Search the public web for current sources.", { exposure: "hidden" }));
   manager.reapply();
   assert.equal(fixture.active().includes("WebSearch"), false);
-  assert.deepEqual(fixture.setCalls.at(-1), ["read", "search_tools"]);
+  assert.deepEqual(fixture.setCalls.at(-1), ["read", "tool_search"]);
   assert.equal(manager.toolCallAllowed("WebSearch"), false);
 
   // Restoration inside the resumed immutable ceiling: the previously loaded
@@ -2280,7 +2347,7 @@ test("a withdrawn baseline tool resumes its normal baseline on permitted re-enab
   fixture.removeFromRegistry("bash");
   manager.reapply();
   assert.equal(fixture.active().includes("bash"), false, "withdrawal prunes the baseline activation too");
-  assert.deepEqual(fixture.setCalls.at(-1), ["read", "edit", "write", "ApplyPatch", "SubtasksStart", "search_tools"]);
+  assert.deepEqual(fixture.setCalls.at(-1), ["read", "edit", "write", "ApplyPatch", "SubtasksStart", "tool_search"]);
   assert.equal(manager.toolCallAllowed("bash"), false);
 
   fixture.pi.registerTool(tool("bash", "Execute a shell command."));
@@ -2290,7 +2357,7 @@ test("a withdrawn baseline tool resumes its normal baseline on permitted re-enab
   assert.ok(manager.toolCallAllowed("bash"));
 });
 
-test("search_tools is callable only while currently registered, selected, and exposure-legal (#224/review-0003)", async () => {
+test("tool_search is callable only while currently registered, selected, and exposure-legal (#224/review-0003)", async () => {
   const fixture = hostFixture();
   const manager = new DeferredToolManager(fixture.pi);
   manager.register();
@@ -2482,13 +2549,13 @@ test("plan-research has all MCP tools off by default, across exposures and late 
 });
 
 function searchDescription(fixture: ReturnType<typeof hostFixture>): string {
-  const registered = fixture.definitions.find((definition) => definition.name === "search_tools");
+  const registered = fixture.definitions.find((definition) => definition.name === "tool_search");
   assert.ok(registered);
   return registered.description ?? "";
 }
 
 function searchSnippet(fixture: ReturnType<typeof hostFixture>): string {
-  const registered = fixture.definitions.find((definition) => definition.name === "search_tools");
+  const registered = fixture.definitions.find((definition) => definition.name === "tool_search");
   assert.ok(registered);
   return registered.promptSnippet ?? "";
 }
@@ -2498,7 +2565,7 @@ function guidanceListsName(manager: DeferredToolManager, name: string): boolean 
   return (manager.startupGuidance() ?? "").includes(`"${name}" (`);
 }
 
-/** Render a search_tools card through the registered renderer with a fixed test theme. */
+/** Render a tool_search card through the registered renderer with a fixed test theme. */
 function renderSearchCards(
   card: RegisteredTool,
   value: unknown,

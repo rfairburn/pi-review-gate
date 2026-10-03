@@ -1001,7 +1001,7 @@ test("research groups inherit authorized native discovery as durable initial-act
 
   // The read-only research intersection keeps the authorized native discovery
   // tools, and the durable initial-active subset starts them active so Pi
-  // workers need no search_tools activation step before the first discovery
+  // workers need no tool_search activation step before the first discovery
   // call. Write-capable tools stay outside the research role.
   assert.deepEqual(started.details.tasks[0].definition.executorToolCatalog, {
     allowedToolCatalog: ["read", "grep", "find", "ls", "WebSearch", "WebFetch", "BrowserExtract"],
@@ -1028,7 +1028,7 @@ test("authorized codemode enters execute ceilings search-deferred and is always 
     // Execute kind, deferred tools ON (the default): the parent-authorized
     // pass-through keeps codemode in the durable allowed ceiling, while the
     // conservative initial order never makes it startup-visible — execute
-    // workers discover and activate it only through search_tools.
+    // workers discover and activate it only through tool_search.
     const execute = await start("codemode-execute", { tasks: [shared] }, undefined, undefined, {});
     assert.equal(execute.isError, false);
     const executeCatalog = execute.details.tasks[0].definition.executorToolCatalog;

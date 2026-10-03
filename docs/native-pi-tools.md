@@ -12,7 +12,7 @@ originate with [#224](https://github.com/rfairburn/pi-review-gate/issues/224).
 
 | Session | Deferred tools on (default) | Deferred tools off |
 | --- | --- | --- |
-| Top-level Prefer execution / Prefer orchestration; execute-kind Pi workers with codemode authorized | `codemode` is not initially active: discovered and loaded through review-gate's `search_tools`, then called on a later turn | ordinary permitted tools, including `codemode`, load without review-gate deferral; native MCP exposure still applies |
+| Top-level Prefer execution / Prefer orchestrate; execute-kind Pi workers with codemode authorized | `codemode` is not initially active: discovered and loaded through review-gate's `tool_search`, then called on a later turn | ordinary permitted tools, including `codemode`, load without review-gate deferral; native MCP exposure still applies |
 | Plan/research sessions; research Pi workers | `codemode` and all MCP tool access are off, regardless of the toggle (the read-only role boundary: no reduced-transport exception, no `readOnlyHint` opt-in, no researcher override) | same |
 
 - **Wrapper default is availability only, and the toggle never widens a role.** Wrapper
@@ -33,11 +33,10 @@ MCP server configuration (`pi mcp`, `/mcp`), project trust, OAuth credentials, a
 per-server/tool exposure (`direct`, `codemode`, `deferred`, `hidden`) are Pi's —
 review-gate neither reads nor writes them and registers no server of its own. While
 deferred tools are on, direct-exposed permitted tools are not automatically declared:
-like any other deferred authorized tool they surface through `search_tools` and
+like any other deferred authorized tool they surface through `tool_search` and
 activate on load, or sit active from start when the toggle is off — codemode- and
-deferred-exposed tools keep their native channels. Pi owns native `tool_search`
-selection: switching review-gate deferral off alone does not enable it, and legal
-native selections and deselections are preserved. Baseline tools remain baseline. MCP annotations (`readOnlyHint` and peers) are unverified server hints:
+deferred-exposed tools keep their native script channels. Baseline tools remain
+baseline. MCP annotations (`readOnlyHint` and peers) are unverified server hints:
 review-gate adds no annotation-based permission policy and never treats a hint as a
 safety signal, though the user's Pi permission handlers keep applying to MCP calls.
 Tool access off is availability-only: this page claims nothing about whether MCP
@@ -46,18 +45,21 @@ server processes start or connect — Pi's configuration and project trust decid
 Turning review-gate deferral off removes only review-gate's loading step. It does
 not force native codemode/deferred MCP tools into direct declarations. Pi's `/mcp`
 enablement and exposure still govern their availability; disabled, hidden, and
-withdrawn tools are absent from `search_tools`. Native loading choices, including
-`tool_search` declarations, remain respected within the role and captured ceiling.
+withdrawn tools are absent from `tool_search` discovery, and an explicit `tool_search`
+activation persists across reapplication within the role and captured ceiling until
+withdrawal or a hidden exposure prunes it.
 
-## The two tool searches stay distinct
+## One loader replaces Pi's builtin tool search
 
-- Review-gate's `search_tools` activates tools within the session's review-gate
-  authorization at live permissions — the reconciled authorized/exposed registry at
-  the top level, the captured catalog in a delegated Pi worker — and never promotes a
-  natively codemode- or deferred-exposed tool into a direct declaration.
-- Pi's native `tool_search` covers the undeclared side of Pi's own registry —
-  codemode- and deferred-exposed tools, including MCP. Review-gate neither replaces it
-  nor duplicates its results; native exposure stays native.
+Review-gate registers its discovery/activation loader under Pi's replaceable
+builtin name `tool_search`, so Pi does not load its own tool-search extension and
+there is exactly one model-facing discovery tool. The loader activates authorized
+matches — ordinary, codemode- and deferred-exposed (including MCP), and model-only
+tools alike — within the session's review-gate authorization at live permissions:
+the reconciled authorized/exposed registry at the top level, the captured catalog in
+a delegated Pi worker. Activation declares the matched schemas for the next model
+call; it never executes the matched operation, and codemode/deferred tools remain
+callable from scripts while inactive exactly as before.
 
 ## Reconciliation during a running session
 
@@ -109,7 +111,7 @@ review windows and bundles.
 ## Out of scope for review-gate
 
 No MCP server manager, `/mcp` replacement, exposure editor, or toolset UI; no
-researcher override, trust grant, credential storage, or proxying; no replacement of
-Pi's `tool_search`; no annotation-derived permission policy; and no claims about Pi
-session-durability or storage — review-gate's own durability story is
-[Recovery](recovery.md).
+researcher override, trust grant, credential storage, or proxying; no second
+discovery loader alongside the builtin `tool_search` replacement; no
+annotation-derived permission policy; and no claims about Pi session-durability or
+storage — review-gate's own durability story is [Recovery](recovery.md).

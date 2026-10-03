@@ -1,5 +1,5 @@
 /**
- * Native result rendering for `search_tools`.
+ * Native result rendering for `tool_search`.
  *
  * Discovery is a loader, not an executor.  The renderer therefore reports the
  * query and the authorization/activation outcome already returned by the
@@ -52,8 +52,6 @@ interface SearchOutcome {
   matched: string[];
   activated: string[];
   alreadyActive: string[];
-  /** Matches with registered native codemode/deferred callable exposure; never activated here. */
-  nativeAvailable: string[];
   /** Matches withheld upstream of this result; absent when not recorded. */
   omitted?: number;
   outcome?: string;
@@ -92,16 +90,11 @@ export const renderDeferredToolResult: DeferredToolResultRenderer = (value, opti
     lines.push({ text: collapsedHeader(outcome, `activated ${outcome.activated.join(", ")}`), color: "toolTitle", bold: true });
   } else if (outcome.alreadyActive.length > 0) {
     lines.push({ text: collapsedHeader(outcome, `already active ${outcome.alreadyActive.join(", ")}`), color: "toolTitle", bold: true });
-  } else if (outcome.nativeAvailable.length > 0) {
-    lines.push({ text: collapsedHeader(outcome, `native available ${outcome.nativeAvailable.join(", ")}`), color: "toolTitle", bold: true });
   } else {
     lines.push({ text: collapsedHeader(outcome, "no matches"), color: "toolTitle", bold: true });
   }
   if (outcome.activated.length > 0 && outcome.alreadyActive.length > 0) {
     lines.push({ text: `Already active (${outcome.alreadyActive.length}): ${outcome.alreadyActive.join(", ")}.`, color: "muted" });
-  }
-  if (outcome.nativeAvailable.length > 0 && !(outcome.activated.length === 0 && outcome.alreadyActive.length === 0)) {
-    lines.push({ text: `Native callability left unchanged (${outcome.nativeAvailable.length}): ${outcome.nativeAvailable.join(", ")}.`, color: "muted" });
   }
   return renderComponent(lines, theme, true);
 };
@@ -115,7 +108,7 @@ export const renderDeferredToolResult: DeferredToolResultRenderer = (value, opti
 export const renderExpandedDeferredToolResult: DeferredToolResultRenderer = (value, options, theme, context) => {
   const outcome = decodeOutcome(value, options, context);
   const lines: RenderLine[] = [
-    { text: "search_tools", color: "toolTitle", bold: true },
+    { text: "tool_search", color: "toolTitle", bold: true },
   ];
 
   if (outcome.query !== undefined) {
@@ -152,14 +145,6 @@ export const renderExpandedDeferredToolResult: DeferredToolResultRenderer = (val
     lines.push({ text: "Already active:", color: "accent", bold: true });
     appendNames(lines, outcome.alreadyActive);
   }
-  if (outcome.nativeAvailable.length > 0) {
-    lines.push({ text: "Native availability (not activated by this search):", color: "accent", bold: true });
-    appendNames(lines, outcome.nativeAvailable);
-    lines.push({
-      text: "Native exposure left as registered: codemode tools stay callable from codemode scripts while inactive, and deferred tools are loaded and declared by the native tool_search tool.",
-      color: "muted",
-    });
-  }
   if (outcome.omitted !== undefined) {
     lines.push({ text: `Omitted matches: ${outcome.omitted}`, color: "muted" });
   }
@@ -180,9 +165,7 @@ export const renderExpandedDeferredToolResult: DeferredToolResultRenderer = (val
     ? outcome.activated[0]!
     : outcome.activated.length === 0 && outcome.alreadyActive.length === 1
       ? outcome.alreadyActive[0]!
-      : outcome.activated.length === 0 && outcome.alreadyActive.length === 0 && outcome.nativeAvailable.length === 1
-        ? outcome.nativeAvailable[0]!
-        : undefined;
+      : undefined;
   lines.push({
     text: single !== undefined
       ? `No ${single} operation was executed by this search.`
@@ -200,7 +183,7 @@ export const deferredToolSearchRenderResult = expandableResult(
 ) as ToolResultRenderCallback;
 
 function collapsedHeader(outcome: SearchOutcome, suffix?: string): string {
-  const parts = ["search_tools"];
+  const parts = ["tool_search"];
   if (outcome.query !== undefined) parts.push(`"${compactWhitespace(outcome.query)}"`);
   if (suffix !== undefined && suffix.length > 0) parts.push(suffix);
   return parts.join(" · ");
@@ -213,10 +196,9 @@ function decodeOutcome(value: unknown, options: DeferredToolRenderOptions, conte
   const matched = stringArrayField(details, "matched");
   const activated = stringArrayField(details, "activated");
   const explicitAlreadyActive = stringArrayField(details, "alreadyActive");
-  const nativeAvailable = stringArrayField(details, "nativeAvailable");
   const alreadyActive = explicitAlreadyActive.length > 0
     ? explicitAlreadyActive
-    : matched.filter((name) => !activated.includes(name) && !nativeAvailable.includes(name));
+    : matched.filter((name) => !activated.includes(name));
   const omitted = integerField(details, "omitted");
   const summary = resultText(record);
   const error = record?.isError === true;
@@ -226,9 +208,8 @@ function decodeOutcome(value: unknown, options: DeferredToolRenderOptions, conte
     && (Array.isArray(details.matched)
       || Array.isArray(details.activated)
       || Array.isArray(details.alreadyActive)
-      || Array.isArray(details.nativeAvailable)
       || outcome !== undefined);
-  return { query, matched, activated, alreadyActive, nativeAvailable, omitted, outcome, error, partial, summary, known };
+  return { query, matched, activated, alreadyActive, omitted, outcome, error, partial, summary, known };
 }
 
 function queryFromContext(context: unknown): string | undefined {
@@ -252,12 +233,12 @@ function resultText(record: RecordValue | undefined): string {
     }
     if (typeof record.message === "string" && record.message.length > 0) return record.message;
   }
-  return "No search_tools result returned.";
+  return "No tool_search result returned.";
 }
 
 function outcomeLabel(outcome: SearchOutcome): string {
   if (outcome.outcome === "unavailable" || /unavailable until session startup/i.test(outcome.summary)) return "unavailable";
-  if (outcome.outcome === "invalid" || /^Invalid search_tools request:/i.test(outcome.summary)) return "invalid request";
+  if (outcome.outcome === "invalid" || /^Invalid tool_search request:/i.test(outcome.summary)) return "invalid request";
   return outcome.outcome ?? "failed";
 }
 
@@ -285,7 +266,7 @@ function appendNames(lines: RenderLine[], names: readonly string[]): void {
 }
 
 function appendCompactSummary(lines: RenderLine[], summary: string, color: string): void {
-  const text = summary.length > 0 ? summary : "No search_tools result returned.";
+  const text = summary.length > 0 ? summary : "No tool_search result returned.";
   for (const line of text.split("\n")) lines.push({ text: line, color, raw: true });
 }
 

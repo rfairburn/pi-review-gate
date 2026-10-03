@@ -218,17 +218,17 @@ function findSearchDetails(value: unknown): Record<string, unknown> | undefined 
 async function searchTools(fixture: NativeMcpFixture, query: string): Promise<Record<string, unknown>> {
   const firstEvent = fixture.sessionEvents.length;
   await fixture.setTurnScript([
-    { toolCalls: [{ toolName: "search_tools", arguments: { query } }] },
+    { toolCalls: [{ toolName: "tool_search", arguments: { query } }] },
     { text: "native candidate search completed" },
   ]);
-  await fixture.promptTurn(`Use search_tools to look for ${query}.`);
+  await fixture.promptTurn(`Use tool_search to look for ${query}.`);
   const turnRecords = collectTypedRecords(fixture.sessionEvents.slice(firstEvent));
   const completedSearch = turnRecords.find((event) =>
-    event.type === "tool_execution_end" && event.toolName === "search_tools",
+    event.type === "tool_execution_end" && event.toolName === "tool_search",
   );
-  assert.ok(completedSearch, `the actual candidate search_tools call should finish; observed ${JSON.stringify(turnRecords)}`);
+  assert.ok(completedSearch, `the actual candidate tool_search call should finish; observed ${JSON.stringify(turnRecords)}`);
   const details = findSearchDetails(completedSearch);
-  assert.ok(details, `the native search_tools result should expose structured discovery details: ${JSON.stringify(completedSearch)}`);
+  assert.ok(details, `the native tool_search result should expose structured discovery details: ${JSON.stringify(completedSearch)}`);
   return details;
 }
 
@@ -289,13 +289,12 @@ test("compiled candidate reconciles native MCP withdrawal, replacement, calls, a
   assert.ok(!initial.activeTools?.includes(oldEcho), "the registered native MCP callee starts inactive");
   const initialSearch = await searchTools(fixture, oldEcho);
   assert.deepEqual(initialSearch.matched, [oldEcho], "the candidate initially discovers the live old MCP name");
-  assert.deepEqual(initialSearch.nativeAvailable, [oldEcho], "search_tools reports native callability without activating it");
-  assert.deepEqual(initialSearch.activated, [], "search_tools does not directly promote native codemode/deferred tools");
-  assert.ok(!(await fixture.probeDump()).activeTools?.includes(oldEcho));
+  assert.deepEqual(initialSearch.activated, [oldEcho], "tool_search declares the authorized native exposure for the next call");
+  assert.ok((await fixture.probeDump()).activeTools?.includes(oldEcho), "Pi's live active set carries the loader declaration");
 
   const rootSearch = await searchTools(fixture, "codemode");
   assert.deepEqual(rootSearch.matched, ["codemode"], "the candidate loader discovers the registered script root");
-  assert.deepEqual(rootSearch.activated, ["codemode"], "search_tools loads the model-facing codemode root");
+  assert.deepEqual(rootSearch.activated, ["codemode"], "tool_search loads the model-facing codemode root");
   assert.ok((await fixture.probeDump()).activeTools?.includes("codemode"),
     "the candidate's loader leaves the root available for the subsequent turn");
 
@@ -327,13 +326,11 @@ test("compiled candidate reconciles native MCP withdrawal, replacement, calls, a
   assert.ok(!rotated.activeTools?.includes(newEcho), "the replacement remains native-only and inactive");
 
   const oldSearch = await searchTools(fixture, oldEcho);
-  assert.deepEqual(oldSearch.matched, [], "candidate search_tools drops the withdrawn/hidden old name");
-  assert.deepEqual(oldSearch.nativeAvailable, []);
+  assert.deepEqual(oldSearch.matched, [], "candidate tool_search drops the withdrawn/hidden old name");
   const replacementSearch = await searchTools(fixture, newEcho);
-  assert.deepEqual(replacementSearch.matched, [newEcho], "candidate search_tools adopts the newly listed native name");
-  assert.deepEqual(replacementSearch.nativeAvailable, [newEcho]);
-  assert.deepEqual(replacementSearch.activated, [], "adoption does not turn the deferred native tool into a direct declaration");
-  assert.ok(!(await fixture.probeDump()).activeTools?.includes(newEcho));
+  assert.deepEqual(replacementSearch.matched, [newEcho], "candidate tool_search adopts the newly listed native name");
+  assert.deepEqual(replacementSearch.activated, [newEcho], "the loader declares the adopted deferred native tool");
+  assert.ok((await fixture.probeDump()).activeTools?.includes(newEcho), "the replacement declaration is live in Pi's active set");
 
   // Register the synthetic tool after candidate capture through Pi's public
   // tool API. Pi itself reports its actual model-only registry exposure.
@@ -373,8 +370,8 @@ test("compiled candidate reconciles native MCP withdrawal, replacement, calls, a
   );
   assert.equal(nestedEnd(replacementCall, newEcho).isError, false,
     "a permitted deferred/native MCP tool remains callable nested after loading the script root");
-  assert.ok(!(await fixture.probeDump()).activeTools?.includes(newEcho),
-    "successful nested native reachability never promotes the MCP tool into the direct active set");
+  assert.ok((await fixture.probeDump()).activeTools?.includes(newEcho),
+    "the loader declaration persists across the nested call");
   const afterReplacementCall = await fixture.readServerEvents();
   assert.ok(afterReplacementCall.some((event) =>
     event.event === "tool_call" && event.tool === "echo_second" && event.generation === 2,
@@ -475,12 +472,12 @@ test("public native MCP registration is discovered dynamically while a worker ce
   assert.ok(!hostDump.activeTools?.includes(lateCounter));
   const hostEchoSearch = await searchTools(host, lateEcho);
   assert.deepEqual(hostEchoSearch.matched, [lateEcho], "dynamic top-level authority adopts a genuinely late MCP name");
-  assert.deepEqual(hostEchoSearch.nativeAvailable, [lateEcho]);
+  assert.deepEqual(hostEchoSearch.activated, [lateEcho], "the loader declares the adopted late registration");
   const hostCounterSearch = await searchTools(host, lateCounter);
   assert.deepEqual(hostCounterSearch.matched, [lateCounter]);
-  assert.deepEqual(hostCounterSearch.nativeAvailable, [lateCounter]);
-  assert.ok(!(await host.probeDump()).activeTools?.includes(lateEcho),
-    "dynamic host discovery leaves deferred native registrations inactive");
+  assert.deepEqual(hostCounterSearch.activated, [lateCounter]);
+  assert.ok((await host.probeDump()).activeTools?.includes(lateEcho),
+    "the late declarations are live in Pi's active set");
 
   const hostRootSearch = await searchTools(host, "codemode");
   assert.deepEqual(hostRootSearch.matched, ["codemode"]);
@@ -552,7 +549,7 @@ test("public native MCP registration is discovered dynamically while a worker ce
   );
   assert.equal(observedTool(workerDump, workerAllowedEcho).exposure, REGISTERED_EXPOSURE_FOR_CODENAME_SERVER);
   // The real MCP server advertises both names above, but Pi's worker `--tools`
-  // list is exactly the captured catalog plus search_tools. The outside name
+  // list is exactly the captured catalog plus tool_search. The outside name
   // is therefore withheld by Pi before it enters getAllTools; this test does
   // not misstate that host-side restriction as a candidate-only rejection.
   assert.equal(workerDump.allTools?.some((tool) => tool.name === lateCounter), false,
@@ -564,8 +561,8 @@ test("public native MCP registration is discovered dynamically while a worker ce
   const permittedLateSearch = await searchTools(worker, workerAllowedEcho);
   assert.deepEqual(permittedLateSearch.matched, [workerAllowedEcho],
     "a late name already in the captured worker ceiling becomes discoverable when registered");
-  assert.deepEqual(permittedLateSearch.nativeAvailable, [workerAllowedEcho]);
-  assert.deepEqual(permittedLateSearch.activated, []);
+  assert.deepEqual(permittedLateSearch.activated, [workerAllowedEcho],
+    "the loader declares the pre-authorized late ceiling name");
   const outsideCeilingSearch = await searchTools(worker, lateCounter);
   assert.deepEqual(outsideCeilingSearch.matched, [],
     "host registration does not append a name to the immutable worker authorization ceiling");
@@ -577,8 +574,8 @@ test("public native MCP registration is discovered dynamically while a worker ce
   );
   assert.equal(nestedEnd(permittedWorkerCall, workerAllowedEcho).isError, false,
     "the pre-authorized name is usable after the live native server appears");
-  assert.ok(!(await worker.probeDump()).activeTools?.includes(workerAllowedEcho),
-    "nested native access does not promote the worker MCP name into direct active tools");
+  assert.ok((await worker.probeDump()).activeTools?.includes(workerAllowedEcho),
+    "the loader declaration persists across the nested call inside the frozen ceiling");
 
   const beforeOutsideCall = await worker.readServerEvents();
   const outsideWorkerCall = await runCodemode(

@@ -127,11 +127,11 @@ test("worker browser approval is launch-scoped and never widens research authori
       for (const hook of hooks.get("before_agent_start") ?? []) await hook({ cwd: dir }, ctx);
       assert.equal(updates.length, updateCount, "already-running worker does not reload changed policy");
       for (const name of ["BrowserClick", "BrowserFill", "BrowserType", "BrowserSelect", "BrowserPress", "BrowserUpload", "BrowserDownloadSave", "BrowserClipboard"]) {
-        const result = await definitions.get("search_tools").execute("restricted", { query: name });
+        const result = await definitions.get("tool_search").execute("restricted", { query: name });
         assert.deepEqual(result.details.activated, []);
         assert.equal(active.includes(name), false, `${mode} cannot grant research ${name}`);
       }
-      const observation = await definitions.get("search_tools").execute("observe", { query: "BrowserHover" });
+      const observation = await definitions.get("tool_search").execute("observe", { query: "BrowserHover" });
       assert.deepEqual(observation.details.activated, ["BrowserHover"]);
     }
     assert.deepEqual(updates, ["ask", "automatically-accept", "automatically-deny"]);
@@ -269,7 +269,7 @@ test("executor role defers to the durable initial subset and activates authorize
     const ctx = { cwd: dir, ui: {}, sessionManager: {} };
     for (const hook of hooks.get("session_start") ?? []) await hook({ cwd: dir }, ctx);
     assert.equal(process.env[EXECUTOR_TOOL_CATALOG_ENV], undefined, "bootstrap catalog is removed before worker tools run");
-    assert.deepEqual(active, ["read", "edit", "search_tools"]);
+    assert.deepEqual(active, ["read", "edit", "tool_search"]);
 
     const before = await Promise.all((hooks.get("before_agent_start") ?? []).map((hook) =>
       hook({ cwd: dir, systemPrompt: "native Pi prompt" }, ctx)
@@ -281,7 +281,7 @@ test("executor role defers to the durable initial subset and activates authorize
     for (const name of [...webToolNames, "ShellList"]) {
       assert.match(guidance, new RegExp(`"${name}"`));
     }
-    for (const name of ["read", "edit", "search_tools"]) {
+    for (const name of ["read", "edit", "tool_search"]) {
       assert.doesNotMatch(guidance, new RegExp(`"${name}"`), "baseline-loaded tools must not be redundantly listed");
     }
     assert.doesNotMatch(guidance, /SubtasksStart|SubtasksInspect/);
@@ -290,13 +290,13 @@ test("executor role defers to the durable initial subset and activates authorize
     assert.match(guidance, /"WebSearch" \(Search the public web\)/);
     assert.doesNotMatch(guidance, /Read files|Edit files|parameters|properties/);
 
-    const search = definitions.get("search_tools");
+    const search = definitions.get("tool_search");
     assert.ok(search?.execute);
     const loaded = await search.execute("load-web", { query: "WebSearch" });
     assert.deepEqual((loaded.details as { activated: string[] }).activated, ["WebSearch"]);
-    assert.deepEqual(active, ["read", "edit", "search_tools", "WebSearch"]);
+    assert.deepEqual(active, ["read", "edit", "tool_search", "WebSearch"]);
 
-    for (const hook of hooks.get("tool_result") ?? []) await hook({ toolName: "search_tools" }, ctx);
+    for (const hook of hooks.get("tool_result") ?? []) await hook({ toolName: "tool_search" }, ctx);
     const after = await Promise.all((hooks.get("before_agent_start") ?? []).map((hook) =>
       hook({ cwd: dir, systemPrompt: "native Pi prompt" }, ctx)
     ));
@@ -304,7 +304,7 @@ test("executor role defers to the durable initial subset and activates authorize
       (value as { systemPrompt?: string } | undefined)?.systemPrompt ?? ""
     ).join("\n");
     assert.equal(guidanceAfterActivation, guidance, "activation must not churn the stable discovery summary");
-    assert.deepEqual(active, ["read", "edit", "search_tools", "WebSearch"], "activation remains additive on the next model turn");
+    assert.deepEqual(active, ["read", "edit", "tool_search", "WebSearch"], "activation remains additive on the next model turn");
 
     const unmatched = await search.execute("load-unmatched", { query: "nonexistent-capability-token" });
     assert.deepEqual((unmatched.details as { activated: string[] }).activated, []);
@@ -423,7 +423,7 @@ workerResources: {
       assert.equal(research.isError, false);
       const researchCatalog = (research.details as any).tasks[0].definition.executorToolCatalog as ExecutorToolCatalog;
       assert.ok(researchCatalog.allowedToolCatalog.includes(GIT_READ_TOOL_NAME), "research ceiling carries GitRead");
-      assert.ok(researchCatalog.initialActiveTools.includes(GIT_READ_TOOL_NAME), "research children start with it active, no search_tools step");
+      assert.ok(researchCatalog.initialActiveTools.includes(GIT_READ_TOOL_NAME), "research children start with it active, no tool_search step");
 
       const execute = await start.execute("execute-catalog", { kind: "execute", tasks: [task] }, undefined, undefined, {});
       assert.equal(execute.isError, false);

@@ -203,8 +203,8 @@ function blockResult(results: unknown[]): { block?: boolean; reason?: string } |
 }
 
 function searchTool(runtime: NativeToolRuntime): NonNullable<ToolDefinition["execute"]> {
-  const execute = runtime.definitions.get("search_tools")?.execute;
-  assert.ok(execute, "search_tools must really be registered");
+  const execute = runtime.definitions.get("tool_search")?.execute;
+  assert.ok(execute, "tool_search must really be registered");
   return execute;
 }
 
@@ -252,32 +252,31 @@ test("wrapper codemode intent is consumed synchronously and composes primary dir
     await activation;
     await startSession(runtime);
 
-    assert.ok(runtime.definitions.has("search_tools"), "the authorized loader was registered");
-    assert.ok(runtime.definitions.get("search_tools")?.description?.includes("codemode"),
+    assert.ok(runtime.definitions.has("tool_search"), "the authorized loader was registered");
+    assert.ok(runtime.definitions.get("tool_search")?.description?.includes("codemode"),
       "wrapper default makes an inactive registered codemode searchable");
     assert.equal(runtime.activeTools().includes("codemode"), false, "wrapper default does not promote codemode into the direct active set");
     assert.equal(runtime.activeTools().includes("NativeDeferred"), false);
 
     const codemodeSearch = await searchTool(runtime)("search-code", { query: "codemode" });
-    assert.deepEqual((codemodeSearch.details as { nativeAvailable: string[] }).nativeAvailable, ["codemode"]);
-    assert.equal(runtime.activeTools().includes("codemode"), false, "searching native codemode exposure does not declare it direct");
-    const rejectedParent = await submitModelCall(runtime, "codemode", "inactive-code", { code: "await tools.NativeDeferred({})" });
-    assert.equal(rejectedParent?.block, true, "model-issued codemode needs Pi's native declaration");
-    const orphan = await submitNestedCall(runtime, "inactive-code", "NativeDeferred", "inactive-code/1", {});
-    assert.equal(orphan?.block, true, "a rejected parent cannot authorize a nested descendant");
+    assert.deepEqual((codemodeSearch.details as { activated: string[] }).activated, ["codemode"]);
+    assert.equal(runtime.activeTools().includes("codemode"), true, "the loader declares the authorized codemode exposure");
 
     // Model-only tools may be loaded for model use, but are never script
     // callees. Deferred native exposure remains nested-callable while inactive.
     const modelOnlySearch = await searchTool(runtime)("load-model-only", { query: "ModelOnly" });
     assert.deepEqual((modelOnlySearch.details as { activated: string[] }).activated, ["ModelOnly"]);
-    runtime.setNativeActive("codemode", true); // Pi's native tool_search declaration.
     const parent = await submitModelCall(runtime, "codemode", "active-code", { code: "await tools.NativeDeferred({}); await tools.ModelOnly({})" });
-    assert.equal(parent?.block, undefined, "a native-selected codemode call is allowed");
+    assert.equal(parent?.block, undefined, "the loader-declared codemode call is allowed");
     const deferredChild = await submitNestedCall(runtime, "active-code", "NativeDeferred", "active-code/1", {});
     assert.equal(deferredChild?.block, undefined, "registered deferred callees may run nested while inactive");
     assert.equal(runtime.activeTools().includes("NativeDeferred"), false, "nested native reachability never promotes a direct declaration");
     const modelOnlyChild = await submitNestedCall(runtime, "active-code", "ModelOnly", "active-code/2", {});
     assert.equal(modelOnlyChild?.block, true, "model-only exposure is never nested-callable");
+
+    // A nested call without an authorized parent is blocked.
+    const orphan = await submitNestedCall(runtime, "never-authorized", "NativeDeferred", "orphan/1", {});
+    assert.equal(orphan?.block, true, "an orphaned nested call cannot authorize itself");
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
@@ -295,7 +294,7 @@ test("primary wrapper codemode intent survives module reload and a replaced sess
     await activate(initial.pi);
     assert.equal(process.env[CODEMODE_DEFAULT_ENV], undefined);
     await startSession(initial);
-    assert.ok(initial.definitions.get("search_tools")?.description?.includes("codemode"));
+    assert.ok(initial.definitions.get("tool_search")?.description?.includes("codemode"));
     assert.equal(initial.activeTools().includes("codemode"), false);
 
     await initial.fire("session_shutdown", initial.context);
@@ -305,12 +304,14 @@ test("primary wrapper codemode intent survives module reload and a replaced sess
     await reloadedActivate(replacement.pi);
     await startSession(replacement);
 
-    assert.ok(replacement.definitions.get("search_tools")?.description?.includes("codemode"),
+    assert.ok(replacement.definitions.get("tool_search")?.description?.includes("codemode"),
       "the process-local primary default rebuilds discovery under the replacement manager identity");
     assert.equal(replacement.activeTools().includes("codemode"), false,
       "retaining wrapper intent does not change native codemode's initial selection");
     const result = await searchTool(replacement)("replacement-codemode", { query: "codemode" });
-    assert.deepEqual((result.details as { nativeAvailable: string[] }).nativeAvailable, ["codemode"]);
+    assert.deepEqual((result.details as { activated: string[] }).activated, ["codemode"]);
+    assert.equal(replacement.activeTools().includes("codemode"), true,
+      "the loader declares the wrapper-authorized codemode under the replacement identity");
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
@@ -324,7 +325,7 @@ test("a fresh manual primary activation does not inherit wrapper codemode defaul
     await activate(runtime.pi);
     await startSession(runtime);
 
-    assert.doesNotMatch(runtime.definitions.get("search_tools")?.description ?? "", /codemode/);
+    assert.doesNotMatch(runtime.definitions.get("tool_search")?.description ?? "", /codemode/);
     const result = await searchTool(runtime)("manual-codemode", { query: "codemode" });
     assert.deepEqual((result.details as { matched: string[] }).matched, []);
   } finally {
@@ -359,7 +360,7 @@ test("executor activation consumes but never captures primary wrapper codemode i
     const primary = new NativeToolRuntime(primaryCwd, nativeDefinitions(), ["read"]);
     await activate(primary.pi);
     await startSession(primary);
-    assert.doesNotMatch(primary.definitions.get("search_tools")?.description ?? "", /codemode/,
+    assert.doesNotMatch(primary.definitions.get("tool_search")?.description ?? "", /codemode/,
       "an executor marker cannot seed primary-process wrapper intent");
   } finally {
     await rm(cwd, { recursive: true, force: true });
@@ -380,18 +381,18 @@ test("primary lifecycle reconciliation preserves the live loader gate and adopts
     assert.equal(runtime.hooks.has("tools_changed"), false, "no synthetic tools_changed event is used");
 
     // A call-time authorization query must not reapply the desired set before
-    // checking whether search_tools is still selected.
-    runtime.setNativeActive("search_tools", false);
-    const deselectedLoader = await submitModelCall(runtime, "search_tools", "deselected-loader", { query: "read" });
+    // checking whether tool_search is still selected.
+    runtime.setNativeActive("tool_search", false);
+    const deselectedLoader = await submitModelCall(runtime, "tool_search", "deselected-loader", { query: "read" });
     assert.equal(deselectedLoader?.block, true, "a deselected loader is rejected");
-    assert.equal(runtime.activeTools().includes("search_tools"), false, "denial does not resurrect the loader");
+    assert.equal(runtime.activeTools().includes("tool_search"), false, "denial does not resurrect the loader");
 
-    runtime.setNativeActive("search_tools", true);
+    runtime.setNativeActive("tool_search", true);
     runtime.registerNative({ name: "LateNativeTool", description: "Registered after startup." });
     await runtime.fire("mcp_servers_change", runtime.context);
     assert.equal(runtime.activeTools().includes("LateNativeTool"), false,
       "the host's late auto-activation is not adopted as a direct declaration");
-    assert.ok(runtime.definitions.get("search_tools")?.description?.includes("LateNativeTool"),
+    assert.ok(runtime.definitions.get("tool_search")?.description?.includes("LateNativeTool"),
       "a permitted late top-level registry name joins host discovery");
     const lateSearch = await searchTool(runtime)("load-late", { query: "LateNativeTool" });
     assert.deepEqual((lateSearch.details as { activated: string[] }).activated, ["LateNativeTool"]);
@@ -443,7 +444,7 @@ test("plan/research rejects codemode and annotated MCP tools with deferred tools
         "read-only annotations do not create a research MCP exception");
       assert.equal((await submitModelCall(runtime, "codemode", `research-code-${deferredPiTools}`, { code: "" }))?.block, true);
       assert.equal((await submitModelCall(runtime, "mcp__docs__lookup", `research-mcp-${deferredPiTools}`, {}))?.block, true);
-      const description = runtime.definitions.get("search_tools")?.description ?? "";
+      const description = runtime.definitions.get("tool_search")?.description ?? "";
       assert.doesNotMatch(description, /codemode|mcp__docs__lookup/);
       await runtime.fire("session_shutdown", runtime.context);
     }
@@ -464,7 +465,7 @@ test("explicit native registry exclusion and frozen research-worker catalogs can
     await startSession(restricted);
     assert.equal(restricted.definitions.has("codemode"), false, "the extension never registers excluded native codemode");
     assert.equal(restricted.activeTools().includes("codemode"), false);
-    assert.doesNotMatch(restricted.definitions.get("search_tools")?.description ?? "", /codemode/);
+    assert.doesNotMatch(restricted.definitions.get("tool_search")?.description ?? "", /codemode/);
     assert.equal((await submitModelCall(restricted, "codemode", "excluded-code", { code: "" }))?.block, true);
 
     process.env.PI_REVIEW_GATE_RUNTIME_ROLE = "executor";
@@ -486,13 +487,13 @@ test("explicit native registry exclusion and frozen research-worker catalogs can
       await startSession(worker);
       assert.equal(process.env[EXECUTOR_TOOL_CATALOG_ENV], undefined);
       assert.deepEqual(worker.activeTools(), deferredPiTools
-        ? ["read", "search_tools"]
-        : ["read", "WebSearch", "search_tools"]);
+        ? ["read", "tool_search"]
+        : ["read", "WebSearch", "tool_search"]);
       worker.registerNative({ name: "LateWorkerTool", description: "Outside the captured worker ceiling." });
       await worker.fire("mcp_servers_change", worker.context);
       assert.equal(worker.activeTools().includes("LateWorkerTool"), false,
         "late registry additions never widen the frozen worker catalog");
-      assert.doesNotMatch(worker.definitions.get("search_tools")?.description ?? "", /LateWorkerTool/);
+      assert.doesNotMatch(worker.definitions.get("tool_search")?.description ?? "", /LateWorkerTool/);
       assert.equal((await submitModelCall(worker, "LateWorkerTool", `worker-late-${deferredPiTools}`, {}))?.block, true);
       assert.equal((await submitModelCall(worker, "codemode", `worker-code-${deferredPiTools}`, { code: "" }))?.block, true);
       assert.equal((await submitModelCall(worker, "mcp__docs__lookup", `worker-mcp-${deferredPiTools}`, {}))?.block, true,

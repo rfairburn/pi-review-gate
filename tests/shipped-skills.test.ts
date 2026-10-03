@@ -71,8 +71,8 @@ test("execution skill teaches the discovery contract without restating the runti
     // names plus a tiny purpose, schemas deferred.
     "startup inventory lists this role's discovery set",
     "full parameter schemas stay deferred",
-    // The search_tools description carries that same discovery set.
-    "`search_tools` tool description itself carries that same discovery set",
+    // The tool_search description carries that same discovery set.
+    "`tool_search` tool description itself carries that same discovery set",
     "exact name",
     "Loading never performs the operation",
     // Stable-summary semantics: activation never rewrites the summary, baseline
@@ -152,7 +152,7 @@ test("research skill teaches the same discovery contract as execution", async ()
   const skill = await readSkillFlat("pi-review-gate-research");
   for (const phrase of [
     "startup inventory lists this role's discovery set",
-    "`search_tools` tool description itself carries that same discovery set",
+    "`tool_search` tool description itself carries that same discovery set",
     "stays byte-identical as deferred tools activate",
     "not a \"still inactive\" list",
     "exact names",
@@ -309,7 +309,7 @@ test("static mode segments never duplicate the dynamic tool inventory", async ()
     // The startup inventory is rendered at runtime from the live catalog
     // (src/tool-inventory.ts); static segments must not embed its rendering.
     assert.doesNotMatch(segment, /Authorized tool names/);
-    assert.doesNotMatch(segment, /search_tools/);
+    assert.doesNotMatch(segment, /tool_search/);
   }
 });
 

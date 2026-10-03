@@ -76,11 +76,11 @@ Choose **Operating mode** in `/review-settings`, then **Save changes**:
   remains responsible for integration and verification.
 - **Plan/research**: local read-only investigation and planning. Write-capable tools,
   arbitrary shell, execution-subtask controls, and the `codemode` script transport are
-  removed from the active tool schemas, authorized inventory, and `search_tools`
+  removed from the active tool schemas, authorized inventory, and `tool_search`
   results. Launch-authorized native read-only discovery (`grep`, `find`, `ls`) stays
   active in every mode. The structured
   read-only Git history tool `GitRead` is active only in this mode: available from the
-  first request (no `search_tools` step) and removed from the active set, inventory,
+  first request (no `tool_search` step) and removed from the active set, inventory,
   and search results in every other mode. When changes are needed, the assistant asks
   you to switch modes; there is no GitHub-writing exception.
 
@@ -356,7 +356,7 @@ them over. The concise rules:
   load gets no new default.
 - `codemode` follows the ordinary deferred-tools toggle
   (`execution.deferredPiTools`): with the default On it is discoverable through
-  `search_tools` but never part of the initial-active subset, so the model loads it
+  `tool_search` but never part of the initial-active subset, so the model loads it
   before use; with the toggle Off ordinary permitted tools, including `codemode`,
   load without review-gate deferral. Native MCP exposure and Pi's loading choices
   still apply: Off does not force codemode/deferred MCP tools into direct declarations.
@@ -371,13 +371,13 @@ them over. The concise rules:
   manager, project-trust grant, credential flow, exposure editor, or annotation-based
   permission policy: server configuration, trust, credentials, exposure, and
   permissions stay with Pi. Enabled, permitted MCP tools are discoverable through
-  `search_tools`; disabled, hidden, or withdrawn names are not. Review-gate's guards
+  `tool_search`; disabled, hidden, or withdrawn names are not. Review-gate's guards
   and existing evidence policy apply to
   MCP and codemode calls like any other tool call.
 
-Behavior details — the two separate tool searches, in-session reconciliation, and the
-nested-call guards — are owned by
-[Native Pi tools](native-pi-tools.md#native-pi-tools-mcp-and-codemode).
+Behavior details — the builtin `tool_search` replacement, in-session reconciliation,
+and the nested-call guards — are owned by
+[Native Pi tools](native-pi-tools.md#one-loader-replaces-pis-builtin-tool-search).
 
 ## Scheduled task fields
 

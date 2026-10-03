@@ -67,7 +67,7 @@ export function renderAuthorizedToolInventory(
   }
   if (options.deferred) {
     lines.push(
-      "If an authorized tool is inactive, call search_tools with its exact name; search_tools only activates it. Invoke the activated tool on the next turn.",
+      "If an authorized tool is inactive, call tool_search with its exact name; tool_search only activates it. Invoke the activated tool on the next turn.",
     );
   } else {
     lines.push("Invoke an available tool by its exact name.");

@@ -56,12 +56,12 @@ async function activateNativeReadinessHost(
   initialized = true;
   const context = { cwd, ui: {}, sessionManager: {}, hasUI: false };
   await trigger(hooks, "session_start", { cwd }, context);
-  const search = definitions.get("search_tools");
+  const search = definitions.get("tool_search");
   assert.ok(search);
   assert.equal(typeof search.execute, "function");
   const loaded = await invokeNativeToolCall(
     hooks,
-    { name: "search_tools", execute: search.execute },
+    { name: "tool_search", execute: search.execute },
     `load-${loadName}`,
     { query: loadName },
     context,

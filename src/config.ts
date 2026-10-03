@@ -401,7 +401,7 @@ export interface ExecutionConfig {
   maxWorkers?: number;
   retryPolicy?: ExecutionRetryPolicy;
   subtaskNotifications?: SubtaskNotificationMode;
-  /** Defer Pi-native schemas until search_tools activation. Defaults on. */
+  /** Defer Pi-native schemas until tool_search activation. Defaults on. */
   deferredPiTools?: boolean;
 }
 

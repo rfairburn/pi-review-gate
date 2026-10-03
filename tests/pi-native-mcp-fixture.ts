@@ -488,6 +488,7 @@ export class NativeMcpFixture {
 	private child: ChildProcess | undefined;
 	private pending = new Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
 	private nextRequestId = 1;
+	private nextProbeDumpRequestId = 1;
 	private stderrTail = "";
 	private disposed = false;
 	private childDied: string | undefined;
@@ -678,20 +679,20 @@ export class NativeMcpFixture {
 		await writeFile(this.paths.denyFile, `${JSON.stringify(policy, null, "\t")}\n`, "utf8");
 	}
 
-	/** Run `/native-mcp-probe dump` and return the live inventory it wrote. */
+	/** Run the probe command and return the inventory from this exact live request. */
 	async probeDump(): Promise<ProbeDump> {
-		const marker = Date.now();
-		await this.runCommand("/native-mcp-probe dump");
+		const requestId = `dump-${this.nextProbeDumpRequestId++}`;
+		await this.runCommand(`/native-mcp-probe ${requestId}`);
 		const deadline = Date.now() + this.timeouts.dumpMs;
 		for (;;) {
 			try {
 				const dump = JSON.parse(readFileSync(this.paths.probeDump, "utf8")) as ProbeDump;
-				if (typeof dump.requested === "string" && dump.requested === "dump") return dump;
+				if (dump.requested === requestId) return dump;
 			} catch {
 				// Not written (yet).
 			}
 			if (Date.now() >= deadline) {
-				throw new Error(`probe dump never appeared\nstderr:\n${this.stderrTail}`);
+				throw new Error(`probe dump ${requestId} never appeared\nstderr:\n${this.stderrTail}`);
 			}
 			await delay(100);
 		}

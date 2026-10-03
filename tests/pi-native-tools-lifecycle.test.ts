@@ -157,6 +157,33 @@ function observedTool(dump: ProbeDump, name: string): NonNullable<ProbeDump["all
   return tool;
 }
 
+async function waitForNativeRegistry(
+  fixture: NativeMcpFixture,
+  description: string,
+  published: (dump: ProbeDump) => boolean,
+): Promise<ProbeDump> {
+  const timeoutMs = FIXTURE_TIMEOUTS.connectMs;
+  const deadline = Date.now() + timeoutMs;
+  let lastDump: ProbeDump | undefined;
+  let observations = 0;
+  do {
+    lastDump = await fixture.probeDump();
+    observations += 1;
+    if (published(lastDump)) return lastDump;
+    if (Date.now() >= deadline) break;
+    // Limit observer traffic; readiness still depends on the live registry condition.
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+  } while (Date.now() < deadline);
+
+  const serverEvents = (await fixture.readServerEvents())
+    .filter((event) => ["initialize", "tools_list", "list_changed"].includes(String(event.event)))
+    .slice(-12);
+  throw new Error(
+    `native Pi registry did not publish ${description} within ${timeoutMs}ms after ${observations} live getAllTools observations; `
+    + `last registry: ${JSON.stringify(lastDump?.allTools)}; recent MCP events: ${JSON.stringify(serverEvents)}`,
+  );
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -249,7 +276,11 @@ test("compiled candidate reconciles native MCP withdrawal, replacement, calls, a
   const oldEcho = mcpToolName(fixture.serverName, "echo");
   const newEcho = mcpToolName(fixture.serverName, "echo_second");
   const counter = mcpToolName(fixture.serverName, "counter");
-  const initial = await fixture.probeDump();
+  const initial = await waitForNativeRegistry(
+    fixture,
+    `initial MCP tool ${oldEcho}`,
+    (dump) => dump.allTools?.some((tool) => tool.name === oldEcho) === true,
+  );
   assert.equal(
     observedTool(initial, oldEcho).exposure,
     REGISTERED_EXPOSURE_FOR_CODENAME_SERVER,
@@ -283,7 +314,12 @@ test("compiled candidate reconciles native MCP withdrawal, replacement, calls, a
   );
   assert.ok(refreshed, "native Pi requests the rotated list before candidate discovery assertions");
 
-  const rotated = await fixture.probeDump();
+  const rotated = await waitForNativeRegistry(
+    fixture,
+    `generation-two MCP replacement ${newEcho} and hidden withdrawal ${oldEcho}`,
+    (dump) => dump.allTools?.some((tool) => tool.name === newEcho) === true
+      && dump.allTools?.some((tool) => tool.name === oldEcho && tool.exposure === "hidden") === true,
+  );
   assert.equal(observedTool(rotated, oldEcho).exposure, "hidden",
     "Pi retains the withdrawn old registration as hidden in its actual registry");
   assert.ok(!rotated.activeTools?.includes(oldEcho), "the withdrawn registration is not directly active");
@@ -427,7 +463,11 @@ test("public native MCP registration is discovered dynamically while a worker ce
     beforeRegistration.length,
   );
   assert.ok(registeredList, "public registerMcpServer connects and lists its late synthetic MCP tools");
-  const hostDump = await host.probeDump();
+  const hostDump = await waitForNativeRegistry(
+    host,
+    `publicly registered MCP tools ${lateEcho} and ${lateCounter}`,
+    (dump) => [lateEcho, lateCounter].every((name) => dump.allTools?.some((tool) => tool.name === name)),
+  );
   assert.equal(observedTool(hostDump, lateEcho).exposure, REGISTERED_EXPOSURE_FOR_CODENAME_SERVER,
     "the late MCP config exposure is checked against actual Pi registry metadata");
   assert.equal(observedTool(hostDump, lateCounter).exposure, REGISTERED_EXPOSURE_FOR_CODENAME_SERVER);
@@ -454,7 +494,11 @@ test("public native MCP registration is discovered dynamically while a worker ce
 
   await host.runCommand("/native-mcp-control unregister");
   await assertLastControlSucceeded(host, "unregister");
-  const afterUnregister = await host.probeDump();
+  const afterUnregister = await waitForNativeRegistry(
+    host,
+    `withdrawal of publicly unregistered MCP tool ${lateCounter}`,
+    (dump) => !dump.allTools?.some((tool) => tool.name === lateCounter && tool.exposure !== "hidden"),
+  );
   assert.ok(
     !afterUnregister.allTools?.some((tool) => tool.name === lateCounter && tool.exposure !== "hidden"),
     "public unregister removes or hides the late native registry entries",
@@ -501,7 +545,11 @@ test("public native MCP registration is discovered dynamically while a worker ce
     workerBeforeRegistration.length,
   );
   assert.ok(workerList, "the native host itself sees both late server names in the worker");
-  const workerDump = await worker.probeDump();
+  const workerDump = await waitForNativeRegistry(
+    worker,
+    `late worker-authorized MCP tool ${workerAllowedEcho}`,
+    (dump) => dump.allTools?.some((tool) => tool.name === workerAllowedEcho) === true,
+  );
   assert.equal(observedTool(workerDump, workerAllowedEcho).exposure, REGISTERED_EXPOSURE_FOR_CODENAME_SERVER);
   // The real MCP server advertises both names above, but Pi's worker `--tools`
   // list is exactly the captured catalog plus search_tools. The outside name

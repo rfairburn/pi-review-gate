@@ -207,6 +207,18 @@ for (const plan of [
   }));
 }
 
+test("native Windows empty raw checkpoint captures, reloads and releases", { skip: process.platform !== "win32" }, async () => fixture(async (root) => {
+  const captured = await captureReviewCheckpoint(root, "native-empty");
+  assert.equal(captured.status, "ok", JSON.stringify(captured));
+  if (captured.status !== "ok" || captured.value.kind !== "raw") throw new Error("expected raw empty baseline");
+  const loaded = await loadReviewCheckpoint(root, captured.value);
+  assert.equal(loaded.status, "ok", JSON.stringify(loaded));
+  if (loaded.status !== "ok" || loaded.value.kind !== "raw") throw new Error("expected empty reload");
+  assert.deepEqual(loaded.value.entries, []);
+  assert.equal((await releaseReviewCheckpoint(root, captured.value)).status, "ok");
+  assert.equal((await loadReviewCheckpoint(root, captured.value)).status, "failed");
+}));
+
 test("native Windows raw checkpoint captures, reloads, compares and advances exact frozen bytes", { skip: process.platform !== "win32" }, async () => fixture(async (root) => {
   await writeFile(join(root, "sample.txt"), Buffer.from([0, 255, 42]));
   const before = await captureReviewCheckpoint(root, "native-before");

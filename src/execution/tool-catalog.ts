@@ -8,7 +8,12 @@
  */
 import { GIT_READ_TOOL_NAME } from "../git-read/tool";
 export const EXECUTOR_TOOL_CATALOG_ENV = "PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG";
-export const DEFERRED_TOOL_SEARCH_NAME = "search_tools";
+/**
+ * #279: the loader registers under Pi's replaceable builtin name, so the
+ * native tool-search extension is not loaded and this single loader owns all
+ * discovery/activation (including codemode/deferred-exposure and MCP tools).
+ */
+export const DEFERRED_TOOL_SEARCH_NAME = "tool_search";
 /**
  * Canonical native discovery set (issues #71/#72). Pi supplies `grep`,
  * `find`, and `ls` as built-in read-only tools; Claude's adapter maps the
@@ -30,14 +35,14 @@ const EXECUTOR_SHELL_TOOLS = ["bash", "powershell"] as const;
  * Conservative startup subset for deferred-tool sessions, in every top-level
  * operating mode and delegated role. Launch-authorized native read-only
  * discovery belongs to that subset: it is active from the first request — no
- * `search_tools` activation step — and mode switches never deactivate it
+ * `tool_search` activation step — and mode switches never deactivate it
  * (the planning visibility policy keeps it). Every entry is still filtered
  * through the captured authorized catalog. Registry removal via --tools,
  * --exclude-tools, or --no-tools keeps those capabilities excluded.
  *
  * `GitRead` (#73) belongs to the subset wherever the durable catalog admits
  * it: Pi research workers carry it in their parent intersection and start
- * with it active, no `search_tools` step. Top-level capture deliberately does
+ * with it active, no `tool_search` step. Top-level capture deliberately does
  * not treat it as baseline there — its top-level activity is pinned to the
  * plan/research operating mode by the deferred-tool manager instead — and
  * execute-kind child catalogs never contain it at all.
@@ -45,7 +50,7 @@ const EXECUTOR_SHELL_TOOLS = ["bash", "powershell"] as const;
  * `codemode` (#224) is deliberately absent from this order even when the
  * authorized parent ceiling carries it: with deferred tools enabled the
  * durable allowed catalog keeps it deferred (execute/orchestrate sessions
- * discover and activate it only through `search_tools`), and read-only
+ * discover and activate it only through `tool_search`), and read-only
  * research workers do not receive it at all (see RESEARCH_ALLOWED_TOOLS).
  * With deferred tools disabled the ordinary full-active contract applies:
  * an authorized execute catalog starts active including codemode.

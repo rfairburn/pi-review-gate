@@ -8,15 +8,15 @@ test("authorized tool inventory is deterministic, deduped, and pairs each name w
       { name: "WebSearch", description: "Search the public web for current sources." },
       { name: "read", description: "Read file contents." },
       { name: "WebSearch", description: "Later duplicate metadata must not win." },
-      { name: "search_tools", description: "Activate authorized tools" },
+      { name: "tool_search", description: "Activate authorized tools" },
     ],
     { deferred: true },
   );
   // Sorted, deduped (first canonical description wins), exactly one list.
-  assert.match(inventory, /^Authorized tool names with purpose: "WebSearch" \(Search the public web for current sources\), "read" \(Read file contents\), "search_tools" \(Activate authorized tools\)\./);
+  assert.match(inventory, /^Authorized tool names with purpose: "WebSearch" \(Search the public web for current sources\), "read" \(Read file contents\), "tool_search" \(Activate authorized tools\)\./);
   assert.equal([...inventory.matchAll(/"read"/g)].length, 1);
   assert.equal([...inventory.matchAll(/"WebSearch"/g)].length, 1);
-  assert.match(inventory, /search_tools with its exact name/);
+  assert.match(inventory, /tool_search with its exact name/);
   assert.match(inventory, /next turn/);
   assert.doesNotMatch(inventory, /Later duplicate metadata|parameters|properties/);
 });

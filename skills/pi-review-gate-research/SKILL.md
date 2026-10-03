@@ -13,7 +13,7 @@ install.
 
 - **Primary plan/research mode** ("Plan/research") is the top-level assistant under an
   enforced local read-only boundary. Write-capable tools are absent from the active
-  tool list, the authorized inventory, and `search_tools` results: file editing and
+  tool list, the authorized inventory, and `tool_search` results: file editing and
   patching, shell execution, and the execution subtask controls (start/add/continue/
   steer/interrupt/force-merge/mark-clean) cannot be activated in this mode. Read-only
   subtask observation (`SubtasksInspect`, `SubtasksWatch`) remains available.
@@ -22,7 +22,7 @@ install.
   and observational browser tools only. A research task never lands workspace changes
   and can only be interrupted as a failure — there is no merge path for research.
 - The role ceilings are the actual authorized catalog. Check the startup inventory
-  and the `search_tools` description for this role's discovery set; do not assume a
+  and the `tool_search` description for this role's discovery set; do not assume a
   capability, and do not try to widen the boundary by delegation — a delegated task
   inherits only authorization the parent already had.
 
@@ -48,8 +48,8 @@ that never makes writes available now.
   and full schemas stay deferred until activation. The summary is a stable role
   inventory, not a "still inactive" list: it stays byte-identical as deferred tools
   activate, and newly activated deferred tools remain listed.
-- The `search_tools` tool description itself carries that same discovery set at live
-  permissions. Query `search_tools` with exact names when known; capability terms only
+- The `tool_search` tool description itself carries that same discovery set at live
+  permissions. Query `tool_search` with exact names when known; capability terms only
   for unknown names. Loading never performs the operation — invoke the activated tool
   on the next turn.
 

@@ -22,7 +22,7 @@ event_log = os.path.join(state_dir, "event-log.jsonl")
 counter_file = os.path.join(state_dir, "counter.txt")
 probe_dump = os.path.join(state_dir, "probe-dump.json")
 ROWS, COLS = 40, 120
-DOWN, ENTER, ESCAPE, CTRL_C = b"\x1b[B", b"\r", b"\x1b", b"\x03"
+UP, DOWN, ENTER, ESCAPE, CTRL_C = b"\x1b[A", b"\x1b[B", b"\r", b"\x1b", b"\x03"
 OVERALL_SECONDS = 6 * 60
 started_at = time.monotonic()
 overall_deadline = started_at + OVERALL_SECONDS
@@ -225,6 +225,35 @@ def manager_toggle(server, desired):
     }
 
 
+def manager_exposure(server, desired):
+    chat("/mcp")
+    wait_fresh(server, 20)
+    server_selection = select_item(server)
+    send(ENTER, 0.5)
+    exposure_selection = select_action("Exposure", 10)
+    send(ENTER, 0.5)
+    # Exposure menu: codemode/deferred/direct rows, the current value
+    # preselected. DOWN/DOWN/UP/UP reaches all three rows whether the menu
+    # wraps or clamps at either end; verify the highlight after every key so
+    # a stale server-menu row can never be mistaken for the submenu choice.
+    pump(0.4)
+    if not selected(desired):
+        for key in (DOWN, DOWN, UP, UP):
+            send(key, 0.18)
+            if selected(desired):
+                break
+        else:
+            raise RuntimeError(f"native /mcp exposure menu never selected {desired!r}; latest output:\n{fresh()[-4000:]}")
+    send(ENTER, 0.5)
+    pump(0.6)
+    close_manager(server)
+    return {
+        "serverSelection": server_selection,
+        "exposureSelection": exposure_selection,
+        "desired": desired,
+    }
+
+
 def dump_snapshot(name):
     previous = os.stat(probe_dump).st_mtime_ns if os.path.exists(probe_dump) else 0
     chat("/native-mcp-probe dump")
@@ -339,6 +368,8 @@ def main():
                 result["detail"] = f"settled {action['name']} scripted turn; counter={counters[action['name']]}"
             elif action["type"] == "manager_toggle":
                 result["detail"] = json.dumps(manager_toggle(action["server"], action["desired"]))
+            elif action["type"] == "manager_exposure":
+                result["detail"] = json.dumps(manager_exposure(action["server"], action["desired"]))
             elif action["type"] == "command":
                 chat(action["command"])
                 wait_count("initialize", action["initializeCount"])

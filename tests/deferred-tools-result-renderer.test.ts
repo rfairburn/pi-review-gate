@@ -22,7 +22,7 @@ function render(tool: Definition, value: unknown, options: Record<string, unknow
   return (component as { render(width: number): string[] }).render(width);
 }
 
-test("registered search_tools card matches the canonical activated shape end to end", async () => {
+test("registered tool_search card matches the canonical activated shape end to end", async () => {
   const fixture = fixtureWithSearch();
   const params = { query: "InactiveRunner" };
   fixture.manager.sessionStart(fixture.sessionIdentity);
@@ -37,12 +37,12 @@ test("registered search_tools card matches the canonical activated shape end to 
 
   // Canonical collapsed card: quoted query plus the activation outcome; the
   // shared wrapper owns the single hint, so the family renderer emits none.
-  assert.equal(collapsedLines[0], 'search_tools · "InactiveRunner" · activated InactiveRunner');
+  assert.equal(collapsedLines[0], 'tool_search · "InactiveRunner" · activated InactiveRunner');
   assert.doesNotMatch(collapsed, /ctrl\+o/);
 
   // Canonical expanded card: query, matched, newly activated, omitted count,
   // next-turn availability and the no-operation boundary, in order.
-  assert.equal(expandedLines[0], "search_tools");
+  assert.equal(expandedLines[0], "tool_search");
   const queryAt = expanded.indexOf("Query: InactiveRunner");
   const matchedAt = expanded.indexOf("Matched authorized tools:");
   const activatedAt = expanded.indexOf("Newly activated:");
@@ -57,10 +57,10 @@ test("registered search_tools card matches the canonical activated shape end to 
   assert.deepEqual((result.details as { matched: string[] }).matched, ["InactiveRunner"]);
   assert.deepEqual((result.details as { activated: string[] }).activated, ["InactiveRunner"]);
   assert.equal((result.details as { omitted: number }).omitted, 0);
-  assert.deepEqual(fixture.active(), ["read", "search_tools", "InactiveRunner"]);
+  assert.deepEqual(fixture.active(), ["read", "tool_search", "InactiveRunner"]);
 });
 
-test("search_tools expansion distinguishes already-active, no-match and mixed activation truthfully", async () => {
+test("tool_search expansion distinguishes already-active, no-match and mixed activation truthfully", async () => {
   const already = fixtureWithSearch();
   already.manager.sessionStart(already.sessionIdentity, undefined, false, false);
   const alreadyParams = { query: "AlreadyRunner" };
@@ -68,7 +68,7 @@ test("search_tools expansion distinguishes already-active, no-match and mixed ac
   const alreadyCollapsed = render(already.tool, alreadyResult, { expanded: false, isPartial: false }, alreadyParams).join("\n");
   const alreadyExpandedLines = render(already.tool, alreadyResult, { expanded: true, isPartial: false }, alreadyParams);
   const alreadyExpanded = alreadyExpandedLines.join("\n");
-  assert.equal(alreadyCollapsed, 'search_tools · "AlreadyRunner" · already active AlreadyRunner');
+  assert.equal(alreadyCollapsed, 'tool_search · "AlreadyRunner" · already active AlreadyRunner');
   assert.ok(alreadyExpandedLines.includes("Already active:"));
   assert.ok(alreadyExpandedLines.includes("  AlreadyRunner"));
   assert.match(alreadyExpanded, /Newly activated:\n  \(none\)/);
@@ -84,7 +84,7 @@ test("search_tools expansion distinguishes already-active, no-match and mixed ac
   const missingResult = await missing.search("missing", missingParams);
   const missingCollapsed = render(missing.tool, missingResult, { expanded: false, isPartial: false }, missingParams).join("\n");
   const missingExpanded = render(missing.tool, missingResult, { expanded: true, isPartial: false }, missingParams).join("\n");
-  assert.equal(missingCollapsed, 'search_tools · "does-not-exist" · no matches');
+  assert.equal(missingCollapsed, 'tool_search · "does-not-exist" · no matches');
   assert.match(missingExpanded, /Outcome: no authorized tools matched; no tools were activated\./);
   assert.match(missingExpanded, /Matched authorized tools:\n  \(none\)/);
   assert.doesNotMatch(missingExpanded, /Omitted matches/);
@@ -100,7 +100,7 @@ test("search_tools expansion distinguishes already-active, no-match and mixed ac
   const mixedCollapsedLines = render(mixed.tool, mixedResult, { expanded: false, isPartial: false }, mixedParams);
   const mixedExpandedLines = render(mixed.tool, mixedResult, { expanded: true, isPartial: false }, mixedParams);
   const mixedExpanded = mixedExpandedLines.join("\n");
-  assert.equal(mixedCollapsedLines[0], 'search_tools · "runner" · activated AlreadyRunner');
+  assert.equal(mixedCollapsedLines[0], 'tool_search · "runner" · activated AlreadyRunner');
   assert.match(mixedCollapsedLines.join("\n"), /Already active \(1\): InactiveRunner\./);
   assert.ok(mixedExpandedLines.includes("Newly activated:"));
   assert.ok(mixedExpandedLines.includes("Already active:"));
@@ -112,7 +112,7 @@ test("search_tools expansion distinguishes already-active, no-match and mixed ac
   assert.deepEqual((mixedResult.details as { alreadyActive: string[] }).alreadyActive, ["InactiveRunner"]);
 });
 
-test("search_tools surfaces the retained omitted-match count without changing model output", () => {
+test("tool_search surfaces the retained omitted-match count without changing model output", () => {
   const fixture = fixtureWithSearch();
   const value = {
     content: [{ type: "text", text: "Matched authorized tools: A.\nActivated: A." }],
@@ -133,7 +133,7 @@ test("unavailable and native-partial search results keep actual text without fab
   const unavailableResult = await unavailable.search("unavailable", unavailableParams);
   const unavailableCollapsed = render(unavailable.tool, unavailableResult, { expanded: false, isPartial: false }, unavailableParams).join("\n");
   const unavailableExpanded = render(unavailable.tool, unavailableResult, { expanded: true, isPartial: false }, unavailableParams).join("\n");
-  assert.equal(unavailableCollapsed, 'search_tools · "Unavailable secret-shaped query" · unavailable\nTool search is unavailable until session startup completes.');
+  assert.equal(unavailableCollapsed, 'tool_search · "Unavailable secret-shaped query" · unavailable\nTool search is unavailable until session startup completes.');
   assert.match(unavailableExpanded, /Query: Unavailable secret-shaped query/);
   assert.match(unavailableExpanded, /Outcome: unavailable/);
   assert.match(unavailableExpanded, /session startup completes/);

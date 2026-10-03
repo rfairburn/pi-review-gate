@@ -1,3 +1,4 @@
+import { dirname, join } from "node:path";
 import {
   DEFERRED_TOOL_SEARCH_NAME,
   DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER,
@@ -5,6 +6,7 @@ import {
   createExecutorToolCatalog,
   type ExecutorToolCatalog,
 } from "./execution/tool-catalog";
+import { loadHostPeerModule, resolveHostPeerFile } from "./host-peer-loader";
 import { RESEARCH_ALLOWED_TOOLS } from "./execution/tool";
 import { GIT_READ_TOOL_NAME } from "./git-read/tool";
 import { DEFAULT_OPERATING_MODE, type OperatingMode } from "./config";
@@ -12,12 +14,19 @@ import { renderAuthorizedToolInventory } from "./tool-inventory";
 import { deferredToolSearchRenderResult } from "./deferred-tools-result-renderer";
 
 const MAX_QUERY_CHARS = 256;
+/**
+ * The approved native limit for one search call: the host's own
+ * tool_search default (Pi 1.0), applied when no positive integer is supplied.
+ */
+const DEFAULT_SEARCH_LIMIT = 8;
+/** The running host package resolved through the existing peer loader. */
+const PI_AGENT_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 
 /**
  * Native Pi tool that runs codemode scripts (Pi 1.0 `builtin:codemode`).
  * Issue #224: the wrapper can opt in to a registered-but-inactive codemode as
  * an authorized, discoverable tool via the manager constructor flag.
- * The ordinary toggle requires search_tools when deferred tools are on and
+ * The ordinary toggle requires tool_search when deferred tools are on and
  * selects permitted tools normally when off. Plan/research disables it;
  * the wrapper default never overrides an explicit
  * native registry restriction, and no builtin is ever re-registered by this
@@ -39,8 +48,6 @@ const TOOL_EXPOSURES = new Set(["direct", "model-only", "codemode", "deferred", 
  * never callable from scripts).
  */
 const NATIVE_CALLABLE_EXPOSURES = new Set(["codemode", "deferred"]);
-/** Pi's builtin native loader is selected independently from gate-managed tools. */
-const PI_NATIVE_TOOL_SEARCH_NAME = "tool_search";
 const NATIVE_MCP_RESOURCE_HELPER_NAMES = new Set([
   "list_mcp_resources",
   "list_mcp_resource_templates",
@@ -65,15 +72,6 @@ interface RegistryRead {
   /** True: Pi answered (an empty answer is a valid, authoritative read). False: the registry is unreadable. */
   ok: boolean;
   metadata: ToolMetadata[];
-}
-
-interface NativeDeclarationState {
-  /** Native Pi selections, separate from the gate's managed loadout. */
-  selectedNames: Set<string>;
-  /** Last loadout written by this manager, retained separately from observations. */
-  lastManagedNames: ReadonlySet<string> | undefined;
-  /** Last successfully observed live native active set; manager writes reset this baseline. */
-  lastObservedNativeNames: ReadonlySet<string> | undefined;
 }
 
 function readRegistryMetadata(pi: DeferredToolHost): RegistryRead {
@@ -162,7 +160,6 @@ function planningToolVisible(name: string): boolean {
 // hidden-to-visible canonical native MCP exposure transition is also adopted.
 // Old-shape retained boundaries fail closed instead of being reinterpreted.
 const BOUNDARY_REGISTRY_KEY = Symbol.for("pi-review-gate.deferred-tool-authorization-boundaries.v4");
-const NATIVE_DECLARATION_REGISTRY_KEY = Symbol.for("pi-review-gate.native-tool-declarations.v1");
 
 /**
  * Top-level Pi-native deferred activation. Authorization is captured once from
@@ -175,12 +172,39 @@ const NATIVE_DECLARATION_REGISTRY_KEY = Symbol.for("pi-review-gate.native-tool-d
  * is its intersection with the current registry, so initially unavailable
  * (late MCP) ceiling names stay retained but only become usable once the
  * registry actually provides them.
+ *
+ * #279: this manager's loader is registered under Pi's replaceable builtin
+ * name `tool_search`, so the native tool-search extension is not loaded and
+ * there is no second discovery/declaration owner. Every authorized match —
+ * including codemode/deferred-exposure and MCP tools — is declared for the
+ * next model call by this loader; native script callability of those exposures
+ * is unchanged.
+ *
+ * #279 follow-up: registration happens at session start (registerWithNativeSchema),
+ * never at factory time, so Pi's load-time replaceable-builtin collision pass
+ * sees no competing definition. The descriptor reuses the host-native
+ * tool_search parameter schema by exact object reference — borrowed from the
+ * live registry when the builtin is loaded, otherwise captured from the
+ * running install's own bundled factory — and honors the native limit
+ * contract (default 8 or a supplied positive integer) capping strongest-tier
+ * matched/activated results per call; the discovery inventory surfaces stay
+ * complete and uncapped. When no running Pi host resolves (fake hosts, unit
+ * tests), the local fallback schema is kept and startup proceeds unchanged;
+ * when a host DOES resolve but its native schema cannot be acquired, session
+ * start fails explicitly — a concrete compatibility failure, never a silent
+ * registration of the known-incompatible fallback.
  */
 export class DeferredToolManager {
   private boundary: AuthorizationBoundary | undefined;
   private sessionIdentity: object | undefined;
-  private nativeDeclarationState: NativeDeclarationState | undefined;
   private desiredActiveNames: string[] = [];
+  /**
+   * Names this loader explicitly activated in the current incarnation (#279).
+   * Kept separate from the full desired list so a deferred-mode transition
+   * retains only deliberate search activations, never the previous mode's
+   * whole base set.
+   */
+  private loaderSelectionNames: string[] = [];
   private failClosedAuthorized: ReadonlySet<string> | undefined;
   private registryUnreadable = false;
   private activeSetEstablished = false;
@@ -188,26 +212,125 @@ export class DeferredToolManager {
   private registered = false;
   private lastSearchDescription: string | undefined;
   private lastSearchSnippet: string | undefined;
+  /**
+   * The exact host-native tool_search parameter schema reference, resolved
+   * once at late registration and reused by every descriptor re-registration
+   * (never cloned or mutated); undefined keeps the local fallback schema.
+   */
+  private nativeSearchParameters: Record<string, unknown> | undefined;
   constructor(
     private readonly pi: unknown,
     private readonly getOperatingMode: () => OperatingMode = () => DEFAULT_OPERATING_MODE,
     // #224 wrapper default: when true, an inactive registered codemode joins
     // the top-level authorization and discovery sets. The ordinary toggle
-    // controls selection: search_tools when on, normal loading when off. Only for
+    // controls selection: tool_search when on, normal loading when off. Only for
     // wrapper-launched sessions (the parent passes the captured
     // PI_REVIEW_GATE_CODEMODE_DEFAULT=1 flag); never applied to configured
     // worker ceilings and never overriding explicit registry restrictions.
     private readonly enableCodemodeDefault = false,
   ) {}
 
-  register(): boolean {
+  register(parameters?: Record<string, unknown>): boolean {
     if (this.registered || !isDeferredToolHost(this.pi)) return false;
+    if (parameters !== undefined) this.nativeSearchParameters = parameters;
     const definition = this.buildSearchToolDefinition();
     this.lastSearchDescription = definition.description;
     this.lastSearchSnippet = definition.promptSnippet;
     this.pi.registerTool(definition);
     this.registered = true;
     return true;
+  }
+
+  /**
+   * Session-start registration with the host-native parameter schema (#279
+   * follow-up). Resolving the exact native reference is asynchronous (the
+   * bundled-factory fallback loads a module), so the parent owns the await in
+   * its session_start handler before authorization capture. When no running
+   * Pi host resolves, the local fallback schema is kept and startup proceeds
+   * unchanged; when a host resolves but its native schema cannot be acquired,
+   * this rejects with an explicit compatibility failure instead of registering
+   * the known-incompatible fallback (which would fail Pi's identity-based
+   * tool_search recognition and restore the false discovery warning).
+   */
+  async registerWithNativeSchema(): Promise<boolean> {
+    if (this.registered || !isDeferredToolHost(this.pi)) return false;
+    this.nativeSearchParameters = await this.resolveNativeSearchParameters();
+    return this.register();
+  }
+
+  private async resolveNativeSearchParameters(): Promise<Record<string, unknown> | undefined> {
+    const live = this.liveToolSearchParameters();
+    if (live !== undefined) return live;
+    return this.factoryToolSearchParameters();
+  }
+
+  /** The exact `parameters` object of the tool_search entry currently in the host registry. */
+  private liveToolSearchParameters(): Record<string, unknown> | undefined {
+    if (!isDeferredToolHost(this.pi)) return undefined;
+    let tools: unknown;
+    try {
+      tools = this.pi.getAllTools();
+    } catch {
+      return undefined;
+    }
+    if (!Array.isArray(tools)) return undefined;
+    for (const entry of tools) {
+      if (!isRecord(entry) || entry.name !== DEFERRED_TOOL_SEARCH_NAME) continue;
+      const parameters = entry.parameters;
+      return isRecord(parameters) ? parameters : undefined;
+    }
+    return undefined;
+  }
+
+  /**
+   * The host-native schema captured from the running install's own bundled
+   * SDK entry: the existing peer loader resolves the package (it follows
+   * realpath(process.argv[1]) and validates the host), the bundled entry is
+   * derived next to it, and the exported tool-search factory is invoked with
+   * a tiny registerTool capture to obtain its exact parameters reference.
+   * No resolved host yields undefined (the caller keeps the local fallback
+   * schema); a RESOLVED host whose bundle, factory, or captured schema cannot
+   * be acquired throws — registering the incompatible fallback there would
+   * fail Pi's identity-based recognition and restore the false discovery
+   * warning, so this is an explicit compatibility failure instead.
+   */
+  private async factoryToolSearchParameters(): Promise<Record<string, unknown> | undefined> {
+    const sdkFile = resolveHostPeerFile(PI_AGENT_PACKAGE_NAME, { packageMainFallback: true });
+    if (!sdkFile) return undefined;
+    const entry = join(dirname(sdkFile), "bundle", "index.js");
+    const sdk = await loadHostPeerModule(entry);
+    if (!isRecord(sdk)) {
+      throw new Error(
+        `tool_search native schema unavailable: the running host resolved to ${sdkFile} ` +
+        `but its bundled SDK entry could not be loaded: ${entry}`,
+      );
+    }
+    const factory = sdk.createToolSearchExtension;
+    if (typeof factory !== "function") {
+      throw new Error(
+        `tool_search native schema unavailable: the running host's bundled SDK entry ${entry} ` +
+        "exports no createToolSearchExtension factory",
+      );
+    }
+    let captured: unknown;
+    try {
+      (factory as () => (api: { registerTool: (definition: unknown) => void }) => void)()({
+        registerTool: (definition: unknown) => { captured = definition; },
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `tool_search native schema unavailable: the running host's tool-search factory threw: ${reason}`,
+      );
+    }
+    const parameters = isRecord(captured) ? captured.parameters : undefined;
+    if (!isRecord(parameters)) {
+      throw new Error(
+        `tool_search native schema unavailable: the running host's tool-search factory registered ` +
+        "no valid parameters schema",
+      );
+    }
+    return parameters;
   }
 
   /** Capture authorization before the first shrink, or install a durable worker boundary. */
@@ -222,8 +345,8 @@ export class DeferredToolManager {
     // the new hook does not provide a stable WeakMap-compatible identity.
     this.boundary = undefined;
     this.sessionIdentity = undefined;
-    this.nativeDeclarationState = undefined;
     this.desiredActiveNames = [];
+    this.loaderSelectionNames = [];
     this.failClosedAuthorized = undefined;
     this.registryUnreadable = false;
     this.activeSetEstablished = false;
@@ -256,25 +379,10 @@ export class DeferredToolManager {
     registry.set(sessionIdentity, boundary);
     this.sessionIdentity = sessionIdentity;
     this.boundary = boundary;
-    const declarationRegistry = nativeDeclarationRegistry();
-    this.nativeDeclarationState = declarationRegistry?.get(sessionIdentity);
     // Reconcile the live registry before building the desired base so a
     // retained boundary also adopts registrations that happened between
     // incarnations (and applies a newly upgraded codemode intent immediately).
     this.reconcile();
-    if (!this.nativeDeclarationState) {
-      const activeNames = readActiveToolNames(this.pi);
-      const active = new Set(activeNames ?? []);
-      const initiallyActiveNativeNames = new Set(this.boundary.catalog
-        .filter((tool) => active.has(tool.name) && isNativeDeclarationSelection(tool))
-        .map((tool) => tool.name));
-      this.nativeDeclarationState = {
-        selectedNames: new Set(initiallyActiveNativeNames),
-        lastManagedNames: undefined,
-        lastObservedNativeNames: activeNames === undefined ? undefined : initiallyActiveNativeNames,
-      };
-      declarationRegistry?.set(sessionIdentity, this.nativeDeclarationState);
-    }
     this.desiredActiveNames = this.computeDesiredBase();
     this.activeSetEstablished = true;
     this.applyActiveSet();
@@ -329,7 +437,23 @@ export class DeferredToolManager {
       return true;
     }
     this.sessionDeferred = enabled;
-    this.desiredActiveNames = this.computeDesiredBase();
+    // Rebuild the base for the new setting against a fresh registry snapshot.
+    // Only explicit native codemode/deferred loader selections survive the
+    // transition in both directions (#279: they are the sole declaration path
+    // for those exposures). Ordinary search activations reset to the existing
+    // conservative baseline: switching ON demotes them back to discovery, and
+    // switching OFF rejoins them through the full authorized base.
+    this.reconcile();
+    const nativeSelections = this.loaderSelectionNames.filter((name) =>
+      isNativeCallableExposure(this.boundary!.registryEntries.get(name)?.exposure));
+    const base = this.computeDesiredBase();
+    const baseSet = new Set(base);
+    this.desiredActiveNames = [...base, ...nativeSelections.filter((name) => !baseSet.has(name))];
+    // The selection record tracks declarations that survive the transition:
+    // demoted ordinary selections are forgotten so a later exposure change
+    // cannot resurrect them without a new search.
+    const surviving = new Set(this.desiredActiveNames);
+    this.loaderSelectionNames = this.loaderSelectionNames.filter((name) => surviving.has(name));
     this.applyActiveSet();
     return true;
   }
@@ -342,13 +466,12 @@ export class DeferredToolManager {
     const baseNames = this.sessionDeferred ? boundary.initialActiveNames : [...boundary.authorizedNames];
     // Reloads and deferred-setting changes never reintroduce a name the live
     // registry does not currently provide: the base intersection keeps a
-    // withdrawn baseline tool out of every rebuilt desired set.
+    // withdrawn baseline tool out of every rebuilt desired set. Native
+    // codemode/deferred exposures stay outside the base in both settings —
+    // they join the declared set only through this loader's search activation.
     const live = new Set([...boundary.catalog].map((tool) => tool.name));
-    // Pi's builtin search helper follows Pi's own selection even in OFF mode;
-    // registry presence or ordinary worker authority alone never promotes it.
     return baseNames.filter((name) => live.has(name)
-      && !nativeCallableNames.has(name)
-      && name !== PI_NATIVE_TOOL_SEARCH_NAME)
+      && !nativeCallableNames.has(name))
       .concat(DEFERRED_TOOL_SEARCH_NAME);
   }
 
@@ -368,12 +491,6 @@ export class DeferredToolManager {
     this.syncSearchToolDescription();
     const names = this.computeActiveNames();
     this.pi.setActiveTools(names);
-    if (this.nativeDeclarationState) {
-      this.nativeDeclarationState.lastManagedNames = new Set(names);
-      // The manager's own mask is not a Pi deselection. Record the post-write
-      // native set as the next comparison baseline, using Pi's actual state.
-      this.nativeDeclarationState.lastObservedNativeNames = this.readNativeActiveNames();
-    }
   }
 
   /** The exact array reapply would write, without performing the write. */
@@ -388,20 +505,6 @@ export class DeferredToolManager {
       ? this.desiredActiveNames.filter(planningToolVisible)
       : [...this.desiredActiveNames];
     let modeNames = names;
-    if (this.boundary && this.nativeDeclarationState) {
-      // Pi's native tool_search can declare codemode/deferred-exposure tools
-      // independently of this manager. Keep those choices separate from the
-      // gate's own loadout so full-active mode never promotes every native
-      // callee merely because it is authorized.
-      this.observeNativeDeclarationChanges();
-      const nativeDeclarations = this.boundary.catalog
-        .filter((tool) => this.nativeDeclarationState!.selectedNames.has(tool.name)
-          && isNativeDeclarationSelection(tool)
-          && !modeNames.includes(tool.name)
-          && (!planning || planningToolVisible(tool.name)))
-        .map((tool) => tool.name);
-      if (nativeDeclarations.length > 0) modeNames = [...modeNames, ...nativeDeclarations];
-    }
     // #73: GitRead is mode/catalog-pinned, not baseline. Add it while visible
     // (so deferred-on plan/research and catalog-initial research workers keep
     // it active from the first request) and remove it everywhere else so a
@@ -435,50 +538,6 @@ export class DeferredToolManager {
       && (!authorized || name === DEFERRED_TOOL_SEARCH_NAME || authorized.has(name)));
   }
 
-  /** Observe Pi-native declaration changes without adopting the manager's own writes. */
-  private observeNativeDeclarationChanges(): void {
-    const state = this.nativeDeclarationState;
-    if (!state || !this.boundary || !isDeferredToolHost(this.pi)) return;
-    const active = readActiveToolNames(this.pi);
-    if (active === undefined) {
-      // An unreadable active set cannot revoke or create native selections.
-      return;
-    }
-    const liveNativeNames = new Set(this.boundary.catalog
-      .filter(isNativeDeclarationSelection)
-      .map((tool) => tool.name));
-    const activeNativeNames = new Set(active.filter((name) => liveNativeNames.has(name)));
-    const previousNativeNames = state.lastObservedNativeNames
-      ?? (state.lastManagedNames
-        ? new Set([...state.lastManagedNames].filter((name) => liveNativeNames.has(name)))
-        : undefined);
-    if (previousNativeNames) {
-      for (const name of liveNativeNames) {
-        const wasObservedActive = previousNativeNames.has(name);
-        const isCurrentlyActive = activeNativeNames.has(name);
-        if (isCurrentlyActive && !wasObservedActive) state.selectedNames.add(name);
-        else if (!isCurrentlyActive && wasObservedActive) state.selectedNames.delete(name);
-      }
-    }
-    // Advance only after a successful read so an observation without a
-    // following manager write still catches a later Pi reselection.
-    state.lastObservedNativeNames = activeNativeNames;
-    for (const name of state.selectedNames) {
-      if (!liveNativeNames.has(name)) state.selectedNames.delete(name);
-    }
-  }
-
-  /** Current live native selection state, or undefined when Pi cannot be read. */
-  private readNativeActiveNames(): ReadonlySet<string> | undefined {
-    if (!this.boundary || !isDeferredToolHost(this.pi)) return undefined;
-    const active = readActiveToolNames(this.pi);
-    if (active === undefined) return undefined;
-    const liveNativeNames = new Set(this.boundary.catalog
-      .filter(isNativeDeclarationSelection)
-      .map((tool) => tool.name));
-    return new Set(active.filter((name) => liveNativeNames.has(name)));
-  }
-
   /** Names visible at the live mode ceiling (authority boundary, not activation). */
   private modeVisibleAuthorizedNames(): ReadonlySet<string> {
     if (!this.boundary) return new Set<string>();
@@ -490,7 +549,7 @@ export class DeferredToolManager {
       .map((tool) => tool.name)
       .filter((name) => planning ? planningToolVisible(name) : true);
     // #73: an invisible GitRead is not part of the live ceiling at all — it
-    // must not reach the startup inventory, the search_tools description,
+    // must not reach the startup inventory, the tool_search description,
     // or any match result outside the modes/roles that expose it.
     if (!this.gitReadVisible()) {
       return new Set(visible.filter((name) => name !== GIT_READ_TOOL_NAME));
@@ -502,10 +561,10 @@ export class DeferredToolManager {
   /**
    * Stable deferred discovery set: the authorized catalog at the live
    * permission ceiling minus the role's baseline automatically-loaded tools
-   * (search_tools itself is baseline and excluded). Derived from the captured
+   * (tool_search itself is baseline and excluded). Derived from the captured
    * boundary's frozen initialActiveNames — never from mutable activation
    * state — so search activations cannot change startup guidance or the
-   * search_tools description (no needless prompt-cache invalidation). Only
+   * tool_search description (no needless prompt-cache invalidation). Only
    * role/mode/permission boundary changes (and live registry reconciliation)
    * recompute this set.
    */
@@ -521,7 +580,7 @@ export class DeferredToolManager {
   }
 
   /**
-   * The search_tools description must itself disclose the deferred discovery
+   * The tool_search description must itself disclose the deferred discovery
    * set — compact comma-delimited names only, never per-name usage prose —
    * filtered by the live operating-mode permission and excluding the
    * baseline-loaded tools. It is byte-identical across search activations;
@@ -529,7 +588,7 @@ export class DeferredToolManager {
    * no names, so it can never disclose an unauthorized or stale set.
    */
   private renderSearchToolDescription(): string {
-    const base = "Activate authorized tools. If names are known, query only exact tool names; otherwise use capability terms. Loading never performs the operation. Native exposure is explained on match, never activated.";
+    const base = "Activate authorized tools. If names are known, query only exact tool names; otherwise use capability terms. Loading never performs the operation.";
     if (!this.boundary || this.registryUnreadable) return base;
     const names = [...this.deferredDiscoveryNames()].sort(compareToolNames);
     return names.length === 0 ? base : `${base} Authorized tool names: ${names.join(", ")}.`;
@@ -542,7 +601,7 @@ export class DeferredToolManager {
     // and fail-closed sessions must not be promised an inventory that is not
     // injected.
     if (!this.boundary || this.registryUnreadable || this.deferredDiscoveryNames().size === 0) {
-      return `No system-prompt inventory is provided; search_tools only activates authorized tools. ${rules}`;
+      return `No system-prompt inventory is provided; tool_search only activates authorized tools. ${rules}`;
     }
     return `Authorized names are listed in the system prompt. ${rules}`;
   }
@@ -554,7 +613,10 @@ export class DeferredToolManager {
       description: this.renderSearchToolDescription(),
       promptSnippet: this.renderSearchToolSnippet(),
       executionMode: "sequential" as const,
-      parameters: {
+      // The host-native schema reference when one was resolved at late
+      // registration (identity Pi's own tool_search recognition requires);
+      // the local fallback otherwise. Never cloned or mutated.
+      parameters: this.nativeSearchParameters ?? {
         type: "object",
         properties: {
           query: {
@@ -573,7 +635,7 @@ export class DeferredToolManager {
   }
 
   /**
-   * Re-register search_tools only when the rendered description or snippet
+   * Re-register tool_search only when the rendered description or snippet
    * changed (mode switch, deferred toggle, boundary capture, or live
    * registry reconciliation). Same-name registerTool replacement is the
    * documented Pi override path; no invented host API. Registration is
@@ -635,7 +697,7 @@ export class DeferredToolManager {
     this.reconcile();
     const trimmed = typeof name === "string" ? name.trim() : "";
     if (!trimmed) return false;
-    // search_tools is the loader itself: startup must have succeeded and the
+    // tool_search is the loader itself: startup must have succeeded and the
     // loader must still answer every live rule below — registry-visible,
     // non-hidden, exposure-legal for the mode of the call, and currently part
     // of the manager's selection (#review-0003). A removed, hidden, replaced,
@@ -799,6 +861,7 @@ export class DeferredToolManager {
     if (drops.length > 0) {
       const dropSet = new Set(drops);
       desired = desired.filter((name) => !dropSet.has(name));
+      this.loaderSelectionNames = this.loaderSelectionNames.filter((name) => !dropSet.has(name));
       if (boundary.dynamic) {
         authorizedNames = new Set([...authorizedNames].filter((name) => !dropSet.has(name)));
         for (const name of drops) withdrawnNames.add(name);
@@ -806,31 +869,23 @@ export class DeferredToolManager {
     }
 
     if (boundary.dynamic) {
-      const nativeToolSearchSelected = registryEntries.has(PI_NATIVE_TOOL_SEARCH_NAME)
-        && isPiNativeToolSearch(registryEntries.get(PI_NATIVE_TOOL_SEARCH_NAME)!)
-        && activeToolNamesOf(this.pi).includes(PI_NATIVE_TOOL_SEARCH_NAME);
       const adopted = [...registryEntries.keys()].filter((name) =>
         !authorizedNames.has(name)
         && (name !== CODEMODE_TOOL_NAME || withdrawnNames.has(name))
         && liveAvailable(name)
-        // Pi's builtin loader is a narrow exception to the baseline rule: a
-        // dynamic host may select it after native MCP exposure becomes
-        // available. Its registry presence alone never grants authorization.
         // Baseline names need a recorded withdrawal, except for the narrowly
-        // seeded hidden-native-MCP marker described at capture.
-        && (name === PI_NATIVE_TOOL_SEARCH_NAME
-          ? nativeToolSearchSelected
-          : !registryBaselineNames.has(name) || withdrawnNames.has(name)));
+        // seeded hidden-native-MCP marker described at capture. The loader
+        // itself is baseline-registered and special-cased outside authority.
+        && (!registryBaselineNames.has(name) || withdrawnNames.has(name)));
       if (adopted.length > 0) {
         authorizedNames = new Set([...authorizedNames, ...adopted]);
         for (const name of adopted) withdrawnNames.delete(name);
         // Deferred-off loads newly adopted ordinary tools, but native
-        // codemode/deferred callees stay governed by Pi's own declarations.
-        // Deferred-on keeps every adopted tool in discovery until search.
+        // codemode/deferred callees stay undeclared until this loader's search
+        // activates them. Deferred-on keeps every adopted tool in discovery.
         if (!this.sessionDeferred) {
           const ordinaryAdopted = adopted.filter((name) =>
-            name !== PI_NATIVE_TOOL_SEARCH_NAME
-            && !isNativeCallableExposure(registryEntries.get(name)?.exposure)
+            !isNativeCallableExposure(registryEntries.get(name)?.exposure)
           );
           desired = desireAdd(desired, ordinaryAdopted);
         }
@@ -843,7 +898,7 @@ export class DeferredToolManager {
         // Wrapper default authorizes discovery only (#224 correction): the
         // codemode registration joins authority and the deferred discovery
         // set, but never the initial/base active set and never a default
-        // activation — search_tools is required before use in deferred-on
+        // activation — tool_search is required before use in deferred-on
         // sessions. A native auto activation is likewise not promoted: the
         // next managed write strips it. Deferred-off runs the ordinary
         // full-active set, so the newly authorized codemode joins the
@@ -856,23 +911,28 @@ export class DeferredToolManager {
     // Rebuilt base plus retained selections: the live-intersected base
     // (baseline initial-active tools, or any live authorized tool while
     // deferred tools are off) resumes its normal state, the loader follows
-    // the base as always, and retained non-base selections (search
-    // activations that survived the prune) re-append after it in their
-    // existing order. Loaded deferred selections that were withdrawn are
-    // never auto-reenabled — restoration requires search loading again — and
-    // consecutive reconciles never churn the managed write layout.
+    // the base as always, and retained non-base selections re-append after it
+    // in their existing order. A retained name is either an ordinary tool
+    // (existing search/toggle behavior) or an explicit loader selection for a
+    // native codemode/deferred exposure (#279: the loader is their sole
+    // declaration path). A name whose live exposure became native-callable
+    // after it was auto-declared by a previous mode or exposure state must
+    // not be re-declared here — only tool_search may declare it, and its
+    // native script callability is unaffected by the strip. Loaded deferred
+    // selections that were withdrawn are never auto-reenabled — restoration
+    // requires search loading again — and consecutive reconciles never churn
+    // the managed write layout.
     const nativeCallableNames = new Set([...registryEntries.values()]
       .filter((tool) => isNativeCallableExposure(tool.exposure))
       .map((tool) => tool.name));
-    desired = desired.filter((name) => !nativeCallableNames.has(name)
-      && name !== PI_NATIVE_TOOL_SEARCH_NAME);
     const rebuiltBase = (this.sessionDeferred ? initialActiveNames : [...authorizedNames])
       .filter((name) => liveAvailable(name)
-        && !nativeCallableNames.has(name)
-        && name !== PI_NATIVE_TOOL_SEARCH_NAME)
+        && !nativeCallableNames.has(name))
       .concat(DEFERRED_TOOL_SEARCH_NAME);
     const rebuiltSet = new Set(rebuiltBase);
-    desired = [...rebuiltBase, ...desired.filter((name) => !rebuiltSet.has(name))];
+    desired = [...rebuiltBase, ...desired.filter((name) =>
+      !rebuiltSet.has(name)
+      && (!nativeCallableNames.has(name) || this.loaderSelectionNames.includes(name)))];
 
     const catalog = [...authorizedNames]
       .filter(liveAvailable)
@@ -892,21 +952,6 @@ export class DeferredToolManager {
     });
     this.boundary = next;
     this.desiredActiveNames = desired;
-    if (this.nativeDeclarationState) {
-      const liveNativeNames = new Set(catalog
-        .filter(isNativeDeclarationSelection)
-        .map((tool) => tool.name));
-      for (const name of this.nativeDeclarationState.selectedNames) {
-        if (!liveNativeNames.has(name)) this.nativeDeclarationState.selectedNames.delete(name);
-      }
-      const observed = this.nativeDeclarationState.lastObservedNativeNames
-        ?? this.nativeDeclarationState.lastManagedNames;
-      if (observed) {
-        this.nativeDeclarationState.lastObservedNativeNames = new Set(
-          [...observed].filter((name) => liveNativeNames.has(name)),
-        );
-      }
-    }
     authorizationBoundaryRegistry()?.set(this.sessionIdentity, next);
   }
 
@@ -926,13 +971,21 @@ export class DeferredToolManager {
     this.reapply();
     const query = searchQuery(params);
     if (!query) {
-      return textResult(`Invalid search_tools request: query must contain 1-${MAX_QUERY_CHARS} characters.`, true, {
+      return textResult(`Invalid tool_search request: query must contain 1-${MAX_QUERY_CHARS} characters.`, true, {
         outcome: "invalid",
       });
     }
     const terms = searchTerms(query);
     if (terms.length === 0) {
-      return textResult("Invalid search_tools request: query must contain searchable terms.", true, {
+      return textResult("Invalid tool_search request: query must contain searchable terms.", true, {
+        outcome: "invalid",
+      });
+    }
+    // The approved native limit contract: a supplied positive integer or the
+    // native default of 8; anything else fails explicitly like an invalid query.
+    const limit = searchLimit(params);
+    if (limit === undefined) {
+      return textResult("Invalid tool_search request: limit must be a positive integer.", true, {
         outcome: "invalid",
       });
     }
@@ -969,10 +1022,15 @@ export class DeferredToolManager {
         activated: [],
         matched: [],
         alreadyActive: [],
-        nativeAvailable: [],
         outcome: "no-match",
       });
     }
+    // The limit caps the strongest-tier results of this call only (matching
+    // and tiering above are untouched): the withheld strongest-tier matches
+    // are reported truthfully through the omitted count, while the discovery
+    // inventory surfaces stay complete and uncapped.
+    const limited = selected.slice(0, limit);
+    const omittedCount = selected.length - limited.length;
 
     const active = new Set(this.computeActiveNames());
     // #73: a visible GitRead is host-active by the mode/catalog pin, not by
@@ -981,67 +1039,47 @@ export class DeferredToolManager {
     if (this.gitReadVisible()) active.add(GIT_READ_TOOL_NAME);
     const activated: string[] = [];
     const alreadyActive: string[] = [];
-    const nativeAvailable: string[] = [];
-    for (const match of selected) {
+    for (const match of limited) {
       // The catalog is already authorization-filtered. Keep this explicit
       // guard so a future catalog refactor cannot turn metadata into authority.
       if (!this.boundary.authorizedNames.has(match.name)) continue;
-      // Native-callable exposures remain native even while deferred tools are
-      // off. Never report them as directly activated or already directly loaded.
-      const entry = this.boundary.catalog.find((tool) => tool.name === match.name);
-      if (isNativeCallableExposure(entry?.exposure)) {
-        nativeAvailable.push(match.name);
-        continue;
-      }
       if (active.has(match.name)) {
         alreadyActive.push(match.name);
         continue;
       }
-      // Only ordinary direct/model-only tools reach gate-managed activation.
-      // Pi's native loader stores its selection in the separate declaration
-      // state so a later Pi deselection cannot be undone by this search.
+      // Every authorized match — ordinary, codemode/deferred-exposure, and MCP
+      // tools alike — is declared for the next model call by this loader. The
+      // activation never executes the matched operation, and native script
+      // callability of codemode/deferred exposures is unchanged by it.
       active.add(match.name);
-      if (entry && isPiNativeToolSearch(entry)) {
-        this.nativeDeclarationState!.selectedNames.add(match.name);
-      } else {
+      if (!this.desiredActiveNames.includes(match.name)) {
         this.desiredActiveNames.push(match.name);
+        this.loaderSelectionNames.push(match.name);
+      } else if (!this.loaderSelectionNames.includes(match.name)) {
+        this.loaderSelectionNames.push(match.name);
       }
       activated.push(match.name);
     }
     this.reapply();
 
-    const matchedNames = selected.map((match) => match.name);
+    const matchedNames = limited.map((match) => match.name);
     const lines: string[] = [`Matched authorized tools: ${matchedNames.join(", ")}.`];
+    if (omittedCount > 0) {
+      lines.push(`${omittedCount} additional strongest-tier match(es) were omitted by the limit.`);
+    }
     if (activated.length > 0) {
       lines.push(
-        `Activated: ${activated.join(", ")}. Call the required tool on the next turn; search_tools did not perform the operation.`,
+        `Activated: ${activated.join(", ")}. Call the required tool on the next turn; tool_search did not perform the operation.`,
       );
     } else if (alreadyActive.length > 0) {
-      lines.push("All matched authorized tools were already active. search_tools did not perform the operation.");
-    } else if (nativeAvailable.length > 0) {
-      lines.push("No direct declaration changed: the matched tools are already reachable through their native exposure. search_tools did not activate or perform anything.");
-    }
-    for (const name of nativeAvailable) {
-      const exposure = this.boundary.catalog.find((tool) => tool.name === name)!.exposure;
-      lines.push(
-        exposure === "deferred"
-          ? `"${name}" has deferred exposure and stays undeclared to the model; native tool_search can find, load, and declare it.`
-          : `"${name}" has codemode exposure and is callable from codemode scripts while it is inactive; native tool_search can also load and declare it. search_tools left its direct declaration unchanged.`,
-      );
+      lines.push("All matched authorized tools were already active. tool_search did not perform the operation.");
     }
     return textResult(lines.join("\n"), false, {
       activated,
       alreadyActive,
       matched: matchedNames,
-      nativeAvailable,
-      omitted: 0,
-      outcome: activated.length > 0
-        ? "activated"
-        : alreadyActive.length > 0
-          ? "already-active"
-          : nativeAvailable.length > 0
-            ? "native-available"
-            : "no-match",
+      omitted: omittedCount,
+      outcome: activated.length > 0 ? "activated" : "already-active",
     });
   }
 }
@@ -1083,27 +1121,6 @@ function authorizationBoundaryRegistry(): WeakMap<object, AuthorizationBoundary>
   const registry = new WeakMap<object, AuthorizationBoundary>();
   try {
     Object.defineProperty(processState, BOUNDARY_REGISTRY_KEY, {
-      value: registry,
-      configurable: false,
-      enumerable: false,
-      writable: false,
-    });
-  } catch {
-    return undefined;
-  }
-  return registry;
-}
-
-function nativeDeclarationRegistry(): WeakMap<object, NativeDeclarationState> | undefined {
-  const processState = globalThis as unknown as Record<PropertyKey, unknown>;
-  const existing = processState[NATIVE_DECLARATION_REGISTRY_KEY];
-  if (existing instanceof WeakMap) {
-    return existing as WeakMap<object, NativeDeclarationState>;
-  }
-  if (existing !== undefined) return undefined;
-  const registry = new WeakMap<object, NativeDeclarationState>();
-  try {
-    Object.defineProperty(processState, NATIVE_DECLARATION_REGISTRY_KEY, {
       value: registry,
       configurable: false,
       enumerable: false,
@@ -1161,11 +1178,12 @@ function createAuthorizationBoundary(input: {
  * registry's native-callable exposures (codemode/deferred stay callable from
  * scripts while inactive, so a registry-present match without activation is
  * authorization metadata — never promoted to declaration here), plus
- * launch-known native discovery and GitRead. Pi's model-only tool_search joins
- * dynamic authority only after Pi actively selects it; registry presence alone
- * does not authorize or activate the helper. A wrapper codemode default adds
- * an inactive registered codemode to authorization (discovery only — it never
- * joins the initial/base active set and search_tools is required before use);
+ * launch-known native discovery and GitRead. The loader itself (#279) is
+ * registered under Pi's replaceable builtin `tool_search` name before capture,
+ * stays outside authority like every other loader, and is special-cased in the
+ * active-set write and call gate instead. A wrapper codemode default adds an
+ * inactive registered codemode to authorization (discovery only — it never
+ * joins the initial/base active set and tool_search is required before use);
  * an already-active codemode is captured as usual regardless of the flag, and
  * a registry-absent codemode is never force-enabled (explicit restrictions
  * win).
@@ -1205,7 +1223,7 @@ function captureAuthorizationBoundary(pi: DeferredToolHost, codemodeDefault: boo
   const codemodeEntry = metadataByName.get(CODEMODE_TOOL_NAME);
   if (codemodeDefault && codemodeEntry && codemodeEntry.exposure !== "hidden" && !activeNames.has(CODEMODE_TOOL_NAME)) {
     // Wrapper default authorizes discovery only (#224 correction): codemode
-    // stays outside the initial/base active set — search_tools is required
+    // stays outside the initial/base active set — tool_search is required
     // before use, and a native auto activation is never promoted either.
     authorizedNames.add(CODEMODE_TOOL_NAME);
   }
@@ -1243,11 +1261,11 @@ function captureAuthorizationBoundary(pi: DeferredToolHost, codemodeDefault: boo
  * absent or hidden; live registry intersection still withholds them. Native
  * codemode/deferred exposures are callable ceiling names, not model
  * declarations, so they may legitimately be inactive at launch even when the
- * CLI allowlist includes them. Pi's model-only tool_search may likewise be
- * inactive inside the fixed ceiling, but is activated only by a native Pi choice.
+ * CLI allowlist includes them; this loader declares them only on an explicit
+ * tool_search activation (#279).
  * A missing ordinary tool promised by
  * `initialActiveTools` remains a broken bootstrap and fails closed, as does
- * any missing `search_tools` activation.
+ * any missing `tool_search` activation.
  */
 function captureConfiguredAuthorizationBoundary(
   pi: DeferredToolHost,
@@ -1304,8 +1322,7 @@ function captureConfiguredAuthorizationBoundary(
     // instruction to Pi to declare a model tool. The CLI `--tools` list may
     // authorize these worker callees while Pi correctly keeps them inactive.
     if (!launchActive.has(name)
-      && !isNativeCallableExposure(entry.exposure)
-      && !isPiNativeToolSearch(entry)) return undefined;
+      && !isNativeCallableExposure(entry.exposure)) return undefined;
   }
   const authorizedNames = new Set(normalized.allowedToolCatalog);
   const catalog = normalized.allowedToolCatalog
@@ -1345,15 +1362,6 @@ function configuredCatalogMatchesBoundary(
       && boundary.initialActiveNames.every((name, index) => name === normalized.initialActiveTools[index]);
   } catch {
     return false;
-  }
-}
-
-function readActiveToolNames(pi: DeferredToolHost): string[] | undefined {
-  try {
-    const active = pi.getActiveTools();
-    return Array.isArray(active) ? normalizedActiveNames(active) : undefined;
-  } catch {
-    return undefined;
   }
 }
 
@@ -1416,14 +1424,6 @@ function isNativeMcpCeilingSlot(name: string): boolean {
   return isCanonicalNativeMcpToolName(name) || NATIVE_MCP_RESOURCE_HELPER_NAMES.has(name);
 }
 
-function isPiNativeToolSearch(tool: ToolMetadata): boolean {
-  return tool.name === PI_NATIVE_TOOL_SEARCH_NAME && tool.exposure === "model-only";
-}
-
-function isNativeDeclarationSelection(tool: ToolMetadata): boolean {
-  return isNativeCallableExposure(tool.exposure) || isPiNativeToolSearch(tool);
-}
-
 function matchTool(tool: ToolMetadata, query: string, terms: readonly string[]): SearchMatch | undefined {
   const name = tool.name.toLocaleLowerCase("en-US");
   const description = tool.description.toLocaleLowerCase("en-US");
@@ -1457,6 +1457,13 @@ function searchQuery(params: unknown): string | undefined {
   return query && query.length <= MAX_QUERY_CHARS ? query : undefined;
 }
 
+/** The approved native limit: a supplied positive integer, else the native default of 8. */
+function searchLimit(params: unknown): number | undefined {
+  if (!isRecord(params) || params.limit === undefined) return DEFAULT_SEARCH_LIMIT;
+  const value = params.limit;
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
 function searchTerms(query: string): string[] {
   return [...new Set(query.match(/[\p{L}\p{N}_-]+/gu) ?? [])];
 }
@@ -1469,7 +1476,12 @@ function compareToolNames(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function isDeferredToolHost(value: unknown): value is DeferredToolHost {
+/**
+ * The narrow host capability the deferred manager needs (exported so the
+ * entrypoint can preserve its unsupported-host early return without a
+ * factory-time tool registration).
+ */
+export function isDeferredToolHost(value: unknown): value is DeferredToolHost {
   return isRecord(value)
     && typeof value.registerTool === "function"
     && typeof value.getActiveTools === "function"

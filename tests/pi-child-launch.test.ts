@@ -415,7 +415,7 @@ test("delegated Pi RPC executor launches the default pi child alias-independentl
     // extension discovery stays available to the worker.
     const extension = argv[argv.indexOf("--extension") + 1];
     assert.ok(extension.endsWith("index.js"), `the review-gate extension must load in the child, got ${extension}`);
-    assert.equal(argv[argv.indexOf("--tools") + 1], "read,grep,find,ls,search_tools");
+    assert.equal(argv[argv.indexOf("--tools") + 1], "read,grep,find,ls,tool_search");
     assert.ok(!argv.includes("--no-extensions"), "the worker must not suppress discovered extensions");
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -807,7 +807,7 @@ test("real Pi RPC executor registers this build and authorized discovered third-
     "--session-id", bootstrap.sessionId,
     "--session-dir", sessionsDir,
     "--extension", candidateEntry,
-    "--tools", "read,ApplyPatch,prg-probe-tool,search_tools",
+    "--tools", "read,ApplyPatch,prg-probe-tool,tool_search",
   ], {
     cwd: sandbox,
     shell: false,
@@ -855,7 +855,7 @@ test("real Pi RPC executor registers this build and authorized discovered third-
     }
     assert.ok(existsSync(probeResult), `executor probe command never ran: ${startupFailure ?? ""}\n${rpc.lines.slice(-20).join("\n")}`);
     const probe = JSON.parse(await readFile(probeResult, "utf8")) as { activeTools: string[]; registeredTools: string[] };
-    for (const name of ["ApplyPatch", "prg-probe-tool", "search_tools"]) {
+    for (const name of ["ApplyPatch", "prg-probe-tool", "tool_search"]) {
       assert.ok(probe.activeTools.includes(name),
         `authorized executor tool ${name} must be active; got ${probe.activeTools.join(", ") || "(none)"}`);
       assert.ok(probe.registeredTools.includes(name),

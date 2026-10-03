@@ -496,7 +496,7 @@ The real-runtime regression in `tests/browser-native-error.test.ts` accepts
 Without that runtime path the optional contract test is explicitly skipped.
 
 The interactive tools are registered only through the Pi extension surface and are
-authorized but inactive initially when deferred tools are enabled. Use `search_tools`
+authorized but inactive initially when deferred tools are enabled. Use `tool_search`
 with the exact tool name to load one. `BrowserScreenshot` checks the current Pi model's
 input contract before capture; when image input is unavailable (or the host does not
 provide a model capability contract), it returns a clear error and directs the caller
@@ -507,7 +507,7 @@ execute Pi roles receive `BrowserConsole`, `BrowserNetwork`, `BrowserInspect`,
 `BrowserClipboard`; research Pi roles receive observational
 `BrowserConsole`, `BrowserNetwork`, `BrowserInspect`, and `BrowserHover` but none of the click/form-action tools. Authorized names appear in each
 role's startup system-prompt inventory — each deferred-authorized name with a tiny
-purpose summary — and in the `search_tools` tool description at live permissions,
+purpose summary — and in the `tool_search` tool description at live permissions,
 while schemas remain deferred until activation. The discovery set is each role's
 authorized names minus the tools that role loads automatically at baseline; those
 baseline-loaded tools are omitted from both surfaces. The startup inventory is a

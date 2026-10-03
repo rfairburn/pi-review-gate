@@ -89,7 +89,7 @@ function toolEnd(fixture: NativeMcpFixture, name: string): FixtureEvent | undefi
 
 function matchSearchResult(fixture: NativeMcpFixture, name: string, pattern: RegExp): void {
   const event = toolEnd(fixture, name);
-  assert.ok(event, `Pi should report search_tools completion for ${name}`);
+  assert.ok(event, `Pi should report tool_search completion for ${name}`);
   assert.match(JSON.stringify(event.result), pattern);
 }
 
@@ -102,7 +102,7 @@ test("native MCP host callees stay outside gate declarations when deferred tools
   });
   if (!nativeHost) return;
   const nativeEchoName = mcpToolName(nativeHost.serverName, "echo");
-  const nativeInitial = await nativeHost.probeDump();
+  const nativeInitial = await nativeHost.waitForRegisteredTools([nativeEchoName]);
   assert.equal(observedTool(nativeInitial, "tool_search").exposure, "model-only");
   assert.ok(!nativeInitial.activeTools?.includes("tool_search"), "the native helper starts inactive before Pi selects it");
   await nativeHost.runCommand("/native-select-tool-search");
@@ -126,10 +126,12 @@ test("native MCP host callees stay outside gate declarations when deferred tools
 
   const echoName = mcpToolName(host.serverName, "echo");
   const counterName = mcpToolName(host.serverName, "counter");
-  const initial = await host.probeDump();
+  const initial = await host.waitForRegisteredTools([echoName, counterName]);
   const nativeToolSearchName = "tool_search";
-  assert.equal(observedTool(initial, nativeToolSearchName).exposure, "model-only");
-  assert.ok(!initial.activeTools?.includes(nativeToolSearchName), "an unselected builtin helper remains inactive under deferred-off");
+  // The gate loader replaces Pi's builtin tool_search: it is an ordinary
+  // registered tool, active from startup as part of the managed set.
+  assert.equal(observedTool(initial, nativeToolSearchName).exposure, "direct");
+  assert.ok(initial.activeTools?.includes(nativeToolSearchName), "the gate loader is declared from startup under deferred-off");
   assert.equal(observedTool(initial, echoName).exposure, REGISTERED_EXPOSURE_FOR_CODENAME_SERVER);
   assert.equal(observedTool(initial, counterName).exposure, REGISTERED_EXPOSURE_FOR_CODENAME_SERVER);
   assert.ok(initial.activeTools?.includes("codemode"), "wrapper-authorized root codemode is ordinary and selected while deferred tools are off");
@@ -145,16 +147,16 @@ test("native MCP host callees stay outside gate declarations when deferred tools
 
   await host.runCommand("/native-select-tool-search");
   const afterNativeSelection = await host.probeDump();
-  assert.ok(afterNativeSelection.activeTools?.includes(nativeToolSearchName), "a native Pi choice is present before managed reapply");
+  assert.ok(afterNativeSelection.activeTools?.includes(nativeToolSearchName), "the loader stays selected across the external active-set write");
   await host.setTurnScript([{
     toolCalls: [{ toolName: nativeToolSearchName, arguments: { query: echoName } }],
   }]);
-  await host.promptTurn("Use Pi's native tool_search to load the permitted fixture echo tool.");
+  await host.promptTurn("Use the gate tool_search to load the permitted fixture echo tool.");
   const candidateNativeSearchEnd = toolEnd(host, nativeToolSearchName);
-  assert.ok(candidateNativeSearchEnd, "the selected native tool_search remains callable through the gate");
+  assert.ok(candidateNativeSearchEnd, "the gate loader remains callable through the gate");
   const afterNativeSearch = await host.probeDump();
-  assert.ok(afterNativeSearch.activeTools?.includes(echoName), `native tool_search loads authorized echo: ${JSON.stringify(candidateNativeSearchEnd.result)}`);
-  assert.ok(afterNativeSearch.activeTools?.includes(counterName), "native server search may select its permitted server tools as a loadout");
+  assert.ok(afterNativeSearch.activeTools?.includes(echoName), `the gate loader declares authorized echo: ${JSON.stringify(candidateNativeSearchEnd.result)}`);
+  assert.ok(!afterNativeSearch.activeTools?.includes(counterName), "exact-name search activates only the matched tool");
   const nativeDirectMessage = "candidate-native-tool-search-call";
   await host.setTurnScript([{
     toolCalls: [{ toolName: echoName, arguments: { message: nativeDirectMessage } }],
@@ -164,13 +166,12 @@ test("native MCP host callees stay outside gate declarations when deferred tools
   assert.deepEqual((await host.readServerEvents()).find((event) => event.event === "tool_call" && event.tool === "echo")?.arguments, { message: nativeDirectMessage });
 
   await host.setTurnScript([{
-    toolCalls: [{ toolName: "search_tools", arguments: { query: echoName } }],
+    toolCalls: [{ toolName: "tool_search", arguments: { query: echoName } }],
   }]);
   await host.promptTurn("Discover the native fixture echo tool.");
-  matchSearchResult(host, "search_tools", /native-available[\s\S]*mcp__|native exposure/i);
+  matchSearchResult(host, "tool_search", /already active[\s\S]*mcp__|All matched authorized tools were already active/i);
   const afterSearch = await host.probeDump();
-  assert.ok(afterSearch.activeTools?.includes(echoName), "review-gate discovery preserves Pi's earlier native declaration");
-  assert.ok(afterSearch.activeTools?.includes(counterName), "review-gate discovery preserves Pi's entire native tool_search loadout");
+  assert.ok(afterSearch.activeTools?.includes(echoName), "the loader's earlier activation persists across discovery");
 
   const message = "candidate-host-native-exposure";
   await host.setTurnScript([{
@@ -188,8 +189,8 @@ test("native MCP host callees stay outside gate declarations when deferred tools
   assert.deepEqual(hostEvents.filter((event) => event.event === "tool_call" && event.tool === "echo")[1]?.arguments, { message });
   assert.equal(await host.readCounter(), 1, "the authorized native counter call has a real fixture-local effect");
   const afterCalls = await host.probeDump();
-  assert.ok(afterCalls.activeTools?.includes(echoName), "Pi's selected native echo stays declared across the nested call");
-  assert.ok(afterCalls.activeTools?.includes(counterName), "Pi's selected native counter stays declared across the nested call");
+  assert.ok(afterCalls.activeTools?.includes(echoName), "the loader-declared echo stays declared across the nested call");
+  assert.ok(!afterCalls.activeTools?.includes(counterName), "nested script reachability never promotes the counter into a declaration");
   assert.ok(toolEnd(host, "codemode"), "Pi reports the model-facing root codemode execution");
 
   const beforeRotation = (await host.readServerEvents()).length;
@@ -204,16 +205,16 @@ test("native MCP host callees stay outside gate declarations when deferred tools
     undefined,
     beforeRotation,
   ), "native Pi should refresh the withdrawn tool list");
-  const rotated = await host.probeDump();
+  const withdrawnEcho = mcpToolName(host.serverName, "echo_second");
+  const rotated = await host.waitForRegisteredTools([withdrawnEcho]);
   assert.equal(observedTool(rotated, echoName).exposure, "hidden", "Pi metadata records the withdrawn registration as hidden");
   assert.ok(!rotated.activeTools?.includes(echoName));
-  const withdrawnEcho = mcpToolName(host.serverName, "echo_second");
   assert.equal(observedTool(rotated, withdrawnEcho).exposure, REGISTERED_EXPOSURE_FOR_CODENAME_SERVER);
   await host.setTurnScript([{
-    toolCalls: [{ toolName: "search_tools", arguments: { query: echoName } }],
+    toolCalls: [{ toolName: "tool_search", arguments: { query: echoName } }],
   }]);
   await host.promptTurn("Search for the withdrawn native echo name.");
-  matchSearchResult(host, "search_tools", /No authorized tools matched/);
+  matchSearchResult(host, "tool_search", /No authorized tools matched/);
 });
 
 test("frozen native Pi worker can discover and call permitted native callees without promotion", { timeout: 300_000 }, async (t) => {
@@ -235,21 +236,21 @@ test("frozen native Pi worker can discover and call permitted native callees wit
 
   const workerEchoName = mcpToolName(worker.serverName, "echo");
   const workerCounterName = mcpToolName(worker.serverName, "counter");
-  const workerInitial = await worker.probeDump();
+  const workerInitial = await worker.waitForRegisteredTools([workerEchoName, workerCounterName]);
   assert.equal(observedTool(workerInitial, workerEchoName).exposure, REGISTERED_EXPOSURE_FOR_CODENAME_SERVER);
   assert.ok(workerInitial.activeTools?.includes("codemode"), "worker CLI ceiling preserves its ordinary root codemode declaration");
-  assert.ok(workerInitial.activeTools?.includes("search_tools"), `worker loader should remain declared: ${JSON.stringify(workerInitial.activeTools)}`);
+  assert.ok(workerInitial.activeTools?.includes("tool_search"), `worker loader should remain declared: ${JSON.stringify(workerInitial.activeTools)}`);
   assert.ok(!workerInitial.activeTools?.includes(workerEchoName), "worker --tools ceiling does not imply a native model declaration");
   assert.ok(!workerInitial.activeTools?.includes(workerCounterName), "the native counter stays undeclared too");
   assert.equal(observedTool(workerInitial, workerCounterName).exposure, REGISTERED_EXPOSURE_FOR_CODENAME_SERVER);
   await worker.setTurnScript([{
-    toolCalls: [{ toolName: "search_tools", arguments: { query: workerEchoName } }],
+    toolCalls: [{ toolName: "tool_search", arguments: { query: workerEchoName } }],
   }]);
   await worker.promptTurn("Discover the permitted native fixture echo tool in the worker.");
-  const workerSearchResult = toolEnd(worker, "search_tools")?.result;
+  const workerSearchResult = toolEnd(worker, "tool_search")?.result;
   const workerAfterSearch = await worker.probeDump();
-  assert.ok(!workerAfterSearch.activeTools?.includes(workerEchoName), "worker discovery does not promote native echo");
-  assert.ok(!workerAfterSearch.activeTools?.includes(workerCounterName));
+  assert.ok(workerAfterSearch.activeTools?.includes(workerEchoName), "the loader declares the in-ceiling native echo for the next call");
+  assert.ok(!workerAfterSearch.activeTools?.includes(workerCounterName), "exact-name search activates only the matched ceiling tool");
 
   const workerMessage = "candidate-worker-native-exposure";
   await worker.setTurnScript([{
@@ -262,24 +263,24 @@ test("frozen native Pi worker can discover and call permitted native callees wit
   assert.deepEqual(
     workerEventsAfterCalls.filter((event) => event.event === "tool_call").map((event) => event.tool),
     ["echo", "counter"],
-    `permitted worker nested calls reach the real MCP protocol server; search_tools result: ${JSON.stringify(workerSearchResult)}; codemode result: ${JSON.stringify(toolEnd(worker, "codemode")?.result)}`,
+    `permitted worker nested calls reach the real MCP protocol server; tool_search result: ${JSON.stringify(workerSearchResult)}; codemode result: ${JSON.stringify(toolEnd(worker, "codemode")?.result)}`,
   );
   assert.deepEqual(workerEventsAfterCalls.find((event) => event.event === "tool_call" && event.tool === "echo")?.arguments, { message: workerMessage });
   assert.equal(await worker.readCounter(), 1, "the permitted worker counter call has a real fixture-local effect");
   const workerCodemodeResult = toolEnd(worker, "codemode")?.result;
   assert.match(JSON.stringify(workerCodemodeResult), /echo:candidate-worker-native-exposure/);
   assert.match(JSON.stringify(workerCodemodeResult), /counter:1/);
-  assert.match(JSON.stringify(workerSearchResult), /native-available[\s\S]*mcp__|native exposure/i,
-    "worker search_tools discovers the authorized native exposure");
+  assert.match(JSON.stringify(workerSearchResult), /activated[\s\S]*mcp__/i,
+    "worker tool_search activates the authorized native exposure");
   const workerAfterCalls = await worker.probeDump();
-  assert.ok(!workerAfterCalls.activeTools?.includes(workerEchoName));
+  assert.ok(workerAfterCalls.activeTools?.includes(workerEchoName), "the loader declaration persists across the nested call");
   assert.ok(!workerAfterCalls.activeTools?.includes(workerCounterName));
 
   await worker.setTurnScript([{ text: "Finished a frozen-worker text-only turn." }]);
   await worker.promptTurn("Reply with the scripted worker text only.");
   const workerAfterText = await worker.probeDump();
-  assert.ok(!workerAfterText.activeTools?.includes(workerEchoName), "frozen-worker reconciliation never declares its permitted native callee");
-  assert.ok(!workerAfterText.activeTools?.includes(workerCounterName));
+  assert.ok(workerAfterText.activeTools?.includes(workerEchoName), "frozen-worker reconciliation retains the loader declaration inside the ceiling");
+  assert.ok(!workerAfterText.activeTools?.includes(workerCounterName), "the unsearched counter stays undeclared");
   assert.equal(await worker.readCounter(), 1, "the worker text-only turn leaves the prior native server effect unchanged");
 
   const beforeWorkerRotation = workerEventsAfterCalls.length;
@@ -295,15 +296,17 @@ test("frozen native Pi worker can discover and call permitted native callees wit
     beforeWorkerRotation,
   ), "native worker Pi should refresh the withdrawn tool list");
   const workerLateEcho = mcpToolName(worker.serverName, "echo_second");
-  const workerAfterRotation = await worker.probeDump();
+  const workerAfterRotation = await worker.waitForRegisteredTools([workerEchoName], (dump) =>
+    dump.allTools?.some((tool) => tool.name === workerEchoName && tool.exposure === "hidden") === true,
+  );
   assert.equal(workerAfterRotation.allTools?.some((tool) => tool.name === workerLateEcho), false,
     "Pi's native CLI mask excludes the late name from worker registry metadata");
   assert.ok(!workerAfterRotation.activeTools?.includes(workerLateEcho), "late native registration stays outside the frozen worker ceiling");
   await worker.setTurnScript([{
-    toolCalls: [{ toolName: "search_tools", arguments: { query: workerLateEcho } }],
+    toolCalls: [{ toolName: "tool_search", arguments: { query: workerLateEcho } }],
   }]);
   await worker.promptTurn("Search for the late native tool outside the worker ceiling.");
-  matchSearchResult(worker, "search_tools", /No authorized tools matched/);
+  matchSearchResult(worker, "tool_search", /No authorized tools matched/);
 
   await worker.setTurnScript([{
     codemode: `try { await tools.${workerLateEcho}({ message: "outside-ceiling" }); return "unexpected success"; }\n`
@@ -317,7 +320,10 @@ test("frozen native Pi worker can discover and call permitted native callees wit
   const workerDeniedResult = toolEnd(worker, "codemode")?.result;
   assert.match(JSON.stringify(workerDeniedResult), /blocked:/);
   const workerAfterDeniedCall = await worker.probeDump();
-  assert.ok(!workerAfterDeniedCall.activeTools?.includes(workerEchoName));
+  // The rotation withdrew `echo` from the live registry, so the loader's
+  // declaration for it is pruned with it; the denied out-of-ceiling attempt
+  // neither restores it nor promotes anything else.
+  assert.ok(!workerAfterDeniedCall.activeTools?.includes(workerEchoName), "the withdrawn echo stays pruned after the denied attempt");
   assert.ok(!workerAfterDeniedCall.activeTools?.includes(workerCounterName));
   assert.ok(!workerAfterDeniedCall.activeTools?.includes(workerLateEcho));
 });

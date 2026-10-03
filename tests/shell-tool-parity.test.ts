@@ -222,10 +222,10 @@ test("an explicit Bash-only worker allowlist never activates registered-but-unau
     initialActiveTools: ["read", "bash"],
   }, true);
   assert.equal(result, true);
-  assert.deepEqual(fixture.active(), ["read", "bash", "search_tools"]);
+  assert.deepEqual(fixture.active(), ["read", "bash", "tool_search"]);
   assert.ok(manager.authorizedToolNames()?.includes("bash"));
   assert.equal(manager.authorizedToolNames()?.includes("powershell"), false);
-  const search = fixture.allNames.find((candidate) => candidate.name === "search_tools") as
+  const search = fixture.allNames.find((candidate) => candidate.name === "tool_search") as
     | { execute?: (id: string, params: unknown) => Promise<Record<string, any>> }
     | undefined;
   assert.ok(search?.execute);
@@ -262,7 +262,7 @@ test("plan-research mode hides both shells from visibility, inventory, and disco
   assert.ok(!fixture.active().includes("powershell"));
   const inventory = manager.startupGuidance() ?? "";
   assert.doesNotMatch(inventory, /"(?:bash|powershell)"/);
-  const search = fixture.allNames.find((candidate) => candidate.name === "search_tools") as
+  const search = fixture.allNames.find((candidate) => candidate.name === "tool_search") as
     | { execute?: (id: string, params: unknown) => Promise<Record<string, any>> }
     | undefined;
   assert.ok(search?.execute);

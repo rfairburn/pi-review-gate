@@ -831,10 +831,10 @@ login/configuration; see [Security model](security-model.md#secrets-and-authenti
 Pi enforces the read-only tool intersection through `--tools`. Launch-authorized native
 read-only discovery (`grep`, `find`, `ls`) is part of the durable initial-active
 subset, so Pi research workers can enumerate paths, search contents, and read matches
-from the first request without a `search_tools` activation step. The structured
+from the first request without a `tool_search` activation step. The structured
 read-only Git history tool `GitRead` belongs to that same subset: whenever the parent's
 authorization carries it, Pi research workers have it active from the first request,
-with no `search_tools` step. Execute-kind tasks never receive `GitRead` — the durable
+with no `tool_search` step. Execute-kind tasks never receive `GitRead` — the durable
 catalog excludes it even when the parent's active set includes it — and an explicit
 child catalog naming it for an execute task fails closed at subset validation.
 Codex uses its

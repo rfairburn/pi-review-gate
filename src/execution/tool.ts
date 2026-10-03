@@ -1051,7 +1051,7 @@ export class ExecutionToolManager {
  * without the script transport even when the parent ceiling or an explicit
  * user tool list carries it. The intersection below denies it on every
  * research task in both deferred settings; codemode exists for execute and
- * orchestrator sessions, which discover and activate it through `search_tools`
+ * orchestrator sessions, which discover and activate it through `tool_search`
  * when deferred tools are enabled, and include it in the ordinary full-active
  * contract when that setting is disabled.
  */

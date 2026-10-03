@@ -15,6 +15,43 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.111]
+
+### Changed
+
+- Replace Pi's builtin `tool_search` with review-gate's own inventory-backed
+  loader registered under the same replaceable name: there is now one
+  model-facing discovery/activation tool, and `search_tools` is no longer part
+  of the tool, prompt, or documentation contract (#279).
+- The loader directly activates authorized matches — ordinary, codemode- and
+  deferred-exposed (including MCP), and model-only tools — declaring their
+  schemas for the next model call without ever executing the matched operation.
+  Exact-name-first matching, the compact discovery inventory in the tool
+  description and startup prompt, native script callability of codemode/deferred
+  exposures, permission gates, the deferred-off setting, operating modes,
+  research visibility, and fixed worker ceilings are unchanged (#279).
+- Supported live MCP changes (server connect/disconnect, `/mcp reconnect`,
+  enablement/exposure changes, and server tool-list notifications) update
+  discovery at Pi's real reconciliation seams without a reload; removed, hidden,
+  or withdrawn tools are pruned from inventory and activation (#279).
+- The loader now registers at session start (after top-level execution tools are
+  synced and before authorization capture) instead of at extension load time, and
+  reuses the host-native `tool_search` parameter schema by exact object reference —
+  borrowed from the live registry when Pi's builtin is loaded, otherwise captured
+  from the running install's own bundled factory. Pi's replaceable-builtin
+  collision pass therefore sees no competing definition, its identity-based
+  tool-search recognition accepts the replacement with the builtin enabled,
+  disabled, or toggled across a reload, and both misleading startup warnings are
+  gone while genuine diagnostics (including the truly-missing discovery warning)
+  remain visible. When no running host resolves the local fallback schema is
+  kept; when a resolved host's native schema cannot be acquired, session start
+  fails explicitly instead of registering the incompatible fallback (#279).
+- `tool_search` honors the native limit contract: a supplied positive integer or
+  the default of eight caps strongest-tier matched/activated results per call,
+  invalid limit values fail explicitly, the omitted count reports exactly what
+  the cap withheld from that call, and the discovery inventory in the loader
+  description and startup prompt stays complete and uncapped (#279).
+
 ## [0.1.0-dev.110]
 
 ### Changed

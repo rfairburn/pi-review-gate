@@ -314,7 +314,7 @@ history — it renders only data the tool already returned.
 Every extension-owned registration with a custom result renderer is covered by one
 shared mechanism in `src/tool-result-expansion.ts` — 40 of the 42 tools registered
 in the top-level runtime (24 web/browser, `ApplyPatch`, `GitRead`, 5 background-shell,
-`search_tools`, `AskUserQuestion`, and 9 subtask tools). `GitRead` and
+`tool_search`, `AskUserQuestion`, and 9 subtask tools). `GitRead` and
 `AskUserQuestion` deliberately register no custom renderer; their results are
 self-describing text rendered through Pi's default text display:
 
@@ -418,7 +418,7 @@ self-describing text rendered through Pi's default text display:
   expanded arm: the complete requested patch envelope and the complete retained final
   diff; on partial failure the view distinguishes applied, failed, and not-attempted
   operations and shows the complete retained failure detail.
-- `search_tools` (`src/deferred-tools.ts`, `src/deferred-tools-result-renderer.ts`)
+- `tool_search` (`src/deferred-tools.ts`, `src/deferred-tools-result-renderer.ts`)
   contributes collapsed and expanded views showing the actual query, matched and
   newly activated tools, and the real activation outcome, preserving the no-match,
   unavailable, invalid-query, and already-active distinctions from the operation

@@ -231,26 +231,26 @@ function toolCall(toolName: string, arguments_: Record<string, unknown>) {
 
 async function runSearchCall(fixture: NativeMcpFixture, query: string): Promise<FixtureEvent> {
   await fixture.setTurnScript([
-    { toolCalls: [toolCall("search_tools", { query })] },
+    { toolCalls: [toolCall("tool_search", { query })] },
     { text: "fixture-search-settled" },
   ]);
   await fixture.promptTurn(`Search authorized tools for ${query}.`);
-  return rootToolResult(fixture, "search_tools", false);
+  return rootToolResult(fixture, "tool_search", false);
 }
 
 test("native candidate: wrapper default requires deferred code discovery, then preserves MCP exposure during real calls", { timeout: 240_000 }, async (t) => {
   const fixture = await startCandidate(t, { wrapperDefault: true, deferredPiTools: true });
   if (!fixture) return;
 
-  const before = await fixture.probeDump();
+  const before = await fixture.waitForRegisteredTools([echoName(fixture), counterName(fixture)]);
   assertMcpRemainsNativeAndInactive(before, fixture);
   assert.equal(requireTool(before, CODEMODE).exposure, "model-only", "root codemode keeps Pi's model-only exposure");
-  assert.ok(before.activeTools?.includes("search_tools"));
+  assert.ok(before.activeTools?.includes("tool_search"));
 
   const gateSearch = await runSearchCall(fixture, CODEMODE);
   assertResultContains(gateSearch, '"activated":["codemode"]');
   const afterGateSearch = await fixture.probeDump();
-  assert.ok(afterGateSearch.activeTools?.includes(CODEMODE), "search_tools loads model-only root codemode");
+  assert.ok(afterGateSearch.activeTools?.includes(CODEMODE), "tool_search loads model-only root codemode");
   assertMcpRemainsNativeAndInactive(afterGateSearch, fixture);
 
   await runSuccessfulCodemodeTurn(fixture, "wrapper-default");
@@ -261,7 +261,7 @@ test("native candidate: deferred-off exposes ordinary codemode without deciding 
   const fixture = await startCandidate(t, { wrapperDefault: true, deferredPiTools: false });
   if (!fixture) return;
 
-  const inventory = await fixture.probeDump();
+  const inventory = await fixture.waitForRegisteredTools([echoName(fixture), counterName(fixture)]);
   assert.ok(inventory.activeTools?.includes(CODEMODE), "deferred-off retains ordinary root codemode availability");
   assert.ok(inventory.activeTools?.includes("read"), "normal direct-exposed tools still load when deferred tools are off");
   assertMcpMetadataRemainsNative(inventory, fixture);
@@ -270,7 +270,7 @@ test("native candidate: deferred-off exposes ordinary codemode without deciding 
   await runCodemodeOnlyTurn(fixture, "deferred-off");
   assertMcpMetadataRemainsNative(await fixture.probeDump(), fixture);
   assert.equal(
-    collectTypedRecords(fixture.sessionEvents).some((event) => event.toolName === "search_tools"),
+    collectTypedRecords(fixture.sessionEvents).some((event) => event.toolName === "tool_search"),
     false,
     "the permitted code call did not depend on a search step when deferred tools are off",
   );
@@ -318,10 +318,10 @@ test("native candidate: plan/research excludes code and every MCP tool with eith
     });
     if (!fixture) return;
 
-    const inventory = await fixture.probeDump();
+    const inventory = await fixture.waitForRegisteredTools([echoName(fixture), counterName(fixture)]);
     requireTool(inventory, CODEMODE);
     assertMcpMetadataRemainsNative(inventory, fixture);
-    assert.doesNotMatch(requireTool(inventory, "search_tools").description ?? "", /codemode|mcp__/i);
+    assert.doesNotMatch(requireTool(inventory, "tool_search").description ?? "", /codemode|mcp__/i);
 
     const codeSearch = await runSearchCall(fixture, CODEMODE);
     assert.doesNotMatch(JSON.stringify(codeSearch.result ?? codeSearch), /"matched":\["codemode"\]|"nativeAvailable":\["codemode"\]/);
@@ -354,13 +354,13 @@ test("native candidate: actual executor-role catalog loads permitted code and re
   });
   if (!fixture) return;
 
-  const initial = await fixture.probeDump();
+  const initial = await fixture.waitForRegisteredTools([echoName(fixture), counterName(fixture)]);
   assertMcpRemainsNativeAndInactive(initial, fixture);
   assert.equal(requireTool(initial, CODEMODE).exposure, "model-only", "executor root codemode keeps Pi's model-only exposure");
   const gateSearch = await runSearchCall(fixture, CODEMODE);
   assertResultContains(gateSearch, '"activated":["codemode"]');
   const afterGateSearch = await fixture.probeDump();
-  assert.ok(afterGateSearch.activeTools?.includes(CODEMODE), "executor search_tools loads its authorized root codemode");
+  assert.ok(afterGateSearch.activeTools?.includes(CODEMODE), "executor tool_search loads its authorized root codemode");
   assertMcpRemainsNativeAndInactive(afterGateSearch, fixture);
   await runSuccessfulCodemodeTurn(fixture, "executor-role");
   assertMcpRemainsNativeAndInactive(await fixture.probeDump(), fixture);

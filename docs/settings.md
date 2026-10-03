@@ -59,7 +59,7 @@ supplies the live switch (the ordinary extension entry point always does):
   [Delegated execution](delegated-execution.md#notifications-and-ui).
 - **Deferred Pi tools** defaults to **On**. Saving **Off** immediately exposes every
   authorized tool in the current top-level Pi session; saving **On** immediately restores
-  the conservative active subset plus `search_tools`. For new mutation-authorized
+  the conservative active subset plus `tool_search`. For new mutation-authorized
   sessions/tasks, `write` starts active alongside `edit` and `ApplyPatch`; planning
   still hides it, explicit exclusions still apply, and previously captured worker
   catalogs retain their recorded initial subsets. The conservative subset always

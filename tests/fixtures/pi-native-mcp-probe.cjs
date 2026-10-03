@@ -313,6 +313,14 @@ module.exports = async function (pi) {
 		return undefined;
 	});
 
+	// --- Reload seam: the public ctx.reload() path (settings + extensions),
+	// registered as an extension command because RPC-mode prompts only route
+	// extension-registered commands, never built-in slash commands. ---
+	pi.registerCommand('native-mcp-reload', {
+		description: 'Reload settings and extensions through the public reload seam (fixture)',
+		handler: async (_args, ctx) => { await ctx.reload(); },
+	});
+
 	// --- Inventory dump command (native extension-command seam) ---
 	pi.registerCommand('native-mcp-probe', {
 		description: 'Write the live session tool/command inventory for the native MCP fixture',

@@ -24,7 +24,7 @@ execution role may do, how tools are discovered, and how results must be reporte
   only use what the parent itself was authorized to use, and a primary cannot gain
   authority it lacked by delegating the same request.
 - Availability ceilings are actual, not assumed. Neither role may invoke a tool by
-  guesswork: consult the startup inventory and the `search_tools` description for this
+  guesswork: consult the startup inventory and the `tool_search` description for this
   role's actual discovery set, then activate with exact names. Baseline tools the
   role loads automatically never need activation.
 
@@ -36,13 +36,13 @@ execution role may do, how tools are discovered, and how results must be reporte
   inactive" list: it stays byte-identical as deferred tools activate, and newly
   activated deferred tools remain listed. It is an index, not the schemas: full
   parameter schemas stay deferred until a tool is activated.
-- The `search_tools` tool description itself carries that same discovery set — the
+- The `tool_search` tool description itself carries that same discovery set — the
   role's authorized names minus its baseline-loaded tools — at live permissions. If a
-  name is known, query `search_tools` with that exact name only; use capability terms
+  name is known, query `tool_search` with that exact name only; use capability terms
   only for names you do not know. Loading never performs the operation — invoke the
   activated tool on the next turn.
 - Do not restate or guess the runtime catalog from memory; the live inventory and
-  `search_tools` are authoritative, and absence from the summary never means absence
+  `tool_search` are authoritative, and absence from the summary never means absence
   of authority — baseline tools are already loaded. The set rebuilds only when the
   real role, mode, or permission boundary changes. Detailed usage for the
   capabilities below lives in this skill.

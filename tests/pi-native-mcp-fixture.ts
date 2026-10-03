@@ -63,7 +63,7 @@
  * executor role exactly like the production Pi executor adapter — the fixed
  * provided catalog through `PI_REVIEW_GATE_RUNTIME_ROLE` +
  * `PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG`, one native `--tools` allowlist of
- * the captured allowed capabilities + `search_tools`, and a fresh synthetic
+ * the captured allowed capabilities + `tool_search`, and a fresh synthetic
  * settlement bootstrap created under the fixture scratch through the
  * production settlement helpers. All role values are synthetic and declared;
  * no inherited `PI_REVIEW_GATE_*` variable or provider key is ever copied,
@@ -335,7 +335,7 @@ function prepareExecutorToolCatalog(catalog: ExecutorToolCatalog): ExecutorToolC
 /**
  * The single native `--tools` allowlist the helper owns for executor-role
  * launches, byte-for-byte like the production adapter's childArgs: every
- * captured allowed capability plus `search_tools` (the sole control tool
+ * captured allowed capability plus `tool_search` (the sole control tool
  * outside the durable capability catalog), deduplicated, never auto-widened.
  */
 function executorLaunchToolList(catalog: ExecutorToolCatalog): string[] {
@@ -438,6 +438,12 @@ export interface NativeMcpFixtureOptions {
 	/** Start with an empty project mcpServers object instead of the default fixture server. Default false. */
 	noMcpServers?: boolean;
 	/**
+	 * Written to `<scratch agent dir>/settings.json` before spawn, so a run can
+	 * exercise real user-level Pi settings (for example toggling the builtin
+	 * tool-search extension with `"extensions": ["-builtin:tool-search"]`).
+	 */
+	agentSettings?: object;
+	/**
 	 * Launch the ACTUAL gate executor role exactly like the production Pi
 	 * executor adapter (`src/execution/adapters/pi-model.ts`): sets
 	 * `PI_REVIEW_GATE_RUNTIME_ROLE="executor"` and
@@ -445,7 +451,7 @@ export interface NativeMcpFixtureOptions {
 	 * through the same production helpers (createExecutorToolCatalog +
 	 * createPiWorkerToolCatalog; never auto-widened; Subtasks* names dropped
 	 * by the shared Pi worker normalization), emits ONE `--tools` allowlist of
-	 * the captured allowed capabilities + `search_tools`, launches with a
+	 * the captured allowed capabilities + `tool_search`, launches with a
 	 * synthetic session id (`--session-id`), and creates a fresh AUTHENTIC
 	 * synthetic settlement bootstrap under the fixture scratch via the production
 	 * createPiSettlementBootstrap/piSettlementEnvironment (random identity +
@@ -515,6 +521,11 @@ export class NativeMcpFixture {
 	/** The pi child's OS pid once spawned (undefined before start() or after a spawn failure). */
 	get childPid(): number | undefined {
 		return this.child?.pid;
+	}
+
+	/** Bounded tail of the pi child's stderr (load-time diagnostics surface). */
+	stderrTailText(): string {
+		return this.stderrTail;
 	}
 
 	// -- Lifecycle -----------------------------------------------------------
@@ -698,6 +709,24 @@ export class NativeMcpFixture {
 		}
 	}
 
+	/** Wait for fresh client-side metadata (optionally a state change); never activate tools. */
+	async waitForRegisteredTools(
+		names: readonly string[],
+		predicate?: (dump: ProbeDump) => boolean,
+	): Promise<ProbeDump> {
+		const deadline = Date.now() + this.timeouts.connectMs;
+		for (;;) {
+			const dump = await this.probeDump();
+			if (names.every((name) => dump.allTools?.some((tool) => tool.name === name))
+				&& (!predicate || predicate(dump))) return dump;
+			if (Date.now() >= deadline) {
+				throw new Error(`native MCP registry did not reach the expected state within ${this.timeouts.connectMs}ms: `
+					+ `${names.join(", ")}; observed ${JSON.stringify(dump.allTools)}\nstderr:\n${this.stderrTail}`);
+			}
+			await delay(50);
+		}
+	}
+
 	/**
 	 * Rotate the advertised tool list to `generation` (>= 2 replaces `echo`
 	 * with `echo_second` and sends `notifications/tools/list_changed`); the
@@ -838,6 +867,9 @@ export class NativeMcpFixture {
 		if (gateConfig !== undefined) {
 			await writeFile(join(piAgentDir, "review-gate.json"), `${JSON.stringify(gateConfig, null, "\t")}\n`, "utf8");
 		}
+		if (this.options.agentSettings !== undefined) {
+			await writeFile(join(piAgentDir, "settings.json"), `${JSON.stringify(this.options.agentSettings, null, "\t")}\n`, "utf8");
+		}
 		this.paths = paths;
 	}
 
@@ -919,7 +951,7 @@ export class NativeMcpFixture {
 		// Executor-role launch shape, byte-for-byte like the production adapter's
 		// childArgs: the synthetic session id is the settlement identity's
 		// session anchor, and ONE --tools allowlist carries the captured allowed
-		// capabilities plus search_tools (the catalog is authoritative; nothing
+		// capabilities plus tool_search (the catalog is authoritative; nothing
 		// is auto-widened).
 		if (executorLaunch) {
 			args.push("--session-id", executorLaunch.sessionId);

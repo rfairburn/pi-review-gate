@@ -13,6 +13,7 @@ import {
   stateFromWaveProgress,
 } from "../src/execution/background-controller";
 import { ExecutionToolManager } from "../src/execution/tool";
+import { createExecutorToolCatalog, type ExecutorToolCatalog } from "../src/execution/tool-catalog";
 import { createState } from "../src/state";
 import { NativeToolCallPreflight } from "../src/tool-call-preflight";
 import { toolCallFingerprint } from "../src/tool-call-fingerprint";
@@ -36,6 +37,8 @@ function harness(options: {
   researchCapable?: boolean;
   resourceCapacity?: number;
   activeTools?: string[];
+  /** Durable-by-reference parent snapshot: tests may mutate the live list mid-run. */
+  liveParentTools?: string[];
   omitActiveToolSnapshot?: boolean;
   deferredPiTools?: boolean;
   submittedFingerprintFor?: (toolCallId: string, toolName: string) => string | undefined;
@@ -55,7 +58,9 @@ function harness(options: {
     setToolActive(name: string, enabled: boolean) { active.push({ name, enabled }); },
   };
   if (!options.omitActiveToolSnapshot) {
-    pi.getActiveTools = () => options.activeTools ?? ["read", "bash", ...executionToolNames];
+    pi.getActiveTools = options.liveParentTools
+      ? () => [...options.liveParentTools!]
+      : () => options.activeTools ?? ["read", "bash", ...executionToolNames];
   }
   const config = normalizeConfig({
     enabled: true,
@@ -1003,6 +1008,291 @@ test("research groups inherit authorized native discovery as durable initial-act
     initialActiveTools: ["read", "grep", "find", "ls"],
   });
   await manager.shutdown();
+});
+
+test("authorized codemode enters execute ceilings search-deferred and is always excluded from research (#224)", async () => {
+  const { tools, manager } = harness({
+    researchCapable: true,
+    activeTools: [
+      "read", "grep", "find", "ls", "bash", "codemode", "edit", "write", "WebFetch",
+      ...executionToolNames,
+    ],
+  });
+  const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+  const shared = {
+    title: "Run tool",
+    instructions: "Do bounded work",
+    acceptanceCriteria: ["Work is complete"],
+  };
+  try {
+    // Execute kind, deferred tools ON (the default): the parent-authorized
+    // pass-through keeps codemode in the durable allowed ceiling, while the
+    // conservative initial order never makes it startup-visible — execute
+    // workers discover and activate it only through search_tools.
+    const execute = await start("codemode-execute", { tasks: [shared] }, undefined, undefined, {});
+    assert.equal(execute.isError, false);
+    const executeCatalog = execute.details.tasks[0].definition.executorToolCatalog;
+    assert.deepEqual(executeCatalog.allowedToolCatalog, [
+      "read", "grep", "find", "ls", "bash", "codemode", "edit", "write", "WebFetch", ...executionToolNames,
+    ]);
+    assert.deepEqual(executeCatalog.initialActiveTools, [
+      "read", "grep", "find", "ls", "bash", "edit", "write", "SubtasksStart",
+    ]);
+    assert.equal((executeCatalog.initialActiveTools as string[]).includes("codemode"), false);
+
+    // Research kind, both deferred settings: the read-only intersection strips
+    // the tool entirely, even though the parent ceiling (or an explicit user
+    // tool list) carries it. No researcher transport or exception.
+    const research = await start("codemode-research", { kind: "research", tasks: [shared] }, undefined, undefined, {});
+    assert.equal(research.isError, false);
+    const researchCatalog = research.details.tasks[0].definition.executorToolCatalog as { allowedToolCatalog: string[]; initialActiveTools: string[] };
+    assert.deepEqual(researchCatalog, {
+      allowedToolCatalog: ["read", "grep", "find", "ls", "WebFetch"],
+      initialActiveTools: ["read", "grep", "find", "ls"],
+    });
+    for (const forbidden of ["codemode", "bash", "write", "edit"]) {
+      assert.equal(researchCatalog.allowedToolCatalog.includes(forbidden), false, forbidden);
+      assert.equal(researchCatalog.initialActiveTools.includes(forbidden), false, forbidden);
+    }
+  } finally {
+    await manager.shutdown();
+    await manager.detach();
+  }
+});
+
+test("codemode absent from the parent ceiling never enters delegated catalogs (#224)", async () => {
+  const { tools, manager } = harness({
+    researchCapable: true,
+    activeTools: ["read", "grep", "find", "ls", "bash", "WebFetch", ...executionToolNames],
+  });
+  const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+  const shared = {
+    title: "No transport",
+    instructions: "Do bounded work",
+    acceptanceCriteria: ["Work is complete"],
+  };
+  try {
+    // The durable ceilings are fixed: an excluded transport is never appended
+    // to the allowed catalog or to the derived CLI --tools of any kind.
+    const execute = await start("codemode-execute-absent", { tasks: [shared] }, undefined, undefined, {});
+    assert.equal(execute.isError, false);
+    const executeCatalog = execute.details.tasks[0].definition.executorToolCatalog as { allowedToolCatalog: string[]; initialActiveTools: string[] };
+    assert.equal(executeCatalog.allowedToolCatalog.includes("codemode"), false);
+    assert.equal(executeCatalog.initialActiveTools.includes("codemode"), false);
+
+    const research = await start("codemode-research-absent", { kind: "research", tasks: [shared] }, undefined, undefined, {});
+    assert.equal(research.isError, false);
+    const researchCatalog = research.details.tasks[0].definition.executorToolCatalog as { allowedToolCatalog: string[]; initialActiveTools: string[] };
+    assert.equal(researchCatalog.allowedToolCatalog.includes("codemode"), false);
+    assert.equal(researchCatalog.initialActiveTools.includes("codemode"), false);
+  } finally {
+    await manager.shutdown();
+    await manager.detach();
+  }
+});
+
+test("deferred-off execute catalogs run authorized codemode full-active through the ordinary contract (#224)", async () => {
+  // Deferred tools OFF: the pre-existing full-active contract is unchanged —
+  // the parent-authorized execute catalog starts with codemode active, with
+  // no special exception for or against the tool.
+  const { tools, manager } = harness({
+    deferredPiTools: false,
+    activeTools: ["read", "bash", "codemode", ...executionToolNames],
+  });
+  const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+  try {
+    const started = await start("codemode-full-active", {
+      tasks: [{
+        title: "Full active tool",
+        instructions: "Do bounded work",
+        acceptanceCriteria: ["Work is complete"],
+      }],
+    }, undefined, undefined, {});
+    assert.equal(started.isError, false);
+    const catalog = started.details.tasks[0].definition.executorToolCatalog;
+    assert.deepEqual(catalog.initialActiveTools, catalog.allowedToolCatalog);
+    assert.equal(catalog.allowedToolCatalog.includes("codemode"), true);
+    assert.equal(catalog.initialActiveTools.includes("codemode"), true);
+  } finally {
+    await manager.shutdown();
+    await manager.detach();
+  }
+});
+
+test("codemode initial visibility follows the durable ceilings; native catalog smuggling stays fail-closed (#224)", async () => {
+  // The parent ceiling stays authoritative at the SubtasksStart surface: a
+  // caller-supplied task catalog is rejected at request normalization —
+  // neither GitRead (#73) nor codemode (#224) nor any other name can be
+  // appended or reshaped through a native request.
+  const { tools, manager } = harness({ activeTools: ["read", "codemode", ...executionToolNames] });
+  const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+  try {
+    const smuggled = await start("codemode-smuggled-catalog", {
+      tasks: [{
+        title: "Rejected",
+        instructions: "Do bounded work",
+        acceptanceCriteria: ["No worker starts"],
+        executorToolCatalog: { allowedToolCatalog: ["read", "codemode"], initialActiveTools: ["read", "codemode"] },
+      }],
+    }, undefined, undefined, {});
+    assert.equal(smuggled.isError, true);
+    assert.match(smuggled.content[0].text, /unsupported tasks\[0\] key executorToolCatalog/);
+  } finally {
+    await manager.shutdown();
+    await manager.detach();
+  }
+
+  // Inside the catalog contract the subset invariant still gates internal
+  // callers: an explicitly named initial set survives untouched, and naming
+  // an unadmitted transport (or GitRead) fails closed instead of widening.
+  assert.deepEqual(
+    createExecutorToolCatalog(["read", "codemode"], ["read"]),
+    { allowedToolCatalog: ["read", "codemode"], initialActiveTools: ["read"] },
+  );
+  assert.throws(
+    () => createExecutorToolCatalog(["read"], ["read", "codemode"]),
+    /initial active tools must be a subset of the allowed tool catalog/,
+  );
+});
+
+/**
+ * Research role-intersection tests against codemode and MCP transports. The
+ * parent ceilings use native/existing role baseline fixtures: authorized
+ * names only, with fabrication limited to the MCP name shape
+ * (mcp__<server>__<tool>) that a parent session could carry. These are
+ * role-policy checks on the durable catalog capture — no MCP connection or
+ * SDK fixture is involved, and no source policy is being added.
+ */
+const transportTools = [
+  "codemode",
+  "mcp__fixture__read",
+  "mcp__fixture__write",
+] as const;
+
+function transportParentTools(): string[] {
+  return ["read", "grep", "find", "ls", "GitRead", ...transportTools, ...executionToolNames];
+}
+
+const transportExcludedResearchCatalog: ExecutorToolCatalog = {
+  allowedToolCatalog: ["read", "grep", "find", "ls", "GitRead"],
+  initialActiveTools: ["read", "grep", "find", "ls", "GitRead"],
+};
+
+async function startTransportFixtureTask(
+  tools: Array<Record<string, any>>,
+  toolCallId: string,
+  kind: "execute" | "research",
+): Promise<Record<string, any>> {
+  const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+  const started = await start(toolCallId, {
+    ...(kind === "research" ? { kind } : {}),
+    tasks: [{ title: "Run bounded work", instructions: "Do bounded work", acceptanceCriteria: ["Work is complete"] }],
+  }, undefined, undefined, {});
+  assert.equal(started.isError, false);
+  return started;
+}
+
+test("default research catalogs omit codemode and every parent-authorized MCP tool for both deferred settings", async () => {
+  // The research role policy is a whitelist: codemode (#224) and all
+  // MCP-transported names are excluded by absence in both deferred settings,
+  // with no read-only transport exception.
+  for (const deferredPiTools of [undefined, false]) {
+    const { tools, manager } = harness({
+      slowExecutor: true,
+      researchCapable: true,
+      activeTools: transportParentTools(),
+      deferredPiTools,
+    });
+    const started = await startTransportFixtureTask(tools, `research-transport-exclusion-${deferredPiTools === undefined ? "default-on" : "off"}`, "research");
+    try {
+      const catalog = started.details.tasks[0].definition.executorToolCatalog;
+      assert.deepEqual(catalog, transportExcludedResearchCatalog, `deferred ${deferredPiTools === undefined ? "default-on" : "off"}`);
+      for (const name of transportTools) {
+        assert.equal(catalog.allowedToolCatalog.includes(name), false, `allowed/${name}`);
+        assert.equal(catalog.initialActiveTools.includes(name), false, `initial/${name}`);
+      }
+    } finally {
+      await manager.shutdown();
+      await manager.detach();
+    }
+  }
+});
+
+test("execute ceilings keep the same parent-authorized native tools and follow the ordinary deferred toggle", async () => {
+  for (const deferredPiTools of [undefined, false]) {
+    const { tools, manager } = harness({
+      slowExecutor: true,
+      researchCapable: true,
+      activeTools: transportParentTools(),
+      deferredPiTools,
+    });
+    const started = await startTransportFixtureTask(tools, `execute-transport-toggle-${deferredPiTools === undefined ? "default-on" : "off"}`, "execute");
+    try {
+      // Ordinary pass-through: the parent-authorized native names stay in the
+      // durable ceiling (GitRead stays execute-excluded per #73) and codemode
+      // (#224) plus the MCP names keep following the existing toggle.
+      const catalog = started.details.tasks[0].definition.executorToolCatalog;
+      assert.deepEqual(catalog.allowedToolCatalog, [
+        "read", "grep", "find", "ls", ...transportTools, ...executionToolNames,
+      ]);
+      if (deferredPiTools === undefined) {
+        assert.deepEqual(catalog.initialActiveTools, ["read", "grep", "find", "ls", "SubtasksStart"]);
+      } else {
+        assert.deepEqual(catalog.initialActiveTools, catalog.allowedToolCatalog);
+      }
+    } finally {
+      await manager.shutdown();
+      await manager.detach();
+    }
+  }
+});
+
+test("late parent MCP authorization never widens a captured research catalog or later research dispatches", async () => {
+  const parentTools = transportParentTools();
+  const { tools, manager } = harness({
+    slowExecutor: true,
+    researchCapable: true,
+    liveParentTools: parentTools,
+  });
+  const addTool = executionTool(tools, "SubtasksAdd").execute as ExecuteTool;
+  try {
+    const first = await startTransportFixtureTask(tools, "late-mcp-first", "research");
+    const firstTask = first.details.tasks[0];
+    assert.deepEqual(firstTask.definition.executorToolCatalog, transportExcludedResearchCatalog);
+
+    // The parent session later gains a new MCP tool. The capture of the
+    // earlier task is durable: its recorded catalog stays exactly the same.
+    parentTools.push("mcp__fixture__late");
+    assert.deepEqual(firstTask.definition.executorToolCatalog, transportExcludedResearchCatalog);
+
+    // A subsequent dispatch inside the same research group is captured from
+    // the later snapshot and is likewise denied the new transport tool.
+    const added = await addTool("late-mcp-add", {
+      executionId: first.details.executionId,
+      tasks: [{ title: "Added research", instructions: "Do bounded work", acceptanceCriteria: ["Work is complete"] }],
+    }, undefined, undefined, {});
+    assert.equal(added.isError, false);
+    assert.equal(added.details.addedTaskIds.length, 1);
+    const addedTask = added.details.tasks.find((task: { taskId: string }) => task.taskId === added.details.addedTaskIds[0]);
+    assert.deepEqual(addedTask.definition.executorToolCatalog, transportExcludedResearchCatalog);
+
+    // A new research group started after the parent change is subject to the
+    // same role policy: still no codemode and no MCP transport of any name.
+    const second = await startTransportFixtureTask(tools, "late-mcp-second", "research");
+    assert.deepEqual(second.details.tasks[0].definition.executorToolCatalog, transportExcludedResearchCatalog);
+    for (const catalog of [
+      addedTask.definition.executorToolCatalog,
+      second.details.tasks[0].definition.executorToolCatalog,
+    ] as Array<Record<string, any>>) {
+      for (const name of [...transportTools, "mcp__fixture__late"]) {
+        assert.equal(catalog.allowedToolCatalog.includes(name), false, `allowed/${name}`);
+        assert.equal(catalog.initialActiveTools.includes(name), false, `initial/${name}`);
+      }
+    }
+  } finally {
+    await manager.shutdown();
+    await manager.detach();
+  }
 });
 
 function renderWidget(content: unknown, width = 240): string[] {

@@ -82,6 +82,18 @@ test("GitRead enters the conservative initial subset wherever the durable catalo
   );
 });
 
+test("codemode stays out of the conservative initial subset; deferred setting decides its activity (#224)", () => {
+  // Deferred tools ON (default): even a fully parent-authorized catalog keeps
+  // the tool out of the initial-active set — execute/orchestrate sessions
+  // discover and activate codemode only through search_tools.
+  assert.deepEqual(
+    defaultExecutorInitialActiveTools(["read", "bash", "codemode", "edit", "write", "ApplyPatch", "SubtasksStart"]),
+    ["read", "bash", "edit", "write", "ApplyPatch", "SubtasksStart"],
+  );
+  // The subset never widens on an allowed-but-unadmitted transport name.
+  assert.deepEqual(defaultExecutorInitialActiveTools(["codemode"]), []);
+});
+
 test("Pi worker catalogs remove orchestrator-only delegation controls without mutating the durable catalog", () => {
   const durable = createExecutorToolCatalog(
     ["read", "bash", "SubtasksStart", "SubtasksInspect", "WebSearch"],

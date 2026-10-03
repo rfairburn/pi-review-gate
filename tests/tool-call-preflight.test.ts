@@ -61,6 +61,46 @@ function nativePiHarness(options: {
     observeReturnedError(toolCallId: string, toolName: string): void {
       preflight.observeReturnedError(toolCallId, toolName);
     },
+    /** Simulates pi 1.0's nested seam: tool_execution_start then tool_call, each carrying parentToolCallId. */
+    async emitNestedCall(
+      parentToolCallId: string,
+      nested: Call,
+      options: { skipStart?: boolean } = {},
+    ): Promise<{ block: boolean; reason?: string }> {
+      if (!options.skipStart) {
+        await this.emit("tool_execution_start", {
+          toolCallId: nested.id,
+          toolName: nested.name,
+          args: nested.input,
+          parentToolCallId,
+        });
+      }
+      const results = await this.emit("tool_call", {
+        toolCallId: nested.id,
+        toolName: nested.name,
+        input: nested.input,
+        parentToolCallId,
+      });
+      const decision = results.find((candidate) => candidate !== undefined) as { block?: boolean; reason?: string } | undefined;
+      return { block: decision?.block === true, ...(decision?.reason ? { reason: decision.reason } : {}) };
+    },
+    /** A nested executed call reaches tool_result handlers with the structured isError flag. */
+    async emitNestedToolResult(
+      parentToolCallId: string,
+      nested: Call,
+      outcome: AttemptOutcome,
+    ): Promise<Record<string, unknown>> {
+      if (outcome === "returned-error") preflight.observeReturnedError(nested.id, nested.name);
+      return this.emitToolResult({
+        type: "tool_result",
+        toolCallId: nested.id,
+        toolName: nested.name,
+        input: nested.input,
+        content: [{ type: "text", text: outcome === "success" ? "completed" : "Error: operation did not complete" }],
+        details: outcome === "returned-error" ? { diagnostic: "the extension returned a structured error" } : {},
+        ...(outcome === "unknown" ? {} : { isError: outcome === "error" }),
+      });
+    },
     toolResultCount(): number {
       return toolResultCount;
     },
@@ -758,4 +798,700 @@ test("innocent fallback siblings are retryable while the identified offender rem
   ]);
   assert.deepEqual(next.decisions.map((decision) => decision.block), [false, true]);
   assert.equal(next.decisions[1]?.reason, "Duplicate SubtasksStart blocked: member 2 (SubtasksStart) of 2 follows an identical request that was blocked before execution; this member did not run.");
+});
+
+function codemodeCall(id: string, code: string): Call {
+  return { id, name: "codemode", input: { code } };
+}
+
+test("pending background starts are guarded across independent codemode parents", async () => {
+  for (const tool of ["ShellStart", "SubtasksStart"] as const) {
+    const runtime = nativePiHarness({
+      shellStart: () => ({ state: "inactive" }),
+      subtaskStart: () => ({ state: "inactive" }),
+    });
+    const input = tool === "ShellStart"
+      ? { command: "long build step", label: "build" }
+      : { tasks: [{ title: "one", instructions: "work", acceptanceCriteria: ["done"] }] };
+    const roots = ["pending-a", "pending-b"].map((id) =>
+      codemodeCall(id, `/* ${id} */ await tools.${tool}(${JSON.stringify(input)});`),
+    );
+    await runtime.emit("message_end", {
+      message: {
+        role: "assistant",
+        content: roots.map((root) => ({
+          type: "toolCall", id: root.id, name: root.name, arguments: root.input,
+        })),
+      },
+    });
+    for (const root of roots) {
+      await runtime.emit("tool_execution_start", {
+        toolCallId: root.id, toolName: root.name, args: root.input,
+      });
+      const decisions = await runtime.emit("tool_call", {
+        toolCallId: root.id, toolName: root.name, input: root.input,
+      });
+      assert.equal((decisions[0] as { block?: boolean } | undefined)?.block, undefined);
+    }
+    // No execute callback/result has published work liveness yet.
+    const first = await runtime.emitNestedCall("pending-a", call("pending-a/1", tool, input));
+    const second = await runtime.emitNestedCall("pending-b", call("pending-b/1", tool, input));
+    assert.deepEqual([first.block, second.block], [false, true], tool);
+    assert.equal(runtime.admittedSubmittedFingerprint("pending-b/1", tool), undefined);
+    const unrelated = await runtime.emitNestedCall("pending-b", call("pending-b/2", "read", { path: "other.txt" }));
+    assert.equal(unrelated.block, false);
+  }
+});
+
+interface NestedChildSpec {
+  call: Call;
+  outcome?: AttemptOutcome;
+  /** Overrides the parent lineage the child event claims. */
+  parentToolCallId?: string;
+  /** Runs between the previous child's result and this child's preflight. */
+  beforePreflight?: () => void;
+}
+
+interface CodemodeRunResult {
+  parentBlocked: boolean;
+  parentReason?: string;
+  siblingDecisions: Array<{ block: boolean; reason?: string }>;
+  childDecisions: Array<{ block: boolean; reason?: string }>;
+  childResults: Array<Record<string, unknown>>;
+}
+
+/** Simulates pi 1.0's codemode seam: a model-issued `codemode` call inside an
+ * assistant batch whose script issues nested tool calls through
+ * ctx.executeTool(). Model-issued preflights all run before executions; the
+ * nested children (each tool_execution_start then tool_call carrying
+ * parentToolCallId) run while the parent script executes, the parent settles
+ * with its result afterwards, then any sibling model-issued results. */
+async function dispatchCodemodeParent(
+  runtime: ReturnType<typeof nativePiHarness>,
+  options: {
+    parent: Call;
+    siblings?: Call[];
+    siblingOutcomes?: AttemptOutcome[];
+    children?: NestedChildSpec[];
+    parentOutcome?: AttemptOutcome;
+  },
+): Promise<CodemodeRunResult> {
+  const batch = [options.parent, ...(options.siblings ?? [])];
+  await runtime.emit("message_end", {
+    message: {
+      role: "assistant",
+      content: batch.map((entry) => ({
+        type: "toolCall",
+        id: entry.id,
+        name: entry.name,
+        arguments: entry.input,
+      })),
+    },
+  });
+
+  // Pi prefights every model-issued member in submission order before any
+  // execution: the codemode parent, then the remaining batch members.
+  await runtime.emit("tool_execution_start", {
+    toolCallId: options.parent.id,
+    toolName: options.parent.name,
+    args: options.parent.input,
+  });
+  const parentResults = await runtime.emit("tool_call", {
+    toolCallId: options.parent.id,
+    toolName: options.parent.name,
+    input: options.parent.input,
+  });
+  const parentDecision = parentResults.find((candidate) => candidate !== undefined) as
+    | { block?: boolean; reason?: string }
+    | undefined;
+  const parentBlocked = parentDecision?.block === true;
+
+  const siblingDecisions: Array<{ block: boolean; reason?: string }> = [];
+  for (const sibling of options.siblings ?? []) {
+    await runtime.emit("tool_execution_start", { toolCallId: sibling.id, toolName: sibling.name, args: sibling.input });
+    const results = await runtime.emit("tool_call", { toolCallId: sibling.id, toolName: sibling.name, input: sibling.input });
+    const decision = results.find((candidate) => candidate !== undefined) as { block?: boolean; reason?: string } | undefined;
+    siblingDecisions.push({ block: decision?.block === true, ...(decision?.reason ? { reason: decision.reason } : {}) });
+  }
+
+  const childDecisions: Array<{ block: boolean; reason?: string }> = [];
+  const childResults: Array<Record<string, unknown>> = [];
+  for (const child of options.children ?? []) {
+    child.beforePreflight?.();
+    const decision = await runtime.emitNestedCall(child.parentToolCallId ?? options.parent.id, child.call);
+    childDecisions.push(decision);
+    if (decision.block) continue;
+    const outcome = child.outcome ?? "success";
+    if (outcome === "policy-blocked") continue;
+    childResults.push(await runtime.emitNestedToolResult(child.parentToolCallId ?? options.parent.id, child.call, outcome));
+  }
+
+  if (!parentBlocked) {
+    const outcome = options.parentOutcome ?? "success";
+    if (outcome !== "policy-blocked") {
+      if (outcome === "returned-error") runtime.observeReturnedError(options.parent.id, options.parent.name);
+      await runtime.emitToolResult({
+        type: "tool_result",
+        toolCallId: options.parent.id,
+        toolName: options.parent.name,
+        input: options.parent.input,
+        content: [{ type: "text", text: outcome === "success" ? "Script completed" : "Error: script failed" }],
+        details: {},
+        ...(outcome === "unknown" ? {} : { isError: outcome === "error" }),
+      });
+    }
+  }
+
+  for (const [index, sibling] of (options.siblings ?? []).entries()) {
+    if (siblingDecisions[index]?.block) continue;
+    const outcome = options.siblingOutcomes?.[index] ?? "success";
+    if (outcome === "policy-blocked") continue;
+    if (outcome === "returned-error") runtime.observeReturnedError(sibling.id, sibling.name);
+    await runtime.emitToolResult({
+      type: "tool_result",
+      toolCallId: sibling.id,
+      toolName: sibling.name,
+      input: sibling.input,
+      content: [{ type: "text", text: outcome === "success" ? "completed" : "Error: operation did not complete" }],
+      details: outcome === "returned-error" ? { diagnostic: "the extension returned a structured error" } : {},
+      ...(outcome === "unknown" ? {} : { isError: outcome === "error" }),
+    });
+  }
+
+  return {
+    parentBlocked,
+    ...(parentDecision?.reason ? { parentReason: parentDecision.reason } : {}),
+    siblingDecisions,
+    childDecisions,
+    childResults,
+  };
+}
+
+test("admitted codemode scripts correlate nested calls and keep per-id evidence scoped to the batch", async () => {
+  const runtime = nativePiHarness();
+  const scriptInput = "const a = await tools.read({ path: 'a.txt' }); const b = await tools.grep({ pattern: 'needle' });";
+  const result = await dispatchCodemodeParent(runtime, {
+    parent: codemodeCall("cm-1", scriptInput),
+    siblings: [call("sibling-read", "read", { path: "sibling.txt" })],
+    children: [
+      { call: call("cm-1/1", "read", { path: "a.txt" }) },
+      { call: call("cm-1/2", "grep", { pattern: "needle" }) },
+    ],
+  });
+  assert.equal(result.parentBlocked, false);
+  assert.deepEqual(result.siblingDecisions.map((decision) => decision.block), [false]);
+  assert.deepEqual(result.childDecisions.map((decision) => decision.block), [false, false]);
+  assert.deepEqual(runtime.admittedSubmittedFingerprint("cm-1/1", "read"), toolCallFingerprint("read", { path: "a.txt" }), "admitted nested calls resolve their own-tool style identity");
+  assert.deepEqual(runtime.admittedSubmittedFingerprint("cm-1/2", "grep"), toolCallFingerprint("grep", { pattern: "needle" }));
+  assert.equal(runtime.admittedSubmittedFingerprint("cm-1/1", "grep"), undefined, "tool name is part of the narrow nested lookup");
+  assert.equal(runtime.admittedSubmittedFingerprint("cm-1/0", "read"), undefined);
+  assert.deepEqual(runtime.admittedSubmittedFingerprint("cm-1", "codemode"), toolCallFingerprint("codemode", { code: scriptInput }));
+
+  // The next assistant batch works normally, and nested evidence never earns
+  // model-issued repeat blocking because the model never saw nested results.
+  const next = await onlyDecisionBatch(runtime, [call("model-read", "read", { path: "a.txt" })]);
+  assert.deepEqual(next.decisions.map((decision) => decision.block), [false]);
+  assert.equal(runtime.admittedSubmittedFingerprint("cm-1/1", "read"), undefined, "nested evidence is dropped with the batch that owned it");
+});
+
+test("nested calls without a live admitted codemode parent are blocked narrowly", async () => {
+  const runtime = nativePiHarness();
+  const script = "await tools.read({ path: 'orphan.txt' });";
+  const result = await dispatchCodemodeParent(runtime, {
+    parent: codemodeCall("cm-2", script),
+    siblings: [call("sibling-read", "read", { path: "kept.txt" })],
+    children: [
+      { call: call("unknown-tool-parent", "read", { path: "orphan.txt" }), parentToolCallId: "never-seen" },
+      { call: call("sibling-read/1", "read", { path: "same.txt" }), parentToolCallId: "sibling-read" },
+    ],
+  });
+  assert.equal(result.parentBlocked, false);
+  assert.deepEqual(result.childDecisions.map((decision) => decision.block), [true, true]);
+  assert.equal(
+    result.childDecisions[0]?.reason,
+    "Nested call blocked before execution: its parent tool call \"never-seen\" is not a live admitted codemode call in this assistant batch; this nested read call did not run. Unrelated model-issued tool calls are unaffected.",
+  );
+  assert.equal(
+    result.childDecisions[1]?.reason,
+    "Nested call blocked before execution: its parent tool call \"sibling-read\" is not a live admitted codemode call in this assistant batch; this nested read call did not run. Unrelated model-issued tool calls are unaffected.",
+  );
+  assert.deepEqual(result.childResults, [], "no nested orphan produced a tool result");
+});
+
+test("nested failures do not poison the remaining model-issued batch members", async () => {
+  const runtime = nativePiHarness();
+  // Sequential pi execution order: the codemode member prefights and runs
+  // first; its script's rejected child must not block the next member.
+  await runtime.emit("message_end", {
+    message: {
+      role: "assistant",
+      content: [
+        { type: "toolCall", id: "cm-2b", name: "codemode", arguments: { code: "await tools.read({ path: 'x' })" } },
+        { type: "toolCall", id: "sib-bash", name: "bash", arguments: { command: "git status" } },
+      ],
+    },
+  });
+  await runtime.emit("tool_execution_start", { toolCallId: "cm-2b", toolName: "codemode", args: { code: "await tools.read({ path: 'x' })" } });
+  const parentPreflight = await runtime.emit("tool_call", { toolCallId: "cm-2b", toolName: "codemode", input: { code: "await tools.read({ path: 'x' })" } });
+  assert.equal((parentPreflight[0] as { block?: boolean } | undefined)?.block, undefined);
+
+  const orphan = await runtime.emitNestedCall("never-seen", call("orphan-x", "read", { path: "a.txt" }), { skipStart: true });
+  assert.equal(orphan.block, true);
+
+  await runtime.emit("tool_execution_start", { toolCallId: "sib-bash", toolName: "bash", args: { command: "git status" } });
+  const siblingPreflight = await runtime.emit("tool_call", { toolCallId: "sib-bash", toolName: "bash", input: { command: "git status" } });
+  assert.equal((siblingPreflight[0] as { block?: boolean } | undefined)?.block, undefined, "an unrelated model-issued member stays admitted after a nested correlation failure");
+
+  await runtime.emitToolResult({
+    type: "tool_result",
+    toolCallId: "sib-bash",
+    input: { command: "git status" },
+    error: undefined,
+    toolName: "bash",
+    content: [{ type: "text", text: "clean" }],
+    details: {},
+    isError: false,
+  });
+  const next = await onlyDecisionBatch(runtime, [call("later-read", "read", { path: "later.txt" })]);
+  assert.deepEqual(next.decisions.map((decision) => decision.block), [false]);
+});
+
+test("nested children of blocked parents are rejected while the live parent's sibling batch stays clean", async () => {
+  const runtime = nativePiHarness();
+  const script = "await tools.read({ path: 'x.txt' });";
+  const result = await dispatchCodemodeParent(runtime, {
+    parent: codemodeCall("cm-3a", script),
+    siblings: [codemodeCall("cm-3b", script)],
+    children: [{ call: call("cm-3b/1", "read", { path: "x.txt" }), parentToolCallId: "cm-3b" }],
+  });
+  assert.deepEqual(result.siblingDecisions.map((decision) => decision.block), [true], "the identical codemode submission itself stays blocked");
+  assert.equal(result.parentBlocked, false);
+  assert.equal(result.childDecisions[0]?.block, true);
+  assert.equal(
+    result.childDecisions[0]?.reason,
+    "Nested call blocked before execution: its parent tool call \"cm-3b\" was blocked before execution, so no script can issue further calls under it; this nested read call did not run. Unrelated model-issued tool calls are unaffected.",
+  );
+});
+
+test("a settled codemode parent admits no further nested calls", async () => {
+  const runtime = nativePiHarness();
+  const parent = codemodeCall("cm-4", "await tools.read({ path: 'a.txt' });");
+  const result = await dispatchCodemodeParent(runtime, {
+    parent,
+    children: [{ call: call("cm-4/1", "read", { path: "a.txt" }) }],
+  });
+  assert.deepEqual(result.childDecisions.map((decision) => decision.block), [false]);
+
+  const late = await runtime.emitNestedCall("cm-4", call("cm-4/2", "read", { path: "a.txt" }), { skipStart: true });
+  assert.equal(late.block, true);
+  assert.equal(
+    late.reason,
+    "Nested call blocked before execution: its parent tool call \"cm-4\" already returned a result, so no script can issue further calls under it; this nested read call did not run. Unrelated model-issued tool calls are unaffected.",
+  );
+
+  const next = await onlyDecisionBatch(runtime, [call("fresh-read", "read", { path: "z.txt" })]);
+  assert.deepEqual(next.decisions.map((decision) => decision.block), [false]);
+});
+
+test("a codemode parent in the previous batch is no longer a live lineage root", async () => {
+  const runtime = nativePiHarness();
+  await dispatchCodemodeParent(runtime, {
+    parent: codemodeCall("cm-5-stale", "old script"),
+    children: [{ call: call("cm-5-stale/1", "read", { path: "stale.txt" }) }],
+  });
+  const batch = await onlyDecisionBatch(runtime, [call("later-read", "read", { path: "later.txt" })]);
+  assert.deepEqual(batch.decisions.map((decision) => decision.block), [false]);
+
+  const stale = await runtime.emitNestedCall("cm-5-stale", call("cm-5-stale/2", "read", { path: "stale.txt" }), { skipStart: true });
+  assert.equal(stale.block, true);
+  assert.equal(
+    stale.reason,
+    "Nested call blocked before execution: its parent tool call \"cm-5-stale\" is not a live admitted codemode call in this assistant batch; this nested read call did not run. Unrelated model-issued tool calls are unaffected.",
+  );
+  assert.equal(runtime.admittedSubmittedFingerprint("cm-5-stale/2", "read"), undefined);
+});
+
+test("nested events before any assistant batch fail closed without poisoning the next batch", async () => {
+  const runtime = nativePiHarness();
+  const orphan = await runtime.emitNestedCall("phantom", call("phantom/1", "read", { path: "a.txt" }), { skipStart: true });
+  assert.equal(orphan.block, true);
+  const batch = await onlyDecisionBatch(runtime, [call("fresh-read", "read", { path: "b.txt" })]);
+  assert.deepEqual(batch.decisions.map((decision) => decision.block), [false]);
+});
+test("nested calls with an unsafe id shape or unusable identity are rejected narrowly", async () => {
+  const runtime = nativePiHarness();
+  const script = "await tools.read({ path: 'a.txt' });";
+  await runtime.emit("message_end", {
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "cm-6", name: "codemode", arguments: { code: script } }],
+    },
+  });
+  await runtime.emit("tool_execution_start", { toolCallId: "cm-6", toolName: "codemode", args: { code: script } });
+  const parentPreflight = await runtime.emit("tool_call", { toolCallId: "cm-6", toolName: "codemode", input: { code: script } });
+  assert.equal((parentPreflight[0] as { block?: boolean } | undefined)?.block, undefined);
+
+  const bogusId = await runtime.emitNestedCall("cm-6", call("unrelated-id", "read", { path: "a.txt" }), { skipStart: true });
+  assert.equal(bogusId.block, true);
+  assert.equal(
+    bogusId.reason,
+    "Nested call blocked before execution: this nested read call's call id does not follow pi's parent-assigned \"<parent tool call id>/<n>\" shape, so it could not be safely correlated; the nested call did not run. Unrelated model-issued tool calls are unaffected.",
+  );
+
+  const zeroSuffix = await runtime.emitNestedCall("cm-6", call("cm-6/0", "read", { path: "a.txt" }), { skipStart: true });
+  assert.equal(zeroSuffix.block, true);
+
+  const unusable = await runtime.emit("tool_call", {
+    toolCallId: "cm-6/1",
+    toolName: "read",
+    input: { path: new Date(0) },
+    parentToolCallId: "cm-6",
+  });
+  const unusableDecision = (unusable[0] as { block?: boolean; reason?: string } | undefined) ?? {};
+  assert.equal(unusableDecision.block, true);
+  assert.equal(
+    unusableDecision.reason,
+    "Nested call blocked before execution: this nested read call's tool name or arguments could not be reduced to a stable comparable identity; the nested call did not run. Unrelated model-issued tool calls are unaffected.",
+  );
+
+  // A later model-issued batch member still works: nested rejections stay scoped.
+  const next = await onlyDecisionBatch(runtime, [call("fresh-read", "read", { path: "b.txt" })]);
+  assert.deepEqual(next.decisions.map((decision) => decision.block), [false]);
+});
+
+test("an admitted nested id cannot be considered again and never collides with an assistant member id", async () => {
+  const runtime = nativePiHarness();
+  // The model itself submitted a direct member whose id happens to look like
+  // pi's parent-assigned child shape for the codemode call in the same batch.
+  await runtime.emit("message_end", {
+    message: {
+      role: "assistant",
+      content: [
+        { type: "toolCall", id: "cm-7", name: "codemode", arguments: { code: "await tools.read({ path: 'a.txt' })" } },
+        { type: "toolCall", id: "cm-7/1", name: "read", arguments: { path: "model-issued.txt" } },
+      ],
+    },
+  });
+  for (const id of ["cm-7", "cm-7/1"]) {
+    await runtime.emit("tool_execution_start", { toolCallId: id, toolName: id === "cm-7" ? "codemode" : "read" });
+  }
+  const parentDecision = await runtime.emit("tool_call", { toolCallId: "cm-7", toolName: "codemode", input: { code: "await tools.read({ path: 'a.txt' })" } });
+  assert.equal((parentDecision[0] as { block?: boolean } | undefined)?.block, undefined);
+  const memberDecision = await runtime.emit("tool_call", { toolCallId: "cm-7/1", toolName: "read", input: { path: "model-issued.txt" } });
+  assert.equal((memberDecision[0] as { block?: boolean } | undefined)?.block, undefined);
+
+  const repeated = await runtime.emitNestedCall("cm-7", call("cm-7/1", "read", { path: "model-issued.txt" }), { skipStart: true });
+  assert.equal(repeated.block, true);
+  assert.equal(
+    repeated.reason,
+    "Nested call blocked before execution: this nested read call's call id is already tracked as another tool call; the nested call did not run. Unrelated model-issued tool calls are unaffected.",
+  );
+
+  // A distinct first nested call of the parent is admitted normally.
+  const firstRealChild = await runtime.emitNestedCall("cm-7", call("cm-7/2", "read", { path: "script.txt" }), { skipStart: true });
+  assert.equal(firstRealChild.block, false);
+  const repeatedRealChild = await runtime.emitNestedCall("cm-7", call("cm-7/2", "read", { path: "script.txt" }), { skipStart: true });
+  assert.equal(repeatedRealChild.block, true);
+});
+
+test("script-scoped duplicates and parallel in-flight repeats read distinctly but stay blocked", async () => {
+  const runtime = nativePiHarness();
+  const script = "const a = await tools.read({ path: 'a.txt' }); tools.read({ path: 'a.txt' });";
+  const result = await dispatchCodemodeParent(runtime, {
+    parent: codemodeCall("cm-8", script),
+    children: [
+      { call: call("cm-8/1", "read", { path: "a.txt" }) },
+      { call: call("cm-8/2", "read", { path: "a.txt" }) },
+    ],
+  });
+  assert.deepEqual(result.childDecisions.map((decision) => decision.block), [false, true]);
+  assert.equal(
+    result.childDecisions[1]?.reason,
+    "Duplicate read blocked: nested call 2 (read) in this codemode script matches an earlier identical request in this script; this call did not run. Use the returned result.",
+  );
+  assert.deepEqual(result.childResults.length, 1, "the blocked duplicate produced no result");
+
+  // A parallel Promise.all() duplicate: the earlier sibling is still running,
+  // so no result was observed when the repeat prefighted.
+  const parallelRuntime = nativePiHarness();
+  await parallelRuntime.emit("message_end", {
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "cm-8p", name: "codemode", arguments: { code: script } }],
+    },
+  });
+  await parallelRuntime.emit("tool_execution_start", { toolCallId: "cm-8p", toolName: "codemode", args: { code: script } });
+  await parallelRuntime.emit("tool_call", { toolCallId: "cm-8p", toolName: "codemode", input: { code: script } });
+  await parallelRuntime.emitNestedCall("cm-8p", call("cm-8p/1", "read", { path: "a.txt" }), { skipStart: true });
+  const inFlight = await parallelRuntime.emitNestedCall("cm-8p", call("cm-8p/2", "read", { path: "a.txt" }), { skipStart: true });
+  assert.equal(inFlight.block, true);
+  assert.equal(
+    inFlight.reason,
+    "Duplicate read blocked: nested call 2 (read) in this codemode script matches an adjacent request whose execution outcome was not observed; this call did not run. This blocked member produced no result.",
+  );
+});
+
+test("observed nested failures earn exactly one identical retry inside the script", async () => {
+  const runtime = nativePiHarness();
+  const result = await dispatchCodemodeParent(runtime, {
+    parent: codemodeCall("cm-9", "const a = await tools.read({ path: 'a.txt' }); await tools.read({ path: 'a.txt' }); await tools.read({ path: 'a.txt' });"),
+    children: [
+      { call: call("cm-9/1", "read", { path: "a.txt" }), outcome: "error" },
+      { call: call("cm-9/2", "read", { path: "a.txt" }), outcome: "error" },
+      { call: call("cm-9/3", "read", { path: "a.txt" }) },
+    ],
+  });
+  assert.deepEqual(result.childDecisions.map((decision) => decision.block), [false, false, true]);
+  assert.equal(
+    result.childDecisions[2]?.reason,
+    "Duplicate read blocked after repeated failures: nested call 3 (read) in this codemode script follows two identical executions that failed; this call did not run. Use the returned result.",
+  );
+});
+
+test("nested lineages root at the current assistant batch's codemode call and stay live-scoped", async () => {
+  const runtime = nativePiHarness();
+  const script = "const wrapper = await tools.proxy({ target: 'inner.txt' });";
+  await runtime.emit("message_end", {
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "cm-10", name: "codemode", arguments: { code: script } }],
+    },
+  });
+  await runtime.emit("tool_execution_start", { toolCallId: "cm-10", toolName: "codemode", args: { code: script } });
+  const parentPreflight = await runtime.emit("tool_call", { toolCallId: "cm-10", toolName: "codemode", input: { code: script } });
+  assert.equal((parentPreflight[0] as { block?: boolean } | undefined)?.block, undefined);
+
+  // A nested tool that itself calls tools roots its own calls in the same
+  // codemode lineage.
+  const wrapper = await runtime.emitNestedCall("cm-10", call("cm-10/1", "proxy", { target: "inner.txt" }));
+  assert.equal(wrapper.block, false);
+  const grandchild = await runtime.emitNestedCall("cm-10/1", call("cm-10/1/1", "read", { path: "inner.txt" }), { skipStart: true });
+  assert.equal(grandchild.block, false);
+
+  // A wrapper whose execution was never observed cannot parent calls.
+  const wrapperNoStart = await runtime.emitNestedCall("cm-10", call("cm-10/2", "proxy", { target: "other.txt" }), { skipStart: true });
+  assert.equal(wrapperNoStart.block, false);
+  const orphanGrandchild = await runtime.emitNestedCall("cm-10/2", call("cm-10/2/1", "read", { path: "other.txt" }), { skipStart: true });
+  assert.equal(orphanGrandchild.block, true);
+  assert.equal(
+    orphanGrandchild.reason,
+    "Nested call blocked before execution: its parent tool call \"cm-10/2\" is not a live admitted codemode call in this assistant batch; this nested read call did not run. Unrelated model-issued tool calls are unaffected.",
+  );
+
+  // A settled intermediate parent admits no further calls under it.
+  await runtime.emitNestedToolResult("cm-10", call("cm-10/1", "proxy", { target: "inner.txt" }), "success");
+  const settledGrandchild = await runtime.emitNestedCall("cm-10/1", call("cm-10/1/2", "read", { path: "inner.txt" }), { skipStart: true });
+  assert.equal(settledGrandchild.block, true);
+  assert.match(settledGrandchild.reason ?? "", /already returned a result/);
+
+  // The root lineage is still live: its own calls stay admitted.
+  const laterChild = await runtime.emitNestedCall("cm-10", call("cm-10/3", "read", { path: "different.txt" }), { skipStart: true });
+  assert.equal(laterChild.block, false);
+});
+
+test("deep parent-linked lineage admits past any fixed ceiling while deep unrooted and settled claims stay blocked", async () => {
+  const runtime = nativePiHarness();
+  const rootId = "cm-deep";
+  const script = "const probe = await tools.read({ path: 'level-1.txt' });";
+  await runtime.emit("message_end", {
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", id: rootId, name: "codemode", arguments: { code: script } }],
+    },
+  });
+  await runtime.emit("tool_execution_start", { toolCallId: rootId, toolName: "codemode", args: { code: script } });
+  const parentPreflight = await runtime.emit("tool_call", { toolCallId: rootId, toolName: "codemode", input: { code: script } });
+  assert.equal((parentPreflight[0] as { block?: boolean } | undefined)?.block, undefined);
+
+  // One past the prior 64-step walk ceiling: each level parents the next
+  // while it stays admitted, started, and unsettled, so admission must
+  // follow recorded live evidence instead of a fixed depth budget.
+  const depth = 70;
+  let prefix = rootId;
+  for (let level = 1; level <= depth; level += 1) {
+    const id = `${prefix}/1`;
+    const decision = await runtime.emitNestedCall(prefix, call(id, "read", { path: `level-${level}.txt` }));
+    assert.equal(decision.block, false, `deep lineage level ${level} admits while its recorded parents stay live`);
+    prefix = id;
+  }
+  const deepestId = prefix;
+  assert.equal(
+    runtime.admittedSubmittedFingerprint(deepestId, "read"),
+    toolCallFingerprint("read", { path: `level-${depth}.txt` }),
+  );
+
+  // Depth is not an admission criterion: a deep id whose claimed parent was
+  // never observed still rejects as unrooted.
+  const unrootedDeep = await runtime.emitNestedCall(`${deepestId}/1`, call(`${deepestId}/1/1`, "read", { path: "unrooted.txt" }), { skipStart: true });
+  assert.equal(unrootedDeep.block, true);
+  assert.match(
+    unrootedDeep.reason ?? "",
+    /is not a live admitted codemode call in this assistant batch/,
+  );
+  assert.equal(runtime.admittedSubmittedFingerprint(`${deepestId}/1/1`, "read"), undefined);
+
+  // A settled parent deep inside the chain rejects further children.
+  const settledLevel = 3;
+  const settledPrefix = `${rootId}${"/1".repeat(settledLevel)}`;
+  await runtime.emitNestedToolResult(settledPrefix, call(settledPrefix, "read", { path: `level-${settledLevel}.txt` }), "success");
+  const underSettled = await runtime.emitNestedCall(settledPrefix, call(`${settledPrefix}/1`, "read", { path: "under-settled.txt" }), { skipStart: true });
+  assert.equal(underSettled.block, true);
+  assert.match(underSettled.reason ?? "", /already returned a result/);
+
+  // The settled intermediate only prunes its own subtree; the root lineage
+  // is still live and admits fresh calls of its own.
+  const laterChild = await runtime.emitNestedCall(rootId, call(`${rootId}/2`, "read", { path: "different.txt" }), { skipStart: true });
+  assert.equal(laterChild.block, false);
+});
+
+test("parallel scripts correlate their nested calls independently", async () => {
+  const runtime = nativePiHarness();
+  await runtime.emit("message_end", {
+    message: {
+      role: "assistant",
+      content: [
+        { type: "toolCall", id: "cm-11a", name: "codemode", arguments: { code: "script a" } },
+        { type: "toolCall", id: "cm-11b", name: "codemode", arguments: { code: "script b" } },
+        { type: "toolCall", id: "cm-11-witness", name: "ls", arguments: { path: "." } },
+      ],
+    },
+  });
+  for (const [id, name] of [["cm-11a", "codemode"], ["cm-11b", "codemode"], ["cm-11-witness", "ls"]] as const) {
+    await runtime.emit("tool_execution_start", { toolCallId: id, toolName: name });
+  }
+  for (const id of ["cm-11a", "cm-11b", "cm-11-witness"]) {
+    const results = await runtime.emit("tool_call", {
+      toolCallId: id,
+      toolName: id === "cm-11-witness" ? "ls" : "codemode",
+      ...(id === "cm-11-witness" ? { input: { path: "." } } : {}),
+    });
+    assert.equal((results[0] as { block?: boolean } | undefined)?.block, undefined);
+  }
+
+  const firstScriptChild = await runtime.emitNestedCall("cm-11a", call("cm-11a/1", "read", { path: "shared.txt" }), { skipStart: true });
+  assert.equal(firstScriptChild.block, false);
+  const secondScriptChild = await runtime.emitNestedCall("cm-11b", call("cm-11b/1", "read", { path: "shared.txt" }), { skipStart: true });
+  assert.equal(secondScriptChild.block, false, "identical nested calls from independent scripts are independently correlated");
+
+  const firstScriptRepeat = await runtime.emitNestedCall("cm-11a", call("cm-11a/2", "read", { path: "shared.txt" }), { skipStart: true });
+  assert.equal(firstScriptRepeat.block, true);
+  const secondScriptRepeat = await runtime.emitNestedCall("cm-11b", call("cm-11b/2", "read", { path: "shared.txt" }), { skipStart: true });
+  assert.equal(secondScriptRepeat.block, true);
+});
+
+test("nested own-tool starts resolve admitted fingerprints and keep active-job blocking", async () => {
+  const activeFingerprints = new Set<string>();
+  const runtime = nativePiHarness({
+    shellStart: (fingerprint) => activeFingerprints.has(fingerprint)
+      ? { state: "active", identity: "job-nested" }
+      : { state: "inactive" },
+  });
+  const shellInput = { command: "sleep 30", label: "worker" };
+  const shell = (id: string) => call(id, "ShellStart", shellInput);
+  const script = "await tools.ShellStart({ command: 'sleep 30', label: 'worker' }); tools.ShellStart(repeat);";
+  const first = await dispatchCodemodeParent(runtime, {
+    parent: codemodeCall("cm-12", script),
+    children: [{ call: shell("cm-12/1") }, { call: shell("cm-12/2") }],
+  });
+  assert.deepEqual(first.childDecisions.map((decision) => decision.block), [false, true]);
+  const submitted = runtime.admittedSubmittedFingerprint("cm-12/1", "ShellStart");
+  assert.deepEqual(submitted, toolCallFingerprint("ShellStart", shellInput), "the execute wrapper resolves the nested admitted identity");
+  assert.equal(first.childDecisions[1]?.reason, "Duplicate ShellStart blocked: nested call 2 (ShellStart) in this codemode script matches an earlier identical request in this script; this call did not run.");
+
+  // The wrapper persists the admitted fingerprint on the live job; a second
+  // script repeating the identical start stays blocked through liveness.
+  activeFingerprints.add(submitted!);
+  const second = await dispatchCodemodeParent(runtime, {
+    parent: codemodeCall("cm-13", "different script; await tools.ShellStart(same args);"),
+    children: [{ call: shell("cm-13/1") }],
+  });
+  assert.equal(second.childDecisions[0]?.block, true);
+  assert.equal(
+    second.childDecisions[0]?.reason,
+    "Duplicate ShellStart blocked: nested call 1 (ShellStart) in this codemode script matches an earlier identical start with an active job job-nested; this call started no job.",
+  );
+});
+
+test("nested own-tool structured errors are normalized and earn one retry", async () => {
+  const runtime = nativePiHarness();
+  const logInput = { id: "missing" };
+  const script = "await tools.ShellLog({ id: 'missing' }); tools.ShellLog(again); tools.ShellLog(again);";
+  const result = await dispatchCodemodeParent(runtime, {
+    parent: codemodeCall("cm-14", script),
+    children: [
+      { call: call("cm-14/1", "ShellLog", logInput), outcome: "returned-error" },
+      { call: call("cm-14/2", "ShellLog", logInput), outcome: "error" },
+      { call: call("cm-14/3", "ShellLog", logInput) },
+    ],
+  });
+  assert.deepEqual(result.childDecisions.map((decision) => decision.block), [false, false, true]);
+  assert.equal(result.childResults[0]?.isError, true, "the wrapper's structured error is normalized into pi's nested result");
+  assert.deepEqual(result.childResults[0]?.details, { diagnostic: "the extension returned a structured error" });
+  assert.equal(result.childResults[1]?.isError, true);
+  assert.equal(
+    result.childDecisions[2]?.reason,
+    "Duplicate ShellLog blocked after repeated failures: nested call 3 (ShellLog) in this codemode script follows two identical executions that failed; this call did not run. Use the evidence already available.",
+  );
+});
+test("nested retries after observed start errors still respect background-start liveness", async () => {
+  const shellInput = { command: "long build step", label: "build" };
+  const subtaskInput = { tasks: [{ title: "one", instructions: "work", acceptanceCriteria: ["done"] }] };
+  for (const tool of ["ShellStart", "SubtasksStart"] as const) {
+    for (const targetState of ["active", "unknown"] as const) {
+      const livenessInput = tool === "ShellStart" ? shellInput : subtaskInput;
+      const state = { value: "inactive" as StartLiveness };
+      const runtime = nativePiHarness({
+        ...(tool === "ShellStart"
+          ? { shellStart: () => ({ state: state.value, ...(targetState === "active" ? { identity: `job-${targetState}` } : {}) }) }
+          : { subtaskStart: () => ({ state: state.value, ...(targetState === "active" ? { identity: `exec-${targetState}` } : {}) }) }),
+      });
+      const parentId = `cm-${tool}-${targetState}`;
+      const result = await dispatchCodemodeParent(runtime, {
+        parent: codemodeCall(parentId, `await tools.${tool}(retry attempt);`),
+        children: [
+          { call: call(`${parentId}/1`, tool, livenessInput), outcome: "error" },
+          { call: call(`${parentId}/2`, tool, livenessInput), beforePreflight: () => { state.value = targetState; } },
+        ],
+      });
+      const nestedLocation = (position: number, tool: string): string => `nested call ${position} (${tool}) in this codemode script`;
+      assert.deepEqual(result.childDecisions.map((decision) => decision.block), [false, true], `${tool} retry with ${targetState} liveness`);
+      assert.equal(
+        result.childDecisions[1]?.reason,
+        tool === "ShellStart" && targetState === "active"
+          ? `Duplicate ShellStart blocked: ${nestedLocation(2, "ShellStart")} matches an earlier identical start with an active job job-active; this call started no job.`
+          : tool === "ShellStart"
+            ? `Duplicate ShellStart blocked: ${nestedLocation(2, "ShellStart")} could not verify whether an identical job is active; this call started no job.`
+            : targetState === "active"
+              ? `Duplicate SubtasksStart blocked: ${nestedLocation(2, "SubtasksStart")} matches an earlier identical start with active work in execution exec-active; this call created no group or tasks.`
+              : `Duplicate SubtasksStart blocked: ${nestedLocation(2, "SubtasksStart")} could not verify whether identical work is active; this call created no group or tasks.`,
+      );
+    }
+  }
+});
+
+test("an inactive liveness status still permits exactly one nested retry of a failed start", async () => {
+  for (const tool of ["ShellStart", "SubtasksStart"] as const) {
+    const livenessInput = tool === "ShellStart"
+      ? { command: "long build step", label: "build" }
+      : { tasks: [{ title: "one", instructions: "work", acceptanceCriteria: ["done"] }] };
+    const runtime = nativePiHarness({
+      ...(tool === "ShellStart"
+        ? { shellStart: () => ({ state: "inactive" }) }
+        : { subtaskStart: () => ({ state: "inactive" }) }),
+    });
+    const parentId = `cm-${tool}-retry-ok`;
+    const result = await dispatchCodemodeParent(runtime, {
+      parent: codemodeCall(parentId, `await tools.${tool}(retry attempt);`),
+      children: [
+        { call: call(`${parentId}/1`, tool, livenessInput), outcome: "error" },
+        { call: call(`${parentId}/2`, tool, livenessInput), outcome: "error" },
+        { call: call(`${parentId}/3`, tool, livenessInput) },
+      ],
+    });
+    assert.deepEqual(result.childDecisions.map((decision) => decision.block), [false, false, true], `${tool} one retry under inactive liveness`);
+    assert.equal(
+      result.childDecisions[2]?.reason,
+      `Duplicate ${tool} blocked after repeated failures: nested call 3 (${tool}) in this codemode script follows two identical executions that failed; this call did not run.`,
+    );
+  }
 });

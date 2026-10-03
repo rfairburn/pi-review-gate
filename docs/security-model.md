@@ -170,9 +170,15 @@ command provides its own safe read-only behavior.
 For delegated workers and research subtasks:
 
 - Pi reviewers and Pi workers are always launched with an explicit `--tools` value;
-  worker values are captured from the orchestrator's active Pi tools and narrowed
-  further for research. Research workers intersect the parent's active tools with a
-  read-only allowlist that excludes `ApplyPatch`. Launch-authorized native read-only
+  worker values are captured from the orchestrator's authorized Pi tools (its reconciled
+  launch authorization — see
+  [Native Pi tools](native-pi-tools.md#native-pi-tools-mcp-and-codemode)) and narrowed
+  further for research. Research workers intersect the parent's authorization with a
+  read-only allowlist that excludes `ApplyPatch`, the `codemode` transport, and every
+  MCP tool name — no callable MCP tools and no default MCP exposure for research, with
+  no `readOnlyHint`-based opt-in and no researcher override; the ordinary deferred
+  toggle operates within the role's authorized ceiling and cannot grant a
+  research-forbidden tool. Launch-authorized native read-only
   discovery (`grep`, `find`, `ls`; mapped to Claude's native `Grep`/`Glob`) is part of
   the conservative initial-active subset, so it is active from the first request in
   every operating mode and delegated role with no deferred activation step, and mode
@@ -183,8 +189,18 @@ For delegated workers and research subtasks:
   activity; they do not exclude registered tools. Consequently, those settings alone
   do not keep `grep`, `find`, or `ls` inactive in review-gate. Use `--exclude-tools`
   or an explicit `--tools` allowlist to withhold them. Other inactive tools are not
-  promoted. Configured worker catalogs are never expanded beyond the inherited
-  durable catalog.
+  promoted by review-gate's own loader. The qualified exception is Pi's native MCP and
+  codemode exposure, which remains reachable through its native channels, is reconciled
+  into the gate's discovery and activation view rather than declared or hidden by it
+  (see [Native Pi tools](native-pi-tools.md#reconciliation-during-a-running-session)),
+  and never overrides an explicit restriction. Configured worker catalogs are never
+  expanded beyond the inherited durable catalog: a later MCP registration, `/mcp`
+  re-enablement, or reconfiguration inside a worker session applies only within it —
+  removed, hidden, or never-captured names stay absent and unusable, and re-enablement
+  holds only inside that fixed ceiling — which carries the `codemode` transport only
+  for execute workers, and never a `codemode` transport or MCP tool name for a research
+  worker (see
+  [Native Pi tools](native-pi-tools.md#delegated-pi-workers-the-fixed-captured-ceiling)).
 - Codex uses its read-only sandbox and rejects configuration that could weaken the
   research profile.
 - Claude uses an explicit read-only tool allowlist and permission callback while

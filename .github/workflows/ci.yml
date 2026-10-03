@@ -38,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: [20.x, 24.x]
+        node-version: [22.19.0, 24.x]
     # Pure/unit tier plus packaging: no browser needed, so provisioning stays skipped.
     env:
       PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"
@@ -101,8 +101,9 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Install pinned Pi agent-core runtime
         # tests/browser-native-error.test.ts drives the real agentLoop from an
-        # installed Pi agent-core build. 0.87.0 is verified against the current
-        # extension sources (and needs Node >=22.19.0, so this job pins Node 24).
+        # installed Pi agent-core build. 1.0.0 is verified against the current
+        # extension sources (and needs Node >=22.19.0, which the verify matrix
+        # exercises at its minimum).
         # The test skips itself when PI_BROWSER_AGENT_RUNTIME is unset; this job
         # always sets it, so the regression genuinely runs in CI.
         # Install the locked tree to avoid transitive range drift and registry
@@ -134,12 +135,13 @@ jobs:
         # tests/pi-tui-live-settings-smoke.test.ts (and the bridge integration
         # tier in tests/native-editor-bridge.test.ts) drive the real Pi TUI
         # surface — CustomEditor, pi-tui components, and the pi CLI entry from
-        # @earendil-works/pi-coding-agent. 0.87.1 is verified against the
-        # current extension sources (and needs Node >=22.19.0, so this job
-        # pins Node 24). Install the locked tree into the runner temp exactly
-        # like the agent-core runtime above: a test-only install, never a
-        # shipping package dependency. When changing the pin, regenerate the
-        # lock in scripts/ci/pi-ui-runtime with `npm install --package-lock-only`.
+        # @earendil-works/pi-coding-agent. 1.0.0 is verified against the
+        # current extension sources (and needs Node >=22.19.0, which the verify
+        # matrix exercises at its minimum). Install the locked tree into the
+        # runner temp exactly like the agent-core runtime above: a test-only
+        # install, never a shipping package dependency. When changing the pin,
+        # regenerate the lock in scripts/ci/pi-ui-runtime with
+        # `npm install --package-lock-only`.
         run: |
           mkdir -p "$RUNNER_TEMP/pi-ui-runtime"
           cp scripts/ci/pi-ui-runtime/package.json scripts/ci/pi-ui-runtime/package-lock.json "$RUNNER_TEMP/pi-ui-runtime/"
@@ -201,7 +203,7 @@ jobs:
     # cases inside the same file skip themselves. This is a disposable runner
     # checkout, so building production dist here is safe and exercises the
     # exact npm toolchain the launcher invokes for development rebuilds.
-    name: Windows launcher (Node 20)
+    name: Windows launcher (Node 22.19.0)
     runs-on: windows-latest
     timeout-minutes: 20
     env:
@@ -210,7 +212,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: 20.x
+          node-version: 22.19.0
           cache: npm
       - name: Install dependencies
         run: npm ci

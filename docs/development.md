@@ -43,8 +43,8 @@ The complete suite (`npm run test:run`) executes up to four test files concurren
 
 ### Development prerequisites
 
-- **Node.js 20 or newer and npm.** CI exercises Node 20 and Node 24; the optional real
-  runtime regression needs Node 22.19 or newer (see below).
+- **Node.js 22.19.0 or newer and npm.** CI exercises Node 22.19.0 (the supported
+  minimum) and Node 24.
 - **TypeScript and type definitions** arrive as ordinary `devDependencies` via
   `npm install`; the runtime dependencies (including Playwright, undici, and the HTML/PDF
   parsing stack) are ordinary npm packages.
@@ -65,8 +65,8 @@ The complete suite (`npm run test:run`) executes up to four test files concurren
   tests do not need Chromium — CI's fast job runs them with provisioning skipped
   entirely.
 - **Optional: `PI_BROWSER_AGENT_RUNTIME`** pointing at an installed Pi agent-core
-  0.87.0-or-newer `dist/index.js` enables `tests/browser-native-error.test.ts` (CI uses
-  `@earendil-works/pi-agent-core@0.87.0`, which needs Node >=22.19; the model stream is
+  1.0.0-or-newer `dist/index.js` enables `tests/browser-native-error.test.ts` (CI uses
+  the exact `@earendil-works/pi-agent-core@1.0.0`; the model stream is
   mocked, with no live model calls). Without it the test skips itself. See
   [Browser guide](browser.md#interactive-browser).
 - **Optional: an installed Pi** (`@earendil-works/pi-coding-agent` plus its pi-tui
@@ -80,7 +80,7 @@ The complete suite (`npm run test:run`) executes up to four test files concurren
   The `@` picker test additionally needs `fd` on `PATH` and fails (rather than
   skipping) when the required-host gate is set and no finder is resolvable.
 - **Test-only explicit paths (never shipped, never user-specific in tracked files):**
-  CI's full suite installs a locked `@earendil-works/pi-coding-agent@0.87.1` UI
+  CI's full suite installs a locked `@earendil-works/pi-coding-agent@1.0.0` UI
   runtime (manifests: `scripts/ci/pi-ui-runtime/`) into the runner temp and exports
   `PI_REVIEW_GATE_INSTALLED_AGENT` (the runtime root) plus
   `PI_REVIEW_GATE_REQUIRE_PI_HOST=1`; the real-host helpers prefer that install over

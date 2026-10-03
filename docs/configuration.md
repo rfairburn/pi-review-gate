@@ -75,9 +75,10 @@ Choose **Operating mode** in `/review-settings`, then **Save changes**:
 - **Prefer orchestration** (default): favor bounded delegation; the primary assistant
   remains responsible for integration and verification.
 - **Plan/research**: local read-only investigation and planning. Write-capable tools,
-  arbitrary shell, and execution-subtask controls are removed from the active tool
-  schemas, authorized inventory, and `search_tools` results. Launch-authorized native
-  read-only discovery (`grep`, `find`, `ls`) stays active in every mode. The structured
+  arbitrary shell, execution-subtask controls, and the `codemode` script transport are
+  removed from the active tool schemas, authorized inventory, and `search_tools`
+  results. Launch-authorized native read-only discovery (`grep`, `find`, `ls`) stays
+  active in every mode. The structured
   read-only Git history tool `GitRead` is active only in this mode: available from the
   first request (no `search_tools` step) and removed from the active set, inventory,
   and search results in every other mode. When changes are needed, the assistant asks
@@ -87,8 +88,10 @@ The next normal run in the same conversation receives the replacement mode promp
 no `/new`, reload, or restart is needed. Shared safety and review instructions and user
 append prompts remain. An in-flight run retains its prompt, and already-running subtasks
 retain their captured instructions and authority. Cancelling settings leaves the mode
-unchanged. Returning to a write-capable mode restores tools within the original
-authorization boundary, not tools that were disabled at launch.
+unchanged. Returning to a write-capable mode restores tools within the
+session's current authorization boundary — including natively reconciled MCP/codemode
+registrations (see [Native Pi tools](native-pi-tools.md#reconciliation-during-a-running-session))
+— not tools that were disabled at launch.
 
 Prompt files live in `scripts/orchestrator-system-prompt.md`,
 `scripts/execution-system-prompt.md`, and `scripts/planning-system-prompt.md`.
@@ -337,6 +340,44 @@ Defaults: `execution.maxWorkers` is `4` (allowed range 1–16) and
 defaults to `true`. The default retry policy is
 `maxRetries: 2`, `baseDelayMs: 1000`, `maxDelayMs: 15000`, `jitter: true`,
 `maxSameIncidentRepeats: 2`.
+
+## Native Pi tool surfaces (MCP and codemode)
+
+On the supported Pi versions (see [Getting started](getting-started.md#prerequisites)),
+review-gate integrates with Pi's native MCP and codemode surfaces without taking any of
+them over. The concise rules:
+
+- Sessions started through the review-gate launcher forward your arguments unchanged
+  and pass no `--tools` value of their own; the review-gate default there is
+  availability, not activation: the registered `codemode` tool is admitted to the
+  session's authorized catalog where Pi's registry carries it and no explicit
+  restriction removed it. Explicit Pi `--tools`/`--exclude-tools`/`--no-tools`
+  restrictions remain authoritative and are never broadened; a manual extension-only
+  load gets no new default.
+- `codemode` follows the ordinary deferred-tools toggle
+  (`execution.deferredPiTools`): with the default On it is discoverable through
+  `search_tools` but never part of the initial-active subset, so the model loads it
+  before use; with the toggle Off ordinary permitted tools, including `codemode`,
+  load without review-gate deferral. Native MCP exposure and Pi's loading choices
+  still apply: Off does not force codemode/deferred MCP tools into direct declarations.
+  Plan/research sessions and research roles exclude it entirely — and, alongside it,
+  all MCP tools are off for research by default: the read-only role boundary admits no
+  MCP tool names through the direct, script, or deferred channels, so there is no
+  default MCP exposure or callable MCP tool there, no `readOnlyHint` opt-in, and no
+  researcher override; the toggle never grants a research-forbidden tool.
+- Delegated Pi workers inherit `codemode` only through the parent's captured worker
+  catalog; the captured worker ceiling never widens after capture, and withdrawn or
+  hidden names become absent and unusable within it. Review-gate adds no MCP server
+  manager, project-trust grant, credential flow, exposure editor, or annotation-based
+  permission policy: server configuration, trust, credentials, exposure, and
+  permissions stay with Pi. Enabled, permitted MCP tools are discoverable through
+  `search_tools`; disabled, hidden, or withdrawn names are not. Review-gate's guards
+  and existing evidence policy apply to
+  MCP and codemode calls like any other tool call.
+
+Behavior details — the two separate tool searches, in-session reconciliation, and the
+nested-call guards — are owned by
+[Native Pi tools](native-pi-tools.md#native-pi-tools-mcp-and-codemode).
 
 ## Scheduled task fields
 

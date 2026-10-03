@@ -15,6 +15,26 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.110]
+
+### Changed
+
+- Require Pi 1.0.0 or newer and Node.js 22.19.0 or newer; replace the Node 20
+  verification tier with the minimum supported Node 22 runtime and validate
+  native Pi integration against locked Pi 1.0.0 fixtures (#224).
+- Make native `codemode` available to wrapper-launched execution/orchestration
+  and authorized Pi execution workers through the ordinary deferred-tools
+  setting: search/load when on, normally loaded when off. Research roles keep
+  codemode and all MCP tool access disabled. Preserve explicit Pi restrictions,
+  native MCP exposure, and captured worker authorization ceilings (#224).
+
+### Fixed
+
+- Reconcile tool discovery and calls against Pi's live registrations so withdrawn
+  or hidden tools cannot remain available through stale loader entries. Correlate
+  codemode's native nested calls with their admitted parent while retaining
+  permission, duplicate-start, review, and evidence boundaries (#224).
+
 ## [0.1.0-dev.107]
 
 ### Fixed

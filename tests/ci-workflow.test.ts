@@ -183,7 +183,7 @@ test("verify job keeps its stable check name, Node matrix, and fast tiers", () =
   const source = readWorkflow();
   assert.match(source, /name: Verify \(Node \$\{\{ matrix\.node-version \}\}\)/);
   const verify = blockOf(source, "verify", 2);
-  assert.match(verify, /node-version: \[20\.x, 24\.x\]/, "both supported Node lines stay in the matrix");
+  assert.match(verify, /node-version: \[22\.19\.0, 24\.x\]/, "both supported Node lines stay in the matrix");
   assert.match(verify, /fail-fast: false/);
   assert.match(verify, /timeout-minutes: \d+/);
   assert.match(verify, /run: npm run check:static/);
@@ -378,7 +378,7 @@ test("full-suite installs the locked Pi UI runtime, provisions fd, and requires 
   const lock = readPiUiRuntimeLock();
   assert.equal(lock.packages?.["node_modules/@earendil-works/pi-coding-agent"]?.version, pin,
     "the UI runtime lock must freeze the exact pinned version, not a drifted one");
-  assert.equal(lock.packages?.["node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui"]?.version, pin,
+  assert.equal(lock.packages?.["node_modules/@earendil-works/pi-tui"]?.version, pin,
     "the installed runtime must carry the pinned pi-tui peer for the real TUI components");
 
   // Real-host helpers point at the locked runtime; a missing host fails the
@@ -604,7 +604,9 @@ test("windows launcher job runs the native .cmd coverage on every enforced trigg
   assert.match(source, /^  windows-launcher:$/m, "the job id must stay stable for downstream callers");
   assert.match(job, /runs-on: windows-latest/,
     "the .cmd launcher and helper need a genuinely native Windows runner");
-  assert.match(job, /node-version: 20\.x/, "the supported Node floor must be exercised natively");
+  assert.match(job, /name: Windows launcher \(Node 22\.19\.0\)/,
+    "the native job name must name the exact floor version it exercises");
+  assert.match(job, /node-version: 22\.19\.0/, "the supported Node floor must be exercised natively");
   assert.match(job, /PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"/,
     "the launcher tier needs no browser, so Chromium provisioning stays skipped");
   assert.match(job, /run: npm run build:test/,
@@ -620,6 +622,31 @@ test("windows launcher job runs the native .cmd coverage on every enforced trigg
     assert.doesNotMatch(line, /npm run test:run|npm run test:integration/,
       `the native job must stay focused on launcher coverage, not the full suite: ${line.trim()}`);
   }
+});
+
+test("engine floor, CI minimum, and locked Pi fixtures stay consistent", () => {
+  // The package engine floor is the Node requirement declared by the locked
+  // Pi 1.0.0 test runtimes (>=22.19.0), and CI must exercise exactly that
+  // floor as its minimum line — never an older Node.
+  const pkg = readRootPackageJson();
+  assert.equal(pkg.engines?.node, ">=22.19.0",
+    "the package engine floor must keep the installed Pi runtimes' Node requirement");
+  const rootLock = readRootLock() as { packages?: Record<string, { engines?: { node?: string } }> };
+  assert.equal(rootLock.packages?.[""]?.engines?.node, pkg.engines?.node,
+    "the lock's root package must mirror the engine floor exactly");
+  const source = readWorkflow();
+  assert.match(source, /node-version: \[22\.19\.0, 24\.x\]/,
+    "CI's minimum matrix entry must exercise the engine floor, never an older Node");
+  assert.match(source, /node-version: 22\.19\.0/,
+    "the native Windows floor job must exercise the same engine floor");
+  // The locked test runtimes stay at the exact published Pi 1.0.0 release.
+  const agentManifest = JSON.parse(
+    readFileSync(join(projectRoot, "scripts", "ci", "pi-agent-runtime", "package.json"), "utf8"),
+  ) as { dependencies?: Record<string, string> };
+  assert.equal(agentManifest.dependencies?.["@earendil-works/pi-agent-core"], "1.0.0",
+    "the agent-core runtime must stay pinned to the exact Pi 1.0.0 release");
+  assert.equal(readPiUiRuntimeManifest().dependencies?.["@earendil-works/pi-coding-agent"], "1.0.0",
+    "the Pi UI runtime must stay pinned to the exact Pi 1.0.0 release");
 });
 
 test("activation tests keep the default runtime role in CI", () => {

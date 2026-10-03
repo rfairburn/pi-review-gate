@@ -75,9 +75,10 @@ receipts of exactly what the model was told.
 
 ## Prerequisites
 
-- Node.js 20 or newer for this extension; your installed Pi version may require a
-  newer Node.js (see [Getting started](docs/getting-started.md#prerequisites)).
-- Pi, installed independently.
+- Node.js 22.19.0 or newer; this extension's support floor matches Pi 1.0.0's
+  verified minimum (see [Getting started](docs/getting-started.md#prerequisites)).
+- Pi 1.0.0 or newer, installed independently; Pi versions below 1.0.0 are outside
+  the supported compatibility scope.
 - Git on `PATH` for captured/worktree-based delegated execution (capture, landing,
   recovery, and diff3 conflict materialization). Opt-in in-place work also supports
   non-Git directories. Ordinary review evidence capture uses Git when available

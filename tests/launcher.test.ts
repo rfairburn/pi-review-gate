@@ -90,6 +90,9 @@ function launcherEnv(fixture: LauncherFixture, overrides: NodeJS.ProcessEnv = {}
   delete env.PI_CODING_AGENT_DIR;
   delete env.PI_REVIEW_GATE_RUNTIME_ROLE;
   delete env.PI_REVIEW_GATE_DISABLED;
+  // Hermeticity for the wrapper-owned codemode default: tests that verify the
+  // export set it explicitly (including its inherited-value override).
+  delete env.PI_REVIEW_GATE_CODEMODE_DEFAULT;
   return {
     ...env,
     HOME: fixture.home,
@@ -262,6 +265,106 @@ test("persistent launcher clears an inherited scheduler flag and honors --schedu
 
   await runLauncher(["--scheduler", "--model", "example"], envFor());
   await assertFlaggedLaunch("no inherited value");
+});
+
+test("persistent launcher exports the wrapper codemode default without rewriting tool arguments", async () => {
+  const fixture = await makeLauncherFixture("pi-review-launcher-codemode-");
+  await mkdir(join(fixture.fallbackConfigPath, ".."), { recursive: true });
+  await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
+  const piPath = join(fixture.bin, "pi");
+  await writeFile(piPath, [
+    "#!/usr/bin/env bash",
+    "printf '%s' \"${PI_REVIEW_GATE_CODEMODE_DEFAULT:-unset}\" > \"$CAPTURE_DIR/codemode-env\"",
+    "printf '%s\\n' \"$@\" > \"$CAPTURE_DIR/args\"",
+  ].join("\n"), "utf8");
+  await chmod(piPath, 0o755);
+
+  const result = await runLauncher(
+    ["--model", "example", "--tools", "read,bash", "--exclude-tools", "bash", "--no-extensions"],
+    // An inherited value must not survive: the wrapper owns the normal-launch
+    // default (the same scoped overwriting as PI_REVIEW_GATE_CONFIG).
+    launcherEnv(fixture, { PI_REVIEW_GATE_CODEMODE_DEFAULT: "0" }),
+  );
+
+  assert.equal(
+    await readFile(join(fixture.capture, "codemode-env"), "utf8"),
+    "1",
+    "normal launches must export the wrapper's scoped codemode default",
+  );
+  // Tool restrictions reach pi byte-exact: the wrapper default must never
+  // append or replace a pi tool argument (Pi's --tools replaces the
+  // selection; the extension enables codemode only when Pi's
+  // policy-filtered tool set still contains it).
+  assert.equal(
+    await readFile(join(fixture.capture, "args"), "utf8"),
+    `--extension\n${resolve("dist/src/index.js")}\n--model\nexample\n--tools\nread,bash\n--exclude-tools\nbash\n--no-extensions\n`,
+  );
+  assert.doesNotMatch(result.stdout, /--tools/, "the wrapper must not inject pi tool flags");
+});
+
+test("persistent launcher management passthrough (including native pi mcp) skips setup and never sets the codemode flag", async () => {
+  // Every management-invocation form, including Pi 1.0's native `pi mcp`
+  // management (`pi mcp` shell commands do not load extensions), must behave
+  // exactly like `exec pi` before any wrapper setup: no config resolution or
+  // initialization, no build, no DDGS or skill publication, and never the
+  // launcher's codemode export.
+  const forms: string[][] = [
+    ["list"],
+    ["mcp"],
+    ["mcp", "add", "docs", "--url", "https://example.com/mcp"],
+  ];
+  for (const args of forms) {
+    const fixture = await makeLauncherFixture(`pi-review-launcher-mgmt-${args[0]}-`);
+    const piPath = join(fixture.bin, "pi");
+    await writeFile(piPath, [
+      "#!/usr/bin/env bash",
+      "printf '%s' \"${PI_REVIEW_GATE_CODEMODE_DEFAULT:-unset}\" > \"$CAPTURE_DIR/codemode-env\"",
+      "printf '%s\\n' \"$@\" > \"$CAPTURE_DIR/args\"",
+    ].join("\n"), "utf8");
+    await chmod(piPath, 0o755);
+
+    // exec pi parity for the environment: an inherited value reaches pi
+    // untouched (the passthrough never rewrites it, never exports the
+    // default, and never strips it).
+    await runLauncher(args, launcherEnv(fixture, { PI_REVIEW_GATE_CODEMODE_DEFAULT: "0" }));
+    assert.equal(
+      await readFile(join(fixture.capture, "codemode-env"), "utf8"),
+      "0",
+      `management passthrough keeps the inherited environment (${args.join(" ")})`,
+    );
+    assert.equal(
+      await readFile(join(fixture.capture, "args"), "utf8"),
+      `${args.join("\n")}\n`,
+      "management passthrough forwards the arguments untouched (no extension flag)",
+    );
+    assert.equal(
+      await pathExists(join(fixture.home, ".pi")),
+      false,
+      "management passthrough must not initialize the config",
+    );
+    assert.equal(
+      await pathExists(join(fixture.home, ".agents")),
+      false,
+      "management passthrough must not publish the skills",
+    );
+  }
+
+  // With no inherited value the passthrough exports nothing: the launcher
+  // itself never sets the flag for a management invocation.
+  const fixture = await makeLauncherFixture("pi-review-launcher-mgmt-clean-");
+  const piPath = join(fixture.bin, "pi");
+  await writeFile(piPath, [
+    "#!/usr/bin/env bash",
+    "printf '%s' \"${PI_REVIEW_GATE_CODEMODE_DEFAULT:-unset}\" > \"$CAPTURE_DIR/codemode-env\"",
+    "printf '%s\\n' \"$@\" > \"$CAPTURE_DIR/args\"",
+  ].join("\n"), "utf8");
+  await chmod(piPath, 0o755);
+  await runLauncher(["list"], launcherEnv(fixture));
+  assert.equal(
+    await readFile(join(fixture.capture, "codemode-env"), "utf8"),
+    "unset",
+    "a clean management invocation must not gain the codemode default",
+  );
 });
 
 test("persistent launcher refreshes a stale installed orchestrator skill", async () => {

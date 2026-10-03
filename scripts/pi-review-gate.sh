@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Pi management verbs pass straight through to pi (Pi package management and
+# Pi 1.0's native `pi mcp` management, which remains Pi-owned): no setup runs,
+# the inherited environment and arguments reach pi untouched, and the wrapper's
+# normal-launch exports below never apply.
 case "${1:-}" in
-  update|install|remove|uninstall|list|config|auth)
+  update|install|remove|uninstall|list|config|auth|mcp)
     exec pi "$@"
     ;;
 esac
@@ -327,7 +331,7 @@ EOF
   # name stays private in $dir until it is linked into place or removed.
   if ! command -v node >/dev/null 2>&1; then
     rm -f "$tmp"
-    echo "pi-review-gate: the node runtime is required to publish the default config (install Node.js 20 or newer); create a config manually at $primary or $fallback" >&2
+    echo "pi-review-gate: the node runtime is required to publish the default config (install Node.js 22.19.0 or newer); create a config manually at $primary or $fallback" >&2
     return 1
   fi
   if node -e 'require("node:fs").linkSync(process.argv[1], process.argv[2]);' "$tmp" "$primary" 2>/dev/null; then
@@ -428,7 +432,7 @@ publish_skill_file() {
   local skill_source="$1" skill_destination="$2" dir tmp
   dir="$(dirname "$skill_destination")"
   if ! command -v node >/dev/null 2>&1; then
-    echo "pi-review-gate: the node runtime is required to publish the skill files (install Node.js 20 or newer)" >&2
+    echo "pi-review-gate: the node runtime is required to publish the skill files (install Node.js 22.19.0 or newer)" >&2
     return 1
   fi
   tmp="$(mktemp "$dir/.skill-publish.XXXXXXXX")" || {
@@ -518,6 +522,18 @@ done
 if [[ -n "$SCHEDULER_ENABLED" ]]; then
   export PI_REVIEW_GATE_SCHEDULER="$SCHEDULER_ENABLED"
 fi
+
+# Wrapper-only codemode default (normal launches only): export
+# PI_REVIEW_GATE_CODEMODE_DEFAULT=1 so the extension can enable Pi's
+# registered native codemode tool without rewriting any pi tool argument.
+# Tool restrictions (--tools/--exclude-tools/--no-tools/--no-extensions) are
+# forwarded untouched and Pi's policy-filtered getAllTools stays
+# authoritative: the extension enables codemode only when Pi's current
+# policy-filtered tool set contains it. The value is always set here, so an
+# inherited value is overwritten and the wrapper owns the default for every
+# normal launch; the management passthrough above never runs this setup and
+# never sets the flag. Keep in sync with scripts/pi-review-gate-launcher.cjs.
+export PI_REVIEW_GATE_CODEMODE_DEFAULT="1"
 
 # The extension owns the operating-mode system prompt segment (issue 19); the
 # launcher no longer passes a permanent --append-system-prompt, so mode

@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.112]
+
+### Fixed
+
+- Restore native Windows raw parent-review baseline capture when directory-handle
+  fsync returns `EPERM`, matching the existing Git checkpoint exception. File
+  flushes and other filesystem failures remain mandatory; mocked Windows tests
+  cover ancestor and final-directory flushes and fail-closed error boundaries
+  (#282).
+- Apply the existing Windows path-stat/open-handle device-ID normalization to
+  raw file capture and record reload, preserving all other identity checks;
+  accept native absolute descriptor roots so Windows drive and UNC paths can
+  reload without accepting relative paths (#282).
+
 ## [0.1.0-dev.111]
 
 ### Changed

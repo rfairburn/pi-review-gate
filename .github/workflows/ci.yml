@@ -225,6 +225,8 @@ jobs:
       # tests are exercised natively without further workflow edits.
       - name: Windows Git checkpoint native smoke
         run: node --test --test-name-pattern="native Windows Git checkpoint" dist-test/tests/git-checkpoint.test.js
+      - name: Windows raw checkpoint regressions (mocked boundaries and native flow)
+        run: node --test dist-test/tests/review-checkpoint-windows.test.js
       - name: Launcher tests (helper pipeline + native .cmd cases)
         run: node --test dist-test/tests/launcher-cmd.test.js
       - name: Launcher development-build seam on native Windows
@@ -267,6 +269,8 @@ jobs:
       # checkpoint …" regression runs natively on this Node version too.
       - name: Windows Git checkpoint native smoke (Node 24)
         run: node --test --test-name-pattern="native Windows Git checkpoint" dist-test/tests/git-checkpoint.test.js
+      - name: Windows raw checkpoint regressions (Node 24)
+        run: node --test dist-test/tests/review-checkpoint-windows.test.js
       - name: Windows private wave capture mode smoke (Node 24)
         run: >-
           node --test --test-name-pattern="native Windows wave"

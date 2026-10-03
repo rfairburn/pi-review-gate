@@ -34,8 +34,8 @@ without one there are no global excludes. Comparisons use the frozen after-check
 against separate window and exchange baselines; a checkpoint is not itself a passing
 review or a substitute for either baseline.
 
-On Windows, Git checkpoint record files are still flushed, but an unsupported
-directory fsync is best-effort: a power loss may lose a newly created directory
+On Windows, Git and non-Git checkpoint record files are still flushed, but a
+directory-handle fsync rejected with `EPERM` is best-effort: a power loss may lose a newly created directory
 entry. Restart verifies the surviving checkpoint rather than assuming it survived.
 
 Exact `write` / `edit` paths and easy shell targets are pre-captured before execution,

@@ -17,6 +17,7 @@ import {
 } from "../src/execution/wave-repository";
 import { executeWaveLanding, planWaveLanding } from "../src/execution/wave-landing";
 import { integrationRefName } from "../src/execution/wave-worktrees";
+import { isSourceIdentity } from "../src/execution/source-identity";
 
 const execFileAsync = promisify(execFile);
 
@@ -223,7 +224,7 @@ test("native Windows wave capture ignores worktree mode noise but preserves stag
     const sourceTree = (await git(["rev-parse", "HEAD^{tree}"], dir)).trim();
     const cleanTree = await gitInRepo(["rev-parse", `${clean.baseCommit}^{tree}`], clean.repositoryPath);
     assert.equal(cleanTree, sourceTree, "Windows stat must not flip a clean tracked executable mode");
-    assert.ok(clean.sourceIdentity.dev > 0 && clean.sourceIdentity.ino > 0,
+    assert.ok(BigInt(clean.sourceIdentity.dev) > 0n && BigInt(clean.sourceIdentity.ino) > 0n,
       "capture must bind to an opened directory's strong NTFS volume and inode identity");
     await gitInRepo(["update-ref", integrationRefName(clean.waveId), clean.baseCommit], clean.repositoryPath);
     const emptyPlan = await planWaveLanding(clean, clean.baseCommit, dir);
@@ -1703,10 +1704,13 @@ test("capture — sourceIdentity is captured with dev and ino", async () => {
     });
 
     assert.ok(result.sourceIdentity, "sourceIdentity should be present");
-    assert.ok(typeof result.sourceIdentity.dev === "number", "dev should be a number");
-    assert.ok(typeof result.sourceIdentity.ino === "number", "ino should be a number");
-    assert.ok(result.sourceIdentity.dev > 0, "dev should be positive");
-    assert.ok(result.sourceIdentity.ino > 0, "ino should be positive");
+    assert.ok(isSourceIdentity(result.sourceIdentity), "dev and ino should have canonical exact encodings");
+    if (process.platform !== "win32") {
+      assert.equal(typeof result.sourceIdentity.dev, "number", "POSIX dev remains numeric");
+      assert.equal(typeof result.sourceIdentity.ino, "number", "POSIX ino remains numeric");
+    }
+    assert.ok(BigInt(result.sourceIdentity.dev) > 0n, "dev should be positive");
+    assert.ok(BigInt(result.sourceIdentity.ino) > 0n, "ino should be positive");
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(artifactDir, { recursive: true, force: true });
@@ -1766,8 +1770,8 @@ test("capture — rejects capture when source identity is unstable (ino=0)", asy
     });
 
     // Verify the identity is stable (non-zero dev and ino).
-    assert.ok(result.sourceIdentity.dev > 0, "dev should be non-zero on stable platforms");
-    assert.ok(result.sourceIdentity.ino > 0, "ino should be non-zero on stable platforms");
+    assert.ok(BigInt(result.sourceIdentity.dev) > 0n, "dev should be non-zero on stable platforms");
+    assert.ok(BigInt(result.sourceIdentity.ino) > 0n, "ino should be non-zero on stable platforms");
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(artifactDir, { recursive: true, force: true });

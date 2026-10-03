@@ -48,6 +48,12 @@ function identity(a: Stats, b: Stats): boolean {
   return a.dev === b.dev && a.ino === b.ino && a.mode === b.mode && a.size === b.size
     && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
 }
+function fileHandleIdentity(pathStat: Stats, handleStat: Stats): boolean {
+  // NTFS path lstat can omit the volume ID while fstat reports it. Normalize
+  // only that cross-API mismatch; path/path checks and every other field stay strict.
+  return identity(pathStat, process.platform === "win32" && pathStat.dev === 0
+    ? { ...handleStat, dev: 0 } : handleStat);
+}
 function sha(bytes: Buffer): string { return createHash("sha256").update(bytes).digest("hex"); }
 function checkAbort(options: GitCheckpointOptions): void {
   if (options.signal?.aborted) throw new Error("checkpoint aborted");
@@ -84,7 +90,14 @@ async function storePath(root: string): Promise<string> {
 }
 async function syncDirectory(dir: string): Promise<void> {
   const handle = await open(dir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-  try { await handle.sync(); } finally { await handle.close(); }
+  try {
+    try { await handle.sync(); }
+    catch (error) {
+      // Windows rejects directory fsync; only that observed unsupported flush
+      // is best-effort. Opening directories and flushing files remain strict.
+      if (process.platform !== "win32" || (error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+    }
+  } finally { await handle.close(); }
 }
 
 /** Persist each directory entry created for the raw record, through root. */
@@ -242,7 +255,7 @@ async function rawEntry(root: string, path: string, options: GitCheckpointOption
   if (pre.isFile()) {
     const handle = await open(absolute, constants.O_RDONLY | constants.O_NOFOLLOW);
     try {
-      if (!identity(pre, await handle.stat())) throw new Error(`file raced: ${path}`);
+      if (!fileHandleIdentity(pre, await handle.stat())) throw new Error(`file raced: ${path}`);
       const bytes = Buffer.alloc(pre.size);
       let offset = 0;
       while (offset < bytes.length) {
@@ -250,7 +263,7 @@ async function rawEntry(root: string, path: string, options: GitCheckpointOption
         if (!bytesRead) throw new Error(`short read: ${path}`);
         offset += bytesRead;
       }
-      if (!identity(pre, await handle.stat())) throw new Error(`file raced: ${path}`);
+      if (!fileHandleIdentity(pre, await handle.stat())) throw new Error(`file raced: ${path}`);
       contentB64 = bytes.toString("base64");
     } finally { await handle.close(); }
   } else {
@@ -325,8 +338,7 @@ export async function captureReviewCheckpoint(root: string, windowId: string, op
       const handle = await open(tmp, "wx", 0o600);
       try { await handle.writeFile(payload); await handle.sync(); } finally { await handle.close(); }
       await rename(tmp, record);
-      const dh = await open(owned, constants.O_RDONLY | constants.O_DIRECTORY);
-      try { await dh.sync(); } finally { await dh.close(); }
+      await syncDirectory(owned);
       published = true;
       return { status: "ok", value: { kind: "raw", format: FORMAT, root: dir, windowId, owner, digest: sha(payload) } };
     } finally { if (!published) await rm(owned, { recursive: true, force: true }); }
@@ -451,7 +463,7 @@ export async function changedRawCheckpointPaths(root: string, descriptor: Extrac
 function validateDescriptor(value: ReviewCheckpointDescriptor): asserts value is Extract<ReviewCheckpointDescriptor, { kind: "raw" }> {
   if (value?.kind !== "raw" || value.format !== FORMAT || !isSafeWindowId(value.windowId)
     || !/^[0-9a-f]{32}$/.test(value.owner) || !/^[0-9a-f]{64}$/.test(value.digest)
-    || typeof value.root !== "string" || !value.root.startsWith("/")) throw new Error("malformed raw descriptor");
+    || typeof value.root !== "string" || !isAbsolute(value.root)) throw new Error("malformed raw descriptor");
 }
 /** Verify owner, root, stored digest, record schema and each raw entry before use. */
 export async function loadReviewCheckpoint(root: string, descriptor: ReviewCheckpointDescriptor, options: GitCheckpointOptions = {}): Promise<ReviewCheckpointResult<{ kind: "git"; record: GitCheckpointRecord } | { kind: "raw"; entries: GitCheckpointUntrackedEntry[] }>> {
@@ -477,9 +489,9 @@ export async function loadReviewCheckpoint(root: string, descriptor: ReviewCheck
     const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
     let bytes: Buffer;
     try {
-      if (!identity(s, await handle.stat())) throw new Error("record raced");
+      if (!fileHandleIdentity(s, await handle.stat())) throw new Error("record raced");
       bytes = await handle.readFile();
-      if (!identity(s, await handle.stat()) || bytes.length !== s.size) throw new Error("record raced");
+      if (!fileHandleIdentity(s, await handle.stat()) || bytes.length !== s.size) throw new Error("record raced");
     } finally { await handle.close(); }
     if (!identity(s, await lstat(path)) || sha(bytes) !== descriptor.digest) throw new Error("record digest/identity mismatch");
     const text = bytes.toString("utf8");

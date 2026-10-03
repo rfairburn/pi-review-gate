@@ -104,6 +104,7 @@ async function makeFixture(prefix: string, options: { skipNpmShim?: boolean; emp
     "  args: process.argv.slice(2),",
     "  configEnv: process.env.PI_REVIEW_GATE_CONFIG ?? null,",
     "  disabledEnv: process.env.PI_REVIEW_GATE_DISABLED ?? null,",
+    "  codemodeEnv: process.env.PI_REVIEW_GATE_CODEMODE_DEFAULT ?? null,",
     "  agentDirEnv: process.env.PI_CODING_AGENT_DIR ?? null,",
     "  ddgsEnv: process.env.PI_REVIEW_GATE_DDGS_PYTHON ?? null,",
     "}));",
@@ -233,6 +234,9 @@ function fixtureEnv(fixture: Fixture, overrides: NodeJS.ProcessEnv = {}): NodeJS
   delete env.PI_CODING_AGENT_DIR;
   delete env.PI_REVIEW_GATE_RUNTIME_ROLE;
   delete env.PI_REVIEW_GATE_DISABLED;
+  // Hermeticity for the wrapper-owned codemode default (tests that verify the
+  // helper's export set it explicitly, including its inherited-value override).
+  delete env.PI_REVIEW_GATE_CODEMODE_DEFAULT;
   delete env.PI_REVIEW_GATE_DDGS_PYTHON;
   delete env.PI_REVIEW_GATE_DDGS_VENV;
   // On POSIX node's os.homedir() honors HOME; on win32 it honors USERPROFILE
@@ -272,6 +276,7 @@ interface LaunchCapture {
   args: string[];
   configEnv: string | null;
   disabledEnv: string | null;
+  codemodeEnv: string | null;
   agentDirEnv: string | null;
   ddgsEnv: string | null;
 }
@@ -393,7 +398,11 @@ test("launcher helper resolves, exports and forwards on a normal launch", async 
   const prior = '{"enabled":true,"marker":"default"}\n';
   await writeFile(fixture.defaultConfigPath, prior, "utf8");
 
-  const result = await runHelper(["--model", "example", "--tools", "read,bash"], fixtureEnv(fixture));
+  const result = await runHelper(["--model", "example", "--tools", "read,bash"], fixtureEnv(fixture, {
+    // An inherited value must not survive: the wrapper owns the normal-launch
+    // default (the same scoped overwriting as PI_REVIEW_GATE_CONFIG).
+    PI_REVIEW_GATE_CODEMODE_DEFAULT: "0",
+  }));
 
   const launch = await capturedLaunch(fixture);
   const extensionPath = resolve("dist/src/index.js");
@@ -401,6 +410,8 @@ test("launcher helper resolves, exports and forwards on a normal launch", async 
   assert.equal(launch.configEnv, fixture.defaultConfigPath,
     "the helper must export the resolved persistent config for pi");
   assert.equal(launch.disabledEnv, null);
+  assert.equal(launch.codemodeEnv, "1",
+    "normal launches export the wrapper's scoped codemode default, overriding any inherited value");
   assert.equal(launch.agentDirEnv, null);
   assert.ok(launch.ddgsEnv, "the DDGS python must be exported for the extension's web search");
   assert.equal(launch.ddgsEnv, helperModule.ddgsPythonPath(fixtureDdgsVenv(fixture), process.platform),
@@ -754,13 +765,15 @@ test("launcher helper management verbs pass straight through to pi without setup
     const inherited = join(fixture.root, "inherited.json");
     await writeFile(inherited, "{}\n", "utf8");
 
-    await runHelper([verb], fixtureEnv(fixture, { PI_REVIEW_GATE_CONFIG: inherited }));
+    await runHelper([verb], fixtureEnv(fixture, { PI_REVIEW_GATE_CONFIG: inherited, PI_REVIEW_GATE_CODEMODE_DEFAULT: "0" }));
 
     const launch = await capturedLaunch(fixture);
     assert.deepEqual(launch.args, [verb],
       "passthrough must forward the verb without the extension flag");
     assert.equal(launch.configEnv, inherited,
       "passthrough keeps the inherited environment (exec pi \"$@\" parity)");
+    assert.equal(launch.codemodeEnv, "0",
+      "management passthrough keeps the inherited codemode value and never exports the wrapper default");
     assert.equal(await pathExists(fixture.agentDir), false, "no config initialization on passthrough");
     assert.equal(await pathExists(join(fixture.home, ".agents")), false, "no skill publication on passthrough");
     assert.equal(await pathExists(join(fixture.capture, "npm-args")), false, "no build on passthrough");
@@ -1722,6 +1735,7 @@ if (isWindows) {
     const launch = JSON.parse(await readFile(join(fixture.capture, "pi.json"), "utf8"));
     assert.deepEqual(launch.args, ["--extension", resolve("dist/src/index.js"), "--model", "example"]);
     assert.equal(launch.configEnv, fixture.defaultConfigPath);
+    assert.equal(launch.codemodeEnv, "1", "the native launch must export the codemode default");
     assert.equal(launch.ddgsEnv, join(sharedWindowsVenv ?? "", "Scripts", "python.exe"),
       "the native launch must export the provisioned DDGS python for web search");
     assert.deepEqual(JSON.parse(await readFile(fixture.defaultConfigPath, "utf8")), zeroModelDefaultConfig);
@@ -1776,7 +1790,7 @@ if (isWindows) {
 
     const result = runCmd(
       'scripts\\pi-review-gate.cmd list --label "a&b|c^d" --caret "a^b" --quote "say ""&hi""" --pct "100%PI%"',
-      fixtureEnv(fixture, { PI_REVIEW_GATE_CONFIG: inherited, PI_EXIT_CODE: "9" }),
+      fixtureEnv(fixture, { PI_REVIEW_GATE_CONFIG: inherited, PI_EXIT_CODE: "9", PI_REVIEW_GATE_CODEMODE_DEFAULT: "0" }),
     );
 
     assert.equal(result.status, 9, `pi's nonzero exit status must propagate: ${result.stderr}`);
@@ -1790,6 +1804,8 @@ if (isWindows) {
     ], "management arguments must reach pi byte for byte without a cmd re-parsing pass");
     assert.equal(launch.configEnv, inherited,
       "the passthrough must keep the inherited environment");
+    assert.equal((launch as { codemodeEnv?: string | null }).codemodeEnv, "0",
+      "the management passthrough must not export the wrapper codemode default");
     assert.equal(await pathExists(fixture.agentDir), false, "no config initialization on passthrough");
     assert.equal(await pathExists(join(fixture.home, ".agents")), false, "no skill publication on passthrough");
     assert.equal(await pathExists(join(fixture.capture, "npm-args")), false, "no build on passthrough");

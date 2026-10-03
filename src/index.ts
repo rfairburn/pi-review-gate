@@ -45,6 +45,7 @@ import {
 import { boundPath, handleCwdMismatchRestore, safeRestoreFailureDiagnostic, sendNoticeUnlessItThrows } from "./activation/diagnostics";
 import { createSessionPersistence } from "./activation/persistence";
 import { deferredToolPromptInjection, executionPromptInjection, extractSystemPrompt } from "./activation/prompt-composition";
+import { capturePrimaryCodemodeDefault } from "./activation/primary-codemode-default";
 import { recoverPendingModelDeliveries, releaseQueuedUserInputs } from "./activation/pending-delivery";
 import { createReviewTurnCoordinator, isToolError } from "./activation/review-turn";
 import { registerApplyPatchTool } from "./apply-patch/tool";
@@ -86,10 +87,18 @@ interface ActivationDependencies {
 }
 
 export async function activate(pi: unknown, dependencies: ActivationDependencies = {}): Promise<void> {
+  // Capture wrapper intent and consume its one-shot environment marker before
+  // any await, tool registration, or model-spawned subprocess can inherit it.
+  const executorRole = process.env.PI_REVIEW_GATE_RUNTIME_ROLE === "executor";
+  const wrapperCodemodeMarker = !executorRole && process.env.PI_REVIEW_GATE_CODEMODE_DEFAULT === "1";
+  delete process.env.PI_REVIEW_GATE_CODEMODE_DEFAULT;
+  // Wrapper opt-in is process-local primary intent. Executor runtimes are
+  // governed only by their fixed catalog and neither read nor retain it.
+  const wrapperCodemodeDefault = !executorRole && capturePrimaryCodemodeDefault(wrapperCodemodeMarker);
+
   // Live session working directory. The top-level branch keeps it updated from
   // hook context; a Pi executor worker's cwd is its stable worktree root.
   let currentCwd = process.cwd();
-  const executorRole = process.env.PI_REVIEW_GATE_RUNTIME_ROLE === "executor";
   let executorSettlementBootstrap: PiSettlementBootstrap | undefined;
   let executorSettlementBootstrapError: Error | undefined;
   if (executorRole) {
@@ -161,6 +170,20 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       );
     }
     const deferredTools = new DeferredToolManager(pi);
+    registerDeferredToolLifecycleHooks(pi, deferredTools);
+    let terminal = false;
+    const acknowledgementFailure = () => executorSettlementBootstrapError
+      ?? (!executorSettlementBootstrap || terminal ? new Error(
+        "Pi executor settlement bootstrap is unavailable or retired. Executor reload/replacement is unsupported; restart this worker with a fresh parent-issued identity.",
+      ) : undefined);
+    toolCallObserver = (...args) => {
+      const failure = acknowledgementFailure();
+      if (failure) return { block: true, reason: failure.message };
+      const name = extractToolName(args);
+      const nested = hasNestedToolCallParent(args);
+      if (!deferredTools.toolCallAllowed(name, nested)) return nativeToolAuthorizationBlock(name, nested);
+      return nativeToolPreflight.preflight(args);
+    };
     if (!deferredTools.register()) {
       // This reduced executor has no bootstrap hooks below, so reset the
       // preflight alongside its existing session lifecycle handlers.
@@ -194,20 +217,10 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       deferredTools.reapply();
     });
     let settlementGeneration = 0;
-    let terminal = false;
     let receiptPublication = Promise.resolve();
-    const acknowledgementFailure = () => executorSettlementBootstrapError
-      ?? (!executorSettlementBootstrap || terminal ? new Error(
-        "Pi executor settlement bootstrap is unavailable or retired. Executor reload/replacement is unsupported; restart this worker with a fresh parent-issued identity.",
-      ) : undefined);
     // Bootstrap secrets are intentionally erased, not persisted across reload.
     // Pi logs most hook errors and continues: block tools explicitly, and never
     // publish a replacement receipt or reset a generation under the old identity.
-    toolCallObserver = (...args) => {
-      const failure = acknowledgementFailure();
-      if (failure) return { block: true, reason: failure.message };
-      return nativeToolPreflight.preflight(args);
-    };
     registerHook(pi, "session_shutdown", async () => {
       nativeToolPreflight.reset();
       terminal = true;
@@ -259,8 +272,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   // Register the compact loader before session_start. Authorization capture
   // is deliberately delayed until executionTools.sync() has registered and
   // reconciled every legitimately available top-level execution tool.
-  const deferredTools = new DeferredToolManager(pi, () => config.operatingMode);
+  const deferredTools = new DeferredToolManager(pi, () => config.operatingMode, wrapperCodemodeDefault);
   deferredTools.register();
+  registerDeferredToolLifecycleHooks(pi, deferredTools);
 
   // Pending questions (issue #95): AskUserQuestion registers before
   // session_start so it enters the deferred-tool authorization boundary like
@@ -765,8 +779,11 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
         reason: `review gate: ${triggeringFailure}; no tool call may execute until the review/auth boundary is restored in a new session`,
       };
     }
-    const decision = nativeToolPreflight.preflight(args);
     const name = extractToolName(args);
+    const nested = hasNestedToolCallParent(args);
+    const decision = deferredTools.toolCallAllowed(name, nested)
+      ? nativeToolPreflight.preflight(args)
+      : nativeToolAuthorizationBlock(name, nested);
     const toolArgs = extractToolArgs(args);
     const window = state.reviewWindow;
     if (window && shouldRecordToolCallEvidence(name)) {
@@ -1021,6 +1038,30 @@ async function cleanupReviewBundles(state: ReviewGateState): Promise<void> {
     window.bundleDir = undefined;
     window.retainBundleAfterClose = false;
   }
+}
+
+function registerDeferredToolLifecycleHooks(pi: unknown, deferredTools: DeferredToolManager): void {
+  // Pi exposes these real runtime boundaries for reconciling native tool
+  // registry changes; there is deliberately no synthetic tools_changed hook.
+  for (const event of ["turn_start", "session_tree", "mcp_servers_change"]) {
+    registerHook(pi, event, () => deferredTools.reapply());
+  }
+}
+
+function hasNestedToolCallParent(args: unknown[]): boolean {
+  return args.some((arg) => {
+    if (typeof arg !== "object" || arg === null) return false;
+    const parentToolCallId = (arg as { parentToolCallId?: unknown }).parentToolCallId;
+    return typeof parentToolCallId === "string" && parentToolCallId.length > 0;
+  });
+}
+
+function nativeToolAuthorizationBlock(name: string, nested: boolean): { block: true; reason: string } {
+  const target = name || "unknown tool";
+  return {
+    block: true,
+    reason: `review gate: ${nested ? "nested " : ""}native tool call to ${target} is not permitted by the live session authorization boundary`,
+  };
 }
 
 function canRegisterBackgroundShell(value: unknown): value is BackgroundShellHost {

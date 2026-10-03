@@ -164,8 +164,9 @@ test("executor role registers web tools and background shell without orchestrati
       assert.equal(captured.tools.has(tool), false, `executor child must not register ${tool}`);
     }
     // Executor children keep the native duplicate preflight hooks (message_end,
-    // tool_call, tool_execution_start, tool_result, and session resets) plus
-    // the background-shell and #84 diagnostic lifecycle hooks. Orchestrator
+    // tool_call, tool_execution_start, tool_result, session resets) and the
+    // deferred-manager turn/MCP reconciliation hooks, plus background-shell
+    // and #84 diagnostic lifecycle hooks. Orchestrator
     // review machinery (before_agent_start, input) and its command surface
     // must stay out of executor children.
     assert.deepEqual([...captured.hooks.keys()].sort(), [
@@ -173,6 +174,7 @@ test("executor role registers web tools and background shell without orchestrati
       "agent_settled",
       "agent_start",
       "context",
+      "mcp_servers_change",
       "message_end",
       "session_shutdown",
       "session_start",
@@ -180,6 +182,7 @@ test("executor role registers web tools and background shell without orchestrati
       "tool_call",
       "tool_execution_start",
       "tool_result",
+      "turn_start",
     ]);
     // agent_end is the only name the #84 bridge shares with the orchestrator's
     // review machinery; pin its count so provenance stays exact (web tools and

@@ -29,7 +29,8 @@ closed before any write:
   `workflow_dispatch`, forks, and other refs are refused. CI additionally invokes the
   builder only after all verification dependencies (`verify`, `full-tests`,
   `windows-launcher`, and `windows-shell`) succeeded. The `verify` matrix runs on
-  Node 20 and Node 24; both Windows jobs gate publication as well as the full suite.
+  Node 22.19.0 (the supported minimum) and Node 24; both Windows jobs gate
+  publication as well as the full suite.
   GitHub's implicit `success()` guard on `needs` skips publication when any dependency
   failed or was skipped. There is no `workflow_run`
   privilege chain, no custom PAT, and no GitHub App; the only write permission anywhere

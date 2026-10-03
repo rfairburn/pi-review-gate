@@ -50,6 +50,12 @@ of event-driven completion notifications or a decision-relevant, one-shot
 This is a native Pi extension-hook guard in the primary and Pi executor runtimes. It
 does not intercept calls made by an external API harness or wrapper such as
 `multi_tool_use.parallel` unless that wrapper dispatches them as native Pi tool calls.
+Calls nested inside a native tool are likewise native Pi tool calls — including the
+tool calls a `codemode` script issues, which Pi forwards through the same
+`tool_call`/`tool_result` hooks correlated to the parent script call — so this guard
+and the review-evidence capture apply to them as well; scripts are not a bypass, and a
+failed script does not undo the calls that already ran
+(see [Native Pi tools](native-pi-tools.md#codemode-calls-inside-the-gate)).
 
 ## Subtask tools
 
@@ -841,7 +847,20 @@ tool. Every adapter also receives a private worktree
 check that quarantines any detected write. Generic binary adapters are ineligible for
 research because their protocol does not acknowledge the restriction. Research
 subtasks never receive `ApplyPatch`, and they never receive an arbitrary shell in
-either native form (`bash` or `powershell`). Enforcement details are owned by
+either native form (`bash` or `powershell`). Native MCP and codemode surfaces on
+delegated Pi workers follow the same role boundary: research workers never carry the
+`codemode` transport or any MCP tool name — no callable MCP tools and no default MCP
+exposure for research, no `readOnlyHint` opt-in, and no researcher override (a supplied
+catalog cannot add either back, so there is no restricted-researcher script path),
+while an execute worker carries `codemode` only
+when the parent's captured authorization did — no separate worker-side enablement.
+Codemode scripts are bounded by the worker's registered tools, never a capability
+grant: names outside the captured ceiling or removed by explicit restrictions are
+unreachable from scripts as well, MCP annotations are treated as unverified hints and
+never as a presumption of safety, and registration or re-enablement never widens the
+worker's immutable captured ceiling. Defaults and dynamic reconciliation are owned by
+[Native Pi tools](native-pi-tools.md#delegated-pi-workers-the-fixed-captured-ceiling).
+Enforcement details are owned by
 [Security model](security-model.md#read-only-enforcement).
 
 ## Artifacts

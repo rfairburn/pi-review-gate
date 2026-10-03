@@ -65,7 +65,7 @@ const KEYS = {
 const textKeys = (text: string): string => Buffer.from(text, "utf8").toString("hex");
 
 interface DriverStep {
-  type: "wait" | "wait_exit" | "send" | "send_slow" | "settle" | "assert_screen" | "assert_latest";
+  type: "wait" | "wait_exit" | "send" | "send_slow" | "settle" | "assert_screen" | "assert_latest" | "assert_terminal" | "decoder_check";
   marker?: string;
   hex?: string;
   delayMs?: number;
@@ -192,6 +192,7 @@ test("live Pi TUI smoke: /review-settings workspace field drives the real native
   const taskMenuDowns = 5; // "Workspace" is row 6 after the Destination row
   const slowDowns = (count: number): string => KEYS.down.repeat(count);
   const steps: DriverStep[] = [
+    { type: "decoder_check" },
     { type: "wait", marker: "Press ctrl+o", timeoutMs: 30_000 },
     // Frame slicing below depends on this exact host status marker. A Pi
     // upgrade must fail loudly rather than silently comparing stale history.
@@ -284,12 +285,12 @@ test("live Pi TUI smoke: /review-settings workspace field drives the real native
     { type: "send", hex: KEYS.escape },
     { type: "assert_latest", includes: ["Review settings"] },
     { type: "send", hex: KEYS.escape },
-    // Inspect only fresh output after the last Esc, not any prior menu/field
-    // frame: no field text leaked into chat and no offline API-key error from
-    // an accidental submission. This is a screen observation, not a proof
-    // about unrendered internal state.
+    // Apply the real VT cursor/erase stream since startup, then inspect the
+    // current terminal buffer after the final Esc. Old raw menu text cannot
+    // satisfy these screen assertions; this is not a claim about unrendered
+    // internal state or field contents that are not visible on screen.
     { type: "settle", seconds: 2 },
-    { type: "assert_latest", includes: ["operating mode:"], excludes: ["Review settings", "ext-edit-mark", "docs/Z", "No API key"] },
+    { type: "assert_terminal", includes: ["operating mode:"], excludes: ["Review settings", "ext-edit-mark", "docs/Z", "No API key"] },
     // Ctrl+C twice is the documented host exit: proves real Ctrl+C delivery
     // end to end and tears the session down cleanly.
     { type: "send", hex: KEYS.ctrlC + KEYS.ctrlC },
@@ -321,6 +322,269 @@ import os, pty, sys, time, select, signal, json, re, struct, fcntl, termios
 
 sandbox, result_path = sys.argv[1:3]
 steps = json.load(open(os.path.join(sandbox, "steps.json")))
+
+class VTScreen:
+    """Render actual PTY VT100/xterm bytes; never synthesize Pi UI content."""
+    def __init__(self, rows, cols):
+        self.rows, self.cols = rows, cols
+        self.primary = self._blank_state()
+        self.alternate = self._blank_state()
+        self.active = self.primary
+        self.alternate_active = False
+        self.parser = "text"
+        self.sequence = ""
+        self.decoder = __import__("codecs").getincrementaldecoder("utf-8")("replace")
+        self.last_char = " "
+
+    def _blank_state(self):
+        return {
+            "cells": [[" "] * self.cols for _ in range(self.rows)],
+            "row": 0, "col": 0, "saved": (0, 0), "top": 0,
+            "bottom": self.rows - 1, "wrap": True, "wrap_pending": False,
+            "insert": False,
+        }
+
+    def _move(self, row=None, col=None):
+        if row is not None:
+            self.active["row"] = max(0, min(self.rows - 1, row))
+        if col is not None:
+            self.active["col"] = max(0, min(self.cols - 1, col))
+        self.active["wrap_pending"] = False
+
+    def _scroll_up(self, count=1):
+        state = self.active
+        top, bottom = state["top"], state["bottom"]
+        for _ in range(max(1, count)):
+            state["cells"].pop(top)
+            state["cells"].insert(bottom, [" "] * self.cols)
+
+    def _scroll_down(self, count=1):
+        state = self.active
+        top, bottom = state["top"], state["bottom"]
+        for _ in range(max(1, count)):
+            state["cells"].pop(bottom)
+            state["cells"].insert(top, [" "] * self.cols)
+
+    def _index(self):
+        state = self.active
+        state["wrap_pending"] = False
+        if state["row"] == state["bottom"]:
+            self._scroll_up()
+        else:
+            state["row"] = min(self.rows - 1, state["row"] + 1)
+
+    def _reverse_index(self):
+        state = self.active
+        state["wrap_pending"] = False
+        if state["row"] == state["top"]:
+            self._scroll_down()
+        else:
+            state["row"] = max(0, state["row"] - 1)
+
+    def _char_width(self, char):
+        import unicodedata
+        if unicodedata.combining(char):
+            return 0
+        return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+    def _put(self, char):
+        import unicodedata
+        state = self.active
+        width = self._char_width(char)
+        if width == 0:
+            col = max(0, state["col"] - (1 if state["wrap_pending"] else 0))
+            row = state["row"]
+            while col > 0 and state["cells"][row][col] == "":
+                col -= 1
+            state["cells"][row][col] += char
+            return
+        if state["wrap_pending"]:
+            if state["wrap"]:
+                state["col"] = 0
+                self._index()
+            state["wrap_pending"] = False
+        if width == 2 and state["col"] == self.cols - 1:
+            if state["wrap"]:
+                state["col"] = 0
+                self._index()
+            else:
+                return
+        row, col = state["row"], state["col"]
+        if state["insert"]:
+            state["cells"][row][col:col] = [" "] * width
+            del state["cells"][row][self.cols:]
+        state["cells"][row][col] = char
+        if width == 2:
+            state["cells"][row][col + 1] = ""
+        self.last_char = char
+        if col + width >= self.cols:
+            state["col"] = self.cols - 1
+            state["wrap_pending"] = state["wrap"]
+        else:
+            state["col"] += width
+
+    def _erase_line(self, mode):
+        row, col = self.active["row"], self.active["col"]
+        cells = self.active["cells"][row]
+        start, end = (col, self.cols) if mode == 0 else (0, col + 1) if mode == 1 else (0, self.cols)
+        cells[start:end] = [" "] * (end - start)
+
+    def _erase_display(self, mode):
+        row, col = self.active["row"], self.active["col"]
+        cells = self.active["cells"]
+        if mode == 0:
+            self._erase_line(0)
+            for y in range(row + 1, self.rows):
+                cells[y] = [" "] * self.cols
+        elif mode == 1:
+            for y in range(0, row):
+                cells[y] = [" "] * self.cols
+            self._erase_line(1)
+        elif mode == 2:
+            for y in range(self.rows):
+                cells[y] = [" "] * self.cols
+        elif mode == 3:
+            pass  # CSI 3 J clears scrollback, which this viewport doesn't model.
+
+    def _switch_screen(self, enter, clear=False):
+        if enter and not self.alternate_active:
+            self.primary["saved"] = (self.primary["row"], self.primary["col"])
+            if clear:
+                self.alternate = self._blank_state()
+            self.active = self.alternate
+            self.alternate_active = True
+        elif not enter and self.alternate_active:
+            self.active = self.primary
+            self.alternate_active = False
+            self._move(*self.primary["saved"])
+
+    def _csi(self, body, final):
+        private = body[:1] if body[:1] in "?<=>!" else ""
+        params_text = body[1:] if private else body
+        params_text = re.sub(r"[ -/].*$", "", params_text)
+        try:
+            params = [int(value) if value else 0 for value in params_text.split(";")]
+        except ValueError:
+            params = []
+        first = params[0] if params else 0
+        n = first or 1
+        state = self.active
+        if final in ("H", "f"):
+            row = params[0] if len(params) > 0 and params[0] else 1
+            col = params[1] if len(params) > 1 and params[1] else 1
+            self._move(row - 1, col - 1)
+        elif final == "A": self._move(row=state["row"] - n)
+        elif final == "B": self._move(row=state["row"] + n)
+        elif final == "C": self._move(col=state["col"] + n)
+        elif final == "D": self._move(col=state["col"] - n)
+        elif final == "E": self._move(row=state["row"] + n, col=0)
+        elif final == "F": self._move(row=state["row"] - n, col=0)
+        elif final == "G": self._move(col=n - 1)
+        elif final == "d": self._move(row=n - 1)
+        elif final == "J": self._erase_display(first)
+        elif final == "K": self._erase_line(first)
+        elif final == "X":
+            row, col = state["row"], state["col"]
+            state["cells"][row][col:min(self.cols, col + n)] = [" "] * min(n, self.cols - col)
+        elif final == "P":
+            row, col = state["row"], state["col"]
+            line = state["cells"][row]
+            del line[col:col + n]
+            line.extend([" "] * n)
+            del line[self.cols:]
+        elif final == "@":
+            row, col = state["row"], state["col"]
+            line = state["cells"][row]
+            line[col:col] = [" "] * n
+            del line[self.cols:]
+        elif final == "L":
+            if state["top"] <= state["row"] <= state["bottom"]:
+                for _ in range(n):
+                    state["cells"].pop(state["bottom"])
+                    state["cells"].insert(state["row"], [" "] * self.cols)
+        elif final == "M":
+            if state["top"] <= state["row"] <= state["bottom"]:
+                for _ in range(n):
+                    state["cells"].pop(state["row"])
+                    state["cells"].insert(state["bottom"], [" "] * self.cols)
+        elif final == "S": self._scroll_up(n)
+        elif final == "T": self._scroll_down(n)
+        elif final == "r":
+            top = params[0] if len(params) > 0 and params[0] else 1
+            bottom = params[1] if len(params) > 1 and params[1] else self.rows
+            if 1 <= top < bottom <= self.rows:
+                state["top"], state["bottom"] = top - 1, bottom - 1
+                self._move(0, 0)
+        elif final in ("s",): state["saved"] = (state["row"], state["col"])
+        elif final == "u": self._move(*state["saved"])
+        elif final in ("h", "l"):
+            enabled = final == "h"
+            if private == "?":
+                for mode in params:
+                    if mode == 1049: self._switch_screen(enabled, clear=True)
+                    elif mode == 1047: self._switch_screen(enabled, clear=True)
+                    elif mode == 47: self._switch_screen(enabled)
+                    elif mode == 7: self.active["wrap"] = enabled
+            elif not private and 4 in params:
+                self.active["insert"] = enabled
+        elif final == "m": pass  # SGR changes attributes, not screen text.
+
+    def _char(self, char):
+        code = ord(char)
+        if self.parser == "osc":
+            if char == "\x07": self.parser = "text"
+            elif char == "\x1b": self.parser = "osc_esc"
+            return
+        if self.parser == "osc_esc":
+            self.parser = "text" if char == "\\" else "osc"
+            return
+        if self.parser == "ignore":
+            if char == "\x1b": self.parser = "ignore_esc"
+            return
+        if self.parser == "ignore_esc":
+            self.parser = "text" if char == "\\" else "ignore"
+            return
+        if self.parser == "csi":
+            if 0x40 <= code <= 0x7e:
+                self._csi(self.sequence, char)
+                self.sequence = ""
+                self.parser = "text"
+            else:
+                self.sequence += char
+            return
+        if self.parser == "esc":
+            self.parser = "text"
+            if char == "[": self.parser = "csi"; self.sequence = ""
+            elif char == "]": self.parser = "osc"
+            elif char in ("P", "^", "_"): self.parser = "ignore"
+            elif char == "7": self.active["saved"] = (self.active["row"], self.active["col"])
+            elif char == "8": self._move(*self.active["saved"])
+            elif char == "D": self._index()
+            elif char == "E": self.active["col"] = 0; self._index()
+            elif char == "M": self._reverse_index()
+            elif char == "c":
+                self.primary = self._blank_state()
+                self.alternate = self._blank_state()
+                self.active = self.primary
+                self.alternate_active = False
+            elif char in "()*+-./": self.parser = "charset"
+            return
+        if self.parser == "charset":
+            self.parser = "text"
+            return
+        if char == "\x1b": self.parser = "esc"
+        elif char == "\r": self.active["col"] = 0; self.active["wrap_pending"] = False
+        elif char in ("\n", "\v", "\f"): self._index()
+        elif char == "\b": self._move(col=self.active["col"] - 1)
+        elif char == "\t": self._move(col=min(self.cols - 1, ((self.active["col"] // 8) + 1) * 8))
+        elif code >= 0x20 and code != 0x7f: self._put(char)
+
+    def feed(self, data):
+        for char in self.decoder.decode(data):
+            self._char(char)
+
+    def text(self):
+        return "\n".join("".join(row).rstrip() for row in self.active["cells"])
 
 home = os.path.join(sandbox, "home")
 workspace = os.path.join(sandbox, "workspace")
@@ -367,6 +631,7 @@ fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
 os.set_blocking(master, False)
 
 buffer = bytearray()
+terminal = VTScreen(40, 120)
 alive = [True]
 last_send_offset = [0]
 
@@ -384,6 +649,7 @@ def pump(seconds):
                 alive[0] = False
                 return
             buffer.extend(data)
+            terminal.feed(data)
 
 def clean(text):
     text = text.decode("utf-8", "replace") if isinstance(text, bytes) else text
@@ -448,7 +714,20 @@ for index, step in enumerate(steps):
     try:
         if not alive[0] and kind != "wait_exit":
             raise RuntimeError("pi exited before this step")
-        if kind == "wait":
+        if kind == "decoder_check":
+            # CSI 3 J clears scrollback, not the visible viewport. Keep this
+            # parser check separate from (and do not synthesize) the live Pi UI.
+            probe = VTScreen(2, 16)
+            probe.feed(b"visible\x1b[3J")
+            if "visible" not in probe.text():
+                raise RuntimeError("CSI 3 J incorrectly erased visible terminal text")
+            probe.feed(b"\r\x1b[2J")
+            if "visible" in probe.text():
+                raise RuntimeError("CSI 2 J failed to erase visible terminal text")
+            probe.feed(b"ABC\r\x1b[4hX")
+            if probe.text().splitlines()[0].rstrip() != "XABC":
+                raise RuntimeError("insert mode failed to shift existing terminal text")
+        elif kind == "wait":
             if not wait_for(step["marker"], step.get("timeoutMs", 30000)):
                 raise RuntimeError("timed out waiting for %r" % step["marker"])
         elif kind == "wait_exit":
@@ -491,6 +770,25 @@ for index, step in enumerate(steps):
             for marker in step.get("excludes", []):
                 if marker in current:
                     raise RuntimeError("fresh frame unexpectedly contains %r" % marker)
+        elif kind == "assert_terminal":
+            # This assertion is about what a user can currently see, not text
+            # emitted since the last key. Apply every real PTY byte (including
+            # cursor positioning and erase operations) to the VT screen above.
+            deadline = time.time() + step.get("timeoutMs", 20000) / 1000.0
+            includes = step.get("includes", [])
+            current = terminal.text()
+            while includes and not all(marker in current for marker in includes):
+                if time.time() >= deadline:
+                    break
+                pump(0.2)
+                current = terminal.text()
+            entry["screen"] = current[-3000:]
+            for marker in includes:
+                if marker not in current:
+                    raise RuntimeError("current terminal screen missing %r" % marker)
+            for marker in step.get("excludes", []):
+                if marker in current:
+                    raise RuntimeError("current terminal screen unexpectedly contains %r" % marker)
         elif kind == "assert_screen":
             current = visible()
             for marker in step.get("includes", []):
@@ -507,7 +805,7 @@ for index, step in enumerate(steps):
     except Exception as error:
         entry["ok"] = False
         entry["error"] = str(error)
-        entry["screen"] = visible()[-3000:]
+        entry.setdefault("screen", terminal.text()[-3000:] if kind == "assert_terminal" else visible()[-3000:])
         ok = False
     results.append(entry)
     if not ok:

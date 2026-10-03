@@ -52,6 +52,8 @@ interface SearchOutcome {
   matched: string[];
   activated: string[];
   alreadyActive: string[];
+  /** Matches with registered native codemode/deferred callable exposure; never activated here. */
+  nativeAvailable: string[];
   /** Matches withheld upstream of this result; absent when not recorded. */
   omitted?: number;
   outcome?: string;
@@ -90,11 +92,16 @@ export const renderDeferredToolResult: DeferredToolResultRenderer = (value, opti
     lines.push({ text: collapsedHeader(outcome, `activated ${outcome.activated.join(", ")}`), color: "toolTitle", bold: true });
   } else if (outcome.alreadyActive.length > 0) {
     lines.push({ text: collapsedHeader(outcome, `already active ${outcome.alreadyActive.join(", ")}`), color: "toolTitle", bold: true });
+  } else if (outcome.nativeAvailable.length > 0) {
+    lines.push({ text: collapsedHeader(outcome, `native available ${outcome.nativeAvailable.join(", ")}`), color: "toolTitle", bold: true });
   } else {
     lines.push({ text: collapsedHeader(outcome, "no matches"), color: "toolTitle", bold: true });
   }
   if (outcome.activated.length > 0 && outcome.alreadyActive.length > 0) {
     lines.push({ text: `Already active (${outcome.alreadyActive.length}): ${outcome.alreadyActive.join(", ")}.`, color: "muted" });
+  }
+  if (outcome.nativeAvailable.length > 0 && !(outcome.activated.length === 0 && outcome.alreadyActive.length === 0)) {
+    lines.push({ text: `Native callability left unchanged (${outcome.nativeAvailable.length}): ${outcome.nativeAvailable.join(", ")}.`, color: "muted" });
   }
   return renderComponent(lines, theme, true);
 };
@@ -145,6 +152,14 @@ export const renderExpandedDeferredToolResult: DeferredToolResultRenderer = (val
     lines.push({ text: "Already active:", color: "accent", bold: true });
     appendNames(lines, outcome.alreadyActive);
   }
+  if (outcome.nativeAvailable.length > 0) {
+    lines.push({ text: "Native availability (not activated by this search):", color: "accent", bold: true });
+    appendNames(lines, outcome.nativeAvailable);
+    lines.push({
+      text: "Native exposure left as registered: codemode tools stay callable from codemode scripts while inactive, and deferred tools are loaded and declared by the native tool_search tool.",
+      color: "muted",
+    });
+  }
   if (outcome.omitted !== undefined) {
     lines.push({ text: `Omitted matches: ${outcome.omitted}`, color: "muted" });
   }
@@ -165,7 +180,9 @@ export const renderExpandedDeferredToolResult: DeferredToolResultRenderer = (val
     ? outcome.activated[0]!
     : outcome.activated.length === 0 && outcome.alreadyActive.length === 1
       ? outcome.alreadyActive[0]!
-      : undefined;
+      : outcome.activated.length === 0 && outcome.alreadyActive.length === 0 && outcome.nativeAvailable.length === 1
+        ? outcome.nativeAvailable[0]!
+        : undefined;
   lines.push({
     text: single !== undefined
       ? `No ${single} operation was executed by this search.`
@@ -196,9 +213,10 @@ function decodeOutcome(value: unknown, options: DeferredToolRenderOptions, conte
   const matched = stringArrayField(details, "matched");
   const activated = stringArrayField(details, "activated");
   const explicitAlreadyActive = stringArrayField(details, "alreadyActive");
+  const nativeAvailable = stringArrayField(details, "nativeAvailable");
   const alreadyActive = explicitAlreadyActive.length > 0
     ? explicitAlreadyActive
-    : matched.filter((name) => !activated.includes(name));
+    : matched.filter((name) => !activated.includes(name) && !nativeAvailable.includes(name));
   const omitted = integerField(details, "omitted");
   const summary = resultText(record);
   const error = record?.isError === true;
@@ -208,8 +226,9 @@ function decodeOutcome(value: unknown, options: DeferredToolRenderOptions, conte
     && (Array.isArray(details.matched)
       || Array.isArray(details.activated)
       || Array.isArray(details.alreadyActive)
+      || Array.isArray(details.nativeAvailable)
       || outcome !== undefined);
-  return { query, matched, activated, alreadyActive, omitted, outcome, error, partial, summary, known };
+  return { query, matched, activated, alreadyActive, nativeAvailable, omitted, outcome, error, partial, summary, known };
 }
 
 function queryFromContext(context: unknown): string | undefined {

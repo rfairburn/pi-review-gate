@@ -41,6 +41,14 @@ const EXECUTOR_SHELL_TOOLS = ["bash", "powershell"] as const;
  * not treat it as baseline there — its top-level activity is pinned to the
  * plan/research operating mode by the deferred-tool manager instead — and
  * execute-kind child catalogs never contain it at all.
+ *
+ * `codemode` (#224) is deliberately absent from this order even when the
+ * authorized parent ceiling carries it: with deferred tools enabled the
+ * durable allowed catalog keeps it deferred (execute/orchestrate sessions
+ * discover and activate it only through `search_tools`), and read-only
+ * research workers do not receive it at all (see RESEARCH_ALLOWED_TOOLS).
+ * With deferred tools disabled the ordinary full-active contract applies:
+ * an authorized execute catalog starts active including codemode.
  */
 export const DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER = [
   "read", ...NATIVE_DISCOVERY_TOOLS, GIT_READ_TOOL_NAME, ...EXECUTOR_SHELL_TOOLS, "edit", "write", "ApplyPatch", "SubtasksStart",

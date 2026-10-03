@@ -1046,6 +1046,14 @@ export class ExecutionToolManager {
  * research intersection (and, through DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER, the
  * conservative initial-active subset) so Pi research workers have it active
  * from the first request; execute-kind catalogs exclude it in withParentTools.
+ *
+ * #224: `codemode` is deliberately not a policy entry: research workers run
+ * without the script transport even when the parent ceiling or an explicit
+ * user tool list carries it. The intersection below denies it on every
+ * research task in both deferred settings; codemode exists for execute and
+ * orchestrator sessions, which discover and activate it through `search_tools`
+ * when deferred tools are enabled, and include it in the ordinary full-active
+ * contract when that setting is disabled.
  */
 export const RESEARCH_ALLOWED_TOOLS = new Set([
   "read", "grep", "glob", "find", "ls", GIT_READ_TOOL_NAME, "WebFetch", "WebSearch", "BrowserExtract",

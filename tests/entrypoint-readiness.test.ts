@@ -2,7 +2,6 @@
 // background work (external ShellStart process groups, native shell wake
 // ordering, delegated execution subtasks) before settling a turn.
 import assert from "node:assert/strict";
-import { spawn, type ChildProcess } from "node:child_process";
 import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,9 +18,60 @@ import {
   waitForFile,
 } from "./entrypoint-harness";
 
+async function activateNativeReadinessHost(
+  pi: Record<string, unknown>,
+  hooks: Map<string, Array<(...args: unknown[]) => unknown>>,
+  cwd: string,
+  loadName: string,
+): Promise<void> {
+  const definitions = new Map<string, Record<string, any>>([
+    ["read", { name: "read", description: "Read files." }],
+    ["bash", { name: "bash", description: "Run shell commands." }],
+  ]);
+  let active = ["read", "bash"];
+  let initialized = false;
+  const assertInitialized = () => {
+    if (!initialized) throw new Error("Extension runtime not initialized");
+  };
+  await activate({
+    ...pi,
+    registerTool(tool: Record<string, any>) {
+      definitions.set(tool.name, tool);
+      if (!active.includes(tool.name)) active.push(tool.name);
+      if (typeof pi.registerTool === "function") pi.registerTool(tool);
+    },
+    getAllTools() {
+      assertInitialized();
+      return [...definitions.values()];
+    },
+    getActiveTools() {
+      assertInitialized();
+      return [...active];
+    },
+    setActiveTools(names: string[]) {
+      assertInitialized();
+      active = [...names];
+    },
+  });
+  initialized = true;
+  const context = { cwd, ui: {}, sessionManager: {}, hasUI: false };
+  await trigger(hooks, "session_start", { cwd }, context);
+  const search = definitions.get("search_tools");
+  assert.ok(search);
+  assert.equal(typeof search.execute, "function");
+  const loaded = await invokeNativeToolCall(
+    hooks,
+    { name: "search_tools", execute: search.execute },
+    `load-${loadName}`,
+    { query: loadName },
+    context,
+  );
+  assert.equal(loaded.isError, false);
+  assert.ok(active.includes(loadName));
+}
+
 test("automatic review waits for ShellStart process groups and resumes the orchestrator when they clear", { skip: process.platform === "win32" }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-background-readiness-"));
-  let background: ChildProcess | undefined;
   try {
     await writeFile(join(dir, "index.ts"), "before\n", "utf8");
     const invocationMarker = join(dir, "reviewer-invoked.txt");
@@ -50,33 +100,35 @@ review: { activeReviewers: [
     delete process.env.PI_REVIEW_GATE_DISABLED;
 
     const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const tools = new Map<string, { name: string; execute: (...args: any[]) => Promise<Record<string, unknown>> }>();
     const notices: string[] = [];
     const followUps: Array<{ message: string; options: unknown }> = [];
     const pi = {
       on(name: string, handler: (...args: unknown[]) => unknown) {
         hooks.set(name, [...(hooks.get(name) ?? []), handler]);
       },
+      registerTool(tool: { name: string; execute?: (...args: any[]) => Promise<Record<string, unknown>> }) {
+        if (tool.execute) tools.set(tool.name, tool as { name: string; execute: (...args: any[]) => Promise<Record<string, unknown>> });
+      },
       registerCommand() {},
       notify(message: string) { notices.push(message); },
       sendUserMessage(message: string, options: unknown) { followUps.push({ message, options }); },
     };
 
-    await activate(pi);
+    await activateNativeReadinessHost(pi, hooks, dir, "ShellStart");
     await trigger(hooks, "input", { cwd: dir, text: "make a background-assisted change", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
-    background = spawn(process.execPath, ["-e", "setTimeout(()=>{},350)"], {
-      detached: true,
-      stdio: "ignore",
-    });
-    background.unref();
-    assert.ok(background.pid);
-    await trigger(hooks, "tool_result", {
-      cwd: dir,
-      toolName: "ShellStart",
-      result: { content: [{ type: "text", text: `Started "tests" as job1 (pid ${background.pid}); currently running.\nFuture wake triggers (not current events): exit.\nYou will be notified automatically; do not poll.` }] },
-      isError: false,
-    });
+    const shellStart = tools.get("ShellStart");
+    assert.ok(shellStart);
+    const started = await invokeNativeToolCall(
+      hooks,
+      shellStart,
+      "readiness-shell-start",
+      { command: "sleep 0.35", label: "tests" },
+      { cwd: dir, ui: {}, sessionManager: {}, hasUI: false },
+    );
+    assert.equal(started.isError, false);
     await triggerAgentEnd(hooks, { cwd: dir, messages: [{ role: "assistant", content: "background still running" }] });
 
     await assert.rejects(access(invocationMarker), /ENOENT/);
@@ -90,9 +142,7 @@ review: { activeReviewers: [
     await triggerAgentEnd(hooks, { cwd: dir, messages: [{ role: "assistant", content: "verified background output" }] });
     assert.equal(await readFile(invocationMarker, "utf8"), "invoked");
   } finally {
-    if (background?.pid) {
-      try { process.kill(-background.pid, "SIGKILL"); } catch { /* already exited */ }
-    }
+    reapAll();
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -144,7 +194,7 @@ review: { activeReviewers: [
       sendUserMessage() {},
     };
 
-    await activate(pi);
+    await activateNativeReadinessHost(pi, hooks, dir, "ShellStart");
     await trigger(hooks, "input", { cwd: dir, text: "make a background-assisted change", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
@@ -192,7 +242,7 @@ test("entrypoint wiring preserves raw ShellStart identity through null normaliza
       sendUserMessage() {},
     };
 
-    await activate(pi);
+    await activateNativeReadinessHost(pi, hooks, dir, "ShellStart");
     hooks.set("tool_result", [...(hooks.get("tool_result") ?? []), () => { toolResultEvents += 1; }]);
     const shellStart = tools.get("ShellStart");
     const shellList = tools.get("ShellList");
@@ -290,7 +340,7 @@ review: { activeReviewers: [
       sendUserMessage() {},
     };
 
-    await activate(pi);
+    await activateNativeReadinessHost(pi, hooks, dir, "ShellStart");
     await trigger(hooks, "input", { cwd: dir, text: "finish after the build", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await trigger(hooks, "agent_start");
@@ -361,7 +411,7 @@ review: { activeReviewers: [
       sendUserMessage() {},
     };
 
-    await activate(pi);
+    await activateNativeReadinessHost(pi, hooks, dir, "ShellStart");
     await trigger(hooks, "input", { cwd: dir, text: "restart a background validation until it is useful", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
@@ -458,8 +508,7 @@ review: { activeReviewers: [
       notify(message: string) { notices.push(message); },
     };
 
-    await activate(pi);
-    await trigger(hooks, "session_start", { cwd: dir });
+    await activateNativeReadinessHost(pi, hooks, dir, "SubtasksStart");
     assert.ok(executionTool);
     await trigger(hooks, "input", { cwd: dir, text: "make a delegated change", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });

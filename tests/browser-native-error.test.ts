@@ -5,11 +5,10 @@ import { normalizeConfig } from "../src/config";
 import type { InteractiveBrowserManager } from "../src/web/interactive-browser";
 import { WebToolManager } from "../src/web/tools";
 
-// Point at a scratch/installed agent-core dist/index.js. Requires pi-agent-core
-// >= 0.87 (this fixture stops via finishTurn); older runtimes ignore finishTurn
-// and re-enter the tool batch forever in a microtask-only loop that no test
-// timer can interrupt. Do not copy its error loop into a mock: this regression
-// must exercise the actual Pi outer result.
+// Point at a scratch/installed Pi >= 1.0.0 agent-core dist/index.js. finishTurn
+// ends this fixture after one tool batch; runtimes predating finishTurn could
+// otherwise loop without yielding to a test timer. This regression exercises
+// the actual Pi outer result, not a copied runtime error loop.
 const runtime = process.env.PI_BROWSER_AGENT_RUNTIME;
 test("interactive Browser failures set native Pi outer isError with text only", { skip: !runtime }, async () => {
   const load = new Function("url", "return import(url)") as (url: string) => Promise<any>;
@@ -29,8 +28,8 @@ test("interactive Browser failures set native Pi outer isError with text only", 
   for (const [, method, , reason] of scenarios) fake[method] = async () => { throw new Error(`${reason}: ${privateMarker} ${"page exception ".repeat(1_000)}`); };
   const manager = new WebToolManager({ registerTool: tool => tools.push(tool) }, normalizeConfig({}), undefined, undefined, fake as unknown as InteractiveBrowserManager);
   manager.register();
-  // This control proves that a fulfilled result with nested isError does NOT
-  // satisfy the runtime contract (and that the runtime is really executing).
+  // Pi 1.0 also propagates a fulfilled tool result's isError flag to its outer
+  // result. Keep this control alongside the browser's thrown, sanitized errors.
   tools.push({ name: "NestedErrorControl", description: "control", label: "control", parameters: { type: "object", properties: {} },
     execute: async () => ({ content: [{ type: "text", text: "nested error" }], details: {}, isError: true }) });
   const calls = [...scenarios.map(([name, , args], index) => ({ type: "toolCall", id: `call-${index}`, name, arguments: args })),
@@ -59,6 +58,6 @@ test("interactive Browser failures set native Pi outer isError with text only", 
       assert.doesNotMatch(JSON.stringify(result), /customer-marker-742|page exception/);
     }
     assert.match(results.find(result => result.toolName === "BrowserFill").content[0].text, /effect status is unknown.*no rollback/);
-    assert.equal(results.at(-1).isError, false, "Pi ignores the nested success-shaped isError field");
+    assert.equal(results.at(-1).isError, true, "Pi 1.0 propagates the returned tool-result isError flag");
   } finally { await manager.cleanup(); }
 });

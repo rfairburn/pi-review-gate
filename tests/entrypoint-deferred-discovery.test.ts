@@ -39,12 +39,36 @@ test("unsupported configuration warns and still registers normal tools and setti
     const notices: string[] = [];
     const commands: string[] = [];
     const tools: string[] = [];
+    const registeredTools = new Map<string, { name: string; description?: string }>([
+      ["read", { name: "read", description: "Read files." }],
+    ]);
+    let activeTools = ["read"];
+    let runtimeInitialized = false;
+    const assertRuntime = () => {
+      if (!runtimeInitialized) throw new Error("Extension runtime not initialized");
+    };
     const pi = {
       on(name: string, handler: (...args: unknown[]) => unknown) {
         hooks.set(name, [...(hooks.get(name) ?? []), handler]);
       },
       registerCommand(name: string) { commands.push(name); },
-      registerTool(tool: { name: string }) { tools.push(tool.name); },
+      registerTool(tool: { name: string; description?: string }) {
+        tools.push(tool.name);
+        registeredTools.set(tool.name, tool);
+        if (!activeTools.includes(tool.name)) activeTools.push(tool.name);
+      },
+      getActiveTools() {
+        assertRuntime();
+        return [...activeTools];
+      },
+      getAllTools() {
+        assertRuntime();
+        return [...registeredTools.values()];
+      },
+      setActiveTools(next: string[]) {
+        assertRuntime();
+        activeTools = next;
+      },
       notify(message: string) { notices.push(message); },
     };
 
@@ -53,6 +77,9 @@ test("unsupported configuration warns and still registers normal tools and setti
     assert.ok(commands.includes("review-settings"));
     assert.ok(tools.includes("ApplyPatch"));
     assert.ok(hooks.has("session_start"));
+    runtimeInitialized = true;
+    const sessionContext = { cwd: dir, ui: {}, sessionManager: {} };
+    await trigger(hooks, "session_start", { cwd: dir }, sessionContext);
     const callId = "config-warning-read";
     const input = { path: configPath };
     await trigger(hooks, "message_end", {
@@ -295,16 +322,19 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     }
     assert.match(inventory, /exact name/);
     assert.match(inventory, /next turn/);
-    // Compact canonical purposes are part of the inventory; schemas and
-    // unauthorized late registrations never appear.
+    // Compact canonical purposes are part of the inventory; schemas never
+    // appear. A newly registered live registry name joins top-level discovery,
+    // but remains inactive until search_tools explicitly loads it.
     assert.match(inventory, /Search the public web/);
-    assert.doesNotMatch(inventory, /LateIdleTool|parameters|properties/);
-    assert.equal(activeTools.includes("LateIdleTool"), false, "request boundary removes an unauthorized idle registration");
+    assert.match(inventory, /LateIdleTool/);
+    assert.doesNotMatch(inventory, /parameters|properties/);
+    assert.equal(activeTools.includes("LateIdleTool"), false, "request boundary removes the host's late auto-activation");
 
     pi.registerTool({ name: "LateToolResultTool", description: "Registered during a tool execution." });
     assert.ok(activeTools.includes("LateToolResultTool"));
     await trigger(hooks, "tool_result", { cwd: dir, toolName: "read", input: {}, isError: false });
     assert.equal(activeTools.includes("LateToolResultTool"), false, "tool-result boundary removes widening before the next request");
+    const executeDescription = registeredTools.find((tool) => tool.name === "search_tools")?.description ?? "";
 
     const searchTools = registeredTools.find((tool) => tool.name === "search_tools") as {
       execute?: (id: string, params: unknown) => Promise<Record<string, unknown>>;
@@ -319,7 +349,6 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     // surfaces rebuild from the live mode ceiling (write-capable and
     // execution-control names disappear), and switching back restores the
     // execute baseline byte-for-byte despite the SubtasksAdd activation.
-    const executeDescription = searchDefinition?.description ?? "";
     const selectOperatingMode = async (label: string) => {
       assert.ok(reviewSettingsHandler);
       let rootVisits = 0;
@@ -430,7 +459,9 @@ test("deferred authorization survives API recreation and remains isolated per Pi
     const originalA = await executeSearch(backingA, "SessionAOnly");
     assert.deepEqual((originalA.details as { activated: string[] }).activated, ["SessionAOnly"]);
     const lateA = await executeSearch(backingA, "SessionALate");
-    assert.deepEqual((lateA.details as { activated: string[] }).activated, []);
+    assert.deepEqual((lateA.details as { activated: string[] }).activated, ["SessionALate"],
+      "a new live registry name joins its retained top-level session boundary");
+    assert.ok(backingA.active.includes("SessionALate"));
 
     const sessionBIdentity = {};
     const backingB = createBacking("SessionBOnly");
@@ -442,7 +473,11 @@ test("deferred authorization survives API recreation and remains isolated per Pi
     assert.deepEqual((ownB.details as { activated: string[] }).activated, ["SessionBOnly"]);
     const foreignA = await executeSearch(backingB, "SessionAOnly");
     assert.deepEqual((foreignA.details as { activated: string[] }).activated, []);
+    const foreignLateA = await executeSearch(backingB, "SessionALate");
+    assert.deepEqual((foreignLateA.details as { activated: string[] }).activated, [],
+      "late registry authority remains isolated to session A");
     assert.equal(backingB.active.includes("SessionAOnly"), false);
+    assert.equal(backingB.active.includes("SessionALate"), false);
   } finally {
     reapAll();
     await rm(dir, { recursive: true, force: true });

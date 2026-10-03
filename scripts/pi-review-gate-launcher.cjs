@@ -54,6 +54,14 @@
  * - Prints the same launch diagnostics and forwards all remaining arguments
  *   to `pi --extension <dist/src/index.js>`.
  *
+ * On normal launches (management passthrough aside) the helper exports
+ * PI_REVIEW_GATE_CODEMODE_DEFAULT=1 so the extension can enable Pi's
+ * registered native codemode tool without rewriting any pi tool argument:
+ * --tools/--exclude-tools/--no-tools/--no-extensions reach pi untouched and
+ * Pi's policy-filtered getAllTools stays authoritative. The management
+ * passthrough (Pi's own verbs plus Pi 1.0's native `pi mcp` management, which
+ * remains Pi-owned) runs before any setup and never sets this flag.
+ *
  * POSIX permission modes (0700/0600/0644) are requested for parity and are a
  * no-op under Windows ACLs; the fail-closed publication structure is what the
  * launcher preserves. To keep forwarded arguments and paths byte-exact, the
@@ -98,9 +106,11 @@ const DEFAULT_CONFIG_CONTENT = `{
 }
 `;
 
-// Mirrors the passthrough list in scripts/pi-review-gate.sh and the batch
-// checks in scripts/pi-review-gate.cmd; keep all three in sync.
-const MANAGEMENT_VERBS = new Set(["update", "install", "remove", "uninstall", "list", "config", "auth"]);
+// Mirrors the passthrough list in scripts/pi-review-gate.sh (the thin .cmd
+// entry point delegates every invocation to this helper); the list covers Pi
+// package management plus Pi 1.0's native `pi mcp` management, which remains
+// Pi-owned. Keep both lists in sync.
+const MANAGEMENT_VERBS = new Set(["update", "install", "remove", "uninstall", "list", "config", "auth", "mcp"]);
 
 function out(text) {
   fs.writeSync(1, text);
@@ -1030,6 +1040,16 @@ function main(argv) {
   // The exported path is already the native Windows form (the helper runs on
   // native Windows); off Windows it is the platform's own form.
   process.env.PI_REVIEW_GATE_CONFIG = selected;
+
+  // Wrapper-only codemode default (parity with scripts/pi-review-gate.sh):
+  // normal launches export PI_REVIEW_GATE_CODEMODE_DEFAULT=1 so the extension
+  // can enable Pi's registered native codemode tool without rewriting any pi
+  // tool argument; --tools/--exclude-tools/--no-tools/--no-extensions reach
+  // pi untouched and Pi's policy-filtered getAllTools stays authoritative.
+  // The value is always set here, so the wrapper owns the default for every
+  // normal launch; the management-verb dispatch before main() (which runs no
+  // setup) never sets this flag.
+  process.env.PI_REVIEW_GATE_CODEMODE_DEFAULT = "1";
 
   // Same truthy values the extension uses (loadConfig/firstTruthyEnv in
   // src/config.ts): warn loudly when the kill switch is on. Keep this list in

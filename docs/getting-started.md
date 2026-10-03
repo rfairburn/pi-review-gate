@@ -7,13 +7,14 @@ Behavioral detail lives in the linked pages.
 
 ### Installed by you
 
-- **Node.js 20 or newer** (`engines.node: ">=20"` in `package.json`), plus **npm**
-  for installation and source-checkout builds. CI exercises Node 20 and Node 24.
-- **Pi**, installed independently. `pi-review-gate` consumes Pi's public extension and
-  CLI/RPC surfaces; it does not patch or bundle Pi, and Pi remains independently
-  installed and upgradeable. Use a Node version meeting both packages' requirements:
-  for example, Pi 0.87.0 requires Node.js 22.19.0 or newer even though this extension's
-  own declared minimum is Node.js 20.
+- **Node.js 22.19.0 or newer**, plus **npm** for installation and source-checkout
+  builds. CI exercises Node 22.19.0 (the supported minimum) and Node 24.
+- **Pi 1.0.0 or newer**, installed independently. `pi-review-gate` consumes Pi's
+  public extension and CLI/RPC surfaces; it does not patch or bundle Pi, and Pi
+  remains independently installed and upgradeable. Pi versions below 1.0.0 are
+  outside the supported compatibility scope. The Node.js 22.19.0 floor is verified
+  by Pi 1.0.0's own package metadata; use a Node version meeting both packages'
+  requirements.
 - **For reviews or worker execution: the chosen harness**, installed and
   authenticated through its own login/configuration: the Codex CLI (`codex` by default), the Claude CLI (`claude`),
   a Pi-scoped model (the `pi` CLI), or a generic CLI program. Do not put OAuth tokens

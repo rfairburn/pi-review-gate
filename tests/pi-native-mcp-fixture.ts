@@ -435,6 +435,8 @@ export interface NativeMcpFixtureOptions {
 	 * `executorToolCatalog` (wrapper launch vs actual executor-role launch).
 	 */
 	wrapperDefault?: boolean;
+	/** Start with an empty project mcpServers object instead of the default fixture server. Default false. */
+	noMcpServers?: boolean;
 	/**
 	 * Launch the ACTUAL gate executor role exactly like the production Pi
 	 * executor adapter (`src/execution/adapters/pi-model.ts`): sets
@@ -827,7 +829,10 @@ export class NativeMcpFixture {
 		writeFileSync(paths.controlFile, `${JSON.stringify({ command: "none" })}\n`, { mode: 0o600 });
 		writeFileSync(paths.generationFile, `${JSON.stringify({ generation: 1 })}\n`, { mode: 0o600 });
 		writeFileSync(paths.counterFile, "0\n", { mode: 0o600 });
-		await writeFile(paths.mcpConfig, `${JSON.stringify({ mcpServers: { [this.serverName]: this.serverEntryConfig(paths, this.options.serverExposure ?? "codemode") } }, null, "\t")}\n`, "utf8");
+		const mcpServers = this.options.noMcpServers
+			? {}
+			: { [this.serverName]: this.serverEntryConfig(paths, this.options.serverExposure ?? "codemode") };
+		await writeFile(paths.mcpConfig, `${JSON.stringify({ mcpServers }, null, "\t")}\n`, "utf8");
 		const gateConfig = this.options.gateConfig === null ? undefined : this.options.gateConfig ?? ZERO_MODEL_GATE_CONFIG;
 		if (gateConfig !== undefined) {
 			await writeFile(join(piAgentDir, "review-gate.json"), `${JSON.stringify(gateConfig, null, "\t")}\n`, "utf8");

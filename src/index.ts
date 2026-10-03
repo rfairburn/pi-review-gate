@@ -45,6 +45,7 @@ import {
 import { boundPath, handleCwdMismatchRestore, safeRestoreFailureDiagnostic, sendNoticeUnlessItThrows } from "./activation/diagnostics";
 import { createSessionPersistence } from "./activation/persistence";
 import { deferredToolPromptInjection, executionPromptInjection, extractSystemPrompt } from "./activation/prompt-composition";
+import { capturePrimaryCodemodeDefault } from "./activation/primary-codemode-default";
 import { recoverPendingModelDeliveries, releaseQueuedUserInputs } from "./activation/pending-delivery";
 import { createReviewTurnCoordinator, isToolError } from "./activation/review-turn";
 import { registerApplyPatchTool } from "./apply-patch/tool";
@@ -88,13 +89,16 @@ interface ActivationDependencies {
 export async function activate(pi: unknown, dependencies: ActivationDependencies = {}): Promise<void> {
   // Capture wrapper intent and consume its one-shot environment marker before
   // any await, tool registration, or model-spawned subprocess can inherit it.
-  const wrapperCodemodeDefault = process.env.PI_REVIEW_GATE_CODEMODE_DEFAULT === "1";
+  const executorRole = process.env.PI_REVIEW_GATE_RUNTIME_ROLE === "executor";
+  const wrapperCodemodeMarker = !executorRole && process.env.PI_REVIEW_GATE_CODEMODE_DEFAULT === "1";
   delete process.env.PI_REVIEW_GATE_CODEMODE_DEFAULT;
+  // Wrapper opt-in is process-local primary intent. Executor runtimes are
+  // governed only by their fixed catalog and neither read nor retain it.
+  const wrapperCodemodeDefault = !executorRole && capturePrimaryCodemodeDefault(wrapperCodemodeMarker);
 
   // Live session working directory. The top-level branch keeps it updated from
   // hook context; a Pi executor worker's cwd is its stable worktree root.
   let currentCwd = process.cwd();
-  const executorRole = process.env.PI_REVIEW_GATE_RUNTIME_ROLE === "executor";
   let executorSettlementBootstrap: PiSettlementBootstrap | undefined;
   let executorSettlementBootstrapError: Error | undefined;
   if (executorRole) {

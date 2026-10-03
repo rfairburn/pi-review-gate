@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { afterEach, beforeEach } from "node:test";
 import { activate } from "../src/index";
+import { resetPrimaryCodemodeDefaultForTests } from "../src/activation/primary-codemode-default";
 import { RESEARCH_ALLOWED_TOOLS } from "../src/execution/tool";
 import { EXECUTOR_TOOL_CATALOG_ENV, createExecutorToolCatalog } from "../src/execution/tool-catalog";
 import {
@@ -120,6 +121,7 @@ const environmentNames = [
 ];
 
 beforeEach(() => {
+  resetPrimaryCodemodeDefaultForTests();
   previousEnvironment.clear();
   for (const name of environmentNames) previousEnvironment.set(name, process.env[name]);
   delete process.env.PI_REVIEW_GATE_DISABLED;
@@ -134,6 +136,7 @@ beforeEach(() => {
 
 afterEach(() => {
   reapAll();
+  resetPrimaryCodemodeDefaultForTests();
   for (const [name, value] of previousEnvironment) {
     if (value === undefined) delete process.env[name];
     else process.env[name] = value;
@@ -205,6 +208,15 @@ function searchTool(runtime: NativeToolRuntime): NonNullable<ToolDefinition["exe
   return execute;
 }
 
+function loadFreshActivate(): typeof activate {
+  // Pi re-instantiates extension factories after native session replacement.
+  // Clear both modules while leaving globalThis intact, as a real Pi process
+  // does when it reloads extension code.
+  delete require.cache[require.resolve("../src/index")];
+  delete require.cache[require.resolve("../src/activation/primary-codemode-default")];
+  return (require("../src/index") as { activate: typeof activate }).activate;
+}
+
 function nativeDefinitions(options: { codemode?: boolean; mcp?: boolean } = {}): ToolDefinition[] {
   return [
     { name: "read", description: "Read files." },
@@ -266,6 +278,89 @@ test("wrapper codemode intent is consumed synchronously and composes primary dir
     assert.equal(runtime.activeTools().includes("NativeDeferred"), false, "nested native reachability never promotes a direct declaration");
     const modelOnlyChild = await submitNestedCall(runtime, "active-code", "ModelOnly", "active-code/2", {});
     assert.equal(modelOnlyChild?.block, true, "model-only exposure is never nested-callable");
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("primary wrapper codemode intent survives module reload and a replaced session identity", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-review-native-tools-replacement-"));
+  const nextCwd = join(cwd, "replacement");
+  try {
+    await mkdir(nextCwd);
+    await writeConfig(cwd);
+    await writeConfig(nextCwd);
+    const initial = new NativeToolRuntime(cwd, nativeDefinitions(), ["read"]);
+    process.env[CODEMODE_DEFAULT_ENV] = "1";
+    await activate(initial.pi);
+    assert.equal(process.env[CODEMODE_DEFAULT_ENV], undefined);
+    await startSession(initial);
+    assert.ok(initial.definitions.get("search_tools")?.description?.includes("codemode"));
+    assert.equal(initial.activeTools().includes("codemode"), false);
+
+    await initial.fire("session_shutdown", initial.context);
+    const replacement = new NativeToolRuntime(nextCwd, nativeDefinitions(), ["read"]);
+    const reloadedActivate = loadFreshActivate();
+    assert.equal(process.env[CODEMODE_DEFAULT_ENV], undefined, "the replacement inherits no environment marker");
+    await reloadedActivate(replacement.pi);
+    await startSession(replacement);
+
+    assert.ok(replacement.definitions.get("search_tools")?.description?.includes("codemode"),
+      "the process-local primary default rebuilds discovery under the replacement manager identity");
+    assert.equal(replacement.activeTools().includes("codemode"), false,
+      "retaining wrapper intent does not change native codemode's initial selection");
+    const result = await searchTool(replacement)("replacement-codemode", { query: "codemode" });
+    assert.deepEqual((result.details as { nativeAvailable: string[] }).nativeAvailable, ["codemode"]);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a fresh manual primary activation does not inherit wrapper codemode default", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-review-native-tools-manual-"));
+  try {
+    await writeConfig(cwd);
+    const runtime = new NativeToolRuntime(cwd, nativeDefinitions(), ["read"]);
+    await activate(runtime.pi);
+    await startSession(runtime);
+
+    assert.doesNotMatch(runtime.definitions.get("search_tools")?.description ?? "", /codemode/);
+    const result = await searchTool(runtime)("manual-codemode", { query: "codemode" });
+    assert.deepEqual((result.details as { matched: string[] }).matched, []);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("executor activation consumes but never captures primary wrapper codemode intent", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-review-native-tools-executor-default-"));
+  const primaryCwd = join(cwd, "primary");
+  try {
+    await mkdir(primaryCwd);
+    await writeConfig(cwd);
+    await writeConfig(primaryCwd);
+    const catalog = createExecutorToolCatalog(["read"], ["read"]);
+    const settlement = createPiSettlementBootstrap(cwd, "executor-no-primary-default");
+    const executor = new NativeToolRuntime(cwd, nativeDefinitions(), ["read"]);
+    process.env.PI_REVIEW_GATE_RUNTIME_ROLE = "executor";
+    process.env[EXECUTOR_TOOL_CATALOG_ENV] = JSON.stringify(catalog);
+    Object.assign(process.env, piSettlementEnvironment(settlement));
+    process.env[CODEMODE_DEFAULT_ENV] = "1";
+    await activate(executor.pi);
+    assert.equal(process.env[CODEMODE_DEFAULT_ENV], undefined);
+    assert.equal(process.env[EXECUTOR_TOOL_CATALOG_ENV], JSON.stringify(catalog));
+    await startSession(executor);
+    assert.equal(executor.activeTools().includes("codemode"), false,
+      "executor authority remains its fixed catalog despite the primary marker");
+    await executor.fire("session_shutdown", executor.context);
+
+    delete process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
+    delete process.env[EXECUTOR_TOOL_CATALOG_ENV];
+    const primary = new NativeToolRuntime(primaryCwd, nativeDefinitions(), ["read"]);
+    await activate(primary.pi);
+    await startSession(primary);
+    assert.doesNotMatch(primary.definitions.get("search_tools")?.description ?? "", /codemode/,
+      "an executor marker cannot seed primary-process wrapper intent");
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

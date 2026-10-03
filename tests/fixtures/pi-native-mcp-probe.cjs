@@ -63,6 +63,30 @@ const path = require('node:path');
 
 const PROVIDER_ID = 'prg-fixture';
 const MODEL_ID = 'driven';
+const PROBE_PROCESS_STATE_KEY = Symbol.for('prg-native-mcp-probe.lifecycle.v1');
+const CODEMODE_DEFAULT_ENV = 'PI_REVIEW_GATE_CODEMODE_DEFAULT';
+
+function probeProcessState() {
+	const slot = globalThis;
+	let state = slot[PROBE_PROCESS_STATE_KEY];
+	if (!state || typeof state !== 'object' || !(state.sessionManagerIds instanceof WeakMap)) {
+		state = { factoryCount: 0, nextSessionManagerId: 1, sessionManagerIds: new WeakMap() };
+		slot[PROBE_PROCESS_STATE_KEY] = state;
+	}
+	return state;
+}
+
+function sessionManagerId(sessionManager) {
+	if ((typeof sessionManager !== 'object' || sessionManager === null) && typeof sessionManager !== 'function') return null;
+	const state = probeProcessState();
+	let id = state.sessionManagerIds.get(sessionManager);
+	if (id === undefined) {
+		id = state.nextSessionManagerId++;
+		state.sessionManagerIds.set(sessionManager, id);
+	}
+	return id;
+}
+
 const DEFAULT_STATE_DIR = () => {
 	const fallback = process.env.PRG_FIXTURE_STATE_DIR;
 	if (fallback) return fallback;
@@ -117,6 +141,12 @@ async function loadFauxModule(agentDir) {
 }
 
 module.exports = async function (pi) {
+	const lifecycleState = probeProcessState();
+	const factoryId = ++lifecycleState.factoryCount;
+	journalProbe('probe_factory_loaded', {
+		factoryId,
+		wrapperMarkerPresent: process.env[CODEMODE_DEFAULT_ENV] !== undefined,
+	});
 	const agentDir = process.env.PRG_FIXTURE_AGENT_DIR;
 	let faux;
 	try {
@@ -243,6 +273,11 @@ module.exports = async function (pi) {
 	// Skipped when the fixture requests a no-auto-model runtime so the fixture's
 	// set_model fallback path is exercised instead.
 	pi.on('session_start', async (_event, ctx) => {
+		journalProbe('probe_session_start', {
+			factoryId,
+			sessionManagerId: sessionManagerId(ctx?.sessionManager),
+			wrapperMarkerPresent: process.env[CODEMODE_DEFAULT_ENV] !== undefined,
+		});
 		if (process.env.PRG_FIXTURE_NO_AUTO_MODEL === '1') {
 			journalProbe('auto_model_skipped', {});
 			return;
@@ -254,6 +289,13 @@ module.exports = async function (pi) {
 		}
 		const ok = await pi.setModel(model);
 		journalProbe(ok ? 'auto_model_selected' : 'auto_model_rejected', { provider: PROVIDER_ID, modelId: MODEL_ID });
+	});
+	pi.on('session_shutdown', (_event, ctx) => {
+		journalProbe('probe_session_shutdown', {
+			factoryId,
+			sessionManagerId: sessionManagerId(ctx?.sessionManager),
+			wrapperMarkerPresent: process.env[CODEMODE_DEFAULT_ENV] !== undefined,
+		});
 	});
 
 	// --- Denial simulation: ordinary tool_call blocking, driven by a control file ---

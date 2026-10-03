@@ -709,6 +709,24 @@ export class NativeMcpFixture {
 		}
 	}
 
+	/** Wait for fresh client-side metadata (optionally a state change); never activate tools. */
+	async waitForRegisteredTools(
+		names: readonly string[],
+		predicate?: (dump: ProbeDump) => boolean,
+	): Promise<ProbeDump> {
+		const deadline = Date.now() + this.timeouts.connectMs;
+		for (;;) {
+			const dump = await this.probeDump();
+			if (names.every((name) => dump.allTools?.some((tool) => tool.name === name))
+				&& (!predicate || predicate(dump))) return dump;
+			if (Date.now() >= deadline) {
+				throw new Error(`native MCP registry did not reach the expected state within ${this.timeouts.connectMs}ms: `
+					+ `${names.join(", ")}; observed ${JSON.stringify(dump.allTools)}\nstderr:\n${this.stderrTail}`);
+			}
+			await delay(50);
+		}
+	}
+
 	/**
 	 * Rotate the advertised tool list to `generation` (>= 2 replaces `echo`
 	 * with `echo_second` and sends `notifications/tools/list_changed`); the

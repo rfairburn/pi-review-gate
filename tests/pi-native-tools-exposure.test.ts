@@ -102,7 +102,7 @@ test("native MCP host callees stay outside gate declarations when deferred tools
   });
   if (!nativeHost) return;
   const nativeEchoName = mcpToolName(nativeHost.serverName, "echo");
-  const nativeInitial = await nativeHost.probeDump();
+  const nativeInitial = await nativeHost.waitForRegisteredTools([nativeEchoName]);
   assert.equal(observedTool(nativeInitial, "tool_search").exposure, "model-only");
   assert.ok(!nativeInitial.activeTools?.includes("tool_search"), "the native helper starts inactive before Pi selects it");
   await nativeHost.runCommand("/native-select-tool-search");
@@ -126,7 +126,7 @@ test("native MCP host callees stay outside gate declarations when deferred tools
 
   const echoName = mcpToolName(host.serverName, "echo");
   const counterName = mcpToolName(host.serverName, "counter");
-  const initial = await host.probeDump();
+  const initial = await host.waitForRegisteredTools([echoName, counterName]);
   const nativeToolSearchName = "tool_search";
   // The gate loader replaces Pi's builtin tool_search: it is an ordinary
   // registered tool, active from startup as part of the managed set.
@@ -205,10 +205,10 @@ test("native MCP host callees stay outside gate declarations when deferred tools
     undefined,
     beforeRotation,
   ), "native Pi should refresh the withdrawn tool list");
-  const rotated = await host.probeDump();
+  const withdrawnEcho = mcpToolName(host.serverName, "echo_second");
+  const rotated = await host.waitForRegisteredTools([withdrawnEcho]);
   assert.equal(observedTool(rotated, echoName).exposure, "hidden", "Pi metadata records the withdrawn registration as hidden");
   assert.ok(!rotated.activeTools?.includes(echoName));
-  const withdrawnEcho = mcpToolName(host.serverName, "echo_second");
   assert.equal(observedTool(rotated, withdrawnEcho).exposure, REGISTERED_EXPOSURE_FOR_CODENAME_SERVER);
   await host.setTurnScript([{
     toolCalls: [{ toolName: "tool_search", arguments: { query: echoName } }],
@@ -236,7 +236,7 @@ test("frozen native Pi worker can discover and call permitted native callees wit
 
   const workerEchoName = mcpToolName(worker.serverName, "echo");
   const workerCounterName = mcpToolName(worker.serverName, "counter");
-  const workerInitial = await worker.probeDump();
+  const workerInitial = await worker.waitForRegisteredTools([workerEchoName, workerCounterName]);
   assert.equal(observedTool(workerInitial, workerEchoName).exposure, REGISTERED_EXPOSURE_FOR_CODENAME_SERVER);
   assert.ok(workerInitial.activeTools?.includes("codemode"), "worker CLI ceiling preserves its ordinary root codemode declaration");
   assert.ok(workerInitial.activeTools?.includes("tool_search"), `worker loader should remain declared: ${JSON.stringify(workerInitial.activeTools)}`);
@@ -296,7 +296,9 @@ test("frozen native Pi worker can discover and call permitted native callees wit
     beforeWorkerRotation,
   ), "native worker Pi should refresh the withdrawn tool list");
   const workerLateEcho = mcpToolName(worker.serverName, "echo_second");
-  const workerAfterRotation = await worker.probeDump();
+  const workerAfterRotation = await worker.waitForRegisteredTools([workerEchoName], (dump) =>
+    dump.allTools?.some((tool) => tool.name === workerEchoName && tool.exposure === "hidden") === true,
+  );
   assert.equal(workerAfterRotation.allTools?.some((tool) => tool.name === workerLateEcho), false,
     "Pi's native CLI mask excludes the late name from worker registry metadata");
   assert.ok(!workerAfterRotation.activeTools?.includes(workerLateEcho), "late native registration stays outside the frozen worker ceiling");

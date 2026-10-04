@@ -456,6 +456,9 @@ test("persistReviewSettings writes split fields, removes the legacy key, and pre
   await writeFile(configPath, JSON.stringify({
     enabled: true,
     futureKey: { keep: true },
+    externalAgents: {
+      one: { adapter: "generic-cli", command: process.execPath, args: [], review: {} },
+    },
     review: { activeReviewers: [LEGACY_ONE], primaryEnabled: false },
   }));
   const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
@@ -522,5 +525,6 @@ const ROOT_SETTING_LABELS = [
   "Deferred Pi tools",
   "Subtasks view",
   "Scheduled tasks",
+  "External workers",
   "Web",
 ] as const;

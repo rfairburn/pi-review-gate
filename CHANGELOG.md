@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.114]
+
+### Fixed
+
+- Bound recovery for an unobserved background-shell exit wake to one hidden,
+  cancelable control turn that resumes Pi's retained follow-up queue; the
+  completion is not re-sent and unrelated queued messages are untouched. The
+  recovery turn remains directly cancelable; ambiguous lifecycle outcomes favor
+  delivery without guessing model intent. Canceling recovery does not start
+  another attempt, while routine status wakes remain best-effort. Real-host
+  tests cover delivery after an aborted run and aborting
+  recovery before the retained exit is drained; the original report's precise
+  cause remains unestablished (Refs #281).
+
 ## [0.1.0-dev.113]
 
 ### Fixed

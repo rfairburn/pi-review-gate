@@ -347,11 +347,22 @@ review: { activeReviewers: [
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
     const shellStart = tools.get("ShellStart");
     assert.ok(shellStart);
-    await invokeNativeToolCall(hooks, { name: "ShellStart", execute: shellStart.execute }, "clean-exit-order", { command: "exit 0", label: "clean-exit-order" }, { hasUI: false });
+    const started = await invokeNativeToolCall(hooks, { name: "ShellStart", execute: shellStart.execute }, "clean-exit-order", { command: "exit 0", label: "clean-exit-order" }, { hasUI: false });
 
     await waitForCondition(() => messages.some((message) => message.customType === "pi-review-bg-shell"));
     assert.equal(messages.filter((message) => message.customType === "pi-review-bg-shell").length, 1);
     await assert.rejects(access(reviewerStarted), /ENOENT/);
+
+    // The run ends naturally, so Pi drains its follow-up queue before
+    // settling: the queued exit wake is injected into the transcript and
+    // emitted (message_start) — the observed-injection event that clears the
+    // gate's outstanding-exit-wake marker (#281), keeping settlement from
+    // re-sending an already-delivered wake.
+    const jobId = String((started.content as Array<{ text?: string }>)[0]?.text ?? "").match(/as (job\d+)/)?.[1];
+    assert.ok(jobId, `ShellStart result must name the job: ${JSON.stringify(started)}`);
+    await trigger(hooks, "message_start", {
+      message: { role: "custom", customType: "pi-review-bg-shell", content: "exit wake", display: true, details: { id: jobId, kind: "exit" } },
+    });
 
     await trigger(hooks, "agent_end", { cwd: dir, messages: [{ role: "assistant", content: "build completed" }] });
     const settlement = trigger(hooks, "agent_settled", { cwd: dir });

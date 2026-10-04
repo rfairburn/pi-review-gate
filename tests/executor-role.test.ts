@@ -166,7 +166,9 @@ test("executor role registers web tools and background shell without orchestrati
     // Executor children keep the native duplicate preflight hooks (message_end,
     // tool_call, tool_execution_start, tool_result, session resets) and the
     // deferred-manager turn/MCP reconciliation hooks, plus background-shell
-    // and #84 diagnostic lifecycle hooks. Orchestrator
+    // and #84 diagnostic lifecycle hooks. message_start is the background
+    // shell's observed-injection listener (#281: exit wakes are tracked until
+    // their custom message enters the transcript). Orchestrator
     // review machinery (before_agent_start, input) and its command surface
     // must stay out of executor children.
     assert.deepEqual([...captured.hooks.keys()].sort(), [
@@ -176,6 +178,7 @@ test("executor role registers web tools and background shell without orchestrati
       "context",
       "mcp_servers_change",
       "message_end",
+      "message_start",
       "session_shutdown",
       "session_start",
       "session_tree",

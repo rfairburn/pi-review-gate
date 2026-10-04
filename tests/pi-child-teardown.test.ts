@@ -294,9 +294,11 @@ async function stopOwnedFixture(fixture: OwnedDescendantFixture, removeRoot = tr
     const parsed = Number(await readFile(fixture.workerPidPath, "utf8"));
     if (Number.isSafeInteger(parsed) && parsed > 0) pid = parsed;
   }
+  // The stopped marker is written before process.exit(), while Windows may
+  // still hold the fixture cwd open. Require actual exit for a recorded PID.
   await waitFor(
-    () => existsSync(fixture.stoppedPath) || pid === undefined || !pidIsAlive(pid),
-    "the test-owned descendant to stop",
+    () => pid === undefined || !pidIsAlive(pid),
+    "the test-owned descendant to exit",
     5_000,
   );
   if (removeRoot) await rm(fixture.root, { recursive: true, force: true });
@@ -321,6 +323,34 @@ function spawnFixtureRoot(fixture: InheritedPipeFixture) {
     stdio: ["pipe", "pipe", "pipe"],
   });
 }
+
+test("owned fixture cleanup waits for actual exit after a pre-exit stopped marker", async () => {
+  const fixture = await createInheritedPipeFixture();
+  // This test owns the fixture and deliberately keeps its process alive after
+  // publishing the marker, making premature cleanup deterministic.
+  await writeFile(join(fixture.root, "worker.cjs"), [
+    "const fs=require('node:fs');",
+    "const [pidPath,readyPath,stopPath,stoppedPath]=process.argv.slice(2);",
+    "fs.writeFileSync(pidPath,String(process.pid));fs.writeFileSync(readyPath,'ready');",
+    "const poll=setInterval(()=>{if(fs.existsSync(stopPath)){clearInterval(poll);fs.writeFileSync(stoppedPath,'stopped');setTimeout(()=>process.exit(0),250)}},20);",
+    "if(process.send)process.send('ready');",
+  ].join("\n"));
+  const child = spawnFixtureRoot(fixture);
+  const closed = new Promise<void>((resolve, reject) => {
+    child.once("close", () => resolve());
+    child.once("error", reject);
+  });
+  try {
+    const pid = await waitForFixtureReady(fixture);
+    await stopOwnedFixture(fixture, false);
+    assert.equal(existsSync(fixture.stoppedPath), true);
+    assert.equal(pidIsAlive(pid), false, "a stopped marker alone must not allow cleanup while the owned process is live");
+  } finally {
+    await stopOwnedFixture(fixture, false);
+    await within(closed, 5_000, "test-owned fixture stdio to close");
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
 
 test("reviewer teardown bounds inherited pipes after the direct root exits", async () => {
   const fixture = await createInheritedPipeFixture();

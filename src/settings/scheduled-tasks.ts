@@ -28,7 +28,7 @@ import { setCatalogKey } from "./catalog-key";
 import { selectReviewers } from "./review";
 import { editSettingText } from "./text-input";
 import { alignedSettingsRows, notify, type UiContext } from "./ui";
-import { validateSelection } from "./validation";
+import { validateSelection, type SettingsValidationPolicy } from "./validation";
 import { executorSelectionLabel, sortedCatalogKeys } from "./workers";
 import { retainedSelect } from "./menu";
 
@@ -498,6 +498,7 @@ export async function validateScheduledTasks(
   config: ReviewGateConfig,
   scoped: ScopedModelChoice[],
   sessionCwd?: string,
+  policy: SettingsValidationPolicy = {},
 ): Promise<string | undefined> {
   for (const [id, entry] of Object.entries(catalog)) {
     if (!entry.name.trim()) return `Scheduled task ${id} has no name`;
@@ -534,7 +535,7 @@ export async function validateScheduledTasks(
       if (entry.review.reviewers.length === 0) {
         return `Scheduled task ${id} review override selects no reviewers; choose Inherit or Off`;
       }
-      const reviewerError = await validateSelection(workerResources, entry.review.reviewers, config, scoped);
+      const reviewerError = await validateSelection(workerResources, entry.review.reviewers, config, scoped, [], [], policy);
       if (reviewerError) return `Scheduled task ${id}: ${reviewerError}`;
     }
   }

@@ -3,8 +3,14 @@ import { open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import {
   cloneScheduledTaskCatalog,
+  cloneExternalAgentCatalog,
+  type ExternalAgentCatalog,
   cloneWorkerCatalog,
   normalizeConfig,
+  externalAgentSupportsExecution,
+  externalAgentSupportsReview,
+  resolvedExternalAgent,
+  workerResourceSupportsResearch,
   type ActiveReviewerSelection,
   type BrowserInteractionApproval,
   type ScheduledTaskCatalog,
@@ -19,6 +25,8 @@ import {
 } from "../config";
 
 export interface ReviewSettingsSelection {
+  /** New definitions only; merged into the latest disk catalog at Save. */
+  externalAgentAdditions?: ExternalAgentCatalog;
   operatingMode: OperatingMode;
   /** Direct operating-mode cycle hotkey (issue #20). */
   modeCycleShortcut: string;
@@ -103,8 +111,20 @@ export async function persistReviewSettings(
       ?? (typeof execution.deferredPiTools === "boolean" ? execution.deferredPiTools : true);
     delete execution.parallelEnabled;
     parsed.execution = execution;
-    // externalAgents is intentionally untouched: agents are not editable in
-    // this UI, and the save boundary canonicalizes the latest on-disk form.
+    // Import the latest catalog (including legacy arrays), never the stale
+    // menu snapshot. Existing definitions remain owned by disk; creation
+    // cannot overwrite even an identical definition saved by another menu.
+    if (selection.externalAgentAdditions && Object.keys(selection.externalAgentAdditions).length > 0) {
+      const stored = normalizeConfig({ externalAgents: parsed.externalAgents }).externalAgents ?? {};
+      const merged = cloneExternalAgentCatalog(stored);
+      for (const [id, definition] of Object.entries(selection.externalAgentAdditions)) {
+        if (Object.prototype.hasOwnProperty.call(stored, id)) {
+          throw new Error("An external worker ID created in this menu already exists on disk. Reopen settings and create it with a different ID.");
+        }
+        Object.defineProperty(merged, id, { value: definition, enumerable: true, writable: true, configurable: true });
+      }
+      parsed.externalAgents = merged;
+    }
     const review = isRecord(parsed.review) ? { ...parsed.review } : {};
     // The split reviewer fields are the only canonical reviewer state (issue
     // #175): every save persists them and removes the legacy single-set key,
@@ -179,7 +199,44 @@ export async function persistReviewSettings(
       parsed.web = web;
     }
   }, {
-    afterValidate: (finalParsed) => {
+    afterValidate: (finalParsed, normalized) => {
+      // Selection validation in the menu used its opening snapshot. Recheck
+      // external references against the merged latest catalog before writing,
+      // so concurrent removal/role changes cannot persist broken selections.
+      const checkReviewers = (reviewers: readonly ActiveReviewerSelection[]): void => {
+        for (const reviewer of reviewers) {
+          if (reviewer.source !== "external") continue;
+          const agent = resolvedExternalAgent(normalized, reviewer.id);
+          if (!agent || !externalAgentSupportsReview(agent)) {
+            throw new Error("A selected external reviewer no longer supports review on disk. Reopen settings and select an available reviewer.");
+          }
+        }
+      };
+      for (const resource of Object.values(selection.workerResources)) {
+        if (resource.selection.source !== "external") continue;
+        const agent = resolvedExternalAgent(normalized, resource.selection.id);
+        if (!agent || !externalAgentSupportsExecution(agent)) {
+          throw new Error("A selected external worker no longer supports execution on disk. Reopen settings and select an available worker.");
+        }
+      }
+      for (const entry of selection.researchRoute ?? []) {
+        const resource = selection.workerResources[entry.resourceId];
+        if (!resource || !workerResourceSupportsResearch(normalized, resource.selection)) {
+          throw new Error("A selected research worker is no longer research-capable on disk. Reopen settings and select a research-capable worker.");
+        }
+      }
+      checkReviewers(selection.primaryReviewers);
+      checkReviewers(selection.subtaskReviewers);
+      for (const task of Object.values(selection.scheduledTasks ?? {})) {
+        if ((task.destination ?? "subtask") !== "subtask") continue;
+        if (task.review?.mode === "selected") checkReviewers(task.review.reviewers);
+        if (task.kind === "research" && task.workerResourceId !== undefined) {
+          const resource = selection.workerResources[task.workerResourceId];
+          if (!resource || !workerResourceSupportsResearch(normalized, resource.selection)) {
+            throw new Error("A scheduled research worker is no longer research-capable on disk. Reopen settings and select a research-capable worker.");
+          }
+        }
+      }
       if (scheduledTasksResult !== undefined) finalParsed.scheduledTasks = scheduledTasksResult;
     },
   });

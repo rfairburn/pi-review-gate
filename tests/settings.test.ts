@@ -1906,6 +1906,7 @@ const ROOT_SETTING_LABELS = [
   "Deferred Pi tools",
   "Subtasks view",
   "Scheduled tasks",
+  "External workers",
   "Web",
 ] as const;
 

@@ -291,6 +291,101 @@ test("settings saves preserve the latest on-disk external agent definitions", as
   }
 });
 
+test("staged external definitions merge with latest legacy catalog and preserve role overrides and adapters", async () => {
+  const dir = await mkdtemp(join(__dirname, "external-merge-"));
+  const configPath = join(dir, "config.json");
+  try {
+    await writeFile(configPath, JSON.stringify({
+      futureRoot: { keep: true },
+      externalAgents: [
+        { id: "old", adapter: "codex-cli", model: "unknown-existing-model", review: { model: "review-override", args: ["review"], env: { PRIVATE_SETTING: "keep" } }, execution: { model: "execution-override" } },
+        { id: "generic", adapter: "generic-cli", command: "custom-tool", review: {} },
+        { id: "binary", adapter: "run-as-binary", command: "custom-binary", execution: { protocol: "pi-review-executor-jsonl-v1" } },
+      ],
+      execution: { futureExecution: true },
+      review: { futureReview: true },
+    }));
+    // A different settings instance appends an entry after this menu opened.
+    await updateReviewGateConfig(configPath, (raw) => {
+      (raw.externalAgents as unknown[]).push({ id: "concurrent", adapter: "claude-cli", model: "future-model", review: {} });
+    });
+    const existing = normalizeConfig(JSON.parse(await readFile(configPath, "utf8"))).externalAgents!;
+    const next = await persistReviewSettings(configPath, {
+      ...selection,
+      externalAgentAdditions: { created: { adapter: "claude-cli", model: "new-model", review: {}, execution: {} } },
+      workerResources: { "external-created": { selection: { source: "external", id: "created" }, maxConcurrent: 1 } },
+      executeRoute: [{ resourceId: "external-created" }],
+      researchRoute: [{ resourceId: "external-created" }],
+      primaryReviewers: [{ source: "external", id: "created" }],
+      subtaskReviewers: [{ source: "external", id: "created" }],
+    });
+    for (const [id, definition] of Object.entries(existing)) assert.deepEqual(next.externalAgents![id], definition);
+    const saved = JSON.parse(await readFile(configPath, "utf8"));
+    assert.deepEqual(saved.futureRoot, { keep: true });
+    assert.equal(saved.execution.futureExecution, true);
+    assert.equal(saved.review.futureReview, true);
+    assert.deepEqual(normalizeConfig(saved), next);
+    assert.equal(saved.externalAgents.generic.adapter, "generic-cli");
+    assert.equal(saved.externalAgents.binary.adapter, "run-as-binary");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("same-ID staged additions reject without overwriting, including identical definitions", async () => {
+  const dir = await mkdtemp(join(__dirname, "external-collision-"));
+  const configPath = join(dir, "config.json");
+  try {
+    const definition = { adapter: "codex-cli" as const, review: {}, env: { PRIVATE_SETTING: "do-not-print" } };
+    await writeFile(configPath, JSON.stringify({ externalAgents: { concurrent: definition }, futureRoot: true }));
+    const before = await readFile(configPath, "utf8");
+    for (const addition of [definition, { adapter: "claude-cli" as const, execution: {} }]) {
+      await assert.rejects(persistReviewSettings(configPath, { ...selection, externalAgentAdditions: { concurrent: addition } }), (error: Error) => {
+        assert.match(error.message, /already exists on disk.*different ID/);
+        assert.equal(error.message.includes("do-not-print"), false);
+        return true;
+      });
+      assert.equal(await readFile(configPath, "utf8"), before);
+    }
+    assert.deepEqual((await readdir(dir)).filter((name) => name.endsWith(".tmp")), []);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("external addition merges are prototype-safe and final validation rejects invalid references before writing", async () => {
+  const dir = await mkdtemp(join(__dirname, "external-validation-"));
+  const configPath = join(dir, "config.json");
+  try {
+    await writeFile(configPath, "{}");
+    const additions = JSON.parse('{"__proto__":{"adapter":"codex-cli","review":{},"execution":{}}}');
+    const next = await persistReviewSettings(configPath, { ...selection, externalAgentAdditions: additions });
+    assert.equal(Object.hasOwn(next.externalAgents!, "__proto__"), true);
+    assert.equal(Object.getPrototypeOf(next.externalAgents!), Object.prototype);
+    const before = await readFile(configPath, "utf8");
+    await assert.rejects(persistReviewSettings(configPath, {
+      ...selection,
+      externalAgentAdditions: { new: { adapter: "claude-cli", execution: {} } },
+      executeRoute: [{ resourceId: "missing" }],
+    }));
+    assert.equal(await readFile(configPath, "utf8"), before);
+    await assert.rejects(persistReviewSettings(configPath, {
+      ...selection,
+      externalAgentAdditions: { new: { adapter: "claude-cli", execution: {} } },
+      primaryReviewers: [{ source: "external", id: "missing" }],
+    }), /no longer supports review/);
+    assert.equal(await readFile(configPath, "utf8"), before);
+    // Latest disk role changes also fail closed, instead of validating only
+    // against the catalog visible when the settings transaction opened.
+    await assert.rejects(persistReviewSettings(configPath, {
+      ...selection,
+      externalAgentAdditions: { executionOnly: { adapter: "claude-cli", execution: {} } },
+      subtaskReviewers: [{ source: "external", id: "executionOnly" }],
+    }), /no longer supports review/);
+    assert.equal(await readFile(configPath, "utf8"), before);
+    await assert.rejects(persistReviewSettings(configPath, {
+      ...selection, externalAgentAdditions: { invalid: { adapter: "not-an-adapter" } as never },
+    }));
+    assert.equal(await readFile(configPath, "utf8"), before);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("an invalid legacy catalog conversion fails the save before any write", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-legacy-invalid-"));
   const configPath = join(dir, "config.json");

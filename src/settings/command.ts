@@ -6,6 +6,8 @@ import {
   DEFAULT_MAX_WORKERS,
   DEFAULT_SUBTASK_NOTIFICATION_MODE,
   cloneScheduledTaskCatalog,
+  cloneExternalAgentCatalog,
+  type ExternalAgentCatalog,
   effectiveReviewSettings,
   externalAgentCatalog,
   externalAgentSupportsReview,
@@ -18,6 +20,7 @@ import { OPERATING_MODE_LABELS } from "../operating-mode";
 import { registerHook, sendNotice } from "../pi";
 import { abortActiveNativeEditorField } from "../native-editor-bridge";
 import { retainedSelect } from "./menu";
+import { selectExternalAgentCreation } from "./external-agents";
 import { scopedModelChoices, type ScopedModelChoice } from "./models";
 import { persistReviewSettings, replaceConfig } from "./persistence";
 import { prepareScheduledImageAssets, rollbackScheduledImageAssetsUnlessPersisted, type PreparedScheduledImageAssets } from "./scheduled-image-assets";
@@ -50,7 +53,7 @@ import {
   selectSubtaskNotifications,
   selectTimeouts,
 } from "./controls";
-import { validateSelection } from "./validation";
+import { collectExternalAgentAvailabilityWarnings, validateSelection } from "./validation";
 
 interface RegisterSettingsInput {
   pi: unknown;
@@ -121,7 +124,11 @@ async function runSettingsMenu(
 ): Promise<void> {
   // Derived list for menu enumeration only; identity lookups go straight to
   // the canonical keyed catalog via resolvedExternalAgent.
-  const agents = externalAgentCatalog(input.config);
+  const draftConfig: ReviewGateConfig = {
+    ...input.config,
+    externalAgents: cloneExternalAgentCatalog(input.config.externalAgents ?? {}),
+  };
+  const externalAgentAdditions: ExternalAgentCatalog = {};
   let operatingMode = input.config.operatingMode;
   let modeCycleShortcut = input.config.modeCycleShortcut;
   // The catalog is keyed by stable resource ID; display order (alphabetical)
@@ -178,7 +185,7 @@ async function runSettingsMenu(
   // through the identical transaction as the ordinary entry — no duplicate
   // scheduler UI or state.
   if (initialSection === "scheduled") {
-    scheduledTasks = await selectScheduledTasks(input.ui, scheduledTasks, workerResources, input.config, input.scoped, agents, scheduledImageProvenance);
+    scheduledTasks = await selectScheduledTasks(input.ui, scheduledTasks, workerResources, draftConfig, input.scoped, externalAgentCatalog(draftConfig), scheduledImageProvenance);
   }
 
   // Caller-local last selection for this loop only: the highlighted row is
@@ -190,6 +197,7 @@ async function runSettingsMenu(
   // /review-settings entry still opens at the head.
   let rootLastKey: string | undefined = initialSection === "scheduled" ? "scheduled" : undefined;
   while (true) {
+    const agents = externalAgentCatalog(draftConfig);
     const totalReviewerChoices = input.scoped.length + agents.filter(externalAgentSupportsReview).length;
     const layerSummary = (enabled: boolean, reviewers: ActiveReviewerSelection[]): string =>
       enabled
@@ -209,8 +217,8 @@ async function runSettingsMenu(
       { key: "mode", label: "Operating mode", value: OPERATING_MODE_LABELS[operatingMode] },
       { key: "modeCycle", label: "Mode cycle hotkey", value: modeCycleShortcut },
       { key: "resources", label: "Worker resources", value: executorPoolSummary(workerResources) },
-      { key: "route.execute", label: "Execution priority", value: workerRouteSummary(executeRoute, workerResources, input.config, input.scoped) },
-      { key: "route.research", label: "Research priority", value: workerRouteSummary(researchRoute, workerResources, input.config, input.scoped) },
+      { key: "route.execute", label: "Execution priority", value: workerRouteSummary(executeRoute, workerResources, draftConfig, input.scoped) },
+      { key: "route.research", label: "Research priority", value: workerRouteSummary(researchRoute, workerResources, draftConfig, input.scoped) },
       { key: "reviewers", label: "Reviewers", value: `primary ${layerSummary(primaryEnabled, primaryReviewers)} · subtask ${layerSummary(subtaskEnabled, subtaskReviewers)}${reviewStatus}` },
       { key: "timeouts", label: "Timeouts", value: `review ${formatDuration(reviewerTimeoutMs)} · executor ${formatDuration(executorTimeoutMs)}` },
       { key: "policy", label: "Review policy", value: `${maxCorrectionCycles} corrections · concrete after ${guidanceThreshold}` },
@@ -224,6 +232,7 @@ async function runSettingsMenu(
       ...(input.schedulerRuntime
         ? [{ key: "schedulerRuntime", label: "Scheduler runtime", value: input.schedulerRuntime.enabled ? "On" : "Off" }]
         : []),
+      { key: "externalAgents", label: "External workers", value: `${agents.length} defined` },
       { key: "web", label: "Web", value: `${formatByteSize(webMaxDownloadBytes)} max download · ${browserVisible ? "headed" : "headless"} browser${browserPermissions.yolo ? " · YOLO ON" : ""}` },
     ];
     const renderedRootRows = alignedSettingsRows(rootSections.map((section) => [section.label, section.value] as const));
@@ -248,6 +257,15 @@ async function runSettingsMenu(
       modeCycleShortcut = await selectModeCycleShortcut(input.ui, modeCycleShortcut);
       continue;
     }
+    if (choice === "externalAgents") {
+      const created = await selectExternalAgentCreation(input.ui, draftConfig);
+      if (created) {
+        const { id, ...definition } = created;
+        Object.defineProperty(draftConfig.externalAgents!, id, { value: definition, enumerable: true, writable: true, configurable: true });
+        Object.defineProperty(externalAgentAdditions, id, { value: definition, enumerable: true, writable: true, configurable: true });
+      }
+      continue;
+    }
     if (choice === "resources") {
       ({ workerResources, executeRoute, researchRoute } = await visitWorkerResources(
         input.ui,
@@ -255,13 +273,13 @@ async function runSettingsMenu(
         executeRoute,
         researchRoute,
         agents,
-        input.config,
+        draftConfig,
         input.scoped,
       ));
       continue;
     }
     if (choice === "route.execute") {
-      executeRoute = await selectWorkerRoute(input.ui, "Execution priority", executeRoute, workerResources, input.config, input.scoped);
+      executeRoute = await selectWorkerRoute(input.ui, "Execution priority", executeRoute, workerResources, draftConfig, input.scoped);
       continue;
     }
     if (choice === "route.research") {
@@ -269,8 +287,8 @@ async function runSettingsMenu(
         input.ui,
         "Research priority",
         researchRoute,
-        filterResearchCapableCatalog(input.config, workerResources),
-        input.config,
+        filterResearchCapableCatalog(draftConfig, workerResources),
+        draftConfig,
         input.scoped,
       );
       continue;
@@ -321,7 +339,7 @@ async function runSettingsMenu(
       continue;
     }
     if (choice === "scheduled") {
-      scheduledTasks = await selectScheduledTasks(input.ui, scheduledTasks, workerResources, input.config, input.scoped, agents, scheduledImageProvenance);
+      scheduledTasks = await selectScheduledTasks(input.ui, scheduledTasks, workerResources, draftConfig, input.scoped, agents, scheduledImageProvenance);
       continue;
     }
     if (choice === "schedulerRuntime") {
@@ -344,9 +362,11 @@ async function runSettingsMenu(
     // This stores an absolute spelling, not a symlink-resolved path. Relative
     // and other spellings keep their parent-session-cwd anchor at run time.
     scheduledTasks = expandScheduledTaskWorkspaces(scheduledTasks);
-    const error = (await validateSelection(workerResources, primaryReviewers, input.config, input.scoped, executeRoute, researchRoute))
-      ?? (await validateSelection(workerResources, subtaskReviewers, input.config, input.scoped, executeRoute, researchRoute))
-      ?? (await validateScheduledTasks(scheduledTasks, workerResources, input.config, input.scoped, input.ui.cwd));
+    const warnings = new Set<string>();
+    const validationPolicy = { allowMissingApplicationCli: true, warnings };
+    const error = (await validateSelection(workerResources, primaryReviewers, draftConfig, input.scoped, executeRoute, researchRoute, validationPolicy))
+      ?? (await validateSelection(workerResources, subtaskReviewers, draftConfig, input.scoped, executeRoute, researchRoute, validationPolicy))
+      ?? (await validateScheduledTasks(scheduledTasks, workerResources, draftConfig, input.scoped, input.ui.cwd, validationPolicy));
     if (error) {
       await notify(input.ui, error, "error");
       continue;
@@ -374,6 +394,7 @@ async function runSettingsMenu(
     try {
       next = await persistReviewSettings(input.configPath!, {
         operatingMode,
+        externalAgentAdditions,
         modeCycleShortcut,
         workerResources,
         executeRoute,
@@ -412,11 +433,18 @@ async function runSettingsMenu(
       if (prepared) await rollbackScheduledImageAssetsUnlessPersisted(input.configPath!, prepared);
       throw error;
     }
+    // Include inactive definitions and additions preserved from the latest
+    // on-disk catalog. Availability probes never launch the application.
+    // Disk may have changed existing definitions since this menu opened.
+    // Announce availability of the saved catalog, not stale draft warnings.
+    warnings.clear();
+    await collectExternalAgentAvailabilityWarnings(next, validationPolicy);
     const previousMode = input.config.operatingMode;
     const previousModeCycleShortcut = input.config.modeCycleShortcut;
     replaceConfig(input.config, next);
     await input.onSaved?.(input.config, previousMode, { ui: input.ui });
     await notify(input.ui, "Review settings saved.", "info");
+    for (const warning of warnings) await notify(input.ui, warning, "warning");
     // The hotkey binding itself is captured by Pi at extension load, so a
     // changed key needs the documented /reload (same as keybindings.json);
     // the persisted mode change itself never needs a reload.

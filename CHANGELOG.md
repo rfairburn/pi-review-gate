@@ -15,6 +15,19 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.118]
+
+### Added
+
+- Create Claude Code and Codex CLI worker definitions through `/review-settings`,
+  with application-specific release-maintained model menus and structured shared
+  and role-specific options. New definitions are available for explicit worker
+  resource and reviewer selection before saving, without automatic activation or
+  provider calls. Save definitions and selections together while preserving existing
+  configuration and rejecting concurrent identifier collisions. Missing Claude/Codex
+  binaries warn without blocking Save; affected workers still fail until their CLI
+  is available (#49).
+
 ## [0.1.0-dev.117]
 
 ### Fixed

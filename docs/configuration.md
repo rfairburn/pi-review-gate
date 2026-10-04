@@ -290,8 +290,11 @@ environment variables).
 stable agent ID, where each value has an optional `review` role, `execution` role, or
 both. Role sections can override shared arguments, environment, model, protocol, and
 timeout, so one harness can use different limits for review and execution. An inactive
-external definition does not need to be installed; its command is checked when that
-definition is selected or run. Pi-scoped internal models are never copied into the
+external definition does not need to be installed. Missing Claude Code or Codex CLI
+binaries produce a warning when settings are saved, including for selected workers,
+but do not prevent saving; those workers will fail until their CLI is installed or
+available at the configured path. Runtime command failures remain errors. Other
+adapters retain their existing executable validation. Pi-scoped internal models are never copied into the
 external catalog.
 
 The legacy array form (entries carrying their own `id`) is deprecated but still
@@ -301,6 +304,56 @@ a fixed date or version ([#116](https://github.com/rfairburn/pi-review-gate/issu
 save the canonical object form now — `/review-settings` saves already write it. The
 worker catalog follows the same shape and deprecation; see
 [Delegated execution](delegated-execution.md#worker-resources-routes-and-concurrency).
+
+### Create external workers in the settings menu
+
+Open `/review-settings` → **External workers** to create a **Claude Code** or
+**Codex CLI** definition without editing JSON. Choose a unique identifier and
+supported application, select execution, review, or both roles, and choose a model
+from that application's menu. The executable may be left at its application default
+(`claude` or `codex`) or set to a path to the matching CLI. Unknown executables and
+generic/binary adapter creation are not offered; existing definitions remain intact.
+
+Advanced fields provide structured argument lists and environment entries, plus
+role-specific model, argument, environment, and timeout overrides. Shared arguments
+precede role arguments; role environment entries override shared entries. An unset
+role model inherits the shared model, and an unset timeout inherits the global role
+timeout. Existing adapter restrictions still apply, including read-only research and
+review safeguards. Authenticate through the CLI's own login/configuration; do not
+enter credentials into the settings file. Summaries show option counts rather than
+argument or environment values.
+
+Creating a definition only adds it to the settings draft. Before saving, explicitly
+add it through **Worker resources** for execution, or select it in the primary and/or
+subtask reviewer sets under **Reviewers** for review. Only configured roles appear
+in their supported selectors. Creation never selects a resource, changes reviewer
+selections, or invokes a provider. **Save changes** saves the definitions together
+with explicit resource, route, and reviewer selections; reopening/reloading retains
+them. Cancel or leaving the root menu with Escape discards the current edits.
+Existing definitions and unrelated configuration are preserved; a conflicting
+identifier added by another writer is rejected rather than overwritten. Missing
+Claude Code or Codex CLI binaries warn rather than block Save, whether the definition
+is selected or inactive. The warning identifies affected workers and explains that
+they cannot run until their executable is available. Saving does not install a CLI,
+authenticate it, or convert a failed run into success.
+
+#### Release-maintained CLI model catalogs
+
+The creation flow uses separate bundled catalogs, not Pi-scoped model names or live
+provider discovery. Claude Code offers the documented CLI aliases `sonnet`, `opus`,
+`haiku`, `fable`, and `best`; Codex CLI offers `gpt-6.1-sol`, `gpt-6-astra`, and
+`gpt-6-luna`. Unset/inherited model choices leave model selection to the existing
+configuration and CLI defaults. There is no manual-model fallback in creation.
+Existing model values outside these catalogs are not removed or rewritten.
+
+The lists are verified against the official
+[Claude Code model configuration](https://code.claude.com/docs/en/model-config) and
+[Codex models](https://developers.openai.com/codex/models) documentation and maintained
+with review-gate releases. Release maintenance must recheck those upstream sources
+and update catalog values and verification provenance when supported choices change.
+A catalog entry is a known CLI selection, not proof of account access: availability
+and alias resolution depend on CLI version, authentication, provider, plan, and
+organization policy. Settings do not probe a provider or authenticate on your behalf.
 
 ### Pre-cutover configuration fields
 

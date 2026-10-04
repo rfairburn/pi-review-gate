@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -636,6 +637,416 @@ test("Pi executor settles from a real child close that lands while durable PID p
   }
 });
 
+test("Pi executor preserves an argumentless startup rejection after a zero-exit close", {
+  skip: process.platform === "win32",
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-startup-falsy-rejection-close-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const command = join(root, "startup-exit-zero.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, ["#!/usr/bin/env node", "process.exit(0);"].join("\n"), "utf8");
+    await chmod(command, 0o755);
+
+    const started = Date.now();
+    const now = () => Date.now() - started;
+    let releaseCloseBarrier!: () => void;
+    const closeBarrier = new Promise<void>((resolvePromise) => { releaseCloseBarrier = resolvePromise; });
+    type TestSpawn = (file: string, args?: readonly string[], options?: SpawnOptions) => ChildProcess;
+    const childProcessExports = require("node:child_process") as { spawn: TestSpawn };
+    const realSpawn = childProcessExports.spawn;
+    let closeSeen: { code: number | null; signal: NodeJS.Signals | null; atMs: number } | undefined;
+    childProcessExports.spawn = ((file: string, args?: readonly string[], options?: SpawnOptions) => {
+      const proc = realSpawn(file, args ?? [], options ?? {});
+      proc.once("close", (code, signal) => {
+        closeSeen ??= { code, signal, atMs: now() };
+        releaseCloseBarrier();
+      });
+      return proc;
+    }) as TestSpawn;
+
+    let startEnteredAtMs: number | undefined;
+    let startRejectedAtMs: number | undefined;
+    let rootExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+    let promptDelivered = false;
+    try {
+      const result = await new PiExecutorAdapter({ model: "provider/model", command, timeoutMs: 10_000 }).run({
+        cwd: root,
+        prompt: "must not be delivered after failed startup persistence",
+        artifactDir,
+        turn: 1,
+        executorToolCatalog: { allowedToolCatalog: ["read"], initialActiveTools: ["read"] },
+        onProcessStart: async () => {
+          startEnteredAtMs = now();
+          await closeBarrier;
+          startRejectedAtMs = now();
+          return Promise.reject();
+        },
+        onProcessExit: ({ code, signal }) => { rootExit = { code, signal }; },
+        onPromptDelivery: () => { promptDelivered = true; },
+      });
+
+      assert.ok(closeSeen, "the independent observer must see the owned child close");
+      assert.equal(closeSeen.code, 0);
+      assert.equal(closeSeen.signal, null);
+      assert.ok(startEnteredAtMs !== undefined && startRejectedAtMs !== undefined);
+      assert.ok(closeSeen.atMs >= startEnteredAtMs && closeSeen.atMs <= startRejectedAtMs,
+        "the zero exit must occur while the argumentless startup rejection is pending");
+      assert.deepEqual(rootExit, { code: 0, signal: null }, "lifecycle reporting preserves the real zero exit");
+      assert.equal(result.code, 1, "a falsy callback rejection remains a protocol failure");
+      assert.equal(result.failure?.category, "protocol");
+      assert.match(result.failure?.message ?? "", /lifecycle start callback failed: undefined/);
+      assert.equal(promptDelivered, false);
+    } finally {
+      childProcessExports.spawn = realSpawn;
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Pi compaction rejects an argumentless startup failure without prompting the resumed turn", {
+  skip: process.platform === "win32",
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-compaction-falsy-start-rejection-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const command = join(root, "compaction-startup.cjs");
+    const launchCountPath = join(root, "launch-count");
+    const readyPath = join(root, "compaction-ready");
+    const exitPath = join(root, "compaction-exit");
+    const promptPath = join(root, "resumed-prompt");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');",
+      `const [launchCountPath,readyPath,exitPath,promptPath]=${JSON.stringify([launchCountPath, readyPath, exitPath, promptPath])};`,
+      "const count=Number(fs.existsSync(launchCountPath)?fs.readFileSync(launchCountPath,'utf8'):0)+1;fs.writeFileSync(launchCountPath,String(count));",
+      "process.on('SIGTERM',()=>{fs.writeFileSync(exitPath,String(count)+':0');process.exit(0)});",
+      "process.stdin.on('data',chunk=>{fs.appendFileSync(promptPath,String(count)+':'+chunk);if(count>1)process.exit(0)});process.stdin.resume();",
+      "if(count===1)fs.writeFileSync(readyPath,'ready');setInterval(()=>{},1000);",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+
+    let startCalls = 0;
+    const exits: Array<{ code: number | null; signal: NodeJS.Signals | null }> = [];
+    await assert.rejects(new PiExecutorAdapter({ model: "provider/model", command, timeoutMs: 5_000 }).run({
+      cwd: root,
+      prompt: "must not be delivered without successful compaction",
+      artifactDir,
+      turn: 2,
+      session: { adapter: "pi-model", id: "falsy-start-rejection-session" },
+      recovery: { kind: "compaction", compactBeforePrompt: true },
+      executorToolCatalog: { allowedToolCatalog: ["read"], initialActiveTools: ["read"] },
+      onProcessStart: async () => {
+        startCalls += 1;
+        if (startCalls === 1) {
+          await waitFor(() => existsSync(readyPath));
+          return Promise.reject();
+        }
+      },
+      onProcessExit: ({ code, signal }) => { exits.push({ code, signal }); },
+    }), /Explicit executor compaction recovery failed:.*Lifecycle callback failed: undefined/);
+
+    assert.equal(await readFile(launchCountPath, "utf8"), "1", "failed compaction must not launch the resumed RPC child");
+    assert.deepEqual(exits, [{ code: 0, signal: null }], "the compaction root's real zero exit remains ordered after its start failure");
+    await assert.rejects(readFile(promptPath, "utf8"), { code: "ENOENT" });
+    assert.equal(startCalls, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Pi executor aborts startup while async identity persistence is pending and never prompts after late resolution", {
+  skip: process.platform === "win32",
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-startup-abort-callback-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const command = join(root, "startup.cjs");
+    const exitPath = join(root, "actual-exit-code");
+    const promptPath = join(root, "prompt-received");
+    const readyPath = join(root, "child-ready");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');",
+      `const exitPath=${JSON.stringify(exitPath)};const promptPath=${JSON.stringify(promptPath)};const readyPath=${JSON.stringify(readyPath)};`,
+      "process.on('SIGTERM',()=>{fs.writeFileSync(exitPath,'23');process.exit(23)});",
+      "process.stdin.on('data',()=>fs.writeFileSync(promptPath,'yes'));process.stdin.resume();fs.writeFileSync(readyPath,'ready');setInterval(()=>{},1000);",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+
+    const controller = new AbortController();
+    let announceStart!: () => void;
+    let releaseStart!: () => void;
+    const startEntered = new Promise<void>((resolvePromise) => { announceStart = resolvePromise; });
+    const startGate = new Promise<void>((resolvePromise) => { releaseStart = resolvePromise; });
+    const events: string[] = [];
+    let rootExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+    let rootPid: number | undefined;
+    let promptDelivered = false;
+    const startedAt = Date.now();
+    const running = new PiExecutorAdapter({ model: "provider/model", command, timeoutMs: 10_000 }).run({
+      cwd: root,
+      prompt: "must not be delivered after startup abort",
+      artifactDir,
+      turn: 1,
+      signal: controller.signal,
+      executorToolCatalog: { allowedToolCatalog: ["read"], initialActiveTools: ["read"] },
+      onProcessStart: async ({ pid }) => {
+        rootPid = pid;
+        await waitFor(() => existsSync(readyPath));
+        events.push("start-entered");
+        announceStart();
+        await startGate;
+        events.push("start-persisted");
+      },
+      onProcessExit: ({ code, signal }) => {
+        events.push(`exit-${code}-${signal}`);
+        rootExit = { code, signal };
+      },
+      onPromptDelivery: () => { promptDelivered = true; },
+    });
+    void running.catch(() => undefined);
+
+    try {
+      let startupGuard: NodeJS.Timeout | undefined;
+      await Promise.race([
+        startEntered,
+        new Promise<never>((_, rejectPromise) => {
+          startupGuard = setTimeout(() => rejectPromise(new Error("Pi child fixture did not reach startup persistence")), 6_000);
+        }),
+      ]).finally(() => { if (startupGuard) clearTimeout(startupGuard); });
+      assert.ok(rootPid);
+      controller.abort();
+      const exitDeadline = Date.now() + 5_000;
+      for (;;) {
+        try {
+          assert.equal(await readFile(exitPath, "utf8"), "23");
+          break;
+        } catch {
+          if (Date.now() >= exitDeadline) assert.fail("the aborted startup child did not handle termination");
+          await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
+        }
+      }
+      releaseStart();
+      let guardTimer: NodeJS.Timeout | undefined;
+      const result = await Promise.race([
+        running,
+        new Promise<never>((_, rejectPromise) => {
+          guardTimer = setTimeout(() => rejectPromise(new Error("Pi executor did not finish bounded startup cancellation")), 5_000);
+          guardTimer.unref?.();
+        }),
+      ]).finally(() => { if (guardTimer) clearTimeout(guardTimer); });
+      assert.ok(Date.now() - startedAt < 5_000);
+      assert.equal(result.aborted, true);
+      assert.equal(result.code, 23);
+      assert.deepEqual(rootExit, { code: 23, signal: null }, "exit persistence carries the actual owned-root status");
+      assert.deepEqual(events, ["start-entered", "start-persisted", "exit-23-null"], "exit persistence stays ordered after late start resolution");
+      assert.equal(promptDelivered, false);
+      await assert.rejects(readFile(promptPath, "utf8"), { code: "ENOENT" });
+      const processResult = JSON.parse(await readFile(join(artifactDir, "executor", "0001", "process-result.json"), "utf8"));
+      assert.equal(processResult.code, 23, "artifacts retain the observed root status");
+    } finally {
+      controller.abort();
+      releaseStart();
+      await running.catch(() => undefined);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Pi executor with an already-aborted signal never sends a startup prompt", {
+  skip: process.platform === "win32",
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-startup-pre-aborted-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const command = join(root, "startup.cjs");
+    const promptPath = join(root, "prompt-received");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');",
+      `const promptPath=${JSON.stringify(promptPath)};`,
+      "process.stdin.on('data',()=>fs.writeFileSync(promptPath,'yes'));process.stdin.resume();setInterval(()=>{},1000);",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+
+    const controller = new AbortController();
+    controller.abort();
+    let rootExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+    let promptDelivered = false;
+    const result = await new PiExecutorAdapter({ model: "provider/model", command, timeoutMs: 10_000 }).run({
+      cwd: root,
+      prompt: "must not be delivered for a pre-aborted request",
+      artifactDir,
+      turn: 2,
+      signal: controller.signal,
+      executorToolCatalog: { allowedToolCatalog: ["read"], initialActiveTools: ["read"] },
+      onProcessExit: ({ code, signal }) => { rootExit = { code, signal }; },
+      onPromptDelivery: () => { promptDelivered = true; },
+    });
+
+    assert.equal(result.aborted, true);
+    assert.equal(promptDelivered, false);
+    assert.ok(rootExit, "the callback reports the actual owned-root exit rather than fabricating one");
+    assert.equal(rootExit.signal, "SIGTERM", "the pre-aborted owned root is reported with its observed signal");
+    await assert.rejects(readFile(promptPath, "utf8"), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Pi executor terminates a child after async start-persistence rejection without prompt delivery", {
+  skip: process.platform === "win32",
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-startup-rejected-callback-"));
+  const exitPath = join(root, "actual-exit-code");
+  const promptPath = join(root, "prompt-received");
+  const stopPath = join(root, "cooperative-stop");
+  const readyPath = join(root, "child-ready");
+  let rootPid: number | undefined;
+  try {
+    const artifactDir = join(root, "artifacts");
+    const command = join(root, "startup.cjs");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');",
+      `const exitPath=${JSON.stringify(exitPath)};const promptPath=${JSON.stringify(promptPath)};const stopPath=${JSON.stringify(stopPath)};const readyPath=${JSON.stringify(readyPath)};`,
+      "process.on('SIGTERM',()=>{fs.writeFileSync(exitPath,'23');process.exit(23)});",
+      "process.stdin.on('data',()=>fs.writeFileSync(promptPath,'yes'));process.stdin.resume();fs.writeFileSync(readyPath,'ready');setInterval(()=>{if(fs.existsSync(stopPath)){fs.writeFileSync(exitPath,'cooperative-stop');process.exit(0)}},20);",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+
+    let rootExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+    let promptDelivered = false;
+    const result = await new PiExecutorAdapter({ model: "provider/model", command, timeoutMs: 10_000 }).run({
+      cwd: root,
+      prompt: "must not be delivered after callback failure",
+      artifactDir,
+      turn: 1,
+      executorToolCatalog: { allowedToolCatalog: ["read"], initialActiveTools: ["read"] },
+      onProcessStart: async ({ pid }) => {
+        rootPid = pid;
+        await waitFor(() => existsSync(readyPath));
+        throw new Error("identity persistence rejected");
+      },
+      onProcessExit: ({ code, signal }) => { rootExit = { code, signal }; },
+      onPromptDelivery: () => { promptDelivered = true; },
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(result.failure?.category, "protocol");
+    assert.match(result.failure?.message ?? "", /lifecycle start callback failed: identity persistence rejected/);
+    assert.deepEqual(rootExit, { code: 23, signal: null });
+    assert.equal(promptDelivered, false);
+    await assert.rejects(readFile(promptPath, "utf8"), { code: "ENOENT" });
+    const processResult = JSON.parse(await readFile(join(artifactDir, "executor", "0001", "process-result.json"), "utf8"));
+    assert.equal(processResult.code, 23);
+  } finally {
+    await writeFile(stopPath, "stop").catch(() => undefined);
+    const cleanupDeadline = Date.now() + 5_000;
+    for (;;) {
+      try {
+        await readFile(exitPath, "utf8");
+        break;
+      } catch {
+        if (Date.now() >= cleanupDeadline) assert.fail(`owned startup fixture ${rootPid ?? "without a reported pid"} did not stop cooperatively`);
+        await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
+      }
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Pi executor bounds a never-settling startup callback at the model deadline", {
+  skip: process.platform === "win32",
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-startup-pending-callback-"));
+  try {
+    const artifactDir = join(root, "artifacts");
+    const command = join(root, "startup.cjs");
+    const exitPath = join(root, "actual-exit-code");
+    const promptPath = join(root, "prompt-received");
+    const readyPath = join(root, "child-ready");
+    await mkdir(artifactDir);
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');",
+      `const exitPath=${JSON.stringify(exitPath)};const promptPath=${JSON.stringify(promptPath)};const readyPath=${JSON.stringify(readyPath)};`,
+      "process.on('SIGTERM',()=>{fs.writeFileSync(exitPath,'23');process.exit(23)});",
+      "process.stdin.on('data',()=>fs.writeFileSync(promptPath,'yes'));process.stdin.resume();fs.writeFileSync(readyPath,'ready');setInterval(()=>{},1000);",
+    ].join("\n"), "utf8");
+    await chmod(command, 0o755);
+
+    let announceStart!: () => void;
+    const startEntered = new Promise<void>((resolvePromise) => { announceStart = resolvePromise; });
+    let releaseStart!: () => void;
+    const startGate = new Promise<void>((resolvePromise) => { releaseStart = resolvePromise; });
+    let rootPid: number | undefined;
+    let exitCallbackCalled = false;
+    let promptDelivered = false;
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    const running = new PiExecutorAdapter({ model: "provider/model", command, timeoutMs: 3_000 }).run({
+      cwd: root,
+      prompt: "must not be delivered while identity persistence is pending",
+      artifactDir,
+      turn: 1,
+      signal: controller.signal,
+      executorToolCatalog: { allowedToolCatalog: ["read"], initialActiveTools: ["read"] },
+      onProcessStart: async ({ pid }) => {
+        rootPid = pid;
+        await waitFor(() => existsSync(readyPath));
+        announceStart();
+        await startGate;
+      },
+      onProcessExit: () => { exitCallbackCalled = true; },
+      onPromptDelivery: () => { promptDelivered = true; },
+    });
+    void running.catch(() => undefined);
+
+    try {
+      let startupGuard: NodeJS.Timeout | undefined;
+      await Promise.race([
+        startEntered,
+        new Promise<never>((_, rejectPromise) => {
+          startupGuard = setTimeout(() => rejectPromise(new Error("Pi child fixture did not reach startup persistence")), 6_000);
+        }),
+      ]).finally(() => { if (startupGuard) clearTimeout(startupGuard); });
+      assert.ok(rootPid);
+      let guardTimer: NodeJS.Timeout | undefined;
+      const result = await Promise.race([
+        running,
+        new Promise<never>((_, rejectPromise) => {
+          guardTimer = setTimeout(() => rejectPromise(new Error("Pi executor startup callback exceeded its bounded model/terminal deadlines")), 13_000);
+        }),
+      ]).finally(() => { if (guardTimer) clearTimeout(guardTimer); });
+      assert.ok(Date.now() - startedAt < 13_000);
+      assert.equal(result.timedOut, true);
+      assert.equal(result.code, 1);
+      assert.equal(result.failure?.category, "protocol");
+      assert.match(result.failure?.message ?? "", /startup did not complete before the configured model deadline/);
+      assert.match(result.failure?.message ?? "", /lifecycle callbacks did not settle.*persistence is unconfirmed/);
+      assert.equal(exitCallbackCalled, false, "exit persistence must wait for the unresolved start callback");
+      assert.equal(promptDelivered, false);
+      assert.equal(await readFile(exitPath, "utf8"), "23", "the child itself records the observed exit status");
+      await assert.rejects(readFile(promptPath, "utf8"), { code: "ENOENT" });
+      const processResult = JSON.parse(await readFile(join(artifactDir, "executor", "0001", "process-result.json"), "utf8"));
+      assert.equal(processResult.code, 23, "artifacts retain the actual root status despite lifecycle uncertainty");
+    } finally {
+      controller.abort();
+      releaseStart();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Pi executor does not mask a terminal cleanup hook error behind a valid live-browser settlement", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-terminal-cleanup-"));
   try {
@@ -661,6 +1072,57 @@ test("Pi executor does not mask a terminal cleanup hook error behind a valid liv
     assert.equal(result.code, 1);
     assert.equal(result.failure?.category, "protocol");
     assert.match(result.failure?.message ?? "", /terminal session cleanup failed/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Pi executor bounds a never-settling terminal exit callback and does not report lifecycle success", {
+  skip: process.platform === "win32",
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-terminal-lifecycle-pending-"));
+  try {
+    const command = join(root, "rpc.cjs");
+    await writeFile(command, [
+      "#!/usr/bin/env node",
+      "const fs=require('node:fs');",
+      ...fakePiSettlementReceipt,
+      "let input='';const out=v=>console.log(JSON.stringify(v));process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const c=JSON.parse(input.slice(0,n));input=input.slice(n+1);",
+      "if(c.type==='prompt'){out({type:'response',id:c.id,success:true});ack();out({type:'agent_end'});}",
+      "else out({type:'response',id:c.id,success:true,data:c.type==='get_state'?{isStreaming:false,pendingMessageCount:0}:{text:'done'}});}});",
+      "process.stdin.on('end',()=>process.exit(0));",
+    ].join("\n"));
+    await chmod(command, 0o755);
+
+    let exitStatus: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+    const startedAt = Date.now();
+    let guardTimer: NodeJS.Timeout | undefined;
+    const result = await Promise.race([
+      new PiExecutorAdapter({ model: "provider/model", command, timeoutMs: 2_000 }).run({
+        cwd: root,
+        prompt: "settle before hanging terminal persistence",
+        artifactDir: root,
+        turn: 1,
+        executorToolCatalog: { allowedToolCatalog: ["read"], initialActiveTools: ["read"] },
+        onProcessExit: async ({ code, signal }) => {
+          exitStatus = { code, signal };
+          await new Promise<void>(() => {});
+        },
+      }),
+      new Promise<never>((_, rejectPromise) => {
+        guardTimer = setTimeout(() => rejectPromise(new Error("Pi executor did not bound terminal lifecycle persistence")), 10_000);
+      }),
+    ]).finally(() => { if (guardTimer) clearTimeout(guardTimer); });
+
+    assert.ok(Date.now() - startedAt < 10_000);
+    assert.equal(result.code, 1);
+    assert.equal(result.failure?.category, "protocol");
+    assert.match(result.failure?.message ?? "", /lifecycle callbacks did not settle.*persistence is unconfirmed/);
+    assert.deepEqual(exitStatus, { code: 0, signal: null }, "the callback receives only the observed root status");
+    assert.equal(result.text, "done", "the turn text does not convert a failed lifecycle persistence wait into success");
+    const processResult = JSON.parse(await readFile(join(root, "executor", "0001", "process-result.json"), "utf8"));
+    assert.equal(processResult.code, 0, "process artifacts retain the actual root status");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -14,6 +14,7 @@ import {
   type ExecutionAttemptRecord,
   type ExecutionIncident,
   type ExecutorAssignmentRecord,
+  type OperationChildLifecycleIdentity,
   type OperationRecord,
 } from "../operation-record";
 import { resolveExecutorToolCatalog } from "../tool-catalog";
@@ -210,6 +211,7 @@ export async function runInplaceTurnLoop(input: {
   // The operation owner slot tracks only the latest child. Retain the full
   // assignment history across same-adapter retries so failover cannot hide one.
   const childProcesses: InPlaceChildProcessSettlement[] = [];
+  const childLifecycleBySettlement = new WeakMap<InPlaceChildProcessSettlement, OperationChildLifecycleIdentity>();
   let unmatchedChildExit = false;
   const firstAttemptIndex = input.operation.attempts.length;
 
@@ -233,6 +235,9 @@ export async function runInplaceTurnLoop(input: {
       input.operation.attempts.push(attemptRecord);
       input.operation.state = "running";
       await writeOperationRecord(input.operation);
+      const attemptChildLifecycles = new Map<string, OperationChildLifecycleIdentity>();
+      const childKey = (process: { pid: number; processGroupId?: number }) =>
+        `${process.pid}:${process.processGroupId === undefined ? "none" : process.processGroupId}`;
 
       let turn: ExecutorTurn | undefined;
       let thrown: unknown;
@@ -299,26 +304,36 @@ export async function runInplaceTurnLoop(input: {
             });
           },
           onProcessStart: async (process) => {
-            childProcesses.push({
+            const lifecycle = recordOperationChildProcess(input.operation, process.pid, process.processGroupId);
+            const settlement: InPlaceChildProcessSettlement = {
               pid: process.pid,
               processGroupId: process.processGroupId,
-            });
-            recordOperationChildProcess(input.operation, process.pid, process.processGroupId);
+            };
+            childProcesses.push(settlement);
+            childLifecycleBySettlement.set(settlement, lifecycle);
+            attemptChildLifecycles.set(childKey(process), lifecycle);
             await writeOperationRecord(input.operation);
           },
           onProcessExit: async (process) => {
+            const key = childKey(process);
+            const lifecycle = attemptChildLifecycles.get(key);
             let matched: InPlaceChildProcessSettlement | undefined;
-            for (let index = childProcesses.length - 1; index >= 0; index -= 1) {
-              const child = childProcesses[index]!;
-              if (child.pid !== process.pid || child.exitedAt !== undefined) continue;
-              if (process.processGroupId !== undefined && child.processGroupId !== process.processGroupId) continue;
-              matched = child;
-              break;
+            if (lifecycle) {
+              for (let index = childProcesses.length - 1; index >= 0; index -= 1) {
+                const child = childProcesses[index]!;
+                if (childLifecycleBySettlement.get(child)?.lifecycleId !== lifecycle.lifecycleId) continue;
+                if (child.pid !== process.pid || child.exitedAt !== undefined) continue;
+                if (process.processGroupId !== undefined && child.processGroupId !== process.processGroupId) continue;
+                matched = child;
+                break;
+              }
             }
             if (matched) matched.exitedAt = new Date().toISOString();
             else unmatchedChildExit = true;
-            recordOperationChildExit(input.operation);
-            await writeOperationRecord(input.operation);
+            if (lifecycle && recordOperationChildExit(input.operation, lifecycle)) {
+              await writeOperationRecord(input.operation);
+            }
+            attemptChildLifecycles.delete(key);
           },
         });
       } catch (error) {

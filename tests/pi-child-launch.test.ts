@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { accessSync, constants as fsConstants, existsSync, statSync } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { PiModelAdapter } from "../src/adapters/pi-model";
-import { runPromptProcess } from "../src/adapters/process";
+import { runPromptProcess, terminateProcessTree } from "../src/adapters/process";
 import { PiExecutorAdapter } from "../src/execution/adapters/pi-model";
 import { createPiSettlementBootstrap, piSettlementEnvironment } from "../src/execution/pi-settlement-receipt";
 import { EXECUTOR_TOOL_CATALOG_ENV } from "../src/execution/tool-catalog";
@@ -18,15 +18,23 @@ import { findInstalledAgentDirs } from "./menu-tui-fakes";
  * compaction recovery) must be alias-independent. On Windows the only PATH
  * entry a spawned child can see is npm's pi.cmd shim (PowerShell aliases are
  * not inherited), and `spawn("pi", { shell: false })` fails with ENOENT. The
- * shared resolver maps the default `pi` to the installed pi.exe or the npm
- * shim's JavaScript entry through this Node binary; POSIX keeps direct
- * execvp, and configured custom commands keep their exact spawn semantics.
+ * shared resolver maps the default `pi` to the installed pi.exe or the
+ * full-path pi.cmd through cmd.exe without inspecting its contents; POSIX
+ * keeps direct execvp, and configured custom commands keep their exact spawn
+ * semantics.
  *
  * Every launch regression below starts a REAL child process (the fixture is a
  * platform-appropriate PATH entry: an exact npm cmd-shim shape on native
  * Windows, an executable script elsewhere) — argv capture alone would prove
  * nothing about startup.
  */
+
+function parentWindowsSystemCmdPath(): string {
+  const key = Object.keys(process.env).find((name) => name.toLowerCase() === "systemroot");
+  const systemRoot = key ? process.env[key] : undefined;
+  assert.ok(systemRoot, "native Windows must provide the parent's SystemRoot");
+  return join(systemRoot, "System32", "cmd.exe");
+}
 
 /** An npm-generated Windows batch shim shape, as npm's cmd-shim writes it. */
 function npmCmdShim(targetRelative: string): string {
@@ -44,10 +52,10 @@ function npmCmdShim(targetRelative: string): string {
     '  SET "_prog=%dp0%\\node.exe"',
     ") ELSE (",
     '  SET "_prog=node"',
-    "  SET PATHEXT=%PATHEXT:;.JS;=;%'",
+    "  SET PATHEXT=%PATHEXT:;.JS;=;%",
+    ")",
     "",
-    'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & goto :_undefined_#',
-    `"%_prog%"  "%dp0%\\${targetRelative}" %*`,
+    `endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\${targetRelative}" %*`,
     "",
   ].join("\r\n");
 }
@@ -91,6 +99,39 @@ async function makeFakePiBin(prefix: string, entryBody: string[], options: { shi
   return createFakePiBinIn(root, entryBody, options);
 }
 
+/**
+ * Simulate win32 resolution in a separate Node process with a controlled
+ * parent SystemRoot and an fs.statSync source spy. This keeps cross-host tests
+ * independent of (and never mutating) the concurrently shared test process.
+ */
+function resolveWindowsChildSpawnInIsolation(command: string, args: string[], env: NodeJS.ProcessEnv) {
+  const trustedRoot = "Z:\\Pi Review Trusted Windows";
+  const trustedCmd = `${trustedRoot}\\System32\\cmd.exe`;
+  const invocationModulePath = resolve(__dirname, "../src/pi-invocation.js");
+  const source = `
+    const fs = require("node:fs");
+    const trustedRoot = ${JSON.stringify(trustedRoot)};
+    const trustedCmd = ${JSON.stringify(trustedCmd)};
+    const originalStatSync = fs.statSync;
+    fs.statSync = function (candidate, ...rest) {
+      if (typeof candidate === "string" && candidate.toLowerCase() === trustedCmd.toLowerCase()) {
+        return { isFile: () => true };
+      }
+      return originalStatSync.call(this, candidate, ...rest);
+    };
+    for (const key of Object.keys(process.env)) {
+      if (key.toLowerCase() === "systemroot") delete process.env[key];
+    }
+    process.env.sYsTeMrOoT = trustedRoot;
+    const { resolvePiChildSpawn } = require(${JSON.stringify(invocationModulePath)});
+    const spec = resolvePiChildSpawn(${JSON.stringify(command)}, ${JSON.stringify(args)}, ${JSON.stringify(env)}, "win32");
+    process.stdout.write(JSON.stringify(spec));
+  `;
+  const result = spawnSync(process.execPath, ["-e", source], { encoding: "utf8", env: process.env });
+  assert.equal(result.status, 0, `isolated win32 Pi resolver failed: ${result.stderr}`);
+  return JSON.parse(result.stdout ?? "{}");
+}
+
 /** Minimal settlement-receipt acknowledgement for fake RPC fixtures. */
 const fakePiSettlementReceipt = [
   "const crypto=require('node:crypto');let ackGeneration=0;",
@@ -101,6 +142,194 @@ async function readCaptureLines(captureFile: string): Promise<Array<Record<strin
   const raw = await readFile(captureFile, "utf8");
   return raw.split("\n").filter((line) => line.trim()).map((line) => JSON.parse(line) as Record<string, unknown>);
 }
+
+const installedPiBin = process.env.PI_REVIEW_GATE_INSTALLED_PI_BIN;
+const expectedPiVersion = process.env.PI_REVIEW_GATE_EXPECT_PI_VERSION;
+const requiredPiHost = process.env.PI_REVIEW_GATE_REQUIRE_PI_HOST === "1";
+
+function usablePiEntry(path: string, platform: NodeJS.Platform): boolean {
+  try {
+    if (!statSync(path).isFile()) return false;
+    if (platform !== "win32") accessSync(path, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function pinnedPiEntry(piBin: string, platform: NodeJS.Platform = process.platform): string | undefined {
+  const names = platform === "win32" ? ["pi.exe", "pi.cmd"] : ["pi"];
+  return names.map((name) => resolve(piBin, name)).find((path) => usablePiEntry(path, platform));
+}
+
+function realPiRpcPrerequisiteError(
+  cliEntry: string | undefined,
+  candidateEntry: string,
+  coverage = { installedBin: installedPiBin, expectedVersion: expectedPiVersion, required: requiredPiHost },
+): string | undefined {
+  if (coverage.required && !coverage.installedBin) {
+    return "required installed Pi launch bin unavailable: PI_REVIEW_GATE_INSTALLED_PI_BIN";
+  }
+  if (coverage.installedBin && !existsSync(coverage.installedBin)) {
+    return `pinned Pi launch bin does not exist: ${coverage.installedBin}`;
+  }
+  if (coverage.installedBin && !pinnedPiEntry(coverage.installedBin)) {
+    const expected = process.platform === "win32" ? "pi.exe or pi.cmd" : "executable pi";
+    return `pinned Pi command entry missing from ${coverage.installedBin} (expected ${expected})`;
+  }
+  if (coverage.required && !coverage.expectedVersion) {
+    return "required installed Pi version unavailable: PI_REVIEW_GATE_EXPECT_PI_VERSION";
+  }
+  if (!coverage.installedBin && !cliEntry) {
+    return "installed pi-coding-agent CLI unavailable (PI_REVIEW_GATE_INSTALLED_AGENT or ambient install)";
+  }
+  if (!existsSync(candidateEntry)) return `built candidate entry unavailable: ${candidateEntry}`;
+  return undefined;
+}
+
+function piResolutionEnv(env: NodeJS.ProcessEnv, piBin: string): NodeJS.ProcessEnv {
+  const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path");
+  const pathValue = pathKey ? env[pathKey] : "";
+  const pinned = resolve(piBin);
+  const samePath = (left: string, right: string) => {
+    const a = resolve(left);
+    const b = resolve(right);
+    return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+  };
+  const names = process.platform === "win32" ? ["pi.exe", "pi.cmd"] : ["pi"];
+  const remaining = (pathValue ?? "").split(delimiter).filter((dir) => {
+    if (!dir || samePath(dir, pinned)) return false;
+    return !names.some((name) => usablePiEntry(join(dir, name), process.platform));
+  });
+  const result: NodeJS.ProcessEnv = { ...env };
+  for (const key of Object.keys(result)) {
+    if (key.toLowerCase() === "path") delete result[key];
+  }
+  // Keep the pinned directory first and remove ambient directories that can
+  // shadow it, while leaving the real child environment untouched so Node and
+  // other tools remain available at runtime.
+  result.PATH = [pinned, ...remaining].join(delimiter);
+  return result;
+}
+
+function resolvePinnedPiSpawn(args: string[], env: NodeJS.ProcessEnv): Extract<ReturnType<typeof resolvePiChildSpawn>, { ok: true }> {
+  if (!installedPiBin || !pinnedPiEntry(installedPiBin)) {
+    throw new Error("the pinned Pi bin must contain a platform-appropriate Pi entry");
+  }
+  const invocation = resolvePiChildSpawn("pi", args, piResolutionEnv(env, installedPiBin));
+  assert.ok(invocation.ok, `the pinned Pi command must resolve: ${JSON.stringify(invocation)}`);
+  return invocation;
+}
+
+function realPiRpcEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("PI_REVIEW_GATE_")) delete env[key];
+  }
+  if (!installedPiBin) return env;
+
+  const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path");
+  const priorPath = pathKey ? process.env[pathKey] : "";
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() === "path") delete env[key];
+  }
+  env.PATH = `${installedPiBin}${delimiter}${priorPath ?? ""}`;
+
+  if (!expectedPiVersion) {
+    if (requiredPiHost) throw new Error("required installed Pi coverage needs PI_REVIEW_GATE_EXPECT_PI_VERSION.");
+    return env;
+  }
+  const versionSpec = resolvePinnedPiSpawn(["--version"], env);
+  const versionResult = spawnSync(versionSpec.file, versionSpec.args, {
+    env,
+    shell: false,
+    encoding: "utf8",
+    ...("windowsVerbatimArguments" in versionSpec && versionSpec.windowsVerbatimArguments === true
+      ? { windowsVerbatimArguments: true }
+      : {}),
+  });
+  const output = `${versionResult.stdout ?? ""}${versionResult.stderr ?? ""}`;
+  assert.equal(versionResult.status, 0, `the pinned Pi CLI --version must succeed: ${output}`);
+  assert.equal((versionResult.stdout ?? "").trim(), expectedPiVersion,
+    `the pinned Pi CLI must report exactly ${expectedPiVersion}, got: ${output}`);
+  return env;
+}
+
+function spawnRealPiRpc(
+  args: string[],
+  cliEntry: string | undefined,
+  env: NodeJS.ProcessEnv,
+  cwd: string,
+): ChildProcess {
+  let invocation: ReturnType<typeof resolvePiChildSpawn>;
+  if (installedPiBin) {
+    invocation = resolvePinnedPiSpawn(args, env);
+  } else if (cliEntry) {
+    invocation = { ok: true as const, file: process.execPath, args: [cliEntry, ...args] };
+  } else {
+    throw new Error("local real-Pi fallback requires the installed CLI entry path");
+  }
+  assert.ok(invocation.ok, `the selected real-Pi command must resolve: ${JSON.stringify(invocation)}`);
+  return spawn(invocation.file, invocation.args, {
+    cwd,
+    shell: false,
+    stdio: ["pipe", "pipe", "pipe"],
+    env,
+    ...("windowsVerbatimArguments" in invocation && invocation.windowsVerbatimArguments === true
+      ? { windowsVerbatimArguments: true }
+      : {}),
+  });
+}
+
+test("required real-Pi coverage rejects an empty pinned bin despite an ambient Pi at the expected version", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prg-pinned-pi-required-"));
+  const pinnedBin = join(root, "pinned-bin");
+  const ambientBin = join(root, "ambient-bin");
+  const candidateEntry = join(root, "candidate.js");
+  const ambientPi = join(ambientBin, process.platform === "win32" ? "pi.cmd" : "pi");
+  try {
+    await mkdir(pinnedBin, { recursive: true });
+    await mkdir(ambientBin, { recursive: true });
+    await writeFile(candidateEntry, "// test candidate\n", "utf8");
+    await writeFile(ambientPi, process.platform === "win32"
+      ? "@ECHO off\r\nECHO 1.0.2\r\n"
+      : "#!/bin/sh\nprintf '%s\\n' '1.0.2'\n", "utf8");
+    if (process.platform !== "win32") await chmod(ambientPi, 0o755);
+
+    const ambientEnv: NodeJS.ProcessEnv = { ...process.env };
+    const pathKey = Object.keys(ambientEnv).find((key) => key.toLowerCase() === "path");
+    const priorPath = pathKey ? ambientEnv[pathKey] : "";
+    for (const key of Object.keys(ambientEnv)) {
+      if (key.toLowerCase() === "path") delete ambientEnv[key];
+    }
+    ambientEnv.PATH = `${ambientBin}${delimiter}${priorPath ?? ""}`;
+    const ambientCommand = `"${ambientPi}" --version`;
+    const ambientResult = process.platform === "win32"
+      ? spawnSync("cmd.exe", ["/d", "/s", "/c", `"${ambientCommand}"`], {
+        env: ambientEnv,
+        shell: false,
+        encoding: "utf8",
+        windowsVerbatimArguments: true,
+      })
+      : spawnSync("pi", ["--version"], { env: ambientEnv, shell: false, encoding: "utf8" });
+    const ambientOutput = `${ambientResult.stdout ?? ""}${ambientResult.stderr ?? ""}`;
+    assert.equal(ambientResult.status, 0, `the ambient fixture must be runnable: ${ambientOutput}`);
+    assert.match(ambientOutput, /1\.0\.2/, "the ambient fixture would satisfy the expected-version check");
+
+    const selectionEnv = piResolutionEnv(ambientEnv, pinnedBin);
+    assert.ok(!selectionEnv.PATH?.split(delimiter).includes(ambientBin),
+      "ambient Pi entries must be excluded from resolver command selection");
+    const missing = realPiRpcPrerequisiteError(ambientPi, candidateEntry, {
+      installedBin: pinnedBin,
+      expectedVersion: "1.0.2",
+      required: true,
+    });
+    assert.match(missing ?? "", /pinned Pi command entry missing/,
+      "required pinned coverage must fail before the ambient Pi can pass version validation");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Shared resolver: cross-platform unit coverage (resolver/argv safety)
@@ -120,26 +349,40 @@ test("shared Pi child resolver keeps custom commands and POSIX default pi exactl
   }
 });
 
-test("shared Pi child resolver maps the Windows npm shim to the Node entry without touching argv", async () => {
+test("shared Pi child resolver maps the Windows npm shim to a cmd.exe spec without inspecting it", async () => {
   const fixture = await makeFakePiBin("prg-child-resolve-shim-", [
     "process.exit(0);",
   ], { shimOnly: true });
   try {
-    const env: NodeJS.ProcessEnv = { PATH: fixture.bin };
-    // Nasty argv must survive byte-exact with only the entry prepended — no
-    // shell is ever involved, so nothing can reparse it.
+    await writeFile(join(fixture.bin, "cmd.exe"), "PATH shadow stand-in\n", "utf8");
+    await writeFile(join(fixture.bin, "cmd.cmd"), "@echo off\r\necho shadowed\r\n", "utf8");
+    const env: NodeJS.ProcessEnv = {
+      PATH: fixture.bin,
+      SystemRoot: "C:\\child-controlled-root",
+      ComSpec: "C:\\child-controlled-root\\System32\\cmd.exe",
+    };
+    // The shared Windows command spec quotes the full shim path and original
+    // arguments for cmd.exe; it never parses the shim or guesses its target.
     const nasty = ["--model", "a b\"c & d | e ^f (g)", "--label", '"a&b|c^d"'];
-    const resolved = resolvePiChildSpawn("pi", nasty, env, "win32");
+    const resolved = resolveWindowsChildSpawnInIsolation("pi", nasty, env);
     assert.ok(resolved.ok, `expected the npm shim to resolve, got ${JSON.stringify(resolved)}`);
     if (!resolved.ok) return;
-    assert.equal(resolved.file, process.execPath, "the shim entry must run through this Node binary");
-    assert.deepEqual(resolved.args, [fixture.entry, ...nasty], "argv must be the entry plus the untouched original arguments");
+    assert.equal(resolved.file, "Z:\\Pi Review Trusted Windows\\System32\\cmd.exe");
+    assert.deepEqual(resolved.args.slice(0, 3), ["/d", "/s", "/c"]);
+    assert.equal(resolved.windowsVerbatimArguments, true,
+      "cmd.exe must receive the launcher's verbatim batch command line");
+    assert.ok(resolved.args[3].includes(join(fixture.bin, "pi.cmd")),
+      "the command string must invoke the resolved full-path pi.cmd");
+    assert.ok(resolved.args[3].includes("a b"), "the original Pi arguments must be encoded into the command string");
     assert.deepEqual(nasty, ["--model", "a b\"c & d | e ^f (g)", "--label", '"a&b|c^d"'], "the caller's argv array must not be mutated");
     // Windows environment variable names are case-insensitive and Node
     // preserves the original key casing (commonly `Path`); the resolver must
     // find an installed Pi when only that spelling is present.
-    assert.deepEqual(resolvePiChildSpawn("pi", nasty, { Path: fixture.bin }, "win32"), resolved,
-      "a Path-only Windows environment must resolve identically to a PATH one");
+    assert.deepEqual(resolveWindowsChildSpawnInIsolation("pi", nasty, {
+      Path: fixture.bin,
+      SystemRoot: "C:\\child-controlled-root",
+      ComSpec: "C:\\child-controlled-root\\System32\\cmd.exe",
+    }), resolved, "a Path-only Windows environment must resolve identically to a PATH one");
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -160,7 +403,7 @@ test("shared Pi child resolver prefers an installed pi.exe over the npm shim on 
   }
 });
 
-test("shared Pi child resolver fails closed for a missing or unresolvable default pi", async () => {
+test("shared Pi child resolver fails closed for a missing default pi and treats cmd shims as opaque", async () => {
   const fixture = await makeFakePiBin("prg-child-resolve-fail-", ["process.exit(0);"], { shimOnly: true });
   try {
     // Missing: no pi entry at all in the searched PATH.
@@ -172,14 +415,19 @@ test("shared Pi child resolver fails closed for a missing or unresolvable defaul
       assert.match(missing.error, /not found on PATH/);
       assert.match(missing.error, /npm install -g @earendil-works\/pi/);
     }
-    // Unresolvable: a shim whose target cannot be determined must not fall
-    // back to a shell reparse.
+    // Even a non-npm/simple managed shim is passed through by full path; its
+    // contents are not inspected to decide whether the command can launch.
     await writeFile(join(fixture.bin, "pi.cmd"), "@echo off\r\nrem opaque\r\n", "utf8");
-    const unresolved = resolvePiChildSpawn("pi", [], { PATH: fixture.bin }, "win32");
-    assert.ok(!unresolved.ok && unresolved.kind === "unresolved");
-    if (!unresolved.ok) {
-      assert.match(unresolved.error, /npm shim at .*pi\.cmd/);
-      assert.match(unresolved.error, /reinstall Pi/);
+    const opaque = resolveWindowsChildSpawnInIsolation("pi", [], {
+      PATH: fixture.bin,
+      SystemRoot: "C:\\child-controlled-root",
+      ComSpec: "C:\\child-controlled-root\\System32\\cmd.exe",
+    });
+    assert.ok(opaque.ok, `opaque pi.cmd must resolve without parsing, got ${JSON.stringify(opaque)}`);
+    if (opaque.ok) {
+      assert.equal(opaque.file, "Z:\\Pi Review Trusted Windows\\System32\\cmd.exe");
+      assert.equal(opaque.windowsVerbatimArguments, true);
+      assert.ok(opaque.args[3].includes(join(fixture.bin, "pi.cmd")));
     }
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
@@ -190,9 +438,26 @@ test("shared Pi child resolver fails closed for a missing or unresolvable defaul
 // The observed failure and its correction: real child launch, not argv alone
 // ---------------------------------------------------------------------------
 
-test("bare shell:false spawn of pi fails while only the npm shim exists; the resolved launch starts a real child", async () => {
-  const root = await mkdtemp(join(tmpdir(), "prg-child-enoent-"));
+test("native Windows starts the Pi child through trusted System32 cmd despite PATH/CWD shadowing", { skip: process.platform !== "win32", timeout: 30_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "prg-child-cmd-shadow-"));
   const captureFile = join(root, "capture.jsonl");
+  const shadowMarker = join(root, "shadow-cmd-was-run.marker");
+  const fakeCmdBin = join(root, "fake cmd bin");
+  const fakeSystemRoot = join(root, "hostile child SystemRoot");
+  const fakeSystem32 = join(fakeSystemRoot, "System32");
+  const parentSystemRootKey = Object.keys(process.env).find((key) => key.toLowerCase() === "systemroot");
+  const trustedSystemRoot = parentSystemRootKey ? process.env[parentSystemRootKey] : undefined;
+  assert.ok(trustedSystemRoot, "native Windows must provide the parent's SystemRoot");
+  const trustedCmd = parentWindowsSystemCmdPath();
+  const fakeCmdScript = `@echo off\r\n>"${shadowMarker}" echo shadowed\r\nexit /b 71\r\n`;
+  await mkdir(fakeCmdBin, { recursive: true });
+  await mkdir(fakeSystem32, { recursive: true });
+  await copyFile(process.execPath, join(fakeCmdBin, "cmd.exe"));
+  await copyFile(process.execPath, join(root, "cmd.exe"));
+  await copyFile(process.execPath, join(fakeSystem32, "cmd.exe"));
+  for (const directory of [fakeCmdBin, root, fakeSystem32]) {
+    await writeFile(join(directory, "cmd.cmd"), fakeCmdScript, "utf8");
+  }
   // shimOnly: the bin holds ONLY pi.cmd on every host, so a shell:false spawn
   // of the bare name finds no executable (the observed Windows failure).
   const fixture = await createFakePiBinIn(root, [
@@ -202,25 +467,50 @@ test("bare shell:false spawn of pi fails while only the npm shim exists; the res
   ], { shimOnly: true });
   try {
     // The pre-#204 launch shape: with only an npm shim on PATH, a shell:false
-    // spawn of the bare name cannot find an executable. On native Windows this
-    // is exactly the observed ENOENT; on POSIX hosts a .cmd file is likewise
-    // not an executable PATH entry, so the reproduction holds everywhere.
+    // spawn of the bare name cannot execute the batch file.
     const bare = spawnSync("pi", ["--probe"], { env: { PATH: fixture.bin }, shell: false });
     assert.equal(bare.status, null);
     assert.equal((bare.error as NodeJS.ErrnoException | undefined)?.code, "ENOENT");
 
-    // The corrected launch: resolve, then spawn the resolved file/argv pair.
-    const spec = resolvePiChildSpawn("pi", ["--probe"], { PATH: fixture.bin }, "win32");
-    assert.ok(spec.ok, `the shim must resolve for the corrected launch, got ${JSON.stringify(spec)}`);
-    if (!spec.ok) return;
-    const exitCode = await new Promise<number | null>((done) => {
-      const child = spawn(spec.file, spec.args, { env: { PATH: fixture.bin }, shell: false });
-      child.on("error", () => done(null));
-      child.on("close", (code) => done(code));
-    });
-    assert.equal(exitCode, 0, "the resolved launch must start a real child that exits cleanly");
-    const [captured] = await readCaptureLines(fixture.captureFile);
-    assert.deepEqual(captured.argv, ["--probe"], "the real child must receive the exact original argv");
+    // Native .cmd execution is tested only on Windows. Put fake CMD ahead of
+    // the pinned Pi shim and the Node/system directories so a bare interpreter
+    // name would hit the stand-in instead of the real System32 cmd.exe.
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const key of Object.keys(env)) {
+      if (key.toLowerCase() === "path") delete env[key];
+    }
+    env.PATH = [fakeCmdBin, fixture.bin, dirname(process.execPath), join(trustedSystemRoot, "System32")].join(delimiter);
+    env.SystemRoot = fakeSystemRoot;
+    env.ComSpec = join(fakeCmdBin, "cmd.exe");
+    const argv = ["--probe", "spaces & pipes | caret ^ parentheses (x)", 'say "hello"'];
+    const shimShapes = [
+      ["simple managed shim", '@ECHO off\r\nnode "%~dp0\\..\\pkg\\pi-entry.cjs" %*\r\n'],
+      ["npm-generated shim", npmCmdShim("..\\pkg\\pi-entry.cjs")],
+    ] as const;
+    for (const [shape, shim] of shimShapes) {
+      await writeFile(join(fixture.bin, "pi.cmd"), shim, "utf8");
+      const spec = resolvePiChildSpawn("pi", argv, env);
+      assert.ok(spec.ok, `${shape} must resolve for the corrected launch: ${JSON.stringify(spec)}`);
+      if (!spec.ok) continue;
+      assert.equal(spec.file, trustedCmd,
+        "the shared resolver must use the parent's absolute SystemRoot cmd.exe, not child SystemRoot, ComSpec, PATH, or CWD");
+      assert.equal(spec.windowsVerbatimArguments, true);
+      assert.deepEqual(spec.args.slice(0, 3), ["/d", "/s", "/c"]);
+      const exitCode = await new Promise<number | null>((done) => {
+        const child = spawn(spec.file, spec.args, {
+          cwd: root,
+          env,
+          shell: false,
+          ...(spec.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+        });
+        child.on("error", () => done(null));
+        child.on("close", (code) => done(code));
+      });
+      assert.equal(exitCode, 0, `${shape} must launch a real child that exits cleanly`);
+      const [captured] = await readCaptureLines(fixture.captureFile);
+      assert.deepEqual(captured.argv, argv, `${shape} must forward the exact original argv`);
+      assert.equal(existsSync(shadowMarker), false, "no PATH/CWD/ComSpec/SystemRoot shadow CMD may run");
+    }
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -543,7 +833,7 @@ function probeExtensionSource(): string {
     // full registered inventory (the candidate extension itself uses
     // getAllTools). Command registration is asserted from the RPC
     // get_commands response, not from an optional host API.
-    "      fs.writeFileSync(process.env.PRG_PROBE_RESULT, JSON.stringify({ activeTools: pi.getActiveTools(), registeredTools: pi.getAllTools().map((tool) => tool.name) }));",
+    "      fs.writeFileSync(process.env.PRG_PROBE_RESULT, JSON.stringify({ processId: process.pid, activeTools: pi.getActiveTools(), registeredTools: pi.getAllTools().map((tool) => tool.name) }));",
     "    },",
     "  });",
     "};",
@@ -558,12 +848,36 @@ interface RpcExchange {
   close: () => Promise<void>;
 }
 
+const RPC_CLOSE_WAIT_MS = 4_000;
+const RPC_CLEANUP_DEADLINE_MS = 15_000;
+
 /** Minimal JSON-over-stdio RPC driver for a real pi --mode rpc process. */
 function drivePiRpc(child: ChildProcess): RpcExchange {
   let nextId = 1;
   let buffer = "";
   const pending = new Map<string, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>();
   const lines: string[] = [];
+  let closed = false;
+  let announceClose!: () => void;
+  const closeEvent = new Promise<void>((resolvePromise) => { announceClose = resolvePromise; });
+  let closing: Promise<void> | undefined;
+  child.once("close", () => {
+    closed = true;
+    announceClose();
+  });
+  child.stdin?.on("error", () => {
+    // Closing a stream after an early process exit can race its EPIPE event.
+  });
+  const waitForClose = (timeoutMs: number): Promise<boolean> => {
+    if (closed) return Promise.resolve(true);
+    return new Promise((resolvePromise) => {
+      const timer = setTimeout(() => resolvePromise(false), timeoutMs);
+      void closeEvent.then(() => {
+        clearTimeout(timer);
+        resolvePromise(true);
+      });
+    });
+  };
   child.stdout?.setEncoding("utf8");
   child.stdout?.on("data", (chunk: string) => {
     buffer += chunk;
@@ -606,52 +920,140 @@ function drivePiRpc(child: ChildProcess): RpcExchange {
       timer.unref?.();
       child.stdin?.write(`${JSON.stringify({ id, type, ...fields })}\n`);
     }),
-    close: async () => {
-      // A child that already exited will never emit another close event;
-      // waiting for one unconditionally would stall cleanup.
-      if (child.exitCode !== null || child.signalCode !== null) return;
-      try {
-        child.stdin?.end();
-      } catch {
-        // already closed
-      }
-      await new Promise<void>((done) => {
-        const timer = setTimeout(() => {
-          try {
-            child.kill("SIGKILL");
-          } catch {
-            // already gone
-          }
-          // Bounded: settle cleanup even if no close event ever arrives.
-          done();
-        }, 10_000);
-        timer.unref?.();
-        child.once("close", () => {
-          clearTimeout(timer);
-          done();
-        });
-      });
+    close: () => {
+      if (closing) return closing;
+      closing = (async () => {
+        // A cmd.exe root can exit while its Pi descendant still holds the
+        // inherited stdio pipes. Close input and await the actual ChildProcess
+        // close event; exitCode alone is not proof that the tree is gone.
+        try { child.stdin?.end(); } catch { /* already closed */ }
+        if (closed) return;
+
+        const firstTerminationError = terminateProcessTree(child, "SIGTERM");
+        if (await waitForClose(RPC_CLOSE_WAIT_MS)) return;
+        const escalationError = terminateProcessTree(child, "SIGKILL");
+        if (await waitForClose(RPC_CLOSE_WAIT_MS)) return;
+        const detail = escalationError ?? firstTerminationError;
+        throw new Error(
+          `Pi RPC owned process tree did not close within ${RPC_CLEANUP_DEADLINE_MS}ms${detail ? `: ${detail}` : ""}`,
+        );
+      })();
+      return closing;
     },
   };
 }
 
+async function assertProcessExited(pid: number, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ESRCH" || code === "EINVAL") return;
+      if (code !== "EPERM") throw error;
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+  }
+  assert.fail(`process ${pid} remained alive after ${timeoutMs}ms`);
+}
+
+async function closeRpcAndAssertPiExit(rpc: RpcExchange, piPid?: number): Promise<void> {
+  const started = Date.now();
+  await rpc.close();
+  assert.ok(Date.now() - started <= RPC_CLEANUP_DEADLINE_MS,
+    `owned Pi process-tree cleanup must finish within ${RPC_CLEANUP_DEADLINE_MS}ms`);
+  if (piPid !== undefined) await assertProcessExited(piPid, 5_000);
+}
+
+test("RPC cleanup awaits the Pi child and kills the cmd-rooted tree on Windows", {
+  timeout: 25_000,
+}, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "prg-cmd-tree-cleanup-"));
+  const pidPath = join(root, "actual-pi-pid.txt");
+  let rpc: RpcExchange | undefined;
+  let piPid: number | undefined;
+  t.after(async () => {
+    if (rpc) {
+      await rpc.close();
+      if (piPid !== undefined) await assertProcessExited(piPid, 5_000);
+    }
+    await rm(root, { recursive: true, force: true });
+  });
+  const fixture = await createFakePiBinIn(root, [
+    "'use strict';",
+    "const fs = require('node:fs');",
+    `fs.writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));`,
+    "let buffer = '';",
+    "process.stdin.setEncoding('utf8');",
+    "process.stdin.on('data', chunk => { buffer += chunk; for (;;) { const end = buffer.indexOf('\\n'); if (end < 0) break; const raw = buffer.slice(0, end); buffer = buffer.slice(end + 1); const request = JSON.parse(raw); process.stdout.write(JSON.stringify({ type: 'response', id: request.id, success: true, data: {} }) + '\\n'); } });",
+    "process.stdin.on('end', () => {});",
+    "setInterval(() => {}, 1000);",
+  ]);
+  const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path");
+  const priorPath = pathKey ? process.env[pathKey] : "";
+  const requiredPath = process.platform === "win32"
+    ? [fixture.bin, dirname(process.execPath), dirname(parentWindowsSystemCmdPath())]
+    : [fixture.bin, dirname(process.execPath), priorPath ?? ""];
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() === "path") delete env[key];
+  }
+  env.PATH = requiredPath.join(delimiter);
+  const invocation = resolvePiChildSpawn("pi", [], env);
+  assert.ok(invocation.ok, `the fake Pi entry must resolve: ${JSON.stringify(invocation)}`);
+  if (!invocation.ok) return;
+  if (process.platform === "win32") {
+    assert.equal(invocation.file, parentWindowsSystemCmdPath());
+    assert.equal(invocation.windowsVerbatimArguments, true);
+  } else {
+    assert.equal(invocation.file, "pi");
+    assert.equal(invocation.windowsVerbatimArguments, undefined);
+  }
+  const child = spawn(invocation.file, invocation.args, {
+    cwd: root,
+    env,
+    shell: false,
+    stdio: ["pipe", "pipe", "pipe"],
+    ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+  });
+  const exchange = drivePiRpc(child);
+  rpc = exchange;
+
+  const response = await exchange.request("get_state");
+  assert.equal(response.success, true);
+  const pidDeadline = Date.now() + 5_000;
+  while (!existsSync(pidPath) && Date.now() < pidDeadline) {
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+  }
+  assert.ok(existsSync(pidPath), "the child Pi process must publish its actual PID");
+  piPid = Number((await readFile(pidPath, "utf8")).trim());
+  assert.ok(Number.isSafeInteger(piPid) && piPid > 0);
+  if (process.platform === "win32") {
+    assert.notEqual(piPid, child.pid, "the Pi PID must differ from its owned cmd.exe root");
+  } else {
+    assert.equal(piPid, child.pid, "the POSIX exec shim keeps the Pi process as the owned root");
+  }
+
+  const cleanupStarted = Date.now();
+  await exchange.close();
+  assert.ok(Date.now() - cleanupStarted <= RPC_CLEANUP_DEADLINE_MS,
+    `owned-tree cleanup must finish within ${RPC_CLEANUP_DEADLINE_MS}ms`);
+  await assertProcessExited(piPid, 5_000);
+});
+
 test("real Pi RPC registers the candidate extension alongside a third-party extension (no provider call)", async (t) => {
-  // Prerequisites: an installed pi-coding-agent CLI and a built candidate
-  // extension entry. Skip-or-fail mirrors the other real-host tests; CI's
-  // full suite sets PI_REVIEW_GATE_REQUIRE_PI_HOST=1, pins the agent, and
-  // exports PI_REVIEW_GATE_CANDIDATE_ENTRY, so this genuinely runs there.
-  const cliEntry = findInstalledAgentDirs()
+  // Local runs may use the optional ambient Pi host; CI sets an explicit
+  // installed-bin path and version, so the real launch goes through the shared
+  // resolver (including cmd.exe on Windows) rather than a CLI-entry shortcut.
+  const cliEntry = installedPiBin ? undefined : findInstalledAgentDirs()
     .map((agentDir) => join(agentDir, "dist", "bundle", "cli.js"))
     .find((candidate) => existsSync(candidate));
   const candidateEntry = process.env.PI_REVIEW_GATE_CANDIDATE_ENTRY ?? resolve("dist/src/index.js");
-  if (!cliEntry || !existsSync(candidateEntry)) {
-    const missing: string[] = [];
-    if (!cliEntry) missing.push("installed pi-coding-agent (dist/bundle/cli.js; PI_REVIEW_GATE_INSTALLED_AGENT or ambient install)");
-    if (!existsSync(candidateEntry)) missing.push(`built candidate entry (${candidateEntry})`);
-    if (process.env.PI_REVIEW_GATE_REQUIRE_PI_HOST === "1") {
-      throw new Error(`required Pi host unavailable: ${missing.join(", ")}`);
-    }
-    t.skip(`real-Pi registration check prerequisites unavailable: ${missing.join(", ")}`);
+  const missing = realPiRpcPrerequisiteError(cliEntry, candidateEntry);
+  if (missing) {
+    if (requiredPiHost) throw new Error(`required Pi host unavailable: ${missing}`);
+    t.skip(`real-Pi registration check prerequisites unavailable: ${missing}`);
     return;
   }
 
@@ -666,10 +1068,7 @@ test("real Pi RPC registers the candidate extension alongside a third-party exte
   // PI_REVIEW_GATE_CONFIG at the host's real config). Stripping every
   // PI_REVIEW_GATE_* variable keeps the disposable session in the default
   // top-level role against the disposable agent dir.
-  const childEnv: NodeJS.ProcessEnv = { ...process.env };
-  for (const key of Object.keys(childEnv)) {
-    if (key.startsWith("PI_REVIEW_GATE_")) delete childEnv[key];
-  }
+  const childEnv = realPiRpcEnv();
   await mkdir(home, { recursive: true });
   await mkdir(agentDir, { recursive: true });
   // The zero-model default the launcher writes on first launch: no reviewers,
@@ -677,27 +1076,23 @@ test("real Pi RPC registers the candidate extension alongside a third-party exte
   await writeFile(join(agentDir, "review-gate.json"), ZERO_MODEL_DEFAULT_CONFIG, "utf8");
   await writeFile(probePath, probeExtensionSource(), "utf8");
 
-  const child = spawn(process.execPath, [
-    cliEntry,
+  const child = spawnRealPiRpc([
     "--mode", "rpc",
     "--session-dir", sessionsDir,
     "--extension", candidateEntry,
     "--extension", probePath,
-  ], {
-    cwd: sandbox,
-    shell: false,
-    stdio: ["pipe", "pipe", "pipe"],
-    env: {
-      ...childEnv,
-      HOME: home,
-      USERPROFILE: home,
-      PI_CODING_AGENT_DIR: agentDir,
-      PRG_PROBE_RESULT: probeResult,
-    },
-  });
+  ], cliEntry, {
+    ...childEnv,
+    HOME: home,
+    USERPROFILE: home,
+    PI_CODING_AGENT_DIR: agentDir,
+    PRG_PROBE_RESULT: probeResult,
+  }, sandbox);
   const rpc = drivePiRpc(child);
+  let piPid: number | undefined;
   t.after(async () => {
     await rpc.close();
+    if (piPid !== undefined) await assertProcessExited(piPid, 5_000);
     await rm(sandbox, { recursive: true, force: true });
   });
 
@@ -740,7 +1135,9 @@ test("real Pi RPC registers the candidate extension alongside a third-party exte
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
     }
     assert.ok(existsSync(probeResult), `the probe command never ran (no provider call was made): ${startupFailure ?? ""}\n${rpc.lines.slice(-20).join("\n")}`);
-    const probe = JSON.parse(await readFile(probeResult, "utf8")) as { activeTools: string[]; registeredTools: string[] };
+    const probe = JSON.parse(await readFile(probeResult, "utf8")) as { processId: number; activeTools: string[]; registeredTools: string[] };
+    piPid = probe.processId;
+    assert.ok(Number.isSafeInteger(piPid) && piPid > 0, "the live Pi process must report its actual PID");
     assert.ok(Array.isArray(probe.activeTools), "getActiveTools must report a tool list");
     assert.ok(probe.activeTools.includes("ApplyPatch"),
       `the candidate extension's ApplyPatch tool must be registered and active at runtime; got: ${probe.activeTools.join(", ") || "(none)"}`);
@@ -757,24 +1154,19 @@ test("real Pi RPC registers the candidate extension alongside a third-party exte
     // tools to its own inventory, so activation of a foreign tool is
     // configuration-dependent and is deliberately not asserted here.
   } finally {
-    // The session is disposable; terminate it without waiting for shutdown.
-    try {
-      child.kill("SIGTERM");
-    } catch {
-      // already gone
-    }
+    await closeRpcAndAssertPiExit(rpc, piPid);
   }
 });
 
 test("real Pi RPC executor registers this build and authorized discovered third-party tools (no provider call)", async (t) => {
-  const cliEntry = findInstalledAgentDirs()
+  const cliEntry = installedPiBin ? undefined : findInstalledAgentDirs()
     .map((agentDir) => join(agentDir, "dist", "bundle", "cli.js"))
     .find((candidate) => existsSync(candidate));
   const candidateEntry = process.env.PI_REVIEW_GATE_CANDIDATE_ENTRY ?? resolve("dist/src/index.js");
-  if (!cliEntry || !existsSync(candidateEntry)) {
-    const missing = [!cliEntry && "installed Pi CLI", !existsSync(candidateEntry) && "built candidate extension"].filter(Boolean);
-    if (process.env.PI_REVIEW_GATE_REQUIRE_PI_HOST === "1") throw new Error(`required Pi host unavailable: ${missing.join(", ")}`);
-    t.skip(`real-Pi executor registration prerequisites unavailable: ${missing.join(", ")}`);
+  const missing = realPiRpcPrerequisiteError(cliEntry, candidateEntry);
+  if (missing) {
+    if (requiredPiHost) throw new Error(`required Pi host unavailable: ${missing}`);
+    t.skip(`real-Pi executor registration prerequisites unavailable: ${missing}`);
     return;
   }
 
@@ -784,10 +1176,7 @@ test("real Pi RPC executor registers this build and authorized discovered third-
   const sessionsDir = join(sandbox, "sessions");
   const thirdPartyDir = join(agentDir, "extensions");
   const probeResult = join(sandbox, "probe-result.json");
-  const childEnv: NodeJS.ProcessEnv = { ...process.env };
-  for (const key of Object.keys(childEnv)) {
-    if (key.startsWith("PI_REVIEW_GATE_")) delete childEnv[key];
-  }
+  const childEnv = realPiRpcEnv();
   await Promise.all([
     mkdir(home, { recursive: true }),
     mkdir(thirdPartyDir, { recursive: true }),
@@ -801,31 +1190,27 @@ test("real Pi RPC executor registers this build and authorized discovered third-
     initialActiveTools: ["read", "ApplyPatch", "prg-probe-tool"],
   };
   const bootstrap = createPiSettlementBootstrap(sandbox, "executor-registration-test");
-  const child = spawn(process.execPath, [
-    cliEntry,
+  const child = spawnRealPiRpc([
     "--mode", "rpc",
     "--session-id", bootstrap.sessionId,
     "--session-dir", sessionsDir,
     "--extension", candidateEntry,
     "--tools", "read,ApplyPatch,prg-probe-tool,tool_search",
-  ], {
-    cwd: sandbox,
-    shell: false,
-    stdio: ["pipe", "pipe", "pipe"],
-    env: {
-      ...childEnv,
-      ...piSettlementEnvironment(bootstrap),
-      HOME: home,
-      USERPROFILE: home,
-      PI_CODING_AGENT_DIR: agentDir,
-      PI_REVIEW_GATE_RUNTIME_ROLE: "executor",
-      [EXECUTOR_TOOL_CATALOG_ENV]: JSON.stringify(catalog),
-      PRG_PROBE_RESULT: probeResult,
-    },
-  });
+  ], cliEntry, {
+    ...childEnv,
+    ...piSettlementEnvironment(bootstrap),
+    HOME: home,
+    USERPROFILE: home,
+    PI_CODING_AGENT_DIR: agentDir,
+    PI_REVIEW_GATE_RUNTIME_ROLE: "executor",
+    [EXECUTOR_TOOL_CATALOG_ENV]: JSON.stringify(catalog),
+    PRG_PROBE_RESULT: probeResult,
+  }, sandbox);
   const rpc = drivePiRpc(child);
+  let piPid: number | undefined;
   t.after(async () => {
     await rpc.close();
+    if (piPid !== undefined) await assertProcessExited(piPid, 5_000);
     await rm(sandbox, { recursive: true, force: true });
   });
   let startupFailure: string | undefined;
@@ -854,7 +1239,9 @@ test("real Pi RPC executor registers this build and authorized discovered third-
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
     }
     assert.ok(existsSync(probeResult), `executor probe command never ran: ${startupFailure ?? ""}\n${rpc.lines.slice(-20).join("\n")}`);
-    const probe = JSON.parse(await readFile(probeResult, "utf8")) as { activeTools: string[]; registeredTools: string[] };
+    const probe = JSON.parse(await readFile(probeResult, "utf8")) as { processId: number; activeTools: string[]; registeredTools: string[] };
+    piPid = probe.processId;
+    assert.ok(Number.isSafeInteger(piPid) && piPid > 0, "the executor Pi process must report its actual PID");
     for (const name of ["ApplyPatch", "prg-probe-tool", "tool_search"]) {
       assert.ok(probe.activeTools.includes(name),
         `authorized executor tool ${name} must be active; got ${probe.activeTools.join(", ") || "(none)"}`);
@@ -862,7 +1249,7 @@ test("real Pi RPC executor registers this build and authorized discovered third-
         `executor tool ${name} must be registered; got ${probe.registeredTools.join(", ") || "(none)"}`);
     }
   } finally {
-    try { child.kill("SIGTERM"); } catch { /* already gone */ }
+    await closeRpcAndAssertPiExit(rpc, piPid);
   }
 });
 

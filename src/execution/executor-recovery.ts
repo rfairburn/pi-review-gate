@@ -13,6 +13,7 @@ import {
   writeOperationRecord,
   type ExecutionAttemptRecord,
   type ExecutionIncident,
+  type OperationChildLifecycleIdentity,
   type OperationRecord,
   type RecoveryCheckpoint,
 } from "./operation-record";
@@ -99,6 +100,9 @@ export async function runExecutorWithRecovery(input: {
 
     let turn: ExecutorTurn | undefined;
     let thrown: unknown;
+    const childLifecycles = new Map<string, OperationChildLifecycleIdentity>();
+    const childKey = (process: { pid: number; processGroupId?: number }) =>
+      `${process.pid}:${process.processGroupId === undefined ? "none" : process.processGroupId}`;
     try {
       turn = await input.adapter.run({
         ...input.request,
@@ -130,13 +134,18 @@ export async function runExecutorWithRecovery(input: {
           });
         },
         onProcessStart: async (process) => {
-          recordOperationChildProcess(input.operation, process.pid, process.processGroupId);
+          const lifecycle = recordOperationChildProcess(input.operation, process.pid, process.processGroupId);
+          childLifecycles.set(childKey(process), lifecycle);
           await writeOperationRecord(input.operation);
           await input.request.onProcessStart?.(process);
         },
         onProcessExit: async (process) => {
-          recordOperationChildExit(input.operation);
-          await writeOperationRecord(input.operation);
+          const key = childKey(process);
+          const lifecycle = childLifecycles.get(key);
+          if (lifecycle && recordOperationChildExit(input.operation, lifecycle)) {
+            await writeOperationRecord(input.operation);
+          }
+          childLifecycles.delete(key);
           await input.request.onProcessExit?.(process);
         },
       });

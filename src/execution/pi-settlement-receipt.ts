@@ -20,6 +20,8 @@ export interface PiSettlementBootstrap {
   childId: string;
   secret: string;
   pid?: number;
+  /** Parent-only proof used once for cmd.exe-rooted Windows Pi launches. */
+  verifySpawnedPid?: (pid: number) => boolean | Promise<boolean>;
 }
 
 interface PiSettlementReceipt {
@@ -121,7 +123,7 @@ export async function awaitPiSettlementReceipt(
       const raw = await readFile(bootstrap.path);
       if (raw.byteLength > MAX_RECEIPT_BYTES) throw new Error("Pi executor settlement acknowledgement is oversized.");
       const receipt = parseReceipt(raw.toString("utf8"));
-      verifyReceipt(receipt, bootstrap, afterSettlement);
+      await verifyReceipt(receipt, bootstrap, afterSettlement);
       await unlink(bootstrap.path).catch((error: NodeJS.ErrnoException) => {
         if (error.code !== "ENOENT") throw error;
       });
@@ -156,18 +158,25 @@ function parseReceipt(raw: string): PiSettlementReceipt {
     || typeof receipt.childId !== "string"
     || !Number.isSafeInteger(receipt.settlement)
     || !Number.isSafeInteger(receipt.pid)
+    || (receipt.pid as number) <= 0
     || typeof receipt.mac !== "string"
   ) throw new Error("Pi executor settlement acknowledgement is malformed.");
   return receipt as unknown as PiSettlementReceipt;
 }
 
-function verifyReceipt(receipt: PiSettlementReceipt, bootstrap: PiSettlementBootstrap, afterSettlement: number): void {
+async function verifyReceipt(
+  receipt: PiSettlementReceipt,
+  bootstrap: PiSettlementBootstrap,
+  afterSettlement: number,
+): Promise<void> {
   if (
     receipt.sessionId !== bootstrap.sessionId
     || receipt.childId !== bootstrap.childId
     || receipt.settlement <= afterSettlement
-    || receipt.pid !== bootstrap.pid
   ) throw new Error("Pi executor settlement acknowledgement does not match this child/session/settlement.");
+  if (bootstrap.pid !== undefined && receipt.pid !== bootstrap.pid) {
+    throw new Error("Pi executor settlement acknowledgement does not match this child/session/settlement.");
+  }
   const unsigned = {
     version: receipt.version,
     sessionId: receipt.sessionId,
@@ -183,6 +192,29 @@ function verifyReceipt(receipt: PiSettlementReceipt, bootstrap: PiSettlementBoot
   if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
     throw new Error("Pi executor settlement acknowledgement signature is invalid.");
   }
+  if (bootstrap.pid !== undefined) {
+    return;
+  }
+  if (!bootstrap.verifySpawnedPid) {
+    throw new Error("Pi executor settlement acknowledgement does not match this child/session/settlement.");
+  }
+  let verified = false;
+  try {
+    verified = await bootstrap.verifySpawnedPid(receipt.pid);
+  } catch {
+    // Lineage is a fail-closed identity check. Keep host/query details out of
+    // the receipt diagnostics and never bind a PID when verification errors.
+    verified = false;
+  }
+  if (!verified) {
+    throw new Error("Pi executor settlement acknowledgement PID is not a verified live descendant of its owned shell.");
+  }
+  // Concurrent first-receipt waiters must not race two otherwise valid PIDs
+  // into the bootstrap's initial identity binding.
+  if (bootstrap.pid !== undefined && bootstrap.pid !== receipt.pid) {
+    throw new Error("Pi executor settlement acknowledgement does not match this child/session/settlement.");
+  }
+  bootstrap.pid = receipt.pid;
 }
 
 function receiptMac(

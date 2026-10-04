@@ -29,6 +29,7 @@ const helperModule = require(helperPath) as {
   SKILL_MIGRATION_PLAN: Array<{ installed: string[]; source: string[]; historicalSha256: string }>;
   SKILL_PUBLISH_RETRY_ATTEMPTS: number;
   SKILL_PUBLISH_RETRY_DELAY_MS: number;
+  buildExtension: (root: string) => { status: number | null; error?: Error };
   cmdQuote: (arg: string) => string;
   compatibilityFallbackConfigPath: (resolution: { homeDir: string; platform: string }) => string;
   ddgsPythonPath: (venv: string, platform: string) => string;
@@ -50,8 +51,160 @@ const helperModule = require(helperPath) as {
   resolvePiAgentDir: (env: NodeJS.ProcessEnv, resolution: { homeDir: string; platform: string }) => string;
   resolveLauncherPiInvocation: (env: NodeJS.ProcessEnv, platform: string) =>
     { kind: string; file?: string };
+  resolvePiChildSpawnSpec: (command: string, args: string[], env: NodeJS.ProcessEnv, platform: string) =>
+    | { ok: true; file: string; args: string[]; windowsVerbatimArguments?: true }
+    | { ok: false; kind: string; error: string };
   selectReviewGateConfig: (candidates: string[]) => { status: number; path?: string };
 };
+
+test("Windows development-build CMD fallback uses the trusted parent system path or fails closed", () => {
+  const trustedRoot = "Z:\\Trusted Windows Root";
+  const trustedCmd = `${trustedRoot}\\System32\\cmd.exe`;
+  const buildRoot = "D:\\Gate Source (build)";
+  const source = `
+    const fs = require("node:fs");
+    const cp = require("node:child_process");
+    Object.defineProperty(process, "platform", { value: "win32" });
+    process.env.PATH = "";
+    process.env.ComSpec = "C:\\\\untrusted\\\\cmd.exe";
+    const trustedCmd = ${JSON.stringify(trustedCmd)};
+    let regular = false;
+    let calls = [];
+    fs.statSync = (candidate) => {
+      if (candidate === trustedCmd && regular) return { isFile: () => true };
+      throw new Error("fixture file unavailable");
+    };
+    cp.spawnSync = (file, args, options) => {
+      calls.push({ file, args, options });
+      return { status: 0 };
+    };
+    const helper = require(${JSON.stringify(helperPath)});
+    const scenarios = [
+      { root: ${JSON.stringify(trustedRoot)}, regular: true },
+      { regular: true },
+      { root: "relative-root", regular: true },
+      { root: ${JSON.stringify(trustedRoot)}, regular: false },
+    ];
+    const results = scenarios.map((scenario) => {
+      for (const key of Object.keys(process.env)) {
+        if (key.toLowerCase() === "systemroot") delete process.env[key];
+      }
+      if (scenario.root) process.env.sYsTeMrOoT = scenario.root;
+      regular = scenario.regular;
+      calls = [];
+      const result = helper.buildExtension(${JSON.stringify(buildRoot)});
+      return { status: result.status, error: result.error?.message, calls };
+    });
+    process.stdout.write(JSON.stringify(results));
+  `;
+  const isolated = spawnSync(process.execPath, ["-e", source], { encoding: "utf8" });
+  assert.equal(isolated.status, 0, isolated.stderr);
+  const results = JSON.parse(isolated.stdout) as Array<{
+    status: number | null;
+    error?: string;
+    calls: Array<{ file: string; args: string[]; options: { windowsVerbatimArguments?: boolean } }>;
+  }>;
+  assert.equal(results[0].status, 0);
+  assert.deepEqual(results[0].calls.map((call) => call.file), [trustedCmd]);
+  assert.deepEqual(results[0].calls[0].args, [
+    "/d", "/s", "/c", `npm --prefix ${helperModule.cmdQuote(buildRoot)} run build`,
+  ]);
+  assert.equal(results[0].calls[0].options.windowsVerbatimArguments, true);
+  for (const result of results.slice(1)) {
+    assert.equal(result.status, null);
+    assert.match(result.error ?? "", /refusing an unqualified development-build fallback/);
+    assert.deepEqual(result.calls, [], "an unavailable trusted CMD must never spawn a fallback");
+  }
+});
+
+test("native Windows development-build fallback ignores CMD copies in CWD and PATH", { skip: !isWindows, timeout: 30_000 }, async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "prg-build-cmd-root-"));
+  try {
+    const bin = join(scratch, "npm bin");
+    const buildRoot = join(scratch, "source root (build)");
+    const capture = join(scratch, "npm-argv.json");
+    const stub = join(bin, "npm-stub.cjs");
+    await mkdir(bin, { recursive: true });
+    await mkdir(buildRoot, { recursive: true });
+    await copyFile(process.execPath, join(scratch, "cmd.exe"));
+    await copyFile(process.execPath, join(bin, "cmd.exe"));
+    await writeFile(stub, `require('node:fs').writeFileSync(${JSON.stringify(capture)}, JSON.stringify(process.argv.slice(2)));`, "utf8");
+    // Deliberately not npm's parseable %dp0% shape: exercise the CMD fallback.
+    await writeFile(join(bin, "npm.cmd"), `@ECHO off\r\n"${process.execPath}" "${stub}" %*\r\n`, "utf8");
+    const env = { ...process.env };
+    for (const key of Object.keys(env)) {
+      if (key.toLowerCase() === "path") delete env[key];
+    }
+    env.PATH = bin;
+    env.ComSpec = join(bin, "cmd.exe");
+    const source = `const result=require(${JSON.stringify(helperPath)}).buildExtension(${JSON.stringify(buildRoot)}); if(result.error) console.error(result.error.message); process.exitCode=result.error?1:(result.status??1);`;
+    const result = spawnSync(process.execPath, ["-e", source], {
+      cwd: scratch, env, encoding: "utf8", timeout: 20_000,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(await readFile(capture, "utf8")), ["--prefix", buildRoot, "run", "build"]);
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+interface SimulatedWindowsSpawnCase {
+  args: string[];
+  env: NodeJS.ProcessEnv;
+  parentSystemRoot?: string;
+  parentSystemRootKey?: string;
+  expectedCmd?: string;
+  cmdFileKind: "regular" | "directory" | "missing";
+}
+
+function resolveSimulatedWindowsSpecs(cases: SimulatedWindowsSpawnCase[]) {
+  const invocationModulePath = resolve(__dirname, "../src/pi-invocation.js");
+  const source = `
+    const fs = require("node:fs");
+    const cases = ${JSON.stringify(cases)};
+    const helper = require(${JSON.stringify(helperPath)});
+    const typed = require(${JSON.stringify(invocationModulePath)});
+    const realStatSync = fs.statSync;
+    let active;
+    fs.statSync = function (candidate, ...args) {
+      if (typeof candidate === "string" && /(?:^|[\\\\/])System32[\\\\/]cmd\\.exe$/i.test(candidate)) {
+        active.statPaths.push(candidate);
+        if (candidate.toLowerCase() === active.expectedCmd?.toLowerCase()) {
+          if (active.cmdFileKind === "missing") {
+            const error = new Error("fixture cmd.exe is missing");
+            error.code = "ENOENT";
+            throw error;
+          }
+          return { isFile: () => active.cmdFileKind === "regular" };
+        }
+        return { isFile: () => false };
+      }
+      return realStatSync.call(this, candidate, ...args);
+    };
+    const results = [];
+    for (const item of cases) {
+      for (const key of Object.keys(process.env)) {
+        if (key.toLowerCase() === "systemroot") delete process.env[key];
+      }
+      if (item.parentSystemRoot !== undefined) {
+        process.env[item.parentSystemRootKey ?? "SystemRoot"] = item.parentSystemRoot;
+      }
+      item.statPaths = [];
+      active = item;
+      const direct = helper.resolvePiChildSpawnSpec("pi", item.args, item.env, "win32");
+      const child = typed.resolvePiChildSpawn("pi", item.args, item.env, "win32");
+      results.push({ direct, child, statPaths: item.statPaths });
+    }
+    process.stdout.write(JSON.stringify(results));
+  `;
+  const result = spawnSync(process.execPath, ["-e", source], { encoding: "utf8", env: process.env });
+  assert.equal(result.status, 0, `isolated Windows resolver failed: ${result.stderr}`);
+  return JSON.parse(result.stdout ?? "[]") as Array<{
+    direct: ReturnType<typeof helperModule.resolvePiChildSpawnSpec>;
+    child: ReturnType<typeof helperModule.resolvePiChildSpawnSpec>;
+    statPaths: string[];
+  }>;
+}
 
 /** The exact zero-model default the launcher writes on first launch (issue 32). */
 const zeroModelDefaultConfig = {
@@ -1606,7 +1759,7 @@ test("helper resolves npm cmd-shim JavaScript entry points without a shell", asy
     await mkdir(binDir, { recursive: true });
     const target = join(targetDir, "entry.cjs");
     await writeFile(target, "process.exit(0);\n", "utf8");
-    const shim = join(binDir, "pi.cmd");
+    const shim = join(binDir, "npm.cmd");
     await writeFile(shim, npmCmdShim("..\\pkg\\bin\\entry.cjs"), "utf8");
     assert.equal(helperModule.resolveCmdShimTarget(shim), target);
 
@@ -1634,10 +1787,42 @@ test("helper resolves the full pi.cmd path without inspecting shim contents", as
     const target = join(targetDir, "pi-entry.cjs");
     await writeFile(target, "process.exit(0);\n", "utf8");
     await writeFile(join(bin, "pi.cmd"), npmCmdShim("..\\pkg\\bin\\pi-entry.cjs"), "utf8");
+    await writeFile(join(bin, "cmd.exe"), "path shadow stand-in\n", "utf8");
+    await writeFile(join(bin, "cmd.cmd"), "@echo off\r\necho shadowed\r\n", "utf8");
 
-    const env: NodeJS.ProcessEnv = { PATH: bin };
+    const env: NodeJS.ProcessEnv = {
+      PATH: bin,
+      SystemRoot: "C:\\child-controlled-root",
+      ComSpec: "C:\\child-controlled-root\\System32\\cmd.exe",
+    };
     const resolved = helperModule.resolveLauncherPiInvocation(env, "win32");
     assert.deepEqual(resolved, { kind: "cmd", file: join(bin, "pi.cmd") });
+    const originalArgs = ["--model", "example model", "--label", "a&b|c"];
+    const trustedCmd = "Z:\\Trusted Windows Root\\System32\\cmd.exe";
+    const command = [join(bin, "pi.cmd"), ...originalArgs].map(helperModule.cmdQuote).join(" ");
+    const [spec] = resolveSimulatedWindowsSpecs([{
+      args: originalArgs,
+      env,
+      parentSystemRoot: "Z:\\Trusted Windows Root",
+      parentSystemRootKey: "sYsTeMrOoT",
+      expectedCmd: trustedCmd,
+      cmdFileKind: "regular",
+    }]);
+    assert.deepEqual(spec.direct, {
+      ok: true,
+      file: trustedCmd,
+      args: ["/d", "/s", "/c", `"${command}"`],
+      windowsVerbatimArguments: true,
+    }, "the shared launcher spec must use the absolute parent-SystemRoot cmd.exe, not childenv, PATH, or CWD shadows");
+    assert.deepEqual(spec.child, spec.direct,
+      "the TypeScript child resolver and launcher must use the same production spawn-spec route");
+    assert.deepEqual(spec.statPaths, [trustedCmd, trustedCmd],
+      "both shared routes validate the same trusted regular System32 cmd.exe");
+    assert.deepEqual(helperModule.resolvePiChildSpawnSpec("custom-pi", originalArgs, env, "win32"), {
+      ok: true,
+      file: "custom-pi",
+      args: originalArgs,
+    }, "custom commands retain exact spawn semantics");
 
     // The command's implementation is irrelevant, even without a JS target.
     await writeFile(join(bin, "pi.cmd"), "@echo off\r\nrem opaque\r\n", "utf8");
@@ -1648,6 +1833,52 @@ test("helper resolves the full pi.cmd path without inspecting shim contents", as
 
     // POSIX uses plain execvp of the PATH entry.
     assert.deepEqual(helperModule.resolveLauncherPiInvocation(env, "linux"), { kind: "path" });
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test("shared Windows Pi resolver fails closed when parent SystemRoot or its cmd.exe is unusable", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "pi-review-cmd-unavailable-"));
+  try {
+    const bin = join(scratch, "bin");
+    await mkdir(bin, { recursive: true });
+    await writeFile(join(bin, "pi.cmd"), "@echo off\r\n", "utf8");
+    const childEnv: NodeJS.ProcessEnv = {
+      PATH: bin,
+      SystemRoot: "C:\\child-controlled-root",
+      ComSpec: "C:\\child-controlled-root\\System32\\cmd.exe",
+    };
+    const validRoot = "Q:\\TrustedWindows";
+    const cases: SimulatedWindowsSpawnCase[] = [
+      { args: [], env: childEnv, cmdFileKind: "regular" },
+      { args: [], env: childEnv, parentSystemRoot: "relative\\Windows", expectedCmd: undefined, cmdFileKind: "regular" },
+      { args: [], env: childEnv, parentSystemRoot: "Q:Windows", expectedCmd: undefined, cmdFileKind: "regular" },
+      { args: [], env: childEnv, parentSystemRoot: "\\Windows", expectedCmd: undefined, cmdFileKind: "regular" },
+      {
+        args: [], env: childEnv, parentSystemRoot: validRoot,
+        expectedCmd: `${validRoot}\\System32\\cmd.exe`, cmdFileKind: "missing",
+      },
+      {
+        args: [], env: childEnv, parentSystemRoot: validRoot,
+        expectedCmd: `${validRoot}\\System32\\cmd.exe`, cmdFileKind: "directory",
+      },
+    ];
+    const results = resolveSimulatedWindowsSpecs(cases);
+    for (const [index, result] of results.entries()) {
+      for (const spec of [result.direct, result.child]) {
+        assert.ok(!spec.ok, `scenario ${index} must not produce a spawnable fallback: ${JSON.stringify(spec)}`);
+        if (!spec.ok) {
+          assert.equal(spec.kind, "cmd-unavailable");
+          assert.match(spec.error, /SystemRoot/);
+        }
+      }
+      if (index < 4) {
+        assert.deepEqual(result.statPaths, [], `invalid parent root ${index} must fail before probing a relative path`);
+      } else {
+        assert.deepEqual(result.statPaths, [cases[index].expectedCmd, cases[index].expectedCmd]);
+      }
+    }
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }

@@ -8,7 +8,7 @@
  * retry backoff, never via sleeps or lucky reruns.
  */
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,6 +18,8 @@ import type { ExecutionRetryPolicy } from "../src/config";
 import { runExecutorWithRecovery } from "../src/execution/executor-recovery";
 import {
   createOperationRecord,
+  operationOwnershipStatus,
+  readOperationRecord,
   writeOperationRecord,
   type OperationRecord,
 } from "../src/execution/operation-record";
@@ -38,6 +40,27 @@ const GIT_ENV = {
 async function git(args: string[], cwd: string): Promise<string> {
   const { stdout } = await execFileAsync("git", args, { cwd, env: { ...process.env, ...GIT_ENV } });
   return stdout.trim();
+}
+
+function childExit(child: ChildProcess): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  return new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+}
+
+async function within<T>(promise: Promise<T>, message: string, timeoutMs = 15_000): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function mkTmp(prefix: string): Promise<string> {
@@ -191,6 +214,145 @@ test("recovery — abort during retry backoff settles cancelled with the failure
     assert.equal(attempt.outcome, "cancelled");
     assert.ok(attempt.incidentId, "the attempt keeps its failure-incident linkage");
   } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("recovery fences a late prior-attempt exit from the newer durable child owner", async () => {
+  const scenario = await startRecoveryScenario("task-late-child-exit-fence");
+  const { capture, worktree, operation, artifactDir } = scenario;
+  const controller = new AbortController();
+  let releaseFirstStart!: () => void;
+  let announceFirstStart!: () => void;
+  let announceSecondStart!: () => void;
+  let announceLateFirstExit!: () => void;
+  const firstStartEntered = new Promise<void>((resolvePromise) => { announceFirstStart = resolvePromise; });
+  const secondStartEntered = new Promise<void>((resolvePromise) => { announceSecondStart = resolvePromise; });
+  const lateFirstExitPublished = new Promise<void>((resolvePromise) => { announceLateFirstExit = resolvePromise; });
+  const firstStartGate = new Promise<void>((resolvePromise) => { releaseFirstStart = resolvePromise; });
+  const children: ChildProcess[] = [];
+  let firstPid: number | undefined;
+  let secondPid: number | undefined;
+  let firstLifecycleId: string | undefined;
+  let secondLifecycleId: string | undefined;
+  let adapterCalls = 0;
+  let running: ReturnType<typeof runExecutorWithRecovery> | undefined;
+
+  const adapter: ExecutorAdapter = {
+    kind: "fake",
+    model: "fake-model",
+    run: async (request: ExecutorRequest) => {
+      adapterCalls += 1;
+      const firstAttempt = adapterCalls === 1;
+      const child = spawn(process.execPath, ["-e", firstAttempt
+        ? "setTimeout(()=>process.exit(1),80)"
+        : "setInterval(()=>{},1000)"], {
+        cwd: worktree.effectiveCwd,
+        detached: process.platform !== "win32",
+        stdio: "ignore",
+      });
+      children.push(child);
+      if (child.pid === undefined) throw new Error("recovery lifecycle fixture failed to spawn its child");
+      const processIdentity = {
+        pid: child.pid,
+        processGroupId: process.platform === "win32" ? undefined : child.pid,
+      };
+      const exitPromise = childExit(child);
+      const startPromise = Promise.resolve(request.onProcessStart?.(processIdentity));
+      void startPromise.catch(() => undefined);
+
+      if (firstAttempt) {
+        const exit = await exitPromise;
+        await writeFile(join(worktree.worktreeRoot, "retry-draft.txt"), "checkpoint before retry\n", "utf8");
+        void startPromise.then(() => request.onProcessExit?.({ ...processIdentity, ...exit })).catch(() => undefined);
+        return failingTurn(artifactDir, "attempt-a");
+      }
+
+      await startPromise;
+      await new Promise<void>((resolvePromise) => {
+        if (request.signal?.aborted) resolvePromise();
+        else request.signal?.addEventListener("abort", () => resolvePromise(), { once: true });
+      });
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+      const exit = await exitPromise;
+      await request.onProcessExit?.({ ...processIdentity, ...exit });
+      return {
+        ...failingTurn(artifactDir, "attempt-b"),
+        code: 0,
+        aborted: true,
+      };
+    },
+  };
+
+  try {
+    running = runExecutorWithRecovery({
+      adapter,
+      request: {
+        cwd: worktree.effectiveCwd,
+        artifactDir,
+        workspaceAccess: "workspace-write",
+        signal: controller.signal,
+        onProcessStart: async ({ pid }) => {
+          if (firstPid === undefined) {
+            firstPid = pid;
+            firstLifecycleId = operation.owner?.childLifecycleId;
+            announceFirstStart();
+            await firstStartGate;
+            return;
+          }
+          secondPid = pid;
+          secondLifecycleId = operation.owner?.childLifecycleId;
+          announceSecondStart();
+        },
+        onProcessExit: ({ pid }) => {
+          if (pid === firstPid) announceLateFirstExit();
+        },
+      },
+      prompt: "Keep process ownership fenced across recovery attempts.",
+      startingTurn: 1,
+      capture,
+      worktree,
+      taskId: "task-late-child-exit-fence",
+      title: "Late lifecycle ownership fencing",
+      retryPolicy: {
+        maxRetries: 1,
+        baseDelayMs: 0,
+        maxDelayMs: 0,
+        jitter: false,
+        maxSameIncidentRepeats: 1,
+      },
+      operation,
+    });
+    void running.catch(() => undefined);
+
+    await within(firstStartEntered, "attempt A did not publish its durable start identity");
+    await within(secondStartEntered, "recovery did not start attempt B");
+    assert.ok(firstPid && secondPid);
+    assert.ok(firstLifecycleId && secondLifecycleId);
+    assert.notEqual(firstLifecycleId, secondLifecycleId);
+    assert.equal(operation.owner?.childPid, secondPid);
+    assert.equal(operation.owner?.childLifecycleId, secondLifecycleId);
+    assert.equal(operation.owner?.childExitedAt, undefined);
+
+    releaseFirstStart();
+    await within(lateFirstExitPublished, "attempt A's retained exit callback did not complete");
+    const durable = await readOperationRecord(join(operation.artifactDir, "operation.json"));
+    assert.equal(durable.owner?.childPid, secondPid);
+    assert.equal(durable.owner?.childLifecycleId, secondLifecycleId);
+    assert.equal(durable.owner?.childExitedAt, undefined, "attempt A cannot mark B's owner slot exited");
+    assert.equal(operationOwnershipStatus(durable).childAlive, true, "attempt B remains durably live after A's late exit publication");
+
+    controller.abort(new Error("finish lifecycle owner fencing regression"));
+    const result = await within(running, "attempt B did not settle cancellation after the fencing assertion");
+    assert.equal(adapterCalls, 2);
+    assert.equal(result.status, "cancelled");
+  } finally {
+    releaseFirstStart();
+    controller.abort();
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }
+    await running?.catch(() => undefined);
     await scenario.cleanup();
   }
 });

@@ -101,7 +101,7 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Install pinned Pi agent-core runtime
         # tests/browser-native-error.test.ts drives the real agentLoop from an
-        # installed Pi agent-core build. 1.0.0 is verified against the current
+        # installed Pi agent-core build. 1.0.2 is verified against the current
         # extension sources (and needs Node >=22.19.0, which the verify matrix
         # exercises at its minimum).
         # The test skips itself when PI_BROWSER_AGENT_RUNTIME is unset; this job
@@ -111,6 +111,7 @@ jobs:
         # pin, regenerate the lock in scripts/ci/pi-agent-runtime with
         # `npm install --package-lock-only`.
         run: |
+          rm -rf "$RUNNER_TEMP/pi-agent-runtime"
           mkdir -p "$RUNNER_TEMP/pi-agent-runtime"
           cp scripts/ci/pi-agent-runtime/package.json scripts/ci/pi-agent-runtime/package-lock.json "$RUNNER_TEMP/pi-agent-runtime/"
           cd "$RUNNER_TEMP/pi-agent-runtime"
@@ -135,7 +136,7 @@ jobs:
         # tests/pi-tui-live-settings-smoke.test.ts (and the bridge integration
         # tier in tests/native-editor-bridge.test.ts) drive the real Pi TUI
         # surface — CustomEditor, pi-tui components, and the pi CLI entry from
-        # @earendil-works/pi-coding-agent. 1.0.0 is verified against the
+        # @earendil-works/pi-coding-agent. 1.0.2 is verified against the
         # current extension sources (and needs Node >=22.19.0, which the verify
         # matrix exercises at its minimum). Install the locked tree into the
         # runner temp exactly like the agent-core runtime above: a test-only
@@ -143,18 +144,19 @@ jobs:
         # regenerate the lock in scripts/ci/pi-ui-runtime with
         # `npm install --package-lock-only`.
         run: |
+          rm -rf "$RUNNER_TEMP/pi-ui-runtime"
           mkdir -p "$RUNNER_TEMP/pi-ui-runtime"
           cp scripts/ci/pi-ui-runtime/package.json scripts/ci/pi-ui-runtime/package-lock.json "$RUNNER_TEMP/pi-ui-runtime/"
           cd "$RUNNER_TEMP/pi-ui-runtime"
           npm ci --no-audit --no-fund
       - name: Export Pi UI runtime path and require real Pi hosts
-        # PI_REVIEW_GATE_INSTALLED_AGENT points the real-host helpers at the
-        # locked runtime instead of ambient installs; PI_REVIEW_GATE_REQUIRE_PI_HOST=1
-        # turns a missing Pi host in any gated real-host test into a hard
-        # failure, so the coverage cannot silently degrade to skips in CI.
+        # Pin the host helpers and installed-command RPC smoke to this exact
+        # fresh runtime; the version assertion is enforced by the smoke test.
         run: |
           echo "PI_REVIEW_GATE_INSTALLED_AGENT=$RUNNER_TEMP/pi-ui-runtime/node_modules/@earendil-works/pi-coding-agent" >> "$GITHUB_ENV"
+          echo "PI_REVIEW_GATE_INSTALLED_PI_BIN=$RUNNER_TEMP/pi-ui-runtime/node_modules/.bin" >> "$GITHUB_ENV"
           echo "PI_REVIEW_GATE_REQUIRE_PI_HOST=1" >> "$GITHUB_ENV"
+          echo "PI_REVIEW_GATE_EXPECT_PI_VERSION=1.0.2" >> "$GITHUB_ENV"
       - name: Build review-gate candidate extension into scratch (never live dist)
         # The TUI smoke launches the built extension through pi's public
         # --no-extensions --extension seam. The candidate is compiled into the
@@ -235,15 +237,48 @@ jobs:
         # The same npm script the launcher's development branch executes
         # (npm --prefix <root> run build), validating the toolchain natively.
         run: npm run build
+      - name: Install fresh locked Pi runtime (native Windows)
+        # This is a test-only npm ci into an empty runner-temp directory, not a
+        # global install or the official installer (which always requests
+        # /latest). npm must generate the native pi.cmd executable shim.
+        run: |
+          $runtime = Join-Path $env:RUNNER_TEMP "pi-ui-runtime"
+          if (Test-Path -LiteralPath $runtime) { Remove-Item -LiteralPath $runtime -Recurse -Force -ErrorAction Stop }
+          if (Test-Path -LiteralPath $runtime) { throw "Pi runtime temp directory was not cleared" }
+          New-Item -ItemType Directory -Path $runtime -Force | Out-Null
+          Copy-Item scripts/ci/pi-ui-runtime/package.json, scripts/ci/pi-ui-runtime/package-lock.json -Destination $runtime
+          Push-Location $runtime
+          npm ci --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+      - name: Installed Pi command RPC and registration smoke (native Windows)
+        # Resolve `pi` through src/pi-invocation, run npm's actual installed
+        # Windows command shim, and prove RPC + candidate registration without
+        # a provider/model call. Missing prerequisites are fatal, not skipped.
+        env:
+          PI_REVIEW_GATE_INSTALLED_PI_BIN: ${{ runner.temp }}\pi-ui-runtime\node_modules\.bin
+          PI_REVIEW_GATE_INSTALLED_AGENT: ${{ runner.temp }}\pi-ui-runtime\node_modules\@earendil-works\pi-coding-agent
+          PI_REVIEW_GATE_CANDIDATE_ENTRY: ${{ github.workspace }}\dist\src\index.js
+          PI_REVIEW_GATE_REQUIRE_PI_HOST: "1"
+          PI_REVIEW_GATE_EXPECT_PI_VERSION: "1.0.2"
+        run: node --test dist-test/tests/pi-installed-launch.test.js
       # Issue #204: alias-independent Pi child launch. On this host the only
       # `pi` PATH entry is npm's pi.cmd shim, and a shell:false spawn of the
       # bare name cannot find an executable; these regressions start real
       # child processes through the shared resolver (reviewer prompt, delegated
       # RPC executor, compaction recovery) plus cross-platform resolver/argv
-      # safety cases. The bounded real-Pi registration check skips itself when
-      # no pi-coding-agent install is discoverable on the runner.
+      # safety cases. Require the same installed Pi 1.0.2 host for both real
+      # registration cases; missing prerequisites must not silently skip them.
       - name: Pi child launch tests (alias-independent, native Windows)
-        run: node --test dist-test/tests/pi-child-launch.test.js
+        env:
+          PI_REVIEW_GATE_INSTALLED_PI_BIN: ${{ runner.temp }}\pi-ui-runtime\node_modules\.bin
+          PI_REVIEW_GATE_INSTALLED_AGENT: ${{ runner.temp }}\pi-ui-runtime\node_modules\@earendil-works\pi-coding-agent
+          PI_REVIEW_GATE_CANDIDATE_ENTRY: ${{ github.workspace }}\dist\src\index.js
+          PI_REVIEW_GATE_REQUIRE_PI_HOST: "1"
+          PI_REVIEW_GATE_EXPECT_PI_VERSION: "1.0.2"
+        # Include bounded teardown when an exited root leaves inherited pipes
+        # open in reviewer, RPC executor, and compaction recovery paths.
+        run: node --test dist-test/tests/pi-child-launch.test.js dist-test/tests/pi-child-teardown.test.js
       - name: Static docs validation
         run: node scripts/check-docs.cjs
       - name: Docs checker regression tests

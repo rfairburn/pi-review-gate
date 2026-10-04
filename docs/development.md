@@ -66,7 +66,7 @@ The complete suite (`npm run test:run`) executes up to four test files concurren
   entirely.
 - **Optional: `PI_BROWSER_AGENT_RUNTIME`** pointing at an installed Pi agent-core
   1.0.0-or-newer `dist/index.js` enables `tests/browser-native-error.test.ts` (CI uses
-  the exact `@earendil-works/pi-agent-core@1.0.0`; the model stream is
+  the exact `@earendil-works/pi-agent-core@1.0.2`; the model stream is
   mocked, with no live model calls). Without it the test skips itself. See
   [Browser guide](browser.md#interactive-browser).
 - **Optional: an installed Pi** (`@earendil-works/pi-coding-agent` plus its pi-tui
@@ -80,18 +80,27 @@ The complete suite (`npm run test:run`) executes up to four test files concurren
   The `@` picker test additionally needs `fd` on `PATH` and fails (rather than
   skipping) when the required-host gate is set and no finder is resolvable.
 - **Test-only explicit paths (never shipped, never user-specific in tracked files):**
-  CI's full suite installs a locked `@earendil-works/pi-coding-agent@1.0.0` UI
-  runtime (manifests: `scripts/ci/pi-ui-runtime/`) into the runner temp and exports
-  `PI_REVIEW_GATE_INSTALLED_AGENT` (the runtime root) plus
-  `PI_REVIEW_GATE_REQUIRE_PI_HOST=1`; the real-host helpers prefer that install over
-  ambient discovery. The same job compiles the review-gate candidate into the runner
+  Linux's full suite and the native Windows launcher job freshly install a locked
+  `@earendil-works/pi-coding-agent@1.0.2` full runtime (manifests:
+  `scripts/ci/pi-ui-runtime/`) into runner temp and export
+  `PI_REVIEW_GATE_INSTALLED_AGENT` (the package root),
+  `PI_REVIEW_GATE_INSTALLED_PI_BIN` (the installed executable directory),
+  `PI_REVIEW_GATE_EXPECT_PI_VERSION=1.0.2`, and
+  `PI_REVIEW_GATE_REQUIRE_PI_HOST=1` for required host coverage. The command-path
+  smoke runs the installed `pi`/`pi.cmd`, checks its exact version, and verifies
+  RPC and candidate registration without a provider call. Missing prerequisites
+  fail, rather than skip. A separate generated simple managed-style wrapper
+  exercises the same real runtime; it is not an official installer run. The same job compiles the review-gate candidate into the runner
   temp (`npx tsc -p tsconfig.json --outDir ...`) and exports
   `PI_REVIEW_GATE_CANDIDATE_ENTRY` for the live PTY smoke, and provisions `fd`
   (Ubuntu's `fd-find`, exposed as `fdfind`) exporting the resolved binary as
   `PI_REVIEW_GATE_FD` so the `@` test never depends on ambient `PATH` variance.
   Locally, set `PI_REVIEW_GATE_INSTALLED_AGENT` to any installed pi-coding-agent
   package root and `PI_REVIEW_GATE_CANDIDATE_ENTRY` to a built `dist/src/index.js`
-  to enable the smoke.
+  to enable the TUI smoke. For `tests/pi-installed-launch.test.ts`, additionally
+  set `PI_REVIEW_GATE_INSTALLED_PI_BIN` to that install's executable directory and
+  `PI_REVIEW_GATE_EXPECT_PI_VERSION=1.0.2`; set the required-host gate to make
+  missing prerequisites fail locally too.
 - **Live PTY smoke (`tests/pi-tui-live-settings-smoke.test.ts`):** drives the built
   candidate inside a real Pi TUI on a real PTY through the public
   `pi --no-extensions --extension <candidate>` seam, under a throwaway sandbox
@@ -255,33 +264,77 @@ artifact, provisioning the pinned DDGS dependency in a `Scripts\python.exe` venv
 `scripts/ensure-ddgs.sh` stays the macOS/Linux mechanism), publishing the orchestrator
 skill through an atomic rename, exporting `PI_REVIEW_GATE_DDGS_PYTHON`, and executing
 `pi` with the forwarded arguments and exit status. On Windows it resolves `pi.cmd`
-on `PATH` and invokes that full path through `cmd.exe` with quoted arguments, without
-reading the shim or resolving Pi's underlying installation; an installed `pi.exe`
-continues to run directly. Normal Windows batch parsing, including `%VAR%` expansion,
-applies. Publication runs in-process (`fs.linkSync`/`fs.renameSync`), Python is spawned
-with argument arrays, and npm's development build still uses its resolved JavaScript
-entry point with a fixed-token cmd.exe fallback. POSIX uses plain `execvp`. Invoking a `.cmd`
-file from PowerShell still crosses cmd.exe parsing: PowerShell string delimiters alone
-do not protect batch metacharacters. For example, pass `--label '\"a&b|c^d\"'` from
+on `PATH` and invokes that full path through the parent's validated absolute
+`SystemRoot\System32\cmd.exe`, without reading the shim or resolving Pi's underlying
+installation; an installed `pi.exe` continues to run directly. The interpreter must
+exist as a regular file at the parent's fully qualified `SystemRoot\System32\cmd.exe`;
+child `SystemRoot`, `ComSpec`, `PATH`, and the working directory cannot override it, and an
+invalid or missing interpreter fails closed. Normal Windows batch parsing, including
+`%VAR%` expansion, applies. Publication runs in-process (`fs.linkSync`/`fs.renameSync`),
+and Python is spawned with argument arrays. npm's development build still uses its
+resolved JavaScript entry point with a fixed-token fallback through the same
+validated system command processor; that fallback also fails closed when the
+interpreter is unavailable. POSIX uses plain
+`execvp`. Invoking a `.cmd` file from PowerShell still crosses cmd.exe parsing:
+PowerShell string delimiters alone do not protect batch metacharacters. For example, pass `--label '\"a&b|c^d\"'` from
 PowerShell so literal double quotes protect the value through batch forwarding.
 Command-shell expansion (including `%VAR%`) can happen before the helper receives an
-argument, and Pi's batch invocation also follows command-shell expansion rules. POSIX permission
-modes (0700/0600/0644) are requested for parity
-and are no-ops under Windows ACLs. CI covers the native paths on `windows-latest`
+argument, and Pi's batch invocation also follows command-shell expansion rules. POSIX
+permission modes (0700/0600/0644) are requested for parity and are no-ops under Windows
+ACLs. CI covers the native paths on `windows-latest`
 (`.github/workflows/ci.yml`, focused `launcher-cmd` tests); macOS/Linux behavior of the
 POSIX launcher is unchanged.
 The `review-checkpoint-windows` tests exercise raw parent checkpoint directory-sync
 and file-identity error boundaries with mocks on every host, plus native Windows
 capture/reload/frozen-comparison/advancement. Both Windows CI Node versions run
 that file; the full suite also runs its non-skipped mocked cases.
-The extension's own Pi child launches (reviewer prompts, the delegated Pi RPC
-executor, and compaction recovery) use the same alias-independent resolution
-(issue 204): on Windows the default `pi` resolves to an installed pi.exe or the
-npm shim's JavaScript entry spawned through Node without a shell, POSIX keeps
-direct execution, and configured custom commands keep their exact spawn
-semantics; a missing or unresolvable default Pi CLI fails closed with an
-actionable error. The focused `pi-child-launch` tests cover these launches
-natively on `windows-latest` alongside the launcher cases.
+The launcher and the extension's Pi child launches (reviewer prompts, the
+delegated Pi RPC executor, and compaction recovery) share one authoritative
+resolver and spawn-spec generator. On Windows it resolves the installed
+`pi.exe` directly or invokes the full `pi.cmd` path through the parent's validated
+absolute `SystemRoot\System32\cmd.exe` with `/d /s /c`, `cmdQuote`, and
+`windowsVerbatimArguments`; it does not inspect or parse Pi's shim, so both simple
+managed shims and npm-generated shims use the same path. The interpreter is checked
+as an existing regular file and never selected from the child environment, `ComSpec`,
+`PATH`, or working directory; invalid or missing parent `SystemRoot` fails closed.
+The launcher's npm-only parser remains separate for its development build;
+its batch fallback uses the same validated absolute system command processor.
+POSIX default launches and configured custom commands retain their
+existing spawn semantics, and a missing default CLI fails closed.
+
+For a Windows `.cmd` launch, `cmd.exe` remains the owned lifecycle and cleanup
+root (including tree termination with `taskkill /T`), while the signed RPC
+settlement receipt identifies the actual Pi process. Before accepting its
+first receipt, the parent authenticates the existing child/session/generation
+signature and then verifies through bounded native process ancestry evidence
+that the reported live PID descends from the still-owned command root. The
+query rechecks process creation times and parent links and requires each parent
+to predate its child, rejecting recycled PIDs. That verified PID is bound for
+exact equality on later receipts; the receipt wire schema and HMAC identity
+remain unchanged. Focused tests cover command generation, PID binding, and
+owned-tree teardown; native `.cmd` cleanup verifies the actual Pi PID exits and
+waits for process close before removing its sandbox.
+
+Terminal teardown bounds inherited-pipe waits separately from root exit. Reviewer
+cleanup drains for its escalation interval plus a five-second grace period; RPC
+and recovery cleanup use a seven-second terminal drain after signaling. RPC keeps
+its existing fifteen-second graceful shutdown window where applicable. Root exit,
+cancellation, and interruption stop background-readiness waits and deadline renewal.
+An observed root exit retains its actual status, but missing close/cleanup evidence
+is an explicit infrastructure failure, not an accepted executor result. Destroying
+local stdio cannot confirm descendant cleanup, including for concurrent close
+waiters. POSIX owned groups remain signalable after leader exit; Windows refuses
+`taskkill /T` against an already-exited root and reports uncertainty instead.
+Lifecycle callback persistence also has a five-second terminal completion bound;
+a pending callback reports unconfirmed persistence instead of keeping completion
+open indefinitely. Startup still persists process identity before prompt delivery,
+with cancellation and the configured deadline active during that wait. Late callback
+completion remains ordered and cannot deliver a prompt after teardown. Child ownership
+records carry an optional lifecycle identity so a late exit from an earlier attempt
+cannot clear a newer child's ownership, even if its PID is reused.
+The required native Windows child suite includes
+`tests/pi-child-teardown.test.ts` for reviewer, RPC executor, recovery, and
+root-exit-during-background-readiness paths.
 
 The extension selects the configured [operating-mode prompt](configuration.md#operating-modes)
 for each new run; each prompt opens with a startup cue to read the matching shipped

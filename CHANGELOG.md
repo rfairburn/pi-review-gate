@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.113]
+## [0.1.0-dev.114]
 
 ### Fixed
 
@@ -28,6 +28,17 @@ dates.
   tests cover delivery after an aborted run and aborting
   recovery before the retained exit is drained; the original report's precise
   cause remains unestablished (Refs #281).
+
+## [0.1.0-dev.113]
+
+### Fixed
+
+- Allow ordinary review checkpoints in initialized repositories before the
+  user's first commit by pinning a synthetic empty-tree baseline under the
+  checkpoint-owned ref. Staged, unstaged, and non-ignored untracked state still
+  uses the normal review path; the user's HEAD, branch refs, and live index are
+  unchanged, and unverified HEAD state remains fail-closed. Windows requires Git
+  2.36.0 or newer for durable synthetic objects (#284).
 
 ## [0.1.0-dev.112]
 

@@ -7,18 +7,124 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import { mkdir, realpath } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { GitCheckpointError, messageOf, resultFromError, throwIfAborted, truncateDetail, type GitCheckpointResult } from "./errors";
-import { GIT_CHECKPOINT_DESCRIPTOR_FORMAT, GIT_CHECKPOINT_RECORD_FORMAT, SCRATCH_SUBDIR, checkpointRefForWindow, encodeGitCheckpointRecord, isSafeWindowId, type GitCheckpointArmStats, type GitCheckpointDescriptor, type GitCheckpointObjectFormat, type GitCheckpointRecord, type GitCheckpointUntrackedEntry } from "./record";
-import { DEFAULT_MAX_PATCH_BYTES, DEFAULT_MAX_UNTRACKED_BYTES, DEFAULT_TIMEOUT_MS, ZERO_OID_SHA1, ZERO_OID_SHA256, runGit, type GitRunOutput, type GitRunSpec } from "./run-git";
-import { assertAuditProofStable, auditRepository, resolveRepo, runAfterInitialAuditHook } from "./audit";
+import { GIT_CHECKPOINT_DESCRIPTOR_FORMAT, GIT_CHECKPOINT_RECORD_FORMAT, OID_RE_40, OID_RE_64, SCRATCH_SUBDIR, checkpointRefForWindow, encodeGitCheckpointRecord, isSafeWindowId, type GitCheckpointArmStats, type GitCheckpointDescriptor, type GitCheckpointObjectFormat, type GitCheckpointRecord, type GitCheckpointUntrackedEntry } from "./record";
+import { DEFAULT_MAX_PATCH_BYTES, DEFAULT_MAX_UNTRACKED_BYTES, DEFAULT_TIMEOUT_MS, ZERO_OID_SHA1, ZERO_OID_SHA256, runGit, runGitWithInput, type GitRunOutput, type GitRunSpec } from "./run-git";
+import { assertAuditProofStable, auditRepository, resolveRepo, runAfterInitialAuditHook, type ResolvedRepo } from "./audit";
 import { acquireWindowPinLock, cleanupAfterFailedArm, createPinIfMissing } from "./pin";
 import { captureDiff, captureUntrackedEntry, listUntrackedPaths, snapshotIndexTree } from "./capture";
-import { publishRecordDurable, syncAncestorChain } from "./durability";
+import { publishRecordDurable, syncAncestorChain, syncLooseGitObject } from "./durability";
 import type { GitCheckpointOptions } from "./types";
 
 // ── Arm ──────────────────────────────────────────────────────────────────────
+
+const SYNTHETIC_BASE_ENV: NodeJS.ProcessEnv = {
+  GIT_AUTHOR_NAME: "pi-review-gate",
+  GIT_AUTHOR_EMAIL: "checkpoint@pi-review-gate.invalid",
+  GIT_AUTHOR_DATE: "@0 +0000",
+  GIT_COMMITTER_NAME: "pi-review-gate",
+  GIT_COMMITTER_EMAIL: "checkpoint@pi-review-gate.invalid",
+  GIT_COMMITTER_DATE: "@0 +0000",
+};
+const DURABLE_OBJECT_CONFIG = ["-c", "core.fsync=loose-object", "-c", "core.fsyncMethod=fsync"] as const;
+
+/** Windows cannot fsync a read-only object handle, so object writes must be flushed by Git. */
+async function assertWindowsGitObjectFsync(gitPath: string, root: string, spec: GitRunSpec): Promise<void> {
+  if (process.platform !== "win32") return;
+  const versionOut = await runGit(gitPath, root, ["version"], spec);
+  const versionText = versionOut.stdout.toString("utf8").trim();
+  const match = /^git version (\d+)\.(\d+)\.(\d+)(?:\D.*)?$/.exec(versionText);
+  if (versionOut.code !== 0 || versionOut.stderr.trim() !== "" || !match) {
+    throw new GitCheckpointError(`cannot verify Git loose-object fsync support: ${versionOut.stderr || versionText || `exit ${versionOut.code}`}`, "git_failed");
+  }
+  const [, majorText, minorText] = match;
+  const major = Number(majorText);
+  const minor = Number(minorText);
+  if (major < 2 || (major === 2 && minor < 36)) {
+    throw new GitCheckpointError("Git 2.36.0 or newer is required to durably create synthetic checkpoint objects on Windows", "git_failed");
+  }
+}
+
+/** Only a valid symbolic HEAD whose valid target ref is definitely absent is unborn. */
+async function isVerifiedUnbornHead(gitPath: string, root: string, spec: GitRunSpec): Promise<boolean> {
+  const symbolic = await runGit(gitPath, root, ["symbolic-ref", "--quiet", "HEAD"], spec);
+  if (symbolic.code !== 0 || symbolic.stderr.trim() !== "") return false;
+  const symbolicText = symbolic.stdout.toString("utf8");
+  const headRef = symbolicText.endsWith("\n") ? symbolicText.slice(0, -1) : symbolicText;
+  if (!headRef || headRef.includes("\n") || symbolicText !== `${headRef}\n`) return false;
+
+  const validRef = await runGit(gitPath, root, ["check-ref-format", headRef], spec);
+  if (validRef.code !== 0 || validRef.stderr.trim() !== "") return false;
+
+  const target = await runGit(gitPath, root, ["show-ref", "--verify", "--quiet", headRef], spec);
+  return target.code === 1 && target.stderr.trim() === "";
+}
+
+/**
+ * Make a parentless empty-tree commit without touching HEAD, branch refs, or
+ * the live index. Its fixed reserved identity prevents user identity/config
+ * from entering the object; the per-arm message makes the commit unique so
+ * its loose object can be synced before the checkpoint pin is published.
+ */
+async function createSyntheticEmptyBaseline(
+  gitPath: string,
+  repo: ResolvedRepo,
+  armId: string,
+  spec: GitRunSpec,
+): Promise<{ base: string; objectFormat: GitCheckpointObjectFormat }> {
+  await assertWindowsGitObjectFsync(gitPath, repo.root, spec);
+  const fileSyncByGit = process.platform === "win32";
+  const objectsPathOut = await runGit(gitPath, repo.root, ["rev-parse", "--git-path", "objects"], spec);
+  if (objectsPathOut.code !== 0 || objectsPathOut.stderr.trim() !== "") {
+    throw new GitCheckpointError(`cannot locate Git object storage: ${objectsPathOut.stderr || `exit ${objectsPathOut.code}`}`, "git_failed");
+  }
+  const objectsPathText = objectsPathOut.stdout.toString("utf8").trim();
+  if (!objectsPathText || objectsPathText.includes("\n")) throw new GitCheckpointError("Git returned an invalid object directory", "git_failed");
+  const objectsDir = await realpath(resolve(repo.root, objectsPathText));
+
+  const treeOut = await runGitWithInput(
+    gitPath,
+    repo.root,
+    [...DURABLE_OBJECT_CONFIG, "hash-object", "-w", "-t", "tree", "--stdin"],
+    Buffer.alloc(0),
+    spec,
+    {},
+  );
+  if (treeOut.code !== 0 || treeOut.stderr.trim() !== "") {
+    throw new GitCheckpointError(`cannot create the empty baseline tree: ${treeOut.stderr || `exit ${treeOut.code}`}`, "git_failed");
+  }
+  const emptyTree = treeOut.stdout.toString("ascii").trim();
+  const objectFormat: GitCheckpointObjectFormat = emptyTree.length === 40 ? "sha1" : emptyTree.length === 64 ? "sha256" : (() => {
+    throw new GitCheckpointError(`unexpected empty-tree object id length: ${emptyTree.length}`, "git_failed");
+  })();
+  if (!(objectFormat === "sha1" ? OID_RE_40 : OID_RE_64).test(emptyTree)) {
+    throw new GitCheckpointError("Git returned an invalid empty-tree object id", "git_failed");
+  }
+  await syncLooseGitObject(objectsDir, emptyTree, false, fileSyncByGit);
+  const treeCheck = await runGit(gitPath, repo.root, ["cat-file", "-e", `${emptyTree}^{tree}`], spec);
+  if (treeCheck.code !== 0 || treeCheck.stderr.trim() !== "") {
+    throw new GitCheckpointError(`empty baseline tree is unavailable: ${treeCheck.stderr || `exit ${treeCheck.code}`}`, "git_failed");
+  }
+
+  const commitOut = await runGit(gitPath, repo.root, [
+    ...DURABLE_OBJECT_CONFIG,
+    "commit-tree", emptyTree, "-m", `pi-review-gate empty baseline ${armId}`,
+  ], {
+    ...spec,
+    extraEnv: { ...spec.extraEnv, ...SYNTHETIC_BASE_ENV },
+  });
+  if (commitOut.code !== 0 || commitOut.stderr.trim() !== "") {
+    throw new GitCheckpointError(`cannot create the synthetic empty baseline commit: ${commitOut.stderr || `exit ${commitOut.code}`}`, "git_failed");
+  }
+  const base = commitOut.stdout.toString("ascii").trim();
+  if (!(objectFormat === "sha1" ? OID_RE_40 : OID_RE_64).test(base)) {
+    throw new GitCheckpointError("Git returned an invalid synthetic baseline commit id", "git_failed");
+  }
+  await syncLooseGitObject(objectsDir, base, true, fileSyncByGit);
+  return { base, objectFormat };
+}
 
 export interface GitCheckpointArmOutcome {
   record: GitCheckpointRecord;
@@ -97,16 +203,37 @@ export async function armGitCheckpoint(
     } catch (error) {
       return resultFromError(error);
     }
-    if (headOut.code !== 0) {
-      return { status: "unsupported", reason: "unborn_head", detail: truncateDetail(headOut.stderr || "HEAD does not name a commit") };
-    }
-    const base = headOut.stdout.toString("utf8").trim();
-
-    // Derive the object format from the full base oid length (40 hex = sha1,
-    // 64 hex = sha256). This matches every oid Git emits in this repository.
-    const objectFormat: GitCheckpointObjectFormat | undefined = base.length === 40 ? "sha1" : base.length === 64 ? "sha256" : undefined;
-    if (objectFormat === undefined) {
-      return { status: "failed", reason: "git_failed", detail: `unexpected object id length for HEAD: ${base.length}` };
+    const armId = randomBytes(8).toString("hex");
+    let base: string;
+    let objectFormat: GitCheckpointObjectFormat;
+    if (headOut.code === 0) {
+      base = headOut.stdout.toString("utf8").trim();
+      const detectedFormat = base.length === 40 ? "sha1" : base.length === 64 ? "sha256" : undefined;
+      if (detectedFormat === undefined || !(detectedFormat === "sha1" ? OID_RE_40 : OID_RE_64).test(base)) {
+        return { status: "failed", reason: "git_failed", detail: `unexpected commit id for HEAD: ${truncateDetail(base)}` };
+      }
+      objectFormat = detectedFormat;
+    } else {
+      let isUnborn = false;
+      try {
+        isUnborn = await isVerifiedUnbornHead(gitPath, repo.root, spec);
+      } catch (error) {
+        return resultFromError(error);
+      }
+      if (!isUnborn) {
+        return {
+          status: "failed",
+          reason: "git_failed",
+          detail: truncateDetail(headOut.stderr || "HEAD does not name a commit and is not a verified unborn symbolic ref"),
+        };
+      }
+      try {
+        const synthetic = await createSyntheticEmptyBaseline(gitPath, repo, armId, spec);
+        base = synthetic.base;
+        objectFormat = synthetic.objectFormat;
+      } catch (error) {
+        return resultFromError(error);
+      }
     }
 
     // Pin the base commit in an owned ref BEFORE capturing anything, so the
@@ -116,7 +243,6 @@ export async function armGitCheckpoint(
     // refusal happens before any scratch or capture work begins. The update
     // is reflog-annotated with this arm's generation nonce so release can
     // later prove which generation owns the pin (see release docs).
-    const armId = randomBytes(8).toString("hex");
     const ref = checkpointRefForWindow(windowId);
     const zeroOid = objectFormat === "sha1" ? ZERO_OID_SHA1 : ZERO_OID_SHA256;
     // Serialize ref creation against release's generation proof, deletion,

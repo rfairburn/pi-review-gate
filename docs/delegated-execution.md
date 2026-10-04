@@ -456,9 +456,18 @@ regardless of repository size.
 On Windows, private Git capture ignores unreliable worktree-only executable-bit
 differences while retaining staged index modes and current worktree content;
 its root identity uses an opened directory's volume ID when path stat omits it,
-and landing and recovery verify that same identity. POSIX worktree mode
-handling is unchanged. Landing stages temporary files beside their destination
-on the same volume; recovery validates those native paths before acting.
+and landing and recovery verify that same identity. Windows root path and both
+opened-handle stats use exact integers, including NTFS inode/volume values above
+JavaScript's safe-number range. Capture JSON and version-1 authenticated recovery
+manifests retain safe positive components as numbers; larger unsigned 64-bit
+components use canonical decimal strings (no leading zeros). Adjacent large inode
+values remain distinct; malformed or unsafe numeric identities fail closed rather
+than being rounded or guessed. Existing safe numeric records and their HMAC
+encoding remain compatible, but older builds cannot consume new exact-large
+records: use a build supporting this encoding for their reload/recovery.
+POSIX safe-number root identity and worktree mode handling are unchanged. Landing
+stages temporary files beside their destination on the same volume; recovery
+validates those native paths before acting.
 
 During task capture, `maxSnapshotBytes` limits only the cumulative size of non-ignored
 untracked files (50 MiB by default). This private task capture, candidate review, and

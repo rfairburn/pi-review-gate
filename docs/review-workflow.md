@@ -40,10 +40,10 @@ against separate window and exchange baselines; a checkpoint is not itself a pas
 review or a substitute for either baseline.
 
 On Windows, synthetic checkpoint objects are flushed by Git at write time; this
-requires Git 2.36.0 or newer, and older versions fail closed. Checkpoint record
-files are also flushed, but an unsupported directory fsync is best-effort: a power
-loss may lose a newly created directory entry. Restart verifies the surviving
-checkpoint rather than assuming it survived.
+requires Git 2.36.0 or newer, and older versions fail closed. Git and non-Git
+checkpoint record files are also flushed, but a directory-handle fsync rejected
+with `EPERM` is best-effort: a power loss may lose a newly created directory entry.
+Restart verifies the surviving checkpoint rather than assuming it survived.
 
 Exact `write` / `edit` paths and easy shell targets are pre-captured before execution,
 including absolute paths outside the current worktree. Repository baselines,

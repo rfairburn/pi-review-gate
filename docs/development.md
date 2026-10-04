@@ -268,6 +268,10 @@ modes (0700/0600/0644) are requested for parity
 and are no-ops under Windows ACLs. CI covers the native paths on `windows-latest`
 (`.github/workflows/ci.yml`, focused `launcher-cmd` tests); macOS/Linux behavior of the
 POSIX launcher is unchanged.
+The `review-checkpoint-windows` tests exercise raw parent checkpoint directory-sync
+and file-identity error boundaries with mocks on every host, plus native Windows
+capture/reload/frozen-comparison/advancement. Both Windows CI Node versions run
+that file; the full suite also runs its non-skipped mocked cases.
 The extension's own Pi child launches (reviewer prompts, the delegated Pi RPC
 executor, and compaction recovery) use the same alias-independent resolution
 (issue 204): on Windows the default `pi` resolves to an installed pi.exe or the

@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.112]
+## [0.1.0-dev.113]
 
 ### Fixed
 
@@ -25,6 +25,25 @@ dates.
   uses the normal review path; the user's HEAD, branch refs, and live index are
   unchanged, and unverified HEAD state remains fail-closed. Windows requires Git
   2.36.0 or newer for durable synthetic objects (#284).
+
+## [0.1.0-dev.112]
+
+### Fixed
+
+- Preserve exact large NTFS wave-root inode and volume identities through capture,
+  persisted reload, landing, and authenticated recovery. Safe numeric identity
+  fields keep their existing version-1 encoding; larger unsigned 64-bit fields
+  use canonical decimal strings, requiring an updated build to reload/recover
+  those records. Root replacement and retarget checks remain fail-closed (#282).
+- Restore native Windows raw parent-review baseline capture when directory-handle
+  fsync returns `EPERM`, matching the existing Git checkpoint exception. File
+  flushes and other filesystem failures remain mandatory; mocked Windows tests
+  cover ancestor and final-directory flushes and fail-closed error boundaries
+  (#282).
+- Apply the existing Windows path-stat/open-handle device-ID normalization to
+  raw file capture and record reload, preserving all other identity checks;
+  accept native absolute descriptor roots so Windows drive and UNC paths can
+  reload without accepting relative paths (#282).
 
 ## [0.1.0-dev.111]
 

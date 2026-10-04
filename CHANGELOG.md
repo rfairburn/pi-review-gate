@@ -15,6 +15,43 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.117]
+
+### Fixed
+
+- Use one shared Windows Pi spawn specification across the launcher, reviewer,
+  delegated RPC executor, and compaction recovery: resolve the full `pi.cmd`
+  path and invoke it through the parent's validated absolute
+  `SystemRoot\System32\cmd.exe`, without inspecting Pi's shim or trusting the
+  child environment, `ComSpec`, `PATH`, or working directory; invalid or missing
+  interpreter paths fail closed. Simple managed and npm-generated shims use the
+  same path; `pi.exe`, custom commands, POSIX launch semantics, setup,
+  management passthrough, exit-status propagation, and the launcher's npm-only
+  build parser are preserved; its batch fallback also uses the validated
+  system command processor and fails closed when unavailable (#290).
+- Keep the Windows `cmd.exe` PID as the lifecycle and process-tree cleanup root
+  while authenticating the actual Pi PID from the signed settlement receipt.
+  Before first binding, the parent verifies live, snapshot-stable ancestry and
+  requires each parent to predate its child, rejecting recycled PIDs; later
+  receipts require exact PID equality. The receipt wire schema and HMAC
+  child/session/generation identity are unchanged (#290).
+- Bound reviewer, RPC executor, and compaction-recovery teardown when an exited
+  root leaves inherited pipes open. Root exit and cancellation stop background
+  readiness waits; uncertain cleanup fails explicitly without accepting a result,
+  inventing exit status, or treating locally destroyed pipes as descendant cleanup.
+  Native Windows regressions cover all three launch paths (#290).
+- Keep cancellation and deadlines active during asynchronous PID persistence;
+  bound terminal lifecycle callbacks without delivering prompts after teardown.
+  Preserve late callback ordering and match exit updates to the originating
+  lifecycle so they cannot clear a newer child's ownership (#290).
+
+### Changed
+
+- Require fresh, locked full Pi 1.0.2 installations on Linux and Windows CI,
+  exercising the installed command's version, provider-free RPC, candidate
+  registration, and a generated simple managed-style wrapper. Missing required
+  prerequisites fail instead of skipping; Pi remains a test-only dependency (#290).
+
 ## [0.1.0-dev.116]
 
 ### Documentation

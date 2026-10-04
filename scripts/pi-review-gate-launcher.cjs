@@ -66,12 +66,13 @@
  * no-op under Windows ACLs; the fail-closed publication structure is what the
  * launcher preserves. Publication runs in-process (fs.linkSync /
  * fs.renameSync) and Python is spawned directly with argument arrays. Pi's
- * Windows .cmd is resolved on PATH and invoked by its full path through
- * cmd.exe with quoted arguments; its contents and underlying installation
- * are never inspected. Normal batch parsing, including %VAR% expansion,
- * applies. npm's development build resolution remains separate. POSIX uses
- * plain execvp. Management verbs are dispatched here before any setup, so
- * the .cmd entry point stays a thin single `%*` passthrough.
+ * Windows .cmd is resolved on PATH and invoked by its full path through the
+ * parent's validated absolute SystemRoot\System32\cmd.exe; its contents
+ * and underlying installation are never inspected. Normal batch parsing,
+ * including %VAR% expansion, applies. npm's development build resolution
+ * remains separate. POSIX uses plain execvp. Management verbs are dispatched
+ * here before any setup, so the .cmd entry point stays a thin single `%*`
+ * passthrough.
  *
  * Keep in sync with src/config-path.ts (Pi agent-dir semantics) and
  * scripts/ensure-ddgs.sh (DDGS provisioning); the mirrors are deliberate so
@@ -458,11 +459,11 @@ function findOnPath(name, extensions, pathEnv = process.env.PATH || "") {
 }
 
 /**
- * Resolve the JavaScript entry point an npm-generated Windows batch shim
- * (pi.cmd, npm.cmd) refers to, so the launcher can spawn it through this Node
- * binary with an argument array instead of reparsing arguments through
- * cmd.exe. npm shims reference the target as a quoted "%dp0%"-relative path;
- * the last such token ending in .js/.cjs wins.
+ * Resolve the JavaScript entry point an npm-generated npm.cmd shim refers to
+ * so the launcher can use an argument array for its fixed development-build
+ * fallback instead of reparsing through cmd.exe. Pi's own command shim is
+ * never passed here. npm shims reference the target as a quoted "%dp0%"-relative
+ * path; the last such token ending in .js/.cjs wins.
  */
 function resolveCmdShimTarget(shimPath) {
   let content;
@@ -485,33 +486,78 @@ function resolveCmdShimTarget(shimPath) {
   return null;
 }
 
-/** Resolve Pi's launcher command, not the implementation behind its .cmd. */
-function resolveLauncherPiInvocation(env, platform) {
+/** Resolve the default Pi executable without inspecting a .cmd shim. */
+function resolvePiInvocation(env, platform) {
   if (platform !== "win32") return { kind: "path" };
-  const pathEnv = env.PATH || "";
+  const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path");
+  const pathEnv = env.PATH ?? (pathKey ? env[pathKey] : "") ?? "";
   const exe = findOnPath("pi", [".exe"], pathEnv);
-  if (exe) return { kind: "direct", file: exe };
+  if (exe) return { kind: "direct", file: path.resolve(exe) };
   const shim = findOnPath("pi", [".cmd"], pathEnv);
   if (shim) return { kind: "cmd", file: path.resolve(shim) };
   return { kind: "missing" };
 }
 
+/** Return whether a path has a fully qualified Windows drive or UNC root. */
+function isFullyQualifiedWindowsPath(candidate) {
+  if (typeof candidate !== "string" || candidate.length === 0 || candidate.includes("\0")) return false;
+  const normalized = path.win32.normalize(candidate);
+  if (!path.win32.isAbsolute(normalized)) return false;
+  const root = path.win32.parse(normalized).root;
+  return /^[a-z]:\\$/i.test(root)
+    || /^\\\\[^\\]+\\[^\\]+\\$/.test(root)
+    || /^\\\\\?\\[a-z]:\\$/i.test(root)
+    || /^\\\\\?\\UNC\\[^\\]+\\[^\\]+\\$/i.test(root);
+}
+
 /**
- * Shell-free resolver used by the extension's internal Pi child launches.
- * Keep this separate from the launcher's direct .cmd invocation above.
+ * Resolve only the parent's OS-provided SystemRoot. The supplied child env,
+ * ComSpec, PATH, and working directory are deliberately irrelevant: a default
+ * Pi batch shim must never select its interpreter from any of them.
  */
-function resolvePiInvocation(env, platform) {
-  if (platform !== "win32") return { kind: "path" };
-  const pathEnv = env.PATH || "";
-  const exe = findOnPath("pi", [".exe"], pathEnv);
-  if (exe) return { kind: "direct", file: exe };
-  const shim = findOnPath("pi", [".cmd"], pathEnv);
-  if (shim) {
-    const target = resolveCmdShimTarget(shim);
-    if (target) return { kind: "node", file: target };
-    return { kind: "unresolved", shim };
+function resolveTrustedWindowsCmd() {
+  const systemRootKey = Object.keys(process.env).find((key) => key.toLowerCase() === "systemroot");
+  const systemRoot = systemRootKey ? process.env[systemRootKey] : undefined;
+  if (!isFullyQualifiedWindowsPath(systemRoot)) return null;
+  const candidate = path.win32.join(path.win32.normalize(systemRoot), "System32", "cmd.exe");
+  if (!isFullyQualifiedWindowsPath(candidate) || !isUsableRegularFile(candidate)) return null;
+  return candidate;
+}
+
+/**
+ * Authoritative shared spawn-spec resolver for the launcher and extension Pi
+ * children. npm parsing is deliberately confined to the launcher's build
+ * fallback; Pi's own .cmd implementation is opaque and invoked as a batch
+ * command with cmd.exe's normal argument processing.
+ */
+function resolvePiChildSpawnSpec(command, args, env, platform) {
+  const forwarded = [...args];
+  if (command !== "pi") return { ok: true, file: command, args: forwarded };
+  const invocation = resolvePiInvocation(env, platform);
+  if (invocation.kind === "path") return { ok: true, file: command, args: forwarded };
+  if (invocation.kind === "direct") return { ok: true, file: invocation.file, args: forwarded };
+  if (invocation.kind === "cmd") {
+    const cmdExe = resolveTrustedWindowsCmd();
+    if (!cmdExe) {
+      return {
+        ok: false,
+        kind: "cmd-unavailable",
+        error: "A valid regular cmd.exe was not found under the parent process's absolute Windows SystemRoot\\System32; refusing to launch pi.cmd.",
+      };
+    }
+    const commandLine = [invocation.file, ...forwarded].map(cmdQuote).join(" ");
+    return {
+      ok: true,
+      file: cmdExe,
+      args: ["/d", "/s", "/c", `"${commandLine}"`],
+      windowsVerbatimArguments: true,
+    };
   }
-  return { kind: "missing" };
+  return {
+    ok: false,
+    kind: "missing",
+    error: "The default pi command was not found on PATH; install Pi (npm install -g @earendil-works/pi) or configure an explicit command.",
+  };
 }
 
 /**
@@ -520,23 +566,17 @@ function resolvePiInvocation(env, platform) {
  */
 function launchPi(argv, extensionPath, env) {
   const forwarded = extensionPath ? ["--extension", extensionPath, ...argv] : [...argv];
-  const invocation = resolveLauncherPiInvocation(env, process.platform);
-  let result;
-  if (invocation.kind === "direct") {
-    result = spawnSync(invocation.file, forwarded, { stdio: "inherit", env });
-  } else if (invocation.kind === "cmd") {
-    // The outer quotes are cmd.exe /s /c's command-string delimiters.
-    // Use the full .cmd path so PowerShell aliases cannot intercept Pi.
-    const command = [invocation.file, ...forwarded].map(cmdQuote).join(" ");
-    result = spawnSync("cmd.exe", ["/d", "/s", "/c", `"${command}"`], {
-      stdio: "inherit", env, windowsVerbatimArguments: true,
-    });
-  } else if (invocation.kind === "path") {
-    result = spawnSync("pi", forwarded, { stdio: "inherit", env });
-  } else {
-    note("pi-review-gate: pi was not found on PATH; install Pi (npm install -g @earendil-works/pi) and re-run the launcher\n");
+  const invocation = resolvePiChildSpawnSpec("pi", forwarded, env, process.platform);
+  if (!invocation.ok) {
+    if (invocation.kind === "cmd-unavailable") note(`pi-review-gate: ${invocation.error}\n`);
+    else note("pi-review-gate: pi was not found on PATH; install Pi (npm install -g @earendil-works/pi) and re-run the launcher\n");
     return 127;
   }
+  const result = spawnSync(invocation.file, invocation.args, {
+    stdio: "inherit",
+    env,
+    ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+  });
   if (result.error) {
     note(`pi-review-gate: could not execute pi (${result.error.message})\n`);
     return 127;
@@ -559,11 +599,20 @@ function buildExtension(root) {
         return spawnSync(process.execPath, [entry, "--prefix", root, "run", "build"], { stdio: "inherit" });
       }
     }
-    // Fallback for exotic npm installations: fixed tokens plus one quoted
-    // path (quotes are illegal in Windows file names, so the path cannot
-    // break cmd's quoted region; a % in the install path would be expanded by
-    // cmd — visible corruption, never attacker-controlled).
-    return spawnSync("cmd.exe", ["/d", "/s", "/c", `npm --prefix ${cmdQuote(root)} run build`], { stdio: "inherit" });
+    // Fallback for exotic npm installations: use the same trusted command
+    // processor as Pi batch launches, with fixed tokens and one quoted path.
+    // Normal Windows batch parsing, including percent expansion, still applies.
+    const cmdExe = resolveTrustedWindowsCmd();
+    if (!cmdExe) {
+      return {
+        status: null,
+        error: new Error("The parent process's Windows SystemRoot\\System32 command processor is unavailable; refusing an unqualified development-build fallback."),
+      };
+    }
+    return spawnSync(cmdExe, ["/d", "/s", "/c", `npm --prefix ${cmdQuote(root)} run build`], {
+      stdio: "inherit",
+      windowsVerbatimArguments: true,
+    });
   }
   return spawnSync("npm", ["--prefix", root, "run", "build"], { stdio: "inherit" });
 }
@@ -1107,6 +1156,7 @@ module.exports = {
   SKILL_MIGRATION_PLAN,
   SKILL_PUBLISH_RETRY_ATTEMPTS,
   SKILL_PUBLISH_RETRY_DELAY_MS,
+  buildExtension,
   cmdQuote,
   compatibilityFallbackConfigPath,
   ddgsPythonPath,
@@ -1117,7 +1167,10 @@ module.exports = {
   migrateGenericSkillFiles,
   resolveCmdShimTarget,
   resolvePiAgentDir,
-  resolveLauncherPiInvocation,
   resolvePiInvocation,
+  resolvePiChildSpawnSpec,
+  // Kept as a compatibility seam for launcher tests and consumers of this
+  // helper; it is the same authoritative resolver, not a second path.
+  resolveLauncherPiInvocation: resolvePiInvocation,
   selectReviewGateConfig,
 };

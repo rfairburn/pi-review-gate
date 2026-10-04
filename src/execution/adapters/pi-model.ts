@@ -2,7 +2,13 @@ import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { terminateProcessTree, type ProcessRunResult } from "../../adapters/process";
+import {
+  PROCESS_TREE_CLEANUP_GRACE_MS,
+  terminateProcessTree,
+  waitForPromiseBounded,
+  type BoundedProcessClose,
+  type ProcessRunResult,
+} from "../../adapters/process";
 import { DEFAULT_PI_COMMAND, resolvePiChildSpawn, translateDefaultPiSpawnError } from "../../pi-invocation";
 import { BoundedTextAccumulator, MEBIBYTE } from "../../jsonl";
 import { extractReviewTextFromPiJsonl, PiJsonlReviewExtractor } from "../../usage";
@@ -12,6 +18,7 @@ import { ExecutorLifecycleError, type ExecutorAdapter, type ExecutorInteractionA
 import type { ThinkingLevel } from "../../config";
 import { BackgroundProcessReadiness } from "../../background-process-readiness";
 import { assertNoPiToolPolicyArgs } from "../../pi-tool-policy";
+import { isLiveWindowsProcessDescendant } from "../windows-process-lineage";
 import {
   DEFERRED_TOOL_SEARCH_NAME,
   EXECUTOR_TOOL_CATALOG_ENV,
@@ -42,10 +49,11 @@ export interface PiExecutorOptions {
   settlementTimeoutMs?: number;
 }
 
-// Successful settlement leaves a live browser. Terminal cleanup can use a
-// 5-second concurrent close phase followed by a 5-second late-containment drain;
-// allow both phases plus exit overhead, independently of the model deadline.
+// Successful settlement leaves a live browser. Terminal cleanup gets its
+// existing shutdown window, then a separate bounded tree-cleanup/close drain.
 const PI_EXECUTOR_TERMINAL_SHUTDOWN_MS = 15_000;
+const PI_EXECUTOR_TERMINAL_CLEANUP_MS = 2_000 + PROCESS_TREE_CLEANUP_GRACE_MS;
+const PI_RPC_ROOT_EXIT_DRAIN_MS = 100;
 
 export class PiExecutorAdapter implements ExecutorAdapter {
   readonly kind = "pi-model";
@@ -124,9 +132,8 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     // The identity is random, but remove only this exact parent-owned path so
     // an impossible stale collision can never satisfy the new child.
     await removePiSettlementReceipt(settlementBootstrap);
-    // #204: alias-independent default `pi` launch (the Windows npm pi.cmd
-    // shim resolves to its JavaScript entry through this Node binary; custom
-    // commands and POSIX direct spawns keep their exact semantics).
+    // #204: alias-independent default `pi` launch; Windows npm pi.cmd is
+    // invoked through the shared cmd.exe spec without inspecting its contents.
     const childEnv = executorEnv(toolCatalog, settlementBootstrap);
     const invocation = resolvePiChildSpawn(this.options.command ?? "pi", args, childEnv);
     if (!invocation.ok) throw new Error(invocation.error);
@@ -139,12 +146,21 @@ export class PiExecutorAdapter implements ExecutorAdapter {
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
       env: childEnv,
+      ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
     });
     const identity = proc.pid === undefined ? undefined : {
       pid: proc.pid,
       processGroupId: process.platform === "win32" ? undefined : proc.pid,
     };
-    settlementBootstrap.pid = proc.pid;
+    if (invocation.windowsVerbatimArguments) {
+      // cmd.exe is the owned cleanup/lifecycle root, not the actual Pi Node
+      // process. The first signed child receipt must prove native process
+      // ancestry before binding its PID; the callback remains parent-only.
+      settlementBootstrap.verifySpawnedPid = (pid) => isLiveWindowsProcessDescendant(proc, pid);
+    } else {
+      // Direct spawns bind the known child PID exactly as before.
+      settlementBootstrap.pid = proc.pid;
+    }
     // Observe the child lifecycle before awaiting durable PID persistence
     // (#231): a fast-exiting child can emit 'close' while onProcessStart is
     // still pending, and PiRpc must already be listening for that event so
@@ -156,10 +172,18 @@ export class PiExecutorAdapter implements ExecutorAdapter {
       extractor.push(chunk);
       activity.push(chunk);
     }, (error) => translateDefaultPiSpawnError(error, isDefaultPiPassThrough), request.onToolObservation);
-    if (identity) await request.onProcessStart?.(identity);
+    const rootExit = rpc.rootExited();
+    let rootExitObserved = false;
+    void rootExit.then(() => { rootExitObserved = true; });
+    let lifecycleStart: Promise<void> | undefined;
+    let lifecycleStartError: unknown;
+    let lifecycleCompletion: Promise<void> | undefined;
     let timedOut = false;
     let aborted = false;
     let interruptedByControl = false;
+    let startupReady = false;
+    let cancelStartup!: () => void;
+    const startupCancelled = new Promise<void>((resolvePromise) => { cancelStartup = resolvePromise; });
     // Turn-interrupt steering handoff (issue #63): held from the start of a
     // steering delivery until its transport acceptance. During that window an
     // interrupted session can briefly look idle, so run() must not settle on
@@ -181,6 +205,11 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     // run (issue #63).
     let completing = false;
     let protocolFailure: string | undefined;
+    const appendProtocolFailure = (failure: string): void => {
+      if (!protocolFailure) protocolFailure = failure;
+      else if (!protocolFailure.includes(failure)) protocolFailure = `${protocolFailure} ${failure}`;
+    };
+    let cleanupFailure: string | undefined;
     let finalText = "";
     let timeoutDeadline = Date.now() + timeoutMs;
     let receiptGeneration = 0;
@@ -227,22 +256,68 @@ export class PiExecutorAdapter implements ExecutorAdapter {
       await acknowledgement;
     };
     const timer = setInterval(() => {
-      if (backgroundReadiness.snapshot().running.length > 0) {
+      if (startupReady && backgroundReadiness.snapshot().running.length > 0 && !rootExitObserved
+        && !aborted && !request.signal?.aborted
+        && !interruptedByControl && !rpc.terminationWasRequested) {
         timeoutDeadline = Date.now() + timeoutMs;
         return;
       }
       if (Date.now() < timeoutDeadline) return;
       timedOut = true;
+      if (!startupReady) cancelStartup();
       rpc.terminate();
     }, Math.min(250, Math.max(25, Math.floor(timeoutMs / 4))));
-    timer.unref?.();
+    // Keep the model deadline live even if the owned child exits while an
+    // asynchronous start-persistence callback is still pending.
     const onAbort = () => {
       aborted = true;
+      if (!startupReady) {
+        cancelStartup();
+        rpc.terminate();
+        return;
+      }
       if (interruptedByControl) return;
-      void rpc.request("abort", {}).catch(() => undefined).finally(() => rpc.terminate());
+      const abortDeadline = setTimeout(() => rpc.terminate(), 2_000);
+      void rpc.request("abort", {}).catch(() => undefined).finally(() => {
+        clearTimeout(abortDeadline);
+        rpc.terminate();
+      });
     };
     request.signal?.addEventListener("abort", onAbort, { once: true });
+    if (request.signal?.aborted) onAbort();
+    lifecycleStart = (async () => {
+      if (identity) await request.onProcessStart?.(identity);
+    })();
+    void lifecycleStart.catch((error) => {
+      lifecycleStartError = error instanceof Error ? error : new Error(messageOf(error));
+      if (!startupReady) cancelStartup();
+      rpc.terminate();
+    });
+    const startupOutcome = await Promise.race([
+      lifecycleStart.then(() => "ready" as const, () => "failed" as const),
+      startupCancelled.then(() => "stopped" as const),
+    ]);
+    if (startupOutcome === "ready" && Date.now() >= timeoutDeadline) {
+      timedOut = true;
+      cancelStartup();
+      rpc.terminate();
+    }
+    startupReady = startupOutcome === "ready"
+      && !timedOut && !aborted && !request.signal?.aborted && !rpc.terminationWasRequested;
+    if (lifecycleStartError) {
+      protocolFailure = `Pi executor lifecycle start callback failed: ${messageOf(lifecycleStartError)}`;
+    }
+    if (!startupReady && timedOut && !protocolFailure) {
+      protocolFailure = "Pi executor startup did not complete before the configured model deadline.";
+    }
+    if (!startupReady && !timedOut && !aborted && !protocolFailure && rpc.terminationWasRequested) {
+      protocolFailure = "Pi executor startup stopped before durable process identity publication completed.";
+    }
+    // Keep a bounded startup stop out of the RPC failure path without wrapping
+    // the existing prompt/settlement state machine in an additional scope.
+    const startupSkipped = Symbol("Pi executor startup did not complete");
     try {
+      if (!startupReady) throw startupSkipped;
       let settledGeneration = rpc.settledGeneration;
       await rpc.request("prompt", { message: request.prompt });
       // #93: the RPC transport accepted the prompt — the actual delivery
@@ -302,8 +377,11 @@ export class PiExecutorAdapter implements ExecutorAdapter {
             const state = await rpc.request("get_state", {});
             if (!rpcState(state).isStreaming) {
               rpc.terminate();
-              await rpc.closed();
-              return { status: "acknowledged", message: "Pi RPC interruption terminated the idle executor and its background processes." };
+              const close = await rpc.waitForCloseBounded(PI_EXECUTOR_TERMINAL_CLEANUP_MS);
+              if (!close.closeObserved) {
+                throw new Error("Pi RPC interruption cleanup is uncertain: child close was not observed before the teardown deadline; the owned root or descendants may remain live.");
+              }
+              return { status: "acknowledged", message: "Pi RPC interruption observed executor shutdown." };
             }
             const beforeInterrupt = rpc.settledGeneration;
             await rpc.request("abort", {});
@@ -311,8 +389,11 @@ export class PiExecutorAdapter implements ExecutorAdapter {
             await waitForAuthenticatedSettlement(beforeInterrupt);
             // Turn settlement leaves a live browser; interruption is terminal.
             rpc.terminate();
-            await rpc.closed();
-            return { status: "acknowledged", message: "Pi RPC acknowledged interruption and terminated the executor process group." };
+            const close = await rpc.waitForCloseBounded(PI_EXECUTOR_TERMINAL_CLEANUP_MS);
+            if (!close.closeObserved) {
+              throw new Error("Pi RPC interruption cleanup is uncertain: child close was not observed before the teardown deadline; the owned root or descendants may remain live.");
+            }
+            return { status: "acknowledged", message: "Pi RPC acknowledged interruption and observed executor shutdown." };
           } catch (error) {
             return { status: "failed", message: messageOf(error) };
           }
@@ -362,8 +443,13 @@ export class PiExecutorAdapter implements ExecutorAdapter {
         request.onUpdate?.(
           `executor waiting for ${background.running.length} background process group(s): ${background.running.map((job) => `${job.id} (${job.label})`).join(", ")}`,
         );
-        await waitForBackgroundProcesses(backgroundReadiness, request.signal);
-        if (request.signal?.aborted || timedOut || interruptedByControl) break;
+        await waitForBackgroundProcesses(
+          backgroundReadiness,
+          request.signal,
+          rootExit,
+          () => timedOut || aborted || interruptedByControl || rpc.terminationWasRequested,
+        );
+        if (request.signal?.aborted || timedOut || aborted || interruptedByControl || rpc.terminationWasRequested) break;
         const idleRevision = backgroundReadiness.snapshot().revision;
 
         settledGeneration = rpc.settledGeneration;
@@ -386,6 +472,9 @@ export class PiExecutorAdapter implements ExecutorAdapter {
           authenticatedSettlementGeneration = rpc.settledGeneration;
         }
       }
+      if (request.signal?.aborted || timedOut || aborted || interruptedByControl || rpc.terminationWasRequested) {
+        throw new Error("Pi RPC terminal teardown was requested.");
+      }
       completing = true;
       const response = await rpc.request("get_last_assistant_text", {});
       finalText = isRecord(response.data) && typeof response.data.text === "string" ? response.data.text : "";
@@ -393,7 +482,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
         throw new Error("Pi executor completion lacks an acknowledgement for its final settlement.");
       }
     } catch (error) {
-      if (!timedOut && !aborted && !interruptedByControl) protocolFailure = messageOf(error);
+      if (error !== startupSkipped && !timedOut && !aborted && !interruptedByControl) protocolFailure = messageOf(error);
     } finally {
       clearInterval(timer);
       request.signal?.removeEventListener("abort", onAbort);
@@ -401,19 +490,79 @@ export class PiExecutorAdapter implements ExecutorAdapter {
       if (lastSettlementAcknowledged && !timedOut && !aborted && !interruptedByControl && !protocolFailure && !rpc.failure) rpc.closeInput();
       else rpc.terminate();
     }
+    type ShutdownOutcome =
+      | { kind: "closed"; exit: { code: number | null; signal: NodeJS.Signals | null } }
+      | { kind: "root-exited" }
+      | { kind: "deadline" };
     let shutdownTimer: NodeJS.Timeout | undefined;
-    const exitWithinDeadline = Promise.race([
-      rpc.closed(),
-      new Promise<undefined>((resolvePromise) => {
-        shutdownTimer = setTimeout(() => resolvePromise(undefined), PI_EXECUTOR_TERMINAL_SHUTDOWN_MS);
+    const shutdownWaits: Array<Promise<ShutdownOutcome>> = [
+      rpc.closed().then((exit) => ({ kind: "closed", exit } as const)),
+      new Promise<ShutdownOutcome>((resolvePromise) => {
+        shutdownTimer = setTimeout(() => resolvePromise({ kind: "deadline" }), PI_EXECUTOR_TERMINAL_SHUTDOWN_MS);
         shutdownTimer.unref?.();
       }),
-    ]);
-    let exit = await exitWithinDeadline.finally(() => clearTimeout(shutdownTimer));
-    if (!exit) {
-      protocolFailure ??= `Pi RPC terminal shutdown exceeded its ${PI_EXECUTOR_TERMINAL_SHUTDOWN_MS}ms cleanup deadline.`;
-      rpc.terminate();
-      exit = await rpc.closed();
+    ];
+    // During an already-requested teardown, root exit is enough to begin the
+    // bounded inherited-pipe drain. A normal stdin-close shutdown still gets
+    // the full existing graceful window before any process-tree signaling.
+    if (rpc.terminationWasRequested) {
+      shutdownWaits.push(rpc.rootExited().then(() => ({ kind: "root-exited" } as const)));
+    }
+    const exitWithinDeadline: Promise<ShutdownOutcome> = Promise.race(shutdownWaits);
+    let shutdown = await exitWithinDeadline.finally(() => clearTimeout(shutdownTimer));
+    let exit: { code: number | null; signal: NodeJS.Signals | null } = { code: null, signal: null };
+    let exitObserved = false;
+    if (shutdown.kind === "closed") {
+      exit = shutdown.exit;
+      exitObserved = true;
+      if (rpc.closeCleanupUncertainStatus) {
+        cleanupFailure = "Pi RPC cleanup uncertain: the child close notification followed local stdio destruction and does not confirm owned descendant cleanup.";
+      }
+    } else {
+      if (shutdown.kind === "deadline") {
+        protocolFailure ??= `Pi RPC terminal shutdown exceeded its ${PI_EXECUTOR_TERMINAL_SHUTDOWN_MS}ms cleanup deadline.`;
+      } else {
+        // The root can exit before its inherited stdio handles close. Give a
+        // normally-draining close event a short chance before tree cleanup.
+        let rootDrainTimer: NodeJS.Timeout | undefined;
+        const drained = await Promise.race([
+          rpc.closed().then((closedExit) => ({ kind: "closed", exit: closedExit } as const)),
+          new Promise<{ kind: "drain-deadline" }>((resolvePromise) => {
+            rootDrainTimer = setTimeout(
+              () => resolvePromise({ kind: "drain-deadline" }),
+              PI_RPC_ROOT_EXIT_DRAIN_MS,
+            );
+          }),
+        ]).finally(() => clearTimeout(rootDrainTimer));
+        if (drained.kind === "closed") {
+          shutdown = drained;
+          exit = drained.exit;
+          exitObserved = true;
+          if (rpc.closeCleanupUncertainStatus) {
+            cleanupFailure = "Pi RPC cleanup uncertain: the child close notification followed local stdio destruction and does not confirm owned descendant cleanup.";
+          }
+        } else {
+          if (!timedOut && !aborted && !interruptedByControl) {
+            protocolFailure ??= "Pi RPC root exited before child stdio closed; terminal cleanup is required.";
+          }
+          rpc.terminate();
+          const close = await rpc.waitForCloseBounded(PI_EXECUTOR_TERMINAL_CLEANUP_MS);
+          exit = { code: close.code, signal: close.signal };
+          exitObserved = close.exitObserved;
+          if (!close.closeObserved) {
+            cleanupFailure = `Pi RPC cleanup uncertain: child close was not observed within ${PI_EXECUTOR_TERMINAL_CLEANUP_MS}ms; the owned root or descendants may remain live.`;
+          }
+        }
+      }
+      if (shutdown.kind === "deadline") {
+        rpc.terminate();
+        const close = await rpc.waitForCloseBounded(PI_EXECUTOR_TERMINAL_CLEANUP_MS);
+        exit = { code: close.code, signal: close.signal };
+        exitObserved = close.exitObserved;
+        if (!close.closeObserved) {
+          cleanupFailure = `Pi RPC cleanup uncertain: child close was not observed within ${PI_EXECUTOR_TERMINAL_CLEANUP_MS}ms; the owned root or descendants may remain live.`;
+        }
+      }
     }
     if (!aborted && !interruptedByControl && !timedOut && (exit.signal || (exit.code !== null && exit.code !== 0))) {
       protocolFailure ??= `Pi executor process terminated unexpectedly (${exit.signal ?? exit.code}).`;
@@ -427,16 +576,50 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     // A live-browser settlement receipt must not mask failed terminal cleanup.
     protocolFailure ??= rpc.shutdownFailure;
     await removePiSettlementReceipt(settlementBootstrap).catch(() => undefined);
-    if (identity) await request.onProcessExit?.({ ...identity, code: exit.code, signal: exit.signal });
+    if (identity) {
+      lifecycleCompletion ??= (async () => {
+        try {
+          await lifecycleStart;
+        } catch {
+          // Exit publication remains ordered after a failed start callback.
+        }
+        if (exitObserved) await request.onProcessExit?.({ ...identity, code: exit.code, signal: exit.signal });
+      })();
+      void lifecycleCompletion.catch(() => undefined);
+      const lifecycleOutcome = await waitForPromiseBounded(lifecycleCompletion, PI_EXECUTOR_TERMINAL_CLEANUP_MS);
+      if (lifecycleOutcome.kind === "timeout") {
+        appendProtocolFailure(`Pi executor lifecycle callbacks did not settle within ${PI_EXECUTOR_TERMINAL_CLEANUP_MS}ms; process identity or exit persistence is unconfirmed.`);
+      } else if (lifecycleOutcome.kind === "rejected") {
+        appendProtocolFailure(`Pi executor lifecycle callback failed: ${messageOf(lifecycleOutcome.error)}`);
+      }
+      if (lifecycleStartError) {
+        appendProtocolFailure(`Pi executor lifecycle start callback failed: ${messageOf(lifecycleStartError)}`);
+      }
+    }
     const terminationFailure = rpc.terminationError
       ? `Pi RPC termination attempts failed before child close: ${rpc.terminationError}`
       : undefined;
-    const failureMessage = [protocolFailure, terminationFailure].filter(Boolean).join(" ") || undefined;
-    const output = rpc.output(failureMessage ? 1 : 0, timedOut, aborted || interruptedByControl);
+    if (protocolFailure || timedOut || aborted || interruptedByControl || rpc.terminationWasRequested) {
+      const residual = backgroundReadiness.snapshot().running;
+      if (residual.length > 0) {
+        cleanupFailure = [
+          cleanupFailure,
+          `Pi RPC cleanup uncertain: tracked background process groups are still live or unconfirmed after executor shutdown: ${residual.map((job) => `${job.id} (${job.label}, pid ${job.pid}, group ${job.processGroupId})`).join(", ")}.`,
+        ].filter(Boolean).join(" ");
+      }
+    }
+    const failureMessage = [protocolFailure, cleanupFailure, terminationFailure].filter(Boolean).join(" ") || undefined;
+    const processCleanupFailure = cleanupFailure
+      ?? (terminationFailure && /descendants may remain live|owned cleanup is uncertain/.test(terminationFailure)
+        ? terminationFailure
+        : undefined);
+    // Process artifacts retain the real direct-root exit status; the adapter's
+    // returned code separately represents a failed protocol/cleanup outcome.
+    const output = rpc.output(exit.code, timedOut, aborted || interruptedByControl);
     activity.finish();
     const streamed = extractor.finish();
     const extracted = streamed.text.trim() ? streamed : extractReviewTextFromPiJsonl(output.stdout);
-    const text = finalText.trim() || extracted.text;
+    const text = processCleanupFailure ? "" : finalText.trim() || extracted.text;
     const artifacts = await writeExecutorArtifacts({
       artifactDir: request.artifactDir,
       turn: request.turn,
@@ -455,8 +638,10 @@ export class PiExecutorAdapter implements ExecutorAdapter {
       timedOut: output.timedOut,
       aborted: output.aborted,
       lifecycle: extracted.lifecycle,
-      failure: protocolFailure
-        ? { category: "protocol", message: failureMessage! }
+      failure: processCleanupFailure
+        ? { category: "process", message: failureMessage! }
+        : protocolFailure
+          ? { category: "protocol", message: failureMessage! }
         : terminationFailure
           ? { category: "process", message: terminationFailure }
         : interruptedByControl
@@ -486,10 +671,13 @@ export class PiRpc {
   // transport as successful execution.
   private transportFailure?: Error;
   private exitStatus?: { code: number | null; signal: NodeJS.Signals | null };
+  private closeStatus?: { code: number | null; signal: NodeJS.Signals | null };
+  private closeCleanupUncertain = false;
   private forceKillTimer: NodeJS.Timeout | undefined;
   private terminationRequested = false;
   private terminationFailures = new Map<NodeJS.Signals, string>();
   private readonly exitPromise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  private readonly rootExitPromise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   private readonly stdout = new BoundedTextAccumulator(100 * MEBIBYTE);
   private readonly stderr = new BoundedTextAccumulator(16 * MEBIBYTE);
 
@@ -517,16 +705,31 @@ export class PiRpc {
     proc.stdin?.on("error", (error) => this.failTransport(error));
     proc.stdout?.on("error", (error) => this.failTransport(error));
     proc.stderr?.on("error", (error) => this.failTransport(error));
+    const rejectPending = (error: Error): void => {
+      for (const pending of this.pending.values()) pending.reject(error);
+      this.pending.clear();
+      for (const waiter of this.settledWaiters) waiter.reject(error);
+      this.settledWaiters = [];
+    };
+    this.rootExitPromise = new Promise((resolvePromise) => {
+      const observeRootExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+        this.exitStatus = { code, signal };
+        rejectPending(new Error(`Pi RPC root exited before protocol completion (${code ?? signal ?? "unknown"}).`));
+        resolvePromise({ code, signal });
+      };
+      if (typeof proc.exitCode === "number" || proc.signalCode !== null) {
+        observeRootExit(proc.exitCode, proc.signalCode);
+      } else {
+        proc.once("exit", observeRootExit);
+      }
+    });
     this.exitPromise = new Promise((resolvePromise) => {
       proc.once("close", (code, signal) => {
         if (this.forceKillTimer) clearTimeout(this.forceKillTimer);
         this.forceKillTimer = undefined;
-        this.exitStatus = { code, signal };
-        const error = new Error(`Pi RPC exited before protocol completion (${code ?? signal ?? "unknown"}).`);
-        for (const pending of this.pending.values()) pending.reject(error);
-        this.pending.clear();
-        for (const waiter of this.settledWaiters) waiter.reject(error);
-        this.settledWaiters = [];
+        this.closeStatus = { code, signal };
+        this.exitStatus ??= { code, signal };
+        rejectPending(new Error(`Pi RPC exited before protocol completion (${code ?? signal ?? "unknown"}).`));
         resolvePromise({ code, signal });
       });
       proc.once("error", (error) => this.failTransport(this.translateSpawnError ? this.translateSpawnError(error) : error));
@@ -549,6 +752,14 @@ export class PiRpc {
 
   request(type: string, fields: Record<string, unknown>, explicitId?: string): Promise<Record<string, unknown>> {
     const id = explicitId ?? `review-gate-${this.nextId++}`;
+    if (this.exitStatus && !this.proc.stdin?.writable) {
+      // Preserve the existing transport diagnostic when ownership publication
+      // completes after a normal close has already made stdin unwritable.
+      return Promise.reject(new Error("Pi RPC stdin is not writable."));
+    }
+    if (this.exitStatus) {
+      return Promise.reject(new Error(`Pi RPC root exited before protocol completion (${this.exitStatus.code ?? this.exitStatus.signal ?? "unknown"}).`));
+    }
     if (this.transportFailure) {
       // The transport is already broken; never write to it again.
       return Promise.reject(new Error(`Pi RPC transport failed: ${messageOf(this.transportFailure)}`));
@@ -582,6 +793,14 @@ export class PiRpc {
     return this.terminationFailures.size > 0 ? [...this.terminationFailures.values()].join("\n") : undefined;
   }
 
+  get closeCleanupUncertainStatus(): boolean {
+    return this.closeCleanupUncertain;
+  }
+
+  get terminationWasRequested(): boolean {
+    return this.terminationRequested;
+  }
+
   get settledGeneration(): number {
     return this.settledCount;
   }
@@ -598,14 +817,30 @@ export class PiRpc {
   }
 
   terminate(): void {
-    if (this.proc.exitCode !== null || this.proc.signalCode !== null || this.terminationRequested) return;
+    if (this.terminationRequested) return;
+    // Ordinary close already completed this lifecycle. Do not signal a
+    // potentially recycled group ID. Locally induced close is not evidence
+    // of cleanup and must retain the existing terminal signaling path.
+    if (this.closeStatus && !this.closeCleanupUncertain) return;
     this.terminationRequested = true;
-    this.recordTerminationFailure(terminateProcessTree(this.proc, "SIGTERM"));
+    const termination = new Error("Pi RPC process termination was requested.");
+    for (const pending of this.pending.values()) pending.reject(termination);
+    this.pending.clear();
+    for (const waiter of this.settledWaiters) waiter.reject(termination);
+    this.settledWaiters = [];
+    // On POSIX, the owned process group remains signalable after its leader
+    // exits. Windows deliberately refuses to taskkill a dead/reusable root PID.
+    const attemptTermination = (signal: NodeJS.Signals): void => {
+      try {
+        this.recordTerminationFailure(terminateProcessTree(this.proc, signal));
+      } catch (error) {
+        this.recordTerminationFailure(`${signal} termination failed (${messageOf(error)}); owned cleanup is uncertain`);
+      }
+    };
+    attemptTermination("SIGTERM");
     this.forceKillTimer = setTimeout(() => {
       this.forceKillTimer = undefined;
-      if (this.proc.exitCode === null && this.proc.signalCode === null) {
-        this.recordTerminationFailure(terminateProcessTree(this.proc, "SIGKILL"));
-      }
+      attemptTermination("SIGKILL");
     }, 2_000);
     this.forceKillTimer.unref?.();
   }
@@ -623,6 +858,49 @@ export class PiRpc {
 
   closed(): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
     return this.exitPromise;
+  }
+
+  rootExited(): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+    return this.rootExitPromise;
+  }
+
+  waitForCloseBounded(timeoutMs: number): Promise<BoundedProcessClose> {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) {
+      throw new RangeError("timeoutMs must be a non-negative safe integer");
+    }
+    if (this.closeStatus) {
+      return Promise.resolve({
+        ...this.closeStatus,
+        closeObserved: !this.closeCleanupUncertain,
+        exitObserved: true,
+      });
+    }
+    return new Promise((resolvePromise) => {
+      let settled = false;
+      const finish = (outcome: BoundedProcessClose): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolvePromise(outcome);
+      };
+      const timer = setTimeout(() => {
+        const status = this.exitStatus ?? (typeof this.proc.exitCode === "number" || this.proc.signalCode !== null
+          ? { code: this.proc.exitCode, signal: this.proc.signalCode }
+          : { code: null, signal: null });
+        this.closeCleanupUncertain = true;
+        // Record uncertainty before our own stream destruction can emit close.
+        finish({ ...status, closeObserved: false, exitObserved: this.exitStatus !== undefined });
+        this.proc.stdin?.destroy();
+        this.proc.stdout?.destroy();
+        this.proc.stderr?.destroy();
+        this.proc.unref();
+      }, timeoutMs);
+      void this.exitPromise.then((status) => finish({
+        ...status,
+        closeObserved: !this.closeCleanupUncertain,
+        exitObserved: true,
+      }));
+    });
   }
 
   output(code: number | null, timedOut: boolean, aborted: boolean): ProcessRunResult {
@@ -736,6 +1014,7 @@ async function compactInterruptedSession(input: {
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
       env: childEnv,
+      ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
     });
     const processIdentity = proc.pid === undefined
       ? undefined
@@ -747,14 +1026,16 @@ async function compactInterruptedSession(input: {
     let settled = false;
     let finishing = false;
     let completionError: Error | undefined;
+    let lifecycleCompletion: Promise<void> | undefined;
     let forceKillTimer: NodeJS.Timeout | undefined;
+    let cleanupDeadlineTimer: NodeJS.Timeout | undefined;
+    let rootExitStatus: { code: number | null; signal: NodeJS.Signals | null } | undefined;
     const terminationErrors: string[] = [];
     let phase: "state" | "compact" = "state";
 
     const stop = (signal: NodeJS.Signals) => {
-      // Preserve the existing POSIX escalation path after a signal-exited
-      // leader: descendants can still hold the group's stdio open.
-      if (proc.exitCode !== null) return;
+      // Preserve POSIX process-group signaling after leader exit. Windows
+      // cleanup fails closed rather than taskkilling a dead/reusable root PID.
       try {
         const failure = terminateProcessTree(proc, signal);
         if (failure) terminationErrors.push(failure);
@@ -771,24 +1052,77 @@ async function compactInterruptedSession(input: {
       stop("SIGTERM");
       forceKillTimer = setTimeout(() => stop("SIGKILL"), 2_000);
       forceKillTimer.unref?.();
+      cleanupDeadlineTimer = setTimeout(() => {
+        if (settled) return;
+        const status = rootExitStatus ?? (typeof proc.exitCode === "number" || proc.signalCode !== null
+          ? { code: proc.exitCode, signal: proc.signalCode }
+          : { code: null, signal: null });
+        const exitObserved = rootExitStatus !== undefined || typeof proc.exitCode === "number" || proc.signalCode !== null;
+        terminationErrors.push(
+          "cleanup uncertain: child close was not observed before the teardown deadline; the owned root or descendants may remain live",
+        );
+        // Settle as uncertain before local pipe destruction can emit close;
+        // releasing those endpoints does not prove descendant termination.
+        const cleanup = finishAfterClose(status.code, status.signal, exitObserved);
+        proc.stdin.destroy();
+        proc.stdout.destroy();
+        proc.stderr.destroy();
+        proc.unref();
+        void cleanup;
+      }, 2_000 + PROCESS_TREE_CLEANUP_GRACE_MS);
     };
-    const finishAfterClose = async (code: number | null, signal: NodeJS.Signals | null) => {
+    const finishAfterClose = async (
+      code: number | null,
+      signal: NodeJS.Signals | null,
+      exitObserved = true,
+    ) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
+      if (cleanupDeadlineTimer) clearTimeout(cleanupDeadlineTimer);
       input.signal?.removeEventListener("abort", onAbort);
       try {
-        await lifecycleStart?.catch(() => undefined);
-        if (lifecycleStartInvoked && processIdentity) await input.onProcessExit?.({ ...processIdentity, code, signal });
-        if (completionError || terminationErrors.length > 0) {
-          const detail = terminationErrors.length > 0
-            ? ` Termination attempts failed before child close: ${terminationErrors.join("; ")}`
+        lifecycleCompletion ??= (async () => {
+          let startError: unknown;
+          try {
+            await lifecycleStart;
+          } catch (error) {
+            startError = error instanceof Error ? error : new Error(messageOf(error));
+          }
+          if (exitObserved && lifecycleStartInvoked && processIdentity) {
+            await input.onProcessExit?.({ ...processIdentity, code, signal });
+          }
+          if (startError) throw startError;
+        })();
+        void lifecycleCompletion.catch(() => undefined);
+        const lifecycleOutcome = await waitForPromiseBounded(
+          lifecycleCompletion,
+          2_000 + PROCESS_TREE_CLEANUP_GRACE_MS,
+        );
+        const terminationDetail = terminationErrors.length > 0
+          ? ` Termination attempts failed before child close: ${terminationErrors.join("; ")}`
+          : "";
+        if (lifecycleOutcome.kind === "timeout") {
+          const completionDetail = completionError?.message ?? "Executor compaction cleanup failed.";
+          reject(new Error(
+            `${completionDetail} Lifecycle callbacks did not settle within ${2_000 + PROCESS_TREE_CLEANUP_GRACE_MS}ms; process identity or exit persistence is unconfirmed.${terminationDetail}`,
+          ));
+          return;
+        }
+        if (lifecycleOutcome.kind === "rejected") {
+          const completionDetail = completionError && messageOf(completionError) !== messageOf(lifecycleOutcome.error)
+            ? `${completionError.message} `
             : "";
+          reject(new Error(`${completionDetail}Lifecycle callback failed: ${messageOf(lifecycleOutcome.error)}${terminationDetail}`));
+          return;
+        }
+        if (completionError || terminationErrors.length > 0) {
+          const detail = terminationDetail;
           reject(new Error(`${completionError?.message ?? "Executor compaction cleanup failed."}${detail}`));
         } else resolve();
       } catch (lifecycleError) {
-        reject(lifecycleError);
+        reject(new Error(`Executor lifecycle callback failed: ${messageOf(lifecycleError)}`));
       }
     };
     const fail = (message: string) => requestFinish(new Error(`${message}${stderr.trim() ? ` Stderr: ${stderr.trim().slice(-2000)}` : ""}`));
@@ -796,9 +1130,11 @@ async function compactInterruptedSession(input: {
       if (!proc.stdin.writable) return fail("Executor RPC stdin closed during compaction recovery.");
       proc.stdin.write(`${JSON.stringify(value)}\n`);
     };
+    const deadline = Date.now() + input.timeoutMs;
     const timer = setTimeout(() => fail(`Executor compaction recovery timed out after ${input.timeoutMs}ms.`), input.timeoutMs);
     const onAbort = () => requestFinish(abortError(input.signal));
     input.signal?.addEventListener("abort", onAbort, { once: true });
+    if (input.signal?.aborted) onAbort();
 
     // Only the POSIX pass-through keeps the bare `pi` name; a missing default
     // Pi CLI there surfaces as an actionable diagnostic instead of raw ENOENT.
@@ -847,17 +1183,22 @@ async function compactInterruptedSession(input: {
         }
       }
     });
+    proc.once("exit", (code, signal) => { rootExitStatus = { code, signal }; });
     proc.on("close", (code, signal) => {
       if (!finishing) completionError = new Error(`Executor RPC exited with status ${code} during compaction recovery.`);
-      void finishAfterClose(code, signal);
+      void finishAfterClose(code, signal, rootExitStatus !== undefined);
     });
     lifecycleStart = (async () => {
       if (!processIdentity) throw new Error(`Could not determine pid for ${input.command}.`);
       lifecycleStartInvoked = true;
       await input.onProcessStart?.(processIdentity);
-      if (!settled) send({ id: "review-gate-state", type: "get_state" });
+      if (Date.now() >= deadline && !finishing) {
+        fail(`Executor compaction recovery timed out after ${input.timeoutMs}ms.`);
+        return;
+      }
+      if (!settled && !finishing) send({ id: "review-gate-state", type: "get_state" });
     })();
-    void lifecycleStart.catch((error) => requestFinish(error));
+    void lifecycleStart.catch((error) => requestFinish(error instanceof Error ? error : new Error(messageOf(error))));
   });
 }
 
@@ -875,11 +1216,22 @@ const backgroundCompletionPrompt = [
 
 async function waitForBackgroundProcesses(
   readiness: BackgroundProcessReadiness,
-  signal?: AbortSignal,
+  signal: AbortSignal | undefined,
+  rootExit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>,
+  shouldStop: () => boolean,
 ): Promise<void> {
+  const rootExitWait = rootExit.then((status) => ({ kind: "root-exit" as const, status }));
   while (readiness.snapshot().running.length > 0) {
     if (signal?.aborted) throw abortError(signal);
-    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 100));
+    if (shouldStop()) return;
+    const outcome = await Promise.race([
+      new Promise<{ kind: "poll" }>((resolvePromise) => setTimeout(() => resolvePromise({ kind: "poll" }), 100)),
+      rootExitWait,
+    ]);
+    if (outcome.kind === "root-exit") {
+      const { code, signal: exitSignal } = outcome.status;
+      throw new Error(`Pi RPC root exited while waiting for background process readiness (${code ?? exitSignal ?? "unknown"}).`);
+    }
   }
 }
 

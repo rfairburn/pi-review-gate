@@ -25,7 +25,7 @@ function operation() {
 test("operation ownership distinguishes live, released, and confirmed-dead writers", () => {
   const record = operation();
   acquireOperationOwner(record);
-  recordOperationChildProcess(record, process.pid, process.pid);
+  const lifecycle = recordOperationChildProcess(record, process.pid, process.pid);
   assert.equal(operationOwnershipStatus(record).status, "live");
   assert.equal(operationOwnershipStatus(record).processAlive, true);
 
@@ -51,13 +51,29 @@ test("operation ownership distinguishes live, released, and confirmed-dead write
     hostPid: 2_147_483_647,
     childPid: process.pid,
     childProcessGroupId: process.pid,
+    childLifecycleId: lifecycle.lifecycleId,
     childStartedAt: new Date().toISOString(),
     acquiredAt: new Date().toISOString(),
     heartbeatAt: new Date().toISOString(),
     status: "active",
   };
-  recordOperationChildExit(record);
+  assert.equal(recordOperationChildExit(record, lifecycle), true);
   assert.equal(operationOwnershipStatus(record).status, "dead", "an acknowledged child exit must not be confused with PID reuse");
+});
+
+test("late operation-child exit is fenced from a newer durable child identity", () => {
+  const record = operation();
+  acquireOperationOwner(record);
+  const first = recordOperationChildProcess(record, 31_001, 31_001);
+  const second = recordOperationChildProcess(record, 31_002, 31_002);
+
+  assert.equal(recordOperationChildExit(record, first), false);
+  assert.equal(record.owner?.childPid, second.pid);
+  assert.equal(record.owner?.childProcessGroupId, second.processGroupId);
+  assert.equal(record.owner?.childLifecycleId, second.lifecycleId);
+  assert.equal(record.owner?.childExitedAt, undefined);
+  assert.equal(recordOperationChildExit(record, second), true);
+  assert.ok(record.owner?.childExitedAt);
 });
 
 test("a cancelled operation with a verified checkpoint remains explicitly continuable", async () => {

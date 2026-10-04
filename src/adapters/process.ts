@@ -1,6 +1,6 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import type { ReviewerInvocationTelemetry, ReviewResult } from "../schema";
 import { BoundedJsonlDecoder, MEBIBYTE, utf8Prefix } from "../jsonl";
 import { DEFAULT_PI_COMMAND, resolvePiChildSpawn, translateDefaultPiSpawnError } from "../pi-invocation";
@@ -40,9 +40,97 @@ export interface ProcessLifecycleExit extends ProcessLifecycleStart {
   signal: NodeJS.Signals | null;
 }
 
+export interface BoundedProcessClose {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  closeObserved: boolean;
+  exitObserved: boolean;
+}
+
+/** Grace period after terminal signaling before stdio is closed fail-closed. */
+export const PROCESS_TREE_CLEANUP_GRACE_MS = 5_000;
+
+export type BoundedPromiseOutcome<T> =
+  | { kind: "fulfilled"; value: T }
+  | { kind: "rejected"; error: unknown }
+  | { kind: "timeout" };
+
+/** Observe a promise for a bounded interval without abandoning rejection ownership. */
+export function waitForPromiseBounded<T>(promise: Promise<T>, timeoutMs: number): Promise<BoundedPromiseOutcome<T>> {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) {
+    throw new RangeError("timeoutMs must be a non-negative safe integer");
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (outcome: BoundedPromiseOutcome<T>): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(outcome);
+    };
+    const timer = setTimeout(() => finish({ kind: "timeout" }), timeoutMs);
+    promise.then(
+      (value) => finish({ kind: "fulfilled", value }),
+      (error: unknown) => finish({ kind: "rejected", error }),
+    );
+  });
+}
+
 // Retained output is diagnostic evidence, not a protocol transport. Protocol
 // adapters parse incrementally and remain correct even if this limit is hit.
 export const MAX_RETAINED_OUTPUT_BYTES = 100 * MEBIBYTE;
+
+/**
+ * Wait for the child and all inherited stdio handles to close, but never let
+ * terminal cleanup wait indefinitely on a descendant that retained a pipe.
+ * On expiry only our local pipe handles are destroyed; this does not prove or
+ * claim that any process was terminated. The returned status is only what the
+ * direct root's exit or close event actually reported.
+ */
+export function waitForProcessCloseBounded(
+  proc: ChildProcess,
+  timeoutMs: number,
+  onUnobservedClose?: (outcome: BoundedProcessClose) => void,
+): Promise<BoundedProcessClose> {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) {
+    throw new RangeError("timeoutMs must be a non-negative safe integer");
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    let exitStatus: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+    if (typeof proc.exitCode === "number" || proc.signalCode !== null) {
+      exitStatus = { code: proc.exitCode, signal: proc.signalCode };
+    }
+    const finish = (outcome: BoundedProcessClose): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      proc.removeListener("exit", onExit);
+      proc.removeListener("close", onClose);
+      resolve(outcome);
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      exitStatus = { code, signal };
+    };
+    const onClose = (code: number | null, signal: NodeJS.Signals | null): void => {
+      finish({ code, signal, closeObserved: true, exitObserved: exitStatus !== undefined });
+    };
+    const timer = setTimeout(() => {
+      const status = exitStatus ?? { code: null, signal: null };
+      // Latch the unobserved outcome before destroying our local endpoints;
+      // the resulting close notifications are not child-close evidence.
+      const outcome = { ...status, closeObserved: false, exitObserved: exitStatus !== undefined };
+      onUnobservedClose?.(outcome);
+      finish(outcome);
+      proc.stdin?.destroy();
+      proc.stdout?.destroy();
+      proc.stderr?.destroy();
+      proc.unref();
+    }, timeoutMs);
+    proc.once("exit", onExit);
+    proc.once("close", onClose);
+  });
+}
 
 export function reviewerArtifactPaths(bundleDir: string): ReviewerArtifactPaths {
   return {
@@ -171,6 +259,8 @@ export async function runPromptProcess(input: {
   maxRetainedOutputBytes?: number;
   /** Internal/test override for deterministic SIGKILL escalation coverage. */
   terminationEscalationMs?: number;
+  /** Test-only cmd.exe fixture control; ordinary configured launches keep Node's default quoting. */
+  windowsVerbatimArguments?: boolean;
   /**
    * #204: alias-independent default `pi` resolution. This seam is shared by
    * non-Pi adapters (generic-cli, run-as-binary, claude-cli, codex-cli), whose
@@ -197,6 +287,7 @@ export async function runPromptProcess(input: {
     // sharing this seam keep their exact configured command/argv semantics.
     let file = input.command;
     let spawnArgs: string[] = [...input.args];
+    let windowsVerbatimArguments = input.windowsVerbatimArguments === true;
     if (input.resolveDefaultPi) {
       const invocation = resolvePiChildSpawn(input.command, input.args, childEnv);
       if (!invocation.ok) {
@@ -205,6 +296,7 @@ export async function runPromptProcess(input: {
       }
       file = invocation.file;
       spawnArgs = invocation.args;
+      windowsVerbatimArguments = invocation.windowsVerbatimArguments === true;
     }
     // Only the POSIX pass-through keeps the bare `pi` name; a missing default
     // Pi CLI there surfaces as an actionable diagnostic instead of raw ENOENT.
@@ -215,6 +307,7 @@ export async function runPromptProcess(input: {
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
       env: childEnv,
+      ...(windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
     });
 
     let stdout = "";
@@ -232,6 +325,8 @@ export async function runPromptProcess(input: {
     let stdinError: string | undefined;
     let terminationError: string | undefined;
     let forceKillTimer: NodeJS.Timeout | undefined;
+    let boundedCleanup: Promise<BoundedProcessClose> | undefined;
+    let cleanupCloseUnobserved = false;
     // #93: report delivery only when the stdin write actually flushed to the
     // transport pipe; an erroring child or pipe never reports delivery.
     let promptDeliveryReported = false;
@@ -249,21 +344,50 @@ export async function runPromptProcess(input: {
     let lifecycleStartInvoked = false;
     let lifecycleStartError: unknown;
     let lifecycleStart: Promise<void> | undefined;
+    let lifecycleCompletion: Promise<void> | undefined;
 
-    const finish = async (result: ProcessRunResult, code: number | null, signal: NodeJS.Signals | null) => {
+    const completeLifecycle = (
+      code: number | null,
+      signal: NodeJS.Signals | null,
+      exitObserved: boolean,
+    ): Promise<void> => {
+      lifecycleCompletion ??= (async () => {
+        try {
+          await lifecycleStart;
+        } catch {
+          // A failed start publication still precedes exit publication; the
+          // original start failure is reported after the ordered exit callback.
+        }
+        if (exitObserved && lifecycleStartInvoked && processIdentity) {
+          await input.onProcessExit?.({ ...processIdentity, code, signal });
+        }
+      })();
+      return lifecycleCompletion;
+    };
+
+    const finish = async (
+      result: ProcessRunResult,
+      code: number | null,
+      signal: NodeJS.Signals | null,
+      exitObserved = true,
+    ) => {
       if (settled) {
         return;
       }
       settled = true;
       clearTimeout(timer);
-      if (forceKillTimer) {
-        clearTimeout(forceKillTimer);
-      }
+      input.signal?.removeEventListener("abort", onAbort);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
       try {
-        await lifecycleStart?.catch(() => undefined);
-        if (lifecycleStartInvoked && processIdentity) {
-          await input.onProcessExit?.({ ...processIdentity, code, signal });
+        const lifecycle = completeLifecycle(code, signal, exitObserved);
+        const lifecycleOutcome = await waitForPromiseBounded(lifecycle, PROCESS_TREE_CLEANUP_GRACE_MS);
+        if (lifecycleOutcome.kind === "timeout") {
+          const cleanup = terminationError ? ` ${terminationError}` : "";
+          throw new Error(
+            `Process lifecycle callbacks did not settle within ${PROCESS_TREE_CLEANUP_GRACE_MS}ms; process identity or exit persistence is unconfirmed.${cleanup}`,
+          );
         }
+        if (lifecycleOutcome.kind === "rejected") throw lifecycleOutcome.error;
         if (lifecycleStartError) throw lifecycleStartError;
         resolve(result);
       } catch (error) {
@@ -287,13 +411,42 @@ export async function runPromptProcess(input: {
       };
       attemptTermination("SIGTERM");
       forceKillTimer = setTimeout(() => {
-        if (!settled) {
-          attemptTermination("SIGKILL");
-        }
+        if (!settled) attemptTermination("SIGKILL");
       }, terminationEscalationMs);
       forceKillTimer.unref?.();
+      boundedCleanup ??= waitForProcessCloseBounded(
+        proc,
+        terminationEscalationMs + PROCESS_TREE_CLEANUP_GRACE_MS,
+        (close) => {
+          if (close.closeObserved) return;
+          cleanupCloseUnobserved = true;
+          terminationError = joinDiagnostics(
+            terminationError,
+            "cleanup uncertain: the child close event was not observed before the teardown deadline; the owned root or descendants may remain live",
+          );
+        },
+      );
+      void boundedCleanup.then((close) => {
+        if (close.closeObserved || settled) return;
+        streamMetrics.finish();
+        void finish({
+          stdout,
+          stderr,
+          stdoutTruncated,
+          stderrTruncated,
+          stdoutBytes,
+          stderrBytes,
+          ...streamMetrics.snapshot(),
+          code: close.code,
+          timedOut,
+          aborted,
+          stdinError,
+          terminationError,
+        }, close.code, close.signal, close.exitObserved);
+      });
     };
 
+    const deadline = Date.now() + input.timeoutMs;
     const timer = setTimeout(() => {
       timedOut = true;
       terminate();
@@ -331,6 +484,7 @@ export async function runPromptProcess(input: {
       stderrTruncated = stderrTruncated || captured.truncated;
     });
     proc.on("close", (code, signal) => {
+      if (cleanupCloseUnobserved) return;
       input.signal?.removeEventListener("abort", onAbort);
       streamMetrics.finish();
       void finish({
@@ -346,7 +500,7 @@ export async function runPromptProcess(input: {
         aborted,
         stdinError,
         terminationError,
-      }, code, signal);
+      }, code, signal, true);
     });
     proc.stdin.on("error", (error: NodeJS.ErrnoException) => {
       // A child may exit or close stdin before a large prompt has been fully
@@ -360,13 +514,21 @@ export async function runPromptProcess(input: {
       lifecycleStartInvoked = true;
       await input.onProcessStart?.(processIdentity);
       if (settled) return;
+      if (Date.now() >= deadline && !timedOut) {
+        timedOut = true;
+        terminate();
+        return;
+      }
+      if (settled || timedOut || aborted || input.signal?.aborted) return;
       proc.stdin.end(input.prompt);
-      if (input.signal?.aborted) onAbort();
     })();
     void lifecycleStart.catch((error) => {
-      lifecycleStartError = error;
-      terminate();
+      lifecycleStartError = error instanceof Error
+        ? error
+        : new Error(`Process lifecycle start callback failed: ${String(error)}`);
+      if (!settled) terminate();
     });
+    if (input.signal?.aborted && !aborted) onAbort();
   });
 }
 
@@ -547,12 +709,43 @@ export function terminateProcessTree(proc: ChildProcess, signal: NodeJS.Signals)
       processGroupError = error;
     }
   }
+  if (process.platform === "win32") {
+    if (hasExited(proc)) {
+      return terminationFailure(
+        signal,
+        new Error("owned process root exited before taskkill /T; descendants may remain live"),
+        undefined,
+        true,
+      );
+    }
+    const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
+    if (!systemRoot || !isAbsolute(systemRoot)) {
+      return terminationFailure(signal, new Error("the Windows system root is unavailable for taskkill /T"));
+    }
+    const taskkill = join(systemRoot, "System32", "taskkill.exe");
+    try {
+      const result = spawnSync(taskkill, ["/PID", String(proc.pid), "/T", "/F"], {
+        shell: false,
+        windowsHide: true,
+        stdio: "ignore",
+        timeout: 3_000,
+      });
+      if (result.error) return terminationFailure(signal, result.error);
+      if (result.status !== 0) {
+        return terminationFailure(signal, new Error(`taskkill /T exited with status ${result.status ?? "unknown"}`));
+      }
+      return undefined;
+    } catch (error) {
+      return terminationFailure(signal, error);
+    }
+  }
   // A POSIX leader may have exited while descendants still hold its process
   // group's pipes open. Try the group signal first even in that state; only
-  // skip signaling the direct child once its exit is known. On Windows there
-  // is no group signal, so this guard avoids a redundant kill on a dead child.
+  // skip the POSIX direct-child fallback once its exit is known.
   if (hasExited(proc)) {
-    return processGroupError
+    // ESRCH proves that the owned group has no members at the moment of the
+    // signal attempt; other failures leave descendant cleanup unconfirmed.
+    return processGroupError && !hasErrnoCode(processGroupError, "ESRCH")
       ? terminationFailure(signal, processGroupError, undefined, true)
       : undefined;
   }
@@ -587,6 +780,11 @@ export function terminateProcessTree(proc: ChildProcess, signal: NodeJS.Signals)
 
 function hasExited(proc: ChildProcess): boolean {
   return proc.exitCode != null || proc.signalCode != null;
+}
+
+function hasErrnoCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error
+    && (error as { code?: unknown }).code === code;
 }
 
 function terminationFailure(signal: NodeJS.Signals, error: unknown, processGroupError?: unknown, leaderExited = false): string {

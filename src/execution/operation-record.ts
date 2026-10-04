@@ -115,9 +115,16 @@ export interface OperationOwnerLease {
   status: "active" | "released";
   childPid?: number;
   childProcessGroupId?: number;
+  childLifecycleId?: string;
   childStartedAt?: string;
   childExitedAt?: string;
   releasedAt?: string;
+}
+
+export interface OperationChildLifecycleIdentity {
+  pid: number;
+  processGroupId?: number;
+  lifecycleId: string;
 }
 
 export interface ReattachmentBundle {
@@ -231,21 +238,33 @@ export function acquireOperationOwner(record: OperationRecord): OperationOwnerLe
   return owner;
 }
 
-export function recordOperationChildProcess(record: OperationRecord, childPid: number, childProcessGroupId?: number): void {
+export function recordOperationChildProcess(
+  record: OperationRecord,
+  childPid: number,
+  childProcessGroupId?: number,
+): OperationChildLifecycleIdentity {
   if (!record.owner || record.owner.status !== "active") acquireOperationOwner(record);
   const now = new Date().toISOString();
+  const lifecycleId = randomUUID();
   record.owner!.childPid = childPid;
   record.owner!.childProcessGroupId = childProcessGroupId;
+  record.owner!.childLifecycleId = lifecycleId;
   record.owner!.childStartedAt = now;
   record.owner!.childExitedAt = undefined;
   record.owner!.heartbeatAt = now;
+  return { pid: childPid, processGroupId: childProcessGroupId, lifecycleId };
 }
 
-export function recordOperationChildExit(record: OperationRecord): void {
-  if (!record.owner) return;
+export function recordOperationChildExit(record: OperationRecord, identity: OperationChildLifecycleIdentity): boolean {
+  const owner = record.owner;
+  if (!owner
+    || owner.childPid !== identity.pid
+    || owner.childProcessGroupId !== identity.processGroupId
+    || owner.childLifecycleId !== identity.lifecycleId) return false;
   const now = new Date().toISOString();
-  record.owner.childExitedAt = now;
-  record.owner.heartbeatAt = now;
+  owner.childExitedAt = now;
+  owner.heartbeatAt = now;
+  return true;
 }
 
 export function touchOperationOwner(record: OperationRecord): void {

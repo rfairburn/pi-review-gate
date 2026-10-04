@@ -1,49 +1,46 @@
 import { resolve } from "node:path";
 
 /**
- * Shared alias-independent launch resolution for Pi child processes (issue #204).
+ * Shared alias-independent launch resolution for Pi child processes (issues #204 and #290).
  *
  * Shell aliases and functions never reach a Node child process: on Windows the
  * `pi` that an interactive PowerShell resolves may be an alias to the gate
  * wrapper, while the only PATH entry a spawned child can see is npm's `pi.cmd`
  * shim — which `spawn("pi", { shell: false })` cannot execute (ENOENT). This
- * module resolves the exact executable and argument prefix for every Pi child
- * launch (Pi reviewer, delegated Pi RPC executor, compaction recovery) without
- * a shell:
+ * module resolves an exact executable and spawn specification for every Pi
+ * child launch (Pi reviewer, delegated Pi RPC executor, compaction recovery),
+ * avoiding implicit shell mode:
  *
  * - A configured custom command keeps its exact spawn semantics on every
  *   platform; only the default `pi` name is alias-dependent.
  * - POSIX default `pi`: plain execvp of the PATH entry (aliases are a shell
  *   feature and cannot affect it).
- * - Windows default `pi`: the installed `pi.exe` directly, or npm's `pi.cmd`
- *   shim resolved to its JavaScript entry point and launched through this Node
- *   binary — reusing the launcher's fail-closed `resolvePiInvocation`
- *   (scripts/pi-review-gate-launcher.cjs), so no shell ever reparses user
- *   arguments and no alias or gate-wrapper recursion can occur.
+ * - Windows default `pi`: the installed `pi.exe` directly, or the full-path
+ *   `pi.cmd` through the launcher's authoritative spawn spec, using the
+ *   parent's validated absolute SystemRoot\System32\cmd.exe
+ *   (scripts/pi-review-gate-launcher.cjs). The shim stays opaque and uses
+ *   normal batch parsing; no alias or gate-wrapper recursion can occur.
  *
- * When the default Pi CLI is missing or its shim cannot be resolved, the
- * result fails closed with an actionable error instead of spawning a command
- * that cannot exist.
+ * When the default Pi CLI or trusted Windows command interpreter is
+ * unavailable, resolution fails closed with an actionable error instead of
+ * spawning a command that cannot exist.
  */
 
 export type PiChildSpawn =
-  | { ok: true; file: string; args: string[] }
-  | { ok: false; kind: "missing" | "unresolved" | "helper-unavailable"; shim?: string; error: string };
+  | { ok: true; file: string; args: string[]; windowsVerbatimArguments?: true }
+  | { ok: false; kind: "missing" | "cmd-unavailable" | "helper-unavailable"; error: string };
 
-/** The exact result shape of the launcher's resolvePiInvocation. */
-type LauncherPiInvocation =
-  | { kind: "path" }
-  | { kind: "direct"; file: string }
-  | { kind: "node"; file: string }
-  | { kind: "unresolved"; shim: string }
-  | { kind: "missing" };
-
-type LauncherResolver = (env: NodeJS.ProcessEnv, platform: string) => LauncherPiInvocation;
+type LauncherPiSpawnSpec = (
+  command: string,
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+  platform: string,
+) => PiChildSpawn;
 
 /** The default Pi CLI name; only this exact command is alias-dependent. */
 export const DEFAULT_PI_COMMAND = "pi";
 
-/** Actionable diagnostic for a missing or unresolvable default Pi CLI. */
+/** Actionable diagnostic for a missing default Pi CLI. */
 export function missingPiDiagnostic(): string {
   return "The default pi command was not found on PATH while launching a Pi child process; " +
     "install Pi (npm install -g @earendil-works/pi) or configure an explicit reviewer/executor command.";
@@ -67,17 +64,17 @@ export function translateDefaultPiSpawnError(error: unknown, isDefaultPiPassThro
   return error instanceof Error ? error : new Error(String(error));
 }
 
-let launcherResolver: LauncherResolver | undefined;
+let launcherResolver: LauncherPiSpawnSpec | undefined;
 
 /**
- * Lazily load the launcher's resolvePiInvocation. The path is computed at
+ * Lazily load the launcher's resolvePiChildSpawnSpec. The path is computed at
  * runtime so TypeScript does not type-check the CommonJS launcher; requiring
  * it executes only top-level definitions (its CLI entry point is guarded by
  * `require.main === module`). Both shipped layouts keep scripts/ beside the
  * compiled extension: <package>/dist/src + <package>/scripts and a source
  * checkout's dist(-test)/src + scripts.
  */
-function loadLauncherResolver(): LauncherResolver | undefined {
+function loadLauncherResolver(): LauncherPiSpawnSpec | undefined {
   if (launcherResolver) return launcherResolver;
   const launcherPath = resolve(__dirname, "../../scripts/pi-review-gate-launcher.cjs");
   let module: unknown;
@@ -86,18 +83,18 @@ function loadLauncherResolver(): LauncherResolver | undefined {
   } catch {
     return undefined;
   }
-  const candidate = isRecord(module) ? module.resolvePiInvocation : undefined;
+  const candidate = isRecord(module) ? module.resolvePiChildSpawnSpec : undefined;
   if (typeof candidate !== "function") return undefined;
-  launcherResolver = candidate.bind(module as object) as LauncherResolver;
+  launcherResolver = candidate.bind(module as object) as LauncherPiSpawnSpec;
   return launcherResolver;
 }
 
 /**
  * Resolve how to spawn a Pi child process with the given command and argv.
  * The returned `file`/`args` pair is spawned with `shell: false`; on Windows
- * the default `pi` resolves to the installed pi.exe or the npm shim's JS
- * entry through this Node binary, while custom commands and every POSIX spawn
- * stay exactly as configured.
+ * the default `pi` resolves to the installed pi.exe or a full-path pi.cmd
+ * command through the validated absolute SystemRoot\System32\cmd.exe,
+ * while custom commands and every POSIX spawn stay exactly as configured.
  */
 export function resolvePiChildSpawn(
   command: string,
@@ -110,8 +107,8 @@ export function resolvePiChildSpawn(
   if (command !== DEFAULT_PI_COMMAND || platform !== "win32") {
     return { ok: true, file: command, args: argv };
   }
-  const resolveInvocation = loadLauncherResolver();
-  if (!resolveInvocation) {
+  const resolveSpawnSpec = loadLauncherResolver();
+  if (!resolveSpawnSpec) {
     return {
       ok: false,
       kind: "helper-unavailable",
@@ -127,30 +124,11 @@ export function resolvePiChildSpawn(
   // missing on Windows.
   const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path");
   const resolverEnv = env.PATH === undefined && pathKey ? { ...env, PATH: env[pathKey] } : env;
-  const invocation = resolveInvocation(resolverEnv, platform);
-  switch (invocation.kind) {
-    case "direct":
-      return { ok: true, file: invocation.file, args: argv };
-    case "node":
-      // The shim's JavaScript entry runs through this Node binary; the
-      // original arguments follow byte-exact and are never reparsed.
-      return { ok: true, file: process.execPath, args: [invocation.file, ...argv] };
-    case "unresolved":
-      return {
-        ok: false,
-        kind: "unresolved",
-        shim: invocation.shim,
-        error:
-          `Could not resolve the pi entry point from the npm shim at ${invocation.shim} while launching a Pi child process; ` +
-          "reinstall Pi (npm install -g @earendil-works/pi) or configure an explicit reviewer/executor command.",
-      };
-    case "missing":
-      return { ok: false, kind: "missing", error: missingPiDiagnostic() };
-    default:
-      // "path" cannot occur for win32 from the launcher resolver; keep the
-      // plain PATH spawn rather than inventing a failure.
-      return { ok: true, file: command, args: argv };
+  const invocation = resolveSpawnSpec(command, argv, resolverEnv, platform);
+  if (!invocation.ok && invocation.kind === "missing") {
+    return { ...invocation, error: missingPiDiagnostic() };
   }
+  return invocation;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

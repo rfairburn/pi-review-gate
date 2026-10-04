@@ -3,6 +3,7 @@
 // /review-cancel), review window checkpointing and continuation, reviewer
 // session semantics, transmission disclosure, and operating-mode settings.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -14,6 +15,7 @@ import { SessionStateStore } from "../src/session-state";
 import { agentCatalog } from "./helpers";
 import {
   createSessionRuntime,
+  countingPassReviewerWithPromptDump,
   extractBundleDir,
   indexTestConfig,
   stableJsonForTest,
@@ -23,6 +25,52 @@ import {
   waitForCondition,
   waitForFile,
 } from "./entrypoint-harness";
+
+test("ordinary prompt in an initialized empty Git repository reaches normal review settlement", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-unborn-review-"));
+  const configPath = join(tmpdir(), `pi-review-gate-unborn-config-${process.pid}-${Date.now()}.json`);
+  const invocationPath = join(tmpdir(), `pi-review-gate-unborn-invocations-${process.pid}-${Date.now()}.txt`);
+  const promptPath = join(tmpdir(), `pi-review-gate-unborn-prompt-${process.pid}-${Date.now()}.txt`);
+  let session: ReturnType<typeof createSessionRuntime> | undefined;
+  try {
+    execFileSync("git", ["init", "-q"], { cwd: dir });
+    const headBefore = await readFile(join(dir, ".git", "HEAD"));
+    const branchRefsBefore = execFileSync("git", ["for-each-ref", "--format=%(refname)", "refs/heads"], { cwd: dir, encoding: "utf8" });
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      externalAgents: {
+        "unborn-pass": countingPassReviewerWithPromptDump("unborn-pass", invocationPath, promptPath),
+      },
+      review: { activeReviewers: [{ source: "external", id: "unborn-pass" }] },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    session = createSessionRuntime("unborn-review-session", join(dir, "session.jsonl"), dir);
+    await activate(session.pi);
+    await trigger(session.hooks, "session_start", { type: "session_start", reason: "startup" }, session.ctx);
+    await trigger(session.hooks, "input", { cwd: dir, text: "create the first file", source: "user" }, session.ctx);
+    await trigger(session.hooks, "before_agent_start", { cwd: dir }, session.ctx);
+    await writeFile(join(dir, "first.txt"), "review this new file\n", "utf8");
+    await triggerAgentEnd(session.hooks, {
+      cwd: dir,
+      messages: [{ role: "assistant", content: "created the first file" }],
+    });
+
+    assert.equal(await readFile(invocationPath, "utf8"), "1", "the ordinary reviewer ran exactly once");
+    assert.match(await readFile(promptPath, "utf8"), /\+review this new file/);
+    assert.match(session.notices.join("\n"), /review gate: passed/);
+    assert.deepEqual(await readFile(join(dir, ".git", "HEAD")), headBefore, "arming and review do not create the user's first commit");
+    assert.equal(execFileSync("git", ["for-each-ref", "--format=%(refname)", "refs/heads"], { cwd: dir, encoding: "utf8" }), branchRefsBefore);
+  } finally {
+    if (session) await trigger(session.hooks, "session_shutdown", { type: "session_shutdown", reason: "test" }, session.ctx);
+    await rm(dir, { recursive: true, force: true });
+    await rm(configPath, { force: true });
+    await rm(invocationPath, { force: true });
+    await rm(promptPath, { force: true });
+  }
+});
+
 test("cap status is concise while reviewer results are delivered once in the transmission", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-cap-"));
 

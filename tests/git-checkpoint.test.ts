@@ -27,6 +27,7 @@ import {
   type GitCheckpointDescriptor,
   type GitCheckpointReleaseOptions,
 } from "../src/git-checkpoint";
+import { compareReviewCheckpoints } from "../src/review-checkpoint";
 
 const execFileAsync = promisify(execFile);
 
@@ -226,6 +227,21 @@ test("native Windows Git checkpoint arms and reloads despite directory fsync EPE
   if (arm.status !== "ok") return;
   const loaded = await loadGitCheckpoint(repo, arm.value.descriptor);
   assert.equal(loaded.status, "ok", loaded.status !== "ok" ? loaded.detail : "");
+});
+
+test("native Windows Git checkpoint arms, loads, and releases in unborn repositories", { skip: process.platform !== "win32" }, async () => {
+  const repo = await mkTmp();
+  await git(repo, "init", "-q");
+  const arm = await armGitCheckpoint(repo, "windows-unborn-empty");
+  assert.equal(arm.status, "ok", arm.status !== "ok" ? arm.detail : "");
+  if (arm.status !== "ok") return;
+  assert.equal((await loadGitCheckpoint(repo, arm.value.descriptor)).status, "ok");
+  const released = await releaseGitCheckpointPin(repo, arm.value.descriptor.windowId, {
+    expectedBase: arm.value.descriptor.base,
+    armId: arm.value.descriptor.armId,
+  });
+  assert.equal(released.status, "ok", JSON.stringify(released));
+  assert.equal((await loadGitCheckpoint(repo, arm.value.descriptor)).status, "failed");
 });
 
 test("native Windows Git checkpoint arms and reloads after a new untracked file", { skip: process.platform !== "win32" }, async () => {
@@ -993,6 +1009,156 @@ test("unsafe window ids are rejected", async () => {
   }
 });
 
+test("empty unborn repository arms a durable parentless baseline without initializing the branch or index", async () => {
+  const repo = await mkTmp();
+  await git(repo, "init", "-q");
+  const headBefore = await readFile(join(repo, ".git", "HEAD"));
+  const branchesBefore = await gitTolerant(repo, "show-ref", "--heads");
+  await assert.rejects(readFile(indexPath(repo)), { code: "ENOENT" });
+
+  const arm = await armGitCheckpoint(repo, "unborn-empty");
+  assert.equal(arm.status, "ok", JSON.stringify(arm));
+  if (arm.status !== "ok") return;
+  assert.deepEqual(await readFile(join(repo, ".git", "HEAD")), headBefore);
+  assert.deepEqual(await gitTolerant(repo, "show-ref", "--heads"), branchesBefore);
+  await assert.rejects(readFile(indexPath(repo)), { code: "ENOENT" });
+  assert.equal(arm.value.record.stagedPatchB64, "");
+  assert.equal(arm.value.record.unstagedPatchB64, "");
+  assert.deepEqual(arm.value.record.untracked, []);
+  assert.equal(arm.value.record.base.length, 40);
+  const baseTree = (await git(repo, "rev-parse", `${arm.value.record.base}^{tree}`)).trim();
+  assert.equal(await git(repo, "ls-tree", baseTree), "", "synthetic baseline tree is empty");
+  const commit = await git(repo, "cat-file", "-p", arm.value.record.base);
+  assert.doesNotMatch(commit, /^parent /m, "synthetic base is parentless");
+  assert.match(commit, /^author pi-review-gate <checkpoint@pi-review-gate\.invalid> 0 \+0000$/m);
+  assert.match(commit, /^committer pi-review-gate <checkpoint@pi-review-gate\.invalid> 0 \+0000$/m);
+  assert.equal((await loadGitCheckpoint(repo, arm.value.descriptor)).status, "ok");
+
+  await git(repo, "gc", "--prune=now", "-q");
+  assert.equal((await loadGitCheckpoint(repo, arm.value.descriptor)).status, "ok", "owned ref keeps the synthetic commit reachable through GC");
+  assert.deepEqual(await readFile(join(repo, ".git", "HEAD")), headBefore);
+  const released = await releaseGitCheckpointPin(repo, arm.value.descriptor.windowId, {
+    expectedBase: arm.value.descriptor.base,
+    armId: arm.value.descriptor.armId,
+  });
+  assert.equal(released.status, "ok", JSON.stringify(released));
+  assert.equal((await loadGitCheckpoint(repo, arm.value.descriptor)).status, "failed");
+  assert.deepEqual(await gitTolerant(repo, "show-ref", "--heads"), branchesBefore);
+});
+
+test("unborn synthetic baselines preserve SHA-256 repositories when supported", async (t) => {
+  const repo = await mkTmp();
+  const initialized = await gitTolerant(repo, "init", "-q", "--object-format=sha256");
+  if (initialized.code !== 0) {
+    t.skip("this Git build does not support SHA-256 repositories");
+    return;
+  }
+  const arm = await armGitCheckpoint(repo, "unborn-sha256");
+  assert.equal(arm.status, "ok", JSON.stringify(arm));
+  if (arm.status !== "ok") return;
+  assert.equal(arm.value.record.objectFormat, "sha256");
+  assert.equal(arm.value.record.base.length, 64);
+  assert.equal((await loadGitCheckpoint(repo, arm.value.descriptor)).status, "ok");
+  const released = await releaseGitCheckpointPin(repo, arm.value.descriptor.windowId, {
+    expectedBase: arm.value.descriptor.base,
+    armId: arm.value.descriptor.armId,
+  });
+  assert.equal(released.status, "ok", JSON.stringify(released));
+});
+
+test("unborn staged, unstaged, and untracked state survives reload, first commit, compare, restore, and release", async () => {
+  const repo = await mkTmp();
+  await git(repo, "init", "-q");
+  const trackedPath = join(repo, "tracked.txt");
+  const untrackedPath = join(repo, "untracked.txt");
+  await writeFile(trackedPath, "staged baseline\n");
+  await git(repo, "add", "tracked.txt");
+  await writeFile(trackedPath, "worktree baseline\n");
+  await writeFile(untrackedPath, "untracked baseline\n");
+  const headBefore = await readFile(join(repo, ".git", "HEAD"));
+  const indexBefore = await readFile(indexPath(repo));
+  const branchesBefore = await gitTolerant(repo, "show-ref", "--heads");
+
+  const armed = await armGitCheckpoint(repo, "unborn-populated");
+  assert.equal(armed.status, "ok", JSON.stringify(armed));
+  if (armed.status !== "ok") return;
+  const { record, descriptor, encoded } = armed.value;
+  assert.equal(record.base.length, 40);
+  assert.ok(Buffer.from(record.stagedPatchB64, "base64").length > 0);
+  assert.ok(Buffer.from(record.unstagedPatchB64, "base64").length > 0);
+  assert.deepEqual(record.untracked.map((entry) => entry.path), ["untracked.txt"]);
+  assert.equal(Buffer.from(record.untracked[0]!.contentB64!, "base64").toString(), "untracked baseline\n");
+  assert.deepEqual(await readFile(join(repo, ".git", "HEAD")), headBefore);
+  assert.deepEqual(await readFile(indexPath(repo)), indexBefore);
+  assert.deepEqual(await gitTolerant(repo, "show-ref", "--heads"), branchesBefore);
+  assert.equal((await loadGitCheckpoint(repo, descriptor)).status, "ok");
+
+  await git(repo, "gc", "--prune=now", "-q");
+  assert.equal((await loadGitCheckpoint(repo, descriptor)).status, "ok");
+
+  // The user's first commit advances their own branch. The synthetic base is
+  // still a normal pinned commit, so the ordinary frozen compare remains valid.
+  await git(repo, "add", "-A");
+  await git(repo, "commit", "-q", "-m", "first user commit");
+  const firstUserCommit = (await git(repo, "rev-parse", "HEAD")).trim();
+  await writeFile(trackedPath, "after first commit\n");
+  const after = await armGitCheckpoint(repo, "unborn-after-first-commit");
+  assert.equal(after.status, "ok", JSON.stringify(after));
+  if (after.status !== "ok") return;
+  const comparison = await compareGitCheckpoints(repo, descriptor, after.value.descriptor, {}, true);
+  assert.equal(comparison.status, "ok", JSON.stringify(comparison));
+  if (comparison.status === "ok") {
+    assert.deepEqual(comparison.value.trackedChanges.map((change) => change.path), ["tracked.txt", "untracked.txt"]);
+    assert.equal(comparison.value.trackedChanges[0]?.oldBytes?.toString(), "worktree baseline\n");
+    assert.equal(comparison.value.trackedChanges[0]?.newBytes?.toString(), "after first commit\n");
+    assert.deepEqual(comparison.value.untrackedRemoved, ["untracked.txt"], "the low-level comparison reports the file's trackedness transition");
+  }
+  const reviewComparison = await compareReviewCheckpoints(repo,
+    { kind: "git", checkpoint: descriptor },
+    { kind: "git", checkpoint: after.value.descriptor });
+  assert.equal(reviewComparison.status, "ok", JSON.stringify(reviewComparison));
+  if (reviewComparison.status === "ok") {
+    assert.deepEqual(reviewComparison.value.changes.map((change) => change.path), ["tracked.txt"], "review compares net worktree state across the first commit");
+  }
+
+  await writeFile(trackedPath, "restore drift\n");
+  const restored = await restoreGitCheckpoint(repo, encoded);
+  assert.equal(restored.status, "ok", JSON.stringify(restored));
+  assert.equal((await git(repo, "rev-parse", "HEAD")).trim(), firstUserCommit, "restore never moves the user's branch");
+  assert.deepEqual(await readFile(join(repo, ".git", "HEAD")), headBefore);
+  assert.equal(await readFile(trackedPath, "utf8"), "worktree baseline\n");
+  assert.equal((await git(repo, "show", ":tracked.txt")).toString(), "staged baseline\n");
+  assert.equal(await readFile(untrackedPath, "utf8"), "untracked baseline\n");
+  assert.deepEqual((await git(repo, "ls-files")).trim().split("\n"), ["tracked.txt"]);
+
+  for (const checkpoint of [descriptor, after.value.descriptor]) {
+    const released = await releaseGitCheckpointPin(repo, checkpoint.windowId, {
+      expectedBase: checkpoint.base,
+      armId: checkpoint.armId,
+    });
+    assert.equal(released.status, "ok", JSON.stringify(released));
+    assert.equal((await loadGitCheckpoint(repo, checkpoint)).status, "failed");
+  }
+  assert.equal((await git(repo, "rev-parse", "HEAD")).trim(), firstUserCommit);
+});
+
+test("corrupt or unsafe symbolic HEAD is not classified as an unborn repository", async () => {
+  const repo = await mkTmp();
+  await git(repo, "init", "-q");
+  await writeFile(join(repo, "staged.txt"), "keep staged content\n");
+  await git(repo, "add", "staged.txt");
+  const indexBefore = await readFile(indexPath(repo));
+  const corruptHead = Buffer.from("ref: refs/heads/../unsafe\n");
+  await writeFile(join(repo, ".git", "HEAD"), corruptHead);
+
+  const result = await armGitCheckpoint(repo, "unborn-corrupt-head");
+  assert.equal(result.status, "failed", JSON.stringify(result));
+  if (result.status === "failed") assert.equal(result.reason, "git_failed");
+  assert.deepEqual(await readFile(join(repo, ".git", "HEAD")), corruptHead);
+  assert.deepEqual(await readFile(indexPath(repo)), indexBefore);
+  assert.notEqual((await gitTolerant(repo, "rev-parse", "--verify", "--quiet", checkpointRefForWindow("unborn-corrupt-head"))).code, 0);
+});
+
 test("fail-closed gates refuse unsafe repository states", async () => {
   // not_a_git_repository: a plain directory.
   const plain = await mkTmp();
@@ -1009,13 +1175,6 @@ test("fail-closed gates refuse unsafe repository states", async () => {
   const sub = await armGitCheckpoint(join(repo, "sub"), "w2");
   assert.equal(sub.status, "unsupported");
   if (sub.status === "unsupported") assert.equal(sub.reason, "not_repository_root");
-
-  // unborn_head: initialized but no commits.
-  const unborn = await mkTmp();
-  await git(unborn, "init", "-q");
-  const unbornResult = await armGitCheckpoint(unborn, "w3");
-  assert.equal(unbornResult.status, "unsupported");
-  if (unbornResult.status === "unsupported") assert.equal(unbornResult.reason, "unborn_head");
 
   // diff_program_configured: a diff driver with an external command.
   const diffRepo = await initRepo();

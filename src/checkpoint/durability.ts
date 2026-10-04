@@ -7,7 +7,7 @@
 
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
-import { open, rename, rm } from "node:fs/promises";
+import { lstat, open, rename, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { GitCheckpointError, messageOf } from "./errors";
@@ -44,7 +44,7 @@ export async function publishRecordDurable(scratchDir: string, encoded: string):
 
 /** fsync a directory so a rename into it is durable where supported. */
 async function syncDirectory(dir: string): Promise<void> {
-  const dirHandle = await open(dir, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0));
+  const dirHandle = await open(dir, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0));
   try {
     try {
       await dirHandle.sync();
@@ -56,6 +56,54 @@ async function syncDirectory(dir: string): Promise<void> {
   } finally {
     await dirHandle.close().catch(() => undefined);
   }
+}
+
+/**
+ * Flush a loose Git object created for a synthetic checkpoint baseline.
+ * Git's ordinary loose-object write is atomic, but an arm must not publish a
+ * pin to a newly-created synthetic commit until the object bytes and their
+ * directory entries have been synced. On Windows, Git's write-time fsync is
+ * used instead of flushing a read-only handle; the caller must first verify
+ * that its Git version supports the forced core.fsync settings. A missing
+ * loose object is allowed for a shared tree object already available from a
+ * pack/alternate; a synthetic commit is unique per arm and must be loose here.
+ */
+export async function syncLooseGitObject(objectsDir: string, oid: string, required: boolean, fileSyncByGit = false): Promise<boolean> {
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(oid)) throw new Error("invalid Git object id for durability sync");
+  const shard = join(objectsDir, oid.slice(0, 2));
+  const objectPath = join(shard, oid.slice(2));
+  let before;
+  try {
+    before = await lstat(objectPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      if (required) throw new Error("new synthetic checkpoint commit is missing from loose object storage");
+      return false;
+    }
+    throw error;
+  }
+  if (!before.isFile() || before.isSymbolicLink()) throw new Error("Git loose object is not a regular file");
+
+  const handle = await open(objectPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = await handle.stat();
+    // On Windows, path lstat can report dev=0 while fstat identifies the
+    // volume. Normalize only that path-stat zero; all other identity fields
+    // and nonzero device comparisons remain strict.
+    const openedDev = process.platform === "win32" && before.dev === 0 ? before.dev : opened.dev;
+    if (!opened.isFile() || openedDev !== before.dev || opened.ino !== before.ino || opened.size !== before.size) {
+      throw new Error("Git loose object changed while syncing its durability");
+    }
+    if (!fileSyncByGit) await handle.sync();
+  } finally {
+    await handle.close();
+  }
+
+  // The object bytes must reach stable storage before its pathname and any
+  // newly-created two-hex shard become durable.
+  await syncDirectory(shard);
+  await syncDirectory(objectsDir);
+  return true;
 }
 
 /**

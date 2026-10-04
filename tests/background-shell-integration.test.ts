@@ -23,6 +23,8 @@ import { toolCallFingerprint } from "../src/tool-call-fingerprint";
 
 interface Sent {
   content: string;
+  customType?: string;
+  display?: boolean;
   delivery: any;
 }
 
@@ -46,6 +48,15 @@ function wire(options: {
 }
 
 const textOf = (r: any) => r.content[0].text as string;
+
+/** Fire the observed-injection event exactly as Pi emits it when an injected
+ *  custom wake message enters the transcript (role "custom", customType
+ *  "pi-review-bg-shell", details.id = job id, details.kind = event kind).
+ *  A run that drains its follow-up queue before ending always produces this
+ *  event; an aborted run does not. */
+const injectionEvent = (jobId: string, kind = "exit") => ({
+  message: { role: "custom", customType: "pi-review-bg-shell", content: "x", display: true, details: { id: jobId, kind } },
+});
 
 /** Poll until `fn()` is true or the deadline passes. `fn` may be async — the
  *  tools all return promises, and treating one as a value silently reads
@@ -535,7 +546,7 @@ describe("wake coalescing", () => {
   it("a failed exit supersedes nonurgent matches that fired while the agent was busy", async () => {
     const { sent, call, handlers } = wire();
     handlers.agent_start?.(); // the agent stays busy for the whole window
-    await call("ShellStart", {
+    const started = await call("ShellStart", {
       command:
         "echo checkpoint one; sleep 1.7; echo checkpoint two; sleep 1.7; " +
         "echo checkpoint three; sleep 0.6; exit 7",
@@ -546,6 +557,9 @@ describe("wake coalescing", () => {
     // busy, so each one lands in the internal hold instead of Pi's queue.
     expect(await until(() => sent.length === 1 && sent[0].content.includes("exited 7"), 8000)).toBe(true);
     expect(sent[0].delivery).toEqual({ deliverAs: "steer", triggerTurn: true });
+    // The run drains its follow-up queue before settling (natural end): the
+    // exit wake's injection is observed, so settlement re-sends nothing.
+    handlers.message_start?.(injectionEvent(textOf(started).match(/as (job\d+)/)![1]!));
     // Settlement must not resurrect the stale matches.
     handlers.agent_settled?.();
     expect(sent.length).toBe(1);
@@ -557,7 +571,7 @@ describe("wake coalescing", () => {
   it("sends a clean exit before settlement so Pi can drain its continuation first", async () => {
     const { sent, call, handlers } = wire();
     handlers.agent_start?.();
-    await call("ShellStart", {
+    const started = await call("ShellStart", {
       command: "echo complete; exit 0",
       label: "clean-exit-before-settlement",
     });
@@ -568,7 +582,9 @@ describe("wake coalescing", () => {
 
     // The exit was queued while Pi was still processing the active run. It is
     // not held until agent_settled, where triggerTurn would start a competing
-    // turn alongside the gate's automatic review.
+    // turn alongside the gate's automatic review. The run drains it before
+    // settling (injection observed), so settlement adds nothing.
+    handlers.message_start?.(injectionEvent(textOf(started).match(/as (job\d+)/)![1]!));
     handlers.agent_settled?.();
     expect(sent.length).toBe(1);
   });
@@ -614,6 +630,214 @@ describe("wake coalescing", () => {
     expect(sent[0].delivery).toEqual({ deliverAs: "steer", triggerTurn: true });
     handlers.agent_settled?.(); // the older routine wake must not follow it
     expect(sent.length).toBe(1);
+  });
+});
+
+// #281: ShellStart promises "You will be notified automatically; do not poll".
+// These tests model an exit wake queued into an active run that settles without
+// draining its follow-up queue (including the aborted-run path). They do not
+// establish that this was the cause of the original report. pi.sendMessage
+// returns void on the real extension API, so delivery is proven by observation:
+// the injected custom message fires message_start with customType
+// "pi-review-bg-shell", details.id = job id, and details.kind = event kind.
+// Each exit wake stays outstanding until its own injection is observed
+// (kind === "exit" — an earlier urgent match from the same job never
+// acknowledges it). One bounded hidden recovery turn resumes Pi's drainage of
+// the retained completion; routine status wakes remain best-effort.
+describe("exit-wake delivery failure (#281)", () => {
+  /** Like wire(), but the host's sendMessage behaviour is caller-supplied.
+   *  Models the real extension API: void return, no delivery promise. */
+  function wireHost(sendMessage: (msg: any, delivery: any) => unknown) {
+    const sent: Sent[] = [];
+    const tools: Record<string, any> = {};
+    const handlers: Record<string, any> = {};
+    const pi: any = {
+      registerTool: (t: any) => { tools[t.name] = t; },
+      on: (n: string, h: any) => { handlers[n] = h; },
+      sendMessage: (msg: any, delivery: any) => {
+        const result = sendMessage(msg, delivery);
+        sent.push({ content: msg.content, customType: msg.customType, display: msg.display, delivery });
+        return result;
+      },
+    };
+    const controller = registerBackgroundShell(pi);
+    const ctx = { hasUI: false, ui: {} };
+    const call = (name: string, params: any, toolCallId = "id") =>
+      tools[name].execute(toolCallId, params, undefined, undefined, ctx);
+    return { sent, handlers, call, controller };
+  }
+
+  it("does not retry a canceled recovery turn for the same unobserved exit", async () => {
+    const { sent, handlers, call } = wireHost(() => undefined);
+    handlers.agent_start?.(); // a run is active; the exit wake will be queued
+    await call("ShellStart", { command: "echo done; exit 0", label: "aborted-loss" });
+    expect(await until(() => sent.length === 1)).toBe(true);
+    expect(sent[0].content).toContain("exited 0");
+    // The run settles WITHOUT draining its follow-up queue (aborted): no
+    // message_start for the wake. Pi retains the queued completion, so
+    // settlement must resume its drainage — with a distinct hidden control
+    // message, never a second copy of the completion payload.
+    handlers.agent_settled?.();
+    expect(sent.length).toBe(2);
+    expect(sent[1].customType).toBe("pi-review-bg-shell-resume");
+    expect(sent[1].display).toBe(false);
+    expect(String(sent[1].content)).toContain("Resume pending background-shell notifications.");
+    expect(sent[1].content).not.toBe(sent[0].content); // no second completion copy
+    expect(sent[1].delivery).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    // Model the one recovery turn being canceled before message_start
+    // acknowledges the retained exit: its settlement must not self-restart.
+    // The marker was consumed before the bounded control send.
+    handlers.agent_start?.();
+    handlers.agent_settled?.();
+    expect(sent.length).toBe(2);
+    expect(sent.filter((message) => message.customType === "pi-review-bg-shell-resume").length).toBe(1);
+  });
+
+  it("uses one bounded recovery trigger for every outstanding job at a settlement", async () => {
+    const { sent, handlers, call } = wireHost(() => undefined);
+    handlers.agent_start?.();
+    await call("ShellStart", { command: "echo a; exit 0", label: "resume-one" });
+    await call("ShellStart", { command: "echo b; exit 1", label: "resume-two" });
+    expect(await until(() => sent.length === 2)).toBe(true);
+    // Both completions are queued and unobserved when the run settles;
+    // one recovery trigger services all of them — never one per job.
+    handlers.agent_settled?.();
+    expect(sent.length).toBe(3);
+    expect(sent[2].customType).toBe("pi-review-bg-shell-resume");
+  });
+
+  it("does not acknowledge a queued exit when an earlier urgent match is injected", async () => {
+    const { sent, handlers, call } = wireHost(() => undefined);
+    handlers.agent_start?.();
+    const started = await call("ShellStart", {
+      command: "echo fatal; sleep 2.5; exit 0",
+      label: "match-before-exit",
+      wake_on: { exit: true, match: ["fatal"] },
+    });
+    const id = textOf(started).match(/as (job\d+)/)![1]!;
+    expect(await until(() => sent.length === 2, 8000)).toBe(true);
+    expect(sent[0].delivery).toEqual({ deliverAs: "steer", triggerTurn: true });
+    expect(sent[1].delivery).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    handlers.message_start?.(injectionEvent(id, "match"));
+    // Abort before the exit follow-up is injected.
+    handlers.agent_settled?.();
+    expect(sent.length).toBe(3);
+    expect(sent[2].customType).toBe("pi-review-bg-shell-resume");
+  });
+
+  it("does not re-send an exit wake whose injection was observed", async () => {
+    const { sent, handlers, call } = wireHost(() => undefined);
+    handlers.agent_start?.();
+    const started = await call("ShellStart", { command: "echo done; exit 0", label: "observed-drain" });
+    const id = textOf(started).match(/as (job\d+)/)![1]!;
+    expect(await until(() => sent.length === 1)).toBe(true);
+    // The run drains its follow-up queue before ending: Pi injects the custom
+    // message and emits it — delivery observed, marker cleared.
+    handlers.message_start?.(injectionEvent(id));
+    handlers.agent_settled?.();
+    expect(sent.length).toBe(1); // no duplicate wake
+  });
+
+  it("resumes an unobserved exit wake sent while idle at the next settlement", async () => {
+    const { sent, handlers, call } = wireHost(() => undefined);
+    // No agent_start: the session is idle; the wake takes the triggerTurn path
+    // and starts a run. If that run ends without the injection being observed
+    // (a host-internal failure), settlement still triggers one bounded
+    // recovery — again a distinct control message, not a second completion.
+    await call("ShellStart", { command: "echo done; exit 0", label: "idle-loss" });
+    expect(await until(() => sent.length === 1)).toBe(true);
+    handlers.agent_start?.();
+    handlers.agent_settled?.();
+    expect(sent.length).toBe(2);
+    expect(sent[1].customType).toBe("pi-review-bg-shell-resume");
+    expect(sent[1].content).not.toBe(sent[0].content);
+  });
+
+  it("does not track or re-send routine match wakes", async () => {
+    const { sent, handlers, call } = wireHost(() => undefined);
+    handlers.agent_start?.();
+    await call("ShellStart", {
+      command: "echo boom; sleep 30",
+      label: "match-only",
+      wake_on: { exit: false, match: ["boom"] },
+    });
+    expect(await until(() => sent.length === 1)).toBe(true);
+    expect(sent[0].content).toContain("matched");
+    // Losing a routine status wake is survivable by design — never re-sent.
+    handlers.agent_settled?.();
+    handlers.agent_start?.();
+    handlers.agent_settled?.();
+    expect(sent.length).toBe(1);
+  });
+
+  it("reports a synchronously refused exit delivery as unscheduled and never re-sends it", async () => {
+    let attempts = 0;
+    const { sent, handlers, call, controller } = wireHost(() => {
+      attempts += 1;
+      throw new Error("no such delivery mode");
+    });
+    const settled: Array<{ exitWakeScheduled: boolean }> = [];
+    controller.subscribe((event) => {
+      if (event.type === "settled") settled.push({ exitWakeScheduled: event.exitWakeScheduled });
+    });
+    await call("ShellStart", { command: "echo done; exit 0", label: "sync-throw" });
+    expect(await until(() => settled.length === 1)).toBe(true);
+    // Synchronous rejection means nothing was sent, so nothing is outstanding:
+    // settlement reports none scheduled (the review-resume fallback may still
+    // apply) and re-sends nothing.
+    expect(settled[0]!.exitWakeScheduled).toBe(false);
+    handlers.agent_settled?.();
+    expect(attempts).toBe(1);
+    expect(sent.length).toBe(0); // the throw happened before anything was accepted
+  });
+
+  it("acknowledges an exit wake observed synchronously inside sendMessage without redundant recovery", async () => {
+    const { sent, handlers, call, controller } = wireHost((msg) => {
+      // The host injects the custom message and dispatches its matching
+      // message_start from inside the void sendMessage call, before it
+      // returns. Observation only clears an existing marker, so the marker
+      // must already be set when this fires.
+      handlers.message_start?.(injectionEvent(String(msg.details.id)));
+    });
+    const settled: Array<{ exitWakeScheduled: boolean }> = [];
+    controller.subscribe((event) => {
+      if (event.type === "settled") settled.push({ exitWakeScheduled: event.exitWakeScheduled });
+    });
+    handlers.agent_start?.(); // a run is active; the wake would otherwise queue
+    await call("ShellStart", { command: "echo done; exit 0", label: "sync-observe" });
+    expect(await until(() => settled.length === 1)).toBe(true);
+    // The synchronous observation proved delivery: the send reports accepted,
+    // and nothing is left outstanding for settlement to recover.
+    expect(settled[0]!.exitWakeScheduled).toBe(true);
+    handlers.agent_settled?.();
+    expect(sent.length).toBe(1); // no recovery trigger, no second copy
+    expect(sent[0].customType).toBe("pi-review-bg-shell");
+    expect(sent[0].content).toContain("exited 0");
+  });
+
+  it("reports an exit wake observed before a synchronous send failure as accepted", async () => {
+    let attempts = 0;
+    const { sent, handlers, call, controller } = wireHost((msg) => {
+      // The host accepts and observes the injection, then its wrapper fails:
+      // delivery happened even though sendMessage throws.
+      attempts += 1;
+      handlers.message_start?.(injectionEvent(String(msg.details.id)));
+      throw new Error("wrapper failed after the host accepted the message");
+    });
+    const settled: Array<{ exitWakeScheduled: boolean }> = [];
+    controller.subscribe((event) => {
+      if (event.type === "settled") settled.push({ exitWakeScheduled: event.exitWakeScheduled });
+    });
+    handlers.agent_start?.();
+    await call("ShellStart", { command: "echo done; exit 0", label: "observe-then-throw" });
+    expect(await until(() => settled.length === 1)).toBe(true);
+    // Observed delivery is not misreported as non-delivery: the lifecycle
+    // event reports the wake scheduled, so the review gate stays off its own
+    // completion follow-up — and nothing is left outstanding to recover.
+    expect(settled[0]!.exitWakeScheduled).toBe(true);
+    handlers.agent_settled?.();
+    expect(attempts).toBe(1); // no redundant recovery re-send for an observed wake
+    expect(sent.length).toBe(0); // the wrapper threw, so nothing is recorded and nothing was re-sent
   });
 });
 

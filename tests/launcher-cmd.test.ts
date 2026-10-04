@@ -48,8 +48,8 @@ const helperModule = require(helperPath) as {
   ) => { published: boolean; attempts: number; lastError: (Error & { code?: string }) | null };
   resolveCmdShimTarget: (shimPath: string) => string | null;
   resolvePiAgentDir: (env: NodeJS.ProcessEnv, resolution: { homeDir: string; platform: string }) => string;
-  resolvePiInvocation: (env: NodeJS.ProcessEnv, platform: string) =>
-    { kind: string; file?: string; shim?: string };
+  resolveLauncherPiInvocation: (env: NodeJS.ProcessEnv, platform: string) =>
+    { kind: string; file?: string };
   selectReviewGateConfig: (candidates: string[]) => { status: number; path?: string };
 };
 
@@ -94,10 +94,10 @@ async function makeFixture(prefix: string, options: { skipNpmShim?: boolean; emp
 
   // Fake pi: records the forwarded arguments and the gate environment the
   // launcher exported, then exits with PI_EXIT_CODE. POSIX execution is a
-  // plain execvp of the PATH entry; Windows execution resolves the npm pi.cmd
-  // shim's JavaScript entry point (an exact npm cmd-shim shape) and spawns
-  // this Node binary directly — both without any shell reparse of arguments.
-  const fakePiEntry = join(bin, "fake-pi-entry.cjs");
+  // plain execvp of the PATH entry; Windows invokes the full pi.cmd path.
+  // Use a simple shim with no npm-style target for the regression: the
+  // launcher must run the command itself, not parse its implementation.
+  const fakePiEntry = join(bin, "pi-launcher.js");
   await writeFile(fakePiEntry, [
     "const fs = require('node:fs');",
     "fs.writeFileSync(process.env.CAPTURE_FILE, JSON.stringify({",
@@ -111,7 +111,7 @@ async function makeFixture(prefix: string, options: { skipNpmShim?: boolean; emp
     "process.exit(Number(process.env.PI_EXIT_CODE ?? '0'));",
   ].join("\n"), "utf8");
   if (isWindows) {
-    await writeFile(join(bin, "pi.cmd"), npmCmdShim("fake-pi-entry.cjs"), "utf8");
+    await writeFile(join(bin, "pi.cmd"), '@ECHO off\r\nnode "%~dp0pi-launcher.js" %*\r\n', "utf8");
   } else {
     const piPath = join(bin, "pi");
     await writeFile(piPath, `#!/usr/bin/env bash\nexec node "${fakePiEntry}" "$@"\n`, "utf8");
@@ -182,8 +182,8 @@ function npmCmdShim(targetRelative: string): string {
     "  SET PATHEXT=%PATHEXT:;.JS;=;%",
     ")",
     "",
-    'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & goto :_undefined_#',
-    `"%_prog%"  "%dp0%\\${targetRelative}" %*`,
+    // npm keeps this on one line so _prog/dp0 expand before endLocal.
+    `endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\${targetRelative}" %*`,
     "",
   ].join("\r\n");
 }
@@ -656,15 +656,13 @@ test("launcher helper packaged mode uses the packaged artifact and fails closed 
   }
 });
 
-test("launcher helper preserves literal arguments and metacharacters to pi without a shell", async () => {
+test("launcher helper quotes spaces, empty arguments and metacharacters for pi", async () => {
   const fixture = await makeFixture("pi-review-cmd-args-");
   await mkdir(fixture.agentDir, { recursive: true });
   await writeFile(fixture.defaultConfigPath, '{"enabled":true}\n', "utf8");
 
-  // pi is spawned with an argument array and no shell on every platform, so
-  // every byte — including combinations of embedded quotes with shell
-  // metacharacters and literal %VAR% text — must reach pi exactly as the
-  // caller provided it.
+  // POSIX uses an argument array; Windows quotes these arguments for the
+  // resolved batch command. Shell metacharacters must remain arguments.
   const forwarded = [
     "--model", "example model",
     "--tools", "read,bash",
@@ -716,7 +714,7 @@ test("launcher helper clears an inherited scheduler flag and honors --scheduler"
   await writeFile(fixture.defaultConfigPath, "{}\n", "utf8");
 
   // Capture the scheduler env seam exactly as pi's child would see it.
-  const fakePiEntry = join(fixture.bin, "fake-pi-entry.cjs");
+  const fakePiEntry = join(fixture.bin, "pi-launcher.js");
   await writeFile(fakePiEntry, [
     "const fs = require('node:fs');",
     "fs.writeFileSync(process.env.CAPTURE_FILE, JSON.stringify({",
@@ -1626,7 +1624,7 @@ test("helper resolves npm cmd-shim JavaScript entry points without a shell", asy
   }
 });
 
-test("helper resolves the pi invocation strategy without shell reparsing", async () => {
+test("helper resolves the full pi.cmd path without inspecting shim contents", async () => {
   const scratch = await mkdtemp(join(tmpdir(), "pi-review-cmd-piresolve-"));
   try {
     const bin = join(scratch, ".bin");
@@ -1638,22 +1636,18 @@ test("helper resolves the pi invocation strategy without shell reparsing", async
     await writeFile(join(bin, "pi.cmd"), npmCmdShim("..\\pkg\\bin\\pi-entry.cjs"), "utf8");
 
     const env: NodeJS.ProcessEnv = { PATH: bin };
-    const resolved = helperModule.resolvePiInvocation(env, "win32");
-    assert.equal(resolved.kind, "node");
-    assert.ok("file" in resolved && resolved.file === target,
-      "the pi.cmd shim must resolve to its JavaScript entry point");
+    const resolved = helperModule.resolveLauncherPiInvocation(env, "win32");
+    assert.deepEqual(resolved, { kind: "cmd", file: join(bin, "pi.cmd") });
 
-    // An unresolvable shim must fail closed rather than route arguments
-    // through cmd.exe.
+    // The command's implementation is irrelevant, even without a JS target.
     await writeFile(join(bin, "pi.cmd"), "@echo off\r\nrem opaque\r\n", "utf8");
-    const unresolved = helperModule.resolvePiInvocation(env, "win32");
-    assert.equal(unresolved.kind, "unresolved");
+    assert.deepEqual(helperModule.resolveLauncherPiInvocation(env, "win32"), resolved);
 
     // A missing pi must fail closed.
-    assert.equal(helperModule.resolvePiInvocation({ PATH: join(scratch, "empty") }, "win32").kind, "missing");
+    assert.equal(helperModule.resolveLauncherPiInvocation({ PATH: join(scratch, "empty") }, "win32").kind, "missing");
 
     // POSIX uses plain execvp of the PATH entry.
-    assert.deepEqual(helperModule.resolvePiInvocation(env, "linux"), { kind: "path" });
+    assert.deepEqual(helperModule.resolveLauncherPiInvocation(env, "linux"), { kind: "path" });
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
@@ -1727,6 +1721,23 @@ function runCmd(command: string, env: NodeJS.ProcessEnv, cwd = resolve("")) {
 }
 
 if (isWindows) {
+  test("native launcher invokes both simple and npm pi.cmd implementations", async () => {
+    const fixture = await makeFixture("pi-review-cmd-native-shapes-");
+    for (const shim of [
+      '@ECHO off\r\nnode "%~dp0pi-launcher.js" %*\r\n',
+      npmCmdShim("pi-launcher.js"),
+    ]) {
+      await writeFile(join(fixture.bin, "pi.cmd"), shim, "utf8");
+      assert.equal(helperModule.resolveLauncherPiInvocation(fixtureEnv(fixture), "win32").file,
+        join(fixture.bin, "pi.cmd"));
+      const result = runCmd('scripts\\pi-review-gate.cmd --model "example model"',
+        fixtureEnv(fixture, { PI_EXIT_CODE: "7" }));
+      assert.equal(result.status, 7, `stderr: ${result.stderr}`);
+      assert.deepEqual((await capturedLaunch(fixture)).args,
+        ["--extension", resolve("dist/src/index.js"), "--model", "example model"]);
+    }
+  });
+
   test("native .cmd entry point performs first launch from cmd.exe", async () => {
     const fixture = await makeFixture("pi-review-cmd-native-first-");
     const result = runCmd("scripts\\pi-review-gate.cmd --model example", fixtureEnv(fixture));
@@ -1801,7 +1812,7 @@ if (isWindows) {
       "--caret", "a^b",
       "--quote", 'say "&hi"',
       "--pct", "100%PI%",
-    ], "management arguments must reach pi byte for byte without a cmd re-parsing pass");
+    ], "quoted management arguments must reach the resolved pi.cmd");
     assert.equal(launch.configEnv, inherited,
       "the passthrough must keep the inherited environment");
     assert.equal((launch as { codemodeEnv?: string | null }).codemodeEnv, "0",
@@ -1856,9 +1867,8 @@ if (isWindows) {
 
     // Production entrypoint regression (review finding): arguments combining
     // embedded quotes with cmd metacharacters must reach pi byte for byte.
-    // pi is resolved from its npm shim and spawned with an argument array, so
-    // no shell reparses the arguments — an injection would surface as a
-    // "not recognized" error or a wrong capture.
+    // The resolved pi.cmd receives quoted arguments. An unprotected shell
+    // metacharacter would surface as a "not recognized" error or wrong capture.
     const result = runCmd(
       'scripts\\pi-review-gate.cmd --label "a&b|c^d" --quote "say ""&hi""" --paren "(x)" --empty ""',
       fixtureEnv(fixture),
@@ -1883,8 +1893,8 @@ if (isWindows) {
     await writeFile(fixture.defaultConfigPath, '{"enabled":true}\n', "utf8");
 
     // Check literal percent text and protected metacharacters through a real
-    // PowerShell-to-batch invocation. The helper must not add another cmd.exe
-    // parsing pass before pi; caller-side shell expansion remains separate.
+    // PowerShell-to-batch invocation. Undefined percent variables in these
+    // arguments remain literal under normal Windows command parsing.
     // PowerShell's single quotes delimit its string, but are not forwarded to
     // cmd.exe. Include literal double quotes around the metacharacter argument
     // so it stays protected both on batch entry and when %* is forwarded to

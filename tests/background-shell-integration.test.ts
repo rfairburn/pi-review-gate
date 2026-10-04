@@ -790,6 +790,55 @@ describe("exit-wake delivery failure (#281)", () => {
     expect(attempts).toBe(1);
     expect(sent.length).toBe(0); // the throw happened before anything was accepted
   });
+
+  it("acknowledges an exit wake observed synchronously inside sendMessage without redundant recovery", async () => {
+    const { sent, handlers, call, controller } = wireHost((msg) => {
+      // The host injects the custom message and dispatches its matching
+      // message_start from inside the void sendMessage call, before it
+      // returns. Observation only clears an existing marker, so the marker
+      // must already be set when this fires.
+      handlers.message_start?.(injectionEvent(String(msg.details.id)));
+    });
+    const settled: Array<{ exitWakeScheduled: boolean }> = [];
+    controller.subscribe((event) => {
+      if (event.type === "settled") settled.push({ exitWakeScheduled: event.exitWakeScheduled });
+    });
+    handlers.agent_start?.(); // a run is active; the wake would otherwise queue
+    await call("ShellStart", { command: "echo done; exit 0", label: "sync-observe" });
+    expect(await until(() => settled.length === 1)).toBe(true);
+    // The synchronous observation proved delivery: the send reports accepted,
+    // and nothing is left outstanding for settlement to recover.
+    expect(settled[0]!.exitWakeScheduled).toBe(true);
+    handlers.agent_settled?.();
+    expect(sent.length).toBe(1); // no recovery trigger, no second copy
+    expect(sent[0].customType).toBe("pi-review-bg-shell");
+    expect(sent[0].content).toContain("exited 0");
+  });
+
+  it("reports an exit wake observed before a synchronous send failure as accepted", async () => {
+    let attempts = 0;
+    const { sent, handlers, call, controller } = wireHost((msg) => {
+      // The host accepts and observes the injection, then its wrapper fails:
+      // delivery happened even though sendMessage throws.
+      attempts += 1;
+      handlers.message_start?.(injectionEvent(String(msg.details.id)));
+      throw new Error("wrapper failed after the host accepted the message");
+    });
+    const settled: Array<{ exitWakeScheduled: boolean }> = [];
+    controller.subscribe((event) => {
+      if (event.type === "settled") settled.push({ exitWakeScheduled: event.exitWakeScheduled });
+    });
+    handlers.agent_start?.();
+    await call("ShellStart", { command: "echo done; exit 0", label: "observe-then-throw" });
+    expect(await until(() => settled.length === 1)).toBe(true);
+    // Observed delivery is not misreported as non-delivery: the lifecycle
+    // event reports the wake scheduled, so the review gate stays off its own
+    // completion follow-up — and nothing is left outstanding to recover.
+    expect(settled[0]!.exitWakeScheduled).toBe(true);
+    handlers.agent_settled?.();
+    expect(attempts).toBe(1); // no redundant recovery re-send for an observed wake
+    expect(sent.length).toBe(0); // the wrapper threw, so nothing is recorded and nothing was re-sent
+  });
 });
 
 describe("ShellStop races", () => {

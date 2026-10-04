@@ -64,16 +64,24 @@ function candidateEntry(): string | null {
 		: null;
 }
 
-function checkPrerequisites(t: { skip(message?: string): void }): void {
+/** Verify the real-host prerequisites. Returns false only when the test was
+ *  skipped — callers must return immediately and never construct the fixture
+ *  after a skip (t.skip does not stop an async test body). Under
+ *  PI_REVIEW_GATE_REQUIRE_PI_HOST=1 a missing prerequisite throws via
+ *  skipOrFail instead, so this returns true exactly when the run may proceed.
+ */
+function checkPrerequisites(t: { skip(message?: string): void }): boolean {
 	if (!candidateEntry()) {
 		skipOrFail(t, "no compiled candidate extension (build with npm run build) and no PI_REVIEW_GATE_CANDIDATE_ENTRY");
-		return;
+		return false;
 	}
 	try {
 		createBgShellWakeFixture({ candidateEntry: null });
 	} catch (error) {
 		skipOrFail(t, error instanceof Error ? error.message : String(error));
+		return false;
 	}
+	return true;
 }
 
 /**
@@ -350,7 +358,7 @@ async function runCanceledRecoveryScenario(fixture: BgShellWakeFixture): Promise
 }
 
 test("aborted run recovers its queued exit wake (#281)", { timeout: 180_000 }, async (t) => {
-	checkPrerequisites(t);
+	if (!checkPrerequisites(t)) return;
 	const fixture = createBgShellWakeFixture({ candidateEntry: candidateEntry() });
 	// Dispose no matter how startup or the scenario fails: a startup failure
 	// after spawn must not leak the child, its stdio, or the scratch tree.
@@ -359,21 +367,21 @@ test("aborted run recovers its queued exit wake (#281)", { timeout: 180_000 }, a
 });
 
 test("canceling recovery does not restart the same exit delivery (#281)", { timeout: 180_000 }, async (t) => {
-	checkPrerequisites(t);
+	if (!checkPrerequisites(t)) return;
 	const fixture = createBgShellWakeFixture({ candidateEntry: candidateEntry() });
 	t.after(() => fixture.dispose());
 	await runCanceledRecoveryScenario(fixture);
 });
 
 test("immediate job exit wakes the owning session without polling (#281)", { timeout: 180_000 }, async (t) => {
-	checkPrerequisites(t);
+	if (!checkPrerequisites(t)) return;
 	const fixture = createBgShellWakeFixture({ candidateEntry: candidateEntry() });
 	t.after(() => fixture.dispose());
 	await runWakeScenario(fixture, "echo probe-immediate-done", "probe-immediate");
 });
 
 test("short-lived job exit wakes the owning session without polling (#281)", { timeout: 180_000 }, async (t) => {
-	checkPrerequisites(t);
+	if (!checkPrerequisites(t)) return;
 	const fixture = createBgShellWakeFixture({ candidateEntry: candidateEntry() });
 	t.after(() => fixture.dispose());
 	await runWakeScenario(fixture, "sleep 3 && echo probe-short-done", "probe-short");

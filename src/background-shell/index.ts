@@ -182,6 +182,20 @@ interface Job {
    * agent_settled only while the job is still running; an exit supersedes it.
    */
   heldWake?: { event: WakeEvent; count: number };
+  /**
+   * Set when this job's exit wake was submitted but its injection into the
+   * transcript has not yet been observed as a custom message event
+   * (message_start with customType "pi-review-bg-shell", details.id ===
+   * job.id, and details.kind === "exit" — other notifications from the same
+   * job, such as an earlier urgent match, never acknowledge it). pi.sendMessage
+   * returns void on the real extension API, so
+   * observation — not a delivery result — is the only supported delivery
+   * signal. A run can settle without draining its follow-up queue, leaving the
+   * queued exit wake in Pi's internal queue; at agent_settled a still-outstanding
+   * marker triggers a single bounded recovery turn that resumes Pi's own
+   * drainage of the retained completion instead of re-submitting it.
+   */
+  exitWakeOutstanding?: boolean;
   /** Windows-only per-job ownership identity (job-object record/stop paths);
    *  keeps descendants accounted for and cleanable after the shell root exits. */
   ownership?: BackgroundJobOwnership;
@@ -352,7 +366,20 @@ function resolveJob(target: string): { job?: Job; error?: ReturnType<typeof text
  *  job is "still running". */
 let agentRunActive = false;
 
-/** Send a wake event to the agent through the lane its urgency earns. */
+/** Send a wake event to the agent through the lane its urgency earns.
+ *
+ *  The real extension API's pi.sendMessage returns void (the loader forwards
+ *  the call without returning a result), so there is no delivery promise to
+ *  observe. For exit wakes — the acknowledged completion contract behind
+ *  "You will be notified automatically; do not poll" — the send is therefore
+ *  retained on the job as outstanding until its injection into the transcript
+ *  is observed (message_start with matching customType and details.id). A run
+ *  that ends without draining its follow-up queue (an aborted run) leaves the
+ *  wake stuck in Pi's internal queue; at agent_settled a still-outstanding
+ *  marker triggers one bounded recovery turn that resumes Pi's own drainage of
+ *  the retained completion — never a second copy of it. Routine status wakes
+ *  stay best-effort: losing one is survivable by design, and they are never
+ *  tracked or resumed. */
 function sendWake(pi: BackgroundShellHost, job: Job, event: WakeEvent, now: number, coalescedCount: number): boolean {
   job.wake.lastWakeAt = now;
   const delivery = laneDelivery(event.lane);
@@ -369,16 +396,76 @@ function sendWake(pi: BackgroundShellHost, job: Job, event: WakeEvent, now: numb
     lines: job.buffer.around(WAKE_CONTEXT_LINES),
     totalLines: job.buffer.total,
   });
+  // Tag the notification with its event kind so observation can acknowledge
+  // only exit completions: an earlier urgent match (steer lane) can be
+  // injected while this job's exit completion is still queued in the
+  // follow-up lane, and must not clear the outstanding-exit marker.
+  const message = { customType: "pi-review-bg-shell", content: payload, display: true, details: { id: job.id, kind: event.kind } };
   try {
-    pi.sendMessage(
-      { customType: "pi-review-bg-shell", content: payload, display: true, details: { id: job.id } },
-      delivery as any,
-    );
-    return true;
+    pi.sendMessage(message, delivery as any);
   } catch {
     // A delivery mode can be rejected while pi is mid-transition. Losing a
     // status wake is survivable; throwing out of a process event handler is not.
     return false;
+  }
+  if (event.kind === "exit") {
+    job.exitWakeOutstanding = true;
+  }
+  return true;
+}
+
+/** Clear the outstanding marker for a job whose EXIT wake has been observed
+ *  in the transcript. Pi emits message_start/message_end for the injected
+ *  custom message (role "custom", customType "pi-review-bg-shell",
+ *  details.id = job id, details.kind = event kind) — both when it is queued
+ *  and drained mid-run and when it starts a fresh run — so observation proves
+ *  delivery to the owning session's model. Only an exit injection (kind ===
+ *  "exit") acknowledges the marker: urgent matches travel the steering lane
+ *  and can be injected while the same job's exit completion is still queued
+ *  in the follow-up lane; acknowledging on a match would strand that
+ *  completion after an abort with no recovery marker left. */
+function observeWakeDelivery(event: unknown): void {
+  const message = (event as { message?: Record<string, unknown> } | undefined)?.message;
+  if (!message || message.role !== "custom" || message.customType !== "pi-review-bg-shell") return;
+  const details = message.details as { id?: unknown; kind?: unknown } | undefined;
+  if (!details || typeof details.id !== "string" || details.kind !== "exit") return;
+  const job = jobs.get(details.id);
+  if (job?.exitWakeOutstanding) job.exitWakeOutstanding = undefined;
+}
+
+/** Resume drainage of exit wakes that were never observed in the transcript.
+ *  Called at agent_settled: a run that just settled may have ended without
+ *  draining its follow-up queue (an aborted run). Pi retains the queued
+ *  completion — Agent.abort() does not clear the queues, and neither does a
+ *  new prompt — so re-submitting it would inject one copy immediately and
+ *  drain the original again when the recovery turn stops: a duplicate. One
+ *  bounded hidden control message (distinct customType, display:false) starts
+ *  the recovery turn instead; when that turn ends naturally Pi drains its own
+ *  queue and injects the retained completion exactly once, without touching
+ *  any unrelated queued messages. Observed injections clear the marker first,
+ *  so an already-delivered wake never triggers recovery; one trigger per
+ *  settlement services every outstanding job. Outstanding markers are consumed
+ *  before the control send, so a refused or canceled recovery does not
+ *  automatically retry the same exit wake. */
+function resendUnobservedExitWakes(pi: BackgroundShellHost): void {
+  let needsResume = false;
+  for (const job of jobs.values()) {
+    if (!job.exitWakeOutstanding) continue;
+    job.exitWakeOutstanding = undefined;
+    needsResume = true;
+  }
+  if (!needsResume) return;
+  try {
+    // The completion remains in Pi's queue; resume drainage, not delivery of a
+    // second copy. Never clear queues containing unrelated messages.
+    pi.sendMessage({
+      customType: "pi-review-bg-shell-resume",
+      content: "Resume pending background-shell notifications.",
+      display: false,
+    }, { deliverAs: "followUp", triggerTurn: true });
+  } catch {
+    // The session may be shutting down; the job's final state stays readable
+    // through ShellList/ShellLog, which is the documented floor, not the promise.
   }
 }
 
@@ -1144,9 +1231,13 @@ export function registerBackgroundShell(
   pi.on("agent_start", () => {
     agentRunActive = true;
   });
+  // The injected custom wake message is the delivery signal for outstanding
+  // exit wakes (see observeWakeDelivery).
+  pi.on("message_start", (event) => observeWakeDelivery(event));
   pi.on("agent_settled", () => {
     agentRunActive = false;
     flushHeldWakes(pi);
+    resendUnobservedExitWakes(pi);
   });
 
   // A job may outlive a turn; it must never outlive the session.

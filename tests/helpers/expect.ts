@@ -24,6 +24,7 @@ export function expect(actual: unknown, message?: string) {
     },
     toThrow: throws,
     not: {
+      toBe: (expected: unknown) => assert.notEqual(actual, expected, message),
       toBeNull: () => assert.notEqual(actual, null, message),
       toContain: (expected: unknown) => {
         if (typeof actual === "string") assert.ok(!actual.includes(String(expected)), message);

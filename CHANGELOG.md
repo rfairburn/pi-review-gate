@@ -15,6 +15,39 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.113]
+
+### Fixed
+
+- Bound recovery for an unobserved background-shell exit wake to one hidden,
+  cancelable control turn that resumes Pi's retained follow-up queue; the
+  completion is not re-sent and unrelated queued messages are untouched. The
+  recovery turn remains directly cancelable; ambiguous lifecycle outcomes favor
+  delivery without guessing model intent. Canceling recovery does not start
+  another attempt, while routine status wakes remain best-effort. Real-host
+  tests cover delivery after an aborted run and aborting
+  recovery before the retained exit is drained; the original report's precise
+  cause remains unestablished (Refs #281).
+
+## [0.1.0-dev.112]
+
+### Fixed
+
+- Preserve exact large NTFS wave-root inode and volume identities through capture,
+  persisted reload, landing, and authenticated recovery. Safe numeric identity
+  fields keep their existing version-1 encoding; larger unsigned 64-bit fields
+  use canonical decimal strings, requiring an updated build to reload/recover
+  those records. Root replacement and retarget checks remain fail-closed (#282).
+- Restore native Windows raw parent-review baseline capture when directory-handle
+  fsync returns `EPERM`, matching the existing Git checkpoint exception. File
+  flushes and other filesystem failures remain mandatory; mocked Windows tests
+  cover ancestor and final-directory flushes and fail-closed error boundaries
+  (#282).
+- Apply the existing Windows path-stat/open-handle device-ID normalization to
+  raw file capture and record reload, preserving all other identity checks;
+  accept native absolute descriptor roots so Windows drive and UNC paths can
+  reload without accepting relative paths (#282).
+
 ## [0.1.0-dev.111]
 
 ### Changed

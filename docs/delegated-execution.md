@@ -774,6 +774,16 @@ review. Executor timeouts are suspended while verified background work remains a
 (a POSIX process group or Windows owned job); external or unparseable `ShellStart`
 success responses fail closed.
 
+An exit wake remains outstanding until its custom message is observed. If a Pi run
+settles first, one hidden recovery turn resumes drainage of Pi's retained follow-up
+queue; the extension does not enqueue a duplicate completion or clear unrelated
+messages. A direct cancellation of the recovery turn is honored. When the lifecycle
+does not reveal whether the preceding run was intentionally canceled, delivery is
+favored over guessing model intent. Canceling recovery does not automatically start
+another attempt for the same exit. The completed job remains available through
+`ShellList` and `ShellLog`.
+Routine match, stall, and milestone wakes remain best-effort and are not recovered.
+
 The shell is a fixed per-platform contract: `ShellStart` runs commands in Bash on
 macOS/Linux and PowerShell on Windows — `pwsh.exe` first, then the built-in
 `powershell.exe`, matching Pi's native powershell-tool discovery; there is no shell

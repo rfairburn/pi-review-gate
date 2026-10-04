@@ -58,6 +58,7 @@ const ROOT_SETTING_LABELS = [
   "Deferred Pi tools",
   "Subtasks view",
   "Scheduled tasks",
+  "External workers",
   "Web",
 ] as const;
 
@@ -515,7 +516,7 @@ test("in the interactive TUI a text field opens through the native editor bridge
     },
     tuiKeys(...Array(6).fill(KEY_DOWN), KEY_ENTER), // entry re-show (instructions, row 4) → Back (row 10)
     tuiKeys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
-    tuiKeys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 16)
+    tuiKeys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 17)
   ]);
 
   await registered.handler("", harness.ctx);

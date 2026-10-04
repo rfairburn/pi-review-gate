@@ -616,7 +616,7 @@ test("real host: full flow stages a completed existing absolute directory throug
     },
     keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 10)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
-    keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 16)
+    keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 17)
   ], { cwd: dir, keybindings: createRealKeybindingsManager(loaded.tui), theme: REAL_IDENTITY_THEME, provider: new providerCtor(HOST_COMMANDS, dir) });
 
   await run(harness.ctx);
@@ -672,7 +672,7 @@ for (const target of ["missing", "file"] as const) {
       },
       keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 10)
       keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
-      keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 16)
+      keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 17)
       keys(ESCAPE), // failed save re-shows the root menu; Esc leaves without saving
     ], { cwd: dir, keybindings: createRealKeybindingsManager(loaded.tui), theme: REAL_IDENTITY_THEME, provider: new providerCtor(HOST_COMMANDS, dir) });
 

@@ -62,6 +62,7 @@ const ROOT_SETTING_LABELS = [
   "Subtasks view",
   "Scheduled tasks",
   "Scheduler runtime",
+  "External workers",
   "Web",
 ] as const;
 
@@ -341,7 +342,7 @@ test("TUI: /scheduled-tasks lands in the scheduled list; Esc returns to root and
       [...downs(8), KEY_ENTER], // editor → Enabled (row 8)
       [KEY_ESCAPE], // editor → list
       [KEY_ESCAPE], // list → root (Scheduled tasks row highlighted)
-      [...downs(2), KEY_ENTER], // root → Save changes (row 16, two below the highlight)
+      [...downs(3), KEY_ENTER], // root → Save changes (row 17, three below the highlight)
     ]);
     setMenuTuiHost(harness.host);
     try {
@@ -512,7 +513,7 @@ test("installed Pi host: /scheduled-tasks lands in the scheduled list and saves 
       [...downs(8), KEY_ENTER], // editor → Enabled (row 8)
       [KEY_ESCAPE], // editor → list
       [KEY_ESCAPE], // list → root (Scheduled tasks row highlighted)
-      [...downs(2), KEY_ENTER], // root → Save changes (row 16, two below the highlight)
+      [...downs(3), KEY_ENTER], // root → Save changes (row 17, three below the highlight)
     ]);
     setMenuTuiHost(host);
     try {

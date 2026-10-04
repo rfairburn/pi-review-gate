@@ -956,7 +956,7 @@ async function runImageFlow(
       ...(options.outcome === "cancel"
         ? [keys(KEY_ESCAPE)] // root: leave without saving
         : [
-            keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (scheduled) → Save changes (row 16)
+            keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (scheduled) → Save changes (row 17)
             ...(options.outcome === "fail" ? [keys(KEY_ESCAPE)] : []), // failed save re-shows the root; leave
           ]),
     ],

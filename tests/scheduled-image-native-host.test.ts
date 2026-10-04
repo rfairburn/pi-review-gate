@@ -201,7 +201,7 @@ async function runNativeImageFlow(
       ...(options.outcome === "cancel"
         ? [keys(KEY_ESCAPE)] // root: leave without saving
         : [
-            keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (retained "scheduled", row 14) → Save (row 16)
+            keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (retained "scheduled", row 14) → Save (row 17)
           ]),
     ],
   });

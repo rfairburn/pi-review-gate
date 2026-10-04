@@ -163,7 +163,7 @@ for (const targetKind of ["missing", "existing file"] as const) {
       },
       keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 10)
       keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
-      keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 16)
+      keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 17)
       keys(ESCAPE), // failed save re-shows the root menu; Esc leaves without saving
     ], { cwd: dir });
 
@@ -206,7 +206,7 @@ test("full TUI flow: a typed existing workspace stages through Save", async (t) 
     },
     keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 10)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
-    keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 16)
+    keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 17)
   ], { cwd: dir });
 
   await run(harness.ctx);
@@ -302,7 +302,7 @@ test("full TUI flow (real host): native Tab completion stages an existing direct
     },
     keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 10)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
-    keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 16)
+    keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 17)
   ], { cwd: home, keybindings: createRealKeybindingsManager(loaded.tui), theme: REAL_IDENTITY_THEME, provider: new providerCtor([], home) });
 
   await run(harness.ctx);

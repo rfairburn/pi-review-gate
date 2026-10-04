@@ -254,16 +254,18 @@ artifact, provisioning the pinned DDGS dependency in a `Scripts\python.exe` venv
 (`python3`, then `python`, probed for isolated-mode usability; the POSIX
 `scripts/ensure-ddgs.sh` stays the macOS/Linux mechanism), publishing the orchestrator
 skill through an atomic rename, exporting `PI_REVIEW_GATE_DDGS_PYTHON`, and executing
-`pi` with the forwarded arguments and exit status. The helper never reparses arguments
-through a shell: publication runs in-process (`fs.linkSync`/`fs.renameSync`), Python is
-spawned with argument arrays, and pi/npm are executed by resolving their npm `.cmd`
-shim's JavaScript entry point and spawning Node directly (POSIX uses plain `execvp`),
-with a fixed-token cmd.exe fallback only for the development build. Invoking a `.cmd`
+`pi` with the forwarded arguments and exit status. On Windows it resolves `pi.cmd`
+on `PATH` and invokes that full path through `cmd.exe` with quoted arguments, without
+reading the shim or resolving Pi's underlying installation; an installed `pi.exe`
+continues to run directly. Normal Windows batch parsing, including `%VAR%` expansion,
+applies. Publication runs in-process (`fs.linkSync`/`fs.renameSync`), Python is spawned
+with argument arrays, and npm's development build still uses its resolved JavaScript
+entry point with a fixed-token cmd.exe fallback. POSIX uses plain `execvp`. Invoking a `.cmd`
 file from PowerShell still crosses cmd.exe parsing: PowerShell string delimiters alone
 do not protect batch metacharacters. For example, pass `--label '\"a&b|c^d\"'` from
 PowerShell so literal double quotes protect the value through batch forwarding.
 Command-shell expansion (including `%VAR%`) can happen before the helper receives an
-argument; the helper does not perform an additional shell expansion. POSIX permission
+argument, and Pi's batch invocation also follows command-shell expansion rules. POSIX permission
 modes (0700/0600/0644) are requested for parity
 and are no-ops under Windows ACLs. CI covers the native paths on `windows-latest`
 (`.github/workflows/ci.yml`, focused `launcher-cmd` tests); macOS/Linux behavior of the

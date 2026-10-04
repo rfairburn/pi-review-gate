@@ -7,8 +7,8 @@ rem cmd.exe and PowerShell without Bash, WSL, or PowerShell script execution.
 rem
 rem Requires Node.js 22.19.0+ on PATH. The helper dispatches Pi management verbs
 rem without setup (keeping the inherited environment and pi's exit status) and
-rem invokes pi for normal launches without an additional shell parsing pass,
-rem so forwarded arguments arrive byte-exact. The batch layer is deliberately
-rem thin: a single raw `%*` passthrough, nothing re-quoted.
+rem invokes the resolved full pi.cmd path with quoted launch arguments.
+rem Pi's shim contents are not inspected; normal batch parsing applies.
+rem The batch layer stays thin: a single raw `%*` passthrough.
 node "%~dp0pi-review-gate-launcher.cjs" %*
 exit /b %ERRORLEVEL%

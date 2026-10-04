@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.114]
+
+### Fixed
+
+- Invoke the resolved full Windows `pi.cmd` path with the extension and launch
+  arguments instead of parsing its JavaScript entry point. Simple Pi 1.0.0
+  shims and future shim layouts no longer depend on npm's shim format; normal
+  batch parsing applies. Launcher setup, management passthrough, and exit
+  status propagation remain unchanged (#287).
+
 ## [0.1.0-dev.113]
 
 ### Fixed

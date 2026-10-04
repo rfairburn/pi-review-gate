@@ -64,17 +64,14 @@
  *
  * POSIX permission modes (0700/0600/0644) are requested for parity and are a
  * no-op under Windows ACLs; the fail-closed publication structure is what the
- * launcher preserves. To keep forwarded arguments and paths byte-exact, the
- * helper never reparses them through a shell: publication runs in-process
- * (fs.linkSync / fs.renameSync), Python is spawned directly with argument
- * arrays, and pi/npm are executed by resolving their npm `.cmd` shim's
- * JavaScript entry point and spawning this Node binary directly (POSIX uses
- * plain execvp). The only cmd.exe pass left is the fixed-token development
- * build fallback. Management verbs are dispatched here before any setup, so
- * the .cmd entry point stays a thin single `%*` passthrough and every
- * argument — management or launch — avoids cmd re-parsing; cmd.exe itself
- * expands a literal %VAR% on the user's command line before the batch sees
- * it (the helper receives and forwards such arguments literally).
+ * launcher preserves. Publication runs in-process (fs.linkSync /
+ * fs.renameSync) and Python is spawned directly with argument arrays. Pi's
+ * Windows .cmd is resolved on PATH and invoked by its full path through
+ * cmd.exe with quoted arguments; its contents and underlying installation
+ * are never inspected. Normal batch parsing, including %VAR% expansion,
+ * applies. npm's development build resolution remains separate. POSIX uses
+ * plain execvp. Management verbs are dispatched here before any setup, so
+ * the .cmd entry point stays a thin single `%*` passthrough.
  *
  * Keep in sync with src/config-path.ts (Pi agent-dir semantics) and
  * scripts/ensure-ddgs.sh (DDGS provisioning); the mirrors are deliberate so
@@ -433,8 +430,8 @@ function removeQuietly(target) {
  * and let & | < > ( ) ^ operate; "" keeps cmd inside quotes while the
  * receiving program's argv parser reads the pair as one literal quote).
  * Backslash runs immediately before a quote or the closing quote are doubled
- * for the argv parser's backslash-quote rule. This is used only for the
- * fixed-token build fallback; a literal %VAR% would still be expanded by cmd.
+ * for the argv parser's backslash-quote rule. Used for Pi's batch invocation
+ * and the fixed-token build fallback; literal %VAR% text is expanded by cmd.
  */
 function cmdQuote(arg) {
   if (arg.length === 0) return '""';
@@ -488,13 +485,20 @@ function resolveCmdShimTarget(shimPath) {
   return null;
 }
 
+/** Resolve Pi's launcher command, not the implementation behind its .cmd. */
+function resolveLauncherPiInvocation(env, platform) {
+  if (platform !== "win32") return { kind: "path" };
+  const pathEnv = env.PATH || "";
+  const exe = findOnPath("pi", [".exe"], pathEnv);
+  if (exe) return { kind: "direct", file: exe };
+  const shim = findOnPath("pi", [".cmd"], pathEnv);
+  if (shim) return { kind: "cmd", file: path.resolve(shim) };
+  return { kind: "missing" };
+}
+
 /**
- * Decide how to execute pi without reparsing arguments through a shell:
- * - POSIX: plain execvp of `pi` (the PATH entry; scripts with shebangs work).
- * - Windows: the installed pi.exe directly, or the npm pi.cmd shim's resolved
- *   JavaScript entry point through this Node binary.
- * No fallback through cmd.exe exists for user-supplied arguments: when the
- * shim cannot be resolved, the launcher fails closed with a diagnostic.
+ * Shell-free resolver used by the extension's internal Pi child launches.
+ * Keep this separate from the launcher's direct .cmd invocation above.
  */
 function resolvePiInvocation(env, platform) {
   if (platform !== "win32") return { kind: "path" };
@@ -516,17 +520,19 @@ function resolvePiInvocation(env, platform) {
  */
 function launchPi(argv, extensionPath, env) {
   const forwarded = extensionPath ? ["--extension", extensionPath, ...argv] : [...argv];
-  const invocation = resolvePiInvocation(env, process.platform);
+  const invocation = resolveLauncherPiInvocation(env, process.platform);
   let result;
   if (invocation.kind === "direct") {
     result = spawnSync(invocation.file, forwarded, { stdio: "inherit", env });
-  } else if (invocation.kind === "node") {
-    result = spawnSync(process.execPath, [invocation.file, ...forwarded], { stdio: "inherit", env });
+  } else if (invocation.kind === "cmd") {
+    // The outer quotes are cmd.exe /s /c's command-string delimiters.
+    // Use the full .cmd path so PowerShell aliases cannot intercept Pi.
+    const command = [invocation.file, ...forwarded].map(cmdQuote).join(" ");
+    result = spawnSync("cmd.exe", ["/d", "/s", "/c", `"${command}"`], {
+      stdio: "inherit", env, windowsVerbatimArguments: true,
+    });
   } else if (invocation.kind === "path") {
     result = spawnSync("pi", forwarded, { stdio: "inherit", env });
-  } else if (invocation.kind === "unresolved") {
-    note(`pi-review-gate: could not resolve the pi entry point from the npm shim at ${invocation.shim}; reinstall Pi (npm install -g @earendil-works/pi) or launch it directly with --extension ${extensionPath ?? "(none requested)"}\n`);
-    return 127;
   } else {
     note("pi-review-gate: pi was not found on PATH; install Pi (npm install -g @earendil-works/pi) and re-run the launcher\n");
     return 127;
@@ -1063,8 +1069,8 @@ function main(argv) {
   out(`pi-review-gate extension: ${extensionPath}\n`);
 
   // Execute pi with the extension and the forwarded arguments, inheriting the
-  // sanitized environment and stdio; the helper's exit status is pi's. pi is
-  // spawned without any shell reparse of the arguments (see launchPi).
+  // sanitized environment and stdio; the helper's exit status is pi's.
+  // Windows invokes the resolved .cmd itself (see launchPi).
   return launchPi(forwardedArgs, extensionPath, process.env);
 }
 
@@ -1087,8 +1093,8 @@ if (require.main === module) {
     // Direct helper invocation (the .cmd entry point forwards %* here
     // unconditionally): management verbs are forwarded to pi untouched, with
     // the inherited environment and no setup, mirroring the POSIX launcher's
-    // early passthrough — and, unlike a `call pi %*` batch dispatch, without
-    // any cmd re-parsing of carets or percent expansions.
+    // early passthrough. The same resolved-command invocation is used for
+    // management and normal launches.
     process.exitCode = launchPi(argv, null, process.env);
   } else {
     process.exitCode = main(argv) ?? 0;
@@ -1111,6 +1117,7 @@ module.exports = {
   migrateGenericSkillFiles,
   resolveCmdShimTarget,
   resolvePiAgentDir,
+  resolveLauncherPiInvocation,
   resolvePiInvocation,
   selectReviewGateConfig,
 };

@@ -60,8 +60,9 @@ newly queued retry of the same SHA replaces a still-pending (not yet started) ru
 that same SHA, so redundant same-SHA retries coalesce instead of stacking. The publish
 job then:
 
-1. Creates the tag `b<N>` first, verifying it points at the exact target SHA. A tag that
-   already exists pointing anywhere else is never retargeted; the run fails closed.
+1. Creates the lightweight tag `b<N>` first, verifying it points directly at the exact
+   target SHA. An existing annotated tag or a tag pointing anywhere else fails closed;
+   neither is converted or retargeted (see [Annotated tag failures](#annotated-tag-failures)).
 2. Creates a **draft** release carrying an ownership marker that pins the source
    repository, SHA, tag, and version. Because the by-tag release endpoint only returns
    published releases, an interrupted draft is located through the authenticated release
@@ -175,3 +176,26 @@ the original failed attempt remains history.
 If a draft remains incomplete, a re-run of the same SHA resumes it after identity
 validation; if the failure was a fail-closed identity, integrity, or permission error,
 resolve the underlying condition (or recover manually at the same exact SHA) and re-run.
+
+### Annotated tag failures
+
+The builder only manages lightweight `b<N>` tags: the ref must point directly to the
+exact target commit. An annotated tag instead points to a tag object, which is rejected
+with `tag <name> is an annotated tag object; the release builder only manages lightweight tags`.
+This rejection happens before the SHA comparison, even if the annotated tag ultimately
+resolves to the correct commit, and before draft recovery or already-published release
+verification.
+
+Keep the existing tag unchanged: do not delete, convert, or retarget a protected tag.
+There is no permitted in-place builder recovery while that annotated ref remains;
+leave the automated run blocked rather than blindly re-running the same producer.
+Even a manually published release does not make that producer's retry eligible: its
+tag check still rejects the annotated ref before reaching published-release verification.
+
+Any separately, explicitly authorized manual exact-source publication must preserve
+the tag, independently verify that it resolves to the exact eligible target SHA, and
+satisfy the existing provenance, asset-integrity, release-notes, and published-release
+immutability requirements. It is not a builder retry or an exemption from the builder's
+lightweight-tag requirement. If the tag resolves to another commit, or no policy-compliant
+manual publication is authorized, leave the release blocked. Do not publish a different
+SHA, dispatch a floating workflow, or bypass policy to fill the gap.

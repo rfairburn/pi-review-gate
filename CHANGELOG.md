@@ -15,6 +15,14 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.116]
+
+### Documentation
+
+- Explain the release builder's lightweight-tag-only requirement, annotated-tag
+  rejection, and operator recovery boundaries without changing publication behavior
+  or immutable-tag protections (#30).
+
 ## [0.1.0-dev.115]
 
 ### Fixed

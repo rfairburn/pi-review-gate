@@ -182,8 +182,8 @@ function npmCmdShim(targetRelative: string): string {
     "  SET PATHEXT=%PATHEXT:;.JS;=;%",
     ")",
     "",
-    'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & goto :_undefined_#',
-    `"%_prog%"  "%dp0%\\${targetRelative}" %*`,
+    // npm keeps this on one line so _prog/dp0 expand before endLocal.
+    `endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\${targetRelative}" %*`,
     "",
   ].join("\r\n");
 }

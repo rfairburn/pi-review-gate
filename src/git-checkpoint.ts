@@ -45,7 +45,7 @@
  * reason rather than producing a silent gap — external diff/textconv/filter
  * programs and non-EOL clean/smudge transformations,
  * assume-unchanged and skip-worktree index flags, unmerged entries, sparse
- * checkout, tracked submodules, unborn HEAD, non-root capture paths,
+ * checkout, tracked submodules, corrupt or unclassifiable HEAD, non-root capture paths,
  * enumeration warnings, capture races (an untracked entry changing under its
  * pre/post stat checks, or the index/tracked worktree shifting between the
  * two patch captures — arm re-verifies consistency read-only before
@@ -55,6 +55,12 @@
  * snapshot code; `failed` results are operational errors. Tracked text follows
  * Git-normalized semantics: CRLF/LF differences alone are not separately
  * captured. Non-ignored untracked content remains raw-exact.
+ * A verified unborn symbolic HEAD uses a checkpoint-owned synthetic
+ * parentless empty-tree commit as its base. The fixed non-personal identity
+ * and object are created through hardened Git plumbing; the loose commit is
+ * synced before its owned pin is published. This does not create the user's
+ * first commit, move HEAD, change branch refs, or write the live index.
+ * Corrupt or otherwise unverified HEAD state remains fail-closed.
  *
  * **Compact descriptor and by-ID reload.** Arm publishes the exact encoded
  * record durably — owned scratch temp file, file fsync, atomic rename,

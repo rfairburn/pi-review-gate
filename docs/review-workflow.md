@@ -23,6 +23,11 @@ The Git checkpoint pins clean committed content and captures both staged and uns
 Git differences plus raw non-ignored untracked entries. Tracked content follows Git-normalized newline semantics: the checkpoint is
 not a raw CRLF reproduction guarantee and does not run a separate EOL proof pass.
 Untracked entries, and eligible entries in a non-Git workspace, retain their raw bytes.
+An initialized repository with a verified unborn symbolic `HEAD` uses a checkpoint-owned
+synthetic parentless commit with an empty tree as its baseline. This does not create the
+user's first commit, move `HEAD`, change branch refs, or write the live index; staged,
+unstaged, and non-ignored untracked content still follows the ordinary review path.
+Corrupt or otherwise unverified `HEAD` state remains fail-closed.
 On Windows, checkpoint Git commands use the effective `core.autocrlf` value
 without enabling other system/global Git settings. Unreliable worktree-only
 executable-bit differences are ignored; staged mode changes remain captured.
@@ -34,9 +39,11 @@ without one there are no global excludes. Comparisons use the frozen after-check
 against separate window and exchange baselines; a checkpoint is not itself a passing
 review or a substitute for either baseline.
 
-On Windows, Git and non-Git checkpoint record files are still flushed, but a
-directory-handle fsync rejected with `EPERM` is best-effort: a power loss may lose a newly created directory
-entry. Restart verifies the surviving checkpoint rather than assuming it survived.
+On Windows, synthetic checkpoint objects are flushed by Git at write time; this
+requires Git 2.36.0 or newer, and older versions fail closed. Git and non-Git
+checkpoint record files are also flushed, but a directory-handle fsync rejected
+with `EPERM` is best-effort: a power loss may lose a newly created directory entry.
+Restart verifies the surviving checkpoint rather than assuming it survived.
 
 Exact `write` / `edit` paths and easy shell targets are pre-captured before execution,
 including absolute paths outside the current worktree. Repository baselines,

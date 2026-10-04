@@ -10,6 +10,12 @@ import { BackgroundProcessReadiness } from "../src/background-process-readiness"
 import { PiExecutorAdapter, PiRpc } from "../src/execution/adapters/pi-model";
 import type { ExecutorLiveControl } from "../src/execution/types";
 
+// Node's Windows child job ordinarily terminates non-detached children when
+// their spawning Node exits. These fixtures deliberately need a surviving pipe
+// holder: detach only on Windows, retain inherited stdio, and stop it via its
+// test-owned control file. POSIX holders stay in the owned process group.
+const inheritedPipeHolderOptions = "{detached:process.platform==='win32',stdio:['ignore','inherit','inherit','ipc']}";
+
 interface OwnedDescendantFixture {
   root: string;
   workerPidPath: string;
@@ -45,7 +51,7 @@ async function createInheritedPipeFixture(): Promise<InheritedPipeFixture> {
   ].join("\n"));
   const parentScript = [
     "const {spawn}=require('node:child_process');",
-    `const child=spawn(process.execPath,[${JSON.stringify(workerPath)},${JSON.stringify(workerPidPath)},${JSON.stringify(readyPath)},${JSON.stringify(stopPath)},${JSON.stringify(stoppedPath)}],{stdio:['ignore','inherit','inherit','ipc']});`,
+    `const child=spawn(process.execPath,[${JSON.stringify(workerPath)},${JSON.stringify(workerPidPath)},${JSON.stringify(readyPath)},${JSON.stringify(stopPath)},${JSON.stringify(stoppedPath)}],${inheritedPipeHolderOptions});`,
     "child.on('message',message=>{if(message==='ready')process.exit(0)});",
     "child.once('error',error=>{console.error(error);process.exit(1)});",
   ].join("\n");
@@ -94,7 +100,7 @@ async function createBackgroundWaitFixture(mode: "root-exits" | "interruptible" 
     "const settlementSession=process.env.PI_REVIEW_GATE_SETTLEMENT_SESSION;const settlementChild=process.env.PI_REVIEW_GATE_SETTLEMENT_CHILD;const settlementSecret=process.env.PI_REVIEW_GATE_SETTLEMENT_SECRET;const settlementPath=process.env.PI_REVIEW_GATE_SETTLEMENT_PATH;",
     "for(const key of ['PI_REVIEW_GATE_SETTLEMENT_SESSION','PI_REVIEW_GATE_SETTLEMENT_CHILD','PI_REVIEW_GATE_SETTLEMENT_SECRET','PI_REVIEW_GATE_SETTLEMENT_PATH'])delete process.env[key];",
     `const rootStopPath=${JSON.stringify(rootStopPath)};const rootStoppedPath=${JSON.stringify(rootStoppedPath)};process.on('exit',()=>{try{fs.writeFileSync(rootStoppedPath,'stopped')}catch{}});setInterval(()=>{if(fs.existsSync(rootStopPath))process.exit(0)},20);`,
-    `const holder=spawn(process.execPath,[${JSON.stringify(join(fixture.root, "worker.cjs"))},${JSON.stringify(fixture.workerPidPath)},${JSON.stringify(fixture.readyPath)},${JSON.stringify(fixture.stopPath)},${JSON.stringify(fixture.stoppedPath)}],{stdio:['ignore','inherit','inherit','ipc']});`,
+    `const holder=spawn(process.execPath,[${JSON.stringify(join(fixture.root, "worker.cjs"))},${JSON.stringify(fixture.workerPidPath)},${JSON.stringify(fixture.readyPath)},${JSON.stringify(fixture.stopPath)},${JSON.stringify(fixture.stoppedPath)}],${inheritedPipeHolderOptions});`,
     `const background=spawn(process.execPath,['-e',${JSON.stringify(backgroundScript)},${JSON.stringify(backgroundStopPath)},${JSON.stringify(backgroundStoppedPath)}],{detached:true,stdio:'ignore'});background.unref();fs.writeFileSync(${JSON.stringify(backgroundPidPath)},String(background.pid));`,
     "const out=(value)=>process.stdout.write(JSON.stringify(value)+'\\n');",
     "let holderReady=false;let input='';process.stdin.setEncoding('utf8');",
@@ -201,7 +207,7 @@ async function createNativeWindowsPiFixture(mode: "rpc" | "rpc-background" | "co
   ].join("\n"));
   const commonRunner = [
     "const fs=require('node:fs');const {spawn}=require('node:child_process');",
-    `const holder=spawn(process.execPath,[${JSON.stringify(workerPath)},${JSON.stringify(workerPidPath)},${JSON.stringify(readyPath)},${JSON.stringify(stopPath)},${JSON.stringify(stoppedPath)}],{stdio:['ignore','inherit','inherit','ipc']});`,
+    `const holder=spawn(process.execPath,[${JSON.stringify(workerPath)},${JSON.stringify(workerPidPath)},${JSON.stringify(readyPath)},${JSON.stringify(stopPath)},${JSON.stringify(stoppedPath)}],${inheritedPipeHolderOptions});`,
     "holder.on('message',message=>{if(message==='ready'){fs.writeFileSync(" + JSON.stringify(workerPidPath) + ",String(holder.pid));fs.writeFileSync(" + JSON.stringify(readyPath) + ",'ready');}});",
   ];
   let entryLines: string[];
@@ -216,7 +222,7 @@ async function createNativeWindowsPiFixture(mode: "rpc" | "rpc-background" | "co
       "const fs=require('node:fs');const crypto=require('node:crypto');const path=require('node:path');const {spawn}=require('node:child_process');",
       "const settlementSession=process.env.PI_REVIEW_GATE_SETTLEMENT_SESSION;const settlementChild=process.env.PI_REVIEW_GATE_SETTLEMENT_CHILD;const settlementSecret=process.env.PI_REVIEW_GATE_SETTLEMENT_SECRET;const settlementPath=process.env.PI_REVIEW_GATE_SETTLEMENT_PATH;",
       "for(const key of ['PI_REVIEW_GATE_SETTLEMENT_SESSION','PI_REVIEW_GATE_SETTLEMENT_CHILD','PI_REVIEW_GATE_SETTLEMENT_SECRET','PI_REVIEW_GATE_SETTLEMENT_PATH'])delete process.env[key];",
-      `const holder=spawn(process.execPath,[${JSON.stringify(workerPath)},${JSON.stringify(workerPidPath)},${JSON.stringify(readyPath)},${JSON.stringify(stopPath)},${JSON.stringify(stoppedPath)}],{stdio:['ignore','inherit','inherit','ipc']});`,
+      `const holder=spawn(process.execPath,[${JSON.stringify(workerPath)},${JSON.stringify(workerPidPath)},${JSON.stringify(readyPath)},${JSON.stringify(stopPath)},${JSON.stringify(stoppedPath)}],${inheritedPipeHolderOptions});`,
       "holder.on('message',message=>{if(message==='ready'){fs.writeFileSync(" + JSON.stringify(workerPidPath) + ",String(holder.pid));fs.writeFileSync(" + JSON.stringify(readyPath) + ",'ready');}});",
       backgroundRunner,
       "const ack=()=>{const settlement=1;const pid=process.pid;const version=2;const oneShot=crypto.createHmac('sha256',settlementSecret).update('pi-review-gate-live-browser-settlement-key:v2:'+settlement).digest();const mac=crypto.createHmac('sha256',oneShot).update(JSON.stringify([version,settlementSession,settlementChild,settlement,pid])).digest('base64url');const receipt={version,sessionId:settlementSession,childId:settlementChild,settlement,pid,mac};fs.mkdirSync(path.dirname(settlementPath),{recursive:true,mode:0o700});const temporary=settlementPath+'.tmp.'+crypto.randomUUID();fs.writeFileSync(temporary,JSON.stringify(receipt)+'\\n',{mode:0o600});fs.renameSync(temporary,settlementPath);};",

@@ -76,3 +76,24 @@ test("missing fields preserve exact legacy duplicate concat and commands/protoco
   const defaultRole = configFor({ ...agent, execution: { reasoningEffort: "default" } });
   assert.deepEqual(activeExternalExecutor(defaultRole, { source: "external", id: "native" })!.args, []);
 });
+
+test("Codex attached effort honors shared and role settings without mutating legacy config", () => {
+  const sharedArgs = ['-cmodel_reasoning_effort="high"', '-cmodel_reasoning_effort_extra="low"', "--sandbox", "read-only"];
+  const roleArgs = ["-c=model_reasoning_effort=low", "-c", "other_model_reasoning_effort=medium", "--role-guard"];
+  const preserved = [...sharedArgs.slice(1), ...roleArgs.slice(1)];
+  for (const model of [undefined, "custom-pinned"])
+    for (const shared of [undefined, "default", "high"] as const)
+      for (const role of [undefined, "default", "medium"] as const) {
+        const config = configFor({ adapter: "codex-cli", model, args: sharedArgs, reasoningEffort: shared,
+          review: { args: roleArgs, reasoningEffort: role }, execution: { args: roleArgs, reasoningEffort: role } });
+        const before = structuredClone(config);
+        const effort = role ?? shared;
+        const expected = effort === undefined ? [...sharedArgs, ...roleArgs]
+          : [...preserved, ...(effort === "default" ? [] : ["-c", `model_reasoning_effort="${effort}"`])];
+        assert.deepEqual(resolveReviewers(config).reviewers[0]!.args, expected);
+        assert.deepEqual(activeExternalExecutor(config, { source: "external", id: "native" })!.args, expected);
+        assert.deepEqual(config, before);
+        assert.deepEqual(config.externalAgents!.native!.args, sharedArgs);
+        assert.deepEqual(config.externalAgents!.native!.execution!.args, roleArgs);
+      }
+});

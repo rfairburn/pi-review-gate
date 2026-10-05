@@ -2,6 +2,28 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { encodeNativeReasoning, importNativeReasoning, nativeReasoningArgs, parseLiteralReasoning, validateNativeReasoning } from "../src/external-agent-reasoning";
 
+test("Codex attached short config options import and filter only exact effort keys", () => {
+  for (const prefix of ["-c", "-c="]) {
+    const effort = `${prefix}model_reasoning_effort="high"`;
+    const unrelated = [`${prefix}other_model_reasoning_effort="low"`, `${prefix}model_reasoning_effort_extra="low"`, "--sandbox", "read-only"];
+    assert.deepEqual(parseLiteralReasoning("codex-cli", [effort, ...unrelated]), {
+      reasoning: { kind: "value", value: "high" }, remainingArgs: unrelated,
+      recognizedSettingCount: 1, removedTokenCount: 1, warnings: [],
+    });
+    const shared = [effort, ...unrelated];
+    const role = ['-cmodel_reasoning_effort="low"', "--role-guard"];
+    assert.deepEqual(nativeReasoningArgs("codex-cli", shared, role, undefined), [...shared, ...role]);
+    assert.deepEqual(nativeReasoningArgs("codex-cli", shared, role, "default"), [...unrelated, "--role-guard"]);
+    assert.deepEqual(nativeReasoningArgs("codex-cli", shared, role, "high"), [...unrelated, "--role-guard", "-c", 'model_reasoning_effort="high"']);
+    const conflicting = parseLiteralReasoning("codex-cli", [effort, "-cmodel_reasoning_effort=low"]);
+    assert.deepEqual(conflicting.reasoning, { kind: "unresolved", reason: "conflicting" });
+    const unknown = parseLiteralReasoning("codex-cli", [`${prefix}model_reasoning_effort="secret-unknown"`]);
+    assert.deepEqual(unknown.reasoning, { kind: "unresolved", reason: "malformed-or-unknown" });
+    assert.deepEqual(unknown.warnings, ["malformed-or-unknown-effort"]);
+    assert.ok(!JSON.stringify(unknown).includes("secret-unknown"));
+  }
+});
+
 test("literal native canonical and equivalent effort forms", () => {
   for (const args of [["--effort", "high"], ["--effort=high"]]) {
     assert.deepEqual(parseLiteralReasoning("claude-cli", args).reasoning, { kind: "value", value: "high" });

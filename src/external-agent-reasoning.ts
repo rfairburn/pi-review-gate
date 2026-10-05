@@ -44,7 +44,9 @@ export function parseLiteralReasoning(adapter: GuidedExternalAgentAdapter, args:
       }
     } else {
       const separate = arg === "-c" || arg === "--config";
-      const config = separate ? args[i + 1] : arg.startsWith("-c=") ? arg.slice(3) : arg.startsWith("--config=") ? arg.slice(9) : undefined;
+      // Codex accepts -c VALUE, -cVALUE, and -c=VALUE; ownership still
+      // depends on the exact config key below, not the short-option prefix.
+      const config = separate ? args[i + 1] : arg.startsWith("-c") ? arg.slice(2).replace(/^=/, "") : arg.startsWith("--config=") ? arg.slice(9) : undefined;
       if (config !== undefined) {
         const separator = config.indexOf("=");
         const key = (separator < 0 ? config : config.slice(0, separator)).trim();

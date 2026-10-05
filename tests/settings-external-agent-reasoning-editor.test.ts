@@ -144,3 +144,66 @@ for (const cancel of ["Cancel", undefined]) test(`opening and ${cancel ?? "Escap
   const { result, notices } = await edit({ adapter: "claude-cli", args: ["--effort=secret"], command: "/secret/path", execution: {} }, [cancel]);
   assert.equal(result, undefined); assert.deepEqual(notices, []);
 });
+
+for (const prefix of ["-c", "-c="]) {
+  test(`Codex ${prefix} attached High imports for shared and role scopes`, async () => {
+    const { result, menus, notices } = await edit({ adapter: "codex-cli", model: "gpt-6.1-sol",
+      command: "/secret-path/codex", args: [`${prefix}model_reasoning_effort="high"`, "secret-arg"],
+      execution: { args: [`${prefix}model_reasoning_effort="low"`] }, review: {} }, ["Apply edit"]);
+    assert.ok(result?.kind === "apply");
+    assert.equal(result.agent.reasoningEffort, "high");
+    assert.equal(result.agent.execution?.reasoningEffort, "low");
+    assert.equal(result.agent.review?.reasoningEffort, undefined);
+    assert.match(JSON.stringify(menus), /Shared reasoning: High/);
+    assert.deepEqual(result.agent.args, []);
+    assert.deepEqual(result.agent.execution?.args, []);
+    assert.doesNotMatch(JSON.stringify([menus, notices]), /secret-path|secret-arg|model_reasoning_effort/);
+  });
+
+  for (const location of ["shared", "review", "execution"] as const) {
+    for (const pattern of ["conflicting", "unknown"] as const) {
+      test(`Codex ${prefix} attached ${pattern} ${location} effort blocks Apply until explicitly resolved`, async () => {
+        const args = pattern === "conflicting" ? [`${prefix}model_reasoning_effort="high"`, "-cmodel_reasoning_effort=low"]
+          : [`${prefix}model_reasoning_effort="secret-unknown"`];
+        const scope = location === "shared" ? { args, execution: {} } : { execution: {}, [location]: { args } };
+        const actions = location === "shared" ? ["Apply edit", "Shared reasoning:", "CLI default", "Apply edit"]
+          : ["Apply edit", `Advanced ${location} overrides`, "Reasoning:", "CLI default", "Back", "Apply edit"];
+        const { result, menus, notices } = await edit({ adapter: "codex-cli", model: "gpt-6.1-sol", command: "/secret-path/codex", ...scope }, actions);
+        assert.ok(result?.kind === "apply");
+        assert.equal((location === "shared" ? result.agent : result.agent[location])?.reasoningEffort, "default");
+        assert.equal(notices.filter(notice => notice.startsWith("Cannot apply")).length, 1);
+        assert.match(JSON.stringify(menus), /Invalid — resolve explicitly/);
+        assert.doesNotMatch(JSON.stringify([menus, notices]), /secret-unknown|secret-path|model_reasoning_effort/);
+      });
+    }
+  }
+}
+
+for (const model of [undefined, "custom-pinned"]) test(`Codex attached High with ${model ?? "default model"} requires verified-model resolution`, async () => {
+  const { result, menus, notices } = await edit({ adapter: "codex-cli", model,
+    args: ['-cmodel_reasoning_effort="high"'], execution: {} }, ["Apply edit", "Shared reasoning:", "CLI default", "Apply edit"]);
+  assert.ok(result?.kind === "apply");
+  assert.equal(result.agent.model, model);
+  assert.equal(result.agent.reasoningEffort, "default");
+  assert.match(notices[0], /Cannot apply/);
+  assert.deepEqual(menus.find(rows => rows.includes("CLI default (no app-owned effort flag)")), ["CLI default (no app-owned effort flag)"]);
+});
+
+test("Codex structured default supersedes stale attached shared and inherited role effort", async () => {
+  const { result, notices } = await edit({ adapter: "codex-cli", model: "gpt-6.1-sol", reasoningEffort: "default",
+    args: ['-cmodel_reasoning_effort="high"'], execution: { args: ["-cmodel_reasoning_effort=low", "-c=model_reasoning_effort=secret-unknown"] } }, ["Apply edit"]);
+  assert.ok(result?.kind === "apply");
+  assert.equal(result.agent.reasoningEffort, "default");
+  assert.equal(result.agent.execution?.reasoningEffort, undefined);
+  assert.deepEqual(result.agent.args, []);
+  assert.deepEqual(result.agent.execution?.args, []);
+  assert.match(notices.join(" "), /stale-literal-effort/);
+  assert.doesNotMatch(notices.join(" "), /secret-unknown|model_reasoning_effort/);
+});
+
+for (const cancel of ["Cancel", undefined]) test(`Codex attached unknown effort remains untouched on ${cancel ?? "Escape"}`, async () => {
+  const { result, notices } = await edit({ adapter: "codex-cli", args: ["-cmodel_reasoning_effort=secret-unknown"],
+    command: "/secret-path/codex", execution: {} }, [cancel]);
+  assert.equal(result, undefined);
+  assert.deepEqual(notices, []);
+});

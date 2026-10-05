@@ -340,11 +340,16 @@ for (const finish of ["Save changes", "Cancel", undefined]) test(`${adapter} del
 
 test("created definition can be edited and renamed before explicit enrollment and shared Save", async () => {
   await workspace(async (path, config) => {
-    creations = [{ ...structuredClone(definitions[0]), command: join(__dirname, "missing", "codex") }];
+    // Use the owned fixture directory, not the host PATH: no Codex is installed here.
+    const fixturePath = join(path, "..");
+    creations = [{ ...structuredClone(definitions[0]), command: join(__dirname, "missing", "codex"), env: { PATH: fixturePath } }];
     const warnings = await menu(path, config, ["External workers", "Create worker", "codex [codex-cli]", "Identifier:", "Apply edit", "Back", "Worker resources", "Add worker resource", "back [codex-cli]", "1  current", "Back", "Save changes"], undefined, ["back"]);
-    assert.equal(warnings.length, 1);
-    assert.match(warnings[0], /Definition back, shared: removed custom executable/);
+    assert.deepEqual(warnings, [
+      "Definition back, shared: removed custom executable (1); using automatic native command.",
+      "External worker back cannot run until its Codex binary is installed and available.",
+    ]);
     assert.equal(config.externalAgents!.back.command, "codex");
+    assert.deepEqual(config.externalAgents!.back.env, { PATH: fixturePath });
     assert.deepEqual(Object.keys(config.externalAgents!), ["back"]);
     assert.deepEqual(config.execution!.workerResources!["external-back"].selection, { source: "external", id: "back" });
     assert.deepEqual(normalizeConfig(JSON.parse(await readFile(path, "utf8"))), config);

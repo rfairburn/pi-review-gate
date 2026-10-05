@@ -20,7 +20,7 @@ dates.
 ### Added
 
 - Create and manage Claude Code and Codex CLI definitions in `/review-settings`,
-  editing ID, adapter, roles, environment, timeouts, and human-readable Model/Reasoning
+  editing ID, adapter, roles, timeouts, and human-readable Model/Reasoning
   choices. Release catalogs include versioned Claude models and eight Codex models;
   custom/pinned values remain until explicitly replaced. Model-specific structured
   `reasoningEffort` supports Shared inheritance and explicit role CLI default (not
@@ -42,6 +42,18 @@ dates.
   or invokes providers; catalogs do not guarantee installed CLI/account access.
   Missing native CLIs on PATH warn without blocking Save, including selected workers;
   runtime failures remain failures (#49).
+
+### Changed
+
+- Simplified the native external worker editors in `/review-settings`: they no longer
+  offer shared/role environment key/value editing or entry counts. `env` remains
+  supported in the `externalAgents` schema and honored at runtime; configure
+  environment variables by editing the configuration file directly, and Apply,
+  rename, and unrelated staged edits preserve existing shared/role environment
+  entries while the roles remain enabled (disabling a role drops that role's
+  overrides, including its environment). The root menu now lists **External
+  workers** immediately below **Worker resources**; ordinary rows and Save/Cancel
+  behavior are unchanged (#49).
 
 ## [0.1.0-dev.117]
 

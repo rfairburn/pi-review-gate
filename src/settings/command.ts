@@ -220,6 +220,7 @@ async function runSettingsMenu(
       { key: "mode", label: "Operating mode", value: OPERATING_MODE_LABELS[operatingMode] },
       { key: "modeCycle", label: "Mode cycle hotkey", value: modeCycleShortcut },
       { key: "resources", label: "Worker resources", value: executorPoolSummary(workerResources) },
+      { key: "externalAgents", label: "External workers", value: `${agents.length} defined` },
       { key: "route.execute", label: "Execution priority", value: workerRouteSummary(executeRoute, workerResources, draftConfig, input.scoped) },
       { key: "route.research", label: "Research priority", value: workerRouteSummary(researchRoute, workerResources, draftConfig, input.scoped) },
       { key: "reviewers", label: "Reviewers", value: `primary ${layerSummary(primaryEnabled, primaryReviewers)} · subtask ${layerSummary(subtaskEnabled, subtaskReviewers)}${reviewStatus}` },
@@ -235,7 +236,6 @@ async function runSettingsMenu(
       ...(input.schedulerRuntime
         ? [{ key: "schedulerRuntime", label: "Scheduler runtime", value: input.schedulerRuntime.enabled ? "On" : "Off" }]
         : []),
-      { key: "externalAgents", label: "External workers", value: `${agents.length} defined` },
       { key: "web", label: "Web", value: `${formatByteSize(webMaxDownloadBytes)} max download · ${browserVisible ? "headed" : "headless"} browser${browserPermissions.yolo ? " · YOLO ON" : ""}` },
     ];
     const renderedRootRows = alignedSettingsRows(rootSections.map((section) => [section.label, section.value] as const));

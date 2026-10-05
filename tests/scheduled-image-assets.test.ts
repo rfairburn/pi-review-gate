@@ -929,7 +929,7 @@ async function runImageFlow(
     keybindings: fakeKeybindingsManager(),
     draft: "chat draft",
     drivers: [
-      keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks
+      keys(...Array(15).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 15)
       keys(KEY_ENTER), // list → task entry (row 0)
       ...(options.skipField
         ? [keys(...Array(10).fill(KEY_DOWN), KEY_ENTER)] // entry editor → Back (row 10)
@@ -956,7 +956,7 @@ async function runImageFlow(
       ...(options.outcome === "cancel"
         ? [keys(KEY_ESCAPE)] // root: leave without saving
         : [
-            keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (scheduled) → Save changes (row 17)
+            keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (scheduled, index 15) → Save changes (row 17)
             ...(options.outcome === "fail" ? [keys(KEY_ESCAPE)] : []), // failed save re-shows the root; leave
           ]),
     ],

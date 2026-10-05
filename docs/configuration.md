@@ -314,16 +314,21 @@ Open `/review-settings` → **External workers** to list every configured defini
 Choose **Create worker** to add a **Claude Code** or **Codex CLI** definition without
 editing JSON. Choose a unique identifier and application, enable execution, review,
 or both roles, then use the human-readable **Model** and **Reasoning** controls.
-Shared and role-specific environment and timeout fields remain editable; role
-environment entries override shared entries, an unset role model inherits Shared,
-and an unset timeout inherits the global role timeout.
+Timeout fields remain editable: an unset role model inherits Shared and an unset
+timeout inherits the global role timeout. The native editors offer no shared/role
+environment key/value editing or entry counts. Environment variables are configured
+by editing the JSON file directly — `env` on the entry and on each role section
+remains valid schema honored at runtime — and Apply, rename, and unrelated staged
+edits preserve existing shared/role environment entries while the roles remain
+enabled (disabling a role drops that role's overrides, including its environment).
 
 Create/Apply automatically stores `command: "claude"` or `command: "codex"` and uses
 the existing fixed native transport. There are no **Application executable**, literal
 argument-list, or protocol-override controls. Generic/binary creation is not offered;
 existing unsupported definitions are listed with **Delete** and **Back** only.
 Authenticate through the CLI's own login/configuration; do not enter credentials
-into the settings file. Summaries show option counts rather than environment values.
+into the settings file. No editor row offers environment editing or displays
+environment values or entry counts.
 Existing read-only research and review safeguards are unchanged.
 
 Creating a definition only adds it to the settings draft. Before saving, explicitly
@@ -344,8 +349,10 @@ authenticate it, or convert a failed run into success.
 #### Manage existing external workers
 
 Existing and newly created **Claude Code** and **Codex CLI** definitions are editable,
-including their ID, adapter, roles, models, reasoning effort, environment, and
-timeouts. A missing binary does not make a supported type read-only. **Keep current**
+including their ID, adapter, roles, models, reasoning effort, and
+timeouts. Environment variables are edited only in the JSON file: manual `env`
+configuration remains fully supported and is preserved by Apply, rename, and other
+edits while the roles remain enabled. A missing binary does not make a supported type read-only. **Keep current**
 preserves custom or pinned shared/role model strings until an explicit replacement
 or unset choice. Model or adapter changes must resolve incompatible reasoning
 explicitly; Apply never silently resets it.
@@ -363,7 +370,9 @@ values, secrets, or paths. Root Cancel still discards the staged normalization.
 Opening, Back, Cancel, or root Save of unrelated changes never normalizes untouched
 native or unsupported entries from the current catalog. Legacy JSON
 arguments, custom commands, environment, timeouts, and models remain compatible in
-untouched configurations; this is not a global removal of argument fields.
+untouched configurations; this is not a global removal of argument or environment
+fields, and Apply itself preserves the edited definition's existing shared/role
+environment entries while its roles remain enabled.
 
 Renaming updates resource selections and primary, subtask, and scheduled reviewer
 references together. Resource IDs, route order, and scheduled resource pins remain

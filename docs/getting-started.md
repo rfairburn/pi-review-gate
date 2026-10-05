@@ -127,7 +127,9 @@ add reviewers and workers through `/review-settings` or by editing the file; unt
 do, no reviewer or worker model is invoked implicitly; no usable review is configured.
 For Claude Code or Codex CLI, open `/review-settings` → **External workers** →
 **Create worker**, choose roles, then use human-readable **Model** and **Reasoning**
-controls plus shared/role environment and timeouts. The executable is automatically
+controls and timeouts. The menus offer no environment key/value editing: configure
+environment variables by editing the JSON file (`env` on the entry or a role), and
+staged edits preserve existing entries while the roles remain enabled. The executable is automatically
 `claude`/`codex` with the fixed native protocol; no executable, argument-list, or
 protocol-override menus are needed. Reasoning choices depend on the effective model;
 CLI default means the CLI's own settings, not no thinking. Role effort inherits

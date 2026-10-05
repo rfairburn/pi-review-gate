@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test, { mock } from "node:test";
 import childProcess from "node:child_process";
-import { normalizeConfig, type ReviewGateConfig } from "../src/config";
+import { normalizeConfig, resolvedExternalAgent, type ReviewGateConfig } from "../src/config";
 import { selectExternalAgentCreation, selectExternalAgentEdit } from "../src/settings/external-agents";
 import { EXTERNAL_AGENT_MODEL_CATALOG } from "../src/settings/external-agent-models";
 import type { UiContext } from "../src/settings/ui";
@@ -73,20 +73,78 @@ test("invalid and duplicate IDs, including prototype-sensitive own IDs, do not i
   s.assertConsumed();
 });
 
-test("shared/role environment and timeout remain editable without argv, executable or protocol controls", async () => {
+test("creation and role menus expose no environment controls and created definitions carry no env", async () => {
   const s = scripted(["Codex", "Identifier:", "Roles:", "Execution and review",
-    "Advanced shared environment:", "Add environment entry", "Back",
-    "Advanced execution overrides", "Environment overrides:", "Add environment entry", "Back",
-    "Timeout (ms):", "Timeout (ms):", "Back", "Create"],
-    ["worker", "TOKEN", "secret-env", "TOKEN", "secret-role-env", "0", "90000"]);
+    "Advanced execution overrides", "Timeout (ms):", "Timeout (ms):", "Back", "Advanced review overrides", "Back", "Create"],
+    ["worker", "0", "90000"]);
   const result = await selectExternalAgentCreation(s.ui, normalizeConfig({}));
   assert.equal(result?.command, "codex");
-  assert.deepEqual(result?.env, { TOKEN: "secret-env" });
-  assert.deepEqual(result?.execution?.env, { TOKEN: "secret-role-env" });
+  assert.equal(result?.env, undefined);
+  assert.equal(result?.execution?.env, undefined);
+  assert.equal(result?.review?.env, undefined);
   assert.equal(result?.execution?.timeoutMs, 90000);
+  // The preserved timeout control still rejects non-positive input.
   assert.equal(s.notices.length, 1);
+  assert.match(s.notices[0]!, /Timeout must be a positive integer/);
+  for (const menu of s.menus) {
+    assert.ok(!menu.options.some((option) => /environment/i.test(option)), `no environment control in ${JSON.stringify(menu.options)}`);
+  }
   const display = JSON.stringify([s.menus, s.notices]);
   assert.doesNotMatch(display, /secret|executable|[Aa]rgument|[Pp]rotocol/);
+  s.assertConsumed();
+});
+
+test("manually configured shared/role environment (including empty maps) survives ordinary Apply, rename and field edits", async () => {
+  const config = normalizeConfig({ externalAgents: { worker: {
+    adapter: "codex-cli", env: { SHARED_TOKEN: "shared-secret" },
+    execution: { env: { ROLE_TOKEN: "role-secret" } }, review: { env: {} },
+  } } });
+  const before = JSON.stringify(config);
+  // Ordinary Apply with a timeout edit; both roles remain enabled.
+  let s = scripted(["Advanced execution overrides", "Timeout (ms):", "Back", "Apply edit"], ["60000"]);
+  let result = await selectExternalAgentEdit(s.ui, config, resolvedExternalAgent(config, "worker")!);
+  assert.ok(result?.kind === "apply");
+  assert.deepEqual(result.agent.env, { SHARED_TOKEN: "shared-secret" });
+  assert.deepEqual(result.agent.execution!.env, { ROLE_TOKEN: "role-secret" });
+  assert.deepEqual(result.agent.review!.env, {});
+  assert.equal(result.agent.execution!.timeoutMs, 60000);
+  assert.deepEqual(s.notices, []);
+  for (const menu of s.menus) assert.ok(!menu.options.some((option) => /environment/i.test(option)));
+  s.assertConsumed();
+  // Rename keeps the environment data intact.
+  s = scripted(["Identifier:", "Apply edit"], ["renamed"]);
+  result = await selectExternalAgentEdit(s.ui, config, resolvedExternalAgent(config, "worker")!);
+  assert.ok(result?.kind === "apply");
+  assert.equal(result.agent.id, "renamed");
+  assert.deepEqual(result.agent.env, { SHARED_TOKEN: "shared-secret" });
+  assert.deepEqual(result.agent.execution!.env, { ROLE_TOKEN: "role-secret" });
+  assert.deepEqual(result.agent.review!.env, {});
+  s.assertConsumed();
+  // Model/reasoning edits (roles untouched) preserve it as well.
+  s = scripted(["Shared model:", "GPT-6.1-Sol", "Shared reasoning:", "High", "Apply edit"]);
+  result = await selectExternalAgentEdit(s.ui, config, resolvedExternalAgent(config, "worker")!);
+  assert.ok(result?.kind === "apply");
+  assert.equal(result.agent.model, "gpt-6.1-sol");
+  assert.equal(result.agent.reasoningEffort, "high");
+  assert.deepEqual(result.agent.env, { SHARED_TOKEN: "shared-secret" });
+  assert.deepEqual(result.agent.execution!.env, { ROLE_TOKEN: "role-secret" });
+  assert.deepEqual(result.agent.review!.env, {});
+  s.assertConsumed();
+  // Switching native adapters also keeps manual env while roles remain enabled.
+  s = scripted(["Adapter:", "Claude Code", "Apply edit"]);
+  result = await selectExternalAgentEdit(s.ui, config, resolvedExternalAgent(config, "worker")!);
+  assert.ok(result?.kind === "apply");
+  assert.equal(result.agent.adapter, "claude-cli");
+  assert.deepEqual(result.agent.env, { SHARED_TOKEN: "shared-secret" });
+  assert.deepEqual(result.agent.execution!.env, { ROLE_TOKEN: "role-secret" });
+  assert.deepEqual(result.agent.review!.env, {});
+  s.assertConsumed();
+  // Cancel discards the session and leaves the stored definition untouched.
+  s = scripted(["Shared model:", undefined, "Cancel"]);
+  result = await selectExternalAgentEdit(s.ui, config, resolvedExternalAgent(config, "worker")!);
+  assert.equal(result, undefined);
+  assert.deepEqual(s.notices, []);
+  assert.equal(JSON.stringify(config), before);
   s.assertConsumed();
 });
 

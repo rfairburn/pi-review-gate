@@ -65,7 +65,7 @@ function tuiUi(harness: TuiSettingsHarness): RetainedUi {
 
 // Root menu row indices (17 sections; the optional Scheduler runtime row adds
 // one more row only when the host provides the switch, then Save + Cancel).
-const ROOT = { resources: 2, routeExecute: 3, reviewers: 5, deferredTools: 12, web: 16, save: 17 } as const;
+const ROOT = { resources: 2, externalAgents: 3, routeExecute: 4, reviewers: 6, deferredTools: 13, web: 16, save: 17 } as const;
 // Web settings row indices.
 const WEB = { permissions: 5 } as const;
 // Browser permissions row indices (field order, then yolo, then Back).
@@ -567,6 +567,31 @@ test("escape at the root discards staged changes without saving", async () => {
   assert.equal(await readFile(configPath, "utf8"), before);
 });
 
+for (const withScheduler of [false, true]) test(`external workers stays directly below resources ${withScheduler ? "with" : "without"} scheduler runtime`, async () => {
+  const { configPath, config } = await makeConfig({ enabled: false });
+  const before = await readFile(configPath, "utf8");
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath,
+    schedulerRuntime: withScheduler ? { enabled: true, setEnabled() { assert.fail("opening must not toggle runtime"); } } : undefined,
+  });
+  let rows: string[] = [];
+  await registered.handler("", { scopedModels: [], ui: {
+    async select(title: string, options: string[]) {
+      assert.equal(title, "Review settings");
+      rows = options;
+      return "Cancel";
+    },
+    notify() {},
+  } });
+  assert.equal(rows.filter(row => row.startsWith("Worker resources")).length, 1);
+  assert.equal(rows.filter(row => row.startsWith("External workers")).length, 1);
+  assert.equal(rows.findIndex(row => row.startsWith("External workers")), rows.findIndex(row => row.startsWith("Worker resources")) + 1);
+  assert.equal(rows.filter(row => row.startsWith("Scheduler runtime")).length, withScheduler ? 1 : 0);
+  assert.equal(rows.length, withScheduler ? 20 : 19);
+  assert.deepEqual(rows.slice(-2), ["Save changes", "Cancel"]);
+  assert.equal(await readFile(configPath, "utf8"), before);
+});
+
 test("plain-select hosts keep the legacy label flow for web permissions (fallback)", async () => {
   const { configPath, config } = await makeConfig({ enabled: false });
   const registered = commandHarness();
@@ -602,7 +627,7 @@ test("plain-select hosts keep the legacy label flow for web permissions (fallbac
   // The root menu includes external worker creation, ending with Save/Cancel.
   const rootOptions = menus[0]!.options;
   assert.equal(rootOptions.length, 19);
-  assert.ok(rootOptions[15]!.startsWith("External workers"));
+  assert.ok(rootOptions[ROOT.externalAgents]!.startsWith("External workers"));
   assert.ok(rootOptions[ROOT.web]!.startsWith("Web"));
   assert.ok(rootOptions[ROOT.web]!.includes("50 MiB max download · headless browser"));
   assert.equal(rootOptions[17], "Save changes");

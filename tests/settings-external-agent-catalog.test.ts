@@ -141,20 +141,26 @@ test("cleanup warnings precede the manager apply callback and never affect unrel
   assert.equal(called, true); s.consumed();
 });
 
-test("environment text cancel preserves values, and unchanged empty environments retain their spelling", async () => {
+test("editor menus expose no environment controls and manual env (including empty maps) retains its spelling through Apply", async () => {
   const config = fixture(), existing = resolvedExternalAgent(config, "A")!;
-  const s = script(["Advanced shared environment:", "Environment entry 1", "Edit value", "Back", "Apply edit"], [undefined]);
+  // A text-field cancel inside the role menu must not disturb the manually
+  // configured shared/role env either.
+  const s = script(["Advanced execution overrides", "Timeout (ms):", "Back", "Apply edit"], [undefined]);
   const result = await selectExternalAgentEdit(s.ui, config, existing);
   assert.ok(result?.kind === "apply");
   const edited = result.agent;
   assert.deepEqual(edited!.args, []); assert.deepEqual(edited!.env, existing.env);
+  assert.deepEqual(edited!.execution!.env, existing.execution!.env);
+  for (const rows of s.menus) assert.ok(!rows.some((row) => /environment/i.test(row)), JSON.stringify(rows));
   assert.ok(!JSON.stringify([s.menus, s.notices]).includes("secret")); s.consumed();
   const emptyConfig = normalizeConfig({ externalAgents: { empty: { adapter: "codex-cli", env: {}, review: { env: {} } } } });
-  const empty = script(["Advanced shared environment:", "Back", "Advanced review overrides", "Environment overrides:", undefined, "Back", "Apply edit"]);
+  const empty = script(["Shared model:", undefined, "Apply edit"]);
   const unchangedResult = await selectExternalAgentEdit(empty.ui, emptyConfig, resolvedExternalAgent(emptyConfig, "empty")!);
   assert.ok(unchangedResult?.kind === "apply");
   const unchanged = unchangedResult.agent;
-  assert.deepEqual(unchanged!.env, {}); assert.deepEqual(unchanged!.review!.env, {}); empty.consumed();
+  assert.deepEqual(unchanged!.env, {}); assert.deepEqual(unchanged!.review!.env, {});
+  for (const rows of empty.menus) assert.ok(!rows.some((row) => /environment/i.test(row)), JSON.stringify(rows));
+  empty.consumed();
 });
 
 for (const adapter of ["claude-cli", "codex-cli"] as const) {

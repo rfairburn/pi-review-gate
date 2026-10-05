@@ -344,9 +344,11 @@ the worker-resource catalog displays alphabetically and edits by key with no reo
 controls; ordering is set only in the two priority routes. Edit Claude/Codex external
 agent definitions separately under **External workers**; renaming an agent updates
 resource selections while retaining resource IDs and route order. Supported editors
-use human-readable Model/Reasoning choices and shared/role environment and timeouts,
+use human-readable Model/Reasoning choices and timeouts,
 with automatic `claude`/`codex` commands and fixed native protocols, not executable,
-argument-list, or protocol-override menus. Only Create/Apply normalizes that definition:
+argument-list, or protocol-override menus, and no environment key/value editing or
+counts. Manual JSON `env` configuration remains fully supported and is preserved by
+Apply, rename, and other edits while the roles remain enabled. Only Create/Apply normalizes that definition:
 legacy effort migrates; other arguments, custom executable paths, and native protocol
 overrides are removed with scoped warnings. Untouched legacy JSON remains compatible. Model-specific effort and every enabled
 role's inheritance must be valid before Apply; incompatible choices require explicit

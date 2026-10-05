@@ -62,54 +62,6 @@ async function selectReasoning(ui: UiContext, draft: ExternalAgentConfig, adapte
   unresolved.delete(location);
 }
 
-/** Keys and values are separate fields; menus reveal neither values nor argv. */
-async function editEnv(ui: UiContext, initial: Record<string, string> | undefined): Promise<Record<string, string> | undefined> {
-  const entries = Object.entries(initial ?? {});
-  let lastKey: string | undefined;
-  while (true) {
-    const choice = await retainedSelect(ui, {
-      title: "Environment — key/value entries",
-      rows: [...entries.map((_, index) => ({ key: String(index), label: `Environment entry ${index + 1}` })),
-        { key: "add", label: "Add environment entry" }, { key: "back", label: "Back" }],
-      initialKey: lastKey,
-    });
-    if (!choice || choice === "back") {
-      if (initial && entries.length === Object.keys(initial).length && entries.every(([key, value]) => Object.hasOwn(initial, key) && initial[key] === value)) return { ...initial };
-      return entries.length ? Object.fromEntries(entries) : undefined;
-    }
-    lastKey = choice;
-    const index = entries.findIndex((_, i) => String(i) === choice);
-    if (choice === "add") {
-      const key = await editSettingText(ui, "Environment key", "");
-      if (key === undefined) continue;
-      if (!key || /[=\0]/.test(key) || entries.some(([existing]) => existing === key)) {
-        await notify(ui, "Use a non-empty, unique environment key without '=' or NUL; edit an existing entry to change its value.", "error");
-        continue;
-      }
-      const value = await editSettingText(ui, "Environment value", "");
-      if (value !== undefined) entries.push([key, value]);
-    } else if (index >= 0) {
-      const action = await retainedSelect(ui, { title: `Environment entry ${index + 1}`, rows: [
-        { key: "key", label: "Edit key" }, { key: "edit", label: "Edit value" },
-        { key: "remove", label: "Remove" }, { key: "back", label: "Back" },
-      ] });
-      if (action === "key") {
-        const key = await editSettingText(ui, "Environment key", entries[index]![0]);
-        if (key !== undefined) {
-          if (!key || /[=\0]/.test(key) || entries.some(([existing], i) => i !== index && existing === key)) {
-            await notify(ui, "Use a non-empty, unique environment key without '=' or NUL.", "error");
-          } else entries[index]![0] = key;
-        }
-      }
-      if (action === "remove") entries.splice(index, 1);
-      if (action === "edit") {
-        const value = await editSettingText(ui, "Environment value", entries[index]![1]);
-        if (value !== undefined) entries[index]![1] = value;
-      }
-    }
-  }
-}
-
 async function editRole(ui: UiContext, adapter: GuidedExternalAgentAdapter, draft: ExternalAgentConfig, location: "execution" | "review", unresolved: Set<ReasoningLocation>): Promise<void> {
   const role = draft[location]!;
   const name = location === "execution" ? "Execution" : "Review";
@@ -118,7 +70,6 @@ async function editRole(ui: UiContext, adapter: GuidedExternalAgentAdapter, draf
     const choice = await retainedSelect(ui, { title: `${name} overrides — model/reasoning inherit shared; other omitted fields use schema defaults`, rows: [
       { key: "model", label: `Model: ${role.model ?? "inherit shared"}` },
       { key: "reasoning", label: `Reasoning: ${reasoningLabel(draft, adapter, location, unresolved)}` },
-      { key: "env", label: `Environment overrides: ${Object.keys(role.env ?? {}).length}` },
       { key: "timeout", label: `Timeout (ms): ${role.timeoutMs ?? "default"}` },
       { key: "back", label: "Back" },
     ], initialKey: lastKey });
@@ -128,7 +79,6 @@ async function editRole(ui: UiContext, adapter: GuidedExternalAgentAdapter, draf
       const model = await selectModel(ui, adapter, true, role.model);
       if (model !== undefined) { if (model === null) delete role.model; else role.model = model; }
     } else if (choice === "reasoning") await selectReasoning(ui, draft, adapter, location, unresolved);
-    else if (choice === "env") role.env = await editEnv(ui, role.env);
     else if (choice === "timeout") {
       const value = await editSettingText(ui, "Timeout in milliseconds (blank = default)", String(role.timeoutMs ?? ""));
       if (value === undefined) continue;
@@ -159,6 +109,8 @@ export async function selectExternalAgentEdit(ui: UiContext, config: ReviewGateC
 
 async function editExternalAgent(ui: UiContext, config: ReviewGateConfig, initial: ExternalAgentConfig, originalId?: string): Promise<ExternalAgentEditResult | undefined> {
   let adapter = initial.adapter as GuidedExternalAgentAdapter;
+  // Environment entries are deliberately not GUI-editable: manually configured
+  // shared/role env (including empty maps) passes through Apply unchanged.
   const draft = structuredClone(initial);
   // Import every scope from the original before installing shared imported effort.
   const imports = importNativeReasoning(adapter, initial);
@@ -176,7 +128,6 @@ async function editExternalAgent(ui: UiContext, config: ReviewGateConfig, initia
       { key: "roles", label: `Roles: ${[draft.execution && "execution", draft.review && "review"].filter(Boolean).join(" + ") || "required"}` },
       { key: "model", label: `Shared model: ${draft.model ?? "CLI default"}` },
       { key: "reasoning", label: `Shared reasoning: ${reasoningLabel(draft, adapter, "shared", unresolved)}` },
-      { key: "env", label: `Advanced shared environment: ${Object.keys(draft.env ?? {}).length}` },
       ...(draft.execution ? [{ key: "execution", label: `Advanced execution overrides${reasoningLabel(draft, adapter, "execution", unresolved).startsWith("Invalid") ? " — invalid reasoning" : ""}` }] : []),
       ...(draft.review ? [{ key: "review", label: `Advanced review overrides${reasoningLabel(draft, adapter, "review", unresolved).startsWith("Invalid") ? " — invalid reasoning" : ""}` }] : []),
       { key: "create", label: originalId === undefined ? "Create" : "Apply edit" },
@@ -217,7 +168,6 @@ async function editExternalAgent(ui: UiContext, config: ReviewGateConfig, initia
       const model = await selectModel(ui, adapter, false, draft.model);
       if (model !== undefined) { if (model === null) delete draft.model; else draft.model = model; }
     } else if (choice === "reasoning") await selectReasoning(ui, draft, adapter, "shared", unresolved);
-    else if (choice === "env") draft.env = await editEnv(ui, draft.env);
     else if (choice === "execution" && draft.execution) await editRole(ui, adapter, draft, "execution", unresolved);
     else if (choice === "review" && draft.review) await editRole(ui, adapter, draft, "review", unresolved);
     else if (choice === "create") {

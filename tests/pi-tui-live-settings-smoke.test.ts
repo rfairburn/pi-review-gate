@@ -188,7 +188,7 @@ test("live Pi TUI smoke: /review-settings workspace field drives the real native
   // clears are not observable as a step boundary through this driver's frame
   // heuristics — see the documented gap in docs/development.md), so in-place
   // clearing is not used as a step boundary.
-  const rootMenuDowns = 14; // "Scheduled tasks" is row 15 of the root menu
+  const rootMenuDowns = 15; // "Scheduled tasks" is row 16 of the root menu
   const taskMenuDowns = 5; // "Workspace" is row 6 after the Destination row
   const slowDowns = (count: number): string => KEYS.down.repeat(count);
   const steps: DriverStep[] = [

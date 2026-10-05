@@ -220,7 +220,6 @@ test("real creation forms share the resource/reviewer draft and persist advanced
       const warnings = await menu(path, config, [
         "External workers", "Create worker", "Codex (codex-cli)", "Identifier:", "Roles:", "Execution and review",
         "Shared model:", "GPT-6.1-Sol", "Shared reasoning:", "High",
-        "Advanced shared environment:", "Add environment entry", "Back",
         "Advanced review overrides", "Timeout (ms):", "Back", "Create",
         "Create worker", "Claude Code (claude-cli)", "Identifier:", "Roles:", "Execution and review",
         "Create", "Back",
@@ -228,13 +227,15 @@ test("real creation forms share the resource/reviewer draft and persist advanced
       ], async () => {
         assert.deepEqual(config, activeBefore);
         assert.equal(await readFile(path, "utf8"), original);
-      }, ["codex", "CUSTOM_OPTION", "literal value", "60000", "claude"]);
+      }, ["codex", "60000", "claude"]);
       assert.equal(warnings.length, 2);
       const reloaded = normalizeConfig(JSON.parse(await readFile(path, "utf8")));
       assert.deepEqual(config, reloaded);
       assert.deepEqual(reloaded.externalAgents!.codex.args, []);
       assert.equal(reloaded.externalAgents!.codex.reasoningEffort, "high");
-      assert.deepEqual(reloaded.externalAgents!.codex.env, { CUSTOM_OPTION: "literal value" });
+      // GUI-created definitions carry no environment data: the menus expose
+      // no env controls, so nothing is staged for a fresh definition.
+      assert.equal(reloaded.externalAgents!.codex.env, undefined);
       assert.equal(reloaded.externalAgents!.codex.review!.timeoutMs, 60000);
       assert.equal(reloaded.externalAgents!.claude.command, "claude");
       assert.deepEqual(Object.keys(reloaded.execution!.workerResources!).sort(), ["external-claude", "external-codex"]);
@@ -271,7 +272,7 @@ for (const availableOnDisk of [true, false]) test(`warnings reflect the saved la
 for (const finish of ["Save changes", "Cancel", undefined]) test(`native rename and edit ${finish ?? "Escape"} preserves resource identities and paired schedule/reviewer state`, async () => {
   await workspace(async (path, config) => {
     Object.assign(config, normalizeConfig({ ...config,
-      externalAgents: { A: { adapter: "claude-cli", command: process.execPath, model: "custom-model", execution: { model: "custom-role" }, review: {} } },
+      externalAgents: { A: { adapter: "claude-cli", command: process.execPath, model: "custom-model", env: { CUSTOM_OPTION: "manual-shared" }, execution: { model: "custom-role", env: { CUSTOM_OPTION: "manual-execution" } }, review: { env: { CUSTOM_OPTION: "manual-review" } } } },
       execution: { ...config.execution, workerResources: { r: { selection: { source: "external", id: "A" }, maxConcurrent: 1 } }, routes: { execute: [{ resourceId: "r" }], research: [{ resourceId: "r" }] } },
       review: { ...config.review, primaryReviewers: [{ source: "external", id: "A" }], subtaskReviewers: [{ source: "external", id: "A" }] },
       scheduledTasks: { task: { name: "Task", enabled: false, cron: "0 * * * *", kind: "execute", instructions: "A literal", workspace: __dirname, workerResourceId: "r", review: { mode: "selected", reviewers: [{ source: "external", id: "A" }] } } },
@@ -288,6 +289,9 @@ for (const finish of ["Save changes", "Cancel", undefined]) test(`native rename 
     assert.deepEqual(saved, config); assert.equal(saved.externalAgents!.A, undefined); assert.equal(saved.externalAgents!.B, undefined);
     assert.equal(saved.externalAgents!.__proto__.command, "claude"); assert.equal(saved.externalAgents!.__proto__.model, "custom-model");
     assert.equal(saved.externalAgents!.__proto__.execution!.model, "custom-role"); assert.equal(saved.externalAgents!.__proto__.execution!.timeoutMs, 60000);
+    assert.deepEqual(saved.externalAgents!.__proto__.env, before.externalAgents!.A.env);
+    assert.deepEqual(saved.externalAgents!.__proto__.execution!.env, before.externalAgents!.A.execution!.env);
+    assert.deepEqual(saved.externalAgents!.__proto__.review!.env, before.externalAgents!.A.review!.env);
     assert.deepEqual(saved.execution!.routes, before.execution!.routes);
     assert.deepEqual(saved.execution!.workerResources!.r.selection, { source: "external", id: "__proto__" });
     assert.deepEqual(saved.review!.primaryReviewers, [{ source: "external", id: "__proto__" }]);

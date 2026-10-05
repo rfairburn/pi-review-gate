@@ -307,12 +307,13 @@ worker catalog follows the same shape and deprecation; see
 
 ### Create external workers in the settings menu
 
-Open `/review-settings` → **External workers** to create a **Claude Code** or
-**Codex CLI** definition without editing JSON. Choose a unique identifier and
-supported application, select execution, review, or both roles, and choose a model
-from that application's menu. The executable may be left at its application default
-(`claude` or `codex`) or set to a path to the matching CLI. Unknown executables and
-generic/binary adapter creation are not offered; existing definitions remain intact.
+Open `/review-settings` → **External workers** to list every configured definition.
+Choose **Create worker** to add a **Claude Code** or **Codex CLI** definition without
+editing JSON. Choose a unique identifier and supported application, select execution,
+review, or both roles, and choose a model from that application's menu. The executable
+may be left at its application default (`claude` or `codex`) or set to a path to the
+matching CLI. Generic/binary adapter creation is not offered. Existing definitions
+of other adapter types remain visible with read-only viewing and deletion controls.
 
 Advanced fields provide structured argument lists and environment entries, plus
 role-specific model, argument, environment, and timeout overrides. Shared arguments
@@ -326,20 +327,49 @@ argument or environment values.
 Creating a definition only adds it to the settings draft. Before saving, explicitly
 add it through **Worker resources** for execution, or select it in the primary and/or
 subtask reviewer sets under **Reviewers** for review. Only configured roles appear
-in their supported selectors. Creation never selects a resource, changes reviewer
-selections, or invokes a provider. **Save changes** saves the definitions together
+in their supported selectors. Creating, listing, viewing, or editing a definition
+never enrolls it in a resource or reviewer pool or invokes a provider. **Save changes** saves the definitions together
 with explicit resource, route, and reviewer selections; reopening/reloading retains
 them. Cancel or leaving the root menu with Escape discards the current edits.
-Existing definitions and unrelated configuration are preserved; a conflicting
-identifier added by another writer is rejected rather than overwritten. Missing
+Untouched definitions and unrelated configuration are preserved; conflicting
+catalog changes by another writer are rejected rather than overwritten. Missing
 Claude Code or Codex CLI binaries warn rather than block Save, whether the definition
 is selected or inactive. The warning identifies affected workers and explains that
 they cannot run until their executable is available. Saving does not install a CLI,
 authenticate it, or convert a failed run into success.
 
+#### Manage existing external workers
+
+Existing and newly created **Claude Code** and **Codex CLI** definitions are editable,
+including their ID, adapter, roles, executable, models, arguments, environment, and
+timeouts. A missing binary does not make a supported type read-only. Editing keeps
+existing shared and role-specific model values, including values outside the bundled
+catalog, unless you explicitly replace or unset them. Changing adapters does not
+silently clear model or argument overrides; choose or clear the executable if the
+old command does not match the newly selected application.
+
+Renaming updates resource selections and primary, subtask, and scheduled reviewer
+references together. Resource IDs, route order, and scheduled resource pins remain
+unchanged: these refer to the same resource, not directly to the renamed definition.
+Invalid or duplicate IDs do not partially change the catalog or its references.
+
+For unsupported adapter types, **Select** opens a read-only definition view; it does
+not activate or enroll the worker. **Delete** removes that definition, resources
+selecting it, their route entries, and primary/subtask/scheduled reviewer references.
+If a scheduled task loses its pinned resource or its explicit reviewer set becomes
+empty, the task is disabled and only the invalid pin or review override resets to
+inheritance. Other task settings and remaining reviewers are retained. The menu
+reports removed references, disabled tasks, and inheritance resets; a later explicit
+re-enable uses the configured defaults rather than the deleted worker.
+
+Edits, renames, and deletion cascades are staged until root **Save changes**. Root
+Cancel or Escape discards them together. Saving rejects conflicting catalog changes
+rather than overwriting another writer's definition. These controls do not add guided
+configuration for generic executables or change runtime adapter safeguards.
+
 #### Release-maintained CLI model catalogs
 
-The creation flow uses separate bundled catalogs, not Pi-scoped model names or live
+The creation and editing flows use separate bundled catalogs, not Pi-scoped model names or live
 provider discovery. Claude Code offers the documented CLI aliases `sonnet`, `opus`,
 `haiku`, `fable`, and `best`; Codex CLI offers `gpt-6.1-sol`, `gpt-6-astra`, and
 `gpt-6-luna`. Unset/inherited model choices leave model selection to the existing
@@ -703,7 +733,7 @@ boundaries are owned by [Web tools](web-tools.md) and
 ## `/review-settings`
 
 The staged settings menu is documented on the [Settings menu](settings.md#review-settings)
-page: its sixteen ordinary rows, the conditional **Scheduler runtime** row, Save/Cancel
+page: its seventeen ordinary rows, the conditional **Scheduler runtime** row, Save/Cancel
 staging and apply semantics, and the shared native text-field behavior. Raw field values
 and defaults stay in this reference — see [Top-level fields](#top-level-fields),
 [Operating modes](#operating-modes), [Reviewers](#reviewers), and

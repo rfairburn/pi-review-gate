@@ -340,9 +340,12 @@ a saved config no longer depends on the legacy import. If you are still on a leg
 array when a release removes that import, first run an intervening release that still
 supports the conversion and save once through `/review-settings` to persist the
 canonical object form, then upgrade to the removing release. In `/review-settings`
-the worker catalog displays alphabetically and edits by key with no reorder controls;
-external agents are not editable in this UI; ordering is set only in the two priority
-routes. Explicitly adding a worker resource enrolls it in each supported role's
+the worker-resource catalog displays alphabetically and edits by key with no reorder
+controls; ordering is set only in the two priority routes. Edit Claude/Codex external
+agent definitions separately under **External workers**; renaming an agent updates
+resource selections while retaining resource IDs and route order. Unsupported types
+can be viewed or deleted there, with explicit reference/schedule cleanup notices. See
+[External worker management](configuration.md#manage-existing-external-workers). Explicitly adding a worker resource enrolls it in each supported role's
 priority (in addition order, with the model's default reasoning); if its model is
 changed before leaving the pool editor, enrollment and reasoning are re-derived
 from the final selection — enrolling it in any supported route it is not yet

@@ -125,15 +125,21 @@ default — no reviewers or workers selected — so a fresh install starts witho
 hand-created config. You then
 add reviewers and workers through `/review-settings` or by editing the file; until you
 do, no reviewer or worker model is invoked implicitly; no usable review is configured.
-For Claude Code or Codex CLI, open `/review-settings` → **External workers** to
-create a definition, choose its roles and application-specific model, and configure
-advanced options without JSON. The new definition is immediately available for
-explicit **Worker resources** or **Reviewers** selection before saving. Creation
-alone activates nothing; select the workers you want, then **Save changes**. If the
-Claude/Codex CLI is missing, Save still succeeds with a warning; affected workers
-cannot run until the executable is installed or available at its configured path. See
-[Creating external workers](configuration.md#create-external-workers-in-the-settings-menu)
-for the flow and release-maintained model catalogs.
+For Claude Code or Codex CLI, open `/review-settings` → **External workers** →
+**Create worker**, choose roles and an application-specific model, and configure
+advanced options without JSON. External workers also lists existing definitions:
+Claude/Codex definitions are fully editable, including ID and adapter; unsupported
+types can be viewed or deleted. Renames keep references paired. Deletion reports
+removed references and disables schedules whose pin or reviewer override becomes
+invalid, resetting invalid references to inheritance.
+
+The new or edited definition is immediately available for explicit **Worker resources**
+or **Reviewers** selection before saving. Creation alone activates nothing; select
+the workers you want, then **Save changes**. If the Claude/Codex CLI is missing, Save
+still succeeds with a warning; affected workers cannot run until the executable is
+installed or available at its configured path. See
+[Creating and managing external workers](configuration.md#create-external-workers-in-the-settings-menu)
+for the flow, inheritance effects, and release-maintained model catalogs.
 
 A minimal example using Codex as the reviewer:
 

@@ -7,7 +7,6 @@ import {
   DEFAULT_SUBTASK_NOTIFICATION_MODE,
   cloneScheduledTaskCatalog,
   cloneExternalAgentCatalog,
-  type ExternalAgentCatalog,
   effectiveReviewSettings,
   externalAgentCatalog,
   externalAgentSupportsReview,
@@ -20,7 +19,7 @@ import { OPERATING_MODE_LABELS } from "../operating-mode";
 import { registerHook, sendNotice } from "../pi";
 import { abortActiveNativeEditorField } from "../native-editor-bridge";
 import { retainedSelect } from "./menu";
-import { selectExternalAgentCreation } from "./external-agents";
+import { changeExternalAgent, manageExternalAgents, stageExternalAgentOperation, type ExternalAgentOperation } from "./external-agent-catalog";
 import { scopedModelChoices, type ScopedModelChoice } from "./models";
 import { persistReviewSettings, replaceConfig } from "./persistence";
 import { prepareScheduledImageAssets, rollbackScheduledImageAssetsUnlessPersisted, type PreparedScheduledImageAssets } from "./scheduled-image-assets";
@@ -128,7 +127,8 @@ async function runSettingsMenu(
     ...input.config,
     externalAgents: cloneExternalAgentCatalog(input.config.externalAgents ?? {}),
   };
-  const externalAgentAdditions: ExternalAgentCatalog = {};
+  const externalAgentOperations: ExternalAgentOperation[] = [];
+  const externalAgentOpening = structuredClone(input.config);
   let operatingMode = input.config.operatingMode;
   let modeCycleShortcut = input.config.modeCycleShortcut;
   // The catalog is keyed by stable resource ID; display order (alphabetical)
@@ -197,6 +197,9 @@ async function runSettingsMenu(
   // /review-settings entry still opens at the head.
   let rootLastKey: string | undefined = initialSection === "scheduled" ? "scheduled" : undefined;
   while (true) {
+    draftConfig.execution = { ...draftConfig.execution, workerResources, routes: { execute: executeRoute, research: researchRoute } };
+    draftConfig.review = { ...draftConfig.review, primaryReviewers, subtaskReviewers, primaryEnabled, subtaskEnabled, reviewLandedChanges };
+    draftConfig.scheduledTasks = scheduledTasks;
     const agents = externalAgentCatalog(draftConfig);
     const totalReviewerChoices = input.scoped.length + agents.filter(externalAgentSupportsReview).length;
     const layerSummary = (enabled: boolean, reviewers: ActiveReviewerSelection[]): string =>
@@ -258,12 +261,23 @@ async function runSettingsMenu(
       continue;
     }
     if (choice === "externalAgents") {
-      const created = await selectExternalAgentCreation(input.ui, draftConfig);
-      if (created) {
-        const { id, ...definition } = created;
-        Object.defineProperty(draftConfig.externalAgents!, id, { value: definition, enumerable: true, writable: true, configurable: true });
-        Object.defineProperty(externalAgentAdditions, id, { value: definition, enumerable: true, writable: true, configurable: true });
-      }
+      await manageExternalAgents(input.ui, draftConfig, async (id, nextId, definition) => {
+        if (!Object.hasOwn(draftConfig.externalAgents ?? {}, id)) {
+          Object.defineProperty(draftConfig.externalAgents!, id, { value: definition, enumerable: true, writable: true, configurable: true });
+          stageExternalAgentOperation(externalAgentOperations, externalAgentOpening, id, nextId, definition);
+          return;
+        }
+        const changed = changeExternalAgent(draftConfig, id, nextId, definition);
+        replaceConfig(draftConfig, changed.config);
+        workerResources = draftConfig.execution!.workerResources!;
+        executeRoute = draftConfig.execution!.routes!.execute ?? [];
+        researchRoute = draftConfig.execution!.routes!.research ?? [];
+        primaryReviewers = draftConfig.review!.primaryReviewers!;
+        subtaskReviewers = draftConfig.review!.subtaskReviewers!;
+        scheduledTasks = draftConfig.scheduledTasks!;
+        stageExternalAgentOperation(externalAgentOperations, externalAgentOpening, id, nextId, definition);
+        for (const notice of changed.notices) await notify(input.ui, notice, "info");
+      });
       continue;
     }
     if (choice === "resources") {
@@ -394,7 +408,8 @@ async function runSettingsMenu(
     try {
       next = await persistReviewSettings(input.configPath!, {
         operatingMode,
-        externalAgentAdditions,
+        externalAgentOperations,
+        externalAgentOpening,
         modeCycleShortcut,
         workerResources,
         executeRoute,
@@ -431,7 +446,9 @@ async function runSettingsMenu(
       // everything when the config cannot be read); the staged catalog keeps
       // the original temporary paths so a later Save can retry either way.
       if (prepared) await rollbackScheduledImageAssetsUnlessPersisted(input.configPath!, prepared);
-      throw error;
+      if (externalAgentOperations.length === 0) throw error;
+      await notify(input.ui, `Cannot save external worker changes: ${error instanceof Error ? error.message : "persistence conflict"}`, "error");
+      continue;
     }
     // Include inactive definitions and additions preserved from the latest
     // on-disk catalog. Availability probes never launch the application.

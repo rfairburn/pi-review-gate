@@ -19,14 +19,16 @@ function matchingCommand(command: string, adapter: GuidedExternalAgentAdapter): 
   return new RegExp(`^${adapter === "claude-cli" ? "claude" : "codex"}(?:\\.cmd|\\.exe)?$`).test(basename ?? "");
 }
 
-async function selectModel(ui: UiContext, adapter: GuidedExternalAgentAdapter, role: boolean): Promise<string | undefined | null> {
+async function selectModel(ui: UiContext, adapter: GuidedExternalAgentAdapter, role: boolean, current?: string): Promise<string | undefined | null> {
   const choice = await retainedSelect(ui, {
     title: "Model — availability depends on CLI/account/provider",
     rows: [
       { key: "unset", label: role ? "Inherit shared model" : "Unset (CLI default)" },
+      ...(current ? [{ key: "keep-current", label: `Keep current model: ${current}` }] : []),
       ...EXTERNAL_AGENT_MODEL_CATALOG[adapter].models.map((model) => ({ key: model.value, label: model.label })),
     ],
   });
+  if (choice === "keep-current") return current;
   if (choice === "unset") return null;
   return EXTERNAL_AGENT_MODEL_CATALOG[adapter].models.some((model) => model.value === choice) ? choice : undefined;
 }
@@ -42,7 +44,10 @@ async function editArgs(ui: UiContext, initial: string[] | undefined): Promise<s
         { key: "add", label: "Add argument" }, { key: "back", label: "Back" }],
       initialKey: lastKey,
     });
-    if (!choice || choice === "back") return args.length ? args : undefined;
+    if (!choice || choice === "back") {
+      if (initial && args.length === initial.length && args.every((value, index) => value === initial[index])) return [...initial];
+      return args.length ? args : undefined;
+    }
     lastKey = choice;
     if (choice === "add") {
       const value = await editSettingText(ui, "New argument (literal value)", "");
@@ -73,7 +78,10 @@ async function editEnv(ui: UiContext, initial: Record<string, string> | undefine
         { key: "add", label: "Add environment entry" }, { key: "back", label: "Back" }],
       initialKey: lastKey,
     });
-    if (!choice || choice === "back") return entries.length ? Object.fromEntries(entries) : undefined;
+    if (!choice || choice === "back") {
+      if (initial && entries.length === Object.keys(initial).length && entries.every(([key, value]) => Object.hasOwn(initial, key) && initial[key] === value)) return { ...initial };
+      return entries.length ? Object.fromEntries(entries) : undefined;
+    }
     lastKey = choice;
     const index = entries.findIndex((_, i) => String(i) === choice);
     if (choice === "add") {
@@ -115,13 +123,22 @@ async function editRole(ui: UiContext, adapter: GuidedExternalAgentAdapter, role
       { key: "args", label: `Additional arguments: ${role.args?.length ?? 0}` },
       { key: "env", label: `Environment overrides: ${Object.keys(role.env ?? {}).length}` },
       { key: "timeout", label: `Timeout (ms): ${role.timeoutMs ?? "default"}` },
+      { key: "protocol", label: `Protocol: ${role.protocol ?? "adapter default"}` },
       { key: "back", label: "Back" },
     ], initialKey: lastKey });
     if (!choice || choice === "back") return;
     lastKey = choice;
     if (choice === "model") {
-      const model = await selectModel(ui, adapter, true);
+      const model = await selectModel(ui, adapter, true, role.model);
       if (model !== undefined) { if (model === null) delete role.model; else role.model = model; }
+    } else if (choice === "protocol") {
+      const selected = await retainedSelect(ui, { title: "Protocol", rows: [
+        { key: "unset", label: "Adapter default" },
+        { key: "pi-review-executor-jsonl-v1", label: "pi-review-executor-jsonl-v1" },
+        { key: "pi-reviewer-json-v1", label: "pi-reviewer-json-v1" },
+      ] });
+      if (selected === "unset") delete role.protocol;
+      else if (selected === "pi-review-executor-jsonl-v1" || selected === "pi-reviewer-json-v1") role.protocol = selected;
     } else if (choice === "args") role.args = await editArgs(ui, role.args);
     else if (choice === "env") role.env = await editEnv(ui, role.env);
     else if (choice === "timeout") {
@@ -139,10 +156,20 @@ async function editRole(ui: UiContext, adapter: GuidedExternalAgentAdapter, role
 export async function selectExternalAgentCreation(ui: UiContext, config: ReviewGateConfig): Promise<ExternalAgentConfig | undefined> {
   let adapter = await selectAdapter(ui);
   if (!adapter) return undefined;
-  const draft: ExternalAgentConfig = { id: "", adapter };
+  return editExternalAgent(ui, config, { id: "", adapter });
+}
+
+export async function selectExternalAgentEdit(ui: UiContext, config: ReviewGateConfig, existing: ExternalAgentConfig): Promise<ExternalAgentConfig | undefined> {
+  if (existing.adapter !== "claude-cli" && existing.adapter !== "codex-cli") return undefined;
+  return editExternalAgent(ui, config, existing, existing.id);
+}
+
+async function editExternalAgent(ui: UiContext, config: ReviewGateConfig, initial: ExternalAgentConfig, originalId?: string): Promise<ExternalAgentConfig | undefined> {
+  let adapter = initial.adapter as GuidedExternalAgentAdapter;
+  const draft = structuredClone(initial);
   let lastKey: string | undefined;
   while (true) {
-    const choice = await retainedSelect(ui, { title: "Create external agent definition", rows: [
+    const choice = await retainedSelect(ui, { title: originalId === undefined ? "Create external agent definition" : "Edit external worker definition", rows: [
       { key: "id", label: `Identifier: ${draft.id || "required"}` },
       { key: "adapter", label: `Adapter: ${adapter}` },
       { key: "command", label: `Application executable: ${draft.command ? "configured" : "PATH default"}` },
@@ -152,7 +179,7 @@ export async function selectExternalAgentCreation(ui: UiContext, config: ReviewG
       { key: "env", label: `Advanced shared environment: ${Object.keys(draft.env ?? {}).length}` },
       ...(draft.execution ? [{ key: "execution", label: "Advanced execution overrides" }] : []),
       ...(draft.review ? [{ key: "review", label: "Advanced review overrides" }] : []),
-      { key: "create", label: "Create" }, { key: "cancel", label: "Cancel" },
+      { key: "create", label: originalId === undefined ? "Create" : "Apply edit" }, { key: "cancel", label: "Cancel" },
     ], initialKey: lastKey });
     if (!choice || choice === "cancel") return undefined;
     lastKey = choice;
@@ -161,7 +188,7 @@ export async function selectExternalAgentCreation(ui: UiContext, config: ReviewG
       if (value !== undefined) {
         try {
           normalizeConfig({ externalAgents: Object.fromEntries([[value, { adapter, execution: {} }]]) });
-          if (Object.prototype.hasOwnProperty.call(config.externalAgents ?? {}, value)) throw new Error("duplicate");
+          if (value !== originalId && Object.prototype.hasOwnProperty.call(config.externalAgents ?? {}, value)) throw new Error("duplicate");
           draft.id = value;
         } catch {
           await notify(ui, "Identifier must be unique and contain only letters, numbers, underscores, periods, hyphens; '.' and '..' are not allowed.", "error");
@@ -171,15 +198,17 @@ export async function selectExternalAgentCreation(ui: UiContext, config: ReviewG
       const selected = await selectAdapter(ui);
       if (selected && selected !== adapter) {
         adapter = selected; draft.adapter = adapter;
-        delete draft.command; delete draft.model;
-        if (draft.execution) delete draft.execution.model;
-        if (draft.review) delete draft.review.model;
+        if (originalId === undefined) {
+          delete draft.command; delete draft.model;
+          if (draft.execution) delete draft.execution.model;
+          if (draft.review) delete draft.review.model;
+        }
       }
     } else if (choice === "command") {
       const value = await editSettingText(ui, "Application executable path (blank = PATH default)", draft.command ?? "");
       if (value === undefined) continue;
       if (!value.trim()) delete draft.command;
-      else if (matchingCommand(value.trim(), adapter)) draft.command = value.trim();
+      else if (matchingCommand(value.trim(), adapter) || (value.trim() === initial.command && adapter === initial.adapter)) draft.command = value.trim();
       else await notify(ui, `Choose the ${adapter === "claude-cli" ? "claude" : "codex"} executable (optional .cmd/.exe), or leave blank for PATH lookup. Unknown executables are not supported here.`, "error");
     } else if (choice === "roles") {
       const roles = await retainedSelect(ui, { title: "Supported roles", rows: [
@@ -190,14 +219,17 @@ export async function selectExternalAgentCreation(ui: UiContext, config: ReviewG
         if (roles !== "execution") draft.review ??= {}; else delete draft.review;
       }
     } else if (choice === "model") {
-      const model = await selectModel(ui, adapter, false);
+      const model = await selectModel(ui, adapter, false, draft.model);
       if (model !== undefined) { if (model === null) delete draft.model; else draft.model = model; }
     } else if (choice === "args") draft.args = await editArgs(ui, draft.args);
     else if (choice === "env") draft.env = await editEnv(ui, draft.env);
     else if (choice === "execution" && draft.execution) await editRole(ui, adapter, draft.execution, "Execution");
     else if (choice === "review" && draft.review) await editRole(ui, adapter, draft.review, "Review");
     else if (choice === "create") {
-      if (Object.prototype.hasOwnProperty.call(config.externalAgents ?? {}, draft.id)) {
+      if (draft.command && !matchingCommand(draft.command, adapter) && !(adapter === initial.adapter && draft.command === initial.command)) {
+        await notify(ui, `Choose or clear the ${adapter === "claude-cli" ? "claude" : "codex"} executable before applying this adapter change. Existing configuration has been retained.`, "error"); continue;
+      }
+      if (draft.id !== originalId && Object.prototype.hasOwnProperty.call(config.externalAgents ?? {}, draft.id)) {
         await notify(ui, "Identifier already exists; choose a unique identifier before Create.", "error"); continue;
       }
       try {

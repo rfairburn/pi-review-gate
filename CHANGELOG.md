@@ -19,14 +19,18 @@ dates.
 
 ### Added
 
-- Create Claude Code and Codex CLI worker definitions through `/review-settings`,
-  with application-specific release-maintained model menus and structured shared
-  and role-specific options. New definitions are available for explicit worker
-  resource and reviewer selection before saving, without automatic activation or
-  provider calls. Save definitions and selections together while preserving existing
-  configuration and rejecting concurrent identifier collisions. Missing Claude/Codex
-  binaries warn without blocking Save; affected workers still fail until their CLI
-  is available (#49).
+- Create and manage Claude Code and Codex CLI worker definitions through
+  `/review-settings`, with release-maintained application model menus and structured
+  shared/role options. List all definitions and fully edit supported types, including
+  ID and adapter; renames keep references paired, preserving resource identities and
+  existing model values until explicitly replaced. Unsupported types offer read-only
+  viewing and deletion with vocal reference-cleanup notices; invalidated schedules
+  are disabled and their invalid pins/review overrides reset to inheritance. New or
+  edited definitions are available for explicit resource/reviewer selection before
+  Save, without automatic enrollment or provider calls. Save the shared draft while
+  preserving unrelated configuration and rejecting catalog conflicts. Missing
+  Claude/Codex binaries warn without blocking Save; runtime failures remain failures
+  (#49).
 
 ## [0.1.0-dev.117]
 

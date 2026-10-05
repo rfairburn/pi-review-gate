@@ -6,7 +6,8 @@ import Module from "node:module";
 import { effectiveReviewSettings, externalAgentCatalog, normalizeConfig, type ExternalAgentConfig, type ReviewGateConfig } from "../src/config";
 import { validateSelection } from "../src/settings/validation";
 import { validateScheduledTasks } from "../src/settings/scheduled-tasks";
-import { selectExternalAgentCreation as realCreator } from "../src/settings/external-agents";
+import * as realExternalAgents from "../src/settings/external-agents";
+const realCreator = realExternalAgents.selectExternalAgentCreation;
 
 // Exercise selection/persistence with controlled definitions, plus the real
 // creation form below to establish the complete menu-to-save path.
@@ -16,6 +17,7 @@ const loader = Module as unknown as { _load: (request: string, ...args: unknown[
 const originalLoad = loader._load;
 loader._load = function (request, ...args) {
   if (request === "./external-agents") return {
+    ...realExternalAgents,
     async selectExternalAgentCreation(ui: import("../src/settings/ui").UiContext, draft: ReviewGateConfig) {
       if (useCreationForm) return realCreator(ui, draft);
       const created = creations.shift();
@@ -78,7 +80,7 @@ async function menu(path: string, config: ReviewGateConfig, actions: Action[], b
   assert.equal(inputs.length, 0);
   return warnings;
 }
-const createBoth: Action[] = ["External workers", "External workers"];
+const createBoth: Action[] = ["External workers", "Create worker", "Create worker", "Back"];
 const selectExplicitly: Action[] = [
   "Worker resources", "Add worker resource", "codex [codex-cli]", "1  current",
   "Add worker resource", "claude [claude-cli]", "1  current", "Back",
@@ -196,12 +198,12 @@ test("real creation forms share the resource/reviewer draft and persist advanced
     useCreationForm = true;
     try {
       const warnings = await menu(path, config, [
-        "External workers", "Codex (codex-cli)", "Identifier:", "Roles:", "Execution and review",
+        "External workers", "Create worker", "Codex (codex-cli)", "Identifier:", "Roles:", "Execution and review",
         "Advanced shared arguments:", "Add argument", "Back",
         "Advanced shared environment:", "Add environment entry", "Back",
         "Advanced review overrides", "Timeout (ms):", "Back", "Create",
-        "External workers", "Claude Code (claude-cli)", "Identifier:", "Roles:", "Execution and review",
-        "Application executable:", "Create",
+        "Create worker", "Claude Code (claude-cli)", "Identifier:", "Roles:", "Execution and review",
+        "Application executable:", "Create", "Back",
         ...selectExplicitly, "Save changes",
       ], async () => {
         assert.deepEqual(config, activeBefore);
@@ -245,11 +247,78 @@ for (const availableOnDisk of [true, false]) test(`warnings reflect the saved la
   });
 });
 
+for (const finish of ["Save changes", "Cancel", undefined]) test(`native rename and edit ${finish ?? "Escape"} preserves resource identities and paired schedule/reviewer state`, async () => {
+  await workspace(async (path, config) => {
+    Object.assign(config, normalizeConfig({ ...config,
+      externalAgents: { A: { adapter: "claude-cli", command: process.execPath, model: "custom-model", execution: { model: "custom-role" }, review: {} } },
+      execution: { ...config.execution, workerResources: { r: { selection: { source: "external", id: "A" }, maxConcurrent: 1 } }, routes: { execute: [{ resourceId: "r" }], research: [{ resourceId: "r" }] } },
+      review: { ...config.review, primaryReviewers: [{ source: "external", id: "A" }], subtaskReviewers: [{ source: "external", id: "A" }] },
+      scheduledTasks: { task: { name: "Task", enabled: false, cron: "0 * * * *", kind: "execute", instructions: "A literal", workspace: __dirname, workerResourceId: "r", review: { mode: "selected", reviewers: [{ source: "external", id: "A" }] } } },
+    }));
+    const original = JSON.stringify(config); await writeFile(path, original);
+    const before = structuredClone(config);
+    await menu(path, config, ["External workers", "A [claude-cli]", "Identifier:", "Advanced execution overrides", "Timeout (ms):", "Back", "Shared model:", undefined, "Apply edit", "B [claude-cli]", "Identifier:", "Apply edit", "Back", finish], async () => {
+      assert.deepEqual(config, before); assert.equal(await readFile(path, "utf8"), original);
+    }, ["B", "60000", "__proto__"]);
+    if (finish !== "Save changes") {
+      assert.deepEqual(config, before); assert.equal(await readFile(path, "utf8"), original); return;
+    }
+    const saved = normalizeConfig(JSON.parse(await readFile(path, "utf8")));
+    assert.deepEqual(saved, config); assert.equal(saved.externalAgents!.A, undefined); assert.equal(saved.externalAgents!.B, undefined);
+    assert.equal(saved.externalAgents!.__proto__.command, process.execPath); assert.equal(saved.externalAgents!.__proto__.model, "custom-model");
+    assert.equal(saved.externalAgents!.__proto__.execution!.model, "custom-role"); assert.equal(saved.externalAgents!.__proto__.execution!.timeoutMs, 60000);
+    assert.deepEqual(saved.execution!.routes, before.execution!.routes);
+    assert.deepEqual(saved.execution!.workerResources!.r.selection, { source: "external", id: "__proto__" });
+    assert.deepEqual(saved.review!.primaryReviewers, [{ source: "external", id: "__proto__" }]);
+    assert.deepEqual(saved.review!.subtaskReviewers, [{ source: "external", id: "__proto__" }]);
+    assert.equal(saved.scheduledTasks!.task.workerResourceId, "r"); assert.equal(saved.scheduledTasks!.task.enabled, false);
+    assert.deepEqual(saved.scheduledTasks!.task.review, { mode: "selected", reviewers: [{ source: "external", id: "__proto__" }] });
+    assert.equal(saved.scheduledTasks!.task.instructions, "A literal");
+  });
+});
+
+for (const finish of ["Save changes", "Cancel", undefined]) test(`unsupported deletion ${finish ?? "Escape"} is one shared transaction`, async () => {
+  await workspace(async (path, config) => {
+    Object.assign(config, normalizeConfig({ ...config,
+      externalAgents: { X: { adapter: "run-as-binary", command: process.execPath, execution: { protocol: "pi-review-executor-jsonl-v1" }, review: { protocol: "pi-reviewer-json-v1" } } },
+      execution: { ...config.execution, workerResources: { arbitrary: { selection: { source: "external", id: "X" }, maxConcurrent: 1 } }, routes: { execute: [{ resourceId: "arbitrary" }], research: [] } },
+      review: { ...config.review, primaryReviewers: [{ source: "external", id: "X" }], subtaskReviewers: [{ source: "external", id: "X" }] },
+      scheduledTasks: { task: { name: "Task", enabled: true, cron: "0 * * * *", kind: "execute", instructions: "X literal", workspace: __dirname, workerResourceId: "arbitrary", review: { mode: "selected", reviewers: [{ source: "external", id: "X" }] } } },
+    }));
+    const original = JSON.stringify(config); await writeFile(path, original);
+    const before = structuredClone(config);
+    await menu(path, config, ["External workers", "X [run-as-binary]", "Delete", "Back", finish], async () => {
+      assert.deepEqual(config, before); assert.equal(await readFile(path, "utf8"), original);
+    });
+    if (finish !== "Save changes") {
+      assert.deepEqual(config, before); assert.equal(await readFile(path, "utf8"), original); return;
+    }
+    const saved = normalizeConfig(JSON.parse(await readFile(path, "utf8")));
+    assert.deepEqual(saved, config); assert.deepEqual(saved.externalAgents, {});
+    assert.deepEqual(saved.execution!.workerResources, {}); assert.deepEqual(saved.execution!.routes, { execute: [], research: [] });
+    assert.deepEqual(saved.review!.primaryReviewers, []); assert.deepEqual(saved.review!.subtaskReviewers, []);
+    assert.equal(saved.scheduledTasks!.task.enabled, false); assert.equal(saved.scheduledTasks!.task.workerResourceId, undefined); assert.equal(saved.scheduledTasks!.task.review, undefined);
+    assert.equal(saved.scheduledTasks!.task.instructions, "X literal");
+  });
+});
+
+test("created definition can be edited and renamed before explicit enrollment and shared Save", async () => {
+  await workspace(async (path, config) => {
+    creations = [{ ...structuredClone(definitions[0]), command: join(__dirname, "missing", "codex") }];
+    const warnings = await menu(path, config, ["External workers", "Create worker", "codex [codex-cli]", "Identifier:", "Apply edit", "Back", "Worker resources", "Add worker resource", "back [codex-cli]", "1  current", "Back", "Save changes"], undefined, ["back"]);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /back.*cannot run until its Codex binary is installed and available/);
+    assert.deepEqual(Object.keys(config.externalAgents!), ["back"]);
+    assert.deepEqual(config.execution!.workerResources!["external-back"].selection, { source: "external", id: "back" });
+    assert.deepEqual(normalizeConfig(JSON.parse(await readFile(path, "utf8"))), config);
+  });
+});
+
 test("creation-form cancellation stages no definition", async () => {
   await workspace(async (path, config, original) => {
     const activeBefore = structuredClone(config);
     creations = [undefined];
-    await menu(path, config, ["External workers", "Cancel"]);
+    await menu(path, config, ["External workers", "Create worker", "Back", "Cancel"]);
     assert.deepEqual(config, activeBefore);
     assert.equal(await readFile(path, "utf8"), original);
   });

@@ -1,6 +1,6 @@
 # Settings menu
 
-This page owns the staged `/review-settings` settings menu: its sixteen ordinary rows,
+This page owns the staged `/review-settings` settings menu: its seventeen ordinary rows,
 the conditional **Scheduler runtime** row, Save/Cancel staging and apply semantics, and
 the shared native text-field behavior. Raw field values and defaults are owned by the
 [Configuration](configuration.md) reference, and scheduled-task semantics are documented
@@ -8,11 +8,11 @@ on [Scheduled tasks](scheduled-tasks.md#scheduled-task-fields).
 
 ## `/review-settings`
 
-`/review-settings` opens one staged settings transaction with sixteen ordinary rows —
+`/review-settings` opens one staged settings transaction with seventeen ordinary rows —
 Operating mode, Mode cycle hotkey, Worker resources, Execution priority, Research
 priority, Reviewers, Timeouts, Review policy, Bundle retention, Global concurrency,
 Retry policy, Subtask notifications, Deferred Pi tools, Subtasks view, Scheduled
-tasks, and Web — plus a conditional **Scheduler runtime** row when the host runtime
+tasks, External workers, and Web — plus a conditional **Scheduler runtime** row when the host runtime
 supplies the live switch (the ordinary extension entry point always does):
 
 - **Operating mode** stages the primary assistant posture; **Save changes** persists it
@@ -83,6 +83,15 @@ supplies the live switch (the ordinary extension entry point always does):
   fields block Save with a named validation error. Entries stay visible and
   editable regardless of the **Scheduler runtime** switch, and saving never
   clears entries. See [Scheduled task fields](scheduled-tasks.md#scheduled-task-fields).
+- **External workers** lists the shared external-agent catalog. Create and fully edit
+  Claude Code/Codex CLI definitions, including ID and adapter, with application-specific
+  model menus and structured shared/role options. Renames migrate existing references
+  without changing resource IDs or route order. Other adapter types expose view-only
+  Select and Delete; deletion reports removed references and disables schedules whose
+  pin or explicit reviewer set becomes invalid, resetting invalid references to
+  inheritance. Creation/viewing does not enroll workers in pools or invoke providers.
+  Everything remains staged until root Save; missing Claude/Codex binaries warn rather
+  than block saving. See [External worker management](configuration.md#manage-existing-external-workers).
 - **Scheduler runtime** (the conditional row, shown when the host runtime provides
   the switch; the ordinary extension entry point supplies it) is a
   live, current-process-only On/Off toggle for scheduled execution: it applies

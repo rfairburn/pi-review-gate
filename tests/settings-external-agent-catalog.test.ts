@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeConfig, resolvedExternalAgent } from "../src/config";
 import { changeExternalAgent, guardExternalAgentReferences, manageExternalAgents, stageExternalAgentOperation, type ExternalAgentOperation } from "../src/settings/external-agent-catalog";
-import { selectExternalAgentEdit } from "../src/settings/external-agents";
+import { selectExternalAgentCreation, selectExternalAgentEdit } from "../src/settings/external-agents";
 import type { UiContext } from "../src/settings/ui";
 
 function fixture() {
@@ -72,7 +72,7 @@ test("delete cascades actual resources, routes, both layers, dormant tasks and e
   assert.ok(opening.externalAgents!.X);
 });
 
-test("catalog lists native/unsupported and action-name IDs; unsupported offers only Delete/Back, Back is inert, native has no Delete", async () => {
+test("catalog lists native/unsupported and action-name IDs; unsupported offers only Delete/Back, Back and native Cancel are inert", async () => {
   const config = normalizeConfig({ externalAgents: Object.fromEntries(["create", "back", "__proto__"].map((id, index) => [id, index === 2 ? { adapter: "generic-cli", command: "unused", review: {} } : { adapter: "codex-cli", execution: {} }])) });
   const before = structuredClone(config);
   const s = script(["__proto__", "Back", "create [", "Cancel", "back [", "Cancel", "Back"]);
@@ -82,7 +82,10 @@ test("catalog lists native/unsupported and action-name IDs; unsupported offers o
   assert.ok(s.menus[0].includes("Create worker"));
   assert.deepEqual(s.menus[1], ["Delete", "Back"]);
   assert.deepEqual(s.notices, []);
-  assert.ok(!s.menus.filter((rows) => rows.some((row) => row.startsWith("Identifier:"))).some((rows) => rows.includes("Delete")));
+  const editors = s.menus.filter((rows) => rows.some((row) => row.startsWith("Identifier:")));
+  assert.equal(editors.length, 2);
+  assert.ok(editors[0].includes("Delete create"));
+  assert.ok(editors[1].includes("Delete back"));
   s.consumed();
 });
 
@@ -98,36 +101,113 @@ test("unsupported Delete passes only the selected ID to the apply callback", asy
   s.consumed();
 });
 
-test("native edits preserve custom command/models and field cancel; adapter switch requires executable correction without clearing fields", async () => {
+test("native edits normalize only edited commands/args/protocol, preserve models/env and field cancel", async () => {
   const config = fixture(); const existing = resolvedExternalAgent(config, "A")!;
   const s = script(["Shared model:", undefined, "Advanced execution overrides", "Model:", "Keep current", "Timeout (ms):", "Back", "Apply edit"], ["60000"]);
-  const edited = await selectExternalAgentEdit(s.ui, config, existing);
-  assert.equal(edited!.command, existing.command); assert.equal(edited!.model, "old-custom");
+  const result = await selectExternalAgentEdit(s.ui, config, existing);
+  assert.ok(result?.kind === "apply");
+  const edited = result.agent;
+  assert.equal(edited!.command, "claude"); assert.equal(edited!.model, "old-custom");
   assert.equal(edited!.execution!.model, "pinned"); assert.equal(edited!.execution!.timeoutMs, 60000);
-  assert.deepEqual(edited!.args, existing.args); assert.deepEqual(edited!.env, existing.env);
-  assert.deepEqual(edited!.execution!.args, existing.execution!.args); assert.deepEqual(edited!.execution!.env, existing.execution!.env);
-  assert.equal(edited!.execution!.protocol, existing.execution!.protocol);
+  assert.deepEqual(edited!.args, []); assert.deepEqual(edited!.env, existing.env);
+  assert.deepEqual(edited!.execution!.args, []); assert.deepEqual(edited!.execution!.env, existing.execution!.env);
+  assert.equal(edited!.execution!.protocol, undefined);
   assert.ok(!JSON.stringify([s.menus, s.notices]).includes("secret"));
   s.consumed();
-  const switched = script(["Adapter:", "Codex", "Apply edit", "Application executable:", "Apply edit"], [""]);
-  const changed = await selectExternalAgentEdit(switched.ui, config, existing);
+  const switched = script(["Adapter:", "Codex", "Apply edit"]);
+  const switchedResult = await selectExternalAgentEdit(switched.ui, config, existing);
+  assert.ok(switchedResult?.kind === "apply");
+  const changed = switchedResult.agent;
   assert.equal(changed!.adapter, "codex-cli"); assert.equal(changed!.command, "codex");
   assert.equal(changed!.model, "old-custom"); assert.equal(changed!.execution!.model, "pinned"); assert.equal(changed!.review!.model, "review-pinned");
-  assert.deepEqual(changed!.args, existing.args); assert.deepEqual(changed!.env, existing.env);
-  assert.deepEqual(changed!.execution, existing.execution); assert.deepEqual(changed!.review, existing.review);
-  assert.match(switched.notices[0], /Choose or clear.*codex.*retained/); switched.consumed();
+  assert.deepEqual(changed!.args, []); assert.deepEqual(changed!.env, existing.env);
+  assert.deepEqual(changed!.execution, { ...existing.execution, args: [], protocol: undefined });
+  assert.deepEqual(changed!.review, { ...existing.review, args: [], protocol: undefined });
+  assert.ok(switched.notices.some(notice => /removed custom executable/.test(notice))); switched.consumed();
 });
 
-test("argument/environment text cancel preserves literals, and unchanged empty environments retain their spelling", async () => {
+test("cleanup warnings precede the manager apply callback and never affect unrelated definitions", async () => {
+  const config = fixture(), before = structuredClone(config);
+  const s = script(["A [", "Apply edit", "Back"]);
+  let called = false;
+  await manageExternalAgents(s.ui, config, async (id, _nextId, definition) => {
+    called = true;
+    assert.equal(id, "A");
+    assert.ok(s.notices.some(notice => /removed custom executable/.test(notice)));
+    assert.ok(s.notices.some(notice => /removed other argument tokens 1/.test(notice)));
+    assert.equal(definition?.command, "claude");
+    assert.deepEqual(config, before);
+  });
+  assert.equal(called, true); s.consumed();
+});
+
+test("environment text cancel preserves values, and unchanged empty environments retain their spelling", async () => {
   const config = fixture(), existing = resolvedExternalAgent(config, "A")!;
-  const s = script(["Advanced shared arguments:", "Argument 1", "Edit value", "Back", "Advanced shared environment:", "Environment entry 1", "Edit value", "Back", "Apply edit"], [undefined, undefined]);
-  const edited = await selectExternalAgentEdit(s.ui, config, existing);
-  assert.deepEqual(edited!.args, existing.args); assert.deepEqual(edited!.env, existing.env);
+  const s = script(["Advanced shared environment:", "Environment entry 1", "Edit value", "Back", "Apply edit"], [undefined]);
+  const result = await selectExternalAgentEdit(s.ui, config, existing);
+  assert.ok(result?.kind === "apply");
+  const edited = result.agent;
+  assert.deepEqual(edited!.args, []); assert.deepEqual(edited!.env, existing.env);
   assert.ok(!JSON.stringify([s.menus, s.notices]).includes("secret")); s.consumed();
   const emptyConfig = normalizeConfig({ externalAgents: { empty: { adapter: "codex-cli", env: {}, review: { env: {} } } } });
   const empty = script(["Advanced shared environment:", "Back", "Advanced review overrides", "Environment overrides:", undefined, "Back", "Apply edit"]);
-  const unchanged = await selectExternalAgentEdit(empty.ui, emptyConfig, resolvedExternalAgent(emptyConfig, "empty")!);
+  const unchangedResult = await selectExternalAgentEdit(empty.ui, emptyConfig, resolvedExternalAgent(emptyConfig, "empty")!);
+  assert.ok(unchangedResult?.kind === "apply");
+  const unchanged = unchangedResult.agent;
   assert.deepEqual(unchanged!.env, {}); assert.deepEqual(unchanged!.review!.env, {}); empty.consumed();
+});
+
+for (const adapter of ["claude-cli", "codex-cli"] as const) {
+  test(`${adapter}: direct Delete uses original identity and discards invalid, unapplied edits`, async () => {
+    const config = fixture();
+    config.externalAgents!.A.adapter = adapter;
+    const before = structuredClone(config);
+    const s = script(["Identifier:", "Shared model:", "Unset", "Adapter:", adapter === "claude-cli" ? "Codex" : "Claude Code", "Delete A"], ["unapplied-name"]);
+    assert.deepEqual(await selectExternalAgentEdit(s.ui, config, resolvedExternalAgent(config, "A")!), { kind: "delete", id: "A" });
+    assert.deepEqual(config, before);
+    // Delete must still work without implicit Apply or cleanup warnings.
+    assert.deepEqual(s.notices, []);
+    assert.ok(s.menus[0].includes("Apply edit"));
+    assert.ok(s.menus[0].includes("Delete A"));
+    assert.ok(s.menus[0].includes("Cancel"));
+    assert.ok(s.menus.at(-1)!.includes("Identifier: unapplied-name"));
+    assert.ok(s.menus.at(-1)!.includes("Delete A"));
+    s.consumed();
+  });
+
+  test(`${adapter}: manager dispatches direct Delete through the existing ID-only callback`, async () => {
+    const config = normalizeConfig({ externalAgents: { custom: { adapter, execution: {}, review: {} } } });
+    const before = structuredClone(config), calls: unknown[][] = [];
+    const s = script(["custom [", "Identifier:", "Delete custom", "Back"], ["not-applied"]);
+    await manageExternalAgents(s.ui, config, async (...args) => { calls.push(args); });
+    assert.deepEqual(calls, [["custom"]]);
+    assert.equal(s.menus[1][0], "Identifier: custom");
+    assert.deepEqual(config, before);
+    s.consumed();
+  });
+
+  for (const cancel of ["Cancel", undefined]) test(`${adapter}: editor ${cancel ?? "Escape"} discards unapplied edits`, async () => {
+    const config = normalizeConfig({ externalAgents: { custom: { adapter, execution: {} } } });
+    const before = structuredClone(config);
+    const s = script(["custom [", "Identifier:", "Shared model:", "Unset", cancel, "Back"], ["not-applied"]);
+    await manageExternalAgents(s.ui, config, async () => { throw new Error("Canceled editor applied a change"); });
+    assert.deepEqual(config, before);
+    assert.deepEqual(s.notices, []);
+    s.consumed();
+  });
+}
+
+test("initial creation has Cancel but no Delete and preserves the untagged creation API", async () => {
+  const config = normalizeConfig({});
+  const s = script(["Claude Code", "Identifier:", "Roles:", "Execution only", "Create"], ["created"]);
+  const created = await selectExternalAgentCreation(s.ui, config);
+  assert.equal(created?.id, "created");
+  assert.equal(created?.adapter, "claude-cli");
+  for (const rows of s.menus.filter((rows) => rows.some((row) => row.startsWith("Identifier:")))) {
+    assert.ok(rows.includes("Cancel"));
+    assert.ok(!rows.some((row) => row.startsWith("Delete")));
+  }
+  s.consumed();
 });
 
 test("operation lineage coalesces repeated rename and unsaved creation edits", () => {

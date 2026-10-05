@@ -1,8 +1,9 @@
-import { normalizeConfig, resolvedExternalAgent, type ExternalAgentConfig, type ExternalAgentRoleConfig, type ReviewGateConfig } from "../config";
+import { normalizeConfig, resolvedExternalAgent, type ExternalAgentConfig, type ReviewGateConfig } from "../config";
 import { retainedSelect } from "./menu";
 import { editSettingText } from "./text-input";
 import { notify, type UiContext } from "./ui";
-import { EXTERNAL_AGENT_MODEL_CATALOG, type GuidedExternalAgentAdapter } from "./external-agent-models";
+import { EXTERNAL_AGENT_MODEL_CATALOG, externalAgentModelCapability, type GuidedExternalAgentAdapter } from "./external-agent-models";
+import { importNativeReasoning, validateNativeReasoning, type NativeReasoningEffort, type ReasoningLocation } from "../external-agent-reasoning";
 
 const adapters = [
   { key: "claude-cli", label: "Claude Code (claude-cli)" },
@@ -12,11 +13,6 @@ const adapters = [
 async function selectAdapter(ui: UiContext): Promise<GuidedExternalAgentAdapter | undefined> {
   const choice = await retainedSelect(ui, { title: "Application adapter", rows: adapters });
   return choice === "claude-cli" || choice === "codex-cli" ? choice : undefined;
-}
-
-function matchingCommand(command: string, adapter: GuidedExternalAgentAdapter): boolean {
-  const basename = command.split(/[\\/]/).pop()?.toLowerCase();
-  return new RegExp(`^${adapter === "claude-cli" ? "claude" : "codex"}(?:\\.cmd|\\.exe)?$`).test(basename ?? "");
 }
 
 async function selectModel(ui: UiContext, adapter: GuidedExternalAgentAdapter, role: boolean, current?: string): Promise<string | undefined | null> {
@@ -33,38 +29,37 @@ async function selectModel(ui: UiContext, adapter: GuidedExternalAgentAdapter, r
   return EXTERNAL_AGENT_MODEL_CATALOG[adapter].models.some((model) => model.value === choice) ? choice : undefined;
 }
 
-/** Arguments are individual literal argv entries, never shell-split or summarized. */
-async function editArgs(ui: UiContext, initial: string[] | undefined): Promise<string[] | undefined> {
-  const args = [...(initial ?? [])];
-  let lastKey: string | undefined;
-  while (true) {
-    const choice = await retainedSelect(ui, {
-      title: "Arguments — individual literal entries",
-      rows: [...args.map((_, index) => ({ key: String(index), label: `Argument ${index + 1}` })),
-        { key: "add", label: "Add argument" }, { key: "back", label: "Back" }],
-      initialKey: lastKey,
-    });
-    if (!choice || choice === "back") {
-      if (initial && args.length === initial.length && args.every((value, index) => value === initial[index])) return [...initial];
-      return args.length ? args : undefined;
-    }
-    lastKey = choice;
-    if (choice === "add") {
-      const value = await editSettingText(ui, "New argument (literal value)", "");
-      if (value !== undefined) args.push(value);
-    } else {
-      const index = args.findIndex((_, i) => String(i) === choice);
-      if (index < 0) continue;
-      const action = await retainedSelect(ui, { title: `Argument ${index + 1}`, rows: [
-        { key: "edit", label: "Edit value" }, { key: "remove", label: "Remove" }, { key: "back", label: "Back" },
-      ] });
-      if (action === "remove") args.splice(index, 1);
-      if (action === "edit") {
-        const value = await editSettingText(ui, "Argument value", args[index]!);
-        if (value !== undefined) args[index] = value;
-      }
-    }
-  }
+const effortLabels: Record<NativeReasoningEffort, string> = {
+  default: "CLI default", low: "Low", medium: "Medium", high: "High",
+  xhigh: "Extra High (xhigh)", max: "Max", ultra: "Ultra — automatic task delegation",
+};
+
+function reasoningLabel(draft: ExternalAgentConfig, adapter: GuidedExternalAgentAdapter, location: ReasoningLocation, unresolved: Set<ReasoningLocation>): string {
+  const scope = location === "shared" ? draft : draft[location]!;
+  const invalid = unresolved.has(location) || (location !== "shared" && scope.reasoningEffort === undefined && unresolved.has("shared"))
+    || validateNativeReasoning(adapter, draft).some((issue) => issue.location === location);
+  return `${invalid ? "Invalid — resolve explicitly; " : ""}${scope.reasoningEffort === undefined ? (location === "shared" ? "CLI default" : "inherit shared") : effortLabels[scope.reasoningEffort] ?? "invalid effort"}`;
+}
+
+async function selectReasoning(ui: UiContext, draft: ExternalAgentConfig, adapter: GuidedExternalAgentAdapter, location: ReasoningLocation, unresolved: Set<ReasoningLocation>): Promise<void> {
+  const scope = location === "shared" ? draft : draft[location]!;
+  const model = scope.model ?? (location === "shared" ? undefined : draft.model);
+  const levels = model ? externalAgentModelCapability(adapter, model)?.effortLevels ?? [] : [];
+  const inheritedEffort = draft.reasoningEffort;
+  const canInherit = location !== "shared" && !unresolved.has("shared")
+    && (inheritedEffort === undefined || inheritedEffort === "default" || levels.some((level) => level === inheritedEffort));
+  const choice = await retainedSelect(ui, { title: "Reasoning — native model capabilities", rows: [
+    ...(canInherit ? [{ key: "inherit", label: "Inherit shared reasoning" }] : []),
+    { key: "default", label: "CLI default (no app-owned effort flag)" },
+    ...levels.map((level) => ({ key: level, label: effortLabels[level] })),
+  ], initialKey: scope.reasoningEffort ?? (location === "shared" ? "default" : "inherit") });
+  if (choice === "inherit" && canInherit) {
+    delete scope.reasoningEffort;
+  } else if (choice === "default" || levels.some((level) => level === choice)) {
+    scope.reasoningEffort = choice as NativeReasoningEffort;
+  } else return;
+  delete scope.args;
+  unresolved.delete(location);
 }
 
 /** Keys and values are separate fields; menus reveal neither values nor argv. */
@@ -115,15 +110,16 @@ async function editEnv(ui: UiContext, initial: Record<string, string> | undefine
   }
 }
 
-async function editRole(ui: UiContext, adapter: GuidedExternalAgentAdapter, role: ExternalAgentRoleConfig, name: string): Promise<void> {
+async function editRole(ui: UiContext, adapter: GuidedExternalAgentAdapter, draft: ExternalAgentConfig, location: "execution" | "review", unresolved: Set<ReasoningLocation>): Promise<void> {
+  const role = draft[location]!;
+  const name = location === "execution" ? "Execution" : "Review";
   let lastKey: string | undefined;
   while (true) {
-    const choice = await retainedSelect(ui, { title: `${name} overrides — omitted fields inherit schema defaults`, rows: [
+    const choice = await retainedSelect(ui, { title: `${name} overrides — model/reasoning inherit shared; other omitted fields use schema defaults`, rows: [
       { key: "model", label: `Model: ${role.model ?? "inherit shared"}` },
-      { key: "args", label: `Additional arguments: ${role.args?.length ?? 0}` },
+      { key: "reasoning", label: `Reasoning: ${reasoningLabel(draft, adapter, location, unresolved)}` },
       { key: "env", label: `Environment overrides: ${Object.keys(role.env ?? {}).length}` },
       { key: "timeout", label: `Timeout (ms): ${role.timeoutMs ?? "default"}` },
-      { key: "protocol", label: `Protocol: ${role.protocol ?? "adapter default"}` },
       { key: "back", label: "Back" },
     ], initialKey: lastKey });
     if (!choice || choice === "back") return;
@@ -131,15 +127,7 @@ async function editRole(ui: UiContext, adapter: GuidedExternalAgentAdapter, role
     if (choice === "model") {
       const model = await selectModel(ui, adapter, true, role.model);
       if (model !== undefined) { if (model === null) delete role.model; else role.model = model; }
-    } else if (choice === "protocol") {
-      const selected = await retainedSelect(ui, { title: "Protocol", rows: [
-        { key: "unset", label: "Adapter default" },
-        { key: "pi-review-executor-jsonl-v1", label: "pi-review-executor-jsonl-v1" },
-        { key: "pi-reviewer-json-v1", label: "pi-reviewer-json-v1" },
-      ] });
-      if (selected === "unset") delete role.protocol;
-      else if (selected === "pi-review-executor-jsonl-v1" || selected === "pi-reviewer-json-v1") role.protocol = selected;
-    } else if (choice === "args") role.args = await editArgs(ui, role.args);
+    } else if (choice === "reasoning") await selectReasoning(ui, draft, adapter, location, unresolved);
     else if (choice === "env") role.env = await editEnv(ui, role.env);
     else if (choice === "timeout") {
       const value = await editSettingText(ui, "Timeout in milliseconds (blank = default)", String(role.timeoutMs ?? ""));
@@ -152,36 +140,53 @@ async function editRole(ui: UiContext, adapter: GuidedExternalAgentAdapter, role
   }
 }
 
+export type ExternalAgentEditResult =
+  | { kind: "apply"; agent: ExternalAgentConfig }
+  | { kind: "delete"; id: string };
+
 /** Creates a definition only: no catalog mutations, enrollment, activation or CLI calls. */
 export async function selectExternalAgentCreation(ui: UiContext, config: ReviewGateConfig): Promise<ExternalAgentConfig | undefined> {
-  let adapter = await selectAdapter(ui);
+  const adapter = await selectAdapter(ui);
   if (!adapter) return undefined;
-  return editExternalAgent(ui, config, { id: "", adapter });
+  const result = await editExternalAgent(ui, config, { id: "", adapter });
+  return result?.kind === "apply" ? result.agent : undefined;
 }
 
-export async function selectExternalAgentEdit(ui: UiContext, config: ReviewGateConfig, existing: ExternalAgentConfig): Promise<ExternalAgentConfig | undefined> {
+export async function selectExternalAgentEdit(ui: UiContext, config: ReviewGateConfig, existing: ExternalAgentConfig): Promise<ExternalAgentEditResult | undefined> {
   if (existing.adapter !== "claude-cli" && existing.adapter !== "codex-cli") return undefined;
   return editExternalAgent(ui, config, existing, existing.id);
 }
 
-async function editExternalAgent(ui: UiContext, config: ReviewGateConfig, initial: ExternalAgentConfig, originalId?: string): Promise<ExternalAgentConfig | undefined> {
+async function editExternalAgent(ui: UiContext, config: ReviewGateConfig, initial: ExternalAgentConfig, originalId?: string): Promise<ExternalAgentEditResult | undefined> {
   let adapter = initial.adapter as GuidedExternalAgentAdapter;
   const draft = structuredClone(initial);
+  // Import every scope from the original before installing shared imported effort.
+  const imports = importNativeReasoning(adapter, initial);
+  const unresolved = new Set<ReasoningLocation>();
+  for (const entry of imports) {
+    const scope = entry.location === "shared" ? draft : draft[entry.location]!;
+    if (entry.reasoning.kind === "unresolved") unresolved.add(entry.location);
+    else if (entry.reasoning.kind === "value" || entry.reasoning.kind === "structured") scope.reasoningEffort = entry.reasoning.value;
+  }
   let lastKey: string | undefined;
   while (true) {
     const choice = await retainedSelect(ui, { title: originalId === undefined ? "Create external agent definition" : "Edit external worker definition", rows: [
       { key: "id", label: `Identifier: ${draft.id || "required"}` },
       { key: "adapter", label: `Adapter: ${adapter}` },
-      { key: "command", label: `Application executable: ${draft.command ? "configured" : "PATH default"}` },
       { key: "roles", label: `Roles: ${[draft.execution && "execution", draft.review && "review"].filter(Boolean).join(" + ") || "required"}` },
       { key: "model", label: `Shared model: ${draft.model ?? "CLI default"}` },
-      { key: "args", label: `Advanced shared arguments: ${draft.args?.length ?? 0}` },
+      { key: "reasoning", label: `Shared reasoning: ${reasoningLabel(draft, adapter, "shared", unresolved)}` },
       { key: "env", label: `Advanced shared environment: ${Object.keys(draft.env ?? {}).length}` },
-      ...(draft.execution ? [{ key: "execution", label: "Advanced execution overrides" }] : []),
-      ...(draft.review ? [{ key: "review", label: "Advanced review overrides" }] : []),
-      { key: "create", label: originalId === undefined ? "Create" : "Apply edit" }, { key: "cancel", label: "Cancel" },
+      ...(draft.execution ? [{ key: "execution", label: `Advanced execution overrides${reasoningLabel(draft, adapter, "execution", unresolved).startsWith("Invalid") ? " — invalid reasoning" : ""}` }] : []),
+      ...(draft.review ? [{ key: "review", label: `Advanced review overrides${reasoningLabel(draft, adapter, "review", unresolved).startsWith("Invalid") ? " — invalid reasoning" : ""}` }] : []),
+      { key: "create", label: originalId === undefined ? "Create" : "Apply edit" },
+      ...(originalId !== undefined ? [{ key: "delete", label: `Delete ${originalId}` }] : []),
+      { key: "cancel", label: "Cancel" },
     ], initialKey: lastKey });
     if (!choice || choice === "cancel") return undefined;
+    // Delete the selected definition, not any unapplied identity or field edits.
+    // This action intentionally bypasses Apply validation.
+    if (choice === "delete" && originalId !== undefined) return { kind: "delete", id: originalId };
     lastKey = choice;
     if (choice === "id") {
       const value = await editSettingText(ui, "Unique identifier (letters, numbers, underscores, periods, hyphens)", draft.id);
@@ -198,47 +203,58 @@ async function editExternalAgent(ui: UiContext, config: ReviewGateConfig, initia
       const selected = await selectAdapter(ui);
       if (selected && selected !== adapter) {
         adapter = selected; draft.adapter = adapter;
-        if (originalId === undefined) {
-          delete draft.command; delete draft.model;
-          if (draft.execution) delete draft.execution.model;
-          if (draft.review) delete draft.review.model;
-        }
+        draft.command = adapter === "claude-cli" ? "claude" : "codex";
       }
-    } else if (choice === "command") {
-      const value = await editSettingText(ui, "Application executable path (blank = PATH default)", draft.command ?? "");
-      if (value === undefined) continue;
-      if (!value.trim()) delete draft.command;
-      else if (matchingCommand(value.trim(), adapter) || (value.trim() === initial.command && adapter === initial.adapter)) draft.command = value.trim();
-      else await notify(ui, `Choose the ${adapter === "claude-cli" ? "claude" : "codex"} executable (optional .cmd/.exe), or leave blank for PATH lookup. Unknown executables are not supported here.`, "error");
     } else if (choice === "roles") {
       const roles = await retainedSelect(ui, { title: "Supported roles", rows: [
         { key: "execution", label: "Execution only" }, { key: "review", label: "Review only" }, { key: "both", label: "Execution and review" },
       ] });
       if (roles === "execution" || roles === "review" || roles === "both") {
-        if (roles !== "review") draft.execution ??= {}; else delete draft.execution;
-        if (roles !== "execution") draft.review ??= {}; else delete draft.review;
+        if (roles !== "review") draft.execution ??= {}; else { delete draft.execution; unresolved.delete("execution"); }
+        if (roles !== "execution") draft.review ??= {}; else { delete draft.review; unresolved.delete("review"); }
       }
     } else if (choice === "model") {
       const model = await selectModel(ui, adapter, false, draft.model);
       if (model !== undefined) { if (model === null) delete draft.model; else draft.model = model; }
-    } else if (choice === "args") draft.args = await editArgs(ui, draft.args);
+    } else if (choice === "reasoning") await selectReasoning(ui, draft, adapter, "shared", unresolved);
     else if (choice === "env") draft.env = await editEnv(ui, draft.env);
-    else if (choice === "execution" && draft.execution) await editRole(ui, adapter, draft.execution, "Execution");
-    else if (choice === "review" && draft.review) await editRole(ui, adapter, draft.review, "Review");
+    else if (choice === "execution" && draft.execution) await editRole(ui, adapter, draft, "execution", unresolved);
+    else if (choice === "review" && draft.review) await editRole(ui, adapter, draft, "review", unresolved);
     else if (choice === "create") {
-      if (draft.command && !matchingCommand(draft.command, adapter) && !(adapter === initial.adapter && draft.command === initial.command)) {
-        await notify(ui, `Choose or clear the ${adapter === "claude-cli" ? "claude" : "codex"} executable before applying this adapter change. Existing configuration has been retained.`, "error"); continue;
+      const unresolvedEnabled = [...unresolved].filter((location) => location === "shared" || draft[location]);
+      const issues = validateNativeReasoning(adapter, draft);
+      if (unresolvedEnabled.length || issues.length) {
+        await notify(ui, `Cannot apply: resolve invalid reasoning in ${[...new Set([...unresolvedEnabled, ...issues.map((issue) => issue.location)])].join(", ")}; choose a compatible model/level, CLI default, or compatible inheritance.`, "error");
+        continue;
       }
       if (draft.id !== originalId && Object.prototype.hasOwnProperty.call(config.externalAgents ?? {}, draft.id)) {
         await notify(ui, "Identifier already exists; choose a unique identifier before Create.", "error"); continue;
       }
       try {
-        const { id, ...definition } = draft;
+        const candidate = structuredClone(draft);
+        candidate.command = adapter === "claude-cli" ? "claude" : "codex";
+        delete candidate.args;
+        for (const location of ["review", "execution"] as const) {
+          if (candidate[location]) { delete candidate[location]!.args; delete candidate[location]!.protocol; }
+        }
+        const { id, ...definition } = candidate;
         const validated = normalizeConfig({ externalAgents: Object.fromEntries([[id, definition]]) });
-        return resolvedExternalAgent(validated, id);
+        // Diagnostics use original adapter/counts, never secret-bearing values.
+        for (const entry of imports) {
+          if (entry.recognizedSettingCount || entry.droppedOtherTokenCount || entry.warnings.length) {
+            await notify(ui, `Definition ${id}, ${entry.location}: normalized/cleared legacy reasoning settings ${entry.recognizedSettingCount}; removed other argument tokens ${entry.droppedOtherTokenCount}${entry.warnings.length ? `; ${entry.warnings.join(", ")}` : ""}.`, "warning");
+          }
+        }
+        for (const location of ["review", "execution"] as const) {
+          if (initial[location]?.protocol !== undefined) await notify(ui, `Definition ${id}, ${location}: removed protocol override (1).`, "warning");
+        }
+        if (initial.command && initial.command !== (initial.adapter === "claude-cli" ? "claude" : "codex")) {
+          await notify(ui, `Definition ${id}, shared: removed custom executable (1); using automatic native command.`, "warning");
+        }
+        return { kind: "apply", agent: resolvedExternalAgent(validated, id)! };
       } catch {
         // Never echo validation input: arguments/environment may contain secrets.
-        await notify(ui, "Cannot create: supply a valid unique identifier, a supported application executable and at least one explicit role.", "error");
+        await notify(ui, "Cannot apply: supply a valid unique identifier and at least one explicit role.", "error");
       }
     }
   }

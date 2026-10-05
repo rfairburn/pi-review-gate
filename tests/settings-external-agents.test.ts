@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test, { mock } from "node:test";
 import childProcess from "node:child_process";
 import { normalizeConfig, type ReviewGateConfig } from "../src/config";
-import { selectExternalAgentCreation } from "../src/settings/external-agents";
+import { selectExternalAgentCreation, selectExternalAgentEdit } from "../src/settings/external-agents";
 import { EXTERNAL_AGENT_MODEL_CATALOG } from "../src/settings/external-agent-models";
 import type { UiContext } from "../src/settings/ui";
 
@@ -31,7 +31,7 @@ function scripted(selects: Step[], edits: Step[] = []) {
 }
 
 for (const [adapter, application, model] of [
-  ["claude-cli", "Claude Code", "sonnet"], ["codex-cli", "Codex", "gpt-6.1-sol"],
+  ["claude-cli", "Claude Code", "claude-opus-5-5"], ["codex-cli", "Codex", "gpt-6.1-sol"],
 ] as const) {
   test(`${adapter}: creates without activation, role models are application-specific`, async () => {
     const config = normalizeConfig({ externalAgents: {} });
@@ -73,39 +73,33 @@ test("invalid and duplicate IDs, including prototype-sensitive own IDs, do not i
   s.assertConsumed();
 });
 
-test("structured shared/role args and env, literal secrets, timeout feedback and executable validation", async () => {
-  const s = scripted(["Codex", "Identifier:", "Application executable:", "Application executable:",
-    "Roles:", "Execution and review", "Advanced shared arguments:", "Add argument", "Add argument", "Argument 1", "Edit value", "Back",
-    "Advanced shared environment:", "Add environment entry", "Add environment entry", "Add environment entry", "Environment entry 1", "Edit value", "Back",
-    "Advanced execution overrides", "Additional arguments:", "Add argument", "Back", "Environment overrides:", "Add environment entry", "Back",
-    "Timeout (ms):", "Timeout (ms):", "Timeout (ms):", "Timeout (ms):", "Back", "Create"],
-  ["codex-worker", "/bin/unknown", "C:\\Apps\\codex.cmd", "secret-arg", "second-secret", "changed-secret",
-    "TOKEN", "secret-env", "TOKEN", "OTHER", "other-secret", "changed-env-secret", "role-secret", "TOKEN", "role-env-secret", "0", "1.5", "90000", ""]);
-  const config = normalizeConfig({});
-  const result = await selectExternalAgentCreation(s.ui, config);
-  assert.equal(result?.command, "C:\\Apps\\codex.cmd");
-  assert.deepEqual(result?.args, ["changed-secret", "second-secret"]);
-  assert.deepEqual(result?.env, { TOKEN: "changed-env-secret", OTHER: "other-secret" });
-  assert.deepEqual(result?.execution?.args, ["role-secret"]);
-  assert.deepEqual(result?.execution?.env, { TOKEN: "role-env-secret" });
-  assert.equal(result?.execution?.timeoutMs, undefined);
-  assert.equal(s.notices.length, 4);
-  assert.ok(s.notices.some((notice) => /positive integer.*60000/.test(notice)));
+test("shared/role environment and timeout remain editable without argv, executable or protocol controls", async () => {
+  const s = scripted(["Codex", "Identifier:", "Roles:", "Execution and review",
+    "Advanced shared environment:", "Add environment entry", "Back",
+    "Advanced execution overrides", "Environment overrides:", "Add environment entry", "Back",
+    "Timeout (ms):", "Timeout (ms):", "Back", "Create"],
+    ["worker", "TOKEN", "secret-env", "TOKEN", "secret-role-env", "0", "90000"]);
+  const result = await selectExternalAgentCreation(s.ui, normalizeConfig({}));
+  assert.equal(result?.command, "codex");
+  assert.deepEqual(result?.env, { TOKEN: "secret-env" });
+  assert.deepEqual(result?.execution?.env, { TOKEN: "secret-role-env" });
+  assert.equal(result?.execution?.timeoutMs, 90000);
+  assert.equal(s.notices.length, 1);
   const display = JSON.stringify([s.menus, s.notices]);
-  for (const secret of ["secret-arg", "second-secret", "changed-secret", "secret-env", "changed-env-secret", "other-secret", "role-secret", "role-env-secret"]) {
-    assert.ok(!display.includes(secret), `Summary leaked ${secret}`);
-  }
+  assert.doesNotMatch(display, /secret|executable|[Aa]rgument|[Pp]rotocol/);
   s.assertConsumed();
 });
 
-test("optional overrides inherit, unset model works, adapter changes clear incompatible models and command", async () => {
-  const s = scripted(["Claude Code", "Identifier:", "Roles:", "Execution only", "Shared model:", "Sonnet", "Application executable:",
-    "Advanced execution overrides", "Model:", "Opus", "Timeout (ms):", "Back", "Adapter:", "Codex", "Shared model:", "GPT-6 Luna", "Shared model:", "Unset", "Create"],
-  ["agent", "/usr/bin/claude.exe", "60000"]);
-  const result = await selectExternalAgentCreation(s.ui, normalizeConfig({}));
-  assert.equal(result?.adapter, "codex-cli"); assert.equal(result?.command, "codex");
-  assert.equal(result?.model, undefined); assert.equal(result?.execution?.model, undefined);
-  assert.equal(result?.execution?.timeoutMs, 60000); assert.equal(result?.review, undefined);
+test("adapter changes retain model strings and compatible effort, automatic command replaces custom executable", async () => {
+  const config = normalizeConfig({externalAgents: { agent: { adapter: "claude-cli", command: "/secret/claude", model: "claude-opus-5-5", reasoningEffort: "high", execution: {} } }});
+  const s = scripted(["Adapter:", "Codex", "Apply edit", "Shared model:", "GPT-6.1-Sol", "Apply edit"]);
+  const result = await selectExternalAgentEdit(s.ui, config, {id: "agent", ...config.externalAgents!.agent});
+  assert.ok(result?.kind === "apply");
+  assert.equal(result.agent.command, "codex"); assert.equal(result.agent.reasoningEffort, "high");
+  assert.ok(s.menus.some(menu => menu.options.includes("Shared model: claude-opus-5-5")));
+  assert.match(s.notices[0], /resolve invalid reasoning/);
+  assert.match(s.notices[1], /removed custom executable/);
+  assert.ok(!JSON.stringify(s.menus.concat()).includes("/secret"));
   s.assertConsumed();
 });
 
@@ -123,38 +117,22 @@ test("cancellation never creates; text cancellation preserves the draft; invalid
   s.assertConsumed();
 });
 
-test("missing matching executable is accepted without process or provider invocation", async () => {
+test("automatic command creation never invokes process/provider", async () => {
   const forbidden = () => { throw new Error("Creation must not invoke a process/provider"); };
-  const spawn = mock.method(childProcess, "spawn", forbidden);
-  const spawnSync = mock.method(childProcess, "spawnSync", forbidden);
-  const exec = mock.method(childProcess, "exec", forbidden);
-  const execFile = mock.method(childProcess, "execFile", forbidden);
-  const fetch = mock.method(globalThis, "fetch", forbidden);
+  const spies = [mock.method(childProcess, "spawn", forbidden), mock.method(childProcess, "spawnSync", forbidden),
+    mock.method(childProcess, "exec", forbidden), mock.method(childProcess, "execFile", forbidden), mock.method(globalThis, "fetch", forbidden)];
   try {
-    const s = scripted(["Claude Code", "Identifier:", "Application executable:", "Roles:", "Execution only", "Create"],
-      ["missing-cli", "/nonexistent/application-directory/claude"]);
+    const s = scripted(["Claude Code", "Identifier:", "Roles:", "Execution only", "Create"], ["worker"]);
     const result = await selectExternalAgentCreation(s.ui, normalizeConfig({}));
-    assert.equal(result?.command, "/nonexistent/application-directory/claude");
-    for (const spy of [spawn, spawnSync, exec, execFile, fetch]) assert.equal(spy.mock.callCount(), 0);
+    assert.equal(result?.command, "claude");
+    for (const spy of spies) assert.equal(spy.mock.callCount(), 0);
     s.assertConsumed();
   } finally { mock.restoreAll(); }
 });
 
-test("structured entries can be renamed/removed, with invalid keys rejected and positive timeout retained", async () => {
-  const s = scripted(["Codex", "Identifier:", "Roles:", "Review only", "Advanced shared arguments:", "Add argument", "Argument 1", "Remove", "Back",
-    "Advanced shared environment:", "Add environment entry", "Add environment entry", "Environment entry 1", "Edit key", "Environment entry 1", "Edit key", "Environment entry 1", "Remove", "Back",
-    "Advanced review overrides", "Timeout (ms):", "Back", "Create"],
-  ["entry-editor", "removed-secret", "bad=key", "OLD", "removed-env-secret", "", "NEW", "60000"]);
-  const result = await selectExternalAgentCreation(s.ui, normalizeConfig({}));
-  assert.deepEqual(result?.args, []); assert.equal(result?.env, undefined);
-  assert.equal(result?.review?.timeoutMs, 60000);
-  assert.equal(s.notices.length, 2);
-  s.assertConsumed();
-});
-
 test("catalog records release verification provenance without runtime discovery", () => {
   for (const catalog of Object.values(EXTERNAL_AGENT_MODEL_CATALOG)) {
-    assert.equal(catalog.verifiedOn, "2026-10-04");
+    assert.equal(catalog.verifiedOn, "2026-10-05");
     assert.match(catalog.source, /^https:\/\//);
     assert.ok(catalog.models.length > 0);
   }

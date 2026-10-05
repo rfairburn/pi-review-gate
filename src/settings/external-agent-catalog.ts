@@ -118,7 +118,8 @@ export async function manageExternalAgents(ui: UiContext, config: ReviewGateConf
     const agent = resolvedExternalAgent(config, id)!;
     if (agent.adapter === "claude-cli" || agent.adapter === "codex-cli") {
       const edited = await selectExternalAgentEdit(ui, config, agent);
-      if (edited) { const { id: nextId, ...definition } = edited; await apply(id, nextId, definition); }
+      if (edited?.kind === "delete") await apply(edited.id);
+      else if (edited?.kind === "apply") { const { id: nextId, ...definition } = edited.agent; await apply(id, nextId, definition); }
     } else {
       const action = await retainedSelect(ui, { title: `Worker ${id} — unsupported adapter`, rows: [
         { key: "delete", label: "Delete" }, { key: "back", label: "Back" },

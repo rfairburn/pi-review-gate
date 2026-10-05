@@ -19,19 +19,29 @@ dates.
 
 ### Added
 
-- Create and manage Claude Code and Codex CLI worker definitions through
-  `/review-settings`, with release-maintained application model menus and structured
-  shared/role options. List all definitions and fully edit supported types, including
-  ID and adapter; renames keep references paired, preserving resource identities and
-  existing model values until explicitly replaced. Unsupported types offer only
-  Delete and Back, without a separate viewer; deletion has vocal reference-cleanup
-  notices. Invalidated schedules are disabled and their invalid pins/review overrides
-  reset to inheritance. New or
-  edited definitions are available for explicit resource/reviewer selection before
-  Save, without automatic enrollment or provider calls. Save the shared draft while
-  preserving unrelated configuration and rejecting catalog conflicts. Missing
-  Claude/Codex binaries warn without blocking Save; runtime failures remain failures
-  (#49).
+- Create and manage Claude Code and Codex CLI definitions in `/review-settings`,
+  editing ID, adapter, roles, environment, timeouts, and human-readable Model/Reasoning
+  choices. Release catalogs include versioned Claude models and eight Codex models;
+  custom/pinned values remain until explicitly replaced. Model-specific structured
+  `reasoningEffort` supports Shared inheritance and explicit role CLI default (not
+  off), distinguishes Max from Extra High (`xhigh`), and discloses Codex Ultra's
+  automatic task delegation. Invalid or incompatible effort requires explicit resolution, not
+  silent fallback. Create/Apply automatically sets `claude`/`codex` and fixed native
+  protocols, with no executable/argument-list/protocol-override menus. Only that
+  edited definition imports legacy effort and removes other advanced arguments,
+  custom paths, and native protocol overrides, with scoped warnings before staging;
+  untouched legacy configurations remain compatible.
+- List every external definition; supported editors offer Delete directly beside
+  Apply/Cancel, targeting the original identity despite unapplied edits, including
+  newly staged definitions. Unsupported types offer only Delete/Back. Renames keep
+  references paired and resource IDs/routes stable. Deletion reports resource,
+  route, and reviewer cleanup, disables invalidated schedules, and resets only
+  invalid pins or emptied review overrides to inheritance with later-default notices.
+  Root Save/Cancel atomically persists/discards the shared draft, preserving unrelated
+  definitions and rejecting catalog conflicts. Creation/editing never enrolls workers
+  or invokes providers; catalogs do not guarantee installed CLI/account access.
+  Missing native CLIs on PATH warn without blocking Save, including selected workers;
+  runtime failures remain failures (#49).
 
 ## [0.1.0-dev.117]
 

@@ -83,15 +83,31 @@ supplies the live switch (the ordinary extension entry point always does):
   fields block Save with a named validation error. Entries stay visible and
   editable regardless of the **Scheduler runtime** switch, and saving never
   clears entries. See [Scheduled task fields](scheduled-tasks.md#scheduled-task-fields).
-- **External workers** lists the shared external-agent catalog. Create and fully edit
-  Claude Code/Codex CLI definitions, including ID and adapter, with application-specific
-  model menus and structured shared/role options. Renames migrate existing references
-  without changing resource IDs or route order. Other adapter types offer only Delete
-  and Back, with no editor or separate viewer; deletion reports removed references
-  and disables schedules whose pin or explicit reviewer set becomes invalid, resetting invalid references to
-  inheritance. Creating/listing/editing does not enroll workers in pools or invoke providers.
-  Everything remains staged until root Save; missing Claude/Codex binaries warn rather
-  than block saving. See [External worker management](configuration.md#manage-existing-external-workers).
+- **External workers** lists every external-agent definition. Create and edit Claude
+  Code/Codex CLI IDs, adapters, enabled roles, shared/role environment and timeouts,
+  and human-readable **Model**/**Reasoning** choices. Custom/pinned models have a
+  **Keep current** choice. Reasoning is model-specific: CLI default delegates to the
+  CLI (not off); a role can inherit Shared or explicitly suppress it with CLI default.
+  Max differs from Extra High (`xhigh`); Codex Ultra discloses automatic task delegation
+  and appears only where supported. Unknown/alias models and Claude Haiku 4.5 offer only CLI
+  default. Invalid effort or incompatible inheritance blocks Create/Apply until an
+  explicit valid choice, never a silent fallback.
+  Create/Apply sets `claude`/`codex` automatically, with fixed native protocols and
+  no executable, literal argument-list, or protocol-override menus. Only that
+  definition is normalized: legacy effort migrates, other advanced arguments/custom
+  paths/protocol overrides are removed with scoped count/category warnings before
+  staging; opening, Back/Cancel, or unrelated root Save leaves other entries alone.
+  Renames migrate references without changing resource IDs or route order. Every
+  supported editor has **Delete** beside **Apply**/**Cancel**, targeting the original
+  identity despite unapplied edits; a new staged definition can also be deleted.
+  Unsupported types offer only **Delete**/**Back**. Deletion reports reference
+  cleanup, disables invalidated schedules, and resets only invalid pins or emptied
+  review overrides to inheritance, with notice of defaults used on later re-enable.
+  No creation/listing/editing enrolls workers or invokes providers. Root Save/Cancel
+  atomically persists/discards the draft; missing native CLIs on `PATH` warn without
+  blocking Save, including selected workers, and runtime failures remain errors.
+  See [External worker management](configuration.md#manage-existing-external-workers)
+  and [Native reasoning effort](configuration.md#native-reasoning-effort).
 - **Scheduler runtime** (the conditional row, shown when the host runtime provides
   the switch; the ordinary extension entry point supplies it) is a
   live, current-process-only On/Off toggle for scheduled execution: it applies

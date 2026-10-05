@@ -277,25 +277,28 @@ automatic review consumes layer-specific values from a single canonical source.
 
 Pi and the selected provider own reasoning effort and token-budget behavior;
 review-gate does not impose a second output-side thinking cap. Reviewer and executor
-selections remain separate from the orchestrator. External harness reasoning is
-configured natively through each `externalAgents` entry's `review.args` and
-`execution.args` roles (for example a Codex CLI role can use
-`["-c", "model_reasoning_effort=\"high\""]`, Claude Code can use
-`["--effort", "high"]`, and arbitrary binary adapters may use their own arguments or
-environment variables).
+selections remain separate from the orchestrator. Native external harness reasoning
+uses optional `reasoningEffort` fields on each
+`externalAgents` entry and its `execution`/`review` roles (see
+[Native reasoning effort](#native-reasoning-effort)). Untouched legacy Claude/Codex
+argument-based settings remain compatible; arbitrary binary adapters may still use
+their own arguments or environment variables.
 
 ### The `externalAgents` catalog
 
 `externalAgents` is one configured catalog shared by both menus: an object keyed by
 stable agent ID, where each value has an optional `review` role, `execution` role, or
-both. Role sections can override shared arguments, environment, model, protocol, and
-timeout, so one harness can use different limits for review and execution. An inactive
-external definition does not need to be installed. Missing Claude Code or Codex CLI
+both. Role sections can override shared environment, model, and reasoning effort,
+plus the global role timeout, so one harness can use different limits for review and execution. Raw JSON
+also supports legacy arguments and adapter-specific protocols; these are not native
+Claude/Codex editor controls. An inactive external definition does not need to be
+installed. Missing Claude Code or Codex CLI
 binaries produce a warning when settings are saved, including for selected workers,
 but do not prevent saving; those workers will fail until their CLI is installed or
-available at the configured path. Runtime command failures remain errors. Other
-adapters retain their existing executable validation. Pi-scoped internal models are never copied into the
-external catalog.
+available on `PATH` for definitions created or applied through the native editor.
+Untouched custom commands remain compatible. Runtime command failures remain errors.
+Other adapters retain their existing executable validation. Pi-scoped internal models
+are never copied into the external catalog.
 
 The legacy array form (entries carrying their own `id`) is deprecated but still
 imported at load time and converted to the keyed object, preserving every identity,
@@ -309,26 +312,26 @@ worker catalog follows the same shape and deprecation; see
 
 Open `/review-settings` → **External workers** to list every configured definition.
 Choose **Create worker** to add a **Claude Code** or **Codex CLI** definition without
-editing JSON. Choose a unique identifier and supported application, select execution,
-review, or both roles, and choose a model from that application's menu. The executable
-may be left at its application default (`claude` or `codex`) or set to a path to the
-matching CLI. Generic/binary adapter creation is not offered. Existing definitions
-of other adapter types remain visible with **Delete** and **Back** controls only.
+editing JSON. Choose a unique identifier and application, enable execution, review,
+or both roles, then use the human-readable **Model** and **Reasoning** controls.
+Shared and role-specific environment and timeout fields remain editable; role
+environment entries override shared entries, an unset role model inherits Shared,
+and an unset timeout inherits the global role timeout.
 
-Advanced fields provide structured argument lists and environment entries, plus
-role-specific model, argument, environment, and timeout overrides. Shared arguments
-precede role arguments; role environment entries override shared entries. An unset
-role model inherits the shared model, and an unset timeout inherits the global role
-timeout. Existing adapter restrictions still apply, including read-only research and
-review safeguards. Authenticate through the CLI's own login/configuration; do not
-enter credentials into the settings file. Summaries show option counts rather than
-argument or environment values.
+Create/Apply automatically stores `command: "claude"` or `command: "codex"` and uses
+the existing fixed native transport. There are no **Application executable**, literal
+argument-list, or protocol-override controls. Generic/binary creation is not offered;
+existing unsupported definitions are listed with **Delete** and **Back** only.
+Authenticate through the CLI's own login/configuration; do not enter credentials
+into the settings file. Summaries show option counts rather than environment values.
+Existing read-only research and review safeguards are unchanged.
 
 Creating a definition only adds it to the settings draft. Before saving, explicitly
 add it through **Worker resources** for execution, or select it in the primary and/or
 subtask reviewer sets under **Reviewers** for review. Only configured roles appear
 in their supported selectors. Creating, listing, or editing a definition
-never enrolls it in a resource or reviewer pool or invokes a provider. **Save changes** saves the definitions together
+never enrolls it in a resource or reviewer pool or invokes a provider.
+**Save changes** saves the definitions together
 with explicit resource, route, and reviewer selections; reopening/reloading retains
 them. Cancel or leaving the root menu with Escape discards the current edits.
 Untouched definitions and unrelated configuration are preserved; conflicting
@@ -341,20 +344,38 @@ authenticate it, or convert a failed run into success.
 #### Manage existing external workers
 
 Existing and newly created **Claude Code** and **Codex CLI** definitions are editable,
-including their ID, adapter, roles, executable, models, arguments, environment, and
-timeouts. A missing binary does not make a supported type read-only. Editing keeps
-existing shared and role-specific model values, including values outside the bundled
-catalog, unless you explicitly replace or unset them. Changing adapters does not
-silently clear model or argument overrides; choose or clear the executable if the
-old command does not match the newly selected application.
+including their ID, adapter, roles, models, reasoning effort, environment, and
+timeouts. A missing binary does not make a supported type read-only. **Keep current**
+preserves custom or pinned shared/role model strings until an explicit replacement
+or unset choice. Model or adapter changes must resolve incompatible reasoning
+explicitly; Apply never silently resets it.
+
+Only the definition being created or edited is normalized on **Create**/**Apply**.
+The editor imports recognized legacy Claude `["--effort", "high"]` or Codex
+`["-c", "model_reasoning_effort=\"high\""]` arguments into structured `reasoningEffort`.
+Valid levels are migrated; identical duplicates are canonicalized with a warning,
+while conflicting or unverified levels require an explicit valid choice. All other
+advanced arguments, native protocol overrides, and custom executable paths are
+removed from that edited definition in favor of automatic native settings. Before
+staging at Apply, clear warnings identify the definition, Shared/execution/review
+scope, and counts/categories of affected options, not raw arguments, environment
+values, secrets, or paths. Root Cancel still discards the staged normalization.
+Opening, Back, Cancel, or root Save of unrelated changes never normalizes untouched
+native or unsupported entries from the current catalog. Legacy JSON
+arguments, custom commands, environment, timeouts, and models remain compatible in
+untouched configurations; this is not a global removal of argument fields.
 
 Renaming updates resource selections and primary, subtask, and scheduled reviewer
 references together. Resource IDs, route order, and scheduled resource pins remain
 unchanged: these refer to the same resource, not directly to the renamed definition.
 Invalid or duplicate IDs do not partially change the catalog or its references.
 
-For unsupported adapter types, opening an entry offers only **Delete** and **Back**;
-there is no editor or separate viewer. **Delete** removes that definition, resources
+Every supported definition has **Delete** directly alongside **Apply** and **Cancel**
+in its existing editor, with no extra action submenu. Delete targets the original
+selected identity even after an unapplied local ID rename, ignoring other unapplied
+edits. A newly created staged definition is also deletable. For unsupported adapter
+types, opening an entry offers only **Delete** and **Back**; there is no editor or
+separate viewer. **Delete** removes that definition, resources
 selecting it, their route entries, and primary/subtask/scheduled reviewer references.
 If a scheduled task loses its pinned resource or its explicit reviewer set becomes
 empty, the task is disabled and only the invalid pin or review override resets to
@@ -369,21 +390,91 @@ configuration for generic executables or change runtime adapter safeguards.
 
 #### Release-maintained CLI model catalogs
 
-The creation and editing flows use separate bundled catalogs, not Pi-scoped model names or live
-provider discovery. Claude Code offers the documented CLI aliases `sonnet`, `opus`,
-`haiku`, `fable`, and `best`; Codex CLI offers `gpt-6.1-sol`, `gpt-6-astra`, and
-`gpt-6-luna`. Unset/inherited model choices leave model selection to the existing
-configuration and CLI defaults. There is no manual-model fallback in creation.
-Existing model values outside these catalogs are not removed or rewritten.
+The creation and editing flows use separate bundled catalogs with human labels,
+not Pi-scoped model names or live provider discovery:
+
+| Application | Label | Stored model ID |
+| --- | --- | --- |
+| Claude Code | Opus 5.5 | `claude-opus-5-5` |
+| Claude Code | Fable 5.1 | `claude-fable-5-1` |
+| Claude Code | Sonnet 5.5 | `claude-sonnet-5-5` |
+| Claude Code | Haiku 4.5 | `claude-haiku-4-5` |
+| Codex CLI | GPT-6.1-Sol | `gpt-6.1-sol` |
+| Codex CLI | GPT-6-Astra | `gpt-6-astra` |
+| Codex CLI | GPT-6-Sol | `gpt-6-sol` |
+| Codex CLI | GPT-6-Luna | `gpt-6-luna` |
+| Codex CLI | GPT-5.6-Sol | `gpt-5.6-sol` |
+| Codex CLI | GPT-5.6-Terra | `gpt-5.6-terra` |
+| Codex CLI | GPT-5.6-Luna | `gpt-5.6-luna` |
+| Codex CLI | GPT-5.5 | `gpt-5.5` |
+
+Unset/inherited model choices leave selection to existing configuration and CLI
+defaults. There is no manual-model fallback in creation. Existing custom or pinned
+strings, including mutable aliases, can be kept without replacement.
 
 The lists are verified against the official
 [Claude Code model configuration](https://code.claude.com/docs/en/model-config) and
 [Codex models](https://developers.openai.com/codex/models) documentation and maintained
-with review-gate releases. Release maintenance must recheck those upstream sources
+with review-gate releases. Catalog data and verification provenance live in
+`src/settings/external-agent-models.ts`; the Codex catalog was verified against
+Codex CLI 0.160.0 on 2026-10-05. Release maintenance must recheck those upstream sources
 and update catalog values and verification provenance when supported choices change.
 A catalog entry is a known CLI selection, not proof of account access: availability
 and alias resolution depend on CLI version, authentication, provider, plan, and
-organization policy. Settings do not probe a provider or authenticate on your behalf.
+organization policy. Settings do not probe a provider, start one, or authenticate
+on your behalf, and a release catalog does not guarantee support by the installed
+CLI or account entitlement.
+
+#### Native reasoning effort
+
+Optional `reasoningEffort` is stored at Shared and/or `execution`/`review` scope.
+An absent role field inherits Shared. An explicit role `"default"` suppresses any
+inherited effort and supplies no app-owned effort: **CLI default** means the CLI's
+own settings, not off or no thinking. Shared `"default"` or no shared effort also
+delegates to the CLI.
+
+Reasoning choices come from the selected/effective model's bundled capabilities,
+not generic Pi thinking levels. Native levels include `low`, `medium`, `high`,
+`xhigh`, and `max` only where supported; **Max** is distinct from **Extra High** (`xhigh`).
+Codex **Ultra — automatic task delegation** is offered only for models whose
+capabilities include `ultra`. Claude Haiku 4.5 has no effort control beyond CLI
+default. Mutable aliases, unknown strings, and unset CLI-default models preserve
+their model value but offer only CLI default reasoning because new levels cannot
+be verified. There is no generic `off` or `minimal` choice.
+
+Create/Apply validates every effective enabled role, including inherited Shared
+effort against a role-specific model. Existing invalid, unverified, or conflicting
+effort, or a model change that invalidates a level, blocks Create/Apply until you
+explicitly choose a known model with compatible effort or CLI default. Compatible
+existing effort is preserved; there is no silent reset or fallback.
+
+```json
+{
+  "externalAgents": {
+    "claude": {
+      "adapter": "claude-cli",
+      "command": "claude",
+      "model": "claude-sonnet-5-5",
+      "reasoningEffort": "high",
+      "execution": {},
+      "review": { "reasoningEffort": "default", "timeoutMs": 600000 }
+    },
+    "codex": {
+      "adapter": "codex-cli",
+      "command": "codex",
+      "model": "gpt-6.1-sol",
+      "reasoningEffort": "high",
+      "execution": {},
+      "review": { "reasoningEffort": "default" }
+    }
+  }
+}
+```
+
+Here execution inherits High; review uses CLI default without inheriting High.
+Runtime centrally generates canonical Claude `["--effort", "high"]` or Codex
+`["-c", "model_reasoning_effort=\"high\""]` arguments with only one effective effort.
+This does not change native transport or safety enforcement.
 
 ### Pre-cutover configuration fields
 

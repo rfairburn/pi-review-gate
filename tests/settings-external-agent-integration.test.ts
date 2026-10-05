@@ -47,7 +47,7 @@ async function workspace(run: (path: string, config: ReviewGateConfig, original:
     await run(path, normalizeConfig(JSON.parse(original)), original);
   } finally { await rm(dir, { recursive: true, force: true }); }
 }
-async function menu(path: string, config: ReviewGateConfig, actions: Action[], beforeSave?: () => Promise<void>, inputs: string[] = []) {
+async function menu(path: string, config: ReviewGateConfig, actions: Action[], beforeSave?: () => Promise<void>, inputs: string[] = [], notices: string[] = []) {
   let handler: ((args: string, ctx: unknown) => Promise<void>) | undefined;
   registerReviewSettings({ config, configPath: path, pi: {
     registerCommand(name: string, options: { handler: typeof handler }) {
@@ -73,6 +73,7 @@ async function menu(path: string, config: ReviewGateConfig, actions: Action[], b
     },
     notify(message: string, kind: string) {
       assert.notEqual(kind, "error", message);
+      notices.push(message);
       if (kind === "warning") warnings.push(message);
     },
   } });
@@ -169,6 +170,25 @@ for (const selected of [false, true]) test(`missing application CLIs save with w
   });
 });
 
+test("unrelated root Save preserves untouched and concurrent latest native legacy fields", async () => {
+  await workspace(async (path, config) => {
+    const legacy = { adapter: "claude-cli", command: process.execPath, model: "opus", args: ["--effort=high", "literal-secret"],
+      execution: { args: ["--effort=low", "--effort=max"], protocol: "pi-review-executor-jsonl-v1" }, review: {} };
+    Object.assign(config, normalizeConfig({ ...config, externalAgents: { untouched: legacy } }));
+    await writeFile(path, JSON.stringify(config));
+    const opening = structuredClone(config.externalAgents!.untouched);
+    await menu(path, config, ["Save changes"], async () => {
+      const latest = JSON.parse(await readFile(path, "utf8"));
+      latest.externalAgents.concurrent = { ...legacy, model: "latest-pinned", reasoningEffort: "default" };
+      await writeFile(path, JSON.stringify(latest));
+    });
+    assert.deepEqual(config.externalAgents!.untouched, opening);
+    const expected = normalizeConfig({ externalAgents: { concurrent: { ...legacy, model: "latest-pinned", reasoningEffort: "default" } } });
+    assert.deepEqual(config.externalAgents!.concurrent, expected.externalAgents!.concurrent);
+    assert.deepEqual(normalizeConfig(JSON.parse(await readFile(path, "utf8"))), config);
+  });
+});
+
 test("save policy still blocks invalid role references and missing generic/binary executables", async () => {
   for (const adapter of ["generic-cli", "run-as-binary"] as const) {
     const config = normalizeConfig({ enabled: true, externalAgents: { other: {
@@ -199,23 +219,24 @@ test("real creation forms share the resource/reviewer draft and persist advanced
     try {
       const warnings = await menu(path, config, [
         "External workers", "Create worker", "Codex (codex-cli)", "Identifier:", "Roles:", "Execution and review",
-        "Advanced shared arguments:", "Add argument", "Back",
+        "Shared model:", "GPT-6.1-Sol", "Shared reasoning:", "High",
         "Advanced shared environment:", "Add environment entry", "Back",
         "Advanced review overrides", "Timeout (ms):", "Back", "Create",
         "Create worker", "Claude Code (claude-cli)", "Identifier:", "Roles:", "Execution and review",
-        "Application executable:", "Create", "Back",
+        "Create", "Back",
         ...selectExplicitly, "Save changes",
       ], async () => {
         assert.deepEqual(config, activeBefore);
         assert.equal(await readFile(path, "utf8"), original);
-      }, ["codex", "literal argument with spaces", "CUSTOM_OPTION", "literal value", "60000", "claude", join(__dirname, "missing", "claude")]);
+      }, ["codex", "CUSTOM_OPTION", "literal value", "60000", "claude"]);
       assert.equal(warnings.length, 2);
       const reloaded = normalizeConfig(JSON.parse(await readFile(path, "utf8")));
       assert.deepEqual(config, reloaded);
-      assert.deepEqual(reloaded.externalAgents!.codex.args, ["literal argument with spaces"]);
+      assert.deepEqual(reloaded.externalAgents!.codex.args, []);
+      assert.equal(reloaded.externalAgents!.codex.reasoningEffort, "high");
       assert.deepEqual(reloaded.externalAgents!.codex.env, { CUSTOM_OPTION: "literal value" });
       assert.equal(reloaded.externalAgents!.codex.review!.timeoutMs, 60000);
-      assert.equal(reloaded.externalAgents!.claude.command, join(__dirname, "missing", "claude"));
+      assert.equal(reloaded.externalAgents!.claude.command, "claude");
       assert.deepEqual(Object.keys(reloaded.execution!.workerResources!).sort(), ["external-claude", "external-codex"]);
       assert.equal(effectiveReviewSettings(reloaded).primaryReviewers.length, 2);
       assert.equal(effectiveReviewSettings(reloaded).subtaskReviewers.length, 2);
@@ -265,7 +286,7 @@ for (const finish of ["Save changes", "Cancel", undefined]) test(`native rename 
     }
     const saved = normalizeConfig(JSON.parse(await readFile(path, "utf8")));
     assert.deepEqual(saved, config); assert.equal(saved.externalAgents!.A, undefined); assert.equal(saved.externalAgents!.B, undefined);
-    assert.equal(saved.externalAgents!.__proto__.command, process.execPath); assert.equal(saved.externalAgents!.__proto__.model, "custom-model");
+    assert.equal(saved.externalAgents!.__proto__.command, "claude"); assert.equal(saved.externalAgents!.__proto__.model, "custom-model");
     assert.equal(saved.externalAgents!.__proto__.execution!.model, "custom-role"); assert.equal(saved.externalAgents!.__proto__.execution!.timeoutMs, 60000);
     assert.deepEqual(saved.execution!.routes, before.execution!.routes);
     assert.deepEqual(saved.execution!.workerResources!.r.selection, { source: "external", id: "__proto__" });
@@ -277,24 +298,39 @@ for (const finish of ["Save changes", "Cancel", undefined]) test(`native rename 
   });
 });
 
-for (const finish of ["Save changes", "Cancel", undefined]) test(`unsupported deletion ${finish ?? "Escape"} is one shared transaction`, async () => {
+for (const adapter of ["run-as-binary", "claude-cli", "codex-cli"] as const)
+for (const finish of ["Save changes", "Cancel", undefined]) test(`${adapter} deletion ${finish ?? "Escape"} is one shared transaction`, async () => {
   await workspace(async (path, config) => {
     Object.assign(config, normalizeConfig({ ...config,
-      externalAgents: { X: { adapter: "run-as-binary", command: process.execPath, execution: { protocol: "pi-review-executor-jsonl-v1" }, review: { protocol: "pi-reviewer-json-v1" } } },
-      execution: { ...config.execution, workerResources: { arbitrary: { selection: { source: "external", id: "X" }, maxConcurrent: 1 } }, routes: { execute: [{ resourceId: "arbitrary" }], research: [] } },
+      externalAgents: {
+        X: { adapter, command: process.execPath, execution: { protocol: "pi-review-executor-jsonl-v1" }, review: { protocol: "pi-reviewer-json-v1" } },
+        untouched: { adapter: "codex-cli", command: process.execPath, execution: {}, model: "keep-custom" },
+      },
+      execution: { ...config.execution, workerResources: { arbitrary: { selection: { source: "external", id: "X" }, maxConcurrent: 1 } }, routes: { execute: [{ resourceId: "arbitrary" }], research: adapter === "run-as-binary" ? [] : [{ resourceId: "arbitrary" }] } },
       review: { ...config.review, primaryReviewers: [{ source: "external", id: "X" }], subtaskReviewers: [{ source: "external", id: "X" }] },
       scheduledTasks: { task: { name: "Task", enabled: true, cron: "0 * * * *", kind: "execute", instructions: "X literal", workspace: __dirname, workerResourceId: "arbitrary", review: { mode: "selected", reviewers: [{ source: "external", id: "X" }] } } },
     }));
     const original = JSON.stringify(config); await writeFile(path, original);
     const before = structuredClone(config);
-    await menu(path, config, ["External workers", "X [run-as-binary]", "Delete", "Back", finish], async () => {
+    const notices: string[] = [];
+    await menu(path, config, ["External workers", `X [${adapter}]`, ...(adapter === "run-as-binary" ? [] : ["Identifier:"]), "Delete", "Back", finish], async () => {
       assert.deepEqual(config, before); assert.equal(await readFile(path, "utf8"), original);
-    });
+      const latest = JSON.parse(original);
+      latest.externalAgents.latest = { adapter: "claude-cli", command: process.execPath, review: {}, model: "latest-custom" };
+      await writeFile(path, JSON.stringify(latest));
+    }, adapter === "run-as-binary" ? [] : ["unapplied-name"], notices);
+    const noticeText = notices.join("\n");
+    for (const expected of ["Staged deletion of external worker X", "Cancel discards", "Removed worker resource arbitrary", "Removed execute route", "Removed primary layer reviewer X", "Removed subtask layer reviewer X", "removed pin arbitrary", "empty selected-reviewer override reset to inheritance", "Task task disabled", "Later enabling uses configured defaults"]) assert.ok(noticeText.includes(expected), expected);
+    if (adapter !== "run-as-binary") assert.ok(noticeText.includes("Removed research route"));
     if (finish !== "Save changes") {
       assert.deepEqual(config, before); assert.equal(await readFile(path, "utf8"), original); return;
     }
     const saved = normalizeConfig(JSON.parse(await readFile(path, "utf8")));
-    assert.deepEqual(saved, config); assert.deepEqual(saved.externalAgents, {});
+    assert.deepEqual(saved, config);
+    assert.deepEqual(Object.keys(saved.externalAgents!).sort(), ["latest", "untouched"]);
+    assert.deepEqual(saved.externalAgents!.untouched, before.externalAgents!.untouched);
+    assert.equal(saved.externalAgents!.latest.model, "latest-custom");
+    assert.equal(saved.externalAgents!["unapplied-name"], undefined);
     assert.deepEqual(saved.execution!.workerResources, {}); assert.deepEqual(saved.execution!.routes, { execute: [], research: [] });
     assert.deepEqual(saved.review!.primaryReviewers, []); assert.deepEqual(saved.review!.subtaskReviewers, []);
     assert.equal(saved.scheduledTasks!.task.enabled, false); assert.equal(saved.scheduledTasks!.task.workerResourceId, undefined); assert.equal(saved.scheduledTasks!.task.review, undefined);
@@ -307,10 +343,53 @@ test("created definition can be edited and renamed before explicit enrollment an
     creations = [{ ...structuredClone(definitions[0]), command: join(__dirname, "missing", "codex") }];
     const warnings = await menu(path, config, ["External workers", "Create worker", "codex [codex-cli]", "Identifier:", "Apply edit", "Back", "Worker resources", "Add worker resource", "back [codex-cli]", "1  current", "Back", "Save changes"], undefined, ["back"]);
     assert.equal(warnings.length, 1);
-    assert.match(warnings[0], /back.*cannot run until its Codex binary is installed and available/);
+    assert.match(warnings[0], /Definition back, shared: removed custom executable/);
+    assert.equal(config.externalAgents!.back.command, "codex");
     assert.deepEqual(Object.keys(config.externalAgents!), ["back"]);
     assert.deepEqual(config.execution!.workerResources!["external-back"].selection, { source: "external", id: "back" });
     assert.deepEqual(normalizeConfig(JSON.parse(await readFile(path, "utf8"))), config);
+  });
+});
+
+for (const adapter of ["claude-cli", "codex-cli"] as const)
+for (const finish of ["Save changes", "Cancel", undefined]) test(`${adapter}: real staged creation, enrollment and deletion respects root ${finish ?? "Escape"}`, async () => {
+  await workspace(async (path, config) => {
+    Object.assign(config, normalizeConfig({ ...config, externalAgents: {
+      untouched: { adapter: "codex-cli", command: process.execPath, execution: {}, model: "keep-custom" },
+    } }));
+    const original = JSON.stringify(config); await writeFile(path, original);
+    const before = structuredClone(config), notices: string[] = [];
+    useCreationForm = true;
+    try {
+      const warnings = await menu(path, config, [
+        "External workers", "Create worker", adapter === "claude-cli" ? "Claude Code" : "Codex",
+        "Identifier:", "Roles:", "Execution and review", "Create", "Back",
+        "Worker resources", "Add worker resource", `new-worker [${adapter}]`, "1  current", "Back",
+        "Reviewers", "Primary reviewers", `new-worker [${adapter}] ✗`, "Back",
+        "Subtask reviewers", `new-worker [${adapter}] ✗`, "Back", "Back",
+        "External workers", `new-worker [${adapter}]`, "Delete new-worker", "Back", finish,
+      ], async () => {
+        assert.deepEqual(config, before);
+        assert.equal(await readFile(path, "utf8"), original);
+      }, ["new-worker"], notices);
+      assert.deepEqual(warnings, []);
+      if (finish !== "Save changes") {
+        assert.deepEqual(config, before);
+        assert.equal(await readFile(path, "utf8"), original);
+      } else {
+        assert.deepEqual(normalizeConfig(JSON.parse(await readFile(path, "utf8"))), config);
+        // Root Save still materializes its existing scalar defaults. The
+        // create/delete transaction leaves no definition or activation behind.
+        assert.deepEqual(config.externalAgents, before.externalAgents);
+        assert.deepEqual(config.execution!.workerResources, {});
+        assert.deepEqual(config.execution!.routes, { execute: [], research: [] });
+        assert.deepEqual(config.review!.primaryReviewers, []);
+        assert.deepEqual(config.review!.subtaskReviewers, []);
+        assert.deepEqual(config.scheduledTasks, {});
+      }
+      const text = notices.join("\n");
+      for (const expected of ["Staged deletion of external worker new-worker", "Removed worker resource external-new-worker", "Removed execute route", "Removed research route", "Removed primary layer reviewer new-worker", "Removed subtask layer reviewer new-worker"]) assert.ok(text.includes(expected), expected);
+    } finally { useCreationForm = false; }
   });
 });
 

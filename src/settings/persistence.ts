@@ -1,10 +1,19 @@
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
+import { guardExternalAgentReferences, type ExternalAgentOperation } from "./external-agent-catalog";
 import { open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import {
   cloneScheduledTaskCatalog,
+  cloneExternalAgentCatalog,
+  type ExternalAgentCatalog,
   cloneWorkerCatalog,
+  executorEntryId,
   normalizeConfig,
+  externalAgentSupportsExecution,
+  externalAgentSupportsReview,
+  resolvedExternalAgent,
+  workerResourceSupportsResearch,
   type ActiveReviewerSelection,
   type BrowserInteractionApproval,
   type ScheduledTaskCatalog,
@@ -19,6 +28,10 @@ import {
 } from "../config";
 
 export interface ReviewSettingsSelection {
+  /** New definitions only; merged into the latest disk catalog at Save. */
+  externalAgentAdditions?: ExternalAgentCatalog;
+  externalAgentOperations?: ExternalAgentOperation[];
+  externalAgentOpening?: ReviewGateConfig;
   operatingMode: OperatingMode;
   /** Direct operating-mode cycle hotkey (issue #20). */
   modeCycleShortcut: string;
@@ -86,7 +99,82 @@ export async function persistReviewSettings(
   selection: ReviewSettingsSelection,
 ): Promise<ReviewGateConfig> {
   let scheduledTasksResult: Record<string, unknown> | undefined;
+  const latestAffectedPins = new Set<string>();
   return updateReviewGateConfig(configPath, (parsed) => {
+    if (selection.externalAgentOperations?.length) {
+      let latest: ReviewGateConfig;
+      try {
+        // Validate the stored catalog, not owned scalar settings that this
+        // transaction may be repairing. The complete candidate is validated
+        // after the staged settings have been applied below.
+        latest = normalizeConfig({ externalAgents: parsed.externalAgents });
+        if (selection.externalAgentOperations.some((operation) => operation.baseline !== undefined)) {
+          const execution = isRecord(parsed.execution) ? parsed.execution : undefined;
+          const review = isRecord(parsed.review) ? parsed.review : undefined;
+          const references = normalizeConfig({
+            execution: execution && { workerResources: execution.workerResources, routes: execution.routes },
+            review: review && { activeReviewers: review.activeReviewers, primaryReviewers: review.primaryReviewers, subtaskReviewers: review.subtaskReviewers },
+          });
+          latest.execution = references.execution;
+          latest.review = references.review;
+        }
+      }
+      catch { throw new Error("External worker settings changed or are invalid on disk. Reopen settings before saving."); }
+      // Foreign schedules remain unvalidated, but their structured references
+      // must still participate in optimistic cascade safety.
+      latest.scheduledTasks = (isRecord(parsed.scheduledTasks) ? parsed.scheduledTasks : {}) as ScheduledTaskCatalog;
+      // Include latest resource identities, not only the opening snapshot:
+      // preserved foreign schedules may pin resources appended meanwhile.
+      const touchedIds = new Set(selection.externalAgentOperations.flatMap((operation) => [operation.id, ...(operation.nextId ? [operation.nextId] : [])]));
+      const storedResources = isRecord(parsed.execution) ? parsed.execution.workerResources : undefined;
+      const resourceEntries: [string, unknown][] = Array.isArray(storedResources)
+        ? storedResources.flatMap((resource): [string, unknown][] => {
+          if (!isRecord(resource) || !isRecord(resource.selection) || resource.selection.source !== "external" || typeof resource.selection.id !== "string") return [];
+          // Match the legacy importer: resourceId, or its generated selection
+          // identity when omitted. Agent catalog entries use a different id.
+          const resourceId = typeof resource.resourceId === "string" && resource.resourceId.trim()
+            ? resource.resourceId.trim()
+            : executorEntryId({ source: "external", id: resource.selection.id.trim() });
+          return [[resourceId, resource]];
+        })
+        : isRecord(storedResources) ? Object.entries(storedResources) : [];
+      for (const [resourceId, resource] of resourceEntries) {
+        if (isRecord(resource) && isRecord(resource.selection) && resource.selection.source === "external" && typeof resource.selection.id === "string" && touchedIds.has(resource.selection.id.trim())) {
+          latestAffectedPins.add(resourceId.trim());
+        }
+      }
+      const merged = cloneExternalAgentCatalog(latest.externalAgents ?? {});
+      const releasedIds = new Set(selection.externalAgentOperations.filter((operation) => operation.baseline !== undefined && operation.nextId !== operation.id).map((operation) => operation.id));
+      const finalIds = new Set<string>();
+      for (const operation of selection.externalAgentOperations) {
+        if (operation.nextId !== undefined) {
+          if (finalIds.has(operation.nextId)) throw new Error("External worker draft IDs collide. Reopen settings before saving.");
+          finalIds.add(operation.nextId);
+        }
+        const exists = Object.hasOwn(merged, operation.id);
+        if (operation.baseline !== undefined) {
+          if (!exists || !isDeepStrictEqual(merged[operation.id], operation.baseline)) {
+            throw new Error("An edited external worker changed or disappeared on disk. Reopen settings before saving.");
+          }
+          // Same-ID role/option edits also must not erase newly added
+          // related resources or break their preserved foreign schedules.
+          if (!selection.externalAgentOpening) throw new Error("Missing external worker opening baseline. Reopen settings.");
+          guardExternalAgentReferences(selection.externalAgentOpening, latest, operation.id);
+        } else if (operation.nextId !== undefined && exists) {
+          throw new Error("An external worker ID created in this menu already exists on disk. Reopen settings.");
+        }
+        if (operation.nextId !== undefined && operation.nextId !== operation.id && Object.hasOwn(merged, operation.nextId) && !releasedIds.has(operation.nextId)) {
+          throw new Error("External worker rename destination already exists on disk. Reopen settings and choose a different ID.");
+        }
+      }
+      // Release opening keys before installing final keys, so valid staged
+      // rename chains/swaps cannot delete a newly installed definition.
+      for (const operation of selection.externalAgentOperations) if (operation.baseline !== undefined) delete merged[operation.id];
+      for (const operation of selection.externalAgentOperations) {
+        if (operation.nextId !== undefined) Object.defineProperty(merged, operation.nextId, { value: operation.definition, enumerable: true, writable: true, configurable: true });
+      }
+      parsed.externalAgents = merged;
+    }
     const execution = isRecord(parsed.execution) ? { ...parsed.execution } : {};
     // Both catalogs persist in canonical keyed-object form; routes persist
     // exactly as selected. Missing or empty routes stay empty — the catalog
@@ -103,8 +191,20 @@ export async function persistReviewSettings(
       ?? (typeof execution.deferredPiTools === "boolean" ? execution.deferredPiTools : true);
     delete execution.parallelEnabled;
     parsed.execution = execution;
-    // externalAgents is intentionally untouched: agents are not editable in
-    // this UI, and the save boundary canonicalizes the latest on-disk form.
+    // Import the latest catalog (including legacy arrays), never the stale
+    // menu snapshot. Existing definitions remain owned by disk; creation
+    // cannot overwrite even an identical definition saved by another menu.
+    if (selection.externalAgentAdditions && Object.keys(selection.externalAgentAdditions).length > 0) {
+      const stored = normalizeConfig({ externalAgents: parsed.externalAgents }).externalAgents ?? {};
+      const merged = cloneExternalAgentCatalog(stored);
+      for (const [id, definition] of Object.entries(selection.externalAgentAdditions)) {
+        if (Object.prototype.hasOwnProperty.call(stored, id)) {
+          throw new Error("An external worker ID created in this menu already exists on disk. Reopen settings and create it with a different ID.");
+        }
+        Object.defineProperty(merged, id, { value: definition, enumerable: true, writable: true, configurable: true });
+      }
+      parsed.externalAgents = merged;
+    }
     const review = isRecord(parsed.review) ? { ...parsed.review } : {};
     // The split reviewer fields are the only canonical reviewer state (issue
     // #175): every save persists them and removes the legacy single-set key,
@@ -179,7 +279,61 @@ export async function persistReviewSettings(
       parsed.web = web;
     }
   }, {
-    afterValidate: (finalParsed) => {
+    afterValidate: (finalParsed, normalized) => {
+      // Selection validation in the menu used its opening snapshot. Recheck
+      // external references against the merged latest catalog before writing,
+      // so concurrent removal/role changes cannot persist broken selections.
+      const checkReviewers = (reviewers: readonly ActiveReviewerSelection[]): void => {
+        for (const reviewer of reviewers) {
+          if (reviewer.source !== "external") continue;
+          const agent = resolvedExternalAgent(normalized, reviewer.id);
+          if (!agent || !externalAgentSupportsReview(agent)) {
+            throw new Error("A selected external reviewer no longer supports review on disk. Reopen settings and select an available reviewer.");
+          }
+        }
+      };
+      for (const resource of Object.values(selection.workerResources)) {
+        if (resource.selection.source !== "external") continue;
+        const agent = resolvedExternalAgent(normalized, resource.selection.id);
+        if (!agent || !externalAgentSupportsExecution(agent)) {
+          throw new Error("A selected external worker no longer supports execution on disk. Reopen settings and select an available worker.");
+        }
+      }
+      for (const entry of selection.researchRoute ?? []) {
+        const resource = selection.workerResources[entry.resourceId];
+        if (!resource || !workerResourceSupportsResearch(normalized, resource.selection)) {
+          throw new Error("A selected research worker is no longer research-capable on disk. Reopen settings and select a research-capable worker.");
+        }
+      }
+      checkReviewers(selection.primaryReviewers);
+      checkReviewers(selection.subtaskReviewers);
+      for (const task of Object.values(selection.scheduledTasks ?? {})) {
+        if ((task.destination ?? "subtask") !== "subtask") continue;
+        if (task.review?.mode === "selected") checkReviewers(task.review.reviewers);
+        if (task.kind === "research" && task.workerResourceId !== undefined) {
+          const resource = selection.workerResources[task.workerResourceId];
+          if (!resource || !workerResourceSupportsResearch(normalized, resource.selection)) {
+            throw new Error("A scheduled research worker is no longer research-capable on disk. Reopen settings and select a research-capable worker.");
+          }
+        }
+      }
+      // Restored foreign entries are not generally revalidated. Check only
+      // structured references affected by this catalog transaction, including
+      // dormant orchestrator-turn overrides, before the atomic write.
+      const touchedIds = new Set((selection.externalAgentOperations ?? []).flatMap((operation) => [operation.id, ...(operation.nextId ? [operation.nextId] : [])]));
+      const affectedPins = new Set([...latestAffectedPins, ...Object.entries(selection.externalAgentOpening?.execution?.workerResources ?? {}).filter(([, resource]) => resource.selection.source === "external" && touchedIds.has(resource.selection.id)).map(([id]) => id)]);
+      const finalSchedules = scheduledTasksResult ?? finalParsed.scheduledTasks;
+      if (isRecord(finalSchedules)) {
+        for (const rawTask of Object.values(finalSchedules)) {
+          if (!isRecord(rawTask)) continue;
+          if (typeof rawTask.workerResourceId === "string" && affectedPins.has(rawTask.workerResourceId.trim()) && !Object.hasOwn(selection.workerResources, rawTask.workerResourceId.trim())) {
+            throw new Error("A preserved schedule still pins a removed worker resource. Reopen settings before saving.");
+          }
+          if (isRecord(rawTask.review) && rawTask.review.mode === "selected" && Array.isArray(rawTask.review.reviewers)) {
+            checkReviewers(rawTask.review.reviewers.filter((reviewer): reviewer is ActiveReviewerSelection => isRecord(reviewer) && reviewer.source === "external" && typeof reviewer.id === "string" && touchedIds.has(reviewer.id)));
+          }
+        }
+      }
       if (scheduledTasksResult !== undefined) finalParsed.scheduledTasks = scheduledTasksResult;
     },
   });

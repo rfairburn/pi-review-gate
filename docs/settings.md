@@ -1,6 +1,6 @@
 # Settings menu
 
-This page owns the staged `/review-settings` settings menu: its sixteen ordinary rows,
+This page owns the staged `/review-settings` settings menu: its seventeen ordinary rows,
 the conditional **Scheduler runtime** row, Save/Cancel staging and apply semantics, and
 the shared native text-field behavior. Raw field values and defaults are owned by the
 [Configuration](configuration.md) reference, and scheduled-task semantics are documented
@@ -8,9 +8,9 @@ on [Scheduled tasks](scheduled-tasks.md#scheduled-task-fields).
 
 ## `/review-settings`
 
-`/review-settings` opens one staged settings transaction with sixteen ordinary rows —
-Operating mode, Mode cycle hotkey, Worker resources, Execution priority, Research
-priority, Reviewers, Timeouts, Review policy, Bundle retention, Global concurrency,
+`/review-settings` opens one staged settings transaction with seventeen ordinary rows —
+Operating mode, Mode cycle hotkey, Worker resources, External workers, Execution
+priority, Research priority, Reviewers, Timeouts, Review policy, Bundle retention, Global concurrency,
 Retry policy, Subtask notifications, Deferred Pi tools, Subtasks view, Scheduled
 tasks, and Web — plus a conditional **Scheduler runtime** row when the host runtime
 supplies the live switch (the ordinary extension entry point always does):
@@ -24,6 +24,36 @@ supplies the live switch (the ordinary extension entry point always does):
   `externalAgents`, each with one physical maximum concurrency shared by every
   background-task kind. The catalog displays alphabetically and edits by stable key —
   it has no reorder controls, because row order never defines identity or scheduling.
+- **External workers** sits immediately below **Worker resources** and lists every
+  external-agent definition. Create and edit Claude Code/Codex CLI IDs, adapters,
+  enabled roles, timeouts, and human-readable **Model**/**Reasoning** choices. The
+  native editors offer no shared/role environment key/value editing or entry counts:
+  environment variables are configured by editing the JSON file directly, where `env`
+  remains a supported schema and runtime field, and Apply, rename, and unrelated
+  staged edits preserve existing shared/role environment entries while the roles
+  remain enabled. Custom/pinned models have a
+  **Keep current** choice. Reasoning is model-specific: CLI default delegates to the
+  CLI (not off); a role can inherit Shared or explicitly suppress it with CLI default.
+  Max differs from Extra High (`xhigh`); Codex Ultra discloses automatic task delegation
+  and appears only where supported. Unknown/alias models and Claude Haiku 4.5 offer only CLI
+  default. Invalid effort or incompatible inheritance blocks Create/Apply until an
+  explicit valid choice, never a silent fallback.
+  Create/Apply sets `claude`/`codex` automatically, with fixed native protocols and
+  no executable, literal argument-list, or protocol-override menus. Only that
+  definition is normalized: legacy effort migrates, other advanced arguments/custom
+  paths/protocol overrides are removed with scoped count/category warnings before
+  staging; opening, Back/Cancel, or unrelated root Save leaves other entries alone.
+  Renames migrate references without changing resource IDs or route order. Every
+  supported editor has **Delete** beside **Apply**/**Cancel**, targeting the original
+  identity despite unapplied edits; a new staged definition can also be deleted.
+  Unsupported types offer only **Delete**/**Back**. Deletion reports reference
+  cleanup, disables invalidated schedules, and resets only invalid pins or emptied
+  review overrides to inheritance, with notice of defaults used on later re-enable.
+  No creation/listing/editing enrolls workers or invokes providers. Root Save/Cancel
+  atomically persists/discards the draft; missing native CLIs on `PATH` warn without
+  blocking Save, including selected workers, and runtime failures remain errors.
+  See [External worker management](configuration.md#manage-existing-external-workers)
+  and [Native reasoning effort](configuration.md#native-reasoning-effort).
 - **Execution priority** and **Research priority** are independently ordered subsets of
   those resources, referenced by key. Either route can exclude a resource; a missing or
   empty route means no models for that role. Per-route reasoning lets the same local

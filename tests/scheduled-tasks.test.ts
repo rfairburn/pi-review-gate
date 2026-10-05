@@ -517,6 +517,7 @@ const ROOT_SETTING_LABELS = [
   "Operating mode",
   "Mode cycle hotkey",
   "Worker resources",
+  "External workers",
   "Execution priority",
   "Research priority",
   "Reviewers",

@@ -3,6 +3,7 @@ import { lstatSync, readFileSync } from "node:fs";
 import type { ConfigPathResolution } from "./config-path";
 import { reviewGateConfigCandidates, resolveConfigPathResolution } from "./config-path";
 import { parseCronExpression } from "./scheduling/cron";
+import { isNativeReasoningEffort, nativeReasoningArgs, type NativeReasoningEffort } from "./external-agent-reasoning";
 
 export type RetainBundles = "never" | "on-failure" | "always";
 /**
@@ -232,6 +233,8 @@ export type ExternalExecutorConfig = CodexExecutorConfig | ClaudeExecutorConfig 
 export type ExternalAgentAdapter = "codex-cli" | "claude-cli" | "generic-cli" | "run-as-binary";
 
 export interface ExternalAgentRoleConfig {
+  /** Native only. Missing inherits shared; default suppresses app-supplied effort. */
+  reasoningEffort?: NativeReasoningEffort;
   args?: string[];
   env?: Record<string, string>;
   model?: string;
@@ -240,6 +243,8 @@ export interface ExternalAgentRoleConfig {
 }
 
 export interface ExternalAgentConfig {
+  /** Native only. Missing preserves legacy argv; default adds no effort. */
+  reasoningEffort?: NativeReasoningEffort;
   id: string;
   adapter: ExternalAgentAdapter;
   command?: string;
@@ -1490,8 +1495,8 @@ function normalizeExternalAgent(value: unknown, id: string): ExternalAgentValue 
   if (!command) {
     throw new Error(`${adapter} external agent requires command`);
   }
-  const review = normalizeExternalAgentRole(value.review, "review");
-  const execution = normalizeExternalAgentRole(value.execution, "execution");
+  const review = normalizeExternalAgentRole(value.review, "review", adapter);
+  const execution = normalizeExternalAgentRole(value.execution, "execution", adapter);
   if (!review && !execution) {
     throw new Error(`external agent requires review or execution role: ${id}`);
   }
@@ -1509,6 +1514,7 @@ function normalizeExternalAgent(value: unknown, id: string): ExternalAgentValue 
   return {
     adapter,
     command,
+    ...normalizeAgentReasoning(adapter, value.reasoningEffort),
     args: normalizeStringArray(value.args, "external agent args"),
     env: normalizeStringRecord(value.env, "external agent env"),
     model: normalizeOptionalNonEmptyString(value.model, "external agent model"),
@@ -1517,7 +1523,14 @@ function normalizeExternalAgent(value: unknown, id: string): ExternalAgentValue 
   };
 }
 
-function normalizeExternalAgentRole(value: unknown, role: "review" | "execution"): ExternalAgentRoleConfig | undefined {
+function normalizeAgentReasoning(adapter: ExternalAgentAdapter, value: unknown): { reasoningEffort?: NativeReasoningEffort } {
+  // Foreign adapters retain their previous schema (unknown fields are ignored).
+  if (value === undefined || (adapter !== "claude-cli" && adapter !== "codex-cli")) return {};
+  if (!isNativeReasoningEffort(adapter, value)) throw new Error("invalid native external agent reasoningEffort");
+  return { reasoningEffort: value };
+}
+
+function normalizeExternalAgentRole(value: unknown, role: "review" | "execution", adapter: ExternalAgentAdapter): ExternalAgentRoleConfig | undefined {
   if (value === undefined || value === false) return undefined;
   if (!isRecord(value)) {
     throw new Error(`external agent ${role} role must be an object`);
@@ -1529,6 +1542,7 @@ function normalizeExternalAgentRole(value: unknown, role: "review" | "execution"
     throw new Error(`unsupported external agent ${role} protocol`);
   }
   return {
+    ...normalizeAgentReasoning(adapter, value.reasoningEffort),
     args: normalizeStringArray(value.args, `external agent ${role} args`),
     env: normalizeStringRecord(value.env, `external agent ${role} env`),
     model: normalizeOptionalNonEmptyString(value.model, `external agent ${role} model`),
@@ -1772,7 +1786,9 @@ function mergedAgentRole(agent: ExternalAgentConfig, role: ExternalAgentRoleConf
   timeoutMs: number;
 } {
   return {
-    args: [...(agent.args ?? []), ...(role.args ?? [])],
+    args: agent.adapter === "claude-cli" || agent.adapter === "codex-cli"
+      ? nativeReasoningArgs(agent.adapter, agent.args ?? [], role.args ?? [], role.reasoningEffort ?? agent.reasoningEffort)
+      : [...(agent.args ?? []), ...(role.args ?? [])],
     env: { ...(agent.env ?? {}), ...(role.env ?? {}) },
     model: role.model ?? agent.model,
     timeoutMs: role.timeoutMs ?? fallbackTimeout,

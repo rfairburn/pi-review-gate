@@ -340,9 +340,35 @@ a saved config no longer depends on the legacy import. If you are still on a leg
 array when a release removes that import, first run an intervening release that still
 supports the conversion and save once through `/review-settings` to persist the
 canonical object form, then upgrade to the removing release. In `/review-settings`
-the worker catalog displays alphabetically and edits by key with no reorder controls;
-external agents are not editable in this UI; ordering is set only in the two priority
-routes. Explicitly adding a worker resource enrolls it in each supported role's
+the worker-resource catalog displays alphabetically and edits by key with no reorder
+controls; ordering is set only in the two priority routes. Edit Claude/Codex external
+agent definitions separately under **External workers**; renaming an agent updates
+resource selections while retaining resource IDs and route order. Supported editors
+use human-readable Model/Reasoning choices and timeouts,
+with automatic `claude`/`codex` commands and fixed native protocols, not executable,
+argument-list, or protocol-override menus, and no environment key/value editing or
+counts. Manual JSON `env` configuration remains fully supported and is preserved by
+Apply, rename, and other edits while the roles remain enabled. Only Create/Apply normalizes that definition:
+legacy effort migrates; other arguments, custom executable paths, and native protocol
+overrides are removed with scoped warnings. Untouched legacy JSON remains compatible. Model-specific effort and every enabled
+role's inheritance must be valid before Apply; incompatible choices require explicit
+resolution, never fallback. CLI default delegates to CLI settings, not off, and an
+explicit role default suppresses inherited Shared effort. Custom/pinned model values
+can be kept. Max is not Extra High (`xhigh`); Codex Ultra means automatic task delegation and is
+only offered where supported. Catalogs are release-maintained, not live discovery
+or a guarantee of installed CLI/account access; no provider is started by the menu.
+
+Every supported editor offers **Delete** directly beside **Apply**/**Cancel**, using
+the original identity despite unapplied local edits; newly staged definitions are
+also deletable. Unsupported types offer only **Delete**/**Back**. The staged cascade
+removes affected resources/routes and primary/subtask/scheduled reviewer references;
+invalidated schedules are disabled, with only invalid pins or emptied reviewer
+overrides reset to inheritance. Notices explain cleanup and defaults used on later
+re-enable. Root Save/Cancel persists/discards the whole draft. Missing native CLIs
+on `PATH` warn without blocking Save, even for selected workers; runtime failures
+remain errors. See [External worker management](configuration.md#manage-existing-external-workers)
+and [Native reasoning effort](configuration.md#native-reasoning-effort).
+Explicitly adding a worker resource enrolls it in each supported role's
 priority (in addition order, with the model's default reasoning); if its model is
 changed before leaving the pool editor, enrollment and reasoning are re-derived
 from the final selection — enrolling it in any supported route it is not yet
@@ -351,7 +377,8 @@ resource that exists when the pool editor opens is never enrolled into a route
 it was excluded from just because its model changed later. Opening or saving
 settings never enrolls preexisting resources into missing or empty priorities.
 
-When `/review-settings` switches a resource to a different model, the previous model's
+For Pi-scoped selections, when `/review-settings` switches a resource to a different
+model, the previous model's
 reasoning is discarded for that resource's retained route entries — the model and its
 reasoning go hand in hand, even when the new model supports the prior level — and each
 entry takes the new model's own configured or pinned reasoning, otherwise that model's

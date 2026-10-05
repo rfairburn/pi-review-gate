@@ -125,6 +125,43 @@ default — no reviewers or workers selected — so a fresh install starts witho
 hand-created config. You then
 add reviewers and workers through `/review-settings` or by editing the file; until you
 do, no reviewer or worker model is invoked implicitly; no usable review is configured.
+For Claude Code or Codex CLI, open `/review-settings` → **External workers** →
+**Create worker**, choose roles, then use human-readable **Model** and **Reasoning**
+controls and timeouts. The menus offer no environment key/value editing: configure
+environment variables by editing the JSON file (`env` on the entry or a role), and
+staged edits preserve existing entries while the roles remain enabled. The executable is automatically
+`claude`/`codex` with the fixed native protocol; no executable, argument-list, or
+protocol-override menus are needed. Reasoning choices depend on the effective model;
+CLI default means the CLI's own settings, not no thinking. Role effort inherits
+Shared unless overridden with a supported level or CLI default; incompatible choices
+require explicit resolution, never a silent fallback. See
+[Native reasoning effort](configuration.md#native-reasoning-effort) for Max versus
+Extra High (`xhigh`) and Codex Ultra's automatic task delegation.
+
+All definitions are listed. Claude/Codex entries are editable, including ID and
+adapter, and preserve custom/pinned models until explicit replacement. Apply
+normalizes only that edited definition, migrating valid legacy effort and warning
+before removing other advanced arguments, custom paths, and native protocol overrides.
+Opening or cancelling an editor, or saving unrelated changes, preserves untouched
+legacy definitions. Every supported editor has **Delete** beside **Apply**/**Cancel**;
+unsupported entries offer only **Delete**/**Back**. Delete uses the original selected
+identity, ignoring unapplied renames/edits, and also works for newly staged entries.
+Renames keep references paired. Deletion reports resource/route/reviewer cleanup,
+disables schedules with invalid pins or emptied explicit reviewer sets, and resets
+only those invalid overrides to inheritance, explaining defaults on later re-enable.
+Root Save/Cancel persists/discards these staged changes together.
+
+The new or edited definition is immediately available for explicit **Worker resources**
+or **Reviewers** selection before saving. Creation alone activates nothing; select
+the workers you want, then **Save changes**. If the Claude/Codex CLI is missing, Save
+still succeeds with a warning; affected workers cannot run until the executable is
+installed and available on `PATH` for a created/applied definition. The bundled
+model catalog does not guarantee installed CLI support or account/provider access;
+the menu performs no live discovery or provider startup. Runtime failures remain
+errors. See
+[Creating and managing external workers](configuration.md#create-external-workers-in-the-settings-menu)
+for the flow, inheritance effects, and release-maintained model catalogs.
+
 A minimal example using Codex as the reviewer:
 
 ```json
@@ -136,6 +173,9 @@ A minimal example using Codex as the reviewer:
   "externalAgents": {
     "codex": {
       "adapter": "codex-cli",
+      "command": "codex",
+      "model": "gpt-6.1-sol",
+      "reasoningEffort": "high",
       "review": { "timeoutMs": 600000 }
     }
   },

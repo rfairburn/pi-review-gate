@@ -151,7 +151,7 @@ for (const targetKind of ["missing", "existing file"] as const) {
     const before = await readFile(configPath, "utf8");
     const run = await registerFlowHandler(configPath);
     const harness = flowHarness([
-      keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
+      keys(...Array(15).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 15)
       keys(KEY_ENTER), // list → task entry (row 0)
       keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 5)
       async (component) => {
@@ -163,7 +163,7 @@ for (const targetKind of ["missing", "existing file"] as const) {
       },
       keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 10)
       keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
-      keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 16)
+      keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 15) → Save changes (row 17)
       keys(ESCAPE), // failed save re-shows the root menu; Esc leaves without saving
     ], { cwd: dir });
 
@@ -196,7 +196,7 @@ test("full TUI flow: a typed existing workspace stages through Save", async (t) 
   const run = await registerFlowHandler(configPath);
 
   const harness = flowHarness([
-    keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
+    keys(...Array(15).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 15)
     keys(KEY_ENTER), // list → task entry (row 0)
     keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 5)
     async (component) => {
@@ -206,7 +206,7 @@ test("full TUI flow: a typed existing workspace stages through Save", async (t) 
     },
     keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 10)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
-    keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 16)
+    keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 15) → Save changes (row 17)
   ], { cwd: dir });
 
   await run(harness.ctx);
@@ -231,7 +231,7 @@ test("full TUI flow: cancel in the workspace field leaves the staged value uncha
   const run = await registerFlowHandler(configPath);
 
   const harness = flowHarness([
-    keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
+    keys(...Array(15).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 15)
     keys(KEY_ENTER), // list → task entry (row 0)
     keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 5)
     async (component) => {
@@ -289,7 +289,7 @@ test("full TUI flow (real host): native Tab completion stages an existing direct
   setNativeEditorHost(loaded.host);
   const providerCtor = loaded.tui.CombinedAutocompleteProvider as new (commands: never[], basePath: string) => unknown;
   const harness = flowHarness([
-    keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
+    keys(...Array(15).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 15)
     keys(KEY_ENTER), // list → task entry (row 0)
     keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 5)
     async (component) => {
@@ -302,7 +302,7 @@ test("full TUI flow (real host): native Tab completion stages an existing direct
     },
     keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 10)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
-    keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 14) → Save changes (row 16)
+    keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 15) → Save changes (row 17)
   ], { cwd: home, keybindings: createRealKeybindingsManager(loaded.tui), theme: REAL_IDENTITY_THEME, provider: new providerCtor([], home) });
 
   await run(harness.ctx);

@@ -15,6 +15,46 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.118]
+
+### Added
+
+- Create and manage Claude Code and Codex CLI definitions in `/review-settings`,
+  editing ID, adapter, roles, timeouts, and human-readable Model/Reasoning
+  choices. Release catalogs include versioned Claude models and eight Codex models;
+  custom/pinned values remain until explicitly replaced. Model-specific structured
+  `reasoningEffort` supports Shared inheritance and explicit role CLI default (not
+  off), distinguishes Max from Extra High (`xhigh`), and discloses Codex Ultra's
+  automatic task delegation. Invalid or incompatible effort requires explicit resolution, not
+  silent fallback. Create/Apply automatically sets `claude`/`codex` and fixed native
+  protocols, with no executable/argument-list/protocol-override menus. Only that
+  edited definition imports legacy effort and removes other advanced arguments,
+  custom paths, and native protocol overrides, with scoped warnings before staging;
+  untouched legacy configurations remain compatible.
+- List every external definition; supported editors offer Delete directly beside
+  Apply/Cancel, targeting the original identity despite unapplied edits, including
+  newly staged definitions. Unsupported types offer only Delete/Back. Renames keep
+  references paired and resource IDs/routes stable. Deletion reports resource,
+  route, and reviewer cleanup, disables invalidated schedules, and resets only
+  invalid pins or emptied review overrides to inheritance with later-default notices.
+  Root Save/Cancel atomically persists/discards the shared draft, preserving unrelated
+  definitions and rejecting catalog conflicts. Creation/editing never enrolls workers
+  or invokes providers; catalogs do not guarantee installed CLI/account access.
+  Missing native CLIs on PATH warn without blocking Save, including selected workers;
+  runtime failures remain failures (#49).
+
+### Changed
+
+- Simplified the native external worker editors in `/review-settings`: they no longer
+  offer shared/role environment key/value editing or entry counts. `env` remains
+  supported in the `externalAgents` schema and honored at runtime; configure
+  environment variables by editing the configuration file directly, and Apply,
+  rename, and unrelated staged edits preserve existing shared/role environment
+  entries while the roles remain enabled (disabling a role drops that role's
+  overrides, including its environment). The root menu now lists **External
+  workers** immediately below **Worker resources**; ordinary rows and Save/Cancel
+  behavior are unchanged (#49).
+
 ## [0.1.0-dev.117]
 
 ### Fixed

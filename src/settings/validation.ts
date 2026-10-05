@@ -6,10 +6,12 @@
  * contract.
  */
 import { constants } from "node:fs";
-import { access } from "node:fs/promises";
-import { delimiter, isAbsolute, join } from "node:path";
+import { access, stat } from "node:fs/promises";
+import { delimiter, extname, isAbsolute, join, win32 } from "node:path";
 import {
   MAX_EXECUTION_WORKERS,
+  externalAgentCatalog,
+  type ExternalAgentConfig,
   externalAgentSupportsExecution,
   externalAgentSupportsReview,
   executorSelectionKey,
@@ -23,6 +25,35 @@ import {
 import type { ScopedModelChoice } from "./models";
 import { reviewerKey } from "./review";
 
+export interface SettingsValidationPolicy {
+  /** Settings Save only; runtime and other callers remain strict by default. */
+  allowMissingApplicationCli?: boolean;
+  warnings?: Set<string>;
+}
+
+function warnMissingApplication(agent: ExternalAgentConfig, policy: SettingsValidationPolicy): boolean {
+  if (!policy.allowMissingApplicationCli || (agent.adapter !== "codex-cli" && agent.adapter !== "claude-cli")) return false;
+  policy.warnings?.add(`External worker ${agent.id} cannot run until its ${agent.adapter === "codex-cli" ? "Codex" : "Claude"} binary is installed and available.`);
+  return true;
+}
+
+async function applicationRoleAvailable(agent: ExternalAgentConfig, role: "execution" | "review"): Promise<boolean> {
+  return applicationCommandAvailable(agent.command!, { ...process.env, ...agent.env, ...agent[role]?.env });
+}
+
+/** Warn for configured application CLIs even when not selected for a role. */
+export async function collectExternalAgentAvailabilityWarnings(config: ReviewGateConfig, policy: SettingsValidationPolicy): Promise<void> {
+  for (const agent of externalAgentCatalog(config)) {
+    if (agent.adapter !== "codex-cli" && agent.adapter !== "claude-cli") continue;
+    for (const role of ["execution", "review"] as const) {
+      if (agent[role] && !await applicationRoleAvailable(agent, role)) {
+        warnMissingApplication(agent, policy);
+        break;
+      }
+    }
+  }
+}
+
 export async function validateSelection(
   workerResources: WorkerResourceCatalog,
   reviewers: ActiveReviewerSelection[],
@@ -30,6 +61,7 @@ export async function validateSelection(
   scoped: ScopedModelChoice[],
   executeRoute: WorkerRouteEntry[] = [],
   researchRoute: WorkerRouteEntry[] = [],
+  policy: SettingsValidationPolicy = {},
 ): Promise<string | undefined> {
   const duplicateReviewer = duplicate(reviewers.map(reviewerKey));
   if (duplicateReviewer) return `Duplicate enabled reviewer: ${duplicateReviewer}`;
@@ -75,7 +107,9 @@ export async function validateSelection(
     }
     const agent = resolvedExternalAgent(config, selection.id);
     if (!agent || !externalAgentSupportsExecution(agent)) return `External executor is unavailable: ${selection.id}`;
-    if (!await commandAvailable(agent.command!)) return `Executor executable is unavailable: ${agent.command}`;
+    const available = policy.allowMissingApplicationCli && (agent.adapter === "codex-cli" || agent.adapter === "claude-cli")
+      ? await applicationRoleAvailable(agent, "execution") : await commandAvailable(agent.command!);
+    if (!available && !warnMissingApplication(agent, policy)) return `Executor executable is unavailable: ${agent.command}`;
   }
   for (const reviewer of reviewers) {
     if (reviewer.source === "pi") {
@@ -89,9 +123,42 @@ export async function validateSelection(
     }
     const agent = resolvedExternalAgent(config, reviewer.id);
     if (!agent || !externalAgentSupportsReview(agent)) return `External reviewer is unavailable: ${reviewer.id}`;
-    if (config.enabled && !await commandAvailable(agent.command!)) return `Reviewer executable is unavailable: ${agent.command} (${agent.id})`;
+    if (config.enabled) {
+      const available = policy.allowMissingApplicationCli && (agent.adapter === "codex-cli" || agent.adapter === "claude-cli")
+        ? await applicationRoleAvailable(agent, "review") : await commandAvailable(agent.command!);
+      if (!available && !warnMissingApplication(agent, policy)) return `Reviewer executable is unavailable: ${agent.command} (${agent.id})`;
+    }
   }
   return undefined;
+}
+
+/** Application-only availability probe; platform/environment injection keeps tests hermetic. */
+export async function applicationCommandAvailable(
+  command: string,
+  environment: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): Promise<boolean> {
+  const windows = platform === "win32";
+  // Match Node's first case-insensitive environment key on Windows when
+  // shared/role overrides produce a plain object (rather than process.env).
+  const environmentValue = (name: string): string | undefined => {
+    if (!windows) return environment[name];
+    const key = Object.keys(environment).sort().find((candidate) => candidate.toUpperCase() === name);
+    return key === undefined ? undefined : environment[key];
+  };
+  const suffixes = windows && !extname(command)
+    ? ["", ...(environmentValue("PATHEXT") ?? ".COM;.EXE;.BAT;.CMD").split(";").filter((suffix) => /^\.[a-z0-9]+$/i.test(suffix)).map((suffix) => suffix.toLowerCase())]
+    : [""];
+  const explicitPath = isAbsolute(command) || (windows && win32.isAbsolute(command)) || command.includes("/") || (windows && command.includes("\\"));
+  const locations = explicitPath ? [command] : (environmentValue("PATH") ?? "").split(windows ? ";" : delimiter).filter(Boolean).map((directory) => join(directory, command));
+  for (const location of locations) {
+    for (const suffix of suffixes) {
+      const candidate = location + suffix;
+      if (await stat(candidate).then((entry) => entry.isFile(), () => false)
+        && await access(candidate, constants.X_OK).then(() => true, () => false)) return true;
+    }
+  }
+  return false;
 }
 
 async function commandAvailable(command: string): Promise<boolean> {

@@ -188,7 +188,7 @@ async function runNativeImageFlow(
       editor.insertTextAtCursor(options.paste);
     },
     drivers: [
-      keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (row 14)
+      keys(...Array(15).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 15)
       keys(KEY_ENTER), // list → task entry (row 0)
       keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → instructions (row 4)
       async (component: { handleInput?(data: string): void }): Promise<void> => {
@@ -201,7 +201,7 @@ async function runNativeImageFlow(
       ...(options.outcome === "cancel"
         ? [keys(KEY_ESCAPE)] // root: leave without saving
         : [
-            keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (retained "scheduled", row 14) → Save (row 16)
+            keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (retained "scheduled", index 15) → Save (row 17)
           ]),
     ],
   });

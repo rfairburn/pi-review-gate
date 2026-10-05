@@ -313,7 +313,7 @@ editing JSON. Choose a unique identifier and supported application, select execu
 review, or both roles, and choose a model from that application's menu. The executable
 may be left at its application default (`claude` or `codex`) or set to a path to the
 matching CLI. Generic/binary adapter creation is not offered. Existing definitions
-of other adapter types remain visible with read-only viewing and deletion controls.
+of other adapter types remain visible with **Delete** and **Back** controls only.
 
 Advanced fields provide structured argument lists and environment entries, plus
 role-specific model, argument, environment, and timeout overrides. Shared arguments
@@ -327,7 +327,7 @@ argument or environment values.
 Creating a definition only adds it to the settings draft. Before saving, explicitly
 add it through **Worker resources** for execution, or select it in the primary and/or
 subtask reviewer sets under **Reviewers** for review. Only configured roles appear
-in their supported selectors. Creating, listing, viewing, or editing a definition
+in their supported selectors. Creating, listing, or editing a definition
 never enrolls it in a resource or reviewer pool or invokes a provider. **Save changes** saves the definitions together
 with explicit resource, route, and reviewer selections; reopening/reloading retains
 them. Cancel or leaving the root menu with Escape discards the current edits.
@@ -353,8 +353,8 @@ references together. Resource IDs, route order, and scheduled resource pins rema
 unchanged: these refer to the same resource, not directly to the renamed definition.
 Invalid or duplicate IDs do not partially change the catalog or its references.
 
-For unsupported adapter types, **Select** opens a read-only definition view; it does
-not activate or enroll the worker. **Delete** removes that definition, resources
+For unsupported adapter types, opening an entry offers only **Delete** and **Back**;
+there is no editor or separate viewer. **Delete** removes that definition, resources
 selecting it, their route entries, and primary/subtask/scheduled reviewer references.
 If a scheduled task loses its pinned resource or its explicit reviewer set becomes
 empty, the task is disabled and only the invalid pin or review override resets to

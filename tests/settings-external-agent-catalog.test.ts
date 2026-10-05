@@ -72,15 +72,29 @@ test("delete cascades actual resources, routes, both layers, dormant tasks and e
   assert.ok(opening.externalAgents!.X);
 });
 
-test("catalog lists native/unsupported and action-name IDs; unsupported Select is inert, native has no Delete", async () => {
+test("catalog lists native/unsupported and action-name IDs; unsupported offers only Delete/Back, Back is inert, native has no Delete", async () => {
   const config = normalizeConfig({ externalAgents: Object.fromEntries(["create", "back", "__proto__"].map((id, index) => [id, index === 2 ? { adapter: "generic-cli", command: "unused", review: {} } : { adapter: "codex-cli", execution: {} }])) });
   const before = structuredClone(config);
-  const s = script(["__proto__", "Select", "create [", "Cancel", "back [", "Cancel", "Back"]);
-  await manageExternalAgents(s.ui, config, async () => { throw new Error("view activated"); });
+  const s = script(["__proto__", "Back", "create [", "Cancel", "back [", "Cancel", "Back"]);
+  await manageExternalAgents(s.ui, config, async () => { throw new Error("Back or Cancel applied a change"); });
   assert.deepEqual(config, before);
   assert.equal(s.menus[0].length, 5);
   assert.ok(s.menus[0].includes("Create worker"));
+  assert.deepEqual(s.menus[1], ["Delete", "Back"]);
+  assert.deepEqual(s.notices, []);
   assert.ok(!s.menus.filter((rows) => rows.some((row) => row.startsWith("Identifier:"))).some((rows) => rows.includes("Delete")));
+  s.consumed();
+});
+
+test("unsupported Delete passes only the selected ID to the apply callback", async () => {
+  const config = fixture(), before = structuredClone(config);
+  const s = script(["X [", "Delete", "Back"]);
+  const calls: unknown[][] = [];
+  await manageExternalAgents(s.ui, config, async (...args) => { calls.push(args); });
+  assert.deepEqual(s.menus[1], ["Delete", "Back"]);
+  assert.deepEqual(calls, [["X"]]);
+  assert.deepEqual(config, before);
+  assert.deepEqual(s.notices, []);
   s.consumed();
 });
 

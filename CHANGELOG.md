@@ -23,9 +23,10 @@ dates.
   `/review-settings`, with release-maintained application model menus and structured
   shared/role options. List all definitions and fully edit supported types, including
   ID and adapter; renames keep references paired, preserving resource identities and
-  existing model values until explicitly replaced. Unsupported types offer read-only
-  viewing and deletion with vocal reference-cleanup notices; invalidated schedules
-  are disabled and their invalid pins/review overrides reset to inheritance. New or
+  existing model values until explicitly replaced. Unsupported types offer only
+  Delete and Back, without a separate viewer; deletion has vocal reference-cleanup
+  notices. Invalidated schedules are disabled and their invalid pins/review overrides
+  reset to inheritance. New or
   edited definitions are available for explicit resource/reviewer selection before
   Save, without automatic enrollment or provider calls. Save the shared draft while
   preserving unrelated configuration and rejecting catalog conflicts. Missing

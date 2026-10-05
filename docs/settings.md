@@ -86,10 +86,10 @@ supplies the live switch (the ordinary extension entry point always does):
 - **External workers** lists the shared external-agent catalog. Create and fully edit
   Claude Code/Codex CLI definitions, including ID and adapter, with application-specific
   model menus and structured shared/role options. Renames migrate existing references
-  without changing resource IDs or route order. Other adapter types expose view-only
-  Select and Delete; deletion reports removed references and disables schedules whose
-  pin or explicit reviewer set becomes invalid, resetting invalid references to
-  inheritance. Creation/viewing does not enroll workers in pools or invoke providers.
+  without changing resource IDs or route order. Other adapter types offer only Delete
+  and Back, with no editor or separate viewer; deletion reports removed references
+  and disables schedules whose pin or explicit reviewer set becomes invalid, resetting invalid references to
+  inheritance. Creating/listing/editing does not enroll workers in pools or invoke providers.
   Everything remains staged until root Save; missing Claude/Codex binaries warn rather
   than block saving. See [External worker management](configuration.md#manage-existing-external-workers).
 - **Scheduler runtime** (the conditional row, shown when the host runtime provides

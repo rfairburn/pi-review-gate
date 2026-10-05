@@ -344,7 +344,7 @@ the worker-resource catalog displays alphabetically and edits by key with no reo
 controls; ordering is set only in the two priority routes. Edit Claude/Codex external
 agent definitions separately under **External workers**; renaming an agent updates
 resource selections while retaining resource IDs and route order. Unsupported types
-can be viewed or deleted there, with explicit reference/schedule cleanup notices. See
+offer only **Delete** and **Back** there, with explicit reference/schedule cleanup notices. See
 [External worker management](configuration.md#manage-existing-external-workers). Explicitly adding a worker resource enrolls it in each supported role's
 priority (in addition order, with the model's default reasoning); if its model is
 changed before leaving the pool editor, enrollment and reasoning are re-derived

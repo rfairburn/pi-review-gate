@@ -129,7 +129,8 @@ For Claude Code or Codex CLI, open `/review-settings` â†’ **External workers** â
 **Create worker**, choose roles and an application-specific model, and configure
 advanced options without JSON. External workers also lists existing definitions:
 Claude/Codex definitions are fully editable, including ID and adapter; unsupported
-types can be viewed or deleted. Renames keep references paired. Deletion reports
+entries offer only **Delete** and **Back**, with no editor or separate viewer.
+Renames keep references paired. Deletion reports
 removed references and disables schedules whose pin or reviewer override becomes
 invalid, resetting invalid references to inheritance.
 

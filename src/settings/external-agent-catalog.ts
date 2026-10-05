@@ -2,7 +2,7 @@ import { isDeepStrictEqual } from "node:util";
 import { cloneExternalAgentCatalog, effectiveReviewSettings, normalizeConfig, resolvedExternalAgent, resolvedWorkerCatalog, type ExternalAgentValue, type ReviewGateConfig } from "../config";
 import { selectExternalAgentCreation, selectExternalAgentEdit } from "./external-agents";
 import { retainedSelect } from "./menu";
-import { notify, type UiContext } from "./ui";
+import type { UiContext } from "./ui";
 
 export interface ExternalAgentOperation {
   /** Opening identity and immutable definition; absent baseline means creation. */
@@ -120,10 +120,9 @@ export async function manageExternalAgents(ui: UiContext, config: ReviewGateConf
       const edited = await selectExternalAgentEdit(ui, config, agent);
       if (edited) { const { id: nextId, ...definition } = edited; await apply(id, nextId, definition); }
     } else {
-      const action = await retainedSelect(ui, { title: `Worker ${id} — unsupported adapter (view only)`, rows: [
-        { key: "select", label: "Select (view only)" }, { key: "delete", label: "Delete" }, { key: "back", label: "Back" },
+      const action = await retainedSelect(ui, { title: `Worker ${id} — unsupported adapter`, rows: [
+        { key: "delete", label: "Delete" }, { key: "back", label: "Back" },
       ] });
-      if (action === "select") await notify(ui, `${id}: ${agent.adapter}; roles: ${[agent.execution && "execution", agent.review && "review"].filter(Boolean).join(", ")}; arguments: ${agent.args?.length ?? 0}; environment entries: ${Object.keys(agent.env ?? {}).length}. View only — no enrollment or activation.`, "info");
       if (action === "delete") await apply(id);
     }
   }

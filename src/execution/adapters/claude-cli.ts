@@ -271,12 +271,31 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
           // the terminal one (issue #63).
           targetUuid = messageUuid;
           let interruptionVerified = false;
+          let interruptionSurvived = false;
           let deliverySettled: (() => void) | undefined;
           let deliveryPromise: Promise<void> | undefined;
           try {
             if (options?.interrupt) {
-              await query!.interrupt();
+              // Record the owned control event before issuing it so a result
+              // that races the acknowledgement is still attributed to this
+              // turn; it stays unverified until the native interrupt resolves,
+              // so a racing or rejected interruption cannot relabel a genuine
+              // failure (#305).
+              activity.notePendingInterruption(previousTargetUuid);
+              const receipt = await query!.interrupt();
               interruptionVerified = true;
+              // The receipt's still_queued uuids survive the abort and will
+              // run: a surviving target was never interrupted, so withdraw
+              // its unproven authority instead of granting it. Older CLIs
+              // provide no survivor receipt; their acknowledgement authorizes
+              // classification only when the result itself has an explicit
+              // abort terminal reason (#305).
+              interruptionSurvived = receipt !== undefined && receipt.still_queued.includes(previousTargetUuid);
+              if (interruptionSurvived) {
+                activity.clearInterruption(previousTargetUuid);
+              } else {
+                activity.verifyInterruption(previousTargetUuid, receipt !== undefined);
+              }
               // Track the delivery of a verified interruption so run
               // settlement can reflect a delivery that fails while shutdown
               // is in flight.
@@ -288,7 +307,9 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
             return {
               status: "acknowledged",
               message: options?.interrupt
-                ? `Claude Agent SDK delivered turn-interrupt steering to the same session (${instructionId}); any in-flight turn was interrupted.`
+                ? interruptionSurvived
+                  ? `Claude Agent SDK delivered turn-interrupt steering to the same session (${instructionId}); the previous turn was still queued and survives the interrupt.`
+                  : `Claude Agent SDK delivered turn-interrupt steering to the same session (${instructionId}); any in-flight turn was interrupted.`
                 : `Claude Agent SDK accepted live steering (${instructionId}).`,
               turnId: messageUuid,
             };
@@ -299,7 +320,9 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
               // any interruption): the original turn was never verified as
               // interrupted, so restore its completion tracking — including a
               // terminal result that arrived while the request was pending —
-              // instead of stranding this run on an undelivered UUID.
+              // instead of stranding this run on an undelivered UUID. A later
+              // genuine failure of that turn must keep its failure label (#305).
+              activity.clearInterruption(previousTargetUuid);
               targetUuid = previousTargetUuid;
               const bufferedKey = previousTargetUuid !== initialUuid || unmatchedResults.has(previousTargetUuid)
                 ? previousTargetUuid
@@ -314,8 +337,12 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
             } else {
               // The interrupt succeeded but the replacement was never
               // delivered: settle with a concrete failure rather than waiting
-              // for a result whose message will never arrive.
-              steerDeliveryFailure = `Claude turn-interrupt steering verified the interruption, but replacement delivery failed: ${failure}`;
+              // for a result whose message will never arrive. A surviving
+              // target (receipt still_queued) was acknowledged, not
+              // interrupted (#305).
+              steerDeliveryFailure = interruptionSurvived
+                ? `Claude turn-interrupt steering was acknowledged, but the previous turn survived the interrupt and replacement delivery failed: ${failure}`
+                : `Claude turn-interrupt steering verified the interruption, but replacement delivery failed: ${failure}`;
               finished = true;
               settleNow?.();
             }
@@ -328,13 +355,31 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
         interrupt: async (): Promise<ExecutorInteractionAcknowledgement> => {
           try {
             interruptedByControl = true;
+            // Record the owned control event before issuing it so a result
+            // that races the acknowledgement is still attributed to this
+            // turn; it stays unverified until the native interrupt resolves,
+            // so a racing or rejected interruption cannot relabel a genuine
+            // failure (#305).
+            activity.notePendingInterruption(targetUuid);
             const receipt = await query!.interrupt();
+            // The receipt's still_queued uuids survive the abort and will
+            // run: a surviving target was never interrupted, so withdraw its
+            // unproven authority instead of granting it. Older CLIs provide
+            // no survivor receipt; their acknowledgement authorizes
+            // classification only when the result itself has an explicit
+            // abort terminal reason (#305).
+            if (receipt !== undefined && receipt.still_queued.includes(targetUuid)) {
+              activity.clearInterruption(targetUuid);
+            } else {
+              activity.verifyInterruption(targetUuid, receipt !== undefined);
+            }
             await resultPromise.catch(() => undefined);
             return {
               status: "acknowledged",
               message: `Claude Agent SDK acknowledged interruption${receipt ? `; ${receipt.still_queued.length} message(s) remain queued` : ""}.`,
             };
           } catch (error) {
+            activity.clearInterruption(targetUuid);
             return { status: "failed", message: messageOf(error) };
           }
         },

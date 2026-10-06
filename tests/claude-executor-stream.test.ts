@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { Query, SDKMessage, SDKResultError, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { ClaudeExecutorAdapter } from "../src/execution/adapters/claude-cli";
 import type { ExecutorLiveControl } from "../src/execution/types";
 
@@ -650,6 +650,854 @@ test("Claude executor settles with a concrete failure when replacement delivery 
     assert.equal(result.aborted, true);
     assert.equal(result.failure?.category, "protocol");
     assert.match(result.failure?.message ?? "", /replacement delivery failed/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// Contract-checked SDKResultError fixture: the installed SDK's error-result
+// type carries no user_message_uuid field. Positive interruption evidence is
+// supplied explicitly via terminal_reason where a test establishes an
+// interruption.
+// Usage accounting is boilerplate for these fixtures; the fields under test
+// are subtype, terminal_reason, and errors.
+const fixtureUsage = {
+  input_tokens: 1,
+  output_tokens: 0,
+  cache_read_input_tokens: 0,
+  cache_creation_input_tokens: 0,
+} as SDKResultError["usage"];
+
+function interruptedTurnResult(overrides: Partial<SDKResultError> = {}): SDKResultError {
+  return {
+    type: "result",
+    subtype: "error_during_execution",
+    is_error: true,
+    errors: ["[ede_diagnostic] result_type=user stop_reason=tool_use"],
+    duration_ms: 1,
+    duration_api_ms: 1,
+    num_turns: 1,
+    stop_reason: null,
+    total_cost_usd: 0,
+    usage: fixtureUsage,
+    modelUsage: {},
+    permission_denials: [],
+    uuid: "00000000-0000-4000-8000-000000000001",
+    session_id: "claude-session",
+    ...overrides,
+  };
+}
+
+// A fake streaming session whose interrupt acknowledgement precedes the
+// interrupted turn's terminal result, matching the CLI's ordering: the ack
+// resolves first, then the error result is emitted, then (for steering) the
+// replacement turn runs.
+function createInterruptingFakeQuery(
+  prompt: AsyncIterable<SDKUserMessage>,
+  inputs: SDKUserMessage[],
+  interruptBehavior: "ack-then-result" | "result-before-ack" | "reject-then-result" | "ack-then-max-turns" | "ack-then-model-error" | "ack-then-no-reason" | "ack-then-reported" | "ack-survivor-then-reported" | "ack-then-abort-no-receipt",
+  withReceipt = true,
+): Query {
+  const output = new AsyncOutputQueue();
+  void (async () => {
+    for await (const message of prompt) {
+      inputs.push(message);
+      if (inputs.length === 1) {
+        output.push({ type: "system", subtype: "init", session_id: "claude-session", uuid: "system-1" } as unknown as SDKMessage);
+        output.push({
+          type: "assistant",
+          session_id: "claude-session",
+          uuid: "assistant-1",
+          parent_tool_use_id: null,
+          message: { role: "assistant", content: [{ type: "text", text: "working" }] },
+        } as unknown as SDKMessage);
+      } else {
+        // The replacement turn's result follows the interrupted turn's.
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 0));
+        output.push({
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          result: "claude complete",
+          user_message_uuid: message.uuid,
+          session_id: "claude-session",
+          uuid: "result-1",
+          duration_ms: 1,
+          duration_api_ms: 1,
+          num_turns: 1,
+          stop_reason: null,
+          total_cost_usd: 0,
+          usage: { input_tokens: 20, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+          modelUsage: {},
+          permission_denials: [],
+        } as unknown as SDKMessage);
+      }
+    }
+  })();
+  const iterator = output[Symbol.asyncIterator]();
+  return {
+    next: () => iterator.next(),
+    return: async () => ({ value: undefined, done: true }),
+    throw: async (error?: unknown) => { throw error; },
+    [Symbol.asyncIterator]() { return this; },
+    initializationResult: async () => ({ commands: [], agents: [], output_style: "", available_output_styles: [], models: [], account: {} as never }),
+    interrupt: async () => {
+      if (interruptBehavior === "ack-then-result") {
+        setTimeout(() => output.push(interruptedTurnResult({ terminal_reason: "aborted_streaming" })), 0);
+        return { still_queued: [] };
+      }
+      if (interruptBehavior === "result-before-ack") {
+        // The turn's genuine API failure beats the interrupt acknowledgement.
+        output.push(interruptedTurnResult({
+          terminal_reason: "api_error",
+          errors: ["API Error: 429 rate limit exceeded"],
+          uuid: "00000000-0000-4000-8000-000000000002",
+        }));
+        return { still_queued: [] };
+      }
+      if (interruptBehavior === "reject-then-result") {
+        setTimeout(() => output.push(interruptedTurnResult({
+          terminal_reason: "api_error",
+          errors: ["API Error: 429 rate limit exceeded"],
+          uuid: "00000000-0000-4000-8000-000000000002",
+        })), 0);
+        throw new Error("synthetic interrupt rejection");
+      }
+      if (interruptBehavior === "ack-then-model-error") {
+        // A genuine same-subtype execution failure after a verified ack.
+        setTimeout(() => output.push(interruptedTurnResult({
+          terminal_reason: "model_error",
+          errors: ["synthetic model failure detail"],
+          uuid: "00000000-0000-4000-8000-000000000003",
+        })), 0);
+        return { still_queued: [] };
+      }
+      if (interruptBehavior === "ack-then-no-reason") {
+        // An execution error without any terminal reason after a verified ack.
+        setTimeout(() => output.push(interruptedTurnResult({
+          errors: ["synthetic undiagnosed termination"],
+          uuid: "00000000-0000-4000-8000-000000000004",
+        })), 0);
+        return { still_queued: [] };
+      }
+      if (interruptBehavior === "ack-then-reported") {
+        // The exact reported steering-correlated raw result: SDK-mode
+        // interrupted turn results carry no terminal_reason, only the CLI's
+        // internal cutoff diagnostic in errors[].
+        setTimeout(() => output.push(interruptedTurnResult({
+          stop_reason: "tool_use",
+          errors: ["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],
+          uuid: "00000000-0000-4000-8000-000000000006",
+        })), 0);
+        return withReceipt ? { still_queued: [] } : undefined;
+      }
+      if (interruptBehavior === "ack-then-abort-no-receipt") {
+        // Legacy CLIs resolve the interrupt without a receipt; an explicit
+        // abort terminal reason still classifies the result on its own.
+        setTimeout(() => output.push(interruptedTurnResult({
+          terminal_reason: "aborted_streaming",
+          uuid: "00000000-0000-4000-8000-000000000008",
+        })), 0);
+        return undefined;
+      }
+      if (interruptBehavior === "ack-survivor-then-reported") {
+        // The receipt reports the target uuid as a survivor (still queued
+        // when the abort landed, per the interrupt_receipt_v1 contract): it
+        // was never interrupted and will run. Its later diagnostic-only EDE
+        // must not gain interruption authority from this request.
+        setTimeout(() => output.push(interruptedTurnResult({
+          stop_reason: "tool_use",
+          errors: ["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],
+          uuid: "00000000-0000-4000-8000-000000000007",
+        })), 0);
+        return { still_queued: [inputs[0]?.uuid ?? ""] };
+      }
+      setTimeout(() => output.push(interruptedTurnResult({
+        subtype: "error_max_turns",
+        errors: ["max turns reached"],
+        uuid: "00000000-0000-4000-8000-000000000005",
+      })), 0);
+      return { still_queued: [] };
+    },
+    close: () => output.close(),
+  } as unknown as Query;
+}
+
+test("Claude executor reports owned turn-interrupt steering as an interruption, not an API failure (#305)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-steer-interrupt-activity-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    const fakeQuery = ((paramsArg: { prompt: AsyncIterable<SDKUserMessage> }) =>
+      createInterruptingFakeQuery(paramsArg.prompt, inputs, "ack-then-result")) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const activity: string[] = [];
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "initial",
+      artifactDir,
+      turn: 1,
+      onUpdate: (message) => activity.push(message),
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.equal((await control.steer("steered", "steer-interrupt-activity-1", { interrupt: true })).status, "acknowledged");
+    const result = await run;
+
+    // The interrupted turn's contract-shaped (unkeyed) error result is a
+    // truthful interruption; the replacement turn completes normally. No
+    // fabricated API failure.
+    assert.equal(result.failure, undefined);
+    assert.ok(activity.includes("model turn interrupted"));
+    assert.ok(activity.includes("model turn completed"));
+    assert.equal(activity.some((message) => message.startsWith("model failed")), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude executor reports an explicit Interrupt as an interruption, not an API failure (#305)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-interrupt-activity-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    const fakeQuery = ((paramsArg: { prompt: AsyncIterable<SDKUserMessage> }) =>
+      createInterruptingFakeQuery(paramsArg.prompt, inputs, "ack-then-result")) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const activity: string[] = [];
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "initial",
+      artifactDir,
+      turn: 1,
+      onUpdate: (message) => activity.push(message),
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.equal((await control.interrupt()).status, "acknowledged");
+    const result = await run;
+
+    // The owned interruption keeps its category and truthful activity; the
+    // interrupted turn's contract-shaped (unkeyed) error result is not a
+    // model/API failure.
+    assert.equal(result.aborted, true);
+    assert.equal(result.failure?.category, "interruption");
+    assert.ok(activity.includes("model turn interrupted"));
+    assert.equal(activity.some((message) => message.startsWith("model failed")), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude executor reports the reported SDK-mode cutoff payload as an interruption for turn-interrupt steering (#305)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-reported-steer-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    const fakeQuery = ((paramsArg: { prompt: AsyncIterable<SDKUserMessage> }) =>
+      createInterruptingFakeQuery(paramsArg.prompt, inputs, "ack-then-reported")) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const activity: string[] = [];
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "initial",
+      artifactDir,
+      turn: 1,
+      onUpdate: (message) => activity.push(message),
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.equal((await control.steer("steered", "reported-steer-1", { interrupt: true })).status, "acknowledged");
+    const result = await run;
+
+    // The exact reported payload (no terminal_reason) is the interrupted
+    // turn's truthful cutoff; the replacement turn completes normally.
+    assert.equal(result.failure, undefined);
+    assert.ok(activity.includes("model turn interrupted"));
+    assert.ok(activity.includes("model turn completed"));
+    assert.equal(activity.some((message) => message.startsWith("model failed")), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude executor reports the reported SDK-mode cutoff payload as an interruption for an explicit Interrupt (#305)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-reported-interrupt-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    const fakeQuery = ((paramsArg: { prompt: AsyncIterable<SDKUserMessage> }) =>
+      createInterruptingFakeQuery(paramsArg.prompt, inputs, "ack-then-reported")) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const activity: string[] = [];
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "initial",
+      artifactDir,
+      turn: 1,
+      onUpdate: (message) => activity.push(message),
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.equal((await control.interrupt()).status, "acknowledged");
+    const result = await run;
+
+    // The owned interruption keeps its category and truthful activity for the
+    // exact reported payload.
+    assert.equal(result.aborted, true);
+    assert.equal(result.failure?.category, "interruption");
+    assert.ok(activity.includes("model turn interrupted"));
+    assert.equal(activity.some((message) => message.startsWith("model failed")), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude executor keeps a surviving target's diagnostic-only result failing after turn-interrupt steering (#305)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-survivor-steer-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    const fakeQuery = ((paramsArg: { prompt: AsyncIterable<SDKUserMessage> }) =>
+      createInterruptingFakeQuery(paramsArg.prompt, inputs, "ack-survivor-then-reported")) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const activity: string[] = [];
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "initial",
+      artifactDir,
+      turn: 1,
+      onUpdate: (message) => activity.push(message),
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    const acknowledgement = await control.steer("steered", "survivor-steer-1", { interrupt: true });
+    assert.equal(acknowledgement.status, "acknowledged");
+    assert.ok(acknowledgement.message.includes("survives the interrupt"));
+    const result = await run;
+
+    // The receipt proves the previous turn survived the abort (it was still
+    // queued), so its later diagnostic-only EDE keeps its failure label; the
+    // replacement turn completes normally.
+    assert.equal(result.failure, undefined);
+    assert.ok(activity.includes("model failed · Claude error (error_during_execution): [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"));
+    assert.equal(activity.includes("model turn interrupted"), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude executor keeps a surviving target's diagnostic-only result failing after an explicit Interrupt (#305)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-survivor-interrupt-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    const fakeQuery = ((paramsArg: { prompt: AsyncIterable<SDKUserMessage> }) =>
+      createInterruptingFakeQuery(paramsArg.prompt, inputs, "ack-survivor-then-reported")) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const activity: string[] = [];
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "initial",
+      artifactDir,
+      turn: 1,
+      onUpdate: (message) => activity.push(message),
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.equal((await control.interrupt()).status, "acknowledged");
+    const result = await run;
+
+    // The receipt proves the target survived the abort (first-command
+    // prewait window), so its diagnostic-only EDE is a failure, not an
+    // interruption; the run keeps its existing control-cancellation
+    // settlement.
+    assert.equal(result.aborted, true);
+    assert.equal(result.failure?.category, "interruption");
+    assert.ok(activity.includes("model failed · Claude error (error_during_execution): [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"));
+    assert.equal(activity.includes("model turn interrupted"), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude executor keeps a no-receipt diagnostic-only result failing after turn-interrupt steering (#305)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-noreceipt-steer-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    // Legacy CLIs resolve the interrupt without a survivor receipt.
+    const fakeQuery = ((paramsArg: { prompt: AsyncIterable<SDKUserMessage> }) =>
+      createInterruptingFakeQuery(paramsArg.prompt, inputs, "ack-then-reported", false)) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const activity: string[] = [];
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "initial",
+      artifactDir,
+      turn: 1,
+      onUpdate: (message) => activity.push(message),
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.equal((await control.steer("steered", "noreceipt-steer-1", { interrupt: true })).status, "acknowledged");
+    const result = await run;
+
+    // Without a survivor receipt the diagnostic-only shape is not
+    // abort-specific: the failure label stands and the replacement turn
+    // completes normally.
+    assert.equal(result.failure, undefined);
+    assert.ok(activity.includes("model failed · Claude error (error_during_execution): [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"));
+    assert.equal(activity.includes("model turn interrupted"), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude executor keeps a no-receipt diagnostic-only result failing after an explicit Interrupt (#305)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-noreceipt-interrupt-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    // Legacy CLIs resolve the interrupt without a survivor receipt.
+    const fakeQuery = ((paramsArg: { prompt: AsyncIterable<SDKUserMessage> }) =>
+      createInterruptingFakeQuery(paramsArg.prompt, inputs, "ack-then-reported", false)) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const activity: string[] = [];
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "initial",
+      artifactDir,
+      turn: 1,
+      onUpdate: (message) => activity.push(message),
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.equal((await control.interrupt()).status, "acknowledged");
+    const result = await run;
+
+    // Without a survivor receipt the diagnostic-only shape is not
+    // abort-specific: the failure label stands; the run keeps its existing
+    // control-cancellation settlement.
+    assert.equal(result.aborted, true);
+    assert.equal(result.failure?.category, "interruption");
+    assert.ok(activity.includes("model failed · Claude error (error_during_execution): [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"));
+    assert.equal(activity.includes("model turn interrupted"), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude executor keeps legacy abort-terminal-reason classification working without a receipt (#305)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-noreceipt-abort-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    // Legacy CLIs resolve the interrupt without a receipt; an explicit abort
+    // terminal reason still classifies the result as an interruption.
+    const fakeQuery = ((paramsArg: { prompt: AsyncIterable<SDKUserMessage> }) =>
+      createInterruptingFakeQuery(paramsArg.prompt, inputs, "ack-then-abort-no-receipt")) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const activity: string[] = [];
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "initial",
+      artifactDir,
+      turn: 1,
+      onUpdate: (message) => activity.push(message),
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.equal((await control.interrupt()).status, "acknowledged");
+    const result = await run;
+
+    assert.equal(result.aborted, true);
+    assert.equal(result.failure?.category, "interruption");
+    assert.ok(activity.includes("model turn interrupted"));
+    assert.equal(activity.some((message) => message.startsWith("model failed")), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude executor keeps a racing genuine API failure failing while the interrupt acknowledgement is pending (#305)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-racing-failure-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    const fakeQuery = ((paramsArg: { prompt: AsyncIterable<SDKUserMessage> }) =>
+      createInterruptingFakeQuery(paramsArg.prompt, inputs, "result-before-ack")) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const activity: string[] = [];
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "initial",
+      artifactDir,
+      turn: 1,
+      onUpdate: (message) => activity.push(message),
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.equal((await control.steer("steered", "racing-failure-1", { interrupt: true })).status, "acknowledged");
+    const result = await run;
+
+    // The same turn's genuine API failure arrived before the interrupt was
+    // verified: it keeps its failure diagnostics and is not an interruption.
+    assert.equal(result.failure, undefined);
+    assert.ok(activity.includes("model failed · Claude error (error_during_execution): API Error: 429 rate limit exceeded"));
+    assert.equal(activity.includes("model turn interrupted"), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude executor keeps same-turn failures failing after a rejected interrupt (#305)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-rejected-interrupt-failure-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    const fakeQuery = ((paramsArg: { prompt: AsyncIterable<SDKUserMessage> }) =>
+      createInterruptingFakeQuery(paramsArg.prompt, inputs, "reject-then-result")) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const activity: string[] = [];
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "initial",
+      artifactDir,
+      turn: 1,
+      onUpdate: (message) => activity.push(message),
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    const acknowledgement = await control.steer("steered", "rejected-interrupt-failure-1", { interrupt: true });
+    assert.equal(acknowledgement.status, "failed");
+    const result = await run;
+
+    // The rejected interruption was withdrawn; the original turn's genuine
+    // API failure keeps its failure label and settles the restored tracking.
+    assert.equal(result.code, 1);
+    assert.equal(result.failure?.category, "provider");
+    assert.ok(activity.includes("model failed · Claude error (error_during_execution): API Error: 429 rate limit exceeded"));
+    assert.equal(activity.includes("model turn interrupted"), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude executor keeps non-interruption subtypes failing after a verified Interrupt (#305)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-max-turns-interrupt-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    const fakeQuery = ((paramsArg: { prompt: AsyncIterable<SDKUserMessage> }) =>
+      createInterruptingFakeQuery(paramsArg.prompt, inputs, "ack-then-max-turns")) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const activity: string[] = [];
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "initial",
+      artifactDir,
+      turn: 1,
+      onUpdate: (message) => activity.push(message),
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.equal((await control.interrupt()).status, "acknowledged");
+    const result = await run;
+
+    // A verified interrupt whose turn ended for a different reason keeps the
+    // failure label with subtype detail.
+    assert.equal(result.failure?.category, "interruption");
+    assert.ok(activity.includes("model failed · Claude error (error_max_turns): max turns reached"));
+    assert.equal(activity.includes("model turn interrupted"), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude executor keeps same-subtype genuine failures failing after a verified Interrupt (#305)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-model-error-interrupt-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    const fakeQuery = ((paramsArg: { prompt: AsyncIterable<SDKUserMessage> }) =>
+      createInterruptingFakeQuery(paramsArg.prompt, inputs, "ack-then-model-error")) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const activity: string[] = [];
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "initial",
+      artifactDir,
+      turn: 1,
+      onUpdate: (message) => activity.push(message),
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.equal((await control.interrupt()).status, "acknowledged");
+    const result = await run;
+
+    // error_during_execution with a non-abort terminal reason is a genuine
+    // failure even though the interrupt was acknowledged.
+    assert.equal(result.failure?.category, "interruption");
+    assert.ok(activity.includes("model failed · Claude error (error_during_execution): synthetic model failure detail"));
+    assert.equal(activity.includes("model turn interrupted"), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude executor keeps unexplained execution errors failing after a verified Interrupt (#305)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-no-reason-interrupt-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    const fakeQuery = ((paramsArg: { prompt: AsyncIterable<SDKUserMessage> }) =>
+      createInterruptingFakeQuery(paramsArg.prompt, inputs, "ack-then-no-reason")) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const activity: string[] = [];
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "initial",
+      artifactDir,
+      turn: 1,
+      onUpdate: (message) => activity.push(message),
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    assert.equal((await control.interrupt()).status, "acknowledged");
+    const result = await run;
+
+    // Without positive abort evidence the failure diagnostics are preserved.
+    assert.equal(result.failure?.category, "interruption");
+    assert.ok(activity.includes("model failed · Claude error (error_during_execution): synthetic undiagnosed termination"));
+    assert.equal(activity.includes("model turn interrupted"), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude executor keeps genuine API failures failing after nearby non-interrupting steering (#305)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-nearby-steer-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    // The steered replacement turn fails with a genuine API error.
+    const output = new AsyncOutputQueue();
+    const fakeQuery = ((params: { prompt: AsyncIterable<SDKUserMessage> }) => {
+      void (async () => {
+        for await (const message of params.prompt) {
+          inputs.push(message);
+          if (inputs.length === 1) {
+            output.push({ type: "system", subtype: "init", session_id: "claude-session", uuid: "system-1" } as unknown as SDKMessage);
+            output.push({
+              type: "assistant",
+              session_id: "claude-session",
+              uuid: "assistant-1",
+              parent_tool_use_id: null,
+              message: { role: "assistant", content: [{ type: "text", text: "working" }] },
+            } as unknown as SDKMessage);
+          } else {
+            output.push({
+              type: "result",
+              subtype: "error_during_execution",
+              is_error: true,
+              api_error_status: 429,
+              errors: [],
+              result: "Rate limited",
+              user_message_uuid: message.uuid,
+              session_id: "claude-session",
+              uuid: "result-429",
+              duration_ms: 1,
+              duration_api_ms: 1,
+              num_turns: 1,
+              stop_reason: null,
+              total_cost_usd: 0,
+              usage: { input_tokens: 1, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+              modelUsage: {},
+              permission_denials: [],
+            } as unknown as SDKMessage);
+          }
+        }
+      })();
+      const iterator = output[Symbol.asyncIterator]();
+      return {
+        next: () => iterator.next(),
+        return: async () => ({ value: undefined, done: true }),
+        throw: async (error?: unknown) => { throw error; },
+        [Symbol.asyncIterator]() { return this; },
+        initializationResult: async () => ({ commands: [], agents: [], output_style: "", available_output_styles: [], models: [], account: {} as never }),
+        interrupt: async () => ({ still_queued: [] }),
+        close: () => output.close(),
+      } as unknown as Query;
+    }) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const activity: string[] = [];
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const run = adapter.run({
+      cwd: dir,
+      prompt: "initial",
+      artifactDir,
+      turn: 1,
+      onUpdate: (message) => activity.push(message),
+      onLiveControl: (control) => { if (control) resolveControl(control); },
+    });
+    const control = await controlReady;
+    // Ordinary steering interrupts nothing and must not suppress the real error.
+    assert.equal((await control.steer("steered", "nearby-steer-1")).status, "acknowledged");
+    const result = await run;
+
+    assert.equal(result.code, 1);
+    assert.equal(result.failure?.category, "provider");
+    assert.ok(activity.includes("model failed · Claude API 429: Rate limited"));
+    assert.equal(activity.includes("model turn interrupted"), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude executor keeps an uncorrelated error_during_execution a failure with subtype and errors detail (#305)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-claude-uncorrelated-error-"));
+  try {
+    const artifactDir = join(dir, "artifacts");
+    await mkdir(artifactDir);
+    const inputs: SDKUserMessage[] = [];
+    // No control event: the turn ends in an error_during_execution result on
+    // its own. The subtype alone must not read as an owned interruption.
+    const output = new AsyncOutputQueue();
+    const fakeQuery = ((params: { prompt: AsyncIterable<SDKUserMessage> }) => {
+      void (async () => {
+        for await (const message of params.prompt) {
+          inputs.push(message);
+          if (inputs.length === 1) {
+            output.push({ type: "system", subtype: "init", session_id: "claude-session", uuid: "system-1" } as unknown as SDKMessage);
+            output.push({
+              type: "assistant",
+              session_id: "claude-session",
+              uuid: "assistant-1",
+              parent_tool_use_id: null,
+              message: { role: "assistant", content: [{ type: "text", text: "working" }] },
+            } as unknown as SDKMessage);
+            output.push({
+              type: "result",
+              subtype: "error_during_execution",
+              is_error: true,
+              errors: ["[ede_diagnostic] result_type=user stop_reason=tool_use"],
+              user_message_uuid: message.uuid,
+              session_id: "claude-session",
+              uuid: "result-ede",
+              duration_ms: 1,
+              duration_api_ms: 1,
+              num_turns: 1,
+              stop_reason: null,
+              total_cost_usd: 0,
+              usage: { input_tokens: 1, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+              modelUsage: {},
+              permission_denials: [],
+            } as unknown as SDKMessage);
+          }
+        }
+      })();
+      const iterator = output[Symbol.asyncIterator]();
+      return {
+        next: () => iterator.next(),
+        return: async () => ({ value: undefined, done: true }),
+        throw: async (error?: unknown) => { throw error; },
+        [Symbol.asyncIterator]() { return this; },
+        initializationResult: async () => ({ commands: [], agents: [], output_style: "", available_output_styles: [], models: [], account: {} as never }),
+        interrupt: async () => ({ still_queued: [] }),
+        close: () => output.close(),
+      } as unknown as Query;
+    }) as unknown as typeof import("@anthropic-ai/claude-agent-sdk")["query"];
+    const adapter = new ClaudeExecutorAdapter({ id: "claude", adapter: "claude-cli", command: "claude", model: "sonnet" }, {
+      loadSdk: async () => ({ query: fakeQuery }),
+    });
+    const activity: string[] = [];
+    const result = await adapter.run({
+      cwd: dir,
+      prompt: "initial",
+      artifactDir,
+      turn: 1,
+      onUpdate: (message) => activity.push(message),
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(result.failure?.category, "provider");
+    assert.ok(activity.includes("model failed · Claude error (error_during_execution): [ede_diagnostic] result_type=user stop_reason=tool_use"));
+    assert.equal(activity.includes("model turn interrupted"), false);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -2,6 +2,16 @@ import { BoundedJsonlDecoder, BoundedTextAccumulator, MEBIBYTE, utf8Prefix } fro
 
 const MAX_STREAMED_TEXT_BYTES = 16 * MEBIBYTE;
 
+/** Bound on recorded owned-control interruptions awaiting their turn's result (#305). */
+const MAX_PENDING_INTERRUPTIONS = 8;
+
+interface PendingInterruption {
+  uuid: string;
+  verified: boolean;
+  /** True when the native interrupt returned a survivor receipt excluding this turn (#305). */
+  hasSurvivorReceipt?: boolean;
+}
+
 export class PiJsonlActivityExtractor {
   private readonly decoder = new BoundedJsonlDecoder((line) => this.processLine(line));
   private lastModelUpdate = "";
@@ -373,6 +383,8 @@ export class ClaudeStreamActivityExtractor {
   private readonly toolNames = new Map<string, string>();
   private readonly seenToolStarts = new Set<string>();
   private readonly seenToolResults = new Set<string>();
+  /** Recorded owned-control interruptions awaiting their interrupted turn's result (#305). */
+  private readonly pendingInterruptions: PendingInterruption[] = [];
 
   constructor(
     private readonly onActivity: (message: string) => void,
@@ -451,9 +463,69 @@ export class ClaudeStreamActivityExtractor {
     }
 
     if (event.type === "result") {
-      this.onActivity(event.is_error === true
-        ? `model failed · ${singleLine(claudeErrorSummary(event))}`
-        : "model turn completed");
+      const resultUuid = typeof event.user_message_uuid === "string" ? event.user_message_uuid : undefined;
+      // Correlate the result with a recorded owned control interruption:
+      // keyed results match by the interrupted turn's marker, and unkeyed
+      // results consume the oldest recorded interruption (SDKResultError has
+      // no user_message_uuid, and SDKResultSuccess makes it optional), matching
+      // the CLI's sequential per-turn result ordering. A completed turn must
+      // not leave interruption authority for a later turn. A result is labeled
+      // an interruption only when its record was verified natively AND the
+      // result carries positive abort evidence; anything else keeps the
+      // failure label (#305).
+      let entry: PendingInterruption | undefined;
+      if (resultUuid !== undefined) {
+        const index = this.pendingInterruptions.findIndex((candidate) => candidate.uuid === resultUuid);
+        if (index !== -1) entry = this.pendingInterruptions.splice(index, 1)[0];
+      } else if (this.pendingInterruptions.length > 0) {
+        entry = this.pendingInterruptions.shift();
+      }
+      if (event.is_error === true) {
+        this.onActivity(entry?.verified === true && isInterruptionResult(event, entry.hasSurvivorReceipt === true)
+          ? "model turn interrupted"
+          : `model failed · ${singleLine(claudeErrorSummary(event))}`);
+      } else {
+        // A successful result for an interrupted turn means the interrupt was
+        // a no-op; its record is consumed above so it cannot relabel a later
+        // genuine failure (#305).
+        this.onActivity("model turn completed");
+      }
+    }
+  }
+
+  /**
+   * Record that the extension issued an owned control interruption (turn-interrupt
+   * steering or explicit Interrupt) against the turn identified by
+   * `userMessageUuid`. The record stays unverified until
+   * {@link verifyInterruption}, so a result that arrives before the native
+   * interrupt is acknowledged keeps its failure label (#305).
+   */
+  notePendingInterruption(userMessageUuid: string): void {
+    if (this.pendingInterruptions.some((candidate) => candidate.uuid === userMessageUuid)) return;
+    if (this.pendingInterruptions.length >= MAX_PENDING_INTERRUPTIONS) this.pendingInterruptions.shift();
+    this.pendingInterruptions.push({ uuid: userMessageUuid, verified: false });
+  }
+
+  /**
+   * Mark a recorded control interruption as natively acknowledged (#305).
+   * `hasSurvivorReceipt` records that the native interrupt returned a
+   * survivor receipt excluding this turn; only such an acknowledgement
+   * authorizes classifying a diagnostic-only result (with no explicit abort
+   * terminal reason) as an interruption.
+   */
+  verifyInterruption(userMessageUuid: string, hasSurvivorReceipt = false): void {
+    for (const entry of this.pendingInterruptions) {
+      if (entry.uuid === userMessageUuid) {
+        entry.verified = true;
+        entry.hasSurvivorReceipt = hasSurvivorReceipt;
+      }
+    }
+  }
+
+  /** Withdraw a recorded control interruption that was rejected (#305). */
+  clearInterruption(userMessageUuid: string): void {
+    for (let index = this.pendingInterruptions.length - 1; index >= 0; index--) {
+      if (this.pendingInterruptions[index]!.uuid === userMessageUuid) this.pendingInterruptions.splice(index, 1);
     }
   }
 
@@ -466,13 +538,53 @@ export class ClaudeStreamActivityExtractor {
 }
 
 function claudeErrorSummary(value: Record<string, unknown>): string {
-  const status = typeof value.api_error_status === "number" ? `Claude API ${value.api_error_status}` : "Claude API error";
+  const status = typeof value.api_error_status === "number"
+    ? `Claude API ${value.api_error_status}`
+    : typeof value.subtype === "string" && value.subtype.trim()
+      ? `Claude error (${singleLine(value.subtype)})`
+      : "Claude error";
   const detail = typeof value.error === "string" && value.error.trim()
     ? value.error
-    : typeof value.result === "string" && value.result.trim()
-      ? value.result
-      : undefined;
+    : claudeErrorListDetail(value.errors)
+      ?? (typeof value.result === "string" && value.result.trim() ? value.result : undefined);
   return detail ? `${status}: ${detail}` : status;
+}
+
+function claudeErrorListDetail(errors: unknown): string | undefined {
+  if (!Array.isArray(errors)) return undefined;
+  const entries = errors.filter((entry): entry is string => typeof entry === "string" && entry.trim() !== "");
+  return entries.length > 0 ? singleLine(entries.join("; ")) : undefined;
+}
+
+/**
+ * Positive evidence that a result was caused by an owned control interruption:
+ * no API error status, the execution-error subtype, and either an explicit
+ * abort terminal reason (which stands on its own) or the CLI's internal
+ * mid-execution cutoff diagnostic with no terminal reason — the latter only
+ * when the owning control returned a survivor receipt excluding this turn,
+ * since the diagnostic marker alone is not abort-specific. The execution-error
+ * subtype alone also covers genuine failures (for example terminal_reason
+ * "model_error"), so an acknowledged interrupt never relabels a result without
+ * this evidence (#305).
+ */
+function isInterruptionResult(value: Record<string, unknown>, hasSurvivorReceipt: boolean): boolean {
+  if (typeof value.api_error_status === "number" || value.subtype !== "error_during_execution") return false;
+  if (value.terminal_reason === "aborted_streaming" || value.terminal_reason === "aborted_tools") return true;
+  return hasSurvivorReceipt && value.terminal_reason === undefined && isCutoffDiagnosticOnly(value.errors);
+}
+
+/**
+ * The CLI appends an internal `[ede_diagnostic]` entry to the errors of a turn
+ * that ended mid-execution without a caught error — in SDK mode this includes
+ * a control interruption whose result carries no terminal reason. An errors
+ * array consisting solely of those internal diagnostics, with no terminal
+ * reason and no other error content, is the CLI's own cutoff marker; genuine
+ * failures carry real error text (or an API status / non-abort terminal
+ * reason) and keep their failure label (#305).
+ */
+function isCutoffDiagnosticOnly(errors: unknown): boolean {
+  if (!Array.isArray(errors) || errors.length === 0) return false;
+  return errors.every((entry) => typeof entry === "string" && entry.startsWith("[ede_diagnostic]"));
 }
 
 function boundedText(value: string): string {

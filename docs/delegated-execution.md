@@ -654,6 +654,19 @@ steering during review uses the existing review-to-executor handoff. Adapters th
 unsupported status as a failed steering acknowledgement instead of acknowledging a
 queued delivery as an interruption.
 
+Claude activity reporting distinguishes positively correlated owned interruptions
+from failures. Interrupting steering and explicit Interrupt can report `model turn
+interrupted` after native acknowledgement and abort evidence. A diagnostic-only
+`error_during_execution` result without a terminal reason additionally requires
+an interrupt receipt excluding the target from `still_queued`; queued survivors
+are not treated as interrupted. Without a receipt, an explicit abort terminal
+reason is required. Results arriving before acknowledgement or lacking sufficient
+evidence keep a failure label rather than guessing the cause. Genuine failures
+include available subtype and structured error details; an API status is shown
+only when supplied. This changes progress reporting, not execution outcomes,
+retries, cancellation, or review gates. Raw adapter output remains buffered for
+settlement artifacts; live activity supplies bounded summaries, not full raw logs.
+
 Stopped tasks retain verified checkpoints and reattachment bundles for
 `SubtasksContinue`; stopped tasks without a usable checkpoint remain salvageable
 through explicit `SubtasksForceMerge` from their retained worktree or surviving refs.

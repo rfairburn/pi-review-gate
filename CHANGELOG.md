@@ -15,6 +15,19 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.119]
+
+### Fixed
+
+- Stop labeling every Claude execution error as an API error; progress now
+  includes available subtype and `errors[]` diagnostics. Interrupting steering
+  and explicit Interrupt report `model turn interrupted` when an acknowledged
+  owned interrupt correlates with abort evidence. Diagnostic-only cutoff results
+  require a native interrupt receipt excluding the target from `still_queued`;
+  CLIs without that receipt require an explicit abort terminal reason instead.
+  Unproven, racing, rejected, and genuine failure results retain failure labels.
+  Execution, retry, cancellation, and review semantics are unchanged (#305).
+
 ## [0.1.0-dev.118]
 
 ### Added

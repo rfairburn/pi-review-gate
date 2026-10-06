@@ -365,17 +365,43 @@ to limit the orchestrator, pass Pi's native allowlist through the wrapper, for e
   canonical shape alone without rewriting the stored record
   ([Configuration](configuration.md#pre-cutover-configuration-fields)).
 
-## Shared native tool-result expansion
+## Shared native presentation expansion
 
-Tool result expansion is presentation-only and Pi-native: Pi toggles each tool row's
-expanded state through its configured expansion binding (`app.tools.expand`, ctrl+o by
-default) and passes `{ expanded, isPartial }` to the registered `renderResult`. The
-extension registers no competing key handler, mirrors no expansion state, and expansion
-never reruns a tool, performs a network request, polls, or reads logs, artifacts, or
-history — it renders only data the tool already returned.
+Expansion is presentation-only and Pi-native: the host toggles each row's expanded state
+through its configured expansion binding (`app.tools.expand`, ctrl+o by default) and
+passes that state to the registered renderer — `{ expanded, isPartial }` for tool rows,
+`{ expanded, outputPad }` for the extension's own notification messages. The extension
+registers no competing key handler; tool rows retain that host-owned state without
+mirroring it, while notification rows keep only the local per-click state that is
+reconciled to the host's global expansion flag. Expansion never
+reruns a tool, performs a network request, polls, or reads logs, artifacts, or history —
+it renders only data that was already returned.
 
-Every extension-owned registration with a custom result renderer is covered by one
-shared mechanism in `src/tool-result-expansion.ts` — 40 of the 42 tools registered
+One shared core backs every expandable extension row, tool-result and automatic
+notification alike (issue #92):
+
+- `src/presentation-expansion.ts` owns the cross-cutting expansion logic for all
+  presentation rows: renderer selection (collapsed unless `options.expanded === true`; a
+  contributed detail renderer is used only when one exists), the visible failure notice
+  when a detail view fails to render, forwarding of host-owned `options` fields unchanged,
+  handler forwarding, and a wiring-audit marker. It is never tool-specific — it receives
+  an opaque result value, the host's options, the theme, and render context, and a
+  consumer whose host contract guarantees extra fields supplies its own fallback options
+  (tool rows keep `{ expanded: false, isPartial: false }`, message rows their own shape).
+- `src/presentation-hints.ts` owns the native configured hints and width safety for every
+  renderer with a contributed expanded view (see below).
+- Tool rows consume the core through the thin backwards-compatible adapter
+  `src/tool-result-expansion.ts`; `src/tool-result-hints.ts` re-exports the shared hint
+  functions unchanged, so existing tool registrations, tests, and imports keep their
+  names while the logic lives in one non-tool-specific module. Tool content, host-owned
+  state, global keyboard behavior, fullscreen per-card click behavior, provenance, and
+  native image presentation are unchanged by the extraction.
+- Automatic notification messages consume the same core through their own registered
+  message renderers, so tool-result and notification presentation stay in lockstep:
+  [Automatic notification compaction](#automatic-notification-compaction-92).
+
+Every extension-owned registration with a custom result renderer is covered by this
+mechanism, consumed via `src/tool-result-expansion.ts` — 40 of the 42 tools registered
 in the top-level runtime (24 web/browser, `ApplyPatch`, `GitRead`, 5 background-shell,
 `tool_search`, `AskUserQuestion`, and 9 subtask tools). `GitRead` and
 `AskUserQuestion` deliberately register no custom renderer; their results are
@@ -399,7 +425,8 @@ self-describing text rendered through Pi's default text display:
   labeled exact. Data genuinely omitted upstream (retention bounds, dropped log lines,
   uncaptured bodies, genuinely unavailable fields) stays truthfully disclosed; nothing
   is presented as complete when it cannot be shown.
-- Centralized native hints (`src/tool-result-hints.ts`): the shared wrapper appends
+- Centralized native hints (`src/presentation-hints.ts`, re-exported unchanged by the
+  `src/tool-result-hints.ts` adapter): the shared wrapper appends
   exactly one native-style `(ctrl+o to expand)` / `(ctrl+o to collapse)` hint to the
   header of every tool with a contributed expanded renderer; family renderers emit no
   expansion hints of their own. The key is never hard-coded: it is resolved at render
@@ -487,7 +514,8 @@ self-describing text rendered through Pi's default text display:
   unavailable, invalid-query, and already-active distinctions from the operation
   record.
 
-`isExpandableResult()` provides a wiring-audit marker used by
+`isExpandableResult()` (tool rows) and `isExpandablePresentation()` (the shared core,
+set on every callback it produces) provide wiring-audit markers used by
 `tests/tool-result-expansion.test.ts` and
 `tests/browser-render-registration.test.ts` to prove that every expandable
 registration routes through the shared helper, that expand and re-collapse render
@@ -499,6 +527,54 @@ handling, errors, partial and empty results, long output bounds, and the redacti
 boundaries — rather than only the module callbacks. The shared inventory also exercises
 registered web, discovery, shell, subtask, and patch tools through expansion and
 re-collapse with their real renderers.
+
+### Automatic notification compaction (#92)
+
+The same shared core delivers a compact, expandable presentation for the extension's
+own automatic notification messages, registered through Pi's public custom
+message-renderer API. Exactly five notification families render compactly:
+
+- `pi-review-subtask-event` — the task title, the actual outcome (reported, landed,
+  failed, conflicted, or recovery-required), available aggregate progress, and a
+  separate full, usable report-reference line whenever a report exists; immediate
+  actionable failure, conflict, and recovery details also stay visible collapsed. An
+  in-place execution's settlement is shown through its own event state and is never
+  presented as a Git landing.
+- `pi-review-bg-shell` — job identity or label, the wake reason, the exit status where
+  reported, and immediate actionable failure or match information.
+- `pi-review-subtask-watch` — execution-level active-work summaries, explicitly framed
+  as a checkpoint rather than a completion or failure claim.
+- `pi-review-scheduled-task-event` — the schedule identity and due occurrence, the
+  truthful skipped / not-run / failed / uncertain outcome and the immediate action,
+  including retry or duplicate warnings where present.
+- `pi-review-scheduled-orchestrator-turn` — the scheduled entry and due occurrence only:
+  the collapsed view never claims execution started or completed; the turn's full
+  instructions and metadata are one expansion away.
+
+The existing short subtask launch admission and background-ready notices are unchanged,
+and hidden messages and native host-owned messages are not touched.
+
+Boundaries shared by all five families:
+
+- Expanding a notification displays all of its current notification text and nothing
+  beyond it: no fetch of the linked report, log, or artifacts, no polling, execution,
+  or other I/O, and no change to the model-visible payload, upstream privacy or
+  retention behavior, delivery lanes, lifecycle tracking, wake policy, or scheduler
+  behavior. This is compaction of the delivered text, not replacement of it.
+- Unknown historical or malformed notification formats fall back to the full retained
+  text rather than a potentially misleading summary, and when the host's renderer APIs
+  are absent the native full presentation applies instead of a degraded guess.
+- Keyboard expansion is the same native-configured `app.tools.expand` binding the
+  tool rows use, toggling all expandable rows together. In fullscreen mode, clicking
+  one notification operates that item
+  only, through the public pi-tui `MouseRegion` surface, with each message's local
+  expansion state reconciled to the host's global expansion flag. Regular mode remains
+  keyboard-only. The extension performs no host patching and registers no competing
+  keyboard binding.
+
+Consumer-facing notes for the affected families live in the product
+guides: [Delegated execution → Notifications and UI](delegated-execution.md#notifications-and-ui)
+and [Scheduled tasks](scheduled-tasks.md#schedule-destinations).
 
 ## Model-stream failure reporting (#84)
 

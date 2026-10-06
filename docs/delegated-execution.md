@@ -802,6 +802,24 @@ failure, meaningful state changes, and workspace conflicts are delivered proacti
 polling loops are neither required nor recommended, but purposeful `SubtasksInspect`
 calls are always supported.
 
+**Compact expandable presentation:** the extension's automatic notification messages
+render through one shared, presentation-only expansion core (the same mechanism
+behind tool-result expansion, [Development → Shared native presentation
+expansion](development.md#shared-native-presentation-expansion)): the subtask
+event notification leads with the task title, the actual outcome (reported, landed,
+failed, conflicted, or recovery-required), aggregate progress when available, and a
+separate full, usable report-reference line, plus immediate actionable failure,
+conflict, and recovery detail; the background-shell wake leads with the job identity,
+wake reason, and exit status where reported; the watch notification leads with
+execution-level active work, explicitly a checkpoint rather than a completion or
+failure. The native expansion key (ctrl+o by default) toggles all expandable rows;
+clicking a notification in fullscreen mode expands/contracts only that item.
+Expansion reveals all of the notification's current text and nothing beyond it —
+no linked report or log is fetched and nothing is re-run — and collapsing restores
+the compact view. Expansion never changes what the model received,
+delivery, wake, or scheduling behavior, and an unrecognized historical notification
+falls back to its full retained text.
+
 **Scheduled runs:** when the process-local scheduler switch is On, a due schedule
 entry starts through this same background subtask path — no model or orchestrator
 launch turn begins the run. Scheduled executions appear in the widget and receive

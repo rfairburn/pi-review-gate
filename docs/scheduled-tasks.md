@@ -179,6 +179,18 @@ never keep the schedule occurrence open, and later due occurrences of the
 entry are evaluated independently (there is no per-entry overlap gate in this
 destination).
 
+**Notification presentation:** the scheduled task events (`pi-review-scheduled-task-event`)
+and scheduled orchestrator-turn deliveries (`pi-review-scheduled-orchestrator-turn`)
+render as compact, expandable notifications in the host's native expansion mechanism:
+each collapsed view names the schedule entry and the due occurrence and states the
+truthful outcome and immediate action — a skipped occurrence, a not-run drop, a
+failure or an uncertain dispatch, or a duplicate/retry warning — while an
+orchestrator-turn delivery never claims the turn executed or completed: its full
+instructions and metadata are visible by expanding the item. Expansion reveals all of
+the delivered event text and nothing beyond it; it fetches nothing and changes no
+delivery or scheduling behavior. See [Development → Shared native presentation
+expansion](development.md#shared-native-presentation-expansion).
+
 Installed Pi starts an idle custom-message turn without emitting
 `before_agent_start`; for both idle and queued custom messages, the extension
 therefore arms the fail-closed review baseline and reasserts the deferred-tool

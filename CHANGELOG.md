@@ -15,6 +15,50 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.125]
+
+### Changed
+
+- One shared presentation expansion core (#92). `src/presentation-expansion.ts` and
+  `src/presentation-hints.ts` now own the cross-cutting expansion presentation —
+  renderer selection, native configured hints, width safety, the visible
+  detail-failure fallback, and component forwarding — for every expandable
+  extension row. `src/tool-result-expansion.ts` and `src/tool-result-hints.ts`
+  become thin backwards-compatible adapters over that core, so tool behavior is
+  unchanged: the same registrations, host-owned `{ expanded, isPartial }` state,
+  the global keyboard expansion binding (`app.tools.expand`, ctrl+o by default),
+  fullscreen per-card clicking, provenance, and native image presentation.
+- Automatic notification compaction (#92). Five automatic notification families
+  now render through the same shared core as compact, expandable messages:
+  `pi-review-subtask-event` (task title, the actual landed/reported/failed/
+  conflicted/recovery outcome, available aggregate progress, and a separate full,
+  usable report-reference line; actionable failure, conflict, and recovery
+  details stay visible without expansion, and in-place settlement is shown
+  through the event's own state rather than as a Git landing),
+  `pi-review-bg-shell` (job identity, wake reason, exit status where reported,
+  and actionable failure or match information), `pi-review-subtask-watch`
+  (execution-level active-work summaries, explicitly a checkpoint rather than a
+  completion or failure), `pi-review-scheduled-task-event` (schedule identity and
+  due occurrence, the truthful skipped/not-run/failed/uncertain outcome and
+  immediate action, including retry and duplicate warnings), and
+  `pi-review-scheduled-orchestrator-turn` (schedule entry and due occurrence
+  only, with no execution or completion claim; the full instructions are one
+  expansion away). Expanding a notification shows all of its current
+  notification text and nothing beyond it — no report, log, or artifact fetch,
+  no polling, execution, or other I/O — and never changes the model-visible
+  payload, upstream privacy or retention, delivery lanes, lifecycle tracking,
+  wake policy, or scheduler behavior. The existing short subtask launch and
+  background-ready notices, hidden messages, and native host-owned messages are
+  unchanged. Unknown historical or malformed notification formats fall back to
+  the full retained text, and when the host's renderer APIs are absent the
+  native full presentation applies. Keyboard expansion follows the same native
+  configured binding as tool rows; fullscreen clicking operates a single item
+  through the public pi-tui `MouseRegion` with per-message state reconciled to
+  the host's global expansion flag; regular mode remains keyboard-only, with no
+  host patching and no competing keyboard binding. See
+  [Development → Shared native presentation
+  expansion](docs/development.md#shared-native-presentation-expansion).
+
 ## [0.1.0-dev.124]
 
 ### Added

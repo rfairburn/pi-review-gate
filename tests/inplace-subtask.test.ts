@@ -1719,3 +1719,70 @@ test("a review-error pause followed by continuation keeps distinct durable cycle
     await rm(scratch, { recursive: true, force: true });
   }
 });
+
+test("an aborted in-place turn whose started child never reports a verified exit fails closed with ownership retained (#310)", async () => {
+  const scratch = await createInPlaceScratch("unverified-shutdown");
+  const workspace = join(scratch, "selected-root");
+  const artifactDir = join(scratch, "artifacts", "unverified-shutdown");
+  await mkdir(workspace, { recursive: true });
+  const config = inplaceExternalConfig({ script: "unused" });
+  const entry = resolvedExecutorPool(config)[0];
+  assert.ok(entry);
+  const abort = new AbortController();
+  let started!: () => void;
+  const adapterStarted = new Promise<void>((resolvePromise) => { started = resolvePromise; });
+  const adapter: ExecutorAdapter = {
+    kind: "claude-cli",
+    async run(request) {
+      // The adapter could not verify its owned shutdown after an explicit
+      // interrupt, so it never reports the child's exit.
+      await request.onProcessStart?.({ pid: 900310 });
+      started();
+      await new Promise<void>((resolvePromise) => {
+        if (request.signal?.aborted) resolvePromise();
+        else request.signal?.addEventListener("abort", () => resolvePromise(), { once: true });
+      });
+      return {
+        text: "",
+        session: { adapter: "claude-cli", id: "unverified-session" },
+        stdoutPath: "",
+        stderrPath: "",
+        code: 1,
+        timedOut: false,
+        aborted: true,
+        failure: { category: "interruption" as const, message: "Claude query was interrupted. Claude CLI shutdown after explicit interruption was not verified: injected" },
+      };
+    },
+  };
+  try {
+    const lifecycle = runInplaceLifecycle({
+      taskId: "inplace-unverified-shutdown",
+      task: { title: "Interrupted in place", instructions: "work", acceptanceCriteria: ["none"] },
+      workspaceRoot: workspace,
+      artifactDir,
+      config,
+      executorAssignment: { entry, priority: 0 },
+      signal: abort.signal,
+      adapterFactory: () => adapter,
+    });
+    await adapterStarted;
+    abort.abort(new Error("interrupt_as_failure"));
+    const result = await lifecycle;
+    assert.notEqual(result.status, "reviewed");
+    const operation = JSON.parse(await readFile(join(artifactDir, "operation.json"), "utf8")) as {
+      state: string;
+      incidents: Array<{ stage: string; terminalCode?: string; message: string }>;
+      owner?: { status: string; childPid?: number; childExitedAt?: string };
+    };
+    assert.equal(operation.state, "failed_critical");
+    const incident = operation.incidents.at(-1)!;
+    assert.equal(incident.stage, "executor_shutdown");
+    assert.equal(incident.terminalCode, "recovery_state_corrupt_or_unverifiable");
+    assert.match(incident.message, /shutdown after explicit interruption was not verified: injected/);
+    assert.equal(operation.owner?.status, "active");
+    assert.equal(operation.owner?.childPid, 900310);
+    assert.equal(operation.owner?.childExitedAt, undefined);
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});

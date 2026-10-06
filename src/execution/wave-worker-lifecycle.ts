@@ -571,7 +571,15 @@ async function persistReviewCycleRecord(artifactDir: string, record: ReviewCycle
 async function writeResult(artifactDir: string, result: WaveWorkerLifecycleResult): Promise<void> {
   try {
     const operation = await readOperationRecord(join(artifactDir, "operation.json"));
-    operation.state = lifecycleOperationState(result.status);
+    // #310: an unverified executor shutdown (an unresolved executor_shutdown
+    // incident recorded by recordUnverifiedChildShutdown) may leave a live
+    // writer, so that failed_critical state is never downgraded. Other
+    // critical incidents, such as checkpoint staging failures, keep their
+    // established paused_recoverable finalization so explicit in-place
+    // continuation and salvage remain available.
+    const unverifiedShutdown = operation.state === "failed_critical"
+      && operation.incidents.some((incident) => incident.stage === "executor_shutdown" && !incident.resolvedAt);
+    if (!unverifiedShutdown) operation.state = lifecycleOperationState(result.status);
     await writeOperationRecord(operation);
     result.operationRecord = join(artifactDir, "operation.json");
     result.bundle = createReattachmentBundle(operation, resolve(artifactDir, "..", ".."));

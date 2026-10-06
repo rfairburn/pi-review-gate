@@ -32,7 +32,7 @@ import {
 import { ExecutorPoolScheduler, type ExecutorPoolLease } from "./executor-pool";
 import { inspectOperation, readVerifiedAcceptedResult, verifyInPlaceContinuation, verifyRecoveryCheckpoint } from "./operation-actions";
 import type { OperationRecord, ReattachmentBundle } from "./operation-record";
-import { createReattachmentBundle, operationOwnershipStatus, readOperationRecord } from "./operation-record";
+import { createReattachmentBundle, operationOwnershipStatus, operationRecordPath, readOperationRecord } from "./operation-record";
 import { resolveArtifactRoot } from "./evidence/sources";
 import { buildSubtaskEvidence, readConfinedOperationRecord, readSubtaskEvidence, type SubtaskEvidenceRead, type SubtaskEvidenceSelector, type SubtaskEvidenceUnavailable } from "./subtask-evidence";
 import { sourceMutationCoordinator } from "./source-mutation-lease";
@@ -2044,6 +2044,22 @@ export class BackgroundExecutionController {
       }
     }
     await runtime.promise;
+    // #310: runtime settlement is not proof of quiescence. When the executor
+    // could not verify its owned process shutdown, the operation keeps its
+    // owner lease; never acknowledge quiescence or merge over a possibly
+    // live writer.
+    const unverifiedWriter = await this.unverifiedWriterAfterInterrupt(group, task);
+    if (unverifiedWriter) {
+      command.status = "failed";
+      command.acknowledgedAt = undefined;
+      command.error = `Writer quiescence was not verified: ${unverifiedWriter}`;
+      task.error = command.error;
+      task.summary = command.error;
+      this.addActivity(task, "interrupt", `${command.error} ${transportMessage}`);
+      task.interruptionMode = undefined;
+      await this.save(group);
+      return this.inspect(group.executionId, task.taskId);
+    }
     command.status = "acknowledged";
     command.acknowledgedAt = new Date().toISOString();
     command.error = undefined;
@@ -2062,6 +2078,28 @@ export class BackgroundExecutionController {
       });
     }
     return this.inspect(group.executionId, task.taskId);
+  }
+
+  /**
+   * #310: after an interrupted runtime settles, report a writer whose owned
+   * shutdown is unverified. The durable operation owner lease is the
+   * authority: executor loops retain it when a started child never reported
+   * a verified exit. A missing record means no executor operation started.
+   */
+  private async unverifiedWriterAfterInterrupt(group: BackgroundExecutionGroup, task: BackgroundTaskRecord): Promise<string | undefined> {
+    const artifactDir = this.durableArtifactDirOf(group, task);
+    if (!artifactDir) return undefined;
+    let record: OperationRecord;
+    try {
+      record = await readOperationRecord(operationRecordPath(artifactDir));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      return `the operation record could not be read: ${messageOf(error)}`;
+    }
+    const ownership = operationOwnershipStatus(record);
+    if (!ownership.processAlive) return undefined;
+    const shutdown = [...record.incidents].reverse().find((incident) => incident.stage === "executor_shutdown" && !incident.resolvedAt);
+    return shutdown?.message ?? ownership.message;
   }
 
   async forceMerge(input: BackgroundForceMergeInput): Promise<BackgroundInspection> {
@@ -3031,6 +3069,18 @@ export class BackgroundExecutionController {
   private async acknowledgeInterrupt(task: BackgroundTaskRecord): Promise<void> {
     const command = [...task.commands].reverse().find((candidate) => candidate.action === "interrupt" && candidate.status === "delivered");
     if (!command) return;
+    // #310: lifecycle settlement persists right after this; never record an
+    // acknowledgement while the owned writer's shutdown is unverified.
+    const group = [...this.groups.values()].find((candidate) => candidate.tasks.includes(task));
+    const unverifiedWriter = group ? await this.unverifiedWriterAfterInterrupt(group, task) : undefined;
+    if (unverifiedWriter) {
+      command.status = "failed";
+      command.acknowledgedAt = undefined;
+      command.error = `Writer quiescence was not verified: ${unverifiedWriter}`;
+      task.error = command.error;
+      task.summary = command.error;
+      return;
+    }
     command.status = "acknowledged";
     command.acknowledgedAt = new Date().toISOString();
   }

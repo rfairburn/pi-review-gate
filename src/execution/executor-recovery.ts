@@ -8,6 +8,7 @@ import {
   createIncident,
   recordOperationChildExit,
   recordOperationChildProcess,
+  recordUnverifiedChildShutdown,
   releaseOperationOwner,
   touchOperationOwner,
   writeOperationRecord,
@@ -78,6 +79,8 @@ export async function runExecutorWithRecovery(input: {
 
   acquireOperationOwner(input.operation);
   await writeOperationRecord(input.operation);
+  // #310: an unverified child shutdown keeps the owner lease active.
+  let retainOwner = false;
   const ownerHeartbeat = setInterval(() => {
     touchOperationOwner(input.operation);
     void writeOperationRecord(input.operation).catch(() => undefined);
@@ -156,6 +159,19 @@ export async function runExecutorWithRecovery(input: {
     }
 
     if (input.request.signal?.aborted) {
+      if (childLifecycles.size > 0) {
+        // #310: a started child never reported a verified exit, so the writer
+        // may still be live. Fail closed instead of checkpointing and
+        // releasing ownership as an ordinary cancellation.
+        retainOwner = true;
+        attemptRecord.endedAt ??= new Date().toISOString();
+        attemptRecord.outcome = "failed";
+        const detail = turn?.failure?.message ?? (thrown === undefined ? undefined : thrown instanceof Error ? thrown.message : String(thrown));
+        const incident = recordUnverifiedChildShutdown(input.operation, attemptRecord.attempt, detail);
+        incidents.push(incident);
+        await writeOperationRecord(input.operation);
+        return { status: "critical", turn, error: incident.message, lastTurnNumber: turnNumber, checkpoint, incidents };
+      }
       // #165: post-turn aborts settle through the shared cancellation path.
       return await settleCancellation(input, attemptRecord, turnNumber, priorCheckpointCandidate, checkpoint, incidents, "Executor was cancelled.");
     }
@@ -288,7 +304,7 @@ export async function runExecutorWithRecovery(input: {
     }
   } finally {
     clearInterval(ownerHeartbeat);
-    releaseOperationOwner(input.operation);
+    if (!retainOwner) releaseOperationOwner(input.operation);
     await writeOperationRecord(input.operation);
   }
 }

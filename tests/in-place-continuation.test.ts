@@ -3,7 +3,8 @@
  *  controller paths with a synthetic run-as-binary executor whose first turn
  *  leaves an absolute symlink that candidate staging rejects. */
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { once } from "node:events";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname } from "node:path";
@@ -14,7 +15,7 @@ import test from "node:test";
 import { normalizeConfig, type ReviewGateConfig } from "../src/config";
 import { BackgroundExecutionController } from "../src/execution/background-controller";
 import { continueOperation, inspectOperation, verifyInPlaceContinuation } from "../src/execution/operation-actions";
-import { readOperationRecord, type OperationRecord } from "../src/execution/operation-record";
+import { operationOwnershipStatus, readOperationRecord, recordUnverifiedChildShutdown, type OperationRecord } from "../src/execution/operation-record";
 import { transitionTaskState } from "../src/execution/task-state";
 import { executeWave } from "../src/execution/wave-controller";
 import { readWaveCaptureRecord } from "../src/execution/wave-repository";
@@ -320,6 +321,70 @@ test("in-place continuation fails closed for missing, foreign, attached, live, u
       record.state = "failed_critical";
       record.incidents.push({ ...record.incidents.at(-1)!, incidentId: "other", stage: "other", terminalCode: "other" as never });
     }, /latest terminal incident: other\/other/);
+    // #310: the canonical unverified-shutdown incident shares the bypassable
+    // terminal code but is not a checkpoint staging/verification failure. With
+    // its recorded writer proven dead (or released) the preflight reaches the
+    // eligibility gate and still refuses — whether or not a genuine
+    // checkpoint incident precedes it — and never reports it as the
+    // checkpoint incident.
+    const exited = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+    const exitedPid = exited.pid!;
+    await once(exited, "close");
+    const deadOwner = (): NonNullable<OperationRecord["owner"]> => ({
+      version: 1, instanceId: "exited", hostPid: exitedPid, acquiredAt: new Date().toISOString(), heartbeatAt: new Date().toISOString(),
+      status: "active", childPid: exitedPid, childLifecycleId: "exited-child", childStartedAt: new Date().toISOString(),
+    });
+    const shutdownCases: Array<[string, (record: OperationRecord) => void]> = [
+      ["dead retained owner after a genuine checkpoint incident", (record) => { record.owner = deadOwner(); }],
+      ["released owner after a genuine checkpoint incident", (record) => {
+        record.owner = { ...deadOwner(), status: "released", releasedAt: new Date().toISOString() };
+      }],
+      ["dead retained owner without a checkpoint incident", (record) => {
+        record.owner = deadOwner();
+        record.incidents = [];
+      }],
+    ];
+    for (const [label, prepare] of shutdownCases) {
+      await refuse(`unresolved executor_shutdown: ${label}`, (record) => {
+        prepare(record);
+        const hadCheckpointIncident = record.incidents.some((incident) => incident.stage === "checkpointing" && !incident.resolvedAt);
+        const incident = recordUnverifiedChildShutdown(record, record.attempts.at(-1)?.attempt ?? 1, "test shutdown");
+        assert.equal(incident.stage, "executor_shutdown");
+        assert.equal(incident.terminalCode, "recovery_state_corrupt_or_unverifiable");
+        assert.equal(record.state, "failed_critical");
+        assert.equal(record.incidents.at(-1), incident);
+        assert.equal(hadCheckpointIncident, !label.includes("without"));
+        assert.equal(operationOwnershipStatus(record).processAlive, false, "ownership is proven dead or released, so the gate is reached");
+      }, /unresolved executor_shutdown incident/);
+    }
+    // A genuine checkpoint incident recorded after an unresolved shutdown does
+    // not explain it away either, in failed_critical or a downgraded state.
+    for (const state of ["failed_critical", "paused_recoverable"] as const) {
+      await refuse(`unresolved executor_shutdown followed by a checkpoint incident (${state})`, (record) => {
+        record.owner = deadOwner();
+        const checkpoint = record.incidents.at(-1)!;
+        recordUnverifiedChildShutdown(record, 1, "test shutdown");
+        record.incidents.push({ ...checkpoint, incidentId: "later-checkpoint" });
+        record.state = state;
+      }, /unresolved executor_shutdown incident/);
+    }
+    // A resolved shutdown does not hide the checkpoint incident, which stays
+    // bypassable as before.
+    const resolvedShutdown = JSON.parse(originalRecord) as OperationRecord;
+    resolvedShutdown.owner = deadOwner();
+    recordUnverifiedChildShutdown(resolvedShutdown, 1, "test shutdown").resolvedAt = new Date().toISOString();
+    resolvedShutdown.state = "failed_critical";
+    resolvedShutdown.incidents.push({ ...resolvedShutdown.incidents.at(-2)!, incidentId: "later-checkpoint" });
+    assert.equal(
+      (await verifyInPlaceContinuation({ waveRoot: wave.waveRoot, record: resolvedShutdown, capture, manifest })).checkpointIncident?.incidentId,
+      "later-checkpoint",
+    );
+    // A live retained shutdown owner keeps the earlier live/uncertain refusal.
+    await refuse("unresolved executor_shutdown with a live owner", (record) => {
+      recordUnverifiedChildShutdown(record, 1, "test shutdown");
+      record.owner = { version: 1, instanceId: "live", hostPid: process.pid, acquiredAt: new Date().toISOString(), heartbeatAt: new Date().toISOString(), status: "active" };
+    }, /live or uncertain writer/);
+
     const bypass = JSON.parse(originalRecord) as OperationRecord;
     bypass.state = "failed_critical";
     assert.equal(

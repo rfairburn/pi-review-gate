@@ -86,7 +86,7 @@ export function createSessionPersistence(deps: SessionPersistenceDependencies): 
       for (const [id, owner] of savedOwners) durableOwners.set(id, owner);
       for (const [id, owner] of durableOwners) {
         if (latestSavedOwners.has(id) || ownersOf().has(id)) continue;
-        const released = await releaseReviewCheckpoint(owner.cwd, owner.descriptor);
+        const released = await releaseReviewCheckpoint(owner.cwd, owner.descriptor, { scope: deps.state.checkpointScope });
         if (released.status !== "ok") {
           await sendNoticeUnlessItThrows(deps.pi, `review gate: retained checkpoint owner; release failed (${released.reason}). Inspect the checkpoint store and retry after repairing storage; no review success is implied`);
           throw new Error(`review gate: retained checkpoint owner; release failed (${released.reason}): ${released.detail}`);

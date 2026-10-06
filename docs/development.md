@@ -286,7 +286,11 @@ ACLs. CI covers the native paths on `windows-latest`
 POSIX launcher is unchanged.
 The `review-checkpoint-windows` tests exercise raw parent checkpoint directory-sync
 and file-identity error boundaries with mocks on every host, plus native Windows
-capture/reload/frozen-comparison/advancement. Both Windows CI Node versions run
+capture/reload/frozen-comparison/advancement. Raw checkpoint tests point
+`PI_CODING_AGENT_DIR` (or an explicit test scope) at a disposable directory, because
+non-Git records live in the session namespace under the Pi agent-data directory; the
+`review-checkpoint-session-storage` and `entrypoint-session-checkpoint-storage` tests
+cover that layout, isolation, and lifecycle. Both Windows CI Node versions run
 that file; the full suite also runs its non-skipped mocked cases.
 The launcher and the extension's Pi child launches (reviewer prompts, the
 delegated Pi RPC executor, and compaction recovery) share one authoritative

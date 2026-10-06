@@ -27,6 +27,7 @@ import {
   trigger,
   triggerAgentEnd,
   waitForFile,
+  testActivation,
 } from "./entrypoint-harness";
 test("review state restores only when the same persisted conversation resumes", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-conversation-restore-"));
@@ -68,7 +69,7 @@ test("review state restores only when the same persisted conversation resumes", 
     };
 
     const first = runtime("conversation-a", sessionFile);
-    await activate(first.pi);
+    await activate(first.pi, testActivation());
     await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
     await trigger(first.hooks, "input", { cwd: dir, text: "preserve this request", source: "user" }, first.ctx);
     await trigger(first.hooks, "before_agent_start", { cwd: dir }, first.ctx);
@@ -109,7 +110,7 @@ test("review state restores only when the same persisted conversation resumes", 
     const bootstrapFile = join(dir, "startup-session.jsonl");
     await writeFile(bootstrapFile, "", "utf8");
     const bootstrap = runtime("startup-session", bootstrapFile);
-    await activate(bootstrap.pi);
+    await activate(bootstrap.pi, testActivation());
     await trigger(bootstrap.hooks, "session_start", { type: "session_start", reason: "startup" }, bootstrap.ctx);
     await trigger(bootstrap.hooks, "input", { cwd: dir, text: "must not leak into resumed conversation", source: "user" }, bootstrap.ctx);
     await trigger(bootstrap.hooks, "session_shutdown", {
@@ -119,7 +120,7 @@ test("review state restores only when the same persisted conversation resumes", 
     }, bootstrap.ctx);
 
     const resumed = runtime("conversation-a", sessionFile);
-    await activate(resumed.pi);
+    await activate(resumed.pi, testActivation());
     await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
     assert.match(resumed.notices.join("\n"), /restored conversation state revision/);
     assert.deepEqual(resumed.sent, [{
@@ -133,7 +134,7 @@ test("review state restores only when the same persisted conversation resumes", 
     const newSessionFile = join(dir, "conversation-b.jsonl");
     await writeFile(newSessionFile, "", "utf8");
     const fresh = runtime("conversation-b", newSessionFile);
-    await activate(fresh.pi);
+    await activate(fresh.pi, testActivation());
     await trigger(fresh.hooks, "session_start", { type: "session_start", reason: "new" }, fresh.ctx);
     assert.doesNotMatch(fresh.notices.join("\n"), /restored conversation state revision/);
   } finally {
@@ -179,7 +180,7 @@ review: { activeReviewers: [
     });
 
     const resumed = createSessionRuntime("conversation-a", sessionFile, dir);
-    await activate(resumed.pi);
+    await activate(resumed.pi, testActivation());
     await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
 
     const restoredStore = new SessionStateStore({ sessionId: "conversation-a", sessionFile, cwd: dir });
@@ -218,7 +219,7 @@ review: { activeReviewers: [
     // A repeated reload under the same settings is idempotent: no second
     // reconciliation notice and no further state change.
     const again = createSessionRuntime("conversation-a", sessionFile, dir);
-    await activate(again.pi);
+    await activate(again.pi, testActivation());
     await trigger(again.hooks, "session_start", { type: "session_start", reason: "resume" }, again.ctx);
     assert.doesNotMatch(again.notices.join("\n"), /reconciled/);
     assert.match(again.notices.join("\n"), /restored conversation state revision/);
@@ -253,7 +254,7 @@ review: { activeReviewers: [
     const session = createSessionRuntime("conversation-a", sessionFile, dir, {
       reviewSettings: (handler) => { reviewSettings = handler; },
     });
-    await activate(session.pi);
+    await activate(session.pi, testActivation());
     assert.ok(reviewSettings, "the /review-settings command must be registered");
 
     await trigger(session.hooks, "session_start", { type: "session_start", reason: "startup" }, session.ctx);
@@ -362,7 +363,7 @@ review: { activeReviewers: [
     const session = createSessionRuntime("conversation-a", sessionFile, dir, {
       reviewSettings: (handler) => { reviewSettings = handler; },
     });
-    await activate(session.pi);
+    await activate(session.pi, testActivation());
 
     await trigger(session.hooks, "session_start", { type: "session_start", reason: "startup" }, session.ctx);
     await trigger(session.hooks, "input", { cwd: dir, text: "implement the change", source: "user" }, session.ctx);
@@ -482,7 +483,7 @@ review: { activeReviewers: [
       reviewSettings: (handler) => { reviewSettings = handler; },
     });
     sessionRef = session;
-    await activate(session.pi);
+    await activate(session.pi, testActivation());
 
     await trigger(session.hooks, "session_start", { type: "session_start", reason: "startup" }, session.ctx);
     await trigger(session.hooks, "input", { cwd: dir, text: "implement the change", source: "user" }, session.ctx);
@@ -630,7 +631,7 @@ review: { activeReviewers: [
     await writeFile(sessionFile, "", "utf8");
 
     const first = createSessionRuntime("conversation-a", sessionFile, dir);
-    await activate(first.pi);
+    await activate(first.pi, testActivation());
     await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
     await trigger(first.hooks, "input", { cwd: dir, text: "implement the change", source: "user" }, first.ctx);
     await trigger(first.hooks, "before_agent_start", { cwd: dir }, first.ctx);
@@ -666,7 +667,7 @@ review: { activeReviewers: [
     }), "utf8");
 
     const resumed = createSessionRuntime("conversation-a", sessionFile, dir);
-    await activate(resumed.pi);
+    await activate(resumed.pi, testActivation());
     await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
 
     // Restore must not backfill the missing historical identity from B.
@@ -742,7 +743,7 @@ review: { activeReviewers: [
     }), "utf8");
 
     const resumed = createSessionRuntime("conversation-a", sessionFile, dir);
-    await activate(resumed.pi);
+    await activate(resumed.pi, testActivation());
     await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
 
     const noticeText = resumed.notices.join("\n");
@@ -796,7 +797,7 @@ review: { activeReviewers: [
     }), "utf8");
 
     const resumed = createSessionRuntime("conversation-a", sessionFile, dir);
-    await activate(resumed.pi);
+    await activate(resumed.pi, testActivation());
     await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
     await trigger(resumed.hooks, "input", { cwd: dir, text: "continue the change", source: "user" }, resumed.ctx);
     await trigger(resumed.hooks, "before_agent_start", { cwd: dir }, resumed.ctx);
@@ -867,7 +868,7 @@ review: { activeReviewers: [
     }), "utf8");
 
     const resumed = createSessionRuntime("conversation-a", sessionFile, dir);
-    await activate(resumed.pi);
+    await activate(resumed.pi, testActivation());
     await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
     await trigger(resumed.hooks, "input", { cwd: dir, text: "continue the change", source: "user" }, resumed.ctx);
     await trigger(resumed.hooks, "before_agent_start", { cwd: dir }, resumed.ctx);
@@ -935,7 +936,7 @@ review: { activeReviewers: [
     }), "utf8");
 
     const resumed = createSessionRuntime("conversation-a", sessionFile, dir);
-    await activate(resumed.pi);
+    await activate(resumed.pi, testActivation());
     await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
     assert.match(resumed.notices.join("\n"), /reconciled 1 review window/);
 
@@ -982,7 +983,7 @@ test("same-conversation/different-cwd session start quarantines the prior sideca
 
     // First session in dirA persists state with a pending delivery.
     const first = createSessionRuntime("conversation-a", sessionFile, dirA);
-    await activate(first.pi);
+    await activate(first.pi, testActivation());
     await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
     await trigger(first.hooks, "input", { cwd: dirA, text: "preserve this request", source: "user" }, first.ctx);
     await trigger(first.hooks, "before_agent_start", { cwd: dirA }, first.ctx);
@@ -1006,7 +1007,7 @@ test("same-conversation/different-cwd session start quarantines the prior sideca
 
     // Second session: same conversation, different cwd (dirB).
     const resumed = createSessionRuntime("conversation-a", sessionFile, dirB);
-    await activate(resumed.pi);
+    await activate(resumed.pi, testActivation());
     await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
 
     assert.deepEqual(resumed.sent, [], "no old follow-up may be delivered into a different cwd");
@@ -1037,7 +1038,7 @@ test("same-conversation/different-cwd session start quarantines the prior sideca
     // Third session: repeated mismatch (dirC) must not clobber the first quarantine.
     const secondBytes = freshText;
     const again = createSessionRuntime("conversation-a", sessionFile, dirC);
-    await activate(again.pi);
+    await activate(again.pi, testActivation());
     await trigger(again.hooks, "session_start", { type: "session_start", reason: "resume" }, again.ctx);
     assert.deepEqual(again.sent, []);
     const quarantineFiles2 = (await readdir(dirA)).filter((name) => name.includes(".quarantine-"));
@@ -1073,7 +1074,7 @@ test("quarantine failure leaves the prior sidecar untouched and disables persist
     await writeFile(sessionFile, "", "utf8");
 
     const first = createSessionRuntime("conversation-a", sessionFile, dirA);
-    await activate(first.pi);
+    await activate(first.pi, testActivation());
     await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
     await trigger(first.hooks, "input", { cwd: dirA, text: "preserve this request", source: "user" }, first.ctx);
     await trigger(first.hooks, "before_agent_start", { cwd: dirA }, first.ctx);
@@ -1086,7 +1087,7 @@ test("quarantine failure leaves the prior sidecar untouched and disables persist
     await chmod(dirA, 0o555);
 
     const resumed = createSessionRuntime("conversation-a", sessionFile, dirB);
-    await activate(resumed.pi);
+    await activate(resumed.pi, testActivation());
     await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
 
     assert.deepEqual(resumed.sent, [], "no old follow-up may be delivered");
@@ -1122,7 +1123,7 @@ test("a corrupted prior sidecar is preserved in place and persistence is disable
     await writeFile(sessionFile, "", "utf8");
 
     const first = createSessionRuntime("conversation-a", sessionFile, dir);
-    await activate(first.pi);
+    await activate(first.pi, testActivation());
     await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
     await trigger(first.hooks, "input", { cwd: dir, text: "preserve this request", source: "user" }, first.ctx);
     await trigger(first.hooks, "before_agent_start", { cwd: dir }, first.ctx);
@@ -1138,7 +1139,7 @@ test("a corrupted prior sidecar is preserved in place and persistence is disable
     await writeFile(statePath, corruptedBytes, "utf8");
 
     const resumed = createSessionRuntime("conversation-a", sessionFile, dir);
-    await activate(resumed.pi);
+    await activate(resumed.pi, testActivation());
     await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
 
     assert.deepEqual(resumed.sent, [], "no follow-up may be delivered from a failed restore");
@@ -1171,7 +1172,7 @@ test("a throwing notifier cannot disable persistence after a successful quaranti
     await writeFile(sessionFile, "", "utf8");
 
     const first = createSessionRuntime("conversation-a", sessionFile, dirA);
-    await activate(first.pi);
+    await activate(first.pi, testActivation());
     await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
     await trigger(first.hooks, "input", { cwd: dirA, text: "preserve this request", source: "user" }, first.ctx);
     await trigger(first.hooks, "before_agent_start", { cwd: dirA }, first.ctx);
@@ -1189,7 +1190,7 @@ test("a throwing notifier cannot disable persistence after a successful quaranti
       if (notifyCalls === 1) throw new Error("notifier exploded");
       return resumed.notices.push(message);
     };
-    await activate(resumed.pi);
+    await activate(resumed.pi, testActivation());
     await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
 
     assert.ok(notifyCalls >= 1, "the quarantine notice was attempted");
@@ -1238,7 +1239,7 @@ test("malformed sidecar JSON never leaks content or unbounded paths into restore
     await writeFile(sessionFile, "", "utf8");
 
     const first = createSessionRuntime("conversation-a", sessionFile, deep);
-    await activate(first.pi);
+    await activate(first.pi, testActivation());
     await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
     await trigger(first.hooks, "input", { cwd: deep, text: "preserve this request", source: "user" }, first.ctx);
     await trigger(first.hooks, "before_agent_start", { cwd: deep }, first.ctx);
@@ -1254,7 +1255,7 @@ test("malformed sidecar JSON never leaks content or unbounded paths into restore
     await writeFile(statePath, corruptedBytes, "utf8");
 
     const resumed = createSessionRuntime("conversation-a", sessionFile, deep);
-    await activate(resumed.pi);
+    await activate(resumed.pi, testActivation());
     await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
 
     const noticeText = resumed.notices.join("\n");
@@ -1294,7 +1295,7 @@ review: { activeReviewers: [
 
     // Session 1: establish a persisted review window (baseline + history).
     const first = createSessionRuntime("conversation-a", sessionFile, dir);
-    await activate(first.pi);
+    await activate(first.pi, testActivation());
     await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
     await trigger(first.hooks, "input", { cwd: dir, text: "implement the change", source: "user" }, first.ctx);
     await trigger(first.hooks, "before_agent_start", { cwd: dir }, first.ctx);
@@ -1320,7 +1321,7 @@ review: { activeReviewers: [
 
     // Session 2: the unsupported shape is rejected before state is applied.
     const resumed = createSessionRuntime("conversation-a", sessionFile, dir);
-    await activate(resumed.pi);
+    await activate(resumed.pi, testActivation());
     await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
 
     // Explicit actionable local failure; no restored-state notice.
@@ -1373,7 +1374,7 @@ review: { activeReviewers: [
 
     // Session 1: establish a review window with a baseline, then shut down.
     const first = createSessionRuntime("conversation-a", sessionFile, dir);
-    await activate(first.pi);
+    await activate(first.pi, testActivation());
     await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
     await trigger(first.hooks, "input", { cwd: dir, text: "initial request", source: "user" }, first.ctx);
     await trigger(first.hooks, "before_agent_start", { cwd: dir }, first.ctx);
@@ -1404,7 +1405,7 @@ review: { activeReviewers: [
     // may promise a /review-now release only for the one with an active
     // record, and must identify the other as unreleasable but preserved.
     const resumed = createSessionRuntime("conversation-a", sessionFile, dir);
-    await activate(resumed.pi);
+    await activate(resumed.pi, testActivation());
     await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
     assert.match(
       resumed.notices.join("\n"),

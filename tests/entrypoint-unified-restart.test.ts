@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
@@ -13,7 +13,9 @@ import { agentCatalog } from "./helpers";
 import {
   countingPassReviewerWithPromptDump, createSessionRuntime, indexTestConfig,
   stableJsonForTest, trigger, triggerAgentEnd,
+  testAgentDir,
 } from "./entrypoint-harness";
+import { rawReviewCheckpointRecordPath } from "../src/review-checkpoint";
 
 const exec = promisify(execFile);
 const sessionId = "restart-smoke";
@@ -260,7 +262,7 @@ for (const [kind, damage] of [
       await writeFile(join(f.cwd, "work.txt"), "edit already present before restart\n");
       let damagedRecord: string | undefined;
       if (baseline.kind === "raw") {
-        const record = join(f.cwd, ".pi-review-gate", "checkpoints", `${baseline.windowId}-${baseline.owner}`, "record.json");
+        const record = rawReviewCheckpointRecordPath({ agentDir: testAgentDir, sessionId }, await realpath(f.cwd), baseline);
         damagedRecord = record;
         if (damage === "missing record") await rm(record);
         else await writeFile(record, "corrupt owned record");
@@ -308,7 +310,7 @@ for (const failure of ["quarantine", "fresh save"] as const) {
       assert.equal(baseline.kind, "raw");
       const original = await readFile(f.store.path, "utf8");
       if (baseline.kind !== "raw") return;
-      const record = join(f.cwd, ".pi-review-gate", "checkpoints", `${baseline.windowId}-${baseline.owner}`, "record.json");
+      const record = rawReviewCheckpointRecordPath({ agentDir: testAgentDir, sessionId }, await realpath(f.cwd), baseline);
       await rm(record);
       if (failure === "quarantine") {
         SessionStateStore.prototype.quarantine = async function () {

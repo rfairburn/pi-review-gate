@@ -14,6 +14,7 @@ import { activate } from "../src/index";
 import { normalizeConfig } from "../src/config";
 import { InteractiveBrowserManager } from "../src/web/interactive-browser";
 import { WebToolManager } from "../src/web/tools";
+import { testCheckpointActivation } from "./checkpoint-scope-helpers";
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const PUBLIC_ANSWER = "203.0.114.1";
@@ -651,7 +652,7 @@ review: { activeReviewers: [
     delete process.env.PI_REVIEW_GATE_DISABLED;
     delete process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
     const parent = host();
-    await activate(parent.pi, { webTools: new WebToolManager(parent.pi, reviewConfig, undefined, undefined, harness.manager) });
+    await activate(parent.pi, { ...testCheckpointActivation(), webTools: new WebToolManager(parent.pi, reviewConfig, undefined, undefined, harness.manager) });
     const ctx = { cwd: root, isIdle: () => true, notify: parent.pi.notify };
     await parent.emit("session_start", { reason: "startup" }, ctx);
 
@@ -835,7 +836,7 @@ test("frame payload markers never appear in diagnostics or tool text", async () 
   const harness = createManagerHarness();
   try {
     const parent = host();
-    await activate(parent.pi, { webTools: new WebToolManager(parent.pi, baseConfig(), undefined, undefined, harness.manager) });
+    await activate(parent.pi, { ...testCheckpointActivation(), webTools: new WebToolManager(parent.pi, baseConfig(), undefined, undefined, harness.manager) });
     const ctx = { cwd: root, isIdle: () => true, notify: parent.pi.notify };
     await parent.emit("session_start", { reason: "startup" }, ctx);
 

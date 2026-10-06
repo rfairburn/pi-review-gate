@@ -15,6 +15,36 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.122]
+
+### Changed
+
+- Non-Git parent review checkpoints are no longer written inside the workspace
+  (#301). Every record now lives in the live Pi session's namespace under Pi's
+  agent-data directory, `<agent dir>/sessions/pi-review-gate/<session id>/checkpoints/`
+  (`~/.pi/agent` by default, following `PI_CODING_AGENT_DIR` on every platform), for
+  persisted and in-memory (`--no-session`) sessions alike. Review is not disabled for a
+  session without a conversation file, and no conversation persistence is enabled for
+  one. The location never follows the conversation file (even one inside the
+  workspace) or Pi's session-directory setting. Records bind the live session,
+  canonical workspace, review window, and a random owner generation; they are private,
+  atomically published, and every publication flushes each directory entry it depends
+  on. A restart verifies every checkpoint the saved review references before deciding
+  whether damage is recoverable. Loading and release re-derive the location from
+  the live session rather than any stored path, and only the verified owner generation
+  is removed at the existing release points. A record of another session or workspace
+  can never be cut over as recoverable damage. Delegated task capture no longer sees
+  checkpoint records or counts them against `maxSnapshotBytes`, and ordinary project
+  `.pi-review-gate` content, top-level or nested, is captured and reviewed normally.
+  Git checkpoints are unchanged.
+- The non-Git checkpoint format is now `prg-parent-raw/v2`. A persisted review window
+  that references an earlier non-Git format fails restore closed instead of being
+  migrated, and earlier in-workspace `.pi-review-gate/checkpoints` records are neither
+  read nor removed. If the agent-data checkpoint location overlaps the captured
+  workspace (for example `PI_CODING_AGENT_DIR` inside it, or a non-Git session started
+  in an ancestor of the agent directory such as the home directory), non-Git checkpoint
+  capture fails closed with an explicit unsupported-configuration error.
+
 ## [0.1.0-dev.121]
 
 ### Tests

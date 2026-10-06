@@ -291,7 +291,7 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
       await deps.persist();
       return "armed";
     }
-    const captured = existing ? undefined : await captureReviewCheckpoint(deps.cwd(), `window-${deps.state.reviewWindow?.id ?? 0}-${randomUUID()}`);
+    const captured = existing ? undefined : await captureReviewCheckpoint(deps.cwd(), `window-${deps.state.reviewWindow?.id ?? 0}-${randomUUID()}`, { scope: deps.state.checkpointScope });
     if (captured && captured.status !== "ok") throw new Error(`review gate: baseline capture failed (${captured.reason}): ${captured.detail}`);
     const baseline = existing ?? (captured?.status === "ok"
       ? { kind: "checkpoint" as const, descriptor: captured.value, cwd: deps.cwd(), capturedAt: new Date().toISOString() }
@@ -305,7 +305,7 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
       await deps.persist();
     } catch (error) {
       if (captured?.status === "ok" && deps.state.reviewWindow?.baseline !== baseline && deps.state.reviewWindow?.activeExchange?.baseline !== baseline) {
-        const released = await releaseReviewCheckpoint(deps.cwd(), captured.value);
+        const released = await releaseReviewCheckpoint(deps.cwd(), captured.value, { scope: deps.state.checkpointScope });
         if (released.status !== "ok") throw new Error(`review gate: baseline setup failed; orphan release failed (${released.reason}): ${released.detail}`);
       }
       throw error;
@@ -442,6 +442,7 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
           if (window?.baseline && !runAborted) {
             await collectPausedReviewExchange({
               cwd: deps.cwd(),
+              checkpointScope: deps.state.checkpointScope,
               config: window.reviewConfig ?? deps.config,
               evidence: window.evidence,
               actingUsage,
@@ -492,6 +493,7 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
         }
         await collectPausedReviewExchange({
           cwd: deps.cwd(),
+          checkpointScope: deps.state.checkpointScope,
           config: window.reviewConfig ?? freezeReviewWindowConfig(deps.state, deps.config, deps.scopedModels()),
           evidence: window.evidence,
           actingUsage,
@@ -568,6 +570,7 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
       if (deps.state.reviewsPaused) {
         await collectPausedReviewExchange({
           cwd: deps.cwd(),
+          checkpointScope: deps.state.checkpointScope,
           config: reviewConfig,
           evidence: window.evidence,
           actingUsage,
@@ -624,6 +627,7 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
       try {
         output = await runReview({
           cwd: deps.cwd(),
+          checkpointScope: deps.state.checkpointScope,
           request: buildRequestContext(deps.state, deps.state.reviewWindow, { priorFeedback: "latest" }),
           before: reviewBefore,
           config: reviewConfig,

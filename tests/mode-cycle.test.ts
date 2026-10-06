@@ -8,6 +8,7 @@ import { findOccupiedHostBindings, setHostKeybindingLoader } from "../src/host-k
 import { registerModeCycleShortcut } from "../src/mode-cycle";
 import { nextOperatingMode } from "../src/operating-mode";
 import { activate } from "../src/index";
+import { testCheckpointActivation } from "./checkpoint-scope-helpers";
 
 let previousConfig: string | undefined;
 let previousDisabled: string | undefined;
@@ -156,7 +157,7 @@ test("startup names an occupied host binding and does not register or override i
     delete process.env.PI_REVIEW_GATE_DISABLED;
     setHostKeybindingLoader(() => ({ "app.tools.expand": "ctrl+o" }));
     const harness = createHarness();
-    await activate(harness.pi);
+    await activate(harness.pi, testCheckpointActivation());
     assert.match(harness.notices.join("\n"), /mode cycle hotkey 'ctrl\+o' is also used by built-in Pi binding\(s\) \(app\.tools\.expand\)/);
     assert.ok(!harness.shortcuts.has("ctrl+o"), "a known occupied host key must not be registered or overridden");
     assert.equal(JSON.parse(await readFile(configPath, "utf8")).operatingMode, "execute");
@@ -176,7 +177,7 @@ test("occupancy comparison is chord-identity based: reordered equivalent modifie
     delete process.env.PI_REVIEW_GATE_DISABLED;
     setHostKeybindingLoader(() => ({ "app.commandPalette": "ctrl+shift+r" }));
     const harness = createHarness();
-    await activate(harness.pi);
+    await activate(harness.pi, testCheckpointActivation());
     assert.match(harness.notices.join("\n"), /mode cycle hotkey 'shift\+ctrl\+r' is also used by built-in Pi binding\(s\) \(app\.commandPalette\)/);
     assert.ok(!harness.shortcuts.has("shift+ctrl+r"), "an equivalent reordered chord must not be registered");
   } finally {
@@ -192,7 +193,7 @@ test("overlapping presses serialize complete cycle operations: two presses advan
     process.env.PI_REVIEW_GATE_CONFIG = configPath;
     delete process.env.PI_REVIEW_GATE_DISABLED;
     const harness = createHarness();
-    await activate(harness.pi);
+    await activate(harness.pi, testCheckpointActivation());
     const shortcut = harness.shortcuts.get("alt+m");
     assert.ok(shortcut, "the default alt+m binding is registered");
 
@@ -224,7 +225,7 @@ test("mode cycling is registered with the configured binding and advances the ca
     process.env.PI_REVIEW_GATE_CONFIG = configPath;
     delete process.env.PI_REVIEW_GATE_DISABLED;
     const harness = createHarness();
-    await activate(harness.pi);
+    await activate(harness.pi, testCheckpointActivation());
     const shortcut = harness.shortcuts.get("alt+m");
     assert.ok(shortcut, "the default alt+m binding is registered");
     assert.match(shortcut.description ?? "", /Cycle the review gate operating mode directly/);
@@ -317,7 +318,7 @@ test("/review-settings edits the mode cycle hotkey: current binding visible, can
     process.env.PI_REVIEW_GATE_CONFIG = configPath;
     delete process.env.PI_REVIEW_GATE_DISABLED;
     const harness = createHarness();
-    await activate(harness.pi);
+    await activate(harness.pi, testCheckpointActivation());
     const settings = harness.reviewSettings();
     assert.ok(settings);
 

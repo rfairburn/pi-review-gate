@@ -2,35 +2,76 @@
  * Git uses the pinned commit/patch backend; non-Git uses the same raw-entry
  * representation as Git's non-ignored untracked entries for EVERY eligible file.
  * This module does not restore or write a target index.
+ *
+ * Raw (non-Git) records never live inside a workspace (#301). Every raw record
+ * is stored in the live Pi session's external namespace under the Pi-resolved
+ * agent-data directory:
+ *
+ *   <agentDir>/sessions/pi-review-gate/<sessionId>/checkpoints/<workspace-key>/<windowId>-<owner>/record.json
+ *
+ * for persisted and in-memory (`--no-session`) sessions alike. The location is
+ * derived only from the trusted caller scope (live session id + agent dir) and
+ * the canonical workspace root, never from a stored descriptor path or the
+ * conversation file's directory.
  */
 import { execFile, spawn } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import { lstat, mkdir, mkdtemp, open, readdir, readlink, realpath, rename, rm } from "node:fs/promises";
-import { dirname, join, resolve, relative, isAbsolute, sep } from "node:path";
+import { tmpdir } from "node:os";
+import { basename, dirname, join, resolve, relative, isAbsolute, sep } from "node:path";
 import { promisify } from "node:util";
 import {
   armGitCheckpoint, loadGitCheckpoint, compareGitCheckpoints, releaseGitCheckpointPin,
   gitCheckpointDiscoveryEnv, isSafeWindowId, type GitCheckpointDescriptor, type GitCheckpointOptions,
   type GitCheckpointResult, type GitCheckpointRecord, type GitCheckpointUntrackedEntry,
 } from "./git-checkpoint";
+import { piAgentDir, type ConfigPathResolution } from "./config-path";
 
 const exec = promisify(execFile);
-const FORMAT = "prg-parent-raw/v1";
-const STORE = join(".pi-review-gate", "checkpoints");
+const FORMAT = "prg-parent-raw/v2";
+/** Current raw descriptor format. Earlier raw formats are not accepted. */
+export const RAW_REVIEW_CHECKPOINT_FORMAT = FORMAT;
 const MAX_BYTES = 512 * 1024 * 1024;
+/** Pi's conversation-session directory name inside the agent-data directory. */
+const SESSIONS_DIRECTORY = "sessions";
+/** This extension's namespace inside `<agentDir>/sessions`. */
+const SESSION_NAMESPACE = "pi-review-gate";
+const CHECKPOINTS_DIRECTORY = "checkpoints";
+/** Detail prefix for owned-record damage (missing/corrupt record data) that a
+ * restart may treat as recoverable. Identity, scope, and storage-location
+ * failures never carry it. */
+export const RAW_CHECKPOINT_DAMAGE_PREFIX = "checkpoint record damaged: ";
+
+/**
+ * Trusted live-session storage scope supplied by the caller (never read from a
+ * descriptor). `sessionId` is the live Pi session id (present for persisted
+ * and in-memory sessions); `agentDir` is Pi's resolved agent-data directory.
+ */
+export interface ReviewCheckpointScope {
+  readonly agentDir: string;
+  readonly sessionId: string;
+}
+export type ReviewCheckpointOptions = GitCheckpointOptions & { scope?: ReviewCheckpointScope };
 
 export type ReviewCheckpointDescriptor =
   | { kind: "git"; checkpoint: GitCheckpointDescriptor }
-  | { kind: "raw"; format: typeof FORMAT; root: string; windowId: string; owner: string; digest: string };
+  | { kind: "raw"; format: typeof FORMAT; sessionId: string; root: string; windowId: string; owner: string; digest: string };
 export type ReviewCheckpointResult<T> = GitCheckpointResult<T> | { status: "failed"; reason: "raw_checkpoint_failed"; detail: string };
 export interface ReviewCheckpointState { kind: "file" | "symlink"; mode: number; bytes?: Buffer; target?: string }
 export interface ReviewCheckpointChange { path: string; old?: ReviewCheckpointState; new?: ReviewCheckpointState }
 export interface ReviewCheckpointComparison { changes: ReviewCheckpointChange[] }
-interface RawRecord { format: typeof FORMAT; owner: string; entries: GitCheckpointUntrackedEntry[] }
+interface RawRecord { format: typeof FORMAT; sessionId: string; root: string; windowId: string; owner: string; entries: GitCheckpointUntrackedEntry[] }
+type RawDescriptor = Extract<ReviewCheckpointDescriptor, { kind: "raw" }>;
+
+/** Owned-record damage: carries the recoverable-damage prefix. */
+class RawCheckpointDamage extends Error {
+  constructor(detail: string) { super(`${RAW_CHECKPOINT_DAMAGE_PREFIX}${detail}`); }
+}
 
 function fail(detail: string): ReviewCheckpointResult<never> { return { status: "failed", reason: "raw_checkpoint_failed", detail }; }
 function errorOf(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+function isMissing(error: unknown): boolean { return (error as NodeJS.ErrnoException)?.code === "ENOENT"; }
 function safePath(path: string): boolean {
   return path.length > 0 && !path.includes("\0") && !path.includes("\uFFFD")
     && !path.split("/").some((part) => part === "" || part === "." || part === "..");
@@ -74,20 +115,162 @@ async function ensureRoot(root: string): Promise<string> {
   if (!s.isDirectory() || s.isSymbolicLink()) throw new Error("root must be a real directory");
   return realpath(absolute);
 }
-async function storePath(root: string): Promise<string> {
-  const top = join(root, ".pi-review-gate");
-  const dir = join(root, STORE);
-  for (const path of [top, dir]) {
-    try { const s = await lstat(path); if (!s.isDirectory() || s.isSymbolicLink()) throw new Error(`unsafe checkpoint directory ${path}`); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; await mkdir(path); }
-  }
-  // This namespace is excluded from captures to avoid including our own
-  // records. Reject user content there instead of silently omitting it.
-  if ((await readdir(top)).some((name) => name !== "checkpoints")) throw new Error("checkpoint namespace contains unrelated content");
-  if (!(await readdir(dir)).every((name) => /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}-[0-9a-f]{32}$/.test(name)))
-    throw new Error("checkpoint store contains unrelated content");
-  return dir;
+
+/** Windows reserved device names are invalid as path segments on every host. */
+const WINDOWS_RESERVED_SEGMENT = /^(?:con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(?:\..*)?$/i;
+/** A live session id usable as one private directory name on every platform. */
+export function isSafeCheckpointSessionId(sessionId: unknown): sessionId is string {
+  return typeof sessionId === "string" && isSafeWindowId(sessionId) && !WINDOWS_RESERVED_SEGMENT.test(sessionId);
 }
+
+/**
+ * Resolve the trusted raw-checkpoint scope from a live Pi event context: the
+ * session manager's live session id (available for persisted and in-memory
+ * sessions; a missing session file is irrelevant) plus Pi's agent-data
+ * directory resolved with Pi-native environment/platform semantics. Pi's
+ * conversation session-directory override never selects this location.
+ */
+export function reviewCheckpointScopeFromContext(
+  ctx: unknown, env: NodeJS.ProcessEnv = process.env, resolution?: Partial<ConfigPathResolution>,
+): ReviewCheckpointScope | undefined {
+  if (!ctx || typeof ctx !== "object") return undefined;
+  const manager = (ctx as { sessionManager?: unknown }).sessionManager;
+  if (!manager || typeof manager !== "object") return undefined;
+  const getSessionId = (manager as { getSessionId?: unknown }).getSessionId;
+  if (typeof getSessionId !== "function") return undefined;
+  const sessionId: unknown = getSessionId.call(manager);
+  if (typeof sessionId !== "string" || !sessionId) return undefined;
+  return { agentDir: piAgentDir(env, resolution), sessionId };
+}
+
+/** Canonical session checkpoint namespace for display/tests: never created here. */
+export function reviewCheckpointSessionDirectory(scope: ReviewCheckpointScope): string {
+  return join(resolve(scope.agentDir), SESSIONS_DIRECTORY, SESSION_NAMESPACE, scope.sessionId, CHECKPOINTS_DIRECTORY);
+}
+
+/** Lexical record location for a raw descriptor under a trusted scope and
+ * canonical root (diagnostics/tests). Loading never trusts this from storage:
+ * the loader re-derives and verifies the same location from the live scope. */
+export function rawReviewCheckpointRecordPath(scope: ReviewCheckpointScope, canonicalRoot: string, descriptor: { windowId: string; owner: string }): string {
+  return join(reviewCheckpointSessionDirectory(scope), workspaceKey(canonicalRoot), `${descriptor.windowId}-${descriptor.owner}`, "record.json");
+}
+
+function workspaceKey(root: string): string {
+  return createHash("sha256").update(`prg-raw-workspace\0${root}`).digest("hex").slice(0, 32);
+}
+function validateScope(scope: ReviewCheckpointScope | undefined): ReviewCheckpointScope {
+  if (!scope) throw new Error("raw checkpoint requires the live Pi session scope; no session id is available");
+  if (!isSafeCheckpointSessionId(scope.sessionId)) throw new Error("raw checkpoint session id is not a safe directory name");
+  if (typeof scope.agentDir !== "string" || !scope.agentDir || scope.agentDir.includes("\0"))
+    throw new Error("raw checkpoint agent directory is invalid");
+  return scope;
+}
+function within(parent: string, child: string): boolean {
+  const path = relative(parent, child);
+  return path === "" || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path));
+}
+/** Records must stay outside the capture root, and the root outside the store. */
+function assertOutsideRoot(store: string, root: string): void {
+  if (within(root, store) || within(store, root)) {
+    throw new Error(`raw checkpoint storage ${store} overlaps the capture workspace ${root}; this Pi agent-data directory configuration is unsupported for non-Git review checkpoints`);
+  }
+}
+/** Canonical form of a possibly not-yet-existing path: realpath of the deepest
+ * existing ancestor plus the remaining lexical segments. */
+async function canonicalProspective(path: string): Promise<string> {
+  const rest: string[] = [];
+  let current = path;
+  while (true) {
+    try { return join(await realpath(current), ...rest.reverse()); }
+    catch (error) { if (!isMissing(error)) throw error; }
+    const parent = dirname(current);
+    if (parent === current) throw new Error("raw checkpoint storage has no existing ancestor");
+    rest.push(basename(current));
+    current = parent;
+  }
+}
+/** Private-directory/file check for checkpoint-owned storage (POSIX only:
+ * Windows modes are not ACLs and process.getuid is unavailable there). */
+function assertPrivate(s: Stats, what: string): void {
+  if (process.platform === "win32") return;
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if ((s.mode & 0o077) !== 0 || (uid !== undefined && s.uid !== uid)) throw new Error(`${what} is not private to the current user`);
+}
+
+interface SessionStore {
+  /** Canonical workspace store directory. */
+  store: string;
+  /** Canonical `<agentDir>/sessions` directory: the top of the owned chain. */
+  base: string;
+  /** Canonical Pi agent-data directory. */
+  agentDir: string;
+}
+/**
+ * Resolve (and on capture, create) the workspace store inside the live
+ * session namespace. The agent directory and its `sessions` directory are
+ * Pi-owned and may be symlinked; everything this extension owns below them
+ * must be a real private directory. Nothing is created when the prospective
+ * location overlaps the capture root. Creation is bounded: at most the agent
+ * directory itself (when its parent exists) and `sessions` are created above
+ * the extension namespace, so every directory entry this extension can ever
+ * create is inside the chain that each publication re-flushes.
+ */
+async function sessionStore(scopeInput: ReviewCheckpointScope | undefined, root: string, create: boolean): Promise<SessionStore> {
+  const scope = validateScope(scopeInput);
+  const lexicalAgentDir = resolve(scope.agentDir);
+  const owned = [SESSION_NAMESPACE, scope.sessionId, CHECKPOINTS_DIRECTORY, workspaceKey(root)];
+  assertOutsideRoot(join(await canonicalProspective(join(lexicalAgentDir, SESSIONS_DIRECTORY)), ...owned), root);
+  const missing = (what: string): Error => create ? new Error(`raw checkpoint storage missing: ${what}`) : new RawCheckpointDamage(`missing ${what}`);
+  const createDirectory = async (path: string): Promise<void> => {
+    try { await mkdir(path, { mode: 0o700 }); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  };
+  if (create) {
+    try { await lstat(lexicalAgentDir); }
+    catch (error) {
+      if (!isMissing(error)) throw error;
+      try { await lstat(dirname(lexicalAgentDir)); }
+      catch (parentError) {
+        if (isMissing(parentError)) throw new Error("raw checkpoint storage missing: the Pi agent-data directory and its parent do not exist");
+        throw parentError;
+      }
+      await createDirectory(lexicalAgentDir);
+    }
+  }
+  let agentDir: string;
+  try { agentDir = await realpath(lexicalAgentDir); }
+  catch (error) { if (isMissing(error)) throw missing("agent-data directory"); throw error; }
+  if (!(await lstat(agentDir)).isDirectory()) throw new Error("raw checkpoint agent-data directory is not a directory");
+  const sessions = join(agentDir, SESSIONS_DIRECTORY);
+  if (create) {
+    try { await lstat(sessions); }
+    catch (error) { if (!isMissing(error)) throw error; await createDirectory(sessions); }
+  }
+  let base: string;
+  try { base = await realpath(sessions); }
+  catch (error) { if (isMissing(error)) throw missing("session storage"); throw error; }
+  const baseStat = await lstat(base);
+  if (!baseStat.isDirectory()) throw new Error("raw checkpoint session storage is not a directory");
+  let store = base;
+  for (const name of owned) {
+    store = join(store, name);
+    let s: Stats;
+    try { s = await lstat(store); }
+    catch (error) {
+      if (!isMissing(error)) throw error;
+      if (!create) throw missing("checkpoint namespace");
+      await createDirectory(store);
+      s = await lstat(store);
+    }
+    if (!s.isDirectory() || s.isSymbolicLink()) throw new Error(`unsafe raw checkpoint directory ${store}`);
+    assertPrivate(s, "raw checkpoint directory");
+  }
+  // The final location is canonical by construction (canonical base plus
+  // verified non-symlink components); recheck it against the root.
+  assertOutsideRoot(store, root);
+  return { store, base, agentDir };
+}
+
 async function syncDirectory(dir: string): Promise<void> {
   const handle = await open(dir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   try {
@@ -100,26 +283,39 @@ async function syncDirectory(dir: string): Promise<void> {
   } finally { await handle.close(); }
 }
 
-/** Persist each directory entry created for the raw record, through root. */
-async function syncAncestorChain(owned: string, root: string): Promise<void> {
-  let current = dirname(owned);
-  while (true) {
-    await syncDirectory(current);
-    if (current === root) return;
-    const parent = dirname(current);
-    if (parent === current) throw new Error("checkpoint directory escaped root");
-    current = parent;
+/** Persist every directory entry the raw record depends on before any
+ * descriptor is published, on EVERY publication regardless of which
+ * invocation created the entry (a failed earlier attempt or a concurrent
+ * first capture may have left it unflushed): each directory from the owned
+ * generation's parent up to the canonical sessions directory, then the
+ * directories holding the `sessions` entry and the agent-data directory
+ * entry. These are the only entries this extension ever creates. */
+async function syncChain(store: SessionStore, owned: string): Promise<void> {
+  const seen = new Set<string>();
+  const sync = async (dir: string): Promise<void> => {
+    if (seen.has(dir)) return;
+    seen.add(dir);
+    await syncDirectory(dir);
+  };
+  for (let dir = dirname(owned); ; dir = dirname(dir)) {
+    await sync(dir);
+    if (dir === store.base) break;
+    if (dirname(dir) === dir) throw new Error("checkpoint directory escaped its session storage");
   }
+  await sync(dirname(store.base));
+  await sync(store.agentDir);
+  await sync(dirname(store.agentDir));
 }
 
-async function existingStore(root: string): Promise<string> {
-  const dir = join(root, STORE);
-  for (const path of [join(root, ".pi-review-gate"), dir]) {
-    const s = await lstat(path);
-    if (!s.isDirectory() || s.isSymbolicLink()) throw new Error("checkpoint store is not an owned directory");
-  }
-  return dir;
+/** Durable atomic publication of one private record inside its owned directory. */
+async function publishRecord(owned: string, payload: Buffer): Promise<void> {
+  const tmp = join(owned, "record.tmp");
+  const handle = await open(tmp, "wx", 0o600);
+  try { await handle.writeFile(payload); await handle.sync(); } finally { await handle.close(); }
+  await rename(tmp, join(owned, "record.json"));
+  await syncDirectory(owned);
 }
+
 type GitRoot = { kind: "git"; root: string } | { kind: "raw" | "broken" };
 async function gitRoot(root: string): Promise<GitRoot> {
   const out = await command(root, ["rev-parse", "--show-toplevel"], gitCheckpointDiscoveryEnv());
@@ -168,7 +364,9 @@ async function walk(root: string, path: string, files: string[], ignores: string
   const before = await lstat(dir);
   if (!before.isDirectory() || before.isSymbolicLink()) throw new Error(`directory changed: ${path}`);
   for (const name of (await readdir(dir)).sort()) {
-    if (path === "" && (name === ".git" || name === ".pi-review-gate")) continue;
+    // Ordinary project content named .pi-review-gate stays eligible: raw
+    // records never live inside the workspace (#301).
+    if (path === "" && name === ".git") continue;
     const rel = path ? `${path}/${name}` : name;
     if (!safePath(rel) || Buffer.from(rel).toString("utf8") !== rel) throw new Error("unrepresentable path");
     const s = await lstat(join(root, rel));
@@ -180,12 +378,14 @@ async function walk(root: string, path: string, files: string[], ignores: string
   }
   if (!identity(before, await lstat(dir))) throw new Error(`directory changed during enumeration: ${path}`);
 }
-async function ignoredPaths(root: string, candidates: string[], hasIgnore: boolean, store: string): Promise<Set<string>> {
+async function ignoredPaths(root: string, candidates: string[], hasIgnore: boolean): Promise<Set<string>> {
   if (!hasIgnore) return new Set();
   // Git's own wildmatch and hierarchy semantics, using an isolated metadata
   // directory, not a .git in the target. The global excludes are enabled only
-  // when at least one project .gitignore exists anywhere in the root.
-  const scratch = await mkdtemp(join(store, "ignore-"));
+  // when at least one project .gitignore exists anywhere in the root. The
+  // matcher scratch is a private OS temporary directory, never inside the
+  // workspace or the checkpoint store, so concurrent captures cannot see it.
+  const scratch = await mkdtemp(join(tmpdir(), "pi-review-gate-ignore-"));
   try {
     const repo = join(scratch, "repo.git");
     // Ambient templates can install info/exclude, which is not part of the
@@ -283,31 +483,41 @@ async function rawEntry(root: string, path: string, options: GitCheckpointOption
     size: pre.size, mtimeMs: pre.mtimeMs, ctimeMs: pre.ctimeMs, ...(contentB64 === undefined ? { target } : { contentB64 }) };
 }
 
-/** Capture a Git pin/patch record or a durable raw record (never a WorkspaceSnapshot). */
-export async function captureReviewCheckpoint(root: string, windowId: string, options: GitCheckpointOptions = {}): Promise<ReviewCheckpointResult<ReviewCheckpointDescriptor>> {
+function gitOptions(options: ReviewCheckpointOptions): GitCheckpointOptions {
+  const { scope: _scope, ...git } = options;
+  return git;
+}
+function rawPayload(scope: ReviewCheckpointScope, root: string, windowId: string, owner: string, entries: GitCheckpointUntrackedEntry[]): Buffer {
+  return Buffer.from(JSON.stringify({ format: FORMAT, sessionId: scope.sessionId, root, windowId, owner, entries } satisfies RawRecord));
+}
+
+/** Capture a Git pin/patch record or a durable raw record (never a WorkspaceSnapshot).
+ * Raw records require the trusted live session scope and are published only
+ * in that session's external checkpoint namespace. */
+export async function captureReviewCheckpoint(root: string, windowId: string, options: ReviewCheckpointOptions = {}): Promise<ReviewCheckpointResult<ReviewCheckpointDescriptor>> {
   try {
     if (!isSafeWindowId(windowId)) return fail("unsafe window id");
     const dir = await ensureRoot(root);
     const strategy = await gitRoot(dir);
     if (strategy.kind === "broken") return fail("broken Git metadata; refusing raw fallback");
     if (strategy.kind === "git") {
-      const armed = await armGitCheckpoint(strategy.root, windowId, options);
+      const armed = await armGitCheckpoint(strategy.root, windowId, gitOptions(options));
       return armed.status === "ok" ? { status: "ok", value: { kind: "git", checkpoint: armed.value.descriptor } } : armed;
     }
-    const store = await storePath(dir);
+    const scope = validateScope(options.scope);
+    const location = await sessionStore(scope, dir, true);
     const owner = randomBytes(16).toString("hex");
-    const owned = join(store, `${windowId}-${owner}`);
-    await mkdir(owned);
+    const owned = join(location.store, `${windowId}-${owner}`);
+    await mkdir(owned, { mode: 0o700 });
     let published = false;
     try {
-      // mkdir(owned) and storePath may have created directory entries in
-      // store, .pi-review-gate and root. Sync their parents before publishing
-      // a descriptor, just as the Git checkpoint arm syncs its scratch chain.
-      await syncAncestorChain(owned, dir);
+      // Flush the owned directory entry and every storage directory created
+      // for it before publishing a descriptor, as the Git arm syncs its chain.
+      await syncChain(location, owned);
       const files: string[] = [], ignores: string[] = [];
       await walk(dir, "", files, ignores, options);
       const ignoreEntries = await Promise.all(ignores.map((path) => rawEntry(dir, path, options)));
-      const excluded = await ignoredPaths(dir, files, ignores.length > 0, store);
+      const excluded = await ignoredPaths(dir, files, ignores.length > 0);
       const entries: GitCheckpointUntrackedEntry[] = [];
       let bytes = 0;
       for (const path of files) {
@@ -332,15 +542,10 @@ export async function captureReviewCheckpoint(root: string, windowId: string, op
       const filesAfter: string[] = [], ignoresAfter: string[] = [];
       await walk(dir, "", filesAfter, ignoresAfter, options);
       if (JSON.stringify(filesAfter) !== JSON.stringify(files) || JSON.stringify(ignoresAfter) !== JSON.stringify(ignores)) throw new Error("path enumeration changed during capture");
-      const payload = Buffer.from(JSON.stringify({ format: FORMAT, owner, entries } satisfies RawRecord));
-      const record = join(owned, "record.json");
-      const tmp = join(owned, "record.tmp");
-      const handle = await open(tmp, "wx", 0o600);
-      try { await handle.writeFile(payload); await handle.sync(); } finally { await handle.close(); }
-      await rename(tmp, record);
-      await syncDirectory(owned);
+      const payload = rawPayload(scope, dir, windowId, owner, entries);
+      await publishRecord(owned, payload);
       published = true;
-      return { status: "ok", value: { kind: "raw", format: FORMAT, root: dir, windowId, owner, digest: sha(payload) } };
+      return { status: "ok", value: { kind: "raw", format: FORMAT, sessionId: scope.sessionId, root: dir, windowId, owner, digest: sha(payload) } };
     } finally { if (!published) await rm(owned, { recursive: true, force: true }); }
   } catch (error) { return fail(errorOf(error)); }
 }
@@ -348,9 +553,9 @@ export async function captureReviewCheckpoint(root: string, windowId: string, op
 /** Compose verified old raw entries with a frozen capture of selected live paths.
  * The old descriptor remains intact; unrelated live bytes are never read. */
 export async function advanceRawReviewCheckpoint(
-  root: string, descriptor: Extract<ReviewCheckpointDescriptor, { kind: "raw" }>,
-  landedPaths: readonly string[], checkpointId: string, options: GitCheckpointOptions = {},
-): Promise<ReviewCheckpointResult<Extract<ReviewCheckpointDescriptor, { kind: "raw" }>>> {
+  root: string, descriptor: RawDescriptor,
+  landedPaths: readonly string[], checkpointId: string, options: ReviewCheckpointOptions = {},
+): Promise<ReviewCheckpointResult<RawDescriptor>> {
   let owned: string | undefined;
   let published = false;
   try {
@@ -361,16 +566,17 @@ export async function advanceRawReviewCheckpoint(
     const old = await loadReviewCheckpoint(root, descriptor, options);
     if (old.status !== "ok") return old;
     if (old.value.kind !== "raw") throw new Error("expected raw checkpoint");
+    const scope = validateScope(options.scope);
     const dir = await ensureRoot(root);
     if ((await gitRoot(dir)).kind !== "raw") throw new Error("raw root became a Git repository during advancement");
-    const store = await existingStore(dir);
+    const location = await sessionStore(scope, dir, false);
     const files: string[] = [], ignores: string[] = [];
     await walk(dir, "", files, ignores, options);
     const ignoreEntries = await Promise.all(ignores.map((path) => rawEntry(dir, path, options)));
     // Enumerate the entire path set for consistency, but read bytes only for
     // selected eligible entries; unrelated large files never consume the cap.
     const selectedFiles = files.filter((path) => selectedPath(path, selected));
-    const excluded = await ignoredPaths(dir, selectedFiles, ignores.length > 0, store);
+    const excluded = await ignoredPaths(dir, selectedFiles, ignores.length > 0);
     const liveEntries: GitCheckpointUntrackedEntry[] = [];
     for (const path of selectedFiles) {
       if (!excluded.has(path)) liveEntries.push(await rawEntry(dir, path, options));
@@ -405,15 +611,12 @@ export async function advanceRawReviewCheckpoint(
     if (verified.status !== "ok") return verified;
     checkAbort(options);
     const owner = randomBytes(16).toString("hex");
-    owned = join(store, `${checkpointId}-${owner}`);
-    await mkdir(owned);
-    await syncAncestorChain(owned, dir);
-    const payload = Buffer.from(JSON.stringify({ format: FORMAT, owner, entries } satisfies RawRecord));
-    const handle = await open(join(owned, "record.tmp"), "wx", 0o600);
-    try { await handle.writeFile(payload); await handle.sync(); } finally { await handle.close(); }
-    await rename(join(owned, "record.tmp"), join(owned, "record.json"));
-    await syncDirectory(owned);
-    const result: Extract<ReviewCheckpointDescriptor, { kind: "raw" }> = { kind: "raw", format: FORMAT, root: dir, windowId: checkpointId, owner, digest: sha(payload) };
+    owned = join(location.store, `${checkpointId}-${owner}`);
+    await mkdir(owned, { mode: 0o700 });
+    await syncChain(location, owned);
+    const payload = rawPayload(scope, dir, checkpointId, owner, entries);
+    await publishRecord(owned, payload);
+    const result: RawDescriptor = { kind: "raw", format: FORMAT, sessionId: scope.sessionId, root: dir, windowId: checkpointId, owner, digest: sha(payload) };
     const finalOld = await loadReviewCheckpoint(root, descriptor, options);
     if (finalOld.status !== "ok") return finalOld;
     checkAbort(options);
@@ -428,7 +631,7 @@ export async function advanceRawReviewCheckpoint(
 /** Read-only pre-task guard for raw checkpoints. Metadata drift conservatively
  * counts as a parent change, including unreadable/oversized unselected files;
  * no current content is ever substituted for a parent checkpoint entry. */
-export async function changedRawCheckpointPaths(root: string, descriptor: Extract<ReviewCheckpointDescriptor, { kind: "raw" }>, options: GitCheckpointOptions = {}): Promise<ReviewCheckpointResult<Set<string>>> {
+export async function changedRawCheckpointPaths(root: string, descriptor: RawDescriptor, options: ReviewCheckpointOptions = {}): Promise<ReviewCheckpointResult<Set<string>>> {
   try {
     const old = await loadReviewCheckpoint(root, descriptor, options);
     if (old.status !== "ok") return old;
@@ -437,8 +640,7 @@ export async function changedRawCheckpointPaths(root: string, descriptor: Extrac
     if ((await gitRoot(dir)).kind !== "raw") throw new Error("raw root became a Git repository");
     const files: string[] = [], ignores: string[] = [];
     await walk(dir, "", files, ignores, options);
-    const store = await existingStore(dir);
-    const excluded = await ignoredPaths(dir, files, ignores.length > 0, store);
+    const excluded = await ignoredPaths(dir, files, ignores.length > 0);
     const current = new Set(files.filter((path) => !excluded.has(path)));
     const changed = new Set<string>();
     const previous = new Map(old.value.entries.map((entry) => [entry.path, entry]));
@@ -460,64 +662,93 @@ export async function changedRawCheckpointPaths(root: string, descriptor: Extrac
   } catch (error) { return fail(errorOf(error)); }
 }
 
-function validateDescriptor(value: ReviewCheckpointDescriptor): asserts value is Extract<ReviewCheckpointDescriptor, { kind: "raw" }> {
-  if (value?.kind !== "raw" || value.format !== FORMAT || !isSafeWindowId(value.windowId)
-    || !/^[0-9a-f]{32}$/.test(value.owner) || !/^[0-9a-f]{64}$/.test(value.digest)
+const DESCRIPTOR_KEYS = ["digest", "format", "kind", "owner", "root", "sessionId", "windowId"].join(",");
+const RECORD_KEYS = ["entries", "format", "owner", "root", "sessionId", "windowId"].join(",");
+function validateDescriptor(value: ReviewCheckpointDescriptor): asserts value is RawDescriptor {
+  if (!value || typeof value !== "object" || Object.keys(value).sort().join(",") !== DESCRIPTOR_KEYS
+    || value.kind !== "raw" || value.format !== FORMAT || !isSafeWindowId(value.windowId)
+    || !isSafeCheckpointSessionId(value.sessionId)
+    || typeof value.owner !== "string" || !/^[0-9a-f]{32}$/.test(value.owner)
+    || typeof value.digest !== "string" || !/^[0-9a-f]{64}$/.test(value.digest)
     || typeof value.root !== "string" || !isAbsolute(value.root)) throw new Error("malformed raw descriptor");
 }
-/** Verify owner, root, stored digest, record schema and each raw entry before use. */
-export async function loadReviewCheckpoint(root: string, descriptor: ReviewCheckpointDescriptor, options: GitCheckpointOptions = {}): Promise<ReviewCheckpointResult<{ kind: "git"; record: GitCheckpointRecord } | { kind: "raw"; entries: GitCheckpointUntrackedEntry[] }>> {
+/** Locate a raw descriptor's owned generation from the trusted scope and the
+ * caller's canonical root only; the descriptor never supplies a path. */
+async function ownedRawLocation(root: string, descriptor: ReviewCheckpointDescriptor, options: ReviewCheckpointOptions): Promise<{ owned: string; store: string; descriptor: RawDescriptor }> {
+  validateDescriptor(descriptor);
+  const scope = validateScope(options.scope);
+  if (descriptor.sessionId !== scope.sessionId) throw new Error("wrong session");
+  checkAbort(options);
+  const dir = await ensureRoot(root);
+  if (dir !== descriptor.root) throw new Error("wrong root");
+  const { store } = await sessionStore(scope, dir, false);
+  const owned = join(store, `${descriptor.windowId}-${descriptor.owner}`);
+  if (dirname(owned) !== store) throw new Error("unsafe owner path");
+  return { owned, store, descriptor };
+}
+/** Verify session/workspace binding, owner, stored digest, record schema and
+ * each raw entry before use. */
+export async function loadReviewCheckpoint(root: string, descriptor: ReviewCheckpointDescriptor, options: ReviewCheckpointOptions = {}): Promise<ReviewCheckpointResult<{ kind: "git"; record: GitCheckpointRecord } | { kind: "raw"; entries: GitCheckpointUntrackedEntry[] }>> {
   if (descriptor?.kind === "git") {
     let checkpointRoot: string;
     try { checkpointRoot = await gitCheckpointRoot(root); }
     catch { checkpointRoot = resolve(root); }
-    const result = await loadGitCheckpoint(checkpointRoot, descriptor.checkpoint, options);
+    const result = await loadGitCheckpoint(checkpointRoot, descriptor.checkpoint, gitOptions(options));
     return result.status === "ok" ? { status: "ok", value: { kind: "git", record: result.value.record } } : result;
   }
   try {
-    validateDescriptor(descriptor);
-    checkAbort(options);
-    const dir = await ensureRoot(root);
-    if (dir !== descriptor.root) throw new Error("wrong root");
-    const store = await existingStore(dir);
-    const owned = join(store, `${descriptor.windowId}-${descriptor.owner}`);
-    const os = await lstat(owned);
+    const location = await ownedRawLocation(root, descriptor, options);
+    const raw = location.descriptor;
+    let os: Stats;
+    try { os = await lstat(location.owned); }
+    catch (error) { if (isMissing(error)) throw new RawCheckpointDamage("owner record missing"); throw error; }
     if (!os.isDirectory() || os.isSymbolicLink()) throw new Error("unsafe owner directory");
-    const path = join(owned, "record.json");
-    const s = await lstat(path);
-    if (!s.isFile() || s.isSymbolicLink() || s.size > MAX_BYTES * 2 + 1024 * 1024) throw new Error("unsafe record");
+    assertPrivate(os, "raw checkpoint owner directory");
+    const path = join(location.owned, "record.json");
+    let s: Stats;
+    try { s = await lstat(path); }
+    catch (error) { if (isMissing(error)) throw new RawCheckpointDamage("record missing"); throw error; }
+    if (!s.isFile() || s.isSymbolicLink() || s.size > MAX_BYTES * 2 + 1024 * 1024) throw new RawCheckpointDamage("unsafe record");
+    assertPrivate(s, "raw checkpoint record");
     const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
     let bytes: Buffer;
     try {
-      if (!fileHandleIdentity(s, await handle.stat())) throw new Error("record raced");
+      if (!fileHandleIdentity(s, await handle.stat())) throw new RawCheckpointDamage("record raced");
       bytes = await handle.readFile();
-      if (!fileHandleIdentity(s, await handle.stat()) || bytes.length !== s.size) throw new Error("record raced");
+      if (!fileHandleIdentity(s, await handle.stat()) || bytes.length !== s.size) throw new RawCheckpointDamage("record raced");
     } finally { await handle.close(); }
-    if (!identity(s, await lstat(path)) || sha(bytes) !== descriptor.digest) throw new Error("record digest/identity mismatch");
+    if (!identity(s, await lstat(path)) || sha(bytes) !== raw.digest) throw new RawCheckpointDamage("record digest/identity mismatch");
     const text = bytes.toString("utf8");
-    if (!Buffer.from(text, "utf8").equals(bytes)) throw new Error("record is not valid UTF-8");
-    const parsed: unknown = JSON.parse(text);
-    if (!parsed || typeof parsed !== "object") throw new Error("invalid record");
+    if (!Buffer.from(text, "utf8").equals(bytes)) throw new RawCheckpointDamage("record is not valid UTF-8");
+    let parsed: unknown;
+    try { parsed = JSON.parse(text); }
+    catch { throw new RawCheckpointDamage("invalid record"); }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new RawCheckpointDamage("invalid record");
     const record = parsed as RawRecord;
-    if (record.format !== FORMAT || record.owner !== descriptor.owner || !Array.isArray(record.entries)) throw new Error("record owner/format mismatch");
+    // The digest already binds these bytes to the descriptor. A record whose
+    // own session/workspace/window/owner binding disagrees is an identity
+    // mismatch, never recoverable damage.
+    if (Object.keys(record).sort().join(",") !== RECORD_KEYS || record.format !== FORMAT
+      || record.sessionId !== raw.sessionId || record.root !== raw.root || record.windowId !== raw.windowId
+      || record.owner !== raw.owner || !Array.isArray(record.entries)) throw new Error("record binding mismatch");
     const paths = new Set<string>();
     let size = 0;
     for (const entry of record.entries) {
       if (!entry || typeof entry.path !== "string" || !safePath(entry.path) || Buffer.from(entry.path).toString("utf8") !== entry.path
-        || paths.has(entry.path) || entry.path === ".pi-review-gate" || entry.path.startsWith(".pi-review-gate/")
+        || paths.has(entry.path)
         || typeof entry.mode !== "number" || !Number.isInteger(entry.mode) || !Number.isFinite(entry.size) || entry.size < 0
-        || ![entry.dev, entry.ino, entry.mtimeMs, entry.ctimeMs].every((n) => typeof n === "number" && Number.isFinite(n) && n >= 0)) throw new Error("invalid raw entry");
+        || ![entry.dev, entry.ino, entry.mtimeMs, entry.ctimeMs].every((n) => typeof n === "number" && Number.isFinite(n) && n >= 0)) throw new RawCheckpointDamage("invalid raw entry");
       paths.add(entry.path);
       if (entry.kind === "file") {
         if ((entry.mode & 0o170000) !== 0o100000 || typeof entry.contentB64 !== "string" || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(entry.contentB64)
-          || Buffer.byteLength(entry.contentB64, "base64") !== entry.size) throw new Error("invalid file content");
+          || Buffer.byteLength(entry.contentB64, "base64") !== entry.size) throw new RawCheckpointDamage("invalid file content");
       } else if (entry.kind === "symlink") {
         if ((entry.mode & 0o170000) !== 0o120000 || typeof entry.target !== "string" || !entry.target.length
           || entry.target.includes("\uFFFD") || Buffer.from(entry.target).toString("utf8") !== entry.target
-          || Buffer.byteLength(entry.target) !== entry.size) throw new Error("invalid symlink target");
-      } else throw new Error("invalid entry kind");
+          || Buffer.byteLength(entry.target) !== entry.size) throw new RawCheckpointDamage("invalid symlink target");
+      } else throw new RawCheckpointDamage("invalid entry kind");
       size += entry.size;
-      if (size > MAX_BYTES) throw new Error("raw byte cap exceeded");
+      if (size > MAX_BYTES) throw new RawCheckpointDamage("raw byte cap exceeded");
     }
     return { status: "ok", value: { kind: "raw", entries: record.entries } };
   } catch (error) { return fail(errorOf(error)); }
@@ -532,12 +763,12 @@ function sameState(old: ReviewCheckpointState | undefined, next: ReviewCheckpoin
   return typeof old.target === "string" && old.target === next.target;
 }
 /** Compare two independently verified frozen records, never the current worktree. */
-export async function compareReviewCheckpoints(root: string, before: ReviewCheckpointDescriptor, after: ReviewCheckpointDescriptor, options: GitCheckpointOptions = {}): Promise<ReviewCheckpointResult<ReviewCheckpointComparison>> {
+export async function compareReviewCheckpoints(root: string, before: ReviewCheckpointDescriptor, after: ReviewCheckpointDescriptor, options: ReviewCheckpointOptions = {}): Promise<ReviewCheckpointResult<ReviewCheckpointComparison>> {
   if (before.kind === "git" && after.kind === "git") {
     let checkpointRoot: string;
     try { checkpointRoot = await gitCheckpointRoot(root); }
     catch (error) { return fail(errorOf(error)); }
-    const compared = await compareGitCheckpoints(checkpointRoot, before.checkpoint, after.checkpoint, options, true);
+    const compared = await compareGitCheckpoints(checkpointRoot, before.checkpoint, after.checkpoint, gitOptions(options), true);
     if (compared.status !== "ok") return compared;
     // Tracked symlinks are Git blobs, not necessarily UTF-8 text. Refuse a
     // lossy decode before sameState can collapse distinct targets to U+FFFD.
@@ -576,27 +807,30 @@ export async function compareReviewCheckpoints(root: string, before: ReviewCheck
   }
   return { status: "ok", value: { changes } };
 }
-/** Release only the descriptor's verified owner. A failed verification deletes nothing. */
-export async function releaseReviewCheckpoint(root: string, descriptor: ReviewCheckpointDescriptor, options: GitCheckpointOptions = {}): Promise<ReviewCheckpointResult<void>> {
+/** Release only the descriptor's verified owner. A failed verification deletes
+ * nothing; the session namespace, workspace store and unrelated content are
+ * never removed. */
+export async function releaseReviewCheckpoint(root: string, descriptor: ReviewCheckpointDescriptor, options: ReviewCheckpointOptions = {}): Promise<ReviewCheckpointResult<void>> {
   if (descriptor.kind === "git") {
     const loaded = await loadReviewCheckpoint(root, descriptor, options);
     if (loaded.status !== "ok") return loaded;
     let checkpointRoot: string;
     try { checkpointRoot = await gitCheckpointRoot(root); }
     catch (error) { return fail(errorOf(error)); }
-    const released = await releaseGitCheckpointPin(checkpointRoot, descriptor.checkpoint.windowId, { ...options, expectedBase: descriptor.checkpoint.base, armId: descriptor.checkpoint.armId });
+    const released = await releaseGitCheckpointPin(checkpointRoot, descriptor.checkpoint.windowId, { ...gitOptions(options), expectedBase: descriptor.checkpoint.base, armId: descriptor.checkpoint.armId });
     return released.status === "ok" ? { status: "ok", value: undefined } : released;
   }
   const loaded = await loadReviewCheckpoint(root, descriptor, options);
   if (loaded.status !== "ok") return loaded;
   try {
-    validateDescriptor(descriptor);
-    const dir = await ensureRoot(root);
-    const store = await existingStore(dir);
-    const owned = join(store, `${descriptor.windowId}-${descriptor.owner}`);
+    // Re-derive the location from the trusted scope (never a stored path) and
+    // re-verify the owned generation immediately before removal.
+    const { owned } = await ownedRawLocation(root, descriptor, options);
+    const s = await lstat(owned);
+    if (!s.isDirectory() || s.isSymbolicLink()) throw new Error("unsafe owner directory");
+    assertPrivate(s, "raw checkpoint owner directory");
     // No recursive parent deletion; the validated owner directory is this
     // generation's only removal target.
-    if (relative(store, owned).startsWith("..")) throw new Error("unsafe owner path");
     await rm(owned, { recursive: true });
     return { status: "ok", value: undefined };
   } catch (error) { return fail(errorOf(error)); }

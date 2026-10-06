@@ -22,6 +22,7 @@ import {
   trigger,
   triggerAgentEnd,
   waitForCondition,
+  testActivation,
 } from "./entrypoint-harness";
 
 // Row formatting mirrors src/settings/command.ts alignedSettingsRows so the
@@ -191,7 +192,7 @@ test("primary off: turns settle without reviewers and the accumulated window ser
     });
 
     const rt = createPersistentToggleRuntime("conversation-a", sessionFile, dir);
-    await activate(rt.pi);
+    await activate(rt.pi, testActivation());
     await trigger(rt.hooks, "session_start", { type: "session_start", reason: "startup" }, rt.ctx);
 
     await runTurn(rt, dir, "add the first file", { name: "a.ts", content: "one\n" });
@@ -245,7 +246,7 @@ test("primary on: automatic review keeps its existing settlement behavior", asyn
     });
 
     const rt = createToggleRuntime(dir);
-    await activate(rt.pi);
+    await activate(rt.pi, testActivation());
     await runTurn(rt, dir, "make the change", { name: "index.ts", content: "changed\n" });
 
     const invocationPath = join(dir, "reviewer-invocations.txt");
@@ -270,7 +271,7 @@ test("both layers off: automatic primary review stays suppressed and manual revi
     });
 
     const rt = createToggleRuntime(dir);
-    await activate(rt.pi);
+    await activate(rt.pi, testActivation());
     await runTurn(rt, dir, "make the change", { name: "index.ts", content: "changed\n" });
 
     const invocationPath = join(dir, "reviewer-invocations.txt");
@@ -300,7 +301,7 @@ test("restoring with primary off preserves the open window and reviews accumulat
 
     // Session 1: one turn settles without a reviewer and persists.
     const first = createPersistentToggleRuntime("conversation-a", sessionFile, dir);
-    await activate(first.pi);
+    await activate(first.pi, testActivation());
     await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
     await runTurn(first, dir, "implement the feature", { name: "a.ts", content: "one\n" });
     const invocationPath = join(dir, "reviewer-invocations.txt");
@@ -321,7 +322,7 @@ test("restoring with primary off preserves the open window and reviews accumulat
     // turn still settles without automatic review, and /review-now covers both
     // turns.
     const resumed = createPersistentToggleRuntime("conversation-a", sessionFile, dir);
-    await activate(resumed.pi);
+    await activate(resumed.pi, testActivation());
     await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
     assert.match(resumed.notices.join("\n"), /restored conversation state revision/);
 
@@ -353,7 +354,7 @@ test("primary off: active background work neither defers review nor wakes the or
     });
 
     const rt = createToggleRuntime(dir);
-    await activate(rt.pi);
+    await activate(rt.pi, testActivation());
     await trigger(rt.hooks, "input", { cwd: dir, text: "make a background-assisted change", source: "user" });
     await trigger(rt.hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
@@ -411,7 +412,7 @@ test("toggling primary off mid-deferral keeps the completion wake and resumes wi
     });
 
     const rt = createToggleRuntime(dir);
-    await activate(rt.pi);
+    await activate(rt.pi, testActivation());
     await trigger(rt.hooks, "input", { cwd: dir, text: "make a background-assisted change", source: "user" });
     await trigger(rt.hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
@@ -481,7 +482,7 @@ test("master off with primary off: settlement preserves the window for reviewer 
     }, { enabled: false });
 
     const rt = createPersistentToggleRuntime("conversation-a", sessionFile, dir);
-    await activate(rt.pi);
+    await activate(rt.pi, testActivation());
     await trigger(rt.hooks, "session_start", { type: "session_start", reason: "startup" }, rt.ctx);
     await runTurn(rt, dir, "make the change", { name: "index.ts", content: "changed\n" });
 
@@ -517,7 +518,7 @@ test("an aborted run with primary off leaves the window and its unsettled exchan
     });
 
     const rt = createPersistentToggleRuntime("conversation-a", sessionFile, dir);
-    await activate(rt.pi);
+    await activate(rt.pi, testActivation());
     await trigger(rt.hooks, "session_start", { type: "session_start", reason: "startup" }, rt.ctx);
     await trigger(rt.hooks, "input", { cwd: dir, text: "make the change", source: "user" });
     await trigger(rt.hooks, "before_agent_start", { cwd: dir });
@@ -563,7 +564,7 @@ test("review-pause composes with primary off: exchanges still collect without a 
     });
 
     const rt = createPersistentToggleRuntime("conversation-a", sessionFile, dir);
-    await activate(rt.pi);
+    await activate(rt.pi, testActivation());
     await trigger(rt.hooks, "session_start", { type: "session_start", reason: "startup" }, rt.ctx);
     await rt.commands.get("review-pause")?.("", rt.pi);
 
@@ -601,7 +602,7 @@ test("primary off in execute mode: the shared primary reviewer set still gates m
     }, { operatingMode: "execute" });
 
     const rt = createToggleRuntime(dir);
-    await activate(rt.pi);
+    await activate(rt.pi, testActivation());
     await runTurn(rt, dir, "make the change", { name: "index.ts", content: "changed\n" });
 
     const invocationPath = join(dir, "reviewer-invocations.txt");

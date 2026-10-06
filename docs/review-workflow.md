@@ -39,6 +39,50 @@ without one there are no global excludes. Comparisons use the frozen after-check
 against separate window and exchange baselines; a checkpoint is not itself a passing
 review or a substitute for either baseline.
 
+### Non-Git checkpoint storage
+
+Non-Git checkpoint records are never written inside a workspace. Every record lives in
+the live Pi session's namespace under Pi's agent-data directory:
+`<agent dir>/sessions/pi-review-gate/<session id>/checkpoints/` (the agent directory
+is `~/.pi/agent` by default, following Pi's `PI_CODING_AGENT_DIR` semantics on every
+platform). This applies equally to persisted sessions and to in-memory sessions such
+as `--no-session`: review is not disabled because a session has no conversation file,
+and no conversation persistence or resumability is enabled for in-memory sessions. The
+location never depends on where the conversation file lives (including a conversation
+file inside the workspace), and Pi's conversation session-directory setting does not
+select it. Git workspaces keep their existing Git checkpoint storage unchanged.
+
+Each record is bound to the live session id, the canonical workspace, the review window,
+and a random owner generation. It is published atomically as a private file (POSIX mode
+`0600` in `0700` directories owned by the current user), and every publication flushes
+each directory entry it depends on, up to the agent directory's own entry, before use.
+Above the extension namespace, only a missing agent directory (when its parent exists)
+and its `sessions` directory are ever created; otherwise capture fails explicitly. Loading and release re-derive the expected location from the live
+session and the current workspace, never from a path stored in persisted state, and
+verify the digest, record schema, and binding before any use. A record of another
+session or workspace cannot be read, released, or treated as recoverable damage.
+Release removes only the verified owner generation; the session namespace, other
+workspaces' records, and unrelated or unverified content are never removed, and
+cleanup happens only at the existing release points (no extra retention or automatic
+garbage collection). Window baselines are retired only after a durable session-state
+save, so an in-memory session, which saves no state, keeps those records in its session
+namespace, just as they previously remained in the workspace.
+
+Because records are outside the workspace, delegated task capture never sees them or
+counts them against `maxSnapshotBytes`, and ordinary project files or directories named
+`.pi-review-gate` (top-level or nested) are captured and reviewed like any other
+content. Only the current record format is accepted: a persisted review window that
+references an earlier non-Git checkpoint format fails restore closed rather than being
+migrated. Records are located from the agent directory resolved when the session
+starts; if that directory changes between restarts, the earlier record is reported as
+damaged and review starts fresh from the current workspace.
+
+If the agent-data checkpoint location overlaps the workspace being captured (for
+example `PI_CODING_AGENT_DIR` inside the workspace, or a non-Git session started in an
+ancestor of the agent directory such as the home directory), non-Git checkpoint capture
+fails closed with an explicit unsupported-configuration error instead of writing
+records into the workspace or choosing another location.
+
 On Windows, synthetic checkpoint objects are flushed by Git at write time; this
 requires Git 2.36.0 or newer, and older versions fail closed. Git and non-Git
 checkpoint record files are also flushed, but a directory-handle fsync rejected

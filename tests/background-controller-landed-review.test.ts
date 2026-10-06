@@ -36,6 +36,10 @@ import { inspectOperation } from "../src/execution/operation-actions";
 import { readOperationRecord, writeOperationRecord } from "../src/execution/operation-record";
 import { activeExchangeBaseline, beginAgentRun, createState, ownedReviewCheckpointDescriptors, rememberUserRequest, setReviewWindowBaseline, setReviewWindowCheckpointBaseline, snapshotOfReviewBaseline, type ReviewGateState } from "../src/state";
 import { initGitRepo, waitFor, waitForAsync } from "./helpers/background-controller-fixtures";
+import { disposableAgentDir, testCheckpointScope } from "./checkpoint-scope-helpers";
+
+// #301: raw records live in this disposable agent dir's session namespace.
+const checkpointScope = testCheckpointScope(disposableAgentDir(), "landed-review-session");
 
 async function waitUntil(predicate: () => boolean | Promise<boolean>, what: string): Promise<void> {
   const deadline = Date.now() + 30_000;
@@ -115,7 +119,7 @@ async function armParentReviewWindow(
   root: string,
   config: ReviewGateConfig,
 ): Promise<{ state: ReviewGateState; baseline: WorkspaceSnapshot }> {
-  const state = createState();
+  const state = Object.assign(createState(), { checkpointScope });
   rememberUserRequest(state, "run subtasks while I keep editing the parent workspace");
   beginAgentRun(state);
   const baseline = await createWorkspaceSnapshot(root, {
@@ -727,10 +731,10 @@ test("an explicit foreign-target landing never enters the parent review window e
 async function checkpointDiff(state: ReviewGateState, root: string): Promise<string[]> {
   const baseline = activeExchangeBaseline(state);
   assert.equal(baseline?.kind, "checkpoint");
-  const current = await captureReviewCheckpoint(root, `test-current-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const current = await captureReviewCheckpoint(root, `test-current-${Date.now()}-${Math.random().toString(16).slice(2)}`, { scope: checkpointScope });
   assert.equal(current.status, "ok");
   if (baseline?.kind !== "checkpoint" || current.status !== "ok") throw new Error("missing checkpoint");
-  const compared = await compareReviewCheckpoints(root, baseline.descriptor, current.value);
+  const compared = await compareReviewCheckpoints(root, baseline.descriptor, current.value, { scope: checkpointScope });
   assert.equal(compared.status, "ok", JSON.stringify(compared));
   return compared.status === "ok" ? compared.value.changes.map((change) => change.path).sort() : [];
 }
@@ -746,10 +750,10 @@ for (const strategy of ["git", "raw"] as const) {
         { sentinel: "LANDED_CONTINUE", file: "continued.txt" },
       ]);
       const config = executionConfig(script);
-      const state = createState();
+      const state = Object.assign(createState(), { checkpointScope });
       rememberUserRequest(state, "land a subtask");
       beginAgentRun(state);
-      const armed = await captureReviewCheckpoint(root, `parent-${strategy}`);
+      const armed = await captureReviewCheckpoint(root, `parent-${strategy}`, { scope: checkpointScope });
       assert.equal(armed.status, "ok", JSON.stringify(armed));
       if (armed.status !== "ok") throw new Error("checkpoint arm failed");
       const old = armed.value;
@@ -757,7 +761,7 @@ for (const strategy of ["git", "raw"] as const) {
       // A response exchange can own a different checkpoint from the window;
       // advancing one must not silently substitute it for the other.
       if (strategy === "git") {
-        const exchange = await captureReviewCheckpoint(root, "parent-git-exchange");
+        const exchange = await captureReviewCheckpoint(root, "parent-git-exchange", { scope: checkpointScope });
         assert.equal(exchange.status, "ok");
         if (exchange.status !== "ok") throw new Error("exchange arm failed");
         state.reviewWindow!.activeExchange!.baseline = { kind: "checkpoint", descriptor: exchange.value, cwd: root, capturedAt: new Date().toISOString() };
@@ -775,14 +779,14 @@ for (const strategy of ["git", "raw"] as const) {
         assert.equal(exchangeBase?.kind, "checkpoint");
         if (windowBase?.kind !== "checkpoint" || exchangeBase?.kind !== "checkpoint") throw new Error("missing baseline");
         assert.notDeepEqual(windowBase.descriptor, exchangeBase.descriptor, "distinct owners stay distinct");
-        const now = await captureReviewCheckpoint(root, "parent-git-window-check");
+        const now = await captureReviewCheckpoint(root, "parent-git-window-check", { scope: checkpointScope });
         assert.equal(now.status, "ok");
         if (now.status !== "ok") throw new Error("check arm failed");
-        const diff = await compareReviewCheckpoints(root, windowBase.descriptor, now.value);
+        const diff = await compareReviewCheckpoints(root, windowBase.descriptor, now.value, { scope: checkpointScope });
         assert.equal(diff.status, "ok");
         if (diff.status === "ok") assert.deepEqual(diff.value.changes.map((item) => item.path), ["parent.txt"]);
       }
-      assert.equal((await loadReviewCheckpoint(root, old)).status, "ok", "the old owner stays pinned until its durable sidecar can be retired");
+      assert.equal((await loadReviewCheckpoint(root, old, { scope: checkpointScope })).status, "ok", "the old owner stays pinned until its durable sidecar can be retired");
       await waitForAsync(async () => {
         try {
           await controller!.continueTask({ executionId: started.executionId, taskId, instructions: "LANDED_CONTINUE", instructionId: "checkpoint-continue", actor: "user" });
@@ -812,17 +816,17 @@ for (const strategy of ["git", "raw"] as const) {
         const sessionFile = join(root, "conversation.jsonl");
         await writeFile(sessionFile, "");
         const config = executionConfig(script);
-        const state = createState();
+        const state = Object.assign(createState(), { checkpointScope });
         rememberUserRequest(state, "land work with durable parent checkpoint");
         beginAgentRun(state);
-        const captured = await captureReviewCheckpoint(root, `old-${strategy}`);
+        const captured = await captureReviewCheckpoint(root, `old-${strategy}`, { scope: checkpointScope });
         assert.equal(captured.status, "ok");
         if (captured.status !== "ok") throw new Error("capture failed");
         const old = captured.value;
         setReviewWindowCheckpointBaseline(state, { kind: "checkpoint", descriptor: old, cwd: root, capturedAt: new Date().toISOString() });
         let exchangeOld = old;
         if (distinct) {
-          const exchange = await captureReviewCheckpoint(root, `exchange-${strategy}`);
+          const exchange = await captureReviewCheckpoint(root, `exchange-${strategy}`, { scope: checkpointScope });
           assert.equal(exchange.status, "ok");
           if (exchange.status !== "ok") throw new Error("exchange capture failed");
           exchangeOld = exchange.value;
@@ -839,11 +843,11 @@ for (const strategy of ["git", "raw"] as const) {
             if (state.reviewWindow?.baseline?.kind === "checkpoint" && state.reviewWindow.baseline.descriptor !== old) {
               // Both old owners are still readable before AND after the real
               // sidecar write: release must follow the acknowledgement.
-              assert.equal((await loadReviewCheckpoint(root, old)).status, "ok");
-              assert.equal((await loadReviewCheckpoint(root, exchangeOld)).status, "ok");
+              assert.equal((await loadReviewCheckpoint(root, old, { scope: checkpointScope })).status, "ok");
+              assert.equal((await loadReviewCheckpoint(root, exchangeOld, { scope: checkpointScope })).status, "ok");
               const saved = await store.save(state, associations, config);
-              assert.equal((await loadReviewCheckpoint(root, old)).status, "ok");
-              assert.equal((await loadReviewCheckpoint(root, exchangeOld)).status, "ok");
+              assert.equal((await loadReviewCheckpoint(root, old, { scope: checkpointScope })).status, "ok");
+              assert.equal((await loadReviewCheckpoint(root, exchangeOld, { scope: checkpointScope })).status, "ok");
               replacementsSaved += 1;
               return saved;
             }
@@ -853,17 +857,17 @@ for (const strategy of ["git", "raw"] as const) {
         const started = await controller.start([task("owner landing", "OWNER_LANDING")]);
         await waitFor(() => controller!.inspect(started.executionId).tasks[0]?.state === "landed", 30_000);
         assert.ok(replacementsSaved > 0, "the replacement was durably saved");
-        const restored = await store.restore(root);
+        const restored = await store.restore(root, checkpointScope);
         assert.ok(restored?.state.reviewWindow?.baseline);
         assert.deepEqual(restored.state.reviewWindow.baseline, state.reviewWindow!.baseline);
         assert.deepEqual(restored.state.reviewWindow.activeExchange?.baseline, state.reviewWindow!.activeExchange!.baseline);
         const restoredBaseline = restored.state.reviewWindow.baseline;
         assert.equal(restoredBaseline?.kind, "checkpoint");
         if (restoredBaseline?.kind !== "checkpoint") throw new Error("restored checkpoint missing");
-        assert.equal((await loadReviewCheckpoint(root, restoredBaseline.descriptor)).status, "ok");
-        assert.equal((await loadReviewCheckpoint(root, old)).status, distinct ? "ok" : "failed",
+        assert.equal((await loadReviewCheckpoint(root, restoredBaseline.descriptor, { scope: checkpointScope })).status, "ok");
+        assert.equal((await loadReviewCheckpoint(root, old, { scope: checkpointScope })).status, distinct ? "ok" : "failed",
           "a shared owner is retired once, a last-question owner stays reachable");
-        assert.equal((await loadReviewCheckpoint(root, exchangeOld)).status, "failed",
+        assert.equal((await loadReviewCheckpoint(root, exchangeOld, { scope: checkpointScope })).status, "failed",
           "a distinct superseded exchange owner is retired after the save");
         assert.deepEqual(await checkpointDiff(state, root), ["conversation.jsonl.pi-review-gate-state.json"],
           "the session sidecar is parent-owned and never selectively checkpointed as worker content");
@@ -884,10 +888,10 @@ for (const strategy of ["git", "raw"] as const) {
         const sessionFile = join(root, "conversation.jsonl");
         await writeFile(sessionFile, "");
         const config = executionConfig(script);
-        const state = createState();
+        const state = Object.assign(createState(), { checkpointScope });
         rememberUserRequest(state, "land work without durable replacement");
         beginAgentRun(state);
-        const captured = await captureReviewCheckpoint(root, `unsaved-old-${strategy}`);
+        const captured = await captureReviewCheckpoint(root, `unsaved-old-${strategy}`, { scope: checkpointScope });
         assert.equal(captured.status, "ok");
         if (captured.status !== "ok") throw new Error("capture failed");
         const old = captured.value;
@@ -911,10 +915,10 @@ for (const strategy of ["git", "raw"] as const) {
         assert.equal(newWindow?.kind, "checkpoint");
         assert.equal(newExchange?.kind, "checkpoint");
         if (newWindow?.kind !== "checkpoint" || newExchange?.kind !== "checkpoint") throw new Error("new checkpoint missing");
-        assert.equal((await loadReviewCheckpoint(root, old)).status, "ok", "old sidecar can still restore");
-        assert.equal((await loadReviewCheckpoint(root, newWindow.descriptor)).status, "ok", "new window retained for later save");
-        assert.equal((await loadReviewCheckpoint(root, newExchange.descriptor)).status, "ok", "new exchange retained for later save");
-        const restored = await store.restore(root);
+        assert.equal((await loadReviewCheckpoint(root, old, { scope: checkpointScope })).status, "ok", "old sidecar can still restore");
+        assert.equal((await loadReviewCheckpoint(root, newWindow.descriptor, { scope: checkpointScope })).status, "ok", "new window retained for later save");
+        assert.equal((await loadReviewCheckpoint(root, newExchange.descriptor, { scope: checkpointScope })).status, "ok", "new exchange retained for later save");
+        const restored = await store.restore(root, checkpointScope);
         assert.deepEqual(restored?.state.reviewWindow?.baseline?.kind === "checkpoint"
           ? restored.state.reviewWindow.baseline.descriptor : undefined, old, "restart recovers the last durable owner");
       } finally {
@@ -947,17 +951,17 @@ for (const strategy of ["git"] as const) {
         const sessionFile = join(root, "conversation.jsonl");
         await writeFile(sessionFile, "");
         const config = executionConfig(script);
-        const state = createState();
+        const state = Object.assign(createState(), { checkpointScope });
         rememberUserRequest(state, "land with a session-owned save and retirement");
         beginAgentRun(state);
-        const captured = await captureReviewCheckpoint(root, `receipt-${strategy}`);
+        const captured = await captureReviewCheckpoint(root, `receipt-${strategy}`, { scope: checkpointScope });
         assert.equal(captured.status, "ok");
         if (captured.status !== "ok") throw new Error("capture failed");
         const old = captured.value;
         setReviewWindowCheckpointBaseline(state, { kind: "checkpoint", descriptor: old, cwd: root, capturedAt: new Date().toISOString() });
         let exchangeOld = old;
         if (distinct) {
-          const exchange = await captureReviewCheckpoint(root, `receipt-exchange-${strategy}`);
+          const exchange = await captureReviewCheckpoint(root, `receipt-exchange-${strategy}`, { scope: checkpointScope });
           assert.equal(exchange.status, "ok");
           if (exchange.status !== "ok") throw new Error("exchange capture failed");
           exchangeOld = exchange.value;
@@ -983,12 +987,12 @@ for (const strategy of ["git"] as const) {
             // from ALL live windows, including lastQuestionWindow.
             const live = ownedReviewCheckpointDescriptors(state).some(({ descriptor }) => descriptor === old);
             if (!live && !retired.has(old)) {
-              assert.equal((await checkpointModule.releaseReviewCheckpoint(root, old)).status, "ok");
+              assert.equal((await checkpointModule.releaseReviewCheckpoint(root, old, { scope: checkpointScope })).status, "ok");
               retired.add(old);
             }
             if (exchangeOld !== old && !retired.has(exchangeOld)
               && !ownedReviewCheckpointDescriptors(state).some(({ descriptor }) => descriptor === exchangeOld)) {
-              assert.equal((await checkpointModule.releaseReviewCheckpoint(root, exchangeOld)).status, "ok");
+              assert.equal((await checkpointModule.releaseReviewCheckpoint(root, exchangeOld, { scope: checkpointScope })).status, "ok");
               retired.add(exchangeOld);
             }
             return true;
@@ -1005,13 +1009,13 @@ for (const strategy of ["git"] as const) {
         assert.equal(notices.some((message) => /Parent checkpoint owners retained/.test(message)), false);
         assert.equal(releases.get(JSON.stringify(old)) ?? 0, distinct ? 0 : 1, "shared superseded owner released exactly once");
         if (distinct) assert.equal(releases.get(JSON.stringify(exchangeOld)), 1, "distinct superseded exchange released exactly once");
-        assert.equal((await loadReviewCheckpoint(root, old)).status, distinct ? "ok" : "failed");
-        if (distinct) assert.equal((await loadReviewCheckpoint(root, exchangeOld)).status, "failed");
-        const restored = await store.restore(root);
+        assert.equal((await loadReviewCheckpoint(root, old, { scope: checkpointScope })).status, distinct ? "ok" : "failed");
+        if (distinct) assert.equal((await loadReviewCheckpoint(root, exchangeOld, { scope: checkpointScope })).status, "failed");
+        const restored = await store.restore(root, checkpointScope);
         assert.deepEqual(restored?.state.reviewWindow?.baseline, state.reviewWindow?.baseline);
         assert.deepEqual(restored?.state.reviewWindow?.activeExchange?.baseline, state.reviewWindow?.activeExchange?.baseline);
         for (const owner of ownedReviewCheckpointDescriptors(restored!.state)) {
-          assert.equal((await loadReviewCheckpoint(owner.cwd, owner.descriptor)).status, "ok", "every persisted owner remains restorable");
+          assert.equal((await loadReviewCheckpoint(owner.cwd, owner.descriptor, { scope: checkpointScope })).status, "ok", "every persisted owner remains restorable");
         }
       } finally {
         checkpointModule.releaseReviewCheckpoint = originalRelease;
@@ -1030,10 +1034,10 @@ test("active Git checkpoint advances only clean applied paths at conflict and se
     const script = await writeLandingExecutorScript(root, [{ sentinel: "LANDED_CONFLICT", file: "applied.txt", worktreeShared: "worker a\n",
       targetShared: join(root, "shared.txt"), targetSharedContent: "user a\n" }]);
     const config = executionConfig(script);
-    const state = createState();
+    const state = Object.assign(createState(), { checkpointScope });
     rememberUserRequest(state, "land a conflicting subtask");
     beginAgentRun(state);
-    const armed = await captureReviewCheckpoint(root, "conflict-parent");
+    const armed = await captureReviewCheckpoint(root, "conflict-parent", { scope: checkpointScope });
     assert.equal(armed.status, "ok");
     if (armed.status !== "ok") throw new Error("checkpoint arm failed");
     setReviewWindowCheckpointBaseline(state, { kind: "checkpoint", descriptor: armed.value, cwd: root, capturedAt: new Date().toISOString() });
@@ -1069,10 +1073,10 @@ test("force-merge with an active parent checkpoint keeps unrelated edits anchore
       execution: { maxWorkers: 1, workerResources: { default: { selection: { source: "external", id: "force-fake" }, maxConcurrent: 1 } },
         routes: { execute: [{ resourceId: "default" }], research: [] } }, retainBundles: "always",
     });
-    const state = createState();
+    const state = Object.assign(createState(), { checkpointScope });
     rememberUserRequest(state, "force land work");
     beginAgentRun(state);
-    const armed = await captureReviewCheckpoint(root, "force-parent");
+    const armed = await captureReviewCheckpoint(root, "force-parent", { scope: checkpointScope });
     assert.equal(armed.status, "ok");
     if (armed.status !== "ok") throw new Error("checkpoint arm failed");
     setReviewWindowCheckpointBaseline(state, { kind: "checkpoint", descriptor: armed.value, cwd: root, capturedAt: new Date().toISOString() });
@@ -1114,11 +1118,11 @@ for (const strategy of ["git", "raw"] as const) {
         "clearInterval(timer);console.log(JSON.stringify({type:'assistant',text:'done'}));},20);});",
       ].join("\n"));
       const config = executionConfig(script, {}, { passingReviewer: true });
-      const state = createState();
+      const state = Object.assign(createState(), { checkpointScope });
       rememberUserRequest(state, "keep parent edits reviewable during worker execution");
       beginAgentRun(state);
-      const windowOld = await captureReviewCheckpoint(root, `running-${strategy}-window`);
-      const exchangeOld = await captureReviewCheckpoint(root, `running-${strategy}-exchange`);
+      const windowOld = await captureReviewCheckpoint(root, `running-${strategy}-window`, { scope: checkpointScope });
+      const exchangeOld = await captureReviewCheckpoint(root, `running-${strategy}-exchange`, { scope: checkpointScope });
       assert.equal(windowOld.status, "ok");
       assert.equal(exchangeOld.status, "ok");
       if (windowOld.status !== "ok" || exchangeOld.status !== "ok") throw new Error("checkpoint capture failed");
@@ -1141,10 +1145,10 @@ for (const strategy of ["git", "raw"] as const) {
       for (const [owner, baseline] of [state.reviewWindow!.baseline, state.reviewWindow!.activeExchange!.baseline].entries()) {
         assert.equal(baseline?.kind, "checkpoint");
         if (baseline?.kind !== "checkpoint") throw new Error("missing owner");
-        const now = await captureReviewCheckpoint(root, `running-${strategy}-current-${owner}`);
+        const now = await captureReviewCheckpoint(root, `running-${strategy}-current-${owner}`, { scope: checkpointScope });
         assert.equal(now.status, "ok", JSON.stringify(now));
         if (now.status !== "ok") throw new Error("current checkpoint missing");
-        const diff = await compareReviewCheckpoints(root, baseline.descriptor, now.value);
+        const diff = await compareReviewCheckpoints(root, baseline.descriptor, now.value, { scope: checkpointScope });
         assert.equal(diff.status, "ok");
         if (diff.status === "ok") assert.deepEqual(diff.value.changes.map((change) => change.path), ["shared.txt"],
           "the combined parent/worker path stays reviewable while independent reviewed work advances");
@@ -1165,10 +1169,10 @@ for (const strategy of ["git", "raw"] as const) {
         { sentinel: "LANDED_OVERLAP", file: "applied.txt", worktreeShared: "parent first\nworker second\n" },
       ]);
       const config = executionConfig(script);
-      const state = createState();
+      const state = Object.assign(createState(), { checkpointScope });
       rememberUserRequest(state, "land worker work while I edit");
       beginAgentRun(state);
-      const armed = await captureReviewCheckpoint(root, "overlap-parent");
+      const armed = await captureReviewCheckpoint(root, "overlap-parent", { scope: checkpointScope });
       assert.equal(armed.status, "ok");
       if (armed.status !== "ok") throw new Error("checkpoint arm failed");
       setReviewWindowCheckpointBaseline(state, { kind: "checkpoint", descriptor: armed.value, cwd: root, capturedAt: new Date().toISOString() });
@@ -1190,22 +1194,22 @@ test("raw selective advancement never reads or caps an oversized unselected new 
   const root = await mkdtemp(join(tmpdir(), "pi-review-raw-selective-"));
   try {
     await writeFile(join(root, "selected.txt"), "old\n");
-    const armed = await captureReviewCheckpoint(root, "raw-base");
+    const armed = await captureReviewCheckpoint(root, "raw-base", { scope: checkpointScope });
     assert.equal(armed.status, "ok");
     if (armed.status !== "ok" || armed.value.kind !== "raw") throw new Error("raw checkpoint arm failed");
     await writeFile(join(root, "selected.txt"), "landed\n");
     const huge = await open(join(root, "unselected.dat"), "w");
     try { await huge.truncate(512 * 1024 * 1024 + 1); } finally { await huge.close(); }
-    const advanced = await advanceRawReviewCheckpoint(root, armed.value, ["selected.txt"], "raw-advanced");
+    const advanced = await advanceRawReviewCheckpoint(root, armed.value, ["selected.txt"], "raw-advanced", { scope: checkpointScope });
     assert.equal(advanced.status, "ok", JSON.stringify(advanced));
     if (advanced.status !== "ok") return;
-    const loaded = await loadReviewCheckpoint(root, advanced.value);
+    const loaded = await loadReviewCheckpoint(root, advanced.value, { scope: checkpointScope });
     assert.equal(loaded.status, "ok");
     if (loaded.status === "ok" && loaded.value.kind === "raw") {
       assert.deepEqual(loaded.value.entries.map((entry) => entry.path), ["selected.txt"]);
       assert.equal(Buffer.from(loaded.value.entries[0]!.contentB64!, "base64").toString(), "landed\n");
     }
-    assert.equal((await loadReviewCheckpoint(root, armed.value)).status, "ok", "old owner stays intact");
+    assert.equal((await loadReviewCheckpoint(root, armed.value, { scope: checkpointScope })).status, "ok", "old owner stays intact");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

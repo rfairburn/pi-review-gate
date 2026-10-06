@@ -14,6 +14,10 @@ import { armGitCheckpoint, type GitCheckpointDescriptor } from "../src/git-check
 import { collectPausedReviewExchange, runAskReviewer, runReview } from "../src/review";
 import { beginAgentRun, createState, recordReviewerFeedbackAndArmExchange, type ReviewBaseline } from "../src/state";
 import { fakeNeedsChangesConfig } from "./helpers";
+import { disposableAgentDir, testCheckpointScope } from "./checkpoint-scope-helpers";
+
+// #301: raw records live in this disposable agent dir's session namespace.
+const checkpointScope = testCheckpointScope(disposableAgentDir(), "git-baseline-session");
 
 const execFileAsync = promisify(execFile);
 
@@ -66,21 +70,21 @@ test("raw parent checkpoint reviews changed binary and mode without a workspace 
     await writeFile(join(root, "clean.txt"), "unchanged\n");
     await writeFile(join(root, "binary.bin"), Buffer.from([0, 255, 1]));
     await writeFile(join(root, "mode.txt"), "same text\n");
-    const captured = await captureReviewCheckpoint(root, "raw-parent");
+    const captured = await captureReviewCheckpoint(root, "raw-parent", { scope: checkpointScope });
     assert.equal(captured.status, "ok", JSON.stringify(captured));
     if (captured.status !== "ok") return;
     assert.equal(captured.value.kind, "raw");
     const before: ReviewBaseline = { kind: "checkpoint", descriptor: captured.value, cwd: root, capturedAt: new Date().toISOString() };
     await writeFile(join(root, "binary.bin"), Buffer.from([0, 254, 1]));
     await chmod(join(root, "mode.txt"), 0o755);
-    const output = await runReview({ cwd: root, request: "change binary and mode", before, config });
+    const output = await runReview({ cwd: root, request: "change binary and mode", before, config, checkpointScope });
     assert.equal(output.result?.verdict, "needs_changes");
     assert.equal(output.reviewedBaseline?.kind, "checkpoint");
     assert.deepEqual(output.changes.map((change) => change.path).sort(), ["binary.bin", "mode.txt"]);
     assert.equal(output.changes.find((change) => change.path === "binary.bin")?.binary, true);
     assert.equal(output.changes.find((change) => change.path === "mode.txt")?.newGitMode, "100755");
     if (output.reviewedBaseline?.kind === "checkpoint") {
-      assert.equal((await loadReviewCheckpoint(root, output.reviewedBaseline.descriptor)).status, "ok");
+      assert.equal((await loadReviewCheckpoint(root, output.reviewedBaseline.descriptor, { scope: checkpointScope })).status, "ok");
     }
   } finally { await rm(root, { recursive: true, force: true }); }
 });
@@ -91,7 +95,7 @@ test("Git-ignored in-root evidence remains reviewable using its pre-checkpoint f
     await git(repo, "add", ".gitignore");
     await git(repo, "commit", "-q", "-m", "ignore candidate");
     await writeFile(join(repo, "ignored.txt"), "before\n");
-    const captured = await captureReviewCheckpoint(repo, "ignored-candidate");
+    const captured = await captureReviewCheckpoint(repo, "ignored-candidate", { scope: checkpointScope });
     assert.equal(captured.status, "ok", JSON.stringify(captured));
     if (captured.status !== "ok") return;
     const evidence = createEvidenceState();
@@ -121,7 +125,7 @@ test("nested Git-ignored evidence deletion reports a repository-root-relative pa
     await git(repo, "add", ".");
     await git(repo, "commit", "-qm", "base");
     await writeFile(join(repo, "ignored.txt"), "before\n");
-    const captured = await captureReviewCheckpoint(cwd, "nested-ignored-deletion");
+    const captured = await captureReviewCheckpoint(cwd, "nested-ignored-deletion", { scope: checkpointScope });
     assert.equal(captured.status, "ok", JSON.stringify(captured));
     if (captured.status !== "ok") return;
 
@@ -149,7 +153,7 @@ test("/review-continue captures a repository-root checkpoint while preserving ne
     await writeFile(join(repo, "baseline.txt"), "base\n");
     await git(repo, "add", "baseline.txt");
     await git(repo, "commit", "-qm", "base");
-    const state = createState();
+    const state = Object.assign(createState(), { checkpointScope });
     beginAgentRun(state);
     const window = state.reviewWindow!;
     window.lastCappedFollowUp = "capped feedback";
@@ -168,15 +172,15 @@ test("/review-continue captures a repository-root checkpoint while preserving ne
     if (response?.kind !== "checkpoint") throw new Error("missing response checkpoint");
     assert.equal(response.cwd, cwd);
     assert.equal(response.descriptor.kind, "git");
-    assert.equal((await loadReviewCheckpoint(cwd, response.descriptor)).status, "ok");
-    assert.equal((await releaseReviewCheckpoint(cwd, response.descriptor)).status, "ok");
+    assert.equal((await loadReviewCheckpoint(cwd, response.descriptor, { scope: checkpointScope })).status, "ok");
+    assert.equal((await releaseReviewCheckpoint(cwd, response.descriptor, { scope: checkpointScope })).status, "ok");
   } finally { await rm(repo, { recursive: true, force: true }); }
 });
 
 test("/review-continue capture failure preserves capped authorization for retry", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-continue-capture-"));
   try {
-    const state = createState();
+    const state = Object.assign(createState(), { checkpointScope });
     beginAgentRun(state);
     const window = state.reviewWindow!;
     window.lastCappedFollowUp = "original capped feedback";
@@ -196,10 +200,10 @@ test("/review-continue capture failure preserves capped authorization for retry"
 test("/review-now retains completed checkpoint when changes-requested notice fails", async () => {
   const repo = await initRepo();
   try {
-    const captured = await captureReviewCheckpoint(repo, "manual-notice-baseline");
+    const captured = await captureReviewCheckpoint(repo, "manual-notice-baseline", { scope: checkpointScope });
     assert.equal(captured.status, "ok", JSON.stringify(captured));
     if (captured.status !== "ok") return;
-    const state = createState();
+    const state = Object.assign(createState(), { checkpointScope });
     beginAgentRun(state);
     const window = state.reviewWindow!;
     const baseline: ReviewBaseline = { kind: "checkpoint", descriptor: captured.value, cwd: repo, capturedAt: new Date().toISOString() };
@@ -220,10 +224,10 @@ test("/review-now retains completed checkpoint when changes-requested notice fai
 test("/review-continue retains its newly referenced capture when persistence fails", async () => {
   const repo = await initRepo();
   try {
-    const captured = await captureReviewCheckpoint(repo, "continue-baseline");
+    const captured = await captureReviewCheckpoint(repo, "continue-baseline", { scope: checkpointScope });
     assert.equal(captured.status, "ok", JSON.stringify(captured));
     if (captured.status !== "ok") return;
-    const state = createState();
+    const state = Object.assign(createState(), { checkpointScope });
     beginAgentRun(state);
     const window = state.reviewWindow!;
     const baseline: ReviewBaseline = { kind: "checkpoint", descriptor: captured.value, cwd: repo, capturedAt: new Date().toISOString() };
@@ -245,12 +249,12 @@ test("/review-continue retains its newly referenced capture when persistence fai
 test("/review-continue rebases an existing response exchange while retaining the old pin without durable acknowledgement", async () => {
   const repo = await initRepo();
   try {
-    const first = await captureReviewCheckpoint(repo, "continue-window");
-    const old = await captureReviewCheckpoint(repo, "continue-previous-response");
+    const first = await captureReviewCheckpoint(repo, "continue-window", { scope: checkpointScope });
+    const old = await captureReviewCheckpoint(repo, "continue-previous-response", { scope: checkpointScope });
     assert.equal(first.status, "ok", JSON.stringify(first));
     assert.equal(old.status, "ok", JSON.stringify(old));
     if (first.status !== "ok" || old.status !== "ok") return;
-    const state = createState();
+    const state = Object.assign(createState(), { checkpointScope });
     beginAgentRun(state);
     const window = state.reviewWindow!;
     const windowBaseline: ReviewBaseline = { kind: "checkpoint", descriptor: first.value, cwd: repo, capturedAt: new Date().toISOString() };
@@ -295,7 +299,7 @@ test("/review-continue rebases an existing response exchange while retaining the
 test("unified Git checkpoint baseline settles without a workspace snapshot", async () => {
   const repo = await initRepo();
   try {
-    const captured = await captureReviewCheckpoint(repo, "unified-git-parent");
+    const captured = await captureReviewCheckpoint(repo, "unified-git-parent", { scope: checkpointScope });
     assert.equal(captured.status, "ok", JSON.stringify(captured));
     if (captured.status !== "ok") return;
     assert.equal(captured.value.kind, "git");
@@ -370,7 +374,7 @@ test("distinct Git window and exchange baselines compare against the same frozen
     assert.equal((await stat(join(repo, "a.txt"))).mtimeMs, cached.mtimeMs);
     const descB = await armAt(repo, "w-b");
 
-    const state = createState();
+    const state = Object.assign(createState(), { checkpointScope });
     beginAgentRun(state);
     const window = state.reviewWindow!;
     window.baseline = baselineOf(descA, repo);
@@ -523,7 +527,7 @@ test("collectPausedReviewExchange settles a Git exchange baseline and releases i
   try {
     const before = await armAt(repo, "w-paused");
 
-    const state = createState();
+    const state = Object.assign(createState(), { checkpointScope });
     beginAgentRun(state);
     const window = state.reviewWindow!;
     window.baseline = baselineOf(before, repo);
@@ -626,7 +630,7 @@ test("paused exchange settle failure releases the ephemeral after pin", async ()
   try {
     const before = await armAt(repo, "w-paused-fail");
 
-    const state = createState();
+    const state = Object.assign(createState(), { checkpointScope });
     beginAgentRun(state);
     const window = state.reviewWindow!;
     window.baseline = baselineOf(before, repo);
@@ -660,7 +664,7 @@ test("a completed Git pass transfers after-baseline ownership to the response ex
     const before = await armAt(repo, "w-handoff");
     await writeFile(join(repo, "index.ts"), "after\n");
 
-    const state = createState();
+    const state = Object.assign(createState(), { checkpointScope });
     beginAgentRun(state);
     const window = state.reviewWindow!;
     window.baseline = baselineOf(before, repo);

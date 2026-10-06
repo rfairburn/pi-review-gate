@@ -192,6 +192,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
       try {
         output = await runReview({
           cwd: input.cwd(),
+          checkpointScope: input.state.checkpointScope,
           request: buildRequestContext(input.state) || "Manual /review-now request",
           before,
           config: reviewConfig,
@@ -301,7 +302,8 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
       const followUp = window.lastCappedFollowUp;
       const reviewConfig = window.reviewConfig ?? currentConfig();
-      const captured = await captureReviewCheckpoint(input.cwd(), randomUUID());
+      const scope = { scope: input.state.checkpointScope };
+      const captured = await captureReviewCheckpoint(input.cwd(), randomUUID(), scope);
       if (captured.status !== "ok") throw new Error(`review gate: response checkpoint failed (${captured.reason}): ${captured.detail}`);
       const responseBaseline = { kind: "checkpoint" as const, descriptor: captured.value, cwd: input.cwd(), capturedAt: new Date().toISOString() };
       const oldCycles = window.correctionCycles;
@@ -321,7 +323,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
           if (feedback) feedback.disposition = "sent_at_cap";
           window.lastCappedFollowUp = followUp;
           window.correctionCycles = oldCycles;
-          const released = await releaseReviewCheckpoint(input.cwd(), captured.value);
+          const released = await releaseReviewCheckpoint(input.cwd(), captured.value, scope);
           if (released.status !== "ok") throw new Error(`review gate: response arming failed; orphan release failed (${released.reason}): ${released.detail}`);
         }
         throw error;
@@ -330,13 +332,13 @@ export function registerCommands(input: RegisterCommandsInput): void {
         await input.onStateChanged?.();
       } catch (error) {
         if (window.activeExchange?.baseline !== responseBaseline) {
-          const unused = await releaseReviewCheckpoint(input.cwd(), captured.value);
+          const unused = await releaseReviewCheckpoint(input.cwd(), captured.value, scope);
           if (unused.status !== "ok") throw new Error(`review gate: unused response checkpoint cleanup failed (${unused.reason}): ${unused.detail}`);
         }
         throw error;
       }
       if (window.activeExchange?.baseline !== responseBaseline) {
-        const unused = await releaseReviewCheckpoint(input.cwd(), captured.value);
+        const unused = await releaseReviewCheckpoint(input.cwd(), captured.value, scope);
         if (unused.status !== "ok") throw new Error(`review gate: unused response checkpoint release failed (${unused.reason}): ${unused.detail}`);
       }
       await sendCommandNotice(ctx, `review gate: continuing review; correction budget reset to ${reviewConfig.maxCorrectionCycles}`);
@@ -396,6 +398,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
       try {
         output = await runAskReviewer({
           cwd: input.cwd(),
+          checkpointScope: input.state.checkpointScope,
           question,
           request: buildRequestContext(input.state, contextWindow),
           // #193 slice D: pass the typed baseline through; a Git checkpoint

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,6 +11,8 @@ import type { BackgroundExecutionGroup, BackgroundTaskRecord } from "../src/exec
 import { normalizeConfig } from "../src/config";
 import { createState } from "../src/state";
 import { sourceMutationCoordinator } from "../src/execution/source-mutation-lease";
+import { operationOwnershipStatus, operationRecordPath, readOperationRecord } from "../src/execution/operation-record";
+import { denyProcessGroupSignals, mockRootPid, readMockEvents, writeMockClaudeCli } from "./helpers/claude-mock-cli";
 import {
   initGitRepo,
   setupFaultScenario,
@@ -664,3 +666,143 @@ workerResources: { "default": { selection: { source: "external", id: "predispatc
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// #310: an explicit interrupt whose owned Claude shutdown cannot be verified
+// must never become a durable acknowledgement, a quiescence claim, a
+// cancellation checkpoint, or an interrupt-with-merge landing. The real
+// controller, recovery loop, Claude adapter, and installed Agent SDK drive an
+// owned local mock CLI; the operating system's refusal (EPERM) of group-wide
+// signals and probes is injected for that CLI's process group only.
+test("interrupt_with_merge never acknowledges or merges a Claude writer whose owned shutdown is unverified (#310)", { skip: process.platform === "win32" }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-background-claude-310-"));
+  const scratch = await mkdtemp(join(tmpdir(), "pi-review-background-claude-310-cli-"));
+  const marker = join(scratch, "events.log");
+  const blocked = new Set<number>();
+  const restoreKill = denyProcessGroupSignals(blocked);
+  let rootPid: number | undefined;
+  let controller: BackgroundExecutionController | undefined;
+  try {
+    await initGitRepo(root);
+    const cli = await writeMockClaudeCli(scratch);
+    const config = normalizeConfig({
+      enabled: true,
+      review: { activeReviewers: [] },
+      externalAgents: {
+        "claude-mock": { adapter: "claude-cli", command: cli, env: { CLAUDE_MOCK_MARKER: marker }, execution: { model: "mock-model" } },
+      },
+      execution: {
+        maxWorkers: 1,
+        workerResources: { "default": { selection: { source: "external", id: "claude-mock" }, maxConcurrent: 1 } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
+      },
+      retainBundles: "always",
+    });
+    controller = new BackgroundExecutionController({ config, state: createState(), cwd: () => root, pi: {} });
+    const started = await controller.start([{ title: "unverified shutdown", instructions: "work", acceptanceCriteria: ["none"] }]);
+    const taskId = started.tasks[0]!.taskId;
+    const internals = controller as unknown as {
+      runtimes: Map<string, { control?: { capabilities: { interrupt: boolean } } }>;
+      groups: Map<string, BackgroundExecutionGroup>;
+    };
+    await waitForAsync(async () => (await readMockEvents(marker)).includes("user:1"));
+    await waitFor(() => internals.runtimes.get(taskId)?.control?.capabilities.interrupt === true);
+    rootPid = mockRootPid(await readMockEvents(marker));
+    assert.ok(rootPid !== undefined);
+    blocked.add(rootPid);
+    const task = internals.groups.get(started.executionId)!.tasks.find((candidate) => candidate.taskId === taskId)!;
+    const persistedCommand = async () => {
+      const snapshot = JSON.parse(await readFile(join(started.root, "execution.json"), "utf8")) as unknown;
+      return findByInstructionId(snapshot, "interrupt-310");
+    };
+
+    const interrupting = controller.interrupt({
+      executionId: started.executionId,
+      taskId,
+      mode: "interrupt_with_merge",
+      instructionId: "interrupt-310",
+      actor: "user",
+    });
+    // While the adapter is still trying to verify shutdown, neither memory nor
+    // persistence may show an acknowledgement.
+    await waitForAsync(async () => (await readMockEvents(marker)).includes("control:interrupt"));
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_000));
+    const pendingCommand = task.commands.find((command) => command.instructionId === "interrupt-310")!;
+    assert.equal(pendingCommand.status, "delivered");
+    assert.equal(pendingCommand.acknowledgedAt, undefined);
+    const pendingPersisted = await persistedCommand();
+    assert.notEqual(pendingPersisted?.status, "acknowledged");
+    assert.equal(pendingPersisted?.acknowledgedAt, undefined);
+
+    const settled = await interrupting;
+    const command = task.commands.find((candidate) => candidate.instructionId === "interrupt-310")!;
+    assert.equal(command.status, "failed");
+    assert.equal(command.acknowledgedAt, undefined);
+    assert.match(command.error ?? "", /Writer quiescence was not verified/);
+    const persisted = await persistedCommand();
+    assert.equal(persisted?.status, "failed");
+    assert.equal(persisted?.acknowledgedAt, undefined);
+    const settledTask = settled.tasks[0]!;
+    assert.match(settledTask.summary ?? "", /Writer quiescence was not verified/);
+    assert.doesNotMatch(settledTask.summary ?? "", /quiesced\.|acknowledged interrupt/i);
+    assert.equal(task.activity?.some((event) => /Writer quiesced/.test(event.message)), false);
+    // No interrupt-with-merge landing was attempted.
+    assert.equal(task.commands.some((candidate) => candidate.instructionId === "interrupt-310-force-merge"), false);
+    assert.equal(settledTask.state === "landed", false);
+
+    // The operation keeps the possibly live writer's ownership and records why.
+    const artifactDir = join(settledTask.waveRoot!, "artifacts", taskId);
+    const operation = await readOperationRecord(operationRecordPath(artifactDir));
+    assert.equal(operation.state, "failed_critical");
+    assert.equal(operation.checkpoint, undefined);
+    assert.equal(operation.incidents.at(-1)?.stage, "executor_shutdown");
+    assert.equal(operation.owner?.status, "active");
+    assert.equal(operation.owner?.childExitedAt, undefined);
+    assert.equal(operationOwnershipStatus(operation).processAlive, true);
+    const processResults = await findFiles(artifactDir, "process-result.json");
+    assert.ok(processResults.length > 0);
+    const terminationErrors = await Promise.all(processResults.map(async (path) =>
+      (JSON.parse(await readFile(path, "utf8")) as { terminationError?: string }).terminationError));
+    assert.ok(terminationErrors.some((value) => /EPERM/.test(value ?? "")));
+  } finally {
+    restoreKill();
+    if (rootPid !== undefined) {
+      try {
+        process.kill(-rootPid, "SIGKILL");
+      } catch {
+        // Already gone (ESRCH): nothing of ours remains.
+      }
+    }
+    await controller?.shutdown().catch(() => undefined);
+    await rm(scratch, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+function findByInstructionId(value: unknown, instructionId: string): { status?: string; acknowledgedAt?: string } | undefined {
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const found = findByInstructionId(entry, instructionId);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  if (typeof value !== "object" || value === null) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.instructionId === instructionId && record.action === "interrupt") return record as { status?: string; acknowledgedAt?: string };
+  for (const entry of Object.values(record)) {
+    const found = findByInstructionId(entry, instructionId);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+async function findFiles(dir: string, name: string): Promise<string[]> {
+  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+  const found: string[] = [];
+  for (const entry of entries) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) found.push(...await findFiles(path, name));
+    else if (entry.name === name) found.push(path);
+  }
+  return found;
+}

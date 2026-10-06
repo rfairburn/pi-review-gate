@@ -267,6 +267,28 @@ export function recordOperationChildExit(record: OperationRecord, identity: Oper
   return true;
 }
 
+/**
+ * #310: a cancelled executor attempt whose started child never reported a
+ * verified exit may still be writing. Record a terminal incident and mark the
+ * operation failed_critical; the caller must leave the owner lease active so
+ * ownership checks keep refusing quiescence, continuation, and force-merge
+ * until the writer is provably gone.
+ */
+export function recordUnverifiedChildShutdown(record: OperationRecord, attempt: number, detail?: string): ExecutionIncident {
+  const incident = createIncident({
+    attempt,
+    generation: record.generation,
+    cause: "process_exit",
+    stage: "executor_shutdown",
+    message: `Executor was cancelled, but shutdown of its owned process was not verified; the writer may still be live, so no cancellation checkpoint was taken and ownership is retained.${detail ? ` ${detail}` : ""}`,
+    retryable: false,
+    terminalCode: "recovery_state_corrupt_or_unverifiable",
+  });
+  record.incidents.push(incident);
+  record.state = "failed_critical";
+  return incident;
+}
+
 export function touchOperationOwner(record: OperationRecord): void {
   if (record.owner?.status === "active") record.owner.heartbeatAt = new Date().toISOString();
 }

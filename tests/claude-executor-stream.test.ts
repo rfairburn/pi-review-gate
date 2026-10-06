@@ -1035,17 +1035,20 @@ test("Claude executor keeps a surviving target's diagnostic-only result failing 
       onLiveControl: (control) => { if (control) resolveControl(control); },
     });
     const control = await controlReady;
-    assert.equal((await control.interrupt()).status, "acknowledged");
+    const acknowledgement = await control.interrupt();
+    assert.equal(acknowledgement.status, "acknowledged");
+    assert.match(acknowledgement.message, /closed the session so 1 surviving queued message\(s\) cannot run/);
     const result = await run;
 
     // The receipt proves the target survived the abort (first-command
-    // prewait window), so its diagnostic-only EDE is a failure, not an
-    // interruption; the run keeps its existing control-cancellation
-    // settlement.
+    // prewait window). It is never granted interruption authority, and an
+    // explicit Interrupt closes the session at the receipt so the survivor
+    // cannot run afterwards: no result is attributed to it at all (#305,
+    // #310). The run keeps its control-cancellation settlement.
     assert.equal(result.aborted, true);
     assert.equal(result.failure?.category, "interruption");
-    assert.ok(activity.includes("model failed · Claude error (error_during_execution): [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"));
     assert.equal(activity.includes("model turn interrupted"), false);
+    assert.equal(activity.some((message) => message.startsWith("model failed")), false);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

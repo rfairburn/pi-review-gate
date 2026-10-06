@@ -9,7 +9,7 @@
  */
 import assert from "node:assert/strict";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -19,13 +19,16 @@ import { runExecutorWithRecovery } from "../src/execution/executor-recovery";
 import {
   createOperationRecord,
   operationOwnershipStatus,
+  operationRecordPath,
   readOperationRecord,
   writeOperationRecord,
   type OperationRecord,
 } from "../src/execution/operation-record";
 import { captureWaveBase, type WaveCaptureResult } from "../src/execution/wave-repository";
 import { createWorkerWorktree, removeWorktree } from "../src/execution/wave-worktrees";
-import type { ExecutorAdapter, ExecutorRequest, ExecutorTurn } from "../src/execution/types";
+import type { ExecutorAdapter, ExecutorLiveControl, ExecutorRequest, ExecutorTurn } from "../src/execution/types";
+import { ClaudeExecutorAdapter } from "../src/execution/adapters/claude-cli";
+import { denyProcessGroupSignals, mockRootPid, readMockEvents, writeMockClaudeCli } from "./helpers/claude-mock-cli";
 
 const execFileAsync = promisify(execFile);
 
@@ -477,6 +480,90 @@ test("recovery — an unverifiable cancellation checkpoint during a backoff abor
     assert.equal(operation.checkpoint!.verified, true);
     assert.equal(operation.attempts.at(-1)!.outcome, "failed");
   } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("recovery — an explicit Claude interrupt with unverified owned shutdown stays critical with ownership retained (#310)", { skip: process.platform === "win32" }, async () => {
+  const scenario = await startRecoveryScenario("task-unverified-shutdown");
+  const scratch = await mkTmp("pi-recov-claude-310-");
+  const marker = join(scratch, "events.log");
+  const blocked = new Set<number>();
+  const restoreKill = denyProcessGroupSignals(blocked);
+  let rootPid: number | undefined;
+  try {
+    const { capture, worktree, operation, artifactDir } = scenario;
+    const cli = await writeMockClaudeCli(scratch);
+    // The installed Agent SDK drives an owned local mock CLI (no provider).
+    const adapter = new ClaudeExecutorAdapter(
+      { id: "claude", adapter: "claude-cli", command: cli, env: { CLAUDE_MOCK_MARKER: marker }, model: "sonnet" },
+      { interruptSettleMs: 5_000, processCleanupGraceMs: 200 },
+    );
+    const abort = new AbortController();
+    let resolveControl!: (control: ExecutorLiveControl) => void;
+    const controlReady = new Promise<ExecutorLiveControl>((resolvePromise) => { resolveControl = resolvePromise; });
+    const recovery = runExecutorWithRecovery({
+      adapter,
+      request: {
+        cwd: worktree.effectiveCwd,
+        artifactDir,
+        workspaceAccess: "workspace-write",
+        signal: abort.signal,
+        onLiveControl: (control) => { if (control) resolveControl(control); },
+      },
+      prompt: "Do bounded work.",
+      startingTurn: 1,
+      capture,
+      worktree,
+      taskId: "task-unverified-shutdown",
+      title: "Recovery task",
+      retryPolicy: LONG_BACKOFF,
+      operation,
+    });
+    const control = await within(controlReady, "live control was never published");
+    rootPid = mockRootPid(await readMockEvents(marker));
+    assert.ok(rootPid !== undefined);
+    // Group-wide termination and verification of the owned CLI are refused.
+    blocked.add(rootPid);
+
+    // Controller order: adapter interrupt, then runtime abort.
+    const transport = control.interrupt();
+    abort.abort(new Error("interrupt_as_failure"));
+    const acknowledgement = await within(transport, "explicit interrupt did not settle");
+    assert.equal(acknowledgement.status, "failed");
+    assert.match(acknowledgement.message, /owned Claude process shutdown was not verified/);
+
+    const result = await within(recovery, "recovery did not settle");
+    assert.equal(result.status, "critical");
+    assert.match(result.error ?? "", /shutdown of its owned process was not verified/);
+    assert.equal(operation.checkpoint, undefined, "no cancellation checkpoint is taken over a possibly live writer");
+    const durable = await readOperationRecord(operationRecordPath(operation.artifactDir));
+    assert.equal(durable.state, "failed_critical");
+    assert.equal(durable.checkpoint, undefined);
+    const incident = durable.incidents.at(-1)!;
+    assert.equal(incident.stage, "executor_shutdown");
+    assert.equal(incident.cause, "process_exit");
+    assert.equal(incident.terminalCode, "recovery_state_corrupt_or_unverifiable");
+    assert.match(incident.message, /Claude CLI shutdown after explicit interruption was not verified/);
+    // Ownership stays with the possibly live writer: no exit was recorded and
+    // the lease was not released.
+    assert.equal(durable.owner?.status, "active");
+    assert.equal(durable.owner?.childPid, rootPid);
+    assert.equal(durable.owner?.childExitedAt, undefined);
+    assert.equal(operationOwnershipStatus(durable).processAlive, true);
+    // The termination diagnostic is durable in the executor artifacts.
+    const processResult = JSON.parse(await readFile(join(artifactDir, "executor", "0001", "process-result.json"), "utf8")) as { terminationError?: string };
+    assert.match(processResult.terminationError ?? "", /EPERM/);
+  } finally {
+    restoreKill();
+    if (rootPid !== undefined) {
+      try {
+        process.kill(-rootPid, "SIGKILL");
+      } catch {
+        // Already gone (ESRCH): nothing of ours remains.
+      }
+    }
+    await rm(scratch, { recursive: true, force: true });
     await scenario.cleanup();
   }
 });

@@ -676,6 +676,23 @@ only when supplied. This changes progress reporting, not execution outcomes,
 retries, cancellation, or review gates. Raw adapter output remains buffered for
 settlement artifacts; live activity supplies bounded summaries, not full raw logs.
 
+A Claude explicit Interrupt settles on its own terms rather than on earlier
+steering (#310). After the native interrupt, any terminal result ends the run, even
+when non-interrupting steering had moved the completion target. The native
+acknowledgement and that result share a five-second bound, after which the session
+is closed regardless, so the interrupt never waits for the executor timeout. Steering
+the interrupt receipt lists in `still_queued` would otherwise run afterward, so the
+session closes at the receipt instead; steering sent during or after the interruption
+reports non-delivery. The acknowledgement follows owned Claude CLI process-group
+termination (SIGTERM, then SIGKILL) verified gone. A missing, rejected, or timed-out
+native acknowledgement or unverified shutdown is reported as a failed acknowledgement
+with its diagnostic, and an unverified shutdown is added to the run failure. The task
+still waits for this quiescence. An unverified shutdown is never reported as
+quiescence: the operation becomes `failed_critical` with an `executor_shutdown`
+incident, keeps its writer ownership, takes no cancellation checkpoint, and the
+interrupt command fails without acknowledgement, so `interrupt_with_merge` does not
+merge.
+
 Stopped tasks retain verified checkpoints and reattachment bundles for
 `SubtasksContinue`; stopped tasks without a usable checkpoint remain salvageable
 through explicit `SubtasksForceMerge` from their retained worktree or surviving refs.

@@ -15,6 +15,23 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.121]
+
+### Fixed
+
+- A Claude explicit Interrupt after non-interrupting steering no longer waits for
+  the superseded steering result or the executor timeout. Any terminal result after
+  the native interrupt settles the run; a missing acknowledgement or result falls
+  back after a bounded wait and closes the session. Steering surviving the native
+  interrupt (`still_queued`) is stopped by closing the session rather than running
+  afterward, and steering during or after interruption reports non-delivery.
+  Adapter acknowledgement requires verified owned process-group shutdown; a missing
+  native acknowledgement or unverified shutdown is reported as failed with diagnostics.
+  When shutdown is unverified, the operation stays `failed_critical` with its writer
+  ownership retained, and the interrupt command is never acknowledged or merged.
+  Codex, native Pi, controller
+  queueing, retries, and review gates are unchanged (#310).
+
 ## [0.1.0-dev.120]
 
 ### Added

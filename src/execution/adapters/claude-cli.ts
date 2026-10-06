@@ -10,7 +10,13 @@ import type {
   SpawnedProcess,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeExecutorConfig } from "../../config";
-import { reviewerEnv, type ProcessRunResult } from "../../adapters/process";
+import {
+  PROCESS_TREE_CLEANUP_GRACE_MS,
+  reviewerEnv,
+  terminateProcessTree,
+  waitForPromiseBounded,
+  type ProcessRunResult,
+} from "../../adapters/process";
 import { BoundedTextAccumulator, MEBIBYTE } from "../../jsonl";
 import { parseClaudeUsage } from "../../usage";
 import { ClaudeStreamJsonParser, ClaudeStreamActivityExtractor } from "../progress";
@@ -26,6 +32,12 @@ const dynamicImport = new Function("specifier", "return import(specifier)") as (
 // still pending (issue #63).
 const UNKEYED_RESULT_KEY = "__unkeyed__";
 const MAX_BUFFERED_RESULTS = 8;
+
+// Explicit interruption is terminal for the run and must not wait on a
+// superseded steering target's result or the executor timeout (#310): the
+// native acknowledgement and the interrupted turn's terminal result share
+// this bound before the session is shut down regardless.
+const CLAUDE_INTERRUPT_SETTLE_MS = 5_000;
 
 const CLAUDE_RESEARCH_TOOL_MAP = new Map([
   ["read", "Read"],
@@ -60,6 +72,10 @@ const CLAUDE_RESEARCH_POLICY_FLAGS = [
 
 export interface ClaudeExecutorDependencies {
   loadSdk?: () => Promise<{ query: typeof import("@anthropic-ai/claude-agent-sdk")["query"] }>;
+  /** Bound for explicit-interrupt acknowledgement plus terminal result (#310). */
+  interruptSettleMs?: number;
+  /** Per-signal grace for verifying owned process shutdown after explicit interruption (#310). */
+  processCleanupGraceMs?: number;
 }
 
 /** Claude executor using the official Agent SDK streaming control surface. */
@@ -117,6 +133,16 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
     let aborted = false;
     let interruptedByControl = false;
     let finished = false;
+    // The single owned-process shutdown of an explicit interruption (#310):
+    // started at the interruption's settlement boundary, awaited by both the
+    // interrupt acknowledgement and run cleanup. Resolves with a diagnostic
+    // when shutdown could not be verified, undefined otherwise.
+    let ownedShutdown: Promise<string | undefined> | undefined;
+    let terminationFailure: string | undefined;
+    // The exit report delivered through onProcessExit, the canonical owned
+    // lifecycle record. After explicit interruption it is withheld until the
+    // whole owned group is verified gone and never fabricated otherwise.
+    let exitReported: Promise<void> | undefined;
 
     const sdk = await (this.dependencies.loadSdk?.() ?? dynamicImport("@anthropic-ai/claude-agent-sdk"));
     const abortController = new AbortController();
@@ -143,8 +169,12 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
       }
       lifecycleExit = new Promise((resolvePromise) => {
         child!.once("exit", (code, signal) => {
-          void Promise.resolve(processIdentity && request.onProcessExit?.({ ...processIdentity, code, signal }))
-            .finally(resolvePromise);
+          if (interruptedByControl) {
+            resolvePromise();
+            return;
+          }
+          exitReported = Promise.resolve(processIdentity && request.onProcessExit?.({ ...processIdentity, code, signal }));
+          void exitReported.finally(resolvePromise);
         });
         child!.once("error", () => resolvePromise());
       });
@@ -201,9 +231,14 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
               const resultUuid = "user_message_uuid" in message && typeof message.user_message_uuid === "string"
                 ? message.user_message_uuid
                 : undefined;
-              if (resultUuid === targetUuid || resultUuid === undefined && targetUuid === initialUuid) {
+              // After an explicit interrupt any terminal result settles the
+              // run: deferred steering may have retargeted completion, and
+              // the interrupted turn's result can be original-tagged or
+              // untagged (#310). Close at once so queued work cannot start.
+              if (interruptedByControl || resultUuid === targetUuid || resultUuid === undefined && targetUuid === initialUuid) {
                 finalResult = message;
                 finished = true;
+                if (interruptedByControl) beginControlShutdown();
                 return true;
               }
               const key = resultUuid ?? UNKEYED_RESULT_KEY;
@@ -218,8 +253,11 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
         } catch (error) {
           // Preserve protocol-error reporting when the SDK stream itself
           // fails: record it under the same timeout/abort policy as the main
-          // flow instead of leaving an unhandled rejection behind.
-          if (!timedOut && !aborted) protocolFailure = messageOf(error);
+          // flow instead of leaving an unhandled rejection behind. Only
+          // disposal errors after an explicit interruption closed the
+          // session are suppressed; earlier failures keep their diagnostic
+          // even while the interrupt is pending (#310).
+          if (!timedOut && !aborted && !(interruptedByControl && sessionClosed)) protocolFailure = messageOf(error);
         } finally {
           resolveSettlement();
         }
@@ -234,6 +272,34 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
         sessionClosed = true;
         query?.close();
       }
+    };
+    const shutDownOwnedProcess = (): Promise<string | undefined> => ownedShutdown ??= (async () => {
+      const failure = await terminateOwnedClaudeProcess(
+        child,
+        this.dependencies.processCleanupGraceMs ?? PROCESS_TREE_CLEANUP_GRACE_MS,
+      );
+      if (failure === undefined && processIdentity && child && exitReported === undefined) {
+        exitReported = Promise.resolve(request.onProcessExit?.({
+          ...processIdentity,
+          code: child.exitCode,
+          signal: child.signalCode,
+        }));
+      }
+      await exitReported;
+      return failure;
+    })();
+    // Explicit interruption is terminal: at its settlement boundary stop all
+    // input, close the session, and start owned termination at once rather
+    // than after SDK iterator disposal, which grants the CLI a stdin-EOF
+    // grace in which surviving queued work could still run (#310). Closing
+    // input also rejects any steering the SDK never pulled.
+    const beginControlShutdown = (): void => {
+      finished = true;
+      input.close();
+      closeQuerySession();
+      abortController.abort();
+      void shutDownOwnedProcess();
+      settleNow?.();
     };
     const timeout = setTimeout(() => {
       timedOut = true;
@@ -263,6 +329,9 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
         protocol: "Claude Agent SDK streaming Query",
         capabilities: { steer: true, interrupt: true },
         steer: async (instruction, instructionId, options) => {
+          if (interruptedByControl) {
+            return { status: "blocked", message: "Claude turn was explicitly interrupted; steering was not delivered." };
+          }
           if (finished) return { status: "blocked", message: "Claude turn already reached a terminal result." };
           const messageUuid = randomUUID();
           const previousTargetUuid = targetUuid;
@@ -324,10 +393,12 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
               // genuine failure of that turn must keep its failure label (#305).
               activity.clearInterruption(previousTargetUuid);
               targetUuid = previousTargetUuid;
+              // An explicit interruption that already settled the run keeps
+              // its terminal result (#310).
               const bufferedKey = previousTargetUuid !== initialUuid || unmatchedResults.has(previousTargetUuid)
                 ? previousTargetUuid
                 : UNKEYED_RESULT_KEY;
-              const buffered = unmatchedResults.get(bufferedKey);
+              const buffered = finished ? undefined : unmatchedResults.get(bufferedKey);
               if (buffered !== undefined) {
                 unmatchedResults.delete(bufferedKey);
                 finalResult = buffered;
@@ -353,35 +424,78 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
           }
         },
         interrupt: async (): Promise<ExecutorInteractionAcknowledgement> => {
-          try {
-            interruptedByControl = true;
-            // Record the owned control event before issuing it so a result
-            // that races the acknowledgement is still attributed to this
-            // turn; it stays unverified until the native interrupt resolves,
-            // so a racing or rejected interruption cannot relabel a genuine
-            // failure (#305).
-            activity.notePendingInterruption(targetUuid);
-            const receipt = await query!.interrupt();
-            // The receipt's still_queued uuids survive the abort and will
+          if (sessionClosed) {
+            return { status: "blocked", message: "Claude streaming session is already closed; there is no live turn to interrupt." };
+          }
+          interruptedByControl = true;
+          const settleMs = this.dependencies.interruptSettleMs ?? CLAUDE_INTERRUPT_SETTLE_MS;
+          const deadline = Date.now() + settleMs;
+          const remaining = () => Math.max(0, deadline - Date.now());
+          // Deferred steering retargets completion while the superseded turn
+          // keeps running, so the interrupt may abort either. Record both
+          // owned control events before issuing the interrupt so a result
+          // that races the acknowledgement is still attributed; they stay
+          // unverified until the native interrupt resolves, so a racing,
+          // rejected, or unacknowledged interruption cannot relabel a
+          // genuine failure (#305, #310).
+          const interruptedUuids = targetUuid !== initialUuid
+            && !unmatchedResults.has(initialUuid)
+            && !unmatchedResults.has(UNKEYED_RESULT_KEY)
+            ? [initialUuid, targetUuid]
+            : [targetUuid];
+          for (const uuid of interruptedUuids) activity.notePendingInterruption(uuid);
+          const native = await waitForPromiseBounded(
+            Promise.resolve().then(() => activeQuery.interrupt()),
+            remaining(),
+          );
+          const details: string[] = [];
+          let nativeFailure: string | undefined;
+          let survivors = 0;
+          if (native.kind === "fulfilled") {
+            const receipt = native.value;
+            // The receipt's still_queued uuids survive the abort and would
             // run: a surviving target was never interrupted, so withdraw its
             // unproven authority instead of granting it. Older CLIs provide
             // no survivor receipt; their acknowledgement authorizes
             // classification only when the result itself has an explicit
             // abort terminal reason (#305).
-            if (receipt !== undefined && receipt.still_queued.includes(targetUuid)) {
-              activity.clearInterruption(targetUuid);
-            } else {
-              activity.verifyInterruption(targetUuid, receipt !== undefined);
+            for (const uuid of interruptedUuids) {
+              if (receipt !== undefined && receipt.still_queued.includes(uuid)) {
+                activity.clearInterruption(uuid);
+              } else {
+                activity.verifyInterruption(uuid, receipt !== undefined);
+              }
             }
-            await resultPromise.catch(() => undefined);
-            return {
-              status: "acknowledged",
-              message: `Claude Agent SDK acknowledged interruption${receipt ? `; ${receipt.still_queued.length} message(s) remain queued` : ""}.`,
-            };
-          } catch (error) {
-            activity.clearInterruption(targetUuid);
-            return { status: "failed", message: messageOf(error) };
+            survivors = receipt?.still_queued.length ?? 0;
+            details.push(`Claude Agent SDK acknowledged interruption${receipt ? `; ${receipt.still_queued.length} message(s) remain queued` : ""}`);
+          } else {
+            for (const uuid of interruptedUuids) activity.clearInterruption(uuid);
+            nativeFailure = native.kind === "rejected"
+              ? messageOf(native.error)
+              : `Claude Agent SDK did not acknowledge the interrupt within ${settleMs} ms`;
+            details.push(nativeFailure);
           }
+          if (survivors > 0) {
+            // Survivors would start as soon as the interrupted turn ends;
+            // the public SDK cannot cancel them, so shut the session down
+            // now instead of letting them execute after interruption (#310).
+            details.push(`closed the session so ${survivors} surviving queued message(s) cannot run`);
+          } else if (nativeFailure === undefined && (await waitForPromiseBounded(resultPromise, remaining())).kind === "timeout") {
+            details.push(`no terminal result arrived within ${settleMs} ms, so the session was closed`);
+          } else if (nativeFailure !== undefined && !finished) {
+            details.push("closed the session");
+          }
+          beginControlShutdown();
+          const cleanupFailure = await shutDownOwnedProcess();
+          if (cleanupFailure) {
+            details.push(`owned Claude process shutdown was not verified: ${cleanupFailure}`);
+          } else if (processIdentity) {
+            details.push("owned Claude process shutdown verified");
+          }
+          return {
+            status: nativeFailure === undefined && cleanupFailure === undefined ? "acknowledged" : "failed",
+            message: `${details.join("; ")}.`,
+          };
         },
       });
       await resultPromise;
@@ -399,7 +513,13 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
       input.close();
       closeQuerySession();
       abortController.abort();
-      await lifecycleExit;
+      if (interruptedByControl) {
+        // Explicit interruption acknowledges only verified owned shutdown;
+        // an unverifiable group is reported, never assumed (#310).
+        terminationFailure = await shutDownOwnedProcess();
+      } else {
+        await lifecycleExit;
+      }
     }
 
     activity.finish();
@@ -417,7 +537,10 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
         ? undefined
         : finalResult.errors.join("; ") || finalResult.subtype
       : parsed.error;
-    const code = protocolFailure || resultError || steerDeliveryFailure ? 1 : 0;
+    const terminationDiagnostic = terminationFailure
+      ? `Claude CLI shutdown after explicit interruption was not verified: ${terminationFailure}`
+      : undefined;
+    const code = protocolFailure || resultError || steerDeliveryFailure || terminationDiagnostic ? 1 : 0;
     const output: ProcessRunResult = {
       stdout: stdout.value,
       stderr: stderr.value,
@@ -432,6 +555,7 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
       code,
       timedOut,
       aborted: aborted || interruptedByControl,
+      ...(terminationFailure ? { terminationError: terminationFailure } : {}),
     };
     const artifacts = await writeExecutorArtifacts({
       artifactDir: request.artifactDir,
@@ -442,6 +566,15 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
       sessionId: effectiveSessionId,
       adapter: this.kind,
     });
+    const failure: ExecutorTurn["failure"] = protocolFailure
+      ? { category: "protocol", message: protocolFailure }
+      : interruptedByControl
+        ? { category: "interruption", message: resultError ?? "Claude query was interrupted." }
+      : steerDeliveryFailure
+        ? { category: "protocol", message: steerDeliveryFailure }
+      : resultError
+        ? { category: "provider", message: resultError }
+        : undefined;
     return {
       text,
       session: { adapter: this.kind, id: effectiveSessionId },
@@ -450,15 +583,11 @@ export class ClaudeExecutorAdapter implements ExecutorAdapter {
       code,
       timedOut,
       aborted: aborted || interruptedByControl,
-      failure: protocolFailure
-        ? { category: "protocol", message: protocolFailure }
-        : interruptedByControl
-          ? { category: "interruption", message: resultError ?? "Claude query was interrupted." }
-        : steerDeliveryFailure
-          ? { category: "protocol", message: steerDeliveryFailure }
-        : resultError
-          ? { category: "provider", message: resultError }
-          : undefined,
+      failure: terminationDiagnostic
+        ? failure
+          ? { ...failure, message: `${failure.message} ${terminationDiagnostic}` }
+          : { category: "process", message: terminationDiagnostic }
+        : failure,
     };
   }
 }
@@ -483,19 +612,19 @@ function assertClaudeResearchArgsSafe(args: readonly string[] | undefined): void
 }
 
 class AsyncMessageQueue implements AsyncIterable<SDKUserMessage> {
-  private values: Array<{ message: SDKUserMessage; consumed: () => void }> = [];
+  private values: Array<{ message: SDKUserMessage; consumed: () => void; undelivered: (error: Error) => void }> = [];
   private waiters: Array<(value: IteratorResult<SDKUserMessage>) => void> = [];
   private closed = false;
 
   enqueue(message: SDKUserMessage): Promise<void> {
     if (this.closed) return Promise.reject(new Error("Claude streaming input is closed."));
-    return new Promise((resolvePromise) => {
+    return new Promise((resolvePromise, rejectPromise) => {
       const waiter = this.waiters.shift();
       if (waiter) {
         waiter({ value: message, done: false });
         resolvePromise();
       } else {
-        this.values.push({ message, consumed: resolvePromise });
+        this.values.push({ message, consumed: resolvePromise, undelivered: rejectPromise });
       }
     });
   }
@@ -505,7 +634,10 @@ class AsyncMessageQueue implements AsyncIterable<SDKUserMessage> {
     this.closed = true;
     for (const waiter of this.waiters) waiter({ value: undefined, done: true });
     this.waiters = [];
-    for (const value of this.values) value.consumed();
+    // A message the SDK never pulled was not delivered; report that instead
+    // of resolving as if the transport had accepted it (#310).
+    const undelivered = new Error("Claude streaming input closed before the message was delivered.");
+    for (const value of this.values) value.undelivered(undelivered);
     this.values = [];
   }
 
@@ -584,6 +716,54 @@ function forwardClaudeToolObservations(
       });
       if (id) toolUses.delete(id);
     }
+  }
+}
+
+/**
+ * Terminate and verify the owned Claude CLI process group after explicit
+ * interruption (#310). Each escalation step waits a bounded grace for the
+ * root's observed exit and, on POSIX, for the detached group to have no
+ * members. Returns undefined only when shutdown is verified (or nothing was
+ * spawned); otherwise a diagnostic, never an assumed shutdown.
+ */
+async function terminateOwnedClaudeProcess(
+  proc: ChildProcess | undefined,
+  graceMs: number,
+): Promise<string | undefined> {
+  if (proc?.pid === undefined) return undefined;
+  // Only an observed root exit counts as evidence; the spawn-signal
+  // AbortError precedes it.
+  const rootExit = proc.exitCode !== null || proc.signalCode !== null
+    ? Promise.resolve()
+    : new Promise<void>((resolvePromise) => { proc.once("exit", () => resolvePromise()); });
+  const failures: string[] = [];
+  for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+    const failure = terminateProcessTree(proc, signal);
+    if (failure) failures.push(failure);
+    const deadline = Date.now() + graceMs;
+    const rootExited = (await waitForPromiseBounded(rootExit, graceMs)).kind !== "timeout";
+    if (rootExited && await ownedGroupEmpty(proc.pid, failure === undefined, deadline)) return undefined;
+  }
+  return [
+    ...failures,
+    `Claude CLI process ${proc.pid}${process.platform === "win32" ? "" : ` (process group ${proc.pid})`} was still live or unverifiable after SIGKILL`,
+  ].join("; ");
+}
+
+async function ownedGroupEmpty(processGroupId: number, signalDelivered: boolean, deadline: number): Promise<boolean> {
+  // Windows has no detached process group to probe: a successful taskkill /T
+  // plus the root's observed exit is the available evidence.
+  if (process.platform === "win32") return signalDelivered;
+  for (;;) {
+    try {
+      process.kill(-processGroupId, 0);
+    } catch (error) {
+      // Only ESRCH proves the group has no members; other errors (such as a
+      // transient EPERM while a member is mid-exec) keep it unverified.
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+    }
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
   }
 }
 

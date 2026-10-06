@@ -28,6 +28,7 @@ export async function writeExecutorArtifacts(input: {
       timedOut: input.output.timedOut,
       aborted: input.output.aborted,
       stdinError: input.output.stdinError,
+      terminationError: input.output.terminationError,
       stdoutTruncated: input.output.stdoutTruncated,
       stderrTruncated: input.output.stderrTruncated,
     }, null, 2), "utf8"),

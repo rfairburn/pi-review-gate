@@ -8,6 +8,7 @@ import {
   createIncident,
   recordOperationChildExit,
   recordOperationChildProcess,
+  recordUnverifiedChildShutdown,
   releaseOperationOwner,
   touchOperationOwner,
   writeOperationRecord,
@@ -217,6 +218,8 @@ export async function runInplaceTurnLoop(input: {
 
   acquireOperationOwner(input.operation);
   await writeOperationRecord(input.operation).catch(() => undefined);
+  // #310: an unverified child shutdown keeps the owner lease active.
+  let retainOwner = false;
   const ownerHeartbeat = setInterval(() => {
     touchOperationOwner(input.operation);
     void writeOperationRecord(input.operation).catch(() => undefined);
@@ -342,6 +345,19 @@ export async function runInplaceTurnLoop(input: {
         input.onLiveControl?.(undefined);
       }
 
+      if (input.signal?.aborted && (unmatchedChildExit || childProcesses.some((child) => child.exitedAt === undefined))) {
+        // #310: a started child never reported a verified exit, so the writer
+        // may still be live. Fail closed instead of releasing ownership as an
+        // ordinary cancellation.
+        retainOwner = true;
+        attemptRecord.endedAt ??= new Date().toISOString();
+        attemptRecord.outcome = "failed";
+        const detail = turn?.failure?.message ?? (thrown === undefined ? undefined : thrown instanceof Error ? thrown.message : String(thrown));
+        const incident = recordUnverifiedChildShutdown(input.operation, attemptRecord.attempt, detail);
+        incidents.push(incident);
+        await writeOperationRecord(input.operation);
+        return { status: "failed", turn, error: incident.message, lastTurnNumber: turnNumber, incidents, childProcesses, unmatchedChildExit };
+      }
       if (input.signal?.aborted) {
         attemptRecord.endedAt ??= new Date().toISOString();
         attemptRecord.outcome = "cancelled";
@@ -420,7 +436,7 @@ export async function runInplaceTurnLoop(input: {
     }
   } finally {
     clearInterval(ownerHeartbeat);
-    releaseOperationOwner(input.operation);
+    if (!retainOwner) releaseOperationOwner(input.operation);
     await writeOperationRecord(input.operation).catch(() => undefined);
   }
 }

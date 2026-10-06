@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.121]
+## [0.1.0-dev.122]
 
 ### Fixed
 
@@ -29,8 +29,21 @@ dates.
   native acknowledgement or unverified shutdown is reported as failed with diagnostics.
   When shutdown is unverified, the operation stays `failed_critical` with its writer
   ownership retained, and the interrupt command is never acknowledged or merged.
-  Codex, native Pi, controller
-  queueing, retries, and review gates are unchanged (#310).
+  Codex, native Pi, controller queueing, retries, and review gates are unchanged (#310).
+
+## [0.1.0-dev.121]
+
+### Tests
+
+- Make the child-teardown suite's owned fixture-root removal reliable on Windows
+  (test-only; #312). Removal still runs only after each recorded owned PID has
+  actually exited, then retries a transient Windows directory lock (`EBUSY`,
+  `ENOTEMPTY`, `EPERM`) for at most about five seconds. Other errors, POSIX
+  errors, and an exhausted budget still fail with the original error code.
+  Focused regressions cover the retry rules, and a native Windows test shows that
+  removal fails while an owned child holds the root as its working directory and
+  succeeds after that child exits. Every existing teardown assertion is
+  unchanged, and runtime behavior is unchanged.
 
 ## [0.1.0-dev.120]
 

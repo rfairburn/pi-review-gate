@@ -301,7 +301,51 @@ async function stopOwnedFixture(fixture: OwnedDescendantFixture, removeRoot = tr
     "the test-owned descendant to exit",
     5_000,
   );
-  if (removeRoot) await rm(fixture.root, { recursive: true, force: true });
+  if (removeRoot) await removeOwnedFixtureRoot(fixture.root);
+}
+
+// Windows reports a process dead (its exit code is no longer STILL_ACTIVE)
+// before every handle it held, including an inherited fixture-root cwd, is
+// necessarily released, and a directory in use maps to EBUSY (with ENOTEMPTY or
+// EPERM for the same transient removal race). Only those codes, only on
+// Windows, and only for a finite budget are retried; any other error, any POSIX
+// error, or an exhausted budget rethrows the unwrapped fs error.
+const WINDOWS_TRANSIENT_ROOT_REMOVAL_CODES: ReadonlySet<string> = new Set(["EBUSY", "ENOTEMPTY", "EPERM"]);
+const WINDOWS_ROOT_REMOVAL_BUDGET_MS = 5_000;
+const WINDOWS_ROOT_REMOVAL_INTERVAL_MS = 50;
+
+interface OwnedRootRemovalOptions {
+  platform?: NodeJS.Platform;
+  remove?: (root: string) => Promise<void>;
+  budgetMs?: number;
+  intervalMs?: number;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Removes a test-owned fixture root after its owned processes have already
+ * been confirmed exited. This never waits for or signals processes itself.
+ */
+async function removeOwnedFixtureRoot(root: string, options: OwnedRootRemovalOptions = {}): Promise<void> {
+  const platform = options.platform ?? process.platform;
+  const remove = options.remove ?? ((path: string) => rm(path, { recursive: true, force: true }));
+  const budgetMs = options.budgetMs ?? WINDOWS_ROOT_REMOVAL_BUDGET_MS;
+  const intervalMs = options.intervalMs ?? WINDOWS_ROOT_REMOVAL_INTERVAL_MS;
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const deadline = now() + budgetMs;
+  for (;;) {
+    try {
+      await remove(root);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      const transient = platform === "win32" && typeof code === "string" && WINDOWS_TRANSIENT_ROOT_REMOVAL_CODES.has(code);
+      if (!transient || now() >= deadline) throw error;
+      await sleep(intervalMs);
+    }
+  }
 }
 
 async function waitForFixtureReady(fixture: OwnedDescendantFixture): Promise<number> {
@@ -348,7 +392,220 @@ test("owned fixture cleanup waits for actual exit after a pre-exit stopped marke
   } finally {
     await stopOwnedFixture(fixture, false);
     await within(closed, 5_000, "test-owned fixture stdio to close");
-    await rm(fixture.root, { recursive: true, force: true });
+    await removeOwnedFixtureRoot(fixture.root);
+  }
+});
+
+function errnoError(code: string, label = code): NodeJS.ErrnoException {
+  return Object.assign(new Error(`${label}: synthetic owned-root removal failure`), { code });
+}
+
+function virtualRemovalClock(): { now: () => number; sleep: (ms: number) => Promise<void>; sleeps: number[] } {
+  let current = 0;
+  const sleeps: number[] = [];
+  return {
+    now: () => current,
+    sleep: async (ms: number) => {
+      sleeps.push(ms);
+      current += ms;
+    },
+    sleeps,
+  };
+}
+
+test("owned-root removal retries only a transient Windows directory lock and then succeeds", async () => {
+  for (const code of WINDOWS_TRANSIENT_ROOT_REMOVAL_CODES) {
+    const clock = virtualRemovalClock();
+    const attempts: string[] = [];
+    await removeOwnedFixtureRoot("owned-root", {
+      platform: "win32",
+      now: clock.now,
+      sleep: clock.sleep,
+      remove: async (root) => {
+        attempts.push(root);
+        if (attempts.length <= 2) throw errnoError(code);
+      },
+    });
+    assert.deepEqual(attempts, ["owned-root", "owned-root", "owned-root"], `${code} is retried until removal succeeds`);
+    assert.deepEqual(clock.sleeps, [WINDOWS_ROOT_REMOVAL_INTERVAL_MS, WINDOWS_ROOT_REMOVAL_INTERVAL_MS]);
+  }
+});
+
+test("owned-root removal fails visibly with the original code after a persistent Windows lock exhausts its budget", async () => {
+  const clock = virtualRemovalClock();
+  const thrown: NodeJS.ErrnoException[] = [];
+  await assert.rejects(
+    removeOwnedFixtureRoot("owned-root", {
+      platform: "win32",
+      now: clock.now,
+      sleep: clock.sleep,
+      remove: async () => {
+        const error = errnoError("EBUSY", `attempt ${thrown.length + 1}`);
+        thrown.push(error);
+        throw error;
+      },
+    }),
+    (error: unknown) => {
+      assert.equal(error, thrown.at(-1), "the unwrapped fs error is rethrown");
+      assert.equal((error as NodeJS.ErrnoException).code, "EBUSY");
+      return true;
+    },
+  );
+  const expectedAttempts = WINDOWS_ROOT_REMOVAL_BUDGET_MS / WINDOWS_ROOT_REMOVAL_INTERVAL_MS + 1;
+  assert.equal(thrown.length, expectedAttempts, "a persistent lock consumes a finite retry budget");
+  assert.equal(clock.sleeps.reduce((total, ms) => total + ms, 0), WINDOWS_ROOT_REMOVAL_BUDGET_MS);
+});
+
+test("owned-root removal rethrows nonretryable Windows errors immediately", async () => {
+  for (const failure of [errnoError("EACCES"), errnoError("EIO"), new Error("uncoded removal failure")]) {
+    const clock = virtualRemovalClock();
+    let attempts = 0;
+    await assert.rejects(
+      removeOwnedFixtureRoot("owned-root", {
+        platform: "win32",
+        now: clock.now,
+        sleep: clock.sleep,
+        remove: async () => {
+          attempts += 1;
+          throw failure;
+        },
+      }),
+      (error: unknown) => error === failure,
+    );
+    assert.equal(attempts, 1, `${failure.message} must not be retried`);
+    assert.deepEqual(clock.sleeps, []);
+  }
+});
+
+test("owned-root removal rethrows POSIX errors immediately, including lock-like codes", async () => {
+  for (const platform of ["linux", "darwin"] as const) {
+    for (const code of [...WINDOWS_TRANSIENT_ROOT_REMOVAL_CODES, "EACCES"]) {
+      const clock = virtualRemovalClock();
+      const failure = errnoError(code);
+      let attempts = 0;
+      await assert.rejects(
+        removeOwnedFixtureRoot("owned-root", {
+          platform,
+          now: clock.now,
+          sleep: clock.sleep,
+          remove: async () => {
+            attempts += 1;
+            throw failure;
+          },
+        }),
+        (error: unknown) => error === failure,
+      );
+      assert.equal(attempts, 1, `${platform} ${code} must not be retried`);
+      assert.deepEqual(clock.sleeps, []);
+    }
+  }
+});
+
+test("owned-root removal deletes a real owned root and tolerates an already-removed root", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-child-teardown-remove-"));
+  await mkdir(join(root, "nested"));
+  await writeFile(join(root, "nested", "owned.txt"), "owned");
+  await removeOwnedFixtureRoot(root);
+  assert.equal(existsSync(root), false);
+  await removeOwnedFixtureRoot(root);
+});
+
+test("native Windows owned-root removal rejects while an owned child holds its cwd and succeeds after actual exit", {
+  skip: process.platform !== "win32",
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-child-teardown-win-lock-"));
+  await writeFile(join(root, "owned.txt"), "owned");
+  // Control is over IPC, not files: recursive removal may delete every entry
+  // inside the root while the root directory itself stays locked as a cwd.
+  const child = spawn(process.execPath, [
+    "-e",
+    "process.on('message',message=>{if(message==='stop')process.exit(0)});setInterval(()=>{},1000);process.send('ready');",
+  ], { cwd: root, stdio: ["ignore", "ignore", "ignore", "ipc"] });
+  const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+  const closed = new Promise<void>((resolve, reject) => {
+    child.once("close", () => resolve());
+    child.once("error", reject);
+  });
+  void closed.catch(() => undefined);
+  const ready = new Promise<void>((resolve) => {
+    child.on("message", (message) => { if (message === "ready") resolve(); });
+  });
+  let primaryFailure: unknown;
+  try {
+    await within(ready, 8_000, "owned cwd-holding child startup");
+    const pid = child.pid;
+    assert.ok(pid, "the exact owned child PID is captured");
+    assert.equal(pidIsAlive(pid), true);
+
+    let lockedAttempts = 0;
+    await assert.rejects(
+      removeOwnedFixtureRoot(root, {
+        budgetMs: 500,
+        remove: async (path) => {
+          lockedAttempts += 1;
+          await rm(path, { recursive: true, force: true });
+        },
+      }),
+      (error: unknown) => {
+        const code = (error as NodeJS.ErrnoException).code;
+        assert.ok(code && WINDOWS_TRANSIENT_ROOT_REMOVAL_CODES.has(code), `a live cwd holder must surface a directory lock code, got ${String(code)}`);
+        return true;
+      },
+    );
+    assert.ok(lockedAttempts > 1, "a live lock is retried only within the bounded budget");
+    assert.equal(existsSync(root), true, "the root remains while its owned child holds it");
+    assert.equal(pidIsAlive(pid), true, "bounded removal neither waits for nor terminates the owned child");
+
+    child.send("stop");
+    assert.deepEqual(await within(exited, 5_000, "owned cwd-holding child exit"), { code: 0, signal: null });
+    await within(closed, 5_000, "owned cwd-holding child close");
+    await waitFor(() => !pidIsAlive(pid), "the owned cwd-holding child to exit", 5_000);
+    await removeOwnedFixtureRoot(root);
+    assert.equal(existsSync(root), false, "removal succeeds after the owned child actually exits");
+  } catch (error) {
+    primaryFailure = error;
+    throw error;
+  } finally {
+    // The root is deleted only after this exact owned child's exit, close, and
+    // actual PID exit are all confirmed within bounds. Any shutdown failure
+    // skips deletion and is surfaced, never suppressed or allowed to mask an
+    // earlier assertion failure.
+    const cleanupFailures: unknown[] = [];
+    let shutdownConfirmed = false;
+    try {
+      if (child.exitCode === null && child.signalCode === null) {
+        try {
+          if (child.connected) child.send("stop");
+          await within(exited, 5_000, "owned cwd-holding child cooperative cleanup exit");
+        } catch (cooperativeFailure) {
+          cleanupFailures.push(cooperativeFailure);
+          child.kill();
+          await within(exited, 5_000, "owned cwd-holding child exit after fallback kill");
+        }
+      } else {
+        await within(exited, 5_000, "owned cwd-holding child cleanup exit");
+      }
+      await within(closed, 5_000, "owned cwd-holding child cleanup close");
+      const ownedPid = child.pid;
+      if (ownedPid !== undefined) await waitFor(() => !pidIsAlive(ownedPid), "the owned cwd-holding child PID to exit", 5_000);
+      shutdownConfirmed = true;
+    } catch (shutdownFailure) {
+      cleanupFailures.push(shutdownFailure);
+    }
+    if (shutdownConfirmed) {
+      try {
+        await removeOwnedFixtureRoot(root);
+      } catch (removalFailure) {
+        cleanupFailures.push(removalFailure);
+      }
+    }
+    if (cleanupFailures.length > 0) {
+      if (primaryFailure === undefined && cleanupFailures.length === 1) throw cleanupFailures[0];
+      const failures = primaryFailure === undefined ? cleanupFailures : [primaryFailure, ...cleanupFailures];
+      throw new AggregateError(failures, "owned cwd-lock regression cleanup failed");
+    }
   }
 });
 
@@ -642,7 +899,7 @@ test("Pi RPC root exit interrupts background readiness and returns a bounded cla
   } finally {
     await stopBackgroundWaitFixture(fixture, false);
     await running.catch(() => undefined);
-    await rm(fixture.root, { recursive: true, force: true });
+    await removeOwnedFixtureRoot(fixture.root);
   }
 });
 
@@ -739,7 +996,7 @@ test("Pi RPC live-control interruption breaks background readiness after termina
     terminationPatch?.restore();
     await running.catch(() => undefined);
     await interrupting?.catch(() => undefined);
-    await rm(fixture.root, { recursive: true, force: true });
+    await removeOwnedFixtureRoot(fixture.root);
   }
 });
 
@@ -827,7 +1084,7 @@ test("Pi RPC signal cancellation bounds an unanswered abort with live background
     }
     terminationPatch?.restore();
     await running.catch(() => undefined);
-    await rm(fixture.root, { recursive: true, force: true });
+    await removeOwnedFixtureRoot(fixture.root);
   }
 });
 
@@ -878,7 +1135,7 @@ test("native Windows Pi RPC executor reports uncertain cleanup after its CMD roo
     restorePath?.();
     await stopOwnedFixture(fixture, false);
     await running.catch(() => undefined);
-    await rm(fixture.root, { recursive: true, force: true });
+    await removeOwnedFixtureRoot(fixture.root);
   }
 });
 
@@ -945,7 +1202,7 @@ test("native Windows default pi.cmd root exit bounds authenticated background re
     }
     await stopOwnedFixture(fixture, false);
     await running.catch(() => undefined);
-    await rm(fixture.root, { recursive: true, force: true });
+    await removeOwnedFixtureRoot(fixture.root);
   }
 });
 
@@ -994,7 +1251,7 @@ test("native Windows compaction recovery rejects uncertain cleanup after its CMD
     restorePath?.();
     await stopOwnedFixture(fixture, false);
     await running.catch(() => undefined);
-    await rm(fixture.root, { recursive: true, force: true });
+    await removeOwnedFixtureRoot(fixture.root);
   }
 });
 

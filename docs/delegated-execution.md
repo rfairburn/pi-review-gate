@@ -633,7 +633,16 @@ acknowledged transport, and a steer during review cancels that review and resume
 executor with the changed request before a fresh review. If the current adapter cannot
 steer a long-running command, the instruction waits for that next executor handoff
 instead of being reported as rejected. The no-argument `/subtask-steer` command
-picks a task interactively and collects the instruction through the same shared
+picks a task interactively, then asks whether to **Steer without interrupting the
+active turn** (listed first) or **Interrupt the active turn, then steer** before
+any instruction is entered (#309). The choice is sent as the existing `interrupt`
+flag described below (`false` or `true`), with the same task, workspace, review
+gates, transport statuses, and fail-closed handling as `SubtasksSteer`. Dismissing
+the task picker, the mode choice, or the instruction field (or submitting a blank
+instruction) returns without steering or interrupting anything. The explicit
+`/subtask-steer <executionId> <taskId> <instruction>` form is unchanged: it opens no
+prompts and sends no `interrupt` flag, so it keeps normal steering. The command
+collects the instruction through the same shared
 native editor field as every other extension-owned text field (issue #26): the
 host's own main-prompt editor in the interactive Pi TUI — including the native
 filesystem suggestions for first-line leading-`/` tokens, never slash-command

@@ -17,6 +17,36 @@ dates.
 
 ## [0.1.0-dev.125]
 
+### Fixed
+
+- Compiled launches now actually wire the shared expansion peers (#92 correction).
+  A compiled CommonJS extension entry is loaded by pi ≥ 0.86 through native
+  import, whose `require()` calls bypass the extension loader's package aliases —
+  so the notification renderers' bare-name `require("@earendil-works/pi-tui")`
+  failed, was cached, and every automatic notification silently rendered through
+  the host's native full-text fallback (no compaction, no hint, no expansion),
+  exactly as reported for installed Pi 1.0.4. The five notification families and
+  the shared hint core now resolve their peers through the established shared
+  host-relative loader (`src/host-peer-loader.ts`) asynchronously at activation
+  and complete during interactive session setup — before pi renders the initial
+  transcript — with rendering itself performing no loading; when a peer is
+  genuinely unavailable the documented native fallback applies unchanged. The
+  configured expansion binding is resolved on the separately evaluated pi-tui
+  record from the running host's own keybinding configuration — the host's own
+  `KeybindingsManager.create()` static factory, so built-in defaults plus the
+  user's `keybindings.json` overrides make a remapped binding resolve exactly
+  as the host renders it — never hard-coded; a configured initialization that
+  fails installs nothing rather than substituting defaults. Tool and
+  notification content, native state, delivery, and model-visible behavior are
+  unchanged. The compiled-launch regression
+  `tests/message-expansion-compiled-launch.test.ts` drives the real built
+  candidate through pi's public `--extension` seam on a real PTY (compact
+  two-family rendering with the live hint, default Ctrl+O and a remapped
+  keybindings.json binding driven by its real keystroke expanding/contracting
+  the complete retained text, a configured-empty binding rendering no hint,
+  and independent fullscreen clicks) and is required host coverage; it fails
+  with this exact regression on the unfixed candidates.
+
 ### Changed
 
 - One shared presentation expansion core (#92). `src/presentation-expansion.ts` and

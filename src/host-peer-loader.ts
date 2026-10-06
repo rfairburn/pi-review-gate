@@ -114,6 +114,35 @@ export function resolveHostPeerFile(
 }
 
 /**
+ * The package root (the directory holding the peer's own package.json) of one
+ * peer package inside the running Pi install, without loading it. Consumers
+ * needing a file from the peer's own dist tree (for example the agent keybinding
+ * definitions the running mode installs globally) resolve it relative to this
+ * root instead of hard-coding an install path. Returns undefined when the
+ * process was not started from a Pi install or the peer cannot be resolved.
+ */
+export function resolveHostPeerPackageRoot(
+  name: string,
+  options: HostPeerLoadOptions = {},
+): string | undefined {
+  const entry = resolveHostPeerFile(name, options);
+  if (!entry) return undefined;
+  let dir: string;
+  try {
+    dir = dirname(realpathSync(entry));
+  } catch {
+    return undefined;
+  }
+  for (let depth = 0; depth < MAX_HOST_ROOT_DEPTH; depth += 1) {
+    if (readPackageJson(dir) !== undefined) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return undefined;
+}
+
+/**
  * Locates the running Pi install from the process entry. `process.argv[1]`
  * is the public, documented pointer to the launched script; a bin symlink
  * (npm global, nvm, homebrew) is resolved with realpath before walking up

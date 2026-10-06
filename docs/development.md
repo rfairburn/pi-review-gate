@@ -435,6 +435,21 @@ self-describing text rendered through Pi's default text display:
   line still fits and otherwise moves to its own wrapped row(s) below the card (oversized
   tokens hard-wrap) without truncating or dropping any family line, so the affordance
   stays visible at every width.
+- Peer loading happens entirely at session setup, never at render time (`src/host-peer-loader.ts`,
+  the established shared loader): soft `require` first (the loader's package
+  alias path), then resolution inside the running Pi install for a compiled
+  extension entry, which pi ≥ 0.86 loads by native import and whose `require()`
+  calls cannot resolve host packages by bare name (`src/index.ts` starts it at
+  activation and completes it during interactive `session_start`, before pi
+  renders the initial transcript). When the separately evaluated pi-tui record
+  has no configured app-level keybindings yet, the shared hints core installs
+  the host package's own manager through its `KeybindingsManager.create()`
+  static factory (built-in defaults plus the user's `keybindings.json`
+  overrides, the same file the running mode reads) on that record so a remapped
+  binding resolves exactly as the host renders it; a configured initialization
+  that fails installs nothing (no misleading defaults), the running session's
+  own manager is never touched, and a genuinely unavailable peer degrades to
+  the documented native full presentation instead of guessing.
 - Interaction stays the host's own: keyboard expansion is the global `app.tools.expand`
   binding, which flips every row's expansion state together, and in fullscreen mode the
   host's per-card click region toggles one card without changing its neighbors. Regular
@@ -564,6 +579,18 @@ Boundaries shared by all five families:
 - Unknown historical or malformed notification formats fall back to the full retained
   text rather than a potentially misleading summary, and when the host's renderer APIs
   are absent the native full presentation applies instead of a degraded guess.
+- The host peer modules the renderers read (pi-tui helpers and the native key-hint
+  helpers) are resolved through the established shared host-relative loader during
+  session setup — before anything renders, with no loading at render time. A compiled
+  extension entry cannot resolve host packages by bare `require` name (pi ≥ 0.86
+  loads pre-compiled CommonJS by native import), which previously left every
+  notification family on the native full-text fallback in real compiled launches; the
+  compiled-launch regression (`tests/message-expansion-compiled-launch.test.ts`) now
+  pins the actual behavior through pi's public `--extension` seam on a real PTY:
+  compact rows with the live configured hint — including a remapped
+  `keybindings.json` expansion binding driven by its real keystroke, and a
+  configured-empty binding that renders no hint — global expand/contract of the
+  complete retained text, and independent fullscreen clicks.
 - Keyboard expansion is the same native-configured `app.tools.expand` binding the
   tool rows use, toggling all expandable rows together. In fullscreen mode, clicking
   one notification operates that item

@@ -76,7 +76,13 @@
  * `undefined` (full native fallback) rather than emit a custom component whose
  * lines could exceed the terminal width and bypass the host's own wrapping; the
  * MouseRegion click affordance is likewise omitted when the peer is absent,
- * while keyboard expansion via the global binding keeps working.
+ * while keyboard expansion via the global binding keeps working. The pi-tui
+ * peer is resolved with the established shared host-relative loader
+ * (src/host-peer-loader.ts) asynchronously at session setup — a compiled
+ * extension entry (pi >= 0.86 native import) cannot resolve host packages by
+ * bare `require` name — and rendering itself performs no loading: it reads
+ * only the already-resolved peer record and degrades to the documented full
+ * native fallback when the peer is genuinely unavailable.
  */
 
 import {
@@ -84,6 +90,7 @@ import {
   isPresentationExpanded,
   type PresentationRenderer,
 } from "./presentation-expansion";
+import { loadHostPeerModule } from "./host-peer-loader";
 import { visibleTerminalText } from "./tool-result-text";
 import { BACKGROUND_TASK_STATES } from "./execution/task-state";
 
@@ -145,41 +152,64 @@ interface PiTuiHost {
 }
 
 let tuiOverride: PiTuiHost | undefined;
-let tuiLoaded: PiTuiHost | undefined;
-let tuiLoadAttempted = false;
+let tuiEntryProvider: (() => string | undefined) | undefined;
+/** Populated only by a completed warm; rendering never loads anything itself. */
+let warmedTuiHost: PiTuiHost | undefined;
+let warmPromise: Promise<PiTuiHost | undefined> | undefined;
 
 /** Test seam: inject a fake pi-tui host, or clear the override with undefined. */
 export function setPiTuiHost(host: PiTuiHost | undefined): void {
   tuiOverride = host;
 }
 
-function resolveTui(): PiTuiHost | undefined {
-  if (tuiOverride !== undefined) return tuiOverride;
-  if (!tuiLoadAttempted) {
-    tuiLoaded = loadPiTui();
-    tuiLoadAttempted = true;
-  }
-  return tuiLoaded;
+/**
+ * Test seam: replace (or clear) discovery of the running Pi entry file. The
+ * replacement still goes through the same realpath/package.json validation.
+ */
+export function setPiTuiHostEntryProvider(provider: (() => string | undefined) | undefined): void {
+  tuiEntryProvider = provider;
+  warmPromise = undefined;
+  warmedTuiHost = undefined;
 }
 
-function loadPiTui(): PiTuiHost | undefined {
-  try {
-    // Loaded inside Pi: the extension loader aliases @earendil-works/pi-tui to
-    // the running host's module. Never a hard import — it is a host-provided
-    // peer, not a dependency of this extension.
-    const tui = require("@earendil-works/pi-tui") as Record<string, unknown>;
-    const host: PiTuiHost = {};
-    if (typeof tui?.wrapTextWithAnsi === "function") {
-      host.wrapTextWithAnsi = tui.wrapTextWithAnsi as PiTuiHost["wrapTextWithAnsi"];
-    }
-    if (typeof tui?.MouseRegion === "function") {
-      host.MouseRegion = tui.MouseRegion as PiTuiHost["MouseRegion"];
-    }
-    return host;
-  } catch {
-    // Outside Pi (unit tests, tooling) the peer is simply not resolvable.
+/** The running host's pi-tui peer package name; resolved host-relatively. */
+const PI_TUI_PACKAGE_NAME = "@earendil-works/pi-tui";
+
+/**
+ * Resolves the running host's pi-tui peer through the established shared
+ * loader (soft require first — the extension loader's package alias path —
+ * then host-relative resolution for a compiled entry, which a pi >= 0.86
+ * native-import load needs) and remembers the resolved record for every later
+ * synchronous render. Memoized per process; a resolution that finds nothing is
+ * also final until the entry provider or override seam changes. Returns the
+ * resolved host record (possibly empty or undefined), never rejects.
+ */
+export function warmPiTuiHost(): Promise<PiTuiHost | undefined> {
+  if (tuiOverride !== undefined) return Promise.resolve(tuiOverride);
+  warmPromise ??= loadSharedPiTuiHost();
+  return warmPromise;
+}
+
+async function loadSharedPiTuiHost(): Promise<PiTuiHost | undefined> {
+  const tui = await loadHostPeerModule(PI_TUI_PACKAGE_NAME, { entryProvider: tuiEntryProvider });
+  if (!tui) {
+    warmedTuiHost = undefined;
     return undefined;
   }
+  const host: PiTuiHost = {};
+  if (typeof tui?.wrapTextWithAnsi === "function") {
+    host.wrapTextWithAnsi = tui.wrapTextWithAnsi as PiTuiHost["wrapTextWithAnsi"];
+  }
+  if (typeof tui?.MouseRegion === "function") {
+    host.MouseRegion = tui.MouseRegion as PiTuiHost["MouseRegion"];
+  }
+  warmedTuiHost = host;
+  return host;
+}
+
+function resolveTui(): PiTuiHost | undefined {
+  if (tuiOverride !== undefined) return tuiOverride;
+  return warmedTuiHost;
 }
 
 // ── Shared display helpers ───────────────────────────────────────────────────

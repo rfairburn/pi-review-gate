@@ -53,11 +53,22 @@
  *   are forwarded unchanged so family detail views can reuse the recorded
  *   call arguments instead of duplicating them.
  *
- * Outside a Pi host (unit tests, tooling) the peer packages are not
- * resolvable and no hint is rendered: the wrapper degrades to the inner
- * component byte-for-byte instead of guessing a key. Tests inject a fake
- * host through {@link setNativeExpansionHost}.
+ * Peer loading: the two host packages are resolved with the established
+ * shared host-relative loader (src/host-peer-loader.ts) — soft `require`
+ * first (works under the extension loader's package aliases), then, for a
+ * compiled extension entry (pi >= 0.86 loads pre-compiled CommonJS by native
+ * import and `require()` no longer sees the aliases), resolution inside the
+ * running Pi's own install. The load is asynchronous and happens at session
+ * setup — src/index.ts awaits it before the first render — never at render
+ * time: rendering only reads the already-resolved peer record and degrades
+ * to the byte-for-byte native fallback when it is genuinely unavailable.
+ * Tests inject a fake host through {@link setNativeExpansionHost}.
  */
+
+import { createRequire } from "node:module";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { loadHostPeerModule, resolveHostPeerPackageRoot } from "./host-peer-loader";
 
 /** The keybinding id Pi binds tool-output expansion to (default Ctrl+O). */
 export const EXPANSION_KEYBINDING_ID = "app.tools.expand";
@@ -79,51 +90,213 @@ export interface NativeExpansionHost {
 }
 
 let hostOverride: NativeExpansionHost | undefined;
-let loadedHost: NativeExpansionHost | undefined;
-let hostLoadAttempted = false;
+let hostEntryProvider: (() => string | undefined) | undefined;
+/** Populated only by a completed warm; rendering never loads anything itself. */
+let warmedHost: NativeExpansionHost | undefined;
+let warmPromise: Promise<NativeExpansionHost | undefined> | undefined;
 
 /** Test seam: inject a fake native host, or clear the override with undefined. */
 export function setNativeExpansionHost(host: NativeExpansionHost | undefined): void {
   hostOverride = host;
 }
 
-function resolveNativeHost(): NativeExpansionHost | undefined {
-  if (hostOverride !== undefined) return hostOverride;
-  if (!hostLoadAttempted) {
-    loadedHost = loadNativeExpansionHost();
-    hostLoadAttempted = true;
-  }
-  return loadedHost;
+/**
+ * Test seam: replace (or clear) discovery of the running Pi entry file. The
+ * replacement still goes through the same realpath/package.json validation.
+ */
+export function setNativeExpansionHostEntryProvider(
+  provider: (() => string | undefined) | undefined,
+): void {
+  hostEntryProvider = provider;
+  warmPromise = undefined;
+  warmedHost = undefined;
 }
 
-function loadNativeExpansionHost(): NativeExpansionHost | undefined {
-  try {
-    // Loaded inside Pi: the extension loader aliases @earendil-works/pi-coding-agent
-    // and @earendil-works/pi-tui to the running host's modules (verified in pi
-    // 0.85.1, dist/core/extensions/loader.js). Never a hard import: both are
-    // host-provided peers, not dependencies of this extension.
-    const agent = require("@earendil-works/pi-coding-agent") as {
-      keyHint?: (keybinding: string, description: string) => string;
-      keyText?: (keybinding: string) => string;
-    };
-    if (typeof agent?.keyHint !== "function") return undefined;
-    let visibleWidth: ((line: string) => number) | undefined;
-    let wrapTextWithAnsi: ((text: string, width: number) => string[]) | undefined;
-    try {
-      const tui = require("@earendil-works/pi-tui") as {
-        visibleWidth?: (line: string) => number;
-        wrapTextWithAnsi?: (text: string, width: number) => string[];
-      };
-      if (typeof tui?.visibleWidth === "function") visibleWidth = tui.visibleWidth;
-      if (typeof tui?.wrapTextWithAnsi === "function") wrapTextWithAnsi = tui.wrapTextWithAnsi;
-    } catch {
-      // A host without the pi-tui alias degrades to the conservative helpers below.
-    }
-    return { keyHint: agent.keyHint, keyText: agent.keyText, visibleWidth, wrapTextWithAnsi };
-  } catch {
-    // Outside Pi (unit tests, tooling) the peer is simply not resolvable.
+/**
+ * Resolves the running host's peer packages through the established shared
+ * loader (soft require first — the extension loader's package alias path —
+ * then host-relative resolution for a compiled entry) and remembers the
+ * resolved record for every later synchronous render. Memoized per process;
+ * a resolution that finds nothing is also final until the entry provider or
+ * override seam changes. Returns the resolved host (possibly undefined).
+ */
+export function warmNativeExpansionHost(): Promise<NativeExpansionHost | undefined> {
+  if (hostOverride !== undefined) return Promise.resolve(hostOverride);
+  warmPromise ??= loadSharedNativeExpansionHost();
+  return warmPromise;
+}
+
+const PI_AGENT_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
+const PI_TUI_PACKAGE_NAME = "@earendil-works/pi-tui";
+
+async function loadSharedNativeExpansionHost(): Promise<NativeExpansionHost | undefined> {
+  // Loaded inside Pi: the extension loader aliases @earendil-works/pi-coding-agent
+  // and @earendil-works/pi-tui to the running host's modules (verified in pi
+  // 0.85.1, dist/core/extensions/loader.js) for the soft-require step, and the
+  // shared loader's host-relative step covers a compiled entry (pi >= 0.86).
+  // Never a hard import: both are host-provided peers, not dependencies of
+  // this extension.
+  const agent = await loadHostPeerModule(PI_AGENT_PACKAGE_NAME, {
+    entryProvider: hostEntryProvider,
+    packageMainFallback: true,
+  });
+  const agentKeyHint = hostFnOf<(keybinding: string, description: string) => string>(agent, "keyHint");
+  if (!agentKeyHint) {
+    warmedHost = undefined;
     return undefined;
   }
+  const agentKeyText = hostFnOf<(keybinding: string) => string>(agent, "keyText");
+  const host: NativeExpansionHost = {
+    keyHint: (keybinding, description) => agentKeyHint(keybinding, description),
+    keyText: agentKeyText ? (keybinding) => agentKeyText(keybinding) : undefined,
+  };
+  try {
+    const tui = await loadHostPeerModule(PI_TUI_PACKAGE_NAME, { entryProvider: hostEntryProvider });
+    await configurePeerKeybindingsGlobal(tui);
+    const visibleWidth = hostFnOf<(line: string) => number>(tui, "visibleWidth");
+    const wrapTextWithAnsi = hostFnOf<(text: string, width: number) => string[]>(tui, "wrapTextWithAnsi");
+    if (visibleWidth && wrapTextWithAnsi) {
+      host.visibleWidth = (line) => visibleWidth(line);
+      host.wrapTextWithAnsi = (text, width) => wrapTextWithAnsi(text, width);
+    }
+  } catch {
+    // A host without the pi-tui peer degrades to the conservative helpers below.
+  }
+  warmedHost = host;
+  return host;
+}
+
+function resolveNativeHost(): NativeExpansionHost | undefined {
+  if (hostOverride !== undefined) return hostOverride;
+  return warmedHost;
+}
+
+/** The running host's agent keybinding config (dist-relative, no absolute path). */
+const AGENT_KEYBINDINGS_SUBPATH = "./dist/core/keybindings.js";
+
+// tsc rewrites `await import(x)` in CommonJS output to require(x), which
+// cannot load ESM on Node 20 — compile a native dynamic import the
+// transpiler leaves untouched (same technique as ./host-peer-loader).
+const nativeDynamicImport = new Function("specifier", "return import(specifier)") as (
+  specifier: string,
+) => Promise<unknown>;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * The running host's agent package keybinding definitions module (the class
+ * that carries the app-level defaults, including `app.tools.expand`, plus the
+ * user's keybindings.json overrides), loaded from the resolved install root
+ * without any absolute path. Returns undefined when unresolvable.
+ */
+async function loadAgentKeybindingDefinitions(
+  entryProvider: (() => string | undefined) | undefined,
+): Promise<Record<string, unknown> | undefined> {
+  const root = resolveHostPeerPackageRoot(PI_AGENT_PACKAGE_NAME, {
+    entryProvider,
+    packageMainFallback: true,
+  });
+  if (!root) return undefined;
+  let resolved: string;
+  try {
+    resolved = createRequire(join(root, "package.json")).resolve(AGENT_KEYBINDINGS_SUBPATH);
+  } catch {
+    return undefined;
+  }
+  try {
+    const mod = require(resolved) as unknown;
+    return isRecord(mod) ? mod : undefined;
+  } catch {
+    // Node < 22.12 (ERR_REQUIRE_ESM): load the same file natively instead.
+  }
+  try {
+    const mod = await nativeDynamicImport(pathToFileURL(resolved).href);
+    return isRecord(mod) ? mod : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The configured keys for the expansion binding from a manager, if any. */
+function expansionBindingKeys(manager: unknown): string[] | undefined {
+  if (!isRecord(manager) || typeof manager.getKeys !== "function") return undefined;
+  try {
+    const keys = manager.getKeys(EXPANSION_KEYBINDING_ID);
+    if (Array.isArray(keys) && keys.every((key) => typeof key === "string")) {
+      return keys as string[];
+    }
+  } catch {
+    // an unusable manager: treat as unconfigured
+  }
+  return undefined;
+}
+
+/**
+ * Gives the separately evaluated pi-tui record the running host's configured
+ * keybindings: the interactive mode installs its manager on the RUNNING
+ * (bundled) pi-tui copy, while a compiled extension resolves its own pi-tui
+ * record whose global starts empty (or lazily holds a TUI-only default without
+ * app-level ids) — so the record's `keyText("app.tools.expand")` resolution
+ * would otherwise be empty. When this record's current global cannot name the
+ * expansion binding yet, install the host's own configured manager — the agent
+ * package's `KeybindingsManager` (built-in app defaults plus the user's
+ * keybindings.json overrides, the same file the running mode reads). The
+ * running session's own manager and the bundled copy are never touched, and a
+ * resolution failure leaves the honest no-hint degradation (binding
+ * unresolved) rather than guessing a key.
+ */
+async function configurePeerKeybindingsGlobal(tui: Record<string, unknown> | undefined): Promise<void> {
+  try {
+    const getKeybindings = hostFnOf<() => unknown>(tui, "getKeybindings");
+    const setKeybindings = hostFnOf<(manager: unknown) => void>(tui, "setKeybindings");
+    if (!getKeybindings || !setKeybindings) return;
+    const currentKeys = expansionBindingKeys(safeCall(getKeybindings));
+    if (currentKeys !== undefined && currentKeys.length > 0) return; // already configured
+    const agent = await loadAgentKeybindingDefinitions(hostEntryProvider);
+    const agentManagerCtor = hostFnOf<new (...args: never[]) => unknown>(agent, "KeybindingsManager");
+    if (!agentManagerCtor) return;
+    // The configured manager comes from the class's own static factory
+    // (`KeybindingsManager.create()`, pi 1.0.2 and 1.0.4): built-in defaults
+    // plus the user's keybindings.json overrides, so a remapped expansion
+    // binding resolves exactly as the host renders it. Called with the class
+    // as receiver. A configured initialization failure installs nothing — a
+    // defaults-only manager would silently show a wrong hint for a remapped
+    // binding — and the honest no-hint degradation applies instead.
+    const staticCreate = typeof (agentManagerCtor as unknown as Record<string, unknown>).create === "function"
+      ? (agentManagerCtor as unknown as { create: (agentDir?: string) => unknown }).create
+      : undefined;
+    let managerValue: unknown;
+    if (staticCreate) {
+      try {
+        managerValue = staticCreate.call(agentManagerCtor);
+      } catch {
+        return;
+      }
+    } else {
+      // Unknown future layout without the static factory: the class's own
+      // constructor still installs its same built-in definitions.
+      managerValue = new agentManagerCtor();
+    }
+    if (isRecord(managerValue)) setKeybindings(managerValue);
+  } catch {
+    // Any failure leaves the honest no-hint degradation (binding unresolved).
+  }
+}
+
+function safeCall<T>(fn: ((...args: never[]) => T) | undefined): T | undefined {
+  if (typeof fn !== "function") return undefined;
+  try {
+    return (fn as () => T)();
+  } catch {
+    return undefined;
+  }
+}
+
+/** A structurally present callable member of one loaded peer record. */
+function hostFnOf<T>(record: Record<string, unknown> | undefined, name: string): T | undefined {
+  return typeof record?.[name] === "function" ? record[name] as T : undefined;
 }
 
 const SGR_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;

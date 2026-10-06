@@ -56,8 +56,12 @@ import { DeferredToolManager, isDeferredToolHost } from "./deferred-tools";
 import { loadOperatingModeSegments, OPERATING_MODE_LABELS } from "./operating-mode";
 import { registerModeCycleShortcut } from "./mode-cycle";
 import { contextIsInteractiveTui, registerUserQuestions, userQuestionsBeginSession, userQuestionsEndSession } from "./user-question";
-import { registerNotificationMessageRenderers } from "./message-expansion";
+import {
+  registerNotificationMessageRenderers,
+  warmPiTuiHost,
+} from "./message-expansion";
 import { prewarmPiAgentPeer } from "./peer-prewarm";
+import { warmNativeExpansionHost } from "./presentation-hints";
 import {
   EXECUTOR_TOOL_CATALOG_ENV,
   createExecutorToolCatalog,
@@ -321,6 +325,14 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   // existing notification text. Top level only — executor runtimes send none of
   // these. A host without registerMessageRenderer keeps the full native fallback.
   const notificationRenderersRegistered = registerNotificationMessageRenderers(pi);
+  // Unified expansion peers (#92, wiring via src/host-peer-loader.ts): a compiled
+  // extension entry (pi >= 0.86 native import) cannot resolve the host's
+  // pi-tui / key-hint packages by bare `require` name, so the shared
+  // presentation renderers resolve them asynchronously. Start resolving now and
+  // complete it during interactive session setup below, strictly before the
+  // first render; a genuinely absent peer keeps the documented native fallback.
+  void warmNativeExpansionHost();
+  void warmPiTuiHost();
   if (!notificationRenderersRegistered) {
     // Honest degradation: the host predates registerMessageRenderer, so the five
     // notification types render through the host's default label + full-Markdown
@@ -572,10 +584,19 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     // this hook (no timer, no visible UI) so the first /review-settings menu
     // and native textbox consume an already-cached module instead of pausing
     // on a cold load. Non-TUI modes never prewarm, and any failure keeps
-    // today's on-demand/fail-closed behavior. Never awaited here: the hook
-    // must not block on it.
+    // today's on-demand/fail-closed behavior. The prewarm call itself stays
+    // fire-and-forget; the expansion-peer warm below awaits the same in-flight
+    // module records.
     if (contextIsInteractiveTui(extractContext(args))) {
       void prewarmPiAgentPeer();
+      // #92: complete the expansion-peer resolution BEFORE anything renders —
+      // pi draws the initial (restored) transcript only after this hook
+      // completes, so a compiled deployment whose bare require() cannot see
+      // the host packages is fully wired ahead of the first message or tool
+      // row. Both waits join the prewarm's own in-flight module records; a
+      // genuinely absent peer keeps the honest native full fallback instead
+      // of failing the session.
+      await Promise.all([warmNativeExpansionHost(), warmPiTuiHost()]);
     }
     await sessionPersistence.awaitSaveTail();
     nativeToolPreflight.reset();

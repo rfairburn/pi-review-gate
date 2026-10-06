@@ -447,6 +447,9 @@ export class ExecutionToolManager {
       let executionId: string | undefined;
       let taskId: string | undefined;
       let instruction = "";
+      // Issue #309: only the interactive flow chooses a mode; explicit
+      // arguments keep their established non-interrupting request unchanged.
+      let interrupt: boolean | undefined;
       if (explicit) {
         let rest: string;
         [executionId, rest] = splitFirst(args);
@@ -461,6 +464,13 @@ export class ExecutionToolManager {
         taskId = selected.taskId;
         const ui = commandUi(ctx);
         if (!ui?.input && !ui?.editor) throw new Error("interactive input is unavailable; use /subtask-steer <executionId> <taskId> <instruction>");
+        // Issue #309: choose interrupt-or-defer before the instruction is
+        // entered. The choice maps onto the existing SubtasksSteer interrupt
+        // flag; dismissing it (like dismissing the task picker or the
+        // instruction field) returns before any steering or interruption.
+        const selectedMode = await ui.select("Steering mode", [STEER_MODE_DEFER, STEER_MODE_INTERRUPT]);
+        if (selectedMode !== STEER_MODE_DEFER && selectedMode !== STEER_MODE_INTERRUPT) return undefined;
+        interrupt = selectedMode === STEER_MODE_INTERRUPT;
         // The pre-bridge steering chain preserved on non-interactive hosts:
         // the single-line input first, the editor behind a cancelled input.
         // In an interactive TUI the shared native field seam presents the
@@ -468,7 +478,14 @@ export class ExecutionToolManager {
         instruction = (await editNativeTextField(ui, "Steering instruction", "", { preferInputFirst: true })) ?? "";
         if (!instruction.trim()) return undefined;
       }
-      return this.controller.steer({ executionId, taskId, instructions: instruction, instructionId: `user-steer-${randomUUID()}`, actor: "user" });
+      return this.controller.steer({
+        executionId,
+        taskId,
+        instructions: instruction,
+        instructionId: `user-steer-${randomUUID()}`,
+        actor: "user",
+        ...(interrupt === undefined ? {} : { interrupt }),
+      });
     });
     register("subtask-interrupt", "Pick a queued or active task to interrupt; explicit arguments remain optional.", async (args, ctx) => {
       let [executionId, taskId, mode] = words(args);
@@ -1659,6 +1676,11 @@ function requiredInteger(value: unknown, field: string, min: number, max: number
   if (!Number.isSafeInteger(value) || (value as number) < min || (value as number) > max) throw new Error(`${field} must be an integer between ${min} and ${max}`);
   return value as number;
 }
+
+/** Issue #309: interactive /subtask-steer modes. Non-interrupting steering is
+ * listed first so it stays the default highlighted choice. */
+const STEER_MODE_DEFER = "Steer without interrupting the active turn";
+const STEER_MODE_INTERRUPT = "Interrupt the active turn, then steer";
 
 async function selectTask(
   controller: BackgroundExecutionController,

@@ -15,6 +15,19 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.120]
+
+### Added
+
+- The no-argument `/subtask-steer` now asks, after you pick a task and before you
+  enter the instruction, whether to steer without interrupting the active turn
+  (listed first) or to interrupt it and then steer. The choice is sent as the
+  existing `SubtasksSteer` `interrupt` flag, so it keeps the same task, workspace,
+  review gates, transport statuses, and fail-closed handling. Dismissing any prompt
+  steers and interrupts nothing. The explicit
+  `/subtask-steer <executionId> <taskId> <instruction>` form and the model-facing
+  `SubtasksSteer` API are unchanged (#309).
+
 ## [0.1.0-dev.119]
 
 ### Fixed

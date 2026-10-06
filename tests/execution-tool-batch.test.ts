@@ -23,6 +23,10 @@ const executionToolNames = [
   "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean",
 ];
 
+// Issue #309: the interactive /subtask-steer mode labels.
+const STEER_MODE_DEFER = "Steer without interrupting the active turn";
+const STEER_MODE_INTERRUPT = "Interrupt the active turn, then steer";
+
 type ExecuteTool = (id: string, params: unknown, signal?: AbortSignal, update?: unknown, ctx?: unknown) => Promise<Record<string, any>>;
 
 function executionTool(tools: Array<Record<string, any>>, name: string): Record<string, any> {
@@ -947,13 +951,18 @@ test("/subtask-steer reports immediate acknowledgement or queued status in the l
     tasks: [{ title: "Steer me", instructions: "Wait for steering", acceptanceCriteria: ["Steering is applied"] }],
   }, undefined, undefined, {});
   const notifications: Array<{ message: string; level: string }> = [];
+  const selections: string[] = [];
   await commandHandlers.get("subtask-steer")!("", {
     ui: {
-      select: async (_title: string, options: string[]) => options[0],
+      select: async (title: string, options: string[]) => {
+        selections.push(title);
+        return title === "Steering mode" ? STEER_MODE_DEFER : options[0];
+      },
       input: async () => "Change direction now",
       notify: async (message: string, level: string) => notifications.push({ message, level }),
     },
   });
+  assert.deepEqual(selections, ["Steer background subtask", "Steering mode"]);
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0]?.level, "info");
   assert.match(notifications[0]?.message ?? "", new RegExp(started.details.tasks[0].taskId));
@@ -978,6 +987,162 @@ test("/subtask-steer reports malformed syntax and unknown targets as immediate f
   assert.equal(notifications.at(-1)?.level, "error");
   assert.match(notifications.at(-1)?.message ?? "", /\/subtask-steer failed:/);
   assert.match(notifications.at(-1)?.message ?? "", /unknown/i);
+  await manager.shutdown();
+});
+
+// Issue #309: the no-argument /subtask-steer offers an interrupt-or-defer
+// choice after task selection and before instruction entry, forwarding the
+// choice through the existing controller.steer interrupt flag.
+type SteerCall = { executionId?: string; taskId?: string; instructions: string; instructionId: string; actor: string; interrupt?: boolean };
+
+/** Record every controller steer/interrupt call while preserving the real controller behavior. */
+function spyOnControl(manager: ExecutionToolManager): { steers: SteerCall[]; interrupts: unknown[] } {
+  const controller = (manager as unknown as { controller: Record<string, (input: any) => Promise<unknown>> }).controller;
+  const steers: SteerCall[] = [];
+  const interrupts: unknown[] = [];
+  const steer = controller.steer!.bind(controller);
+  const interrupt = controller.interrupt!.bind(controller);
+  controller.steer = async (input: SteerCall) => {
+    steers.push({ ...input });
+    return steer(input);
+  };
+  controller.interrupt = async (input: unknown) => {
+    interrupts.push(input);
+    return interrupt(input);
+  };
+  return { steers, interrupts };
+}
+
+async function startSteerTarget(tools: Array<Record<string, any>>, id: string): Promise<{ executionId: string; taskId: string }> {
+  const execute = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+  const started = await execute(id, {
+    tasks: [{ title: "Steer target", instructions: "Wait for steering", acceptanceCriteria: ["Steering is applied"] }],
+  }, undefined, undefined, {});
+  return { executionId: started.details.executionId, taskId: started.details.tasks[0].taskId };
+}
+
+for (const [mode, expected] of [[STEER_MODE_DEFER, false], [STEER_MODE_INTERRUPT, true]] as const) {
+  test(`/subtask-steer orders task, mode, then instruction and forwards interrupt: ${expected} (#309)`, async () => {
+    const { tools, commandHandlers, manager } = harness({ slowExecutor: true });
+    const target = await startSteerTarget(tools, `steer-mode-${expected}`);
+    const spy = spyOnControl(manager);
+    const prompts: string[] = [];
+    const modeOptions: string[][] = [];
+    const notifications: Array<{ message: string; level: string }> = [];
+    await commandHandlers.get("subtask-steer")!("", {
+      ui: {
+        select: async (title: string, options: string[]) => {
+          prompts.push(`select:${title}`);
+          if (title === "Steering mode") {
+            modeOptions.push(options);
+            return mode;
+          }
+          return options[0];
+        },
+        input: async (title: string) => {
+          prompts.push(`input:${title}`);
+          return "Change direction now";
+        },
+        notify: async (message: string, level: string) => notifications.push({ message, level }),
+      },
+    });
+    assert.deepEqual(prompts, ["select:Steer background subtask", "select:Steering mode", "input:Steering instruction"]);
+    assert.deepEqual(modeOptions, [[STEER_MODE_DEFER, STEER_MODE_INTERRUPT]], "non-interrupting steering is listed first");
+    assert.equal(spy.steers.length, 1);
+    assert.equal(spy.interrupts.length, 0, "interrupt-or-defer steering never calls the terminal interrupt control");
+    const [call] = spy.steers;
+    assert.equal(call?.executionId, target.executionId);
+    assert.equal(call?.taskId, target.taskId, "the same selected task is steered");
+    assert.equal(call?.instructions, "Change direction now");
+    assert.equal(call?.actor, "user");
+    assert.equal(call?.interrupt, expected, "the chosen mode is forwarded through the existing interrupt flag");
+    // The command still reports the controller's own durable status.
+    assert.equal(notifications.length, 1);
+    assert.match(notifications[0]?.message ?? "", new RegExp(target.taskId));
+    assert.match(notifications[0]?.message ?? "", /latest command: steer /);
+    const inspect = executionTool(tools, "SubtasksInspect").execute as ExecuteTool;
+    const after = (await inspect(`steer-mode-after-${expected}`, target, undefined, undefined, {})).details as any;
+    const steerCommands = (after.tasks[0]?.commands ?? []).filter((command: any) => command.action === "steer");
+    assert.equal(steerCommands.length, 1);
+    assert.equal(steerCommands[0]?.instructionId, call?.instructionId);
+    assert.equal(steerCommands[0]?.interrupt === true, expected, "the durable command record carries the chosen mode");
+    await manager.shutdown();
+  });
+}
+
+for (const stage of ["task selection", "mode selection", "instruction entry", "blank instruction"] as const) {
+  test(`/subtask-steer cancelled at ${stage} performs no steering or interruption (#309)`, async () => {
+    const { tools, commandHandlers, manager } = harness({ slowExecutor: true });
+    const target = await startSteerTarget(tools, `steer-cancel-${stage.replace(/\s+/g, "-")}`);
+    const inspect = executionTool(tools, "SubtasksInspect").execute as ExecuteTool;
+    const before = (await inspect("steer-cancel-before", target, undefined, undefined, {})).details as any;
+    const spy = spyOnControl(manager);
+    const prompts: string[] = [];
+    const notifications: Array<{ message: string; level: string }> = [];
+    await commandHandlers.get("subtask-steer")!("", {
+      ui: {
+        select: async (title: string, options: string[]) => {
+          prompts.push(`select:${title}`);
+          if (title === "Steer background subtask") return stage === "task selection" ? undefined : options[0];
+          return stage === "mode selection" ? undefined : STEER_MODE_INTERRUPT;
+        },
+        input: async (title: string) => {
+          prompts.push(`input:${title}`);
+          return stage === "blank instruction" ? "   " : undefined;
+        },
+        editor: async (title: string) => {
+          prompts.push(`editor:${title}`);
+          return undefined;
+        },
+        notify: async (message: string, level: string) => notifications.push({ message, level }),
+      },
+    });
+    const expectedPrompts = {
+      "task selection": ["select:Steer background subtask"],
+      "mode selection": ["select:Steer background subtask", "select:Steering mode"],
+      "instruction entry": ["select:Steer background subtask", "select:Steering mode", "input:Steering instruction", "editor:Steering instruction"],
+      "blank instruction": ["select:Steer background subtask", "select:Steering mode", "input:Steering instruction"],
+    }[stage];
+    assert.deepEqual(prompts, expectedPrompts, "no later prompt opens after a cancellation");
+    assert.deepEqual(spy.steers, [], "no steering call");
+    assert.deepEqual(spy.interrupts, [], "no interruption call");
+    assert.deepEqual(notifications, [], "a cancelled command reports nothing");
+    const after = (await inspect("steer-cancel-after", target, undefined, undefined, {})).details as any;
+    assert.deepEqual(after.tasks[0]?.commands, before.tasks[0]?.commands, "no command was recorded");
+    assert.equal(after.tasks[0]?.state, before.tasks[0]?.state, "the task state is unchanged");
+    await manager.shutdown();
+  });
+}
+
+test("/subtask-steer explicit arguments keep the established request without a mode prompt (#309)", async () => {
+  const { tools, commandHandlers, manager } = harness({ slowExecutor: true });
+  const target = await startSteerTarget(tools, "steer-explicit");
+  const spy = spyOnControl(manager);
+  const prompts: string[] = [];
+  const notifications: Array<{ message: string; level: string }> = [];
+  await commandHandlers.get("subtask-steer")!(`${target.executionId} ${target.taskId} Focus on  the docs`, {
+    ui: {
+      select: async (title: string) => {
+        prompts.push(`select:${title}`);
+        return undefined;
+      },
+      input: async (title: string) => {
+        prompts.push(`input:${title}`);
+        return undefined;
+      },
+      notify: async (message: string, level: string) => notifications.push({ message, level }),
+    },
+  });
+  assert.deepEqual(prompts, [], "explicit arguments open no picker, mode, or instruction prompt");
+  assert.equal(spy.steers.length, 1);
+  assert.equal(spy.interrupts.length, 0);
+  const [call] = spy.steers;
+  assert.equal(call?.executionId, target.executionId);
+  assert.equal(call?.taskId, target.taskId);
+  assert.equal(call?.instructions, "Focus on  the docs");
+  assert.ok(!Object.prototype.hasOwnProperty.call(call, "interrupt"), "explicit syntax forwards no interrupt flag");
+  assert.equal(notifications.at(-1)?.level, "info");
+  assert.match(notifications.at(-1)?.message ?? "", /latest command: steer /);
   await manager.shutdown();
 });
 

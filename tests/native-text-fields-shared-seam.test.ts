@@ -361,7 +361,12 @@ test("steering keeps the input-first chain on non-interactive hosts; a cancelled
 
   const prompts: string[] = [];
   const steerUi = {
-    select: async (_title: string, choices: string[]) => choices[0],
+    // Issue #309: the task picker, then the interrupt-or-defer mode choice
+    // (non-interrupting steering is listed first), precede the text field.
+    select: async (title: string, choices: string[]) => {
+      prompts.push(`select:${title}`);
+      return choices[0];
+    },
     input: async (title: string) => {
       prompts.push(`input:${title}`);
       return undefined; // cancelled input: the pre-bridge chain opens the editor
@@ -378,7 +383,15 @@ test("steering keeps the input-first chain on non-interactive hosts; a cancelled
     (after.tasks[0]?.commands ?? []).some((command: any) => command.action === "steer" && /Focus on the docs directory/.test(String(command.text))),
     `the steered instruction was queued: ${JSON.stringify(after.tasks[0]?.commands)}`,
   );
-  assert.deepEqual(prompts, ["input:Steering instruction", "editor:Steering instruction:"], "input first, editor behind the cancelled input");
+  assert.deepEqual(
+    prompts,
+    ["select:Steer background subtask", "select:Steering mode", "input:Steering instruction", "editor:Steering instruction:"],
+    "task and mode selection first, then input first with the editor behind the cancelled input",
+  );
+  assert.ok(
+    (after.tasks[0]?.commands ?? []).every((command: any) => command.action !== "steer" || command.interrupt !== true),
+    "the first (non-interrupting) mode forwards no interruption",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -628,6 +641,8 @@ test("real host: steering instruction `/se` never lists slash commands and steer
     mode: "tui",
     ui: {
       ...ui,
+      // Issue #309: the task picker, then the interrupt-or-defer mode choice
+      // (first option: steer without interrupting), precede the host editor.
       select: async (_title: string, choices: string[]) => choices[0],
       notify(): void {},
     },

@@ -30,6 +30,10 @@ import {
 import { isActiveTaskState } from "../src/execution/task-state";
 import { activeExchangeBaseline, beginAgentRun, createState, rememberUserRequest, setReviewWindowCheckpointBaseline, type ReviewGateState } from "../src/state";
 import { initGitRepo, waitFor } from "./helpers/background-controller-fixtures";
+import { disposableAgentDir, testCheckpointScope } from "./checkpoint-scope-helpers";
+
+// #301: raw records live in this disposable agent dir's session namespace.
+const checkpointScope = testCheckpointScope(disposableAgentDir(), "nested-parent-session");
 
 const NESTED = "pkg";
 const GUARD_REFUSAL = /Parent checkpoint guard refused|not_repository_root/;
@@ -60,7 +64,7 @@ async function nestedRepository(prefix: string): Promise<{ repo: string; nested:
 }
 
 async function armCheckpoint(state: ReviewGateState, cwd: string, id: string): Promise<ReviewCheckpointDescriptor> {
-  const armed = await captureReviewCheckpoint(cwd, id);
+  const armed = await captureReviewCheckpoint(cwd, id, { scope: checkpointScope });
   assert.equal(armed.status, "ok", JSON.stringify(armed));
   if (armed.status !== "ok") throw new Error("checkpoint arm failed");
   assert.equal(armed.value.kind, "git", "a nested Git cwd must record a Git checkpoint");
@@ -69,7 +73,7 @@ async function armCheckpoint(state: ReviewGateState, cwd: string, id: string): P
 }
 
 function parentState(): ReviewGateState {
-  const state = createState();
+  const state = Object.assign(createState(), { checkpointScope });
   rememberUserRequest(state, "run subtasks while I keep editing the parent workspace");
   beginAgentRun(state);
   return state;
@@ -80,10 +84,10 @@ async function checkpointDiff(state: ReviewGateState, cwd: string): Promise<stri
   const baseline = activeExchangeBaseline(state);
   assert.equal(baseline?.kind, "checkpoint");
   if (baseline?.kind !== "checkpoint") throw new Error("missing checkpoint");
-  const current = await captureReviewCheckpoint(cwd, `test-current-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const current = await captureReviewCheckpoint(cwd, `test-current-${Date.now()}-${Math.random().toString(16).slice(2)}`, { scope: checkpointScope });
   assert.equal(current.status, "ok");
   if (current.status !== "ok") throw new Error("missing checkpoint");
-  const compared = await compareReviewCheckpoints(cwd, baseline.descriptor, current.value);
+  const compared = await compareReviewCheckpoints(cwd, baseline.descriptor, current.value, { scope: checkpointScope });
   assert.equal(compared.status, "ok", JSON.stringify(compared));
   return compared.status === "ok" ? compared.value.changes.map((change) => change.path).sort() : [];
 }
@@ -362,7 +366,7 @@ test("a nested parent checkpoint whose owner cannot be verified still refuses ad
     const stub = await writeRecordingStub(stubs, "binary-stub", "binary", marker);
     // A descriptor owned by a different repository, attributed to this
     // nested cwd: the resolved root must still verify it and refuse.
-    const foreignArm = await captureReviewCheckpoint(other.nested, "nested-refusal-foreign");
+    const foreignArm = await captureReviewCheckpoint(other.nested, "nested-refusal-foreign", { scope: checkpointScope });
     assert.equal(foreignArm.status, "ok");
     if (foreignArm.status !== "ok") throw new Error("arm failed");
     const state = parentState();

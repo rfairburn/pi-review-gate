@@ -15,6 +15,53 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.123]
+
+### Changed
+
+- Non-Git parent review checkpoints are no longer written inside the workspace
+  (#301). Every record now lives in the live Pi session's namespace under Pi's
+  agent-data directory, `<agent dir>/sessions/pi-review-gate/<session id>/checkpoints/`
+  (`~/.pi/agent` by default, following `PI_CODING_AGENT_DIR` on every platform), for
+  persisted and in-memory (`--no-session`) sessions alike. Review is not disabled for a
+  session without a conversation file, and no conversation persistence is enabled for
+  one. The location never follows the conversation file (even one inside the
+  workspace) or Pi's session-directory setting. Records bind the live session,
+  canonical workspace, review window, and a random owner generation; they are private,
+  atomically published, and every publication flushes each directory entry it depends
+  on. A restart verifies every checkpoint the saved review references before deciding
+  whether damage is recoverable. Loading and release re-derive the location from
+  the live session rather than any stored path, and only the verified owner generation
+  is removed at the existing release points. A record of another session or workspace
+  can never be cut over as recoverable damage. For an ordinary project root that
+  neither contains the checkpoint store nor lies inside it, no checkpoint bytes are
+  written under that root, so delegated task capture of it no longer sees checkpoint
+  records or counts them against `maxSnapshotBytes`; the overlapping case is a known
+  limitation described below. Ordinary project `.pi-review-gate` content, top-level
+  or nested, is captured and reviewed normally. Git checkpoints are unchanged.
+- The non-Git checkpoint format is now `prg-parent-raw/v2`. A persisted review window
+  that references an earlier non-Git format fails restore closed instead of being
+  migrated, and earlier in-workspace `.pi-review-gate/checkpoints` records are neither
+  read nor removed. If the agent-data checkpoint location overlaps the captured
+  workspace (for example `PI_CODING_AGENT_DIR` inside it, or a non-Git session started
+  in an ancestor of the agent directory such as the home directory), non-Git checkpoint
+  capture fails closed with an explicit unsupported-configuration error.
+
+### Known limitations
+
+- A workspace that overlaps the checkpoint store is only partly supported in this
+  release (#301). A non-Git review root that contains the store, or lies inside it, is
+  rejected as an unsupported configuration, as described above. A delegated execution
+  target whose tree contains the store is not rejected: its automatic task capture and
+  downstream snapshots may include checkpoint record files, and those bytes count
+  against capture budgets such as `maxSnapshotBytes`. Keeping the Pi agent directory
+  outside review and delegated workspaces avoids both. Follow-up
+  [#318](https://github.com/rfairburn/pi-review-gate/issues/318) will exclude exactly
+  this extension's checkpoint record files from automatic and downstream collection,
+  without choosing another storage destination and while still retaining tool-based
+  evidence of modifications to those files. Record file permissions and capture-size
+  limits are unchanged.
+
 ## [0.1.0-dev.122]
 
 ### Fixed

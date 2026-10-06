@@ -12,10 +12,14 @@ import type { EvidenceCandidate, EvidenceState } from "./evidence";
 import type { ReattachmentBundle } from "./execution/operation-record";
 import { decodeGitCheckpointDescriptor, GIT_CHECKPOINT_DESCRIPTOR_FORMAT, isSafeWindowId } from "./git-checkpoint";
 import type { GitCheckpointDescriptor } from "./git-checkpoint";
-import { loadReviewCheckpoint, type ReviewCheckpointDescriptor } from "./review-checkpoint";
+import {
+  isSafeCheckpointSessionId, loadReviewCheckpoint, RAW_CHECKPOINT_DAMAGE_PREFIX, RAW_REVIEW_CHECKPOINT_FORMAT,
+  type ReviewCheckpointDescriptor, type ReviewCheckpointScope,
+} from "./review-checkpoint";
 import type { ChangedFile, FileSnapshot, SnapshotOmission, WorkspaceSnapshot } from "./capture";
 import type { ReviewBaseline, ReviewGateState, ReviewWindow } from "./state";
 import type { ReviewerSession } from "./adapters/types";
+import { piAgentDir } from "./config-path";
 
 export const SESSION_STATE_ENTRY_TYPE = "pi-review-gate-session-state";
 const SESSION_STATE_VERSION = 4;
@@ -155,10 +159,12 @@ export class SessionStateGitBaselineError extends Error {
 /** Unified checkpoint restore failure (raw or Git). The sidecar is untouched. */
 export class SessionStateCheckpointBaselineError extends Error {
   readonly reason: string;
+  readonly detail: string | undefined;
   constructor(reason: string, detail?: string) {
     super(`Persisted review-gate checkpoint baseline failed verification (${reason})${detail ? `: ${detail}` : ""}.`);
     this.name = "SessionStateCheckpointBaselineError";
     this.reason = reason;
+    this.detail = detail;
   }
 }
 
@@ -458,7 +464,16 @@ export class SessionStateStore {
     await this.tail;
   }
 
-  async restore(currentCwd: string): Promise<RestoredSessionState | undefined> {
+  /**
+   * Restore and verify persisted state. `checkpointScope` is the trusted live
+   * session scope (live session id + Pi agent-data directory) that locates raw
+   * checkpoint records; it is never read from the sidecar. By default it is
+   * this store's live-bound session identity with Pi's resolved agent dir.
+   */
+  async restore(
+    currentCwd: string,
+    checkpointScope: ReviewCheckpointScope | undefined = { agentDir: piAgentDir(process.env), sessionId: this.identity.sessionId },
+  ): Promise<RestoredSessionState | undefined> {
     let text: string;
     try {
       text = await readFile(this.path, "utf8");
@@ -517,13 +532,17 @@ export class SessionStateStore {
     // Only an authentic current-format unified descriptor with a damaged
     // owned record/pin qualifies. Malformed sidecars, foreign descriptors and
     // legacy Git baselines remain fail-closed. No state is applied on failure.
+    // Every distinct descriptor is verified before any cutover decision: one
+    // recoverable failure can never mask another descriptor's or record's
+    // non-recoverable (schema, binding, session, workspace) failure.
     let damagedCheckpointReason: string | undefined;
-    try {
-      await verifyCheckpointBaselines(state);
-    } catch (error) {
-      if (!(error instanceof SessionStateCheckpointBaselineError) || preCutover
-        || !await hasRecoverableCheckpointDamage(state, currentCwd, error)) throw error;
-      damagedCheckpointReason = error.reason;
+    const failures = await verifyCheckpointBaselines(state, checkpointScope);
+    if (failures.length > 0) {
+      if (preCutover) throw failures[0];
+      for (const failure of failures) {
+        if (!await hasRecoverableCheckpointDamage(state, currentCwd, failure, checkpointScope)) throw failure;
+      }
+      damagedCheckpointReason = failures[0]!.reason;
       state.reviewWindow = undefined;
       state.lastQuestionWindow = undefined;
       state.pendingAcceptedReviewerQuestions = [];
@@ -550,7 +569,9 @@ export class SessionStateStore {
 
 /** Restrict fresh-start eligibility to well-formed local unified descriptors and
  * owned evidence failures. Never treat a foreign/malformed descriptor as damage. */
-async function hasRecoverableCheckpointDamage(state: ReviewGateState, currentCwd: string, error: SessionStateCheckpointBaselineError): Promise<boolean> {
+async function hasRecoverableCheckpointDamage(
+  state: ReviewGateState, currentCwd: string, error: SessionStateCheckpointBaselineError, checkpointScope: ReviewCheckpointScope | undefined,
+): Promise<boolean> {
   const baselines = [state.reviewWindow, state.lastQuestionWindow]
     .flatMap((window) => [window?.baseline, window?.activeExchange?.baseline])
     .filter((baseline) => baseline?.kind === "checkpoint");
@@ -562,14 +583,20 @@ async function hasRecoverableCheckpointDamage(state: ReviewGateState, currentCwd
     if (baseline.descriptor.kind === "git") {
       try { decodeGitCheckpointDescriptor(JSON.stringify(baseline.descriptor.checkpoint)); }
       catch { return false; }
-    } else if (!isSafeWindowId(baseline.descriptor.windowId)
+    } else if (baseline.descriptor.format !== RAW_REVIEW_CHECKPOINT_FORMAT
+      || !isSafeWindowId(baseline.descriptor.windowId)
       || !/^[0-9a-f]{32}$/.test(baseline.descriptor.owner)
       || !/^[0-9a-f]{64}$/.test(baseline.descriptor.digest)
+      // Only the trusted live session and the current canonical workspace can
+      // own a recoverable raw record; an identity mismatch is never damage.
+      || !checkpointScope || !isSafeCheckpointSessionId(baseline.descriptor.sessionId)
+      || baseline.descriptor.sessionId !== checkpointScope.sessionId
       || baseline.descriptor.root !== captureRoot) return false;
   }
   if (error.reason === "raw_checkpoint_failed") {
-    // Raw loader reports one broad reason; exclude descriptor/root failures.
-    return !/malformed raw descriptor|wrong root/.test(error.message);
+    // Only owned-record damage qualifies; descriptor, session, workspace,
+    // storage-location and privacy failures carry no damage marker.
+    return error.detail?.startsWith(RAW_CHECKPOINT_DAMAGE_PREFIX) === true;
   }
   return new Set([
     "checkpoint_data_missing", "checkpoint_digest_mismatch", "malformed_record",
@@ -579,12 +606,15 @@ async function hasRecoverableCheckpointDamage(state: ReviewGateState, currentCwd
 }
 
 /**
- * Reload and verify each distinct unified raw/Git descriptor before returning
- * restored state. Snapshot and typed legacy Git compatibility remain only
+ * Reload and verify EVERY distinct unified raw/Git descriptor, returning all
+ * unified failures (legacy Git baselines still throw immediately). Snapshot and typed legacy Git compatibility remain only
  * until the primary adapter has moved entirely to unified checkpoints.
  */
-async function verifyCheckpointBaselines(state: ReviewGateState): Promise<void> {
+async function verifyCheckpointBaselines(
+  state: ReviewGateState, checkpointScope: ReviewCheckpointScope | undefined,
+): Promise<SessionStateCheckpointBaselineError[]> {
   const seen = new Set<string>();
+  const failures: SessionStateCheckpointBaselineError[] = [];
   for (const window of [state.reviewWindow, state.lastQuestionWindow]) {
     if (!window) continue;
     for (const baseline of [window.baseline, window.activeExchange?.baseline]) {
@@ -598,11 +628,12 @@ async function verifyCheckpointBaselines(state: ReviewGateState): Promise<void> 
         const outcome = await loadReviewCheckpoint(baseline.cwd, { kind: "git", checkpoint: baseline.descriptor });
         if (outcome.status !== "ok") throw new SessionStateGitBaselineError(outcome.reason, outcome.detail);
       } else {
-        const outcome = await loadReviewCheckpoint(baseline.cwd, baseline.descriptor);
-        if (outcome.status !== "ok") throw new SessionStateCheckpointBaselineError(outcome.reason, outcome.detail);
+        const outcome = await loadReviewCheckpoint(baseline.cwd, baseline.descriptor, { scope: checkpointScope });
+        if (outcome.status !== "ok") failures.push(new SessionStateCheckpointBaselineError(outcome.reason, outcome.detail));
       }
     }
   }
+  return failures;
 }
 
 export function sessionPersistenceIdentity(ctx: unknown, fallbackCwd: string): SessionPersistenceIdentity | undefined {
@@ -1120,8 +1151,10 @@ function isPersistedCheckpointBaseline(value: unknown): value is PersistedCheckp
     && typeof d.checkpoint.gitDir === "string" && typeof d.checkpoint.base === "string"
     && typeof d.checkpoint.ref === "string" && typeof d.checkpoint.digest === "string"
     && (d.checkpoint.objectFormat === "sha1" || d.checkpoint.objectFormat === "sha256");
-  return d.kind === "raw" && d.format === "prg-parent-raw/v1"
-    && typeof d.root === "string" && typeof d.windowId === "string"
+  // Forward-only: raw descriptors must carry the current storage-bound format
+  // (#301). Earlier raw formats are rejected, never migrated.
+  return d.kind === "raw" && d.format === RAW_REVIEW_CHECKPOINT_FORMAT
+    && typeof d.sessionId === "string" && typeof d.root === "string" && typeof d.windowId === "string"
     && typeof d.owner === "string" && typeof d.digest === "string";
 }
 

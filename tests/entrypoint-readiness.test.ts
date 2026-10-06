@@ -16,6 +16,7 @@ import {
   triggerAgentEnd,
   waitForCondition,
   waitForFile,
+  testActivation,
 } from "./entrypoint-harness";
 
 async function activateNativeReadinessHost(
@@ -52,7 +53,7 @@ async function activateNativeReadinessHost(
       assertInitialized();
       active = [...names];
     },
-  });
+  }, testActivation());
   initialized = true;
   const context = { cwd, ui: {}, sessionManager: {}, hasUI: false };
   await trigger(hooks, "session_start", { cwd }, context);

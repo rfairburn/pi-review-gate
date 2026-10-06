@@ -17,6 +17,7 @@ import {
   trigger,
   triggerResults,
   webToolNames,
+  testActivation,
 } from "./entrypoint-harness";
 test("unsupported configuration warns and still registers normal tools and settings", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-legacy-config-fail-closed-"));
@@ -72,7 +73,7 @@ test("unsupported configuration warns and still registers normal tools and setti
       notify(message: string) { notices.push(message); },
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     assert.match(notices.join("\n"), /config warning: decider is invalid or unsupported/);
     assert.ok(commands.includes("review-settings"));
     assert.ok(tools.includes("ApplyPatch"));
@@ -167,7 +168,7 @@ test("session_start keeps launch-authorized native discovery active in the conse
       notify() {},
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     runtimeInitialized = true;
     await trigger(hooks, "session_start", { cwd: dir }, { cwd: dir, ui: {}, sessionManager: {} });
     for (const name of ["grep", "find", "ls"]) {
@@ -248,7 +249,7 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
       notify() {},
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     // Late registration (#279 follow-up): the loader is NOT registered at
     // factory time, so Pi's load-time replaceable-builtin collision pass sees
     // no competing tool_search definition.
@@ -449,14 +450,14 @@ test("deferred authorization survives API recreation and remains isolated per Pi
     const sessionAIdentity = {};
     const backingA = createBacking("SessionAOnly");
     const firstA = createWrapper(backingA);
-    await activate(firstA.pi);
+    await activate(firstA.pi, testActivation());
     const contextA = { cwd: dir, ui: {}, sessionManager: sessionAIdentity };
     await trigger(firstA.hooks, "session_start", { cwd: dir }, contextA);
 
     firstA.pi.registerTool({ name: "SessionALate", description: "Registered after authorization capture." });
     const reloadedA = createWrapper(backingA);
     assert.notEqual(reloadedA.pi, firstA.pi, "reload recreates the ExtensionAPI wrapper");
-    await activate(reloadedA.pi);
+    await activate(reloadedA.pi, testActivation());
     const reloadedContextA = { cwd: dir, ui: {}, sessionManager: sessionAIdentity };
     assert.notEqual(reloadedContextA, contextA, "reload recreates the ExtensionContext wrapper");
     await trigger(reloadedA.hooks, "session_start", { cwd: dir }, reloadedContextA);
@@ -471,7 +472,7 @@ test("deferred authorization survives API recreation and remains isolated per Pi
     const sessionBIdentity = {};
     const backingB = createBacking("SessionBOnly");
     const sessionB = createWrapper(backingB);
-    await activate(sessionB.pi);
+    await activate(sessionB.pi, testActivation());
     const contextB = { cwd: dir, ui: {}, sessionManager: sessionBIdentity };
     await trigger(sessionB.hooks, "session_start", { cwd: dir }, contextB);
     const ownB = await executeSearch(backingB, "SessionBOnly");
@@ -542,7 +543,7 @@ test("GitRead registers in the top-level runtime and follows the operating mode 
       notify() {},
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     // #73: GitRead registers in the top-level runtime before authorization capture.
     assert.ok(registeredTools.some((tool) => tool.name === "GitRead"), "GitRead registered at activation");
 

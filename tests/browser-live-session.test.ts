@@ -13,6 +13,7 @@ import { normalizeConfig } from "../src/config";
 import { InteractiveBrowserManager } from "../src/web/interactive-browser";
 import { WebToolManager } from "../src/web/tools";
 import { awaitPiSettlementReceipt, createPiSettlementBootstrap, piSettlementEnvironment } from "../src/execution/pi-settlement-receipt";
+import { testCheckpointActivation } from "./checkpoint-scope-helpers";
 
 function host() {
   const hooks = new Map<string, Array<(...args: any[]) => any>>();
@@ -120,7 +121,7 @@ review: { activeReviewers: [
     delete process.env.PI_REVIEW_GATE_DISABLED;
     delete process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
     const parent = host();
-    await activate(parent.pi, { webTools: new WebToolManager(parent.pi, config, undefined, undefined, manager) });
+    await activate(parent.pi, { ...testCheckpointActivation(), webTools: new WebToolManager(parent.pi, config, undefined, undefined, manager) });
     const ctx = { cwd: root, isIdle: () => true, notify: parent.pi.notify };
     await parent.emit("session_start", { reason: "startup" }, ctx);
     const opened = await manager.open(`https://live.test:${port}/first`);

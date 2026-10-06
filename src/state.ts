@@ -1,7 +1,7 @@
 import type { ChangedFile, WorkspaceSnapshot } from "./capture";
 import type { CorrectionFeedbackMarker } from "./correction-feedback";
 import type { GitCheckpointDescriptor } from "./git-checkpoint";
-import type { ReviewCheckpointDescriptor } from "./review-checkpoint";
+import type { ReviewCheckpointDescriptor, ReviewCheckpointScope } from "./review-checkpoint";
 import {
   createEvidenceState,
   recordAcceptedReviewerQuestion as recordAcceptedQuestionEvidence,
@@ -141,6 +141,12 @@ export interface ReviewGateState {
   reviewInProgress: boolean;
   queuedUserInputsDuringReview: string[];
   pendingModelDeliveries: PendingModelDelivery[];
+  /**
+   * Runtime-only trusted raw-checkpoint scope for the live Pi session (#301):
+   * the live session id plus Pi's resolved agent-data directory. Set from the
+   * live session context at session_start; never persisted or restored.
+   */
+  checkpointScope?: ReviewCheckpointScope;
 }
 
 export interface PendingModelDelivery {

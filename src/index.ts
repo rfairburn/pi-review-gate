@@ -8,7 +8,7 @@ import { ScheduledOrchestratorTurnTracker } from "./scheduling/orchestrator-turn
 import { deliverSubtaskLaunchNotice, type SubtaskLaunchNotice } from "./execution/launch-notice";
 import { getSchedulerRuntime } from "./scheduling/runtime";
 import { removeReviewBundle, removeTransientWindowBundle } from "./bundle";
-import { captureReviewCheckpoint } from "./review-checkpoint";
+import { captureReviewCheckpoint, reviewCheckpointScopeFromContext, type ReviewCheckpointScope } from "./review-checkpoint";
 import { registerCommands } from "./commands";
 import {
   recordToolCallEvidence,
@@ -84,6 +84,13 @@ interface ActivationDependencies {
    */
   schedulerTimer?: { now?: () => number; tickIntervalMs?: number };
   orchestratorTurnsTestAccess?: (tracker: ScheduledOrchestratorTurnTracker) => void;
+  /**
+   * #301 lifecycle-test seam for fake hosts that never emit a session_start
+   * carrying a live session manager: the raw-checkpoint scope those tests'
+   * "live session" would have. Pi never supplies dependencies, so production
+   * scope always comes from the live session context at session_start.
+   */
+  initialCheckpointScope?: ReviewCheckpointScope;
 }
 
 export async function activate(pi: unknown, dependencies: ActivationDependencies = {}): Promise<void> {
@@ -290,6 +297,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   const userQuestions = registerUserQuestions(pi);
 
   const state = createState();
+  state.checkpointScope = dependencies.initialCheckpointScope;
   let currentScopedModels: string[] = [];
   let sessionActive = true;
   let checkpointRestartBlocked: string | undefined;
@@ -539,6 +547,11 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     checkpointRestartBlocked = undefined;
     sessionPersistence.resetLedger();
     const context = extractContext(args);
+    // #301: raw checkpoints live in this live session's external namespace
+    // under Pi's agent-data directory, for persisted and in-memory sessions
+    // alike. The scope comes from the live session id, never from a session
+    // file location or a persisted descriptor.
+    state.checkpointScope = reviewCheckpointScopeFromContext(context) ?? dependencies.initialCheckpointScope;
     const deferredSessionIdentity = typeof context === "object" && context !== null
       ? (context as { sessionManager?: unknown }).sessionManager
       : undefined;
@@ -570,7 +583,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     let damagedReviewRestart = false;
     if (stateStore) {
       try {
-        const restored = await stateStore.restore(currentCwd);
+        const restored = await stateStore.restore(currentCwd, state.checkpointScope);
         if (restored) {
           if (restored.reviewCutover === "damaged_checkpoint") {
             // Preserve the authentic prior review and its damaged record/pin
@@ -605,7 +618,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
               // Arm immediately on restart, before another turn can edit the
               // workspace; never reuse any verdict or evidence from the old
               // window. before_agent_start will attach its exchange baseline.
-              const captured = await captureReviewCheckpoint(currentCwd, `window-${state.nextReviewWindowId}-${randomUUID()}`);
+              const captured = await captureReviewCheckpoint(currentCwd, `window-${state.nextReviewWindowId}-${randomUUID()}`, { scope: state.checkpointScope });
               if (captured.status !== "ok") throw new Error(`checkpoint capture failed (${captured.reason})`);
               beginAgentRun(state);
               setReviewWindowCheckpointBaseline(state, {

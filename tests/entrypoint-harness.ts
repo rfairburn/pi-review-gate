@@ -4,7 +4,9 @@
 // previous single-file behavior) and share fixtures rather than duplicating
 // the runtime wiring.
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
 import { access, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach } from "node:test";
 import { activate } from "../src/index";
@@ -25,8 +27,22 @@ export const webToolNames = [
 let previousConfig: string | undefined;
 let previousDisabled: string | undefined;
 let previousRuntimeRole: string | undefined;
+let previousAgentDir: string | undefined;
+/** #301: disposable Pi agent-data directory for this test. Raw (non-Git)
+ * checkpoints are stored under <agentDir>/sessions/pi-review-gate/<session>/,
+ * so tests never touch the real home directory. */
+export let testAgentDir = "";
+
+/** Activation dependencies for fake hosts that never emit a session_start
+ * with a live session manager: the scope that live session would provide. */
+export function testActivation(sessionId = "entrypoint-test-session") {
+  return { initialCheckpointScope: { agentDir: testAgentDir, sessionId } };
+}
 
 beforeEach(() => {
+  previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  testAgentDir = mkdtempSync(join(tmpdir(), "prg-entrypoint-agent-"));
+  process.env.PI_CODING_AGENT_DIR = testAgentDir;
   previousConfig = process.env.PI_REVIEW_GATE_CONFIG;
   previousDisabled = process.env.PI_REVIEW_GATE_DISABLED;
   // Hermetic top-level surface: an inherited executor role would divert
@@ -36,6 +52,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  rmSync(testAgentDir, { recursive: true, force: true });
   if (previousConfig === undefined) delete process.env.PI_REVIEW_GATE_CONFIG;
   else process.env.PI_REVIEW_GATE_CONFIG = previousConfig;
   if (previousDisabled === undefined) delete process.env.PI_REVIEW_GATE_DISABLED;

@@ -24,6 +24,7 @@ import {
   triggerResults,
   waitForCondition,
   waitForFile,
+  testActivation,
 } from "./entrypoint-harness";
 
 test("ordinary prompt in an initialized empty Git repository reaches normal review settlement", async () => {
@@ -47,7 +48,7 @@ test("ordinary prompt in an initialized empty Git repository reaches normal revi
     delete process.env.PI_REVIEW_GATE_DISABLED;
 
     session = createSessionRuntime("unborn-review-session", join(dir, "session.jsonl"), dir);
-    await activate(session.pi);
+    await activate(session.pi, testActivation());
     await trigger(session.hooks, "session_start", { type: "session_start", reason: "startup" }, session.ctx);
     await trigger(session.hooks, "input", { cwd: dir, text: "create the first file", source: "user" }, session.ctx);
     await trigger(session.hooks, "before_agent_start", { cwd: dir }, session.ctx);
@@ -123,7 +124,7 @@ review: { activeReviewers: [
       },
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
@@ -195,7 +196,7 @@ review: { activeReviewers: [
       },
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     await commands.get("review-pause")?.("", pi);
 
     await trigger(hooks, "input", { cwd: dir, text: "first paused change", source: "user" });
@@ -288,7 +289,7 @@ review: { activeReviewers: [
       },
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
@@ -368,7 +369,7 @@ review: { activeReviewers: [
       },
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
@@ -501,7 +502,7 @@ review: { activeReviewers: [
       },
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
@@ -552,7 +553,7 @@ test("session_shutdown runs review cleanup before the #84 diagnostic reset", asy
       },
       notify() {},
     };
-    await activate(pi);
+    await activate(pi, testActivation());
 
     // The #84 reporting hooks must be registered by real activation.
     for (const name of ["message_end", "context", "tool_execution_start", "agent_end", "session_start", "session_tree", "session_shutdown"]) {
@@ -672,7 +673,7 @@ review: { activeReviewers: [
       },
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
@@ -807,7 +808,7 @@ review: { activeReviewers: [
       },
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
@@ -918,7 +919,7 @@ review: { activeReviewers: [
       sendUserMessage() {},
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     assert.equal(commands.has("review-cancel"), true);
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
@@ -1048,7 +1049,7 @@ review: { activeReviewers: [
 
     // First session: establish a review window with a baseline, then shut down.
     const first = mkRuntime("legacy-conversation");
-    await activate(first.pi);
+    await activate(first.pi, testActivation());
     await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
     await trigger(first.hooks, "input", { cwd: dir, text: "initial request", source: "user" }, first.ctx);
     await trigger(first.hooks, "before_agent_start", { cwd: dir }, first.ctx);
@@ -1081,7 +1082,7 @@ review: { activeReviewers: [
     // The drop notice must count the legacy entry even though it has no
     // delivery record, without ever echoing its content.
     const resumed = mkRuntime("legacy-conversation");
-    await activate(resumed.pi);
+    await activate(resumed.pi, testActivation());
     await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
     // The recovery notice must not promise a /review-now release for an
     // occurrence that has no active durable delivery record; it stays
@@ -1196,7 +1197,7 @@ review: { activeReviewers: [
       },
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     await trigger(hooks, "session_start", { cwd: dir, ui: pi.ui, sessionManager });
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
@@ -1294,7 +1295,7 @@ review: { activeReviewers: [
       },
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo original-tool-evidence" } });
@@ -1400,7 +1401,7 @@ review: { activeReviewers: [
       },
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "incorrect\n", "utf8");
@@ -1491,7 +1492,7 @@ review: { activeReviewers: [
       },
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "broken\n", "utf8");
@@ -1603,7 +1604,7 @@ review: { activeReviewers: [
       },
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo capped-original-evidence" } });
@@ -1723,7 +1724,7 @@ review: { activeReviewers: [
       sendUserMessage() {},
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await trigger(hooks, "tool_call", { cwd: dir, toolName: "bash", input: { command: "echo old-capped-evidence" } });
@@ -1823,7 +1824,7 @@ review: { activeReviewers: [
       sendUserMessage() {},
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "first Docker task", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await trigger(hooks, "tool_call", { cwd: dir, toolName: "write", input: { path: outside } });
@@ -1932,7 +1933,7 @@ review: { activeReviewers: [
       },
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "write hello world and flag review-gate", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "after\n", "utf8");
@@ -2028,7 +2029,7 @@ review: { activeReviewers: [
       },
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "implement the change", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "first implementation\n", "utf8");
@@ -2118,7 +2119,7 @@ review: { activeReviewers: [
       },
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "implement the change", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
     await writeFile(join(dir, "index.ts"), "implemented\n", "utf8");
@@ -2208,7 +2209,7 @@ review: { activeReviewers: [
       ui: { notify() {} },
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     idle = false;
     await trigger(hooks, "before_agent_start", { cwd: dir });
@@ -2293,7 +2294,7 @@ review: { activeReviewers: [
       sendUserMessage(message: string, options: unknown) { followUps.push({ message, options }); },
     };
 
-    await activate(pi);
+    await activate(pi, testActivation());
     await trigger(hooks, "input", { cwd: dir, text: "change index", source: "user" });
     await trigger(hooks, "before_agent_start", { cwd: dir });
 
@@ -2347,7 +2348,7 @@ test("settings replace the mode prompt on the next run in the same conversation"
     const session = createSessionRuntime("mode-session", join(dir, "session.jsonl"), dir, {
       reviewSettings: (handler) => { settings = handler; },
     });
-    await activate(session.pi);
+    await activate(session.pi, testActivation());
     await trigger(session.hooks, "session_start", { cwd: dir }, session.ctx);
     const prompt = async () => {
       const results = await triggerResults(session.hooks, "before_agent_start", {

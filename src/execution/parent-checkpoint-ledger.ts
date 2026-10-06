@@ -105,7 +105,7 @@ export class ParentCheckpointLedger {
           ...compared.value.untrackedChanges.map((change) => change.path),
         ]));
       } else {
-        const compared = await changedRawCheckpointPaths(sourceRoot, baseline.descriptor);
+        const compared = await changedRawCheckpointPaths(sourceRoot, baseline.descriptor, { scope: this.env.state().checkpointScope });
         if (compared.status !== "ok") throw new Error(`Parent checkpoint guard refused: ${compared.reason} ${compared.detail ?? ""}`);
         changes.set(baseline.descriptor, compared.value);
       }
@@ -238,7 +238,7 @@ export class ParentCheckpointLedger {
           if (advanced.status !== "ok") throw new Error(`Parent checkpoint advance refused: ${advanced.reason} ${advanced.detail ?? ""}`);
           descriptor = { kind: "git", checkpoint: advanced.value.descriptor };
         } else {
-          const advanced = await advanceRawReviewCheckpoint(sourceRoot, old.descriptor, eligiblePaths, checkpointId);
+          const advanced = await advanceRawReviewCheckpoint(sourceRoot, old.descriptor, eligiblePaths, checkpointId, { scope: env.state().checkpointScope });
           if (advanced.status !== "ok") throw new Error(`Parent checkpoint advance refused: ${advanced.reason} ${advanced.detail ?? ""}`);
           descriptor = advanced.value;
         }
@@ -284,7 +284,7 @@ export class ParentCheckpointLedger {
       }
       for (const owner of superseded.values()) {
         try {
-          const released = await releaseReviewCheckpoint(owner.cwd, owner.descriptor);
+          const released = await releaseReviewCheckpoint(owner.cwd, owner.descriptor, { scope: env.state().checkpointScope });
           if (released.status !== "ok") await this.reportParentCheckpointRetention(faultContext, `owner release failed (${released.reason}): ${released.detail}`);
         } catch (error) {
           await this.reportParentCheckpointRetention(faultContext, `owner release failed (${messageOf(error)})`);
@@ -292,7 +292,7 @@ export class ParentCheckpointLedger {
       }
     } finally {
       // Failed or superseded compositions are not reachable from state.
-      for (const update of updates.values()) await releaseReviewCheckpoint(sourceRoot, update.descriptor);
+      for (const update of updates.values()) await releaseReviewCheckpoint(sourceRoot, update.descriptor, { scope: env.state().checkpointScope });
     }
   }
 

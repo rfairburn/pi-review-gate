@@ -14,6 +14,7 @@ import { SessionStateStore } from "../src/session-state";
 import {
   indexTestConfig,
   trigger,
+  testActivation,
 } from "./entrypoint-harness";
 async function createUncertainTransmissionHarness(input: {
   dir: string;
@@ -108,7 +109,7 @@ test("a throwing automatic transmission is durably uncertain and surfaced once i
     // throws. The delivery must be durably uncertain and surfaced exactly
     // once in-session, and agent_settled must resolve rather than reject.
     const first = mkRuntime("uncertain-conversation");
-    await activate(first.pi);
+    await activate(first.pi, testActivation());
     await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
     await trigger(first.hooks, "input", { cwd: dir, text: "change index", source: "user" }, first.ctx);
     await trigger(first.hooks, "before_agent_start", { cwd: dir }, first.ctx);
@@ -137,7 +138,7 @@ test("a throwing automatic transmission is durably uncertain and surfaced once i
     // not duplicate the in-session notice: the recovery notice is the
     // existing manual-inspection protocol, without the transport diagnostic.
     const resumed = mkRuntime("uncertain-conversation");
-    await activate(resumed.pi);
+    await activate(resumed.pi, testActivation());
     await trigger(resumed.hooks, "session_start", { type: "session_start", reason: "resume" }, resumed.ctx);
     assert.equal(resumed.followUps.length, 0, "restart must not re-dispatch an uncertain delivery");
     const resumedUncertain = resumed.notices.filter((notice) => notice.includes("is uncertain"));
@@ -159,7 +160,7 @@ test("uncertain transmission notices bound long transport diagnostics with visib
     const { mkRuntime } = await createUncertainTransmissionHarness({ dir, sessionFile, diagnostic: longDiagnostic });
 
     const runtime = mkRuntime("truncation-conversation");
-    await activate(runtime.pi);
+    await activate(runtime.pi, testActivation());
     await trigger(runtime.hooks, "session_start", { type: "session_start", reason: "startup" }, runtime.ctx);
     await trigger(runtime.hooks, "input", { cwd: dir, text: "change index", source: "user" }, runtime.ctx);
     await trigger(runtime.hooks, "before_agent_start", { cwd: dir }, runtime.ctx);
@@ -203,7 +204,7 @@ test("a failing uncertain-state persist rejects agent_settled without emitting t
     });
 
     const runtime = mkRuntime("uncertain-persist-conversation");
-    await activate(runtime.pi);
+    await activate(runtime.pi, testActivation());
     await trigger(runtime.hooks, "session_start", { type: "session_start", reason: "startup" }, runtime.ctx);
     await trigger(runtime.hooks, "input", { cwd: dir, text: "change index", source: "user" }, runtime.ctx);
     await trigger(runtime.hooks, "before_agent_start", { cwd: dir }, runtime.ctx);
@@ -262,7 +263,7 @@ test("shutdown before uncertain-state persistence does not masquerade as a durab
       runtime.ctx,
     );
 
-    await activate(runtime.pi);
+    await activate(runtime.pi, testActivation());
     await trigger(runtime.hooks, "session_start", { type: "session_start", reason: "startup" }, runtime.ctx);
     await trigger(runtime.hooks, "input", { cwd: dir, text: "change index", source: "user" }, runtime.ctx);
     await trigger(runtime.hooks, "before_agent_start", { cwd: dir }, runtime.ctx);
@@ -303,7 +304,7 @@ test("a pre-existing uncertain delivery record cannot duplicate the in-session n
     // Runtime A completes a full pass cycle with a working follow-up channel.
     const working = await createUncertainTransmissionHarness({ dir, sessionFile });
     const first = working.mkRuntime("dedupe-conversation");
-    await activate(first.pi);
+    await activate(first.pi, testActivation());
     await trigger(first.hooks, "session_start", { type: "session_start", reason: "startup" }, first.ctx);
     await trigger(first.hooks, "input", { cwd: dir, text: "change index", source: "user" }, first.ctx);
     await trigger(first.hooks, "before_agent_start", { cwd: dir }, first.ctx);
@@ -343,7 +344,7 @@ test("a pre-existing uncertain delivery record cannot duplicate the in-session n
     // deduplicates against the uncertain record must not emit a second
     // in-session uncertainty notice and must not re-send the follow-up.
     const second = working.mkRuntime("dedupe-conversation");
-    await activate(second.pi);
+    await activate(second.pi, testActivation());
     await trigger(second.hooks, "session_start", { type: "session_start", reason: "resume" }, second.ctx);
     assert.equal(second.followUps.length, 0, "recovery does not re-dispatch an uncertain delivery");
     await trigger(second.hooks, "input", { cwd: dir, text: "change index again", source: "user" }, second.ctx);

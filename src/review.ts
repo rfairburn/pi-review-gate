@@ -5,7 +5,7 @@ import { basename, join, relative, resolve, isAbsolute, sep } from "node:path";
 import { resolveReviewers, reviewerConfigFingerprint, reviewerDisplayLabel, reviewerDisplayLabels, unresolvedReviewerSelectionsFor, type DeciderConfig, type ReviewGateConfig } from "./config";
 import { createReviewerQuestionBundle, createReviewBundle, removeReviewBundle, syncReviewWindowArtifacts, type ReviewBundle } from "./bundle";
 import { BINARY_SAMPLE_BYTES, looksBinary, compareFileSnapshots, compareSnapshots, createPathSnapshot, createWorkspaceSnapshot, type ChangedFile, type FileSnapshot, type SnapshotOmission, type WorkspaceSnapshot } from "./capture";
-import { captureReviewCheckpoint, compareReviewCheckpoints, loadReviewCheckpoint, releaseReviewCheckpoint, reviewCheckpointWorkspaceRoot, type ReviewCheckpointDescriptor, type ReviewCheckpointChange, type ReviewCheckpointState } from "./review-checkpoint";
+import { captureReviewCheckpoint, compareReviewCheckpoints, loadReviewCheckpoint, releaseReviewCheckpoint, reviewCheckpointWorkspaceRoot, type ReviewCheckpointDescriptor, type ReviewCheckpointChange, type ReviewCheckpointScope, type ReviewCheckpointState } from "./review-checkpoint";
 import { buildUnifiedPatch, type PatchBuildResult } from "./diff";
 import { buildEvidenceBundle, collectEvidenceChanges, type EvidenceState } from "./evidence";
 import {
@@ -48,6 +48,8 @@ export interface ReviewRunInput {
   onUpdate?: (message: string) => void;
   onInvocationPrepared?: () => void | Promise<void>;
   window?: ReviewWindow;
+  /** Trusted live-session scope that locates raw (non-Git) checkpoint records. */
+  checkpointScope?: ReviewCheckpointScope;
 }
 
 /** Exact Git-derived change data for a normalized candidate commit. */
@@ -82,6 +84,8 @@ export interface ReviewRunOutput {
 
 export interface PausedExchangeInput {
   cwd: string;
+  /** Trusted live-session scope that locates raw (non-Git) checkpoint records. */
+  checkpointScope?: ReviewCheckpointScope;
   config: ReviewGateConfig;
   evidence?: EvidenceState;
   actingUsage?: TokenUsage;
@@ -103,6 +107,8 @@ export interface AskReviewerInput {
   onUpdate?: (message: string) => void;
   onInvocationPrepared?: () => void | Promise<void>;
   window?: ReviewWindow;
+  /** Trusted live-session scope that locates raw (non-Git) checkpoint records. */
+  checkpointScope?: ReviewCheckpointScope;
 }
 
 export interface AskReviewerOutput {
@@ -179,7 +185,7 @@ export async function runReview(input: ReviewRunInput): Promise<ReviewRunOutput>
   const checkpointBefore = typedCheckpointBaselineOf(input.before);
   const gitBefore = typedGitBaselineOf(input.before);
   const settled = checkpointBefore
-    ? await settleCheckpointReview({ cwd: input.cwd, before: checkpointBefore, exchangeBefore: input.window?.activeExchange?.baseline, config: input.config, signal: input.signal, evidence: input.evidence })
+    ? await settleCheckpointReview({ cwd: input.cwd, before: checkpointBefore, exchangeBefore: input.window?.activeExchange?.baseline, config: input.config, signal: input.signal, evidence: input.evidence, scope: input.checkpointScope })
     : gitBefore
     ? await settleGitReview({
         cwd: input.cwd,
@@ -400,7 +406,7 @@ export async function collectPausedReviewExchange(input: PausedExchangeInput): P
   const gitBaseline = typedGitBaselineOf(active.baseline);
   if (checkpointBaseline || gitBaseline) {
     const settled = checkpointBaseline
-      ? await settleCheckpointReview({ cwd: input.cwd, before: checkpointBaseline, config: input.config, evidence: input.evidence })
+      ? await settleCheckpointReview({ cwd: input.cwd, before: checkpointBaseline, config: input.config, evidence: input.evidence, scope: input.checkpointScope })
       : await settleGitReview({ cwd: input.cwd, before: gitBaseline!, config: input.config });
     try {
       const evidenceChanges = input.evidence
@@ -484,6 +490,7 @@ export async function runAskReviewer(input: AskReviewerInput): Promise<AskReview
   // it after artifacts are written without transferring window ownership.
   const collected = await collectCurrentChanges({
     cwd: input.cwd,
+    checkpointScope: input.checkpointScope,
     before: input.before,
     config: input.config,
     evidence: input.evidence,
@@ -1173,8 +1180,8 @@ function checkpointFailure(context: string, result: { reason?: string; detail?: 
   return new Error(`review gate: ${context} failed (${result.reason ?? "unknown"}): ${result.detail ?? "checkpoint unavailable"}; refusing snapshot fallback`);
 }
 
-async function releaseCheckpoint(cwd: string, descriptor: ReviewCheckpointDescriptor): Promise<void> {
-  const result = await releaseReviewCheckpoint(cwd, descriptor);
+async function releaseCheckpoint(cwd: string, descriptor: ReviewCheckpointDescriptor, scope: ReviewCheckpointScope | undefined): Promise<void> {
+  const result = await releaseReviewCheckpoint(cwd, descriptor, { scope });
   if (result.status !== "ok") throw checkpointFailure("releasing after-checkpoint", result);
 }
 
@@ -1209,9 +1216,10 @@ function checkpointDelta(changes: ReviewCheckpointChange[], config: ReviewGateCo
 async function settleCheckpointReview(input: {
   cwd: string; before: UnifiedReviewBaseline; exchangeBefore?: ReviewBaseline;
   config: ReviewGateConfig; signal?: AbortSignal; evidence?: EvidenceState;
+  scope?: ReviewCheckpointScope;
 }): Promise<SettledBaseline> {
   const { cwd, before, config } = input;
-  const options = input.signal ? { signal: input.signal } : {};
+  const options = { ...(input.signal ? { signal: input.signal } : {}), scope: input.scope };
   if (before.cwd !== cwd) throw new Error("review gate: checkpoint baseline root mismatch");
   const exchange = input.exchangeBefore;
   if (exchange && (exchange.kind !== "checkpoint" || exchange.cwd !== cwd)) throw new Error("review gate: mixed or wrong-root exchange baseline");
@@ -1234,7 +1242,7 @@ async function settleCheckpointReview(input: {
     if (!path || isAbsolute(path) || path === ".." || path.startsWith(`..${sep}`)) continue;
     try {
       frozenCandidateAfter.set(candidate.absolutePath, await createPathSnapshot(checkpointRoot, candidate.absolutePath, {
-        maxFileBytes: config.maxFileBytes, maxSnapshotBytes: config.maxSnapshotBytes, ...options,
+        maxFileBytes: config.maxFileBytes, maxSnapshotBytes: config.maxSnapshotBytes, ...(input.signal ? { signal: input.signal } : {}),
       }));
     } catch (error) {
       if (input.signal?.aborted) throw error;
@@ -1243,7 +1251,7 @@ async function settleCheckpointReview(input: {
   const captured = await captureReviewCheckpoint(cwd, randomUUID(), options);
   if (captured.status !== "ok") throw checkpointFailure("capturing after-checkpoint", captured);
   const descriptor = captured.value;
-  const releaseOrphan = () => releaseCheckpoint(cwd, descriptor);
+  const releaseOrphan = () => releaseCheckpoint(cwd, descriptor, input.scope);
   try {
     const windowResult = await compareReviewCheckpoints(cwd, before.descriptor, descriptor, options);
     if (windowResult.status !== "ok") throw checkpointFailure("comparing window", windowResult);
@@ -1462,6 +1470,7 @@ interface CurrentChanges {
 
 async function collectCurrentChanges(input: {
   cwd: string;
+  checkpointScope?: ReviewCheckpointScope;
   before?: WorkspaceSnapshot | ReviewBaseline;
   config: ReviewGateConfig;
   evidence?: EvidenceState;
@@ -1476,7 +1485,7 @@ async function collectCurrentChanges(input: {
   const gitBefore = typedGitBaselineOf(input.before);
   if (checkpointBefore || gitBefore) {
     const settled = checkpointBefore
-      ? await settleCheckpointReview({ cwd: input.cwd, before: checkpointBefore, config: input.config, evidence: input.evidence })
+      ? await settleCheckpointReview({ cwd: input.cwd, before: checkpointBefore, config: input.config, evidence: input.evidence, scope: input.checkpointScope })
       : await settleGitReview({ cwd: input.cwd, before: gitBefore!, config: input.config });
     try {
       const evidenceChanges = input.evidence

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -11,7 +11,8 @@ import { materializeReviewConfig, normalizeConfig, unresolvedReviewerSelectionsF
 import { queueModelDelivery } from "../src/durable-delivery";
 import { createEvidenceState } from "../src/evidence";
 import { armGitCheckpoint } from "../src/git-checkpoint";
-import { captureReviewCheckpoint } from "../src/review-checkpoint";
+import { captureReviewCheckpoint, rawReviewCheckpointRecordPath } from "../src/review-checkpoint";
+import { testCheckpointScope, withTestAgentDir } from "./checkpoint-scope-helpers";
 import {
   configDigest,
   replaceReviewGateState,
@@ -1538,13 +1539,14 @@ test("a provisional v2 sidecar with a snapshot reference starts a fresh review",
   }
 });
 
-test("unified raw checkpoint stays compact, deduplicates an equal descriptor, and verifies on restore", async () => {
+test("unified raw checkpoint stays compact, deduplicates an equal descriptor, and verifies on restore", async () => withTestAgentDir(async (agentDir) => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-unified-raw-"));
+  const scope = testCheckpointScope(agentDir, "raw-session");
   try {
     const sessionFile = join(root, "conversation.jsonl");
     await writeFile(sessionFile, "", "utf8");
     await writeFile(join(root, "payload.txt"), "unified-raw-payload-sentinel", "utf8");
-    const captured = await captureReviewCheckpoint(root, "window-raw");
+    const captured = await captureReviewCheckpoint(root, "window-raw", { scope });
     assert.equal(captured.status, "ok");
     if (captured.status !== "ok") return;
     assert.equal(captured.value.kind, "raw");
@@ -1555,7 +1557,7 @@ test("unified raw checkpoint stays compact, deduplicates an equal descriptor, an
     state.reviewWindow!.activeExchange!.baseline = { ...baseline, capturedAt: "later", descriptor:
       captured.value.kind === "raw" ? {
         digest: captured.value.digest, owner: captured.value.owner, windowId: captured.value.windowId,
-        root: captured.value.root, format: captured.value.format, kind: captured.value.kind,
+        root: captured.value.root, sessionId: captured.value.sessionId, format: captured.value.format, kind: captured.value.kind,
       } : captured.value };
     const store = new SessionStateStore({ sessionId: "raw-session", sessionFile, cwd: root });
     state.reviewsPaused = true;
@@ -1571,7 +1573,7 @@ test("unified raw checkpoint stays compact, deduplicates an equal descriptor, an
       $checkpointRef: { format: "pi-review-gate-review-checkpoint", version: 1, target: "window.baseline" },
     });
     assert.ok(!text.includes("unified-raw-payload-sentinel"));
-    const restored = await store.restore(root);
+    const restored = await store.restore(root, scope);
     assert.strictEqual(restored?.state.reviewWindow?.baseline, restored?.state.reviewWindow?.activeExchange?.baseline);
     assert.deepEqual(restored?.execution.waveRoots, ["execution-root"]);
 
@@ -1579,23 +1581,39 @@ test("unified raw checkpoint stays compact, deduplicates an equal descriptor, an
     delete missing.state.reviewWindow.baseline;
     signSidecarForTest(missing);
     await writeFile(store.path, JSON.stringify(missing));
-    await assert.rejects(store.restore(root), SessionStateInvalidStateError);
+    await assert.rejects(store.restore(root, scope), SessionStateInvalidStateError);
     delete missing.state.reviewWindow.activeExchange.baseline;
     signSidecarForTest(missing);
     await writeFile(store.path, JSON.stringify(missing));
-    await assert.rejects(store.restore(root), SessionStateInvalidStateError, "armed marker rejects loss of both baseline fields");
+    await assert.rejects(store.restore(root, scope), SessionStateInvalidStateError, "armed marker rejects loss of both baseline fields");
 
     const malformed = JSON.parse(text);
     malformed.state.reviewWindow.baseline.descriptor.digest = "not-a-digest";
     signSidecarForTest(malformed);
     await writeFile(store.path, JSON.stringify(malformed));
-    await assert.rejects(store.restore(root), (error: unknown) =>
+    await assert.rejects(store.restore(root, scope), (error: unknown) =>
       error instanceof SessionStateCheckpointBaselineError && error.reason === "raw_checkpoint_failed");
 
     await writeFile(store.path, text);
     if (captured.value.kind !== "raw") return;
-    await rm(join(root, ".pi-review-gate", "checkpoints", `${captured.value.windowId}-${captured.value.owner}`, "record.json"));
-    const damaged = await store.restore(root);
+    // Identity mismatch is never recoverable damage: a different live session
+    // or a missing session scope cannot locate or cut over this record.
+    await assert.rejects(store.restore(root, testCheckpointScope(agentDir, "other-session")), (error: unknown) =>
+      error instanceof SessionStateCheckpointBaselineError && /wrong session/.test(error.message));
+    // The default scope is the store's own live-bound session identity plus
+    // Pi's resolved agent-data directory (PI_CODING_AGENT_DIR here).
+    assert.equal((await store.restore(root))?.reviewCutover, undefined);
+    assert.equal(await readFile(store.path, "utf8"), text);
+    // Forward-only format: a previous raw descriptor format is rejected, not migrated.
+    const previousFormat = JSON.parse(text);
+    previousFormat.state.reviewWindow.baseline.descriptor.format = "prg-parent-raw/v1";
+    delete previousFormat.state.reviewWindow.baseline.descriptor.sessionId;
+    signSidecarForTest(previousFormat);
+    await writeFile(store.path, JSON.stringify(previousFormat));
+    await assert.rejects(store.restore(root, scope), SessionStateInvalidStateError);
+    await writeFile(store.path, text);
+    await rm(rawReviewCheckpointRecordPath(scope, await realpath(root), captured.value));
+    const damaged = await store.restore(root, scope);
     assert.equal(damaged?.reviewCutover, "damaged_checkpoint");
     assert.equal(damaged?.state.reviewWindow, undefined);
     assert.deepEqual(damaged?.execution.waveRoots, ["execution-root"]);
@@ -1604,15 +1622,79 @@ test("unified raw checkpoint stays compact, deduplicates an equal descriptor, an
     assert.equal(damaged?.state.pendingAcceptedReviewerQuestions.length, 0);
     assert.equal(await readFile(store.path, "utf8"), text);
   } finally { await rm(root, { recursive: true, force: true }); }
-});
+}));
 
-test("a signed foreign unified checkpoint and malformed execution association never qualify for damage cutover", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-review-foreign-unified-"));
-  const foreign = await mkdtemp(join(tmpdir(), "pi-review-foreign-root-"));
+test("one recoverable damaged record never masks a distinct exchange descriptor's non-recoverable failure", async () => withTestAgentDir(async (agentDir) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-all-baselines-"));
+  const scope = testCheckpointScope(agentDir, "all-baselines");
   try {
     const sessionFile = join(root, "conversation.jsonl");
     await writeFile(sessionFile, "");
-    const captured = await captureReviewCheckpoint(root, "window-foreign-check");
+    await writeFile(join(root, "work.txt"), "baseline\n");
+    const windowCapture = await captureReviewCheckpoint(root, "window-all-window", { scope });
+    const exchangeCapture = await captureReviewCheckpoint(root, "window-all-exchange", { scope });
+    if (windowCapture.status !== "ok" || windowCapture.value.kind !== "raw"
+      || exchangeCapture.status !== "ok" || exchangeCapture.value.kind !== "raw") throw new Error("expected raw captures");
+    const windowDescriptor = windowCapture.value, exchangeDescriptor = exchangeCapture.value;
+    const state = createState();
+    beginAgentRun(state);
+    setReviewWindowCheckpointBaseline(state, { kind: "checkpoint", descriptor: windowDescriptor, cwd: root, capturedAt: "now" });
+    state.reviewWindow!.activeExchange!.baseline = { kind: "checkpoint", descriptor: exchangeDescriptor, cwd: root, capturedAt: "later" };
+    const store = new SessionStateStore({ sessionId: "all-baselines", sessionFile, cwd: root });
+    await store.save(state, { waveRoots: [], bundles: [] }, normalizeConfig({ enabled: true }));
+    const text = await readFile(store.path, "utf8");
+    const canonicalRoot = await realpath(root);
+    const windowRecord = rawReviewCheckpointRecordPath(scope, canonicalRoot, windowDescriptor);
+    const exchangeRecord = rawReviewCheckpointRecordPath(scope, canonicalRoot, exchangeDescriptor);
+    const windowBytes = await readFile(windowRecord);
+    await rm(windowRecord);
+
+    // Malformed (unexpected-field) distinct exchange descriptor.
+    const malformed = JSON.parse(text);
+    malformed.state.reviewWindow.activeExchange.baseline.descriptor.extra = "unexpected";
+    signSidecarForTest(malformed);
+    const malformedText = JSON.stringify(malformed);
+    await writeFile(store.path, malformedText);
+    await assert.rejects(store.restore(root, scope), (error: unknown) =>
+      error instanceof SessionStateCheckpointBaselineError && /malformed raw descriptor/.test(error.message));
+    assert.equal(await readFile(store.path, "utf8"), malformedText, "the sidecar is preserved");
+
+    // Binding-mismatched distinct exchange record (digest re-signed to match).
+    const exchangeBytes = await readFile(exchangeRecord);
+    const forged = JSON.parse(exchangeBytes.toString("utf8"));
+    forged.sessionId = "another-session";
+    const forgedBytes = Buffer.from(JSON.stringify(forged));
+    await rm(exchangeRecord);
+    await writeFile(exchangeRecord, forgedBytes, { mode: 0o600 });
+    const mismatch = JSON.parse(text);
+    mismatch.state.reviewWindow.activeExchange.baseline.descriptor.digest = createHash("sha256").update(forgedBytes).digest("hex");
+    signSidecarForTest(mismatch);
+    const mismatchText = JSON.stringify(mismatch);
+    await writeFile(store.path, mismatchText);
+    await assert.rejects(store.restore(root, scope), (error: unknown) =>
+      error instanceof SessionStateCheckpointBaselineError && /record binding mismatch/.test(error.message));
+    assert.equal(await readFile(store.path, "utf8"), mismatchText, "the sidecar is preserved");
+    assert.ok((await readFile(exchangeRecord)).equals(forgedBytes), "nothing is deleted");
+
+    // Control: with the exchange intact, the same missing window record is
+    // ordinary recoverable damage.
+    await rm(exchangeRecord);
+    await writeFile(exchangeRecord, exchangeBytes, { mode: 0o600 });
+    await writeFile(store.path, text);
+    const damaged = await store.restore(root, scope);
+    assert.equal(damaged?.reviewCutover, "damaged_checkpoint");
+    assert.ok(windowBytes.length > 0);
+  } finally { await rm(root, { recursive: true, force: true }); }
+}));
+
+test("a signed foreign unified checkpoint and malformed execution association never qualify for damage cutover", async () => withTestAgentDir(async (agentDir) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-foreign-unified-"));
+  const foreign = await mkdtemp(join(tmpdir(), "pi-review-foreign-root-"));
+  const scope = testCheckpointScope(agentDir, "foreign-check");
+  try {
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "");
+    const captured = await captureReviewCheckpoint(root, "window-foreign-check", { scope });
     assert.equal(captured.status, "ok");
     if (captured.status !== "ok" || captured.value.kind !== "raw") return;
     const state = createState();
@@ -1627,18 +1709,27 @@ test("a signed foreign unified checkpoint and malformed execution association ne
     foreignSidecar.state.reviewWindow.baseline.descriptor.root = foreign;
     signSidecarForTest(foreignSidecar);
     await writeFile(store.path, JSON.stringify(foreignSidecar));
-    await assert.rejects(store.restore(root), SessionStateCheckpointBaselineError);
+    await assert.rejects(store.restore(root, scope), SessionStateCheckpointBaselineError);
+
+    // A sidecar naming another session cannot be cut over even when this
+    // session's record is genuinely missing.
+    const foreignSession = JSON.parse(JSON.stringify(original));
+    foreignSession.state.reviewWindow.baseline.descriptor.sessionId = "another-session";
+    signSidecarForTest(foreignSession);
+    await writeFile(store.path, JSON.stringify(foreignSession));
+    await rm(rawReviewCheckpointRecordPath(scope, await realpath(root), captured.value));
+    await assert.rejects(store.restore(root, scope), SessionStateCheckpointBaselineError);
 
     const invalidExecution = JSON.parse(JSON.stringify(original));
     invalidExecution.execution.bundles.push({ version: 1, operationId: 42 });
     signSidecarForTest(invalidExecution);
     await writeFile(store.path, JSON.stringify(invalidExecution));
-    await assert.rejects(store.restore(root), SessionStateInvalidStateError);
+    await assert.rejects(store.restore(root, scope), SessionStateInvalidStateError);
   } finally {
     await rm(root, { recursive: true, force: true });
     await rm(foreign, { recursive: true, force: true });
   }
-});
+}));
 
 test("unified Git checkpoint requires its pinned ref; pre-cutover verdict and deliveries do not survive", async () => {
   const root = await initGitRepoForBaselineTest();

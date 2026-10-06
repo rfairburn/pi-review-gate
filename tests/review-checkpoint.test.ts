@@ -4,25 +4,34 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
-import { captureReviewCheckpoint, compareReviewCheckpoints, loadReviewCheckpoint, releaseReviewCheckpoint, type ReviewCheckpointDescriptor } from "../src/review-checkpoint";
+import { tmpdir } from "node:os";
+import { captureReviewCheckpoint, compareReviewCheckpoints, loadReviewCheckpoint, rawReviewCheckpointRecordPath, releaseReviewCheckpoint, type ReviewCheckpointDescriptor, type ReviewCheckpointScope } from "../src/review-checkpoint";
 
 const exec = promisify(execFile);
+// #301: raw records live in the session's external namespace under a
+// disposable Pi agent-data directory outside every capture root.
+let scope: ReviewCheckpointScope | undefined;
+const opts = () => ({ scope });
 async function fixture(run: (root: string) => Promise<void>): Promise<void> {
   // Test fixtures remain inside this isolated worker root, never in a source checkout.
   const root = await mkdtemp(join(process.cwd(), ".review-checkpoint-test-"));
+  const agentDir = await mkdtemp(join(tmpdir(), "prg-review-checkpoint-agent-"));
+  scope = { agentDir, sessionId: "review-checkpoint-session" };
   const previous = process.env.GIT_CEILING_DIRECTORIES;
   process.env.GIT_CEILING_DIRECTORIES = process.cwd();
   try { await run(root); } finally {
     if (previous === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
     else process.env.GIT_CEILING_DIRECTORIES = previous;
+    scope = undefined;
     await rm(root, { recursive: true, force: true });
+    await rm(agentDir, { recursive: true, force: true });
   }
 }
 async function git(root: string, ...args: string[]): Promise<void> {
   await exec("git", args, { cwd: root, env: { ...process.env, GIT_AUTHOR_NAME: "Test", GIT_COMMITTER_NAME: "Test", GIT_AUTHOR_EMAIL: "test@example.com", GIT_COMMITTER_EMAIL: "test@example.com" } });
 }
 async function capture(root: string, id: string): Promise<ReviewCheckpointDescriptor> {
-  const result = await captureReviewCheckpoint(root, id);
+  const result = await captureReviewCheckpoint(root, id, opts());
   assert.equal(result.status, "ok", JSON.stringify(result));
   return result.value;
 }
@@ -38,14 +47,14 @@ test("nested Git review checkpoints cover repository-relative sibling changes wi
 
   const before = await capture(cwd, "nested-before");
   assert.equal(before.kind, "git");
-  assert.equal((await loadReviewCheckpoint(cwd, before)).status, "ok");
+  assert.equal((await loadReviewCheckpoint(cwd, before, opts())).status, "ok");
   await writeFile(join(repository, "sibling.txt"), "frozen sibling after\n");
   await writeFile(join(repository, "eligible-sibling.txt"), Buffer.from([0, 255, 11]));
   const after = await capture(cwd, "nested-after");
   await writeFile(join(repository, "sibling.txt"), "later live sibling bytes\n");
   await writeFile(join(repository, "eligible-sibling.txt"), "later live untracked bytes\n");
 
-  const compared = await compareReviewCheckpoints(cwd, before, after);
+  const compared = await compareReviewCheckpoints(cwd, before, after, opts());
   assert.equal(compared.status, "ok", JSON.stringify(compared));
   if (compared.status === "ok") {
     assert.deepEqual(compared.value.changes.map((change) => change.path), ["eligible-sibling.txt", "sibling.txt"]);
@@ -61,14 +70,14 @@ test("nested Git review checkpoints cover repository-relative sibling changes wi
   await git(otherRepository, "add", "other.txt");
   await git(otherRepository, "commit", "-qm", "other");
   const other = await capture(otherRepository, "nested-other");
-  assert.equal((await loadReviewCheckpoint(otherRepository, before)).status, "failed");
+  assert.equal((await loadReviewCheckpoint(otherRepository, before, opts())).status, "failed");
   if (before.kind === "git" && other.kind === "git") {
     const tampered = { ...before, checkpoint: { ...before.checkpoint, gitDir: other.checkpoint.gitDir } };
-    assert.equal((await loadReviewCheckpoint(cwd, tampered)).status, "failed");
+    assert.equal((await loadReviewCheckpoint(cwd, tampered, opts())).status, "failed");
   }
-  assert.equal((await releaseReviewCheckpoint(cwd, before)).status, "ok");
-  assert.equal((await releaseReviewCheckpoint(cwd, after)).status, "ok");
-  assert.equal((await releaseReviewCheckpoint(otherRepository, other)).status, "ok");
+  assert.equal((await releaseReviewCheckpoint(cwd, before, opts())).status, "ok");
+  assert.equal((await releaseReviewCheckpoint(cwd, after, opts())).status, "ok");
+  assert.equal((await releaseReviewCheckpoint(otherRepository, other, opts())).status, "ok");
 }));
 
 test("ambient Git repository redirects cannot hide nested parent-review changes", async () => fixture(async (root) => {
@@ -95,15 +104,15 @@ test("ambient Git repository redirects cannot hide nested parent-review changes"
     assert.equal(before.checkpoint.gitDir, await realpath(join(actual, ".git")));
     await writeFile(join(actual, "tracked.txt"), "actual repository changed\n");
     const after = await capture(selected, "redirect-after");
-    const compared = await compareReviewCheckpoints(selected, before, after);
+    const compared = await compareReviewCheckpoints(selected, before, after, opts());
     assert.equal(compared.status, "ok", JSON.stringify(compared));
     if (compared.status === "ok") {
       assert.deepEqual(compared.value.changes.map((change) => change.path), ["tracked.txt"]);
       assert.equal(compared.value.changes[0]?.new?.bytes?.toString(), "actual repository changed\n");
     }
-    assert.equal((await loadReviewCheckpoint(selected, before)).status, "ok");
-    assert.equal((await releaseReviewCheckpoint(selected, before)).status, "ok");
-    assert.equal((await releaseReviewCheckpoint(selected, after)).status, "ok");
+    assert.equal((await loadReviewCheckpoint(selected, before, opts())).status, "ok");
+    assert.equal((await releaseReviewCheckpoint(selected, before, opts())).status, "ok");
+    assert.equal((await releaseReviewCheckpoint(selected, after, opts())).status, "ok");
   } finally {
     if (priorDir === undefined) delete process.env.GIT_DIR;
     else process.env.GIT_DIR = priorDir;
@@ -128,7 +137,7 @@ test("Git clean tracked bytes are referenced, while staged, unstaged and untrack
   const first = await capture(root, "first");
   assert.equal(first.kind, "git");
   assert.ok(first.kind === "git" && first.checkpoint.digest.length === 64);
-  const loaded = await loadReviewCheckpoint(root, first);
+  const loaded = await loadReviewCheckpoint(root, first, opts());
   assert.equal(loaded.status, "ok");
   // The Git record contains patches/untracked content, but never the clean blob.
   const dir = first.kind === "git" ? first.checkpoint.gitDir : "";
@@ -138,16 +147,16 @@ test("Git clean tracked bytes are referenced, while staged, unstaged and untrack
   await writeFile(join(root, "edited"), "later");
   await writeFile(join(root, "new"), "later");
   const second = await capture(root, "second");
-  const result = await compareReviewCheckpoints(root, first, second);
+  const result = await compareReviewCheckpoints(root, first, second, opts());
   assert.equal(result.status, "ok", JSON.stringify(result));
   if (result.status === "ok") {
     assert.equal(result.value.changes.find((c) => c.path === "edited")?.old?.bytes?.toString(), "unstaged");
     assert.deepEqual(result.value.changes.find((c) => c.path === "new")?.old?.bytes, Buffer.from([0, 255, 1]));
     assert.ok(!result.value.changes.some((c) => c.path === "clean" || c.path === "ignored-tracked" || c.path === "ignored-untracked"));
   }
-  assert.equal((await releaseReviewCheckpoint(root, first)).status, "ok");
-  assert.equal((await loadReviewCheckpoint(root, first)).status, "failed");
-  assert.equal((await releaseReviewCheckpoint(root, second)).status, "ok");
+  assert.equal((await releaseReviewCheckpoint(root, first, opts())).status, "ok");
+  assert.equal((await loadReviewCheckpoint(root, first, opts())).status, "failed");
+  assert.equal((await releaseReviewCheckpoint(root, second, opts())).status, "ok");
 }));
 
 test("Git tracked/untracked transitions with identical worktree content are not changes", async () => fixture(async (root) => {
@@ -159,15 +168,15 @@ test("Git tracked/untracked transitions with identical worktree content are not 
   const tracked = await capture(root, "tracked");
   await git(root, "rm", "--cached", "--", "file");
   const untracked = await capture(root, "untracked");
-  const toUntracked = await compareReviewCheckpoints(root, tracked, untracked);
+  const toUntracked = await compareReviewCheckpoints(root, tracked, untracked, opts());
   assert.equal(toUntracked.status, "ok", JSON.stringify(toUntracked));
   if (toUntracked.status === "ok") assert.deepEqual(toUntracked.value.changes, []);
   await git(root, "add", "file");
   const trackedAgain = await capture(root, "tracked-again");
-  const toTracked = await compareReviewCheckpoints(root, untracked, trackedAgain);
+  const toTracked = await compareReviewCheckpoints(root, untracked, trackedAgain, opts());
   assert.equal(toTracked.status, "ok", JSON.stringify(toTracked));
   if (toTracked.status === "ok") assert.deepEqual(toTracked.value.changes, []);
-  for (const checkpoint of [tracked, untracked, trackedAgain]) assert.equal((await releaseReviewCheckpoint(root, checkpoint)).status, "ok");
+  for (const checkpoint of [tracked, untracked, trackedAgain]) assert.equal((await releaseReviewCheckpoint(root, checkpoint, opts())).status, "ok");
 }));
 
 test("Git tracked symlinks retain valid targets and reject lossy non-UTF-8 parent comparisons", async () => fixture(async (root) => {
@@ -179,7 +188,7 @@ test("Git tracked symlinks retain valid targets and reject lossy non-UTF-8 paren
   await rm(join(root, "link"));
   await symlink("updated", join(root, "link"));
   const valid = await capture(root, "valid");
-  const validComparison = await compareReviewCheckpoints(root, original, valid);
+  const validComparison = await compareReviewCheckpoints(root, original, valid, opts());
   assert.equal(validComparison.status, "ok", JSON.stringify(validComparison));
   if (validComparison.status === "ok") {
     assert.deepEqual(validComparison.value.changes.map((change) => change.path), ["link"]);
@@ -201,14 +210,14 @@ test("Git tracked symlinks retain valid targets and reject lossy non-UTF-8 paren
   const invalidFirst = await capture(root, "invalid-first");
   await installTarget(0xfe);
   const invalidSecond = await capture(root, "invalid-second");
-  const compared = await compareReviewCheckpoints(root, invalidFirst, invalidSecond);
+  const compared = await compareReviewCheckpoints(root, invalidFirst, invalidSecond, opts());
   assert.equal(compared.status, "failed", JSON.stringify(compared));
   if (compared.status === "failed") {
     assert.equal(compared.reason, "raw_checkpoint_failed");
     assert.match(compared.detail, /tracked symlink target is not valid UTF-8: link/);
   }
   for (const checkpoint of [original, valid, invalidFirst, invalidSecond])
-    assert.equal((await releaseReviewCheckpoint(root, checkpoint)).status, "ok");
+    assert.equal((await releaseReviewCheckpoint(root, checkpoint, opts())).status, "ok");
 }));
 
 test("raw global excludes only with any project .gitignore; nested patterns stay local", async () => fixture(async (root) => {
@@ -229,7 +238,7 @@ test("raw global excludes only with any project .gitignore; nested patterns stay
     await writeFile(join(root, "ordinary"), "one");
     const noIgnore = await capture(root, "no-ignore");
     assert.equal(noIgnore.kind, "raw");
-    const loaded = await loadReviewCheckpoint(root, noIgnore);
+    const loaded = await loadReviewCheckpoint(root, noIgnore, opts());
     assert.equal(loaded.status, "ok");
     if (loaded.status === "ok") assert.ok(loaded.value.kind === "raw" && loaded.value.entries.some((e) => e.path === "global.txt"));
     await mkdir(join(root, "nested"));
@@ -238,7 +247,7 @@ test("raw global excludes only with any project .gitignore; nested patterns stay
     await writeFile(join(root, "local.txt"), "kept");
     for (let i = 0; i < 64; i++) await writeFile(join(root, "nested", `ordinary-${i}`), `value-${i}`);
     const withIgnore = await capture(root, "with-ignore");
-    const other = await loadReviewCheckpoint(root, withIgnore);
+    const other = await loadReviewCheckpoint(root, withIgnore, opts());
     assert.equal(other.status, "ok");
     if (other.status === "ok") {
       assert.equal(other.value.kind, "raw");
@@ -249,8 +258,8 @@ test("raw global excludes only with any project .gitignore; nested patterns stay
       assert.ok(names.includes("local.txt"));
       assert.equal(names.filter((name) => name.startsWith("nested/ordinary-")).length, 64);
     }
-    assert.equal((await releaseReviewCheckpoint(root, noIgnore)).status, "ok");
-    assert.equal((await releaseReviewCheckpoint(root, withIgnore)).status, "ok");
+    assert.equal((await releaseReviewCheckpoint(root, noIgnore, opts())).status, "ok");
+    assert.equal((await releaseReviewCheckpoint(root, withIgnore, opts())).status, "ok");
   } finally {
     if (previousTemplate === undefined) delete process.env.GIT_TEMPLATE_DIR;
     else process.env.GIT_TEMPLATE_DIR = previousTemplate;
@@ -271,7 +280,7 @@ test("raw frozen comparison selects changed files only; mode, symlink, missing a
   await symlink("changed", join(root, "link"));
   const after = await capture(root, "after");
   await writeFile(join(root, "changed"), "live must not be compared");
-  const result = await compareReviewCheckpoints(root, before, after);
+  const result = await compareReviewCheckpoints(root, before, after, opts());
   assert.equal(result.status, "ok", JSON.stringify(result));
   if (result.status === "ok") {
     assert.deepEqual(result.value.changes.map((c) => c.path), ["changed", "link", "mode"]);
@@ -282,20 +291,20 @@ test("raw frozen comparison selects changed files only; mode, symlink, missing a
   }
   assert.equal(before.kind, "raw");
   if (before.kind !== "raw") return;
-  const record = join(root, ".pi-review-gate", "checkpoints", `${before.windowId}-${before.owner}`, "record.json");
+  const record = rawReviewCheckpointRecordPath(scope!, await realpath(root), before);
   await writeFile(record, "corrupt");
-  assert.equal((await loadReviewCheckpoint(root, before)).status, "failed");
-  assert.equal((await releaseReviewCheckpoint(root, before)).status, "failed");
+  assert.equal((await loadReviewCheckpoint(root, before, opts())).status, "failed");
+  assert.equal((await releaseReviewCheckpoint(root, before, opts())).status, "failed");
   assert.ok((await lstat(record)).isFile());
   await rm(record);
-  assert.equal((await compareReviewCheckpoints(root, before, after)).status, "failed");
-  assert.equal((await releaseReviewCheckpoint(root, after)).status, "ok");
+  assert.equal((await compareReviewCheckpoints(root, before, after, opts())).status, "failed");
+  assert.equal((await releaseReviewCheckpoint(root, after, opts())).status, "ok");
 }));
 
 test("broken root or ancestor .git marker never falls back to raw capture", async () => fixture(async (root) => {
   const child = join(root, "child");
   await mkdir(child);
   await writeFile(join(root, ".git"), "gitdir: nowhere\n");
-  assert.equal((await captureReviewCheckpoint(root, "broken-root")).status, "failed");
-  assert.equal((await captureReviewCheckpoint(child, "broken-parent")).status, "failed");
+  assert.equal((await captureReviewCheckpoint(root, "broken-root", opts())).status, "failed");
+  assert.equal((await captureReviewCheckpoint(child, "broken-parent", opts())).status, "failed");
 }));

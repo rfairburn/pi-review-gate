@@ -13,7 +13,9 @@ accept from an untrusted repository, task, or process environment:
   inherited value from a parent pi session cannot redirect the gate).
 - `PI_CODING_AGENT_DIR` — Pi's native override of the Pi agent directory, which also
   relocates implicitly discovered review-gate config
-  ([Configuration](configuration.md#config-discovery)).
+  ([Configuration](configuration.md#config-discovery)) and the private non-Git review
+  checkpoint records under `sessions/pi-review-gate/`
+  ([Review workflow](review-workflow.md#non-git-checkpoint-storage)).
 - `PI_REVIEW_GATE_DISABLED` — the documented kill switch.
 - `PI_REVIEW_GATE_DDGS_VENV`, `XDG_CACHE_HOME` / `HOME` — venv and cache locations for
   the web search bridge. The default venv lives in a user-writable cache by design.

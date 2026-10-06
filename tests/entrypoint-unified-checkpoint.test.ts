@@ -5,14 +5,14 @@
 // on-disk descriptor shape and the live review, not restart recovery.
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { GIT_CHECKPOINT_DESCRIPTOR_FORMAT } from "../src/git-checkpoint";
 import { activate } from "../src/index";
 import { SessionStateStore } from "../src/session-state";
-import type { ReviewCheckpointDescriptor } from "../src/review-checkpoint";
+import { rawReviewCheckpointRecordPath, type ReviewCheckpointDescriptor } from "../src/review-checkpoint";
 import type { ReviewGateState } from "../src/state";
 import { agentCatalog } from "./helpers";
 import {
@@ -21,6 +21,7 @@ import {
   indexTestConfig,
   trigger,
   triggerAgentEnd,
+  testAgentDir,
 } from "./entrypoint-harness";
 
 const exec = promisify(execFile);
@@ -109,7 +110,8 @@ async function ownerExists(cwd: string, descriptor: ReviewCheckpointDescriptor):
       return true;
     } catch { return false; }
   }
-  return access(join(cwd, ".pi-review-gate", "checkpoints", `${descriptor.windowId}-${descriptor.owner}`, "record.json"))
+  // #301: raw records live in the live session's external namespace.
+  return access(rawReviewCheckpointRecordPath({ agentDir: testAgentDir, sessionId: "checkpoint-smoke" }, await realpath(cwd), descriptor))
     .then(() => true, () => false);
 }
 
@@ -402,6 +404,14 @@ test("plain root: real preprompt and review use raw checkpoint, never snapshot f
     assert.equal(window?.activeExchange?.baseline?.kind, "checkpoint");
     assert.equal(window?.activeExchange?.baseline?.kind === "checkpoint" ? window.activeExchange.baseline.descriptor.kind : undefined, "raw");
     assert.doesNotMatch(await readFile(store.path, "utf8"), /"files"\s*:/);
+    // #301: no checkpoint folder is ever created in the workspace; records are
+    // in <agentDir>/sessions/pi-review-gate/<session>/checkpoints/.
+    assert.deepEqual((await readdir(f.cwd)).sort(), ["keep.txt", "loose.bin", "work.txt"]);
+    const active = window?.activeExchange?.baseline;
+    if (active?.kind === "checkpoint" && active.descriptor.kind === "raw") {
+      assert.equal(active.descriptor.sessionId, "checkpoint-smoke");
+      await access(rawReviewCheckpointRecordPath({ agentDir: testAgentDir, sessionId: "checkpoint-smoke" }, await realpath(f.cwd), active.descriptor));
+    }
   } finally {
     f.restoreGitCeiling();
     await rm(f.root, { recursive: true, force: true });

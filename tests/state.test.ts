@@ -951,7 +951,7 @@ test("snapshotOfReviewBaseline narrows snapshots and fails closed on Git baselin
 test("unified descriptor ownership includes window and exchange without releasing on state mutation", () => {
   const state = createState();
   beginAgentRun(state);
-  const descriptor = { kind: "raw" as const, format: "prg-parent-raw/v1" as const,
+  const descriptor = { kind: "raw" as const, format: "prg-parent-raw/v2" as const, sessionId: "state-session",
     root: "/tmp/project", windowId: "win-owned", owner: "a".repeat(32), digest: "b".repeat(64) };
   const baseline = { kind: "checkpoint" as const, descriptor, cwd: "/tmp/project", capturedAt: "now" };
   setReviewWindowCheckpointBaseline(state, baseline);
@@ -959,7 +959,7 @@ test("unified descriptor ownership includes window and exchange without releasin
   // Same descriptor, different insertion order and capture timestamp: one owner.
   state.reviewWindow!.activeExchange!.baseline = { ...baseline, capturedAt: "later", descriptor: {
     digest: descriptor.digest, owner: descriptor.owner, windowId: descriptor.windowId,
-    root: descriptor.root, format: descriptor.format, kind: descriptor.kind,
+    root: descriptor.root, sessionId: descriptor.sessionId, format: descriptor.format, kind: descriptor.kind,
   } };
   assert.deepEqual(ownedReviewCheckpointDescriptors(state), [{ cwd: "/tmp/project", descriptor: state.reviewWindow!.activeExchange!.baseline.descriptor }]);
   closeReviewWindow(state, true);

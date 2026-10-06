@@ -614,7 +614,7 @@ test("real host: full flow stages a completed existing absolute directory throug
       assert.ok(applied.includes(`${root}/alpha/`), `the completed path is the draft: ${applied}`);
       component.handleInput?.(ENTER); // submit the field
     },
-    keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 10)
+    keys(...Array(7).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 12)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 15) → Save changes (row 17)
   ], { cwd: dir, keybindings: createRealKeybindingsManager(loaded.tui), theme: REAL_IDENTITY_THEME, provider: new providerCtor(HOST_COMMANDS, dir) });
@@ -670,7 +670,7 @@ for (const target of ["missing", "file"] as const) {
         }
         component.handleInput?.(ENTER); // submit the field
       },
-      keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 10)
+      keys(...Array(7).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 12)
       keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
       keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 15) → Save changes (row 17)
       keys(ESCAPE), // failed save re-shows the root menu; Esc leaves without saving

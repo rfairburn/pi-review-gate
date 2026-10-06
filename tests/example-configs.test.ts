@@ -604,7 +604,11 @@ test("scheduled-tasks scheduledTasks fragment is illustrative and needs its docu
   const config = normalizeConfig(wrapped);
 
   const tasks = config.scheduledTasks!;
-  assert.deepEqual(Object.keys(tasks).sort(), ["task-nightly", "task-research"], "fragment: entry keys");
+  assert.deepEqual(Object.keys(tasks).sort(), ["task-nightly", "task-onboarding", "task-research"], "fragment: entry keys");
+  assert.equal(tasks["task-onboarding"]!.kind, "execute", "fragment: one-shot kind");
+  assert.equal(tasks["task-onboarding"]!.oneShot, true, "fragment: one-shot mode");
+  assert.equal(tasks["task-onboarding"]!.alreadyRun, undefined, "fragment: one-shot starts armed");
+  assert.equal(tasks["task-onboarding"]!.workspace, "/work/pi-review-gate", "fragment: one-shot workspace");
   assert.equal(tasks["task-nightly"]!.kind, "execute", "fragment: nightly kind");
   assert.equal(tasks["task-nightly"]!.workspace, "/work/pi-review-gate", "fragment: nightly workspace");
   assert.equal(tasks["task-research"]!.kind, "research", "fragment: research kind");

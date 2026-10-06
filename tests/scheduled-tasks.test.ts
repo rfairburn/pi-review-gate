@@ -178,6 +178,8 @@ test("scheduled task entries reject invalid definitions strictly", () => {
     [{ "task-a": { ...validEntry, review: { mode: "selected", reviewers: [{ source: "nonsense" }] } } }, /unsupported scheduledTasks\.task-a\.review\.reviewers source/],
     [{ "task-bad id": { ...validEntry } }, /scheduled task id may contain only/],
     [{ "task-a": { ...validEntry, workerResourceId: "missing-resource" } }, /references unknown worker resource missing-resource/],
+    [{ "task-a": { ...validEntry, oneShot: "yes" } }, /scheduledTasks\.task-a\.oneShot must be a boolean/],
+    [{ "task-a": { ...validEntry, alreadyRun: 1 } }, /scheduledTasks\.task-a\.alreadyRun must be a boolean/],
   ];
   for (const [scheduledTasks, pattern] of cases) {
     assert.throws(() => normalizeConfig(configWithScheduledTasks(scheduledTasks)), pattern);
@@ -544,6 +546,8 @@ const SCHEDULED_EDITOR_LABELS = [
   "Worker",
   "Review",
   "Enabled",
+  "One shot",
+  "Already run",
 ] as const;
 
 function alignedTestRow(label: string, value: string, labels: readonly string[]): string {
@@ -720,6 +724,90 @@ test("/review-settings stages edits to an existing scheduled task and preserves 
   assert.equal(entry.cron, "0 9 * * *");
   assert.equal(entry.instructions, "Original instructions");
   assert.equal(entry.workspace, dir);
+});
+
+test("/review-settings toggles one-shot mode and the already-run state with explicit semantics", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-scheduled-oneshot-menu-"));
+  const configPath = join(dir, "review-gate.json");
+  await writeFile(configPath, JSON.stringify({
+    enabled: true,
+    review: { primaryReviewers: [], subtaskReviewers: [] },
+    scheduledTasks: {
+      "task-abcdef12": {
+        name: "Once",
+        cron: "0 9 * * *",
+        enabled: true,
+        kind: "execute",
+        instructions: "Run once",
+        workspace: dir,
+      },
+    },
+  }), "utf8");
+  const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+  const registered = commandHarness();
+  registerReviewSettings({ pi: registered.pi, config, configPath });
+
+  // Turn one-shot on; the already-run state starts editable and off.
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Scheduled tasks", "1 of 1 enabled"),
+    "1. Once — 0 9 * * * — execute — enabled",
+    scheduledEditorRow("One shot", "Off"),
+    "Back",
+    "Back",
+    "Save changes",
+  ]));
+  let saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.scheduledTasks["task-abcdef12"].oneShot, true);
+  assert.equal(saved.scheduledTasks["task-abcdef12"].alreadyRun, undefined, "absence is the false default");
+
+  // Manual disarm: Already run No → Yes persists alreadyRun=true.
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Scheduled tasks", "1 of 1 enabled"),
+    "1. Once — 0 9 * * * — execute — enabled",
+    scheduledEditorRow("Already run", "No"),
+    "Back",
+    "Back",
+    "Save changes",
+  ]));
+  saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.scheduledTasks["task-abcdef12"].alreadyRun, true);
+
+  // Manual re-arm: Already run Yes → No removes the flag (future-only).
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Scheduled tasks", "1 of 1 enabled"),
+    "1. Once — 0 9 * * * — execute — enabled",
+    scheduledEditorRow("Already run", "Yes"),
+    "Back",
+    "Back",
+    "Save changes",
+  ]));
+  saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.scheduledTasks["task-abcdef12"].alreadyRun, undefined, "the manual re-arm persisted");
+
+  // Turning one-shot off removes the key; already-run becomes n/a and its
+  // selection is rejected without changing the entry.
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Scheduled tasks", "1 of 1 enabled"),
+    "1. Once — 0 9 * * * — execute — enabled",
+    scheduledEditorRow("One shot", "On"),
+    "Back",
+    "Back",
+    "Save changes",
+  ]));
+  saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.scheduledTasks["task-abcdef12"].oneShot, undefined);
+
+  await registered.handler("", contextWithSelections([
+    rootSettingsRow("Scheduled tasks", "1 of 1 enabled"),
+    "1. Once — 0 9 * * * — execute — enabled",
+    scheduledEditorRow("Already run", "n/a (not one-shot)"),
+    "Back",
+    "Back",
+    "Save changes",
+  ]));
+  saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.scheduledTasks["task-abcdef12"].alreadyRun, undefined, "the n/a selection changed nothing");
+  assert.equal(saved.scheduledTasks["task-abcdef12"].oneShot, undefined);
 });
 
 test("/review-settings persists a task-local review Off without touching global review state", async () => {

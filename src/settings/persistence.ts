@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { setCatalogKey } from "./catalog-key";
 import { guardExternalAgentReferences, type ExternalAgentOperation } from "./external-agent-catalog";
 import { open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
@@ -70,6 +71,14 @@ export interface ReviewSettingsSelection {
    * never erase schedule entries it never knew about).
    */
   scheduledTasksStagedFrom?: string[];
+  /**
+   * Entry ids whose already-run state the caller EXPLICITLY toggled in its
+   * staged session (issue #306). For every other entry, Save preserves the
+   * latest on-disk alreadyRun instead of the staged snapshot's value, so a
+   * stale or unrelated settings Save can never erase an alreadyRun the
+   * scheduler recorded after the menu opened. An explicit toggle always wins.
+   */
+  scheduledTasksAlreadyRunEdited?: string[];
   webMaxDownloadBytes?: number;
   browserInteractionApproval?: BrowserInteractionApproval;
   browserIdleExpiryMinutes?: number;
@@ -240,6 +249,27 @@ export async function persistReviewSettings(
         (selection.scheduledTasksStagedFrom ?? []).filter((id) => !stagedIds.has(id)),
       );
       const stored = isRecord(parsed.scheduledTasks) ? parsed.scheduledTasks : {};
+      // Issue #306: the scheduler records alreadyRun=true on disk at actual
+      // execution start. A staged snapshot opened before that record must not
+      // erase it on an unrelated Save — and a stale snapshot that still carries
+      // true must not resurrect a flag another save explicitly cleared. For
+      // every EXISTING entry the caller did not explicitly toggle, the latest
+      // on-disk value wins in BOTH directions; newly created entries keep
+      // their staged state. An explicit manual re-arm/disarm always persists.
+      const alreadyRunEdited = new Set(selection.scheduledTasksAlreadyRunEdited ?? []);
+      for (const id of Object.keys(staged)) {
+        if (alreadyRunEdited.has(id)) continue;
+        const storedEntry = isRecord(stored[id]) ? stored[id] : undefined;
+        if (storedEntry === undefined) continue;
+        const stagedEntry = staged[id];
+        if (storedEntry.alreadyRun === true && stagedEntry?.alreadyRun !== true) {
+          setCatalogKey(staged, id, { ...stagedEntry, alreadyRun: true });
+        } else if (storedEntry.alreadyRun !== true && stagedEntry?.alreadyRun === true) {
+          const cleared = { ...stagedEntry };
+          delete cleared.alreadyRun;
+          setCatalogKey(staged, id, cleared);
+        }
+      }
       scheduledTasksResult = mergeScheduledTaskEntries(stored, staged, deletions);
       // The validation gate below runs on exactly the entries this save owns:
       // a preserved on-disk entry this snapshot cannot resolve (hand-edited, or
@@ -454,12 +484,71 @@ async function writeConfigAtomically(configPath: string, parsed: Record<string, 
   }
 }
 
-export function replaceConfig(target: ReviewGateConfig, next: ReviewGateConfig): void {
+/**
+ * Live per-entry already-run state captured BEFORE an asynchronous save
+ * starts (#306). The entry identity plus the flag let a later install tell a
+ * newer live change (consumption or explicit re-arm) apart from the stale
+ * result it is replacing.
+ */
+export type ScheduledAlreadyRunSnapshot = ReadonlyMap<string, {
+  entry: ScheduledTaskCatalog[string];
+  alreadyRun: boolean;
+}>;
+
+/** Capture the live scheduled entries' identity and already-run flags. */
+export function captureScheduledAlreadyRun(config: ReviewGateConfig): ScheduledAlreadyRunSnapshot {
+  return new Map<string, { entry: ScheduledTaskCatalog[string]; alreadyRun: boolean }>(
+    Object.entries(config.scheduledTasks ?? {}).map(([id, entry]) =>
+      [id, { entry, alreadyRun: entry.alreadyRun === true }]),
+  );
+}
+
+/**
+ * Install an asynchronous config result into the live in-memory config.
+ *
+ * #306: a scheduler-recorded alreadyRun=true in the LIVE catalog must survive
+ * installing a result captured before the consumption write landed — such a
+ * stale result would otherwise silently re-arm a consumed one-shot entry and
+ * allow a second execution. Symmetrically, an explicit re-arm that installed
+ * false while this save was still in flight must survive the older result
+ * reinstalling true: when a pre-save baseline is supplied, a live flag that
+ * CHANGED during the save wins in either direction. The protection is skipped
+ * for entries whose Already-run field this result explicitly edited (a manual
+ * re-arm/disarm always wins in both directions).
+ */
+export function replaceConfig(
+  target: ReviewGateConfig,
+  next: ReviewGateConfig,
+  options?: {
+    scheduledTasksAlreadyRunEdited?: Iterable<string>;
+    scheduledTasksAlreadyRunBeforeSave?: ScheduledAlreadyRunSnapshot;
+  },
+): void {
   const mutable = target as unknown as Record<string, unknown>;
+  const previousScheduledTasks = target.scheduledTasks;
   for (const key of Object.keys(mutable)) {
     delete mutable[key];
   }
   Object.assign(mutable, next);
+  if (previousScheduledTasks === undefined || !isRecord(next.scheduledTasks)) return;
+  const edited = new Set(options?.scheduledTasksAlreadyRunEdited ?? []);
+  for (const [id, previousEntry] of Object.entries(previousScheduledTasks)) {
+    if (edited.has(id)) continue;
+    const alreadyRun = previousEntry.alreadyRun === true;
+    const baseline = options?.scheduledTasksAlreadyRunBeforeSave?.get(id);
+    const changedDuringSave = baseline !== undefined
+      && (baseline.entry !== previousEntry || baseline.alreadyRun !== alreadyRun);
+    // With a pre-save baseline, preserve only a newer live change. An
+    // unchanged live true must not override the latest on-disk false returned
+    // by Save (for example, another settings session explicitly re-armed it).
+    // Without a baseline, retain the conservative live-consumption protection.
+    if (!changedDuringSave && (options?.scheduledTasksAlreadyRunBeforeSave !== undefined || !alreadyRun)) continue;
+    const nextEntry = next.scheduledTasks[id];
+    if (isRecord(nextEntry)) {
+      if (alreadyRun) nextEntry.alreadyRun = true;
+      else delete nextEntry.alreadyRun;
+    }
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

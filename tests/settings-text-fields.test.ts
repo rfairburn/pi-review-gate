@@ -514,7 +514,7 @@ test("in the interactive TUI a text field opens through the native editor bridge
       typeText(component, "Rewritten instructions");
       component.handleInput?.(ENTER); // submit through the bridge
     },
-    tuiKeys(...Array(6).fill(KEY_DOWN), KEY_ENTER), // entry re-show (instructions, row 4) → Back (row 10)
+    tuiKeys(...Array(8).fill(KEY_DOWN), KEY_ENTER), // entry re-show (instructions, row 4) → Back (row 12)
     tuiKeys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
     tuiKeys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 15) → Save changes (row 17)
   ]);
@@ -553,7 +553,7 @@ test("an interactive TUI without the native editor seams fails closed: error not
     tuiKeys(...Array(15).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 15)
     tuiKeys(KEY_ENTER), // list → task entry (row 0)
     tuiKeys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → instructions (row 4)
-    tuiKeys(...Array(6).fill(KEY_DOWN), KEY_ENTER), // entry re-show (instructions, row 4) → Back (row 10)
+    tuiKeys(...Array(8).fill(KEY_DOWN), KEY_ENTER), // entry re-show (instructions, row 4) → Back (row 12)
     tuiKeys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
     tuiKeys(ESCAPE), // root: leave without saving
   ]);

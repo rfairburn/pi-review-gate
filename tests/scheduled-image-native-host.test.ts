@@ -196,7 +196,7 @@ async function runNativeImageFlow(
         component.handleInput?.(CTRL_V); // real keypress through the native editor
         component.handleInput?.(options.fieldSettle === "cancel" ? KEY_ESCAPE : ENTER);
       },
-      keys(...Array(6).fill(KEY_DOWN), KEY_ENTER), // entry re-show (instructions, row 4) → Back (row 10)
+      keys(...Array(8).fill(KEY_DOWN), KEY_ENTER), // entry re-show (instructions, row 4) → Back (row 12)
       keys(...Array(3).fill(KEY_DOWN), KEY_ENTER), // list re-show (two entries) → Back (row 3)
       ...(options.outcome === "cancel"
         ? [keys(KEY_ESCAPE)] // root: leave without saving

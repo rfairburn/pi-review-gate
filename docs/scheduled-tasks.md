@@ -27,6 +27,8 @@ consumes.
 | `workspace` | required for `subtask`; otherwise absent | Explicit authorized target directory for a scheduled subtask. A leading `~` or `~/...` expands against the user's home (the same Pi-native rule as the built-in file tools); every other spelling, including `~user`, is used verbatim. Save persists the expanded absolute spelling of a tilde workspace (the runtime separately resolves the target's realpath). Orchestrator-turn entries may omit it or leave it empty; any stored value is unused and never overrides the existing agent's current Pi launch workspace. Switching an entry back to `subtask` requires a valid workspace. |
 | `workerResourceId` | absent | Optional override naming an `execution.workerResources` entry. See below. Unused while the destination is `orchestrator-turn`. |
 | `review` | absent | Task-local review choice. See below. Unused while the destination is `orchestrator-turn`. |
+| `oneShot` | `false` | One-shot mode (issue #306). When `true`, the entry is eligible to fire only while `alreadyRun` is `false`; once an occurrence actually starts, the scheduler records `alreadyRun: true` and the entry stays in the catalog disarmed until manually re-armed. See [One-shot entries](#one-shot-entries). |
+| `alreadyRun` | `false` | Whether an occurrence of this entry has actually started execution. Meaningful only for one-shot entries: a recurring entry ignores it and the scheduler never auto-updates it. It is editable by hand to disarm or re-arm — see [One-shot entries](#one-shot-entries). |
 
 Illustrative fragment, not a standalone config: it assumes a research-capable
 `execution.workerResources.local-research` entry and usable routes are already
@@ -53,6 +55,15 @@ on its own the pinned `local-research` reference does not resolve.
       "workspace": "/work/pi-review-gate",
       "workerResourceId": "local-research",
       "review": { "mode": "off" }
+    },
+    "task-onboarding": {
+      "name": "One-shot onboarding sweep",
+      "cron": "0 4 * * 1",
+      "enabled": true,
+      "kind": "execute",
+      "oneShot": true,
+      "instructions": "Run the onboarding checklist once",
+      "workspace": "/work/pi-review-gate"
     }
   }
 }
@@ -85,6 +96,48 @@ any stored copy going stale:
 
 The two inheritances are independent: an entry may pin a worker while
 inheriting review policy, or the reverse.
+
+### One-shot entries
+
+Each entry accepts two optional booleans, `oneShot` and `alreadyRun` (issue #306).
+Absent fields mean `false`, so existing entries stay recurring unchanged; both
+catalog fields persist across `/reload` and restarts like every other entry
+field. The behavior applies to both destinations — scheduled subtasks and
+orchestrator turns.
+
+- **Eligibility:** a `oneShot: true` entry is eligible at a due occurrence only
+  while its stored `alreadyRun` is `false`. That is one more condition at the
+  ordinary per-minute admission, under the entry's existing `enabled` setting
+  and unchanged cron expression — not a separate scheduling system, date
+  format, retry mechanism, or catch-up behavior.
+- **Consumption records run start, not success:** the scheduler sets
+  `alreadyRun: true` when the occurrence's execution actually begins — for the
+  `subtask` destination at the actual delivery of that worker's prompt, and for
+  `orchestrator-turn` at the matching scheduled-message observation inside the
+  host run (a queued delivery alone, or one the host accepted but never
+  acknowledged, is not evidence that execution started). Once the flag is set
+  it never depends on the model: a refusal, a failure, unsuccessful work, or
+  any review outcome leaves it consumed. "Already-run" means **has started** —
+  never "succeeded".
+- **What does not consume an occurrence:** the existing skip and rejection
+  paths leave `alreadyRun` untouched — occurrences skipped for overlap, dropped
+  as sampled-but-not-admitted (switch Off, session end, or a Save replan), or
+  skipped for a dispatch-time validation failure, and launches that never
+  start. Rejected or uncertain sends do not by themselves consume a one shot;
+  if execution is subsequently observed to start, that start consumes it.
+  A queued-only orchestrator-turn delivery likewise does not mark the entry
+  as run.
+- **Lifecycle:** the entry remains in the catalog after it runs, disarmed —
+  later due occurrences, including any that fall while that first run is still
+  active, do not execute it again. Setting `alreadyRun: true` manually disarms
+  the entry without executing anything; setting it back to `false` re-arms it
+  for its next future cron occurrence — never an immediate run and never a
+  replay of missed occurrences (future-only semantics as in
+  [Local time and daylight saving](#local-time-and-daylight-saving)).
+- **Recurring entries are unchanged:** with `oneShot: false` (the default),
+  `alreadyRun` has no role — its stored value is ignored for scheduling and
+  execution, and the scheduler never auto-updates it. It is not a status or
+  history field for recurring tasks.
 
 ### Schedule destinations
 

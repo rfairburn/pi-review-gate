@@ -5,6 +5,7 @@ import { ScheduledTaskRuntime } from "./scheduling/dispatcher";
 import { createScheduledEntryDispatcher } from "./scheduling/dispatch";
 import { deliverScheduledEvent } from "./scheduling/events";
 import { ScheduledOrchestratorTurnTracker } from "./scheduling/orchestrator-turn";
+import { consumeOneShotExecution } from "./scheduling/one-shot";
 import { deliverSubtaskLaunchNotice, type SubtaskLaunchNotice } from "./execution/launch-notice";
 import { getSchedulerRuntime } from "./scheduling/runtime";
 import { removeReviewBundle, removeTransientWindowBundle } from "./bundle";
@@ -30,7 +31,7 @@ import {
 } from "./state";
 import { registerReviewSettings } from "./settings/command";
 import { scopedModelChoices } from "./settings/models";
-import { persistSubtasksViewPreference, replaceConfig } from "./settings/persistence";
+import { captureScheduledAlreadyRun, persistSubtasksViewPreference, replaceConfig } from "./settings/persistence";
 import { assertScheduledImagesPresent, managedScheduledImageRoot } from "./settings/scheduled-image-assets";
 import { registerStreamFailureReporting } from "./stream-failure-report";
 import { ExecutionToolManager } from "./execution/tool";
@@ -123,6 +124,21 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   }
 
   const { config } = loaded;
+  /**
+   * Issue #306: one-shot consumption shared by both destination seams — the
+   * subtask destination's actual transport-boundary dispatch record and the
+   * orchestrator destination's in-run message_start observation. Both fire
+   * at ACTUAL execution start, never at queueing or admission; persistence
+   * failures are reported through the console (honest, non-model-facing) and
+   * never claimed as recorded.
+   */
+  const consumeOneShot = (entryId: string): void => {
+    consumeOneShotExecution(entryId, {
+      config,
+      ...(loaded.path !== undefined ? { configPath: loaded.path } : {}),
+      reportError: (message) => console.warn(message),
+    });
+  };
   if (loaded.globallyDisabled) {
     await sendNotice(pi, `review gate: disabled (${loaded.disabledReason ?? "environment kill switch"})`);
     return;
@@ -333,8 +349,14 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       if (!loaded.path) {
         throw new Error("No persistent review-gate config file is loaded.");
       }
-      replaceConfig(config, await persistSubtasksViewPreference(loaded.path, expanded));
+      // #306: capture the live already-run state before this asynchronous
+      // save so a later install can preserve changes made while in flight.
+      const scheduledTasksAlreadyRunBeforeSave = captureScheduledAlreadyRun(config);
+      replaceConfig(config, await persistSubtasksViewPreference(loaded.path, expanded), {
+        scheduledTasksAlreadyRunBeforeSave,
+      });
     },
+    onScheduledDispatchRecorded: consumeOneShot,
   });
 
   // Issue #26: process-local scheduled-execution runtime. The live On/Off
@@ -367,7 +389,11 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
    * is rejected before an orchestrator turn is sent, and the limitation is
    * reported instead.
    */
-  const orchestratorTurnTracker = new ScheduledOrchestratorTurnTracker();
+  const orchestratorTurnTracker = new ScheduledOrchestratorTurnTracker({
+    // Issue #306: the in-run message_start observation is the one-shot
+    // consumption point for this destination — the provider turn started.
+    onObserved: (occurrence) => consumeOneShot(occurrence.entryId),
+  });
   // Lifecycle-test seam: exposes the live tracker so host-faithful tests can
   // observe attribution and settlement state.
   dependencies.orchestratorTurnsTestAccess?.(orchestratorTurnTracker);

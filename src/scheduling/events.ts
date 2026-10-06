@@ -67,6 +67,25 @@ export function formatScheduledSkipEvent(
 }
 
 /**
+ * Issue #306: one-shot orchestrator-turn pending-skip report. A due
+ * occurrence of a one-shot entry whose previous delivery is still pending
+ * (queued behind a busy agent, in flight, or observed but unsettled) must
+ * not queue another execution of the same entry. The report states exactly
+ * what is pending and that nothing new was dispatched; the pending turn is
+ * counted only by its own message_start observation.
+ */
+export function formatScheduledOneShotPendingSkip(
+  entryId: string,
+  entry: ScheduledTaskEntryConfig,
+  dueAt: Date,
+): string {
+  return [
+    `Scheduled task ${entryId} (${entry.name}) was due at ${dueTimeLabel(dueAt)} for cron "${entry.cron}", but it is a one-shot entry whose previous orchestrator-turn delivery is still pending (queued, in flight, or observed but not yet settled).`,
+    "The due occurrence was SKIPPED: no second turn was queued, dispatched, or executed. The pending turn counts as the entry's single execution only when the host's own message lifecycle observes it; until then the entry has NOT run.",
+  ].join("\n");
+}
+
+/**
  * Bounded overdue-drop report: a due occurrence whose minute passed before it
  * could be dispatched while this entry's previous dispatch had not yet
  * settled, with no run of the entry active. It names the schedule identity

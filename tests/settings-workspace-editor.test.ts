@@ -161,7 +161,7 @@ for (const targetKind of ["missing", "existing file"] as const) {
         typeText(component, invalid);
         component.handleInput?.(ENTER);
       },
-      keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 10)
+      keys(...Array(7).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 12)
       keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
       keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 15) → Save changes (row 17)
       keys(ESCAPE), // failed save re-shows the root menu; Esc leaves without saving
@@ -204,7 +204,7 @@ test("full TUI flow: a typed existing workspace stages through Save", async (t) 
       typeText(component, target);
       component.handleInput?.(ENTER); // submit the existing directory
     },
-    keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 10)
+    keys(...Array(7).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 12)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 15) → Save changes (row 17)
   ], { cwd: dir });
@@ -240,7 +240,7 @@ test("full TUI flow: cancel in the workspace field leaves the staged value uncha
       typeText(component, "-partial"); // a partial edit that must not survive
       component.handleInput?.(ESCAPE); // cancel the field
     },
-    keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 10)
+    keys(...Array(7).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 12)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
     keys(ESCAPE), // root: leave without saving
   ], { cwd: dir });
@@ -300,7 +300,7 @@ test("full TUI flow (real host): native Tab completion stages an existing direct
       assert.ok(component.render!(200).join("\n").includes("~/alpha/"), "the folder completion is in the draft");
       component.handleInput?.(ENTER); // submit
     },
-    keys(...Array(5).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 10)
+    keys(...Array(7).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 12)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 15) → Save changes (row 17)
   ], { cwd: home, keybindings: createRealKeybindingsManager(loaded.tui), theme: REAL_IDENTITY_THEME, provider: new providerCtor([], home) });

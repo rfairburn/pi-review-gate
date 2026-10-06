@@ -15,6 +15,28 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.124]
+
+### Added
+
+- Re-armable one-shot scheduled tasks (#306). Scheduled task entries accept two
+  optional boolean fields, `oneShot` and `alreadyRun`, each `false` by default
+  when absent, so existing entries stay recurring and need no migration. A
+  `oneShot: true` entry is eligible to fire only while `alreadyRun` is `false`;
+  the scheduler records `alreadyRun: true` when execution of a due occurrence
+  actually starts — the scheduled worker's prompt delivery for the subtask
+  destination and the matching scheduled-message observation inside the host
+  run for the orchestrator-turn destination — and never through launch
+  admission, queueing, completion, model-reported success, or review results,
+  none of which reset the consumed state. Skipped occurrences and launch sends
+  that never start leave the flag unchanged. The entry remains in the catalog
+  after it runs, disarmed; setting `alreadyRun: true` manually disarms it
+  without executing anything, and setting it back to `false` re-arms it for its
+  next future cron occurrence under its existing `enabled` setting — no
+  immediate run and no catch-up. Cron expressions, schedule destinations,
+  scheduler firing reliability, and future-only scheduling are unchanged. See
+  the scheduled-task docs, [One-shot entries](docs/scheduled-tasks.md#one-shot-entries).
+
 ## [0.1.0-dev.123]
 
 ### Changed

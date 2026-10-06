@@ -68,20 +68,39 @@ garbage collection). Window baselines are retired only after a durable session-s
 save, so an in-memory session, which saves no state, keeps those records in its session
 namespace, just as they previously remained in the workspace.
 
-Because records are outside the workspace, delegated task capture never sees them or
-counts them against `maxSnapshotBytes`, and ordinary project files or directories named
-`.pi-review-gate` (top-level or nested) are captured and reviewed like any other
-content. Only the current record format is accepted: a persisted review window that
-references an earlier non-Git checkpoint format fails restore closed rather than being
-migrated. Records are located from the agent directory resolved when the session
-starts; if that directory changes between restarts, the earlier record is reported as
-damaged and review starts fresh from the current workspace.
+For an ordinary project root that neither contains the checkpoint store nor lies
+inside it, no checkpoint bytes are written under that root. Delegated task capture of
+such a root therefore never sees checkpoint records or counts them against
+`maxSnapshotBytes`, and ordinary project files or directories named `.pi-review-gate`
+(top-level or nested) are captured and reviewed like any other content. Only the
+current record format is accepted: a persisted review window that references an
+earlier non-Git checkpoint format fails restore closed rather than being migrated.
+Records are located from the agent directory resolved when the session starts; if that
+directory changes between restarts, the earlier record is reported as damaged and
+review starts fresh from the current workspace.
 
-If the agent-data checkpoint location overlaps the workspace being captured (for
-example `PI_CODING_AGENT_DIR` inside the workspace, or a non-Git session started in an
-ancestor of the agent directory such as the home directory), non-Git checkpoint capture
-fails closed with an explicit unsupported-configuration error instead of writing
-records into the workspace or choosing another location.
+#### Known limitation: a workspace that overlaps the checkpoint store
+
+The checkpoint store has one location for every non-Git session, with no alternate or
+configurable base. This release accepts two limitations when a workspace overlaps it:
+
+- **Non-Git review root.** If the store overlaps the non-Git workspace being captured
+  for review (for example `PI_CODING_AGENT_DIR` inside the workspace, or a non-Git
+  session started in an ancestor of the agent directory such as the home directory),
+  non-Git checkpoint capture fails closed with an explicit unsupported-configuration
+  error instead of writing records into the workspace or choosing another location.
+  Reviewing such a root is unsupported.
+- **Delegated target.** A delegated execution target whose tree contains the store is
+  not rejected. Its automatic task capture and downstream snapshots may include
+  checkpoint record files, and those bytes count against capture budgets such as
+  `maxSnapshotBytes`.
+
+Keeping the Pi agent directory outside review and delegated workspaces avoids both.
+Follow-up [#318](https://github.com/rfairburn/pi-review-gate/issues/318) will exclude
+exactly this extension's checkpoint record files from automatic and downstream
+collection. It will not choose another storage destination, and tool-based evidence
+of modifications to those files will still be retained. Record file permissions and
+capture-size limits stay as described above.
 
 On Windows, synthetic checkpoint objects are flushed by Git at write time; this
 requires Git 2.36.0 or newer, and older versions fail closed. Git and non-Git

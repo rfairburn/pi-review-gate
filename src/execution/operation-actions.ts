@@ -926,12 +926,27 @@ export async function verifyRecoveryCheckpoint(
   }
 }
 
-/** #179: the only terminal code an explicit in-place continuation may bypass.
- * Every producer of this code is a checkpoint staging or verification failure
- * (candidate normalization, checkpoint verification, cancellation/retry/
- * adapter-initialization checkpoint creation); landing rollback uses its own
- * `landing_rollback_incomplete` code, which is never bypassed. */
+/** #179: the only terminal code an explicit in-place continuation may bypass,
+ * and only for checkpoint staging or verification failures (candidate
+ * normalization, checkpoint verification, cancellation/retry/
+ * adapter-initialization checkpoint creation). Landing rollback uses its own
+ * `landing_rollback_incomplete` code, which is never bypassed. #310: the code
+ * is also reused by `recordUnverifiedChildShutdown` at stage
+ * `executor_shutdown`, which is not a checkpoint failure, so eligibility is
+ * decided by {@link isInPlaceBypassableCheckpointIncident}, never by the code
+ * alone. */
 const IN_PLACE_BYPASSABLE_TERMINAL_CODE = "recovery_state_corrupt_or_unverifiable";
+
+/** #310: stage of the unverified executor shutdown incident. It shares the
+ * bypassable terminal code but never makes a critical operation eligible for
+ * in-place continuation, even once the recorded writer is proven dead. */
+const EXECUTOR_SHUTDOWN_STAGE = "executor_shutdown";
+
+/** Whether an incident is a checkpoint staging/verification failure that an
+ * explicit in-place continuation may bypass. */
+function isInPlaceBypassableCheckpointIncident(incident: ExecutionIncident): boolean {
+  return incident.terminalCode === IN_PLACE_BYPASSABLE_TERMINAL_CODE && incident.stage !== EXECUTOR_SHUTDOWN_STAGE;
+}
 
 const IN_PLACE_REFUSED = "In-place continuation refused:";
 
@@ -964,7 +979,7 @@ function latestUnresolvedTerminalIncident(record: OperationRecord): ExecutionInc
 function latestUnresolvedCheckpointIncident(record: OperationRecord): ExecutionIncident | undefined {
   for (let index = record.incidents.length - 1; index >= 0; index -= 1) {
     const incident = record.incidents[index]!;
-    if (incident.terminalCode === IN_PLACE_BYPASSABLE_TERMINAL_CODE && !incident.resolvedAt) return incident;
+    if (isInPlaceBypassableCheckpointIncident(incident) && !incident.resolvedAt) return incident;
   }
   return undefined;
 }
@@ -981,6 +996,7 @@ function latestUnresolvedCheckpointIncident(record: OperationRecord): ExecutionI
  * - the writer is live/uncertain, or an active state has no durable owner;
  * - the operation is landed/reviewing, or failed_critical for any reason other
  *   than a checkpoint staging/verification failure with its durable incident;
+ * - an unverified executor shutdown (#310 `executor_shutdown`) is unresolved;
  * - the retained folder is missing, not a real directory, not the task's
  *   managed worktree path, not a Git top-level of the private wave repository,
  *   on an attached HEAD, or at a HEAD that is neither the captured base nor a
@@ -1021,10 +1037,18 @@ export async function verifyInPlaceContinuation(input: {
   if (record.state === "reviewing") {
     throw new Error(`${IN_PLACE_REFUSED} operation ${record.operationId} is in state reviewing; in-place continuation only applies to a stopped executor.`);
   }
+  // #310: an unresolved unverified executor shutdown is never bypassable, in
+  // any state and regardless of incident order (an older or newer genuine
+  // checkpoint incident does not explain it away), even after the recorded
+  // writer is proven dead or released.
+  const unverifiedShutdown = record.incidents.find((incident) => incident.stage === EXECUTOR_SHUTDOWN_STAGE && !incident.resolvedAt);
+  if (unverifiedShutdown) {
+    throw new Error(`${IN_PLACE_REFUSED} the operation has an unresolved ${EXECUTOR_SHUTDOWN_STAGE} incident (${unverifiedShutdown.terminalCode ?? "no terminal code"}): shutdown of its executor was never verified, which is not a checkpoint staging or verification failure. Only a checkpoint staging or verification failure may be continued in place; inspect the operation diagnostics.`);
+  }
   const checkpointIncident = latestUnresolvedCheckpointIncident(record);
   if (record.state === "failed_critical") {
     const terminal = latestUnresolvedTerminalIncident(record);
-    if (!terminal || terminal.terminalCode !== IN_PLACE_BYPASSABLE_TERMINAL_CODE) {
+    if (!terminal || !isInPlaceBypassableCheckpointIncident(terminal)) {
       throw new Error(`${IN_PLACE_REFUSED} operation state failed_critical is not explained by a durable checkpoint staging/verification incident${terminal ? ` (latest terminal incident: ${terminal.stage}/${terminal.terminalCode})` : ""}. Only a checkpoint staging or verification failure may be continued in place; inspect the operation diagnostics.`);
     }
   }

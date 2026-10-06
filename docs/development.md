@@ -579,6 +579,21 @@ Boundaries shared by all five families:
 - Unknown historical or malformed notification formats fall back to the full retained
   text rather than a potentially misleading summary, and when the host's renderer APIs
   are absent the native full presentation applies instead of a degraded guess.
+- Each notification renders in the host's own native custom-message card in both
+  states: the pi-tui `Box(1, 1, (t) => theme.bg("customMessageBg", t))` boundary the
+  default `CustomMessageComponent` uses — one-cell horizontal/vertical padding, every
+  row (including wrapped hints and the blank padding rows) filled to the terminal
+  width — with the plain body text and family labels following the native
+  `customMessageText`/`customMessageLabel` fg tokens (outcome colors preserved). Every
+  color resolves through the theme at render time — never snapshotted or hard-coded —
+  so the card follows the active theme, including nondefault/custom themes and theme
+  changes, exactly like the native card. Width safety holds at every width: below the
+  three cells the native padding needs, a width-aware narrow path renders with zero
+  horizontal padding and clips every row to the exact cell width (the host's own
+  ANSI-aware `truncateToWidth`), so no row — including retained wide-glyph content,
+  in compact, expanded, or full-text-fallback states — ever exceeds the requested
+  width. Clicking any card content or padding location
+  still toggles only that item, and tool-result card backgrounds are untouched.
 - The host peer modules the renderers read (pi-tui helpers and the native key-hint
   helpers) are resolved through the established shared host-relative loader during
   session setup — before anything renders, with no loading at render time. A compiled

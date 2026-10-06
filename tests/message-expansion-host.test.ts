@@ -50,7 +50,13 @@ interface HostBundle {
   tui: {
     visibleWidth(line: string): number;
     wrapTextWithAnsi(text: string, width: number): string[];
+    truncateToWidth(text: string, maxWidth: number, ellipsis?: string, pad?: boolean): string;
     MouseRegion: new (child: unknown, handler: (event: unknown) => unknown) => unknown;
+    Box: new (
+      paddingX: number,
+      paddingY: number,
+      bgFn?: (text: string) => string,
+    ) => unknown;
     KeybindingsManager: new (definitions: Record<string, unknown>) => {
       setUserBindings(bindings: Record<string, string | string[]>): void;
     };
@@ -80,7 +86,8 @@ function discoverInstalledHost(): HostBundle | undefined {
       const req = createRequire(path.join(agentDir, "node_modules", "__pi_host_anchor__.js"));
       const agent = req(path.join(agentDir, "dist", "index.js"));
       const tui = req("@earendil-works/pi-tui");
-      if (typeof agent?.CustomMessageComponent !== "function" || typeof tui?.MouseRegion !== "function") continue;
+      if (typeof agent?.CustomMessageComponent !== "function" || typeof tui?.MouseRegion !== "function"
+    || typeof tui?.Box !== "function") continue;
       const coreKeybindings = req(path.join(agentDir, "dist", "core", "keybindings.js"));
       return { agentDir, agent, tui, keyHint: agent.keyHint, keyText: agent.keyText, coreKeybindings } as HostBundle;
     } catch {
@@ -109,6 +116,10 @@ if (!host) {
   setPiTuiHost({
     wrapTextWithAnsi: h.tui.wrapTextWithAnsi,
     MouseRegion: h.tui.MouseRegion as never,
+    // The real pi-tui Box: the notification card's native boundary component.
+    Box: h.tui.Box as never,
+    // The real ANSI-aware cell truncator used by the degenerate-width path.
+    truncateToWidth: h.tui.truncateToWidth as never,
   });
   // The native hint resolves the configured `app.tools.expand` binding through
   // pi-tui's global KeybindingsManager; install it (defaults) so keyText/keyHint
@@ -133,8 +144,22 @@ if (!host) {
 
   const realTheme = (globalThis as Record<symbol, unknown>)[
     Symbol.for("@earendil-works/pi-coding-agent:theme")
-  ] as { fg(color: string, text: string): string } | undefined;
-  assert.ok(realTheme && typeof realTheme.fg === "function", "initTheme installed the real native Theme");
+  ] as {
+    fg(color: string, text: string): string;
+    bg(color: string, text: string): string;
+  } | undefined;
+  assert.ok(realTheme && typeof realTheme.fg === "function" && typeof realTheme.bg === "function", "initTheme installed the real native Theme with fg/bg");
+
+  // The CURRENT ANSI for one theme token, resolved through the real native
+  // theme at assertion time (never a constant copied from earlier work).
+  function tokenFgOpen(color: string): string {
+    const styled = realTheme!.fg(color, "");
+    return styled.slice(0, styled.length - "\x1b[39m".length);
+  }
+  function tokenBgOpen(color: string): string {
+    const styled = realTheme!.bg(color, "");
+    return styled.slice(0, styled.length - "\x1b[49m".length);
+  }
 
   // Each scenario gets its OWN message object: the per-message expansion state
   // is keyed by the message object (by design a clicked message stays expanded
@@ -181,6 +206,237 @@ if (!host) {
     const rendered = comp.render(100);
     assert.ok(rendered.some((line) => stripAnsi(line).includes("[bg-shell] build (job-42)")), "collapsed row renders");
     assert.ok(rendered.some((line) => line.includes("\x1b[")), "the real theme applies ANSI styling");
+  });
+
+  // ── Native card boundary (#92 styling correction) ─────────────────────
+  // These assertions establish the ACTUAL card background — the real Box fill,
+  // padding rows, and width filling — not merely stripped text.
+
+  /**
+   * The host's `CustomMessageComponent` renders its own native Spacer row above
+   * the card (inter-message spacing, OUTSIDE the card boundary): the leading
+   * empty row of every render. Everything after it is the themed card.
+   */
+  function cardRowsOf(comp: ReturnType<typeof makeRow>): string[] {
+    const rows = comp.render(80);
+    assert.ok(rows.length > 1 && rows[0] === "", "the native Spacer row precedes the card");
+    return rows.slice(1);
+  }
+
+  const compactSubtaskMessage = {
+    role: "custom", customType: "pi-review-subtask-event",
+    content: "Task: t-1 · Do the styled work · landed\nExecution exec-1 COMPLETE: 1/1 tasks landed.\nFull report: /tmp/reports/styled.md",
+    display: true, details: { state: "landed", executionId: "exec-1" },
+  };
+
+  test("native card: every row of BOTH states fills the width with the REAL customMessageBg token and 1-cell padding", () => {
+    const comp = makeRow("pi-review-subtask-event", compactSubtaskMessage);
+    for (const state of [false, true]) {
+      comp.setExpanded(state);
+      const rows = cardRowsOf(comp);
+      assert.ok(rows.length > 2, `state ${state}: card has content rows plus the blank padding rows`);
+      for (const row of rows) {
+        // Width fill: the Box pads EVERY row (content, hint, and blank padding)
+        // to the full terminal width with the background applied.
+        assert.equal(h.tui.visibleWidth(row), 80, `state ${state}: row fills the width: ${JSON.stringify(row)}`);
+        // The background is the real theme's customMessageBg token (not a
+        // hard-coded color): the row opens with it and closes its reset last.
+        assert.ok(row.startsWith(tokenBgOpen("customMessageBg")), `state ${state}: row carries the customMessageBg token: ${JSON.stringify(row.slice(0, 40))}`);
+        assert.ok(row.endsWith("\x1b[49m"), `state ${state}: background reset closes the row`);
+      }
+      // The original native one-cell horizontal/vertical padding: the first and
+      // last rows are blank background rows, and content starts at column 2.
+      assert.equal(stripAnsi(rows[0]!).trim(), "", `state ${state}: blank top padding row`);
+      assert.equal(stripAnsi(rows[rows.length - 1]!).trim(), "", `state ${state}: blank bottom padding row`);
+    }
+  });
+
+  test("native card: label and body follow the customMessageLabel/customMessageText fg tokens", () => {
+    const comp = makeRow("pi-review-subtask-event", compactSubtaskMessage);
+    const rows = cardRowsOf(comp).map(stripAnsi);
+    const headerIndex = rows.findIndex((line) => line.includes("[subtask] Do the styled work"));
+    assert.ok(headerIndex >= 0, "compact header present");
+    const reportIndex = rows.findIndex((line) => line.includes("Full report: /tmp/reports/styled.md"));
+    assert.ok(reportIndex >= 0, "report line present");
+    // Header card label: the native customMessageLabel token (bold label), and
+    // the report line: the native customMessageText body token — both resolved
+    // through the REAL theme (verified against its own token output).
+    const labelOpen = tokenFgOpen("customMessageLabel");
+    const textOpen = tokenFgOpen("customMessageText");
+    const styledRows = cardRowsOf(comp);
+    const bgOpen = tokenBgOpen("customMessageBg");
+    assert.ok(styledRows[headerIndex]!.startsWith(`${bgOpen} ${labelOpen}`), "header label opens with the real customMessageLabel token");
+    assert.ok(styledRows[reportIndex]!.startsWith(`${bgOpen} ${textOpen}`), "body row opens with the real customMessageText token");
+  });
+
+  test("native card: expansion keeps the themed card; a re-click contracts to the identical card", () => {
+    const comp = makeRow("pi-review-subtask-event", compactSubtaskMessage);
+    const collapsed = cardRowsOf(comp);
+    clickOnLine(comp, "[subtask] Do the styled work");
+    // Expanded stays in the SAME themed boundary (full text on the card).
+    const expanded = cardRowsOf(comp);
+    assert.ok(expanded.some((row) => stripAnsi(row).includes("Task: t-1 · Do the styled work · landed")), "expanded shows the full retained text");
+    for (const row of expanded) {
+      assert.ok(row.startsWith(tokenBgOpen("customMessageBg")) && h.tui.visibleWidth(row) === 80, "expanded row keeps the themed full-width card");
+    }
+    clickOnLine(comp, "Task: t-1 · Do the styled work");
+    assert.deepEqual(cardRowsOf(comp), collapsed, "re-click contracts to the byte-identical collapsed card");
+  });
+
+  test("native card: blank card padding rows and card edges still toggle ONLY that message", () => {
+    const comp = makeRow("pi-review-subtask-event", compactSubtaskMessage);
+    const rows = cardRowsOf(comp);
+    // A click on the blank TOP PADDING row (card edge, not content) toggles it.
+    // (y is in the FULL render: the leading native Spacer row is y=0, so the
+    // card's own top padding row is y=1.)
+    const top = comp.handleMouse({ type: "click", button: "left", x: 0, y: 1, screenX: 0, screenY: 1, width: 80, height: rows.length + 1 });
+    assert.equal(top?.handled, true, "card padding-row click is handled by the card");
+    assert.ok(cardRowsOf(comp).some((line) => stripAnsi(line).includes("Task: t-1 · Do the styled work · landed")), "padding click expanded that card");
+    // A click on the bottom blank padding row contracts it again.
+    const bottomY = cardRowsOf(comp).length; // last card row index in the full render
+    const bottom = comp.handleMouse({ type: "click", button: "left", x: 79, y: bottomY, screenX: 79, screenY: bottomY, width: 80, height: bottomY + 1 });
+    assert.equal(bottom?.handled, true, "bottom padding-row click is handled by the card");
+    assert.ok(!cardRowsOf(comp).some((line) => stripAnsi(line).includes("Task: t-1 · Do the styled work · landed")), "padding click contracted that card");
+  });
+
+  test("native card: width-correct at narrow widths in both states", () => {
+    const comp = makeRow("pi-review-subtask-event", compactSubtaskMessage);
+    for (const width of [0, 1, 2, 3, 10, 20, 40]) {
+      for (const state of [false, true]) {
+        comp.setExpanded(state);
+        // Skip the native Spacer row: only the card rows are width-filled.
+        const rows = comp.render(width).slice(1);
+        if (width === 0) {
+          assert.equal(rows.length, 0, `width 0/${state ? "expanded" : "collapsed"}: no cell to render into`);
+          continue;
+        }
+        for (const row of rows) {
+          assert.equal(h.tui.visibleWidth(row), width, `width ${width}/${state ? "expanded" : "collapsed"}: row fills exactly: ${JSON.stringify(row)}`);
+          assert.ok(row.startsWith(tokenBgOpen("customMessageBg")), `width ${width}/${state ? "expanded" : "collapsed"}: themed row`);
+        }
+      }
+    }
+    // The ordinary widths keep the native one-cell padding (blank rows around
+    // the content); the degenerate widths keep the same background without the
+    // impossible horizontal padding.
+    comp.setExpanded(false);
+    assert.equal(stripAnsi(comp.render(40).slice(1)[0]!).trim(), "", "width 40: blank top padding row (native padding kept)");
+    assert.equal(stripAnsi(comp.render(3).slice(1)[0]!).trim(), "", "width 3: blank top padding row still rendered");
+  });
+
+  test("native card: degenerate widths stay cell-safe with wide-glyph retained content in compact, expanded, and historical-fallback states", () => {
+    // Wide graphemes cannot fit one cell: the row must clip rather than
+    // overflow (the box padding must also collapse, never spill). Covers the
+    // compact recognized event, the expanded full text of the same message,
+    // and the full-text historical fallback (unrecognized content).
+    const wide = { role: "custom", customType: "pi-review-subtask-event",
+      content: "Task: t-你 · 宽 task title · reported\nFull report: /tmp/你.md",
+      display: true, details: { state: "reported", executionId: "exec-你" } };
+    const historical = { role: "custom", customType: "pi-review-subtask-event",
+      content: "unrecognized 你 historical shape 你 here 😀",
+      display: true };
+    const comps = [
+      makeRow("pi-review-subtask-event", wide),
+      makeRow("pi-review-subtask-event", historical),
+    ];
+    for (const comp of comps) {
+      for (const state of [false, true]) {
+        comp.setExpanded(state);
+        for (const width of [0, 1, 2, 3]) {
+          for (const row of comp.render(width)) {
+            assert.ok(h.tui.visibleWidth(row) <= width, `width ${width}/${state ? "expanded" : "collapsed"}: row never exceeds (got ${JSON.stringify(row)})`);
+          }
+          if (width >= 1) {
+            const rows = comp.render(width).slice(1);
+            assert.equal(rows.every((row) => h.tui.visibleWidth(row) === width), true, `width ${width}/${state ? "expanded" : "collapsed"}: themed rows fill exactly`);
+          } else {
+            assert.equal(comp.render(width).slice(1).length, 0, "width 0 renders no card rows");
+          }
+        }
+      }
+    }
+  });
+
+  test("native card: padded path clips graphemes wider than two cells", () => {
+    const glyph = "क्षि";
+    assert.equal(h.tui.visibleWidth(glyph), 3, "real host measures this Indic grapheme as three cells");
+    const messages = [
+      {
+        role: "custom", customType: "pi-review-subtask-event",
+        content: [`Task: t-1 · ${glyph} · reported`, "Full report: /tmp/report.md"].join("\n"),
+        display: true, details: { state: "reported", executionId: "exec-1" },
+      },
+      {
+        role: "custom", customType: "pi-review-subtask-event",
+        content: `unrecognized ${glyph} historical shape`, display: true,
+      },
+    ];
+    for (const message of messages) {
+      const comp = makeRow("pi-review-subtask-event", message);
+      for (const expanded of [false, true]) {
+        comp.setExpanded(expanded);
+        for (const width of [1, 2, 3, 4, 10]) {
+          for (const row of comp.render(width).slice(1)) {
+            assert.equal(h.tui.visibleWidth(row), width,
+              `state ${expanded ? "expanded" : "compact"}, width ${width}: ${JSON.stringify(row)}`);
+            assert.ok(row.includes(tokenBgOpen("customMessageBg")), "clipped row retains the themed background");
+            assert.ok(row.endsWith("\x1b[49m"), "card background closes at the row boundary");
+          }
+        }
+      }
+    }
+  });
+
+  test("native card: clipped wide glyph restores the background before the padding cell", () => {
+    const comp = makeRow("pi-review-subtask-event", {
+      role: "custom", customType: "pi-review-subtask-event",
+      content: "你", display: true,
+    });
+    for (const expanded of [false, true]) {
+      comp.setExpanded(expanded);
+      const rows = comp.render(1).slice(1);
+      assert.ok(rows.some((row) => row.includes("\x1b[0m")),
+        "real host truncator emitted a reset for the clipped glyph");
+      assert.ok(rows.some((row) => row.includes(
+        `\x1b[0m${tokenBgOpen("customMessageBg")} `)),
+        "background is restored before the padding cell is painted");
+    }
+  });
+
+  test("native card: colors follow the ACTIVE theme — in-place token change restyles the same component, rebuild rebinds", () => {
+    // A live token table the renderers resolve through — never a snapshot.
+    const table: Record<string, string> = {
+      customMessageBg: "\x1b[48;5;17m",
+      customMessageText: "\x1b[38;5;51m",
+      customMessageLabel: "\x1b[38;5;201m",
+      muted: "",
+      success: "",
+      error: "",
+      warning: "",
+      accent: "",
+    };
+    const liveTheme = {
+      bold: (text: string): string => text,
+      fg: (color: string, text: string): string => (table[color] === undefined ? text : `${table[color]}${text}\x1b[39m`),
+      bg: (color: string, text: string): string => (table[color] === undefined ? text : `${table[color]}${text}\x1b[49m`),
+    };
+    const renderer = registered.get("pi-review-bg-shell")!;
+    const comp = renderer(bgShellMessage(), { expanded: false, outputPad: 1 }, liveTheme) as { render(width: number): string[] };
+    const before = comp.render(80);
+    assert.ok(before.every((row) => row.startsWith("\x1b[48;5;17m")), "initial rows use theme variant A's customMessageBg");
+    // In-place theme change (the way a theme switch updates token tables):
+    // the SAME component restyles on the next render — no ANSI snapshot.
+    table.customMessageBg = "\x1b[48;5;18m";
+    table.customMessageText = "\x1b[38;5;87m";
+    const after = comp.render(80);
+    assert.ok(after.every((row) => row.startsWith("\x1b[48;5;18m")), "rows restyle with theme variant B's customMessageBg");
+    assert.ok(after.some((row) => row.includes("\x1b[38;5;87m")), "body text restyles with theme variant B's customMessageText");
+    assert.ok(!after.some((row) => row.includes("\x1b[48;5;17m")), "variant A's background ANSI is gone");
+    // A rebuild with a DIFFERENT theme object rebinds: a fresh renderer call
+    // with theme C produces its own colors (and keeps the same message state).
+    const themeC = { ...liveTheme, bg: (color: string, text: string): string => `\x1b[48;5;19m${text}\x1b[49m` };
+    const rebuilt = (registered.get("pi-review-bg-shell")!)((bgShellMessage("build", "job-c")), { expanded: false, outputPad: 1 }, themeC) as { render(width: number): string[] };
+    assert.ok(rebuilt.render(80).every((row) => row.startsWith("\x1b[48;5;19m")), "a rebuilt row follows the new theme object's customMessageBg");
   });
 
   test("shared core adds exactly one native header hint to a message row (both states)", () => {
@@ -257,7 +513,12 @@ if (!host) {
       assert.ok(rendered.some((line) => line.includes("background job")), "the host default box shows the full content");
     } finally {
       // Restore the real helpers for any later tests in this process.
-      setPiTuiHost({ wrapTextWithAnsi: h.tui.wrapTextWithAnsi, MouseRegion: h.tui.MouseRegion as never });
+      setPiTuiHost({
+        wrapTextWithAnsi: h.tui.wrapTextWithAnsi,
+        MouseRegion: h.tui.MouseRegion as never,
+        Box: h.tui.Box as never,
+        truncateToWidth: h.tui.truncateToWidth as never,
+      });
     }
   });
 

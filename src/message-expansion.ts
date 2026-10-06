@@ -70,6 +70,21 @@
  *   their own. No competing key handler is registered and nothing is fetched,
  *   rerun, or read from disk on toggle.
  *
+ * Native visual boundary (#92 correction): the compact and expanded rows are
+ * wrapped in the HOST'S OWN native card — the same pi-tui
+ * `Box(1, 1, (t) => theme.bg("customMessageBg", t))` the default
+ * `CustomMessageComponent` uses (one horizontal/vertical padding cell, every
+ * rendered row filled to the terminal width through the theme's
+ * `customMessageBg` token) — in BOTH states, and the formerly unstyled body
+ * text follows the native `customMessageText`/`customMessageLabel` fg tokens
+ * (status colors stay). Every color is resolved through the theme object the
+ * host passed, at render time — never snapshotted or hard-coded — so the card
+ * follows the active theme (including nondefault/custom themes and theme
+ * changes) exactly like the native card. This is presentation only: content,
+ * interactions, hints, and degradation paths are unchanged, and without the
+ * Box peer or a theme bg() the row degrades to the previously shipped
+ * unwrapped rendering.
+ *
  * Public peer degradation: when `registerMessageRenderer` is absent (older
  * hosts) registration is skipped entirely so the host's full native fallback
  * renders. When pi-tui's `wrapTextWithAnsi` is unavailable the renderer returns
@@ -146,9 +161,20 @@ export type MessageRendererCallback = (
 
 // ── pi-tui peer loading (host-provided, never a dependency) ─────────────────
 
+/** The structural pi-tui `Box` subset this module drives (host card boundary). */
+export interface TuiBoxLike extends MessageComponent {
+  addChild(child: MessageComponent): unknown;
+}
+
 interface PiTuiHost {
   wrapTextWithAnsi?: (text: string, width: number) => string[];
+  truncateToWidth?: (text: string, maxWidth: number, ellipsis?: string, pad?: boolean) => string;
   MouseRegion?: new (child: MessageComponent, handler: (event: unknown) => unknown) => MessageComponent;
+  Box?: new (
+    paddingX: number,
+    paddingY: number,
+    bgFn: ((text: string) => string) | undefined,
+  ) => TuiBoxLike;
 }
 
 let tuiOverride: PiTuiHost | undefined;
@@ -203,6 +229,12 @@ async function loadSharedPiTuiHost(): Promise<PiTuiHost | undefined> {
   if (typeof tui?.MouseRegion === "function") {
     host.MouseRegion = tui.MouseRegion as PiTuiHost["MouseRegion"];
   }
+  if (typeof tui?.Box === "function") {
+    host.Box = tui.Box as PiTuiHost["Box"];
+  }
+  if (typeof tui?.truncateToWidth === "function") {
+    host.truncateToWidth = tui.truncateToWidth as PiTuiHost["truncateToWidth"];
+  }
   warmedTuiHost = host;
   return host;
 }
@@ -210,6 +242,119 @@ async function loadSharedPiTuiHost(): Promise<PiTuiHost | undefined> {
 function resolveTui(): PiTuiHost | undefined {
   if (tuiOverride !== undefined) return tuiOverride;
   return warmedTuiHost;
+}
+
+// ── The native notification card boundary (theme-driven, both states) ───────
+
+/**
+ * Wraps one notification row in the host's OWN native card: a pi-tui `Box`
+ * with exactly the default `CustomMessageComponent` padding and background —
+ * `new Box(1, 1, (t) => theme.bg("customMessageBg", t))` — so every rendered
+ * row (content, wrapped hint, and the blank one-cell padding rows) fills the
+ * terminal width with the theme's `customMessageBg` token in BOTH states.
+ *
+ * The box's bgFn is evaluated by the Box itself on EVERY render against the
+ * theme object the host passed, so colors follow the active theme (including
+ * nondefault/custom themes and theme changes) without any ANSI snapshot —
+ * exactly like the native card. The returned box forwards clicks into the
+ * row (which has none of its own), so any card content or padding location
+ * toggles that one item; when the Box peer or a theme bg() is unavailable the
+ * unwrapped row degrades exactly as previously shipped.
+ *
+ * Width safety (#92 review correction): the native one-cell horizontal
+ * padding needs three cells (pad×2 + one content cell). The host can measure
+ * some graphemes as more than two cells, so content rows are clipped to the
+ * width Box gives them before padding is added. Below three cells the card uses
+ * zero horizontal padding, the same one-cell vertical padding and background,
+ * and clips each row to the exact cell width. Width 0 and below renders nothing
+ * — there is no cell to render into. Rows already fitting their content width
+ * remain byte-identical, and both paths keep the native Box background.
+ */
+/**
+ * A narrow card line that clipped a wide grapheme can carry a FULL ANSI reset
+ * from the host truncator (`\x1b[0m`, review pass 2): the reset clears the
+ * background, so a background applied ONLY at the line start leaves every
+ * following cell — including the Box's own padding cell — unthemed. The card
+ * background therefore reapplies `customMessageBg` after every full reset,
+ * span by span. Ordinary rows (no full reset inside) stay byte-identical: one
+ * background application around the whole padded line, exactly as before.
+ */
+const CARD_BG_FULL_RESET_SPLIT = /(\x1b\[0?m|\x1b\[49m)/;
+
+function themedCardBgFn(bg: (color: string, text: string) => string): (text: string) => string {
+  return (text: string): string => {
+    const parts = text.split(CARD_BG_FULL_RESET_SPLIT);
+    if (parts.length === 1) return bg("customMessageBg", text); // ordinary rows: byte-identical
+    let result = "";
+    for (const part of parts) {
+      if (part === "\x1b[0m" || part === "\x1b[m" || part === "\x1b[49m") {
+        result += part; // the reset itself; the next background span reopens
+      } else if (part.length > 0) {
+        result += bg("customMessageBg", part);
+      }
+    }
+    return result;
+  };
+}
+
+function nativeCard(row: MessageComponent, theme: unknown): MessageComponent {
+  const tui = resolveTui();
+  const BoxCtor = tui?.Box;
+  const bg = bgOf(theme);
+  if (typeof BoxCtor !== "function" || !bg) return row;
+  const truncateToWidth = typeof tui?.truncateToWidth === "function"
+    ? tui.truncateToWidth
+    : undefined;
+  const bgFn = themedCardBgFn(bg);
+  const box = new BoxCtor(1, 1, bgFn);
+  box.addChild({
+    render(width: number): string[] {
+      const w = Math.max(0, Math.floor(width));
+      const lines = row.render(w);
+      return w > 0 && truncateToWidth
+        ? lines.map((line) => truncateToWidth(line, w, ""))
+        : lines;
+    },
+    invalidate() {
+      row.invalidate();
+    },
+  });
+  // Degenerate-width card: zero horizontal padding (the native one-cell
+  // padding cannot fit), the same vertical padding and background, and every
+  // row clipped to the exact cell width with the host's own ANSI-aware
+  // truncator so a wide grapheme can never push a row past the width.
+  const narrowBox = new BoxCtor(0, 1, bgFn);
+  narrowBox.addChild({
+    render(width: number): string[] {
+      const w = Math.max(0, Math.floor(width));
+      if (w <= 0 || !truncateToWidth) return row.render(w);
+      return row.render(w).map((line) => truncateToWidth(line, w, ""));
+    },
+    invalidate() {
+      row.invalidate();
+    },
+  });
+  return {
+    render(width: number): string[] {
+      const w = Math.max(0, Math.floor(width));
+      // Keep native padding from three cells up. Both paths clip oversized
+      // graphemes before Box adds padding; clusters can exceed two cells.
+      if (w >= 3) return box.render(w);
+      if (w <= 0) return [];
+      if (truncateToWidth) return narrowBox.render(w);
+      // Without the host truncator the narrow path is not cell-safe; keep the
+      // native Box behavior (identical to the host's own degenerate widths).
+      return box.render(w);
+    },
+    invalidate() {
+      box.invalidate();
+    },
+    handleMouse(event: unknown): unknown {
+      const width = isRecord(event) && typeof event.width === "number"
+        ? Math.floor(event.width) : 0;
+      return width >= 3 ? box.handleMouse?.(event) : narrowBox.handleMouse?.(event);
+    },
+  };
 }
 
 // ── Shared display helpers ───────────────────────────────────────────────────
@@ -224,9 +369,32 @@ function isRenderableComponent(value: unknown): boolean {
 }
 
 /**
- * The theme's fg()/bold() with the receiver preserved: the host Theme.fg reads
- * instance state (token tables), so a standalone call throws. Unknown colors or
- * a broken receiver degrade to plain text rather than breaking the render.
+ * The theme's bg() with the receiver preserved, returning the theme-token ANSI
+ * applied at CALL time: the host Theme.bg reads instance token tables, so a
+ * standalone call throws; this closure keeps the theme object as `this` and
+ * degrades to plain text on every failure. Never a hard-coded color, and
+ * nothing is snapshotted — each call resolves the CURRENT token value, so a
+ * theme change (or in-place token update) shows on the next render.
+ */
+function bgOf(value: unknown): ((color: string, text: string) => string) | undefined {
+  const record = isRecord(value) ? value : undefined;
+  const bgFn = typeof record?.bg === "function" ? record.bg as (color: string, text: string) => string : undefined;
+  if (!bgFn) return undefined;
+  return (color, text): string => {
+    try {
+      return bgFn.call(record, color, text);
+    } catch {
+      // Unknown token or receiver issue: plain text still communicates.
+      return text;
+    }
+  };
+}
+
+/**
+ * The native fg() with the receiver preserved: the host Theme.fg reads
+ * instance state (token tables), so a standalone call throws. Unknown colors
+ * or a broken receiver degrade to plain text rather than breaking the render.
+ * Each call resolves the CURRENT token value (never a cached ANSI snapshot).
  */
 function themeOf(value: unknown): MessageRendererTheme {
   const theme = isRecord(value) ? value : undefined;
@@ -309,12 +477,13 @@ function detailsOf(message: unknown): Record<string, unknown> | undefined {
  *   one message toggles only that message; a host global-flag change reconciles
  *   every message to the new absolute value; an unrelated rebuild with an
  *   unchanged flag retains each clicked state.
- * - The returned component is wrapped in pi-tui's MouseRegion when available so
- *   a fullscreen left click toggles that one message (handled, no neighbor
- *   effect). When pi-tui's wrapTextWithAnsi is unavailable the renderer returns
- *   undefined (full native fallback) so no over-width custom output is emitted;
- *   without the MouseRegion peer the full accessible text still renders and the
- *   keyboard global binding keeps working.
+ * - The returned row is wrapped in the native message card (`nativeCard`,
+ *   `Box(1, 1, customMessageBg)`) in BOTH states, and in pi-tui's MouseRegion
+ *   when available so a fullscreen left click toggles that one message (handled,
+ *   no neighbor effect). When pi-tui's wrapTextWithAnsi is unavailable the
+ *   renderer returns undefined (full native fallback) so no over-width custom
+ *   output is emitted; without the MouseRegion peer the full accessible text
+ *   still renders and the keyboard global binding keeps working.
  */
 export function createExpandableMessageRenderer(
   collapsedRenderer: MessageDelegate,
@@ -373,9 +542,15 @@ export function createExpandableMessageRenderer(
       invalidate() {},
     };
 
+    // The native visual boundary (both states): the row — header, hint, and
+    // expanded body alike — is wrapped in the host's own native card so the
+    // notification never blends with surrounding assistant text. Rendering is
+    // synchronous, IO-free, and peer-load-free: it reads only the
+    // already-warmed peer record and the theme object the host passed.
+    const card = nativeCard(inner, theme);
     const Region = resolveTui()?.MouseRegion;
-    if (typeof Region !== "function") return inner; // keyboard-only degradation
-    return new Region(inner, (event: unknown): unknown => {
+    if (typeof Region !== "function") return card; // keyboard-only degradation
+    return new Region(card, (event: unknown): unknown => {
       if (!isRecord(event) || event.type !== "click" || event.button !== "left") return undefined;
       state.expanded = !state.expanded;
       localState.set(message, { expanded: state.expanded, globalAtSet: currentGlobal });
@@ -404,8 +579,12 @@ export function renderFullMessageContent(
       return wrapLines(rendererTheme.fg("muted", "[no retained notification content]"), width);
     }
     // Display-encode exactly once at the raw-text boundary: control bytes become
-    // visible notation instead of being executed or deleted.
-    return wrapLines(visibleTerminalText(text), width);
+    // visible notation instead of being executed or deleted. Each wrapped body
+    // row follows the native customMessageText body token (resolved against the
+    // theme at render time — never a cached ANSI snapshot), like the host's
+    // default custom-message body.
+    return wrapLines(visibleTerminalText(text), width)
+      .map((line) => rendererTheme.fg("customMessageText", line));
   });
 }
 
@@ -577,17 +756,22 @@ export function renderSubtaskEventCollapsed(
 
   return textComponent((width) => {
     const headerParts = [
-      rendererTheme.fg("accent", rendererTheme.bold("[subtask]")),
-      title ? visibleTerminalText(title) : "[title not retained]",
+      // Native custom-message styling (#92 correction): the bounded card label
+      // and body text follow the theme's customMessageLabel/customMessageText
+      // tokens (resolved per render, never hard-coded); status colors stay.
+      rendererTheme.fg("customMessageLabel", rendererTheme.bold("[subtask]")),
+      title
+        ? rendererTheme.fg("customMessageText", visibleTerminalText(title))
+        : rendererTheme.fg("customMessageText", "[title not retained]"),
       stateInfo
         ? `· ${rendererTheme.fg(stateInfo.color, stateInfo.label)}`
         : (rawState ? `· ${rendererTheme.fg("muted", visibleTerminalText(rawState.toUpperCase()))}` : ""),
-      count ? `· ${count}` : "",
+      count ? `· ${rendererTheme.fg("customMessageText", count)}` : "",
     ].filter((part) => part.length > 0);
     const lines = [headerParts.join(" ")];
 
-    if (reportLine) lines.push(visibleTerminalText(reportLine.trim()));
-    else if (landedLine) lines.push(visibleTerminalText(landedLine.trim()));
+    if (reportLine) lines.push(rendererTheme.fg("customMessageText", visibleTerminalText(reportLine.trim())));
+    else if (landedLine) lines.push(rendererTheme.fg("customMessageText", visibleTerminalText(landedLine.trim())));
 
     // Immediate actionable failure/conflict/recovery detail, from the curated
     // diagnostic when present (bounded by construction upstream). The notice and
@@ -599,7 +783,7 @@ export function renderSubtaskEventCollapsed(
       const recovery = isRecord(diagnostic.recovery) ? diagnostic.recovery : undefined;
       const conflictGate = recovery && isRecord(recovery.conflictGate) ? recovery.conflictGate : undefined;
       if (error) lines.push(rendererTheme.fg("error", `Error: ${visibleTerminalText(error)}`));
-      if (notice && notice !== error) lines.push(visibleTerminalText(notice));
+      if (notice && notice !== error) lines.push(rendererTheme.fg("customMessageText", visibleTerminalText(notice)));
       if (conflictGate) {
         const paths = Array.isArray(conflictGate.paths)
           ? (conflictGate.paths as unknown[]).filter((item): item is string => typeof item === "string")
@@ -668,10 +852,10 @@ export function renderBgShellCollapsed(
 
   return textComponent((width) => {
     const headerParts = [
-      rendererTheme.fg("accent", rendererTheme.bold("[bg-shell]")),
-      visibleTerminalText(label),
+      rendererTheme.fg("customMessageLabel", rendererTheme.bold("[bg-shell]")),
+      rendererTheme.fg("customMessageText", visibleTerminalText(label)),
       rendererTheme.fg("muted", `(${visibleTerminalText(id)})`),
-      `· ${visibleTerminalText(reason)}`,
+      `· ${rendererTheme.fg("customMessageText", visibleTerminalText(reason))}`,
       exitCode !== undefined
         ? rendererTheme.fg(Number(exitCode) === 0 ? "success" : "error", `· exit ${exitCode}`)
         : "",
@@ -679,7 +863,7 @@ export function renderBgShellCollapsed(
     const lines = [headerParts.join(" ")];
     if (command) lines.push(rendererTheme.fg("muted", `command: ${visibleTerminalText(command)}`));
     for (const line of excerpt) {
-      lines.push(visibleTerminalText(line));
+      lines.push(rendererTheme.fg("customMessageText", visibleTerminalText(line)));
     }
     return lines.flatMap((line) => wrapLines(line, width));
   });
@@ -737,7 +921,7 @@ export function renderSubtaskWatchCollapsed(
 
   return textComponent((width) => {
     const lines: string[] = [
-      rendererTheme.fg("accent", rendererTheme.bold("[subtask-watch]")) + " "
+      rendererTheme.fg("customMessageLabel", rendererTheme.bold("[subtask-watch]")) + " "
       + rendererTheme.fg("muted", "one-shot checkpoint · active work only — not a completion or failure"),
     ];
     for (const execution of executions) {
@@ -839,9 +1023,9 @@ export function renderScheduledTaskEventCollapsed(
 
   return textComponent((width) => {
     const out: string[] = [
-      rendererTheme.fg("accent", rendererTheme.bold("[scheduled]")) + " "
+      rendererTheme.fg("customMessageLabel", rendererTheme.bold("[scheduled]")) + " "
       + rendererTheme.fg(outcome.color, outcome.label) + " · "
-      + visibleTerminalText(head),
+      + rendererTheme.fg("customMessageText", visibleTerminalText(head)),
     ];
     for (const errorLine of errorLines) {
       out.push(rendererTheme.fg("error", visibleTerminalText(errorLine)));
@@ -878,8 +1062,8 @@ export function renderScheduledOrchestratorTurnCollapsed(
 
   return textComponent((width) => {
     const lines: string[] = [
-      rendererTheme.fg("accent", rendererTheme.bold("[scheduled-turn]")) + " "
-      + visibleTerminalText(head),
+      rendererTheme.fg("customMessageLabel", rendererTheme.bold("[scheduled-turn]")) + " "
+      + rendererTheme.fg("customMessageText", visibleTerminalText(head)),
       rendererTheme.fg("muted", "scheduled request for the current turn — not a completed outcome or an outcome report"),
     ];
     const entryId = typeof details.entryId === "string" ? details.entryId : undefined;

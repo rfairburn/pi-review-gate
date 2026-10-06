@@ -812,8 +812,14 @@ separate full, usable report-reference line, plus immediate actionable failure,
 conflict, and recovery detail; the background-shell wake leads with the job identity,
 wake reason, and exit status where reported; the watch notification leads with
 execution-level active work, explicitly a checkpoint rather than a completion or
-failure. The native expansion key (ctrl+o by default) toggles all expandable rows;
-clicking a notification in fullscreen mode expands/contracts only that item.
+failure. Every notification renders in the host's native custom-message card theme —
+the themed `customMessageBg` background with its one-cell padding boundary and the
+`customMessageText`/`customMessageLabel` token styling (resolved at render time, never
+hard-coded) — in both collapsed and expanded states, so a notification never blends
+with surrounding assistant text. The native expansion key (ctrl+o by default) toggles
+all expandable rows;
+clicking a notification in fullscreen mode expands/contracts only that item — card
+content and card edge locations included.
 Expansion reveals all of the notification's current text and nothing beyond it —
 no linked report or log is fetched and nothing is re-run — and collapsing restores
 the compact view. Expansion never changes what the model received,

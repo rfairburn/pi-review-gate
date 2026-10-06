@@ -19,6 +19,35 @@ dates.
 
 ### Fixed
 
+- Notification cards regained the native custom-message theme (#92 correction).
+  The #92 expansion renderers re-created the rows bare — compact header/report line
+  and expanded retained text rendered directly on the ordinary terminal background
+  with the default foreground, so automatic notifications blended with surrounding
+  assistant inference text. The five notification families now wrap their rows in the
+  host's own native card in BOTH states — the same pi-tui
+  `Box(1, 1, (t) => theme.bg("customMessageBg", t))` the default
+  `CustomMessageComponent` uses, with the original one-cell horizontal/vertical
+  padding and every row (content, wrapped hint, and the blank padding rows) filled to
+  the terminal width — and the plain body text and family labels follow the native
+  `customMessageText`/`customMessageLabel` fg tokens with the existing outcome colors
+  preserved. Every cell stays terminal-safe: at degenerate widths (below the three
+  cells the padding needs) the card renders a width-aware narrow path — zero
+  horizontal padding, the same vertical padding and background, and rows clipped to
+  the exact cell width with the host's own ANSI-aware `truncateToWidth` (single wide
+  graphemes clip rather than overflow, with the card background reapplied after the
+  truncator's full reset so no cell — padding included — is left unthemed) — so no
+  card row ever exceeds the requested
+  width in any state. Colors resolve through the theme at render time — no
+  snapshotted ANSI,
+  no hard-coded colors — so compact and expanded cards follow the active theme
+  (including nondefault/custom themes and theme changes) exactly like the host's own
+  card. Content, expansion, click behavior (any card content or padding location
+  toggles that one item), hints, degradation paths, and tool-result card backgrounds
+  are unchanged. The real-host suite establishes the actual card styling (themed
+  full-width fill, padding rows, token fg output) in both states, pins render-time
+  theme re-resolution including an in-place token change, and the compiled-launch
+  PTY regressions (default/remapped/empty binding, independent clicks) still pass on
+  installed Pi 1.0.4 and the 1.0.2 pinned runtime.
 - Compiled launches now actually wire the shared expansion peers (#92 correction).
   A compiled CommonJS extension entry is loaded by pi ≥ 0.86 through native
   import, whose `require()` calls bypass the extension loader's package aliases —

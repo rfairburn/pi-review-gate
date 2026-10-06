@@ -248,7 +248,8 @@ npm run test:package  # scratch build, install, docs/example byte-fidelity smoke
 
 Use an owned isolated build for commands that rebuild `dist/` (including `npm test`).
 The [development guide](docs/development.md) owns prerequisites, fast/execution tiers,
-serial diagnosis, launcher internals, and verification limits.
+serial diagnosis, launcher internals, the shared native presentation expansion (tool
+results and automatic notifications), and verification limits.
 
 ## Contributing and governance
 

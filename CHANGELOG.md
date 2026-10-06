@@ -15,6 +15,109 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.125]
+
+### Fixed
+
+- Notification cards regained the native custom-message theme (#92 correction).
+  The #92 expansion renderers re-created the rows bare — compact header/report line
+  and expanded retained text rendered directly on the ordinary terminal background
+  with the default foreground, so automatic notifications blended with surrounding
+  assistant inference text. The five notification families now wrap their rows in the
+  host's own native card in BOTH states — the same pi-tui
+  `Box(1, 1, (t) => theme.bg("customMessageBg", t))` the default
+  `CustomMessageComponent` uses, with the original one-cell horizontal/vertical
+  padding and every row (content, wrapped hint, and the blank padding rows) filled to
+  the terminal width — and the plain body text and family labels follow the native
+  `customMessageText`/`customMessageLabel` fg tokens with the existing outcome colors
+  preserved. Every cell stays terminal-safe: at degenerate widths (below the three
+  cells the padding needs) the card renders a width-aware narrow path — zero
+  horizontal padding, the same vertical padding and background, and rows clipped to
+  the exact cell width with the host's own ANSI-aware `truncateToWidth` (single wide
+  graphemes clip rather than overflow, with the card background reapplied after the
+  truncator's full reset so no cell — padding included — is left unthemed) — so no
+  card row ever exceeds the requested
+  width in any state. Colors resolve through the theme at render time — no
+  snapshotted ANSI,
+  no hard-coded colors — so compact and expanded cards follow the active theme
+  (including nondefault/custom themes and theme changes) exactly like the host's own
+  card. Content, expansion, click behavior (any card content or padding location
+  toggles that one item), hints, degradation paths, and tool-result card backgrounds
+  are unchanged. The real-host suite establishes the actual card styling (themed
+  full-width fill, padding rows, token fg output) in both states, pins render-time
+  theme re-resolution including an in-place token change, and the compiled-launch
+  PTY regressions (default/remapped/empty binding, independent clicks) still pass on
+  installed Pi 1.0.4 and the 1.0.2 pinned runtime.
+- Compiled launches now actually wire the shared expansion peers (#92 correction).
+  A compiled CommonJS extension entry is loaded by pi ≥ 0.86 through native
+  import, whose `require()` calls bypass the extension loader's package aliases —
+  so the notification renderers' bare-name `require("@earendil-works/pi-tui")`
+  failed, was cached, and every automatic notification silently rendered through
+  the host's native full-text fallback (no compaction, no hint, no expansion),
+  exactly as reported for installed Pi 1.0.4. The five notification families and
+  the shared hint core now resolve their peers through the established shared
+  host-relative loader (`src/host-peer-loader.ts`) asynchronously at activation
+  and complete during interactive session setup — before pi renders the initial
+  transcript — with rendering itself performing no loading; when a peer is
+  genuinely unavailable the documented native fallback applies unchanged. The
+  configured expansion binding is resolved on the separately evaluated pi-tui
+  record from the running host's own keybinding configuration — the host's own
+  `KeybindingsManager.create()` static factory, so built-in defaults plus the
+  user's `keybindings.json` overrides make a remapped binding resolve exactly
+  as the host renders it — never hard-coded; a configured initialization that
+  fails installs nothing rather than substituting defaults. Tool and
+  notification content, native state, delivery, and model-visible behavior are
+  unchanged. The compiled-launch regression
+  `tests/message-expansion-compiled-launch.test.ts` drives the real built
+  candidate through pi's public `--extension` seam on a real PTY (compact
+  two-family rendering with the live hint, default Ctrl+O and a remapped
+  keybindings.json binding driven by its real keystroke expanding/contracting
+  the complete retained text, a configured-empty binding rendering no hint,
+  and independent fullscreen clicks) and is required host coverage; it fails
+  with this exact regression on the unfixed candidates.
+
+### Changed
+
+- One shared presentation expansion core (#92). `src/presentation-expansion.ts` and
+  `src/presentation-hints.ts` now own the cross-cutting expansion presentation —
+  renderer selection, native configured hints, width safety, the visible
+  detail-failure fallback, and component forwarding — for every expandable
+  extension row. `src/tool-result-expansion.ts` and `src/tool-result-hints.ts`
+  become thin backwards-compatible adapters over that core, so tool behavior is
+  unchanged: the same registrations, host-owned `{ expanded, isPartial }` state,
+  the global keyboard expansion binding (`app.tools.expand`, ctrl+o by default),
+  fullscreen per-card clicking, provenance, and native image presentation.
+- Automatic notification compaction (#92). Five automatic notification families
+  now render through the same shared core as compact, expandable messages:
+  `pi-review-subtask-event` (task title, the actual landed/reported/failed/
+  conflicted/recovery outcome, available aggregate progress, and a separate full,
+  usable report-reference line; actionable failure, conflict, and recovery
+  details stay visible without expansion, and in-place settlement is shown
+  through the event's own state rather than as a Git landing),
+  `pi-review-bg-shell` (job identity, wake reason, exit status where reported,
+  and actionable failure or match information), `pi-review-subtask-watch`
+  (execution-level active-work summaries, explicitly a checkpoint rather than a
+  completion or failure), `pi-review-scheduled-task-event` (schedule identity and
+  due occurrence, the truthful skipped/not-run/failed/uncertain outcome and
+  immediate action, including retry and duplicate warnings), and
+  `pi-review-scheduled-orchestrator-turn` (schedule entry and due occurrence
+  only, with no execution or completion claim; the full instructions are one
+  expansion away). Expanding a notification shows all of its current
+  notification text and nothing beyond it — no report, log, or artifact fetch,
+  no polling, execution, or other I/O — and never changes the model-visible
+  payload, upstream privacy or retention, delivery lanes, lifecycle tracking,
+  wake policy, or scheduler behavior. The existing short subtask launch and
+  background-ready notices, hidden messages, and native host-owned messages are
+  unchanged. Unknown historical or malformed notification formats fall back to
+  the full retained text, and when the host's renderer APIs are absent the
+  native full presentation applies. Keyboard expansion follows the same native
+  configured binding as tool rows; fullscreen clicking operates a single item
+  through the public pi-tui `MouseRegion` with per-message state reconciled to
+  the host's global expansion flag; regular mode remains keyboard-only, with no
+  host patching and no competing keyboard binding. See
+  [Development → Shared native presentation
+  expansion](docs/development.md#shared-native-presentation-expansion).
+
 ## [0.1.0-dev.124]
 
 ### Added

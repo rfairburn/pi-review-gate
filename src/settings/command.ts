@@ -21,7 +21,7 @@ import { abortActiveNativeEditorField } from "../native-editor-bridge";
 import { retainedSelect } from "./menu";
 import { changeExternalAgent, manageExternalAgents, stageExternalAgentOperation, type ExternalAgentOperation } from "./external-agent-catalog";
 import { scopedModelChoices, type ScopedModelChoice } from "./models";
-import { persistReviewSettings, replaceConfig } from "./persistence";
+import { captureScheduledAlreadyRun, persistReviewSettings, replaceConfig } from "./persistence";
 import { prepareScheduledImageAssets, rollbackScheduledImageAssetsUnlessPersisted, type PreparedScheduledImageAssets } from "./scheduled-image-assets";
 import { alignedSettingsRows, formatByteSize, formatDuration, notify, type UiContext } from "./ui";
 import { selectWebSettings } from "./web";
@@ -178,6 +178,10 @@ async function runSettingsMenu(
   // or entry removal discards that entry's observations; Save consumes them
   // without clearing — the menu exits after a successful save.
   const scheduledImageProvenance = new Map<string, string[]>();
+  // Issue #306: entry ids whose already-run state was explicitly toggled in
+  // this staged session. Save preserves the scheduler-recorded alreadyRun for
+  // every other entry so a stale unrelated save cannot erase it.
+  const scheduledAlreadyRunEdited = new Set<string>();
 
   // Issue #190: /scheduled-tasks lands in the existing Scheduled tasks submenu
   // before the root. It stages into this same canonical catalog through the
@@ -185,7 +189,7 @@ async function runSettingsMenu(
   // through the identical transaction as the ordinary entry — no duplicate
   // scheduler UI or state.
   if (initialSection === "scheduled") {
-    scheduledTasks = await selectScheduledTasks(input.ui, scheduledTasks, workerResources, draftConfig, input.scoped, externalAgentCatalog(draftConfig), scheduledImageProvenance);
+    scheduledTasks = await selectScheduledTasks(input.ui, scheduledTasks, workerResources, draftConfig, input.scoped, externalAgentCatalog(draftConfig), scheduledImageProvenance, scheduledAlreadyRunEdited);
   }
 
   // Caller-local last selection for this loop only: the highlighted row is
@@ -353,7 +357,7 @@ async function runSettingsMenu(
       continue;
     }
     if (choice === "scheduled") {
-      scheduledTasks = await selectScheduledTasks(input.ui, scheduledTasks, workerResources, draftConfig, input.scoped, agents, scheduledImageProvenance);
+      scheduledTasks = await selectScheduledTasks(input.ui, scheduledTasks, workerResources, draftConfig, input.scoped, agents, scheduledImageProvenance, scheduledAlreadyRunEdited);
       continue;
     }
     if (choice === "schedulerRuntime") {
@@ -404,6 +408,9 @@ async function runSettingsMenu(
       await notify(input.ui, `review gate: ${error instanceof Error ? error.message : String(error)}`, "error");
       continue;
     }
+    // #306: capture the live already-run state before this asynchronous save
+    // so a later install can preserve changes made while it was in flight.
+    const scheduledTasksAlreadyRunBeforeSave = captureScheduledAlreadyRun(input.config);
     let next: ReviewGateConfig;
     try {
       next = await persistReviewSettings(input.configPath!, {
@@ -431,6 +438,7 @@ async function runSettingsMenu(
         subtasksViewExpanded,
         scheduledTasks: catalogForSave,
         scheduledTasksStagedFrom,
+        scheduledTasksAlreadyRunEdited: [...scheduledAlreadyRunEdited],
         webMaxDownloadBytes,
         browserInteractionApproval,
         browserIdleExpiryMinutes,
@@ -458,7 +466,14 @@ async function runSettingsMenu(
     await collectExternalAgentAvailabilityWarnings(next, validationPolicy);
     const previousMode = input.config.operatingMode;
     const previousModeCycleShortcut = input.config.modeCycleShortcut;
-    replaceConfig(input.config, next);
+    // #306: a scheduler-recorded alreadyRun=true in the live catalog must
+    // survive installing this (possibly stale) save result — and an explicit
+    // re-arm made while this save was in flight must survive it too; only
+    // explicit Already-run edits from this session clear the protection.
+    replaceConfig(input.config, next, {
+      scheduledTasksAlreadyRunEdited: scheduledAlreadyRunEdited,
+      scheduledTasksAlreadyRunBeforeSave,
+    });
     await input.onSaved?.(input.config, previousMode, { ui: input.ui });
     await notify(input.ui, "Review settings saved.", "info");
     for (const warning of warnings) await notify(input.ui, warning, "warning");

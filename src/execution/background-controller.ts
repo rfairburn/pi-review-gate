@@ -258,6 +258,15 @@ interface BackgroundControllerInput {
   /** Only true or a save-and-retirement receipt confirms a durable parent sidecar write. */
   onAssociationsChanged?: (associations: ExecutionAssociationsSnapshot) => ParentCheckpointSaveResult | Promise<ParentCheckpointSaveResult>;
   onExpandedViewChanged?: (expanded: boolean) => void | Promise<void>;
+  /**
+   * #306: one-shot consumption observer at the existing dispatch-record
+   * seam. Invoked for every actual transport-boundary dispatch record of a
+   * SCHEDULED group (group.scheduledTaskId set), including retry/failover
+   * turn deliveries of an already-consumed execution — the observer is
+   * idempotent and decides eligibility itself. Never invoked for
+   * non-scheduled groups or for failures before delivery.
+   */
+  onScheduledDispatchRecorded?: (scheduledTaskId: string) => void;
   faults?: BackgroundFaultHooks;
 }
 
@@ -1339,9 +1348,35 @@ export class BackgroundExecutionController {
     task: BackgroundTaskRecord,
     record: SubtaskDispatchRecord,
   ): void {
+    // #306: consumption is gated by the first delivery of the SCHEDULED
+    // EXECUTION GROUP, not each task. add() retains scheduledTaskId while every
+    // added task begins without initialDispatch — an added task's first prompt
+    // delivery must not re-consume an entry the user manually re-armed. Archived
+    // settled history suppresses consumption too: a group whose start already
+    // settled (and was archived) has no live start signal to report.
+    const firstDelivery = task.initialDispatch === undefined
+      && (group.settledArchivedCount ?? 0) === 0
+      && !group.tasks.some((candidate) => candidate !== task && candidate.initialDispatch !== undefined);
     task.initialDispatch ??= { ...record };
     task.dispatch = { ...record };
     task.updatedAt = new Date().toISOString();
+    // #306: the transport accepted this prompt's write — but only the FIRST
+    // actual delivery of this execution consumes a one-shot entry. Corrections,
+    // retries, and continuations (including recovery re-dispatches, whose
+    // initialDispatch survives) must not re-consume an entry the user manually
+    // re-armed while this execution is still active or recoverable.
+    if (
+      firstDelivery
+      && group.scheduledTaskId !== undefined
+      && this.input.onScheduledDispatchRecorded !== undefined
+    ) {
+      try {
+        this.input.onScheduledDispatchRecorded(group.scheduledTaskId);
+      } catch {
+        // Observer reporting is best-effort; the dispatch record itself is
+        // already authoritative and stays recorded.
+      }
+    }
     // The settling check lets the fan-out sweep retire subscriptions for
     // executions that can no longer dispatch, while any execution with a live
     // (e.g. still-queued or paused-recoverable) card is never evicted.

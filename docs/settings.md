@@ -109,6 +109,10 @@ supplies the live switch (the ordinary extension entry point always does):
   turns), an optional task-local review choice (**Inherit global subtask review
   settings**, **Off — run this task's subtasks without review**, or a selected
   reviewer set; unused for orchestrator turns), and an enabled/disabled toggle.
+  Each entry also has a **One shot** toggle (issue #306) and an **Already run**
+  toggle, editable only while **One shot** is enabled (otherwise shown as
+  not applicable). The scheduler sets it when execution actually starts — see
+  [One-shot entries](scheduled-tasks.md#one-shot-entries).
   Adding prompts for a name and generates a stable identity; required-but-unset
   fields block Save with a named validation error. Entries stay visible and
   editable regardless of the **Scheduler runtime** switch, and saving never

@@ -162,6 +162,8 @@ interface ExecutionToolManagerInput {
   notify?: (message: string) => void | Promise<void>;
   onAssociationsChanged?: (associations: ExecutionAssociationsSnapshot) => ParentCheckpointSaveResult | Promise<ParentCheckpointSaveResult>;
   onExpandedViewChanged?: (expanded: boolean) => void | Promise<void>;
+  /** #306: one-shot consumption at the scheduled group's actual dispatch record. */
+  onScheduledDispatchRecorded?: (scheduledTaskId: string) => void;
   /** Raw submitted identity for admitted native calls; UI/command starts synthesize it locally. */
   submittedFingerprintFor?: SubmittedToolCallFingerprint;
   /** Internal outcome signal for explicit returned errors from owned native tools. */

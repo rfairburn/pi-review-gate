@@ -289,6 +289,30 @@ interface PendingOccurrence {
   reviewArmed: boolean;
   resolveObserved: (next: "observed" | "abandoned") => void;
   observedPromise: Promise<"observed" | "abandoned">;
+  /**
+   * #306: one-shot entries' pending admission/observation identity is exempt
+   * from the bounded recurring-occurrence eviction below — evicting it would
+   * release the dispatcher's busy-queue guard (allowing a second queued
+   * execution) and lose the identity needed to record actual-start
+   * consumption. It is released only by the existing delivery lifecycle:
+   * definite non-delivery discards, settlement removes, session reset clears.
+   */
+  oneShot: boolean;
+}
+
+/**
+ * Tracker options. The observation callback is the #306 one-shot consumption
+ * seam: it fires at the host's in-run message_start for a scheduled turn —
+ * the provider turn has actually started, irrespective of any later refusal,
+ * failure, review arming outcome, or model claim.
+ */
+export interface ScheduledOrchestratorTurnTrackerOptions {
+  /**
+   * Invoked exactly once per occurrence when noteMessageObserved attributes
+   * it (matching identity, in-flight run). Must not throw; a callback
+   * failure never changes attribution or settlement accounting.
+   */
+  onObserved?: (occurrence: ScheduledOrchestratorTurnOccurrence) => void;
 }
 
 /**
@@ -310,6 +334,8 @@ interface PendingOccurrence {
  * yet consumed.
  */
 export class ScheduledOrchestratorTurnTracker {
+  constructor(private readonly options: ScheduledOrchestratorTurnTrackerOptions = {}) {}
+
   /** Pending occurrences keyed by their opaque occurrenceId, in delivery order. */
   private readonly pending = new Map<string, PendingOccurrence>();
   private readonly settled: ScheduledOrchestratorTurnOccurrence[] = [];
@@ -347,17 +373,29 @@ export class ScheduledOrchestratorTurnTracker {
     entryName: string;
     cron: string;
     dueAt: Date;
-  }): ScheduledOrchestratorTurnSending {
-    while (this.pending.size >= PENDING_OCCURRENCES_RETAINED) {
+  }, options?: { oneShot?: boolean }): ScheduledOrchestratorTurnSending {
+    // #306: the capacity bound counts RECURRING pending occurrences only.
+    // One-shot pending identities are exempt in both directions: they never
+    // count toward the recurring limit, and admitting a one-shot never evicts
+    // recurring history — their guard and consumption identity must survive
+    // any amount of intervening traffic, and ordinary recurring retention
+    // (32 identities) is unchanged by one-shot presence.
+    let recurringPending = [...this.pending.values()].filter((pending) => !pending.oneShot).length;
+    while (options?.oneShot !== true && recurringPending >= PENDING_OCCURRENCES_RETAINED) {
       // Bound the unbounded-uncertainty case: drop the OLDEST pending
-      // occurrence (insertion order). A dropped occurrence stops tracking
-      // (it can never be counted) instead of ever overcounting — the
-      // fail-closed direction.
-      const oldest = this.pending.keys().next();
-      if (oldest.done) break;
-      const dropped = this.pending.get(oldest.value);
-      this.pending.delete(oldest.value);
-      dropped?.resolveObserved("abandoned");
+      // RECURRING occurrence (insertion order). A dropped occurrence stops
+      // tracking (it can never be counted) instead of ever overcounting —
+      // the fail-closed direction.
+      let evicted = false;
+      for (const [occurrenceId, pending] of this.pending) {
+        if (pending.oneShot) continue;
+        this.pending.delete(occurrenceId);
+        pending.resolveObserved("abandoned");
+        recurringPending -= 1;
+        evicted = true;
+        break;
+      }
+      if (!evicted) break; // only one-shot occurrences remain: never evict them
     }
     const occurrenceId = randomUUID();
     const occurrence: ScheduledOrchestratorTurnOccurrence = {
@@ -369,7 +407,7 @@ export class ScheduledOrchestratorTurnTracker {
     const observedPromise = new Promise<"observed" | "abandoned">((resolve) => {
       resolveObserved = resolve;
     });
-    this.pending.set(occurrenceId, { occurrence, reviewArmed: false, resolveObserved, observedPromise });
+    this.pending.set(occurrenceId, { occurrence, reviewArmed: false, resolveObserved, observedPromise, oneShot: options?.oneShot === true });
     return {
       occurrenceId,
       observed: observedPromise,
@@ -414,7 +452,32 @@ export class ScheduledOrchestratorTurnTracker {
     pending.processedRunSequence = consumingRun;
     pending.reviewArmed = true;
     pending.resolveObserved("observed");
+    // #306: the provider turn for this scheduled message has started — the
+    // one-shot consumption point. A later arming failure cannot un-start it,
+    // so the callback fires here, exactly once per occurrence.
+    if (this.options.onObserved !== undefined) {
+      try {
+        this.options.onObserved(pending.occurrence);
+      } catch {
+        // Consumption reporting must never break attribution or settlement.
+      }
+    }
     return true;
+  }
+
+  /**
+   * #306: true while any delivered occurrence for this entry is still
+   * pending — queued behind a busy agent, in flight, or observed but not yet
+   * settled. The one-shot dispatcher guard uses this so a busy orchestrator
+   * never accumulates several queued executions of the same entry; the
+   * existing delivery lifecycle releases it (definite non-delivery discards,
+   * settlement removes, session reset clears).
+   */
+  hasPendingOccurrence(entryId: string): boolean {
+    for (const pending of this.pending.values()) {
+      if (pending.occurrence.entryId === entryId) return true;
+    }
+    return false;
   }
 
   /**

@@ -478,6 +478,27 @@ export interface ScheduledTaskEntryConfig {
   workerResourceId?: string;
   /** Task-local review choice; omitted inherits live global subtask review settings. */
   review?: ScheduledTaskReviewOverride;
+  /**
+   * One-shot mode (issue #306). Absent or false is the recurring default:
+   * every matching future occurrence dispatches as today. A one-shot entry
+   * runs at most once — its single execution starts at the next matching
+   * FUTURE occurrence while enabled and not yet run, and actual execution
+   * start (never queueing, admission, or a pre-start failure) records
+   * `alreadyRun` below. One-shot entries keep the same scheduling, launch,
+   * safety, review, and delivery-reliability semantics as ordinary entries.
+   */
+  oneShot?: boolean;
+  /**
+   * Scheduler-recorded actual execution start for one-shot entries (issue
+   * #306). Absent or false means the entry has not run yet. The scheduler
+   * sets it to true at the entry's ACTUAL execution start — the subtask
+   * destination's transport-boundary dispatch record, or the orchestrator
+   * destination's in-run message_start observation — irrespective of any
+   * later refusal, failure, review, or model outcome. It is never updated
+   * for recurring entries, and a manual false re-arms the entry for its next
+   * matching future occurrence (never immediate, never catch-up).
+   */
+  alreadyRun?: boolean;
 }
 
 /** Unordered scheduled-task catalog keyed by stable task identity. */
@@ -805,6 +826,15 @@ function normalizeScheduledTasks(value: unknown): ScheduledTaskCatalog {
     const review = entry.review === undefined
       ? undefined
       : normalizeScheduledTaskReviewOverride(entry.review, `scheduledTasks.${id}`);
+    // Issue #306: strict booleans; absence is the false default, so a false
+    // value never materializes a redundant key (existing entries stay byte-
+    // identical and recurring remains the unmarked default).
+    if (entry.oneShot !== undefined && typeof entry.oneShot !== "boolean") {
+      throw new Error(`scheduledTasks.${id}.oneShot must be a boolean`);
+    }
+    if (entry.alreadyRun !== undefined && typeof entry.alreadyRun !== "boolean") {
+      throw new Error(`scheduledTasks.${id}.alreadyRun must be a boolean`);
+    }
     defineOwnKey(catalog, id, {
       name,
       cron,
@@ -815,6 +845,8 @@ function normalizeScheduledTasks(value: unknown): ScheduledTaskCatalog {
       workspace,
       ...(workerResourceId !== undefined ? { workerResourceId } : {}),
       ...(review !== undefined ? { review } : {}),
+      ...(entry.oneShot === true ? { oneShot: true } : {}),
+      ...(entry.alreadyRun === true ? { alreadyRun: true } : {}),
     });
   }
   return catalog;

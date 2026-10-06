@@ -278,7 +278,10 @@ export class ScheduledTaskRuntime {
     const entries: CronMinuteSamplerEntry[] = [];
     for (const [id, entry] of Object.entries(catalog)) {
       try {
-        entries.push({ id, enabled: entry.enabled !== false, cron: parseCronExpression(entry.cron, `scheduledTasks.${id}.cron`) });
+        // Issue #306: a one-shot entry whose single execution already started
+        // is never due again; recurring entries ignore alreadyRun entirely.
+        const eligible = entry.enabled !== false && !(entry.oneShot === true && entry.alreadyRun === true);
+        entries.push({ id, enabled: eligible, cron: parseCronExpression(entry.cron, `scheduledTasks.${id}.cron`) });
       } catch (error) {
         if (!this.reportedInvalid.has(id)) {
           this.reportedInvalid.add(id);
@@ -304,6 +307,10 @@ export class ScheduledTaskRuntime {
   private dispatchDue(entryId: string, dueAt: Date): void {
     const sampled = this.options.catalog()?.[entryId];
     if (!sampled || sampled.enabled === false) return; // Removed or disabled at sample time.
+    // Issue #306: a consumed one-shot entry is never queued, even for an
+    // occurrence sampled before the consumption landed. Recurring entries
+    // are unaffected (alreadyRun is ignored for them).
+    if (sampled.oneShot === true && sampled.alreadyRun === true) return;
     // Shallow-copy the definition as sampled so a queued occurrence can never
     // execute an edited definition even if a future catalog edit mutated the
     // entry in place (today entries are replaced, never mutated).
@@ -333,6 +340,12 @@ export class ScheduledTaskRuntime {
     // start on re-enable/reload or execute an edited definition. Active
     // subtasks are untouched by the boundary — only not-yet-admitted starts stop.
     if (generation !== this.generation || !this.attached || !this.options.switchState.enabled) return;
+    // Issue #306: fresh one-shot eligibility at ADMISSION — the entry may
+    // have consumed its single execution while this occurrence waited behind
+    // its same-entry chain. Queuing never consumes, so a queued occurrence of
+    // a now-consumed entry is dropped here, never caught up.
+    const current = this.options.catalog()?.[entryId];
+    if (current?.oneShot === true && current.alreadyRun === true) return;
     // Admission past the occurrence's own due minute: the hook reports it and
     // must not launch a catch-up run.
     const overdue = this.now() > dueAt.getTime() + MINUTE_MS;

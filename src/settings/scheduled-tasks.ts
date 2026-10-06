@@ -148,6 +148,13 @@ export async function selectScheduledTasks(
   agents: ExternalAgentConfig[],
   /** Native-paste provenance per task id; consumed at Save (image assets). */
   imageProvenance: Map<string, string[]>,
+  /**
+   * Issue #306: entry ids whose already-run state the user EXPLICITLY
+   * toggled in this staged session. Save uses it to tell a manual re-arm
+   * apart from a stale snapshot: only an explicit toggle may change the
+   * scheduler-recorded alreadyRun; anything else preserves the latest.
+   */
+  alreadyRunEdited: Set<string>,
 ): Promise<ScheduledTaskCatalog> {
   const catalog = cloneScheduledTaskCatalog(initial);
   // Caller-local last selection for this loop only (issue #140): keys are the
@@ -184,7 +191,7 @@ export async function selectScheduledTasks(
       // still missing; no default schedule or workspace is ever invented.
       const id = generateScheduledTaskId(catalog);
       setCatalogKey(catalog, id, { name, cron: "", enabled: true, kind: "execute", instructions: "", workspace: "" });
-      await editScheduledTaskEntry(ui, catalog, id, workerResources, config, scoped, agents, imageProvenance);
+      await editScheduledTaskEntry(ui, catalog, id, workerResources, config, scoped, agents, imageProvenance, alreadyRunEdited);
       continue;
     }
     // Action keys contain ":", which validateConfiguredId rejects, so a
@@ -192,7 +199,7 @@ export async function selectScheduledTasks(
     // "add" stays editable instead of being shadowed by the Add action, and
     // an unknown value remains a no-op re-show.
     if (Object.prototype.hasOwnProperty.call(catalog, choice)) {
-      await editScheduledTaskEntry(ui, catalog, choice, workerResources, config, scoped, agents, imageProvenance);
+      await editScheduledTaskEntry(ui, catalog, choice, workerResources, config, scoped, agents, imageProvenance, alreadyRunEdited);
     }
   }
 }
@@ -211,12 +218,13 @@ async function editScheduledTaskEntry(
   scoped: ScopedModelChoice[],
   agents: ExternalAgentConfig[],
   imageProvenance: Map<string, string[]>,
+  alreadyRunEdited: Set<string>,
 ): Promise<void> {
   // Caller-local last selection for this loop only (issue #140).
   let lastKey: string | undefined;
   while (Object.prototype.hasOwnProperty.call(catalog, id)) {
     const entry = catalog[id]!;
-    const [nameRow, cronRow, kindRow, destinationRow, instructionsRow, workspaceRow, workerRow, reviewRow, enabledRow] = alignedSettingsRows([
+    const [nameRow, cronRow, kindRow, destinationRow, instructionsRow, workspaceRow, workerRow, reviewRow, enabledRow, oneShotRow, alreadyRunRow] = alignedSettingsRows([
       ["Name", entry.name],
       ["Schedule (cron)", entry.cron || "(not set)"],
       ["Kind", scheduledTaskKindLabel(entry.kind)],
@@ -226,6 +234,10 @@ async function editScheduledTaskEntry(
       ["Worker", scheduledTaskWorkerSummary(entry, workerResources, config, scoped)],
       ["Review", scheduledTaskReviewSummary(entry)],
       ["Enabled", entry.enabled ? "On" : "Off"],
+      // Issue #306: one-shot mode is always editable; the already-run state
+      // is editable only for one-shot entries (recurring entries ignore it).
+      ["One shot", entry.oneShot === true ? "On" : "Off"],
+      ["Already run", entry.oneShot === true ? (entry.alreadyRun === true ? "Yes" : "No") : "n/a (not one-shot)"],
     ]);
     const choice = await retainedSelect(ui, {
       title: `Scheduled task ${id}`,
@@ -239,6 +251,8 @@ async function editScheduledTaskEntry(
         { key: "worker", label: workerRow },
         { key: "review", label: reviewRow },
         { key: "enabled", label: enabledRow },
+        { key: "oneShot", label: oneShotRow },
+        { key: "alreadyRun", label: alreadyRunRow },
         { key: "remove", label: "Remove" },
         { key: "back", label: "Back" },
       ],
@@ -368,6 +382,33 @@ async function editScheduledTaskEntry(
     }
     if (choice === "enabled") {
       setCatalogKey(catalog, id, { ...entry, enabled: !entry.enabled });
+      continue;
+    }
+    if (choice === "oneShot") {
+      // Issue #306: toggling one-shot off keeps any stored alreadyRun value
+      // in place (it is ignored for recurring entries and never auto-
+      // updated); absence is the false default, so turning it off removes
+      // the key rather than storing a redundant false.
+      const next: ScheduledTaskEntryConfig = { ...entry };
+      if (entry.oneShot === true) delete next.oneShot;
+      else next.oneShot = true;
+      setCatalogKey(catalog, id, next);
+      continue;
+    }
+    if (choice === "alreadyRun") {
+      // Issue #306: only one-shot entries have an editable already-run
+      // state. A manual false re-arms the entry for its next matching
+      // FUTURE occurrence under its current enabled+cron — never immediate,
+      // never catch-up (the runtime's future-only sampling enforces that).
+      if (entry.oneShot !== true) {
+        await notify(ui, "Only one-shot entries have an already-run state. Enable One shot first.", "error");
+        continue;
+      }
+      alreadyRunEdited.add(id);
+      const next: ScheduledTaskEntryConfig = { ...entry };
+      if (entry.alreadyRun === true) delete next.alreadyRun; // manual re-arm
+      else next.alreadyRun = true; // manual disarm
+      setCatalogKey(catalog, id, next);
       continue;
     }
     if (choice === "remove") {

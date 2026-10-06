@@ -932,7 +932,7 @@ async function runImageFlow(
       keys(...Array(15).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 15)
       keys(KEY_ENTER), // list → task entry (row 0)
       ...(options.skipField
-        ? [keys(...Array(10).fill(KEY_DOWN), KEY_ENTER)] // entry editor → Back (row 10)
+        ? [keys(...Array(12).fill(KEY_DOWN), KEY_ENTER)] // entry editor → Back (row 12)
         : [
             keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → instructions (row 4)
             async (component: { handleInput?(data: string): void }): Promise<void> => {
@@ -950,7 +950,7 @@ async function runImageFlow(
               // cancels).
               component.handleInput?.(options.fieldDriver === "cancel" ? KEY_ESCAPE : ENTER);
             },
-            keys(...Array(6).fill(KEY_DOWN), KEY_ENTER), // entry re-show (instructions, row 4) → Back (row 10)
+            keys(...Array(8).fill(KEY_DOWN), KEY_ENTER), // entry re-show (instructions, row 4) → Back (row 12)
           ]),
       keys(...Array(3).fill(KEY_DOWN), KEY_ENTER), // list re-show (two entries) → Back (row 3)
       ...(options.outcome === "cancel"

@@ -34,6 +34,7 @@ import { launchNoticeGate } from "../execution/launch-notice";
 import {
   dueTimeLabel,
   formatScheduledDispatchFailure,
+  formatScheduledOneShotPendingSkip,
   formatScheduledOrchestratorDeliveryFailure,
   formatScheduledOrchestratorDeliveryUncertain,
   formatScheduledOverdueDrop,
@@ -222,6 +223,31 @@ async function dispatchScheduledOrchestratorTurn(
   dueAt: Date,
   overdue: boolean,
 ): Promise<void> {
+  // Issue #306: a one-shot entry whose previous delivery is still pending
+  // (queued behind a busy agent, in flight, or observed but unsettled) must
+  // not accumulate a second queued execution. alreadyRun is still false —
+  // only the actual in-run observation consumes — so this narrow guard keyed
+  // to the tracker's existing pending occurrences is what keeps a busy
+  // orchestrator from queueing several due minutes' worth of the same turn.
+  // The existing delivery lifecycle releases it: definite non-delivery
+  // discards the occurrence, settlement removes it, and a session reset
+  // clears it. Recurring entries keep independent occurrences unchanged.
+  if (entry.oneShot === true && host.orchestratorTurns.hasPendingOccurrence(entryId)) {
+    const report = formatScheduledOneShotPendingSkip(entryId, entry, dueAt);
+    if (host.orchestratorTurnUnsafeReason() !== undefined) {
+      // A host that cannot safely arm a scheduled turn must not be woken
+      // with one for the skip either: console-only, like the unsafe
+      // rejection itself.
+      try {
+        host.consoleWarn(report);
+      } catch {
+        // Safety reporting must not turn a skipped dispatch into another path.
+      }
+    } else {
+      await host.reportOwnerEvent(report);
+    }
+    return;
+  }
   if (overdue) {
     await host.reportOwnerEvent(formatScheduledOverdueDrop(entryId, entry, dueAt));
     return;
@@ -261,12 +287,18 @@ async function dispatchScheduledOrchestratorTurn(
   // starts (or queues) the run synchronously and observes the custom message
   // on message_start while this dispatch is still in flight is attributed —
   // and the delivery can never count anything by itself.
-  const sending = host.orchestratorTurns.beginOccurrence({
-    entryId,
-    entryName: entry.name,
-    cron: entry.cron,
-    dueAt,
-  });
+  const sending = host.orchestratorTurns.beginOccurrence(
+    {
+      entryId,
+      entryName: entry.name,
+      cron: entry.cron,
+      dueAt,
+    },
+    // #306: a one-shot entry's pending identity must survive tracker-capacity
+    // eviction so the busy-queue guard and actual-start consumption keep
+    // working no matter how much recurring traffic intervenes.
+    { oneShot: entry.oneShot === true },
+  );
   const outcome = await deliverScheduledOrchestratorTurn(host.pi, {
     entryId,
     entryName: entry.name,

@@ -2,9 +2,9 @@
  * Session-host status companion (issue #323).
  *
  * Opt-in Pi extension. It reports bounded status and accepts authenticated
- * native rename requests. The session-host process spawns the
- * Node-based Pi CLI directly with this reporter extension loaded first and
- * the review gate after it (plus the early NODE_OPTIONS preload). It reports
+ * native rename and graceful-shutdown requests. The session-host process
+ * spawns the Node-based Pi CLI directly with this reporter extension loaded
+ * first and the review gate after it (plus the early NODE_OPTIONS preload). It reports
  * top-level session status (busy/idle, pending input presence, modal input
  * surface, generic activity) to the parent session-host process over a local
  * stream socket described by the one-shot
@@ -45,6 +45,7 @@ import {
   isValidNativeSessionId,
   isValidRenameName,
   parseBootstrap,
+  parseShutdownRequest,
   sanitizeActivityLine,
   type SessionHostBootstrap,
   type SessionHostHello,
@@ -52,6 +53,8 @@ import {
   type SessionHostNativeSession,
   type SessionHostRenameAck,
   type SessionHostRenameRequest,
+  type SessionHostShutdownAck,
+  type SessionHostShutdownRequest,
   type SessionHostStatus,
 } from "./protocol";
 
@@ -75,8 +78,10 @@ const EXIT_HANDLER_FLAG = Symbol.for("pi-review-gate.session-host.exit-handler")
 const DEFAULT_RECONNECT_DELAY_MS = 1_000;
 const DEFAULT_MAX_RECONNECT_ATTEMPTS = 3;
 const CONNECT_TIMEOUT_MS = 3_000;
-/** Encoded replies waiting outside Node's own bounded writable buffer. */
+/** Encoded rename/shutdown replies waiting outside Node's bounded writable buffer. */
 const MAX_QUEUED_RENAME_ACKS = 4;
+const MAX_CONCURRENT_SHUTDOWN_REQUESTS = 1;
+const MAX_RECENT_SHUTDOWN_REQUEST_IDS = 64;
 
 export interface SessionHostReporterOptions {
   /** Test seam: reconnect delay. Production default is 1000ms. */
@@ -94,6 +99,7 @@ interface StickyState {
   sequence: number;
   sessionEpoch: number;
   nativeSessionId?: string;
+  shutdownRequested?: boolean;
   teardown?: () => void;
 }
 
@@ -216,15 +222,19 @@ function readStickyState(): StickyState | undefined {
     sequence: raw.sequence as number,
     sessionEpoch,
     nativeSessionId,
+    shutdownRequested: raw.shutdownRequested === true,
     teardown: typeof raw.teardown === "function" ? (raw.teardown as () => void) : undefined,
   };
 }
 
-function writeStickyState(state: StickyState): void {
+function writeStickyState(state: StickyState): boolean {
   try {
-    (globalThis as Record<PropertyKey, unknown>)[SESSION_HOST_STICKY_STATE_KEY] = state;
+    const storage = globalThis as Record<PropertyKey, unknown>;
+    storage[SESSION_HOST_STICKY_STATE_KEY] = state;
+    return storage[SESSION_HOST_STICKY_STATE_KEY] === state;
   } catch {
-    // Sticky retention is best-effort; /reload continuity degrades to no bootstrap.
+    // Sticky retention is best-effort for observation; terminal controls fail closed if it is unavailable.
+    return false;
   }
 }
 
@@ -301,6 +311,7 @@ export function primeReporterBootstrap(): SessionHostBootstrap | undefined {
     sequence: sticky ? sticky.sequence : 0,
     sessionEpoch: sticky?.sessionEpoch ?? 0,
     nativeSessionId: sticky?.nativeSessionId,
+    shutdownRequested: sticky?.shutdownRequested ?? false,
     teardown: sticky?.teardown,
   });
   return explicit;
@@ -330,6 +341,7 @@ export async function activate(pi: unknown, options: SessionHostReporterOptions 
     sequence: reporter.sequence,
     sessionEpoch: reporter.sessionEpoch,
     nativeSessionId: reporter.nativeSessionId,
+    shutdownRequested: reporter.shutdownRequested,
     teardown: reporter.teardown,
   });
 }
@@ -363,6 +375,7 @@ interface ReporterHandle {
   sessionEpoch: number;
   nativeSessionId?: string;
   teardown: () => void;
+  shutdownRequested: boolean;
 }
 
 function createReporter(
@@ -393,6 +406,10 @@ function createReporter(
   let sessionEpoch = sticky.sessionEpoch;
   let nativeSessionId = sticky.nativeSessionId;
   let nativeSession: SessionHostNativeSession | null = null;
+  // A committed graceful-shutdown request is terminal for this process,
+  // including /reload. The in-flight fence is temporary and is never persisted.
+  let shutdownRequested = sticky.shutdownRequested === true;
+  let shutdownInProgress = false;
   let currentContext: unknown;
   let lastSnapshot: SessionHostStatus | undefined;
 
@@ -407,6 +424,12 @@ function createReporter(
   let inboundBuffer = Buffer.alloc(0);
   const pendingRenameRequestIds = new Set<string>();
   const recentRenameRequestIds = new Set<string>();
+  const pendingShutdownRequestIds = new Set<string>();
+  const recentShutdownRequests = new Map<string, {
+    expectedSessionId: string;
+    expectedSessionEpoch: number;
+    ack?: SessionHostShutdownAck;
+  }>();
   const renameAckQueue: string[] = [];
   const MAX_CONCURRENT_RENAME_REQUESTS = 4;
   const MAX_RECENT_RENAME_REQUEST_IDS = 64;
@@ -573,7 +596,7 @@ function createReporter(
   };
 
   // ------------------------------------------------------------------
-  // Socket transport (bounded status snapshots plus bounded rename replies)
+  // Socket transport (bounded status snapshots plus bounded control replies)
   // ------------------------------------------------------------------
 
   const nextSequence = (): number => {
@@ -653,7 +676,7 @@ function createReporter(
   };
 
   const scheduleReconnect = (): void => {
-    if (!active || reconnectTimer || socket || connecting) return;
+    if (!active || shutdownRequested || reconnectTimer || socket || connecting) return;
     if (reconnectAttempts >= maxReconnectAttempts) return; // Finite: give up until the next session_start.
     reconnectAttempts += 1;
     reconnectTimer = setTimeout(() => {
@@ -665,7 +688,7 @@ function createReporter(
 
   const connectSocket = (): void => {
     teardownSocket();
-    if (!active) return;
+    if (!active || shutdownRequested) return;
     const generation = sessionGeneration;
     let candidate: net.Socket;
     try {
@@ -738,7 +761,7 @@ function createReporter(
   // ------------------------------------------------------------------
 
   const emit = (): void => {
-    if (!active) return;
+    if (!active || shutdownRequested) return;
     if (lastSnapshot
       && lastSnapshot.busy === busy
       && lastSnapshot.pendingInput === pendingInput
@@ -761,7 +784,7 @@ function createReporter(
     };
     lastSnapshot = snapshot;
     snapshotQueued = false;
-    writeStickyState({ bootstrap, sequence, sessionEpoch, nativeSessionId, teardown });
+    writeStickyState({ bootstrap, sequence, sessionEpoch, nativeSessionId, shutdownRequested, teardown });
     // While backpressured nothing more is queued: the latest snapshot is
     // retained in lastSnapshot and flushes once on drain.
     if (socket && !connecting && !drainPending) {
@@ -791,7 +814,7 @@ function createReporter(
       name: read.displayName,
     };
     if (sessionEpoch < 1) sessionEpoch = nativeSession.epoch;
-    writeStickyState({ bootstrap, sequence, sessionEpoch, nativeSessionId, teardown });
+    writeStickyState({ bootstrap, sequence, sessionEpoch, nativeSessionId, shutdownRequested, teardown });
     if (emitUpdate) emit();
     return read;
   };
@@ -857,6 +880,331 @@ function createReporter(
     if (!tryWriteFrame(frame)) candidate.destroy();
   };
 
+  const sendShutdownAck = (candidate: net.Socket, generation: number, ack: SessionHostShutdownAck): void => {
+    if (!active || candidate.destroyed || generation !== sessionGeneration || candidate !== socket) return;
+    const cached = recentShutdownRequests.get(ack.requestId);
+    if (cached
+      && cached.expectedSessionId === ack.expectedSessionId
+      && cached.expectedSessionEpoch === ack.expectedSessionEpoch) cached.ack = ack;
+    let frame: string;
+    try {
+      frame = encodeFrame(ack);
+    } catch {
+      candidate.destroy();
+      return;
+    }
+    if (drainPending) {
+      if (renameAckQueue.length >= MAX_QUEUED_RENAME_ACKS) {
+        candidate.destroy();
+        return;
+      }
+      renameAckQueue.push(frame);
+      return;
+    }
+    if (!tryWriteFrame(frame)) candidate.destroy();
+  };
+
+  const sendShutdownResult = (
+    candidate: net.Socket,
+    generation: number,
+    request: SessionHostShutdownRequest,
+    outcome: SessionHostShutdownAck["outcome"],
+    reason: SessionHostShutdownAck["reason"],
+  ): void => {
+    const ack: SessionHostShutdownAck = {
+      version: 1,
+      type: "shutdown_result",
+      instanceId: bootstrap.instanceId,
+      generation: bootstrap.generation,
+      requestId: request.requestId,
+      expectedSessionId: request.expectedSessionId,
+      expectedSessionEpoch: request.expectedSessionEpoch,
+      outcome,
+      reason,
+    };
+    sendShutdownAck(candidate, generation, ack);
+  };
+
+  const rememberShutdownRequest = (request: SessionHostShutdownRequest): boolean => {
+    if (recentShutdownRequests.has(request.requestId)) return false;
+    recentShutdownRequests.set(request.requestId, {
+      expectedSessionId: request.expectedSessionId,
+      expectedSessionEpoch: request.expectedSessionEpoch,
+    });
+    if (recentShutdownRequests.size > MAX_RECENT_SHUTDOWN_REQUEST_IDS) {
+      const oldest = recentShutdownRequests.keys().next().value as string | undefined;
+      if (oldest) recentShutdownRequests.delete(oldest);
+    }
+    return true;
+  };
+
+  const processShutdownRequest = (
+    candidate: net.Socket,
+    generation: number,
+    request: SessionHostShutdownRequest,
+  ): void => {
+    if (!active || candidate.destroyed || generation !== sessionGeneration || candidate !== socket) return;
+    if (request.instanceId !== bootstrap.instanceId
+      || request.generation !== bootstrap.generation
+      || !tokenMatches(request.token, bootstrap.token)) {
+      candidate.destroy(); // Wrong capability or identity is a protocol failure.
+      return;
+    }
+    if (renameAckQueue.length >= MAX_QUEUED_RENAME_ACKS) {
+      candidate.destroy(); // Do not request shutdown without bounded reply capacity.
+      return;
+    }
+    const recent = recentShutdownRequests.get(request.requestId);
+    if (recent) {
+      if (recent.expectedSessionId !== request.expectedSessionId
+        || recent.expectedSessionEpoch !== request.expectedSessionEpoch) {
+        candidate.destroy(); // Reusing an ID for a different session tuple is a protocol violation.
+        return;
+      }
+      if (recent.ack) sendShutdownAck(candidate, generation, recent.ack);
+      return; // Pending or completed replay never repeats public side effects.
+    }
+    if (shutdownInProgress || pendingShutdownRequestIds.size >= MAX_CONCURRENT_SHUTDOWN_REQUESTS) {
+      candidate.destroy(); // Never silently discard an authenticated shutdown command.
+      return;
+    }
+    rememberShutdownRequest(request);
+    pendingShutdownRequestIds.add(request.requestId);
+    shutdownInProgress = true;
+    try {
+      const ownsTransport = (): boolean => active && !candidate.destroyed
+        && generation === sessionGeneration && candidate === socket;
+      const reject = (reason: SessionHostShutdownAck["reason"]): void => {
+        sendShutdownResult(candidate, generation, request, "rejected", reason);
+      };
+      if (shutdownRequested) {
+        reject("already-requested");
+        return;
+      }
+
+      const ctx = currentContext;
+      if (!isRecord(ctx) || !ownsTransport()) {
+        reject("unavailable");
+        return;
+      }
+      if (!contextModeIsTui(ctx)) {
+        if (ownsTransport()) reject("unavailable");
+        return;
+      }
+      if (currentContext !== ctx || !ownsTransport()) return;
+
+      const current = readNativeSession(ctx);
+      if (!ownsTransport()) return;
+      if (currentContext !== ctx) {
+        reject("stale-session");
+        return;
+      }
+      if (!current || !nativeSession) {
+        reject("unavailable");
+        return;
+      }
+      if (current.sessionId !== request.expectedSessionId
+        || !nativeSessionMatches(nativeSession, request.expectedSessionId, request.expectedSessionEpoch)) {
+        reject("stale-session");
+        return;
+      }
+
+      let isIdle: unknown;
+      try {
+        isIdle = ctx.isIdle;
+      } catch {
+        if (ownsTransport() && currentContext === ctx) reject("unavailable");
+        return;
+      }
+      if (!ownsTransport() || currentContext !== ctx) return;
+      if (typeof isIdle !== "function") {
+        reject("unavailable");
+        return;
+      }
+      let idle: unknown;
+      try {
+        idle = isIdle.call(ctx);
+      } catch {
+        if (ownsTransport() && currentContext === ctx) reject("unavailable");
+        return;
+      }
+      if (!ownsTransport() || currentContext !== ctx) return;
+      if (typeof idle !== "boolean") {
+        reject("unavailable");
+        return;
+      }
+
+      let shutdown: unknown;
+      try {
+        shutdown = ctx.shutdown;
+      } catch {
+        if (ownsTransport() && currentContext === ctx) reject("unavailable");
+        return;
+      }
+      if (!ownsTransport() || currentContext !== ctx) return;
+      if (typeof shutdown !== "function") {
+        reject("unavailable");
+        return;
+      }
+
+      let abort: unknown;
+      if (!idle) {
+        try {
+          abort = ctx.abort;
+        } catch {
+          if (ownsTransport() && currentContext === ctx) reject("unavailable");
+          return;
+        }
+        if (!ownsTransport() || currentContext !== ctx) return;
+        if (typeof abort !== "function") {
+          reject("unavailable");
+          return;
+        }
+      }
+
+      // Re-read the public shutdown API and native session after all earlier
+      // getters/probes, but before committing the terminal fence. A confirmed
+      // pre-invocation rejection must leave ordinary reporting/reload intact.
+      let currentShutdown: unknown;
+      try {
+        currentShutdown = ctx.shutdown;
+      } catch {
+        if (ownsTransport() && currentContext === ctx) reject("unavailable");
+        return;
+      }
+      if (!ownsTransport() || currentContext !== ctx) return;
+      if (currentShutdown !== shutdown || typeof currentShutdown !== "function") {
+        reject("unavailable");
+        return;
+      }
+      const beforeShutdown = readNativeSession(ctx);
+      if (!ownsTransport()) return;
+      if (currentContext !== ctx) {
+        reject("stale-session");
+        return;
+      }
+      if (!beforeShutdown
+        || beforeShutdown.sessionId !== request.expectedSessionId
+        || !nativeSessionMatches(nativeSession, request.expectedSessionId, request.expectedSessionEpoch)) {
+        reject(beforeShutdown ? "stale-session" : "unavailable");
+        return;
+      }
+
+      // Commit the terminal fence immediately before invoking the public API.
+      // If a post-write check confirms a failure while this exact context,
+      // connection, and sticky object are still ours, roll it back; uncertainty
+      // or teardown preserves the terminal state rather than reviving a stale
+      // reporter incarnation.
+      const stickyStorage = globalThis as Record<PropertyKey, unknown>;
+      const stickyBeforeTerminal = stickyStorage[SESSION_HOST_STICKY_STATE_KEY];
+      const terminalStickyState: StickyState = {
+        bootstrap, sequence, sessionEpoch, nativeSessionId, shutdownRequested: true, teardown,
+      };
+      shutdownRequested = true;
+      const stickyTerminalWritten = writeStickyState(terminalStickyState);
+      const restoreUninvokedFence = (): boolean => {
+        if (!ownsTransport() || currentContext !== ctx) return false;
+        const currentSticky = stickyStorage[SESSION_HOST_STICKY_STATE_KEY];
+        if (!ownsTransport() || currentContext !== ctx) return false;
+        if (currentSticky === stickyBeforeTerminal) {
+          shutdownRequested = false;
+          return true;
+        }
+        if (currentSticky !== terminalStickyState) return false;
+        const restoredStickyState: StickyState = {
+          bootstrap, sequence, sessionEpoch, nativeSessionId, shutdownRequested: false, teardown,
+        };
+        if (!writeStickyState(restoredStickyState)
+          || !ownsTransport()
+          || currentContext !== ctx
+          || stickyStorage[SESSION_HOST_STICKY_STATE_KEY] !== restoredStickyState) return false;
+        shutdownRequested = false;
+        return true;
+      };
+      if (!ownsTransport() || currentContext !== ctx) return;
+      if (!stickyTerminalWritten) {
+        if (restoreUninvokedFence()) reject("unavailable");
+        return;
+      }
+      const immediatelyBeforeShutdown = readNativeSession(ctx);
+      if (!ownsTransport() || currentContext !== ctx) return;
+      if (!immediatelyBeforeShutdown
+        || immediatelyBeforeShutdown.sessionId !== request.expectedSessionId
+        || !nativeSessionMatches(nativeSession, request.expectedSessionId, request.expectedSessionEpoch)) {
+        const reason = immediatelyBeforeShutdown ? "stale-session" : "unavailable";
+        if (restoreUninvokedFence()) reject(reason);
+        return;
+      }
+      try {
+        currentShutdown.call(ctx);
+      } catch {
+        if (ownsTransport() && currentContext === ctx) reject("shutdown-failed");
+        return;
+      }
+
+      // Public shutdown was requested first. Abort only a previously observed
+      // busy operation, and only while the exact context/connection incarnation
+      // still owns this request. A re-entrant session_shutdown may teardown the
+      // socket; in that case no acknowledgement is fabricated.
+      if (!ownsTransport() || currentContext !== ctx) return;
+      const afterShutdown = readNativeSession(ctx);
+      if (!ownsTransport() || currentContext !== ctx) return;
+      if (!afterShutdown
+        || afterShutdown.sessionId !== request.expectedSessionId
+        || !nativeSessionMatches(nativeSession, request.expectedSessionId, request.expectedSessionEpoch)) return;
+      let stillBusy = false;
+      if (!idle) {
+        let currentIsIdle: unknown;
+        try {
+          currentIsIdle = ctx.isIdle;
+        } catch {
+          if (!ownsTransport() || currentContext !== ctx) return;
+        }
+        if (!ownsTransport() || currentContext !== ctx) return;
+        if (typeof currentIsIdle === "function") {
+          try {
+            stillBusy = currentIsIdle.call(ctx) === false;
+          } catch {
+            stillBusy = false; // A throwing public probe never authorizes a stale abort.
+          }
+          if (!ownsTransport() || currentContext !== ctx) return;
+        }
+      }
+      if (stillBusy) {
+        let currentAbort: unknown;
+        try {
+          currentAbort = ctx.abort;
+        } catch {
+          if (!ownsTransport() || currentContext !== ctx) return;
+          currentAbort = undefined; // Shutdown was already requested; do not call an unavailable/stale API.
+        }
+        if (!ownsTransport() || currentContext !== ctx) return;
+        if (typeof currentAbort === "function") {
+          const beforeAbort = readNativeSession(ctx);
+          if (!ownsTransport() || currentContext !== ctx) return;
+          if (!beforeAbort
+            || beforeAbort.sessionId !== request.expectedSessionId
+            || !nativeSessionMatches(nativeSession, request.expectedSessionId, request.expectedSessionEpoch)) return;
+          try {
+            currentAbort.call(ctx);
+          } catch {
+            // shutdown() itself succeeded, so the truthful result remains requested.
+          }
+          if (!ownsTransport() || currentContext !== ctx) return;
+          const afterAbort = readNativeSession(ctx);
+          if (!ownsTransport() || currentContext !== ctx) return;
+          if (!afterAbort
+            || afterAbort.sessionId !== request.expectedSessionId
+            || !nativeSessionMatches(nativeSession, request.expectedSessionId, request.expectedSessionEpoch)) return;
+        }
+      }
+      sendShutdownResult(candidate, generation, request, "requested", "none");
+    } finally {
+      shutdownInProgress = false;
+      pendingShutdownRequestIds.delete(request.requestId);
+    }
+  };
+
   const rememberRenameRequest = (requestId: string): boolean => {
     if (recentRenameRequestIds.has(requestId)) return false;
     recentRenameRequestIds.add(requestId);
@@ -873,6 +1221,10 @@ function createReporter(
       || request.generation !== bootstrap.generation
       || !tokenMatches(request.token, bootstrap.token)) {
       candidate.destroy(); // Wrong capability or identity is a protocol failure.
+      return;
+    }
+    if (shutdownRequested) {
+      candidate.destroy(); // A terminal shutdown incarnation accepts no more mutations.
       return;
     }
     if (renameAckQueue.length >= MAX_QUEUED_RENAME_ACKS) {
@@ -948,11 +1300,12 @@ function createReporter(
       return false;
     }
     const message = decodeFrame(line);
-    if (!message || message.type !== "rename_request") {
-      candidate.destroy(); // Reporter accepts only authenticated host rename commands.
+    if (!message || (message.type !== "rename_request" && message.type !== "shutdown_request")) {
+      candidate.destroy(); // Reporter accepts only authenticated host commands.
       return false;
     }
-    processRenameRequest(candidate, generation, message);
+    if (message.type === "rename_request") processRenameRequest(candidate, generation, message);
+    else processShutdownRequest(candidate, generation, message);
     return !candidate.destroyed;
   };
 
@@ -1030,6 +1383,10 @@ function createReporter(
   };
 
   const installSession = (ctx: unknown): void => {
+    if (shutdownRequested) {
+      deactivate();
+      return;
+    }
     restoreObserver(); // Every session gets a fresh observation generation.
     cancelPendingStoredUserRefresh();
     sessionGeneration += 1;
@@ -1206,5 +1563,5 @@ function createReporter(
   registerHook(pi, "session_compact", reprobesReadiness);
   registerHook(pi, "session_compact_failed", reprobesReadiness);
 
-  return { bootstrap, sequence, sessionEpoch, nativeSessionId, teardown };
+  return { bootstrap, sequence, sessionEpoch, nativeSessionId, teardown, shutdownRequested };
 }

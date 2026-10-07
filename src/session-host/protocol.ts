@@ -9,13 +9,14 @@
  * and then pushes bounded newline-delimited JSON status frames:
  * top-level busy/idle, pending-input presence, modal input surface, a
  * two-line generic activity summary, and optional canonical native-session
- * identity/name metadata. The host can also send a narrowly scoped,
- * authenticated native rename request and receive its observed result.
+ * identity/name metadata. The host can also send narrowly scoped,
+ * authenticated native rename and graceful-shutdown requests and receive their
+ * observed results.
  *
  * Privacy contract: status frames carry no tool arguments, question text,
  * transcripts, or credentials. The canonical native conversation name is
  * the sole intentionally allowed prompt-derived title. The bootstrap token
- * appears in the hello and authenticated rename-request frames only. Every
+ * appears in the hello and authenticated command frames only. Every
  * field is strictly bounded and MAX_STATUS_FRAME_BYTES caps each wire frame;
  * this module is the shared contract for both sides and performs no IO.
  */
@@ -124,7 +125,33 @@ export interface SessionHostRenameAck {
   reason: "none" | "stale-session" | "unavailable" | "invalid-name" | "setter-failed" | "verification-failed";
 }
 
-export type SessionHostMessage = SessionHostHello | SessionHostStatus | SessionHostRenameRequest | SessionHostRenameAck;
+/** Host request to gracefully shut down this owned process, fenced to the observed session incarnation. */
+export interface SessionHostShutdownRequest {
+  version: 1;
+  type: "shutdown_request";
+  instanceId: string;
+  generation: string;
+  token: string;
+  requestId: string;
+  expectedSessionId: string;
+  expectedSessionEpoch: number;
+}
+
+/** Acknowledges a public shutdown request, never process exit. */
+export interface SessionHostShutdownAck {
+  version: 1;
+  type: "shutdown_result";
+  instanceId: string;
+  generation: string;
+  requestId: string;
+  expectedSessionId: string;
+  expectedSessionEpoch: number;
+  outcome: "requested" | "rejected";
+  reason: "none" | "stale-session" | "unavailable" | "shutdown-failed" | "already-requested";
+}
+
+export type SessionHostMessage = SessionHostHello | SessionHostStatus | SessionHostRenameRequest | SessionHostRenameAck
+  | SessionHostShutdownRequest | SessionHostShutdownAck;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -317,6 +344,48 @@ export function parseRenameAck(value: unknown): SessionHostRenameAck | undefined
   };
 }
 
+/** Validates a broker-to-reporter graceful-shutdown request. */
+export function parseShutdownRequest(value: unknown): SessionHostShutdownRequest | undefined {
+  if (!isRecord(value) || value.version !== PROTOCOL_VERSION || value.type !== "shutdown_request") return undefined;
+  if (!isValidId(value.instanceId) || !isValidId(value.generation) || !isValidToken(value.token)) return undefined;
+  if (!isValidId(value.requestId) || !isValidNativeSessionId(value.expectedSessionId)) return undefined;
+  if (!Number.isSafeInteger(value.expectedSessionEpoch) || (value.expectedSessionEpoch as number) < 1) return undefined;
+  return {
+    version: 1,
+    type: "shutdown_request",
+    instanceId: value.instanceId,
+    generation: value.generation,
+    token: value.token,
+    requestId: value.requestId,
+    expectedSessionId: value.expectedSessionId,
+    expectedSessionEpoch: value.expectedSessionEpoch as number,
+  };
+}
+
+/** Validates a reporter acknowledgement; it means only that public shutdown was requested. */
+export function parseShutdownAck(value: unknown): SessionHostShutdownAck | undefined {
+  if (!isRecord(value) || value.version !== PROTOCOL_VERSION || value.type !== "shutdown_result") return undefined;
+  if (!isValidId(value.instanceId) || !isValidId(value.generation) || !isValidId(value.requestId)) return undefined;
+  if (!isValidNativeSessionId(value.expectedSessionId)
+    || !Number.isSafeInteger(value.expectedSessionEpoch)
+    || (value.expectedSessionEpoch as number) < 1) return undefined;
+  if (value.outcome !== "requested" && value.outcome !== "rejected") return undefined;
+  const reasons = ["none", "stale-session", "unavailable", "shutdown-failed", "already-requested"];
+  if (!reasons.includes(value.reason as string)) return undefined;
+  if ((value.outcome === "requested") !== (value.reason === "none")) return undefined;
+  return {
+    version: 1,
+    type: "shutdown_result",
+    instanceId: value.instanceId,
+    generation: value.generation,
+    requestId: value.requestId,
+    expectedSessionId: value.expectedSessionId,
+    expectedSessionEpoch: value.expectedSessionEpoch as number,
+    outcome: value.outcome,
+    reason: value.reason as SessionHostShutdownAck["reason"],
+  };
+}
+
 /**
  * Validates a raw wire line (with or without the trailing newline): bounded
  * size, JSON syntax, and message shape. Returns undefined when malformed.
@@ -337,6 +406,8 @@ export function decodeFrame(line: string): SessionHostMessage | undefined {
     case "status": return parseStatus(parsed);
     case "rename_request": return parseRenameRequest(parsed);
     case "rename_result": return parseRenameAck(parsed);
+    case "shutdown_request": return parseShutdownRequest(parsed);
+    case "shutdown_result": return parseShutdownAck(parsed);
     default: return undefined;
   }
 }

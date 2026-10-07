@@ -23,11 +23,54 @@ import {
   MAX_STATUS_FRAME_BYTES,
   decodeFrame,
   parseBootstrap,
+  parseShutdownAck,
 } from "../src/session-host/protocol";
 
 const INSTANCE_A = "11111111-1111-4111-8111-111111111111";
 const INSTANCE_B = "22222222-2222-4222-8222-222222222222";
 const INSTANCE_C = "33333333-3333-4333-8333-333333333333";
+
+// The isolated worker root is deliberately longer than macOS's sun_path. The
+// tests still create every socket inode below this root: only the address sent
+// to bind/connect is expressed relative to the already-rooted process cwd.
+function rootRelativeSocketAddress(address: string): string {
+  const relative = path.relative(process.cwd(), address);
+  if (path.isAbsolute(address) && relative && relative !== ".." && !relative.startsWith(`..${path.sep}`)
+    && Buffer.byteLength(address, "utf8") > 100) return `./${relative}`;
+  return address;
+}
+
+function rootRelativeSocketArgument(value: unknown): unknown {
+  if (typeof value === "string") return rootRelativeSocketAddress(value);
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const options = value as Record<string, unknown>;
+    if (typeof options.path === "string") return { ...options, path: rootRelativeSocketAddress(options.path) };
+  }
+  return value;
+}
+
+function rootRelativeSocketConnectArgument(value: unknown): unknown {
+  if (Array.isArray(value) && value.length > 0) {
+    // Node normalizes net.connect(string) into an options array carrying a
+    // private symbol marker; mutate only the path option to preserve it.
+    value[0] = rootRelativeSocketArgument(value[0]);
+    return value;
+  }
+  if (typeof value === "string") return { path: rootRelativeSocketAddress(value) };
+  return rootRelativeSocketArgument(value);
+}
+
+const originalServerListen = net.Server.prototype.listen;
+net.Server.prototype.listen = function (this: net.Server, ...args: unknown[]): net.Server {
+  args[0] = rootRelativeSocketArgument(args[0]);
+  return Reflect.apply(originalServerListen, this, args) as net.Server;
+} as typeof net.Server.prototype.listen;
+
+const originalSocketConnect = net.Socket.prototype.connect;
+net.Socket.prototype.connect = function (this: net.Socket, ...args: unknown[]): net.Socket {
+  args[0] = rootRelativeSocketConnectArgument(args[0]);
+  return Reflect.apply(originalSocketConnect, this, args) as net.Socket;
+} as typeof net.Socket.prototype.connect;
 
 const SOCKET_CLOSE_DEADLINE_MS = 4000;
 const ALLOWED_REJECTION_ERROR_CODES = ["EPIPE", "ECONNRESET"] as const;
@@ -171,6 +214,7 @@ function trackReplacementServer(server: net.Server): net.Server {
 }
 
 async function createStatusBroker(options?: StatusBrokerOptions): Promise<StatusBroker> {
+  brokerTest.setSocketPathLimitForTests(4096);
   const broker = await createStatusBrokerImpl(options);
   brokers.add(broker);
   ownDirectory(path.dirname(broker.socketPath));
@@ -193,6 +237,7 @@ async function withDeadline<T>(promise: Promise<T>, label: string, timeoutMs = S
 }
 
 afterEach(async () => {
+  brokerTest.setSocketPathLimitForTests(undefined);
   const unexpectedErrors = [
     ...[...clients.values()].flatMap((state) => {
       const errors = state.errors.filter((error) => !state.expectedErrors.has(error));
@@ -403,6 +448,36 @@ test("rename acknowledgement policy fences request, host generation, and current
     brokerTest.classifyRenameAck(ack, expected, INSTANCE_A, ack.generation, { sessionId: "native-two", epoch: 8, name: "other" }),
     "stale-session",
   );
+});
+
+test("shutdown acknowledgement policy binds the request and refuses stale session success", () => {
+  const expected = {
+    requestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    expectedSessionId: "native-one",
+    expectedSessionEpoch: 7,
+  };
+  const ack = {
+    version: 1 as const,
+    type: "shutdown_result" as const,
+    instanceId: INSTANCE_A,
+    generation: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    ...expected,
+    outcome: "requested" as const,
+    reason: "none" as const,
+  };
+  assert.deepEqual(parseShutdownAck(ack), ack);
+  assert.equal(brokerTest.classifyShutdownAck(ack, expected, INSTANCE_A, ack.generation, {
+    sessionId: "native-one", epoch: 7, name: "title",
+  }), "matching");
+  assert.equal(brokerTest.classifyShutdownAck(ack, expected, INSTANCE_A, "cccccccc-cccc-4ccc-8ccc-cccccccccccc", {
+    sessionId: "native-one", epoch: 7, name: "title",
+  }), "invalid");
+  assert.equal(brokerTest.classifyShutdownAck(ack, { ...expected, expectedSessionEpoch: 8 }, INSTANCE_A, ack.generation, {
+    sessionId: "native-one", epoch: 7, name: "title",
+  }), "invalid");
+  assert.equal(brokerTest.classifyShutdownAck(ack, expected, INSTANCE_A, ack.generation, {
+    sessionId: "native-two", epoch: 8, name: "other",
+  }), "stale-session");
 });
 
 test("broker creates a private 0700 transport, owns its 0600 socket, and cleans up while preserving unknown files", async () => {
@@ -626,6 +701,140 @@ test("registration rename is identity-fenced, authenticated, acknowledged, and b
   assert.equal("token" in result, false, "the capability never reaches callback results");
 });
 
+test("registration shutdown is authenticated, idempotent, session-fenced, and never an exit result", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const recorded = recording();
+  const registration = broker.register(INSTANCE_A, recorded.handlers);
+  assert.equal((await registration.shutdown()).status, "unavailable", "unknown session metadata cannot be guessed");
+
+  const client = await connectClient(broker.socketPath);
+  const outbound: Record<string, unknown>[] = [];
+  let buffer = "";
+  client.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    let newline: number;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, newline + 1);
+      buffer = buffer.slice(newline + 1);
+      const decoded = decodeFrame(line);
+      if (decoded) outbound.push(decoded as unknown as Record<string, unknown>);
+    }
+  });
+  const nativeSession = { sessionId: "native-shutdown", epoch: 12, name: "private title" };
+  client.write(JSON.stringify(helloFrame(registration.bootstrap)) + "\n");
+  client.write(JSON.stringify(statusFrame(registration.bootstrap, { sequence: 1, nativeSession })) + "\n");
+  await waitFor(() => recorded.statuses.length === 1);
+
+  const pending = registration.shutdown();
+  assert.equal(registration.shutdown(), pending, "repeated host Quit shares one terminal request/result");
+  await waitFor(() => outbound.some((frame) => frame.type === "shutdown_request"));
+  const request = outbound.find((frame) => frame.type === "shutdown_request")!;
+  assert.equal(request.instanceId, INSTANCE_A);
+  assert.equal(request.generation, registration.bootstrap.generation);
+  assert.equal(request.token, registration.bootstrap.token, "only the authenticated command carries the capability");
+  assert.equal(request.expectedSessionId, nativeSession.sessionId);
+  assert.equal(request.expectedSessionEpoch, nativeSession.epoch);
+
+  client.write(JSON.stringify({
+    version: 1,
+    type: "shutdown_result",
+    instanceId: registration.bootstrap.instanceId,
+    generation: registration.bootstrap.generation,
+    requestId: request.requestId,
+    expectedSessionId: nativeSession.sessionId,
+    expectedSessionEpoch: nativeSession.epoch,
+    outcome: "requested",
+    reason: "none",
+  }) + "\n");
+  const result = await pending;
+  assert.deepEqual(result, { requestId: request.requestId, status: "requested" });
+  assert.deepEqual(Object.keys(result).sort(), ["requestId", "status"]);
+  assert.equal(recorded.disconnects, 0, "request acknowledgement does not infer reporter or PTY exit");
+  assert.equal(client.destroyed, false, "the request can be acknowledged while the reporter remains connected");
+  client.destroy();
+  await waitFor(() => recorded.disconnects === 1);
+});
+
+test("shutdown acknowledgements arriving after a session change are rejected", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const recorded = recording();
+  const registration = broker.register(INSTANCE_A, recorded.handlers);
+  const client = await connectClient(broker.socketPath);
+  const outbound: Record<string, unknown>[] = [];
+  let buffer = "";
+  client.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    let newline: number;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, newline + 1);
+      buffer = buffer.slice(newline + 1);
+      const decoded = decodeFrame(line);
+      if (decoded) outbound.push(decoded as unknown as Record<string, unknown>);
+    }
+  });
+  client.write(JSON.stringify(helloFrame(registration.bootstrap)) + "\n");
+  client.write(JSON.stringify(statusFrame(registration.bootstrap, {
+    sequence: 1,
+    nativeSession: { sessionId: "native-one", epoch: 4, name: "title" },
+  })) + "\n");
+  await waitFor(() => recorded.statuses.length === 1);
+  const pending = registration.shutdown();
+  await waitFor(() => outbound.some((frame) => frame.type === "shutdown_request"));
+  const request = outbound.find((frame) => frame.type === "shutdown_request")!;
+  client.write(JSON.stringify(statusFrame(registration.bootstrap, {
+    sequence: 2,
+    nativeSession: { sessionId: "native-two", epoch: 5, name: "new title" },
+  })) + "\n");
+  await waitFor(() => recorded.statuses.length === 2);
+  client.write(JSON.stringify({
+    version: 1,
+    type: "shutdown_result",
+    instanceId: registration.bootstrap.instanceId,
+    generation: registration.bootstrap.generation,
+    requestId: request.requestId,
+    expectedSessionId: "native-one",
+    expectedSessionEpoch: 4,
+    outcome: "requested",
+    reason: "none",
+  }) + "\n");
+  assert.equal((await pending).status, "rejected", "a stale requested acknowledgement cannot cross conversation epochs");
+});
+
+test("real disconnect before shutdown acknowledgement returns disconnected", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const recorded = recording();
+  const registration = broker.register(INSTANCE_A, recorded.handlers);
+  const client = await connectClient(broker.socketPath);
+  client.write(JSON.stringify(helloFrame(registration.bootstrap)) + "\n");
+  client.write(JSON.stringify(statusFrame(registration.bootstrap, {
+    sequence: 1,
+    nativeSession: { sessionId: "native-one", epoch: 1, name: "title" },
+  })) + "\n");
+  await waitFor(() => recorded.statuses.length === 1);
+  const pending = registration.shutdown();
+  client.destroy();
+  const result = await pending;
+  assert.equal(result.status, "disconnected");
+  assert.equal(recorded.disconnects, 1, "only the actual reporter socket disconnect is observed here");
+});
+
+test("shutdown acknowledgement timeout retires the silent authenticated connection", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const recorded = recording();
+  const registration = broker.register(INSTANCE_A, recorded.handlers);
+  const client = await connectClient(broker.socketPath);
+  client.write(JSON.stringify(helloFrame(registration.bootstrap)) + "\n");
+  client.write(JSON.stringify(statusFrame(registration.bootstrap, {
+    sequence: 1,
+    nativeSession: { sessionId: "native-one", epoch: 1, name: "title" },
+  })) + "\n");
+  await waitFor(() => recorded.statuses.length === 1);
+  const result = await registration.shutdown();
+  assert.equal(result.status, "timeout");
+  await waitFor(() => recorded.disconnects === 1);
+  assert.equal(recorded.disconnects, 1, "broker retired the silent authenticated connection");
+});
+
 test("rename rejects stale broker metadata and fails closed on a mismatched acknowledgement tuple", async () => {
   const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
   const recorded = recording();
@@ -756,15 +965,15 @@ test("rename has a per-registration in-flight cap and disposal resolves pending 
     expectedSessionEpoch: 1,
     name: `title ${index}`,
   }));
+  const shutdown = registration.shutdown();
   const capped = await registration.rename({
     expectedSessionId: "native-one",
     expectedSessionEpoch: 1,
     name: "fifth title",
   });
   assert.equal(capped.status, "busy");
-  const closed = expectClientClose(client);
+  assert.equal((await shutdown).status, "busy", "shutdown shares the bounded four-frame control write queue");
   await disposeBroker(broker);
-  await closed;
   assert.deepEqual((await Promise.all(pending)).map((result) => result.status), ["disconnected", "disconnected", "disconnected", "disconnected"]);
 });
 
@@ -1156,8 +1365,9 @@ test("invalid socket roots fail clearly without adopting or unlinking anything",
   const deepRoot = path.join(root, "x".repeat(110));
   fs.mkdirSync(deepRoot);
   ownDirectory(deepRoot);
+  brokerTest.setSocketPathLimitForTests(undefined);
   await assert.rejects(
-    createStatusBroker({ socketRoot: deepRoot }),
+    createStatusBrokerImpl({ socketRoot: deepRoot }),
     /Unix-socket limit/,
   );
   assert.equal(fs.readdirSync(deepRoot).length, 0, "the failed attempt left nothing behind");

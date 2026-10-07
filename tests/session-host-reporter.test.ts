@@ -13,12 +13,13 @@ import net from "node:net";
 import { randomBytes, randomUUID } from "node:crypto";
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { NODE_OPTIONS_RESTORE_ENV, restoreNodeOptions } from "../src/session-host/bootstrap-preload";
 import activate, { __test as reporterTest, primeReporterBootstrap, SESSION_HOST_STICKY_STATE_KEY } from "../src/session-host/reporter";
 import {
   HOST_BOOTSTRAP_ENV,
+  MAX_STATUS_FRAME_BYTES,
   MAX_NATIVE_SESSION_NAME_LENGTH,
   MAX_RENAME_NAME_BYTES,
   decodeFrame,
@@ -26,12 +27,53 @@ import {
   parseBootstrap,
   parseRenameAck,
   parseRenameRequest,
+  parseShutdownAck,
+  parseShutdownRequest,
   parseStatus,
   sanitizeActivityLine,
   stripTerminalControls,
   type SessionHostMessage,
   type SessionHostStatus,
 } from "../src/session-host/protocol";
+
+// Keep integration socket files inside the isolated worker root while using
+// relative local-socket addresses that fit macOS's bounded sun_path field.
+function rootRelativeSocketAddress(address: string): string {
+  const rooted = relative(process.cwd(), address);
+  if (isAbsolute(address) && rooted && rooted !== ".." && !rooted.startsWith(`..${sep}`)
+    && Buffer.byteLength(address, "utf8") > 100) return `./${rooted}`;
+  return address;
+}
+
+function rootRelativeSocketArgument(value: unknown): unknown {
+  if (typeof value === "string") return rootRelativeSocketAddress(value);
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const options = value as Record<string, unknown>;
+    if (typeof options.path === "string") return { ...options, path: rootRelativeSocketAddress(options.path) };
+  }
+  return value;
+}
+
+function rootRelativeSocketConnectArgument(value: unknown): unknown {
+  if (Array.isArray(value) && value.length > 0) {
+    value[0] = rootRelativeSocketArgument(value[0]);
+    return value;
+  }
+  if (typeof value === "string") return { path: rootRelativeSocketAddress(value) };
+  return rootRelativeSocketArgument(value);
+}
+
+const originalServerListen = net.Server.prototype.listen;
+net.Server.prototype.listen = function (this: net.Server, ...args: unknown[]): net.Server {
+  args[0] = rootRelativeSocketArgument(args[0]);
+  return Reflect.apply(originalServerListen, this, args) as net.Server;
+} as typeof net.Server.prototype.listen;
+
+const originalSocketConnect = net.Socket.prototype.connect;
+net.Socket.prototype.connect = function (this: net.Socket, ...args: unknown[]): net.Socket {
+  args[0] = rootRelativeSocketConnectArgument(args[0]);
+  return Reflect.apply(originalSocketConnect, this, args) as net.Socket;
+} as typeof net.Socket.prototype.connect;
 
 // ----------------------------------------------------------------------
 // Synthetic Pi host + UI fixtures
@@ -80,6 +122,8 @@ interface TestCtx {
   mode: string;
   ui: Record<string, unknown>;
   isIdle: () => boolean;
+  abort?: () => void;
+  shutdown?: () => void;
   sessionManager: {
     getSessionId: () => string;
     getSessionName?: () => string | undefined;
@@ -222,6 +266,25 @@ function makeBootstrap(socketPath: string, overrides: Record<string, unknown> = 
     token: randomBytes(32).toString("hex"),
     instanceId: randomUUID(),
     generation: randomUUID(),
+    ...overrides,
+  };
+}
+
+function makeShutdownRequest(
+  bootstrap: Record<string, unknown>,
+  expectedSessionId: string,
+  expectedSessionEpoch: number,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    version: 1,
+    type: "shutdown_request",
+    instanceId: bootstrap.instanceId,
+    generation: bootstrap.generation,
+    token: bootstrap.token,
+    requestId: randomUUID(),
+    expectedSessionId,
+    expectedSessionEpoch,
     ...overrides,
   };
 }
@@ -424,6 +487,40 @@ describe("session-host protocol", () => {
     } });
     assert.equal(clipped?.displayName.length, MAX_NATIVE_SESSION_NAME_LENGTH, "display name clipping never changes the stored name");
     assert.equal(clipped?.storedName?.length, MAX_NATIVE_SESSION_NAME_LENGTH + 10);
+  });
+
+  it("strictly validates graceful shutdown requests and request-only acknowledgements", () => {
+    const request = {
+      version: 1,
+      type: "shutdown_request",
+      instanceId: randomUUID(),
+      generation: randomUUID(),
+      token: "a".repeat(64),
+      requestId: randomUUID(),
+      expectedSessionId: "native-session",
+      expectedSessionEpoch: 8,
+    };
+    assert.deepEqual(parseShutdownRequest(request), request);
+    assert.deepEqual(decodeFrame(encodeFrame(request as never)), request);
+    assert.equal(parseShutdownRequest({ ...request, token: "wrong" }), undefined);
+    assert.equal(parseShutdownRequest({ ...request, expectedSessionEpoch: 0 }), undefined);
+    assert.equal(parseShutdownRequest({ ...request, expectedSessionId: "../sibling" }), undefined);
+
+    const ack = {
+      version: 1,
+      type: "shutdown_result",
+      instanceId: request.instanceId,
+      generation: request.generation,
+      requestId: request.requestId,
+      expectedSessionId: request.expectedSessionId,
+      expectedSessionEpoch: request.expectedSessionEpoch,
+      outcome: "requested",
+      reason: "none",
+    };
+    assert.deepEqual(parseShutdownAck(ack), ack);
+    assert.deepEqual(decodeFrame(encodeFrame(ack as never)), ack);
+    assert.equal(parseShutdownAck({ ...ack, reason: "already-requested" }), undefined);
+    assert.equal(parseShutdownAck({ ...ack, outcome: "rejected", reason: "none" }), undefined);
   });
 
   it("round-trips frames through encode/decode and rejects oversized lines", () => {
@@ -795,7 +892,7 @@ describe("session-host reporter status frames", () => {
     }
   });
 
-  it("rejects host commands with the wrong token before calling the public rename setter", async () => {
+  it("rejects host commands with the wrong token before invoking public rename or shutdown APIs", async () => {
     const server = await startTestServer();
     const sessionManager: TestCtx["sessionManager"] = {
       getSessionId: () => "native-session",
@@ -804,7 +901,10 @@ describe("session-host reporter status frames", () => {
     };
     const { testPi, ctx, bootstrap } = await startSession({ server, sessionManager, reporterOptions: { reconnectDelayMs: 20 } });
     let setterCalls = 0;
+    let shutdownCalls = 0;
     (testPi.pi as { setSessionName?: (name: string) => void }).setSessionName = () => { setterCalls += 1; };
+    ctx.shutdown = () => { shutdownCalls += 1; };
+    ctx.abort = () => undefined;
     const status = await server.waitForFrame((frame) => frame.message.type === "status");
     const nativeSession = status.message.nativeSession as { sessionId: string; epoch: number };
     const command = {
@@ -821,7 +921,414 @@ describe("session-host reporter status frames", () => {
     server.sendToClients(encodeFrame(command as never));
     await server.waitForFrame((frame) => frame.message.type === "hello" && server.frames.filter((entry) => entry.message.type === "hello").length >= 2);
     assert.equal(setterCalls, 0, "wrong capability closes the channel without invoking the native setter");
+    const shutdown = makeShutdownRequest(bootstrap, nativeSession.sessionId, nativeSession.epoch, { token: "0".repeat(64) });
+    server.sendToClients(encodeFrame(shutdown as never));
+    await server.waitForFrame((frame) => frame.message.type === "hello" && server.frames.filter((entry) => entry.message.type === "hello").length >= 3);
+    assert.equal(shutdownCalls, 0, "wrong capability closes the channel without calling public shutdown");
+    assert.equal(server.frames.some((frame) => frame.message.type === "shutdown_result"), false);
     await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("closes malformed and oversized host frames without invoking shutdown", async () => {
+    const server = await startTestServer();
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => "malformed-shutdown-session",
+      getSessionName: () => undefined,
+      getEntries: () => [],
+    };
+    const { testPi, ctx } = await startSession({
+      server,
+      sessionManager,
+      reporterOptions: { reconnectDelayMs: 20 },
+    });
+    let shutdownCalls = 0;
+    ctx.shutdown = () => { shutdownCalls += 1; };
+    ctx.abort = () => undefined;
+    await server.waitForFrame((frame) => frame.message.type === "status");
+
+    server.sendToClients("{not-json}\n");
+    await server.waitForFrame((frame) => frame.message.type === "hello"
+      && server.frames.filter((entry) => entry.message.type === "hello").length >= 2);
+    server.sendToClients("x".repeat(MAX_STATUS_FRAME_BYTES + 1));
+    await server.waitForFrame((frame) => frame.message.type === "hello"
+      && server.frames.filter((entry) => entry.message.type === "hello").length >= 3);
+    assert.equal(shutdownCalls, 0);
+    assert.equal(server.frames.some((frame) => frame.message.type === "shutdown_result"), false);
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("requests public graceful shutdown once, aborting busy work only after shutdown and never claiming exit", async () => {
+    const server = await startTestServer();
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => "shutdown-session",
+      getSessionName: () => undefined,
+      getEntries: () => [],
+    };
+    const { testPi, ctx, bootstrap } = await startSession({ server, sessionManager });
+    const calls: string[] = [];
+    ctx.isIdle = () => { calls.push("isIdle"); return false; };
+    ctx.shutdown = () => { calls.push("shutdown"); };
+    ctx.abort = () => { calls.push("abort"); };
+
+    const status = await server.waitForFrame((frame) => frame.message.type === "status");
+    const native = status.message.nativeSession as { sessionId: string; epoch: number };
+    const request = makeShutdownRequest(bootstrap, native.sessionId, native.epoch);
+    const encoded = encodeFrame(request as never);
+    const before = server.frames.length;
+    // Exact replay must acknowledge the cached result without repeating either public side effect.
+    server.sendToClients(encoded + encoded);
+    const firstAck = await server.waitForFrame(
+      (frame) => frame.message.type === "shutdown_result" && frame.message.requestId === request.requestId,
+      3_000,
+      before - 1,
+    );
+    const secondAck = await server.waitForFrame(
+      (frame) => frame.message.type === "shutdown_result" && frame.message.requestId === request.requestId,
+      3_000,
+      server.frames.indexOf(firstAck),
+    );
+    assert.equal(firstAck.message.outcome, "requested");
+    assert.equal(firstAck.message.reason, "none");
+    assert.deepEqual(calls, ["isIdle", "shutdown", "isIdle", "abort"], "busy cancellation follows the public shutdown request and only runs if still busy");
+    assert.equal(server.connections, 1, "request acknowledgement does not imply PTY exit or reporter disconnect");
+    assert.equal("exited" in firstAck.message || "processExited" in firstAck.message, false);
+    assert.equal("token" in firstAck.message, false);
+    assert.equal("name" in firstAck.message, false);
+    assert.equal(secondAck.message.outcome, "requested", "duplicate request replays only its bounded acknowledgement");
+
+    const distinct = makeShutdownRequest(bootstrap, native.sessionId, native.epoch);
+    const afterReplay = server.frames.length;
+    server.sendToClients(encodeFrame(distinct as never));
+    const terminalAck = await server.waitForFrame(
+      (frame) => frame.message.type === "shutdown_result" && frame.message.requestId === distinct.requestId,
+      3_000,
+      afterReplay - 1,
+    );
+    assert.equal(terminalAck.message.outcome, "rejected");
+    assert.equal(terminalAck.message.reason, "already-requested");
+    assert.deepEqual(calls, ["isIdle", "shutdown", "isIdle", "abort"], "shutdown is terminal and idempotent for this process incarnation");
+    const helloCount = server.frames.filter((frame) => frame.message.type === "hello").length;
+    const reloaded = createPi();
+    await activate(reloaded.pi);
+    await reloaded.trigger("session_start", { type: "session_start", reason: "reload" }, ctx);
+    await sleep(30);
+    assert.equal(server.frames.filter((frame) => frame.message.type === "hello").length, helloCount,
+      "sticky terminal state prevents /reload from reattaching to the old context");
+    assert.deepEqual(calls, ["isIdle", "shutdown", "isIdle", "abort"]);
+    await reloaded.trigger("session_shutdown", { type: "session_shutdown" }, ctx);
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("fails closed for stale, foreign, missing, and throwing public shutdown contexts", async () => {
+    const server = await startTestServer();
+    const native = { id: "shutdown-fence-session", name: undefined as string | undefined };
+    let sessionReadThrows = false;
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => {
+        if (sessionReadThrows) throw new Error("stale session getter");
+        return native.id;
+      },
+      getSessionName: () => native.name,
+      getEntries: () => [],
+    };
+    const { testPi, ctx, bootstrap } = await startSession({ server, sessionManager });
+    let shutdownCalls = 0;
+    let abortCalls = 0;
+    ctx.shutdown = () => { shutdownCalls += 1; };
+    ctx.abort = () => { abortCalls += 1; };
+    const status = await server.waitForFrame((frame) => frame.message.type === "status");
+    const observed = status.message.nativeSession as { sessionId: string; epoch: number };
+
+    const sendAndRead = async (request: Record<string, unknown>) => {
+      const after = server.frames.length;
+      server.sendToClients(encodeFrame(request as never));
+      return server.waitForFrame(
+        (frame) => frame.message.type === "shutdown_result" && frame.message.requestId === request.requestId,
+        3_000,
+        after - 1,
+      );
+    };
+
+    ctx.mode = "rpc"; // A foreign/non-native TUI context must not be shut down.
+    let ack = await sendAndRead(makeShutdownRequest(bootstrap, observed.sessionId, observed.epoch));
+    assert.equal(ack.message.reason, "unavailable");
+    ctx.mode = "tui";
+
+    ctx.isIdle = () => { throw new Error("stale isIdle"); };
+    ack = await sendAndRead(makeShutdownRequest(bootstrap, observed.sessionId, observed.epoch));
+    assert.equal(ack.message.reason, "unavailable");
+    ctx.isIdle = () => false;
+
+    sessionReadThrows = true;
+    ack = await sendAndRead(makeShutdownRequest(bootstrap, observed.sessionId, observed.epoch));
+    assert.equal(ack.message.reason, "unavailable", "a throwing public session getter fails closed");
+    sessionReadThrows = false;
+
+    ctx.abort = undefined; // Busy work cannot be left running if public abort is unavailable.
+    ack = await sendAndRead(makeShutdownRequest(bootstrap, observed.sessionId, observed.epoch));
+    assert.equal(ack.message.reason, "unavailable");
+    assert.equal(shutdownCalls, 0, "missing abort is rejected before shutdown side effects");
+    ctx.abort = () => { abortCalls += 1; };
+
+    ctx.shutdown = undefined;
+    ack = await sendAndRead(makeShutdownRequest(bootstrap, observed.sessionId, observed.epoch));
+    assert.equal(ack.message.reason, "unavailable", "missing public shutdown is rejected before side effects");
+    ctx.shutdown = () => { shutdownCalls += 1; };
+
+    Object.defineProperty(ctx, "shutdown", {
+      configurable: true,
+      get() { throw new Error("hostile public API getter"); },
+    });
+    ack = await sendAndRead(makeShutdownRequest(bootstrap, observed.sessionId, observed.epoch));
+    assert.equal(ack.message.reason, "unavailable");
+    Object.defineProperty(ctx, "shutdown", {
+      configurable: true,
+      writable: true,
+      value: () => { shutdownCalls += 1; },
+    });
+
+    native.id = "different-current-session";
+    ack = await sendAndRead(makeShutdownRequest(bootstrap, observed.sessionId, observed.epoch));
+    assert.equal(ack.message.reason, "stale-session");
+    assert.equal(shutdownCalls, 0, "a conversation change cannot redirect an old request");
+    assert.equal(abortCalls, 0);
+
+    const previousStatusCount = statusFrames(server).length;
+    await testPi.trigger("session_info_changed", { type: "session_info_changed" }, ctx);
+    const updated = await server.waitForFrame(
+      (frame) => frame.message.type === "status"
+        && (frame.message.nativeSession as { sessionId?: string } | null)?.sessionId === native.id,
+      3_000,
+      server.frames.length - 2,
+    );
+    assert.ok(statusFrames(server).length > previousStatusCount);
+    const current = updated.message.nativeSession as { sessionId: string; epoch: number };
+    ctx.isIdle = () => true;
+    ctx.shutdown = () => { throw new Error("public shutdown threw"); };
+    ack = await sendAndRead(makeShutdownRequest(bootstrap, current.sessionId, current.epoch));
+    assert.equal(ack.message.outcome, "rejected");
+    assert.equal(ack.message.reason, "shutdown-failed", "a throwing public shutdown API is not acknowledged as requested");
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("keeps reporting and reloadable when the final public shutdown getter rejects before invocation", async () => {
+    const server = await startTestServer();
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => "shutdown-getter-rejection-session",
+      getSessionName: () => undefined,
+      getEntries: () => [],
+    };
+    const { testPi, ctx, bootstrap } = await startSession({ server, sessionManager });
+    const status = await server.waitForFrame((frame) => frame.message.type === "status");
+    const native = status.message.nativeSession as { sessionId: string; epoch: number };
+    let getterCalls = 0;
+    let shutdownCalls = 0;
+    Object.defineProperty(ctx, "shutdown", {
+      configurable: true,
+      get() {
+        getterCalls += 1;
+        if (getterCalls === 2) throw new Error("second public shutdown getter failed");
+        return () => { shutdownCalls += 1; };
+      },
+    });
+
+    const request = makeShutdownRequest(bootstrap, native.sessionId, native.epoch);
+    const afterRequest = server.frames.length;
+    server.sendToClients(encodeFrame(request as never));
+    const ack = await server.waitForFrame(
+      (frame) => frame.message.type === "shutdown_result" && frame.message.requestId === request.requestId,
+      3_000,
+      afterRequest - 1,
+    );
+    assert.equal(ack.message.outcome, "rejected");
+    assert.equal(ack.message.reason, "unavailable");
+    assert.equal(shutdownCalls, 0);
+    let sticky = (globalThis as Record<PropertyKey, unknown>)[SESSION_HOST_STICKY_STATE_KEY] as { shutdownRequested?: boolean };
+    assert.equal(sticky.shutdownRequested, false, "pre-invocation rejection does not commit a terminal sticky fence");
+
+    const sequenceBeforeActivity = lastStatusSequence(server);
+    await testPi.trigger("agent_start", { type: "agent_start" }, ctx);
+    const activity = await server.waitForFrame((frame) => frame.message.type === "status"
+      && (frame.message.sequence as number) > sequenceBeforeActivity);
+    assert.equal(activity.message.busy, true, "ordinary status forwarding continues after rejection");
+
+    const previousHelloCount = server.frames.filter((frame) => frame.message.type === "hello").length;
+    const previousSequence = activity.message.sequence as number;
+    const reloaded = createPi();
+    await activate(reloaded.pi);
+    await reloaded.trigger("session_start", { type: "session_start", reason: "reload" }, ctx);
+    await server.waitForFrame((frame) => frame.message.type === "hello"
+      && server.frames.filter((entry) => entry.message.type === "hello").length > previousHelloCount);
+    const restored = await server.waitForFrame((frame) => frame.message.type === "status"
+      && (frame.message.sequence as number) > previousSequence);
+    assert.equal(restored.message.nativeSession && (restored.message.nativeSession as { sessionId: string }).sessionId, native.sessionId);
+    sticky = (globalThis as Record<PropertyKey, unknown>)[SESSION_HOST_STICKY_STATE_KEY] as { shutdownRequested?: boolean };
+    assert.equal(sticky.shutdownRequested, false, "reload restores the nonterminal reporter incarnation");
+    await reloaded.trigger("session_shutdown", { type: "session_shutdown" }, ctx);
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" }, ctx);
+  });
+
+  it("does not shut down through a reporter socket destroyed by a public getter", async () => {
+    const server = await startTestServer();
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => "shutdown-getter-destroy-session",
+      getSessionName: () => undefined,
+      getEntries: () => [],
+    };
+    let reporterSocket: net.Socket | undefined;
+    const { testPi, ctx, bootstrap } = await startSession({
+      server,
+      sessionManager,
+      reporterOptions: { onSocket: (candidate) => { reporterSocket = candidate; } },
+    });
+    const status = await server.waitForFrame((frame) => frame.message.type === "status");
+    const native = status.message.nativeSession as { sessionId: string; epoch: number };
+    let shutdownCalls = 0;
+    let abortCalls = 0;
+    ctx.isIdle = () => false;
+    ctx.abort = () => { abortCalls += 1; };
+    Object.defineProperty(ctx, "shutdown", {
+      configurable: true,
+      get() {
+        reporterSocket?.destroy();
+        return () => { shutdownCalls += 1; };
+      },
+    });
+
+    server.sendToClients(encodeFrame(makeShutdownRequest(bootstrap, native.sessionId, native.epoch) as never));
+    await sleep(40);
+    assert.equal(reporterSocket?.destroyed, true);
+    assert.equal(shutdownCalls, 0, "a synchronously destroyed owned socket cannot authorize shutdown");
+    assert.equal(abortCalls, 0);
+    assert.equal(server.frames.some((frame) => frame.message.type === "shutdown_result"), false);
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" }, ctx);
+  });
+
+  it("does not abort busy work when public shutdown destroys its reporter socket", async () => {
+    const server = await startTestServer();
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => "shutdown-during-call-destroy-session",
+      getSessionName: () => undefined,
+      getEntries: () => [],
+    };
+    let reporterSocket: net.Socket | undefined;
+    const { testPi, ctx, bootstrap } = await startSession({
+      server,
+      sessionManager,
+      reporterOptions: { onSocket: (candidate) => { reporterSocket = candidate; } },
+    });
+    const status = await server.waitForFrame((frame) => frame.message.type === "status");
+    const native = status.message.nativeSession as { sessionId: string; epoch: number };
+    let shutdownCalls = 0;
+    let abortCalls = 0;
+    ctx.isIdle = () => false;
+    ctx.shutdown = () => {
+      shutdownCalls += 1;
+      reporterSocket?.destroy();
+    };
+    ctx.abort = () => { abortCalls += 1; };
+
+    server.sendToClients(encodeFrame(makeShutdownRequest(bootstrap, native.sessionId, native.epoch) as never));
+    await sleep(40);
+    assert.equal(shutdownCalls, 1);
+    assert.equal(reporterSocket?.destroyed, true);
+    assert.equal(abortCalls, 0, "destroyed ownership prevents the follow-up public abort");
+    assert.equal(server.frames.some((frame) => frame.message.type === "shutdown_result"), false);
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" }, ctx);
+  });
+
+  it("rechecks ownership after reentrant public getters and withholds acknowledgements after teardown", async () => {
+    const server = await startTestServer();
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => "reentrant-shutdown-session",
+      getSessionName: () => undefined,
+      getEntries: () => [],
+    };
+    const { testPi, ctx, bootstrap } = await startSession({ server, sessionManager });
+    let oldCalls = 0;
+    let newCalls = 0;
+    const status = await server.waitForFrame((frame) => frame.message.type === "status");
+    const native = status.message.nativeSession as { sessionId: string; epoch: number };
+    const replacement = makeCtx(makeUi().ui, "tui", () => true);
+    replacement.sessionManager = sessionManager;
+    replacement.shutdown = () => { newCalls += 1; };
+    replacement.abort = () => undefined;
+    Object.defineProperty(ctx, "shutdown", {
+      configurable: true,
+      get() {
+        // A reentrant new-session event replaces the current context and socket
+        // while this old context's API getter is being evaluated.
+        void testPi.trigger("session_start", { type: "session_start", reason: "reentrant" }, replacement);
+        return () => { oldCalls += 1; };
+      },
+    });
+    server.sendToClients(encodeFrame(makeShutdownRequest(bootstrap, native.sessionId, native.epoch) as never));
+    await server.waitForFrame((frame) =>
+      frame.message.type === "hello" && server.frames.filter((entry) => entry.message.type === "hello").length >= 2,
+    );
+    assert.equal(oldCalls, 0, "stale context getter re-entry prevents old-context shutdown");
+    assert.equal(newCalls, 0, "a request for the old session is not redirected to its replacement");
+    assert.equal(server.frames.some((frame) => frame.message.type === "shutdown_result"), false, "stale connection gets no acknowledgement");
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" }, replacement);
+  });
+
+  it("does not fabricate a shutdown acknowledgement when native teardown precedes it", async () => {
+    const server = await startTestServer();
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => "teardown-before-ack-session",
+      getSessionName: () => undefined,
+      getEntries: () => [],
+    };
+    const { testPi, ctx, bootstrap } = await startSession({ server, sessionManager });
+    const status = await server.waitForFrame((frame) => frame.message.type === "status");
+    const native = status.message.nativeSession as { sessionId: string; epoch: number };
+    ctx.isIdle = () => true;
+    ctx.shutdown = () => {
+      (testPi.hooks.get("session_shutdown")?.[0] as (...args: unknown[]) => unknown)({ type: "session_shutdown" }, ctx);
+    };
+    server.sendToClients(encodeFrame(makeShutdownRequest(bootstrap, native.sessionId, native.epoch) as never));
+    await sleep(40);
+    assert.equal(server.frames.some((frame) => frame.message.type === "shutdown_result"), false);
+    assert.equal(server.connections, 1, "session_shutdown tears down the reporter transport but is not a PTY-exit witness");
+  });
+
+  it("bounds shutdown acknowledgements under writable backpressure before further side effects", async () => {
+    const fakeServer = { socketPath: join(process.cwd(), "unused-memory-shutdown.sock") } as TestServer;
+    const memory = createMemoryReporterSocket();
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => "backpressure-shutdown-session",
+      getSessionName: () => undefined,
+      getEntries: () => [],
+    };
+    const { testPi, ctx, bootstrap } = await startSession({
+      server: fakeServer,
+      sessionManager,
+      reporterOptions: { connectSocket: () => memory.socket },
+    });
+    let shutdownCalls = 0;
+    ctx.isIdle = () => true;
+    ctx.shutdown = () => { shutdownCalls += 1; };
+    memory.socket.emit("connect");
+    const initial = memory.frames.find((frame) => frame.type === "status");
+    assert.ok(initial?.type === "status" && initial.nativeSession);
+
+    let shutdownAckWrites = 0;
+    memory.setWritePolicy((frame) => {
+      if (frame.type !== "shutdown_result") return true;
+      shutdownAckWrites += 1;
+      return shutdownAckWrites !== 1;
+    });
+    const queueLimit = reporterTest.MAX_QUEUED_RENAME_ACKS;
+    const requests = Array.from({ length: queueLimit + 2 }, () => encodeFrame(makeShutdownRequest(
+      bootstrap,
+      initial.nativeSession!.sessionId,
+      initial.nativeSession!.epoch,
+    ) as never));
+    memory.socket.emit("data", Buffer.from(requests.join(""), "utf8"));
+    assert.equal(shutdownCalls, 1, "terminal shutdown is invoked only once while replies queue");
+    assert.equal(shutdownAckWrites, 1, "queued replies do not bypass the writable backpressure signal");
+    assert.equal(memory.socket.destroyed, true, "queue exhaustion closes the authenticated channel");
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" }, ctx);
   });
 
   it("fences old reporter commands and epochs immediately across /reload", async () => {
@@ -2069,6 +2576,21 @@ describe("session-host bootstrap preload", () => {
 
   const CHILD_MAIN_SOURCE = [
     "const assert = require(\"node:assert/strict\");",
+    "const net = require(\"node:net\");",
+    "const originalConnect = net.Socket.prototype.connect;",
+    "net.Socket.prototype.connect = function (...args) {",
+    "  const relative = process.env.SH_TEST_RELATIVE_SOCKET;",
+    "  const normalized = Array.isArray(args[0]);",
+    "  const options = normalized ? args[0][0] : args[0];",
+    "  if (relative && typeof options === \"string\") {",
+    "    const replacement = { path: relative };",
+    "    if (normalized) args[0][0] = replacement; else args[0] = replacement;",
+    "  } else if (relative && options && typeof options === \"object\" && typeof options.path === \"string\") {",
+    "    const replacement = { ...options, path: relative };",
+    "    if (normalized) args[0][0] = replacement; else args[0] = replacement;",
+    "  }",
+    "  return originalConnect.apply(this, args);",
+    "};",
     "(async () => {",
     "  const reporter = require(process.env.SH_TEST_REPORTER);",
     "  assert.equal(process.env.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP, undefined, \"bootstrap consumed pre-main\");",
@@ -2118,6 +2640,7 @@ describe("session-host bootstrap preload", () => {
       else childEnv[NODE_OPTIONS_RESTORE_ENV] = restoreFrame;
       childEnv[HOST_BOOTSTRAP_ENV] = JSON.stringify(options.bootstrap);
       childEnv.SH_TEST_MARKER = marker;
+      childEnv.SH_TEST_RELATIVE_SOCKET = rootRelativeSocketAddress(options.bootstrap.socketPath as string);
       childEnv.SH_TEST_REPORTER = options.reporterPath ?? REPORTER_PATH;
       childEnv.SH_TEST_ORIGINAL_NODE_OPTIONS = options.expectedNodeOptionsFor(userFixture);
       childEnv.SH_TEST_INSTANCE_ID = options.bootstrap.instanceId as string;

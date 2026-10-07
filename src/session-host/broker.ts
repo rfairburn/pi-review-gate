@@ -11,8 +11,12 @@
  * bounded stream of newline-delimited JSON status frames from each
  * authenticated reporter connection and forwards sanitized snapshot callbacks
  * to that registration's handlers. Registrations can issue bounded native
- * rename requests whose acknowledgements are fenced to the live connection,
- * unique request ID, and expected native session ID/epoch.
+ * rename requests and process-scoped graceful-shutdown requests whose
+ * acknowledgements are fenced to the live connection, unique request ID, and
+ * expected native session ID/epoch. A
+ * shutdown acknowledgement means only that public shutdown was requested;
+ * the manager must still observe the owned PTY's actual onExit before treating
+ * the process as exited.
  *
  * Safety contract (fail closed):
  *
@@ -74,6 +78,8 @@ import {
   type SessionHostNativeSession,
   type SessionHostRenameAck,
   type SessionHostRenameRequest,
+  type SessionHostShutdownAck,
+  type SessionHostShutdownRequest,
   type SessionHostStatus,
   MAX_STATUS_FRAME_BYTES,
   PROTOCOL_VERSION,
@@ -82,6 +88,7 @@ import {
   isValidNativeSessionId,
   isValidRenameName,
   parseBootstrap,
+  parseShutdownAck,
 } from "./protocol";
 
 /** Options accepted by {@link createStatusBroker}. */
@@ -104,6 +111,12 @@ export interface StatusRegistration {
   bootstrap: SessionHostBootstrap;
   /** Authenticated rename, fenced by the last observed native session ID and epoch. */
   rename: (request: StatusRenameRequest) => Promise<StatusRenameResult>;
+  /**
+   * Terminal/idempotent shutdown for this owned process registration, fenced
+   * to its latest observed session tuple. `requested` is not process exit;
+   * the manager must wait for the owned PTY's actual `onExit` result.
+   */
+  shutdown: () => Promise<StatusShutdownResult>;
   /** Releases the registration: closes its active connection silently, rejects later hellos. */
   release: () => void;
 }
@@ -138,6 +151,14 @@ export interface StatusRenameResult {
   observedSessionEpoch: number | null;
 }
 
+export type StatusShutdownStatus = "requested" | "rejected" | "unavailable" | "busy" | "timeout" | "disconnected";
+
+/** No capability token, conversation content, tool data, or prompt-derived name is exposed. */
+export interface StatusShutdownResult {
+  requestId: string;
+  status: StatusShutdownStatus;
+}
+
 /** The broker facade consumed by the future session-host manager. */
 export interface StatusBroker {
   /** Absolute path of the broker-owned Unix socket (already bound). */
@@ -156,8 +177,12 @@ const MAX_PENDING_UNAUTH_CONNECTIONS = 32;
 /** Short authentication deadline; later a connection without a valid hello is closed. */
 const AUTH_DEADLINE_MS = 2000;
 const RENAME_TIMEOUT_MS = 5000;
+const SHUTDOWN_TIMEOUT_MS = 5000;
 const MAX_PENDING_RENAMES = 4;
+const MAX_PENDING_SHUTDOWNS = 1;
+const MAX_PENDING_CONTROL_FRAMES = 4;
 const MAX_COMPLETED_RENAME_IDS = 64;
+const MAX_COMPLETED_SHUTDOWN_IDS = 64;
 
 /**
  * Conservative cap on the broker socket path length in UTF-8 bytes. macOS
@@ -190,6 +215,9 @@ interface RegistrationRecord {
   latestNativeSession: SessionHostNativeSession | null;
   pendingRenames: Map<string, PendingRename>;
   completedRenameIds: Set<string>;
+  pendingShutdowns: Map<string, PendingShutdown>;
+  completedShutdownIds: Set<string>;
+  shutdownResult: Promise<StatusShutdownResult> | undefined;
   active: ConnectionState | undefined;
   handlers: StatusBrokerStatusHandlers;
 }
@@ -199,6 +227,13 @@ interface PendingRename {
   request: SessionHostRenameRequest;
   timer: NodeJS.Timeout;
   resolve: (result: StatusRenameResult) => void;
+}
+
+interface PendingShutdown {
+  connection: ConnectionState;
+  request: SessionHostShutdownRequest;
+  timer: NodeJS.Timeout;
+  resolve: (result: StatusShutdownResult) => void;
 }
 
 /** Per-socket connection state machine (awaiting hello -> active -> closed). */
@@ -215,7 +250,7 @@ interface ConnectionState {
   registration: RegistrationRecord | undefined;
   /** True while counted against the unauthenticated backlog bound. */
   pending: boolean;
-  /** At most four bounded rename frames are coalesced into one socket write per turn. */
+  /** At most four bounded rename/shutdown control frames are coalesced per socket write turn. */
   renameWriteQueue: string[];
   renameWriteScheduled: boolean;
 }
@@ -250,8 +285,38 @@ function classifyRenameAck(
   return "matching";
 }
 
-/** Narrow pure seam for protocol policy tests; the broker uses the same predicate. */
-export const __test = Object.freeze({ classifyRenameAck });
+type ShutdownAckClassification = "matching" | "stale-session" | "invalid";
+
+function classifyShutdownAck(
+  ack: SessionHostShutdownAck,
+  expected: Pick<SessionHostShutdownRequest, "requestId" | "expectedSessionId" | "expectedSessionEpoch">,
+  instanceId: string,
+  generation: string,
+  latestNativeSession: SessionHostNativeSession | null,
+): ShutdownAckClassification {
+  if (!timingSafeTextEqual(ack.instanceId, instanceId)
+    || !timingSafeTextEqual(ack.generation, generation)
+    || ack.requestId !== expected.requestId
+    || ack.expectedSessionId !== expected.expectedSessionId
+    || ack.expectedSessionEpoch !== expected.expectedSessionEpoch) return "invalid";
+  if (ack.outcome === "requested"
+    && (!latestNativeSession
+      || latestNativeSession.sessionId !== ack.expectedSessionId
+      || latestNativeSession.epoch !== ack.expectedSessionEpoch)) return "stale-session";
+  return "matching";
+}
+
+/** Test-only override allows root-bound fixtures to express the same local path relatively. */
+let socketPathLimitForTests: number | undefined;
+
+/** Narrow seams for protocol policy tests and root-bound socket fixtures. */
+export const __test = Object.freeze({
+  classifyRenameAck,
+  classifyShutdownAck,
+  setSocketPathLimitForTests(limit: number | undefined): void {
+    socketPathLimitForTests = limit;
+  },
+});
 
 /**
  * Canonicalizes the optional socket root: it must be an absolute, existing,
@@ -427,6 +492,9 @@ class LocalStatusBroker implements StatusBroker {
       latestNativeSession: null,
       pendingRenames: new Map(),
       completedRenameIds: new Set(),
+      pendingShutdowns: new Map(),
+      completedShutdownIds: new Set(),
+      shutdownResult: undefined,
       active: undefined,
       handlers,
     };
@@ -441,6 +509,7 @@ class LocalStatusBroker implements StatusBroker {
     return {
       bootstrap,
       rename: (request) => this.#rename(record, request),
+      shutdown: () => this.#shutdown(record),
       release: () => this.#releaseRegistration(record),
     };
   }
@@ -522,9 +591,57 @@ class LocalStatusBroker implements StatusBroker {
     });
   }
 
+  #shutdown(record: RegistrationRecord): Promise<StatusShutdownResult> {
+    if (record.shutdownResult) return record.shutdownResult;
+    const requestId = randomUUID();
+    const result = (status: StatusShutdownStatus): StatusShutdownResult => ({ requestId, status });
+    if (record.released || this.#disposed) return Promise.resolve(result("disconnected"));
+    const session = record.latestNativeSession;
+    if (!session) return Promise.resolve(result("unavailable"));
+    const connection = record.active;
+    if (!connection || !connection.authed || connection.destroyed || connection.superseded) {
+      return Promise.resolve(result("disconnected"));
+    }
+    if (record.pendingShutdowns.size >= MAX_PENDING_SHUTDOWNS
+      || connection.renameWriteQueue.length >= MAX_PENDING_CONTROL_FRAMES) return Promise.resolve(result("busy"));
+
+    const command: SessionHostShutdownRequest = {
+      version: PROTOCOL_VERSION,
+      type: "shutdown_request",
+      instanceId: record.instanceId,
+      generation: this.generation,
+      token: record.token,
+      requestId,
+      expectedSessionId: session.sessionId,
+      expectedSessionEpoch: session.epoch,
+    };
+    const promise = new Promise<StatusShutdownResult>((resolve) => {
+      const timer = setTimeout(() => {
+        const pending = record.pendingShutdowns.get(requestId);
+        if (pending) {
+          this.#settleShutdown(record, pending, result("timeout"));
+          // A silent peer may still have an unbounded kernel-side write queue;
+          // retire that authenticated channel before accepting more commands.
+          this.#destroyConnection(connection);
+        }
+      }, SHUTDOWN_TIMEOUT_MS);
+      timer.unref?.();
+      const pending: PendingShutdown = { connection, request: command, timer, resolve };
+      record.pendingShutdowns.set(requestId, pending);
+      try {
+        this.#queueRenameFrame(connection, encodeFrame(command));
+      } catch {
+        this.#settleShutdown(record, pending, result("disconnected"));
+        this.#destroyConnection(connection);
+      }
+    });
+    record.shutdownResult = promise;
+    return promise;
+  }
+
   #queueRenameFrame(connection: ConnectionState, frame: string): void {
-    if (connection.destroyed || connection.superseded || connection.renameWriteQueue.length >= MAX_PENDING_RENAMES) {
-      throw new Error("rename transport unavailable");
+    if (connection.destroyed || connection.superseded || connection.renameWriteQueue.length >= MAX_PENDING_CONTROL_FRAMES) {
+      throw new Error("control transport unavailable");
     }
     connection.renameWriteQueue.push(frame);
     if (connection.renameWriteScheduled) return;
@@ -566,6 +683,26 @@ class LocalStatusBroker implements StatusBroker {
     }
   }
 
+  #rememberCompletedShutdown(record: RegistrationRecord, requestId: string): void {
+    record.completedShutdownIds.add(requestId);
+    if (record.completedShutdownIds.size > MAX_COMPLETED_SHUTDOWN_IDS) {
+      const oldest = record.completedShutdownIds.values().next().value as string | undefined;
+      if (oldest) record.completedShutdownIds.delete(oldest);
+    }
+  }
+
+  #settleShutdown(record: RegistrationRecord, pending: PendingShutdown, result: StatusShutdownResult): void {
+    if (record.pendingShutdowns.get(pending.request.requestId) !== pending) return;
+    record.pendingShutdowns.delete(pending.request.requestId);
+    clearTimeout(pending.timer);
+    this.#rememberCompletedShutdown(record, pending.request.requestId);
+    try {
+      pending.resolve(result);
+    } catch {
+      // A consumer's Promise machinery is outside the transport contract.
+    }
+  }
+
   #failPendingRenames(record: RegistrationRecord, connection: ConnectionState, status: "disconnected"): void {
     connection.renameWriteQueue.length = 0;
     for (const pending of [...record.pendingRenames.values()]) {
@@ -576,6 +713,14 @@ class LocalStatusBroker implements StatusBroker {
           expectedSessionId: pending.request.expectedSessionId,
           expectedSessionEpoch: pending.request.expectedSessionEpoch,
           ...this.#observedTuple(record),
+        });
+      }
+    }
+    for (const pending of [...record.pendingShutdowns.values()]) {
+      if (pending.connection === connection) {
+        this.#settleShutdown(record, pending, {
+          requestId: pending.request.requestId,
+          status,
         });
       }
     }
@@ -868,6 +1013,8 @@ class LocalStatusBroker implements StatusBroker {
       this.#onStatus(conn, message);
     } else if (message.type === "rename_result") {
       this.#onRenameAck(conn, message);
+    } else if (message.type === "shutdown_result") {
+      this.#onShutdownAck(conn, message);
     } else {
       this.#destroyConnection(conn); // Reporter processes may never issue host commands.
     }
@@ -1004,6 +1151,41 @@ class LocalStatusBroker implements StatusBroker {
     });
   }
 
+  #onShutdownAck(conn: ConnectionState, ack: SessionHostShutdownAck): void {
+    const record = conn.registration;
+    if (!record || !conn.authed || conn.superseded || record.released || record.active !== conn) {
+      this.#destroyConnection(conn);
+      return;
+    }
+    const pending = record.pendingShutdowns.get(ack.requestId);
+    if (!pending) {
+      // A timed-out/settled request may produce one late response. It can
+      // never satisfy a later request or be interpreted as process exit.
+      if (record.completedShutdownIds.has(ack.requestId)) return;
+      this.#destroyConnection(conn);
+      return;
+    }
+    if (pending.connection !== conn) {
+      this.#destroyConnection(conn);
+      return;
+    }
+    const classification = classifyShutdownAck(
+      ack,
+      pending.request,
+      record.instanceId,
+      this.generation,
+      record.latestNativeSession,
+    );
+    if (classification === "invalid") {
+      this.#destroyConnection(conn);
+      return;
+    }
+    this.#settleShutdown(record, pending, {
+      requestId: ack.requestId,
+      status: classification === "stale-session" ? "rejected" : ack.outcome,
+    });
+  }
+
   /** Ends a connection; the close handler decides what (if anything) is reported. */
   #destroyConnection(conn: ConnectionState): void {
     if (conn.destroyed) return;
@@ -1068,6 +1250,12 @@ class LocalStatusBroker implements StatusBroker {
         ...this.#observedTuple(record),
       });
     }
+    for (const pending of [...record.pendingShutdowns.values()]) {
+      this.#settleShutdown(record, pending, {
+        requestId: pending.request.requestId,
+        status: "disconnected",
+      });
+    }
     record.active = undefined;
     this.#registrations.delete(record.instanceId);
   }
@@ -1099,7 +1287,7 @@ export async function createStatusBroker(options: StatusBrokerOptions = {}): Pro
   const socketPath = join(transportDir, SOCKET_FILENAME);
   // macOS Unix-socket path length (~100 bytes of usable sun_path) is the
   // real limit, not the protocol's 2048-byte validation bound; fail clearly.
-  if (Buffer.byteLength(socketPath, "utf8") > MAX_SOCKET_PATH_BYTES) {
+  if (Buffer.byteLength(socketPath, "utf8") > (socketPathLimitForTests ?? MAX_SOCKET_PATH_BYTES)) {
     removeOwnEmptyDirectory(transportDir, transportIdentity);
     throw new Error(
       `pi-review-gate: the session-host status socket path exceeds the ${MAX_SOCKET_PATH_BYTES}-byte OS Unix-socket limit; pass a shorter socketRoot`,

@@ -727,7 +727,7 @@ test("a configured Delete toggle keeps its identity and exposes x as the removal
   assert.deepEqual(harness.focusedActions().at(-1), { type: "visibility", visible: false });
 });
 
-test("arrows select roster items then New session and Quit host with wrap", () => {
+test("arrows select roster items then Saved conversations, New session, and Quit host with wrap", () => {
   const harness = makeRoster(["a", "b"]);
   harness.send(DOWN); // New session -> Quit host
   assert.equal(harness.controller.selectedId, undefined); // on quit row
@@ -735,7 +735,9 @@ test("arrows select roster items then New session and Quit host with wrap", () =
   assert.deepEqual(harness.controller.selectedId, "a");
   harness.send(DOWN);
   assert.deepEqual(harness.controller.selectedId, "b");
-  harness.send(DOWN); // b -> New session
+  harness.send(DOWN); // b -> Saved conversations
+  assert.equal(harness.controller.selectedId, undefined);
+  harness.send(DOWN); // -> New session
   assert.equal(harness.controller.selectedId, undefined);
   harness.send(DOWN); // -> Quit host
   assert.equal(harness.controller.selectedId, undefined);
@@ -743,9 +745,11 @@ test("arrows select roster items then New session and Quit host with wrap", () =
   assert.deepEqual(harness.controller.selectedId, "a");
   harness.send(UP); // a wraps backwards to Quit host
   assert.equal(harness.controller.selectedId, undefined);
-  harness.send(UP); // Quit -> New session? (b is before New; up from quit)
-  assert.equal(harness.controller.selectedId, undefined); // New session
-  harness.send(UP);
+  harness.send(UP); // Quit -> New session
+  assert.equal(harness.controller.selectedId, undefined);
+  harness.send(UP); // New -> Saved conversations
+  assert.equal(harness.controller.selectedId, undefined);
+  harness.send(UP); // Saved -> b
   assert.deepEqual(harness.controller.selectedId, "b");
 });
 
@@ -1071,7 +1075,8 @@ test("create is single-shot, completion closes New without activating the new ro
   assert.equal(harness.controller.selectedId, undefined);
   harness.controller.updateItems([makeItem({ id: "a" }), makeItem({ id: "spawned", lifecycle: "starting", busy: null })]);
   assert.equal(harness.controller.selectedId, "spawned");
-  harness.send(DOWN);
+  harness.send(DOWN); // spawned -> Saved conversations
+  harness.send(DOWN); // -> New session
   harness.send(ENTER);
   harness.send("/next");
   harness.send(ENTER);
@@ -1109,7 +1114,8 @@ test("Edit starts with a separate empty replacement field and emits the observed
   const rosterText = assertPaneSafe(harness.controller.renderRoster(48, 10).lines, 48, 10).join("\n");
   assert.ok(rosterText.includes("Observed title"));
   assert.ok(!rosterText.includes("stale row label"), "validated native metadata is authoritative over an old display label");
-  harness.send(UP); // highlight the existing row, not New
+  harness.send(UP); // New -> Saved conversations
+  harness.send(UP); // -> the existing row, not a picker entry
   harness.send("e");
   const edit = harness.focusedActions().at(-1);
   assert.deepEqual(edit, { type: "edit", id: "a", nativeSession: tuple });
@@ -1551,7 +1557,7 @@ test("32-column roster reserves lifecycle, AGENT, and input status before long l
     makeItem({ id: "exited", label: "E".repeat(80), lifecycle: "exited", exitCode: 3 }),
     makeItem({ id: "error", label: "障害".repeat(20), lifecycle: "error", exitCode: 1 }),
   ]);
-  const view = rosterView(harness.controller, 32, 10);
+  const view = rosterView(harness.controller, 32, 12);
   assert.ok(view.texts[1]?.includes("[AGENT: running]"));
   assert.ok(view.texts[1]?.includes("[input]"));
   assert.ok(view.texts[2]?.includes("セ"));
@@ -1560,7 +1566,7 @@ test("32-column roster reserves lifecycle, AGENT, and input status before long l
   assert.ok(view.texts[3]?.includes("[exited (code 3)]"));
   assert.ok(view.texts[4]?.includes("[error (code 1)]"));
   assert.ok(view.texts.every((line) => visibleWidth(line) <= 32));
-  assert.equal(view.lines.length, 10);
+  assert.equal(view.lines.length, 12);
   assert.ok(!view.texts[1]?.includes("A".repeat(20)));
   assert.ok(!view.texts[2]?.includes("セッション".repeat(3)));
 });
@@ -1743,4 +1749,298 @@ test("module purity: no process, fs, network, or TerminalSurface coupling", () =
   ]) {
     assert.ok(!source.includes(banned), `sidebar must not reference ${banned}`);
   }
+});
+// ---------------------------------------------------------------------------
+// Deliberate saved-conversation picker (issue 323)
+// ---------------------------------------------------------------------------
+
+const SAVED_ROWS = [
+  { id: "conv-1", file: "/agents/a/sessions/proj/one.jsonl", caption: "First conversation" },
+  { id: "conv-2", file: "/agents/a/sessions/proj/two.jsonl", caption: "Second conversation" },
+] as const;
+
+/** Opens the saved-conversation picker from a roster with the given items. */
+function savedPaneWith(ids: string[] = [], options: SidebarControllerOptions = {}): RosterHarness {
+  const harness = makeRoster(ids, options);
+  // Default selection is "new"; one UP lands on the saved entry.
+  harness.send(UP);
+  assert.equal(harness.controller.focus, "sidebar");
+  harness.send(ENTER);
+  assert.equal(harness.controller.focus, "form", "the picker occupies the form pane slot");
+  const action = harness.sinceActions().at(-1);
+  assert.ok(action !== undefined && action.type === "saved-list", `expected saved-list, got ${JSON.stringify(action)}`);
+  harness.baseline = harness.actions.length;
+  return harness;
+}
+
+function savedView(harness: RosterHarness, cols = 40, rows = 10): string[] {
+  const lines = harness.controller.render(cols, rows).lines;
+  return assertPaneSafe(lines, cols, rows);
+}
+
+test("saved picker lists, highlights without acting, and opens a deliberate saved-open", () => {
+  const harness = savedPaneWith(["a"]);
+  const listAction = harness.actions.at(-1);
+  assert.ok(listAction?.type === "saved-list");
+  const requestId = listAction!.type === "saved-list" ? listAction.requestId : -1;
+
+  // Loading state is truthful while the listing is outstanding.
+  assert.ok(savedView(harness).some((line) => line.includes("Loading saved conversations...")));
+
+  harness.controller.completeSavedList(requestId, [...SAVED_ROWS], 0);
+  const texts = savedView(harness);
+  assert.ok(texts.some((line) => line.includes("Saved conversations")));
+  assert.ok(texts.some((line) => line.includes("> First conversation")), "first row highlighted by default");
+  assert.ok(texts.some((line) => line.includes("Second conversation")));
+
+  // Highlighting rows does nothing to any session: navigation emits no actions.
+  harness.send(DOWN);
+  harness.send(UP);
+  assert.deepEqual(harness.sinceActions(), [], "arrows never emit actions");
+
+  // Deliberate Enter opens the highlighted row exactly once.
+  harness.send(ENTER);
+  const open = harness.sinceActions().at(-1);
+  assert.deepEqual(open, { type: "saved-open", requestId: requestId + 1, file: SAVED_ROWS[0].file, sessionId: "conv-1" });
+
+  // A second Enter while the open is pending is refused with a notice.
+  harness.send(ENTER);
+  assert.equal(harness.sinceActions().length, 1, "no duplicate saved-open");
+  assert.ok(savedView(harness).join(" ").replace(/\s+/g, " ").includes("A saved conversation is already starting"));
+
+  // Completion highlights the new row without transferring input ownership.
+  harness.controller.updateItems([makeItem({ id: "a" }), makeItem({ id: "new-row" })]);
+  harness.controller.completeSavedOpen(requestId + 1, "new-row");
+  assert.equal(harness.controller.focus, "sidebar", "focus returns to the roster, not main");
+  assert.equal(harness.controller.selectedId, "new-row", "the new row is highlighted only");
+});
+
+test("saved picker fencing: stale listings and late completions never seize the pane", () => {
+  const harness = savedPaneWith();
+  const first = harness.actions.at(-1);
+  assert.ok(first?.type === "saved-list");
+  const r1 = first!.type === "saved-list" ? first.requestId : -1;
+
+  // Dismiss while the listing is pending: cancel is emitted, roster restored.
+  harness.send(ESC);
+  assert.deepEqual(harness.sinceActions(), [{ type: "saved-cancel", requestId: r1 }]);
+  assert.equal(harness.controller.focus, "sidebar");
+  assert.ok(savedView(harness).some((line) => line.includes("Sessions (0)")));
+
+  // Reopen (the saved entry is still highlighted): the stale first listing
+  // is fenced; only the new request counts.
+  harness.send(ENTER);
+  const second = harness.sinceActions().at(-1);
+  assert.ok(second?.type === "saved-list");
+  const r2 = second!.type === "saved-list" ? second.requestId : -1;
+  assert.equal(harness.controller.completeSavedList(r1, [...SAVED_ROWS], 0), false, "stale listing is ignored");
+  assert.equal(harness.controller.completeSavedList(r2, [SAVED_ROWS[1]], 0), true);
+  const texts = savedView(harness);
+  assert.ok(texts.some((line) => line.includes("Second conversation")));
+  assert.ok(!texts.some((line) => line.includes("First conversation")));
+
+  // A late open completion after dismissal never highlights or steals focus.
+  harness.send(ENTER);
+  const open = harness.sinceActions().at(-1);
+  assert.ok(open?.type === "saved-open");
+  const r3 = open!.type === "saved-open" ? open.requestId : -1;
+  harness.send(ESC); // dismiss while the open is pending
+  assert.equal(harness.controller.focus, "sidebar");
+  harness.controller.completeSavedOpen(r3, "ghost-row");
+  assert.equal(harness.controller.selectedId, undefined, "late completion never highlights");
+  assert.equal(harness.controller.focus, "sidebar");
+});
+
+test("saved picker shows truthful empty, unavailable, and partial issue-count notices", () => {
+  const harness = savedPaneWith();
+  const list = harness.actions.at(-1);
+  assert.ok(list?.type === "saved-list");
+  const r1 = list!.type === "saved-list" ? list.requestId : -1;
+
+  harness.controller.completeSavedList(r1, [], 0);
+  assert.ok(savedView(harness).some((line) => line.includes("No saved conversations")));
+
+  // Unavailable: bounded sanitized notice (a hostile 500-char message with
+  // escape sequences is stripped and clipped before it can appear).
+  const second = savedPaneWith();
+  const r2 = second.actions.at(-1)!;
+  assert.equal(r2.type, "saved-list");
+  second.controller.failSavedList(r2.requestId, "boom \x1b[31m" + "xx ".repeat(150));
+  const texts = savedView(second, 40, 20);
+  assert.ok(texts.some((line) => line.includes("! boom")));
+  assert.ok(!texts.some((line) => line.includes("\x1b[31m")), "escape sequences are sanitized");
+  assert.ok(texts.join("").replace(/[^x]/g, "").length <= 300, "notice stays within the 300-codepoint bound");
+
+  // Partial: retained issue count is disclosed, not hidden.
+  const third = savedPaneWith();
+  const r3 = third.actions.at(-1)!;
+  assert.equal(r3.type, "saved-list");
+  third.controller.completeSavedList(r3.requestId, [...SAVED_ROWS], 3);
+  const partial = savedView(third);
+  assert.ok(partial.some((line) => line.includes("3 catalog issue(s) not shown")));
+
+  // Tiny geometry falls back to the truthful too-small pane.
+  assert.ok(savedView(harness, 24, 5).some((line) => line.includes("too small")));
+});
+
+test("saved picker: bracketed paste and Kitty repeats/releases never activate or dismiss", () => {
+  const harness = savedPaneWith();
+  const list = harness.actions.at(-1);
+  assert.ok(list?.type === "saved-list");
+  const r1 = list!.type === "saved-list" ? list.requestId : -1;
+  harness.controller.completeSavedList(r1, [...SAVED_ROWS], 0);
+
+  // A bracketed paste containing Enter is opaque: no activation.
+  harness.send("\x1b[200~\r\x1b[201~");
+  assert.deepEqual(harness.sinceActions(), [], "paste never activates a row");
+  assert.equal(harness.controller.focus, "form");
+
+  // Kitty repeat and release of Enter/Escape are inert.
+  harness.send("\x1b[13;1:2u"); // Enter repeat
+  harness.send("\x1b[13;1:3u"); // Enter release
+  harness.send("\x1b[27;1:2u"); // Escape repeat
+  harness.send("\x1b[27;1:3u"); // Escape release
+  assert.deepEqual(harness.sinceActions(), [], "repeats and releases never activate or dismiss");
+  assert.equal(harness.controller.focus, "form");
+
+  // The initial presses still work.
+  harness.send(ENTER);
+  assert.ok(harness.sinceActions().at(-1)?.type === "saved-open");
+});
+
+test("saved picker: reserved toggle dismisses like the other forms", () => {
+  const harness = savedPaneWith();
+  harness.send(ALT_LEFT_LEGACY);
+  assert.equal(harness.controller.visible, false, "toggle hides the pane");
+  assert.equal(harness.controller.focus, "main");
+  assert.ok(harness.sinceActions().some((action) => action.type === "visibility" && action.visible === false));
+});
+
+test("saved picker: roster Enter repeat does not re-open the picker", () => {
+  const harness = makeRoster(["a"]);
+  harness.send(UP); // new -> saved
+  assert.equal(harness.controller.focus, "sidebar");
+  harness.send("\x1b[13;1:2u"); // Enter repeat on the saved entry
+  assert.equal(harness.controller.focus, "sidebar", "repeat never opens the picker");
+  assert.deepEqual(harness.sinceActions(), []);
+  harness.send(ENTER); // initial press opens it
+  assert.equal(harness.controller.focus, "form");
+});
+
+test("held Enter after a completed saved-open never activates the highlighted row", () => {
+  const harness = savedPaneWith(["a"]);
+  const list = harness.actions.at(-1);
+  assert.ok(list?.type === "saved-list");
+  const r1 = list!.type === "saved-list" ? list.requestId : -1;
+  harness.controller.completeSavedList(r1, [...SAVED_ROWS], 0);
+
+  // The deliberate Enter opens the highlighted row.
+  harness.send(ENTER);
+  const open = harness.sinceActions().at(-1);
+  assert.ok(open?.type === "saved-open");
+  const r2 = open!.type === "saved-open" ? open.requestId : -1;
+
+  // Completion highlights the new row and returns to the roster.
+  harness.controller.updateItems([makeItem({ id: "a" }), makeItem({ id: "new-row" })]);
+  harness.controller.completeSavedOpen(r2, "new-row");
+  assert.equal(harness.controller.focus, "sidebar");
+  assert.equal(harness.controller.selectedId, "new-row");
+  harness.baseline = harness.actions.length;
+
+  // The held Enter's repeat and release must not activate the highlighted row.
+  harness.send("\x1b[13;1:2u"); // Enter repeat
+  harness.send("\x1b[13;1:3u"); // Enter release
+  assert.deepEqual(harness.sinceActions(), [], "repeat/release never transfer ownership");
+
+  // A fresh press is the explicit activation.
+  harness.send(ENTER);
+  assert.deepEqual(harness.sinceActions(), [{ type: "select", id: "new-row" }]);
+});
+
+test("streamed paste containing the toggle packet never dismisses the saved picker", () => {
+  const harness = savedPaneWith();
+  const list = harness.actions.at(-1);
+  assert.ok(list?.type === "saved-list");
+  void list.requestId;
+
+  // Streamed paste: start marker, a body chunk equal to the reserved toggle,
+  // then the end marker — every chunk stays opaque to the picker.
+  harness.send("\x1b[200~");
+  harness.send(ALT_LEFT_LEGACY);
+  harness.send("\x1b[201~");
+  assert.deepEqual(harness.sinceActions(), [], "paste body never dismisses or cancels");
+  assert.equal(harness.controller.focus, "form", "the picker stays open");
+
+  // A fresh toggle press outside any paste still dismisses.
+  harness.send(ALT_LEFT_LEGACY);
+  assert.equal(harness.controller.focus, "main");
+});
+
+test("saved picker distinguishes empty, failed, and issue-bearing zero-row listings", () => {
+  // Failed listing: the error notice is shown, never an empty-catalog claim.
+  const failed = savedPaneWith();
+  const rf = failed.actions.at(-1)!;
+  assert.equal(rf.type, "saved-list");
+  failed.controller.failSavedList(rf.requestId, "Saved conversations are unavailable in this host");
+  let texts = savedView(failed);
+  assert.ok(texts.some((line) => line.includes("unavailable")));
+  assert.ok(!texts.some((line) => line.includes("No saved conversations")), "failure is not an empty catalog");
+
+  // Issue-bearing zero rows: the listing succeeded but nothing could be listed.
+  const issues = savedPaneWith();
+  const ri = issues.actions.at(-1)!;
+  assert.equal(ri.type, "saved-list");
+  issues.controller.completeSavedList(ri.requestId, [], 2);
+  texts = savedView(issues);
+  assert.ok(texts.some((line) => line.includes("No conversations could be listed")));
+  assert.ok(!texts.some((line) => line.includes("No saved conversations")));
+
+  // Successful issue-free empty: the truthful empty notice.
+  const empty = savedPaneWith();
+  const re = empty.actions.at(-1)!;
+  assert.equal(re.type, "saved-list");
+  empty.controller.completeSavedList(re.requestId, [], 0);
+  texts = savedView(empty);
+  assert.ok(texts.some((line) => line.includes("No saved conversations")));
+});
+
+test("rename failure notices use set/verify wording, never persistence claims", () => {
+  const tuple = { sessionId: "session-123", epoch: 7, name: "Observed title" };
+  const harness = makeRoster(["a"]);
+  harness.controller.updateItems([makeItem({ id: "a", nativeSession: tuple })]);
+  harness.send(UP); // New -> Saved conversations
+  harness.send(UP); // -> the existing row
+  harness.send("e");
+  assert.equal(harness.controller.openEdit({ id: "a", nativeSession: tuple, currentName: tuple.name }), true);
+  harness.send("Replacement");
+  harness.send(ENTER);
+  const rename = harness.focusedActions().at(-1);
+  assert.ok(rename?.type === "rename");
+
+  harness.controller.completeRename(rename!.requestId, "setter-failed");
+  let text = savedView(harness, 60, 12).join(" ").replace(/\s+/g, " ");
+  assert.ok(text.includes("Pi could not set the new session name"), `setter notice: ${text}`);
+  assert.ok(!text.toLowerCase().includes("persist"), "no persistence claim on setter failure");
+
+  // The failed form retains its draft; resubmit for the verification-failed wording.
+  harness.send(ENTER);
+  const second = harness.focusedActions().at(-1);
+  assert.ok(second?.type === "rename");
+  harness.controller.completeRename(second!.requestId, "verification-failed");
+  text = savedView(harness, 60, 12).join(" ").replace(/\s+/g, " ");
+  assert.ok(text.includes("Pi could not verify the native session name"), `verification notice: ${text}`);
+  assert.ok(!text.toLowerCase().includes("persist"), "no persistence claim on verification failure");
+});
+
+test("saved picker footer shows the complete keyboard hints with tiny-terminal fallback", () => {
+  const harness = savedPaneWith(["a"]);
+  const list = harness.actions.at(-1);
+  assert.ok(list?.type === "saved-list");
+  harness.controller.completeSavedList(list!.requestId, [...SAVED_ROWS], 0);
+  const texts = savedView(harness, 48, 12).join(" ").replace(/\s+/g, " ");
+  for (const hint of ["toggle", "up/down select", "enter open", "esc back"]) {
+    assert.ok(texts.includes(hint), `missing hint ${hint} in: ${texts}`);
+  }
+  // Tiny geometry falls back to the truthful too-small pane.
+  assert.ok(savedView(harness, 20, 4).some((line) => line.includes("too small")));
 });

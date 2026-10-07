@@ -422,7 +422,7 @@ function isStaleHostCapabilityName(name: string): boolean {
 }
 
 /** Snapshot Windows env names case-insensitively without silently choosing conflicting values. */
-function snapshotNativeEnvironment(
+export function snapshotNativeEnvironment(
   source: NodeJS.ProcessEnv,
   platform: NodeJS.Platform,
 ): NodeJS.ProcessEnv {

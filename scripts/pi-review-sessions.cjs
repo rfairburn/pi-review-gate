@@ -5,13 +5,17 @@
  * Shared setup and runtime selection for the one-command session host
  * launchers (issue 323). The POSIX script and installed
  * `pi-review-sessions` bin dispatch here; the .cmd entry point also dispatches
- * here, but Windows remains fail-closed before setup until native ConPTY
- * integration is complete. No Windows host-parity claim is made.
+ * here. Windows setup and host admission use public Node APIs, but source-level
+ * implementation is not proof of native runtime support; real ConPTY and
+ * lifecycle validation remains a parent-owned Windows task.
  *
- * - Source checkouts are copied to a fresh owned stage, install unchanged
+ * - Source checkouts are copied to a fresh stage, install unchanged
  *   package-lock dependencies with npm ci, then build there. DDGS
  *   provisioning uses the shared Node helper (ensureDdgs in scripts/
- *   pi-review-gate-launcher.cjs) in a bounded subprocess group.
+ *   pi-review-gate-launcher.cjs) in a bounded owned process. Automatic stage
+ *   cleanup is disabled because root identity does not prove ownership of
+ *   npm/build/runtime descendants and complete per-entry creation receipts
+ *   with BigInt identities are not recorded.
  * - Runtime selection resolves the public @earendil-works/pi-coding-agent
  *   CLI without parsing or executing opaque shims: an explicit
  *   --pi-executable Node entry is honored when valid; otherwise the npm
@@ -23,7 +27,8 @@
  *   (<agent-dir>/.pi-review-gate/pi-runtime) with npm --ignore-scripts and
  *   re-validated before publication. Global installs and existing user
  *   files are never modified; failed or unknown cache resources are
- *   preserved, and staging cleanup requires the captured directory identity.
+ *   preserved, and staging trees are retained without complete per-entry
+ *   creation receipts.
  * - Probes and provisioning occur BEFORE the host broker/token exists, on a
  *   scrubbed setup environment (bootstrap/restore/settlement markers removed,
  *   role authorization rejected earlier), while trusted provider variables and
@@ -37,13 +42,17 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
-const { assertSessionHostStartupOptions } = require("./session-host-startup-options.cjs");
+const {
+  assertSessionHostStartupOptions,
+  snapshotSessionHostEnvironment,
+} = require("./session-host-startup-options.cjs");
 const gateLauncher = require("./pi-review-gate-launcher.cjs");
 
 const USAGE = `Usage: pi-review-sessions [--pi-executable <path>] [--state-root <path>] [--sidebar-key <key>] [--help] [-- <Pi arguments...>]
 
-Alpha POSIX macOS/Linux session host. Requires Node >=22.19.0 and Pi >=1.0.4
-with a positively identified Node CLI entry. Without --pi-executable the
+Alpha same-machine macOS/Linux session host with Windows source paths available
+for native validation only (not a Windows readiness claim). Requires Node >=22.19.0
+and Pi >=1.0.4 with a positively identified Node CLI entry. Without --pi-executable the
 launcher resolves the public @earendil-works/pi-coding-agent installation
 (npm global root, then PATH) and, when none is supported, provisions an
 isolated Pi 1.0.4 runtime cache under the native Pi agent directory; no
@@ -96,9 +105,6 @@ const NODE_ENTRY_HEAD_BYTES = 512;
 const MAX_SOURCE_DEPTH = 64;
 const MAX_SOURCE_FILES = 100_000;
 const MAX_SOURCE_BYTES = 2 * 1024 * 1024 * 1024;
-const MAX_STAGE_CLEANUP_DEPTH = 128;
-const MAX_STAGE_CLEANUP_ENTRIES = 200_000;
-const MAX_STAGE_CLEANUP_BYTES = 4 * 1024 * 1024 * 1024;
 const SOURCE_COPY_CHUNK_BYTES = 64 * 1024;
 let activeBoundedProcessCount = 0;
 
@@ -209,9 +215,16 @@ function statusCode(result, fallback = 1) {
   return fallback;
 }
 
+function hasPositiveIdentity(stats) {
+  return typeof stats.dev === "bigint" && stats.dev >= 0n
+    && typeof stats.ino === "bigint" && stats.ino > 0n;
+}
+
 function identityOfDirectory(target) {
   const stats = fs.lstatSync(target, { bigint: true });
-  if (!stats.isDirectory() || stats.isSymbolicLink()) throw new Error("not a regular directory");
+  if (!stats.isDirectory() || stats.isSymbolicLink() || !hasPositiveIdentity(stats)) {
+    throw new Error("directory identity is unavailable or unsafe");
+  }
   return { dev: stats.dev, ino: stats.ino };
 }
 
@@ -229,11 +242,11 @@ function ensureDirectoryTree(target) {
   const absolute = path.resolve(target);
   const parsed = path.parse(absolute);
   let current = parsed.root;
+  const chain = [{ target: current, identity: identityOfDirectory(current) }];
   for (const component of absolute.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
     current = path.join(current, component);
     try {
-      const stats = fs.lstatSync(current);
-      if (!stats.isDirectory() || stats.isSymbolicLink()) throw new Error("unsafe directory component");
+      identityOfDirectory(current);
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
       try {
@@ -241,10 +254,11 @@ function ensureDirectoryTree(target) {
       } catch (mkdirError) {
         if (mkdirError.code !== "EEXIST") throw mkdirError;
       }
-      const stats = fs.lstatSync(current);
-      if (!stats.isDirectory() || stats.isSymbolicLink()) throw new Error("unsafe directory component");
     }
+    chain.push({ target: current, identity: identityOfDirectory(current) });
+    if (!directoryChainIsSame(chain)) throw new Error("directory chain changed during setup");
   }
+  return chain;
 }
 
 /**
@@ -253,19 +267,35 @@ function ensureDirectoryTree(target) {
  * ownership. Existing paths are not adopted, removed, or traversed.
  */
 function createOwnedStage(parent, prefix, randomBytes = crypto.randomBytes) {
-  ensureDirectoryTree(parent);
+  const absoluteParent = path.resolve(parent);
+  const parentChain = ensureDirectoryTree(absoluteParent);
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const suffix = randomBytes(16).toString("hex");
-    const root = path.join(parent, `${prefix}${suffix}`);
+    const root = path.join(absoluteParent, `${prefix}${suffix}`);
     try {
       fs.mkdirSync(root, { mode: 0o700 });
     } catch (error) {
       if (error.code === "EEXIST") continue;
       throw error;
     }
-    // Capture identity immediately after successful exclusive creation.
-    const identity = identityOfDirectory(root);
-    return { root, identity };
+    // Capture identity immediately after successful exclusive creation, then
+    // fence the whole public-Node-observed parent chain before returning it.
+    // If identity itself is unavailable, ownership cannot be proven and this
+    // fresh stage is retained rather than unlinked by name.
+    let identity;
+    try {
+      identity = identityOfDirectory(root);
+    } catch (cause) {
+      cause.retainedStage = true;
+      throw cause;
+    }
+    const chain = [...parentChain, { target: root, identity }];
+    if (!directoryChainIsSame(chain)) {
+      const error = new Error("staging directory identity changed during creation");
+      error.retainedStage = true;
+      throw error;
+    }
+    return { root, identity, parentChain, chain };
   }
   throw new Error("could not exclusively create a unique staging directory");
 }
@@ -274,145 +304,15 @@ function directoryChainIsSame(chain) {
   return chain.every(({ target, identity }) => sameDirectoryIdentity(target, identity));
 }
 
-function removeOwnedTree(target, rootIdentity, root, budget, depth, ancestors = [], expectedEntry) {
-  if (path.basename(target) === ".terraform") return false;
-  if (depth > MAX_STAGE_CLEANUP_DEPTH) {
-    budget.exceeded = true;
-    return false;
-  }
-  budget.entries += 1;
-  if (budget.entries > MAX_STAGE_CLEANUP_ENTRIES) {
-    budget.exceeded = true;
-    return false;
-  }
-  if (target === root && !sameDirectoryIdentity(root, rootIdentity)) {
-    // A vanished root is already clean; a replacement is never ours to remove.
-    try {
-      fs.lstatSync(root);
-      return false;
-    } catch (error) {
-      return error.code === "ENOENT";
-    }
-  }
-  const activeChain = ancestors.length > 0 ? ancestors : [{ target: root, identity: rootIdentity }];
-  if (!directoryChainIsSame(activeChain)) return false;
-  let stats;
-  try {
-    stats = fs.lstatSync(target, { bigint: true });
-  } catch (error) {
-    if (error.code === "ENOENT") return true;
-    return false;
-  }
-  if (expectedEntry && !sameStatIdentity(stats, expectedEntry)) return false;
-  if (stats.isSymbolicLink()) {
-    try {
-      if (!directoryChainIsSame(activeChain)) return false;
-      const current = fs.lstatSync(target, { bigint: true });
-      if (!current.isSymbolicLink() || !sameStatIdentity(stats, current)) return false;
-      fs.unlinkSync(target);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-  if (!stats.isDirectory()) {
-    if (!stats.isFile()) return false;
-    if (stats.size > BigInt(MAX_STAGE_CLEANUP_BYTES - budget.bytes)) {
-      budget.exceeded = true;
-      return false;
-    }
-    budget.bytes += Number(stats.size);
-    try {
-      if (!directoryChainIsSame(activeChain)) return false;
-      const current = fs.lstatSync(target, { bigint: true });
-      if (!current.isFile() || current.isSymbolicLink() || !sameStatIdentity(stats, current)) return false;
-      fs.unlinkSync(target);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  const directoryIdentity = { dev: stats.dev, ino: stats.ino };
-  if (!directoryChainIsSame(activeChain) || !sameDirectoryIdentity(target, directoryIdentity)) return false;
-  const directoryChain = target === root
-    ? activeChain
-    : [...activeChain, { target, identity: directoryIdentity }];
-  let empty = true;
-  let directory;
-  try {
-    directory = fs.opendirSync(target);
-  } catch {
-    return false;
-  }
-  try {
-    for (;;) {
-      if (!directoryChainIsSame(directoryChain)) {
-        empty = false;
-        break;
-      }
-      const entry = directory.readSync();
-      if (!entry) break;
-      const name = entry.name;
-      budget.entries += 1;
-      if (budget.entries > MAX_STAGE_CLEANUP_ENTRIES) {
-        budget.exceeded = true;
-        empty = false;
-        break;
-      }
-      if (name === ".terraform") {
-        empty = false;
-        continue;
-      }
-      if (!directoryChainIsSame(directoryChain)) {
-        empty = false;
-        break;
-      }
-      const childPath = path.join(target, name);
-      let childStats;
-      try {
-        childStats = fs.lstatSync(childPath, { bigint: true });
-      } catch (error) {
-        if (error.code === "ENOENT") continue;
-        empty = false;
-        continue;
-      }
-      if (!directoryChainIsSame(directoryChain)) {
-        empty = false;
-        break;
-      }
-      if (!removeOwnedTree(childPath, rootIdentity, root, budget, depth + 1, directoryChain, childStats)) empty = false;
-      if (budget.exceeded) break;
-    }
-  } catch {
-    return false;
-  } finally {
-    closeDirectory(directory);
-  }
-  if (
-    !empty
-    || !directoryChainIsSame(activeChain)
-    || !sameDirectoryIdentity(target, directoryIdentity)
-  ) return false;
-  try {
-    const current = fs.lstatSync(target, { bigint: true });
-    if (
-      !current.isDirectory()
-      || current.isSymbolicLink()
-      || !sameDirectoryIdentity(target, directoryIdentity)
-      || !directoryChainIsSame(activeChain)
-    ) return false;
-    fs.rmdirSync(target);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** Remove only a stage carrying the identity captured at exclusive creation. */
-function removeOwnedStage(ownedStage) {
-  if (!ownedStage || typeof ownedStage.root !== "string" || !ownedStage.identity) return false;
-  return removeOwnedTree(ownedStage.root, ownedStage.identity, ownedStage.root, { entries: 0, bytes: 0, exceeded: false }, 0);
+/**
+ * Root identity does not prove creation ownership of descendants written by
+ * npm, the build, or runtime provisioning. No complete per-entry creation
+ * receipts with BigInt identities are recorded, so retain stages without
+ * enumerating or deleting any part of them, even after their setup process has
+ * settled.
+ */
+function removeOwnedStage() {
+  return false;
 }
 
 function closeDirectory(directory) {
@@ -424,12 +324,15 @@ function closeDirectory(directory) {
 }
 
 function sameStatIdentity(left, right) {
-  return left.dev === right.dev && left.ino === right.ino;
+  return hasPositiveIdentity(left) && hasPositiveIdentity(right)
+    && left.dev === right.dev && left.ino === right.ino;
 }
 
 function lstatRegularFile(file) {
   const stats = fs.lstatSync(file, { bigint: true });
-  if (!stats.isFile() || stats.isSymbolicLink()) throw new Error("not a regular file");
+  if (!stats.isFile() || stats.isSymbolicLink() || !hasPositiveIdentity(stats)) {
+    throw new Error("file identity is unavailable or unsafe");
+  }
   return stats;
 }
 
@@ -458,9 +361,15 @@ function copySourceFile(source, destination, budget) {
   let destinationFd;
   try {
     const opened = fs.fstatSync(sourceFd, { bigint: true });
-    if (!opened.isFile() || !sameStatIdentity(before, opened)) throw new Error("source file changed during staging");
+    if (!opened.isFile() || !sameStatIdentity(before, opened)
+      || !sameStatIdentity(before, lstatRegularFile(source))) throw new Error("source file changed during staging");
     assertSourceCopyWithinBounds(budget);
     destinationFd = fs.openSync(destination, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow, 0o600);
+    const destinationOpened = fs.fstatSync(destinationFd, { bigint: true });
+    if (!destinationOpened.isFile() || !hasPositiveIdentity(destinationOpened)
+      || !sameStatIdentity(destinationOpened, lstatRegularFile(destination))) {
+      throw new Error("staged file identity is unavailable");
+    }
     const buffer = Buffer.alloc(SOURCE_COPY_CHUNK_BYTES);
     let position = 0;
     for (;;) {
@@ -478,9 +387,23 @@ function copySourceFile(source, destination, budget) {
     }
     const after = fs.fstatSync(sourceFd, { bigint: true });
     assertSourceCopyWithinBounds(budget);
-    if (!sameStatIdentity(before, after) || before.size !== after.size) throw new Error("source file changed during staging");
-    const mode = Number(before.mode & 0o777n);
-    fs.fchmodSync(destinationFd, 0o600 | (mode & 0o111));
+    if (!sameStatIdentity(before, after)
+      || !sameStatIdentity(after, lstatRegularFile(source))
+      || before.size !== after.size) throw new Error("source file changed during staging");
+    // POSIX execute/mode bits preserve source metadata for the local build.
+    // Windows uses its ordinary inherited ACLs; Node mode bits are not a
+    // privacy control there and are not treated as one.
+    if (process.platform !== "win32") {
+      const mode = Number(before.mode & 0o777n);
+      fs.fchmodSync(destinationFd, 0o600 | (mode & 0o111));
+    }
+    const destinationAfter = fs.fstatSync(destinationFd, { bigint: true });
+    const destinationPathStats = lstatRegularFile(destination);
+    if (!sameStatIdentity(destinationOpened, destinationAfter)
+      || !sameStatIdentity(destinationAfter, destinationPathStats)
+      || destinationAfter.size !== before.size) {
+      throw new Error("staged file changed before publication");
+    }
   } finally {
     if (destinationFd !== undefined) fs.closeSync(destinationFd);
     fs.closeSync(sourceFd);
@@ -490,7 +413,7 @@ function copySourceFile(source, destination, budget) {
 function copySourceDirectory(source, destination, budget, depth, ownedStage) {
   if (depth > MAX_SOURCE_DEPTH) throw new Error("source copy depth limit exceeded");
   assertSourceCopyWithinBounds(budget);
-  if (!sameDirectoryIdentity(ownedStage.root, ownedStage.identity)) throw new Error("staging root identity changed");
+  if (!directoryChainIsSame(ownedStage.chain)) throw new Error("staging directory chain changed");
   const before = identityOfDirectory(source);
   assertSourceCopyWithinBounds(budget);
   fs.mkdirSync(destination, { mode: 0o700 });
@@ -505,6 +428,7 @@ function copySourceDirectory(source, destination, budget, depth, ownedStage) {
   try {
     assertSourceCopyWithinBounds(budget);
     directory = fs.opendirSync(source);
+    if (!sameDirectoryIdentity(source, before)) throw new Error("source directory changed while opening staging input");
     for (;;) {
       assertSourceCopyWithinBounds(budget);
       const entry = directory.readSync();
@@ -518,6 +442,7 @@ function copySourceDirectory(source, destination, budget, depth, ownedStage) {
       const sourceEntry = path.join(source, name);
       const destinationEntry = path.join(destination, name);
       const stats = fs.lstatSync(sourceEntry, { bigint: true });
+      if (!sameDirectoryIdentity(source, before)) throw new Error("source directory changed during staging");
       if (stats.isSymbolicLink()) throw new Error("source tree contains a symlink");
       if (stats.isDirectory()) {
         copySourceDirectory(sourceEntry, destinationEntry, budget, depth + 1, ownedStage);
@@ -546,26 +471,31 @@ function copySourceDirectory(source, destination, budget, depth, ownedStage) {
 function stageSourcePackage(packageRoot, buildCacheRoot) {
   const ownedStage = createOwnedStage(buildCacheRoot, "pi-review-sessions-");
   try {
-    const packageStats = identityOfDirectory(packageRoot);
+    const resolvedPackageRoot = path.resolve(packageRoot);
+    const packageChain = process.platform === "win32"
+      ? assertDirectoryChain(path.parse(resolvedPackageRoot).root, resolvedPackageRoot)
+      : [{ target: resolvedPackageRoot, identity: identityOfDirectory(resolvedPackageRoot) }];
     const budget = sourceCopyBudget();
     budget.directories = [
-      { target: packageRoot, identity: packageStats },
-      { target: ownedStage.root, identity: ownedStage.identity },
+      ...packageChain,
+      ...ownedStage.chain,
     ];
     for (const name of ["package.json", "package-lock.json", "tsconfig.json"]) {
-      const source = path.join(packageRoot, name);
+      const source = path.join(resolvedPackageRoot, name);
       copySourceFile(source, path.join(ownedStage.root, name), budget);
     }
     for (const name of ["src", "scripts", "skills"]) {
-      const source = path.join(packageRoot, name);
+      const source = path.join(resolvedPackageRoot, name);
       copySourceDirectory(source, path.join(ownedStage.root, name), budget, 0, ownedStage);
     }
-    if (!sameDirectoryIdentity(packageRoot, packageStats) || !sameDirectoryIdentity(ownedStage.root, ownedStage.identity)) {
+    if (!directoryChainIsSame(packageChain) || !directoryChainIsSame(ownedStage.chain)) {
       throw new Error("source or staging root changed during copy");
     }
   } catch (cause) {
-    const preserveStage = Boolean(cause && cause.preserveStage);
-    const removed = !preserveStage && removeOwnedStage(ownedStage);
+    const preserveStage = Boolean(cause && (cause.preserveStage || cause.retainedStage));
+    const removed = ownedStage
+      ? (!preserveStage && removeOwnedStage(ownedStage))
+      : !preserveStage;
     const error = new Error("could not stage the source package for building");
     error.retainedStage = !removed;
     throw error;
@@ -574,7 +504,7 @@ function stageSourcePackage(packageRoot, buildCacheRoot) {
 }
 
 function stageNpmEnvironment(env, ownedStage) {
-  if (!sameDirectoryIdentity(ownedStage.root, ownedStage.identity)) throw new Error("staging root identity changed");
+  if (!directoryChainIsSame(ownedStage.chain)) throw new Error("staging directory chain changed");
   const npmPaths = {
     cache: path.join(ownedStage.root, ".npm-cache"),
     logs: path.join(ownedStage.root, ".npm-logs"),
@@ -600,6 +530,18 @@ function stageNpmEnvironment(env, ownedStage) {
   return ownEnv;
 }
 
+function boundedProcessCleanupStatus({ closed, pid, platform, timedOut, outputExceeded, normalExit, groupStillExists }) {
+  if (!closed) return false;
+  if (pid === undefined) return true;
+  if (platform === "win32") {
+    // Public Node owns only the direct ChildProcess on Windows. A normal
+    // successful close needs no escalation and makes no descendant claim;
+    // after timeout/output termination there is no public process-tree proof.
+    return timedOut || outputExceeded || !normalExit ? false : undefined;
+  }
+  return !groupStillExists();
+}
+
 function runBoundedProcess(file, args, options = {}) {
   const { env, cwd, timeoutMs, maxOutputBytes = 0, captureStdout = false } = options;
   const testHooks = options.testHooks;
@@ -617,11 +559,11 @@ function runBoundedProcess(file, args, options = {}) {
     let finished = false;
     let cleanupDeadlineReached = false;
 
-    const killGroup = (signal) => {
+    const killOwnedProcess = (signal) => {
       if (!child || child.pid === undefined) return;
       try {
-        if (process.platform === "win32") child.kill(signal);
-        else process.kill(-child.pid, signal);
+        if (process.platform === "win32") child.kill(signal); // direct public ChildProcess only
+        else process.kill(-child.pid, signal); // the POSIX child process group owned by this spawn
       } catch (error) {
         if (error.code !== "ESRCH") spawnError ??= error;
       }
@@ -640,15 +582,22 @@ function runBoundedProcess(file, args, options = {}) {
       if (finished || (!closed && !cleanupDeadlineReached) || (terminating && killTimer !== undefined)) return;
       finished = true;
       clearTimeout(deadlineTimer);
-      const cleanupConfirmed = closed && (
-        child.pid === undefined
-        || process.platform === "win32"
-        || !groupStillExists()
-      );
-      if (cleanupConfirmed) {
+      const normalExit = closeResult?.code === 0 && closeResult?.signal === null && !spawnError;
+      const cleanupConfirmed = boundedProcessCleanupStatus({
+        closed,
+        pid: child.pid,
+        platform: process.platform,
+        timedOut,
+        outputExceeded,
+        normalExit,
+        groupStillExists,
+      });
+      const naturallySettledWindowsChild = process.platform === "win32"
+        && closed && !timedOut && !outputExceeded && normalExit;
+      if (cleanupConfirmed === true || naturallySettledWindowsChild) {
         activeBoundedProcessCount -= 1;
       } else {
-        spawnError ??= new Error("setup process-group cleanup was not confirmed");
+        spawnError ??= new Error("setup process cleanup was not confirmed");
         child.unref();
         child.stdout?.destroy();
       }
@@ -665,9 +614,9 @@ function runBoundedProcess(file, args, options = {}) {
     const terminate = () => {
       if (terminating || finished) return;
       terminating = true;
-      killGroup("SIGTERM");
+      killOwnedProcess("SIGTERM");
       killTimer = setTimeout(() => {
-        killGroup("SIGKILL");
+        killOwnedProcess("SIGKILL");
         killTimer = setTimeout(() => {
           cleanupDeadlineReached = true;
           killTimer = undefined;
@@ -711,8 +660,8 @@ function runBoundedProcess(file, args, options = {}) {
       closeResult = { code, signal };
       closed = true;
       clearTimeout(deadlineTimer);
-      // A setup parent must not leave an untracked descendant behind even if
-      // its own exit/stdio closes first. Check only its own process group.
+      // POSIX can verify only its own group. Windows deliberately performs no
+      // process-tree scan; abnormal direct-child settlement stays uncertain.
       if (!timedOut && !outputExceeded && groupStillExists()) terminate();
       else complete();
     });
@@ -763,7 +712,7 @@ async function buildSourceExtension(options) {
         retainedStage: !removed,
       };
     }
-    if (!sameDirectoryIdentity(stagingRoot, ownedStage.identity)) throw new Error("staging root identity changed");
+    if (!directoryChainIsSame(ownedStage.chain)) throw new Error("staging directory chain changed");
     if (pathExists(path.join(stagingRoot, "dist"))) throw new Error("staging root unexpectedly contains build output");
     const build = await executeNpm(npmCli, ["--prefix", stagingRoot, "run", "build"], {
       cwd: stagingRoot,
@@ -783,7 +732,7 @@ async function buildSourceExtension(options) {
         retainedStage: !removed,
       };
     }
-    if (!sameDirectoryIdentity(stagingRoot, ownedStage.identity)) throw new Error("staging root identity changed");
+    if (!directoryChainIsSame(ownedStage.chain)) throw new Error("staging directory chain changed");
     return { status: 0, stagingRoot, ownedStage };
   } catch (error) {
     const cleanupUnconfirmed = Boolean(error && error.cleanupUnconfirmed);
@@ -834,14 +783,18 @@ function pathExists(candidate) {
 }
 
 function assertDirectoryChain(base, target) {
-  const relative = path.relative(base, target);
+  const canonicalBase = path.resolve(base);
+  const canonicalTarget = path.resolve(target);
+  const relative = path.relative(canonicalBase, canonicalTarget);
   if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("path escapes directory root");
-  let current = base;
+  const chain = [{ target: canonicalBase, identity: identityOfDirectory(canonicalBase) }];
+  let current = canonicalBase;
   for (const component of relative.split(path.sep).filter(Boolean)) {
     current = path.join(current, component);
-    const stats = fs.lstatSync(current);
-    if (!stats.isDirectory() || stats.isSymbolicLink()) throw new Error("path contains a non-directory or symlink");
+    chain.push({ target: current, identity: identityOfDirectory(current) });
+    if (!directoryChainIsSame(chain)) throw new Error("path identity changed during validation");
   }
+  return chain;
 }
 
 /** Bounded first-bytes read with no-follow open and descriptor identity checks. */
@@ -851,7 +804,8 @@ function readHeadBytes(file, bytes) {
     const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
     try {
       const opened = fs.fstatSync(fd, { bigint: true });
-      if (!opened.isFile() || !sameStatIdentity(before, opened)) return undefined;
+      if (!opened.isFile() || !sameStatIdentity(before, opened)
+        || !sameStatIdentity(before, lstatRegularFile(file))) return undefined;
       const head = Buffer.alloc(bytes);
       let offset = 0;
       while (offset < head.length) {
@@ -860,7 +814,8 @@ function readHeadBytes(file, bytes) {
         offset += bytesRead;
       }
       const after = fs.fstatSync(fd, { bigint: true });
-      if (!sameStatIdentity(before, after)) return undefined;
+      if (!sameStatIdentity(before, after)
+        || !sameStatIdentity(after, lstatRegularFile(file))) return undefined;
       return head.subarray(0, offset);
     } finally {
       fs.closeSync(fd);
@@ -897,7 +852,10 @@ function readBoundedRegularFile(file, maxBytes) {
   const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
   try {
     const opened = fs.fstatSync(fd, { bigint: true });
-    if (!opened.isFile() || !sameStatIdentity(before, opened) || opened.size > BigInt(maxBytes)) throw new Error("file changed during bounded read");
+    if (!opened.isFile() || !sameStatIdentity(before, opened)
+      || !sameStatIdentity(before, lstatRegularFile(file)) || opened.size > BigInt(maxBytes)) {
+      throw new Error("file changed during bounded read");
+    }
     const chunks = [];
     let total = 0;
     const chunk = Buffer.alloc(Math.min(64 * 1024, maxBytes + 1));
@@ -909,7 +867,9 @@ function readBoundedRegularFile(file, maxBytes) {
       chunks.push(Buffer.from(chunk.subarray(0, count)));
     }
     const after = fs.fstatSync(fd, { bigint: true });
-    if (!sameStatIdentity(before, after) || before.size !== after.size) throw new Error("file changed during bounded read");
+    if (!sameStatIdentity(before, after)
+      || !sameStatIdentity(after, lstatRegularFile(file))
+      || before.size !== after.size) throw new Error("file changed during bounded read");
     return Buffer.concat(chunks, total);
   } finally {
     fs.closeSync(fd);
@@ -965,6 +925,7 @@ async function probePiVersion(file, env, processRunner = runBoundedProcess) {
  */
 async function validatePiPackage(pkgDir, env, options = {}) {
   const { expectedFile, exactVersion } = options;
+  const processRunner = options.processRunner || runBoundedProcess;
   const manifestPath = path.join(pkgDir, "package.json");
   let manifest;
   try {
@@ -994,13 +955,21 @@ async function validatePiPackage(pkgDir, env, options = {}) {
   if (contained.startsWith("..") || path.isAbsolute(contained)) {
     throw new PiRuntimeError(`the pi package bin entry escapes the package directory: ${pkgDir}`);
   }
+  if (process.platform === "win32") {
+    try {
+      assertDirectoryChain(pkgDir, path.dirname(entry));
+    } catch {
+      throw new PiRuntimeError(`the pi package bin entry has an unsafe directory chain: ${pkgDir}`);
+    }
+  }
   let canonical;
   try {
-    const stats = fs.statSync(entry);
-    if (!stats.isFile()) throw new PiRuntimeError("not a regular file");
-    const access = fs.constants.R_OK | (process.platform === "win32" ? 0 : fs.constants.X_OK);
-    fs.accessSync(entry, access);
     canonical = fs.realpathSync(entry);
+    // POSIX npm bins may be symlinks; validate their canonical target. On
+    // Windows, keep the stronger no-symlink policy on the declared entry.
+    lstatRegularFile(process.platform === "win32" ? entry : canonical);
+    const access = fs.constants.R_OK | (process.platform === "win32" ? 0 : fs.constants.X_OK);
+    fs.accessSync(canonical, access);
   } catch {
     throw new PiRuntimeError(`the pi CLI entry is not a regular readable file: ${entry}`);
   }
@@ -1032,7 +1001,7 @@ async function validatePiPackage(pkgDir, env, options = {}) {
       throw new PiRuntimeError(`the pi package bin entry does not match the resolved PATH file: ${pkgDir}`);
     }
   }
-  const probed = await probePiVersion(canonical, env);
+  const probed = await probePiVersion(canonical, env, processRunner);
   // Metadata/probe agreement: the live entry must report exactly the version
   // its package metadata declares; a mismatched pair is never trusted.
   if (probed !== String(manifest.version)) {
@@ -1135,10 +1104,13 @@ function findPiOnPath(env) {
     if (!rawEntry) continue; // an empty PATH entry would mean the current directory: never searched
     const candidate = path.join(rawEntry, "pi");
     try {
-      const stats = fs.statSync(candidate);
-      if (!stats.isFile()) continue;
-      fs.accessSync(candidate, fs.constants.R_OK);
-      return fs.realpathSync(candidate);
+      // POSIX npm bin entries are commonly symlinks. Canonicalize first, then
+      // positively validate the regular target; the package/bin checks below
+      // still decide whether that target is the public Pi CLI.
+      const canonical = fs.realpathSync(candidate);
+      lstatRegularFile(canonical);
+      fs.accessSync(canonical, fs.constants.R_OK);
+      return canonical;
     } catch {
       continue;
     }
@@ -1177,7 +1149,10 @@ function enclosingPiPackage(file) {
  * checked; publication is admitted only after validating the resulting public
  * package and never replaces an existing version root.
  */
-async function validateCachedPiRuntime(versionRoot, targetPkgDir, env, expectedIdentity) {
+async function validateCachedPiRuntime(versionRoot, targetPkgDir, env, expectedIdentity, expectedParentChain, processRunner = runBoundedProcess) {
+  if (expectedParentChain && !directoryChainIsSame(expectedParentChain)) {
+    throw new PiRuntimeError(`the cached pi runtime at ${versionRoot} has a changed parent identity; preserving it`);
+  }
   let identity;
   try {
     identity = identityOfDirectory(versionRoot);
@@ -1190,19 +1165,23 @@ async function validateCachedPiRuntime(versionRoot, targetPkgDir, env, expectedI
   if (!pathExists(targetPkgDir)) {
     throw new PiRuntimeError(`the cached pi runtime at ${versionRoot} is partial or unknown; preserving it`);
   }
+  let packageDirectoryChain;
   try {
-    assertDirectoryChain(versionRoot, path.dirname(targetPkgDir));
+    packageDirectoryChain = assertDirectoryChain(versionRoot, path.dirname(targetPkgDir));
   } catch {
     throw new PiRuntimeError(`the cached pi runtime at ${versionRoot} is partial or unsafe; preserving it`);
   }
   let validated;
   try {
-    validated = await validatePiPackage(targetPkgDir, env, { exactVersion: PI_PROVISION_VERSION });
+    validated = await validatePiPackage(targetPkgDir, env, { exactVersion: PI_PROVISION_VERSION, processRunner });
   } catch (error) {
     if (error && error.cleanupUnconfirmed) throw error;
     throw new PiRuntimeError(`the cached pi runtime at ${targetPkgDir} is invalid; preserving it`);
   }
-  if (!sameDirectoryIdentity(versionRoot, identity) || (expectedIdentity && !sameDirectoryIdentity(versionRoot, expectedIdentity))) {
+  if (!sameDirectoryIdentity(versionRoot, identity)
+    || (expectedIdentity && !sameDirectoryIdentity(versionRoot, expectedIdentity))
+    || !directoryChainIsSame(packageDirectoryChain)
+    || (expectedParentChain && !directoryChainIsSame(expectedParentChain))) {
     throw new PiRuntimeError(`the cached pi runtime at ${versionRoot} changed during validation; preserving it`);
   }
   try {
@@ -1216,29 +1195,46 @@ async function validateCachedPiRuntime(versionRoot, targetPkgDir, env, expectedI
 async function provisionPiRuntime(options) {
   const { env, agentDir, writeError, npmCli, beforeVersionRootMkdir } = options;
   const executeNpm = options.runNpm || runNpm;
-  const validatePackage = options.validatePiPackage || validatePiPackage;
+  const processRunner = options.processRunner || runBoundedProcess;
+  const validatePackage = options.validatePiPackage || ((pkgDir, validationEnv, validationOptions = {}) => validatePiPackage(
+    pkgDir,
+    validationEnv,
+    { ...validationOptions, processRunner },
+  ));
   const runtimeRoot = path.join(agentDir, RUNTIME_CACHE_DIRNAME, PI_RUNTIME_DIRNAME);
   const versionRoot = path.join(runtimeRoot, `pi-${PI_PROVISION_VERSION}`);
   const targetNodeModules = path.join(versionRoot, "node_modules");
   const targetPkgDir = path.join(targetNodeModules, "@earendil-works", "pi-coding-agent");
 
+  let runtimeChain;
   try {
-    ensureDirectoryTree(runtimeRoot);
+    runtimeChain = ensureDirectoryTree(runtimeRoot);
   } catch {
     throw new PiRuntimeError(`could not access the isolated pi runtime cache under ${runtimeRoot}`);
   }
   if (pathExists(versionRoot)) {
-    return validateCachedPiRuntime(versionRoot, targetPkgDir, env);
+    return validateCachedPiRuntime(versionRoot, targetPkgDir, env, undefined, runtimeChain, processRunner);
   }
   if (!npmCli) throw new PiRuntimeError("the public npm Node CLI is not available on PATH; cannot provision Pi");
 
-  // No stale stage is inspected or removed. Exclusive creation plus the
-  // captured directory identity is the sole ownership proof for this run.
+  // No stale stage is inspected or removed. The captured directory identity
+  // identifies only the root, not descendants produced by npm.
   let ownedStage;
   let preserveStage = false;
   try {
     ownedStage = createOwnedStage(runtimeRoot, `.staging-pi-${PI_PROVISION_VERSION}-`);
-  } catch {
+    if (!directoryChainIsSame(runtimeChain) || !directoryChainIsSame(ownedStage.parentChain)) {
+      const error = new PiRuntimeError(`the pi runtime cache parent changed during staging under ${runtimeRoot}`);
+      error.cleanupUnconfirmed = true;
+      throw error;
+    }
+  } catch (error) {
+    if (error && error.cleanupUnconfirmed) throw error;
+    if (error && error.retainedStage) {
+      const retained = new PiRuntimeError("the Pi runtime staging directory identity could not be confirmed; preserving the stage");
+      retained.cleanupUnconfirmed = true;
+      throw retained;
+    }
     throw new PiRuntimeError(`could not create the pi runtime staging directory under ${runtimeRoot} (permission denied?)`);
   }
   try {
@@ -1266,45 +1262,63 @@ async function provisionPiRuntime(options) {
       else if (Number.isInteger(install.status)) result = `exited with status ${install.status}`;
       throw new PiRuntimeError(`pi runtime provisioning failed (npm install ${result}); re-run the launcher`);
     }
-    if (!sameDirectoryIdentity(stagingRoot, ownedStage.identity)) throw new PiRuntimeError("the pi runtime staging root changed during installation");
+    if (!directoryChainIsSame(ownedStage.chain)) throw new PiRuntimeError("the pi runtime staging directory chain changed during installation");
     const stagedPkgDir = path.join(stagingRoot, "node_modules", "@earendil-works", "pi-coding-agent");
-    assertDirectoryChain(stagingRoot, stagedPkgDir);
+    const stagedPackageChain = assertDirectoryChain(stagingRoot, stagedPkgDir);
+    const stagedNodeModulesPath = path.join(stagingRoot, "node_modules");
+    const stagedNodeModulesEntry = stagedPackageChain.find(({ target }) => target === stagedNodeModulesPath);
+    if (!stagedNodeModulesEntry) throw new PiRuntimeError("the staged pi package has no positively identified node_modules root");
     await validatePackage(stagedPkgDir, env, { exactVersion: PI_PROVISION_VERSION });
+    if (!directoryChainIsSame(ownedStage.chain) || !directoryChainIsSame(stagedPackageChain)) {
+      throw new PiRuntimeError("the pi runtime staging identity changed during validation");
+    }
 
     if (pathExists(versionRoot)) {
       // Another process may have completed publication while npm ran. Reuse
       // only a fully validated result; partial/unknown resources are preserved.
-      return validateCachedPiRuntime(versionRoot, targetPkgDir, env);
+      return validateCachedPiRuntime(versionRoot, targetPkgDir, env, undefined, runtimeChain, processRunner);
     }
 
     let ownedVersionRoot;
     try {
       // mkdir is exclusive: unlike rename-over-empty-dir, it cannot replace a
       // preexisting empty or partially populated version destination.
+      if (!directoryChainIsSame(runtimeChain)) throw new Error("runtime cache parent changed");
       if (typeof beforeVersionRootMkdir === "function") beforeVersionRootMkdir(versionRoot);
       fs.mkdirSync(versionRoot, { mode: 0o700 });
-      ownedVersionRoot = { root: versionRoot, identity: identityOfDirectory(versionRoot) };
-      if (!sameDirectoryIdentity(versionRoot, ownedVersionRoot.identity) || pathExists(targetNodeModules)) {
+      const versionIdentity = identityOfDirectory(versionRoot);
+      const publicationChain = [...runtimeChain, { target: versionRoot, identity: versionIdentity }];
+      ownedVersionRoot = { root: versionRoot, identity: versionIdentity, chain: publicationChain };
+      if (!directoryChainIsSame(publicationChain) || pathExists(targetNodeModules)) {
         throw new Error("publication target is not fresh");
       }
-      if (!sameDirectoryIdentity(stagingRoot, ownedStage.identity)) throw new Error("staging identity changed");
-      fs.renameSync(path.join(stagingRoot, "node_modules"), targetNodeModules);
+      if (!directoryChainIsSame(ownedStage.chain) || !directoryChainIsSame(stagedPackageChain)) {
+        throw new Error("staging identity changed");
+      }
+      fs.renameSync(stagedNodeModulesPath, targetNodeModules);
+      if (!directoryChainIsSame(publicationChain)
+        || !sameDirectoryIdentity(targetNodeModules, stagedNodeModulesEntry.identity)) {
+        throw new Error("published node_modules identity changed");
+      }
     } catch {
-      if (ownedVersionRoot && !pathExists(targetNodeModules)) removeOwnedStage(ownedVersionRoot);
-      if (pathExists(versionRoot)) return await validateCachedPiRuntime(versionRoot, targetPkgDir, env);
+      if (ownedVersionRoot) {
+        if (!pathExists(targetNodeModules)) removeOwnedStage(ownedVersionRoot);
+        throw new PiRuntimeError(`the owned pi runtime publication changed under ${versionRoot}; preserving unknown resources`);
+      }
+      if (pathExists(versionRoot)) return await validateCachedPiRuntime(versionRoot, targetPkgDir, env, undefined, runtimeChain, processRunner);
       throw new PiRuntimeError(`pi runtime provisioning failed while publishing under ${runtimeRoot}`);
     }
 
     // Validate the published location against the exclusive version root.
     if (!ownedVersionRoot) throw new PiRuntimeError(`the cached pi runtime at ${versionRoot} changed during publication; preserving it`);
-    const published = await validateCachedPiRuntime(versionRoot, targetPkgDir, env, ownedVersionRoot.identity);
+    const published = await validateCachedPiRuntime(versionRoot, targetPkgDir, env, ownedVersionRoot.identity, runtimeChain, processRunner);
     writeError(`pi-review-sessions: installed isolated Pi ${PI_PROVISION_VERSION} runtime at ${runtimeRoot}\n`);
     return { ...published, source: "isolated-cache" };
   } catch (error) {
     if (error && error.cleanupUnconfirmed) preserveStage = true;
     throw error;
   } finally {
-    if (preserveStage || !removeOwnedStage(ownedStage)) writeError("pi-review-sessions: preserving a Pi runtime staging tree that could not be safely removed.\n");
+    if (preserveStage || !removeOwnedStage(ownedStage)) writeError("pi-review-sessions: preserving a Pi runtime staging tree because per-entry descendant creation receipts are unavailable.\n");
   }
 }
 
@@ -1448,14 +1462,25 @@ async function runSessionHostLauncher(argv, overrides = {}) {
     return 0;
   }
 
-  const inheritedEnv = deps.getEnv();
+  const rawInheritedEnv = deps.getEnv();
+  let inheritedEnv;
+  try {
+    // Snapshot Windows names case-insensitively before storage/role checks,
+    // process.env scrubbing, or any setup child. Conflicting ordinary aliases
+    // reject; nonempty role markers remain present for fail-closed rejection.
+    inheritedEnv = snapshotSessionHostEnvironment(rawInheritedEnv, deps.platform);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Invalid session host environment.";
+    deps.writeError(`pi-review-sessions: ${message}\n`);
+    return 1;
+  }
 
   // Reject parent startup session overrides before any setup (build, Pi
   // runtime, DDGS, token, PTY): every created instance would inherit
   // them and open the same old chat/storage instead of a new native chat of
   // its own.
   try {
-    assertSessionHostStartupOptions(parsed.args, inheritedEnv);
+    assertSessionHostStartupOptions(parsed.args, inheritedEnv, deps.platform);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Invalid pi-review-sessions startup options.";
     deps.writeError(`pi-review-sessions: ${message}\n`);
@@ -1468,8 +1493,8 @@ async function runSessionHostLauncher(argv, overrides = {}) {
       return 1;
     }
   }
-  if (deps.platform !== "darwin" && deps.platform !== "linux") {
-    deps.writeError("pi-review-sessions: the alpha session host supports POSIX macOS/Linux only.\n");
+  if (deps.platform !== "darwin" && deps.platform !== "linux" && deps.platform !== "win32") {
+    deps.writeError("pi-review-sessions: the alpha session host supports macOS/Linux and Windows source admission only.\n");
     return 1;
   }
   if (!meetsNodeFloor(deps.nodeVersion)) {
@@ -1487,8 +1512,11 @@ async function runSessionHostLauncher(argv, overrides = {}) {
   // variables.
   const setupEnv = { ...inheritedEnv };
   for (const name of HOST_ENV_TO_CLEAR) delete setupEnv[name];
-  if (inheritedEnv === deps.processEnv) {
-    for (const name of HOST_ENV_TO_CLEAR) delete deps.processEnv[name];
+  if (rawInheritedEnv === deps.processEnv) {
+    const hostEnvToClear = new Set(HOST_ENV_TO_CLEAR.map((name) => name.toUpperCase()));
+    for (const name of Object.keys(deps.processEnv)) {
+      if (hostEnvToClear.has(name.toUpperCase())) delete deps.processEnv[name];
+    }
   }
 
   // Native Pi agent directory (honors PI_CODING_AGENT_DIR with Pi's native
@@ -1523,12 +1551,12 @@ async function runSessionHostLauncher(argv, overrides = {}) {
   const finish = (status) => {
     if (ownedSourceStage) {
       if (sourceStageSetupUnconfirmed) {
-        deps.writeError("pi-review-sessions: preserving the source stage because setup cleanup was not confirmed.\n");
+        deps.writeError("pi-review-sessions: preserving the source stage because setup cleanup was not confirmed and per-entry descendant creation receipts are unavailable.\n");
       } else if (sourceStageHostStarted && status !== 0) {
-        deps.writeError("pi-review-sessions: preserving the source stage because native shutdown was not confirmed.\n");
+        deps.writeError("pi-review-sessions: preserving the source stage because native shutdown was not confirmed and per-entry descendant creation receipts are unavailable.\n");
       } else {
         const removed = removeOwnedStage(ownedSourceStage);
-        if (!removed) deps.writeError("pi-review-sessions: preserving an owned source stage that could not be safely removed.\n");
+        if (!removed) deps.writeError("pi-review-sessions: preserving the source stage because per-entry descendant creation receipts are unavailable.\n");
       }
       ownedSourceStage = undefined;
     }
@@ -1563,7 +1591,7 @@ async function runSessionHostLauncher(argv, overrides = {}) {
             ? ` (exit status ${build.status})`
             : "";
       deps.writeError(`pi-review-sessions: extension build failed${detail}.\n`);
-      if (build && build.retainedStage) deps.writeError("pi-review-sessions: an uncleanable source stage was preserved.\n");
+      if (build && build.retainedStage) deps.writeError("pi-review-sessions: a source stage was retained because per-entry descendant creation receipts are unavailable.\n");
       return statusCode(build);
     }
     if (typeof build.stagingRoot === "string" && build.stagingRoot.length > 0) {
@@ -1603,8 +1631,8 @@ async function runSessionHostLauncher(argv, overrides = {}) {
   }
   deps.writeError(`pi-review-sessions: pi runtime: ${piRuntime.file} (v${piRuntime.version}, ${piRuntime.source})\n`);
 
-  // The default shared DDGS helper runs in a bounded subprocess group; test
-  // overrides retain the same injected seam. setupEnv is already scrubbed.
+  // The shared DDGS helper runs in a bounded owned Node process (a POSIX
+  // group, but only the direct Windows child). setupEnv is already scrubbed.
   const savedTokens = {};
   for (const name of HOST_ENV_TO_CLEAR) {
     if (name in process.env) {
@@ -1694,7 +1722,9 @@ module.exports = {
     createOwnedStage,
     removeOwnedStage,
     findNpmCli,
+    findPiOnPath,
     runBoundedProcess,
+    boundedProcessCleanupStatus,
     activeBoundedProcessCount: () => activeBoundedProcessCount,
   },
 };

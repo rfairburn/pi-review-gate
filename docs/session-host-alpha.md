@@ -12,33 +12,51 @@ uses Pi's public `ProcessTerminal` input and terminal-negotiation path with cust
 generated frame composition; it is not a `TuiAltScreen` renderer. Native wrapper,
 terminal-input, menu, question, editor, and runtime parity remain under integration
 verification.
+
 Component, mock, or socket tests alone do not prove compatibility with a real native
-Pi wrapper. macOS and Linux are the intended host platforms; intended platform scope
-is not evidence that end-to-end Linux runtime compatibility has been proven.
+Pi wrapper. macOS and Linux are the intended POSIX host platforms; intended platform
+scope is not evidence that end-to-end runtime compatibility has been proven. Windows
+startup, public named-pipe, and pinned node-pty ConPTY source paths are being prepared
+for native validation only. Source implementation is not Windows runtime support or
+readiness evidence: the parent phase still requires real Windows Node 22.19 and 24
+Main, PTY, kernel, graceful-shutdown, and terminal-restoration tests.
 
 ## Requirements and launch
 
-- **Host platform:** same-machine POSIX macOS or Linux. This alpha adds no Windows
-  host support; Windows remains a required next phase, and the existing standalone
+- **Host platform:** same-machine POSIX macOS or Linux remains the documented
+  runtime scope. Windows source paths now admit the same-machine host and public
+  ConPTY flow for validation, but Windows is not supported/readiness-certified until
+  real Windows Node 22.19 and 24 runtime evidence passes. The ordinary standalone
   Windows launcher remains unchanged.
 - **Node.js:** 22.19.0 or newer.
 - **Pi:** stable Pi 1.0.4 or newer.
 - An interactive terminal with both stdin and stdout attached.
 
-Windows support is not implemented by this POSIX alpha. The selected Windows MVP is
-plain Node named pipes using the existing per-instance token authorization and the
-platform's default pipe ACL behavior: it adds no bespoke ACL guarantee, explicit
-remote-client rejection, or encryption. The Windows phase must document its bounded
-denial-of-service limits. It does not call for a custom Win32 pipe application or a
-TLS/PSK layer. Do not treat the host as Windows-supported until that phase is delivered
-and verified.
+The Windows validation path uses plain Node named pipes with the existing
+per-instance token authorization and the platform's default pipe ACL behavior. It
+adds no custom ACL guarantee, explicit remote-client rejection, or encryption; this
+is not a same-user sandbox. The broker retains its 32-connection unauthenticated
+backlog cap and 2-second authentication deadline, but those bounds do not prevent
+resource-exhaustion attempts or promise availability. Node source staging likewise
+relies on inherited OS ACLs: requested POSIX mode bits do not establish Windows
+privacy. Setup uses a fresh exclusive stage and public Node identity checks. Stages
+are retained after setup because a root identity does not establish ownership of npm,
+build, or runtime descendants; complete per-entry creation receipts with BigInt
+identities are not recorded, so cleanup does not enumerate or delete stage contents,
+even after graceful setup or native shutdown. A timed-out setup child that cannot be
+positively settled is likewise not treated as clean. No custom Win32 pipe application, TLS/PSK layer, taskkill tree
+scan, or private process helper
+is part of the design. These source paths do not make the host Windows-supported;
+that claim remains gated on the native evidence above.
 
 The host must launch Pi through its actual supported Node CLI entry, not through an
 arbitrary shell command. By default, `pi-review-sessions` looks for `pi` on `PATH`,
-but accepts it only when that file is an executable Node entry with a standard direct
-`node` shebang or `env node` shebang. A `pi` name that resolves to a shell shim is not
-sufficient. Opaque shell or managed-shell wrappers, native/SEA executables, and
-complex interpreter flags are rejected before the version probe. For a managed or
+but accepts it only when that file is a readable (Windows) or executable (POSIX) Node
+entry with a standard direct `node` shebang or `env node` shebang. Windows descriptors
+use `process.execPath` and the exact canonical readable JavaScript CLI as the first
+argument; POSIX keeps direct CLI/shebang execution. A `pi` name that resolves to a shell
+shim is not sufficient. Opaque shell or managed-shell wrappers, native/SEA executables,
+and complex interpreter flags are rejected before the version probe. For a managed or
 custom installation, point to the actual Node CLI entry file explicitly; for example:
 
 ```sh
@@ -79,14 +97,20 @@ Pi sessions, but a nonempty inherited `PI_CODING_AGENT_SESSION_DIR` is explicitl
 rejected by the host startup guard and launcher before setup or dependency construction.
 With that override unset, Pi uses its ordinary session-storage default. Native
 commands inside an individual window, including `/resume`, remain unchanged. Saved
-conversation selection through a deliberate per-child API is not part of this phase.
+conversation selection happens only through the sidebar's deliberate Saved conversations
+picker (below); parent startup arguments still cannot select a session.
 
 The launcher rejects unsupported platform, Node version, non-interactive use, and
 runtime-role contexts before starting a host. It builds from a source checkout or uses
 the compiled package, then validates or provisions the existing DDGS environment once
-before starting the host or creating any instance capability. Setup failures stop
-startup rather than falling back to a shell wrapper. The normal review-gate launchers,
-their behavior, and user settings are unchanged.
+before starting the host or creating any instance capability. Source builds use fresh
+bounded staging, locked `npm ci --ignore-scripts`, and the existing build script; public
+Node can terminate only the directly owned Windows setup child, so abnormal timeout
+settlement is not represented as descendant-tree proof and uncertain stages are kept.
+Setup preserves trusted original `NODE_OPTIONS` and provider values while removing only
+stale host capabilities. Setup failures stop startup rather than falling back to a
+shell wrapper. The normal review-gate launchers, their behavior, and user settings are
+unchanged.
 
 ## Starting and owning sessions
 
@@ -116,6 +140,21 @@ session; press Enter to activate a row. Activating another session or hiding the
 changes only display and input focus: it does not pause, stop, or transfer ownership of
 any session. Background work can continue while another session is active. If the active
 owner exits or disappears, the host does not automatically send input to a sibling.
+
+**Saved conversations** is a deliberate, read-only picker in the sidebar. It lists the
+shared native agent root's saved conversations showing each conversation's canonical
+caption only — never transcripts, tool arguments, question text, or credentials.
+Highlighting a row does nothing to any running session. Deliberately selecting a row
+revalidates that exact catalog entry (file identity and first-line header) against the
+live file and starts a new, independently owned child in that conversation's recorded
+workspace with an exact per-child `--session` admission; it never adopts an external
+process or attaches a child to another live conversation. A conversation already open in
+this host is refused while its row is live or its creation is pending, and can be opened
+again after that child has confirmed exit. The picker shows truthful loading, empty,
+unavailable, and partial issue-count notices; Up/Down moves the highlight, Enter opens
+the highlighted conversation, and Escape returns to the roster without pausing or
+stopping anything. A late listing or creation result never takes over a later-opened or
+dismissed pane.
 
 The native review-gate configuration is initialized with the ordinary zero-model
 default only when no native/explicit configuration exists. Existing configuration bytes
@@ -238,8 +277,10 @@ unavailable or failed public control falls back to SIGTERM for that owned handle
 immediately. A public request still pending after the first half of the shared grace
 window also falls back to SIGTERM, leaving the remainder for an owned exit; without
 a confirmed exit by the deadline, the manager escalates with SIGKILL against that
-same handle. The host does not scan for processes or promise to stop arbitrary detached
-descendants. A forced stop or a child whose exit could not be confirmed is reported
-truthfully; do not assume such a handle has exited.
+same handle. On Windows no POSIX signal is sent: forced escalation calls the same
+public PTY handle's no-argument `kill()` and still waits for its actual exit event; a
+shutdown acknowledgement is never exit proof. The host does not scan for processes or
+promise to stop arbitrary detached descendants. A forced stop or a child whose exit
+could not be confirmed is reported truthfully; do not assume such a handle has exited.
 Native Pi configuration, credentials, conversations, and unknown files are preserved,
 not removed as part of host shutdown.

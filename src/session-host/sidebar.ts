@@ -4,8 +4,9 @@
  *
  * Each sidebar row is an independent native process; the main UI is its
  * nativePTY frame, so this module renders ONLY the sidebar-owned panes: the
- * roster snapshot (top-level public agent/input/activity metadata) and the
- * New/Edit forms. It returns plain, bounded lines at the supplied pane
+ * roster snapshot (top-level public agent/input/activity metadata), the
+ * New/Edit forms, and the deliberate saved-conversation picker. It returns
+ * plain, bounded lines at the supplied pane
  * geometry — `render()` for the focused pane, `renderRoster()`/`renderForm()`
  * for the wide layout that shows both at once. The compositor owns offsets,
  * composition over the native frame, the real TTY, and resizing.
@@ -84,12 +85,29 @@ export interface SidebarItem {
   readonly exitCode?: number;
 }
 
+/**
+ * One saved-conversation row for the deliberate picker (issue 323): identity
+ * and canonical caption only. Never a transcript, tool argument, question
+ * text, or credential — the read-only listing API guarantees that shape.
+ */
+export interface SidebarSavedRow {
+  readonly id: string;
+  readonly file: string;
+  readonly caption: string;
+}
+
 /** Actions the sidebar asks the backend to perform. */
 export type SidebarAction =
   | { readonly type: "forward"; readonly data: string }
   | { readonly type: "select"; readonly id: string }
   | { readonly type: "remove"; readonly id: string }
   | { readonly type: "edit"; readonly id: string; readonly nativeSession: SessionHostNativeSession }
+  /** Open the saved-conversation picker and list the shared native catalog. */
+  | { readonly type: "saved-list"; readonly requestId: number }
+  /** Cancel an outstanding listing (dismiss or shutdown); Main aborts its signal. */
+  | { readonly type: "saved-cancel"; readonly requestId: number }
+  /** Deliberately open one listed conversation as a new independently owned child. */
+  | { readonly type: "saved-open"; readonly requestId: number; readonly file: string; readonly sessionId: string }
   | {
       readonly type: "create";
       readonly requestId: number;
@@ -161,7 +179,7 @@ export const SIDEBAR_GENERATED_SGR_ALLOWLIST: ReadonlySet<string> = new Set([
 interface SidebarEntry {
   /** Internal key; real item ids are namespaced with "item:" to stay unique. */
   readonly key: string;
-  readonly kind: "item" | "new" | "quit";
+  readonly kind: "item" | "saved" | "new" | "quit";
   readonly item?: SidebarItem;
 }
 
@@ -203,6 +221,7 @@ const DEFAULT_FORM_HINTS = {
 };
 const ACTIVITY_LINES_MAX = 2;
 const ACTIVITY_INPUT_MAX_CODEPOINTS = 400;
+const SAVED_CAPTION_MAX_CODEPOINTS = 256;
 const ITEM_LABEL_INPUT_MAX_CODEPOINTS = 400;
 const ERROR_TEXT_MAX_CODEPOINTS = 300;
 const ROSTER_MIN_COLS = 12;
@@ -214,6 +233,7 @@ const PANE_MAX_ROWS = 1000;
 
 const ENTRY_NEW_KEY = "new";
 const ENTRY_QUIT_KEY = "quit";
+const ENTRY_SAVED_KEY = "saved";
 const ITEM_KEY_PREFIX = "item:";
 
 const SPECIAL_BASE_KEYS = [
@@ -735,7 +755,16 @@ export class SidebarController {
   private formHints = DEFAULT_FORM_HINTS;
   private formNotice: string | undefined;
   private formGeneration = 0;
-  private formKind: "new" | "edit" | undefined;
+  private formKind: "new" | "edit" | "saved" | undefined;
+  /** Outstanding saved-conversation listing request (issue 323). */
+  private pendingSavedList: { readonly requestId: number } | undefined;
+  /** Deliberate saved-open in flight; late results are fenced by requestId. */
+  private pendingSavedOpen: { readonly requestId: number } | undefined;
+  private savedRows: SidebarSavedRow[] = [];
+  private savedIssueCount = 0;
+  private savedError: string | undefined;
+  private savedSelectedIndex = 0;
+  private savedListTop = 0;
   private editTarget?: { readonly id: string; readonly nativeSession: SessionHostNativeSession; readonly currentName: string };
   private workspaceDraft: string;
   private editDraft = "";
@@ -1040,6 +1069,9 @@ export class SidebarController {
     if (cols < FORM_MIN_COLS || rows < FORM_MIN_ROWS) {
       return this.renderTooSmall(cols, rows);
     }
+    if (this.formKind === "saved") {
+      return this.renderSavedPane(cols, rows);
+    }
     return this.renderFormPane(cols, rows);
   }
 
@@ -1104,6 +1136,9 @@ export class SidebarController {
       return;
     }
     if (matchesKey(data, "enter")) {
+      // A held Enter never activates a roster entry — including a row that a
+      // just-completed saved-open highlighted; only a fresh press does.
+      if (isKeyRepeat(data)) return;
       this.activateEntry();
       return;
     }
@@ -1163,6 +1198,10 @@ export class SidebarController {
       this.emit({ type: "select", id: entry.item.id });
       return;
     }
+    if (entry.kind === "saved") {
+      this.openSavedPane();
+      return;
+    }
     if (entry.kind === "new") {
       this.openNewForm();
       return;
@@ -1216,6 +1255,10 @@ export class SidebarController {
   // --- Forms use the real public Editor adapter for every editable value. ---
 
   private handleFormInput(data: string): void {
+    if (this.formKind === "saved") {
+      this.handleSavedPaneInput(data);
+      return;
+    }
     if (this.routeBracketedPaste(data)) {
       this.formField?.handleInput(data);
       return;
@@ -1253,6 +1296,161 @@ export class SidebarController {
 
 
 
+
+  // --- Saved-conversation picker (issue 323): deliberate, read-only. ---
+
+  /**
+   * Opens the saved-conversation picker in the form pane slot and requests a
+   * fresh listing of the shared native catalog. Highlighting rows never
+   * touches any running session; only an explicit Enter on a row emits a
+   * saved-open action.
+   */
+  private openSavedPane(): void {
+    this.disposeFormField();
+    this.formKind = "saved";
+    this.editTarget = undefined;
+    this.pendingCreate = undefined;
+    this.pendingRename = undefined;
+    this.pendingSavedOpen = undefined;
+    this.formError = undefined;
+    this.noticeError = undefined;
+    this.savedRows = [];
+    this.savedIssueCount = 0;
+    this.savedError = undefined;
+    this.savedSelectedIndex = 0;
+    this.savedListTop = 0;
+    this._focus = "form";
+    const requestId = this.nextRequestId++;
+    this.pendingSavedList = { requestId };
+    this.emit({ type: "saved-list", requestId });
+  }
+
+  /**
+   * Dismisses the picker and restores the roster display. Cancelling an
+   * outstanding listing only aborts that read; it never pauses, stops, or
+   * rolls back any instance. A pending saved-open keeps running in the
+   * backend; its late result is fenced by requestId.
+   */
+  private dismissSavedPane(): void {
+    if (this.pendingSavedList !== undefined) {
+      this.emit({ type: "saved-cancel", requestId: this.pendingSavedList.requestId });
+      this.pendingSavedList = undefined;
+    }
+    this.pendingSavedOpen = undefined; // UI ownership only; the backend op continues
+    this.abandonForm();
+    this.savedError = undefined;
+    this._focus = "sidebar";
+  }
+
+  private handleSavedPaneInput(data: string): void {
+    // Bracketed paste is opaque in the picker and never activates a row; a
+    // streamed body chunk that merely equals the toggle must not dismiss.
+    if (this.routeBracketedPaste(data)) return;
+    if (this.handleReservedToggle(data, () => this.dismissSavedPane())) return;
+    if (isKeyRelease(data)) return;
+    if (matchesKey(data, "up")) {
+      this.moveSavedSelection(-1);
+      return;
+    }
+    if (matchesKey(data, "down")) {
+      this.moveSavedSelection(1);
+      return;
+    }
+    // Key repeats never activate or dismiss; only initial presses do.
+    if (isKeyRepeat(data)) return;
+    if (matchesKey(data, "enter")) {
+      this.activateSavedRow();
+      return;
+    }
+    if (matchesKey(data, "escape")) {
+      this.dismissSavedPane();
+      return;
+    }
+  }
+
+  private moveSavedSelection(delta: number): void {
+    if (this.savedRows.length === 0) return;
+    const current = this.savedSelectedIndex;
+    this.savedSelectedIndex = (current + delta + this.savedRows.length) % this.savedRows.length;
+  }
+
+  /**
+   * Deliberately opens the highlighted conversation. While a listing is still
+   * in flight there is nothing to open; while an open is already pending the
+   * row is not re-emitted.
+   */
+  private activateSavedRow(): void {
+    if (this.pendingSavedList !== undefined) return;
+    const row = this.savedRows[this.savedSelectedIndex];
+    if (row === undefined) return;
+    if (this.pendingSavedOpen !== undefined) {
+      this.savedError = "A saved conversation is already starting";
+      return;
+    }
+    const requestId = this.nextRequestId++;
+    this.pendingSavedOpen = { requestId };
+    this.savedError = undefined;
+    this.emit({ type: "saved-open", requestId, file: row.file, sessionId: row.id });
+  }
+
+  /**
+   * Accepts one saved-conversation listing only while that request still owns
+   * the pane. Stale completions (dismissed or superseded panes) are ignored
+   * entirely and never seize a later-opened or dismissed UI.
+   */
+  completeSavedList(requestId: number, rows: readonly SidebarSavedRow[], issueCount: number): boolean {
+    if (this.pendingSavedList?.requestId !== requestId) return false; // stale: ignore
+    this.pendingSavedList = undefined;
+    const accepted: SidebarSavedRow[] = [];
+    for (const row of Array.isArray(rows) ? rows : []) {
+      if (!row || typeof row.id !== "string" || row.id.length === 0
+        || typeof row.file !== "string" || row.file.length === 0
+        || typeof row.caption !== "string") continue;
+      accepted.push({
+        id: row.id,
+        file: row.file,
+        caption: sanitizeBounded(row.caption, SAVED_CAPTION_MAX_CODEPOINTS),
+      });
+    }
+    this.savedRows = accepted;
+    this.savedIssueCount = Number.isSafeInteger(issueCount) && issueCount > 0 ? issueCount : 0;
+    this.savedError = undefined;
+    if (this.savedSelectedIndex >= this.savedRows.length) this.savedSelectedIndex = 0;
+    return true;
+  }
+
+  /** Shows a bounded, truthful unavailable notice for a failed listing. */
+  failSavedList(requestId: number, message: string): void {
+    if (this.pendingSavedList?.requestId !== requestId) return; // stale: ignore
+    this.pendingSavedList = undefined;
+    this.savedError = sanitizeBounded(message, ERROR_TEXT_MAX_CODEPOINTS);
+  }
+
+  /**
+   * Completes a deliberate saved-open. The new row is highlighted only while
+   * the request still owns the open pane; highlighting is not ownership
+   * transfer — only a later explicit host-row Enter activates it.
+   */
+  completeSavedOpen(requestId: number, id: string): void {
+    if (this.pendingSavedOpen?.requestId !== requestId) return; // stale: ignore
+    this.pendingSavedOpen = undefined;
+    if (this._focus === "form" && this.formKind === "saved") {
+      this.savedError = undefined;
+      this.acceptCompletedRow(id);
+      this.disposeFormField();
+      this.formKind = undefined;
+      this._focus = "sidebar";
+    }
+  }
+
+  /** Shows a bounded refusal/failure notice while the picker still owns the pane. */
+  failSavedOpen(requestId: number, message: string): void {
+    if (this.pendingSavedOpen?.requestId !== requestId) return; // stale: ignore
+    this.pendingSavedOpen = undefined;
+    if (this._focus === "form" && this.formKind === "saved") {
+      this.savedError = sanitizeBounded(message, ERROR_TEXT_MAX_CODEPOINTS);
+    }
+  }
 
   private openNewForm(): void {
     this.disposeFormField();
@@ -1458,6 +1656,7 @@ export class SidebarController {
       ...this.rowStore.map(
         (item): SidebarEntry => ({ key: ITEM_KEY_PREFIX + item.id, kind: "item", item }),
       ),
+      { key: ENTRY_SAVED_KEY, kind: "saved" },
       { key: ENTRY_NEW_KEY, kind: "new" },
       { key: ENTRY_QUIT_KEY, kind: "quit" },
     ];
@@ -1563,6 +1762,8 @@ export class SidebarController {
       const labelWidth = Math.max(0, cols - visibleWidth(marker) - visibleWidth(badges));
       const visibleLabel = labelWidth > 0 ? truncateToWidth(label, labelWidth, "...") : "";
       text = `${marker}${visibleLabel}${badges}`;
+    } else if (entry.kind === "saved") {
+      text = `${marker}Saved conversations`;
     } else if (entry.kind === "new") {
       text = `${marker}New session`;
     } else {
@@ -1632,6 +1833,87 @@ export class SidebarController {
     };
   }
 
+  /**
+   * The deliberate saved-conversation picker: canonical captions only, with
+   * truthful loading/empty/unavailable/partial notices and wrapped keyboard
+   * hints. It occupies the same form-pane slot (right pane on wide layouts,
+   * full-content overlay on narrow ones) as New/Edit.
+   */
+  private renderSavedPane(cols: number, rows: number): { lines: string[] } {
+    const header = " Saved conversations ";
+    const footerLines = wrapHintLines(
+      [`${this.toggleLabel} toggle`, "up/down select", "enter open", "esc back"],
+      cols,
+    );
+    const noticeLines = this.savedError === undefined
+      ? []
+      : wrapHintLines([`! ${this.savedError}`], cols);
+    const issueLines = this.pendingSavedList === undefined && this.savedIssueCount > 0
+      ? wrapHintLines([`${this.savedIssueCount} catalog issue(s) not shown`], cols)
+      : [];
+    if (footerLines === undefined || noticeLines === undefined || issueLines === undefined
+      || visibleWidth(header) > cols) {
+      return this.renderTooSmall(cols, rows);
+    }
+    const fixedRows = 1 + noticeLines.length + issueLines.length + footerLines.length;
+    const listRows = rows - fixedRows;
+    if (listRows < 1) {
+      return this.renderTooSmall(cols, rows);
+    }
+
+    const lines: string[] = [wrapRow(header, cols, "\x1b[1m")];
+    let y = 0;
+    if (this.pendingSavedList !== undefined) {
+      lines.push(wrapRow(" Loading saved conversations... ", cols));
+      y += 1;
+    } else if (this.savedRows.length === 0) {
+      // A failed listing never establishes an empty catalog; only a
+      // successful issue-free empty one says "No saved conversations".
+      if (this.savedError === undefined) {
+        lines.push(wrapRow(
+          this.savedIssueCount > 0 ? " No conversations could be listed " : " No saved conversations ",
+          cols,
+        ));
+        y += 1;
+      }
+    } else {
+      const top = this.savedScrollWindow(listRows);
+      let index = top;
+      while (index < this.savedRows.length && y < listRows) {
+        const row = this.savedRows[index];
+        lines.push(this.renderSavedRow(row, index === this.savedSelectedIndex, cols));
+        y += 1;
+        index += 1;
+      }
+    }
+    for (const noticeLine of noticeLines) lines.push(wrapRow(noticeLine, cols));
+    for (const issueLine of issueLines) lines.push(wrapRow(issueLine, cols));
+    lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
+    for (const footerLine of footerLines) lines.push(wrapRow(footerLine, cols));
+    return { lines };
+  }
+
+  /** Keeps the keyboard-highlighted saved row visible inside the list window. */
+  private savedScrollWindow(listRows: number): number {
+    const maxTop = Math.max(0, this.savedRows.length - 1);
+    let top = Math.min(Math.max(this.savedListTop, 0), maxTop);
+    if (this.savedSelectedIndex < top) {
+      top = this.savedSelectedIndex;
+    } else if (this.savedSelectedIndex >= top + listRows) {
+      top = this.savedSelectedIndex - listRows + 1;
+    }
+    this.savedListTop = top;
+    return top;
+  }
+
+  private renderSavedRow(row: SidebarSavedRow, selected: boolean, cols: number): string {
+    const marker = selected ? "> " : "  ";
+    const labelWidth = Math.max(0, cols - visibleWidth(marker));
+    const label = sanitizeBounded(row.caption, SAVED_CAPTION_MAX_CODEPOINTS);
+    const visibleLabel = labelWidth > 0 ? truncateToWidth(label, labelWidth, "...") : "";
+    return wrapRow(`${marker}${visibleLabel}`, cols, selected ? "\x1b[1;7m" : undefined);
+  }
+
   private renderConfirmPane(cols: number, rows: number): { lines: string[] } {
     const header = " Quit host? ";
     const liveCount = this.rowStore.filter(requiresQuitConfirmation).length;
@@ -1684,8 +1966,8 @@ function renameFailureNotice(status: string): string {
     case "stale-session": return "Native conversation changed; reopen Edit before renaming";
     case "unavailable": return "Native session rename is unavailable";
     case "invalid-name": return "New name is invalid or exceeds 1024 UTF-8 bytes";
-    case "setter-failed": return "Pi could not persist the new session name";
-    case "verification-failed": return "Pi could not verify the persisted session name";
+    case "setter-failed": return "Pi could not set the new session name";
+    case "verification-failed": return "Pi could not verify the native session name";
     case "busy": return "Session name was not changed while Pi is busy";
     case "timeout": return "Session rename timed out; verify the session name before retrying";
     case "disconnected": return "Status connection closed; session name was not confirmed";

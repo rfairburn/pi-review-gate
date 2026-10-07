@@ -16,6 +16,7 @@ import { NativeAgentRegistry, type ProfilePreparer } from "../src/session-host/p
 import { runNativeExternalEditor } from "../src/session-host/form-support";
 import type { TerminalFrame, TerminalInputModes } from "../src/session-host/terminal-surface";
 import { SidebarController } from "../src/session-host/sidebar";
+import { isSavedSessionAdmission, listSavedSessions, type SavedSessionCatalog } from "../src/session-host/saved-sessions";
 import type { SessionHostNativeSession } from "../src/session-host/protocol";
 import { __test, type SessionHostOptions } from "../src/session-host/main";
 
@@ -213,7 +214,9 @@ class FakeManager {
   readonly closeExitedCalls: string[] = [];
   readonly refusedCloseIds = new Set<string>();
   readonly resizeCalls: { cols: number; rows: number; ids: string[] }[] = [];
-  readonly createOptions: { workspace: string }[] = [];
+  readonly createOptions: { workspace: string; savedSession?: unknown }[] = [];
+  /** Known-owned live session data served to deliberate saved-conversation admission. */
+  ownedLiveSessionsData: { id?: string; file?: string }[] = [];
   readonly renameCalls: { id: string; request: StatusRenameRequest }[] = [];
   readonly order: string[];
   onChange?: (id: string) => void;
@@ -225,6 +228,7 @@ class FakeManager {
   createGateEntered?: () => void;
   renameGate?: Promise<void>;
   renameGateEntered?: () => void;
+  renameError = false;
   stopping = false;
   spawnCount = 0;
   shutdownCalls = 0;
@@ -255,7 +259,9 @@ class FakeManager {
     return true;
   }
 
-  create(options: { workspace: string }): Promise<string> {
+  ownedLiveSessions(): { id?: string; file?: string }[] { return [...this.ownedLiveSessionsData]; }
+
+  create(options: { workspace: string; savedSession?: unknown }): Promise<string> {
     this.createOptions.push({ ...options });
     const id = `native-${this.nextId++}`;
     const error = this.nextError;
@@ -314,6 +320,7 @@ class FakeManager {
 
   async rename(id: string, request: StatusRenameRequest): Promise<StatusRenameResult> {
     this.renameCalls.push({ id, request: { ...request } });
+    if (this.renameError) throw new Error("synthetic-secret-rename-error");
     if (this.renameGate) {
       this.renameGateEntered?.();
       await this.renameGate;
@@ -540,7 +547,8 @@ async function startTwoSessions(harness: Harness): Promise<FakeManager> {
   const manager = await ready(harness);
   fillForm(harness.terminal, "/first/workspace");
   await nextTurn();
-  harness.terminal.emitInput("\x1b[B"); // first row -> New session
+  harness.terminal.emitInput("\x1b[B"); // first row -> Saved conversations
+  harness.terminal.emitInput("\x1b[B"); // -> New session
   harness.terminal.emitInput(ENTER);
   completeForm(harness.terminal, "/another/workspace");
   await nextTurn();
@@ -634,6 +642,52 @@ test("missing package-root helper fails closed without searching an ancestor hel
   assert.equal(await harness.result, 1);
   assert.deepEqual(harness.events, [], "the helper is loaded only from the exact canonical package root");
   assert.deepEqual(harness.reports, ["Session host startup options were rejected."]);
+});
+
+test("synthetic Windows Main admission canonicalizes env names and reaches the injected public-host path", async () => {
+  const originalEnv: NodeJS.ProcessEnv = {
+    Path: "/synthetic/bin",
+    node_options: "--no-warnings --require=trusted-loader",
+    Anthropic_Api_Key: "provider-secret",
+    pi_review_gate_session_host_bootstrap: "stale-host-capability",
+  };
+  const harness = createHarness({ env: originalEnv }, { platform: "win32" });
+  const manager = await ready(harness);
+  assert.ok(harness.events.includes("resolve"), "Windows passes platform/Node/TTY admission and reaches Pi resolution");
+  assert.equal(manager.options.env?.PATH, "/synthetic/bin");
+  assert.equal(manager.options.env?.NODE_OPTIONS, "--no-warnings --require=trusted-loader");
+  assert.equal(manager.options.env?.ANTHROPIC_API_KEY, "provider-secret");
+  assert.equal(manager.options.env?.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP, undefined);
+  assert.deepEqual(originalEnv, {
+    Path: "/synthetic/bin",
+    node_options: "--no-warnings --require=trusted-loader",
+    Anthropic_Api_Key: "provider-secret",
+    pi_review_gate_session_host_bootstrap: "stale-host-capability",
+  }, "Windows normalization and stale-capability removal use only the detached snapshot");
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("Windows role casing and ambiguous ordinary env aliases fail before Pi resolution", async () => {
+  const role = createHarness({
+    env: { PI_REVIEW_GATE_RUNTIME_ROLE: "", pi_review_gate_runtime_role: "private-role-secret" },
+  }, { platform: "win32" });
+  assert.equal(await role.result, 1);
+  assert.deepEqual(role.events, []);
+  assert.deepEqual(role.reports, ["Session host preflight failed."]);
+  assert.doesNotMatch(role.reports.join(""), /private-role-secret/);
+
+  const ambiguous = createHarness({ env: { PATH: "/one", Path: "/two" } }, { platform: "win32" });
+  assert.equal(await ambiguous.result, 1);
+  assert.deepEqual(ambiguous.events, []);
+  assert.deepEqual(ambiguous.reports, ["Session host preflight failed."]);
+});
+
+test("Windows-cased parent session storage override rejects before any dependency", async () => {
+  const harness = createHarness({ env: { pi_coding_agent_session_dir: "/synthetic-storage-secret" } }, { platform: "win32" });
+  assert.equal(await harness.result, 1);
+  assert.deepEqual(harness.events, []);
+  assert.deepEqual(harness.reports, ["Session host startup options were rejected."]);
+  assert.doesNotMatch(harness.reports.join(""), /synthetic-storage-secret/);
 });
 
 test("direct Main preflight rejects role input before native Pi probing", async () => {
@@ -749,7 +803,8 @@ test("highlighting a newly created row does not transfer active input ownership;
 
   // Reopen the picker and open New session while native-1 remains active.
   harness.terminal.emitInput(ALT_LEFT);
-  harness.terminal.emitInput("\x1b[B"); // highlighted first -> New session
+  harness.terminal.emitInput("\x1b[B"); // highlighted first -> Saved conversations
+  harness.terminal.emitInput("\x1b[B"); // -> New session
   harness.terminal.emitInput(ENTER); // Open New session
   completeForm(harness.terminal, "/another/explicit/workspace");
   await nextTurn();
@@ -802,6 +857,25 @@ test("native Edit persists a rename without activating the row or routing input 
   assert.equal(harness.sidebar?.focus, "sidebar");
   assert.equal(harness.sidebar?.selectedId, "native-1");
   assert.deepEqual(manager.writes, [], "editing and saving never activates the session or sends it input");
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("rename refusal uses set/verify wording, never persistence claims", async () => {
+  const harness = createHarness();
+  const manager = await ready(harness);
+  fillForm(harness.terminal, "/rename/workspace");
+  await nextTurn();
+
+  harness.terminal.emitInput("e");
+  harness.terminal.emitInput("Renamed title");
+  manager.renameError = true;
+  harness.terminal.emitInput(ENTER);
+  await nextTurn();
+  const text = plain(harness.writer.frames.at(-1)?.frame).replace(/\s+/g, " ");
+  // The narrow form pane may ellipsize the tail; the set/verify wording is
+  // what must be present (and no persistence claim).
+  assert.ok(text.includes("Pi could not set or verify"), `refusal notice: ${text}`);
+  assert.ok(!text.toLowerCase().includes("persist"), "no persistence claim on refusal");
   assert.equal(await closeWithSignal(harness), 0);
 });
 
@@ -1224,7 +1298,8 @@ test("removing the active exited row clears ownership to the picker and stale sn
   assert.deepEqual(manager.views, []);
   assert.equal(harness.sidebar?.focus, "sidebar");
   assert.equal(harness.sidebar?.visible, true);
-  harness.terminal.emitInput("\x1b[B"); // cleared selection -> New session
+  harness.terminal.emitInput("\x1b[B"); // cleared selection -> Saved conversations
+  harness.terminal.emitInput("\x1b[B"); // -> New session
   harness.terminal.emitInput(ENTER);
   assert.equal(harness.sidebar?.focus, "form");
   assert.match(harness.sidebar?.render(40, 8).lines.join("\n") ?? "", /New session/);
@@ -1259,12 +1334,14 @@ test("removing an inactive exited row preserves the live owner, status, surface,
 
   harness.terminal.emitInput(ALT_LEFT); // hide/show to focus the picker on the active sibling
   harness.terminal.emitInput(ALT_LEFT);
-  harness.terminal.emitInput("\x1b[B"); // second -> New session
+  harness.terminal.emitInput("\x1b[B"); // second -> Saved conversations
+  harness.terminal.emitInput("\x1b[B"); // -> New session
   harness.terminal.emitInput(ENTER);
   harness.terminal.emitInput("retained draft");
   harness.terminal.emitInput(ALT_LEFT); // hide without discarding the form draft
   harness.terminal.emitInput(ALT_LEFT); // reopen with New session still selected
-  harness.terminal.emitInput("\x1b[A"); // New -> second
+  harness.terminal.emitInput("\x1b[A"); // New -> Saved conversations
+  harness.terminal.emitInput("\x1b[A"); // Saved -> second
   harness.terminal.emitInput("\x1b[A"); // second -> exited first
   assert.equal(harness.sidebar?.selectedId, "native-1");
   harness.terminal.emitInput(DELETE);
@@ -1282,6 +1359,7 @@ test("removing an inactive exited row preserves the live owner, status, surface,
   assert.deepEqual(preserved?.activity, ["Waiting for input"]);
 
   harness.terminal.emitInput("\x1b[B"); // no selection -> second row
+  harness.terminal.emitInput("\x1b[B"); // -> Saved conversations
   harness.terminal.emitInput("\x1b[B"); // -> New session
   harness.terminal.emitInput(ENTER);
   const formText = harness.sidebar?.render(48, 8).lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "") ?? "";
@@ -1368,6 +1446,7 @@ test("wide form temporarily replaces the right pane; the child stays alive, unre
   harness.terminal.emitInput(ALT_LEFT); // reopen -> sidebar focus on native-1
   await nextTurn();
   const resizesBeforeForm = manager.resizeCalls.length;
+  harness.terminal.emitInput("\x1b[B"); // -> Saved conversations
   harness.terminal.emitInput("\x1b[B"); // -> New session row
   harness.terminal.emitInput(ENTER); // open the form
   harness.terminal.emitInput("draft label"); // form field input
@@ -1476,6 +1555,7 @@ test("responsive resize resizes every owned child only when native geometry chan
   const manager = await ready(harness);
   fillForm(harness.terminal, "first");
   await nextTurn();
+  harness.terminal.emitInput("\x1b[B"); // -> Saved conversations
   harness.terminal.emitInput("\x1b[B"); // next row is New session
   harness.terminal.emitInput(ENTER);
   completeForm(harness.terminal, "/workspace-two");
@@ -1660,4 +1740,294 @@ test("stdin end, output error, startup failure, forced termination, and incomple
   await ready(writerFailure);
   writerFailure.writer.closeResult = false;
   assert.equal(await closeWithSignal(writerFailure), 1, "an unconfirmed frame-writer cleanup is not reported as success");
+});
+
+// --- Deliberate saved-conversation picker (issue 323). ---
+//
+// The synthetic listSavedCatalog override records exactly what Main passes
+// (agentDir, piExecutable, expectedPiVersion, signal) and serves real branded
+// catalogs minted by the landed read-only API against own-root fixtures.
+
+interface SavedMainFixture {
+  root: string;
+  agentDir: string;
+  workspace: string;
+  file: string;
+  sessionId: string;
+}
+
+function makeSavedMainFixture(prefix: string): SavedMainFixture {
+  const root = makeMainTestDirectory(`saved-${prefix}`);
+  const agentDir = join(root, "agent");
+  const workspace = join(root, "workspace");
+  mkdirSync(join(agentDir, "sessions", "proj"), { recursive: true });
+  mkdirSync(workspace, { recursive: true });
+  const sessionId = `saved-main-${prefix}`;
+  const file = join(agentDir, "sessions", "proj", "saved.jsonl");
+  writeFileSync(
+    file,
+    [
+      JSON.stringify({ type: "session", version: 3, id: sessionId, timestamp: "2025-01-01T00:00:00.000Z", cwd: workspace }),
+      JSON.stringify({ type: "message", id: "m1", message: { role: "user", content: [{ type: "text", text: `First conversation ${prefix}` }] } }),
+    ].join("\n") + "\n",
+    "utf8",
+  );
+  return { root, agentDir, workspace, file, sessionId };
+}
+
+function makeSavedListAll() {
+  return async (sessionDir: string, _onProgress?: (progress: Readonly<Record<string, unknown>>) => void, signal?: AbortSignal) => {
+    if (signal?.aborted) {
+      const error = new Error("aborted");
+      error.name = "AbortError";
+      throw error;
+    }
+    const rows: { path: string; id: string; cwd: string }[] = [];
+    for (const entry of readdirSync(sessionDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+      const file = join(sessionDir, entry.name);
+      let text: string;
+      try {
+        text = readFileSync(file, "utf8");
+      } catch {
+        continue;
+      }
+      const first = text.split("\n").find((line) => line.trim() !== "");
+      if (!first) continue;
+      let header: Record<string, unknown>;
+      try {
+        header = JSON.parse(first) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      if (typeof header.id !== "string" || typeof header.cwd !== "string") continue;
+      // Mirror the public SDK's first user message extraction for captions.
+      let firstMessage: string | undefined;
+      for (const line of text.split("\n")) {
+        if (line.trim() === "") continue;
+        try {
+          const entry = JSON.parse(line) as { type?: unknown; message?: { role?: unknown; content?: unknown } };
+          if (entry.type !== "message" || entry.message?.role !== "user") continue;
+          const content = Array.isArray(entry.message.content) ? entry.message.content : [];
+          const firstText = content.find((part): part is { type: string; text: string } =>
+            typeof part === "object" && part !== null && (part as { type?: unknown }).type === "text"
+            && typeof (part as { text?: unknown }).text === "string");
+          if (typeof firstText?.text === "string") firstMessage = firstText.text;
+          break;
+        } catch {
+          continue;
+        }
+      }
+      rows.push({ path: file, id: header.id, cwd: header.cwd, ...(firstMessage !== undefined ? { firstMessage } : {}) });
+    }
+    return rows;
+  };
+}
+
+function savedFixtureDependencies(fixture: SavedMainFixture, listing?: (options: {
+  agentDir: string;
+  piExecutable: string;
+  expectedPiVersion: string;
+  signal: AbortSignal;
+}) => Promise<SavedSessionCatalog>) {
+  const savedCalls: { agentDir: string; piExecutable: string; expectedPiVersion: string; signal: AbortSignal }[] = [];
+  return {
+    savedCalls,
+    overrides: {
+      createSessionSetup: () => ({
+        nativeSetup: false,
+        nativeAgentDir: fixture.agentDir,
+        profileRegistry: {
+          prepare: () => { throw new Error("the fake Main manager must not prepare sessions"); },
+        } satisfies ProfilePreparer,
+      }),
+      listSavedCatalog: listing ?? (async (options) => {
+        savedCalls.push({ ...options });
+        return listSavedSessions({ agentDir: options.agentDir, listAll: makeSavedListAll(), signal: options.signal });
+      }),
+    },
+  };
+}
+
+/** Opens the saved picker from the default roster selection. */
+function openSavedPicker(terminal: FakeTerminal): void {
+  terminal.emitInput("\x1b[A"); // New session -> Saved conversations
+  terminal.emitInput(ENTER);
+}
+
+test("saved picker lists the shared catalog and opens a new independent child with exact branded admission", async () => {
+  const fixture = makeSavedMainFixture("open");
+  const { savedCalls, overrides } = savedFixtureDependencies(fixture);
+  try {
+    const harness = createHarness({}, overrides);
+    const manager = await ready(harness);
+
+    openSavedPicker(harness.terminal);
+    await nextTurn();
+    await nextTurn();
+    // The listing used the captured Pi identity and the shared native root.
+    assert.equal(savedCalls.length, 1);
+    assert.deepEqual(savedCalls[0], {
+      agentDir: fixture.agentDir,
+      piExecutable: "/synthetic/pi",
+      expectedPiVersion: "1.0.4",
+      signal: savedCalls[0].signal,
+    });
+    const frame = harness.writer.frames.at(-1)?.frame;
+    assert.ok(plain(frame).includes("First conversation open"), "the canonical caption is listed");
+
+    // Deliberate Enter opens the highlighted conversation as a new child.
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    await nextTurn();
+    assert.equal(manager.createOptions.length, 1, "exactly one new child was created");
+    const created = manager.createOptions[0];
+    assert.equal(created.workspace, realpathSync(fixture.workspace), "the exact saved header cwd is the workspace");
+    assert.ok(isSavedSessionAdmission(created.savedSession), "the admission receipt stays branded");
+    assert.equal((created.savedSession as { sessionId: string }).sessionId, fixture.sessionId);
+    assert.equal((created.savedSession as { file: string }).file, fixture.file);
+
+    // Success highlights the new row without transferring input ownership.
+    assert.equal(harness.sidebar?.focus, "sidebar");
+    assert.equal(harness.sidebar?.selectedId, "native-1", "the new row is highlighted only");
+    assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 0).startsWith("Session host"), "no active view was adopted");
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("saved picker cancel aborts the listing and shows no failure notice", async () => {
+  const fixture = makeSavedMainFixture("cancel");
+  try {
+    const { overrides } = savedFixtureDependencies(fixture, async (options) => {
+      // Never resolves unless its signal is aborted.
+      return new Promise<never>((resolve, reject) => {
+        void resolve;
+        options.signal.addEventListener("abort", () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+      });
+    });
+    const harness = createHarness({}, overrides);
+    await ready(harness);
+
+    openSavedPicker(harness.terminal);
+    await nextTurn();
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("Loading saved conversations..."));
+    harness.terminal.emitInput(ESC); // dismiss while the listing is pending
+    await nextTurn();
+    await nextTurn();
+    const frame = plain(harness.writer.frames.at(-1)?.frame);
+    assert.ok(!frame.includes("unavailable"), "an aborted listing never renders as a failure");
+    assert.equal(harness.sidebar?.focus, "sidebar", "dismiss restores the roster display");
+
+    // Shutdown with the (already rejected) listing is clean.
+    assert.equal(await closeWithSignal(harness), 0);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("saved picker fences a late listing completion after dismissal", async () => {
+  const fixture = makeSavedMainFixture("stale");
+  try {
+    const resolvers: Array<(catalog: SavedSessionCatalog) => void> = [];
+    const { overrides } = savedFixtureDependencies(fixture, async (options) => {
+      return new Promise((resolve) => {
+        resolvers.push(resolve);
+      });
+    });
+    const harness = createHarness({}, overrides);
+    await ready(harness);
+
+    openSavedPicker(harness.terminal); // listing R1 pending
+    harness.terminal.emitInput(ESC); // dismiss before it completes
+    assert.equal(resolvers.length, 1);
+    resolvers[0](await listSavedSessions({ agentDir: fixture.agentDir, listAll: makeSavedListAll() }));
+    await nextTurn();
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "sidebar", "the late completion never reopens the pane");
+    assert.ok(!plain(harness.writer.frames.at(-1)?.frame).includes("First conversation stale"), "stale rows never appear");
+
+    // A fresh listing for the reopened pane is still accepted (selection
+    // stayed on the Saved conversations entry after dismissal).
+    harness.terminal.emitInput(ENTER);
+    resolvers[1](await listSavedSessions({ agentDir: fixture.agentDir, listAll: makeSavedListAll() }));
+    await nextTurn();
+    await nextTurn();
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("First conversation stale"), "the fresh listing is shown");
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("saved picker refuses a known-owned duplicate without creating", async () => {
+  const fixture = makeSavedMainFixture("duplicate");
+  try {
+    const { overrides } = savedFixtureDependencies(fixture);
+    const harness = createHarness({}, overrides);
+    const manager = await ready(harness);
+    manager.ownedLiveSessionsData = [{ id: fixture.sessionId }];
+
+    openSavedPicker(harness.terminal);
+    await nextTurn();
+    await nextTurn();
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.equal(manager.createOptions.length, 0, "a known-owned duplicate spawns no child");
+    const frame = plain(harness.writer.frames.at(-1)?.frame);
+    assert.ok(frame.includes("! That saved conversation is already"), `refusal notice is truthful: ${frame}`);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("saved-open before keyboard negotiation is deferred until ready", async () => {
+  const fixture = makeSavedMainFixture("deferred");
+  try {
+    const { overrides } = savedFixtureDependencies(fixture);
+    const harness = createHarness({}, overrides);
+    const manager = await started(harness); // negotiation not settled yet
+
+    openSavedPicker(harness.terminal);
+    await nextTurn();
+    await nextTurn();
+    harness.terminal.emitInput(ENTER); // deliberate open while negotiation is pending
+    await nextTurn();
+    assert.equal(manager.createOptions.length, 0, "no child before keyboard negotiation");
+
+    harness.observer.settle(0);
+    await nextTurn();
+    await nextTurn();
+    assert.equal(manager.createOptions.length, 1, "the deferred saved-open launches after ready");
+    assert.ok(isSavedSessionAdmission(manager.createOptions[0].savedSession));
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("shutdown while a saved listing is pending aborts it and exits cleanly", async () => {
+  const fixture = makeSavedMainFixture("shutdown");
+  try {
+    const { overrides } = savedFixtureDependencies(fixture, async (options) => {
+      return new Promise<never>((resolve, reject) => {
+        void resolve;
+        options.signal.addEventListener("abort", () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+      });
+    });
+    const harness = createHarness({}, overrides);
+    await ready(harness);
+
+    openSavedPicker(harness.terminal);
+    await nextTurn();
+    assert.equal(await closeWithSignal(harness), 0, "a pending read-only listing never blocks shutdown");
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
 });

@@ -11,11 +11,12 @@ import {
 } from "./launch";
 import { TerminalSurface } from "./terminal-surface";
 import { isValidNativeSessionId, isValidRenameName, type SessionHostNativeSession } from "./protocol";
+import { isSavedSessionAdmission, type OwnedLiveSession, type SavedSessionAdmission } from "./saved-sessions";
 import type { StatusRenameRequest, StatusRenameResult, StatusShutdownResult } from "./broker";
 
 /**
  * Independent owned-PTY process lifecycle for the optional per-instance
- * custom terminal host (#323 alpha, POSIX only).
+ * custom terminal host (#323 alpha, POSIX and source-level Windows ConPTY path).
  *
  * `InstanceManager` owns the full native lifecycle of one or more independent
  * native Pi session-host processes. By default every row uses one shared
@@ -72,6 +73,17 @@ import type { StatusRenameRequest, StatusRenameResult, StatusShutdownResult } fr
  *   arguments, no config contents, no tokens, and no provider environment
  *   values; the bootstrap token is redacted even if it somehow surfaced in
  *   an upstream message.
+ * - Deliberate saved-conversation creation (issue 323) accepts a branded
+ *   SavedSessionAdmission, reserves its session id/exact file synchronously
+ *   before any await so concurrent deliberate opens cannot spawn duplicates,
+ *   and passes the receipt verbatim to prepareNativeLaunch. The reservation
+ *   is released only when creation definitively failed before a child exists
+ *   or the exact owned PTY actually exited — never on an acknowledgement,
+ *   unknown state, or reporter disconnect. Each row also keeps its
+ *   last-observed current native conversation id privately (replaced by a
+ *   newer observed binding on native /new or /resume) so duplicate fencing
+ *   survives status disconnects; exited and removed rows never block
+ *   reopening their saved conversation.
  */
 
 /** Default terminal geometry for newly created instances. */
@@ -84,11 +96,6 @@ export const DEFAULT_SHUTDOWN_KILL_MS = 2000;
 
 /** Internal policy seam for synthetic manager tests; production defaults to the actual host platform. */
 let shutdownPlatformForTests: NodeJS.Platform | undefined;
-export const __test = Object.freeze({
-	setShutdownPlatform(platform: NodeJS.Platform | undefined): void {
-		shutdownPlatformForTests = platform;
-	},
-});
 
 /** Upper bound for a single-line instance label (UTF-16 code units). */
 export const MAX_LABEL_CHARS = 80;
@@ -108,7 +115,9 @@ export type InstanceLifecycle = "starting" | "alive" | "exited" | "error";
  * subset of the pinned `@lydell/node-pty` `IPty` (data/exit events, write,
  * resize, kill, pause/resume), injectable so focused tests never load the
  * native addon. The default factory casts the real pinned implementation to
- * this interface; source shape is validated by the real-spawn fixture test.
+ * this interface; Windows ConPTY uses node-pty's normal public spawn API,
+ * not private bindings or emulated callbacks. Actual Windows behavior still
+ * requires the parent-owned native validation harness.
  */
 export interface InstancePty {
 	readonly pid: number;
@@ -206,6 +215,16 @@ export interface CreateInstanceOptions {
 	workspace: string;
 	/** Legacy-test-only explicit profile directory; native setup rejects it. */
 	profile?: string;
+	/**
+	 * Deliberate per-child saved-conversation selection: a branded receipt
+	 * minted by admitSavedSession (src/session-host/saved-sessions.ts) from the
+	 * read-only native saved-conversation catalog. The exact saved header cwd
+	 * (`admission.workspace`) determines the child workspace and must equal
+	 * `workspace` — the host cwd is never substituted. The receipt is reserved
+	 * synchronously before any await for known-owned duplicate fencing and
+	 * passed verbatim to prepareNativeLaunch.
+	 */
+	savedSession?: SavedSessionAdmission;
 }
 
 export interface InstanceManagerOptions {
@@ -263,6 +282,19 @@ interface ManagedInstance {
 	error?: string;
 	profile?: PreparedProfile;
 	profileReleased: boolean;
+	/**
+	 * Synchronous saved-session creation reservation (issue 323): set before
+	 * any await in create() and released only when creation definitively failed
+	 * before a child exists or the exact owned PTY actually exited — never on
+	 * an acknowledgement, unknown state, or reporter disconnect.
+	 */
+	savedReservation?: { readonly sessionId: string; readonly file: string };
+	/**
+	 * Last-observed CURRENT native conversation id, kept privately for
+	 * duplicate fencing across status disconnects. Replaced only by a newer
+	 * observed binding (native /new or /resume); never a UI badge.
+	 */
+	knownNativeSessionId?: string;
 	registration?: InstanceStatusRegistration;
 	registrationReleased: boolean;
 	surface?: TerminalSurface;
@@ -290,10 +322,17 @@ interface LoadedNodePty {
 
 const nodePtyRequire = createRequire(__filename);
 let cachedNodePty: LoadedNodePty | undefined;
+let nodePtyLoaderForTests: (() => LoadedNodePty) | undefined;
 
-function posixOnlyDiagnostic(): string {
-	return `pi-review-gate: per-instance native PTY hosting supports POSIX platforms only in this alpha (${process.platform} cannot host a native terminal instance)`;
-}
+export const __test = Object.freeze({
+	setShutdownPlatform(platform: NodeJS.Platform | undefined): void {
+		shutdownPlatformForTests = platform;
+	},
+	setNodePtyLoaderForTests(loader: (() => LoadedNodePty) | undefined): void {
+		nodePtyLoaderForTests = loader;
+		cachedNodePty = undefined;
+	},
+});
 
 /**
  * The default PTY factory. Loads the pinned `@lydell/node-pty` module only
@@ -302,12 +341,9 @@ function posixOnlyDiagnostic(): string {
  */
 export function createDefaultPtyFactory(): PtyFactory {
 	return (descriptor: InstanceSpawnDescriptor): InstancePty => {
-		if (process.platform === "win32") {
-			throw new Error(posixOnlyDiagnostic());
-		}
 		let nodePty = cachedNodePty;
 		if (!nodePty) {
-			nodePty = nodePtyRequire("@lydell/node-pty") as LoadedNodePty;
+			nodePty = nodePtyLoaderForTests?.() ?? nodePtyRequire("@lydell/node-pty") as LoadedNodePty;
 			cachedNodePty = nodePty;
 		}
 		// The pinned implementation satisfies the InstancePty subset
@@ -609,6 +645,21 @@ export class InstanceManager {
 		if (profile !== undefined && typeof profile !== "string") {
 			throw new Error("session-host: the instance profile directory must be a string");
 		}
+		const savedSession = options.savedSession;
+		if (savedSession !== undefined && !isSavedSessionAdmission(savedSession)) {
+			throw new Error("session-host: the saved-session selection is not a valid admission receipt; select from the current saved-conversation catalog");
+		}
+		// The exact saved header cwd determines the child workspace; a
+		// conflicting explicit workspace is refused, never silently substituted.
+		if (savedSession !== undefined && options.workspace !== savedSession.workspace) {
+			throw new Error("session-host: a saved-session selection uses the conversation's recorded workspace");
+		}
+		// Synchronous known-owned duplicate fence and reservation BEFORE any
+		// await: concurrent deliberate opens of the same saved conversation
+		// cannot both spawn, including pending creations of siblings.
+		if (savedSession !== undefined) {
+			this.#assertSavedSessionAvailable(savedSession);
+		}
 		const id = randomUUID();
 		// Row posted (resource ownership starts here) before any async step.
 		const record: ManagedInstance = {
@@ -622,6 +673,9 @@ export class InstanceManager {
 			pendingInput: null,
 			inputSurface: false,
 			activity: [],
+			savedReservation: savedSession !== undefined
+				? { sessionId: savedSession.sessionId, file: savedSession.file }
+				: undefined,
 			profileReleased: false,
 			registrationReleased: false,
 			ptyExited: false,
@@ -631,7 +685,7 @@ export class InstanceManager {
 		};
 		this.#records.set(id, record);
 		this.#safeChanged(id);
-		const launch = this.#launchInstance(record, { workspace: options.workspace, profile });
+		const launch = this.#launchInstance(record, { workspace: options.workspace, profile, savedSession });
 		this.#inflightCreates.add(launch);
 		try {
 			await launch;
@@ -639,6 +693,52 @@ export class InstanceManager {
 			this.#inflightCreates.delete(launch);
 		}
 		return id;
+	}
+
+	/**
+	 * Refuse a saved-session admission that a known-owned row already holds:
+	 * an active reservation (pending or live creation) with the same session id
+	 * or exact file, or a live row whose last-observed current native binding
+	 * is the same conversation. Exited and removed rows never block reopening.
+	 */
+	#assertSavedSessionAvailable(admission: SavedSessionAdmission): void {
+		for (const record of this.#records.values()) {
+			const live = Boolean(record.pty && !record.ptyExited);
+			if (!live && record.savedReservation === undefined) continue;
+			if (record.savedReservation !== undefined
+				&& (record.savedReservation.sessionId === admission.sessionId
+					|| record.savedReservation.file === admission.file)) {
+				throw new Error("session-host: the saved conversation is already open in this host");
+			}
+			if (live && record.knownNativeSessionId === admission.sessionId) {
+				throw new Error("session-host: the saved conversation is already open in this host");
+			}
+		}
+	}
+
+	/**
+	 * Known-owned live native session data for deliberate saved-conversation
+	 * duplicate fencing (issue 323): the last-observed current conversation id
+	 * of every live row plus admitted saved-session reservations, including
+	 * pending creations. Data only — no process discovery, scan, daemon, or
+	 * lock. Exited and removed rows contribute nothing.
+	 */
+	ownedLiveSessions(): readonly OwnedLiveSession[] {
+		const sessions: OwnedLiveSession[] = [];
+		for (const record of this.#records.values()) {
+			const live = Boolean(record.pty && !record.ptyExited);
+			if (!live && record.savedReservation === undefined) continue;
+			const entry: OwnedLiveSession = {};
+			if (record.savedReservation !== undefined) {
+				entry.id = record.savedReservation.sessionId;
+				entry.file = record.savedReservation.file;
+			}
+			if (live && record.knownNativeSessionId !== undefined) {
+				entry.id = record.knownNativeSessionId;
+			}
+			sessions.push(entry);
+		}
+		return sessions;
 	}
 
 	/**
@@ -858,7 +958,10 @@ export class InstanceManager {
 	 * row with truthful state and owned-resource cleanup, and create()
 	 * resolves with the row id (an error row) instead of orphaning callers.
 	 */
-	async #launchInstance(record: ManagedInstance, options: { workspace: string; profile?: string }): Promise<void> {
+	async #launchInstance(
+			record: ManagedInstance,
+			options: { workspace: string; profile?: string; savedSession?: SavedSessionAdmission },
+		): Promise<void> {
 		try {
 			// 1. Setup admission. Native mode shares the fixed Pi root; legacy
 			// mode is available only through explicit test injection. No tokens
@@ -879,6 +982,12 @@ export class InstanceManager {
 
 			// 2. Native launch preparation (verbatim; the launch module owns
 			// its helper responsibilities; skills publication happens here).
+			// The branded saved-session receipt is revalidated by the launch
+			// module against the accepted agent directory and live file identity
+			// before spawn, then composed as the exact per-child --session pair.
+			// This stretch through registration and spawn never yields, so a
+			// file/header/root replacement landing at the checkpoint above is
+			// caught by the revalidation instead of reaching the child.
 			const descriptor: NativeLaunchDescriptor = prepareNativeLaunch({
 				nativeSetup: this.#nativeSetup,
 				packageRoot: this.#packageRoot,
@@ -887,13 +996,9 @@ export class InstanceManager {
 				piExecutable: this.#piExecutable,
 				args: this.#args,
 				env: this.#env,
+				...(options.savedSession !== undefined ? { savedSession: options.savedSession } : {}),
 			});
 			record.workspace = descriptor.cwd;
-
-			await yieldCheckpoint();
-			if (this.#stopping) {
-				throw new Error("shutting down; spawn aborted before the status registration or child existed");
-			}
 
 			// 3. Status registration immediately before the spawn; its JSON
 			// bootstrap is injected only into a fresh env clone below, at the
@@ -992,11 +1097,13 @@ export class InstanceManager {
 					}
 					return;
 				}
-				// Failed spawn before any child exists: release everything.
+				// Failed spawn before any child exists: release everything,
+				// including the saved-session reservation (no child ever existed).
 				record.error = publicInstanceError("ptySetup");
 				record.lifecycle = "error";
 				this.#releaseRegistration(record);
 				this.#releaseProfile(record);
+				record.savedReservation = undefined;
 				this.#safeChanged(record.id);
 				return;
 			}
@@ -1005,11 +1112,13 @@ export class InstanceManager {
 			}
 		} catch {
 			// Pre-spawn failure or a stop-aborted launch: release everything
-			// acquired so far; no child ever existed to wait for.
+			// acquired so far; no child ever existed to wait for, so the
+			// saved-session reservation (if any) is released with it.
 			record.error = publicInstanceError("launchPreparation");
 			record.lifecycle = "error";
 			this.#releaseRegistration(record);
 			this.#releaseProfile(record);
+			record.savedReservation = undefined;
 			this.#safeChanged(record.id);
 		}
 	}
@@ -1098,12 +1207,14 @@ export class InstanceManager {
 			record.lifecycle = "exited";
 		}
 		// A known exit is the only condition (besides a failed spawn before
-		// any child exists) under which the admission is released.
+		// any child exists) under which the admission — and the saved-session
+		// reservation — is released; an exited row never blocks reopening.
 		this.#releaseRegistration(record);
 		this.#disposeDataListener(record);
 		this.#disposeExitListener(record);
 		this.#disposeReadErrorListener(record);
 		this.#releaseProfile(record);
+		record.savedReservation = undefined;
 		this.#resolveExitWaiters(record);
 		this.#safeChanged(record.id);
 		// Flush the queued child bytes so the retained last frame is the
@@ -1156,6 +1267,19 @@ export class InstanceManager {
 				} else {
 					record.nativeSession = next;
 					record.label = next.name;
+					// Private duplicate-fencing binding: the CURRENT observed
+					// conversation replaces any older one (native /new or
+					// /resume) and is retained across later disconnects.
+					record.knownNativeSessionId = next.sessionId;
+					// A valid newer binding that supersedes the initial saved
+					// conversation releases its reservation: this row no longer
+					// represents that saved file, so the conversation can be
+					// opened again while the new binding stays fenced. Pending
+					// (unobserved) reservations are untouched.
+					if (record.savedReservation !== undefined
+						&& record.savedReservation.sessionId !== next.sessionId) {
+						record.savedReservation = undefined;
+					}
 				}
 			} else {
 				record.nativeSession = null;

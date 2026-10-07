@@ -84,8 +84,61 @@ const NATIVE_SHORT_VALUE_OPTIONS = new Set(["n", "t", "xt", "e"]);
 
 /** Pi config env (dist/config.js ENV_SESSION_DIR): redirects all session storage. */
 const SESSION_DIR_ENV = "PI_CODING_AGENT_SESSION_DIR";
+const WINDOWS_ROLE_ENV_NAMES = new Set([
+  "PI_REVIEW_GATE_RUNTIME_ROLE",
+  "PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG",
+]);
+const WINDOWS_HOST_ONLY_ENV_NAMES = new Set([
+  "PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP",
+  "PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE",
+  "PI_REVIEW_GATE_DDGS_PYTHON",
+  ...["SECRET", "PATH", "SESSION", "CHILD"].flatMap((suffix) => [
+    `PI_REVIEW_GATE_SETTLEMENT_${suffix}`,
+    `PI_REVIEW_GATE_QUIESCENCE_${suffix}`,
+  ]),
+]);
 
 class SessionHostStartupOptionError extends Error {}
+
+/**
+ * Detach an environment snapshot using Windows' case-insensitive name rules.
+ * Role/catalog authorization is retained for fail-closed rejection; only
+ * stale host-owned capabilities are discarded. Conflicting ordinary aliases
+ * are ambiguous and reject rather than choosing whichever a child sees.
+ */
+function snapshotSessionHostEnvironment(env, platform = process.platform) {
+  if (env === undefined) return {};
+  if (env === null || typeof env !== "object" || Array.isArray(env)) {
+    throw new SessionHostStartupOptionError("Invalid session host environment.");
+  }
+  if (platform !== "win32") return { ...env };
+
+  const valuesByName = new Map();
+  for (const [rawName, value] of Object.entries(env)) {
+    const name = rawName.toUpperCase();
+    if (WINDOWS_HOST_ONLY_ENV_NAMES.has(name)) continue;
+    const values = valuesByName.get(name) || [];
+    values.push(value);
+    valuesByName.set(name, values);
+  }
+
+  const snapshot = {};
+  for (const [name, values] of valuesByName) {
+    if (WINDOWS_ROLE_ENV_NAMES.has(name)) {
+      // A benign empty spelling must never shadow a nonempty worker marker.
+      snapshot[name] = values.find((value) => typeof value === "string" && value.length > 0) ?? values[0];
+      continue;
+    }
+    const [value, ...aliases] = values;
+    if (aliases.some((alias) => alias !== value)) {
+      throw new SessionHostStartupOptionError(
+        "Conflicting case variants in the Windows environment; refusing to select one value.",
+      );
+    }
+    snapshot[name] = value;
+  }
+  return snapshot;
+}
 
 /**
  * Assert that the native args and environment carry no parent startup
@@ -96,7 +149,7 @@ class SessionHostStartupOptionError extends Error {}
  * @param {readonly string[]} args Native Pi arguments (after the wrapper's own `--`).
  * @param {NodeJS.ProcessEnv} [env] Environment to check for a session-dir override.
  */
-function assertSessionHostStartupOptions(args, env) {
+function assertSessionHostStartupOptions(args, env, platform = process.platform) {
   if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string")) {
     throw new SessionHostStartupOptionError("Invalid session host startup arguments.");
   }
@@ -130,7 +183,8 @@ function assertSessionHostStartupOptions(args, env) {
     // Positional message or @file data: never an option; scanning continues.
   }
 
-  const sessionDir = env === undefined ? undefined : env[SESSION_DIR_ENV];
+  const snapshot = env === undefined ? undefined : snapshotSessionHostEnvironment(env, platform);
+  const sessionDir = snapshot === undefined ? undefined : snapshot[SESSION_DIR_ENV];
   if (typeof sessionDir === "string" && sessionDir.length > 0) {
     throw new SessionHostStartupOptionError(`session host startup override is not accepted: ${SESSION_DIR_ENV}`);
   }
@@ -138,6 +192,7 @@ function assertSessionHostStartupOptions(args, env) {
 
 module.exports = {
   assertSessionHostStartupOptions,
+  snapshotSessionHostEnvironment,
   SessionHostStartupOptionError,
   SESSION_DIR_ENV,
 };

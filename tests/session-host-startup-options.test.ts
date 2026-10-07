@@ -6,7 +6,8 @@ import test from "node:test";
 
 const requireCjs = createRequire(join(process.cwd(), "tests", "session-host-startup-options.test.ts"));
 const helper = requireCjs("../scripts/session-host-startup-options.cjs") as {
-  assertSessionHostStartupOptions(args: readonly string[], env?: NodeJS.ProcessEnv): void;
+  assertSessionHostStartupOptions(args: readonly string[], env?: NodeJS.ProcessEnv, platform?: NodeJS.Platform): void;
+  snapshotSessionHostEnvironment(env?: NodeJS.ProcessEnv, platform?: NodeJS.Platform): NodeJS.ProcessEnv;
   SessionHostStartupOptionError: new (message: string) => Error;
   SESSION_DIR_ENV: string;
 };
@@ -151,6 +152,56 @@ test("rejects a nonempty inherited session-dir env override; empty/absent is ben
   assertAdmitted([], { PI_CODING_AGENT_SESSION_DIR: "" });
   assertAdmitted([], {});
   assertAdmitted([]);
+});
+
+test("Windows environment snapshots canonicalize aliases, drop only stale host capabilities, and preserve ordinary security values", () => {
+  const env: NodeJS.ProcessEnv = {
+    Path: "/synthetic/bin",
+    PATH: "/synthetic/bin",
+    node_options: "--no-warnings --require=trusted-loader",
+    NODE_OPTIONS: "--no-warnings --require=trusted-loader",
+    Anthropic_Api_Key: "provider-secret",
+    PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP: "old-bootstrap",
+    pi_review_gate_session_host_bootstrap: "conflicting-old-bootstrap",
+    PI_REVIEW_GATE_SETTLEMENT_SECRET: "old-settlement",
+    pi_review_gate_quiescence_child: "old-quiescence",
+    PI_REVIEW_GATE_RUNTIME_ROLE: "",
+    pi_review_gate_runtime_role: "worker-secret",
+    PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG: "",
+    pi_review_gate_executor_tool_catalog: "catalog-secret",
+    PI_REVIEW_GATE_RESEARCH_CEILING: "frozen-research-ceiling",
+    PI_REVIEW_GATE_CAPTURE_CEILING: "frozen-capture-ceiling",
+  };
+  const before = { ...env };
+  const snapshot = helper.snapshotSessionHostEnvironment(env, "win32");
+  assert.deepEqual(snapshot, {
+    PATH: "/synthetic/bin",
+    NODE_OPTIONS: "--no-warnings --require=trusted-loader",
+    ANTHROPIC_API_KEY: "provider-secret",
+    PI_REVIEW_GATE_RUNTIME_ROLE: "worker-secret",
+    PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG: "catalog-secret",
+    PI_REVIEW_GATE_RESEARCH_CEILING: "frozen-research-ceiling",
+    PI_REVIEW_GATE_CAPTURE_CEILING: "frozen-capture-ceiling",
+  });
+  assert.deepEqual(env, before, "the caller's source environment is never mutated");
+  assert.equal(snapshot.PI_REVIEW_GATE_RUNTIME_ROLE, "worker-secret",
+    "a nonempty role marker is retained, not laundered by an empty alias");
+});
+
+test("Windows startup admission rejects ambiguous ordinary aliases and sees mixed-case storage overrides", () => {
+  assert.throws(
+    () => helper.snapshotSessionHostEnvironment({ PATH: "one", Path: "two" }, "win32"),
+    /[Cc]onflicting case variants in the Windows environment/,
+  );
+  assert.throws(
+    () => helper.snapshotSessionHostEnvironment({ NODE_OPTIONS: "--no-warnings", node_options: "--trace-warnings" }, "win32"),
+    /[Cc]onflicting case variants in the Windows environment/,
+  );
+  assert.throws(
+    () => helper.assertSessionHostStartupOptions([], { pi_coding_agent_session_dir: "/private/storage" }, "win32"),
+    /PI_CODING_AGENT_SESSION_DIR/,
+  );
+  helper.assertSessionHostStartupOptions([], { PI_CODING_AGENT_SESSION_DIR: "" }, "win32");
 });
 
 test("never mutates its inputs", () => {

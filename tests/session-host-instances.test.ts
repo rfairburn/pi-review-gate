@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync as readBytesSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync as readBytesSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import test from "node:test";
 
@@ -11,6 +11,8 @@ import {
   DEFAULT_SHUTDOWN_GRACE_MS,
   DEFAULT_SHUTDOWN_KILL_MS,
   InstanceManager,
+  createDefaultPtyFactory,
+  __test as instanceTestSeam,
   MAX_ACTIVITY_ENTRIES,
   MAX_ACTIVITY_ENTRY_CHARS,
   MAX_INSTANCE_ERROR_CHARS,
@@ -25,6 +27,11 @@ import {
   type StatusRegistrar,
 } from "../src/session-host/instances";
 import { ProfileRegistry } from "../src/session-host/profiles";
+import {
+  admitSavedSession,
+  listSavedSessions,
+  type SavedSessionAdmission,
+} from "../src/session-host/saved-sessions";
 import { SESSION_HOST_BOOTSTRAP_ENV, prepareNativeLaunch } from "../src/session-host/launch";
 import { TerminalSurface } from "../src/session-host/terminal-surface";
 import type { StatusRenameRequest, StatusRenameResult } from "../src/session-host/broker";
@@ -45,6 +52,56 @@ import type { StatusRenameRequest, StatusRenameResult } from "../src/session-hos
 function makeTestRoot(label: string): string {
   return realpathSync(mkdtempSync(join(process.cwd(), `.prg-instances-${label}-`)));
 }
+
+test("synthetic Windows default PTY factory lazily delegates the unchanged descriptor to public node-pty spawn", () => {
+  const processPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  assert.ok(processPlatform);
+  let moduleLoads = 0;
+  let captured: { file: string; args: string[]; options: unknown } | undefined;
+  const ownedPty = {} as unknown as InstancePty;
+  instanceTestSeam.setNodePtyLoaderForTests(() => {
+    moduleLoads += 1;
+    return {
+      spawn(file, args, options) {
+        captured = { file, args: [...args], options: { ...options } };
+        return ownedPty as unknown as import("@lydell/node-pty").IPty;
+      },
+    };
+  });
+  Object.defineProperty(process, "platform", { ...processPlatform, value: "win32" });
+  try {
+    const factory = createDefaultPtyFactory();
+    assert.equal(moduleLoads, 0, "factory construction remains lazy and loads no native addon");
+    const env = { Path: "C:\\synthetic\\node" };
+    const descriptor: InstanceSpawnDescriptor = {
+      file: "C:\\synthetic\\node\\node.exe",
+      args: ["C:\\synthetic\\pi\\dist\\cli.js", "--offline"],
+      env,
+      cwd: "C:\\synthetic\\workspace",
+      cols: 91,
+      rows: 37,
+    };
+    assert.equal(factory(descriptor), ownedPty, "the exact public PTY handle is returned to its owner");
+    assert.equal(moduleLoads, 1);
+    assert.deepEqual(captured, {
+      file: descriptor.file,
+      args: descriptor.args,
+      options: {
+        name: "xterm-256color",
+        cols: 91,
+        rows: 37,
+        cwd: descriptor.cwd,
+        env,
+      },
+    });
+    assert.ok(captured && typeof captured.options === "object" && captured.options !== null);
+    assert.equal(Object.hasOwn(captured.options, "useConpty"), false,
+      "normal node-pty spawn selects its supported Windows ConPTY implementation without a deprecated hint");
+  } finally {
+    Object.defineProperty(process, "platform", processPlatform);
+    instanceTestSeam.setNodePtyLoaderForTests(undefined);
+  }
+});
 
 const SHUTDOWN_ENV_KEYS = [
   "PI_REVIEW_GATE_RUNTIME_ROLE",
@@ -2237,6 +2294,351 @@ test("pinned native addon: independent PTYs with an owned Node shim, explicit cw
     assert.equal(viewFor(realManager, idB).lifecycle, "exited");
   } finally {
     await realManager.dispose().catch(() => undefined);
+    cleanup(harness);
+  }
+});
+// --- Deliberate saved-conversation creation (issue 323). ---
+//
+// These cases use the landed read-only saved-sessions API with a synthetic
+// public listAll injection against own-root fixtures: real catalog minting,
+// real branded admissions, real launch revalidation. Fake PTYs only.
+
+const SAVED_SESSION_HEADER_TIMESTAMP = "2025-01-01T00:00:00.000Z";
+
+function writeSavedSessionFile(dir: string, name: string, id: string, cwd: string): string {
+  const file = join(dir, name);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    file,
+    `${JSON.stringify({ type: "session", version: 3, id, timestamp: SAVED_SESSION_HEADER_TIMESTAMP, cwd })}\n`,
+    "utf8",
+  );
+  return file;
+}
+
+/** Synthetic public-API flat-directory listAll injection (component-test seam). */
+function makeSavedListAll() {
+  return async (
+    sessionDir: string,
+    _onProgress?: (progress: Readonly<Record<string, unknown>>) => void,
+    signal?: AbortSignal,
+  ) => {
+    if (signal?.aborted) {
+      const error = new Error("aborted");
+      error.name = "AbortError";
+      throw error;
+    }
+    const rows: { path: string; id: string; cwd: string }[] = [];
+    for (const entry of readdirSync(sessionDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+      const file = join(sessionDir, entry.name);
+      let text: string;
+      try {
+        text = readBytesSync(file).toString("utf8");
+      } catch {
+        continue;
+      }
+      const first = text.split("\n").find((line) => line.trim() !== "");
+      if (!first) continue;
+      let header: Record<string, unknown>;
+      try {
+        header = JSON.parse(first) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      if (typeof header.id === "string" && typeof header.cwd === "string") {
+        rows.push({ path: file, id: header.id, cwd: header.cwd });
+      }
+    }
+    return rows;
+  };
+}
+
+interface SavedFixture {
+  agentDir: string;
+  workspace: string;
+  home: string;
+  env: NodeJS.ProcessEnv;
+  manager: InstanceManager;
+}
+
+function makeSavedHarness(label: string): Harness & SavedFixture {
+  const harness = makeHarness(`saved-${label}`);
+  const agentDir = join(harness.root, `saved-agent-${label}`);
+  const workspace = join(harness.root, `saved-workspace-${label}`);
+  const home = join(harness.root, `saved-home-${label}`);
+  mkdirSync(workspace, { recursive: true });
+  mkdirSync(home, { recursive: true });
+  mkdirSync(join(agentDir, "sessions"), { recursive: true });
+  const env: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH,
+    HOME: home,
+    PI_CODING_AGENT_DIR: agentDir,
+  };
+  const manager = new InstanceManager({
+    packageRoot: harness.packageRoot,
+    piExecutable: harness.piExecutable,
+    statusRegistrar: harness.registrar,
+    env,
+    ptyFactory: harness.ptyFactory,
+  });
+  return { ...harness, agentDir, workspace, home, env, manager };
+}
+
+async function admissionFor(harness: SavedFixture, id: string): Promise<SavedSessionAdmission> {
+  const catalog = await listSavedSessions({ agentDir: harness.agentDir, listAll: makeSavedListAll() });
+  const row = catalog.rows.find((candidate) => candidate.id === id);
+  assert.ok(row, `catalog lists ${id}`);
+  const admitted = admitSavedSession(catalog, row);
+  assert.equal(admitted.status, "admitted");
+  if (admitted.status !== "admitted") throw new Error("unreachable");
+  return admitted.admission;
+}
+
+test("saved-session create composes the exact per-child --session admission in the shared native root", { skip: process.platform === "win32" }, async () => {
+  const harness = makeSavedHarness("compose");
+  try {
+    const file = writeSavedSessionFile(join(harness.agentDir, "sessions", "proj"), "one.jsonl", "saved-compose-1", harness.workspace);
+    const admission = await admissionFor(harness, "saved-compose-1");
+
+    // A conflicting explicit workspace is refused: the header cwd decides.
+    await assert.rejects(
+      harness.manager.create({ workspace: harness.workspace2, savedSession: admission }),
+      /recorded workspace/,
+    );
+    // A forged (non-branded) receipt is refused before any row exists.
+    await assert.rejects(
+      harness.manager.create({
+        workspace: admission.workspace,
+        savedSession: { ...admission } as unknown as SavedSessionAdmission,
+      }),
+      /not a valid admission receipt/,
+    );
+    assert.equal(harness.spawned.length, 0, "refusals spawn no child and post no row");
+
+    const id = await harness.manager.create({ workspace: admission.workspace, savedSession: admission });
+    const descriptor = harness.spawned[0]?.spawnDescriptor;
+    assert.ok(descriptor);
+    assert.equal(descriptor.cwd, realpathSync(harness.workspace), "the exact saved header cwd is the child workspace");
+    assert.deepEqual(descriptor.args.slice(0, 6), [
+      "--extension", join(harness.packageRoot, "dist", "src", "session-host", "reporter.js"),
+      "--extension", join(harness.packageRoot, "dist", "src", "index.js"),
+      "--session", file,
+    ], "the exact --session pair is composed after the extension pairs");
+    assert.equal(viewFor(harness.manager, id).lifecycle, "alive");
+  } finally {
+    cleanup(harness);
+  }
+});
+
+test("saved-session duplicate fencing: concurrent and live reservations, released only on confirmed exit", { skip: process.platform === "win32" }, async () => {
+  const harness = makeSavedHarness("fence");
+  try {
+    writeSavedSessionFile(join(harness.agentDir, "sessions", "proj"), "one.jsonl", "saved-fence-1", harness.workspace);
+    const admission = await admissionFor(harness, "saved-fence-1");
+
+    // Concurrent deliberate opens: the second is fenced synchronously by the
+    // first create's reservation, before any await.
+    const first = harness.manager.create({ workspace: admission.workspace, savedSession: admission });
+    await assert.rejects(
+      harness.manager.create({ workspace: admission.workspace, savedSession: admission }),
+      /already open in this host/,
+    );
+    const idA = await first;
+
+    // A live row with the reservation still fences a later deliberate open.
+    await assert.rejects(
+      harness.manager.create({ workspace: admission.workspace, savedSession: admission }),
+      /already open in this host/,
+    );
+    assert.deepEqual(harness.manager.ownedLiveSessions(), [
+      { id: "saved-fence-1", file: admission.file },
+    ], "the pending/live reservation is known-owned data");
+
+    // Only the exact owned PTY's actual exit releases the reservation.
+    harness.spawned[0]!.emitExit(0);
+    assert.equal(harness.manager.closeExited(idA), true);
+    const idB = await harness.manager.create({ workspace: admission.workspace, savedSession: admission });
+    assert.equal(viewFor(harness.manager, idB).lifecycle, "alive", "exited rows never block reopening");
+  } finally {
+    cleanup(harness);
+  }
+});
+
+test("saved-session reservation is released when creation definitively fails before a child exists", { skip: process.platform === "win32" }, async () => {
+  const harness = makeSavedHarness("release-fail");
+  try {
+    writeSavedSessionFile(join(harness.agentDir, "sessions", "proj"), "one.jsonl", "saved-release-1", harness.workspace);
+    const admission = await admissionFor(harness, "saved-release-1");
+
+    let failNextSpawn = true;
+    const originalFactory = harness.ptyFactory;
+    const manager = new InstanceManager({
+      packageRoot: harness.packageRoot,
+      piExecutable: harness.piExecutable,
+      statusRegistrar: harness.registrar,
+      env: harness.env,
+      ptyFactory: (descriptor) => {
+        if (failNextSpawn) {
+          failNextSpawn = false;
+          throw new Error("synthetic spawn failure");
+        }
+        return originalFactory(descriptor);
+      },
+    });
+
+    const failedId = await manager.create({ workspace: admission.workspace, savedSession: admission });
+    assert.equal(viewFor(manager, failedId).lifecycle, "error", "the failed row is contained to itself");
+    // The reservation is released with the pre-child failure: reopening works.
+    const retryId = await manager.create({ workspace: admission.workspace, savedSession: admission });
+    assert.equal(viewFor(manager, retryId).lifecycle, "alive");
+  } finally {
+    cleanup(harness);
+  }
+});
+
+test("known native bindings fence duplicate saved admissions across disconnect and replace on rebind", { skip: process.platform === "win32" }, async () => {
+  const harness = makeSavedHarness("rebind");
+  try {
+    const proj = join(harness.agentDir, "sessions", "proj");
+    writeSavedSessionFile(proj, "x.jsonl", "conv-x", harness.workspace);
+    writeSavedSessionFile(proj, "y.jsonl", "conv-y", harness.workspace2);
+    // One catalog mints both admissions at the same revision.
+    const catalog = await listSavedSessions({ agentDir: harness.agentDir, listAll: makeSavedListAll() });
+    const rowX = catalog.rows.find((candidate) => candidate.id === "conv-x");
+    const rowY = catalog.rows.find((candidate) => candidate.id === "conv-y");
+    assert.ok(rowX && rowY);
+    const admittedX = admitSavedSession(catalog, rowX);
+    const admittedY = admitSavedSession(catalog, rowY);
+    assert.equal(admittedX.status, "admitted");
+    assert.equal(admittedY.status, "admitted");
+    if (admittedX.status !== "admitted" || admittedY.status !== "admitted") throw new Error("unreachable");
+
+    const id = await harness.manager.create({ label: "ordinary", workspace: harness.workspace });
+    const entry = harness.registrar.entryFor(id);
+
+    // The observed current binding fences the same conversation's admission.
+    harness.registrar.emitStatus(entry, { busy: null, pendingInput: null, inputSurface: false, activity: [], nativeSession: { sessionId: "conv-x", epoch: 1, name: "Conversation X" } });
+    await assert.rejects(
+      harness.manager.create({ workspace: admittedX.admission.workspace, savedSession: admittedX.admission }),
+      /already open in this host/,
+    );
+
+    // A status disconnect retains the last-known CURRENT binding.
+    harness.registrar.emitDisconnect(entry);
+    await assert.rejects(
+      harness.manager.create({ workspace: admittedX.admission.workspace, savedSession: admittedX.admission }),
+      /already open in this host/,
+    );
+
+    // A newer observed binding (native /new or /resume) replaces it.
+    harness.registrar.emitStatus(entry, { busy: null, pendingInput: null, inputSurface: false, activity: [], nativeSession: { sessionId: "conv-y", epoch: 2, name: "Conversation Y" } });
+    await assert.rejects(
+      harness.manager.create({ workspace: admittedY.admission.workspace, savedSession: admittedY.admission }),
+      /already open in this host/,
+    );
+    const reopened = await harness.manager.create({ workspace: admittedX.admission.workspace, savedSession: admittedX.admission });
+    assert.equal(viewFor(harness.manager, reopened).lifecycle, "alive", "the replaced conversation can be opened again");
+  } finally {
+    cleanup(harness);
+  }
+});
+
+test("saved-origin rebind releases the initial reservation; the new binding stays fenced", { skip: process.platform === "win32" }, async () => {
+  const harness = makeSavedHarness("rebind-saved");
+  try {
+    const proj = join(harness.agentDir, "sessions", "proj");
+    writeSavedSessionFile(proj, "x.jsonl", "conv-x", harness.workspace);
+    writeSavedSessionFile(proj, "y.jsonl", "conv-y", harness.workspace2);
+    // One catalog mints both admissions at the same revision.
+    const catalog = await listSavedSessions({ agentDir: harness.agentDir, listAll: makeSavedListAll() });
+    const rowX = catalog.rows.find((candidate) => candidate.id === "conv-x");
+    const rowY = catalog.rows.find((candidate) => candidate.id === "conv-y");
+    assert.ok(rowX && rowY);
+    const admittedX = admitSavedSession(catalog, rowX);
+    const admittedY = admitSavedSession(catalog, rowY);
+    assert.equal(admittedX.status, "admitted");
+    assert.equal(admittedY.status, "admitted");
+    if (admittedX.status !== "admitted" || admittedY.status !== "admitted") throw new Error("unreachable");
+
+    // Open X through the saved picker: its reservation fences X while live.
+    const idA = await harness.manager.create({ workspace: admittedX.admission.workspace, savedSession: admittedX.admission });
+    const entry = harness.registrar.entryFor(idA);
+    await assert.rejects(
+      harness.manager.create({ workspace: admittedX.admission.workspace, savedSession: admittedX.admission }),
+      /already open in this host/,
+    );
+
+    // The observed binding confirms X, then native /new moves the child to Y.
+    harness.registrar.emitStatus(entry, { busy: null, pendingInput: null, inputSurface: false, activity: [], nativeSession: { sessionId: "conv-x", epoch: 1, name: "Conversation X" } });
+    harness.registrar.emitStatus(entry, { busy: null, pendingInput: null, inputSurface: false, activity: [], nativeSession: { sessionId: "conv-y", epoch: 2, name: "Conversation Y" } });
+
+    // The superseded reservation is released: X can be opened again...
+    const idB = await harness.manager.create({ workspace: admittedX.admission.workspace, savedSession: admittedX.admission });
+    assert.equal(viewFor(harness.manager, idB).lifecycle, "alive", "the replaced conversation can be opened again");
+    // ...while the current binding Y stays fenced and is no longer paired with X's file.
+    await assert.rejects(
+      harness.manager.create({ workspace: admittedY.admission.workspace, savedSession: admittedY.admission }),
+      /already open in this host/,
+    );
+    assert.deepEqual(harness.manager.ownedLiveSessions(), [
+      { id: "conv-y" },
+      { id: "conv-x", file: rowX.file },
+    ], "the rebound row reports only its current binding; the new child keeps its reservation");
+  } finally {
+    cleanup(harness);
+  }
+});
+
+test("saved admission is revalidated at the final checkpoint: a replaced file spawns no child", { skip: process.platform === "win32" }, async () => {
+  const harness = makeSavedHarness("checkpoint");
+  try {
+    const proj = join(harness.agentDir, "sessions", "proj");
+    const file = writeSavedSessionFile(proj, "one.jsonl", "saved-checkpoint-1", harness.workspace);
+    const admission = await admissionFor(harness, "saved-checkpoint-1");
+
+    // Replace the exact file during the final launch checkpoint (before the
+    // admission revalidation): the child must never receive a path that no
+    // longer matches the branded admission.
+    setImmediate(() => {
+      rmSync(file);
+      writeSavedSessionFile(proj, "one.jsonl", "saved-checkpoint-2", harness.workspace);
+    });
+    const id = await harness.manager.create({ workspace: admission.workspace, savedSession: admission });
+    assert.equal(viewFor(harness.manager, id).lifecycle, "error", "the replaced file is contained to an error row");
+    assert.equal(harness.spawned.length, 0, "no child spawns from a stale admission");
+    assert.deepEqual(harness.manager.ownedLiveSessions(), [], "the failed reservation is released");
+  } finally {
+    cleanup(harness);
+  }
+});
+
+test("ownedLiveSessions reports live bindings and reservations only; exited rows contribute nothing", { skip: process.platform === "win32" }, async () => {
+  const harness = makeSavedHarness("owned");
+  try {
+    writeSavedSessionFile(join(harness.agentDir, "sessions", "proj"), "one.jsonl", "saved-owned-1", harness.workspace);
+    const admission = await admissionFor(harness, "saved-owned-1");
+
+    const pending = harness.manager.create({ workspace: admission.workspace, savedSession: admission });
+    assert.deepEqual(harness.manager.ownedLiveSessions(), [
+      { id: "saved-owned-1", file: admission.file },
+    ], "a pending creation reservation is known-owned before its spawn settles");
+    const idA = await pending;
+
+    const idB = await harness.manager.create({ label: "ordinary", workspace: harness.workspace2 });
+    const entry = harness.registrar.entryFor(idB);
+    harness.registrar.emitStatus(entry, { busy: null, pendingInput: null, inputSurface: false, activity: [], nativeSession: { sessionId: "observed-binding", epoch: 1, name: "Observed" } });
+    assert.deepEqual(harness.manager.ownedLiveSessions(), [
+      { id: "saved-owned-1", file: admission.file },
+      { id: "observed-binding" },
+    ]);
+
+    harness.spawned[0]!.emitExit(0);
+    harness.spawned[1]!.emitExit(0);
+    assert.equal(harness.manager.closeExited(idA), true);
+    assert.equal(harness.manager.closeExited(idB), true);
+    assert.deepEqual(harness.manager.ownedLiveSessions(), [], "exited and removed rows never block reopening");
+  } finally {
     cleanup(harness);
   }
 });

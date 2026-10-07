@@ -20,14 +20,22 @@ import {
   type ShutdownResult,
   type StatusRegistrar,
 } from "./instances";
-import { resolveNativePi, RUNTIME_ROLE_ENV, EXECUTOR_TOOL_CATALOG_ENV } from "./launch";
+import { resolveNativePi, RUNTIME_ROLE_ENV, EXECUTOR_TOOL_CATALOG_ENV, snapshotNativeEnvironment } from "./launch";
 import { NativeAgentRegistry, type ProfilePreparer } from "./profiles";
+import {
+  admitSavedSession,
+  listSavedSessions,
+  type SavedSessionAdmissionResult,
+  type SavedSessionCatalog,
+  type SavedSessionRefusalReason,
+} from "./saved-sessions";
 import { SidebarController, type SidebarAction, type SidebarFieldFactoryOptions, type SidebarItem } from "./sidebar";
 import type { TerminalInputModes } from "./terminal-surface";
 
 const STARTUP_OPTIONS_HELPER = join("scripts", "session-host-startup-options.cjs");
 const GENERIC_FAILURE_MESSAGE = "Session host could not complete startup or cleanup.";
 const GENERIC_CREATE_FAILURE = "Session could not be started. Check the workspace, then try again.";
+const SAVED_UNAVAILABLE = "Saved conversations are unavailable in this host";
 const REMOVE_REFUSED_MESSAGE = "Session not removed; it may be live, unconfirmed, or no longer available.";
 const REMOVE_FAILURE_MESSAGE = "Session was not removed; its state could not be confirmed.";
 const INPUT_DRAIN_MAX_MS = 250;
@@ -48,7 +56,7 @@ type MainTerminal = Pick<ProcessTerminal,
   "start" | "stop" | "drainInput" | "write" | "columns" | "rows" | "kittyProtocolActive" | "modifyOtherKeysActive"
 >;
 type MainManager = Pick<InstanceManager,
-  "list" | "surface" | "write" | "resize" | "hasLiveProcesses" | "create" | "rename" | "closeExited" | "shutdown" | "dispose"
+  "list" | "surface" | "write" | "resize" | "hasLiveProcesses" | "create" | "rename" | "closeExited" | "shutdown" | "dispose" | "ownedLiveSessions"
 >;
 type MainObserver = Pick<KeyboardCapabilityObserver, "flags" | "wait" | "dispose" | "feed">;
 type MainWriter = Pick<SessionHostFrameWriter, "start" | "submit" | "close">;
@@ -67,7 +75,7 @@ interface HostSnapshot {
 }
 
 interface MainDependencies {
-  readonly platform: string;
+  readonly platform: NodeJS.Platform;
   readonly nodeVersion: string;
   readonly stdin: MainStdin;
   readonly stdout: MainStdout;
@@ -81,6 +89,13 @@ interface MainDependencies {
   };
   readonly createManager: (options: InstanceManagerOptions) => MainManager;
   readonly createSidebar: (options: ConstructorParameters<typeof SidebarController>[0]) => SidebarController;
+  /** Read-only listing of the shared native agent root's saved conversations. */
+  readonly listSavedCatalog: (options: {
+    agentDir: string;
+    piExecutable: string;
+    expectedPiVersion: string;
+    signal: AbortSignal;
+  }) => Promise<SavedSessionCatalog>;
   readonly createTerminal: () => MainTerminal;
   readonly createObserver: (options: ConstructorParameters<typeof KeyboardCapabilityObserver>[0]) => MainObserver;
   readonly createWriter: (output: Writable, options: Parameters<typeof createSessionHostFrameWriter>[1]) => MainWriter;
@@ -139,7 +154,7 @@ function assertStartupOptions(snapshot: HostSnapshot): string {
 }
 
 function assertPreflight(snapshot: HostSnapshot, dependencies: MainDependencies): void {
-  if (dependencies.platform !== "darwin" && dependencies.platform !== "linux") {
+  if (dependencies.platform !== "darwin" && dependencies.platform !== "linux" && dependencies.platform !== "win32") {
     throw new MainFailure("preflight");
   }
   if (!stableNodeVersion(dependencies.nodeVersion)) {
@@ -196,6 +211,28 @@ function stableNodeVersion(version: string): boolean {
 
 function sidebarFocus(focus: SidebarController["focus"]): HostFocus {
   return focus;
+}
+
+/** Truthful, bounded picker notices for each admission refusal reason. */
+function savedRefusalNotice(reason: SavedSessionRefusalReason): string {
+  switch (reason) {
+    case "stale-catalog":
+      return "The saved list is stale; reopen Saved conversations";
+    case "unknown-row":
+      return "That saved conversation is no longer available; reopen the list";
+    case "missing-file":
+    case "not-a-regular-file":
+    case "symlink-file":
+    case "outside-sessions-root":
+      return "That saved conversation file is unavailable; reopen the list";
+    case "replaced-file":
+    case "malformed-header":
+      return "That saved conversation changed since it was listed; reopen the list";
+    case "workspace-unavailable":
+      return "The saved conversation's workspace is no longer available";
+    case "known-owned-duplicate":
+      return "That saved conversation is already open in this host";
+  }
 }
 
 function statusRegistrar(broker: StatusBroker): StatusRegistrar {
@@ -255,6 +292,7 @@ function productionDependencies(): MainDependencies {
     },
     createManager: (options) => new InstanceManager(options),
     createSidebar: (options) => new SidebarController(options),
+    listSavedCatalog: listSavedSessions,
     createTerminal: () => new ProcessTerminal(),
     createObserver: (options) => new KeyboardCapabilityObserver(options),
     createWriter: (output, options) => createSessionHostFrameWriter(output, options),
@@ -282,6 +320,13 @@ export async function runSessionHost(options: SessionHostOptions): Promise<numbe
 async function runSessionHostController(snapshot: HostSnapshot, dependencies: MainDependencies): Promise<number> {
   let packageRoot: string;
   try {
+    // Windows environment names are case-insensitive. Normalize and reject
+    // ambiguous ordinary aliases before startup storage/role checks, resolver
+    // probes, or any resource construction. POSIX remains case-sensitive.
+    snapshot = {
+      ...snapshot,
+      env: snapshotNativeEnvironment(snapshot.env, dependencies.platform),
+    };
     packageRoot = assertStartupOptions(snapshot);
     assertPreflight(snapshot, dependencies);
   } catch (error) {
@@ -291,6 +336,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     return 1;
   }
 
+  let pi: { file: string; version: string } | undefined;
+  let sessionSetup: {
+    nativeSetup: boolean;
+    profileRegistry: ProfilePreparer;
+    nativeAgentDir?: string;
+  } | undefined;
   let broker: StatusBroker | undefined;
   let manager: MainManager | undefined;
   let terminal: MainTerminal | undefined;
@@ -329,6 +380,13 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let externalEditorTask: Promise<string | undefined> | undefined;
   const createTasks = new Set<Promise<void>>();
   const deferredCreates = new Map<number, Extract<SidebarAction, { type: "create" }>>();
+  // Deliberate saved-conversation picker (issue 323): the last accepted
+  // catalog mints admissions; listing controllers are aborted on dismiss and
+  // shutdown so late completions never contribute.
+  let savedCatalog: SavedSessionCatalog | undefined;
+  const savedListControllers = new Map<number, AbortController>();
+  const savedOpenTasks = new Set<Promise<void>>();
+  const deferredSavedOpens = new Map<number, { readonly file: string; readonly sessionId: string }>();
   let finishRun!: (status: number) => void;
   const runFinished = new Promise<number>((resolve) => { finishRun = resolve; });
 
@@ -695,6 +753,68 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     createTasks.add(task);
   }
 
+  /**
+   * Deliberate saved-conversation open (issue 323): revalidate the exact
+   * catalog row against the live file and known-owned duplicates, then start
+   * a NEW independently owned child with the exact branded per-child
+   * --session admission. The active session is never touched; success only
+   * highlights the new row.
+   */
+  function launchSavedOpen(requestId: number, file: string, sessionId: string): void {
+    if (!manager || !sidebar || shutdownRequested) return;
+    const catalog = savedCatalog;
+    const row = catalog === undefined ? undefined : catalog.rows.find(
+      (candidate) => candidate.file === file && candidate.id === sessionId,
+    );
+    if (catalog === undefined || row === undefined) {
+      sidebar.failSavedOpen(requestId, "That saved conversation is no longer available; reopen the list");
+      scheduleRedraw();
+      return;
+    }
+    let result: SavedSessionAdmissionResult;
+    try {
+      result = admitSavedSession(catalog, row, { ownedLiveSessions: manager.ownedLiveSessions() });
+    } catch {
+      result = { status: "refused", reason: "unknown-row" };
+    }
+    if (result.status === "refused") {
+      sidebar.failSavedOpen(requestId, savedRefusalNotice(result.reason));
+      scheduleRedraw();
+      return;
+    }
+    const admission = result.admission;
+    let task!: Promise<void>;
+    task = (async () => {
+      try {
+        // The exact saved header cwd determines the workspace; the manager
+        // refuses any conflicting explicit workspace and fences duplicates.
+        const id = await manager!.create({ workspace: admission.workspace, savedSession: admission });
+        if (shutdownRequested || !sidebar || !manager) return;
+        const created = manager.list().find((candidate) => candidate.id === id);
+        if (!created || created.lifecycle === "error" || created.lifecycle === "starting") {
+          sidebar.failSavedOpen(requestId, GENERIC_CREATE_FAILURE);
+        } else {
+          // Highlighting the new row is not ownership transfer; only a later
+          // explicit host-row Enter activates it.
+          sidebar.completeSavedOpen(requestId, id);
+        }
+        syncRosterAndSchedule();
+        reconcileLayout(true);
+      } catch (error) {
+        if (!shutdownRequested && sidebar) {
+          sidebar.failSavedOpen(requestId,
+            error instanceof Error && error.message.includes("already open in this host")
+              ? "That saved conversation is already open in this host"
+              : GENERIC_CREATE_FAILURE);
+          scheduleRedraw();
+        }
+      } finally {
+        savedOpenTasks.delete(task);
+      }
+    })();
+    savedOpenTasks.add(task);
+  }
+
   function handleSidebarAction(action: SidebarAction): void {
     if (shutdownRequested) return;
     switch (action.type) {
@@ -749,7 +869,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           },
           () => {
             if (shutdownRequested || !sidebar) return;
-            sidebar.failRename(action.requestId, "Session name could not be persisted; the active session was not changed");
+            sidebar.failRename(action.requestId, "Pi could not set or verify the new session name; the active session was not changed");
             scheduleRedraw();
           },
         );
@@ -781,6 +901,64 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         reconcileLayout(true);
         return;
       }
+      case "saved-list": {
+        if (!manager || !sidebar || !pi || !sessionSetup) return;
+        const agentDir = sessionSetup.nativeAgentDir;
+        if (agentDir === undefined || agentDir === "") {
+          sidebar.failSavedList(action.requestId, SAVED_UNAVAILABLE);
+          scheduleRedraw();
+          return;
+        }
+        const controller = new AbortController();
+        savedListControllers.set(action.requestId, controller);
+        void dependencies.listSavedCatalog({
+          agentDir,
+          piExecutable: pi.file,
+          expectedPiVersion: pi.version,
+          signal: controller.signal,
+        }).then(
+          (catalog) => {
+            savedListControllers.delete(action.requestId);
+            if (shutdownRequested || !sidebar) return;
+            const accepted = sidebar.completeSavedList(
+              action.requestId,
+              catalog.rows.map((row) => ({ id: row.id, file: row.file, caption: row.caption })),
+              catalog.issueCount,
+            );
+            if (accepted) savedCatalog = catalog;
+            scheduleRedraw();
+          },
+          () => {
+            savedListControllers.delete(action.requestId);
+            if (shutdownRequested || !sidebar) return;
+            // A dismissed or shut-down listing is fenced by the sidebar's own
+            // requestId; an aborted signal never renders as a failure notice.
+            if (controller.signal.aborted) return;
+            sidebar.failSavedList(action.requestId, SAVED_UNAVAILABLE);
+            scheduleRedraw();
+          },
+        );
+        reconcileLayout(true);
+        scheduleRedraw();
+        return;
+      }
+      case "saved-cancel": {
+        const controller = savedListControllers.get(action.requestId);
+        if (controller !== undefined) {
+          savedListControllers.delete(action.requestId);
+          try {
+            controller.abort();
+          } catch { /* abort is best-effort */ }
+        }
+        return;
+      }
+      case "saved-open": {
+        if (!manager || !sidebar) return;
+        if (negotiationReady) launchSavedOpen(action.requestId, action.file, action.sessionId);
+        else deferredSavedOpens.set(action.requestId, { file: action.file, sessionId: action.sessionId });
+        scheduleRedraw();
+        return;
+      }
       case "visibility":
         reconcileLayout(true);
         syncOuterMouseModes();
@@ -801,6 +979,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     shutdownPromise = Promise.resolve();
     shutdownRequested = true;
     deferredCreates.clear();
+    deferredSavedOpens.clear();
+    // Abort every outstanding saved-conversation listing; late completions of
+    // an aborted query never contribute to the UI.
+    for (const controller of savedListControllers.values()) {
+      try {
+        controller.abort();
+      } catch { /* abort is best-effort */ }
+    }
+    savedListControllers.clear();
     let shutdownTask: Promise<{ result?: ShutdownResult; failed: boolean }> | undefined;
     if (manager) {
       try {
@@ -880,7 +1067,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             cleanupFailure = true;
           }
         }
-        await Promise.allSettled([...createTasks]);
+        await Promise.allSettled([...createTasks, ...savedOpenTasks]);
       }
 
       if (manager) {
@@ -939,7 +1126,6 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       return await runFinished;
     }
 
-    let pi: { file: string; version: string } | undefined;
     let probeFailed = false;
     try {
       pi = dependencies.resolvePi({ executable: snapshot.piExecutable, env: snapshot.env });
@@ -977,12 +1163,13 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     terminal = dependencies.createTerminal();
     const initialCols = clampDimension(terminal.columns, 80);
     const initialRows = clampDimension(terminal.rows, 24);
-    const sessionSetup = dependencies.createSessionSetup({ env: snapshot.env });
+    sessionSetup = dependencies.createSessionSetup({ env: snapshot.env });
+    const activeSessionSetup = sessionSetup;
     const createTextField = (options: SidebarFieldFactoryOptions) => {
-      if (!sessionSetup.nativeAgentDir) {
+      if (!activeSessionSetup.nativeAgentDir) {
         throw new Error("native Pi agent directory is unavailable for session-host fields");
       }
-      const keybindings = loadNativeFieldKeybindings(sessionSetup.nativeAgentDir);
+      const keybindings = loadNativeFieldKeybindings(activeSessionSetup.nativeAgentDir);
       const common = {
         initialText: options.initialText,
         keybindings: keybindings.manager,
@@ -1082,6 +1269,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       if (!shutdownRequested) {
         for (const action of deferredCreates.values()) launchCreate(action);
         deferredCreates.clear();
+        for (const [requestId, pending] of deferredSavedOpens) {
+          launchSavedOpen(requestId, pending.file, pending.sessionId);
+        }
+        deferredSavedOpens.clear();
         syncOuterMouseModes();
         scheduleRedraw();
       }

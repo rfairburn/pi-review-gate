@@ -214,7 +214,13 @@ test("constructor opens a usable visible welcome picker", () => {
   assert.ok(texts[0].includes("Sessions (0)"));
   assert.ok(texts.some((line) => line.includes("New session")));
   assert.ok(texts.some((line) => line.includes("Quit host")));
-  assert.ok(texts[texts.length - 1].includes("toggle"));
+  // The footer wraps across reserved rows at this width; every hint must
+  // survive the wrap, never an ellipsis.
+  const footer = texts.slice(-2).join(" ");
+  for (const hint of ["toggle", "enter open", "esc hide", "q quit"]) {
+    assert.ok(footer.includes(hint), `missing hint ${JSON.stringify(hint)} in ${JSON.stringify(texts)}`);
+  }
+  assert.ok(!texts.some((line) => line.includes("...")), "no ellipsized hints");
   harness.send(DOWN);
   harness.send(UP);
   assert.equal(controller.focus, "sidebar");
@@ -1574,6 +1580,112 @@ test("selected activity lines render beneath the row, bounded to two", () => {
   assert.ok(texts.every((line) => !line.includes("three")));
   // Bounded rendering only: the stored DTO keeps everything the backend sent.
   assert.equal(harness.controller.items[0]?.activity.length, 4);
+});
+
+test("wide layout renders roster and form as independent panes", () => {
+  const harness = formWith();
+  // render() dispatches to the focused pane (the form) with its cursor.
+  const formPane = harness.controller.render(47, 23);
+  assert.deepEqual(formPane.cursor, { column: 13, row: 1 });
+  assert.ok(assertPaneSafe(formPane.lines, 47, 23)[0].includes("New session"));
+  // The roster pane is still available beside it on wide terminals; its
+  // return type carries no cursor, so it can never claim one.
+  const roster = harness.controller.renderRoster(32, 23);
+  const texts = assertPaneSafe(roster.lines, 32, 23);
+  assert.ok(texts[0].includes("Sessions (1)"));
+  assert.ok(texts.some((line) => line.includes("> New session")));
+});
+
+test("footer hints wrap across reserved rows and never ellipsize", () => {
+  const harness = makeRoster(["a"]);
+  for (const cols of [32, 40, 60]) {
+    const texts = rosterView(harness.controller, cols, 10).texts;
+    const footer = texts.slice(-2).join(" ");
+    for (const hint of ["toggle", "enter open", "esc hide", "q quit"]) {
+      assert.ok(footer.includes(hint), `missing ${JSON.stringify(hint)} at ${cols} cols: ${JSON.stringify(texts)}`);
+    }
+    assert.ok(!texts.some((line) => line.includes("...")), `no ellipsized hints at ${cols} cols`);
+  }
+  // The form footer wraps too, preserving both hints.
+  const form = formWith({ cols: 24 });
+  const texts = assertPaneSafe(form.controller.render(24, 8).lines, 24, 8);
+  const footer = texts.slice(-2).join(" ");
+  assert.ok(footer.includes("enter next/submit"), JSON.stringify(texts));
+  assert.ok(footer.includes("esc toggle-cancel"), JSON.stringify(texts));
+});
+
+test("roster requires a visible entry row; otherwise it falls back to too-small", () => {
+  const { controller } = makeController();
+  // The default toggle footer wraps to three rows at 20 cols; 20x4 leaves no
+  // room for an entry, so Enter would activate an invisible target.
+  const tooSmall = controller.render(20, 4);
+  assert.ok(tooSmall.lines.some((line) => line.includes("too small")));
+  assert.equal(tooSmall.cursor, undefined);
+
+  // One more row keeps exactly one visible entry plus the complete hints.
+  const fits = assertPaneSafe(controller.render(20, 5).lines, 20, 5);
+  assert.ok(fits.some((line) => line.includes("> New session")), JSON.stringify(fits));
+  const footer = fits.slice(-3).join(" ");
+  for (const hint of ["toggle", "enter open", "esc hide", "q quit"]) {
+    assert.ok(footer.includes(hint), `missing ${JSON.stringify(hint)}: ${JSON.stringify(fits)}`);
+  }
+
+  // An error row consumes the last entry slot at 32x4.
+  controller.showError("boom");
+  const tooSmallWithError = controller.render(32, 4);
+  assert.ok(tooSmallWithError.lines.some((line) => line.includes("too small")));
+  const fitsWithError = assertPaneSafe(controller.render(32, 5).lines, 32, 5);
+  assert.ok(fitsWithError.some((line) => line.includes("> New session")), JSON.stringify(fitsWithError));
+  assert.ok(fitsWithError.some((line) => line.includes("boom")));
+  const footerWith = fitsWithError.slice(-2).join(" ");
+  for (const hint of ["toggle", "enter open", "esc hide", "q quit"]) {
+    assert.ok(footerWith.includes(hint), `missing ${JSON.stringify(hint)}: ${JSON.stringify(fitsWithError)}`);
+  }
+});
+
+test("long validated toggle chords render in full, wrapping or falling back instead of truncating", () => {
+  const chord = "ctrl+shift+alt+super+pageDown";
+  const harness = makeController({ toggleKey: chord });
+  harness.controller.updateItems([makeItem({ id: "a" })]);
+  assert.equal(harness.controller.focus, "sidebar");
+
+  // Ample width: the complete label survives the wrap.
+  const wide = assertPaneSafe(harness.controller.render(40, 8).lines, 40, 8);
+  assert.ok(wide.some((line) => line.includes("Ctrl+Shift+Alt+Super+PageDown")), JSON.stringify(wide));
+
+  // Tight width: the chord wraps to its own rows while an entry stays visible.
+  const tight = assertPaneSafe(harness.controller.render(32, 5).lines, 32, 5);
+  assert.ok(tight.some((line) => line.includes("Ctrl+Shift+Alt+Super+PageDown")), JSON.stringify(tight));
+  assert.ok(tight.some((line) => line.includes("> New session")));
+
+  // When even the wrapped chord leaves no entry row, the pane is truthfully
+  // too small with no partial chord.
+  const tooSmall = harness.controller.render(32, 4);
+  assert.ok(tooSmall.lines.some((line) => line.includes("too small")));
+  assert.ok(!tooSmall.lines.join("\n").includes("Ctrl+Shift"), "no partial chord in the fallback");
+});
+
+test("tiny form and confirm geometry falls back to a truthful too-small pane", () => {
+  const form = formWith();
+  // 24x6: the wrapped two-line footer no longer fits under header+fields+status.
+  const tooSmallForm = form.controller.render(24, 6);
+  assert.ok(tooSmallForm.lines.some((line) => line.includes("too small")));
+  assert.equal(tooSmallForm.cursor, undefined);
+  // One more row renders the full form again.
+  const fits = form.controller.render(24, 7);
+  assert.deepEqual(fits.cursor, { column: 13, row: 1 });
+  assertPaneSafe(fits.lines, 24, 7);
+
+  const confirm = makeRoster(["alive"]);
+  confirm.send("q");
+  assert.equal(confirm.controller.focus, "confirm");
+  const tooSmallConfirm = confirm.controller.render(13, 4);
+  assert.ok(tooSmallConfirm.lines.some((line) => line.includes("too small")));
+  // A usable confirm geometry shows the full wrapped hint text.
+  const confirmTexts = assertPaneSafe(confirm.controller.render(32, 6).lines, 32, 6);
+  const footer = confirmTexts.slice(-2).join(" ");
+  assert.ok(footer.includes("enter/y = quit host"), JSON.stringify(confirmTexts));
+  assert.ok(footer.includes("esc/n = cancel"), JSON.stringify(confirmTexts));
 });
 
 test("small panes degrade to a graceful bounded message, never a broken layout", () => {

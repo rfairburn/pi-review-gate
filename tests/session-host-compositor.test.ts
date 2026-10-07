@@ -146,6 +146,57 @@ test("narrow layout keeps native geometry stable and overlays only for non-main 
 	assert.deepEqual(formResult.cursor, { column: 4, row: 1, visible: true });
 });
 
+test("wide form focus replaces only the right native pane while the roster stays left", () => {
+	const layout = computeHostLayout(80, 10, { sidebarVisible: true, focus: "form" });
+	assert.equal(layout.sidebarOverlay, false);
+	assert.deepEqual(layout.sidebar, { column: 0, row: 1, cols: 32, rows: 9 });
+	assert.equal(layout.dividerColumn, 32);
+	assert.deepEqual(layout.form, layout.native, "the form mirrors the native rect");
+	assert.deepEqual(layout.native, { column: 33, row: 1, cols: 47, rows: 9 });
+
+	const main = mainFrame(47, 9, ["native frame", "second", "third"], { column: 5, row: 0, visible: true });
+	const result = composeHostFrame(layout, {
+		main,
+		sidebar: { lines: ["Sessions (1)", "> New session"] },
+		form: { lines: ["New session", "> Label:     my"], cursor: { column: 20, row: 1 } },
+		header: "host",
+		focus: "form",
+	});
+	assertBounded(result.lines, 80, 10);
+	assert.equal(plain(result.lines[1]).slice(0, 32), "Sessions (1)" + " ".repeat(20));
+	assert.equal(plain(result.lines[1])[32], "│");
+	assert.ok(plain(result.lines[1]).slice(33).startsWith("New session"), "form owns the right pane");
+	assert.ok(!result.lines.join("\n").includes("native frame"), "the child frame is hidden, not destroyed");
+	assert.deepEqual(result.cursor, { column: 53, row: 2, visible: true }, "form cursor offsets into the right pane");
+
+	// Closing the form (sidebar focus) restores the native pane without any layout churn.
+	const closed = computeHostLayout(80, 10, { sidebarVisible: true, focus: "sidebar" });
+	assert.equal(closed.form, undefined);
+	assert.deepEqual(closed.native, layout.native, "native geometry is stable across form show/hide");
+	const closedResult = composeHostFrame(closed, {
+		main,
+		sidebar: { lines: ["Sessions (1)"] },
+		header: "host",
+		focus: "sidebar",
+	});
+	assert.ok(plain(closedResult.lines[1]).slice(33).startsWith("native frame"), "same child frame returns after the form closes");
+	assert.equal(closedResult.cursor.visible, false);
+});
+
+test("wide form focus keeps a hidden-cursor fallback when the form is too small for its pane", () => {
+	const layout = computeHostLayout(53, 4, { sidebarVisible: true, focus: "form" });
+	assert.deepEqual(layout.form, layout.native); // 20-column native pane
+	const result = composeHostFrame(layout, {
+		sidebar: { lines: ["Sessions (0)"] },
+		form: { lines: ["too small", " ", " ", " "] },
+		header: "host",
+		focus: "form",
+	});
+	assertBounded(result.lines, 53, 4);
+	assert.ok(plain(result.lines[1]).slice(33).startsWith("too small"), "truthful too-small fallback in the right pane");
+	assert.equal(result.cursor.visible, false, "a cursor-less form cannot claim the hardware cursor");
+});
+
 test("missing native content shows the welcome fallback despite supplied but hidden sidebar data", () => {
 	const sidebar: RenderedSidebar = { lines: ["sidebar data"] };
 	const narrowMainFocus = composeHostFrame(

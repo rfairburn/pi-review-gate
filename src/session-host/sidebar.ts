@@ -3,9 +3,11 @@
  * optional custom session host terminal sidebar (#323).
  *
  * Each sidebar row is an independent native process; the main UI is its
- * nativePTY frame, so this module renders ONLY the sidebar pane snapshot
- * (top-level public agent/input/activity metadata) and returns plain,
- * bounded lines at the supplied pane geometry. The compositor owns offsets,
+ * nativePTY frame, so this module renders ONLY the sidebar-owned panes: the
+ * roster snapshot (top-level public agent/input/activity metadata) and the
+ * New session form. It returns plain, bounded lines at the supplied pane
+ * geometry — `render()` for the focused pane, `renderRoster()`/`renderForm()`
+ * for the wide layout that shows both at once. The compositor owns offsets,
  * composition over the native frame, the real TTY, and resizing.
  *
  * Hard boundaries of this module (pure frontend):
@@ -25,6 +27,9 @@
  *   matchesKey).
  * - Roster/form/error text is sanitized (C0/C1/DEL and ANSI/OSC/APC
  *   sequences stripped) and bounded before it can appear in a rendered line.
+ *   Generated hint text wraps across reserved footer rows instead of being
+ *   ellipsized; geometry that cannot show the hints plus a usable pane falls
+ *   back to a truthful too-small message.
  *   Only fixed generated SGR (bold 1, inverse 7/27, explicit 0 resets at row
  *   boundaries) is ever emitted; untrusted ESC/OSC-52/title/window commands
  *   can never reach the composed frame. Real pi-tui key matching
@@ -482,7 +487,10 @@ function normalizeToggleKey(raw: string | undefined): string {
 
 /** Fixed, generated display label for a normalized toggle key id. */
 function toggleDisplayName(key: string): string {
-  const display = sanitizeBounded(key, 24);
+  // Normalization already bounds every component; the complete validated
+  // chord is preserved so the footer wrap (or truthful too-small fallback)
+  // decides what fits instead of a partial, misleading label.
+  const display = sanitizeCellText(key);
   return display
     .split("+")
     .map((part) => (/[a-z]/.test(part.charAt(0)) ? part.charAt(0).toUpperCase() + part.slice(1) : part))
@@ -511,6 +519,49 @@ function wrapRow(text: string, cols: number, sgr?: string): string {
   return sgr === undefined
     ? `\x1b[0m${padded}\x1b[0m`
     : `\x1b[0m${sgr}${padded}\x1b[0m`;
+}
+
+/**
+ * Word-wraps generated hint segments into lines of at most `cols` visible
+ * width, separated by " | ". Hints are never ellipsized: a segment that does
+ * not fit moves whole to the next line, and only a segment wider than the
+ * pane is word-wrapped. Returns undefined when even one word cannot fit, so
+ * callers fall back to the truthful too-small pane instead of half-hints.
+ */
+function wrapHintLines(segments: readonly string[], cols: number): string[] | undefined {
+  const lines: string[] = [];
+  let current = "";
+  for (const segment of segments) {
+    if (visibleWidth(segment) > cols) {
+      // Wider than the pane as a unit: it starts its own line and word-wraps,
+      // so hint separators are never lost or merged.
+      if (current !== "") {
+        lines.push(current);
+        current = "";
+      }
+      for (const word of segment.split(" ")) {
+        if (word.length === 0) continue;
+        if (visibleWidth(word) > cols) return undefined;
+        const candidate = current === "" ? word : `${current} ${word}`;
+        if (visibleWidth(candidate) <= cols) {
+          current = candidate;
+        } else {
+          lines.push(current);
+          current = word;
+        }
+      }
+      continue;
+    }
+    const candidate = current === "" ? segment : `${current} | ${segment}`;
+    if (visibleWidth(candidate) <= cols) {
+      current = candidate;
+    } else {
+      lines.push(current);
+      current = segment;
+    }
+  }
+  if (current !== "") lines.push(current);
+  return lines.length > 0 ? lines : [""];
 }
 
 function blankLines(count: number): string[] {
@@ -858,11 +909,43 @@ export class SidebarController {
     if (!this._visible) {
       return { lines: [] };
     }
+    return this.renderForFocus(cols, rows);
+  }
+
+  /**
+   * Renders the roster picker pane at the supplied geometry regardless of
+   * focus. The wide layout shows it beside the New session form; hidden
+   * visibility is decided by the compositor, not here.
+   */
+  renderRoster(cols: number, rows: number): { lines: string[] } {
+    assertPaneDimension(cols, PANE_MAX_COLS, "cols");
+    assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
+    if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
+      return this.renderTooSmall(cols, rows);
+    }
+    return this.renderRosterPane(cols, rows);
+  }
+
+  /**
+   * Renders the New session form pane at the supplied geometry regardless of
+   * focus. On wide terminals the compositor places it in the native pane's
+   * rect; on narrow terminals it becomes the full-content overlay.
+   */
+  renderForm(cols: number, rows: number): { lines: string[]; cursor?: { column: number; row: number } } {
+    assertPaneDimension(cols, PANE_MAX_COLS, "cols");
+    assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
+    if (cols < FORM_MIN_COLS || rows < FORM_MIN_ROWS) {
+      return this.renderTooSmall(cols, rows);
+    }
+    return this.renderFormPane(cols, rows);
+  }
+
+  private renderForFocus(
+    cols: number,
+    rows: number,
+  ): { lines: string[]; cursor?: { column: number; row: number } } {
     if (this._focus === "form") {
-      if (cols < FORM_MIN_COLS || rows < FORM_MIN_ROWS) {
-        return this.renderTooSmall(cols, rows);
-      }
-      return this.renderFormPane(cols, rows);
+      return this.renderForm(cols, rows);
     }
     if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
       return this.renderTooSmall(cols, rows);
@@ -1310,22 +1393,22 @@ export class SidebarController {
   }
 
   private renderRosterPane(cols: number, rows: number): { lines: string[] } {
-    const header = wrapRow(` Sessions (${this.rowStore.length}) `, cols, "\x1b[1m");
-    const footer = wrapRow(
-      ` ${this.toggleLabel} toggle | enter open | esc hide | q quit `,
+    const header = ` Sessions (${this.rowStore.length}) `;
+    const footerLines = wrapHintLines(
+      [`${this.toggleLabel} toggle`, "enter open", "esc hide", "q quit"],
       cols,
     );
-    const errorRows = this.noticeError === undefined ? 0 : 1;
-    const listRows = rows - 2 - errorRows;
-    const lines: string[] = [header];
-    if (listRows <= 0) {
-      if (this.noticeError !== undefined) {
-        lines.push(wrapRow(` ! ${this.noticeError}`, cols));
-      }
-      lines.push(...blankLines(rows - lines.length - 1));
-      lines.push(footer);
-      return { lines };
+    if (footerLines === undefined || visibleWidth(header) > cols) {
+      return this.renderTooSmall(cols, rows);
     }
+    const errorRows = this.noticeError === undefined ? 0 : 1;
+    const listRows = rows - 1 - errorRows - footerLines.length;
+    // At least one entry row is required: a picker whose selected target is
+    // invisible would let Enter activate something the user cannot see.
+    if (listRows < 1) {
+      return this.renderTooSmall(cols, rows);
+    }
+    const lines: string[] = [wrapRow(header, cols, "\x1b[1m")];
     const selectedIndex = this.entries.findIndex((entry) => entry.key === this.selectedEntryKey);
     const top = this.scrollWindow(selectedIndex, listRows);
     let y = 0;
@@ -1349,8 +1432,10 @@ export class SidebarController {
     if (this.noticeError !== undefined) {
       lines.push(wrapRow(` ! ${this.noticeError}`, cols));
     }
-    lines.push(...blankLines(Math.max(0, rows - lines.length - 1)));
-    lines.push(footer);
+    lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
+    for (const footerLine of footerLines) {
+      lines.push(wrapRow(footerLine, cols));
+    }
     return { lines };
   }
 
@@ -1390,11 +1475,20 @@ export class SidebarController {
   private renderFormPane(
     cols: number,
     rows: number,
-  ): { lines: string[]; cursor: { column: number; row: number } } {
+  ): { lines: string[]; cursor?: { column: number; row: number } } {
+    const header = " New session ";
+    const footerLines = wrapHintLines(["enter next/submit", "esc toggle-cancel"], cols);
+    if (footerLines === undefined || visibleWidth(header) > cols) {
+      return this.renderTooSmall(cols, rows);
+    }
+    // header + 3 fields + reserved status row + wrapped footer
+    if (rows < 1 + 3 + 1 + footerLines.length) {
+      return this.renderTooSmall(cols, rows);
+    }
     const fieldContentWidth = Math.max(cols - PREFIELD_WIDTH, 1);
     const prompts = [" Label:     ", " Workspace: ", " Profile:   "];
     const inputs = [this.labelInput, this.workspaceInput, this.profileInput];
-    const lines = [wrapRow(" New session ", cols, "\x1b[1m")];
+    const lines = [wrapRow(header, cols, "\x1b[1m")];
     let caretColumn = PREFIELD_WIDTH;
     for (let index = 0; index < inputs.length; index += 1) {
       const marker = index === this.formFieldIndex ? ">" : " ";
@@ -1410,14 +1504,19 @@ export class SidebarController {
         caretColumn = PREFIELD_WIDTH + rendered.caretColumn;
       }
     }
-    if (this.pendingCreate !== undefined) {
-      lines.push(wrapRow(` Starting (request ${this.pendingCreate.requestId}) `, cols));
-    } else if (this.formError !== undefined) {
-      lines.push(wrapRow(` ! ${this.formError} `, cols));
+    // The status row is always reserved so an error can never shrink the pane
+    // into a too-small fallback after it appeared.
+    lines.push(
+      this.pendingCreate !== undefined
+        ? wrapRow(` Starting (request ${this.pendingCreate.requestId}) `, cols)
+        : this.formError !== undefined
+          ? wrapRow(` ! ${this.formError} `, cols)
+          : "",
+    );
+    lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
+    for (const footerLine of footerLines) {
+      lines.push(wrapRow(footerLine, cols));
     }
-    const footer = wrapRow(" enter next/submit | esc toggle-cancel ", cols);
-    lines.push(...blankLines(Math.max(0, rows - lines.length - 1)));
-    lines.push(footer);
 
     return {
       lines,
@@ -1429,11 +1528,27 @@ export class SidebarController {
   }
 
   private renderConfirmPane(cols: number, rows: number): { lines: string[] } {
+    const header = " Quit host? ";
     const liveCount = this.rowStore.filter(requiresQuitConfirmation).length;
-    const lines = [wrapRow(" Quit host? ", cols, "\x1b[1m")];
-    lines.push(wrapRow(` ${liveCount} session(s) starting, alive, or host-owned `, cols));
-    lines.push(wrapRow(" enter/y = quit host | esc/n = cancel ", cols));
-    lines.push(...blankLines(Math.max(0, rows - lines.length)));
+    const countLines = wrapHintLines(
+      [`${liveCount} session(s) starting, alive, or host-owned`],
+      cols,
+    );
+    const hintLines = wrapHintLines(["enter/y = quit host", "esc/n = cancel"], cols);
+    if (countLines === undefined || hintLines === undefined || visibleWidth(header) > cols) {
+      return this.renderTooSmall(cols, rows);
+    }
+    if (rows < 1 + countLines.length + hintLines.length) {
+      return this.renderTooSmall(cols, rows);
+    }
+    const lines = [wrapRow(header, cols, "\x1b[1m")];
+    for (const line of countLines) {
+      lines.push(wrapRow(line, cols));
+    }
+    lines.push(...blankLines(Math.max(0, rows - lines.length - hintLines.length)));
+    for (const line of hintLines) {
+      lines.push(wrapRow(line, cols));
+    }
     return { lines };
   }
 }

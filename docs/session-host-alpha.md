@@ -153,11 +153,18 @@ and basic emoji; newer emoji and complex ZWJ sequences are not guaranteed to mat
 Pi's standalone layout.
 
 With the sidebar visible at 53 columns or wider, it uses 32 columns plus a divider
-and leaves at least 20 columns for the native frame. Below that width the sidebar is
-a frontend overlay while it has focus; native geometry remains full-width and
-unchanged across focus switches, and returning to native focus only removes the overlay.
-Very small terminals show bounded text, not a promise that every native Pi menu will
-remain readable.
+and leaves at least 20 columns for the native frame. The New session form
+temporarily replaces that right (native) pane while the roster remains on the left;
+below that width the form is a full-content overlay instead. While the form is open,
+the underlying child keeps running unpaused with its geometry and input ownership
+unchanged, and cancelling or completing the form restores the same child frame.
+Below 53 columns the sidebar is a frontend overlay while it has focus; native
+geometry remains full-width and unchanged across focus switches, and returning to
+native focus only removes the overlay. Sidebar hint text wraps across reserved
+footer rows instead of being ellipsized; when the geometry cannot show the hints
+plus a usable pane, that pane shows a truthful too-small message rather than
+half-hints. Very small terminals show bounded text, not a promise that every native
+Pi menu will remain readable.
 
 The intended mouse path is cell-based and applies only to the active native frame;
 events outside that frame are dropped before coordinate translation, never clamped to

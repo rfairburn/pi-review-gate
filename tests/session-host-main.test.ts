@@ -444,6 +444,10 @@ function plain(frame: ComposedHostFrame | undefined): string {
   return frame?.lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "") ?? "";
 }
 
+function plainLine(frame: ComposedHostFrame | undefined, row: number): string {
+  return frame?.lines[row]?.replace(/\x1b\[[0-9;]*m/g, "") ?? "";
+}
+
 test("Main module import is inert: no ProcessTerminal, native PTY, terminal listeners, or timers are constructed", () => {
   const entry = join(process.cwd(), "dist-test", "src", "session-host", "main.js");
   const script = `
@@ -588,6 +592,52 @@ test("highlighting a newly created row does not transfer active input ownership;
   assert.equal(harness.writer.frames.at(-1)?.frame.cursor.visible, false, "non-alive native frames never retain an owned cursor");
 
   assert.equal(manager.createOptions[1]?.profile, undefined, "blank profile means a fresh independent default profile");
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("wide form temporarily replaces the right pane; the child stays alive, unresized, and unrouted", async () => {
+  const harness = createHarness();
+  const manager = await ready(harness);
+
+  fillForm(harness.terminal, "first");
+  await nextTurn();
+  assert.equal(manager.views[0]?.id, "native-1");
+  assert.equal(manager.views[0]?.hasLiveProcess, true);
+  harness.terminal.emitInput(ENTER); // explicit select -> main focus
+
+  harness.terminal.emitInput(ALT_LEFT); // hide the picker (focus main)
+  harness.terminal.emitInput(ALT_LEFT); // reopen -> sidebar focus on native-1
+  await nextTurn();
+  const resizesBeforeForm = manager.resizeCalls.length;
+  harness.terminal.emitInput("\x1b[B"); // -> New session row
+  harness.terminal.emitInput(ENTER); // open the form
+  harness.terminal.emitInput("draft label"); // form field input
+  await nextTurn();
+  assert.equal(harness.sidebar?.focus, "form");
+
+  const frame = harness.writer.frames.at(-1)?.frame;
+  assert.ok(frame, "a composed frame exists while the form is open");
+  const left = plainLine(frame, 1).slice(0, 32);
+  const right = plainLine(frame, 1).slice(33);
+  assert.ok(left.includes("Sessions (1)"), `roster stays in the left pane: ${JSON.stringify(left)}`);
+  assert.ok(right.trimStart().startsWith("New session"), `form owns the right pane: ${JSON.stringify(right)}`);
+  assert.ok(!frame.lines.join("\n").includes("frame:first"), "the child frame is hidden, not destroyed, while the form is open");
+  // The retained label draft ("first" + "draft label") puts the caret at
+  // pane column 13 + 16 = 29, offset by the right pane origin.
+  assert.deepEqual(frame.cursor, { column: 62, row: 2, visible: true }, "form caret offsets into the right pane");
+  assert.equal(manager.resizeCalls.length, resizesBeforeForm, "opening the form never resizes the child");
+  assert.deepEqual(manager.writes, [], "form input is never broadcast to the child");
+
+  harness.terminal.emitInput(ESC); // cancel the form -> hide sidebar, focus main
+  await nextTurn();
+  assert.equal(harness.sidebar?.focus, "main");
+  assert.equal(manager.views[0]?.hasLiveProcess, true, "cancelling the form leaves the child alive");
+  assert.deepEqual(manager.resizeCalls.at(-1), { cols: 80, rows: 23, ids: ["native-1"] }, "hiding the sidebar restores the full-width native pane");
+  const restored = harness.writer.frames.at(-1)?.frame;
+  assert.ok(restored, "a composed frame exists after the form closes");
+  assert.ok(plainLine(restored, 1).startsWith("frame:first"), "the same child frame returns");
+  harness.terminal.emitInput("q"); // main input still routes to the same active child
+  assert.deepEqual(manager.writes.at(-1), { id: "native-1", data: "q" });
   assert.equal(await closeWithSignal(harness), 0);
 });
 

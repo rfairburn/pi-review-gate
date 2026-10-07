@@ -25,6 +25,12 @@ export interface HostLayout {
 	readonly native: HostPaneRect;
 	readonly sidebar?: HostPaneRect;
 	readonly dividerColumn?: number;
+	/**
+	 * Present only while the New session form temporarily replaces the native
+	 * pane in the wide (non-overlay) layout. It mirrors the native rect so the
+	 * underlying child keeps its geometry underneath.
+	 */
+	readonly form?: HostPaneRect;
 	readonly sidebarOverlay: boolean;
 }
 
@@ -37,6 +43,8 @@ export interface RenderedSidebar {
 export interface ComposeHostFrameOptions {
 	readonly main?: TerminalFrame;
 	readonly sidebar?: RenderedSidebar;
+	/** New session form pane; composed into layout.form when present. */
+	readonly form?: RenderedSidebar;
 	/** Already-generic host label/status; control sequences are never trusted. */
 	readonly header: string;
 	readonly focus: HostFocus;
@@ -76,6 +84,7 @@ export function computeHostLayout(
 		native: HostPaneRect;
 		sidebar?: HostPaneRect;
 		dividerColumn?: number;
+		form?: HostPaneRect;
 		sidebarOverlay: boolean;
 	} = { cols, rows, headerRows, native, sidebarOverlay };
 
@@ -89,6 +98,11 @@ export function computeHostLayout(
 		} else {
 			layout.sidebar = { column: 0, row: headerRows, cols: SIDEBAR_WIDTH, rows: contentRows };
 			layout.dividerColumn = SIDEBAR_WIDTH;
+			if (options.focus === "form") {
+				// The form temporarily replaces the native pane; the roster stays
+				// in the left sidebar and the native child keeps its geometry.
+				layout.form = { ...native };
+			}
 		}
 	}
 
@@ -117,6 +131,7 @@ export function composeHostFrame(layout: HostLayout, options: ComposeHostFrameOp
 		? options.main.lines.slice(0, Number.isSafeInteger(options.main.rows) && options.main.rows > 0 ? options.main.rows : 0)
 		: [EMPTY_HOST_MESSAGE];
 	const sidebarLines = options.sidebar?.lines ?? (fallbackInSidebar ? [EMPTY_HOST_MESSAGE] : []);
+	const formLines = options.form?.lines ?? [];
 
 	for (let row = 0; row < layout.native.rows; row += 1) {
 		const outerRow = layout.native.row + row;
@@ -130,7 +145,10 @@ export function composeHostFrame(layout: HostLayout, options: ComposeHostFrameOp
 		if (layout.dividerColumn !== undefined && layout.sidebar !== undefined) {
 			const sidebarRow = panelRow(sidebarLines[row], layout.sidebar.cols);
 			const divider = `${SGR_RESET}│${SGR_RESET}`;
-			const nativeRow = panelRow(mainLines[row], layout.native.cols);
+			// While the form is open it temporarily replaces the native pane;
+			// the child frame stays composed only after the form closes.
+			const rightLines = layout.form !== undefined ? formLines : mainLines;
+			const nativeRow = panelRow(rightLines[row], layout.native.cols);
 			lines[outerRow] = `${sidebarRow}${divider}${nativeRow}`;
 			continue;
 		}
@@ -156,6 +174,17 @@ export function composeHostFrame(layout: HostLayout, options: ComposeHostFrameOp
 			return { lines, cursor: {
 				column: layout.native.column + mainCursor.column,
 				row: layout.native.row + mainCursor.row,
+				visible: true,
+			} };
+		}
+	}
+
+	if (options.focus === "form" && layout.form !== undefined && options.form?.cursor) {
+		const formCursor = cursorInRect(options.form.cursor, layout.form);
+		if (formCursor) {
+			return { lines, cursor: {
+				column: layout.form.column + formCursor.column,
+				row: layout.form.row + formCursor.row,
 				visible: true,
 			} };
 		}

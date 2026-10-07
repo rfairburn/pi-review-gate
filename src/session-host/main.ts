@@ -5,7 +5,7 @@ import type { Writable } from "node:stream";
 import { ProcessTerminal } from "pi-session-host-tui";
 
 import { createStatusBroker, type StatusBroker } from "./broker";
-import { composeHostFrame, computeHostLayout, type HostFocus, type HostLayout } from "./compositor";
+import { composeHostFrame, computeHostLayout, type HostFocus, type HostLayout, type RenderedSidebar } from "./compositor";
 import { createSessionHostFrameWriter, type SessionHostFrameWriter } from "./frame-writer";
 import { normalizeNativeSourceInput, translateInput, KeyboardCapabilityObserver } from "./input";
 import {
@@ -401,17 +401,29 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             cursor: { ...mainFrame.cursor, visible: false },
           };
         }
-        const sidebarFrame = currentLayout.sidebar
-          ? sidebar.render(currentLayout.sidebar.cols, currentLayout.sidebar.rows)
-          : { lines: [] };
+        // Wide layout with the form open: the roster stays in the left pane
+        // while the form temporarily replaces the native (right) pane. Narrow
+        // overlays and every other focus render a single sidebar-owned pane.
+        const focus = sidebarFocus(sidebar.focus);
+        let sidebarFrame: RenderedSidebar = { lines: [] };
+        let formFrame: RenderedSidebar | undefined;
+        if (currentLayout.sidebar) {
+          if (focus === "form" && currentLayout.form !== undefined) {
+            sidebarFrame = sidebar.renderRoster(currentLayout.sidebar.cols, currentLayout.sidebar.rows);
+            formFrame = sidebar.renderForm(currentLayout.form.cols, currentLayout.form.rows);
+          } else {
+            sidebarFrame = sidebar.render(currentLayout.sidebar.cols, currentLayout.sidebar.rows);
+          }
+        }
         const header = view
           ? `Session host · ${view.label} · ${view.lifecycle}`
           : "Session host";
         const composed = composeHostFrame(currentLayout, {
           main: mainFrame,
           sidebar: sidebarFrame,
+          form: formFrame,
           header,
-          focus: sidebarFocus(sidebar.focus),
+          focus,
         });
         writer.submit(composed, cols, rows);
       } catch {

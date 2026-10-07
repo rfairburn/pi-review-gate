@@ -80,9 +80,12 @@ supplies the live switch (the ordinary extension entry point always does):
 - **Review policy** edits `maxCorrectionCycles` and
   `implementationGuidanceAfterCorrectionAttempts` as non-negative whole numbers.
 - **Bundle retention** selects `never`, `on-failure`, or `always`.
-- **Global concurrency** sets `execution.maxWorkers` (1–16, default 4). This is the
-  total worker ceiling; each worker resource also has its own shared `maxConcurrent`
-  capacity.
+- **Global concurrency** sets `execution.maxWorkers` (1–128, default 4). This is the
+  session-wide worker ceiling shared by every group; each worker resource also has its
+  own shared `maxConcurrent` capacity (1–128). These bound how many workers run at
+  once, not how many tasks one `SubtasksStart`/`SubtasksAdd` call may submit or how
+  many unsettled tasks an execution may hold — see
+  [Worker resources, routes, and concurrency](delegated-execution.md#worker-resources-routes-and-concurrency).
 - **Retry policy** configures bounded executor/reviewer recovery: retry count,
   exponential-backoff bounds, jitter, and the repeated-incident guard.
 - **Subtask notifications** defaults to **Quiet**. See

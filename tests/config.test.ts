@@ -783,7 +783,7 @@ test("normalizeConfig rejects invalid or duplicate executor pool entries", () =>
 workerResources: {
   "bad-capacity": {
     selection: { source: "external", id: "deepseek" },
-    maxConcurrent: 17
+    maxConcurrent: 129
   }
 },
     },
@@ -1160,8 +1160,8 @@ test("scoped pi models resolve as reviewers only when currently available", () =
   assert.equal("model" in frozen.reviewers[0]! ? frozen.reviewers[0].model : undefined, "openai-codex/gpt-5.6-sol");
 });
 
-test("normalizeConfig accepts execution.maxWorkers 1..16", () => {
-  for (const w of [1, 2, 4, 8, 12, 16]) {
+test("normalizeConfig accepts execution.maxWorkers 1..128", () => {
+  for (const w of [1, 2, 4, 8, 12, 16, 64, 128]) {
     const config = normalizeConfig({
       enabled: true,
       execution: { maxWorkers: w },
@@ -1171,8 +1171,8 @@ test("normalizeConfig accepts execution.maxWorkers 1..16", () => {
 });
 
 test("normalizeConfig rejects invalid execution.maxWorkers", () => {
-  assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: 0 } }), /maxWorkers must be between 1 and 16/);
-  assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: 17 } }), /maxWorkers must be between 1 and 16/);
+  assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: 0 } }), /maxWorkers must be between 1 and 128/);
+  assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: 129 } }), /maxWorkers must be between 1 and 128/);
   assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: 2.5 } }), /maxWorkers must be an integer/);
   assert.throws(() => normalizeConfig({ enabled: true, execution: { maxWorkers: "2" } }), /maxWorkers must be an integer/);
 });

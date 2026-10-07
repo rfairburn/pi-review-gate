@@ -375,7 +375,14 @@ export interface ExecutionRetryPolicy {
 }
 
 export const DEFAULT_MAX_WORKERS = 4;
-export const MAX_EXECUTION_WORKERS = 16;
+/**
+ * Upper bound for every concurrent-worker count: `execution.maxWorkers` and a
+ * worker resource's `maxConcurrent`. This is the shared ceiling for the
+ * global worker budget and each per-resource budget; the separate
+ * per-execution unsettled-admission and per-call submission bounds remain
+ * independent concepts.
+ */
+export const MAX_EXECUTION_WORKERS = 128;
 /** Maximum number of results a single web search may request. */
 export const MAX_WEB_SEARCH_RESULTS = 100;
 /** Maximum number of characters a single web fetch may return. */

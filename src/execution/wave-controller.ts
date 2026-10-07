@@ -2,7 +2,13 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { atomicWrite } from "./durable-write";
-import { DEFAULT_EXECUTION_RETRY_POLICY, resolvedExecutorPool, type ReviewGateConfig } from "../config";
+import {
+  DEFAULT_EXECUTION_RETRY_POLICY,
+  DEFAULT_MAX_WORKERS,
+  MAX_EXECUTION_WORKERS,
+  resolvedExecutorPool,
+  type ReviewGateConfig,
+} from "../config";
 import type { WaveCaptureHooks, WaveCaptureResult } from "./wave-repository";
 import { captureWaveBase, discoverWaveSource, WaveCaptureError } from "./wave-repository";
 import {
@@ -198,7 +204,7 @@ export interface WaveControllerInput {
   config: ReviewGateConfig;
   /** Scoped model identifiers for reviewer resolution in every worker lifecycle. */
   scopedModels?: string[];
-  /** Maximum concurrent workers (1..16, default 4). */
+  /** Maximum concurrent workers (1..128, default 4). */
   maxWorkers?: number;
   /** Abort signal. */
   signal?: AbortSignal;
@@ -354,8 +360,10 @@ export interface WaveManifest {
 // ── validation ───────────────────────────────────────────────────────────────
 
 const MIN_WORKERS = 1;
-const MAX_WORKERS = 16;
-const DEFAULT_WORKERS = 4;
+// The concurrent-worker ceiling is the shared config bound (see
+// MAX_EXECUTION_WORKERS); the batch/admission bound is a separate concept.
+const MAX_WORKERS = MAX_EXECUTION_WORKERS;
+const DEFAULT_WORKERS = DEFAULT_MAX_WORKERS;
 
 function validateMaxWorkers(value: number | undefined): number {
   if (value === undefined) {
@@ -667,7 +675,7 @@ function isEligibleForIntegration(result: WaveTaskResult): boolean {
  * (up to maxWorkers), integrate eligible results, plan and execute landing.
  *
  * This is the controller-owned orchestrator. It:
- * 1. Validates input (maxWorkers 1..16, tasks >= 1).
+ * 1. Validates input (maxWorkers 1..128, tasks >= 1).
  * 2. Generates deterministic task IDs (task-0, task-1, ...).
  * 3. Captures the source exactly once via captureWaveBase.
  * 4. Starts at most maxWorkers isolated worktrees/lifecycles concurrently.

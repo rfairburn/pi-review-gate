@@ -518,7 +518,7 @@ documented with the behavior they control in
 including the keyed-catalog shape, legacy array import, and deprecation.
 A complete end-to-end example is `examples/delegated-execution.json`.
 
-Defaults: `execution.maxWorkers` is `4` (allowed range 1–16) and
+Defaults: `execution.maxWorkers` is `4` (allowed range 1–128) and
 `execution.subtaskNotifications` defaults to `quiet`. `execution.deferredPiTools`
 defaults to `true`. The default retry policy is
 `maxRetries: 2`, `baseDelayMs: 1000`, `maxDelayMs: 15000`, `jitter: true`,

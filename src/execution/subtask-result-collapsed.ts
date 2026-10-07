@@ -207,7 +207,7 @@ function startAddCard(details: Record<string, any>, args: Record<string, any> | 
   }
   if (target) lines.push(...bodyLines([`Target: ${target}`], undefined, 1));
   // Bounded inline rendering with explicit disclosure (#56): the collapsed
-  // card stays concise even for a full 16-task group.
+  // card stays concise even for a full batch of tasks.
   const shown = tasks.slice(0, MAX_INLINE_TASKS);
   for (const task of shown) {
     const live = dispatchViewEntry(dispatchView, task.taskId);

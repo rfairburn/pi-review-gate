@@ -209,7 +209,7 @@ The full lifecycle, including commands (`/review-now`, `/review-cancel`, `/revie
 
 ## Delegated execution in one paragraph
 
-With a worker route configured, the orchestrator can start 1–16 bounded background tasks
+With a worker route configured, the orchestrator can start 1–128 bounded background tasks
 per group. An `execute` task captures the source workspace independently (git-ignored
 files are never captured or landed), works in an isolated worktree, and lands on its
 own: accepted tasks acquire the source-mutation lease, replan against current main,

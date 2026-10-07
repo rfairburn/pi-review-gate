@@ -510,19 +510,19 @@ test("maxWorkers rejects 0", async () => {
       config: makeConfigWithWritingExecutor(),
       maxWorkers: 0,
     }),
-    /Invalid maxWorkers.*Must be an integer between 1 and 16/,
+    /Invalid maxWorkers.*Must be an integer between 1 and 128/,
   );
 });
 
-test("maxWorkers rejects 17", async () => {
+test("maxWorkers rejects 129", async () => {
   await assert.rejects(
     async () => executeWave({
       cwd: "/tmp",
       tasks: [{ title: "T", instructions: "i", acceptanceCriteria: [] }],
       config: makeConfigWithWritingExecutor(),
-      maxWorkers: 17,
+      maxWorkers: 129,
     }),
-    /Invalid maxWorkers.*Must be an integer between 1 and 16/,
+    /Invalid maxWorkers.*Must be an integer between 1 and 128/,
   );
 });
 
@@ -534,7 +534,7 @@ test("maxWorkers rejects non-integer", async () => {
       config: makeConfigWithWritingExecutor(),
       maxWorkers: 2.5,
     }),
-    /Invalid maxWorkers.*Must be an integer between 1 and 16/,
+    /Invalid maxWorkers.*Must be an integer between 1 and 128/,
   );
 });
 
@@ -562,7 +562,7 @@ test("maxWorkers accepts 1", async () => {
   }
 });
 
-test("maxWorkers accepts 16", async () => {
+test("maxWorkers accepts 128", async () => {
   const artifactDir = await mkTmp("pi-wc-art-");
   const sourceDir = await mkTmp("pi-wc-src-");
   await git(["init", "--quiet"], sourceDir);
@@ -575,11 +575,11 @@ test("maxWorkers accepts 16", async () => {
       cwd: sourceDir,
       tasks: [{ title: "Test", instructions: "noop", acceptanceCriteria: [] }],
       config: makeConfigWithWritingExecutor(),
-      maxWorkers: 16,
+      maxWorkers: 128,
       artifactDir,
-      waveId: "wc-16",
+      waveId: "wc-128",
     });
-    assert.equal(result.waveId, "wc-16");
+    assert.equal(result.waveId, "wc-128");
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
     await rm(sourceDir, { recursive: true, force: true });

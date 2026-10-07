@@ -15,6 +15,22 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.126]
+
+### Changed
+
+- Worker concurrency and task-submission maxima now reach 128 (#119). The
+  user-configured `execution.maxWorkers` range is 1–128 (default 4 unchanged) as the
+  session-wide worker budget shared by every group, each `workerResources` entry's
+  shared `maxConcurrent` range is 1–128, and `SubtasksStart`/`SubtasksAdd` accept
+  1–128 task definitions per call. The three limits stay distinct: how many tasks one
+  call may submit, how many workers run at once, and the independently enforced
+  per-execution unsettled admission cap, which remains 128. Sequential top-offs after
+  tasks settle remain unbounded, and reviewer concurrency still does not draw on the
+  worker pool. Queueing, per-resource capacity, review, landing, cancellation, and
+  recovery behavior are otherwise unchanged, and the larger maxima imply no
+  sustained-operation or performance guarantee.
+
 ## [0.1.0-dev.125]
 
 ### Fixed

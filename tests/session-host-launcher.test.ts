@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
-import test, { type TestContext } from "node:test";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, opendirSync, readFileSync, readdirSync, renameSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
+import nodeTest, { type TestContext } from "node:test";
 
 interface ParsedArguments {
   help: boolean;
@@ -28,6 +28,29 @@ interface PiRuntimeResult {
   source: string;
 }
 
+interface BuildResult {
+  status: number | null;
+  childStatus?: number | null;
+  error?: Error;
+  signal?: string | null;
+  cleanupConfirmed?: boolean;
+  timedOut?: boolean;
+  outputExceeded?: boolean;
+  retainedStage?: boolean;
+  stagingRoot?: string;
+  ownedStage?: OwnedStage;
+}
+
+interface BoundedProcessResult {
+  status: number | null;
+  signal: string | null;
+  error?: Error;
+  cleanupConfirmed?: boolean;
+  timedOut: boolean;
+  outputExceeded: boolean;
+  stdout: string;
+}
+
 interface LauncherOverrides {
   getEnv?: () => NodeJS.ProcessEnv;
   platform?: string;
@@ -37,13 +60,18 @@ interface LauncherOverrides {
   packageRoot?: string;
   cwd?: string;
   processEnv?: NodeJS.ProcessEnv;
-  build?: (options: { packageRoot: string; agentDir: string; env: NodeJS.ProcessEnv }) => { status: number | null; error?: Error; stagingRoot?: string };
-  ensureDdgs?: (homeDir: string, env: NodeJS.ProcessEnv) => { ok: boolean; python?: string; exitCode?: number };
-  resolvePiRuntime?: (options: { explicit?: string; env: NodeJS.ProcessEnv; agentDir: string; cwd: string; writeError: (text: string) => void }) => PiRuntimeResult;
+  build?: (options: { packageRoot: string; agentDir: string; env: NodeJS.ProcessEnv }) => BuildResult | Promise<BuildResult>;
+  ensureDdgs?: (homeDir: string, env: NodeJS.ProcessEnv, packageRoot?: string) => { ok: boolean; python?: string; exitCode?: number; cleanupUnconfirmed?: boolean } | Promise<{ ok: boolean; python?: string; exitCode?: number; cleanupUnconfirmed?: boolean }>;
+  resolvePiRuntime?: (options: { explicit?: string; env: NodeJS.ProcessEnv; agentDir: string; cwd: string; writeError: (text: string) => void }) => PiRuntimeResult | Promise<PiRuntimeResult>;
   isRegularFile?: (file: string) => boolean;
   loadMain?: (entry: string) => { runSessionHost(options: HostOptions): Promise<number> | number };
   writeOut?: (text: string) => void;
   writeError?: (text: string) => void;
+}
+
+interface OwnedStage {
+  root: string;
+  identity: { dev: bigint; ino: bigint };
 }
 
 interface LauncherModule {
@@ -54,25 +82,87 @@ interface LauncherModule {
   parseSessionHostArguments(argv: readonly string[]): ParsedArguments;
   __test: {
     runSessionHostLauncher(argv: readonly string[], overrides?: LauncherOverrides): Promise<number>;
-    resolvePiRuntime(options: { explicit?: string; env: NodeJS.ProcessEnv; agentDir: string; cwd: string; writeError: (text: string) => void }): PiRuntimeResult;
-    validatePiPackage(pkgDir: string, env: NodeJS.ProcessEnv, options?: { expectedFile?: string; exactVersion?: string }): { file: string; version: string };
-    probePiVersion(file: string, env: NodeJS.ProcessEnv): string;
-    stageSourcePackage(packageRoot: string, buildCacheRoot: string): string;
-    removeOwnedStage(target: string): boolean;
+    resolvePiRuntime(options: { explicit?: string; env: NodeJS.ProcessEnv; agentDir: string; cwd: string; writeError: (text: string) => void }): Promise<PiRuntimeResult>;
+    buildSourceExtension(options: { packageRoot: string; agentDir: string; env: NodeJS.ProcessEnv; sourceBuildTimeoutMs?: number; runNpm?: (npmCli: string, args: string[], options: Record<string, unknown>) => Promise<BoundedProcessResult> }): Promise<BuildResult>;
+    provisionPiRuntime(options: { env: NodeJS.ProcessEnv; agentDir: string; writeError: (text: string) => void; npmCli?: string; beforeVersionRootMkdir?: (versionRoot: string) => void; runNpm?: (npmCli: string, args: string[], options: Record<string, unknown>) => Promise<BoundedProcessResult>; validatePiPackage?: (pkgDir: string, env: NodeJS.ProcessEnv, options?: { exactVersion?: string }) => Promise<{ file: string; version: string }> }): Promise<PiRuntimeResult>;
+    validatePiPackage(pkgDir: string, env: NodeJS.ProcessEnv, options?: { expectedFile?: string; exactVersion?: string }): Promise<{ file: string; version: string }>;
+    probePiVersion(file: string, env: NodeJS.ProcessEnv, processRunner?: (file: string, args: string[], options: Record<string, unknown>) => Promise<BoundedProcessResult>): Promise<string>;
+    runDdgsSetup(homeDir: string, env: NodeJS.ProcessEnv, packageRoot: string, processRunner?: (file: string, args: string[], options: Record<string, unknown>) => Promise<BoundedProcessResult>): Promise<{ ok: boolean; python?: string; exitCode?: number; cleanupUnconfirmed?: boolean }>;
+    stageSourcePackage(packageRoot: string, buildCacheRoot: string): OwnedStage;
+    createOwnedStage(parent: string, prefix: string, randomBytes?: (size: number) => Buffer): OwnedStage;
+    removeOwnedStage(target: OwnedStage): boolean;
+    findNpmCli(env: NodeJS.ProcessEnv): string | undefined;
+    runBoundedProcess(file: string, args: string[], options: Record<string, unknown>): Promise<BoundedProcessResult>;
+    activeBoundedProcessCount(): number;
   };
 }
 
 const requireCjs = createRequire(join(process.cwd(), "tests", "session-host-launcher.test.ts"));
+const fsNative = requireCjs("node:fs") as typeof import("node:fs");
 const launcher = requireCjs("../scripts/pi-review-sessions.cjs") as LauncherModule;
 const gateLauncher = requireCjs("../scripts/pi-review-gate-launcher.cjs") as { ensureDdgs(homeDir: string, env: NodeJS.ProcessEnv): { ok: boolean; python?: string; exitCode?: number } };
 const SCRIPT = join(process.cwd(), "scripts", "pi-review-sessions.cjs");
 
-function makePackageFixture(source: boolean): { root: string; packageRoot: string } {
-  const root = mkdtempSync(join(process.cwd(), ".session-host-launcher-fixture-"));
+interface OwnedFixture {
+  root: string;
+  identity: { dev: bigint; ino: bigint };
+  assertionsComplete?: boolean;
+  processCleanupConfirmed?: boolean;
+}
+
+const fixturesByTest = new WeakMap<TestContext, OwnedFixture[]>();
+type TestBody = (t: TestContext) => unknown;
+type TestOptions = { skip?: boolean | string; todo?: boolean | string; only?: boolean; timeout?: number; concurrency?: number | boolean };
+
+async function runTrackedTestBody(t: TestContext, body: TestBody): Promise<void> {
+  const fixtures: OwnedFixture[] = [];
+  fixturesByTest.set(t, fixtures);
+  let completed = false;
+  try {
+    await body(t);
+    completed = true;
+  } finally {
+    for (const fixture of fixtures) {
+      fixture.assertionsComplete = completed;
+      // Direct-child exit or signal delivery alone does not authorize fixture
+      // cleanup; unconfirmed setup groups remain counted.
+      fixture.processCleanupConfirmed = completed && launcher.__test.activeBoundedProcessCount() === 0;
+      t.after(() => {
+        if (!fixture.assertionsComplete || !fixture.processCleanupConfirmed) {
+          t.diagnostic(`Retained failed-test fixture witness at ${fixture.root}`);
+          return;
+        }
+        if (!removeFixtureTree(fixture.root, fixture.root, fixture.identity)) {
+          t.diagnostic(`Retained fixture that could not be safely removed at ${fixture.root}`);
+        }
+      });
+    }
+    fixturesByTest.delete(t);
+  }
+}
+
+function test(name: string, body: TestBody): void;
+function test(name: string, options: TestOptions, body: TestBody): void;
+function test(name: string, optionsOrBody: TestOptions | TestBody, maybeBody?: TestBody): void {
+  const body = typeof optionsOrBody === "function" ? optionsOrBody : maybeBody;
+  if (!body) throw new Error("test body is required");
+  const trackedBody = (t: TestContext): Promise<void> => runTrackedTestBody(t, body);
+  if (typeof optionsOrBody === "function") {
+    void nodeTest(name, trackedBody);
+  } else {
+    void nodeTest(name, optionsOrBody as never, trackedBody);
+  }
+}
+
+function makePackageFixture(source: boolean): { root: string; packageRoot: string; identity: OwnedFixture["identity"] } {
+  const root = mkdtempSync(join(process.cwd(), "node_modules", ".session-host-launcher-fixture-"));
+  const rootStats = lstatSync(root, { bigint: true });
   const packageRoot = join(root, "package root π");
   mkdirSync(join(packageRoot, "dist", "src", "session-host"), { recursive: true });
   mkdirSync(join(packageRoot, "scripts"), { recursive: true });
+  mkdirSync(join(packageRoot, "skills"), { recursive: true });
   writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name: "pi-review-gate", version: "0.1.0", scripts: { build: "tsc -p tsconfig.json" } }), "utf8");
+  writeFileSync(join(packageRoot, "package-lock.json"), JSON.stringify({ name: "pi-review-gate", version: "0.1.0", lockfileVersion: 3, requires: true, packages: { "": { name: "pi-review-gate", version: "0.1.0" } } }), "utf8");
   writeFileSync(join(packageRoot, "tsconfig.json"), JSON.stringify({ compilerOptions: { outDir: "dist" }, include: ["src/**/*.ts"] }), "utf8");
   // Sentinel content: source-build tests assert the live dist survives.
   writeFileSync(join(packageRoot, "dist", "src", "session-host", "main.js"), "LIVE DIST SENTINEL — never rebuild in place\n", "utf8");
@@ -80,12 +170,228 @@ function makePackageFixture(source: boolean): { root: string; packageRoot: strin
     mkdirSync(join(packageRoot, "src", "session-host"), { recursive: true });
     writeFileSync(join(packageRoot, "src", "session-host", "main.ts"), "// source marker\n", "utf8");
   }
-  return { root, packageRoot };
+  return { root, packageRoot, identity: { dev: rootStats.dev, ino: rootStats.ino } };
 }
 
-function cleanupFixture(t: TestContext, fixture: { root: string }): void {
-  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+function sameFixtureDirectoryChain(chain: Array<{ target: string; identity: OwnedFixture["identity"] }>): boolean {
+  for (const { target, identity } of chain) {
+    try {
+      const current = lstatSync(target, { bigint: true });
+      if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== identity.dev || current.ino !== identity.ino) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
+
+function removeFixtureTree(
+  target: string,
+  root: string,
+  identity: OwnedFixture["identity"],
+  budget = { entries: 0, bytes: 0 },
+  depth = 0,
+  ancestors: Array<{ target: string; identity: OwnedFixture["identity"] }> = [],
+  expectedEntry?: { dev: bigint; ino: bigint },
+): boolean {
+  if (basename(target) === ".terraform") return false;
+  if (depth > 128 || budget.entries >= 200_000) return false;
+  budget.entries += 1;
+  let stats;
+  try {
+    stats = lstatSync(target, { bigint: true });
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
+  }
+  if (target === root && (stats.dev !== identity.dev || stats.ino !== identity.ino || !stats.isDirectory() || stats.isSymbolicLink())) return false;
+  const activeChain = ancestors.length > 0 ? ancestors : [{ target: root, identity }];
+  if (!sameFixtureDirectoryChain(activeChain)) return false;
+  if (expectedEntry && (stats.dev !== expectedEntry.dev || stats.ino !== expectedEntry.ino)) return false;
+  if (stats.isSymbolicLink()) {
+    try {
+      if (!sameFixtureDirectoryChain(activeChain)) return false;
+      const current = lstatSync(target, { bigint: true });
+      if (!current.isSymbolicLink() || current.dev !== stats.dev || current.ino !== stats.ino) return false;
+      unlinkSync(target);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  if (stats.isFile()) {
+    if (stats.size > BigInt(4 * 1024 * 1024 * 1024 - budget.bytes)) return false;
+    budget.bytes += Number(stats.size);
+    try {
+      if (!sameFixtureDirectoryChain(activeChain)) return false;
+      const current = lstatSync(target, { bigint: true });
+      if (!current.isFile() || current.isSymbolicLink() || current.dev !== stats.dev || current.ino !== stats.ino) return false;
+      unlinkSync(target);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  if (!stats.isDirectory()) return false;
+  const directoryIdentity = { dev: stats.dev, ino: stats.ino };
+  if (!sameFixtureDirectoryChain(activeChain)) return false;
+  const directoryChain = target === root ? activeChain : [...activeChain, { target, identity: directoryIdentity }];
+  let complete = true;
+  let directory;
+  try {
+    directory = opendirSync(target);
+  } catch {
+    return false;
+  }
+  try {
+    for (;;) {
+      if (!sameFixtureDirectoryChain(directoryChain)) {
+        complete = false;
+        break;
+      }
+      const entry = directory.readSync();
+      if (!entry) break;
+      const name = entry.name;
+      budget.entries += 1;
+      if (budget.entries > 200_000) {
+        complete = false;
+        break;
+      }
+      if (name === ".terraform") {
+        complete = false;
+        continue;
+      }
+      if (!sameFixtureDirectoryChain(directoryChain)) {
+        complete = false;
+        break;
+      }
+      const childPath = join(target, name);
+      let childStats;
+      try {
+        childStats = lstatSync(childPath, { bigint: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        complete = false;
+        continue;
+      }
+      if (!sameFixtureDirectoryChain(directoryChain)) {
+        complete = false;
+        break;
+      }
+      if (!removeFixtureTree(childPath, root, identity, budget, depth + 1, directoryChain, childStats)) complete = false;
+    }
+  } finally {
+    try {
+      directory.closeSync();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ERR_DIR_CLOSED") throw error;
+    }
+  }
+  try {
+    const after = lstatSync(target, { bigint: true });
+    if (!complete || !sameFixtureDirectoryChain(activeChain) || after.isSymbolicLink() || !after.isDirectory() || after.dev !== stats.dev || after.ino !== stats.ino) return false;
+    const final = lstatSync(target, { bigint: true });
+    if (!sameFixtureDirectoryChain(activeChain) || final.isSymbolicLink() || !final.isDirectory() || final.dev !== stats.dev || final.ino !== stats.ino) return false;
+    rmdirSync(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function cleanupFixture(t: TestContext, fixture: OwnedFixture): void {
+  const fixtures = fixturesByTest.get(t);
+  if (!fixtures) throw new Error("fixture cleanup must be registered by its owning test callback");
+  fixtures.push(fixture);
+}
+
+function withOpendirHook<T>(hook: (path: unknown) => void, action: () => T): T {
+  const originalDescriptor = Object.getOwnPropertyDescriptor(fsNative, "opendirSync");
+  assert.ok(originalDescriptor);
+  const original = fsNative.opendirSync;
+  const patched = (...args: Parameters<typeof fsNative.opendirSync>) => {
+    const directory = Reflect.apply(original, fsNative, args) as ReturnType<typeof fsNative.opendirSync>;
+    hook(args[0]);
+    return directory;
+  };
+  Object.defineProperty(fsNative, "opendirSync", { ...originalDescriptor, value: patched });
+  try {
+    return action();
+  } finally {
+    Object.defineProperty(fsNative, "opendirSync", originalDescriptor);
+  }
+}
+
+function withOpenSyncHook<T>(hook: (path: unknown) => void, action: () => T): T {
+  const originalDescriptor = Object.getOwnPropertyDescriptor(fsNative, "openSync");
+  assert.ok(originalDescriptor);
+  const original = fsNative.openSync;
+  const patched = (...args: Parameters<typeof fsNative.openSync>) => {
+    hook(args[0]);
+    return Reflect.apply(original, fsNative, args) as ReturnType<typeof fsNative.openSync>;
+  };
+  Object.defineProperty(fsNative, "openSync", { ...originalDescriptor, value: patched });
+  try {
+    return action();
+  } finally {
+    Object.defineProperty(fsNative, "openSync", originalDescriptor);
+  }
+}
+
+test("a failed assertion retains its private fixture witness", async (t) => {
+  const fixture = makePackageFixture(false);
+  cleanupFixture(t, fixture);
+  const afterHooks: Array<() => void> = [];
+  const diagnostics: string[] = [];
+  const failedContext = {
+    after: (callback: () => void) => { afterHooks.push(callback); },
+    diagnostic: (message: string) => { diagnostics.push(message); },
+  } as unknown as TestContext;
+
+  await assert.rejects(
+    () => runTrackedTestBody(failedContext, (failedTest) => {
+      cleanupFixture(failedTest, fixture);
+      assert.fail("synthetic assertion failure");
+    }),
+    /synthetic assertion failure/,
+  );
+  assert.equal(afterHooks.length, 1);
+  afterHooks[0]();
+  assert.equal(existsSync(fixture.root), true, "failed test cleanup leaves the private witness intact");
+  assert.match(diagnostics[0], /Retained failed-test fixture witness/);
+});
+
+test("fixture cleanup aborts before following a replaced nested directory", (t) => {
+  const fixture = makePackageFixture(false);
+  cleanupFixture(t, fixture);
+  const outsideRoot = mkdtempSync(join(process.cwd(), "node_modules", ".session-host-cleanup-outside-"));
+  const outsideStats = lstatSync(outsideRoot, { bigint: true });
+  cleanupFixture(t, { root: outsideRoot, identity: { dev: outsideStats.dev, ino: outsideStats.ino } });
+  const nested = join(fixture.root, "nested");
+  const held = join(outsideRoot, "held-original");
+  const victim = join(outsideRoot, "victim");
+  mkdirSync(nested);
+  mkdirSync(victim);
+  writeFileSync(join(nested, "original-sentinel"), "original stays\n", "utf8");
+  writeFileSync(join(victim, "outside-sentinel"), "outside stays\n", "utf8");
+
+  let replaced = false;
+  const removed = withOpendirHook((openedPath) => {
+    if (openedPath === nested && !replaced) {
+      replaced = true;
+      renameSync(nested, held);
+      symlinkSync(victim, nested);
+    }
+  }, () => removeFixtureTree(fixture.root, fixture.root, fixture.identity));
+  assert.equal(replaced, true);
+  assert.equal(removed, false, "fixture cleanup refuses the changed active directory chain");
+  assert.equal(readFileSync(join(held, "original-sentinel"), "utf8"), "original stays\n");
+  assert.equal(readFileSync(join(victim, "outside-sentinel"), "utf8"), "outside stays\n");
+  assert.equal(lstatSync(nested).isSymbolicLink(), true);
+
+  unlinkSync(nested);
+  renameSync(held, nested);
+  assert.equal(removeFixtureTree(fixture.root, fixture.root, fixture.identity), true, "the restored owned fixture is cleanable");
+});
 
 function makeEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
@@ -115,18 +421,24 @@ function baseOverrides(
       assert.equal(root, packageRoot);
       assert.equal(setupEnv.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP, undefined);
       assert.equal(setupEnv.PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE, undefined);
+      assert.equal(setupEnv.PI_REVIEW_GATE_SETTLEMENT_SECRET, undefined);
+      assert.equal(setupEnv.PI_REVIEW_GATE_QUIESCENCE_CHILD, undefined);
       return { status: 0 };
     },
     resolvePiRuntime: (options) => {
       events.push("pi");
       assert.equal(options.env.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP, undefined);
       assert.equal(options.env.PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE, undefined);
+      assert.equal(options.env.PI_REVIEW_GATE_SETTLEMENT_SECRET, undefined);
+      assert.equal(options.env.PI_REVIEW_GATE_QUIESCENCE_CHILD, undefined);
       return { file: "/synthetic/pi", version: "1.0.4", source: "npm-global" };
     },
     ensureDdgs: (homeDir, setupEnv) => {
       events.push("ddgs");
       assert.equal(setupEnv.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP, undefined);
       assert.equal(setupEnv.PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE, undefined);
+      assert.equal(setupEnv.PI_REVIEW_GATE_SETTLEMENT_SECRET, undefined);
+      assert.equal(setupEnv.PI_REVIEW_GATE_QUIESCENCE_CHILD, undefined);
       void homeDir;
       return { ok: true, python: "/synthetic/ddgs/bin/python" };
     },
@@ -220,9 +532,12 @@ test("--help works in the real CLI without TTY, role setup, build, or provisioni
   assert.match(result.stdout, /Node >=22\.19\.0/);
   assert.match(result.stdout, /Pi >=1\.0\.4/);
   assert.match(result.stdout, /no\s+manual Pi CLI path is needed/);
-  assert.match(result.stdout, /Basic controls only;\s*terminal\s+graphics rendering is disabled/);
-  assert.match(result.stdout, /native image\/model input behavior\s+stays\s+native/);
-  assert.match(result.stdout, /startup session\s+overrides \(--continue\/-c[^)]*\) are not accepted/);
+  assert.match(result.stdout, /Basic controls only;\s*terminal\s+graphics rendering\s+is disabled/);
+  assert.match(result.stdout, /native image\/model input behavior\s+stays\s+native/i);
+  assert.match(result.stdout, /startup session\s+overrides\s+\(--continue\/-c[^)]*\) are not accepted/);
+  assert.match(result.stdout, /choose\s+a workspace explicitly in the UI/);
+  assert.match(result.stdout, /new native conversation using Pi's normal session storage/);
+  assert.doesNotMatch(result.stdout, /label|profile-owned|profile storage/i);
   assert.doesNotMatch(result.stdout + result.stderr, /private-role-marker/);
 });
 
@@ -348,35 +663,37 @@ test("production source-build runs in an owned staging root and preserves the li
   cleanupFixture(t, fixture);
   const bin = join(fixture.root, "fake-bin");
   mkdirSync(bin);
-  const log = join(fixture.root, "npm-invocation.json");
-  // The fake npm simulates `npm run build`: it records the invocation and
-  // writes the compiled entry under the staged prefix (never the checkout).
-  writeFileSync(join(bin, "npm"), [
-    `#!${process.execPath}`,
+  const log = join(fixture.root, "npm-invocations.jsonl");
+  writeFileSync(join(bin, "package.json"), JSON.stringify({ name: "npm", version: "10.0.0", bin: { npm: "npm" } }), "utf8");
+  // The fake public npm JS bin simulates locked ci plus `npm run build`.
+  writeFileSync(join(bin, "npm"), `#!/usr/bin/env node\n${[
     `const fs = require("node:fs");`,
     `const path = require("node:path");`,
-    `if (process.argv[2] === "root") process.exit(0); // no global root in this fixture`,
-    `fs.writeFileSync(process.env.TEST_NPM_LOG, JSON.stringify({ args: process.argv.slice(2), cwd: process.cwd(), bootstrap: process.env.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP ?? null, restore: process.env.PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE ?? null, ddgs: process.env.PI_REVIEW_GATE_DDGS_PYTHON ?? null, nodeOptions: process.env.NODE_OPTIONS, provider: process.env.ANTHROPIC_API_KEY }));`,
+    `const args = process.argv.slice(2);`,
+    `fs.appendFileSync(process.env.TEST_NPM_LOG, JSON.stringify({ args, cwd: process.cwd(), home: process.env.HOME, cache: process.env.npm_config_cache, logs: process.env.npm_config_logs_dir, temp: process.env.TMPDIR, bootstrap: process.env.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP ?? null, restore: process.env.PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE ?? null, settlement: process.env.PI_REVIEW_GATE_SETTLEMENT_SECRET ?? null, quiescence: process.env.PI_REVIEW_GATE_QUIESCENCE_CHILD ?? null, ddgs: process.env.PI_REVIEW_GATE_DDGS_PYTHON ?? null, nodeOptions: process.env.NODE_OPTIONS, nodeEnv: process.env.NODE_ENV ?? null, provider: process.env.ANTHROPIC_API_KEY }) + "\\n");`,
+    `if (args[0] === "ci") { fs.mkdirSync(path.join(process.cwd(), "node_modules")); process.exit(0); }`,
     `if (process.argv[2] === "--prefix") {`,
-    `  const prefix = process.argv[3];`,
+    `  const prefix = args[1];`,
     `  const distDir = path.join(prefix, "dist", "src", "session-host");`,
     `  fs.mkdirSync(distDir, { recursive: true });`,
     `  fs.writeFileSync(path.join(distDir, "main.js"), "// staged build output\\n");`,
     `}`,
     "",
-  ].join("\n"), "utf8");
-  chmodSync(join(bin, "npm"), 0o755);
+  ].join("\n")}`, "utf8");
 
   const events: string[] = [];
   const captured: HostOptions[] = [];
   const env = makeEnvironment({
     HOME: fixture.root,
-    PATH: `${bin}:${process.env.PATH ?? ""}`,
+    PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
     TEST_NPM_LOG: log,
     PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP: "bootstrap-secret",
     PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE: "restore-secret",
+    PI_REVIEW_GATE_SETTLEMENT_SECRET: "settlement-secret",
+    PI_REVIEW_GATE_QUIESCENCE_CHILD: "quiescence-secret",
     PI_REVIEW_GATE_DDGS_PYTHON: "/inherited/stale/python",
     NODE_OPTIONS: "--no-warnings",
+    NODE_ENV: "production",
     ANTHROPIC_API_KEY: "provider-secret",
   });
   const status = await launcher.__test.runSessionHostLauncher(["--", "--scheduler"], {
@@ -392,6 +709,13 @@ test("production source-build runs in an owned staging root and preserves the li
     loadMain: (entry) => {
       events.push("load");
       assert.ok(existsSync(entry));
+      const stagedRoot = dirname(dirname(dirname(dirname(entry))));
+      assert.ok(existsSync(join(stagedRoot, "node_modules")), "fresh source setup owns its dependencies in-stage");
+      for (const name of ["package.json", "package-lock.json", "tsconfig.json", join("src", "session-host", "main.ts")]) {
+        assert.ok(existsSync(join(stagedRoot, name)), `staged package includes ${name}`);
+      }
+      assert.equal(readFileSync(join(stagedRoot, "package-lock.json"), "utf8"), readFileSync(join(fixture.packageRoot, "package-lock.json"), "utf8"));
+      assert.equal(existsSync(join(fixture.packageRoot, "node_modules")), false, "source checkout dependencies are not required or linked");
       return { runSessionHost: (options) => { events.push("run"); captured.push(options); return 0; } };
     },
     writeOut: () => undefined,
@@ -402,15 +726,26 @@ test("production source-build runs in an owned staging root and preserves the li
   // The real default build runs (no build override): its npm invocation is
   // asserted from the log below.
   assert.deepEqual(events, ["pi", "ddgs", "load", "run"]);
-  const invocation = JSON.parse(readFileSync(log, "utf8")) as {
+  const invocations = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line) as {
     args: string[];
     cwd: string;
+    home: string;
+    cache: string;
+    logs: string;
+    temp: string;
     bootstrap: string | null;
     restore: string | null;
+    settlement: string | null;
+    quiescence: string | null;
     ddgs: string | null;
     nodeOptions: string;
+    nodeEnv: string | null;
     provider: string;
-  };
+  });
+  assert.equal(invocations.length, 2, "the source stage runs locked ci before build");
+  assert.deepEqual(invocations[0].args, ["ci", "--include=dev", "--ignore-scripts", "--no-audit", "--no-fund", "--registry", "https://registry.npmjs.org"]);
+  assert.equal(invocations[0].nodeEnv, "production", "npm's production environment is preserved while dev dependencies are explicitly included");
+  const invocation = invocations[1];
   const stagingRoot = invocation.args[1];
   // The build runs against an owned staging package root under the agent
   // directory cache — never the live checkout.
@@ -420,17 +755,23 @@ test("production source-build runs in an owned staging root and preserves the li
   assert.ok(stagingRoot.startsWith(`${agentDir}/.pi-review-gate/build/pi-review-sessions-`), `staged root must be owned: ${stagingRoot}`);
   // The host receives the staged root so every runtime lookup stays in the stage.
   assert.equal(captured[0].packageRoot, stagingRoot);
-  // The staged package carries the build and runtime inputs.
-  for (const name of ["package.json", "tsconfig.json", join("src", "session-host", "main.ts")]) {
-    assert.ok(existsSync(join(stagingRoot, name)), `staged package must include ${name}`);
-  }
+  assert.equal(captured[0].env.NODE_ENV, "production", "the native host environment remains unchanged");
+  // The stage is kept until Main returns, then removed by exact captured identity.
+  assert.equal(existsSync(stagingRoot), false);
   // The live checkout dist is preserved byte-for-byte.
   assert.equal(readFileSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"), "utf8"), "LIVE DIST SENTINEL — never rebuild in place\n");
   assert.equal(invocation.bootstrap, null);
   assert.equal(invocation.restore, null);
+  assert.equal(invocation.settlement, null);
+  assert.equal(invocation.quiescence, null);
   assert.equal(invocation.ddgs, null);
   assert.equal(invocation.nodeOptions, "--no-warnings");
   assert.equal(invocation.provider, "provider-secret");
+  assert.equal(env.PI_REVIEW_GATE_SETTLEMENT_SECRET, "settlement-secret", "the injected caller environment is not mutated");
+  assert.equal(env.PI_REVIEW_GATE_QUIESCENCE_CHILD, "quiescence-secret");
+  for (const ownedPath of [invocation.home, invocation.cache, invocation.logs, invocation.temp]) {
+    assert.ok(ownedPath.startsWith(`${stagingRoot}/`), `npm resources must remain in the owned stage: ${ownedPath}`);
+  }
   assert.deepEqual(captured[0].args, ["--scheduler"]);
 });
 
@@ -440,17 +781,17 @@ test("a failed staged build preserves the live dist and removes only its owned s
   const bin = join(fixture.root, "fake-bin");
   mkdirSync(bin);
   const log = join(fixture.root, "npm-invocation.json");
-  writeFileSync(join(bin, "npm"), [
-    `#!${process.execPath}`,
+  writeFileSync(join(bin, "package.json"), JSON.stringify({ name: "npm", version: "10.0.0", bin: { npm: "npm" } }), "utf8");
+  writeFileSync(join(bin, "npm"), `#!/usr/bin/env node\n${[
     `const fs = require("node:fs");`,
-    `if (process.argv[2] === "root") process.exit(0);`,
-    `fs.writeFileSync(process.env.TEST_NPM_LOG, JSON.stringify({ args: process.argv.slice(2), cwd: process.cwd() }));`,
-    `process.exit(23); // simulate a failing tsc`,
+    `const args = process.argv.slice(2);`,
+    `fs.appendFileSync(process.env.TEST_NPM_LOG, JSON.stringify({ args, cwd: process.cwd() }) + "\\n");`,
+    `if (args[0] === "ci") process.exit(0);`,
+    `process.exit(23); // simulate a failing build`,
     "",
-  ].join("\n"), "utf8");
-  chmodSync(join(bin, "npm"), 0o755);
+  ].join("\n")}`, "utf8");
 
-  const env = makeEnvironment({ HOME: fixture.root, PATH: `${bin}:${process.env.PATH ?? ""}`, TEST_NPM_LOG: log });
+  const env = makeEnvironment({ HOME: fixture.root, PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`, TEST_NPM_LOG: log });
   const events: string[] = [];
   let stderr = "";
   const status = await launcher.__test.runSessionHostLauncher(["--", "--scheduler"], {
@@ -480,6 +821,112 @@ test("a failed staged build preserves the live dist and removes only its owned s
   }
 });
 
+test("a source build retains its stage when bounded setup cleanup is unconfirmed", async (t) => {
+  const source = makePackageFixture(true);
+  const runtime = makeRuntimeFixture(".session-host-build-cleanup-unconfirmed-");
+  cleanupFixture(t, source);
+  cleanupFixture(t, runtime);
+  writeFakeNpm(runtime, "global");
+  let stagingRoot = "";
+  const result = await launcher.__test.buildSourceExtension({
+    packageRoot: source.packageRoot,
+    agentDir: runtime.agentDir,
+    env: runtimeEnv(runtime),
+    runNpm: async (_npmCli, args, options) => {
+      stagingRoot = String(options.cwd);
+      if (args[0] === "ci") {
+        mkdirSync(join(stagingRoot, "node_modules"));
+        return { status: 0, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "" };
+      }
+      return {
+        status: 0,
+        signal: null,
+        error: new Error("synthetic process-group cleanup unconfirmed"),
+        cleanupConfirmed: false,
+        timedOut: false,
+        outputExceeded: false,
+        stdout: "",
+      };
+    },
+  });
+
+  assert.equal(result.status, 1);
+  assert.equal(result.childStatus, 0, "the synthetic child exit is kept separate from launcher status");
+  assert.equal(result.cleanupConfirmed, false);
+  assert.equal(result.retainedStage, true);
+  assert.ok(stagingRoot.startsWith(join(runtime.agentDir, ".pi-review-gate", "build")));
+  assert.ok(existsSync(join(stagingRoot, "package.json")), "the owned stage remains available for unresolved setup work");
+});
+
+test("owned source stages clean only before Main or after confirmed graceful success", async (t) => {
+  const fixture = makePackageFixture(true);
+  cleanupFixture(t, fixture);
+  const cases: Array<{ name: string; preMainFailure?: boolean; setupCleanupUnconfirmed?: boolean; result?: number; rejected?: boolean; expectedStatus: number; preserve: boolean }> = [
+    { name: "pre-Main setup failure", preMainFailure: true, expectedStatus: 1, preserve: false },
+    { name: "unconfirmed setup cleanup", setupCleanupUnconfirmed: true, expectedStatus: 1, preserve: true },
+    { name: "graceful Main success", result: 0, expectedStatus: 0, preserve: false },
+    { name: "unconfirmed native shutdown", result: 1, expectedStatus: 1, preserve: true },
+    { name: "invalid Main result", result: Number.NaN, expectedStatus: 1, preserve: true },
+    { name: "rejected Main", rejected: true, expectedStatus: 1, preserve: true },
+  ];
+
+  for (let index = 0; index < cases.length; index += 1) {
+    const scenario = cases[index];
+    const owned = launcher.__test.createOwnedStage(fixture.root, `synthetic-host-stage-${index}-`);
+    const entry = join(owned.root, "dist", "src", "session-host", "main.js");
+    mkdirSync(dirname(entry), { recursive: true });
+    writeFileSync(entry, "// synthetic compiled main\n", "utf8");
+    const events: string[] = [];
+    let stderr = "";
+    const status = await launcher.__test.runSessionHostLauncher([], {
+      getEnv: () => makeEnvironment({ HOME: fixture.root }),
+      processEnv: {},
+      platform: "linux",
+      nodeVersion: "22.19.0",
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      packageRoot: fixture.packageRoot,
+      build: () => { events.push("build"); return { status: 0, stagingRoot: owned.root, ownedStage: owned }; },
+      resolvePiRuntime: () => {
+        events.push("pi");
+        if (scenario.preMainFailure) throw new Error("synthetic setup failure");
+        return { file: "/synthetic/pi", version: "1.0.4", source: "npm-global" };
+      },
+      ensureDdgs: () => {
+        events.push("ddgs");
+        return scenario.setupCleanupUnconfirmed
+          ? { ok: false, exitCode: 1, cleanupUnconfirmed: true }
+          : { ok: true, python: "/synthetic/python" };
+      },
+      loadMain: () => {
+        events.push("load");
+        return {
+          runSessionHost: async () => {
+            events.push("main");
+            if (scenario.rejected) throw new Error("synthetic unresolved child process");
+            return scenario.result as number;
+          },
+        };
+      },
+      writeOut: () => undefined,
+      writeError: (text) => { stderr += text; },
+    });
+    assert.equal(status, scenario.expectedStatus, scenario.name);
+    assert.equal(existsSync(owned.root), scenario.preserve, `${scenario.name}: stage retention policy`);
+    if (scenario.preserve) {
+      const current = lstatSync(owned.root, { bigint: true });
+      assert.equal(current.dev, owned.identity.dev);
+      assert.equal(current.ino, owned.identity.ino);
+      assert.match(stderr, scenario.setupCleanupUnconfirmed
+        ? /preserving the source stage because setup cleanup was not confirmed/
+        : /preserving the source stage because native shutdown was not confirmed/);
+    }
+    if (scenario.preMainFailure) assert.deepEqual(events, ["build", "pi"]);
+    else if (scenario.setupCleanupUnconfirmed) assert.deepEqual(events, ["build", "pi", "ddgs"]);
+    else assert.ok(events.includes("main"), `${scenario.name}: Main was started`);
+  }
+});
+
 test("stageSourcePackage copies build and runtime inputs without touching the checkout", (t) => {
   const fixture = makePackageFixture(true);
   cleanupFixture(t, fixture);
@@ -494,42 +941,218 @@ test("stageSourcePackage copies build and runtime inputs without touching the ch
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "sentinel"), "do not copy\n", "utf8");
   }
+  const checkoutDependencies = join(fixture.root, "foreign checkout dependencies");
+  mkdirSync(checkoutDependencies);
+  writeFileSync(join(checkoutDependencies, "sentinel"), "must not be followed\n", "utf8");
+  symlinkSync(checkoutDependencies, join(fixture.packageRoot, "node_modules"));
 
   const buildCacheRoot = join(fixture.root, "build-cache");
-  const stagingRoot = launcher.__test.stageSourcePackage(fixture.packageRoot, buildCacheRoot);
+  const lockBytes = readFileSync(join(fixture.packageRoot, "package-lock.json"));
+  const ownedStage = launcher.__test.stageSourcePackage(fixture.packageRoot, buildCacheRoot);
+  const stagingRoot = ownedStage.root;
   assert.ok(stagingRoot.startsWith(buildCacheRoot));
-  for (const name of ["package.json", "tsconfig.json", join("src", "session-host", "main.ts"), join("scripts", "helper.ps1"), join("skills", "pi-review-gate-execution", "SKILL.md")]) {
+  assert.equal(Number(lstatSync(stagingRoot).mode & 0o077), 0, "owned staging root is private");
+  for (const name of ["package.json", "package-lock.json", "tsconfig.json", join("src", "session-host", "main.ts"), join("scripts", "helper.ps1"), join("skills", "pi-review-gate-execution", "SKILL.md")]) {
     assert.ok(existsSync(join(stagingRoot, name)), `staged package must include ${name}`);
   }
+  assert.deepEqual(readFileSync(join(stagingRoot, "package-lock.json")), lockBytes, "lockfile is byte-for-byte unchanged");
+  assert.equal(existsSync(join(stagingRoot, "node_modules")), false, "checkout dependencies are not linked into staging");
+  assert.equal(existsSync(join(stagingRoot, "dist")), false, "the source checkout dist is not copied");
   for (const name of [join("src", ".terraform"), join("scripts", "nested", ".terraform"), join("skills", "pi-review-gate-execution", ".terraform")]) {
     assert.ok(!existsSync(join(stagingRoot, name)), `staged package must omit ${name}`);
   }
   // The checkout is untouched: its live dist sentinel and sources remain.
   assert.equal(readFileSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"), "utf8"), "LIVE DIST SENTINEL — never rebuild in place\n");
   assert.ok(existsSync(join(fixture.packageRoot, "src", "session-host", "main.ts")));
+  assert.equal(lstatSync(join(fixture.packageRoot, "node_modules")).isSymbolicLink(), true, "the source dependency alias is left untouched");
+  assert.equal(readFileSync(join(checkoutDependencies, "sentinel"), "utf8"), "must not be followed\n");
+  for (const dir of [join(fixture.packageRoot, "src", ".terraform"), join(fixture.packageRoot, "scripts", "nested", ".terraform"), join(skillsDir, ".terraform")]) {
+    unlinkSync(join(dir, "sentinel"));
+    rmdirSync(dir);
+  }
+  assert.equal(launcher.__test.removeOwnedStage(ownedStage), true, "the exact staging identity is removed after assertions");
+});
+
+test("exclusive stage creation never adopts a preexisting random-name collision", (t) => {
+  const fixture = makePackageFixture(true);
+  cleanupFixture(t, fixture);
+  const parent = join(fixture.root, "owned-cache");
+  mkdirSync(parent);
+  const random = Buffer.alloc(16, 0xa5);
+  const collision = join(parent, `collision-${random.toString("hex")}`);
+  mkdirSync(collision);
+  const sentinel = join(collision, "foreign.txt");
+  writeFileSync(sentinel, "unknown preexisting data\n", "utf8");
+
+  assert.throws(
+    () => launcher.__test.createOwnedStage(parent, "collision-", () => random),
+    /could not exclusively create a unique staging directory/,
+  );
+  assert.equal(readFileSync(sentinel, "utf8"), "unknown preexisting data\n");
+  assert.equal(lstatSync(collision).isDirectory(), true);
+});
+
+test("source staging rejects symlink aliases and removes only its owned partial stage", (t) => {
+  const fixture = makePackageFixture(true);
+  cleanupFixture(t, fixture);
+  const outside = join(fixture.root, "alias target");
+  writeFileSync(outside, "not copied\n", "utf8");
+  const alias = join(fixture.packageRoot, "src", "alias.ts");
+  symlinkSync(outside, alias);
+  const cache = join(fixture.root, "build-cache");
+
+  assert.throws(() => launcher.__test.stageSourcePackage(fixture.packageRoot, cache), /could not stage the source package/);
+  assert.equal(readFileSync(outside, "utf8"), "not copied\n");
+  assert.equal(lstatSync(alias).isSymbolicLink(), true, "the source alias is preserved");
+  assert.deepEqual(readdirSync(cache), [], "only the failed run's positively owned partial stage was removed");
+});
+
+test("source staging stops before opening a replaced source directory", (t) => {
+  const fixture = makePackageFixture(true);
+  cleanupFixture(t, fixture);
+  const sourceDirectory = join(fixture.packageRoot, "src");
+  const heldSource = join(fixture.root, "held-source-original");
+  const foreignDirectory = join(fixture.root, "foreign-source");
+  const foreignFile = join(foreignDirectory, "sentinel.ts");
+  mkdirSync(foreignDirectory);
+  writeFileSync(foreignFile, "foreign source must not be opened\n", "utf8");
+  const aliasedForeignFile = join(sourceDirectory, "sentinel.ts");
+  const cache = join(fixture.root, "build-cache");
+  let replaced = false;
+  let foreignFileOpened = false;
+
+  withOpendirHook((openedPath) => {
+    if (openedPath === sourceDirectory && !replaced) {
+      replaced = true;
+      renameSync(sourceDirectory, heldSource);
+      symlinkSync(foreignDirectory, sourceDirectory, "dir");
+    }
+  }, () => withOpenSyncHook((openedPath) => {
+    if (openedPath === aliasedForeignFile) foreignFileOpened = true;
+  }, () => {
+    assert.throws(() => launcher.__test.stageSourcePackage(fixture.packageRoot, cache), /could not stage the source package/);
+  }));
+
+  assert.equal(replaced, true, "the source directory was replaced after its handle was opened");
+  assert.equal(foreignFileOpened, false, "no foreign file path was opened through the replacement");
+  assert.equal(lstatSync(sourceDirectory).isSymbolicLink(), true, "the source replacement remains intact");
+  assert.equal(readFileSync(foreignFile, "utf8"), "foreign source must not be opened\n");
+  const [stageName] = readdirSync(cache);
+  assert.ok(stageName, "the stage is retained as a witness after a directory-chain change");
+  assert.equal(lstatSync(join(cache, stageName, "src")).isDirectory(), true);
+});
+
+test("source staging stops before writing through a replaced destination directory", (t) => {
+  const fixture = makePackageFixture(true);
+  cleanupFixture(t, fixture);
+  const sourceDirectory = join(fixture.packageRoot, "src");
+  const cache = join(fixture.root, "build-cache");
+  const heldDestination = join(fixture.root, "held-destination-original");
+  const foreignDestination = join(fixture.root, "foreign-destination");
+  mkdirSync(foreignDestination);
+  writeFileSync(join(foreignDestination, "sentinel"), "foreign destination stays\n", "utf8");
+  let replaced = false;
+  let stagedSource = "";
+
+  withOpendirHook((openedPath) => {
+    if (openedPath !== sourceDirectory || replaced) return;
+    replaced = true;
+    const [stageName] = readdirSync(cache);
+    assert.ok(stageName, "the stage exists before the source directory is read");
+    stagedSource = join(cache, stageName, "src");
+    renameSync(stagedSource, heldDestination);
+    symlinkSync(foreignDestination, stagedSource, "dir");
+  }, () => {
+    assert.throws(() => launcher.__test.stageSourcePackage(fixture.packageRoot, cache), /could not stage the source package/);
+  });
+
+  assert.equal(replaced, true, "the destination directory was replaced while copying");
+  assert.equal(lstatSync(heldDestination).isDirectory(), true, "the displaced original destination remains intact");
+  assert.equal(lstatSync(stagedSource).isSymbolicLink(), true, "the replacement symlink is preserved inside the retained stage");
+  assert.equal(readFileSync(join(foreignDestination, "sentinel"), "utf8"), "foreign destination stays\n");
+  assert.equal(existsSync(join(foreignDestination, "session-host")), false, "no staged file or directory was created in the foreign target");
+});
+
+test("stage cleanup refuses a replacement root and never follows a staged directory symlink", (t) => {
+  const fixture = makePackageFixture(true);
+  cleanupFixture(t, fixture);
+  const owned = launcher.__test.createOwnedStage(fixture.root, "replace-");
+  const held = `${owned.root}-held`;
+  renameSync(owned.root, held);
+  mkdirSync(owned.root);
+  const replacement = join(owned.root, "foreign.txt");
+  writeFileSync(replacement, "replacement survives\n", "utf8");
+
+  assert.equal(launcher.__test.removeOwnedStage(owned), false);
+  assert.equal(readFileSync(replacement, "utf8"), "replacement survives\n");
+  assert.equal(launcher.__test.removeOwnedStage({ ...owned, root: held }), true, "the captured original identity can be cleaned at its moved path");
+
+  const victim = join(fixture.root, "symlink-victim");
+  mkdirSync(victim);
+  writeFileSync(join(victim, "sentinel"), "outside target stays\n", "utf8");
+  const symlinkStage = launcher.__test.createOwnedStage(fixture.root, "symlink-stage-");
+  symlinkSync(victim, join(symlinkStage.root, "alias"));
+  assert.equal(launcher.__test.removeOwnedStage(symlinkStage), true);
+  assert.equal(readFileSync(join(victim, "sentinel"), "utf8"), "outside target stays\n");
+});
+
+test("owned-stage cleanup aborts before following a replaced nested directory", (t) => {
+  const fixture = makePackageFixture(false);
+  cleanupFixture(t, fixture);
+  const owned = launcher.__test.createOwnedStage(fixture.root, "nested-replace-");
+  const nested = join(owned.root, "nested");
+  const held = join(fixture.root, "held-original");
+  const victim = join(fixture.root, "victim");
+  mkdirSync(nested);
+  mkdirSync(victim);
+  writeFileSync(join(nested, "original-sentinel"), "original stays\n", "utf8");
+  writeFileSync(join(victim, "outside-sentinel"), "outside stays\n", "utf8");
+
+  let replaced = false;
+  const removed = withOpendirHook((openedPath) => {
+    if (openedPath === nested && !replaced) {
+      replaced = true;
+      renameSync(nested, held);
+      symlinkSync(victim, nested);
+    }
+  }, () => launcher.__test.removeOwnedStage(owned));
+  assert.equal(replaced, true);
+  assert.equal(removed, false, "owned cleanup refuses the changed active directory chain");
+  assert.equal(readFileSync(join(held, "original-sentinel"), "utf8"), "original stays\n");
+  assert.equal(readFileSync(join(victim, "outside-sentinel"), "utf8"), "outside stays\n");
+  assert.equal(lstatSync(nested).isSymbolicLink(), true);
+
+  unlinkSync(nested);
+  renameSync(held, nested);
+  assert.equal(launcher.__test.removeOwnedStage(owned), true, "the restored owned stage is cleanable");
 });
 
 test("removeOwnedStage removes an owned stage but preserves .terraform subtrees", (t) => {
   const fixture = makePackageFixture(true);
   cleanupFixture(t, fixture);
-  const stage = join(fixture.root, "stage");
+  const owned = launcher.__test.createOwnedStage(fixture.root, "stage-");
+  const stage = owned.root;
   mkdirSync(join(stage, "src", ".terraform"), { recursive: true });
   writeFileSync(join(stage, "src", ".terraform", "sentinel"), "preserve me\n", "utf8");
   writeFileSync(join(stage, "src", "main.ts"), "removable\n", "utf8");
   writeFileSync(join(stage, "package.json"), "{}\n", "utf8");
 
-  const removed = launcher.__test.removeOwnedStage(stage);
+  const removed = launcher.__test.removeOwnedStage(owned);
   assert.equal(removed, false, "a preserved .terraform subtree keeps its ancestors");
   assert.equal(readFileSync(join(stage, "src", ".terraform", "sentinel"), "utf8"), "preserve me\n", ".terraform contents are never deleted");
   assert.ok(!existsSync(join(stage, "src", "main.ts")), "ordinary stage contents are removed");
   assert.ok(!existsSync(join(stage, "package.json")), "ordinary stage contents are removed");
 
-  // With no .terraform present the whole owned stage is removed.
-  const plain = join(fixture.root, "plain-stage");
-  mkdirSync(plain, { recursive: true });
-  writeFileSync(join(plain, "file"), "x\n", "utf8");
+  // Remove only the synthetic Terraform sentinel after its assertions.
+  unlinkSync(join(stage, "src", ".terraform", "sentinel"));
+  rmdirSync(join(stage, "src", ".terraform"));
+  assert.equal(launcher.__test.removeOwnedStage(owned), true);
+  assert.ok(!existsSync(stage));
+
+  const plain = launcher.__test.createOwnedStage(fixture.root, "plain-stage-");
+  writeFileSync(join(plain.root, "file"), "x\n", "utf8");
   assert.equal(launcher.__test.removeOwnedStage(plain), true);
-  assert.ok(!existsSync(plain));
+  assert.ok(!existsSync(plain.root));
 });
 
 test("a relative PI_CODING_AGENT_DIR anchors staging and host paths against the startup cwd", { skip: process.platform === "win32" }, async (t) => {
@@ -537,27 +1160,27 @@ test("a relative PI_CODING_AGENT_DIR anchors staging and host paths against the 
   cleanupFixture(t, fixture);
   const bin = join(fixture.root, "fake-bin");
   mkdirSync(bin);
-  const log = join(fixture.root, "npm-invocation.json");
-  writeFileSync(join(bin, "npm"), [
-    `#!${process.execPath}`,
+  const log = join(fixture.root, "npm-invocations.jsonl");
+  writeFileSync(join(bin, "package.json"), JSON.stringify({ name: "npm", version: "10.0.0", bin: { npm: "npm" } }), "utf8");
+  writeFileSync(join(bin, "npm"), `#!/usr/bin/env node\n${[
     `const fs = require("node:fs");`,
     `const path = require("node:path");`,
-    `if (process.argv[2] === "root") process.exit(0);`,
-    `fs.writeFileSync(process.env.TEST_NPM_LOG, JSON.stringify({ args: process.argv.slice(2), cwd: process.cwd() }));`,
-    `if (process.argv[2] === "--prefix") {`,
-    `  const distDir = path.join(process.argv[3], "dist", "src", "session-host");`,
+    `const args = process.argv.slice(2);`,
+    `fs.appendFileSync(process.env.TEST_NPM_LOG, JSON.stringify({ args, cwd: process.cwd() }) + "\\n");`,
+    `if (args[0] === "ci") { fs.mkdirSync(path.join(process.cwd(), "node_modules")); process.exit(0); }`,
+    `if (args[0] === "--prefix") {`,
+    `  const distDir = path.join(args[1], "dist", "src", "session-host");`,
     `  fs.mkdirSync(distDir, { recursive: true });`,
     `  fs.writeFileSync(path.join(distDir, "main.js"), "// staged build output\\n");`,
     `}`,
     "",
-  ].join("\n"), "utf8");
-  chmodSync(join(bin, "npm"), 0o755);
+  ].join("\n")}`, "utf8");
 
   const startupCwd = join(fixture.root, "startup cwd");
   mkdirSync(startupCwd);
   const env = makeEnvironment({
     HOME: fixture.root,
-    PATH: `${bin}:${process.env.PATH ?? ""}`,
+    PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
     TEST_NPM_LOG: log,
     PI_CODING_AGENT_DIR: "./agent dir π",
   });
@@ -582,7 +1205,9 @@ test("a relative PI_CODING_AGENT_DIR anchors staging and host paths against the 
   const anchoredAgentDir = join(startupCwd, "agent dir π");
   // The real default build runs against an absolute staged prefix under the
   // anchored agent directory.
-  const invocation = JSON.parse(readFileSync(log, "utf8")) as { args: string[]; cwd: string };
+  const invocations = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { args: string[]; cwd: string });
+  assert.equal(invocations.length, 2);
+  const invocation = invocations[1];
   const stagingRoot = invocation.args[1];
   assert.ok(isAbsolute(stagingRoot), `npm prefix must be absolute: ${stagingRoot}`);
   assert.equal(invocation.cwd, stagingRoot);
@@ -812,8 +1437,8 @@ test("help bypasses all environment and TTY preflight", async () => {
   });
   assert.equal(status, 0);
   assert.equal(envRead, false);
-  assert.match(output, /terminal\s+graphics rendering is disabled/);
-  assert.match(output, /native image\/model input behavior\s+stays\s+native/);
+  assert.match(output, /terminal\s+graphics rendering\s+is disabled/);
+  assert.match(output, /native image\/model input behavior\s+stays\s+native/i);
 });
 
 test("build and DDGS failures propagate safely and prevent loading the host", async (t) => {
@@ -894,7 +1519,7 @@ test("host-module failures and invalid DDGS paths fail closed with bounded diagn
 test("missing compiled host never falls back to the review-gate entry", async (t) => {
   const fixture = makePackageFixture(false);
   cleanupFixture(t, fixture);
-  rmSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"));
+  unlinkSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"));
   const events: string[] = [];
   let stderr = "";
   const status = await launcher.__test.runSessionHostLauncher([], {
@@ -919,11 +1544,11 @@ test("missing compiled host never falls back to the review-gate entry", async (t
 
 // ---------------------------------------------------------------------------
 // Pi runtime selection (issue 323): synthetic OWNROOT package metadata,
-// npm shims, and runtime cache directories. No real HOME, SDK, or global
+// public npm Node bins, and runtime cache directories. No real HOME, SDK, or global
 // npm root is ever touched.
 // ---------------------------------------------------------------------------
 
-interface RuntimeFixture {
+interface RuntimeFixture extends OwnedFixture {
   root: string;
   bin: string;
   agentDir: string;
@@ -932,9 +1557,11 @@ interface RuntimeFixture {
 }
 
 function makeRuntimeFixture(prefix: string): RuntimeFixture {
-  const root = mkdtempSync(join(process.cwd(), prefix));
+  const root = mkdtempSync(join(process.cwd(), "node_modules", prefix));
+  const rootStats = lstatSync(root, { bigint: true });
   const fixture = {
     root,
+    identity: { dev: rootStats.dev, ino: rootStats.ino },
     bin: join(root, "bin"),
     agentDir: join(root, "agent dir π"),
     // The npm global root is the bare node_modules directory; the resolver
@@ -949,11 +1576,11 @@ function makeRuntimeFixture(prefix: string): RuntimeFixture {
 /** A positive Node CLI entry that reports a fixed version and logs its env. */
 function writePiEntry(file: string, version: string, logEnv = false): string {
   mkdirSync(join(file, ".."), { recursive: true });
-  const lines = [`#!${process.execPath}`];
+  const lines = ["#!/usr/bin/env node"];
   if (logEnv) {
     lines.push(
       `const fs = require("node:fs");`,
-      `if (process.argv[2] === "--version" && process.env.PI_PROBE_LOG) fs.writeFileSync(process.env.PI_PROBE_LOG, JSON.stringify({ bootstrap: process.env.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP ?? null, restore: process.env.PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE ?? null, nodeOptions: process.env.NODE_OPTIONS ?? null, provider: process.env.ANTHROPIC_API_KEY ?? null }));`,
+      `if (process.argv[2] === "--version" && process.env.PI_PROBE_LOG) fs.writeFileSync(process.env.PI_PROBE_LOG, JSON.stringify({ args: process.argv.slice(1), bootstrap: process.env.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP ?? null, restore: process.env.PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE ?? null, nodeOptions: process.env.NODE_OPTIONS ?? null, provider: process.env.ANTHROPIC_API_KEY ?? null }));`,
     );
   }
   lines.push(`if (process.argv[2] === "--version") console.log("pi ${version}");`);
@@ -974,10 +1601,10 @@ function writePiPackage(pkgDir: string, version = "1.0.4", name = launcher.PI_PA
   return entry;
 }
 
-function writeFakeNpm(fixture: RuntimeFixture, behavior: "global" | "install" = "global"): void {
+function writeFakeNpm(fixture: RuntimeFixture, behavior: "global" | "install" | "timeout-build" = "global"): void {
   const fakeNpm = join(fixture.bin, "npm");
+  writeFileSync(join(fixture.bin, "package.json"), JSON.stringify({ name: "npm", version: "10.0.0", bin: { npm: "npm" } }), "utf8");
   const lines = [
-    `#!${process.execPath}`,
     `const fs = require("node:fs");`,
     `const args = process.argv.slice(2);`,
     `fs.appendFileSync(process.env.PI_NPM_LOG, JSON.stringify({ args }) + "\\n");`,
@@ -985,6 +1612,10 @@ function writeFakeNpm(fixture: RuntimeFixture, behavior: "global" | "install" = 
   if (behavior === "global") {
     lines.push(`if (args[0] === "root") { if (process.env.PI_FAKE_GLOBAL_ROOT) console.log(process.env.PI_FAKE_GLOBAL_ROOT); process.exit(0); }`);
     lines.push(`process.exit(1);`);
+  } else if (behavior === "timeout-build") {
+    lines.push(`if (args[0] === "ci") { fs.mkdirSync(require("node:path").join(process.cwd(), "node_modules")); process.exit(0); }`);
+    lines.push(`process.on("SIGTERM", () => process.exit(0));`);
+    lines.push(`setInterval(() => {}, 1000);`);
   } else {
     // install --prefix <staging> --ignore-scripts --no-audit --no-fund
     // --registry https://registry.npmjs.org @earendil-works/pi-coding-agent@1.0.4
@@ -995,13 +1626,20 @@ function writeFakeNpm(fixture: RuntimeFixture, behavior: "global" | "install" = 
     lines.push(`  fs.mkdirSync(require("node:path").join(pkgDir, "dist", "bundle"), { recursive: true });`);
     lines.push(`  fs.writeFileSync(require("node:path").join(pkgDir, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "1.0.4", bin: { pi: "dist/bundle/cli.js" } }));`);
     lines.push(`  const entry = require("node:path").join(pkgDir, "dist", "bundle", "cli.js");`);
-    lines.push(`  fs.writeFileSync(entry, "#!${process.execPath}\\nif (process.argv[2] === '--version') console.log('pi 1.0.4');\\n");`);
+    lines.push(`  fs.writeFileSync(entry, "#!/usr/bin/env node\\nif (process.argv[2] === '--version') console.log('pi 1.0.4');\\n");`);
     lines.push(`  fs.chmodSync(entry, 0o755);`);
+    lines.push(`  if (process.env.PI_FAKE_PUBLISH_ROOT) {`);
+    lines.push(`    const concurrentPkg = require("node:path").join(process.env.PI_FAKE_PUBLISH_ROOT, "node_modules", "@earendil-works", "pi-coding-agent");`);
+    lines.push(`    fs.mkdirSync(require("node:path").join(concurrentPkg, "dist", "bundle"), { recursive: true });`);
+    lines.push(`    fs.writeFileSync(require("node:path").join(concurrentPkg, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "1.0.4", bin: { pi: "dist/bundle/cli.js" } }));`);
+    lines.push(`    const concurrentEntry = require("node:path").join(concurrentPkg, "dist", "bundle", "cli.js");`);
+    lines.push(`    fs.writeFileSync(concurrentEntry, "#!/usr/bin/env node\\nif (process.argv[2] === '--version') console.log('pi 1.0.4');\\n");`);
+    lines.push(`    fs.chmodSync(concurrentEntry, 0o755);`);
+    lines.push(`  }`);
     lines.push(`}`);
     lines.push(`process.exit(0);`);
   }
-  writeFileSync(fakeNpm, `${lines.join("\n")}\n`, "utf8");
-  chmodSync(fakeNpm, 0o755);
+  writeFileSync(fakeNpm, `#!/usr/bin/env node\n${lines.join("\n")}\n`, "utf8");
 }
 
 function runtimeEnv(fixture: RuntimeFixture, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
@@ -1015,32 +1653,114 @@ function runtimeEnv(fixture: RuntimeFixture, overrides: NodeJS.ProcessEnv = {}):
   });
 }
 
-test("explicit executable is honored when valid and rejected fail-closed otherwise", (t) => {
+test("npm PATH resolution uses the native delimiter and rejects opaque shim-only candidates", (t) => {
+  const fixture = makeRuntimeFixture(".session-host-npm-resolution-");
+  cleanupFixture(t, fixture);
+  writeFakeNpm(fixture, "global");
+  const env = runtimeEnv(fixture, { PATH: `${join(fixture.root, "missing path")}${delimiter}${fixture.bin}` });
+  assert.equal(launcher.__test.findNpmCli(env), join(fixture.bin, "npm"));
+
+  const shimOnly = join(fixture.root, "shim only");
+  mkdirSync(shimOnly);
+  writeFileSync(join(shimOnly, "npm.cmd"), "@echo off\r\necho opaque shim\r\n", "utf8");
+  assert.equal(launcher.__test.findNpmCli(runtimeEnv(fixture, { PATH: shimOnly })), undefined);
+});
+
+test("a timed-out source build that exits zero on SIGTERM never falls through to the checkout", async (t) => {
+  const runtimeFixture = makeRuntimeFixture(".session-host-build-timeout-");
+  const sourceFixture = makePackageFixture(true);
+  cleanupFixture(t, runtimeFixture);
+  cleanupFixture(t, sourceFixture);
+  writeFakeNpm(runtimeFixture, "timeout-build");
+  const events: string[] = [];
+  let buildResult: BuildResult | undefined;
+  let stderr = "";
+  const status = await launcher.__test.runSessionHostLauncher(["--", "--scheduler"], {
+    getEnv: () => runtimeEnv(runtimeFixture),
+    processEnv: {},
+    platform: "linux",
+    nodeVersion: "22.19.0",
+    stdinIsTTY: true,
+    stdoutIsTTY: true,
+    packageRoot: sourceFixture.packageRoot,
+    cwd: runtimeFixture.root,
+    build: async (options) => {
+      events.push("build");
+      buildResult = await launcher.__test.buildSourceExtension({ ...options, sourceBuildTimeoutMs: 500 });
+      return buildResult;
+    },
+    resolvePiRuntime: () => { events.push("pi"); return { file: "/synthetic/pi", version: "1.0.4", source: "npm-global" }; },
+    ensureDdgs: () => { events.push("ddgs"); return { ok: true, python: "/synthetic/python" }; },
+    loadMain: () => { events.push("load"); return { runSessionHost: () => 0 }; },
+    writeOut: () => undefined,
+    writeError: (text) => { stderr += text; },
+  });
+  assert.equal(status, 124);
+  assert.equal(buildResult?.timedOut, true);
+  assert.equal(buildResult?.childStatus, 0, "the synthetic npm child handled SIGTERM with exit 0");
+  assert.equal(buildResult?.status, 124, "expiration remains a nonzero build outcome");
+  assert.deepEqual(events, ["build"], "runtime resolution, DDGS, and Main are not reached");
+  assert.match(stderr, /extension build failed \(setup deadline exceeded\)/);
+  assert.equal(readFileSync(join(sourceFixture.packageRoot, "dist", "src", "session-host", "main.js"), "utf8"), "LIVE DIST SENTINEL — never rebuild in place\n");
+});
+
+test("bounded setup subprocesses preserve exit outcomes and terminate expired groups", async (t) => {
+  const fixture = makeRuntimeFixture(".session-host-bounded-process-");
+  cleanupFixture(t, fixture);
+  const exitScript = join(fixture.root, "exit.js");
+  const timeoutScript = join(fixture.root, "timeout.js");
+  const outputScript = join(fixture.root, "output.js");
+  writeFileSync(exitScript, "process.exit(19);\n", "utf8");
+  writeFileSync(timeoutScript, "setInterval(() => {}, 1000);\n", "utf8");
+  writeFileSync(outputScript, "process.stdout.write('too much'); setInterval(() => {}, 1000);\n", "utf8");
+  const env = runtimeEnv(fixture);
+
+  const exited = await launcher.__test.runBoundedProcess(process.execPath, [exitScript], {
+    cwd: fixture.root, env, timeoutMs: 1000, maxOutputBytes: 32, captureStdout: true,
+  });
+  assert.equal(exited.status, 19);
+  assert.equal(exited.timedOut, false);
+  assert.equal(exited.cleanupConfirmed, true);
+  const expired = await launcher.__test.runBoundedProcess(process.execPath, [timeoutScript], {
+    cwd: fixture.root, env, timeoutMs: 25,
+  });
+  assert.equal(expired.timedOut, true);
+  assert.equal(expired.cleanupConfirmed, true, "termination is followed by process-group absence confirmation");
+  assert.ok(expired.signal || expired.status !== 0, "expiration is not reported as a successful exit");
+  const oversized = await launcher.__test.runBoundedProcess(process.execPath, [outputScript], {
+    cwd: fixture.root, env, timeoutMs: 1000, maxOutputBytes: 4, captureStdout: true,
+  });
+  assert.equal(oversized.outputExceeded, true);
+  assert.equal(oversized.cleanupConfirmed, true);
+});
+
+test("a readable Node CLI entry is probed through the admitted Node and rejected fail-closed otherwise", async (t) => {
   const fixture = makeRuntimeFixture(".session-host-pi-runtime-explicit-");
   cleanupFixture(t, fixture);
   const env = runtimeEnv(fixture);
   const goodEntry = writePiEntry(join(fixture.root, "explicit tools/π pi.js"), "1.0.4");
+  if (process.platform === "win32") chmodSync(goodEntry, 0o600);
 
-  const ok = launcher.__test.resolvePiRuntime({ explicit: goodEntry, env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined });
+  const ok = await launcher.__test.resolvePiRuntime({ explicit: goodEntry, env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined });
   assert.deepEqual(ok, { file: goodEntry, version: "1.0.4", source: "explicit" });
 
   const shellShim = join(fixture.root, "shell pi.sh");
   writeFileSync(shellShim, "#!/bin/sh\necho shim\n", "utf8");
   chmodSync(shellShim, 0o755);
   const failures: Array<{ explicit: string; diagnostic: RegExp }> = [
-    { explicit: join(fixture.root, "missing pi"), diagnostic: /not a regular readable executable file/ },
+    { explicit: join(fixture.root, "missing pi"), diagnostic: /not a regular readable file/ },
     { explicit: shellShim, diagnostic: /not a positive Node entry/ },
     { explicit: writePiEntry(join(fixture.root, "old pi.js"), "1.0.3"), diagnostic: /found 1\.0\.3/ },
   ];
   for (const failure of failures) {
-    assert.throws(
+    await assert.rejects(
       () => launcher.__test.resolvePiRuntime({ explicit: failure.explicit, env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined }),
       failure.diagnostic,
     );
   }
 });
 
-test("npm global package root is resolved by metadata with bin containment and a live probe", (t) => {
+test("npm global package root is resolved by metadata with bin containment and a live probe", async (t) => {
   const fixture = makeRuntimeFixture(".session-host-pi-runtime-global-");
   cleanupFixture(t, fixture);
   const pkgDir = join(fixture.globalRoot, "@earendil-works", "pi-coding-agent");
@@ -1048,13 +1768,13 @@ test("npm global package root is resolved by metadata with bin containment and a
   writeFakeNpm(fixture, "global");
   const env = runtimeEnv(fixture, { PI_FAKE_GLOBAL_ROOT: fixture.globalRoot });
 
-  const result = launcher.__test.resolvePiRuntime({ env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined });
+  const result = await launcher.__test.resolvePiRuntime({ env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined });
   assert.equal(result.source, "npm-global");
   assert.equal(result.version, "1.0.4");
   assert.equal(result.file, join(pkgDir, "dist", "bundle", "cli.js"));
 });
 
-test("an unsupported global install falls through to PATH discovery", (t) => {
+test("an unsupported global install falls through to PATH discovery", async (t) => {
   const fixture = makeRuntimeFixture(".session-host-pi-runtime-fallthrough-");
   cleanupFixture(t, fixture);
   const globalPkgDir = join(fixture.globalRoot, "@earendil-works", "pi-coding-agent");
@@ -1068,13 +1788,13 @@ test("an unsupported global install falls through to PATH discovery", (t) => {
   writeFakeNpm(fixture, "global");
   const env = runtimeEnv(fixture, { PI_FAKE_GLOBAL_ROOT: fixture.globalRoot });
 
-  const result = launcher.__test.resolvePiRuntime({ env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined });
+  const result = await launcher.__test.resolvePiRuntime({ env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined });
   assert.equal(result.source, "path");
   assert.equal(result.file, pathEntry);
   assert.equal(result.version, "1.0.4");
 });
 
-test("a PATH pi outside the public package is never trusted", (t) => {
+test("a PATH pi outside the public package is never trusted", async (t) => {
   const fixture = makeRuntimeFixture(".session-host-pi-runtime-untrusted-");
   cleanupFixture(t, fixture);
   // A positive Node entry named `pi` that is NOT inside the public package:
@@ -1084,19 +1804,19 @@ test("a PATH pi outside the public package is never trusted", (t) => {
   writeFakeNpm(fixture, "install");
   const env = runtimeEnv(fixture);
 
-  const result = launcher.__test.resolvePiRuntime({ env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined });
+  const result = await launcher.__test.resolvePiRuntime({ env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined });
   assert.equal(result.source, "isolated-cache");
   assert.ok(result.file.startsWith(join(fixture.agentDir, ".pi-review-gate", "pi-runtime")));
 });
 
-test("absent or unsupported Pi provisions the isolated cache with exact npm arguments", (t) => {
+test("absent or unsupported Pi provisions the isolated cache with exact npm arguments", async (t) => {
   const fixture = makeRuntimeFixture(".session-host-pi-runtime-provision-");
   cleanupFixture(t, fixture);
   writeFakeNpm(fixture, "install");
   const env = runtimeEnv(fixture);
 
   let notice = "";
-  const result = launcher.__test.resolvePiRuntime({ env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: (text) => { notice += text; } });
+  const result = await launcher.__test.resolvePiRuntime({ env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: (text) => { notice += text; } });
   assert.equal(result.source, "isolated-cache");
   assert.equal(result.version, "1.0.4");
   const expectedPkgDir = join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`, "node_modules", "@earendil-works", "pi-coding-agent");
@@ -1125,11 +1845,99 @@ test("absent or unsupported Pi provisions the isolated cache with exact npm argu
   }
 });
 
+test("version-probe and DDGS setup expose unconfirmed cleanup", async (t) => {
+  const fixture = makeRuntimeFixture(".session-host-probe-cleanup-unconfirmed-");
+  cleanupFixture(t, fixture);
+  let probeError: (Error & { cleanupUnconfirmed?: boolean }) | undefined;
+  await launcher.__test.probePiVersion("/synthetic/pi", runtimeEnv(fixture), async () => ({
+    status: 0,
+    signal: null,
+    error: new Error("synthetic setup cleanup unconfirmed"),
+    cleanupConfirmed: false,
+    timedOut: false,
+    outputExceeded: false,
+    stdout: "pi 1.0.4\n",
+  })).catch((error: unknown) => { probeError = error as Error & { cleanupUnconfirmed?: boolean }; });
+  assert.equal(probeError?.cleanupUnconfirmed, true, "Pi probe cleanup uncertainty is propagated distinctly");
+
+  const setup = await launcher.__test.runDdgsSetup(fixture.root, runtimeEnv(fixture), fixture.root, async () => ({
+    status: null,
+    signal: null,
+    error: new Error("synthetic DDGS setup cleanup unconfirmed"),
+    cleanupConfirmed: false,
+    timedOut: true,
+    outputExceeded: false,
+    stdout: "",
+  }));
+  assert.deepEqual(setup, { ok: false, exitCode: 124, cleanupUnconfirmed: true });
+});
+
+test("a staged Pi runtime is retained when its version probe cleanup is unconfirmed", async (t) => {
+  const fixture = makeRuntimeFixture(".session-host-pi-probe-cleanup-unconfirmed-");
+  cleanupFixture(t, fixture);
+  const probeError = Object.assign(new Error("synthetic staged Pi probe cleanup unconfirmed"), { cleanupUnconfirmed: true });
+  let stagingRoot = "";
+  let diagnostic = "";
+
+  await assert.rejects(() => launcher.__test.provisionPiRuntime({
+    env: runtimeEnv(fixture),
+    agentDir: fixture.agentDir,
+    npmCli: "/synthetic/npm-cli.js",
+    writeError: (text) => { diagnostic += text; },
+    runNpm: async (_npmCli, _args, options) => {
+      stagingRoot = String(options.cwd);
+      writePiPackage(join(stagingRoot, "node_modules", "@earendil-works", "pi-coding-agent"), launcher.PI_PROVISION_VERSION);
+      return { status: 0, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "" };
+    },
+    validatePiPackage: async () => { throw probeError; },
+  }), /synthetic staged Pi probe cleanup unconfirmed/);
+
+  assert.ok(stagingRoot.includes(".staging-pi-"));
+  assert.ok(existsSync(join(stagingRoot, "node_modules", "@earendil-works", "pi-coding-agent", "package.json")), "the staged runtime remains available");
+  assert.match(diagnostic, /preserving a Pi runtime staging tree/);
+});
+
+test("Pi provisioning retains its stage when the install group cleanup is unconfirmed", async (t) => {
+  const fixture = makeRuntimeFixture(".session-host-pi-install-cleanup-unconfirmed-");
+  cleanupFixture(t, fixture);
+  let stagingRoot = "";
+  let validationAttempted = false;
+  let diagnostic = "";
+
+  await assert.rejects(() => launcher.__test.provisionPiRuntime({
+    env: runtimeEnv(fixture),
+    agentDir: fixture.agentDir,
+    npmCli: "/synthetic/npm-cli.js",
+    writeError: (text) => { diagnostic += text; },
+    runNpm: async (_npmCli, _args, options) => {
+      stagingRoot = String(options.cwd);
+      return {
+        status: 0,
+        signal: null,
+        error: new Error("synthetic install cleanup unconfirmed"),
+        cleanupConfirmed: false,
+        timedOut: false,
+        outputExceeded: false,
+        stdout: "",
+      };
+    },
+    validatePiPackage: async () => {
+      validationAttempted = true;
+      return { file: "/synthetic/pi", version: launcher.PI_PROVISION_VERSION };
+    },
+  }), /cleanup was not confirmed/);
+
+  assert.equal(validationAttempted, false, "an unconfirmed install is never validated or published");
+  assert.ok(stagingRoot.includes(".staging-pi-"));
+  assert.ok(existsSync(join(stagingRoot, ".npm-cache")), "the owned staging root is preserved");
+  assert.match(diagnostic, /preserving a Pi runtime staging tree/);
+});
+
 function readdirNames(dir: string): string[] {
   return require("node:fs").readdirSync(dir) as string[];
 }
 
-test("a valid cached runtime is reused without any npm invocation", (t) => {
+test("a valid cached runtime is reused without any npm invocation", async (t) => {
   const fixture = makeRuntimeFixture(".session-host-pi-runtime-cached-");
   cleanupFixture(t, fixture);
   const pkgDir = join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`, "node_modules", "@earendil-works", "pi-coding-agent");
@@ -1137,7 +1945,7 @@ test("a valid cached runtime is reused without any npm invocation", (t) => {
   writeFakeNpm(fixture, "install");
   const env = runtimeEnv(fixture);
 
-  const result = launcher.__test.resolvePiRuntime({ env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined });
+  const result = await launcher.__test.resolvePiRuntime({ env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined });
   assert.equal(result.source, "isolated-cache");
   assert.equal(result.file, join(pkgDir, "dist", "bundle", "cli.js"));
   // Only the global-root probe may run; a valid cached runtime is never
@@ -1150,7 +1958,7 @@ test("a valid cached runtime is reused without any npm invocation", (t) => {
   }
 });
 
-test("an invalid cached runtime is preserved and fails closed", (t) => {
+test("an invalid cached runtime is preserved and fails closed", async (t) => {
   const fixture = makeRuntimeFixture(".session-host-pi-runtime-badcache-");
   cleanupFixture(t, fixture);
   const pkgDir = join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`, "node_modules", "@earendil-works", "pi-coding-agent");
@@ -1161,14 +1969,86 @@ test("an invalid cached runtime is preserved and fails closed", (t) => {
   writeFakeNpm(fixture, "global");
   const env = runtimeEnv(fixture);
 
-  assert.throws(
+  await assert.rejects(
     () => launcher.__test.resolvePiRuntime({ env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined }),
     /cached pi runtime .* is invalid/,
   );
   assert.equal(readFileSync(marker, "utf8"), "preserve me\n", "unknown cache resources are preserved");
 });
 
-test("failed provisioning preserves foreign staging and unknown resources, removing only its own stage", (t) => {
+test("preexisting empty and partial version destinations are preserved rather than replaced", async (t) => {
+  for (const shape of ["empty", "unknown-node-modules"] as const) {
+    const fixture = makeRuntimeFixture(`.session-host-pi-runtime-partial-${shape}-`);
+    cleanupFixture(t, fixture);
+    writeFakeNpm(fixture, "global");
+    const versionRoot = join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`);
+    mkdirSync(shape === "empty" ? versionRoot : join(versionRoot, "node_modules"), { recursive: true });
+    const marker = shape === "unknown-node-modules" ? join(versionRoot, "node_modules", "unknown.txt") : join(versionRoot, "unknown.txt");
+    if (shape === "unknown-node-modules") writeFileSync(marker, "preserve this node_modules tree\n", "utf8");
+    const identity = lstatSync(versionRoot, { bigint: true });
+
+    await assert.rejects(
+      () => launcher.__test.resolvePiRuntime({ env: runtimeEnv(fixture), agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined }),
+      /partial or unknown/,
+    );
+    const after = lstatSync(versionRoot, { bigint: true });
+    assert.equal(after.dev, identity.dev);
+    assert.equal(after.ino, identity.ino);
+    if (shape === "unknown-node-modules") assert.equal(readFileSync(marker, "utf8"), "preserve this node_modules tree\n");
+    const invocations = readFileSync(fixture.npmLog, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { args: string[] });
+    assert.ok(invocations.every(({ args }) => args[0] !== "install"), "a partial destination blocks installation and publication");
+  }
+});
+
+test("a concurrent valid Pi cache publication is reused only after metadata and Node probe validation", async (t) => {
+  const fixture = makeRuntimeFixture(".session-host-pi-runtime-concurrent-publish-");
+  cleanupFixture(t, fixture);
+  writeFakeNpm(fixture, "install");
+  const versionRoot = join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`);
+  const result = await launcher.__test.resolvePiRuntime({
+    env: runtimeEnv(fixture, { PI_FAKE_PUBLISH_ROOT: versionRoot }),
+    agentDir: fixture.agentDir,
+    cwd: fixture.root,
+    writeError: () => undefined,
+  });
+  const publishedEntry = join(versionRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
+  assert.equal(result.source, "isolated-cache");
+  assert.equal(result.file, publishedEntry);
+  assert.ok(existsSync(publishedEntry));
+  assert.equal(existsSync(join(versionRoot, "node_modules", "@earendil-works", "pi-coding-agent", ".staging")), false);
+});
+
+test("a version-root symlink injected at publication cannot be reused as a concurrent cache", async (t) => {
+  const fixture = makeRuntimeFixture(".session-host-pi-runtime-publication-alias-");
+  cleanupFixture(t, fixture);
+  writeFakeNpm(fixture, "install");
+  const versionRoot = join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`);
+  const aliasRoot = join(fixture.root, "concurrent version alias");
+  const aliasPkgDir = join(aliasRoot, "node_modules", "@earendil-works", "pi-coding-agent");
+  const aliasEntry = writePiPackage(aliasPkgDir);
+  const env = runtimeEnv(fixture);
+  const npmCli = launcher.__test.findNpmCli(env);
+  assert.ok(npmCli);
+
+  await assert.rejects(
+    () => launcher.__test.provisionPiRuntime({
+      env,
+      agentDir: fixture.agentDir,
+      npmCli,
+      writeError: () => undefined,
+      beforeVersionRootMkdir: (target) => {
+        assert.equal(target, versionRoot);
+        symlinkSync(aliasRoot, versionRoot, "dir");
+      },
+    }),
+    /partial or unsafe/,
+  );
+  assert.equal(lstatSync(versionRoot).isSymbolicLink(), true, "the foreign alias is preserved");
+  assert.ok(existsSync(aliasEntry), "the alias target remains untouched");
+  assert.equal(readFileSync(aliasEntry, "utf8").includes("pi 1.0.4"), true);
+});
+
+test("failed provisioning preserves foreign staging and unknown resources, removing only its own stage", async (t) => {
   const fixture = makeRuntimeFixture(".session-host-pi-runtime-fail-");
   cleanupFixture(t, fixture);
   writeFakeNpm(fixture, "install");
@@ -1183,7 +2063,7 @@ test("failed provisioning preserves foreign staging and unknown resources, remov
   writeFileSync(join(foreignStage, "active-download"), "in progress\n", "utf8");
   const env = runtimeEnv(fixture, { PI_FAKE_NPM_FAIL: "1" });
 
-  assert.throws(
+  await assert.rejects(
     () => launcher.__test.resolvePiRuntime({ env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined }),
     /pi runtime provisioning failed/,
   );
@@ -1195,7 +2075,7 @@ test("failed provisioning preserves foreign staging and unknown resources, remov
   }
 });
 
-test("a concurrent launch's staging survives a successful provision", (t) => {
+test("a concurrent launch's staging survives a successful provision", async (t) => {
   const fixture = makeRuntimeFixture(".session-host-pi-runtime-concurrent-");
   cleanupFixture(t, fixture);
   writeFakeNpm(fixture, "install");
@@ -1205,13 +2085,13 @@ test("a concurrent launch's staging survives a successful provision", (t) => {
   writeFileSync(join(foreignStage, "active-download"), "in progress\n", "utf8");
   const env = runtimeEnv(fixture);
 
-  const result = launcher.__test.resolvePiRuntime({ env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined });
+  const result = await launcher.__test.resolvePiRuntime({ env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined });
   assert.equal(result.source, "isolated-cache");
   assert.ok(existsSync(result.file), "the provisioned runtime is published");
   assert.equal(readFileSync(join(foreignStage, "active-download"), "utf8"), "in progress\n", "foreign staging is untouched");
 });
 
-test("version probes run on the scrubbed env with provider variables preserved", (t) => {
+test("version probes run on the supplied env with provider variables preserved", async (t) => {
   const fixture = makeRuntimeFixture(".session-host-pi-runtime-probe-env-");
   cleanupFixture(t, fixture);
   const pkgDir = join(fixture.globalRoot, "@earendil-works", "pi-coding-agent");
@@ -1222,7 +2102,7 @@ test("version probes run on the scrubbed env with provider variables preserved",
     version: "1.0.4",
     bin: { pi: "dist/bundle/cli.js" },
   }), "utf8");
-  writePiEntry(join(pkgDir, "dist", "bundle", "cli.js"), "1.0.4", true);
+  const cliEntry = writePiEntry(join(pkgDir, "dist", "bundle", "cli.js"), "1.0.4", true);
   writeFakeNpm(fixture, "global");
   const env = runtimeEnv(fixture, {
     PI_FAKE_GLOBAL_ROOT: fixture.globalRoot,
@@ -1233,20 +2113,22 @@ test("version probes run on the scrubbed env with provider variables preserved",
     PI_PROBE_LOG: probeLog,
   });
 
-  const result = launcher.__test.resolvePiRuntime({ env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined });
+  const result = await launcher.__test.resolvePiRuntime({ env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined });
   assert.equal(result.source, "npm-global");
   const probe = JSON.parse(readFileSync(probeLog, "utf8")) as {
+    args: string[];
     bootstrap: string | null;
     restore: string | null;
     nodeOptions: string | null;
     provider: string | null;
   };
-  assert.equal(probe.bootstrap, "bootstrap-secret", "the resolver receives the caller env; the CJS scrubs it before calling");
+  assert.deepEqual(probe.args, [cliEntry, "--version"], "the admitted Node interprets the public CLI entry with argv unchanged");
+  assert.equal(probe.bootstrap, "bootstrap-secret", "the direct resolver receives the caller env; the launcher scrubs it before calling");
   assert.equal(probe.nodeOptions, "--no-warnings", "the original NODE_OPTIONS is preserved for probes");
   assert.equal(probe.provider, "provider-secret", "trusted provider variables are preserved for probes");
 });
 
-test("bin containment rejects a package whose pi entry escapes the package directory", (t) => {
+test("bin containment rejects a package whose pi entry escapes the package directory", async (t) => {
   const fixture = makeRuntimeFixture(".session-host-pi-runtime-escape-");
   cleanupFixture(t, fixture);
   const pkgDir = join(fixture.root, "escaping package", "@earendil-works", "pi-coding-agent");
@@ -1259,13 +2141,13 @@ test("bin containment rejects a package whose pi entry escapes the package direc
   const outside = join(fixture.root, "escaping package", "outside-cli.js");
   writePiEntry(outside, "1.0.4");
 
-  assert.throws(
+  await assert.rejects(
     () => launcher.__test.validatePiPackage(pkgDir, runtimeEnv(fixture)),
     /bin entry escapes the package directory/,
   );
 });
 
-test("an in-package bin symlink that resolves outside is never executed", (t) => {
+test("an in-package bin symlink that resolves outside is never executed", async (t) => {
   const fixture = makeRuntimeFixture(".session-host-pi-runtime-symlink-escape-");
   cleanupFixture(t, fixture);
   const pkgDir = join(fixture.root, "symlink package", "@earendil-works", "pi-coding-agent");
@@ -1280,13 +2162,13 @@ test("an in-package bin symlink that resolves outside is never executed", (t) =>
   writePiEntry(outside, "1.0.4");
   symlinkSync(outside, join(pkgDir, "dist", "bundle", "cli.js"));
 
-  assert.throws(
+  await assert.rejects(
     () => launcher.__test.validatePiPackage(pkgDir, runtimeEnv(fixture)),
     /resolves outside the package directory/,
   );
 });
 
-test("a probe that disagrees with the package metadata is rejected", (t) => {
+test("a probe that disagrees with the package metadata is rejected", async (t) => {
   const fixture = makeRuntimeFixture(".session-host-pi-runtime-mismatch-");
   cleanupFixture(t, fixture);
   const pkgDir = join(fixture.root, "mismatch package", "@earendil-works", "pi-coding-agent");
@@ -1299,21 +2181,52 @@ test("a probe that disagrees with the package metadata is rejected", (t) => {
   // The entry reports a different version than its metadata declares.
   writePiEntry(join(pkgDir, "dist", "bundle", "cli.js"), "1.2.3");
 
-  assert.throws(
+  await assert.rejects(
     () => launcher.__test.validatePiPackage(pkgDir, runtimeEnv(fixture)),
     /disagrees with the package metadata/,
   );
 });
 
-test("staged and cached provisions require exactly the pinned provision version", (t) => {
+test("staged and cached provisions require exactly the pinned provision version", async (t) => {
   const fixture = makeRuntimeFixture(".session-host-pi-runtime-wrongversion-");
   cleanupFixture(t, fixture);
   const pkgDir = join(fixture.root, "newer package", "@earendil-works", "pi-coding-agent");
   // Above the floor, but not the pinned provision version.
   writePiPackage(pkgDir, "1.0.5");
 
-  assert.throws(
+  await assert.rejects(
     () => launcher.__test.validatePiPackage(pkgDir, runtimeEnv(fixture), { exactVersion: launcher.PI_PROVISION_VERSION }),
     /does not match the pinned provision version/,
   );
+});
+
+test("bounded setup settles without close and retains an unconfirmed process group", async (t) => {
+  const fixture = makeRuntimeFixture(".session-host-unconfirmed-process-group-");
+  cleanupFixture(t, fixture);
+  const closeObserved = { value: false };
+  const startedAt = Date.now();
+  const before = launcher.__test.activeBoundedProcessCount();
+  const result = await launcher.__test.runBoundedProcess(process.execPath, [
+    "-e",
+    'process.on("SIGTERM", () => process.exit(0)); setInterval(() => {}, 1000);',
+  ], {
+    cwd: fixture.root,
+    env: runtimeEnv(fixture),
+    timeoutMs: 100,
+    testHooks: {
+      // The controlled hook models an unobservable descendant group and a
+      // missing close notification while the owned child handle still exits.
+      groupStillExists: () => true,
+      ignoreClose: true,
+      onClose: () => { closeObserved.value = true; },
+    },
+  });
+  const elapsed = Date.now() - startedAt;
+
+  assert.equal(result.cleanupConfirmed, false);
+  assert.equal(result.timedOut, true);
+  assert.equal(result.status, null, "without close, no child exit is invented");
+  assert.equal(closeObserved.value, true, "the synthetic child handle emitted close but the controlled observer withheld it");
+  assert.ok(elapsed < 3_000, `settlement remains bounded (elapsed ${elapsed} ms)`);
+  assert.equal(launcher.__test.activeBoundedProcessCount(), before + 1, "unconfirmed setup groups remain counted");
 });

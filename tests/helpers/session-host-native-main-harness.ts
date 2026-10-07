@@ -767,9 +767,23 @@ function renderedCaptionMatches(rendered: string | undefined, canonicalCaption: 
     && canonicalCaption.length > clippedPrefix.length;
 }
 
+/** Observe the native Editor's bordered content row, not its label/top border. */
+export function nativeFormFieldIsEmpty(text: string, marker: "> Workspace:" | "> New name:"): boolean {
+  const rows = text.split("\n");
+  const index = rows.findIndex((line) => line.includes(marker));
+  if (index < 0) return false;
+  const start = rows[index]!.indexOf(marker) + marker.length + 1;
+  const top = rows[index]!.slice(start).trim();
+  const body = rows[index + 1]?.slice(start);
+  const bottom = rows[index + 2]?.slice(start).trim();
+  // Require the real empty single-line Editor structure. A missing content
+  // row, text draft, menu, or mere blank label is never evidence of clearance.
+  return /^─+$/.test(top) && body !== undefined && body.trim() === ""
+    && bottom !== undefined && /^─+$/.test(bottom);
+}
+
 function workspaceFieldIsEmpty(text: string): boolean {
-  const field = text.split("\n").find((line) => line.includes("> Workspace:"));
-  return field !== undefined && field.slice(field.indexOf("> Workspace:") + "> Workspace:".length).trim() === "";
+  return nativeFormFieldIsEmpty(text, "> Workspace:");
 }
 
 export class MainPtyDriver {
@@ -1366,7 +1380,7 @@ export class MainPtyDriver {
       "the canonical display caption is shown separately from the exact stored-name replacement field");
     const replacementLine = editFrame.split("\n").find((line) => line.includes("> New name:"));
     assert.ok(replacementLine, "the empty replacement field is rendered");
-    assert.equal(replacementLine!.slice(replacementLine!.indexOf("> New name:") + "> New name:".length).trim(), "",
+    assert.equal(nativeFormFieldIsEmpty(editFrame, "> New name:"), true,
       "Edit never prefills the replacement with the current or clipped caption");
 
     await this.writeAndWait(name, (text) => text.includes(name.slice(-Math.min(name.length, 12))),
@@ -1411,7 +1425,7 @@ export class MainPtyDriver {
       assert.ok(clippedFrame.includes(displayName.slice(0, 80)), "the canonical caption is displayed in bounded clipped form");
       const emptyReplacement = clippedFrame.split("\n").find((line) => line.includes("> New name:"));
       assert.ok(emptyReplacement, "the replacement field is present beside the clipped current caption");
-      assert.equal(emptyReplacement!.slice(emptyReplacement!.indexOf("> New name:") + "> New name:".length).trim(), "",
+      assert.equal(nativeFormFieldIsEmpty(clippedFrame, "> New name:"), true,
         "a clipped current caption is never copied into the replacement field");
       const beforeCancel = this.frameRevision;
       this.pty.write(KEYS.escape);

@@ -153,9 +153,18 @@ id/epoch. A stale or unavailable tuple is rejected, and a failed rename leaves t
 session name unconfirmed. Editing never activates the row, routes input to it, pauses or
 stops its child, or changes the active input owner. Both forms show the effective native
 keybindings; the external-editor action temporarily hands the real terminal to the
-configured `VISUAL`/`EDITOR` command (default `vi`) as a directly owned, shell-free child.
-It edits a private bounded temporary file; unsafe, oversized, or failed results are not
-applied. Use the on-screen cues for form actions and quit confirmation. When a native Pi
+shared native Pi agent directory's `settings.json` `externalEditor` command when it is a
+nonempty string, otherwise to `VISUAL`, then `EDITOR`, then Pi's native platform
+fallback (`nano` on POSIX, `notepad` on Windows). An absent global settings file uses
+those fallbacks; malformed, unsafe, or unavailable settings fail before the editor
+child starts rather than silently guessing. Workspace/project `.pi/settings.json` overrides are deliberately
+not loaded, so this adds no project-code or trust grant. The command is parsed as literal
+arguments and run as a directly owned, shell-free child; Windows `.cmd`/batch and
+command-shell shims are unsupported. This editor-command support does not make the alpha
+host Windows-supported: Windows temporary-file privacy follows Node and the operating
+system's default ACLs, without a custom-ACL or same-user sandbox guarantee. The editor
+uses a bounded temporary file; unsafe, oversized, or failed results are not applied.
+Use the on-screen cues for form actions and quit confirmation. When a native Pi
 frame has focus, input is sent only to the explicitly activated, live child; it is never
 broadcast to hidden or sibling sessions. Native Escape, `q`/`Q`, and Ctrl+C remain Pi's
 keys whenever the native frame has focus. They cannot be configured as the sidebar

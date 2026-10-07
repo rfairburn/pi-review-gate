@@ -89,8 +89,11 @@ per operation: `SubtasksStart`, `SubtasksAdd`, `SubtasksInspect`, `SubtasksWatch
   checks remain in force independently of the selected target, and a landing
   into a target other than the parent session's workspace never enters the
   parent review baseline.
-- Start and add accept 1–16 bounded tasks and return stable execution/task handles
-  immediately. Work continues in the background up to the configured global and
+- Start and add accept 1–128 bounded task definitions per call and return stable
+  execution/task handles immediately. A submission batch is independent of how many
+  workers run at once and of the separate per-execution unsettled admission cap (see
+  [Worker resources, routes, and concurrency](#worker-resources-routes-and-concurrency)).
+  Work continues in the background up to the configured global and
   per-model capacities.
 - Each task owns its capture, worktree, session, checkpoint, review, and landing
   outcome; there is no wave-wide shared base or all-workers integration barrier.
@@ -388,12 +391,23 @@ override because the agent owns its configuration, and other resources' route ov
 are untouched, so a model switch never leaves an unsupported or stale level behind and
 needs no second manual configuration step.
 
-`config.execution.maxWorkers` controls concurrent workers (1–16, default 4); there is no
-parallelism toggle or per-tool override. Task count is independent, and excess tasks
-queue. The sum of resource capacities may exceed `maxWorkers`; it describes available
-fallback capacity, not the number of workers that must run. Thus a one-slot local
-primary cannot run one execution and one research worker at the same time, while
-lower-priority cloud entries can absorb overflow.
+`config.execution.maxWorkers` controls concurrent workers (1–128, default 4); there is no
+parallelism toggle or per-tool override. It is one session-wide worker budget shared by
+every group, and each `workerResources` entry's `maxConcurrent` (1–128) is that
+resource's own shared capacity across groups. Task count is independent, and excess
+tasks queue. Three limits are separate: how many task definitions a single
+`SubtasksStart` or `SubtasksAdd` call may submit (1–128, a submission batch), how many
+workers actually run at once (bounded by `maxWorkers` and the selected resource's
+remaining capacity), and how many tasks one execution may admit while they have not
+yet settled (128). Sequential top-offs after earlier tasks settle remain unbounded, so
+several submission batches can exceed that unsettled admission cap over the life of an
+execution even though at most 128 tasks are unsettled at once. `maxWorkers` bounds
+delegated workers only; reviewer concurrency is unchanged and is not drawn from that
+pool. The sum of resource
+capacities may exceed `maxWorkers`; it describes available fallback capacity, not the
+number of workers that must run. Thus a one-slot local primary cannot run one execution
+and one research worker at the same time, while lower-priority cloud entries can absorb
+overflow.
 
 Worker routes and reviewers are independent:
 

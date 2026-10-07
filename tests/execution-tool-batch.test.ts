@@ -155,7 +155,7 @@ test("operation-specific execution tools expose exact durable schemas", () => {
   const start = executionTool(tools, "SubtasksStart").parameters;
   assert.deepEqual(start.required, ["tasks"]);
   assert.equal(start.properties.tasks.minItems, 1);
-  assert.equal(start.properties.tasks.maxItems, 16);
+  assert.equal(start.properties.tasks.maxItems, 128);
   assert.equal(start.properties.tasks.items.properties.wakeOn, undefined);
   assert.equal(start.properties.instructions, undefined);
   // #179: one explicit boolean opt-in; strict continuation stays the default.

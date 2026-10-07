@@ -268,6 +268,20 @@ interface BackgroundControllerInput {
    */
   onScheduledDispatchRecorded?: (scheduledTaskId: string) => void;
   faults?: BackgroundFaultHooks;
+  /**
+   * Deterministic test seam: when set, `launch` invokes this runner instead of
+   * the per-kind lifecycle runner. The controller still owns every scheduling
+   * responsibility — global/per-resource slot accounting, lease
+   * acquisition/release, runtime registration, and rejection terminalization —
+   * so tests can exercise the real pump/refill behavior at full worker counts
+   * without dispatching a real process or provider call per task.
+   */
+  lifecycleRunner?: (
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    abort: AbortController,
+    lease: ExecutorPoolLease,
+  ) => Promise<void>;
 }
 
 /** Context passed to deterministic fault hooks (used by tests to inject failures). */
@@ -2921,17 +2935,21 @@ export class BackgroundExecutionController {
     // #237: per-kind lifecycle runners (research/in-place/wave) receive only
     // their narrow capability slices; the controller keeps admission, runtime
     // registration, lease lifecycle, and handleLaunchRejection terminalization.
-    const promise = (group.kind === "research"
-      ? task.pendingContinuation
-        ? runResearchContinuation(group, task, abort, lease, this.researchDeps)
-        : runResearchFresh(group, task, abort, lease, this.researchDeps)
-      : isInPlaceKind(group.kind)
+    // The optional lifecycleRunner seam substitutes only the runner itself.
+    const lifecycle = this.input.lifecycleRunner
+      ? this.input.lifecycleRunner(group, task, abort, lease)
+      : group.kind === "research"
         ? task.pendingContinuation
-          ? runInPlaceTaskContinuation(group, task, abort, lease, this.inplaceDeps)
-          : runInPlaceTaskFresh(group, task, abort, lease, this.inplaceDeps)
-        : task.pendingContinuation
-          ? runWaveTaskContinuation(group, task, abort, lease, this.waveDeps)
-          : runWaveTaskFresh(group, task, abort, lease, this.waveDeps))
+          ? runResearchContinuation(group, task, abort, lease, this.researchDeps)
+          : runResearchFresh(group, task, abort, lease, this.researchDeps)
+        : isInPlaceKind(group.kind)
+          ? task.pendingContinuation
+            ? runInPlaceTaskContinuation(group, task, abort, lease, this.inplaceDeps)
+            : runInPlaceTaskFresh(group, task, abort, lease, this.inplaceDeps)
+          : task.pendingContinuation
+            ? runWaveTaskContinuation(group, task, abort, lease, this.waveDeps)
+            : runWaveTaskFresh(group, task, abort, lease, this.waveDeps);
+    const promise = lifecycle
       .catch((error) => this.handleLaunchRejection(group, task, error))
       .finally(() => {
         // executeWave/continuation owns normal lease release. This is idempotent

@@ -41,6 +41,9 @@ import {
 import { GIT_READ_TOOL_NAME } from "../git-read/tool";
 import { isToolCallFingerprint, toolCallFingerprint, type StartLiveness, type SubmittedToolCallFingerprint } from "../tool-call-fingerprint";
 
+/** Per-call batch bound, independent of worker concurrency and group admission. */
+const MAX_TASKS_PER_SUBMISSION = 128;
+
 const ACTIONS = ["start", "add", "inspect", "watch", "continue", "steer", "interrupt", "force_merge", "mark_clean"] as const;
 type Action = typeof ACTIONS[number];
 
@@ -118,9 +121,9 @@ const SHARED_PROMPT_GUIDELINES = [
 function toolDescription(action: Action): string {
   switch (action) {
     case "start":
-      return "Start 1–16 durable background execute, research, or in-place subtasks — optionally selecting an existing authorized checkout/worktree (execute) or any directory the workers write in directly (inplace) via workspace — and return stable handles immediately.";
+      return `Start 1–${MAX_TASKS_PER_SUBMISSION} durable background execute, research, or in-place subtasks — optionally selecting an existing authorized checkout/worktree (execute) or any directory the workers write in directly (inplace) via workspace — and return stable handles immediately.`;
     case "add":
-      return "Add 1–16 durable background subtasks to an existing execution so freed capacity can be topped off.";
+      return `Add 1–${MAX_TASKS_PER_SUBMISSION} durable background subtasks to an existing execution so freed capacity can be topped off.`;
     case "inspect":
       return "Inspect durable execution-subtask state, recent activity, live controls, and artifact locations for an explicitly named task; taskId is required.";
     case "watch":
@@ -1105,7 +1108,7 @@ function toolSchema(action: Action): Record<string, unknown> {
   const executionId = { type: "string", minLength: 1, description: "Stable execution handle returned by SubtasksStart, SubtasksAdd, or SubtasksInspect." };
   const taskId = { type: "string", minLength: 1, description: "Stable task handle. May be omitted only when the execution contains exactly one task." };
   const inspectTaskId = { type: "string", minLength: 1, description: "Stable task handle. Required for inspection, even for single-task executions; use a handle returned by SubtasksStart/SubtasksAdd or shown in prior results." };
-  const tasks = { type: "array", minItems: 1, maxItems: 16, items: taskSchema(), description: "One to sixteen bounded task definitions for the selected group kind." };
+  const tasks = { type: "array", minItems: 1, maxItems: MAX_TASKS_PER_SUBMISSION, items: taskSchema(), description: `One to ${MAX_TASKS_PER_SUBMISSION} bounded task definitions for the selected group kind.` };
   const instructions = { type: "string", minLength: 1, description: "New authoritative direction for this operation." };
   const instructionId = { type: "string", minLength: 1, description: "Optional caller-provided idempotency handle." };
   const properties: Record<string, unknown> = {};
@@ -1339,7 +1342,9 @@ function normalizeEvidenceSelector(value: unknown): SubtaskEvidenceSelector {
 }
 
 function normalizeTasks(value: unknown): BackgroundTaskDefinition[] {
-  if (!Array.isArray(value) || value.length < 1 || value.length > 16) throw new Error("tasks must contain 1..16 items");
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_TASKS_PER_SUBMISSION) {
+    throw new Error(`tasks must contain 1..${MAX_TASKS_PER_SUBMISSION} items`);
+  }
   return value.map((candidate, index) => {
     if (!isRecord(candidate)) throw new Error(`tasks[${index}] must be an object`);
     for (const key of Object.keys(candidate)) {

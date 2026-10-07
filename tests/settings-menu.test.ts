@@ -473,7 +473,7 @@ test("worker resources keep the edited resource highlighted after a model switch
   // One-shot pickers (model/capacity) still use plain select.
   assert.deepEqual(
     harness.selectCalls.map((call) => call.title),
-    ["Executor model", "Maximum concurrency (1–16)", "Executor model", "Maximum concurrency (1–16)", "Executor model"],
+    ["Executor model", "Maximum concurrency (1–128)", "Executor model", "Maximum concurrency (1–128)", "Executor model"],
   );
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));

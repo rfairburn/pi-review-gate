@@ -37,8 +37,16 @@ async function settingsSmoke(driver: MainPtyDriver, session: OwnedSession, works
   assert.equal(driver.focus, "main");
   const beforeCommand = driver.frameRevision;
   driver.pty.write("/review-settings");
-  await driver.waitFrame((text) => text.includes("/review-settings"),
-    "A's real native command draft is visible before Enter", beforeCommand);
+  const exactSettingsDraft = (text: string): boolean => text.split("\n")
+    .some((line) => line.trim() === "/review-settings");
+  await driver.waitFrame(exactSettingsDraft,
+    "A's exact native command draft, not an earlier notice mentioning the command, is visible before Enter", beforeCommand);
+  // A native slash list may still be visible while its async suggestions
+  // settle. Real Escape dismisses it without changing the idle draft/owner.
+  driver.pty.write(KEYS.escape);
+  await driver.waitForFrameQuiet("A's native completion dismissal reaches a bounded stable frame");
+  assert.equal(exactSettingsDraft(driver.currentText()), true,
+    "native completion dismissal preserves the exact settings command draft");
   await driver.writeKeys(KEYS.enter, "A's /review-settings command is submitted to its native Pi process");
   await driver.waitFrame((text) => text.includes("Review settings") && text.includes("Operating mode"),
     "the production review-gate root settings menu opens in A's native process");
@@ -123,7 +131,7 @@ async function settingsSmoke(driver: MainPtyDriver, session: OwnedSession, works
 }
 
 // Guards the immutable startup-option contract as well as this alpha's
-// no-provider/no-session-override fixture boundary.
+// local-scripted-provider/no-session-override fixture boundary.
 const FORBIDDEN_SESSION_ARGS = new Set([
   "--session", "--session-id", "--sessionID", "--session-dir", "--no-session",
   "--continue", "--resume", "--fork",
@@ -205,9 +213,20 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
     nativeAgentDir,
   );
   startEnv.EDITOR = join(scratch, "unavailable-editor-must-not-be-selected");
+  // Native Pi creates a saved conversation only after an actual user message.
+  // Two explicit UI-delivered seed turns exercise ordinary persistence; this
+  // existing public faux-provider seam makes no external AI/API requests.
+  const seedStateDir = join(scratch, "fixture-state");
+  mkdirSync(seedStateDir, { mode: 0o700 });
+  writeFileSync(join(seedStateDir, "turn-script.json"), JSON.stringify({
+    steps: [{ text: "native-save-seed-complete" }],
+  }), { flag: "wx", mode: 0o600 });
+  startEnv.PRG_FIXTURE_AGENT_DIR = runtime.agentDir;
+  startEnv.PRG_FIXTURE_STATE_DIR = seedStateDir;
   assert.deepEqual(Object.keys(startEnv).filter((name) => /(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|PASSWORD)/i.test(name)), [],
     "the synthetic native child environment contains no external credentials");
-  const args = ["--offline", "--no-context-files", "--no-themes", "--no-tools", "--extension", OBSERVER_FIXTURE];
+  const args = ["--offline", "--no-context-files", "--no-themes", "--no-tools", "--extension", OBSERVER_FIXTURE,
+    "--extension", resolve(process.cwd(), "tests", "fixtures", "session-host-main-provider.cjs")];
   assert.equal(args.some((arg) => FORBIDDEN_SESSION_ARGS.has(arg)), false,
     "the real native sessions receive no forced/resumed/no-session override");
   const compiledMain = join(candidate.root, "dist", "src", "session-host", "main.js");
@@ -241,7 +260,9 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   assert.ok(driver.currentText().includes("Welcome"), "A's highlighted completion has not activated or replaced the empty Main frame");
   assert.equal(driver.selected(labelA), true, "A is highlighted after asynchronous creation");
   assert.equal(driver.focus, "sidebar", "creation completion returns ownership to the roster, not native input");
-  const unselectedGuard = `focusGuard${suffix}`;
+  // Printable digits exercise non-owner input without invoking host commands
+  // such as `e` (Edit), which can legitimately occur in a hexadecimal suffix.
+  const unselectedGuard = `314159265358${suffix.replace(/[a-f]/g, "9")}`;
   driver.pty.write(unselectedGuard);
   await driver.waitForFrameQuiet("A's highlight-only input is followed by a bounded stable frame");
   const afterUnselectedGuard = driver.currentText();
@@ -277,10 +298,11 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
     assert.deepEqual(session.record.credentialLikeEnvironmentNames, [], "the native process inherited no credential-like environment variables");
     assert.ok(session.record.sessionFile && isAbsolute(session.record.sessionFile), "Pi's public SessionManager reports its native session file");
   }
-  driver.pty.write(`highlightOnly${suffix}`);
+  const unselectedBGuard = `271828182845${suffix.replace(/[a-f]/g, "9")}`;
+  driver.pty.write(unselectedBGuard);
   await driver.waitForFrameQuiet("B's highlight-only input is followed by a bounded stable frame");
   const afterUnselectedBGuard = driver.currentText();
-  assert.ok(!afterUnselectedBGuard.includes(`highlightOnly${suffix}`),
+  assert.ok(!afterUnselectedBGuard.includes(unselectedBGuard),
     `B's highlight-only input never appears in the native child or host frame:\n${afterUnselectedBGuard.slice(-1_000)}`);
   assert.ok(afterUnselectedBGuard.includes("Welcome"), "B remains only highlighted in the empty Main view");
   await driver.activateRoster(labelB);
@@ -290,6 +312,26 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
     assert.equal(session.record.rows, 49, "the native child excludes the outer header row");
     assert.equal(processIsAlive(session.record.pid), true, "the native child remains independently alive while another row is selected");
   }
+
+  for (const session of initialSessions) {
+    assert.equal(existsSync(session.record.sessionFile!), false,
+      "native names alone do not force an empty conversation file into shared saved discovery");
+    await driver.activateRoster(session.rowProbe);
+    const beforeSeed = driver.records().length;
+    const seedPrompt = `native-save-seed-${session.rowProbe}`;
+    await driver.writeAndWait(seedPrompt, (text) => text.includes(seedPrompt),
+      "the deliberate saved-conversation seed is typed through its actual native editor");
+    await driver.writeKeys(KEYS.enter, "the actual native UI submits the seed user message");
+    await driver.waitForRecords((records) => records.slice(beforeSeed).some((record) =>
+      record.type === "agent_settled" && record.pid === session.record.pid),
+    "the real local scripted turn settles in the exact owned native child");
+    await driver.waitFrame((text) => text.includes("native-save-seed-complete"),
+      "the actual native pane renders the locally scripted response");
+    assert.equal(sessionFileHasStoredName(session.record.sessionFile!, session.currentName), true,
+      "ordinary Pi persistence writes the previously set exact native name after a real user message");
+  }
+  assert.equal(driver.records().filter((record) => record.type === "agent_start").length, 2,
+    "only the two deliberately submitted local scripted seed turns ran");
 
   const draftB = `nativeDraftB${suffix}`;
   await driver.writeAndWait(draftB, (text) => text.includes(draftB), "B receives a unique real native draft");
@@ -356,19 +398,31 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   assert.equal(processIsAlive(bPid), true, "B remains live after the actual host editor handoff");
 
   await driver.setOuterSize(52, 30, initialSessions, 52, 29);
+  const expectedHints = ["enter create", "escape cancel", "tab complete", "ctrl+c clear", "ctrl+g external editor"];
+  await driver.waitFrame((text) => expectedHints.every((hint) => text.replace(/\s+/g, " ").includes(hint)),
+    "the actual narrow New form finishes painting every wrapped native hint after resize");
   const wrappedHints = driver.currentText().replace(/\s+/g, " ");
-  for (const hint of ["enter create", "esc cancel", "tab complete", "ctrl+c clear", "ctrl+g external editor"]) {
-    assert.ok(wrappedHints.includes(hint), `the narrow New form keeps its wrapped ${hint} hint readable`);
+  for (const hint of expectedHints) {
+    assert.ok(wrappedHints.includes(hint), `the narrow New form keeps its wrapped ${hint} hint readable\n${driver.currentText()}`);
   }
   await driver.setOuterSize(24, 5, initialSessions, 24, 4);
-  assert.ok(driver.currentText().includes("too small"),
-    "the real New form falls back to its bounded tiny-pane message without fabricating a field");
+  await driver.waitFrame((text) => text.includes("too small") && !text.includes("Workspace:"),
+    "the real New form paints its bounded tiny-pane message without fabricating a field");
   await driver.setOuterSize(52, 30, initialSessions, 52, 29);
-  assert.ok(driver.currentText().includes("Workspace:"), "the New form returns after restoring usable geometry");
+  await driver.waitFrame((text) => text.includes("Workspace:"), "the New form returns after restoring usable geometry");
   await driver.clearWorkspaceField("the native clear binding empties B's retained workspace before filesystem completion");
   const partialWorkspace = join(scratch, "workspace-new-");
   await driver.writeAndWait(partialWorkspace, (text) => text.includes(partialWorkspace.slice(-18)),
     "the New form's real workspace Editor accepts an absolute fixture-only completion prefix");
+  await driver.waitFrame((text) => text.includes(completionTargetNameA) && text.includes(completionTargetNameB),
+    "typing the native path prefix automatically displays both owned folder suggestions");
+  // Native Tab accepts an already visible selection. Dismiss that list first
+  // so this separate Tab action tests opening completion, not accepting alpha.
+  const beforeAutomaticDismiss = driver.frameRevision;
+  driver.pty.write(KEYS.escape);
+  await driver.waitFrame((text) => text.includes("Workspace:")
+    && !text.includes(completionTargetNameA) && !text.includes(completionTargetNameB),
+  "native Escape dismisses the automatically opened completion while retaining New", beforeAutomaticDismiss);
   const beforeCompletion = driver.frameRevision;
   driver.pty.write("\t");
   await driver.waitFrame((text) => text.includes(completionTargetNameA) && text.includes(completionTargetNameB),
@@ -383,8 +437,8 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   driver.pty.write(KEYS.escape);
   driver.focus = "main";
   driver.sidebarVisible = false;
-  await driver.waitFrame((text) => !text.includes("New session") && !text.includes("Workspace:"),
-    "the second Escape cancels New and returns focus to B", beforeFormCancel);
+  await driver.waitFrame((text) => !text.includes("New session") && !text.includes("Workspace:") && text.includes(draftB),
+    "the second Escape cancels New and finishes painting B's unchanged native draft", beforeFormCancel);
   assert.ok(driver.currentText().includes(draftB), "canceling New restores B's unchanged native prompt draft");
   assert.equal(processIsAlive(bPid), true, "canceling New never stops B's native process");
   await driver.toggleSidebar();
@@ -392,10 +446,9 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   await driver.activateRoster(labelB, draftB);
 
   await driver.writeAndWait("qQ", (text) => text.includes(`${draftB}qQ`), "native q/Q are forwarded unchanged in Main focus");
-  const beforeEscape = driver.frameRevision;
-  driver.pty.write(KEYS.escape);
-  await driver.waitFrame((text) => text.includes("New session") && text.includes("Quit host"),
-    "native Escape is forwarded without hiding the still-visible host sidebar", beforeEscape);
+  await driver.sendNativeEscapeAndObserve(sessionB);
+  assert.ok(driver.currentText().includes("New session") && driver.currentText().includes("Quit host"),
+    "native Escape is forwarded without hiding the still-visible host sidebar");
   assert.equal(driver.focus, "main", "Escape did not move Main ownership to the sidebar");
   assert.equal(processIsAlive(bPid), true, "native q/Q/Escape did not quit or pause B");
   await driver.writeAndWait(KEYS.ctrlC, (text) => !text.includes(`${draftB}qQ`),
@@ -509,8 +562,8 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
     && task.name.startsWith(`native-main-${editorMarker}`) && task.enabled === false),
   "the shared saved settings contain A's disabled native fixture task");
   const afterSettingsRecords = driver.records();
-  assert.equal(afterSettingsRecords.filter((record) => record.type === "agent_start").length, 0,
-    "no native model turn or external API request was started");
+  assert.equal(afterSettingsRecords.filter((record) => record.type === "agent_start").length, 2,
+    "the settings/editor flow adds no turn beyond the two explicit local scripted seeds");
   assert.equal(afterSettingsRecords.filter((record) => record.type === "tool_call").length, 0,
     "the real settings/editor flow called no native tools");
   assert.ok(editorRecords(driver.editorLog).some((record) => record.type === "external-editor"
@@ -561,9 +614,16 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
 
   const bStartCountBeforeResume = driver.records().filter((record) => record.type === "session_start"
     && record.pid === sessionB.record.pid).length;
-  await driver.writeAndWait(`/resume ${originalBSessionId}`, (text) => text.includes(originalBSessionId),
-    "the real native Pi /resume command targets B's own previously observed session id");
-  await driver.writeKeys(KEYS.enter, "the public native Pi /resume command is submitted through the native UI");
+  const nativeResumeSelectsB = (text: string): boolean => text.includes("Resume Session (Current Folder)")
+    && text.split("\n").some((line) => line.slice(33).trimStart().startsWith(`› ${labelB} `));
+  await driver.writeAndWait("/resume", (text) => text.split("\n").some((line) => line.slice(33).trim() === "/resume"),
+    "the exact public Pi /resume picker command is entered in B's native editor");
+  await driver.writeAndWait(KEYS.enter, nativeResumeSelectsB,
+    "Pi's real current-folder resume picker visibly highlights B's own saved native conversation");
+  assert.equal(driver.records().filter((record) => record.type === "agent_start").length, 2,
+    "opening the public resume picker is not submitted as a model turn");
+  assert.ok(nativeResumeSelectsB(driver.currentText()), "native resume selection names B before the explicit Enter action");
+  driver.pty.write(KEYS.enter); // Select the observed native picker row, not a host roster row.
   const resumedRecords = await driver.waitForRecords((records) => {
     const starts = records.filter((record) => record.type === "session_start" && record.pid === sessionB.record.pid);
     const latest = starts.at(-1);
@@ -580,8 +640,8 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
     "the resumed conversation's own native session file retains its persisted title");
   await driver.waitFrame((text) => text.split("\n")[0]?.includes(`Session host · ${labelB} ·`) === true,
     "Main's active header reflects the resumed native conversation caption");
-  assert.equal(driver.records().filter((record) => record.type === "agent_start").length, 0,
-    "the public /new and /resume UI checks started no native model turn");
+  assert.equal(driver.records().filter((record) => record.type === "agent_start").length, 2,
+    "the public /new and /resume UI checks add no turn beyond the two local scripted seeds");
   assert.equal(driver.records().filter((record) => record.type === "tool_call").length, 0,
     "the public /new and /resume UI checks invoked no native tools");
 

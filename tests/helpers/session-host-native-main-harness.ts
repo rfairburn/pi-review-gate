@@ -54,7 +54,10 @@ const CLEANUP_HOST_EXIT_TIMEOUT_MS = 2_000;
 const CLEANUP_SIGNAL_TIMEOUT_MS = 3_000;
 export const OUTER_COLS = 120;
 export const OUTER_ROWS = 50;
-const BASELINE = "SESSION_HOST_NATIVE_MAIN_OUTER_RESTORATION_BASELINE";
+// The primary buffer is legitimately clipped while the alternate buffer is
+// resized; keep the complete restoration witness inside the narrowest 24 cols.
+export const OUTER_RESTORATION_BASELINE = "PRG-TTY-BASELINE";
+const BASELINE = OUTER_RESTORATION_BASELINE;
 export const OBSERVER_ENV = "PRG_SESSION_HOST_NATIVE_MAIN_OBSERVER_FILE";
 export const OBSERVER_FIXTURE = join(process.cwd(), "tests", "fixtures", "session-host-main-observer.cjs");
 export const RUNNER_FIXTURE = join(process.cwd(), "tests", "fixtures", "session-host-main-runner.cjs");
@@ -683,16 +686,17 @@ export function sessionFileHasStoredName(sessionFile: string, expectedName: stri
   if (!stats.isFile() || stats.isSymbolicLink() || stats.size > 8 * 1024 * 1024) {
     throw new Error("owned native session file is not a bounded regular file");
   }
+  let latestName: unknown;
   for (const line of readFileSync(sessionFile, "utf8").split("\n")) {
     if (!line.trim()) continue;
     try {
       const entry = JSON.parse(line) as { type?: unknown; name?: unknown };
-      if (entry.type === "session_info" && entry.name === expectedName) return true;
+      if (entry.type === "session_info") latestName = entry.name;
     } catch {
       // Ignore only an incomplete append; complete native entries are checked.
     }
   }
-  return false;
+  return latestName === expectedName;
 }
 
 function readRecords(path: string): SessionRecord[] {
@@ -810,6 +814,7 @@ export class MainPtyDriver {
   parserError?: Error;
   private forcedCleanup = false;
   private selectedNativeTarget?: { readonly workspace: string; readonly pid: number; readonly sessionId: string };
+  private rosterSelectionClearedByRemoval = false;
   frameRevision = 0;
   outputRevision = 0;
   sidebarVisible = true;
@@ -886,6 +891,7 @@ export class MainPtyDriver {
     mkdirSync(observerDirectory, { recursive: true, mode: 0o700 });
     writeFileSync(options.observerFile, "", { mode: 0o600 });
     writeFileSync(ptyExitLog, "", { mode: 0o600 });
+    writeFileSync(join(options.scratchRoot, "pty-controls.jsonl"), "", { flag: "wx", mode: 0o600 });
     const args = options.args ?? [
       "--offline",
       "--no-context-files",
@@ -925,6 +931,7 @@ export class MainPtyDriver {
       PRG_SESSION_HOST_NATIVE_MAIN_RESULT: resultFile,
       PRG_SESSION_HOST_NATIVE_MAIN_BASELINE: BASELINE,
       PRG_SESSION_HOST_NATIVE_MAIN_PTY_EXIT_LOG: ptyExitLog,
+      PRG_SESSION_HOST_NATIVE_MAIN_PTY_CONTROL_LOG: join(options.scratchRoot, "pty-controls.jsonl"),
       PI_REVIEW_GATE_CANDIDATE_ENTRY: options.candidate.entry,
       PI_REVIEW_GATE_INSTALLED_AGENT: process.env.PI_REVIEW_GATE_INSTALLED_AGENT,
       PI_REVIEW_GATE_INSTALLED_PI_BIN: process.env.PI_REVIEW_GATE_INSTALLED_PI_BIN,
@@ -1017,6 +1024,36 @@ export class MainPtyDriver {
     return this.ownedSessions().filter((session) => !this.removedWorkspaces.has(session.workspace));
   }
 
+  /** Observe idle Escape delivery without demanding a native no-op repaint. */
+  async sendNativeEscapeAndObserve(session: OwnedSession): Promise<void> {
+    assert.equal(this.focus, "main", "structural Escape targets an active native input owner");
+    const file = join(dirname(this.ptyExitLog), "pty-controls.jsonl");
+    const count = (): number => {
+      const stats = lstatSync(file);
+      assert.ok(stats.isFile() && !stats.isSymbolicLink() && stats.size <= 64 * 1024,
+        "the owned structural-control journal stays a bounded regular file");
+      let found = 0;
+      for (const line of readFileSync(file, "utf8").split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const record = JSON.parse(line) as { type?: string; key?: string; pid?: number; cwd?: string };
+          if (record.type === "pty_control" && record.key === "escape"
+            && record.pid === session.record.pid && record.cwd === session.workspace) found += 1;
+        } catch { /* a bounded watcher may see an incomplete append */ }
+      }
+      return found;
+    };
+    const before = count();
+    const change = new ChangeSignal();
+    const watcher = watch(file, () => change.notify());
+    try {
+      this.pty.write(KEYS.escape);
+      await change.waitFor(() => count() > before, EVENT_TIMEOUT_MS,
+        "unmodified native Escape freshly reaches the exact owned child's real public PTY write");
+      await this.waitForFrameQuiet("idle native Escape preserves a bounded stable owner frame");
+    } finally { watcher.close(); }
+  }
+
   /** Real @lydell/node-pty onExit observations journaled by the Main runner. */
   ptyExits(): PtyExitRecord[] {
     if (!existsSync(this.ptyExitLog)) return [];
@@ -1103,9 +1140,9 @@ export class MainPtyDriver {
       timeoutMs,
       description,
     ).catch((error: unknown) => {
-      const frame = this.currentText().split("\n").filter((line) => line.trim()).slice(-12).join(" | ").slice(0, 2_000);
+      const frame = this.currentText(); // complete controlled fixture frame, including wrapped native fields
       const exit = this.exitEvent ? `exit=${this.exitEvent.exitCode}/${this.exitEvent.signal ?? 0}` : "still-running";
-      throw new Error(`${description}: ${error instanceof Error ? error.message : "bounded frame wait failed"}; ${exit}; frames=${this.frameRevision}; ${frame}`);
+      throw new Error(`${description}: ${error instanceof Error ? error.message : "bounded frame wait failed"}; ${exit}; frames=${this.frameRevision}\nActual owned Main frame:\n${frame}`);
     });
   }
 
@@ -1136,7 +1173,14 @@ export class MainPtyDriver {
     description: string,
     timeoutMs = EVENT_TIMEOUT_MS,
   ): Promise<SessionRecord[]> {
-    await this.journalSignal.waitFor(() => predicate(this.records()), timeoutMs, description);
+    try {
+      await this.journalSignal.waitFor(() => predicate(this.records()), timeoutMs, description);
+    } catch (error) {
+      // Controlled fixture content only. Preserve the actual frame in the
+      // failure diagnostic so a UI/backend error is not hidden by an empty
+      // lifecycle journal; never synthesize a session or weaken the predicate.
+      throw new Error(`${description}: ${error instanceof Error ? error.message : "observation failed"}\nActual owned Main frame:\n${this.currentText()}`);
+    }
     return this.records();
   }
 
@@ -1202,10 +1246,29 @@ export class MainPtyDriver {
     }
     this.selectedNativeTarget = undefined;
     const labels = this.sessions().map((session) => session.rowProbe)
-      .concat(["New session", "Quit host"]);
+      .concat(["Saved conversations", "New session", "Quit host"]);
+    if (this.rosterSelectionClearedByRemoval) {
+      assert.equal(selectedRosterCaption(this.currentText(), this.sidebarColumnCount()), undefined,
+        "confirmed selected-row removal leaves the host highlight empty instead of selecting a sibling");
+      const activeHeader = this.currentText().split("\n")[0];
+      const beforeHighlight = this.frameRevision;
+      this.pty.write(KEYS.down); // Explicit UI navigation only, never activation.
+      await this.waitFrame((text) => this.rosterTargetSelected(text, labels[0]!)
+        && text.split("\n")[0] === activeHeader,
+      "explicit Down establishes the first actual roster highlight without transferring Main ownership", beforeHighlight, timeoutMs);
+      this.rosterSelectionClearedByRemoval = false;
+      if (this.rosterTargetSelected(this.currentText(), label)) {
+        this.rememberSelectedTarget(label);
+        return;
+      }
+    }
     for (let count = 0; count < maximumDowns; count += 1) {
+      // Observe an actual known row before authorizing any navigation key.
+      await this.waitFrame((text) => labels.some((candidate) => this.rosterTargetSelected(text, candidate)),
+        "the current owned roster finishes painting its actual highlighted row before navigation", -1, timeoutMs);
       const selectedIndex = labels.findIndex((candidate) => this.rosterTargetSelected(this.currentText(), candidate));
-      assert.ok(selectedIndex >= 0, "the owned roster has an observed highlighted row before navigation");
+      assert.ok(selectedIndex >= 0,
+        `the owned roster has an observed highlighted row before navigation\nActual owned Main frame:\n${this.currentText()}`);
       const nextLabel = labels[(selectedIndex + 1) % labels.length]!;
       const after = this.frameRevision;
       this.pty.write(KEYS.down);
@@ -1302,10 +1365,26 @@ export class MainPtyDriver {
     await this.clearWorkspaceField("the native `ctrl+c clear` action removes any retained Workspace draft");
     await this.writeAndWait(canonicalWorkspace, (text) => text.includes(canonicalWorkspace.slice(-18)),
       "the explicit workspace is entered in the real native field");
+    const visibleWorkspace = (text: string): string | undefined => {
+      const fieldRows = text.split("\n");
+      const fieldIndex = fieldRows.findIndex((line) => line.includes("> Workspace:"));
+      if (fieldIndex < 0) return undefined;
+      const fieldColumn = fieldRows[fieldIndex]!.indexOf("> Workspace:") + "> Workspace: ".length;
+      return fieldRows[fieldIndex + 1]?.slice(fieldColumn).trim();
+    };
+    const beforeFirstEnter = this.frameRevision;
+    this.pty.write(KEYS.enter);
+    await this.waitFrame((text) => !text.includes("> Workspace:") || text.includes("Starting (request")
+      || visibleWorkspace(text) === `${canonicalWorkspace}/`,
+    "native Enter accepts the exact folder completion or actually submits New", beforeFirstEnter);
+    const afterFirstEnter = this.currentText();
+    if (afterFirstEnter.includes("> Workspace:") && !afterFirstEnter.includes("Starting (request")) {
+      assert.equal(visibleWorkspace(afterFirstEnter), `${canonicalWorkspace}/`,
+        "first native Enter accepted the exact owned folder completion, not another path or an error");
+      await this.writeKeys(KEYS.enter, "a separate native Enter submits the accepted Workspace path");
+    }
     this.pendingWorkspace = canonicalWorkspace;
     this.submittedWorkspaces.add(canonicalWorkspace);
-    await this.writeKeys(KEYS.enter, "the Workspace-only native New form submits");
-    this.focus = "sidebar";
 
     const records = await this.waitForRecords(
       (entries) => entries.some((record) => record.type === "session_start"
@@ -1330,6 +1409,7 @@ export class MainPtyDriver {
     this.ownedLabels.set(canonicalWorkspace, { rowProbe, currentName, displayName, workspace: canonicalWorkspace });
     await this.waitFrame((text) => this.selectedCaptionMatches(text, displayName) && text.includes("Session host"),
       `new canonical row ${displayName} is highlighted after completion without activation`);
+    this.focus = "sidebar"; // confirmed completed row, not merely a completion-accept key
     this.selectedNativeTarget = { workspace: canonicalWorkspace, pid: record.pid!, sessionId: record.sessionId! };
     return { rowProbe, currentName, displayName, workspace: canonicalWorkspace, record, exitWatcher };
   }
@@ -1373,24 +1453,25 @@ export class MainPtyDriver {
     this.focus = "form";
     await this.waitFrame((text) => text.includes("Edit native session name")
       && text.includes("Current name (display only; type a complete replacement):")
-      && text.includes("> New name:"),
-    "the actual host Edit form opens for the selected native row", beforeEdit);
+      && text.includes("> New name:") && nativeFormFieldIsEmpty(text, "> New name:"),
+    "the actual host Edit form renders its empty native replacement field for the selected row", beforeEdit);
     const editFrame = this.currentText();
     assert.ok(editFrame.includes(session.displayName.slice(0, Math.min(session.displayName.length, 80))),
       "the canonical display caption is shown separately from the exact stored-name replacement field");
     const replacementLine = editFrame.split("\n").find((line) => line.includes("> New name:"));
     assert.ok(replacementLine, "the empty replacement field is rendered");
     assert.equal(nativeFormFieldIsEmpty(editFrame, "> New name:"), true,
-      "Edit never prefills the replacement with the current or clipped caption");
+      `Edit never prefills the replacement with the current or clipped caption\nActual owned Edit frame:\n${editFrame}`);
 
     await this.writeAndWait(name, (text) => text.includes(name.slice(-Math.min(name.length, 12))),
       "the replacement native name is typed into the actual host form");
+    const nameRecordStart = this.records().length;
     await this.writeKeys(KEYS.enter, "the replacement is submitted through the actual host Edit form");
-    const nameRecords = await this.waitForRecords((records) => records.some((record) => record.type === "native_session_name"
+    const nameRecords = await this.waitForRecords((records) => records.slice(nameRecordStart).some((record) => record.type === "native_session_name"
       && record.pid === session.record.pid
       && record.sessionId === session.record.sessionId
       && record.storedName === name && typeof record.displayName === "string"),
-    "the native public SessionManager observes the exact persisted replacement name");
+    "the native public SessionManager freshly observes the exact replacement name");
     const nameRecord = nameRecords.filter((record) => record.type === "native_session_name"
       && record.pid === session.record.pid && record.sessionId === session.record.sessionId
       && record.storedName === name && typeof record.displayName === "string").at(-1);
@@ -1419,8 +1500,9 @@ export class MainPtyDriver {
       const beforeReopen = this.frameRevision;
       this.pty.write("e");
       this.focus = "form";
-      await this.waitFrame((text) => text.includes("Edit native session name") && text.includes("> New name:"),
-        "Edit reopens with a long current caption", beforeReopen);
+      await this.waitFrame((text) => text.includes("Edit native session name") && text.includes("> New name:")
+        && nativeFormFieldIsEmpty(text, "> New name:"),
+        "Edit reopens with a long current caption and a fully rendered empty replacement", beforeReopen);
       const clippedFrame = this.currentText();
       assert.ok(clippedFrame.includes(displayName.slice(0, 80)), "the canonical caption is displayed in bounded clipped form");
       const emptyReplacement = clippedFrame.split("\n").find((line) => line.includes("> New name:"));
@@ -1461,6 +1543,13 @@ export class MainPtyDriver {
   async closeNativeNormally(session: OwnedSession): Promise<void> {
     assert.equal(this.focus, "main", `native input is focused on ${session.rowProbe}`);
     assert.equal(processIsAlive(session.record.pid), true, `${session.rowProbe} is alive before its native Ctrl+C exit`);
+    assert.ok(this.currentText().split("\n")[0]?.includes(`Session host · ${session.displayName} · alive`),
+      "the explicit native exit begins with the exact uniquely observed target as active owner");
+    const alreadyExitedRows = this.currentText().split("\n").filter((line) => line.includes("[exited (code 0)]")).length;
+    const otherLiveOwners = this.ownedSessions().filter((candidate) => candidate.record.pid !== session.record.pid
+      && !candidate.exitWatcher.observedExit);
+    for (const owner of otherLiveOwners) assert.equal(processIsAlive(owner.record.pid), true,
+      "another owned child is still live before this exact native exit");
     const before = this.frameRevision;
     const shutdownCount = this.records().filter((record) => record.type === "session_shutdown"
       && record.pid === session.record.pid).length;
@@ -1472,19 +1561,38 @@ export class MainPtyDriver {
       && record.pid === session.record.pid).at(-1);
     assert.equal(nativeShutdown?.reason, "quit",
       "the public native lifecycle reports its actual quit reason after the real Ctrl+C exit");
-    // The exact active-owner header proves THIS session reached lifecycle
-    // exited (set only after its real native onExit), and the same-owner row
-    // carries the zero exit status; another owner's already-exited row can
-    // never satisfy both.
+    assert.equal(nativeShutdown?.sessionId, session.record.sessionId,
+      "the fresh shutdown witness belongs to the exact observed conversation, not another session on that PID");
+    assert.equal(nativeShutdown?.contextSessionId, session.record.sessionId,
+      "the public native shutdown context independently confirms the same conversation id");
+    // Reporter disconnect invalidates native metadata: an unavailable caption
+    // is truthful, not a new identity. Correlate the uniquely active owner and
+    // one NEW zero-status row with the exact PID's public lifecycle/kernel/PTY
+    // evidence below; old rows or another child's exit cannot stand in for it.
+    let exitCaption: string | undefined;
     await this.waitFrame((text) => {
       const lines = text.split("\n");
-      if (lines[0]?.includes(`Session host · ${session.rowProbe} · exited`) !== true) return false;
-      return lines.some((line) => line.includes(session.rowProbe) && line.includes("[exited (code 0)]"));
-    }, `Main observes the normal owned ${session.rowProbe} process exit with code 0`, before);
+      const match = /^Session host · (.+) · exited\s*$/.exec(lines[0] ?? "");
+      if (!match || (match[1] !== session.displayName && match[1] !== "(session name unavailable)")) return false;
+      if (lines.filter((line) => line.includes("[exited (code 0)]")).length !== alreadyExitedRows + 1) return false;
+      exitCaption = match[1];
+      return true;
+    }, `Main observes one new exited row for the exact active owned ${session.rowProbe} process`, before);
     await session.exitWatcher.waitForExit(EVENT_TIMEOUT_MS);
     assert.equal(session.exitWatcher.observedExit, true,
       `${session.rowProbe} received the kernel EVFILT_PROC/NOTE_EXIT event for its exact owned PID`);
     await this.assertGracefulPtyExits([session]);
+    for (const owner of otherLiveOwners) assert.equal(processIsAlive(owner.record.pid), true,
+      "this exact native exit does not stop or substitute another owned process");
+    assert.ok(exitCaption);
+    // Keep stored native names intact; only the observed UI navigation caption
+    // changes after its reporter goes away. This is not persisted metadata.
+    session.rowProbe = exitCaption;
+    session.displayName = exitCaption;
+    this.ownedLabels.set(session.workspace, {
+      rowProbe: exitCaption, currentName: session.currentName,
+      displayName: exitCaption, workspace: session.workspace,
+    });
   }
 
   /** Remove one positively exited row via the real sidebar Delete action only. */
@@ -1509,13 +1617,18 @@ export class MainPtyDriver {
     await this.moveRosterTo(session.rowProbe);
     assert.equal(this.selectedCaptionMatches(this.currentText(), session.displayName), true,
       "the Delete key is directed at the selected row's actual exited caption");
+    const remainingRows = this.sessions().filter((candidate) => candidate.workspace !== session.workspace);
     const beforeDelete = this.frameRevision;
     this.pty.write(KEYS.delete);
     await this.waitFrame((text) => text.includes(`Sessions (${beforeRows - 1})`)
-      && !this.rosterHasCaption(text, session.displayName),
-    `the public Delete action removes only ${session.rowProbe}'s confirmed exited row`, beforeDelete);
+      && !this.rosterHasCaption(text, session.displayName)
+      && remainingRows.every((candidate) => this.rosterHasCaption(text, candidate.displayName))
+      && ["Saved conversations", "New session", "Quit host"].every((entry) => text.includes(entry))
+      && selectedRosterCaption(text, this.sidebarColumnCount()) === undefined,
+    `the public Delete action removes only ${session.rowProbe}'s confirmed exited row and clears its highlight`, beforeDelete);
     this.removedWorkspaces.add(session.workspace);
     this.selectedNativeTarget = undefined;
+    this.rosterSelectionClearedByRemoval = true;
     assert.equal(this.sessions().length, beforeRows - 1,
       "current roster removal does not discard historical native process ownership");
     assert.ok(existsSync(session.record.sessionFile),
@@ -1540,7 +1653,8 @@ export class MainPtyDriver {
     assert.ok(this.sawAltLeave, "the real Main frame writer restored the primary screen on the owned outer PTY");
     assert.ok(this.sawCursorShow, "the real Main cleanup restored cursor visibility");
     assert.ok(this.sawReset, "the real Main cleanup emitted terminal style reset");
-    assert.ok(frameText(this.surface).includes(this.baseline), "the outer terminal emulator observes its pre-Main primary-screen baseline after restoration");
+    assert.ok(frameText(this.surface).includes(this.baseline),
+      `the outer terminal emulator observes its complete pre-Main primary-screen baseline after restoration\nActual restored primary frame:\n${frameText(this.surface)}`);
     assert.ok(this.replyLog.some((reply) => /^\x1b\[\?[\d;]*c$/.test(reply)),
       "the owned outer PTY answered the real public primary device-attribute query");
     assert.ok(this.replyLog.some((reply) => /^\x1b\[\?\d+u$/.test(reply)),

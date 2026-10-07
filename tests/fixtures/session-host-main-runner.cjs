@@ -9,11 +9,13 @@
  * on the exact module instance production lazily loads (instances.js uses
  * createRequire(__filename).require('@lydell/node-pty')). The wrapper is a
  * strict forwarder: it calls the original spawn with the identical receiver
- * and arguments, returns the same actual IPty handle unchanged, and attaches
- * only a public onExit listener that appends the actual exitCode/signal plus
+ * and arguments, returns the same actual IPty handle (no substitute), and attaches
+ * a public onExit listener that appends the actual exitCode/signal plus
  * the owned PID/cwd to the private journal. It records metadata only (never
- * argv/env/tokens/transcripts), performs no writes/input/kills through the
- * observed handles, and preserves spawn errors. This is authorized test
+ * argv/env/tokens/transcripts). An optional structural-control journal observes
+ * unmodified Escape delivered through the real public write() method, forwarding
+ * identical arguments/receiver/return values without synthesizing input or
+ * adding a terminal listener/writer. It performs no kills and preserves errors. This is authorized test
  * instrumentation of the public API, not a production stub or factory
  * override: production code paths are untouched.
  */
@@ -22,7 +24,7 @@ const path = require('node:path');
 const { createRequire } = require('node:module');
 const { spawnSync } = require('node:child_process');
 
-function installPtyExitObservation(mainEntry, logPath) {
+function installPtyExitObservation(mainEntry, logPath, controlLogPath) {
   // Resolve @lydell/node-pty exactly as production will: the compiled
   // instances.js loads it lazily through createRequire(__filename). Requiring
   // that same resolved file gives this runner the identical module instance,
@@ -37,8 +39,25 @@ function installPtyExitObservation(mainEntry, logPath) {
   const originalSpawn = nodePty.spawn;
   nodePty.spawn = function observedSpawn(file, args, options) {
     // Strict forwarding: identical receiver and arguments; the real IPty
-    // handle is returned unchanged and spawn errors propagate untouched.
+    // handle identity is preserved and spawn errors propagate untouched.
     const handle = originalSpawn.call(nodePty, file, args, options);
+    if (controlLogPath && typeof handle.write === 'function') {
+      const originalWrite = handle.write;
+      handle.write = function observedWrite(...writeArgs) {
+        const result = originalWrite.apply(this, writeArgs);
+        const data = writeArgs[0];
+        if (typeof data === 'string' && (data === '\x1b' || /^\x1b\[27(?:;1(?::1)?)?u$/.test(data))) {
+          try {
+            fs.appendFileSync(controlLogPath, `${JSON.stringify({
+              type: 'pty_control', key: 'escape', pid: handle.pid,
+              cwd: options && typeof options.cwd === 'string' ? options.cwd : undefined,
+              encoding: data === '\x1b' ? 'legacy' : 'csi-u',
+            })}\n`, 'utf8');
+          } catch { /* observation never changes the real write outcome */ }
+        }
+        return result;
+      };
+    }
     try {
       handle.onExit((event) => {
         try {
@@ -78,7 +97,8 @@ async function main() {
   const options = JSON.parse(fs.readFileSync(process.env.PRG_SESSION_HOST_NATIVE_MAIN_OPTIONS, 'utf8'));
   const exitLog = process.env.PRG_SESSION_HOST_NATIVE_MAIN_PTY_EXIT_LOG;
   if (exitLog) {
-    installPtyExitObservation(process.env.PRG_SESSION_HOST_NATIVE_MAIN_ENTRY, exitLog);
+    installPtyExitObservation(process.env.PRG_SESSION_HOST_NATIVE_MAIN_ENTRY, exitLog,
+      process.env.PRG_SESSION_HOST_NATIVE_MAIN_PTY_CONTROL_LOG);
   }
   const { runSessionHost } = require(process.env.PRG_SESSION_HOST_NATIVE_MAIN_ENTRY);
   const before = readControllingTtyState();

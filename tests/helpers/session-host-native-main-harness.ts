@@ -1686,8 +1686,11 @@ export class MainPtyDriver {
     assert.ok(starts.every((record) => this.nativeExitWatchers.get(record.pid!)?.observedExit === true),
       "the host is quit only after every owned native child OS exit is confirmed");
     await this.ensureSidebarFocus();
-    await this.moveRosterTo("Quit host");
-    this.pty.write(KEYS.enter);
+    assert.equal(this.focus, "sidebar", "the explicit host quit action belongs to the visible sidebar, not a native editor");
+    await this.waitFrame((text) => text.includes("q quit"), "the actual sidebar exposes its host-only quit action");
+    // Disconnected exited rows truthfully share an unavailable caption. Quit
+    // needs no invented name or ambiguous row navigation after exact OS exits.
+    this.pty.write("q");
     this.focus = "main";
     const exit = await this.waitForExit();
     await this.surface.flush();

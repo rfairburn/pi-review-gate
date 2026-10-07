@@ -4,6 +4,7 @@
  * Modified for pi-review-gate; see NOTICE and LICENSES/Apache-2.0.txt.
  */
 import type { ChildProcess } from "node:child_process";
+import { onExit } from "signal-exit";
 import { expandableResult, type ToolResultRenderCallback } from "../tool-result-expansion";
 import { isToolCallFingerprint, toolCallFingerprint, type StartLiveness, type SubmittedToolCallFingerprint } from "../tool-call-fingerprint";
 import { spawnBackgroundJob } from "./shell";
@@ -797,14 +798,21 @@ export function reapAll(): void {
 /**
  * Reap on any way pi-review-gate can stop.
  *
- * `session_shutdown` covers the orderly path. These cover the rest: ctrl+c,
- * `kill`, a closed terminal, a crash. SIGKILL cannot be caught by anyone, which
- * is exactly why each job also carries its own parent-watchdog (see
- * wrapWithParentWatchdog) — that is the backstop this cannot be.
+ * `session_shutdown` covers the orderly path. The public signal-exit observer
+ * handles supported fatal signals only when they are otherwise unowned; it
+ * never replaces or redispatches listeners owned by the native host or other
+ * extensions. When a host listener owns a signal, its normal shutdown event
+ * continues to reap jobs. The observer callback is synchronous: POSIX groups
+ * receive the existing TERM request, and Windows receives its synchronous
+ * stop-file request. Neither this callback nor the ordinary `exit` fallback
+ * can await escalation. Each job's existing parent/ownership watchdog remains
+ * the backstop for work that outlives the host or cannot be reaped inline.
  *
- * Registered once per process, and the handlers re-raise so we never change
- * pi-review-gate's own exit behaviour.
+ * Registered once per process. Returning no value from the observer preserves
+ * signal-exit's normal signal handling, including the default disposition
+ * when no other handler owns the signal.
  */
+const CLEANUP_SIGNALS = new Set<string>(["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"]);
 let exitHooksInstalled = false;
 function installExitHooks(): void {
   if (exitHooksInstalled) return;
@@ -823,19 +831,9 @@ function installExitHooks(): void {
     }
   });
 
-  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"] as NodeJS.Signals[]) {
-    process.on(sig, () => {
-      reapAll();
-      // Re-raise with our handler removed so the default disposition applies
-      // and our exit code matches what the signal would normally produce.
-      process.removeAllListeners(sig);
-      try {
-        process.kill(process.pid, sig);
-      } catch {
-        process.exit(1);
-      }
-    });
-  }
+  onExit((_code, signal) => {
+    if (signal && CLEANUP_SIGNALS.has(signal)) reapAll();
+  });
 }
 
 function statusOf(job: Job): string {

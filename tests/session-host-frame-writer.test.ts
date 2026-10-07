@@ -1,0 +1,310 @@
+import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
+import { EventEmitter } from "node:events";
+import test from "node:test";
+import { Writable } from "node:stream";
+import { createSessionHostFrameWriter } from "../src/session-host/frame-writer";
+import type { ComposedHostFrame } from "../src/session-host/compositor";
+
+const ESC = "\x1b";
+
+class SyntheticWritable extends EventEmitter {
+	readonly writes: Buffer[] = [];
+	readonly callbacks: Array<(error?: Error | null) => void> = [];
+	readonly writeResults: boolean[] = [];
+	deferCallbacks = false;
+	throwNextWrite = false;
+	endCalls = 0;
+	destroyCalls = 0;
+
+	write(chunk: Uint8Array | string, callback?: (error?: Error | null) => void): boolean {
+		if (this.throwNextWrite) {
+			this.throwNextWrite = false;
+			throw new Error("synthetic-secret-write-failure");
+		}
+		this.writes.push(Buffer.from(chunk));
+		if (callback) {
+			if (this.deferCallbacks) this.callbacks.push(callback);
+			else callback();
+		}
+		return this.writeResults.shift() ?? true;
+	}
+
+	completeCallback(index: number, error?: Error): void {
+		const callback = this.callbacks[index];
+		assert.ok(callback, `missing synthetic write callback ${index}`);
+		callback(error);
+	}
+
+	end(): this {
+		this.endCalls += 1;
+		return this;
+	}
+
+	destroy(): this {
+		this.destroyCalls += 1;
+		return this;
+	}
+}
+
+function frame(lines: string[], cursor = { column: 0, row: 0, visible: false }): ComposedHostFrame {
+	return { lines, cursor };
+}
+
+function writer(output: SyntheticWritable, options: Parameters<typeof createSessionHostFrameWriter>[1] = {}) {
+	return createSessionHostFrameWriter(output as unknown as Writable, options);
+}
+
+function outputText(output: SyntheticWritable, index: number): string {
+	return output.writes[index]?.toString("utf8") ?? "";
+}
+
+function wait(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+test("construction is inert and start/frame/cleanup own only generated alternate-screen output", async () => {
+	const output = new SyntheticWritable();
+	const driver = writer(output, { redrawIntervalMs: 0 });
+	assert.equal(output.writes.length, 0);
+	assert.equal(output.listenerCount("error"), 0);
+
+	driver.start();
+	assert.equal(outputText(output, 0), `${ESC}[?1049h${ESC}[0m${ESC}[?25l`);
+	driver.submit({
+		lines: [`${ESC}[1;38;2;12;34;56mHi${ESC}[0m`, "row two"],
+		cursor: { column: 2, row: 1, visible: true },
+	}, 8, 2);
+	const rendered = outputText(output, 1);
+	assert.ok(rendered.includes(`${ESC}[1;1H${ESC}[0m${ESC}[2K`));
+	assert.ok(rendered.includes(`${ESC}[2;1H${ESC}[0m${ESC}[2K`));
+	assert.ok(rendered.includes(`${ESC}[1;38;2;12;34;56mHi${ESC}[0m`), "generated RGB SGR survives");
+	assert.ok(rendered.endsWith(`${ESC}[?25h${ESC}[2;3H`), "valid focused cursor is shown at 1-based CUP coordinates");
+	assert.equal(rendered.includes("\n"), false, "no row uses LF, including the bottom row");
+
+	assert.equal(await driver.close(), true);
+	assert.equal(outputText(output, 2), `${ESC}[0m${ESC}[?25h${ESC}[?1049l`);
+	assert.equal(output.endCalls, 0, "the caller's stream is not ended");
+	assert.equal(output.destroyCalls, 0, "the caller's stream is not destroyed");
+});
+
+test("ANSI envelope rejects OSC, non-SGR CSI, controls, and C1 injection while clipping safely", async () => {
+	const output = new SyntheticWritable();
+	const driver = writer(output, { redrawIntervalMs: 0 });
+	driver.start();
+	driver.submit(frame([
+		`A${ESC}]2;osc-secret\x07B${ESC}[?25hC\x01D\u009b31mE\u009d52;clip-secret\u009cF\nG`,
+	], { column: 1, row: 0, visible: false }), 8, 1);
+	const rendered = outputText(output, 1);
+	assert.ok(rendered.includes("ABCDEFG"), "safe text on either side of discarded controls is retained");
+	assert.equal(rendered.includes("osc-secret"), false);
+	assert.equal(rendered.includes("clip-secret"), false);
+	assert.equal(rendered.includes(`${ESC}[?25h`), false, "untrusted cursor control does not pass through");
+	assert.equal(rendered.includes("\n"), false);
+
+	const before = output.writes.length;
+	driver.submit(frame(["A界Z"], { column: 0, row: 0, visible: true }), 1, 1);
+	const clipped = outputText(output, before);
+	assert.ok(clipped.includes("A"));
+	assert.equal(clipped.includes("界"), false, "wide graphemes are not split at a one-cell edge");
+	assert.equal(clipped.includes("Z"), false);
+	assert.ok(clipped.endsWith(`${ESC}[?25h${ESC}[1;1H`));
+	assert.equal(await driver.close(), true);
+});
+
+test("resizes and invalid cursors stay inside supplied geometry, including a one-cell frame", async () => {
+	const output = new SyntheticWritable();
+	const driver = writer(output, { redrawIntervalMs: 0 });
+	driver.start();
+	driver.submit(frame(["one", "two"], { column: 3, row: 1, visible: true }), 4, 2);
+	assert.ok(outputText(output, 1).includes(`${ESC}[2;4H`));
+	driver.submit(frame(["🙂"], { column: 1, row: 0, visible: true }), 1, 1);
+	const oneCell = outputText(output, 2);
+	assert.ok(oneCell.includes(`${ESC}[1;1H${ESC}[0m${ESC}[2K`));
+	assert.ok(oneCell.endsWith(`${ESC}[?25l`), "out-of-geometry cursor is hidden");
+	assert.equal(oneCell.includes("🙂"), false, "a wide glyph cannot overrun a 1x1 frame");
+	assert.throws(() => driver.submit(frame(["x"]), 0, 1), /cols/);
+	assert.throws(() => driver.submit(frame(["x"]), 1, 1001), /rows/);
+	assert.equal(await driver.close(), true);
+});
+
+test("serialized byte cap counts UTF-8 bytes rather than JavaScript string length", async () => {
+	const output = new SyntheticWritable();
+	const driver = writer(output, { redrawIntervalMs: 0, maxFrameBytes: 32 });
+	driver.start();
+	driver.submit(frame(["é"]), 2, 1);
+	assert.equal(output.writes[1].byteLength, 32, "two-byte UTF-8 character fits exactly at the cap");
+	assert.throws(() => driver.submit(frame(["🙂"]), 2, 1), /UTF-8 byte limit/,
+		"four-byte UTF-8 character exceeds the same cap despite one UTF-16 code unit");
+	assert.equal(output.writes.length, 2, "oversized candidate is rejected before writing");
+	assert.equal(await driver.close(), true);
+});
+
+test("redraw interval coalesces invalidations and a blocked Writable retains only the newest frame", async () => {
+	const output = new SyntheticWritable();
+	output.writeResults.push(false);
+	const driver = writer(output, { redrawIntervalMs: 0 });
+	driver.start();
+	driver.submit(frame(["superseded"]), 20, 1);
+	driver.submit(frame(["newest"]), 20, 1);
+	assert.equal(output.writes.length, 1, "backpressure prevents further writes before drain");
+	output.emit("drain");
+	assert.equal(output.writes.length, 2);
+	assert.ok(outputText(output, 1).includes("newest"));
+	assert.equal(outputText(output, 1).includes("superseded"), false);
+	assert.equal(await driver.close(), true);
+
+	const coalescedOutput = new SyntheticWritable();
+	const coalesced = writer(coalescedOutput, { redrawIntervalMs: 80 });
+	coalesced.start();
+	coalesced.submit(frame(["first"]), 20, 1);
+	coalesced.submit(frame(["middle"]), 20, 1);
+	coalesced.submit(frame(["latest"]), 20, 1);
+	await wait(110);
+	assert.equal(coalescedOutput.writes.length, 3, "one scheduled redraw emits the newest invalidation");
+	assert.ok(outputText(coalescedOutput, 2).includes("latest"));
+	assert.equal(outputText(coalescedOutput, 2).includes("middle"), false);
+	assert.equal(await coalesced.close(), true);
+});
+
+test("synchronous write failures and throwing error callbacks are guarded and non-sensitive", async () => {
+	const output = new SyntheticWritable();
+	output.throwNextWrite = true;
+	const errors: string[] = [];
+	const driver = writer(output, {
+		onError: (error) => {
+			errors.push(error.message);
+			throw new Error("callback-secret");
+		},
+	});
+	assert.doesNotThrow(() => driver.start());
+	assert.deepEqual(errors, ["Session host frame output failed"]);
+	assert.equal(JSON.stringify(errors).includes("synthetic-secret"), false);
+	assert.equal(await driver.close(), true, "cleanup is attempted even after the initial write failed");
+	assert.equal(outputText(output, 0), `${ESC}[0m${ESC}[?25h${ESC}[?1049l`);
+});
+
+test("async Writable error is reported once and late write callbacks cannot recreate work", async () => {
+	const output = new SyntheticWritable();
+	output.deferCallbacks = true;
+	let errorCount = 0;
+	const driver = writer(output, {
+		redrawIntervalMs: 0,
+		onError: () => { errorCount += 1; },
+	});
+	driver.start();
+	output.emit("error", new Error("stream-secret-diagnostic"));
+	assert.equal(errorCount, 1);
+	assert.throws(() => driver.submit(frame(["no longer accepted"]), 10, 1), /unavailable/);
+	output.deferCallbacks = false;
+	assert.equal(await driver.close(), true, "final cleanup can still be flushed after a prior submission failure");
+	const writesAtClose = output.writes.length;
+	assert.doesNotThrow(() => output.completeCallback(0, new Error("late-secret-callback")));
+	assert.equal(errorCount, 1, "error event and late callback are deduplicated");
+	assert.equal(output.listenerCount("error"), 0, "a delivered stream error covers callbacks completed afterward");
+	assert.equal(output.writes.length, writesAtClose, "late callbacks do not recreate a pending queue");
+});
+
+test("async write callbacks and premature Writable close failures are handled once", async () => {
+	const callbackOutput = new SyntheticWritable();
+	callbackOutput.deferCallbacks = true;
+	const callbackErrors: string[] = [];
+	const callbackDriver = writer(callbackOutput, {
+		onError: (error) => { callbackErrors.push(error.message); },
+	});
+	callbackDriver.start();
+	assert.doesNotThrow(() => callbackOutput.completeCallback(0, new Error("callback-secret")));
+	assert.deepEqual(callbackErrors, ["Session host frame output failed"]);
+	callbackOutput.deferCallbacks = false;
+	assert.equal(await callbackDriver.close(), true);
+
+	const closedOutput = new SyntheticWritable();
+	let closeErrorCount = 0;
+	const closeDriver = writer(closedOutput, { onError: () => { closeErrorCount += 1; } });
+	closeDriver.start();
+	closedOutput.emit("close");
+	assert.equal(closeErrorCount, 1, "unexpected close is reported once");
+	closedOutput.throwNextWrite = true;
+	assert.equal(await closeDriver.close(), false, "failed final cleanup is reported as incomplete");
+	assert.equal(closeErrorCount, 1);
+});
+
+test("real Writable late errors stay guarded after cleanup timeout and release owned listeners", async () => {
+	const writtenChunks: Buffer[] = [];
+	let pendingWrite: ((error?: Error | null) => void) | undefined;
+	let pendingDestroy: (() => void) | undefined;
+	const output = new Writable({
+		highWaterMark: 1,
+		write(chunk, _encoding, callback) {
+			writtenChunks.push(Buffer.from(chunk));
+			pendingWrite = callback;
+		},
+		destroy(error, callback) {
+			pendingDestroy = () => callback(error);
+		},
+	});
+	let callerErrorCount = 0;
+	const callerErrorListener = (): void => { callerErrorCount += 1; };
+	output.on("error", callerErrorListener);
+	const reportedErrors: string[] = [];
+	const driver = createSessionHostFrameWriter(output, {
+		cleanupTimeoutMs: 20,
+		onError: (error) => { reportedErrors.push(error.message); },
+	});
+	driver.start();
+	const completeHeldWrite = pendingWrite;
+	assert.ok(completeHeldWrite, "the real Writable holds the driver's start write");
+	assert.equal(await driver.close(), false, "the bounded cleanup expires while the underlying write is held");
+	assert.equal(output.listenerCount("error"), 2, "the writer retains only its error guard while an owned write is outstanding");
+	assert.equal(writtenChunks.length, 1, "cleanup remains buffered behind the held write");
+
+	const closeObserved = new Promise<void>((resolve) => output.once("close", resolve));
+	completeHeldWrite(new Error("late-writable-secret"));
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.ok(pendingDestroy, "Node has entered the deliberately delayed _destroy callback");
+	assert.equal(output.listenerCount("error"), 2,
+		"the owned guard survives an immediate while _destroy has not delivered error");
+	assert.equal(callerErrorCount, 0, "the delayed stream error has not been delivered yet");
+	const completeDestroy = pendingDestroy;
+	assert.ok(completeDestroy);
+	completeDestroy();
+	await Promise.race([
+		closeObserved,
+		wait(250).then(() => { throw new Error("real Writable did not close after its failed write"); }),
+	]);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.deepEqual(reportedErrors, ["Session host frame output failed"]);
+	assert.equal(callerErrorCount, 1, "the caller's error listener is preserved and receives the stream event");
+	assert.equal(writtenChunks.length, 1, "late failure does not recreate or append output");
+	assert.equal(output.listenerCount("error"), 1, "the owned error guard is removed after Node's error delivery");
+	assert.equal(output.listenerCount("close"), 0, "the retained close cleanup listener is eventually removed too");
+	assert.throws(() => driver.submit(frame(["late"]), 1, 1), /closed/);
+});
+
+test("close cancels redraws, is idempotent, preserves caller listeners, and bounds a wedged cleanup", async () => {
+	const output = new SyntheticWritable();
+	const callerError = (): void => {};
+	const callerDrain = (): void => {};
+	const callerClose = (): void => {};
+	output.on("error", callerError);
+	output.on("drain", callerDrain);
+	output.on("close", callerClose);
+	const driver = writer(output, { redrawIntervalMs: 100, cleanupTimeoutMs: 20 });
+	driver.start();
+	driver.submit(frame(["visible"]), 10, 1);
+	driver.submit(frame(["obsolete pending redraw"]), 10, 1);
+	output.writeResults.push(false);
+	const closing = driver.close();
+	assert.equal(driver.close(), closing, "concurrent close calls share one bounded cleanup attempt");
+	assert.equal(await closing, false, "write false without drain is incomplete at the deadline");
+	const writesAtClose = output.writes.length;
+	await wait(120);
+	assert.equal(output.writes.length, writesAtClose, "close cancels pending timer work");
+	assert.deepEqual(output.listeners("error"), [callerError]);
+	assert.deepEqual(output.listeners("drain"), [callerDrain]);
+	assert.deepEqual(output.listeners("close"), [callerClose]);
+	assert.throws(() => driver.start(), /closed/);
+	assert.throws(() => driver.submit(frame(["closed"]), 1, 1), /closed/);
+	assert.equal(output.endCalls, 0);
+	assert.equal(output.destroyCalls, 0);
+});

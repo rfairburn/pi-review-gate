@@ -131,6 +131,10 @@ On Windows, use the native cmd.exe/PowerShell entry point (no Bash or WSL requir
 scripts\pi-review-gate.cmd
 ```
 
+An optional, separate session-host alpha can run multiple independent native Pi sessions
+in one terminal on macOS/Linux. It does not replace either launcher; see the
+[session-host alpha guide](docs/session-host-alpha.md) for requirements and limitations.
+
 The persistent launcher selects the Pi agent directory's `review-gate.json`
 (`~/.pi/agent/review-gate.json` by default, following `PI_CODING_AGENT_DIR`), then
 `~/.config/pi-review-gate/config.json` as a compatibility fallback. It ignores an

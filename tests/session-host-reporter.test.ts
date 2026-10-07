@@ -16,15 +16,20 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { NODE_OPTIONS_RESTORE_ENV, restoreNodeOptions } from "../src/session-host/bootstrap-preload";
-import activate, { primeReporterBootstrap, SESSION_HOST_STICKY_STATE_KEY } from "../src/session-host/reporter";
+import activate, { __test as reporterTest, primeReporterBootstrap, SESSION_HOST_STICKY_STATE_KEY } from "../src/session-host/reporter";
 import {
   HOST_BOOTSTRAP_ENV,
+  MAX_NATIVE_SESSION_NAME_LENGTH,
+  MAX_RENAME_NAME_BYTES,
   decodeFrame,
   encodeFrame,
   parseBootstrap,
+  parseRenameAck,
+  parseRenameRequest,
   parseStatus,
   sanitizeActivityLine,
   stripTerminalControls,
+  type SessionHostMessage,
   type SessionHostStatus,
 } from "../src/session-host/protocol";
 
@@ -75,7 +80,11 @@ interface TestCtx {
   mode: string;
   ui: Record<string, unknown>;
   isIdle: () => boolean;
-  sessionManager: { getSessionId: () => string };
+  sessionManager: {
+    getSessionId: () => string;
+    getSessionName?: () => string | undefined;
+    getEntries?: () => unknown[];
+  };
 }
 
 function makeCtx(ui: Record<string, unknown>, mode: string, isIdle: () => boolean): TestCtx {
@@ -106,6 +115,7 @@ interface TestServer {
   frames: Frame[];
   connections: number;
   waitForFrame(predicate: (frame: Frame) => boolean, timeoutMs?: number, afterIndex?: number): Promise<Frame>;
+  sendToClients(data: string): void;
   destroyClients(): void;
   close(): Promise<void>;
 }
@@ -123,6 +133,11 @@ async function startServer(): Promise<TestServer> {
   const server = net.createServer((client) => {
     connections += 1;
     clients.push(client);
+    client.on("error", () => undefined);
+    client.on("close", () => {
+      const index = clients.indexOf(client);
+      if (index >= 0) clients.splice(index, 1);
+    });
     let buffer = "";
     client.on("data", (chunk: Buffer) => {
       buffer += chunk.toString("utf8");
@@ -160,6 +175,9 @@ async function startServer(): Promise<TestServer> {
       return connections;
     },
     waitForFrame,
+    sendToClients(data: string) {
+      for (const client of clients) if (!client.destroyed) client.write(data);
+    },
     destroyClients() {
       for (const client of clients.splice(0)) client.destroy();
     },
@@ -168,6 +186,32 @@ async function startServer(): Promise<TestServer> {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       rmSync(socketPath, { force: true });
     },
+  };
+}
+
+function createMemoryReporterSocket(): {
+  socket: net.Socket;
+  frames: SessionHostMessage[];
+  setWritePolicy(policy: (message: SessionHostMessage) => boolean): void;
+} {
+  const socket = new net.Socket();
+  const frames: SessionHostMessage[] = [];
+  let writePolicy = (_message: SessionHostMessage): boolean => true;
+  socket.write = ((chunk: string | Uint8Array) => {
+    const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    for (const line of text.split("\n")) {
+      if (!line) continue;
+      const frame = decodeFrame(line);
+      if (!frame) continue;
+      frames.push(frame);
+      if (!writePolicy(frame)) return false;
+    }
+    return true;
+  }) as typeof socket.write;
+  return {
+    socket,
+    frames,
+    setWritePolicy(policy) { writePolicy = policy; },
   };
 }
 
@@ -271,6 +315,115 @@ describe("session-host protocol", () => {
     assert.equal(parseStatus({ ...base, activity: ["x".repeat(121)] }), undefined);
     assert.equal(parseStatus({ ...base, activity: ["bad\x1b[31mcontrol"] }), undefined);
     assert.equal(parseStatus({ ...base, type: "hello" }), undefined);
+  });
+
+  it("validates optional canonical native-session identity/name metadata", () => {
+    const base = {
+      version: 1,
+      type: "status",
+      instanceId: randomUUID(),
+      generation: randomUUID(),
+      sequence: 1,
+      busy: null,
+      pendingInput: null,
+      inputSurface: false,
+      activity: [],
+    };
+    const nativeSession = { sessionId: "native-session-id", epoch: 3, name: "first user prompt" };
+    assert.deepEqual(parseStatus({ ...base, nativeSession })?.nativeSession, nativeSession);
+    assert.equal(parseStatus({ ...base, nativeSession: null })?.nativeSession, null, "unavailable APIs stay explicitly unknown");
+    assert.equal(parseStatus(base)?.nativeSession, undefined, "older reporters may omit the optional metadata");
+    assert.equal(parseStatus({ ...base, nativeSession: { ...nativeSession, epoch: 0 } }), undefined);
+    assert.equal(parseStatus({ ...base, nativeSession: { ...nativeSession, sessionId: "bad\x1bid" } }), undefined);
+    assert.equal(parseStatus({ ...base, nativeSession: { ...nativeSession, sessionId: "/private/session.jsonl" } }), undefined);
+    assert.equal(parseStatus({ ...base, nativeSession: { ...nativeSession, name: "bad\u009btitle" } }), undefined);
+    assert.equal(parseStatus({ ...base, nativeSession: { ...nativeSession, name: " padded title " } }), undefined);
+    assert.equal(parseStatus({ ...base, nativeSession: { ...nativeSession, name: "n".repeat(MAX_NATIVE_SESSION_NAME_LENGTH + 1) } }), undefined);
+  });
+
+  it("strictly validates authenticated rename commands and identity-bound acknowledgements", () => {
+    const common = {
+      version: 1,
+      instanceId: randomUUID(),
+      generation: randomUUID(),
+      requestId: randomUUID(),
+      expectedSessionId: "native-session-id",
+      expectedSessionEpoch: 9,
+    };
+    const request = {
+      ...common,
+      type: "rename_request",
+      token: "a".repeat(64),
+      name: "persisted title",
+    };
+    assert.deepEqual(parseRenameRequest(request), request);
+    assert.ok(parseRenameRequest({ ...request, name: "  native-normalized title  " }), "Pi's native setter may trim surrounding whitespace");
+    assert.equal(parseRenameRequest({ ...request, name: "bad\nname" }), undefined);
+    assert.equal(parseRenameRequest({ ...request, name: "line\u2028separator" }), undefined);
+    assert.equal(parseRenameRequest({ ...request, name: "x".repeat(MAX_RENAME_NAME_BYTES + 1) }), undefined);
+    assert.ok(parseRenameRequest({ ...request, name: "é".repeat(MAX_RENAME_NAME_BYTES / 2) }), "the limit is measured in UTF-8 bytes");
+    assert.equal(parseRenameRequest({ ...request, name: "é".repeat(MAX_RENAME_NAME_BYTES / 2 + 1) }), undefined);
+    assert.equal(parseRenameRequest({ ...request, expectedSessionEpoch: 0 }), undefined);
+    assert.equal(parseRenameRequest({ ...request, token: "wrong" }), undefined);
+    assert.ok(decodeFrame(encodeFrame(request as never)));
+
+    const ack = {
+      ...common,
+      type: "rename_result",
+      sessionId: common.expectedSessionId,
+      sessionEpoch: common.expectedSessionEpoch,
+      outcome: "renamed",
+      reason: "none",
+    };
+    assert.deepEqual(parseRenameAck(ack), ack);
+    assert.equal(parseRenameAck({ ...ack, sessionEpoch: ack.sessionEpoch + 1 }), undefined, "success cannot attest another session epoch");
+    assert.equal(parseRenameAck({ ...ack, reason: "setter-failed" }), undefined);
+    assert.ok(parseRenameAck({ ...ack, sessionId: "other-session", sessionEpoch: ack.sessionEpoch + 1, outcome: "rejected", reason: "stale-session" }));
+  });
+
+  it("requires both native session ID and monotonic epoch to match before and after rename", () => {
+    const current = { sessionId: "native-one", epoch: 7, name: "title" };
+    assert.equal(reporterTest.nativeSessionMatches(current, "native-one", 7), true);
+    assert.equal(reporterTest.nativeSessionMatches(current, "native-two", 7), false);
+    assert.equal(reporterTest.nativeSessionMatches(current, "native-one", 8), false);
+    assert.equal(reporterTest.nativeSessionMatches(null, "native-one", 7), false, "unknown context fails closed");
+  });
+
+  it("derives only the bounded canonical native title and treats unavailable APIs as unknown", () => {
+    assert.equal(reporterTest.readNativeSession(undefined), undefined);
+    assert.equal(reporterTest.readNativeSession({ sessionManager: {
+      getSessionId: () => { throw new Error("unavailable"); },
+      getSessionName: () => undefined,
+      getEntries: () => [],
+    } }), undefined);
+    assert.equal(reporterTest.readNativeSession({ sessionManager: {
+      getSessionId: () => "native-id",
+      getSessionName: () => { throw new Error("stale manager"); },
+      getEntries: () => [],
+    } }), undefined);
+
+    const fallback = reporterTest.readNativeSession({ sessionManager: {
+      getSessionId: () => "native-id",
+      getSessionName: () => undefined,
+      getEntries: () => [
+        { type: "message", message: { role: "assistant", content: "not a title" } },
+        { type: "message", message: { role: "user", content: "\x01 first\nmessage " } },
+      ],
+    } });
+    assert.deepEqual(fallback, { sessionId: "native-id", displayName: "first message" });
+    const noMessages = reporterTest.readNativeSession({ sessionManager: {
+      getSessionId: () => "native-id",
+      getSessionName: () => undefined,
+      getEntries: () => [],
+    } });
+    assert.equal(noMessages?.displayName, "(no messages)");
+    const clipped = reporterTest.readNativeSession({ sessionManager: {
+      getSessionId: () => "native-id",
+      getSessionName: () => "n".repeat(MAX_NATIVE_SESSION_NAME_LENGTH + 10),
+      getEntries: () => [],
+    } });
+    assert.equal(clipped?.displayName.length, MAX_NATIVE_SESSION_NAME_LENGTH, "display name clipping never changes the stored name");
+    assert.equal(clipped?.storedName?.length, MAX_NATIVE_SESSION_NAME_LENGTH + 10);
   });
 
   it("round-trips frames through encode/decode and rejects oversized lines", () => {
@@ -384,7 +537,13 @@ describe("session-host reporter status frames", () => {
     mode?: string;
     ui?: TestUi;
     isIdle?: () => boolean;
-    reporterOptions?: { reconnectDelayMs?: number; maxReconnectAttempts?: number };
+    sessionManager?: TestCtx["sessionManager"];
+    reporterOptions?: {
+      reconnectDelayMs?: number;
+      maxReconnectAttempts?: number;
+      connectSocket?: (socketPath: string) => net.Socket;
+      onSocket?: (socket: net.Socket) => void;
+    };
   }): Promise<{ testPi: TestPi; ctx: TestCtx; bootstrap: Record<string, unknown> }> {
     const bootstrap = options.bootstrap ?? makeBootstrap(options.server.socketPath);
     process.env[HOST_BOOTSTRAP_ENV] = JSON.stringify(bootstrap);
@@ -392,6 +551,7 @@ describe("session-host reporter status frames", () => {
     await activate(testPi.pi, options.reporterOptions);
     const ui = options.ui ?? makeUi();
     const ctx = makeCtx(ui.ui, options.mode ?? "tui", options.isIdle ?? (() => true));
+    if (options.sessionManager) ctx.sessionManager = options.sessionManager;
     await testPi.trigger("session_start", { type: "session_start", reason: "startup" }, ctx);
     return { testPi, ctx, bootstrap };
   }
@@ -411,8 +571,310 @@ describe("session-host reporter status frames", () => {
     assert.equal(status.message.pendingInput, null);
     assert.equal(status.message.inputSurface, false);
     assert.deepEqual(status.message.activity, ["Ready"]);
+    assert.equal(status.message.nativeSession, null, "missing public session metadata remains unknown");
     assert.equal(status.message.sequence, 1);
     await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("reports native canonical names, persists fenced renames through the public setter, and rebinds sessions", async () => {
+    const server = await startTestServer();
+    const native = {
+      id: "native-session-one",
+      name: undefined as string | undefined,
+      entries: [
+        { type: "message", message: { role: "assistant", content: "not the fallback" } },
+        { type: "message", message: { role: "user", content: [{ type: "text", text: "\u0001  first\nuser prompt  " }] } },
+      ] as unknown[],
+    };
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => native.id,
+      getSessionName: () => native.name,
+      getEntries: () => native.entries,
+    };
+    const { testPi, ctx, bootstrap } = await startSession({ server, sessionManager });
+    let setterCalls = 0;
+    (testPi.pi as { setSessionName?: (name: string) => void }).setSessionName = (name) => {
+      setterCalls += 1;
+      native.name = name;
+    };
+
+    const initial = await server.waitForFrame((frame) => frame.message.type === "status");
+    const firstNative = initial.message.nativeSession as { sessionId: string; epoch: number; name: string };
+    assert.deepEqual(firstNative, {
+      sessionId: native.id,
+      epoch: 1,
+      name: "first user prompt",
+    }, "native first stored user message is the fallback; assistant text is ignored");
+
+    const rename = {
+      version: 1,
+      type: "rename_request",
+      instanceId: bootstrap.instanceId,
+      generation: bootstrap.generation,
+      token: bootstrap.token,
+      requestId: randomUUID(),
+      expectedSessionId: native.id,
+      expectedSessionEpoch: firstNative.epoch,
+      name: "Persisted title",
+    };
+    server.sendToClients(encodeFrame(rename as never));
+    const ackFrame = await server.waitForFrame((frame) => frame.message.type === "rename_result");
+    assert.equal(ackFrame.message.outcome, "renamed");
+    assert.equal(ackFrame.message.sessionId, native.id);
+    assert.equal(ackFrame.message.sessionEpoch, firstNative.epoch);
+    assert.equal(native.name, "Persisted title", "only public setSessionName persists the rename");
+    assert.equal(setterCalls, 1);
+    const renamedStatus = await server.waitForFrame((frame) =>
+      frame.message.type === "status"
+      && (frame.message.nativeSession as { name?: string } | null)?.name === "Persisted title",
+    );
+    assert.ok(!renamedStatus.raw.includes(bootstrap.token as string), "the capability token never reaches status");
+
+    // Native /name publishes the same persisted title through the public event.
+    native.name = "Native /name title";
+    await testPi.trigger("session_info_changed", { type: "session_info_changed" }, ctx);
+    const nativeRenameStatus = await server.waitForFrame((frame) =>
+      frame.message.type === "status"
+      && (frame.message.nativeSession as { name?: string } | null)?.name === "Native /name title",
+    );
+    assert.equal((nativeRenameStatus.message.nativeSession as { sessionId: string }).sessionId, native.id);
+
+    // A native /resume selection changes the manager's ID within this child.
+    const oldEpoch = firstNative.epoch;
+    native.id = "native-session-two";
+    native.name = undefined;
+    native.entries = [];
+    await testPi.trigger("session_start", { type: "session_start", reason: "resume" }, ctx);
+    const resumed = await server.waitForFrame((frame) =>
+      frame.message.type === "status"
+      && (frame.message.nativeSession as { sessionId?: string } | null)?.sessionId === native.id,
+    );
+    const resumedNative = resumed.message.nativeSession as { sessionId: string; epoch: number; name: string };
+    assert.ok(resumedNative.epoch > oldEpoch, "the session epoch advances across native selection/reload boundaries");
+    assert.equal(resumedNative.name, "(no messages)", "empty native sessions use Pi's native fallback");
+
+    const staleRename = { ...rename, requestId: randomUUID(), name: "must not rename session two" };
+    server.sendToClients(encodeFrame(staleRename as never));
+    const staleAck = await server.waitForFrame((frame) =>
+      frame.message.type === "rename_result" && frame.message.requestId === staleRename.requestId,
+    );
+    assert.equal(staleAck.message.outcome, "rejected");
+    assert.equal(staleAck.message.reason, "stale-session");
+    assert.equal(native.name, undefined, "stale request never mutates the newly selected native session");
+    assert.equal(setterCalls, 1);
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("bounds and drains rename acknowledgements under socket backpressure [review_ack_queue]", async () => {
+    const fakeServer = { socketPath: join(process.cwd(), "unused-memory-reporter.sock") } as TestServer;
+    const memory = createMemoryReporterSocket();
+    const native = { id: "ack-queue-session", name: undefined as string | undefined, entries: [] as unknown[] };
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => native.id,
+      getSessionName: () => native.name,
+      getEntries: () => native.entries,
+    };
+    const { testPi, ctx, bootstrap } = await startSession({
+      server: fakeServer,
+      sessionManager,
+      reporterOptions: { connectSocket: () => memory.socket },
+    });
+    let setterCalls = 0;
+    (testPi.pi as { setSessionName?: (name: string) => void }).setSessionName = (name) => {
+      setterCalls += 1;
+      native.name = name;
+    };
+    let ackWriteCalls = 0;
+    let blockAllAcks = false;
+    memory.setWritePolicy((frame) => {
+      if (frame.type !== "rename_result") return true;
+      ackWriteCalls += 1;
+      return ackWriteCalls !== 1 && !blockAllAcks;
+    });
+
+    try {
+      memory.socket.emit("connect");
+      const initial = memory.frames.find((frame) => frame.type === "status");
+      assert.ok(initial?.type === "status" && initial.nativeSession);
+      const firstBatchRequestIds: string[] = [];
+      const firstBatch = Array.from({ length: 3 }, (_, index) => {
+        const requestId = randomUUID();
+        firstBatchRequestIds.push(requestId);
+        return encodeFrame({
+          version: 1,
+          type: "rename_request",
+          instanceId: bootstrap.instanceId,
+          generation: bootstrap.generation,
+          token: bootstrap.token,
+          requestId,
+          expectedSessionId: initial.nativeSession!.sessionId,
+          expectedSessionEpoch: initial.nativeSession!.epoch,
+          name: `first-batch-${index}`,
+        } as never);
+      });
+      memory.socket.emit("data", Buffer.from(firstBatch.join(""), "utf8"));
+      assert.equal(ackWriteCalls, 1, "write(false) stops direct acknowledgement writes");
+      assert.equal(setterCalls, 3, "bounded queued replies still correspond to handled commands");
+
+      memory.socket.emit("drain");
+      assert.equal(ackWriteCalls, 3, "queued acknowledgements flush on drain");
+      assert.deepEqual(
+        memory.frames.filter((frame) => frame.type === "rename_result").map((frame) => frame.requestId),
+        firstBatchRequestIds,
+        "queued acknowledgements flush in request order",
+      );
+
+      blockAllAcks = true;
+      const queueLimit = reporterTest.MAX_QUEUED_RENAME_ACKS;
+      const overflowRequests = Array.from({ length: queueLimit + 2 }, (_, index) => encodeFrame({
+        version: 1,
+        type: "rename_request",
+        instanceId: bootstrap.instanceId,
+        generation: bootstrap.generation,
+        token: bootstrap.token,
+        requestId: randomUUID(),
+        expectedSessionId: initial.nativeSession!.sessionId,
+        expectedSessionEpoch: initial.nativeSession!.epoch,
+        name: `overflow-batch-${index}`,
+      } as never));
+      memory.socket.emit("data", Buffer.from(overflowRequests.join(""), "utf8"));
+      assert.equal(ackWriteCalls, 4, "only one overflow-batch reply reaches the backpressured socket");
+      assert.equal(setterCalls, 3 + queueLimit + 1, "the command beyond reply capacity is rejected before mutation");
+      assert.equal(memory.socket.destroyed, true, "reply-capacity exhaustion closes the authenticated channel");
+    } finally {
+      await testPi.trigger("session_shutdown", { type: "session_shutdown" }, ctx);
+    }
+  });
+
+  it("refreshes the canonical title after the first user message is persisted, before settlement [review_persisted_user]", async () => {
+    const fakeServer = { socketPath: join(process.cwd(), "unused-memory-reporter.sock") } as TestServer;
+    const memory = createMemoryReporterSocket();
+    const native = { id: "stored-message-session", name: undefined as string | undefined, entries: [] as unknown[] };
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => native.id,
+      getSessionName: () => native.name,
+      getEntries: () => native.entries,
+    };
+    const { testPi, ctx } = await startSession({
+      server: fakeServer,
+      sessionManager,
+      reporterOptions: { connectSocket: () => memory.socket },
+    });
+
+    try {
+      memory.socket.emit("connect");
+      const initial = memory.frames.filter((frame) => frame.type === "status").at(-1);
+      assert.ok(initial?.type === "status" && initial.nativeSession);
+      assert.equal(initial.nativeSession.name, "(no messages)");
+
+      await testPi.trigger("agent_start", { type: "agent_start" }, ctx);
+      const beforePersistence = memory.frames.filter((frame) => frame.type === "status").at(-1);
+      assert.ok(beforePersistence?.type === "status");
+      assert.equal(beforePersistence.busy, true);
+      assert.equal(beforePersistence.nativeSession?.name, "(no messages)");
+
+      const eventText = "message_end payload must not become a title";
+      await testPi.trigger("message_end", {
+        type: "message_end",
+        message: { role: "user", content: [{ type: "text", text: eventText }] },
+      }, ctx);
+      native.entries.push({
+        type: "message",
+        message: { role: "user", content: [{ type: "text", text: "stored native first message" }] },
+      }); // Simulate Pi's SessionManager.appendMessage after the public message_end hook returns.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      const refreshed = memory.frames.filter((frame) => frame.type === "status").at(-1);
+      assert.ok(refreshed?.type === "status" && refreshed.nativeSession);
+      assert.equal(refreshed.nativeSession.name, "stored native first message");
+      assert.notEqual(refreshed.nativeSession.name, eventText, "metadata comes from stored SessionManager entries, not event text");
+      assert.equal(refreshed.busy, true, "metadata refresh preserves busy state");
+      assert.deepEqual(refreshed.activity, ["Working"], "metadata refresh preserves activity semantics");
+    } finally {
+      await testPi.trigger("session_shutdown", { type: "session_shutdown" }, ctx);
+    }
+  });
+
+  it("rejects host commands with the wrong token before calling the public rename setter", async () => {
+    const server = await startTestServer();
+    const sessionManager: TestCtx["sessionManager"] = {
+      getSessionId: () => "native-session",
+      getSessionName: () => undefined,
+      getEntries: () => [],
+    };
+    const { testPi, ctx, bootstrap } = await startSession({ server, sessionManager, reporterOptions: { reconnectDelayMs: 20 } });
+    let setterCalls = 0;
+    (testPi.pi as { setSessionName?: (name: string) => void }).setSessionName = () => { setterCalls += 1; };
+    const status = await server.waitForFrame((frame) => frame.message.type === "status");
+    const nativeSession = status.message.nativeSession as { sessionId: string; epoch: number };
+    const command = {
+      version: 1,
+      type: "rename_request",
+      instanceId: bootstrap.instanceId,
+      generation: bootstrap.generation,
+      token: "0".repeat(64),
+      requestId: randomUUID(),
+      expectedSessionId: nativeSession.sessionId,
+      expectedSessionEpoch: nativeSession.epoch,
+      name: "must be rejected",
+    };
+    server.sendToClients(encodeFrame(command as never));
+    await server.waitForFrame((frame) => frame.message.type === "hello" && server.frames.filter((entry) => entry.message.type === "hello").length >= 2);
+    assert.equal(setterCalls, 0, "wrong capability closes the channel without invoking the native setter");
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("fences old reporter commands and epochs immediately across /reload", async () => {
+    const server = await startTestServer();
+    const bootstrap = makeBootstrap(server.socketPath);
+    const native = { id: "reload-session", name: undefined as string | undefined };
+    const ctx = makeCtx(makeUi().ui, "tui", () => true);
+    ctx.sessionManager = {
+      getSessionId: () => native.id,
+      getSessionName: () => native.name,
+      getEntries: () => [],
+    };
+    process.env[HOST_BOOTSTRAP_ENV] = JSON.stringify(bootstrap);
+    const first = createPi();
+    let firstSetterCalls = 0;
+    (first.pi as { setSessionName?: (name: string) => void }).setSessionName = () => { firstSetterCalls += 1; };
+    await activate(first.pi);
+    await first.trigger("session_start", { type: "session_start" }, ctx);
+    const firstStatus = await server.waitForFrame((frame) => frame.message.type === "status");
+    const oldEpoch = (firstStatus.message.nativeSession as { epoch: number }).epoch;
+
+    const reloaded = createPi();
+    let reloadedSetterCalls = 0;
+    (reloaded.pi as { setSessionName?: (name: string) => void }).setSessionName = () => { reloadedSetterCalls += 1; };
+    await activate(reloaded.pi); // immediately tears down the previous reporter incarnation
+    await reloaded.trigger("session_start", { type: "session_start", reason: "reload" }, ctx);
+    await server.waitForFrame((frame) =>
+      frame.message.type === "hello" && server.frames.filter((entry) => entry.message.type === "hello").length >= 2,
+    );
+    const current = await server.waitForFrame((frame) =>
+      frame.message.type === "status"
+      && (frame.message.nativeSession as { epoch?: number } | null)?.epoch !== undefined
+      && ((frame.message.nativeSession as { epoch: number }).epoch > oldEpoch),
+    );
+    const currentNative = current.message.nativeSession as { sessionId: string; epoch: number };
+    const stale = {
+      version: 1,
+      type: "rename_request",
+      instanceId: bootstrap.instanceId,
+      generation: bootstrap.generation,
+      token: bootstrap.token,
+      requestId: randomUUID(),
+      expectedSessionId: currentNative.sessionId,
+      expectedSessionEpoch: oldEpoch,
+      name: "old incarnation must not rename",
+    };
+    server.sendToClients(encodeFrame(stale as never));
+    const ack = await server.waitForFrame((frame) => frame.message.type === "rename_result" && frame.message.requestId === stale.requestId);
+    assert.equal(ack.message.outcome, "rejected");
+    assert.equal(ack.message.reason, "stale-session");
+    assert.equal(firstSetterCalls, 0);
+    assert.equal(reloadedSetterCalls, 0);
+    await reloaded.trigger("session_shutdown", { type: "session_shutdown" });
   });
 
   it("reports unknown pending for a pre-existing panel and resolves on first observed set/clear", async () => {

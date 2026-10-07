@@ -10,7 +10,9 @@
  * the protocol hello frame (see ./protocol). The broker then accepts a
  * bounded stream of newline-delimited JSON status frames from each
  * authenticated reporter connection and forwards sanitized snapshot callbacks
- * to that registration's handlers.
+ * to that registration's handlers. Registrations can issue bounded native
+ * rename requests whose acknowledgements are fenced to the live connection,
+ * unique request ID, and expected native session ID/epoch.
  *
  * Safety contract (fail closed):
  *
@@ -69,10 +71,16 @@ import { isAbsolute, join } from "node:path";
 import {
   type SessionHostBootstrap,
   type SessionHostHello,
+  type SessionHostNativeSession,
+  type SessionHostRenameAck,
+  type SessionHostRenameRequest,
   type SessionHostStatus,
   MAX_STATUS_FRAME_BYTES,
   PROTOCOL_VERSION,
   decodeFrame,
+  encodeFrame,
+  isValidNativeSessionId,
+  isValidRenameName,
   parseBootstrap,
 } from "./protocol";
 
@@ -94,8 +102,40 @@ export interface StatusBrokerStatusHandlers {
 export interface StatusRegistration {
   /** One-shot bootstrap (socket path, cryptorandom token) handed to the reporter at spawn. */
   bootstrap: SessionHostBootstrap;
+  /** Authenticated rename, fenced by the last observed native session ID and epoch. */
+  rename: (request: StatusRenameRequest) => Promise<StatusRenameResult>;
   /** Releases the registration: closes its active connection silently, rejects later hellos. */
   release: () => void;
+}
+
+/** Native session tuple expected before a persisted rename. */
+export interface StatusRenameRequest {
+  expectedSessionId: string;
+  expectedSessionEpoch: number;
+  /** Complete persisted input, <= 1024 UTF-8 bytes; it is never clipped. */
+  name: string;
+}
+
+export type StatusRenameStatus =
+  | "renamed"
+  | "stale-session"
+  | "unavailable"
+  | "invalid-name"
+  | "setter-failed"
+  | "verification-failed"
+  | "busy"
+  | "timeout"
+  | "disconnected"
+  | "invalid-request";
+
+/** No capability token or requested name is exposed in this observed result. */
+export interface StatusRenameResult {
+  requestId: string;
+  status: StatusRenameStatus;
+  expectedSessionId?: string;
+  expectedSessionEpoch?: number;
+  observedSessionId: string | null;
+  observedSessionEpoch: number | null;
 }
 
 /** The broker facade consumed by the future session-host manager. */
@@ -115,6 +155,9 @@ const MAX_PENDING_UNAUTH_CONNECTIONS = 32;
 
 /** Short authentication deadline; later a connection without a valid hello is closed. */
 const AUTH_DEADLINE_MS = 2000;
+const RENAME_TIMEOUT_MS = 5000;
+const MAX_PENDING_RENAMES = 4;
+const MAX_COMPLETED_RENAME_IDS = 64;
 
 /**
  * Conservative cap on the broker socket path length in UTF-8 bytes. macOS
@@ -144,8 +187,18 @@ interface RegistrationRecord {
   released: boolean;
   /** Last accepted status sequence (0 = none yet); strictly monotonic, retained across reconnects. */
   lastSequence: number;
+  latestNativeSession: SessionHostNativeSession | null;
+  pendingRenames: Map<string, PendingRename>;
+  completedRenameIds: Set<string>;
   active: ConnectionState | undefined;
   handlers: StatusBrokerStatusHandlers;
+}
+
+interface PendingRename {
+  connection: ConnectionState;
+  request: SessionHostRenameRequest;
+  timer: NodeJS.Timeout;
+  resolve: (result: StatusRenameResult) => void;
 }
 
 /** Per-socket connection state machine (awaiting hello -> active -> closed). */
@@ -162,6 +215,9 @@ interface ConnectionState {
   registration: RegistrationRecord | undefined;
   /** True while counted against the unauthenticated backlog bound. */
   pending: boolean;
+  /** At most four bounded rename frames are coalesced into one socket write per turn. */
+  renameWriteQueue: string[];
+  renameWriteScheduled: boolean;
 }
 
 /** Verifies two strings are equal without content-dependent timing. */
@@ -171,6 +227,31 @@ function timingSafeTextEqual(left: string, right: string): boolean {
     createHash("sha256").update(right, "utf8").digest(),
   );
 }
+
+type RenameAckClassification = "matching" | "stale-session" | "invalid";
+
+/** Shared production/test predicate for response identity, request tuple, and current-session fencing. */
+function classifyRenameAck(
+  ack: SessionHostRenameAck,
+  expected: Pick<SessionHostRenameRequest, "requestId" | "expectedSessionId" | "expectedSessionEpoch">,
+  instanceId: string,
+  generation: string,
+  latestNativeSession: SessionHostNativeSession | null,
+): RenameAckClassification {
+  if (!timingSafeTextEqual(ack.instanceId, instanceId)
+    || !timingSafeTextEqual(ack.generation, generation)
+    || ack.requestId !== expected.requestId
+    || ack.expectedSessionId !== expected.expectedSessionId
+    || ack.expectedSessionEpoch !== expected.expectedSessionEpoch) return "invalid";
+  if (ack.outcome === "renamed"
+    && (!latestNativeSession
+      || latestNativeSession.sessionId !== ack.expectedSessionId
+      || latestNativeSession.epoch !== ack.expectedSessionEpoch)) return "stale-session";
+  return "matching";
+}
+
+/** Narrow pure seam for protocol policy tests; the broker uses the same predicate. */
+export const __test = Object.freeze({ classifyRenameAck });
 
 /**
  * Canonicalizes the optional socket root: it must be an absolute, existing,
@@ -343,6 +424,9 @@ class LocalStatusBroker implements StatusBroker {
       token,
       released: false,
       lastSequence: 0,
+      latestNativeSession: null,
+      pendingRenames: new Map(),
+      completedRenameIds: new Set(),
       active: undefined,
       handlers,
     };
@@ -356,8 +440,145 @@ class LocalStatusBroker implements StatusBroker {
     };
     return {
       bootstrap,
+      rename: (request) => this.#rename(record, request),
       release: () => this.#releaseRegistration(record),
     };
+  }
+
+  #observedTuple(record: RegistrationRecord): Pick<StatusRenameResult, "observedSessionId" | "observedSessionEpoch"> {
+    return {
+      observedSessionId: record.latestNativeSession?.sessionId ?? null,
+      observedSessionEpoch: record.latestNativeSession?.epoch ?? null,
+    };
+  }
+
+  #rename(record: RegistrationRecord, input: StatusRenameRequest): Promise<StatusRenameResult> {
+    const requestId = randomUUID();
+    let expectedIdValue: unknown;
+    let expectedEpochValue: unknown;
+    let requestedName: unknown;
+    try {
+      expectedIdValue = input?.expectedSessionId;
+      expectedEpochValue = input?.expectedSessionEpoch;
+      requestedName = input?.name;
+    } catch {
+      return Promise.resolve({ requestId, status: "invalid-request", ...this.#observedTuple(record) });
+    }
+    const expectedSessionId = isValidNativeSessionId(expectedIdValue) ? expectedIdValue : undefined;
+    const expectedSessionEpoch = Number.isSafeInteger(expectedEpochValue) && (expectedEpochValue as number) > 0
+      ? expectedEpochValue as number
+      : undefined;
+    const name = isValidRenameName(requestedName) ? requestedName : undefined;
+    const result = (status: StatusRenameStatus): StatusRenameResult => ({
+      requestId,
+      status,
+      ...(expectedSessionId === undefined ? {} : { expectedSessionId }),
+      ...(expectedSessionEpoch === undefined ? {} : { expectedSessionEpoch }),
+      ...this.#observedTuple(record),
+    });
+    if (!expectedSessionId || expectedSessionEpoch === undefined || name === undefined) {
+      return Promise.resolve(result(name === undefined ? "invalid-name" : "invalid-request"));
+    }
+    if (record.released || this.#disposed) return Promise.resolve(result("disconnected"));
+    if (!record.latestNativeSession) return Promise.resolve(result("unavailable"));
+    if (record.latestNativeSession.sessionId !== expectedSessionId
+      || record.latestNativeSession.epoch !== expectedSessionEpoch) return Promise.resolve(result("stale-session"));
+    const connection = record.active;
+    if (!connection || !connection.authed || connection.destroyed || connection.superseded) {
+      return Promise.resolve(result("disconnected"));
+    }
+    if (record.pendingRenames.size >= MAX_PENDING_RENAMES) return Promise.resolve(result("busy"));
+
+    const command: SessionHostRenameRequest = {
+      version: PROTOCOL_VERSION,
+      type: "rename_request",
+      instanceId: record.instanceId,
+      generation: this.generation,
+      token: record.token,
+      requestId,
+      expectedSessionId,
+      expectedSessionEpoch,
+      name,
+    };
+    return new Promise<StatusRenameResult>((resolve) => {
+      const timer = setTimeout(() => {
+        const pending = record.pendingRenames.get(requestId);
+        if (pending) {
+          this.#settleRename(record, pending, result("timeout"));
+          // A silent peer may still have an unbounded kernel-side write queue;
+          // retire that authenticated channel before accepting more commands.
+          this.#destroyConnection(connection);
+        }
+      }, RENAME_TIMEOUT_MS);
+      timer.unref?.();
+      const pending: PendingRename = { connection, request: command, timer, resolve };
+      record.pendingRenames.set(requestId, pending);
+      try {
+        this.#queueRenameFrame(connection, encodeFrame(command));
+      } catch {
+        this.#settleRename(record, pending, result("disconnected"));
+        this.#destroyConnection(connection);
+      }
+    });
+  }
+
+  #queueRenameFrame(connection: ConnectionState, frame: string): void {
+    if (connection.destroyed || connection.superseded || connection.renameWriteQueue.length >= MAX_PENDING_RENAMES) {
+      throw new Error("rename transport unavailable");
+    }
+    connection.renameWriteQueue.push(frame);
+    if (connection.renameWriteScheduled) return;
+    connection.renameWriteScheduled = true;
+    queueMicrotask(() => {
+      connection.renameWriteScheduled = false;
+      if (connection.destroyed || connection.superseded) {
+        connection.renameWriteQueue.length = 0;
+        return;
+      }
+      const batch = connection.renameWriteQueue.splice(0).join("");
+      if (!batch) return;
+      try {
+        // socket.write(false) still accepts the bounded coalesced batch.
+        connection.socket.write(batch);
+      } catch {
+        this.#destroyConnection(connection);
+      }
+    });
+  }
+
+  #rememberCompletedRename(record: RegistrationRecord, requestId: string): void {
+    record.completedRenameIds.add(requestId);
+    if (record.completedRenameIds.size > MAX_COMPLETED_RENAME_IDS) {
+      const oldest = record.completedRenameIds.values().next().value as string | undefined;
+      if (oldest) record.completedRenameIds.delete(oldest);
+    }
+  }
+
+  #settleRename(record: RegistrationRecord, pending: PendingRename, result: StatusRenameResult): void {
+    if (record.pendingRenames.get(pending.request.requestId) !== pending) return;
+    record.pendingRenames.delete(pending.request.requestId);
+    clearTimeout(pending.timer);
+    this.#rememberCompletedRename(record, pending.request.requestId);
+    try {
+      pending.resolve(result);
+    } catch {
+      // A consumer's Promise machinery is outside the transport contract.
+    }
+  }
+
+  #failPendingRenames(record: RegistrationRecord, connection: ConnectionState, status: "disconnected"): void {
+    connection.renameWriteQueue.length = 0;
+    for (const pending of [...record.pendingRenames.values()]) {
+      if (pending.connection === connection) {
+        this.#settleRename(record, pending, {
+          requestId: pending.request.requestId,
+          status,
+          expectedSessionId: pending.request.expectedSessionId,
+          expectedSessionEpoch: pending.request.expectedSessionEpoch,
+          ...this.#observedTuple(record),
+        });
+      }
+    }
   }
 
   async dispose(): Promise<void> {
@@ -371,6 +592,7 @@ class LocalStatusBroker implements StatusBroker {
     this.#disposed = true;
     for (const record of this.#registrations.values()) {
       record.released = true;
+      if (record.active) this.#failPendingRenames(record, record.active, "disconnected");
       record.active = undefined;
     }
     this.#registrations.clear();
@@ -545,6 +767,8 @@ class LocalStatusBroker implements StatusBroker {
       authTimer: undefined,
       registration: undefined,
       pending: false,
+      renameWriteQueue: [],
+      renameWriteScheduled: false,
     };
     this.#connections.add(conn);
     this.#unauthCount += 1;
@@ -640,8 +864,12 @@ class LocalStatusBroker implements StatusBroker {
     }
     if (message.type === "hello") {
       this.#onHello(conn, message);
-    } else {
+    } else if (message.type === "status") {
       this.#onStatus(conn, message);
+    } else if (message.type === "rename_result") {
+      this.#onRenameAck(conn, message);
+    } else {
+      this.#destroyConnection(conn); // Reporter processes may never issue host commands.
     }
     return !conn.destroyed && !conn.superseded;
   }
@@ -677,12 +905,13 @@ class LocalStatusBroker implements StatusBroker {
       this.#unauthCount -= 1;
     }
     const previous = record.active;
-    if (previous && previous !== conn && !previous.destroyed) {
+    if (previous && previous !== conn) {
       // A fresh valid hello supersedes the old socket silently: the replaced
       // connection never counts as a disconnect for the registration.
+      this.#failPendingRenames(record, previous, "disconnected");
       previous.superseded = true;
       previous.registration = undefined;
-      this.#destroyConnection(previous);
+      if (!previous.destroyed) this.#destroyConnection(previous);
     }
     record.active = conn;
     conn.registration = record;
@@ -709,6 +938,7 @@ class LocalStatusBroker implements StatusBroker {
       return;
     }
     record.lastSequence = status.sequence;
+    record.latestNativeSession = status.nativeSession ?? null;
     // The decoded object is the shared-contract snapshot (extra fields were
     // dropped by the shared parser); guard callback errors so status-metadata
     // failures can never reach the native process, with no content logging.
@@ -717,6 +947,61 @@ class LocalStatusBroker implements StatusBroker {
     } catch {
       // Contained: the broker keeps serving subsequent frames.
     }
+  }
+
+  #onRenameAck(conn: ConnectionState, ack: SessionHostRenameAck): void {
+    const record = conn.registration;
+    if (!record || !conn.authed || conn.superseded || record.released || record.active !== conn) {
+      this.#destroyConnection(conn);
+      return;
+    }
+    const pending = record.pendingRenames.get(ack.requestId);
+    if (!pending) {
+      // A timed-out/settled request may produce one late response. It is
+      // acknowledged only as stale and can never satisfy another request.
+      if (record.completedRenameIds.has(ack.requestId)) return;
+      this.#destroyConnection(conn);
+      return;
+    }
+    if (pending.connection !== conn) {
+      this.#destroyConnection(conn);
+      return;
+    }
+    const classification = classifyRenameAck(
+      ack,
+      pending.request,
+      record.instanceId,
+      this.generation,
+      record.latestNativeSession,
+    );
+    if (classification === "invalid") {
+      this.#destroyConnection(conn);
+      return;
+    }
+    if (classification === "stale-session") {
+      this.#settleRename(record, pending, {
+        requestId: ack.requestId,
+        status: "stale-session",
+        expectedSessionId: ack.expectedSessionId,
+        expectedSessionEpoch: ack.expectedSessionEpoch,
+        ...this.#observedTuple(record),
+      });
+      return;
+    }
+    const status: StatusRenameStatus = ack.outcome === "renamed"
+      ? "renamed"
+      : ack.reason === "stale-session" || ack.reason === "unavailable" || ack.reason === "invalid-name"
+        || ack.reason === "setter-failed" || ack.reason === "verification-failed"
+        ? ack.reason
+        : "verification-failed";
+    this.#settleRename(record, pending, {
+      requestId: ack.requestId,
+      status,
+      expectedSessionId: ack.expectedSessionId,
+      expectedSessionEpoch: ack.expectedSessionEpoch,
+      observedSessionId: ack.sessionId,
+      observedSessionEpoch: ack.sessionEpoch,
+    });
   }
 
   /** Ends a connection; the close handler decides what (if anything) is reported. */
@@ -752,6 +1037,7 @@ class LocalStatusBroker implements StatusBroker {
     if (!conn.superseded && conn.authed && record && !record.released
       && record.active === conn && !this.#disposed) {
       if (record.active === conn) {
+        this.#failPendingRenames(record, conn, "disconnected");
         record.active = undefined;
       }
       try {
@@ -768,9 +1054,19 @@ class LocalStatusBroker implements StatusBroker {
     // Intentional release: the active connection is closed silently (its
     // close callback is suppressed), and later hellos are rejected as stale.
     if (record.active && !record.active.destroyed) {
+      this.#failPendingRenames(record, record.active, "disconnected");
       record.active.superseded = true;
       record.active.registration = undefined;
       this.#destroyConnection(record.active);
+    }
+    for (const pending of [...record.pendingRenames.values()]) {
+      this.#settleRename(record, pending, {
+        requestId: pending.request.requestId,
+        status: "disconnected",
+        expectedSessionId: pending.request.expectedSessionId,
+        expectedSessionEpoch: pending.request.expectedSessionEpoch,
+        ...this.#observedTuple(record),
+      });
     }
     record.active = undefined;
     this.#registrations.delete(record.instanceId);

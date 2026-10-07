@@ -1,7 +1,8 @@
 /**
  * Session-host status companion (issue #323).
  *
- * Opt-in, write-only Pi extension. The session-host process spawns the
+ * Opt-in Pi extension. It reports bounded status and accepts authenticated
+ * native rename requests. The session-host process spawns the
  * Node-based Pi CLI directly with this reporter extension loaded first and
  * the review gate after it (plus the early NODE_OPTIONS preload). It reports
  * top-level session status (busy/idle, pending input presence, modal input
@@ -18,7 +19,8 @@
  *   never wrapped or mutated.
  * - Observation is local only: the known pending-question widget key and the
  *   presence/absence of its value. Question text, controllers, tool args,
- *   titles, and transcripts never enter a frame.
+ *   and transcripts never enter a frame. The native canonical conversation
+ *   name is the sole intentionally allowed prompt-derived title.
  * - The setWidget decorator only observes FUTURE calls and no API queries an
  *   already-present panel, so pendingInput starts unknown (null) each session
  *   and resolves to true/false only on the first observed set/clear of the
@@ -32,15 +34,24 @@
  */
 
 import net from "node:net";
+import { timingSafeEqual } from "node:crypto";
 import { extractContext, extractToolName, registerHook, type HookHandler } from "../pi";
 import {
   HOST_BOOTSTRAP_ENV,
+  MAX_NATIVE_SESSION_NAME_LENGTH,
   MAX_STATUS_FRAME_BYTES,
+  decodeFrame,
   encodeFrame,
+  isValidNativeSessionId,
+  isValidRenameName,
   parseBootstrap,
   sanitizeActivityLine,
   type SessionHostBootstrap,
   type SessionHostHello,
+  type SessionHostMessage,
+  type SessionHostNativeSession,
+  type SessionHostRenameAck,
+  type SessionHostRenameRequest,
   type SessionHostStatus,
 } from "./protocol";
 
@@ -54,8 +65,8 @@ const PENDING_QUESTIONS_WIDGET_KEY = "review-gate-pending-questions";
 /**
  * Process-local sticky state across /reload (same native process). The env
  * bootstrap is one-shot, so a reloaded extension incarnation recovers the
- * known instance identity and sequence from here instead of attaching to
- * anything else.
+ * known instance identity, sequence, and native-session epoch from here
+ * instead of attaching to anything else.
  */
 export const SESSION_HOST_STICKY_STATE_KEY = Symbol.for("pi-review-gate.session-host.state.v1");
 
@@ -64,6 +75,8 @@ const EXIT_HANDLER_FLAG = Symbol.for("pi-review-gate.session-host.exit-handler")
 const DEFAULT_RECONNECT_DELAY_MS = 1_000;
 const DEFAULT_MAX_RECONNECT_ATTEMPTS = 3;
 const CONNECT_TIMEOUT_MS = 3_000;
+/** Encoded replies waiting outside Node's own bounded writable buffer. */
+const MAX_QUEUED_RENAME_ACKS = 4;
 
 export interface SessionHostReporterOptions {
   /** Test seam: reconnect delay. Production default is 1000ms. */
@@ -72,11 +85,15 @@ export interface SessionHostReporterOptions {
   maxReconnectAttempts?: number;
   /** Test seam: observe the raw socket when a connection attempt is created. */
   onSocket?: (socket: net.Socket) => void;
+  /** Test seam: supply an in-memory socket without touching the filesystem. */
+  connectSocket?: (socketPath: string) => net.Socket;
 }
 
 interface StickyState {
   bootstrap: SessionHostBootstrap;
   sequence: number;
+  sessionEpoch: number;
+  nativeSessionId?: string;
   teardown?: () => void;
 }
 
@@ -84,15 +101,121 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+interface NativeSessionRead {
+  sessionId: string;
+  displayName: string;
+  /** Native stored name, only retained locally for exact setter read-back. */
+  storedName?: string;
+}
+
+/** Clips only display metadata; persisted rename commands are validated separately and never clipped. */
+function displayNameFromPieces(pieces: readonly string[]): string {
+  const chars: string[] = [];
+  let started = false;
+  for (const piece of pieces) {
+    for (const codePoint of piece) {
+      const safe = /[\x00-\x1f\x7f\u0080-\u009f\u2028\u2029]/.test(codePoint) ? " " : codePoint;
+      if (!started && safe.trim() === "") continue;
+      started = true;
+      chars.push(safe);
+      if (chars.length > MAX_NATIVE_SESSION_NAME_LENGTH) break;
+    }
+    if (chars.length > MAX_NATIVE_SESSION_NAME_LENGTH) break;
+  }
+  const clipped = chars.slice(0, MAX_NATIVE_SESSION_NAME_LENGTH).join("").trim();
+  return clipped || "(no messages)";
+}
+
+/** Mirrors native SessionInfo's first user-text fallback without exporting message content beyond its clipped title. */
+function firstUserMessageDisplayName(entries: unknown[]): string {
+  for (const entry of entries) {
+    try {
+      if (!isRecord(entry) || entry.type !== "message" || !isRecord(entry.message) || entry.message.role !== "user") continue;
+      const content = entry.message.content;
+      if (typeof content === "string") {
+        if (content) return displayNameFromPieces([content]);
+        continue;
+      }
+      if (!Array.isArray(content)) continue;
+      const pieces: string[] = [];
+      for (const block of content) {
+        if (isRecord(block) && block.type === "text" && typeof block.text === "string") pieces.push(block.text);
+      }
+      if (pieces.length > 0 && (pieces.some((piece) => piece.length > 0) || pieces.length > 1)) {
+        // The native selector joins text blocks with a single space.
+        const joined: string[] = [];
+        pieces.forEach((piece, index) => {
+          if (index > 0) joined.push(" ");
+          joined.push(piece);
+        });
+        return displayNameFromPieces(joined);
+      }
+    } catch {
+      return "(no messages)";
+    }
+  }
+  return "(no messages)";
+}
+
+/** Reads only public Pi context/session-manager APIs; any unavailable or throwing surface is unknown. */
+function readNativeSession(context: unknown): NativeSessionRead | undefined {
+  try {
+    if (!isRecord(context)) return undefined;
+    const manager = context.sessionManager;
+    if (!isRecord(manager)) return undefined;
+    const getSessionId = manager.getSessionId;
+    const getSessionName = manager.getSessionName;
+    const getEntries = manager.getEntries;
+    if (typeof getSessionId !== "function" || typeof getSessionName !== "function" || typeof getEntries !== "function") return undefined;
+    const sessionId: unknown = getSessionId.call(manager);
+    if (!isValidNativeSessionId(sessionId)) return undefined;
+    const storedName: unknown = getSessionName.call(manager);
+    if (storedName !== undefined && storedName !== null && typeof storedName !== "string") return undefined;
+    if (typeof storedName === "string" && storedName.trim()) {
+      return { sessionId, displayName: displayNameFromPieces([storedName]), storedName };
+    }
+    const entries: unknown = getEntries.call(manager);
+    if (!Array.isArray(entries)) return undefined;
+    return { sessionId, displayName: firstUserMessageDisplayName(entries) };
+  } catch {
+    return undefined;
+  }
+}
+
+function tokenMatches(candidate: string, expected: string): boolean {
+  const left = Buffer.from(candidate, "utf8");
+  const right = Buffer.from(expected, "utf8");
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+
+/** Pure fail-closed predicate used immediately before and after the public rename setter. */
+function nativeSessionMatches(
+  current: SessionHostNativeSession | null,
+  expectedSessionId: string,
+  expectedSessionEpoch: number,
+): boolean {
+  return current !== null
+    && current.sessionId === expectedSessionId
+    && current.epoch === expectedSessionEpoch;
+}
+
+export const __test = Object.freeze({ nativeSessionMatches, readNativeSession, MAX_QUEUED_RENAME_ACKS });
+
 function readStickyState(): StickyState | undefined {
   const raw = (globalThis as Record<PropertyKey, unknown>)[SESSION_HOST_STICKY_STATE_KEY];
   if (!isRecord(raw)) return undefined;
   if (!Number.isSafeInteger(raw.sequence) || (raw.sequence as number) < 0) return undefined;
   const bootstrap = parseBootstrap(raw.bootstrap);
   if (!bootstrap) return undefined;
+  const sessionEpoch = Number.isSafeInteger(raw.sessionEpoch) && (raw.sessionEpoch as number) >= 0
+    ? raw.sessionEpoch as number
+    : 0;
+  const nativeSessionId = isValidNativeSessionId(raw.nativeSessionId) ? raw.nativeSessionId : undefined;
   return {
     bootstrap,
     sequence: raw.sequence as number,
+    sessionEpoch,
+    nativeSessionId,
     teardown: typeof raw.teardown === "function" ? (raw.teardown as () => void) : undefined,
   };
 }
@@ -176,6 +299,8 @@ export function primeReporterBootstrap(): SessionHostBootstrap | undefined {
   writeStickyState({
     bootstrap: explicit,
     sequence: sticky ? sticky.sequence : 0,
+    sessionEpoch: sticky?.sessionEpoch ?? 0,
+    nativeSessionId: sticky?.nativeSessionId,
     teardown: sticky?.teardown,
   });
   return explicit;
@@ -199,8 +324,14 @@ export async function activate(pi: unknown, options: SessionHostReporterOptions 
   if (!sticky) return; // No valid bootstrap: register nothing, perform no IO.
 
   installExitCleanup();
-  const reporter = createReporter(pi, sticky.bootstrap, sticky.sequence, sticky.teardown, options);
-  writeStickyState({ bootstrap: reporter.bootstrap, sequence: reporter.sequence, teardown: reporter.teardown });
+  const reporter = createReporter(pi, sticky, options);
+  writeStickyState({
+    bootstrap: reporter.bootstrap,
+    sequence: reporter.sequence,
+    sessionEpoch: reporter.sessionEpoch,
+    nativeSessionId: reporter.nativeSessionId,
+    teardown: reporter.teardown,
+  });
 }
 
 export default activate;
@@ -210,6 +341,7 @@ Object.assign(module.exports as Record<string, unknown>, {
   activate,
   primeReporterBootstrap,
   SESSION_HOST_STICKY_STATE_KEY,
+  __test,
 });
 
 function installExitCleanup(): void {
@@ -228,20 +360,29 @@ function installExitCleanup(): void {
 interface ReporterHandle {
   bootstrap: SessionHostBootstrap;
   sequence: number;
+  sessionEpoch: number;
+  nativeSessionId?: string;
   teardown: () => void;
 }
 
 function createReporter(
   pi: unknown,
-  bootstrap: SessionHostBootstrap,
-  initialSequence: number,
-  previousTeardown: (() => void) | undefined,
+  sticky: StickyState,
   options: SessionHostReporterOptions,
 ): ReporterHandle {
+  const bootstrap = sticky.bootstrap;
+  const previousTeardown = sticky.teardown;
+  // A new extension incarnation fences commands on the old socket before it
+  // registers its own hooks or waits for session_start.
+  try {
+    previousTeardown?.();
+  } catch {
+    // A stale cleanup seam cannot prevent the new reporter from activating.
+  }
   const reconnectDelayMs = Math.max(0, options.reconnectDelayMs ?? DEFAULT_RECONNECT_DELAY_MS);
   const maxReconnectAttempts = Math.max(0, options.maxReconnectAttempts ?? DEFAULT_MAX_RECONNECT_ATTEMPTS);
 
-  let sequence = Math.max(0, initialSequence);
+  let sequence = Math.max(0, sticky.sequence);
   let active = false;
   /** Process-wide monotonic guard: stale async callbacks never act. */
   let sessionGeneration = 0;
@@ -249,6 +390,10 @@ function createReporter(
   let pendingInput: boolean | null = null;
   let inputSurface = false;
   let activity: string[] = [];
+  let sessionEpoch = sticky.sessionEpoch;
+  let nativeSessionId = sticky.nativeSessionId;
+  let nativeSession: SessionHostNativeSession | null = null;
+  let currentContext: unknown;
   let lastSnapshot: SessionHostStatus | undefined;
 
   let socket: net.Socket | undefined;
@@ -258,6 +403,19 @@ function createReporter(
   let snapshotQueued = false;
   let reconnectAttempts = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingStoredUserRefresh: NodeJS.Immediate | undefined;
+  let inboundBuffer = Buffer.alloc(0);
+  const pendingRenameRequestIds = new Set<string>();
+  const recentRenameRequestIds = new Set<string>();
+  const renameAckQueue: string[] = [];
+  const MAX_CONCURRENT_RENAME_REQUESTS = 4;
+  const MAX_RECENT_RENAME_REQUEST_IDS = 64;
+
+  const cancelPendingStoredUserRefresh = (): void => {
+    if (!pendingStoredUserRefresh) return;
+    clearImmediate(pendingStoredUserRefresh);
+    pendingStoredUserRefresh = undefined;
+  };
 
   let wrappedUi: Record<string, unknown> | undefined;
   /** Original setWidget captured by the currently installed wrapper. */
@@ -415,7 +573,7 @@ function createReporter(
   };
 
   // ------------------------------------------------------------------
-  // Socket transport (write-only, bounded last-snapshot backpressure)
+  // Socket transport (bounded status snapshots plus bounded rename replies)
   // ------------------------------------------------------------------
 
   const nextSequence = (): number => {
@@ -445,8 +603,31 @@ function createReporter(
       }
       return false;
     }
-    if (!written) drainPending = true; // The frame is queued; the latest snapshot flushes on drain.
+    if (!written) drainPending = true; // The frame is accepted; queued replies and the latest snapshot flush on drain.
     return true; // Accepted, including when buffered pending drain.
+  };
+
+  const tryWriteMessage = (message: SessionHostMessage): boolean => {
+    try {
+      return tryWriteFrame(encodeFrame(message));
+    } catch {
+      // All protocol fields are bounded; a failed encode is contained.
+      return false;
+    }
+  };
+
+  const flushQueuedRenameAcks = (candidate: net.Socket, generation: number): boolean => {
+    if (!active || generation !== sessionGeneration || candidate !== socket) return false;
+    while (renameAckQueue.length > 0) {
+      const frame = renameAckQueue.shift()!;
+      if (!tryWriteFrame(frame)) {
+        candidate.destroy();
+        return false;
+      }
+      // write(false) accepts this frame but asks us to stop until another drain.
+      if (drainPending) return false;
+    }
+    return true;
   };
 
   const teardownSocket = (): void => {
@@ -457,6 +638,8 @@ function createReporter(
     connecting = false;
     drainPending = false;
     snapshotQueued = false;
+    renameAckQueue.length = 0;
+    inboundBuffer = Buffer.alloc(0);
     if (socket) {
       const stale = socket;
       socket = undefined;
@@ -486,7 +669,7 @@ function createReporter(
     const generation = sessionGeneration;
     let candidate: net.Socket;
     try {
-      candidate = net.connect(bootstrap.socketPath);
+      candidate = options.connectSocket?.(bootstrap.socketPath) ?? net.connect(bootstrap.socketPath);
     } catch {
       scheduleReconnect();
       return;
@@ -499,8 +682,8 @@ function createReporter(
       // A seam failure must not affect the transport.
     }
     candidate.unref?.();
-    // Write-only companion: discard anything the host sends, and bound the
-    // connect attempt so a wedged listener cannot hold the session open.
+    // Bound the connection attempt so a wedged listener cannot hold the
+    // session open. Incoming bytes are parsed below under the shared cap.
     candidate.resume();
     candidate.setTimeout(CONNECT_TIMEOUT_MS);
     candidate.on("timeout", () => {
@@ -519,25 +702,21 @@ function createReporter(
         generation: bootstrap.generation,
         token: bootstrap.token,
       };
-      try {
-        if (tryWriteFrame(encodeFrame(hello)) && lastSnapshot && !drainPending) {
-          snapshotQueued = tryWriteFrame(encodeFrame(lastSnapshot));
-        }
-      } catch {
-        // Oversized frame (impossible with bounded fields): drop.
+      if (tryWriteMessage(hello) && lastSnapshot && !drainPending) {
+        snapshotQueued = tryWriteMessage(lastSnapshot);
       }
     });
     candidate.on("drain", () => {
       if (!drainPending || generation !== sessionGeneration || !active || candidate !== socket) return;
       drainPending = false;
-      // Backpressure retained only the latest snapshot; flush it once, and
-      // never retransmit a snapshot that is already queued in the buffer.
+      if (renameAckQueue.length > 0 && !flushQueuedRenameAcks(candidate, generation)) return;
+      // Status backpressure retains only the latest snapshot; flush it once,
+      // and never retransmit a snapshot already queued in the buffer.
       if (!lastSnapshot || snapshotQueued) return;
-      try {
-        snapshotQueued = tryWriteFrame(encodeFrame(lastSnapshot));
-      } catch {
-        // Dropped.
-      }
+      snapshotQueued = tryWriteMessage(lastSnapshot);
+    });
+    candidate.on("data", (chunk: Buffer) => {
+      processInbound(candidate, generation, chunk);
     });
     candidate.on("error", () => {
       // 'close' follows and drives the bounded reconnect decision.
@@ -548,6 +727,8 @@ function createReporter(
       socket = undefined;
       connecting = false;
       drainPending = false;
+      renameAckQueue.length = 0;
+      inboundBuffer = Buffer.alloc(0);
       if (generation === sessionGeneration && active) scheduleReconnect();
     });
   };
@@ -562,7 +743,8 @@ function createReporter(
       && lastSnapshot.busy === busy
       && lastSnapshot.pendingInput === pendingInput
       && lastSnapshot.inputSurface === inputSurface
-      && lastSnapshot.activity.join("\u0000") === activity.join("\u0000")) {
+      && lastSnapshot.activity.join("\u0000") === activity.join("\u0000")
+      && JSON.stringify(lastSnapshot.nativeSession ?? null) === JSON.stringify(nativeSession)) {
       return; // Unchanged: no new frame.
     }
     const snapshot: SessionHostStatus = {
@@ -575,18 +757,239 @@ function createReporter(
       pendingInput,
       inputSurface,
       activity: [...activity],
+      nativeSession: nativeSession ? { ...nativeSession } : null,
     };
     lastSnapshot = snapshot;
     snapshotQueued = false;
-    writeStickyState({ bootstrap, sequence, teardown });
+    writeStickyState({ bootstrap, sequence, sessionEpoch, nativeSessionId, teardown });
     // While backpressured nothing more is queued: the latest snapshot is
     // retained in lastSnapshot and flushes once on drain.
     if (socket && !connecting && !drainPending) {
+      snapshotQueued = tryWriteMessage(snapshot);
+    }
+  };
+
+  const refreshNativeSession = (
+    ctx: unknown,
+    epochAlreadyAdvanced = false,
+    emitUpdate = true,
+  ): NativeSessionRead | undefined => {
+    currentContext = ctx;
+    const read = readNativeSession(ctx);
+    if (!read) {
+      nativeSession = null;
+      if (emitUpdate) emit();
+      return undefined;
+    }
+    if (nativeSessionId !== read.sessionId) {
+      if (!epochAlreadyAdvanced) sessionEpoch += 1;
+      nativeSessionId = read.sessionId;
+    }
+    nativeSession = {
+      sessionId: read.sessionId,
+      epoch: Math.max(1, sessionEpoch),
+      name: read.displayName,
+    };
+    if (sessionEpoch < 1) sessionEpoch = nativeSession.epoch;
+    writeStickyState({ bootstrap, sequence, sessionEpoch, nativeSessionId, teardown });
+    if (emitUpdate) emit();
+    return read;
+  };
+
+  const scheduleStoredUserRefresh = (): void => {
+    if (pendingStoredUserRefresh) return; // Coalesce same-turn user messages.
+    const generation = sessionGeneration;
+    // Pi 1.0.4 dispatches message_end before appending the message entry. Defer
+    // one turn so this reads the persisted native SessionManager entries, not
+    // event payload text, while still updating during a long first response.
+    pendingStoredUserRefresh = setImmediate(() => {
+      pendingStoredUserRefresh = undefined;
+      if (!active || generation !== sessionGeneration) return;
       try {
-        snapshotQueued = tryWriteFrame(encodeFrame(snapshot));
+        if (contextModeIsTui(currentContext)) refreshNativeSession(currentContext);
       } catch {
-        // Oversized frame (impossible with bounded fields): drop.
+        // A transient persistence/context failure leaves metadata unknown until the next public refresh.
       }
+    });
+  };
+
+  const nativeTuple = (): { sessionId: string | null; sessionEpoch: number | null } => ({
+    sessionId: nativeSession?.sessionId ?? null,
+    sessionEpoch: nativeSession?.epoch ?? null,
+  });
+
+  const sendRenameAck = (
+    candidate: net.Socket,
+    generation: number,
+    request: SessionHostRenameRequest,
+    outcome: SessionHostRenameAck["outcome"],
+    reason: SessionHostRenameAck["reason"],
+  ): void => {
+    if (!active || generation !== sessionGeneration || candidate !== socket) return;
+    const tuple = nativeTuple();
+    const ack: SessionHostRenameAck = {
+      version: 1,
+      type: "rename_result",
+      instanceId: bootstrap.instanceId,
+      generation: bootstrap.generation,
+      requestId: request.requestId,
+      expectedSessionId: request.expectedSessionId,
+      expectedSessionEpoch: request.expectedSessionEpoch,
+      ...tuple,
+      outcome,
+      reason,
+    };
+    let frame: string;
+    try {
+      frame = encodeFrame(ack);
+    } catch {
+      candidate.destroy();
+      return;
+    }
+    if (drainPending) {
+      if (renameAckQueue.length >= MAX_QUEUED_RENAME_ACKS) {
+        candidate.destroy(); // Never grow an unbounded acknowledgement queue.
+        return;
+      }
+      renameAckQueue.push(frame);
+      return;
+    }
+    if (!tryWriteFrame(frame)) candidate.destroy();
+  };
+
+  const rememberRenameRequest = (requestId: string): boolean => {
+    if (recentRenameRequestIds.has(requestId)) return false;
+    recentRenameRequestIds.add(requestId);
+    if (recentRenameRequestIds.size > MAX_RECENT_RENAME_REQUEST_IDS) {
+      const oldest = recentRenameRequestIds.values().next().value as string | undefined;
+      if (oldest) recentRenameRequestIds.delete(oldest);
+    }
+    return true;
+  };
+
+  const processRenameRequest = (candidate: net.Socket, generation: number, request: SessionHostRenameRequest): void => {
+    if (!active || generation !== sessionGeneration || candidate !== socket) return;
+    if (request.instanceId !== bootstrap.instanceId
+      || request.generation !== bootstrap.generation
+      || !tokenMatches(request.token, bootstrap.token)) {
+      candidate.destroy(); // Wrong capability or identity is a protocol failure.
+      return;
+    }
+    if (renameAckQueue.length >= MAX_QUEUED_RENAME_ACKS) {
+      candidate.destroy(); // Do not mutate native state when no reply capacity remains.
+      return;
+    }
+    if (pendingRenameRequestIds.size >= MAX_CONCURRENT_RENAME_REQUESTS) {
+      candidate.destroy(); // Fail closed instead of silently dropping an authenticated command.
+      return;
+    }
+    if (!rememberRenameRequest(request.requestId)) return; // Replay: never invoke the setter twice.
+    pendingRenameRequestIds.add(request.requestId);
+    try {
+      if (!isValidRenameName(request.name)) {
+        sendRenameAck(candidate, generation, request, "rejected", "invalid-name");
+        return;
+      }
+      const before = refreshNativeSession(currentContext);
+      if (!before || !nativeSession) {
+        sendRenameAck(candidate, generation, request, "rejected", "unavailable");
+        return;
+      }
+      if (!nativeSessionMatches(nativeSession, request.expectedSessionId, request.expectedSessionEpoch)) {
+        sendRenameAck(candidate, generation, request, "rejected", "stale-session");
+        return;
+      }
+
+      let setter: unknown;
+      try {
+        setter = isRecord(pi) ? (pi as Record<string, unknown>).setSessionName : undefined;
+      } catch {
+        setter = undefined;
+      }
+      if (typeof setter !== "function") {
+        sendRenameAck(candidate, generation, request, "rejected", "unavailable");
+        return;
+      }
+      try {
+        // Public ExtensionAPI method; it synchronously appends native
+        // session_info and emits session_info_changed in Pi 1.0.4.
+        (setter as (name: string) => void).call(pi, request.name);
+      } catch {
+        sendRenameAck(candidate, generation, request, "rejected", "setter-failed");
+        return;
+      }
+      if (!active || generation !== sessionGeneration || candidate !== socket) return;
+      const after = refreshNativeSession(currentContext);
+      if (!after || !nativeSession) {
+        sendRenameAck(candidate, generation, request, "rejected", "unavailable");
+        return;
+      }
+      if (!nativeSessionMatches(nativeSession, request.expectedSessionId, request.expectedSessionEpoch)) {
+        sendRenameAck(candidate, generation, request, "rejected", "stale-session");
+        return;
+      }
+      // Pi 1.0.4 stores the public setter value after trimming surrounding whitespace.
+      if (after.storedName !== request.name.trim()) {
+        sendRenameAck(candidate, generation, request, "rejected", "verification-failed");
+        return;
+      }
+      sendRenameAck(candidate, generation, request, "renamed", "none");
+    } finally {
+      pendingRenameRequestIds.delete(request.requestId);
+    }
+  };
+
+  const processInboundLine = (candidate: net.Socket, generation: number, lineBytes: Buffer): boolean => {
+    let line: string;
+    try {
+      line = new TextDecoder("utf-8", { fatal: true }).decode(lineBytes);
+    } catch {
+      candidate.destroy();
+      return false;
+    }
+    const message = decodeFrame(line);
+    if (!message || message.type !== "rename_request") {
+      candidate.destroy(); // Reporter accepts only authenticated host rename commands.
+      return false;
+    }
+    processRenameRequest(candidate, generation, message);
+    return !candidate.destroyed;
+  };
+
+  const processInbound = (candidate: net.Socket, generation: number, chunk: Buffer): void => {
+    if (!active || generation !== sessionGeneration || candidate !== socket) return;
+    let offset = 0;
+    while (offset < chunk.length) {
+      const newlineIndex = chunk.indexOf(0x0a, offset);
+      if (newlineIndex === -1) {
+        const remainingLength = chunk.length - offset;
+        const frameLength = inboundBuffer.length + remainingLength;
+        if (frameLength + 1 > MAX_STATUS_FRAME_BYTES) {
+          candidate.destroy();
+          return;
+        }
+        const bounded = Buffer.allocUnsafe(frameLength);
+        inboundBuffer.copy(bounded, 0);
+        chunk.copy(bounded, inboundBuffer.length, offset);
+        inboundBuffer = bounded;
+        return;
+      }
+      const segmentLength = newlineIndex - offset;
+      const frameLength = inboundBuffer.length + segmentLength;
+      if (frameLength + 1 > MAX_STATUS_FRAME_BYTES) {
+        candidate.destroy();
+        return;
+      }
+      let lineBytes: Buffer;
+      if (inboundBuffer.length === 0) lineBytes = chunk.subarray(offset, newlineIndex);
+      else {
+        lineBytes = Buffer.allocUnsafe(frameLength);
+        inboundBuffer.copy(lineBytes, 0);
+        chunk.copy(lineBytes, inboundBuffer.length, offset, newlineIndex);
+        inboundBuffer = Buffer.alloc(0);
+      }
+      offset = newlineIndex + 1;
+      if (!processInboundLine(candidate, generation, lineBytes)) return;
     }
   };
 
@@ -627,9 +1030,12 @@ function createReporter(
   };
 
   const installSession = (ctx: unknown): void => {
-    previousTeardown?.(); // Close any leftover connection from a reloaded incarnation.
     restoreObserver(); // Every session gets a fresh observation generation.
+    cancelPendingStoredUserRefresh();
     sessionGeneration += 1;
+    sessionEpoch += 1; // Every native session_start/reload invalidates older host commands.
+    nativeSessionId = undefined;
+    nativeSession = null;
     active = true;
     busy = null;
     // The decorator only observes future setWidget calls and nothing queries
@@ -643,6 +1049,7 @@ function createReporter(
     snapshotQueued = false;
     reconnectAttempts = 0;
     installObserver(ctx);
+    refreshNativeSession(ctx, true, false);
     connectSocket();
     // Probe live readiness instead of assuming it: a session that starts
     // mid-run reports busy, and an unavailable probe stays unknown (null).
@@ -652,7 +1059,10 @@ function createReporter(
 
   const deactivate = (): void => {
     sessionGeneration += 1;
+    cancelPendingStoredUserRefresh();
     active = false;
+    currentContext = undefined;
+    nativeSession = null;
     restoreObserver();
     teardownSocket();
     busy = null;
@@ -693,6 +1103,39 @@ function createReporter(
     deactivate();
   }));
 
+  // Public Pi notification emitted by native /name and setSessionName.
+  // It refreshes only the bounded canonical title/identity, never session
+  // entries or message text other than the clipped first-user fallback.
+  registerHook(pi, "session_info_changed", safe((...args) => {
+    if (!active) return;
+    const eventContext = extractSafeContext(args);
+    const ctx = contextModeIsTui(eventContext) ? eventContext : currentContext;
+    if (!contextModeIsTui(ctx)) {
+      nativeSession = null;
+      emit();
+      return;
+    }
+    refreshNativeSession(ctx);
+  }));
+
+  registerHook(pi, "message_end", safe((...args) => {
+    if (!active) return;
+    const event = args.find((arg) => isRecord(arg) && arg.type === "message_end");
+    if (!isRecord(event) || !isRecord(event.message) || event.message.role !== "user") return;
+    // The public event is dispatched before native persistence; the deferred
+    // refresh reads only the subsequently stored SessionManager entries.
+    scheduleStoredUserRefresh();
+  }));
+
+  registerHook(pi, "message_start", safe((...args) => {
+    if (!active || nativeSession?.name !== "(no messages)") return;
+    const event = args.find((arg) => isRecord(arg) && arg.type === "message_start");
+    if (!isRecord(event) || !isRecord(event.message) || event.message.role !== "assistant") return;
+    // In Pi's event order, the assistant message starts only after initial user
+    // message_end handlers return and their SessionManager entries are appended.
+    if (contextModeIsTui(currentContext)) refreshNativeSession(currentContext);
+  }));
+
   registerHook(pi, "agent_start", safe(() => {
     if (!active) return;
     busy = true;
@@ -708,7 +1151,9 @@ function createReporter(
     // Settled is the only boundary where Pi guarantees no automatic
     // continuation remains. A valid false probe establishes busy; an
     // unavailable or throwing probe (or context) cannot preserve an idle claim.
-    applyReadiness(probeReadiness(extractSafeContext(args)));
+    const ctx = extractSafeContext(args);
+    if (contextModeIsTui(ctx)) refreshNativeSession(ctx);
+    applyReadiness(probeReadiness(ctx));
     emit();
   }));
 
@@ -750,14 +1195,16 @@ function createReporter(
       return;
     }
     if (installObserver(ctx)) {
+      refreshNativeSession(ctx);
       emit();
     } else {
       pendingInput = null; // Observation no longer available: unknown.
+      refreshNativeSession(ctx);
       emit();
     }
   });
   registerHook(pi, "session_compact", reprobesReadiness);
   registerHook(pi, "session_compact_failed", reprobesReadiness);
 
-  return { bootstrap, sequence, teardown };
+  return { bootstrap, sequence, sessionEpoch, nativeSessionId, teardown };
 }

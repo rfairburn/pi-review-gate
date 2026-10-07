@@ -15,11 +15,13 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import test, { afterEach } from "node:test";
-import { createStatusBroker as createStatusBrokerImpl, type StatusBroker, type StatusBrokerOptions } from "../src/session-host/broker";
+import { __test as brokerTest, createStatusBroker as createStatusBrokerImpl, type StatusBroker, type StatusBrokerOptions } from "../src/session-host/broker";
 import {
   type SessionHostBootstrap,
+  type SessionHostNativeSession,
   type SessionHostStatus,
   MAX_STATUS_FRAME_BYTES,
+  decodeFrame,
   parseBootstrap,
 } from "../src/session-host/protocol";
 
@@ -280,6 +282,7 @@ function statusFrame(bootstrap: SessionHostBootstrap, fields: {
   pendingInput?: boolean | null;
   inputSurface?: boolean;
   activity?: string[];
+  nativeSession?: SessionHostNativeSession | null;
 }): SessionHostStatus {
   return {
     version: 1,
@@ -291,6 +294,7 @@ function statusFrame(bootstrap: SessionHostBootstrap, fields: {
     pendingInput: fields.pendingInput ?? null,
     inputSurface: fields.inputSurface ?? false,
     activity: fields.activity ?? [],
+    ...(fields.nativeSession === undefined ? {} : { nativeSession: fields.nativeSession }),
   };
 }
 
@@ -372,6 +376,34 @@ async function waitFor(predicate: () => boolean, timeoutMs = 6000): Promise<void
 function makeSocketRoot(): string {
   return ownDirectory(fs.mkdtempSync(path.join(os.tmpdir(), "prg-bt-")));
 }
+
+test("rename acknowledgement policy fences request, host generation, and current native epoch", () => {
+  const expected = {
+    requestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    expectedSessionId: "native-one",
+    expectedSessionEpoch: 7,
+  };
+  const ack = {
+    version: 1 as const,
+    type: "rename_result" as const,
+    instanceId: INSTANCE_A,
+    generation: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    ...expected,
+    sessionId: "native-one",
+    sessionEpoch: 7,
+    outcome: "renamed" as const,
+    reason: "none" as const,
+  };
+  const current = { sessionId: "native-one", epoch: 7, name: "title" };
+  assert.equal(brokerTest.classifyRenameAck(ack, expected, INSTANCE_A, ack.generation, current), "matching");
+  assert.equal(brokerTest.classifyRenameAck(ack, expected, INSTANCE_A, "cccccccc-cccc-4ccc-8ccc-cccccccccccc", current), "invalid");
+  assert.equal(brokerTest.classifyRenameAck({ ...ack, expectedSessionEpoch: 8 }, expected, INSTANCE_A, ack.generation, current), "invalid");
+  assert.equal(brokerTest.classifyRenameAck({ ...ack, requestId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" }, expected, INSTANCE_A, ack.generation, current), "invalid");
+  assert.equal(
+    brokerTest.classifyRenameAck(ack, expected, INSTANCE_A, ack.generation, { sessionId: "native-two", epoch: 8, name: "other" }),
+    "stale-session",
+  );
+});
 
 test("broker creates a private 0700 transport, owns its 0600 socket, and cleans up while preserving unknown files", async () => {
   const root = makeSocketRoot();
@@ -518,6 +550,222 @@ test("broker authenticates a valid hello then delivers bounded status snapshots 
     "activity", "busy", "generation", "inputSurface", "instanceId", "pendingInput", "sequence", "type", "version",
   ], "snapshot callbacks never carry raw frames or unknown fields");
   assert.equal(recorded.disconnects, 0);
+});
+
+test("registration rename is identity-fenced, authenticated, acknowledged, and bounded", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const recorded = recording();
+  const registration = broker.register(INSTANCE_A, recorded.handlers);
+  const unavailable = await registration.rename({
+    expectedSessionId: "native-one",
+    expectedSessionEpoch: 1,
+    name: "title",
+  });
+  assert.equal(unavailable.status, "unavailable", "rename cannot guess before native metadata is observed");
+
+  const client = await connectClient(broker.socketPath);
+  const outbound: Record<string, unknown>[] = [];
+  let buffer = "";
+  client.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    let newline: number;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, newline + 1);
+      buffer = buffer.slice(newline + 1);
+      const decoded = decodeFrame(line);
+      if (decoded) outbound.push(decoded as unknown as Record<string, unknown>);
+    }
+  });
+  const nativeSession = { sessionId: "native-one", epoch: 4, name: "original title" };
+  client.write(JSON.stringify(helloFrame(registration.bootstrap)) + "\n");
+  client.write(JSON.stringify(statusFrame(registration.bootstrap, { sequence: 1, nativeSession })) + "\n");
+  await waitFor(() => recorded.statuses.length === 1);
+
+  const overLimit = await registration.rename({
+    expectedSessionId: nativeSession.sessionId,
+    expectedSessionEpoch: nativeSession.epoch,
+    name: "x".repeat(1025),
+  });
+  assert.equal(overLimit.status, "invalid-name", "oversized persisted input is rejected rather than clipped");
+  assert.equal(outbound.some((frame) => frame.type === "rename_request"), false, "invalid names never enter the wire queue");
+
+  const renamedPromise = registration.rename({
+    expectedSessionId: nativeSession.sessionId,
+    expectedSessionEpoch: nativeSession.epoch,
+    name: "persisted native title",
+  });
+  await waitFor(() => outbound.some((frame) => frame.type === "rename_request"));
+  const request = outbound.find((frame) => frame.type === "rename_request")!;
+  assert.equal(request.instanceId, INSTANCE_A);
+  assert.equal(request.generation, registration.bootstrap.generation);
+  assert.equal(request.token, registration.bootstrap.token, "only the authenticated command carries the capability");
+  assert.equal(request.expectedSessionId, nativeSession.sessionId);
+  assert.equal(request.expectedSessionEpoch, nativeSession.epoch);
+  assert.equal(request.name, "persisted native title", "the full bounded name is not clipped");
+
+  const ack = {
+    version: 1,
+    type: "rename_result",
+    instanceId: registration.bootstrap.instanceId,
+    generation: registration.bootstrap.generation,
+    requestId: request.requestId,
+    expectedSessionId: nativeSession.sessionId,
+    expectedSessionEpoch: nativeSession.epoch,
+    sessionId: nativeSession.sessionId,
+    sessionEpoch: nativeSession.epoch,
+    outcome: "renamed",
+    reason: "none",
+  };
+  client.write(JSON.stringify(ack) + "\n");
+  const result = await renamedPromise;
+  assert.equal(result.status, "renamed");
+  assert.equal(result.requestId, request.requestId);
+  assert.equal(result.observedSessionId, nativeSession.sessionId);
+  assert.equal(result.observedSessionEpoch, nativeSession.epoch);
+  assert.equal("name" in result, false, "the asynchronous result does not echo title content");
+  assert.equal("token" in result, false, "the capability never reaches callback results");
+});
+
+test("rename rejects stale broker metadata and fails closed on a mismatched acknowledgement tuple", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const recorded = recording();
+  const registration = broker.register(INSTANCE_A, recorded.handlers);
+  const client = await connectClient(broker.socketPath);
+  const outbound: Record<string, unknown>[] = [];
+  let buffer = "";
+  client.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    let newline: number;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, newline + 1);
+      buffer = buffer.slice(newline + 1);
+      const decoded = decodeFrame(line);
+      if (decoded) outbound.push(decoded as unknown as Record<string, unknown>);
+    }
+  });
+  client.write(JSON.stringify(helloFrame(registration.bootstrap)) + "\n");
+  client.write(JSON.stringify(statusFrame(registration.bootstrap, {
+    sequence: 1,
+    nativeSession: { sessionId: "native-one", epoch: 5, name: "title" },
+  })) + "\n");
+  await waitFor(() => recorded.statuses.length === 1);
+  const stale = await registration.rename({
+    expectedSessionId: "native-one",
+    expectedSessionEpoch: 4,
+    name: "must not be sent",
+  });
+  assert.equal(stale.status, "stale-session");
+  assert.equal(outbound.some((frame) => frame.type === "rename_request"), false, "stale expected epoch is rejected locally");
+
+  const pending = registration.rename({
+    expectedSessionId: "native-one",
+    expectedSessionEpoch: 5,
+    name: "pending title",
+  });
+  await waitFor(() => outbound.some((frame) => frame.type === "rename_request"));
+  const request = outbound.find((frame) => frame.type === "rename_request")!;
+  const mismatchedAck = JSON.stringify({
+    version: 1,
+    type: "rename_result",
+    instanceId: registration.bootstrap.instanceId,
+    generation: registration.bootstrap.generation,
+    requestId: request.requestId,
+    expectedSessionId: "native-one",
+    expectedSessionEpoch: 6,
+    sessionId: "native-one",
+    sessionEpoch: 6,
+    outcome: "rejected",
+    reason: "stale-session",
+  }) + "\n";
+  const closed = expectBrokerRejection(client, () => client.write(mismatchedAck));
+  const failed = await pending;
+  await closed;
+  assert.equal(failed.status, "disconnected", "an acknowledgement for a different expected tuple cannot satisfy the request");
+  assert.equal(failed.requestId, request.requestId);
+});
+
+test("a successful rename acknowledgement cannot outlive the broker's current session epoch", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const recorded = recording();
+  const registration = broker.register(INSTANCE_A, recorded.handlers);
+  const client = await connectClient(broker.socketPath);
+  const outbound: Record<string, unknown>[] = [];
+  let buffer = "";
+  client.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    let newline: number;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, newline + 1);
+      buffer = buffer.slice(newline + 1);
+      const decoded = decodeFrame(line);
+      if (decoded) outbound.push(decoded as unknown as Record<string, unknown>);
+    }
+  });
+  client.write(JSON.stringify(helloFrame(registration.bootstrap)) + "\n");
+  client.write(JSON.stringify(statusFrame(registration.bootstrap, {
+    sequence: 1,
+    nativeSession: { sessionId: "native-one", epoch: 5, name: "title" },
+  })) + "\n");
+  await waitFor(() => recorded.statuses.length === 1);
+  const pending = registration.rename({
+    expectedSessionId: "native-one",
+    expectedSessionEpoch: 5,
+    name: "persisted title",
+  });
+  await waitFor(() => outbound.some((frame) => frame.type === "rename_request"));
+  const request = outbound.find((frame) => frame.type === "rename_request")!;
+
+  client.write(JSON.stringify(statusFrame(registration.bootstrap, {
+    sequence: 2,
+    nativeSession: { sessionId: "native-two", epoch: 6, name: "new session" },
+  })) + "\n");
+  await waitFor(() => recorded.statuses.length === 2);
+  client.write(JSON.stringify({
+    version: 1,
+    type: "rename_result",
+    instanceId: registration.bootstrap.instanceId,
+    generation: registration.bootstrap.generation,
+    requestId: request.requestId,
+    expectedSessionId: "native-one",
+    expectedSessionEpoch: 5,
+    sessionId: "native-one",
+    sessionEpoch: 5,
+    outcome: "renamed",
+    reason: "none",
+  }) + "\n");
+  const result = await pending;
+  assert.equal(result.status, "stale-session", "late success is not accepted for a replaced native session");
+  assert.equal(result.observedSessionId, "native-two");
+  assert.equal(result.observedSessionEpoch, 6);
+});
+
+test("rename has a per-registration in-flight cap and disposal resolves pending work", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const recorded = recording();
+  const registration = broker.register(INSTANCE_A, recorded.handlers);
+  const client = await connectClient(broker.socketPath);
+  client.write(JSON.stringify(helloFrame(registration.bootstrap)) + "\n");
+  client.write(JSON.stringify(statusFrame(registration.bootstrap, {
+    sequence: 1,
+    nativeSession: { sessionId: "native-one", epoch: 1, name: "title" },
+  })) + "\n");
+  await waitFor(() => recorded.statuses.length === 1);
+
+  const pending = Array.from({ length: 4 }, (_, index) => registration.rename({
+    expectedSessionId: "native-one",
+    expectedSessionEpoch: 1,
+    name: `title ${index}`,
+  }));
+  const capped = await registration.rename({
+    expectedSessionId: "native-one",
+    expectedSessionEpoch: 1,
+    name: "fifth title",
+  });
+  assert.equal(capped.status, "busy");
+  const closed = expectClientClose(client);
+  await disposeBroker(broker);
+  await closed;
+  assert.deepEqual((await Promise.all(pending)).map((result) => result.status), ["disconnected", "disconnected", "disconnected", "disconnected"]);
 });
 
 test("wrong token, wrong generation, and cross-instance tokens are rejected without disconnect callbacks", async () => {

@@ -27,6 +27,7 @@ import {
 import { ProfileRegistry } from "../src/session-host/profiles";
 import { SESSION_HOST_BOOTSTRAP_ENV, prepareNativeLaunch } from "../src/session-host/launch";
 import { TerminalSurface } from "../src/session-host/terminal-surface";
+import type { StatusRenameRequest, StatusRenameResult } from "../src/session-host/broker";
 
 /**
  * Focused component tests for the independent owned-PTY instance lifecycle.
@@ -249,6 +250,8 @@ interface RegistrarEntry {
 class FakeRegistrar implements StatusRegistrar {
   readonly entries: RegistrarEntry[] = [];
   readonly order: string[] = ["registrar"];
+  readonly renameRequests: { instanceId: string; request: StatusRenameRequest }[] = [];
+  renameHandler?: (entry: RegistrarEntry, request: StatusRenameRequest) => Promise<StatusRenameResult>;
   nextToken?: string;
 
   register(instanceId: string, handlers: RegistrarEntry["handlers"]): InstanceStatusRegistration {
@@ -268,12 +271,19 @@ class FakeRegistrar implements StatusRegistrar {
     };
     this.nextToken = undefined;
     this.entries.push(entry);
-    return {
+    const registration: InstanceStatusRegistration = {
       bootstrap: entry.bootstrap,
       release: () => {
         entry.released = true;
       },
     };
+    if (this.renameHandler) {
+      registration.rename = (request) => {
+        this.renameRequests.push({ instanceId, request: { ...request } });
+        return this.renameHandler!(entry, request);
+      };
+    }
+    return registration;
   }
 
   /** Deliver a status update the way the (future) broker would. */
@@ -844,6 +854,82 @@ test("status updates land in a truthful bounded copied view; disconnect never cl
     view = viewFor(harness.manager, id);
     assert.equal(view.busy, busyBefore, "late status after release cannot touch the row");
     assert.equal(view.activity.includes("late"), false);
+  } finally {
+    cleanup(harness);
+  }
+});
+
+test("native names are observed and persisted rename is fenced before and after the broker call", async () => {
+  const harness = makeHarness("native-rename");
+  let releaseRename: ((result: StatusRenameResult) => void) | undefined;
+  harness.registrar.renameHandler = (entry, request) => {
+    if (request.expectedSessionEpoch === 2) {
+      return new Promise<StatusRenameResult>((resolve) => { releaseRename = resolve; });
+    }
+    harness.registrar.emitStatus(entry, {
+      busy: false, pendingInput: false, inputSurface: false, activity: [],
+      nativeSession: { sessionId: request.expectedSessionId, epoch: request.expectedSessionEpoch, name: request.name },
+    });
+    return Promise.resolve({
+      requestId: "rename-ack-1",
+      status: "renamed",
+      expectedSessionId: request.expectedSessionId,
+      expectedSessionEpoch: request.expectedSessionEpoch,
+      observedSessionId: request.expectedSessionId,
+      observedSessionEpoch: request.expectedSessionEpoch,
+    });
+  };
+  try {
+    const id = await harness.manager.create({ workspace: harness.workspace });
+    const entry = harness.registrar.entryFor(id);
+    harness.registrar.emitStatus(entry, {
+      busy: false, pendingInput: false, inputSurface: false, activity: [],
+      nativeSession: { sessionId: "conversation-1", epoch: 1, name: "Initial title" },
+    });
+    assert.equal(viewFor(harness.manager, id).label, "Initial title");
+    assert.deepEqual(viewFor(harness.manager, id).nativeSession, {
+      sessionId: "conversation-1", epoch: 1, name: "Initial title",
+    });
+
+    const success = await harness.manager.rename(id, {
+      expectedSessionId: "conversation-1", expectedSessionEpoch: 1, name: "Persisted title",
+    });
+    assert.equal(success.status, "renamed");
+    assert.deepEqual(harness.registrar.renameRequests.map(({ request }) => request), [{
+      expectedSessionId: "conversation-1", expectedSessionEpoch: 1, name: "Persisted title",
+    }]);
+    assert.equal(viewFor(harness.manager, id).label, "Persisted title", "the row follows observed status, not an optimistic local label");
+
+    harness.registrar.emitStatus(entry, {
+      busy: false, pendingInput: false, inputSurface: false, activity: [],
+      nativeSession: { sessionId: "conversation-2", epoch: 2, name: "Switched conversation" },
+    });
+    const stale = await harness.manager.rename(id, {
+      expectedSessionId: "conversation-1", expectedSessionEpoch: 1, name: "Must not win",
+    });
+    assert.equal(stale.status, "stale-session");
+    assert.equal(harness.registrar.renameRequests.length, 1, "preflight stale tuples never reach the broker");
+
+    const pending = harness.manager.rename(id, {
+      expectedSessionId: "conversation-2", expectedSessionEpoch: 2, name: "Racing title",
+    });
+    assert.equal(harness.registrar.renameRequests.length, 2);
+    harness.registrar.emitStatus(entry, {
+      busy: false, pendingInput: false, inputSurface: false, activity: [],
+      nativeSession: { sessionId: "conversation-3", epoch: 3, name: "Latest conversation" },
+    });
+    assert.ok(releaseRename, "the pending broker rename reached its asynchronous handler");
+    releaseRename({
+      requestId: "rename-ack-2", status: "renamed",
+      expectedSessionId: "conversation-2", expectedSessionEpoch: 2,
+      observedSessionId: "conversation-2", observedSessionEpoch: 2,
+    });
+    const raced = await pending;
+    assert.equal(raced.status, "stale-session", "a tuple change during persistence prevents reporting success");
+    assert.equal(viewFor(harness.manager, id).label, "Latest conversation");
+    harness.registrar.emitDisconnect(entry);
+    assert.equal(viewFor(harness.manager, id).nativeSession, null, "disconnect clears observed native identity");
+    assert.equal(viewFor(harness.manager, id).label, "(session name unavailable)");
   } finally {
     cleanup(harness);
   }

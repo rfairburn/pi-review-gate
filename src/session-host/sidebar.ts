@@ -5,7 +5,7 @@
  * Each sidebar row is an independent native process; the main UI is its
  * nativePTY frame, so this module renders ONLY the sidebar-owned panes: the
  * roster snapshot (top-level public agent/input/activity metadata) and the
- * New session form. It returns plain, bounded lines at the supplied pane
+ * New/Edit forms. It returns plain, bounded lines at the supplied pane
  * geometry — `render()` for the focused pane, `renderRoster()`/`renderForm()`
  * for the wide layout that shows both at once. The compositor owns offsets,
  * composition over the native frame, the real TTY, and resizing.
@@ -35,10 +35,11 @@
  *   Only fixed generated SGR (bold 1, inverse 7/27, explicit 0 resets at row
  *   boundaries) is ever emitted; untrusted ESC/OSC-52/title/window commands
  *   can never reach the composed frame. Real pi-tui key matching
- *   (legacy, modifyOtherKeys, and Kitty CSI-u packets) plus its Input class
- *   provide field editing, grapheme-safe caret movement, Ctrl+U line kill,
- *   and bounded single-line bracketed paste.
- * - No native widget ownership: the roster and form are plain text + SGR.
+ *   (legacy, modifyOtherKeys, and Kitty CSI-u packets) plus the native Editor
+ *   adapter provide field editing, grapheme-safe caret movement, and bounded
+ *   single-line input.
+ * - Editable fields use the native Editor adapter; roster and surrounding form
+ *   labels remain plain text + generated SGR.
  *
  * Stable DTO/API surface for future root-host phases: `SidebarItem`,
  * `SidebarAction`, `SidebarControllerOptions`, and `SidebarController` with
@@ -46,9 +47,7 @@
  */
 
 import {
-  CURSOR_MARKER,
   decodeKittyPrintable,
-  Input,
   isKeyRelease,
   isKeyRepeat,
   type KeyId,
@@ -56,6 +55,14 @@ import {
   truncateToWidth,
   visibleWidth,
 } from "pi-session-host-tui";
+import { resolve } from "node:path";
+import {
+	createSessionHostTextField,
+	type SessionHostFieldRejection,
+	type SessionHostFieldSubmission,
+	type SessionHostTextField,
+} from "./field-editor";
+import { isValidNativeSessionId, isValidRenameName, type SessionHostNativeSession } from "./protocol";
 
 /** One roster row: a top-level snapshot of one host-owned instance. */
 export interface SidebarItem {
@@ -72,6 +79,8 @@ export interface SidebarItem {
   readonly inputSurface: boolean;
   /** Generic top-level activity lines; at most 2 are rendered, sanitized. */
   readonly activity: readonly string[];
+	/** Last validated canonical native conversation identity and display name. */
+	readonly nativeSession?: SessionHostNativeSession | null;
   readonly exitCode?: number;
 }
 
@@ -80,11 +89,19 @@ export type SidebarAction =
   | { readonly type: "forward"; readonly data: string }
   | { readonly type: "select"; readonly id: string }
   | { readonly type: "remove"; readonly id: string }
+  | { readonly type: "edit"; readonly id: string; readonly nativeSession: SessionHostNativeSession }
   | {
       readonly type: "create";
       readonly requestId: number;
-      readonly label: string;
       readonly workspace: string;
+    }
+  | {
+      readonly type: "rename";
+      readonly requestId: number;
+      readonly id: string;
+      readonly expectedSessionId: string;
+      readonly expectedSessionEpoch: number;
+      readonly name: string;
     }
   | { readonly type: "quit" }
   | { readonly type: "visibility"; readonly visible: boolean };
@@ -94,9 +111,37 @@ export interface SidebarControllerOptions {
   readonly toggleKey?: string;
   /** Suggested editable workspace path pre-filled in the New session form. */
   readonly initialWorkspace?: string;
+  /** Host-startup cwd used by the native path completer for relative input. */
+  readonly workspaceBasePath?: string;
+  /** Optional Main-owned factory; production supplies current native keybindings and external-editor ownership. */
+  readonly createTextField?: (options: SidebarFieldFactoryOptions) => SidebarFieldFactoryResult;
+  /** Redraw hook for asynchronous native completion and Editor invalidation. */
+  readonly onInvalidate?: () => void;
   /** Initial visibility (default true: the empty welcome picker shows). */
   readonly initialVisible?: boolean;
   readonly onAction?: (action: SidebarAction) => void;
+}
+
+export interface SidebarFieldFactoryOptions {
+  readonly kind: "name" | "path";
+  readonly initialText: string;
+  readonly onInvalidate: () => void;
+  readonly onSubmit: (submission: SessionHostFieldSubmission) => void;
+  readonly onCancel: () => void;
+  readonly onReject: (reason: SessionHostFieldRejection) => void;
+}
+
+export interface SidebarFieldFactoryResult {
+  readonly field: SessionHostTextField;
+  readonly matchesCancel?: (data: string) => boolean;
+  readonly notice?: string;
+  readonly hints?: {
+    readonly submit: string;
+    readonly cancel: string;
+    readonly complete: string;
+    readonly clear: string;
+    readonly externalEditor: string;
+  };
 }
 
 export type SidebarFocus = "main" | "sidebar" | "form" | "confirm";
@@ -146,10 +191,16 @@ const FUNCTION_KEY_BY_CSI_FINAL: Readonly<Record<string, string>> = {
 };
 const FUNCTION_KEY_TILDE_EVENT = /^\x1b\[(\d+);(\d+)(?::([123]))?~$/;
 const FUNCTION_KEY_LETTER_EVENT = /^\x1b\[1;(\d+)(?::([123]))?([PQRS])$/;
-const LABEL_FIELD_MAX_UTF16_CODE_UNITS = 80;
 const PATH_FIELD_MAX_CODEPOINTS = 2048;
-const LABEL_FIELD_PLACEHOLDER = "session name (required)";
-const WORKSPACE_FIELD_PLACEHOLDER = "workspace path (required)";
+const BRACKETED_PASTE_START = "\x1b[200~";
+const BRACKETED_PASTE_END = "\x1b[201~";
+const DEFAULT_FORM_HINTS = {
+  submit: "enter",
+  cancel: "esc",
+  complete: "tab",
+  clear: "ctrl+c",
+  externalEditor: "ctrl+g",
+};
 const ACTIVITY_LINES_MAX = 2;
 const ACTIVITY_INPUT_MAX_CODEPOINTS = 400;
 const ITEM_LABEL_INPUT_MAX_CODEPOINTS = 400;
@@ -353,17 +404,6 @@ function sanitizeCellText(value: unknown): string {
     index += char.length;
   }
   return out;
-}
-
-/** Longest suffix of text that could become the start of marker next packet. */
-function markerPrefixSuffixLength(text: string, marker: string): number {
-  const max = Math.min(text.length, marker.length - 1);
-  for (let length = max; length > 0; length -= 1) {
-    if (marker.startsWith(text.slice(-length))) {
-      return length;
-    }
-  }
-  return 0;
 }
 
 /** Sanitizes and bounds a string by code points. */
@@ -655,6 +695,12 @@ function copyItem(item: SidebarItem): SidebarItem {
     pendingInput: item.pendingInput,
     inputSurface: item.inputSurface,
     activity: Array.isArray(item.activity) ? [...item.activity] : [],
+    ...(item.nativeSession === null ? { nativeSession: null }
+      : item.nativeSession && isValidNativeSessionId(item.nativeSession.sessionId)
+        && Number.isSafeInteger(item.nativeSession.epoch) && item.nativeSession.epoch > 0
+        && isValidRenameName(item.nativeSession.name)
+        ? { nativeSession: { ...item.nativeSession } }
+        : {}),
     ...(typeof item.exitCode === "number" ? { exitCode: item.exitCode } : {}),
   };
 }
@@ -667,50 +713,53 @@ function assertPaneDimension(value: number, max: number, label: "cols" | "rows")
   }
 }
 
-/** Prompt gutter width owned by the sidebar, not by the public Input widget. */
-const PREFIELD_WIDTH = 13;
-
-interface FieldSnapshot {
-  readonly value: string;
+function markerSuffixLength(value: string, marker: string): number {
+  const limit = Math.min(value.length, marker.length - 1);
+  for (let length = limit; length > 0; length -= 1) {
+    if (value.endsWith(marker.slice(0, length))) return length;
+  }
+  return 0;
 }
-
-/** Bracketed paste markers accumulated by the sidebar before public Input. */
-const BRACKETED_PASTE_START = "\x1b[200~";
-const BRACKETED_PASTE_END = "\x1b[201~";
-/** Total streamed bytes allowed per bracketed paste accumulation. */
-const MAX_PASTE_BYTES = 8192;
 
 export class SidebarController {
   private readonly toggleKey: string;
   private readonly toggleLabel: string;
   private readonly onAction?: (action: SidebarAction) => void;
-  private readonly labelInput: Input;
-  private readonly workspaceInput: Input;
+  private readonly onInvalidate?: () => void;
+  private readonly workspaceBasePath: string;
+  private readonly createTextField?: SidebarControllerOptions["createTextField"];
+  private formField?: SessionHostTextField;
+  private formMatchesCancel: (data: string) => boolean = (data) => matchesKey(data, "escape");
+  private formPasteActive = false;
+  private formPasteCarry = "";
+  private formHints = DEFAULT_FORM_HINTS;
+  private formNotice: string | undefined;
+  private formGeneration = 0;
+  private formKind: "new" | "edit" | undefined;
+  private editTarget?: { readonly id: string; readonly nativeSession: SessionHostNativeSession; readonly currentName: string };
+  private workspaceDraft: string;
+  private editDraft = "";
   private rowStore: SidebarItem[] = [];
   private entries: SidebarEntry[] = [];
   private selectedEntryKey: string | undefined = ENTRY_NEW_KEY;
   private desiredSelectionId: string | undefined;
   private _visible: boolean;
   private _focus: SidebarFocus = "main";
-  private formFieldIndex = 0;
   private pendingCreate: { readonly requestId: number } | undefined;
+  private pendingRename: { readonly requestId: number } | undefined;
   private formError: string | undefined;
   private noticeError: string | undefined;
   private nextRequestId = 1;
   private listTop = 0;
-  /** Bounded frontend-owned paste accumulator; raw data never reaches Input. */
-  private formPasteBuffer: string[] | undefined;
-  private formPasteBytes = 0;
-  private formPasteOverflow = false;
-  private formPasteEndCarry = "";
-  private formPasteStartCarry = "";
-  private formPasteSnapshot: FieldSnapshot | undefined;
 
   constructor(options: SidebarControllerOptions = {}) {
     this.toggleKey = normalizeToggleKey(options.toggleKey);
     this.toggleLabel = toggleDisplayName(this.toggleKey);
     this.onAction = options.onAction;
+    this.onInvalidate = options.onInvalidate;
     this._visible = options.initialVisible ?? true;
+    this.workspaceBasePath = resolve(options.workspaceBasePath ?? "/");
+    this.createTextField = options.createTextField;
 
     const suggestedWorkspace = sanitizeCellText(options.initialWorkspace ?? "");
     if (countCodePoints(suggestedWorkspace) > PATH_FIELD_MAX_CODEPOINTS) {
@@ -718,21 +767,12 @@ export class SidebarController {
         `initialWorkspace exceeds the ${PATH_FIELD_MAX_CODEPOINTS}-character limit`,
       );
     }
-    // Each field is the public pinned Input API. The sidebar renders its own
-    // label gutter; Input owns grapheme-safe editing, caret scrolling and SGR.
-    this.labelInput = new Input({ prompt: "", placeholder: LABEL_FIELD_PLACEHOLDER });
-    this.workspaceInput = new Input({ prompt: "", placeholder: WORKSPACE_FIELD_PLACEHOLDER });
-    this.workspaceInput.setValue(suggestedWorkspace);
+    this.workspaceDraft = suggestedWorkspace;
     // A visible pane is an opened pane: the welcome picker (default) and a
     // supplied roster both take sidebar focus, while an explicitly hidden
     // start keeps main focus for native typing.
     this._focus = this._visible ? "sidebar" : "main";
     this.rebuildEntries();
-    this.labelInput.onSubmit = () => this.advanceField();
-    this.workspaceInput.onSubmit = () => this.submitForm();
-    for (const field of [this.labelInput, this.workspaceInput]) {
-      field.onEscape = () => this.escapeFromForm();
-    }
   }
 
   /** Whether the sidebar pane is currently shown at all. */
@@ -805,8 +845,15 @@ export class SidebarController {
       throw new Error("SidebarController.select expects a nonempty string id");
     }
     // A newer backend selection supersedes this request's UI ownership,
-    // not the native launch. Preserve the draft and current focus.
-    this.pendingCreate = undefined;
+    // not the native launch. Preserve the draft and current focus. The native
+    // Editor field is one-shot after submit, so reopen it for a real retry.
+    if (this.pendingCreate !== undefined) {
+      this.pendingCreate = undefined;
+      if (this.formKind === "new") {
+        this.workspaceDraft = this.formField?.getValue() ?? this.workspaceDraft;
+        this.createFormField(this.workspaceDraft);
+      }
+    }
     const entry = this.findItemEntry(id);
     if (entry !== undefined) {
       this.selectedEntryKey = entry.key;
@@ -830,7 +877,9 @@ export class SidebarController {
       return; // stale callback: ignore entirely, no contamination
     }
     this.pendingCreate = undefined;
-    this.formFieldIndex = 0;
+    if (this.formKind === "new" && this.formField) this.workspaceDraft = this.formField.getValue();
+    this.disposeFormField();
+    this.formKind = undefined;
     this.formError = undefined;
     if (this._focus === "form") {
       this.acceptCompletedRow(id);
@@ -849,6 +898,62 @@ export class SidebarController {
     }
     this.pendingCreate = undefined;
     this.formError = sanitizeBounded(message, ERROR_TEXT_MAX_CODEPOINTS);
+    if (this.formKind === "new") {
+      if (this.formField) this.workspaceDraft = this.formField.getValue();
+      this.disposeFormField();
+      this.createFormField(this.workspaceDraft);
+    }
+  }
+
+  /** Open Edit for the exact observed native conversation, without selecting it. */
+  openEdit(target: { readonly id: string; readonly nativeSession: SessionHostNativeSession; readonly currentName: string }): boolean {
+    if (!this._visible || this._focus !== "sidebar" || !target.id || !target.nativeSession
+      || !isValidNativeSessionId(target.nativeSession.sessionId)
+      || !Number.isSafeInteger(target.nativeSession.epoch) || target.nativeSession.epoch < 1
+      || !isValidRenameName(target.nativeSession.name)) return false;
+    this.disposeFormField();
+    this.pendingCreate = undefined;
+    this.pendingRename = undefined;
+    this.formKind = "edit";
+    this.editTarget = {
+      id: target.id,
+      nativeSession: { ...target.nativeSession },
+      currentName: sanitizeBounded(target.currentName, 256),
+    };
+    this.editDraft = "";
+    this.formError = undefined;
+    this.noticeError = undefined;
+    this._focus = "form";
+    this.createFormField(this.editDraft);
+    return this.formField !== undefined;
+  }
+
+  /** Complete one rename only while that request still owns the open form. */
+  completeRename(requestId: number, status: string): void {
+    if (this.pendingRename?.requestId !== requestId || this.formKind !== "edit") return;
+    this.pendingRename = undefined;
+    if (this.formField) this.editDraft = this.formField.getValue();
+    this.disposeFormField();
+    if (status === "renamed") {
+      this.formKind = undefined;
+      this.editTarget = undefined;
+      this.formError = undefined;
+      this._focus = "sidebar";
+      this.noticeError = undefined;
+      return;
+    }
+    this.formError = renameFailureNotice(status);
+    this.createFormField(this.editDraft);
+  }
+
+  /** Shows a bounded error when Main rejects an edit before broker admission. */
+  failRename(requestId: number, message: string): void {
+    if (this.pendingRename?.requestId !== requestId || this.formKind !== "edit") return;
+    this.pendingRename = undefined;
+    if (this.formField) this.editDraft = this.formField.getValue();
+    this.disposeFormField();
+    this.formError = sanitizeBounded(message, ERROR_TEXT_MAX_CODEPOINTS);
+    this.createFormField(this.editDraft);
   }
 
   private acceptCompletedRow(id: string): void {
@@ -1014,6 +1119,10 @@ export class SidebarController {
       return;
     }
     const printable = printableOf(data);
+    if (printable === "e" || printable === "E") {
+      this.editSelectedEntry();
+      return;
+    }
     if (printable === "q" || printable === "Q") {
       // Menu `q` is the same explicit Quit action as the Quit host row.
       this.activateQuit();
@@ -1055,11 +1164,25 @@ export class SidebarController {
       return;
     }
     if (entry.kind === "new") {
-      this.formFieldIndex = 0;
-      this._focus = "form";
+      this.openNewForm();
       return;
     }
     this.activateQuit();
+  }
+
+  private editSelectedEntry(): void {
+    const entry = this.currentEntry();
+    if (entry?.kind !== "item" || !entry.item) {
+      this.noticeError = "Select a session row to edit its native name";
+      return;
+    }
+    const nativeSession = entry.item.nativeSession;
+    if (!nativeSession) {
+      this.noticeError = "Native conversation name is unavailable until status is observed";
+      return;
+    }
+    this.noticeError = undefined;
+    this.emit({ type: "edit", id: entry.item.id, nativeSession: { ...nativeSession } });
   }
 
   /** Requests backend removal by the selected row's stable host-owned id. */
@@ -1090,220 +1213,178 @@ export class SidebarController {
     this.emit({ type: "quit" });
   }
 
-  // --- Form focus: three fields via the real Input class. ---
+  // --- Forms use the real public Editor adapter for every editable value. ---
 
   private handleFormInput(data: string): void {
-    const parsingPaste = this.formPasteBuffer !== undefined;
-    if (!parsingPaste) {
-      if (
-        this.handleReservedToggle(data, () => {
-          // Abandon UI ownership only; a native launch already handed to the
-          // backend is never stopped and callbacks become stale.
-          this.pendingCreate = undefined;
-          this.resetFormPaste();
-        })
-      ) {
-        return;
+    if (this.routeBracketedPaste(data)) {
+      this.formField?.handleInput(data);
+      return;
+    }
+    if (this.handleReservedToggle(data, () => this.abandonForm())) return;
+    if (isKeyRelease(data)) return;
+    if (this.pendingCreate || this.pendingRename) {
+      if (this.formMatchesCancel(data)) this.escapeFromForm();
+      return;
+    }
+    if (this.formField) this.formField.handleInput(data);
+    else if (matchesKey(data, "escape")) this.escapeFromForm();
+  }
+
+  /** Keep bracketed-paste chunks opaque to host actions; the native Editor still owns their contents. */
+  private routeBracketedPaste(data: string): boolean {
+    let owned = this.formPasteActive;
+    let combined = this.formPasteCarry + data;
+    this.formPasteCarry = "";
+
+    for (;;) {
+      const marker = this.formPasteActive ? BRACKETED_PASTE_END : BRACKETED_PASTE_START;
+      const index = combined.indexOf(marker);
+      if (index < 0) {
+        const suffixLength = markerSuffixLength(combined, marker);
+        this.formPasteCarry = suffixLength === 0 ? "" : combined.slice(-suffixLength);
+        if (combined === "\x1b" && !owned) return false;
+        return owned || suffixLength > 0;
       }
-      if (isKeyRelease(data)) {
-        return;
-      }
-    }
-    this.feedFormField(data);
-  }
-
-  /**
-   * Parses bracketed paste framing before data reaches the real Input. Raw
-   * paste bytes are accumulated only up to MAX_PASTE_BYTES, sanitized as a
-   * complete string (so split terminal sequences are removed), then delivered
-   * to Input as one safe paste. Normal key packets still use Input directly.
-   */
-  private feedFormField(data: string): void {
-    const field = this.activeField();
-    if (this.formPasteBuffer !== undefined) {
-      this.consumeFormPaste(data, field);
-      return;
-    }
-    const before = { value: field.getValue() };
-    this.feedOutsidePaste(data, field, before);
-  }
-
-  private feedOutsidePaste(data: string, field: Input, before: FieldSnapshot): void {
-    // Escape is an immediate form cancel, not an incomplete paste prefix.
-    if (this.formPasteStartCarry.length === 0 && matchesKey(data, "escape")) {
-      field.handleInput(data);
-      return;
-    }
-    const combined = this.formPasteStartCarry + data;
-    this.formPasteStartCarry = "";
-    const startIndex = combined.indexOf(BRACKETED_PASTE_START);
-    if (startIndex >= 0) {
-      const prefix = combined.slice(0, startIndex);
-      if (prefix.length > 0) {
-        field.handleInput(prefix);
-        this.enforceFieldLimit(field, before);
-      }
-      this.formPasteBuffer = [];
-      this.formPasteBytes = 0;
-      this.formPasteOverflow = false;
-      this.formPasteEndCarry = "";
-      this.formPasteSnapshot = { value: field.getValue() };
-      this.consumeFormPaste(combined.slice(startIndex + BRACKETED_PASTE_START.length), field);
-      return;
-    }
-    const carryLength = markerPrefixSuffixLength(combined, BRACKETED_PASTE_START);
-    const ordinary = combined.slice(0, combined.length - carryLength);
-    this.formPasteStartCarry = combined.slice(combined.length - carryLength);
-    if (ordinary.length > 0) {
-      field.handleInput(ordinary);
-    }
-    this.enforceFieldLimit(field, before);
-  }
-
-  private consumeFormPaste(data: string, field: Input): void {
-    const combined = this.formPasteEndCarry + data;
-    const endIndex = combined.indexOf(BRACKETED_PASTE_END);
-    const body = endIndex >= 0 ? combined.slice(0, endIndex) : combined;
-    const carryLength = endIndex >= 0 ? 0 : markerPrefixSuffixLength(body, BRACKETED_PASTE_END);
-    this.appendPasteBytes(body.slice(0, body.length - carryLength));
-    this.formPasteEndCarry = endIndex >= 0 ? "" : body.slice(body.length - carryLength);
-    if (endIndex < 0) {
-      return;
-    }
-
-    const remainder = combined.slice(endIndex + BRACKETED_PASTE_END.length);
-    const before = this.formPasteSnapshot ?? { value: field.getValue() };
-    if (this.formPasteOverflow) {
-      this.formError = `Paste exceeds ${MAX_PASTE_BYTES} bytes`;
-    } else {
-      const safePaste = sanitizeCellText((this.formPasteBuffer ?? []).join(""));
-      field.handleInput(`${BRACKETED_PASTE_START}${safePaste}${BRACKETED_PASTE_END}`);
-      this.enforceFieldLimit(field, before);
-    }
-    this.clearPasteState();
-    if (remainder.length > 0) {
-      const freshBefore = { value: field.getValue() };
-      this.feedOutsidePaste(remainder, field, freshBefore);
+      owned = true;
+      this.formPasteActive = !this.formPasteActive;
+      combined = combined.slice(index + marker.length);
     }
   }
 
-  private appendPasteBytes(text: string): void {
-    if (this.formPasteOverflow || text.length === 0) {
-      return;
-    }
-    const buffer = this.formPasteBuffer;
-    if (buffer === undefined) {
-      return;
-    }
-    for (const char of text) {
-      const code = char.codePointAt(0) ?? 0;
-      const bytes = code <= 0x7f ? 1 : code <= 0x7ff ? 2 : code <= 0xffff ? 3 : 4;
-      if (this.formPasteBytes + bytes > MAX_PASTE_BYTES) {
-        this.formPasteOverflow = true;
-        return;
-      }
-      buffer.push(char);
-      this.formPasteBytes += bytes;
-    }
+
+
+
+  private openNewForm(): void {
+    this.disposeFormField();
+    this.formKind = "new";
+    this.editTarget = undefined;
+    this.pendingCreate = undefined;
+    this.pendingRename = undefined;
+    this.formError = undefined;
+    this._focus = "form";
+    this.createFormField(this.workspaceDraft);
   }
 
-  private clearPasteState(): void {
-    this.formPasteBuffer = undefined;
-    this.formPasteBytes = 0;
-    this.formPasteOverflow = false;
-    this.formPasteEndCarry = "";
-    this.formPasteStartCarry = "";
-    this.formPasteSnapshot = undefined;
-  }
-
-  private resetFormPaste(): void {
-    // The sidebar parser owns all streamed paste state; Input only receives a
-    // complete sanitized bracketed paste through its public handleInput API.
-    this.clearPasteState();
-  }
-
-  /**
-   * Rolls back an over-limit edit through public Input APIs. Input.setValue
-   * preserves/clamps its own post-edit caret; the SDK exposes no public way to
-   * restore the exact pre-edit caret without reaching into private state.
-   */
-  private enforceFieldLimit(field: Input, before: FieldSnapshot): void {
-    const fieldMax = field === this.labelInput
-      ? LABEL_FIELD_MAX_UTF16_CODE_UNITS
-      : PATH_FIELD_MAX_CODEPOINTS;
-    const value = field.getValue();
-    const length = field === this.labelInput ? value.length : countCodePoints(value);
-    if (length > fieldMax) {
-      field.setValue(before.value);
-      this.formFieldError(fieldMax);
+  private createFormField(initialText: string): void {
+    this.disposeFormField();
+    const kind = this.formKind === "edit" ? "name" : "path";
+    const generation = this.formGeneration;
+    const fieldOptions: SidebarFieldFactoryOptions = {
+      kind,
+      initialText,
+      onInvalidate: () => {
+        if (generation === this.formGeneration) this.onInvalidate?.();
+      },
+      onSubmit: (submission) => {
+        if (generation !== this.formGeneration) return;
+        if (this.formKind === "edit") this.submitRename(submission);
+        else if (this.formKind === "new") this.submitCreate(submission);
+      },
+      onCancel: () => {
+        if (generation === this.formGeneration) this.escapeFromForm();
+      },
+      onReject: (reason) => {
+        if (generation === this.formGeneration) {
+          this.formError = fieldRejectionNotice(reason);
+          this.onInvalidate?.();
+        }
+      },
+    };
+    try {
+      const created: SidebarFieldFactoryResult = this.createTextField
+        ? this.createTextField(fieldOptions)
+        : {
+          field: kind === "path"
+            ? createSessionHostTextField({
+              kind: "path", initialText, workspaceBasePath: this.workspaceBasePath,
+              onInvalidate: fieldOptions.onInvalidate, onSubmit: fieldOptions.onSubmit,
+              onCancel: fieldOptions.onCancel, onReject: fieldOptions.onReject,
+            })
+            : createSessionHostTextField({
+              kind: "name", initialText, onInvalidate: fieldOptions.onInvalidate,
+              onSubmit: fieldOptions.onSubmit, onCancel: fieldOptions.onCancel,
+              onReject: fieldOptions.onReject,
+            }),
+        };
+      this.formField = created.field;
+      this.formMatchesCancel = created.matchesCancel ?? ((data) => matchesKey(data, "escape"));
+      this.formHints = created.hints ?? DEFAULT_FORM_HINTS;
+      this.formNotice = created.notice
+        ? sanitizeBounded(created.notice, ERROR_TEXT_MAX_CODEPOINTS)
+        : undefined;
+    } catch {
+      this.formField = undefined;
+      this.formError = "Session host field could not be opened";
     }
+    this.onInvalidate?.();
   }
 
-  private activeField(): Input {
-    return this.formFieldIndex === 0 ? this.labelInput : this.workspaceInput;
+  private disposeFormField(): void {
+    this.formGeneration += 1;
+    try { this.formField?.dispose(); } catch { /* independent field cleanup */ }
+    this.formField = undefined;
+    this.formMatchesCancel = (data) => matchesKey(data, "escape");
+    this.formPasteActive = false;
+    this.formPasteCarry = "";
+    this.formHints = DEFAULT_FORM_HINTS;
+    this.formNotice = undefined;
   }
 
-  private formFieldError(max: number): void {
-    this.formError =
-      max === LABEL_FIELD_MAX_UTF16_CODE_UNITS
-        ? `Label exceeds ${LABEL_FIELD_MAX_UTF16_CODE_UNITS} UTF-16 code units`
-        : `Path exceeds ${PATH_FIELD_MAX_CODEPOINTS} characters`;
-  }
-
-  private advanceField(): void {
-    if (this.formFieldIndex < 1) {
-      this.formFieldIndex += 1;
-    }
-  }
-
-  private submitForm(): void {
-    if (this.pendingCreate !== undefined) {
-      // Starting state: duplicate Enter is disabled until the backend
-      // completes or fails the request.
-      return;
-    }
-    const label = sanitizeCellText(this.labelInput.getValue());
-    const workspace = sanitizeCellText(this.workspaceInput.getValue());
-    if (label.length === 0) {
-      this.formFieldIndex = 0;
-      this.formError = "Label is required";
-      return;
-    }
+  private submitCreate(submission: SessionHostFieldSubmission): void {
+    if (this.pendingCreate || this.formKind !== "new") return;
+    const workspace = submission.value;
     if (workspace.length === 0) {
-      this.formFieldIndex = 1;
       this.formError = "Workspace is required";
+      this.workspaceDraft = "";
+      this.createFormField("");
       return;
     }
-    if (label.length > LABEL_FIELD_MAX_UTF16_CODE_UNITS) {
-      this.formFieldError(LABEL_FIELD_MAX_UTF16_CODE_UNITS);
+    if (sanitizeCellText(workspace) !== workspace || countCodePoints(workspace) > PATH_FIELD_MAX_CODEPOINTS) {
+      this.formError = `Path exceeds ${PATH_FIELD_MAX_CODEPOINTS} characters or contains unsafe text`;
+      this.workspaceDraft = this.formField?.getValue() ?? "";
+      this.createFormField(this.workspaceDraft);
       return;
     }
-    if (countCodePoints(workspace) > PATH_FIELD_MAX_CODEPOINTS) {
-      this.formFieldError(PATH_FIELD_MAX_CODEPOINTS);
-      return;
-    }
-    const requestId = this.nextRequestId;
-    this.nextRequestId += 1;
+    this.workspaceDraft = workspace;
+    const requestId = this.nextRequestId++;
     this.pendingCreate = { requestId };
     this.formError = undefined;
-    const action: SidebarAction = {
-      type: "create",
-      requestId,
-      label,
-      workspace,
-    };
-    this.emit(action);
+    this.emit({ type: "create", requestId, workspace });
   }
 
-  /**
-   * Escape inside the form (including Ctrl+C via the real Input cancel
-   * binding) abandons only the UI request — a launch already handed to the
-   * backend is never killed from here — and hides the pane. Entered field
-   * drafts are preserved.
-   */
+  private submitRename(submission: SessionHostFieldSubmission): void {
+    if (this.pendingRename || this.formKind !== "edit" || !this.editTarget) return;
+    const name = submission.value;
+    if (!isValidRenameName(name)) {
+      this.formError = submission.value.length === 0 ? "New name is required" : "New name must be valid and at most 1024 UTF-8 bytes";
+      this.editDraft = name;
+      this.createFormField(name);
+      return;
+    }
+    const requestId = this.nextRequestId++;
+    this.pendingRename = { requestId };
+    this.editDraft = name;
+    this.formError = undefined;
+    this.emit({
+      type: "rename", requestId, id: this.editTarget.id,
+      expectedSessionId: this.editTarget.nativeSession.sessionId,
+      expectedSessionEpoch: this.editTarget.nativeSession.epoch, name,
+    });
+  }
+
   private escapeFromForm(): void {
-    this.pendingCreate = undefined;
+    this.abandonForm();
     this.hide();
+  }
+
+  private abandonForm(): void {
+    if (this.formKind === "new" && this.formField) this.workspaceDraft = this.formField.getValue();
+    if (this.formKind === "edit" && this.formField) this.editDraft = this.formField.getValue();
+    this.pendingCreate = undefined;
+    this.pendingRename = undefined;
+    this.disposeFormField();
+    this.formKind = undefined;
+    this.editTarget = undefined;
   }
 
   // --- Confirm focus: explicit quit confirmation. ---
@@ -1405,6 +1486,7 @@ export class SidebarController {
       [
         `${this.toggleLabel} toggle`,
         "enter open",
+        ...(this._focus === "sidebar" ? ["e edit name"] : []),
         ...(this._focus === "sidebar"
           ? [this.toggleKey === "delete" ? "x remove exited" : "delete remove exited"]
           : []),
@@ -1476,7 +1558,7 @@ export class SidebarController {
     let text: string;
     if (entry.kind === "item" && entry.item !== undefined) {
       const item = entry.item;
-      const label = sanitizeBounded(item.label, ITEM_LABEL_INPUT_MAX_CODEPOINTS);
+      const label = sanitizeBounded(item.nativeSession?.name ?? item.label, ITEM_LABEL_INPUT_MAX_CODEPOINTS);
       const badges = rowBadges(item);
       const labelWidth = Math.max(0, cols - visibleWidth(marker) - visibleWidth(badges));
       const visibleLabel = labelWidth > 0 ? truncateToWidth(label, labelWidth, "...") : "";
@@ -1493,53 +1575,59 @@ export class SidebarController {
     cols: number,
     rows: number,
   ): { lines: string[]; cursor?: { column: number; row: number } } {
-    const header = " New session ";
-    const footerLines = wrapHintLines(["enter next/submit", "esc toggle-cancel"], cols);
-    if (footerLines === undefined || visibleWidth(header) > cols) {
+    const editing = this.formKind === "edit";
+    const header = editing ? " Edit native session name " : " New session ";
+    const hints = editing
+      ? [`${this.formHints.submit} save`, `${this.formHints.cancel} cancel`, `${this.formHints.clear} clear`, `${this.formHints.externalEditor} external editor`]
+      : [`${this.formHints.submit} create`, `${this.formHints.cancel} cancel`, `${this.formHints.complete} complete`, `${this.formHints.clear} clear`, `${this.formHints.externalEditor} external editor`];
+    const footerLines = wrapHintLines(hints, cols);
+    const noticeLines = this.formNotice === undefined
+      ? []
+      : wrapHintLines([`! ${this.formNotice}`], cols);
+    if (footerLines === undefined || noticeLines === undefined || visibleWidth(header) > cols || !this.formField) {
       return this.renderTooSmall(cols, rows);
     }
-    // header + 2 fields + reserved status row + wrapped footer
-    if (rows < 1 + 2 + 1 + footerLines.length) {
-      return this.renderTooSmall(cols, rows);
-    }
-    const fieldContentWidth = Math.max(cols - PREFIELD_WIDTH, 1);
-    const prompts = [" Label:     ", " Workspace: "];
-    const inputs = [this.labelInput, this.workspaceInput];
+    const fixedRows = 1 + (editing ? 2 : 0) + 1 + 1 + noticeLines.length + footerLines.length;
+    const fieldRows = rows - fixedRows;
+    if (fieldRows < 1) return this.renderTooSmall(cols, rows);
+
+    const prefix = editing ? "> New name: " : "> Workspace: ";
+    const prefixWidth = Math.min(visibleWidth(prefix), cols - 1);
+    const fieldWidth = Math.max(1, cols - prefixWidth);
+    const fieldFrame = this.formField.render(fieldWidth, fieldRows);
+    if (!fieldFrame.cursor.visible || fieldFrame.lines.length === 0) return this.renderTooSmall(cols, rows);
+
     const lines = [wrapRow(header, cols, "\x1b[1m")];
-    let caretColumn = PREFIELD_WIDTH;
-    for (let index = 0; index < inputs.length; index += 1) {
-      const marker = index === this.formFieldIndex ? ">" : " ";
-      const rendered = renderFieldValue(
-        inputs[index],
-        fieldContentWidth,
-        index === this.formFieldIndex,
-      );
-      lines.push(
-        `\x1b[0m${truncateToWidth(`${marker}${prompts[index]}${rendered.line}`, cols, "", true)}\x1b[0m`,
-      );
-      if (index === this.formFieldIndex) {
-        caretColumn = PREFIELD_WIDTH + rendered.caretColumn;
-      }
+    if (editing) {
+      lines.push(wrapRow(" Current name (display only; type a complete replacement): ", cols));
+      const currentName = sanitizeBounded(this.editTarget?.currentName ?? "", 256);
+      lines.push(wrapRow(truncateToWidth(currentName, cols, "...", true), cols));
     }
-    // The status row is always reserved so an error can never shrink the pane
-    // into a too-small fallback after it appeared.
+    const fieldTopRow = lines.length;
+    const fieldRowsToShow = Math.min(fieldRows, fieldFrame.lines.length);
+    for (let index = 0; index < fieldRowsToShow; index += 1) {
+      const source = fieldFrame.lines[index] ?? "";
+      const positionedSource = index === 0 ? `${prefix}${source}` : `${" ".repeat(prefixWidth)}${source}`;
+      lines.push(wrapRow(positionedSource, cols));
+    }
     lines.push(
       this.pendingCreate !== undefined
         ? wrapRow(` Starting (request ${this.pendingCreate.requestId}) `, cols)
-        : this.formError !== undefined
-          ? wrapRow(` ! ${this.formError} `, cols)
-          : "",
+        : this.pendingRename !== undefined
+          ? wrapRow(" Saving native name... ", cols)
+          : this.formError !== undefined
+            ? wrapRow(` ! ${this.formError} `, cols)
+            : "",
     );
+    for (const noticeLine of noticeLines) lines.push(wrapRow(noticeLine, cols));
     lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
-    for (const footerLine of footerLines) {
-      lines.push(wrapRow(footerLine, cols));
-    }
+    for (const footerLine of footerLines) lines.push(wrapRow(footerLine, cols));
 
     return {
       lines,
       cursor: {
-        column: Math.min(Math.max(caretColumn, PREFIELD_WIDTH), cols - 1),
-        row: 1 + this.formFieldIndex,
+        column: Math.min(prefixWidth + fieldFrame.cursor.column, cols - 1),
+        row: fieldTopRow + fieldFrame.cursor.row,
       },
     };
   }
@@ -1570,40 +1658,6 @@ export class SidebarController {
   }
 }
 
-interface RenderedFieldValue {
-  /** Public Input-rendered field line without its hardware cursor marker. */
-  readonly line: string;
-  /** Caret's visible column relative to the content window start. */
-  readonly caretColumn: number;
-}
-
-/**
- * Uses the public pinned Input renderer for grapheme-safe scrolling and its
- * cursor placement. Values are sanitized before render, then the public
- * CURSOR_MARKER is consumed into the sidebar cursor DTO and never returned in
- * pane text. Input's own inverse SGR is generated by the SDK, not user text.
- */
-function renderFieldValue(
-  input: Input,
-  contentWidth: number,
-  focused: boolean,
-): RenderedFieldValue {
-  const currentValue = input.getValue();
-  const safeValue = sanitizeCellText(currentValue);
-  if (safeValue !== currentValue) {
-    input.setValue(safeValue);
-  }
-  input.focused = focused;
-  const rendered = input.render(contentWidth)[0] ?? "";
-  const markerIndex = rendered.indexOf(CURSOR_MARKER);
-  const caretColumn =
-    markerIndex < 0 ? 0 : visibleWidth(rendered.slice(0, markerIndex));
-  return {
-    line: rendered.split(CURSOR_MARKER).join(""),
-    caretColumn,
-  };
-}
-
 function renderActivityLines(activity: readonly string[], cols: number): string[] {
   return activity
     .map((line) => sanitizeCellText(line))
@@ -1612,4 +1666,30 @@ function renderActivityLines(activity: readonly string[], cols: number): string[
     .map((line) =>
       wrapRow(`   ${sanitizeBounded(line, ACTIVITY_INPUT_MAX_CODEPOINTS)}`, cols),
     );
+}
+
+function fieldRejectionNotice(reason: SessionHostFieldRejection): string {
+  switch (reason) {
+    case "unsafe-text": return "Unsafe terminal text was rejected";
+    case "text-limit": return "Field value exceeds its limit";
+    case "paste-limit": return "Pasted text exceeds the field limit";
+    case "input-chunk-limit": return "Input chunk exceeds the field limit";
+    case "completion-limit": return "Native completion exceeds the field limit";
+    case "external-editor-failed": return "External editor did not complete; the field was not changed";
+  }
+}
+
+function renameFailureNotice(status: string): string {
+  switch (status) {
+    case "stale-session": return "Native conversation changed; reopen Edit before renaming";
+    case "unavailable": return "Native session rename is unavailable";
+    case "invalid-name": return "New name is invalid or exceeds 1024 UTF-8 bytes";
+    case "setter-failed": return "Pi could not persist the new session name";
+    case "verification-failed": return "Pi could not verify the persisted session name";
+    case "busy": return "Session name was not changed while Pi is busy";
+    case "timeout": return "Session rename timed out; verify the session name before retrying";
+    case "disconnected": return "Status connection closed; session name was not confirmed";
+    case "invalid-request": return "Session rename request was rejected";
+    default: return "Session name could not be changed";
+  }
 }

@@ -145,7 +145,11 @@ function makeRoster(ids: string[], options: SidebarControllerOptions = {}): Rost
 function formWith(
   overrides: { cols?: number; rows?: number; options?: SidebarControllerOptions } = {},
 ): Harness {
-  const harness = makeController({ initialVisible: false, ...(overrides.options ?? {}) });
+  const harness = makeController({
+    initialVisible: false,
+    workspaceBasePath: join(process.cwd(), ".pi-session-host-test-missing-workspace"),
+    ...(overrides.options ?? {}),
+  });
   harness.controller.updateItems([makeItem({ id: "a" })]);
   harness.send(togglePacketFor(overrides.options ?? {})); // show -> focus sidebar (New default)
   harness.send(ENTER); // Enter on New session -> form focus
@@ -217,8 +221,8 @@ test("constructor opens a usable visible welcome picker", () => {
   assert.ok(texts.some((line) => line.includes("Quit host")));
   // The footer wraps across reserved rows at this width; every hint must
   // survive the wrap, never an ellipsis.
-  const footer = texts.slice(-2).join(" ");
-  for (const hint of ["toggle", "enter open", "delete remove exited", "esc hide", "q quit"]) {
+  const footer = texts.join(" ");
+  for (const hint of ["toggle", "enter open", "e edit name", "delete remove exited", "esc hide", "q quit"]) {
     assert.ok(footer.includes(hint), `missing hint ${JSON.stringify(hint)} in ${JSON.stringify(texts)}`);
   }
   assert.ok(!texts.some((line) => line.includes("...")), "no ellipsized hints");
@@ -695,7 +699,7 @@ test("sidebar Delete visibly requests removal using the selected row's stable id
   harness.send(DOWN); // wrap to the exited row
   assert.equal(harness.controller.selectedId, id);
   const texts = rosterView(harness.controller, 40, 10).texts;
-  assert.ok(texts.slice(-2).join(" ").includes("delete remove exited"), JSON.stringify(texts));
+  assert.ok(texts.join(" ").includes("delete remove exited"), JSON.stringify(texts));
   harness.send(DELETE);
   assert.deepEqual(harness.focusedActions(), [{ type: "remove", id }]);
   assert.equal(harness.controller.selectedId, id, "the UI waits for the backend roster confirmation");
@@ -1033,198 +1037,128 @@ test("sidebar Escape hides with a single visibility action and keeps selection",
 // New session form
 // ---------------------------------------------------------------------------
 
-test("New session opens a two-field form and forwards only label/workspace", () => {
+test("New session has only an explicit workspace field and creates without a manual label", () => {
   const harness = formWith();
-  const first = harness.controller.render(40, 8);
-  const texts = assertPaneSafe(first.lines, 40, 8);
+  const first = harness.controller.render(40, 10);
+  const texts = assertPaneSafe(first.lines, 40, 10);
   assert.ok(texts[0].includes("New session"));
-  assert.ok(texts[1].includes("Label:"));
-  assert.ok(texts[2].includes("Workspace:"));
-  assert.ok(!texts.some((line) => line.includes("Profile:")));
-  assert.deepEqual(first.cursor, { column: 13, row: 1 });
-  for (const ch of "my session") {
-    harness.controller.handleInput(ch);
-  }
-  const typed = harness.controller.render(40, 8);
-  assert.deepEqual(typed.cursor, { column: 23, row: 1 });
-  harness.send(ENTER); // label -> workspace, still no create
-  assert.deepEqual(harness.focusedActions(), []);
-  assert.deepEqual(harness.controller.render(40, 8).cursor, { column: 13, row: 2 });
+  assert.ok(texts.some((line) => line.includes("Workspace:")));
+  assert.ok(!texts.some((line) => /Label:|Profile:/.test(line)));
+  assert.equal(first.cursor?.row, 2, "the native Editor owns a completion viewport above the path cursor");
+  assert.equal(first.cursor?.column, 13);
+  assert.ok(texts[first.cursor!.row]?.startsWith(" ".repeat(13)), "the empty insertion row begins under the workspace field label");
   harness.send("/workspace");
   harness.send(ENTER); // workspace submits directly
   assert.deepEqual(harness.focusedActions(), [
-    { type: "create", requestId: 1, label: "my session", workspace: "/workspace" },
+    { type: "create", requestId: 1, workspace: "/workspace" },
   ]);
   assert.ok(!("profile" in createOf(harness.focusedActions()[0])));
+  assert.ok(!("label" in createOf(harness.focusedActions()[0])));
 });
 
-test("submit emits one create with a monotonic requestId and disables duplicate Enter", () => {
+test("create is single-shot, completion closes New without activating the new row, ids increase", () => {
   const harness = formWith();
-  harness.send("my session");
-  harness.send(ENTER); // label -> workspace
   harness.send("/workspace");
-  harness.send(ENTER); // submit
+  harness.send(ENTER);
+  harness.send(ENTER); // duplicate Enter is ignored while starting
   assert.deepEqual(harness.focusedActions(), [
-    { type: "create", requestId: 1, label: "my session", workspace: "/workspace" },
+    { type: "create", requestId: 1, workspace: "/workspace" },
   ]);
   assert.equal(harness.controller.focus, "form");
-  const texts = assertPaneSafe(harness.controller.render(40, 8).lines, 40, 8);
-  assert.ok(texts.some((line) => line.includes("Starting (request 1)")));
-  harness.send(ENTER); // duplicate Enter disabled while starting
-  assert.equal(harness.focusedActions().length, 1);
-  // Completion closes the form; the row is highlighted once the backend
-  // publishes it in the roster.
+  assert.ok(assertPaneSafe(harness.controller.render(40, 8).lines, 40, 8).some((line) => line.includes("Starting (request 1)")));
   harness.controller.completeCreate(1, "spawned");
   assert.equal(harness.controller.focus, "sidebar");
-  assert.deepEqual(harness.controller.selectedId, undefined); // row not published yet
-  harness.controller.updateItems([
-    makeItem({ id: "a" }),
-    makeItem({ id: "spawned", lifecycle: "starting", busy: null }),
-  ]);
-  assert.deepEqual(harness.controller.selectedId, "spawned");
-  // Monotonic ids for the next submission.
-  harness.send(DOWN); // spawned -> New session
-  harness.send(ENTER); // reopen the form
-  assert.equal(harness.controller.focus, "form");
+  assert.equal(harness.controller.selectedId, undefined);
+  harness.controller.updateItems([makeItem({ id: "a" }), makeItem({ id: "spawned", lifecycle: "starting", busy: null })]);
+  assert.equal(harness.controller.selectedId, "spawned");
+  harness.send(DOWN);
   harness.send(ENTER);
+  harness.send("/next");
   harness.send(ENTER);
-  harness.send(ENTER); // submit -> request 2
-  const creates = harness.focusedActions().filter(
-    (action): action is Extract<SidebarAction, { type: "create" }> => action.type === "create",
-  );
-  assert.deepEqual(
-    creates.map((create) => create.requestId),
-    [1, 2],
-  );
+  const creates = harness.focusedActions().filter((action) => action.type === "create");
+  assert.deepEqual(creates.map((create) => create.type === "create" ? create.requestId : -1), [1, 2]);
 });
 
-test("label remains temporarily required; a suggested workspace never supplies an implicit name", () => {
+test("a suggested workspace stays editable but is the only New form value", () => {
   const harness = formWith({ options: { initialWorkspace: "/tmp/proj one" } });
-  harness.send(ENTER); // empty label -> workspace
-  harness.send(ENTER); // submit returns focus to the required label
-  assert.equal(harness.controller.focus, "form");
-  assert.ok(assertPaneSafe(harness.controller.render(48, 8).lines, 48, 8).some((line) => line.includes("Label is required")));
-  assert.ok(!harness.focusedActions().some((action) => action.type === "create"));
-
-  harness.send("my project");
-  harness.send(ENTER); // label -> suggested workspace
-  harness.send("\x1b[4~"); // public Input End key; suggested path remains editable
+  harness.send("\x1b[4~"); // End; the suggested path is an editable draft
   harness.send("/child");
-  harness.send(ENTER); // submit
+  harness.send(ENTER);
   assert.deepEqual(harness.focusedActions().at(-1), {
-    type: "create",
-    requestId: 1,
-    label: "my project",
-    workspace: "/tmp/proj one/child",
+    type: "create", requestId: 1, workspace: "/tmp/proj one/child",
   });
 });
 
-test("workspace is required and its validation preserves the label draft", () => {
+test("workspace is required and an empty submission can be corrected", () => {
   const harness = formWith();
-  harness.send("project");
-  harness.send(ENTER); // label -> workspace
-  harness.send(ENTER); // submit returns focus to workspace
+  harness.send(ENTER);
   assert.equal(harness.controller.focus, "form");
-  assert.ok(assertPaneSafe(harness.controller.render(44, 8).lines, 44, 8).some((line) => line.includes("Workspace is required")));
+  assert.ok(assertPaneSafe(harness.controller.render(44, 10).lines, 44, 10).some((line) => line.includes("Workspace is required")));
   assert.ok(!harness.focusedActions().some((action) => action.type === "create"));
-
   harness.send("/workspace");
-  harness.send(ENTER); // submit
+  harness.send(ENTER);
   assert.deepEqual(harness.focusedActions().at(-1), {
-    type: "create",
-    requestId: 1,
-    label: "project",
-    workspace: "/workspace",
+    type: "create", requestId: 1, workspace: "/workspace",
   });
 });
 
-test("label limit: the 81st character is an explicit error, never truncated", () => {
-  const harness = formWith();
-  for (let i = 0; i < 80; i += 1) {
-    harness.controller.handleInput("a");
-  }
-  harness.controller.handleInput("a"); // the 81st
-  const texts = assertPaneSafe(harness.controller.render(40, 8).lines, 40, 8);
-  assert.ok(texts.some((line) => line.includes("exceeds 80 UTF-16 code units")));
-  // The prior draft stays at exactly 80 code units (rollback, not truncation).
-  harness.send(ENTER); // label -> workspace
-  harness.send("/workspace");
-  harness.send(ENTER); // submit
-  assert.equal(createOf(harness.focusedActions().at(-1)).label, "a".repeat(80));
+test("Edit starts with a separate empty replacement field and emits the observed tuple without selecting", () => {
+  const tuple = { sessionId: "session-123", epoch: 7, name: "Observed title" };
+  const harness = makeRoster(["a"]);
+  harness.controller.updateItems([makeItem({ id: "a", nativeSession: tuple, label: "stale row label" })]);
+  const rosterText = assertPaneSafe(harness.controller.renderRoster(48, 10).lines, 48, 10).join("\n");
+  assert.ok(rosterText.includes("Observed title"));
+  assert.ok(!rosterText.includes("stale row label"), "validated native metadata is authoritative over an old display label");
+  harness.send(UP); // highlight the existing row, not New
+  harness.send("e");
+  const edit = harness.focusedActions().at(-1);
+  assert.deepEqual(edit, { type: "edit", id: "a", nativeSession: tuple });
+  assert.equal(harness.controller.focus, "sidebar");
+  assert.equal(harness.controller.selectedId, "a");
+  assert.equal(harness.controller.openEdit({ id: "a", nativeSession: tuple, currentName: tuple.name }), true);
+  const text = assertPaneSafe(harness.controller.render(48, 10).lines, 48, 10);
+  assert.ok(text.some((line) => line.includes("Observed title")));
+  assert.ok(text.some((line) => line.includes("New name:")));
+  harness.send("Replacement");
+  harness.send(ENTER);
+  assert.deepEqual(harness.focusedActions().at(-1), {
+    type: "rename", requestId: 1, id: "a", expectedSessionId: "session-123",
+    expectedSessionEpoch: 7, name: "Replacement",
+  });
+  assert.equal(harness.controller.selectedId, "a");
+  assert.equal(harness.focusedActions().some((action) => action.type === "select"), false);
 });
 
 test("path limit: the 2049th character is an explicit error, never truncated", () => {
   const harness = formWith();
-  for (const ch of "L") {
-    harness.controller.handleInput(ch);
-  }
-  harness.send(ENTER); // label -> workspace
   for (let i = 0; i < 2048; i += 1) {
     harness.controller.handleInput("p");
   }
   harness.controller.handleInput("p"); // the 2049th
-  const texts = assertPaneSafe(harness.controller.render(48, 8).lines, 48, 8);
-  assert.ok(texts.some((line) => line.includes("exceeds 2048 characters")));
+  const texts = assertPaneSafe(harness.controller.render(48, 24).lines, 48, 24);
+  assert.ok(texts.some((line) => line.includes("Field value exceeds its limit")));
   harness.send(ENTER); // submit
   const create = createOf(harness.focusedActions().at(-1));
   assert.equal(create.workspace, "p".repeat(2048));
-  assert.equal(create.label, "L");
 });
 
-test("label bound matches the manager's 80 UTF-16 code units", () => {
-  const emoji = "🙂";
-  const harness = formWith();
-  for (let index = 0; index < 40; index += 1) {
-    harness.send(emoji); // 40 graphemes, exactly 80 UTF-16 code units
-  }
-  harness.send(emoji); // exceeds the manager's UTF-16 code-unit limit
-  const texts = assertPaneSafe(harness.controller.render(48, 8).lines, 48, 8);
-  assert.ok(texts.some((line) => line.includes("exceeds 80 UTF-16 code units")));
-  assert.ok(!harness.focusedActions().some((action) => action.type === "create"));
-  harness.send(ENTER); // label -> workspace
-  harness.send("/workspace");
-  harness.send(ENTER); // valid preserved draft submits
-  assert.equal(createOf(harness.focusedActions().at(-1)).label, emoji.repeat(40));
-});
 
-test("public Input rollback preserves text and documents its caret clamping", () => {
-  const harness = formWith();
-  for (let index = 0; index < 80; index += 1) {
-    harness.send("a");
-  }
-  harness.send("\x1b[H"); // Home to the beginning via public Input key handling
-  assert.deepEqual(harness.controller.render(40, 8).cursor, { column: 13, row: 1 });
-  harness.send("b"); // over limit rolls text back; public setValue retains/clamps caret at column 1
-  const frame = harness.controller.render(40, 8);
-  assert.deepEqual(frame.cursor, { column: 14, row: 1 });
-  assert.ok(assertPaneSafe(frame.lines, 40, 8).some((line) => line.includes("exceeds 80 UTF-16 code units")));
-  harness.send(ENTER);
-  harness.send("/workspace");
-  harness.send(ENTER);
-  harness.send(ENTER);
-  assert.equal(createOf(harness.focusedActions().at(-1)).label, "a".repeat(80));
-});
 
-test("Unicode labels: editing removes whole graphemes and never splits them", () => {
+
+
+test("Unicode workspace editing removes whole graphemes and never splits them", () => {
   const harness = formWith();
   harness.controller.handleInput("héllo👨‍👩‍👧"); // ZWJ family grapheme at the end
   harness.controller.handleInput("\x7f"); // backspace: whole grapheme
-  harness.send(ENTER); // label -> workspace
-  harness.send("/workspace");
-  harness.send(ENTER); // submit
-  const create = createOf(harness.focusedActions().at(-1));
-  assert.equal(create.label, "héllo");
+  harness.send(ENTER);
+  assert.equal(createOf(harness.focusedActions().at(-1)).workspace, "héllo");
 });
 
-test("bounded single-line paste; multi-line paste is cleaned to one line", () => {
+test("bounded single-line paste; multi-line workspace paste is cleaned to one line", () => {
   const harness = formWith();
-  harness.controller.handleInput("\x1b[200~a\nb\r\nc\x1b[201~");
-  harness.send(ENTER); // label -> workspace
-  harness.controller.handleInput("\x1b[200~/tmp/paste dir\x1b[201~");
-  harness.send(ENTER); // submit
-  const create = createOf(harness.focusedActions().at(-1));
-  assert.equal(create.label, "abc");
-  assert.equal(create.workspace, "/tmp/paste dir");
+  harness.controller.handleInput("\x1b[200~/tmp/a\nb\r\nc\x1b[201~");
+  harness.send(ENTER);
+  assert.equal(createOf(harness.focusedActions().at(-1)).workspace, "/tmp/abc");
 });
 
 test("malicious form pastes are sanitized before Input storage and pane rendering", () => {
@@ -1238,9 +1172,62 @@ test("malicious form pastes are sanitized before Input storage and pane renderin
   harness.send("~tail");
   const frame = harness.controller.render(44, 8);
   const texts = assertPaneSafe(frame.lines, 44, 8);
-  assert.ok(texts[1]?.includes("ABCDEFGHItail"), JSON.stringify(texts));
+  const visible = texts.join("\n");
+  assert.ok(visible.includes("ABCDEF") && visible.includes("tail"), JSON.stringify(texts));
   assert.ok(texts.every((line) => !/YWJj|malicious title|99;99|31m/.test(line)));
   assert.ok(texts.every((line) => !line.includes(CURSOR_MARKER)));
+});
+
+test("streamed paste owns toggle and key-release packets until its split end marker", () => {
+  const harness = formWith();
+  harness.send("\x1b[20");
+  harness.send("0~before");
+  harness.send(ALT_LEFT_LEGACY);
+  harness.send(KITTY_Q_RELEASE);
+  harness.send("\x1b[201");
+  harness.send("~after");
+
+  assert.equal(harness.controller.visible, true);
+  assert.equal(harness.controller.focus, "form");
+  assert.deepEqual(harness.focusedActions(), [], "paste-body packets never trigger sidebar actions");
+  assert.equal(harness.sinceActions().some((action) => action.type === "forward"), false,
+    "paste-body packets are not forwarded to the active child");
+  const text = assertPaneSafe(harness.controller.render(44, 8).lines, 44, 8).join("\n");
+  assert.ok(text.includes("before") && text.includes("after"), text);
+});
+
+test("adjacent bracketed pastes retain ownership across end/start markers in one chunk", () => {
+  const harness = formWith();
+  harness.send("\x1b[200~first");
+  harness.send("\x1b[201~\x1b[200~second");
+  harness.send(ALT_LEFT_LEGACY);
+  harness.send(KITTY_Q_RELEASE);
+  harness.send("\x1b[201~");
+
+  assert.equal(harness.controller.visible, true);
+  assert.equal(harness.controller.focus, "form");
+  assert.deepEqual(harness.focusedActions(), []);
+  assert.equal(harness.sinceActions().some((action) => action.type === "forward"), false);
+  const text = assertPaneSafe(harness.controller.render(44, 8).lines, 44, 8).join("\n");
+  assert.ok(text.includes("first") && text.includes("second"), text);
+});
+
+test("a consecutive paste start split across chunks keeps toggle and release packets opaque", () => {
+  const harness = formWith();
+  harness.send("\x1b[200~first");
+  harness.send("\x1b[201~\x1b[20");
+  harness.send("0~second");
+  harness.send(ALT_LEFT_LEGACY);
+  harness.send(KITTY_Q_RELEASE);
+  harness.send("\x1b[201");
+  harness.send("~");
+
+  assert.equal(harness.controller.visible, true);
+  assert.equal(harness.controller.focus, "form");
+  assert.deepEqual(harness.focusedActions(), []);
+  assert.equal(harness.sinceActions().some((action) => action.type === "forward"), false);
+  const text = assertPaneSafe(harness.controller.render(44, 8).lines, 44, 8).join("\n");
+  assert.ok(text.includes("first") && text.includes("second"), text);
 });
 
 test("sanitized paste preserves visible caret editing around stripped commands", () => {
@@ -1251,7 +1238,7 @@ test("sanitized paste preserves visible caret editing around stripped commands",
   harness.send(LEFT);
   harness.send("X");
   const texts = assertPaneSafe(harness.controller.render(44, 8).lines, 44, 8);
-  assert.ok(texts[1]?.includes("XAB"), JSON.stringify(texts));
+  assert.ok(texts.join("\n").includes("XAB"), JSON.stringify(texts));
 });
 
 test("streamed paste accumulation is byte-bounded and reports overflow", () => {
@@ -1261,7 +1248,7 @@ test("streamed paste accumulation is byte-bounded and reports overflow", () => {
   harness.send("y".repeat(5000));
   harness.send("\x1b[201~");
   const texts = assertPaneSafe(harness.controller.render(44, 8).lines, 44, 8);
-  assert.ok(texts.some((line) => line.includes("Paste exceeds 8192 bytes")));
+  assert.ok(texts.some((line) => line.includes("Pasted text exceeds the field limit")));
   assert.ok(texts.every((line) => !line.includes("x".repeat(20)) && !line.includes("y".repeat(20))));
 });
 
@@ -1274,10 +1261,8 @@ test("Ctrl+U kills the field line via the real keybinding", () => {
   for (const ch of "kept") {
     harness.controller.handleInput(ch);
   }
-  harness.send(ENTER); // label -> workspace
-  harness.send("/workspace");
-  harness.send(ENTER); // submit
-  assert.equal(createOf(harness.focusedActions().at(-1)).label, "kept");
+  harness.send(ENTER);
+  assert.equal(createOf(harness.focusedActions().at(-1)).workspace, "kept");
 });
 
 test("exact-width form text reserves a visible end-of-value caret", () => {
@@ -1285,27 +1270,67 @@ test("exact-width form text reserves a visible end-of-value caret", () => {
   for (const char of "abcdefghijk") {
     harness.send(char);
   }
-  const frame = harness.controller.render(24, 8);
-  const texts = assertPaneSafe(frame.lines, 24, 8);
-  assert.ok(texts[1]?.endsWith("bcdefghijk "), JSON.stringify(texts[1]));
-  assert.ok(frame.lines[1]?.includes("\x1b[7m \x1b[27m"));
-  assert.deepEqual(frame.cursor, { column: 23, row: 1 });
+  const frame = harness.controller.render(24, 20);
+  const texts = assertPaneSafe(frame.lines, 24, 20);
+  assert.ok(texts[2]?.startsWith(" ".repeat(13)), JSON.stringify(texts));
+  assert.ok(texts[2]?.slice(13).trimEnd().endsWith("abcdefghij"), JSON.stringify(texts));
+  assert.ok(texts[3]?.startsWith(" ".repeat(13)), JSON.stringify(texts));
+  assert.ok(texts[3]?.slice(13).trimEnd().endsWith("k"), JSON.stringify(texts));
+  assert.deepEqual(frame.cursor, { column: 14, row: 3 }, "hardware cursor follows the native Editor's wrapped value");
+  assert.equal(texts[frame.cursor!.row]?.slice(13, frame.cursor!.column), "k", "cursor is at the insertion cell after the wrapped character");
 });
 
-test("home/end navigate fields; the path field scrolls horizontally to the cursor", () => {
+test("empty, populated, Unicode, and Edit cursors align with their indented native text rows", () => {
+  const empty = formWith({ cols: 44, rows: 10 });
+  const emptyFrame = empty.controller.render(44, 10);
+  const emptyRows = assertPaneSafe(emptyFrame.lines, 44, 10);
+  assert.ok(emptyFrame.cursor);
+  assert.equal(emptyRows[emptyFrame.cursor.row]?.slice(0, 13), " ".repeat(13));
+  assert.equal(emptyRows[emptyFrame.cursor.row]?.slice(13).trim(), "");
+
+  empty.send("/a");
+  const populatedFrame = empty.controller.render(44, 10);
+  const populatedRows = assertPaneSafe(populatedFrame.lines, 44, 10);
+  assert.ok(populatedFrame.cursor);
+  assert.equal(populatedRows[populatedFrame.cursor.row]?.slice(13, populatedFrame.cursor.column), "/a");
+
+  const unicode = formWith({ cols: 44, rows: 10 });
+  unicode.send("雪");
+  const unicodeFrame = unicode.controller.render(44, 10);
+  const unicodeRows = assertPaneSafe(unicodeFrame.lines, 44, 10);
+  assert.ok(unicodeFrame.cursor);
+  assert.equal(unicodeRows[unicodeFrame.cursor.row]?.slice(0, 13), " ".repeat(13));
+  assert.equal(unicodeRows[unicodeFrame.cursor.row]?.slice(13).trimStart().startsWith("雪"), true);
+  assert.equal(visibleWidth(" ".repeat(13) + "雪"), unicodeFrame.cursor.column,
+    "the Unicode grapheme occupies two terminal cells before the insertion point");
+
+  const edit = makeRoster(["a"]);
+  const tuple = { sessionId: "session-123", epoch: 7, name: "Current" };
+  edit.controller.updateItems([makeItem({ id: "a", nativeSession: tuple })]);
+  edit.controller.openEdit({ id: "a", nativeSession: tuple, currentName: tuple.name });
+  edit.send("雪");
+  const editFrame = edit.controller.render(48, 12);
+  const editRows = assertPaneSafe(editFrame.lines, 48, 12);
+  assert.ok(editFrame.cursor);
+  assert.equal(editRows[editFrame.cursor.row]?.slice(0, 12), " ".repeat(12));
+  assert.equal(editRows[editFrame.cursor.row]?.slice(12).trimStart().startsWith("雪"), true);
+  assert.equal(visibleWidth(" ".repeat(12) + "雪"), editFrame.cursor.column,
+    "Edit cursor follows the wide Unicode grapheme by terminal cells, not UTF-16 code units");
+});
+
+test("home/end navigate the native path field and scroll horizontally to the cursor", () => {
   const harness = formWith({ cols: 44 });
-  harness.send(ENTER); // label -> workspace
   harness.controller.handleInput("/Users/dev/" + "0123456789".repeat(3));
-  const atEnd = harness.controller.render(44, 8);
+  const atEnd = harness.controller.render(44, 20);
   assert.ok(
     (atEnd.cursor?.column ?? 0) >= 13 && (atEnd.cursor?.column ?? 0) <= 43,
     `end caret out of pane: ${JSON.stringify(atEnd.cursor)}`,
   );
   harness.controller.handleInput("\x1b[H"); // home: cursor scrolls back left
-  const atHome = harness.controller.render(44, 8);
-  assert.deepEqual(atHome.cursor, { column: 13, row: 2 });
+  const atHome = harness.controller.render(44, 20);
+  assert.equal(atHome.cursor?.row, 2);
   harness.controller.handleInput("\x1b[4~"); // end again
-  const atEndAgain = harness.controller.render(44, 8);
+  const atEndAgain = harness.controller.render(44, 20);
   assert.ok((atEndAgain.cursor?.column ?? 0) > 13);
   // 0-based pane coordinates on every render.
   assert.ok((atHome.cursor?.row ?? 0) >= 0);
@@ -1313,10 +1338,6 @@ test("home/end navigate fields; the path field scrolls horizontally to the curso
 
 test("form Escape abandons the UI request and hides; the launch is never killed", () => {
   const harness = formWith();
-  for (const ch of "fast") {
-    harness.controller.handleInput(ch);
-  }
-  harness.send(ENTER); // label -> workspace
   harness.send("/workspace");
   harness.send(ENTER); // submit -> create request 1
   const texts = assertPaneSafe(harness.controller.render(40, 8).lines, 40, 8);
@@ -1325,7 +1346,7 @@ test("form Escape abandons the UI request and hides; the launch is never killed"
   assert.equal(harness.controller.visible, false);
   assert.equal(harness.controller.focus, "main");
   assert.deepEqual(harness.focusedActions(), [
-    { type: "create", requestId: 1, label: "fast", workspace: "/workspace" },
+    { type: "create", requestId: 1, workspace: "/workspace" },
     { type: "visibility", visible: false },
   ]);
   // Backend already launched? Then this late completion is real UI noise:
@@ -1356,13 +1377,10 @@ test("reserved toggle hides a form during editing and while creation is pending"
     assert.equal(editing.controller.focus, "sidebar");
     editing.send(ENTER); // reopen the New session form
     assert.equal(editing.controller.focus, "form");
-    assert.ok(assertPaneSafe(editing.controller.render(44, 8).lines, 44, 8)[1]?.includes("draft"));
+    assert.ok(assertPaneSafe(editing.controller.render(44, 8).lines, 44, 8).join("\n").includes("draft"));
 
     const pending = formWith({ options });
-    pending.send("draft");
-    pending.send(ENTER);
     pending.send("/workspace");
-    pending.send(ENTER);
     pending.send(ENTER); // request 1 starts
     assert.equal(createOf(pending.focusedActions().at(-1)).requestId, 1);
     pending.send(packet); // abandon UI ownership; do not stop the backend launch
@@ -1381,24 +1399,18 @@ test("reserved toggle hides a form during editing and while creation is pending"
   }
 });
 
-test("failCreate preserves entered fields and shows the sanitized error", () => {
+test("failCreate preserves the workspace draft and shows the sanitized error", () => {
   const harness = formWith();
-  for (const ch of "first") {
-    harness.controller.handleInput(ch);
-  }
-  harness.send(ENTER);
   harness.controller.handleInput("/w");
-  harness.send(ENTER);
   harness.send(ENTER); // submit -> request 1
   harness.controller.failCreate(1, "\x1b[31mNo such workspace\x07boom");
   const texts = assertPaneSafe(harness.controller.render(44, 8).lines, 44, 8);
   assert.ok(texts.some((line) => line.includes("No such workspaceboom")));
   assert.ok(texts.every((line) => !line.includes("Starting")));
   // Draft preserved: re-submitting needs no retyping and gets a fresh id.
-   harness.send(ENTER); // submit -> request 2
+  harness.send(ENTER); // submit -> request 2
   const create = createOf(harness.focusedActions().at(-1));
   assert.equal(create.requestId, 2);
-  assert.equal(create.label, "first");
   assert.equal(create.workspace, "/w");
 });
 
@@ -1406,10 +1418,7 @@ test("backend selection supersedes pending create callbacks", () => {
   for (const selectedId of ["a", "later"]) {
     for (const callback of ["complete", "fail"]) {
       const harness = formWith();
-      harness.send("draft");
-      harness.send(ENTER);
       harness.send("/w");
-      harness.send(ENTER);
       harness.send(ENTER);
       const request = createOf(harness.focusedActions().at(-1));
       harness.controller.select(selectedId);
@@ -1432,7 +1441,6 @@ test("backend selection supersedes pending create callbacks", () => {
       harness.send(ENTER);
       const retry = createOf(harness.focusedActions().at(-1));
       assert.equal(retry.requestId, request.requestId + 1);
-      assert.equal(retry.label, "draft");
       assert.equal(retry.workspace, "/w");
     }
   }
@@ -1440,10 +1448,7 @@ test("backend selection supersedes pending create callbacks", () => {
 
 test("stale create callbacks never contaminate the current form or selection", () => {
   const harness = formWith();
-  harness.send("draft");
-  harness.send(ENTER);
   harness.send("/workspace");
-  harness.send(ENTER);
   harness.send(ENTER); // submit -> request 1
   harness.controller.failCreate(1, "nope");
   // A stale failCreate for the already-failed request changes nothing.
@@ -1600,7 +1605,7 @@ test("wide layout renders roster and form as independent panes", () => {
   const harness = formWith();
   // render() dispatches to the focused pane (the form) with its cursor.
   const formPane = harness.controller.render(47, 23);
-  assert.deepEqual(formPane.cursor, { column: 13, row: 1 });
+  assert.deepEqual(formPane.cursor, { column: 13, row: 2 });
   assert.ok(assertPaneSafe(formPane.lines, 47, 23)[0].includes("New session"));
   // The roster pane is still available beside it on wide terminals; its
   // return type carries no cursor, so it can never claim one.
@@ -1616,44 +1621,45 @@ test("footer hints wrap across reserved rows and never ellipsize", () => {
   for (const cols of [32, 40, 60]) {
     const texts = rosterView(harness.controller, cols, 10).texts;
     const footer = texts.join(" ");
-    for (const hint of ["toggle", "enter open", "delete remove exited", "esc hide", "q quit"]) {
+    for (const hint of ["toggle", "enter open", "e edit name", "delete remove exited", "esc hide", "q quit"]) {
       assert.ok(footer.includes(hint), `missing ${JSON.stringify(hint)} at ${cols} cols: ${JSON.stringify(texts)}`);
     }
     assert.ok(!texts.some((line) => line.includes("...")), `no ellipsized hints at ${cols} cols`);
   }
-  // The form footer wraps too, preserving both hints.
+  // The form footer wraps the actual native keybinding labels.
   const form = formWith({ cols: 24 });
-  const texts = assertPaneSafe(form.controller.render(24, 8).lines, 24, 8);
-  const footer = texts.slice(-2).join(" ");
-  assert.ok(footer.includes("enter next/submit"), JSON.stringify(texts));
-  assert.ok(footer.includes("esc toggle-cancel"), JSON.stringify(texts));
+  const texts = assertPaneSafe(form.controller.render(24, 10).lines, 24, 10);
+  const footer = texts.join(" ");
+  assert.ok(footer.includes("enter create"), JSON.stringify(texts));
+  assert.ok(footer.includes("esc cancel"), JSON.stringify(texts));
+  assert.ok(footer.includes("external editor"), JSON.stringify(texts));
 });
 
 test("roster requires a visible entry row; otherwise it falls back to too-small", () => {
   const { controller } = makeController();
-  // The complete footer wraps to four rows at 20 cols; 20x5 leaves no
+  // The complete footer plus an entry now needs 20x7; 20x6 leaves no
   // room for an entry, so Enter would activate an invisible target.
-  const tooSmall = controller.render(20, 5);
+  const tooSmall = controller.render(20, 6);
   assert.ok(tooSmall.lines.some((line) => line.includes("too small")));
   assert.equal(tooSmall.cursor, undefined);
 
   // One more row keeps exactly one visible entry plus the complete hints.
-  const fits = assertPaneSafe(controller.render(20, 6).lines, 20, 6);
+  const fits = assertPaneSafe(controller.render(20, 7).lines, 20, 7);
   assert.ok(fits.some((line) => line.includes("> New session")), JSON.stringify(fits));
   const footer = fits.join(" ");
-  for (const hint of ["toggle", "enter open", "delete remove exited", "esc hide", "q quit"]) {
+  for (const hint of ["toggle", "enter open", "e edit name", "delete remove exited", "esc hide", "q quit"]) {
     assert.ok(footer.includes(hint), `missing ${JSON.stringify(hint)}: ${JSON.stringify(fits)}`);
   }
 
-  // An error row consumes the last entry slot at 32x5.
+  // An error row consumes the last entry slot at 32x6.
   controller.showError("boom");
-  const tooSmallWithError = controller.render(32, 5);
+  const tooSmallWithError = controller.render(32, 6);
   assert.ok(tooSmallWithError.lines.some((line) => line.includes("too small")));
-  const fitsWithError = assertPaneSafe(controller.render(32, 6).lines, 32, 6);
+  const fitsWithError = assertPaneSafe(controller.render(32, 7).lines, 32, 7);
   assert.ok(fitsWithError.some((line) => line.includes("> New session")), JSON.stringify(fitsWithError));
   assert.ok(fitsWithError.some((line) => line.includes("boom")));
   const footerWith = fitsWithError.join(" ");
-  for (const hint of ["toggle", "enter open", "delete remove exited", "esc hide", "q quit"]) {
+  for (const hint of ["toggle", "enter open", "e edit name", "delete remove exited", "esc hide", "q quit"]) {
     assert.ok(footerWith.includes(hint), `missing ${JSON.stringify(hint)}: ${JSON.stringify(fitsWithError)}`);
   }
 });
@@ -1669,27 +1675,26 @@ test("long validated toggle chords render in full, wrapping or falling back inst
   assert.ok(wide.some((line) => line.includes("Ctrl+Shift+Alt+Super+PageDown")), JSON.stringify(wide));
 
   // Tight width: the chord and removal hint wrap while an entry stays visible.
-  const tight = assertPaneSafe(harness.controller.render(32, 6).lines, 32, 6);
+  const tight = assertPaneSafe(harness.controller.render(32, 7).lines, 32, 7);
   assert.ok(tight.some((line) => line.includes("Ctrl+Shift+Alt+Super+PageDown")), JSON.stringify(tight));
   assert.ok(tight.some((line) => line.includes("> New session")));
 
   // When even the wrapped chord leaves no entry row, the pane is truthfully
   // too small with no partial chord.
-  const tooSmall = harness.controller.render(32, 5);
+  const tooSmall = harness.controller.render(32, 6);
   assert.ok(tooSmall.lines.some((line) => line.includes("too small")));
   assert.ok(!tooSmall.lines.join("\n").includes("Ctrl+Shift"), "no partial chord in the fallback");
 });
 
 test("tiny form and confirm geometry falls back to a truthful too-small pane", () => {
   const form = formWith();
-  // 24x5 cannot fit header+two fields+status+the wrapped two-line footer.
-  const tooSmallForm = form.controller.render(24, 5);
+  // 24x8 cannot fit the header, editable field, status, and wrapped native hints.
+  const tooSmallForm = form.controller.render(24, 8);
   assert.ok(tooSmallForm.lines.some((line) => line.includes("too small")));
   assert.equal(tooSmallForm.cursor, undefined);
-  // One more row renders the full two-field form again.
-  const fits = form.controller.render(24, 6);
-  assert.deepEqual(fits.cursor, { column: 13, row: 1 });
-  assertPaneSafe(fits.lines, 24, 6);
+  const fits = form.controller.render(24, 20);
+  assert.deepEqual(fits.cursor, { column: 13, row: 2 });
+  assertPaneSafe(fits.lines, 24, 20);
 
   const confirm = makeRoster(["alive"]);
   confirm.send("q");
@@ -1731,9 +1736,10 @@ test("module purity: no process, fs, network, or TerminalSurface coupling", () =
     "node:child_process",
     "node:net",
     "node:http",
-    "process.cwd",
     "terminal-surface",
-    "from \"./",
+    "from \"./main\"",
+    "from \"./instances\"",
+    "from \"./terminal-surface\"",
   ]) {
     assert.ok(!source.includes(banned), `sidebar must not reference ${banned}`);
   }

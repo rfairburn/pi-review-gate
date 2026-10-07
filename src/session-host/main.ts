@@ -7,6 +7,8 @@ import { ProcessTerminal } from "pi-session-host-tui";
 import { createStatusBroker, type StatusBroker } from "./broker";
 import { composeHostFrame, computeHostLayout, type HostFocus, type HostLayout, type RenderedSidebar } from "./compositor";
 import { createSessionHostFrameWriter, type SessionHostFrameWriter } from "./frame-writer";
+import { createSessionHostTextField, type SessionHostFieldKeybindings } from "./field-editor";
+import { loadNativeFieldKeybindings, runNativeExternalEditor } from "./form-support";
 import { normalizeNativeSourceInput, translateInput, KeyboardCapabilityObserver } from "./input";
 import {
   InstanceManager,
@@ -20,7 +22,7 @@ import {
 } from "./instances";
 import { resolveNativePi, RUNTIME_ROLE_ENV, EXECUTOR_TOOL_CATALOG_ENV } from "./launch";
 import { NativeAgentRegistry, type ProfilePreparer } from "./profiles";
-import { SidebarController, type SidebarAction, type SidebarItem } from "./sidebar";
+import { SidebarController, type SidebarAction, type SidebarFieldFactoryOptions, type SidebarItem } from "./sidebar";
 import type { TerminalInputModes } from "./terminal-surface";
 
 const STARTUP_OPTIONS_HELPER = join("scripts", "session-host-startup-options.cjs");
@@ -46,7 +48,7 @@ type MainTerminal = Pick<ProcessTerminal,
   "start" | "stop" | "drainInput" | "write" | "columns" | "rows" | "kittyProtocolActive" | "modifyOtherKeysActive"
 >;
 type MainManager = Pick<InstanceManager,
-  "list" | "surface" | "write" | "resize" | "hasLiveProcesses" | "create" | "closeExited" | "shutdown" | "dispose"
+  "list" | "surface" | "write" | "resize" | "hasLiveProcesses" | "create" | "rename" | "closeExited" | "shutdown" | "dispose"
 >;
 type MainObserver = Pick<KeyboardCapabilityObserver, "flags" | "wait" | "dispose" | "feed">;
 type MainWriter = Pick<SessionHostFrameWriter, "start" | "submit" | "close">;
@@ -61,6 +63,7 @@ interface HostSnapshot {
   readonly toggleKey?: string;
   readonly args: readonly string[];
   readonly env: NodeJS.ProcessEnv;
+  readonly startupCwd: string;
 }
 
 interface MainDependencies {
@@ -74,12 +77,14 @@ interface MainDependencies {
   readonly createSessionSetup: (options: { env: NodeJS.ProcessEnv }) => {
     nativeSetup: boolean;
     profileRegistry: ProfilePreparer;
+    nativeAgentDir?: string;
   };
   readonly createManager: (options: InstanceManagerOptions) => MainManager;
   readonly createSidebar: (options: ConstructorParameters<typeof SidebarController>[0]) => SidebarController;
   readonly createTerminal: () => MainTerminal;
   readonly createObserver: (options: ConstructorParameters<typeof KeyboardCapabilityObserver>[0]) => MainObserver;
   readonly createWriter: (output: Writable, options: Parameters<typeof createSessionHostFrameWriter>[1]) => MainWriter;
+  readonly runExternalEditor: typeof runNativeExternalEditor;
   readonly reportError: (message: string) => void;
 }
 
@@ -101,6 +106,7 @@ function snapshotOptions(options: SessionHostOptions): HostSnapshot {
     toggleKey: options?.toggleKey,
     args,
     env,
+    startupCwd: process.cwd(),
   };
 }
 
@@ -163,6 +169,24 @@ function clampDimension(value: unknown, fallback: number): number {
   return Math.max(1, Math.min(1000, Math.floor(value)));
 }
 
+function nativeKeyHint(
+  manager: SessionHostFieldKeybindings,
+  action: string,
+  fallback: string,
+  excludedActions: readonly string[] = [],
+): string {
+  try {
+    const source = manager as SessionHostFieldKeybindings & { getKeys?: (keybinding: string) => string[] };
+    const keys = source.getKeys?.(action);
+    if (!Array.isArray(keys)) return fallback;
+    const excluded = new Set(excludedActions.flatMap((binding) => source.getKeys?.(binding) ?? []));
+    const effective = keys.filter((key) => !excluded.has(key));
+    return effective.length === 0 ? "unbound" : effective.join("/");
+  } catch {
+    return fallback;
+  }
+}
+
 function stableNodeVersion(version: string): boolean {
   const parsed = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
   if (!parsed) return false;
@@ -184,6 +208,7 @@ function statusRegistrar(broker: StatusBroker): StatusRegistrar {
             pendingInput: status.pendingInput,
             inputSurface: status.inputSurface,
             activity: status.activity,
+            ...(status.nativeSession === undefined ? {} : { nativeSession: status.nativeSession }),
           };
           handlers.onStatus(update);
         },
@@ -206,6 +231,7 @@ function toSidebarItem(view: NativeInstanceView): SidebarItem {
     pendingInput: view.pendingInput,
     inputSurface: view.inputSurface,
     activity: view.activity,
+    nativeSession: view.nativeSession,
   };
   if (view.exitCode !== undefined) {
     return { ...item, exitCode: view.exitCode };
@@ -222,15 +248,16 @@ function productionDependencies(): MainDependencies {
     signals: process as unknown as MainSignals,
     resolvePi: resolveNativePi,
     createBroker: (options) => createStatusBroker(options),
-    createSessionSetup: ({ env }) => ({
-      nativeSetup: true,
-      profileRegistry: new NativeAgentRegistry({ env }),
-    }),
+    createSessionSetup: ({ env }) => {
+      const registry = new NativeAgentRegistry({ env });
+      return { nativeSetup: true, profileRegistry: registry, nativeAgentDir: registry.agentDir };
+    },
     createManager: (options) => new InstanceManager(options),
     createSidebar: (options) => new SidebarController(options),
     createTerminal: () => new ProcessTerminal(),
     createObserver: (options) => new KeyboardCapabilityObserver(options),
     createWriter: (output, options) => createSessionHostFrameWriter(output, options),
+    runExternalEditor: runNativeExternalEditor,
     reportError: (message) => { process.stderr.write(`${message}\n`); },
   };
 }
@@ -296,6 +323,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let forcedCount = 0;
   let remainingCount = 0;
   let shutdownPromise: Promise<void> | undefined;
+  let externalEditorActive = false;
+  let externalEditorAbort: AbortController | undefined;
+  let externalEditorTask: Promise<string | undefined> | undefined;
   const createTasks = new Set<Promise<void>>();
   const deferredCreates = new Map<number, Extract<SidebarAction, { type: "create" }>>();
   let finishRun!: (status: number) => void;
@@ -327,6 +357,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   function requestShutdown(failed: boolean): void {
     shutdownRequested = true;
     if (failed) runtimeFailure = true;
+    try { externalEditorAbort?.abort(); } catch { /* exact child ownership is contained by the helper */ }
     if (startupComplete) beginShutdown();
   }
 
@@ -394,11 +425,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   }
 
   function scheduleRedraw(): void {
-    if (redrawQueued || shutdownRequested || !writer || !sidebar || !terminal) return;
+    if (redrawQueued || shutdownRequested || externalEditorActive || !writer || !sidebar || !terminal) return;
     redrawQueued = true;
     queueMicrotask(() => {
       redrawQueued = false;
-      if (shutdownRequested || !writer || !sidebar || !terminal) return;
+      if (shutdownRequested || externalEditorActive || !writer || !sidebar || !terminal) return;
       try {
         const cols = clampDimension(terminal.columns, 80);
         const rows = clampDimension(terminal.rows, 24);
@@ -444,6 +475,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       } catch {
         requestShutdown(true);
       }
+    });
+  }
+
+  function createFrameWriter(): MainWriter {
+    return dependencies.createWriter(dependencies.stdout, {
+      onError: () => requestShutdown(true),
     });
   }
 
@@ -507,7 +544,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   }
 
   function routeForward(data: string): void {
-    if (!terminal || !sidebar || sidebar.focus !== "main" || shutdownRequested) return;
+    if (!terminal || !sidebar || sidebar.focus !== "main" || shutdownRequested || externalEditorActive) return;
     const view = findActiveView();
     if (!view || !view.hasLiveProcess || view.lifecycle !== "alive" || !layout || !manager) return;
     const surface = manager.surface(view.id);
@@ -522,12 +559,114 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }
   }
 
+  function handleTerminalInput(data: string): void {
+    if (shutdownRequested || externalEditorActive || !sidebar) return;
+    try {
+      sidebar.handleInput(data);
+      reconcileLayout(false);
+      scheduleRedraw();
+    } catch {
+      requestShutdown(true);
+    }
+  }
+
+  function handleTerminalResize(): void {
+    reconcileLayout(true);
+  }
+
+  async function handoffExternalEditor(text: string): Promise<string | undefined> {
+    if (externalEditorActive || shutdownRequested || !terminal || !terminalStarted) {
+      throw new Error("external editor handoff is unavailable");
+    }
+    externalEditorActive = true;
+    const controller = new AbortController();
+    externalEditorAbort = controller;
+    let terminalPaused = false;
+    try {
+      await terminal.drainInput(INPUT_DRAIN_MAX_MS, INPUT_DRAIN_IDLE_MS);
+      if (shutdownRequested || controller.signal.aborted) return undefined;
+      const activeWriter = writer;
+      writer = undefined;
+      if (!activeWriter) {
+        requestShutdown(true);
+        throw new Error("external editor handoff is unavailable");
+      }
+      let writerSettled = false;
+      try {
+        writerSettled = await activeWriter.close();
+      } catch {
+        writerSettled = false;
+      }
+      if (!writerSettled) {
+        requestShutdown(true);
+        throw new Error("external editor handoff could not settle terminal output");
+      }
+      if (shutdownRequested || controller.signal.aborted) return undefined;
+      if (mouseTrackingMode !== undefined) {
+        if (!writeOwnedMouseSequence(`\x1b[?${mouseTrackingMode}l`)) {
+          requestShutdown(true);
+          throw new Error("terminal handoff failed");
+        }
+        mouseTrackingMode = undefined;
+      }
+      if (mouseSgrEnabled) {
+        if (!writeOwnedMouseSequence("\x1b[?1006l")) {
+          requestShutdown(true);
+          throw new Error("terminal handoff failed");
+        }
+        mouseSgrEnabled = false;
+      }
+      try {
+        terminal.stop();
+      } catch {
+        requestShutdown(true);
+        throw new Error("terminal handoff failed");
+      }
+      terminalStarted = false;
+      terminalPaused = true;
+      const result = await dependencies.runExternalEditor(text, {
+        env: snapshot.env,
+        cwd: snapshot.startupCwd,
+        signal: controller.signal,
+      });
+      if (shutdownRequested || controller.signal.aborted) return undefined;
+      return result;
+    } finally {
+      if (externalEditorAbort === controller) externalEditorAbort = undefined;
+      if (!shutdownRequested && terminalPaused && terminal) {
+        try {
+          const resumedWriter = createFrameWriter();
+          writer = resumedWriter;
+          resumedWriter.start();
+          if (shutdownRequested) throw new Error("terminal output could not be restored");
+          terminal.start(handleTerminalInput, handleTerminalResize);
+          terminalStarted = true;
+          syncOuterMouseModes();
+        } catch {
+          requestShutdown(true);
+        }
+      }
+      externalEditorActive = false;
+      if (!shutdownRequested) {
+        reconcileLayout(false);
+        scheduleRedraw();
+      }
+    }
+  }
+
+  function startExternalEditor(text: string): Promise<string | undefined> {
+    const task = handoffExternalEditor(text);
+    externalEditorTask = task;
+    void task.then(
+      () => { if (externalEditorTask === task) externalEditorTask = undefined; },
+      () => { if (externalEditorTask === task) externalEditorTask = undefined; },
+    );
+    return task;
+  }
+
   function launchCreate(action: Extract<SidebarAction, { type: "create" }>): void {
     if (!manager || shutdownRequested || !negotiationReady) return;
-    const createOptions: CreateInstanceOptions = {
-      label: action.label,
-      workspace: action.workspace,
-    };
+    const createOptions: CreateInstanceOptions = { workspace: action.workspace };
     let task!: Promise<void>;
     task = (async () => {
       try {
@@ -573,6 +712,48 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         reconcileLayout(true);
         scheduleRedraw();
         return;
+      case "edit": {
+        if (!sidebar) return;
+        const row = views.find((candidate) => candidate.id === action.id);
+        const observed = row?.nativeSession;
+        if (!observed || observed.sessionId !== action.nativeSession.sessionId
+          || observed.epoch !== action.nativeSession.epoch) {
+          sidebar.showError("Session name changed or is unavailable; reopen Edit from the current row");
+          scheduleRedraw();
+          return;
+        }
+        const opened = sidebar.openEdit({
+          id: row.id,
+          nativeSession: action.nativeSession,
+          currentName: observed.name,
+        });
+        if (!opened) sidebar.showError("Session name could not be edited while this row is changing");
+        reconcileLayout(true);
+        scheduleRedraw();
+        return;
+      }
+      case "rename": {
+        if (!manager || !sidebar) return;
+        const request = {
+          expectedSessionId: action.expectedSessionId,
+          expectedSessionEpoch: action.expectedSessionEpoch,
+          name: action.name,
+        };
+        void manager.rename(action.id, request).then(
+          (result) => {
+            if (shutdownRequested || !sidebar) return;
+            sidebar.completeRename(action.requestId, result.status);
+            syncRosterAndSchedule();
+            reconcileLayout(true);
+          },
+          () => {
+            if (shutdownRequested || !sidebar) return;
+            sidebar.failRename(action.requestId, "Session name could not be persisted; the active session was not changed");
+            scheduleRedraw();
+          },
+        );
+        return;
+      }
       case "remove": {
         if (!manager || !sidebar) return;
         let removed: boolean;
@@ -634,6 +815,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     shutdownPromise = Promise.resolve().then(async () => {
       let shutdownResult: ShutdownResult | undefined;
 
+      const editorTask = externalEditorTask;
+      if (editorTask) await Promise.allSettled([editorTask]);
+
       // Stop only mouse modes this host enabled. Unknown pre-existing modes
       // and foreign listeners are never guessed at or reset.
       if (terminalStarted) {
@@ -660,7 +844,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       } catch {
         cleanupFailure = true;
       }
-      if (terminalStartAttempted && terminal) {
+      if (terminalStartAttempted && terminal && !externalEditorActive) {
         try {
           await terminal.drainInput(INPUT_DRAIN_MAX_MS, INPUT_DRAIN_IDLE_MS);
         } catch {
@@ -790,14 +974,60 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       },
     });
     terminal = dependencies.createTerminal();
-    sidebar = dependencies.createSidebar({
-      toggleKey: snapshot.toggleKey,
-      initialVisible: true,
-      onAction: handleSidebarAction,
-    });
-
     const initialCols = clampDimension(terminal.columns, 80);
     const initialRows = clampDimension(terminal.rows, 24);
+    const sessionSetup = dependencies.createSessionSetup({ env: snapshot.env });
+    const createTextField = (options: SidebarFieldFactoryOptions) => {
+      if (!sessionSetup.nativeAgentDir) {
+        throw new Error("native Pi agent directory is unavailable for session-host fields");
+      }
+      const keybindings = loadNativeFieldKeybindings(sessionSetup.nativeAgentDir);
+      const common = {
+        initialText: options.initialText,
+        keybindings: keybindings.manager,
+        actionBindings: {
+          clear: "app.clear",
+          submit: "tui.input.submit",
+          cancel: "app.interrupt",
+          externalEditor: "app.editor.external",
+        },
+        onInvalidate: options.onInvalidate,
+        onSubmit: options.onSubmit,
+        onCancel: options.onCancel,
+        onReject: options.onReject,
+        onExternalEditor: startExternalEditor,
+      };
+      const field = options.kind === "path"
+        ? createSessionHostTextField({
+          ...common,
+          kind: "path",
+          workspaceBasePath: snapshot.startupCwd,
+        })
+        : createSessionHostTextField({ ...common, kind: "name" });
+      return {
+        field,
+        matchesCancel: (data: string) =>
+          !keybindings.manager.matches(data, "app.clear")
+          && !keybindings.manager.matches(data, "app.editor.external")
+          && keybindings.manager.matches(data, "app.interrupt"),
+        ...(keybindings.notice ? { notice: keybindings.notice } : {}),
+        hints: {
+          submit: nativeKeyHint(keybindings.manager, "tui.input.submit", "enter", ["app.clear", "app.editor.external", "app.interrupt"]),
+          cancel: nativeKeyHint(keybindings.manager, "app.interrupt", "esc", ["app.clear", "app.editor.external"]),
+          complete: nativeKeyHint(keybindings.manager, "tui.input.tab", "tab", ["app.clear", "app.editor.external", "app.interrupt", "tui.input.submit"]),
+          clear: nativeKeyHint(keybindings.manager, "app.clear", "ctrl+c"),
+          externalEditor: nativeKeyHint(keybindings.manager, "app.editor.external", "ctrl+g", ["app.clear"]),
+        },
+      };
+    };
+    sidebar = dependencies.createSidebar({
+      toggleKey: snapshot.toggleKey,
+      workspaceBasePath: snapshot.startupCwd,
+      createTextField,
+      initialVisible: true,
+      onAction: handleSidebarAction,
+      onInvalidate: scheduleRedraw,
+    });
     layout = computeHostLayout(initialCols, initialRows, {
       sidebarVisible: sidebar.visible,
       focus: sidebarFocus(sidebar.focus),
@@ -805,7 +1035,6 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     lastNativeCols = layout.native.cols;
     lastNativeRows = layout.native.rows;
 
-    const sessionSetup = dependencies.createSessionSetup({ env: snapshot.env });
     manager = dependencies.createManager({
       packageRoot,
       piExecutable: pi.file,
@@ -819,11 +1048,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       getSupportedKeyboardFlags: () => terminal?.kittyProtocolActive ? observedFlags & 7 : 0,
       onChange: () => syncRosterAndSchedule(),
     });
-    writer = dependencies.createWriter(dependencies.stdout, {
-      onError: () => requestShutdown(true),
-    });
+    writer = createFrameWriter();
 
-    passiveInputListener = (data): void => observer?.feed(data);
+    passiveInputListener = (data): void => {
+      if (!externalEditorActive) observer?.feed(data);
+    };
     dependencies.stdin.on("data", passiveInputListener);
     observerListenerAttached = true;
     if (shutdownRequested) {
@@ -839,19 +1068,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       return await runFinished;
     }
     terminalStartAttempted = true;
-    terminal.start(
-      (data) => {
-        if (shutdownRequested || !sidebar) return;
-        try {
-          sidebar.handleInput(data);
-          reconcileLayout(false);
-          scheduleRedraw();
-        } catch {
-          requestShutdown(true);
-        }
-      },
-      () => reconcileLayout(true),
-    );
+    terminal.start(handleTerminalInput, handleTerminalResize);
     terminalStarted = true;
     syncRosterAndSchedule();
     reconcileLayout(false);

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Writable } from "node:stream";
 import test from "node:test";
@@ -10,16 +11,24 @@ import type { ComposedHostFrame } from "../src/session-host/compositor";
 import type { InstanceManagerOptions, NativeInstanceView, ShutdownResult } from "../src/session-host/instances";
 import type { SessionHostFrameWriterOptions } from "../src/session-host/frame-writer";
 import type { KeyboardCapabilityObserverOptions } from "../src/session-host/input";
-import type { StatusBroker } from "../src/session-host/broker";
+import type { StatusBroker, StatusRenameRequest, StatusRenameResult } from "../src/session-host/broker";
 import { NativeAgentRegistry, type ProfilePreparer } from "../src/session-host/profiles";
+import { runNativeExternalEditor } from "../src/session-host/form-support";
 import type { TerminalFrame, TerminalInputModes } from "../src/session-host/terminal-surface";
 import { SidebarController } from "../src/session-host/sidebar";
+import type { SessionHostNativeSession } from "../src/session-host/protocol";
 import { __test, type SessionHostOptions } from "../src/session-host/main";
 
 const ESC = "\x1b";
 const ALT_LEFT = `${ESC}[1;3D`;
 const ENTER = "\r";
 const DELETE = "\x1b[3~";
+const MAIN_TEST_SCRATCH_ROOT = join(process.cwd(), "node_modules", ".cache", "session-host-main-tests");
+
+function makeMainTestDirectory(prefix: string): string {
+  mkdirSync(MAIN_TEST_SCRATCH_ROOT, { recursive: true });
+  return mkdtempSync(join(MAIN_TEST_SCRATCH_ROOT, `${prefix}-`));
+}
 
 class FakeInput extends EventEmitter {
   readonly isTTY = true;
@@ -136,6 +145,7 @@ class FakeWriter {
   startError?: Error;
   closeGate?: Promise<void>;
   closeStarted = false;
+  submitsAfterClose = 0;
   readonly frames: { frame: ComposedHostFrame; cols: number; rows: number }[] = [];
   readonly order: string[];
 
@@ -148,6 +158,7 @@ class FakeWriter {
   }
 
   submit(frame: ComposedHostFrame, cols: number, rows: number): void {
+    if (this.closed) this.submitsAfterClose += 1;
     this.frames.push({ frame, cols, rows });
   }
 
@@ -202,7 +213,8 @@ class FakeManager {
   readonly closeExitedCalls: string[] = [];
   readonly refusedCloseIds = new Set<string>();
   readonly resizeCalls: { cols: number; rows: number; ids: string[] }[] = [];
-  readonly createOptions: { label: string; workspace: string }[] = [];
+  readonly createOptions: { workspace: string }[] = [];
+  readonly renameCalls: { id: string; request: StatusRenameRequest }[] = [];
   readonly order: string[];
   onChange?: (id: string) => void;
   nextId = 1;
@@ -211,6 +223,8 @@ class FakeManager {
   readonly pendingCreates = new Set<Promise<string>>();
   createGate?: Promise<void>;
   createGateEntered?: () => void;
+  renameGate?: Promise<void>;
+  renameGateEntered?: () => void;
   stopping = false;
   spawnCount = 0;
   shutdownCalls = 0;
@@ -241,16 +255,16 @@ class FakeManager {
     return true;
   }
 
-  create(options: { label: string; workspace: string }): Promise<string> {
+  create(options: { workspace: string }): Promise<string> {
     this.createOptions.push({ ...options });
     const id = `native-${this.nextId++}`;
     const error = this.nextError;
     this.nextError = false;
-    const surface = new FakeSurface(this.options.cols ?? 80, this.options.rows ?? 24, `frame:${options.label}`);
+    const surface = new FakeSurface(this.options.cols ?? 80, this.options.rows ?? 24, `frame:${id}`);
     this.surfaces.set(id, surface);
     this.views.push({
       id,
-      label: options.label,
+      label: "(session starting)",
       workspace: options.workspace,
       agentDir: `/private-profile/${id}`,
       lifecycle: "starting",
@@ -259,6 +273,7 @@ class FakeManager {
       pendingInput: null,
       inputSurface: false,
       activity: [],
+      nativeSession: null,
     });
     this.onChange?.(id);
     const pending = this.finishCreate(id, error);
@@ -284,13 +299,43 @@ class FakeManager {
       this.views[index] = { ...view, lifecycle: "error", hasLiveProcess: false, error: "synthetic-secret-native-error" };
     } else {
       this.spawnCount += 1;
-      this.views[index] = { ...view, lifecycle: "alive", hasLiveProcess: true };
+      const nativeSession: SessionHostNativeSession = {
+        sessionId: `conversation-${id}`,
+        epoch: 1,
+        name: `Native ${id}`,
+      };
+      this.views[index] = { ...view, label: nativeSession.name, nativeSession, lifecycle: "alive", hasLiveProcess: true };
     }
     this.onChange?.(id);
     return id;
   }
 
   write(id: string, data: string | Buffer): void { this.writes.push({ id, data }); }
+
+  async rename(id: string, request: StatusRenameRequest): Promise<StatusRenameResult> {
+    this.renameCalls.push({ id, request: { ...request } });
+    if (this.renameGate) {
+      this.renameGateEntered?.();
+      await this.renameGate;
+    }
+    const index = this.views.findIndex((view) => view.id === id);
+    const view = this.views[index];
+    if (!view?.nativeSession) {
+      return { requestId: "synthetic", status: "unavailable", expectedSessionId: request.expectedSessionId,
+        expectedSessionEpoch: request.expectedSessionEpoch, observedSessionId: null, observedSessionEpoch: null };
+    }
+    if (view.nativeSession.sessionId !== request.expectedSessionId || view.nativeSession.epoch !== request.expectedSessionEpoch) {
+      return { requestId: "synthetic", status: "stale-session", expectedSessionId: request.expectedSessionId,
+        expectedSessionEpoch: request.expectedSessionEpoch, observedSessionId: view.nativeSession.sessionId,
+        observedSessionEpoch: view.nativeSession.epoch };
+    }
+    const nativeSession = { ...view.nativeSession, name: request.name };
+    this.views[index] = { ...view, label: request.name, nativeSession };
+    this.onChange?.(id);
+    return { requestId: "synthetic", status: "renamed", expectedSessionId: request.expectedSessionId,
+      expectedSessionEpoch: request.expectedSessionEpoch, observedSessionId: nativeSession.sessionId,
+      observedSessionEpoch: nativeSession.epoch };
+  }
 
   resize(cols: number, rows: number): void {
     const liveIds: string[] = [];
@@ -340,6 +385,7 @@ interface Harness {
   terminal: FakeTerminal;
   observer: FakeObserver;
   writer: FakeWriter;
+  writers: FakeWriter[];
   broker: StatusBroker & { disposeCalls: number; order: string[] };
   manager?: FakeManager;
   sidebar?: SidebarController;
@@ -359,6 +405,25 @@ function options(overrides: Partial<SessionHostOptions> = {}): SessionHostOption
   };
 }
 
+function syntheticExternalEditor(result: string | ((text: string) => string)): typeof runNativeExternalEditor {
+  return (text, options) => runNativeExternalEditor(text, {
+    env: { EDITOR: "synthetic-editor" },
+    cwd: options.cwd,
+    signal: options.signal,
+    tempRoot: MAIN_TEST_SCRATCH_ROOT,
+    spawn: ((_command: string, args: string[], _options: SpawnOptions) => {
+      writeFileSync(args.at(-1)!, typeof result === "string" ? result : result(text), "utf8");
+      const child = new EventEmitter() as ChildProcess;
+      Object.assign(child, { pid: 12350, exitCode: null, signalCode: null, killed: false, kill: () => true });
+      queueMicrotask(() => {
+        child.emit("spawn");
+        child.emit("close", 0, null);
+      });
+      return child;
+    }) as unknown as typeof import("node:child_process").spawn,
+  });
+}
+
 function createHarness(
   overrides: Partial<SessionHostOptions> = {},
   dependencyOverrides: MainTestDependencies = {},
@@ -371,6 +436,9 @@ function createHarness(
   const events: string[] = [];
   terminal.order = events;
   const writer = new FakeWriter(events);
+  const writers: FakeWriter[] = [];
+  const defaultAgentDir = makeMainTestDirectory("agent");
+  writeFileSync(join(defaultAgentDir, "keybindings.json"), "{}", "utf8");
   const reports: string[] = [];
   let brokerDisposals = 0;
   const broker = {
@@ -414,6 +482,7 @@ function createHarness(
       events.push("setup.construct");
       return {
         nativeSetup: false,
+        nativeAgentDir: defaultAgentDir,
         profileRegistry: {
           prepare: () => { throw new Error("the fake Main manager must not prepare sessions"); },
         } satisfies ProfilePreparer,
@@ -424,16 +493,26 @@ function createHarness(
       observer.onChange = observerOptions?.onChange;
       return observer;
     },
-    createWriter: (_output, _writerOptions?: SessionHostFrameWriterOptions) => { events.push("writer.construct"); return writer; },
+    createWriter: (_output, _writerOptions?: SessionHostFrameWriterOptions) => {
+      events.push("writer.construct");
+      const created = writers.length === 0 ? writer : new FakeWriter(events);
+      writers.push(created);
+      if (harness) {
+        harness.writer = created;
+        harness.writers = writers;
+      }
+      return created;
+    },
     reportError: (message) => reports.push(message),
     ...dependencyOverrides,
   });
   harness = {
-    options: options(overrides), stdin, stdout, signals, terminal, observer, writer, broker, reports, events, manager, sidebar, result,
+    options: options(overrides), stdin, stdout, signals, terminal, observer, writer, writers, broker, reports, events, manager, sidebar, result,
     get brokerOptions() { return brokerOptions; },
   };
   // Manager and sidebar construction occur after the broker's first asynchronous boundary.
   void result.then(() => undefined);
+  void result.then(() => rmSync(defaultAgentDir, { recursive: true, force: true }));
   return harness;
 }
 
@@ -459,25 +538,22 @@ async function ready(harness: Harness, flags = 0): Promise<FakeManager> {
 
 async function startTwoSessions(harness: Harness): Promise<FakeManager> {
   const manager = await ready(harness);
-  fillForm(harness.terminal, "first");
+  fillForm(harness.terminal, "/first/workspace");
   await nextTurn();
   harness.terminal.emitInput("\x1b[B"); // first row -> New session
   harness.terminal.emitInput(ENTER);
-  completeForm(harness.terminal, "second", "/another/workspace");
+  completeForm(harness.terminal, "/another/workspace");
   await nextTurn();
   assert.deepEqual(manager.views.map((view) => view.id), ["native-1", "native-2"]);
   return manager;
 }
 
-function fillForm(terminal: FakeTerminal, label: string, workspace = "/explicit/workspace"): void {
+function fillForm(terminal: FakeTerminal, workspace = "/explicit/workspace"): void {
   terminal.emitInput(ENTER); // New session
-  completeForm(terminal, label, workspace);
+  completeForm(terminal, workspace);
 }
 
-function completeForm(terminal: FakeTerminal, label: string, workspace = "/explicit/workspace"): void {
-  terminal.emitInput("\x15"); // replace any retained label draft
-  terminal.emitInput(label);
-  terminal.emitInput(ENTER); // label -> workspace
+function completeForm(terminal: FakeTerminal, workspace = "/explicit/workspace"): void {
   terminal.emitInput("\x15"); // replace any retained workspace draft
   terminal.emitInput(workspace);
   terminal.emitInput(ENTER); // submit
@@ -591,7 +667,7 @@ test("snapshotted args/env survive caller mutation after startup admission and r
 });
 
 test("Main native mode binds the captured Pi environment, not --state-root, to the shared agent directory", async () => {
-  const root = mkdtempSync(join(process.cwd(), ".session-host-main-native-"));
+  const root = makeMainTestDirectory("native");
   const home = join(root, "home");
   const agentDir = join(root, "native-agent");
   const workspace = join(root, "workspace");
@@ -606,10 +682,10 @@ test("Main native mode binds the captured Pi environment, not --state-root, to t
     ANTHROPIC_API_KEY: "synthetic-provider-key",
   };
   const harness = createHarness({ env: nativeEnv, stateRoot: hostStateRoot }, {
-    createSessionSetup: ({ env }) => ({
-      nativeSetup: true,
-      profileRegistry: new NativeAgentRegistry({ env }),
-    }),
+    createSessionSetup: ({ env }) => {
+      const registry = new NativeAgentRegistry({ env });
+      return { nativeSetup: true, profileRegistry: registry, nativeAgentDir: registry.agentDir };
+    },
   });
   try {
     const manager = await started(harness);
@@ -642,7 +718,7 @@ test("forms may be edited during keyboard negotiation but no native create start
   harness.observer.settle(5);
   await nextTurn();
   assert.equal(manager.createOptions.length, 1);
-  assert.deepEqual(manager.createOptions[0], { label: "negotiated session", workspace: "/explicit/workspace" });
+  assert.deepEqual(manager.createOptions[0], { workspace: "negotiated session" });
   assert.equal(manager.views[0]?.lifecycle, "alive");
   assert.equal(manager.options.getSupportedKeyboardFlags?.(), 0, "actual ProcessTerminal activation remains authoritative");
   harness.terminal.kittyProtocolActive = true;
@@ -675,10 +751,10 @@ test("highlighting a newly created row does not transfer active input ownership;
   harness.terminal.emitInput(ALT_LEFT);
   harness.terminal.emitInput("\x1b[B"); // highlighted first -> New session
   harness.terminal.emitInput(ENTER); // Open New session
-  completeForm(harness.terminal, "second", "/another/explicit/workspace");
+  completeForm(harness.terminal, "/another/explicit/workspace");
   await nextTurn();
   assert.equal(manager.views[1]?.id, "native-2");
-  assert.equal(harness.manager?.list()[1]?.label, "second");
+  assert.equal(harness.manager?.list()[1]?.label, "Native native-2");
   assert.equal(manager.writes.at(-1)?.id, "native-1", "late create/highlight did not steal the active owner");
 
   // The newly created row is highlighted in the picker. Enter is the explicit
@@ -697,7 +773,399 @@ test("highlighting a newly created row does not transfer active input ownership;
   await nextTurn();
   assert.equal(harness.writer.frames.at(-1)?.frame.cursor.visible, false, "non-alive native frames never retain an owned cursor");
 
-  assert.deepEqual(manager.createOptions[1], { label: "second", workspace: "/another/explicit/workspace" });
+  assert.deepEqual(manager.createOptions[1], { workspace: "/another/explicit/workspace" });
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("native Edit persists a rename without activating the row or routing input to it", async () => {
+  const harness = createHarness();
+  const manager = await ready(harness);
+  fillForm(harness.terminal, "/rename/workspace");
+  await nextTurn();
+  assert.equal(manager.views[0]?.nativeSession?.epoch, 1);
+
+  harness.terminal.emitInput("e");
+  assert.equal(harness.sidebar?.focus, "form");
+  harness.terminal.emitInput("Renamed title");
+  harness.terminal.emitInput(ENTER);
+  await nextTurn();
+  assert.deepEqual(manager.renameCalls, [{
+    id: "native-1",
+    request: {
+      expectedSessionId: "conversation-native-1",
+      expectedSessionEpoch: 1,
+      name: "Renamed title",
+    },
+  }]);
+  assert.equal(manager.views[0]?.label, "Renamed title");
+  assert.equal(manager.views[0]?.nativeSession?.name, "Renamed title");
+  assert.equal(harness.sidebar?.focus, "sidebar");
+  assert.equal(harness.sidebar?.selectedId, "native-1");
+  assert.deepEqual(manager.writes, [], "editing and saving never activates the session or sends it input");
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("external editor handoff settles the frame writer, applies a normal editor newline, and restores a fresh screen", async () => {
+  let captured: { text: string; cwd: string; signalAborted: boolean } | undefined;
+  const fakeEditor = syntheticExternalEditor((text) => `${text}/edited-in-native-editor\n`);
+  const harness = createHarness({}, {
+    runExternalEditor: async (text, editorOptions) => {
+      harness.events.push("external-editor.run");
+      captured = { text, cwd: editorOptions.cwd, signalAborted: editorOptions.signal?.aborted ?? false };
+      assert.equal(harness.terminal.started, false, "the host terminal is stopped while VISUAL/EDITOR owns the real tty");
+      return fakeEditor(text, editorOptions);
+    },
+  });
+  await ready(harness);
+  const initialWriter = harness.writer;
+  harness.terminal.emitInput(ENTER); // New session
+  harness.terminal.emitInput("/original/workspace");
+  harness.terminal.emitInput("\x07"); // Ctrl+G from the current native keybinding
+  await nextTurn();
+  assert.deepEqual(captured, {
+    text: "/original/workspace",
+    cwd: process.cwd(),
+    signalAborted: false,
+  });
+  assert.equal(harness.terminal.started, true, "the host terminal is restarted after the editor exits");
+  assert.equal(harness.terminal.stopCount, 1);
+  assert.equal(initialWriter.closed, true, "the old frame writer exits its alternate screen before the editor starts");
+  assert.equal(harness.writers.length, 2, "the host gets a fresh frame writer after editor ownership ends");
+  assert.equal(harness.writer.started, true, "the fresh frame writer re-enters the host screen");
+  assert.ok(harness.events.indexOf("terminal.stop") < harness.events.indexOf("external-editor.run"));
+  assert.ok(harness.events.indexOf("external-editor.run") < harness.events.lastIndexOf("terminal.start"));
+  assert.ok(harness.events.indexOf("writer.close") < harness.events.indexOf("external-editor.run"));
+  assert.ok(harness.events.lastIndexOf("writer.start") > harness.events.indexOf("external-editor.run"));
+  const form = harness.sidebar?.renderForm(80, 24).lines.join("\n") ?? "";
+  assert.match(form, /edited-in-native-editor/);
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("external-editor writer close is a barrier and no host frames are submitted while the editor owns the tty", async () => {
+  let releaseWriterClose!: () => void;
+  const writerCloseGate = new Promise<void>((resolve) => { releaseWriterClose = resolve; });
+  let editorEntered!: () => void;
+  const editorStarted = new Promise<void>((resolve) => { editorEntered = resolve; });
+  let finishEditor!: (result: string) => void;
+  const harness = createHarness({}, {
+    runExternalEditor: (text) => new Promise<string>((resolve) => {
+      harness.events.push("external-editor.run");
+      editorEntered();
+      finishEditor = resolve;
+      assert.equal(harness.terminal.started, false);
+      assert.ok(text.startsWith("/"));
+    }),
+  });
+  await ready(harness);
+  const initialWriter = harness.writer;
+  initialWriter.closeGate = writerCloseGate;
+  harness.terminal.emitInput(ENTER);
+  harness.terminal.emitInput("/synthetic/workspace");
+  harness.terminal.emitInput("\x07"); // Ctrl+G
+  await nextTurn();
+  assert.equal(initialWriter.closeStarted, true, "pending output settlement begins before the editor is spawned");
+  assert.equal(harness.events.includes("external-editor.run"), false, "the editor waits for the writer close barrier");
+  harness.manager?.notify("during-writer-close");
+  await nextTurn();
+  assert.equal(initialWriter.submitsAfterClose, 0);
+
+  releaseWriterClose();
+  await editorStarted;
+  assert.equal(harness.writers.length, 1, "the replacement writer is not created while the editor owns stdout");
+  const framesBeforeEditorMutation = initialWriter.frames.length;
+  harness.manager?.notify("during-editor");
+  await nextTurn();
+  assert.equal(initialWriter.frames.length, framesBeforeEditorMutation);
+  assert.equal(initialWriter.submitsAfterClose, 0);
+
+  finishEditor("/synthetic/edited");
+  await nextTurn();
+  assert.equal(harness.writers.length, 2);
+  assert.equal(harness.writer.started, true);
+  assert.equal(harness.terminal.started, true);
+  assert.ok(harness.events.lastIndexOf("writer.start") > harness.events.indexOf("external-editor.run"));
+  assert.ok(harness.events.lastIndexOf("writer.start") < harness.events.lastIndexOf("terminal.start"));
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("external editor is not spawned when the frame writer cannot settle safely", async () => {
+  let editorSpawned = false;
+  const harness = createHarness({}, {
+    runExternalEditor: async () => {
+      editorSpawned = true;
+      return "should-not-be-read";
+    },
+  });
+  await ready(harness);
+  harness.writer.closeResult = false;
+  harness.terminal.emitInput(ENTER);
+  harness.terminal.emitInput("/synthetic/workspace");
+  harness.terminal.emitInput("\x07"); // Ctrl+G
+  assert.equal(await harness.result, 1, "incomplete output settlement fails the host closed");
+  assert.equal(editorSpawned, false);
+  assert.equal(harness.terminal.stopCount, 1);
+});
+
+test("external-editor field application preserves edge spaces and truthfully rejects multiline output", async () => {
+  let result = "  replacement title  \n";
+  const harness = createHarness({}, {
+    runExternalEditor: syntheticExternalEditor(() => result),
+  });
+
+  await ready(harness);
+  harness.terminal.emitInput(ENTER);
+  harness.terminal.emitInput("/original/workspace");
+  harness.terminal.emitInput("\x07");
+  await nextTurn();
+  const first = harness.sidebar?.renderForm(80, 24).lines.join("\n") ?? "";
+  assert.ok(first.includes("  replacement title  "), first);
+
+  result = "first line\nsecond line\n";
+  harness.terminal.emitInput("\x07");
+  await nextTurn();
+  const rejected = harness.sidebar?.renderForm(80, 24).lines.join("\n") ?? "";
+  assert.ok(rejected.includes("Unsafe terminal text was rejected"), rejected);
+  assert.ok(rejected.includes("replacement title"), "the previous valid value remains after multiline rejection");
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("Main applies native app.clear and app.interrupt bindings and reloads them when a form is reopened", async () => {
+  const agentDir = makeMainTestDirectory("keybindings");
+  const keybindingsPath = join(agentDir, "keybindings.json");
+  const writeKeybindings = (clear: string, interrupt: string): void => {
+    writeFileSync(keybindingsPath, JSON.stringify({ "app.clear": clear, "app.interrupt": interrupt }), "utf8");
+  };
+  try {
+    writeKeybindings("ctrl+l", "ctrl+x");
+    const harness = createHarness({}, {
+      createSessionSetup: () => ({
+        nativeSetup: false,
+        nativeAgentDir: agentDir,
+        profileRegistry: { prepare: () => { throw new Error("synthetic profile preparation is not expected"); } } satisfies ProfilePreparer,
+      }),
+    });
+    await ready(harness);
+    harness.terminal.emitInput(ENTER);
+    const initialHints = harness.sidebar?.renderForm(80, 24).lines.join("\n") ?? "";
+    assert.ok(initialHints.includes("ctrl+l clear"), initialHints);
+    assert.ok(initialHints.includes("ctrl+x cancel"), initialHints);
+    harness.terminal.emitInput("/first/workspace");
+    harness.terminal.emitInput("\x0c"); // configured app.clear = Ctrl+L
+    assert.ok(!(harness.sidebar?.renderForm(80, 24).lines.join("\n") ?? "").includes("/first/workspace"));
+    harness.terminal.emitInput("draft");
+    harness.terminal.emitInput("\x18"); // configured app.interrupt = Ctrl+X
+    assert.equal(harness.sidebar?.visible, false);
+
+    writeKeybindings("ctrl+u", "ctrl+z");
+    harness.terminal.emitInput(ALT_LEFT);
+    harness.terminal.emitInput(ENTER);
+    const reopenedHints = harness.sidebar?.renderForm(80, 24).lines.join("\n") ?? "";
+    assert.ok(reopenedHints.includes("ctrl+u clear"), reopenedHints);
+    assert.ok(reopenedHints.includes("ctrl+z cancel"), reopenedHints);
+    harness.terminal.emitInput("/second/workspace");
+    harness.terminal.emitInput("\x0c"); // old binding is no longer clear
+    assert.ok((harness.sidebar?.renderForm(80, 24).lines.join("\n") ?? "").includes("/second/workspace"));
+    harness.terminal.emitInput("\x15"); // new app.clear = Ctrl+U
+    assert.ok(!(harness.sidebar?.renderForm(80, 24).lines.join("\n") ?? "").includes("/second/workspace"));
+    harness.terminal.emitInput("\x18"); // old interrupt no longer cancels
+    assert.equal(harness.sidebar?.visible, true);
+    harness.terminal.emitInput("\x1a"); // new app.interrupt = Ctrl+Z
+    assert.equal(harness.sidebar?.visible, false);
+    assert.equal(await closeWithSignal(harness), 0);
+  } finally {
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("pending create uses the configured interrupt and ignores its late result after reopening New", async () => {
+  const agentDir = makeMainTestDirectory("pending-create-keys");
+  writeFileSync(join(agentDir, "keybindings.json"), JSON.stringify({ "app.clear": "ctrl+l", "app.interrupt": "ctrl+x" }), "utf8");
+  try {
+    const harness = createHarness({}, {
+      createSessionSetup: () => ({
+        nativeSetup: false,
+        nativeAgentDir: agentDir,
+        profileRegistry: { prepare: () => { throw new Error("synthetic profile preparation is not expected"); } } satisfies ProfilePreparer,
+      }),
+    });
+    const manager = await ready(harness);
+    let releaseCreate!: () => void;
+    let enterCreate!: () => void;
+    const createEntered = new Promise<void>((resolve) => { enterCreate = resolve; });
+    manager.createGate = new Promise<void>((resolve) => { releaseCreate = resolve; });
+    manager.createGateEntered = enterCreate;
+
+    harness.terminal.emitInput(ENTER);
+    harness.terminal.emitInput("/pending/workspace");
+    harness.terminal.emitInput(ENTER);
+    await createEntered;
+    assert.equal(harness.sidebar?.focus, "form");
+    harness.terminal.emitInput(ESC);
+    assert.equal(harness.sidebar?.focus, "form", "unbound Escape does not abandon the pending form");
+    assert.equal(harness.sidebar?.visible, true);
+    harness.terminal.emitInput("\x18");
+    assert.equal(harness.sidebar?.visible, false, "the configured Ctrl+X interrupt abandons the pending form");
+
+    harness.terminal.emitInput(ALT_LEFT);
+    harness.terminal.emitInput(ENTER);
+    assert.equal(harness.sidebar?.focus, "form");
+    harness.terminal.emitInput("\x0c"); // Clear the retained draft with app.clear.
+    harness.terminal.emitInput("/reopened/workspace");
+    releaseCreate();
+    await nextTurn();
+    await nextTurn();
+    const reopened = harness.sidebar?.renderForm(80, 24).lines.join("\n") ?? "";
+    assert.equal(harness.sidebar?.visible, true);
+    assert.equal(harness.sidebar?.focus, "form");
+    assert.ok(reopened.includes("/reopened/workspace"), reopened);
+    assert.equal(await closeWithSignal(harness), 0);
+  } finally {
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("pending rename uses the configured interrupt and ignores its late result after reopening Edit", async () => {
+  const agentDir = makeMainTestDirectory("pending-rename-keys");
+  writeFileSync(join(agentDir, "keybindings.json"), JSON.stringify({ "app.clear": "ctrl+l", "app.interrupt": "ctrl+x" }), "utf8");
+  try {
+    const harness = createHarness({}, {
+      createSessionSetup: () => ({
+        nativeSetup: false,
+        nativeAgentDir: agentDir,
+        profileRegistry: { prepare: () => { throw new Error("synthetic profile preparation is not expected"); } } satisfies ProfilePreparer,
+      }),
+    });
+    const manager = await ready(harness);
+    fillForm(harness.terminal, "/pending-rename/workspace");
+    await nextTurn();
+
+    let releaseRename!: () => void;
+    let enterRename!: () => void;
+    const renameEntered = new Promise<void>((resolve) => { enterRename = resolve; });
+    manager.renameGate = new Promise<void>((resolve) => { releaseRename = resolve; });
+    manager.renameGateEntered = enterRename;
+    harness.terminal.emitInput("e");
+    harness.terminal.emitInput("Delayed rename");
+    harness.terminal.emitInput(ENTER);
+    await renameEntered;
+    assert.equal(harness.sidebar?.focus, "form");
+    harness.terminal.emitInput(ESC);
+    assert.equal(harness.sidebar?.focus, "form", "unbound Escape does not abandon the pending rename");
+    harness.terminal.emitInput("\x18");
+    assert.equal(harness.sidebar?.visible, false, "the configured Ctrl+X interrupt abandons the pending rename");
+
+    harness.terminal.emitInput(ALT_LEFT);
+    harness.terminal.emitInput("e");
+    assert.equal(harness.sidebar?.focus, "form");
+    harness.terminal.emitInput("Reopened replacement");
+    releaseRename();
+    await nextTurn();
+    await nextTurn();
+    const reopened = harness.sidebar?.renderForm(80, 24).lines.join("\n") ?? "";
+    assert.equal(harness.sidebar?.visible, true);
+    assert.equal(harness.sidebar?.focus, "form");
+    assert.ok(reopened.includes("Reopened replacement"), reopened);
+    assert.equal(reopened.includes("Saving native name"), false);
+    assert.equal(await closeWithSignal(harness), 0);
+  } finally {
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("native keybinding fallback notices render in narrow New and Edit forms and clear after valid reopen", async () => {
+  const root = makeMainTestDirectory("keybinding-notices");
+  const absentDir = join(root, "absent-agent");
+  const unavailablePath = join(root, "not-an-agent-directory");
+  const unsupportedDir = join(root, "unsupported-agent");
+  mkdirSync(absentDir);
+  writeFileSync(unavailablePath, "not a directory", "utf8");
+  mkdirSync(unsupportedDir);
+  const unsupportedKeybindings = join(unsupportedDir, "keybindings.json");
+  writeFileSync(unsupportedKeybindings, "{invalid json", "utf8");
+  const createConfiguredHarness = (nativeAgentDir: string): Harness => createHarness({}, {
+    createSessionSetup: () => ({
+      nativeSetup: false,
+      nativeAgentDir,
+      profileRegistry: { prepare: () => { throw new Error("synthetic profile preparation is not expected"); } } satisfies ProfilePreparer,
+    }),
+  });
+  const noticeInForm = (harness: Harness): string => {
+    const rendered = harness.sidebar?.render(40, 24).lines.join("\n") ?? "";
+    assert.equal(harness.sidebar?.focus, "form");
+    assert.ok(!rendered.includes("too small"), rendered);
+    return rendered.replace(/\x1b\[[0-9;]*m/g, "").replace(/\s+/g, " ");
+  };
+  try {
+    const absent = createConfiguredHarness(absentDir);
+    await ready(absent);
+    absent.terminal.columns = 40;
+    absent.terminal.emitInput(ENTER);
+    assert.ok(noticeInForm(absent).includes("Native keybindings.json is absent"));
+    assert.equal(await closeWithSignal(absent), 0);
+
+    const unavailable = createConfiguredHarness(unavailablePath);
+    await ready(unavailable);
+    unavailable.terminal.columns = 40;
+    unavailable.terminal.emitInput(ENTER);
+    const unavailableForm = noticeInForm(unavailable);
+    assert.ok(unavailableForm.includes("Native keybindings.json is unavailable"), unavailableForm);
+    assert.equal(await closeWithSignal(unavailable), 0);
+
+    const unsupported = createConfiguredHarness(unsupportedDir);
+    const manager = await ready(unsupported);
+    const tuple = { sessionId: "conversation-notice", epoch: 1, name: "Observed" };
+    manager.views.push({
+      id: "notice-session", label: tuple.name, workspace: "/workspace", agentDir: unsupportedDir,
+      lifecycle: "alive", busy: false, pendingInput: false, inputSurface: false,
+      nativeSession: tuple, hasLiveProcess: true, activity: [],
+    });
+    manager.notify("notice-session");
+    await nextTurn();
+    unsupported.terminal.columns = 40;
+    assert.equal(unsupported.sidebar?.openEdit({ id: "notice-session", nativeSession: tuple, currentName: tuple.name }), true);
+    assert.ok(noticeInForm(unsupported).includes("Native keybindings.json has an unsupported format"));
+
+    unsupported.terminal.emitInput(ESC);
+    assert.equal(unsupported.sidebar?.visible, false);
+    writeFileSync(unsupportedKeybindings, JSON.stringify({ "app.clear": "ctrl+u", "app.interrupt": "ctrl+x" }), "utf8");
+    unsupported.terminal.emitInput(ALT_LEFT);
+    assert.equal(unsupported.sidebar?.openEdit({ id: "notice-session", nativeSession: tuple, currentName: tuple.name }), true);
+    const valid = noticeInForm(unsupported);
+    assert.ok(valid.includes("ctrl+u clear"), valid);
+    assert.ok(valid.includes("ctrl+x cancel"), valid);
+    assert.equal(valid.includes("unsupported format"), false);
+    assert.equal(await closeWithSignal(unsupported), 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Main carries the observed tuple into Edit and leaves a stale rename unconfirmed", async () => {
+  const harness = createHarness();
+  const manager = await ready(harness);
+  fillForm(harness.terminal, "/stale-rename/workspace");
+  await nextTurn();
+  harness.terminal.emitInput("e");
+  assert.equal(harness.sidebar?.focus, "form");
+
+  const current = manager.views[0]!;
+  const changed = {
+    sessionId: current.nativeSession!.sessionId,
+    epoch: current.nativeSession!.epoch + 1,
+    name: "New conversation title",
+  };
+  manager.views[0] = { ...current, label: changed.name, nativeSession: changed };
+  manager.notify("native-1");
+  await nextTurn();
+  harness.terminal.emitInput("Replacement");
+  harness.terminal.emitInput(ENTER);
+  await nextTurn();
+  assert.equal(manager.renameCalls[0]?.request.expectedSessionEpoch, 1, "the request keeps the Edit-time epoch");
+  assert.equal(manager.views[0]?.label, "New conversation title", "the stale form cannot overwrite a newer name");
+  assert.equal(harness.sidebar?.focus, "form");
+  const text = harness.sidebar?.render(48, 10).lines.join("\n") ?? "";
+  assert.match(text, /conversation changed/i);
+  assert.deepEqual(manager.writes, []);
   assert.equal(await closeWithSignal(harness), 0);
 });
 
@@ -912,10 +1380,10 @@ test("wide form temporarily replaces the right pane; the child stays alive, unre
   const right = plainLine(frame, 1).slice(33);
   assert.ok(left.includes("Sessions (1)"), `roster stays in the left pane: ${JSON.stringify(left)}`);
   assert.ok(right.trimStart().startsWith("New session"), `form owns the right pane: ${JSON.stringify(right)}`);
-  assert.ok(!frame.lines.join("\n").includes("frame:first"), "the child frame is hidden, not destroyed, while the form is open");
-  // The retained label draft ("first" + "draft label") puts the caret at
+  assert.ok(!frame.lines.join("\n").includes("frame:native-1"), "the child frame is hidden, not destroyed, while the form is open");
+  // The retained workspace draft ("first" + "draft label") puts the caret at
   // pane column 13 + 16 = 29, offset by the right pane origin.
-  assert.deepEqual(frame.cursor, { column: 62, row: 2, visible: true }, "form caret offsets into the right pane");
+  assert.deepEqual(frame.cursor, { column: 62, row: 3, visible: true }, "form caret offsets into the right pane and native Editor completion viewport");
   assert.equal(manager.resizeCalls.length, resizesBeforeForm, "opening the form never resizes the child");
   assert.deepEqual(manager.writes, [], "form input is never broadcast to the child");
 
@@ -926,7 +1394,7 @@ test("wide form temporarily replaces the right pane; the child stays alive, unre
   assert.deepEqual(manager.resizeCalls.at(-1), { cols: 80, rows: 23, ids: ["native-1"] }, "hiding the sidebar restores the full-width native pane");
   const restored = harness.writer.frames.at(-1)?.frame;
   assert.ok(restored, "a composed frame exists after the form closes");
-  assert.ok(plainLine(restored, 1).startsWith("frame:first"), "the same child frame returns");
+  assert.ok(plainLine(restored, 1).startsWith("frame:native-1"), "the same child frame returns");
   harness.terminal.emitInput("q"); // main input still routes to the same active child
   assert.deepEqual(manager.writes.at(-1), { id: "native-1", data: "q" });
   assert.equal(await closeWithSignal(harness), 0);
@@ -936,14 +1404,14 @@ test("create error row reports only a generic message and preserves the editable
   const harness = createHarness();
   const manager = await ready(harness);
   manager.nextError = true;
-  fillForm(harness.terminal, "draft label", "/missing/workspace");
+  fillForm(harness.terminal, "/missing/workspace");
   await nextTurn();
   assert.equal(manager.views[0]?.lifecycle, "error");
   assert.equal(manager.views[0]?.error, "synthetic-secret-native-error", "the fixture confirms a private error existed");
   assert.ok(harness.sidebar);
   assert.equal(harness.sidebar.focus, "form");
   const formText = harness.sidebar.render(40, 8).lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
-  assert.match(formText, /draft label/);
+  assert.match(formText, /missing\/workspace/);
   assert.match(formText, /Session could not be started/);
   assert.doesNotMatch(formText, /profile/i, "create errors do not ask for a removed Profile field");
   assert.doesNotMatch(formText, /synthetic-secret-native-error/);
@@ -1010,7 +1478,7 @@ test("responsive resize resizes every owned child only when native geometry chan
   await nextTurn();
   harness.terminal.emitInput("\x1b[B"); // next row is New session
   harness.terminal.emitInput(ENTER);
-  completeForm(harness.terminal, "second", "/workspace-two");
+  completeForm(harness.terminal, "/workspace-two");
   await nextTurn();
   assert.equal(manager.views.length, 2);
 
@@ -1181,7 +1649,7 @@ test("stdin end, output error, startup failure, forced termination, and incomple
   const forcedManager = await started(forced);
   forcedManager.views.push({
     id: "owned-live-id", label: "safe", workspace: "/workspace", agentDir: "/profile", lifecycle: "alive",
-    hasLiveProcess: true, busy: null, pendingInput: null, inputSurface: false, activity: [],
+    hasLiveProcess: true, busy: null, pendingInput: null, inputSurface: false, activity: [], nativeSession: null,
   });
   Object.assign(forcedManager.shutdownResult, { forcedIds: ["owned-live-id"], remainingIds: ["owned-live-id"] });
   assert.equal(await closeWithSignal(forced), 1);

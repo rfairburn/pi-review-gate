@@ -91,15 +91,19 @@ their behavior, and user settings are unchanged.
 ## Starting and owning sessions
 
 The host opens on a welcome/sidebar picker; it does not implicitly launch a Pi session
-or treat its own startup directory as a workspace. Each **New session** currently asks
-for a temporary display label and an explicit existing workspace directory. The
-per-window Profile field is removed: every child uses the same canonical native Pi agent
-directory, resolved from `PI_CODING_AGENT_DIR` or Pi's ordinary `~/.pi/agent` default.
-That directory is fixed user configuration, not a workspace selector, and cannot also
-be selected as a session workspace. The manual Label requirement is temporary; the next
-delivery must replace it with the actual native Pi session name supplied by the
-canonical metadata integration. This alpha does not yet
-implement or prove that metadata behavior.
+or treat its own startup directory as a workspace. Each **New session** asks only for an
+explicit existing workspace directory; there is no separate host display-label field.
+The sidebar name comes from the observed native conversation metadata (the stored
+native name or Pi's native first-user-message fallback). Until that metadata is observed,
+the row reports that the session name is unavailable rather than inventing a user label.
+The New field uses Pi's native path completion, with relative suggestions rooted at the
+host startup working directory; this does not select that directory as the workspace.
+Its on-screen key cues reflect the current `keybindings.json` in the shared native Pi
+agent directory. If that file is absent, unavailable, or unsupported, the form shows a
+bounded warning and uses Pi's default form keys. The per-window Profile field is removed: every child uses the same
+canonical native Pi agent directory, resolved from `PI_CODING_AGENT_DIR` or Pi's
+ordinary `~/.pi/agent` default. That directory is fixed user configuration, not a
+workspace selector, and cannot also be selected as a session workspace.
 
 Each host-created row owns a separate top-level native Pi process, selected workspace,
 new conversation, input route, terminal frame, and lifecycle. All children naturally
@@ -136,8 +140,22 @@ with a notice. Removing an exited row only detaches that host-owned entry: it do
 signal a process or delete its workspace, native Pi files, or saved conversation files.
 Delete remains native input in Main focus unless it is itself the explicitly configured
 sidebar-toggle chord.
-In the New session form, Enter advances to the next field and submits from the last
-field; Escape cancels. Use the on-screen cues for quit confirmation. When a native Pi
+In the New session form, Enter submits the explicit workspace path; the native Editor
+provides path completion and its current Pi editing bindings. If a completion menu is
+open, the first Escape/cancel action dismisses that native menu; the next cancels the form.
+A form can also be abandoned while a launch/rename result is pending; that changes UI
+ownership only and does not stop or roll back the backend operation. The Edit form is
+available with `e` while a row with observed native metadata is highlighted. It shows the
+current native name for reference and starts with a separate empty **New name** field;
+the existing name is never prefilled or treated as an editable draft. Submitting sends a
+persisted rename request fenced by the host row id and the exact observed native session
+id/epoch. A stale or unavailable tuple is rejected, and a failed rename leaves the
+session name unconfirmed. Editing never activates the row, routes input to it, pauses or
+stops its child, or changes the active input owner. Both forms show the effective native
+keybindings; the external-editor action temporarily hands the real terminal to the
+configured `VISUAL`/`EDITOR` command (default `vi`) as a directly owned, shell-free child.
+It edits a private bounded temporary file; unsafe, oversized, or failed results are not
+applied. Use the on-screen cues for form actions and quit confirmation. When a native Pi
 frame has focus, input is sent only to the explicitly activated, live child; it is never
 broadcast to hidden or sibling sessions. Native Escape, `q`/`Q`, and Ctrl+C remain Pi's
 keys whenever the native frame has focus. They cannot be configured as the sidebar
@@ -146,12 +164,13 @@ sidebar-toggle chord is reserved there, including its repeat and release events.
 Pi's native word-left chord; set `--sidebar-key f8` (or another supported key) if you
 need to keep that native chord.
 
-The sidebar is a bounded top-level summary: busy/idle/unknown state, pending-input
-presence only when observed, and at most a couple of generic activity lines. It does
-not monitor or coordinate reviewers, workers, or their children, and does not display
-tool arguments, question text, titles, transcripts, or secrets. Status stays unknown
-until it is observed; an unavailable reporter, disconnect, error, or process exit does
-not turn unknown into Idle. Exited rows retain their last terminal frame until
+The sidebar is a bounded top-level summary: the observed native conversation name,
+busy/idle/unknown state, pending-input presence only when observed, and at most a couple
+of generic activity lines. Native names may use Pi's first-user-message fallback when
+there is no stored title. The sidebar does not monitor or coordinate reviewers, workers,
+or their children, and does not display tool arguments, question text, transcripts, or
+secrets. Status stays unknown until it is observed; an unavailable reporter, disconnect,
+error, or process exit does not turn unknown into Idle. Exited rows retain their last terminal frame until
 explicitly removed. There is no heartbeat timeout that declares a quiet session dead,
 so a valid idle state may remain for hours.
 
@@ -174,7 +193,7 @@ and basic emoji; newer emoji and complex ZWJ sequences are not guaranteed to mat
 Pi's standalone layout.
 
 With the sidebar visible at 53 columns or wider, it uses 32 columns plus a divider
-and leaves at least 20 columns for the native frame. The New session form
+and leaves at least 20 columns for the native frame. The New/Edit form
 temporarily replaces that right (native) pane while the roster remains on the left;
 below that width the form is a full-content overlay instead. While the form is open,
 the underlying child keeps running unpaused with its geometry and input ownership

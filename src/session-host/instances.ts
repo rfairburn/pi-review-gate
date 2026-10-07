@@ -10,6 +10,8 @@ import {
   prepareNativeLaunch,
 } from "./launch";
 import { TerminalSurface } from "./terminal-surface";
+import { isValidNativeSessionId, isValidRenameName, type SessionHostNativeSession } from "./protocol";
+import type { StatusRenameRequest, StatusRenameResult } from "./broker";
 
 /**
  * Independent owned-PTY process lifecycle for the optional per-instance
@@ -131,6 +133,8 @@ export interface InstanceStatusUpdate {
 	pendingInput: boolean | null;
 	inputSurface: boolean;
 	activity: readonly string[];
+	/** Optional canonical native conversation metadata; never transcript or status detail. */
+	nativeSession?: SessionHostNativeSession | null;
 }
 
 export interface InstanceStatusHandlers {
@@ -148,6 +152,8 @@ export interface InstanceStatusBootstrap {
 
 export interface InstanceStatusRegistration {
 	readonly bootstrap: InstanceStatusBootstrap;
+	/** Authenticated persisted rename when supported by the current registrar. */
+	rename?(request: StatusRenameRequest): Promise<StatusRenameResult>;
 	release(): void;
 }
 
@@ -171,6 +177,8 @@ export interface NativeInstanceView {
 	readonly busy: boolean | null;
 	readonly pendingInput: boolean | null;
 	readonly inputSurface: boolean;
+	/** Last validated native conversation tuple; null means unavailable/unknown. */
+	readonly nativeSession: SessionHostNativeSession | null;
 	/** True only while this manager still owns a PTY without a confirmed exit. */
 	readonly hasLiveProcess: boolean;
 	readonly activity: readonly string[];
@@ -180,8 +188,8 @@ export interface NativeInstanceView {
 }
 
 export interface CreateInstanceOptions {
-	/** Single-line sidebar label, at most 80 UTF-16 code units. */
-	label: string;
+	/** Legacy/test-only initial display label; production creation omits it and waits for native metadata. */
+	label?: string;
 	/** Explicit workspace directory for the instance's child process. */
 	workspace: string;
 	/** Legacy-test-only explicit profile directory; native setup rejects it. */
@@ -231,6 +239,7 @@ export interface ShutdownResult {
 interface ManagedInstance {
 	id: string;
 	label: string;
+	nativeSession: SessionHostNativeSession | null;
 	workspace: string;
 	agentDir: string;
 	lifecycle: InstanceLifecycle;
@@ -399,6 +408,19 @@ function boundedActivity(activity: readonly string[] | undefined): string[] {
 	});
 }
 
+function validatedNativeSession(value: unknown): SessionHostNativeSession | null | undefined {
+	if (value === null) return null;
+	if (typeof value !== "object" || value === null) return undefined;
+	const candidate = value as Partial<SessionHostNativeSession>;
+	if (!isValidNativeSessionId(candidate.sessionId)
+		|| !Number.isSafeInteger(candidate.epoch) || (candidate.epoch as number) < 1
+		|| typeof candidate.name !== "string"
+		|| candidate.name.trim().length === 0 || candidate.name.trim() !== candidate.name
+		|| [...candidate.name].length > 256 || Buffer.byteLength(candidate.name, "utf8") > 1024
+		|| /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(candidate.name)) return undefined;
+	return { sessionId: candidate.sessionId, epoch: candidate.epoch as number, name: candidate.name };
+}
+
 function validateLabel(label: unknown): string {
 	if (typeof label !== "string") {
 		throw new Error("session-host: instance label must be a string");
@@ -477,6 +499,7 @@ export class InstanceManager {
 			const view: NativeInstanceView & { exitCode?: number; error?: string } = {
 				id: record.id,
 				label: record.label,
+				nativeSession: record.nativeSession ? Object.freeze({ ...record.nativeSession }) : null,
 				workspace: record.workspace,
 				agentDir: record.agentDir,
 				lifecycle: record.lifecycle,
@@ -549,7 +572,7 @@ export class InstanceManager {
 		if (this.#disposed || this.#stopping) {
 			throw new Error("session-host: the instance manager is shut down; no new instances can be created");
 		}
-		const label = validateLabel(options?.label);
+		const label = options?.label === undefined ? "(session starting)" : validateLabel(options.label);
 		if (typeof options?.workspace !== "string" || options.workspace === "") {
 			throw new Error("session-host: create requires an explicit workspace directory");
 		}
@@ -562,6 +585,7 @@ export class InstanceManager {
 		const record: ManagedInstance = {
 			id,
 			label,
+			nativeSession: null,
 			workspace: options.workspace,
 			agentDir: "",
 			lifecycle: "starting",
@@ -586,6 +610,69 @@ export class InstanceManager {
 			this.#inflightCreates.delete(launch);
 		}
 		return id;
+	}
+
+	/**
+	 * Rename only the currently observed native conversation through its
+	 * authenticated registration. The expected tuple is checked before and
+	 * after the broker call; stale/released owners never receive an optimistic
+	 * caption update.
+	 */
+	async rename(id: string, request: StatusRenameRequest): Promise<StatusRenameResult> {
+		const record = this.#records.get(id);
+		const requestId = randomUUID();
+		const expectedSessionId = request?.expectedSessionId;
+		const expectedSessionEpoch = request?.expectedSessionEpoch;
+		const name = request?.name;
+		const observed = (): { observedSessionId: string | null; observedSessionEpoch: number | null } => ({
+			observedSessionId: record?.nativeSession?.sessionId ?? null,
+			observedSessionEpoch: record?.nativeSession?.epoch ?? null,
+		});
+		const result = (status: StatusRenameResult["status"], resultId: string = requestId): StatusRenameResult => ({
+			requestId: resultId,
+			status,
+			...(typeof expectedSessionId === "string" ? { expectedSessionId } : {}),
+			...(Number.isSafeInteger(expectedSessionEpoch) ? { expectedSessionEpoch } : {}),
+			...observed(),
+		});
+		if (!isValidNativeSessionId(expectedSessionId)
+			|| !Number.isSafeInteger(expectedSessionEpoch) || expectedSessionEpoch <= 0) {
+			return result("invalid-request");
+		}
+		if (!isValidRenameName(name)) return result("invalid-name");
+		if (!record || this.#disposed || !record.registration || record.registrationReleased) {
+			return result(record ? "disconnected" : "unavailable");
+		}
+		if (!record.nativeSession) return result("unavailable");
+		if (record.nativeSession.sessionId !== expectedSessionId || record.nativeSession.epoch !== expectedSessionEpoch) {
+			return result("stale-session");
+		}
+		const registration = record.registration;
+		if (typeof registration.rename !== "function") return result("unavailable");
+		let brokerResult: StatusRenameResult;
+		try {
+			brokerResult = await registration.rename({ expectedSessionId, expectedSessionEpoch, name });
+		} catch {
+			return result("disconnected");
+		}
+		if (this.#records.get(id) !== record || record.registration !== registration || record.registrationReleased) {
+			return result("disconnected", brokerResult.requestId);
+		}
+		if (!record.nativeSession
+			|| record.nativeSession.sessionId !== expectedSessionId
+			|| record.nativeSession.epoch !== expectedSessionEpoch) {
+			return result("stale-session", brokerResult.requestId);
+		}
+		const statuses: readonly StatusRenameResult["status"][] = [
+			"renamed", "stale-session", "unavailable", "invalid-name", "setter-failed",
+			"verification-failed", "busy", "timeout", "disconnected", "invalid-request",
+		];
+		if (!brokerResult || typeof brokerResult.requestId !== "string" || !statuses.includes(brokerResult.status)
+			|| brokerResult.expectedSessionId !== expectedSessionId
+			|| brokerResult.expectedSessionEpoch !== expectedSessionEpoch) {
+			return result("verification-failed", typeof brokerResult?.requestId === "string" ? brokerResult.requestId : requestId);
+		}
+		return result(brokerResult.status, brokerResult.requestId);
 	}
 
 	/** Write input to the explicitly addressed known-alive child. Never a fallback. */
@@ -1012,6 +1099,26 @@ export class InstanceManager {
 		record.pendingInput = update && typeof update.pendingInput === "boolean" ? update.pendingInput : null;
 		record.inputSurface = update?.inputSurface === true;
 		record.activity = boundedActivity(update?.activity);
+		if (Object.prototype.hasOwnProperty.call(update ?? {}, "nativeSession")) {
+			const next = validatedNativeSession(update?.nativeSession);
+			const previous = record.nativeSession;
+			if (next === null) {
+				record.nativeSession = null;
+				record.label = "(session name unavailable)";
+			} else if (next !== undefined) {
+				if (previous && (next.epoch < previous.epoch
+					|| (next.sessionId !== previous.sessionId && next.epoch <= previous.epoch))) {
+					record.nativeSession = null;
+					record.label = "(session name unavailable)";
+				} else {
+					record.nativeSession = next;
+					record.label = next.name;
+				}
+			} else {
+				record.nativeSession = null;
+				record.label = "(session name unavailable)";
+			}
+		}
 		this.#safeChanged(record.id);
 	}
 
@@ -1026,6 +1133,8 @@ export class InstanceManager {
 		record.pendingInput = null;
 		record.inputSurface = false;
 		record.activity = [];
+		record.nativeSession = null;
+		record.label = "(session name unavailable)";
 		this.#safeChanged(record.id);
 	}
 

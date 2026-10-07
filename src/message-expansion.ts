@@ -64,7 +64,21 @@
  *   `content` and `details` (no new payload fields). Unknown, historical, or
  *   malformed content that yields no supported short summary falls back to the
  *   FULL retained content rather than a misleading preview — compaction is not
- *   promised where it cannot be produced honestly.
+ *   promised where it cannot be produced honestly. A failure/recovery event
+ *   compacts from the curated diagnostic whether it arrives as structured
+ *   `details.diagnostic` or only as the producer's retained preamble + JSON
+ *   text (validated structurally, and against the preamble's own task,
+ *   execution, kind, state, revision, and progress identities). Valid
+ *   structured metadata stays authoritative; nonempty but unusable structured
+ *   metadata is never replaced by a text-derived diagnostic, and a recovered
+ *   diagnostic is rejected when it contradicts a supplied taskId, executionId,
+ *   or state, so genuinely unknown, invalid, or inconsistent data stays
+ *   full-text.
+ * - A full-text fallback row is marked as the complete retained text
+ *   (`markFullTextFallback`), so the shared core shows it in both states with
+ *   NO expansion hint: the hint would advertise a change expansion cannot make.
+ *   This is explicit state, never a rendered-line comparison, so width, theme,
+ *   and partial rendering cannot disable a genuinely expandable row's hint.
  * - The single native header hint is added by the shared core (the host's
  *   configured `app.tools.expand` binding); family renderers emit no hint of
  *   their own. No competing key handler is registered and nothing is fetched,
@@ -103,11 +117,13 @@
 import {
   expandablePresentation,
   isPresentationExpanded,
+  markFullTextFallback,
   type PresentationRenderer,
 } from "./presentation-expansion";
 import { loadHostPeerModule } from "./host-peer-loader";
 import { visibleTerminalText } from "./tool-result-text";
-import { BACKGROUND_TASK_STATES } from "./execution/task-state";
+import { BACKGROUND_TASK_STATES, type BackgroundTaskKind } from "./execution/task-state";
+import { TRUNCATION_MARKER, subtaskSuccessVerb } from "./execution/subtask-notifications";
 
 // ── Structural host types ────────────────────────────────────────────────────
 
@@ -498,7 +514,13 @@ export function createExpandableMessageRenderer(
   const renderRow = expandablePresentation(
     collapsedRenderer as PresentationRenderer<unknown, unknown, unknown>,
     expandedRenderer as PresentationRenderer<unknown, unknown, unknown> | undefined,
-    { fallbackOptions: () => ({ expanded: false, outputPad: 0 }) },
+    {
+      fallbackOptions: () => ({ expanded: false, outputPad: 0 }),
+      // The five family renderers fall back to the complete retained text when
+      // a row's shape cannot be compacted truthfully; such a row must not
+      // advertise an expansion that could not change what is shown.
+      honorFullTextFallback: true,
+    },
   );
 
   return (message: unknown, options: unknown, theme: unknown): unknown => {
@@ -591,10 +613,13 @@ export function renderFullMessageContent(
 /**
  * The honest fallback for unknown/historical/malformed content: the FULL
  * retained content (no arbitrary preview, no compaction promise). The expanded
- * view carries the same complete text.
+ * view carries the same complete text. The component is explicitly marked as
+ * the complete retained text so the shared core omits the expansion hint (the
+ * hint would promise a change expansion cannot make); the mark is a
+ * presentation signal, never a comparison of rendered lines.
  */
 function collapsedFallback(message: unknown, theme: unknown): MessageComponent {
-  return renderFullMessageContent(message, {}, theme);
+  return markFullTextFallback(renderFullMessageContent(message, {}, theme));
 }
 
 function firstLine(text: string): string {
@@ -637,6 +662,165 @@ function hasDiagnosticContent(d: Record<string, unknown>): boolean {
     && Array.isArray(d.recovery.suggestedActions)
     && d.recovery.suggestedActions.length > 0
     && d.recovery.suggestedActions.every((action) => typeof action === "string" && action.trim().length > 0);
+}
+
+/**
+ * True only for ABSENT diagnostic metadata (`undefined`/`null`) or an empty
+ * record. Any other delivered value is nonempty metadata: even when it is not
+ * usable, it is meaningful recorded state and must not be silently replaced by
+ * a diagnostic recovered from the retained text.
+ */
+function isEmptyDiagnosticMetadata(value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  return isRecord(value) && Object.keys(value).length === 0;
+}
+
+/** A supplied details field that is actually present (non-empty string). */
+function suppliedIdentity(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/** The producer's preamble head line (`formatWakeFailurePreamble`, line 1). */
+const WAKE_FAILURE_PREAMBLE_HEAD =
+  /^Task (\S+) requires recovery attention at state ([A-Z_]+) in (execute|research|inplace) execution (\S+) \(revision (\d+)\)\.$/;
+/** The producer's preamble progress line (`formatWakeFailurePreamble`, line 2). */
+const WAKE_FAILURE_PREAMBLE_PROGRESS = /^Execution progress: (\d+)\/(\d+) task\(s\) (.+), (\d+) active\.$/;
+/** The literal separator the producer writes between the preamble and the curated JSON. */
+const WAKE_FAILURE_DIAGNOSTIC_BOUNDARY =
+  "Failure recovery diagnostic (curated and bounded; use SubtasksInspect for the full current snapshot):";
+
+/** Structural validation of the diagnostic's optional conflict gate. */
+function validConflictGate(value: unknown): boolean {
+  return isRecord(value)
+    && Array.isArray(value.paths) && value.paths.every((path) => typeof path === "string")
+    && typeof value.manifestPath === "string"
+    && typeof value.reason === "string";
+}
+
+/**
+ * Content-only recognition of the producer's recovery/failure notification: the
+ * `formatWakeFailurePreamble` head, the literal diagnostic boundary line, and
+ * the curated `formatWakeFailureDiagnostic` JSON — all read from the retained
+ * message text alone (no fetch, artifact, log, or history read). Used only when
+ * the delivered structured details are absent or unusable, so valid structured
+ * metadata always stays authoritative.
+ *
+ * Recognition is deliberately strict so a compact recovery summary can never be
+ * fabricated from unrelated JSON or inlined content:
+ *
+ * - the preamble must OPEN the message (its first two lines must match the
+ *   producer's own wording) and its optional Notice/Summary/Error lines must
+ *   appear in the producer's order, exactly once each;
+ * - the literal boundary line must follow a single blank separator line, and the
+ *   remainder must be complete, parseable JSON — an explicitly truncated
+ *   diagnostic is rejected (its recovery actions may be incomplete);
+ * - the JSON's task/execution/kind/state/revision/progress identities and its
+ *   Notice/Summary/Error text must AGREE with the preamble, and the fields the
+ *   collapsed view relies on (title, message, recovery actions) must validate
+ *   structurally. Any mismatch or malformed shape returns undefined, and the
+ *   caller keeps the full retained text.
+ */
+function contentWakeFailureDiagnostic(content: string): Record<string, unknown> | undefined {
+  const lines = content.split(/\r?\n/);
+  const head = lines[0]?.match(WAKE_FAILURE_PREAMBLE_HEAD);
+  if (!head) return undefined;
+  const taskId = head[1]!;
+  const stateUpper = head[2]!;
+  const kind = head[3]!;
+  const executionId = head[4]!;
+  const revisionText = head[5]!;
+  const progress = lines[1]?.match(WAKE_FAILURE_PREAMBLE_PROGRESS);
+  if (!progress) return undefined;
+  const settledText = progress[1]!;
+  const taskCountText = progress[2]!;
+  const activeText = progress[4]!;
+  // The prose between the counts must be this kind's own success verb, exactly
+  // as the producer writes it (execute lands, research reports, in-place
+  // settles in place) — a different sentence is not the producer's preamble.
+  if (progress[3] !== subtaskSuccessVerb(kind as BackgroundTaskKind)) return undefined;
+
+  // Notice/Summary/Error in the producer's own order, each at most once, then
+  // the blank separator and the literal boundary line.
+  let index = 2;
+  const preambleText: { notice?: string; summary?: string; error?: string } = {};
+  for (const [field, prefix] of [["notice", "Notice: "], ["summary", "Summary: "], ["error", "Error: "]] as const) {
+    const line = lines[index];
+    if (line !== undefined && line.startsWith(prefix)) {
+      preambleText[field] = line.slice(prefix.length);
+      index += 1;
+    }
+  }
+  if (lines[index] !== "" || lines[index + 1] !== WAKE_FAILURE_DIAGNOSTIC_BOUNDARY) return undefined;
+  const jsonText = lines.slice(index + 2).join("\n");
+  if (jsonText.length === 0 || jsonText.endsWith(TRUNCATION_MARKER)) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed)) return undefined;
+
+  // Identity agreement between the preamble and the curated JSON: both are
+  // written from ONE diagnostic by the producer, so any disagreement means this
+  // is not the producer's own concatenation (unrelated or inlined JSON).
+  if (parsed.taskId !== taskId || parsed.executionId !== executionId) return undefined;
+  if (parsed.kind !== kind) return undefined;
+  if (parsed.revision !== Number(revisionText)) return undefined;
+  if (typeof parsed.taskState !== "string" || parsed.taskState.toUpperCase() !== stateUpper) return undefined;
+  if (!BACKGROUND_TASK_STATES.some((state) => state === parsed.taskState)) return undefined;
+  if (typeof parsed.title !== "string" || parsed.title.trim().length === 0) return undefined;
+  if (typeof parsed.message !== "string") return undefined;
+  if (parsed.summary !== undefined && typeof parsed.summary !== "string") return undefined;
+  if (parsed.error !== undefined && typeof parsed.error !== "string") return undefined;
+  const groupSummary = parsed.groupSummary;
+  if (!isRecord(groupSummary)
+    || groupSummary.settled !== Number(settledText)
+    || groupSummary.taskCount !== Number(taskCountText)
+    || groupSummary.active !== Number(activeText)) return undefined;
+  if (!isRecord(parsed.recovery)
+    || !Array.isArray(parsed.recovery.suggestedActions)
+    || parsed.recovery.suggestedActions.length === 0
+    || !parsed.recovery.suggestedActions.every((action) => typeof action === "string" && action.trim().length > 0)) {
+    return undefined;
+  }
+  if (parsed.recovery.conflictGate !== undefined && !validConflictGate(parsed.recovery.conflictGate)) return undefined;
+  // The preamble omits a field exactly when the curated value is empty, and
+  // repeats the value verbatim otherwise: a present/absent or textual mismatch
+  // is a shape we cannot attribute to the producer.
+  const summary = typeof parsed.summary === "string" ? parsed.summary : undefined;
+  const error = typeof parsed.error === "string" ? parsed.error : undefined;
+  if (preambleText.notice !== undefined && preambleText.notice !== parsed.message) return undefined;
+  if (preambleText.summary !== undefined && preambleText.summary !== summary) return undefined;
+  if (preambleText.error !== undefined && preambleText.error !== error) return undefined;
+  if (preambleText.notice === undefined && parsed.message.length > 0) return undefined;
+  if (preambleText.summary === undefined && summary !== undefined && summary.length > 0) return undefined;
+  if (preambleText.error === undefined && error !== undefined && error.length > 0) return undefined;
+  return parsed;
+}
+
+/**
+ * Recovers the curated diagnostic from the retained notification text ONLY when
+ * the delivered metadata is absent or empty, and ONLY when the recovered
+ * identity does not contradict any identity the delivered details DID supply
+ * (`taskId`, `executionId`, `state`). A conflict means the two recorded views
+ * disagree, so neither is presented as a compact summary — the caller keeps the
+ * full retained text. Valid structured metadata never reaches this path (it is
+ * authoritative on its own).
+ */
+function recoverTextDiagnostic(
+  details: Record<string, unknown>,
+  content: string,
+): Record<string, unknown> | undefined {
+  const recovered = contentWakeFailureDiagnostic(content);
+  if (!recovered) return undefined;
+  const taskId = suppliedIdentity(details.taskId);
+  if (taskId !== undefined && recovered.taskId !== taskId) return undefined;
+  const executionId = suppliedIdentity(details.executionId);
+  if (executionId !== undefined && recovered.executionId !== executionId) return undefined;
+  const state = suppliedIdentity(details.state);
+  if (state !== undefined && recovered.taskState !== state) return undefined;
+  return recovered;
 }
 
 /**
@@ -687,8 +871,12 @@ function subtaskStateLabel(state: string): { label: string; color: "success" | "
  * Collapsed subtask lifecycle event: task title + actual outcome state + the
  * available aggregate count; a separate full report-reference line when present
  * (no path shortening); and, for failures/conflicts/recovery, the immediate
- * actionable detail from the curated diagnostic. Unrecognized content falls back
- * to the full retained text rather than a misleading summary.
+ * actionable detail from the curated diagnostic — whether it arrived as
+ * structured details or only as the producer's retained preamble + JSON text.
+ * Unrecognized, malformed, or identity-inconsistent content falls back to the
+ * full retained text rather than a misleading summary, as does nonempty but
+ * unusable structured metadata and a text-derived diagnostic that contradicts a
+ * supplied task/execution/state identity.
  */
 export function renderSubtaskEventCollapsed(
   message: unknown,
@@ -699,9 +887,19 @@ export function renderSubtaskEventCollapsed(
   const content = messageContentText(message);
   const details = detailsOf(message) ?? {};
   // A curated failure diagnostic is usable only when it carries real content —
-  // an empty `diagnostic: {}` must not bypass the full-content fallback.
-  const diagnostic = isRecord(details.diagnostic) && hasDiagnosticContent(details.diagnostic)
-    ? details.diagnostic : undefined;
+  // an empty `diagnostic: {}` must not bypass the full-content fallback. Valid
+  // structured details stay authoritative. Nonempty but unusable structured
+  // metadata is meaningful recorded state and is NEVER replaced by a diagnostic
+  // recovered from text: the full retained text is shown instead. Only ABSENT or
+  // EMPTY diagnostic metadata falls through to the retained-text path, whose
+  // recovered identity must not contradict any identity the details supplied.
+  const suppliedDiagnostic = details.diagnostic;
+  const structuredDiagnostic = isRecord(suppliedDiagnostic) && hasDiagnosticContent(suppliedDiagnostic)
+    ? suppliedDiagnostic : undefined;
+  if (!structuredDiagnostic && !isEmptyDiagnosticMetadata(suppliedDiagnostic)) {
+    return collapsedFallback(message, theme);
+  }
+  const diagnostic = structuredDiagnostic ?? recoverTextDiagnostic(details, content);
 
   // Title and state from the recorded "Task: <id> · <title> · <state>" line.
   // The producer appends its authoritative Task line AFTER any inlined report

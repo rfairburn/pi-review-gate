@@ -25,6 +25,11 @@ import {
   buildWakeFailureDiagnostic,
   formatExecutionEvent,
   formatResearchCompletion,
+  formatWakeFailureDiagnostic,
+  formatWakeFailurePreamble,
+  formatWatchEvent,
+  capNotificationText,
+  WAKE_FAILURE_NOTIFICATION_CAP,
 } from "../src/execution/subtask-notifications";
 import {
   formatScheduledSkipEvent,
@@ -34,7 +39,10 @@ import {
   formatScheduledOrchestratorDeliveryFailure,
   formatScheduledOrchestratorDeliveryUncertain,
 } from "../src/scheduling/events";
+import { formatScheduledOrchestratorTurnContent } from "../src/scheduling/orchestrator-turn";
 import { formatWakePayload } from "../src/background-shell/jobs";
+import { isFullTextFallback } from "../src/presentation-expansion";
+import { setNativeExpansionHost, type NativeExpansionHost } from "../src/presentation-hints";
 
 // A minimal fake pi-tui: naive hard-wrap (content in these tests is short), no
 // MouseRegion so the core adapter degrades to keyboard-only rendering.
@@ -57,9 +65,9 @@ function lines(component: unknown, width = 100): string[] {
 
 // ── Real producer fixtures (minimal shapes, cast to the producer's types) ────
 
-function makeGroup(kind: "execute" | "research" | "inplace", tasks: unknown[]): Record<string, unknown> {
+function makeGroup(kind: "execute" | "research" | "inplace", tasks: unknown[], executionId = "exec-1"): Record<string, unknown> {
   return {
-    version: 3, revision: 1, integritySha256: "x", executionId: "exec-1", kind, root: "/tmp/root", cwd: "/tmp/cwd",
+    version: 3, revision: 1, integritySha256: "x", executionId, kind, root: "/tmp/root", cwd: "/tmp/cwd",
     createdAt: "", updatedAt: "", tasks, totalTaskCount: tasks.length, settledArchivedCount: 0,
   };
 }
@@ -70,6 +78,56 @@ function makeEntry(name: string, cron = "0 2 * * *"): Record<string, unknown> {
   return { name, cron, enabled: true, kind: "execute", instructions: "" };
 }
 const DUE = new Date("2026-01-01T02:00:00Z");
+
+/**
+ * A real producer failure/recovery notification: the delivered content is
+ * `capNotificationText(formatWakeFailurePreamble + boundary + formatWakeFailureDiagnostic)`,
+ * exactly as src/execution/wake-delivery.ts composes it (the same literal
+ * boundary line), with a synthetic task/execution identity and paths. The
+ * diagnostic is built by the real builder over a real group/task shape.
+ */
+function recoverableStopFixture() {
+  const task = makeTask(
+    "task-recover-a",
+    "Validate real Main focus, native settings/editor, and owned terminal restoration in a PTY",
+    "paused_recoverable",
+    {
+      bundle: { waveRoot: "/tmp/fixture-wave-root" },
+      executorEntryId: "exec-entry-fixture",
+      error: "No progress detected.",
+      summary: "No progress: candidate tree unchanged after correction.",
+      activity: [{ sequence: 1, phase: "reviewing", message: "reviewing needs_changes" }],
+    },
+  );
+  const group = makeGroup("execute", [task], "exec-recover-a");
+  const diagnostic = buildWakeFailureDiagnostic({
+    group: group as never,
+    task: task as never,
+    content: "Task task-recover-a continuation stopped: No progress detected.",
+  });
+  const content = capNotificationText(
+    `${formatWakeFailurePreamble(diagnostic)}\n\nFailure recovery diagnostic (curated and bounded; use SubtasksInspect for the full current snapshot):\n${formatWakeFailureDiagnostic(diagnostic)}`,
+    WAKE_FAILURE_NOTIFICATION_CAP,
+  );
+  return { task, group, diagnostic, content };
+}
+
+/** A real watch checkpoint body from the actual formatter. */
+function watchFixture() {
+  return formatWatchEvent([{
+    executionId: "exec-watch-a",
+    kind: "execute" as never,
+    revision: 3,
+    tasks: [{
+      taskId: "t-watch-1",
+      definition: { title: "Active checkpoint work" },
+      state: "running" as never,
+      updatedAt: new Date().toISOString(),
+      activity: [{ sequence: 1, phase: "running", message: "still working", at: new Date().toISOString() }],
+      timing: { totalMs: 5000 },
+    }],
+  } as never], {} as never);
+}
 
 // ── pi-review-subtask-event ──────────────────────────────────────────────────
 
@@ -153,6 +211,146 @@ test("subtask-event collapsed: failure without a usable diagnostic falls back to
   // A malformed Task line (no title/state) with no valid diagnostic falls back.
   const malformed = { role: "custom", customType: "pi-review-subtask-event", content: "Task: t-1 only\nSome unstructured text.", display: true };
   assert.equal(lines(renderSubtaskEventCollapsed(malformed, {}, THEME)).join("\n"), "Task: t-1 only\nSome unstructured text.");
+});
+
+/** The registered renderer for one family, as the host would invoke it. */
+function registeredRenderer(type: string): (message: unknown, options: unknown, theme: unknown) => unknown {
+  const registered = new Map<string, (message: unknown, options: unknown, theme: unknown) => unknown>();
+  registerNotificationMessageRenderers({
+    registerMessageRenderer: (customType: string, renderer: (message: unknown, options: unknown, theme: unknown) => unknown) => {
+      registered.set(customType, renderer);
+    },
+  });
+  const renderer = registered.get(type);
+  assert.ok(renderer, `a renderer is registered for ${type}`);
+  return renderer!;
+}
+
+/** The complete retained text as the shared expanded view renders it. */
+function fullText(message: unknown, width = 1000): string {
+  return lines(renderFullMessageContent(message, {}, THEME), width).join("\n");
+}
+
+/**
+ * Runs one assertion block with a resolvable native hint host installed, so a
+ * row that legitimately carries no hint is distinguishable from a row whose
+ * hint merely could not be resolved. The host is always cleared afterwards.
+ */
+function withExpansionHintHost<T>(run: () => T): T {
+  const host: NativeExpansionHost = {
+    keyHint: (_keybinding: string, description: string) => `ctrl+o ${description}`,
+    keyText: () => "ctrl+o",
+    visibleWidth: (line: string) => line.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "").length,
+  };
+  setNativeExpansionHost(host);
+  try {
+    return run();
+  } finally {
+    setNativeExpansionHost(undefined);
+  }
+}
+
+test("subtask-event collapsed: real failure preamble + curated JSON compacts with absent, empty, and valid structured details", () => {
+  const { diagnostic, content } = recoverableStopFixture();
+  // Four delivery shapes: structured details absent, empty, present but with an
+  // unusable empty diagnostic, and the real valid diagnostic. The curated
+  // diagnostic is recovered from the retained producer text in the first three;
+  // valid structured metadata stays authoritative in the fourth.
+  const shapes: unknown[] = [undefined, {}, { diagnostic: {} }, { state: "paused_recoverable", executionId: "exec-recover-a", taskId: "task-recover-a", diagnostic }];
+  const compactViews: string[] = [];
+  for (const details of shapes) {
+    const message = { role: "custom", customType: "pi-review-subtask-event", content, display: true, details };
+    const component = renderSubtaskEventCollapsed(message, {}, THEME);
+    assert.equal(isFullTextFallback(component), false, `recognized failure content must compact (details: ${JSON.stringify(details)})`);
+    const out = lines(component, 1000).join("\n");
+    compactViews.push(out);
+    assert.ok(out.includes("[subtask] Validate real Main focus, native settings/editor, and owned terminal restoration in a PTY"), "recorded title in the compact header");
+    assert.ok(out.includes("PAUSED (RECOVERABLE)"), "recorded recovery state");
+    assert.ok(out.includes("· 0/1"), "groupSummary progress from the curated diagnostic");
+    assert.ok(out.includes("Error: No progress detected."), "immediate error stays visible");
+    assert.ok(out.includes("Task task-recover-a continuation stopped: No progress detected."), "immediate notice stays visible");
+    // Every recovery action stays visible collapsed — not only the first.
+    for (const action of diagnostic.recovery.suggestedActions) {
+      assert.ok(out.includes(action), `recovery action visible: ${action.slice(0, 48)}…`);
+    }
+    assert.ok(out.includes("SubtasksInspect"), "inspect-first ordering preserved");
+    assert.ok(out.includes("SubtasksContinue"), "continuation instruction preserved");
+    assert.ok(out.includes("SubtasksForceMerge"), "force-merge instruction preserved");
+    assert.ok(out.includes("SubtasksInterrupt"), "live-writer interruption instruction preserved");
+    assert.ok(!out.includes("Failure recovery diagnostic (curated"), "the JSON block is not part of the compact view");
+    assert.notEqual(out, content, "the compact view is not the complete retained text");
+  }
+  // The text-only and structured paths produce the identical compact card.
+  for (const view of compactViews.slice(1)) assert.equal(view, compactViews[0], "the diagnostics recovered from text match the structured diagnostic's view");
+});
+
+test("subtask-event registered renderer: recovered failure content expands to the entire retained text and contracts", () => {
+  const { content } = recoverableStopFixture();
+  const renderer = registeredRenderer("pi-review-subtask-event");
+  const message = { role: "custom", customType: "pi-review-subtask-event", content, display: true, details: {} };
+  const collapsed = lines(renderer(message, { expanded: false, outputPad: 1 }, THEME), 1000).join("\n");
+  const expanded = lines(renderer(message, { expanded: true, outputPad: 1 }, THEME), 1000).join("\n");
+  const contracted = lines(renderer(message, { expanded: false, outputPad: 1 }, THEME), 1000).join("\n");
+  assert.ok(collapsed.includes("[subtask] Validate real Main focus"), "collapsed is the compact recovery card");
+  assert.ok(!collapsed.includes("Failure recovery diagnostic (curated"), "collapsed hides the curated JSON block");
+  assert.equal(expanded, fullText(message), "expanded is the complete retained notification text");
+  assert.ok(expanded.includes("Failure recovery diagnostic (curated and bounded; use SubtasksInspect for the full current snapshot):"), "expanded includes the full curated diagnostic block");
+  assert.equal(contracted, collapsed, "contraction restores the compact state");
+});
+
+test("subtask-event collapsed: a malformed, truncated, or identity-inconsistent failure stays full-text with no compaction promise", () => {
+  const { diagnostic, content } = recoverableStopFixture();
+  const boundaryMarker = "Failure recovery diagnostic (curated and bounded; use SubtasksInspect for the full current snapshot):";
+  // A second, genuinely real diagnostic for a DIFFERENT task/execution: the
+  // preamble belongs to the first, so the embedded JSON is unrelated data.
+  const otherTask = makeTask("task-recover-b", "A different fixture task", "paused_recoverable", { bundle: { waveRoot: "/tmp/other" } });
+  const otherGroup = makeGroup("execute", [otherTask], "exec-recover-b");
+  const otherDiagnostic = buildWakeFailureDiagnostic({ group: otherGroup as never, task: otherTask as never, content: "other" });
+  const truncated = content.slice(0, content.lastIndexOf("}"));
+  const cases: Record<string, string> = {
+    "unknown shape": "A historical failure note with no recognized producer preamble.",
+    "mismatched task identity": content.replace("Task task-recover-a requires", "Task task-other requires"),
+    "mismatched state identity": content.replace("state PAUSED_RECOVERABLE in", "state FAILED in"),
+    "mismatched notice": content.replace(`Notice: ${diagnostic.message}`, "Notice: a different notice"),
+    "truncated JSON": `${truncated}…[truncated]`,
+    "unrelated JSON": `${formatWakeFailurePreamble(diagnostic)}\n\n${boundaryMarker}\n${formatWakeFailureDiagnostic(otherDiagnostic)}`,
+    "inlined preamble": `Report body that merely mentions the shape\n${content}`,
+    "missing boundary": `${formatWakeFailurePreamble(diagnostic)}\n\nNo curated diagnostic followed.`,
+  };
+  for (const [label, body] of Object.entries(cases)) {
+    const message = { role: "custom", customType: "pi-review-subtask-event", content: body, display: true, details: {} };
+    const component = renderSubtaskEventCollapsed(message, {}, THEME);
+    assert.equal(isFullTextFallback(component), true, `${label}: must fall back to the full retained text`);
+    assert.equal(lines(component, 1000).join("\n"), fullText(message), `${label}: the full retained text is shown unchanged`);
+  }
+});
+
+test("subtask-event registered renderer: nonempty invalid or identity-conflicting metadata stays full-text with no hint in either state", () => {
+  const { content } = recoverableStopFixture();
+  const renderer = registeredRenderer("pi-review-subtask-event");
+  const cases: Record<string, unknown> = {
+    // Nonempty but unusable structured metadata is meaningful recorded state
+    // and must never be replaced by the text-derived diagnostic.
+    "nonempty partial diagnostic": { diagnostic: { taskState: "paused_recoverable" } },
+    "nonempty invalid diagnostic": { diagnostic: { taskState: "bogus_state", title: "x", message: "y", recovery: { suggestedActions: ["z"] } } },
+    // Absent/empty diagnostic metadata permits text recovery, but the recovered
+    // identity may not contradict any identity the details DID supply.
+    "conflicting taskId": { taskId: "task-other", diagnostic: {} },
+    "conflicting executionId": { executionId: "exec-other", diagnostic: {} },
+    "conflicting state": { state: "landed", diagnostic: {} },
+  };
+  withExpansionHintHost(() => {
+    for (const [label, details] of Object.entries(cases)) {
+      const message = { role: "custom", customType: "pi-review-subtask-event", content, display: true, details };
+      const collapsed = lines(renderer(message, { expanded: false, outputPad: 1 }, THEME), 1000).join("\n");
+      const expanded = lines(renderer(message, { expanded: true, outputPad: 1 }, THEME), 1000).join("\n");
+      assert.equal(collapsed, fullText(message), `${label}: complete retained text collapsed`);
+      assert.equal(expanded, fullText(message), `${label}: complete retained text expanded`);
+      assert.equal(collapsed.includes("to expand"), false, `${label}: no expand hint is advertised`);
+      assert.equal(expanded.includes("to collapse"), false, `${label}: no collapse hint is advertised`);
+      assert.equal(collapsed.includes("[subtask] Validate real Main focus"), false, `${label}: no compact recovery header`);
+    }
+  });
 });
 
 // ── pi-review-bg-shell ───────────────────────────────────────────────────────
@@ -373,4 +571,77 @@ test("registration: registers exactly the five types and reports success", () =>
 test("registration: returns false and registers nothing when the API is absent", () => {
   const ok = registerNotificationMessageRenderers({ notARegistration: () => {} });
   assert.equal(ok, false);
+});
+
+// ── Real producer coverage across all five families (#92 compaction) ─────────
+
+test("every registered family: real producer output compacts collapsed and expands to the complete retained text", () => {
+  const completionTask = makeTask("t-done", "Completed fixture work", "landed");
+  const completionGroup = makeGroup("execute", [completionTask], "exec-done");
+  const completionContent = formatExecutionEvent(completionGroup as never, completionTask as never, "completion", "Worker reported success.");
+  const bgShell = formatWakePayload({
+    id: "job-cover", label: "cover", command: "npm run cover",
+    event: { kind: "exit", lane: "now", reason: "exited 1" },
+    elapsedMs: 1000, exitCode: 1, lines: ["cover diagnostic line"], totalLines: 1,
+  });
+  const watch = watchFixture();
+  const scheduled = formatScheduledDispatchFailure("e-cover", makeEntry("Cover") as never, DUE, "the entry has no workspace");
+  const turn = formatScheduledOrchestratorTurnContent(
+    { instructions: "COVER-TURN-INSTRUCTIONS: carry out the scheduled request." },
+    { entryId: "e-turn", entryName: "Turn cover", cron: "0 9 * * *", dueAt: DUE, dueLabel: "09:00" },
+  );
+  const cases: Array<{ type: string; content: string; details?: unknown; label: string; deep: string }> = [
+    {
+      type: "pi-review-subtask-event", content: completionContent,
+      details: { state: "landed", executionId: "exec-done", taskId: "t-done" },
+      label: "[subtask] Completed fixture work", deep: "Execution exec-done COMPLETE: 1/1 tasks landed.",
+    },
+    {
+      type: "pi-review-bg-shell", content: bgShell, details: { id: "job-cover", kind: "exit" },
+      label: "[bg-shell] cover (job-cover)", deep: 'background job "cover" (job-cover) — exited 1',
+    },
+    {
+      type: "pi-review-subtask-watch", content: watch,
+      details: { executions: [{ executionId: "exec-watch-a", kind: "execute", revision: 3, tasks: [{ state: "running" }] }] },
+      label: "[subtask-watch]", deep: "Active checkpoint work",
+    },
+    {
+      type: "pi-review-scheduled-task-event", content: scheduled, details: undefined,
+      label: "[scheduled] DISPATCH FAILED", deep: "COVER-NONE",
+    },
+    {
+      type: "pi-review-scheduled-orchestrator-turn", content: turn, details: { entryId: "e-turn", dueAt: DUE.toISOString() },
+      label: "[scheduled-turn]", deep: "COVER-TURN-INSTRUCTIONS: carry out the scheduled request.",
+    },
+  ];
+  for (const { type, content, details, label, deep } of cases) {
+    const renderer = registeredRenderer(type);
+    const message = { role: "custom", customType: type, content, display: true, details };
+    const collapsed = lines(renderer(message, { expanded: false, outputPad: 1 }, THEME), 1000).join("\n");
+    const expanded = lines(renderer(message, { expanded: true, outputPad: 1 }, THEME), 1000).join("\n");
+    assert.ok(collapsed.includes(label), `${type}: compact header (${label})`);
+    assert.equal(expanded, fullText(message), `${type}: expanded is the complete retained notification text`);
+    assert.notEqual(collapsed, expanded, `${type}: the compact view must differ from the complete text`);
+    if (deep !== "COVER-NONE") {
+      assert.ok(expanded.includes(deep), `${type}: the complete text keeps ${deep.slice(0, 40)}`);
+      assert.equal(collapsed.includes(deep), false, `${type}: the compact view hides the deep-only content`);
+    }
+  }
+});
+
+// ── Honest fallback affordance (explicit state, never line comparison) ───────
+
+test("full-text fallback rows are explicitly marked; compact rows are not", () => {
+  const { content } = recoverableStopFixture();
+  const compact = renderSubtaskEventCollapsed({ role: "custom", customType: "pi-review-subtask-event", content, display: true, details: {} }, {}, THEME);
+  assert.equal(isFullTextFallback(compact), false, "a compacted row is not marked as a full-text fallback");
+  const fallback = renderSubtaskEventCollapsed({ role: "custom", customType: "pi-review-subtask-event", content: "unknown historical shape", display: true }, {}, THEME);
+  assert.equal(isFullTextFallback(fallback), true, "an un-compactable row is explicitly marked");
+  for (const body of ["", "A historical note\nwith two lines."]) {
+    const message = { role: "custom", customType: "pi-review-bg-shell", content: body, display: true };
+    assert.equal(isFullTextFallback(renderBgShellCollapsed(message, {}, THEME)), true, "bg-shell unknown shape is marked");
+    assert.equal(isFullTextFallback(renderSubtaskWatchCollapsed(message, {}, THEME)), true, "watch unknown shape is marked");
+    assert.equal(isFullTextFallback(renderScheduledTaskEventCollapsed(message, {}, THEME)), true, "scheduled-event unknown shape is marked");
+    assert.equal(isFullTextFallback(renderScheduledOrchestratorTurnCollapsed(message, {}, THEME)), true, "scheduled-turn unknown shape is marked");
+  }
 });

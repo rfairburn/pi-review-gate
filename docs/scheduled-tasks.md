@@ -188,7 +188,10 @@ failure or an uncertain dispatch, or a duplicate/retry warning — while an
 orchestrator-turn delivery never claims the turn executed or completed: its full
 instructions and metadata are visible by expanding the item. Expansion reveals all of
 the delivered event text and nothing beyond it; it fetches nothing and changes no
-delivery or scheduling behavior. See [Development → Shared native presentation
+delivery or scheduling behavior. A notification whose shape is unknown, malformed, or
+inconsistent is shown as its full retained text and carries no expand/collapse hint
+(there is no compact view to restore), rather than a summary fabricated from
+unrelated content. See [Development → Shared native presentation
 expansion](development.md#shared-native-presentation-expansion).
 
 Installed Pi starts an idle custom-message turn without emitting

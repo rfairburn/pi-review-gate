@@ -578,7 +578,25 @@ Boundaries shared by all five families:
   behavior. This is compaction of the delivered text, not replacement of it.
 - Unknown historical or malformed notification formats fall back to the full retained
   text rather than a potentially misleading summary, and when the host's renderer APIs
-  are absent the native full presentation applies instead of a degraded guess.
+  are absent the native full presentation applies instead of a degraded guess. A
+  row that falls back to its complete retained text is explicitly marked as such, so
+  it carries NO expand/collapse hint in either state — the hint would advertise a
+  change expansion cannot make — while a genuinely compact row keeps its hint. The
+  signal is explicit renderer state, never a comparison of rendered lines, so width,
+  theme, or partial rendering cannot disable a real row's expansion. Tool-result rows
+  do not participate in this fallback signaling and are rendered unchanged.
+- A failure/recovery notification compacts from its curated diagnostic whether the
+  diagnostic arrived as structured message details or only inside the retained
+  notification text. The text-only path recognizes only the producer's own preamble
+  and literal diagnostic-boundary line, validates the embedded JSON structurally, and
+  requires its task/execution/kind/state/revision/progress identities and its
+  notice/summary/error text to agree with the preamble — so unrelated, inlined, or
+  truncated JSON can never be compacted into a misleading recovery summary. Valid
+  structured details remain authoritative; nonempty but unusable structured metadata
+  is never replaced by a text-derived diagnostic, and a diagnostic recovered from
+  text is rejected when it contradicts a supplied taskId, executionId, or state.
+  Genuinely unknown, malformed, invalid, or identity-inconsistent content keeps the
+  full retained text.
 - Each notification renders in the host's own native custom-message card in both
   states: the pi-tui `Box(1, 1, (t) => theme.bg("customMessageBg", t))` boundary the
   default `CustomMessageComponent` uses — one-cell horizontal/vertical padding, every

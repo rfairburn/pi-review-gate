@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { Writable } from "node:stream";
 import test from "node:test";
@@ -10,6 +11,7 @@ import type { InstanceManagerOptions, NativeInstanceView, ShutdownResult } from 
 import type { SessionHostFrameWriterOptions } from "../src/session-host/frame-writer";
 import type { KeyboardCapabilityObserverOptions } from "../src/session-host/input";
 import type { StatusBroker } from "../src/session-host/broker";
+import { NativeAgentRegistry, type ProfilePreparer } from "../src/session-host/profiles";
 import type { TerminalFrame, TerminalInputModes } from "../src/session-host/terminal-surface";
 import { SidebarController } from "../src/session-host/sidebar";
 import { __test, type SessionHostOptions } from "../src/session-host/main";
@@ -200,7 +202,7 @@ class FakeManager {
   readonly closeExitedCalls: string[] = [];
   readonly refusedCloseIds = new Set<string>();
   readonly resizeCalls: { cols: number; rows: number; ids: string[] }[] = [];
-  readonly createOptions: { label: string; workspace: string; profile?: string }[] = [];
+  readonly createOptions: { label: string; workspace: string }[] = [];
   readonly order: string[];
   onChange?: (id: string) => void;
   nextId = 1;
@@ -239,7 +241,7 @@ class FakeManager {
     return true;
   }
 
-  create(options: { label: string; workspace: string; profile?: string }): Promise<string> {
+  create(options: { label: string; workspace: string }): Promise<string> {
     this.createOptions.push({ ...options });
     const id = `native-${this.nextId++}`;
     const error = this.nextError;
@@ -341,6 +343,7 @@ interface Harness {
   broker: StatusBroker & { disposeCalls: number; order: string[] };
   manager?: FakeManager;
   sidebar?: SidebarController;
+  brokerOptions?: { socketRoot?: string };
   reports: string[];
   events: string[];
   result: Promise<number>;
@@ -380,6 +383,7 @@ function createHarness(
   } as unknown as StatusBroker & { readonly disposeCalls: number; order: string[] };
   let manager: FakeManager | undefined;
   let sidebar: SidebarController | undefined;
+  let brokerOptions: { socketRoot?: string } | undefined;
   let harness!: Harness;
   const result = __test.runWithDependencies(options(overrides), {
     platform: "linux",
@@ -392,7 +396,7 @@ function createHarness(
       assert.equal(env.PI_REVIEW_GATE_RUNTIME_ROLE, undefined);
       return { file: executable ?? "/synthetic/pi", version: "1.0.4" };
     },
-    createBroker: async () => { events.push("broker.create"); return broker; },
+    createBroker: async (brokerSetup) => { brokerOptions = brokerSetup; events.push("broker.create"); return broker; },
     createManager: (managerOptions) => {
       events.push("manager.create");
       manager = new FakeManager(managerOptions, events);
@@ -400,21 +404,34 @@ function createHarness(
       return manager as never;
     },
     createSidebar: (sidebarOptions) => {
+      events.push("sidebar.construct");
       sidebar = new SidebarController(sidebarOptions);
       if (harness) harness.sidebar = sidebar;
       return sidebar;
     },
     createTerminal: () => { events.push("terminal.construct"); return terminal; },
+    createSessionSetup: () => {
+      events.push("setup.construct");
+      return {
+        nativeSetup: false,
+        profileRegistry: {
+          prepare: () => { throw new Error("the fake Main manager must not prepare sessions"); },
+        } satisfies ProfilePreparer,
+      };
+    },
     createObserver: (observerOptions) => {
       events.push("observer.construct");
       observer.onChange = observerOptions?.onChange;
       return observer;
     },
-    createWriter: (_output, _writerOptions?: SessionHostFrameWriterOptions) => writer,
+    createWriter: (_output, _writerOptions?: SessionHostFrameWriterOptions) => { events.push("writer.construct"); return writer; },
     reportError: (message) => reports.push(message),
     ...dependencyOverrides,
   });
-  harness = { options: options(overrides), stdin, stdout, signals, terminal, observer, writer, broker, reports, events, manager, sidebar, result };
+  harness = {
+    options: options(overrides), stdin, stdout, signals, terminal, observer, writer, broker, reports, events, manager, sidebar, result,
+    get brokerOptions() { return brokerOptions; },
+  };
   // Manager and sidebar construction occur after the broker's first asynchronous boundary.
   void result.then(() => undefined);
   return harness;
@@ -458,10 +475,11 @@ function fillForm(terminal: FakeTerminal, label: string, workspace = "/explicit/
 }
 
 function completeForm(terminal: FakeTerminal, label: string, workspace = "/explicit/workspace"): void {
+  terminal.emitInput("\x15"); // replace any retained label draft
   terminal.emitInput(label);
   terminal.emitInput(ENTER); // label -> workspace
+  terminal.emitInput("\x15"); // replace any retained workspace draft
   terminal.emitInput(workspace);
-  terminal.emitInput(ENTER); // workspace -> profile
   terminal.emitInput(ENTER); // submit
 }
 
@@ -509,7 +527,7 @@ test("Main module import is inert: no ProcessTerminal, native PTY, terminal list
   execFileSync(process.execPath, ["-e", script], { cwd: process.cwd(), stdio: "pipe" });
 });
 
-test("the actual startup-options helper rejects before probe, socket, profiles, terminal, or listeners", async () => {
+test("the actual startup-options helper rejects before probe, socket, setup, terminal, or listeners", async () => {
   const harness = createHarness({ args: ["--session", "/credential-like-secret.jsonl"] });
   assert.equal(await harness.result, 1);
   assert.deepEqual(harness.events, [], "startup admission precedes all injected runtime dependencies");
@@ -517,6 +535,22 @@ test("the actual startup-options helper rejects before probe, socket, profiles, 
   assert.equal(harness.stdout.listenerCount("error"), 0);
   assert.deepEqual(harness.reports, ["Session host startup options were rejected."]);
   assert.doesNotMatch(harness.reports.join(""), /credential-like-secret|jsonl/);
+});
+
+test("nonempty PI_CODING_AGENT_SESSION_DIR rejects before dependency construction", async () => {
+  const harness = createHarness({
+    env: {
+      PATH: process.env.PATH,
+      HOME: "/synthetic-home",
+      PI_CODING_AGENT_SESSION_DIR: "/synthetic-session-dir-secret",
+    },
+  });
+  assert.equal(await harness.result, 1);
+  assert.deepEqual(harness.events, [], "the inherited storage override is rejected before any runtime factory");
+  assert.equal(harness.stdin.listenerCount("data"), 0);
+  assert.equal(harness.stdout.listenerCount("error"), 0);
+  assert.deepEqual(harness.reports, ["Session host startup options were rejected."]);
+  assert.doesNotMatch(harness.reports.join(""), /synthetic-session-dir-secret/);
 });
 
 test("missing package-root helper fails closed without searching an ancestor helper", async () => {
@@ -554,6 +588,49 @@ test("snapshotted args/env survive caller mutation after startup admission and r
   assert.equal(env.PI_REVIEW_GATE_RUNTIME_ROLE, "late-role");
   const status = await closeWithSignal(harness);
   assert.equal(status, 0);
+});
+
+test("Main native mode binds the captured Pi environment, not --state-root, to the shared agent directory", async () => {
+  const root = mkdtempSync(join(process.cwd(), ".session-host-main-native-"));
+  const home = join(root, "home");
+  const agentDir = join(root, "native-agent");
+  const workspace = join(root, "workspace");
+  const hostStateRoot = join(root, "host-state");
+  for (const directory of [home, agentDir, workspace, hostStateRoot]) {
+    mkdirSync(directory, { recursive: true });
+  }
+  const nativeEnv: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH,
+    HOME: home,
+    PI_CODING_AGENT_DIR: agentDir,
+    ANTHROPIC_API_KEY: "synthetic-provider-key",
+  };
+  const harness = createHarness({ env: nativeEnv, stateRoot: hostStateRoot }, {
+    createSessionSetup: ({ env }) => ({
+      nativeSetup: true,
+      profileRegistry: new NativeAgentRegistry({ env }),
+    }),
+  });
+  try {
+    const manager = await started(harness);
+    assert.equal(manager.options.nativeSetup, true);
+    assert.deepEqual(harness.brokerOptions, { socketRoot: hostStateRoot }, "--state-root scopes transient broker state only");
+    assert.equal(manager.options.env?.PI_CODING_AGENT_DIR, agentDir);
+    assert.equal(manager.options.env?.ANTHROPIC_API_KEY, "synthetic-provider-key");
+    const prepared = manager.options.profileRegistry?.prepare({ workspace });
+    assert.ok(prepared);
+    assert.equal(prepared.agentDir, realpathSync(agentDir));
+    assert.equal(prepared.created, false);
+    assert.notEqual(prepared.agentDir, hostStateRoot, "private host state is not a Pi agent/profile selector");
+    assert.equal(readdirSync(hostStateRoot).length, 0, "the fake broker did not turn host state into a profile tree");
+    assert.ok(readFileSync(join(agentDir, "review-gate.json"), "utf8").includes('"enabled"'));
+    prepared.release();
+    assert.equal(await closeWithSignal(harness), 0);
+  } finally {
+    harness.signals.emit("SIGTERM");
+    await harness.result;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("forms may be edited during keyboard negotiation but no native create starts until observed capabilities settle", async () => {
@@ -598,7 +675,6 @@ test("highlighting a newly created row does not transfer active input ownership;
   harness.terminal.emitInput(ALT_LEFT);
   harness.terminal.emitInput("\x1b[B"); // highlighted first -> New session
   harness.terminal.emitInput(ENTER); // Open New session
-  harness.terminal.emitInput("\x15"); // clear the retained prior draft through the real field binding
   completeForm(harness.terminal, "second", "/another/explicit/workspace");
   await nextTurn();
   assert.equal(manager.views[1]?.id, "native-2");
@@ -621,7 +697,7 @@ test("highlighting a newly created row does not transfer active input ownership;
   await nextTurn();
   assert.equal(harness.writer.frames.at(-1)?.frame.cursor.visible, false, "non-alive native frames never retain an owned cursor");
 
-  assert.equal(manager.createOptions[1]?.profile, undefined, "blank profile means a fresh independent default profile");
+  assert.deepEqual(manager.createOptions[1], { label: "second", workspace: "/another/explicit/workspace" });
   assert.equal(await closeWithSignal(harness), 0);
 });
 
@@ -869,6 +945,7 @@ test("create error row reports only a generic message and preserves the editable
   const formText = harness.sidebar.render(40, 8).lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
   assert.match(formText, /draft label/);
   assert.match(formText, /Session could not be started/);
+  assert.doesNotMatch(formText, /profile/i, "create errors do not ask for a removed Profile field");
   assert.doesNotMatch(formText, /synthetic-secret-native-error/);
   assert.equal(harness.writer.frames.some(({ frame }) => plain(frame).includes("synthetic-secret-native-error")), false);
   assert.equal(harness.reports.some((message) => message.includes("synthetic-secret")), false);
@@ -933,7 +1010,6 @@ test("responsive resize resizes every owned child only when native geometry chan
   await nextTurn();
   harness.terminal.emitInput("\x1b[B"); // next row is New session
   harness.terminal.emitInput(ENTER);
-  harness.terminal.emitInput("\x15"); // clear the retained prior draft before the second create
   completeForm(harness.terminal, "second", "/workspace-two");
   await nextTurn();
   assert.equal(manager.views.length, 2);

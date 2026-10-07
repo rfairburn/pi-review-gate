@@ -14,7 +14,7 @@
  *
  * - No process, PTY, network, filesystem, config, Git, or model work. All
  *   lifecycle/roster truth arrives as `SidebarItem` DTOs from the backend;
- *   launch/path/profile validation stays in the backend. No host module is
+ *   launch/workspace validation stays in the backend. No host module is
  *   imported — in particular no TerminalSurface.
  * - UI actions never stop an instance: hiding the sidebar, confirming an
  *   item, abandoning a form, or asking to remove an exited row only emits
@@ -85,7 +85,6 @@ export type SidebarAction =
       readonly requestId: number;
       readonly label: string;
       readonly workspace: string;
-      readonly profile?: string;
     }
   | { readonly type: "quit" }
   | { readonly type: "visibility"; readonly visible: boolean };
@@ -151,7 +150,6 @@ const LABEL_FIELD_MAX_UTF16_CODE_UNITS = 80;
 const PATH_FIELD_MAX_CODEPOINTS = 2048;
 const LABEL_FIELD_PLACEHOLDER = "session name (required)";
 const WORKSPACE_FIELD_PLACEHOLDER = "workspace path (required)";
-const PROFILE_FIELD_PLACEHOLDER = "profile (blank = fresh)";
 const ACTIVITY_LINES_MAX = 2;
 const ACTIVITY_INPUT_MAX_CODEPOINTS = 400;
 const ITEM_LABEL_INPUT_MAX_CODEPOINTS = 400;
@@ -688,7 +686,6 @@ export class SidebarController {
   private readonly onAction?: (action: SidebarAction) => void;
   private readonly labelInput: Input;
   private readonly workspaceInput: Input;
-  private readonly profileInput: Input;
   private rowStore: SidebarItem[] = [];
   private entries: SidebarEntry[] = [];
   private selectedEntryKey: string | undefined = ENTRY_NEW_KEY;
@@ -725,7 +722,6 @@ export class SidebarController {
     // label gutter; Input owns grapheme-safe editing, caret scrolling and SGR.
     this.labelInput = new Input({ prompt: "", placeholder: LABEL_FIELD_PLACEHOLDER });
     this.workspaceInput = new Input({ prompt: "", placeholder: WORKSPACE_FIELD_PLACEHOLDER });
-    this.profileInput = new Input({ prompt: "", placeholder: PROFILE_FIELD_PLACEHOLDER });
     this.workspaceInput.setValue(suggestedWorkspace);
     // A visible pane is an opened pane: the welcome picker (default) and a
     // supplied roster both take sidebar focus, while an explicitly hidden
@@ -733,9 +729,8 @@ export class SidebarController {
     this._focus = this._visible ? "sidebar" : "main";
     this.rebuildEntries();
     this.labelInput.onSubmit = () => this.advanceField();
-    this.workspaceInput.onSubmit = () => this.advanceField();
-    this.profileInput.onSubmit = () => this.submitForm();
-    for (const field of [this.labelInput, this.workspaceInput, this.profileInput]) {
+    this.workspaceInput.onSubmit = () => this.submitForm();
+    for (const field of [this.labelInput, this.workspaceInput]) {
       field.onEscape = () => this.escapeFromForm();
     }
   }
@@ -1233,8 +1228,9 @@ export class SidebarController {
    * restore the exact pre-edit caret without reaching into private state.
    */
   private enforceFieldLimit(field: Input, before: FieldSnapshot): void {
-    const fieldMax =
-      field === this.labelInput ? LABEL_FIELD_MAX_UTF16_CODE_UNITS : PATH_FIELD_MAX_CODEPOINTS;
+    const fieldMax = field === this.labelInput
+      ? LABEL_FIELD_MAX_UTF16_CODE_UNITS
+      : PATH_FIELD_MAX_CODEPOINTS;
     const value = field.getValue();
     const length = field === this.labelInput ? value.length : countCodePoints(value);
     if (length > fieldMax) {
@@ -1244,11 +1240,7 @@ export class SidebarController {
   }
 
   private activeField(): Input {
-    return this.formFieldIndex === 0
-      ? this.labelInput
-      : this.formFieldIndex === 1
-        ? this.workspaceInput
-        : this.profileInput;
+    return this.formFieldIndex === 0 ? this.labelInput : this.workspaceInput;
   }
 
   private formFieldError(max: number): void {
@@ -1259,7 +1251,7 @@ export class SidebarController {
   }
 
   private advanceField(): void {
-    if (this.formFieldIndex < 2) {
+    if (this.formFieldIndex < 1) {
       this.formFieldIndex += 1;
     }
   }
@@ -1272,7 +1264,6 @@ export class SidebarController {
     }
     const label = sanitizeCellText(this.labelInput.getValue());
     const workspace = sanitizeCellText(this.workspaceInput.getValue());
-    const profile = sanitizeCellText(this.profileInput.getValue());
     if (label.length === 0) {
       this.formFieldIndex = 0;
       this.formError = "Label is required";
@@ -1291,24 +1282,16 @@ export class SidebarController {
       this.formFieldError(PATH_FIELD_MAX_CODEPOINTS);
       return;
     }
-    if (countCodePoints(profile) > PATH_FIELD_MAX_CODEPOINTS) {
-      this.formFieldError(PATH_FIELD_MAX_CODEPOINTS);
-      return;
-    }
     const requestId = this.nextRequestId;
     this.nextRequestId += 1;
     this.pendingCreate = { requestId };
     this.formError = undefined;
-    const action: SidebarAction & { profile?: string } = {
+    const action: SidebarAction = {
       type: "create",
       requestId,
       label,
       workspace,
     };
-    if (profile.length > 0) {
-      // Blank profile means fresh; only a non-blank profile is emitted.
-      action.profile = profile;
-    }
     this.emit(action);
   }
 
@@ -1515,13 +1498,13 @@ export class SidebarController {
     if (footerLines === undefined || visibleWidth(header) > cols) {
       return this.renderTooSmall(cols, rows);
     }
-    // header + 3 fields + reserved status row + wrapped footer
-    if (rows < 1 + 3 + 1 + footerLines.length) {
+    // header + 2 fields + reserved status row + wrapped footer
+    if (rows < 1 + 2 + 1 + footerLines.length) {
       return this.renderTooSmall(cols, rows);
     }
     const fieldContentWidth = Math.max(cols - PREFIELD_WIDTH, 1);
-    const prompts = [" Label:     ", " Workspace: ", " Profile:   "];
-    const inputs = [this.labelInput, this.workspaceInput, this.profileInput];
+    const prompts = [" Label:     ", " Workspace: "];
+    const inputs = [this.labelInput, this.workspaceInput];
     const lines = [wrapRow(header, cols, "\x1b[1m")];
     let caretColumn = PREFIELD_WIDTH;
     for (let index = 0; index < inputs.length; index += 1) {

@@ -11,6 +11,7 @@ import { normalizeNativeSourceInput, translateInput, KeyboardCapabilityObserver 
 import {
   InstanceManager,
   type CreateInstanceOptions,
+  type InstanceManagerOptions,
   type InstanceStatusRegistration,
   type InstanceStatusUpdate,
   type NativeInstanceView,
@@ -18,13 +19,13 @@ import {
   type StatusRegistrar,
 } from "./instances";
 import { resolveNativePi, RUNTIME_ROLE_ENV, EXECUTOR_TOOL_CATALOG_ENV } from "./launch";
-import { defaultProfileStateRoot, ProfileRegistry } from "./profiles";
+import { NativeAgentRegistry, type ProfilePreparer } from "./profiles";
 import { SidebarController, type SidebarAction, type SidebarItem } from "./sidebar";
 import type { TerminalInputModes } from "./terminal-surface";
 
 const STARTUP_OPTIONS_HELPER = join("scripts", "session-host-startup-options.cjs");
 const GENERIC_FAILURE_MESSAGE = "Session host could not complete startup or cleanup.";
-const GENERIC_CREATE_FAILURE = "Session could not be started. Check the workspace and profile, then try again.";
+const GENERIC_CREATE_FAILURE = "Session could not be started. Check the workspace, then try again.";
 const REMOVE_REFUSED_MESSAGE = "Session not removed; it may be live, unconfirmed, or no longer available.";
 const REMOVE_FAILURE_MESSAGE = "Session was not removed; its state could not be confirmed.";
 const INPUT_DRAIN_MAX_MS = 250;
@@ -34,6 +35,7 @@ const INPUT_DRAIN_IDLE_MS = 50;
 export interface SessionHostOptions {
   packageRoot: string;
   piExecutable?: string;
+  /** Existing private directory for transient broker transport; never a Pi agent/profile root. */
   stateRoot?: string;
   toggleKey?: string;
   args: readonly string[];
@@ -68,8 +70,12 @@ interface MainDependencies {
   readonly stdout: MainStdout;
   readonly signals: MainSignals;
   readonly resolvePi: (options: { executable?: string; env: NodeJS.ProcessEnv }) => { file: string; version: string };
-  readonly createBroker: () => Promise<StatusBroker>;
-  readonly createManager: (options: ConstructorParameters<typeof InstanceManager>[0]) => MainManager;
+  readonly createBroker: (options?: { socketRoot?: string }) => Promise<StatusBroker>;
+  readonly createSessionSetup: (options: { env: NodeJS.ProcessEnv }) => {
+    nativeSetup: boolean;
+    profileRegistry: ProfilePreparer;
+  };
+  readonly createManager: (options: InstanceManagerOptions) => MainManager;
   readonly createSidebar: (options: ConstructorParameters<typeof SidebarController>[0]) => SidebarController;
   readonly createTerminal: () => MainTerminal;
   readonly createObserver: (options: ConstructorParameters<typeof KeyboardCapabilityObserver>[0]) => MainObserver;
@@ -215,7 +221,11 @@ function productionDependencies(): MainDependencies {
     stdout: process.stdout as unknown as MainStdout,
     signals: process as unknown as MainSignals,
     resolvePi: resolveNativePi,
-    createBroker: () => createStatusBroker(),
+    createBroker: (options) => createStatusBroker(options),
+    createSessionSetup: ({ env }) => ({
+      nativeSetup: true,
+      profileRegistry: new NativeAgentRegistry({ env }),
+    }),
     createManager: (options) => new InstanceManager(options),
     createSidebar: (options) => new SidebarController(options),
     createTerminal: () => new ProcessTerminal(),
@@ -227,7 +237,7 @@ function productionDependencies(): MainDependencies {
 
 /**
  * Run an opt-in native session host. The module is inert until this function is
- * called; it does not construct a terminal, broker, profile, timer, listener,
+ * called; it does not construct a terminal, broker, setup registry, timer, listener,
  * or PTY as an import side effect.
  */
 export async function runSessionHost(options: SessionHostOptions): Promise<number> {
@@ -518,9 +528,6 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       label: action.label,
       workspace: action.workspace,
     };
-    if (action.profile !== undefined) {
-      Object.assign(createOptions, { profile: action.profile });
-    }
     let task!: Promise<void>;
     task = (async () => {
       try {
@@ -766,7 +773,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       throw new MainFailure("preflight");
     }
 
-    broker = await dependencies.createBroker();
+    broker = await dependencies.createBroker(snapshot.stateRoot === undefined
+      ? undefined
+      : { socketRoot: snapshot.stateRoot });
     if (shutdownRequested) {
       startupComplete = true;
       beginShutdown();
@@ -796,14 +805,13 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     lastNativeCols = layout.native.cols;
     lastNativeRows = layout.native.rows;
 
-    const profileRegistry = new ProfileRegistry({
-      stateRoot: snapshot.stateRoot ?? defaultProfileStateRoot(snapshot.env),
-    });
+    const sessionSetup = dependencies.createSessionSetup({ env: snapshot.env });
     manager = dependencies.createManager({
       packageRoot,
       piExecutable: pi.file,
       statusRegistrar: statusRegistrar(broker),
-      profileRegistry,
+      nativeSetup: sessionSetup.nativeSetup,
+      profileRegistry: sessionSetup.profileRegistry,
       args: snapshot.args,
       env: snapshot.env,
       cols: layout.native.cols,

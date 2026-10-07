@@ -1033,14 +1033,14 @@ test("sidebar Escape hides with a single visibility action and keeps selection",
 // New session form
 // ---------------------------------------------------------------------------
 
-test("enter on New session opens the sidebar-owned form; Enter advances fields", () => {
+test("New session opens a two-field form and forwards only label/workspace", () => {
   const harness = formWith();
   const first = harness.controller.render(40, 8);
   const texts = assertPaneSafe(first.lines, 40, 8);
   assert.ok(texts[0].includes("New session"));
   assert.ok(texts[1].includes("Label:"));
   assert.ok(texts[2].includes("Workspace:"));
-  assert.ok(texts[3].includes("Profile:"));
+  assert.ok(!texts.some((line) => line.includes("Profile:")));
   assert.deepEqual(first.cursor, { column: 13, row: 1 });
   for (const ch of "my session") {
     harness.controller.handleInput(ch);
@@ -1050,9 +1050,12 @@ test("enter on New session opens the sidebar-owned form; Enter advances fields",
   harness.send(ENTER); // label -> workspace, still no create
   assert.deepEqual(harness.focusedActions(), []);
   assert.deepEqual(harness.controller.render(40, 8).cursor, { column: 13, row: 2 });
-  harness.send(ENTER); // workspace -> profile
-  assert.deepEqual(harness.focusedActions(), []);
-  assert.deepEqual(harness.controller.render(40, 8).cursor, { column: 13, row: 3 });
+  harness.send("/workspace");
+  harness.send(ENTER); // workspace submits directly
+  assert.deepEqual(harness.focusedActions(), [
+    { type: "create", requestId: 1, label: "my session", workspace: "/workspace" },
+  ]);
+  assert.ok(!("profile" in createOf(harness.focusedActions()[0])));
 });
 
 test("submit emits one create with a monotonic requestId and disables duplicate Enter", () => {
@@ -1060,7 +1063,6 @@ test("submit emits one create with a monotonic requestId and disables duplicate 
   harness.send("my session");
   harness.send(ENTER); // label -> workspace
   harness.send("/workspace");
-  harness.send(ENTER); // workspace -> profile
   harness.send(ENTER); // submit
   assert.deepEqual(harness.focusedActions(), [
     { type: "create", requestId: 1, label: "my session", workspace: "/workspace" },
@@ -1096,10 +1098,9 @@ test("submit emits one create with a monotonic requestId and disables duplicate 
   );
 });
 
-test("label is required; a suggested workspace never supplies an implicit name", () => {
+test("label remains temporarily required; a suggested workspace never supplies an implicit name", () => {
   const harness = formWith({ options: { initialWorkspace: "/tmp/proj one" } });
   harness.send(ENTER); // empty label -> workspace
-  harness.send(ENTER); // workspace -> profile
   harness.send(ENTER); // submit returns focus to the required label
   assert.equal(harness.controller.focus, "form");
   assert.ok(assertPaneSafe(harness.controller.render(48, 8).lines, 48, 8).some((line) => line.includes("Label is required")));
@@ -1109,7 +1110,6 @@ test("label is required; a suggested workspace never supplies an implicit name",
   harness.send(ENTER); // label -> suggested workspace
   harness.send("\x1b[4~"); // public Input End key; suggested path remains editable
   harness.send("/child");
-  harness.send(ENTER); // workspace -> profile
   harness.send(ENTER); // submit
   assert.deepEqual(harness.focusedActions().at(-1), {
     type: "create",
@@ -1123,14 +1123,12 @@ test("workspace is required and its validation preserves the label draft", () =>
   const harness = formWith();
   harness.send("project");
   harness.send(ENTER); // label -> workspace
-  harness.send(ENTER); // workspace -> profile
   harness.send(ENTER); // submit returns focus to workspace
   assert.equal(harness.controller.focus, "form");
   assert.ok(assertPaneSafe(harness.controller.render(44, 8).lines, 44, 8).some((line) => line.includes("Workspace is required")));
   assert.ok(!harness.focusedActions().some((action) => action.type === "create"));
 
   harness.send("/workspace");
-  harness.send(ENTER); // workspace -> profile
   harness.send(ENTER); // submit
   assert.deepEqual(harness.focusedActions().at(-1), {
     type: "create",
@@ -1138,24 +1136,6 @@ test("workspace is required and its validation preserves the label draft", () =>
     label: "project",
     workspace: "/workspace",
   });
-});
-
-test("explicit non-blank profile is emitted; blank profile stays omitted", () => {
-  const withProfile = formWith();
-  withProfile.send("project");
-  withProfile.send(ENTER);
-  withProfile.send("/workspace");
-  withProfile.send(ENTER);
-  withProfile.send("review");
-  withProfile.send(ENTER); // profile -> submit
-  assert.deepEqual(createOf(withProfile.focusedActions().at(-1)).profile, "review");
-  const blank = formWith();
-  blank.send("project");
-  blank.send(ENTER);
-  blank.send("/workspace");
-  blank.send(ENTER);
-  blank.send(ENTER);
-  assert.equal(createOf(blank.focusedActions().at(-1)).profile, undefined);
 });
 
 test("label limit: the 81st character is an explicit error, never truncated", () => {
@@ -1169,7 +1149,6 @@ test("label limit: the 81st character is an explicit error, never truncated", ()
   // The prior draft stays at exactly 80 code units (rollback, not truncation).
   harness.send(ENTER); // label -> workspace
   harness.send("/workspace");
-  harness.send(ENTER); // workspace -> profile
   harness.send(ENTER); // submit
   assert.equal(createOf(harness.focusedActions().at(-1)).label, "a".repeat(80));
 });
@@ -1186,7 +1165,6 @@ test("path limit: the 2049th character is an explicit error, never truncated", (
   harness.controller.handleInput("p"); // the 2049th
   const texts = assertPaneSafe(harness.controller.render(48, 8).lines, 48, 8);
   assert.ok(texts.some((line) => line.includes("exceeds 2048 characters")));
-  harness.send(ENTER); // workspace -> profile
   harness.send(ENTER); // submit
   const create = createOf(harness.focusedActions().at(-1));
   assert.equal(create.workspace, "p".repeat(2048));
@@ -1205,7 +1183,6 @@ test("label bound matches the manager's 80 UTF-16 code units", () => {
   assert.ok(!harness.focusedActions().some((action) => action.type === "create"));
   harness.send(ENTER); // label -> workspace
   harness.send("/workspace");
-  harness.send(ENTER); // workspace -> profile
   harness.send(ENTER); // valid preserved draft submits
   assert.equal(createOf(harness.focusedActions().at(-1)).label, emoji.repeat(40));
 });
@@ -1234,7 +1211,6 @@ test("Unicode labels: editing removes whole graphemes and never splits them", ()
   harness.controller.handleInput("\x7f"); // backspace: whole grapheme
   harness.send(ENTER); // label -> workspace
   harness.send("/workspace");
-  harness.send(ENTER); // workspace -> profile
   harness.send(ENTER); // submit
   const create = createOf(harness.focusedActions().at(-1));
   assert.equal(create.label, "héllo");
@@ -1245,7 +1221,6 @@ test("bounded single-line paste; multi-line paste is cleaned to one line", () =>
   harness.controller.handleInput("\x1b[200~a\nb\r\nc\x1b[201~");
   harness.send(ENTER); // label -> workspace
   harness.controller.handleInput("\x1b[200~/tmp/paste dir\x1b[201~");
-  harness.send(ENTER); // workspace -> profile
   harness.send(ENTER); // submit
   const create = createOf(harness.focusedActions().at(-1));
   assert.equal(create.label, "abc");
@@ -1301,7 +1276,6 @@ test("Ctrl+U kills the field line via the real keybinding", () => {
   }
   harness.send(ENTER); // label -> workspace
   harness.send("/workspace");
-  harness.send(ENTER); // workspace -> profile
   harness.send(ENTER); // submit
   assert.equal(createOf(harness.focusedActions().at(-1)).label, "kept");
 });
@@ -1344,7 +1318,6 @@ test("form Escape abandons the UI request and hides; the launch is never killed"
   }
   harness.send(ENTER); // label -> workspace
   harness.send("/workspace");
-  harness.send(ENTER); // workspace -> profile
   harness.send(ENTER); // submit -> create request 1
   const texts = assertPaneSafe(harness.controller.render(40, 8).lines, 40, 8);
   assert.ok(texts.some((line) => line.includes("Starting (request 1)")));
@@ -1422,7 +1395,7 @@ test("failCreate preserves entered fields and shows the sanitized error", () => 
   assert.ok(texts.some((line) => line.includes("No such workspaceboom")));
   assert.ok(texts.every((line) => !line.includes("Starting")));
   // Draft preserved: re-submitting needs no retyping and gets a fresh id.
-  harness.send(ENTER); // profile -> submit -> request 2
+   harness.send(ENTER); // submit -> request 2
   const create = createOf(harness.focusedActions().at(-1));
   assert.equal(create.requestId, 2);
   assert.equal(create.label, "first");
@@ -1480,7 +1453,7 @@ test("stale create callbacks never contaminate the current form or selection", (
   assert.ok(texts.every((line) => !line.includes("late")));
   // A stale completion cannot steal focus while a newer request is pending:
   // submit again (request 2) and replay the old completion.
-  harness.send(ENTER); // profile -> submit -> request 2
+   harness.send(ENTER); // submit -> request 2
   harness.controller.completeCreate(1, "stale-row");
   assert.equal(harness.controller.focus, "form");
   assert.equal(harness.controller.selectedId, undefined);
@@ -1709,14 +1682,14 @@ test("long validated toggle chords render in full, wrapping or falling back inst
 
 test("tiny form and confirm geometry falls back to a truthful too-small pane", () => {
   const form = formWith();
-  // 24x6: the wrapped two-line footer no longer fits under header+fields+status.
-  const tooSmallForm = form.controller.render(24, 6);
+  // 24x5 cannot fit header+two fields+status+the wrapped two-line footer.
+  const tooSmallForm = form.controller.render(24, 5);
   assert.ok(tooSmallForm.lines.some((line) => line.includes("too small")));
   assert.equal(tooSmallForm.cursor, undefined);
-  // One more row renders the full form again.
-  const fits = form.controller.render(24, 7);
+  // One more row renders the full two-field form again.
+  const fits = form.controller.render(24, 6);
   assert.deepEqual(fits.cursor, { column: 13, row: 1 });
-  assertPaneSafe(fits.lines, 24, 7);
+  assertPaneSafe(fits.lines, 24, 6);
 
   const confirm = makeRoster(["alive"]);
   confirm.send("q");

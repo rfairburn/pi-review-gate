@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import type { IPty } from "@lydell/node-pty";
 
-import { PreparedProfile, ProfileRegistry } from "./profiles";
+import { NativeAgentRegistry, PreparedProfile, ProfilePreparer } from "./profiles";
 import {
   SESSION_HOST_BOOTSTRAP_ENV,
   NativeLaunchDescriptor,
@@ -12,23 +12,21 @@ import {
 import { TerminalSurface } from "./terminal-surface";
 
 /**
- * Independent owned-PTY instance lifecycle for the optional per-instance
+ * Independent owned-PTY process lifecycle for the optional per-instance
  * custom terminal host (#323 alpha, POSIX only).
  *
- * `InstanceManager` owns the full native lifecycle of one or more isolated
- * native Pi session-host instances. Every instance owns, exclusively:
+ * `InstanceManager` owns the full native lifecycle of one or more independent
+ * native Pi session-host processes. By default every row uses one shared
+ * native Pi agent directory; only explicit legacy test mode uses private
+ * profiles. Each row owns, exclusively:
  *
- * - one admitted profile (`ProfileRegistry.prepare`): independent agent
- *   directory, admission, and persistence; the profile helper owns
- *   admission, generated defaults, and persistence, the manager never copies
- *   auth, settings, or any profile content;
  * - one explicitly selected workspace (canonical cwd of the child);
  * - one prepared native launch descriptor (`prepareNativeLaunch`) applied
  *   verbatim: file/argv/env/cwd are never rewritten by the manager;
  * - one status registration created BEFORE the child is spawned, whose
  *   JSON bootstrap ({@linkcode SESSION_HOST_BOOTSTRAP_ENV}) is injected only
  *   into a fresh clone of the descriptor env at the actual PTY spawn —
- *   never during profile/skills/provision work and never into the caller's
+ *   never during setup work and never into the caller's
  *   environment, which is never mutated;
  * - one `InstancePty` (real @lydell/node-pty 1.2.0-beta.15, lazy-loaded only
  *   when the default factory actually spawns; never imported eagerly so a
@@ -58,7 +56,7 @@ import { TerminalSurface } from "./terminal-surface";
  *   handle only, no global process scans, no arbitrary group kills, no
  *   daemon/adopted-descendant cleanup (remaining handles are reported
  *   honestly and are released only when their own exit event fires).
- *   Profile admission is released only after a known child exit or a
+ *   Setup admission is released only after a known child exit or a
  *   failed spawn before any child exists; a kill that never settles never
  *   frees an admission as if it were safely gone.
  * - Resource ownership is recorded before any spawned-child callback can
@@ -186,7 +184,7 @@ export interface CreateInstanceOptions {
 	label: string;
 	/** Explicit workspace directory for the instance's child process. */
 	workspace: string;
-	/** Explicit profile directory; omitted creates a new private profile. */
+	/** Legacy-test-only explicit profile directory; native setup rejects it. */
 	profile?: string;
 }
 
@@ -197,8 +195,10 @@ export interface InstanceManagerOptions {
 	piExecutable: string;
 	/** Per-instance status registrar (the future broker); rows are registered before spawn. */
 	statusRegistrar: StatusRegistrar;
-	/** Profile registry; defaults to a fresh standard registry. */
-	profileRegistry?: ProfileRegistry;
+  /** Native setup is the production/default mode; false requires explicit test injection. */
+  nativeSetup?: boolean;
+  /** Structural setup preparer (legacy option name retained for compatibility). */
+  profileRegistry?: ProfilePreparer;
 	/** Native pi arguments snapshotted at construction and forwarded verbatim to each launch. */
 	args?: readonly string[];
 	/** Environment snapshotted at construction (or from process.env); caller originals are never mutated. */
@@ -420,7 +420,8 @@ export class InstanceManager {
 	readonly #packageRoot: string;
 	readonly #piExecutable: string;
 	readonly #statusRegistrar: StatusRegistrar;
-	readonly #profileRegistry: ProfileRegistry;
+	readonly #profilePreparer: ProfilePreparer;
+	readonly #nativeSetup: boolean;
 	readonly #args: readonly string[];
 	readonly #env: NodeJS.ProcessEnv;
 	#cols: number;
@@ -450,13 +451,20 @@ export class InstanceManager {
 		this.#packageRoot = options.packageRoot;
 		this.#piExecutable = options.piExecutable;
 		this.#statusRegistrar = options.statusRegistrar;
-		this.#profileRegistry = options.profileRegistry ?? new ProfileRegistry();
 		this.#args = [...(options.args ?? [])];
 		this.#env = { ...(options.env ?? process.env) };
 		this.#cols = options.cols ?? DEFAULT_INSTANCE_COLS;
 		this.#rows = options.rows ?? DEFAULT_INSTANCE_ROWS;
 		validateDimension(this.#cols, "cols");
 		validateDimension(this.#rows, "rows");
+		if (options.profileRegistry !== undefined && options.nativeSetup === undefined) {
+			throw new Error("session-host: nativeSetup must be explicit when a setup preparer is injected");
+		}
+		if (options.nativeSetup === false && options.profileRegistry === undefined) {
+			throw new Error("session-host: nativeSetup:false requires an explicitly injected legacy setup preparer");
+		}
+		this.#nativeSetup = options.nativeSetup ?? true;
+		this.#profilePreparer = options.profileRegistry ?? new NativeAgentRegistry({ env: this.#env });
 		this.#getSupportedKeyboardFlags = options.getSupportedKeyboardFlags;
 		this.#onChange = options.onChange;
 		this.#ptyFactory = options.ptyFactory ?? createDefaultPtyFactory();
@@ -504,7 +512,7 @@ export class InstanceManager {
 	/**
 	 * Remove one row whose owned PTY has confirmed exit. This never signals a
 	 * process: unknown rows, rows without an observed PTY exit, and every
-	 * still-owned live process are left untouched. Persistent workspace/profile
+	 * still-owned live process are left untouched. Persistent workspace/native
 	 * data is outside the manager's cleanup ownership and is never removed.
 	 * Returns true only when the row was removed; otherwise returns false.
 	 */
@@ -671,8 +679,8 @@ export class InstanceManager {
 	 * owned child never signaled before (default windows), disposes terminal
 	 * surfaces, and releases status registrations. Exited rows keep their
 	 * recorded truth; rows whose child never confirmed exit keep lifecycle
-	 * 'alive' and hold their profile admission (never freed as if safely
-	 * gone) until their own exit event fires. Profile/session files and
+	 * 'alive' and hold their setup admission (never freed as if safely
+	 * gone) until their own exit event fires. Native/session files and
 	 * unknown files are never touched by this module.
 	 */
 	async dispose(): Promise<void> {
@@ -731,9 +739,10 @@ export class InstanceManager {
 	 */
 	async #launchInstance(record: ManagedInstance, options: { workspace: string; profile?: string }): Promise<void> {
 		try {
-			// 1. Profile admission (the helper owns admission, generated
-			// defaults, and persistence; no tokens exist yet anywhere).
-			const profile = this.#profileRegistry.prepare({
+			// 1. Setup admission. Native mode shares the fixed Pi root; legacy
+			// mode is available only through explicit test injection. No tokens
+			// exist yet anywhere.
+			const profile = this.#profilePreparer.prepare({
 				workspace: options.workspace,
 				profile: options.profile === "" ? undefined : options.profile,
 			});
@@ -750,6 +759,7 @@ export class InstanceManager {
 			// 2. Native launch preparation (verbatim; the launch module owns
 			// its helper responsibilities; skills publication happens here).
 			const descriptor: NativeLaunchDescriptor = prepareNativeLaunch({
+				nativeSetup: this.#nativeSetup,
 				packageRoot: this.#packageRoot,
 				agentDir: profile.agentDir,
 				workspace: profile.workspace,
@@ -766,7 +776,7 @@ export class InstanceManager {
 
 			// 3. Status registration immediately before the spawn; its JSON
 			// bootstrap is injected only into a fresh env clone below, at the
-			// actual PTY spawn — never during the profile/skills work above and
+			// actual PTY spawn — never during setup work above and
 			// never into the caller's or user's environment.
 			const registration: { current?: InstanceStatusRegistration } = {};
 			const handle = this.#statusRegistrar.register(record.id, {

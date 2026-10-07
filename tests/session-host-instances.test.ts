@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync as readBytesSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import test from "node:test";
 
@@ -34,15 +33,16 @@ import { TerminalSurface } from "../src/session-host/terminal-surface";
  *
  * IMPORTANT EVIDENCE SCOPE: all manager cases use a FAKE status registrar;
  * everything except the final native-addon case also uses FAKE PTYs. These
- * prove manager ownership/lifecycle semantics, while the final case exercises
- * the pinned PTY binding with an owned Node shim. Neither proves real Pi 1.0.4,
- * actual preload/gate behavior, broker/protocol integration, or native Main
+ * include one own-root native-setup descriptor/preservation case, but do not
+ * prove native Pi runtime behavior. The final case exercises the pinned PTY
+ * binding with an owned Node shim. None proves real Pi 1.0.4, actual
+ * preload/gate behavior, broker/protocol integration, or native Main
  * compatibility; the parent owns those integrated checks. Broker/protocol
  * components have landed, but this file does not exercise them.
  */
 
 function makeTestRoot(label: string): string {
-  return realpathSync(mkdtempSync(join(tmpdir(), `prg-instances-${label}-`)));
+  return realpathSync(mkdtempSync(join(process.cwd(), `.prg-instances-${label}-`)));
 }
 
 const SHUTDOWN_ENV_KEYS = [
@@ -341,6 +341,7 @@ function makeHarness(label: string, options: HarnessOptions = {}): Harness {
     packageRoot: pkg.packageRoot,
     piExecutable: pkg.piExecutable,
     statusRegistrar: registrar,
+    nativeSetup: false,
     profileRegistry,
     args: [],
     env: options.managerEnv ?? cleanTestEnv(),
@@ -406,6 +407,7 @@ test("create posts a truthful starting-to-alive row with an independently admitt
       packageRoot: harness.packageRoot,
       piExecutable: harness.piExecutable,
       statusRegistrar: harness.registrar,
+      nativeSetup: false,
       profileRegistry: new ProfileRegistry({ stateRoot: harness.stateRoot }),
       args: ["--model", "test-model"],
       env: managerEnv,
@@ -496,6 +498,138 @@ test("create posts a truthful starting-to-alive row with an independently admitt
   }
 });
 
+test("default native setup shares one owned Pi root without copying resources or coupling child ownership", { skip: process.platform === "win32" }, async () => {
+  const harness = makeHarness("native-shared-root");
+  try {
+    const agentDir = join(harness.root, "native-agent");
+    const home = join(harness.root, "native-home");
+    const sessionDir = join(agentDir, "sessions");
+    mkdirSync(home, { recursive: true });
+    mkdirSync(join(agentDir, "skills", "user-skill"), { recursive: true });
+    mkdirSync(join(agentDir, "extensions"), { recursive: true });
+    mkdirSync(sessionDir, { recursive: true });
+    const nativeFiles = new Map<string, Buffer>([
+      [join(agentDir, "review-gate.json"), Buffer.from('{"enabled":false,"nativeMarker":"keep-config-bytes"}\n')],
+      [join(agentDir, "settings.json"), Buffer.from('{"theme":"native-settings"}\n')],
+      [join(agentDir, "keybindings.json"), Buffer.from('{"native":"keybindings"}\n')],
+      [join(agentDir, "models.json"), Buffer.from('{"native":"models"}\n')],
+      [join(agentDir, "mcp.json"), Buffer.from('{"native":"mcp"}\n')],
+      [join(agentDir, "auth.json"), Buffer.from('{"native":"auth fixture"}\n')],
+      [join(agentDir, "skills", "user-skill", "SKILL.md"), Buffer.from("native skill bytes\n")],
+      [join(agentDir, "extensions", "native-extension.ts"), Buffer.from("native extension bytes\n")],
+      [join(sessionDir, "saved-conversation.jsonl"), Buffer.from("native conversation bytes\n")],
+    ]);
+    for (const [path, bytes] of nativeFiles) writeFileSync(path, bytes);
+
+    const nativeEnv: NodeJS.ProcessEnv = {
+      PATH: process.env.PATH,
+      HOME: home,
+      PI_CODING_AGENT_DIR: agentDir,
+      PI_CODING_AGENT_SESSION_DIR: sessionDir,
+      PI_PROVIDER_FIXTURE_KEY: "synthetic-provider-key",
+      ANTHROPIC_API_KEY: "synthetic-auth-key",
+      PI_IMAGE_PROTOCOL: "native-image-selection",
+      PI_REVIEW_GATE_CODEMODE_DEFAULT: "0",
+    };
+    const manager = new InstanceManager({
+      packageRoot: harness.packageRoot,
+      piExecutable: harness.piExecutable,
+      statusRegistrar: harness.registrar,
+      args: ["--model", "fixture/native-model"],
+      env: nativeEnv,
+      ptyFactory: harness.ptyFactory,
+    });
+
+    const idA = await manager.create({ label: "temporary-a", workspace: harness.workspace });
+    const idB = await manager.create({ label: "temporary-b", workspace: harness.workspace2 });
+    const viewA = viewFor(manager, idA);
+    const viewB = viewFor(manager, idB);
+    assert.equal(viewA.agentDir, realpathSync(agentDir));
+    assert.equal(viewB.agentDir, viewA.agentDir, "default manager admissions share the canonical native root");
+    assert.equal(viewA.workspace, realpathSync(harness.workspace));
+    assert.equal(viewB.workspace, realpathSync(harness.workspace2));
+    assert.notEqual(viewA.workspace, viewB.workspace);
+    assert.notEqual(harness.spawned[0]?.pid, harness.spawned[1]?.pid, "child process ownership stays independent");
+
+    for (const [index, id, workspace] of [
+      [0, idA, harness.workspace],
+      [1, idB, harness.workspace2],
+    ] as const) {
+      const descriptor = harness.spawned[index]?.spawnDescriptor;
+      assert.ok(descriptor);
+      assert.equal(descriptor.cwd, realpathSync(workspace));
+      assert.equal(descriptor.env.PI_CODING_AGENT_DIR, realpathSync(agentDir));
+      assert.equal(descriptor.env.PI_REVIEW_GATE_CONFIG, undefined, "native config discovery is not overridden per child");
+      assert.equal(descriptor.env.PI_PROVIDER_FIXTURE_KEY, "synthetic-provider-key");
+      assert.equal(descriptor.env.ANTHROPIC_API_KEY, "synthetic-auth-key");
+      assert.equal(descriptor.env.PI_CODING_AGENT_SESSION_DIR, sessionDir, "ordinary native session storage is preserved");
+      assert.equal(descriptor.env.PI_IMAGE_PROTOCOL, "native-image-selection");
+      assert.equal(descriptor.env.PI_REVIEW_GATE_CODEMODE_DEFAULT, "0");
+      assert.deepEqual(descriptor.args.slice(-2), ["--model", "fixture/native-model"]);
+      assert.equal(JSON.parse(descriptor.env[SESSION_HOST_BOOTSTRAP_ENV] as string).instanceId, id);
+    }
+    assert.notEqual(
+      JSON.parse(harness.spawned[0]!.spawnDescriptor.env[SESSION_HOST_BOOTSTRAP_ENV] as string).token,
+      JSON.parse(harness.spawned[1]!.spawnDescriptor.env[SESSION_HOST_BOOTSTRAP_ENV] as string).token,
+      "per-child status authorization remains independent",
+    );
+    assert.deepEqual(readDirNames(harness.stateRoot), [], "native mode creates no private profile tree");
+    for (const [path, bytes] of nativeFiles) {
+      assert.deepEqual(readBytesSync(path), bytes, `native resource bytes survive launch: ${path}`);
+    }
+
+    manager.write(idA, "only-child-a");
+    assert.deepEqual(harness.spawned[0]?.writes.at(-1), "only-child-a");
+    assert.equal(harness.spawned[1]?.writes.includes("only-child-a"), false, "input stays addressed to one child");
+
+    const registrationsBeforeGuard = harness.registrar.entries.length;
+    const guardedManager = new InstanceManager({
+      packageRoot: harness.packageRoot,
+      piExecutable: harness.piExecutable,
+      statusRegistrar: harness.registrar,
+      args: ["--session", "synthetic-session-secret"],
+      env: nativeEnv,
+      ptyFactory: harness.ptyFactory,
+    });
+    const guardedId = await guardedManager.create({ label: "guarded", workspace: harness.workspace });
+    assert.equal(viewFor(guardedManager, guardedId).lifecycle, "error");
+    assert.equal(viewFor(guardedManager, guardedId).error, "session-host: instance launch preparation failed");
+    assert.equal(harness.registrar.entries.length, registrationsBeforeGuard, "startup-option rejection happens before status registration");
+    assert.equal(harness.spawned.length, 2, "rejected startup selection spawns no child");
+    for (const [path, bytes] of nativeFiles) {
+      assert.deepEqual(readBytesSync(path), bytes, `startup-option rejection preserves native bytes: ${path}`);
+    }
+    await guardedManager.dispose();
+
+    // A failed create is contained to its own row and does not touch native
+    // resources or the independently live sibling.
+    const failedId = await manager.create({
+      label: "bad-workspace",
+      workspace: join(harness.root, "missing-workspace"),
+    });
+    assert.equal(viewFor(manager, failedId).lifecycle, "error");
+    assert.equal(harness.spawned.length, 2, "workspace admission failure spawns no third child");
+    assert.equal(viewFor(manager, idB).hasLiveProcess, true, "failed creation does not stop its sibling");
+    for (const [path, bytes] of nativeFiles) {
+      assert.deepEqual(readBytesSync(path), bytes, `failed create preserves native bytes: ${path}`);
+    }
+
+    harness.spawned[0]!.emitExit(0);
+    assert.equal(manager.closeExited(idA), true);
+    assert.equal(viewFor(manager, idB).hasLiveProcess, true, "removal does not activate or stop a sibling");
+    for (const [path, bytes] of nativeFiles) {
+      assert.deepEqual(readBytesSync(path), bytes, `removing an exited row preserves native bytes: ${path}`);
+    }
+    assert.deepEqual(readDirNames(harness.stateRoot), []);
+
+    harness.spawned[1]!.exitsOnSignal = "SIGTERM";
+    await manager.shutdown({ graceMs: 30, killMs: 30 });
+    await manager.dispose();
+  } finally {
+    cleanup(harness);
+  }
+});
+
 test("constructor snapshots caller arguments and environment for every later sibling launch", async () => {
   const harness = makeHarness("constructor-snapshot");
   try {
@@ -506,6 +640,7 @@ test("constructor snapshots caller arguments and environment for every later sib
       packageRoot: harness.packageRoot,
       piExecutable: harness.piExecutable,
       statusRegistrar: harness.registrar,
+      nativeSetup: false,
       profileRegistry: new ProfileRegistry({ stateRoot: harness.stateRoot }),
       args: callerArgs,
       env: callerEnv,
@@ -542,6 +677,7 @@ test("constructor snapshots caller arguments and environment for every later sib
         packageRoot: harness.packageRoot,
         piExecutable: harness.piExecutable,
         statusRegistrar: harness.registrar,
+        nativeSetup: false,
         profileRegistry: new ProfileRegistry({ stateRoot: harness.stateRoot }),
         ptyFactory: harness.ptyFactory,
       });
@@ -737,6 +873,7 @@ test("exit freezes the retained frame with a truthful code, drops late events, a
       packageRoot: harness.packageRoot,
       piExecutable: harness.piExecutable,
       statusRegistrar: harness.registrar,
+      nativeSetup: false,
       profileRegistry: registry,
       env: cleanTestEnv(),
       ptyFactory: harness.ptyFactory,
@@ -967,6 +1104,7 @@ test("an exit callback during listener registration cannot revive a starting row
       packageRoot: harness.packageRoot,
       piExecutable: harness.piExecutable,
       statusRegistrar: harness.registrar,
+      nativeSetup: false,
       profileRegistry: registry,
       env: cleanTestEnv(),
       ptyFactory: factory,
@@ -999,6 +1137,7 @@ test("a row closed reentrantly during exit-listener registration does not alloca
       packageRoot: harness.packageRoot,
       piExecutable: harness.piExecutable,
       statusRegistrar: harness.registrar,
+      nativeSetup: false,
       profileRegistry: new ProfileRegistry({ stateRoot: harness.stateRoot }),
       env: cleanTestEnv(),
       ptyFactory: (descriptor) => {
@@ -1077,6 +1216,7 @@ test("a synchronous output-queue failure stays an error and stops only its owner
       packageRoot: harness.packageRoot,
       piExecutable: harness.piExecutable,
       statusRegistrar: harness.registrar,
+      nativeSetup: false,
       profileRegistry: registry,
       env: cleanTestEnv(),
       ptyFactory: factory,
@@ -1122,6 +1262,7 @@ test("PTY setup failure keeps process truth and admission until the owned child 
       packageRoot: harness.packageRoot,
       piExecutable: harness.piExecutable,
       statusRegistrar: harness.registrar,
+      nativeSetup: false,
       profileRegistry: registry,
       env: cleanTestEnv(),
       ptyFactory: factory,
@@ -1164,6 +1305,7 @@ test("a native PTY read error is contained to its owner until that child confirm
       packageRoot: harness.packageRoot,
       piExecutable: harness.piExecutable,
       statusRegistrar: harness.registrar,
+      nativeSetup: false,
       profileRegistry: registry,
       env: cleanTestEnv(),
       ptyFactory: harness.ptyFactory,
@@ -1210,6 +1352,7 @@ test("expected UnixTerminal read-error codes do not fail healthy instances or mi
       packageRoot: harness.packageRoot,
       piExecutable: harness.piExecutable,
       statusRegistrar: harness.registrar,
+      nativeSetup: false,
       profileRegistry: new ProfileRegistry({ stateRoot: harness.stateRoot }),
       env: cleanTestEnv(),
       ptyFactory: harness.ptyFactory,
@@ -1255,6 +1398,7 @@ test("read-error listener remains installed through synchronous native exit disp
       packageRoot: harness.packageRoot,
       piExecutable: harness.piExecutable,
       statusRegistrar: harness.registrar,
+      nativeSetup: false,
       profileRegistry: new ProfileRegistry({ stateRoot: harness.stateRoot }),
       env: cleanTestEnv(),
       ptyFactory: harness.ptyFactory,
@@ -1316,6 +1460,7 @@ test("failed spawn before a child exists is truthful and exposes no upstream dia
       packageRoot: harness.packageRoot,
       piExecutable: harness.piExecutable,
       statusRegistrar: harness.registrar,
+      nativeSetup: false,
       profileRegistry: registry,
       args: ["--model", argumentSecret],
       env: managerEnv,
@@ -1389,6 +1534,7 @@ test("resize and query-write failures never expose argv, provider env, config, o
       packageRoot: harness.packageRoot,
       piExecutable: harness.piExecutable,
       statusRegistrar: harness.registrar,
+      nativeSetup: false,
       profileRegistry: registry,
       args: ["--model", argumentSecret],
       env: managerEnv,
@@ -1469,6 +1615,7 @@ test("a throwing resume after successful pause fails only its owner and retains 
       packageRoot: harness.packageRoot,
       piExecutable: harness.piExecutable,
       statusRegistrar: harness.registrar,
+      nativeSetup: false,
       profileRegistry: registry,
       env: cleanTestEnv(),
       ptyFactory: harness.ptyFactory,
@@ -1519,6 +1666,7 @@ test("a throwing pause is a fatal owned PTY I/O error", async () => {
       packageRoot: harness.packageRoot,
       piExecutable: harness.piExecutable,
       statusRegistrar: harness.registrar,
+      nativeSetup: false,
       profileRegistry: registry,
       env: cleanTestEnv(),
       ptyFactory: harness.ptyFactory,
@@ -1646,6 +1794,7 @@ test("a child that never settles keeps its admission and is reported with remain
       packageRoot: harness.packageRoot,
       piExecutable: harness.piExecutable,
       statusRegistrar: harness.registrar,
+      nativeSetup: false,
       profileRegistry: registry,
       env: cleanTestEnv(),
       ptyFactory: harness.ptyFactory,
@@ -1691,6 +1840,7 @@ test("shutdown recomputes remaining handles after a timed-out child exits while 
       packageRoot: harness.packageRoot,
       piExecutable: harness.piExecutable,
       statusRegistrar: harness.registrar,
+      nativeSetup: false,
       profileRegistry: new ProfileRegistry({ stateRoot: harness.stateRoot }),
       env: cleanTestEnv(),
       ptyFactory: harness.ptyFactory,
@@ -1848,6 +1998,25 @@ test("dispose without prior shutdown gracefully stops un-signaled children; alre
 test("constructor validation and defaults", async () => {
   const harness = makeHarness("ctor");
   try {
+    assert.throws(
+      () => new InstanceManager({
+        packageRoot: harness.packageRoot,
+        piExecutable: harness.piExecutable,
+        statusRegistrar: harness.registrar,
+        nativeSetup: false,
+      }),
+      /nativeSetup:false requires an explicitly injected legacy setup preparer/,
+    );
+    assert.throws(
+      () => new InstanceManager({
+        packageRoot: harness.packageRoot,
+        piExecutable: harness.piExecutable,
+        statusRegistrar: harness.registrar,
+        profileRegistry: new ProfileRegistry({ stateRoot: harness.stateRoot }),
+      }),
+      /nativeSetup must be explicit/,
+      "injected setup preparers cannot silently select legacy/native launch mode",
+    );
     assert.throws(() => new InstanceManager({ packageRoot: "", piExecutable: "x", statusRegistrar: harness.registrar }), /packageRoot/);
     assert.throws(() => new InstanceManager({ packageRoot: "p", piExecutable: "", statusRegistrar: harness.registrar }), /piExecutable/);
     assert.throws(
@@ -1954,6 +2123,7 @@ test("pinned native addon: independent PTYs with an owned Node shim, explicit cw
     packageRoot: harness.packageRoot,
     piExecutable: pi,
     statusRegistrar: harness.registrar,
+    nativeSetup: false,
     profileRegistry: new ProfileRegistry({ stateRoot: harness.stateRoot }),
     env: cleanTestEnv(),
   });

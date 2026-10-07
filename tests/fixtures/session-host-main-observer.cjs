@@ -40,6 +40,8 @@ module.exports = (pi) => {
   pi.on('session_start', (...args) => {
     const context = contextFrom(args);
     nativeSessionId = sessionIdFrom(context);
+    let activeTools;
+    try { activeTools = pi.getActiveTools(); } catch { activeTools = undefined; }
     append('session_start', {
       contextCwd: typeof context?.cwd === 'string' ? context.cwd : undefined,
       sessionFile: context?.sessionManager && typeof context.sessionManager.getSessionFile === 'function'
@@ -47,6 +49,7 @@ module.exports = (pi) => {
         : undefined,
       mode: context?.mode,
       tty: process.stdout.isTTY === true,
+      activeTools: Array.isArray(activeTools) ? activeTools : undefined,
       credentialLikeEnvironmentNames: Object.keys(process.env)
         .filter((name) => /(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|PASSWORD)/i.test(name))
         .sort(),
@@ -60,6 +63,7 @@ module.exports = (pi) => {
   });
 
   pi.on('agent_start', () => append('agent_start'));
+  pi.on('agent_settled', () => append('agent_settled'));
   pi.on('tool_call', (event) => append('tool_call', {
     toolName: typeof event?.toolName === 'string' ? event.toolName : undefined,
   }));

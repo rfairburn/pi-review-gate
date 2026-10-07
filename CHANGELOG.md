@@ -15,6 +15,34 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.128]
+
+### Added
+
+- Optional `pi-review-sessions` terminal host alpha for same-machine POSIX
+  macOS/Linux (#323, related research #274). Each explicitly created row owns
+  an independent native Pi process, workspace, persistent private profile and
+  native conversation. Highlighting or hiding a row changes no ownership;
+  activation is explicit and input is never broadcast. The separate launcher
+  requires Node 22.19.0+, stable Pi 1.0.4+ and a supported readable Node CLI
+  entry. Parent resume/session/storage overrides are rejected; ordinary native
+  arguments and commands remain native. Public terminal APIs, independent
+  headless surfaces and bounded generated frames provide text/SGR display and
+  observed generic sidebar status, with explicit Unicode, mouse and platform
+  limits. Existing standalone launchers remain unchanged. See
+  [the alpha guide](docs/session-host-alpha.md).
+
+### Fixed
+
+- Background-shell exit cleanup preserves native and foreign asynchronous
+  signal handlers through the public, directly pinned `signal-exit` API
+  instead of deleting handlers and re-sending signals (#324). Owned-job
+  termination/watchdog cleanup and ordinary Windows behavior remain intact.
+- Pending-question widgets retain their current-session public widget sink
+  separately from fresh shortcut dialog/editor contexts, with stale-context
+  fences. Answer completion clears observed pending status without inventing
+  lifecycle events or inferring clearance from idle state (#323).
+
 ## [0.1.0-dev.127]
 
 ### Fixed

@@ -11,6 +11,8 @@ const destination = process.env.PRG_SESSION_HOST_NATIVE_MAIN_OBSERVER_FILE;
 if (!destination) throw new Error('session-host Main observer destination is missing');
 
 let nativeSessionId;
+let currentSessionManager;
+let lastStoredName;
 
 function contextFrom(args) {
   return args.find((value) => value && typeof value === 'object' && value.sessionManager);
@@ -22,6 +24,36 @@ function sessionIdFrom(context) {
     ? manager.getSessionId()
     : nativeSessionId;
 }
+
+function storedNameFrom(context) {
+  const manager = context && context.sessionManager;
+  if (!manager || typeof manager.getSessionName !== 'function') return undefined;
+  try {
+    const name = manager.getSessionName();
+    return typeof name === 'string' && name.trim() ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function displayNameFromStoredName(name) {
+  const safe = Array.from(name.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')).slice(0, 256);
+  return safe.join('').trim() || '(no messages)';
+}
+
+function observeStoredName() {
+  const name = storedNameFrom({ sessionManager: currentSessionManager });
+  if (!name || name === lastStoredName) return;
+  lastStoredName = name;
+  append('native_session_name', {
+    sessionId: nativeSessionId,
+    storedName: name,
+    displayName: displayNameFromStoredName(name),
+  });
+}
+
+const namePoller = setInterval(observeStoredName, 50);
+namePoller.unref();
 
 function append(type, fields = {}) {
   fs.appendFileSync(destination, `${JSON.stringify({
@@ -40,13 +72,20 @@ module.exports = (pi) => {
   pi.on('session_start', (...args) => {
     const context = contextFrom(args);
     nativeSessionId = sessionIdFrom(context);
+    currentSessionManager = context?.sessionManager;
+    lastStoredName = storedNameFrom(context);
     let activeTools;
     try { activeTools = pi.getActiveTools(); } catch { activeTools = undefined; }
+    const storedName = lastStoredName;
+    // These fixture-created sessions start empty. Never journal first-user
+    // fallback text: the question/privacy case intentionally stores prompts.
     append('session_start', {
       contextCwd: typeof context?.cwd === 'string' ? context.cwd : undefined,
       sessionFile: context?.sessionManager && typeof context.sessionManager.getSessionFile === 'function'
         ? context.sessionManager.getSessionFile()
         : undefined,
+      storedName,
+      displayName: storedName ? displayNameFromStoredName(storedName) : '(no messages)',
       mode: context?.mode,
       tty: process.stdout.isTTY === true,
       activeTools: Array.isArray(activeTools) ? activeTools : undefined,
@@ -56,8 +95,10 @@ module.exports = (pi) => {
     });
   });
 
-  pi.on('session_shutdown', (...args) => {
+  pi.on('session_shutdown', (event, ...args) => {
+    observeStoredName();
     append('session_shutdown', {
+      reason: typeof event?.reason === 'string' ? event.reason : undefined,
       contextSessionId: sessionIdFrom(contextFrom(args)),
     });
   });

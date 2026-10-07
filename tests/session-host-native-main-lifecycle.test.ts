@@ -36,7 +36,7 @@
  * this file, the shared harness, and the existing uniquely named fixtures.
  */
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, realpathSync, watch as fsWatch, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, watch as fsWatch, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -55,11 +55,11 @@ import {
   createEditorLog,
   createOwnedScratchRoot,
   makeRuntimeEnvironment,
+  makeNativeAgentRoot,
   makeWorkspace,
   processIsAlive,
   removeOwnedScratchTreePruningTerraform,
   resolveRuntimePin,
-  sha256,
 } from "./helpers/session-host-native-main-harness";
 
 // Paced Main-lifecycle specialization of the scripted faux provider (public
@@ -128,24 +128,6 @@ function providerJournalRecords(path: string): ProviderJournalRecord[] {
   return records;
 }
 
-/**
- * One explicit existing synthetic profile with the zero-model gate config and
- * deferred tools DISABLED, so AskUserQuestion is launch-active exactly like
- * the production sessions in which the question UI is used. No auth, settings,
- * models, or any other content is copied into the profile.
- */
-function makeOwnedProfile(scratch: string, name: string): string {
-  const profile = join(scratch, "profiles", name);
-  mkdirSync(profile, { recursive: true, mode: 0o700 });
-  writeFileSync(join(profile, "review-gate.json"), JSON.stringify({
-    enabled: true,
-    review: { activeReviewers: [] },
-    externalAgents: {},
-    execution: { deferredPiTools: false, workerResources: {}, routes: { execute: [], research: [] } },
-  }, undefined, 2), { mode: 0o600 });
-  return realpathSync(profile);
-}
-
 function rowHasInputBadge(text: string, label: string): boolean {
   return sidebarPaneText(text).split("\n").some((line) => line.includes(label) && line.includes("[input]"));
 }
@@ -186,13 +168,13 @@ function registerCaseCleanup(t: { after(fn: () => Promise<void>): void }, state:
       && cleanup.shutdownEventsObserved
       && cleanup.gracefulHostExit
       && !cleanup.forced;
-    // Scratch is removed only after a fully successful body AND confirmed
-    // graceful cleanup; any assertion failure preserves the 0700-owned tree
-    // (even when cleanup itself was graceful) as test-debug evidence.
+    // Preserve failed witnesses. The compatibility cleanup entry point also
+    // retains successful runtime trees until positive per-entry ownership
+    // receipts exist; root creation alone never authorizes recursive removal.
     if (state.assertionsCompleted === true && cleanupConfirmed) {
       try {
         if (!removeOwnedScratchTreePruningTerraform(state.scratch)) {
-          process.stderr.write("preserved owned Main scratch: a .terraform subtree was intentionally pruned from cleanup\n");
+          process.stderr.write(`preserved Main runtime witness (per-entry ownership receipts unavailable): ${state.scratch}\n`);
         }
       } catch {
         process.stderr.write("preserved owned Main scratch: bounded cleanup could not positively remove every entry\n");
@@ -227,6 +209,7 @@ async function startTwoLiveChildren(
   const scratch = state.scratch;
   const workspaceA = makeWorkspace(scratch, "workspace-a");
   const workspaceB = makeWorkspace(scratch, "workspace-b");
+  const nativeAgentDir = makeNativeAgentRoot(scratch);
   const editorTarget = join(workspaceA, "editor-target");
   mkdirSync(editorTarget, { mode: 0o700 });
   const observerFile = join(scratch, "observer", "native-main.jsonl");
@@ -234,7 +217,7 @@ async function startTwoLiveChildren(
   const editor = createEditorExecutable(scratch, editorTarget, editorLog);
   const candidate = compileAndStageCandidate(scratch);
 
-  const startEnv = makeRuntimeEnvironment(scratch, runtime, editor, observerFile, editorLog, "");
+  const startEnv = makeRuntimeEnvironment(scratch, runtime, editor, observerFile, editorLog, "", nativeAgentDir);
   assert.deepEqual(Object.keys(startEnv).filter((name) => /(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|PASSWORD)/i.test(name)), [],
     "the synthetic native child environment contains no external credentials");
   const args = ["--offline", "--no-context-files", "--no-themes", "--no-tools", "--extension", OBSERVER_FIXTURE];
@@ -259,10 +242,25 @@ async function startTwoLiveChildren(
   const suffix = Math.random().toString(16).slice(2, 8);
   const labelA = `A-${suffix}`;
   const labelB = `B-${suffix}`;
-  const sessionA = await driver.createNativeSession(labelA, workspaceA);
-  const sessionB = await driver.createNativeSession(labelB, workspaceB);
-  assert.equal(processIsAlive(sessionA.record.pid), true, "A is a live native child before the shutdown case");
-  assert.equal(processIsAlive(sessionB.record.pid), true, "B is a live native child before the shutdown case");
+  const sessionA = await driver.createNativeSession(workspaceA);
+  await driver.renameNativeSession(sessionA, labelA);
+  const sessionB = await driver.createNativeSession(workspaceB);
+  await driver.renameNativeSession(sessionB, labelB);
+  assert.equal(sessionA.record.agentDir, nativeAgentDir, "A uses the fixture's shared normal native agent root");
+  assert.equal(sessionB.record.agentDir, nativeAgentDir, "B uses the same shared normal native agent root");
+  assert.notEqual(sessionA.record.pid, sessionB.record.pid, "the native children own distinct PIDs");
+  assert.notEqual(sessionA.record.sessionId, sessionB.record.sessionId,
+    "the shared native root still contains independently owned conversations");
+  assert.notEqual(sessionA.record.sessionFile, sessionB.record.sessionFile,
+    "each native child retains its own conversation file under shared discovery");
+  assert.equal(sessionA.record.cwd, workspaceA, "A owns its explicitly selected workspace");
+  assert.equal(sessionB.record.cwd, workspaceB, "B owns its explicitly selected workspace");
+  for (const session of [sessionA, sessionB]) {
+    assert.equal(session.record.tty, true, `${session.rowProbe} has its own real native PTY`);
+    assert.deepEqual(session.record.credentialLikeEnvironmentNames, [],
+      `${session.rowProbe} inherited no external credential-like environment variables`);
+    assert.equal(processIsAlive(session.record.pid), true, `${session.rowProbe} is a live native child before the shutdown case`);
+  }
   return { runtime, scratch, driver, labelA, labelB, sessionA, sessionB };
 }
 
@@ -272,10 +270,20 @@ async function assertLiveChildShutdown(
   cause: string,
 ): Promise<void> {
   const { driver, sessionA, sessionB } = setup;
-  await driver.waitForRecords((records) => records.some((record) => record.type === "session_shutdown"
-    && record.pid === sessionA.record.pid), `real A session_shutdown lifecycle event after ${cause}`);
-  await driver.waitForRecords((records) => records.some((record) => record.type === "session_shutdown"
-    && record.pid === sessionB.record.pid), `real B session_shutdown lifecycle event after ${cause}`);
+  const shutdownRecords = await driver.waitForRecords((records) => [sessionA, sessionB].every((session) =>
+    records.some((record) => record.type === "session_shutdown" && record.pid === session.record.pid),
+  ), `real A/B session_shutdown lifecycle events after ${cause}`);
+  const signalShutdown = cause.includes("SIGTERM") || cause.includes("SIGHUP");
+  // Both outer signals enter Main's graceful manager shutdown; native Pi may
+  // report its quit disposition or the child-side SIGTERM. Never copy the
+  // outer cause into this public native event.
+  const allowedNativeReasons = signalShutdown ? new Set(["quit", "SIGTERM"]) : new Set(["quit"]);
+  for (const session of [sessionA, sessionB]) {
+    const shutdown = shutdownRecords.filter((record) => record.type === "session_shutdown"
+      && record.pid === session.record.pid).at(-1);
+    assert.ok(shutdown && allowedNativeReasons.has(shutdown.reason ?? ""),
+      `${session.rowProbe} reports an observed native quit reason after ${cause}; got ${shutdown?.reason ?? "missing"}`);
+  }
   await sessionA.exitWatcher.waitForExit(EVENT_TIMEOUT_MS);
   await sessionB.exitWatcher.waitForExit(EVENT_TIMEOUT_MS);
   assert.equal(sessionA.exitWatcher.observedExit, true,
@@ -300,12 +308,9 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
   const state: CaseState = { scratch };
   registerCaseCleanup(t, state);
 
-  // Explicit existing synthetic profiles: launch-active AskUserQuestion via
-  // deferredPiTools:false, zero auth/settings/models copies.
-  const profileA = makeOwnedProfile(scratch, "profile-a");
-  const profileB = makeOwnedProfile(scratch, "profile-b");
   const workspaceA = makeWorkspace(scratch, "workspace-a");
   const workspaceB = makeWorkspace(scratch, "workspace-b");
+  const nativeAgentDir = makeNativeAgentRoot(scratch, { deferredPiTools: false });
   const editorTarget = join(workspaceA, "editor-target");
   mkdirSync(editorTarget, { mode: 0o700 });
   const observerFile = join(scratch, "observer", "native-main.jsonl");
@@ -335,7 +340,7 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
   };
   writeFileSync(join(stateDir, "turn-script.json"), JSON.stringify(turnScript), { mode: 0o600 });
 
-  const startEnv = makeRuntimeEnvironment(scratch, runtime, editor, observerFile, editorLog, "");
+  const startEnv = makeRuntimeEnvironment(scratch, runtime, editor, observerFile, editorLog, "", nativeAgentDir);
   startEnv.PRG_FIXTURE_AGENT_DIR = runtime.agentDir;
   startEnv.PRG_FIXTURE_STATE_DIR = stateDir;
   assert.deepEqual(Object.keys(startEnv).filter((name) => /(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|PASSWORD)/i.test(name)), [],
@@ -374,22 +379,28 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
   // the smallest width can be matched against their real rendered rows.
   const labelA = "QA";
   const labelB = "QB";
-  const sessionA = await driver.createNativeSession(labelA, workspaceA, profileA);
-  const sessionB = await driver.createNativeSession(labelB, workspaceB, profileB);
+  const sessionA = await driver.createNativeSession(workspaceA);
+  assert.equal(sessionA.record.displayName, "(no messages)", "A begins with the actual native empty-conversation fallback");
+  await driver.renameNativeSession(sessionA, labelA);
+  const sessionB = await driver.createNativeSession(workspaceB);
+  assert.equal(sessionB.record.displayName, "(no messages)", "B begins with the actual native empty-conversation fallback");
+  await driver.renameNativeSession(sessionB, labelB);
 
-  // Both children adopted the explicit existing profiles they were given.
-  assert.equal(sessionA.record.agentDir, profileA, "A runs under its explicit existing synthetic profile");
-  assert.equal(sessionB.record.agentDir, profileB, "B runs under its explicit existing synthetic profile");
+  assert.equal(sessionA.record.agentDir, nativeAgentDir, "A uses the fixture's one shared normal native root");
+  assert.equal(sessionB.record.agentDir, nativeAgentDir, "B uses the same shared normal native root");
+  assert.notEqual(sessionA.record.pid, sessionB.record.pid, "the native children own distinct PIDs");
   assert.notEqual(sessionA.record.sessionId, sessionB.record.sessionId,
     "Pi's public native SessionManager generated distinct conversation ids");
+  assert.notEqual(sessionA.record.sessionFile, sessionB.record.sessionFile,
+    "the children keep independent conversation files under shared discovery");
   for (const session of [sessionA, sessionB]) {
-    assert.equal(processIsAlive(session.record.pid), true, `${session.label} is a live native child`);
+    assert.equal(processIsAlive(session.record.pid), true, `${session.rowProbe} is a live native child`);
     assert.equal(session.record.tty, true, `each actual Pi process has a real owned PTY`);
     assert.deepEqual(session.record.credentialLikeEnvironmentNames, [],
       "the native process inherited no credential-like environment variables");
   }
   // AskUserQuestion is launch-active in both real gate sessions through the
-  // explicit profiles' deferredPiTools:false (no tool_search discovery).
+  // shared native root's ordinary deferredPiTools:false config.
   assert.ok(Array.isArray(sessionA.record.activeTools) && sessionA.record.activeTools.includes("AskUserQuestion"),
     "AskUserQuestion is launch-active in A's real gate session");
   assert.ok(Array.isArray(sessionB.record.activeTools) && sessionB.record.activeTools.includes("AskUserQuestion"),
@@ -406,8 +417,6 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
     EVENT_TIMEOUT_MS,
     "both real native children auto-selected the scripted faux model",
   );
-
-  const profileBDigestBefore = sha256(join(profileB, "review-gate.json"));
 
   // Establish a distinctive B draft before the question flow so ownership
   // isolation can be proven against B's real native surface.
@@ -526,18 +535,22 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
     "the real Main sidebar clears A's [input] badge to idle after the answer turn", afterRunning);
   assertSidebarHasNoQuestionContent(driver.currentText());
 
-  // B ownership isolation: no agent turns, tool calls, or profile changes.
+  // B ownership isolation: no agent turns or tool calls despite shared setup.
   // Legitimate pane-resize observations from the roster switches are allowed;
   // any agent/tool activity would break the isolation contract.
   const bRecords = driver.records().filter((record) => record.pid === sessionB.record.pid);
   for (const record of bRecords) {
-    assert.ok(record.type === "session_start" || record.type === "resize",
-      `B's independent idle native child received only session_start/resize observations (saw ${record.type})`);
+    assert.ok(record.type === "session_start" || record.type === "native_session_name" || record.type === "resize",
+      `B's independent idle native child received only start/name/resize observations (saw ${record.type})`);
   }
+  assert.deepEqual(bRecords.filter((record) => record.type === "native_session_name").map((record) => record.storedName), [labelB],
+    "B's only additional lifecycle metadata is its own intentionally persisted native name");
   assert.equal(bRecords.filter((record) => record.type === "session_start").length, 1,
-    "B observed exactly one lifecycle event (its session_start)");
-  assert.equal(sha256(join(profileB, "review-gate.json")), profileBDigestBefore,
-    "A's question flow did not change B's independent profile file");
+    "B observed exactly one session_start lifecycle event");
+  assert.equal(sessionA.record.agentDir, sessionB.record.agentDir,
+    "the question flow leaves both children on their shared native root");
+  assert.ok(!JSON.stringify(driver.records()).includes(QUESTION_TEXT),
+    "the native status-observation journal never captures question text as session-name metadata");
 
   // Faux provider journal: exactly three scripted requests, all from A; the
   // third carries the UI-delivered answer as an ordinary user message.

@@ -9,8 +9,8 @@
  * kernel exit watchers. It is test infrastructure only: no production source,
  * CI, package, docs, or SDK surface changes; no `__test` dependency-injection
  * seam is added to production. The driver's optional `args`/`env` overrides
- * and explicit-profile session creation are the only configurability added so
- * the lifecycle regressions can drive different real Main configurations.
+ * and synthetic native-agent fixture setup let lifecycle regressions drive
+ * different real Main configurations while native children share Pi state.
  *
  * Graceful native-child exit evidence: the test-only Main runner observes the
  * real pinned `@lydell/node-pty` public `spawn`/`onExit` API on the exact
@@ -36,9 +36,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
-  rmdirSync,
   statSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { watch, type FSWatcher } from "node:fs";
@@ -70,8 +68,7 @@ export const KEYS = {
   f8: "\x1b[19~",
   ctrlC: "\x03",
   ctrlG: "\x07",
-  ctrlU: "\x15",
-  ctrlK: "\x0b",
+  delete: "\x1b[3~",
 };
 
 export interface PtyExit {
@@ -117,11 +114,14 @@ export interface NativePtyModule {
 
 export interface SessionRecord {
   type: string;
+  reason?: string;
   pid?: number;
   cwd?: string;
   contextCwd?: string;
   agentDir?: string;
   sessionId?: string;
+  displayName?: string;
+  storedName?: string;
   contextSessionId?: string;
   sessionFile?: string;
   columns?: number;
@@ -134,8 +134,13 @@ export interface SessionRecord {
 }
 
 export interface OwnedSession {
-  readonly label: string;
+  /** Stable fixture-side row probe; visible matching uses the canonical caption and current pane geometry. */
+  rowProbe: string;
   readonly workspace: string;
+  /** Exact native stored name, including names longer than the visible row. */
+  currentName: string;
+  /** Canonical native display caption, already bounded by the native reporter. */
+  displayName: string;
   readonly record: SessionRecord;
   readonly exitWatcher: OwnedPidExitWatcher;
 }
@@ -340,6 +345,9 @@ function nodeVersionMeetsFloor(): boolean {
 }
 
 export function resolveRuntimePin(t: { skip(message?: string): void }): RuntimePin | undefined {
+  if (process.env.PI_REVIEW_GATE_RUNTIME_ROLE || process.env.PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG) {
+    throw new Error("real native Main verification is unavailable in a delegated runtime role");
+  }
   if (process.platform !== "darwin") {
     t.skip("the real native Main proof is intentionally scoped to macOS; Linux and physical-keyboard claims are out of scope");
     return undefined;
@@ -607,6 +615,7 @@ export function makeRuntimeEnvironment(
   observerFile: string,
   editorLog: string,
   editorValue: string,
+  nativeAgentDir = makeNativeAgentRoot(root),
 ): NodeJS.ProcessEnv {
   const home = join(root, "home");
   const temporary = join(root, "tmp");
@@ -621,10 +630,12 @@ export function makeRuntimeEnvironment(
     HOME: home,
     USERPROFILE: home,
     XDG_CONFIG_HOME: join(home, ".config"),
+    PI_CODING_AGENT_DIR: nativeAgentDir,
     TMPDIR: temporary,
     TMP: temporary,
     TEMP: temporary,
     NODE_PATH: runtime.nodePath,
+    NODE_OPTIONS: process.env.NODE_OPTIONS,
     EDITOR: editor,
     PI_OFFLINE: "1",
     PI_TELEMETRY: "0",
@@ -632,6 +643,56 @@ export function makeRuntimeEnvironment(
     PRG_SESSION_HOST_NATIVE_MAIN_EDITOR_LOG: editorLog,
     PRG_SESSION_HOST_NATIVE_MAIN_EDITOR_VALUE: editorValue,
   };
+}
+
+/** Create one ordinary, fixture-owned Pi agent root shared by every child. */
+export function makeNativeAgentRoot(
+  scratchRoot: string,
+  options: { readonly deferredPiTools?: boolean } = {},
+): string {
+  const scratch = realpathSync(scratchRoot);
+  const agentDir = join(scratch, "native-agent");
+  mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  const agentStats = lstatSync(agentDir);
+  if (!agentStats.isDirectory() || agentStats.isSymbolicLink()) {
+    throw new Error("synthetic native agent root is not a real directory");
+  }
+  chmodSync(agentDir, 0o700);
+  const canonicalAgentDir = realpathSync(agentDir);
+  const relativeAgentDir = relative(scratch, canonicalAgentDir);
+  if (relativeAgentDir === ".." || relativeAgentDir.startsWith(`..${sep}`) || isAbsolute(relativeAgentDir)) {
+    throw new Error("synthetic native agent root escaped its owned scratch fixture");
+  }
+  const execution: Record<string, unknown> = {
+    workerResources: {},
+    routes: { execute: [], research: [] },
+  };
+  if (options.deferredPiTools !== undefined) execution.deferredPiTools = options.deferredPiTools;
+  writeFileSync(join(agentDir, "review-gate.json"), JSON.stringify({
+    enabled: true,
+    review: { activeReviewers: [] },
+    externalAgents: {},
+    execution,
+  }, undefined, 2), { mode: 0o600, flag: "wx" });
+  return canonicalAgentDir;
+}
+
+/** Observe the real native session_info name entry in an owned session file. */
+export function sessionFileHasStoredName(sessionFile: string, expectedName: string): boolean {
+  const stats = lstatSync(sessionFile);
+  if (!stats.isFile() || stats.isSymbolicLink() || stats.size > 8 * 1024 * 1024) {
+    throw new Error("owned native session file is not a bounded regular file");
+  }
+  for (const line of readFileSync(sessionFile, "utf8").split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line) as { type?: unknown; name?: unknown };
+      if (entry.type === "session_info" && entry.name === expectedName) return true;
+    } catch {
+      // Ignore only an incomplete append; complete native entries are checked.
+    }
+  }
+  return false;
 }
 
 function readRecords(path: string): SessionRecord[] {
@@ -663,40 +724,16 @@ export function processIsAlive(pidValue: number | undefined): boolean {
   }
 }
 
+/**
+ * Compatibility entry point: retain native runtime witnesses, including success.
+ * Root creation alone does not prove ownership of every descendant subsequently
+ * written there. Until each removable entry has a positive creation/identity
+ * receipt, do not enumerate, descend, unlink, or remove any of them. This also
+ * preserves unknown/replaced entries and initialized Terraform contents.
+ */
 export function removeOwnedScratchTreePruningTerraform(root: string): boolean {
-  const rootStats = lstatSync(root);
-  if (!rootStats.isDirectory() || rootStats.isSymbolicLink() || realpathSync(root) !== root) return false;
-  let complete = true;
-  const removeEntry = (path: string, name: string): void => {
-    // Never descend into initialized Terraform data, including under the
-    // test-owned synthetic root. Preserve it and its ancestors if encountered.
-    if (name === ".terraform") {
-      complete = false;
-      return;
-    }
-    const stats = lstatSync(path);
-    if (stats.isDirectory() && !stats.isSymbolicLink()) {
-      for (const child of readdirSync(path)) {
-        if (child === ".terraform") {
-          complete = false;
-          continue;
-        }
-        removeEntry(join(path, child), child);
-      }
-      if (complete) rmdirSync(path);
-    } else {
-      unlinkSync(path);
-    }
-  };
-  for (const name of readdirSync(root)) {
-    if (name === ".terraform") {
-      complete = false;
-      continue;
-    }
-    removeEntry(join(root, name), name);
-  }
-  if (complete) rmdirSync(root);
-  return complete;
+  void root;
+  return false;
 }
 
 function frameText(surface: TerminalSurface): string {
@@ -705,6 +742,34 @@ function frameText(surface: TerminalSurface): string {
 
 function selectedLine(text: string, label: string): boolean {
   return text.split("\n").some((line) => (line.includes("→ ") || line.includes("> ")) && line.includes(label));
+}
+
+function rosterRowCaption(row: string): string | undefined {
+  const contents = row.startsWith("> ") || row.startsWith("→ ") || row.startsWith("  ")
+    ? row.slice(2).trimEnd()
+    : undefined;
+  if (contents === undefined) return undefined;
+  const badge = contents.search(/\s+\[(?:AGENT:|starting\]|exited(?:\s|\])|error(?:\s|\])|input\])/);
+  return badge < 0 ? undefined : contents.slice(0, badge).trimEnd();
+}
+
+function selectedRosterCaption(text: string, sidebarCols: number): string | undefined {
+  const row = text.split("\n").slice(1).map((line) => line.slice(0, sidebarCols))
+    .find((line) => /^\s*[>→] /.test(line));
+  return row === undefined ? undefined : rosterRowCaption(row);
+}
+
+function renderedCaptionMatches(rendered: string | undefined, canonicalCaption: string): boolean {
+  if (rendered === undefined) return false;
+  if (rendered === canonicalCaption) return true;
+  const clippedPrefix = rendered.endsWith("...") ? rendered.slice(0, -3) : "";
+  return clippedPrefix.length > 0 && canonicalCaption.startsWith(clippedPrefix)
+    && canonicalCaption.length > clippedPrefix.length;
+}
+
+function workspaceFieldIsEmpty(text: string): boolean {
+  const field = text.split("\n").find((line) => line.includes("> Workspace:"));
+  return field !== undefined && field.slice(field.indexOf("> Workspace:") + "> Workspace:".length).trim() === "";
 }
 
 export class MainPtyDriver {
@@ -716,9 +781,10 @@ export class MainPtyDriver {
   readonly exitSignal = new ChangeSignal();
   readonly replyLog: string[] = [];
   readonly kittyFlagSnapshots: number[] = [];
-  readonly ownedLabels = new Map<string, { label: string; workspace: string }>();
+  readonly ownedLabels = new Map<string, { rowProbe: string; currentName: string; displayName: string; workspace: string }>();
   readonly nativeExitWatchers = new Map<number, OwnedPidExitWatcher>();
   readonly submittedWorkspaces = new Set<string>();
+  readonly removedWorkspaces = new Set<string>();
   readonly stateRoot: string;
   readonly observerFile: string;
   readonly resultFile: string;
@@ -729,6 +795,7 @@ export class MainPtyDriver {
   exitEvent?: PtyExit;
   parserError?: Error;
   private forcedCleanup = false;
+  private selectedNativeTarget?: { readonly workspace: string; readonly pid: number; readonly sessionId: string };
   frameRevision = 0;
   outputRevision = 0;
   sidebarVisible = true;
@@ -910,7 +977,8 @@ export class MainPtyDriver {
     return readRecords(this.observerFile);
   }
 
-  sessions(): OwnedSession[] {
+  /** All positively owned native processes, including rows already removed from Main. */
+  ownedSessions(): OwnedSession[] {
     const starts = this.records().filter((record) => record.type === "session_start");
     const seen = new Set<number>();
     const output: OwnedSession[] = [];
@@ -924,6 +992,11 @@ export class MainPtyDriver {
       if (owned && exitWatcher) output.push({ ...owned, record, exitWatcher });
     }
     return output;
+  }
+
+  /** Current Main roster only; historical process ownership stays in ownedSessions(). */
+  sessions(): OwnedSession[] {
+    return this.ownedSessions().filter((session) => !this.removedWorkspaces.has(session.workspace));
   }
 
   /** Real @lydell/node-pty onExit observations journaled by the Main runner. */
@@ -955,11 +1028,11 @@ export class MainPtyDriver {
     for (const session of sessions) {
       const record = exits.find((entry) => entry.type === "pty_exit" && entry.pid === session.record.pid);
       assert.ok(record,
-        `the manager-owned ${session.label} native PTY exit was observed through the real @lydell/node-pty onExit API`);
+        `the manager-owned ${session.rowProbe} native PTY exit was observed through the real @lydell/node-pty onExit API`);
       assert.equal(record!.exitCode, 0,
-        `the manager-owned ${session.label} native PTY exited with code 0 through its real public onExit event`);
+        `the manager-owned ${session.rowProbe} native PTY exited with code 0 through its real public onExit event`);
       assert.ok(!record!.signal,
-        `the manager-owned ${session.label} native PTY exit was not signal termination or escalation`);
+        `the manager-owned ${session.rowProbe} native PTY exit was not signal termination or escalation`);
     }
   }
 
@@ -1019,15 +1092,25 @@ export class MainPtyDriver {
   }
 
   async writeAndWait(data: string, predicate: (text: string) => boolean, description: string): Promise<void> {
+    this.selectedNativeTarget = undefined;
     const after = this.frameRevision;
     this.pty.write(data);
     await this.waitFrame(predicate, description, after);
   }
 
   async writeKeys(keys: string, description: string, timeoutMs = EVENT_TIMEOUT_MS): Promise<void> {
+    this.selectedNativeTarget = undefined;
     const after = this.frameRevision;
     this.pty.write(keys);
     await this.waitFrame(() => true, description, after, timeoutMs);
+  }
+
+  async clearWorkspaceField(description: string): Promise<void> {
+    this.selectedNativeTarget = undefined;
+    if (workspaceFieldIsEmpty(this.currentText())) return;
+    const before = this.frameRevision;
+    this.pty.write(KEYS.ctrlC); // the real Workspace field's displayed `ctrl+c clear` binding
+    await this.waitFrame(workspaceFieldIsEmpty, description, before);
   }
 
   async waitForRecords(
@@ -1062,21 +1145,60 @@ export class MainPtyDriver {
     return selectedLine(this.currentText(), label);
   }
 
+  private sidebarColumnCount(): number {
+    const cols = this.surface.frame().cols;
+    return this.sidebarVisible && cols >= 53 ? 32 : cols;
+  }
+
+  private selectedCaptionMatches(text: string, displayName: string): boolean {
+    return renderedCaptionMatches(selectedRosterCaption(text, this.sidebarColumnCount()), displayName);
+  }
+
+  private rosterHasCaption(text: string, displayName: string): boolean {
+    const sidebarCols = this.sidebarColumnCount();
+    return text.split("\n").slice(1).map((line) => line.slice(0, sidebarCols))
+      .some((line) => renderedCaptionMatches(rosterRowCaption(line), displayName));
+  }
+
+  private rememberSelectedTarget(label: string): void {
+    const matches = this.sessions().filter((session) => session.rowProbe === label);
+    const session = matches.length === 1 ? matches[0] : undefined;
+    this.selectedNativeTarget = session === undefined ? undefined : {
+      workspace: session.workspace,
+      pid: session.record.pid!,
+      sessionId: session.record.sessionId!,
+    };
+  }
+
+  private rosterTargetSelected(text: string, label: string): boolean {
+    const matches = this.sessions().filter((session) => session.rowProbe === label);
+    return matches.length === 1
+      ? this.selectedCaptionMatches(text, matches[0]!.displayName)
+      : selectedLine(text, label);
+  }
+
   async moveRosterTo(label: string, maximumDowns = 5, timeoutMs = EVENT_TIMEOUT_MS): Promise<void> {
-    if (this.selected(label)) return;
-    const labels = this.sessions().map((session) => session.label)
+    if (this.rosterTargetSelected(this.currentText(), label)) {
+      this.rememberSelectedTarget(label);
+      return;
+    }
+    this.selectedNativeTarget = undefined;
+    const labels = this.sessions().map((session) => session.rowProbe)
       .concat(["New session", "Quit host"]);
     for (let count = 0; count < maximumDowns; count += 1) {
-      const selectedIndex = labels.findIndex((candidate) => this.selected(candidate));
+      const selectedIndex = labels.findIndex((candidate) => this.rosterTargetSelected(this.currentText(), candidate));
       assert.ok(selectedIndex >= 0, "the owned roster has an observed highlighted row before navigation");
       const nextLabel = labels[(selectedIndex + 1) % labels.length]!;
       const after = this.frameRevision;
       this.pty.write(KEYS.down);
       // Native output and status can repaint before this key changes the roster.
       // Wait for the actual next highlight, not merely any parsed frame.
-      await this.waitFrame((text) => selectedLine(text, nextLabel),
+      await this.waitFrame((text) => this.rosterTargetSelected(text, nextLabel),
         `sidebar advances to ${nextLabel} toward ${label}`, after, timeoutMs);
-      if (this.selected(label)) return;
+      if (this.rosterTargetSelected(this.currentText(), label)) {
+        this.rememberSelectedTarget(label);
+        return;
+      }
     }
     throw new Error(`the real Main sidebar did not select the expected ${label} row; ${this.currentText().slice(0, 2_000)}`);
   }
@@ -1147,69 +1269,153 @@ export class MainPtyDriver {
     `Enter activates the highlighted native session ${label} with its own observed header and surface`, after);
   }
 
-  /**
-   * Create one real native session through the actual New session form. An
-   * explicit existing profile directory (with its local review-gate.json) is
-   * entered in the form's Profile field; omitted creates a fresh private
-   * profile exactly as before.
-   */
-  async createNativeSession(label: string, workspace: string, profile?: string): Promise<OwnedSession> {
+  /** Create one real native session through the Workspace-only public form. */
+  async createNativeSession(workspace: string): Promise<OwnedSession> {
     const canonicalWorkspace = realpathSync(workspace);
-    if (profile !== undefined) {
-      assert.ok(existsSync(profile), `the explicit profile directory for ${label} exists before host creation`);
-      assert.ok(existsSync(join(profile, "review-gate.json")),
-        `the explicit profile for ${label} carries its local review-gate.json before host creation`);
-    }
-    this.ownedLabels.set(canonicalWorkspace, { label, workspace: canonicalWorkspace });
     await this.ensureSidebarFocus();
     await this.moveRosterTo("New session");
     const afterOpen = this.frameRevision;
     this.pty.write(KEYS.enter);
     this.focus = "form";
-    await this.waitFrame((text) => text.includes("New session") && text.includes("Label:")
-      && text.includes("Workspace:") && text.includes("Profile:") && text.includes("enter next/submit"),
-    `new-session form opens for ${label}`, afterOpen);
+    await this.waitFrame((text) => text.includes("New session") && text.includes("Workspace:")
+      && !text.includes("Label:") && !text.includes("Profile:") && text.includes("tab complete"),
+    "the canonical Workspace-only New session form opens", afterOpen);
 
-    // Empty initial fields do not redraw when Ctrl+U/Ctrl+K are no-ops; write
-    // the clear bindings without waiting, then observe the following text edit.
-    this.pty.write(`${KEYS.ctrlU}${KEYS.ctrlK}`);
-    await this.writeAndWait(label, (text) => text.includes(label), `new-session label ${label} is entered`);
-    await this.writeKeys(KEYS.enter, `new-session label ${label} advances`);
-    this.pty.write(`${KEYS.ctrlU}${KEYS.ctrlK}`);
+    await this.clearWorkspaceField("the native `ctrl+c clear` action removes any retained Workspace draft");
     await this.writeAndWait(canonicalWorkspace, (text) => text.includes(canonicalWorkspace.slice(-18)),
-      `explicit workspace for ${label} is entered`);
-    await this.writeKeys(KEYS.enter, `new-session workspace ${label} advances`);
+      "the explicit workspace is entered in the real native field");
     this.pendingWorkspace = canonicalWorkspace;
     this.submittedWorkspaces.add(canonicalWorkspace);
-    // completeCreate retains form field values across successful creations
-    // (it resets only the field index and error), so explicitly clear the
-    // retained Profile before entering or submitting it; an empty-field clear
-    // is a no-op with no redraw, so no repaint wait follows.
-    this.pty.write(`${KEYS.ctrlU}${KEYS.ctrlK}`);
-    if (profile === undefined) {
-      await this.writeKeys(KEYS.enter, `blank fresh profile for ${label} is submitted`);
-    } else {
-      const canonicalProfile = realpathSync(profile);
-      await this.writeAndWait(canonicalProfile, (text) => text.includes(canonicalProfile.slice(-18)),
-        `explicit profile for ${label} is entered`);
-      await this.writeKeys(KEYS.enter, `explicit profile for ${label} is submitted`);
-    }
+    await this.writeKeys(KEYS.enter, "the Workspace-only native New form submits");
     this.focus = "sidebar";
 
     const records = await this.waitForRecords(
-      (entries) => entries.some((record) => record.type === "session_start" && record.cwd === canonicalWorkspace),
-      `real native Pi ${label} session_start with its selected workspace`,
+      (entries) => entries.some((record) => record.type === "session_start"
+        && record.cwd === canonicalWorkspace
+        && typeof record.sessionId === "string" && record.sessionId.length > 0
+        && typeof record.displayName === "string"),
+      "real native Pi session_start with observed metadata and selected workspace",
     );
     this.pendingWorkspace = undefined;
-    const record = records.find((entry) => entry.type === "session_start" && entry.cwd === canonicalWorkspace);
-    assert.ok(record, `native observer recorded ${label}`);
-    assert.ok(Number.isSafeInteger(record.pid), `native observer recorded an owned PID for ${label}`);
+    const record = records.filter((entry) => entry.type === "session_start" && entry.cwd === canonicalWorkspace
+      && typeof entry.sessionId === "string" && typeof entry.displayName === "string").at(-1);
+    assert.ok(record, "native observer recorded the new native session");
+    assert.ok(Number.isSafeInteger(record.pid), "native observer recorded the owned native PID");
+    assert.ok(record.sessionId && record.sessionId.length > 0, "native SessionManager reported its conversation id");
+    assert.ok(record.sessionFile && isAbsolute(record.sessionFile), "native SessionManager reported its session file");
     const exitWatcher = new OwnedPidExitWatcher(record.pid!);
     this.nativeExitWatchers.set(record.pid!, exitWatcher);
     await exitWatcher.waitUntilRegistered(EVENT_TIMEOUT_MS);
-    await this.waitFrame((text) => selectedLine(text, label) && text.includes("Session host"),
-      `new row ${label} is highlighted after completion without activation`);
-    return { label, workspace: canonicalWorkspace, record, exitWatcher };
+    const rowProbe = record.displayName!;
+    const currentName = record.storedName ?? "";
+    const displayName = record.displayName!;
+    this.ownedLabels.set(canonicalWorkspace, { rowProbe, currentName, displayName, workspace: canonicalWorkspace });
+    await this.waitFrame((text) => this.selectedCaptionMatches(text, displayName) && text.includes("Session host"),
+      `new canonical row ${displayName} is highlighted after completion without activation`);
+    this.selectedNativeTarget = { workspace: canonicalWorkspace, pid: record.pid!, sessionId: record.sessionId! };
+    return { rowProbe, currentName, displayName, workspace: canonicalWorkspace, record, exitWatcher };
+  }
+
+  /** Rename the selected native row through the real host Edit form, never a child command. */
+  async renameNativeSession(session: OwnedSession, name: string): Promise<void> {
+    assert.ok(Number.isSafeInteger(session.record.pid) && session.record.sessionId,
+      "the rename target is an observer-confirmed native session");
+    assert.equal(processIsAlive(session.record.pid), true, "the rename target is a live owned native child");
+    await this.ensureSidebarFocus();
+    const exactOwner = this.sessions().find((candidate) => candidate.workspace === session.workspace
+      && candidate.record.pid === session.record.pid && candidate.record.sessionId === session.record.sessionId);
+    assert.ok(exactOwner, "the native row is owned by its observed workspace, PID, and conversation id");
+    const selectedTarget = this.selectedNativeTarget;
+    const targetAlreadySelected = selectedTarget?.workspace === session.workspace
+      && selectedTarget.pid === session.record.pid
+      && selectedTarget.sessionId === session.record.sessionId
+      && this.selectedCaptionMatches(this.currentText(), session.displayName);
+    if (!targetAlreadySelected) {
+      const sameCaptionOwners = this.sessions().filter((candidate) => candidate.rowProbe === session.rowProbe);
+      assert.equal(sameCaptionOwners.length, 1,
+        "a non-current rename target has a unique observed caption before keyboard row targeting");
+      assert.equal(sameCaptionOwners[0]?.workspace, session.workspace,
+        "the selected caption resolves to the observed target workspace");
+      assert.equal(sameCaptionOwners[0]?.record.pid, session.record.pid,
+        "the selected caption resolves to the observed target PID");
+      assert.equal(sameCaptionOwners[0]?.record.sessionId, session.record.sessionId,
+        "the selected caption resolves to the observed native conversation id");
+      await this.moveRosterTo(session.rowProbe);
+      assert.equal(this.selectedCaptionMatches(this.currentText(), session.displayName), true,
+        "the selected row's actual geometry-clipped caption belongs to the observed target");
+    }
+    assert.ok(this.selectedNativeTarget?.workspace === session.workspace
+      && this.selectedNativeTarget.pid === session.record.pid
+      && this.selectedNativeTarget.sessionId === session.record.sessionId,
+    "the real host Edit key targets the row established by the exact workspace/PID/native-id tuple");
+    const activeHeader = this.currentText().split("\n")[0];
+    const resizeCount = this.records().filter((record) => record.type === "resize").length;
+    const beforeEdit = this.frameRevision;
+    this.pty.write("e");
+    this.focus = "form";
+    await this.waitFrame((text) => text.includes("Edit native session name")
+      && text.includes("Current name (display only; type a complete replacement):")
+      && text.includes("> New name:"),
+    "the actual host Edit form opens for the selected native row", beforeEdit);
+    const editFrame = this.currentText();
+    assert.ok(editFrame.includes(session.displayName.slice(0, Math.min(session.displayName.length, 80))),
+      "the canonical display caption is shown separately from the exact stored-name replacement field");
+    const replacementLine = editFrame.split("\n").find((line) => line.includes("> New name:"));
+    assert.ok(replacementLine, "the empty replacement field is rendered");
+    assert.equal(replacementLine!.slice(replacementLine!.indexOf("> New name:") + "> New name:".length).trim(), "",
+      "Edit never prefills the replacement with the current or clipped caption");
+
+    await this.writeAndWait(name, (text) => text.includes(name.slice(-Math.min(name.length, 12))),
+      "the replacement native name is typed into the actual host form");
+    await this.writeKeys(KEYS.enter, "the replacement is submitted through the actual host Edit form");
+    const nameRecords = await this.waitForRecords((records) => records.some((record) => record.type === "native_session_name"
+      && record.pid === session.record.pid
+      && record.sessionId === session.record.sessionId
+      && record.storedName === name && typeof record.displayName === "string"),
+    "the native public SessionManager observes the exact persisted replacement name");
+    const nameRecord = nameRecords.filter((record) => record.type === "native_session_name"
+      && record.pid === session.record.pid && record.sessionId === session.record.sessionId
+      && record.storedName === name && typeof record.displayName === "string").at(-1);
+    assert.ok(nameRecord, "the actual stored-name event includes its canonical bounded display caption");
+    const displayName = nameRecord.displayName!;
+    await this.waitFrame((text) => this.selectedCaptionMatches(text, displayName) && text.includes("Session host"),
+      "the selected native row renders the actual canonical caption at its available sidebar width");
+    assert.equal(this.currentText().split("\n")[0], activeHeader,
+      "editing a native caption does not transfer active Main ownership");
+    assert.equal(processIsAlive(session.record.pid), true, "the edited native child remains live");
+    assert.equal(this.records().filter((record) => record.type === "resize").length, resizeCount,
+      "opening and saving the right-pane Edit form does not change child geometry");
+    session.currentName = name;
+    session.displayName = displayName;
+    const rendered = selectedRosterCaption(this.currentText(), this.sidebarColumnCount());
+    if (rendered === displayName) session.rowProbe = displayName;
+    this.ownedLabels.set(session.workspace, {
+      rowProbe: session.rowProbe, currentName: name, displayName, workspace: session.workspace,
+    });
+    this.selectedNativeTarget = {
+      workspace: session.workspace, pid: session.record.pid!, sessionId: session.record.sessionId!,
+    };
+    this.focus = "sidebar";
+
+    if (name.length > 256) {
+      const beforeReopen = this.frameRevision;
+      this.pty.write("e");
+      this.focus = "form";
+      await this.waitFrame((text) => text.includes("Edit native session name") && text.includes("> New name:"),
+        "Edit reopens with a long current caption", beforeReopen);
+      const clippedFrame = this.currentText();
+      assert.ok(clippedFrame.includes(displayName.slice(0, 80)), "the canonical caption is displayed in bounded clipped form");
+      const emptyReplacement = clippedFrame.split("\n").find((line) => line.includes("> New name:"));
+      assert.ok(emptyReplacement, "the replacement field is present beside the clipped current caption");
+      assert.equal(emptyReplacement!.slice(emptyReplacement!.indexOf("> New name:") + "> New name:".length).trim(), "",
+        "a clipped current caption is never copied into the replacement field");
+      const beforeCancel = this.frameRevision;
+      this.pty.write(KEYS.escape);
+      this.focus = "main";
+      this.sidebarVisible = false;
+      await this.waitFrame((text) => !text.includes("Edit native session name") && !text.includes("New session"),
+        "Escape cancels the untouched Edit form without changing the persisted name", beforeCancel);
+    }
   }
 
   async setOuterSize(
@@ -1229,31 +1435,73 @@ export class MainPtyDriver {
         (records) => records.slice(recordCountBeforeResize).some((record) => record.type === "resize"
           && record.pid === session.record.pid
           && record.columns === expectedNativeCols && record.rows === expectedNativeRows),
-        `owned native ${session.label} receives a fresh ${expectedNativeCols}x${expectedNativeRows} pane after outer resize to ${cols}x${rows}`,
+        `owned native ${session.rowProbe} receives a fresh ${expectedNativeCols}x${expectedNativeRows} pane after outer resize to ${cols}x${rows}`,
       );
     }
   }
 
   async closeNativeNormally(session: OwnedSession): Promise<void> {
-    assert.equal(this.focus, "main", `native input is focused on ${session.label}`);
-    assert.equal(processIsAlive(session.record.pid), true, `${session.label} is alive before its native Ctrl+C exit`);
+    assert.equal(this.focus, "main", `native input is focused on ${session.rowProbe}`);
+    assert.equal(processIsAlive(session.record.pid), true, `${session.rowProbe} is alive before its native Ctrl+C exit`);
     const before = this.frameRevision;
+    const shutdownCount = this.records().filter((record) => record.type === "session_shutdown"
+      && record.pid === session.record.pid).length;
     this.pty.write(`${KEYS.ctrlC}${KEYS.ctrlC}`);
-    await this.waitForRecords((records) => records.some((record) => record.type === "session_shutdown"
-      && record.pid === session.record.pid), `real ${session.label} session_shutdown lifecycle event`);
+    const shutdownRecords = await this.waitForRecords((records) => records.filter((record) => record.type === "session_shutdown"
+      && record.pid === session.record.pid).length > shutdownCount,
+    `real ${session.rowProbe} session_shutdown lifecycle event after the explicit native exit`);
+    const nativeShutdown = shutdownRecords.filter((record) => record.type === "session_shutdown"
+      && record.pid === session.record.pid).at(-1);
+    assert.equal(nativeShutdown?.reason, "quit",
+      "the public native lifecycle reports its actual quit reason after the real Ctrl+C exit");
     // The exact active-owner header proves THIS session reached lifecycle
     // exited (set only after its real native onExit), and the same-owner row
     // carries the zero exit status; another owner's already-exited row can
     // never satisfy both.
     await this.waitFrame((text) => {
       const lines = text.split("\n");
-      if (lines[0]?.includes(`Session host · ${session.label} · exited`) !== true) return false;
-      return lines.some((line) => line.includes(session.label) && line.includes("[exited (code 0)]"));
-    }, `Main observes the normal owned ${session.label} process exit with code 0`, before);
+      if (lines[0]?.includes(`Session host · ${session.rowProbe} · exited`) !== true) return false;
+      return lines.some((line) => line.includes(session.rowProbe) && line.includes("[exited (code 0)]"));
+    }, `Main observes the normal owned ${session.rowProbe} process exit with code 0`, before);
     await session.exitWatcher.waitForExit(EVENT_TIMEOUT_MS);
     assert.equal(session.exitWatcher.observedExit, true,
-      `${session.label} received the kernel EVFILT_PROC/NOTE_EXIT event for its exact owned PID`);
+      `${session.rowProbe} received the kernel EVFILT_PROC/NOTE_EXIT event for its exact owned PID`);
     await this.assertGracefulPtyExits([session]);
+  }
+
+  /** Remove one positively exited row via the real sidebar Delete action only. */
+  async removeExitedNativeSession(session: OwnedSession): Promise<void> {
+    assert.equal(session.exitWatcher.observedExit, true,
+      `${session.rowProbe} has the exact kernel exit confirmation before row removal`);
+    const ptyExit = this.ptyExits().find((record) => record.type === "pty_exit" && record.pid === session.record.pid);
+    assert.ok(ptyExit, `${session.rowProbe} has the public owned-PTY onExit record before row removal`);
+    assert.equal(ptyExit.exitCode, 0, `${session.rowProbe} exited gracefully before row removal`);
+    assert.equal(ptyExit.signal ?? 0, 0, `${session.rowProbe} has no forced signal exit before row removal`);
+    const shutdown = this.records().filter((record) => record.type === "session_shutdown"
+      && record.pid === session.record.pid).at(-1);
+    assert.equal(shutdown?.reason, "quit", `${session.rowProbe} has the native quit reason before row removal`);
+    assert.ok(session.record.sessionFile && existsSync(session.record.sessionFile),
+      `${session.rowProbe}'s persistent native conversation file exists before row removal`);
+
+    const beforeRows = this.sessions().length;
+    assert.ok(beforeRows > 0 && this.sessions().some((candidate) => candidate.workspace === session.workspace
+      && candidate.record.pid === session.record.pid && candidate.record.sessionId === session.record.sessionId),
+      `${session.rowProbe} is still an owned Main row after its confirmed process exit`);
+    await this.ensureSidebarFocus();
+    await this.moveRosterTo(session.rowProbe);
+    assert.equal(this.selectedCaptionMatches(this.currentText(), session.displayName), true,
+      "the Delete key is directed at the selected row's actual exited caption");
+    const beforeDelete = this.frameRevision;
+    this.pty.write(KEYS.delete);
+    await this.waitFrame((text) => text.includes(`Sessions (${beforeRows - 1})`)
+      && !this.rosterHasCaption(text, session.displayName),
+    `the public Delete action removes only ${session.rowProbe}'s confirmed exited row`, beforeDelete);
+    this.removedWorkspaces.add(session.workspace);
+    this.selectedNativeTarget = undefined;
+    assert.equal(this.sessions().length, beforeRows - 1,
+      "current roster removal does not discard historical native process ownership");
+    assert.ok(existsSync(session.record.sessionFile),
+      `${session.rowProbe}'s persistent native conversation file survives row removal`);
   }
 
   private assertOuterRestoration(exit: PtyExit): void {
@@ -1301,8 +1549,8 @@ export class MainPtyDriver {
       && typeof record.pid === "number").map((record) => [record.pid!, record])).values()];
     assert.equal(starts.length, this.submittedWorkspaces.size,
       "every submitted native session, and no unowned session, has a public session_start record");
-    assert.equal(this.sessions().length, this.submittedWorkspaces.size,
-      "every submitted native session has a test-owned OS-exit watcher before host shutdown");
+    assert.equal(this.ownedSessions().length, this.submittedWorkspaces.size,
+      "every submitted native process retains its test-owned OS-exit watcher through row removal and host shutdown");
     assert.ok(starts.every((record) => this.nativeExitWatchers.get(record.pid!)?.observedExit === true),
       "the host is quit only after every owned native child OS exit is confirmed");
     await this.ensureSidebarFocus();
@@ -1324,7 +1572,7 @@ export class MainPtyDriver {
           .map((record) => [record.pid!, record])).values()];
         const submissionsKnown = this.pendingWorkspace === undefined
           && starts.length === this.submittedWorkspaces.size
-          && this.sessions().length === this.submittedWorkspaces.size;
+          && this.ownedSessions().length === this.submittedWorkspaces.size;
         const allChildrenOwnedAndWatched = starts.every((record) => {
           const exitWatcher = this.nativeExitWatchers.get(record.pid!);
           const owned = record.cwd
@@ -1349,12 +1597,12 @@ export class MainPtyDriver {
               if (!owned) break;
               try {
                 await this.ensureSidebarFocus(CLEANUP_UI_TIMEOUT_MS);
-                await this.moveRosterTo(owned.label, 5, CLEANUP_UI_TIMEOUT_MS);
+                await this.moveRosterTo(owned.rowProbe, 5, CLEANUP_UI_TIMEOUT_MS);
                 this.pty.write(KEYS.enter);
                 this.focus = "main";
                 this.pty.write(`${KEYS.ctrlC}${KEYS.ctrlC}`);
                 await this.waitForRecords((records) => records.some((entry) => entry.type === "session_shutdown"
-                  && entry.pid === record.pid), `bounded normal cleanup lifecycle for ${owned.label}`, CLEANUP_LIFECYCLE_TIMEOUT_MS);
+                  && entry.pid === record.pid), `bounded normal cleanup lifecycle for ${owned.rowProbe}`, CLEANUP_LIFECYCLE_TIMEOUT_MS);
               } catch {
                 // The retained outer PTY below is still terminated on schedule.
               }
@@ -1370,7 +1618,7 @@ export class MainPtyDriver {
             this.nativeExitWatchers.get(record.pid!)?.observedExit === true);
           const currentSubmissionsKnown = this.pendingWorkspace === undefined
             && currentStarts.length === this.submittedWorkspaces.size
-            && this.sessions().length === this.submittedWorkspaces.size;
+            && this.ownedSessions().length === this.submittedWorkspaces.size;
           if (!this.exitEvent && allObservedChildrenExited && currentSubmissionsKnown) {
             try {
               await this.ensureSidebarFocus(CLEANUP_UI_TIMEOUT_MS);
@@ -1454,7 +1702,7 @@ export class MainPtyDriver {
     try {
       submittedSessionsObserved = this.pendingWorkspace === undefined
         && starts.length === this.submittedWorkspaces.size
-        && this.sessions().length === this.submittedWorkspaces.size;
+        && this.ownedSessions().length === this.submittedWorkspaces.size;
     } catch {
       submittedSessionsObserved = false;
     }

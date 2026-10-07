@@ -16,15 +16,15 @@ function stageFilter(source) {
 }
 
 /**
- * Owned-scratch cleanup with the same traversal-time .terraform protection as
- * staging: never descends into a directory named .terraform (at any depth),
- * unlinks symlink leaves without traversing their targets, removes the other
- * owned entries, and leaves protected .terraform subtrees — plus their now
- * non-empty ancestors, including the root itself — in place. Returns the
- * preserved .terraform paths (empty for a routine no-TF cleanup).
+ * Retain an owned package-smoke scratch tree. Root origin and identity do not
+ * establish creation ownership for its descendants, and the smoke has no
+ * complete per-entry BigInt identity receipts. Therefore cleanup must not
+ * enumerate, inspect, or remove any descendant (including symlinks and
+ * .terraform directories). The returned array keeps the existing export shape
+ * and contains the retained root path.
  *
- * Guards: the root must exist, be a real directory (not a symlink), and only
- * that bounded owned root is ever removed; no parent is touched.
+ * Guards: the root must exist, be a real directory (not a symlink). This
+ * bounded lstat is admission only; it grants no authority over descendants.
  */
 function removeOwnedScratch(root) {
   const rootStat = fs.lstatSync(root);
@@ -34,42 +34,7 @@ function removeOwnedScratch(root) {
   if (!rootStat.isDirectory()) {
     throw new Error(`owned scratch root is not a directory: ${root}`);
   }
-  const preserved = [];
-  const removeTree = (dir) => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, entry.name);
-      if (entry.isSymbolicLink()) {
-        // Leaf unlink only; the link target is never traversed or removed.
-        fs.rmSync(full, { force: true });
-        continue;
-      }
-      if (entry.isDirectory()) {
-        if (entry.name === ".terraform") {
-          preserved.push(full);
-          continue; // Protected subtree: never descend.
-        }
-        removeTree(full);
-        try {
-          fs.rmdirSync(full);
-        } catch (error) {
-          // A protected .terraform child keeps this ancestor non-empty:
-          // leave it in place rather than forcing a raw delete.
-          if (error.code !== "ENOTEMPTY") throw error;
-        }
-        continue;
-      }
-      fs.rmSync(full, { force: true });
-    }
-  };
-  removeTree(root);
-  try {
-    fs.rmdirSync(root);
-  } catch (error) {
-    if (error.code !== "ENOTEMPTY") throw error;
-    // A protected .terraform subtree kept the root non-empty: leave it in
-    // place rather than forcing a raw recursive delete.
-  }
-  return preserved;
+  return [root];
 }
 
 /** Flat production module inventory of the session host source directory. */
@@ -541,11 +506,11 @@ if (require.main === module) {
   try {
     runPackageSmoke(scratch);
   } finally {
-    const preserved = removeOwnedScratch(scratch);
-    if (preserved.length > 0) {
-      // Truthful partial cleanup: a protected .terraform subtree was left in
-      // place, so the owned scratch root is not fully removed.
-      process.stderr.write(`package smoke: left protected .terraform subtree in place: ${preserved.join(", ")}\n`);
+    const retained = removeOwnedScratch(scratch);
+    if (retained.length > 0) {
+      process.stderr.write(
+        `package smoke: retained scratch tree because complete per-entry BigInt creation-ownership receipts are unavailable; descendants were not enumerated or removed: ${retained.join(", ")}\n`,
+      );
     }
   }
 }

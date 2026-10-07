@@ -8,7 +8,7 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, rmdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import { createRequire } from "node:module";
 import { join, sep } from "node:path";
@@ -78,8 +78,8 @@ const SYNTHETIC_HELP = [
 
 function makeFixture(t: TestContext): Fixture {
   const root = mkdtempSync(join(os.tmpdir(), "session-host-package-test-"));
-  // Pruning cleanup helper: traversal-time .terraform protection for the
-  // owned fixture root (synthetic fixtures only ever contain our own files).
+  // Retain the synthetic fixture root after the test; descendant creation
+  // ownership is not established merely by owning this root.
   t.after(() => smoke.removeOwnedScratch(root));
   const consumerNodeModules = join(root, "consumer", "node_modules");
   const installedRoot = join(consumerNodeModules, "pi-review-gate");
@@ -327,84 +327,73 @@ test("sessionHostSourceModules derives only flat .ts files", (t) => {
   assert.deepEqual(smoke.sessionHostSourceModules(f.sourceModulesDir), ["alpha.ts", "beta.ts"]);
 });
 
-// Owned-scratch cleanup semantics (MOCK/SYNTHETIC markers only — no actual
+// Owned-scratch retention semantics (MOCK/SYNTHETIC markers only — no actual
 // initialized Terraform content is created or accessed).
-test("removeOwnedScratch removes owned entries and preserves a nested .terraform subtree", () => {
-  const root = mkdtempSync(join(os.tmpdir(), "session-host-scratch-cleanup-"));
-  // Protected nested .terraform with a known synthetic marker (paths only;
-  // creation happens inside the try below).
-  const tf = join(root, "consumer", ".terraform");
-  const marker = join(tf, "marker.txt");
+test("removeOwnedScratch retains unknown, symlink, FIFO, and .terraform descendants without traversal", () => {
+  const root = mkdtempSync(join(os.tmpdir(), "session-host-scratch-retention-"));
+  const unknownMarker = join(root, "package", "node_modules", "unknown.txt");
+  const tfMarker = join(root, "consumer", ".terraform", "marker.txt");
+  const symlinkTargetMarker = join(root, "symlink-target", "marker.txt");
+  const symlinkPath = join(root, "links", "target-dir");
+  const fifoPath = join(root, "consumer", "runtime-fifo");
+  mkdirSync(join(root, "package", "node_modules"), { recursive: true });
+  writeFileSync(unknownMarker, "synthetic unknown descendant\n");
+  mkdirSync(join(root, "consumer", ".terraform"), { recursive: true });
+  writeFileSync(tfMarker, "synthetic terraform marker\n");
+  mkdirSync(join(root, "symlink-target"), { recursive: true });
+  writeFileSync(symlinkTargetMarker, "synthetic symlink target\n");
+  mkdirSync(join(root, "links"), { recursive: true });
+  symlinkSync(join(root, "symlink-target"), symlinkPath, "dir");
+  // Synthetic FIFO: cleanup must not need to classify or remove special files.
+  execFileSync("mkfifo", [fifoPath], { cwd: root, stdio: "ignore" });
 
-  // Spy: any readdir/realpath entering the protected directory is a
-  // traversal-safety violation.
-  const enteredProtected: string[] = [];
-  const watch = (p: unknown): boolean => typeof p === "string" && (p === tf || p.startsWith(tf + sep));
+  const violations: string[] = [];
+  const methods = [
+    "readdirSync",
+    "opendirSync",
+    "realpathSync",
+    "statSync",
+    "lstatSync",
+    "readFileSync",
+    "rmSync",
+    "rmdirSync",
+    "unlinkSync",
+  ];
+  const originals = new Map<string, unknown>();
+  const isUnderRoot = (candidate: unknown): boolean =>
+    typeof candidate === "string" && (candidate === root || candidate.startsWith(root + sep));
+  // Any descendant inspection, enumeration, or deletion is a contract failure.
+  // The sole allowed operation is the bounded lstat admission check on root.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const originalReaddirSync: any = fsModule.readdirSync;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const originalRealpathSync: any = fsModule.realpathSync;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (fsModule as any).readdirSync = function (this: unknown, p: unknown, ...rest: unknown[]) {
-    if (watch(p)) enteredProtected.push(`readdirSync ${String(p)}`);
-    return originalReaddirSync(p, ...(rest as [unknown]));
-  };
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (fsModule as any).realpathSync = function (this: unknown, p: unknown, ...rest: unknown[]) {
-    if (watch(p)) enteredProtected.push(`realpathSync ${String(p)}`);
-    return originalRealpathSync(p, ...(rest as [unknown]));
-  };
-
-  try {
-    // Normal owned entries.
-    mkdirSync(join(root, "consumer", "node_modules"), { recursive: true });
-    writeFileSync(join(root, "consumer", "node_modules", "pkg.js"), "// owned\n");
-    writeFileSync(join(root, "npm-cache.txt"), "owned\n");
-    mkdirSync(tf, { recursive: true });
-    writeFileSync(marker, "protected synthetic marker\n");
-
-    const preserved = smoke.removeOwnedScratch(root);
-
-    assert.deepEqual(preserved, [tf]);
-    // Normal owned entries removed.
-    assert.ok(!existsSync(join(root, "consumer", "node_modules")));
-    assert.ok(!existsSync(join(root, "npm-cache.txt")));
-    // Protected subtree and marker preserved; the non-empty root stays in
-    // place (truthful partial cleanup, no forced raw delete).
-    assert.ok(existsSync(root));
-    assert.equal(readFileSync(marker, "utf8"), "protected synthetic marker\n");
-    // No readdir/realpath ever entered the protected directory.
-    assert.deepEqual(enteredProtected, []);
-  } finally {
-    (fsModule as { readdirSync: unknown; realpathSync: unknown }).readdirSync = originalReaddirSync;
-    (fsModule as { readdirSync: unknown; realpathSync: unknown }).realpathSync = originalRealpathSync;
-    // Explicit known teardown: unlink the marker and remove now-empty
-    // directories — never a recursive walk of the protected subtree.
-    rmSync(marker, { force: true });
-    if (existsSync(tf)) rmdirSync(tf);
-    if (existsSync(join(root, "consumer"))) rmdirSync(join(root, "consumer"));
-    if (existsSync(root)) rmdirSync(root);
+  const mutableFs = fsModule as any;
+  for (const method of methods) {
+    const original = mutableFs[method];
+    originals.set(method, original);
+    mutableFs[method] = function (this: unknown, candidate: unknown, ...args: unknown[]) {
+      const rootAdmission = method === "lstatSync" && candidate === root;
+      if (isUnderRoot(candidate) && !rootAdmission) {
+        violations.push(`${method} ${String(candidate)}`);
+        throw new Error(`unexpected descendant access: ${method} ${String(candidate)}`);
+      }
+      return original.call(this, candidate, ...args);
+    };
   }
-});
 
-test("removeOwnedScratch unlinks symlink leaves without traversing their targets", () => {
-  const base = mkdtempSync(join(os.tmpdir(), "session-host-scratch-cleanup-"));
+  let retained: string[] = [];
   try {
-    const root = join(base, "scratch");
-    mkdirSync(root);
-    const target = join(base, "outside-target.txt");
-    writeFileSync(target, "outside the owned scratch root\n");
-    symlinkSync(target, join(root, "link.txt"));
-
-    const preserved = smoke.removeOwnedScratch(root);
-
-    assert.deepEqual(preserved, []);
-    assert.ok(!existsSync(root), "routine no-TF cleanup removes the owned root");
-    // The link is gone but its target (outside the owned root) is untouched.
-    assert.equal(readFileSync(target, "utf8"), "outside the owned scratch root\n");
+    retained = smoke.removeOwnedScratch(root);
+    assert.deepEqual(violations, []);
   } finally {
-    smoke.removeOwnedScratch(base);
+    for (const [method, original] of originals) mutableFs[method] = original;
   }
+
+  assert.deepEqual(retained, [root]);
+  assert.ok(existsSync(root), "the scratch root is retained");
+  assert.equal(readFileSync(unknownMarker, "utf8"), "synthetic unknown descendant\n");
+  assert.equal(readFileSync(tfMarker, "utf8"), "synthetic terraform marker\n");
+  assert.equal(lstatSync(symlinkPath).isSymbolicLink(), true, "the symlink itself is retained");
+  assert.equal(readFileSync(symlinkTargetMarker, "utf8"), "synthetic symlink target\n");
+  assert.equal(lstatSync(fifoPath).isFIFO(), true, "the FIFO is retained");
 });
 
 test("removeOwnedScratch rejects non-directory and symlinked roots", () => {
@@ -433,8 +422,8 @@ test("removeOwnedScratch rejects non-directory and symlinked roots", () => {
  */
 function makeProbeFixture(t: TestContext): { root: string; consumerDir: string; installedRoot: string } {
   const root = mkdtempSync(join(os.tmpdir(), "session-host-probe-test-"));
-  // Pruning cleanup helper: traversal-time .terraform protection for the
-  // owned fixture root (synthetic fixtures only ever contain our own files).
+  // Retain the synthetic fixture root after the test; descendant creation
+  // ownership is not established merely by owning this root.
   t.after(() => smoke.removeOwnedScratch(root));
   const consumerDir = join(root, "consumer");
   const nm = join(consumerDir, "node_modules");

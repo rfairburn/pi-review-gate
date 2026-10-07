@@ -501,6 +501,41 @@ export class InstanceManager {
 		return this.#records.get(id)?.surface;
 	}
 
+	/**
+	 * Remove one row whose owned PTY has confirmed exit. This never signals a
+	 * process: unknown rows, rows without an observed PTY exit, and every
+	 * still-owned live process are left untouched. Persistent workspace/profile
+	 * data is outside the manager's cleanup ownership and is never removed.
+	 * Returns true only when the row was removed; otherwise returns false.
+	 */
+	closeExited(id: string): boolean {
+		const record = this.#records.get(id);
+		if (!record || !record.pty || !record.ptyExited) {
+			return false;
+		}
+
+		// Detach first so even synchronous callbacks caused by cleanup (or
+		// callbacks already queued by the PTY/status source) are stale before
+		// any retained resource is disposed.
+		this.#records.delete(id);
+		this.#releaseRegistration(record);
+		this.#disposeDataListener(record);
+		this.#disposeExitListener(record);
+		this.#disposeReadErrorListener(record);
+		try {
+			record.surface?.dispose();
+		} catch {
+			// Teardown is scoped to this already-exited row; still notify removal.
+		}
+		record.surface = undefined;
+		record.registration = undefined;
+		record.profile = undefined;
+		record.pty = undefined;
+		record.stopPromise = undefined;
+		this.#safeChanged(id);
+		return true;
+	}
+
 	/** Launch one independently owned instance and resolve with its row id. */
 	async create(options: CreateInstanceOptions): Promise<string> {
 		if (this.#disposed || this.#stopping) {
@@ -761,6 +796,12 @@ export class InstanceManager {
 				record.exitDisposable = pty.onExit((event) => this.#onPtyExit(record, event));
 				if (record.ptyExited) {
 					this.#disposeExitListener(record);
+					if (this.#records.get(record.id) !== record) {
+						// An exit observer may synchronously close the row while
+						// onExit() is registering its listener. Do not allocate a
+						// surface or any other resources for a detached record.
+						return;
+					}
 				}
 				record.surface = new TerminalSurface(this.#cols, this.#rows, {
 					onReply: (data) => this.#onQueryReply(record, data),
@@ -828,7 +869,9 @@ export class InstanceManager {
 				this.#safeChanged(record.id);
 				return;
 			}
-			this.#safeChanged(record.id);
+			if (this.#records.get(record.id) === record) {
+				this.#safeChanged(record.id);
+			}
 		} catch {
 			// Pre-spawn failure or a stop-aborted launch: release everything
 			// acquired so far; no child ever existed to wait for.

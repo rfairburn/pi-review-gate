@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync as readBytesSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import test from "node:test";
@@ -214,6 +214,16 @@ class FakePty implements InstancePty {
     for (const listener of [...this.#exitListeners]) listener({ exitCode, signal });
   }
 
+  captureCallbacks(): {
+    data: readonly ((data: string) => void)[];
+    exit: readonly ((event: { exitCode: number; signal?: number }) => void)[];
+  } {
+    return {
+      data: [...this.#dataListeners],
+      exit: [...this.#exitListeners],
+    };
+  }
+
   emitReadError(error: Error): void {
     // Like EventEmitter, dispatch from a snapshot. The built-in handler runs
     // first and performs its listener-count check after any synchronous exit.
@@ -292,6 +302,7 @@ interface Harness {
   packageRoot: string;
   piExecutable: string;
   stateRoot: string;
+  profileRegistry: ProfileRegistry;
   workspace: string;
   workspace2: string;
   registrar: FakeRegistrar;
@@ -305,6 +316,7 @@ interface HarnessOptions {
   rows?: number;
   managerEnv?: NodeJS.ProcessEnv;
   getSupportedKeyboardFlags?: () => number;
+  onChange?: (instanceId: string) => void;
 }
 
 function makeHarness(label: string, options: HarnessOptions = {}): Harness {
@@ -318,6 +330,7 @@ function makeHarness(label: string, options: HarnessOptions = {}): Harness {
   mkdirSync(workspace2, { recursive: true });
   const registrar = new FakeRegistrar();
   const spawned: FakePty[] = [];
+  const profileRegistry = new ProfileRegistry({ stateRoot });
   const ptyFactory: PtyFactory = (descriptor) => {
     registrar.order.push(`spawn ${descriptor.env[SESSION_HOST_BOOTSTRAP_ENV] === undefined ? "?" : "tokened"}`);
     const pty = new FakePty(descriptor);
@@ -328,19 +341,21 @@ function makeHarness(label: string, options: HarnessOptions = {}): Harness {
     packageRoot: pkg.packageRoot,
     piExecutable: pkg.piExecutable,
     statusRegistrar: registrar,
-    profileRegistry: new ProfileRegistry({ stateRoot }),
+    profileRegistry,
     args: [],
     env: options.managerEnv ?? cleanTestEnv(),
     cols: options.cols ?? DEFAULT_INSTANCE_COLS,
     rows: options.rows ?? DEFAULT_INSTANCE_ROWS,
     getSupportedKeyboardFlags: options.getSupportedKeyboardFlags ?? (() => 7),
     ptyFactory,
+    onChange: options.onChange,
   });
   return {
     root,
     packageRoot: pkg.packageRoot,
     piExecutable: pkg.piExecutable,
     stateRoot,
+    profileRegistry,
     workspace,
     workspace2,
     registrar,
@@ -778,6 +793,163 @@ test("exit freezes the retained frame with a truthful code, drops late events, a
   }
 });
 
+test("closeExited removes only one confirmed-exited owner and preserves its storage and live sibling", async () => {
+  const rosterChanges: { instanceId: string; ids: string[] }[] = [];
+  let observeRoster: (() => string[]) | undefined;
+  const harness = makeHarness("close-exited", {
+    onChange: (instanceId) => rosterChanges.push({ instanceId, ids: observeRoster?.() ?? [] }),
+  });
+  observeRoster = () => harness.manager.list().map((row) => row.id);
+  try {
+    const idA = await harness.manager.create({ label: "close-me", workspace: harness.workspace });
+    const idB = await harness.manager.create({ label: "keep-running", workspace: harness.workspace2 });
+    const agentDirA = viewFor(harness.manager, idA).agentDir;
+    const agentDirB = viewFor(harness.manager, idB).agentDir;
+    const surfaceA = harness.manager.surface(idA);
+    const surfaceB = harness.manager.surface(idB);
+    assert.ok(surfaceA);
+    assert.ok(surfaceB);
+
+    const workspaceAFile = join(harness.workspace, "workspace-owned.bin");
+    const workspaceBFile = join(harness.workspace2, "workspace-owned.bin");
+    writeFileSync(workspaceAFile, Buffer.from([0, 1, 255, 10]));
+    writeFileSync(workspaceBFile, Buffer.from([9, 8, 0, 255]));
+    for (const [agentDir, prefix] of [[agentDirA, "alpha"], [agentDirB, "beta"]] as const) {
+      mkdirSync(join(agentDir, "sessions"), { recursive: true });
+      writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ owner: prefix }));
+      writeFileSync(join(agentDir, "auth.json"), JSON.stringify({ credentialFixture: `${prefix}-auth` }));
+      writeFileSync(join(agentDir, "sessions", "conversation.jsonl"), `${prefix}-session\n`);
+    }
+    const persistentFiles = [
+      workspaceAFile,
+      join(agentDirA, "review-gate.json"),
+      join(agentDirA, "settings.json"),
+      join(agentDirA, "auth.json"),
+      join(agentDirA, "sessions", "conversation.jsonl"),
+      workspaceBFile,
+      join(agentDirB, "review-gate.json"),
+      join(agentDirB, "settings.json"),
+      join(agentDirB, "auth.json"),
+      join(agentDirB, "sessions", "conversation.jsonl"),
+    ];
+    const persistedBytes = new Map(persistentFiles.map((path) => [path, readBytesSync(path)] as const));
+
+    const ptyA = harness.spawned[0];
+    const ptyB = harness.spawned[1];
+    const lateCallbacksA = ptyA.captureCallbacks();
+    harness.registrar.emitStatus(harness.registrar.entryFor(idB), {
+      busy: true,
+      pendingInput: true,
+      inputSurface: true,
+      activity: ["sibling remains active"],
+    });
+    ptyB.emitData("sibling-frame");
+    await surfaceB.flush();
+    const siblingView = viewFor(harness.manager, idB);
+    const siblingFrame = frameText(surfaceB);
+    const siblingWrites = [...ptyB.writes];
+    const siblingSignals = [...ptyB.killSignals];
+    const changesBeforeExit = rosterChanges.length;
+
+    ptyA.emitData("final-frame-before-close");
+    ptyA.emitExit(7);
+    await surfaceA.flush();
+    await sleep(0);
+    assert.equal(viewFor(harness.manager, idA).lifecycle, "exited");
+    assert.equal(viewFor(harness.manager, idA).exitCode, 7);
+    assert.strictEqual(harness.manager.surface(idA), surfaceA, "the final surface stays retained until explicit close");
+    assert.deepEqual(ptyA.killSignals, [], "natural exit and row removal never signal the child");
+
+    const changesBeforeClose = rosterChanges.length;
+    assert.equal(harness.manager.closeExited(idA), true);
+    assert.equal(rosterChanges.length, changesBeforeClose + 1, "removal emits exactly one synchronous roster change");
+    assert.deepEqual(rosterChanges.at(-1), { instanceId: idA, ids: [idB] }, "observers see the row already removed");
+    const changesAfterClose = rosterChanges.length;
+    assert.equal(harness.manager.closeExited(idA), false, "a repeated close is a harmless unknown-id refusal");
+    assert.equal(rosterChanges.length, changesAfterClose, "repeated close emits no duplicate roster change");
+    assert.deepEqual(harness.manager.list().map((row) => row.id), [idB]);
+    assert.equal(harness.manager.surface(idA), undefined, "the removed row's surface is disposed and released");
+    assert.strictEqual(harness.manager.surface(idB), surfaceB, "the sibling surface remains owned");
+    assert.equal(harness.manager.hasLiveProcesses(), true, "the sibling stays live after the exited owner is removed");
+    assert.deepEqual(viewFor(harness.manager, idB), siblingView, "sibling status and lifecycle remain unchanged");
+    assert.equal(frameText(surfaceB), siblingFrame, "sibling frame remains unchanged");
+    assert.deepEqual(ptyB.writes, siblingWrites, "closing A does not write to B");
+    assert.deepEqual(ptyB.killSignals, siblingSignals, "closing A does not signal B");
+    assert.equal(ptyB.exited, false, "B remains live");
+    assert.throws(() => harness.profileRegistry.prepare({ workspace: harness.workspace2, profile: agentDirB }), /already has an active admission/);
+    const releasedA = harness.profileRegistry.prepare({ workspace: harness.workspace, profile: agentDirA });
+    releasedA.release();
+
+    for (const [path, bytes] of persistedBytes) {
+      assert.deepEqual(readBytesSync(path), bytes, `persistent file remains byte-identical: ${path}`);
+    }
+
+    // Events already queued against A's old handlers, plus a late reporter
+    // callback, cannot mutate or reinsert the removed row.
+    for (const callback of lateCallbacksA.data) callback("late-frame-must-not-return");
+    for (const callback of lateCallbacksA.exit) callback({ exitCode: 99 });
+    harness.registrar.emitAfterRelease(harness.registrar.entryFor(idA), {
+      busy: true,
+      pendingInput: true,
+      inputSurface: true,
+      activity: ["late status"],
+    });
+    assert.deepEqual(harness.manager.list().map((row) => row.id), [idB]);
+    assert.equal(rosterChanges.length, changesBeforeClose + 1, "late callbacks do not emit misleading roster changes");
+    assert.deepEqual(ptyB.writes, siblingWrites, "unknown A input cannot fall through to B");
+    assert.throws(() => harness.manager.write(idA, "must-not-be-rerouted"), /unknown instance id/);
+    assert.deepEqual(ptyB.writes, siblingWrites);
+    harness.manager.write(idB, "explicitly-addressed-b");
+    assert.deepEqual(ptyB.writes, [...siblingWrites, "explicitly-addressed-b"]);
+    assert.deepEqual(ptyA.killSignals, []);
+
+    // A normal explicit create can reuse A's released profile after close;
+    // removal neither owns that storage nor blocks future admissions.
+    const nextId = await harness.manager.create({ label: "next-owner", workspace: harness.workspace, profile: agentDirA });
+    assert.equal(viewFor(harness.manager, nextId).agentDir, agentDirA);
+    harness.spawned[2].emitExit(0);
+    assert.equal(harness.manager.closeExited(nextId), true);
+    assert.equal(viewFor(harness.manager, idB).hasLiveProcess, true);
+    assert.equal(rosterChanges.length > changesBeforeExit, true);
+  } finally {
+    cleanup(harness);
+  }
+});
+
+test("closeExited refuses unknown, starting, and live rows without side effects", async () => {
+  const changes: string[] = [];
+  const harness = makeHarness("close-refusals", { onChange: (id) => changes.push(id) });
+  try {
+    assert.equal(harness.manager.closeExited("unknown-instance"), false);
+    assert.deepEqual(changes, [], "unknown ids do not notify roster observers");
+
+    const createPending = harness.manager.create({ label: "starting", workspace: harness.workspace });
+    const starting = harness.manager.list().find((row) => row.label === "starting");
+    assert.ok(starting);
+    assert.equal(starting.lifecycle, "starting");
+    const changesAfterPost = changes.length;
+    assert.equal(harness.manager.closeExited(starting.id), false);
+    assert.equal(changes.length, changesAfterPost, "starting refusal does not alter the roster");
+
+    const id = await createPending;
+    const livePty = harness.spawned[0];
+    const liveSurface = harness.manager.surface(id);
+    assert.equal(viewFor(harness.manager, id).lifecycle, "alive");
+    const changesBeforeLiveRefusal = changes.length;
+    assert.equal(harness.manager.closeExited(id), false);
+    assert.equal(changes.length, changesBeforeLiveRefusal);
+    assert.deepEqual(livePty.killSignals, [], "refusal never signals a live child");
+    assert.equal(livePty.exited, false);
+    assert.equal(viewFor(harness.manager, id).hasLiveProcess, true);
+    assert.strictEqual(harness.manager.surface(id), liveSurface, "live surface is retained");
+
+    livePty.emitExit(0);
+    assert.equal(harness.manager.closeExited(id), true, "the same row becomes closable only after observed exit");
+  } finally {
+    cleanup(harness);
+  }
+});
+
 test("an exit callback during listener registration cannot revive a starting row or retain its admission", async () => {
   const harness = makeHarness("early-exit");
   try {
@@ -809,6 +981,80 @@ test("an exit callback during listener registration cannot revive a starting row
     assert.ok(manager.surface(id), "the exited row retains its terminal surface");
     const readmitted = registry.prepare({ workspace: harness.workspace, profile: agentDir });
     readmitted.release();
+  } finally {
+    cleanup(harness);
+  }
+});
+
+test("a row closed reentrantly during exit-listener registration does not allocate detached resources", async () => {
+  const harness = makeHarness("reentrant-close-on-exit");
+  const spawned: FakePty[] = [];
+  const changes: { id: string; present: boolean; lifecycle?: string }[] = [];
+  let manager!: InstanceManager;
+  let closedId: string | undefined;
+  let closeResults: boolean[] = [];
+  let notificationsAfterRemoval = 0;
+  try {
+    manager = new InstanceManager({
+      packageRoot: harness.packageRoot,
+      piExecutable: harness.piExecutable,
+      statusRegistrar: harness.registrar,
+      profileRegistry: new ProfileRegistry({ stateRoot: harness.stateRoot }),
+      env: cleanTestEnv(),
+      ptyFactory: (descriptor) => {
+        const pty = new FakePty(descriptor);
+        if (spawned.length === 1) {
+          pty.exitOnSubscription = { exitCode: 23, signal: 15 };
+        }
+        spawned.push(pty);
+        return pty;
+      },
+      onChange: (id) => {
+        const row = manager.list().find((candidate) => candidate.id === id);
+        changes.push({ id, present: row !== undefined, lifecycle: row?.lifecycle });
+        if (closedId === id && !row) {
+          notificationsAfterRemoval += 1;
+        }
+        if (row?.lifecycle === "exited" && closedId === undefined) {
+          closeResults.push(manager.closeExited(id));
+          closedId = id;
+        }
+      },
+    });
+
+    const siblingId = await manager.create({ label: "sibling", workspace: harness.workspace2 });
+    const siblingPty = spawned[0];
+    const siblingSurface = manager.surface(siblingId);
+    assert.ok(siblingSurface);
+
+    const id = await manager.create({ label: "sync-exit", workspace: harness.workspace });
+    assert.equal(closedId, id, "the exited-row observer closes synchronously from the exit callback");
+    assert.deepEqual(closeResults, [true]);
+    assert.equal(manager.list().some((row) => row.id === id), false);
+    assert.equal(manager.surface(id), undefined, "a detached row has no public retained surface");
+    assert.equal(
+      changes.filter((change) => change.id === id && !change.present).length,
+      1,
+      "the removal notification is emitted once, with no later launch notification",
+    );
+    assert.equal(notificationsAfterRemoval, 0, "launch continuation emits no notification after reentrant removal");
+    assert.deepEqual(spawned[1].killSignals, [], "closing the sync-exited child does not signal it");
+    assert.equal(spawned[1].exited, true);
+    assert.equal(manager.surface(siblingId), siblingSurface);
+    assert.equal(viewFor(manager, siblingId).hasLiveProcess, true);
+    assert.equal(siblingPty.exited, false);
+
+    const nextId = await manager.create({ label: "next-create", workspace: harness.workspace });
+    assert.equal(viewFor(manager, nextId).lifecycle, "alive");
+    assert.ok(manager.surface(nextId));
+    assert.equal(viewFor(manager, siblingId).hasLiveProcess, true);
+
+    // Settle and close the fake fixture children without involving a shutdown
+    // signal ladder; this test is only about manager ownership interleaving.
+    siblingPty.emitExit(0);
+    assert.equal(manager.closeExited(siblingId), true);
+    spawned[2].emitExit(0);
+    assert.equal(manager.closeExited(nextId), true);
   } finally {
     cleanup(harness);
   }

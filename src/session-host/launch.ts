@@ -22,6 +22,12 @@ import {
   reviewGateConfigCandidates,
   resolveConfigPathResolution,
 } from "../config-path";
+import {
+  isSavedSessionAdmission,
+  readSavedSessionHeader,
+  SavedSessionAdmission,
+  validateSavedSessionLocation,
+} from "./saved-sessions";
 
 /**
  * Native standalone Pi launch preparation (alpha, POSIX-only).
@@ -601,6 +607,19 @@ export interface NativeLaunchOptions {
    * storage itself remains at Pi's ordinary configured location.
    */
   args?: readonly string[];
+  /**
+   * Deliberate per-child saved-session selection: an admission receipt minted
+   * by admitSavedSession (src/session-host/saved-sessions.ts) from the
+   * read-only native saved-conversation catalog. Only `nativeSetup: true`
+   * launches accept it (legacy profile mode rejects it so no cross-setup
+   * copies happen). The receipt is revalidated against the accepted native
+   * agent directory and live file identity (dev/ino plus first-line header
+   * id/cwd) BEFORE spawn, then composed as the exact `--session <file>`
+   * option in the argument position the native CLI recognizes before any
+   * forwarded `--`. Caller args can never carry `--session`: the startup
+   * options guard rejects it first, and no env path admits a session.
+   */
+  savedSession?: SavedSessionAdmission;
   /** Environment to clone (defaults to process.env); never mutated. */
   env?: NodeJS.ProcessEnv;
 }
@@ -634,7 +653,11 @@ export interface NativeLaunchOptions {
  *   unless that flag explicitly enables it. Startup session-selection args
  *   (see scripts/session-host-startup-options.cjs) still reject before any
  *   filesystem mutation, while native `PI_CODING_AGENT_SESSION_DIR` remains
- *   available as ordinary shared Pi setup.
+ *   available as ordinary shared Pi setup. The one deliberate exception is
+ *   the per-child `savedSession` admission receipt (native mode only): it is
+ *   revalidated against the accepted agent directory and live file identity
+ *   before spawn and composed as the exact `--session <file>` option before
+ *   any forwarded `--`; legacy profile mode rejects it.
  * - The user's ORIGINAL NODE_OPTIONS is preserved exactly and handed to the
  *   session-host preload (compiled at
  *   <root>/dist/src/session-host/bootstrap-preload.js) through the one-shot
@@ -716,6 +739,32 @@ export function prepareNativeLaunch(options: NativeLaunchOptions): NativeLaunchD
   const agentDir = canonicalAdmittedAgentDir(options.agentDir);
   const workspace = canonicalWorkspace(options.workspace);
   const piExecutable = validatePiExecutable(options.piExecutable);
+
+  // Deliberate per-child saved-session selection: validated BEFORE any config
+  // validation, publication, or descriptor composition. Legacy profile mode
+  // rejects it outright (no cross-setup copies); native mode revalidates the
+  // branded receipt against this launch's accepted agent directory, live file
+  // identity, and the admitted workspace before spawn.
+  let savedSessionFile: string | undefined;
+  if (options.savedSession !== undefined) {
+    if (!options.nativeSetup) {
+      throw new Error(
+        "pi-review-gate: legacy profile mode does not accept a native saved-session selection",
+      );
+    }
+    if (!isSavedSessionAdmission(options.savedSession)) {
+      throw new Error(
+        "pi-review-gate: the saved-session selection is not a valid admission receipt; select from the current saved-conversation catalog",
+      );
+    }
+    if (options.savedSession.agentDir !== agentDir) {
+      throw new Error(
+        "pi-review-gate: the saved-session admission belongs to a different native agent directory; re-select from this root's catalog",
+      );
+    }
+    savedSessionFile = revalidateSavedSessionAdmission(options.savedSession, agentDir, workspace);
+  }
+
   if (options.nativeSetup) {
     if (canonicalNativeAgentDirFromEnv(env) !== agentDir) {
       throw new Error(
@@ -798,9 +847,18 @@ export function prepareNativeLaunch(options: NativeLaunchOptions): NativeLaunchD
     file: piExecutable,
     // The reporter extension loads first: its preload requirement is consumed
     // from NODE_OPTIONS before the gate extension factory runs, and it can
-    // observe the gate's SessionStart widget updates. Native args follow
-    // byte-for-byte.
-    args: ["--extension", reporterExtension, "--extension", indexExtension, ...forwardedArgs],
+    // observe the gate's SessionStart widget updates. The authorized
+    // `--session <file>` pair is composed AFTER the complete extension pairs
+    // and BEFORE any ordinary caller args: that position is always an option
+    // position for the native parser, so a caller arg that merely LOOKS like
+    // a separator (e.g. `--model --`) can never consume or shadow it. Native
+    // args follow byte-for-byte.
+    args: [
+      "--extension", reporterExtension,
+      "--extension", indexExtension,
+      ...(savedSessionFile !== undefined ? ["--session", savedSessionFile] : []),
+      ...forwardedArgs,
+    ],
     env,
     cwd: workspace,
   };
@@ -917,6 +975,77 @@ function validateNativeConfigFile(path: string): void {
       // A close failure must not mask bounded validation or native warnings.
     }
   }
+}
+
+/**
+ * Revalidate an admitted saved-session receipt against this launch's
+ * accepted native agent directory, live file identity, and workspace BEFORE
+ * spawn: branded receipt, same agent directory, sessions root and project
+ * directory still real directories containing the file directly, regular
+ * non-symlink file with unchanged bigint dev/ino, a parseable first-line
+ * header whose id/cwd still match the admission, and the admitted workspace
+ * still resolving to the launch workspace. Diagnostics are bounded (fixed
+ * strings; no transcript or header content).
+ */
+function revalidateSavedSessionAdmission(
+  admission: SavedSessionAdmission,
+  agentDir: string,
+  launchWorkspace: string,
+): string {
+  const structureIssue = validateSavedSessionLocation(agentDir, admission.file);
+  if (structureIssue !== undefined) {
+    throw new Error(
+      structureIssue === "missing-file"
+        ? "pi-review-gate: the saved-session file is missing; re-select a saved conversation"
+        : "pi-review-gate: the saved-session file is outside the native agent sessions root; re-select a saved conversation",
+    );
+  }
+  let stats;
+  try {
+    stats = lstatSync(admission.file, { bigint: true });
+  } catch {
+    throw new Error("pi-review-gate: the saved-session file is missing; re-select a saved conversation");
+  }
+  if (stats.isSymbolicLink()) {
+    throw new Error("pi-review-gate: the saved-session file is a symlink; refusing to launch from it");
+  }
+  if (!stats.isFile()) {
+    throw new Error("pi-review-gate: the saved-session file is not a regular file; re-select a saved conversation");
+  }
+  if (stats.dev !== admission.dev || stats.ino !== admission.ino) {
+    throw new Error(
+      "pi-review-gate: the saved-session file changed since admission; re-select a saved conversation",
+    );
+  }
+  const header = readSavedSessionHeader(admission.file);
+  if (header === undefined) {
+    throw new Error("pi-review-gate: the saved-session file header is unreadable; re-select a saved conversation");
+  }
+  if (header.id !== admission.sessionId || header.cwd !== admission.cwd) {
+    throw new Error(
+      "pi-review-gate: the saved-session file no longer matches its admission; re-select a saved conversation",
+    );
+  }
+  // The admitted workspace must still exist and resolve to the exact
+  // canonical workspace bound at admission, which must equal THIS launch's
+  // workspace: a receipt for workspace A never launches in workspace B.
+  let workspaceReal;
+  try {
+    workspaceReal = realpathSync(admission.cwd);
+  } catch {
+    throw new Error("pi-review-gate: the saved-session workspace is unavailable; re-select a saved conversation");
+  }
+  if (workspaceReal !== admission.workspace) {
+    throw new Error(
+      "pi-review-gate: the saved-session workspace changed since admission; re-select a saved conversation",
+    );
+  }
+  if (workspaceReal !== launchWorkspace) {
+    throw new Error(
+      "pi-review-gate: the saved-session selection belongs to a different workspace than this launch; select a saved conversation from this workspace",
+    );
+  }
+  return admission.file;
 }
 
 /** Validate and canonicalize the per-instance workspace (existing directory). */

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, realpathSync, rmSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
-import { chmod, cp, lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import {
@@ -15,6 +15,11 @@ import {
   prepareNativeLaunch,
   resolveNativePi,
 } from "../src/session-host/launch";
+import {
+  admitSavedSession,
+  listSavedSessions,
+  SavedSessionAdmission,
+} from "../src/session-host/saved-sessions";
 
 interface PiFixture {
   /** Real (symlink-resolved) root holding the fake pi executable. */
@@ -114,6 +119,7 @@ function baseOptions(
     piExecutable: string;
     args: string[];
     env: NodeJS.ProcessEnv;
+    savedSession: SavedSessionAdmission;
   }> = {},
 ): Parameters<typeof prepareNativeLaunch>[0] {
   return {
@@ -1339,11 +1345,295 @@ function removeOwnedFixtureTree(root: string, files: string[], dirsLeafToRoot: s
   }
 }
 
+// ---------------------------------------------------------------------------
+// Deliberate per-child saved-session selection (issue 323)
+// ---------------------------------------------------------------------------
+
+/** Synthetic flat listAll for launch tests: .jsonl files of one directory only. */
+async function flatListAll(sessionDir: string): Promise<{ path: string; id: string; cwd: string }[]> {
+  const entries = await readdir(sessionDir, { withFileTypes: true });
+  const rows: { path: string; id: string; cwd: string }[] = [];
+  for (const entry of entries) {
+    if (!entry.name.endsWith(".jsonl")) continue;
+    const file = join(sessionDir, entry.name);
+    const text = await readFile(file, "utf8");
+    const firstLine = text.split("\n")[0];
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(firstLine);
+    } catch {
+      continue;
+    }
+    if (parsed === null || typeof parsed !== "object") continue;
+    const record = parsed as Record<string, unknown>;
+    if (typeof record.id !== "string" || typeof record.cwd !== "string") continue;
+    rows.push({ path: file, id: record.id, cwd: record.cwd });
+  }
+  return rows;
+}
+
+/** Create one saved conversation under the fixture agent dir and admit it. */
+async function admitFixtureSavedSession(pkg: PackageFixture, id = "saved-1"): Promise<{ savedFile: string; admission: SavedSessionAdmission }> {
+  const projDir = join(pkg.agentDir, "sessions", "proj");
+  await mkdir(projDir, { recursive: true });
+  const savedFile = join(projDir, "saved.jsonl");
+  await writeFile(savedFile, `${JSON.stringify({ type: "session", id, cwd: pkg.workspace })}\n`, "utf8");
+  const catalog = await listSavedSessions({ agentDir: pkg.agentDir, listAll: flatListAll });
+  const result = admitSavedSession(catalog, catalog.rows[0]);
+  assert.equal(result.status, "admitted", "the fixture saved session must admit");
+  if (result.status !== "admitted") throw new Error("unreachable");
+  return { savedFile, admission: result.admission };
+}
+
+function nativeLaunchEnv(pkg: PackageFixture): NodeJS.ProcessEnv {
+  return {
+    HOME: join(pkg.root, "home"),
+    PATH: process.env.PATH,
+    PI_CODING_AGENT_DIR: pkg.agentDir,
+  };
+}
+
+test("prepareNativeLaunch composes the exact --session option for an admitted saved selection (native mode)", async (t) => {
+  const pkg = await makePackageFixture();
+  t.after(() => rm(pkg.root, { recursive: true, force: true }));
+  const { savedFile, admission } = await admitFixtureSavedSession(pkg);
+  const descriptor = prepareNativeLaunch(baseOptions(pkg, {
+    nativeSetup: true,
+    env: nativeLaunchEnv(pkg),
+    savedSession: admission,
+  }));
+  assert.deepEqual(descriptor.args, [
+    "--extension",
+    join(pkg.packageRoot, "dist", "src", "session-host", "reporter.js"),
+    "--extension",
+    join(pkg.packageRoot, "dist", "src", "index.js"),
+    "--session",
+    savedFile,
+  ], "the authorized --session <file> option follows the extensions and nothing else is injected");
+  assert.equal(descriptor.cwd, pkg.workspace);
+});
+
+test("saved selection argument order snapshot: --session composes before any caller args", async (t) => {
+  const pkg = await makePackageFixture();
+  t.after(() => rm(pkg.root, { recursive: true, force: true }));
+  const { savedFile, admission } = await admitFixtureSavedSession(pkg);
+  const descriptor = prepareNativeLaunch(baseOptions(pkg, {
+    nativeSetup: true,
+    env: nativeLaunchEnv(pkg),
+    args: ["-p", "plan", "--", "message data"],
+    savedSession: admission,
+  }));
+  // Snapshot: extensions first, then the authorized --session option in a
+  // position that is ALWAYS an option position for the native parser, then
+  // the caller args byte-for-byte (a genuine `--` still terminates options).
+  assert.deepEqual(descriptor.args, [
+    "--extension",
+    join(pkg.packageRoot, "dist", "src", "session-host", "reporter.js"),
+    "--extension",
+    join(pkg.packageRoot, "dist", "src", "index.js"),
+    "--session",
+    savedFile,
+    "-p",
+    "plan",
+    "--",
+    "message data",
+  ]);
+});
+
+test("saved selection composes in option position regardless of caller args that look like separators or values", async (t) => {
+  const pkg = await makePackageFixture();
+  t.after(() => rm(pkg.root, { recursive: true, force: true }));
+  const { savedFile, admission } = await admitFixtureSavedSession(pkg);
+  const extensions = [
+    "--extension",
+    join(pkg.packageRoot, "dist", "src", "session-host", "reporter.js"),
+    "--extension",
+    join(pkg.packageRoot, "dist", "src", "index.js"),
+  ];
+
+  // A `--` that is the VALUE of a value-taking flag is not the separator:
+  // composing before the caller args keeps --session in option position.
+  let descriptor = prepareNativeLaunch(baseOptions(pkg, {
+    nativeSetup: true,
+    env: nativeLaunchEnv(pkg),
+    args: ["--model", "--", "message"],
+    savedSession: admission,
+  }));
+  assert.deepEqual(descriptor.args, [...extensions, "--session", savedFile, "--model", "--", "message"]);
+
+  // A trailing value-taking flag: our pair is never consumed as its value.
+  descriptor = prepareNativeLaunch(baseOptions(pkg, {
+    nativeSetup: true,
+    env: nativeLaunchEnv(pkg),
+    args: ["--model"],
+    savedSession: admission,
+  }));
+  assert.deepEqual(descriptor.args, [...extensions, "--session", savedFile, "--model"]);
+
+  // A genuine separator: everything after it stays message/file data.
+  descriptor = prepareNativeLaunch(baseOptions(pkg, {
+    nativeSetup: true,
+    env: nativeLaunchEnv(pkg),
+    args: ["--", "data"],
+    savedSession: admission,
+  }));
+  assert.deepEqual(descriptor.args, [...extensions, "--session", savedFile, "--", "data"]);
+});
+
+test("legacy profile mode rejects the native saved selection (no cross-setup copies)", async (t) => {
+  const pkg = await makePackageFixture();
+  t.after(() => rm(pkg.root, { recursive: true, force: true }));
+  const { admission } = await admitFixtureSavedSession(pkg);
+  assert.throws(
+    () => prepareNativeLaunch(baseOptions(pkg, { savedSession: admission })),
+    /legacy profile mode does not accept a native saved-session selection/,
+  );
+});
+
+test("parent startup overrides, raw --session args, and role env still reject with a saved selection present", async (t) => {
+  const pkg = await makePackageFixture();
+  t.after(() => rm(pkg.root, { recursive: true, force: true }));
+  const { admission } = await admitFixtureSavedSession(pkg);
+  // Parent resume flags are rejected by the startup guard before composition.
+  assert.throws(
+    () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), args: ["--resume"], savedSession: admission })),
+    /--resume/,
+  );
+  // A raw --session in caller args is never an admission path.
+  assert.throws(
+    () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), args: ["--session", "/tmp/old.jsonl"], savedSession: admission })),
+    (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      return message.includes("--session") && !message.includes("/tmp/old.jsonl");
+    },
+  );
+  // Executor role input is still rejected fail-closed.
+  assert.throws(
+    () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: { ...nativeLaunchEnv(pkg), [RUNTIME_ROLE_ENV]: "executor" }, savedSession: admission })),
+    (error: unknown) => (error instanceof Error ? error.message.includes(RUNTIME_ROLE_ENV) : false),
+  );
+  // Legacy session-dir env override is still rejected before any selection work.
+  assert.throws(
+    () => prepareNativeLaunch(baseOptions(pkg, { savedSession: admission, env: { PATH: process.env.PATH, PI_CODING_AGENT_SESSION_DIR: join(pkg.root, "private-storage") } })),
+    /PI_CODING_AGENT_SESSION_DIR|legacy profile mode/,
+  );
+});
+
+test("alien receipts and foreign agent directories are refused at launch", async (t) => {
+  const pkg = await makePackageFixture();
+  t.after(() => rm(pkg.root, { recursive: true, force: true }));
+  const { admission } = await admitFixtureSavedSession(pkg);
+  // A caller-fabricated receipt object (no brand) is refused.
+  const alien = { ...admission };
+  assert.throws(
+    () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), savedSession: alien })),
+    /not a valid admission receipt/,
+  );
+  // A receipt minted under a DIFFERENT native agent directory is refused.
+  const foreignAgent = join(pkg.root, "home2", ".pi", "agent");
+  const foreignProj = join(foreignAgent, "sessions", "proj");
+  await mkdir(foreignProj, { recursive: true });
+  await writeFile(join(foreignProj, "saved.jsonl"), `${JSON.stringify({ type: "session", id: "foreign-1", cwd: pkg.workspace })}\n`, "utf8");
+  const foreignCatalog = await listSavedSessions({ agentDir: foreignAgent, listAll: flatListAll });
+  const foreignResult = admitSavedSession(foreignCatalog, foreignCatalog.rows[0]);
+  assert.equal(foreignResult.status, "admitted");
+  if (foreignResult.status !== "admitted") throw new Error("unreachable");
+  assert.throws(
+    () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), savedSession: foreignResult.admission })),
+    /different native agent directory/,
+  );
+});
+
+test("launch revalidates the saved file before spawn: replacement, deletion, and identity change refuse", async (t) => {
+  const pkg = await makePackageFixture();
+  t.after(() => rm(pkg.root, { recursive: true, force: true }));
+  const { savedFile, admission } = await admitFixtureSavedSession(pkg);
+
+  // Replaced first line (different id): the live header no longer matches.
+  await writeFile(savedFile, `${JSON.stringify({ type: "session", id: "replaced-1", cwd: pkg.workspace })}\n`, "utf8");
+  assert.throws(
+    () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), savedSession: admission })),
+    /no longer matches its admission/,
+  );
+
+  // Deleted file: refused honestly.
+  await rm(savedFile);
+  assert.throws(
+    () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), savedSession: admission })),
+    /saved-session file is missing/,
+  );
+
+  // Re-created with identical content but a NEW identity (dev/ino changed):
+  // mtime immutability is never pretended; the identity check refuses.
+  await writeFile(savedFile, `${JSON.stringify({ type: "session", id: "saved-1", cwd: pkg.workspace })}\n`, "utf8");
+  assert.throws(
+    () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), savedSession: admission })),
+    /changed since admission/,
+  );
+
+  // A symlink at the admitted path is refused.
+  const target = join(pkg.root, "saved-target.jsonl");
+  await writeFile(target, `${JSON.stringify({ type: "session", id: "saved-1", cwd: pkg.workspace })}\n`, "utf8");
+  await rm(savedFile);
+  await symlink(target, savedFile);
+  assert.throws(
+    () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), savedSession: admission })),
+    /saved-session file is a symlink/,
+  );
+});
+
+test("saved selection is bound to its admitted workspace: mismatched and retargeted workspaces refuse before spawn", async (t) => {
+  const pkg = await makePackageFixture();
+  t.after(() => rm(pkg.root, { recursive: true, force: true }));
+  const { admission } = await admitFixtureSavedSession(pkg);
+
+  // A receipt for workspace A never launches in workspace B.
+  const otherWorkspace = join(pkg.root, "other-workspace");
+  await mkdir(otherWorkspace, { recursive: true });
+  assert.throws(
+    () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), workspace: otherWorkspace, savedSession: admission })),
+    /different workspace than this launch/,
+  );
+
+  // The admitted workspace retargeted to a different directory (symlink
+  // swap) no longer resolves to the canonical workspace bound at admission.
+  const target = join(pkg.root, "workspace-target");
+  await mkdir(target, { recursive: true });
+  await rm(pkg.workspace, { recursive: true });
+  await symlink(target, pkg.workspace);
+  assert.throws(
+    () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), savedSession: admission })),
+    /changed since admission/,
+  );
+});
+
+test("launch revalidates the sessions path structure: a project directory swapped for a symlink refuses before spawn", async (t) => {
+  const pkg = await makePackageFixture();
+  t.after(() => rm(pkg.root, { recursive: true, force: true }));
+  const { admission } = await admitFixtureSavedSession(pkg);
+
+  // Move the project directory outside the sessions root and replace it with
+  // a symlink: the file's inode and header identity are preserved, but the
+  // canonical location now escapes the native sessions root.
+  const projDir = join(pkg.agentDir, "sessions", "proj");
+  const moved = join(pkg.root, "moved-proj");
+  await rename(projDir, moved);
+  await symlink(moved, projDir);
+  assert.throws(
+    () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), savedSession: admission })),
+    /outside the native agent sessions root/,
+  );
+});
+
 test("the startup options helper resolves only the own compiled package scripts (no ancestor fallback)", async (t) => {
   const compiledLaunch = join(process.cwd(), "dist-test", "src", "session-host", "launch.js");
   const compiledConfigPath = join(process.cwd(), "dist-test", "src", "config-path.js");
+  const compiledSavedSessions = join(process.cwd(), "dist-test", "src", "session-host", "saved-sessions.js");
+  const compiledNativeSessionSdk = join(process.cwd(), "dist-test", "src", "session-host", "native-session-sdk.js");
   assert.ok(existsSync(compiledLaunch), "the compiled launch module under test must exist");
   assert.ok(existsSync(compiledConfigPath), "the compiled native config-path helper must exist");
+  assert.ok(existsSync(compiledSavedSessions), "the compiled saved-session catalog module must exist");
+  assert.ok(existsSync(compiledNativeSessionSdk), "the compiled public SDK loader module must exist");
 
   // Tree A: the own package scripts/ is missing, but a MALICIOUS ancestor
   // scripts/ helper exists. The loader must reject fail-closed without ever
@@ -1352,6 +1642,8 @@ test("the startup options helper resolves only the own compiled package scripts 
   const markerA = join(rootA, "parent-helper-loaded");
   t.after(() => removeOwnedFixtureTree(rootA, [
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "launch.js"),
+    join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "saved-sessions.js"),
+    join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "native-session-sdk.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "config-path.js"),
     join(rootA, "scripts", "session-host-startup-options.cjs"),
     markerA,
@@ -1368,6 +1660,8 @@ test("the startup options helper resolves only the own compiled package scripts 
   const distA = join(pkgA, "dist", "src", "session-host");
   await mkdir(distA, { recursive: true });
   await cp(compiledLaunch, join(distA, "launch.js"));
+  await cp(compiledSavedSessions, join(distA, "saved-sessions.js"));
+  await cp(compiledNativeSessionSdk, join(distA, "native-session-sdk.js"));
   await cp(compiledConfigPath, join(pkgA, "dist", "src", "config-path.js"));
   await mkdir(join(rootA, "scripts"), { recursive: true });
   await writeFile(
@@ -1390,6 +1684,8 @@ test("the startup options helper resolves only the own compiled package scripts 
   const rootB = await realpath(await mkdtemp(join(process.cwd(), ".pi-native-host-anchor-b-")));
   t.after(() => removeOwnedFixtureTree(rootB, [
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "launch.js"),
+    join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "saved-sessions.js"),
+    join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "native-session-sdk.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "config-path.js"),
     join(rootB, "node_modules", "pi-review-gate", "scripts", "session-host-startup-options.cjs"),
   ], [
@@ -1405,6 +1701,8 @@ test("the startup options helper resolves only the own compiled package scripts 
   const distB = join(pkgB, "dist", "src", "session-host");
   await mkdir(distB, { recursive: true });
   await cp(compiledLaunch, join(distB, "launch.js"));
+  await cp(compiledSavedSessions, join(distB, "saved-sessions.js"));
+  await cp(compiledNativeSessionSdk, join(distB, "native-session-sdk.js"));
   await cp(compiledConfigPath, join(pkgB, "dist", "src", "config-path.js"));
   await mkdir(join(pkgB, "scripts"), { recursive: true });
   await cp(join(process.cwd(), "scripts", "session-host-startup-options.cjs"), join(pkgB, "scripts", "session-host-startup-options.cjs"));

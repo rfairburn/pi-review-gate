@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import { decodePrintableKey } from "pi-session-host-tui/dist/keys.js";
+import { MAX_RENAME_NAME_BYTES } from "./protocol";
 import {
   CombinedAutocompleteProvider,
   CURSOR_MARKER,
@@ -19,18 +20,18 @@ import {
   type Terminal,
 } from "pi-session-host-tui";
 
-const NAME_MAX_UTF16_CODE_UNITS = 80;
+const DEFAULT_NAME_MAX_BYTES = MAX_RENAME_NAME_BYTES;
 const PATH_MAX_CODE_POINTS = 2048;
 const MAX_PASTE_BYTES = 8192;
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
 const ABSOLUTE_PREFIX_MASK = "\u0000";
 const MAX_FIELD_DIMENSION = 1000;
-const CLEAR_ACTION = "app.interrupt";
+const CLEAR_ACTION = "app.clear";
 const TUI_COPY_ACTION = "tui.input.copy";
 const SUBMIT_ACTION = "tui.input.submit";
 const CANCEL_ACTION = "tui.select.cancel";
-const EXTERNAL_EDITOR_ACTION = "app.externalEditor";
+const EXTERNAL_EDITOR_ACTION = "app.editor.external";
 
 type FieldKind = "name" | "path";
 type ForcedNativeAction = "tui.select.confirm" | "tui.select.cancel" | "tui.editor.undo" | "tui.editor.cursorLineStart" | "tui.editor.cursorRight";
@@ -82,8 +83,13 @@ interface CommonFieldOptions {
 }
 
 export type SessionHostFieldOptions = CommonFieldOptions & (
-  | { readonly kind: "name"; readonly workspaceBasePath?: never }
-  | { readonly kind: "path"; readonly workspaceBasePath: string }
+  | {
+    readonly kind: "name";
+    readonly workspaceBasePath?: never;
+    /** Optional tighter 1..1024 UTF-8-byte limit; defaults to the persisted rename limit. */
+    readonly maxNameBytes?: number;
+  }
+  | { readonly kind: "path"; readonly workspaceBasePath: string; readonly maxNameBytes?: never }
 );
 
 export interface SessionHostFieldRender {
@@ -153,6 +159,7 @@ export class SessionHostTextField {
   private readonly actionBindings: Required<NonNullable<SessionHostFieldOptions["actionBindings"]>>;
   private readonly liveKeybindings?: SessionHostFieldKeybindings;
   private readonly restoreKeybindings?: () => void;
+  private readonly maxNameBytes: number;
   private acceptedText = "";
   private acceptedStoredText = "";
   private acceptedCursor = { line: 0, col: 0 };
@@ -171,6 +178,12 @@ export class SessionHostTextField {
   private nativeJumpTargetPending = false;
 
   constructor(options: SessionHostFieldOptions) {
+    const requestedNameLimit = options.kind === "name" ? options.maxNameBytes : undefined;
+    this.maxNameBytes = requestedNameLimit === undefined ? DEFAULT_NAME_MAX_BYTES : requestedNameLimit;
+    if (!Number.isSafeInteger(this.maxNameBytes) || this.maxNameBytes < 1 || this.maxNameBytes > DEFAULT_NAME_MAX_BYTES) {
+      throw new Error(`Session host field maxNameBytes must be an integer between 1 and ${DEFAULT_NAME_MAX_BYTES}`);
+    }
+
     const initialText = options.initialText ?? "";
     const safeInitial = sanitizeSingleLine(initialText);
     if (safeInitial !== initialText) {
@@ -796,7 +809,7 @@ export class SessionHostTextField {
 
   private isWithinLimit(kind: FieldKind, value: string): boolean {
     return kind === "name"
-      ? value.length <= NAME_MAX_UTF16_CODE_UNITS
+      ? Buffer.byteLength(value, "utf8") <= this.maxNameBytes
       : codePointLength(value) <= PATH_MAX_CODE_POINTS;
   }
 

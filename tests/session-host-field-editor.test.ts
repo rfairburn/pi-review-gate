@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import {
   mkdtempSync,
   mkdirSync,
@@ -24,6 +25,7 @@ import {
   type SessionHostFieldRejection,
   type SessionHostFieldSubmission,
 } from "../src/session-host/field-editor";
+import { isValidRenameName, MAX_RENAME_NAME_BYTES } from "../src/session-host/protocol";
 
 const ENTER = "\r";
 const ESCAPE = "\x1b";
@@ -182,6 +184,7 @@ test("encoded native editing bindings work at the field limit", () => {
   const rejected: SessionHostFieldRejection[] = [];
   const field = createSessionHostTextField({
     kind: "name",
+    maxNameBytes: 80,
     keybindings: manager,
     onReject: (reason) => rejected.push(reason),
   });
@@ -204,6 +207,7 @@ test("native character-jump targets work at the field limit", () => {
   const rejected: SessionHostFieldRejection[] = [];
   const field = createSessionHostTextField({
     kind: "name",
+    maxNameBytes: 80,
     keybindings: new KeybindingsManager(TUI_KEYBINDINGS),
     onReject: (reason) => rejected.push(reason),
   });
@@ -230,6 +234,7 @@ test("name and path limits reject an edit atomically instead of persisting trunc
   const rejected: SessionHostFieldRejection[] = [];
   const name = createSessionHostTextField({
     kind: "name",
+    maxNameBytes: 80,
     onReject: (reason) => rejected.push(reason),
   });
   const path = makePathField({ onReject: (reason) => rejected.push(reason) });
@@ -240,9 +245,9 @@ test("name and path limits reject an edit atomically instead of persisting trunc
     assert.equal(name.getText().length, 80);
 
     const emoji = "🙂";
-    name.setText(emoji.repeat(40));
+    name.setText(emoji.repeat(20));
     name.handleInput(emoji);
-    assert.equal(name.getText(), emoji.repeat(40), "UTF-16 name limit rejects the 41st grapheme without truncation");
+    assert.equal(name.getText(), emoji.repeat(20), "80-byte test limit rejects the next 4-byte grapheme without truncation");
 
     path.handleInput("p".repeat(2048));
     path.handleInput("q");
@@ -255,10 +260,114 @@ test("name and path limits reject an edit atomically instead of persisting trunc
   }
 });
 
+test("default name limit matches the exact 1024-byte persisted rename contract", () => {
+  const rejected: SessionHostFieldRejection[] = [];
+  assert.equal(MAX_RENAME_NAME_BYTES, 1024);
+  const asciiLimit = "a".repeat(MAX_RENAME_NAME_BYTES);
+  const unicodeLimit = "🙂".repeat(255) + "é\u0301";
+  assert.equal(Buffer.byteLength(asciiLimit, "utf8"), MAX_RENAME_NAME_BYTES);
+  assert.equal(Buffer.byteLength(unicodeLimit, "utf8"), MAX_RENAME_NAME_BYTES);
+  assert.equal(isValidRenameName(asciiLimit), true);
+  assert.equal(isValidRenameName(unicodeLimit), true);
+  assert.equal(isValidRenameName(`${asciiLimit}a`), false);
+
+  const field = createSessionHostTextField({
+    kind: "name",
+    onReject: (reason) => rejected.push(reason),
+  });
+  try {
+    assert.equal(field.setText(asciiLimit), true);
+    field.handleInput("\x1b[D");
+    const caret = field.getCursor().col;
+    field.handleInput("b");
+    assert.equal(field.getText(), asciiLimit);
+    assert.equal(field.getCursor().col, caret, "over-limit printable input preserves the native caret");
+
+    field.editor.insertTextAtCursor("b");
+    assert.equal(field.getText(), asciiLimit, "the native mutation callback rejects and undoes an over-limit edit");
+    assert.equal(field.getCursor().col, caret, "native rollback preserves the accepted caret");
+    field.handleInput("\x1f");
+    assert.equal(field.getText(), "", "rejected native input does not pollute the undo stack");
+
+    assert.equal(field.setText(unicodeLimit), true, "emoji and combining sequences count by UTF-8 bytes, not UTF-16 units or code points");
+    assert.equal(field.getText(), unicodeLimit);
+    field.handleInput("\x1b[D");
+    const unicodeCaret = field.getCursor().col;
+    assert.equal(field.setText(`${unicodeLimit}x`), false);
+    assert.equal(field.getText(), unicodeLimit);
+    assert.equal(field.getCursor().col, unicodeCaret, "over-limit replacement preserves the Unicode caret");
+    assert.ok(rejected.filter((reason) => reason === "text-limit").length >= 3);
+  } finally {
+    field.dispose();
+  }
+});
+
+test("custom name byte limit covers initial text, setText, paste, and external-editor replacement", async () => {
+  const rejected: SessionHostFieldRejection[] = [];
+  const changes: string[] = [];
+  assert.throws(() => createSessionHostTextField({
+    kind: "name",
+    maxNameBytes: 5,
+    initialText: "🙂xx",
+  }), /initial text exceeds its name limit/);
+
+  const field = createSessionHostTextField({
+    kind: "name",
+    maxNameBytes: 5,
+    initialText: "🙂e",
+    onChange: (text) => changes.push(text),
+    onExternalEditor: () => "🙂xy",
+    onReject: (reason) => rejected.push(reason),
+  });
+  try {
+    assert.equal(field.getText(), "🙂e", "an exactly 5-byte initial value is retained");
+    assert.equal(field.setText("🙂ee"), false);
+    assert.equal(field.getText(), "🙂e");
+
+    assert.equal(field.setText("é\u0301"), true);
+    field.handleInput(`${BRACKETED_PASTE_START}x${BRACKETED_PASTE_END}`);
+    assert.equal(field.getText(), "é\u0301x", "paste uses the same byte limit as setText");
+    field.handleInput(`${BRACKETED_PASTE_START}y${BRACKETED_PASTE_END}`);
+    assert.equal(field.getText(), "é\u0301x", "over-limit paste leaves the complete prior value unchanged");
+
+    field.setText("ok");
+    field.handleInput("\x07");
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+    assert.equal(field.getText(), "ok", "over-limit external-editor output is rejected atomically");
+    assert.deepEqual(changes, ["é\u0301", "é\u0301x", "ok"]);
+    assert.ok(rejected.filter((reason) => reason === "text-limit").length >= 3);
+  } finally {
+    field.dispose();
+  }
+});
+
+test("invalid custom name byte limits are rejected instead of clamped", () => {
+  for (const maxNameBytes of [0, -1, MAX_RENAME_NAME_BYTES + 1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(() => createSessionHostTextField({ kind: "name", maxNameBytes }), /maxNameBytes/);
+  }
+});
+
+test("native name fields allow an empty draft for caller-side submission validation", () => {
+  const submissions: SessionHostFieldSubmission[] = [];
+  const field = createSessionHostTextField({
+    kind: "name",
+    onSubmit: (submission) => submissions.push(submission),
+  });
+  try {
+    assert.equal(isValidRenameName(""), false);
+    assert.equal(field.setText(""), true);
+    field.handleInput(ENTER);
+    assert.deepEqual(submissions, [{ text: "", value: "", source: "typed" }]);
+  } finally {
+    field.dispose();
+  }
+});
+
 test("rejected over-limit and unsafe edits preserve the native undo stack and caret", () => {
   const rejected: SessionHostFieldRejection[] = [];
   const field = createSessionHostTextField({
     kind: "name",
+    maxNameBytes: 80,
     onReject: (reason) => rejected.push(reason),
   });
   try {
@@ -507,31 +616,107 @@ test("tilde completion stays rooted at the explicitly supplied test HOME", async
   }
 });
 
-test("injected keybindings stay live for app-level actions", () => {
+test("injected native app keybindings stay live for clear and external-editor actions", async () => {
   const manager = new KeybindingsManager({
     ...TUI_KEYBINDINGS,
-    "app.interrupt": { defaultKeys: "ctrl+k" },
+    "app.clear": { defaultKeys: "ctrl+c" },
+    "app.interrupt": { defaultKeys: "escape" },
+    "app.editor.external": { defaultKeys: "ctrl+g" },
+    "app.cancel": { defaultKeys: "ctrl+x" },
   });
   let cleared = 0;
+  let externalEdits = 0;
   const field = createSessionHostTextField({
     kind: "path",
     workspaceBasePath: process.cwd(),
     keybindings: manager,
+    actionBindings: { cancel: "app.cancel" },
     onClear: () => { cleared += 1; },
+    onExternalEditor: (text) => {
+      externalEdits += 1;
+      return `${text}-external`;
+    },
   });
   try {
     field.setText("draft");
-    field.handleInput("\x0b");
+    field.handleInput("\x03");
     assert.equal(field.getText(), "");
-    assert.equal(cleared, 1);
+    assert.equal(cleared, 1, "the native app.clear default Ctrl+C is honored");
 
-    manager.setUserBindings({ "app.interrupt": "ctrl+l" });
+    manager.setUserBindings({ "app.clear": "ctrl+k", "app.editor.external": "ctrl+e" });
     field.setText("still live");
+    field.handleInput("\x03");
+    assert.equal(field.getText(), "still live", "custom app.clear replaces its Ctrl+C default");
+    assert.equal(cleared, 1);
     field.handleInput("\x0b");
-    assert.equal(field.getText(), "still live", "the old action key now belongs to the native Editor");
-    field.handleInput("\x0c");
     assert.equal(field.getText(), "");
     assert.equal(cleared, 2);
+
+    field.setText("external");
+    field.handleInput("\x07");
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+    assert.equal(field.getText(), "external", "custom app.editor.external replaces the Ctrl+G default");
+    assert.equal(externalEdits, 0);
+    field.handleInput("\x05");
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+    assert.equal(field.getText(), "external-external");
+    assert.equal(externalEdits, 1);
+
+    manager.setUserBindings({ "app.clear": "ctrl+l", "app.editor.external": "ctrl+o" });
+    field.setText("still live");
+    field.handleInput("\x0b");
+    assert.equal(field.getText(), "still live", "the previous clear action key stops matching");
+    field.handleInput("\x0c");
+    assert.equal(field.getText(), "");
+    assert.equal(cleared, 3);
+
+    field.setText("another external edit");
+    field.handleInput("\x05");
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+    assert.equal(field.getText(), "another external edit", "the previous external-editor key stops matching");
+    assert.equal(externalEdits, 1);
+    field.handleInput("\x0f");
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+    assert.equal(field.getText(), "another external edit-external");
+    assert.equal(externalEdits, 2);
+  } finally {
+    field.dispose();
+  }
+});
+
+test("native app Escape interrupts without clearing and preserves completion-first cancellation", async (t) => {
+  const fixture = makeFixture(t);
+  mkdirSync(join(fixture, "entry-one"));
+  mkdirSync(join(fixture, "entry-two"));
+  const manager = new KeybindingsManager({
+    ...TUI_KEYBINDINGS,
+    "app.clear": { defaultKeys: "ctrl+c" },
+    "app.interrupt": { defaultKeys: "escape" },
+    "app.editor.external": { defaultKeys: "ctrl+g" },
+  });
+  const prefix = `${displayPath(relative(process.cwd(), fixture))}/entry`;
+  let cleared = 0;
+  let canceled = 0;
+  const field = createSessionHostTextField({
+    kind: "path",
+    workspaceBasePath: process.cwd(),
+    initialText: prefix,
+    keybindings: manager,
+    onClear: () => { cleared += 1; },
+    onCancel: () => { canceled += 1; },
+  });
+  try {
+    field.handleInput(TAB);
+    await waitForAutocomplete(field);
+    field.handleInput(ESCAPE);
+    assert.equal(field.isShowingAutocomplete(), false, "the first Escape dismisses native suggestions");
+    assert.equal(field.getText(), prefix);
+    assert.equal(canceled, 0);
+    assert.equal(cleared, 0, "app.interrupt Escape is never mistaken for app.clear");
+
+    field.handleInput(ESCAPE);
+    assert.equal(canceled, 1, "the next Escape cancels the field");
+    assert.equal(cleared, 0);
   } finally {
     field.dispose();
   }

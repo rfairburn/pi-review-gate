@@ -1,4 +1,5 @@
 import {
+  accessSync,
   closeSync,
   constants as fsConstants,
   fstatSync,
@@ -30,7 +31,15 @@ import {
  *   `SessionManager.listAll(EXPLICIT projectDir, progress?, AbortSignal)`
  *   flat-directory overload (the SDK's flat list filters `.jsonl` and does
  *   not recurse). The no-arg scan (which follows symlinks) and the
- *   cwd-filtering `list` are never used.
+ *   cwd-filtering `list` are never used. BEFORE the call, the project
+ *   directory is rechecked as a real non-symlink directory and every
+ *   `.jsonl` entry the flat list would read is prefetched as a safe regular
+ *   readable file: the explicit overload has no per-file filter, so one
+ *   unsafe entry (symlink, FIFO, special file) fails that project's listing
+ *   with a bounded truthful issue instead of letting the SDK follow it,
+ *   read it, or block on it. The unsafe entries are preserved untouched.
+ * - Catalog issues are retained in a bounded array (at most
+ *   MAX_CATALOG_ISSUES at creation) while the exact total is always counted.
  * - The catalog is strictly read-only user storage: no SDK
  *   `SessionManager.open`/create/migrate, no credential reads, no provider
  *   activation, no user filesystem mutation. Unknown or malformed files and
@@ -68,10 +77,13 @@ export const NO_MESSAGES_CAPTION = "(no messages)";
 const MAX_PROJECT_LIST_CONCURRENCY = 4;
 
 /** Bounded number of catalog issues retained (the total is always reported). */
-const MAX_CATALOG_ISSUES = 20;
+export const MAX_CATALOG_ISSUES = 20;
 
 /** Upper bound for the bounded first-line session header read (never a whole transcript). */
 export const MAX_SESSION_HEADER_BYTES = 64 * 1024;
+
+/** Upper bound for a bounded session header field (id/cwd). */
+export const MAX_SESSION_HEADER_FIELD_LENGTH = 4096;
 
 /** One observed saved conversation row: identity and display metadata only. */
 export interface SavedSessionRow {
@@ -179,6 +191,12 @@ export interface ListSavedSessionsOptions {
     onProgress?: (progress: Readonly<Record<string, unknown>>) => void,
     signal?: AbortSignal,
   ) => Promise<NativeSessionSdkInfo[]>;
+  /**
+   * The caller's admitted Pi version: when provided (and no listAll is
+   * injected), the public SDK's owning package must declare exactly this
+   * stable version. No CLI execution or probe happens here.
+   */
+  expectedPiVersion?: string;
   /** Abort the listing; late completions of an aborted query never contribute. */
   signal?: AbortSignal;
 }
@@ -235,26 +253,64 @@ export function canonicalSavedSessionCaption(
   return `${codepoints.slice(0, MAX_SAVED_SESSION_CAPTION_CODEPOINTS - 1).join("")}\u2026`;
 }
 
-/** Bounded first-line read of a saved conversation's public session header. */
+/** True only for nonempty strings within the field bound and free of control characters. */
+function isBoundedControlFreeString(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0) return false;
+  if (value.length > MAX_SESSION_HEADER_FIELD_LENGTH) return false;
+  return !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+/**
+ * Bounded first-line read of a saved conversation's PUBLIC session header.
+ *
+ * The first line must be a complete bounded public SessionHeader: `type`
+ * exactly "session" with nonempty bounded control-free `id` and `cwd`. A
+ * first line that overflows the 64 KiB bound without a line break is refused
+ * (a valid JSON prefix followed by unread garbage on the same line is never
+ * accepted), as are symlinked or special files. The read is descriptor-based
+ * and bounded; it never copies the transcript, and native appends or name
+ * changes after the header remain admissible (no mtime lock).
+ */
 export function readSavedSessionHeader(file: string): { id: string; cwd: string } | undefined {
+  let preStats;
+  try {
+    preStats = lstatSync(file, { bigint: true });
+  } catch {
+    return undefined;
+  }
+  // Non-symlink identity: a symlinked or special file is never probed.
+  if (preStats.isSymbolicLink() || !preStats.isFile()) return undefined;
   let fd: number;
   try {
-    fd = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
+    fd = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0) | (fsConstants.O_NOFOLLOW ?? 0));
   } catch {
     return undefined;
   }
   try {
-    if (!fstatSync(fd).isFile()) return undefined; // special file: never probe it
+    const openStats = fstatSync(fd, { bigint: true });
+    if (!openStats.isFile()) return undefined; // special file: never probe it
+    // Descriptor identity: the opened file must be the SAME regular file that
+    // was inspected. O_NOFOLLOW only protects against a final-component
+    // symlink; a regular-file replacement between lstat and open is refused.
+    if (openStats.dev !== preStats.dev || openStats.ino !== preStats.ino) return undefined;
     const buffer = Buffer.alloc(MAX_SESSION_HEADER_BYTES);
     let offset = 0;
     let lineEnd = -1;
+    let eof = false;
     while (offset < buffer.length) {
       const bytesRead = readSync(fd, buffer, offset, buffer.length - offset, offset);
-      if (bytesRead <= 0) break;
+      if (bytesRead <= 0) {
+        eof = true;
+        break;
+      }
       offset += bytesRead;
       lineEnd = buffer.subarray(0, offset).indexOf(0x0a);
       if (lineEnd !== -1) break;
     }
+    // First-line overflow: no LF within the bound and not EOF. A complete
+    // short final line without a trailing newline (EOF before the bound) is
+    // still a bounded, fully-read line.
+    if (lineEnd === -1 && !eof) return undefined;
     const firstLine = (lineEnd === -1 ? buffer.subarray(0, offset) : buffer.subarray(0, lineEnd)).toString("utf8");
     if (firstLine.trim().length === 0) return undefined;
     let parsed: unknown;
@@ -265,8 +321,9 @@ export function readSavedSessionHeader(file: string): { id: string; cwd: string 
     }
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
     const record = parsed as Record<string, unknown>;
-    if (typeof record.id !== "string" || record.id.length === 0) return undefined;
-    if (typeof record.cwd !== "string" || record.cwd.length === 0) return undefined;
+    // The PUBLIC SessionHeader type: never another entry kind.
+    if (record.type !== "session") return undefined;
+    if (!isBoundedControlFreeString(record.id) || !isBoundedControlFreeString(record.cwd)) return undefined;
     return { id: record.id, cwd: record.cwd };
   } finally {
     try {
@@ -302,38 +359,152 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   }
 }
 
+/** A dev/ino observation of one real directory at discovery time. */
+interface PathIdentity {
+  dev: bigint;
+  ino: bigint;
+}
+
 /**
  * Top-level discovery of approved real project session directories under the
  * sessions root: dirents + lstat only, `.terraform` pruned BEFORE any
  * descent, directory symlinks never followed. Unknown files and directories
  * are preserved (never touched); only real directories become listing targets.
+ * Each discovered directory's dev/ino identity is retained so a later swap
+ * (symlink or replacement directory) is detectable before any SDK call.
  */
 function discoverProjectSessionDirs(
   sessionsRoot: string,
-): { projectDirs: string[]; issues: SavedSessionIssue[] } {
+  addIssue: (projectDir: string, reason: string) => void,
+): { dirs: string[]; identities: Map<string, PathIdentity> } {
   let entries;
   try {
     entries = readdirSync(sessionsRoot, { withFileTypes: true });
   } catch {
-    return { projectDirs: [], issues: [{ projectDir: sessionsRoot, reason: "sessions root could not be read" }] };
+    addIssue(sessionsRoot, "sessions root could not be read");
+    return { dirs: [], identities: new Map() };
   }
-  const projectDirs: string[] = [];
-  const issues: SavedSessionIssue[] = [];
+  const dirs: string[] = [];
+  const identities = new Map<string, PathIdentity>();
   for (const entry of entries) {
     if (entry.name === TERRAFORM_DIRNAME) continue; // pruned before any descent
     const full = join(sessionsRoot, entry.name);
     let stats;
     try {
-      stats = lstatSync(full);
+      stats = lstatSync(full, { bigint: true });
     } catch {
-      issues.push({ projectDir: full, reason: "entry could not be inspected" });
+      addIssue(full, "entry could not be inspected");
       continue;
     }
     if (stats.isSymbolicLink()) continue; // directory symlinks are never followed
     if (!stats.isDirectory()) continue; // non-directory entries are preserved, not session dirs
-    projectDirs.push(full);
+    dirs.push(full);
+    identities.set(full, { dev: stats.dev, ino: stats.ino });
   }
-  return { projectDirs, issues };
+  return { dirs, identities };
+}
+
+/**
+ * Revalidate the sessions-root-to-project path chain before SDK enumeration
+ * and again immediately before the listAll call: the root must still be the
+ * SAME real non-symlink directory (discovery dev/ino), every component down
+ * to the project must be a real non-symlink directory, the project must still
+ * be the SAME directory it was at discovery (dev/ino), and its canonical path
+ * must remain contained in the root's. A swapped root (e.g. replaced with a
+ * symlink to another tree) or a replaced project directory is refused before
+ * the SDK can read anything foreign.
+ */
+function revalidateProjectChain(
+  sessionsRoot: string,
+  sessionsRootReal: string,
+  rootIdentity: PathIdentity,
+  projectDir: string,
+  projectIdentity: PathIdentity,
+): string | undefined {
+  let rootStats;
+  try {
+    rootStats = lstatSync(sessionsRoot, { bigint: true });
+  } catch {
+    return "sessions root could not be inspected";
+  }
+  if (rootStats.isSymbolicLink() || !rootStats.isDirectory()) {
+    return "sessions root was replaced after discovery";
+  }
+  if (rootStats.dev !== rootIdentity.dev || rootStats.ino !== rootIdentity.ino) {
+    return "sessions root was replaced after discovery";
+  }
+  const rel = relative(sessionsRoot, projectDir);
+  if (rel.startsWith("..") || isAbsolute(rel)) return "project directory escapes the sessions root";
+  let current = sessionsRoot;
+  let finalStats: { dev: bigint; ino: bigint; isSymbolicLink(): boolean; isDirectory(): boolean } | undefined;
+  for (const part of rel.split(sep)) {
+    current = join(current, part);
+    let stats;
+    try {
+      stats = lstatSync(current, { bigint: true });
+    } catch {
+      return "project path could not be inspected";
+    }
+    if (stats.isSymbolicLink() || !stats.isDirectory()) return "project path is not a real directory chain";
+    finalStats = stats;
+  }
+  if (finalStats === undefined) return "project path could not be inspected";
+  if (finalStats.dev !== projectIdentity.dev || finalStats.ino !== projectIdentity.ino) {
+    return "project directory was replaced after discovery";
+  }
+  let projectReal;
+  try {
+    projectReal = realpathSync(projectDir);
+  } catch {
+    return "project directory could not be canonicalized";
+  }
+  if (!projectReal.startsWith(`${sessionsRootReal}${sep}`)) return "project directory escapes the sessions root";
+  return undefined;
+}
+
+/**
+ * Preflight one approved project directory BEFORE the public SDK call:
+ * recheck that it is still a real non-symlink directory (it may have been
+ * swapped after discovery), and that every `.jsonl` entry the flat list would
+ * read is already a safe regular readable file. Flat-directory entry checks
+ * only — no descent anywhere, `.terraform` pruned before any descent. Returns
+ * a bounded issue reason when the directory must not be listed (the explicit
+ * flat overload has no per-file filter, so one unsafe entry fails the whole
+ * project listing; the entries are preserved untouched).
+ */
+function preflightProjectSessionDir(projectDir: string): string | undefined {
+  let stats;
+  try {
+    stats = lstatSync(projectDir);
+  } catch {
+    return "project directory could not be inspected";
+  }
+  if (stats.isSymbolicLink() || !stats.isDirectory()) return "project directory is not a real directory";
+  let entries;
+  try {
+    entries = readdirSync(projectDir, { withFileTypes: true });
+  } catch {
+    return "project directory could not be read";
+  }
+  for (const entry of entries) {
+    if (entry.name === TERRAFORM_DIRNAME) continue; // pruned before any descent
+    if (!entry.name.endsWith(".jsonl")) continue; // the flat SDK list reads .jsonl entries only
+    const full = join(projectDir, entry.name);
+    let fileStats;
+    try {
+      fileStats = lstatSync(full);
+    } catch {
+      return "session entry could not be inspected";
+    }
+    if (fileStats.isSymbolicLink()) return "session entry is a symlink";
+    if (!fileStats.isFile()) return "session entry is not a regular file";
+    try {
+      accessSync(full, fsConstants.R_OK);
+    } catch {
+      return "session entry is not readable";
+    }
+  }
+  return undefined;
 }
 
 /** Bounded-concurrency map that preserves input order. */
@@ -389,9 +560,11 @@ function emptyCatalog(
  * - A missing sessions root yields an honest empty catalog (no error).
  * - A symlinked or non-directory sessions root yields an empty catalog with a
  *   bounded issue: it is never followed or invented around.
- * - Each approved project directory is listed with the public explicit
- *   flat-directory `listAll` overload under bounded concurrency; per-directory
- *   failures and malformed rows become bounded issues, never silent drops.
+ * - Each approved project directory is prefetched (real non-symlink
+ *   directory; every `.jsonl` entry a safe regular readable file) and then
+ *   listed with the public explicit flat-directory `listAll` overload under
+ *   bounded concurrency; an unsafe entry, a swapped directory, per-directory
+ *   failures, and malformed rows become bounded issues, never silent drops.
  * - No `HOME` or `process.env` mutation ever happens: the agent directory is
  *   always explicit, so the SDK's default-directory resolution is irrelevant.
  */
@@ -417,7 +590,7 @@ export async function listSavedSessions(options: ListSavedSessionsOptions): Prom
 
   let rootStats;
   try {
-    rootStats = lstatSync(sessionsRoot);
+    rootStats = lstatSync(sessionsRoot, { bigint: true });
   } catch {
     return emptyCatalog(agentDir, sessionsRoot, revision); // missing sessions root: honest empty
   }
@@ -426,6 +599,9 @@ export async function listSavedSessions(options: ListSavedSessionsOptions): Prom
       { projectDir: sessionsRoot, reason: "sessions root is not a real directory" },
     ]);
   }
+  // Discovery identity of the root: any later swap (symlink or replacement
+  // directory) must be detectable before a project listing runs.
+  const rootIdentity: PathIdentity = { dev: rootStats.dev, ino: rootStats.ino };
 
   let listAll: NonNullable<ListSavedSessionsOptions["listAll"]>;
   if (options.listAll !== undefined) {
@@ -439,42 +615,80 @@ export async function listSavedSessions(options: ListSavedSessionsOptions): Prom
         "pi-review-gate: the saved-session catalog needs the resolved native pi executable (or an injected listAll) to locate the public session SDK",
       );
     }
-    const sdk = resolveNativeSessionSdk(options.piExecutable);
+    const sdk = resolveNativeSessionSdk(options.piExecutable, { expectedPiVersion: options.expectedPiVersion });
     listAll = sdk.SessionManager.listAll.bind(sdk.SessionManager);
   }
 
-  const { projectDirs, issues: discoveryIssues } = discoverProjectSessionDirs(sessionsRoot);
-  const issues: SavedSessionIssue[] = [...discoveryIssues];
+  // Bounded retention at creation: the total is always counted, but at most
+  // MAX_CATALOG_ISSUES issues are retained (first-seen order).
+  const issues: SavedSessionIssue[] = [];
+  let issueCount = 0;
+  function addIssue(projectDir: string, reason: string): void {
+    issueCount += 1;
+    if (issues.length < MAX_CATALOG_ISSUES) issues.push({ projectDir, reason });
+  }
+
+  const { dirs: projectDirs, identities } = discoverProjectSessionDirs(sessionsRoot, addIssue);
   const rows: SavedSessionRow[] = [];
 
   const sessionsRootReal = realpathSync(sessionsRoot);
   const perDirResults = await mapWithConcurrency(projectDirs, MAX_PROJECT_LIST_CONCURRENCY, async (projectDir) => {
     throwIfAborted(options.signal);
+    const projectIdentity = identities.get(projectDir);
+    if (projectIdentity === undefined) {
+      addIssue(projectDir, "project directory identity is unknown");
+      return [];
+    }
+    // Revalidate the root-to-project chain BEFORE enumerating entries: the
+    // root and every component must still be the same real non-symlink
+    // directories observed at discovery.
+    const chainIssue = revalidateProjectChain(sessionsRoot, sessionsRootReal, rootIdentity, projectDir, projectIdentity);
+    if (chainIssue !== undefined) {
+      addIssue(projectDir, chainIssue);
+      return [];
+    }
+    // Preflight BEFORE the public SDK call: every .jsonl entry the flat list
+    // would read must already be a safe regular readable file. The explicit
+    // flat overload has no per-file filter, so one unsafe entry fails this
+    // project's listing with a bounded truthful issue instead of letting the
+    // SDK follow it, read it, or block on it; the entries stay preserved.
+    const preflightIssue = preflightProjectSessionDir(projectDir);
+    if (preflightIssue !== undefined) {
+      addIssue(projectDir, preflightIssue);
+      return [];
+    }
+    // Immediately before the public SDK call: revalidate identity one last
+    // time so a swap landing between enumeration and listAll is still refused.
+    const finalChainIssue = revalidateProjectChain(sessionsRoot, sessionsRootReal, rootIdentity, projectDir, projectIdentity);
+    if (finalChainIssue !== undefined) {
+      addIssue(projectDir, finalChainIssue);
+      return [];
+    }
     let infos: NativeSessionSdkInfo[];
     try {
       infos = await listAll(projectDir, undefined, options.signal);
     } catch (error) {
       if (options.signal?.aborted) throw error; // an aborted query rejects wholesale
-      issues.push({ projectDir, reason: "session listing failed" });
+      addIssue(projectDir, "session listing failed");
       return [];
     }
     // A listing that resolves AFTER cancellation (instead of rejecting)
     // must not contribute rows to a published catalog.
     throwIfAborted(options.signal);
     if (!Array.isArray(infos)) {
-      issues.push({ projectDir, reason: "session listing returned no rows" });
+      addIssue(projectDir, "session listing returned no rows");
       return [];
     }
     const dirRows: SavedSessionRow[] = [];
     for (const info of infos) {
       if (info === null || typeof info !== "object") {
-        issues.push({ projectDir, reason: "malformed session entry" });
+        addIssue(projectDir, "malformed session entry");
         continue;
       }
       if (typeof info.path !== "string" || info.path.length === 0
         || typeof info.id !== "string" || info.id.length === 0
         || typeof info.cwd !== "string" || info.cwd.length === 0) {
-        issues.push({ projectDir, reason: "malformed session entry" });
+        addIssue(projectDir, "malformed session entry");
         continue;
       }
       const observed = isAbsolute(info.path) ? info.path : join(projectDir, info.path);
@@ -482,17 +696,17 @@ export async function listSavedSessions(options: ListSavedSessionsOptions): Prom
       try {
         stats = lstatSync(observed, { bigint: true });
       } catch {
-        issues.push({ projectDir, reason: "session file missing" });
+        addIssue(projectDir, "session file missing");
         continue;
       }
       if (stats.isSymbolicLink() || !stats.isFile()) {
         // Preserved untouched; a symlinked or special file is never admissible.
-        issues.push({ projectDir, reason: "session file is not a regular file" });
+        addIssue(projectDir, "session file is not a regular file");
         continue;
       }
       const canonicalFile = realpathSync(observed);
       if (!canonicalFile.startsWith(`${sessionsRootReal}${sep}`)) {
-        issues.push({ projectDir, reason: "session file outside the sessions root" });
+        addIssue(projectDir, "session file outside the sessions root");
         continue;
       }
       const row: SavedSessionRow = {
@@ -527,20 +741,20 @@ export async function listSavedSessions(options: ListSavedSessionsOptions): Prom
     return a.file < b.file ? -1 : a.file > b.file ? 1 : 0;
   });
 
-  const catalogIssues = issues.slice(0, MAX_CATALOG_ISSUES);
+  // `issues` is already bounded at creation; issueCount is the exact total.
   const catalog: SavedSessionCatalog = {
     agentDir,
     sessionsRoot,
     revision,
     rows,
-    issues: catalogIssues,
-    issueCount: issues.length,
+    issues,
+    issueCount,
   };
   // Deep-freeze every identity-bearing object so the brand authenticates
   // immutable minted data: a caller cannot push fabricated rows, rewrite the
   // revision/root fields, or retarget a row after the catalog is published.
-  for (const issue of catalogIssues) Object.freeze(issue);
-  Object.freeze(catalogIssues);
+  for (const issue of issues) Object.freeze(issue);
+  Object.freeze(issues);
   for (const row of rows) Object.freeze(row);
   Object.freeze(rows);
   Object.freeze(catalog);

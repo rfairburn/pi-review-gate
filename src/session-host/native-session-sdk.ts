@@ -1,4 +1,13 @@
-import { accessSync, constants as fsConstants, lstatSync, readFileSync, realpathSync } from "node:fs";
+import {
+  accessSync,
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+} from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 /**
@@ -10,14 +19,25 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
  * OWN official `@earendil-works/pi-coding-agent` package that contains the
  * resolved native Pi CLI:
  *
- * - Bounded ancestor walk from the CLI file to the nearest `package.json`
- *   whose `name` is exactly `@earendil-works/pi-coding-agent`. No guessed
- *   home releases, no unrelated PATH packages, no private SDK locations.
+ * - Bounded ancestor walk (MAX_SDK_ANCESTOR_STEPS) from the CLI file to the
+ *   nearest `package.json` — a package boundary. Only a boundary named
+ *   exactly `@earendil-works/pi-coding-agent` may own the CLI; an unrelated
+ *   boundary or reaching the bound without one is an honest unavailability.
+ *   No guessed home releases, no unrelated PATH packages, no private SDK
+ *   locations.
+ * - The package metadata must agree: a stable declared version at or above
+ *   MIN_SUPPORTED_PI_VERSION (never "unknown", malformed, or a prerelease),
+ *   an official `pi` CLI bin declared and contained in the package as a
+ *   regular readable file, and — when the caller admits a Pi version — exact
+ *   agreement with it. All of this is checked BEFORE any cached entry can be
+ *   returned.
  * - The public entry comes only from that package's own metadata: the
  *   `exports["."]` target (require/import/default conditions) or `main`,
  *   resolved to a contained regular readable Node file inside the package.
  *   Private SDK internals (`core/session-manager.js`, keybindings, …) are
- *   never imported; only the package's declared public entry is loaded.
+ *   never imported; only the package's declared public entry is loaded with
+ *   the supported Node loader (`require` of the canonical entry, which the
+ *   supported Node runtime resolves for both CommonJS and ESM entries).
  * - The loaded module must export a `SessionManager` runtime with a static
  *   `listAll` function; anything else is an honest "unavailable" diagnostic.
  *
@@ -47,6 +67,12 @@ const FORBIDDEN_SDK_ENV_PREFIXES: readonly string[] = [
 
 /** Upper bound for one package.json read during the bounded ancestor walk. */
 export const MAX_SDK_PACKAGE_JSON_BYTES = 256 * 1024;
+
+/** Fixed bound on the ancestor walk from the CLI to its owning package boundary. */
+export const MAX_SDK_ANCESTOR_STEPS = 32;
+
+/** Lowest stable Pi version whose public SDK this catalog supports. */
+export const MIN_SUPPORTED_PI_VERSION = "1.0.4";
 
 /** Minimal structural view of a public SDK session row (SessionInfo). */
 export interface NativeSessionSdkInfo {
@@ -86,8 +112,18 @@ export interface NativeSessionSdk {
   entry: string;
   /** Absolute path of the owning official Pi package directory. */
   packageDir: string;
-  /** The owning package's declared version. */
+  /** The owning package's declared stable version. */
   version: string;
+}
+
+/** Optional caller context for public SDK resolution. */
+export interface ResolveNativeSessionSdkOptions {
+  /**
+   * The caller's admitted Pi version: when provided, the owning package's
+   * declared version must agree with it exactly; anything else is an honest
+   * unavailability. No CLI execution or probe happens here.
+   */
+  expectedPiVersion?: string;
 }
 
 interface SdkPackageManifest {
@@ -95,95 +131,241 @@ interface SdkPackageManifest {
   version?: unknown;
   main?: unknown;
   exports?: unknown;
+  bin?: unknown;
 }
 
-/** Bounded, parse-checked read of one ancestor package.json (undefined when absent). */
-function readSdkPackageManifest(dir: string): SdkPackageManifest | undefined {
-  const candidate = join(dir, "package.json");
-  let stats;
-  try {
-    stats = lstatSync(candidate);
-  } catch {
-    return undefined;
-  }
-  if (!stats.isFile()) return undefined; // a symlinked or special package.json is never trusted
-  if (stats.size > MAX_SDK_PACKAGE_JSON_BYTES) return undefined;
-  let text: string;
-  try {
-    text = readFileSync(candidate, "utf8");
-  } catch {
-    return undefined;
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return undefined;
-  }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
-  return parsed as SdkPackageManifest;
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** True when `path` lexically escapes `root`. */
+function escapesRoot(root: string, path: string): boolean {
+  const rel = relative(root, path);
+  return rel.startsWith("..") || isAbsolute(rel);
 }
 
 /**
- * Resolve the official Pi package directory containing the CLI: a bounded
- * ancestor walk from the CLI's own directory, stopping at the nearest
- * `package.json` named exactly `@earendil-works/pi-coding-agent`. The CLI
- * file must remain contained in the resolved package (same-package
- * containment); unrelated packages are skipped, and the walk never descends
- * anywhere (ancestors only).
+ * Bounded, descriptor-based, parse-checked read of one ancestor package.json.
+ * The manifest is opened non-blocking with O_NOFOLLOW and sized via fstat
+ * BEFORE any read, so a symlinked foreign manifest or an unbounded file is
+ * never trusted. The outcomes are deliberately distinct: `absent` means the
+ * walk may continue to the next ancestor; `invalid` means an EXISTING
+ * package boundary is not trustworthy (malformed, oversized, unreadable,
+ * symlinked, special, or replaced between inspection and open) and the walk
+ * must STOP there — it never crosses an invalid boundary to attribute the
+ * CLI to an outer package.
  */
-function findOwnPiPackage(piExecutable: string): { packageDir: string; manifest: SdkPackageManifest } | undefined {
+type SdkManifestRead =
+  | { status: "absent" }
+  | { status: "valid"; manifest: SdkPackageManifest }
+  | { status: "invalid"; reason: string };
+
+function readSdkPackageManifest(dir: string): SdkManifestRead {
+  const candidate = join(dir, "package.json");
+  let preStats;
+  try {
+    preStats = lstatSync(candidate, { bigint: true });
+  } catch (error) {
+    // Only ENOENT establishes an ABSENT manifest. Permission or I/O failures
+    // mean an existing boundary that cannot be inspected: the walk must stop
+    // there, never cross it toward an outer package.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { status: "absent" };
+    return { status: "invalid", reason: "package.json could not be inspected" };
+  }
+  // A symlinked or special package.json is an EXISTING invalid boundary.
+  if (preStats.isSymbolicLink() || !preStats.isFile()) {
+    return { status: "invalid", reason: "package.json is not a regular file" };
+  }
+  let fd: number;
+  try {
+    fd = openSync(candidate, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0) | (fsConstants.O_NOFOLLOW ?? 0));
+  } catch {
+    return { status: "invalid", reason: "package.json could not be opened" };
+  }
+  try {
+    try {
+      const stats = fstatSync(fd, { bigint: true });
+      // Descriptor identity: the opened file must be the same regular file
+      // that was inspected; a replacement between lstat and open is an
+      // invalid boundary.
+      if (stats.dev !== preStats.dev || stats.ino !== preStats.ino) {
+        return { status: "invalid", reason: "package.json identity changed between inspection and open" };
+      }
+      if (!stats.isFile() || stats.size <= 0 || stats.size > MAX_SDK_PACKAGE_JSON_BYTES) {
+        return { status: "invalid", reason: "package.json is not a bounded regular file" };
+      }
+      const buffer = Buffer.alloc(Number(stats.size));
+      let offset = 0;
+      while (offset < buffer.length) {
+        const bytesRead = readSync(fd, buffer, offset, buffer.length - offset, offset);
+        if (bytesRead <= 0) break; // shrank underneath us: the bounded partial read fails parsing
+        offset += bytesRead;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(buffer.subarray(0, offset).toString("utf8"));
+      } catch {
+        return { status: "invalid", reason: "package.json is malformed" };
+      }
+      if (!isPlainObject(parsed)) return { status: "invalid", reason: "package.json is malformed" };
+      return { status: "valid", manifest: parsed as SdkPackageManifest };
+    } catch {
+      // Any descriptor failure (fstat/read I/O) is a bounded invalid boundary,
+      // never an unbounded escape toward the caller.
+      return { status: "invalid", reason: "package.json could not be read" };
+    }
+  } finally {
+    try {
+      closeSync(fd);
+    } catch {
+      // A close failure must not mask the bounded manifest read result.
+    }
+  }
+}
+
+type OwnPackageSearch =
+  | { status: "found"; packageDir: string; manifest: SdkPackageManifest }
+  | { status: "unrelated-boundary" }
+  | { status: "invalid-boundary"; reason: string }
+  | { status: "bound-reached" };
+
+/**
+ * Resolve the official Pi package directory containing the CLI: a bounded
+ * ancestor walk (at most MAX_SDK_ANCESTOR_STEPS) from the CLI's own directory
+ * to the nearest `package.json` — a package boundary. Only a boundary named
+ * exactly `@earendil-works/pi-coding-agent` may own the CLI; an unrelated
+ * boundary means the CLI is not inside its own official package (the walk
+ * never continues into unrelated PATH or private SDK locations), and reaching
+ * the bound without any boundary is an honest unavailability. The walk never
+ * descends anywhere (ancestors only).
+ */
+function findOwnPiPackage(piExecutable: string): OwnPackageSearch {
   let dir = dirname(resolve(piExecutable));
-  for (;;) {
-    const manifest = readSdkPackageManifest(dir);
-    if (manifest && manifest.name === PI_PACKAGE_NAME) {
-      return { packageDir: dir, manifest };
+  for (let step = 0; step < MAX_SDK_ANCESTOR_STEPS; step += 1) {
+    const read = readSdkPackageManifest(dir);
+    if (read.status === "valid") {
+      return read.manifest.name === PI_PACKAGE_NAME
+        ? { status: "found", packageDir: dir, manifest: read.manifest }
+        : { status: "unrelated-boundary" };
+    }
+    if (read.status === "invalid") {
+      // An EXISTING but untrustworthy boundary stops the walk: the CLI is
+      // never attributed to an outer package across it.
+      return { status: "invalid-boundary", reason: read.reason };
     }
     const parent = dirname(dir);
-    if (parent === dir) return undefined; // filesystem root reached without the official package
+    if (parent === dir) return { status: "bound-reached" }; // filesystem root reached within the bound
     dir = parent;
   }
+  return { status: "bound-reached" };
+}
+
+/**
+ * Parse a stable (non-prerelease, non-build-suffixed) semver triple. Malformed
+ * numeric components are rejected: leading zeros ("01") and values that are
+ * not finite safe integers (arbitrarily large components).
+ */
+function parseStablePiVersion(version: unknown): readonly [number, number, number] | undefined {
+  if (typeof version !== "string") return undefined;
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
+  // The match must consume the ENTIRE string: JavaScript's $ also matches
+  // before a final line terminator, so "1.0.4\n" would otherwise pass.
+  if (!match || match[0] !== version) return undefined;
+  const parts: number[] = [];
+  for (const raw of [match[1], match[2], match[3]]) {
+    if (raw.length > 1 && raw.startsWith("0")) return undefined; // leading zeros are malformed semver
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value)) return undefined;
+    parts.push(value);
+  }
+  return [parts[0], parts[1], parts[2]] as const;
+}
+
+const MIN_SUPPORTED_PI_VERSION_PARTS = parseStablePiVersion(MIN_SUPPORTED_PI_VERSION);
+
+/** True only for stable declared versions at or above MIN_SUPPORTED_PI_VERSION. */
+function isSupportedStablePiVersion(version: unknown): boolean {
+  const parsed = parseStablePiVersion(version);
+  if (parsed === undefined || MIN_SUPPORTED_PI_VERSION_PARTS === undefined) return false;
+  for (let i = 0; i < 3; i += 1) {
+    if (parsed[i] !== MIN_SUPPORTED_PI_VERSION_PARTS[i]) {
+      return parsed[i] > MIN_SUPPORTED_PI_VERSION_PARTS[i];
+    }
+  }
+  return true;
 }
 
 /** Extract a contained relative entry target from `exports["."]` or `main` metadata. */
 function resolvePublicEntryTarget(manifest: SdkPackageManifest): string | undefined {
   const exportsField = manifest.exports;
   if (exportsField !== undefined) {
-    let rootExport: unknown = exportsField;
-    if (typeof exportsField === "object" && !Array.isArray(exportsField)) {
-      rootExport = (exportsField as Record<string, unknown>)["."];
+    // Node semantics: a present exports field takes precedence over main. A
+    // malformed or unsupported exports map is an honest unavailability, never
+    // a fallback to private internals.
+    if (!isPlainObject(exportsField)) return undefined;
+    const rootExport = exportsField["."];
+    if (typeof rootExport === "string") {
+      return rootExport.startsWith("./") ? rootExport : undefined;
     }
-    let target: unknown = rootExport;
-    if (typeof rootExport === "object" && rootExport !== null && !Array.isArray(rootExport)) {
-      const conditions = rootExport as Record<string, unknown>;
-      target = conditions.require ?? conditions.import ?? conditions.default;
+    if (isPlainObject(rootExport)) {
+      const target = rootExport.require ?? rootExport.import ?? rootExport.default;
+      return typeof target === "string" && target.startsWith("./") ? target : undefined;
     }
-    if (typeof target === "string" && target.startsWith("./")) return target;
-    return undefined; // an exports map without a usable "." string target is unavailable
+    return undefined;
   }
-  if (typeof manifest.main === "string" && manifest.main.startsWith("./")) return manifest.main;
-  if (typeof manifest.main === "string" && !manifest.main.startsWith(".")) {
-    // A bare `main` (e.g. "index.js") is still package-relative per Node semantics.
-    return `./${manifest.main}`;
+  if (typeof manifest.main === "string" && manifest.main.length > 0) {
+    if (manifest.main.startsWith("./")) return manifest.main;
+    if (!manifest.main.startsWith(".") && !manifest.main.startsWith("/") && !/^[A-Za-z]:/.test(manifest.main)) {
+      // A bare `main` (e.g. "index.js") is still package-relative per Node semantics.
+      return `./${manifest.main}`;
+    }
   }
   return undefined;
 }
 
-const sdkCache = new Map<string, NativeSessionSdk>();
+/** Extract the official `pi` CLI bin target from package metadata, when declared. */
+function resolveDeclaredCliBinTarget(manifest: SdkPackageManifest): string | undefined {
+  const bin = manifest.bin;
+  const declared = typeof bin === "string" ? bin : isPlainObject(bin) ? bin["pi"] : undefined;
+  if (typeof declared !== "string" || declared.length === 0) return undefined;
+  if (declared.startsWith("./")) return declared;
+  if (!declared.startsWith(".") && !declared.startsWith("/") && !/^[A-Za-z]:/.test(declared)) {
+    // A bare bin path (e.g. "dist/bundle/cli.js") is package-relative per npm semantics.
+    return `./${declared}`;
+  }
+  return undefined;
+}
+
+/** A cached SDK view bound to the exact metadata that admitted it. */
+interface SdkCacheEntry {
+  sdk: NativeSessionSdk;
+  version: string;
+  packageDirReal: string;
+}
+
+const sdkCache = new Map<string, SdkCacheEntry>();
 
 /**
  * Resolve and load the public SDK entry of the official Pi package that owns
- * the given (already resolved) native Pi CLI file. Synchronous: the entry is
- * a CommonJS module loaded with `require` exactly once per entry path.
+ * the given (already resolved) native Pi CLI file. Synchronous: the canonical
+ * entry is loaded with `require` exactly once per entry path (the supported
+ * Node runtime resolves CommonJS and ESM public entries alike).
  *
  * Fails closed with bounded diagnostics (package name/entry kind only, never
  * environment or file content) when: the runtime context is forbidden, the
- * official package is not an ancestor of the CLI, the public entry metadata
- * is missing or points outside the package, the entry is not a readable
- * regular file, or the loaded module lacks the `SessionManager.listAll`
- * runtime. A missing public SDK is an honest unavailability, never a stub.
+ * official package is not the CLI's own package boundary (or no boundary
+ * exists within the walk bound), the declared version is not a supported
+ * stable Pi version (or disagrees with the caller-admitted one), the official
+ * CLI bin metadata is missing or escapes the package, the public entry
+ * metadata is missing or points outside the package, the entry is not a
+ * readable regular file, or the loaded module lacks the
+ * `SessionManager.listAll` runtime. A missing public SDK is an honest
+ * unavailability, never a stub.
  */
-export function resolveNativeSessionSdk(piExecutable: string): NativeSessionSdk {
+export function resolveNativeSessionSdk(
+  piExecutable: string,
+  options: ResolveNativeSessionSdkOptions = {},
+): NativeSessionSdk {
   for (const marker of FORBIDDEN_SDK_ENV_MARKERS) {
     if (process.env[marker] !== undefined) {
       throw new Error(
@@ -215,18 +397,154 @@ export function resolveNativeSessionSdk(piExecutable: string): NativeSessionSdk 
   }
 
   const owned = findOwnPiPackage(piExecutable);
-  if (!owned) {
+  if (owned.status === "unrelated-boundary") {
     throw new Error(
-      `pi-review-gate: no official ${PI_PACKAGE_NAME} package was found above the native pi executable; the public session SDK is unavailable`,
+      `pi-review-gate: the native pi executable is not inside its own ${PI_PACKAGE_NAME} package (the nearest package boundary is unrelated); the public session SDK is unavailable`,
+    );
+  }
+  if (owned.status === "invalid-boundary") {
+    throw new Error(
+      `pi-review-gate: an invalid package boundary was found while locating the ${PI_PACKAGE_NAME} package (${owned.reason}); the public session SDK is unavailable`,
+    );
+  }
+  if (owned.status === "bound-reached") {
+    throw new Error(
+      `pi-review-gate: no package boundary was found within ${MAX_SDK_ANCESTOR_STEPS} ancestors of the native pi executable; the public session SDK is unavailable`,
     );
   }
   const { packageDir, manifest } = owned;
 
+  // Metadata agreement, checked BEFORE any cached entry can be returned: a
+  // stable declared version at or above the supported floor (never "unknown"
+  // or a prerelease), and exact agreement with the caller-admitted Pi version
+  // when one is provided.
+  if (!isSupportedStablePiVersion(manifest.version)) {
+    throw new Error(
+      `pi-review-gate: the official ${PI_PACKAGE_NAME} package does not declare a supported stable version (>= ${MIN_SUPPORTED_PI_VERSION}); the public session SDK is unavailable`,
+    );
+  }
+  const version = manifest.version as string;
+  if (options.expectedPiVersion !== undefined && version !== options.expectedPiVersion) {
+    throw new Error(
+      `pi-review-gate: the official ${PI_PACKAGE_NAME} package version does not agree with the caller-admitted Pi version; the public session SDK is unavailable`,
+    );
+  }
+
   // Same-package containment: the CLI must live inside the resolved package.
-  const relativeCli = relative(packageDir, piExecutable);
-  if (relativeCli.startsWith("..") || isAbsolute(relativeCli)) {
+  if (escapesRoot(packageDir, piExecutable)) {
     throw new Error(
       `pi-review-gate: the native pi executable is not contained in its own ${PI_PACKAGE_NAME} package; the public session SDK is unavailable`,
+    );
+  }
+
+  // Canonical containment: an intermediate directory (e.g. dist/) may be a
+  // symlink OUTSIDE the owning package even though the lexical path and the
+  // final lstat look contained. Resolve the real paths and require the CLI to
+  // stay inside the canonical package directory before anything is loaded.
+  let packageDirReal;
+  try {
+    packageDirReal = realpathSync(packageDir);
+  } catch {
+    throw new Error(
+      `pi-review-gate: the official ${PI_PACKAGE_NAME} package directory is missing; the public session SDK is unavailable`,
+    );
+  }
+  let cliReal;
+  try {
+    cliReal = realpathSync(piExecutable);
+  } catch {
+    throw new Error(`pi-review-gate: the native pi executable is missing for SDK resolution: ${piExecutable}`);
+  }
+  if (escapesRoot(packageDirReal, cliReal)) {
+    throw new Error(
+      `pi-review-gate: the native pi executable is not contained in its own ${PI_PACKAGE_NAME} package; the public session SDK is unavailable`,
+    );
+  }
+
+  // The official CLI bin must be declared and contained in the package as a
+  // regular readable file (metadata agreement for the official provider).
+  const binTarget = resolveDeclaredCliBinTarget(manifest);
+  if (!binTarget) {
+    throw new Error(
+      `pi-review-gate: the official ${PI_PACKAGE_NAME} package declares no official pi CLI bin; the public session SDK is unavailable`,
+    );
+  }
+  const declaredBin = resolve(packageDir, binTarget);
+  if (escapesRoot(packageDir, declaredBin)) {
+    throw new Error(
+      `pi-review-gate: the official ${PI_PACKAGE_NAME} package CLI bin escapes the package directory; refusing to use it`,
+    );
+  }
+  let declaredBinReal;
+  try {
+    declaredBinReal = realpathSync(declaredBin);
+  } catch {
+    throw new Error(
+      `pi-review-gate: the official ${PI_PACKAGE_NAME} package CLI bin is missing; the public session SDK is unavailable`,
+    );
+  }
+  if (escapesRoot(packageDirReal, declaredBinReal)) {
+    throw new Error(
+      `pi-review-gate: the official ${PI_PACKAGE_NAME} package CLI bin escapes the package directory; refusing to use it`,
+    );
+  }
+  let binStats;
+  try {
+    binStats = lstatSync(declaredBinReal);
+  } catch {
+    throw new Error(
+      `pi-review-gate: the official ${PI_PACKAGE_NAME} package CLI bin is missing; the public session SDK is unavailable`,
+    );
+  }
+  if (binStats.isSymbolicLink() || !binStats.isFile()) {
+    throw new Error(
+      `pi-review-gate: the official ${PI_PACKAGE_NAME} package CLI bin is not a regular file; the public session SDK is unavailable`,
+    );
+  }
+  try {
+    accessSync(declaredBinReal, fsConstants.R_OK);
+  } catch {
+    throw new Error(
+      `pi-review-gate: the official ${PI_PACKAGE_NAME} package CLI bin is not readable; the public session SDK is unavailable`,
+    );
+  }
+
+  // The given CLI must BE the declared official bin or the specific official
+  // unbundled entry (dist/cli.js) — never an additional wrapper script that
+  // merely sits inside the package.
+  let cliIsOfficial = cliReal === declaredBinReal;
+  if (!cliIsOfficial) {
+    const unbundledEntry = resolve(packageDir, "dist", "cli.js");
+    if (!escapesRoot(packageDir, unbundledEntry)) {
+      let unbundledReal: string | undefined;
+      try {
+        unbundledReal = realpathSync(unbundledEntry);
+      } catch {
+        unbundledReal = undefined;
+      }
+      if (unbundledReal !== undefined && !escapesRoot(packageDirReal, unbundledReal) && cliReal === unbundledReal) {
+        let unbundledStats;
+        try {
+          unbundledStats = lstatSync(unbundledReal);
+        } catch {
+          unbundledStats = undefined;
+        }
+        if (unbundledStats !== undefined && !unbundledStats.isSymbolicLink() && unbundledStats.isFile()) {
+          cliIsOfficial = true;
+        }
+      }
+    }
+  }
+  if (!cliIsOfficial) {
+    throw new Error(
+      `pi-review-gate: the native pi executable is not the official CLI of its ${PI_PACKAGE_NAME} package (the declared bin or dist/cli.js); the public session SDK is unavailable`,
+    );
+  }
+  try {
+    accessSync(cliReal, fsConstants.R_OK);
+  } catch {
+    throw new Error(
+      `pi-review-gate: the native pi executable is not readable; the public session SDK is unavailable`,
     );
   }
 
@@ -237,16 +555,14 @@ export function resolveNativeSessionSdk(piExecutable: string): NativeSessionSdk 
     );
   }
   const entry = resolve(packageDir, entryTarget);
-  if (relative(packageDir, entry).startsWith("..") || isAbsolute(relative(packageDir, entry))) {
+  if (escapesRoot(packageDir, entry)) {
     throw new Error(
       `pi-review-gate: the official ${PI_PACKAGE_NAME} public SDK entry escapes the package directory; refusing to load it`,
     );
   }
-  // Canonical containment: an intermediate entry directory (e.g. dist/) may be
-  // a symlink OUTSIDE the owning package even though the lexical path and the
-  // final lstat look contained. Resolve the real path and require it stay
-  // inside the canonical package directory before anything is loaded.
-  const packageDirReal = realpathSync(packageDir);
+  // Canonical containment for the entry as well: an intermediate entry
+  // directory (e.g. dist/) may be a symlink OUTSIDE the owning package even
+  // though the lexical path and the final lstat look contained.
   let entryReal;
   try {
     entryReal = realpathSync(entry);
@@ -255,7 +571,7 @@ export function resolveNativeSessionSdk(piExecutable: string): NativeSessionSdk 
       `pi-review-gate: the official ${PI_PACKAGE_NAME} public SDK entry is missing; the public session SDK is unavailable`,
     );
   }
-  if (relative(packageDirReal, entryReal).startsWith("..") || isAbsolute(relative(packageDirReal, entryReal))) {
+  if (escapesRoot(packageDirReal, entryReal)) {
     throw new Error(
       `pi-review-gate: the official ${PI_PACKAGE_NAME} public SDK entry escapes the package directory; refusing to load it`,
     );
@@ -281,12 +597,32 @@ export function resolveNativeSessionSdk(piExecutable: string): NativeSessionSdk 
     );
   }
 
+  // All metadata/identity/version gating is done: only now may a cached
+  // entry be returned — and only when the cached view still agrees with the
+  // CURRENT validated metadata. require() would not reload an already-loaded
+  // module, so a package whose version or identity changed since the first
+  // load must fail closed instead of returning a stale SDK view.
   const cached = sdkCache.get(entryReal);
-  if (cached) return cached;
+  if (cached) {
+    if (cached.version !== version || cached.packageDirReal !== packageDirReal) {
+      throw new Error(
+        `pi-review-gate: the loaded public SDK no longer matches the current ${PI_PACKAGE_NAME} package metadata; the public session SDK is unavailable`,
+      );
+    }
+    return cached.sdk;
+  }
 
-  // Load exactly the canonical path that was validated above.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
-  const module: unknown = require(entryReal);
+  let module: unknown;
+  try {
+    // Load exactly the canonical path that was validated above. The supported
+    // Node runtime resolves both CommonJS and ESM public entries here.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
+    module = require(entryReal);
+  } catch {
+    throw new Error(
+      `pi-review-gate: the official ${PI_PACKAGE_NAME} public SDK entry failed to load; the public session SDK is unavailable`,
+    );
+  }
   if (module === null || typeof module !== "object") {
     throw new Error(
       `pi-review-gate: the official ${PI_PACKAGE_NAME} public SDK entry did not load a module; the public session SDK is unavailable`,
@@ -306,13 +642,12 @@ export function resolveNativeSessionSdk(piExecutable: string): NativeSessionSdk 
     );
   }
 
-  const version = typeof manifest.version === "string" ? manifest.version : "unknown";
   const sdk: NativeSessionSdk = {
     SessionManager: manager as NativeSessionSdkManager,
     entry: entryReal,
     packageDir,
     version,
   };
-  sdkCache.set(entryReal, sdk);
+  sdkCache.set(entryReal, { sdk, version, packageDirReal });
   return sdk;
 }

@@ -15,6 +15,41 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.127]
+
+### Fixed
+
+- Automatic notifications no longer advertise an expansion that cannot happen (#326).
+  A notification whose shape cannot be compacted truthfully — unknown, historical, or
+  malformed content — already rendered its complete retained text in both states, but
+  the shared expansion core still appended the native `(ctrl+o to expand)` /
+  `(ctrl+o to collapse)` hint, promising a change expansion could not make. The
+  collapsed renderers now explicitly mark such a row as the complete retained text
+  (`markFullTextFallback`), and the shared core shows it in both states with no
+  expansion hint; a genuinely compact row keeps its hint unchanged. The signal is
+  explicit renderer state, never a comparison of rendered lines, so width, theme, or
+  partial rendering cannot disable a real row's expansion, and tool-result rows —
+  which do not opt into the marker — render byte-identically to before.
+- Recovery-required failure notifications now compact from the curated diagnostic even
+  when the structured message details are absent or empty (#326). The collapsed
+  subtask-event card previously required a usable `details.diagnostic`; when a host or
+  history delivered only the retained notification text (the producer's own recovery
+  preamble, the literal diagnostic-boundary line, and the curated JSON), the card fell
+  back to the full text. The text-only path now recognizes exactly that producer shape,
+  validates the embedded JSON structurally, and requires its task/execution/kind/state/
+  revision/progress identities and its notice/summary/error text to agree with the
+  preamble, so unrelated, inlined, or truncated JSON can never be compacted into a
+  misleading recovery summary. Valid structured details remain authoritative;
+  nonempty but unusable structured metadata is never replaced by a text-derived
+  diagnostic, and a diagnostic recovered from text is rejected when it contradicts a
+  supplied taskId, executionId, or state, so the full retained text is shown instead.
+  The collapsed card keeps the immediate error and notice plus EVERY recovery action
+  visible, expansion still shows the complete retained text and nothing beyond it, and
+  contraction restores the compact card. The shared presentation-core unit tests, the
+  notification unit tests, and the real-host tests cover absent/empty/valid diagnostic
+  metadata, nonempty-invalid and conflicting metadata, identity-inconsistent and
+  truncated content, no-hint fallbacks, and the native keyboard/click paths.
+
 ## [0.1.0-dev.126]
 
 ### Changed

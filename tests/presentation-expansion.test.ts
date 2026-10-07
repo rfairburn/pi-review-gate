@@ -15,7 +15,9 @@ import {
   PRESENTATION_EXPANSION_MARKER,
   expandablePresentation,
   isExpandablePresentation,
+  isFullTextFallback,
   isPresentationExpanded,
+  markFullTextFallback,
 } from "../src/presentation-expansion";
 import {
   EXPANDABLE_RESULT_MARKER,
@@ -322,4 +324,105 @@ test("the tool adapter preserves the native tool fallback options shape", () => 
   // Host options absent: exactly the pre-extraction tool fallback shape.
   rendered({}, undefined, theme);
   assert.deepEqual(seen[1] as Record<string, unknown>, { expanded: false, isPartial: false });
+});
+
+// ── Explicit full-text-fallback state (issue #326) ───────────────────────
+
+test("full-text fallback markers are explicit own-property state", () => {
+  const component = textComponent(["already the complete retained text"]);
+  assert.equal(isFullTextFallback(component), false);
+  assert.equal(markFullTextFallback(component), component, "marking returns the same component");
+  assert.equal(isFullTextFallback(component), true);
+  assert.equal(isFullTextFallback(undefined), false);
+  assert.equal(isFullTextFallback(null), false);
+  assert.equal(isFullTextFallback([]), false);
+  const frozen = Object.freeze(textComponent(["frozen host component"]));
+  markFullTextFallback(frozen);
+  assert.equal(isFullTextFallback(frozen), false, "an unmarkable component stays honestly unmarked");
+});
+
+test("honorFullTextFallback: a marked collapsed row carries no hint and never invokes the expanded delegate", () => {
+  const fake = makeFakeHost();
+  setNativeExpansionHost(fake.host);
+  try {
+    const expandedCalls: unknown[] = [];
+    const rendered = expandablePresentation(
+      () => markFullTextFallback(textComponent(["complete retained text"])),
+      (result) => {
+        expandedCalls.push(result);
+        return textComponent(["complete retained text"]);
+      },
+      { honorFullTextFallback: true },
+    );
+    const collapsed = renderLines(rendered({}, { expanded: false }, theme));
+    assert.deepEqual(collapsed.map(stripAnsi), ["complete retained text"], "no hint is added collapsed");
+    const expanded = renderLines(rendered({}, { expanded: true }, theme));
+    assert.deepEqual(expanded.map(stripAnsi), ["complete retained text"], "no hint is added expanded");
+    assert.equal(expandedCalls.length, 0, "the expanded delegate is never called for an un-compactable row");
+  } finally {
+    setNativeExpansionHost(undefined);
+  }
+});
+
+test("honorFullTextFallback: a genuinely compact row keeps its hint and its expanded view", () => {
+  const fake = makeFakeHost();
+  setNativeExpansionHost(fake.host);
+  try {
+    const expandedCalls: unknown[] = [];
+    const rendered = expandablePresentation(
+      () => textComponent(["compact summary"]),
+      (result) => {
+        expandedCalls.push(result);
+        return textComponent(["compact summary", "complete retained text"]);
+      },
+      { honorFullTextFallback: true },
+    );
+    const collapsed = renderLines(rendered({}, { expanded: false }, theme)).map(stripAnsi);
+    assert.match(collapsed[0]!, /^compact summary \(ctrl\+o to expand\)$/);
+    const expanded = renderLines(rendered({}, { expanded: true }, theme)).map(stripAnsi);
+    assert.match(expanded[0]!, /to collapse/);
+    assert.deepEqual(expanded.slice(1), ["complete retained text"]);
+    assert.equal(expandedCalls.length, 1, "compact rows still render their contributed detail view");
+  } finally {
+    setNativeExpansionHost(undefined);
+  }
+});
+
+test("fallback detection is explicit state, not rendered-line equality", () => {
+  const fake = makeFakeHost();
+  setNativeExpansionHost(fake.host);
+  try {
+    // Byte-identical rendered lines; only the explicit marker differs.
+    const marked = () => markFullTextFallback(textComponent(["same lines"]));
+    const unmarked = () => textComponent(["same lines"]);
+    assert.deepEqual(renderLines(marked(), 200).map(stripAnsi), renderLines(unmarked(), 200).map(stripAnsi));
+    const markedCore = expandablePresentation(marked, unmarked, { honorFullTextFallback: true });
+    const unmarkedCore = expandablePresentation(unmarked, unmarked, { honorFullTextFallback: true });
+    assert.equal(renderLines(markedCore({}, { expanded: false }, theme)).map(stripAnsi).join("\n"), "same lines", "marked rows get no hint");
+    assert.match(renderLines(unmarkedCore({}, { expanded: false }, theme)).map(stripAnsi)[0]!, /to expand/, "unmarked rows keep the hint even with identical text");
+  } finally {
+    setNativeExpansionHost(undefined);
+  }
+});
+
+test("tool-result consumers (no opt-in) keep byte-identical behavior for a marked row", () => {
+  const fake = makeFakeHost();
+  setNativeExpansionHost(fake.host);
+  try {
+    const expandedCalls: unknown[] = [];
+    const rendered = expandableResult(
+      () => markFullTextFallback(textComponent(["tool row"])),
+      (result) => {
+        expandedCalls.push(result);
+        return textComponent(["tool row", "tool detail"]);
+      },
+    );
+    const collapsed = renderLines(rendered({}, { expanded: false, isPartial: false }, theme)).map(stripAnsi);
+    assert.match(collapsed[0]!, /to expand/, "tool rows are unaffected by the message-only opt-in");
+    const expanded = renderLines(rendered({}, { expanded: true, isPartial: false }, theme)).map(stripAnsi);
+    assert.deepEqual(expanded.slice(1), ["tool detail"]);
+    assert.equal(expandedCalls.length, 1);
+  } finally {
+    setNativeExpansionHost(undefined);
+  }
 });

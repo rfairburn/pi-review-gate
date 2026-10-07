@@ -838,7 +838,13 @@ Expansion reveals all of the notification's current text and nothing beyond it �
 no linked report or log is fetched and nothing is re-run — and collapsing restores
 the compact view. Expansion never changes what the model received,
 delivery, wake, or scheduling behavior, and an unrecognized historical notification
-falls back to its full retained text.
+falls back to its full retained text. A row that falls back to the full text carries
+no expand/collapse hint at all (there is no compact view to restore), while a
+recognized row keeps the native hint in both states. Recovery-required failure
+notifications compact to their error, notice, and every recovery action whether the
+curated diagnostic was delivered as structured message details or only inside the
+retained notification text; data that is unknown, malformed, or internally
+inconsistent stays full-text rather than being summarized from unrelated content.
 
 **Scheduled runs:** when the process-local scheduler switch is On, a due schedule
 entry starts through this same background subtask path — no model or orchestrator

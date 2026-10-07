@@ -29,6 +29,13 @@ import {
   type MessageRendererCallback,
 } from "../src/message-expansion";
 import { setNativeExpansionHost } from "../src/tool-result-hints";
+import {
+  buildWakeFailureDiagnostic,
+  formatWakeFailureDiagnostic,
+  formatWakeFailurePreamble,
+  capNotificationText,
+  WAKE_FAILURE_NOTIFICATION_CAP,
+} from "../src/execution/subtask-notifications";
 import { registerMissingHostPlaceholder } from "./tool-host-gate";
 
 interface HostBundle {
@@ -589,5 +596,136 @@ if (!host) {
     for (const needle of ["Task: t-3 · Research topic · reported", "Finding 1:", "Finding 40: a detailed observation about the system under test that runs on for a while."]) {
       assert.ok(expanded.includes(needle), `expanded contains: ${needle.slice(0, 40)}`);
     }
+  });
+
+  // ── Recovered failure/recovery notifications and honest fallbacks (#326) ──
+
+  /**
+   * A REAL producer failure/recovery notification: the delivered content is
+   * `capNotificationText(formatWakeFailurePreamble + literal boundary +
+   * formatWakeFailureDiagnostic)`, exactly as src/execution/wake-delivery.ts
+   * composes it, over a synthetic task/execution and paths.
+   */
+  function failureWakeMessage(details: unknown) {
+    const task = {
+      taskId: "task-host-recover",
+      definition: { title: "Host recovery fixture task", instructions: "i", acceptanceCriteria: [] },
+      state: "paused_recoverable", createdAt: "", updatedAt: "", generation: 1, activity: [],
+      bundle: { waveRoot: "/tmp/host-fixture-wave" },
+      error: "No progress detected.", summary: "No progress: fixture.",
+    };
+    const group = {
+      version: 3, revision: 9, integritySha256: "x", executionId: "exec-host-recover", kind: "execute",
+      root: "/tmp/root", cwd: "/tmp/cwd", createdAt: "", updatedAt: "",
+      tasks: [task], totalTaskCount: 1, settledArchivedCount: 0,
+    };
+    const diagnostic = buildWakeFailureDiagnostic({
+      group: group as never,
+      task: task as never,
+      content: "Task task-host-recover continuation stopped: No progress detected.",
+    });
+    const content = capNotificationText(
+      `${formatWakeFailurePreamble(diagnostic)}\n\nFailure recovery diagnostic (curated and bounded; use SubtasksInspect for the full current snapshot):\n${formatWakeFailureDiagnostic(diagnostic)}`,
+      WAKE_FAILURE_NOTIFICATION_CAP,
+    );
+    return {
+      content,
+      diagnostic,
+      message: { role: "custom", customType: "pi-review-subtask-event", content, display: true, details },
+    };
+  }
+
+  test("real-host recovery card: compacts with absent/empty/valid details, carries the live hint, expands completely, and contracts", () => {
+    const { diagnostic } = failureWakeMessage({});
+    // Each delivery shape gets its own message object (per-message click state).
+    const shapes: unknown[] = [
+      undefined,
+      {},
+      { diagnostic: {} },
+      { state: "paused_recoverable", executionId: "exec-host-recover", taskId: "task-host-recover", diagnostic },
+    ];
+    for (const details of shapes) {
+      const { message } = failureWakeMessage(details);
+      // A wide render keeps the bounded recovery actions on one line each.
+      const text = makeRow("pi-review-subtask-event", message).render(1000).map(stripAnsi).join("\n");
+      assert.ok(text.includes("[subtask] Host recovery fixture task"), `details ${JSON.stringify(details)}: compact header`);
+      assert.ok(text.includes("PAUSED (RECOVERABLE)"), "recorded recovery state");
+      for (const action of diagnostic.recovery.suggestedActions) {
+        assert.ok(text.includes(action), `recovery action visible: ${action.slice(0, 40)}…`);
+      }
+      assert.equal(text.split("to expand").length - 1, 1, "exactly one native expand hint on the compact card");
+      assert.equal(text.includes("Failure recovery diagnostic (curated"), false, "the curated JSON block stays hidden compact");
+    }
+
+    // The click path (independent per-message toggle), then a re-click contract.
+    const { message } = failureWakeMessage({});
+    const comp = makeRow("pi-review-subtask-event", message);
+    const collapsed = comp.render(120).map(stripAnsi);
+    const res = clickOnLine(comp, "[subtask] Host recovery fixture task");
+    assert.equal(res?.handled, true, "the real MouseRegion handled the click");
+    const expandedText = comp.render(120).map(stripAnsi).join("\n");
+    assert.ok(expandedText.includes("Failure recovery diagnostic (curated and bounded; use SubtasksInspect for the full current snapshot):"), "expanded shows the complete curated diagnostic block");
+    assert.ok(expandedText.includes('"suggestedActions"'), "expanded shows the JSON the model received");
+    assert.equal(expandedText.split("to collapse").length - 1, 1, "exactly one collapse hint while expanded");
+    clickOnLine(comp, "Failure recovery diagnostic");
+    assert.deepEqual(comp.render(120).map(stripAnsi), collapsed, "re-click restores the byte-identical compact card");
+    // The host's global expansion binding (keyboard path) reconciles the click.
+    comp.setExpanded(true);
+    assert.ok(comp.render(120).map(stripAnsi).join("\n").includes("Failure recovery diagnostic (curated"), "global expand shows the full text");
+    comp.setExpanded(false);
+    assert.deepEqual(comp.render(120).map(stripAnsi), collapsed, "global collapse restores the compact card");
+  });
+
+  test("real-host: nonempty invalid or identity-conflicting metadata stays full-text with no hint in either state", () => {
+    const { content } = failureWakeMessage({});
+    const cases: Array<[string, unknown]> = [
+      ["nonempty partial diagnostic", { diagnostic: { taskState: "paused_recoverable" } }],
+      ["nonempty invalid diagnostic", { diagnostic: { taskState: "bogus_state", title: "x", message: "y", recovery: { suggestedActions: ["z"] } } }],
+      ["conflicting taskId", { taskId: "task-other", diagnostic: {} }],
+      ["conflicting executionId", { executionId: "exec-other", diagnostic: {} }],
+      ["conflicting state", { state: "landed", diagnostic: {} }],
+    ];
+    for (const [label, details] of cases) {
+      const message = { role: "custom", customType: "pi-review-subtask-event", content, display: true, details };
+      const comp = makeRow("pi-review-subtask-event", message);
+      const collapsed = comp.render(1000).map(stripAnsi);
+      const collapsedText = collapsed.join("\n");
+      assert.ok(collapsedText.includes("Task task-host-recover requires recovery attention at state PAUSED_RECOVERABLE"), `${label}: complete retained text shown`);
+      assert.equal(collapsedText.includes("[subtask] Host recovery fixture task"), false, `${label}: no compact recovery header`);
+      assert.equal(collapsedText.includes("to expand"), false, `${label}: no expand hint is advertised`);
+      comp.setExpanded(true);
+      const expanded = comp.render(1000).map(stripAnsi);
+      assert.deepEqual(expanded, collapsed, `${label}: the complete retained text is identical in both states`);
+      assert.equal(expanded.join("\n").includes("to collapse"), false, `${label}: no collapse hint is advertised`);
+      comp.setExpanded(false);
+    }
+  });
+
+  test("real-host fallback row: no expand/collapse hint in either state and no visible change on a click", () => {
+    const fallback = { role: "custom", customType: "pi-review-subtask-event", content: "unrecognized historical notification shape", display: true };
+    const comp = makeRow("pi-review-subtask-event", fallback);
+    const collapsed = comp.render(100).map(stripAnsi);
+    const collapsedText = collapsed.join("\n");
+    assert.ok(collapsedText.includes("unrecognized historical notification shape"), "the complete retained text is shown");
+    assert.equal(collapsedText.includes("to expand"), false, "no misleading expand hint");
+    assert.equal(collapsedText.includes("to collapse"), false, "no collapse hint collapsed");
+    const res = clickOnLine(comp, "unrecognized historical notification shape");
+    assert.equal(res?.handled, true, "the native card still owns the click");
+    assert.deepEqual(comp.render(100).map(stripAnsi), collapsed, "clicking changes nothing visible");
+    comp.setExpanded(true);
+    assert.deepEqual(comp.render(100).map(stripAnsi), collapsed, "host-expanded text is identical (no expansion exists)");
+    assert.equal(comp.render(100).map(stripAnsi).join("\n").includes("to collapse"), false, "no collapse hint when the host expands everything");
+    comp.setExpanded(false);
+  });
+
+  test("real-host: an un-compactable row never suppresses its compact neighbor's hint", () => {
+    const fallbackComp = makeRow("pi-review-subtask-event", { role: "custom", customType: "pi-review-subtask-event", content: "unrecognized historical notification shape", display: true });
+    const fallbackBefore = fallbackComp.render(100).map(stripAnsi);
+    const compactComp = makeRow("pi-review-subtask-event", failureWakeMessage({}).message);
+    assert.equal(fallbackBefore.join("\n").includes("to expand"), false, "the fallback row advertises no expansion");
+    assert.ok(compactComp.render(100).map(stripAnsi).join("\n").includes("to expand"), "the compact neighbor keeps its hint");
+    clickOnLine(compactComp, "[subtask] Host recovery fixture task");
+    assert.ok(compactComp.render(100).map(stripAnsi).join("\n").includes("Failure recovery diagnostic (curated"), "the compact neighbor expanded independently");
+    assert.deepEqual(fallbackComp.render(100).map(stripAnsi), fallbackBefore, "the fallback neighbor is byte-identical");
   });
 }

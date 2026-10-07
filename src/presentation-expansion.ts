@@ -24,6 +24,14 @@
  *   withExpansionHint} adds exactly one host-configured native-style hint to
  *   the header of renderers that have a contributed expanded view, width-safe
  *   at every terminal size. Renderers must not emit their own hints.
+ * - Honest fallback rows: a consumer whose collapsed renderer can honestly
+ *   fall back to the complete retained text (
+ *   {@link markFullTextFallback}) opts in through `honorFullTextFallback`;
+ *   such a row renders that same complete text in both states and carries no
+ *   expansion hint, because expansion could not change what is shown. The
+ *   signal is explicit state, never a rendered-line comparison, so width,
+ *   theme, or partial-render differences cannot disable a real row's
+ *   expansion. Consumers that do not opt in are byte-identical to before.
  * - Failure notice: if the expanded detail renderer throws or returns a
  *   non-renderable component (the host's custom-renderer slot does not guard
  *   against that), the collapsed view is shown WITH a visible failure notice
@@ -106,10 +114,59 @@ export interface PresentationExpansionConfig {
    * `{ expanded: false }`.
    */
   fallbackOptions?: () => unknown;
+  /**
+   * Opt-in for consumers whose collapsed renderer can honestly fall back to
+   * the COMPLETE retained text (see {@link markFullTextFallback}) when a row's
+   * shape cannot be compacted truthfully. With this enabled the core renders
+   * such a row's complete text in both states and adds NO expansion hint,
+   * because expansion could not change what is shown; the decision is the
+   * collapsed renderer's explicit marker, never a rendered-line comparison
+   * (width, theme, and partial rendering cannot accidentally disable a real
+   * row's expansion). Tool-result consumers omit it, so their rendering — and
+   * the number of delegate invocations — is byte-identical to before.
+   */
+  honorFullTextFallback?: boolean;
 }
 
 /** Generic wiring-audit marker set on every callback produced here. */
 export const PRESENTATION_EXPANSION_MARKER = "__piReviewGateExpandablePresentation";
+
+/**
+ * Explicit-state marker for a collapsed component that already IS the complete
+ * retained text: the honest fallback used when a row cannot be compacted
+ * (unknown, historical, malformed, or otherwise untrustworthy shape).
+ */
+export const PRESENTATION_FULL_TEXT_FALLBACK_MARKER = "__piReviewGateFullTextFallback";
+
+/**
+ * Marks a collapsed component as the complete retained text (no compaction).
+ * A marked row has no meaningful expansion — the expanded view would show the
+ * same text — so the core shows it in both states without an expansion hint.
+ * The marker is a non-enumerable own property and carries no rendering state;
+ * when a component cannot be marked (a non-extensible host component) it stays
+ * unmarked and the default expandable presentation applies rather than a
+ * fabricated decision.
+ */
+export function markFullTextFallback<T>(component: T): T {
+  if (component !== null && (typeof component === "object" || typeof component === "function")) {
+    try {
+      Object.defineProperty(component, PRESENTATION_FULL_TEXT_FALLBACK_MARKER, {
+        value: true,
+        enumerable: false,
+        configurable: true,
+      });
+    } catch {
+      // Non-extensible component: keep the default presentation.
+    }
+  }
+  return component;
+}
+
+/** True when the component was explicitly marked as the complete retained text. */
+export function isFullTextFallback(value: unknown): boolean {
+  return typeof value === "object" && value !== null
+    && (value as Record<string, unknown>)[PRESENTATION_FULL_TEXT_FALLBACK_MARKER] === true;
+}
 
 /** True when the host's expansion flag is on: anything else stays collapsed. */
 export function isPresentationExpanded(options: unknown): boolean {
@@ -145,6 +202,7 @@ export function expandablePresentation<TOptions, TTheme, TContext>(
 ): PresentationRenderCallback<TTheme, TContext> {
   const fallbackOptions = config?.fallbackOptions
     ?? (() => ({ expanded: false } as unknown as TOptions));
+  const honorFullTextFallback = config?.honorFullTextFallback === true;
   // TOptions is only ever materialized through the host's forwarded record or
   // the consumer's own fallback: the unknown-typed config closure above is
   // narrowed to the delegates' options type here.
@@ -158,7 +216,17 @@ export function expandablePresentation<TOptions, TTheme, TContext>(
     let component: unknown;
     if (!expandedRenderer || !isPresentationExpanded(options)) {
       component = collapsedRenderer(result, optionsOf(options, fallbackOptionsOf), theme, context);
+      // A collapsed row that explicitly IS the complete retained text has no
+      // meaningful expansion: no hint would be honest, so none is added.
+      if (honorFullTextFallback && isFullTextFallback(component)) return component;
     } else {
+      if (honorFullTextFallback) {
+        // The collapsed shape decides (explicitly, never by comparing rendered
+        // output): an un-compactable row shows its complete text in both states
+        // and advertises no expansion it cannot perform.
+        const collapsedProbe = collapsedRenderer(result, optionsOf(options, fallbackOptionsOf), theme, context);
+        if (isFullTextFallback(collapsedProbe)) return collapsedProbe;
+      }
       try {
         component = expandedRenderer(result, optionsOf(options, fallbackOptionsOf), theme, context);
       } catch {

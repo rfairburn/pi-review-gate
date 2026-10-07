@@ -17,6 +17,7 @@ import { __test, type SessionHostOptions } from "../src/session-host/main";
 const ESC = "\x1b";
 const ALT_LEFT = `${ESC}[1;3D`;
 const ENTER = "\r";
+const DELETE = "\x1b[3~";
 
 class FakeInput extends EventEmitter {
   readonly isTTY = true;
@@ -193,8 +194,11 @@ class FakeSurface {
 class FakeManager {
   readonly options: InstanceManagerOptions;
   readonly views: NativeInstanceView[] = [];
+  readonly staleListedViews: NativeInstanceView[] = [];
   readonly surfaces = new Map<string, FakeSurface>();
   readonly writes: { id: string; data: string | Buffer }[] = [];
+  readonly closeExitedCalls: string[] = [];
+  readonly refusedCloseIds = new Set<string>();
   readonly resizeCalls: { cols: number; rows: number; ids: string[] }[] = [];
   readonly createOptions: { label: string; workspace: string; profile?: string }[] = [];
   readonly order: string[];
@@ -218,8 +222,22 @@ class FakeManager {
     this.onChange = options.onChange;
   }
 
-  list(): NativeInstanceView[] { return this.views.map((view) => ({ ...view, activity: [...view.activity] })); }
+  list(): NativeInstanceView[] {
+    return [...this.views, ...this.staleListedViews].map((view) => ({ ...view, activity: [...view.activity] }));
+  }
   surface(id: string): FakeSurface | undefined { return this.surfaces.get(id); }
+
+  closeExited(id: string): boolean {
+    this.closeExitedCalls.push(id);
+    if (this.refusedCloseIds.has(id)) return false;
+    const index = this.views.findIndex((view) => view.id === id);
+    const view = this.views[index];
+    if (!view || view.lifecycle !== "exited" || view.hasLiveProcess !== false) return false;
+    this.views.splice(index, 1);
+    this.surfaces.delete(id);
+    this.onChange?.(id);
+    return true;
+  }
 
   create(options: { label: string; workspace: string; profile?: string }): Promise<string> {
     this.createOptions.push({ ...options });
@@ -422,6 +440,18 @@ async function ready(harness: Harness, flags = 0): Promise<FakeManager> {
   return manager;
 }
 
+async function startTwoSessions(harness: Harness): Promise<FakeManager> {
+  const manager = await ready(harness);
+  fillForm(harness.terminal, "first");
+  await nextTurn();
+  harness.terminal.emitInput("\x1b[B"); // first row -> New session
+  harness.terminal.emitInput(ENTER);
+  completeForm(harness.terminal, "second", "/another/workspace");
+  await nextTurn();
+  assert.deepEqual(manager.views.map((view) => view.id), ["native-1", "native-2"]);
+  return manager;
+}
+
 function fillForm(terminal: FakeTerminal, label: string, workspace = "/explicit/workspace"): void {
   terminal.emitInput(ENTER); // New session
   completeForm(terminal, label, workspace);
@@ -592,6 +622,191 @@ test("highlighting a newly created row does not transfer active input ownership;
   assert.equal(harness.writer.frames.at(-1)?.frame.cursor.visible, false, "non-alive native frames never retain an owned cursor");
 
   assert.equal(manager.createOptions[1]?.profile, undefined, "blank profile means a fresh independent default profile");
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("removing the active exited row clears ownership to the picker and stale snapshots cannot revive it", async () => {
+  const harness = createHarness();
+  const manager = await startTwoSessions(harness);
+
+  harness.terminal.emitInput("\x1b[A"); // second -> first
+  harness.terminal.emitInput(ENTER); // explicitly make first the active owner
+  const firstIndex = manager.views.findIndex((view) => view.id === "native-1");
+  const first = manager.views[firstIndex];
+  assert.ok(first);
+  const exitedFirst = { ...first, lifecycle: "exited" as const, hasLiveProcess: false, busy: null, pendingInput: null };
+  manager.views[firstIndex] = exitedFirst;
+  manager.notify("native-1");
+  await nextTurn();
+
+  harness.terminal.emitInput(ALT_LEFT); // hide, then reopen the sidebar on the exited owner
+  harness.terminal.emitInput(ALT_LEFT);
+  assert.equal(harness.sidebar?.focus, "sidebar");
+  assert.equal(harness.sidebar?.selectedId, "native-1");
+  harness.terminal.emitInput(DELETE);
+  await nextTurn();
+
+  assert.deepEqual(manager.closeExitedCalls, ["native-1"]);
+  assert.deepEqual(manager.views.map((view) => view.id), ["native-2"]);
+  assert.deepEqual(harness.sidebar?.items.map((view) => view.id), ["native-2"]);
+  assert.equal(harness.sidebar?.selectedId, undefined, "removing the owner must not auto-select its sibling");
+  assert.equal(harness.sidebar?.focus, "sidebar");
+  assert.equal(harness.sidebar?.visible, true, "the dead Main surface returns to the visible picker");
+  assert.equal(manager.views[0]?.hasLiveProcess, true, "the live sibling remains untouched");
+  assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("New session"), "the picker remains usable");
+
+  // Simulate a delayed stale roster snapshot for the same id. The Main
+  // tombstone keeps that successful removal from being rendered again.
+  manager.staleListedViews.push(exitedFirst);
+  manager.notify("late-old-snapshot");
+  await nextTurn();
+  assert.deepEqual(harness.sidebar?.items.map((view) => view.id), ["native-2"]);
+  assert.equal(plain(harness.writer.frames.at(-1)?.frame).includes("label-native-1"), false);
+
+  harness.terminal.emitInput(ESC); // no active owner remains after hiding the picker
+  harness.terminal.emitInput("must not reach the sibling");
+  assert.deepEqual(manager.writes, []);
+  assert.equal(manager.shutdownCalls, 0, "removal never uses host shutdown");
+
+  const sibling = manager.views[0];
+  assert.ok(sibling);
+  manager.views[0] = { ...sibling, lifecycle: "exited", hasLiveProcess: false, busy: null, pendingInput: null };
+  manager.notify("last-row-exited");
+  await nextTurn();
+  harness.terminal.emitInput(ALT_LEFT); // reopen the picker with no selection
+  harness.terminal.emitInput("\x1b[B"); // select the last exited row
+  harness.terminal.emitInput(DELETE);
+  await nextTurn();
+  assert.deepEqual(manager.views, []);
+  assert.equal(harness.sidebar?.focus, "sidebar");
+  assert.equal(harness.sidebar?.visible, true);
+  harness.terminal.emitInput("\x1b[B"); // cleared selection -> New session
+  harness.terminal.emitInput(ENTER);
+  assert.equal(harness.sidebar?.focus, "form");
+  assert.match(harness.sidebar?.render(40, 8).lines.join("\n") ?? "", /New session/);
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("removing an inactive exited row preserves the live owner, status, surface, and New-session draft", async () => {
+  const harness = createHarness();
+  const manager = await startTwoSessions(harness);
+  harness.terminal.emitInput(ENTER); // second row remains highlighted; explicitly activate it
+  assert.equal(harness.sidebar?.focus, "main");
+
+  const firstIndex = manager.views.findIndex((view) => view.id === "native-1");
+  const first = manager.views[firstIndex];
+  assert.ok(first);
+  manager.views[firstIndex] = { ...first, lifecycle: "exited", hasLiveProcess: false, busy: null, pendingInput: null };
+  const secondIndex = manager.views.findIndex((view) => view.id === "native-2");
+  const second = manager.views[secondIndex];
+  assert.ok(second);
+  const inputStatus = {
+    ...second,
+    busy: true,
+    pendingInput: true,
+    inputSurface: true,
+    activity: ["Waiting for input"],
+  };
+  manager.views[secondIndex] = inputStatus;
+  const secondSurface = manager.surface("native-2");
+  assert.ok(secondSurface);
+  manager.notify("status-update");
+  await nextTurn();
+
+  harness.terminal.emitInput(ALT_LEFT); // hide/show to focus the picker on the active sibling
+  harness.terminal.emitInput(ALT_LEFT);
+  harness.terminal.emitInput("\x1b[B"); // second -> New session
+  harness.terminal.emitInput(ENTER);
+  harness.terminal.emitInput("retained draft");
+  harness.terminal.emitInput(ALT_LEFT); // hide without discarding the form draft
+  harness.terminal.emitInput(ALT_LEFT); // reopen with New session still selected
+  harness.terminal.emitInput("\x1b[A"); // New -> second
+  harness.terminal.emitInput("\x1b[A"); // second -> exited first
+  assert.equal(harness.sidebar?.selectedId, "native-1");
+  harness.terminal.emitInput(DELETE);
+  await nextTurn();
+
+  assert.deepEqual(manager.closeExitedCalls, ["native-1"]);
+  assert.deepEqual(manager.views.map((view) => view.id), ["native-2"]);
+  assert.equal(harness.sidebar?.selectedId, undefined, "the removed inactive row is not replaced by a guessed selection");
+  assert.equal(harness.sidebar?.focus, "sidebar");
+  assert.equal(manager.surface("native-2"), secondSurface, "the active sibling keeps the same terminal surface");
+  const preserved = manager.views[0];
+  assert.equal(preserved?.busy, true);
+  assert.equal(preserved?.pendingInput, true);
+  assert.equal(preserved?.inputSurface, true);
+  assert.deepEqual(preserved?.activity, ["Waiting for input"]);
+
+  harness.terminal.emitInput("\x1b[B"); // no selection -> second row
+  harness.terminal.emitInput("\x1b[B"); // -> New session
+  harness.terminal.emitInput(ENTER);
+  const formText = harness.sidebar?.render(48, 8).lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "") ?? "";
+  assert.match(formText, /retained draft/, "removing another row does not reset the New-session draft");
+  harness.terminal.emitInput(ALT_LEFT); // return to Main without changing the active owner
+  harness.terminal.emitInput("still owned by second");
+  assert.deepEqual(manager.writes.at(-1), { id: "native-2", data: "still owned by second" });
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("failed, live, and unconfirmed removals leave the row and owner in place with a bounded notice", async () => {
+  const harness = createHarness();
+  const manager = await ready(harness);
+  fillForm(harness.terminal, "removal refusal");
+  await nextTurn();
+  harness.terminal.emitInput(ENTER); // explicitly activate native-1
+  const original = manager.views[0];
+  assert.ok(original);
+  manager.views[0] = { ...original, lifecycle: "exited", hasLiveProcess: false, busy: null, pendingInput: null };
+  manager.refusedCloseIds.add("native-1"); // model a stale/failed backend removal
+  manager.notify("confirmed-exit");
+  await nextTurn();
+
+  harness.terminal.emitInput(ALT_LEFT);
+  harness.terminal.emitInput(ALT_LEFT);
+  harness.terminal.emitInput(DELETE);
+  await nextTurn();
+  assert.deepEqual(manager.closeExitedCalls, ["native-1"]);
+  assert.deepEqual(manager.views.map((view) => view.id), ["native-1"]);
+  assert.equal(harness.sidebar?.selectedId, "native-1");
+  let noticeText = (harness.sidebar?.render(32, 12).lines.join(" ").replace(/\x1b\[[0-9;]*m/g, "") ?? "").replace(/\s+/g, " ");
+  assert.match(noticeText, /Session not removed; it may be live, unconfirmed, or no longer available/);
+
+  manager.refusedCloseIds.delete("native-1");
+  manager.views.splice(0, 1); // the sidebar snapshot now refers to a stale backend id
+  harness.terminal.emitInput(DELETE);
+  await nextTurn();
+  assert.deepEqual(manager.closeExitedCalls, ["native-1", "native-1"]);
+  assert.deepEqual(harness.sidebar?.items.map((view) => view.id), ["native-1"], "a stale refusal keeps the visible row");
+  assert.equal(harness.sidebar?.selectedId, "native-1");
+
+  manager.views.push({ ...original, lifecycle: "alive", hasLiveProcess: true });
+  manager.notify("live-owner-restored");
+  await nextTurn();
+  harness.terminal.emitInput(DELETE); // closeExited refuses a live child
+  await nextTurn();
+  assert.deepEqual(manager.closeExitedCalls, ["native-1", "native-1", "native-1"]);
+  assert.equal(manager.views[0]?.hasLiveProcess, true);
+
+  manager.views[0] = { ...manager.views[0]!, lifecycle: "exited", hasLiveProcess: true };
+  manager.notify("unconfirmed-exit");
+  harness.terminal.emitInput(DELETE); // an exited badge is insufficient without confirmed process exit
+  await nextTurn();
+  assert.deepEqual(manager.closeExitedCalls, ["native-1", "native-1", "native-1", "native-1"]);
+  assert.equal(manager.views[0]?.hasLiveProcess, true);
+  noticeText = (harness.sidebar?.render(32, 12).lines.join(" ").replace(/\x1b\[[0-9;]*m/g, "") ?? "").replace(/\s+/g, " ");
+  const notice = noticeText.match(/Session not removed; it may be live, unconfirmed, or no longer available/)?.[0] ?? "";
+  assert.ok(notice.length > 0 && notice.length <= 300, "refusal is bounded and truthful");
+  assert.equal(manager.shutdownCalls, 0);
+  assert.equal(harness.terminal.stopCount, 0, "refusal never stops the process or terminal");
+
+  manager.views[0] = { ...manager.views[0]!, lifecycle: "alive", hasLiveProcess: true };
+  manager.notify("alive-again");
+  harness.terminal.emitInput(ALT_LEFT); // hide the sidebar, return to native focus
+  harness.terminal.emitInput(DELETE); // Delete is native in Main focus, not a closeExited request
+  assert.equal(manager.closeExitedCalls.length, 4);
+  assert.deepEqual(manager.writes.at(-1), { id: "native-1", data: DELETE });
+  harness.terminal.emitInput("owner is preserved");
+  assert.deepEqual(manager.writes.at(-1), { id: "native-1", data: "owner is preserved" });
   assert.equal(await closeWithSignal(harness), 0);
 });
 

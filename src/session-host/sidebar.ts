@@ -17,8 +17,10 @@
  *   launch/path/profile validation stays in the backend. No host module is
  *   imported — in particular no TerminalSurface.
  * - UI actions never stop an instance: hiding the sidebar, confirming an
- *   item, or abandoning a form only emits visibility/select/create/quit
- *   action DTOs; the backend decides what they mean.
+ *   item, abandoning a form, or asking to remove an exited row only emits
+ *   visibility/select/create/quit/remove action DTOs; the backend decides
+ *   what they mean. Removal never signals a process or deletes persistent
+ *   files.
  * - Escape in MAIN focus is never intercepted (it stays native input, e.g.
  *   native menu cancellation); while MAIN is focused every chunk — including
  *   `q`/Ctrl+C and terminal-native bytes like bracketed pastes and Kitty key
@@ -77,6 +79,7 @@ export interface SidebarItem {
 export type SidebarAction =
   | { readonly type: "forward"; readonly data: string }
   | { readonly type: "select"; readonly id: string }
+  | { readonly type: "remove"; readonly id: string }
   | {
       readonly type: "create";
       readonly requestId: number;
@@ -1004,6 +1007,13 @@ export class SidebarController {
       this.activateEntry();
       return;
     }
+    if (
+      matchesKey(data, "delete") ||
+      (this.toggleKey === "delete" && ["x", "X"].includes(printableOf(data) ?? ""))
+    ) {
+      this.removeSelectedEntry();
+      return;
+    }
     if (matchesKey(data, "escape")) {
       this.hide();
       return;
@@ -1055,6 +1065,20 @@ export class SidebarController {
       return;
     }
     this.activateQuit();
+  }
+
+  /** Requests backend removal by the selected row's stable host-owned id. */
+  private removeSelectedEntry(): void {
+    const entry = this.currentEntry();
+    if (entry === undefined || entry.kind !== "item" || entry.item === undefined) {
+      this.noticeError = "Select a session row to remove";
+      return;
+    }
+    // The backend is authoritative about confirmed exit. A Delete attempt on
+    // a live, unconfirmed, or stale row is safe and produces a bounded notice
+    // when closeExited refuses it.
+    this.noticeError = undefined;
+    this.emit({ type: "remove", id: entry.item.id });
   }
 
   /**
@@ -1395,14 +1419,24 @@ export class SidebarController {
   private renderRosterPane(cols: number, rows: number): { lines: string[] } {
     const header = ` Sessions (${this.rowStore.length}) `;
     const footerLines = wrapHintLines(
-      [`${this.toggleLabel} toggle`, "enter open", "esc hide", "q quit"],
+      [
+        `${this.toggleLabel} toggle`,
+        "enter open",
+        ...(this._focus === "sidebar"
+          ? [this.toggleKey === "delete" ? "x remove exited" : "delete remove exited"]
+          : []),
+        "esc hide",
+        "q quit",
+      ],
       cols,
     );
-    if (footerLines === undefined || visibleWidth(header) > cols) {
+    const noticeLines = this.noticeError === undefined
+      ? []
+      : wrapHintLines([`! ${this.noticeError}`], cols);
+    if (footerLines === undefined || noticeLines === undefined || visibleWidth(header) > cols) {
       return this.renderTooSmall(cols, rows);
     }
-    const errorRows = this.noticeError === undefined ? 0 : 1;
-    const listRows = rows - 1 - errorRows - footerLines.length;
+    const listRows = rows - 1 - noticeLines.length - footerLines.length;
     // At least one entry row is required: a picker whose selected target is
     // invisible would let Enter activate something the user cannot see.
     if (listRows < 1) {
@@ -1429,8 +1463,8 @@ export class SidebarController {
       }
       index += 1;
     }
-    if (this.noticeError !== undefined) {
-      lines.push(wrapRow(` ! ${this.noticeError}`, cols));
+    for (const noticeLine of noticeLines) {
+      lines.push(wrapRow(noticeLine, cols));
     }
     lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
     for (const footerLine of footerLines) {

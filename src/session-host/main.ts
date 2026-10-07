@@ -25,6 +25,8 @@ import type { TerminalInputModes } from "./terminal-surface";
 const STARTUP_OPTIONS_HELPER = join("scripts", "session-host-startup-options.cjs");
 const GENERIC_FAILURE_MESSAGE = "Session host could not complete startup or cleanup.";
 const GENERIC_CREATE_FAILURE = "Session could not be started. Check the workspace and profile, then try again.";
+const REMOVE_REFUSED_MESSAGE = "Session not removed; it may be live, unconfirmed, or no longer available.";
+const REMOVE_FAILURE_MESSAGE = "Session was not removed; its state could not be confirmed.";
 const INPUT_DRAIN_MAX_MS = 250;
 const INPUT_DRAIN_IDLE_MS = 50;
 
@@ -42,7 +44,7 @@ type MainTerminal = Pick<ProcessTerminal,
   "start" | "stop" | "drainInput" | "write" | "columns" | "rows" | "kittyProtocolActive" | "modifyOtherKeysActive"
 >;
 type MainManager = Pick<InstanceManager,
-  "list" | "surface" | "write" | "resize" | "hasLiveProcesses" | "create" | "shutdown" | "dispose"
+  "list" | "surface" | "write" | "resize" | "hasLiveProcesses" | "create" | "closeExited" | "shutdown" | "dispose"
 >;
 type MainObserver = Pick<KeyboardCapabilityObserver, "flags" | "wait" | "dispose" | "feed">;
 type MainWriter = Pick<SessionHostFrameWriter, "start" | "submit" | "close">;
@@ -266,6 +268,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let cleanupFailure = false;
   let activeId: string | undefined;
   let views: NativeInstanceView[] = [];
+  // Successful removals are terminal for this host id. A delayed roster
+  // notification must not resurrect a detached row.
+  const removedExitedIds = new Set<string>();
   let layout: HostLayout | undefined;
   let lastNativeCols: number | undefined;
   let lastNativeRows: number | undefined;
@@ -446,7 +451,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }
     rosterSyncInProgress = true;
     try {
-      views = manager.list();
+      views = manager.list().filter((view) => !removedExitedIds.has(view.id));
       if (activeId !== undefined && !views.some((view) => view.id === activeId)) {
         activeId = undefined;
       }
@@ -561,6 +566,32 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         reconcileLayout(true);
         scheduleRedraw();
         return;
+      case "remove": {
+        if (!manager || !sidebar) return;
+        let removed: boolean;
+        try {
+          removed = manager.closeExited(action.id);
+        } catch {
+          sidebar.showError(REMOVE_FAILURE_MESSAGE);
+          scheduleRedraw();
+          return;
+        }
+        if (!removed) {
+          sidebar.showError(REMOVE_REFUSED_MESSAGE);
+          scheduleRedraw();
+          return;
+        }
+        removedExitedIds.add(action.id);
+        if (activeId === action.id) {
+          activeId = undefined;
+        }
+        // closeExited may synchronously notify after detaching the row. Sync
+        // again here so even managers without a callback redraw the picker;
+        // the tombstone filters any later stale snapshot of this id.
+        syncRosterAndSchedule();
+        reconcileLayout(true);
+        return;
+      }
       case "visibility":
         reconcileLayout(true);
         syncOuterMouseModes();

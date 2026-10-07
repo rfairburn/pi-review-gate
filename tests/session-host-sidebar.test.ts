@@ -62,6 +62,7 @@ const DOWN = "\x1b[B";
 const UP = "\x1b[A";
 const LEFT = "\x1b[D";
 const ENTER = "\r";
+const DELETE = "\x1b[3~";
 const ESC = "\x1b";
 
 interface Harness {
@@ -217,7 +218,7 @@ test("constructor opens a usable visible welcome picker", () => {
   // The footer wraps across reserved rows at this width; every hint must
   // survive the wrap, never an ellipsis.
   const footer = texts.slice(-2).join(" ");
-  for (const hint of ["toggle", "enter open", "esc hide", "q quit"]) {
+  for (const hint of ["toggle", "enter open", "delete remove exited", "esc hide", "q quit"]) {
     assert.ok(footer.includes(hint), `missing hint ${JSON.stringify(hint)} in ${JSON.stringify(texts)}`);
   }
   assert.ok(!texts.some((line) => line.includes("...")), "no ellipsized hints");
@@ -652,6 +653,7 @@ test("main focus forwards ordinary press, repeat and release packets unchanged",
       KITTY_CTRL_C_RELEASE,
       "\x1b[200~-p hello\nworld\x1b[201~",
       "\x1b[27u",
+      DELETE, // Delete is native in Main focus, not the sidebar removal action.
     ];
     for (const chunk of chunks) {
       harness.send(chunk);
@@ -683,6 +685,44 @@ test("native Ctrl+C in main focus never quits the whole host", () => {
 // Roster selection: id-based continuity, reorder, vanishing rows
 // ---------------------------------------------------------------------------
 
+test("sidebar Delete visibly requests removal using the selected row's stable id", () => {
+  const id = "owned:opaque/session-42";
+  const harness = makeRoster([id]);
+  harness.controller.updateItems([
+    makeItem({ id, label: "friendly label", lifecycle: "exited", hasLiveProcess: false }),
+  ]);
+  harness.send(DOWN); // New session -> Quit host
+  harness.send(DOWN); // wrap to the exited row
+  assert.equal(harness.controller.selectedId, id);
+  const texts = rosterView(harness.controller, 40, 10).texts;
+  assert.ok(texts.slice(-2).join(" ").includes("delete remove exited"), JSON.stringify(texts));
+  harness.send(DELETE);
+  assert.deepEqual(harness.focusedActions(), [{ type: "remove", id }]);
+  assert.equal(harness.controller.selectedId, id, "the UI waits for the backend roster confirmation");
+  assert.equal(harness.controller.focus, "sidebar");
+});
+
+test("a configured Delete toggle keeps its identity and exposes x as the removal key", () => {
+  const id = "opaque-delete-toggle-row";
+  const harness = makeController({ toggleKey: "delete", initialVisible: false });
+  harness.controller.updateItems([
+    makeItem({ id, lifecycle: "exited", hasLiveProcess: false }),
+  ]);
+  harness.send(DELETE); // configured toggle shows the sidebar
+  assert.equal(harness.controller.focus, "sidebar");
+  harness.send(DOWN); // New -> Quit
+  harness.send(DOWN); // -> exited row
+  const texts = rosterView(harness.controller, 40, 10).texts;
+  assert.ok(texts.join(" ").includes("x remove exited"), JSON.stringify(texts));
+  assert.ok(!texts.join(" ").includes("delete remove exited"));
+  harness.baseline = harness.actions.length;
+  harness.send("x");
+  assert.deepEqual(harness.focusedActions(), [{ type: "remove", id }]);
+  harness.send(DELETE); // the original configured toggle still hides the sidebar
+  assert.equal(harness.controller.visible, false);
+  assert.deepEqual(harness.focusedActions().at(-1), { type: "visibility", visible: false });
+});
+
 test("arrows select roster items then New session and Quit host with wrap", () => {
   const harness = makeRoster(["a", "b"]);
   harness.send(DOWN); // New session -> Quit host
@@ -713,6 +753,7 @@ test("enter on a roster item emits select(id), focuses main, sidebar stays visib
   assert.deepEqual(harness.focusedActions(), [{ type: "select", id: "a" }]);
   assert.equal(harness.controller.focus, "main");
   assert.equal(harness.controller.visible, true); // still composited
+  assert.ok(!rosterView(harness.controller, 40, 10).texts.join(" ").includes("delete remove exited"));
   // Typing now goes to the main instance, not any other row.
   harness.send("pwd");
   assert.deepEqual(harness.sinceActions(), [
@@ -1594,14 +1635,15 @@ test("wide layout renders roster and form as independent panes", () => {
   const texts = assertPaneSafe(roster.lines, 32, 23);
   assert.ok(texts[0].includes("Sessions (1)"));
   assert.ok(texts.some((line) => line.includes("> New session")));
+  assert.ok(!texts.join(" ").includes("delete remove exited"), "the sidebar-only action is hidden while the form owns input");
 });
 
 test("footer hints wrap across reserved rows and never ellipsize", () => {
   const harness = makeRoster(["a"]);
   for (const cols of [32, 40, 60]) {
     const texts = rosterView(harness.controller, cols, 10).texts;
-    const footer = texts.slice(-2).join(" ");
-    for (const hint of ["toggle", "enter open", "esc hide", "q quit"]) {
+    const footer = texts.join(" ");
+    for (const hint of ["toggle", "enter open", "delete remove exited", "esc hide", "q quit"]) {
       assert.ok(footer.includes(hint), `missing ${JSON.stringify(hint)} at ${cols} cols: ${JSON.stringify(texts)}`);
     }
     assert.ok(!texts.some((line) => line.includes("...")), `no ellipsized hints at ${cols} cols`);
@@ -1616,29 +1658,29 @@ test("footer hints wrap across reserved rows and never ellipsize", () => {
 
 test("roster requires a visible entry row; otherwise it falls back to too-small", () => {
   const { controller } = makeController();
-  // The default toggle footer wraps to three rows at 20 cols; 20x4 leaves no
+  // The complete footer wraps to four rows at 20 cols; 20x5 leaves no
   // room for an entry, so Enter would activate an invisible target.
-  const tooSmall = controller.render(20, 4);
+  const tooSmall = controller.render(20, 5);
   assert.ok(tooSmall.lines.some((line) => line.includes("too small")));
   assert.equal(tooSmall.cursor, undefined);
 
   // One more row keeps exactly one visible entry plus the complete hints.
-  const fits = assertPaneSafe(controller.render(20, 5).lines, 20, 5);
+  const fits = assertPaneSafe(controller.render(20, 6).lines, 20, 6);
   assert.ok(fits.some((line) => line.includes("> New session")), JSON.stringify(fits));
-  const footer = fits.slice(-3).join(" ");
-  for (const hint of ["toggle", "enter open", "esc hide", "q quit"]) {
+  const footer = fits.join(" ");
+  for (const hint of ["toggle", "enter open", "delete remove exited", "esc hide", "q quit"]) {
     assert.ok(footer.includes(hint), `missing ${JSON.stringify(hint)}: ${JSON.stringify(fits)}`);
   }
 
-  // An error row consumes the last entry slot at 32x4.
+  // An error row consumes the last entry slot at 32x5.
   controller.showError("boom");
-  const tooSmallWithError = controller.render(32, 4);
+  const tooSmallWithError = controller.render(32, 5);
   assert.ok(tooSmallWithError.lines.some((line) => line.includes("too small")));
-  const fitsWithError = assertPaneSafe(controller.render(32, 5).lines, 32, 5);
+  const fitsWithError = assertPaneSafe(controller.render(32, 6).lines, 32, 6);
   assert.ok(fitsWithError.some((line) => line.includes("> New session")), JSON.stringify(fitsWithError));
   assert.ok(fitsWithError.some((line) => line.includes("boom")));
-  const footerWith = fitsWithError.slice(-2).join(" ");
-  for (const hint of ["toggle", "enter open", "esc hide", "q quit"]) {
+  const footerWith = fitsWithError.join(" ");
+  for (const hint of ["toggle", "enter open", "delete remove exited", "esc hide", "q quit"]) {
     assert.ok(footerWith.includes(hint), `missing ${JSON.stringify(hint)}: ${JSON.stringify(fitsWithError)}`);
   }
 });
@@ -1653,14 +1695,14 @@ test("long validated toggle chords render in full, wrapping or falling back inst
   const wide = assertPaneSafe(harness.controller.render(40, 8).lines, 40, 8);
   assert.ok(wide.some((line) => line.includes("Ctrl+Shift+Alt+Super+PageDown")), JSON.stringify(wide));
 
-  // Tight width: the chord wraps to its own rows while an entry stays visible.
-  const tight = assertPaneSafe(harness.controller.render(32, 5).lines, 32, 5);
+  // Tight width: the chord and removal hint wrap while an entry stays visible.
+  const tight = assertPaneSafe(harness.controller.render(32, 6).lines, 32, 6);
   assert.ok(tight.some((line) => line.includes("Ctrl+Shift+Alt+Super+PageDown")), JSON.stringify(tight));
   assert.ok(tight.some((line) => line.includes("> New session")));
 
   // When even the wrapped chord leaves no entry row, the pane is truthfully
   // too small with no partial chord.
-  const tooSmall = harness.controller.render(32, 4);
+  const tooSmall = harness.controller.render(32, 5);
   assert.ok(tooSmall.lines.some((line) => line.includes("too small")));
   assert.ok(!tooSmall.lines.join("\n").includes("Ctrl+Shift"), "no partial chord in the fallback");
 });

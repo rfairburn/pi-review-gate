@@ -114,7 +114,14 @@ and delegated-execution policies still apply to native activity.
 
 Host keyboard controls apply only while the corresponding host surface has focus. In
 the sidebar, Up/Down moves the selection, Enter opens the selected session or activates
-the New session/Quit host row, `q`/`Q` activates Quit host, and Escape hides the sidebar.
+the New session/Quit host row, Delete removes the selected exited row (`x` does so if
+Delete is explicitly configured as the sidebar toggle), `q`/`Q` activates Quit host,
+and Escape hides the sidebar. Removal is refused unless the backend has
+confirmed that the child exited; a live, unconfirmed, or stale row remains in place
+with a notice. Removing an exited row only detaches that host-owned entry: it does not
+signal a process or delete its workspace, profile, or saved conversation files. Delete
+remains native input in Main focus unless it is itself the explicitly configured
+sidebar-toggle chord.
 In the New session form, Enter advances to the next field and submits from the last
 field; Escape cancels. Use the on-screen cues for quit confirmation. When a native Pi
 frame has focus, input is sent only to the explicitly activated, live child; it is never
@@ -130,9 +137,9 @@ presence only when observed, and at most a couple of generic activity lines. It 
 not monitor or coordinate reviewers, workers, or their children, and does not display
 tool arguments, question text, titles, transcripts, or secrets. Status stays unknown
 until it is observed; an unavailable reporter, disconnect, error, or process exit does
-not turn unknown into Idle. Exited rows retain their last terminal frame. There is no
-heartbeat timeout that declares a quiet session dead, so a valid idle state may remain
-for hours.
+not turn unknown into Idle. Exited rows retain their last terminal frame until
+explicitly removed. There is no heartbeat timeout that declares a quiet session dead,
+so a valid idle state may remain for hours.
 
 The local status channel uses a private Unix socket and per-instance authorization
 identity bound to the owned child. A pre-main Node preload consumes the one-shot

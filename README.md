@@ -134,6 +134,20 @@ scripts\pi-review-gate.cmd
 An optional, separate session-host alpha can run multiple independent native Pi sessions
 in one terminal on macOS/Linux. It does not replace either launcher; see the
 [session-host alpha guide](docs/session-host-alpha.md) for requirements and limitations.
+Launch it with the one-command entry points. Node.js 22.19.0 or newer must already
+be on PATH; automatic isolated Node fallback remains unfinished. The launcher
+resolves (or provisions) the public Pi runtime automatically — no manual Pi CLI
+path is needed:
+
+```bash
+./scripts/pi-review-sessions.sh   # macOS/Linux source checkout
+```
+
+```bat
+scripts\pi-review-sessions.cmd    # native Windows entry point (the host itself is POSIX-only in this alpha)
+```
+
+An installed package exposes the `pi-review-sessions` command.
 
 The persistent launcher selects the Pi agent directory's `review-gate.json`
 (`~/.pi/agent/review-gate.json` by default, following `PI_CODING_AGENT_DIR`), then

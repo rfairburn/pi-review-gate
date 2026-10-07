@@ -1157,6 +1157,10 @@ module.exports = {
   SKILL_PUBLISH_RETRY_ATTEMPTS,
   SKILL_PUBLISH_RETRY_DELAY_MS,
   buildExtension,
+  // Shared Node DDGS provisioning (issue 323): the session host launcher
+  // (scripts/pi-review-sessions.cjs) reuses this instead of a Bash-only call
+  // so the same host setup can run from the .cmd entry point.
+  ensureDdgs,
   cmdQuote,
   compatibilityFallbackConfigPath,
   ddgsPythonPath,

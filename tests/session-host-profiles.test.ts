@@ -1,23 +1,24 @@
 import assert from "node:assert/strict";
 import fs, { chmodSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, lstatSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { homedir, tmpdir } from "node:os";
-import { join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import test from "node:test";
 import {
   DEFAULT_REVIEW_GATE_CONFIG_JSON,
   MAX_PROFILE_CONFIG_BYTES,
   PROFILE_MUTABLE_CONFIG_FILENAMES,
+  NativeAgentRegistry,
   ProfileRegistry,
   defaultProfileStateRoot,
   initializeProfileDirectory,
+  nativePiAgentDir,
 } from "../src/session-host/profiles";
 import { PI_AGENT_DIR_ENV, piAgentDir } from "../src/config-path";
 
-/** Unique test root outside the captured tree, with Unicode, spaces, and cleanup. */
+/** Unique synthetic test root inside this worker tree, with Unicode and spaces. */
 function makeTestRoot(label: string): string {
   // Realpath so expectations match canonical prepared paths on macOS (/var -> /private/var).
-  return realpathSync(mkdtempSync(join(tmpdir(), `prg-session-host-${label}- ünïcode-`)));
+  return realpathSync(mkdtempSync(join(process.cwd(), `.prg-session-host-${label}- ünïcode-`)));
 }
 
 function writeConfig(dir: string, content: string, filename = "review-gate.json"): string {
@@ -92,9 +93,100 @@ function expectError(fn: () => unknown, ...substrings: string[]): Error {
 }
 
 test("default profile state root follows the native Pi agent directory", () => {
-  const env = { [PI_AGENT_DIR_ENV]: "/custom agent dir" };
+  const env = { HOME: "/synthetic-home", [PI_AGENT_DIR_ENV]: "/custom agent dir" };
   assert.equal(defaultProfileStateRoot(env), join(piAgentDir(env), "session-host"));
-  assert.match(defaultProfileStateRoot({}), /[\\/]\.pi[\\/]agent[\\/]session-host$/);
+  assert.equal(defaultProfileStateRoot({ HOME: "/synthetic-home" }), join("/synthetic-home", ".pi", "agent", "session-host"));
+});
+
+test("NativeAgentRegistry admits simultaneous children against one untouched native root", () => {
+  const root = makeTestRoot("native-shared");
+  const home = join(root, "home");
+  const agentDir = join(home, ".pi", "agent");
+  const workspaceA = join(root, "workspace-a");
+  const workspaceB = join(root, "workspace-b");
+  mkdirSync(agentDir, { recursive: true });
+  mkdirSync(workspaceA);
+  mkdirSync(workspaceB);
+  try {
+    writeConfig(agentDir, JSON.stringify({ enabled: true, marker: "preserve-native-config" }));
+    for (const [filename, content] of [
+      ["settings.json", "{\"theme\":\"native\"}\n"],
+      ["keybindings.json", "{\"bindings\":[]}\n"],
+      ["models.json", "{\"models\":[\"native-model\"]}\n"],
+      ["mcp.json", "{\"servers\":{}}\n"],
+      ["auth.json", "synthetic-fixture-credential\n"],
+    ]) {
+      writeConfig(agentDir, content, filename);
+    }
+    const extension = join(agentDir, "extensions", "native-extension.js");
+    const skill = join(agentDir, "skills", "native-skill", "SKILL.md");
+    const session = join(agentDir, "sessions", "native-session.jsonl");
+    mkdirSync(dirname(extension), { recursive: true });
+    mkdirSync(dirname(skill), { recursive: true });
+    mkdirSync(dirname(session), { recursive: true });
+    writeFileSync(extension, "synthetic extension\n", "utf8");
+    writeFileSync(skill, "synthetic skill\n", "utf8");
+    writeFileSync(session, "synthetic saved conversation\n", "utf8");
+
+    const before = snapshotTree(agentDir);
+    const env = { HOME: home, [PI_AGENT_DIR_ENV]: agentDir };
+    assert.equal(nativePiAgentDir({ HOME: home, [PI_AGENT_DIR_ENV]: "~/.pi/agent" }), realpathSync(agentDir));
+    const registry = new NativeAgentRegistry({ env });
+    // Admissions must keep using Main's captured environment even if the
+    // source object later changes (or process.env contains another override).
+    env[PI_AGENT_DIR_ENV] = join(root, "unrelated-agent-dir");
+
+    const first = registry.prepare({ workspace: workspaceA });
+    const second = registry.prepare({ workspace: workspaceB });
+    assert.equal(first.agentDir, realpathSync(agentDir));
+    assert.equal(second.agentDir, first.agentDir, "simultaneous children intentionally share native setup");
+    assert.equal(first.created, false);
+    assert.equal(second.created, false);
+    assert.notEqual(first.workspace, second.workspace, "workspace ownership remains independent");
+    assertTreesEqual(before, agentDir);
+
+    first.release();
+    first.release();
+    assertTreesEqual(before, agentDir);
+    second.release();
+    assertTreesEqual(before, agentDir);
+    expectError(() => registry.prepare({ workspace: workspaceA, profile: join(root, "legacy-profile") }), "per-instance profiles are not supported");
+    expectError(() => registry.prepare({ workspace: agentDir }), "must not be the workspace");
+    assertTreesEqual(before, agentDir);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("NativeAgentRegistry preserves native config fallback and initializes only an absent default", () => {
+  const root = makeTestRoot("native-defaults");
+  const home = join(root, "home");
+  const agentDir = join(home, ".pi", "agent");
+  const workspace = join(root, "workspace");
+  mkdirSync(agentDir, { recursive: true });
+  mkdirSync(workspace);
+  try {
+    const fallback = join(home, ".config", "pi-review-gate", "config.json");
+    mkdirSync(dirname(fallback), { recursive: true });
+    const fallbackBytes = Buffer.from(JSON.stringify({ enabled: false, marker: "fallback" }));
+    writeFileSync(fallback, fallbackBytes);
+    const withFallback = new NativeAgentRegistry({ env: { HOME: home, [PI_AGENT_DIR_ENV]: agentDir } });
+    const adopted = withFallback.prepare({ workspace });
+    assert.equal(readFileSync(fallback).equals(fallbackBytes), true);
+    assert.equal(fs.existsSync(join(agentDir, "review-gate.json")), false, "a native default does not shadow the existing fallback");
+    adopted.release();
+
+    rmSync(fallback);
+    const withoutConfig = new NativeAgentRegistry({ env: { HOME: home } });
+    assert.equal(withoutConfig.agentDir, realpathSync(agentDir), "the default is the snapshotted home/.pi/agent root");
+    const initialized = withoutConfig.prepare({ workspace });
+    const primary = join(agentDir, "review-gate.json");
+    assert.equal(readFileSync(primary, "utf8"), DEFAULT_REVIEW_GATE_CONFIG_JSON);
+    assert.equal(statSync(primary).mode & 0o777, 0o600);
+    initialized.release();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("prepare creates a private profile with the byte-exact zero-model default config", () => {
@@ -211,10 +303,23 @@ test("workspace acceptance: tilde expansion, relative paths, and canonical direc
     assert.equal(viaRelative.workspace, resolve(workspace));
     viaRelative.release();
 
-    // Bare tilde expands to the real home directory without touching it.
-    const viaTilde = registry.prepare({ workspace: "~" });
-    assert.equal(viaTilde.workspace, realpathSync(homedir()));
-    viaTilde.release();
+    // Bare tilde resolves against a synthetic home wholly inside this test root.
+    const syntheticHome = join(root, "synthetic-home");
+    mkdirSync(syntheticHome);
+    const priorHome = process.env.HOME;
+    const priorUserProfile = process.env.USERPROFILE;
+    try {
+      process.env.HOME = syntheticHome;
+      process.env.USERPROFILE = syntheticHome;
+      const viaTilde = registry.prepare({ workspace: "~" });
+      assert.equal(viaTilde.workspace, realpathSync(syntheticHome));
+      viaTilde.release();
+    } finally {
+      if (priorHome === undefined) delete process.env.HOME;
+      else process.env.HOME = priorHome;
+      if (priorUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = priorUserProfile;
+    }
 
     // A symlinked workspace canonicalizes to its real directory.
     const link = join(root, "workspace-link");

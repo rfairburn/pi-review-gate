@@ -16,14 +16,20 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import {
+  PI_AGENT_DIR_ENV,
+  piAgentDir,
+  reviewGateConfigCandidates,
+  resolveConfigPathResolution,
+} from "../config-path";
 
 /**
  * Native standalone Pi launch preparation (alpha, POSIX-only).
  *
  * This module is the preparatory stage of the future native session host: it
- * resolves the real Pi CLI, validates the admitted per-instance profile, and
- * composes the exact spawn descriptor (file, argv, environment, cwd) for one
- * direct native Pi TUI session. It deliberately does NOT spawn Pi, create
+ * resolves the real Pi CLI, validates the admitted native root or legacy
+ * profile, and composes the exact spawn descriptor (file, argv, environment,
+ * cwd) for one direct native Pi TUI session. It deliberately does NOT spawn
  * PTYs, bootstrap the session-host protocol, or run any dependency setup:
  *
  * - The outer launcher owns the single DDGS setup (`scripts/ensure-ddgs.sh` /
@@ -33,11 +39,12 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
  * - The future host manager supplies the session-host bootstrap token
  *   immediately at the actual PTY spawn, never earlier; this preparation
  *   strips any inherited bootstrap so setup descendants can never carry it.
- * - The ordinary wrapper keeps owning the gate defaults: review-gate config,
- *   shipped skills, `PI_REVIEW_GATE_CODEMODE_DEFAULT=1`, the
- *   `PI_REVIEW_GATE_DISABLED` kill switch, and untouched tool-policy
- *   arguments are preserved exactly as the shell/`.cmd` launchers implement
- *   them (this module never rewrites native arguments or tool filters).
+ * - Ordinary launcher behavior is unchanged. Native setup reuses the native
+ *   agent directory and normal config/resource discovery, initializing only
+ *   the ordinary zero-model review-gate default when genuinely absent; it
+ *   never recopies native resources or skills. Legacy profile mode retains
+ *   its isolated config and skill publication behavior. The disabled kill
+ *   switch, provider environment, and tool-policy arguments are preserved.
  * - Runtime role authorization (`PI_REVIEW_GATE_RUNTIME_ROLE` /
  *   `PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG`) is an executor-child mechanism:
  *   a delegated worker's environment must never flow into this top-level
@@ -89,11 +96,11 @@ export const MAX_NATIVE_CONFIG_BYTES = 1024 * 1024;
 /** Upper bound for one shipped skill file copy. */
 export const MAX_SKILL_FILE_BYTES = 2 * 1024 * 1024;
 
-/** Reserved profile skills root, per Pi's `<agent-dir>/skills/` discovery location. */
+/** Reserved skills root used only by the legacy profile path. */
 const PROFILE_SKILLS_DIRNAME = "skills";
 
 /**
- * Shipped-skill publication map for a native profile, mirroring
+ * Shipped-skill publication map used only by legacy profiles, mirroring
  * SKILL_PUBLISH_PLAN in scripts/pi-review-gate.sh and
  * scripts/pi-review-gate-launcher.cjs (orchestrator SKILL.md plus its
  * recovery runbook, execution, and research). Publication targets stay the
@@ -571,9 +578,15 @@ export interface NativeLaunchDescriptor {
 }
 
 export interface NativeLaunchOptions {
+  /**
+   * Select the ordinary shared Pi agent directory instead of a legacy private
+   * profile. Production Main must pass `true`; omission remains legacy-only
+   * for internal callers and existing isolated-profile tests.
+   */
+  nativeSetup?: boolean;
   /** Already-built gate package root (owning dist/src/index.js). */
   packageRoot: string;
-  /** Admitted per-instance profile agent directory (created by the profile registry, never here). */
+  /** Admitted native agent directory or legacy profile directory, as selected by nativeSetup. */
   agentDir: string;
   /** Per-instance workspace directory the native Pi session runs in. */
   workspace: string;
@@ -583,8 +596,9 @@ export interface NativeLaunchOptions {
    * Native pi arguments, forwarded byte-for-byte in order (--scheduler is
    * consumed as the wrapper does). Parent startup session overrides
    * (--continue/-c, --resume/-r, --session[=v], --session-id[=v], --fork[=v],
-   * --session-dir[=v], --no-session) reject fail-closed: every instance must
-   * start a NEW native chat in its own profile-owned storage.
+   * --session-dir[=v], --no-session) reject fail-closed: startup selection
+   * cannot attach a child to a parent/live conversation. Native session
+   * storage itself remains at Pi's ordinary configured location.
    */
   args?: readonly string[];
   /** Environment to clone (defaults to process.env); never mutated. */
@@ -603,24 +617,24 @@ export interface NativeLaunchOptions {
  *   CATALOG`) is rejected outright, and executor settlement/quiescence
  *   authorization markers are stripped so no delegated-worker token can
  *   outlive preparation.
- * - `PI_CODING_AGENT_DIR` is pinned to the canonical admitted profile agent
- *   directory and `PI_REVIEW_GATE_CONFIG` explicitly to
- *   `<agentDir>/review-gate.json`. That local file must already exist as a
- *   readable JSON object under the bounded size cap — no compatibility
- *   fallback and no creation here: the profile registry owns creation.
- * - `PI_IMAGE_PROTOCOL=none` for the alpha text display; native image input
- *   and model tools are unaffected by this default.
- * - `PI_REVIEW_GATE_CODEMODE_DEFAULT=1` exactly like the ordinary launchers,
- *   which own the codemode default; the `PI_REVIEW_GATE_DISABLED` kill switch
- *   and any inherited tool filters stay inherited as-is, and native arguments
- *   are forwarded byte-for-byte in order with no tool-policy rewrite. Only
- *   the explicit `--scheduler` flag is consumed into
- *   `PI_REVIEW_GATE_SCHEDULER=1`, mirroring the wrapper contract. The one
- *   exception to full forwarding: parent startup session overrides (see
- *   scripts/session-host-startup-options.cjs) reject before any filesystem
- *   mutation, and a nonempty inherited `PI_CODING_AGENT_SESSION_DIR` rejects
- *   too — every instance starts a NEW native chat in its own profile-owned
- *   storage (issue 323).
+ * - Legacy profile mode pins `PI_CODING_AGENT_DIR` and `PI_REVIEW_GATE_CONFIG`
+ *   to the admitted private profile. With `nativeSetup: true`, the admitted
+ *   directory must equal Pi's native environment-resolved agent directory;
+ *   the canonical root is passed to Pi, while `PI_REVIEW_GATE_CONFIG` and
+ *   all ordinary native config fallback behavior are left untouched. The
+ *   registry initializes the ordinary zero-model default only when no
+ *   explicit override, native config, or compatibility config exists, and
+ *   never overwrites an existing file.
+ * - Legacy profile mode applies the alpha `PI_IMAGE_PROTOCOL=none` and
+ *   `PI_REVIEW_GATE_CODEMODE_DEFAULT=1` defaults. Native mode supplies those
+ *   only when absent, preserving explicit native environment choices. The
+ *   `PI_REVIEW_GATE_DISABLED` kill switch, provider environment, and inherited
+ *   tool filters remain intact. Native arguments are forwarded byte-for-byte
+ *   except `--scheduler`; native mode preserves an inherited scheduler value
+ *   unless that flag explicitly enables it. Startup session-selection args
+ *   (see scripts/session-host-startup-options.cjs) still reject before any
+ *   filesystem mutation, while native `PI_CODING_AGENT_SESSION_DIR` remains
+ *   available as ordinary shared Pi setup.
  * - The user's ORIGINAL NODE_OPTIONS is preserved exactly and handed to the
  *   session-host preload (compiled at
  *   <root>/dist/src/session-host/bootstrap-preload.js) through the one-shot
@@ -638,10 +652,10 @@ export interface NativeLaunchOptions {
  *   bootstrap preload must all already exist in the package root before any
  *   validation or publication runs. The argv loads the reporter extension
  *   FIRST, then the gate extension, then the native arguments.
- * - The standard shipped skills (orchestrator SKILL.md plus recovery runbook,
- *   execution, research) are refreshed into the profile's reserved
- *   `pi-review-gate-*` skill directories under `<agentDir>/skills/` using the
- *   shipped launcher helper's atomic rename; see `refreshNativeProfileSkills`.
+ * - Legacy profile mode refreshes the standard shipped skills into its
+ *   reserved `pi-review-gate-*` directories. Native setup does not republish
+ *   skills: Pi and the ordinary launcher discover the user's existing native
+ *   skill locations naturally.
  *
  * POSIX only in this alpha; other platforms get a clear diagnostic.
  */
@@ -650,13 +664,16 @@ export function prepareNativeLaunch(options: NativeLaunchOptions): NativeLaunchD
     throw new Error(unsupportedPlatformDiagnostic(process.platform));
   }
 
-  // Reject parent startup session overrides before any filesystem mutation,
-  // profile work, or bootstrap injection: every instance must start a NEW
-  // native chat in its own profile-owned storage (issue 323). The launcher
-  // preflight already rejects these; this is the defensive gate for direct
-  // callers. Diagnostics are bounded to the fixed override name.
+  // Reject parent startup session arguments before any filesystem mutation,
+  // profile work, or bootstrap injection. Saved-session selection remains an
+  // ordinary native Pi operation; this host does not attach a child to a live
+  // conversation. Native setup may preserve Pi's configured session storage
+  // directory, so omit only that env field from the legacy preflight check.
+  // The caller env is never mutated.
   try {
-    loadStartupOptionsHelper().assertSessionHostStartupOptions(options.args ?? [], options.env ?? process.env);
+    const startupEnv = { ...(options.env ?? process.env) };
+    if (options.nativeSetup) delete startupEnv.PI_CODING_AGENT_SESSION_DIR;
+    loadStartupOptionsHelper().assertSessionHostStartupOptions(options.args ?? [], startupEnv);
   } catch (error) {
     throw new Error(`pi-review-gate: ${error instanceof Error ? error.message : "invalid session host startup options"}`);
   }
@@ -699,24 +716,42 @@ export function prepareNativeLaunch(options: NativeLaunchOptions): NativeLaunchD
   const agentDir = canonicalAdmittedAgentDir(options.agentDir);
   const workspace = canonicalWorkspace(options.workspace);
   const piExecutable = validatePiExecutable(options.piExecutable);
-  const configPath = validateProfileConfig(agentDir);
+  if (options.nativeSetup) {
+    if (canonicalNativeAgentDirFromEnv(env) !== agentDir) {
+      throw new Error(
+        `pi-review-gate: native setup agent directory does not match the directory resolved from PI_CODING_AGENT_DIR: ${agentDir}`,
+      );
+    }
+    validateNativeResolvedConfig(env, agentDir, workspace);
+  }
+  const configPath = options.nativeSetup ? undefined : validateProfileConfig(agentDir);
 
-  // --scheduler opt-in exactly like the ordinary launchers: the flag is
-  // consumed here and exported for this launch only; all other arguments are
-  // forwarded byte-for-byte, in order, with no tool-policy rewrite.
+  // The wrapper-only --scheduler flag is consumed. Legacy profiles clear a
+  // stale inherited scheduler value; native setup otherwise preserves the
+  // user's existing native environment. All other arguments are forwarded
+  // byte-for-byte, in order, with no tool-policy rewrite.
   let schedulerEnabled = false;
   const forwardedArgs: string[] = [];
   for (const arg of options.args ?? []) {
     if (arg === "--scheduler") schedulerEnabled = true;
     else forwardedArgs.push(arg);
   }
-  delete env.PI_REVIEW_GATE_SCHEDULER;
+  if (!options.nativeSetup) delete env.PI_REVIEW_GATE_SCHEDULER;
   if (schedulerEnabled) env.PI_REVIEW_GATE_SCHEDULER = "1";
 
+  // Pin the canonical shared root so a relative PI_CODING_AGENT_DIR cannot
+  // resolve differently after the child changes cwd to its workspace.
   env.PI_CODING_AGENT_DIR = agentDir;
-  env.PI_REVIEW_GATE_CONFIG = configPath;
-  env.PI_IMAGE_PROTOCOL = "none";
-  env.PI_REVIEW_GATE_CODEMODE_DEFAULT = "1";
+  if (!options.nativeSetup) {
+    env.PI_REVIEW_GATE_CONFIG = configPath;
+    env.PI_IMAGE_PROTOCOL = "none";
+    env.PI_REVIEW_GATE_CODEMODE_DEFAULT = "1";
+  } else {
+    // Native mode preserves every user choice and supplies only ordinary
+    // defaults that are truly absent (an explicit empty value is intentional).
+    if (env.PI_IMAGE_PROTOCOL === undefined) env.PI_IMAGE_PROTOCOL = "none";
+    if (env.PI_REVIEW_GATE_CODEMODE_DEFAULT === undefined) env.PI_REVIEW_GATE_CODEMODE_DEFAULT = "1";
+  }
 
   // NODE_OPTIONS: the preload require clause is PREPENDED before the user's
   // ORIGINAL value (which is preserved exactly and restored synchronously by
@@ -755,7 +790,9 @@ export function prepareNativeLaunch(options: NativeLaunchOptions): NativeLaunchD
   }
   env.NODE_OPTIONS = originalNodeOptions === null ? preloadRequire : `${preloadRequire} ${originalNodeOptions}`;
 
-  refreshNativeProfileSkills(packageRoot, join(agentDir, PROFILE_SKILLS_DIRNAME));
+  if (!options.nativeSetup) {
+    refreshNativeProfileSkills(packageRoot, join(agentDir, PROFILE_SKILLS_DIRNAME));
+  }
 
   return {
     file: piExecutable,
@@ -789,17 +826,97 @@ function validateCompiledExtensionFiles(compiledFiles: readonly string[]): void 
   }
 }
 
-/** Validate the admitted profile agent directory: absolute, existing, a real canonical directory. */
+/** Validate the admitted native or legacy agent directory: absolute, existing, and canonical. */
 function canonicalAdmittedAgentDir(agentDir: string): string {
   if (!isAbsolute(agentDir)) {
     throw new Error(`pi-review-gate: the profile agent directory must be an absolute path: ${agentDir}`);
   }
   if (!isDirectory(agentDir)) {
     throw new Error(
-      `pi-review-gate: the profile agent directory does not exist; the profile registry owns its creation: ${agentDir}`,
+      `pi-review-gate: the agent directory does not exist; the selected registry owns its setup: ${agentDir}`,
     );
   }
   return realpathSync(agentDir);
+}
+
+/** Resolve Pi-native path defaults from the same explicit child environment snapshot. */
+function nativeConfigPathResolution(env: NodeJS.ProcessEnv): ReturnType<typeof resolveConfigPathResolution> {
+  const homeDir = process.platform === "win32"
+    ? env.USERPROFILE ?? env.HOME
+    : env.HOME;
+  return resolveConfigPathResolution(homeDir === undefined ? {} : { homeDir });
+}
+
+/** Resolve the common native Pi root from the same explicit child environment snapshot. */
+function canonicalNativeAgentDirFromEnv(env: NodeJS.ProcessEnv): string {
+  const path = resolve(piAgentDir(env, nativeConfigPathResolution(env)));
+  if (!isDirectory(path)) {
+    throw new Error(`pi-review-gate: the native Pi agent directory resolved from PI_CODING_AGENT_DIR is not a directory: ${path}`);
+  }
+  return realpathSync(path);
+}
+
+/** Validate only bounded regular-file access; native Pi retains JSON recovery and warning behavior. */
+function validateNativeResolvedConfig(env: NodeJS.ProcessEnv, agentDir: string, workspace: string): void {
+  const explicit = env.PI_REVIEW_GATE_CONFIG;
+  if (explicit) {
+    const path = isAbsolute(explicit) ? explicit : resolve(workspace, explicit);
+    if (nativeConfigPathExists(path)) validateNativeConfigFile(path);
+    return;
+  }
+  const configEnv = { ...env, [PI_AGENT_DIR_ENV]: agentDir };
+  for (const candidate of reviewGateConfigCandidates(configEnv, nativeConfigPathResolution(env))) {
+    if (nativeConfigPathExists(candidate)) {
+      validateNativeConfigFile(candidate);
+      return;
+    }
+  }
+}
+
+function nativeConfigPathExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return false;
+    throw new Error(`pi-review-gate: the native review-gate config path could not be inspected: ${path}`);
+  }
+}
+
+/** Bounded nonblocking check that never parses, rewrites, or logs native config bytes. */
+function validateNativeConfigFile(path: string): void {
+  let fd: number;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
+  } catch {
+    throw new Error(`pi-review-gate: the native review-gate config is present but not a readable regular file: ${path}`);
+  }
+  try {
+    const stats = fstatSync(fd);
+    if (!stats.isFile()) {
+      throw new Error(`pi-review-gate: the native review-gate config is not a regular file: ${path}`);
+    }
+    if (stats.size > MAX_NATIVE_CONFIG_BYTES) {
+      throw new Error(`pi-review-gate: the native review-gate config exceeds the ${MAX_NATIVE_CONFIG_BYTES}-byte bound: ${path}`);
+    }
+    const buffer = Buffer.alloc(MAX_NATIVE_CONFIG_BYTES + 1);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const bytesRead = readSync(fd, buffer, offset, buffer.length - offset, offset);
+      if (bytesRead <= 0) break;
+      offset += bytesRead;
+    }
+    if (offset > MAX_NATIVE_CONFIG_BYTES) {
+      throw new Error(`pi-review-gate: the native review-gate config exceeds the ${MAX_NATIVE_CONFIG_BYTES}-byte bound: ${path}`);
+    }
+  } finally {
+    try {
+      closeSync(fd);
+    } catch {
+      // A close failure must not mask bounded validation or native warnings.
+    }
+  }
 }
 
 /** Validate and canonicalize the per-instance workspace (existing directory). */

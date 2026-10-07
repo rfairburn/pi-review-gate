@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, realpathSync, rmSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { chmod, cp, lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import {
@@ -29,7 +28,7 @@ async function makePiFixture(
   prefix = "pi-native-host",
   behavior?: "exit1" | "garbage" | "huge" | "hang",
 ): Promise<PiFixture> {
-  const root = await realpath(await mkdtemp(join(tmpdir(), `${prefix}-`)));
+  const root = await realpath(await mkdtemp(join(process.cwd(), `.${prefix}-`)));
   const bin = join(root, "bin");
   await mkdir(bin, { recursive: true });
   // All fake pi executables are controlled Node-entry fixtures with an
@@ -65,10 +64,10 @@ interface PackageFixture {
 }
 
 async function makePackageFixture(prefix = "pi-native-host-pkg"): Promise<PackageFixture> {
-  const root = await realpath(await mkdtemp(join(tmpdir(), `${prefix}-`)));
+  const root = await realpath(await mkdtemp(join(process.cwd(), `.${prefix}-`)));
   const packageRoot = join(root, "package");
   const bin = join(root, "bin");
-  const agentDir = join(root, "home", ".pi", "agent", "profiles", "alpha");
+  const agentDir = join(root, "home", ".pi", "agent");
   const workspace = join(root, "workspace");
   await Promise.all([
     mkdir(join(packageRoot, "dist", "src", "session-host"), { recursive: true }),
@@ -108,6 +107,7 @@ async function makePackageFixture(prefix = "pi-native-host-pkg"): Promise<Packag
 function baseOptions(
   fixture: PackageFixture,
   overrides: Partial<{
+    nativeSetup: boolean;
     packageRoot: string;
     agentDir: string;
     workspace: string;
@@ -117,6 +117,7 @@ function baseOptions(
   }> = {},
 ): Parameters<typeof prepareNativeLaunch>[0] {
   return {
+    nativeSetup: false,
     packageRoot: fixture.packageRoot,
     agentDir: fixture.agentDir,
     workspace: fixture.workspace,
@@ -221,7 +222,7 @@ test("resolveNativePi rejects shell command strings, metacharacters, and bare PA
     /command string/,
   );
   assert.throws(() => resolveNativePi({ executable: "pi|touch", env: { PATH: fixture.bin } }), /command string/);
-  assert.throws(() => resolveNativePi({ executable: "pi", env: { PATH: "/nonexistent-dir" } }), /was not found on PATH/);
+  assert.throws(() => resolveNativePi({ executable: "pi", env: { PATH: join(fixture.root, "missing-bin") } }), /was not found on PATH/);
 });
 
 test("resolveNativePi fails closed on exit failure, garbage version, oversize output, and timeout", async (t) => {
@@ -397,6 +398,102 @@ test("prepareNativeLaunch validates the profile: local config object and no glob
     false,
     "no fallback config is created or consulted",
   );
+});
+
+test("nativeSetup retains native config, provider environment, resources, and skill locations", async (t) => {
+  const pkg = await makePackageFixture();
+  t.after(() => rm(pkg.root, { recursive: true, force: true }));
+  const nativeEnv = {
+    HOME: join(pkg.root, "home"),
+    PATH: process.env.PATH,
+    PI_CODING_AGENT_DIR: pkg.agentDir,
+    PI_CODING_AGENT_SESSION_DIR: join(pkg.root, "native-sessions"),
+    PI_IMAGE_PROTOCOL: "native-image-selection",
+    PI_REVIEW_GATE_CODEMODE_DEFAULT: "0",
+    PI_REVIEW_GATE_SCHEDULER: "native-scheduler-setting",
+    PI_REVIEW_GATE_DISABLED: "0",
+    PI_PROVIDER_FIXTURE_KEY: "synthetic-provider-value",
+  };
+  const markers = [
+    ["settings.json", "{\"theme\":\"native\"}\n"],
+    ["keybindings.json", "{\"keys\":[]}\n"],
+    ["models.json", "{\"provider\":\"native\"}\n"],
+    ["mcp.json", "{\"servers\":{}}\n"],
+    ["auth.json", "synthetic-fixture-auth-data\n"],
+  ] as const;
+  const originalConfig = await readFile(pkg.configPath);
+  for (const [filename, bytes] of markers) await writeFile(join(pkg.agentDir, filename), bytes, "utf8");
+  const nativeExtension = join(pkg.agentDir, "extensions", "native-extension.js");
+  const nativeSkill = join(pkg.agentDir, "skills", "native-skill", "SKILL.md");
+  const nativeSession = join(pkg.agentDir, "sessions", "saved.jsonl");
+  await Promise.all([
+    mkdir(dirname(nativeExtension), { recursive: true }),
+    mkdir(dirname(nativeSkill), { recursive: true }),
+    mkdir(dirname(nativeSession), { recursive: true }),
+    mkdir(nativeEnv.PI_CODING_AGENT_SESSION_DIR, { recursive: true }),
+  ]);
+  await writeFile(nativeExtension, "native extension marker\n", "utf8");
+  await writeFile(nativeSkill, "native skill marker\n", "utf8");
+  await writeFile(nativeSession, "saved conversation marker\n", "utf8");
+  const sessionMarker = join(nativeEnv.PI_CODING_AGENT_SESSION_DIR, "retained.jsonl");
+  await writeFile(sessionMarker, "native session directory marker\n", "utf8");
+
+  const descriptor = prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeEnv }));
+  assert.equal(descriptor.env.PI_CODING_AGENT_DIR, realpathSync(pkg.agentDir));
+  assert.equal(descriptor.env.PI_REVIEW_GATE_CONFIG, undefined, "normal native config resolution is left to the extension");
+  assert.equal(descriptor.env.PI_CODING_AGENT_SESSION_DIR, nativeEnv.PI_CODING_AGENT_SESSION_DIR);
+  assert.equal(descriptor.env.PI_PROVIDER_FIXTURE_KEY, nativeEnv.PI_PROVIDER_FIXTURE_KEY);
+  assert.equal(descriptor.env.PI_IMAGE_PROTOCOL, "native-image-selection");
+  assert.equal(descriptor.env.PI_REVIEW_GATE_CODEMODE_DEFAULT, "0");
+  assert.equal(descriptor.env.PI_REVIEW_GATE_SCHEDULER, "native-scheduler-setting");
+  assert.equal(descriptor.env.PI_REVIEW_GATE_DISABLED, "0");
+  assert.equal((await readFile(pkg.configPath)).equals(originalConfig), true);
+  for (const [filename, bytes] of markers) {
+    assert.equal((await readFile(join(pkg.agentDir, filename), "utf8")), bytes);
+  }
+  assert.equal(await readFile(nativeExtension, "utf8"), "native extension marker\n");
+  assert.equal(await readFile(nativeSkill, "utf8"), "native skill marker\n");
+  assert.equal(await readFile(nativeSession, "utf8"), "saved conversation marker\n");
+  assert.equal(await readFile(sessionMarker, "utf8"), "native session directory marker\n");
+  for (const skill of NATIVE_SKILL_PUBLISH_PLAN) {
+    assert.equal(existsSync(join(pkg.skillsRoot, skill.name)), false, "native launches do not republish nested profile skills");
+  }
+
+  const overridePath = join(pkg.root, "explicit-native-review-gate.json");
+  const overrideBytes = Buffer.from(JSON.stringify({ enabled: false, marker: "explicit override" }));
+  await writeFile(overridePath, overrideBytes);
+  const overridden = prepareNativeLaunch(baseOptions(pkg, {
+    nativeSetup: true,
+    env: { ...nativeEnv, PI_REVIEW_GATE_CONFIG: overridePath },
+  }));
+  assert.equal(overridden.env.PI_REVIEW_GATE_CONFIG, overridePath, "explicit ordinary config overrides are preserved byte-for-byte");
+  assert.equal((await readFile(overridePath)).equals(overrideBytes), true);
+
+  // Malformed native JSON remains untouched so the ordinary extension loader
+  // can emit its normal recovery warning instead of preparation hiding it.
+  const malformed = Buffer.from("{native-invalid");
+  await writeFile(pkg.configPath, malformed);
+  prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeEnv }));
+  assert.equal((await readFile(pkg.configPath)).equals(malformed), true);
+});
+
+test("nativeSetup supplies only absent ordinary defaults and resolves the native root from its explicit env", async (t) => {
+  const pkg = await makePackageFixture();
+  t.after(() => rm(pkg.root, { recursive: true, force: true }));
+  const descriptor = prepareNativeLaunch(baseOptions(pkg, {
+    nativeSetup: true,
+    env: {
+      HOME: join(pkg.root, "home"),
+      PATH: process.env.PATH,
+      PI_CODING_AGENT_DIR: pkg.agentDir,
+      PI_IMAGE_PROTOCOL: "",
+      PI_REVIEW_GATE_CODEMODE_DEFAULT: undefined,
+    },
+  }));
+  assert.equal(descriptor.env.PI_IMAGE_PROTOCOL, "", "an explicit empty value is not replaced");
+  assert.equal(descriptor.env.PI_REVIEW_GATE_CODEMODE_DEFAULT, "1");
+  assert.equal(descriptor.env.PI_REVIEW_GATE_CONFIG, undefined);
+  assert.equal(existsSync(pkg.skillsRoot), false);
 });
 
 test("prepareNativeLaunch enforces the bounded config size cap", async (t) => {
@@ -649,7 +746,7 @@ test("the alpha rejects native/SEA pi binaries fail-closed in resolution and pre
 test("resolveNativePi ignores-SIGTERM wrappers fail within the bounded probe window (SIGKILL terminate)", (t) => {
   // The owned Node process ignores SIGTERM itself; the probe's non-ignorable
   // SIGKILL must end that exact process within the bounded window.
-  const bin = resolve(join(tmpdir(), `pi-native-host-sigterm-${process.pid}-${Date.now()}`));
+  const bin = resolve(join(process.cwd(), `.pi-native-host-sigterm-${process.pid}-${Date.now()}`));
   mkdirSync(bin, { recursive: true });
   t.after(() => rmSync(bin, { recursive: true, force: true }));
   const fake = join(bin, "pi");
@@ -668,7 +765,7 @@ test("resolveNativePi ignores-SIGTERM wrappers fail within the bounded probe win
 });
 
 test("resolveNativePi resolves explicit executable paths under directories with spaces, quotes, and parentheses", (t) => {
-  const rawBase = resolve(join(tmpdir(), `pi-native-host-spq-${process.pid}-${Date.now()}`));
+  const rawBase = resolve(join(process.cwd(), `.pi-native-host-spq-${process.pid}-${Date.now()}`));
   mkdirSync(rawBase);
   const base = realpathSync(rawBase);
   const dir = join(base, "pi tool dir (alpha) with 'quotes' & spaces");
@@ -795,10 +892,10 @@ test("prepareNativeLaunch republishes a symlink leaf whose target is byte-identi
 test("prepareNativeLaunch validates caller paths even though the caller passes pre-validated values", async (t) => {
   const pkg = await makePackageFixture();
   t.after(() => rm(pkg.root, { recursive: true, force: true }));
-  assert.throws(() => prepareNativeLaunch(baseOptions(pkg, { workspace: "/nonexistent-workspace-dir" })), /workspace is not a directory/);
-  assert.throws(() => prepareNativeLaunch(baseOptions(pkg, { agentDir: "/nonexistent-agent-dir" })), /profile registry owns its creation/);
-  assert.throws(() => prepareNativeLaunch(baseOptions(pkg, { piExecutable: "/nonexistent/pi" })), /executable regular file/);
-  assert.throws(() => prepareNativeLaunch(baseOptions(pkg, { packageRoot: "/nonexistent-package-root" })), /package root/);
+  assert.throws(() => prepareNativeLaunch(baseOptions(pkg, { workspace: join(pkg.root, "missing-workspace") })), /workspace is not a directory/);
+  assert.throws(() => prepareNativeLaunch(baseOptions(pkg, { agentDir: join(pkg.root, "missing-agent-dir") })), /selected registry owns its setup/);
+  assert.throws(() => prepareNativeLaunch(baseOptions(pkg, { piExecutable: join(pkg.root, "missing-bin", "pi") })), /executable regular file/);
+  assert.throws(() => prepareNativeLaunch(baseOptions(pkg, { packageRoot: join(pkg.root, "missing-package-root") })), /package root/);
 });
 
 test("publication genuinely uses the shipped launcher helper's production rename implementation", () => {
@@ -912,7 +1009,7 @@ test("resolveNativePi rejects noisy, pre-release, and multi-number --version out
 });
 
 test("resolveNativePi rejects unreadable, unknown, and opaque non-Node entries before probing", async (t) => {
-  const rawBase = resolve(join(tmpdir(), `pi-native-host-head-${process.pid}-${Date.now()}`));
+  const rawBase = resolve(join(process.cwd(), `.pi-native-host-head-${process.pid}-${Date.now()}`));
   mkdirSync(rawBase, { recursive: true });
   const root = realpathSync(rawBase);
   t.after(() => rmSync(rawBase, { recursive: true, force: true }));
@@ -1193,10 +1290,10 @@ test("prepareNativeLaunch rejects a nonempty inherited session-dir env override 
   const pkg = await makePackageFixture();
   t.after(() => rm(pkg.root, { recursive: true, force: true }));
   assert.throws(
-    () => prepareNativeLaunch(baseOptions(pkg, { env: { PATH: process.env.PATH, PI_CODING_AGENT_SESSION_DIR: "/private/storage" } })),
+    () => prepareNativeLaunch(baseOptions(pkg, { env: { PATH: process.env.PATH, PI_CODING_AGENT_SESSION_DIR: join(pkg.root, "private-storage") } })),
     (error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
-      return message.includes("PI_CODING_AGENT_SESSION_DIR") && !message.includes("/private/storage");
+      return message.includes("PI_CODING_AGENT_SESSION_DIR") && !message.includes(join(pkg.root, "private-storage"));
     },
   );
   assert.equal(existsSync(pkg.skillsRoot), false, "no skill publication for a rejected session-dir override");
@@ -1244,15 +1341,18 @@ function removeOwnedFixtureTree(root: string, files: string[], dirsLeafToRoot: s
 
 test("the startup options helper resolves only the own compiled package scripts (no ancestor fallback)", async (t) => {
   const compiledLaunch = join(process.cwd(), "dist-test", "src", "session-host", "launch.js");
+  const compiledConfigPath = join(process.cwd(), "dist-test", "src", "config-path.js");
   assert.ok(existsSync(compiledLaunch), "the compiled launch module under test must exist");
+  assert.ok(existsSync(compiledConfigPath), "the compiled native config-path helper must exist");
 
   // Tree A: the own package scripts/ is missing, but a MALICIOUS ancestor
   // scripts/ helper exists. The loader must reject fail-closed without ever
   // loading it (no profile/skills work runs before the helper gate).
-  const rootA = await realpath(await mkdtemp(join(tmpdir(), "pi-native-host-anchor-a-")));
+  const rootA = await realpath(await mkdtemp(join(process.cwd(), ".pi-native-host-anchor-a-")));
   const markerA = join(rootA, "parent-helper-loaded");
   t.after(() => removeOwnedFixtureTree(rootA, [
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "launch.js"),
+    join(rootA, "node_modules", "pi-review-gate", "dist", "src", "config-path.js"),
     join(rootA, "scripts", "session-host-startup-options.cjs"),
     markerA,
   ], [
@@ -1268,6 +1368,7 @@ test("the startup options helper resolves only the own compiled package scripts 
   const distA = join(pkgA, "dist", "src", "session-host");
   await mkdir(distA, { recursive: true });
   await cp(compiledLaunch, join(distA, "launch.js"));
+  await cp(compiledConfigPath, join(pkgA, "dist", "src", "config-path.js"));
   await mkdir(join(rootA, "scripts"), { recursive: true });
   await writeFile(
     join(rootA, "scripts", "session-host-startup-options.cjs"),
@@ -1276,7 +1377,7 @@ test("the startup options helper resolves only the own compiled package scripts 
   );
   const launchA = require(join(distA, "launch.js")) as CompiledLaunchModule;
   assert.throws(
-    () => launchA.prepareNativeLaunch({ packageRoot: pkgA, agentDir: "/nonexistent-agent-dir", workspace: "/nonexistent-workspace", piExecutable: "/nonexistent/pi", args: [] }),
+    () => launchA.prepareNativeLaunch({ packageRoot: pkgA, agentDir: join(pkgA, "missing-agent-dir"), workspace: join(pkgA, "missing-workspace"), piExecutable: join(pkgA, "missing-bin", "pi"), args: [] }),
     (error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       // Bounded diagnostic: fixed filename only, never the fixture path.
@@ -1286,9 +1387,10 @@ test("the startup options helper resolves only the own compiled package scripts 
   assert.equal(existsSync(markerA), false, "an ancestor scripts/ helper is never loaded");
 
   // Tree B: the own scripts/ is present -> the helper loads and admission runs.
-  const rootB = await realpath(await mkdtemp(join(tmpdir(), "pi-native-host-anchor-b-")));
+  const rootB = await realpath(await mkdtemp(join(process.cwd(), ".pi-native-host-anchor-b-")));
   t.after(() => removeOwnedFixtureTree(rootB, [
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "launch.js"),
+    join(rootB, "node_modules", "pi-review-gate", "dist", "src", "config-path.js"),
     join(rootB, "node_modules", "pi-review-gate", "scripts", "session-host-startup-options.cjs"),
   ], [
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host"),
@@ -1303,11 +1405,12 @@ test("the startup options helper resolves only the own compiled package scripts 
   const distB = join(pkgB, "dist", "src", "session-host");
   await mkdir(distB, { recursive: true });
   await cp(compiledLaunch, join(distB, "launch.js"));
+  await cp(compiledConfigPath, join(pkgB, "dist", "src", "config-path.js"));
   await mkdir(join(pkgB, "scripts"), { recursive: true });
   await cp(join(process.cwd(), "scripts", "session-host-startup-options.cjs"), join(pkgB, "scripts", "session-host-startup-options.cjs"));
   const launchB = require(join(distB, "launch.js")) as CompiledLaunchModule;
   assert.throws(
-    () => launchB.prepareNativeLaunch({ packageRoot: pkgB, agentDir: "/nonexistent-agent-dir", workspace: "/nonexistent-workspace", piExecutable: "/nonexistent/pi", args: ["--session", "/tmp/old.jsonl"] }),
+    () => launchB.prepareNativeLaunch({ packageRoot: pkgB, agentDir: join(pkgB, "missing-agent-dir"), workspace: join(pkgB, "missing-workspace"), piExecutable: join(pkgB, "missing-bin", "pi"), args: ["--session", "/tmp/old.jsonl"] }),
     /startup override is not accepted: --session/,
   );
 });

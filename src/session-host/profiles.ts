@@ -1,9 +1,12 @@
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
+  chmodSync,
   closeSync,
   constants as fsConstants,
   fstatSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -11,14 +14,22 @@ import {
   readSync,
   realpathSync,
   statSync,
+  unlinkSync,
   writeSync,
 } from "node:fs";
-import { PI_AGENT_DIR_ENV, REVIEW_GATE_CONFIG_FILENAME, piAgentDir } from "../config-path";
+import {
+  PI_AGENT_DIR_ENV,
+  REVIEW_GATE_CONFIG_FILENAME,
+  piAgentConfigPath,
+  piAgentDir,
+  reviewGateConfigCandidates,
+  resolveConfigPathResolution,
+} from "../config-path";
 
 /**
- * Independent workspace/profile admission for session-host instances (issue 323
- * follow-up): each launched session-host process owns one explicitly selected
- * canonical workspace and one independent native Pi agent directory.
+ * Legacy independent workspace/profile admission for internal compatibility
+ * and focused tests. Production session-host integration must use
+ * NativeAgentRegistry so host children share ordinary native Pi setup.
  *
  * Design boundaries:
  *
@@ -88,7 +99,7 @@ export const PROFILE_MUTABLE_CONFIG_FILENAMES = [
   "mcp.json",
 ] as const;
 
-/** Exact byte content written to a newly created profile's review-gate.json. */
+/** Exact ordinary zero-model bytes used for a new legacy profile or absent native default config. */
 export const DEFAULT_REVIEW_GATE_CONFIG_JSON = `{
   "enabled": true,
   "review": {
@@ -111,13 +122,13 @@ const PROFILES_DIRNAME = "profiles";
 /** Prefix for generated profile directories (completed by `mkdtempSync`). */
 const PROFILE_DIR_PREFIX = "session-host-";
 
-/** A profile admitted by {@linkcode ProfileRegistry.prepare}. */
+/** One admission returned by either profile registry implementation. */
 export interface PreparedProfile {
   /** Canonical real path of the explicitly selected workspace directory. */
   workspace: string;
-  /** Canonical real path of the profile's independent native agent directory. */
+  /** Canonical real path of the shared native root or legacy private profile. */
   agentDir: string;
-  /** True when this call created a brand-new private profile directory. */
+  /** True only when the legacy registry created a brand-new private profile. */
   created: boolean;
   /** Remove this admission from the registry's active set. Idempotent. */
   release: () => void;
@@ -135,21 +146,44 @@ export interface ProfileRegistryOptions {
 export interface PrepareProfileOptions {
   /** Workspace directory the launched instance will operate in. */
   workspace: string;
-  /**
-   * Existing user-chosen profile directory serving as the instance's native
-   * agent directory. When omitted, a brand-new private profile is created
-   * under `<stateRoot>/profiles` (an empty string is treated the same as
-   * omitted).
-   */
+  /** Legacy-only explicit profile directory. NativeAgentRegistry rejects it. */
   profile?: string;
 }
 
+/** Structural contract consumed by InstanceManager; production must inject NativeAgentRegistry. */
+export interface ProfilePreparer {
+  prepare(options: PrepareProfileOptions): PreparedProfile;
+}
+
+export interface NativeAgentRegistryOptions {
+  /**
+   * Snapshot of the parent Main environment used for Pi-native path
+   * resolution. Production Main must pass its captured environment here.
+   */
+  env?: NodeJS.ProcessEnv;
+}
+
+/** Use the parent's home-related environment snapshot for Pi's native path helpers. */
+function configResolutionForEnv(env: NodeJS.ProcessEnv): ReturnType<typeof resolveConfigPathResolution> {
+  const homeDir = process.platform === "win32"
+    ? env.USERPROFILE ?? env.HOME
+    : env.HOME;
+  return resolveConfigPathResolution(homeDir === undefined ? {} : { homeDir });
+}
+
 /**
- * Default state root: Pi's native agent directory plus `session-host`,
- * honoring `PI_CODING_AGENT_DIR` with Pi's native semantics.
+ * Canonical existing native Pi agent directory resolved with Pi's own local
+ * path helper. This honors `PI_CODING_AGENT_DIR` (including native tilde and
+ * Windows shell-path semantics) without consulting an unrelated process env
+ * when the caller supplied a snapshot.
  */
+export function nativePiAgentDir(env: NodeJS.ProcessEnv = process.env): string {
+  return resolveExistingDirectory(piAgentDir(env, configResolutionForEnv(env)), "native Pi agent directory");
+}
+
+/** Default state root for the legacy generated-profile registry. */
 export function defaultProfileStateRoot(env: NodeJS.ProcessEnv = process.env): string {
-  return join(piAgentDir(env), "session-host");
+  return join(piAgentDir(env, configResolutionForEnv(env)), "session-host");
 }
 
 /**
@@ -427,11 +461,12 @@ function isSameOrInside(parent: string, candidate: string): boolean {
 }
 
 /**
- * Registry of active session-host profile admissions. Synchronous by design:
- * state is a bounded in-memory map of active rows only, with no persistent
- * catalogs, background processes, or locks.
+ * Legacy registry of active session-host profile admissions. Synchronous by
+ * design: state is a bounded in-memory map of active rows only, with no
+ * persistent catalogs, background processes, or locks. Do not use as the
+ * production Main default; inject NativeAgentRegistry instead.
  */
-export class ProfileRegistry {
+export class ProfileRegistry implements ProfilePreparer {
   readonly #active = new Map<string, ActiveAdmission>();
   readonly #stateRoot: string;
 
@@ -583,6 +618,172 @@ export class ProfileRegistry {
         }
       },
     };
+  }
+}
+
+/**
+ * Production native agent-directory admissions. Every child shares Pi's
+ * ordinary agent directory; only its process, workspace, conversation and
+ * input ownership are per-instance. This registry never creates profile
+ * directories, copies resources, scans processes, or rejects sibling
+ * admissions that intentionally share the native root.
+ *
+ * `ProfileRegistry` remains available for compatibility and focused legacy
+ * tests, but production Main must inject this registry rather than relying on
+ * a fresh-profile default.
+ */
+export class NativeAgentRegistry implements ProfilePreparer {
+  readonly #env: NodeJS.ProcessEnv;
+  readonly #agentDir: string;
+
+  constructor(options: NativeAgentRegistryOptions = {}) {
+    this.#env = { ...(options.env ?? process.env) };
+    this.#agentDir = nativePiAgentDir(this.#env);
+  }
+
+  /** The common canonical Pi-native root used by every admission. */
+  get agentDir(): string {
+    return this.#agentDir;
+  }
+
+  /** Admit one workspace against the shared native setup; release is idempotent and non-destructive. */
+  prepare(options: PrepareProfileOptions): PreparedProfile {
+    if (options.profile !== undefined && options.profile !== "") {
+      throw new Error("session-host: per-instance profiles are not supported; children use the native Pi agent directory");
+    }
+    const workspace = resolveExistingDirectory(options.workspace, "workspace");
+    if (workspace === this.#agentDir) {
+      throw new Error(
+        `session-host: native Pi agent directory ${this.#agentDir} must not be the workspace; native agent state is never the workspace`,
+      );
+    }
+
+    ensureNativeReviewGateConfig(this.#agentDir, workspace, this.#env);
+
+    return {
+      workspace,
+      agentDir: this.#agentDir,
+      created: false,
+      // There is no exclusive native-root admission to release. Keep the
+      // compatible no-op hook without mutating shared setup.
+      release: () => undefined,
+    };
+  }
+}
+
+/**
+ * Ensure ordinary launcher config setup without changing existing native
+ * configuration. Explicit overrides and the XDG fallback retain normal
+ * precedence; only when every candidate is genuinely absent is the ordinary
+ * zero-model default atomically published at the native agent root.
+ */
+function ensureNativeReviewGateConfig(agentDir: string, workspace: string, env: NodeJS.ProcessEnv): void {
+  const resolution = configResolutionForEnv(env);
+  const explicit = env.PI_REVIEW_GATE_CONFIG;
+  if (explicit) {
+    const path = isAbsolute(explicit) ? explicit : resolve(workspace, explicit);
+    if (nativeConfigEntryExists(path)) validateNativeConfigEntry(path);
+    return;
+  }
+
+  for (const candidate of reviewGateConfigCandidates(env, resolution)) {
+    if (nativeConfigEntryExists(candidate)) {
+      validateNativeConfigEntry(candidate);
+      return;
+    }
+  }
+  // piAgentConfigPath is the ordinary primary location. Use the canonical
+  // root for publication so a relative/symlinked spelling cannot redirect a
+  // child (whose cwd is the workspace) to a different directory.
+  const primary = piAgentConfigPath({ ...env, [PI_AGENT_DIR_ENV]: agentDir }, resolution);
+  if (resolve(primary) !== resolve(join(agentDir, REVIEW_GATE_CONFIG_FILENAME))) {
+    throw new Error("session-host: native review-gate config path did not resolve to the admitted Pi agent directory");
+  }
+  publishDefaultNativeConfig(join(agentDir, REVIEW_GATE_CONFIG_FILENAME));
+}
+
+function nativeConfigEntryExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return false;
+    throw new Error(`session-host: native review-gate config ${path} could not be inspected (${code ?? "unknown error"})`);
+  }
+}
+
+/** Validate bounded regular-file access, but leave JSON recovery/warnings to the native extension. */
+function validateNativeConfigEntry(path: string): void {
+  let handle: number;
+  try {
+    handle = openSync(path, boundedReadOpenFlags);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "unknown error";
+    throw new Error(`session-host: native review-gate config ${path} is present but not a readable regular file (${code})`);
+  }
+  try {
+    const stats = fstatSync(handle);
+    if (!stats.isFile()) {
+      throw new Error(`session-host: native review-gate config ${path} is not a regular file`);
+    }
+    if (stats.size > MAX_PROFILE_CONFIG_BYTES) {
+      throw new Error(`session-host: native review-gate config ${path} exceeds the ${MAX_PROFILE_CONFIG_BYTES}-byte read limit`);
+    }
+    const { bytesRead } = readBoundedDescriptorSync(handle, MAX_PROFILE_CONFIG_BYTES);
+    if (bytesRead > MAX_PROFILE_CONFIG_BYTES) {
+      throw new Error(`session-host: native review-gate config ${path} exceeds the ${MAX_PROFILE_CONFIG_BYTES}-byte read limit`);
+    }
+  } finally {
+    try {
+      closeSync(handle);
+    } catch {
+      // Closing a checked read must not mask its validation result.
+    }
+  }
+}
+
+/** Publish only the absent ordinary default; link(2) makes concurrent setup non-clobbering. */
+function publishDefaultNativeConfig(configPath: string): void {
+  const directory = dirname(configPath);
+  const temporaryPath = join(directory, `.review-gate.json.${randomUUID()}.tmp`);
+  let handle: number | undefined;
+  try {
+    handle = openSync(temporaryPath, "wx", 0o600);
+    const payload = Buffer.from(DEFAULT_REVIEW_GATE_CONFIG_JSON, "utf8");
+    let written = 0;
+    while (written < payload.length) {
+      const count = writeSync(handle, payload, written, payload.length - written, written);
+      if (count <= 0) throw new Error("default config write returned no bytes");
+      written += count;
+    }
+    chmodSync(temporaryPath, 0o600);
+    closeSync(handle);
+    handle = undefined;
+    try {
+      linkSync(temporaryPath, configPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      // A concurrent ordinary launch won. Never overwrite it; validate its
+      // file type/size while leaving parsing and diagnostics to native Pi.
+      validateNativeConfigEntry(configPath);
+    }
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "unknown error";
+    throw new Error(`session-host: could not initialize absent native review-gate config ${configPath} (${code})`);
+  } finally {
+    if (handle !== undefined) {
+      try {
+        closeSync(handle);
+      } catch {
+        // Best-effort close of our unpublished temporary file.
+      }
+    }
+    try {
+      unlinkSync(temporaryPath);
+    } catch {
+      // Best-effort cleanup is scoped to this unique file created with wx.
+    }
   }
 }
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import fs, { chmodSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, lstatSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import fs, { chmodSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, lstatSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { dirname, join, relative, resolve } from "node:path";
 import test from "node:test";
@@ -90,6 +90,59 @@ function expectError(fn: () => unknown, ...substrings: string[]): Error {
     );
   }
   return error;
+}
+
+interface OwnedFixtureFile {
+  path: string;
+  dev: bigint;
+  ino: bigint;
+}
+
+function ownedFixtureFileFromPath(path: string): OwnedFixtureFile {
+  const stats = lstatSync(path, { bigint: true });
+  assert.ok(stats.isFile(), `expected owned fixture file ${path} to be regular`);
+  return { path, dev: stats.dev, ino: stats.ino };
+}
+
+function ownedFixtureFileFromDescriptor(path: string, fd: number): OwnedFixtureFile {
+  const stats = fs.fstatSync(fd, { bigint: true });
+  assert.ok(stats.isFile(), `expected owned fixture descriptor for ${path} to be regular`);
+  return { path, dev: stats.dev, ino: stats.ino };
+}
+
+function removeOwnedFixtureFile(file: OwnedFixtureFile | undefined): void {
+  if (file === undefined) return;
+  try {
+    const current = lstatSync(file.path, { bigint: true });
+    if (current.isFile() && current.dev === file.dev && current.ino === file.ino) {
+      unlinkSync(file.path);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+function removeEmptyFixtureDirectory(path: string): void {
+  try {
+    rmdirSync(path);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "ENOTEMPTY" && code !== "EEXIST") throw error;
+  }
+}
+
+/** Remove only positively identified fixture files, then known empty directories; unexpected entries survive. */
+function cleanupNativeTempTestRoot(root: string, ownedFiles: Array<OwnedFixtureFile | undefined>): void {
+  for (const file of ownedFiles) removeOwnedFixtureFile(file);
+  for (const directory of [
+    join(root, "home", ".pi", "agent"),
+    join(root, "home", ".pi"),
+    join(root, "home"),
+    join(root, "workspace"),
+    root,
+  ]) {
+    removeEmptyFixtureDirectory(directory);
+  }
 }
 
 test("default profile state root follows the native Pi agent directory", () => {
@@ -183,9 +236,231 @@ test("NativeAgentRegistry preserves native config fallback and initializes only 
     const primary = join(agentDir, "review-gate.json");
     assert.equal(readFileSync(primary, "utf8"), DEFAULT_REVIEW_GATE_CONFIG_JSON);
     assert.equal(statSync(primary).mode & 0o777, 0o600);
+    assert.deepEqual(readdirSync(agentDir), ["review-gate.json"], "successful publication removes its owned temporary file");
     initialized.release();
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("native default temp collision preserves the unknown file and its permissions", (t) => {
+  const root = makeTestRoot("native-temp-collision");
+  const agentDir = join(root, "home", ".pi", "agent");
+  const workspace = join(root, "workspace");
+  mkdirSync(agentDir, { recursive: true });
+  mkdirSync(workspace);
+  const primary = join(agentDir, "review-gate.json");
+  const unknownBytes = Buffer.from("unknown collided temporary file\n", "utf8");
+  let collisionPath: string | undefined;
+  let collisionMode: number | undefined;
+  let collisionFile: OwnedFixtureFile | undefined;
+  const originalOpenSync = fs.openSync.bind(fs) as (
+    path: fs.PathOrFileDescriptor,
+    flags?: string | number,
+    mode?: fs.Mode,
+  ) => number;
+  const originalWriteSync = fs.writeSync.bind(fs);
+  const originalCloseSync = fs.closeSync.bind(fs);
+  try {
+    t.mock.method(
+      fs,
+      "openSync",
+      ((path: fs.PathOrFileDescriptor, flags?: string | number, mode?: fs.Mode): number => {
+        if (
+          typeof path === "string" &&
+          path.startsWith(join(agentDir, ".review-gate.json.")) &&
+          path.endsWith(".tmp") &&
+          flags === "wx" &&
+          collisionPath === undefined
+        ) {
+          collisionPath = path;
+          const fd = originalOpenSync(path, "wx", 0o640);
+          originalWriteSync(fd, unknownBytes, 0, unknownBytes.length, 0);
+          originalCloseSync(fd);
+          chmodSync(path, 0o640);
+          collisionMode = statSync(path).mode & 0o777;
+          collisionFile = ownedFixtureFileFromPath(path);
+        }
+        return originalOpenSync(path, flags as string | number | undefined, mode as fs.Mode | undefined);
+      }) as unknown as typeof fs.openSync,
+    );
+
+    const registry = new NativeAgentRegistry({ env: { HOME: join(root, "home") } });
+    expectError(() => registry.prepare({ workspace }), "could not initialize absent native review-gate config", "(EEXIST)");
+    assert.ok(collisionPath !== undefined, "the exclusive-open collision was exercised");
+    assert.equal(readFileSync(collisionPath).equals(unknownBytes), true, "unknown bytes survive the collision");
+    assert.equal(statSync(collisionPath).mode & 0o777, collisionMode, "unknown permissions survive the collision");
+    assert.equal(fs.existsSync(primary), false, "a collided temporary file is never published");
+  } finally {
+    t.mock.restoreAll();
+    cleanupNativeTempTestRoot(root, [collisionFile]);
+  }
+});
+
+test("native default replacement is neither published nor removed", (t) => {
+  const root = makeTestRoot("native-temp-replaced");
+  const agentDir = join(root, "home", ".pi", "agent");
+  const workspace = join(root, "workspace");
+  mkdirSync(agentDir, { recursive: true });
+  mkdirSync(workspace);
+  const primary = join(agentDir, "review-gate.json");
+  const replacementBytes = Buffer.from("replacement file supplied during initialization\n", "utf8");
+  const displacedOwnedFile = join(root, "displaced-owned-temporary.tmp");
+  let temporaryPath: string | undefined;
+  let ownedTemporaryFile: OwnedFixtureFile | undefined;
+  let replacementFile: OwnedFixtureFile | undefined;
+  let replacementMode: number | undefined;
+  let replaced = false;
+  const originalOpenSync = fs.openSync.bind(fs) as (
+    path: fs.PathOrFileDescriptor,
+    flags?: string | number,
+    mode?: fs.Mode,
+  ) => number;
+  const originalWriteSync = fs.writeSync.bind(fs);
+  const originalCloseSync = fs.closeSync.bind(fs);
+  try {
+    t.mock.method(
+      fs,
+      "openSync",
+      ((path: fs.PathOrFileDescriptor, flags?: string | number, mode?: fs.Mode): number => {
+        if (
+          typeof path === "string" &&
+          path.startsWith(join(agentDir, ".review-gate.json.")) &&
+          path.endsWith(".tmp") &&
+          flags === "wx"
+        ) {
+          temporaryPath = path;
+          const fd = originalOpenSync(path, flags, mode);
+          ownedTemporaryFile = ownedFixtureFileFromDescriptor(path, fd);
+          return fd;
+        }
+        return originalOpenSync(path, flags as string | number | undefined, mode as fs.Mode | undefined);
+      }) as unknown as typeof fs.openSync,
+    );
+    t.mock.method(
+      fs,
+      "writeSync",
+      ((fd: number, buffer: Buffer, offset: number, length: number, position: number): number => {
+        const count = originalWriteSync(fd, buffer, offset, length, position);
+        if (!replaced) {
+          assert.ok(temporaryPath !== undefined, "the owned temporary path was captured before writing");
+          assert.ok(ownedTemporaryFile !== undefined, "the created temporary file identity was captured");
+          renameSync(temporaryPath, displacedOwnedFile);
+          ownedTemporaryFile = { ...ownedTemporaryFile, path: displacedOwnedFile };
+          const replacementFd = originalOpenSync(temporaryPath, "wx", 0o644);
+          originalWriteSync(replacementFd, replacementBytes, 0, replacementBytes.length, 0);
+          originalCloseSync(replacementFd);
+          chmodSync(temporaryPath, 0o644);
+          replacementMode = statSync(temporaryPath).mode & 0o777;
+          replacementFile = ownedFixtureFileFromPath(temporaryPath);
+          replaced = true;
+        }
+        return count;
+      }) as unknown as typeof fs.writeSync,
+    );
+
+    const registry = new NativeAgentRegistry({ env: { HOME: join(root, "home") } });
+    expectError(() => registry.prepare({ workspace }), "could not initialize absent native review-gate config", "(ESTALE)");
+    assert.equal(replaced, true, "the pathname was replaced after exclusive creation");
+    assert.ok(temporaryPath !== undefined);
+    assert.equal(readFileSync(temporaryPath).equals(replacementBytes), true, "replacement bytes survive failed publication and cleanup");
+    assert.equal(statSync(temporaryPath).mode & 0o777, replacementMode, "replacement permissions are unchanged");
+    assert.equal(readFileSync(displacedOwnedFile, "utf8"), DEFAULT_REVIEW_GATE_CONFIG_JSON);
+    assert.equal(fs.existsSync(primary), false, "the replaced pathname is not published");
+  } finally {
+    t.mock.restoreAll();
+    cleanupNativeTempTestRoot(root, [ownedTemporaryFile, replacementFile]);
+  }
+});
+
+test("native default failed writes clean only the owned temporary file and retain the write error", (t) => {
+  const root = makeTestRoot("native-temp-write-failure");
+  const agentDir = join(root, "home", ".pi", "agent");
+  const workspace = join(root, "workspace");
+  mkdirSync(agentDir, { recursive: true });
+  mkdirSync(workspace);
+  const primary = join(agentDir, "review-gate.json");
+  let temporaryPath: string | undefined;
+  let ownedTemporaryFile: OwnedFixtureFile | undefined;
+  const originalOpenSync = fs.openSync.bind(fs) as (
+    path: fs.PathOrFileDescriptor,
+    flags?: string | number,
+    mode?: fs.Mode,
+  ) => number;
+  const originalWriteSync = fs.writeSync.bind(fs);
+  try {
+    t.mock.method(
+      fs,
+      "openSync",
+      ((path: fs.PathOrFileDescriptor, flags?: string | number, mode?: fs.Mode): number => {
+        if (
+          typeof path === "string" &&
+          path.startsWith(join(agentDir, ".review-gate.json.")) &&
+          path.endsWith(".tmp") &&
+          flags === "wx"
+        ) {
+          temporaryPath = path;
+          const fd = originalOpenSync(path, flags, mode);
+          ownedTemporaryFile = ownedFixtureFileFromDescriptor(path, fd);
+          return fd;
+        }
+        return originalOpenSync(path, flags as string | number | undefined, mode as fs.Mode | undefined);
+      }) as unknown as typeof fs.openSync,
+    );
+    t.mock.method(
+      fs,
+      "writeSync",
+      ((fd: number, buffer: Buffer, offset: number, length: number, position: number): number => {
+        originalWriteSync(fd, buffer, offset, Math.min(length, 8), position);
+        throw Object.assign(new Error("controlled native default write failure"), { code: "EIO" });
+      }) as unknown as typeof fs.writeSync,
+    );
+
+    const registry = new NativeAgentRegistry({ env: { HOME: join(root, "home") } });
+    expectError(() => registry.prepare({ workspace }), "could not initialize absent native review-gate config", "(EIO)");
+    assert.ok(temporaryPath !== undefined, "the created temporary pathname was captured");
+    assert.equal(fs.existsSync(temporaryPath), false, "the owned failed-write temporary file is cleaned");
+    assert.equal(fs.existsSync(primary), false, "a failed write is not published");
+  } finally {
+    t.mock.restoreAll();
+    cleanupNativeTempTestRoot(root, [ownedTemporaryFile]);
+  }
+});
+
+test("native default concurrent primary creation remains no-clobber", (t) => {
+  const root = makeTestRoot("native-primary-race");
+  const agentDir = join(root, "home", ".pi", "agent");
+  const workspace = join(root, "workspace");
+  mkdirSync(agentDir, { recursive: true });
+  mkdirSync(workspace);
+  const primary = join(agentDir, "review-gate.json");
+  const concurrentBytes = Buffer.from("{\"enabled\":false,\"owner\":\"concurrent-launch\"}\n", "utf8");
+  let concurrentMode: number | undefined;
+  let concurrentFile: OwnedFixtureFile | undefined;
+  const originalLinkSync = fs.linkSync.bind(fs);
+  try {
+    t.mock.method(
+      fs,
+      "linkSync",
+      ((existingPath: fs.PathLike, newPath: fs.PathLike): void => {
+        if (newPath === primary) {
+          writeFileSync(primary, concurrentBytes, { mode: 0o640 });
+          concurrentMode = statSync(primary).mode & 0o777;
+          concurrentFile = ownedFixtureFileFromPath(primary);
+        }
+        originalLinkSync(existingPath, newPath);
+      }) as unknown as typeof fs.linkSync,
+    );
+
+    const registry = new NativeAgentRegistry({ env: { HOME: join(root, "home") } });
+    const prepared = registry.prepare({ workspace });
+    assert.equal(readFileSync(primary).equals(concurrentBytes), true, "the concurrent primary is preserved byte-for-byte");
+    assert.equal(statSync(primary).mode & 0o777, concurrentMode, "the concurrent primary permissions are preserved");
+    assert.deepEqual(readdirSync(agentDir), ["review-gate.json"], "the owned losing temporary file is removed");
+    prepared.release();
+  } finally {
+    t.mock.restoreAll();
+    cleanupNativeTempTestRoot(root, [concurrentFile]);
   }
 });
 

@@ -2,9 +2,9 @@ import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
-  chmodSync,
   closeSync,
   constants as fsConstants,
+  fchmodSync,
   fstatSync,
   linkSync,
   lstatSync,
@@ -743,13 +743,48 @@ function validateNativeConfigEntry(path: string): void {
   }
 }
 
+/** Identity of the regular file exclusively created for a native default config. */
+interface NativeTemporaryFileIdentity {
+  dev: bigint;
+  ino: bigint;
+  type: "regular-file";
+}
+
+/**
+ * Check the pathname without following symlinks; only the original regular
+ * file is ours to remove or publish. These checks are not syscall-atomic
+ * against a malicious same-user filesystem race.
+ */
+function hasNativeTemporaryFileIdentity(path: string, identity: NativeTemporaryFileIdentity): boolean {
+  try {
+    const stats = lstatSync(path, { bigint: true });
+    return identity.type === "regular-file" && stats.isFile() && stats.dev === identity.dev && stats.ino === identity.ino;
+  } catch {
+    return false;
+  }
+}
+
+function changedNativeTemporaryFileError(): NodeJS.ErrnoException {
+  return Object.assign(new Error("native default config temporary pathname no longer identifies the created regular file"), {
+    code: "ESTALE",
+  });
+}
+
 /** Publish only the absent ordinary default; link(2) makes concurrent setup non-clobbering. */
 function publishDefaultNativeConfig(configPath: string): void {
   const directory = dirname(configPath);
   const temporaryPath = join(directory, `.review-gate.json.${randomUUID()}.tmp`);
   let handle: number | undefined;
+  let ownedIdentity: NativeTemporaryFileIdentity | undefined;
   try {
     handle = openSync(temporaryPath, "wx", 0o600);
+    const createdStats = fstatSync(handle, { bigint: true });
+    if (!createdStats.isFile()) throw changedNativeTemporaryFileError();
+    ownedIdentity = { dev: createdStats.dev, ino: createdStats.ino, type: "regular-file" };
+    if (!hasNativeTemporaryFileIdentity(temporaryPath, ownedIdentity)) {
+      throw changedNativeTemporaryFileError();
+    }
+
     const payload = Buffer.from(DEFAULT_REVIEW_GATE_CONFIG_JSON, "utf8");
     let written = 0;
     while (written < payload.length) {
@@ -757,9 +792,19 @@ function publishDefaultNativeConfig(configPath: string): void {
       if (count <= 0) throw new Error("default config write returned no bytes");
       written += count;
     }
-    chmodSync(temporaryPath, 0o600);
+    // chmod the exclusively opened inode, never whatever may now occupy its pathname.
+    fchmodSync(handle, 0o600);
+    if (!hasNativeTemporaryFileIdentity(temporaryPath, ownedIdentity)) {
+      throw changedNativeTemporaryFileError();
+    }
     closeSync(handle);
     handle = undefined;
+
+    // Recheck after close, immediately before link(2), so a replaced or
+    // unverified pathname is never intentionally published as the default.
+    if (!hasNativeTemporaryFileIdentity(temporaryPath, ownedIdentity)) {
+      throw changedNativeTemporaryFileError();
+    }
     try {
       linkSync(temporaryPath, configPath);
     } catch (error) {
@@ -776,13 +821,15 @@ function publishDefaultNativeConfig(configPath: string): void {
       try {
         closeSync(handle);
       } catch {
-        // Best-effort close of our unpublished temporary file.
+        // Best-effort close; preserve the original initialization outcome.
       }
     }
-    try {
-      unlinkSync(temporaryPath);
-    } catch {
-      // Best-effort cleanup is scoped to this unique file created with wx.
+    if (ownedIdentity !== undefined && hasNativeTemporaryFileIdentity(temporaryPath, ownedIdentity)) {
+      try {
+        unlinkSync(temporaryPath);
+      } catch {
+        // Best-effort cleanup of only the positively-owned regular file.
+      }
     }
   }
 }

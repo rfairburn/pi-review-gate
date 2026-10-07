@@ -15,7 +15,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, win32 as win32Path } from "node:path";
 import {
   PI_AGENT_DIR_ENV,
   piAgentDir,
@@ -30,13 +30,15 @@ import {
 } from "./saved-sessions";
 
 /**
- * Native standalone Pi launch preparation (alpha, POSIX-only).
+ * Native standalone Pi launch preparation (alpha, backend descriptor stage).
  *
  * This module is the preparatory stage of the future native session host: it
  * resolves the real Pi CLI, validates the admitted native root or legacy
  * profile, and composes the exact spawn descriptor (file, argv, environment,
- * cwd) for one direct native Pi TUI session. It deliberately does NOT spawn
- * PTYs, bootstrap the session-host protocol, or run any dependency setup:
+ * cwd) for one native Pi TUI session. Windows descriptors run the admitted
+ * JavaScript CLI through the current Node host executable; POSIX descriptors
+ * retain direct CLI/shebang execution. It deliberately does NOT spawn PTYs,
+ * bootstrap the session-host protocol, or run any dependency setup:
  *
  * - The outer launcher owns the single DDGS setup (`scripts/ensure-ddgs.sh` /
  *   `ensureDdgs` in scripts/pi-review-gate-launcher.cjs) BEFORE any Node host
@@ -164,6 +166,35 @@ function isExecutableRegularFile(candidate: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** Windows admits readable JS CLI files; the trusted host Node supplies execution. */
+function isReadableRegularFile(candidate: string): boolean {
+  try {
+    if (!statSync(candidate).isFile()) return false;
+    accessSync(candidate, fsConstants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isAdmissiblePiFile(candidate: string, platform: NodeJS.Platform): boolean {
+  return platform === "win32"
+    ? isReadableRegularFile(candidate)
+    : isExecutableRegularFile(candidate);
+}
+
+function isExplicitExecutablePath(executable: string, platform: NodeJS.Platform): boolean {
+  if (executable.includes("/")) return true;
+  if (platform !== "win32") return false;
+  // Windows path forms are filenames, never command strings: recognize drive
+  // paths, UNC/rooted paths, and relative paths containing native separators.
+  return win32Path.isAbsolute(executable) || /^[A-Za-z]:/.test(executable) || executable.includes("\\");
+}
+
+function pathDelimiter(platform: NodeJS.Platform): string {
+  return platform === "win32" ? ";" : ":";
 }
 
 /** Bounded first-bytes read (never a whole-file or directory scan; O_NONBLOCK, fstat-checked). */
@@ -373,7 +404,78 @@ function loadStartupOptionsHelper(): SessionHostStartupOptionsHelper {
 }
 
 function unsupportedPlatformDiagnostic(platform: string): string {
-  return `pi-review-gate: native standalone Pi launch preparation supports POSIX platforms only in this alpha; ${platform} must launch pi through the standard pi-review-gate wrapper`;
+  return `pi-review-gate: native standalone Pi launch preparation supports macOS/Linux direct CLI and Windows Node-host descriptor preparation only; ${platform} must launch pi through the standard pi-review-gate wrapper`;
+}
+
+function assertSupportedPlatform(platform: NodeJS.Platform): void {
+  if (platform !== "darwin" && platform !== "linux" && platform !== "win32") {
+    throw new Error(unsupportedPlatformDiagnostic(platform));
+  }
+}
+
+/** Windows has case-insensitive environment names; these stale capabilities are dropped in every casing. */
+function isStaleHostCapabilityName(name: string): boolean {
+  if (name === SESSION_HOST_BOOTSTRAP_ENV || name === NODE_OPTIONS_RESTORE_ENV) return true;
+  return SETTLEMENT_ENV_SUFFIXES.some((suffix) =>
+    name === `PI_REVIEW_GATE_SETTLEMENT_${suffix}` || name === `PI_REVIEW_GATE_QUIESCENCE_${suffix}`,
+  );
+}
+
+/** Snapshot Windows env names case-insensitively without silently choosing conflicting values. */
+function snapshotNativeEnvironment(
+  source: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+): NodeJS.ProcessEnv {
+  if (platform !== "win32") return { ...source }; // POSIX environment names remain case-sensitive.
+
+  const valuesByName = new Map<string, (string | undefined)[]>();
+  for (const [rawName, value] of Object.entries(source)) {
+    const name = rawName.toUpperCase();
+    const values = valuesByName.get(name) ?? [];
+    values.push(value);
+    valuesByName.set(name, values);
+  }
+
+  const snapshot: NodeJS.ProcessEnv = {};
+  for (const [name, values] of valuesByName) {
+    if (isStaleHostCapabilityName(name)) continue;
+    if (name === RUNTIME_ROLE_ENV || name === EXECUTOR_TOOL_CATALOG_ENV) {
+      // Preserve any nonempty spelling for the ordinary fail-closed role
+      // rejection below; never let an empty alias shadow a worker marker.
+      snapshot[name] = values.find((value) => value !== undefined && value.length > 0) ?? values[0];
+      continue;
+    }
+    const [value, ...aliases] = values;
+    if (aliases.some((alias) => alias !== value)) {
+      throw new Error(
+        "pi-review-gate: conflicting case variants in the Windows environment; refusing to select one value.",
+      );
+    }
+    // Uppercase keys give the rest of this module one canonical spelling for
+    // PATH, NODE_OPTIONS, native Pi settings, and unrelated provider values.
+    snapshot[name] = value;
+  }
+  return snapshot;
+}
+
+/** Reject real worker authorization, then remove stale host-only capabilities before any probe/child. */
+function rejectAndStripInheritedHostCapabilities(env: NodeJS.ProcessEnv): void {
+  if (env[RUNTIME_ROLE_ENV]) {
+    throw new Error(
+      `pi-review-gate: refusing to prepare a native launch while ${RUNTIME_ROLE_ENV} is set; runtime role authorization comes only from the delegated execution adapter.`,
+    );
+  }
+  if (env[EXECUTOR_TOOL_CATALOG_ENV]) {
+    throw new Error(
+      `pi-review-gate: refusing to prepare a native launch while ${EXECUTOR_TOOL_CATALOG_ENV} is set; executor tool catalogs belong to executor-role children only.`,
+    );
+  }
+  delete env[RUNTIME_ROLE_ENV];
+  delete env[EXECUTOR_TOOL_CATALOG_ENV];
+  delete env[SESSION_HOST_BOOTSTRAP_ENV];
+  delete env[NODE_OPTIONS_RESTORE_ENV];
+  for (const suffix of SETTLEMENT_ENV_SUFFIXES) delete env[`PI_REVIEW_GATE_SETTLEMENT_${suffix}`];
+  for (const suffix of SETTLEMENT_ENV_SUFFIXES) delete env[`PI_REVIEW_GATE_QUIESCENCE_${suffix}`];
 }
 
 /** Numeric component-wise semantic-version comparison: negative/zero/positive. */
@@ -407,57 +509,63 @@ function extractPiVersion(output: string): string | null {
  * Resolve the real native Pi CLI executable and probe its exact version.
  *
  * - Default `pi`: a narrow PATH filename lookup (env override supported), the
- *   first PATH entry holding an executable regular file with that exact
- *   name, canonically resolved to an absolute file so the descriptor is
- *   cwd-independent. Shell aliases and command strings are never consulted
- *   (aliases are a shell feature a child cannot see), and a bare name that
+ *   first PATH entry holding an admissible regular file with that exact
+ *   name (readable on Windows, executable on POSIX), canonically resolved to
+ *   an absolute file so the descriptor is cwd-independent. Windows splits
+ *   PATH on `;`; POSIX uses `:`. Shell aliases and command strings are never
+ *   consulted (aliases are a shell feature a child cannot see), and a bare name that
  *   contains whitespace or shell metacharacters is rejected — an exact
  *   filename is required, not a shell command line. No global directory or
  *   process scan happens: PATH filename checks only, never a home or
  *   Terraform recursion.
  * - An explicit executable path is honored for installed managed or custom Pi
- *   builds: it is validated and resolved to an absolute regular executable
- *   file exactly as a whole filename (no shell participates, so
- *   spaces/quotes/parentheses in a real path are legitimate; a slash-bearing
- *   command string simply fails its file validation and is never executed).
+ *   builds: it is validated and resolved to an absolute regular file exactly
+ *   as a whole filename (POSIX also requires X_OK; Windows requires read
+ *   access because Node executes the JS file). Drive/UNC/backslash Windows
+ *   paths and spaces/quotes/parentheses in real paths are filename input, not
+ *   shell command strings; invalid paths fail file validation and are never
+ *   executed.
  *   A positive Node-entry shebang is required and the path is used as-is:
  *   this module never parses shims or invents an implementation path behind
  *   them.
  *
  * The chosen file is probed with `--version` (bounded 10 s window, bounded
- * 8 KiB output, no shell): builds older than Pi 1.0.4, unparseable versions,
+ * 8 KiB output, no shell; Windows runs it as `process.execPath <file>`):
+ * builds older than Pi 1.0.4, unparseable versions,
  * exit failures, timeouts, and oversized output fail closed with a bounded
  * safe diagnostic that never includes the command output itself. There is no
  * old-compatibility scaffold: unsupported Pi versions must fail.
  *
- * POSIX only in this alpha; other platforms get a clear diagnostic.
+ * POSIX retains direct executable probing; Windows probes the admitted JS
+ * entry through the running Node host. Other platforms fail closed.
  */
 export function resolveNativePi(
   options: { executable?: string; env?: NodeJS.ProcessEnv } = {},
 ): { file: string; version: string } {
-  if (process.platform === "win32") {
-    throw new Error(unsupportedPlatformDiagnostic(process.platform));
-  }
-  // The probe runs on a clean clone of the caller environment: inherited
-  // session-host status capability (bootstrap/restore markers) must never
-  // reach even the --version child, while the user's normal NODE_OPTIONS and
-  // every other trusted-provider setting are inherited as usual.
-  const env = { ...(options.env ?? process.env) };
-  delete env[SESSION_HOST_BOOTSTRAP_ENV];
-  delete env[NODE_OPTIONS_RESTORE_ENV];
+  const platform = process.platform;
+  assertSupportedPlatform(platform);
+  // Worker authorization is rejected, never laundered, before any child
+  // probe. Stale host/settlement capabilities are stripped from the probe
+  // environment while ordinary NODE_OPTIONS and provider settings survive.
+  const env = snapshotNativeEnvironment(options.env ?? process.env, platform);
+  rejectAndStripInheritedHostCapabilities(env);
   const executable = options.executable ?? "pi";
 
   let file: string;
-  if (executable.includes("/")) {
+  if (isExplicitExecutablePath(executable, platform)) {
     // An explicit path is a complete filename for installed managed or custom
     // Pi builds: it is validated and canonicalized as a whole (no shell is
     // ever involved, so spaces, quotes, or parentheses in the path are
-    // legitimate and never command-string input; a nonpath that happens to
-    // contain a slash simply fails its file validation).
-    const candidate = isAbsolute(executable) ? executable : resolve(process.cwd(), executable);
-    if (!isExecutableRegularFile(candidate)) {
+    // legitimate and never command-string input). Windows drive, UNC, and
+    // backslash-bearing paths reach this path branch without being parsed as
+    // shell syntax.
+    const candidate = isAbsolute(executable) || (platform === "win32" && win32Path.isAbsolute(executable))
+      ? executable
+      : resolve(process.cwd(), executable);
+    if (!isAdmissiblePiFile(candidate, platform)) {
+      const requirement = platform === "win32" ? "a readable" : "an executable";
       throw new Error(
-        `pi-review-gate: the configured native pi executable is not an executable regular file (no shell command is ever executed; the path cannot be resolved): ${candidate}`,
+        `pi-review-gate: the configured native pi executable is not ${requirement} regular file (no shell command is ever executed; the path cannot be resolved): ${candidate}`,
       );
     }
     file = realpathSync(candidate);
@@ -471,7 +579,7 @@ export function resolveNativePi(
         `pi-review-gate: the native pi executable must be a single exact filename, not a shell command string: ${JSON.stringify(executable)}`,
       );
     }
-    const found = findOnPath(executable, env.PATH ?? "");
+    const found = findOnPath(executable, env.PATH ?? "", platform);
     if (!found) {
       throw new Error(
         `pi-review-gate: the native pi executable "${executable}" was not found on PATH; install Pi (npm install -g @earendil-works/pi) or pass an explicit executable path.`,
@@ -485,16 +593,16 @@ export function resolveNativePi(
   // or SEA binary would silently ignore it, so it is rejected up front.
   rejectNonNodeCliExecutable(file);
 
-  const version = probePiVersion(file, env);
+  const version = probePiVersion(file, env, platform);
   return { file, version };
 }
 
-/** First PATH entry holding an executable regular file with the exact name, realpathed. */
-function findOnPath(name: string, pathEnv: string): string | undefined {
-  for (const rawEntry of pathEnv.split(":")) {
+/** First PATH entry holding an admissible regular file with the exact name, realpathed. */
+function findOnPath(name: string, pathEnv: string, platform: NodeJS.Platform): string | undefined {
+  for (const rawEntry of pathEnv.split(pathDelimiter(platform))) {
     if (!rawEntry) continue; // an empty PATH entry would mean the current directory: never searched
     const candidate = join(rawEntry, name);
-    if (!isExecutableRegularFile(candidate)) continue;
+    if (!isAdmissiblePiFile(candidate, platform)) continue;
     try {
       return realpathSync(candidate);
     } catch {
@@ -505,11 +613,14 @@ function findOnPath(name: string, pathEnv: string): string | undefined {
 }
 
 /** Bounded --version probe with fail-closed diagnostics that never dump output. */
-function probePiVersion(file: string, env: NodeJS.ProcessEnv): string {
+function probePiVersion(file: string, env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string {
   let result;
   try {
-    result = spawnSync(file, ["--version"], {
+    const command = platform === "win32" ? process.execPath : file;
+    const args = platform === "win32" ? [file, "--version"] : ["--version"];
+    result = spawnSync(command, args, {
       env,
+      shell: false,
       timeout: VERSION_PROBE_TIMEOUT_MS,
       // SIGKILL is non-ignorable: an executable (or wrapper) that handles or
       // ignores SIGTERM can otherwise block this probe far past the bound.
@@ -573,9 +684,9 @@ function probePiVersion(file: string, env: NodeJS.ProcessEnv): string {
 
 /** A prepared direct native Pi launch: everything the future host manager needs to spawn one session. */
 export interface NativeLaunchDescriptor {
-  /** Absolute path to the resolved native Pi executable. */
+  /** POSIX: canonical Pi CLI; Windows: the current Node host process executable. */
   file: string;
-  /** Full native argv: the review-gate and session-host reporter extensions first, then forwarded args. */
+  /** Full native argv: Windows starts with the canonical Pi CLI script, then extensions and forwarded args. */
   args: string[];
   /** Cloned, sanitized environment; the caller's env is never mutated. */
   env: NodeJS.ProcessEnv;
@@ -680,12 +791,16 @@ export interface NativeLaunchOptions {
  *   skills: Pi and the ordinary launcher discover the user's existing native
  *   skill locations naturally.
  *
- * POSIX only in this alpha; other platforms get a clear diagnostic.
+ * POSIX descriptors execute the validated CLI directly. Windows descriptors
+ * run the same validated JS CLI through process.execPath, with its exact
+ * canonical path as argv[0]; unsupported platforms get a clear diagnostic.
  */
 export function prepareNativeLaunch(options: NativeLaunchOptions): NativeLaunchDescriptor {
-  if (process.platform === "win32") {
-    throw new Error(unsupportedPlatformDiagnostic(process.platform));
-  }
+  const platform = process.platform;
+  assertSupportedPlatform(platform);
+  // Snapshot Windows environment names case-insensitively before either the
+  // parent startup preflight or later role/capability checks.
+  const env = snapshotNativeEnvironment(options.env ?? process.env, platform);
 
   // Reject parent startup session arguments before any filesystem mutation,
   // profile work, or bootstrap injection. Saved-session selection remains an
@@ -694,36 +809,16 @@ export function prepareNativeLaunch(options: NativeLaunchOptions): NativeLaunchD
   // directory, so omit only that env field from the legacy preflight check.
   // The caller env is never mutated.
   try {
-    const startupEnv = { ...(options.env ?? process.env) };
+    const startupEnv = { ...env };
     if (options.nativeSetup) delete startupEnv.PI_CODING_AGENT_SESSION_DIR;
     loadStartupOptionsHelper().assertSessionHostStartupOptions(options.args ?? [], startupEnv);
   } catch (error) {
     throw new Error(`pi-review-gate: ${error instanceof Error ? error.message : "invalid session host startup options"}`);
   }
 
-  const env = { ...(options.env ?? process.env) };
-
-  // Fail-closed role rejection before anything else: explicit worker/executor
-  // role authorization must never be laundered into (or silently converted
-  // by) a top-level native launch. Both markers are then stripped regardless,
-  // so a caller whose environment merely carries empty remnants is safe.
-  if (env[RUNTIME_ROLE_ENV]) {
-    // Flag name only: a malformed role value could itself carry secret
-    // material, so diagnostics must never echo it.
-    throw new Error(
-      `pi-review-gate: refusing to prepare a native launch while ${RUNTIME_ROLE_ENV} is set; runtime role authorization comes only from the delegated execution adapter.`,
-    );
-  }
-  if (env[EXECUTOR_TOOL_CATALOG_ENV]) {
-    throw new Error(
-      `pi-review-gate: refusing to prepare a native launch while ${EXECUTOR_TOOL_CATALOG_ENV} is set; executor tool catalogs belong to executor-role children only.`,
-    );
-  }
-  delete env[RUNTIME_ROLE_ENV];
-  delete env[EXECUTOR_TOOL_CATALOG_ENV];
-  delete env[SESSION_HOST_BOOTSTRAP_ENV];
-  for (const suffix of SETTLEMENT_ENV_SUFFIXES) delete env[`PI_REVIEW_GATE_SETTLEMENT_${suffix}`];
-  for (const suffix of SETTLEMENT_ENV_SUFFIXES) delete env[`PI_REVIEW_GATE_QUIESCENCE_${suffix}`];
+  // Explicit worker/executor authorization is rejected rather than laundered;
+  // stale host capabilities and settlement markers are then stripped.
+  rejectAndStripInheritedHostCapabilities(env);
 
   const packageRoot = canonicalPackageRoot(options.packageRoot);
 
@@ -738,7 +833,7 @@ export function prepareNativeLaunch(options: NativeLaunchOptions): NativeLaunchD
 
   const agentDir = canonicalAdmittedAgentDir(options.agentDir);
   const workspace = canonicalWorkspace(options.workspace);
-  const piExecutable = validatePiExecutable(options.piExecutable);
+  const piExecutable = validatePiExecutable(options.piExecutable, platform);
 
   // Deliberate per-child saved-session selection: validated BEFORE any config
   // validation, publication, or descriptor composition. Legacy profile mode
@@ -844,16 +939,19 @@ export function prepareNativeLaunch(options: NativeLaunchOptions): NativeLaunchD
   }
 
   return {
-    file: piExecutable,
-    // The reporter extension loads first: its preload requirement is consumed
-    // from NODE_OPTIONS before the gate extension factory runs, and it can
-    // observe the gate's SessionStart widget updates. The authorized
-    // `--session <file>` pair is composed AFTER the complete extension pairs
+    file: platform === "win32" ? process.execPath : piExecutable,
+    // On Windows Node receives the exact canonical public CLI as its first
+    // argument; it is never launched through cmd.exe or a shell. POSIX keeps
+    // the direct executable/shebang descriptor. The reporter extension loads
+    // first: its preload requirement is consumed from NODE_OPTIONS before the
+    // gate extension factory runs, and it can observe SessionStart updates.
+    // The authorized `--session <file>` pair is composed AFTER the complete extension pairs
     // and BEFORE any ordinary caller args: that position is always an option
     // position for the native parser, so a caller arg that merely LOOKS like
     // a separator (e.g. `--model --`) can never consume or shadow it. Native
     // args follow byte-for-byte.
     args: [
+      ...(platform === "win32" ? [piExecutable] : []),
       "--extension", reporterExtension,
       "--extension", indexExtension,
       ...(savedSessionFile !== undefined ? ["--session", savedSessionFile] : []),
@@ -1059,13 +1157,17 @@ function canonicalWorkspace(workspace: string): string {
   return realpathSync(workspace);
 }
 
-/** Validate the caller-provided Pi executable: an absolute executable regular file. */
-function validatePiExecutable(piExecutable: string): string {
+/**
+ * Validate the caller-provided Pi CLI: an absolute regular file (X_OK on
+ * POSIX; readable on Windows, where the host Node executable runs it).
+ */
+function validatePiExecutable(piExecutable: string, platform: NodeJS.Platform): string {
   if (!isAbsolute(piExecutable)) {
     throw new Error(`pi-review-gate: the native pi executable must be an absolute path: ${piExecutable}`);
   }
-  if (!isExecutableRegularFile(piExecutable)) {
-    throw new Error(`pi-review-gate: the native pi executable is not an executable regular file: ${piExecutable}`);
+  if (!isAdmissiblePiFile(piExecutable, platform)) {
+    const requirement = platform === "win32" ? "a readable" : "an executable";
+    throw new Error(`pi-review-gate: the native pi executable is not ${requirement} regular file: ${piExecutable}`);
   }
   const canonical = realpathSync(piExecutable);
   // Belt and braces: descriptors are normally built from resolveNativePi

@@ -385,10 +385,11 @@ test("native candidate: research executor catalog stays read-only with deferred 
     });
     if (!fixture) return;
 
-    const inventory = await fixture.probeDump();
+    // Pi 1.0.4 keeps passive MCP tool metadata registered (deferred exposure) even when --tools omits mcp__ entries;
+    // that metadata is not a grant — the research ceiling still controls tool_search, activation, and direct calls below.
+    const inventory = await fixture.waitForRegisteredTools([echoName(fixture), counterName(fixture)]);
     assert.equal(observedTool(inventory, CODEMODE), undefined, "research worker --tools catalog withholds native code");
-    assert.equal(observedTool(inventory, echoName(fixture)), undefined, "research worker --tools catalog withholds MCP echo");
-    assert.equal(observedTool(inventory, counterName(fixture)), undefined, "research worker --tools catalog withholds MCP counter");
+    assertMcpRemainsNativeAndInactive(inventory, fixture);
     assert.ok(!inventory.activeTools?.includes(CODEMODE));
     assert.ok(!inventory.activeTools?.some((name) => name.startsWith("mcp__")));
     const codeSearch = await runSearchCall(fixture, CODEMODE);

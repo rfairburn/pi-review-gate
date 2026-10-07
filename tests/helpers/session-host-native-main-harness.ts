@@ -862,6 +862,9 @@ export class MainPtyDriver {
     env?: NodeJS.ProcessEnv;
   }): Promise<MainPtyDriver> {
     const stateRoot = join(options.scratchRoot, "native-state");
+    // The transport option names an existing directory, not a profile root
+    // that production creates. This fixture owns its exclusive creation.
+    mkdirSync(stateRoot, { mode: 0o700 });
     const resultFile = join(options.scratchRoot, "main-result.json");
     const optionsFile = join(options.scratchRoot, "main-options.json");
     const ptyExitLog = join(options.scratchRoot, "pty-exits.jsonl");
@@ -902,6 +905,7 @@ export class MainPtyDriver {
       HOME: join(options.scratchRoot, "home"),
       TMPDIR: join(options.scratchRoot, "tmp"),
       NODE_PATH: options.runtime.nodePath,
+      NODE_OPTIONS: process.env.NODE_OPTIONS,
       PRG_SESSION_HOST_NATIVE_MAIN_ENTRY: join(options.candidate.root, "dist", "src", "session-host", "main.js"),
       PRG_SESSION_HOST_NATIVE_MAIN_OPTIONS: optionsFile,
       PRG_SESSION_HOST_NATIVE_MAIN_RESULT: resultFile,

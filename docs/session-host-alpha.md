@@ -229,9 +229,17 @@ treat the design description as proof that every terminal/input combination work
 
 Quitting the host asks for confirmation whenever it still owns a live child-process
 handle, including a row marked error; the row's lifecycle badge alone does not determine
-whether a handle is live. It then makes bounded graceful and forced-stop attempts
-against only the host's owned child handles. The host does not scan for processes or
-promise to stop arbitrary detached descendants. A forced stop or a child whose exit
-could not be confirmed is reported truthfully; do not assume such a handle has exited.
+whether a handle is live. It then asks each active authenticated status registration to
+request native shutdown, when that public control is available, and waits only within
+the existing bounded grace window. A `requested` acknowledgement means the request was
+accepted; it is not proof of PTY exit or successful graceful termination. The host
+therefore treats only the owned PTY's actual exit event as confirmation. On POSIX,
+unavailable or failed public control falls back to SIGTERM for that owned handle
+immediately. A public request still pending after the first half of the shared grace
+window also falls back to SIGTERM, leaving the remainder for an owned exit; without
+a confirmed exit by the deadline, the manager escalates with SIGKILL against that
+same handle. The host does not scan for processes or promise to stop arbitrary detached
+descendants. A forced stop or a child whose exit could not be confirmed is reported
+truthfully; do not assume such a handle has exited.
 Native Pi configuration, credentials, conversations, and unknown files are preserved,
 not removed as part of host shutdown.

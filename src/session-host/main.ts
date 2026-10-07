@@ -214,7 +214,8 @@ function statusRegistrar(broker: StatusBroker): StatusRegistrar {
         },
         onDisconnect: handlers.onDisconnect,
       });
-      return registration as InstanceStatusRegistration;
+      // Keep the broker's exact registration closures and their auth/tuple fences.
+      return registration satisfies InstanceStatusRegistration;
     },
   };
 }

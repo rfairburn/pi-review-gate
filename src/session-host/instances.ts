@@ -11,7 +11,7 @@ import {
 } from "./launch";
 import { TerminalSurface } from "./terminal-surface";
 import { isValidNativeSessionId, isValidRenameName, type SessionHostNativeSession } from "./protocol";
-import type { StatusRenameRequest, StatusRenameResult } from "./broker";
+import type { StatusRenameRequest, StatusRenameResult, StatusShutdownResult } from "./broker";
 
 /**
  * Independent owned-PTY process lifecycle for the optional per-instance
@@ -53,11 +53,14 @@ import type { StatusRenameRequest, StatusRenameResult } from "./broker";
  *   and `busy`/`pendingInput` collapse to null on exit or reporter
  *   disconnect (never inferred, never "Idle"), keeping the retained last
  *   frame (queued bytes are flushed before the surface freezes).
- * - Shutdown and dispose are bounded and owned-scoped: graceful SIGTERM to
- *   exactly the owned PTY handle, bounded escalation to SIGKILL on the same
- *   handle only, no global process scans, no arbitrary group kills, no
- *   daemon/adopted-descendant cleanup (remaining handles are reported
- *   honestly and are released only when their own exit event fires).
+ * - Shutdown and dispose are bounded and owned-scoped: request graceful exit
+ *   through the active authenticated public status registration when
+ *   available; on POSIX, fall back to SIGTERM and escalate with SIGKILL on the
+ *   same owned PTY handle only. On Windows, force through that handle's
+ *   no-argument kill() API; it is never treated as graceful. There are no
+ *   global process scans, arbitrary group kills, or daemon/adopted-descendant
+ *   cleanup (remaining handles are reported honestly and are released only
+ *   when their own exit event fires).
  *   Setup admission is released only after a known child exit or a
  *   failed spawn before any child exists; a kill that never settles never
  *   frees an admission as if it were safely gone.
@@ -78,6 +81,14 @@ export const DEFAULT_INSTANCE_ROWS = 24;
 /** Default bounded windows for graceful owned shutdown escalation. */
 export const DEFAULT_SHUTDOWN_GRACE_MS = 8000;
 export const DEFAULT_SHUTDOWN_KILL_MS = 2000;
+
+/** Internal policy seam for synthetic manager tests; production defaults to the actual host platform. */
+let shutdownPlatformForTests: NodeJS.Platform | undefined;
+export const __test = Object.freeze({
+	setShutdownPlatform(platform: NodeJS.Platform | undefined): void {
+		shutdownPlatformForTests = platform;
+	},
+});
 
 /** Upper bound for a single-line instance label (UTF-16 code units). */
 export const MAX_LABEL_CHARS = 80;
@@ -154,14 +165,15 @@ export interface InstanceStatusRegistration {
 	readonly bootstrap: InstanceStatusBootstrap;
 	/** Authenticated persisted rename when supported by the current registrar. */
 	rename?(request: StatusRenameRequest): Promise<StatusRenameResult>;
+	/** Authenticated public native shutdown when supported; acceptance is not PTY exit. */
+	shutdown?(): Promise<StatusShutdownResult>;
 	release(): void;
 }
 
 /**
- * Structural status registrar contract (the upcoming broker implements the
- * same API with the richer compatible wire status and owns all auth,
- * generation, and sequence checks. This module never imports the not-yet-
- * landed protocol module and never duplicates any wire parser.)
+ * Structural status registrar contract. The broker owns all authentication,
+ * generation, request-fence, and wire checks; this module never duplicates
+ * any wire parser.
  */
 export interface StatusRegistrar {
 	register(instanceId: string, handlers: InstanceStatusHandlers): InstanceStatusRegistration;
@@ -224,13 +236,13 @@ export interface InstanceManagerOptions {
 }
 
 export interface ShutdownOptions {
-	/** Grace window after SIGTERM (default 8000 ms; injectable short for tests). */
+	/** Shared grace window for public shutdown request and POSIX SIGTERM fallback (default 8000 ms). */
 	graceMs?: number;
-	/** Kill window after SIGKILL escalation (default 2000 ms). */
+	/** Confirmation window after forced owned-handle escalation (default 2000 ms). */
 	killMs?: number;
 }
 
-/** Truthful shutdown outcome: forced = escalated to SIGKILL on the owned handle; remaining = never confirmed exit. */
+/** Truthful outcome: forced = owned-handle force escalation was attempted; remaining = never confirmed exit. */
 export interface ShutdownResult {
 	readonly forcedIds: readonly string[];
 	readonly remainingIds: readonly string[];
@@ -319,6 +331,21 @@ function validateDimension(value: number, label: string): void {
 function validateShutdownMs(value: number, label: string): void {
 	if (!Number.isSafeInteger(value) || value < 0) {
 		throw new Error(`session-host: shutdown ${label} must be a non-negative safe integer, got ${value}`);
+	}
+}
+
+/** Only a well-shaped accepted public response suppresses the POSIX SIGTERM fallback. */
+function validShutdownRequest(value: unknown): boolean {
+	try {
+		if (typeof value !== "object" || value === null) return false;
+		const result = value as Partial<StatusShutdownResult>;
+		return typeof result.requestId === "string"
+			&& result.requestId.length > 0
+			&& ["requested", "rejected", "unavailable", "busy", "timeout", "disconnected"].includes(result.status as string)
+			&& result.status === "requested";
+	} catch {
+		// Malformed foreign objects (including throwing getters) fail closed.
+		return false;
 	}
 }
 
@@ -451,6 +478,7 @@ export class InstanceManager {
 	readonly #getSupportedKeyboardFlags?: () => number;
 	readonly #onChange?: (instanceId: string) => void;
 	readonly #ptyFactory: PtyFactory;
+	readonly #shutdownPlatform: NodeJS.Platform;
 	readonly #records = new Map<string, ManagedInstance>();
 	readonly #inflightCreates = new Set<Promise<void>>();
 	#stopping = false;
@@ -490,6 +518,7 @@ export class InstanceManager {
 		this.#getSupportedKeyboardFlags = options.getSupportedKeyboardFlags;
 		this.#onChange = options.onChange;
 		this.#ptyFactory = options.ptyFactory ?? createDefaultPtyFactory();
+		this.#shutdownPlatform = shutdownPlatformForTests ?? process.platform;
 	}
 
 	/** Current rows, copied and immutable per call (later SidebarItem shape). */
@@ -734,8 +763,9 @@ export class InstanceManager {
 	}
 
 	/**
-	 * Bounded graceful shutdown of every owned child: SIGTERM to the owned
-	 * PTY handle, bounded SIGKILL escalation on the same handle only, honest
+	 * Bounded graceful shutdown of every owned child: authenticated public
+	 * native shutdown when available, POSIX SIGTERM fallback, and bounded
+	 * forced escalation on the same owned handle only, honest
 	 * forced/remaining tracking. No global process scans, no arbitrary group
 	 * kills, no adopted-descendant cleanup: remaining handles keep their
 	 * admission and are released only by their own confirmed exit event.
@@ -763,11 +793,10 @@ export class InstanceManager {
 
 	/**
 	 * Idempotent graceful cleanup then owned resource disposal: stops any
-	 * owned child never signaled before (default windows), disposes terminal
-	 * surfaces, and releases status registrations. Exited rows keep their
-	 * recorded truth; rows whose child never confirmed exit keep lifecycle
-	 * 'alive' and hold their setup admission (never freed as if safely
-	 * gone) until their own exit event fires. Native/session files and
+	 * owned child never signaled before (default windows). Exited rows release
+	 * their status registrations and terminal surfaces; rows whose child never
+	 * confirmed exit retain both, keep lifecycle 'alive', and hold their setup
+	 * admission until their own exit event fires. Native/session files and
 	 * unknown files are never touched by this module.
 	 */
 	async dispose(): Promise<void> {
@@ -796,8 +825,13 @@ export class InstanceManager {
 			record.pendingInput = null;
 			record.inputSurface = false;
 			record.activity = [];
-			this.#releaseRegistration(record);
 			this.#disposeDataListener(record);
+			if (record.pty && !record.ptyExited) {
+				// Preserve the authenticated owner and terminal surface until actual
+				// PTY exit. The retained exit/error listeners complete this teardown.
+				continue;
+			}
+			this.#releaseRegistration(record);
 			try {
 				record.surface?.dispose();
 			} catch {
@@ -806,8 +840,8 @@ export class InstanceManager {
 			record.surface = undefined;
 		}
 		// Exit and read-error listeners of never-settled children stay attached:
-		// they are required to release admission on a late exit and to keep the
-		// pinned native stream's unexpected errors contained after disposal.
+		// they release registration, surface, and admission on a late exit and
+		// keep the pinned native stream's unexpected errors contained.
 	}
 
 	#assertUsable(operation: string): void {
@@ -1075,6 +1109,15 @@ export class InstanceManager {
 		// Flush the queued child bytes so the retained last frame is the
 		// complete final one before the row freezes.
 		const surface = record.surface;
+		if (this.#disposed) {
+			try {
+				surface?.dispose();
+			} catch {
+				// A late exit after manager disposal still completes per-row cleanup.
+			}
+			record.surface = undefined;
+			return;
+		}
 		void (async () => {
 			try {
 				await surface?.flush();
@@ -1243,10 +1286,14 @@ export class InstanceManager {
 	}
 
 	/**
-	 * Owned graceful stop of one child: SIGTERM at the owned handle, bounded
-	 * wait, bounded SIGKILL escalation at the same handle. Releases happen
-	 * only in the exit handler (confirmed exit) — this routine never frees
-	 * an admission for a child that never settled.
+	 * Owned graceful stop of one child: ask the active authenticated public
+	 * status registration to request native shutdown, bounded by the same grace
+	 * deadline as the owned PTY exit wait. On POSIX, unavailable or failed
+	 * control falls back to SIGTERM; Windows never treats a PTY signal as
+	 * graceful and forces only through the owned handle's no-argument kill().
+	 * Forced escalation remains bounded and owned-handle-only.
+	 * Releases happen only in the exit handler (confirmed exit) — this routine
+	 * never frees an admission for a child that never settled.
 	 */
 	#gracefulStop(record: ManagedInstance, graceMs: number, killMs: number): Promise<boolean> {
 		const pty = record.pty;
@@ -1262,19 +1309,89 @@ export class InstanceManager {
 	}
 
 	async #runGracefulStop(record: ManagedInstance, pty: InstancePty, graceMs: number, killMs: number): Promise<boolean> {
-		record.sigtermSent = true;
+		// Register the actual-exit waiter before making any public request: a
+		// synchronous PTY exit inside shutdown() must win over its acknowledgement.
+		const graceExit = this.#waitForExit(record, graceMs);
+		const registration = record.registration;
+		let requestShutdown: InstanceStatusRegistration["shutdown"] = undefined;
 		try {
-			pty.kill("SIGTERM");
+			if (registration && !record.registrationReleased) {
+				requestShutdown = registration.shutdown;
+			}
 		} catch {
-			// Contained: the escalation still runs against the owned handle.
+			// A broken optional adapter is equivalent to unavailable control.
 		}
-		const settled = await this.#waitForExit(record, graceMs);
-		if (settled) {
+
+		let requested = false;
+		if (registration && requestShutdown) {
+			let requestTimer: NodeJS.Timeout | undefined;
+			const requestTimeout = this.#shutdownPlatform === "win32" ? undefined : new Promise<{ kind: "request-timeout" }>((resolve) => {
+				// Reserve half of the single grace window for POSIX SIGTERM to
+				// produce an exit. A hung public request must not postpone its
+				// fallback until immediately before forced SIGKILL.
+				requestTimer = setTimeout(() => resolve({ kind: "request-timeout" }), Math.floor(graceMs / 2));
+			});
+			let request: Promise<boolean>;
+			try {
+				// Attach both fulfillment and rejection handlers immediately. A
+				// hung or late public response can never outlive the grace wait as
+				// an unhandled rejection or change owned-process truth.
+				request = Promise.resolve(requestShutdown.call(registration)).then(
+					(result) => validShutdownRequest(result),
+					() => false,
+				);
+			} catch {
+				request = Promise.resolve(false);
+			}
+			const first = await Promise.race([
+				request.then((accepted) => ({ kind: "request" as const, accepted })),
+				graceExit.then((exited) => ({ kind: "exit" as const, exited })),
+				...(requestTimeout ? [requestTimeout] : []),
+			]);
+			if (requestTimer) clearTimeout(requestTimer);
+			if (first.kind === "exit" && first.exited) {
+				return true;
+			}
+			if (first.kind === "request") {
+				requested = first.accepted;
+			}
+		}
+		if (record.ptyExited) {
 			return true;
 		}
+
+		// `requested` acknowledges only the public native request. It never
+		// substitutes for the owned PTY's actual exit event.
+		if (!requested && this.#shutdownPlatform !== "win32") {
+			record.sigtermSent = true;
+			try {
+				pty.kill("SIGTERM");
+			} catch {
+				// Contained: the escalation still runs against the owned handle.
+			}
+			if (record.ptyExited) {
+				return true;
+			}
+		}
+
+		// This is the remainder of the original grace window, not a second
+		// post-request grace period. On Windows-like injected policy, no PTY
+		// signal is sent until the forced owned-handle escalation below.
+		const settled = await graceExit;
+		if (settled || record.ptyExited) {
+			return true;
+		}
+		// Record the force attempt before invoking a native API that may throw or
+		// partially complete; it is never evidence that the PTY actually exited.
 		record.sigkillSent = true;
 		try {
-			pty.kill("SIGKILL");
+			// Public node-pty's Windows signal argument is unsupported; its
+			// no-argument kill is the forced owned-handle operation there.
+			if (this.#shutdownPlatform === "win32") {
+				pty.kill();
+			} else {
+				pty.kill("SIGKILL");
+			}
 		} catch {
 			// Contained: truthfully reported below if the child never settles.
 		}

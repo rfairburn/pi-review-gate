@@ -2061,9 +2061,12 @@ test("dispose without prior shutdown gracefully stops un-signaled children; alre
     assert.equal(viewFor(harness.manager, hangId).pendingInput, null);
     assert.deepEqual(viewFor(harness.manager, hangId).activity, [], "dispose clears stale activity when reporting closes");
     assert.equal(viewFor(harness.manager, hangId).hasLiveProcess, true, "the retained row still truthfully owns the child");
-    assert.equal(hungRegistration.released, true, "dispose releases the owned status registration");
+    assert.equal(hungRegistration.released, false, "dispose retains the live owner's status registration until confirmed exit");
     assert.equal(harness.manager.hasLiveProcesses(), true, "truthful: an owned child was not confirmed dead");
     assert.equal(viewFor(harness.manager, polite).lifecycle, "exited");
+    harness.spawned[1].emitExit(42, 9);
+    assert.equal(hungRegistration.released, true, "a later owned exit releases the deferred registration");
+    assert.equal(harness.manager.hasLiveProcesses(), false);
     // A dispose-only manager stops fresh children within the default windows.
     const fresh = makeHarness("dispose-only");
     try {

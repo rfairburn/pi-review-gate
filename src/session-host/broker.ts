@@ -1,10 +1,13 @@
 /**
  * Authenticated bounded local status broker for independently owned native
- * instances (issue #323 optional POSIX alpha).
+ * instances (issue #323 POSIX and Windows IPC alpha).
  *
- * Each broker owns one private freshly-created Unix-socket transport
+ * Each POSIX broker owns one private freshly-created Unix-socket transport
  * (mkdtemp directory, mode 0700; own socket file, mode 0600) beneath a
  * canonical caller-supplied socket root directory or the OS temp directory.
+ * Windows brokers instead own one freshly generated public-Node named-pipe
+ * endpoint; Windows default ACLs are used because the public Node API does
+ * not expose a restrictive security descriptor or local-only option.
  * Independently owned native instances register themselves BEFORE their PTY
  * is spawned and receive a per-registration cryptorandom token to present in
  * the protocol hello frame (see ./protocol). The broker then accepts a
@@ -88,12 +91,11 @@ import {
   isValidNativeSessionId,
   isValidRenameName,
   parseBootstrap,
-  parseShutdownAck,
 } from "./protocol";
 
 /** Options accepted by {@link createStatusBroker}. */
 export interface StatusBrokerOptions {
-  /** Canonical existing directory that will contain the broker's private transport directory. */
+  /** Canonical existing POSIX directory for the private transport; unused by Windows named pipes. */
   socketRoot?: string;
 }
 
@@ -161,7 +163,7 @@ export interface StatusShutdownResult {
 
 /** The broker facade consumed by the future session-host manager. */
 export interface StatusBroker {
-  /** Absolute path of the broker-owned Unix socket (already bound). */
+  /** Broker-owned local IPC address (POSIX Unix socket or Windows named pipe; already bound). */
   readonly socketPath: string;
   /** Random host generation marker shared by every registration. */
   readonly generation: string;
@@ -178,6 +180,8 @@ const MAX_PENDING_UNAUTH_CONNECTIONS = 32;
 const AUTH_DEADLINE_MS = 2000;
 const RENAME_TIMEOUT_MS = 5000;
 const SHUTDOWN_TIMEOUT_MS = 5000;
+const WINDOWS_PIPE_LISTEN_TIMEOUT_MS = 5000;
+const WINDOWS_PIPE_CLOSE_TIMEOUT_MS = 5000;
 const MAX_PENDING_RENAMES = 4;
 const MAX_PENDING_SHUTDOWNS = 1;
 const MAX_PENDING_CONTROL_FRAMES = 4;
@@ -185,11 +189,11 @@ const MAX_COMPLETED_RENAME_IDS = 64;
 const MAX_COMPLETED_SHUTDOWN_IDS = 64;
 
 /**
- * Conservative cap on the broker socket path length in UTF-8 bytes. macOS
+ * Conservative cap on a POSIX broker socket path in UTF-8 bytes. macOS
  * Unix-socket addressing (sun_path 104 bytes including the terminating NUL)
  * only fits ~100 real path characters even though Linux allows 107; the
- * protocol's 2048-byte path validation is never treated as an actual socket
- * limit here, and over-long roots fail with a clear diagnostic instead.
+ * protocol's 2048-character bootstrap bound is never treated as an actual
+ * socket limit here, and over-long roots fail with a clear diagnostic instead.
  */
 const MAX_SOCKET_PATH_BYTES = 103;
 
@@ -198,6 +202,9 @@ const TRANSPORT_DIR_PREFIX = "prg-st-";
 
 /** Own socket filename inside the private transport directory (short: macOS sun_path is tiny). */
 const SOCKET_FILENAME = "s.sock";
+
+/** Cryptorandom namespace for one public-Node Windows local named pipe. */
+const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\prg-st-";
 
 /**
  * Fixture token used ONLY to reuse the shared bootstrap validator's id
@@ -308,6 +315,10 @@ function classifyShutdownAck(
 
 /** Test-only override allows root-bound fixtures to express the same local path relatively. */
 let socketPathLimitForTests: number | undefined;
+let brokerPlatformForTests: NodeJS.Platform | undefined;
+let createServerForTests: (() => Server) | undefined;
+let windowsPipeListenTimeoutForTests: number | undefined;
+let windowsPipeCloseTimeoutForTests: number | undefined;
 
 /** Narrow seams for protocol policy tests and root-bound socket fixtures. */
 export const __test = Object.freeze({
@@ -316,7 +327,21 @@ export const __test = Object.freeze({
   setSocketPathLimitForTests(limit: number | undefined): void {
     socketPathLimitForTests = limit;
   },
+  setPlatformForTests(platform: NodeJS.Platform | undefined): void {
+    brokerPlatformForTests = platform;
+  },
+  setCreateServerForTests(factory: (() => Server) | undefined): void {
+    createServerForTests = factory;
+  },
+  setWindowsPipeTimeoutsForTests(listenMs: number | undefined, closeMs: number | undefined): void {
+    windowsPipeListenTimeoutForTests = listenMs;
+    windowsPipeCloseTimeoutForTests = closeMs;
+  },
 });
+
+type BrokerTransport =
+  | { kind: "unix"; socketPath: string; transportDir: string; transportIdentity: OwnedPathIdentity }
+  | { kind: "pipe"; socketPath: string };
 
 /**
  * Canonicalizes the optional socket root: it must be an absolute, existing,
@@ -393,26 +418,27 @@ class LocalStatusBroker implements StatusBroker {
   readonly socketPath: string;
   readonly generation: string;
 
-  #transportDir: string;
-  #transportIdentity: OwnedPathIdentity;
+  #transport: BrokerTransport;
   #socketIdentity: OwnedPathIdentity | undefined;
   #server: Server | undefined;
+  #listenSucceeded = false;
+  #listenHandleClosed = false;
+  #latePipeCloseStarted = false;
   #registrations = new Map<string, RegistrationRecord>();
   #connections = new Set<ConnectionState>();
   #unauthCount = 0;
   #disposed = false;
   #disposal: Promise<void> | undefined;
 
-  constructor(transportDir: string, socketPath: string, transportIdentity: OwnedPathIdentity) {
-    this.#transportDir = transportDir;
-    this.#transportIdentity = transportIdentity;
-    this.socketPath = socketPath;
+  constructor(transport: BrokerTransport) {
+    this.#transport = transport;
+    this.socketPath = transport.socketPath;
     this.generation = randomUUID();
   }
 
-  /** Binds the server; resolves only once the socket exists with private permissions. */
+  /** Binds the endpoint; POSIX resolves after private socket permissions are verified. */
   async listen(): Promise<void> {
-    const server = createServer();
+    const server = createServerForTests?.() ?? createServer();
     this.#server = server;
     // A persistent error handler keeps server/listen failures controlled:
     // status-metadata failures must never affect the native PTY processes.
@@ -420,6 +446,16 @@ class LocalStatusBroker implements StatusBroker {
       // Controlled: surfaced through listen/promise paths only, never thrown
       // into the native process, and nothing about it is logged.
     });
+    server.on("close", () => {
+      this.#listenHandleClosed = true;
+    });
+    if (this.#transport.kind === "pipe") {
+      // Install the owner before listening so a late success after the bounded
+      // listen deadline can be closed without admitting untracked clients.
+      server.on("connection", (socket) => this.#trackConnection(socket));
+      await this.#listenWindowsPipe(server);
+      return;
+    }
     await new Promise<void>((resolve, reject) => {
       const onceError = (error: NodeJS.ErrnoException) => {
         reject(new Error(`pi-review-gate: the session-host status broker could not listen (code ${error.code ?? "unknown"})`));
@@ -439,6 +475,7 @@ class LocalStatusBroker implements StatusBroker {
           }
           this.#socketIdentity = { dev: stats.dev, ino: stats.ino };
           chmodSync(this.socketPath, 0o600);
+          this.#listenSucceeded = true;
           resolve();
         } catch (error) {
           reject(
@@ -450,6 +487,70 @@ class LocalStatusBroker implements StatusBroker {
       });
     });
     server.on("connection", (socket) => this.#trackConnection(socket));
+  }
+
+  /** Bounded Windows listen; a late success is closed through this server handle only. */
+  async #listenWindowsPipe(server: Server): Promise<void> {
+    const timeoutMs = windowsPipeListenTimeoutForTests ?? WINDOWS_PIPE_LISTEN_TIMEOUT_MS;
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let timer: NodeJS.Timeout;
+      const settleError = (error: NodeJS.ErrnoException) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        server.off("error", onceError);
+        reject(new Error(
+          `pi-review-gate: the session-host named-pipe broker could not listen (code ${error.code ?? "unknown"})`,
+        ));
+      };
+      const onceError = (error: NodeJS.ErrnoException) => settleError(error);
+      timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        server.off("error", onceError);
+        if (server.listening) this.#closeLatePipeListenHandle(server);
+        reject(new Error(
+          `pi-review-gate: the session-host named-pipe broker listen timed out after ${timeoutMs}ms`,
+        ));
+      }, timeoutMs);
+      server.once("error", onceError);
+      try {
+        server.listen(this.socketPath, () => {
+          server.off("error", onceError);
+          if (settled) {
+            if (!this.#listenSucceeded) this.#closeLatePipeListenHandle(server);
+            return;
+          }
+          settled = true;
+          clearTimeout(timer);
+          this.#listenSucceeded = true;
+          resolve();
+        });
+      } catch (error) {
+        settleError(error instanceof Error ? error as NodeJS.ErrnoException : new Error("listen failed"));
+      }
+    });
+  }
+
+  /** Best-effort bounded close for a listen callback that arrived after its caller timed out. */
+  #closeLatePipeListenHandle(server: Server): void {
+    if (this.#latePipeCloseStarted || this.#listenHandleClosed) return;
+    this.#latePipeCloseStarted = true;
+    const timeoutMs = windowsPipeCloseTimeoutForTests ?? WINDOWS_PIPE_CLOSE_TIMEOUT_MS;
+    let settled = false;
+    const timer = setTimeout(() => { settled = true; }, timeoutMs);
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (!error) this.#listenHandleClosed = true;
+    };
+    try {
+      server.close(finish);
+    } catch (error) {
+      finish(error instanceof Error ? error : new Error("close failed"));
+    }
   }
 
   register(instanceId: string, handlers: StatusBrokerStatusHandlers): StatusRegistration {
@@ -759,6 +860,45 @@ class LocalStatusBroker implements StatusBroker {
     }
     this.#connections.clear();
     this.#unauthCount = 0;
+    if (this.#transport.kind === "pipe") {
+      // A failed listen never owns the named-pipe endpoint. In particular, a
+      // collision must not trigger cleanup or close a foreign server.
+      if (!this.#listenSucceeded || this.#listenHandleClosed) return;
+      const server = this.#server;
+      if (!server) {
+        throw new Error("pi-review-gate: the session-host named-pipe listen handle is unavailable during disposal");
+      }
+      const timeoutMs = windowsPipeCloseTimeoutForTests ?? WINDOWS_PIPE_CLOSE_TIMEOUT_MS;
+      return new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          reject(new Error(
+            `pi-review-gate: the session-host named-pipe listen handle close timed out after ${timeoutMs}ms`,
+          ));
+        }, timeoutMs);
+        const finish = (error?: unknown) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (!error || this.#listenHandleClosed) {
+            if (!error) this.#listenHandleClosed = true;
+            resolve();
+            return;
+          }
+          const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
+          reject(new Error(
+            `pi-review-gate: the session-host named-pipe listen handle could not be closed (code ${code ?? "unknown"})`,
+          ));
+        };
+        try {
+          server.close((error) => finish(error));
+        } catch (error) {
+          finish(error);
+        }
+      });
+    }
     // Node/libuv unlinks the pathname used by server.listen() when close
     // finishes. Move any current occupant aside and install a directory guard
     // at that pathname first, so close cannot unlink an unknown replacement.
@@ -781,7 +921,9 @@ class LocalStatusBroker implements StatusBroker {
       }
     }).then(() => {
       this.#finishSocketPathTeardown(pathTeardown);
-      removeOwnEmptyDirectory(this.#transportDir, this.#transportIdentity);
+      if (this.#transport.kind === "unix") {
+        removeOwnEmptyDirectory(this.#transport.transportDir, this.#transport.transportIdentity);
+      }
     });
   }
 
@@ -791,6 +933,10 @@ class LocalStatusBroker implements StatusBroker {
    * only within our private directory and restored after server.close().
    */
   #stageSocketPathTeardown(): SocketPathTeardown {
+    if (this.#transport.kind !== "unix") {
+      throw new Error("pi-review-gate: named-pipe cleanup cannot use filesystem path teardown");
+    }
+    const transportDir = this.#transport.transportDir;
     const quarantined: QuarantinedSocketPath[] = [];
     for (let attempt = 0; attempt < 8; attempt += 1) {
       let occupant: ReturnType<typeof lstatSync> | undefined;
@@ -807,7 +953,7 @@ class LocalStatusBroker implements StatusBroker {
       const occupied = occupant !== undefined;
 
       if (occupied) {
-        const quarantineDir = mkdtempSync(join(this.#transportDir, ".dispose-"));
+        const quarantineDir = mkdtempSync(join(transportDir, ".dispose-"));
         const quarantineDirStats = lstatSync(quarantineDir);
         const quarantineDirIdentity = {
           dev: quarantineDirStats.dev,
@@ -1262,17 +1408,23 @@ class LocalStatusBroker implements StatusBroker {
 }
 
 /**
- * Creates the broker's private, freshly-created transport: a unique mkdtemp
- * directory (mode 0700) inside the canonical existing socket root
- * (or the OS temp directory), with the broker's own Unix socket (mode 0600).
- * POSIX only in this alpha; no daemon adoption, no pre-existing socket
- * unlinking, and no child-process or profile work.
+ * Creates one fresh broker-owned local endpoint. POSIX uses a private mkdtemp
+ * directory (0700) and its own Unix socket (0600); Windows uses only a
+ * cryptorandom public-Node named pipe in the local `\\.\pipe\prg-st-` namespace.
+ * No daemon adoption, foreign-endpoint cleanup, or child-process/profile work.
  */
 export async function createStatusBroker(options: StatusBrokerOptions = {}): Promise<StatusBroker> {
-  if (process.platform === "win32") {
-    throw new Error(
-      `pi-review-gate: the native session-host status broker supports POSIX platforms only in this alpha; ${process.platform} must launch pi through the standard pi-review-gate wrapper`,
-    );
+  const platform = brokerPlatformForTests ?? process.platform;
+  if (platform === "win32") {
+    const socketPath = `${WINDOWS_PIPE_PREFIX}${randomBytes(16).toString("hex")}`;
+    const broker = new LocalStatusBroker({ kind: "pipe", socketPath });
+    try {
+      await broker.listen();
+    } catch (error) {
+      await broker.dispose().catch(() => undefined);
+      throw error;
+    }
+    return broker;
   }
   const root = canonicalSocketRoot(options.socketRoot ?? os.tmpdir());
   // mkdtempSync creates a unique directory with mode 0700; re-assert the
@@ -1307,7 +1459,12 @@ export async function createStatusBroker(options: StatusBrokerOptions = {}): Pro
       `pi-review-gate: unexpected pre-existing entry at the session-host status socket path; refusing to adopt it`,
     );
   }
-  const broker = new LocalStatusBroker(transportDir, socketPath, transportIdentity);
+  const broker = new LocalStatusBroker({
+    kind: "unix",
+    transportDir,
+    transportIdentity,
+    socketPath,
+  });
   try {
     await broker.listen();
   } catch (error) {

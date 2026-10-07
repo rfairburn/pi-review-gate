@@ -29,6 +29,33 @@ The legacy `PI_REVIEW_GATE_DDGS_HELPER` variable is ignored, so an inherited val
 cannot substitute an arbitrary helper; production always resolves the packaged
 `scripts/ddgs-search.py` relative to the loaded extension ([Web tools](web-tools.md)).
 
+### Session-host status IPC
+
+The session-host broker and its child reporter share one authenticated, bounded
+protocol. POSIX uses a fresh private directory (mode `0700`) and broker-owned Unix
+socket (mode `0600`). Windows uses a fresh random public-Node named pipe in the local
+`\\.\pipe\prg-st-<32 lowercase hex characters>` namespace. Windows named-pipe access
+is governed by operating-system ACLs, but the public Node API used here does not expose
+a restrictive security-descriptor or local-only option. The broker therefore relies on
+the default pipe ACL and does not explicitly reject remote clients; remote reachability
+depends on the effective ACL and system configuration. No custom/private ACL is installed
+or promised. The generated name is routing information, not a replacement for the POSIX
+filesystem-permission boundary.
+
+Both transports retain the same per-child random token and host-generation checks,
+authentication-before-status handling, strict sequence and request/session fences,
+bounded newline framing, and connection limits: at most 32 unauthenticated pending
+connections with a two-second authentication deadline. These controls reduce but do
+not eliminate connection/resource-exhaustion risk. The named pipe is not encrypted;
+token authentication does not protect traffic from interception, and neither transport
+claims confidentiality in transit.
+
+This describes only the IPC transport. Windows native-host preflight, manager/PTY
+integration, ConPTY behavior, and restoration remain incomplete and require separate
+native-platform validation. This IPC support does not establish Windows host parity,
+delivery readiness, security equivalence with the POSIX filesystem boundary, or a
+private Windows ACL guarantee.
+
 ## Web egress hardening
 
 Every native web path (`WebFetch`, `BrowserExtract`, and bounded semantic interactive

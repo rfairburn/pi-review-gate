@@ -3,9 +3,9 @@
  *
  * Exercises the REAL production extension entry point (src/session-host/
  * reporter.ts) and protocol (src/session-host/protocol.ts) against a bounded
- * local net server on a unix domain socket and a synthetic Pi event emitter /
- * UI object. No state algorithm is duplicated here: frames are observed on
- * the wire and asserted as received.
+ * local net server on a POSIX socket or Windows named pipe and a synthetic Pi
+ * event emitter/UI object. No state algorithm is duplicated here: frames are
+ * observed on the wire and asserted as received.
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -36,9 +36,10 @@ import {
   type SessionHostStatus,
 } from "../src/session-host/protocol";
 
-// Keep integration socket files inside the isolated worker root while using
-// relative local-socket addresses that fit macOS's bounded sun_path field.
+// Keep POSIX integration socket files inside the isolated worker root while
+// using relative addresses that fit macOS's bounded sun_path field.
 function rootRelativeSocketAddress(address: string): string {
+  if (address.startsWith("\\\\.\\pipe\\")) return address;
   const rooted = relative(process.cwd(), address);
   if (isAbsolute(address) && rooted && rooted !== ".." && !rooted.startsWith(`..${sep}`)
     && Buffer.byteLength(address, "utf8") > 100) return `./${rooted}`;
@@ -167,10 +168,12 @@ interface TestServer {
 let serverCounter = 0;
 
 async function startServer(): Promise<TestServer> {
-  // Keep the path well under the unix socket sun_path limit (~104 chars on
-  // macOS, where tmpdir() is already long).
+  // Keep POSIX paths well under the unix socket sun_path limit (~104 chars on
+  // macOS); Windows test servers use a real public-Node named pipe.
   serverCounter += 1;
-  const socketPath = join(tmpdir(), `sh-${process.pid}-${serverCounter}.sock`);
+  const socketPath = process.platform === "win32"
+    ? `\\\\.\\pipe\\prg-st-${randomBytes(16).toString("hex")}`
+    : join(tmpdir(), `sh-${process.pid}-${serverCounter}.sock`);
   const frames: Frame[] = [];
   let connections = 0;
   const clients: net.Socket[] = [];
@@ -228,7 +231,7 @@ async function startServer(): Promise<TestServer> {
     close: async () => {
       for (const client of clients.splice(0)) client.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      rmSync(socketPath, { force: true });
+      if (process.platform !== "win32") rmSync(socketPath, { force: true });
     },
   };
 }
@@ -268,6 +271,11 @@ function makeBootstrap(socketPath: string, overrides: Record<string, unknown> = 
     generation: randomUUID(),
     ...overrides,
   };
+}
+
+/** Validator-admitted address for memory sockets; never opened as a real pipe. */
+function makeMemorySocketAddress(): string {
+  return `\\\\.\\pipe\\prg-st-${randomBytes(16).toString("hex")}`;
 }
 
 function makeShutdownRequest(
@@ -342,6 +350,23 @@ describe("session-host protocol", () => {
   it("parses a valid bootstrap and rejects malformed fields", () => {
     const bootstrap = makeBootstrap("/tmp/socket.sock");
     assert.ok(parseBootstrap(bootstrap));
+
+    const localPipe = `\\\\.\\pipe\\prg-st-${"a".repeat(32)}`;
+    assert.ok(parseBootstrap({ ...bootstrap, socketPath: localPipe }), "generated local Windows pipe namespace is admitted cross-platform");
+    for (const socketPath of [
+      `\\\\server\\pipe\\prg-st-${"a".repeat(32)}`,
+      `\\\\?\\pipe\\prg-st-${"a".repeat(32)}`,
+      `\\\\.\\pipe\\other-${"a".repeat(32)}`,
+      `\\\\.\\pipe\\prg-st-..${"a".repeat(30)}`,
+      `\\\\.\\pipe\\prg-st-${"A".repeat(32)}`,
+      `${localPipe}\n`,
+      "/tmp/../socket.sock",
+      "//tmp/socket.sock",
+      "/tmp/socket.sock/",
+      "/",
+    ]) {
+      assert.equal(parseBootstrap({ ...bootstrap, socketPath }), undefined, `rejected noncanonical IPC address: ${socketPath}`);
+    }
 
     assert.equal(parseBootstrap(undefined), undefined);
     assert.equal(parseBootstrap({ ...bootstrap, version: 2 }), undefined);
@@ -763,7 +788,7 @@ describe("session-host reporter status frames", () => {
   });
 
   it("bounds and drains rename acknowledgements under socket backpressure [review_ack_queue]", async () => {
-    const fakeServer = { socketPath: join(process.cwd(), "unused-memory-reporter.sock") } as TestServer;
+    const fakeServer = { socketPath: makeMemorySocketAddress() } as TestServer;
     const memory = createMemoryReporterSocket();
     const native = { id: "ack-queue-session", name: undefined as string | undefined, entries: [] as unknown[] };
     const sessionManager: TestCtx["sessionManager"] = {
@@ -844,7 +869,7 @@ describe("session-host reporter status frames", () => {
   });
 
   it("refreshes the canonical title after the first user message is persisted, before settlement [review_persisted_user]", async () => {
-    const fakeServer = { socketPath: join(process.cwd(), "unused-memory-reporter.sock") } as TestServer;
+    const fakeServer = { socketPath: makeMemorySocketAddress() } as TestServer;
     const memory = createMemoryReporterSocket();
     const native = { id: "stored-message-session", name: undefined as string | undefined, entries: [] as unknown[] };
     const sessionManager: TestCtx["sessionManager"] = {
@@ -1293,7 +1318,7 @@ describe("session-host reporter status frames", () => {
   });
 
   it("bounds shutdown acknowledgements under writable backpressure before further side effects", async () => {
-    const fakeServer = { socketPath: join(process.cwd(), "unused-memory-shutdown.sock") } as TestServer;
+    const fakeServer = { socketPath: makeMemorySocketAddress() } as TestServer;
     const memory = createMemoryReporterSocket();
     const sessionManager: TestCtx["sessionManager"] = {
       getSessionId: () => "backpressure-shutdown-session",
@@ -1687,7 +1712,7 @@ describe("session-host reporter status frames", () => {
     assert.ok(reconnected, "a new session retries the connection");
     await testPi.trigger("session_shutdown", { type: "session_shutdown" });
     await new Promise<void>((resolve) => reopened.close(() => resolve()));
-    rmSync(server.socketPath, { force: true });
+    if (process.platform !== "win32") rmSync(server.socketPath, { force: true });
   });
 
   it("cancels pending reconnects on session shutdown (no stale callbacks into later sessions)", async () => {
@@ -1822,7 +1847,9 @@ describe("session-host reporter status frames", () => {
 
   it("bounds backpressure: retains only the latest snapshot while the host stops reading", async () => {
     serverCounter += 1;
-    const socketPath = join(tmpdir(), `sh-${process.pid}-${serverCounter}.sock`);
+    const socketPath = process.platform === "win32"
+      ? `\\\\.\\pipe\\prg-st-${randomBytes(16).toString("hex")}`
+      : join(tmpdir(), `sh-${process.pid}-${serverCounter}.sock`);
     let client: net.Socket | undefined;
     const rawServer = net.createServer((c) => {
       client = c; // Accept but never read until released below.
@@ -1844,7 +1871,7 @@ describe("session-host reporter status frames", () => {
       close: async () => {
         client?.destroy();
         await new Promise<void>((resolve) => rawServer.close(() => resolve()));
-        rmSync(socketPath, { force: true });
+        if (process.platform !== "win32") rmSync(socketPath, { force: true });
       },
     } as unknown as TestServer);
 
@@ -1955,7 +1982,9 @@ describe("session-host reporter status frames", () => {
 
   it("keeps the reconnect budget across accept-then-close connections", async () => {
     serverCounter += 1;
-    const socketPath = join(tmpdir(), `sh-${process.pid}-${serverCounter}.sock`);
+    const socketPath = process.platform === "win32"
+      ? `\\\\.\\pipe\\prg-st-${randomBytes(16).toString("hex")}`
+      : join(tmpdir(), `sh-${process.pid}-${serverCounter}.sock`);
     let connections = 0;
     const broker = net.createServer((client) => {
       connections += 1;
@@ -1978,7 +2007,7 @@ describe("session-host reporter status frames", () => {
     await sleep(50);
     assert.equal(connections, 4, "shutdown leaves no further attempts");
     await new Promise<void>((resolve) => broker.close(() => resolve()));
-    rmSync(socketPath, { force: true });
+    if (process.platform !== "win32") rmSync(socketPath, { force: true });
   });
 
   it("refreshes observation on consecutive session starts sharing one UI", async () => {
@@ -2418,6 +2447,16 @@ describe("session-host reporter status frames", () => {
 const PRELOAD_PATH = join(__dirname, "../src/session-host/bootstrap-preload.js");
 const REPORTER_PATH = join(__dirname, "../src/session-host/reporter.js");
 
+/** Node's quoted NODE_OPTIONS grammar treats Windows backslashes as escapes. */
+function nodeOptionsPath(pathname: string): string {
+  return pathname.replace(/\\/g, "/");
+}
+
+function nodeRequireOption(pathname: string, quoted = false): string {
+  const portablePath = nodeOptionsPath(pathname);
+  return quoted ? `--require="${portablePath}"` : `--require=${portablePath}`;
+}
+
 describe("session-host bootstrap preload", () => {
   function withNodeOptions<T>(value: string | undefined, fn: () => T): T {
     const previous = process.env.NODE_OPTIONS;
@@ -2433,7 +2472,7 @@ describe("session-host bootstrap preload", () => {
   }
 
   it("restoreNodeOptions restores the original exactly and consumes the frame", () => {
-    withNodeOptions(`--require=${PRELOAD_PATH} --max-old-space-size=100`, () => {
+    withNodeOptions(`${nodeRequireOption(PRELOAD_PATH)} --max-old-space-size=100`, () => {
       process.env[NODE_OPTIONS_RESTORE_ENV] = JSON.stringify({ original: "--max-old-space-size=100" });
       restoreNodeOptions();
       assert.equal(process.env.NODE_OPTIONS, "--max-old-space-size=100");
@@ -2442,7 +2481,7 @@ describe("session-host bootstrap preload", () => {
   });
 
   it("restoreNodeOptions deletes NODE_OPTIONS for a null original", () => {
-    withNodeOptions(`--require=${PRELOAD_PATH}`, () => {
+    withNodeOptions(nodeRequireOption(PRELOAD_PATH), () => {
       process.env[NODE_OPTIONS_RESTORE_ENV] = JSON.stringify({ original: null });
       restoreNodeOptions();
       assert.equal(process.env.NODE_OPTIONS, undefined);
@@ -2450,7 +2489,7 @@ describe("session-host bootstrap preload", () => {
   });
 
   it("restoreNodeOptions strips only its own flag on an invalid frame (no content dump)", () => {
-    withNodeOptions(`--require=${PRELOAD_PATH} --other=1`, () => {
+    withNodeOptions(`${nodeRequireOption(PRELOAD_PATH)} --other=1`, () => {
       process.env[NODE_OPTIONS_RESTORE_ENV] = "not-json";
       restoreNodeOptions();
       assert.equal(process.env.NODE_OPTIONS, "--other=1");
@@ -2470,7 +2509,7 @@ describe("session-host bootstrap preload", () => {
   });
 
   it("restoreNodeOptions strips a quoted self flag and preserves spaced options verbatim", () => {
-    withNodeOptions(`--require="${PRELOAD_PATH}" --require="/tmp/a b.js" --other=1`, () => {
+    withNodeOptions(`${nodeRequireOption(PRELOAD_PATH, true)} --require="/tmp/a b.js" --other=1`, () => {
       process.env[NODE_OPTIONS_RESTORE_ENV] = "malformed";
       restoreNodeOptions();
       assert.equal(process.env.NODE_OPTIONS, `--require="/tmp/a b.js" --other=1`);
@@ -2478,7 +2517,7 @@ describe("session-host bootstrap preload", () => {
   });
 
   it("restoreNodeOptions restores a spaced original verbatim", () => {
-    withNodeOptions(`--require=${PRELOAD_PATH}`, () => {
+    withNodeOptions(nodeRequireOption(PRELOAD_PATH), () => {
       process.env[NODE_OPTIONS_RESTORE_ENV] = JSON.stringify({ original: `--require="/tmp/a b.js"` });
       restoreNodeOptions();
       assert.equal(process.env.NODE_OPTIONS, `--require="/tmp/a b.js"`);
@@ -2486,7 +2525,7 @@ describe("session-host bootstrap preload", () => {
   });
 
   it("restoreNodeOptions bounds the original in UTF-8 bytes, not UTF-16 length", () => {
-    withNodeOptions(`--require="${PRELOAD_PATH}" --other=1`, () => {
+    withNodeOptions(`${nodeRequireOption(PRELOAD_PATH, true)} --other=1`, () => {
       // 5000 code units but 10000 UTF-8 bytes: over the 8KiB launch limit.
       process.env[NODE_OPTIONS_RESTORE_ENV] = JSON.stringify({ original: "é".repeat(5_000) });
       restoreNodeOptions();
@@ -2675,16 +2714,16 @@ describe("session-host bootstrap preload", () => {
     const bootstrap = makeBootstrap(server.socketPath);
     const { status, markerData } = await runPreloadedChild({
       bootstrap,
-      restoreFrameFor: (userFixture) => JSON.stringify({ original: `--require=${userFixture}` }),
+      restoreFrameFor: (userFixture) => JSON.stringify({ original: nodeRequireOption(userFixture, true) }),
       // Host contract: our --require is PREPENDED before the original options.
-      nodeOptionsFor: (userFixture) => `--require=${PRELOAD_PATH} --require=${userFixture}`,
-      expectedNodeOptionsFor: (userFixture) => `--require=${userFixture}`,
+      nodeOptionsFor: (userFixture) => `${nodeRequireOption(PRELOAD_PATH, true)} ${nodeRequireOption(userFixture, true)}`,
+      expectedNodeOptionsFor: (userFixture) => nodeRequireOption(userFixture, true),
     });
     assert.equal(status, 0, "preloaded child exits cleanly (env hygiene + default factory assertions)");
 
     assert.equal(markerData.userFixture.ran, true, "original user fixture still executes");
     assert.ok(
-      markerData.userFixture.nodeOptions !== null && !markerData.userFixture.nodeOptions.includes(PRELOAD_PATH),
+      markerData.userFixture.nodeOptions !== null && !markerData.userFixture.nodeOptions.includes(nodeOptionsPath(PRELOAD_PATH)),
       "prepended preload restores before the user fixture loads",
     );
     assert.equal(markerData.grandchild.bootstrap, false, "descendant never inherits the bootstrap secret");
@@ -2708,12 +2747,12 @@ describe("session-host bootstrap preload", () => {
     const { status, markerData } = await runPreloadedChild({
       bootstrap,
       restoreFrameFor: () => "malformed",
-      nodeOptionsFor: (userFixture) => `--require="${PRELOAD_PATH}" --require="${userFixture}"`,
-      expectedNodeOptionsFor: (userFixture) => `--require="${userFixture}"`,
+      nodeOptionsFor: (userFixture) => `${nodeRequireOption(PRELOAD_PATH, true)} ${nodeRequireOption(userFixture, true)}`,
+      expectedNodeOptionsFor: (userFixture) => nodeRequireOption(userFixture, true),
     });
     assert.equal(status, 0, "preloaded child exits cleanly (quoted self flag stripped)");
     assert.ok(
-      markerData.userFixture.nodeOptions !== null && !markerData.userFixture.nodeOptions.includes(PRELOAD_PATH),
+      markerData.userFixture.nodeOptions !== null && !markerData.userFixture.nodeOptions.includes(nodeOptionsPath(PRELOAD_PATH)),
       "quoted --require self flag removed from NODE_OPTIONS",
     );
     assert.equal(markerData.grandchild.bootstrap, false, "descendant never inherits the bootstrap secret");
@@ -2753,19 +2792,19 @@ describe("session-host bootstrap preload", () => {
         const { status, markerData, output } = await runPreloadedChild({
           bootstrap,
           restoreFrameFor: () => restoreFrame,
-          nodeOptionsFor: (userFixture) => `--require="${spacedPreload}" --require="${userFixture}"`,
-          expectedNodeOptionsFor: (userFixture) => `--require="${userFixture}"`,
+          nodeOptionsFor: (userFixture) => `${nodeRequireOption(spacedPreload, true)} ${nodeRequireOption(userFixture, true)}`,
+          expectedNodeOptionsFor: (userFixture) => nodeRequireOption(userFixture, true),
           fixturesRoot: root,
           reporterPath: join(root, "src/session-host/reporter.js"),
         });
         assert.equal(status, 0, `preloaded child exits cleanly (spaced self flag stripped)\n${output}`);
         assert.equal(
           markerData.userFixture.nodeOptions,
-          `--require="${join(root, "fixtures/user-fixture.js")}"`,
+          nodeRequireOption(join(root, "fixtures/user-fixture.js"), true),
           "user fixture receives exactly the original NODE_OPTIONS",
         );
         assert.ok(
-          !markerData.userFixture.nodeOptions!.includes(spacedPreload),
+          !markerData.userFixture.nodeOptions!.includes(nodeOptionsPath(spacedPreload)),
           "spaced quoted self flag removed from NODE_OPTIONS",
         );
         assert.equal(markerData.grandchild.bootstrap, false, "descendant never inherits the bootstrap secret");

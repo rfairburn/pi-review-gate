@@ -2,10 +2,10 @@
  * Focused real-socket tests for the authenticated bounded local status broker
  * (src/session-host/broker.ts, issue #323).
  *
- * These tests exercise real local net server/client Unix sockets against the
- * candidate broker together with the shared session-host protocol contract
- * (src/session-host/protocol module). These tests are focused broker checks;
- * they do not claim completion of native-host integration.
+ * These tests exercise real local net server/client Unix sockets, scoped
+ * transport-branch seams, and a guarded real Windows named pipe against the
+ * broker and shared protocol. They are focused IPC checks; they do not claim
+ * completion of native-host integration.
  */
 
 import assert from "node:assert/strict";
@@ -29,11 +29,13 @@ import {
 const INSTANCE_A = "11111111-1111-4111-8111-111111111111";
 const INSTANCE_B = "22222222-2222-4222-8222-222222222222";
 const INSTANCE_C = "33333333-3333-4333-8333-333333333333";
+const WINDOWS_PIPE_ADDRESS = /^\\\\\.\\pipe\\prg-st-[0-9a-f]{32}$/;
 
 // The isolated worker root is deliberately longer than macOS's sun_path. The
 // tests still create every socket inode below this root: only the address sent
 // to bind/connect is expressed relative to the already-rooted process cwd.
 function rootRelativeSocketAddress(address: string): string {
+  if (WINDOWS_PIPE_ADDRESS.test(address)) return address;
   const relative = path.relative(process.cwd(), address);
   if (path.isAbsolute(address) && relative && relative !== ".." && !relative.startsWith(`..${path.sep}`)
     && Buffer.byteLength(address, "utf8") > 100) return `./${relative}`;
@@ -217,9 +219,35 @@ async function createStatusBroker(options?: StatusBrokerOptions): Promise<Status
   brokerTest.setSocketPathLimitForTests(4096);
   const broker = await createStatusBrokerImpl(options);
   brokers.add(broker);
-  ownDirectory(path.dirname(broker.socketPath));
-  ownFile(broker.socketPath);
+  if (!WINDOWS_PIPE_ADDRESS.test(broker.socketPath)) {
+    ownDirectory(path.dirname(broker.socketPath));
+    ownFile(broker.socketPath);
+  }
   return broker;
+}
+
+async function withFilesystemCallSpy<T>(run: (calls: string[]) => Promise<T>): Promise<T> {
+  const fsModule = require("node:fs") as Record<string, unknown>;
+  const names = [
+    "chmodSync", "linkSync", "lstatSync", "mkdirSync", "renameSync", "rmdirSync",
+    "statSync", "unlinkSync", "mkdtempSync", "realpathSync",
+  ];
+  const calls: string[] = [];
+  const originals = new Map<string, unknown>();
+  for (const name of names) {
+    const original = fsModule[name];
+    if (typeof original !== "function") throw new Error(`test setup: node:fs.${name} is unavailable`);
+    originals.set(name, original);
+    fsModule[name] = (...args: unknown[]) => {
+      calls.push(name);
+      return Reflect.apply(original, fsModule, args);
+    };
+  }
+  try {
+    return await run(calls);
+  } finally {
+    for (const [name, original] of originals) fsModule[name] = original;
+  }
 }
 
 async function withDeadline<T>(promise: Promise<T>, label: string, timeoutMs = SOCKET_CLOSE_DEADLINE_MS): Promise<T> {
@@ -238,6 +266,9 @@ async function withDeadline<T>(promise: Promise<T>, label: string, timeoutMs = S
 
 afterEach(async () => {
   brokerTest.setSocketPathLimitForTests(undefined);
+  brokerTest.setPlatformForTests(undefined);
+  brokerTest.setCreateServerForTests(undefined);
+  brokerTest.setWindowsPipeTimeoutsForTests(undefined, undefined);
   const unexpectedErrors = [
     ...[...clients.values()].flatMap((state) => {
       const errors = state.errors.filter((error) => !state.expectedErrors.has(error));
@@ -480,7 +511,215 @@ test("shutdown acknowledgement policy binds the request and refuses stale sessio
   }), "stale-session");
 });
 
-test("broker creates a private 0700 transport, owns its 0600 socket, and cleans up while preserving unknown files", async () => {
+test("Windows transport uses a fresh local pipe and disposes only its own listen handle", async () => {
+  const server = new net.Server();
+  let listenAddress = "";
+  let closeCalls = 0;
+  Object.defineProperty(server, "listen", {
+    value: (...args: unknown[]) => {
+      listenAddress = args[0] as string;
+      setImmediate(() => (args[1] as () => void)());
+      return server;
+    },
+  });
+  Object.defineProperty(server, "close", {
+    value: (callback?: (error?: Error) => void) => {
+      closeCalls += 1;
+      setImmediate(() => {
+        server.emit("close");
+        callback?.();
+      });
+      return server;
+    },
+  });
+  brokerTest.setPlatformForTests("win32");
+  brokerTest.setCreateServerForTests(() => server);
+
+  await withFilesystemCallSpy(async (filesystemCalls) => {
+    // A relative socketRoot would fail on POSIX. Windows must not consult it or
+    // touch filesystem permission/path APIs for the named-pipe address.
+    const broker = await createStatusBrokerImpl({ socketRoot: "relative/unused" });
+    brokers.add(broker);
+    assert.match(listenAddress, WINDOWS_PIPE_ADDRESS);
+    assert.equal(broker.socketPath, listenAddress);
+    const registration = broker.register(INSTANCE_A, recording().handlers);
+    assert.deepEqual(parseBootstrap(registration.bootstrap), registration.bootstrap);
+
+    await disposeBroker(broker);
+    assert.equal(closeCalls, 1, "the broker closes its own successful listen handle exactly once");
+    assert.deepEqual(filesystemCalls, [], "named-pipe bind and disposal never call filesystem permission or cleanup APIs");
+  });
+});
+
+test("Windows named-pipe listen collision refuses adoption and never closes a foreign server", async () => {
+  const server = new net.Server();
+  let listenAddress = "";
+  let closeCalls = 0;
+  Object.defineProperty(server, "listen", {
+    value: (...args: unknown[]) => {
+      listenAddress = args[0] as string;
+      setImmediate(() => server.emit("error", Object.assign(new Error("pipe already exists"), { code: "EADDRINUSE" })));
+      return server;
+    },
+  });
+  Object.defineProperty(server, "close", {
+    value: () => {
+      closeCalls += 1;
+      return server;
+    },
+  });
+  brokerTest.setPlatformForTests("win32");
+  brokerTest.setCreateServerForTests(() => server);
+
+  await withFilesystemCallSpy(async (filesystemCalls) => {
+    await assert.rejects(
+      createStatusBrokerImpl({ socketRoot: "relative/unused" }),
+      /could not listen \(code EADDRINUSE\)/,
+    );
+    assert.match(listenAddress, WINDOWS_PIPE_ADDRESS);
+    assert.equal(closeCalls, 0, "a failed bind never adopts or closes the existing endpoint");
+    assert.deepEqual(filesystemCalls, [], "a collision performs no filesystem cleanup or permission calls");
+  });
+});
+
+test("Windows pipe disposal reports a listen-handle close failure", async () => {
+  const server = new net.Server();
+  Object.defineProperty(server, "listen", {
+    value: (...args: unknown[]) => {
+      setImmediate(() => (args[1] as () => void)());
+      return server;
+    },
+  });
+  Object.defineProperty(server, "close", {
+    value: (callback?: (error?: Error) => void) => {
+      setImmediate(() => callback?.(Object.assign(new Error("close failed"), { code: "EIO" })));
+      return server;
+    },
+  });
+  brokerTest.setPlatformForTests("win32");
+  brokerTest.setCreateServerForTests(() => server);
+
+  const broker = await createStatusBrokerImpl();
+  await assert.rejects(broker.dispose(), /listen handle could not be closed \(code EIO\)/);
+});
+
+test("Windows named-pipe listen timeout is bounded and does not claim an endpoint", async () => {
+  const server = new net.Server();
+  let closeCalls = 0;
+  Object.defineProperty(server, "listen", { value: () => server });
+  Object.defineProperty(server, "close", {
+    value: () => {
+      closeCalls += 1;
+      return server;
+    },
+  });
+  brokerTest.setPlatformForTests("win32");
+  brokerTest.setCreateServerForTests(() => server);
+  brokerTest.setWindowsPipeTimeoutsForTests(20, 20);
+
+  await assert.rejects(
+    createStatusBrokerImpl(),
+    /named-pipe broker listen timed out after 20ms/,
+  );
+  assert.equal(closeCalls, 0, "without a successful listen callback no handle is assumed to be owned");
+});
+
+test("late Windows pipe listen success is fenced and its owned handle is closed", async () => {
+  const server = new net.Server();
+  let listenCallback: (() => void) | undefined;
+  let closeCalls = 0;
+  Object.defineProperty(server, "listen", {
+    value: (_address: string, callback: () => void) => {
+      listenCallback = callback;
+      return server;
+    },
+  });
+  Object.defineProperty(server, "close", {
+    value: (callback?: (error?: Error) => void) => {
+      closeCalls += 1;
+      setImmediate(() => {
+        server.emit("close");
+        callback?.();
+      });
+      return server;
+    },
+  });
+  brokerTest.setPlatformForTests("win32");
+  brokerTest.setCreateServerForTests(() => server);
+  brokerTest.setWindowsPipeTimeoutsForTests(20, 50);
+
+  await assert.rejects(createStatusBrokerImpl(), /listen timed out after 20ms/);
+  assert.equal(typeof listenCallback, "function");
+  const closed = once(server, "close").then(() => undefined);
+  listenCallback!();
+  await withDeadline(closed, "late Windows pipe listener close");
+  assert.equal(closeCalls, 1, "a late successful bind is closed using only its own server handle");
+});
+
+test("Windows pipe close timeout stays rejected when its callback arrives late", async () => {
+  const server = new net.Server();
+  let closeCallback: ((error?: Error) => void) | undefined;
+  let closeCalls = 0;
+  Object.defineProperty(server, "listen", {
+    value: (_address: string, callback: () => void) => {
+      setImmediate(callback);
+      return server;
+    },
+  });
+  Object.defineProperty(server, "close", {
+    value: (callback?: (error?: Error) => void) => {
+      closeCalls += 1;
+      closeCallback = callback;
+      return server;
+    },
+  });
+  brokerTest.setPlatformForTests("win32");
+  brokerTest.setCreateServerForTests(() => server);
+  brokerTest.setWindowsPipeTimeoutsForTests(50, 20);
+
+  const broker = await createStatusBrokerImpl();
+  const disposal = broker.dispose();
+  await assert.rejects(disposal, /listen handle close timed out after 20ms/);
+  assert.equal(typeof closeCallback, "function");
+
+  // A later close event is observed, but the already-timed-out promise and
+  // its result are not rewritten by a stale close callback.
+  server.emit("close");
+  closeCallback!();
+  await assert.rejects(broker.dispose(), /listen handle close timed out after 20ms/);
+  assert.equal(closeCalls, 1, "late callback does not issue a second close");
+});
+
+test("real Windows Node named pipe accepts the authenticated protocol and closes on dispose", {
+  skip: process.platform !== "win32",
+}, async () => {
+  const broker = await createStatusBrokerImpl();
+  brokers.add(broker);
+  assert.match(broker.socketPath, WINDOWS_PIPE_ADDRESS);
+  const recorded = recording();
+  const registration = broker.register(INSTANCE_A, recorded.handlers);
+  const client = await connectClient(registration.bootstrap.socketPath);
+  client.write(`${JSON.stringify(helloFrame(registration.bootstrap))}\n`);
+  client.write(`${JSON.stringify(statusFrame(registration.bootstrap, { sequence: 1 }))}\n`);
+  await waitFor(() => recorded.statuses.length === 1);
+  assert.equal(recorded.statuses[0]?.sequence, 1);
+
+  const closed = expectClientClose(client);
+  await disposeBroker(broker);
+  await closed;
+  await new Promise<void>((resolve, reject) => {
+    const probe = net.connect(broker.socketPath);
+    probe.once("connect", () => {
+      probe.destroy();
+      reject(new Error("disposed Windows pipe accepted a new client"));
+    });
+    probe.once("error", () => resolve());
+  });
+});
+
+test("broker creates a private 0700 transport, owns its 0600 socket, and cleans up while preserving unknown files", {
+  skip: process.platform === "win32",
+}, async () => {
   const root = makeSocketRoot();
   const marker = path.join(root, "unknown-sibling-entry.txt");
   fs.writeFileSync(marker, "untouched");
@@ -511,7 +750,9 @@ test("broker creates a private 0700 transport, owns its 0600 socket, and cleans 
   await disposeBroker(broker, "idempotent broker dispose");
 });
 
-test("broker cleanup preserves a different socket inode that appears at its former path", async () => {
+test("broker cleanup preserves a different socket inode that appears at its former path", {
+  skip: process.platform === "win32",
+}, async () => {
   const root = makeSocketRoot();
   const broker = await createStatusBroker({ socketRoot: root });
   const socketPath = broker.socketPath;
@@ -528,7 +769,9 @@ test("broker cleanup preserves a different socket inode that appears at its form
   assert.equal(fs.existsSync(transportDir), true, "the directory stays while it contains the replacement");
 });
 
-test("broker cleanup preserves an unknown directory at the socket pathname", async () => {
+test("broker cleanup preserves an unknown directory at the socket pathname", {
+  skip: process.platform === "win32",
+}, async () => {
   const root = makeSocketRoot();
   const broker = await createStatusBroker({ socketRoot: root });
   const socketPath = broker.socketPath;
@@ -544,7 +787,9 @@ test("broker cleanup preserves an unknown directory at the socket pathname", asy
   assert.equal(fs.readFileSync(marker, "utf8"), "preserve directory");
 });
 
-test("broker restoration never overwrites a concurrent destination", async () => {
+test("broker restoration never overwrites a concurrent destination", {
+  skip: process.platform === "win32",
+}, async () => {
   const root = makeSocketRoot();
   const broker = await createStatusBroker({ socketRoot: root });
   const socketPath = broker.socketPath;
@@ -1327,7 +1572,9 @@ test("snapshot consumer throws are contained; the broker keeps serving", async (
   await waitFor(() => recorded.statuses.length === 4);
 });
 
-test("dispose clears pending unauth clients, timers, and the transport without touching unknown files", async () => {
+test("dispose clears pending unauth clients, timers, and the transport without touching unknown files", {
+  skip: process.platform === "win32",
+}, async () => {
   const root = makeSocketRoot();
   const broker = await createStatusBroker({ socketRoot: root });
   const registration = broker.register(INSTANCE_A, recording().handlers);
@@ -1350,7 +1597,9 @@ test("dispose clears pending unauth clients, timers, and the transport without t
   await disposeBroker(broker, "idempotent broker dispose");
 });
 
-test("invalid socket roots fail clearly without adopting or unlinking anything", async () => {
+test("invalid socket roots fail clearly without adopting or unlinking anything", {
+  skip: process.platform === "win32",
+}, async () => {
   const missingRoot = path.join(os.tmpdir(), `prg-broker-missing-${Date.now()}`);
   await assert.rejects(
     createStatusBroker({ socketRoot: missingRoot }),

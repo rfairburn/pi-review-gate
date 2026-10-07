@@ -3,9 +3,10 @@
  *
  * A separate session-host process spawns the Node-based Pi CLI directly with
  * a one-shot bootstrap environment variable (HOST_BOOTSTRAP_ENV) describing a
- * local stream socket it listens on. The companion reporter (reporter.ts),
+ * local stream endpoint it listens on (a POSIX Unix socket or Windows named
+ * pipe). The companion reporter (reporter.ts),
  * loaded in the spawned child before the review gate extension, connects to
- * that socket, authenticates with a hello frame carrying the bootstrap token,
+ * that endpoint, authenticates with a hello frame carrying the bootstrap token,
  * and then pushes bounded newline-delimited JSON status frames:
  * top-level busy/idle, pending-input presence, modal input surface, a
  * two-line generic activity summary, and optional canonical native-session
@@ -20,6 +21,8 @@
  * field is strictly bounded and MAX_STATUS_FRAME_BYTES caps each wire frame;
  * this module is the shared contract for both sides and performs no IO.
  */
+
+import { posix as posixPath } from "node:path";
 
 export const HOST_BOOTSTRAP_ENV = "PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP";
 
@@ -37,6 +40,9 @@ export const MAX_NATIVE_SESSION_ID_BYTES = 256;
 
 const MAX_ID_LENGTH = 128;
 const MAX_SOCKET_PATH_LENGTH = 2048;
+/** Generated Windows pipe addresses have a fixed 48-character shape. */
+const MAX_LOCAL_PIPE_ADDRESS_LENGTH = 48;
+const LOCAL_PIPE_ADDRESS_PATTERN = /^\\\\\.\\pipe\\prg-st-[0-9a-f]{32}$/;
 /** Cryptorandom hex token issued by the session host (32 random bytes). */
 const TOKEN_PATTERN = /^[0-9a-f]{64}$/i;
 /** UUID-like identifiers: hex digits and hyphens only, at least one hex digit. */
@@ -45,7 +51,7 @@ const ID_PATTERN = /^[0-9a-f-]*[0-9a-f][0-9a-f-]*$/i;
 /** One-shot bootstrap the session host injects into the spawned CLI child's environment. */
 export interface SessionHostBootstrap {
   version: 1;
-  /** Absolute POSIX local stream-socket path. */
+  /** Canonical absolute POSIX socket path or generated local Windows named-pipe address. */
   socketPath: string;
   /** Cryptorandom hex64 authentication token; never appears in status frames. */
   token: string;
@@ -165,11 +171,15 @@ function isValidToken(value: unknown): value is string {
   return typeof value === "string" && TOKEN_PATTERN.test(value);
 }
 
-/** Absolute POSIX local stream-socket path (the only form the launch uses). */
+/** Admits only canonical absolute POSIX sockets or this host's bounded local-pipe namespace. */
 function isValidSocketPath(value: unknown): value is string {
-  if (typeof value !== "string" || value.length === 0 || value.length > MAX_SOCKET_PATH_LENGTH) return false;
-  if (value.includes("\0")) return false;
-  return value.startsWith("/");
+  if (typeof value !== "string" || value.length === 0 || value.includes("\0")) return false;
+  if (value.length <= MAX_LOCAL_PIPE_ADDRESS_LENGTH && LOCAL_PIPE_ADDRESS_PATTERN.test(value)) return true;
+  return value.length <= MAX_SOCKET_PATH_LENGTH
+    && value.startsWith("/")
+    && value !== "/"
+    && !value.endsWith("/")
+    && posixPath.normalize(value) === value;
 }
 
 function isValidActivityLine(value: unknown): value is string {

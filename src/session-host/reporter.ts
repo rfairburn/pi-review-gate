@@ -7,7 +7,7 @@
  * first and the review gate after it (plus the early NODE_OPTIONS preload). It reports
  * top-level session status (busy/idle, pending input presence, modal input
  * surface, generic activity) to the parent session-host process over a local
- * stream socket described by the one-shot
+ * stream endpoint (POSIX Unix socket or Windows named pipe) described by the one-shot
  * PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP environment variable.
  *
  * Invariants:
@@ -45,7 +45,6 @@ import {
   isValidNativeSessionId,
   isValidRenameName,
   parseBootstrap,
-  parseShutdownRequest,
   sanitizeActivityLine,
   type SessionHostBootstrap,
   type SessionHostHello,
@@ -90,7 +89,7 @@ export interface SessionHostReporterOptions {
   maxReconnectAttempts?: number;
   /** Test seam: observe the raw socket when a connection attempt is created. */
   onSocket?: (socket: net.Socket) => void;
-  /** Test seam: supply an in-memory socket without touching the filesystem. */
+  /** Test seam: supply an in-memory socket without touching a local IPC endpoint. */
   connectSocket?: (socketPath: string) => net.Socket;
 }
 

@@ -105,7 +105,9 @@ The launcher rejects unsupported platform, Node version, non-interactive use, an
 runtime-role contexts before starting a host. It builds from a source checkout or uses
 the compiled package, then validates or provisions the existing DDGS environment once
 before starting the host or creating any instance capability. Source builds use fresh
-bounded staging, locked `npm ci --ignore-scripts`, and the existing build script; public
+bounded staging and locked `npm ci --include=dev --ignore-scripts`. It then runs the
+stage-installed TypeScript compiler directly through trusted Node, without the package
+build script's recursive clean step; ordinary package scripts are unchanged. Public
 Node can terminate only the directly owned Windows setup child, so abnormal timeout
 settlement is not represented as descendant-tree proof and uncertain stages are kept.
 Setup preserves trusted original `NODE_OPTIONS` and provider values while removing only
@@ -137,15 +139,26 @@ models, keybindings, extensions, MCP configuration, skills, and provider environ
 The host does not clone those files, republish skills, create per-window credentials, or
 require a separate login. It does not attach to existing or detached processes, adopt
 them, or reparent work. Moving the sidebar highlight does not change the active
-session; press Enter to activate a row. Activating another session or hiding the sidebar
+session; press Enter to activate a row. Enter on an exited row instead starts a new
+owned process for its current observed conversation, using a freshly revalidated saved
+entry. A positively never-saved binding can start fresh in the same workspace only when
+the safe catalog confirms that exact conversation is absent. Unknown, ambiguous, unsafe,
+or missing-known-saved bindings are refused; the host never substitutes the original
+launch conversation or newest file. Successful replacement removes the old placeholder
+without taking over a later focus, pane, or draft; a failure retains the old row and any
+already-started child. Activating another session or hiding the sidebar
 changes only display and input focus: it does not pause, stop, or transfer ownership of
 any session. Background work can continue while another session is active. If the active
 owner exits or disappears, the host does not automatically send input to a sibling.
 
 **Saved conversations** is a deliberate, read-only picker in the sidebar. It lists the
 shared native agent root's saved conversations showing each conversation's canonical
-caption only — never transcripts, tool arguments, question text, or credentials.
-Highlighting a row does nothing to any running session. Deliberately selecting a row
+caption and, when the catalog recorded one, its workspace on one bounded line (long
+captions/paths are visibly ellipsized) — never transcripts, tool arguments, question
+text, or credentials. A small details area below the list shows more of the selected
+caption and its recorded workspace, wrapped within its reserved rows: the full
+workspace is shown only when it fits, otherwise it is explicitly truncated; a missing
+workspace shows as unavailable, never a current-workspace guess. Highlighting a row does nothing to any running session. Deliberately selecting a row
 revalidates that exact catalog entry (file identity and first-line header) against the
 live file and starts a new, independently owned child in that conversation's recorded
 workspace with an exact per-child `--session` admission; it never adopts an external
@@ -153,8 +166,9 @@ process or attaches a child to another live conversation. A conversation already
 this host is refused while its row is live or its creation is pending, and can be opened
 again after that child has confirmed exit. The picker shows truthful loading, empty,
 unavailable, and partial issue-count notices; Up/Down moves the highlight, Enter opens
-the highlighted conversation, and Escape returns to the roster without pausing or
-stopping anything. A late listing or creation result never takes over a later-opened or
+the highlighted conversation only when that row was fully drawn by the last picker
+render (a too-small fallback or an undrawn/hidden row is refused), and Escape returns
+to the roster without pausing or stopping anything. A late listing or creation result never takes over a later-opened or
 dismissed pane.
 
 The native review-gate configuration is initialized with the ordinary zero-model
@@ -172,12 +186,23 @@ and delegated-execution policies still apply to native activity.
 
 Host keyboard controls apply only while the corresponding host surface has focus. In
 the sidebar, Up/Down moves the selection, Enter opens the selected session or activates
-the New session/Quit host row, Delete removes the selected exited row (`x` does so if
-Delete is explicitly configured as the sidebar toggle), `q`/`Q` activates Quit host,
-and Escape hides the sidebar. Removal is refused unless the backend has
-confirmed that the child exited; a live, unconfirmed, or stale row remains in place
-with a notice. Removing an exited row only detaches that host-owned entry: it does not
-signal a process or delete its workspace, native Pi files, or saved conversation files.
+the New session/Quit host row, `d`/`D` or Delete stops/removes precisely the selected
+fully displayed row (`x` is the Delete fallback when Delete is configured as the sidebar
+toggle), `q`/`Q` activates Quit host,
+Alt+Right returns input focus to the existing Main owner without activating the
+highlighted row, resizing, or hiding (its repeats and releases are fenced so a held key
+never leaks into the child; in Main focus Alt+Right is ordinary native input), and
+Escape hides the sidebar. A live row stops directly only with positively observed
+complete idleness, including zero background tasks and shells, and fresh authenticated
+idle revalidation. Otherwise it requires a separate, fully displayed confirmation for
+that frozen row; cancellation or a vanished target cannot stop a sibling. Removal waits
+for the exact owned process's exit, never merely a shutdown acknowledgement.
+Errored rows follow the same safeguards: an error badge grants neither exit nor force
+authority. A no-child error can be removed only after the backend positively settles its
+own launch and resource releases; pending, uncertain, or stale rows stay with a notice.
+Removing a row detaches only that host entry and never deletes its workspace, native Pi
+files, or saved conversation files. Removing the active owner clears ownership without
+auto-activating a sibling; removing an inactive row preserves the existing owner.
 Delete remains native input in Main focus unless it is itself the explicitly configured
 sidebar-toggle chord.
 In the New session form, Enter submits the explicit workspace path; the native Editor
@@ -190,8 +215,10 @@ current native name for reference and starts with a separate empty **New name** 
 the existing name is never prefilled or treated as an editable draft. Submitting sends a
 persisted rename request fenced by the host row id and the exact observed native session
 id/epoch. A stale or unavailable tuple is rejected, and a failed rename leaves the
-session name unconfirmed. Editing never activates the row, routes input to it, pauses or
-stops its child, or changes the active input owner. Both forms show the effective native
+session name unconfirmed. Escape in the Edit form cancels only that form and returns to
+the visible roster (it does not hide the sidebar); a held Escape repeat does not bubble
+into the roster hide, but a fresh roster Escape still hides. Editing never activates the
+row, routes input to it, pauses or stops its child, or changes the active input owner. Both forms show the effective native
 keybindings; the external-editor action temporarily hands the real terminal to the
 shared native Pi agent directory's `settings.json` `externalEditor` command when it is a
 nonempty string, otherwise to `VISUAL`, then `EDITOR`, then Pi's native platform
@@ -215,13 +242,21 @@ need to keep that native chord.
 
 The sidebar is a bounded top-level summary: the observed native conversation name,
 busy/idle/unknown state, pending-input presence only when observed, and at most a couple
-of generic activity lines. Native names may use Pi's first-user-message fallback when
+of generic activity lines, with reporter-backed numeric background task/shell counts
+when available. Missing or uncertain count observations stay unknown, never inferred
+zero. Native names may use Pi's first-user-message fallback when
 there is no stored title. The sidebar does not monitor or coordinate reviewers, workers,
 or their children, and does not display tool arguments, question text, transcripts, or
 secrets. Status stays unknown until it is observed; an unavailable reporter, disconnect,
 error, or process exit does not turn unknown into Idle. Exited rows retain their last terminal frame until
 explicitly removed. There is no heartbeat timeout that declares a quiet session dead,
 so a valid idle state may remain for hours.
+
+Title highlighting is focus-domain, never both at once: while a sidebar-owned surface
+(roster, form, or confirmation) has focus, the LEFT selected navigation target's title
+is blue; while Main has focus, the ACTUAL active Main conversation's title is white
+(never a sibling or the stale left selection). With no active owner, no row is falsely
+highlighted.
 
 The local status channel uses a private Unix socket and per-instance authorization
 identity bound to the owned child. A pre-main Node preload consumes the one-shot

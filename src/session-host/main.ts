@@ -283,6 +283,8 @@ function statusRegistrar(broker: StatusBroker): StatusRegistrar {
             busy: status.busy,
             pendingInput: status.pendingInput,
             inputSurface: status.inputSurface,
+            backgroundTasks: status.backgroundTasks ?? null,
+            backgroundShells: status.backgroundShells ?? null,
             activity: status.activity,
             ...(status.nativeSession === undefined ? {} : { nativeSession: status.nativeSession }),
           };
@@ -1711,6 +1713,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
 
 /** Internal-only injection seam for focused controller tests; not an option on the public API or CLI. */
 export const __test = Object.freeze({
+  /** Production broker-to-manager adapter, exposed only for wiring regressions. */
+  statusRegistrar,
   /** Pure readiness decision exposed for source regressions (no runtime effect). */
   rowResumeReadiness: (
     view: NativeInstanceView | undefined,

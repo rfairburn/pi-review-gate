@@ -274,6 +274,13 @@ async function startTwoLiveChildren(
       `${session.rowProbe} inherited no external credential-like environment variables`);
     assert.equal(processIsAlive(session.record.pid), true, `${session.rowProbe} is a live native child before the shutdown case`);
   }
+  // Genuine managed native startup, not a synthetic source/handle injection:
+  // both fresh children must publish accounted logical zero counts through the
+  // reporter/broker/manager into complete title-scoped cards. Missing sources
+  // or uncertainty cannot satisfy this predicate by becoming an inferred zero.
+  await driver.waitFrame((text) => [labelA, labelB].every((label) =>
+    cardFor(text, label)?.background === "bg tasks 0 | shells 0"),
+  "both fresh native children publish known zero background counts in complete owner-scoped cards");
   return { runtime, scratch, driver, labelA, labelB, sessionA, sessionB };
 }
 

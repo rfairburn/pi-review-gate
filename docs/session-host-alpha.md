@@ -126,8 +126,9 @@ the row reports that the session name is unavailable rather than inventing a use
 The New field uses Pi's native path completion, with relative suggestions rooted at the
 host startup working directory; this does not select that directory as the workspace.
 Its on-screen key cues reflect the current `keybindings.json` in the shared native Pi
-agent directory. If that file is absent, unavailable, or unsupported, the form shows a
-bounded warning and uses Pi's default form keys. The per-window Profile field is removed: every child uses the same
+agent directory. A genuinely absent optional file is silent and uses Pi's real default
+form keys; an unavailable, unsafe, or unsupported file keeps a bounded warning and the
+same default keys. The per-window Profile field is removed: every child uses the same
 canonical native Pi agent directory, resolved from `PI_CODING_AGENT_DIR` or Pi's
 ordinary `~/.pi/agent` default. That directory is fixed user configuration, not a
 workspace selector, and cannot also be selected as a session workspace.
@@ -192,7 +193,10 @@ toggle), `q`/`Q` activates Quit host,
 Alt+Right returns input focus to the existing Main owner without activating the
 highlighted row, resizing, or hiding (its repeats and releases are fenced so a held key
 never leaks into the child; in Main focus Alt+Right is ordinary native input), and
-Escape hides the sidebar. A live row stops directly only with positively observed
+Escape hides the sidebar. The reserved toggle is two-step: it shows and focuses a hidden
+sidebar; from a visible Main focus one press only moves host input focus to the sidebar
+without hiding it or resizing any child; and a press from sidebar-owned focus hides it
+back to Main. A live row stops directly only with positively observed
 complete idleness, including zero background tasks and shells, and fresh authenticated
 idle revalidation. Otherwise it requires a separate, fully displayed confirmation for
 that frozen row; cancellation or a vanished target cannot stop a sibling. Removal waits
@@ -207,17 +211,23 @@ Delete remains native input in Main focus unless it is itself the explicitly con
 sidebar-toggle chord.
 In the New session form, Enter submits the explicit workspace path; the native Editor
 provides path completion and its current Pi editing bindings. If a completion menu is
-open, the first Escape/cancel action dismisses that native menu; the next cancels the form.
-A form can also be abandoned while a launch/rename result is pending; that changes UI
-ownership only and does not stop or roll back the backend operation. The Edit form is
+open, the first Escape/cancel action dismisses that native menu and keeps the form; the
+next fresh Escape cancels only New and returns to the visible roster without hiding the
+sidebar. New and Edit cancellation are both local to their own form: the active Main
+owner, native process, native input draft, persisted name, selection, and geometry are
+preserved, a retained New **Workspace** draft is still offered by a later form, and the
+held Escape's repeat/release neither hides the roster nor reaches the child as native
+input. A form can also be abandoned while a launch/rename result is pending; that changes
+UI ownership only and does not stop or roll back the backend operation, and its late
+result still cannot take over a later-opened or dismissed pane. The Edit form is
 available with `e` while a row with observed native metadata is highlighted. It shows the
 current native name for reference and starts with a separate empty **New name** field;
 the existing name is never prefilled or treated as an editable draft. Submitting sends a
 persisted rename request fenced by the host row id and the exact observed native session
 id/epoch. A stale or unavailable tuple is rejected, and a failed rename leaves the
-session name unconfirmed. Escape in the Edit form cancels only that form and returns to
-the visible roster (it does not hide the sidebar); a held Escape repeat does not bubble
-into the roster hide, but a fresh roster Escape still hides. Editing never activates the
+session name unconfirmed. Escape in the Edit form cancels only that form in the same local
+way and returns to the visible roster; a held Escape repeat does not bubble into the
+roster hide, but a fresh roster Escape still hides. Editing never activates the
 row, routes input to it, pauses or stops its child, or changes the active input owner. Both forms show the effective native
 keybindings; the external-editor action temporarily hands the real terminal to the
 shared native Pi agent directory's `settings.json` `externalEditor` command when it is a

@@ -145,15 +145,18 @@ arm64; Windows x64, arm64, or x86). Each fallback launch re-extracts rather than
 reusing an existing cache runtime; this does not replace a global Node install or
 change normal user configuration. The launcher also resolves (or provisions) the public
 Pi runtime automatically — no manual Pi CLI path is needed. The `.cmd` entry point
-performs the Node bootstrap, but the current native session-host backend remains
-POSIX-only and does not establish Windows backend parity:
+performs the Node bootstrap. Experimental same-machine Windows source paths for the
+native session-host backend are prepared for validation only: they do not establish
+Windows support, parity, or readiness, and real Windows Node 22.19 and 24 native
+runtime validation remains required. POSIX macOS/Linux remains the supported alpha
+host scope:
 
 ```bash
 ./scripts/pi-review-sessions.sh   # macOS/Linux source checkout
 ```
 
 ```bat
-scripts\pi-review-sessions.cmd    # native Windows entry point (the host itself is POSIX-only in this alpha)
+scripts\pi-review-sessions.cmd    # native Windows entry point (experimental validation paths only; no Windows readiness claim)
 ```
 
 An installed package exposes the `pi-review-sessions` command.

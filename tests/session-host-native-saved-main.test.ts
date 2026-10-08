@@ -62,6 +62,8 @@ import {
   type SessionRecord,
 } from "./helpers/session-host-native-saved-main-harness";
 
+import { sidebarPaneLines } from "./helpers/session-host-native-roster-witness";
+
 interface ProviderRecord {
   readonly event?: string;
   readonly requestIndex?: number;
@@ -72,8 +74,19 @@ function isCompleteRosterFrame(text: string): boolean {
   return parseRosterFrame(text, 32).complete;
 }
 
-function isSidebarVisible(text: string): boolean {
-  return isCompleteRosterFrame(text);
+function isCompleteMainFocus(text: string): boolean {
+  const parsed = parseRosterFrame(text, 32);
+  if (!parsed.complete) return false;
+  const pane = sidebarPaneLines(text, 32);
+  const offset = /^\s*Sessions \(/u.test(pane[0] ?? "") ? 0 : 1;
+  const footer = pane.slice(offset + 1 + parsed.entryEnd).map((line) => line.trim()).filter(Boolean);
+  return footer.length === 2 && footer[0] === "F8 toggle | enter open" && footer[1] === "esc hide | q quit";
+}
+
+function isCompleteWelcome(text: string): boolean {
+  return frameHeader(text) === "Session host" && text.includes("Welcome")
+    && parseRosterFrame(text, 32).count === 0 && isSidebarFocus(text)
+    && selectedRosterEntry(text)?.label === "New session";
 }
 
 function isSidebarFocus(text: string): boolean {
@@ -131,23 +144,15 @@ async function assertNoStartsAfter(driver: SavedMainDriver, snapshot: JournalSna
 
 async function ensureSidebarFocus(driver: SavedMainDriver): Promise<void> {
   if (isSavedPane(driver.currentText())) throw new Error("close the actual Saved conversations pane before selecting a roster row");
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const text = driver.currentText();
-    if (isSidebarFocus(text)) return;
-    const visible = isSidebarVisible(text);
-    const snapshot = driver.snapshot();
-    driver.pty.write(KEYS.f8);
-    // The reserved chord is two-step: from a visible Main-focused roster this
-    // single press focuses without hiding; from an open form/picker it runs
-    // that pane's own cancellation fence (hiding), so the loop presses again.
-    await driver.waitFrame((next) => visible
-      ? isSidebarFocus(next) || sidebarRosterHidden(next)
-      : isSidebarFocus(next),
-    visible
-      ? "one F8 press focuses the visible sidebar or runs the open pane's cancellation fence"
-      : "one F8 press shows and focuses the hidden sidebar", snapshot.frameRevision);
-  }
-  assert.ok(isSidebarFocus(driver.currentText()), "actual rendered sidebar-only footer establishes host focus");
+  // Observe a completed focus domain before deciding whether to send a key.
+  // A partial/stale footer never authorizes four speculative toggle presses.
+  await driver.waitFrame((text) => isSidebarFocus(text) || isCompleteMainFocus(text) || sidebarRosterHidden(text),
+    "the complete roster/footer or fully hidden pane establishes the current focus domain");
+  if (isSidebarFocus(driver.currentText())) return;
+  const snapshot = driver.snapshot();
+  driver.pty.write(KEYS.f8);
+  await driver.waitFrame(isSidebarFocus,
+    "one deliberate F8 focuses the visible Main roster or shows the fully hidden sidebar", snapshot.frameRevision);
 }
 
 async function moveRosterToPosition(driver: SavedMainDriver, targetPosition: number): Promise<void> {
@@ -223,8 +228,8 @@ async function activateProcessRow(driver: SavedMainDriver, process: ProcessIncar
   assert.ok(selected, "the target row remains visibly highlighted before explicit activation");
   const before = driver.snapshot();
   driver.pty.write(KEYS.enter);
-  await driver.waitFrame((text) => frameHeader(text) === expectedHeader,
-    "a later explicit host-row Enter activates only the creation-correlated process row", before.frameRevision);
+  await driver.waitFrame((text) => frameHeader(text) === expectedHeader && isCompleteMainFocus(text),
+    "a later explicit host-row Enter completes the exact owner header and full Main-focus footer", before.frameRevision);
 }
 
 async function editFirstNativeName(
@@ -492,6 +497,28 @@ test("pure saved-pane predicate distinguishes the real right picker from roster 
     "the right-pane predicate recognizes the combined footer from the actual public Saved renderer");
 });
 
+test("Saved startup and activation witnesses refuse partial or mixed focus frames", () => {
+  const controller = new SidebarController({ toggleKey: "f8" });
+  const rows = controller.renderRoster(32, 49).lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const compose = (left: readonly string[]) => ["Session host", ...left.map((line, index) =>
+    `${line.padEnd(32)}│${index === 0 ? "Welcome — select a session" : ""}`)].join("\n");
+  const complete = compose(rows);
+  assert.equal(isCompleteWelcome(complete), true);
+  assert.equal(isCompleteMainFocus(complete), false);
+  assert.equal(isCompleteWelcome("Session host\nWelcome — select a session\nNew session\nQuit host"), false);
+  const incomplete = [...rows];
+  const hint = incomplete.findIndex((line) => line.includes("d stop/remove"));
+  assert.ok(hint >= 0);
+  incomplete[hint] = "";
+  assert.equal(isCompleteWelcome(compose(incomplete)), false);
+  // renderRoster's public pure contract renders independently of visibility.
+  const mainController = new SidebarController({ toggleKey: "f8", initialVisible: false });
+  const main = mainController.renderRoster(32, 49).lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  assert.equal(isCompleteMainFocus(compose(main)), true);
+  assert.equal(isCompleteWelcome(compose(main)), false);
+  assert.equal(isCompleteMainFocus(compose([...main, "e edit name | d stop/remove"])), false);
+});
+
 test("native Saved witness requires a single selected summary and complete recorded-workspace details", () => {
   const actions: SidebarAction[] = [];
   const controller = new SidebarController({ toggleKey: "f8", onAction: (action) => actions.push(action) });
@@ -702,8 +729,8 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
     }
   });
 
-  await driver.waitFrame((text) => text.includes("Welcome") && text.includes("New session") && text.includes("Quit host"),
-    "fresh real public Main displays its empty native welcome/sidebar state");
+  await driver.waitFrame(isCompleteWelcome,
+    "fresh real public Main completely displays canonical Welcome, empty roster, New selection and Sidebar-only footer");
   assert.deepEqual(driver.records(), [], "the public native observer has no fabricated pre-session events");
   assert.equal(childEnv.PI_CODING_AGENT_DIR, nativeAgentRoot,
     "all native Pi children share the fixture's one ordinary root inside the isolated test HOME");

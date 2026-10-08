@@ -15,7 +15,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, win32 as win32Path } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep, win32 as win32Path } from "node:path";
 import {
   PI_AGENT_DIR_ENV,
   piAgentDir,
@@ -1382,7 +1382,7 @@ function requireBoundedShippedFile(path: string): Buffer {
 function skillDirectoryComponents(agentDir: string, destination: string): string[] {
   let current = agentDir;
   const components = [agentDir];
-  for (const part of relative(agentDir, dirname(destination)).split("/").filter(Boolean)) {
+  for (const part of relative(agentDir, dirname(destination)).split(sep).filter(Boolean)) {
     current = join(current, part);
     components.push(current);
   }

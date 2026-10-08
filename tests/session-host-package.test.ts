@@ -113,7 +113,7 @@ function makeFixture(t: TestContext): Fixture {
   mkdirSync(join(consumerNodeModules, "pi-session-host-tui", "dist"), { recursive: true });
   writeFileSync(
     join(consumerNodeModules, "pi-session-host-tui", "package.json"),
-    JSON.stringify({ name: "@earendil-works/pi-tui", version: "1.0.4" }),
+    JSON.stringify({ name: "@earendil-works/pi-tui", version: "1.1.0" }),
   );
   writeFileSync(join(consumerNodeModules, "pi-session-host-tui", "dist", "index.js"), "// mock entry\n");
   mkdirSync(join(consumerNodeModules, "@xterm", "headless", "lib-headless"), { recursive: true });
@@ -145,7 +145,7 @@ function makeRuntimeReport(f: Fixture, overrides: Partial<RuntimeReport> = {}): 
       "pi-session-host-tui": {
         resolved: join(f.consumerNodeModules, "pi-session-host-tui", "dist", "index.js"),
         name: "@earendil-works/pi-tui",
-        version: "1.0.4",
+        version: "1.1.0",
         loaded: true,
       },
       "@xterm/headless": {
@@ -252,7 +252,7 @@ test("fails when canonical @earendil-works/pi-tui is hoisted into the consumer r
   mkdirSync(join(f.consumerNodeModules, "@earendil-works", "pi-tui"), { recursive: true });
   writeFileSync(
     join(f.consumerNodeModules, "@earendil-works", "pi-tui", "package.json"),
-    JSON.stringify({ name: "@earendil-works/pi-tui", version: "1.0.4" }),
+    JSON.stringify({ name: "@earendil-works/pi-tui", version: "1.1.0" }),
   );
   assert.throws(() => validate(f), /canonical @earendil-works\/pi-tui/);
 });
@@ -271,7 +271,7 @@ test("fails when a runtime dependency entry resolves but throws on load", (t) =>
   report.loads["pi-session-host-tui"] = {
     resolved: join(f.consumerNodeModules, "pi-session-host-tui", "dist", "index.js"),
     name: "@earendil-works/pi-tui",
-    version: "1.0.4",
+    version: "1.1.0",
     loaded: false,
   };
   assert.throws(() => validate(f, { report }), /did not load pi-session-host-tui/);
@@ -445,7 +445,7 @@ function makeProbeFixture(t: TestContext): { root: string; consumerDir: string; 
       + "exports.TerminalSurface = class { write() {} async flush() {} frame() { return { lines: ['中文😀'], cursor: { column: 6 } }; } dispose() {} };\n",
   );
   const fakeDeps: Record<string, { name: string; version: string }> = {
-    "pi-session-host-tui": { name: "@earendil-works/pi-tui", version: "1.0.4" },
+    "pi-session-host-tui": { name: "@earendil-works/pi-tui", version: "1.1.0" },
     "@xterm/headless": { name: "@xterm/headless", version: "6.0.0" },
     "@xterm/addon-unicode11": { name: "@xterm/addon-unicode11", version: "0.9.0" },
   };

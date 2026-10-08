@@ -186,3 +186,18 @@ export function classifyFirstWorkspaceEnter(
   }
   return { state: "folder-completed", acceptedPath };
 }
+
+/**
+ * Require a verified folder-completion observation before allowing submission.
+ * A direct submission (form closed without a verified folder completion) is
+ * not accepted as proof that the workspace was completed through the native
+ * provider. This enforces the completion-evidence-before-submission invariant.
+ */
+export function requireFolderCompletedObservation(
+  observation: FirstWorkspaceEnterObservation,
+): Extract<FirstWorkspaceEnterObservation, { state: "folder-completed" }> {
+  if (observation.state !== "folder-completed") {
+    throw new Error("direct submission is not completion evidence; a verified folder completion is required before submission");
+  }
+  return observation;
+}

@@ -125,6 +125,11 @@ jobs:
         run: node --test dist-test/tests/session-host-broker.test.js dist-test/tests/session-host-reporter.test.js
       - name: Pure Windows helper-contract tests
         run: node --test dist-test/tests/session-host-native-windows-helper-contract.test.js
+      - name: Real pinned-provider Windows workspace completion regression
+        # Exercises the real CombinedAutocompleteProvider against real
+        # drive-letter and UNC paths on a real Windows host. The macOS/POSIX
+        # skip is not Windows proof; this step earns that evidence here.
+        run: node --test dist-test/tests/session-host-windows-workspace-completion.test.js
       - name: Real public Windows ConPTY Main acceptance (opt-in, fail-closed)
         # PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST=1 makes every missing
         # Pi/ConPTY/PowerShell prerequisite a hard failure instead of a skip.

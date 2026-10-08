@@ -6,6 +6,7 @@ import {
   borderedEditorContentMatches,
   classifyFirstWorkspaceEnter,
   readBorderedEditorContent,
+  requireFolderCompletedObservation,
   sameFileIdentity,
   windowsDirectoryCompletionCandidates,
   validateWindowsExitWitness,
@@ -124,4 +125,16 @@ test("Windows native helper contract reconstructs wrapped Editor rows and forwar
   assert.deepEqual(classifyFirstWorkspaceEnter("Session host · Welcome", expected), { state: "submitted" });
   assert.throws(() => classifyFirstWorkspaceEnter(frame, windowsDirectoryCompletionCandidates("C:\\owned\\other")),
     /exact owned forward-slash directory completion/);
+});
+
+test("Windows native helper contract rejects direct submission as completion evidence", () => {
+  const expected = windowsDirectoryCompletionCandidates("C:\\owned\\project");
+  // A direct submission (form closed) is not completion evidence.
+  const submitted = classifyFirstWorkspaceEnter("Session host · Starting (request 1)", expected);
+  assert.throws(() => requireFolderCompletedObservation(submitted), /direct submission is not completion evidence/);
+  // A verified folder completion is accepted.
+  const wrappedRows = ["C:/owned", "/project", "/"];
+  const frame = publicEditorFrame("> Workspace:", wrappedRows, 9);
+  const completed = classifyFirstWorkspaceEnter(frame, expected);
+  assert.equal(requireFolderCompletedObservation(completed).acceptedPath, expected[0]);
 });

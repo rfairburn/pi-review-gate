@@ -15,6 +15,7 @@ import {
   visibleWidth,
   type AutocompleteItem,
   type AutocompleteProvider,
+  type AutocompleteSuggestions,
   type EditorTheme,
   type KeybindingsManager,
   type Terminal,
@@ -860,6 +861,10 @@ function decorateAbsolutePathProvider(
       return base.triggerCharacters;
     },
     async getSuggestions(lines, cursorLine, cursorCol, options) {
+      const windows = windowsAbsolutePathContext(lines, cursorLine, cursorCol);
+      if (windows) {
+        return windowsAbsoluteSuggestions(base, lines, cursorLine, cursorCol, windows, nativeSuggestionContext, options);
+      }
       const forceFileBranch = isAbsolutePathContext(lines, cursorLine, cursorCol);
       const suggestions = await base.getSuggestions(lines, cursorLine, cursorCol, forceFileBranch
         ? { ...options, force: true }
@@ -908,6 +913,7 @@ function decorateAbsolutePathProvider(
     },
     shouldTriggerFileCompletion(lines, cursorLine, cursorCol) {
       if (isAbsolutePathContext(lines, cursorLine, cursorCol)) return true;
+      if (windowsAbsolutePathContext(lines, cursorLine, cursorCol)) return true;
       return base.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? true;
     },
   };
@@ -955,6 +961,137 @@ function nativeCompletionApplication(
 function isAbsolutePathContext(lines: string[], cursorLine: number, cursorCol: number): boolean {
   if (cursorLine !== 0) return false;
   return (lines[0] ?? "").slice(0, cursorCol).trimStart().startsWith("/");
+}
+
+/** Parsed parts of a complete Windows absolute path (drive-letter or UNC). */
+export interface WindowsAbsolutePathParts {
+  /** The intended directory, including its trailing separator. */
+  readonly dirPart: string;
+  /** The relative basename query after the last separator (may be empty). */
+  readonly query: string;
+}
+
+/**
+ * Parse a complete Windows absolute path into its intended directory and
+ * relative basename query. Drive-letter paths require a separator immediately
+ * after the colon (`C:\foo` or `C:/foo`); drive-relative forms such as `C:foo`
+ * are not absolute and return undefined. Complete UNC paths start with two
+ * separators and require nonempty server and share components (`\\server\share`, `//server/share`).
+ */
+export function parseWindowsAbsolutePath(token: string): WindowsAbsolutePathParts | undefined {
+  const trimmed = token.trimStart();
+  // Recognize the provider's generated outer quote context (a single opening
+  // double quote with no closing quote yet) so continuing an already quoted
+  // completion stays on the Windows absolute route. Manually submitted values
+  // that carry a closing quote are left untouched.
+  const inner = trimmed.startsWith('"') && !trimmed.endsWith('"') ? trimmed.slice(1) : trimmed;
+  if (!isDriveLetterAbsolute(inner) && !isUncAbsolute(inner)) return undefined;
+  // A complete bare share root (\\server\share or //server/share) scopes the
+  // provider to that share directory with an empty basename query, rather than
+  // splitting into a server directory plus a share-name query.
+  if (isUncAbsolute(inner) && inner.slice(2).split(/[\\/]/).length === 2) {
+    return { dirPart: inner + inner[0], query: "" };
+  }
+  let lastSeparator = -1;
+  for (let index = inner.length - 1; index >= 0; index -= 1) {
+    if (inner[index] === "\\" || inner[index] === "/") {
+      lastSeparator = index;
+      break;
+    }
+  }
+  if (lastSeparator < 0) return undefined;
+  return { dirPart: inner.slice(0, lastSeparator + 1), query: inner.slice(lastSeparator + 1) };
+}
+
+function isDriveLetterAbsolute(token: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(token);
+}
+
+function isUncAbsolute(token: string): boolean {
+  if (!token.startsWith("\\\\") && !token.startsWith("//")) return false;
+  const [server, share] = token.slice(2).split(/[\\/]/);
+  return Boolean(server && share);
+}
+
+/** The complete Windows absolute path at the current cursor, if any. */
+function windowsAbsolutePathContext(
+  lines: string[],
+  cursorLine: number,
+  cursorCol: number,
+): (WindowsAbsolutePathParts & { readonly token: string }) | undefined {
+  // Windows absolute routing is only active on Windows hosts; on POSIX the
+  // double-leading-slash prefix is a valid relative/absolute path form and
+  // must keep its own provider behavior.
+  if (process.platform !== "win32" || cursorLine !== 0) return undefined;
+  const token = (lines[0] ?? "").slice(0, cursorCol).trimStart();
+  const parts = parseWindowsAbsolutePath(token);
+  return parts ? { ...parts, token } : undefined;
+}
+
+/** A native completion value needs the provider's generated outer quote pair when it contains whitespace. */
+function needsShellQuotes(path: string): boolean {
+  return /\s/.test(path);
+}
+
+/**
+ * Route a complete Windows absolute path to the pinned public provider scoped
+ * to its actual intended directory, with a relative basename query, and map
+ * the provider's real suggestions back to absolute workspace insertion.
+ */
+async function windowsAbsoluteSuggestions(
+  base: AutocompleteProvider,
+  lines: string[],
+  cursorLine: number,
+  cursorCol: number,
+  windows: WindowsAbsolutePathParts & { readonly token: string },
+  nativeSuggestionContext: WeakMap<AutocompleteItem, NativeSuggestionContext>,
+  options: { signal: AbortSignal; force?: boolean },
+): Promise<AutocompleteSuggestions | null> {
+  const scoped = new CombinedAutocompleteProvider([], windows.dirPart, null);
+  // Represent the complete basename through the provider's public quoted-path
+  // syntax so native token delimiters (spaces) inside the basename do not
+  // truncate the query. The provider strips its own generated quote.
+  const queryLine = `"./${windows.query}`;
+  const suggestions = await scoped.getSuggestions([queryLine], 0, queryLine.length, {
+    signal: options.signal,
+    force: true,
+  });
+  if (!suggestions || suggestions.items.length === 0) return null;
+  // Preserve the provider's native directory label marker (trailing "/") so
+  // applyCompletion classifies directories correctly and positions the cursor
+  // inside a quoted directory for nested editing. The absolute value uses the
+  // provider's forward-slash display convention (matching toDisplayPath) plus
+  // the native label suffix, which also lets pathValueFromNativeCompletion
+  // prove the generated quote pair.
+  const dirPartDisplay = windows.dirPart.replace(/\\/g, "/");
+  // Editor treats every slash-prefixed suggestion as a command on Enter,
+  // even complete //server/share paths. Reuse the same-width neutral mask
+  // used for POSIX absolute paths; it is never inserted into field text.
+  const prefix = windows.token.startsWith("/")
+    ? `${ABSOLUTE_PREFIX_MASK}${windows.token.slice(1)}`
+    : windows.token;
+  const items: AutocompleteItem[] = [];
+  for (const item of suggestions.items) {
+    const absoluteRaw = dirPartDisplay + item.label;
+    const value = needsShellQuotes(absoluteRaw) ? `"${absoluteRaw}"` : absoluteRaw;
+    const mapped: AutocompleteItem = { ...item, value };
+    const application = nativeCompletionApplication(base, lines, cursorLine, cursorCol, mapped, prefix);
+    if (application && (sanitizeSingleLine(application.pathValue) !== application.pathValue
+      || sanitizeSingleLine(application.surfaceText) !== application.surfaceText
+      || codePointLength(application.pathValue) > PATH_MAX_CODE_POINTS
+      || codePointLength(application.surfaceText) > PATH_MAX_CODE_POINTS)) {
+      continue;
+    }
+    nativeSuggestionContext.set(mapped, {
+      lines: lines.join("\n"),
+      cursorLine,
+      cursorCol,
+      prefix,
+      ...(application ? { application } : {}),
+    });
+    items.push(mapped);
+  }
+  return { items, prefix };
 }
 
 /**

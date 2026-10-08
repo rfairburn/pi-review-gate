@@ -31,6 +31,7 @@ import {
   assertNativeEditorFieldEmpty,
   borderedEditorContentMatches,
   classifyFirstWorkspaceEnter,
+  requireFolderCompletedObservation,
   windowsDirectoryCompletionCandidates,
   sameFileIdentity,
   validateWindowsExitWitness,
@@ -43,6 +44,7 @@ export {
   assertNativeEditorFieldEmpty,
   borderedEditorContentMatches,
   classifyFirstWorkspaceEnter,
+  requireFolderCompletedObservation,
   readBorderedEditorContent,
   windowsDirectoryCompletionCandidates,
   sameFileIdentity,
@@ -911,33 +913,38 @@ export class WindowsMainPtyDriver {
       });
     const expectedCompletions = windowsDirectoryCompletionCandidates(canonicalWorkspace);
     const beforeFirstEnter = this.frameRevision;
-    this.pty.write(WINDOWS_KEYS.enter);
+    // Explicitly force completion with Tab so the asynchronous provider is
+    // triggered and awaited before submission. For the uniquely matching owned
+    // directory, forced Tab accepts the single native result without risking
+    // premature submission.
+    this.pty.write("\t");
     await this.waitFrame((frame) => {
       try {
-        classifyFirstWorkspaceEnter(frame, expectedCompletions);
+        requireFolderCompletedObservation(classifyFirstWorkspaceEnter(frame, expectedCompletions));
         return true;
       } catch {
         return false;
       }
-    }, `${label} first Enter resolves the actual native directory completion or submits a confirmed form`, beforeFirstEnter);
+    }, `${label} forced Tab accepts the exact owned native directory completion before submission`, beforeFirstEnter);
     let afterFirstEnter = this.currentText();
     const firstEnterObservation = classifyFirstWorkspaceEnter(afterFirstEnter, expectedCompletions);
-    if (firstEnterObservation.state === "folder-completed") {
-      const acceptedPath = firstEnterObservation.acceptedPath;
-      assert.ok(expectedCompletions.includes(acceptedPath),
-        `${label} first Enter accepted exactly its owned forward-slash directory completion`);
-      assert.equal(this.records().some((record) => record.type === "session_start"
-        && samePath(record.cwd ?? "", canonicalWorkspace)), false,
-      `${label} completion acceptance is not mistaken for a New submission`);
-      const beforeSubmit = this.frameRevision;
-      assert.ok(this.currentText().includes("Workspace:"), `${label} form remains open after folder completion`);
-      assert.ok(borderedEditorContentMatches(this.currentText(), "> Workspace:", acceptedPath),
-        `${label} second Enter is authorized only while the accepted exact path remains in the visible Editor body`);
-      this.pty.write(WINDOWS_KEYS.enter);
-      await this.waitFrame((frame) => frame.includes("Starting (request ") || !frame.includes("Workspace:"),
-        `${label} distinct second Enter submits the accepted directory`, beforeSubmit);
-      afterFirstEnter = this.currentText();
-    }
+    // Completion evidence is required before submission: a direct submission
+    // (form closed without a verified folder completion) is not accepted as
+    // proof that the workspace was completed through the native provider.
+    const { acceptedPath } = requireFolderCompletedObservation(firstEnterObservation);
+    assert.ok(expectedCompletions.includes(acceptedPath),
+      `${label} first Enter accepted exactly its owned forward-slash directory completion`);
+    assert.equal(this.records().some((record) => record.type === "session_start"
+      && samePath(record.cwd ?? "", canonicalWorkspace)), false,
+    `${label} completion acceptance is not mistaken for a New submission`);
+    const beforeSubmit = this.frameRevision;
+    assert.ok(this.currentText().includes("Workspace:"), `${label} form remains open after folder completion`);
+    assert.ok(borderedEditorContentMatches(this.currentText(), "> Workspace:", acceptedPath),
+      `${label} second Enter is authorized only while the accepted exact path remains in the visible Editor body`);
+    this.pty.write(WINDOWS_KEYS.enter);
+    await this.waitFrame((frame) => frame.includes("Starting (request ") || !frame.includes("Workspace:"),
+      `${label} distinct second Enter submits the accepted directory`, beforeSubmit);
+    afterFirstEnter = this.currentText();
     assert.ok(afterFirstEnter.includes("Starting (request ") || !afterFirstEnter.includes("Workspace:"),
       `${label} New request reached its submitted/closed state before lifecycle ownership is claimed`);
     const matchingRecords = await this.waitForNative((records) => records.some((record) => record.type === "session_start"

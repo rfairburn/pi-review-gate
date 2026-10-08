@@ -63,11 +63,19 @@ interface ProviderRecord {
   readonly lastUserPreview?: string;
 }
 
+function isCompleteRosterFrame(text: string): boolean {
+  const left = text.split("\n").slice(1).map((line) => line.slice(0, 32));
+  const count = /^\s*Sessions \((\d+)\)\s*$/.exec(left[0] ?? "");
+  if (!count) return false;
+  const rows = rosterEntries(text);
+  const actions = ["Saved conversations", "New session", "Quit host"];
+  return rows.length === Number(count[1]) + actions.length
+    && actions.every((action, index) => rows.filter((entry) => entry.label === action).length === 1
+      && rows[rows.length - actions.length + index]?.label === action);
+}
+
 function isSidebarVisible(text: string): boolean {
-  const left = text.split("\n").slice(1).map((line) => line.slice(0, 32)).join("\n");
-  const actions = rosterEntries(text).map((entry) => entry.label);
-  return left.includes("Sessions (")
-    && ["Saved conversations", "New session", "Quit host"].every((action) => actions.includes(action));
+  return isCompleteRosterFrame(text);
 }
 
 function isSidebarFocus(text: string): boolean {
@@ -128,7 +136,8 @@ async function ensureSidebarFocus(driver: SavedMainDriver): Promise<void> {
     const snapshot = driver.snapshot();
     driver.pty.write(KEYS.f8);
     await driver.waitFrame((next) => visible
-      ? !isSidebarVisible(next)
+      ? !next.split("\n").slice(1).map((line) => line.slice(0, 32)).join("\n").includes("Sessions (")
+        && rosterEntries(next).every((entry) => !["Saved conversations", "New session", "Quit host"].includes(entry.label))
       : isSidebarFocus(next),
     visible ? "F8 visibly hides the non-focused roster before reacquiring sidebar focus"
       : "F8 visibly opens the roster and its sidebar-only actions", snapshot.frameRevision);
@@ -161,8 +170,9 @@ async function moveRosterToPosition(driver: SavedMainDriver, targetPosition: num
     const nextPosition = (selected!.position + direction + count) % count;
     const snapshot = driver.snapshot();
     driver.pty.write(direction > 0 ? KEYS.down : KEYS.up);
-    await driver.waitFrame((text) => selectedPosition(text) === nextPosition,
-      `one genuine roster arrow selects visible position ${nextPosition}`, snapshot.frameRevision);
+    await driver.waitFrame((text) => isCompleteRosterFrame(text)
+      && rosterEntries(text).length === count && selectedPosition(text) === nextPosition,
+      `one genuine roster arrow completely paints selection at visible position ${nextPosition}`, snapshot.frameRevision);
     assert.equal(rosterEntries(driver.currentText()).length, count,
       "roster navigation did not create, remove, or adopt a row");
     await assertNoStartsAfter(driver, snapshot, "roster arrow navigation");
@@ -473,6 +483,26 @@ test("pure saved-pane predicate distinguishes the real right picker from roster 
   const publicPicker = compose(publicRoster, publicForm);
   assert.equal(isSavedPane(publicPicker), true,
     "the right-pane predicate recognizes the combined footer from the actual public Saved renderer");
+});
+
+test("pure complete-roster witness rejects duplicate action rows during incremental repaint", () => {
+  const controller = new SidebarController();
+  controller.updateItems([{
+    id: "synthetic-owned-row", label: "Saved synthetic", workspace: "/owned/workspace",
+    agentDir: "/owned/agent", lifecycle: "alive", busy: false, pendingInput: false,
+    inputSurface: false, activity: [],
+  }]);
+  const lines = controller.renderRoster(32, 49).lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const compose = (left: readonly string[]): string => ["Session host · synthetic frame",
+    ...left.map((line) => `${line.padEnd(32)}│owned native pane`)].join("\n");
+  assert.equal(isCompleteRosterFrame(compose(lines)), true,
+    "the public renderer has one native row and exactly three ordered actions");
+  const newRow = lines.find((line) => line.trim() === "New session" || line.trim() === "> New session");
+  assert.ok(newRow);
+  assert.equal(isCompleteRosterFrame(compose([...lines, newRow!])), false,
+    "a stale duplicated action line cannot satisfy a complete roster witness");
+  assert.equal(isCompleteRosterFrame(compose(lines.filter((line) => line !== newRow))), false,
+    "a partially erased action row cannot satisfy a complete roster witness");
 });
 
 // Exercise the actual public pure renderer so wrapped confirmation text cannot

@@ -11,9 +11,16 @@
  * preload, no status secret.
  *
  * Preload-only by design: no socket, hook registration, or UI setup — only
- * environment restoration and sticky priming. The invalid-restore fallback
- * may read the filesystem once (realpath identity check for its own --require
- * path) and performs no other IO. Inert when neither env is present. This is
+ * environment restoration, sticky priming, and (for a valid consumed
+ * authenticated bootstrap, in a non-executor runtime) opting this process
+ * into the pure in-memory owned-activity registry before native main and
+ * every extension module evaluates. The opt-in opens no transport, registers
+ * no hook, and performs no IO: it only flips the registry's process-local
+ * active flag, so a fresh extension source registration landing after it is
+ * observed directly instead of being replayed as pre-announcement uncertain.
+ * The invalid-restore fallback may read the filesystem once (realpath identity
+ * check for its own --require path) and performs no other IO; the opt-in
+ * itself performs no IO. Inert when neither env is present. This is
  * standard Node CLI support, not a sandbox: a malicious user custom loader
  * ordered before our flag could still tamper with the environment; that is
  * outside this companion's trust model.
@@ -21,6 +28,7 @@
 
 import { realpathSync } from "node:fs";
 
+import { activateOwnedActivity } from "./owned-activity";
 import { primeReporterBootstrap } from "./reporter";
 
 /** One-shot restore frame env set by the host next to NODE_OPTIONS. */
@@ -168,4 +176,19 @@ export function restoreNodeOptions(): void {
 // Pre-main: restore the environment, then prime the sticky bootstrap state
 // the extension factory reads at load time. Both are inert without their env.
 restoreNodeOptions();
-primeReporterBootstrap();
+const primed = primeReporterBootstrap();
+// A valid consumed bootstrap — and the reporter's exact executor role ceiling,
+// not an alias or a stripped marker — opts this process into pure owned-activity
+// observation BEFORE native main and every extension module evaluates. That
+// closes the pre-announcement blind window: later fresh source registrations
+// land directly. Absent/invalid/foreign bootstraps never prime, and an executor
+// runtime never activates, so standalone and worker runs stay inert. The
+// registry is itself exception-safe and performs no IO; this guard only keeps
+// any unexpected opt-in failure from affecting native startup.
+if (primed !== undefined && process.env.PI_REVIEW_GATE_RUNTIME_ROLE !== "executor") {
+  try {
+    activateOwnedActivity();
+  } catch {
+    // Observation opt-in is best-effort: never break the real Pi process.
+  }
+}

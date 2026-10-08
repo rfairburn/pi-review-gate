@@ -1,0 +1,135 @@
+# Separate alpha-runtime CI matrix for the native Windows session host.
+#
+# This workflow is deliberately separate from ci.yml: it adds a read-only
+# windows-latest acceptance job (pull requests, pushes to main, and manual
+# dispatch) that runs the opt-in real public Main/ConPTY test plus the focused
+# named-pipe broker/reporter/protocol component tests and the pure Windows
+# helper-contract regressions. It never publishes, merges, or deploys; it
+# grants no write permission anywhere; and it changes nothing in the ordinary
+# CI or release policy. Under the opt-in gate every missing prerequisite
+# (pinned Pi runtime, ConPTY/node-pty, PowerShell) is a hard failure, never a
+# skip, on every enforced trigger path.
+
+name: Session host alpha (Windows)
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Same event-separated concurrency safety as ci.yml, under its own group
+# prefix so this alpha matrix can never cancel or replace an ordinary CI run
+# (or vice versa). PR runs group per PR number; push/dispatch runs group per
+# unique commit SHA.
+concurrency:
+  group: session-host-alpha-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  windows-acceptance:
+    # Stable check name for optional required-check configuration. This
+    # workflow does not configure branch protection; renaming could break
+    # a separately configured required-check setting.
+    name: Windows session host alpha (Node ${{ matrix.node-version }})
+    runs-on: windows-latest
+    # Finite job budget: the opt-in Main acceptance is bounded by its own
+    # 6-minute test timeout inside the 10-minute step cap below.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22.19.0, 24.x]
+    env:
+      PI_REVIEW_GATE_SKIP_PLAYWRIGHT_CHROMIUM: "1"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - name: Install dependencies
+        # Lockfile-exact, script-free root install with its own step cap. The
+        # only lifecycle scripts in the lock are this project's postinstall
+        # (Playwright Chromium download, already skipped by the job env) and
+        # the darwin-only fsevents optional; @lydell/node-pty ships prebuilt
+        # binaries and needs no lifecycle step.
+        timeout-minutes: 10
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Create fresh exclusive runner-temp child roots
+        # The acceptance helper allocates one fresh exclusive child root under
+        # RUNNER_TEMP with Node's O_EXCL mkdtempSync; nothing pre-exists, so no
+        # cleanup or tree replacement is ever needed.
+        run: |
+          $alpha = node scripts/ci/session-host-windows-acceptance.cjs create-root $env:RUNNER_TEMP
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ([string]::IsNullOrEmpty($alpha) -or -not [System.IO.Path]::IsPathRooted($alpha)) { throw "create-root did not return an absolute fresh root" }
+          New-Item -ItemType Directory -Path (Join-Path $alpha "pi-ui-runtime") | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $alpha "candidate") | Out-Null
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PRG_ALPHA_PI_RUNTIME=$(Join-Path $alpha 'pi-ui-runtime')`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PRG_ALPHA_CANDIDATE=$(Join-Path $alpha 'candidate')`n")
+      - name: Install pinned Pi UI runtime (fresh runner-temp root)
+        # Test-only locked install of exact public Pi 1.0.4 into the fresh
+        # exclusive child root; --ignore-scripts keeps the install declarative
+        # and the exit code propagates for real.
+        timeout-minutes: 8
+        run: |
+          Copy-Item scripts/ci/pi-ui-runtime/package.json, scripts/ci/pi-ui-runtime/package-lock.json -Destination $env:PRG_ALPHA_PI_RUNTIME
+          Push-Location $env:PRG_ALPHA_PI_RUNTIME
+          npm ci --ignore-scripts --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+      - name: Compile candidate extension into fresh scratch (never live dist)
+        timeout-minutes: 5
+        run: |
+          npx tsc -p tsconfig.json --outDir "$env:PRG_ALPHA_CANDIDATE\dist"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Copy packaged scripts into fresh candidate (bounded copier)
+        # The bounded copier prunes .terraform before descending and refuses
+        # symlinks; it preserves every stage of the shipped scripts tree so the
+        # staged candidate keeps its own package-root helper layout. No node_modules
+        # link or dependency copy is created: the harness supplies NODE_PATH
+        # (checkout node_modules plus the pinned runtime root) to the actual Main,
+        # so the candidate resolves the exact same public @lydell/node-pty module
+        # file as the outer harness.
+        run: |
+          node scripts/ci/session-host-windows-acceptance.cjs copy-scripts scripts "$env:PRG_ALPHA_CANDIDATE\scripts"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Compile test bundle (direct tsc, no clean)
+        timeout-minutes: 5
+        run: |
+          npx tsc -p tsconfig.test.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Export pinned Pi runtime and staged candidate pins
+        # The canonical readable JS CLI is the installed package's declared Node
+        # entry (dist/bundle/cli.js); the harness admits only that exact public
+        # entry. A missing prerequisite fails here, not later as a skip.
+        run: |
+          $agent = Join-Path $env:PRG_ALPHA_PI_RUNTIME "node_modules\@earendil-works\pi-coding-agent"
+          $cli = Join-Path $agent "dist\bundle\cli.js"
+          $entry = Join-Path $env:PRG_ALPHA_CANDIDATE "dist\src\index.js"
+          foreach ($required in @($agent, $cli, $entry)) {
+            if (-not (Test-Path -LiteralPath $required)) { throw "pinned Windows alpha prerequisite is missing: $required" }
+          }
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PI_REVIEW_GATE_INSTALLED_AGENT=$agent`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PI_REVIEW_GATE_INSTALLED_PI_BIN=$cli`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PI_REVIEW_GATE_EXPECT_PI_VERSION=1.0.4`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PI_REVIEW_GATE_CANDIDATE_ENTRY=$entry`n")
+      - name: Named-pipe broker/reporter/protocol component tests
+        run: node --test dist-test/tests/session-host-broker.test.js dist-test/tests/session-host-reporter.test.js
+      - name: Pure Windows helper-contract tests
+        run: node --test dist-test/tests/session-host-native-windows-helper-contract.test.js
+      - name: Real public Windows ConPTY Main acceptance (opt-in, fail-closed)
+        # PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST=1 makes every missing
+        # Pi/ConPTY/PowerShell prerequisite a hard failure instead of a skip.
+        # The test's own 6-minute bound sits inside this 10-minute step cap.
+        timeout-minutes: 10
+        env:
+          PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"
+        run: node --test dist-test/tests/session-host-native-windows-main.test.js

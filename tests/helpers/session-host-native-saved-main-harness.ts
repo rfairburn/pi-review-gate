@@ -16,6 +16,23 @@ import { delimiter, dirname, isAbsolute, join, sep } from "node:path";
 import { DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SHUTDOWN_KILL_MS } from "../../src/session-host/instances";
 import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/terminal-surface";
 import {
+  NATIVE_PANE_START,
+  SIDEBAR_COLUMNS,
+  frameHeader,
+  isSidebarFocusedFrame,
+  parseRosterFrame,
+  renderedTitleMatches,
+  selectedRosterCard,
+  selectedRosterEntry as parseSelectedRosterEntry,
+  sidebarRosterHidden,
+  type RosterActionEntry,
+  type RosterCardEntry,
+  type RosterEntry,
+} from "./session-host-native-roster-witness";
+
+export { frameHeader, isSidebarFocusedFrame, parseRosterFrame, renderedTitleMatches, selectedRosterCard, sidebarRosterHidden };
+export type { RosterActionEntry, RosterCardEntry, RosterEntry };
+import {
   ChangeSignal,
   EVENT_TIMEOUT_MS,
   OwnedPidExitWatcher,
@@ -62,8 +79,8 @@ export const KEYS = {
 
 const SHORT_QUIET_WINDOW_MS = 300;
 const MAX_JOURNAL_BYTES = 8 * 1024 * 1024;
-const SIDEBAR_COLS = 32;
-const SIDEBAR_START = 33;
+const SIDEBAR_COLS = SIDEBAR_COLUMNS;
+const SIDEBAR_START = NATIVE_PANE_START;
 const NODE_OPTIONS_ORIGINAL = process.env.NODE_OPTIONS;
 const OWNER_SHUTDOWN_MARGIN_MS = 3_000;
 const OWNER_SHUTDOWN_WINDOW_MS = DEFAULT_SHUTDOWN_GRACE_MS + DEFAULT_SHUTDOWN_KILL_MS + OWNER_SHUTDOWN_MARGIN_MS;
@@ -272,13 +289,6 @@ export interface JournalSnapshot {
   readonly ptyOffset: number;
 }
 
-export interface RosterEntry {
-  readonly position: number;
-  readonly label: string;
-  readonly raw: string;
-  readonly selected: boolean;
-}
-
 export interface SavedMainStartOptions {
   readonly ptyModule: NativePtyModule;
   readonly scratchRoot: string;
@@ -321,37 +331,18 @@ function workspaceFieldValue(text: string): string | undefined {
   return rows[index + 1]?.slice(start).trim();
 }
 
-function leftPaneLine(line: string): string {
-  return line.slice(0, SIDEBAR_COLS);
-}
-
-/** Parse only actual native/action rows from the rendered roster, not captions elsewhere. */
+/**
+ * Actual native/action entries from the rendered sidebar roster only. Each
+ * native entry correlates its complete title-only card (3 collapsed or 5
+ * expanded rows: title, marker/status, background, optional activity) with the
+ * ordered three-action tail; captions elsewhere are never entries.
+ */
 export function rosterEntries(text: string): RosterEntry[] {
-  const rows: RosterEntry[] = [];
-  for (const line of text.split("\n").slice(1)) {
-    const left = leftPaneLine(line);
-    const selected = left.startsWith("> ") || left.startsWith("→ ");
-    const unselected = left.startsWith("  ");
-    if (!selected && !unselected) continue;
-    const raw = left.slice(2).trimEnd();
-    if (!raw.trim()) continue;
-    const isAction = ["Saved conversations", "New session", "Quit host"].includes(raw.trim());
-    const isNative = /\[(?:AGENT:|starting\]|exited(?:\s|\])|error(?:\s|\])|input\])/.test(raw);
-    if (!isAction && !isNative) continue;
-    const badge = raw.search(/\s+\[(?:AGENT:|starting\]|exited(?:\s|\])|error(?:\s|\])|input\])/);
-    rows.push({
-      position: rows.length,
-      label: (badge < 0 ? raw : raw.slice(0, badge)).trimEnd(),
-      raw,
-      selected,
-    });
-  }
-  return rows;
+  return [...parseRosterFrame(text, SIDEBAR_COLS).entries];
 }
 
 export function selectedRosterEntry(text: string): RosterEntry | undefined {
-  const matches = rosterEntries(text).filter((entry) => entry.selected);
-  return matches.length === 1 ? matches[0] : undefined;
+  return parseSelectedRosterEntry(text, SIDEBAR_COLS);
 }
 
 function rightPaneText(text: string): string {

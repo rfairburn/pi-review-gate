@@ -5,7 +5,7 @@
  *
  * This module owns the owned-PTY driver around the real public Main API
  * (`runSessionHost` in a privately staged candidate package), the pinned real
- * Pi 1.0.4 runtime resolution, bounded scratch staging, and the exact-PID
+ * Pi 1.1.0 fixture resolution, bounded scratch staging, and the exact-PID
  * kernel exit watchers. It is test infrastructure only: no production source,
  * CI, package, docs, or SDK surface changes; no `__test` dependency-injection
  * seam is added to production. The driver's optional `args`/`env` overrides
@@ -28,21 +28,40 @@ import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import {
   chmodSync,
-  copyFileSync,
+  closeSync,
+  constants,
   existsSync,
+  fchmodSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
+  opendirSync,
   readFileSync,
-  readdirSync,
+  readSync,
   realpathSync,
   statSync,
   writeFileSync,
+  writeSync,
+  type BigIntStats,
 } from "node:fs";
 import { watch, type FSWatcher } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/terminal-surface";
+import {
+  NATIVE_PANE_START,
+  SIDEBAR_COLUMNS,
+  SIDEBAR_OVERLAY_MIN_OUTER_COLUMNS,
+  frameHeader,
+  frameHeaderMatches,
+  isSidebarFocusedFrame,
+  parseRosterFrame,
+  renderedTitleMatches,
+  selectedRosterEntry,
+  sidebarRosterHidden,
+} from "./session-host-native-roster-witness";
 
 export const TEST_TIMEOUT_MS = 8 * 60_000;
 export const EVENT_TIMEOUT_MS = 30_000;
@@ -367,8 +386,8 @@ export function resolveRuntimePin(t: { skip(message?: string): void }): RuntimeP
     requiredOrSkip(t, "explicit installed Pi package, Node CLI, and version pins are required");
     return undefined;
   }
-  if (expectedVersion !== "1.0.4") {
-    requiredOrSkip(t, "this native Main integration phase pins Pi 1.0.4");
+  if (expectedVersion !== "1.1.0") {
+    requiredOrSkip(t, "this native Main integration phase pins Pi 1.1.0");
     return undefined;
   }
 
@@ -382,7 +401,7 @@ export function resolveRuntimePin(t: { skip(message?: string): void }): RuntimeP
     return undefined;
   }
   if (packageInfo.name !== "@earendil-works/pi-coding-agent" || packageInfo.version !== expectedVersion) {
-    requiredOrSkip(t, "the explicit runtime pin is not the expected @earendil-works/pi-coding-agent 1.0.4 package");
+    requiredOrSkip(t, "the explicit runtime pin is not the expected @earendil-works/pi-coding-agent 1.1.0 package");
     return undefined;
   }
 
@@ -489,50 +508,629 @@ interface CopyBudget {
   bytes: number;
 }
 
-function copyBoundedRegularFile(source: string, destination: string, budget: CopyBudget): void {
-  const stats = lstatSync(source);
-  if (!stats.isFile() || stats.isSymbolicLink() || stats.size > 8 * 1024 * 1024) {
-    throw new Error("owned candidate staging rejected a linked, special, or oversized source file");
-  }
-  budget.files += 1;
-  budget.bytes += stats.size;
-  if (budget.files > 20_000 || budget.bytes > 128 * 1024 * 1024) {
-    throw new Error("owned candidate staging exceeded its aggregate file bound");
-  }
-  mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
-  copyFileSync(source, destination);
-  chmodSync(destination, stats.mode & 0o777);
+/**
+ * Bounded candidate-staging ceilings. The shipped staging contract is 8 MiB
+ * per leaf, 128 MiB aggregate, 20 000 files, depth 40, and 2 048 directories.
+ * The explicit copy seam may LOWER these for a synthetic proof (a strictly
+ * stronger check) but never raises them.
+ */
+export interface CandidateCopyBounds {
+  readonly maxLeafBytes: number;
+  readonly maxTotalBytes: number;
+  readonly maxFiles: number;
+  readonly maxDepth: number;
+  readonly maxDirectories: number;
 }
 
-function copyBoundedTree(sourceRoot: string, destinationRoot: string, budget: CopyBudget): void {
-  const visit = (source: string, destination: string, depth: number): void => {
-    if (depth > 40) throw new Error("owned candidate staging exceeded its directory-depth bound");
-    const rootStats = lstatSync(source);
-    if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) {
-      throw new Error("owned candidate staging requires a real source directory");
+const CANDIDATE_COPY_BOUNDS: CandidateCopyBounds = {
+  maxLeafBytes: 8 * 1024 * 1024,
+  maxTotalBytes: 128 * 1024 * 1024,
+  maxFiles: 20_000,
+  maxDepth: 40,
+  maxDirectories: 2_048,
+};
+
+const CANDIDATE_COPY_CHUNK_BYTES = 1024 * 1024;
+
+/**
+ * Test-only injectable bounded file-I/O seam for the candidate copier.
+ *
+ * The default implementation is the real descriptor operations, and production
+ * staging never substitutes this seam; only the explicit synthetic copy entry
+ * point may. A test wraps one operation to induce a bounded short write or a
+ * mid-copy source swap. Identity checks, budgets, exclusive creation, and byte
+ * accounting stay real: the seam can make an operation observably worse, never
+ * weaken a check.
+ */
+export interface CandidateCopyFileIo {
+  openSource(path: string): number;
+  openDestination(path: string, mode: number): number;
+  read(fd: number, buffer: Buffer, offset: number, length: number, position: number): number;
+  write(fd: number, buffer: Buffer, offset: number, length: number, position: number): number;
+  fstat(fd: number): BigIntStats;
+  fchmod(fd: number, mode: number): void;
+  close(fd: number): void;
+}
+
+const READONLY_NOFOLLOW_NONBLOCK =
+  constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+const EXCLUSIVE_NOFOLLOW =
+  constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0);
+
+const REAL_CANDIDATE_COPY_FILE_IO: CandidateCopyFileIo = {
+  openSource: (path) => openSync(path, READONLY_NOFOLLOW_NONBLOCK),
+  openDestination: (path, mode) => openSync(path, EXCLUSIVE_NOFOLLOW, mode),
+  read: (fd, buffer, offset, length, position) => readSync(fd, buffer, offset, length, position),
+  write: (fd, buffer, offset, length, position) => writeSync(fd, buffer, offset, length, position),
+  fstat: (fd) => fstatSync(fd, { bigint: true }),
+  fchmod: (fd, mode) => fchmodSync(fd, mode),
+  close: (fd) => closeSync(fd),
+};
+
+/** A real-directory identity receipt captured with BigInt dev/ino. */
+interface OwnedDirectory {
+  readonly path: string;
+  readonly dev: bigint;
+  readonly ino: bigint;
+}
+
+interface SourceLeafReceipt extends OwnedDirectory {
+  readonly size: bigint;
+  readonly mtimeNs: bigint;
+  readonly ctimeNs: bigint;
+}
+
+interface StageContext {
+  readonly budget: CopyBudget;
+  readonly bounds: CandidateCopyBounds;
+  readonly io: CandidateCopyFileIo;
+  /** Trusted destination ancestors above the staging base (the scratch root). */
+  readonly ancestors: readonly OwnedDirectory[];
+  /** The directory that directly contains every staged tree root. */
+  readonly stagingBase: OwnedDirectory;
+  /** Every established destination receipt, keyed by path, retained across entries. */
+  readonly owned: Map<string, OwnedDirectory>;
+  directories: number;
+}
+
+function realDirectoryReceipt(path: string): OwnedDirectory {
+  const stats = lstatSync(path, { bigint: true });
+  if (stats.isSymbolicLink() || !stats.isDirectory()) {
+    throw new Error("owned candidate staging refused a linked or non-directory destination ancestor");
+  }
+  return { path, dev: stats.dev, ino: stats.ino };
+}
+
+/**
+ * Re-verify every established destination-ancestor receipt: a real directory
+ * carrying the exact captured BigInt dev/ino. This is a PATH re-inspection. It
+ * detects a replaced or swapped ancestor between our own operations, but it is
+ * NOT an atomic `openat` containment guarantee: a same-identity swap that lstat
+ * cannot observe stays residual uncertainty, never a claim. Any doubt fails
+ * closed and leaves already-written bytes in place.
+ */
+function verifyOwnedDirectories(chain: readonly OwnedDirectory[]): void {
+  for (const receipt of chain) {
+    const stats = lstatSync(receipt.path, { bigint: true });
+    if (stats.isSymbolicLink() || !stats.isDirectory()
+        || stats.dev !== receipt.dev || stats.ino !== receipt.ino) {
+      throw new Error("owned candidate staging detected a replaced or linked destination ancestor");
     }
-    mkdirSync(destination, { recursive: true, mode: 0o700 });
-    for (const name of readdirSync(source)) {
-      // Exclude initialized Terraform data before inspecting or descending at
-      // every depth, including inside the synthetic source roots.
-      if (name === ".terraform") continue;
-      const sourceEntry = join(source, name);
-      const destinationEntry = join(destination, name);
-      const stats = lstatSync(sourceEntry);
-      if (stats.isDirectory() && !stats.isSymbolicLink()) {
-        visit(sourceEntry, destinationEntry, depth + 1);
-      } else {
-        copyBoundedRegularFile(sourceEntry, destinationEntry, budget);
+  }
+}
+
+/**
+ * Establish `destination` below an already-verified real directory chain.
+ *
+ * The directory and depth budgets are checked BEFORE any allocation or descent,
+ * and every destination directory component (including intermediate components
+ * created for nested manifest leaves) is counted exactly once. A missing
+ * component is created non-recursively under the verified parent and its BigInt
+ * receipt is retained in `ctx.owned` for the whole staging operation. A
+ * component that is already established is reused only when its live identity
+ * still matches the retained receipt; a pre-existing real directory that this
+ * operation did not establish, and any linked or special component, fails
+ * closed.
+ */
+function ensureOwnedPath(
+  destination: string,
+  parents: readonly OwnedDirectory[],
+  ctx: StageContext,
+): OwnedDirectory[] {
+  const current = parents[parents.length - 1]!;
+  verifyOwnedDirectories(parents);
+  if (destination === current.path) return [...parents];
+  const rel = relative(current.path, destination);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error("owned candidate staging refused a destination outside its owned directory base");
+  }
+  const chainBaseLength = ctx.ancestors.length + 1;
+  const result = [...parents];
+  let cursor = current.path;
+  for (const component of rel.split(sep)) {
+    if (!component || component === "." || component === "..") {
+      throw new Error("owned candidate staging refused an empty or relative destination component");
+    }
+    const depth = result.length - chainBaseLength + 1;
+    if (depth > ctx.bounds.maxDepth) {
+      throw new Error("owned candidate staging exceeded its destination-depth bound");
+    }
+    verifyOwnedDirectories(result);
+    const next = join(cursor, component);
+    const established = ctx.owned.get(next);
+    if (established) {
+      verifyOwnedDirectories([established]);
+      result.push(established);
+    } else {
+      let stats: BigIntStats | undefined;
+      try {
+        stats = lstatSync(next, { bigint: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
+      if (stats) {
+        if (stats.isSymbolicLink() || !stats.isDirectory()) {
+          throw new Error("owned candidate staging refused a linked or non-directory destination ancestor");
+        }
+        throw new Error("owned candidate staging refused a pre-existing destination directory it did not establish");
+      }
+      // The directory budget is checked before the allocation; reused
+      // components never consume it twice.
+      if (ctx.directories >= ctx.bounds.maxDirectories) {
+        throw new Error("owned candidate staging exceeded its directory bound");
+      }
+      ctx.directories += 1;
+      mkdirSync(next, { mode: 0o700 });
+      const created = lstatSync(next, { bigint: true });
+      if (created.isSymbolicLink() || !created.isDirectory()) {
+        throw new Error("owned candidate staging could not establish a real destination directory");
+      }
+      const receipt: OwnedDirectory = { path: next, dev: created.dev, ino: created.ino };
+      ctx.owned.set(next, receipt);
+      result.push(receipt);
     }
+    verifyOwnedDirectories(result);
+    cursor = next;
+  }
+  return result;
+}
+
+function realSourceDirectoryReceipt(path: string): OwnedDirectory {
+  const stats = lstatSync(path, { bigint: true });
+  if (stats.isSymbolicLink() || !stats.isDirectory()) {
+    throw new Error("owned candidate staging requires a real, non-linked source directory");
+  }
+  return { path, dev: stats.dev, ino: stats.ino };
+}
+
+/**
+ * Re-verify a complete source-directory receipt chain (trusted base through the
+ * current component): each must still be a real, non-linked directory with the
+ * exact captured BigInt dev/ino. Source intermediates are never realpath-
+ * followed and never recaptured, so a linked or replaced ancestor fails closed.
+ */
+function verifySourceDirectories(chain: readonly OwnedDirectory[]): void {
+  for (const receipt of chain) {
+    const stats = lstatSync(receipt.path, { bigint: true });
+    if (stats.isSymbolicLink() || !stats.isDirectory()
+        || stats.dev !== receipt.dev || stats.ino !== receipt.ino) {
+      throw new Error("owned candidate staging detected a replaced or linked source ancestor");
+    }
+  }
+}
+
+/**
+ * Build and retain the source-directory receipt chain from a trusted real base
+ * through every selected intermediate component down to `target`. A linked or
+ * special intermediate (or final) directory component fails closed, so a
+ * `trustedBase/linked-parent/real-child` selection can never read outside the
+ * trusted base.
+ */
+function sourceDirectoryChain(target: string, trustedBase: OwnedDirectory): OwnedDirectory[] {
+  const rel = relative(trustedBase.path, target);
+  if (rel === "") {
+    verifySourceDirectories([trustedBase]);
+    return [trustedBase];
+  }
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error("owned candidate staging refused a source outside its trusted base");
+  }
+  const chain = [trustedBase];
+  let cursor = trustedBase.path;
+  for (const component of rel.split(sep)) {
+    if (!component || component === "." || component === "..") {
+      throw new Error("owned candidate staging refused an empty or relative source component");
+    }
+    const next = join(cursor, component);
+    const stats = lstatSync(next, { bigint: true });
+    if (stats.isSymbolicLink() || !stats.isDirectory()) {
+      throw new Error("owned candidate staging refused a linked or non-directory source ancestor");
+    }
+    chain.push({ path: next, dev: stats.dev, ino: stats.ino });
+    cursor = next;
+  }
+  verifySourceDirectories(chain);
+  return chain;
+}
+
+/**
+ * Copy one regular source leaf to an exclusively created destination leaf.
+ *
+ * `leaf` is the receipt inspected before this call; it must still match on disk
+ * (identity, size, mtime, ctime), so a swap between inspection and the copy
+ * fails closed. The source is then opened read-only with O_NOFOLLOW/O_NONBLOCK
+ * and re-checked through its own descriptor (fstat) for the exact regular-file
+ * identity, size, and bounds. Bytes are copied in bounded chunks; the open
+ * descriptor, the source path, and the whole source-directory chain are
+ * re-verified afterwards so a source swap, ancestor replacement, or in-place
+ * mutation fails closed. The destination is created with O_EXCL/O_NOFOLLOW,
+ * which rejects any pre-existing regular, linked, or special leaf without
+ * overwriting or unlinking it. Permissions are applied through the verified
+ * destination descriptor. Every real owned ancestor is re-verified before each
+ * write and after publication, and a write that makes no positive bounded
+ * progress fails while retaining the partial bytes.
+ */
+function copyBoundedRegularFile(
+  leaf: SourceLeafReceipt,
+  destination: string,
+  ctx: StageContext,
+  sourceChain: readonly OwnedDirectory[],
+  destinationParents: readonly OwnedDirectory[],
+): void {
+  verifySourceDirectories(sourceChain);
+  const before = lstatSync(leaf.path, { bigint: true });
+  if (before.isSymbolicLink() || !before.isFile()
+      || before.dev !== leaf.dev || before.ino !== leaf.ino) {
+    throw new Error("owned candidate staging detected a replaced source file before the copy");
+  }
+  if (before.size !== leaf.size || before.mtimeNs !== leaf.mtimeNs || before.ctimeNs !== leaf.ctimeNs) {
+    throw new Error("owned candidate staging detected a changed source file before the copy");
+  }
+  if (before.size > BigInt(ctx.bounds.maxLeafBytes)) {
+    throw new Error("owned candidate staging rejected an oversized source file");
+  }
+  const chain = ensureOwnedPath(dirname(destination), destinationParents, ctx);
+  verifyOwnedDirectories(chain);
+
+  const sourceFd = ctx.io.openSource(leaf.path);
+  let destinationFd: number | undefined;
+  try {
+    const opened = ctx.io.fstat(sourceFd);
+    if (!opened.isFile()
+        || opened.dev !== leaf.dev || opened.ino !== leaf.ino || opened.size !== leaf.size) {
+      throw new Error("owned candidate staging detected a replaced source file between inspect and open");
+    }
+    // A same-inode, same-size rewrite during the inspect/open gap would
+    // otherwise become the new baseline for the post-copy checks; require the
+    // descriptor's retained timestamps to match the inspected leaf receipt.
+    if (opened.mtimeNs !== leaf.mtimeNs || opened.ctimeNs !== leaf.ctimeNs) {
+      throw new Error("owned candidate staging detected a changed source file between inspect and open");
+    }
+    if (opened.size > BigInt(ctx.bounds.maxLeafBytes)) {
+      throw new Error("owned candidate staging rejected an oversized source file");
+    }
+    ctx.budget.files += 1;
+    ctx.budget.bytes += Number(opened.size);
+    if (ctx.budget.files > ctx.bounds.maxFiles || ctx.budget.bytes > ctx.bounds.maxTotalBytes) {
+      throw new Error("owned candidate staging exceeded its aggregate file bound");
+    }
+
+    destinationFd = ctx.io.openDestination(destination, Number(opened.mode & 0o777n));
+    verifyOwnedDirectories(chain);
+    const createdPath = lstatSync(destination, { bigint: true });
+    const createdFd = ctx.io.fstat(destinationFd);
+    if (createdPath.isSymbolicLink() || !createdPath.isFile()
+        || createdPath.dev !== createdFd.dev || createdPath.ino !== createdFd.ino) {
+      throw new Error("owned candidate staging detected a replaced or linked destination file");
+    }
+
+    const size = Number(opened.size);
+    const buffer = Buffer.allocUnsafe(Math.max(1, Math.min(CANDIDATE_COPY_CHUNK_BYTES, size)));
+    let position = 0;
+    while (position < size) {
+      const wanted = Math.min(buffer.length, size - position);
+      const read = ctx.io.read(sourceFd, buffer, 0, wanted, position);
+      if (read <= 0) throw new Error("owned candidate staging source read made no bounded progress");
+      if (read > wanted) throw new Error("owned candidate staging source read exceeded its bounded request");
+      let written = 0;
+      while (written < read) {
+        verifyOwnedDirectories(chain);
+        const delta = ctx.io.write(destinationFd, buffer, written, read - written, position + written);
+        if (delta <= 0) throw new Error("owned candidate staging destination write made no bounded progress");
+        written += delta;
+      }
+      position += read;
+    }
+
+    const afterFd = ctx.io.fstat(sourceFd);
+    if (afterFd.dev !== opened.dev || afterFd.ino !== opened.ino
+        || afterFd.size !== opened.size
+        || afterFd.mtimeNs !== opened.mtimeNs || afterFd.ctimeNs !== opened.ctimeNs) {
+      throw new Error("owned candidate staging detected a source mutation during the copy");
+    }
+    const afterPath = lstatSync(leaf.path, { bigint: true });
+    if (afterPath.isSymbolicLink() || !afterPath.isFile()
+        || afterPath.dev !== opened.dev || afterPath.ino !== opened.ino
+        || afterPath.size !== opened.size
+        || afterPath.mtimeNs !== opened.mtimeNs || afterPath.ctimeNs !== opened.ctimeNs) {
+      throw new Error("owned candidate staging detected a source path swap during the copy");
+    }
+    verifySourceDirectories(sourceChain);
+
+    ctx.io.fchmod(destinationFd, Number(opened.mode & 0o777n));
+    verifyOwnedDirectories(chain);
+    const published = lstatSync(destination, { bigint: true });
+    const publishedFd = ctx.io.fstat(destinationFd);
+    if (published.isSymbolicLink() || !published.isFile()
+        || published.dev !== publishedFd.dev || published.ino !== publishedFd.ino
+        || published.size !== opened.size) {
+      throw new Error("owned candidate staging detected a replaced destination file after publication");
+    }
+  } finally {
+    if (destinationFd !== undefined) ctx.io.close(destinationFd);
+    ctx.io.close(sourceFd);
+  }
+}
+
+/**
+ * Copy one selected source tree into an owned destination tree.
+ *
+ * `.terraform` is pruned by name BEFORE lstat/readdir/descent at every depth,
+ * including synthetic source roots. The source root and every intermediate are
+ * real, non-linked directories whose retained receipt chain is re-verified
+ * around every iteration; the identity inspected in the parent loop is passed
+ * into the recursion and required, never recaptured. Directory iteration is
+ * bounded (`opendirSync`/`readSync`) so an oversized directory never has its
+ * full name array materialized. Linked or special source entries and linked
+ * destination ancestors fail closed. The copier never realpaths a source root,
+ * so it makes no link-following containment claim for it.
+ */
+function copyBoundedTree(
+  sourceChain: readonly OwnedDirectory[],
+  destinationRoot: string,
+  ctx: StageContext,
+): void {
+  const visit = (
+    chain: readonly OwnedDirectory[],
+    destination: string,
+    destinationParents: readonly OwnedDirectory[],
+  ): void => {
+    const source = chain[chain.length - 1]!.path;
+    verifySourceDirectories(chain);
+    const destinationChain = ensureOwnedPath(destination, destinationParents, ctx);
+    verifyOwnedDirectories(destinationChain);
+
+    const directory = opendirSync(source);
+    try {
+      for (;;) {
+        verifySourceDirectories(chain);
+        verifyOwnedDirectories(destinationChain);
+        const entry = directory.readSync();
+        if (entry === null) break;
+        const name = entry.name;
+        // Exclude initialized Terraform data before lstat, readdir, or descent
+        // at every depth, including inside the synthetic source roots.
+        if (name === ".terraform") continue;
+        const sourceEntry = join(source, name);
+        const destinationEntry = join(destination, name);
+        const entryStats = lstatSync(sourceEntry, { bigint: true });
+        if (entryStats.isSymbolicLink()) {
+          throw new Error("owned candidate staging rejected a linked source entry");
+        }
+        if (entryStats.isDirectory()) {
+          const sourceReceipt: OwnedDirectory = {
+            path: sourceEntry, dev: entryStats.dev, ino: entryStats.ino,
+          };
+          visit([...chain, sourceReceipt], destinationEntry, destinationChain);
+        } else if (entryStats.isFile()) {
+          const leaf: SourceLeafReceipt = {
+            path: sourceEntry,
+            dev: entryStats.dev,
+            ino: entryStats.ino,
+            size: entryStats.size,
+            mtimeNs: entryStats.mtimeNs,
+            ctimeNs: entryStats.ctimeNs,
+          };
+          copyBoundedRegularFile(leaf, destinationEntry, ctx, chain, destinationChain);
+        } else {
+          throw new Error("owned candidate staging rejected a special source entry");
+        }
+      }
+    } finally {
+      directory.closeSync();
+    }
+    verifySourceDirectories(chain);
+    verifyOwnedDirectories(destinationChain);
   };
-  visit(sourceRoot, destinationRoot, 0);
+  visit(sourceChain, destinationRoot, [...ctx.ancestors, ctx.stagingBase]);
+}
+
+/**
+ * Read a bounded regular manifest through a validated descriptor: lstat first,
+ * then a real read-only no-follow descriptor whose fstat identity/size must
+ * match, then bounded reads. The descriptor and path are revalidated after the
+ * read (identity, size, mtime, ctime), so a torn or replaced manifest fails
+ * closed. The returned leaf receipt must match again when the manifest is
+ * staged, so the selected file list always corresponds to the staged
+ * package.json.
+ */
+function readBoundedManifest(
+  path: string,
+  io: CandidateCopyFileIo = REAL_CANDIDATE_COPY_FILE_IO,
+): { manifest: Buffer; leaf: SourceLeafReceipt } {
+  const before = lstatSync(path, { bigint: true });
+  if (before.isSymbolicLink() || !before.isFile()
+      || before.size > BigInt(CANDIDATE_COPY_BOUNDS.maxLeafBytes)) {
+    throw new Error("candidate staging requires a real, bounded package manifest");
+  }
+  const fd = io.openSource(path);
+  try {
+    const opened = io.fstat(fd);
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino
+        || opened.size !== before.size) {
+      throw new Error("candidate staging detected a replaced package manifest");
+    }
+    if (opened.mtimeNs !== before.mtimeNs || opened.ctimeNs !== before.ctimeNs) {
+      throw new Error("candidate staging detected a changed package manifest between inspect and open");
+    }
+    const size = Number(opened.size);
+    const buffer = Buffer.allocUnsafe(Math.max(1, size));
+    let position = 0;
+    while (position < size) {
+      const read = io.read(fd, buffer, position, size - position, position);
+      if (read <= 0) throw new Error("candidate staging package manifest read made no bounded progress");
+      position += read;
+    }
+    const afterFd = io.fstat(fd);
+    if (afterFd.dev !== opened.dev || afterFd.ino !== opened.ino
+        || afterFd.size !== opened.size
+        || afterFd.mtimeNs !== opened.mtimeNs || afterFd.ctimeNs !== opened.ctimeNs) {
+      throw new Error("candidate staging detected a package manifest mutation during the read");
+    }
+    const afterPath = lstatSync(path, { bigint: true });
+    if (afterPath.isSymbolicLink() || !afterPath.isFile()
+        || afterPath.dev !== opened.dev || afterPath.ino !== opened.ino
+        || afterPath.size !== opened.size
+        || afterPath.mtimeNs !== opened.mtimeNs || afterPath.ctimeNs !== opened.ctimeNs) {
+      throw new Error("candidate staging detected a package manifest path swap during the read");
+    }
+    return {
+      manifest: buffer.subarray(0, size),
+      leaf: {
+        path,
+        dev: opened.dev,
+        ino: opened.ino,
+        size: opened.size,
+        mtimeNs: opened.mtimeNs,
+        ctimeNs: opened.ctimeNs,
+      },
+    };
+  } finally {
+    io.close(fd);
+  }
+}
+
+/**
+ * Reject unsafe shipped manifest entries BEFORE any access. Public package files
+ * are accepted as relative strings only: empty, home-relative, absolute,
+ * drive-qualified, traversal, `.terraform`, `.git`, and `node_modules`
+ * components all fail closed.
+ */
+function validateShippedEntry(shippedEntry: string): string {
+  if (!shippedEntry || shippedEntry.startsWith("~")) {
+    throw new Error("candidate staging rejected an empty or home-relative package file entry");
+  }
+  if (isAbsolute(shippedEntry) || /^[A-Za-z]:/.test(shippedEntry)) {
+    throw new Error("candidate staging rejected an absolute package file entry");
+  }
+  const components = shippedEntry.split(/[\\/]+/);
+  for (const component of components) {
+    if (!component || component === "." || component === ".."
+        || component === ".terraform" || component === ".git" || component === "node_modules") {
+      throw new Error("candidate staging rejected an unsafe package file entry");
+    }
+  }
+  return join(...components);
+}
+
+/**
+ * Resolve test bounds overrides. A test may only LOWER a ceiling: every value
+ * must be a finite non-negative integer no greater than its shipped default, so
+ * `Infinity`, `NaN`, fractional, negative, and raised ceilings are rejected
+ * before any filesystem work.
+ */
+function resolveCandidateCopyBounds(overrides?: Partial<CandidateCopyBounds>): CandidateCopyBounds {
+  if (!overrides) return { ...CANDIDATE_COPY_BOUNDS };
+  const bounds: Record<string, number> = { ...CANDIDATE_COPY_BOUNDS };
+  for (const key of Object.keys(CANDIDATE_COPY_BOUNDS) as (keyof CandidateCopyBounds)[]) {
+    const value = overrides[key];
+    if (value === undefined) continue;
+    if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)
+        || value < 0 || value > CANDIDATE_COPY_BOUNDS[key]) {
+      throw new Error("candidate copy test bounds may only lower a finite non-negative integer ceiling");
+    }
+    bounds[key] = value;
+  }
+  return bounds as unknown as CandidateCopyBounds;
+}
+
+/**
+ * Explicit synthetic-copy seam.
+ *
+ * Only a test may call this. It drives the SAME bounded copier that stages the
+ * native candidate against caller-created real destination directories, with
+ * optional bounded overrides (which may only make the checks stricter) and an
+ * optional trusted source base that exercises the intermediate-source-ancestor
+ * checks. A synthetic copy is evidence about the copier's
+ * file/identity/exclusivity behavior only: it never proves the native runtime,
+ * tsc, or a real candidate.
+ */
+export interface CandidateCopyTestOptions {
+  readonly fileIo?: Partial<CandidateCopyFileIo>;
+  readonly bounds?: Partial<CandidateCopyBounds>;
+  readonly sourceTrustedBase?: string;
+}
+
+export function stageCandidateTreeForTest(
+  sourceRoot: string,
+  destinationRoot: string,
+  options?: CandidateCopyTestOptions,
+): void {
+  const bounds = resolveCandidateCopyBounds(options?.bounds);
+  const base = realDirectoryReceipt(destinationRoot);
+  const io: CandidateCopyFileIo = { ...REAL_CANDIDATE_COPY_FILE_IO, ...(options?.fileIo ?? {}) };
+  const sourceRootStats = lstatSync(sourceRoot, { bigint: true });
+  if (sourceRootStats.isSymbolicLink() || !sourceRootStats.isDirectory()) {
+    throw new Error("owned candidate staging requires a real, non-linked source directory");
+  }
+  const sourceChain = options?.sourceTrustedBase
+    ? sourceDirectoryChain(sourceRoot, realDirectoryReceipt(options.sourceTrustedBase))
+    : [realSourceDirectoryReceipt(sourceRoot)];
+  const ctx: StageContext = {
+    budget: { files: 0, bytes: 0 },
+    bounds,
+    io,
+    ancestors: [],
+    stagingBase: base,
+    owned: new Map([[base.path, base]]),
+    directories: 0,
+  };
+  copyBoundedTree(sourceChain, destinationRoot, ctx);
+}
+
+/**
+ * Explicit synthetic-manifest seam: run the same bounded manifest read against
+ * a caller-supplied file with an optional injectable I/O override. Test-only;
+ * production reads the real package manifest.
+ */
+export interface CandidateManifestTestOptions {
+  readonly fileIo?: Partial<CandidateCopyFileIo>;
+}
+
+export function readCandidateManifestForTest(path: string, options?: CandidateManifestTestOptions): number {
+  const io: CandidateCopyFileIo = { ...REAL_CANDIDATE_COPY_FILE_IO, ...(options?.fileIo ?? {}) };
+  return readBoundedManifest(path, io).manifest.byteLength;
 }
 
 export function compileAndStageCandidate(root: string): CandidatePackage {
   const projectRoot = resolve(process.cwd());
   const requireFromProject = createRequire(join(projectRoot, "package.json"));
   const compiler = requireFromProject.resolve("typescript/bin/tsc");
+  // The caller passes a canonical scratch root (createOwnedScratchRoot realpaths
+  // it); this staging path verifies it is real but never re-resolves or follows
+  // it, so it makes no link-following containment claim for the root.
+  const rootStats = lstatSync(root, { bigint: true });
+  if (rootStats.isSymbolicLink() || !rootStats.isDirectory()) {
+    throw new Error("owned candidate staging requires a real, non-linked scratch root");
+  }
+  const scratchReceipt: OwnedDirectory = { path: root, dev: rootStats.dev, ino: rootStats.ino };
+  const projectRootStats = lstatSync(projectRoot, { bigint: true });
+  if (projectRootStats.isSymbolicLink() || !projectRootStats.isDirectory()) {
+    throw new Error("owned candidate staging requires a real, non-linked project root");
+  }
+  const projectReceipt: OwnedDirectory = {
+    path: projectRoot, dev: projectRootStats.dev, ino: projectRootStats.ino,
+  };
   const compiledRoot = join(root, "compiled");
   const build = spawnSync(process.execPath, [
     compiler,
@@ -554,30 +1152,76 @@ export function compileAndStageCandidate(root: string): CandidatePackage {
       + `${build.stdout ?? ""}\n${build.stderr ?? ""}\n${String(build.error ?? "")}`,
     );
   }
+  // The scratch root must still be the same real directory after the compiler
+  // ran; a swap during compilation fails closed before any staging write.
+  verifySourceDirectories([scratchReceipt]);
 
   const candidateRoot = join(root, "candidate-package");
+  // The destination package root is created exclusively: a pre-existing entry
+  // (regular, linked, or special) fails closed rather than being reused.
+  let existingCandidate: BigIntStats | undefined = undefined;
+  try {
+    existingCandidate = lstatSync(candidateRoot, { bigint: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  if (existingCandidate) {
+    throw new Error("owned candidate staging refused a pre-existing candidate package root");
+  }
+  verifySourceDirectories([scratchReceipt]);
   mkdirSync(candidateRoot, { mode: 0o700 });
-  const budget: CopyBudget = { files: 0, bytes: 0 };
-  copyBoundedTree(join(compiledRoot, "src"), join(candidateRoot, "dist", "src"), budget);
-  const manifest = JSON.parse(readFileSync(join(projectRoot, "package.json"), "utf8")) as { files?: unknown };
+  const candidateReceipt = realDirectoryReceipt(candidateRoot);
+  verifyOwnedDirectories([scratchReceipt, candidateReceipt]);
+
+  const ctx: StageContext = {
+    budget: { files: 0, bytes: 0 },
+    bounds: CANDIDATE_COPY_BOUNDS,
+    io: REAL_CANDIDATE_COPY_FILE_IO,
+    ancestors: [scratchReceipt],
+    stagingBase: candidateReceipt,
+    owned: new Map([
+      [scratchReceipt.path, scratchReceipt],
+      [candidateReceipt.path, candidateReceipt],
+    ]),
+    directories: 0,
+  };
+  const compiledSrcChain = sourceDirectoryChain(join(compiledRoot, "src"), scratchReceipt);
+  copyBoundedTree(compiledSrcChain, join(candidateRoot, "dist", "src"), ctx);
+
+  // The shipped-file list and the package.json later staged come from the same
+  // verified manifest snapshot; the manifest leaf receipt is enforced at copy.
+  const manifestRead = readBoundedManifest(join(projectRoot, "package.json"));
+  const manifest = JSON.parse(manifestRead.manifest.toString("utf8")) as { files?: unknown };
   if (!Array.isArray(manifest.files)) throw new Error("the real package manifest has no shipped-file list");
   for (const shippedEntry of manifest.files) {
     if (typeof shippedEntry !== "string") throw new Error("candidate staging rejected a non-string package file entry");
     if (shippedEntry === "dist/src") continue;
-    const source = resolve(projectRoot, shippedEntry);
+    const entryRelative = validateShippedEntry(shippedEntry);
+    const source = join(projectRoot, entryRelative);
     const sourceRelative = relative(projectRoot, source);
     if (sourceRelative === ".." || sourceRelative.startsWith(`..${sep}`) || isAbsolute(sourceRelative)) {
       throw new Error("candidate staging rejected a package file entry outside the source root");
     }
     const destination = join(candidateRoot, sourceRelative);
-    const stats = lstatSync(source);
-    if (stats.isDirectory() && !stats.isSymbolicLink()) {
-      copyBoundedTree(source, destination, budget);
+    const stats = lstatSync(source, { bigint: true });
+    if (stats.isSymbolicLink()) {
+      throw new Error("candidate staging rejected a linked package file entry");
+    }
+    if (stats.isDirectory()) {
+      copyBoundedTree(sourceDirectoryChain(source, projectReceipt), destination, ctx);
+    } else if (stats.isFile()) {
+      const leaf: SourceLeafReceipt = {
+        path: source, dev: stats.dev, ino: stats.ino,
+        size: stats.size, mtimeNs: stats.mtimeNs, ctimeNs: stats.ctimeNs,
+      };
+      copyBoundedRegularFile(leaf, destination, ctx, sourceDirectoryChain(dirname(source), projectReceipt),
+        [...ctx.ancestors, ctx.stagingBase]);
     } else {
-      copyBoundedRegularFile(source, destination, budget);
+      throw new Error("candidate staging rejected a special package file entry");
     }
   }
-  copyBoundedRegularFile(join(projectRoot, "package.json"), join(candidateRoot, "package.json"), budget);
+  copyBoundedRegularFile(manifestRead.leaf, join(candidateRoot, "package.json"), ctx,
+    sourceDirectoryChain(projectRoot, projectReceipt), [...ctx.ancestors, ctx.stagingBase]);
   const entry = join(candidateRoot, "dist", "src", "index.js");
   assert.ok(existsSync(entry), "the scratch candidate contains the real compiled extension entry");
   assert.ok(existsSync(join(candidateRoot, "dist", "src", "session-host", "reporter.js")));
@@ -744,31 +1388,9 @@ function frameText(surface: TerminalSurface): string {
   return surface.frame().lines.map(stripGeneratedSgr).join("\n");
 }
 
-function selectedLine(text: string, label: string): boolean {
-  return text.split("\n").some((line) => (line.includes("→ ") || line.includes("> ")) && line.includes(label));
-}
-
-function rosterRowCaption(row: string): string | undefined {
-  const contents = row.startsWith("> ") || row.startsWith("→ ") || row.startsWith("  ")
-    ? row.slice(2).trimEnd()
-    : undefined;
-  if (contents === undefined) return undefined;
-  const badge = contents.search(/\s+\[(?:AGENT:|starting\]|exited(?:\s|\])|error(?:\s|\])|input\])/);
-  return badge < 0 ? undefined : contents.slice(0, badge).trimEnd();
-}
-
-function selectedRosterCaption(text: string, sidebarCols: number): string | undefined {
-  const row = text.split("\n").slice(1).map((line) => line.slice(0, sidebarCols))
-    .find((line) => /^\s*[>→] /.test(line));
-  return row === undefined ? undefined : rosterRowCaption(row);
-}
-
-function renderedCaptionMatches(rendered: string | undefined, canonicalCaption: string): boolean {
-  if (rendered === undefined) return false;
-  if (rendered === canonicalCaption) return true;
-  const clippedPrefix = rendered.endsWith("...") ? rendered.slice(0, -3) : "";
-  return clippedPrefix.length > 0 && canonicalCaption.startsWith(clippedPrefix)
-    && canonicalCaption.length > clippedPrefix.length;
+function countExitedCards(text: string, sidebarCols: number): number {
+  return parseRosterFrame(text, sidebarCols).cards
+    .filter((card) => card.status === "exited (code 0)").length;
 }
 
 /** Observe the native Editor's bordered content row, not its label/top border. */
@@ -1204,22 +1826,38 @@ export class MainPtyDriver {
   }
 
   selected(label: string): boolean {
-    return selectedLine(this.currentText(), label);
+    const selected = selectedRosterEntry(this.currentText(), this.sidebarColumnCount());
+    if (selected === undefined) return false;
+    const matches = this.sessions().filter((session) => session.rowProbe === label);
+    return matches.length === 1 && selected.kind === "native"
+      ? renderedTitleMatches(selected.title, matches[0]!.displayName)
+      : selected.label === label;
   }
 
+  /** Actual sidebar pane width: 32 wide, or the full narrow-overlay width. */
   private sidebarColumnCount(): number {
     const cols = this.surface.frame().cols;
-    return this.sidebarVisible && cols >= 53 ? 32 : cols;
+    return this.sidebarVisible && cols >= SIDEBAR_OVERLAY_MIN_OUTER_COLUMNS ? SIDEBAR_COLUMNS : cols;
+  }
+
+  /** Title line of the selected native card, or undefined for no/action highlight. */
+  private selectedCardTitle(text: string): string | undefined {
+    const selected = selectedRosterEntry(text, this.sidebarColumnCount());
+    return selected !== undefined && selected.kind === "native" ? selected.title : undefined;
   }
 
   private selectedCaptionMatches(text: string, displayName: string): boolean {
-    return renderedCaptionMatches(selectedRosterCaption(text, this.sidebarColumnCount()), displayName);
+    return renderedTitleMatches(this.selectedCardTitle(text), displayName);
   }
 
   private rosterHasCaption(text: string, displayName: string): boolean {
-    const sidebarCols = this.sidebarColumnCount();
-    return text.split("\n").slice(1).map((line) => line.slice(0, sidebarCols))
-      .some((line) => renderedCaptionMatches(rosterRowCaption(line), displayName));
+    return parseRosterFrame(text, this.sidebarColumnCount()).cards
+      .some((card) => renderedTitleMatches(card.title, displayName));
+  }
+
+  /** True only for a fully drawn roster; a partial repaint is never usable. */
+  private rosterIsComplete(text: string): boolean {
+    return parseRosterFrame(text, this.sidebarColumnCount()).complete;
   }
 
   private rememberSelectedTarget(label: string): void {
@@ -1233,10 +1871,13 @@ export class MainPtyDriver {
   }
 
   private rosterTargetSelected(text: string, label: string): boolean {
+    const selected = selectedRosterEntry(text, this.sidebarColumnCount());
+    if (selected === undefined) return false;
     const matches = this.sessions().filter((session) => session.rowProbe === label);
-    return matches.length === 1
-      ? this.selectedCaptionMatches(text, matches[0]!.displayName)
-      : selectedLine(text, label);
+    if (matches.length === 1 && selected.kind === "native") {
+      return renderedTitleMatches(selected.title, matches[0]!.displayName);
+    }
+    return selected.label === label;
   }
 
   async moveRosterTo(label: string, maximumDowns = 5, timeoutMs = EVENT_TIMEOUT_MS): Promise<void> {
@@ -1248,7 +1889,9 @@ export class MainPtyDriver {
     const labels = this.sessions().map((session) => session.rowProbe)
       .concat(["Saved conversations", "New session", "Quit host"]);
     if (this.rosterSelectionClearedByRemoval) {
-      assert.equal(selectedRosterCaption(this.currentText(), this.sidebarColumnCount()), undefined,
+      assert.equal(this.rosterIsComplete(this.currentText()), true,
+        "a fully drawn roster is observed before the cleared highlight is trusted");
+      assert.equal(this.selectedCardTitle(this.currentText()), undefined,
         "confirmed selected-row removal leaves the host highlight empty instead of selecting a sibling");
       const activeHeader = this.currentText().split("\n")[0];
       const beforeHighlight = this.frameRevision;
@@ -1288,7 +1931,9 @@ export class MainPtyDriver {
     // This flow is exercised after restoring the verified wide layout. Ignore
     // the independent roster's highlight when that pane is visible.
     assert.equal(this.surface.frame().cols, OUTER_COLS);
-    const nativeLeft = this.sidebarVisible ? 33 : 0;
+    const nativeLeft = this.sidebarVisible && this.surface.frame().cols >= SIDEBAR_OVERLAY_MIN_OUTER_COLUMNS
+      ? NATIVE_PANE_START
+      : 0;
     return text.split("\n").slice(1).map((line) => line.slice(nativeLeft))
       .find((line) => /^\s*[→>] /.test(line));
   }
@@ -1313,30 +1958,80 @@ export class MainPtyDriver {
     throw new Error(`the actual native Pi menu did not select ${label}; ${this.currentText().slice(-2_000)}`);
   }
 
+  /**
+   * One genuine reserved-chord (fixture F8) press, witnessing exactly the
+   * production two-step transition for the CURRENT state:
+   * - hidden: show + focus the sidebar (visibility action; native children reflow);
+   * - visible with Main focus: focus the sidebar WITHOUT hiding or resizing it;
+   * - visible with sidebar-owned focus (roster/form/picker/confirm): hide to Main.
+   * Callers that want the hide transition must request it explicitly, pressing
+   * again from the sidebar-focused state; this helper never bundles two presses
+   * that could silently hide a visible Main frame.
+   */
   async toggleSidebar(timeoutMs = EVENT_TIMEOUT_MS): Promise<void> {
-    const nextVisible = !this.sidebarVisible;
+    const wasVisible = this.sidebarVisible;
+    const wasMainFocus = this.focus === "main";
+    // Capture the inspected sidebar width before the press changes visibility:
+    // a hide must be witnessed against the pre-transition pane, not a width
+    // recomputed after the sidebar is already gone.
+    const sidebarColumnsBefore = this.sidebarColumnCount();
+    const resizeCountBefore = this.records().filter((record) => record.type === "resize").length;
     const after = this.frameRevision;
     this.pty.write(KEYS.f8);
-    this.sidebarVisible = nextVisible;
-    this.focus = nextVisible ? "sidebar" : "main";
-    await this.waitFrame((text) => nextVisible
-      ? text.includes("New session") && text.includes("Quit host")
-      : !text.includes("New session") && !text.includes("Quit host"),
-    `real F8 sidebar toggle ${nextVisible ? "opens" : "hides"} the pane`, after, timeoutMs);
+    if (!wasVisible) {
+      this.sidebarVisible = true;
+      this.focus = "sidebar";
+    } else if (wasMainFocus) {
+      this.focus = "sidebar"; // focus only; visibility and native geometry are untouched
+    } else {
+      this.sidebarVisible = false;
+      this.focus = "main";
+    }
+    const expectHidden = wasVisible && !wasMainFocus;
+    await this.waitFrame((text) => expectHidden
+      ? sidebarRosterHidden(text, sidebarColumnsBefore)
+      : isSidebarFocusedFrame(text, this.sidebarColumnCount()),
+    expectHidden
+      ? "one F8 press hides the sidebar-focused pane and returns Main"
+      : wasVisible
+        ? "one F8 press focuses the visible sidebar without hiding or resizing it"
+        : "one F8 press shows and focuses the hidden sidebar",
+    after, timeoutMs);
+    if (wasVisible && wasMainFocus) {
+      assert.equal(this.sidebarVisible, true, "the focus-first press keeps the sidebar visible");
+      assert.equal(
+        this.records().filter((record) => record.type === "resize").length, resizeCountBefore,
+        "the focus-first press does not resize any native child",
+      );
+    }
   }
 
+  /**
+   * Establishes sidebar focus with explicit, individually witnessed presses.
+   * From a visible Main-focused frame this is exactly one focus-first press
+   * (no hide, no resize); a form/picker-owned focus runs its own cancellation
+   * fence on the first press, so a separate second press shows the pane again.
+   * The complete sidebar-only footer proves the result.
+   */
   async ensureSidebarFocus(timeoutMs = EVENT_TIMEOUT_MS): Promise<void> {
     if (this.focus === "sidebar" && this.sidebarVisible) return;
+    const headerBefore = frameHeader(this.currentText());
     if (this.focus === "form") {
-      await this.toggleSidebar(timeoutMs); // abandons only the form UI ownership
+      await this.toggleSidebar(timeoutMs); // abandons only the form/picker UI ownership
     }
-    if (this.sidebarVisible && this.focus !== "sidebar") {
+    if (!this.sidebarVisible || this.focus !== "sidebar") {
+      const wasVisible = this.sidebarVisible;
       await this.toggleSidebar(timeoutMs);
-    }
-    if (!this.sidebarVisible) {
-      await this.toggleSidebar(timeoutMs);
+      if (wasVisible) {
+        assert.equal(this.sidebarVisible, true, "the focus-first press keeps the visible sidebar shown");
+        assert.equal(frameHeader(this.currentText()), headerBefore,
+          "the focus-first press does not transfer the active Main owner");
+      }
     }
     assert.equal(this.focus, "sidebar");
+    assert.equal(this.sidebarVisible, true, "establishing sidebar focus leaves the pane visible");
+    assert.ok(isSidebarFocusedFrame(this.currentText(), this.sidebarColumnCount()),
+      "the complete sidebar-only footer proves real sidebar focus");
   }
 
   async activateRoster(label: string, expectedDraft?: string): Promise<void> {
@@ -1345,7 +2040,7 @@ export class MainPtyDriver {
     const after = this.frameRevision;
     this.pty.write(KEYS.enter);
     this.focus = "main";
-    await this.waitFrame((text) => text.split("\n")[0]?.includes(`Session host · ${label} ·`) === true
+    await this.waitFrame((text) => frameHeaderMatches(text, label)
       && (expectedDraft === undefined || text.includes(expectedDraft)),
     `Enter activates the highlighted native session ${label} with its own observed header and surface`, after);
   }
@@ -1354,6 +2049,9 @@ export class MainPtyDriver {
   async createNativeSession(workspace: string): Promise<OwnedSession> {
     const canonicalWorkspace = realpathSync(workspace);
     await this.ensureSidebarFocus();
+    // The active owner never changes while the New form opens and submits, so
+    // its canonical header is captured before the form and must survive.
+    const activeHeaderBeforeNew = frameHeader(this.currentText());
     await this.moveRosterTo("New session");
     const afterOpen = this.frameRevision;
     this.pty.write(KEYS.enter);
@@ -1407,8 +2105,9 @@ export class MainPtyDriver {
     const currentName = record.storedName ?? "";
     const displayName = record.displayName!;
     this.ownedLabels.set(canonicalWorkspace, { rowProbe, currentName, displayName, workspace: canonicalWorkspace });
-    await this.waitFrame((text) => this.selectedCaptionMatches(text, displayName) && text.includes("Session host"),
-      `new canonical row ${displayName} is highlighted after completion without activation`);
+    await this.waitFrame((text) => this.selectedCaptionMatches(text, displayName)
+      && frameHeader(text) === activeHeaderBeforeNew,
+    `new canonical row ${displayName} is highlighted after completion without activation or a header change`);
     this.focus = "sidebar"; // confirmed completed row, not merely a completion-accept key
     this.selectedNativeTarget = { workspace: canonicalWorkspace, pid: record.pid!, sessionId: record.sessionId! };
     return { rowProbe, currentName, displayName, workspace: canonicalWorkspace, record, exitWatcher };
@@ -1477,8 +2176,9 @@ export class MainPtyDriver {
       && record.storedName === name && typeof record.displayName === "string").at(-1);
     assert.ok(nameRecord, "the actual stored-name event includes its canonical bounded display caption");
     const displayName = nameRecord.displayName!;
-    await this.waitFrame((text) => this.selectedCaptionMatches(text, displayName) && text.includes("Session host"),
-      "the selected native row renders the actual canonical caption at its available sidebar width");
+    await this.waitFrame((text) => this.selectedCaptionMatches(text, displayName)
+      && frameHeader(text) === activeHeader.trimEnd(),
+      "the selected native row renders the actual canonical caption while the active owner is unchanged");
     assert.equal(this.currentText().split("\n")[0], activeHeader,
       "editing a native caption does not transfer active Main ownership");
     assert.equal(processIsAlive(session.record.pid), true, "the edited native child remains live");
@@ -1486,7 +2186,7 @@ export class MainPtyDriver {
       "opening and saving the right-pane Edit form does not change child geometry");
     session.currentName = name;
     session.displayName = displayName;
-    const rendered = selectedRosterCaption(this.currentText(), this.sidebarColumnCount());
+    const rendered = this.selectedCardTitle(this.currentText());
     if (rendered === displayName) session.rowProbe = displayName;
     this.ownedLabels.set(session.workspace, {
       rowProbe: session.rowProbe, currentName: name, displayName, workspace: session.workspace,
@@ -1543,9 +2243,9 @@ export class MainPtyDriver {
   async closeNativeNormally(session: OwnedSession): Promise<void> {
     assert.equal(this.focus, "main", `native input is focused on ${session.rowProbe}`);
     assert.equal(processIsAlive(session.record.pid), true, `${session.rowProbe} is alive before its native Ctrl+C exit`);
-    assert.ok(this.currentText().split("\n")[0]?.includes(`Session host · ${session.displayName} · alive`),
-      "the explicit native exit begins with the exact uniquely observed target as active owner");
-    const alreadyExitedRows = this.currentText().split("\n").filter((line) => line.includes("[exited (code 0)]")).length;
+    assert.ok(renderedTitleMatches(frameHeader(this.currentText()), session.displayName),
+      "the explicit native exit begins with the exact uniquely observed title as active owner");
+    const alreadyExitedCards = countExitedCards(this.currentText(), this.sidebarColumnCount());
     const otherLiveOwners = this.ownedSessions().filter((candidate) => candidate.record.pid !== session.record.pid
       && !candidate.exitWatcher.observedExit);
     for (const owner of otherLiveOwners) assert.equal(processIsAlive(owner.record.pid), true,
@@ -1567,17 +2267,23 @@ export class MainPtyDriver {
       "the public native shutdown context independently confirms the same conversation id");
     // Reporter disconnect invalidates native metadata: an unavailable caption
     // is truthful, not a new identity. Correlate the uniquely active owner and
-    // one NEW zero-status row with the exact PID's public lifecycle/kernel/PTY
+    // one NEW zero-status card with the exact PID's public lifecycle/kernel/PTY
     // evidence below; old rows or another child's exit cannot stand in for it.
+    // The exit status is read from the card's SECOND row, below the title row.
     let exitCaption: string | undefined;
     await this.waitFrame((text) => {
-      const lines = text.split("\n");
-      const match = /^Session host · (.+) · exited\s*$/.exec(lines[0] ?? "");
-      if (!match || (match[1] !== session.displayName && match[1] !== "(session name unavailable)")) return false;
-      if (lines.filter((line) => line.includes("[exited (code 0)]")).length !== alreadyExitedRows + 1) return false;
-      exitCaption = match[1];
+      const header = frameHeader(text);
+      if (header !== "(session name unavailable)" && !renderedTitleMatches(header, session.displayName)) return false;
+      const sidebarCols = this.sidebarColumnCount();
+      const parsed = parseRosterFrame(text, sidebarCols);
+      if (!parsed.complete) return false;
+      if (countExitedCards(text, sidebarCols) !== alreadyExitedCards + 1) return false;
+      const selected = parsed.entries.find((entry) => entry.selected);
+      if (selected === undefined || selected.kind !== "native" || selected.status !== "exited (code 0)") return false;
+      if (header !== "(session name unavailable)" && !renderedTitleMatches(selected.title, session.displayName)) return false;
+      exitCaption = header;
       return true;
-    }, `Main observes one new exited row for the exact active owned ${session.rowProbe} process`, before);
+    }, `Main observes one new exited card for the exact active owned ${session.rowProbe} process`, before);
     await session.exitWatcher.waitForExit(EVENT_TIMEOUT_MS);
     assert.equal(session.exitWatcher.observedExit, true,
       `${session.rowProbe} received the kernel EVFILT_PROC/NOTE_EXIT event for its exact owned PID`);
@@ -1620,12 +2326,13 @@ export class MainPtyDriver {
     const remainingRows = this.sessions().filter((candidate) => candidate.workspace !== session.workspace);
     const beforeDelete = this.frameRevision;
     this.pty.write(KEYS.delete);
-    await this.waitFrame((text) => text.includes(`Sessions (${beforeRows - 1})`)
+    await this.waitFrame((text) => this.rosterIsComplete(text)
+      && text.includes(`Sessions (${beforeRows - 1})`)
       && !this.rosterHasCaption(text, session.displayName)
       && remainingRows.every((candidate) => this.rosterHasCaption(text, candidate.displayName))
       && ["Saved conversations", "New session", "Quit host"].every((entry) => text.includes(entry))
-      && selectedRosterCaption(text, this.sidebarColumnCount()) === undefined,
-    `the public Delete action removes only ${session.rowProbe}'s confirmed exited row and clears its highlight`, beforeDelete);
+      && this.selectedCardTitle(text) === undefined,
+    `the public Delete action removes only ${session.rowProbe}'s confirmed exited row from a complete roster and clears its highlight`, beforeDelete);
     this.removedWorkspaces.add(session.workspace);
     this.selectedNativeTarget = undefined;
     this.rosterSelectionClearedByRemoval = true;
@@ -1687,7 +2394,8 @@ export class MainPtyDriver {
       "the host is quit only after every owned native child OS exit is confirmed");
     await this.ensureSidebarFocus();
     assert.equal(this.focus, "sidebar", "the explicit host quit action belongs to the visible sidebar, not a native editor");
-    await this.waitFrame((text) => text.includes("q quit"), "the actual sidebar exposes its host-only quit action");
+    await this.waitFrame((text) => isSidebarFocusedFrame(text, this.sidebarColumnCount()),
+      "the complete sidebar-only footer exposes the host-only quit action");
     // Disconnected exited rows truthfully share an unavailable caption. Quit
     // needs no invented name or ambiguous row navigation after exact OS exits.
     this.pty.write("q");

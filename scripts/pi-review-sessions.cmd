@@ -3,18 +3,18 @@ setlocal DisableDelayedExpansion
 rem Native Windows one-command session-host entry point. The PowerShell
 rem bootstrap selects supported PATH Node or verifies/extracts the fixed
 rem official Node 22.19.0 archive before invoking the shared CJS unchanged.
-rem This entry point is not proof of Windows session-host backend parity:
-rem the current host implementation still has a POSIX-only guard.
 
 rem Capability isolation must precede the PowerShell child, every Node probe,
 rem and every bootstrap network/archive child. Never remove role/catalog
 rem markers to make a real setup authorized.
+rem Diagnostics inside these blocks escape every parenthesis with a caret;
+rem an unescaped parenthesis would end the block early and abort the launcher.
 if defined PI_REVIEW_GATE_RUNTIME_ROLE (
-  echo pi-review-sessions: unsupported role context (PI_REVIEW_GATE_RUNTIME_ROLE).
+  echo pi-review-sessions: unsupported role context ^(PI_REVIEW_GATE_RUNTIME_ROLE^).
   exit /b 1
 )
 if defined PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG (
-  echo pi-review-sessions: unsupported role context (PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG).
+  echo pi-review-sessions: unsupported role context ^(PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG^).
   exit /b 1
 )
 set "PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP="

@@ -6,7 +6,17 @@
  *
  * Usage:
  *   node scripts/ci/session-host-windows-acceptance.cjs copy-scripts <sourceDir> <destDir>
+ *   node scripts/ci/session-host-windows-acceptance.cjs copy-source <sourceDir> <destDir>
  *   node scripts/ci/session-host-windows-acceptance.cjs create-root <parentDir>
+ *
+ * copy-source copies only the exact production build inputs of a source
+ * checkout (package.json, package-lock.json, tsconfig.json, and the src,
+ * scripts, and skills trees) into a fresh complete source fixture with no
+ * prebuilt dist and no node_modules, so the real source launcher can perform
+ * its own staged, lockfile-exact install and build. tests, dist, node_modules,
+ * .git, and private work notes are never copied.
+ *
+ * Both copiers share the same bounded, retained semantics described below.
  *
  * copy-scripts copies the shipped scripts tree (every stage) into a fresh
  * candidate root so the staged candidate keeps its own package-root helper
@@ -42,6 +52,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const PRUNED_DIR_NAME = '.terraform';
+// Exact production build inputs copied by copy-source. tests/, dist/,
+// node_modules/, .git/, private work notes, and every other root entry are
+// deliberately absent.
+const SOURCE_FILE_INPUTS = ['package.json', 'package-lock.json', 'tsconfig.json'];
+const SOURCE_DIR_INPUTS = ['src', 'scripts', 'skills'];
 const MAX_FILES = 4096;
 const MAX_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_DIRS = 512;
@@ -86,6 +101,16 @@ function lstatOrFail(target, label) {
     return fs.lstatSync(target, { bigint: true });
   } catch (error) {
     fail(`cannot stat ${label} ${target}: ${error.message}`);
+  }
+}
+
+/** lstat that returns undefined only when the entry does not exist. */
+function lstatIfExists(target) {
+  try {
+    return fs.lstatSync(target, { bigint: true });
+  } catch (error) {
+    if (error.code === 'ENOENT') return undefined;
+    fail(`cannot stat source package input ${target}: ${error.message}`);
   }
 }
 
@@ -247,11 +272,11 @@ function copyFileBounded(sourcePath, destParent, entryName, preStats, destReceip
 
 /** Recursively copy one source stage into its destination stage. */
 function copyStage(sourceDir, destDir, sourceReceipt, destReceipt, depth, counter,
-  checkAncestors = () => {}) {
+  checkAncestors = () => {}, label = 'scripts') {
   // The complete guard: admitted ancestors plus this stage's own receipts.
   const checkParents = () => {
     checkAncestors();
-    verifyStage(sourceDir, sourceReceipt, 'source scripts directory');
+    verifyStage(sourceDir, sourceReceipt, `source ${label} directory`);
     verifyStage(destDir, destReceipt, 'destination stage');
   };
 
@@ -265,7 +290,7 @@ function copyStage(sourceDir, destDir, sourceReceipt, destReceipt, depth, counte
   try {
     dirHandle = fs.opendirSync(sourceDir);
   } catch (error) {
-    fail(`cannot open scripts tree directory ${sourceDir}: ${error.message}`);
+    fail(`cannot open ${label} tree directory ${sourceDir}: ${error.message}`);
   }
   try {
     for (;;) {
@@ -273,7 +298,7 @@ function copyStage(sourceDir, destDir, sourceReceipt, destReceipt, depth, counte
       if (entry === null) break;
       entries.push(entry);
       if (entries.length > MAX_ENTRIES_PER_DIR) {
-        fail(`scripts directory exceeds the bounded entry count of ${MAX_ENTRIES_PER_DIR}: ${sourceDir}`);
+        fail(`${label} directory exceeds the bounded entry count of ${MAX_ENTRIES_PER_DIR}: ${sourceDir}`);
       }
     }
   } finally {
@@ -289,19 +314,19 @@ function copyStage(sourceDir, destDir, sourceReceipt, destReceipt, depth, counte
     checkParents();
 
     const sourcePath = path.join(sourceDir, entry.name);
-    const stats = lstatOrFail(sourcePath, 'scripts tree entry');
+    const stats = lstatOrFail(sourcePath, `${label} tree entry`);
     if (stats.isSymbolicLink()) {
-      fail(`refusing symlink in scripts tree: ${sourcePath}`);
+      fail(`refusing symlink in ${label} tree: ${sourcePath}`);
     }
     if (stats.isDirectory()) {
       // Prune before descending: .terraform contents are never copied.
       if (entry.name === PRUNED_DIR_NAME) continue;
       if (depth + 1 > MAX_DEPTH) {
-        fail(`scripts tree exceeds the bounded depth of ${MAX_DEPTH}: ${sourcePath}`);
+        fail(`${label} tree exceeds the bounded depth of ${MAX_DEPTH}: ${sourcePath}`);
       }
       counter.dirs += 1;
       if (counter.dirs > MAX_DIRS) {
-        fail(`scripts tree exceeds the bounded directory count of ${MAX_DIRS}: ${sourcePath}`);
+        fail(`${label} tree exceeds the bounded directory count of ${MAX_DIRS}: ${sourcePath}`);
       }
       const childDest = path.join(destDir, entry.name);
       checkParents();
@@ -318,30 +343,28 @@ function copyStage(sourceDir, destDir, sourceReceipt, destReceipt, depth, counte
       if (!childReceipt.isDirectory() || childReceipt.isSymbolicLink()) {
         fail(`created destination directory is not a real directory: ${childDest}`);
       }
-      copyStage(sourcePath, childDest, stats, childReceipt, depth + 1, counter, checkParents);
+      copyStage(sourcePath, childDest, stats, childReceipt, depth + 1, counter, checkParents, label);
     } else if (stats.isFile()) {
       counter.files += 1;
       if (counter.files > MAX_FILES) {
-        fail(`scripts tree exceeds the bounded file count of ${MAX_FILES}: ${sourcePath}`);
+        fail(`${label} tree exceeds the bounded file count of ${MAX_FILES}: ${sourcePath}`);
       }
       copyFileBounded(sourcePath, destDir, entry.name, stats, destReceipt, counter, checkParents);
     } else {
-      fail(`refusing non-regular file in scripts tree: ${sourcePath}`);
+      fail(`refusing non-regular file in ${label} tree: ${sourcePath}`);
     }
     checkParents();
   }
   checkParents();
 }
 
-function copyScripts(sourceArg, destArg) {
-  const source = path.resolve(sourceArg);
-  const dest = path.resolve(destArg);
-  const sourceReceipt = assertRealDirectory(source, 'source scripts directory');
-  if (source === dest) fail('source and destination must differ');
-  if (dest.startsWith(`${source}${path.sep}`) || source.startsWith(`${dest}${path.sep}`)) {
-    fail('source and destination must not be nested');
-  }
-
+/**
+ * Admit one fresh destination root. dest must not exist, or must exist as an
+ * empty real directory; an existing tree is never replaced. The admitted
+ * receipt is re-verified after the emptiness check so a destination replaced
+ * during admission cannot be followed under its new identity.
+ */
+function admitDestination(dest) {
   let destStats;
   try {
     destStats = fs.lstatSync(dest, { bigint: true });
@@ -381,7 +404,92 @@ function copyScripts(sourceArg, destArg) {
   // identity.
   const destReceipt = destStats || lstatOrFail(dest, 'destination directory');
   verifyStage(dest, destReceipt, 'destination directory');
+  return destReceipt;
+}
 
+/**
+ * Copy the exact production build inputs of one source checkout into a fresh
+ * complete source fixture. Each named file is copied through the bounded
+ * exclusive descriptor path; each named tree is copied stage-by-stage (with
+ * .terraform pruned before descent and symlinks/special files refused). The
+ * source root and the destination root are re-verified around every action.
+ */
+function copySource(sourceArg, destArg) {
+  const source = path.resolve(sourceArg);
+  const dest = path.resolve(destArg);
+  const sourceReceipt = assertRealDirectory(source, 'source package directory');
+  if (source === dest) fail('source and destination must differ');
+  if (dest.startsWith(`${source}${path.sep}`) || source.startsWith(`${dest}${path.sep}`)) {
+    fail('source and destination must not be nested');
+  }
+  const destReceipt = admitDestination(dest);
+  const checkRoots = () => {
+    verifyStage(source, sourceReceipt, 'source package directory');
+    verifyStage(dest, destReceipt, 'destination directory');
+  };
+  const counter = { files: 0, dirs: 0, totalBytes: 0n };
+
+  for (const name of SOURCE_FILE_INPUTS) {
+    checkRoots();
+    const sourcePath = path.join(source, name);
+    const stats = lstatIfExists(sourcePath);
+    if (stats === undefined) fail(`source package input is missing: ${sourcePath}`);
+    if (!stats.isFile() || stats.isSymbolicLink()) {
+      fail(`source package input must be a real regular file: ${sourcePath}`);
+    }
+    counter.files += 1;
+    if (counter.files > MAX_FILES) {
+      fail(`source package exceeds the bounded file count of ${MAX_FILES}: ${sourcePath}`);
+    }
+    copyFileBounded(sourcePath, dest, name, stats, destReceipt, counter, checkRoots);
+  }
+
+  for (const name of SOURCE_DIR_INPUTS) {
+    checkRoots();
+    const sourcePath = path.join(source, name);
+    const stats = lstatIfExists(sourcePath);
+    if (stats === undefined) fail(`source package input is missing: ${sourcePath}`);
+    if (!stats.isDirectory() || stats.isSymbolicLink()) {
+      fail(`source package input must be a real directory: ${sourcePath}`);
+    }
+    counter.dirs += 1;
+    if (counter.dirs > MAX_DIRS) {
+      fail(`source package exceeds the bounded directory count of ${MAX_DIRS}: ${sourcePath}`);
+    }
+    const childDest = path.join(dest, name);
+    checkRoots();
+    try {
+      fs.mkdirSync(childDest);
+    } catch (error) {
+      if (error.code === 'EEXIST') {
+        fail(`destination directory already exists; refusing to replace it: ${childDest}`);
+      }
+      fail(`cannot create destination directory ${childDest}: ${error.message}`);
+    }
+    checkRoots();
+    const childReceipt = lstatOrFail(childDest, 'created destination directory');
+    if (!childReceipt.isDirectory() || childReceipt.isSymbolicLink()) {
+      fail(`created destination directory is not a real directory: ${childDest}`);
+    }
+    copyStage(sourcePath, childDest, stats, childReceipt, 0, counter, checkRoots, 'package');
+  }
+  checkRoots();
+  process.stdout.write(
+    `session-host-windows-acceptance: copied ${counter.files} source files ` +
+    `(${counter.dirs} directories, ${Number(counter.totalBytes)} bytes) into ${dest}\n`,
+  );
+}
+
+function copyScripts(sourceArg, destArg) {
+  const source = path.resolve(sourceArg);
+  const dest = path.resolve(destArg);
+  const sourceReceipt = assertRealDirectory(source, 'source scripts directory');
+  if (source === dest) fail('source and destination must differ');
+  if (dest.startsWith(`${source}${path.sep}`) || source.startsWith(`${dest}${path.sep}`)) {
+    fail('source and destination must not be nested');
+  }
+
+  const destReceipt = admitDestination(dest);
   const counter = { files: 0, dirs: 0, totalBytes: 0n };
   copyStage(source, dest, sourceReceipt, destReceipt, 0, counter);
   process.stdout.write(
@@ -396,11 +504,15 @@ function main(argv) {
     copyScripts(args[0], args[1]);
     return;
   }
+  if (command === 'copy-source' && args.length === 2) {
+    copySource(args[0], args[1]);
+    return;
+  }
   if (command === 'create-root' && args.length === 1) {
     createRoot(args[0]);
     return;
   }
-  process.stderr.write('usage: node scripts/ci/session-host-windows-acceptance.cjs <copy-scripts <sourceDir> <destDir> | create-root <parentDir>>\n');
+  process.stderr.write('usage: node scripts/ci/session-host-windows-acceptance.cjs <copy-scripts <sourceDir> <destDir> | copy-source <sourceDir> <destDir> | create-root <parentDir>>\n');
   process.exit(2);
 }
 
@@ -410,4 +522,4 @@ if (require.main === module) {
 
 // Exposed for the pure copier-contract tests; fail() exits the process, so
 // callers must run these in a child process.
-module.exports = { copyFileBounded, copyStage, copyScripts };
+module.exports = { copyFileBounded, copyStage, copyScripts, copySource };

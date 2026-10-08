@@ -1172,6 +1172,10 @@ class FieldTerminalPort implements Terminal {
   clearScreen(): void {}
   setTitle(_title: string): void {}
   setProgress(_active: boolean): void {}
+  // Pi 1.1.0's public Terminal adds OSC 7501 program status. This embedded
+  // field owns no real terminal and never starts its local TUI, so neither
+  // title/progress nor program-wide status may escape into the host writer.
+  setProgramStatus(_status: unknown): void {}
 }
 
 function sanitizeSingleLine(source: string): string {

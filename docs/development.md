@@ -81,13 +81,14 @@ The complete suite (`npm run test:run`) executes up to four test files concurren
   skipping) when the required-host gate is set and no finder is resolvable.
 - **Test-only explicit paths (never shipped, never user-specific in tracked files):**
   Linux's full suite and the native Windows launcher job freshly install a locked
-  `@earendil-works/pi-coding-agent@1.0.4` full runtime (manifests:
-  `scripts/ci/pi-ui-runtime/`) into runner temp. This matches the alpha helper's
-  minimum stable Pi CLI version; the Windows tier still covers its existing
-  standalone command/RPC and child-launch behavior, not that helper. They export
+  `@earendil-works/pi-coding-agent@1.1.0` full runtime (manifests:
+  `scripts/ci/pi-ui-runtime/`) into runner temp. This sits above the alpha
+  helper's minimum stable Pi CLI version (1.0.4); the Windows tier still
+  covers its existing standalone command/RPC and child-launch behavior, not
+  that helper. They export
   `PI_REVIEW_GATE_INSTALLED_AGENT` (the package root),
   `PI_REVIEW_GATE_INSTALLED_PI_BIN` (the installed executable directory),
-  `PI_REVIEW_GATE_EXPECT_PI_VERSION=1.0.4`, and
+  `PI_REVIEW_GATE_EXPECT_PI_VERSION=1.1.0`, and
   `PI_REVIEW_GATE_REQUIRE_PI_HOST=1` for required host coverage. The command-path
   smoke runs the installed `pi`/`pi.cmd`, checks its exact version, and verifies
   RPC and candidate registration without a provider call. Missing prerequisites
@@ -100,8 +101,8 @@ The complete suite (`npm run test:run`) executes up to four test files concurren
   Locally, set `PI_REVIEW_GATE_INSTALLED_AGENT` to any installed pi-coding-agent
   package root and `PI_REVIEW_GATE_CANDIDATE_ENTRY` to a built `dist/src/index.js`
   to enable the TUI smoke. For `tests/pi-installed-launch.test.ts`, use the matching
-  Pi 1.0.4 install, set `PI_REVIEW_GATE_INSTALLED_PI_BIN` to its executable directory
-  and `PI_REVIEW_GATE_EXPECT_PI_VERSION=1.0.4`; set the required-host gate to make
+  Pi 1.1.0 install, set `PI_REVIEW_GATE_INSTALLED_PI_BIN` to its executable directory
+  and `PI_REVIEW_GATE_EXPECT_PI_VERSION=1.1.0`; set the required-host gate to make
   missing prerequisites fail locally too.
 - **Live PTY smoke (`tests/pi-tui-live-settings-smoke.test.ts`):** drives the built
   candidate inside a real Pi TUI on a real PTY through the public

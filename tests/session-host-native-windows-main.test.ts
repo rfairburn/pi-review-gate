@@ -28,6 +28,7 @@ import {
   sameFileIdentity,
   type WindowsOwnedSession,
 } from "./helpers/session-host-native-windows-harness";
+import { frameHeader } from "./helpers/session-host-native-roster-witness";
 
 const optIn = process.env[WINDOWS_REQUIRE_ENV] === "1";
 
@@ -88,6 +89,8 @@ test("real public Main exits two live Windows ConPTY native Pi sessions through 
 
   await driver.waitFrame((frame) => frame.includes("Welcome") && frame.includes("New session") && frame.includes("Quit host"),
     "actual public runSessionHost renders its welcome frame inside the owned outer Windows ConPTY");
+  assert.ok(typeof driver.pty.pid === "number" && Number.isSafeInteger(driver.pty.pid) && driver.pty.pid > 1,
+    "the exact owned outer ConPTY exposes its positive public PID after real output, not synchronously at spawn");
   assert.ok(existsSync(nativeAgentDir), "one fresh ordinary native agent root is shared by both children");
   assert.deepEqual(driver.records(), [], "no native lifecycle record exists before Workspace-only New");
 
@@ -104,8 +107,8 @@ test("real public Main exits two live Windows ConPTY native Pi sessions through 
   assertNoSavedSessionOverrides(args);
 
   const sessionA = await driver.createNativeSession(workspaceA, labelA);
-  assert.equal(driver.currentText().includes(`Session host · ${labelA} ·`), false,
-    "New highlights A but does not activate it");
+  assert.notEqual(frameHeader(driver.currentText()), labelA,
+    "New highlights A but does not activate it; the outer header stays the welcome title");
   await driver.activate(labelA);
   await driver.writeDraft(draftA);
   const headerA = driver.currentText().split("\n")[0];

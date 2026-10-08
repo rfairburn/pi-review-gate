@@ -17,17 +17,37 @@
  *   lifecycle/roster truth arrives as `SidebarItem` DTOs from the backend;
  *   launch/workspace validation stays in the backend. No host module is
  *   imported — in particular no TerminalSurface.
- * - UI actions never stop an instance: hiding the sidebar, confirming an
- *   item, abandoning a form, or asking to remove an exited row only emits
- *   visibility/select/create/quit/remove action DTOs; the backend decides
- *   what they mean. Removal never signals a process or deletes persistent
- *   files.
+ * - UI actions never stop an instance directly: hiding the sidebar,
+ *   confirming an item, abandoning a form, or asking to remove or stop a
+ *   row only emits visibility/select/create/quit/remove/stop-remove action
+ *   DTOs; the backend decides what they mean and performs any process stop.
+ *   The sidebar itself never signals a process or deletes persistent files.
  * - Escape in MAIN focus is never intercepted (it stays native input, e.g.
  *   native menu cancellation); while MAIN is focused every chunk — including
  *   `q`/Ctrl+C and terminal-native bytes like bracketed pastes and Kitty key
  *   releases — is forwarded unchanged except the reserved, configurable
  *   toggle chord (legacy and Kitty packets both honored via the real
- *   matchesKey).
+ *   matchesKey). The reserved chord is two-step: hidden -> show and focus
+ *   the sidebar; visible with MAIN focus -> focus the sidebar without a
+ *   visibility (resize) action; sidebar-owned focus -> hide and return to
+ *   main. Only initial presses act; repeats/releases are consumed.
+ * - Each native session renders as a fixed-height card: 5 rows expanded
+ *   (default) or 3 collapsed, toggled per card with Space and persisted by
+ *   id. Row 1 is ONLY the sanitized canonical title; status (selection
+ *   marker, observed/unknown agent/input state), honest background counts
+ *   (unknown is never shown as zero), and generic activity follow below.
+ *   Scrolling keeps the complete highlighted card visible or falls back to
+ *   the too-small pane, and selection-targeted keys (Enter, edit,
+ *   stop/remove) act only on an entry the last roster render completely
+ *   drew at its current height and order; hiding or overlaying the roster
+ *   forgets it.
+ * - `d` (and Delete, or x when Delete is the reserved toggle) stops/removes
+ *   the highlighted session row: an exited row removes immediately; a live
+ *   owned process stops only after explicit confirmation unless complete
+ *   idleness is positively observed (unknown is never idle); a row with no
+ *   owned process and no confirmed exit is refused with a bounded notice.
+ *   The stop confirmation freezes the target id and never retargets a later
+ *   highlighted row; the quit host confirmation stays separate.
  * - Roster/form/error text is sanitized (C0/C1/DEL and ANSI/OSC/APC
  *   sequences stripped) and bounded before it can appear in a rendered line.
  *   Generated hint text wraps across reserved footer rows instead of being
@@ -83,6 +103,14 @@ export interface SidebarItem {
 	/** Last validated canonical native conversation identity and display name. */
 	readonly nativeSession?: SessionHostNativeSession | null;
   readonly exitCode?: number;
+  /**
+   * Observed background task count from protocol/backend telemetry. Only a
+   * nonnegative safe integer is accepted; anything else (including absence)
+   * is stored and rendered as unknown, never inferred as zero.
+   */
+  readonly backgroundTasks?: number | null;
+  /** Observed background shell count; same honesty rules as backgroundTasks. */
+  readonly backgroundShells?: number | null;
 }
 
 /**
@@ -101,6 +129,14 @@ export type SidebarAction =
   | { readonly type: "forward"; readonly data: string }
   | { readonly type: "select"; readonly id: string }
   | { readonly type: "remove"; readonly id: string }
+  | { readonly type: "resume-row"; readonly requestId: number; readonly id: string }
+  | { readonly type: "resume-row-cancel"; readonly requestId: number }
+  /**
+   * Stop an owned live session and remove its row. confirmed:false is a
+   * known-idle request the parent revalidates with fresh idle state;
+   * confirmed:true followed a deliberate confirmation of the frozen target.
+   */
+  | { readonly type: "stop-remove"; readonly id: string; readonly confirmed: boolean }
   | { readonly type: "edit"; readonly id: string; readonly nativeSession: SessionHostNativeSession }
   /** Open the saved-conversation picker and list the shared native catalog. */
   | { readonly type: "saved-list"; readonly requestId: number }
@@ -219,7 +255,10 @@ const DEFAULT_FORM_HINTS = {
   clear: "ctrl+c",
   externalEditor: "ctrl+g",
 };
-const ACTIVITY_LINES_MAX = 2;
+/** Native-session card heights: title, status, background (+2 activity). */
+const CARD_COLLAPSED_ROWS = 3;
+const CARD_EXPANDED_ROWS = 5;
+const ACTIVITY_LINES_MAX = CARD_EXPANDED_ROWS - CARD_COLLAPSED_ROWS;
 const ACTIVITY_INPUT_MAX_CODEPOINTS = 400;
 const SAVED_CAPTION_MAX_CODEPOINTS = 256;
 const ITEM_LABEL_INPUT_MAX_CODEPOINTS = 400;
@@ -629,47 +668,77 @@ function blankLines(count: number): string[] {
   return Array.from({ length: count }, () => "");
 }
 
-/** Truthful textual state badges plus the input-observed marker. */
-function rowBadges(item: SidebarItem): string {
-  const badges: string[] = [];
+/**
+ * Truthful card status text (the line below the title): lifecycle or
+ * observed/unknown agent state, plus observed/unknown input state for live
+ * rows. Unknown (null) is never rendered as if it were false.
+ */
+function cardStatusText(item: SidebarItem): string {
+  const parts: string[] = [];
   switch (item.lifecycle) {
     case "starting":
-      badges.push("[starting]");
+      parts.push("starting");
       break;
     case "alive":
-      badges.push(
-        item.busy === true
-          ? "[AGENT: running]"
-          : item.busy === false
-            ? "[AGENT: idle]"
-            : "[AGENT: unknown]",
+      parts.push(
+        item.busy === true || (sanitizeCount(item.backgroundTasks) ?? 0) > 0
+          || (sanitizeCount(item.backgroundShells) ?? 0) > 0
+          ? "agent running"
+          : item.pendingInput === true || item.inputSurface === true
+            ? "agent waiting"
+            : item.busy === false && item.pendingInput === false
+              && sanitizeCount(item.backgroundTasks) === 0 && sanitizeCount(item.backgroundShells) === 0
+              ? "agent idle"
+              : "agent unknown",
       );
       break;
     case "exited":
-      badges.push(
+      parts.push(
         typeof item.exitCode === "number"
-          ? `[exited (code ${Math.trunc(item.exitCode)})]`
-          : "[exited]",
+          ? `exited (code ${Math.trunc(item.exitCode)})`
+          : "exited",
       );
       break;
     case "error":
-      badges.push(
+      parts.push(
         typeof item.exitCode === "number"
-          ? `[error (code ${Math.trunc(item.exitCode)})]`
-          : "[error]",
+          ? `error (code ${Math.trunc(item.exitCode)})`
+          : "error",
       );
       break;
   }
-  // Input observation is only claimed when it was actually observed; unknown
-  // (null) is never rendered as if input were not pending.
-  if (
-    (item.pendingInput === true || item.inputSurface === true) &&
-    (item.lifecycle === "starting" || item.lifecycle === "alive")
-  ) {
-    badges.push("[input]");
+  if (item.lifecycle === "starting" || item.lifecycle === "alive") {
+    parts.push(
+      item.pendingInput === true || item.inputSurface === true
+        ? "input pending"
+        : item.pendingInput === false
+          ? "input none"
+          : "input unknown",
+    );
   }
-  const text = badges.join(" ");
-  return text.length === 0 ? "" : ` ${text}`;
+  return parts.join(" | ");
+}
+
+/** Honest background counts: a missing/invalid count is "unknown", never 0. */
+function cardBackgroundText(item: SidebarItem): string {
+  const tasks = sanitizeCount(item.backgroundTasks);
+  const shells = sanitizeCount(item.backgroundShells);
+  if (tasks === null && shells === null) {
+    return "background unknown";
+  }
+  return `bg tasks ${tasks ?? "unknown"} | shells ${shells ?? "unknown"}`;
+}
+
+/** Accepts only nonnegative safe integers; everything else is unknown. */
+function sanitizeCount(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? Math.abs(value) // normalizes -0
+    : null;
+}
+
+/** Canonical card title: validated native name, else the row label. */
+function cardTitle(item: SidebarItem): string {
+  return sanitizeBounded(item.nativeSession?.name ?? item.label, ITEM_LABEL_INPUT_MAX_CODEPOINTS);
 }
 
 function requiresQuitConfirmation(item: SidebarItem): boolean {
@@ -677,6 +746,21 @@ function requiresQuitConfirmation(item: SidebarItem): boolean {
     item.lifecycle === "starting" ||
     item.lifecycle === "alive" ||
     item.hasLiveProcess === true
+  );
+}
+
+/**
+ * Complete idleness, positively observed: every activity category and modal
+ * input known-false or known-zero. Unknown (null) states or counts are never
+ * idle. The caller already established hasLiveProcess === true.
+ */
+function isCompleteIdle(item: SidebarItem): boolean {
+  return (
+    item.busy === false &&
+    item.pendingInput === false &&
+    item.inputSurface === false &&
+    sanitizeCount(item.backgroundTasks) === 0 &&
+    sanitizeCount(item.backgroundShells) === 0
   );
 }
 
@@ -722,6 +806,8 @@ function copyItem(item: SidebarItem): SidebarItem {
         ? { nativeSession: { ...item.nativeSession } }
         : {}),
     ...(typeof item.exitCode === "number" ? { exitCode: item.exitCode } : {}),
+    backgroundTasks: sanitizeCount(item.backgroundTasks),
+    backgroundShells: sanitizeCount(item.backgroundShells),
   };
 }
 
@@ -760,6 +846,7 @@ export class SidebarController {
   private pendingSavedList: { readonly requestId: number } | undefined;
   /** Deliberate saved-open in flight; late results are fenced by requestId. */
   private pendingSavedOpen: { readonly requestId: number } | undefined;
+  private pendingRowResume: { readonly requestId: number; readonly id: string } | undefined;
   private savedRows: SidebarSavedRow[] = [];
   private savedIssueCount = 0;
   private savedError: string | undefined;
@@ -776,10 +863,39 @@ export class SidebarController {
   private _focus: SidebarFocus = "main";
   private pendingCreate: { readonly requestId: number } | undefined;
   private pendingRename: { readonly requestId: number } | undefined;
+  /** Explicit confirmation purpose: quit the host or stop one owned session. */
+  private confirmPurpose: "quit" | "stop-remove" = "quit";
+  /** Frozen stop target id; later navigation never retargets the confirmation. */
+  private stopRemoveTargetId: string | undefined;
+  /** True only while the last render drew the complete stop warning dialog. */
+  private stopConfirmDisplayed = false;
   private formError: string | undefined;
   private noticeError: string | undefined;
   private nextRequestId = 1;
   private listTop = 0;
+  /**
+   * Item ids whose cards the user collapsed with Space. Cards default to
+   * expanded; each card's state persists independently of the highlight.
+   */
+  private readonly collapsedItemIds = new Set<string>();
+  /**
+   * Narrow resume-replacement fence: old exited placeholder ids the backend is
+   * removing because their replacement child actually started. Consumed by the
+   * roster update that observes the disappearance; never used for ordinary
+   * vanished-row safety or explicit removals.
+   */
+  private readonly replacedRowIds = new Set<string>();
+  /**
+   * What the last roster render actually drew: the entry-order signature at
+   * that time and the height of every COMPLETELY rendered entry. A too-small
+   * render records no entries; hiding the pane or replacing it with a
+   * form/picker/confirmation forgets the record. Selection-targeted keys
+   * (Enter, edit, remove) act only on an entry present here at its current
+   * height, so nothing invisible or since-changed can be activated.
+   */
+  private displayedRoster:
+    | { readonly signature: string; readonly heights: ReadonlyMap<string, number> }
+    | undefined;
 
   constructor(options: SidebarControllerOptions = {}) {
     this.toggleKey = normalizeToggleKey(options.toggleKey);
@@ -840,6 +956,13 @@ export class SidebarController {
     }
     this.rowStore = items.map((item) => copyItem(item));
     this.rebuildEntries();
+    if (this.pendingRowResume && !this.rowStore.some(item => item.id === this.pendingRowResume!.id
+      && item.lifecycle === "exited" && item.hasLiveProcess !== true)) this.cancelRowResume();
+    // Keep expansion memory bounded to the current roster.
+    const liveIds = new Set(this.rowStore.map((item) => item.id));
+    for (const id of [...this.collapsedItemIds]) {
+      if (!liveIds.has(id)) this.collapsedItemIds.delete(id);
+    }
     if (this.desiredSelectionId !== undefined) {
       const resolved = this.findItemEntry(this.desiredSelectionId);
       if (resolved !== undefined) {
@@ -848,23 +971,35 @@ export class SidebarController {
       }
       // A still-pending desired selection stays pending until its row
       // actually appears; no index-based guess is ever made.
+      this.pruneRowReplacementFences(liveIds);
       return;
     }
     const entry = this.currentEntry();
     if (this.selectedEntryKey !== undefined && entry === undefined
       && this.selectedEntryKey.startsWith(ITEM_KEY_PREFIX)) {
-      // The highlighted instance vanished: show the picker and pull focus
-      // back to the list.
+      const vanishedId = this.selectedEntryKey.slice(ITEM_KEY_PREFIX.length);
       this.selectedEntryKey = undefined;
-      if (this._focus === "main") {
-        this._focus = "sidebar";
-        if (!this._visible) {
-          // A vanished selection must not eat input in an invisible picker:
-          // show the pane and emit the visibility action for the reflow.
-          this._visible = true;
-          this.emit({ type: "visibility", visible: true });
+      if (!this.replacedRowIds.delete(vanishedId)) {
+        // The highlighted instance vanished on its own: show the picker and
+        // pull focus back to the list.
+        if (this._focus === "main") {
+          this._focus = "sidebar";
+          if (!this._visible) {
+            // A vanished selection must not eat input in an invisible picker:
+            // show the pane and emit the visibility action for the reflow.
+            this._visible = true;
+            this.emit({ type: "visibility", visible: true });
+          }
         }
       }
+    }
+    this.pruneRowReplacementFences(liveIds);
+  }
+
+  /** Drops replacement fences whose row is no longer in the roster. */
+  private pruneRowReplacementFences(liveIds: ReadonlySet<string>): void {
+    for (const id of [...this.replacedRowIds]) {
+      if (!liveIds.has(id)) this.replacedRowIds.delete(id);
     }
   }
 
@@ -873,6 +1008,7 @@ export class SidebarController {
     if (typeof id !== "string" || id.length === 0) {
       throw new Error("SidebarController.select expects a nonempty string id");
     }
+    this.cancelRowResume();
     // A newer backend selection supersedes this request's UI ownership,
     // not the native launch. Preserve the draft and current focus. The native
     // Editor field is one-shot after submit, so reopen it for a real retry.
@@ -940,6 +1076,7 @@ export class SidebarController {
       || !isValidNativeSessionId(target.nativeSession.sessionId)
       || !Number.isSafeInteger(target.nativeSession.epoch) || target.nativeSession.epoch < 1
       || !isValidRenameName(target.nativeSession.name)) return false;
+    this.forgetDisplayedRoster(); // narrow layouts overlay the roster
     this.disposeFormField();
     this.pendingCreate = undefined;
     this.pendingRename = undefined;
@@ -1001,6 +1138,58 @@ export class SidebarController {
     }
   }
 
+  /**
+   * Complete only the still-current deliberate exited-row intent: the pending
+   * request must still match, the old row must still be a confirmed exit with
+   * no owned process, and the replacement must be an actual live child
+   * (lifecycle alive with a confirmed owned process). Anything else refuses
+   * without selecting or changing focus.
+   */
+  completeRowResume(requestId: number, oldId: string, newId: string): boolean {
+    const pending = this.pendingRowResume;
+    if (!pending || pending.requestId !== requestId || pending.id !== oldId) return false;
+    this.pendingRowResume = undefined;
+    if (!this._visible || this._focus !== "sidebar" || this.selectedId !== oldId
+      || !this.rowStore.some(item => item.id === oldId && item.lifecycle === "exited" && item.hasLiveProcess !== true)
+      || !this.rowStore.some(item => item.id === newId && item.lifecycle === "alive" && item.hasLiveProcess === true)) return false;
+    this.noticeError = undefined;
+    this.select(newId);
+    this._focus = "main";
+    this.emit({ type: "select", id: newId });
+    return true;
+  }
+
+  /**
+   * Narrow resume-replacement fence: the backend is about to remove one old
+   * exited placeholder after its replacement child actually started. The
+   * following roster update must not read exactly that row's disappearance as
+   * the user's highlight vanishing (which would pull focus back from a hidden
+   * main pane and show the picker). Ordinary vanished-row safety and explicit
+   * removals are unchanged.
+   */
+  noteRowReplacement(id: string): void {
+    if (typeof id === "string" && id.length > 0 && this.rowStore.some((item) => item.id === id)) {
+      this.replacedRowIds.add(id);
+    }
+  }
+
+  /** Releases a replacement fence when the backend removal did not actually occur. */
+  clearRowReplacement(id: string): void {
+    this.replacedRowIds.delete(id);
+  }
+
+  failRowResume(requestId: number, message: string): void {
+    if (this.pendingRowResume?.requestId !== requestId) return;
+    this.pendingRowResume = undefined;
+    if (this._visible && this._focus === "sidebar") this.noticeError = sanitizeBounded(message, ERROR_TEXT_MAX_CODEPOINTS);
+  }
+
+  private cancelRowResume(): void {
+    const pending = this.pendingRowResume;
+    this.pendingRowResume = undefined;
+    if (pending) this.emit({ type: "resume-row-cancel", requestId: pending.requestId });
+  }
+
   /** Shows a bounded, sanitized error near the pane's footer. */
   showError(message: string): void {
     this.noticeError = sanitizeBounded(message, ERROR_TEXT_MAX_CODEPOINTS);
@@ -1053,7 +1242,7 @@ export class SidebarController {
     assertPaneDimension(cols, PANE_MAX_COLS, "cols");
     assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
     if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
-      return this.renderTooSmall(cols, rows);
+      return this.renderRosterTooSmall(cols, rows);
     }
     return this.renderRosterPane(cols, rows);
   }
@@ -1079,14 +1268,23 @@ export class SidebarController {
     cols: number,
     rows: number,
   ): { lines: string[]; cursor?: { column: number; row: number } } {
+    // In this focused-pane (narrow) path the form/picker/confirmation
+    // replaces the roster on screen, even if a wide-layout renderRoster()
+    // drew it earlier; standalone renderForm() keeps the wide roster record.
     if (this._focus === "form") {
+      this.forgetDisplayedRoster();
       return this.renderForm(cols, rows);
     }
-    if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
-      return this.renderTooSmall(cols, rows);
-    }
     if (this._focus === "confirm") {
+      this.forgetDisplayedRoster();
+      if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
+        this.stopConfirmDisplayed = false;
+        return this.renderTooSmall(cols, rows);
+      }
       return this.renderConfirmPane(cols, rows);
+    }
+    if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
+      return this.renderRosterTooSmall(cols, rows);
     }
     return this.renderRosterPane(cols, rows);
   }
@@ -1139,14 +1337,25 @@ export class SidebarController {
       // A held Enter never activates a roster entry — including a row that a
       // just-completed saved-open highlighted; only a fresh press does.
       if (isKeyRepeat(data)) return;
+      // Never activate a target the last roster render could not show whole.
+      if (!this.selectionFitsLastRoster()) return;
       this.activateEntry();
+      return;
+    }
+    if (matchesKey(data, "space") || printableOf(data) === " ") {
+      // Space toggles only the highlighted card's own expansion; a held
+      // Space does not flap it.
+      if (!isKeyRepeat(data)) this.toggleSelectedExpansion();
       return;
     }
     if (
       matchesKey(data, "delete") ||
       (this.toggleKey === "delete" && ["x", "X"].includes(printableOf(data) ?? ""))
     ) {
-      this.removeSelectedEntry();
+      // A held Delete/x never stops; only a deliberate initial press does.
+      if (isKeyRepeat(data)) return;
+      if (!this.selectionFitsLastRoster()) return;
+      this.stopRemoveSelectedEntry();
       return;
     }
     if (matchesKey(data, "escape")) {
@@ -1154,7 +1363,15 @@ export class SidebarController {
       return;
     }
     const printable = printableOf(data);
+    if (printable === "d" || printable === "D") {
+      // A held d never stops; only a deliberate initial press does.
+      if (isKeyRepeat(data)) return;
+      if (!this.selectionFitsLastRoster()) return;
+      this.stopRemoveSelectedEntry();
+      return;
+    }
     if (printable === "e" || printable === "E") {
+      if (!this.selectionFitsLastRoster()) return;
       this.editSelectedEntry();
       return;
     }
@@ -1165,6 +1382,7 @@ export class SidebarController {
   }
 
   private moveSelection(delta: number): void {
+    this.cancelRowResume();
     if (this.entries.length === 0) {
       return;
     }
@@ -1184,12 +1402,71 @@ export class SidebarController {
     return this.entries.find((entry) => entry.key === this.selectedEntryKey);
   }
 
+  /** Flips the highlighted card between 5-line expanded and 3-line collapsed. */
+  private toggleSelectedExpansion(): void {
+    const entry = this.currentEntry();
+    if (entry?.kind !== "item" || entry.item === undefined) {
+      return;
+    }
+    const id = entry.item.id;
+    if (this.collapsedItemIds.has(id)) {
+      this.collapsedItemIds.delete(id);
+    } else {
+      this.collapsedItemIds.add(id);
+    }
+  }
+
+  /** Rendered height of one entry: cards are 3 or 5 rows, actions 1 row. */
+  private entryHeight(entry: SidebarEntry | undefined): number {
+    if (entry?.kind !== "item" || entry.item === undefined) {
+      return 1;
+    }
+    return this.collapsedItemIds.has(entry.item.id) ? CARD_COLLAPSED_ROWS : CARD_EXPANDED_ROWS;
+  }
+
+  /**
+   * True only when the highlighted entry was completely drawn by the last
+   * roster render, at its current height (expansion state), with the same
+   * entry order. With no highlighted entry there is nothing to activate (the
+   * keys only produce a bounded notice), so that case is allowed.
+   */
+  private selectionFitsLastRoster(): boolean {
+    const entry = this.currentEntry();
+    if (entry === undefined) {
+      return true;
+    }
+    const shown = this.displayedRoster;
+    if (shown === undefined || shown.signature !== this.rosterSignature()) {
+      return false;
+    }
+    return shown.heights.get(entry.key) === this.entryHeight(entry);
+  }
+
+  private rosterSignature(): string {
+    return JSON.stringify(this.entries.map((entry) => entry.key));
+  }
+
+  /** The roster is no longer on screen (hidden or replaced by another pane). */
+  private forgetDisplayedRoster(): void {
+    this.cancelRowResume();
+    this.displayedRoster = undefined;
+  }
+
   private activateEntry(): void {
     const entry = this.currentEntry();
     if (entry === undefined) {
       return;
     }
     if (entry.kind === "item" && entry.item !== undefined) {
+      if (entry.item.lifecycle === "exited") {
+        if (this.pendingRowResume) { this.noticeError = "This conversation is already starting"; return; }
+        const requestId = this.nextRequestId++;
+        this.pendingRowResume = { requestId, id: entry.item.id };
+        this.noticeError = "Opening this conversation";
+        this.emit({ type: "resume-row", requestId, id: entry.item.id });
+        return;
+      }
+      this.cancelRowResume();
       this.selectedEntryKey = entry.key;
       this.desiredSelectionId = undefined;
       // The sidebar stays visible; the typing room stays narrower until a
@@ -1224,18 +1501,84 @@ export class SidebarController {
     this.emit({ type: "edit", id: entry.item.id, nativeSession: { ...nativeSession } });
   }
 
-  /** Requests backend removal by the selected row's stable host-owned id. */
-  private removeSelectedEntry(): void {
+  /**
+   * d / Delete (x when Delete is the reserved toggle): an exited row removes
+   * immediately; a live owned process requests a stop — directly only when
+   * complete idleness is positively observed, otherwise after explicit
+   * confirmation. A row with no owned process and no confirmed exit is
+   * refused with a bounded notice; nothing is faked or cancelled.
+   */
+  private stopRemoveSelectedEntry(): void {
+    this.cancelRowResume();
     const entry = this.currentEntry();
     if (entry === undefined || entry.kind !== "item" || entry.item === undefined) {
-      this.noticeError = "Select a session row to remove";
+      this.noticeError = "Select a session row to stop or remove";
       return;
     }
-    // The backend is authoritative about confirmed exit. A Delete attempt on
-    // a live, unconfirmed, or stale row is safe and produces a bounded notice
-    // when closeExited refuses it.
-    this.noticeError = undefined;
-    this.emit({ type: "remove", id: entry.item.id });
+    const item = entry.item;
+    if (item.lifecycle === "exited") {
+      // Confirmed exit: plain removal; the backend stays authoritative.
+      this.noticeError = undefined;
+      this.emit({ type: "remove", id: item.id });
+      return;
+    }
+    if (item.hasLiveProcess !== true) {
+      // No owned process to stop and no confirmed exit (starting, unspawned
+      // error, or a live row without an observed handle): refuse truthfully.
+      this.noticeError = "No owned process to stop";
+      return;
+    }
+    if (isCompleteIdle(item)) {
+      // Positively observed complete idleness: request the stop directly;
+      // the parent revalidates fresh idle before acting.
+      this.noticeError = undefined;
+      this.emit({ type: "stop-remove", id: item.id, confirmed: false });
+      return;
+    }
+    // Active or unknown: explicit confirmation with a frozen target id.
+    this.openStopRemoveConfirmation(item.id);
+  }
+
+  private openStopRemoveConfirmation(id: string): void {
+    this.forgetDisplayedRoster(); // the confirmation replaces the roster
+    this.confirmPurpose = "stop-remove";
+    this.stopRemoveTargetId = id; // frozen: later navigation never retargets
+    this.stopConfirmDisplayed = false; // the warning must be drawn before a stop
+    this._focus = "confirm";
+  }
+
+  /**
+   * Cancel the stop confirmation: preserve the highlighted row and sidebar
+   * input ownership, reset the purpose, send no native input, keep visible.
+   */
+  private cancelStopRemove(): void {
+    this.confirmPurpose = "quit";
+    this.stopRemoveTargetId = undefined;
+    this.stopConfirmDisplayed = false;
+    this._focus = "sidebar";
+  }
+
+  /**
+   * Confirms the frozen stop target only while it still exists and is live
+   * owned; a vanished or no-longer-live target is refused, never a sibling.
+   */
+  private confirmStopRemove(): void {
+    const id = this.stopRemoveTargetId;
+    this.confirmPurpose = "quit";
+    this.stopRemoveTargetId = undefined;
+    this.stopConfirmDisplayed = false;
+    this._focus = "sidebar";
+    if (id === undefined) return;
+    const entry = this.findItemEntry(id);
+    if (entry === undefined || entry.item === undefined) {
+      this.noticeError = "Session no longer exists";
+      return;
+    }
+    if (entry.item.hasLiveProcess !== true) {
+      this.noticeError = "Session is no longer live";
+      return;
+    }
+    this.emit({ type: "stop-remove", id, confirmed: true });
   }
 
   /**
@@ -1244,8 +1587,10 @@ export class SidebarController {
    * quit action is emitted immediately; no other key path quits the host.
    */
   private activateQuit(): void {
+    this.cancelRowResume();
     const hasLive = this.rowStore.some(requiresQuitConfirmation);
     if (hasLive) {
+      this.forgetDisplayedRoster(); // the confirmation replaces the roster
       this._focus = "confirm";
       return;
     }
@@ -1306,6 +1651,7 @@ export class SidebarController {
    * saved-open action.
    */
   private openSavedPane(): void {
+    this.forgetDisplayedRoster(); // narrow layouts overlay the roster
     this.disposeFormField();
     this.formKind = "saved";
     this.editTarget = undefined;
@@ -1453,6 +1799,7 @@ export class SidebarController {
   }
 
   private openNewForm(): void {
+    this.forgetDisplayedRoster(); // narrow layouts overlay the roster
     this.disposeFormField();
     this.formKind = "new";
     this.editTarget = undefined;
@@ -1585,10 +1932,14 @@ export class SidebarController {
     this.editTarget = undefined;
   }
 
-  // --- Confirm focus: explicit quit confirmation. ---
+  // --- Confirm focus: explicit quit or stop confirmation. ---
 
   private handleConfirmInput(data: string): void {
     if (this.handleReservedToggle(data) || isKeyRelease(data)) {
+      return;
+    }
+    if (this.confirmPurpose === "stop-remove") {
+      this.handleStopRemoveConfirmInput(data);
       return;
     }
     if (matchesKey(data, "escape")) {
@@ -1611,6 +1962,35 @@ export class SidebarController {
     }
   }
 
+  /**
+   * Stop confirmation: deliberate initial presses only. Confirm acts on the
+   * frozen target id; cancel keeps the highlighted row and sidebar input
+   * ownership without sending any native input or hiding the pane.
+   */
+  private handleStopRemoveConfirmInput(data: string): void {
+    // Held keys never confirm or cancel twice; releases are already consumed.
+    if (isKeyRepeat(data)) return;
+    if (matchesKey(data, "escape")) {
+      this.cancelStopRemove();
+      return;
+    }
+    const printable = printableOf(data);
+    if (printable === "n" || printable === "N") {
+      // Cancellation stays available even while the warning is not displayed.
+      this.cancelStopRemove();
+      return;
+    }
+    // A stop is only confirmable while the complete warning is on screen.
+    if (!this.stopConfirmDisplayed) return;
+    if (matchesKey(data, "enter")) {
+      this.confirmStopRemove();
+      return;
+    }
+    if (printable === "y" || printable === "Y") {
+      this.confirmStopRemove();
+    }
+  }
+
   private confirmQuit(): void {
     this._focus = "sidebar";
     this.emit({ type: "quit" });
@@ -1626,23 +2006,39 @@ export class SidebarController {
     if (!this._visible) {
       return;
     }
+    this.forgetDisplayedRoster();
+    // A hidden pane cannot hold an open stop confirmation.
+    this.confirmPurpose = "quit";
+    this.stopRemoveTargetId = undefined;
+    this.stopConfirmDisplayed = false;
     this._visible = false;
     this._focus = "main";
     this.emit({ type: "visibility", visible: false });
   }
 
   /**
-   * Reserved toggle: shows the pane (focus returns to the roster picker) or
-   * hides it (focus returns to main). Only the visibility action is emitted.
+   * Reserved shortcut, two-step:
+   * - hidden: show the pane and focus the roster picker (visibility action);
+   * - visible with MAIN focus: focus the roster picker only — no visibility
+   *   action, so the layout is neither hidden nor resized;
+   * - visible with sidebar-owned focus (roster, form, picker, confirm): hide
+   *   and return focus to main. Form/picker callers run their own
+   *   cancellation fence (abandonForm/dismissSavedPane) before this.
    */
   private toggle(): void {
-    if (this._visible) {
-      this.hide();
+    if (!this._visible) {
+      this._visible = true;
+      this._focus = "sidebar";
+      this.emit({ type: "visibility", visible: true });
       return;
     }
-    this._visible = true;
-    this._focus = "sidebar";
-    this.emit({ type: "visibility", visible: true });
+    if (this._focus === "main") {
+      this._focus = "sidebar";
+      // Focus moved without a layout change; ask the host for a redraw.
+      this.onInvalidate?.();
+      return;
+    }
+    this.hide();
   }
 
   private emit(action: SidebarAction): void {
@@ -1687,10 +2083,11 @@ export class SidebarController {
         "enter open",
         ...(this._focus === "sidebar" ? ["e edit name"] : []),
         ...(this._focus === "sidebar"
-          ? [this.toggleKey === "delete" ? "x remove exited" : "delete remove exited"]
+          ? [this.toggleKey === "delete" ? "d/x stop/remove" : "d stop/remove"]
           : []),
         "esc hide",
         "q quit",
+        ...(this._focus === "sidebar" && this.rowStore.length > 0 ? ["space expand"] : []),
       ],
       cols,
     );
@@ -1698,35 +2095,34 @@ export class SidebarController {
       ? []
       : wrapHintLines([`! ${this.noticeError}`], cols);
     if (footerLines === undefined || noticeLines === undefined || visibleWidth(header) > cols) {
-      return this.renderTooSmall(cols, rows);
+      return this.renderRosterTooSmall(cols, rows);
     }
     const listRows = rows - 1 - noticeLines.length - footerLines.length;
-    // At least one entry row is required: a picker whose selected target is
-    // invisible would let Enter activate something the user cannot see.
-    if (listRows < 1) {
-      return this.renderTooSmall(cols, rows);
+    const selectedIndex = this.entries.findIndex((entry) => entry.key === this.selectedEntryKey);
+    const selectedHeight = selectedIndex >= 0 ? this.entryHeight(this.entries[selectedIndex]) : 1;
+    // At least one entry row is required, and the highlighted entry (a card
+    // is 3 or 5 rows) must fit completely: a picker whose selected target is
+    // invisible or clipped would let Enter act on something not shown.
+    if (listRows < 1 || listRows < selectedHeight) {
+      return this.renderRosterTooSmall(cols, rows);
     }
     const lines: string[] = [wrapRow(header, cols, "\x1b[1m")];
-    const selectedIndex = this.entries.findIndex((entry) => entry.key === this.selectedEntryKey);
     const top = this.scrollWindow(selectedIndex, listRows);
+    const displayed = new Map<string, number>();
     let y = 0;
-    let index = top;
-    while (index < this.entries.length && y < listRows) {
+    for (let index = top; index < this.entries.length; index += 1) {
       const entry = this.entries[index];
-      const selectedRow = index === selectedIndex;
-      lines.push(this.renderEntry(entry, selectedRow, cols));
-      y += 1;
-      if (selectedRow && entry.kind === "item" && entry.item !== undefined) {
-        for (const activityLine of renderActivityLines(entry.item.activity, cols)) {
-          if (y >= listRows) {
-            break;
-          }
-          lines.push(activityLine);
-          y += 1;
-        }
+      const entryLines = this.renderEntryLines(entry, index === selectedIndex, cols);
+      // Only complete entries are drawn; a partially clipped card would
+      // misrepresent its status.
+      if (y + entryLines.length > listRows) {
+        break;
       }
-      index += 1;
+      lines.push(...entryLines);
+      displayed.set(entry.key, entryLines.length);
+      y += entryLines.length;
     }
+    this.displayedRoster = { signature: this.rosterSignature(), heights: displayed };
     for (const noticeLine of noticeLines) {
       lines.push(wrapRow(noticeLine, cols));
     }
@@ -1737,39 +2133,76 @@ export class SidebarController {
     return { lines };
   }
 
-  /** Keeps the keyboard-highlighted entry visible inside the list window. */
+  /** Too-small roster fallback: records that no entry is displayed. */
+  private renderRosterTooSmall(cols: number, rows: number): { lines: string[] } {
+    this.displayedRoster = { signature: this.rosterSignature(), heights: new Map() };
+    return this.renderTooSmall(cols, rows);
+  }
+
+  /**
+   * Variable-height scroll: keeps the complete highlighted entry inside the
+   * list window, moves the top only when needed, and pulls the window back
+   * up when the whole tail fits (e.g. after a card collapses).
+   */
   private scrollWindow(selectedIndex: number, listRows: number): number {
+    const heights = this.entries.map((entry) => this.entryHeight(entry));
     const maxTop = Math.max(0, this.entries.length - 1);
     let top = Math.min(Math.max(this.listTop, 0), maxTop);
     if (selectedIndex >= 0) {
       if (selectedIndex < top) {
         top = selectedIndex;
-      } else if (selectedIndex >= top + listRows) {
-        top = selectedIndex - listRows + 1;
       }
+      let used = 0;
+      for (let index = top; index <= selectedIndex; index += 1) {
+        used += heights[index] ?? 1;
+      }
+      while (used > listRows && top < selectedIndex) {
+        used -= heights[top] ?? 1;
+        top += 1;
+      }
+    }
+    let tail = 0;
+    for (let index = top; index < heights.length; index += 1) {
+      tail += heights[index] ?? 1;
+    }
+    while (top > 0 && tail + (heights[top - 1] ?? 1) <= listRows) {
+      top -= 1;
+      tail += heights[top] ?? 1;
     }
     this.listTop = top;
     return top;
   }
 
-  private renderEntry(entry: SidebarEntry, selected: boolean, cols: number): string {
+  /**
+   * One entry's rows. Native-session cards: a title line holding ONLY the
+   * sanitized canonical title, a status line (selection marker plus
+   * observed/unknown agent and input state), an honest background-count
+   * line, and — when expanded — two generic sanitized activity rows.
+   */
+  private renderEntryLines(entry: SidebarEntry, selected: boolean, cols: number): string[] {
     const marker = selected ? "> " : "  ";
-    let text: string;
     if (entry.kind === "item" && entry.item !== undefined) {
       const item = entry.item;
-      const label = sanitizeBounded(item.nativeSession?.name ?? item.label, ITEM_LABEL_INPUT_MAX_CODEPOINTS);
-      const badges = rowBadges(item);
-      const labelWidth = Math.max(0, cols - visibleWidth(marker) - visibleWidth(badges));
-      const visibleLabel = labelWidth > 0 ? truncateToWidth(label, labelWidth, "...") : "";
-      text = `${marker}${visibleLabel}${badges}`;
-    } else if (entry.kind === "saved") {
-      text = `${marker}Saved conversations`;
-    } else if (entry.kind === "new") {
-      text = `${marker}New session`;
-    } else {
-      text = `${marker}Quit host`;
+      const lines = [
+        wrapRow(cardTitle(item), cols, selected ? "\x1b[1;7m" : "\x1b[1m"),
+        wrapRow(`${marker}${cardStatusText(item)}`, cols),
+        wrapRow(`  ${cardBackgroundText(item)}`, cols),
+      ];
+      if (!this.collapsedItemIds.has(item.id)) {
+        const activity = renderActivityLines(item.activity, cols);
+        while (activity.length < ACTIVITY_LINES_MAX) {
+          activity.push(wrapRow("", cols));
+        }
+        lines.push(...activity);
+      }
+      return lines;
     }
-    return wrapRow(text, cols, selected ? "\x1b[1;7m" : undefined);
+    const text = entry.kind === "saved"
+      ? `${marker}Saved conversations`
+      : entry.kind === "new"
+        ? `${marker}New session`
+        : `${marker}Quit host`;
+    return [wrapRow(text, cols, selected ? "\x1b[1;7m" : undefined)];
   }
 
   private renderFormPane(
@@ -1915,6 +2348,9 @@ export class SidebarController {
   }
 
   private renderConfirmPane(cols: number, rows: number): { lines: string[] } {
+    if (this.confirmPurpose === "stop-remove") {
+      return this.renderStopRemoveConfirmPane(cols, rows);
+    }
     const header = " Quit host? ";
     const liveCount = this.rowStore.filter(requiresQuitConfirmation).length;
     const countLines = wrapHintLines(
@@ -1938,6 +2374,53 @@ export class SidebarController {
     }
     return { lines };
   }
+
+  /**
+   * The explicit stop confirmation: the frozen target's title (or a truthful
+   * gone notice), the warning that its active turn, questions, background
+   * tasks, and shells will be stopped, and the confirm/cancel hints.
+   */
+  private renderStopRemoveConfirmPane(cols: number, rows: number): { lines: string[] } {
+    const header = " Stop session? ";
+    const target = this.stopRemoveTargetId !== undefined
+      ? this.findItemEntry(this.stopRemoveTargetId)
+      : undefined;
+    // The title truncates to the pane so it can never push the warning or
+    // hints out of the dialog.
+    const targetLines = wrapHintLines(
+      [target?.item !== undefined
+        ? truncateToWidth(cardTitle(target.item), cols, "...", true)
+        : "The session no longer exists"],
+      cols,
+    );
+    const warningLines = wrapHintLines(
+      ["Stopping will stop its active turn, questions, background tasks, and shells"],
+      cols,
+    );
+    const hintLines = wrapHintLines(["enter/y = stop", "esc/n = cancel"], cols);
+    if (targetLines === undefined || warningLines === undefined || hintLines === undefined
+      || visibleWidth(header) > cols) {
+      this.stopConfirmDisplayed = false;
+      return this.renderTooSmall(cols, rows);
+    }
+    if (rows < 1 + targetLines.length + warningLines.length + hintLines.length) {
+      this.stopConfirmDisplayed = false;
+      return this.renderTooSmall(cols, rows);
+    }
+    const lines = [wrapRow(header, cols, "\x1b[1m")];
+    for (const line of targetLines) {
+      lines.push(wrapRow(line, cols));
+    }
+    for (const line of warningLines) {
+      lines.push(wrapRow(line, cols));
+    }
+    lines.push(...blankLines(Math.max(0, rows - lines.length - hintLines.length)));
+    for (const line of hintLines) {
+      lines.push(wrapRow(line, cols));
+    }
+    this.stopConfirmDisplayed = true;
+    return { lines };
+  }
 }
 
 function renderActivityLines(activity: readonly string[], cols: number): string[] {
@@ -1946,7 +2429,7 @@ function renderActivityLines(activity: readonly string[], cols: number): string[
     .filter((line) => line.length > 0)
     .slice(0, ACTIVITY_LINES_MAX)
     .map((line) =>
-      wrapRow(`   ${sanitizeBounded(line, ACTIVITY_INPUT_MAX_CODEPOINTS)}`, cols),
+      wrapRow(`    ${sanitizeBounded(line, ACTIVITY_INPUT_MAX_CODEPOINTS)}`, cols),
     );
 }
 

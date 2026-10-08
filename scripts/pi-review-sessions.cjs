@@ -22,7 +22,7 @@
  *   global package root's declared bin entry is validated (package name,
  *   stable version floor, bin containment, regular readable positive Node
  *   entry), then a PATH `pi` that resolves into such a package. When no
- *   supported installation exists, an isolated Pi 1.0.4 runtime is
+ *   supported installation exists, an isolated Pi 1.1.0 runtime is
  *   provisioned under the native Pi agent directory's cache
  *   (<agent-dir>/.pi-review-gate/pi-runtime) with npm --ignore-scripts and
  *   re-validated before publication. Global installs and existing user
@@ -55,7 +55,7 @@ for native validation only (not a Windows readiness claim). Requires Node >=22.1
 and Pi >=1.0.4 with a positively identified Node CLI entry. Without --pi-executable the
 launcher resolves the public @earendil-works/pi-coding-agent installation
 (npm global root, then PATH) and, when none is supported, provisions an
-isolated Pi 1.0.4 runtime cache under the native Pi agent directory; no
+isolated Pi 1.1.0 runtime cache under the native Pi agent directory; no
 manual Pi CLI path is needed. Starts an empty welcome/sidebar picker; choose
 a workspace explicitly in the UI.
 The startup working directory is not selected as a workspace.
@@ -88,7 +88,7 @@ const MIN_NODE_VERSION = [22, 19, 0];
 // src/session-host/launch.ts (Pi 1.0.4 minimum).
 const PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 const PI_MIN_VERSION = [1, 0, 4];
-const PI_PROVISION_VERSION = "1.0.4";
+const PI_PROVISION_VERSION = "1.1.0";
 const RUNTIME_CACHE_DIRNAME = ".pi-review-gate";
 const PI_RUNTIME_DIRNAME = "pi-runtime";
 
@@ -98,6 +98,17 @@ const VERSION_PROBE_TIMEOUT_MS = 10_000;
 const NPM_ROOT_TIMEOUT_MS = 60_000;
 const NPM_INSTALL_TIMEOUT_MS = 600_000;
 const SOURCE_BUILD_TIMEOUT_MS = 600_000;
+// Admitted source build/install children capture both streams so a failure has
+// a cause. The captured bytes share ONE hard ceiling (runBoundedProcess
+// maxOutputBytes counts stdout+stderr together), and the retained diagnostic
+// text is separately sanitized and re-bounded before it is emitted.
+const SOURCE_BUILD_CAPTURE_MAX_BYTES = 256 * 1024;
+const BUILD_DIAGNOSTIC_TEXT_MAX_BYTES = 4 * 1024;
+const BUILD_STAGE_LABELS = {
+  install: "npm ci (dependency install)",
+  compile: "npm run build (compile)",
+  stage: "source stage preparation",
+};
 const DDGS_SETUP_TIMEOUT_MS = 600_000;
 const PROCESS_KILL_GRACE_MS = 500;
 const MAX_MANIFEST_BYTES = 1024 * 1024;
@@ -543,7 +554,7 @@ function boundedProcessCleanupStatus({ closed, pid, platform, timedOut, outputEx
 }
 
 function runBoundedProcess(file, args, options = {}) {
-  const { env, cwd, timeoutMs, maxOutputBytes = 0, captureStdout = false } = options;
+  const { env, cwd, timeoutMs, maxOutputBytes = 0, captureStdout = false, captureStderr = false } = options;
   const testHooks = options.testHooks;
   return new Promise((resolve) => {
     let child;
@@ -554,6 +565,7 @@ function runBoundedProcess(file, args, options = {}) {
     let terminating = false;
     let spawnError;
     let stdout = Buffer.alloc(0);
+    let stderr = Buffer.alloc(0);
     let deadlineTimer;
     let killTimer;
     let finished = false;
@@ -600,6 +612,7 @@ function runBoundedProcess(file, args, options = {}) {
         spawnError ??= new Error("setup process cleanup was not confirmed");
         child.unref();
         child.stdout?.destroy();
+        child.stderr?.destroy();
       }
       resolve({
         status: closeResult?.code ?? null,
@@ -609,6 +622,7 @@ function runBoundedProcess(file, args, options = {}) {
         timedOut,
         outputExceeded,
         stdout: stdout.toString("utf8"),
+        ...(captureStderr ? { stderr: stderr.toString("utf8") } : {}),
       });
     };
     const terminate = () => {
@@ -631,23 +645,55 @@ function runBoundedProcess(file, args, options = {}) {
         env,
         detached: process.platform !== "win32",
         windowsHide: true,
-        stdio: ["ignore", captureStdout ? "pipe" : "ignore", "ignore"],
+        stdio: ["ignore", captureStdout ? "pipe" : "ignore", captureStderr ? "pipe" : "ignore"],
       });
     } catch (error) {
-      resolve({ status: null, signal: null, error, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "" });
+      resolve({
+        status: null,
+        signal: null,
+        error,
+        cleanupConfirmed: true,
+        timedOut: false,
+        outputExceeded: false,
+        stdout: "",
+        ...(captureStderr ? { stderr: "" } : {}),
+      });
       return;
     }
 
     activeBoundedProcessCount += 1;
-    if (captureStdout) {
-      child.stdout.on("data", (chunk) => {
-        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        if (stdout.length + bytes.length > maxOutputBytes) {
-          outputExceeded = true;
-          if (killTimer === undefined) terminate();
-          return;
-        }
-        stdout = Buffer.concat([stdout, bytes]);
+    // stdout and stderr are captured separately for provenance, but the two
+    // buffers count against the same hard ceiling: a child that floods either
+    // stream cannot exceed maxOutputBytes in total, and exceeding it is
+    // reported as outputExceeded (a failure) rather than as successful output.
+    const captureChunk = (chunk, assign) => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (stdout.length + stderr.length + bytes.length > maxOutputBytes) {
+        outputExceeded = true;
+        if (killTimer === undefined) terminate();
+        return;
+      }
+      assign(bytes);
+    };
+    if (captureStdout) child.stdout.on("data", (chunk) => captureChunk(chunk, (bytes) => { stdout = Buffer.concat([stdout, bytes]); }));
+    if (captureStderr) child.stderr.on("data", (chunk) => captureChunk(chunk, (bytes) => { stderr = Buffer.concat([stderr, bytes]); }));
+    // A captured-pipe read error is a setup failure, never a silent success or
+    // an unhandled EventEmitter error: record the first one and take the
+    // existing bounded termination and settlement path. Cleanup is still
+    // decided by the shared cleanup status, so nothing here claims that an
+    // unproven process tree is gone.
+    const onStreamError = (error) => {
+      spawnError ??= error instanceof Error ? error : new Error("setup stream read failed");
+      if (killTimer === undefined) terminate();
+    };
+    if (captureStdout) child.stdout.on("error", onStreamError);
+    if (captureStderr) child.stderr.on("error", onStreamError);
+    if (testHooks && typeof testHooks.onStreams === "function") {
+      // Synthetic seam: the controlled observer may emit a stream error once
+      // the admitted listeners exist, without touching production behavior.
+      testHooks.onStreams({
+        stdout: captureStdout ? child.stdout : undefined,
+        stderr: captureStderr ? child.stderr : undefined,
       });
     }
     child.once("error", (error) => { spawnError = error; });
@@ -677,6 +723,72 @@ function runNpm(npmCli, args, options = {}) {
   return runBoundedProcess(process.execPath, [npmCli, ...args], options);
 }
 
+/**
+ * Neutralize terminal control sequences and non-printing bytes in captured
+ * child output so a failing child cannot rewrite or hijack the operator's
+ * terminal, then keep only the printable text it actually printed. The input
+ * is bounded child output only: no environment, credential, argv, or
+ * parent-process state is ever added here.
+ */
+function sanitizeDiagnosticText(text) {
+  if (typeof text !== "string" || text.length === 0) return "";
+  return text
+    // OSC ... BEL/ST
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/gu, "")
+    // CSI ... final byte
+    .replace(/\u001b\[[0-9;?<=>!]*[ -/]*[@-~]/gu, "")
+    // remaining two-byte escape sequences
+    .replace(/\u001b[@-Z\\-_]/gu, "")
+    // C0/C1 controls and DEL except horizontal tab and newline
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/gu, "");
+}
+
+/**
+ * Bound text to a UTF-8 byte ceiling, appending an explicit truncation marker
+ * when clipped so a reader can tell the diagnostic is incomplete. A ceiling
+ * smaller than the marker emits nothing rather than overshooting it.
+ */
+function boundDiagnosticText(text, limitBytes) {
+  if (typeof text !== "string" || text.length === 0) return "";
+  if (!Number.isFinite(limitBytes) || limitBytes <= 0) return "";
+  const limit = Math.floor(limitBytes);
+  if (Buffer.byteLength(text, "utf8") <= limit) return text;
+  const marker = "[diagnostic truncated]\n";
+  const budget = limit - Buffer.byteLength(marker, "utf8");
+  if (budget <= 0) return "";
+  const clipped = Buffer.from(text, "utf8").subarray(0, budget).toString("utf8").replace(/\ufffd+$/u, "");
+  return `${clipped}${marker}`;
+}
+
+/**
+ * Bounded, sanitized, provenance-labelled diagnostics for one failed admitted
+ * source build stage. Each captured stream keeps its own label so a reader can
+ * tell stdout from stderr, and the blocks together share one aggregate ceiling
+ * (BUILD_DIAGNOSTIC_TEXT_MAX_BYTES). Returns "" when nothing was captured.
+ */
+function formatBuildStageDiagnostics(result, stage) {
+  const label = BUILD_STAGE_LABELS[stage] ?? BUILD_STAGE_LABELS.stage;
+  const perStreamLimit = Math.max(1, Math.floor((BUILD_DIAGNOSTIC_TEXT_MAX_BYTES - 256) / 2));
+  const blocks = [];
+  const streams = [
+    ["stdout", boundDiagnosticText(sanitizeDiagnosticText(result && result.stdout), perStreamLimit)],
+    ["stderr", boundDiagnosticText(sanitizeDiagnosticText(result && result.stderr), perStreamLimit)],
+  ];
+  for (const [stream, text] of streams) {
+    if (text.length === 0) continue;
+    blocks.push(`pi-review-sessions: ${label} ${stream}:\n${text}${text.endsWith("\n") ? "" : "\n"}`);
+  }
+  return blocks.join("");
+}
+
+/** Bounded, sanitized diagnostic for a failure raised by the build wrapper itself. */
+function formatStageErrorDiagnostics(error) {
+  const message = error && typeof error.message === "string" && error.message.length > 0
+    ? error.message
+    : "source stage preparation failed";
+  return boundDiagnosticText(sanitizeDiagnosticText(`${message}\n`), BUILD_DIAGNOSTIC_TEXT_MAX_BYTES);
+}
+
 async function buildSourceExtension(options) {
   const { packageRoot, agentDir, env } = options;
   const executeNpm = options.runNpm || runNpm;
@@ -687,7 +799,7 @@ async function buildSourceExtension(options) {
   try {
     ownedStage = stageSourcePackage(packageRoot, path.join(agentDir, RUNTIME_CACHE_DIRNAME, "build"));
   } catch (error) {
-    return { status: 1, error: new Error("could not stage the source package for building"), retainedStage: Boolean(error && error.retainedStage) };
+    return { status: 1, stage: "stage", error: new Error("could not stage the source package for building"), retainedStage: Boolean(error && error.retainedStage) };
   }
   const stagingRoot = ownedStage.root;
   try {
@@ -698,17 +810,22 @@ async function buildSourceExtension(options) {
       cwd: stagingRoot,
       env: buildEnv,
       timeoutMs: NPM_INSTALL_TIMEOUT_MS,
+      captureStdout: true,
+      captureStderr: true,
+      maxOutputBytes: SOURCE_BUILD_CAPTURE_MAX_BYTES,
     });
     if (install.error || install.status !== 0 || install.signal || install.timedOut || install.outputExceeded || install.cleanupConfirmed === false) {
       const removed = install.cleanupConfirmed !== false && removeOwnedStage(ownedStage);
       return {
         status: statusCode(install),
+        stage: "install",
         childStatus: install.status,
         signal: install.signal,
         cleanupConfirmed: install.cleanupConfirmed,
         timedOut: install.timedOut,
         outputExceeded: install.outputExceeded,
         error: install.error,
+        diagnostics: formatBuildStageDiagnostics(install, "install"),
         retainedStage: !removed,
       };
     }
@@ -718,17 +835,22 @@ async function buildSourceExtension(options) {
       cwd: stagingRoot,
       env: { ...buildEnv, PATH: `${path.join(stagingRoot, "node_modules", ".bin")}${path.delimiter}${env.PATH ?? ""}` },
       timeoutMs: sourceBuildTimeoutMs,
+      captureStdout: true,
+      captureStderr: true,
+      maxOutputBytes: SOURCE_BUILD_CAPTURE_MAX_BYTES,
     });
     if (build.error || build.status !== 0 || build.signal || build.timedOut || build.outputExceeded || build.cleanupConfirmed === false) {
       const removed = build.cleanupConfirmed !== false && removeOwnedStage(ownedStage);
       return {
         status: statusCode(build),
+        stage: "compile",
         childStatus: build.status,
         signal: build.signal,
         cleanupConfirmed: build.cleanupConfirmed,
         timedOut: build.timedOut,
         outputExceeded: build.outputExceeded,
         error: build.error,
+        diagnostics: formatBuildStageDiagnostics(build, "compile"),
         retainedStage: !removed,
       };
     }
@@ -737,7 +859,14 @@ async function buildSourceExtension(options) {
   } catch (error) {
     const cleanupUnconfirmed = Boolean(error && error.cleanupUnconfirmed);
     const removed = !cleanupUnconfirmed && removeOwnedStage(ownedStage);
-    return { status: 1, error, cleanupConfirmed: cleanupUnconfirmed ? false : undefined, retainedStage: !removed };
+    return {
+      status: 1,
+      stage: "stage",
+      error,
+      cleanupConfirmed: cleanupUnconfirmed ? false : undefined,
+      diagnostics: formatStageErrorDiagnostics(error),
+      retainedStage: !removed,
+    };
   }
 }
 
@@ -1585,12 +1714,22 @@ async function runSessionHostLauncher(argv, overrides = {}) {
     if (!build || build.status !== 0 || build.error || build.signal || build.timedOut || build.outputExceeded || build.cleanupConfirmed === false) {
       const detail = build && build.timedOut
         ? " (setup deadline exceeded)"
-        : build && typeof build.signal === "string"
-          ? ` (terminated by ${build.signal})`
-          : build && Number.isInteger(build.status)
-            ? ` (exit status ${build.status})`
-            : "";
+        : build && build.outputExceeded
+          ? " (output limit exceeded)"
+          : build && typeof build.signal === "string"
+            ? ` (terminated by ${build.signal})`
+            : build && build.cleanupConfirmed === false
+              ? " (process cleanup was not confirmed)"
+              : build && Number.isInteger(build.status)
+                ? ` (exit status ${build.status})`
+                : "";
       deps.writeError(`pi-review-sessions: extension build failed${detail}.\n`);
+      if (build && typeof build.stage === "string") {
+        deps.writeError(`pi-review-sessions: failed build stage: ${build.stage === "install" ? BUILD_STAGE_LABELS.install : build.stage === "compile" ? BUILD_STAGE_LABELS.compile : BUILD_STAGE_LABELS.stage}.\n`);
+      }
+      // Bounded, sanitized stderr/stdout from the owned stage child's own
+      // streams only; it never carries credentials or the caller's environment.
+      if (build && typeof build.diagnostics === "string" && build.diagnostics.length > 0) deps.writeError(build.diagnostics);
       if (build && build.retainedStage) deps.writeError("pi-review-sessions: a source stage was retained because per-entry descendant creation receipts are unavailable.\n");
       return statusCode(build);
     }
@@ -1725,6 +1864,9 @@ module.exports = {
     findPiOnPath,
     runBoundedProcess,
     boundedProcessCleanupStatus,
+    sanitizeDiagnosticText,
+    boundDiagnosticText,
+    formatBuildStageDiagnostics,
     activeBoundedProcessCount: () => activeBoundedProcessCount,
   },
 };

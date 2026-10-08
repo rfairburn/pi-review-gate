@@ -101,7 +101,14 @@ export interface StatusBrokerOptions {
 
 /** Callbacks bound to one registration; always guard-wrapped by the broker. */
 export interface StatusBrokerStatusHandlers {
-  /** Bounded snapshot callback; arguments come only from the shared contract. */
+  /**
+   * Bounded snapshot callback; arguments come only from the shared contract.
+   * The optional `backgroundTasks`/`backgroundShells` counts are forwarded
+   * exactly as validated (a nonnegative safe integer, or null for unknown);
+   * the broker never zeroes them on reconnect, replacement, release, or
+   * disconnect, so a cleared tracker can never reach a consumer as "nothing
+   * running".
+   */
   onStatus: (status: SessionHostStatus) => void;
   /** Fired only when a currently-owned authenticated connection actually disconnects. */
   onDisconnect: () => void;
@@ -118,7 +125,7 @@ export interface StatusRegistration {
    * to its latest observed session tuple. `requested` is not process exit;
    * the manager must wait for the owned PTY's actual `onExit` result.
    */
-  shutdown: () => Promise<StatusShutdownResult>;
+  shutdown: (options?: { readonly requireIdle?: boolean }) => Promise<StatusShutdownResult>;
   /** Releases the registration: closes its active connection silently, rejects later hellos. */
   release: () => void;
 }
@@ -153,7 +160,7 @@ export interface StatusRenameResult {
   observedSessionEpoch: number | null;
 }
 
-export type StatusShutdownStatus = "requested" | "rejected" | "unavailable" | "busy" | "timeout" | "disconnected";
+export type StatusShutdownStatus = "requested" | "rejected" | "not-idle" | "unavailable" | "busy" | "timeout" | "disconnected";
 
 /** No capability token, conversation content, tool data, or prompt-derived name is exposed. */
 export interface StatusShutdownResult {
@@ -610,7 +617,7 @@ class LocalStatusBroker implements StatusBroker {
     return {
       bootstrap,
       rename: (request) => this.#rename(record, request),
-      shutdown: () => this.#shutdown(record),
+      shutdown: (options) => this.#shutdown(record, options),
       release: () => this.#releaseRegistration(record),
     };
   }
@@ -692,7 +699,7 @@ class LocalStatusBroker implements StatusBroker {
     });
   }
 
-  #shutdown(record: RegistrationRecord): Promise<StatusShutdownResult> {
+  #shutdown(record: RegistrationRecord, options?: { readonly requireIdle?: boolean }): Promise<StatusShutdownResult> {
     if (record.shutdownResult) return record.shutdownResult;
     const requestId = randomUUID();
     const result = (status: StatusShutdownStatus): StatusShutdownResult => ({ requestId, status });
@@ -715,6 +722,7 @@ class LocalStatusBroker implements StatusBroker {
       requestId,
       expectedSessionId: session.sessionId,
       expectedSessionEpoch: session.epoch,
+      ...(options?.requireIdle === true ? { requireIdle: true } : {}),
     };
     const promise = new Promise<StatusShutdownResult>((resolve) => {
       const timer = setTimeout(() => {
@@ -737,6 +745,11 @@ class LocalStatusBroker implements StatusBroker {
       }
     });
     record.shutdownResult = promise;
+    void promise.then((result) => {
+      // A positively rejected idle-only preflight never invoked shutdown.
+      // It must not poison a later deliberately confirmed stop or Quit.
+      if (result.status === "not-idle" && record.shutdownResult === promise) record.shutdownResult = undefined;
+    });
     return promise;
   }
 
@@ -1233,8 +1246,10 @@ class LocalStatusBroker implements StatusBroker {
     record.lastSequence = status.sequence;
     record.latestNativeSession = status.nativeSession ?? null;
     // The decoded object is the shared-contract snapshot (extra fields were
-    // dropped by the shared parser); guard callback errors so status-metadata
-    // failures can never reach the native process, with no content logging.
+    // dropped by the shared parser, and the optional owned-work counts were
+    // already normalized to a nonnegative safe integer or null). They are
+    // forwarded unchanged: the broker owns no inference of zero, and a fresh
+    // reporter incarnation re-publishes its own observed counts.
     try {
       record.handlers.onStatus(status);
     } catch {
@@ -1328,7 +1343,8 @@ class LocalStatusBroker implements StatusBroker {
     }
     this.#settleShutdown(record, pending, {
       requestId: ack.requestId,
-      status: classification === "stale-session" ? "rejected" : ack.outcome,
+      status: classification === "stale-session" ? "rejected"
+        : ack.outcome === "rejected" && ack.reason === "not-idle" ? "not-idle" : ack.outcome,
     });
   }
 

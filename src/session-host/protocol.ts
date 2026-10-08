@@ -9,13 +9,15 @@
  * that endpoint, authenticates with a hello frame carrying the bootstrap token,
  * and then pushes bounded newline-delimited JSON status frames:
  * top-level busy/idle, pending-input presence, modal input surface, a
- * two-line generic activity summary, and optional canonical native-session
- * identity/name metadata. The host can also send narrowly scoped,
+ * two-line generic activity summary, optional canonical native-session
+ * identity/name metadata, and optional bounded owned background-work counts
+ * (logical execution/review work and unconfirmed background shell jobs). The host can also send narrowly scoped,
  * authenticated native rename and graceful-shutdown requests and receive their
  * observed results.
  *
  * Privacy contract: status frames carry no tool arguments, question text,
- * transcripts, or credentials. The canonical native conversation name is
+ * transcripts, or credentials. Owned-work counts are opaque numbers only.
+ * The canonical native conversation name is
  * the sole intentionally allowed prompt-derived title. The bootstrap token
  * appears in the hello and authenticated command frames only. Every
  * field is strictly bounded and MAX_STATUS_FRAME_BYTES caps each wire frame;
@@ -37,6 +39,18 @@ export const MAX_NATIVE_SESSION_NAME_LENGTH = 256;
 /** Rename is never silently clipped: complete persisted input must fit this UTF-8 byte limit. */
 export const MAX_RENAME_NAME_BYTES = 1024;
 export const MAX_NATIVE_SESSION_ID_BYTES = 256;
+
+/** Complete observed inactivity; unknown or absent work/input state can never authorize an idle-only stop. */
+export function hasCompleteSessionIdle(state: {
+  busy: boolean | null;
+  pendingInput: boolean | null;
+  inputSurface: boolean;
+  backgroundTasks?: number | null;
+  backgroundShells?: number | null;
+}): boolean {
+  return state.busy === false && state.pendingInput === false && state.inputSurface === false
+    && state.backgroundTasks === 0 && state.backgroundShells === 0;
+}
 
 const MAX_ID_LENGTH = 128;
 const MAX_SOCKET_PATH_LENGTH = 2048;
@@ -91,6 +105,16 @@ export interface SessionHostStatus {
   activity: string[];
   /** Omitted by older reporters or null when public native session APIs are unavailable. */
   nativeSession?: SessionHostNativeSession | null;
+  /**
+   * Optional bounded owned background-work counts. Absent (older reporter),
+   * null, or any non-nonnegative-safe-integer value means UNKNOWN (null),
+   * never zero: cleared tracking is never published as "nothing running".
+   * `backgroundTasks` counts logical owned work units (active/queued
+   * execution tasks plus active automatic reviews), not OS processes.
+   */
+  backgroundTasks?: number | null;
+  /** Owned background shell jobs whose actual settlement is not yet confirmed. */
+  backgroundShells?: number | null;
 }
 
 /** Bounded native conversation identity and canonical display title. */
@@ -100,6 +124,8 @@ export interface SessionHostNativeSession {
   epoch: number;
   /** Canonical stored name, otherwise the native first-user-message fallback. */
   name: string;
+  /** Last actual planned-file observation; missing on older reporters means unknown. */
+  persistence?: "saved" | "unsaved" | "unknown";
 }
 
 /** Broker-to-reporter command; the capability token is never forwarded to status/UI callbacks. */
@@ -141,6 +167,8 @@ export interface SessionHostShutdownRequest {
   requestId: string;
   expectedSessionId: string;
   expectedSessionEpoch: number;
+  /** Unconfirmed row deletion must re-establish complete idleness before invoking shutdown. */
+  requireIdle?: boolean;
 }
 
 /** Acknowledges a public shutdown request, never process exit. */
@@ -153,7 +181,7 @@ export interface SessionHostShutdownAck {
   expectedSessionId: string;
   expectedSessionEpoch: number;
   outcome: "requested" | "rejected";
-  reason: "none" | "stale-session" | "unavailable" | "shutdown-failed" | "already-requested";
+  reason: "none" | "stale-session" | "unavailable" | "shutdown-failed" | "already-requested" | "not-idle";
 }
 
 export type SessionHostMessage = SessionHostHello | SessionHostStatus | SessionHostRenameRequest | SessionHostRenameAck
@@ -226,7 +254,20 @@ function parseNativeSession(value: unknown): SessionHostNativeSession | undefine
     sessionId: value.sessionId,
     epoch: value.epoch as number,
     name: value.name,
+    ...(value.persistence === "saved" || value.persistence === "unsaved" || value.persistence === "unknown"
+      ? { persistence: value.persistence } : {}),
   };
+}
+
+/**
+ * Tolerant owned-count parse: only a nonnegative safe integer is a real count.
+ * Absence (an older reporter), explicit null, a fraction, a negative value,
+ * a numeric string, NaN/Infinity, and any other type all mean UNKNOWN (null);
+ * a cleared or unavailable tracker must never be published as zero.
+ */
+function parseOwnedCount(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return null;
+  return value === 0 ? 0 : value; // normalize -0
 }
 
 /**
@@ -285,6 +326,16 @@ export function parseStatus(value: unknown): SessionHostStatus | undefined {
       nativeSession = parsed;
     }
   }
+  let backgroundTasks: number | null | undefined;
+  if (Object.prototype.hasOwnProperty.call(value, "backgroundTasks")) {
+    // Present but invalid is UNKNOWN (null), never a rejection: forward
+    // compatibility must not let an odd count drop an otherwise valid frame.
+    backgroundTasks = parseOwnedCount(value.backgroundTasks);
+  }
+  let backgroundShells: number | null | undefined;
+  if (Object.prototype.hasOwnProperty.call(value, "backgroundShells")) {
+    backgroundShells = parseOwnedCount(value.backgroundShells);
+  }
   return {
     version: 1,
     type: "status",
@@ -295,6 +346,8 @@ export function parseStatus(value: unknown): SessionHostStatus | undefined {
     pendingInput: value.pendingInput as boolean | null,
     inputSurface: value.inputSurface,
     activity: [...(value.activity as string[])],
+    ...(backgroundTasks === undefined ? {} : { backgroundTasks }),
+    ...(backgroundShells === undefined ? {} : { backgroundShells }),
     ...(nativeSession === undefined ? {} : { nativeSession }),
   };
 }
@@ -357,6 +410,7 @@ export function parseRenameAck(value: unknown): SessionHostRenameAck | undefined
 /** Validates a broker-to-reporter graceful-shutdown request. */
 export function parseShutdownRequest(value: unknown): SessionHostShutdownRequest | undefined {
   if (!isRecord(value) || value.version !== PROTOCOL_VERSION || value.type !== "shutdown_request") return undefined;
+  if (value.requireIdle !== undefined && typeof value.requireIdle !== "boolean") return undefined;
   if (!isValidId(value.instanceId) || !isValidId(value.generation) || !isValidToken(value.token)) return undefined;
   if (!isValidId(value.requestId) || !isValidNativeSessionId(value.expectedSessionId)) return undefined;
   if (!Number.isSafeInteger(value.expectedSessionEpoch) || (value.expectedSessionEpoch as number) < 1) return undefined;
@@ -369,6 +423,7 @@ export function parseShutdownRequest(value: unknown): SessionHostShutdownRequest
     requestId: value.requestId,
     expectedSessionId: value.expectedSessionId,
     expectedSessionEpoch: value.expectedSessionEpoch as number,
+    ...(value.requireIdle === undefined ? {} : { requireIdle: value.requireIdle }),
   };
 }
 
@@ -380,7 +435,7 @@ export function parseShutdownAck(value: unknown): SessionHostShutdownAck | undef
     || !Number.isSafeInteger(value.expectedSessionEpoch)
     || (value.expectedSessionEpoch as number) < 1) return undefined;
   if (value.outcome !== "requested" && value.outcome !== "rejected") return undefined;
-  const reasons = ["none", "stale-session", "unavailable", "shutdown-failed", "already-requested"];
+  const reasons = ["none", "stale-session", "unavailable", "shutdown-failed", "already-requested", "not-idle"];
   if (!reasons.includes(value.reason as string)) return undefined;
   if ((value.outcome === "requested") !== (value.reason === "none")) return undefined;
   return {

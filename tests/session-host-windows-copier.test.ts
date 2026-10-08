@@ -43,6 +43,10 @@ function runCopier(source: string, dest: string): CopierResult {
   return runChild([HELPER, "copy-scripts", source, dest]);
 }
 
+function runSourceCopier(source: string, dest: string): CopierResult {
+  return runChild([HELPER, "copy-source", source, dest]);
+}
+
 /** Allocate one fresh exclusive fixture root under the validated ignored own-root subtree. */
 function allocateFixtureRoot(): string {
   const fixtureRoot = ensureIgnoredFixtureRoot(projectRoot, FIXTURE_REL_PATH);
@@ -540,4 +544,110 @@ test("copyFileBounded rejects growth immediately after the final source descript
   assert.equal(result.code, 1, `the post-stat growth must be rejected: ${result.stdout}`);
   assert.match(result.stderr, /source file replaced during copy; retaining partial output/);
   assert.ok(existsSync(join(dest, "source.txt")), "partial output must be retained");
+});
+
+test("copy-source copies only the exact production build inputs and prunes .terraform", () => {
+  const root = allocateFixtureRoot();
+  const source = join(root, "package");
+  writeFileTree(source, {
+    "package.json": "{\"name\":\"synthetic\"}",
+    "package-lock.json": "{\"lockfileVersion\":3}",
+    "tsconfig.json": "{}",
+    "src/session-host/main.ts": "export {};",
+    "src/.terraform/state.tf": "must not be copied",
+    "src/nested/.terraform/other.tf": "also pruned",
+    "scripts/pi-review-sessions.cjs": "// launcher",
+    "skills/pi-review-gate-execution/SKILL.md": "# skill",
+    "tests/should-not-copy.test.ts": "must not be copied",
+    "dist/prebuilt.js": "must not be copied",
+    "node_modules/dep/index.js": "must not be copied",
+    ".git/config": "must not be copied",
+    "private-notes.md": "must not be copied",
+  });
+  // A symlink inside a pruned .terraform tree would be refused if the copier
+  // ever descended there, so success proves pruning happens before descent.
+  symlinkSync(join(source, "package.json"), join(source, "src", ".terraform", "evil-link"));
+  const dest = join(root, "source-fixture");
+  const result = runSourceCopier(source, dest);
+  assert.equal(result.code, 0, `copy-source must succeed: ${result.stderr}`);
+  for (const rel of ["package.json", "package-lock.json", "tsconfig.json",
+    "src/session-host/main.ts", "scripts/pi-review-sessions.cjs", "skills/pi-review-gate-execution/SKILL.md"]) {
+    assert.ok(existsSync(join(dest, rel)), `the exact production build input must be copied: ${rel}`);
+  }
+  for (const rel of ["tests", "dist", "node_modules", ".git", "private-notes.md",
+    "src/.terraform", "src/nested/.terraform"]) {
+    assert.ok(!existsSync(join(dest, rel)), `copy-source must never copy: ${rel}`);
+  }
+  assert.match(result.stdout, /copied 6 source files \(\d+ directories, \d+ bytes\)/,
+    "the report must reflect exactly the copied production inputs");
+  assert.ok(existsSync(source) && existsSync(dest), "both fixture trees must be retained");
+});
+
+test("copy-source copies package-lock.json byte-for-byte", () => {
+  const root = allocateFixtureRoot();
+  const source = join(root, "package");
+  const lockBytes = `{"lockfileVersion":3,"synthetic":"${'x'.repeat(1024)}"}\n`;
+  writeFileTree(source, {
+    "package.json": "{}",
+    "package-lock.json": lockBytes,
+    "tsconfig.json": "{}",
+    "src/a.ts": "export {};",
+    "scripts/a.cjs": "// a",
+    "skills/a/SKILL.md": "# a",
+  });
+  const dest = join(root, "source-fixture");
+  const result = runSourceCopier(source, dest);
+  assert.equal(result.code, 0, `copy-source must succeed: ${result.stderr}`);
+  assert.equal(readFileSync(join(dest, "package-lock.json"), "utf8"), lockBytes,
+    "the production lockfile must survive the bounded copy byte-for-byte");
+});
+
+test("copy-source refuses a missing or symlinked required input", () => {
+  const root = allocateFixtureRoot();
+  const missing = join(root, "missing-skills");
+  writeFileTree(missing, {
+    "package.json": "{}",
+    "package-lock.json": "{}",
+    "tsconfig.json": "{}",
+    "src/a.ts": "export {};",
+    "scripts/a.cjs": "// a",
+  });
+  let result = runSourceCopier(missing, join(root, "dest-missing"));
+  assert.equal(result.code, 1, `a missing required tree must fail the copy: ${result.stdout}`);
+  assert.match(result.stderr, /source package input is missing/);
+
+  const symlinked = join(root, "symlinked-src");
+  writeFileTree(symlinked, {
+    "package.json": "{}",
+    "package-lock.json": "{}",
+    "tsconfig.json": "{}",
+    "real-src/a.ts": "export {};",
+    "scripts/a.cjs": "// a",
+    "skills/a/SKILL.md": "# a",
+  });
+  symlinkSync(join(symlinked, "real-src"), join(symlinked, "src"));
+  result = runSourceCopier(symlinked, join(root, "dest-symlink"));
+  assert.equal(result.code, 1, `a symlinked required tree must be refused: ${result.stdout}`);
+  assert.match(result.stderr, /source package input must be a real directory/);
+});
+
+test("copy-source refuses a non-empty destination and preserves its content", () => {
+  const root = allocateFixtureRoot();
+  const source = join(root, "package");
+  writeFileTree(source, {
+    "package.json": "{}",
+    "package-lock.json": "{}",
+    "tsconfig.json": "{}",
+    "src/a.ts": "export {};",
+    "scripts/a.cjs": "// a",
+    "skills/a/SKILL.md": "# a",
+  });
+  const dest = join(root, "source-fixture");
+  mkdirSync(dest);
+  writeFileSync(join(dest, "pre-existing.txt"), "keep");
+  const result = runSourceCopier(source, dest);
+  assert.equal(result.code, 1, `a non-empty destination must fail the copy: ${result.stdout}`);
+  assert.match(result.stderr, /destination already contains entries/);
+  assert.equal(readFileSync(join(dest, "pre-existing.txt"), "utf8"), "keep",
+    "pre-existing destination content must survive untouched");
 });

@@ -26,10 +26,12 @@ import {
   createSavedMainWorkspace,
   currentBinding,
   findBinding,
+  frameHeader,
   getWorkspaceFieldValue,
   isEmptyWorkspaceField,
   isQuitConfirmationFrame,
   isSavedConversationsPane as isSavedPane,
+  isSidebarFocusedFrame,
   hasQuitConfirmationContents,
   nativeFormFieldIsEmpty,
   latestDimensions,
@@ -38,6 +40,7 @@ import {
   processIsStillOwnedAndLive,
   ptyJournalHasForceAttempt,
   ptySpawnCount,
+  parseRosterFrame,
   readOwnedJsonl,
   recordHasCurrentConversation,
   requirePublicRuntimeDependencies,
@@ -47,6 +50,7 @@ import {
   selectedRosterEntry,
   sessionFileHasStoredName,
   shortBaselineFitsTwentyFourColumns,
+  sidebarRosterHidden,
   validateSharedRuntimeEnvironment,
   waitForJsonl,
   workspaceOnlyNewFrame,
@@ -64,14 +68,7 @@ interface ProviderRecord {
 }
 
 function isCompleteRosterFrame(text: string): boolean {
-  const left = text.split("\n").slice(1).map((line) => line.slice(0, 32));
-  const count = /^\s*Sessions \((\d+)\)\s*$/.exec(left[0] ?? "");
-  if (!count) return false;
-  const rows = rosterEntries(text);
-  const actions = ["Saved conversations", "New session", "Quit host"];
-  return rows.length === Number(count[1]) + actions.length
-    && actions.every((action, index) => rows.filter((entry) => entry.label === action).length === 1
-      && rows[rows.length - actions.length + index]?.label === action);
+  return parseRosterFrame(text, 32).complete;
 }
 
 function isSidebarVisible(text: string): boolean {
@@ -79,8 +76,7 @@ function isSidebarVisible(text: string): boolean {
 }
 
 function isSidebarFocus(text: string): boolean {
-  const left = text.split("\n").slice(1).map((line) => line.slice(0, 32)).join("\n");
-  return isSidebarVisible(text) && left.includes("e edit name") && left.includes("q quit");
+  return isSidebarFocusedFrame(text, 32);
 }
 
 function selectedPosition(text: string): number | undefined {
@@ -89,6 +85,11 @@ function selectedPosition(text: string): number | undefined {
 
 function exactCurrentHeader(driver: SavedMainDriver): string {
   return driver.currentText().split("\n")[0] ?? "";
+}
+
+/** Status row text of a native card, or undefined for an action/absent entry. */
+function entryStatus(entry: RosterEntry | undefined): string | undefined {
+  return entry !== undefined && entry.kind === "native" ? entry.status : undefined;
 }
 
 function sessionStarts(records: readonly SessionRecord[]): SessionRecord[] {
@@ -135,12 +136,15 @@ async function ensureSidebarFocus(driver: SavedMainDriver): Promise<void> {
     const visible = isSidebarVisible(text);
     const snapshot = driver.snapshot();
     driver.pty.write(KEYS.f8);
+    // The reserved chord is two-step: from a visible Main-focused roster this
+    // single press focuses without hiding; from an open form/picker it runs
+    // that pane's own cancellation fence (hiding), so the loop presses again.
     await driver.waitFrame((next) => visible
-      ? !next.split("\n").slice(1).map((line) => line.slice(0, 32)).join("\n").includes("Sessions (")
-        && rosterEntries(next).every((entry) => !["Saved conversations", "New session", "Quit host"].includes(entry.label))
+      ? isSidebarFocus(next) || sidebarRosterHidden(next)
       : isSidebarFocus(next),
-    visible ? "F8 visibly hides the non-focused roster before reacquiring sidebar focus"
-      : "F8 visibly opens the roster and its sidebar-only actions", snapshot.frameRevision);
+    visible
+      ? "one F8 press focuses the visible sidebar or runs the open pane's cancellation fence"
+      : "one F8 press shows and focuses the hidden sidebar", snapshot.frameRevision);
   }
   assert.ok(isSidebarFocus(driver.currentText()), "actual rendered sidebar-only footer establishes host focus");
 }
@@ -219,7 +223,7 @@ async function activateProcessRow(driver: SavedMainDriver, process: ProcessIncar
   assert.ok(selected, "the target row remains visibly highlighted before explicit activation");
   const before = driver.snapshot();
   driver.pty.write(KEYS.enter);
-  await driver.waitFrame((text) => text.split("\n")[0]?.includes(expectedHeader) === true,
+  await driver.waitFrame((text) => frameHeader(text) === expectedHeader,
     "a later explicit host-row Enter activates only the creation-correlated process row", before.frameRevision);
 }
 
@@ -447,7 +451,7 @@ async function openSavedSuccessfully(
 test("pure saved-pane predicate distinguishes the real right picker from roster text and cancellation", () => {
   const compose = (left: readonly string[], right: readonly string[]): string => {
     const rows = Math.max(left.length, right.length);
-    return ["Session host · synthetic frame", ...Array.from({ length: rows }, (_, index) =>
+    return ["Session host", ...Array.from({ length: rows }, (_, index) =>
       `${(left[index] ?? "").padEnd(32)}│${right[index] ?? ""}`)].join("\n");
   };
   const welcomeRoster = compose(
@@ -460,7 +464,7 @@ test("pure saved-pane predicate distinguishes the real right picker from roster 
   );
   const canceledPicker = compose(
     ["Sessions (1)", "Saved conversations", "New session", "Quit host", "enter open"],
-    ["Session host · Saved A · alive", "native transcript"],
+    ["Saved A", "native transcript"],
   );
 
   assert.equal(isSavedPane(welcomeRoster), false,
@@ -493,7 +497,7 @@ test("pure complete-roster witness rejects duplicate action rows during incremen
     inputSurface: false, activity: [],
   }]);
   const lines = controller.renderRoster(32, 49).lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
-  const compose = (left: readonly string[]): string => ["Session host · synthetic frame",
+  const compose = (left: readonly string[]): string => ["Session host",
     ...left.map((line) => `${line.padEnd(32)}│owned native pane`)].join("\n");
   assert.equal(isCompleteRosterFrame(compose(lines)), true,
     "the public renderer has one native row and exactly three ordered actions");
@@ -526,7 +530,7 @@ test("public SidebarController renders wrapped Quit confirmation at the 32-colum
   const rendered = controller.render(32, 50);
   assert.equal(hasQuitConfirmationContents(rendered.lines, 2), true,
     "the 32-column public renderer preserves the full live count and both distinct confirmation hint rows");
-  const composedFrame = ["Session host · synthetic confirmation", ...rendered.lines.map((line) =>
+  const composedFrame = ["Session host", ...rendered.lines.map((line) =>
     `${line.replace(/\x1b\[[0-9;]*m/g, "").slice(0, 32).padEnd(32)}│native surface`)].join("\n");
   assert.equal(isQuitConfirmationFrame(composedFrame, 2), true,
     "the native-frame predicate reads only the rendered 32-column sidebar, not Main's wider content pane");
@@ -890,15 +894,15 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
   await driver.assertPtyExit(opened.process);
   const p2Position = opened.process.rosterPosition!;
   await driver.waitFrame((text) => {
-    const header = /^Session host · (.+) · exited\s*$/.exec(text.split("\n")[0] ?? "");
+    const header = frameHeader(text);
     const row = rosterEntries(text).find((entry) => entry.position === p2Position);
-    return (header?.[1] === savedName || header?.[1] === "(session name unavailable)")
-      && row?.raw.includes("[exited (code 0)]") === true;
-  }, "Main renders the truthful exited row only after exact public PTY and retained kernel exit witnesses",
+    return (header === savedName || header === "(session name unavailable)")
+      && entryStatus(row) === "exited (code 0)";
+  }, "Main renders the truthful exited card only after exact public PTY and retained kernel exit witnesses",
   childExitBefore.frameRevision);
   const afterChildExitEntries = rosterEntries(driver.currentText());
-  assert.ok(afterChildExitEntries[p2Position]?.raw.includes("[exited (code 0)]"),
-    "the public exited child row remains present and truthfully reports its observed exit");
+  assert.equal(entryStatus(afterChildExitEntries[p2Position]), "exited (code 0)",
+    "the public exited child card remains present and truthfully reports its observed exit below its title");
   assert.ok(existsSync(originalBinding.sessionFile), "the exact saved file survives the reopened child's graceful exit");
   assert.equal(sessionFileHasStoredName(originalBinding.sessionFile, savedName), true,
     "the saved file retains its actual persisted name after child exit");
@@ -922,7 +926,7 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
     "the exited row's kernel watcher remains retained after a later saved-open");
   assert.equal(rosterEntries(driver.currentText()).length, rowsBeforeThirdOpen.length + 1,
     "the exited row was not deleted before its original conversation was opened again");
-  assert.equal(rosterEntryAt(driver, p2Position)?.raw.includes("[exited (code 0)]"), true,
+  assert.equal(entryStatus(rosterEntryAt(driver, p2Position)), "exited (code 0)",
     "the first reopened child's exited row remains independently visible after P3 creation");
   assert.equal(rosterEntryAt(driver, p1Position)?.position, p1Position,
     "the original /new process row remains at its own creation-correlated position");
@@ -943,7 +947,7 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
   const nativeRowsBeforeDelete = beforeDeleteRows.filter((entry) =>
     !["Saved conversations", "New session", "Quit host"].includes(entry.label));
   assert.equal(nativeRowsBeforeDelete.length, 3);
-  assert.ok(beforeDeleteRows[p2Position]?.raw.includes("[exited (code 0)]"),
+  assert.equal(entryStatus(beforeDeleteRows[p2Position]), "exited (code 0)",
     "the exact exited row is still present immediately before its explicit native removal");
   await moveRosterToPosition(driver, p2Position);
   assert.equal(selectedRosterEntry(driver.currentText())?.position, p2Position,
@@ -957,7 +961,7 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
       && nativeRows.length === nativeRowsBeforeDelete.length - 1
       && nativeRows.some((entry) => entry.label === "(no messages)")
       && nativeRows.some((entry) => entry.label === savedName)
-      && !nativeRows.some((entry) => entry.raw.includes("[exited (code 0)]"));
+      && !nativeRows.some((entry) => entryStatus(entry) === "exited (code 0)");
   }, "the real host Delete removes only the already-exited row after its saved conversation has reopened", beforeDelete.frameRevision);
   await assertNoStartsAfter(driver, beforeDelete, "removing the positively exited row");
   assert.equal(driver.ledger.all().length, 3,

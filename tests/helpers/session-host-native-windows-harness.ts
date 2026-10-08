@@ -28,6 +28,12 @@ import { delimiter, dirname, isAbsolute, join, relative, sep } from "node:path";
 
 import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/terminal-surface";
 import {
+  frameHeaderMatches,
+  isSidebarFocusedFrame,
+  selectedRosterEntry,
+  sidebarRosterHidden,
+} from "./session-host-native-roster-witness";
+import {
   assertNativeEditorFieldEmpty,
   borderedEditorContentMatches,
   classifyFirstWorkspaceEnter,
@@ -114,7 +120,7 @@ export interface NativePtyModule {
 export interface WindowsRuntimePin {
   readonly agentDir: string;
   readonly piExecutable: string;
-  readonly version: "1.0.4";
+  readonly version: "1.1.0";
   readonly nodePath: string;
   readonly pty: NativePtyModule;
   readonly ptyModulePath: string;
@@ -191,14 +197,17 @@ export class ChangeSignal {
     for (const listener of [...this.listeners]) listener();
   }
 
-  waitFor(predicate: () => boolean, timeoutMs: number, description: string): Promise<void> {
+  waitFor(predicate: () => boolean, timeoutMs: number, description: string, signal?: AbortSignal): Promise<void> {
     return new Promise<void>((resolvePromise, rejectPromise) => {
       let settled = false;
+      let timer: NodeJS.Timeout | undefined;
+      const onAbort = (): void => finish(new Error(`${description}: cancelled before completion`));
       const finish = (error?: Error): void => {
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
+        if (timer !== undefined) clearTimeout(timer);
         this.listeners.delete(check);
+        signal?.removeEventListener("abort", onAbort);
         if (error) rejectPromise(error);
         else resolvePromise();
       };
@@ -210,7 +219,12 @@ export class ChangeSignal {
           finish(new Error(`${description}: bounded event predicate failed`));
         }
       };
-      const timer = setTimeout(() => finish(new Error(`${description}: deadline exceeded`)), timeoutMs);
+      if (signal?.aborted) {
+        finish(new Error(`${description}: cancelled before completion`));
+        return;
+      }
+      timer = setTimeout(() => finish(new Error(`${description}: deadline exceeded`)), timeoutMs);
+      if (signal) signal.addEventListener("abort", onAbort, { once: true });
       this.listeners.add(check);
       check();
     });
@@ -274,7 +288,7 @@ export function writeOwnedFile(path: string, contents: string | Buffer, mode = 0
   if (process.platform !== "win32") chmodSync(path, mode);
 }
 
-function safeWindowsPath(systemRoot: string): string {
+export function safeWindowsPath(systemRoot: string): string {
   return [
     join(systemRoot, "System32"),
     join(systemRoot, "System32", "WindowsPowerShell", "v1.0"),
@@ -286,7 +300,7 @@ function resolvePiRuntime(agentDirValue: string, piBinValue: string, expectedVer
   agentDir: string;
   piExecutable: string;
 } {
-  if (expectedVersion !== "1.0.4") throw new Error("Windows native Main acceptance requires public Pi 1.0.4");
+  if (expectedVersion !== "1.1.0") throw new Error("Windows native Main acceptance requires public Pi 1.1.0");
   const agentDir = realpathSync(agentDirValue);
   const packageInfo = JSON.parse(readFileSync(join(agentDir, "package.json"), "utf8")) as {
     name?: string;
@@ -322,6 +336,14 @@ function resolvePiRuntime(agentDirValue: string, piBinValue: string, expectedVer
     throw new Error("Windows Pi executable pin must name its supported public Node CLI entry or package bin directory");
   }
   return { agentDir, piExecutable };
+}
+
+/** The pinned Pi runtime identity resolver shared by the Windows acceptance lanes. */
+export function resolveInstalledPiRuntime(agentDirValue: string, piBinValue: string, expectedVersion: string): {
+  agentDir: string;
+  piExecutable: string;
+} {
+  return resolvePiRuntime(agentDirValue, piBinValue, expectedVersion);
 }
 
 function resolveCandidate(candidateValue: string): { candidateEntry: string; packageRoot: string; mainEntry: string } {
@@ -376,7 +398,11 @@ function locateWindowsPowerShell(systemRoot: string): string {
   return executable;
 }
 
-export function probeWindowsPowerShell(runtime: WindowsRuntimePin, home: string, temporary: string): void {
+export interface WindowsPowerShellPin {
+  readonly powershell: string;
+}
+
+export function probeWindowsPowerShell(runtime: WindowsPowerShellPin, home: string, temporary: string): void {
   const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
   if (!systemRoot) throw new Error("Windows SystemRoot is unavailable for the PowerShell readiness probe");
   const env: NodeJS.ProcessEnv = {
@@ -431,7 +457,7 @@ export function resolveWindowsRuntime(): WindowsRuntimePin {
     ...candidate,
     agentDir,
     piExecutable,
-    version: "1.0.4",
+    version: "1.1.0",
     nodePath: moduleRoots.nodePath,
     pty: moduleRoots.pty,
     ptyModulePath: moduleRoots.ptyModulePath,
@@ -504,17 +530,11 @@ function samePath(left: string, right: string): boolean {
     : left === right;
 }
 
-function rowLabel(line: string): string | undefined {
-  const match = /^\s*[>→] (.*)$/.exec(line);
-  if (!match) return undefined;
-  return match[1]!.replace(/\s+\[(?:AGENT:.*|starting\]|exited.*|error.*|input\]).*$/, "").trim();
-}
-
 function selectedRosterLabel(frame: string): string | undefined {
-  // Main's settled wide layout gives the sidebar its leftmost 32 columns;
-  // do not mistake the right-pane Editor prompt for a selected roster row.
-  return frame.split("\n").slice(1).map((line) => rowLabel(line.slice(0, 32)))
-    .find((label) => label !== undefined);
+  // Main's settled wide layout gives the sidebar its leftmost 32 columns. The
+  // strict roster parser reads the complete title-only card and the ordered
+  // actions, and never mistakes the right-pane Editor prompt for a row.
+  return selectedRosterEntry(frame, 32)?.label;
 }
 
 function workspaceFieldEmpty(frame: string): boolean {
@@ -539,6 +559,10 @@ export interface WindowsOwnedSession {
 interface MainResult {
   readonly status: number;
   readonly threw: boolean;
+  readonly forceAttempted: boolean;
+  readonly journalFailed: boolean;
+  readonly unresolvedSpawns: number;
+  readonly unexitedSpawns: number;
   readonly stdinIsTTY: boolean;
   readonly stdoutIsTTY: boolean;
   readonly sameInputStream: boolean;
@@ -736,12 +760,10 @@ export class WindowsMainPtyDriver {
       providerWatcher.close();
       throw new Error(`public Windows ConPTY spawn failed: ${error instanceof Error ? error.message : "unknown error"}`);
     }
-    if (!Number.isSafeInteger(Number(pty.pid)) || Number(pty.pid) <= 1) {
-      logWatcher.close();
-      nativeWatcher.close();
-      providerWatcher.close();
-      throw new Error("public Windows ConPTY did not return an exact outer process PID");
-    }
+    // Public ConPTY publishes pid asynchronously after its data pipe connects.
+    // Wire the exact returned handle immediately, including failure teardown;
+    // require its positive public PID with the actual welcome frame, not at
+    // synchronous spawn return. No private ready event or guessed PID is used.
     try {
       return new WindowsMainPtyDriver({
         pty,
@@ -851,16 +873,35 @@ export class WindowsMainPtyDriver {
     await this.waitFrame(predicate ?? (() => true), description, before);
   }
 
+  /**
+   * One genuine public reserved-chord press, witnessing the two-step contract:
+   * hidden -> show + focus; visible Main focus -> focus only (no hide/resize);
+   * sidebar-owned focus -> hide to Main. Callers wanting the hide transition
+   * must press again explicitly; two presses are never bundled here.
+   */
   private async toggleSidebar(): Promise<void> {
-    const nextVisible = !this.sidebarVisible;
+    const wasVisible = this.sidebarVisible;
+    const wasMainFocus = this.focus === "main";
     const before = this.frameRevision;
     this.pty.write(WINDOWS_KEYS.f8);
-    this.sidebarVisible = nextVisible;
-    this.focus = nextVisible ? "sidebar" : "main";
-    await this.waitFrame((frame) => nextVisible
-      ? frame.includes("New session") && frame.includes("Quit host")
-      : !frame.includes("New session") && !frame.includes("Quit host"),
-    `public F8 toggles the Main sidebar ${nextVisible ? "visible" : "hidden"}`, before);
+    if (!wasVisible) {
+      this.sidebarVisible = true;
+      this.focus = "sidebar";
+    } else if (wasMainFocus) {
+      this.focus = "sidebar"; // focus only; visibility and native geometry are untouched
+    } else {
+      this.sidebarVisible = false;
+      this.focus = "main";
+    }
+    const expectHidden = wasVisible && !wasMainFocus;
+    await this.waitFrame((frame) => expectHidden
+      ? sidebarRosterHidden(frame, 32)
+      : isSidebarFocusedFrame(frame, 32),
+    `public F8 ${expectHidden
+      ? "hides the sidebar-focused pane and returns Main"
+      : wasVisible
+        ? "focuses the visible sidebar without hiding or resizing it"
+        : "shows and focuses the hidden sidebar"}`, before);
   }
 
   async ensureSidebarFocus(): Promise<void> {
@@ -871,9 +912,11 @@ export class WindowsMainPtyDriver {
         "public Escape cancels an incomplete sidebar form");
       this.focus = "main";
     }
-    if (this.sidebarVisible && this.focus !== "sidebar") await this.toggleSidebar();
-    if (!this.sidebarVisible) await this.toggleSidebar();
+    if (!this.sidebarVisible || this.focus !== "sidebar") await this.toggleSidebar();
     assert.equal(this.focus, "sidebar");
+    assert.equal(this.sidebarVisible, true, "establishing sidebar focus leaves the pane visible");
+    assert.ok(isSidebarFocusedFrame(this.currentText(), 32),
+      "the complete sidebar-only footer proves public sidebar focus");
   }
 
   async moveRosterTo(label: string): Promise<void> {
@@ -1014,7 +1057,7 @@ export class WindowsMainPtyDriver {
     const before = this.frameRevision;
     this.pty.write(WINDOWS_KEYS.enter);
     this.focus = "main";
-    await this.waitFrame((frame) => frame.split("\n")[0]?.includes(`Session host · ${label} ·`) === true,
+    await this.waitFrame((frame) => frameHeaderMatches(frame, label),
       `public Enter explicitly activates native row ${label}`, before);
   }
 
@@ -1052,6 +1095,10 @@ export class WindowsMainPtyDriver {
     const result = JSON.parse(readFileSync(this.resultFile, "utf8")) as MainResult;
     assert.equal(result.threw, false, "public runSessionHost resolved instead of throwing");
     assert.equal(result.status, 0, "public runSessionHost returned zero");
+    assert.equal(result.forceAttempted, false, "no exact owned child public kill was attempted, including throws");
+    assert.equal(result.journalFailed, false, "owned handle observation and metadata writes never failed");
+    assert.equal(result.unresolvedSpawns, 0, "every real owned spawn obtained its exact public PID");
+    assert.equal(result.unexitedSpawns, 0, "every real owned spawn delivered its actual public PTY exit");
     assert.equal(result.stdinIsTTY, true, "actual Main stdin was a TTY");
     assert.equal(result.stdoutIsTTY, true, "actual Main stdout was a TTY");
     assert.equal(result.sameInputStream, true, "Main restored raw mode on the same public stdin stream");
@@ -1127,7 +1174,7 @@ export class WindowsMainPtyDriver {
 }
 
 export interface ObserverStartOptions {
-  readonly runtime: WindowsRuntimePin;
+  readonly runtime: WindowsPowerShellPin;
   readonly root: string;
   readonly rootIdentity: FileIdentity;
   readonly home: string;

@@ -10,7 +10,7 @@ import {
   prepareNativeLaunch,
 } from "./launch";
 import { TerminalSurface } from "./terminal-surface";
-import { isValidNativeSessionId, isValidRenameName, type SessionHostNativeSession } from "./protocol";
+import { hasCompleteSessionIdle, isValidNativeSessionId, isValidRenameName, type SessionHostNativeSession } from "./protocol";
 import { isSavedSessionAdmission, type OwnedLiveSession, type SavedSessionAdmission } from "./saved-sessions";
 import type { StatusRenameRequest, StatusRenameResult, StatusShutdownResult } from "./broker";
 
@@ -51,9 +51,9 @@ import type { StatusRenameRequest, StatusRenameResult, StatusShutdownResult } fr
  *   guarded per instance and can never affect another row.
  * - Exit and disconnect are truthful: the lifecycle badge is the actual
  *   owned child state, the exit code comes only from the owned exit event,
- *   and `busy`/`pendingInput` collapse to null on exit or reporter
- *   disconnect (never inferred, never "Idle"), keeping the retained last
- *   frame (queued bytes are flushed before the surface freezes).
+ *   and `busy`/`pendingInput`/owned-work counts collapse to null on exit or
+ *   reporter disconnect (never inferred, never "Idle"/zero), keeping the
+ *   retained last frame (queued bytes are flushed before the surface freezes).
  * - Shutdown and dispose are bounded and owned-scoped: request graceful exit
  *   through the active authenticated public status registration when
  *   available; on POSIX, fall back to SIGTERM and escalate with SIGKILL on the
@@ -85,6 +85,11 @@ import type { StatusRenameRequest, StatusRenameResult, StatusShutdownResult } fr
  *   survives status disconnects; exited and removed rows never block
  *   reopening their saved conversation.
  */
+
+export interface StopInstanceResult {
+	readonly status: "exited" | "confirmation-required" | "unavailable" | "unconfirmed";
+	readonly forced: boolean;
+}
 
 /** Default terminal geometry for newly created instances. */
 export const DEFAULT_INSTANCE_COLS = 80;
@@ -155,6 +160,13 @@ export interface InstanceStatusUpdate {
 	activity: readonly string[];
 	/** Optional canonical native conversation metadata; never transcript or status detail. */
 	nativeSession?: SessionHostNativeSession | null;
+	/**
+	 * Optional bounded owned background-work counts. Omitted by an older
+	 * registrar; absence, null, or any invalid value normalizes to null
+	 * (unknown), never zero. Never a PID/process count.
+	 */
+	backgroundTasks?: number | null;
+	backgroundShells?: number | null;
 }
 
 export interface InstanceStatusHandlers {
@@ -175,7 +187,7 @@ export interface InstanceStatusRegistration {
 	/** Authenticated persisted rename when supported by the current registrar. */
 	rename?(request: StatusRenameRequest): Promise<StatusRenameResult>;
 	/** Authenticated public native shutdown when supported; acceptance is not PTY exit. */
-	shutdown?(): Promise<StatusShutdownResult>;
+	shutdown?(options?: { readonly requireIdle?: boolean }): Promise<StatusShutdownResult>;
 	release(): void;
 }
 
@@ -200,6 +212,12 @@ export interface NativeInstanceView {
 	readonly inputSurface: boolean;
 	/** Last validated native conversation tuple; null means unavailable/unknown. */
 	readonly nativeSession: SessionHostNativeSession | null;
+	/** Retained current binding for exited-row restart only; never revives live command availability. */
+	readonly lastNativeSession?: SessionHostNativeSession;
+	/** Observed owned logical background work (tasks + automatic review); null means unknown, never 0. */
+	readonly backgroundTasks?: number | null;
+	/** Observed owned background shell jobs not yet confirmed settled; null means unknown, never 0. */
+	readonly backgroundShells?: number | null;
 	/** True only while this manager still owns a PTY without a confirmed exit. */
 	readonly hasLiveProcess: boolean;
 	readonly activity: readonly string[];
@@ -271,12 +289,15 @@ interface ManagedInstance {
 	id: string;
 	label: string;
 	nativeSession: SessionHostNativeSession | null;
+	lastNativeSession?: SessionHostNativeSession;
 	workspace: string;
 	agentDir: string;
 	lifecycle: InstanceLifecycle;
 	busy: boolean | null;
 	pendingInput: boolean | null;
 	inputSurface: boolean;
+	backgroundTasks: number | null;
+	backgroundShells: number | null;
 	activity: string[];
 	exitCode?: number;
 	error?: string;
@@ -471,6 +492,18 @@ function boundedActivity(activity: readonly string[] | undefined): string[] {
 	});
 }
 
+/**
+ * Normalizes an observed owned-work count: only a nonnegative safe integer is
+ * real. Absence, null, fractions, negatives, and non-numbers are unknown
+ * (null) — a cleared or unavailable tracker is never reported as zero.
+ */
+function normalizedOwnedCount(value: unknown): number | null {
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+		return null;
+	}
+	return value === 0 ? 0 : value; // normalize -0
+}
+
 function validatedNativeSession(value: unknown): SessionHostNativeSession | null | undefined {
 	if (value === null) return null;
 	if (typeof value !== "object" || value === null) return undefined;
@@ -481,7 +514,11 @@ function validatedNativeSession(value: unknown): SessionHostNativeSession | null
 		|| candidate.name.trim().length === 0 || candidate.name.trim() !== candidate.name
 		|| [...candidate.name].length > 256 || Buffer.byteLength(candidate.name, "utf8") > 1024
 		|| /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(candidate.name)) return undefined;
-	return { sessionId: candidate.sessionId, epoch: candidate.epoch as number, name: candidate.name };
+	return {
+		sessionId: candidate.sessionId, epoch: candidate.epoch as number, name: candidate.name,
+		...(candidate.persistence === "saved" || candidate.persistence === "unsaved" || candidate.persistence === "unknown"
+			? { persistence: candidate.persistence } : {}),
+	};
 }
 
 function validateLabel(label: unknown): string {
@@ -565,6 +602,7 @@ export class InstanceManager {
 				id: record.id,
 				label: record.label,
 				nativeSession: record.nativeSession ? Object.freeze({ ...record.nativeSession }) : null,
+				...(record.lastNativeSession ? { lastNativeSession: Object.freeze({ ...record.lastNativeSession }) } : {}),
 				workspace: record.workspace,
 				agentDir: record.agentDir,
 				lifecycle: record.lifecycle,
@@ -572,6 +610,8 @@ export class InstanceManager {
 				busy: record.busy,
 				pendingInput: record.pendingInput,
 				inputSurface: record.inputSurface,
+				backgroundTasks: record.backgroundTasks,
+				backgroundShells: record.backgroundShells,
 				activity: Object.freeze([...record.activity]),
 			};
 			if (record.exitCode !== undefined) {
@@ -632,6 +672,44 @@ export class InstanceManager {
 		return true;
 	}
 
+	/** Stop ONLY this exact owned row; removal is a separate actual-exit-only operation. */
+	async stop(id: string, options: { readonly confirmed: boolean }): Promise<StopInstanceResult> {
+		const record = this.#records.get(id);
+		if (!record || !record.pty || this.#disposed || this.#stopping) return { status: "unavailable", forced: false };
+		const outcome = (): StopInstanceResult => ({ status: record.ptyExited ? "exited" : "unconfirmed", forced: record.sigkillSent });
+		if (record.ptyExited) return outcome();
+		if (record.stopPromise) { await record.stopPromise; return outcome(); }
+		let alreadyRequested = false;
+		if (options?.confirmed !== true) {
+			if (!hasCompleteSessionIdle(record)) return { status: "confirmation-required", forced: false };
+			const registration = record.registration;
+			if (!registration || record.registrationReleased) return { status: "confirmation-required", forced: false };
+			// Register before the public request, because it may synchronously exit.
+			// This bounded preflight never sends a fallback signal or force attempt.
+			const exit = this.#waitForExit(record, DEFAULT_SHUTDOWN_GRACE_MS);
+			let request: Promise<StatusShutdownResult | undefined>;
+			try {
+				const shutdown = registration.shutdown;
+				if (typeof shutdown !== "function") return { status: "confirmation-required", forced: false };
+				request = Promise.resolve(shutdown.call(registration, { requireIdle: true })).catch(() => undefined);
+			} catch {
+				return { status: "confirmation-required", forced: false };
+			}
+			const first = await Promise.race([
+				request.then((result) => ({ kind: "request" as const, result })),
+				exit.then((exited) => ({ kind: "exit" as const, exited })),
+			]);
+			if (record.ptyExited) return outcome();
+			if (this.#records.get(id) !== record || this.#disposed) return { status: "unavailable", forced: record.sigkillSent };
+			if (first.kind !== "request" || !validShutdownRequest(first.result)) {
+				return { status: "confirmation-required", forced: record.sigkillSent };
+			}
+			alreadyRequested = true;
+		}
+		await this.#gracefulStop(record, DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SHUTDOWN_KILL_MS, alreadyRequested);
+		return outcome();
+	}
+
 	/** Launch one independently owned instance and resolve with its row id. */
 	async create(options: CreateInstanceOptions): Promise<string> {
 		if (this.#disposed || this.#stopping) {
@@ -672,6 +750,8 @@ export class InstanceManager {
 			busy: null,
 			pendingInput: null,
 			inputSurface: false,
+			backgroundTasks: null,
+			backgroundShells: null,
 			activity: [],
 			savedReservation: savedSession !== undefined
 				? { sessionId: savedSession.sessionId, file: savedSession.file }
@@ -924,6 +1004,8 @@ export class InstanceManager {
 			record.busy = null;
 			record.pendingInput = null;
 			record.inputSurface = false;
+			record.backgroundTasks = null;
+			record.backgroundShells = null;
 			record.activity = [];
 			this.#disposeDataListener(record);
 			if (record.pty && !record.ptyExited) {
@@ -1199,6 +1281,8 @@ export class InstanceManager {
 		record.busy = null;
 		record.pendingInput = null;
 		record.inputSurface = false;
+		record.backgroundTasks = null;
+		record.backgroundShells = null;
 		record.activity = [];
 		if (typeof event?.exitCode === "number" && Number.isFinite(event.exitCode)) {
 			record.exitCode = event.exitCode;
@@ -1252,10 +1336,12 @@ export class InstanceManager {
 		record.busy = update && typeof update.busy === "boolean" ? update.busy : null;
 		record.pendingInput = update && typeof update.pendingInput === "boolean" ? update.pendingInput : null;
 		record.inputSurface = update?.inputSurface === true;
+		record.backgroundTasks = normalizedOwnedCount(update?.backgroundTasks);
+		record.backgroundShells = normalizedOwnedCount(update?.backgroundShells);
 		record.activity = boundedActivity(update?.activity);
 		if (Object.prototype.hasOwnProperty.call(update ?? {}, "nativeSession")) {
 			const next = validatedNativeSession(update?.nativeSession);
-			const previous = record.nativeSession;
+			const previous = record.lastNativeSession ?? record.nativeSession;
 			if (next === null) {
 				record.nativeSession = null;
 				record.label = "(session name unavailable)";
@@ -1265,7 +1351,10 @@ export class InstanceManager {
 					record.nativeSession = null;
 					record.label = "(session name unavailable)";
 				} else {
+					// Never forget positive saved evidence for the SAME current binding.
+					if (previous?.sessionId === next.sessionId && previous.persistence === "saved") next.persistence = "saved";
 					record.nativeSession = next;
+					record.lastNativeSession = { ...next };
 					record.label = next.name;
 					// Private duplicate-fencing binding: the CURRENT observed
 					// conversation replaces any older one (native /new or
@@ -1299,6 +1388,8 @@ export class InstanceManager {
 		record.busy = null;
 		record.pendingInput = null;
 		record.inputSurface = false;
+		record.backgroundTasks = null;
+		record.backgroundShells = null;
 		record.activity = [];
 		record.nativeSession = null;
 		record.label = "(session name unavailable)";
@@ -1419,7 +1510,7 @@ export class InstanceManager {
 	 * Releases happen only in the exit handler (confirmed exit) — this routine
 	 * never frees an admission for a child that never settled.
 	 */
-	#gracefulStop(record: ManagedInstance, graceMs: number, killMs: number): Promise<boolean> {
+	#gracefulStop(record: ManagedInstance, graceMs: number, killMs: number, alreadyRequested = false): Promise<boolean> {
 		const pty = record.pty;
 		if (!pty || record.ptyExited) {
 			return Promise.resolve(true);
@@ -1427,12 +1518,12 @@ export class InstanceManager {
 		if (record.stopPromise) {
 			return record.stopPromise;
 		}
-		const stopPromise = this.#runGracefulStop(record, pty, graceMs, killMs);
+		const stopPromise = this.#runGracefulStop(record, pty, graceMs, killMs, alreadyRequested);
 		record.stopPromise = stopPromise;
 		return stopPromise;
 	}
 
-	async #runGracefulStop(record: ManagedInstance, pty: InstancePty, graceMs: number, killMs: number): Promise<boolean> {
+	async #runGracefulStop(record: ManagedInstance, pty: InstancePty, graceMs: number, killMs: number, alreadyRequested = false): Promise<boolean> {
 		// Register the actual-exit waiter before making any public request: a
 		// synchronous PTY exit inside shutdown() must win over its acknowledgement.
 		const graceExit = this.#waitForExit(record, graceMs);
@@ -1446,8 +1537,8 @@ export class InstanceManager {
 			// A broken optional adapter is equivalent to unavailable control.
 		}
 
-		let requested = false;
-		if (registration && requestShutdown) {
+		let requested = alreadyRequested;
+		if (!alreadyRequested && registration && requestShutdown) {
 			let requestTimer: NodeJS.Timeout | undefined;
 			const requestTimeout = this.#shutdownPlatform === "win32" ? undefined : new Promise<{ kind: "request-timeout" }>((resolve) => {
 				// Reserve half of the single grace window for POSIX SIGTERM to

@@ -5,15 +5,14 @@
  * The public node-pty spawn is a strict forwarder: the exact pinned module,
  * original receiver/arguments, and returned IPty handles are preserved. Only
  * public spawn/onExit metadata is journaled; argv, env, credentials, and
- * terminal transcripts are never recorded.
+ * terminal transcripts are never recorded. The shared exact observer fixture
+ * owns that logic so the source-launcher acceptance lane reuses the identical
+ * incarnation/force-proof semantics.
  */
 const fs = require('node:fs');
 const path = require('node:path');
 const { createRequire } = require('node:module');
-
-function appendMetadata(destination, record) {
-  fs.appendFileSync(destination, `${JSON.stringify(record)}\n`, 'utf8');
-}
+const { observePtyModule } = require('./session-host-windows-pty-observer.cjs');
 
 function installPtyObservation(mainEntry, expectedPtyModule, ptyJournal) {
   // Match production's exact lazy createRequire anchor in instances.js.
@@ -28,66 +27,7 @@ function installPtyObservation(mainEntry, expectedPtyModule, ptyJournal) {
     throw new Error('candidate Main and the outer harness do not resolve the same pinned public @lydell/node-pty file');
   }
   const nodePty = require(resolvedPtyModule);
-  if (!nodePty || typeof nodePty.spawn !== 'function') {
-    throw new Error('the pinned public @lydell/node-pty spawn API is unavailable');
-  }
-  const originalSpawn = nodePty.spawn;
-  const ownedHandles = [];
-  let normalMainReturn = false;
-  const observedSpawn = function observedSpawn(...args) {
-    // Preserve the real receiver, exact arguments, spawn errors, and handle.
-    const handle = Reflect.apply(originalSpawn, this, args);
-    const options = args[2];
-    const record = {
-      pid: typeof handle.pid === 'number' ? handle.pid : undefined,
-      cwd: options && typeof options.cwd === 'string' ? options.cwd : undefined,
-    };
-    const owner = { handle, record, exited: false };
-    ownedHandles.push(owner);
-    try {
-      appendMetadata(ptyJournal, { type: 'pty_spawn', ...record });
-      // This is the exact real IPty returned by the public spawn method. The
-      // added listener only journals the public event and never controls it.
-      handle.onExit((event) => {
-        owner.exited = true;
-        try {
-          appendMetadata(ptyJournal, {
-            type: 'pty_exit',
-            ...record,
-            exitCode: event && typeof event.exitCode === 'number' ? event.exitCode : undefined,
-            signal: event && event.signal !== undefined ? event.signal : null,
-          });
-        } catch {
-          // A journal I/O problem cannot alter the actual native child.
-        }
-      });
-    } catch {
-      try { appendMetadata(ptyJournal, { type: 'pty_exit_observation_failed', ...record }); } catch { /* metadata only */ }
-    }
-    return handle;
-  };
-  nodePty.spawn = observedSpawn;
-
-  // A failed runner shutdown gets bounded exact-handle cleanup only. A normal
-  // successful public Main return never reaches this force path. Every attempt
-  // is journaled and uses the same actual public IPty.kill() with no signal.
-  process.on('exit', () => {
-    if (normalMainReturn) return;
-    for (const owner of ownedHandles) {
-      if (owner.exited) continue;
-      try { appendMetadata(ptyJournal, { type: 'pty_force_attempt', ...owner.record }); } catch { /* retain fail-closed result */ }
-      try { owner.handle.kill(); } catch { /* exact owned public PTY only */ }
-    }
-  });
-
-  return {
-    markNormalMainReturn(status, threw) {
-      normalMainReturn = status === 0 && threw === false;
-    },
-    restore() {
-      if (nodePty.spawn === observedSpawn) nodePty.spawn = originalSpawn;
-    },
-  };
+  return observePtyModule(nodePty, ptyJournal);
 }
 
 function writeResult(destination, value) {
@@ -134,6 +74,7 @@ async function main() {
   const result = {
     status,
     threw,
+    ...observation.snapshot(),
     stdinIsTTY: inputStream.isTTY === true,
     stdoutIsTTY: outputStream.isTTY === true,
     sameInputStream: process.stdin === inputStream,

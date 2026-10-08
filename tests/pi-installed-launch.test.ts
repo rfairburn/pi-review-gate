@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import test from "node:test";
 import { resolvePiChildSpawn } from "../src/pi-invocation";
 
-const EXPECTED_PI_VERSION = "1.0.4";
+const EXPECTED_PI_VERSION = "1.1.0";
 const RPC_TIMEOUT_MS = 30_000;
 const CHILD_CLOSE_TIMEOUT_MS = 2_000;
 const TREE_TERM_GRACE_MS = 1_500;
@@ -499,7 +499,7 @@ async function runRegistrationSmoke(
   }
 }
 
-test("fresh Pi 1.0.4 install launches through the resolver and registers the candidate without a provider call", { timeout: 180_000 }, async (t) => {
+test("fresh Pi 1.1.0 install launches through the resolver and registers the candidate without a provider call", { timeout: 180_000 }, async (t) => {
   const runtimeBin = requirePath("PI_REVIEW_GATE_INSTALLED_PI_BIN");
   const agentRoot = requirePath("PI_REVIEW_GATE_INSTALLED_AGENT");
   const candidateEntry = requirePath("PI_REVIEW_GATE_CANDIDATE_ENTRY");
@@ -534,7 +534,7 @@ test("fresh Pi 1.0.4 install launches through the resolver and registers the can
   };
   assert.equal(packageInfo.name, "@earendil-works/pi-coding-agent");
   assert.equal(packageInfo.version, EXPECTED_PI_VERSION,
-    "the installed Pi package itself must be exactly 1.0.4");
+    "the installed Pi package itself must be exactly 1.1.0");
   const runnerTemp = process.env.RUNNER_TEMP || tmpdir();
   const sandbox = await mkdtemp(join(runnerTemp, "prg-installed-pi-smoke-"));
   let preserveSandboxForDiagnosis = false;
@@ -547,7 +547,7 @@ test("fresh Pi 1.0.4 install launches through the resolver and registers the can
     const versionSpec = resolveInstalledPi(["--version"], directEnv);
     assertResolvedEntry(versionSpec, nativeBin!, ["--version"], "fresh npm-installed Pi command");
     const versionOutput = await runVersionCommand(versionSpec, directEnv, sandbox);
-    assert.match(versionOutput, /^(?:pi(?: version)?\s+)?1\.0\.4$/i,
+    assert.match(versionOutput, /^(?:pi(?: version)?\s+)?1\.1\.0$/i,
       `the actual installed pi command must report exact ${EXPECTED_PI_VERSION}, got ${JSON.stringify(versionOutput)}`);
     t.diagnostic(`fresh locked npm install: actual pi command reported ${versionOutput}`);
 

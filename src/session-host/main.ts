@@ -6,6 +6,7 @@ import { ProcessTerminal } from "pi-session-host-tui";
 
 import { createStatusBroker, type StatusBroker } from "./broker";
 import { composeHostFrame, computeHostLayout, type HostFocus, type HostLayout, type RenderedSidebar } from "./compositor";
+import { chooseExitedRestart } from "./exited-restart";
 import { createSessionHostFrameWriter, type SessionHostFrameWriter } from "./frame-writer";
 import { createSessionHostTextField, type SessionHostFieldKeybindings } from "./field-editor";
 import { loadNativeFieldKeybindings, runNativeExternalEditor } from "./form-support";
@@ -22,6 +23,8 @@ import {
 } from "./instances";
 import { resolveNativePi, RUNTIME_ROLE_ENV, EXECUTOR_TOOL_CATALOG_ENV, snapshotNativeEnvironment } from "./launch";
 import { NativeAgentRegistry, type ProfilePreparer } from "./profiles";
+import { isValidNativeSessionId } from "./protocol";
+import type { NativePersistenceReceipt } from "./native-persistence";
 import {
   admitSavedSession,
   listSavedSessions,
@@ -35,11 +38,17 @@ import type { TerminalInputModes } from "./terminal-surface";
 const STARTUP_OPTIONS_HELPER = join("scripts", "session-host-startup-options.cjs");
 const GENERIC_FAILURE_MESSAGE = "Session host could not complete startup or cleanup.";
 const GENERIC_CREATE_FAILURE = "Session could not be started. Check the workspace, then try again.";
+const ROW_RESUME_FAILURE = "This session could not be restarted; the previous row was kept.";
+const ROW_RESUME_DUPLICATE = "This conversation is already restarting";
 const SAVED_UNAVAILABLE = "Saved conversations are unavailable in this host";
 const REMOVE_REFUSED_MESSAGE = "Session not removed; it may be live, unconfirmed, or no longer available.";
 const REMOVE_FAILURE_MESSAGE = "Session was not removed; its state could not be confirmed.";
 const INPUT_DRAIN_MAX_MS = 250;
 const INPUT_DRAIN_IDLE_MS = 50;
+// One bounded readiness deadline for a just-spawned exited-row replacement:
+// PTY spawn is not native readiness, and startup/disconnect uncertainty must
+// fail closed rather than hang the restart forever.
+const ROW_RESUME_READY_DEADLINE_MS = 60_000;
 
 /** Public options for the optional standalone native session host. */
 export interface SessionHostOptions {
@@ -57,7 +66,7 @@ type MainTerminal = Pick<ProcessTerminal,
 >;
 type MainManager = Pick<InstanceManager,
   "list" | "surface" | "write" | "resize" | "hasLiveProcesses" | "create" | "rename" | "closeExited" | "shutdown" | "dispose" | "ownedLiveSessions"
->;
+> & Partial<Pick<InstanceManager, "stop">>;
 type MainObserver = Pick<KeyboardCapabilityObserver, "flags" | "wait" | "dispose" | "feed">;
 type MainWriter = Pick<SessionHostFrameWriter, "start" | "submit" | "close">;
 type MainStdin = EventEmitter & { isTTY?: boolean; readableEnded?: boolean };
@@ -107,6 +116,36 @@ class MainFailure extends Error {
   constructor(readonly phase: "startup-options" | "preflight" | "runtime") {
     super(phase);
   }
+}
+
+type RowResumeReadiness = "ready" | "pending" | "failed";
+
+/**
+ * Readiness of an exited-row replacement child: an owned live process AND a
+ * genuine authenticated CURRENT conversation observed on the manager's live
+ * field. PTY spawn, the retained `lastNativeSession`, an original reservation,
+ * or a launch/name guess are never readiness. `expectedSessionId` is the exact
+ * branded saved admission for a saved restart; a fresh restart leaves it
+ * undefined and accepts any safe new current id. A row with no live process or
+ * a confirmed error/exit can never become ready.
+ */
+function rowResumeReadiness(
+  view: NativeInstanceView | undefined,
+  expectedSessionId: string | undefined,
+): RowResumeReadiness {
+  if (!view) return "failed";
+  if (view.lifecycle === "error") return "failed";
+  // Only a positively dead replacement child is an actual exit; missing or
+  // unknown liveness is never accepted as one.
+  if (view.lifecycle === "exited" && view.hasLiveProcess === false) return "failed";
+  if (view.lifecycle !== "alive" || view.hasLiveProcess !== true) return "pending";
+  const current = view.nativeSession;
+  if (!current || !isValidNativeSessionId(current.sessionId)
+    || !Number.isSafeInteger(current.epoch) || current.epoch < 1) {
+    return "pending";
+  }
+  if (expectedSessionId !== undefined && current.sessionId !== expectedSessionId) return "failed";
+  return "ready";
 }
 
 function snapshotOptions(options: SessionHostOptions): HostSnapshot {
@@ -268,6 +307,8 @@ function toSidebarItem(view: NativeInstanceView): SidebarItem {
     busy: view.busy,
     pendingInput: view.pendingInput,
     inputSurface: view.inputSurface,
+    backgroundTasks: view.backgroundTasks ?? null,
+    backgroundShells: view.backgroundShells ?? null,
     activity: view.activity,
     nativeSession: view.nativeSession,
   };
@@ -379,6 +420,19 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let externalEditorAbort: AbortController | undefined;
   let externalEditorTask: Promise<string | undefined> | undefined;
   const createTasks = new Set<Promise<void>>();
+  const rowStopTasks = new Map<string, Promise<void>>();
+  // Exited-row restart (deliberate Enter): one attempt per old row id, a
+  // per-request mapping for cancellation, and every task promise retained for
+  // shutdown awaiting. The task map is the duplicate fence; the set is not.
+  const rowResumeTasks = new Map<string, { readonly controller: AbortController; spawned: boolean }>();
+  const rowResumeTaskSet = new Set<Promise<void>>();
+  const rowResumeRequests = new Map<number, { readonly oldId: string; readonly controller: AbortController }>();
+  // Exited-row restart native readiness is event-driven only: the manager's
+  // existing onChange callback wakes these waiters (there is no polling, timer
+  // loop, PID scan, or additional terminal owner). Each waiter is registered
+  // for exactly one replacement child id and removed on settlement.
+  const rowReadinessWaiters = new Map<string, Set<(forced: RowResumeReadiness | undefined) => void>>();
+  const deferredRowResumes = new Map<number, { readonly requestId: number; readonly id: string }>();
   const deferredCreates = new Map<number, Extract<SidebarAction, { type: "create" }>>();
   // Deliberate saved-conversation picker (issue 323): the last accepted
   // catalog mints admissions; listing controllers are aborted on dismiss and
@@ -520,9 +574,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             sidebarFrame = sidebar.render(currentLayout.sidebar.cols, currentLayout.sidebar.rows);
           }
         }
-        const header = view
-          ? `Session host · ${view.label} · ${view.lifecycle}`
-          : "Session host";
+        // Title only. Lifecycle, activity and input ownership belong below
+        // session-card titles, never on the active conversation's title line.
+        const header = view ? view.label : "Session host";
         const composed = composeHostFrame(currentLayout, {
           main: mainFrame,
           sidebar: sidebarFrame,
@@ -815,6 +869,358 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     savedOpenTasks.add(task);
   }
 
+  /**
+   * The exact current exited binding of one row, read fresh from the manager:
+   * only an actual confirmed exit with no owned process qualifies. The retained
+   * last-observed native binding is the restart target; a missing persistence
+   * observation is unknown, never assumed unsaved.
+   */
+  function readExitedResumeTarget(id: string):
+    { readonly workspace: string; readonly binding: NativePersistenceReceipt; readonly epoch: number } | undefined {
+    if (!manager) return undefined;
+    let view: NativeInstanceView | undefined;
+    try {
+      view = manager.list().find((candidate) => candidate.id === id);
+    } catch {
+      return undefined;
+    }
+    if (!view || view.lifecycle !== "exited" || view.hasLiveProcess !== false) return undefined;
+    const retained = view.lastNativeSession;
+    if (!retained || !isValidNativeSessionId(retained.sessionId)
+      || !Number.isSafeInteger(retained.epoch) || retained.epoch < 1) return undefined;
+    const persistence = retained.persistence === "saved" || retained.persistence === "unsaved"
+      ? retained.persistence
+      : "unknown";
+    return { workspace: view.workspace, binding: { sessionId: retained.sessionId, persistence }, epoch: retained.epoch };
+  }
+
+  /**
+   * Current manager row for one replacement child. A listing failure is a
+   * readiness failure, never a success and never a poll.
+   */
+  function readReadinessView(id: string): NativeInstanceView | undefined {
+    if (!manager) return undefined;
+    try {
+      return manager.list().find((candidate) => candidate.id === id);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Manager onChange fan-out: wake only the readiness waiters for the changed
+   * row (each re-reads current state), then run the ordinary roster
+   * synchronization. A wake only resolves a promise, so it cannot reenter
+   * this path or the manager callback.
+   */
+  function noteManagerChanged(id: string | undefined): void {
+    if (id !== undefined) {
+      const waiters = rowReadinessWaiters.get(id);
+      if (waiters !== undefined) {
+        for (const notify of [...waiters]) {
+          try { notify(undefined); } catch { /* one readiness waiter never disturbs the roster */ }
+        }
+      }
+    }
+    syncRosterAndSchedule();
+  }
+
+  /** Forced settlement of every outstanding readiness wait (shutdown only). */
+  function settleRowReadinessWaiters(outcome: RowResumeReadiness): void {
+    for (const waiters of [...rowReadinessWaiters.values()]) {
+      for (const notify of [...waiters]) {
+        try { notify(outcome); } catch { /* per-waiter shutdown settlement is best-effort */ }
+      }
+    }
+  }
+
+  /**
+   * Event-driven readiness wait for one just-created replacement child. The
+   * waiter is published BEFORE the current-state check so a readiness change
+   * (even a synchronous one that lands before create() returns) is never lost,
+   * and it is woken by the manager's existing onChange callback. Exactly one
+   * 60s deadline bounds unknown startup; a UI/listing cancellation never
+   * settles it (an already-started child still completes), while shutdown does.
+   * The listener and timer are always removed on settlement.
+   */
+  function awaitRowReadiness(id: string, expectedSessionId: string | undefined): Promise<RowResumeReadiness> {
+    return new Promise<RowResumeReadiness>((resolve) => {
+      let finished = false;
+      let timer: NodeJS.Timeout | undefined;
+      const waiters = rowReadinessWaiters.get(id) ?? new Set<(forced: RowResumeReadiness | undefined) => void>();
+      rowReadinessWaiters.set(id, waiters);
+      function finish(outcome: RowResumeReadiness): void {
+        if (finished) return;
+        finished = true;
+        if (timer !== undefined) {
+          clearTimeout(timer);
+          timer = undefined;
+        }
+        waiters.delete(notify);
+        if (waiters.size === 0) rowReadinessWaiters.delete(id);
+        resolve(outcome);
+      }
+      function notify(forced: RowResumeReadiness | undefined): void {
+        if (finished) return;
+        if (forced !== undefined) {
+          finish(forced);
+          return;
+        }
+        let outcome: RowResumeReadiness;
+        try {
+          outcome = rowResumeReadiness(readReadinessView(id), expectedSessionId);
+        } catch {
+          // A throwing metadata read is a readiness failure, never a leak: the
+          // listener and deadline timer settle through the same path, so no
+          // waiter outlives a failed/aborted evaluation.
+          outcome = "failed";
+        }
+        if (outcome !== "pending") finish(outcome);
+      }
+      waiters.add(notify);
+      if (shutdownRequested) {
+        finish("failed");
+        return;
+      }
+      timer = setTimeout(() => finish("failed"), ROW_RESUME_READY_DEADLINE_MS);
+      notify(undefined);
+    });
+  }
+
+  /**
+   * Deliberate Enter on an exited row (resume-row): restart the EXACT current
+   * retained conversation of that one exited row, never the launch arguments,
+   * the original conversation, or the newest saved file. The old placeholder is
+   * replaced only when a new independently owned child actually became ready;
+   * cancellation never kills a child that already started.
+   */
+  function launchRowResume(requestId: number, id: string): void {
+    if (!manager || !sidebar || shutdownRequested) return;
+    const existing = rowResumeTasks.get(id);
+    if (existing !== undefined) {
+      if (existing.spawned) {
+        // An already-started replacement child is never canceled or duplicated.
+        sidebar.failRowResume(requestId, ROW_RESUME_DUPLICATE);
+        scheduleRedraw();
+        return;
+      }
+      // Pre-spawn duplicate: cancel the earlier read-only attempt; this newer
+      // deliberate request takes over the same old row.
+      try { existing.controller.abort(); } catch { /* abort is best-effort */ }
+    }
+    const controller = new AbortController();
+    const record: { readonly controller: AbortController; spawned: boolean } = { controller, spawned: false };
+    // Register the duplicate fence and the cancellation mapping BEFORE the
+    // task body can call any dependency, so even a synchronously throwing
+    // adapter cannot start a second attempt.
+    rowResumeTasks.set(id, record);
+    rowResumeRequests.set(requestId, { oldId: id, controller });
+    let task!: Promise<void>;
+    task = (async () => {
+      await Promise.resolve();
+      try {
+        await runRowResume(record, requestId, id);
+      } finally {
+        if (rowResumeTasks.get(id) === record) rowResumeTasks.delete(id);
+        if (rowResumeRequests.get(requestId)?.controller === controller) rowResumeRequests.delete(requestId);
+        rowResumeTaskSet.delete(task);
+      }
+    })();
+    rowResumeTaskSet.add(task);
+  }
+
+  async function runRowResume(
+    record: { readonly controller: AbortController; spawned: boolean },
+    requestId: number,
+    oldId: string,
+  ): Promise<void> {
+    const owner = manager;
+    const activeSidebar = sidebar;
+    const activePi = pi;
+    if (!owner || !activeSidebar || shutdownRequested) return;
+    const fail = (message: string): void => {
+      if (shutdownRequested || !sidebar) return;
+      sidebar.failRowResume(requestId, message);
+      scheduleRedraw();
+    };
+    const controller = record.controller;
+    // Capture the exact current exited binding before the read-only listing.
+    const before = readExitedResumeTarget(oldId);
+    if (!before) {
+      fail(ROW_RESUME_FAILURE);
+      return;
+    }
+    const agentDir = sessionSetup?.nativeAgentDir;
+    if (typeof agentDir !== "string" || agentDir === ""
+      || !activePi || !activePi.file || !activePi.version) {
+      fail(ROW_RESUME_FAILURE);
+      return;
+    }
+    let catalog: SavedSessionCatalog;
+    try {
+      catalog = await dependencies.listSavedCatalog({
+        agentDir,
+        piExecutable: activePi.file,
+        expectedPiVersion: activePi.version,
+        signal: controller.signal,
+      });
+    } catch {
+      // A canceled listing (navigation, hide, or shutdown) never renders a notice.
+      if (controller.signal.aborted || shutdownRequested || !sidebar) return;
+      sidebar.failRowResume(requestId, ROW_RESUME_FAILURE);
+      scheduleRedraw();
+      return;
+    }
+    if (controller.signal.aborted || shutdownRequested || manager !== owner) return;
+    // Re-read the exited/current binding immediately before any spawn: a row
+    // that rebound or was replaced refuses instead of restarting something else.
+    const after = readExitedResumeTarget(oldId);
+    if (!after || after.binding.sessionId !== before.binding.sessionId || after.epoch !== before.epoch) {
+      fail(ROW_RESUME_FAILURE);
+      return;
+    }
+    const choice = chooseExitedRestart(after.binding, after.workspace, catalog);
+    if (choice.kind === "refused") {
+      fail(ROW_RESUME_FAILURE);
+      return;
+    }
+    let createOptions: CreateInstanceOptions;
+    let expectedSessionId: string | undefined;
+    if (choice.kind === "saved") {
+      let result: SavedSessionAdmissionResult;
+      try {
+        result = admitSavedSession(catalog, choice.row, { ownedLiveSessions: owner.ownedLiveSessions() });
+      } catch {
+        result = { status: "refused", reason: "unknown-row" };
+      }
+      if (result.status === "refused") {
+        fail(savedRefusalNotice(result.reason));
+        return;
+      }
+      // The exact branded admission is passed verbatim; the manager owns the
+      // launch-time file revalidation and known-owned duplicate fence. The
+      // replacement must report exactly this saved conversation to qualify.
+      expectedSessionId = result.admission.sessionId;
+      createOptions = { workspace: result.admission.workspace, savedSession: result.admission };
+    } else {
+      // Positive known-unsaved binding plus an issue-free, safely absent
+      // catalog: a fresh child in the SAME exited owned workspace.
+      createOptions = { workspace: choice.cwd };
+    }
+    if (controller.signal.aborted || shutdownRequested || manager !== owner) return;
+    // The spawn starts here: the per-row map now fences duplicates, and any
+    // later UI/listing cancel must never discard this already-started child.
+    record.spawned = true;
+    let createdId: string;
+    try {
+      createdId = await owner.create(createOptions);
+    } catch (error) {
+      if (shutdownRequested || !sidebar) return;
+      sidebar.failRowResume(requestId,
+        error instanceof Error && error.message.includes("already open in this host")
+          ? "That saved conversation is already open in this host"
+          : ROW_RESUME_FAILURE);
+      syncRosterAndSchedule();
+      return;
+    }
+    // PTY spawn alone is not readiness: the replacement must independently own
+    // a live process AND report a genuine authenticated CURRENT conversation
+    // (exactly the requested saved id for a saved restart) before the old
+    // exited placeholder may be replaced. This wait is event-driven through the
+    // manager's existing onChange callback, bounded by one deadline, and is not
+    // settled by a UI/listing cancellation.
+    const readiness = await awaitRowReadiness(createdId, expectedSessionId);
+    if (readiness !== "ready") {
+      if (shutdownRequested || !sidebar) return;
+      sidebar.failRowResume(requestId, ROW_RESUME_FAILURE);
+      syncRosterAndSchedule();
+      return;
+    }
+    // Only the actual ready success replaces the old exited placeholder. The
+    // replacement completes independently of any UI/listing abort, but the
+    // FULL readiness predicate is revalidated at this final fence: synchronous
+    // status frames can clear or change the current binding (or the saved id)
+    // after the waiter resolved but before this continuation ran.
+    if (shutdownRequested || !sidebar) return;
+    let createdView: NativeInstanceView | undefined;
+    try {
+      createdView = owner.list().find((candidate) => candidate.id === createdId);
+    } catch {
+      createdView = undefined;
+    }
+    let finalReadiness: RowResumeReadiness;
+    try {
+      finalReadiness = rowResumeReadiness(createdView, expectedSessionId);
+    } catch {
+      finalReadiness = "failed";
+    }
+    if (finalReadiness !== "ready") {
+      sidebar.failRowResume(requestId, ROW_RESUME_FAILURE);
+      syncRosterAndSchedule();
+      return;
+    }
+    // Complete the UI before the old placeholder is removed so the synchronous
+    // roster notification cannot invalidate a still-current deliberate intent.
+    syncRosterAndSchedule();
+    // Roster synchronization can synchronously initiate shutdown on a listing
+    // or metadata failure; that fail-closed path must retain the recovery
+    // placeholder instead of completing the restart mid-shutdown.
+    if (shutdownRequested || !sidebar) return;
+    sidebar.completeRowResume(requestId, oldId, createdId);
+    removeExitedRow(oldId, { replaced: true });
+    reconcileLayout(true);
+  }
+
+  function removeExitedRow(id: string, options?: { readonly replaced?: boolean }): void {
+    if (!manager || !sidebar) return;
+    const replacing = options?.replaced === true;
+    if (replacing) sidebar.noteRowReplacement(id);
+    let removed: boolean;
+    try { removed = manager.closeExited(id); }
+    catch {
+      if (replacing) sidebar.clearRowReplacement(id);
+      else { sidebar.showError(REMOVE_FAILURE_MESSAGE); scheduleRedraw(); }
+      return;
+    }
+    if (!removed) {
+      // An already-removed placeholder is tolerated; nothing else is touched.
+      if (replacing) sidebar.clearRowReplacement(id);
+      else { sidebar.showError(REMOVE_REFUSED_MESSAGE); scheduleRedraw(); }
+      return;
+    }
+    removedExitedIds.add(id);
+    if (activeId === id) activeId = undefined;
+    // Actual-exit-only detachment never activates a sibling or loses its owner.
+    syncRosterAndSchedule();
+    reconcileLayout(true);
+  }
+
+  function launchRowStop(id: string, confirmed: boolean): void {
+    if (!manager || !sidebar || rowStopTasks.has(id)) return;
+    const owner = manager;
+    let task!: Promise<void>;
+    task = (async () => {
+      // Publish duplicate fencing before even a synchronously throwing adapter.
+      await Promise.resolve();
+      try {
+        const stop = owner.stop;
+        if (typeof stop !== "function") throw new Error("owned row stop unavailable");
+        const result = await stop.call(owner, id, { confirmed: confirmed === true });
+        if (shutdownRequested || manager !== owner || !sidebar) return;
+        if (result.status === "exited") removeExitedRow(id);
+        else {
+          sidebar.showError(result.status === "confirmation-required"
+            ? "Activity changed or is unknown. Press d again to confirm stopping this session."
+            : REMOVE_REFUSED_MESSAGE);
+          syncRosterAndSchedule();
+        }
+      } catch {
+        if (!shutdownRequested && sidebar) { sidebar.showError(REMOVE_FAILURE_MESSAGE); scheduleRedraw(); }
+      } finally { rowStopTasks.delete(id); }
+    })();
+    rowStopTasks.set(id, task);
+  }
+
   function handleSidebarAction(action: SidebarAction): void {
     if (shutdownRequested) return;
     switch (action.type) {
@@ -875,32 +1281,31 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         );
         return;
       }
-      case "remove": {
-        if (!manager || !sidebar) return;
-        let removed: boolean;
-        try {
-          removed = manager.closeExited(action.id);
-        } catch {
-          sidebar.showError(REMOVE_FAILURE_MESSAGE);
-          scheduleRedraw();
-          return;
+      case "remove":
+        removeExitedRow(action.id);
+        return;
+      case "resume-row":
+        if (negotiationReady) launchRowResume(action.requestId, action.id);
+        else deferredRowResumes.set(action.requestId, { requestId: action.requestId, id: action.id });
+        scheduleRedraw();
+        return;
+      case "resume-row-cancel": {
+        deferredRowResumes.delete(action.requestId);
+        const pending = rowResumeRequests.get(action.requestId);
+        if (pending === undefined) return;
+        rowResumeRequests.delete(action.requestId);
+        try { pending.controller.abort(); } catch { /* abort is best-effort */ }
+        const record = rowResumeTasks.get(pending.oldId);
+        if (record !== undefined && record.controller === pending.controller && !record.spawned) {
+          // Pre-spawn cancellation releases the duplicate fence so a later
+          // deliberate retry can start; an already-started child is never canceled.
+          rowResumeTasks.delete(pending.oldId);
         }
-        if (!removed) {
-          sidebar.showError(REMOVE_REFUSED_MESSAGE);
-          scheduleRedraw();
-          return;
-        }
-        removedExitedIds.add(action.id);
-        if (activeId === action.id) {
-          activeId = undefined;
-        }
-        // closeExited may synchronously notify after detaching the row. Sync
-        // again here so even managers without a callback redraw the picker;
-        // the tombstone filters any later stale snapshot of this id.
-        syncRosterAndSchedule();
-        reconcileLayout(true);
         return;
       }
+      case "stop-remove":
+        launchRowStop(action.id, action.confirmed);
+        return;
       case "saved-list": {
         if (!manager || !sidebar || !pi || !sessionSetup) return;
         const agentDir = sessionSetup.nativeAgentDir;
@@ -980,6 +1385,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     shutdownRequested = true;
     deferredCreates.clear();
     deferredSavedOpens.clear();
+    deferredRowResumes.clear();
+    // Abort every outstanding restart listing; a started child is never killed.
+    for (const record of rowResumeTasks.values()) {
+      try { record.controller.abort(); } catch { /* abort is best-effort */ }
+    }
+    for (const pending of rowResumeRequests.values()) {
+      try { pending.controller.abort(); } catch { /* abort is best-effort */ }
+    }
     // Abort every outstanding saved-conversation listing; late completions of
     // an aborted query never contribute to the UI.
     for (const controller of savedListControllers.values()) {
@@ -1067,7 +1480,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             cleanupFailure = true;
           }
         }
-        await Promise.allSettled([...createTasks, ...savedOpenTasks]);
+        // Native readiness waits are settled before the restart tasks are
+        // awaited: shutdown must never hang for the readiness deadline, and a
+        // pending replacement child is left owned and untouched.
+        settleRowReadinessWaiters("failed");
+        await Promise.allSettled([...createTasks, ...savedOpenTasks, ...rowStopTasks.values(), ...rowResumeTaskSet]);
       }
 
       if (manager) {
@@ -1234,7 +1651,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       cols: layout.native.cols,
       rows: layout.native.rows,
       getSupportedKeyboardFlags: () => terminal?.kittyProtocolActive ? observedFlags & 7 : 0,
-      onChange: () => syncRosterAndSchedule(),
+      onChange: (id) => noteManagerChanged(id),
     });
     writer = createFrameWriter();
 
@@ -1273,6 +1690,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           launchSavedOpen(requestId, pending.file, pending.sessionId);
         }
         deferredSavedOpens.clear();
+        for (const deferred of deferredRowResumes.values()) {
+          launchRowResume(deferred.requestId, deferred.id);
+        }
+        deferredRowResumes.clear();
         syncOuterMouseModes();
         scheduleRedraw();
       }
@@ -1290,6 +1711,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
 
 /** Internal-only injection seam for focused controller tests; not an option on the public API or CLI. */
 export const __test = Object.freeze({
+  /** Pure readiness decision exposed for source regressions (no runtime effect). */
+  rowResumeReadiness: (
+    view: NativeInstanceView | undefined,
+    expectedSessionId: string | undefined,
+  ): "ready" | "pending" | "failed" => rowResumeReadiness(view, expectedSessionId),
   runWithDependencies(options: SessionHostOptions, overrides: Partial<MainDependencies>): Promise<number> {
     let snapshot: HostSnapshot;
     try {

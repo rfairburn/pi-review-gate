@@ -2,13 +2,14 @@
 #
 # This workflow is deliberately separate from ci.yml: it adds a read-only
 # windows-latest acceptance job (pull requests, pushes to main, and manual
-# dispatch) that runs the opt-in real public Main/ConPTY test plus the focused
-# named-pipe broker/reporter/protocol component tests and the pure Windows
-# helper-contract regressions. It never publishes, merges, or deploys; it
-# grants no write permission anywhere; and it changes nothing in the ordinary
-# CI or release policy. Under the opt-in gate every missing prerequisite
-# (pinned Pi runtime, ConPTY/node-pty, PowerShell) is a hard failure, never a
-# skip, on every enforced trigger path.
+# dispatch) that runs the opt-in real public Main/ConPTY test, the opt-in real
+# source-launcher acceptance for BOTH shipped Windows wrappers, plus the
+# focused named-pipe broker/reporter/protocol component tests and the pure
+# Windows helper-contract regressions. It never publishes, merges, or deploys;
+# it grants no write permission anywhere; and it changes nothing in the
+# ordinary CI or release policy. Under the opt-in gate every missing
+# prerequisite (pinned Pi runtime, ConPTY/node-pty, PowerShell, Python 3) is a
+# hard failure, never a skip, on every enforced trigger path.
 
 name: Session host alpha (Windows)
 
@@ -38,8 +39,10 @@ jobs:
     name: Windows session host alpha (Node ${{ matrix.node-version }})
     runs-on: windows-latest
     # Finite job budget: the opt-in Main acceptance is bounded by its own
-    # 6-minute test timeout inside the 10-minute step cap below.
-    timeout-minutes: 30
+    # 6-minute test timeout inside its 10-minute step cap, and the real source
+    # launcher acceptance has its own 20-minute step cap containing two cold
+    # wrapper runs (each with a 9-minute enforced leg deadline).
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -72,10 +75,12 @@ jobs:
           if ([string]::IsNullOrEmpty($alpha) -or -not [System.IO.Path]::IsPathRooted($alpha)) { throw "create-root did not return an absolute fresh root" }
           New-Item -ItemType Directory -Path (Join-Path $alpha "pi-ui-runtime") | Out-Null
           New-Item -ItemType Directory -Path (Join-Path $alpha "candidate") | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $alpha "source") | Out-Null
           [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PRG_ALPHA_PI_RUNTIME=$(Join-Path $alpha 'pi-ui-runtime')`n")
           [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PRG_ALPHA_CANDIDATE=$(Join-Path $alpha 'candidate')`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PRG_ALPHA_SOURCE_FIXTURE=$(Join-Path $alpha 'source')`n")
       - name: Install pinned Pi UI runtime (fresh runner-temp root)
-        # Test-only locked install of exact public Pi 1.0.4 into the fresh
+        # Test-only locked install of exact public Pi 1.1.0 into the fresh
         # exclusive child root; --ignore-scripts keeps the install declarative
         # and the exit code propagates for real.
         timeout-minutes: 8
@@ -101,6 +106,30 @@ jobs:
         run: |
           node scripts/ci/session-host-windows-acceptance.cjs copy-scripts scripts "$env:PRG_ALPHA_CANDIDATE\scripts"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Create fresh complete source fixture (bounded copier, no dist or node_modules)
+        # The bounded copy-source copier stages only the exact production build
+        # inputs (package.json, package-lock.json, tsconfig.json, src, scripts,
+        # and skills) into the fresh exclusive runner-temp root. tests, dist,
+        # node_modules, .git, and private work notes are never copied, so the
+        # real source launcher step below must perform its own locked install
+        # and build rather than reusing any prebuilt output.
+        run: |
+          if (Test-Path -LiteralPath (Join-Path $env:PRG_ALPHA_SOURCE_FIXTURE "dist")) { throw "the fresh source fixture must never contain dist" }
+          if (Test-Path -LiteralPath (Join-Path $env:PRG_ALPHA_SOURCE_FIXTURE "node_modules")) { throw "the fresh source fixture must never contain node_modules" }
+          node scripts/ci/session-host-windows-acceptance.cjs copy-source . "$env:PRG_ALPHA_SOURCE_FIXTURE"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify the Python 3 prerequisite for real DDGS provisioning
+        # The real launcher runs its own bounded ensureDdgs provisioning; this
+        # asserts the honest prerequisite (an isolated-mode Python 3.9+ on
+        # PATH) up front and pins its absolute interpreter for the launcher
+        # environment. No DDGS or build stub is installed.
+        timeout-minutes: 2
+        run: |
+          $python = (Get-Command python.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+          if ([string]::IsNullOrEmpty($python) -or -not [System.IO.Path]::IsPathRooted($python)) { throw "the Windows alpha launcher acceptance requires Python 3.9 or newer on PATH" }
+          & $python -I -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)"
+          if ($LASTEXITCODE -ne 0) { throw "the pinned Python interpreter is older than Python 3.9" }
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PI_REVIEW_GATE_LAUNCHER_PYTHON=$python`n")
       - name: Compile test bundle (direct tsc, no clean)
         timeout-minutes: 5
         run: |
@@ -117,10 +146,17 @@ jobs:
           foreach ($required in @($agent, $cli, $entry)) {
             if (-not (Test-Path -LiteralPath $required)) { throw "pinned Windows alpha prerequisite is missing: $required" }
           }
+          foreach ($excluded in @("dist", "node_modules")) {
+            if (Test-Path -LiteralPath (Join-Path $env:PRG_ALPHA_SOURCE_FIXTURE $excluded)) { throw "the fresh source fixture must stay free of $excluded" }
+          }
+          foreach ($required in @("package.json", "package-lock.json", "tsconfig.json")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $env:PRG_ALPHA_SOURCE_FIXTURE $required))) { throw "the fresh source fixture is missing $required" }
+          }
           [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PI_REVIEW_GATE_INSTALLED_AGENT=$agent`n")
           [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PI_REVIEW_GATE_INSTALLED_PI_BIN=$cli`n")
-          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PI_REVIEW_GATE_EXPECT_PI_VERSION=1.0.4`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PI_REVIEW_GATE_EXPECT_PI_VERSION=1.1.0`n")
           [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PI_REVIEW_GATE_CANDIDATE_ENTRY=$entry`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PI_REVIEW_GATE_LAUNCHER_SOURCE_ROOT=$env:PRG_ALPHA_SOURCE_FIXTURE`n")
       - name: Named-pipe broker/reporter/protocol component tests
         run: node --test dist-test/tests/session-host-broker.test.js dist-test/tests/session-host-reporter.test.js
       - name: Pure Windows helper-contract tests
@@ -138,3 +174,16 @@ jobs:
         env:
           PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"
         run: node --test dist-test/tests/session-host-native-windows-main.test.js
+      - name: Real source launcher acceptance (cmd and direct PowerShell, opt-in, fail-closed)
+        # Exercises BOTH real shipped source wrappers through the real staged,
+        # lockfile-exact, script-free install and build, at least one real
+        # native Pi child, and public graceful shutdown with exact owned exits.
+        # The direct compiled-Main test above remains independently required;
+        # this step is not a help/fake/DI substitute. Its own 20-minute cap
+        # contains both cold wrapper legs, each with a 9-minute enforced test
+        # deadline; PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST=1 makes every
+        # missing Pi/Python/PowerShell prerequisite a hard failure.
+        timeout-minutes: 20
+        env:
+          PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"
+        run: node --test dist-test/tests/session-host-launcher-windows-acceptance.test.js

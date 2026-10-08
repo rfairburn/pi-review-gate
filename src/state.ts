@@ -139,6 +139,12 @@ export interface ReviewGateState {
   pendingAcceptedReviewerQuestions: AcceptedReviewerQuestion[];
   reviewsPaused: boolean;
   reviewInProgress: boolean;
+  /**
+   * Runtime-only exact ownership token of the active automatic review run
+   * (native session cards). Never persisted or restored; it is released with
+   * exactly its own run and a reset cannot release a newer incarnation's run.
+   */
+  reviewActivityToken?: string;
   queuedUserInputsDuringReview: string[];
   pendingModelDeliveries: PendingModelDelivery[];
   /**

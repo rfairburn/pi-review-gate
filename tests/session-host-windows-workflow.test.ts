@@ -138,11 +138,16 @@ test("alpha runtime is bounded by independent job and step timeouts", () => {
   const job = jobBlock(source);
   const jobCap = job.match(/^    timeout-minutes: (\d+)\s*$/m);
   assert.ok(jobCap, "the acceptance job must carry an active, job-scoped cap");
-  assert.ok(Number(jobCap![1]) <= 30, "the job cap must stay finite and bounded");
+  assert.ok(Number(jobCap![1]) <= 45,
+    "the job cap must accommodate two cold real wrapper builds plus the direct Main lane while staying finite");
   const mainStep = stepOf(job, "Real public Windows ConPTY Main acceptance (opt-in, fail-closed)");
   const stepCap = mainStep.match(/^        timeout-minutes: (\d+)\s*$/m);
   assert.ok(stepCap, "the opt-in Main acceptance step must carry its own active cap");
   assert.ok(Number(stepCap![1]) <= 10, "the Main acceptance step cap must stay below the job budget");
+  const launcherStep = stepOf(job, "Real source launcher acceptance (cmd and direct PowerShell, opt-in, fail-closed)");
+  const launcherCap = launcherStep.match(/^        timeout-minutes: (\d+)\s*$/m);
+  assert.ok(launcherCap, "the real source launcher acceptance step must carry its own active cap");
+  assert.ok(Number(launcherCap![1]) <= 20, "the source launcher step cap must stay below the job budget");
   assert.doesNotMatch(source, /continue-on-error/, "no step may tolerate failure: missing prerequisites fail loudly");
 });
 
@@ -279,13 +284,13 @@ test("alpha installs the locked Pi UI runtime with real exit propagation", () =>
   const manifest = JSON.parse(readFileSync(join(projectRoot, "scripts", "ci", "pi-ui-runtime", "package.json"), "utf8")) as {
     dependencies?: Record<string, string>;
   };
-  assert.equal(manifest.dependencies?.["@earendil-works/pi-coding-agent"], "1.0.4",
-    "the UI runtime must be pinned to exact Pi 1.0.4 in the canonical manifest");
+  assert.equal(manifest.dependencies?.["@earendil-works/pi-coding-agent"], "1.1.0",
+    "the UI runtime must be pinned to exact Pi 1.1.0 in the canonical manifest");
   const lock = JSON.parse(readFileSync(join(projectRoot, "scripts", "ci", "pi-ui-runtime", "package-lock.json"), "utf8")) as {
     packages?: Record<string, { version?: string }>;
   };
-  assert.equal(lock.packages?.["node_modules/@earendil-works/pi-coding-agent"]?.version, "1.0.4",
-    "the lock must freeze exact Pi 1.0.4, not a drifted version");
+  assert.equal(lock.packages?.["node_modules/@earendil-works/pi-coding-agent"]?.version, "1.1.0",
+    "the lock must freeze exact Pi 1.1.0, not a drifted version");
 });
 
 test("alpha root dependency install is lockfile-exact, script-free, and bounded", () => {
@@ -320,8 +325,8 @@ test("alpha exports the pinned agent, canonical JS CLI, and staged candidate ent
     "the harness must receive the explicit installed agent root");
   assert.match(exportStep, /PI_REVIEW_GATE_INSTALLED_PI_BIN=\$cli/,
     "the harness must receive the canonical CLI pin");
-  assert.match(exportStep, /PI_REVIEW_GATE_EXPECT_PI_VERSION=1\.0\.4/,
-    "the acceptance must assert exact Pi 1.0.4");
+  assert.match(exportStep, /PI_REVIEW_GATE_EXPECT_PI_VERSION=1\.1\.0/,
+    "the acceptance must assert exact Pi 1.1.0");
   assert.match(exportStep, /Join-Path \$env:PRG_ALPHA_CANDIDATE "dist\\src\\index\.js"/,
     "the candidate entry must be the staged scratch build");
   assert.match(exportStep, /PI_REVIEW_GATE_CANDIDATE_ENTRY=\$entry/,
@@ -363,6 +368,12 @@ test("alpha compiles tests directly and runs only explicit focused test files", 
   assert.match(mainStep, /PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"/,
     "missing Pi/ConPTY/PowerShell prerequisites must hard-fail, never skip");
 
+  const launcherStep = stepOf(job, "Real source launcher acceptance (cmd and direct PowerShell, opt-in, fail-closed)");
+  assert.match(launcherStep, /node --test dist-test\/tests\/session-host-launcher-windows-acceptance\.test\.js/,
+    "the real source launcher acceptance must run as an explicit compiled file");
+  assert.match(launcherStep, /PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"/,
+    "the launcher acceptance must hard-fail on missing Windows prerequisites, never skip");
+
   const source = readAlpha();
   assert.doesNotMatch(source, /dist-test\/tests\/\*\.test\.js/,
     "the alpha matrix must stay focused; the broad suite glob belongs to ordinary CI");
@@ -370,6 +381,78 @@ test("alpha compiles tests directly and runs only explicit focused test files", 
     assert.doesNotMatch(line, /npm (?:run )?test(?![\w:-])/, `unsafe test command: ${line.trim()}`);
     assert.doesNotMatch(line, /npm run build(?![\w:-])/, "CI must not rebuild live dist");
   }
+});
+
+test("alpha stages a fresh complete source fixture without dist or node_modules", () => {
+  const source = readAlpha();
+  const job = jobBlock(source);
+  assert.match(source, /PRG_ALPHA_SOURCE_FIXTURE=/, "the alpha must allocate and export a fresh source fixture root");
+  assert.match(source, /PI_REVIEW_GATE_LAUNCHER_SOURCE_ROOT=\$env:PRG_ALPHA_SOURCE_FIXTURE/,
+    "the launcher acceptance must receive the fresh source fixture root explicitly");
+  const copy = stepOf(job, "Create fresh complete source fixture (bounded copier, no dist or node_modules)");
+  assert.match(copy, /node scripts\/ci\/session-host-windows-acceptance\.cjs copy-source \. "\$env:PRG_ALPHA_SOURCE_FIXTURE"/,
+    "the fresh complete source fixture must come from the bounded copy-source copier");
+  assert.match(copy, /if \(\$LASTEXITCODE -ne 0\) \{ exit \$LASTEXITCODE \}/,
+    "the copier exit code must propagate for real");
+  assert.doesNotMatch(copy, /Remove-Item|copy-scripts[\s\S]{0,40}source/,
+    "the source fixture is never cleaned or replaced");
+  const prereq = stepOf(job, "Verify the Python 3 prerequisite for real DDGS provisioning");
+  assert.match(prereq, /Get-Command python\.exe -CommandType Application/, "the real DDGS prerequisite must be an actual Python application");
+  assert.match(prereq, /sys\.version_info >= \(3, 9\)/, "the Python prerequisite must be bounded to 3.9+");
+  assert.match(prereq, /PI_REVIEW_GATE_LAUNCHER_PYTHON=\$python/, "the pinned interpreter must be exported for the launcher environment");
+  assert.doesNotMatch(source, /ddgs==|npm install[\s\S]{0,40}ddgs/i,
+    "no DDGS stub or pre-provisioned dependency may replace the real launcher setup");
+});
+
+test("alpha launcher acceptance exercises both real source wrappers with required Windows failures", () => {
+  const source = readAlpha();
+  const helper = readFileSync(join(projectRoot, "tests", "helpers", "session-host-native-windows-launcher.ts"), "utf8");
+  assert.match(helper, /LAUNCHER_LEGS = \["cmd", "direct-ps"\] as const/,
+    "both the .cmd and direct PowerShell wrappers are exercised");
+  assert.match(helper, /"\/d", "\/s", "\/c", cmdEntry/, "the .cmd leg must go through trusted cmd.exe /d /s /c");
+  assert.match(helper, /"-File", psEntry/, "the direct leg must go through trusted PowerShell -File");
+  assert.match(helper, /LAUNCHER_EXPECT_PI_VERSION = "1\.1\.0"/, "the launcher lane pins exact Pi 1.1.0");
+  assert.match(helper, /LAUNCHER_PTY_VERSION = "1\.2\.0-beta\.15"/, "the lane pins the exact public node-pty version");
+  assert.match(helper, /assertShellSafeArguments/, "unverifiable shell quoting must fail loud instead of being faked");
+
+  const testSource = readFileSync(join(projectRoot, "tests", "session-host-launcher-windows-acceptance.test.ts"), "utf8");
+  assert.match(testSource,
+    /skip: optIn \? false : `\$\{LAUNCHER_REQUIRE_ENV\}=1 is required; this is not Windows host proof`/,
+    "without the opt-in env the lane must skip and say it is not Windows host proof");
+  assert.match(testSource, /resolveLauncherRuntime\(\)/, "the opted-in lane must resolve its pinned runtime before any harness work");
+  assert.match(testSource, /new LegDeadline\(LAUNCHER_BODY_DEADLINE_MS, testSignal\)/,
+    "the leg must carry an explicit enforced deadline linked to the test signal, with cleanup reserved");
+  assert.match(testSource, /driver\.deadline\.assertOpen\("exit observer creation"\)/,
+    "observer creation must be blocked after cancellation");
+  assert.match(testSource, /await driver\.settleSubscriptions\(\);\n\s*deadline\.dispose\(\);/,
+    "subscriptions must always settle in finally even on a cancelled leg");
+  assert.match(testSource, /launcher restoration witnesses reject corrupted options, unrestored raw mode/,
+    "the synthetic restoration negatives must stay in the lane");
+  assert.match(testSource, /leg deadline blocks further input and observer creation after cancellation/,
+    "the synthetic cancellation case must stay in the lane");
+  assert.doesNotMatch(source, /^ *if:/m, "no job or step condition may skip an enforced trigger path");
+
+  const preload = readFileSync(join(projectRoot, "tests", "fixtures", "session-host-windows-launcher-preload.cjs"), "utf8");
+  assert.match(preload, /launcherEntryIsActual/, "the preload must positively identify the actual launcher entry");
+  assert.match(preload, /nativeChildIsActual/, "the preload must positively identify real native children");
+  assert.match(preload, /process\.stdout\.isTTY !== true/, "a piped version probe must never be mistaken for a native child");
+  assert.match(preload, /LAUNCHER_INSTANCES_PATTERN/, "the shared observer must wrap only the production lazy-load anchor");
+  assert.match(preload, /session-host-windows-launcher-restoration/,
+    "restoration must come from the exact-boolean witness module");
+  assert.doesNotMatch(preload, /nodeOptionsPresent/,
+    "a merely-nonempty NODE_OPTIONS check is not restoration evidence");
+  assert.match(preload, /launcher_restoration/, "the launcher must journal its bounded restoration witness");
+
+  const launcherHelper = readFileSync(join(projectRoot, "tests", "helpers", "session-host-native-windows-launcher.ts"), "utf8");
+  assert.match(launcherHelper, /export class LegDeadline/, "the enforced per-leg deadline must be a reusable contract");
+  assert.match(launcherHelper, /export function frameWaitFailure\([\s\S]{0,400}void terminalContent/,
+    "frame-wait diagnostics must be fixed-metadata only and never read terminal content");
+  assert.doesNotMatch(launcherHelper, /frame=\$\{|; frame=/,
+    "no diagnostic may interpolate a terminal frame");
+
+  const harness = readFileSync(join(projectRoot, "tests", "helpers", "session-host-native-windows-harness.ts"), "utf8");
+  assert.match(harness, /Windows native Main acceptance requires public Pi 1\.1\.0/,
+    "the independently required direct Main lane must pin the same exact Pi 1.1.0 fixture");
 });
 
 test("alpha installs no .NET SDK or external toolchain", () => {

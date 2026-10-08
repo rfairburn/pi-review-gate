@@ -6,7 +6,8 @@
  * spawns the Node-based Pi CLI directly with this reporter extension loaded
  * first and the review gate after it (plus the early NODE_OPTIONS preload). It reports
  * top-level session status (busy/idle, pending input presence, modal input
- * surface, generic activity) to the parent session-host process over a local
+ * surface, generic activity, and optional bounded owned background-work
+ * counts) to the parent session-host process over a local
  * stream endpoint (POSIX Unix socket or Windows named pipe) described by the one-shot
  * PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP environment variable.
  *
@@ -28,14 +29,25 @@
  *   questions".
  * - Every failure path degrades to unknown (null) or silence; native
  *   operation, hook results, and UI forwarding are never changed.
+ * - Owned-work counts come only from the process-local owned-activity registry,
+ *   which stays inert without a valid bootstrap. Counts are unknown (null)
+ *   until every expected source has registered and none is uncertain; a
+ *   cleared tracker, a reaped job, or a detached task owner is never published
+ *   as zero. Updates are event-driven: no timer or polling is used.
  * - The setWidget wrapper is restored only when it is still this reporter's
  *   own wrapper; foreign decorators, `this`, arguments, return values, and
  *   errors pass through untouched.
  */
 
 import net from "node:net";
+import { NativePersistenceTracker, parseNativePersistenceReceipt, readNativePersistence, type NativePersistenceReceipt } from "./native-persistence";
 import { timingSafeEqual } from "node:crypto";
 import { extractContext, extractToolName, registerHook, type HookHandler } from "../pi";
+import {
+  activateOwnedActivity,
+  ownedActivitySnapshot,
+  subscribeOwnedActivity,
+} from "./owned-activity";
 import {
   HOST_BOOTSTRAP_ENV,
   MAX_NATIVE_SESSION_NAME_LENGTH,
@@ -44,6 +56,7 @@ import {
   encodeFrame,
   isValidNativeSessionId,
   isValidRenameName,
+  hasCompleteSessionIdle,
   parseBootstrap,
   sanitizeActivityLine,
   type SessionHostBootstrap,
@@ -98,6 +111,7 @@ interface StickyState {
   sequence: number;
   sessionEpoch: number;
   nativeSessionId?: string;
+  nativePersistence?: NativePersistenceReceipt;
   shutdownRequested?: boolean;
   teardown?: () => void;
 }
@@ -221,6 +235,7 @@ function readStickyState(): StickyState | undefined {
     sequence: raw.sequence as number,
     sessionEpoch,
     nativeSessionId,
+    nativePersistence: parseNativePersistenceReceipt(raw.nativePersistence),
     shutdownRequested: raw.shutdownRequested === true,
     teardown: typeof raw.teardown === "function" ? (raw.teardown as () => void) : undefined,
   };
@@ -310,6 +325,7 @@ export function primeReporterBootstrap(): SessionHostBootstrap | undefined {
     sequence: sticky ? sticky.sequence : 0,
     sessionEpoch: sticky?.sessionEpoch ?? 0,
     nativeSessionId: sticky?.nativeSessionId,
+    nativePersistence: sticky?.nativePersistence,
     shutdownRequested: sticky?.shutdownRequested ?? false,
     teardown: sticky?.teardown,
   });
@@ -333,6 +349,11 @@ export async function activate(pi: unknown, options: SessionHostReporterOptions 
   const sticky = readStickyState();
   if (!sticky) return; // No valid bootstrap: register nothing, perform no IO.
 
+  // Opt this native process into owned-activity observation only now, with a
+  // valid authenticated bootstrap confirmed. Without it the registry stays
+  // inert and ordinary standalone runs observe no behavioural change.
+  activateOwnedActivity();
+
   installExitCleanup();
   const reporter = createReporter(pi, sticky, options);
   writeStickyState({
@@ -340,6 +361,7 @@ export async function activate(pi: unknown, options: SessionHostReporterOptions 
     sequence: reporter.sequence,
     sessionEpoch: reporter.sessionEpoch,
     nativeSessionId: reporter.nativeSessionId,
+    nativePersistence: reporter.nativePersistence,
     shutdownRequested: reporter.shutdownRequested,
     teardown: reporter.teardown,
   });
@@ -373,6 +395,7 @@ interface ReporterHandle {
   sequence: number;
   sessionEpoch: number;
   nativeSessionId?: string;
+  nativePersistence?: NativePersistenceReceipt;
   teardown: () => void;
   shutdownRequested: boolean;
 }
@@ -401,9 +424,14 @@ function createReporter(
   let busy: boolean | null = null;
   let pendingInput: boolean | null = null;
   let inputSurface = false;
+  // Process-local owned-work counts. Unknown (null) until the registry is
+  // active and complete; a cleared tracker is never published as zero.
+  let backgroundTasks: number | null = null;
+  let backgroundShells: number | null = null;
   let activity: string[] = [];
   let sessionEpoch = sticky.sessionEpoch;
   let nativeSessionId = sticky.nativeSessionId;
+  const nativePersistenceTracker = new NativePersistenceTracker(sticky.nativePersistence);
   let nativeSession: SessionHostNativeSession | null = null;
   // A committed graceful-shutdown request is terminal for this process,
   // including /reload. The in-flight fence is temporary and is never persisted.
@@ -765,6 +793,8 @@ function createReporter(
       && lastSnapshot.busy === busy
       && lastSnapshot.pendingInput === pendingInput
       && lastSnapshot.inputSurface === inputSurface
+      && (lastSnapshot.backgroundTasks ?? null) === backgroundTasks
+      && (lastSnapshot.backgroundShells ?? null) === backgroundShells
       && lastSnapshot.activity.join("\u0000") === activity.join("\u0000")
       && JSON.stringify(lastSnapshot.nativeSession ?? null) === JSON.stringify(nativeSession)) {
       return; // Unchanged: no new frame.
@@ -778,18 +808,35 @@ function createReporter(
       busy,
       pendingInput,
       inputSurface,
+      backgroundTasks,
+      backgroundShells,
       activity: [...activity],
       nativeSession: nativeSession ? { ...nativeSession } : null,
     };
     lastSnapshot = snapshot;
     snapshotQueued = false;
-    writeStickyState({ bootstrap, sequence, sessionEpoch, nativeSessionId, shutdownRequested, teardown });
+    writeStickyState({ bootstrap, sequence, sessionEpoch, nativeSessionId, nativePersistence: nativePersistenceTracker.snapshot(), shutdownRequested, teardown });
     // While backpressured nothing more is queued: the latest snapshot is
     // retained in lastSnapshot and flushes once on drain.
     if (socket && !connecting && !drainPending) {
       snapshotQueued = tryWriteMessage(snapshot);
     }
   };
+
+  /** Mirror the process-local owned-work snapshot into the next status frame. */
+  const syncOwnedActivity = (): void => {
+    const owned = ownedActivitySnapshot();
+    backgroundTasks = owned.backgroundTasks;
+    backgroundShells = owned.backgroundShells;
+  };
+
+  // Event-driven only: the registry notifies on a real ownership change, so no
+  // timer or polling ever runs. A late reload event is fenced by `active`.
+  const unsubscribeOwnedActivity = subscribeOwnedActivity(() => {
+    if (!active) return;
+    syncOwnedActivity();
+    emit();
+  });
 
   const refreshNativeSession = (
     ctx: unknown,
@@ -811,9 +858,10 @@ function createReporter(
       sessionId: read.sessionId,
       epoch: Math.max(1, sessionEpoch),
       name: read.displayName,
+      persistence: nativePersistenceTracker.observe(read.sessionId, readNativePersistence(ctx, read.sessionId))?.persistence ?? "unknown",
     };
     if (sessionEpoch < 1) sessionEpoch = nativeSession.epoch;
-    writeStickyState({ bootstrap, sequence, sessionEpoch, nativeSessionId, shutdownRequested, teardown });
+    writeStickyState({ bootstrap, sequence, sessionEpoch, nativeSessionId, nativePersistence: nativePersistenceTracker.snapshot(), shutdownRequested, teardown });
     if (emitUpdate) emit();
     return read;
   };
@@ -1089,6 +1137,21 @@ function createReporter(
         return;
       }
 
+      const completelyIdleNow = (): boolean => {
+        const readiness = probeReadiness(ctx);
+        if (!ownsTransport() || currentContext !== ctx) return false;
+        const owned = ownedActivitySnapshot();
+        applyReadiness(readiness);
+        backgroundTasks = owned.backgroundTasks;
+        backgroundShells = owned.backgroundShells;
+        return hasCompleteSessionIdle({ busy, pendingInput, inputSurface, backgroundTasks, backgroundShells });
+      };
+      if (request.requireIdle === true) {
+        const clear = completelyIdleNow();
+        if (!ownsTransport() || currentContext !== ctx) return;
+        if (!clear) { emit(); reject("not-idle"); return; }
+      }
+
       // Commit the terminal fence immediately before invoking the public API.
       // If a post-write check confirms a failure while this exact context,
       // connection, and sticky object are still ours, roll it back; uncertainty
@@ -1097,7 +1160,7 @@ function createReporter(
       const stickyStorage = globalThis as Record<PropertyKey, unknown>;
       const stickyBeforeTerminal = stickyStorage[SESSION_HOST_STICKY_STATE_KEY];
       const terminalStickyState: StickyState = {
-        bootstrap, sequence, sessionEpoch, nativeSessionId, shutdownRequested: true, teardown,
+        bootstrap, sequence, sessionEpoch, nativeSessionId, nativePersistence: nativePersistenceTracker.snapshot(), shutdownRequested: true, teardown,
       };
       shutdownRequested = true;
       const stickyTerminalWritten = writeStickyState(terminalStickyState);
@@ -1111,7 +1174,7 @@ function createReporter(
         }
         if (currentSticky !== terminalStickyState) return false;
         const restoredStickyState: StickyState = {
-          bootstrap, sequence, sessionEpoch, nativeSessionId, shutdownRequested: false, teardown,
+          bootstrap, sequence, sessionEpoch, nativeSessionId, nativePersistence: nativePersistenceTracker.snapshot(), shutdownRequested: false, teardown,
         };
         if (!writeStickyState(restoredStickyState)
           || !ownsTransport()
@@ -1127,6 +1190,14 @@ function createReporter(
       }
       const immediatelyBeforeShutdown = readNativeSession(ctx);
       if (!ownsTransport() || currentContext !== ctx) return;
+      if (request.requireIdle === true) {
+        const clear = completelyIdleNow();
+        if (!ownsTransport() || currentContext !== ctx) return;
+        if (!clear) {
+          if (restoreUninvokedFence()) { emit(); reject("not-idle"); }
+          return;
+        }
+      }
       if (!immediatelyBeforeShutdown
         || immediatelyBeforeShutdown.sessionId !== request.expectedSessionId
         || !nativeSessionMatches(nativeSession, request.expectedSessionId, request.expectedSessionEpoch)) {
@@ -1404,6 +1475,9 @@ function createReporter(
     lastSnapshot = undefined;
     snapshotQueued = false;
     reconnectAttempts = 0;
+    // Process-owned work survives a native session change: read the current
+    // registry snapshot rather than resetting counts to zero.
+    syncOwnedActivity();
     installObserver(ctx);
     refreshNativeSession(ctx, true, false);
     connectSocket();
@@ -1424,11 +1498,20 @@ function createReporter(
     busy = null;
     pendingInput = null;
     inputSurface = false;
+    // Counts are unknown while no reporter incarnation observes them; the
+    // process-local registry keeps its tokens for the next incarnation.
+    backgroundTasks = null;
+    backgroundShells = null;
     activity = [];
     lastSnapshot = undefined;
   };
 
   const teardown = (): void => {
+    try {
+      unsubscribeOwnedActivity();
+    } catch {
+      // Best-effort reader detach; the registry contains listener failures.
+    }
     deactivate();
   };
 
@@ -1562,5 +1645,5 @@ function createReporter(
   registerHook(pi, "session_compact", reprobesReadiness);
   registerHook(pi, "session_compact_failed", reprobesReadiness);
 
-  return { bootstrap, sequence, sessionEpoch, nativeSessionId, teardown, shutdownRequested };
+  return { bootstrap, sequence, sessionEpoch, nativeSessionId, nativePersistence: nativePersistenceTracker.snapshot(), teardown, shutdownRequested };
 }

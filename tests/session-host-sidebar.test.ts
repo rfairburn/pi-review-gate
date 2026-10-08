@@ -137,6 +137,9 @@ function makeRoster(ids: string[], options: SidebarControllerOptions = {}): Rost
   harness.controller.updateItems(ids.map((id) => makeItem({ id })));
   harness.send(togglePacketFor(options)); // show -> focus sidebar
   assert.equal(harness.controller.focus, "sidebar");
+  // Draw the whole small roster once: selection keys only act on entries
+  // the last roster render actually displayed.
+  void harness.controller.render(40, 30);
   harness.baseline = harness.actions.length;
   return harness;
 }
@@ -152,6 +155,7 @@ function formWith(
   });
   harness.controller.updateItems([makeItem({ id: "a" })]);
   harness.send(togglePacketFor(overrides.options ?? {})); // show -> focus sidebar (New default)
+  void harness.controller.render(40, 20); // the New row is displayed before Enter
   harness.send(ENTER); // Enter on New session -> form focus
   assert.equal(harness.controller.focus, "form");
   // Touch the form geometry so every later render is fresh.
@@ -222,7 +226,7 @@ test("constructor opens a usable visible welcome picker", () => {
   // The footer wraps across reserved rows at this width; every hint must
   // survive the wrap, never an ellipsis.
   const footer = texts.join(" ");
-  for (const hint of ["toggle", "enter open", "e edit name", "delete remove exited", "esc hide", "q quit"]) {
+  for (const hint of ["toggle", "enter open", "e edit name", "d stop/remove", "esc hide", "q quit"]) {
     assert.ok(footer.includes(hint), `missing hint ${JSON.stringify(hint)} in ${JSON.stringify(texts)}`);
   }
   assert.ok(!texts.some((line) => line.includes("...")), "no ellipsized hints");
@@ -699,7 +703,7 @@ test("sidebar Delete visibly requests removal using the selected row's stable id
   harness.send(DOWN); // wrap to the exited row
   assert.equal(harness.controller.selectedId, id);
   const texts = rosterView(harness.controller, 40, 10).texts;
-  assert.ok(texts.join(" ").includes("delete remove exited"), JSON.stringify(texts));
+  assert.ok(texts.join(" ").includes("d stop/remove"), JSON.stringify(texts));
   harness.send(DELETE);
   assert.deepEqual(harness.focusedActions(), [{ type: "remove", id }]);
   assert.equal(harness.controller.selectedId, id, "the UI waits for the backend roster confirmation");
@@ -717,8 +721,7 @@ test("a configured Delete toggle keeps its identity and exposes x as the removal
   harness.send(DOWN); // New -> Quit
   harness.send(DOWN); // -> exited row
   const texts = rosterView(harness.controller, 40, 10).texts;
-  assert.ok(texts.join(" ").includes("x remove exited"), JSON.stringify(texts));
-  assert.ok(!texts.join(" ").includes("delete remove exited"));
+  assert.ok(texts.join(" ").includes("d/x stop/remove"), JSON.stringify(texts));
   harness.baseline = harness.actions.length;
   harness.send("x");
   assert.deepEqual(harness.focusedActions(), [{ type: "remove", id }]);
@@ -761,7 +764,7 @@ test("enter on a roster item emits select(id), focuses main, sidebar stays visib
   assert.deepEqual(harness.focusedActions(), [{ type: "select", id: "a" }]);
   assert.equal(harness.controller.focus, "main");
   assert.equal(harness.controller.visible, true); // still composited
-  assert.ok(!rosterView(harness.controller, 40, 10).texts.join(" ").includes("delete remove exited"));
+  assert.ok(!rosterView(harness.controller, 40, 10).texts.join(" ").includes("d stop/remove"));
   // Typing now goes to the main instance, not any other row.
   harness.send("pwd");
   assert.deepEqual(harness.sinceActions(), [
@@ -801,7 +804,8 @@ test("roster items are copied: later mutation of the source never leaks in", () 
   harness.controller.updateItems([mutable]);
   mutable.label = "\x1b]0;evil\x07poison";
   mutable.activity.push("\x1b[31mred");
-  const texts = rosterView(harness.controller).texts;
+  // Tall enough for the complete 5-row card above the highlighted New row.
+  const texts = rosterView(harness.controller, 40, 14).texts;
   assert.ok(texts.some((line) => line.includes("safe")));
   assert.ok(texts.every((text) => !text.includes("poison")));
   assert.ok(texts.every((text) => !text.includes("evil")));
@@ -831,6 +835,10 @@ test("hidden vanished selection reopens the picker until explicit selection", ()
   harness.send(ALT_LEFT_LEGACY); // reopen the picker before selecting a target
   harness.send(DOWN); // cleared selection -> first row
   assert.deepEqual(harness.controller.selectedId, "b");
+  harness.send(ENTER); // hiding forgot the drawn roster: nothing activates unseen
+  assert.equal(harness.controller.focus, "sidebar");
+  assert.ok(!harness.focusedActions().some((action) => action.type === "select"));
+  rosterView(harness.controller); // the reopened picker is drawn
   harness.send(ENTER);
   assert.deepEqual(harness.focusedActions().slice(-1), [{ type: "select", id: "b" }]);
   assert.equal(harness.controller.focus, "main");
@@ -902,6 +910,7 @@ test("owned error process requires confirmation until backend reports exit", () 
     }),
   ]);
   assert.equal(harness.controller.items[0]?.hasLiveProcess, false);
+  rosterView(harness.controller); // the confirmation had replaced the roster
   harness.send(ENTER); // Error without an owned process needs no confirmation.
   assert.deepEqual(harness.focusedActions(), [{ type: "quit" }]);
 });
@@ -992,6 +1001,421 @@ test("confirm ignores Kitty key releases; native Ctrl+C there quits nothing", ()
 });
 
 // ---------------------------------------------------------------------------
+// Stop/remove: d control with complete-idle warning and explicit confirmation
+// ---------------------------------------------------------------------------
+
+/** A live, host-owned row that is completely idle unless overridden. */
+function liveItem(id: string, overrides: Partial<SidebarItem> = {}): SidebarItem {
+  return makeItem({
+    id,
+    lifecycle: "alive",
+    busy: false,
+    pendingInput: false,
+    inputSurface: false,
+    backgroundTasks: 0,
+    backgroundShells: 0,
+    hasLiveProcess: true,
+    ...overrides,
+  });
+}
+
+test("d on a positively idle owned session requests stop-remove without confirmation", () => {
+  const id = "idle-live";
+  const harness = makeRoster([id]);
+  harness.controller.updateItems([liveItem(id)]);
+  harness.controller.select(id);
+  rosterView(harness.controller, 40, 10); // the card is drawn before acting
+  harness.send("d");
+  assert.deepEqual(harness.focusedActions(), [{ type: "stop-remove", id, confirmed: false }]);
+  assert.equal(harness.controller.focus, "sidebar", "observed complete idleness needs no confirmation");
+});
+
+test("d on an active or unknown owned session asks for explicit stop confirmation", () => {
+  const cases: Array<[string, Partial<SidebarItem>]> = [
+    ["busy turn", { busy: true }],
+    ["pending question", { pendingInput: true }],
+    ["modal input surface", { inputSurface: true }],
+    ["background tasks", { backgroundTasks: 1 }],
+    ["background shells", { backgroundShells: 1 }],
+    ["busy unknown", { busy: null }],
+    ["pending input unknown", { pendingInput: null }],
+    ["background counts unknown", { backgroundTasks: null, backgroundShells: null }],
+  ];
+  for (const [name, overrides] of cases) {
+    const id = `live-${name.replace(/\s+/g, "-")}`;
+    const harness = makeRoster([id]);
+    harness.controller.updateItems([liveItem(id, overrides)]);
+    harness.controller.select(id);
+    rosterView(harness.controller, 40, 10);
+    harness.send("d");
+    assert.equal(harness.controller.focus, "confirm", name);
+    assert.deepEqual(harness.focusedActions(), [], `${name}: no stop before confirmation`);
+    const texts = rosterView(harness.controller, 40, 10).texts;
+    assert.ok(texts.some((line) => line.includes("Stop session?")), name);
+    assert.ok(
+      texts.map((line) => line.trimEnd()).join(" ").includes("active turn, questions, background tasks, and shells"),
+      `${name}: the warning names every stopped category`,
+    );
+  }
+});
+
+test("stop confirmation: enter/y confirm the frozen target; n/escape cancel without hiding", () => {
+  // y confirms.
+  {
+    const harness = makeRoster(["a"]);
+    harness.controller.updateItems([liveItem("a", { busy: true })]);
+    harness.controller.select("a");
+    rosterView(harness.controller, 40, 10);
+    harness.send("d");
+    assert.equal(harness.controller.focus, "confirm");
+    rosterView(harness.controller, 40, 10); // the dialog must be displayed before a stop
+    harness.send("y");
+    assert.deepEqual(harness.focusedActions(), [{ type: "stop-remove", id: "a", confirmed: true }]);
+    assert.equal(harness.controller.focus, "sidebar");
+  }
+  // Enter confirms.
+  {
+    const harness = makeRoster(["a"]);
+    harness.controller.updateItems([liveItem("a", { busy: true })]);
+    harness.controller.select("a");
+    rosterView(harness.controller, 40, 10);
+    harness.send("d");
+    assert.equal(harness.controller.focus, "confirm");
+    rosterView(harness.controller, 40, 10); // the dialog must be displayed before a stop
+    harness.send(ENTER);
+    assert.deepEqual(harness.focusedActions(), [{ type: "stop-remove", id: "a", confirmed: true }]);
+    assert.equal(harness.controller.focus, "sidebar");
+  }
+  // n cancels: no lifecycle action, roster and selection preserved.
+  {
+    const harness = makeRoster(["a"]);
+    harness.controller.updateItems([liveItem("a", { busy: true })]);
+    harness.controller.select("a");
+    rosterView(harness.controller, 40, 10);
+    harness.send("d");
+    assert.equal(harness.controller.focus, "confirm");
+    harness.send("n");
+    assert.deepEqual(harness.focusedActions(), []);
+    assert.equal(harness.controller.focus, "sidebar");
+    assert.equal(harness.controller.visible, true, "cancel keeps the pane visible");
+    assert.equal(harness.controller.selectedId, "a", "the highlighted row is preserved");
+  }
+  // Escape cancels the same way and sends no native input.
+  {
+    const harness = makeRoster(["a"]);
+    harness.controller.updateItems([liveItem("a", { busy: true })]);
+    harness.controller.select("a");
+    rosterView(harness.controller, 40, 10);
+    harness.send("d");
+    assert.equal(harness.controller.focus, "confirm");
+    harness.send(ESC);
+    assert.deepEqual(harness.focusedActions(), []);
+    assert.ok(
+      !harness.sinceActions().some((action) => action.type === "forward"),
+      "no native input on cancel",
+    );
+    assert.equal(harness.controller.focus, "sidebar");
+    assert.equal(harness.controller.visible, true);
+  }
+});
+
+test("stop confirmation ignores held repeats and releases", () => {
+  const previous = isKittyProtocolActive();
+  setKittyProtocolActive(true);
+  try {
+    const harness = makeRoster(["a"]);
+    harness.controller.updateItems([liveItem("a", { busy: true })]);
+    harness.controller.select("a");
+    rosterView(harness.controller, 40, 10);
+    harness.send("d");
+    assert.equal(harness.controller.focus, "confirm");
+    rosterView(harness.controller, 40, 10); // the dialog must be displayed before a stop
+    harness.send("\x1b[13;1:2u"); // Enter repeat
+    harness.send("\x1b[13;1:3u"); // Enter release
+    harness.send("\x1b[121;1:2u"); // y repeat
+    harness.send("\x1b[121;1:3u"); // y release
+    assert.deepEqual(harness.focusedActions(), [], "repeats/releases never confirm");
+    assert.equal(harness.controller.focus, "confirm");
+    harness.send("\x1b[121u"); // a deliberate initial Kitty y press confirms
+    assert.deepEqual(harness.focusedActions(), [{ type: "stop-remove", id: "a", confirmed: true }]);
+  } finally {
+    setKittyProtocolActive(previous);
+  }
+});
+
+test("held d, Delete, and reserved-Delete x repeats never stop an idle owned row", () => {
+  const previous = isKittyProtocolActive();
+  setKittyProtocolActive(true);
+  try {
+    // A d repeat on a completely idle row never requests a stop.
+    {
+      const harness = makeRoster(["a"]);
+      harness.controller.updateItems([liveItem("a")]);
+      harness.controller.select("a");
+      rosterView(harness.controller, 40, 10);
+      harness.send("\x1b[100;1:2u"); // d repeat
+      assert.deepEqual(harness.focusedActions(), [], "d repeat never stops");
+      assert.equal(harness.controller.focus, "sidebar");
+      harness.send("d"); // a deliberate initial press requests the stop
+      assert.deepEqual(harness.focusedActions(), [{ type: "stop-remove", id: "a", confirmed: false }]);
+    }
+    // A Delete repeat on a completely idle row never requests a stop.
+    {
+      const harness = makeRoster(["a"]);
+      harness.controller.updateItems([liveItem("a")]);
+      harness.controller.select("a");
+      rosterView(harness.controller, 40, 10);
+      harness.send("\x1b[127;1:2u"); // Delete repeat
+      assert.deepEqual(harness.focusedActions(), [], "Delete repeat never stops");
+      assert.equal(harness.controller.focus, "sidebar");
+      harness.send(DELETE); // a deliberate initial press requests the stop
+      assert.deepEqual(harness.focusedActions(), [{ type: "stop-remove", id: "a", confirmed: false }]);
+    }
+    // A reserved-Delete x repeat on a completely idle row never requests a stop.
+    {
+      const harness = makeController({ toggleKey: "delete", initialVisible: false });
+      harness.controller.updateItems([liveItem("a")]);
+      harness.send(DELETE); // the configured toggle shows the sidebar
+      harness.controller.select("a");
+      rosterView(harness.controller, 40, 10);
+      harness.baseline = harness.actions.length;
+      harness.send("\x1b[120;1:2u"); // x repeat
+      assert.deepEqual(harness.focusedActions(), [], "x repeat never stops");
+      assert.equal(harness.controller.focus, "sidebar");
+      harness.send("x"); // a deliberate initial press requests the stop
+      assert.deepEqual(harness.focusedActions(), [{ type: "stop-remove", id: "a", confirmed: false }]);
+    }
+    // A repeat arriving after a MAIN-to-sidebar focus transfer never acts.
+    {
+      const harness = makeController({ initialVisible: false });
+      harness.controller.updateItems([liveItem("a")]);
+      harness.send(ALT_LEFT_LEGACY); // show -> focus sidebar
+      harness.controller.select("a");
+      rosterView(harness.controller, 40, 10);
+      harness.send(ENTER); // select a -> MAIN focus, sidebar stays visible
+      assert.equal(harness.controller.focus, "main");
+      harness.baseline = harness.actions.length;
+      harness.send("\x1b[100;1:2u"); // the held d repeat is native in MAIN
+      assert.deepEqual(harness.sinceActions(), [{ type: "forward", data: "\x1b[100;1:2u" }]);
+      harness.send(ALT_LEFT_LEGACY); // visible + MAIN: focus the sidebar only
+      assert.equal(harness.controller.focus, "sidebar");
+      harness.send("\x1b[100;1:2u"); // the held repeat now lands in the sidebar
+      assert.deepEqual(harness.focusedActions(), [], "repeat after focus transfer never stops");
+      assert.equal(harness.controller.focus, "sidebar");
+      harness.send("d"); // a deliberate initial press requests the stop
+      assert.deepEqual(harness.focusedActions(), [{ type: "stop-remove", id: "a", confirmed: false }]);
+    }
+  } finally {
+    setKittyProtocolActive(previous);
+  }
+});
+
+test("stop confirmation refuses to confirm until the complete warning is displayed", () => {
+  // A long unbroken title truncates instead of hiding the warning.
+  {
+    const harness = makeRoster(["a"]);
+    harness.controller.updateItems([liveItem("a", { busy: true, label: "T".repeat(60) })]);
+    harness.controller.select("a");
+    rosterView(harness.controller, 40, 10);
+    harness.send("d");
+    assert.equal(harness.controller.focus, "confirm");
+    const texts = rosterView(harness.controller, 40, 10).texts;
+    assert.ok(texts.some((line) => line.includes("Stop session?")), JSON.stringify(texts));
+    assert.ok(
+      texts.map((line) => line.trimEnd()).join(" ").includes("active turn, questions, background tasks, and shells"),
+      "the warning stays visible under a truncated title",
+    );
+    assert.ok(!texts.some((line) => line.includes("too small")));
+    harness.send(ENTER);
+    assert.deepEqual(harness.focusedActions(), [{ type: "stop-remove", id: "a", confirmed: true }]);
+  }
+  // Resize below the dialog's needs: no confirmed stop until it is visible again.
+  {
+    const harness = makeRoster(["a"]);
+    harness.controller.updateItems([liveItem("a", { busy: true })]);
+    harness.controller.select("a");
+    rosterView(harness.controller, 40, 10);
+    harness.send("d");
+    assert.equal(harness.controller.focus, "confirm");
+    const tooSmall = harness.controller.render(32, 5);
+    assert.ok(tooSmall.lines.some((line) => line.includes("too small")));
+    harness.send(ENTER);
+    harness.send("y");
+    assert.deepEqual(harness.focusedActions(), [], "no confirmed stop while the warning is hidden");
+    assert.equal(harness.controller.focus, "confirm", "the dialog stays open");
+    rosterView(harness.controller, 40, 10); // the complete dialog is visible again
+    harness.send(ENTER);
+    assert.deepEqual(harness.focusedActions(), [{ type: "stop-remove", id: "a", confirmed: true }]);
+  }
+  // Cancellation stays available while the warning is hidden.
+  {
+    const harness = makeRoster(["a"]);
+    harness.controller.updateItems([liveItem("a", { busy: true })]);
+    harness.controller.select("a");
+    rosterView(harness.controller, 40, 10);
+    harness.send("d");
+    assert.equal(harness.controller.focus, "confirm");
+    const tooSmall = harness.controller.render(32, 5);
+    assert.ok(tooSmall.lines.some((line) => line.includes("too small")));
+    harness.send("n");
+    assert.deepEqual(harness.focusedActions(), []);
+    assert.equal(harness.controller.focus, "sidebar", "cancel stays available while hidden");
+    assert.equal(harness.controller.visible, true);
+  }
+});
+
+test("stop confirmation targets the frozen id, never a later highlighted row", () => {
+  const harness = makeRoster(["a", "b"]);
+  harness.controller.updateItems([liveItem("a", { busy: true }), liveItem("b", { busy: true })]);
+  harness.controller.select("a");
+  rosterView(harness.controller, 40, 20);
+  harness.send("d");
+  assert.equal(harness.controller.focus, "confirm");
+  harness.controller.select("b"); // a later highlight never retargets
+  rosterView(harness.controller, 40, 20); // the dialog must be displayed before a stop
+  harness.send(ENTER);
+  assert.deepEqual(harness.focusedActions(), [{ type: "stop-remove", id: "a", confirmed: true }]);
+});
+
+test("stop confirmation refuses a vanished or no-longer-live target instead of a sibling", () => {
+  // The target leaves the roster while the confirmation is open.
+  {
+    const harness = makeRoster(["a", "b"]);
+    harness.controller.updateItems([liveItem("a", { busy: true }), liveItem("b", { busy: true })]);
+    harness.controller.select("a");
+    rosterView(harness.controller, 40, 20);
+    harness.send("d");
+    assert.equal(harness.controller.focus, "confirm");
+    harness.controller.updateItems([liveItem("b", { busy: true })]); // a is gone
+    rosterView(harness.controller, 40, 20); // the dialog must be displayed before a stop
+    harness.send(ENTER);
+    assert.deepEqual(harness.focusedActions(), [], "no stop for a vanished target");
+    assert.equal(harness.controller.focus, "sidebar");
+    assert.ok(
+      rosterView(harness.controller, 40, 20).texts.some((line) => line.includes("no longer exists")),
+    );
+  }
+  // The target exits while the confirmation is open.
+  {
+    const harness = makeRoster(["a", "b"]);
+    harness.controller.updateItems([liveItem("a", { busy: true }), liveItem("b", { busy: true })]);
+    harness.controller.select("a");
+    rosterView(harness.controller, 40, 20);
+    harness.send("d");
+    assert.equal(harness.controller.focus, "confirm");
+    harness.controller.updateItems([
+      makeItem({ id: "a", lifecycle: "exited", exitCode: 0, hasLiveProcess: false }),
+      liveItem("b", { busy: true }),
+    ]);
+    rosterView(harness.controller, 40, 20); // the dialog must be displayed before a stop
+    harness.send(ENTER);
+    assert.deepEqual(harness.focusedActions(), [], "no stop for a no-longer-live target");
+    assert.equal(harness.controller.focus, "sidebar");
+    assert.ok(
+      rosterView(harness.controller, 40, 20).texts.some((line) => line.includes("no longer live")),
+    );
+  }
+});
+
+test("d is native input in MAIN focus and removes an exited row immediately", () => {
+  // MAIN focus: d is ordinary native input.
+  const main = makeController({ initialVisible: false });
+  main.send("d");
+  assert.deepEqual(main.actions, [{ type: "forward", data: "d" }]);
+
+  // Exited row: d and Delete emit the existing remove action immediately.
+  const id = "done";
+  const harness = makeRoster([id]);
+  harness.controller.updateItems([
+    makeItem({ id, lifecycle: "exited", exitCode: 0, hasLiveProcess: false }),
+  ]);
+  harness.controller.select(id);
+  rosterView(harness.controller, 40, 10);
+  harness.send("d");
+  assert.deepEqual(harness.focusedActions(), [{ type: "remove", id }]);
+  assert.equal(harness.controller.focus, "sidebar");
+});
+
+test("d refuses with a bounded notice when no process is owned and exit is unconfirmed", () => {
+  for (const lifecycle of ["starting", "alive", "error"] as const) {
+    const harness = makeRoster([lifecycle]);
+    harness.controller.updateItems([
+      makeItem({ id: lifecycle, lifecycle, hasLiveProcess: false }),
+    ]);
+    harness.controller.select(lifecycle);
+    rosterView(harness.controller, 40, 10);
+    harness.send("d");
+    assert.equal(harness.controller.focus, "sidebar", lifecycle);
+    assert.deepEqual(harness.focusedActions(), [], `${lifecycle}: no stop or remove`);
+    assert.ok(
+      rosterView(harness.controller, 40, 10).texts.some((line) => line.includes("No owned process to stop")),
+      lifecycle,
+    );
+  }
+});
+
+test("d on a non-session row is a bounded notice, never an action", () => {
+  const harness = makeRoster(["a"]);
+  // The default highlight is the New session row.
+  harness.send("d");
+  assert.deepEqual(harness.focusedActions(), []);
+  assert.equal(harness.controller.focus, "sidebar");
+  assert.ok(
+    rosterView(harness.controller, 40, 10).texts.some((line) => line.includes("Select a session row to stop or remove")),
+  );
+});
+
+test("hints advertise d stop/remove; Delete stays an alias and x follows a reserved Delete toggle", () => {
+  const harness = makeRoster(["a"]);
+  const texts = rosterView(harness.controller, 40, 10).texts;
+  assert.ok(texts.join(" ").includes("d stop/remove"), JSON.stringify(texts));
+  assert.ok(!texts.join(" ").includes("remove exited"));
+
+  // Delete is the accessible alias: the same confirmation flow as d.
+  harness.controller.updateItems([liveItem("a", { busy: true })]);
+  harness.controller.select("a");
+  rosterView(harness.controller, 40, 10);
+  harness.send(DELETE);
+  assert.equal(harness.controller.focus, "confirm");
+  assert.deepEqual(harness.focusedActions(), []);
+  harness.send("n");
+
+  // With Delete reserved as the toggle, x carries the stop/remove behavior.
+  const reserved = makeController({ toggleKey: "delete", initialVisible: false });
+  reserved.controller.updateItems([liveItem("a", { busy: true })]);
+  reserved.send(DELETE); // the configured toggle shows the sidebar
+  assert.equal(reserved.controller.focus, "sidebar");
+  const reservedTexts = rosterView(reserved.controller, 40, 10).texts;
+  assert.ok(reservedTexts.join(" ").includes("d/x stop/remove"), JSON.stringify(reservedTexts));
+  reserved.send(DOWN); // New session -> Quit host
+  reserved.send(DOWN); // -> the live row
+  rosterView(reserved.controller, 40, 10);
+  reserved.baseline = reserved.actions.length;
+  reserved.send("x");
+  assert.equal(reserved.controller.focus, "confirm");
+  assert.deepEqual(reserved.focusedActions(), []);
+});
+
+test("reserved toggle still hides from stop confirmation and resets the frozen target", () => {
+  const harness = makeRoster(["a"]);
+  harness.controller.updateItems([liveItem("a", { busy: true })]);
+  harness.controller.select("a");
+  rosterView(harness.controller, 40, 10);
+  harness.send("d");
+  assert.equal(harness.controller.focus, "confirm");
+  harness.send(ALT_LEFT_LEGACY); // the reserved toggle hides the pane
+  assert.equal(harness.controller.visible, false);
+  assert.equal(harness.controller.focus, "main");
+  harness.send(ALT_LEFT_LEGACY); // reopen: the roster is back, no pending stop
+  assert.equal(harness.controller.focus, "sidebar");
+  const texts = rosterView(harness.controller, 40, 10).texts;
+  assert.ok(texts.some((line) => line.includes("Sessions (1)")));
+  harness.baseline = harness.actions.length;
+  harness.send(ENTER); // the redrawn roster: Enter selects, never stops
+  assert.deepEqual(harness.focusedActions(), [{ type: "select", id: "a" }]);
+});
+
+// ---------------------------------------------------------------------------
 // Hiding/switching never stops an instance
 // ---------------------------------------------------------------------------
 
@@ -1003,7 +1427,11 @@ test("hide/show/switch emit only visibility; no stop/quit on hide or switch", ()
   harness.send(ENTER); // select a, focus main, sidebar still visible
   assert.equal(harness.controller.visible, true);
   assert.deepEqual(harness.focusedActions(), [{ type: "select", id: "a" }]);
-  harness.send(ALT_LEFT_LEGACY); // toggle hides
+  harness.send(ALT_LEFT_LEGACY); // visible + main: first press only focuses the sidebar
+  assert.equal(harness.controller.focus, "sidebar");
+  assert.equal(harness.controller.visible, true);
+  assert.deepEqual(harness.focusedActions(), [{ type: "select", id: "a" }]);
+  harness.send(ALT_LEFT_LEGACY); // sidebar focused: second press hides
   assert.deepEqual(harness.focusedActions(), [
     { type: "select", id: "a" },
     { type: "visibility", visible: false },
@@ -1075,6 +1503,7 @@ test("create is single-shot, completion closes New without activating the new ro
   assert.equal(harness.controller.selectedId, undefined);
   harness.controller.updateItems([makeItem({ id: "a" }), makeItem({ id: "spawned", lifecycle: "starting", busy: null })]);
   assert.equal(harness.controller.selectedId, "spawned");
+  rosterView(harness.controller, 40, 20); // the updated roster is drawn before Enter
   harness.send(DOWN); // spawned -> Saved conversations
   harness.send(DOWN); // -> New session
   harness.send(ENTER);
@@ -1111,7 +1540,7 @@ test("Edit starts with a separate empty replacement field and emits the observed
   const tuple = { sessionId: "session-123", epoch: 7, name: "Observed title" };
   const harness = makeRoster(["a"]);
   harness.controller.updateItems([makeItem({ id: "a", nativeSession: tuple, label: "stale row label" })]);
-  const rosterText = assertPaneSafe(harness.controller.renderRoster(48, 10).lines, 48, 10).join("\n");
+  const rosterText = assertPaneSafe(harness.controller.renderRoster(48, 14).lines, 48, 14).join("\n");
   assert.ok(rosterText.includes("Observed title"));
   assert.ok(!rosterText.includes("stale row label"), "validated native metadata is authoritative over an old display label");
   harness.send(UP); // New -> Saved conversations
@@ -1381,6 +1810,7 @@ test("reserved toggle hides a form during editing and while creation is pending"
     assert.deepEqual(editing.focusedActions(), [{ type: "visibility", visible: false }]);
     editing.send(packet);
     assert.equal(editing.controller.focus, "sidebar");
+    void editing.controller.render(40, 20); // the reopened roster is drawn
     editing.send(ENTER); // reopen the New session form
     assert.equal(editing.controller.focus, "form");
     assert.ok(assertPaneSafe(editing.controller.render(44, 8).lines, 44, 8).join("\n").includes("draft"));
@@ -1392,6 +1822,7 @@ test("reserved toggle hides a form during editing and while creation is pending"
     pending.send(packet); // abandon UI ownership; do not stop the backend launch
     assert.equal(pending.controller.visible, false);
     pending.send(packet);
+    void pending.controller.render(40, 20); // the reopened roster is drawn
     pending.send(ENTER); // open a newer form
     assert.equal(pending.controller.focus, "form");
     pending.controller.completeCreate(1, "late-row");
@@ -1507,48 +1938,129 @@ test("malicious metadata, error text, and OSC-52-like payloads are neutralized",
   assert.ok(texts.every((line) => !line.includes("third line hidden")));
 });
 
-test("truthful badges: running/idle/unknown plus input observed only when observed", () => {
+/** Index of the card whose title line is exactly `title` (padding trimmed). */
+function cardIndex(texts: string[], title: string): number {
+  const index = texts.findIndex((line) => line.trimEnd() === title);
+  assert.ok(index >= 0, `missing title-only card line ${JSON.stringify(title)} in ${JSON.stringify(texts)}`);
+  return index;
+}
+
+test("truthful card status: observed/unknown agent and input state below the title", () => {
   const harness = makeController({ initialVisible: false });
   harness.send(ALT_LEFT_LEGACY);
   harness.controller.updateItems([
     makeItem({ id: "run", busy: true }),
-    makeItem({ id: "idle", busy: false }),
+    makeItem({ id: "idle", busy: false, backgroundTasks: 0, backgroundShells: 0 }),
     makeItem({ id: "unsure", busy: null }),
     makeItem({ id: "typed", pendingInput: true }),
     makeItem({ id: "surface", inputSurface: true }),
-    makeItem({ id: "quiet" }),
+    makeItem({ id: "quiet", backgroundTasks: 0, backgroundShells: 0 }),
+    makeItem({ id: "unobserved", pendingInput: null }),
     makeItem({ id: "gone", lifecycle: "exited", exitCode: 3, busy: null, pendingInput: null }),
     makeItem({ id: "err", lifecycle: "error", exitCode: 1 }),
     makeItem({ id: "warm", lifecycle: "starting", busy: null }),
   ]);
-  const texts = rosterView(harness.controller, 80, 20).texts;
-  const rowFor = (id: string): string | undefined =>
-    texts.find((line) => line.includes(`label-${id}`));
-  assert.ok(rowFor("run")?.includes("[AGENT: running]"));
-  assert.ok(rowFor("idle")?.includes("[AGENT: idle]"));
-  assert.ok(rowFor("unsure")?.includes("[AGENT: unknown]"));
-  assert.ok(rowFor("typed")?.includes("[input]"));
-  assert.ok(rowFor("surface")?.includes("[input]"));
-  assert.ok(!rowFor("quiet")?.includes("[input]"));
-  assert.ok(rowFor("gone")?.includes("[exited (code 3)]"));
-  assert.ok(rowFor("err")?.includes("[error (code 1)]"));
-  assert.ok(rowFor("warm")?.includes("[starting]"));
-  // No conflation: exited/error rows never claim running or idle.
-  assert.ok(!rowFor("gone")?.includes("[AGENT: running]"));
-  assert.ok(!rowFor("gone")?.includes("[AGENT: idle]"));
-  assert.ok(!rowFor("err")?.includes("[AGENT: running]"));
+  // 10 expanded cards (50 rows) + 3 action rows fit at 80x60.
+  const texts = rosterView(harness.controller, 80, 60).texts;
+  const statusFor = (id: string): string => texts[cardIndex(texts, `label-${id}`) + 1]?.trimEnd() ?? "";
+  assert.equal(statusFor("run"), "  agent running | input none");
+  // Idle requires every activity category and modal input positively known.
+  assert.equal(statusFor("idle"), "  agent idle | input none");
+  assert.equal(statusFor("unsure"), "  agent unknown | input none");
+  assert.equal(statusFor("typed"), "  agent waiting | input pending");
+  assert.equal(statusFor("surface"), "  agent waiting | input pending");
+  assert.equal(statusFor("quiet"), "  agent idle | input none");
+  // Unobserved input (and omitted background counts) is unknown, never idle.
+  assert.equal(statusFor("unobserved"), "  agent unknown | input unknown");
+  // No conflation: exited/error rows never claim agent or input state.
+  assert.equal(statusFor("gone"), "  exited (code 3)");
+  assert.equal(statusFor("err"), "  error (code 1)");
+  assert.equal(statusFor("warm"), "  starting | input none");
 });
 
-test("CJK width rows stay bounded and intact; configured F8 shows in the help", () => {
+test("card title line carries only the sanitized canonical title", () => {
+  const harness = makeRoster(["native", "plain"]);
+  harness.controller.updateItems([
+    makeItem({
+      id: "native",
+      label: "stale label",
+      busy: true,
+      pendingInput: true,
+      nativeSession: { sessionId: "session-123", epoch: 2, name: "Canonical title" },
+    }),
+    makeItem({ id: "plain", label: "\x1b[31mPlain\x1b]0;evil\x07 label", lifecycle: "exited", exitCode: 0 }),
+  ]);
+  harness.controller.select("native");
+  const { texts, lines } = rosterView(harness.controller, 40, 20);
+  // Header, then the selected native card: the title row is the title alone —
+  // no marker, prefix, or status badge — styled only by generated SGR.
+  assert.equal(texts[1]?.trimEnd(), "Canonical title");
+  assert.ok(lines[1]?.startsWith("\x1b[0m\x1b[1;7mCanonical title"), JSON.stringify(lines[1]));
+  assert.equal(texts[2]?.trimEnd(), "> agent running | input pending", "the selection marker lives on the status row");
+  assert.ok(!texts.join("\n").includes("stale label"));
+  // Unselected title: sanitized label only, bold without inverse, no marker.
+  const plain = cardIndex(texts, "Plain label");
+  assert.ok(lines[plain]?.startsWith("\x1b[0m\x1b[1mPlain label"), JSON.stringify(lines[plain]));
+  assert.equal(texts[plain + 1]?.trimEnd(), "  exited (code 0)");
+  assert.ok(texts.every((line) => !line.includes("evil")));
+  for (const title of [texts[1], texts[plain]]) {
+    assert.ok(!/>|\[|agent|input|exited|bg tasks|background/.test(title ?? ""), JSON.stringify(title));
+  }
+});
+
+test("background counts are honest: observed integers shown, anything else unknown", () => {
+  const harness = makeController({ initialVisible: false });
+  harness.send(ALT_LEFT_LEGACY);
+  harness.controller.updateItems([
+    makeItem({ id: "known", label: "Known", backgroundTasks: 2, backgroundShells: 0, activity: ["compiling", "tests"] }),
+    makeItem({ id: "absent", label: "Absent" }),
+    makeItem({ id: "mixed", label: "Mixed", backgroundTasks: null, backgroundShells: 3 }),
+    makeItem({ id: "bogus", label: "Bogus", backgroundTasks: -1, backgroundShells: 1.5 }),
+    makeItem({
+      id: "hostile",
+      label: "Hostile",
+      backgroundTasks: "3" as unknown as number,
+      backgroundShells: Number.MAX_SAFE_INTEGER + 1,
+    }),
+    makeItem({ id: "nonfinite", label: "Nonfinite", backgroundTasks: Number.NaN, backgroundShells: Number.POSITIVE_INFINITY }),
+  ]);
+  harness.controller.select("known");
+  // 6 expanded cards (30 rows) + 3 action rows fit at 40x40.
+  const texts = rosterView(harness.controller, 40, 40).texts;
+  const known = cardIndex(texts, "Known");
+  // Observed background tasks keep the row running, never idle.
+  assert.equal(texts[known + 1]?.trimEnd(), "> agent running | input none");
+  assert.equal(texts[known + 2]?.trimEnd(), "  bg tasks 2 | shells 0", "an observed zero is shown as zero");
+  assert.equal(texts[known + 3]?.trimEnd(), "    compiling");
+  assert.equal(texts[known + 4]?.trimEnd(), "    tests");
+  assert.equal(texts[cardIndex(texts, "Absent") + 2]?.trimEnd(), "  background unknown");
+  assert.equal(texts[cardIndex(texts, "Mixed") + 2]?.trimEnd(), "  bg tasks unknown | shells 3");
+  assert.equal(texts[cardIndex(texts, "Bogus") + 2]?.trimEnd(), "  background unknown");
+  assert.equal(texts[cardIndex(texts, "Hostile") + 2]?.trimEnd(), "  background unknown");
+  assert.equal(texts[cardIndex(texts, "Nonfinite") + 2]?.trimEnd(), "  background unknown");
+  // The stored DTO copy is sanitized the same way: unknown is null, never 0.
+  const items = harness.controller.items;
+  assert.deepEqual(items.map((item) => [item.backgroundTasks, item.backgroundShells]), [
+    [2, 0],
+    [null, null],
+    [null, 3],
+    [null, null],
+    [null, null],
+    [null, null],
+  ]);
+});
+
+test("CJK width cards stay bounded and intact; configured F8 shows in the help", () => {
   const harness = makeRoster(["jp"], { toggleKey: "f8" });
   harness.controller.updateItems([makeItem({ id: "jp", label: "セッション", busy: true })]);
-  const texts = rosterView(harness.controller, 40, 6).texts;
-  assert.ok(texts.some((line) => line.includes("セッション")));
-  assert.ok(texts.some((line) => line.includes("[AGENT: running]")));
+  harness.controller.select("jp");
+  const texts = rosterView(harness.controller, 40, 10).texts;
+  assert.equal(texts[1]?.trimEnd(), "セッション");
+  assert.equal(texts[2]?.trimEnd(), "> agent running | input none");
   assert.ok(texts.some((line) => line.includes("F8 toggle")));
 });
 
-test("32-column roster reserves lifecycle, AGENT, and input status before long labels", () => {
+test("32-column cards bound long titles while the status row stays intact", () => {
   const harness = makeController({ initialVisible: false });
   harness.send(ALT_LEFT_LEGACY);
   harness.controller.updateItems([
@@ -1557,54 +2069,346 @@ test("32-column roster reserves lifecycle, AGENT, and input status before long l
     makeItem({ id: "exited", label: "E".repeat(80), lifecycle: "exited", exitCode: 3 }),
     makeItem({ id: "error", label: "障害".repeat(20), lifecycle: "error", exitCode: 1 }),
   ]);
-  const view = rosterView(harness.controller, 32, 12);
-  assert.ok(view.texts[1]?.includes("[AGENT: running]"));
-  assert.ok(view.texts[1]?.includes("[input]"));
-  assert.ok(view.texts[2]?.includes("セ"));
-  assert.ok(view.texts[2]?.includes("[AGENT: unknown]"));
-  assert.ok(view.texts[2]?.includes("[input]"));
-  assert.ok(view.texts[3]?.includes("[exited (code 3)]"));
-  assert.ok(view.texts[4]?.includes("[error (code 1)]"));
+  // Four expanded cards (rows 1-20) + 3 action rows fit at 32x40.
+  const view = rosterView(harness.controller, 32, 40);
+  assert.ok(view.texts[1]?.startsWith("AAA"));
+  assert.ok(!view.texts[1]?.includes("A".repeat(32)));
+  assert.equal(view.texts[2]?.trimEnd(), "  agent running | input pending");
+  assert.ok(view.texts[6]?.startsWith("セ"));
+  assert.ok(!view.texts[6]?.includes("セッション".repeat(4)));
+  assert.equal(view.texts[7]?.trimEnd(), "  agent waiting | input pending");
+  assert.ok(view.texts[11]?.startsWith("EEE"));
+  assert.equal(view.texts[12]?.trimEnd(), "  exited (code 3)");
+  assert.ok(view.texts[16]?.startsWith("障"));
+  assert.equal(view.texts[17]?.trimEnd(), "  error (code 1)");
+  for (const titleRow of [1, 6, 11, 16]) {
+    assert.ok(!/agent|input|exited|error|>/.test(view.texts[titleRow] ?? ""), JSON.stringify(view.texts[titleRow]));
+  }
   assert.ok(view.texts.every((line) => visibleWidth(line) <= 32));
-  assert.equal(view.lines.length, 12);
-  assert.ok(!view.texts[1]?.includes("A".repeat(20)));
-  assert.ok(!view.texts[2]?.includes("セッション".repeat(3)));
+  assert.equal(view.lines.length, 40);
 });
 
-test("roster scrolls vertically and keeps the keyboard highlight visible", () => {
+test("variable-height scrolling keeps the complete highlighted card visible", () => {
   const harness = makeController({ initialVisible: false });
   harness.controller.updateItems(
     Array.from({ length: 8 }, (_, i) => makeItem({ id: `s${i}` })),
   );
   harness.send(ALT_LEFT_LEGACY); // show -> focus sidebar
   harness.controller.select("s0");
-  // pane 32x7 => header + 4 list rows + footer; labels still fit beside status.
-  const first = rosterView(harness.controller, 32, 7);
-  assert.ok(first.texts[1].includes("> label-s0"));
+  // 32x16 => header + 12 list rows + 3 wrapped footer rows: two whole cards.
+  const first = rosterView(harness.controller, 32, 16);
+  assert.equal(first.texts[1]?.trimEnd(), "label-s0");
+  assert.ok(first.texts[2]?.startsWith("> "));
+  assert.equal(first.texts[6]?.trimEnd(), "label-s1");
+  assert.ok(first.texts.every((line) => !line.includes("label-s2")), "clipped cards are never half-drawn");
   for (let i = 0; i < 5; i += 1) {
-    harness.controller.handleInput(DOWN); // s0 .. s5
+    harness.send(DOWN); // s0 .. s5
   }
-  const scrolled = rosterView(harness.controller, 32, 7);
-  assert.ok(scrolled.texts.some((line) => line.includes("> label-s5")));
+  const scrolled = rosterView(harness.controller, 32, 16);
+  const s5 = cardIndex(scrolled.texts, "label-s5");
+  assert.ok(scrolled.texts[s5 + 1]?.startsWith("> "));
+  assert.ok(s5 + 4 <= 11, "all five rows of the highlighted card sit inside the list area");
   assert.ok(scrolled.texts.every((line) => !line.includes("label-s0")));
-  assert.equal(scrolled.lines.length, 7);
-  harness.controller.handleInput(UP); // back to s4
-  const scrolledBack = rosterView(harness.controller, 32, 7);
-  assert.ok(scrolledBack.texts.some((line) => line.includes("> label-s4")));
+  assert.equal(scrolled.lines.length, 16);
+  harness.send(UP); // back to s4
+  const back = rosterView(harness.controller, 32, 16);
+  assert.equal(back.texts[1]?.trimEnd(), "label-s4");
+  assert.ok(back.texts[2]?.startsWith("> "));
+
+  // Collapsing s4 (3 rows) changes the variable heights; navigating to the
+  // end still keeps each complete highlighted entry in view.
+  harness.send(" ");
+  harness.send(DOWN); // s5
+  harness.send(DOWN); // s6
+  harness.send(DOWN); // s7
+  const tail = rosterView(harness.controller, 32, 16);
+  const s7 = cardIndex(tail.texts, "label-s7");
+  assert.ok(tail.texts[s7 + 1]?.startsWith("> "));
+  assert.ok(s7 + 4 <= 11);
+  harness.send(DOWN); // Saved conversations
+  const saved = rosterView(harness.controller, 32, 16);
+  assert.ok(saved.texts.some((line) => line.startsWith("> Saved conversations")), JSON.stringify(saved.texts));
+  harness.send(DOWN); // New session
+  const fresh = rosterView(harness.controller, 32, 16);
+  assert.ok(fresh.texts.some((line) => line.startsWith("> New session")), JSON.stringify(fresh.texts));
 });
 
-test("selected activity lines render beneath the row, bounded to two", () => {
+test("expanded card activity is generic, sanitized, and bounded to two rows", () => {
   const harness = makeRoster(["a"]);
   harness.controller.updateItems([
-    makeItem({ id: "a", activity: ["one", "two", "three", "four"] }),
+    makeItem({ id: "a", activity: ["one", "\x1b[31mtwo\x07", "three", "four"] }),
   ]);
   harness.controller.select("a");
   const texts = rosterView(harness.controller, 40, 12).texts;
-  assert.ok(texts.some((line) => line.includes("one")));
-  assert.ok(texts.some((line) => line.includes("two")));
+  assert.equal(texts[4]?.trimEnd(), "    one");
+  assert.equal(texts[5]?.trimEnd(), "    two");
   assert.ok(texts.every((line) => !line.includes("three")));
   // Bounded rendering only: the stored DTO keeps everything the backend sent.
   assert.equal(harness.controller.items[0]?.activity.length, 4);
+  // A collapsed card keeps title, status, and background but drops activity:
+  // exactly 3 rows (expanded was 5), so the next entry starts two rows
+  // earlier and no activity row content appears in the card's rows.
+  harness.send(" ");
+  const collapsed = rosterView(harness.controller, 40, 12).texts;
+  assert.equal(collapsed[1]?.trimEnd(), "label-a");
+  assert.ok(collapsed[2]?.startsWith("> agent"), JSON.stringify(collapsed));
+  assert.equal(collapsed[3]?.trimEnd(), "  background unknown");
+  assert.equal(collapsed[4]?.trimEnd(), "  Saved conversations", "the collapsed card is exactly 3 rows, dropping both activity rows");
+});
+
+test("Space toggles only the highlighted card and expansion persists per id", () => {
+  const harness = makeRoster(["a", "b"]);
+  harness.controller.select("a");
+  const view = (): string[] => rosterView(harness.controller, 40, 20).texts;
+  // Default expanded: a = rows 1-5, b = rows 6-10.
+  assert.equal(view()[6]?.trimEnd(), "label-b");
+  harness.send(" "); // collapse a
+  let texts = view();
+  assert.equal(texts[1]?.trimEnd(), "label-a");
+  assert.equal(texts[4]?.trimEnd(), "label-b", "a now occupies 3 rows");
+  harness.send(DOWN); // highlight b: a stays collapsed, b stays expanded
+  texts = view();
+  assert.equal(texts[4]?.trimEnd(), "label-b");
+  assert.ok(texts[5]?.startsWith("> "));
+  assert.equal(texts[9]?.trimEnd(), "  Saved conversations", "b keeps its 5 rows");
+  harness.send(" "); // collapse b only
+  texts = view();
+  assert.equal(texts[7]?.trimEnd(), "  Saved conversations");
+  harness.send(UP); // highlight a: b stays collapsed
+  harness.send(" "); // expand a again
+  texts = view();
+  assert.equal(texts[6]?.trimEnd(), "label-b");
+  assert.equal(texts[9]?.trimEnd(), "  Saved conversations", "b is still collapsed");
+
+  // Metadata updates and reorders keep each card's own state.
+  harness.controller.updateItems([makeItem({ id: "a", busy: true }), makeItem({ id: "b", busy: true })]);
+  texts = view();
+  assert.equal(texts[9]?.trimEnd(), "  Saved conversations");
+  // A row that leaves the roster forgets its state; it returns expanded.
+  harness.controller.updateItems([makeItem({ id: "a" })]);
+  harness.controller.updateItems([makeItem({ id: "a" }), makeItem({ id: "b" })]);
+  texts = view();
+  assert.equal(texts[11]?.trimEnd(), "  Saved conversations");
+
+  // Space never emits actions, ignores held repeats, and is inert on action rows.
+  const previous = isKittyProtocolActive();
+  setKittyProtocolActive(true);
+  try {
+    harness.send("\x1b[32;1:2u"); // Space repeat
+    harness.send("\x1b[32;1:3u"); // Space release
+  } finally {
+    setKittyProtocolActive(previous);
+  }
+  assert.equal(view()[6]?.trimEnd(), "label-b", "repeat/release did not collapse a");
+  harness.send(DOWN);
+  harness.send(DOWN); // Saved conversations
+  harness.send(" ");
+  assert.equal(harness.controller.focus, "sidebar");
+  assert.deepEqual(harness.sinceActions(), []);
+});
+
+test("a card that cannot fit is truthfully too small and selection keys never act invisibly", () => {
+  const tuple = { sessionId: "session-123", epoch: 1, name: "Nine" };
+  const harness = makeRoster(["a"]);
+  harness.controller.updateItems([makeItem({ id: "a", lifecycle: "exited", hasLiveProcess: false, nativeSession: tuple })]);
+  // 40x8 => 4 list rows: the action rows fit, the 5-row card does not.
+  const actions = rosterView(harness.controller, 40, 8).texts;
+  assert.ok(actions.some((line) => line.startsWith("> New session")));
+  assert.ok(actions.every((line) => !line.includes("Nine")));
+  harness.send(UP); // Saved
+  harness.send(UP); // the card: off-screen at the last rendered geometry
+  assert.equal(harness.controller.selectedId, "a");
+  harness.send(ENTER);
+  harness.send("e");
+  harness.send(DELETE);
+  assert.deepEqual(harness.sinceActions(), [], "no select/edit/remove for a target the user cannot see");
+  assert.equal(harness.controller.focus, "sidebar");
+  const tooSmall = harness.controller.render(40, 8);
+  assert.ok(tooSmall.lines.some((line) => line.includes("too small")));
+  assert.ok(tooSmall.lines.every((line) => !line.includes("Nine")));
+  harness.send(ENTER);
+  assert.deepEqual(harness.sinceActions(), []);
+
+  harness.send(" "); // collapse: 3 rows would fit in 4, but nothing is drawn yet
+  harness.send(ENTER);
+  harness.send("e");
+  harness.send(DELETE);
+  assert.deepEqual(harness.sinceActions(), [], "the screen still shows only the too-small message");
+  const fits = rosterView(harness.controller, 40, 8).texts;
+  assert.equal(fits[1]?.trimEnd(), "Nine");
+  assert.ok(fits[2]?.startsWith("> exited"));
+  assert.equal(fits[3]?.trimEnd(), "  background unknown");
+  harness.send(ENTER);
+  assert.deepEqual(harness.sinceActions(), [{ type: "resume-row", requestId: 1, id: "a" }],
+    "a drawn exited card asks the backend to restart that exact row");
+  assert.equal(harness.controller.focus, "sidebar");
+});
+
+test("activation requires the highlighted entry on the last drawn roster at its current height and order", () => {
+  const harness = makeController({ initialVisible: false });
+  harness.controller.updateItems(Array.from({ length: 4 }, (_, i) => makeItem({ id: `s${i}` })));
+  harness.send(ALT_LEFT_LEGACY);
+  harness.controller.select("s0");
+  harness.baseline = harness.actions.length;
+  const selects = (): number => harness.focusedActions().filter((action) => action.type === "select").length;
+
+  // 32x16 => 12 list rows: s0 and s1 are drawn whole, s2 is not drawn.
+  const first = rosterView(harness.controller, 32, 16).texts;
+  assert.ok(first.every((line) => !line.includes("label-s2")));
+  harness.send(DOWN); // s1
+  harness.send(DOWN); // s2 would fit the list area but was never drawn
+  assert.equal(harness.controller.selectedId, "s2");
+  harness.send(ENTER);
+  harness.send("e");
+  harness.send(DELETE);
+  assert.deepEqual(harness.focusedActions(), [], "navigation alone never activates an undrawn target");
+  const drawn = rosterView(harness.controller, 32, 16).texts;
+  assert.equal(drawn[cardIndex(drawn, "label-s2") + 1]?.slice(0, 2), "> ");
+  harness.send(ENTER);
+  assert.equal(selects(), 1);
+  assert.equal(harness.controller.focus, "main");
+
+  // Visible MAIN -> sidebar focus does not change what is drawn.
+  harness.send(ALT_LEFT_LEGACY);
+  assert.equal(harness.controller.focus, "sidebar");
+
+  // A roster reorder after the last render blocks until it is redrawn.
+  harness.controller.updateItems(["s2", "s0", "s1", "s3"].map((id) => makeItem({ id })));
+  harness.send(ENTER);
+  assert.equal(selects(), 1);
+  rosterView(harness.controller, 32, 16);
+  harness.send(ENTER);
+  assert.equal(selects(), 2);
+
+  // An expansion change after the last render blocks until it is redrawn.
+  harness.send(ALT_LEFT_LEGACY); // MAIN -> sidebar focus
+  harness.send(" "); // collapse s2: drawn at 5 rows, now 3
+  harness.send(ENTER);
+  assert.equal(selects(), 2);
+  const collapsed = rosterView(harness.controller, 32, 16).texts;
+  assert.equal(collapsed[1]?.trimEnd(), "label-s2");
+  assert.equal(collapsed[4]?.trimEnd(), "label-s0", "s2 now occupies 3 rows");
+  harness.send(ENTER);
+  assert.equal(selects(), 3);
+});
+
+test("narrow picker overlay forgets a roster previously drawn beside it", () => {
+  const harness = makeRoster(["a"]);
+  harness.send(UP); // New -> Saved conversations
+  harness.send(ENTER);
+  assert.equal(harness.controller.focus, "form");
+
+  // Wide layout draws both panes; narrowing replaces the roster.
+  void harness.controller.renderRoster(32, 20);
+  void harness.controller.renderForm(40, 20);
+  void harness.controller.render(40, 20);
+  harness.baseline = harness.actions.length;
+
+  harness.send(ESC); // dismiss listing, without a roster redraw yet
+  harness.send(ENTER);
+  assert.equal(harness.controller.focus, "sidebar");
+  assert.ok(!harness.sinceActions().some((action) => action.type === "saved-list"));
+
+  void harness.controller.render(40, 20);
+  harness.send(ENTER);
+  assert.equal(harness.controller.focus, "form");
+  assert.equal(harness.sinceActions().filter((action) => action.type === "saved-list").length, 1);
+});
+
+test("wide layout keeps the roster beside a form actionable after the form closes", () => {
+  const harness = makeRoster(["a"]);
+  harness.send(UP); // New -> Saved conversations
+  harness.send(ENTER);
+  assert.equal(harness.controller.focus, "form");
+  // Wide layout only: the roster stays drawn beside the picker.
+  void harness.controller.renderRoster(32, 20);
+  void harness.controller.renderForm(40, 20);
+  harness.baseline = harness.actions.length;
+  harness.send(ESC);
+  assert.equal(harness.controller.focus, "sidebar");
+  harness.send(ENTER); // the Saved row was visibly drawn beside the picker
+  assert.equal(harness.controller.focus, "form");
+  assert.equal(harness.sinceActions().filter((action) => action.type === "saved-list").length, 1);
+});
+
+test("reserved shortcut: hidden shows, visible MAIN focuses sidebar, sidebar focus hides", () => {
+  for (const options of [{}, { toggleKey: "f8" }] as const) {
+    const packet = togglePacketFor(options);
+    let invalidations = 0;
+    const harness = makeController({ ...options, initialVisible: false, onInvalidate: () => { invalidations += 1; } });
+    harness.controller.updateItems([makeItem({ id: "a" })]);
+    harness.send(packet); // hidden -> show and focus sidebar
+    assert.equal(harness.controller.visible, true);
+    assert.equal(harness.controller.focus, "sidebar");
+    assert.deepEqual(harness.actions, [{ type: "visibility", visible: true }]);
+    rosterView(harness.controller, 40, 20);
+    harness.send(DOWN); // New -> Quit
+    harness.send(DOWN); // -> a
+    harness.send(ENTER); // select a; the sidebar stays visible with MAIN focus
+    assert.equal(harness.controller.focus, "main");
+    harness.baseline = harness.actions.length;
+    const invalidationsBefore = invalidations;
+
+    harness.send(packet); // first press: focus only, no hide or resize
+    assert.equal(harness.controller.visible, true);
+    assert.equal(harness.controller.focus, "sidebar");
+    assert.equal(harness.controller.selectedId, "a");
+    assert.deepEqual(harness.sinceActions(), [], "no visibility (resize) or forward action");
+    assert.equal(invalidations, invalidationsBefore + 1, "the focus change requests a redraw");
+
+    harness.send(packet); // second press: hide and return focus to main
+    assert.equal(harness.controller.visible, false);
+    assert.equal(harness.controller.focus, "main");
+    assert.deepEqual(harness.sinceActions(), [{ type: "visibility", visible: false }]);
+
+    harness.send(packet); // hidden again -> show
+    assert.equal(harness.controller.visible, true);
+    assert.equal(harness.controller.focus, "sidebar");
+    assert.deepEqual(harness.sinceActions(), [
+      { type: "visibility", visible: false },
+      { type: "visibility", visible: true },
+    ]);
+  }
+});
+
+test("visible-MAIN shortcut repeats/releases are consumed without a second step", () => {
+  const harness = makeRoster(["a"]);
+  harness.send(DOWN);
+  harness.send(DOWN); // -> a
+  harness.send(ENTER); // MAIN focus, sidebar visible
+  harness.baseline = harness.actions.length;
+  const previous = isKittyProtocolActive();
+  setKittyProtocolActive(true);
+  try {
+    harness.send(KITTY_ALT_LEFT_PRESS); // focus sidebar
+    harness.send(KITTY_ALT_LEFT_REPEAT);
+    harness.send(KITTY_ALT_LEFT_RELEASE);
+    assert.equal(harness.controller.visible, true);
+    assert.equal(harness.controller.focus, "sidebar");
+    assert.deepEqual(harness.sinceActions(), [], "held chord neither hides nor forwards");
+    harness.send(KITTY_ALT_LEFT_PRESS); // fresh press hides
+    harness.send(KITTY_ALT_LEFT_REPEAT);
+    harness.send(KITTY_ALT_LEFT_RELEASE);
+    assert.equal(harness.controller.visible, false);
+    assert.deepEqual(harness.sinceActions(), [{ type: "visibility", visible: false }]);
+  } finally {
+    setKittyProtocolActive(previous);
+  }
+});
+
+test("visible sidebar with MAIN focus still forwards native keys unchanged", () => {
+  const harness = makeRoster(["a"]);
+  harness.send(DOWN);
+  harness.send(DOWN); // -> a
+  harness.send(ENTER); // MAIN focus, sidebar visible
+  harness.baseline = harness.actions.length;
+  const chunks = ["q", "Q", "\x03", ESC, DELETE, " ", "e", UP, ENTER];
+  for (const chunk of chunks) {
+    harness.send(chunk);
+  }
+  assert.deepEqual(harness.sinceActions(), chunks.map((data) => ({ type: "forward", data })));
+  assert.equal(harness.controller.visible, true);
+  assert.equal(harness.controller.focus, "main");
 });
 
 test("wide layout renders roster and form as independent panes", () => {
@@ -1619,7 +2423,7 @@ test("wide layout renders roster and form as independent panes", () => {
   const texts = assertPaneSafe(roster.lines, 32, 23);
   assert.ok(texts[0].includes("Sessions (1)"));
   assert.ok(texts.some((line) => line.includes("> New session")));
-  assert.ok(!texts.join(" ").includes("delete remove exited"), "the sidebar-only action is hidden while the form owns input");
+  assert.ok(!texts.join(" ").includes("d stop/remove"), "the sidebar-only action is hidden while the form owns input");
 });
 
 test("footer hints wrap across reserved rows and never ellipsize", () => {
@@ -1627,7 +2431,7 @@ test("footer hints wrap across reserved rows and never ellipsize", () => {
   for (const cols of [32, 40, 60]) {
     const texts = rosterView(harness.controller, cols, 10).texts;
     const footer = texts.join(" ");
-    for (const hint of ["toggle", "enter open", "e edit name", "delete remove exited", "esc hide", "q quit"]) {
+    for (const hint of ["toggle", "enter open", "e edit name", "d stop/remove", "esc hide", "q quit", "space expand"]) {
       assert.ok(footer.includes(hint), `missing ${JSON.stringify(hint)} at ${cols} cols: ${JSON.stringify(texts)}`);
     }
     assert.ok(!texts.some((line) => line.includes("...")), `no ellipsized hints at ${cols} cols`);
@@ -1653,19 +2457,19 @@ test("roster requires a visible entry row; otherwise it falls back to too-small"
   const fits = assertPaneSafe(controller.render(20, 7).lines, 20, 7);
   assert.ok(fits.some((line) => line.includes("> New session")), JSON.stringify(fits));
   const footer = fits.join(" ");
-  for (const hint of ["toggle", "enter open", "e edit name", "delete remove exited", "esc hide", "q quit"]) {
+  for (const hint of ["toggle", "enter open", "e edit name", "d stop/remove", "esc hide", "q quit"]) {
     assert.ok(footer.includes(hint), `missing ${JSON.stringify(hint)}: ${JSON.stringify(fits)}`);
   }
 
-  // An error row consumes the last entry slot at 32x6.
+  // An error row consumes the last entry slot at 32x5.
   controller.showError("boom");
-  const tooSmallWithError = controller.render(32, 6);
+  const tooSmallWithError = controller.render(32, 5);
   assert.ok(tooSmallWithError.lines.some((line) => line.includes("too small")));
-  const fitsWithError = assertPaneSafe(controller.render(32, 7).lines, 32, 7);
+  const fitsWithError = assertPaneSafe(controller.render(32, 6).lines, 32, 6);
   assert.ok(fitsWithError.some((line) => line.includes("> New session")), JSON.stringify(fitsWithError));
   assert.ok(fitsWithError.some((line) => line.includes("boom")));
   const footerWith = fitsWithError.join(" ");
-  for (const hint of ["toggle", "enter open", "e edit name", "delete remove exited", "esc hide", "q quit"]) {
+  for (const hint of ["toggle", "enter open", "e edit name", "d stop/remove", "esc hide", "q quit"]) {
     assert.ok(footerWith.includes(hint), `missing ${JSON.stringify(hint)}: ${JSON.stringify(fitsWithError)}`);
   }
 });
@@ -1687,7 +2491,7 @@ test("long validated toggle chords render in full, wrapping or falling back inst
 
   // When even the wrapped chord leaves no entry row, the pane is truthfully
   // too small with no partial chord.
-  const tooSmall = harness.controller.render(32, 6);
+  const tooSmall = harness.controller.render(32, 5);
   assert.ok(tooSmall.lines.some((line) => line.includes("too small")));
   assert.ok(!tooSmall.lines.join("\n").includes("Ctrl+Shift"), "no partial chord in the fallback");
 });
@@ -1946,6 +2750,7 @@ test("held Enter after a completed saved-open never activates the highlighted ro
   assert.equal(harness.controller.focus, "sidebar");
   assert.equal(harness.controller.selectedId, "new-row");
   harness.baseline = harness.actions.length;
+  rosterView(harness.controller, 40, 20); // the roster replaces the picker on screen
 
   // The held Enter's repeat and release must not activate the highlighted row.
   harness.send("\x1b[13;1:2u"); // Enter repeat

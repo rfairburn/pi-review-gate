@@ -1546,26 +1546,48 @@ test("alien receipts and foreign agent directories are refused at launch", async
 
 test("launch revalidates the saved file before spawn: replacement, deletion, and identity change refuse", async (t) => {
   const pkg = await makePackageFixture();
-  t.after(() => rm(pkg.root, { recursive: true, force: true }));
+  // Keep generated descendants: a root fixture name is not a per-entry
+  // creation/identity receipt authorizing recursive teardown.
+  t.diagnostic(`retained saved-launch fixture: ${pkg.root}`);
   const { savedFile, admission } = await admitFixtureSavedSession(pkg);
+  const requireOwnedIdentity = async (file: string, receipt: { dev: bigint; ino: bigint }): Promise<void> => {
+    const current = await lstat(file, { bigint: true });
+    assert.ok(current.isFile() && !current.isSymbolicLink());
+    assert.equal(current.dev, receipt.dev);
+    assert.equal(current.ino, receipt.ino);
+  };
 
   // Replaced first line (different id): the live header no longer matches.
+  await requireOwnedIdentity(savedFile, admission);
   await writeFile(savedFile, `${JSON.stringify({ type: "session", id: "replaced-1", cwd: pkg.workspace })}\n`, "utf8");
   assert.throws(
     () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), savedSession: admission })),
     /no longer matches its admission/,
   );
 
-  // Deleted file: refused honestly.
+  // Allocate the replacement while the original inode still exists. Linux
+  // may immediately reuse an inode after unlink, so unlink+write alone does
+  // not establish the changed-identity precondition this assertion exercises.
+  const replacement = join(pkg.root, "saved-replacement.jsonl");
+  await writeFile(replacement, `${JSON.stringify({ type: "session", id: "saved-1", cwd: pkg.workspace })}\n`, { encoding: "utf8", flag: "wx" });
+  const replacementIdentity = await lstat(replacement, { bigint: true });
+  assert.ok(replacementIdentity.dev !== admission.dev || replacementIdentity.ino !== admission.ino,
+    "both simultaneously existing files demonstrably have different identities");
+
+  // Deleted file: refused honestly. Check exact identity before unlink.
+  await requireOwnedIdentity(savedFile, admission);
   await rm(savedFile);
   assert.throws(
     () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), savedSession: admission })),
     /saved-session file is missing/,
   );
 
-  // Re-created with identical content but a NEW identity (dev/ino changed):
-  // mtime immutability is never pretended; the identity check refuses.
-  await writeFile(savedFile, `${JSON.stringify({ type: "session", id: "saved-1", cwd: pkg.workspace })}\n`, "utf8");
+  // Publish the separately created identical-content file at the now absent
+  // path; verify the different identity survived before requiring refusal.
+  await requireOwnedIdentity(replacement, replacementIdentity);
+  assert.equal(existsSync(savedFile), false);
+  await rename(replacement, savedFile);
+  await requireOwnedIdentity(savedFile, replacementIdentity);
   assert.throws(
     () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), savedSession: admission })),
     /changed since admission/,
@@ -1573,7 +1595,8 @@ test("launch revalidates the saved file before spawn: replacement, deletion, and
 
   // A symlink at the admitted path is refused.
   const target = join(pkg.root, "saved-target.jsonl");
-  await writeFile(target, `${JSON.stringify({ type: "session", id: "saved-1", cwd: pkg.workspace })}\n`, "utf8");
+  await writeFile(target, `${JSON.stringify({ type: "session", id: "saved-1", cwd: pkg.workspace })}\n`, { encoding: "utf8", flag: "wx" });
+  await requireOwnedIdentity(savedFile, replacementIdentity);
   await rm(savedFile);
   await symlink(target, savedFile);
   assert.throws(

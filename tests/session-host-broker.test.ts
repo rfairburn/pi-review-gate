@@ -1621,3 +1621,31 @@ test("invalid socket roots fail clearly without adopting or unlinking anything",
   );
   assert.equal(fs.readdirSync(deepRoot).length, 0, "the failed attempt left nothing behind");
 });
+
+test("authenticated status forwards bounded owned-work counts unchanged, degrading invalid values to unknown", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  const recorded = recording();
+  const registration = broker.register(INSTANCE_A, recorded.handlers);
+  const client = await connectClient(broker.socketPath);
+  client.write(JSON.stringify(helloFrame(registration.bootstrap)) + "\n");
+
+  client.write(JSON.stringify({
+    ...statusFrame(registration.bootstrap, { sequence: 1 }),
+    backgroundTasks: 2,
+    backgroundShells: 0,
+  }) + "\n");
+  await waitFor(() => recorded.statuses.length === 1);
+  assert.equal(recorded.statuses[0]!.backgroundTasks, 2, "an observed count reaches the authenticated consumer");
+  assert.equal(recorded.statuses[0]!.backgroundShells, 0);
+
+  client.write(JSON.stringify({
+    ...statusFrame(registration.bootstrap, { sequence: 2 }),
+    backgroundTasks: -1,
+    backgroundShells: "3",
+  }) + "\n");
+  await waitFor(() => recorded.statuses.length === 2);
+  assert.equal(recorded.statuses[1]!.backgroundTasks, null, "an invalid count is unknown, never zero");
+  assert.equal(recorded.statuses[1]!.backgroundShells, null);
+
+  await disposeBroker(broker);
+});

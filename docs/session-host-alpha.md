@@ -29,7 +29,8 @@ Main, PTY, kernel, graceful-shutdown, and terminal-restoration tests.
   real Windows Node 22.19 and 24 runtime evidence passes. The ordinary standalone
   Windows launcher remains unchanged.
 - **Node.js:** 22.19.0 or newer.
-- **Pi:** stable Pi 1.0.4 or newer.
+- **Pi:** stable Pi 1.0.4 or newer; the provisioned runtime and native UI
+  acceptance fixture are pinned to **1.1.0**, with the matching 1.1.0 TUI dependency.
 - An interactive terminal with both stdin and stdout attached.
 
 The Windows validation path uses plain Node named pipes with the existing

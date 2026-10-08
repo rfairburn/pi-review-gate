@@ -30,6 +30,10 @@ interface PiRuntimeResult {
 
 interface BuildResult {
   status: number | null;
+  // Which admitted stage failed, so an operator can tell install from compile.
+  stage?: "install" | "compile" | "stage";
+  // Bounded, sanitized, provenance-labelled child output for that stage.
+  diagnostics?: string;
   childStatus?: number | null;
   error?: Error;
   signal?: string | null;
@@ -49,6 +53,8 @@ interface BoundedProcessResult {
   timedOut: boolean;
   outputExceeded: boolean;
   stdout: string;
+  // Present only when the caller admitted stderr capture for this child.
+  stderr?: string;
 }
 
 interface LauncherOverrides {
@@ -95,6 +101,9 @@ interface LauncherModule {
     findNpmCli(env: NodeJS.ProcessEnv): string | undefined;
     findPiOnPath(env: NodeJS.ProcessEnv): string | undefined;
     runBoundedProcess(file: string, args: string[], options: Record<string, unknown>): Promise<BoundedProcessResult>;
+    sanitizeDiagnosticText(text: string): string;
+    boundDiagnosticText(text: string, limitBytes: number): string;
+    formatBuildStageDiagnostics(result: { stdout?: string; stderr?: string } | undefined, stage: "install" | "compile" | "stage"): string;
     activeBoundedProcessCount(): number;
     boundedProcessCleanupStatus(input: {
       closed: boolean;
@@ -550,6 +559,10 @@ test("Windows setup timeout cleanup never treats direct child close as descendan
     groupStillExists: () => false,
   };
   assert.equal(classify(base), false, "even a closed direct child cannot prove timed-out Windows descendants settled");
+  assert.equal(classify({ ...base, timedOut: false, outputExceeded: true }), false,
+    "an output-limit termination has no Windows process-tree proof");
+  assert.equal(classify({ ...base, timedOut: false, normalExit: false }), false,
+    "a nonzero Windows child exit has no process-tree proof");
   assert.equal(classify({ ...base, timedOut: false }), undefined,
     "a normal Windows close is not represented as process-tree proof");
   assert.equal(classify({ ...base, platform: "linux", timedOut: false }), true);
@@ -592,7 +605,7 @@ test("synthetic stage cleanup retains Windows Pi runtime provisioning stage with
     ANTHROPIC_API_KEY: "provider-secret",
   });
   const npmCli = join(fixture.root, "synthetic-npm-cli.js");
-  const publishedEntry = join(fixture.agentDir, ".pi-review-gate", "pi-runtime", "pi-1.0.4", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
+  const publishedEntry = join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
   const diagnostics: string[] = [];
   let installStage = "";
   let probes = 0;
@@ -613,7 +626,7 @@ test("synthetic stage cleanup retains Windows Pi runtime provisioning stage with
         }
         assert.equal(installEnv.NODE_OPTIONS, env.NODE_OPTIONS);
         assert.equal(installEnv.ANTHROPIC_API_KEY, "provider-secret");
-        writePiPackage(join(installStage, "node_modules", "@earendil-works", "pi-coding-agent"));
+        writePiPackage(join(installStage, "node_modules", "@earendil-works", "pi-coding-agent"), launcher.PI_PROVISION_VERSION);
         return { status: 0, signal: null, timedOut: false, outputExceeded: false, stdout: "" };
       },
       processRunner: async (file, args, options) => {
@@ -623,11 +636,11 @@ test("synthetic stage cleanup retains Windows Pi runtime provisioning stage with
         const stagedEntry = join(installStage, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
         assert.ok(args[0] === stagedEntry || args[0] === publishedEntry);
         assert.equal((options.env as NodeJS.ProcessEnv).NODE_OPTIONS, env.NODE_OPTIONS);
-        return { status: 0, signal: null, timedOut: false, outputExceeded: false, stdout: "pi 1.0.4" };
+        return { status: 0, signal: null, timedOut: false, outputExceeded: false, stdout: `pi ${launcher.PI_PROVISION_VERSION}` };
       },
     });
     assert.equal(result.file, publishedEntry);
-    assert.equal(result.version, "1.0.4");
+    assert.equal(result.version, launcher.PI_PROVISION_VERSION);
     assert.equal(result.source, "isolated-cache");
     assert.equal(probes, 2, "both staged and published CLI identities are checked with the same bounded public Node probe seam");
     assert.ok(existsSync(publishedEntry));
@@ -1842,22 +1855,24 @@ function writeFakeNpm(fixture: RuntimeFixture, behavior: "global" | "install" | 
     lines.push(`setInterval(() => {}, 1000);`);
   } else {
     // install --prefix <staging> --ignore-scripts --no-audit --no-fund
-    // --registry https://registry.npmjs.org @earendil-works/pi-coding-agent@1.0.4
+    // --registry https://registry.npmjs.org @earendil-works/pi-coding-agent@pinned
+    // The fake publishes the exact pinned provision version so a
+    // provisioning-specific mock never depends on a stale pin.
     lines.push(`if (process.env.PI_FAKE_NPM_FAIL) process.exit(7);`);
     lines.push(`if (args[0] === "install") {`);
     lines.push(`  const prefix = args[args.indexOf("--prefix") + 1];`);
     lines.push(`  const pkgDir = require("node:path").join(prefix, "node_modules", "@earendil-works", "pi-coding-agent");`);
     lines.push(`  fs.mkdirSync(require("node:path").join(pkgDir, "dist", "bundle"), { recursive: true });`);
-    lines.push(`  fs.writeFileSync(require("node:path").join(pkgDir, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "1.0.4", bin: { pi: "dist/bundle/cli.js" } }));`);
+    lines.push(`  fs.writeFileSync(require("node:path").join(pkgDir, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "${launcher.PI_PROVISION_VERSION}", bin: { pi: "dist/bundle/cli.js" } }));`);
     lines.push(`  const entry = require("node:path").join(pkgDir, "dist", "bundle", "cli.js");`);
-    lines.push(`  fs.writeFileSync(entry, "#!/usr/bin/env node\\nif (process.argv[2] === '--version') console.log('pi 1.0.4');\\n");`);
+    lines.push(`  fs.writeFileSync(entry, "#!/usr/bin/env node\\nif (process.argv[2] === '--version') console.log('pi ${launcher.PI_PROVISION_VERSION}');\\n");`);
     lines.push(`  fs.chmodSync(entry, 0o755);`);
     lines.push(`  if (process.env.PI_FAKE_PUBLISH_ROOT) {`);
     lines.push(`    const concurrentPkg = require("node:path").join(process.env.PI_FAKE_PUBLISH_ROOT, "node_modules", "@earendil-works", "pi-coding-agent");`);
     lines.push(`    fs.mkdirSync(require("node:path").join(concurrentPkg, "dist", "bundle"), { recursive: true });`);
-    lines.push(`    fs.writeFileSync(require("node:path").join(concurrentPkg, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "1.0.4", bin: { pi: "dist/bundle/cli.js" } }));`);
+    lines.push(`    fs.writeFileSync(require("node:path").join(concurrentPkg, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "${launcher.PI_PROVISION_VERSION}", bin: { pi: "dist/bundle/cli.js" } }));`);
     lines.push(`    const concurrentEntry = require("node:path").join(concurrentPkg, "dist", "bundle", "cli.js");`);
-    lines.push(`    fs.writeFileSync(concurrentEntry, "#!/usr/bin/env node\\nif (process.argv[2] === '--version') console.log('pi 1.0.4');\\n");`);
+    lines.push(`    fs.writeFileSync(concurrentEntry, "#!/usr/bin/env node\\nif (process.argv[2] === '--version') console.log('pi ${launcher.PI_PROVISION_VERSION}');\\n");`);
     lines.push(`    fs.chmodSync(concurrentEntry, 0o755);`);
     lines.push(`  }`);
     lines.push(`}`);
@@ -1928,6 +1943,13 @@ test("a timed-out source build that exits zero on SIGTERM never falls through to
   assert.equal(readFileSync(join(sourceFixture.packageRoot, "dist", "src", "session-host", "main.js"), "utf8"), "LIVE DIST SENTINEL — never rebuild in place\n");
 });
 
+// The cleanup contract differs by platform and is asserted honestly: Windows
+// has no public process-tree proof for any abnormal outcome (see the
+// boundedProcessCleanupStatus contract test), while POSIX confirms its own
+// owned process group is gone. runBoundedProcess reads the real
+// process.platform, so a launcher platform override cannot change this.
+const ABNORMAL_CLEANUP_SETTLES = process.platform !== "win32";
+
 test("bounded setup subprocesses preserve exit outcomes and terminate expired groups", async (t) => {
   const fixture = makeRuntimeFixture(".session-host-bounded-process-");
   cleanupFixture(t, fixture);
@@ -1944,19 +1966,320 @@ test("bounded setup subprocesses preserve exit outcomes and terminate expired gr
   });
   assert.equal(exited.status, 19);
   assert.equal(exited.timedOut, false);
-  assert.equal(exited.cleanupConfirmed, true);
+  assert.equal(exited.cleanupConfirmed, ABNORMAL_CLEANUP_SETTLES);
   const expired = await launcher.__test.runBoundedProcess(process.execPath, [timeoutScript], {
     cwd: fixture.root, env, timeoutMs: 25,
   });
   assert.equal(expired.timedOut, true);
-  assert.equal(expired.cleanupConfirmed, true, "termination is followed by process-group absence confirmation");
+  assert.equal(expired.cleanupConfirmed, ABNORMAL_CLEANUP_SETTLES, "termination is followed by the platform's own settlement evidence");
   assert.ok(expired.signal || expired.status !== 0, "expiration is not reported as a successful exit");
   const oversized = await launcher.__test.runBoundedProcess(process.execPath, [outputScript], {
     cwd: fixture.root, env, timeoutMs: 1000, maxOutputBytes: 4, captureStdout: true,
   });
   assert.equal(oversized.outputExceeded, true);
-  assert.equal(oversized.cleanupConfirmed, true);
+  assert.equal(oversized.cleanupConfirmed, ABNORMAL_CLEANUP_SETTLES);
 });
+
+test("bounded process diagnostics separate stdout from stderr under one shared capture ceiling", async (t) => {
+  const fixture = makeRuntimeFixture(".session-host-bounded-streams-");
+  cleanupFixture(t, fixture);
+  const streamsScript = join(fixture.root, "streams.js");
+  const stdoutFlood = join(fixture.root, "stdout-flood.js");
+  const stderrFlood = join(fixture.root, "stderr-flood.js");
+  const combinedFlood = join(fixture.root, "combined-flood.js");
+  // Synthetic child: distinguishable streams and a truthful nonzero exit.
+  // A natural exit (exitCode, not process.exit) lets piped writes flush.
+  writeFileSync(streamsScript, "process.stdout.write('OUT-MARKER\\n'); process.stderr.write('ERR-MARKER\\n'); process.exitCode = 7;\n", "utf8");
+  writeFileSync(stdoutFlood, "const fs = require('node:fs'); fs.writeSync(1, 'o'.repeat(64)); setInterval(() => {}, 1000);\n", "utf8");
+  writeFileSync(stderrFlood, "const fs = require('node:fs'); fs.writeSync(2, 'e'.repeat(64)); setInterval(() => {}, 1000);\n", "utf8");
+  // 12 + 12 bytes: each stream stays under the 16-byte ceiling alone, so only
+  // a genuinely shared accounting can report this as over the limit.
+  writeFileSync(combinedFlood, "const fs = require('node:fs'); fs.writeSync(1, 'o'.repeat(12)); fs.writeSync(2, 'e'.repeat(12)); setInterval(() => {}, 1000);\n", "utf8");
+  const env = runtimeEnv(fixture);
+
+  const captured = await launcher.__test.runBoundedProcess(process.execPath, [streamsScript], {
+    cwd: fixture.root, env, timeoutMs: 5000, maxOutputBytes: 1024, captureStdout: true, captureStderr: true,
+  });
+  assert.equal(captured.status, 7, "the true child status survives capture");
+  assert.equal(captured.signal, null);
+  assert.equal(captured.timedOut, false);
+  assert.equal(captured.outputExceeded, false);
+  assert.equal(captured.cleanupConfirmed, ABNORMAL_CLEANUP_SETTLES);
+  assert.match(captured.stdout, /OUT-MARKER/);
+  assert.doesNotMatch(captured.stdout, /ERR-MARKER/);
+  assert.match(captured.stderr ?? "", /ERR-MARKER/);
+  assert.doesNotMatch(captured.stderr ?? "", /OUT-MARKER/);
+
+  // A probe that does not admit stderr keeps its original shape: stdout only.
+  const probeOnly = await launcher.__test.runBoundedProcess(process.execPath, [streamsScript], {
+    cwd: fixture.root, env, timeoutMs: 5000, maxOutputBytes: 1024, captureStdout: true,
+  });
+  assert.equal("stderr" in probeOnly, false, "a stream that is not admitted is not reported");
+  assert.equal(probeOnly.status, 7);
+  assert.match(probeOnly.stdout, /OUT-MARKER/);
+  assert.equal(probeOnly.cleanupConfirmed, ABNORMAL_CLEANUP_SETTLES);
+
+  // Both streams count against the same hard ceiling, and flooding it is a
+  // failure report, never silent success or unbounded retention.
+  const stdoutOverflow = await launcher.__test.runBoundedProcess(process.execPath, [stdoutFlood], {
+    cwd: fixture.root, env, timeoutMs: 5000, maxOutputBytes: 16, captureStdout: true, captureStderr: true,
+  });
+  assert.equal(stdoutOverflow.outputExceeded, true, "a stdout flood exceeds the shared ceiling");
+  assert.equal(stdoutOverflow.cleanupConfirmed, ABNORMAL_CLEANUP_SETTLES);
+  assert.notEqual(stdoutOverflow.status, 0, "an over-limit child never reads as a clean exit");
+
+  const stderrOverflow = await launcher.__test.runBoundedProcess(process.execPath, [stderrFlood], {
+    cwd: fixture.root, env, timeoutMs: 5000, maxOutputBytes: 16, captureStdout: true, captureStderr: true,
+  });
+  assert.equal(stderrOverflow.outputExceeded, true, "a stderr flood shares the same hard ceiling");
+  assert.equal(stderrOverflow.cleanupConfirmed, ABNORMAL_CLEANUP_SETTLES);
+  assert.notEqual(stderrOverflow.status, 0, "a stderr flood is never reported as success");
+
+  const combinedOverflow = await launcher.__test.runBoundedProcess(process.execPath, [combinedFlood], {
+    cwd: fixture.root, env, timeoutMs: 5000, maxOutputBytes: 16, captureStdout: true, captureStderr: true,
+  });
+  assert.equal(combinedOverflow.outputExceeded, true, "stdout and stderr bytes are counted together, not per stream");
+  assert.equal(combinedOverflow.cleanupConfirmed, ABNORMAL_CLEANUP_SETTLES);
+  assert.notEqual(combinedOverflow.status, 0, "combined overflow is never reported as success");
+});
+
+test("an admitted stream read error settles as a bounded failure without inventing cleanup", async (t) => {
+  const fixture = makeRuntimeFixture(".session-host-bounded-stream-error-");
+  cleanupFixture(t, fixture);
+  const childScript = join(fixture.root, "stream-error-child.js");
+  // The synthetic child installs its SIGTERM answer, then announces readiness
+  // on stdout, so the injected stream error is guaranteed to arrive after the
+  // handler exists and the child's own exit can be zero.
+  writeFileSync(childScript, "process.on('SIGTERM', () => process.exit(0)); process.stdout.write('ready\\n'); setInterval(() => {}, 1000);\n", "utf8");
+  const env = runtimeEnv(fixture);
+
+  for (const stream of ["stdout", "stderr"] as const) {
+    const startedAt = Date.now();
+    const result = await launcher.__test.runBoundedProcess(process.execPath, [childScript], {
+      cwd: fixture.root, env, timeoutMs: 5000, maxOutputBytes: 1024, captureStdout: true, captureStderr: true,
+      testHooks: {
+        onStreams: (streams: { stdout?: NodeJS.ReadableStream; stderr?: NodeJS.ReadableStream }) => {
+          // Rendezvous on the child's readiness marker, then error one admitted
+          // stream; nothing here changes production behavior.
+          streams.stdout?.once("data", () => {
+            streams[stream]?.emit("error", new Error(`synthetic ${stream} stream error`));
+          });
+        },
+      },
+    });
+    const elapsed = Date.now() - startedAt;
+    assert.ok(result.error instanceof Error, `${stream}: the stream error is recorded, not left unhandled`);
+    assert.match(result.error?.message ?? "", new RegExp(`synthetic ${stream} stream error`));
+    assert.equal(result.timedOut, false);
+    assert.equal(result.outputExceeded, false);
+    assert.equal(result.cleanupConfirmed, ABNORMAL_CLEANUP_SETTLES);
+    assert.ok(elapsed < 3_000, `${stream}: settlement stays bounded (elapsed ${elapsed} ms)`);
+    if (process.platform !== "win32") {
+      assert.equal(result.status, 0, `${stream}: the child's own zero exit is preserved`);
+      assert.equal(result.signal, null);
+    }
+  }
+});
+
+test("a synthetic stream read error is never admitted as a successful build", async (t) => {
+  const source = makePackageFixture(true);
+  const runtime = makeRuntimeFixture(".session-host-build-stream-error-");
+  cleanupFixture(t, source);
+  cleanupFixture(t, runtime);
+  writeFakeNpm(runtime);
+  const childScript = join(runtime.root, "stream-error-child.js");
+  writeFileSync(childScript, "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000);\n", "utf8");
+
+  // The seam routes the admitted stage call through the real bounded process,
+  // so the recorded stream error reaches the install failure path unchanged.
+  const result = await launcher.__test.buildSourceExtension({
+    packageRoot: source.packageRoot,
+    agentDir: runtime.agentDir,
+    env: runtimeEnv(runtime),
+    runNpm: (npmCli, args, options) => {
+      void npmCli;
+      void args;
+      return launcher.__test.runBoundedProcess(process.execPath, [childScript], {
+        ...options,
+        testHooks: {
+          onStreams: (streams: { stdout?: NodeJS.ReadableStream }) => {
+            streams.stdout?.emit("error", new Error("synthetic stdout stream error"));
+          },
+        },
+      });
+    },
+  });
+  assert.equal(result.stage, "install");
+  assert.equal(result.status, 1, "a stream read error is a failed build, never a green one");
+  assert.ok(result.error instanceof Error, "the recorded stream error reaches the build result");
+  assert.match(result.error?.message ?? "", /synthetic stdout stream error/);
+  assert.equal(result.cleanupConfirmed, ABNORMAL_CLEANUP_SETTLES);
+});
+
+test("build failure diagnostics keep stage identity, stream provenance, and bounded sanitized text", () => {
+  const sanitized = launcher.__test.sanitizeDiagnosticText("\u001b[31mred\u001b[0m \u001b]0;title\u0007 plain\u0000\u0007tail");
+  assert.doesNotMatch(sanitized, /\u001b|\u0007|\u0000/u, "terminal controls are removed, never passed through");
+  assert.match(sanitized, /red/);
+  assert.match(sanitized, /plain/);
+
+  const bounded = launcher.__test.boundDiagnosticText("x".repeat(5000), 256);
+  assert.ok(Buffer.byteLength(bounded, "utf8") <= 256, "emitted diagnostics never exceed their ceiling");
+  assert.match(bounded, /diagnostic truncated/);
+
+  const install = launcher.__test.formatBuildStageDiagnostics(
+    { stdout: "install stdout line", stderr: "\u001b[31minstall stderr line\u001b[0m" },
+    "install",
+  );
+  assert.match(install, /npm ci \(dependency install\) stdout:\ninstall stdout line/);
+  assert.match(install, /npm ci \(dependency install\) stderr:\ninstall stderr line/);
+  assert.doesNotMatch(install, /\u001b/u);
+
+  const compile = launcher.__test.formatBuildStageDiagnostics({ stdout: "", stderr: "compile stderr line" }, "compile");
+  assert.match(compile, /npm run build \(compile\) stderr:\ncompile stderr line/);
+  assert.doesNotMatch(compile, /stdout/);
+  assert.equal(launcher.__test.formatBuildStageDiagnostics({ stdout: "", stderr: "" }, "compile"), "", "no captured output emits no diagnostic block");
+
+  const aggregate = launcher.__test.formatBuildStageDiagnostics({ stdout: "y".repeat(20000), stderr: "z".repeat(20000) }, "compile");
+  assert.ok(Buffer.byteLength(aggregate, "utf8") <= 4096, "both provenance blocks share one aggregate ceiling");
+  assert.match(aggregate, /diagnostic truncated/);
+});
+
+test("synthetic source build failures name the failing stage and preserve the true status", async (t) => {
+  const source = makePackageFixture(true);
+  const runtime = makeRuntimeFixture(".session-host-build-stage-diagnostics-");
+  cleanupFixture(t, source);
+  cleanupFixture(t, runtime);
+  writeFakeNpm(runtime);
+
+  const installFailure = await launcher.__test.buildSourceExtension({
+    packageRoot: source.packageRoot,
+    agentDir: runtime.agentDir,
+    env: runtimeEnv(runtime),
+    runNpm: async (_npmCli, args) => (args[0] === "ci"
+      ? { status: 5, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "install stdout line\n", stderr: "\u001b[31minstall failed\u001b[0m\n" }
+      : { status: 0, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "" }),
+  });
+  assert.equal(installFailure.stage, "install");
+  assert.equal(installFailure.status, 5, "the true install status is preserved");
+  assert.equal(installFailure.childStatus, 5);
+  assert.match(installFailure.diagnostics ?? "", /npm ci \(dependency install\) stderr:\ninstall failed\n/);
+  assert.doesNotMatch(installFailure.diagnostics ?? "", /\u001b/u);
+
+  const compileFailure = await launcher.__test.buildSourceExtension({
+    packageRoot: source.packageRoot,
+    agentDir: runtime.agentDir,
+    env: runtimeEnv(runtime),
+    runNpm: async (_npmCli, args) => (args[0] === "ci"
+      ? { status: 0, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "" }
+      : { status: 23, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "compile stdout line\n", stderr: "compile failed\n" }),
+  });
+  assert.equal(compileFailure.stage, "compile");
+  assert.equal(compileFailure.status, 23);
+  assert.match(compileFailure.diagnostics ?? "", /npm run build \(compile\) stdout:\ncompile stdout line\n/);
+  assert.match(compileFailure.diagnostics ?? "", /npm run build \(compile\) stderr:\ncompile failed\n/);
+});
+
+test("a failing synthetic compile reports its bounded cause and never turns failure green", { skip: process.platform === "win32" }, async (t) => {
+  const fixture = makePackageFixture(true);
+  cleanupFixture(t, fixture);
+  const bin = join(fixture.root, "fake-bin");
+  mkdirSync(bin);
+  const log = join(fixture.root, "npm-invocation.json");
+  writeFileSync(join(bin, "package.json"), JSON.stringify({ name: "npm", version: "10.0.0", bin: { npm: "npm" } }), "utf8");
+  writeFileSync(join(bin, "npm"), `#!/usr/bin/env node\n${[
+    `const fs = require("node:fs");`,
+    `const args = process.argv.slice(2);`,
+    `fs.appendFileSync(process.env.TEST_NPM_LOG, JSON.stringify({ args, cwd: process.cwd() }) + "\\n");`,
+    `if (args[0] === "ci") process.exit(0);`,
+    `process.stdout.write("synthetic build stdout\\n");`,
+    `process.stderr.write("\\u001b[31mTS2304: Cannot find name 'synthetic'.\\u001b[0m\\n");`,
+    // A natural exit flushes both piped streams before the true status lands.
+    `process.exitCode = 1;`,
+    "",
+  ].join("\n")}`, "utf8");
+
+  const env = makeEnvironment({ HOME: fixture.root, PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`, TEST_NPM_LOG: log });
+  let stderr = "";
+  const status = await launcher.__test.runSessionHostLauncher(["--", "--scheduler"], {
+    getEnv: () => env,
+    processEnv: {},
+    platform: "linux",
+    nodeVersion: "22.19.0",
+    stdinIsTTY: true,
+    stdoutIsTTY: true,
+    packageRoot: fixture.packageRoot,
+    resolvePiRuntime: () => ({ file: "/synthetic/pi", version: "1.0.4", source: "npm-global" }),
+    ensureDdgs: () => ({ ok: true, python: "/synthetic/python" }),
+    loadMain: () => ({ runSessionHost: () => 0 }),
+    writeOut: () => undefined,
+    writeError: (text) => { stderr += text; },
+  });
+  assert.equal(status, 1, "the failing compile keeps its true nonzero status");
+  assert.match(stderr, /extension build failed \(exit status 1\)/);
+  assert.match(stderr, /failed build stage: npm run build \(compile\)/);
+  assert.match(stderr, /npm run build \(compile\) stderr:\nTS2304: Cannot find name 'synthetic'\.\n/);
+  assert.match(stderr, /npm run build \(compile\) stdout:\nsynthetic build stdout\n/);
+  assert.doesNotMatch(stderr, /\u001b/u, "terminal controls from the failing child never reach the operator");
+  assert.equal(readFileSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"), "utf8"), "LIVE DIST SENTINEL — never rebuild in place\n");
+});
+
+// Parent-owned acceptance: real Windows cmd.exe parsing and runtime behavior
+// stay with the parent; this file only locks the escaped source contract.
+test("the native .cmd launcher escapes block-breaking parentheses in its role diagnostics", () => {
+  const source = readFileSync(join(process.cwd(), "scripts", "pi-review-sessions.cmd"), "utf8");
+  assert.ok(source.includes("\r\n"), "the batch file keeps CRLF line endings");
+  // Inside a parenthesized IF block an unescaped "(" or ")" is parsed by
+  // cmd.exe even when the condition is false, which aborts the launcher with
+  // "<token> was unexpected at this time.". Every diagnostic parenthesis is
+  // therefore caret-escaped.
+  const echoLines = source.split("\r\n").filter((line) => /^\s*echo\b/u.test(line));
+  assert.equal(echoLines.length, 3, "every diagnostic echo line is checked");
+  for (const line of echoLines) {
+    const text = line.slice(line.indexOf("echo") + "echo".length);
+    for (const match of text.matchAll(/[()]/gu)) {
+      const index = match.index ?? 0;
+      assert.equal(text[index - 1], "^", `unescaped parenthesis would break the block: ${line.trim()}`);
+    }
+  }
+  const roleCheck = source.indexOf("if defined PI_REVIEW_GATE_RUNTIME_ROLE");
+  const catalogCheck = source.indexOf("if defined PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG");
+  const bootstrapClear = source.indexOf('set "PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP="');
+  assert.ok(roleCheck >= 0 && catalogCheck > roleCheck, "role and catalog rejection both precede any child");
+  assert.ok(bootstrapClear > catalogCheck, "capability rejection precedes every environment mutation and child");
+  assert.match(source, /DisableDelayedExpansion/);
+  assert.match(source, /WindowsPowerShell\\v1\.0\\powershell\.exe/);
+  assert.match(source, /-File "%~dp0pi-review-sessions-node\.ps1" %\*/);
+  assert.equal(source.split("-File \"%~dp0pi-review-sessions-node.ps1\"").length, 2, "the original argument tail is forwarded exactly once");
+  assert.doesNotMatch(source, /POSIX-only|POSIX only/u, "obsolete POSIX-only host prose is removed");
+});
+
+test("the provisioning mock follows the pinned provision version while older-Pi admission stays intact", async (t) => {
+  const fixture = makeRuntimeFixture(".session-host-provision-pin-");
+  cleanupFixture(t, fixture);
+  writeFakeNpm(fixture, "install");
+  const env = runtimeEnv(fixture);
+
+  const provisioned = await launcher.__test.resolvePiRuntime({ env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined });
+  assert.equal(provisioned.source, "isolated-cache");
+  assert.equal(provisioned.version, launcher.PI_PROVISION_VERSION, "the synthetic install publishes the pin, not a stale literal");
+  assert.ok(provisioned.file.startsWith(join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`)));
+
+  // The supported floor stays below the pin and is still admitted.
+  const floorEntry = writePiEntry(join(fixture.root, "floor pi.js"), launcher.PI_MIN_VERSION.join("."));
+  const admitted = await launcher.__test.resolvePiRuntime({ explicit: floorEntry, env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: () => undefined });
+  assert.equal(admitted.version, launcher.PI_MIN_VERSION.join("."), "the older supported Pi admission contract is unchanged");
+  assert.ok(compareVersionStrings(launcher.PI_MIN_VERSION.join("."), launcher.PI_PROVISION_VERSION) < 0);
+});
+
+function compareVersionStrings(left: string, right: string): number {
+  const a = left.split(".").map(Number);
+  const b = right.split(".").map(Number);
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const diff = (a[index] ?? 0) - (b[index] ?? 0);
+    if (diff !== 0) return diff < 0 ? -1 : 1;
+  }
+  return 0;
+}
 
 test("a readable Node CLI entry is probed through the admitted Node and rejected fail-closed otherwise", async (t) => {
   const fixture = makeRuntimeFixture(".session-host-pi-runtime-explicit-");
@@ -2042,7 +2365,7 @@ test("absent or unsupported Pi provisions the isolated cache with exact npm argu
   let notice = "";
   const result = await launcher.__test.resolvePiRuntime({ env, agentDir: fixture.agentDir, cwd: fixture.root, writeError: (text) => { notice += text; } });
   assert.equal(result.source, "isolated-cache");
-  assert.equal(result.version, "1.0.4");
+  assert.equal(result.version, launcher.PI_PROVISION_VERSION);
   const expectedPkgDir = join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`, "node_modules", "@earendil-works", "pi-coding-agent");
   assert.equal(result.file, join(expectedPkgDir, "dist", "bundle", "cli.js"));
   assert.ok(existsSync(result.file));
@@ -2062,7 +2385,7 @@ test("absent or unsupported Pi provisions the isolated cache with exact npm argu
     "--registry", "https://registry.npmjs.org",
     `${launcher.PI_PACKAGE_NAME}@${launcher.PI_PROVISION_VERSION}`,
   ]);
-  assert.ok(installs[0].args[2].startsWith(join(fixture.agentDir, ".pi-review-gate", "pi-runtime", ".staging-pi-1.0.4-")));
+  assert.ok(installs[0].args[2].startsWith(join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `.staging-pi-${launcher.PI_PROVISION_VERSION}-`)));
   // Publication remains successful, but the npm stage is retained without
   // complete per-entry creation receipts.
   assert.ok(existsSync(installs[0].args[2]), "the provisioning stage remains after publication");
@@ -2164,7 +2487,7 @@ test("a valid cached runtime is reused without any npm invocation", async (t) =>
   const fixture = makeRuntimeFixture(".session-host-pi-runtime-cached-");
   cleanupFixture(t, fixture);
   const pkgDir = join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`, "node_modules", "@earendil-works", "pi-coding-agent");
-  writePiPackage(pkgDir);
+  writePiPackage(pkgDir, launcher.PI_PROVISION_VERSION);
   writeFakeNpm(fixture, "install");
   const env = runtimeEnv(fixture);
 
@@ -2293,7 +2616,7 @@ test("failed provisioning preserves foreign staging, unknown resources, and its 
   );
   assert.equal(readFileSync(marker, "utf8"), "preserve me\n", "unknown resources are preserved");
   assert.equal(readFileSync(join(foreignStage, "active-download"), "utf8"), "in progress\n", "foreign staging is preserved");
-  const ownStages = readdirNames(runtimeRoot).filter((entry) => /^\.staging-pi-1\.0\.4-/.test(entry) && entry !== ".staging-pi-1.0.4-concurrent-launch");
+  const ownStages = readdirNames(runtimeRoot).filter((entry) => entry.startsWith(`.staging-pi-${launcher.PI_PROVISION_VERSION}-`));
   assert.equal(ownStages.length, 1, "this run's stage is retained without descendant receipts");
   assert.match(diagnostic, /preserving a Pi runtime staging tree because per-entry descendant creation receipts are unavailable/);
 });

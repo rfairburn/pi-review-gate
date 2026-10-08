@@ -21,11 +21,13 @@ dates.
 
 - Optional `pi-review-sessions` terminal host alpha for same-machine POSIX
   macOS/Linux (#323, related research #274). Each explicitly created row owns
-  an independent native Pi process, workspace, persistent private profile and
-  native conversation. Highlighting or hiding a row changes no ownership;
+  an independent native Pi process, workspace and native conversation, sharing
+  ordinary native Pi configuration/resources without per-window profiles.
+  Highlighting or hiding a row changes no ownership;
   activation is explicit and input is never broadcast. The separate launcher
   requires Node 22.19.0+, stable Pi 1.0.4+ and a supported readable Node CLI
-  entry. Parent resume/session/storage overrides are rejected; ordinary native
+  entry; provisioned Pi, the matching TUI dependency and native UI acceptance
+  fixture are pinned to 1.1.0. Parent resume/session/storage overrides are rejected; ordinary native
   arguments and commands remain native. Public terminal APIs, independent
   headless surfaces and bounded generated frames provide text/SGR display and
   observed generic sidebar status, with explicit Unicode, mouse and platform

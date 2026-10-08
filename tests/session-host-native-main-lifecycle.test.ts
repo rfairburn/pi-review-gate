@@ -61,6 +61,11 @@ import {
   removeOwnedScratchTreePruningTerraform,
   resolveRuntimePin,
 } from "./helpers/session-host-native-main-harness";
+import {
+  renderedTitleMatches,
+  rosterCards,
+  type RosterCardEntry,
+} from "./helpers/session-host-native-roster-witness";
 
 // Paced Main-lifecycle specialization of the scripted faux provider (public
 // tokensPerSecond option): deterministic running window for the rendered
@@ -128,17 +133,25 @@ function providerJournalRecords(path: string): ProviderJournalRecord[] {
   return records;
 }
 
-function rowHasInputBadge(text: string, label: string): boolean {
-  return sidebarPaneText(text).split("\n").some((line) => line.includes(label) && line.includes("[input]"));
+/** The one native card whose complete title line belongs to `label`, if any. */
+function cardFor(text: string, label: string): RosterCardEntry | undefined {
+  const matches = rosterCards(text, 32).filter((card) => renderedTitleMatches(card.title, label));
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
-/** The [AGENT: …] badge state of one owner's sidebar row, if rendered. */
-function rowBadgeState(text: string, label: string): "running" | "idle" | "unknown" | undefined {
-  const line = sidebarPaneText(text).split("\n").find((candidate) => candidate.includes(label) && candidate.includes("[AGENT:"));
-  if (line === undefined) return undefined;
-  if (line.includes("[AGENT: running]")) return "running";
-  if (line.includes("[AGENT: idle]")) return "idle";
-  if (line.includes("[AGENT: unknown]")) return "unknown";
+/** The card's real status row says input is pending (never an inline [input] badge). */
+function rowHasInputBadge(text: string, label: string): boolean {
+  return cardFor(text, label)?.status.includes("input pending") === true;
+}
+
+/** The observed/unknown agent state of one owner's card status row, if rendered. */
+function rowBadgeState(text: string, label: string): "running" | "waiting" | "idle" | "unknown" | undefined {
+  const status = cardFor(text, label)?.status;
+  if (status === undefined) return undefined;
+  if (status.startsWith("agent running")) return "running";
+  if (status.startsWith("agent waiting")) return "waiting";
+  if (status.startsWith("agent idle")) return "idle";
+  if (status.startsWith("agent unknown")) return "unknown";
   return undefined;
 }
 
@@ -442,7 +455,7 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
 
   // Fresh sidebar pending presence on A's row.
   await driver.waitFrame((text) => rowHasInputBadge(text, labelA),
-    "the real Main sidebar shows the fresh [input] pending badge for A", beforePrompt);
+    "the real Main sidebar card shows A's fresh input-pending status below its title", beforePrompt);
 
   // The collapsed pending-question panel line is visible in A's native pane.
   const panelLine = process.platform === "darwin"
@@ -461,9 +474,9 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
   await driver.waitForRecords((records) => records.some((record) => record.type === "agent_settled"
     && record.pid === sessionA.record.pid),
     "first public agent_settled boundary in A closes the pending-question turn");
-  await driver.waitFrame((text) => rowBadgeState(text, labelA) === "idle"
+  await driver.waitFrame((text) => rowBadgeState(text, labelA) === "waiting"
     && rowHasInputBadge(text, labelA) && frameContains(text, panelLine),
-    "A's sidebar row is fresh idle with q1 still pending before the answer", beforeFirstSettle);
+    "A's card status row is fresh agent-waiting with q1 still pending before the answer", beforeFirstSettle);
 
   // Ownership isolation while A holds the pending question: switch to B
   // through the real roster; B keeps its own draft and neither surface nor
@@ -514,7 +527,7 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
 
   // Fresh running observation for the answer turn.
   await driver.waitFrame((text) => rowBadgeState(text, labelA) === "running",
-    "A's sidebar row shows the fresh [AGENT: running] state for the answer turn", beforeSubmit);
+    "A's card status row shows the fresh agent-running state for the answer turn", beforeSubmit);
   const afterRunning = driver.frameRevision;
 
   // Native completion frame/transcript: delivered answer and its echo.
@@ -528,11 +541,15 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
     && record.pid === sessionA.record.pid).length >= 2,
     "second public agent_settled boundary in A closes the answer turn");
 
-  // Fresh sidebar clearance after the observed running state: idle badge, no
-  // pending badge, and the native pending panel removed.
-  await driver.waitFrame((text) => rowBadgeState(text, labelA) === "idle"
-    && !rowHasInputBadge(text, labelA) && !frameContains(text, panelLine),
-    "the real Main sidebar clears A's [input] badge to idle after the answer turn", afterRunning);
+  // Fresh sidebar clearance after the observed running state: no pending input
+  // and the native pending panel removed. The agent state is observed clear;
+  // nullable background counts may truthfully render either the observed-zero
+  // "idle" row or the not-yet-observed "unknown" row, so both are accepted.
+  await driver.waitFrame((text) => {
+    const state = rowBadgeState(text, labelA);
+    return (state === "idle" || state === "unknown")
+      && !rowHasInputBadge(text, labelA) && !frameContains(text, panelLine);
+  }, "the real Main sidebar clears A's pending-input status to a truthful clear state after the answer turn", afterRunning);
   assertSidebarHasNoQuestionContent(driver.currentText());
 
   // B ownership isolation: no agent turns or tool calls despite shared setup.

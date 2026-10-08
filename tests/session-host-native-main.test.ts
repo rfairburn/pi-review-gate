@@ -27,6 +27,7 @@ import {
   sessionFileHasStoredName,
   sha256,
 } from "./helpers/session-host-native-main-harness";
+import { frameHeader, frameHeaderMatches, isSidebarFocusedFrame } from "./helpers/session-host-native-roster-witness";
 
 // Scope boundary: this is an owned virtual-PTY proof of the public Main API,
 // not a physical-keyboard or full-CLI test. The question flow and live-child
@@ -458,6 +459,11 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   await driver.writeAndWait(draftB, (text) => text.includes(draftB), "B's private draft is re-entered for focus-retention checks");
 
   const recordCountBeforeWideHide = driver.records().length;
+  // Two explicit presses from the visible Main focus: the first only focuses
+  // the sidebar (no hide, no resize), the second deliberately hides it.
+  await driver.toggleSidebar();
+  assert.equal(driver.sidebarVisible, true,
+    "the first explicit press focuses the visible sidebar instead of hiding it");
   await driver.toggleSidebar();
   for (const session of initialSessions) {
     await driver.waitForRecords((records) => records.slice(recordCountBeforeWideHide).some((record) => record.type === "resize"
@@ -485,9 +491,25 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   await driver.writeAndWait(draftA, (text) => text.includes(draftA), "A receives its own unique native draft");
   assert.ok(!driver.currentText().includes(draftB), "input from B is not broadcast into A");
 
+  // Two-step reserved chord from a visible Main-focused frame: the first press
+  // only focuses the sidebar (no hide, no native resize), and a second
+  // deliberate press from that focused state hides it back to Main.
+  const resizeCountBeforeFocus = driver.records().filter((record) => record.type === "resize").length;
+  const headerBeforeFocus = frameHeader(driver.currentText());
   await driver.toggleSidebar();
-  assert.ok(driver.currentText().includes(draftA), "A's draft remains intact when F8 hides the sidebar");
-  assert.equal(processIsAlive(sessionA.record.pid), true, "the actual F8 press is consumed by Main while A's child stays alive");
+  assert.equal(driver.sidebarVisible, true, "the first F8 press keeps the visible sidebar shown");
+  assert.equal(driver.focus, "sidebar", "the first F8 press moves ownership to the visible sidebar");
+  assert.ok(isSidebarFocusedFrame(driver.currentText(), 32), "the first F8 press draws the complete sidebar-only roster");
+  assert.equal(frameHeader(driver.currentText()), headerBeforeFocus, "the focus-first press leaves A as the active Main owner");
+  assert.ok(driver.currentText().includes(draftA), "the focus-first press preserves A's native draft");
+  assert.equal(processIsAlive(sessionA.record.pid), true, "the focus-first press never stops A's child");
+  assert.equal(driver.records().filter((record) => record.type === "resize").length, resizeCountBeforeFocus,
+    "the focus-first press does not resize any native child");
+  await driver.toggleSidebar();
+  assert.equal(driver.sidebarVisible, false, "the next deliberate F8 press hides the sidebar-focused pane");
+  assert.equal(driver.focus, "main", "hiding the sidebar returns ownership to Main");
+  assert.ok(driver.currentText().includes(draftA), "A's draft remains intact when the second press hides the sidebar");
+  assert.equal(processIsAlive(sessionA.record.pid), true, "the actual second F8 press leaves A's child alive");
   await driver.toggleSidebar();
   assert.ok(driver.currentText().includes(draftA), "F8 reopens the sidebar without altering A's native draft");
   await driver.moveRosterTo(labelB);
@@ -515,7 +537,7 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   const beforeNarrowSelectA = driver.frameRevision;
   driver.pty.write(KEYS.enter);
   driver.focus = "main";
-  await driver.waitFrame((text) => text.includes("Session host · ") && !text.includes("New session"),
+  await driver.waitFrame((text) => frameHeaderMatches(text, labelA) && !text.includes("New session"),
     "narrow overlay selection returns to Main without changing the native rectangle", beforeNarrowSelectA);
   await driver.assertNoJournalEvent((records) => initialSessions.some((session) => records.filter((record) =>
     record.type === "resize" && record.pid === session.record.pid).length
@@ -548,9 +570,15 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   await driver.waitFrame((text) => !text.includes(draftA), "native Ctrl+C clears A's draft before issuing a slash command", afterCtrlC);
   assert.equal(processIsAlive(sessionA.record.pid), true, "native Ctrl+C remains an editor action, not a host quit");
   // The native field's complete help line is wider than the 87-column pane.
-  // Hide the roster to provide the verified full 120-column native surface;
-  // do not mistake legitimate native clipping for a missing editor feature.
+  // Two explicit presses provide the verified full 120-column native surface:
+  // the first only focuses the visible sidebar, the second deliberately hides
+  // it. Never bundle presses that could silently hide a visible Main frame.
   await driver.toggleSidebar();
+  assert.equal(driver.sidebarVisible, true,
+    "the first explicit press focuses the visible sidebar instead of hiding it");
+  await driver.toggleSidebar();
+  assert.equal(driver.sidebarVisible, false,
+    "the second explicit press hides the sidebar for the full native surface");
   await settingsSmoke(driver, sessionA, workspaceEditValue, editorMarker);
   await driver.writeAndWait(draftA, (text) => text.includes(draftA), "A can enter a fresh draft after its native settings transaction closes");
   assert.notEqual(sha256(sharedGateConfigA), sharedGateDigestBeforeSettings,
@@ -638,7 +666,7 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   assert.equal(resumedBSession.displayName, labelB, "/resume restores the actual persisted native caption");
   assert.equal(sessionFileHasStoredName(sessionB.record.sessionFile!, labelB), true,
     "the resumed conversation's own native session file retains its persisted title");
-  await driver.waitFrame((text) => text.split("\n")[0]?.includes(`Session host · ${labelB} ·`) === true,
+  await driver.waitFrame((text) => frameHeaderMatches(text, labelB),
     "Main's active header reflects the resumed native conversation caption");
   assert.equal(driver.records().filter((record) => record.type === "agent_start").length, 2,
     "the public /new and /resume UI checks add no turn beyond the two local scripted seeds");

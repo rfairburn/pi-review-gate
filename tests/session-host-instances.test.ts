@@ -2642,3 +2642,63 @@ test("ownedLiveSessions reports live bindings and reservations only; exited rows
     cleanup(harness);
   }
 });
+
+test("status updates publish bounded owned-work counts and never fabricate zero", async () => {
+  const harness = makeHarness("owned-counts");
+  try {
+    const id = await harness.manager.create({ label: "counts", workspace: harness.workspace });
+    const entry = harness.registrar.entryFor(id);
+    const counts = (): [number | null | undefined, number | null | undefined] => [
+      viewFor(harness.manager, id).backgroundTasks,
+      viewFor(harness.manager, id).backgroundShells,
+    ];
+
+    assert.deepEqual(counts(), [null, null], "no status yet: unknown, never a fabricated zero");
+
+    harness.registrar.emitStatus(entry, {
+      busy: null,
+      pendingInput: null,
+      inputSurface: false,
+      activity: [],
+      backgroundTasks: 2,
+      backgroundShells: 0,
+    });
+    assert.deepEqual(counts(), [2, 0], "observed counts are copied onto the immutable view");
+
+    harness.registrar.emitStatus(entry, {
+      busy: null,
+      pendingInput: null,
+      inputSurface: false,
+      activity: [],
+      backgroundTasks: -1,
+      backgroundShells: 1.5,
+    });
+    assert.deepEqual(counts(), [null, null], "invalid counts normalize to unknown");
+
+    harness.registrar.emitStatus(entry, {
+      busy: false,
+      pendingInput: false,
+      inputSurface: false,
+      activity: [],
+      backgroundShells: 1,
+    });
+    assert.deepEqual(counts(), [null, 1], "an older registrar omitting tasks stays unknown, never zero");
+
+    harness.registrar.emitDisconnect(entry);
+    assert.deepEqual(counts(), [null, null], "a reporter disconnect collapses counts to unknown");
+
+    harness.registrar.emitStatus(entry, {
+      busy: true,
+      pendingInput: null,
+      inputSurface: false,
+      activity: ["Working"],
+      backgroundTasks: 4,
+      backgroundShells: 2,
+    });
+    assert.deepEqual(counts(), [4, 2]);
+    harness.spawned[0]!.emitExit(0);
+    assert.deepEqual(counts(), [null, null], "an actual child exit never retains a stale owned count");
+  } finally {
+    cleanup(harness);
+  }
+});

@@ -45,7 +45,7 @@ export interface ComposeHostFrameOptions {
 	readonly sidebar?: RenderedSidebar;
 	/** New session form pane; composed into layout.form when present. */
 	readonly form?: RenderedSidebar;
-	/** Already-generic host label/status; control sequences are never trusted. */
+	/** Canonical title only, without status/prefix badges; control sequences are never trusted. */
 	readonly header: string;
 	readonly focus: HostFocus;
 }

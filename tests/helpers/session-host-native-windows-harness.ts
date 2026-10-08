@@ -45,6 +45,11 @@ import {
   type WindowsExitWitness,
   type WindowsWitnessExpectation,
 } from "./session-host-native-windows-contracts";
+import {
+  ModeWitnessLedger,
+  formatModeWitnessDiagnostic,
+  normalizeWindowsProbeFailure,
+} from "./session-host-mode-witness";
 
 export {
   assertNativeEditorFieldEmpty,
@@ -414,6 +419,7 @@ export function probeWindowsPowerShell(runtime: WindowsPowerShellPin, home: stri
     TEMP: temporary,
     TMP: temporary,
   };
+  const startedAt = Date.now();
   const result = spawnSync(runtime.powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$PSVersionTable.PSVersion.ToString()"], {
     cwd: process.cwd(),
     env,
@@ -423,8 +429,21 @@ export function probeWindowsPowerShell(runtime: WindowsPowerShellPin, home: stri
     timeout: 10_000,
     maxBuffer: 16 * 1024,
   });
-  if (result.error || result.status !== 0 || !/^5\.1\.[0-9.]+\s*$/.test(result.stdout ?? "")) {
-    throw new Error("required Windows PowerShell 5.1 readiness probe failed");
+  const elapsedMs = Date.now() - startedAt;
+  const stdoutVersionMatched = /^5\.1\.[0-9.]+\s*$/.test(result.stdout ?? "");
+  if (result.error || result.status !== 0 || !stdoutVersionMatched) {
+    // The success condition above is unchanged and stays fail-closed. The
+    // failure throw discloses only bounded generic metadata: no stdout/stderr
+    // content, args, env, or error.message, and no asserted timeout cause.
+    throw new Error("required Windows PowerShell 5.1 readiness probe failed: "
+      + normalizeWindowsProbeFailure({
+        hadSpawnError: result.error !== undefined && result.error !== null,
+        errorCode: (result.error as { code?: unknown } | undefined)?.code,
+        status: result.status,
+        signal: result.signal,
+        stdoutVersionMatched,
+        elapsedMs,
+      }));
   }
 }
 
@@ -586,7 +605,14 @@ export class WindowsMainPtyDriver {
   readonly journalSignal = new ChangeSignal();
   readonly exitSignal = new ChangeSignal();
   readonly replyLog: string[] = [];
-  readonly modeSnapshots: ReturnType<TerminalSurface["inputModes"]>[] = [];
+  /**
+   * Genuine post-parse outer VT input-mode witnesses. Filled only from the
+   * real outer TerminalSurface onChange callback (post-parse) and one
+   * flush-completed read before the pre-quit assertions, and bounded to at
+   * most one unmodified representative per truth class of the three existing
+   * pre-quit predicates — never by data-chunk count.
+   */
+  private readonly modeWitnesses = new ModeWitnessLedger();
   readonly logWatcher: FSWatcher;
   readonly nativeWatcher: FSWatcher;
   readonly providerWatcher: FSWatcher;
@@ -634,10 +660,15 @@ export class WindowsMainPtyDriver {
         this.replyLog.push(reply);
         try { this.pty.write(reply); } catch { /* exact outer PTY may have exited */ }
       },
-      onChange: () => this.refreshFrame(),
+      onChange: () => {
+        // The real outer surface invokes onChange only after xterm finished
+        // parsing the queued writes, so this read is a genuine post-parse
+        // observation of the same outer terminal — never a pre-parse sample.
+        this.recordPostParseInputModes();
+        this.refreshFrame();
+      },
     });
     this.initialModes = this.surface.inputModes();
-    this.modeSnapshots.push(this.initialModes);
     this.refreshFrame();
     this.dataSubscription = this.pty.onData((data) => this.onData(data));
     this.exitSubscription = this.pty.onExit((event) => {
@@ -808,8 +839,10 @@ export class WindowsMainPtyDriver {
     this.sawAlternateLeave ||= this.outputTail.includes("\x1b[?1049l");
     try {
       this.surface.write(data);
-      const snapshot = this.surface.inputModes();
-      if (this.modeSnapshots.length < 2_000) this.modeSnapshots.push(snapshot);
+      // Input modes are observed only in the genuine post-parse onChange
+      // callback (and one flush-completed read before the pre-quit
+      // assertions); this pre-parse sample point records no witness, so no
+      // synthetic or stale mode state becomes acceptance evidence.
       this.refreshFrame();
     } catch {
       this.parserError = new Error("actual ConPTY output could not be parsed by the public terminal surface");
@@ -824,6 +857,46 @@ export class WindowsMainPtyDriver {
     } catch {
       this.parserError = new Error("actual ConPTY frame could not be read");
     }
+  }
+
+  /**
+   * Records the outer VT's current input modes as a genuine post-parse
+   * witness. Only the real TerminalSurface onChange callback (which runs after
+   * xterm parsed a write) and one flush-completed read before the pre-quit
+   * assertions call this; the pre-parse sample point in onData does not, so no
+   * synthetic or pre-parse mode state becomes acceptance evidence.
+   */
+  private recordPostParseInputModes(): void {
+    try {
+      this.modeWitnesses.record(this.surface.inputModes());
+    } catch {
+      this.parserError = new Error("actual outer VT input modes could not be read after parsing");
+    }
+  }
+
+  /** Bounded genuine post-parse mode witnesses, one per preserved truth class. */
+  get modeSnapshots(): readonly ReturnType<TerminalSurface["inputModes"]>[] {
+    return this.modeWitnesses.representatives;
+  }
+
+  /**
+   * Bounded, metadata-only context for a failed pre-quit mode assertion. It
+   * reports the retained truth classes and fixed-known mode-sequence
+   * counts/booleans of the existing bounded outer PTY tail. These hints do not
+   * establish negotiation or a lost observation: earlier bytes may be outside
+   * the tail, and a set/reset pair may share one parse batch. It emits
+   * no raw frame, transcript, environment, path, prompt, or native user string
+   * and asserts no cause.
+   */
+  private modeWitnessDiagnostic(): string {
+    return formatModeWitnessDiagnostic({
+      outputTail: this.outputTail,
+      representatives: this.modeWitnesses.representatives,
+      deviceAttributesReplies: this.replyLog.filter((reply) => /^\x1b\[\?[\d;]*c$/.test(reply)).length,
+      kittyQueryReplies: this.replyLog.filter((reply) => /^\x1b\[\?\d+u$/.test(reply)).length,
+      alternateBufferEntered: this.sawAlternateEnter,
+      alternateBufferLeft: this.sawAlternateLeave,
+    });
   }
 
   currentText(): string {
@@ -1069,13 +1142,27 @@ export class WindowsMainPtyDriver {
 
   async assertBeforeQuitModes(): Promise<void> {
     await this.surface.flush();
+    // flush() completed the parse queue, so this read is the genuine
+    // post-parse state of the same real outer terminal. Recording it here keeps
+    // a final negotiation observable even when no further data chunk arrives
+    // for its onChange callback.
+    this.recordPostParseInputModes();
+    if (this.parserError) throw this.parserError;
     const modes = this.modeSnapshots;
     assert.ok(this.sawAlternateEnter, "actual Main output entered the outer VT alternate buffer");
-    assert.ok(modes.some((mode) => mode.bracketedPaste), "actual outer VT observed Main bracketed-paste negotiation");
-    assert.ok(modes.some((mode) => mode.mouseTracking !== "none" && mode.mouseEncoding === "sgr"),
-      "actual outer VT observed Main mouse tracking and SGR encoding");
-    assert.ok(modes.some((mode) => mode.kittyFlags > 0 || mode.applicationCursorKeys || mode.applicationKeypad || mode.modifyOtherKeys > 0),
-      "actual outer VT observed a non-baseline keyboard mode during Main ownership");
+    const bracketedPasteObserved = modes.some((mode) => mode.bracketedPaste);
+    const mouseTrackingSgrObserved = modes.some((mode) => mode.mouseTracking !== "none" && mode.mouseEncoding === "sgr");
+    const nonBaselineKeyboardObserved = modes.some((mode) => mode.kittyFlags > 0 || mode.applicationCursorKeys || mode.applicationKeypad || mode.modifyOtherKeys > 0);
+    // Only a real failure pays for the bounded metadata-only diagnostic, and
+    // the message stays byte-identical on success.
+    const diagnostic = bracketedPasteObserved && mouseTrackingSgrObserved && nonBaselineKeyboardObserved
+      ? ""
+      : ` (${this.modeWitnessDiagnostic()})`;
+    assert.ok(bracketedPasteObserved, `actual outer VT observed Main bracketed-paste negotiation${diagnostic}`);
+    assert.ok(mouseTrackingSgrObserved,
+      `actual outer VT observed Main mouse tracking and SGR encoding${diagnostic}`);
+    assert.ok(nonBaselineKeyboardObserved,
+      `actual outer VT observed a non-baseline keyboard mode during Main ownership${diagnostic}`);
     assert.ok(this.replyLog.some((reply) => /^\x1b\[\?[\d;]*c$/.test(reply)),
       "actual outer ConPTY answered the real public device-attributes query");
     assert.ok(this.replyLog.some((reply) => /^\x1b\[\?\d+u$/.test(reply)),

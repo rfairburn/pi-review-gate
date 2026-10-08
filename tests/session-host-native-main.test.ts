@@ -27,7 +27,7 @@ import {
   sessionFileHasStoredName,
   sha256,
 } from "./helpers/session-host-native-main-harness";
-import { frameHeader, frameHeaderMatches, isSidebarFocusedFrame } from "./helpers/session-host-native-roster-witness";
+import { frameHeader, frameHeaderMatches, isSidebarFocusedFrame, parseRosterFrame } from "./helpers/session-host-native-roster-witness";
 
 // Scope boundary: this is an owned virtual-PTY proof of the public Main API,
 // not a physical-keyboard or full-CLI test. The question flow and live-child
@@ -494,6 +494,9 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   // Two-step reserved chord from a visible Main-focused frame: the first press
   // only focuses the sidebar (no hide, no native resize), and a second
   // deliberate press from that focused state hides it back to Main.
+  await driver.waitFrame((text) => frameHeaderMatches(text, labelA)
+    && text.includes(draftA) && parseRosterFrame(text, 32).complete,
+  "A's exact active header, private draft, and complete roster are drawn before the focus-only press");
   const resizeCountBeforeFocus = driver.records().filter((record) => record.type === "resize").length;
   const headerBeforeFocus = frameHeader(driver.currentText());
   await driver.toggleSidebar();
@@ -517,11 +520,17 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   const beforeSelectB = driver.frameRevision;
   driver.pty.write(KEYS.enter);
   driver.focus = "main";
-  await driver.waitFrame((text) => text.includes(draftB) && !text.includes(draftA),
-    "only explicit Enter returns ownership to B while both native drafts remain private", beforeSelectB);
+  await driver.waitFrame((text) => frameHeaderMatches(text, labelB)
+    && text.includes(draftB) && !text.includes(draftA) && parseRosterFrame(text, 32).complete,
+    "only explicit Enter returns ownership to B with its exact header, private draft, and complete roster", beforeSelectB);
 
   await driver.setOuterSize(100, 30, initialSessions, 67, 29);
   assert.equal(driver.surface.frame().cols, 100, "the real outer PTY and terminal emulator observe the resized outer width");
+  // A native resize receipt or first output byte is not a complete outer redraw.
+  // Observe B's exact owner and the full roster before capturing the header for F8.
+  await driver.waitFrame((text) => frameHeaderMatches(text, labelB)
+    && text.includes(draftB) && parseRosterFrame(text, 32).complete,
+  "the 100-column redraw completes B's exact active header, private draft, and full roster before F8");
   // A narrow pane overlays only while the roster owns focus. Establish that
   // state before testing a visible overlay's close/reopen transitions.
   await driver.ensureSidebarFocus();
@@ -690,7 +699,7 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   assert.equal(hostExit.signal ?? 0, 0, "the public Main returned after every owned native child had exited normally");
 
   // Keep explicit local verification assertions close to the end-to-end proof.
-  assert.equal(runtime.version, "1.0.4");
+  assert.equal(runtime.version, "1.1.0");
   assert.ok(runtime.piExecutable.endsWith(".js"), "the integration uses the pinned Node CLI entry, never a shell shim");
   assert.equal(candidate.entry, join(candidate.root, "dist", "src", "index.js"));
   assertionsCompleted = true;

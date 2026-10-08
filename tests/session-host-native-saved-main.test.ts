@@ -475,7 +475,9 @@ test("pure saved-pane predicate distinguishes the real right picker from roster 
     "after cancellation, left-roster text cannot make the native Main pane look like the picker");
 
   const controller = new SidebarController({ toggleKey: "f8" });
+  controller.renderRoster(32, 49);
   controller.handleInput(KEYS.up);
+  controller.renderRoster(32, 49); // The selected Saved action must be fully displayed before Enter.
   controller.handleInput(KEYS.enter);
   assert.equal(controller.focus, "form");
   const plain = (lines: readonly string[]): string[] =>
@@ -1071,6 +1073,6 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
   assert.equal(OUTER_COLS, 120);
   assert.equal(OUTER_ROWS, 50);
   assert.equal(OUTER_RESTORATION_BASELINE, "PRG-SAVED-MAIN");
-  assert.equal(runtime.version, "1.0.4");
+  assert.equal(runtime.version, "1.1.0");
   assertionsCompleted = true;
 });

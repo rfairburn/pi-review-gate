@@ -3,7 +3,7 @@
  *
  * Four bounded cases share the owned-PTY Main harness from
  * tests/helpers/session-host-native-main-harness.ts and the same pinned real
- * Pi 1.0.4 runtime as the basic native Main proof:
+ * Pi 1.1.0 runtime as the basic native Main proof:
  *
  * 1. A real offline scripted-provider (public pi.registerProvider + faux
  *    provider, zero external AI/API requests or credential copies)

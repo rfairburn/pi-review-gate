@@ -60,6 +60,7 @@ import {
   parseRosterFrame,
   renderedTitleMatches,
   selectedRosterEntry,
+  sidebarPaneLines,
   sidebarRosterHidden,
 } from "./session-host-native-roster-witness";
 
@@ -87,6 +88,7 @@ export const KEYS = {
   down: "\x1b[B",
   enter: "\r",
   escape: "\x1b",
+  altRight: "\x1b[1;3C",
   f8: "\x1b[19~",
   ctrlC: "\x03",
   ctrlG: "\x07",
@@ -1412,6 +1414,73 @@ function workspaceFieldIsEmpty(text: string): boolean {
   return nativeFormFieldIsEmpty(text, "> Workspace:");
 }
 
+/** Main-focused roster footer hints; sidebar-only actions are stale here. */
+const MAIN_FOCUS_FOOTER_HINTS = ["F8 toggle", "enter open", "esc hide", "q quit"] as const;
+/** Hints drawn only while a sidebar-owned surface owns input. */
+const SIDEBAR_ONLY_FOOTER_HINTS = ["e edit name", "d stop/remove", "space expand", "alt+right main"] as const;
+/** Bounded native editor prompt punctuation; never part of the compared draft. */
+const NATIVE_EDITOR_PREFIX = /^[\s>│┃▏❯]+/u;
+
+/** Roster footer text after the complete entry extent, or undefined when incomplete. */
+function rosterFooterText(text: string, sidebarColumns: number): string | undefined {
+  const parsed = parseRosterFrame(text, sidebarColumns);
+  if (!parsed.complete) return undefined;
+  const pane = sidebarPaneLines(text, sidebarColumns);
+  const offset = /^\s*Sessions \(\d+\)\s*$/u.test(pane[0] ?? "") ? 0 : 1;
+  return pane.slice(offset + 1 + parsed.entryEnd)
+    .filter((line) => line.trim().length > 0)
+    .join(" ")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+/**
+ * Exact native editor content: the whole row after its bounded prompt prefix
+ * equals the draft, so appended or altered text is never accepted.
+ */
+export function nativeEditorContentMatches(line: string, draft: string): boolean {
+  return line.trimEnd().replace(NATIVE_EDITOR_PREFIX, "") === draft;
+}
+
+/**
+ * Complete restored wide native-editor witness. Requires the exact owner
+ * header; the complete roster with its Main-focused footer and no stale
+ * sidebar-only hints; and a width-correct bordered editor block in the right
+ * pane whose content row is exactly the draft. A stale narrow frame (wrong
+ * rule width), a partial repaint (incomplete roster or an unbordered content
+ * row), or an altered/appended draft is rejected. Pure: no timers, no output
+ * or geometry shortcuts.
+ */
+export function restoredNativeEditorFrame(
+  text: string,
+  options: {
+    readonly ownerLabel: string;
+    readonly draft: string;
+    readonly sidebarColumns: number;
+    readonly nativeWidth: number;
+  },
+): boolean {
+  const { ownerLabel, draft, sidebarColumns, nativeWidth } = options;
+  if (typeof ownerLabel !== "string" || ownerLabel.length === 0) return false;
+  if (typeof draft !== "string" || draft.length === 0) return false;
+  if (!Number.isSafeInteger(sidebarColumns) || sidebarColumns < 12 || sidebarColumns > 1000) return false;
+  if (!Number.isSafeInteger(nativeWidth) || nativeWidth < 20 || nativeWidth > 1000) return false;
+  if (!frameHeaderMatches(text, ownerLabel)) return false;
+  const footer = rosterFooterText(text, sidebarColumns);
+  if (footer === undefined) return false;
+  for (const hint of MAIN_FOCUS_FOOTER_HINTS) if (!footer.includes(hint)) return false;
+  for (const stale of SIDEBAR_ONLY_FOOTER_HINTS) if (footer.includes(stale)) return false;
+  const rule = "─".repeat(nativeWidth);
+  const pane = text.split("\n").slice(1).map((line) => stripGeneratedSgr(line).slice(sidebarColumns + 1));
+  const trimmed = pane.map((line) => line.trimEnd());
+  for (let index = 0; index + 2 < pane.length; index += 1) {
+    if (trimmed[index] !== rule) continue;
+    if (!nativeEditorContentMatches(pane[index + 1] ?? "", draft)) continue;
+    if (trimmed[index + 2] === rule) return true;
+  }
+  return false;
+}
+
 export class MainPtyDriver {
   readonly pty: NativePtyHandle;
   readonly surface: TerminalSurface;
@@ -1646,25 +1715,34 @@ export class MainPtyDriver {
     return this.ownedSessions().filter((session) => !this.removedWorkspaces.has(session.workspace));
   }
 
+  /**
+   * Structural native Escape writes journaled for one exact owned child
+   * (PID + workspace). Cancel/provenance witnesses compare this before and
+   * after a host-owned action to prove no Escape reached the child.
+   */
+  nativeEscapeControlCount(pid: number | undefined, workspace: string): number {
+    const file = join(dirname(this.ptyExitLog), "pty-controls.jsonl");
+    if (!existsSync(file)) return 0;
+    const stats = lstatSync(file);
+    assert.ok(stats.isFile() && !stats.isSymbolicLink() && stats.size <= 64 * 1024,
+      "the owned structural-control journal stays a bounded regular file");
+    let found = 0;
+    for (const line of readFileSync(file, "utf8").split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const record = JSON.parse(line) as { type?: string; key?: string; pid?: number; cwd?: string };
+        if (record.type === "pty_control" && record.key === "escape"
+          && record.pid === pid && record.cwd === workspace) found += 1;
+      } catch { /* a bounded watcher may see an incomplete append */ }
+    }
+    return found;
+  }
+
   /** Observe idle Escape delivery without demanding a native no-op repaint. */
   async sendNativeEscapeAndObserve(session: OwnedSession): Promise<void> {
     assert.equal(this.focus, "main", "structural Escape targets an active native input owner");
     const file = join(dirname(this.ptyExitLog), "pty-controls.jsonl");
-    const count = (): number => {
-      const stats = lstatSync(file);
-      assert.ok(stats.isFile() && !stats.isSymbolicLink() && stats.size <= 64 * 1024,
-        "the owned structural-control journal stays a bounded regular file");
-      let found = 0;
-      for (const line of readFileSync(file, "utf8").split("\n")) {
-        if (!line.trim()) continue;
-        try {
-          const record = JSON.parse(line) as { type?: string; key?: string; pid?: number; cwd?: string };
-          if (record.type === "pty_control" && record.key === "escape"
-            && record.pid === session.record.pid && record.cwd === session.workspace) found += 1;
-        } catch { /* a bounded watcher may see an incomplete append */ }
-      }
-      return found;
-    };
+    const count = (): number => this.nativeEscapeControlCount(session.record.pid, session.workspace);
     const before = count();
     const change = new ChangeSignal();
     const watcher = watch(file, () => change.notify());

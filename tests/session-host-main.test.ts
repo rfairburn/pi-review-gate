@@ -790,7 +790,10 @@ test("highlighting a newly created row does not transfer active input ownership;
   assert.equal(manager.views[0]?.id, "native-1");
   assert.equal(manager.views[0]?.hasLiveProcess, true);
   harness.terminal.emitInput(ENTER); // Explicitly select first row; focus returns to Main.
-  harness.terminal.emitInput(ALT_LEFT); // Hide picker, preserving active owner.
+  // Two deliberate F8 presses: the first only focuses the visible sidebar, and
+  // the second hides it back to Main, so these native packets really start in Main.
+  harness.terminal.emitInput(ALT_LEFT);
+  harness.terminal.emitInput(ALT_LEFT); // hide, preserving the active owner
   // These Main packets must still route only to native-1.
   harness.terminal.emitInput(ESC);
   harness.terminal.emitInput("q");
@@ -803,6 +806,7 @@ test("highlighting a newly created row does not transfer active input ownership;
 
   // Reopen the picker and open New session while native-1 remains active.
   harness.terminal.emitInput(ALT_LEFT);
+  await nextTurn(); // the complete reopened roster is drawn before targeted navigation
   harness.terminal.emitInput("\x1b[B"); // highlighted first -> Saved conversations
   harness.terminal.emitInput("\x1b[B"); // -> New session
   harness.terminal.emitInput(ENTER); // Open New session
@@ -816,7 +820,8 @@ test("highlighting a newly created row does not transfer active input ownership;
   // ownership transfer; subsequent Main input goes only to native-2.
   assert.equal(harness.terminal.inputHandler !== undefined, true);
   harness.terminal.emitInput(ENTER);
-  harness.terminal.emitInput(ALT_LEFT); // hide, resume the newly selected Main owner
+  harness.terminal.emitInput(ALT_LEFT); // focus the visible sidebar first
+  harness.terminal.emitInput(ALT_LEFT); // then hide, resuming the newly selected Main owner
   harness.terminal.emitInput("q");
   assert.equal(manager.writes.at(-1)?.id, "native-2");
 
@@ -1028,10 +1033,11 @@ test("Main applies native app.clear and app.interrupt bindings and reloads them 
     assert.ok(!(harness.sidebar?.renderForm(80, 24).lines.join("\n") ?? "").includes("/first/workspace"));
     harness.terminal.emitInput("draft");
     harness.terminal.emitInput("\x18"); // configured app.interrupt = Ctrl+X
-    assert.equal(harness.sidebar?.visible, false);
+    assert.equal(harness.sidebar?.visible, true,
+      "the configured interrupt cancels New locally and leaves the roster visible");
+    assert.equal(harness.sidebar?.focus, "sidebar");
 
     writeKeybindings("ctrl+u", "ctrl+z");
-    harness.terminal.emitInput(ALT_LEFT);
     await nextTurn(); // Draw the restored roster before another targeted action.
     harness.terminal.emitInput(ENTER);
     const reopenedHints = harness.sidebar?.renderForm(80, 24).lines.join("\n") ?? "";
@@ -1045,7 +1051,9 @@ test("Main applies native app.clear and app.interrupt bindings and reloads them 
     harness.terminal.emitInput("\x18"); // old interrupt no longer cancels
     assert.equal(harness.sidebar?.visible, true);
     harness.terminal.emitInput("\x1a"); // new app.interrupt = Ctrl+Z
-    assert.equal(harness.sidebar?.visible, false);
+    assert.equal(harness.sidebar?.visible, true,
+      "the reloaded interrupt also cancels New locally instead of hiding the roster");
+    assert.equal(harness.sidebar?.focus, "sidebar");
     assert.equal(await closeWithSignal(harness), 0);
   } finally {
     rmSync(agentDir, { recursive: true, force: true });
@@ -1079,9 +1087,10 @@ test("pending create uses the configured interrupt and ignores its late result a
     assert.equal(harness.sidebar?.focus, "form", "unbound Escape does not abandon the pending form");
     assert.equal(harness.sidebar?.visible, true);
     harness.terminal.emitInput("\x18");
-    assert.equal(harness.sidebar?.visible, false, "the configured Ctrl+X interrupt abandons the pending form");
+    assert.equal(harness.sidebar?.visible, true,
+      "the configured Ctrl+X interrupt abandons the pending form locally and leaves the roster visible");
+    assert.equal(harness.sidebar?.focus, "sidebar");
 
-    harness.terminal.emitInput(ALT_LEFT);
     await nextTurn(); // Draw the restored roster before another targeted action.
     harness.terminal.emitInput(ENTER);
     assert.equal(harness.sidebar?.focus, "form");
@@ -1149,7 +1158,7 @@ test("pending rename uses the configured interrupt and ignores its late result a
   }
 });
 
-test("native keybinding fallback notices render in narrow New and Edit forms and clear after valid reopen", async () => {
+test("absent native keybindings are silent with real defaults while unavailable/unsupported notices render in narrow forms and clear after valid reopen", async () => {
   const root = makeMainTestDirectory("keybinding-notices");
   const absentDir = join(root, "absent-agent");
   const unavailablePath = join(root, "not-an-agent-directory");
@@ -1177,7 +1186,18 @@ test("native keybinding fallback notices render in narrow New and Edit forms and
     await ready(absent);
     absent.terminal.columns = 40;
     absent.terminal.emitInput(ENTER);
-    assert.ok(noticeInForm(absent).includes("Native keybindings.json is absent"));
+    const absentForm = noticeInForm(absent);
+    assert.equal(absentForm.includes("Native keybindings.json"), false,
+      "a genuinely absent optional keybindings file renders no warning");
+    for (const hint of ["enter create", "escape cancel", "tab complete", "ctrl+c clear", "ctrl+g external editor"]) {
+      assert.ok(absentForm.includes(hint),
+        `absent keybindings silently use Pi's real default ${hint} hint\n${absentForm}`);
+    }
+    absent.terminal.emitInput("/default-bound/workspace");
+    assert.ok((absent.sidebar?.renderForm(40, 24).lines.join("\n") ?? "").includes("/default-bound/workspace"));
+    absent.terminal.emitInput("\x03"); // the real default app.clear binding is Ctrl+C
+    assert.equal((absent.sidebar?.renderForm(40, 24).lines.join("\n") ?? "").includes("/default-bound/workspace"), false,
+      "an absent keybindings file silently uses Pi's real default clear binding");
     assert.equal(await closeWithSignal(absent), 0);
 
     const unavailable = createConfiguredHarness(unavailablePath);
@@ -1260,9 +1280,10 @@ test("removing the active exited row clears ownership to the picker and stale sn
   manager.notify("native-1");
   await nextTurn();
 
-  harness.terminal.emitInput(ALT_LEFT); // hide, then reopen the sidebar on the exited owner
-  harness.terminal.emitInput(ALT_LEFT);
+  harness.terminal.emitInput(ALT_LEFT); // focus the displayed sidebar roster on the exited owner
+  await nextTurn(); // the complete sidebar-focused roster owns the Delete action
   assert.equal(harness.sidebar?.focus, "sidebar");
+  assert.equal(harness.sidebar?.visible, true);
   assert.equal(harness.sidebar?.selectedId, "native-1");
   harness.terminal.emitInput(DELETE);
   await nextTurn();
@@ -1295,6 +1316,7 @@ test("removing the active exited row clears ownership to the picker and stale sn
   manager.notify("last-row-exited");
   await nextTurn();
   harness.terminal.emitInput(ALT_LEFT); // reopen the picker with no selection
+  await nextTurn(); // the complete reopened roster is drawn before the Delete action
   harness.terminal.emitInput("\x1b[B"); // select the last exited row
   harness.terminal.emitInput(DELETE);
   await nextTurn();
@@ -1335,14 +1357,17 @@ test("removing an inactive exited row preserves the live owner, status, surface,
   manager.notify("status-update");
   await nextTurn();
 
-  harness.terminal.emitInput(ALT_LEFT); // hide/show to focus the picker on the active sibling
-  harness.terminal.emitInput(ALT_LEFT);
+  harness.terminal.emitInput(ALT_LEFT); // focus the visible picker on the active sibling
+  assert.equal(harness.sidebar?.focus, "sidebar");
+  assert.equal(harness.sidebar?.visible, true);
+  await nextTurn(); // the complete roster is drawn before any targeted navigation
   harness.terminal.emitInput("\x1b[B"); // second -> Saved conversations
   harness.terminal.emitInput("\x1b[B"); // -> New session
   harness.terminal.emitInput(ENTER);
   harness.terminal.emitInput("retained draft");
   harness.terminal.emitInput(ALT_LEFT); // hide without discarding the form draft
   harness.terminal.emitInput(ALT_LEFT); // reopen with New session still selected
+  await nextTurn(); // the complete reopened roster is drawn before navigation
   harness.terminal.emitInput("\x1b[A"); // New -> Saved conversations
   harness.terminal.emitInput("\x1b[A"); // Saved -> second
   harness.terminal.emitInput("\x1b[A"); // second -> exited first
@@ -1386,14 +1411,14 @@ test("failed, live, and unconfirmed removals leave the row and owner in place wi
   manager.notify("confirmed-exit");
   await nextTurn();
 
-  harness.terminal.emitInput(ALT_LEFT);
-  harness.terminal.emitInput(ALT_LEFT);
+  harness.terminal.emitInput(ALT_LEFT); // focus the displayed sidebar roster
+  await nextTurn(); // the selected exited card is completely drawn before Delete
   harness.terminal.emitInput(DELETE);
   await nextTurn();
   assert.deepEqual(manager.closeExitedCalls, ["native-1"]);
   assert.deepEqual(manager.views.map((view) => view.id), ["native-1"]);
   assert.equal(harness.sidebar?.selectedId, "native-1");
-  let noticeText = (harness.sidebar?.render(32, 12).lines.join(" ").replace(/\x1b\[[0-9;]*m/g, "") ?? "").replace(/\s+/g, " ");
+  let noticeText = plain(harness.writer.frames.at(-1)?.frame).replace(/\s+/g, " ");
   assert.match(noticeText, /Session not removed; it may be live, unconfirmed, or no longer available/);
 
   manager.refusedCloseIds.delete("native-1");
@@ -1404,31 +1429,57 @@ test("failed, live, and unconfirmed removals leave the row and owner in place wi
   assert.deepEqual(harness.sidebar?.items.map((view) => view.id), ["native-1"], "a stale refusal keeps the visible row");
   assert.equal(harness.sidebar?.selectedId, "native-1");
 
+  // Restore only the manager's authoritative row to a live child while the
+  // sidebar still displays the previously rendered exited card: Delete takes
+  // the exited-row path, and the manager's closeExited refuses the live row.
   manager.views.push({ ...original, lifecycle: "alive", hasLiveProcess: true });
-  manager.notify("live-owner-restored");
-  await nextTurn();
-  harness.terminal.emitInput(DELETE); // closeExited refuses a live child
+  harness.terminal.emitInput(DELETE);
   await nextTurn();
   assert.deepEqual(manager.closeExitedCalls, ["native-1", "native-1", "native-1"]);
   assert.equal(manager.views[0]?.hasLiveProcess, true);
+  assert.equal(harness.sidebar?.items.length, 1, "the refused removal keeps the displayed row");
 
-  manager.views[0] = { ...manager.views[0]!, lifecycle: "exited", hasLiveProcess: true };
+  manager.views[0] = { ...original, lifecycle: "exited", hasLiveProcess: true };
   manager.notify("unconfirmed-exit");
   harness.terminal.emitInput(DELETE); // an exited badge is insufficient without confirmed process exit
   await nextTurn();
   assert.deepEqual(manager.closeExitedCalls, ["native-1", "native-1", "native-1", "native-1"]);
   assert.equal(manager.views[0]?.hasLiveProcess, true);
-  noticeText = (harness.sidebar?.render(32, 12).lines.join(" ").replace(/\x1b\[[0-9;]*m/g, "") ?? "").replace(/\s+/g, " ");
+  noticeText = plain(harness.writer.frames.at(-1)?.frame).replace(/\s+/g, " ");
   const notice = noticeText.match(/Session not removed; it may be live, unconfirmed, or no longer available/)?.[0] ?? "";
   assert.ok(notice.length > 0 && notice.length <= 300, "refusal is bounded and truthful");
   assert.equal(manager.shutdownCalls, 0);
   assert.equal(harness.terminal.stopCount, 0, "refusal never stops the process or terminal");
 
-  manager.views[0] = { ...manager.views[0]!, lifecycle: "alive", hasLiveProcess: true };
-  manager.notify("alive-again");
+  // A currently rendered LIVE card must never reach closeExited: Delete enters
+  // the guarded stop confirmation for the frozen row instead.
+  manager.views[0] = { ...original, lifecycle: "alive", hasLiveProcess: true };
+  manager.notify("live-card-rendered");
+  await nextTurn();
+  const closeCallsBeforeGuardedStop = manager.closeExitedCalls.length;
+  harness.terminal.emitInput(DELETE);
+  await nextTurn();
+  assert.equal(manager.closeExitedCalls.length, closeCallsBeforeGuardedStop,
+    "a rendered live card never reaches closeExited directly");
+  assert.equal(harness.sidebar?.focus, "confirm", "a rendered live card enters the guarded stop confirmation");
+  const stopConfirmText = plain(harness.writer.frames.at(-1)?.frame);
+  assert.ok(stopConfirmText.includes("Stop session?"), `the guarded stop confirmation is drawn: ${stopConfirmText}`);
+  assert.ok(stopConfirmText.includes("esc/n = cancel"), "the confirmation exposes its cancel binding before any stop");
+  assert.equal(manager.shutdownCalls, 0);
+  assert.equal(harness.terminal.stopCount, 0);
+
+  // Cancelling the confirmation preserves the displayed row, the owner, and
+  // every process; nothing was stopped or removed.
+  harness.terminal.emitInput(ESC);
+  await nextTurn();
+  assert.equal(harness.sidebar?.focus, "sidebar");
+  assert.equal(harness.sidebar?.visible, true);
+  assert.equal(harness.sidebar?.selectedId, "native-1");
+  assert.equal(manager.closeExitedCalls.length, closeCallsBeforeGuardedStop);
+
   harness.terminal.emitInput(ALT_LEFT); // hide the sidebar, return to native focus
   harness.terminal.emitInput(DELETE); // Delete is native in Main focus, not a closeExited request
-  assert.equal(manager.closeExitedCalls.length, 4);
+  assert.equal(manager.closeExitedCalls.length, closeCallsBeforeGuardedStop);
   assert.deepEqual(manager.writes.at(-1), { id: "native-1", data: DELETE });
   harness.terminal.emitInput("owner is preserved");
   assert.deepEqual(manager.writes.at(-1), { id: "native-1", data: "owner is preserved" });
@@ -1445,9 +1496,10 @@ test("wide form temporarily replaces the right pane; the child stays alive, unre
   assert.equal(manager.views[0]?.hasLiveProcess, true);
   harness.terminal.emitInput(ENTER); // explicit select -> main focus
 
-  harness.terminal.emitInput(ALT_LEFT); // hide the picker (focus main)
-  harness.terminal.emitInput(ALT_LEFT); // reopen -> sidebar focus on native-1
+  harness.terminal.emitInput(ALT_LEFT); // focus the visible sidebar roster on native-1
   await nextTurn();
+  assert.equal(harness.sidebar?.focus, "sidebar");
+  assert.equal(harness.sidebar?.visible, true);
   const resizesBeforeForm = manager.resizeCalls.length;
   harness.terminal.emitInput("\x1b[B"); // -> Saved conversations
   harness.terminal.emitInput("\x1b[B"); // -> New session row
@@ -1469,14 +1521,23 @@ test("wide form temporarily replaces the right pane; the child stays alive, unre
   assert.equal(manager.resizeCalls.length, resizesBeforeForm, "opening the form never resizes the child");
   assert.deepEqual(manager.writes, [], "form input is never broadcast to the child");
 
-  harness.terminal.emitInput(ESC); // cancel the form -> hide sidebar, focus main
+  harness.terminal.emitInput(ESC); // cancel New locally: the visible roster returns, still sidebar-focused
   await nextTurn();
-  assert.equal(harness.sidebar?.focus, "main");
+  assert.equal(harness.sidebar?.focus, "sidebar", "New cancellation returns ownership to the visible roster");
+  assert.equal(harness.sidebar?.visible, true, "New cancellation never hides the sidebar");
   assert.equal(manager.views[0]?.hasLiveProcess, true, "cancelling the form leaves the child alive");
-  assert.deepEqual(manager.resizeCalls.at(-1), { cols: 80, rows: 23, ids: ["native-1"] }, "hiding the sidebar restores the full-width native pane");
+  assert.equal(manager.resizeCalls.length, resizesBeforeForm, "cancelling the form does not resize the child either");
   const restored = harness.writer.frames.at(-1)?.frame;
   assert.ok(restored, "a composed frame exists after the form closes");
-  assert.ok(plainLine(restored, 1).startsWith("frame:native-1"), "the same child frame returns");
+  assert.ok(plainLine(restored, 1).slice(0, 32).includes("Sessions (1)"),
+    `the visible roster remains in the left pane: ${JSON.stringify(plainLine(restored, 1).slice(0, 32))}`);
+  assert.ok(plainLine(restored, 1).slice(33).startsWith("frame:native-1"),
+    `the same child frame returns to the right pane: ${JSON.stringify(plainLine(restored, 1).slice(33))}`);
+  harness.terminal.emitInput(ALT_LEFT); // deliberate hide: full-width native pane
+  await nextTurn();
+  assert.equal(harness.sidebar?.focus, "main");
+  assert.equal(harness.sidebar?.visible, false);
+  assert.deepEqual(manager.resizeCalls.at(-1), { cols: 80, rows: 23, ids: ["native-1"] }, "hiding the sidebar restores the full-width native pane");
   harness.terminal.emitInput("q"); // main input still routes to the same active child
   assert.deepEqual(manager.writes.at(-1), { id: "native-1", data: "q" });
   assert.equal(await closeWithSignal(harness), 0);
@@ -1544,10 +1605,20 @@ test("mouse routing uses active live child modes, mode-only changes, native view
   harness.terminal.emitInput("\x1b[<0;33;2M"); // left of native pane: clipped, never edge-clamped
   assert.deepEqual(manager.writes.slice(beforeMouse).map((entry) => entry.data), ["\x1b[<0;2;1M"]);
 
-  const beforeOverlay = harness.terminal.writes.length;
-  harness.terminal.emitInput(ALT_LEFT); // hide: Main remains active, not an input reset
-  harness.terminal.emitInput(ALT_LEFT); // reopen -> sidebar owns input, disable only our tracking/encoding
-  assert.deepEqual(harness.terminal.writes.slice(beforeOverlay), ["\x1b[?1000l", "\x1b[?1006l"]);
+  const beforeFocusReset = harness.terminal.writes.length;
+  // Main -> Sidebar focus is focus-only: the layout and native geometry are
+  // untouched, and the host disables only its own tracking/encoding.
+  harness.terminal.emitInput(ALT_LEFT);
+  assert.deepEqual(harness.terminal.writes.slice(beforeFocusReset), ["\x1b[?1000l", "\x1b[?1006l"]);
+  assert.equal(harness.sidebar?.focus, "sidebar");
+  assert.equal(harness.sidebar?.visible, true);
+  const beforeFocusReenable = harness.terminal.writes.length;
+  // Sidebar -> hide/Main is the deliberate visibility change that re-enables
+  // exactly the active child's own observed modes.
+  harness.terminal.emitInput(ALT_LEFT);
+  assert.deepEqual(harness.terminal.writes.slice(beforeFocusReenable), ["\x1b[?1000h", "\x1b[?1006h"]);
+  assert.equal(harness.sidebar?.focus, "main");
+  assert.equal(harness.sidebar?.visible, false);
   assert.equal(await closeWithSignal(harness), 0);
   assert.ok(harness.terminal.writes.includes("\x1b[?1000l"), "cleanup disables only the active owned tracking mode");
   assert.ok(harness.terminal.writes.includes("\x1b[?1006l"), "cleanup disables only owned cell-SGR encoding");

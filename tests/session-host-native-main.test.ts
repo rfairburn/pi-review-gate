@@ -3,6 +3,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, isAbsolute, join, resolve, sep } from "node:path";
 import test from "node:test";
 
+import { SidebarController } from "../src/session-host/sidebar";
+import { stripGeneratedSgr } from "../src/session-host/terminal-surface";
+
 import {
   CleanupOutcome,
   KEYS,
@@ -24,6 +27,7 @@ import {
   processIsAlive,
   removeOwnedScratchTreePruningTerraform,
   resolveRuntimePin,
+  restoredNativeEditorFrame,
   sessionFileHasStoredName,
   sha256,
 } from "./helpers/session-host-native-main-harness";
@@ -130,6 +134,49 @@ async function settingsSmoke(driver: MainPtyDriver, session: OwnedSession, works
   assert.equal(entry!.instructions, instructions);
   assert.equal(entry!.workspace, workspaceEditValue, "the actual Ctrl+G editor's changed value was persisted");
 }
+
+test("the complete restored-native-editor witness rejects stale narrow frames, partial repaints, and altered drafts", () => {
+  const controller = new SidebarController({ toggleKey: "f8" });
+  controller.updateItems([{
+    id: "owned-native-row", label: "BGT", workspace: "/owned/workspace", agentDir: "/owned/agent",
+    lifecycle: "alive", busy: false, pendingInput: false, inputSurface: false, activity: [],
+  }]);
+  const ownerLabel = "BGT";
+  const draft = "nativeDraftB";
+  const nativeWidth = OUTER_COLS - 32 - 1;
+  // A visible controller starts sidebar-focused; draw the roster first so the
+  // complete-card fence authorizes the roster-only Alt+Right Main-focus return.
+  controller.renderRoster(32, 49);
+  controller.handleInput(KEYS.altRight);
+  assert.equal(controller.focus, "main");
+  assert.equal(controller.visible, true);
+  const left = controller.renderRoster(32, 49).lines.map((line) => stripGeneratedSgr(line));
+  const nativePane = (top: string, content: string, closing: string): string[] => {
+    const rows = Array.from({ length: 49 }, () => "");
+    rows[20] = top;
+    rows[21] = content;
+    rows[22] = closing;
+    return rows;
+  };
+  const compose = (sidebar: readonly string[], main: readonly string[]): string =>
+    [ownerLabel, ...sidebar.map((line, index) => `${line.padEnd(32)}│${main[index] ?? ""}`)].join("\n");
+  const rule = "─".repeat(nativeWidth);
+  const options = { ownerLabel, draft, sidebarColumns: 32, nativeWidth };
+  assert.equal(restoredNativeEditorFrame(compose(left, nativePane(rule, `> ${draft}`, rule)), options), true,
+    "the complete restored editor at the current width is accepted");
+  assert.equal(restoredNativeEditorFrame(compose(left, nativePane("─".repeat(52), `> ${draft}`, "─".repeat(52))), options), false,
+    "a resized stale narrow frame is rejected");
+  assert.equal(restoredNativeEditorFrame(compose(left, nativePane(rule, `> ${draft}`, "")), options), false,
+    "a partial repaint that never drew the closing border is rejected");
+  assert.equal(restoredNativeEditorFrame(compose(left, nativePane(rule, `> ${draft}qQ`, rule)), options), false,
+    "an appended draft is rejected");
+  assert.equal(restoredNativeEditorFrame(compose(left, nativePane(rule, `> x-${draft}`, rule)), options), false,
+    "an altered draft is rejected");
+  assert.equal(restoredNativeEditorFrame(compose([...left, "e edit name"], nativePane(rule, `> ${draft}`, rule)), options), false,
+    "a stale sidebar-only footer is rejected");
+  assert.equal(restoredNativeEditorFrame([ownerLabel, ...Array.from({ length: 49 }, () => "")].join("\n"), options), false,
+    "a missing roster and editor are rejected");
+});
 
 // Guards the immutable startup-option contract as well as this alpha's
 // local-scripted-provider/no-session-override fixture boundary.
@@ -434,16 +481,56 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
     && !text.includes(completionTargetNameA) && !text.includes(completionTargetNameB),
   "the first Escape dismisses native completion without canceling New", beforeCompletionEscape);
   assert.equal(driver.focus, "form", "completion dismissal retains form ownership");
+  const escapeControlsBeforeFormCancel = driver.nativeEscapeControlCount(bPid, sessionB.workspace);
+  const lifecycleBeforeFormCancel = driver.records().filter((record) =>
+    (record.type === "session_shutdown" || record.type === "session_start") && record.pid === bPid).length;
+  const resizesBeforeFormCancel = driver.records().filter((record) => record.type === "resize").length;
   const beforeFormCancel = driver.frameRevision;
   driver.pty.write(KEYS.escape);
-  driver.focus = "main";
-  driver.sidebarVisible = false;
-  await driver.waitFrame((text) => !text.includes("New session") && !text.includes("Workspace:") && text.includes(draftB),
-    "the second Escape cancels New and finishes painting B's unchanged native draft", beforeFormCancel);
-  assert.ok(driver.currentText().includes(draftB), "canceling New restores B's unchanged native prompt draft");
+  // Escape cancels ONLY New. At 52x30 the roster is a full-width overlay, so the
+  // native pane (and B's retained draft) is genuinely not rendered here:
+  // require the complete current roster/focus/footer and the unchanged owner,
+  // never a fabricated view of the hidden native draft.
+  const narrowColumns = 52;
+  driver.focus = "sidebar";
+  driver.sidebarVisible = true;
+  await driver.waitFrame((text) => !text.includes("> Workspace:")
+    && parseRosterFrame(text, narrowColumns).complete
+    && isSidebarFocusedFrame(text, narrowColumns)
+    && frameHeaderMatches(text, labelB),
+  "the second Escape cancels only New and finishes painting the complete narrow roster with B's unchanged owner",
+  beforeFormCancel);
+  assert.equal(driver.sidebarVisible, true, "canceling New returns to the visible roster instead of hiding the sidebar");
+  assert.equal(driver.focus, "sidebar", "canceling New returns ownership to the visible roster, not Main");
   assert.equal(processIsAlive(bPid), true, "canceling New never stops B's native process");
-  await driver.toggleSidebar();
-  await driver.setOuterSize(OUTER_COLS, OUTER_ROWS, initialSessions, 87, 49);
+  assert.equal(driver.nativeEscapeControlCount(bPid, sessionB.workspace), escapeControlsBeforeFormCancel,
+    "cancelling New writes no native Escape to B's owned PTY");
+  assert.equal(driver.records().filter((record) =>
+    (record.type === "session_shutdown" || record.type === "session_start") && record.pid === bPid).length,
+  lifecycleBeforeFormCancel, "cancelling New mutates no native lifecycle for B");
+  assert.equal(driver.records().filter((record) => record.type === "resize").length, resizesBeforeFormCancel,
+    "cancelling New resizes no native child");
+  // Deliberate, individually witnessed Main-focus return: one roster-only
+  // Alt+Right moves host input focus to the existing Main owner without
+  // activating the highlighted row, hiding the pane, or resizing any child.
+  driver.pty.write(KEYS.altRight);
+  driver.focus = "main";
+  driver.sidebarVisible = true;
+  const beforeRestoredNative = driver.frameRevision;
+  await driver.setOuterSize(OUTER_COLS, OUTER_ROWS, initialSessions, OUTER_COLS - 32 - 1, 49);
+  // setOuterSize only observes first outer output and the resize records, so
+  // require the COMPLETE restored editor: the exact owner header, the complete
+  // roster with its Main-focused footer (no stale sidebar-only hints), a
+  // width-correct bordered editor block, and B's exact unchanged draft. A
+  // stale narrow frame, a partial repaint, or an altered draft never passes.
+  await driver.waitFrame((text) => restoredNativeEditorFrame(text, {
+    ownerLabel: labelB, draft: draftB, sidebarColumns: 32, nativeWidth: OUTER_COLS - 32 - 1,
+  }),
+  "Main completely repaints the restored wide native editor with B's unchanged exact draft",
+  beforeRestoredNative);
+  assert.equal(driver.surface.frame().cols, OUTER_COLS, "the restored outer geometry is the full latest width");
+  assert.equal(driver.focus, "main", "the deliberate Main-focus return keeps the existing owner");
+  assert.equal(driver.sidebarVisible, true, "the deliberate Main-focus return never hides the visible sidebar");
   await driver.activateRoster(labelB, draftB);
 
   await driver.writeAndWait("qQ", (text) => text.includes(`${draftB}qQ`), "native q/Q are forwarded unchanged in Main focus");

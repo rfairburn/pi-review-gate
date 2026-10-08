@@ -168,9 +168,8 @@ test("real POSIX source launcher stages, builds, runs a native Pi child, and res
   const moduleEvidence = await driver.waitForPty((entries) => entries.some((record) => record.type === "pty_module"),
     "the preload observed the production node-pty lazy-load anchor during the first real spawn");
   assert.equal(session.displayName, "(no messages)", "the fresh native child starts with the actual empty-conversation caption");
-  assert.equal(frameHeader(driver.currentText()) === session.displayName, false,
-    "New highlights the row but does not activate it; the outer header stays the welcome title");
-  await driver.activate(session.displayName);
+  assert.equal(frameHeader(driver.currentText()), session.displayName,
+    "a successful New submission activates the child; the outer header becomes its caption");
   const draft = `posixLauncherDraft${randomDigits(8)}`;
   await driver.writeDraft(draft);
   assert.ok(driver.currentText().includes(draft), "the active native child displays its own input draft");

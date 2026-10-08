@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import type { Writable } from "node:stream";
-import { ProcessTerminal } from "pi-session-host-tui";
+import { ProcessTerminal, matchesKey } from "pi-session-host-tui";
 
 import { createStatusBroker, type StatusBroker } from "./broker";
 import { composeHostFrame, computeHostLayout, type HostFocus, type HostLayout, type RenderedSidebar } from "./compositor";
@@ -795,8 +795,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         if (!row || row.lifecycle === "error" || row.lifecycle === "starting") {
           sidebar.failCreate(action.requestId, GENERIC_CREATE_FAILURE);
         } else {
-          // Selecting/highlighting the new row is not ownership transfer.
-          // Only a later explicit SidebarAction.select changes activeId.
+          // A successful New submission activates the created child as the
+          // Main input owner (the sidebar emits select); launch-error rows
+          // never reach this success path.
           sidebar.completeCreate(action.requestId, id);
         }
         syncRosterAndSchedule();
@@ -817,8 +818,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    * Deliberate saved-conversation open (issue 323): revalidate the exact
    * catalog row against the live file and known-owned duplicates, then start
    * a NEW independently owned child with the exact branded per-child
-   * --session admission. The active session is never touched; success only
-   * highlights the new row.
+   * --session admission. The active session is never touched; a successful
+   * open activates the restored child as the Main input owner (the sidebar
+   * emits select), with the pane's visibility unchanged.
    */
   function launchSavedOpen(requestId: number, file: string, sessionId: string): void {
     if (!manager || !sidebar || shutdownRequested) return;
@@ -854,8 +856,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         if (!created || created.lifecycle === "error" || created.lifecycle === "starting") {
           sidebar.failSavedOpen(requestId, GENERIC_CREATE_FAILURE);
         } else {
-          // Highlighting the new row is not ownership transfer; only a later
-          // explicit host-row Enter activates it.
+          // A successful Saved open activates the restored child as the Main
+          // input owner; launch-error rows never reach this success path.
           sidebar.completeSavedOpen(requestId, id);
         }
         syncRosterAndSchedule();
@@ -1652,6 +1654,21 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           !keybindings.manager.matches(data, "app.clear")
           && !keybindings.manager.matches(data, "app.editor.external")
           && keybindings.manager.matches(data, "app.interrupt"),
+        // Mirror the field's own effective submit resolution: the configured
+        // `tui.input.submit` binding when it is defined, otherwise Enter. The
+        // submission provenance fence uses this to consume the held key.
+        matchesSubmit: (data: string) => {
+          try {
+            const defined = typeof keybindings.manager.getDefinition === "function"
+              ? keybindings.manager.getDefinition("tui.input.submit") !== undefined
+              : true;
+            return defined
+              ? keybindings.manager.matches(data, "tui.input.submit")
+              : matchesKey(data, "enter");
+          } catch {
+            return matchesKey(data, "enter");
+          }
+        },
         ...(keybindings.notice ? { notice: keybindings.notice } : {}),
         hints: {
           submit: nativeKeyHint(keybindings.manager, "tui.input.submit", "enter", ["app.clear", "app.editor.external", "app.interrupt"]),

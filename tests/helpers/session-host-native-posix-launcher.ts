@@ -51,12 +51,14 @@ import {
 } from "./session-host-native-main-harness";
 import {
   frameHeader,
+  frameHeaderMatches,
   isSidebarFocusedFrame,
   parseRosterFrame,
   selectedRosterEntry,
   sidebarPaneLines,
   sidebarRosterHidden,
 } from "./session-host-native-roster-witness";
+import { isCompleteMainFocusedRoster } from "./session-host-native-row-lifecycle";
 import {
   assertNativeEditorFieldEmpty,
   borderedEditorContentMatches,
@@ -1002,7 +1004,6 @@ export class PosixLauncherPtyDriver {
   async createNativeSession(workspace: string): Promise<PosixOwnedSession> {
     const canonicalWorkspace = realpathSync(workspace);
     await this.ensureSidebarFocus();
-    const activeHeaderBeforeNew = frameHeader(this.currentText());
     await this.moveRosterTo("New session");
     await this.send(KEYS.enter, "Workspace-only New form opens", (frame) => frame.includes("New session") && frame.includes("Workspace:")
       && !frame.includes("Label:") && !frame.includes("Profile:") && frame.includes("tab complete"));
@@ -1070,10 +1071,12 @@ export class PosixLauncherPtyDriver {
       throw new Error("native observer recorded no canonical display caption");
     }
     const displayName: string = rawDisplayName;
+    // A successful New submission activates the created child as the Main
+    // input owner without a second host-row Enter; the sidebar stays visible.
     await this.waitFrame((frame) => selectedRosterLabel(frame) === displayName
-      && frameHeader(frame) === activeHeaderBeforeNew && isSidebarFocusedFrame(frame, 32),
-    "the new native row is highlighted after completion without activation or a header change");
-    this.focus = "sidebar";
+      && frameHeaderMatches(frame, displayName) && isCompleteMainFocusedRoster(frame),
+    "the new native row is the active Main input owner with a complete Main-focused frame");
+    this.focus = "main";
     const session: PosixOwnedSession = { displayName, workspace: canonicalWorkspace, record, exitWatcher };
     this.ownedSessions.push(session);
     return session;

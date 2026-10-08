@@ -332,7 +332,7 @@ test("a completion-dismissal Escape held through a reserved toggle to Main never
   );
 });
 
-test("a completion-dismissal Escape held through a completed create never hides the roster", () => {
+test("a completion-dismissal Escape held through a completed create never hides the roster or leaks into the child", () => {
   const { harness, fields } = makeCompletionFormHarness();
   harness.send(ENTER); // New form over a field whose completion list is open
   const field = fields.at(-1);
@@ -343,15 +343,18 @@ test("a completion-dismissal Escape held through a completed create never hides 
   assert.equal(field.cancelCalls, 0);
   harness.send(ENTER); // submit -> create request 1
   assert.equal(field.submitCalls, 1, "the form submitted the typed workspace");
-  harness.controller.completeCreate(1, "created-row"); // roster focus before the key is released
-  assert.equal(harness.controller.focus, "sidebar");
+  harness.controller.completeCreate(1, "created-row"); // ownership transfers before the key is released
+  assert.equal(harness.controller.focus, "main", "the completed New activates the created child");
   assert.equal(harness.controller.visible, true);
-  harness.send(ESC_REPEAT); // held repeat in the roster: consumed, never a hide
+  harness.baseline = harness.actions.length;
+  harness.send(ESC_REPEAT); // held repeat in Main: consumed, never a hide
   assert.equal(harness.controller.visible, true, "the held repeat cannot hide the roster");
-  assert.equal(harness.controller.focus, "sidebar");
+  assert.equal(harness.controller.focus, "main");
   harness.send(ESC_RELEASE); // held release: consumed, clears the fence
   assert.equal(harness.controller.visible, true);
-  // A fresh roster Escape still hides (the fence ended on the release).
+  assert.deepEqual(harness.forwards(), [], "the held Escape repeat/release never becomes child input");
+  // A fresh, deliberate Escape in Main focus is ordinary native input.
   harness.send(ESC);
-  assert.equal(harness.controller.visible, false);
+  assert.equal(harness.controller.visible, true, "a fresh Main Escape is native input, not a roster hide");
+  assert.deepEqual(harness.forwards(), [{ type: "forward", data: ESC }]);
 });

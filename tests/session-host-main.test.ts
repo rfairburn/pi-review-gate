@@ -549,12 +549,18 @@ async function startTwoSessions(harness: Harness): Promise<FakeManager> {
   const manager = await ready(harness);
   fillForm(harness.terminal, "/first/workspace");
   await nextTurn();
+  // A successful New made native-1 the Main owner; return to the visible
+  // sidebar roster before navigating to New again.
+  harness.terminal.emitInput(ALT_LEFT);
   harness.terminal.emitInput("\x1b[B"); // first row -> Saved conversations
   harness.terminal.emitInput("\x1b[B"); // -> New session
   harness.terminal.emitInput(ENTER);
   completeForm(harness.terminal, "/another/workspace");
   await nextTurn();
   assert.deepEqual(manager.views.map((view) => view.id), ["native-1", "native-2"]);
+  // Leave the caller in sidebar focus with native-2 (the last created owner)
+  // highlighted, matching the pre-activation roster state.
+  harness.terminal.emitInput(ALT_LEFT);
   return manager;
 }
 
@@ -783,7 +789,7 @@ test("forms may be edited during keyboard negotiation but no native create start
   assert.equal(await closeWithSignal(harness), 0);
 });
 
-test("highlighting a newly created row does not transfer active input ownership; explicit select does", async () => {
+test("a successful New submission activates the created row as the Main input owner without a second Enter", async () => {
   const harness = createHarness();
   const manager = await ready(harness);
 
@@ -791,7 +797,8 @@ test("highlighting a newly created row does not transfer active input ownership;
   await nextTurn();
   assert.equal(manager.views[0]?.id, "native-1");
   assert.equal(manager.views[0]?.hasLiveProcess, true);
-  harness.terminal.emitInput(ENTER); // Explicitly select first row; focus returns to Main.
+  assert.equal(harness.sidebar?.focus, "main", "the completed New child becomes the active input owner");
+  assert.equal(harness.sidebar?.selectedId, "native-1", "the created row is highlighted as the active owner");
   // Two deliberate F8 presses: the first only focuses the visible sidebar, and
   // the second hides it back to Main, so these native packets really start in Main.
   harness.terminal.emitInput(ALT_LEFT);
@@ -816,14 +823,12 @@ test("highlighting a newly created row does not transfer active input ownership;
   await nextTurn();
   assert.equal(manager.views[1]?.id, "native-2");
   assert.equal(harness.manager?.list()[1]?.label, "Native native-2");
-  assert.equal(manager.writes.at(-1)?.id, "native-1", "late create/highlight did not steal the active owner");
+  assert.equal(harness.sidebar?.focus, "main", "the second completed New child is active without another Enter");
+  assert.equal(harness.sidebar?.selectedId, "native-2");
+  assert.equal(manager.writes.at(-1)?.id, "native-1", "completing New wrote no native input");
 
-  // The newly created row is highlighted in the picker. Enter is the explicit
-  // ownership transfer; subsequent Main input goes only to native-2.
+  // Subsequent Main input goes only to the newly active native-2.
   assert.equal(harness.terminal.inputHandler !== undefined, true);
-  harness.terminal.emitInput(ENTER);
-  harness.terminal.emitInput(ALT_LEFT); // focus the visible sidebar first
-  harness.terminal.emitInput(ALT_LEFT); // then hide, resuming the newly selected Main owner
   harness.terminal.emitInput("q");
   assert.equal(manager.writes.at(-1)?.id, "native-2");
 
@@ -846,6 +851,7 @@ test("native Edit persists a rename without activating the row or routing input 
   await nextTurn();
   assert.equal(manager.views[0]?.nativeSession?.epoch, 1);
 
+  harness.terminal.emitInput(ALT_LEFT); // return from the auto-activated child to the visible sidebar
   harness.terminal.emitInput("e");
   assert.equal(harness.sidebar?.focus, "form");
   harness.terminal.emitInput("Renamed title");
@@ -873,6 +879,7 @@ test("rename refusal uses set/verify wording, never persistence claims", async (
   fillForm(harness.terminal, "/rename/workspace");
   await nextTurn();
 
+  harness.terminal.emitInput(ALT_LEFT); // return from the auto-activated child to the visible sidebar
   harness.terminal.emitInput("e");
   harness.terminal.emitInput("Renamed title");
   manager.renameError = true;
@@ -1131,6 +1138,7 @@ test("pending rename uses the configured interrupt and ignores its late result a
     const renameEntered = new Promise<void>((resolve) => { enterRename = resolve; });
     manager.renameGate = new Promise<void>((resolve) => { releaseRename = resolve; });
     manager.renameGateEntered = enterRename;
+    harness.terminal.emitInput(ALT_LEFT); // return from the auto-activated child to the visible sidebar
     harness.terminal.emitInput("e");
     harness.terminal.emitInput("Delayed rename");
     harness.terminal.emitInput(ENTER);
@@ -1244,6 +1252,7 @@ test("Main carries the observed tuple into Edit and leaves a stale rename unconf
   const manager = await ready(harness);
   fillForm(harness.terminal, "/stale-rename/workspace");
   await nextTurn();
+  harness.terminal.emitInput(ALT_LEFT); // return from the auto-activated child to the visible sidebar
   harness.terminal.emitInput("e");
   assert.equal(harness.sidebar?.focus, "form");
 
@@ -1405,7 +1414,6 @@ test("failed, live, and unconfirmed removals leave the row and owner in place wi
   const manager = await ready(harness);
   fillForm(harness.terminal, "removal refusal");
   await nextTurn();
-  harness.terminal.emitInput(ENTER); // explicitly activate native-1
   const original = manager.views[0];
   assert.ok(original);
   manager.views[0] = { ...original, lifecycle: "exited", hasLiveProcess: false, busy: null, pendingInput: null };
@@ -1504,7 +1512,6 @@ test("wide form temporarily replaces the right pane; the child stays alive, unre
   await nextTurn();
   assert.equal(manager.views[0]?.id, "native-1");
   assert.equal(manager.views[0]?.hasLiveProcess, true);
-  harness.terminal.emitInput(ENTER); // explicit select -> main focus
 
   harness.terminal.emitInput(ALT_LEFT); // focus the visible sidebar roster on native-1
   await nextTurn();
@@ -1601,7 +1608,9 @@ test("mouse routing uses active live child modes, mode-only changes, native view
   const surface = manager.surface("native-1");
   assert.ok(surface);
   surface.modes = { ...surface.modes, mouseTracking: "drag", mouseEncoding: "sgr" };
-  harness.terminal.emitInput(ENTER); // explicit select, switch to Main focus
+  // The completed New already made native-1 the active Main owner; a roster
+  // notification re-syncs the host's owned mouse modes for its live surface.
+  manager.notify();
   assert.ok(harness.terminal.writes.includes("\x1b[?1002h"));
   assert.ok(harness.terminal.writes.includes("\x1b[?1006h"));
 
@@ -1639,6 +1648,7 @@ test("responsive resize resizes every owned child only when native geometry chan
   const manager = await ready(harness);
   fillForm(harness.terminal, "first");
   await nextTurn();
+  harness.terminal.emitInput(ALT_LEFT); // return to the visible sidebar with native-1 highlighted
   harness.terminal.emitInput("\x1b[B"); // -> Saved conversations
   harness.terminal.emitInput("\x1b[B"); // next row is New session
   harness.terminal.emitInput(ENTER);
@@ -1666,7 +1676,6 @@ test("outer source normalization uses ProcessTerminal.kittyProtocolActive, never
   const manager = await ready(harness, 7);
   fillForm(harness.terminal, "source kitty");
   await nextTurn();
-  harness.terminal.emitInput(ENTER); // explicit Main selection
   const count = manager.writes.length;
   const surface = manager.surface("native-1");
   assert.ok(surface);
@@ -1689,6 +1698,7 @@ test("confirmed Quit is the only sidebar path that shuts down owned children", a
   const manager = await ready(harness);
   fillForm(harness.terminal, "confirmed quit");
   await nextTurn();
+  harness.terminal.emitInput(ALT_LEFT); // focus the visible sidebar roster
   harness.terminal.emitInput("q");
   assert.equal(harness.terminal.stopCount, 0);
   assert.equal(manager.shutdownCalls, 0, "a live child requires SidebarController confirmation");
@@ -1971,10 +1981,10 @@ test("saved picker lists the shared catalog and opens a new independent child wi
     assert.equal((created.savedSession as { sessionId: string }).sessionId, fixture.sessionId);
     assert.equal((created.savedSession as { file: string }).file, fixture.file);
 
-    // Success highlights the new row without transferring input ownership.
-    assert.equal(harness.sidebar?.focus, "sidebar");
-    assert.equal(harness.sidebar?.selectedId, "native-1", "the new row is highlighted only");
-    assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 0).startsWith("Session host"), "no active view was adopted");
+    // A successful Saved open activates the restored child as the Main owner.
+    assert.equal(harness.sidebar?.focus, "main");
+    assert.equal(harness.sidebar?.selectedId, "native-1", "the restored row becomes the active owner");
+    assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 0).includes("Native native-1"), "the restored child's header is the active view");
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }

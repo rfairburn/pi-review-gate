@@ -75,6 +75,7 @@ import {
   isKeyRepeat,
   type KeyId,
   matchesKey,
+  parseKey,
   truncateToWidth,
   visibleWidth,
 } from "pi-session-host-tui";
@@ -196,6 +197,13 @@ export interface SidebarFieldFactoryOptions {
 export interface SidebarFieldFactoryResult {
   readonly field: SessionHostTextField;
   readonly matchesCancel?: (data: string) => boolean;
+  /**
+   * Optional matcher for the field's effective submit key. The submission
+   * provenance fence consumes the held submit key's repeat/release, so it must
+   * follow the native field's configured binding (e.g. `tui.input.submit`),
+   * not assume unmodified Enter.
+   */
+  readonly matchesSubmit?: (data: string) => boolean;
   readonly notice?: string;
   readonly hints?: {
     readonly submit: string;
@@ -857,6 +865,15 @@ export class SidebarController {
   private readonly createTextField?: SidebarControllerOptions["createTextField"];
   private formField?: SessionHostTextField;
   private formMatchesCancel: (data: string) => boolean = (data) => matchesKey(data, "escape");
+  /** Effective native submit-key matcher for the current form field. */
+  private formMatchesSubmit: (data: string) => boolean = (data) => matchesKey(data, "enter");
+  /**
+   * The exact canonical key id of the field input currently being handled,
+   * captured only while it synchronously submits the New form. This
+   * distinguishes which configured submit binding actually fired when several
+   * keys are bound to `tui.input.submit`.
+   */
+  private formInputSubmitKey: KeyId | undefined;
   private formPasteActive = false;
   private formPasteCarry = "";
   private formHints = DEFAULT_FORM_HINTS;
@@ -911,6 +928,15 @@ export class SidebarController {
    * fresh roster Escape still hides (existing semantics).
    */
   private formEscapeClaimed = false;
+  /**
+   * Provenance fence for the fresh submit key that submitted the New form or
+   * opened a saved conversation. Success transfers input ownership to the
+   * newly created child, so the held key's repeat/release must not be replayed
+   * into that child as native input; a later fresh press of that key in Main is
+   * ordinary native input. The matcher is captured at submission time so it
+   * survives the field teardown that follows a successful completion.
+   */
+  private formSubmitClaim: ((data: string) => boolean) | undefined;
   private pendingCreate: { readonly requestId: number } | undefined;
   private pendingRename: { readonly requestId: number } | undefined;
   /** Explicit confirmation purpose: quit the host or stop one owned session. */
@@ -1098,9 +1124,11 @@ export class SidebarController {
   }
 
   /**
-   * Resolves a pending create. The new row is highlighted only when the
-   * request still owns the form; late completions never steal focus from a
-   * newer selection or form draft.
+   * Resolves a pending create. A successful explicit New submission activates
+   * the created child as the Main input owner without a second host-row Enter
+   * (the pane stays visible exactly as it was); the new row is highlighted only
+   * while the request still owns the form. Late completions never steal focus
+   * from a newer selection or form draft.
    */
   completeCreate(requestId: number, id: string): void {
     if (this.pendingCreate?.requestId !== requestId) {
@@ -1113,7 +1141,8 @@ export class SidebarController {
     this.formError = undefined;
     if (this._focus === "form") {
       this.acceptCompletedRow(id);
-      this._focus = "sidebar";
+      this._focus = "main";
+      this.emit({ type: "select", id });
     }
   }
 
@@ -1396,6 +1425,24 @@ export class SidebarController {
     return false;
   }
 
+  /**
+   * Fences the held submit key whose fresh press submitted the New form or
+   * opened a saved conversation. Once that success transferred ownership to
+   * the new child, the same key's repeat/release is consumed instead of being
+   * replayed into the child; a later fresh press of that key in Main is
+   * ordinary native input and is forwarded. The matcher follows the native
+   * field's configured submit binding. Returns true when the event was
+   * consumed.
+   */
+  private consumeFormSubmitClaim(data: string): boolean {
+    const claimed = this.formSubmitClaim;
+    if (claimed === undefined || !claimed(data)) return false;
+    if (isKeyRelease(data)) { this.formSubmitClaim = undefined; return true; }
+    if (isKeyRepeat(data)) return true; // consume the held-key repeat
+    this.formSubmitClaim = undefined; // a fresh press is ordinary native input
+    return false;
+  }
+
   // --- Main focus: everything is forwarded unchanged except the toggle. ---
 
   private handleMainInput(data: string): void {
@@ -1406,6 +1453,12 @@ export class SidebarController {
     // the child as input, even after a focus change; its repeat/release is
     // consumed here until the key is released or freshly pressed again.
     if (this.consumeFormEscapeClaim(data)) {
+      return;
+    }
+    // The held Enter that submitted the New form or opened a saved
+    // conversation must not replay its repeat/release into the newly focused
+    // child after that success transferred ownership.
+    if (this.consumeFormSubmitClaim(data)) {
       return;
     }
     // A held Alt+Right whose initial press a host-owned surface claimed must
@@ -1784,8 +1837,19 @@ export class SidebarController {
     // input. The field still receives the press first, so its completion-list
     // precedence and the reserved-toggle priority are unchanged.
     if (matchesKey(data, "escape")) this.formEscapeClaimed = true;
-    if (this.formField) this.formField.handleInput(data);
-    else if (matchesKey(data, "escape")) this.escapeFromForm();
+    if (this.formField) {
+      // Capture the exact canonical key id while the field synchronously
+      // handles this packet, so a multi-binding submit fences the binding that
+      // actually fired rather than the whole action matcher.
+      this.formInputSubmitKey = this.formMatchesSubmit(data)
+        ? parseKey(data) as KeyId | undefined
+        : undefined;
+      try {
+        this.formField.handleInput(data);
+      } finally {
+        this.formInputSubmitKey = undefined;
+      }
+    } else if (matchesKey(data, "escape")) this.escapeFromForm();
   }
 
   /** Keep bracketed-paste chunks opaque to host actions; the native Editor still owns their contents. */
@@ -1923,6 +1987,10 @@ export class SidebarController {
     const requestId = this.nextRequestId++;
     this.pendingSavedOpen = { requestId };
     this.savedError = undefined;
+    // Claim the fresh submit key that opened the saved conversation: its
+    // repeat/release must not reach the newly focused native child after a
+    // successful completion. The picker's open key is Enter.
+    this.formSubmitClaim = (data) => matchesKey(data, "enter");
     this.emit({ type: "saved-open", requestId, file: row.file, sessionId: row.id });
   }
 
@@ -1964,19 +2032,22 @@ export class SidebarController {
   }
 
   /**
-   * Completes a deliberate saved-open. The new row is highlighted only while
-   * the request still owns the open pane; highlighting is not ownership
-   * transfer — only a later explicit host-row Enter activates it.
+   * Completes a deliberate saved-open. A successful explicit Saved submission
+   * activates the restored child as the Main input owner without a second
+   * host-row Enter (the pane stays visible exactly as it was); the new row is
+   * highlighted only while the request still owns the open pane. Late
+   * completions never steal ownership or visibility.
    */
   completeSavedOpen(requestId: number, id: string): void {
     if (this.pendingSavedOpen?.requestId !== requestId) return; // stale: ignore
     this.pendingSavedOpen = undefined;
     if (this._focus === "form" && this.formKind === "saved") {
       this.savedError = undefined;
-      this.acceptCompletedRow(id);
       this.disposeFormField();
       this.formKind = undefined;
-      this._focus = "sidebar";
+      this.acceptCompletedRow(id);
+      this._focus = "main";
+      this.emit({ type: "select", id });
     }
   }
 
@@ -2044,6 +2115,7 @@ export class SidebarController {
         };
       this.formField = created.field;
       this.formMatchesCancel = created.matchesCancel ?? ((data) => matchesKey(data, "escape"));
+      this.formMatchesSubmit = created.matchesSubmit ?? ((data) => matchesKey(data, "enter"));
       this.formHints = created.hints ?? DEFAULT_FORM_HINTS;
       this.formNotice = created.notice
         ? sanitizeBounded(created.notice, ERROR_TEXT_MAX_CODEPOINTS)
@@ -2060,6 +2132,7 @@ export class SidebarController {
     try { this.formField?.dispose(); } catch { /* independent field cleanup */ }
     this.formField = undefined;
     this.formMatchesCancel = (data) => matchesKey(data, "escape");
+    this.formMatchesSubmit = (data) => matchesKey(data, "enter");
     this.formPasteActive = false;
     this.formPasteCarry = "";
     this.formHints = DEFAULT_FORM_HINTS;
@@ -2085,6 +2158,14 @@ export class SidebarController {
     const requestId = this.nextRequestId++;
     this.pendingCreate = { requestId };
     this.formError = undefined;
+    // Claim only the exact submit key that fired this submission: its
+    // repeat/release must not reach the newly focused native child after a
+    // successful completion, while any other configured submit binding stays
+    // ordinary input. The captured key survives the field teardown.
+    const submitKey = this.formInputSubmitKey;
+    this.formSubmitClaim = submitKey === undefined
+      ? undefined
+      : (data: string) => matchesKey(data, submitKey);
     this.emit({ type: "create", requestId, workspace });
   }
 

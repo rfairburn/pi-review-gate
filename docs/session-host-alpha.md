@@ -120,6 +120,8 @@ unchanged.
 The host opens on a welcome/sidebar picker; it does not implicitly launch a Pi session
 or treat its own startup directory as a workspace. Each **New session** asks only for an
 explicit existing workspace directory; there is no separate host display-label field.
+Submitting New creates the child and immediately makes it the active Main input owner
+without a second row Enter; the sidebar stays visible.
 The sidebar name comes from the observed native conversation metadata (the stored
 native name or Pi's native first-user-message fallback). Until that metadata is observed,
 the row reports that the session name is unavailable rather than inventing a user label.
@@ -140,7 +142,9 @@ models, keybindings, extensions, MCP configuration, skills, and provider environ
 The host does not clone those files, republish skills, create per-window credentials, or
 require a separate login. It does not attach to existing or detached processes, adopt
 them, or reparent work. Moving the sidebar highlight does not change the active
-session; press Enter to activate a row. Enter on an exited row instead starts a new
+session; press Enter to activate a row. A successful New submission or saved-conversation
+open activates the created or restored child directly, without a second row Enter.
+Enter on an exited row instead starts a new
 owned process for its current observed conversation, using a freshly revalidated saved
 entry. A positively never-saved binding can start fresh in the same workspace only when
 the safe catalog confirms that exact conversation is absent. Unknown, ambiguous, unsafe,
@@ -169,7 +173,8 @@ again after that child has confirmed exit. The picker shows truthful loading, em
 unavailable, and partial issue-count notices; Up/Down moves the highlight, Enter opens
 the highlighted conversation only when that row was fully drawn by the last picker
 render (a too-small fallback or an undrawn/hidden row is refused), and Escape returns
-to the roster without pausing or stopping anything. A late listing or creation result never takes over a later-opened or
+to the roster without pausing or stopping anything. A successful open makes the restored
+child the active Main input owner without a second Enter, with the pane still visible. A late listing or creation result never takes over a later-opened or
 dismissed pane.
 
 The native review-gate configuration is initialized with the ordinary zero-model
@@ -209,8 +214,11 @@ files, or saved conversation files. Removing the active owner clears ownership w
 auto-activating a sibling; removing an inactive row preserves the existing owner.
 Delete remains native input in Main focus unless it is itself the explicitly configured
 sidebar-toggle chord.
-In the New session form, Enter submits the explicit workspace path; the native Editor
-provides path completion and its current Pi editing bindings. If a completion menu is
+In the New session form, Enter (or the configured native submit binding) submits the
+explicit workspace path; the native Editor
+provides path completion and its current Pi editing bindings. A successful submission
+activates the created child as the active Main input owner, and that submission key's
+repeat/release is fenced so it is never replayed into the new child as native input. If a completion menu is
 open, the first Escape/cancel action dismisses that native menu and keeps the form; the
 next fresh Escape cancels only New and returns to the visible roster without hiding the
 sidebar. New and Edit cancellation are both local to their own form: the active Main
@@ -291,7 +299,9 @@ and leaves at least 20 columns for the native frame. The New/Edit form
 temporarily replaces that right (native) pane while the roster remains on the left;
 below that width the form is a full-content overlay instead. While the form is open,
 the underlying child keeps running unpaused with its geometry and input ownership
-unchanged, and cancelling or completing the form restores the same child frame.
+unchanged; cancelling the form restores the same child frame, while completing New or
+Saved activates the new child as the Main input owner (completing Edit restores the same
+child frame).
 Below 53 columns the sidebar is a frontend overlay while it has focus; native
 geometry remains full-width and unchanged across focus switches, and returning to
 native focus only removes the overlay. Sidebar hint text wraps across reserved

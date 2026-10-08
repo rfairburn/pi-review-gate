@@ -1938,6 +1938,20 @@ export class MainPtyDriver {
     return parseRosterFrame(text, this.sidebarColumnCount()).complete;
   }
 
+  /**
+   * Complete Main-focused roster evidence: the drawn entry extent plus the
+   * full Main footer and no stale sidebar-only hint. Used to prove that a
+   * completed New/Saved explicit submission really transferred input
+   * ownership to the new child rather than merely moving the highlight.
+   */
+  private mainFocusedRoster(text: string): boolean {
+    const footer = rosterFooterText(text, this.sidebarColumnCount());
+    if (footer === undefined) return false;
+    for (const hint of MAIN_FOCUS_FOOTER_HINTS) if (!footer.includes(hint)) return false;
+    for (const stale of SIDEBAR_ONLY_FOOTER_HINTS) if (footer.includes(stale)) return false;
+    return true;
+  }
+
   private rememberSelectedTarget(label: string): void {
     const matches = this.sessions().filter((session) => session.rowProbe === label);
     const session = matches.length === 1 ? matches[0] : undefined;
@@ -2127,9 +2141,6 @@ export class MainPtyDriver {
   async createNativeSession(workspace: string): Promise<OwnedSession> {
     const canonicalWorkspace = realpathSync(workspace);
     await this.ensureSidebarFocus();
-    // The active owner never changes while the New form opens and submits, so
-    // its canonical header is captured before the form and must survive.
-    const activeHeaderBeforeNew = frameHeader(this.currentText());
     await this.moveRosterTo("New session");
     const afterOpen = this.frameRevision;
     this.pty.write(KEYS.enter);
@@ -2183,10 +2194,15 @@ export class MainPtyDriver {
     const currentName = record.storedName ?? "";
     const displayName = record.displayName!;
     this.ownedLabels.set(canonicalWorkspace, { rowProbe, currentName, displayName, workspace: canonicalWorkspace });
-    await this.waitFrame((text) => this.selectedCaptionMatches(text, displayName)
-      && frameHeader(text) === activeHeaderBeforeNew,
-    `new canonical row ${displayName} is highlighted after completion without activation or a header change`);
-    this.focus = "sidebar"; // confirmed completed row, not merely a completion-accept key
+    // A successful New submission activates the created child as the Main
+    // input owner without a second host-row Enter: its canonical header owns
+    // the outer frame, the row is the single highlight, and the complete
+    // Main-focused roster footer proves the sidebar is still visible.
+    await this.waitFrame((text) => frameHeaderMatches(text, displayName)
+      && this.selectedCaptionMatches(text, displayName)
+      && this.mainFocusedRoster(text),
+    `new canonical row ${displayName} is the active Main input owner with a complete Main-focused frame`);
+    this.focus = "main"; // the completed New child owns Main input
     this.selectedNativeTarget = { workspace: canonicalWorkspace, pid: record.pid!, sessionId: record.sessionId! };
     return { rowProbe, currentName, displayName, workspace: canonicalWorkspace, record, exitWatcher };
   }
@@ -2224,6 +2240,10 @@ export class MainPtyDriver {
       && this.selectedNativeTarget.sessionId === session.record.sessionId,
     "the real host Edit key targets the row established by the exact workspace/PID/native-id tuple");
     const activeHeader = this.currentText().split("\n")[0];
+    // Is the Edit target itself the active Main owner? An active-owner rename
+    // must follow the new caption; an inactive-row rename must leave the
+    // existing owner's header byte-for-byte unchanged. Never accept either.
+    const targetWasActiveOwner = renderedTitleMatches(activeHeader.trimEnd(), session.displayName);
     const resizeCount = this.records().filter((record) => record.type === "resize").length;
     const beforeEdit = this.frameRevision;
     this.pty.write("e");
@@ -2254,11 +2274,18 @@ export class MainPtyDriver {
       && record.storedName === name && typeof record.displayName === "string").at(-1);
     assert.ok(nameRecord, "the actual stored-name event includes its canonical bounded display caption");
     const displayName = nameRecord.displayName!;
+    const headerTruthful = (text: string): boolean => targetWasActiveOwner
+      ? frameHeaderMatches(text, displayName)
+      : frameHeader(text) === activeHeader.trimEnd();
     await this.waitFrame((text) => this.selectedCaptionMatches(text, displayName)
-      && frameHeader(text) === activeHeader.trimEnd(),
-      "the selected native row renders the actual canonical caption while the active owner is unchanged");
-    assert.equal(this.currentText().split("\n")[0], activeHeader,
-      "editing a native caption does not transfer active Main ownership");
+      && headerTruthful(text),
+      targetWasActiveOwner
+        ? "the renamed active owner reports its new caption as the unchanged owner header"
+        : "the selected native row renders the actual canonical caption while the active owner header is unchanged");
+    assert.ok(headerTruthful(this.currentText()),
+      targetWasActiveOwner
+        ? "renaming the active owner keeps that same owner under its new caption"
+        : "editing an inactive native caption does not transfer active Main ownership");
     assert.equal(processIsAlive(session.record.pid), true, "the edited native child remains live");
     assert.equal(this.records().filter((record) => record.type === "resize").length, resizeCount,
       "opening and saving the right-pane Edit form does not change child geometry");
@@ -2297,7 +2324,7 @@ export class MainPtyDriver {
       await this.waitFrame((text) => !text.includes("Edit native session name")
         && !text.includes("> New name:")
         && this.selectedCaptionMatches(text, displayName)
-        && frameHeader(text) === activeHeader.trimEnd(),
+        && headerTruthful(text),
         "Escape cancels only the Edit form: the visible roster keeps the complete target card and the unchanged native owner", beforeCancel);
     }
   }

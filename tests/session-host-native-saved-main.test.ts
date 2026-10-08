@@ -306,9 +306,10 @@ async function submitWorkspaceOnlyNew(
   const process = await driver.awaitSpawn(beforeSubmit, workspace);
   const binding = await driver.awaitSessionStart(process, beforeSubmit,
     (record) => record.cwd === workspace && record.displayName === "(no messages)");
-  await driver.waitFrame((text) => isSidebarFocus(text)
+  await driver.waitFrame((text) => frameHeader(text) === "(no messages)"
+    && isCompleteMainFocus(text)
     && selectedRosterEntry(text)?.label === "(no messages)",
-  "the genuine New completion highlights the fresh no-messages row without activating it", beforeSubmit.frameRevision);
+  "the genuine New completion activates the fresh no-messages row as the Main input owner", beforeSubmit.frameRevision);
   const selected = selectedRosterEntry(driver.currentText());
   assert.ok(selected, "the completed New process is tied to its actual visible highlight");
   driver.ledger.setRosterPosition(process, selected!.position);
@@ -423,20 +424,20 @@ async function openSavedSuccessfully(
   sessionFile: string,
   priorProcesses: readonly ProcessIncarnation[],
 ): Promise<{ process: ProcessIncarnation; binding: ConversationBinding }> {
-  const activeHeader = exactCurrentHeader(driver);
   await openSavedPane(driver, savedName, workspace);
   const beforeRoster = rosterEntries(driver.currentText());
   const before = driver.snapshot();
   driver.pty.write(KEYS.enter);
   const opened = await awaitSavedOpen(driver, before, workspace, sessionId, sessionFile);
-  await driver.waitFrame((text) => isSidebarFocus(text)
+  await driver.waitFrame((text) => frameHeader(text) === savedName
+    && isCompleteMainFocus(text)
     && selectedRosterEntry(text)?.label === savedName,
-  "saved-open completes by highlighting the newly created exact persisted-conversation row", before.frameRevision);
+  "saved-open activates the restored exact persisted-conversation row as the Main input owner", before.frameRevision);
   const selected = selectedRosterEntry(driver.currentText());
-  assert.ok(selected, "the actual successful saved-open row is visibly highlighted");
+  assert.ok(selected, "the actual successful saved-open row is the active highlighted owner");
   driver.ledger.setRosterPosition(opened.process, selected!.position);
-  assert.equal(exactCurrentHeader(driver), activeHeader,
-    "successful saved-open highlights the new row without implicitly transferring the exited Main owner");
+  assert.equal(frameHeader(driver.currentText()), savedName,
+    "successful saved-open transfers Main ownership to the restored conversation");
   assertEarlierNativeRowsStayAtTheirObservedPositions(beforeRoster, rosterEntries(driver.currentText()));
   for (const prior of priorProcesses) {
     assert.ok(prior.rosterPosition !== undefined);
@@ -872,13 +873,14 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
   assert.equal(opened.binding.displayName, savedName, "the public reopened row reports the persisted canonical caption");
   assert.equal(opened.binding.storedName, savedName, "the reopened SessionManager reports the exact stored name");
   assert.equal(opened.binding.cwd, originalBinding.cwd);
-  await driver.waitFrame((text) => isSidebarFocus(text) && selectedRosterEntry(text)?.label === savedName,
-    "successful saved-open only highlights the fresh child row", beforeSuccessfulOpen.frameRevision);
+  await driver.waitFrame((text) => frameHeader(text) === savedName
+    && isCompleteMainFocus(text)
+    && selectedRosterEntry(text)?.label === savedName,
+  "successful saved-open activates the fresh child row as the Main input owner", beforeSuccessfulOpen.frameRevision);
   driver.ledger.setRosterPosition(opened.process, selectedRosterEntry(driver.currentText())!.position);
   assertEarlierNativeRowsStayAtTheirObservedPositions(rowsBeforeFirstSavedOpen, rosterEntries(driver.currentText()));
-  assert.equal(exactCurrentHeader(driver), activeNewHeader,
-    "saved-open highlight alone does not transfer Main ownership from the original /new conversation");
-  assert.ok(driver.currentText().includes(newDraft), "saved-open highlight preserves the original /new unsent draft");
+  assert.equal(frameHeader(driver.currentText()), savedName,
+    "saved-open transfers Main ownership to the restored conversation");
   assert.equal(processIsAlive(processA.pid), true);
   assert.equal(processIsAlive(opened.process.pid), true);
   assert.equal(opened.process.exitWatcher.observedExit, false,
@@ -890,41 +892,64 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
   assert.equal(driver.records().slice(beforeSuccessfulOpen.observerOffset).filter((record) => record.type === "session_start").length, 1,
     "one deliberate Saved open generated exactly one public native session_start");
 
-  // This sidebar-only guard contains digits and no host commands. Its input
-  // cannot enter either child; activation below proves the reopened surface is
-  // still the real saved transcript without the guard text.
-  const nativeWidth = driver.surface.frame().cols - 33;
+  // The auto-activated reopened child already owns Main: from the successful
+  // submission's own frame revision, await its persisted transcript and the
+  // complete Main-focused frame, then send fresh draft input directly. No
+  // second host-row activation is used.
+  await driver.waitFrame((text) => frameHeader(text) === savedName
+    && isCompleteMainFocus(text)
+    && selectedRosterEntry(text)?.label === savedName
+    && hasFullWidthNativeEditorRule(text, driver.surface.frame().cols - 33)
+    && text.includes(turnPrompt) && text.includes(turnResponse) && !text.includes(newDraft),
+  "the auto-activated reopened child paints its own persisted surface without a second activation",
+  beforeSuccessfulOpen.frameRevision);
+  assert.ok(driver.currentText().includes(turnPrompt), "the restored surface renders the actual reopened saved transcript");
+  assert.ok(driver.currentText().includes(turnResponse), "the restored surface renders the real provider response from disk");
+  assert.ok(!driver.currentText().includes(newDraft), "the reopened saved process has an independent surface from the original /new draft");
+  const reopenedDraft = `saved-main-reopened-child-draft-${suffix}`;
+  await driver.writeAndWait(reopenedDraft, (text) => text.includes(reopenedDraft),
+    "the freshly focused restored child receives an independent unsent draft without reselection");
+  const reopenedHeader = exactCurrentHeader(driver);
+
+  // Auto-activation changes which independent surface is visible, not either
+  // child's draft. Revisit each exact creation-correlated row only AFTER the
+  // fresh restored draft above proved that no second activation was needed.
+  await activateProcessRow(driver, processA, newBinding.displayName);
+  await driver.waitFrame((text) => frameHeader(text) === newBinding.displayName
+    && isCompleteMainFocus(text)
+    && hasFullWidthNativeEditorRule(text, driver.surface.frame().cols - 33)
+    && text.includes(newDraft) && !text.includes(reopenedDraft),
+  "the original /new sibling retains its independent draft after Saved auto-activation");
+  assert.equal(exactCurrentHeader(driver), activeNewHeader,
+    "returning to the exact original /new child preserves its full rendered header");
+  await activateProcessRow(driver, opened.process, savedName);
+  await driver.waitFrame((text) => frameHeader(text) === savedName
+    && isCompleteMainFocus(text)
+    && hasFullWidthNativeEditorRule(text, driver.surface.frame().cols - 33)
+    && text.includes(reopenedDraft) && !text.includes(newDraft),
+  "the restored child's independent draft survives deliberate sibling navigation");
+
+  // Retain the pre-existing ignored-sidebar-input proof in its proper focus
+  // domain: the restored child is now the owner, not the original /new child.
+  await ensureSidebarFocus(driver);
   await driver.waitFrame((text) => isSidebarFocus(text) && isCompleteRosterFrame(text)
-    && text.includes(newDraft) && hasFullWidthNativeEditorRule(text, nativeWidth),
-  "the original native editor completes its latest full-width rule and draft repaint before the ignored-input comparison");
+    && text.includes(reopenedDraft)
+    && hasFullWidthNativeEditorRule(text, driver.surface.frame().cols - 33),
+  "the current owner's complete editor and draft are visible before the sidebar input guard");
   const digitGuard = `271828182845${suffix.replace(/[a-f]/g, "9")}`;
-  assert.match(digitGuard, /^\d+$/, "the visible-row guard contains digits only, with no e/q/commands");
+  assert.match(digitGuard, /^\d+$/, "the sidebar guard contains only digits, never host commands");
   const beforeDigitGuard = driver.snapshot();
   const frameBeforeDigitGuard = driver.currentText();
   const headerBeforeDigitGuard = exactCurrentHeader(driver);
   driver.pty.write(digitGuard);
-  await driver.waitForQuietFrame("the actual sidebar ignores digits without repainting or transferring child input");
+  await driver.waitForQuietFrame("the actual sidebar ignores digits without routing them to either child");
   assert.equal(driver.currentText(), frameBeforeDigitGuard,
-    "the real rendered frame remains byte-for-byte unchanged after ignored sidebar digits");
+    "ignored sidebar digits leave the complete current rendered frame unchanged");
   assert.equal(exactCurrentHeader(driver), headerBeforeDigitGuard);
   await assertNoStartsAfter(driver, beforeDigitGuard, "digits-only sidebar guard");
   assert.equal(processIsAlive(processA.pid), true);
   assert.equal(processIsAlive(opened.process.pid), true);
 
-  const beforeSavedActivation = driver.snapshot();
-  await activateProcessRow(driver, opened.process, savedName);
-  await driver.waitFrame((text) => text.split("\n")[0]?.includes(savedName) === true
-    && text.includes(turnPrompt) && text.includes(turnResponse) && !text.includes(newDraft),
-  "explicit activation completely paints the reopened child's own persisted surface without the /new sibling draft",
-  beforeSavedActivation.frameRevision);
-  assert.ok(driver.currentText().includes(turnPrompt), "explicit activation renders the actual reopened saved transcript");
-  assert.ok(driver.currentText().includes(turnResponse), "explicit activation renders the real provider response from disk");
-  assert.ok(!driver.currentText().includes(digitGuard), "sidebar digits never entered the saved child editor");
-  assert.ok(!driver.currentText().includes(newDraft), "the reopened saved process has an independent surface from the original /new draft");
-  const reopenedDraft = `saved-main-reopened-child-draft-${suffix}`;
-  await driver.writeAndWait(reopenedDraft, (text) => text.includes(reopenedDraft),
-    "the newly activated exact same-workspace child receives an independent unsent draft");
-  const reopenedHeader = exactCurrentHeader(driver);
   const duplicateAgain = driver.snapshot();
   await assertSavedListingAndDuplicateRefusal(driver, savedName, reopenedHeader, workspace);
   assert.equal(ptySpawnCount(driver.ptyRecords()), 2,

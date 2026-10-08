@@ -305,24 +305,25 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   assert.equal(sessionA.record.displayName, "(no messages)", "a fresh native conversation uses Pi's real no-messages fallback");
   assert.equal(sessionA.record.storedName, undefined, "the fresh conversation has no fabricated stored name");
   await driver.renameNativeSession(sessionA, labelA);
-  assert.ok(driver.currentText().includes("Welcome"), "A's highlighted completion has not activated or replaced the empty Main frame");
-  assert.equal(driver.selected(labelA), true, "A is highlighted after asynchronous creation");
-  assert.equal(driver.focus, "sidebar", "creation completion returns ownership to the roster, not native input");
-  // Printable digits exercise non-owner input without invoking host commands
+  assert.equal(frameHeaderMatches(driver.currentText(), labelA), true,
+    "A is the active Main owner after the completed New (its header follows the renamed caption)");
+  assert.equal(driver.selected(labelA), true, "A is the highlighted active owner after asynchronous creation");
+  assert.equal(driver.focus, "sidebar", "the host Edit completion returns ownership to the visible roster");
+  // Printable digits exercise sidebar-focus input without invoking host commands
   // such as `e` (Edit), which can legitimately occur in a hexadecimal suffix.
   const unselectedGuard = `314159265358${suffix.replace(/[a-f]/g, "9")}`;
   driver.pty.write(unselectedGuard);
-  await driver.waitForFrameQuiet("A's highlight-only input is followed by a bounded stable frame");
+  await driver.waitForFrameQuiet("A's sidebar-focus digit guard is followed by a bounded stable frame");
   const afterUnselectedGuard = driver.currentText();
   assert.ok(!afterUnselectedGuard.includes(unselectedGuard),
-    `the highlight-only input never appears in the native child or host frame:\n${afterUnselectedGuard.slice(-1_000)}`);
-  assert.ok(afterUnselectedGuard.includes("Welcome"), "the empty Main frame remains visible while A is only highlighted");
+    `sidebar-focus digits never appear in the native child or host frame:\n${afterUnselectedGuard.slice(-1_000)}`);
+  assert.ok(afterUnselectedGuard.includes(labelA), "A's active native surface remains visible while the roster owns focus");
 
   const sessionB = await driver.createNativeSession(workspaceB);
   assert.equal(sessionB.record.displayName, "(no messages)", "B also starts with Pi's real no-messages fallback");
   assert.equal(sessionB.record.storedName, undefined, "B has no fabricated stored name");
   await driver.renameNativeSession(sessionB, labelB);
-  assert.equal(driver.selected(labelB), true, "B is highlighted after asynchronous creation");
+  assert.equal(driver.selected(labelB), true, "B is the highlighted active owner after asynchronous creation");
   assert.equal(driver.focus, "sidebar");
   const sharedGateConfigA = join(sessionA.record.agentDir!, "review-gate.json");
   const sharedGateConfigB = join(sessionB.record.agentDir!, "review-gate.json");
@@ -348,12 +349,11 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   }
   const unselectedBGuard = `271828182845${suffix.replace(/[a-f]/g, "9")}`;
   driver.pty.write(unselectedBGuard);
-  await driver.waitForFrameQuiet("B's highlight-only input is followed by a bounded stable frame");
+  await driver.waitForFrameQuiet("B's sidebar-focus digit guard is followed by a bounded stable frame");
   const afterUnselectedBGuard = driver.currentText();
   assert.ok(!afterUnselectedBGuard.includes(unselectedBGuard),
-    `B's highlight-only input never appears in the native child or host frame:\n${afterUnselectedBGuard.slice(-1_000)}`);
-  assert.ok(afterUnselectedBGuard.includes("Welcome"), "B remains only highlighted in the empty Main view");
-  await driver.activateRoster(labelB);
+    `sidebar-focus digits never appear in the native child or host frame:\n${afterUnselectedBGuard.slice(-1_000)}`);
+  assert.ok(afterUnselectedBGuard.includes(labelB), "B's active native surface remains visible while the roster owns focus");
   const initialSessions = [sessionA, sessionB];
   for (const session of initialSessions) {
     assert.equal(session.record.columns, 87, "the outer wide sidebar rectangle determines the initial native child width");

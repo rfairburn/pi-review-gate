@@ -295,11 +295,12 @@ async function submitWorkspaceOnlyNew(
   const process = await driver.awaitSpawn(beforeSubmit, workspace);
   const binding = await driver.awaitSessionStart(process, beforeSubmit,
     (record) => record.cwd === workspace && record.displayName === "(no messages)");
-  await driver.waitFrame((text) => isSidebarFocus(text)
+  await driver.waitFrame((text) => frameHeader(text) === "(no messages)"
+    && isCompleteMainFocusedRoster(text)
     && selectedRosterEntry(text)?.label === "(no messages)",
-  "the genuine New completion highlights the fresh no-messages row without activating it", beforeSubmit.frameRevision);
+  "the genuine New completion activates the fresh no-messages row as the Main input owner", beforeSubmit.frameRevision);
   const selected = selectedRosterEntry(driver.currentText());
-  assert.ok(selected, "the completed New process is tied to its actual visible highlight");
+  assert.ok(selected, "the completed New process is tied to its actual active highlight");
   driver.ledger.setRosterPosition(process, selected!.position);
   assert.equal(processIsAlive(process.pid), true, "the exact public PTY-owned process is live after creation");
   assert.equal(process.cwd, workspace);

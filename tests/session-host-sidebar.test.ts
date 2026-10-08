@@ -1490,7 +1490,7 @@ test("New session has only an explicit workspace field and creates without a man
   assert.ok(!("label" in createOf(harness.focusedActions()[0])));
 });
 
-test("create is single-shot, completion closes New without activating the new row, ids increase", () => {
+test("create is single-shot, completion activates the new row, ids increase", () => {
   const harness = formWith();
   harness.send("/workspace");
   harness.send(ENTER);
@@ -1501,10 +1501,12 @@ test("create is single-shot, completion closes New without activating the new ro
   assert.equal(harness.controller.focus, "form");
   assert.ok(assertPaneSafe(harness.controller.render(40, 8).lines, 40, 8).some((line) => line.includes("Starting (request 1)")));
   harness.controller.completeCreate(1, "spawned");
-  assert.equal(harness.controller.focus, "sidebar");
+  assert.equal(harness.controller.focus, "main", "a successful New activates the created child");
+  assert.deepEqual(harness.focusedActions().at(-1), { type: "select", id: "spawned" });
   assert.equal(harness.controller.selectedId, undefined);
-  harness.controller.updateItems([makeItem({ id: "a" }), makeItem({ id: "spawned", lifecycle: "starting", busy: null })]);
+  harness.controller.updateItems([makeItem({ id: "a" }), makeItem({ id: "spawned" })]);
   assert.equal(harness.controller.selectedId, "spawned");
+  harness.send(ALT_LEFT_LEGACY); // return to the visible roster before navigating again
   rosterView(harness.controller, 40, 20); // the updated roster is drawn before Enter
   harness.send(DOWN); // spawned -> Saved conversations
   harness.send(DOWN); // -> New session
@@ -1908,9 +1910,10 @@ test("stale create callbacks never contaminate the current form or selection", (
   harness.controller.completeCreate(1, "stale-row");
   assert.equal(harness.controller.focus, "form");
   assert.equal(harness.controller.selectedId, undefined);
-  // The matching completion selects the row (once published) and closes the form.
+  // The matching completion activates the row (once published) and closes the form.
   harness.controller.completeCreate(2, "fresh-row");
-  assert.equal(harness.controller.focus, "sidebar");
+  assert.equal(harness.controller.focus, "main");
+  assert.deepEqual(harness.focusedActions().at(-1), { type: "select", id: "fresh-row" });
   assert.deepEqual(harness.controller.selectedId, undefined); // row not published yet
   harness.controller.updateItems([
     makeItem({ id: "a" }),
@@ -2624,11 +2627,12 @@ test("saved picker lists, highlights without acting, and opens a deliberate save
   assert.equal(harness.sinceActions().length, 1, "no duplicate saved-open");
   assert.ok(savedView(harness).join(" ").replace(/\s+/g, " ").includes("A saved conversation is already starting"));
 
-  // Completion highlights the new row without transferring input ownership.
+  // Completion activates the restored row as the Main input owner.
   harness.controller.updateItems([makeItem({ id: "a" }), makeItem({ id: "new-row" })]);
   harness.controller.completeSavedOpen(requestId + 1, "new-row");
-  assert.equal(harness.controller.focus, "sidebar", "focus returns to the roster, not main");
-  assert.equal(harness.controller.selectedId, "new-row", "the new row is highlighted only");
+  assert.equal(harness.controller.focus, "main", "the restored row becomes the active Main owner");
+  assert.equal(harness.controller.selectedId, "new-row", "the restored row is highlighted as the active owner");
+  assert.deepEqual(harness.focusedActions().at(-1), { type: "select", id: "new-row" });
 });
 
 test("saved picker fencing: stale listings and late completions never seize the pane", () => {
@@ -2744,7 +2748,7 @@ test("saved picker: roster Enter repeat does not re-open the picker", () => {
   assert.equal(harness.controller.focus, "form");
 });
 
-test("held Enter after a completed saved-open never activates the highlighted row", () => {
+test("held Enter after a completed saved-open is fenced out of the newly focused child", () => {
   const harness = savedPaneWith(["a"]);
   const list = harness.actions.at(-1);
   assert.ok(list?.type === "saved-list");
@@ -2758,22 +2762,23 @@ test("held Enter after a completed saved-open never activates the highlighted ro
   assert.ok(open?.type === "saved-open");
   const r2 = open!.type === "saved-open" ? open.requestId : -1;
 
-  // Completion highlights the new row and returns to the roster.
+  // Completion activates the restored row as the Main input owner.
   harness.controller.updateItems([makeItem({ id: "a" }), makeItem({ id: "new-row" })]);
   harness.controller.completeSavedOpen(r2, "new-row");
-  assert.equal(harness.controller.focus, "sidebar");
+  assert.equal(harness.controller.focus, "main");
   assert.equal(harness.controller.selectedId, "new-row");
+  assert.deepEqual(harness.focusedActions().at(-1), { type: "select", id: "new-row" });
   harness.baseline = harness.actions.length;
   rosterView(harness.controller, 40, 20); // the roster replaces the picker on screen
 
-  // The held Enter's repeat and release must not activate the highlighted row.
+  // The held Enter's repeat and release are consumed, never replayed into the child.
   harness.send("\x1b[13;1:2u"); // Enter repeat
   harness.send("\x1b[13;1:3u"); // Enter release
-  assert.deepEqual(harness.sinceActions(), [], "repeat/release never transfer ownership");
+  assert.deepEqual(harness.sinceActions(), [], "the submission repeat/release never reaches the child");
 
-  // A fresh press is the explicit activation.
+  // A fresh press is ordinary native input for the new owner.
   harness.send(ENTER);
-  assert.deepEqual(harness.sinceActions(), [{ type: "select", id: "new-row" }]);
+  assert.deepEqual(harness.sinceActions(), [{ type: "forward", data: ENTER }]);
 });
 
 test("streamed paste containing the toggle packet never dismisses the saved picker", () => {

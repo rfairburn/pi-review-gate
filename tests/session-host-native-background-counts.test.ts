@@ -311,6 +311,13 @@ function activatedRowFrame(text: string): boolean {
   const footer = sidebarFooterText(text);
   if (footer === undefined) return false;
   if (footer !== "F8 toggle | enter open esc hide | q quit") return false;
+  return mainFocusedFooter(text);
+}
+
+/** Complete Main-focused footer: every owner hint, no stale sidebar-only hint. */
+function mainFocusedFooter(text: string): boolean {
+  const footer = sidebarFooterText(text);
+  if (footer === undefined) return false;
   for (const hint of MAIN_FOOTER_HINTS) {
     if (!footer.includes(hint)) return false;
   }
@@ -339,19 +346,19 @@ function sidebarFocusedFooter(text: string): boolean {
 }
 
 /**
- * Complete sidebar-owned frame after creation or rename: the canonical host
- * header, the unactivated empty Main surface, the complete single-card roster
- * with the expected card selected, and the complete sidebar-focused footer.
- * A stale header-only or mixed-footer frame never establishes ownership.
+ * Complete owned-row frame after a successful New creation or host rename:
+ * the active child's owner header, the complete single-card roster with that
+ * card selected, and a COMPLETE focus footer — Main-focused right after a New
+ * completion or sidebar-focused after an Edit completion. A partial or mixed
+ * footer never establishes ownership.
  */
 function sidebarOwnedFrame(text: string, expectedTitle: string): boolean {
-  if (frameHeader(text) !== "Session host") return false;
-  if (!text.includes("Welcome")) return false; // the unactivated empty Main surface
+  if (!renderedTitleMatches(frameHeader(text), expectedTitle)) return false;
   const parsed = parseRosterFrame(text, SIDEBAR_COLUMNS);
   if (!parsed.complete || parsed.count !== 1) return false;
   const card = selectedRosterCard(text, SIDEBAR_COLUMNS);
   if (card === undefined || !renderedTitleMatches(card.title, expectedTitle)) return false;
-  return sidebarFocusedFooter(text);
+  return mainFocusedFooter(text) || sidebarFocusedFooter(text);
 }
 
 /** One stat observation of a leaf; the identity fields identify the file. */
@@ -1107,33 +1114,34 @@ test("scenario frame witnesses reject partial and mixed footers", () => {
     "",
   ];
   const actions = ["  Saved conversations", "  New session", "  Quit host"];
-  const sidebarFooter = [
+  const mainFooter = ["F8 toggle | enter open", "esc hide | q quit"];
+  const sidebarFocusFooter = [
     "F8 toggle | enter open",
     "e edit name | d stop/remove",
     "esc hide | q quit",
     "space expand | alt+right main",
   ];
-  const mainFooter = ["F8 toggle | enter open", "esc hide | q quit"];
   const frame = (header: string, footer: string[]): string =>
     [header, ...[" Sessions (1) ", ...card, ...actions, ...footer].map((line, index) =>
       `${line.padEnd(32)}│${index === 0 ? "Welcome" : ""}`)].join("\n");
 
-  // Complete witnesses are admitted.
-  assert.equal(sidebarOwnedFrame(frame("Session host", sidebarFooter), "BGT"), true);
+  // Complete witnesses are admitted: the Main-focused frame right after a New
+  // completion, and the sidebar-focused frame right after an Edit completion.
+  assert.equal(sidebarOwnedFrame(frame("BGT", mainFooter), "BGT"), true);
+  assert.equal(sidebarOwnedFrame(frame("BGT", sidebarFocusFooter), "BGT"), true);
   assert.equal(activatedRowFrame(frame("BGT", mainFooter)), true);
 
-  // Partial sidebar footer: the final alt+right main hint is missing.
-  assert.equal(sidebarOwnedFrame(frame("Session host", [
-    "F8 toggle | enter open",
-    "e edit name | d stop/remove",
-    "esc hide | q quit",
-    "space expand",
-  ]), "BGT"), false);
-
+  // Partial Main footer: a required owner hint is missing.
+  assert.equal(sidebarOwnedFrame(frame("BGT", ["F8 toggle | enter open"]), "BGT"), false,
+    "a partial Main-focused footer is never complete ownership evidence");
   // Mixed footer: a stale sidebar-only hint in a Main-focused frame.
+  assert.equal(sidebarOwnedFrame(frame("BGT", ["F8 toggle | enter open", "esc hide | q quit", "alt+right main"]), "BGT"), false,
+    "a stale sidebar-only hint in a Main-focused frame is refused");
   assert.equal(activatedRowFrame(frame("BGT", [...mainFooter, "alt+right main"])), false);
 
   // Stale header-only inference: the owner header is not the activated row's.
+  assert.equal(sidebarOwnedFrame(frame("Session host", mainFooter), "BGT"), false,
+    "a stale host header is never the active child's owner header");
   assert.equal(activatedRowFrame(frame("Session host", mainFooter)), false);
 });
 

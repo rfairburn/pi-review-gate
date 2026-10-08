@@ -1773,28 +1773,35 @@ test("home/end navigate the native path field and scroll horizontally to the cur
   assert.ok((atHome.cursor?.row ?? 0) >= 0);
 });
 
-test("form Escape abandons the UI request and hides; the launch is never killed", () => {
+test("form Escape while starting cancels only the UI, keeps the roster visible, and never kills the launch", () => {
   const harness = formWith();
   harness.send("/workspace");
   harness.send(ENTER); // submit -> create request 1
   const texts = assertPaneSafe(harness.controller.render(40, 8).lines, 40, 8);
   assert.ok(texts.some((line) => line.includes("Starting (request 1)")));
-  harness.send(ESC); // escape while starting: UI-only abandon
-  assert.equal(harness.controller.visible, false);
-  assert.equal(harness.controller.focus, "main");
+  harness.send(ESC); // escape while starting: UI-only local cancel
+  assert.equal(harness.controller.visible, true, "the roster stays visible");
+  assert.equal(harness.controller.focus, "sidebar");
   assert.deepEqual(harness.focusedActions(), [
     { type: "create", requestId: 1, workspace: "/workspace" },
-    { type: "visibility", visible: false },
-  ]);
+  ], "the cancel itself emits no visibility action");
+  // The retained workspace draft is restored when the New form is reopened.
+  void harness.controller.render(40, 20); // the restored roster is drawn before Enter
+  harness.send(ENTER);
+  assert.equal(harness.controller.focus, "form");
+  assert.ok(
+    assertPaneSafe(harness.controller.render(44, 8).lines, 44, 8).join("\n").includes("/workspace"),
+    "the workspace draft survives the cancel",
+  );
   // Backend already launched? Then this late completion is real UI noise:
   // it must not kill anything (it can't — there is no kill path) and must
   // not steal focus. But the escaped request may still legitimately land.
   harness.controller.completeCreate(1, "landing-row");
-  assert.equal(harness.controller.focus, "main");
+  assert.equal(harness.controller.focus, "form", "a late create result never steals the reopened form");
   assert.deepEqual(harness.controller.selectedId, undefined);
-  // The abandon itself emitted no quit/stop action.
+  // The cancel itself emitted no quit/stop action.
   assert.deepEqual(
-    harness.focusedActions().filter((action) => action.type === "quit"),
+    harness.focusedActions().filter((action) => action.type === "quit" || action.type === "stop-remove"),
     [],
   );
 });

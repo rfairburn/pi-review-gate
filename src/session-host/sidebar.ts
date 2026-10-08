@@ -904,12 +904,13 @@ export class SidebarController {
    */
   private altRightClaimed = false;
   /**
-   * Provenance fence for the Edit-form cancel Escape: once a deliberate
-   * Escape cancels only the Edit form and returns to the visible roster, the
-   * held key's repeat/release must not bubble into the roster's Escape-hide.
-   * A fresh roster Escape still hides (existing semantics).
+   * Provenance fence for a host-owned form Escape: a fresh Escape that cancels
+   * only the New or Edit form — or that the native field consumes to dismiss
+   * its completion list — must not let the held key's repeat/release bubble
+   * into the roster's Escape-hide or leak into the child as native input. A
+   * fresh roster Escape still hides (existing semantics).
    */
-  private editEscapeClaimed = false;
+  private formEscapeClaimed = false;
   private pendingCreate: { readonly requestId: number } | undefined;
   private pendingRename: { readonly requestId: number } | undefined;
   /** Explicit confirmation purpose: quit the host or stop one owned session. */
@@ -1374,19 +1375,20 @@ export class SidebarController {
   }
 
   /**
-   * Fences the held Escape key that canceled only the Edit form across every
-   * focus domain until its release or a fresh Escape press. Unrelated input
-   * does NOT clear the claim, so a later repeat/release of the still-held key
-   * is consumed (never a roster hide or child input) wherever focus lands.
-   * Returns true when the event was consumed by the fence.
+   * Fences the held Escape key that canceled only a host-owned form (New or
+   * Edit) — or that the field consumed to dismiss its completion list —
+   * across every focus domain until its release or a fresh Escape press.
+   * Unrelated input does NOT clear the claim, so a later repeat/release of the
+   * still-held key is consumed (never a roster hide or child input) wherever
+   * focus lands. Returns true when the event was consumed by the fence.
    */
-  private consumeEditEscapeClaim(data: string): boolean {
-    if (!this.editEscapeClaimed) return false;
+  private consumeFormEscapeClaim(data: string): boolean {
+    if (!this.formEscapeClaimed) return false;
     if (matchesKey(data, "escape")) {
-      if (isKeyRelease(data)) { this.editEscapeClaimed = false; return true; }
+      if (isKeyRelease(data)) { this.formEscapeClaimed = false; return true; }
       if (isKeyRepeat(data)) return true; // consume the held-key repeat
       // A fresh Escape press ends the fence; let it proceed to the normal handler.
-      this.editEscapeClaimed = false;
+      this.formEscapeClaimed = false;
       return false;
     }
     // Unrelated input does not clear the claim; only the Escape release or a
@@ -1400,10 +1402,10 @@ export class SidebarController {
     if (this.handleReservedToggle(data)) {
       return;
     }
-    // A held Escape that canceled only the Edit form must not leak into the
-    // child as input, even after a focus change; its repeat/release is
+    // A held Escape that canceled only a host-owned form must not leak into
+    // the child as input, even after a focus change; its repeat/release is
     // consumed here until the key is released or freshly pressed again.
-    if (this.consumeEditEscapeClaim(data)) {
+    if (this.consumeFormEscapeClaim(data)) {
       return;
     }
     // A held Alt+Right whose initial press a host-owned surface claimed must
@@ -1428,9 +1430,9 @@ export class SidebarController {
     // equals a host chord (e.g. Alt+Right) must not change focus or leak the
     // remaining pasted content into Main.
     if (this.routeBracketedPaste(data)) return;
-    // Fence the held Escape that canceled only the Edit form across focus
+    // Fence the held Escape that canceled only a host-owned form across focus
     // domains until its release or a fresh Escape press.
-    if (this.consumeEditEscapeClaim(data)) return;
+    if (this.consumeFormEscapeClaim(data)) return;
     // The reserved toggle takes precedence over Alt+Right (the user may
     // configure the toggle as alt+right), so it is handled first.
     if (this.handleReservedToggle(data)) {
@@ -1747,9 +1749,9 @@ export class SidebarController {
       this.formField?.handleInput(data);
       return;
     }
-    // Fence the held Escape that canceled only the Edit form across focus
+    // Fence the held Escape that canceled only a host-owned form across focus
     // domains until its release or a fresh Escape press.
-    if (this.consumeEditEscapeClaim(data)) return;
+    if (this.consumeFormEscapeClaim(data)) return;
     if (this.handleReservedToggle(data, () => this.abandonForm())) return;
     // Host-owned form UI: Alt+Right never dismisses, submits, forwards to the
     // child, or steals ownership; it is consumed in every event form. An
@@ -1762,17 +1764,26 @@ export class SidebarController {
       return;
     }
     if (isKeyRelease(data)) return;
+    // A held Escape's repeat never cancels a form: the press may have just
+    // dismissed the native completion list, and its repeat must not then cancel
+    // New or Edit, hide the roster, or reach the child. Only a fresh press
+    // cancels; the field's own completion-list Escape precedence is intact.
+    if (matchesKey(data, "escape") && isKeyRepeat(data)) return;
     if (this.pendingCreate || this.pendingRename) {
-      // A held Escape's repeat never cancels a pending Edit rename; only a
-      // fresh press does. New-form cancellation keeps its existing behavior.
+      // The configured cancel binding still abandons a pending New/Edit form;
+      // a held repeat never cancels a pending Edit rename (existing rule).
       if (this.formMatchesCancel(data)
         && (this.formKind !== "edit" || !isKeyRepeat(data))) this.escapeFromForm();
       return;
     }
-    // A held Escape's repeat is refused so it cannot cancel the Edit form after
-    // dismissing a completion list; a second fresh press is required. New-form
-    // cancellation keeps its existing behavior.
-    if (this.formKind === "edit" && matchesKey(data, "escape") && isKeyRepeat(data)) return;
+    // Claim every fresh, non-pasted form Escape BEFORE the field sees it: the
+    // field may consume this press to dismiss its own native completion list
+    // without cancelling, and the still-held key's repeat/release can arrive
+    // after a reserved toggle, a focus change, or a completed create. Without
+    // an early claim those later events would hide the roster or become child
+    // input. The field still receives the press first, so its completion-list
+    // precedence and the reserved-toggle priority are unchanged.
+    if (matchesKey(data, "escape")) this.formEscapeClaimed = true;
     if (this.formField) this.formField.handleInput(data);
     else if (matchesKey(data, "escape")) this.escapeFromForm();
   }
@@ -1852,9 +1863,9 @@ export class SidebarController {
     // Bracketed paste is opaque in the picker and never activates a row; a
     // streamed body chunk that merely equals the toggle must not dismiss.
     if (this.routeBracketedPaste(data)) return;
-    // Fence the held Escape that canceled only the Edit form across focus
+    // Fence the held Escape that canceled only a host-owned form across focus
     // domains until its release or a fresh Escape press.
-    if (this.consumeEditEscapeClaim(data)) return;
+    if (this.consumeFormEscapeClaim(data)) return;
     if (this.handleReservedToggle(data, () => this.dismissSavedPane())) return;
     // Host-owned picker UI: Alt+Right is consumed, never a row action. An
     // initial press is claimed so its repeat/release stays fenced across any
@@ -2098,20 +2109,17 @@ export class SidebarController {
   }
 
   private escapeFromForm(): void {
-    const wasEdit = this.formKind === "edit";
     this.abandonForm();
-    if (wasEdit) {
-      // Edit-only cancel: return to the VISIBLE roster without hiding. The
-      // active Main owner, native process, input draft, persisted name,
-      // selection, and geometry are all preserved. Claim the Escape so a held
-      // key's repeat/release does not bubble into the roster's Escape-hide;
-      // a fresh roster Escape still hides (existing semantics).
-      this.editEscapeClaimed = true;
-      this._focus = "sidebar";
-      this.onInvalidate?.();
-      return;
-    }
-    this.hide();
+    // New and Edit cancellations are both LOCAL: return to the VISIBLE roster
+    // without hiding and without forwarding anything to the child. The active
+    // Main owner, native process, native input draft, persisted name,
+    // selection, and geometry are all preserved; abandonForm retains the
+    // workspace/name draft. Claim the Escape so a held key's repeat/release
+    // does not bubble into the roster's Escape-hide or leak into the child as
+    // native input; a fresh roster Escape still hides (existing semantics).
+    this.formEscapeClaimed = true;
+    this._focus = "sidebar";
+    this.onInvalidate?.();
   }
 
   private abandonForm(): void {
@@ -2127,9 +2135,9 @@ export class SidebarController {
   // --- Confirm focus: explicit quit or stop confirmation. ---
 
   private handleConfirmInput(data: string): void {
-    // Fence the held Escape that canceled only the Edit form across focus
+    // Fence the held Escape that canceled only a host-owned form across focus
     // domains until its release or a fresh Escape press.
-    if (this.consumeEditEscapeClaim(data)) return;
+    if (this.consumeFormEscapeClaim(data)) return;
     // The reserved toggle takes precedence over Alt+Right (the user may
     // configure the toggle as alt+right), so it is handled first.
     if (this.handleReservedToggle(data)) {

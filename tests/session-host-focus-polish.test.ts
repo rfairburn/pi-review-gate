@@ -11,7 +11,9 @@
  *    Never both at once, never a false sibling/owner mark.
  * 3. Escape in the Edit form cancels ONLY that form and returns to the VISIBLE
  *    roster (sidebar focus) without hiding; a held Escape repeat does not
- *    bubble into the roster hide, but a fresh roster Escape still hides.
+ *    bubble into the roster hide, but a fresh roster Escape still hides. The
+ *    New-form equivalents (including the completion-list, pending-create, and
+ *    cross-domain fences) live in tests/session-host-new-escape.test.ts.
  *
  * Keyboard paths use REAL pinned pi-tui key matching (legacy, modifyOtherKeys,
  * Kitty CSI-u) — never mock key algorithms. Everything is pure frontend.
@@ -289,26 +291,8 @@ test("a held Escape that canceled the Edit form does not hide the roster; a fres
   assert.equal(harness.controller.focus, "main");
 });
 
-test("Escape in the New form still hides the sidebar (behavior unchanged)", () => {
-  const harness = makeRoster(["a"]);
-  harness.send(ENTER); // default selection "new" -> form focus
-  assert.equal(harness.controller.focus, "form");
-  harness.send(ESC);
-  assert.equal(harness.controller.visible, false, "the New form Escape still hides the sidebar");
-  assert.equal(harness.controller.focus, "main");
-});
-
-test("New form retains its existing Escape-repeat cancellation", () => {
-  const harness = makeRoster(["a"]);
-  harness.send(ENTER); // default selection "new" -> form focus
-  assert.equal(harness.controller.focus, "form");
-  harness.send(ESC_REPEAT);
-  assert.equal(harness.controller.visible, false, "New-form Escape repeat still cancels");
-  assert.equal(harness.controller.focus, "main");
-});
-
 // ---------------------------------------------------------------------------
-// Edit Escape claim lifecycle across focus domains (finding 2)
+// Form Escape claim lifecycle across focus domains (finding 2)
 // ---------------------------------------------------------------------------
 
 test("Edit Escape claim survives unrelated input (Down) and fences the held repeat", () => {

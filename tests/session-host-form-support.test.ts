@@ -69,9 +69,21 @@ test("native app clear/interruption bindings reload per field without changing n
   try {
     const agentDir = join(root, "agent");
     mkdirSync(agentDir);
+    const missingFile = loadNativeFieldKeybindings(agentDir);
+    assert.equal(missingFile.notice, undefined, "a missing optional keybindings file is silent");
+    let createdFile = false;
+    try {
+      lstatSync(join(agentDir, "keybindings.json"));
+      createdFile = true;
+    } catch {
+      // The expected ENOENT proves the silent fallback did not create the user's file.
+    }
+    assert.equal(createdFile, false, "the silent fallback never creates the user's keybindings file");
     const defaults = loadNativeFieldKeybindings(join(root, "missing-agent"));
+    assert.equal(defaults.notice, undefined, "a missing agent directory is silent too");
     assert.equal(defaults.manager.matches("\x03", "app.clear"), true, "app.clear defaults to Ctrl+C");
     assert.equal(defaults.manager.matches("\x1b", "app.interrupt"), true, "app.interrupt defaults to Escape");
+    assert.equal(defaults.manager.matches("\r", "tui.input.submit"), true, "native submit keeps its real Enter default");
     const path = join(agentDir, "keybindings.json");
     const contents = `\uFEFF${JSON.stringify({
       "tui.input.submit": "f5",
@@ -468,6 +480,24 @@ test("unsafe or oversized native settings fail closed before editor handoff", as
       if (assertionsSucceeded) cleanupSuccessfulFormTestDirectory(root);
     }
   });
+});
+
+test("malformed native keybindings keep their fail-safe notice and default bindings", () => {
+  const root = makeFormTestDirectory("field-keybindings-malformed");
+  let assertionsSucceeded = false;
+  try {
+    const agentDir = join(root, "agent");
+    mkdirSync(agentDir);
+    const path = join(agentDir, "keybindings.json");
+    writeFileSync(path, "{invalid json", "utf8");
+    const result = loadNativeFieldKeybindings(agentDir);
+    assert.match(result.notice ?? "", /unsupported format/);
+    assert.equal(result.manager.matches("\x03", "app.clear"), true, "the fail-safe manager keeps the real defaults");
+    assert.equal(readFileSync(path, "utf8"), "{invalid json");
+    assertionsSucceeded = true;
+  } finally {
+    if (assertionsSucceeded) cleanupSuccessfulFormTestDirectory(root);
+  }
 });
 
 test("native field keybindings do not follow a symlinked settings file", { skip: process.platform === "win32" }, () => {

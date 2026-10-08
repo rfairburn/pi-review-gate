@@ -44,7 +44,7 @@ type FileIdentity = { readonly dev: bigint; readonly ino: bigint };
 
 export interface NativeFieldKeybindings {
   readonly manager: SessionHostFieldKeybindings;
-  /** Non-secret, bounded notice for absent, unreadable, or unsupported native configuration. */
+  /** Non-secret, bounded notice for unreadable or unsupported native configuration. A genuinely absent optional file is silent. */
   readonly notice?: string;
 }
 
@@ -59,20 +59,14 @@ export function loadNativeFieldKeybindings(agentDir: string): NativeFieldKeybind
   try {
     bytes = readBoundedRegularFile(path, MAX_KEYBINDINGS_BYTES);
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
+    // A genuinely missing optional file is the normal case and stays silent.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return defaultFieldKeybindings();
     return {
       manager: new KeybindingsManager(FORM_KEYBINDING_DEFINITIONS),
-      notice: code === "ENOENT"
-        ? "Native keybindings.json is absent; using Pi's default form keys"
-        : "Native keybindings.json is unavailable; using Pi's default form keys",
+      notice: "Native keybindings.json is unavailable; using Pi's default form keys",
     };
   }
-  if (bytes === undefined) {
-    return {
-      manager: new KeybindingsManager(FORM_KEYBINDING_DEFINITIONS),
-      notice: "Native keybindings.json is absent; using Pi's default form keys",
-    };
-  }
+  if (bytes === undefined) return defaultFieldKeybindings();
 
   let parsed: unknown;
   try {
@@ -106,6 +100,11 @@ export function loadNativeFieldKeybindings(agentDir: string): NativeFieldKeybind
 
 function isSafeBinding(value: string): boolean {
   return value.length > 0 && value.length <= 64 && !/[\x00-\x1f\x7f-\x9f]/.test(value);
+}
+
+/** Real Pi default form bindings for a genuinely absent optional file. */
+function defaultFieldKeybindings(): NativeFieldKeybindings {
+  return { manager: new KeybindingsManager(FORM_KEYBINDING_DEFINITIONS) };
 }
 
 function unsupportedKeybindings(): NativeFieldKeybindings {

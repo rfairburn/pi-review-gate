@@ -19,11 +19,13 @@ import { SidebarController } from "../src/session-host/sidebar";
 import { isSavedSessionAdmission, listSavedSessions, type SavedSessionCatalog } from "../src/session-host/saved-sessions";
 import type { SessionHostNativeSession } from "../src/session-host/protocol";
 import { __test, type SessionHostOptions } from "../src/session-host/main";
+import { sidebarNoticeRows } from "./helpers/session-host-notice-witness";
 
 const ESC = "\x1b";
 const ALT_LEFT = `${ESC}[1;3D`;
 const ENTER = "\r";
 const DELETE = "\x1b[3~";
+const REMOVE_REFUSED_NOTICE = "Session not removed; it may be live, unconfirmed, or no longer available.";
 const MAIN_TEST_SCRATCH_ROOT = join(process.cwd(), "node_modules", ".cache", "session-host-main-tests");
 
 function makeMainTestDirectory(prefix: string): string {
@@ -1418,8 +1420,12 @@ test("failed, live, and unconfirmed removals leave the row and owner in place wi
   assert.deepEqual(manager.closeExitedCalls, ["native-1"]);
   assert.deepEqual(manager.views.map((view) => view.id), ["native-1"]);
   assert.equal(harness.sidebar?.selectedId, "native-1");
-  let noticeText = plain(harness.writer.frames.at(-1)?.frame).replace(/\s+/g, " ");
-  assert.match(noticeText, /Session not removed; it may be live, unconfirmed, or no longer available/);
+  const refusedFrame = harness.writer.frames.at(-1);
+  assert.ok(refusedFrame?.frame, "the refused removal renders a composed frame");
+  const refusedNoticeText = plain(refusedFrame.frame);
+  const refusedNotice = sidebarNoticeRows(refusedNoticeText, REMOVE_REFUSED_NOTICE);
+  assert.ok(refusedNotice !== undefined,
+    `the complete refusal notice is rendered wrapped in the sidebar: ${JSON.stringify(refusedNoticeText)}`);
 
   manager.refusedCloseIds.delete("native-1");
   manager.views.splice(0, 1); // the sidebar snapshot now refers to a stale backend id
@@ -1445,9 +1451,13 @@ test("failed, live, and unconfirmed removals leave the row and owner in place wi
   await nextTurn();
   assert.deepEqual(manager.closeExitedCalls, ["native-1", "native-1", "native-1", "native-1"]);
   assert.equal(manager.views[0]?.hasLiveProcess, true);
-  noticeText = plain(harness.writer.frames.at(-1)?.frame).replace(/\s+/g, " ");
-  const notice = noticeText.match(/Session not removed; it may be live, unconfirmed, or no longer available/)?.[0] ?? "";
-  assert.ok(notice.length > 0 && notice.length <= 300, "refusal is bounded and truthful");
+  const unconfirmedFrame = harness.writer.frames.at(-1);
+  assert.ok(unconfirmedFrame?.frame, "the unconfirmed refusal renders a composed frame");
+  const unconfirmedNoticeText = plain(unconfirmedFrame.frame);
+  const notice = sidebarNoticeRows(unconfirmedNoticeText, REMOVE_REFUSED_NOTICE);
+  assert.ok(notice !== undefined,
+    `the complete refusal notice is rendered wrapped in the sidebar: ${JSON.stringify(unconfirmedNoticeText)}`);
+  assert.ok(notice.join(" ").length <= 300, "refusal is bounded and truthful");
   assert.equal(manager.shutdownCalls, 0);
   assert.equal(harness.terminal.stopCount, 0, "refusal never stops the process or terminal");
 

@@ -14,25 +14,37 @@ import { createRequire } from "node:module";
 import {
   appendFileSync,
   chmodSync,
+  closeSync,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
+  readSync,
   realpathSync,
   writeFileSync,
   watch,
+  type BigIntStats,
   type FSWatcher,
 } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, relative, sep } from "node:path";
 
 import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/terminal-surface";
 import {
+  frameHeader,
   frameHeaderMatches,
   isSidebarFocusedFrame,
+  renderedTitleMatches,
   selectedRosterEntry,
   sidebarRosterHidden,
 } from "./session-host-native-roster-witness";
+import { isCompleteMainFocusedRoster } from "./session-host-native-row-lifecycle";
+import {
+  nativeEditorContentMatches,
+  restoredNativeEditorFrame,
+} from "./session-host-native-main-harness";
 import {
   assertNativeEditorFieldEmpty,
   borderedEditorContentMatches,
@@ -50,6 +62,13 @@ import {
   formatModeWitnessDiagnostic,
   normalizeWindowsProbeFailure,
 } from "./session-host-mode-witness";
+import {
+  MAIN_CENSUS_SCHEMA_VERSION,
+  OriginalMainPidBinding,
+  formatMainCensusDiagnostic,
+  validateMainModeCensusReply,
+  type MainModeCensusSnapshot,
+} from "./session-host-windows-stdout-census-contract";
 
 export {
   assertNativeEditorFieldEmpty,
@@ -68,6 +87,11 @@ export const WINDOWS_EVENT_TIMEOUT_MS = 30_000;
 export const WINDOWS_OBSERVER_TIMEOUT_SECONDS = 180;
 export const WINDOWS_OUTER_COLS = 120;
 export const WINDOWS_OUTER_ROWS = 50;
+/**
+ * Wide-layout native pane width at the outer geometry: 120 outer columns minus
+ * the 32-column sidebar and its one divider column.
+ */
+export const WINDOWS_NATIVE_COLS = WINDOWS_OUTER_COLS - 32 - 1;
 export const WINDOWS_REQUIRE_ENV = "PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST";
 export const WINDOWS_OBSERVER_FIXTURE = join(process.cwd(), "tests", "fixtures", "session-host-windows-exit-watcher.ps1");
 export const WINDOWS_RUNNER_FIXTURE = join(process.cwd(), "tests", "fixtures", "session-host-windows-main-runner.cjs");
@@ -80,6 +104,48 @@ const TOOL_CATALOG_ENV = "PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG";
 const CREDENTIAL_NAME = /(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|PASSWORD)/i;
 const MAX_JOURNAL_BYTES = 4 * 1024 * 1024;
 const MAX_WITNESS_BYTES = 1024;
+const MAX_CENSUS_REPLY_BYTES = 4 * 1024;
+const CENSUS_REQUEST_FILENAME = "main-census-request.json";
+const CENSUS_REPLY_FILENAME = "main-census-reply.json";
+const MAX_DIRECTORY_CHAIN_DEPTH = 32;
+
+interface DirectoryChainEntry {
+  readonly path: string;
+  readonly dev: bigint;
+  readonly ino: bigint;
+}
+
+/** Bounded directory-identity chain from the fixture root to the filesystem top. */
+function captureDirectoryChainIdentity(root: string): DirectoryChainEntry[] {
+  const chain: DirectoryChainEntry[] = [];
+  let current = root;
+  for (let depth = 0; depth < MAX_DIRECTORY_CHAIN_DEPTH; depth += 1) {
+    const stats = lstatSync(current, { bigint: true });
+    if (!stats.isDirectory() || stats.isSymbolicLink() || stats.dev <= 0n || stats.ino <= 0n) {
+      throw new Error("census fixture root chain is not a real directory with a usable BigInt identity");
+    }
+    chain.push({ path: current, dev: stats.dev, ino: stats.ino });
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return chain;
+}
+
+function directoryChainIdentityUnchanged(chain: DirectoryChainEntry[]): boolean {
+  for (const entry of chain) {
+    let stats: BigIntStats;
+    try {
+      stats = lstatSync(entry.path, { bigint: true });
+    } catch {
+      return false;
+    }
+    if (!stats.isDirectory() || stats.isSymbolicLink() || stats.dev !== entry.dev || stats.ino !== entry.ino) {
+      return false;
+    }
+  }
+  return true;
+}
 const createdDirectoryIdentities = new Map<string, FileIdentity>();
 const createdFileIdentities = new Map<string, FileIdentity>();
 
@@ -145,6 +211,8 @@ export interface NativeJournalRecord {
   readonly sessionId?: string;
   readonly contextSessionId?: string;
   readonly sessionFile?: string;
+  readonly storedName?: string;
+  readonly displayName?: string;
   readonly columns?: number;
   readonly rows?: number;
   readonly tty?: boolean;
@@ -556,6 +624,78 @@ function selectedRosterLabel(frame: string): string | undefined {
   return selectedRosterEntry(frame, 32)?.label;
 }
 
+/**
+ * The observer-recorded canonical display caption for one native session. A
+ * session's startup caption may begin unavailable and settle to the public
+ * stored name or Pi's no-messages fallback; a missing caption is never guessed.
+ */
+function requireRecordedDisplayName(record: NativeJournalRecord, description: string): string {
+  const displayName = record.displayName;
+  if (typeof displayName !== "string" || displayName.length === 0) {
+    throw new Error(`${description}: native observer recorded no canonical display caption`);
+  }
+  return displayName;
+}
+
+/**
+ * Complete, non-guessed witness that a successful New/creation transferred Main
+ * input ownership to the exact observed child without a second host-row Enter:
+ * the active outer header is that child's own canonical caption, the single
+ * sidebar highlight is its own row, the complete Main-focused roster footer is
+ * drawn inside the still-visible wide sidebar pane, and the native pane draws
+ * its width-correct bordered EMPTY editor. A header alone, a partial roster, a
+ * stale sidebar-only footer, or a missing/partial native pane never satisfies
+ * it.
+ */
+export function isWindowsMainOwnerFrame(text: string, displayName: string): boolean {
+  return isWindowsOwnerSurface(text, displayName)
+    && nativeEditorBlockEmpty(text, 32, WINDOWS_NATIVE_COLS);
+}
+
+/** Owner header, single highlight, and complete Main-focused footer. */
+function isWindowsOwnerSurface(text: string, displayName: string): boolean {
+  return frameHeaderMatches(text, displayName)
+    && renderedTitleMatches(selectedRosterLabel(text), displayName)
+    && isCompleteMainFocusedRoster(text);
+}
+
+/**
+ * The native pane's bordered editor block, read at the exact wide geometry, is
+ * a full-width horizontal rule, one content row, and the same-width closing
+ * rule. Returns true only while that content row is EMPTY; a missing, partial,
+ * or wrong-width border never passes. The native content grammar is the shared
+ * POSIX editor-content matcher, so no draft punctuation is re-derived here.
+ */
+function nativeEditorBlockEmpty(text: string, sidebarColumns: number, nativeWidth: number): boolean {
+  if (!Number.isSafeInteger(sidebarColumns) || sidebarColumns < 12 || sidebarColumns > 1000) return false;
+  if (!Number.isSafeInteger(nativeWidth) || nativeWidth < 20 || nativeWidth > 1000) return false;
+  const rule = "─".repeat(nativeWidth);
+  const pane = text.split("\n").slice(1).map((line) => stripGeneratedSgr(line).slice(sidebarColumns + 1));
+  const trimmed = pane.map((line) => line.trimEnd());
+  for (let index = 0; index + 2 < pane.length; index += 1) {
+    if (trimmed[index] !== rule) continue;
+    if (nativeEditorContentMatches(pane[index + 1] ?? "", "") && trimmed[index + 2] === rule) return true;
+  }
+  return false;
+}
+
+/**
+ * Session-aware draft frame for one exact owner: the owner header, single
+ * highlight, complete Main-focused footer, and a width-correct bordered native
+ * editor whose content row is EXACTLY this draft. Reuses the shared POSIX
+ * restored-native-editor witness, so a stale narrow frame, a partial border, or
+ * an appended/altered draft is rejected.
+ */
+export function isWindowsOwnerDraftFrame(text: string, displayName: string, draft: string): boolean {
+  return isWindowsOwnerSurface(text, displayName)
+    && restoredNativeEditorFrame(text, {
+      ownerLabel: displayName,
+      draft,
+      sidebarColumns: 32,
+      nativeWidth: WINDOWS_NATIVE_COLS,
+    });
+}
+
 function workspaceFieldEmpty(frame: string): boolean {
   try {
     assertNativeEditorFieldEmpty(frame, "> Workspace:");
@@ -570,9 +710,21 @@ function writeMetadata(path: string, record: Record<string, unknown>): void {
 }
 
 export interface WindowsOwnedSession {
-  readonly label: string;
+  /** Latest canonical caption/name observed for this child (updated on rename). */
+  label: string;
   readonly workspace: string;
   readonly record: NativeJournalRecord;
+}
+
+/**
+ * Direct-Main session with the observer-recorded canonical display caption that
+ * the strict automatic-New ownership and draft witnesses require. It remains a
+ * subtype of the shared `WindowsOwnedSession` so the untouched launcher harness
+ * (which never observes a Main caption) keeps compiling unchanged.
+ */
+export interface WindowsMainOwnedSession extends WindowsOwnedSession {
+  /** Observer-recorded canonical display caption for the exact native session. */
+  displayName: string;
 }
 
 interface MainResult {
@@ -613,6 +765,11 @@ export class WindowsMainPtyDriver {
    * pre-quit predicates — never by data-chunk count.
    */
   private readonly modeWitnesses = new ModeWitnessLedger();
+  /** Fresh numeric-only Main mode-request census taken before pre-Quit (diagnosis only). */
+  private mainCensus?: MainModeCensusSnapshot;
+  /** The positively admitted original Main PID, bound at first welcome-frame admission. */
+  private readonly mainPidBinding = new OriginalMainPidBinding();
+  private readonly censusRootChain: DirectoryChainEntry[];
   readonly logWatcher: FSWatcher;
   readonly nativeWatcher: FSWatcher;
   readonly providerWatcher: FSWatcher;
@@ -646,6 +803,11 @@ export class WindowsMainPtyDriver {
   }) {
     this.pty = options.pty;
     this.root = options.root;
+    assertCreatedDirectoryIdentity(this.root);
+    // The census root chain is retained from driver creation, never
+    // re-baselined at request time: a change between construction and the
+    // census exchange must fail closed, not become the new baseline.
+    this.censusRootChain = captureDirectoryChainIdentity(this.root);
     this.optionsFile = options.optionsFile;
     this.resultFile = options.resultFile;
     this.observerFile = options.observerFile;
@@ -1006,7 +1168,7 @@ export class WindowsMainPtyDriver {
     assert.equal(this.selectedLabel(), label, `actual Main sidebar selected ${label}`);
   }
 
-  async createNativeSession(workspace: string, label: string, priorActiveHeader?: string): Promise<WindowsOwnedSession> {
+  async createNativeSession(workspace: string): Promise<WindowsMainOwnedSession> {
     const canonicalWorkspace = realpathSync(workspace);
     await this.ensureSidebarFocus();
     await this.moveRosterTo("New session");
@@ -1041,7 +1203,7 @@ export class WindowsMainPtyDriver {
       } catch {
         return false;
       }
-    }, `${label} forced Tab accepts the exact owned native directory completion before submission`, beforeFirstEnter);
+    }, "forced Tab accepts the exact owned native directory completion before submission", beforeFirstEnter);
     let afterFirstEnter = this.currentText();
     const firstEnterObservation = classifyFirstWorkspaceEnter(afterFirstEnter, expectedCompletions);
     // Completion evidence is required before submission: a direct submission
@@ -1049,56 +1211,74 @@ export class WindowsMainPtyDriver {
     // proof that the workspace was completed through the native provider.
     const { acceptedPath } = requireFolderCompletedObservation(firstEnterObservation);
     assert.ok(expectedCompletions.includes(acceptedPath),
-      `${label} first Enter accepted exactly its owned forward-slash directory completion`);
+      "first Enter accepted exactly its owned forward-slash directory completion");
     assert.equal(this.records().some((record) => record.type === "session_start"
       && samePath(record.cwd ?? "", canonicalWorkspace)), false,
-    `${label} completion acceptance is not mistaken for a New submission`);
+    "completion acceptance is not mistaken for a New submission");
     const beforeSubmit = this.frameRevision;
-    assert.ok(this.currentText().includes("Workspace:"), `${label} form remains open after folder completion`);
+    assert.ok(this.currentText().includes("Workspace:"), "form remains open after folder completion");
     assert.ok(borderedEditorContentMatches(this.currentText(), "> Workspace:", acceptedPath),
-      `${label} second Enter is authorized only while the accepted exact path remains in the visible Editor body`);
+      "second Enter is authorized only while the accepted exact path remains in the visible Editor body");
     this.pty.write(WINDOWS_KEYS.enter);
     await this.waitFrame((frame) => frame.includes("Starting (request ") || !frame.includes("Workspace:"),
-      `${label} distinct second Enter submits the accepted directory`, beforeSubmit);
+      "distinct second Enter submits the accepted directory", beforeSubmit);
     afterFirstEnter = this.currentText();
     assert.ok(afterFirstEnter.includes("Starting (request ") || !afterFirstEnter.includes("Workspace:"),
-      `${label} New request reached its submitted/closed state before lifecycle ownership is claimed`);
+      "New request reached its submitted/closed state before lifecycle ownership is claimed");
     const matchingRecords = await this.waitForNative((records) => records.some((record) => record.type === "session_start"
       && samePath(record.cwd ?? "", canonicalWorkspace)
       && typeof record.sessionId === "string" && record.sessionId.length > 0),
-    `real public session_start for ${label}`);
-    let record = matchingRecords.filter((candidate) => candidate.type === "session_start"
+    "real public session_start for the new Workspace-only New");
+    const record = matchingRecords.filter((candidate) => candidate.type === "session_start"
       && samePath(candidate.cwd ?? "", canonicalWorkspace)
       && typeof candidate.sessionId === "string").at(-1);
-    assert.ok(record, `${label} has a native public session_start record`);
-    assert.ok(Number.isSafeInteger(record.pid) && record.pid! > 1, `${label} has its exact native process PID`);
-    assert.equal(record.tty, true, `${label} public session_start confirms native Pi TTY mode`);
+    assert.ok(record, "the new session has a native public session_start record");
+    assert.ok(Number.isSafeInteger(record.pid) && record.pid! > 1, "the new session has its exact native process PID");
+    assert.equal(record.tty, true, "public session_start confirms native Pi TTY mode");
     assert.equal(record.agentDir, this.records().find((entry) => entry.type === "session_start" && entry.pid === record!.pid)?.agentDir,
-      `${label} retains its public native root identity in the lifecycle journal`);
-    assert.ok(record.sessionFile && isAbsolute(record.sessionFile), `${label} has a public absolute planned session path; no disk file is required before a message`);
+      "the new child retains its public native root identity in the lifecycle journal");
+    assert.ok(record.sessionFile && isAbsolute(record.sessionFile), "the new session has a public absolute planned session path; no disk file is required before a message");
     const spawnRecords = await this.waitForPty((entries) => entries.some((entry) => entry.type === "pty_spawn"
       && entry.pid === record!.pid && samePath(entry.cwd ?? "", canonicalWorkspace)),
-    `actual public node-pty spawn ownership for ${label}`);
+    "actual public node-pty spawn ownership for the new session");
     const matchingSpawns = spawnRecords.filter((entry) => entry.type === "pty_spawn"
       && entry.pid === record!.pid && samePath(entry.cwd ?? "", canonicalWorkspace));
-    assert.equal(matchingSpawns.length, 1, `${label} journal PID/cwd cross-binds to exactly one actual PTY spawn`);
+    assert.equal(matchingSpawns.length, 1, "the session_start PID/cwd cross-binds to exactly one actual PTY spawn");
     assert.ok(this.ptyRecords().every((entry) => !(entry.type === "pty_exit" && entry.pid === record!.pid)),
-      `${label} remains a live Main-owned PTY after session_start`);
-    await this.waitFrame((frame) => selectedRosterLabel(frame) === "(no messages)" || frame.includes(label),
-      `${label} New completion selects its row without activation`);
-    this.focus = "sidebar";
-    if (priorActiveHeader !== undefined) {
-      assert.equal(this.currentText().split("\n")[0], priorActiveHeader,
-        `${label} New completion does not auto-activate or replace the already active native session`);
-    } else {
-      assert.ok(this.currentText().includes("Welcome"), `${label} New completion leaves the empty Main surface active`);
-    }
-    await this.renameSelectedNativeSession(record, label);
-    return { label, workspace: canonicalWorkspace, record };
+      "the new session remains a live Main-owned PTY after session_start");
+    const displayName = requireRecordedDisplayName(record, "new Workspace-only New");
+    // A successful explicit New submission activates the created child as the
+    // Main input owner without a second host-row Enter: the active outer header
+    // is that child's own observed canonical caption (its startup caption may
+    // begin unavailable and settle to the public stored name or the
+    // no-messages fallback), its row is the single highlight, and the complete
+    // Main-focused footer with the wide sidebar pane proves the ownership
+    // transfer really happened while the sidebar stays visible.
+    await this.waitFrame((frame) => isWindowsMainOwnerFrame(frame, displayName),
+      `New completion activates the exact created child ${displayName} as the Main input owner with a complete Main-focused frame`);
+    this.focus = "main";
+    return { label: displayName, displayName, workspace: canonicalWorkspace, record };
   }
 
-  private async renameSelectedNativeSession(record: NativeJournalRecord, label: string): Promise<void> {
-    assert.equal(this.selectedLabel(), "(no messages)", "the freshly created native row is highlighted for public Edit");
+  /**
+   * Rename one already-created native row through the real host Edit form,
+   * never a child command. The target row is the single highlight established
+   * by its creation; the witness distinguishes an active-owner rename (the
+   * active header must follow the new caption) from editing an inactive row
+   * (the existing owner header must stay byte-for-byte unchanged). Never
+   * accept either header indiscriminately.
+   */
+  async renameNativeSession(session: WindowsMainOwnedSession, name: string): Promise<void> {
+    assert.ok(Number.isSafeInteger(session.record.pid) && session.record.pid! > 1 && session.record.sessionId,
+      "the rename target is an observer-confirmed native session");
+    await this.ensureSidebarFocus();
+    assert.ok(renderedTitleMatches(this.selectedLabel(), session.displayName),
+      "the observed target row is the single highlight for the public Edit key");
+    const activeHeader = frameHeader(this.currentText());
+    // Is the Edit target itself the active Main owner? An active-owner rename
+    // must follow the new caption; an inactive-row rename must leave the
+    // existing owner's header unchanged.
+    const targetWasActiveOwner = renderedTitleMatches(activeHeader, session.displayName);
     const beforeEdit = this.frameRevision;
     this.pty.write("e");
     this.focus = "form";
@@ -1114,30 +1294,173 @@ export class WindowsMainPtyDriver {
       }
     }, "public Edit form paints a complete, empty replacement body before input", beforeEdit);
     assertNativeEditorFieldEmpty(this.currentText(), "> New name:");
-    await this.send(label, "public Edit replacement is entered", (frame) => frame.includes(label));
+    await this.send(name, "public Edit replacement is entered", (frame) => frame.includes(name));
     this.pty.write(WINDOWS_KEYS.enter);
-    await this.waitForNative((records) => records.some((entry) => entry.type === "native_session_name"
-      && entry.pid === record.pid && entry.sessionId === record.sessionId && entry.storedName === label),
-    `public native observer sees the live SessionManager display-name value ${label}`);
-    await this.waitFrame((frame) => selectedRosterLabel(frame)?.includes(label) === true,
-      `public Edit updates the selected sidebar row to ${label}`);
+    const nameRecords = await this.waitForNative((records) => records.some((entry) => entry.type === "native_session_name"
+      && entry.pid === session.record.pid && entry.sessionId === session.record.sessionId && entry.storedName === name
+      && typeof entry.displayName === "string"),
+    `public native observer sees the live SessionManager display-name value ${name}`);
+    const nameRecord = nameRecords.filter((entry) => entry.type === "native_session_name"
+      && entry.pid === session.record.pid && entry.sessionId === session.record.sessionId && entry.storedName === name
+      && typeof entry.displayName === "string").at(-1);
+    assert.ok(nameRecord, "the actual stored-name event includes its canonical bounded display caption");
+    const displayName = nameRecord.displayName!;
+    const headerTruthful = (frame: string): boolean => targetWasActiveOwner
+      ? frameHeaderMatches(frame, displayName)
+      : frameHeader(frame) === activeHeader;
+    await this.waitFrame((frame) => renderedTitleMatches(selectedRosterLabel(frame), displayName) && headerTruthful(frame),
+      targetWasActiveOwner
+        ? "the renamed active owner reports its new caption as the owner header"
+        : "the selected native row renders the new caption while the active owner header is unchanged");
+    assert.ok(headerTruthful(this.currentText()), targetWasActiveOwner
+      ? "renaming the active owner keeps that same child as the active Main owner under its new caption"
+      : "editing an inactive native caption does not transfer active Main ownership");
+    session.label = name;
+    session.displayName = displayName;
     this.focus = "sidebar";
   }
 
-  async activate(label: string): Promise<void> {
+  async activate(label: string, expectedDraft: string): Promise<void> {
     await this.ensureSidebarFocus();
     await this.moveRosterTo(label);
     const before = this.frameRevision;
     this.pty.write(WINDOWS_KEYS.enter);
     this.focus = "main";
-    await this.waitFrame((frame) => frameHeaderMatches(frame, label),
-      `public Enter explicitly activates native row ${label}`, before);
+    await this.waitFrame((frame) => isWindowsOwnerDraftFrame(frame, label, expectedDraft),
+      `public Enter explicitly activates native row ${label} with its own exact bordered draft`, before);
   }
 
-  async writeDraft(value: string): Promise<void> {
+  async writeDraft(session: WindowsMainOwnedSession, value: string): Promise<void> {
     const before = this.frameRevision;
     this.pty.write(value);
-    await this.waitFrame((frame) => frame.includes(value), `native session displays its own draft ${value}`, before);
+    await this.waitFrame((frame) => isWindowsOwnerDraftFrame(frame, session.displayName, value),
+      `native session ${session.displayName} displays its own exact bordered draft ${value}`, before);
+  }
+
+  /**
+   * Admits the positively admitted original Main PID exactly once, at first
+   * welcome-frame admission. The retained binding is the only PID source for
+   * the fresh census request; a later re-read of the handle is never trusted
+   * on its own.
+   */
+  admitOriginalMainPid(): number {
+    return this.mainPidBinding.admit(this.pty.pid, this.exitEvent !== undefined);
+  }
+
+  /**
+   * One fresh numeric-only Main mode-request census through the fixed owned
+   * request/reply leaves in the existing fixture root, for use immediately
+   * before the strict pre-Quit assertions. The parent writes one exclusive
+   * 0600 request bound to a fresh nonce and the retained admitted original
+   * Main PID; the runner serves exactly once, binding the same nonce and its
+   * genuine process.pid. Both leaves stay retained in the witness tree. The
+   * reply is read through a readonly descriptor with BigInt regular-file,
+   * identity, and bounded-size checks plus bounded reads and a post-read path
+   * check; the fixture root and ancestor identities are revalidated during
+   * the exchange. The snapshot is diagnosis only: offered mode requests never
+   * prove negotiated or delivered terminal state, and a missing, replaced,
+   * or uncertain reply fails closed under the existing bounded
+   * ChangeSignal/deadline mechanics.
+   */
+  async requestMainModeCensus(): Promise<MainModeCensusSnapshot> {
+    const expectedMainPid = this.mainPidBinding.request(this.pty.pid, this.exitEvent !== undefined);
+    const nonce = randomNonce();
+    const rootChain = this.censusRootChain;
+    if (!directoryChainIdentityUnchanged(rootChain)) {
+      throw new Error("fresh Main census original root chain identity changed");
+    }
+    const requestPath = join(this.root, CENSUS_REQUEST_FILENAME);
+    writeOwnedFile(requestPath, JSON.stringify({
+      schemaVersion: MAIN_CENSUS_SCHEMA_VERSION,
+      nonce,
+      expectedMainPid,
+    }));
+    const replyPath = join(this.root, CENSUS_REPLY_FILENAME);
+    let replyIdentity: FileIdentity | undefined;
+    let result: MainModeCensusSnapshot | undefined;
+    await this.journalSignal.waitFor(() => {
+      if (!directoryChainIdentityUnchanged(rootChain)) {
+        throw new Error("fresh Main census root chain identity changed during the exchange");
+      }
+      let preStats: BigIntStats;
+      try {
+        preStats = lstatSync(replyPath, { bigint: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+      if (!preStats.isFile() || preStats.isSymbolicLink() || preStats.dev <= 0n || preStats.ino <= 0n
+        || preStats.size > BigInt(MAX_CENSUS_REPLY_BYTES)) {
+        return false;
+      }
+      if (replyIdentity === undefined) replyIdentity = { dev: preStats.dev, ino: preStats.ino };
+      else if (!sameFileIdentity(replyIdentity, { dev: preStats.dev, ino: preStats.ino })) {
+        throw new Error("fresh Main census reply identity changed during retained observation");
+      }
+      let fd: number;
+      try {
+        fd = openSync(replyPath, "r");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+      let payload = "";
+      let observedSize = 0n;
+      try {
+        const stats = fstatSync(fd, { bigint: true });
+        if (!stats.isFile() || stats.dev !== preStats.dev || stats.ino !== preStats.ino
+          || stats.size > BigInt(MAX_CENSUS_REPLY_BYTES)) {
+          return false; // replaced or grew after the pre-stat
+        }
+        observedSize = stats.size;
+        const buffer = Buffer.alloc(Number(stats.size));
+        let offset = 0;
+        while (offset < buffer.length) {
+          const read = readSync(fd, buffer, offset, buffer.length - offset, offset);
+          if (read === 0) break; // partial publication cannot be accepted
+          offset += read;
+        }
+        if (offset !== buffer.length) return false;
+        // Post-read descriptor validation: growth after the initial fstat can
+        // leave a valid JSON prefix that is not the complete file.
+        const afterRead = fstatSync(fd, { bigint: true });
+        if (!afterRead.isFile() || afterRead.dev !== stats.dev || afterRead.ino !== stats.ino
+          || afterRead.size !== stats.size) {
+          return false;
+        }
+        payload = buffer.toString("utf8");
+      } finally {
+        try { closeSync(fd); } catch { /* exact owned descriptor */ }
+      }
+      let postStats: BigIntStats;
+      try {
+        postStats = lstatSync(replyPath, { bigint: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+      if (!postStats.isFile() || postStats.isSymbolicLink()
+        || postStats.dev !== preStats.dev || postStats.ino !== preStats.ino
+        || postStats.size !== observedSize) {
+        throw new Error("fresh Main census reply path identity changed after the bounded read");
+      }
+      if (!directoryChainIdentityUnchanged(rootChain)) {
+        throw new Error("fresh Main census root chain identity changed after the bounded read");
+      }
+      this.mainPidBinding.request(this.pty.pid, this.exitEvent !== undefined);
+      try {
+        result = validateMainModeCensusReply(JSON.parse(payload), { nonce, expectedMainPid });
+      } catch {
+        result = undefined; // one bounded write may be observed before its final bytes
+      }
+      return result !== undefined;
+    }, WINDOWS_EVENT_TIMEOUT_MS, "fresh Main stdout mode census reply");
+    const snapshot = result!;
+    assert.equal(snapshot.hookActive, true, "the retained Main stdout observation hook is still active at census time");
+    assert.equal(snapshot.sameOutputStream, true, "Main retained the same public stdout stream at census time");
+    assert.equal(snapshot.observationComplete, true, "the fresh Main stdout census covered its complete supported scope");
+    this.mainCensus = snapshot;
+    return snapshot;
   }
 
   async assertBeforeQuitModes(): Promise<void> {
@@ -1149,15 +1472,18 @@ export class WindowsMainPtyDriver {
     this.recordPostParseInputModes();
     if (this.parserError) throw this.parserError;
     const modes = this.modeSnapshots;
-    assert.ok(this.sawAlternateEnter, "actual Main output entered the outer VT alternate buffer");
     const bracketedPasteObserved = modes.some((mode) => mode.bracketedPaste);
     const mouseTrackingSgrObserved = modes.some((mode) => mode.mouseTracking !== "none" && mode.mouseEncoding === "sgr");
     const nonBaselineKeyboardObserved = modes.some((mode) => mode.kittyFlags > 0 || mode.applicationCursorKeys || mode.applicationKeypad || mode.modifyOtherKeys > 0);
     // Only a real failure pays for the bounded metadata-only diagnostic, and
-    // the message stays byte-identical on success.
-    const diagnostic = bracketedPasteObserved && mouseTrackingSgrObserved && nonBaselineKeyboardObserved
+    // the message stays byte-identical on success. The fresh Main census is
+    // included so the mode-failure context survives a forced or failing
+    // cleanup without relying on the final result file — including when the
+    // alternate-screen entry itself is the missing observation.
+    const diagnostic = this.sawAlternateEnter && bracketedPasteObserved && mouseTrackingSgrObserved && nonBaselineKeyboardObserved
       ? ""
-      : ` (${this.modeWitnessDiagnostic()})`;
+      : ` (${this.modeWitnessDiagnostic()}${this.mainCensus === undefined ? "" : ` ${formatMainCensusDiagnostic(this.mainCensus)}`})`;
+    assert.ok(this.sawAlternateEnter, `actual Main output entered the outer VT alternate buffer${diagnostic}`);
     assert.ok(bracketedPasteObserved, `actual outer VT observed Main bracketed-paste negotiation${diagnostic}`);
     assert.ok(mouseTrackingSgrObserved,
       `actual outer VT observed Main mouse tracking and SGR encoding${diagnostic}`);

@@ -8,11 +8,25 @@
  * terminal transcripts are never recorded. The shared exact observer fixture
  * owns that logic so the source-launcher acceptance lane reuses the identical
  * incarnation/force-proof semantics.
+ *
+ * A test-only numeric stdout mode-request census hooks the same retained
+ * process.stdout after the baseline write and before Main starts: it counts
+ * offered write calls and complete DECSET/DECRST requests for the fixed known
+ * tracking/SGR/alternate/paste modes. It is a strict forwarder (exact original
+ * receiver, arguments, callback identity, return, and thrown error) and serves
+ * exactly one fresh request/reply through the fixed known child leaves in the
+ * options file's fixture root. Diagnosis only: offered requests never prove
+ * negotiated or delivered terminal state.
  */
 const fs = require('node:fs');
 const path = require('node:path');
 const { createRequire } = require('node:module');
 const { observePtyModule } = require('./session-host-windows-pty-observer.cjs');
+const {
+  createCensusReplyService,
+  createStdoutModeCensus,
+  installStdoutWriteCensus,
+} = require('./session-host-windows-stdout-census.cjs');
 
 function installPtyObservation(mainEntry, expectedPtyModule, ptyJournal) {
   // Match production's exact lazy createRequire anchor in instances.js.
@@ -59,6 +73,27 @@ async function main() {
   const observation = installPtyObservation(mainEntry, expectedPtyModule, ptyJournal);
   outputStream.write(`\x1b[2J\x1b[H${baseline}`);
 
+  // Census after the baseline write so the baseline is not counted, and before
+  // Main starts so every offered Main/TUI write is observed. The reply service
+  // watches exactly one owned nonrecursive fixture-root watch and serves at
+  // most one fresh request; it is closed on every return/error path.
+  const census = createStdoutModeCensus();
+  const censusHandle = installStdoutWriteCensus(outputStream, census);
+  let censusService;
+  try {
+    censusService = createCensusReplyService({
+      root: path.dirname(optionsPath),
+      mainPid: () => process.pid,
+      buildSnapshot: () => censusHandle.snapshot(),
+      fs,
+    });
+    censusService.start();
+  } catch {
+    // start() closes its own partially registered watcher before rethrowing;
+    // channel unavailable: the parent fails closed on its bounded wait.
+    censusService = undefined;
+  }
+
   let status = 1;
   let threw = false;
   try {
@@ -67,8 +102,15 @@ async function main() {
   } catch {
     threw = true;
   } finally {
-    observation.markNormalMainReturn(status, threw);
-    observation.restore();
+    // The exact census watcher closure sits in an inner finally so a
+    // restoration exception can never bypass it and keep Main alive.
+    try {
+      observation.markNormalMainReturn(status, threw);
+      observation.restore();
+      censusHandle.restore();
+    } finally {
+      if (censusService !== undefined) censusService.close();
+    }
   }
 
   const result = {

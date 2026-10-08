@@ -3,6 +3,9 @@ import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 import test from "node:test";
 
+import { SidebarController } from "../src/session-host/sidebar";
+import { stripGeneratedSgr } from "../src/session-host/terminal-surface";
+
 import {
   WINDOWS_EVENT_TIMEOUT_MS,
   WINDOWS_OBSERVER_TIMEOUT_SECONDS,
@@ -10,6 +13,7 @@ import {
   WINDOWS_TEST_TIMEOUT_MS,
   WINDOWS_OUTER_COLS,
   WINDOWS_OUTER_ROWS,
+  WINDOWS_NATIVE_COLS,
   WindowsMainPtyDriver,
   WindowsOwnedExitObserver,
   assertCredentialFreeNativeRecords,
@@ -22,13 +26,15 @@ import {
   createWindowsHarnessRoot,
   identityOfRealDirectory,
   isSessionShutdownFor,
+  isWindowsMainOwnerFrame,
+  isWindowsOwnerDraftFrame,
   probeWindowsPowerShell,
   randomDigits,
   resolveWindowsRuntime,
   sameFileIdentity,
   type WindowsOwnedSession,
 } from "./helpers/session-host-native-windows-harness";
-import { frameHeader } from "./helpers/session-host-native-roster-witness";
+import { SIDEBAR_COLUMNS, frameHeader, frameHeaderMatches } from "./helpers/session-host-native-roster-witness";
 
 const optIn = process.env[WINDOWS_REQUIRE_ENV] === "1";
 
@@ -89,7 +95,8 @@ test("real public Main exits two live Windows ConPTY native Pi sessions through 
 
   await driver.waitFrame((frame) => frame.includes("Welcome") && frame.includes("New session") && frame.includes("Quit host"),
     "actual public runSessionHost renders its welcome frame inside the owned outer Windows ConPTY");
-  assert.ok(typeof driver.pty.pid === "number" && Number.isSafeInteger(driver.pty.pid) && driver.pty.pid > 1,
+  const originalMainPid = driver.admitOriginalMainPid();
+  assert.ok(typeof originalMainPid === "number" && originalMainPid > 1,
     "the exact owned outer ConPTY exposes its positive public PID after real output, not synchronously at spawn");
   assert.ok(existsSync(nativeAgentDir), "one fresh ordinary native agent root is shared by both children");
   assert.deepEqual(driver.records(), [], "no native lifecycle record exists before Workspace-only New");
@@ -106,24 +113,29 @@ test("real public Main exits two live Windows ConPTY native Pi sessions through 
   ];
   assertNoSavedSessionOverrides(args);
 
-  const sessionA = await driver.createNativeSession(workspaceA, labelA);
-  assert.notEqual(frameHeader(driver.currentText()), labelA,
-    "New highlights A but does not activate it; the outer header stays the welcome title");
-  await driver.activate(labelA);
-  await driver.writeDraft(draftA);
-  const headerA = driver.currentText().split("\n")[0];
+  // A completed New activates its created child as the Main input owner without
+  // a second host-row Enter, so the first draft is typed through that genuinely
+  // automatic ownership. Explicit renames then give each child a distinct
+  // canonical caption for deliberate later navigation.
+  const sessionA = await driver.createNativeSession(workspaceA);
+  await driver.writeDraft(sessionA, draftA);
+  await driver.renameNativeSession(sessionA, labelA);
 
-  const sessionB = await driver.createNativeSession(workspaceB, labelB, headerA);
-  assert.equal(driver.currentText().split("\n")[0], headerA,
-    "New highlights B while leaving A active until explicit selection");
-  await driver.activate(labelB);
-  await driver.writeDraft(draftB);
+  const sessionB = await driver.createNativeSession(workspaceB);
+  assert.notEqual(frameHeader(driver.currentText()), labelA,
+    "the second completed New transfers Main input ownership from A to B instead of leaving A's stale active header");
+  assert.equal(frameHeaderMatches(driver.currentText(), sessionB.displayName), true,
+    "B's own freshly observed canonical caption is the active outer header after the ownership transition");
+  await driver.writeDraft(sessionB, draftB);
   assert.ok(driver.currentText().includes(draftB));
   assert.equal(driver.currentText().includes(draftA), false, "B does not inherit A's independent native input draft");
-  await driver.activate(labelA);
-  assert.ok(driver.currentText().includes(draftA), "A retains its own native input draft after switching back");
+  await driver.renameNativeSession(sessionB, labelB);
+  assert.equal(frameHeaderMatches(driver.currentText(), labelB), true,
+    "renaming the second active owner follows its new caption rather than preserving A's stale header");
+  await driver.activate(labelA, draftA);
+  assert.ok(driver.currentText().includes(draftA), "A is still deliberately activatable and retains its own native input draft");
   assert.equal(driver.currentText().includes(draftB), false, "A does not inherit B's independent native input draft");
-  await driver.activate(labelB);
+  await driver.activate(labelB, draftB);
   assert.ok(driver.currentText().includes(draftB), "B's independent draft survives returning from A");
   assert.equal(driver.currentText().includes(draftA), false);
 
@@ -158,6 +170,14 @@ test("real public Main exits two live Windows ConPTY native Pi sessions through 
   assert.equal(providerEvents.some((record) => record.event === "model_request"), false,
     "the acceptance case made no external/model request");
   assertCredentialFreeNativeRecords(driver.records());
+  // Fresh numeric-only Main mode-request census through the fixed owned
+  // request/reply leaves, immediately before the strict pre-Quit outer VT
+  // assertions. The request is bound to the PID retained at first welcome-frame
+  // admission, refusing identity drift or an observed original exit. The
+  // snapshot is retained by the driver so a failing mode assertion carries it
+  // even when the final result file never appears; offered requests are
+  // diagnosis only and never prove negotiated terminal state.
+  await driver.requestMainModeCensus();
   await driver.assertBeforeQuitModes();
 
   // Prebind both exact child PIDs while their actual Main-owned public PTYs are
@@ -249,6 +269,59 @@ test("real public Main exits two live Windows ConPTY native Pi sessions through 
   assert.equal(WINDOWS_OUTER_COLS, 120);
   assert.equal(WINDOWS_OUTER_ROWS, 50);
   completed = true;
+});
+
+test("Windows New ownership and draft witnesses require a complete composed frame and reject stale, partial, and altered evidence", () => {
+  const controller = new SidebarController({ toggleKey: "f8" });
+  const owner = "(no messages)";
+  const draft = "windowsDraftW";
+  controller.updateItems([{
+    id: "windows-new-owner", label: owner, workspace: "/owned/windows-new", agentDir: "/owned/agent",
+    lifecycle: "alive", hasLiveProcess: true, busy: false, pendingInput: false, inputSurface: false,
+    backgroundTasks: 0, backgroundShells: 0, activity: [],
+  }]);
+  controller.select("windows-new-owner");
+  const sidebarFocused = controller.renderRoster(SIDEBAR_COLUMNS, WINDOWS_OUTER_ROWS - 1).lines.map(stripGeneratedSgr);
+  // The completed New activates the created child without a second host-row Enter.
+  controller.handleInput("\r");
+  const mainFocused = controller.renderRoster(SIDEBAR_COLUMNS, WINDOWS_OUTER_ROWS - 1).lines.map(stripGeneratedSgr);
+  const rule = "\u2500".repeat(WINDOWS_NATIVE_COLS);
+  const nativeRows = (top: string, content: string, closing: string): string[] => {
+    const rows = Array.from({ length: WINDOWS_OUTER_ROWS - 1 }, () => "");
+    rows[20] = top;
+    rows[21] = content;
+    rows[22] = closing;
+    return rows;
+  };
+  const compose = (sidebar: readonly string[], main: readonly string[]): string =>
+    [owner, ...sidebar.map((line, index) => `${line.padEnd(SIDEBAR_COLUMNS)}\u2502${main[index] ?? ""}`)].join("\n");
+  const emptyEditor = compose(mainFocused, nativeRows(rule, "> ", rule));
+  assert.equal(isWindowsMainOwnerFrame(emptyEditor, owner), true,
+    "the observed owner header, single highlight, complete Main-focused roster, and width-correct bordered empty native editor are a genuine automatic-New ownership witness");
+  assert.equal(isWindowsMainOwnerFrame(`${owner}\n${mainFocused.join("\n")}`, owner), false,
+    "a composed frame with no native pane is not complete automatic-New ownership evidence");
+  assert.equal(isWindowsMainOwnerFrame(`${owner}\n${sidebarFocused.join("\n")}`, owner), false,
+    "a stale sidebar-focused footer never proves Main input ownership");
+  assert.equal(isWindowsMainOwnerFrame(compose(mainFocused, nativeRows(rule, "> ", "")), owner), false,
+    "a partial native border that never drew its closing rule never proves ownership");
+  assert.equal(isWindowsMainOwnerFrame(compose(mainFocused, nativeRows("\u2500".repeat(52), "> ", "\u2500".repeat(52))), owner), false,
+    "a wrong-width native border never proves ownership");
+  assert.equal(isWindowsMainOwnerFrame(`A-stale-owner\n${mainFocused.join("\n")}`, owner), false,
+    "an inactive-owner header never proves the newly created child owns Main");
+
+  const filledEditor = compose(mainFocused, nativeRows(rule, `> ${draft}`, rule));
+  assert.equal(isWindowsOwnerDraftFrame(filledEditor, owner, draft), true,
+    "the exact bordered native draft under the owner surface is accepted");
+  assert.equal(isWindowsOwnerDraftFrame(compose(mainFocused, nativeRows(rule, `> ${draft}qQ`, rule)), owner, draft), false,
+    "an appended draft is rejected");
+  assert.equal(isWindowsOwnerDraftFrame(compose(mainFocused, nativeRows(rule, `> x-${draft}`, rule)), owner, draft), false,
+    "an altered draft is rejected");
+  assert.equal(isWindowsOwnerDraftFrame(compose(mainFocused, nativeRows(rule, `> ${draft}`, "")), owner, draft), false,
+    "a partial native border is rejected for the draft witness");
+  assert.equal(isWindowsOwnerDraftFrame(compose(sidebarFocused, nativeRows(rule, `> ${draft}`, rule)), owner, draft), false,
+    "a stale sidebar-focused footer is rejected for the draft witness");
+  assert.equal(isWindowsOwnerDraftFrame(`${owner}\n${nativeRows(rule, `> ${draft}`, rule).join("\n")}`, owner, draft), false,
+    "a draft without the complete owner roster is rejected");
 });
 
 function samePathForTest(left: string, right: string): boolean {

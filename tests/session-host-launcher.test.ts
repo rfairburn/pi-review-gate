@@ -90,7 +90,7 @@ interface LauncherModule {
   __test: {
     runSessionHostLauncher(argv: readonly string[], overrides?: LauncherOverrides): Promise<number>;
     resolvePiRuntime(options: { explicit?: string; env: NodeJS.ProcessEnv; agentDir: string; cwd: string; writeError: (text: string) => void }): Promise<PiRuntimeResult>;
-    buildSourceExtension(options: { packageRoot: string; agentDir: string; env: NodeJS.ProcessEnv; sourceBuildTimeoutMs?: number; runNpm?: (npmCli: string, args: string[], options: Record<string, unknown>) => Promise<BoundedProcessResult> }): Promise<BuildResult>;
+    buildSourceExtension(options: { packageRoot: string; agentDir: string; env: NodeJS.ProcessEnv; sourceBuildTimeoutMs?: number; runNpm?: (npmCli: string, args: string[], options: Record<string, unknown>) => Promise<BoundedProcessResult>; runCompile?: (compilerCli: string, args: string[], options: Record<string, unknown>) => Promise<BoundedProcessResult> }): Promise<BuildResult>;
     provisionPiRuntime(options: { env: NodeJS.ProcessEnv; agentDir: string; writeError: (text: string) => void; npmCli?: string; beforeVersionRootMkdir?: (versionRoot: string) => void; runNpm?: (npmCli: string, args: string[], options: Record<string, unknown>) => Promise<BoundedProcessResult>; processRunner?: (file: string, args: string[], options: Record<string, unknown>) => Promise<BoundedProcessResult>; validatePiPackage?: (pkgDir: string, env: NodeJS.ProcessEnv, options?: { exactVersion?: string }) => Promise<{ file: string; version: string }> }): Promise<PiRuntimeResult>;
     validatePiPackage(pkgDir: string, env: NodeJS.ProcessEnv, options?: { expectedFile?: string; exactVersion?: string; processRunner?: (file: string, args: string[], options: Record<string, unknown>) => Promise<BoundedProcessResult> }): Promise<{ file: string; version: string }>;
     probePiVersion(file: string, env: NodeJS.ProcessEnv, processRunner?: (file: string, args: string[], options: Record<string, unknown>) => Promise<BoundedProcessResult>): Promise<string>;
@@ -191,6 +191,29 @@ function makePackageFixture(source: boolean): { root: string; packageRoot: strin
     writeFileSync(join(packageRoot, "src", "session-host", "main.ts"), "// source marker\n", "utf8");
   }
   return { root, packageRoot, identity: { dev: rootStats.dev, ino: rootStats.ino } };
+}
+
+/**
+ * Inert synthetic installed TypeScript package inside an owned stage. The
+ * launcher only ever resolves and identity-checks this entry; no test executes
+ * it as a compiler, so its content is deliberately inert. Fixtures are small
+ * and fixed (three files) and are retained, never recursively cleaned.
+ */
+function writeInertStageTypeScript(stageRoot: string): void {
+  const packageDir = join(stageRoot, "node_modules", "typescript");
+  mkdirSync(join(packageDir, "bin"), { recursive: true });
+  writeFileSync(join(packageDir, "package.json"), JSON.stringify({ name: "typescript", version: "5.7.2", bin: { tsc: "./bin/tsc" } }), { encoding: "utf8", flag: "wx" });
+  writeFileSync(join(packageDir, "bin", "tsc"), "// inert synthetic compiler: never executed by the launcher\n", { encoding: "utf8", flag: "wx" });
+}
+
+/** The same inert installed layout, as JS source lines for a fake npm script. */
+function inertStageTypeScriptScriptLines(): string[] {
+  return [
+    `const tscPkg = require("node:path").join(process.cwd(), "node_modules", "typescript");`,
+    `fs.mkdirSync(require("node:path").join(tscPkg, "bin"), { recursive: true });`,
+    `fs.writeFileSync(require("node:path").join(tscPkg, "package.json"), JSON.stringify({ name: "typescript", version: "5.7.2", bin: { tsc: "./bin/tsc" } }), { flag: "wx" });`,
+    `fs.writeFileSync(require("node:path").join(tscPkg, "bin", "tsc"), "// inert synthetic compiler: never executed by the launcher\\n", { flag: "wx" });`,
+  ];
 }
 
 function sameFixtureDirectoryChain(chain: Array<{ target: string; identity: OwnedFixture["identity"] }>): boolean {
@@ -858,25 +881,25 @@ test("production source-build runs in an owned staging root and preserves the li
   mkdirSync(bin);
   const log = join(fixture.root, "npm-invocations.jsonl");
   writeFileSync(join(bin, "package.json"), JSON.stringify({ name: "npm", version: "10.0.0", bin: { npm: "npm" } }), "utf8");
-  // The fake public npm JS bin simulates locked ci plus `npm run build`.
+  // The fake public npm JS bin performs only the locked ci install and places
+  // an inert synthetic TypeScript package in the stage; it never runs a
+  // package build lifecycle.
   writeFileSync(join(bin, "npm"), `#!/usr/bin/env node\n${[
     `const fs = require("node:fs");`,
     `const path = require("node:path");`,
     `const args = process.argv.slice(2);`,
     `fs.appendFileSync(process.env.TEST_NPM_LOG, JSON.stringify({ args, cwd: process.cwd(), home: process.env.HOME, cache: process.env.npm_config_cache, logs: process.env.npm_config_logs_dir, temp: process.env.TMPDIR, bootstrap: process.env.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP ?? null, restore: process.env.PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE ?? null, settlement: process.env.PI_REVIEW_GATE_SETTLEMENT_SECRET ?? null, quiescence: process.env.PI_REVIEW_GATE_QUIESCENCE_CHILD ?? null, ddgs: process.env.PI_REVIEW_GATE_DDGS_PYTHON ?? null, nodeOptions: process.env.NODE_OPTIONS, nodeEnv: process.env.NODE_ENV ?? null, provider: process.env.ANTHROPIC_API_KEY }) + "\\n");`,
-    `if (args[0] === "ci") { fs.mkdirSync(path.join(process.cwd(), "node_modules")); process.exit(0); }`,
-    `if (process.argv[2] === "--prefix") {`,
-    `  const prefix = args[1];`,
-    `  const distDir = path.join(prefix, "dist", "src", "session-host");`,
-    `  fs.mkdirSync(distDir, { recursive: true });`,
-    `  fs.writeFileSync(path.join(distDir, "main.js"), "// staged build output\\n");`,
-    `}`,
+    `if (args[0] !== "ci") { process.stderr.write("unexpected npm run lifecycle\\n"); process.exit(97); }`,
+    `fs.mkdirSync(path.join(process.cwd(), "node_modules"));`,
+    ...inertStageTypeScriptScriptLines(),
+    `process.exit(0);`,
     "",
   ].join("\n")}`, "utf8");
 
   const events: string[] = [];
   const captured: HostOptions[] = [];
   const diagnostics: string[] = [];
+  const compilePlans: Array<{ compilerCli: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv }> = [];
   const env = makeEnvironment({
     HOME: fixture.root,
     PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
@@ -898,6 +921,17 @@ test("production source-build runs in an owned staging root and preserves the li
     stdinIsTTY: true,
     stdoutIsTTY: true,
     packageRoot: fixture.packageRoot,
+    build: (options) => launcher.__test.buildSourceExtension({
+      ...options,
+      runCompile: async (compilerCli, args, processOptions) => {
+        const stagedRoot = String(processOptions.cwd);
+        compilePlans.push({ compilerCli, args, cwd: stagedRoot, env: processOptions.env as NodeJS.ProcessEnv });
+        const distDir = join(stagedRoot, "dist", "src", "session-host");
+        mkdirSync(distDir, { recursive: true });
+        writeFileSync(join(distDir, "main.js"), "// staged compile output\n", "utf8");
+        return { status: 0, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "" };
+      },
+    }),
     resolvePiRuntime: (options) => { events.push("pi"); return { file: "/synthetic/pi", version: "1.0.4", source: "npm-global" }; },
     ensureDdgs: (root) => { events.push("ddgs"); void root; return { ok: true, python: "/synthetic/python" }; },
     loadMain: (entry) => {
@@ -935,22 +969,28 @@ test("production source-build runs in an owned staging root and preserves the li
     nodeEnv: string | null;
     provider: string;
   });
-  assert.equal(invocations.length, 2, "the source stage runs locked ci before build");
+  assert.equal(invocations.length, 1, "the source stage installs locked dependencies and never runs a package build lifecycle");
   assert.deepEqual(invocations[0].args, ["ci", "--include=dev", "--ignore-scripts", "--no-audit", "--no-fund", "--registry", "https://registry.npmjs.org"]);
   assert.equal(invocations[0].nodeEnv, "production", "npm's production environment is preserved while dev dependencies are explicitly included");
-  const invocation = invocations[1];
-  const stagingRoot = invocation.args[1];
-  // The build runs against an owned staging package root under the agent
-  // directory cache — never the live checkout.
-  assert.deepEqual(invocation.args, ["--prefix", stagingRoot, "run", "build"]);
-  assert.equal(invocation.cwd, stagingRoot);
+  assert.ok(!invocations[0].args.some((arg) => arg === "run" || arg === "build" || arg === "clean:build"), "no recursive clean/build lifecycle is invoked");
+  const invocation = invocations[0];
+  const stagingRoot = invocation.cwd;
+  // The compile runs against an owned staging package root under the agent
+  // directory cache — never the live checkout — as one direct TypeScript
+  // project invocation through public Node, with no `.bin` PATH shim.
+  assert.equal(compilePlans.length, 1, "the compile phase is a single direct TypeScript invocation");
+  const compilePlan = compilePlans[0];
+  assert.equal(compilePlan.compilerCli, join(stagingRoot, "node_modules", "typescript", "bin", "tsc"), "the compile uses the stage's own installed TypeScript CLI");
+  assert.deepEqual(compilePlan.args, ["-p", join(stagingRoot, "tsconfig.json")], "the compile is a direct tsc project invocation, never `npm run build`");
+  assert.equal(compilePlan.cwd, stagingRoot);
+  assert.doesNotMatch(String(compilePlan.env.PATH ?? ""), /node_modules[/\\]\.bin/u, "the compile PATH never gains a node_modules/.bin shim entry");
   const agentDir = join(fixture.root, ".pi", "agent");
   assert.ok(stagingRoot.startsWith(`${agentDir}/.pi-review-gate/build/pi-review-sessions-`), `staged root must be owned: ${stagingRoot}`);
   // The host receives the staged root so every runtime lookup stays in the stage.
   assert.equal(captured[0].packageRoot, stagingRoot);
   assert.equal(captured[0].env.NODE_ENV, "production", "the native host environment remains unchanged");
   // Main can settle gracefully, but root identity does not authorize deleting
-  // npm/build descendants without complete per-entry creation receipts.
+  // npm/compile descendants without complete per-entry creation receipts.
   assert.equal(existsSync(stagingRoot), true);
   assert.match(diagnostics[0], /^pi-review-sessions: pi runtime: \/synthetic\/pi \(v1\.0\.4, npm-global\)\n$/);
   assert.match(diagnostics[1], /preserving the source stage because per-entry descendant creation receipts are unavailable/);
@@ -963,6 +1003,8 @@ test("production source-build runs in an owned staging root and preserves the li
   assert.equal(invocation.ddgs, null);
   assert.equal(invocation.nodeOptions, "--no-warnings");
   assert.equal(invocation.provider, "provider-secret");
+  assert.equal(compilePlan.env.NODE_OPTIONS, "--no-warnings", "the compile environment preserves the user's NODE_OPTIONS");
+  assert.equal(compilePlan.env.ANTHROPIC_API_KEY, "provider-secret", "the compile environment preserves trusted provider variables");
   assert.equal(env.PI_REVIEW_GATE_SETTLEMENT_SECRET, "settlement-secret", "the injected caller environment is not mutated");
   assert.equal(env.PI_REVIEW_GATE_QUIESCENCE_CHILD, "quiescence-secret");
   for (const ownedPath of [invocation.home, invocation.cache, invocation.logs, invocation.temp]) {
@@ -982,8 +1024,9 @@ test("a failed staged build preserves the live dist and retains its stage", { sk
     `const fs = require("node:fs");`,
     `const args = process.argv.slice(2);`,
     `fs.appendFileSync(process.env.TEST_NPM_LOG, JSON.stringify({ args, cwd: process.cwd() }) + "\\n");`,
-    `if (args[0] === "ci") process.exit(0);`,
-    `process.exit(23); // simulate a failing build`,
+    `if (args[0] !== "ci") { process.stderr.write("unexpected npm run lifecycle\\n"); process.exit(97); }`,
+    ...inertStageTypeScriptScriptLines(),
+    `process.exit(0);`,
     "",
   ].join("\n")}`, "utf8");
 
@@ -998,6 +1041,10 @@ test("a failed staged build preserves the live dist and retains its stage", { sk
     stdinIsTTY: true,
     stdoutIsTTY: true,
     packageRoot: fixture.packageRoot,
+    build: (options) => launcher.__test.buildSourceExtension({
+      ...options,
+      runCompile: async () => ({ status: 23, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "compile stdout line\n", stderr: "compile failed\n" }),
+    }),
     resolvePiRuntime: () => { events.push("pi"); return { file: "/synthetic/pi", version: "1.0.4", source: "npm-global" }; },
     ensureDdgs: (root) => { events.push("ddgs"); void root; return { ok: true, python: "/synthetic/python" }; },
     loadMain: () => { events.push("load"); return { runSessionHost: () => 0 }; },
@@ -1006,6 +1053,8 @@ test("a failed staged build preserves the live dist and retains its stage", { sk
   });
   assert.equal(status, 23);
   assert.deepEqual(events, [], "no Pi/DDGS/load after a failed build");
+  assert.match(stderr, /failed build stage: TypeScript compile \(tsc -p tsconfig\.json\)/);
+  assert.match(stderr, /TypeScript compile \(tsc -p tsconfig\.json\) stderr:\ncompile failed\n/);
   // The live checkout dist is preserved byte-for-byte.
   assert.equal(readFileSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"), "utf8"), "LIVE DIST SENTINEL — never rebuild in place\n");
   // The failed build stage is honestly reported and retained: npm/build
@@ -1032,19 +1081,20 @@ test("synthetic stage cleanup retains source build stage after unconfirmed setup
     runNpm: async (_npmCli, args, options) => {
       stagingRoot = String(options.cwd);
       if (args[0] === "ci") {
-        mkdirSync(join(stagingRoot, "node_modules"));
+        writeInertStageTypeScript(stagingRoot);
         return { status: 0, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "" };
       }
-      return {
-        status: 0,
-        signal: null,
-        error: new Error("synthetic process-group cleanup unconfirmed"),
-        cleanupConfirmed: false,
-        timedOut: false,
-        outputExceeded: false,
-        stdout: "",
-      };
+      throw new Error("the npm seam is install-only");
     },
+    runCompile: async () => ({
+      status: 0,
+      signal: null,
+      error: new Error("synthetic process-group cleanup unconfirmed"),
+      cleanupConfirmed: false,
+      timedOut: false,
+      outputExceeded: false,
+      stdout: "",
+    }),
   });
 
   assert.equal(result.status, 1);
@@ -1378,12 +1428,10 @@ test("a relative PI_CODING_AGENT_DIR anchors staging and host paths against the 
     `const path = require("node:path");`,
     `const args = process.argv.slice(2);`,
     `fs.appendFileSync(process.env.TEST_NPM_LOG, JSON.stringify({ args, cwd: process.cwd() }) + "\\n");`,
-    `if (args[0] === "ci") { fs.mkdirSync(path.join(process.cwd(), "node_modules")); process.exit(0); }`,
-    `if (args[0] === "--prefix") {`,
-    `  const distDir = path.join(args[1], "dist", "src", "session-host");`,
-    `  fs.mkdirSync(distDir, { recursive: true });`,
-    `  fs.writeFileSync(path.join(distDir, "main.js"), "// staged build output\\n");`,
-    `}`,
+    `if (args[0] !== "ci") { process.stderr.write("unexpected npm run lifecycle\\n"); process.exit(97); }`,
+    `fs.mkdirSync(path.join(process.cwd(), "node_modules"));`,
+    ...inertStageTypeScriptScriptLines(),
+    `process.exit(0);`,
     "",
   ].join("\n")}`, "utf8");
 
@@ -1406,6 +1454,15 @@ test("a relative PI_CODING_AGENT_DIR anchors staging and host paths against the 
     stdoutIsTTY: true,
     packageRoot: fixture.packageRoot,
     cwd: startupCwd,
+    build: (options) => launcher.__test.buildSourceExtension({
+      ...options,
+      runCompile: async (_compilerCli, _args, processOptions) => {
+        const distDir = join(String(processOptions.cwd), "dist", "src", "session-host");
+        mkdirSync(distDir, { recursive: true });
+        writeFileSync(join(distDir, "main.js"), "// staged compile output\n", "utf8");
+        return { status: 0, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "" };
+      },
+    }),
     resolvePiRuntime: () => { events.push("pi"); return { file: "/synthetic/pi", version: "1.0.4", source: "npm-global" }; },
     ensureDdgs: (root) => { events.push("ddgs"); void root; return { ok: true, python: "/synthetic/python" }; },
     loadMain: () => { events.push("load"); return { runSessionHost: (options) => { events.push("run"); captured.push(options); return 0; } }; },
@@ -1414,14 +1471,14 @@ test("a relative PI_CODING_AGENT_DIR anchors staging and host paths against the 
   });
   assert.equal(status, 0);
   const anchoredAgentDir = join(startupCwd, "agent dir π");
-  // The real default build runs against an absolute staged prefix under the
-  // anchored agent directory.
+  // The real default build plan runs against an absolute staged prefix under
+  // the anchored agent directory, installing first and then compiling with the
+  // stage's own TypeScript CLI.
   const invocations = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { args: string[]; cwd: string });
-  assert.equal(invocations.length, 2);
-  const invocation = invocations[1];
-  const stagingRoot = invocation.args[1];
-  assert.ok(isAbsolute(stagingRoot), `npm prefix must be absolute: ${stagingRoot}`);
-  assert.equal(invocation.cwd, stagingRoot);
+  assert.equal(invocations.length, 1, "only the locked ci install invokes npm");
+  assert.equal(invocations[0].args[0], "ci");
+  const stagingRoot = invocations[0].cwd;
+  assert.ok(isAbsolute(stagingRoot), `staged root must be absolute: ${stagingRoot}`);
   assert.ok(stagingRoot.startsWith(`${anchoredAgentDir}/.pi-review-gate/build/pi-review-sessions-`), `staged root must be anchored: ${stagingRoot}`);
   // The host receives an absolute package root and the anchored override.
   assert.equal(captured[0].packageRoot, stagingRoot);
@@ -1850,9 +1907,12 @@ function writeFakeNpm(fixture: RuntimeFixture, behavior: "global" | "install" | 
     lines.push(`if (args[0] === "root") { if (process.env.PI_FAKE_GLOBAL_ROOT) console.log(process.env.PI_FAKE_GLOBAL_ROOT); process.exit(0); }`);
     lines.push(`process.exit(1);`);
   } else if (behavior === "timeout-build") {
-    lines.push(`if (args[0] === "ci") { fs.mkdirSync(require("node:path").join(process.cwd(), "node_modules")); process.exit(0); }`);
-    lines.push(`process.on("SIGTERM", () => process.exit(0));`);
-    lines.push(`setInterval(() => {}, 1000);`);
+    // Only the locked ci install invokes npm; it places the stage's inert
+    // installed TypeScript fixture. The compile deadline is exercised by the
+    // injected compile seam in the timeout test.
+    lines.push(`if (args[0] !== "ci") { process.exit(0); }`);
+    lines.push(...inertStageTypeScriptScriptLines());
+    lines.push(`process.exit(0);`);
   } else {
     // install --prefix <staging> --ignore-scripts --no-audit --no-fund
     // --registry https://registry.npmjs.org @earendil-works/pi-coding-agent@pinned
@@ -1911,6 +1971,8 @@ test("a timed-out source build that exits zero on SIGTERM never falls through to
   cleanupFixture(t, runtimeFixture);
   cleanupFixture(t, sourceFixture);
   writeFakeNpm(runtimeFixture, "timeout-build");
+  const compileChild = join(runtimeFixture.root, "hanging-compile-child.js");
+  writeFileSync(compileChild, "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000);\n", "utf8");
   const events: string[] = [];
   let buildResult: BuildResult | undefined;
   let stderr = "";
@@ -1925,7 +1987,15 @@ test("a timed-out source build that exits zero on SIGTERM never falls through to
     cwd: runtimeFixture.root,
     build: async (options) => {
       events.push("build");
-      buildResult = await launcher.__test.buildSourceExtension({ ...options, sourceBuildTimeoutMs: 500 });
+      buildResult = await launcher.__test.buildSourceExtension({
+        ...options,
+        sourceBuildTimeoutMs: 500,
+        runCompile: (compilerCli, args, compileOptions) => {
+          void compilerCli;
+          void args;
+          return launcher.__test.runBoundedProcess(process.execPath, [compileChild], compileOptions);
+        },
+      });
       return buildResult;
     },
     resolvePiRuntime: () => { events.push("pi"); return { file: "/synthetic/pi", version: "1.0.4", source: "npm-global" }; },
@@ -1936,7 +2006,8 @@ test("a timed-out source build that exits zero on SIGTERM never falls through to
   });
   assert.equal(status, 124);
   assert.equal(buildResult?.timedOut, true);
-  assert.equal(buildResult?.childStatus, 0, "the synthetic npm child handled SIGTERM with exit 0");
+  assert.equal(buildResult?.stage, "compile", "the compile stage owns the admitted deadline");
+  assert.equal(buildResult?.childStatus, 0, "the synthetic compile child handled SIGTERM with exit 0");
   assert.equal(buildResult?.status, 124, "expiration remains a nonzero build outcome");
   assert.deepEqual(events, ["build"], "runtime resolution, DDGS, and Main are not reached");
   assert.match(stderr, /extension build failed \(setup deadline exceeded\)/);
@@ -2135,7 +2206,7 @@ test("build failure diagnostics keep stage identity, stream provenance, and boun
   assert.doesNotMatch(install, /\u001b/u);
 
   const compile = launcher.__test.formatBuildStageDiagnostics({ stdout: "", stderr: "compile stderr line" }, "compile");
-  assert.match(compile, /npm run build \(compile\) stderr:\ncompile stderr line/);
+  assert.match(compile, /TypeScript compile \(tsc -p tsconfig\.json\) stderr:\ncompile stderr line/);
   assert.doesNotMatch(compile, /stdout/);
   assert.equal(launcher.__test.formatBuildStageDiagnostics({ stdout: "", stderr: "" }, "compile"), "", "no captured output emits no diagnostic block");
 
@@ -2155,9 +2226,7 @@ test("synthetic source build failures name the failing stage and preserve the tr
     packageRoot: source.packageRoot,
     agentDir: runtime.agentDir,
     env: runtimeEnv(runtime),
-    runNpm: async (_npmCli, args) => (args[0] === "ci"
-      ? { status: 5, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "install stdout line\n", stderr: "\u001b[31minstall failed\u001b[0m\n" }
-      : { status: 0, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "" }),
+    runNpm: async () => ({ status: 5, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "install stdout line\n", stderr: "\u001b[31minstall failed\u001b[0m\n" }),
   });
   assert.equal(installFailure.stage, "install");
   assert.equal(installFailure.status, 5, "the true install status is preserved");
@@ -2165,18 +2234,23 @@ test("synthetic source build failures name the failing stage and preserve the tr
   assert.match(installFailure.diagnostics ?? "", /npm ci \(dependency install\) stderr:\ninstall failed\n/);
   assert.doesNotMatch(installFailure.diagnostics ?? "", /\u001b/u);
 
+  // The compile seam is separate from the npm seam: install stays install-only
+  // and the direct TypeScript compile is its own injected stage.
   const compileFailure = await launcher.__test.buildSourceExtension({
     packageRoot: source.packageRoot,
     agentDir: runtime.agentDir,
     env: runtimeEnv(runtime),
-    runNpm: async (_npmCli, args) => (args[0] === "ci"
-      ? { status: 0, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "" }
-      : { status: 23, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "compile stdout line\n", stderr: "compile failed\n" }),
+    runNpm: async (_npmCli, args, options) => {
+      assert.equal(args[0], "ci");
+      writeInertStageTypeScript(String(options.cwd));
+      return { status: 0, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "" };
+    },
+    runCompile: async () => ({ status: 23, signal: null, cleanupConfirmed: true, timedOut: false, outputExceeded: false, stdout: "compile stdout line\n", stderr: "compile failed\n" }),
   });
   assert.equal(compileFailure.stage, "compile");
   assert.equal(compileFailure.status, 23);
-  assert.match(compileFailure.diagnostics ?? "", /npm run build \(compile\) stdout:\ncompile stdout line\n/);
-  assert.match(compileFailure.diagnostics ?? "", /npm run build \(compile\) stderr:\ncompile failed\n/);
+  assert.match(compileFailure.diagnostics ?? "", /TypeScript compile \(tsc -p tsconfig\.json\) stdout:\ncompile stdout line\n/);
+  assert.match(compileFailure.diagnostics ?? "", /TypeScript compile \(tsc -p tsconfig\.json\) stderr:\ncompile failed\n/);
 });
 
 test("a failing synthetic compile reports its bounded cause and never turns failure green", { skip: process.platform === "win32" }, async (t) => {
@@ -2190,11 +2264,9 @@ test("a failing synthetic compile reports its bounded cause and never turns fail
     `const fs = require("node:fs");`,
     `const args = process.argv.slice(2);`,
     `fs.appendFileSync(process.env.TEST_NPM_LOG, JSON.stringify({ args, cwd: process.cwd() }) + "\\n");`,
-    `if (args[0] === "ci") process.exit(0);`,
-    `process.stdout.write("synthetic build stdout\\n");`,
-    `process.stderr.write("\\u001b[31mTS2304: Cannot find name 'synthetic'.\\u001b[0m\\n");`,
-    // A natural exit flushes both piped streams before the true status lands.
-    `process.exitCode = 1;`,
+    `if (args[0] !== "ci") { process.stderr.write("unexpected npm run lifecycle\\n"); process.exit(97); }`,
+    ...inertStageTypeScriptScriptLines(),
+    `process.exit(0);`,
     "",
   ].join("\n")}`, "utf8");
 
@@ -2208,6 +2280,18 @@ test("a failing synthetic compile reports its bounded cause and never turns fail
     stdinIsTTY: true,
     stdoutIsTTY: true,
     packageRoot: fixture.packageRoot,
+    build: (options) => launcher.__test.buildSourceExtension({
+      ...options,
+      runCompile: async () => ({
+        status: 1,
+        signal: null,
+        cleanupConfirmed: true,
+        timedOut: false,
+        outputExceeded: false,
+        stdout: "synthetic build stdout\n",
+        stderr: "\u001b[31mTS2304: Cannot find name 'synthetic'.\u001b[0m\n",
+      }),
+    }),
     resolvePiRuntime: () => ({ file: "/synthetic/pi", version: "1.0.4", source: "npm-global" }),
     ensureDdgs: () => ({ ok: true, python: "/synthetic/python" }),
     loadMain: () => ({ runSessionHost: () => 0 }),
@@ -2216,9 +2300,9 @@ test("a failing synthetic compile reports its bounded cause and never turns fail
   });
   assert.equal(status, 1, "the failing compile keeps its true nonzero status");
   assert.match(stderr, /extension build failed \(exit status 1\)/);
-  assert.match(stderr, /failed build stage: npm run build \(compile\)/);
-  assert.match(stderr, /npm run build \(compile\) stderr:\nTS2304: Cannot find name 'synthetic'\.\n/);
-  assert.match(stderr, /npm run build \(compile\) stdout:\nsynthetic build stdout\n/);
+  assert.match(stderr, /failed build stage: TypeScript compile \(tsc -p tsconfig\.json\)/);
+  assert.match(stderr, /TypeScript compile \(tsc -p tsconfig\.json\) stderr:\nTS2304: Cannot find name 'synthetic'\.\n/);
+  assert.match(stderr, /TypeScript compile \(tsc -p tsconfig\.json\) stdout:\nsynthetic build stdout\n/);
   assert.doesNotMatch(stderr, /\u001b/u, "terminal controls from the failing child never reach the operator");
   assert.equal(readFileSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"), "utf8"), "LIVE DIST SENTINEL — never rebuild in place\n");
 });

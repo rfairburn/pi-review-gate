@@ -10,7 +10,11 @@
  * lifecycle validation remains a parent-owned Windows task.
  *
  * - Source checkouts are copied to a fresh stage, install unchanged
- *   package-lock dependencies with npm ci, then build there. DDGS
+ *   package-lock dependencies with npm ci, then compile there with the
+ *   stage's own installed TypeScript CLI (`tsc -p tsconfig.json`) through
+ *   public Node directly. The package's own build script is never run, so
+ *   its recursive `clean:build` removal can never touch the stage or the
+ *   live checkout. DDGS
  *   provisioning uses the shared Node helper (ensureDdgs in scripts/
  *   pi-review-gate-launcher.cjs) in a bounded owned process. Automatic stage
  *   cleanup is disabled because root identity does not prove ownership of
@@ -106,7 +110,7 @@ const SOURCE_BUILD_CAPTURE_MAX_BYTES = 256 * 1024;
 const BUILD_DIAGNOSTIC_TEXT_MAX_BYTES = 4 * 1024;
 const BUILD_STAGE_LABELS = {
   install: "npm ci (dependency install)",
-  compile: "npm run build (compile)",
+  compile: "TypeScript compile (tsc -p tsconfig.json)",
   stage: "source stage preparation",
 };
 const DDGS_SETUP_TIMEOUT_MS = 600_000;
@@ -345,6 +349,16 @@ function lstatRegularFile(file) {
     throw new Error("file identity is unavailable or unsafe");
   }
   return stats;
+}
+
+/** A regular non-symlink file still matches its captured BigInt identity. */
+function sameFileIdentity(file, identity) {
+  try {
+    const current = lstatRegularFile(file);
+    return current.dev === identity.dev && current.ino === identity.ino;
+  } catch {
+    return false;
+  }
 }
 
 function sourceCopyBudget() {
@@ -719,8 +733,16 @@ function runBoundedProcess(file, args, options = {}) {
   });
 }
 
+/**
+ * Run one admitted Node JS entry through this trusted public Node, never a
+ * shell, a `.bin` shim, cmd.exe, or a PATH executable lookup.
+ */
+function runNodeJs(entry, args, options = {}) {
+  return runBoundedProcess(process.execPath, [entry, ...args], options);
+}
+
 function runNpm(npmCli, args, options = {}) {
-  return runBoundedProcess(process.execPath, [npmCli, ...args], options);
+  return runNodeJs(npmCli, args, options);
 }
 
 /**
@@ -789,9 +811,99 @@ function formatStageErrorDiagnostics(error) {
   return boundDiagnosticText(sanitizeDiagnosticText(`${message}\n`), BUILD_DIAGNOSTIC_TEXT_MAX_BYTES);
 }
 
+/** Lexical containment of `target` inside `base`, both resolved first. */
+function pathIsWithin(base, target) {
+  const relative = path.relative(path.resolve(base), path.resolve(target));
+  return relative.length === 0 || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+/**
+ * Resolve the staged locked install's own TypeScript CLI. The compiler is part
+ * of the staged package's installed dev dependencies (`npm ci --include=dev`),
+ * so the candidate is derived only from the stage's own node_modules: a global
+ * install, the parent checkout's node_modules, an SDK copy, and any PATH
+ * executable lookup are never consulted. Admission is strictly lexical first:
+ * every directory component from the stage root through `typescript/bin` must
+ * be a real non-symlink directory and `bin/tsc` must itself be a regular
+ * non-symlink file with a positive BigInt identity captured before any
+ * canonicalization. An internal symlink whose target stays inside the package
+ * is refused exactly like an escaping one. Canonical containment and the
+ * installed package's declared `tsc` bin are additionally checked. The caller
+ * re-verifies the captured entry identity and both directory chains around
+ * dispatch. A missing, swapped, or linked compiler is refused (and the stage
+ * retained), never substituted. These checks are not atomic openat
+ * containment and claim none.
+ */
+function resolveStageTypeScriptCli(stagingRoot) {
+  const packageDir = path.join(stagingRoot, "node_modules", "typescript");
+  const binDir = path.join(packageDir, "bin");
+  const candidate = path.join(binDir, "tsc");
+  // Lexical admission FIRST, before any canonicalization can hide a link:
+  // every directory component from the stage root through `typescript/bin`
+  // must be a real non-symlink directory, and `bin/tsc` itself must be a
+  // regular non-symlink file. An internal symlink whose target stays inside
+  // the package is refused exactly like an escaping one, and the entry's
+  // BigInt identity is captured here so it can be re-verified around dispatch.
+  let chain;
+  try {
+    chain = assertDirectoryChain(stagingRoot, binDir);
+  } catch {
+    throw new Error("the staged TypeScript compiler is unavailable");
+  }
+  let entry;
+  try {
+    entry = lstatRegularFile(candidate);
+  } catch {
+    throw new Error("the staged TypeScript compiler is not a regular file");
+  }
+  const identity = { dev: entry.dev, ino: entry.ino };
+  // Canonical containment is defense in depth for a symlinked ancestor above
+  // the owned stage root; it is not atomic openat containment and claims none.
+  let canonical;
+  let canonicalStage;
+  let canonicalPackageDir;
+  try {
+    canonical = fs.realpathSync(candidate);
+    canonicalStage = fs.realpathSync(stagingRoot);
+    canonicalPackageDir = fs.realpathSync(packageDir);
+  } catch {
+    throw new Error("the staged TypeScript compiler is unavailable");
+  }
+  if (!pathIsWithin(canonicalPackageDir, canonical) || !pathIsWithin(canonicalStage, canonical)) {
+    throw new Error("the staged TypeScript compiler escapes the source stage");
+  }
+  let manifest;
+  try {
+    manifest = JSON.parse(readBoundedRegularFile(path.join(packageDir, "package.json"), MAX_MANIFEST_BYTES).toString("utf8"));
+  } catch {
+    throw new Error("the staged TypeScript package metadata is unreadable or invalid");
+  }
+  if (manifest === null || typeof manifest !== "object" || manifest.name !== "typescript") {
+    throw new Error("the staged TypeScript package identity does not match the locked dependency");
+  }
+  const bin = typeof manifest.bin === "string" ? manifest.bin : manifest.bin && manifest.bin.tsc;
+  if (typeof bin !== "string" || bin.length === 0) {
+    throw new Error("the staged TypeScript package declares no tsc entry");
+  }
+  const declared = path.resolve(packageDir, bin);
+  let declaredCanonical;
+  try {
+    declaredCanonical = fs.realpathSync(declared);
+  } catch {
+    throw new Error("the staged TypeScript tsc entry does not match the installed package");
+  }
+  if (declared !== candidate || declaredCanonical !== canonical) {
+    throw new Error("the staged TypeScript tsc entry does not match the installed package");
+  }
+  // The compile receives the lexical stage paths the launcher itself uses, so
+  // the captured entry identity stays meaningful for the pre/post fences.
+  return { file: candidate, tsconfig: path.join(stagingRoot, "tsconfig.json"), chain, identity };
+}
+
 async function buildSourceExtension(options) {
   const { packageRoot, agentDir, env } = options;
   const executeNpm = options.runNpm || runNpm;
+  const executeCompile = options.runCompile || runNodeJs;
   const sourceBuildTimeoutMs = Number.isFinite(options.sourceBuildTimeoutMs)
     ? options.sourceBuildTimeoutMs
     : SOURCE_BUILD_TIMEOUT_MS;
@@ -831,30 +943,48 @@ async function buildSourceExtension(options) {
     }
     if (!directoryChainIsSame(ownedStage.chain)) throw new Error("staging directory chain changed");
     if (pathExists(path.join(stagingRoot, "dist"))) throw new Error("staging root unexpectedly contains build output");
-    const build = await executeNpm(npmCli, ["--prefix", stagingRoot, "run", "build"], {
+    // Compile with the staged locked install's own TypeScript CLI through
+    // public Node directly: `-p <stage>/tsconfig.json`, no `npm run build`,
+    // no `clean:build` recursive removal, no node_modules/.bin PATH entry,
+    // and no shell. The public package build scripts stay unchanged and the
+    // live checkout (or any existing output) is never touched. The compiler
+    // entry and its real ancestor chain are identity-checked first; the
+    // checks are not atomic openat containment and claim nothing of the sort.
+    const compiler = resolveStageTypeScriptCli(stagingRoot);
+    // Fence the compiler immediately before dispatch: the stage and compiler
+    // directory chains and the compiler entry's own BigInt identity must all
+    // still match what admission observed.
+    if (!directoryChainIsSame(ownedStage.chain) || !directoryChainIsSame(compiler.chain)
+      || !sameFileIdentity(compiler.file, compiler.identity)) {
+      throw new Error("staging directory chain changed before the TypeScript compile");
+    }
+    const compile = await executeCompile(compiler.file, ["-p", compiler.tsconfig], {
       cwd: stagingRoot,
-      env: { ...buildEnv, PATH: `${path.join(stagingRoot, "node_modules", ".bin")}${path.delimiter}${env.PATH ?? ""}` },
+      env: buildEnv,
       timeoutMs: sourceBuildTimeoutMs,
       captureStdout: true,
       captureStderr: true,
       maxOutputBytes: SOURCE_BUILD_CAPTURE_MAX_BYTES,
     });
-    if (build.error || build.status !== 0 || build.signal || build.timedOut || build.outputExceeded || build.cleanupConfirmed === false) {
-      const removed = build.cleanupConfirmed !== false && removeOwnedStage(ownedStage);
+    if (compile.error || compile.status !== 0 || compile.signal || compile.timedOut || compile.outputExceeded || compile.cleanupConfirmed === false) {
+      const removed = compile.cleanupConfirmed !== false && removeOwnedStage(ownedStage);
       return {
-        status: statusCode(build),
+        status: statusCode(compile),
         stage: "compile",
-        childStatus: build.status,
-        signal: build.signal,
-        cleanupConfirmed: build.cleanupConfirmed,
-        timedOut: build.timedOut,
-        outputExceeded: build.outputExceeded,
-        error: build.error,
-        diagnostics: formatBuildStageDiagnostics(build, "compile"),
+        childStatus: compile.status,
+        signal: compile.signal,
+        cleanupConfirmed: compile.cleanupConfirmed,
+        timedOut: compile.timedOut,
+        outputExceeded: compile.outputExceeded,
+        error: compile.error,
+        diagnostics: formatBuildStageDiagnostics(compile, "compile"),
         retainedStage: !removed,
       };
     }
-    if (!directoryChainIsSame(ownedStage.chain)) throw new Error("staging directory chain changed");
+    if (!directoryChainIsSame(ownedStage.chain) || !directoryChainIsSame(compiler.chain)
+      || !sameFileIdentity(compiler.file, compiler.identity)) {
+      throw new Error("staging directory chain changed during the TypeScript compile");
+    }
     return { status: 0, stagingRoot, ownedStage };
   } catch (error) {
     const cleanupUnconfirmed = Boolean(error && error.cleanupUnconfirmed);

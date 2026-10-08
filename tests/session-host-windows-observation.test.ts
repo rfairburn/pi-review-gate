@@ -207,6 +207,78 @@ test("negotiation summary keeps the 1006 encoding and Kitty pop/reset requests d
   assert.equal(counts.kittyKeyboardPop, 1);
 });
 
+test("negotiation summary recognizes combined DECSET/DECRST lists for known modes", () => {
+  const tail = "\x1b[?1003;1006h\x1b[?1003;1006l";
+  const counts = summarizeModeNegotiation(tail);
+  assert.equal(counts.mouseTrackingSet, 1, "the combined enable list requests tracking mode 1003");
+  assert.equal(counts.mouseSgrEncodingSet, 1, "the combined enable list requests the 1006 SGR encoding");
+  assert.equal(counts.mouseTrackingReset, 1, "the combined disable list resets tracking mode 1003");
+  assert.equal(counts.mouseSgrEncodingReset, 1, "the combined disable list resets the 1006 SGR encoding");
+  assert.equal(counts.alternateBufferEnter, 0);
+  assert.equal(counts.bracketedPasteSet, 0);
+  assert.equal(counts.applicationCursorKeysSet, 0);
+});
+
+test("negotiation summary counts each known mode in a mixed list once and never counts unknown modes", () => {
+  const tail = "\x1b[?7;25;1000;1002;1003;1003;1016h\x1b[?1;66l";
+  const counts = summarizeModeNegotiation(tail);
+  assert.equal(counts.mouseTrackingSet, 3,
+    "each distinct known tracking mode is counted once, including a repeated parameter");
+  assert.equal(counts.mouseSgrPixelsEncodingSet, 1);
+  assert.equal(counts.applicationCursorKeysReset, 1);
+  assert.equal(counts.applicationKeypadReset, 1);
+  assert.equal(counts.mouseSgrEncodingSet, 0, "1006 is absent from the list");
+  assert.equal(counts.alternateBufferEnter, 0);
+  assert.equal(counts.bracketedPasteSet, 0);
+});
+
+test("negotiation summary treats leading-zero DEC parameters numerically", () => {
+  const counts = summarizeModeNegotiation("\x1b[?01;02004h\x1b[?01006l");
+  assert.equal(counts.applicationCursorKeysSet, 1);
+  assert.equal(counts.bracketedPasteSet, 1);
+  assert.equal(counts.mouseSgrEncodingReset, 1);
+});
+
+test("negotiation summary rejects partial, truncated, and malformed DEC lists", () => {
+  const tails = [
+    "\x1b[?1003;1006", // truncated: no final byte
+    "\x1b[?1003;", // trailing separator
+    "\x1b[?;1006h", // empty first parameter
+    "\x1b[?1003;h", // empty second parameter
+    "\x1b[?100 6h", // a space is not a decimal parameter byte
+    "\x1b[?1003u", // wrong final byte
+    "\x1b[?10034h", // 10034 is a different mode, not a substring of 1003
+    "\x1b[?10030h", // 10030 is a different mode, not a substring of 1003
+  ];
+  for (const tail of tails) {
+    const counts = summarizeModeNegotiation(tail);
+    assert.equal(counts.mouseTrackingSet, 0, `no false positive from ${JSON.stringify(tail)}`);
+    assert.equal(counts.mouseSgrEncodingSet, 0, `no false positive from ${JSON.stringify(tail)}`);
+    assert.equal(counts.applicationCursorKeysSet, 0, `no false positive from ${JSON.stringify(tail)}`);
+    assert.equal(counts.alternateBufferEnter, 0, `no false positive from ${JSON.stringify(tail)}`);
+    assert.equal(counts.bracketedPasteSet, 0, `no false positive from ${JSON.stringify(tail)}`);
+    assert.equal(counts.applicationKeypadSet, 0, `no false positive from ${JSON.stringify(tail)}`);
+  }
+});
+
+test("mode-witness diagnostic recognizes combined tracking/SGR lists without leaking the tail", () => {
+  const secret = "COMBINED_LIST_SECRET_prompt_text";
+  const line = formatModeWitnessDiagnostic({
+    outputTail: `\x1b[?1003;1006h${secret}`,
+    representatives: [modes()],
+    deviceAttributesReplies: 0,
+    kittyQueryReplies: 0,
+    alternateBufferEntered: false,
+    alternateBufferLeft: false,
+  });
+  assert.ok(line.includes("trackSet=1") && line.includes("sgr1006Set=1"),
+    "the combined list is counted for both known modes");
+  assert.ok(line.includes("sequencePresence{bracketedPaste=false trackingSgr=true keyboard=false}"),
+    "a combined list yields the same sequence-presence hint as separate sequences");
+  assert.equal(line.includes(secret), false, "no raw tail or user string is emitted");
+  assert.ok(line.length < 1_024, "the diagnostic line stays bounded");
+});
+
 test("mode-witness diagnostic reports bounded tail sequence presence without asserting a cause", () => {
   const secret = "NATIVE_USER_SECRET_prompt_text";
   const lost = formatModeWitnessDiagnostic({

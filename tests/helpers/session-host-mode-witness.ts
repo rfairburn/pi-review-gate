@@ -101,7 +101,12 @@ export class ModeWitnessLedger {
   }
 }
 
-/** Bounded counts of fixed-known outer VT mode sequences in the retained tail. */
+/**
+ * Bounded counts of fixed-known outer VT mode sequences in the retained tail.
+ * The DECSET/DECRST fields recognize complete decimal mode lists, single or
+ * semicolon-combined (for example `ESC [ ? 1003 ; 1006 h`), and count only the
+ * existing known modes present in each list.
+ */
 export interface ModeNegotiationCounts {
   readonly tailBytes: number;
   readonly alternateBufferEnter: number;
@@ -180,28 +185,96 @@ function kittyKeyboardRequested(text: string): boolean {
 }
 
 /**
+ * A complete DECSET/DECRST list: `ESC [ ?` followed by one or more
+ * semicolon-separated decimal parameters and a final `h` (set) or `l`
+ * (reset). Every parameter must be at least one digit, so empty parameters,
+ * trailing separators, and other malformed shapes never match. Leading zeros
+ * are respected numerically, matching the public VT parser's numeric
+ * parameter handling; unknown modes inside a list are simply not counted.
+ */
+const DEC_MODE_LIST = /\x1b\[\?([0-9]+(?:;[0-9]+)*)([hl])/g;
+
+/** Mutable view of a readonly interface's selected fields (internal counters). */
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+
+/** Internal mutable counter set; the public interface stays readonly. */
+type DecModeCounts = Mutable<Pick<
+  ModeNegotiationCounts,
+  | "alternateBufferEnter"
+  | "alternateBufferLeave"
+  | "bracketedPasteSet"
+  | "bracketedPasteReset"
+  | "mouseTrackingSet"
+  | "mouseTrackingReset"
+  | "mouseSgrEncodingSet"
+  | "mouseSgrEncodingReset"
+  | "mouseSgrPixelsEncodingSet"
+  | "mouseSgrPixelsEncodingReset"
+  | "applicationCursorKeysSet"
+  | "applicationCursorKeysReset"
+  | "applicationKeypadSet"
+  | "applicationKeypadReset"
+>>;
+
+/**
+ * Counts each existing known mode requested by the complete DECSET/DECRST
+ * lists in the tail. A list may combine several modes (for example
+ * `ESC [ ? 1003 ; 1006 h`); every known mode present in a list is counted
+ * once for that list, and unknown modes are never counted or surfaced.
+ * Partial, truncated, or malformed lists produce no counts at all.
+ */
+function countDecModeLists(outputTail: string): DecModeCounts {
+  const counts: DecModeCounts = {
+    alternateBufferEnter: 0,
+    alternateBufferLeave: 0,
+    bracketedPasteSet: 0,
+    bracketedPasteReset: 0,
+    mouseTrackingSet: 0,
+    mouseTrackingReset: 0,
+    mouseSgrEncodingSet: 0,
+    mouseSgrEncodingReset: 0,
+    mouseSgrPixelsEncodingSet: 0,
+    mouseSgrPixelsEncodingReset: 0,
+    applicationCursorKeysSet: 0,
+    applicationCursorKeysReset: 0,
+    applicationKeypadSet: 0,
+    applicationKeypadReset: 0,
+  };
+  const regex = new RegExp(DEC_MODE_LIST.source, "g");
+  for (let match = regex.exec(outputTail); match !== null; match = regex.exec(outputTail)) {
+    const set = match[2] === "h";
+    // The pattern guarantees decimal parameters. Leading zeros are valid;
+    // unknown or non-finite numeric values do not match the known mode set.
+    const params = new Set(match[1].split(";").map(Number));
+    if (params.has(1049)) counts[set ? "alternateBufferEnter" : "alternateBufferLeave"] += 1;
+    if (params.has(2004)) counts[set ? "bracketedPasteSet" : "bracketedPasteReset"] += 1;
+    for (const mode of [1000, 1002, 1003]) {
+      if (params.has(mode)) counts[set ? "mouseTrackingSet" : "mouseTrackingReset"] += 1;
+    }
+    if (params.has(1006)) counts[set ? "mouseSgrEncodingSet" : "mouseSgrEncodingReset"] += 1;
+    if (params.has(1016)) counts[set ? "mouseSgrPixelsEncodingSet" : "mouseSgrPixelsEncodingReset"] += 1;
+    if (params.has(1)) counts[set ? "applicationCursorKeysSet" : "applicationCursorKeysReset"] += 1;
+    if (params.has(66)) counts[set ? "applicationKeypadSet" : "applicationKeypadReset"] += 1;
+  }
+  return counts;
+}
+
+/**
  * Counts only fixed-known mode-negotiation sequences in an already-bounded
- * outer PTY tail. It never returns the tail's raw bytes, so a diagnostic built
+ * outer PTY tail. DECSET/DECRST counts recognize complete decimal mode lists,
+ * single or semicolon-combined, and count only the existing known modes in
+ * each list. It never returns the tail's raw bytes, so a diagnostic built
  * from it carries no frame, transcript, prompt, path, environment, or native
  * user string.
  */
 export function summarizeModeNegotiation(outputTail: string): ModeNegotiationCounts {
+  const dec = countDecModeLists(outputTail);
   return {
     tailBytes: Buffer.byteLength(outputTail, "utf8"),
-    alternateBufferEnter: countAny(outputTail, ["\x1b[?1049h"]),
-    alternateBufferLeave: countAny(outputTail, ["\x1b[?1049l"]),
-    bracketedPasteSet: countAny(outputTail, ["\x1b[?2004h"]),
-    bracketedPasteReset: countAny(outputTail, ["\x1b[?2004l"]),
-    mouseTrackingSet: countAny(outputTail, ["\x1b[?1000h", "\x1b[?1002h", "\x1b[?1003h"]),
-    mouseTrackingReset: countAny(outputTail, ["\x1b[?1000l", "\x1b[?1002l", "\x1b[?1003l"]),
-    mouseSgrEncodingSet: countAny(outputTail, ["\x1b[?1006h"]),
-    mouseSgrEncodingReset: countAny(outputTail, ["\x1b[?1006l"]),
-    mouseSgrPixelsEncodingSet: countAny(outputTail, ["\x1b[?1016h"]),
-    mouseSgrPixelsEncodingReset: countAny(outputTail, ["\x1b[?1016l"]),
-    applicationCursorKeysSet: countAny(outputTail, ["\x1b[?1h"]),
-    applicationCursorKeysReset: countAny(outputTail, ["\x1b[?1l"]),
-    applicationKeypadSet: countAny(outputTail, ["\x1b[?66h", "\x1b="]),
-    applicationKeypadReset: countAny(outputTail, ["\x1b[?66l", "\x1b>"]),
+    ...dec,
+    // The legacy keypad modes are not DEC lists; they keep their fixed shapes.
+    applicationKeypadSet: dec.applicationKeypadSet + countAny(outputTail, ["\x1b="]),
+    applicationKeypadReset: dec.applicationKeypadReset + countAny(outputTail, ["\x1b>"]),
     modifyOtherKeysSet: countAny(outputTail, ["\x1b[>4;1m", "\x1b[>4;2m"]),
     modifyOtherKeysReset: countAny(outputTail, ["\x1b[>4;0m"]),
     kittyKeyboardPush: countMatches(outputTail, KITTY_KEYBOARD_PUSH),

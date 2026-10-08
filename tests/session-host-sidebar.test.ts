@@ -1337,7 +1337,9 @@ test("d is native input in MAIN focus and removes an exited row immediately", ()
 });
 
 test("d refuses with a bounded notice when no process is owned and exit is unconfirmed", () => {
-  for (const lifecycle of ["starting", "alive", "error"] as const) {
+  // Settled error rows (no live process) request the same deliberate removal
+  // as exited rows; see session-host-error-row-ui.test.ts.
+  for (const lifecycle of ["starting", "alive"] as const) {
     const harness = makeRoster([lifecycle]);
     harness.controller.updateItems([
       makeItem({ id: lifecycle, lifecycle, hasLiveProcess: false }),
@@ -1995,7 +1997,9 @@ test("card title line carries only the sanitized canonical title", () => {
   // Header, then the selected native card: the title row is the title alone —
   // no marker, prefix, or status badge — styled only by generated SGR.
   assert.equal(texts[1]?.trimEnd(), "Canonical title");
-  assert.ok(lines[1]?.startsWith("\x1b[0m\x1b[1;7mCanonical title"), JSON.stringify(lines[1]));
+  // Sidebar focus: the selected navigation target's title is blue (the focus-
+  // domain highlight), not the old inverse mark.
+  assert.ok(lines[1]?.startsWith("\x1b[0m\x1b[1;34mCanonical title"), JSON.stringify(lines[1]));
   assert.equal(texts[2]?.trimEnd(), "> agent running | input pending", "the selection marker lives on the status row");
   assert.ok(!texts.join("\n").includes("stale label"));
   // Unselected title: sanitized label only, bold without inverse, no marker.
@@ -2447,25 +2451,26 @@ test("footer hints wrap across reserved rows and never ellipsize", () => {
 
 test("roster requires a visible entry row; otherwise it falls back to too-small", () => {
   const { controller } = makeController();
-  // The complete footer plus an entry now needs 20x7; 20x6 leaves no
-  // room for an entry, so Enter would activate an invisible target.
-  const tooSmall = controller.render(20, 6);
+  // The complete footer (including the alt+right main hint) plus an entry
+  // now needs 20x8; 20x7 leaves no room for an entry, so Enter would
+  // activate an invisible target.
+  const tooSmall = controller.render(20, 7);
   assert.ok(tooSmall.lines.some((line) => line.includes("too small")));
   assert.equal(tooSmall.cursor, undefined);
 
   // One more row keeps exactly one visible entry plus the complete hints.
-  const fits = assertPaneSafe(controller.render(20, 7).lines, 20, 7);
+  const fits = assertPaneSafe(controller.render(20, 8).lines, 20, 8);
   assert.ok(fits.some((line) => line.includes("> New session")), JSON.stringify(fits));
   const footer = fits.join(" ");
   for (const hint of ["toggle", "enter open", "e edit name", "d stop/remove", "esc hide", "q quit"]) {
     assert.ok(footer.includes(hint), `missing ${JSON.stringify(hint)}: ${JSON.stringify(fits)}`);
   }
 
-  // An error row consumes the last entry slot at 32x5.
+  // An error row consumes the last entry slot at 32x6.
   controller.showError("boom");
-  const tooSmallWithError = controller.render(32, 5);
+  const tooSmallWithError = controller.render(32, 6);
   assert.ok(tooSmallWithError.lines.some((line) => line.includes("too small")));
-  const fitsWithError = assertPaneSafe(controller.render(32, 6).lines, 32, 6);
+  const fitsWithError = assertPaneSafe(controller.render(32, 7).lines, 32, 7);
   assert.ok(fitsWithError.some((line) => line.includes("> New session")), JSON.stringify(fitsWithError));
   assert.ok(fitsWithError.some((line) => line.includes("boom")));
   const footerWith = fitsWithError.join(" ");
@@ -2708,6 +2713,7 @@ test("saved picker: bracketed paste and Kitty repeats/releases never activate or
   assert.equal(harness.controller.focus, "form");
 
   // The initial presses still work.
+  savedView(harness);
   harness.send(ENTER);
   assert.ok(harness.sinceActions().at(-1)?.type === "saved-open");
 });
@@ -2739,6 +2745,7 @@ test("held Enter after a completed saved-open never activates the highlighted ro
   harness.controller.completeSavedList(r1, [...SAVED_ROWS], 0);
 
   // The deliberate Enter opens the highlighted row.
+  savedView(harness);
   harness.send(ENTER);
   const open = harness.sinceActions().at(-1);
   assert.ok(open?.type === "saved-open");

@@ -2211,10 +2211,16 @@ export class MainPtyDriver {
         "a clipped current caption is never copied into the replacement field");
       const beforeCancel = this.frameRevision;
       this.pty.write(KEYS.escape);
-      this.focus = "main";
-      this.sidebarVisible = false;
-      await this.waitFrame((text) => !text.includes("Edit native session name") && !text.includes("New session"),
-        "Escape cancels the untouched Edit form without changing the persisted name", beforeCancel);
+      // Escape cancels ONLY the Edit form: it returns to the VISIBLE roster
+      // (sidebar focus), keeps the complete target card and the unchanged
+      // native owner, and never hides the sidebar or changes the name.
+      this.focus = "sidebar";
+      this.sidebarVisible = true;
+      await this.waitFrame((text) => !text.includes("Edit native session name")
+        && !text.includes("> New name:")
+        && this.selectedCaptionMatches(text, displayName)
+        && frameHeader(text) === activeHeader.trimEnd(),
+        "Escape cancels only the Edit form: the visible roster keeps the complete target card and the unchanged native owner", beforeCancel);
     }
   }
 

@@ -66,7 +66,7 @@ type MainTerminal = Pick<ProcessTerminal,
 >;
 type MainManager = Pick<InstanceManager,
   "list" | "surface" | "write" | "resize" | "hasLiveProcesses" | "create" | "rename" | "closeExited" | "shutdown" | "dispose" | "ownedLiveSessions"
-> & Partial<Pick<InstanceManager, "stop">>;
+> & Partial<Pick<InstanceManager, "stop" | "closeError">>;
 type MainObserver = Pick<KeyboardCapabilityObserver, "flags" | "wait" | "dispose" | "feed">;
 type MainWriter = Pick<SessionHostFrameWriter, "start" | "submit" | "close">;
 type MainStdin = EventEmitter & { isTTY?: boolean; readableEnded?: boolean };
@@ -617,6 +617,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       if (activeId !== undefined && !views.some((view) => view.id === activeId)) {
         activeId = undefined;
       }
+      // View-only observer: the sidebar's white title highlight follows the
+      // actual active Main owner; clearing it here (owner row gone) prevents a
+      // false sibling highlight. It never changes activation or ownership.
+      sidebar.setActiveMainOwner(activeId);
       sidebar.updateItems(views.map(toSidebarItem));
       syncOuterMouseModes();
       scheduleRedraw();
@@ -1184,6 +1188,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       else { sidebar.showError(REMOVE_FAILURE_MESSAGE); scheduleRedraw(); }
       return;
     }
+    if (!removed && !replacing) {
+      // A settled error row without an owned PTY exit is closed only through
+      // the manager's own closeError authority. Resume replacements never get
+      // this fallback: they remain closeExited-only.
+      const outcome = tryCloseError(manager, id);
+      if (outcome === "closed") removed = true;
+      else if (outcome === "failure") return; // generic failure already shown
+    }
     if (!removed) {
       // An already-removed placeholder is tolerated; nothing else is touched.
       if (replacing) sidebar.clearRowReplacement(id);
@@ -1192,9 +1204,29 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }
     removedExitedIds.add(id);
     if (activeId === id) activeId = undefined;
-    // Actual-exit-only detachment never activates a sibling or loses its owner.
+    // Authoritatively settled removal never activates a sibling or loses its owner.
     syncRosterAndSchedule();
     reconcileLayout(true);
+  }
+
+  /**
+   * Deliberate-removal fallback for an error row whose closeExited refused:
+   * call the optional manager closeError only when the exact current manager
+   * row is still in "error" lifecycle. A missing method or a refusal leaves
+   * the decision to the caller; a thrown closeError reports the generic
+   * failure and keeps the row. No signal, sibling, or other fallback.
+   */
+  function tryCloseError(owner: MainManager, id: string): "closed" | "not-applicable" | "failure" {
+    const closeError = owner.closeError;
+    if (typeof closeError !== "function") return "not-applicable";
+    if (readReadinessView(id)?.lifecycle !== "error") return "not-applicable";
+    try {
+      return closeError.call(owner, id) === true ? "closed" : "not-applicable";
+    } catch {
+      sidebar?.showError(REMOVE_FAILURE_MESSAGE);
+      scheduleRedraw();
+      return "failure";
+    }
   }
 
   function launchRowStop(id: string, confirmed: boolean): void {
@@ -1329,7 +1361,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             if (shutdownRequested || !sidebar) return;
             const accepted = sidebar.completeSavedList(
               action.requestId,
-              catalog.rows.map((row) => ({ id: row.id, file: row.file, caption: row.caption })),
+              // Display metadata only: the exact recorded workspace (header
+              // cwd) flows to the picker's single-line summary and details.
+              // Admission always revalidates the raw catalog row, never this.
+              catalog.rows.map((row) => ({ id: row.id, file: row.file, caption: row.caption, cwd: row.cwd })),
               catalog.issueCount,
             );
             if (accepted) savedCatalog = catalog;

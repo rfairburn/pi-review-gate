@@ -42,10 +42,12 @@
  *   drew at its current height and order; hiding or overlaying the roster
  *   forgets it.
  * - `d` (and Delete, or x when Delete is the reserved toggle) stops/removes
- *   the highlighted session row: an exited row removes immediately; a live
- *   owned process stops only after explicit confirmation unless complete
- *   idleness is positively observed (unknown is never idle); a row with no
- *   owned process and no confirmed exit is refused with a bounded notice.
+ *   the highlighted session row: an exited row removes immediately; a settled
+ *   error row without a live process requests the same deliberate removal
+ *   (the manager stays authoritative and may still refuse); a live owned
+ *   process stops only after explicit confirmation unless complete idleness
+ *   is positively observed (unknown is never idle); a row with no owned
+ *   process and no confirmed exit is refused with a bounded notice.
  *   The stop confirmation freezes the target id and never retargets a later
  *   highlighted row; the quit host confirmation stays separate.
  * - Roster/form/error text is sanitized (C0/C1/DEL and ANSI/OSC/APC
@@ -122,6 +124,12 @@ export interface SidebarSavedRow {
   readonly id: string;
   readonly file: string;
   readonly caption: string;
+  /**
+   * The exact recorded workspace (cwd) for this saved conversation, when the
+   * catalog supplied one. Display-only metadata: it never affects admission,
+   * ordering, or the opaque id/file. Absent/empty means "unavailable".
+   */
+  readonly cwd?: string;
 }
 
 /** Actions the sidebar asks the backend to perform. */
@@ -210,7 +218,16 @@ export const SIDEBAR_GENERATED_SGR_ALLOWLIST: ReadonlySet<string> = new Set([
   "7",
   "27",
   "1;7",
+  // Focus-domain title highlights: blue for the sidebar-selected navigation
+  // target, white for the actual active Main conversation (native focus).
+  "1;34",
+  "1;97",
 ]);
+
+/** Sidebar-selected navigation-target title highlight (blue). */
+const SGR_SELECTION_BLUE = "\x1b[1;34m";
+/** Actual active Main conversation title highlight (white). */
+const SGR_ACTIVE_MAIN_WHITE = "\x1b[1;97m";
 
 interface SidebarEntry {
   /** Internal key; real item ids are namespaced with "item:" to stay unique. */
@@ -261,6 +278,10 @@ const CARD_EXPANDED_ROWS = 5;
 const ACTIVITY_LINES_MAX = CARD_EXPANDED_ROWS - CARD_COLLAPSED_ROWS;
 const ACTIVITY_INPUT_MAX_CODEPOINTS = 400;
 const SAVED_CAPTION_MAX_CODEPOINTS = 256;
+/** Bounded recorded-workspace (cwd) display limit; the raw catalog keeps the full value for admission. */
+const SAVED_WORKSPACE_MAX_CODEPOINTS = 4096;
+/** Fixed reserved details-area height between the saved list and the footer. */
+const SAVED_DETAILS_ROWS = 3;
 const ITEM_LABEL_INPUT_MAX_CODEPOINTS = 400;
 const ERROR_TEXT_MAX_CODEPOINTS = 300;
 const ROSTER_MIN_COLS = 12;
@@ -852,6 +873,13 @@ export class SidebarController {
   private savedError: string | undefined;
   private savedSelectedIndex = 0;
   private savedListTop = 0;
+  /**
+   * The exact saved rows (id|file) fully drawn by the last valid picker render.
+   * A saved-open is refused unless the highlighted tuple is in this set, so a
+   * too-small fallback or an undrawn/hidden row can never be opened. Invalidated
+   * on fallback, dismissal, and catalog replacement.
+   */
+  private displayedSavedRows: ReadonlySet<string> | undefined;
   private editTarget?: { readonly id: string; readonly nativeSession: SessionHostNativeSession; readonly currentName: string };
   private workspaceDraft: string;
   private editDraft = "";
@@ -861,6 +889,27 @@ export class SidebarController {
   private desiredSelectionId: string | undefined;
   private _visible: boolean;
   private _focus: SidebarFocus = "main";
+  /**
+   * View-only observer of the host's actual active Main owner (the explicitly
+   * activated live child). Set by Main, never inferred from the selection; it
+   * only drives the white title highlight and is cleared when the row leaves
+   * the roster. It never changes activation or input ownership.
+   */
+  private activeMainOwnerID_: string | undefined;
+  /**
+   * Provenance fence for a host-claimed Alt+Right press: once the roster
+   * claims an initial Alt+Right to return focus to Main, the held key's
+   * repeat/release events are consumed instead of leaking into the child.
+   * A fresh (initial) Alt+Right in Main focus is ordinary native input.
+   */
+  private altRightClaimed = false;
+  /**
+   * Provenance fence for the Edit-form cancel Escape: once a deliberate
+   * Escape cancels only the Edit form and returns to the visible roster, the
+   * held key's repeat/release must not bubble into the roster's Escape-hide.
+   * A fresh roster Escape still hides (existing semantics).
+   */
+  private editEscapeClaimed = false;
   private pendingCreate: { readonly requestId: number } | undefined;
   private pendingRename: { readonly requestId: number } | undefined;
   /** Explicit confirmation purpose: quit the host or stop one owned session. */
@@ -936,6 +985,21 @@ export class SidebarController {
     return entry !== undefined && entry.kind === "item" && entry.item !== undefined
       ? entry.item.id
       : undefined;
+  }
+
+  /** View-only: the host's actual active Main owner id (undefined when none). */
+  get activeMainOwnerID(): string | undefined {
+    return this.activeMainOwnerID_;
+  }
+
+  /**
+   * Main-owned, view-only observer of the actual active Main conversation.
+   * It only drives the white title highlight; it never activates a row,
+   * moves input focus, or changes ownership. Main clears it (undefined) when
+   * the owner row leaves the roster so a sibling is never falsely highlighted.
+   */
+  setActiveMainOwner(id: string | undefined): void {
+    this.activeMainOwnerID_ = typeof id === "string" && id.length > 0 ? id : undefined;
   }
 
   /** Read-only view of the last updateItems roster (defensive copies). */
@@ -1255,6 +1319,7 @@ export class SidebarController {
   renderForm(cols: number, rows: number): { lines: string[]; cursor?: { column: number; row: number } } {
     assertPaneDimension(cols, PANE_MAX_COLS, "cols");
     assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
+    if (this.formKind === "saved") this.displayedSavedRows = undefined;
     if (cols < FORM_MIN_COLS || rows < FORM_MIN_ROWS) {
       return this.renderTooSmall(cols, rows);
     }
@@ -1289,17 +1354,6 @@ export class SidebarController {
     return this.renderRosterPane(cols, rows);
   }
 
-  // --- Main focus: everything is forwarded unchanged except the toggle. ---
-
-  private handleMainInput(data: string): void {
-    if (this.handleReservedToggle(data)) {
-      return;
-    }
-    // Nonreserved releases and repeats are forwarded verbatim for the child
-    // adapter to interpret under its own Kitty-protocol state.
-    this.emitForward(data);
-  }
-
   /** Consumes every matcher-recognized toggle event; only initial presses act. */
   private handleReservedToggle(data: string, beforePress?: () => void): boolean {
     const fallbackEventType = functionKeyEventType(data, this.toggleKey);
@@ -1319,10 +1373,85 @@ export class SidebarController {
     this.emit({ type: "forward", data });
   }
 
+  /**
+   * Fences the held Escape key that canceled only the Edit form across every
+   * focus domain until its release or a fresh Escape press. Unrelated input
+   * does NOT clear the claim, so a later repeat/release of the still-held key
+   * is consumed (never a roster hide or child input) wherever focus lands.
+   * Returns true when the event was consumed by the fence.
+   */
+  private consumeEditEscapeClaim(data: string): boolean {
+    if (!this.editEscapeClaimed) return false;
+    if (matchesKey(data, "escape")) {
+      if (isKeyRelease(data)) { this.editEscapeClaimed = false; return true; }
+      if (isKeyRepeat(data)) return true; // consume the held-key repeat
+      // A fresh Escape press ends the fence; let it proceed to the normal handler.
+      this.editEscapeClaimed = false;
+      return false;
+    }
+    // Unrelated input does not clear the claim; only the Escape release or a
+    // fresh Escape press ends the fence.
+    return false;
+  }
+
+  // --- Main focus: everything is forwarded unchanged except the toggle. ---
+
+  private handleMainInput(data: string): void {
+    if (this.handleReservedToggle(data)) {
+      return;
+    }
+    // A held Escape that canceled only the Edit form must not leak into the
+    // child as input, even after a focus change; its repeat/release is
+    // consumed here until the key is released or freshly pressed again.
+    if (this.consumeEditEscapeClaim(data)) {
+      return;
+    }
+    // A held Alt+Right whose initial press a host-owned surface claimed must
+    // not leak into the child as input; a fresh (initial) Alt+Right in Main
+    // focus is ordinary native input and stays forwarded.
+    if (matchesKey(data, "alt+right")) {
+      if (this.altRightClaimed && (isKeyRepeat(data) || isKeyRelease(data))) {
+        if (isKeyRelease(data)) this.altRightClaimed = false;
+        return; // consume the held-key repeat/release
+      }
+      this.altRightClaimed = false; // fresh press: clear any stale claim
+    }
+    // Nonreserved releases and repeats are forwarded verbatim for the child
+    // adapter to interpret under its own Kitty-protocol state.
+    this.emitForward(data);
+  }
+
   // --- Sidebar focus: roster navigation, New session, Quit host. ---
 
   private handleSidebarInput(data: string): void {
-    if (this.handleReservedToggle(data) || isKeyRelease(data)) {
+    // Bracketed paste is opaque in roster focus: a streamed body that merely
+    // equals a host chord (e.g. Alt+Right) must not change focus or leak the
+    // remaining pasted content into Main.
+    if (this.routeBracketedPaste(data)) return;
+    // Fence the held Escape that canceled only the Edit form across focus
+    // domains until its release or a fresh Escape press.
+    if (this.consumeEditEscapeClaim(data)) return;
+    // The reserved toggle takes precedence over Alt+Right (the user may
+    // configure the toggle as alt+right), so it is handled first.
+    if (this.handleReservedToggle(data)) {
+      return;
+    }
+    if (isKeyRelease(data)) {
+      // A held Alt+Right whose press was claimed: its release clears the claim
+      // so a later fresh Alt+Right in Main focus is ordinary native input.
+      if (matchesKey(data, "alt+right")) this.altRightClaimed = false;
+      return;
+    }
+    // Alt+Right (roster-only) returns input focus to the existing Main owner
+    // without activating the highlighted row, resizing, or hiding. Only an
+    // initial deliberate press acts, and only when the selected card was fully
+    // drawn by the last roster render (the complete-card action fence).
+    if (matchesKey(data, "alt+right")) {
+      if (isKeyRepeat(data)) return;
+      this.altRightClaimed = true; // claim for the cross-surface repeat/release fence
+      if (!this.selectionFitsLastRoster()) return; // refuse: selection not fully drawn
+      this._focus = "main";
+      this.onInvalidate?.();
       return;
     }
     if (matchesKey(data, "up")) {
@@ -1503,10 +1632,12 @@ export class SidebarController {
 
   /**
    * d / Delete (x when Delete is the reserved toggle): an exited row removes
-   * immediately; a live owned process requests a stop — directly only when
-   * complete idleness is positively observed, otherwise after explicit
-   * confirmation. A row with no owned process and no confirmed exit is
-   * refused with a bounded notice; nothing is faked or cancelled.
+   * immediately; a settled error row without a live process requests the same
+   * deliberate removal (the manager stays authoritative and may still refuse);
+   * a live owned process requests a stop — directly only when complete
+   * idleness is positively observed, otherwise after explicit confirmation.
+   * A row with no owned process and no confirmed exit is refused with a
+   * bounded notice; nothing is faked or cancelled.
    */
   private stopRemoveSelectedEntry(): void {
     this.cancelRowResume();
@@ -1518,6 +1649,14 @@ export class SidebarController {
     const item = entry.item;
     if (item.lifecycle === "exited") {
       // Confirmed exit: plain removal; the backend stays authoritative.
+      this.noticeError = undefined;
+      this.emit({ type: "remove", id: item.id });
+      return;
+    }
+    if (item.lifecycle === "error" && item.hasLiveProcess === false) {
+      // Settled error row with no live process: the same deliberate removal
+      // flow as an exited row. The error badge is not exit or force authority;
+      // the manager decides whether it may actually be closed.
       this.noticeError = undefined;
       this.emit({ type: "remove", id: item.id });
       return;
@@ -1608,12 +1747,32 @@ export class SidebarController {
       this.formField?.handleInput(data);
       return;
     }
+    // Fence the held Escape that canceled only the Edit form across focus
+    // domains until its release or a fresh Escape press.
+    if (this.consumeEditEscapeClaim(data)) return;
     if (this.handleReservedToggle(data, () => this.abandonForm())) return;
-    if (isKeyRelease(data)) return;
-    if (this.pendingCreate || this.pendingRename) {
-      if (this.formMatchesCancel(data)) this.escapeFromForm();
+    // Host-owned form UI: Alt+Right never dismisses, submits, forwards to the
+    // child, or steals ownership; it is consumed in every event form. An
+    // initial press is claimed so its repeat/release stays fenced if a focus
+    // change (e.g. the reserved toggle) happens while the key is still held;
+    // the release clears the claim.
+    if (matchesKey(data, "alt+right")) {
+      if (isKeyRelease(data)) { this.altRightClaimed = false; return; }
+      if (!isKeyRepeat(data)) this.altRightClaimed = true;
       return;
     }
+    if (isKeyRelease(data)) return;
+    if (this.pendingCreate || this.pendingRename) {
+      // A held Escape's repeat never cancels a pending Edit rename; only a
+      // fresh press does. New-form cancellation keeps its existing behavior.
+      if (this.formMatchesCancel(data)
+        && (this.formKind !== "edit" || !isKeyRepeat(data))) this.escapeFromForm();
+      return;
+    }
+    // A held Escape's repeat is refused so it cannot cancel the Edit form after
+    // dismissing a completion list; a second fresh press is required. New-form
+    // cancellation keeps its existing behavior.
+    if (this.formKind === "edit" && matchesKey(data, "escape") && isKeyRepeat(data)) return;
     if (this.formField) this.formField.handleInput(data);
     else if (matchesKey(data, "escape")) this.escapeFromForm();
   }
@@ -1685,6 +1844,7 @@ export class SidebarController {
     this.pendingSavedOpen = undefined; // UI ownership only; the backend op continues
     this.abandonForm();
     this.savedError = undefined;
+    this.displayedSavedRows = undefined; // dismissal invalidates the display record
     this._focus = "sidebar";
   }
 
@@ -1692,7 +1852,19 @@ export class SidebarController {
     // Bracketed paste is opaque in the picker and never activates a row; a
     // streamed body chunk that merely equals the toggle must not dismiss.
     if (this.routeBracketedPaste(data)) return;
+    // Fence the held Escape that canceled only the Edit form across focus
+    // domains until its release or a fresh Escape press.
+    if (this.consumeEditEscapeClaim(data)) return;
     if (this.handleReservedToggle(data, () => this.dismissSavedPane())) return;
+    // Host-owned picker UI: Alt+Right is consumed, never a row action. An
+    // initial press is claimed so its repeat/release stays fenced across any
+    // subsequent focus change while the key is still held; the release clears
+    // the claim.
+    if (matchesKey(data, "alt+right")) {
+      if (isKeyRelease(data)) { this.altRightClaimed = false; return; }
+      if (!isKeyRepeat(data)) this.altRightClaimed = true;
+      return;
+    }
     if (isKeyRelease(data)) return;
     if (matchesKey(data, "up")) {
       this.moveSavedSelection(-1);
@@ -1729,6 +1901,10 @@ export class SidebarController {
     if (this.pendingSavedList !== undefined) return;
     const row = this.savedRows[this.savedSelectedIndex];
     if (row === undefined) return;
+    // Refuse to open a row the last valid picker render could not show whole:
+    // a too-small fallback or an undrawn/hidden selection never opens.
+    if (this.displayedSavedRows === undefined
+      || !this.displayedSavedRows.has(`${row.id}|${row.file}`)) return;
     if (this.pendingSavedOpen !== undefined) {
       this.savedError = "A saved conversation is already starting";
       return;
@@ -1756,9 +1932,13 @@ export class SidebarController {
         id: row.id,
         file: row.file,
         caption: sanitizeBounded(row.caption, SAVED_CAPTION_MAX_CODEPOINTS),
+        ...(typeof row.cwd === "string" && row.cwd.length > 0
+          ? { cwd: sanitizeBounded(row.cwd, SAVED_WORKSPACE_MAX_CODEPOINTS) }
+          : {}),
       });
     }
     this.savedRows = accepted;
+    this.displayedSavedRows = undefined; // catalog replacement invalidates the display record
     this.savedIssueCount = Number.isSafeInteger(issueCount) && issueCount > 0 ? issueCount : 0;
     this.savedError = undefined;
     if (this.savedSelectedIndex >= this.savedRows.length) this.savedSelectedIndex = 0;
@@ -1918,7 +2098,19 @@ export class SidebarController {
   }
 
   private escapeFromForm(): void {
+    const wasEdit = this.formKind === "edit";
     this.abandonForm();
+    if (wasEdit) {
+      // Edit-only cancel: return to the VISIBLE roster without hiding. The
+      // active Main owner, native process, input draft, persisted name,
+      // selection, and geometry are all preserved. Claim the Escape so a held
+      // key's repeat/release does not bubble into the roster's Escape-hide;
+      // a fresh roster Escape still hides (existing semantics).
+      this.editEscapeClaimed = true;
+      this._focus = "sidebar";
+      this.onInvalidate?.();
+      return;
+    }
     this.hide();
   }
 
@@ -1935,7 +2127,24 @@ export class SidebarController {
   // --- Confirm focus: explicit quit or stop confirmation. ---
 
   private handleConfirmInput(data: string): void {
-    if (this.handleReservedToggle(data) || isKeyRelease(data)) {
+    // Fence the held Escape that canceled only the Edit form across focus
+    // domains until its release or a fresh Escape press.
+    if (this.consumeEditEscapeClaim(data)) return;
+    // The reserved toggle takes precedence over Alt+Right (the user may
+    // configure the toggle as alt+right), so it is handled first.
+    if (this.handleReservedToggle(data)) {
+      return;
+    }
+    if (isKeyRelease(data)) {
+      // A held Alt+Right whose press was claimed: its release clears the claim.
+      if (matchesKey(data, "alt+right")) this.altRightClaimed = false;
+      return;
+    }
+    // Host-owned confirmation UI: Alt+Right is consumed, never confirm/cancel.
+    // An initial press is claimed so its repeat/release stays fenced across any
+    // subsequent focus change while the key is still held.
+    if (matchesKey(data, "alt+right")) {
+      if (!isKeyRepeat(data)) this.altRightClaimed = true;
       return;
     }
     if (this.confirmPurpose === "stop-remove") {
@@ -2088,6 +2297,10 @@ export class SidebarController {
         "esc hide",
         "q quit",
         ...(this._focus === "sidebar" && this.rowStore.length > 0 ? ["space expand"] : []),
+        // Alt+Right returns input focus to the existing Main owner (roster-only);
+        // it never activates the highlighted row. Shown only while the roster
+        // owns focus, where the key actually acts.
+        ...(this._focus === "sidebar" ? ["alt+right main"] : []),
       ],
       cols,
     );
@@ -2183,8 +2396,20 @@ export class SidebarController {
     const marker = selected ? "> " : "  ";
     if (entry.kind === "item" && entry.item !== undefined) {
       const item = entry.item;
+      // One focus-domain title highlight: white identifies the ACTUAL active
+      // Main conversation only while Main has focus; blue identifies the LEFT
+      // selected navigation target while the sidebar-owned surfaces have
+      // focus. Never both at once, and never a false sibling/owner mark.
+      let titleSgr: string;
+      if (this._focus === "main" && this.activeMainOwnerID_ === item.id) {
+        titleSgr = SGR_ACTIVE_MAIN_WHITE;
+      } else if (selected && this._focus !== "main") {
+        titleSgr = SGR_SELECTION_BLUE;
+      } else {
+        titleSgr = "\x1b[1m";
+      }
       const lines = [
-        wrapRow(cardTitle(item), cols, selected ? "\x1b[1;7m" : "\x1b[1m"),
+        wrapRow(cardTitle(item), cols, titleSgr),
         wrapRow(`${marker}${cardStatusText(item)}`, cols),
         wrapRow(`  ${cardBackgroundText(item)}`, cols),
       ];
@@ -2202,7 +2427,9 @@ export class SidebarController {
       : entry.kind === "new"
         ? `${marker}New session`
         : `${marker}Quit host`;
-    return [wrapRow(text, cols, selected ? "\x1b[1;7m" : undefined)];
+    // Host-owned action rows take the blue selection target while a
+    // sidebar-owned surface has focus; they are never the native active owner.
+    return [wrapRow(text, cols, selected && this._focus !== "main" ? SGR_SELECTION_BLUE : undefined)];
   }
 
   private renderFormPane(
@@ -2273,6 +2500,9 @@ export class SidebarController {
    * full-content overlay on narrow ones) as New/Edit.
    */
   private renderSavedPane(cols: number, rows: number): { lines: string[] } {
+    // A fresh render starts with no displayed rows; a too-small fallback never
+    // establishes a displayable selection, so the saved-open guard stays closed.
+    this.displayedSavedRows = undefined;
     const header = " Saved conversations ";
     const footerLines = wrapHintLines(
       [`${this.toggleLabel} toggle`, "up/down select", "enter open", "esc back"],
@@ -2288,7 +2518,9 @@ export class SidebarController {
       || visibleWidth(header) > cols) {
       return this.renderTooSmall(cols, rows);
     }
-    const fixedRows = 1 + noticeLines.length + issueLines.length + footerLines.length;
+    // The fixed details area is reserved between the list and the footer so
+    // notices can never displace it or make an impossible action look done.
+    const fixedRows = 1 + SAVED_DETAILS_ROWS + noticeLines.length + issueLines.length + footerLines.length;
     const listRows = rows - fixedRows;
     if (listRows < 1) {
       return this.renderTooSmall(cols, rows);
@@ -2312,18 +2544,58 @@ export class SidebarController {
     } else {
       const top = this.savedScrollWindow(listRows);
       let index = top;
+      const displayed = new Set<string>();
       while (index < this.savedRows.length && y < listRows) {
         const row = this.savedRows[index];
         lines.push(this.renderSavedRow(row, index === this.savedSelectedIndex, cols));
+        displayed.add(`${row.id}|${row.file}`);
         y += 1;
         index += 1;
       }
+      // Record exactly which rows were fully drawn so a saved-open can only
+      // target a row the user actually saw; undrawn/hidden rows stay refused.
+      this.displayedSavedRows = displayed;
+    }
+    // Pad the list window so the details area sits at a fixed position (just
+    // above the footer), not floating up when there are few rows.
+    lines.push(...blankLines(Math.max(0, listRows - y)));
+    // Fixed details area for the highlighted row, updated in the same frame as
+    // the list highlight. Empty (never a fabricated workspace) while loading,
+    // empty, or failed; late listings are fenced by the pending request.
+    const selectedRow = this.pendingSavedList === undefined && this.savedRows.length > 0
+      ? this.savedRows[this.savedSelectedIndex]
+      : undefined;
+    for (const detailLine of this.renderSavedDetails(selectedRow, cols)) {
+      lines.push(wrapRow(detailLine, cols));
     }
     for (const noticeLine of noticeLines) lines.push(wrapRow(noticeLine, cols));
     for (const issueLine of issueLines) lines.push(wrapRow(issueLine, cols));
     lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
     for (const footerLine of footerLines) lines.push(wrapRow(footerLine, cols));
     return { lines };
+  }
+
+  /**
+   * The fixed details area for one highlighted saved row: the conversation
+   * caption and its EXACT recorded workspace, wrapped within the reserved
+   * rows. A missing recorded workspace renders as unavailable, never a
+   * current-workspace guess. Display only; it never feeds admission.
+   */
+  private renderSavedDetails(row: SidebarSavedRow | undefined, cols: number): string[] {
+    if (row === undefined) {
+      return blankLines(SAVED_DETAILS_ROWS);
+    }
+    const caption = sanitizeBounded(row.caption, SAVED_CAPTION_MAX_CODEPOINTS);
+    const workspace = row.cwd !== undefined
+      ? sanitizeBounded(row.cwd, SAVED_WORKSPACE_MAX_CODEPOINTS)
+      : "workspace unavailable";
+    // Reserve independent capacity for each field so a long multiword caption
+    // cannot consume every row and hide the workspace (and vice versa). The
+    // caption gets one row; the workspace gets the remaining rows with
+    // column-safe wrapping that splits long path tokens across rows.
+    const captionLines = wrapBoundedField(caption, cols, 1);
+    const workspaceLines = wrapBoundedField(workspace, cols, SAVED_DETAILS_ROWS - 1);
+    return [...captionLines, ...workspaceLines];
   }
 
   /** Keeps the keyboard-highlighted saved row visible inside the list window. */
@@ -2341,10 +2613,28 @@ export class SidebarController {
 
   private renderSavedRow(row: SidebarSavedRow, selected: boolean, cols: number): string {
     const marker = selected ? "> " : "  ";
-    const labelWidth = Math.max(0, cols - visibleWidth(marker));
-    const label = sanitizeBounded(row.caption, SAVED_CAPTION_MAX_CODEPOINTS);
-    const visibleLabel = labelWidth > 0 ? truncateToWidth(label, labelWidth, "...") : "";
-    return wrapRow(`${marker}${visibleLabel}`, cols, selected ? "\x1b[1;7m" : undefined);
+    const markerWidth = visibleWidth(marker);
+    const caption = sanitizeBounded(row.caption, SAVED_CAPTION_MAX_CODEPOINTS);
+    let text: string;
+    if (row.cwd !== undefined) {
+      // One single line per entry: caption and recorded workspace summaries,
+      // each fairly bounded and visibly ellipsized. The caption stays the
+      // row's leading identity so picker witnesses keep matching.
+      const separator = " | ";
+      const available = Math.max(0, cols - markerWidth - visibleWidth(separator));
+      const captionWidth = Math.floor(available / 2);
+      const cwdWidth = Math.max(0, available - captionWidth);
+      const cwd = sanitizeBounded(row.cwd, SAVED_WORKSPACE_MAX_CODEPOINTS);
+      const visibleCaption = captionWidth > 0 ? truncateToWidth(caption, captionWidth, "...", true) : "";
+      const visibleCwd = cwdWidth > 0 ? truncateToWidth(cwd, cwdWidth, "...", true) : "";
+      text = `${marker}${visibleCaption}${separator}${visibleCwd}`;
+    } else {
+      // No recorded workspace: caption only, never a fabricated default.
+      const labelWidth = Math.max(0, cols - markerWidth);
+      const visibleLabel = labelWidth > 0 ? truncateToWidth(caption, labelWidth, "...", true) : "";
+      text = `${marker}${visibleLabel}`;
+    }
+    return wrapRow(text, cols, selected ? SGR_SELECTION_BLUE : undefined);
   }
 
   private renderConfirmPane(cols: number, rows: number): { lines: string[] } {
@@ -2421,6 +2711,56 @@ export class SidebarController {
     this.stopConfirmDisplayed = true;
     return { lines };
   }
+}
+
+/**
+ * Word-wraps text with hard line breaks into at most `maxLines` rows of
+ * visible width `cols`. A single word wider than the pane is ellipsized.
+ * When the content overflows the reserved rows, the last row carries an
+ * explicit truncation marker instead of silently dropping text.
+ */
+/**
+ * Column-safe wrapping of one bounded field into at most `maxLines` rows of
+ * visible width `cols`. Grapheme clusters (including spaces and wide Unicode)
+ * are preserved in order; a token longer than a row is split across rows
+ * rather than immediately ellipsized. When the content overflows the reserved
+ * rows, the last row carries an explicit truncation marker instead of silently
+ * dropping text.
+ */
+const detailGraphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+function wrapBoundedField(text: string, cols: number, maxLines: number): string[] {
+  const lines: string[] = [];
+  let current = "";
+  let truncated = false;
+  for (const { segment: char } of detailGraphemes.segment(text)) {
+    if (lines.length >= maxLines) {
+      truncated = true;
+      break;
+    }
+    const candidate = current + char;
+    if (visibleWidth(candidate) <= cols) {
+      current = candidate;
+    } else {
+      lines.push(current);
+      current = char; // preserve the character (including spaces) on the new row
+      if (lines.length >= maxLines) {
+        truncated = true;
+        break;
+      }
+    }
+  }
+  if (current !== "") {
+    if (lines.length < maxLines) lines.push(current);
+    else truncated = true;
+  }
+  if (truncated && lines.length > 0) {
+    const last = lines[lines.length - 1];
+    const base = truncateToWidth(last, Math.max(1, cols - 3), "", true);
+    lines[lines.length - 1] = `${base}...`;
+  }
+  while (lines.length < maxLines) lines.push("");
+  return lines.slice(0, maxLines);
 }
 
 function renderActivityLines(activity: readonly string[], cols: number): string[] {

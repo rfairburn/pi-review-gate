@@ -1032,6 +1032,7 @@ test("Main applies native app.clear and app.interrupt bindings and reloads them 
 
     writeKeybindings("ctrl+u", "ctrl+z");
     harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn(); // Draw the restored roster before another targeted action.
     harness.terminal.emitInput(ENTER);
     const reopenedHints = harness.sidebar?.renderForm(80, 24).lines.join("\n") ?? "";
     assert.ok(reopenedHints.includes("ctrl+u clear"), reopenedHints);
@@ -1081,6 +1082,7 @@ test("pending create uses the configured interrupt and ignores its late result a
     assert.equal(harness.sidebar?.visible, false, "the configured Ctrl+X interrupt abandons the pending form");
 
     harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn(); // Draw the restored roster before another targeted action.
     harness.terminal.emitInput(ENTER);
     assert.equal(harness.sidebar?.focus, "form");
     harness.terminal.emitInput("\x0c"); // Clear the retained draft with app.clear.
@@ -1126,9 +1128,10 @@ test("pending rename uses the configured interrupt and ignores its late result a
     harness.terminal.emitInput(ESC);
     assert.equal(harness.sidebar?.focus, "form", "unbound Escape does not abandon the pending rename");
     harness.terminal.emitInput("\x18");
-    assert.equal(harness.sidebar?.visible, false, "the configured Ctrl+X interrupt abandons the pending rename");
+    assert.equal(harness.sidebar?.visible, true, "Edit cancellation preserves the visible roster");
+    assert.equal(harness.sidebar?.focus, "sidebar");
 
-    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn(); // Draw the restored roster before another targeted action.
     harness.terminal.emitInput("e");
     assert.equal(harness.sidebar?.focus, "form");
     harness.terminal.emitInput("Reopened replacement");
@@ -1200,9 +1203,9 @@ test("native keybinding fallback notices render in narrow New and Edit forms and
     assert.ok(noticeInForm(unsupported).includes("Native keybindings.json has an unsupported format"));
 
     unsupported.terminal.emitInput(ESC);
-    assert.equal(unsupported.sidebar?.visible, false);
+    assert.equal(unsupported.sidebar?.visible, true);
+    assert.equal(unsupported.sidebar?.focus, "sidebar");
     writeFileSync(unsupportedKeybindings, JSON.stringify({ "app.clear": "ctrl+u", "app.interrupt": "ctrl+x" }), "utf8");
-    unsupported.terminal.emitInput(ALT_LEFT);
     assert.equal(unsupported.sidebar?.openEdit({ id: "notice-session", nativeSession: tuple, currentName: tuple.name }), true);
     const valid = noticeInForm(unsupported);
     assert.ok(valid.includes("ctrl+u clear"), valid);

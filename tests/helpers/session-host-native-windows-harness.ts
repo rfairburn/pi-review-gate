@@ -1360,7 +1360,11 @@ export class WindowsMainPtyDriver {
    * the exchange. The snapshot is diagnosis only: offered mode requests never
    * prove negotiated or delivered terminal state, and a missing, replaced,
    * or uncertain reply fails closed under the existing bounded
-   * ChangeSignal/deadline mechanics.
+   * ChangeSignal/deadline mechanics. The reply also carries an independent
+   * bounded active-pane group observed transparently through the original
+   * candidate manager/sidebar classes; it reports current getter inputs of the
+   * actual pane (owner presence, host focus, matching live row, and parsed
+   * input modes) and never a mirror decision, terminal write, or delivery.
    */
   async requestMainModeCensus(): Promise<MainModeCensusSnapshot> {
     const expectedMainPid = this.mainPidBinding.request(this.pty.pid, this.exitEvent !== undefined);
@@ -1459,6 +1463,10 @@ export class WindowsMainPtyDriver {
     assert.equal(snapshot.hookActive, true, "the retained Main stdout observation hook is still active at census time");
     assert.equal(snapshot.sameOutputStream, true, "Main retained the same public stdout stream at census time");
     assert.equal(snapshot.observationComplete, true, "the fresh Main stdout census covered its complete supported scope");
+    // The independent active-pane group is diagnostic only: it is validated and
+    // retained (and surfaced in the bounded failure diagnostic), but it never
+    // becomes a gate on the genuine outer-VT assertions. A coherent unknown
+    // pane with complete producer counts must not lose the producer evidence.
     this.mainCensus = snapshot;
     return snapshot;
   }

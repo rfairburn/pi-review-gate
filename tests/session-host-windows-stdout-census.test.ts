@@ -3,7 +3,8 @@
  * census: the incremental DECSET/DECRST parser, the exact-forwarding write
  * hook with own/inherited restoration semantics and permanent uncertainty
  * latches, the bounded request/reply service driven by injected fake IO, the
- * original Main PID binding, the strict reply contract, and the pre-Quit
+ * original Main PID binding, the strict reply contract (including the nested
+ * independent active-pane diagnostic group), and the pre-Quit
  * diagnostic-preservation path exercised through a prototype-only driver
  * fake. No actual filesystem, process, PTY, or Windows runtime is touched;
  * the CJS fixture is required directly as a pure module.
@@ -14,8 +15,10 @@ import test from "node:test";
 
 import {
   MAIN_CENSUS_COUNT_LIMIT,
+  MAIN_PANE_GEOMETRY_LIMIT,
   OriginalMainPidBinding,
   formatMainCensusDiagnostic,
+  validateMainActivePaneSnapshot,
   validateMainModeCensusReply,
   type MainModeCensusSnapshot,
 } from "./helpers/session-host-windows-stdout-census-contract";
@@ -131,7 +134,45 @@ function sampleSnapshot(): Record<string, unknown> {
   (stream.write as (data?: unknown) => unknown).call(stream, Buffer.from("\x1b[?1003;1006h\x1b[?1049h"));
   const snapshot = handle.snapshot();
   handle.restore();
-  return snapshot;
+  return { ...snapshot, activePane: completeActivePane() };
+}
+
+/** A coherent, positively-known active-pane group used by the pure regressions. */
+function completeActivePane(): Record<string, unknown> {
+  return {
+    complete: true,
+    scope: true,
+    ownerPresent: true,
+    focusMain: true,
+    viewMatched: true,
+    hasLiveProcess: true,
+    lifecycleAlive: true,
+    surfacePresent: true,
+    modesReadSucceeded: true,
+    mouseTracking: 4,
+    mouseEncoding: 1,
+    geometryColumns: null,
+    geometryRows: null,
+  };
+}
+
+/** An honest all-null active-pane group with an explicit independent scope pair. */
+function unknownActivePane(scope: boolean | null, complete: boolean | null): Record<string, unknown> {
+  return {
+    complete,
+    scope,
+    ownerPresent: null,
+    focusMain: null,
+    viewMatched: null,
+    hasLiveProcess: null,
+    lifecycleAlive: null,
+    surfacePresent: null,
+    modesReadSucceeded: null,
+    mouseTracking: null,
+    mouseEncoding: null,
+    geometryColumns: null,
+    geometryRows: null,
+  };
 }
 
 test("census recognizes single, combined, and split complete DEC lists", () => {
@@ -908,6 +949,7 @@ test("fixture reply builder and parent contract agree on the exact key set", () 
     hookActive: true,
     sameOutputStream: true,
     observationComplete: false,
+    activePane: completeActivePane(),
   };
   for (const field of censusFixture.CENSUS_COUNT_FIELDS) unknownSnapshot[field] = null;
   assert.ok(validateMainModeCensusReply(censusFixture.buildCensusReply(NONCE, 4242, unknownSnapshot),
@@ -936,7 +978,7 @@ test("census reply validation is strict on keys, PID, nonce, schema, and caps", 
     assert.equal(validateMainModeCensusReply(value, expect), undefined, `${label} is refused`);
   }
   const incomplete = censusFixture.buildCensusReply(NONCE, 4242, (() => {
-    const snapshot: Record<string, unknown> = { hookActive: true, sameOutputStream: true, observationComplete: false };
+    const snapshot: Record<string, unknown> = { hookActive: true, sameOutputStream: true, observationComplete: false, activePane: completeActivePane() };
     for (const field of censusFixture.CENSUS_COUNT_FIELDS) snapshot[field] = null;
     return snapshot;
   })());
@@ -960,7 +1002,7 @@ test("census reply validation refuses impossible complete flags and keeps honest
     "complete=true with both flags false is impossible");
 
   const unknownReply = (hookActive: boolean, sameOutputStream: boolean): Record<string, unknown> => {
-    const snapshot: Record<string, unknown> = { hookActive, sameOutputStream, observationComplete: false };
+    const snapshot: Record<string, unknown> = { hookActive, sameOutputStream, observationComplete: false, activePane: completeActivePane() };
     for (const field of censusFixture.CENSUS_COUNT_FIELDS) snapshot[field] = null;
     return censusFixture.buildCensusReply(NONCE, 4242, snapshot);
   };
@@ -968,6 +1010,128 @@ test("census reply validation refuses impossible complete flags and keeps honest
     assert.ok(validateMainModeCensusReply(unknownReply(hookActive, sameOutputStream), expect) !== undefined,
       `honest all-null unknown with hookActive=${hookActive}, sameOutputStream=${sameOutputStream} validates`);
   }
+});
+
+test("census reply validation treats the active-pane group independently of the producer scope", () => {
+  const expect = { nonce: NONCE, expectedMainPid: 4242 };
+  // An unknown producer scope never erases a fully known active pane.
+  const producerUnknownPaneComplete = (() => {
+    const snapshot: Record<string, unknown> = {
+      hookActive: true, sameOutputStream: true, observationComplete: false, activePane: completeActivePane(),
+    };
+    for (const field of censusFixture.CENSUS_COUNT_FIELDS) snapshot[field] = null;
+    return censusFixture.buildCensusReply(NONCE, 4242, snapshot);
+  })();
+  const validatedUnknownProducer = validateMainModeCensusReply(producerUnknownPaneComplete, expect);
+  assert.ok(validatedUnknownProducer !== undefined, "an unknown producer with a known pane validates");
+  assert.equal(validatedUnknownProducer!.writeCalls, null, "an unknown producer never borrows pane success");
+  assert.equal(validatedUnknownProducer!.activePane.complete, true, "the honest pane group survives an unknown producer");
+  assert.equal(validatedUnknownProducer!.activePane.ownerPresent, true);
+  assert.equal(validatedUnknownProducer!.activePane.mouseTracking, 4);
+
+  // An unknown active pane never erases a complete producer scope.
+  const producerCompletePaneUnknown = sampleSnapshot();
+  producerCompletePaneUnknown.activePane = unknownActivePane(null, null);
+  const validatedUnknownPane = validateMainModeCensusReply(
+    censusFixture.buildCensusReply(NONCE, 4242, producerCompletePaneUnknown), expect);
+  assert.ok(validatedUnknownPane !== undefined, "a complete producer with an unknown pane validates");
+  assert.equal(validatedUnknownPane!.observationComplete, true);
+  assert.equal(validatedUnknownPane!.writeCalls, 1, "honest producer counts survive an unknown pane");
+  assert.equal(validatedUnknownPane!.activePane.scope, null);
+  assert.equal(validatedUnknownPane!.activePane.complete, null);
+
+  // A coherent partial-but-unknown pane group is accepted alongside known counts.
+  const partialPane = sampleSnapshot();
+  partialPane.activePane = unknownActivePane(true, false);
+  const validatedPartial = validateMainModeCensusReply(censusFixture.buildCensusReply(NONCE, 4242, partialPane), expect);
+  assert.ok(validatedPartial !== undefined, "an intact scope with unknown fields stays a valid honest partial observation");
+  assert.equal(validatedPartial!.activePane.scope, true);
+  assert.equal(validatedPartial!.activePane.complete, false);
+});
+
+test("active-pane validation rejects inconsistent flags, enums, geometry, and impossible field combinations", () => {
+  assert.ok(validateMainActivePaneSnapshot(completeActivePane()) !== undefined, "the known coherent group validates");
+  const invalid: Array<[string, Record<string, unknown>]> = [
+    ["extra key", { ...completeActivePane(), extra: 1 }],
+    ["missing key", Object.fromEntries(Object.entries(completeActivePane()).filter(([key]) => key !== "scope"))],
+    ["complete true with a null scope", unknownActivePane(null, true)],
+    ["null scope with a false complete", unknownActivePane(null, false)],
+    ["complete true with a null field", { ...completeActivePane(), ownerPresent: null }],
+    ["intact scope marked incomplete while fully known", { ...completeActivePane(), complete: false }],
+    ["disturbed scope marked complete", { ...unknownActivePane(false, false), complete: true }],
+    ["unknown tracking enum", { ...completeActivePane(), mouseTracking: 5 }],
+    ["unknown encoding enum", { ...completeActivePane(), mouseEncoding: 3 }],
+    ["non-integer geometry", { ...completeActivePane(), geometryColumns: 1.5 }],
+    ["over-cap geometry", { ...completeActivePane(), geometryRows: MAIN_PANE_GEOMETRY_LIMIT + 1 }],
+    ["negative geometry", { ...completeActivePane(), geometryColumns: -1 }],
+    ["failed mode read carrying a mode value", { ...completeActivePane(), modesReadSucceeded: false }],
+    ["absent surface carrying a mode read", { ...completeActivePane(), surfacePresent: false }],
+    ["not-live row carrying a surface", { ...completeActivePane(), hasLiveProcess: false }],
+    ["unmatched view carrying a live pane", { ...completeActivePane(), viewMatched: false }],
+    ["non-boolean flag", { ...completeActivePane(), scope: "true" }],
+    ["absent owner carrying a matched live pane", { ...completeActivePane(), ownerPresent: false }],
+    ["disturbed scope carrying known pane data", { ...completeActivePane(), scope: false, complete: false }],
+    ["unknown scope carrying known pane data", { ...completeActivePane(), scope: null, complete: null }],
+    ["unknown owner carrying a matched view", { ...completeActivePane(), ownerPresent: null }],
+    ["null view carrying liveness", { ...completeActivePane(), viewMatched: null }],
+    ["unknown scope carrying mode evidence", { ...unknownActivePane(true, false), mouseTracking: 1 }],
+    ["unknown owner carrying a live surface", { ...completeActivePane(), ownerPresent: null, viewMatched: null }],
+    ["disturbed scope carrying geometry", { ...unknownActivePane(false, false), geometryColumns: 80 }],
+    ["unestablished scope carrying geometry", { ...unknownActivePane(null, null), geometryRows: 24 }],
+    ["unknown owner carrying geometry", { ...unknownActivePane(true, false), geometryColumns: 80 }],
+    ["absent surface carrying geometry", { ...completeActivePane(), surfacePresent: false, geometryRows: 24 }],
+    ["not-live row carrying geometry", { ...completeActivePane(), hasLiveProcess: false, geometryColumns: 80 }],
+  ];
+  for (const [label, pane] of invalid) {
+    assert.equal(validateMainActivePaneSnapshot(pane), undefined, `${label} is refused`);
+  }
+  for (const value of [null, undefined, "pane", 7, []]) {
+    assert.equal(validateMainActivePaneSnapshot(value), undefined, "a non-object active-pane group is refused");
+  }
+  // Honest partial unknowns and an off-main focus observation stay valid.
+  const valid: Array<[string, Record<string, unknown>]> = [
+    ["off-main focus with a known owner", { ...completeActivePane(), focusMain: false }],
+    ["live surface with numeric geometry", { ...completeActivePane(), geometryColumns: 80, geometryRows: 24 }],
+    ["known owner with no matching row", {
+      ...completeActivePane(), complete: false, viewMatched: false, hasLiveProcess: false, lifecycleAlive: false,
+      surfacePresent: false, modesReadSucceeded: false, mouseTracking: null, mouseEncoding: null,
+    }],
+    ["matched live owner with an unreadable surface", {
+      ...completeActivePane(), complete: false, surfacePresent: false, modesReadSucceeded: false,
+      mouseTracking: null, mouseEncoding: null,
+    }],
+    ["matched live surface with unknown modes", {
+      ...completeActivePane(), complete: false, mouseTracking: null, mouseEncoding: null,
+    }],
+    ["honest intact-scope partial unknown", unknownActivePane(true, false)],
+    ["disturbed all-null unknown", unknownActivePane(false, false)],
+    ["unestablished all-null unknown", unknownActivePane(null, null)],
+  ];
+  for (const [label, pane] of valid) {
+    assert.ok(validateMainActivePaneSnapshot(pane) !== undefined, `${label} is accepted`);
+  }
+});
+
+test("census diagnostic reports the bounded active-pane group without raw data", () => {
+  const validated = validateMainModeCensusReply(censusFixture.buildCensusReply(NONCE, 4242, sampleSnapshot()),
+    { nonce: NONCE, expectedMainPid: 4242 })!;
+  const line = formatMainCensusDiagnostic(validated);
+  assert.ok(line.includes("activePane{complete=true scope=true owner=true"), "the known pane flags are disclosed");
+  assert.ok(line.includes("tracking=4 encoding=1"), "the known pane modes are disclosed as bounded enums");
+  assert.ok(line.includes("geomCols=null geomRows=null}"), "absent public geometry stays explicit null");
+  assert.ok(line.length < 1_024, "the extended diagnostic line stays bounded");
+
+  const unknownPane = (() => {
+    const snapshot: Record<string, unknown> = {
+      hookActive: true, sameOutputStream: true, observationComplete: false, activePane: unknownActivePane(null, null),
+    };
+    for (const field of censusFixture.CENSUS_COUNT_FIELDS) snapshot[field] = null;
+    return snapshot;
+  })();
+  const unknownLine = formatMainCensusDiagnostic(validateMainModeCensusReply(
+    censusFixture.buildCensusReply(NONCE, 4242, unknownPane), { nonce: NONCE, expectedMainPid: 4242 })!);
+  assert.ok(unknownLine.includes("activePane{complete=null scope=null owner=null"),
+    "an unknown pane reports explicit nulls, never a guessed value");
 });
 
 /**
@@ -1029,6 +1193,40 @@ test("alternate-buffer failure preserves the retained census diagnostic", async 
   assert.ok(failure.message.includes("anySet=1"), "the tracking request count is preserved in the diagnostic");
 });
 
+test("a failing outer-VT assertion keeps complete producer counts alongside an unknown pane", async () => {
+  const modes: TerminalInputModes = {
+    kittyFlags: 0,
+    applicationCursorKeys: true,
+    applicationKeypad: false,
+    bracketedPaste: true,
+    mouseTracking: "any",
+    modifyOtherKeys: 0,
+    mouseEncoding: "sgr",
+  };
+  const reply = sampleSnapshot();
+  reply.activePane = unknownActivePane(true, false);
+  const census = validateMainModeCensusReply(censusFixture.buildCensusReply(NONCE, 4242, reply),
+    { nonce: NONCE, expectedMainPid: 4242 });
+  assert.ok(census !== undefined, "complete producer counts with a coherent unknown pane still validate");
+  assert.equal(census!.observationComplete, true);
+  assert.equal(census!.activePane.complete, false);
+  const fake = makeFakeCensusDriver(modes, census);
+  let failure: unknown;
+  try {
+    await fake.assertBeforeQuitModes();
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure instanceof Error, "the missing alternate-screen entry still fails the genuine VT assertions");
+  assert.match(failure.message, /actual Main output entered the outer VT alternate buffer/);
+  assert.ok(failure.message.includes("mainCensusDiag"), "the diagnostic survives the failure");
+  assert.ok(failure.message.includes("calls=1"), "complete producer counts remain available");
+  assert.ok(failure.message.includes("sgrSet=1"), "the SGR request count remains available");
+  assert.ok(failure.message.includes("activePane{complete=false scope=true"),
+    "the unknown pane is disclosed without erasing the producer evidence");
+  assert.ok(failure.message.includes("owner=null"), "the unknown pane reports null, never a guessed owner");
+});
+
 test("census diagnostic is bounded, metadata-only, and free of raw output", () => {
   assert.equal(formatMainCensusDiagnostic(undefined), "mainCensusDiag{absent}");
   const validated = validateMainModeCensusReply(censusFixture.buildCensusReply(NONCE, 4242, sampleSnapshot()),
@@ -1046,6 +1244,7 @@ test("census diagnostic is bounded, metadata-only, and free of raw output", () =
     hookActive: false,
     sameOutputStream: true,
     observationComplete: false,
+    activePane: completeActivePane(),
   };
   for (const field of censusFixture.CENSUS_COUNT_FIELDS) unknownSnapshot[field] = null;
   const unknownLine = formatMainCensusDiagnostic(validateMainModeCensusReply(

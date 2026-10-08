@@ -17,6 +17,17 @@
  * exactly one fresh request/reply through the fixed known child leaves in the
  * options file's fixture root. Diagnosis only: offered requests never prove
  * negotiated or delivered terminal state.
+ *
+ * The same single fresh reply carries an independent bounded active-pane group
+ * produced by a transparent test-only observer on the original candidate
+ * compiled `InstanceManager.prototype.list` and
+ * `SidebarController.prototype.setActiveMainOwner` prototypes. It forwards
+ * each original call exactly once with the exact receiver/arguments/return and
+ * the identical thrown error, retains only successful receiver identities, and
+ * reports an honest all-null unknown for any unsupported, replaced, ambiguous,
+ * or throwing observation. It never derives an owner from selection or roster
+ * order and never emits raw id, PID, path, label, frame, transcript, or
+ * argument data.
  */
 const fs = require('node:fs');
 const path = require('node:path');
@@ -27,6 +38,9 @@ const {
   createStdoutModeCensus,
   installStdoutWriteCensus,
 } = require('./session-host-windows-stdout-census.cjs');
+const {
+  installPaneModeObserver,
+} = require('./session-host-windows-pane-mode-observer.cjs');
 
 function installPtyObservation(mainEntry, expectedPtyModule, ptyJournal) {
   // Match production's exact lazy createRequire anchor in instances.js.
@@ -79,12 +93,18 @@ async function main() {
   // most one fresh request; it is closed on every return/error path.
   const census = createStdoutModeCensus();
   const censusHandle = installStdoutWriteCensus(outputStream, census);
+  // Transparent test-only actual-owner pane observer on the original candidate
+  // compiled class prototypes, installed before Main is required so it captures
+  // the genuine manager/sidebar instances Main constructs. It never throws and
+  // reports an honest all-null unknown when the candidate classes or their
+  // descriptors are unsupported, leaving public Main execution unchanged.
+  const paneObserver = installPaneModeObserver(mainEntry);
   let censusService;
   try {
     censusService = createCensusReplyService({
       root: path.dirname(optionsPath),
       mainPid: () => process.pid,
-      buildSnapshot: () => censusHandle.snapshot(),
+      buildSnapshot: () => ({ ...censusHandle.snapshot(), activePane: paneObserver.snapshot() }),
       fs,
     });
     censusService.start();
@@ -102,14 +122,20 @@ async function main() {
   } catch {
     threw = true;
   } finally {
-    // The exact census watcher closure sits in an inner finally so a
-    // restoration exception can never bypass it and keep Main alive.
+    // The exact census watcher closure and the exact pane observer restore sit
+    // in nested finally blocks so a restoration exception can never bypass
+    // either one or keep Main alive. Restore only unwinds slots that still hold
+    // this observer's own hook.
     try {
       observation.markNormalMainReturn(status, threw);
       observation.restore();
       censusHandle.restore();
     } finally {
-      if (censusService !== undefined) censusService.close();
+      try {
+        if (censusService !== undefined) censusService.close();
+      } finally {
+        paneObserver.restore();
+      }
     }
   }
 

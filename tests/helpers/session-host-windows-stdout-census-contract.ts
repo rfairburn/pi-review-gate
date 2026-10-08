@@ -14,6 +14,172 @@ export const MAIN_CENSUS_SCHEMA_VERSION = 1;
 /** Upper bound every census counter may report; beyond it the census is unknown. */
 export const MAIN_CENSUS_COUNT_LIMIT = 2 ** 31 - 1;
 
+/**
+ * Upper bound for an optional numeric pane geometry value. This terminal
+ * surface exposes no public geometry getter, so the observation always
+ * reports explicit nulls and never issues an extra frame read for it.
+ */
+export const MAIN_PANE_GEOMETRY_LIMIT = 100_000;
+
+/** Known bounded mouse tracking enum: 0 none, 1 x10, 2 vt200, 3 drag, 4 any. */
+export type MainActivePaneMouseTracking = 0 | 1 | 2 | 3 | 4 | null;
+/** Known bounded mouse encoding enum: 0 default, 1 sgr, 2 sgr-pixels. */
+export type MainActivePaneMouseEncoding = 0 | 1 | 2 | null;
+
+/**
+ * Independent bounded diagnostic group for the ACTUAL active Main pane at
+ * census time: the host's real active-owner id presence, host focus, the
+ * matching live roster row, and that pane surface's current parsed input
+ * modes (current getter inputs of the pane's own terminal surface). It is
+ * diagnosis only — it never claims a mirror decision, a terminal write, byte
+ * delivery, an outer-terminal state, host start/shutdown, or a native SDK
+ * emission, and it carries no id, PID, path, cwd, label, name, environment,
+ * transcript, frame, or argument data. Unknown, ambiguous, replaced,
+ * unsupported, or throwing observations report null instead of a guessed
+ * value.
+ */
+export interface MainActivePaneSnapshot {
+  /** True only when every field below is positively known within an intact scope. */
+  readonly complete: boolean | null;
+  /** True only when both owned hooks were installed and never disturbed; null when the scope was never established. */
+  readonly scope: boolean | null;
+  /** True only for a positively known actual host owner id. */
+  readonly ownerPresent: boolean | null;
+  /** True only when the host's actual focus is the Main pane. */
+  readonly focusMain: boolean | null;
+  /** True only when the actual owner id matches exactly one current roster view. */
+  readonly viewMatched: boolean | null;
+  /** The matched owner row's actual live-process flag. */
+  readonly hasLiveProcess: boolean | null;
+  /** True only when the matched owner row's lifecycle is `alive`. */
+  readonly lifecycleAlive: boolean | null;
+  /** True only when the matched, live owner row has a readable pane surface object. */
+  readonly surfacePresent: boolean | null;
+  /** True only when one pure current getter read of that pane's input modes succeeded. */
+  readonly modesReadSucceeded: boolean | null;
+  /**
+   * Known bounded mouse tracking enum taken from the declared
+   * `TerminalInputModes` union: 0 none, 1 x10, 2 vt200, 3 drag, 4 any; null
+   * for unknown or unsupported values.
+   */
+  readonly mouseTracking: MainActivePaneMouseTracking;
+  /**
+   * Known bounded mouse encoding enum taken from the declared
+   * `TerminalInputModes` union: 0 default, 1 sgr, 2 sgr-pixels; null for
+   * unknown or unsupported values.
+   */
+  readonly mouseEncoding: MainActivePaneMouseEncoding;
+  readonly geometryColumns: number | null;
+  readonly geometryRows: number | null;
+}
+
+/** Exact bounded active-pane field names, sorted as the validator expects. */
+const ACTIVE_PANE_KEYS = [
+  "complete", "focusMain", "geometryColumns", "geometryRows", "hasLiveProcess",
+  "lifecycleAlive", "modesReadSucceeded", "mouseEncoding", "mouseTracking",
+  "ownerPresent", "scope", "surfacePresent", "viewMatched",
+].sort();
+
+/** The observed boolean fields, excluding the independent complete/scope flags. */
+const ACTIVE_PANE_DATA_BOOLEAN_FIELDS = [
+  "focusMain", "hasLiveProcess", "lifecycleAlive", "modesReadSucceeded",
+  "ownerPresent", "surfacePresent", "viewMatched",
+] as const;
+
+const ACTIVE_PANE_FLAG_FIELDS = ["complete", "scope"] as const;
+
+/**
+ * Strict validation of one bounded active-pane group: exact key set, boolean
+ * or null flags/fields, known bounded enums, bounded optional geometry, and
+ * coherent independent complete/scope implications (an unestablished or
+ * disturbed scope carries no pane data). Downstream owner/view/live/surface
+ * evidence must be backed by its upstream guards, so a missing or unknown
+ * owner never carries a matched live pane or known modes. Returns undefined
+ * for any malformed, missing, out-of-cap, or impossible combination; a
+ * partial but honest unknown group is accepted and stays partial.
+ */
+export function validateMainActivePaneSnapshot(value: unknown): MainActivePaneSnapshot | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const pane = value as Record<string, unknown>;
+  const keys = Object.keys(pane).sort();
+  if (keys.length !== ACTIVE_PANE_KEYS.length || keys.some((key, index) => key !== ACTIVE_PANE_KEYS[index])) {
+    return undefined;
+  }
+  for (const field of ACTIVE_PANE_FLAG_FIELDS) {
+    if (typeof pane[field] !== "boolean" && pane[field] !== null) return undefined;
+  }
+  for (const field of ACTIVE_PANE_DATA_BOOLEAN_FIELDS) {
+    if (typeof pane[field] !== "boolean" && pane[field] !== null) return undefined;
+  }
+  const tracking = pane.mouseTracking;
+  if (tracking !== null && (!Number.isSafeInteger(tracking) || (tracking as number) < 0 || (tracking as number) > 4)) {
+    return undefined;
+  }
+  const encoding = pane.mouseEncoding;
+  if (encoding !== null && (!Number.isSafeInteger(encoding) || (encoding as number) < 0 || (encoding as number) > 2)) {
+    return undefined;
+  }
+  for (const field of ["geometryColumns", "geometryRows"] as const) {
+    const geometry = pane[field];
+    if (geometry !== null && (!Number.isSafeInteger(geometry) || (geometry as number) < 0
+      || (geometry as number) > MAIN_PANE_GEOMETRY_LIMIT)) {
+      return undefined;
+    }
+  }
+  const { complete, scope, ownerPresent, viewMatched, hasLiveProcess, lifecycleAlive, surfacePresent, modesReadSucceeded } = pane;
+  const hasGeometry = pane.geometryColumns !== null || pane.geometryRows !== null;
+  const allDataNull = ACTIVE_PANE_DATA_BOOLEAN_FIELDS.every((field) => pane[field] === null)
+    && tracking === null && encoding === null && !hasGeometry;
+  const allKnown = ACTIVE_PANE_DATA_BOOLEAN_FIELDS.every((field) => typeof pane[field] === "boolean")
+    && tracking !== null && encoding !== null;
+
+  // Scope/complete coherence: an unestablished (null) or disturbed (false)
+  // scope carries no pane data at all, and an intact (true) scope is complete
+  // exactly when every observed field is positively known.
+  if (scope === null) {
+    if (complete !== null || !allDataNull) return undefined;
+  } else if (scope === false) {
+    if (complete !== false || !allDataNull) return undefined;
+  } else if (scope === true) {
+    if (complete !== allKnown) return undefined;
+  } else {
+    return undefined;
+  }
+
+  // Owner/view coherence: a matched view requires a positively known owner; an
+  // absent or unknown owner never carries a matched view; and any positive
+  // pane evidence (surface, mode read, or mode value) requires the full
+  // upstream owner/view/live/alive guard chain. Unknown views carry no
+  // downstream claims at all, and unmatched views never carry positive ones.
+  if (ownerPresent === null && viewMatched !== null) return undefined;
+  if (ownerPresent === false && viewMatched !== false) return undefined;
+  if (viewMatched === true && ownerPresent !== true) return undefined;
+  // Numeric geometry is pane evidence too: it requires a positively known
+  // owner, a matched live row, and a present pane surface, exactly like the
+  // other supported pane observations.
+  if (hasGeometry && (ownerPresent !== true || viewMatched !== true
+    || hasLiveProcess !== true || lifecycleAlive !== true || surfacePresent !== true)) return undefined;
+  const hasDownstream = hasLiveProcess !== null || lifecycleAlive !== null
+    || surfacePresent !== null || modesReadSucceeded !== null || tracking !== null || encoding !== null;
+  const claimsPaneEvidence = surfacePresent === true || modesReadSucceeded === true
+    || tracking !== null || encoding !== null;
+  if (viewMatched === null) {
+    if (hasDownstream) return undefined; // an unknown view carries no downstream data
+  } else if (viewMatched === false) {
+    if (hasLiveProcess === true || lifecycleAlive === true || claimsPaneEvidence) return undefined;
+  } else {
+    if (typeof hasLiveProcess !== "boolean" || typeof lifecycleAlive !== "boolean") return undefined;
+    if (hasLiveProcess !== true || lifecycleAlive !== true) {
+      if (claimsPaneEvidence) return undefined; // the actual pane gate is unsatisfied: no positive pane evidence
+    } else if (surfacePresent !== true) {
+      if (modesReadSucceeded === true || tracking !== null || encoding !== null) return undefined;
+    } else if (modesReadSucceeded !== true && (tracking !== null || encoding !== null)) {
+      return undefined; // no successful mode read never carries a fabricated mode
+    }
+  }
+  return pane as unknown as MainActivePaneSnapshot;
+}
+
 /** Exact request leaf payload the parent writes to `main-census-request.json` in the owned fixture root. */
 export interface MainModeCensusRequest {
   readonly schemaVersion: typeof MAIN_CENSUS_SCHEMA_VERSION;
@@ -80,6 +246,8 @@ export interface MainModeCensusSnapshot {
   readonly alternateBufferReset: number | null;
   readonly bracketedPasteSet: number | null;
   readonly bracketedPasteReset: number | null;
+  /** Independent bounded diagnostic group for the actual active pane. */
+  readonly activePane: MainActivePaneSnapshot;
 }
 
 const CENSUS_COUNT_FIELDS = [
@@ -95,7 +263,7 @@ const CENSUS_COUNT_FIELDS = [
 
 const CENSUS_REPLY_KEYS = [
   "schemaVersion", "nonce", "mainPid",
-  "hookActive", "sameOutputStream", "observationComplete",
+  "hookActive", "sameOutputStream", "observationComplete", "activePane",
   ...CENSUS_COUNT_FIELDS,
 ].sort();
 
@@ -141,6 +309,10 @@ export function validateMainModeCensusReply(
       return undefined;
     }
   }
+  // The active-pane group is validated independently: an unknown producer
+  // scope never erases honest pane data, and an unknown pane never erases
+  // honest producer counts.
+  if (validateMainActivePaneSnapshot(reply.activePane) === undefined) return undefined;
   return reply as unknown as MainModeCensusSnapshot;
 }
 
@@ -154,6 +326,8 @@ export function formatMainCensusDiagnostic(snapshot: MainModeCensusSnapshot | un
   if (snapshot === undefined) return "mainCensusDiag{absent}";
   const count = (value: number | null): string =>
     typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? String(value) : "null";
+  const flag = (value: boolean | null): string => value === true ? "true" : value === false ? "false" : "null";
+  const pane = snapshot.activePane;
   return [
     "mainCensusDiag{",
     `complete=${snapshot.observationComplete}`,
@@ -168,6 +342,11 @@ export function formatMainCensusDiagnostic(snapshot: MainModeCensusSnapshot | un
     `sgrSet=${count(snapshot.mouseSgrSet)} sgrReset=${count(snapshot.mouseSgrReset)}`,
     `altSet=${count(snapshot.alternateBufferSet)} altReset=${count(snapshot.alternateBufferReset)}`,
     `pasteSet=${count(snapshot.bracketedPasteSet)} pasteReset=${count(snapshot.bracketedPasteReset)}`,
+    `activePane{complete=${flag(pane.complete)} scope=${flag(pane.scope)} owner=${flag(pane.ownerPresent)}`,
+    `focusMain=${flag(pane.focusMain)} viewMatched=${flag(pane.viewMatched)} live=${flag(pane.hasLiveProcess)}`,
+    `alive=${flag(pane.lifecycleAlive)} surface=${flag(pane.surfacePresent)} modesRead=${flag(pane.modesReadSucceeded)}`,
+    `tracking=${count(pane.mouseTracking)} encoding=${count(pane.mouseEncoding)}`,
+    `geomCols=${count(pane.geometryColumns)} geomRows=${count(pane.geometryRows)}}`,
     "}",
   ].join(" ");
 }

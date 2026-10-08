@@ -321,7 +321,13 @@ function isCensusRequestPayload(payload) {
   return true;
 }
 
-/** Exact reply shape shared with the parent-side contract validator. */
+/**
+ * Exact reply shape shared with the parent-side contract validator. The
+ * producer's numeric stdout snapshot is spread verbatim; a nested
+ * `activePane` group supplied by the independent transparent actual-owner
+ * observer passes through unchanged, so the reply carries both the offered
+ * mode counts and the bounded pane diagnosis under their own flags.
+ */
 function buildCensusReply(nonce, mainPidValue, snapshot) {
   return {
     schemaVersion: CENSUS_SCHEMA_VERSION,

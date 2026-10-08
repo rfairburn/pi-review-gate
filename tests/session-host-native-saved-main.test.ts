@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, sep } from "node:path";
 import test from "node:test";
 
-import { SidebarController, type SidebarItem } from "../src/session-host/sidebar";
+import { SidebarController, type SidebarAction, type SidebarItem } from "../src/session-host/sidebar";
 
 import {
   EVENT_TIMEOUT_MS,
@@ -46,7 +46,8 @@ import {
   requirePublicRuntimeDependencies,
   resolveSavedRuntimePin,
   rosterEntries,
-  savedRowsVisible,
+  isCompleteSavedSelection,
+  hasFullWidthNativeEditorRule,
   selectedRosterEntry,
   sessionFileHasStoredName,
   shortBaselineFitsTwentyFourColumns,
@@ -195,15 +196,14 @@ async function moveRosterToAction(driver: SavedMainDriver, label: "Saved convers
   return entry!.position;
 }
 
-async function openSavedPane(driver: SavedMainDriver, savedName: string): Promise<void> {
+async function openSavedPane(driver: SavedMainDriver, savedName: string, recordedWorkspace: string): Promise<void> {
   await moveRosterToAction(driver, "Saved conversations");
   const beforeOpen = driver.snapshot();
   driver.pty.write(KEYS.enter);
   await driver.waitFrame(isSavedPane,
     "the genuine host Saved conversations action opens its right-hand public picker", beforeOpen.frameRevision);
-  await driver.waitFrame((text) => isSavedPane(text) && savedRowsVisible(text).length === 1
-    && savedRowsVisible(text)[0] === savedName && !text.includes("Loading saved conversations"),
-  "fresh native catalog listing contains the one real persisted saved conversation", beforeOpen.frameRevision);
+  await driver.waitFrame((text) => isCompleteSavedSelection(text, savedName, recordedWorkspace),
+    "fresh native catalog completely paints one selected caption/path summary and exact recorded workspace in its bottom details", beforeOpen.frameRevision);
   assert.equal(isSavedPane(driver.currentText()), true);
 }
 
@@ -369,8 +369,9 @@ async function assertSavedListingAndDuplicateRefusal(
   driver: SavedMainDriver,
   savedName: string,
   activeHeader: string,
+  recordedWorkspace: string,
 ): Promise<void> {
-  await openSavedPane(driver, savedName);
+  await openSavedPane(driver, savedName, recordedWorkspace);
   const beforeOpen = driver.snapshot();
   driver.pty.write(KEYS.enter);
   await driver.waitFrame((text) => isSavedPane(text) && text.includes("That saved conversation is already open in this host"),
@@ -418,7 +419,7 @@ async function openSavedSuccessfully(
   priorProcesses: readonly ProcessIncarnation[],
 ): Promise<{ process: ProcessIncarnation; binding: ConversationBinding }> {
   const activeHeader = exactCurrentHeader(driver);
-  await openSavedPane(driver, savedName);
+  await openSavedPane(driver, savedName, workspace);
   const beforeRoster = rosterEntries(driver.currentText());
   const before = driver.snapshot();
   driver.pty.write(KEYS.enter);
@@ -489,6 +490,37 @@ test("pure saved-pane predicate distinguishes the real right picker from roster 
   const publicPicker = compose(publicRoster, publicForm);
   assert.equal(isSavedPane(publicPicker), true,
     "the right-pane predicate recognizes the combined footer from the actual public Saved renderer");
+});
+
+test("native Saved witness requires a single selected summary and complete recorded-workspace details", () => {
+  const actions: SidebarAction[] = [];
+  const controller = new SidebarController({ toggleKey: "f8", onAction: (action) => actions.push(action) });
+  controller.renderRoster(32, 49);
+  controller.handleInput(KEYS.up);
+  controller.renderRoster(32, 49);
+  controller.handleInput(KEYS.enter);
+  const request = actions.at(-1);
+  assert.ok(request?.type === "saved-list");
+  const caption = "Saved fixture";
+  const cwd = `/recorded/workspace/${"abcdef".repeat(16)}`;
+  assert.equal(controller.completeSavedList(request.requestId, [{ id: "fixture", file: "/fixture.jsonl", caption, cwd }], 0), true);
+  const plain = (lines: readonly string[]): string[] => lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const left = plain(controller.renderRoster(32, 49).lines);
+  const right = plain(controller.renderForm(87, 49).lines);
+  const compose = (pane: readonly string[]): string => ["Session host", ...left.map((line, index) =>
+    `${line.padEnd(32)}│${pane[index] ?? ""}`)].join("\n");
+  const complete = compose(right);
+  assert.equal(isCompleteSavedSelection(complete, caption, cwd), true);
+  assert.equal(isCompleteSavedSelection(complete, caption, `${cwd}-wrong`), false);
+  assert.equal(isCompleteSavedSelection(complete, "Wrong caption", cwd), false);
+  const noFooter = [...right]; noFooter[48] = "";
+  assert.equal(isCompleteSavedSelection(compose(noFooter), caption, cwd), false);
+  const partialDetails = [...right]; partialDetails[47] = "";
+  assert.equal(isCompleteSavedSelection(compose(partialDetails), caption, cwd), false);
+  const duplicateRow = [...right]; duplicateRow[2] = duplicateRow[1];
+  assert.equal(isCompleteSavedSelection(compose(duplicateRow), caption, cwd), false);
+  assert.equal(hasFullWidthNativeEditorRule(compose(["─".repeat(47)]), 87), false);
+  assert.equal(hasFullWidthNativeEditorRule(compose(["─".repeat(87)]), 87), true);
 });
 
 test("pure complete-roster witness rejects duplicate action rows during incremental repaint", () => {
@@ -722,7 +754,7 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
   assert.equal(currentBinding(processA), originalBinding,
     "the original saved ID/file is still the exact current live conversation at the first duplicate attempt");
   assert.ok(processIsStillOwnedAndLive(processA));
-  await assertSavedListingAndDuplicateRefusal(driver, savedName, firstActiveHeader);
+  await assertSavedListingAndDuplicateRefusal(driver, savedName, firstActiveHeader, workspace);
   const duplicateSnapshot = driver.snapshot();
   await cancelSavedPane(driver);
   await assertNoStartsAfter(driver, duplicateSnapshot, "closing the duplicate-refusal pane");
@@ -735,7 +767,7 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
 
   // Reopen the real native catalog and cancel with Escape. This is a new UI
   // request, not a replayed stale listing or a synthetic SDK delay.
-  await openSavedPane(driver, savedName);
+  await openSavedPane(driver, savedName, workspace);
   const cancelHeader = exactCurrentHeader(driver);
   const cancelDraft = firstDraft;
   const cancelDimensions = latestDimensions(driver.records(), processA.pid);
@@ -795,9 +827,8 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
   await moveRosterToAction(driver, "Saved conversations");
   const beforeSavedPane = driver.snapshot();
   driver.pty.write(KEYS.enter);
-  await driver.waitFrame((text) => isSavedPane(text) && savedRowsVisible(text).length === 1
-    && savedRowsVisible(text)[0] === savedName,
-  "the host picker freshly lists the original persisted file after /new released its current binding", beforeSavedPane.frameRevision);
+  await driver.waitFrame((text) => isCompleteSavedSelection(text, savedName, workspace),
+    "the host picker freshly paints the original persisted summary and recorded workspace details after /new released its binding", beforeSavedPane.frameRevision);
   const beforeSuccessfulOpen = driver.snapshot();
   driver.pty.write(KEYS.enter);
   const opened = await awaitSavedOpen(driver, beforeSuccessfulOpen, workspace,
@@ -835,6 +866,10 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
   // This sidebar-only guard contains digits and no host commands. Its input
   // cannot enter either child; activation below proves the reopened surface is
   // still the real saved transcript without the guard text.
+  const nativeWidth = driver.surface.frame().cols - 33;
+  await driver.waitFrame((text) => isSidebarFocus(text) && isCompleteRosterFrame(text)
+    && text.includes(newDraft) && hasFullWidthNativeEditorRule(text, nativeWidth),
+  "the original native editor completes its latest full-width rule and draft repaint before the ignored-input comparison");
   const digitGuard = `271828182845${suffix.replace(/[a-f]/g, "9")}`;
   assert.match(digitGuard, /^\d+$/, "the visible-row guard contains digits only, with no e/q/commands");
   const beforeDigitGuard = driver.snapshot();
@@ -864,7 +899,7 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
     "the newly activated exact same-workspace child receives an independent unsent draft");
   const reopenedHeader = exactCurrentHeader(driver);
   const duplicateAgain = driver.snapshot();
-  await assertSavedListingAndDuplicateRefusal(driver, savedName, reopenedHeader);
+  await assertSavedListingAndDuplicateRefusal(driver, savedName, reopenedHeader, workspace);
   assert.equal(ptySpawnCount(driver.ptyRecords()), 2,
     "same saved row is refused while the independently owned reopened child is live");
   assert.equal(driver.records().filter((record) => record.type === "session_start").length, 3,

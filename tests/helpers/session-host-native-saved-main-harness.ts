@@ -379,6 +379,35 @@ export function savedRowsVisible(text: string): string[] {
       && !line.startsWith("No saved conversations") && !line.startsWith("No conversations could be listed"));
 }
 
+/**
+ * Complete single-entry native Saved witness for the pinned ASCII fixtures.
+ * Requires the one-line selected summary AND the selection-synchronous three
+ * bottom detail rows immediately before the complete keyboard footer. The
+ * bounded workspace must fit these fixture rows; longer production paths may
+ * be visibly ellipsized and are covered by frontend contracts, not guessed here.
+ */
+export function isCompleteSavedSelection(text: string, caption: string, cwd: string): boolean {
+  if (!isSavedConversationsPane(text)) return false;
+  const pane = rightPaneText(text).split("\n").map((line) => line.trimEnd());
+  const footer = pane.findIndex((line) => line.trim() === "F8 toggle | up/down select | enter open | esc back");
+  if (footer < 4 || pane.slice(footer + 1).some((line) => line.trim() !== "")) return false;
+  const details = pane.slice(footer - 3, footer);
+  if (details[0] !== caption || details.slice(1).join("") !== cwd) return false;
+  const visible = savedRowsVisible(text);
+  if (visible.length !== 1) return false;
+  const separator = visible[0].indexOf(" | ");
+  if (separator < 0 || visible[0].slice(0, separator).trimEnd() !== caption) return false;
+  const summary = visible[0].slice(separator + 3);
+  if (summary !== cwd && !(summary.endsWith("...") && summary.length > 3 && cwd.startsWith(summary.slice(0, -3)))) return false;
+  return pane.some((line) => line === `> ${visible[0]}`) && !pane.some((line) => line.includes("Loading saved conversations"));
+}
+
+/** Full latest-width native editor rule, not a partial prior-geometry repaint. */
+export function hasFullWidthNativeEditorRule(text: string, width: number): boolean {
+  if (!Number.isSafeInteger(width) || width < 20 || width > 1000) return false;
+  return rightPaneText(text).split("\n").some((line) => line.trimEnd() === "─".repeat(width));
+}
+
 function canonicalRealpath(path: string): string {
   return realpathSync(path);
 }

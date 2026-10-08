@@ -287,6 +287,15 @@ export interface ShutdownResult {
 
 interface ManagedInstance {
 	id: string;
+	/**
+	 * True only once THIS row's own asynchronous launch has positively
+	 * finished. Initialized before any await and finalized in create()'s
+	 * finally, so it distinguishes a completed, already-released failed launch
+	 * from a row whose preparation or spawn is still in flight. It is never
+	 * inferred from a missing PTY handle, a sibling's state, a status count, or
+	 * the global create set.
+	 */
+	launchSettled: boolean;
 	label: string;
 	nativeSession: SessionHostNativeSession | null;
 	lastNativeSession?: SessionHostNativeSession;
@@ -304,6 +313,13 @@ interface ManagedInstance {
 	profile?: PreparedProfile;
 	profileReleased: boolean;
 	/**
+	 * True only once this row's profile admission release positively returned
+	 * (or there was none to release). Distinct from profileReleased, which is
+	 * only an idempotency latch set before the external call: a throwing release
+	 * leaves this false so removal stays fail closed.
+	 */
+	profileReleaseSettled: boolean;
+	/**
 	 * Synchronous saved-session creation reservation (issue 323): set before
 	 * any await in create() and released only when creation definitively failed
 	 * before a child exists or the exact owned PTY actually exited — never on
@@ -318,6 +334,13 @@ interface ManagedInstance {
 	knownNativeSessionId?: string;
 	registration?: InstanceStatusRegistration;
 	registrationReleased: boolean;
+	/**
+	 * True only once this row's registration release positively returned (or
+	 * there was none to release). Distinct from registrationReleased, which is
+	 * only an idempotency latch set before the external call: a throwing release
+	 * leaves this false so removal stays fail closed.
+	 */
+	registrationReleaseSettled: boolean;
 	surface?: TerminalSurface;
 	pty?: InstancePty;
 	ptyExited: boolean;
@@ -649,11 +672,62 @@ export class InstanceManager {
 		if (!record || !record.pty || !record.ptyExited) {
 			return false;
 		}
+		this.#detachRow(record);
+		return true;
+	}
 
+	/**
+	 * Remove one terminal `error` row that owns no live or unsettled child.
+	 *
+	 * This is the deliberate error-row cleanup for a failed launch: it never
+	 * signals a process, never touches workspace/native files, and never
+	 * affects a sibling. It refuses unless the exact record is still in the
+	 * map, its own asynchronous launch has positively finished, and the row is
+	 * terminally errored. A row that still owns its original PTY refuses while
+	 * that child has no confirmed exit; once the exact owned exit is observed
+	 * the removal is delegated to {@linkcode closeExited}, preserving that
+	 * strict actual-exit-only path and its cleanup exactly. A row that never
+	 * created a child is removable only when the failed launch has positively
+	 * completed cleanup — its registration and profile admission releases
+	 * actually returned (or there was nothing to release) and any saved-session
+	 * reservation was cleared. A missing handle, an idempotency latch set before
+	 * a throwing release, stale status, an unknown PID, or a false busy/zero
+	 * count is never evidence of that. Returns true only when the row was
+	 * removed.
+	 */
+	closeError(id: string): boolean {
+		const record = this.#records.get(id);
+		if (!record || this.#disposed || record.lifecycle !== "error" || !record.launchSettled) {
+			return false;
+		}
+		if (record.pty) {
+			// The original owned child exists: only its own confirmed exit may
+			// release it, through the strict exited-row path.
+			return record.ptyExited ? this.closeExited(id) : false;
+		}
+		// No child was ever created. Require positively completed cleanup of the
+		// failed launch (registration and profile release actually returned, and
+		// any saved-session reservation was cleared) instead of an idempotency
+		// latch, a missing handle, or UI flags.
+		if (!record.registrationReleaseSettled || !record.profileReleaseSettled || record.savedReservation !== undefined) {
+			return false;
+		}
+		this.#detachRow(record);
+		return true;
+	}
+
+	/**
+	 * Detach one already-removable row (no live/unsettled owned child) from the
+	 * live map, then dispose only its manager-owned in-memory bookkeeping with
+	 * the scoped, idempotent cleanup helpers. Nothing on disk is touched and no
+	 * process is signaled. Callers must have established removability.
+	 */
+	#detachRow(record: ManagedInstance): void {
 		// Detach first so even synchronous callbacks caused by cleanup (or
 		// callbacks already queued by the PTY/status source) are stale before
-		// any retained resource is disposed.
-		this.#records.delete(id);
+		// any retained resource is disposed, and cannot resurrect or retarget
+		// this row.
+		this.#records.delete(record.id);
 		this.#releaseRegistration(record);
 		this.#disposeDataListener(record);
 		this.#disposeExitListener(record);
@@ -661,15 +735,14 @@ export class InstanceManager {
 		try {
 			record.surface?.dispose();
 		} catch {
-			// Teardown is scoped to this already-exited row; still notify removal.
+			// Teardown is scoped to this already-detached row; still notify removal.
 		}
 		record.surface = undefined;
 		record.registration = undefined;
 		record.profile = undefined;
 		record.pty = undefined;
 		record.stopPromise = undefined;
-		this.#safeChanged(id);
-		return true;
+		this.#safeChanged(record.id);
 	}
 
 	/** Stop ONLY this exact owned row; removal is a separate actual-exit-only operation. */
@@ -756,8 +829,11 @@ export class InstanceManager {
 			savedReservation: savedSession !== undefined
 				? { sessionId: savedSession.sessionId, file: savedSession.file }
 				: undefined,
+			launchSettled: false,
 			profileReleased: false,
+			profileReleaseSettled: false,
 			registrationReleased: false,
+			registrationReleaseSettled: false,
 			ptyExited: false,
 			sigtermSent: false,
 			sigkillSent: false,
@@ -771,6 +847,10 @@ export class InstanceManager {
 			await launch;
 		} finally {
 			this.#inflightCreates.delete(launch);
+			// This exact row's launch has positively finished: no later spawn can
+			// occur for it, whatever the launch settled as. The flag is per record,
+			// so a sibling's pending or failing launch can never qualify this row.
+			record.launchSettled = true;
 		}
 		return id;
 	}
@@ -1434,8 +1514,13 @@ export class InstanceManager {
 		try {
 			record.registration?.release();
 		} catch {
-			// Cleanup is per-registration; it cannot strand another instance.
+			// The attempt is recorded but not confirmed; no-child removal stays
+			// fail closed and never retries the external release.
+			return;
 		}
+		// Positively settled: either there was no registration owned yet, or the
+		// external release returned. Only this authorizes no-child removal.
+		record.registrationReleaseSettled = true;
 	}
 
 	#disposeDataListener(record: ManagedInstance): void {
@@ -1470,7 +1555,11 @@ export class InstanceManager {
 			return;
 		}
 		record.profileReleased = true;
+		// A throwing admission release keeps the confirmed flag false (the
+		// caller's existing propagation semantics are preserved); a later
+		// idempotent call cannot silently claim success for it.
 		record.profile?.release();
+		record.profileReleaseSettled = true;
 	}
 
 	#resolveExitWaiters(record: ManagedInstance): void {

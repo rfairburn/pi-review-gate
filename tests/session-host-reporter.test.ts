@@ -8,10 +8,10 @@
  * observed on the wire and asserted as received.
  */
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import net from "node:net";
 import { randomBytes, randomUUID } from "node:crypto";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -721,11 +721,13 @@ describe("session-host reporter status frames", () => {
     };
 
     const initial = await server.waitForFrame((frame) => frame.message.type === "status");
-    const firstNative = initial.message.nativeSession as { sessionId: string; epoch: number; name: string };
+    const firstNative = initial.message.nativeSession as { sessionId: string; epoch: number; name: string; persistence: string };
     assert.deepEqual(firstNative, {
       sessionId: native.id,
       epoch: 1,
       name: "first user prompt",
+      // The stub manager has no getSessionFile, so persistence fails closed to unknown.
+      persistence: "unknown",
     }, "native first stored user message is the fallback; assistant text is ignored");
 
     const rename = {
@@ -2596,19 +2598,40 @@ describe("session-host bootstrap preload", () => {
     grandchild: { bootstrap: boolean; restore: boolean; nodeOptions: string | null };
   }
 
+  // The descendant probe CLI: a retained regular nonsymlink file (never an
+  // inline script or shell) that records the environment view the descendant
+  // must NOT have.
+  const GRANDCHILD_CLI_SOURCE = [
+    "process.stdout.write(JSON.stringify({",
+    "  bootstrap: process.env.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP !== undefined,",
+    "  restore: process.env.PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE !== undefined,",
+    "  nodeOptions: process.env.NODE_OPTIONS ?? null,",
+    "}));",
+    "",
+  ].join("\n");
+
   // The ORIGINAL user --require fixture: records its own environment view and
-  // spawns a Node descendant before main to prove no inheritance.
+  // runs the retained grandchild CLI before main to prove no inheritance.
   // SH_TEST_GRANDCHILD guards re-entry: the descendant inherits the restored
   // NODE_OPTIONS (and thus reloads this fixture) but must not spawn again.
   const USER_FIXTURE_SOURCE = [
     'const { spawnSync } = require("node:child_process");',
     'const fs = require("node:fs");',
     'if (process.env.SH_TEST_GRANDCHILD !== "1") {',
-    "  const grandchild = spawnSync(process.execPath, [\"-e\", \"process.stdout.write(JSON.stringify({ bootstrap: process.env.PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP !== undefined, restore: process.env.PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE !== undefined, nodeOptions: process.env.NODE_OPTIONS ?? null }))\"], { encoding: \"utf8\", env: { ...process.env, SH_TEST_GRANDCHILD: \"1\" } });",
+    "  // Finite deadline and bounded capture on the trusted interpreter; only",
+    "  // an explicit successful spawn outcome admits the grandchild JSON.",
+    "  const grandchild = spawnSync(process.execPath, [process.env.SH_TEST_GRANDCHILD_CLI], { encoding: \"utf8\", timeout: 10_000, maxBuffer: 64 * 1024, env: { ...process.env, SH_TEST_GRANDCHILD: \"1\" } });",
+    "  if (grandchild.error !== undefined || grandchild.status !== 0) {",
+    "    fs.writeFileSync(process.env.SH_TEST_MARKER, JSON.stringify({",
+    "      userFixture: { ran: true, nodeOptions: process.env.NODE_OPTIONS ?? null },",
+    "      grandchild: { spawnFailed: true },",
+    '    }), { flag: \"wx\", mode: 0o600 });',
+    '    throw new Error(\"grandchild probe did not settle successfully\");',
+    "  }",
     "  fs.writeFileSync(process.env.SH_TEST_MARKER, JSON.stringify({",
     "    userFixture: { ran: true, nodeOptions: process.env.NODE_OPTIONS ?? null },",
     "    grandchild: JSON.parse(grandchild.stdout),",
-    "  }));",
+    '  }), { flag: \"wx\", mode: 0o600 });',
     "}",
     "",
   ].join("\n");
@@ -2639,15 +2662,79 @@ describe("session-host bootstrap preload", () => {
     "  assert.ok(sticky && sticky.bootstrap.instanceId === process.env.SH_TEST_INSTANCE_ID, \"sticky primed pre-main\");",
     "  const hooks = new Map();",
     "  const pi = { on(name, handler) { hooks.set(name, [...(hooks.get(name) ?? []), handler]); } };",
-    "  await reporter.activate(pi);",
+    "  // Event-driven observation on the reporter's OWN socket: hello and status",
+    "  // delivery is witnessed through its original channel with write",
+    "  // forwarding intact. Only a SUCCESSFUL original write callback settles a",
+    "  // frame as delivered; attempted writes never count. The deadline is",
+    "  // failure, never readiness; no polling or sleep stands in for delivery.",
+    "  const observedTypes = new Set();",
+    "  let deliver;",
+    "  const delivery = new Promise((resolve, reject) => {",
+    "    const deadline = setTimeout(() => reject(new Error(\"hello/status not delivered within the bounded deadline\")), 10_000);",
+    "    deliver = (ok, types) => {",
+    "      if (!ok) {",
+    "        clearTimeout(deadline);",
+    "        reject(new Error(\"original write failed before delivery settlement\"));",
+    "        return;",
+    "      }",
+    "      for (const type of types) observedTypes.add(type);",
+    "      if (observedTypes.has(\"hello\") && observedTypes.has(\"status\")) {",
+    "        clearTimeout(deadline);",
+    "        resolve();",
+    "      }",
+    "    };",
+    "  });",
+    "  await reporter.activate(pi, {",
+    "    onSocket: (socket) => {",
+    "      const originalWrite = socket.write.bind(socket);",
+    "      socket.write = (chunk, ...rest) => {",
+    "        const text = typeof chunk === \"string\" ? chunk : Buffer.from(chunk).toString(\"utf8\");",
+    "        const types = [];",
+    "        for (const line of text.split(\"\\n\")) {",
+    "          if (!line) continue;",
+    "          try {",
+    "            const type = JSON.parse(line).type;",
+    "            if (typeof type === \"string\") types.push(type);",
+    "          } catch { /* not a frame */ }",
+    "        }",
+    "        const settle = (error) => deliver(error === undefined || error === null, types);",
+    "        if (typeof rest[rest.length - 1] === \"function\") {",
+    "          const prior = rest.pop();",
+    "          return originalWrite(chunk, ...rest, (error) => { settle(error); prior(error); });",
+    "        }",
+    "        return originalWrite(chunk, ...rest, settle);",
+    "      };",
+    "    },",
+    "  });",
     "  assert.ok(hooks.size > 0, \"default factory registers from primed sticky state\");",
     "  const ctx = { mode: \"tui\", ui: { setWidget() {} }, isIdle: () => true, sessionManager: { getSessionId: () => \"child\" } };",
     "  for (const h of hooks.get(\"session_start\") ?? []) await h({ type: \"session_start\" }, ctx);",
-    "  await new Promise((r) => setTimeout(r, 300)); // let hello+status flush",
+    "  await delivery;",
     "  for (const h of hooks.get(\"session_shutdown\") ?? []) await h({ type: \"session_shutdown\" });",
     "})().catch((e) => { console.error(e.message); process.exit(1); });",
     "",
   ].join("\n");
+
+  // Inherited ORIGINAL runtime-surface markers (runtime role and executor tool
+  // catalog) must never be stripped to authorize a preloaded child: the
+  // scenario requires a genuine top-level surface. The suite's beforeEach saves
+  // and removes the canonical role for in-process hermeticity, so the inherited
+  // value is witnessed through previousRuntimeRole; case aliases and the
+  // catalog marker are witnessed through the live env (env names are
+  // case-insensitive on Windows). Presence, including empty values, refuses
+  // before any fixture mutation. Never stripped, never laundered.
+  const RUNTIME_SURFACE_MARKER_NAMES = [
+    "PI_REVIEW_GATE_RUNTIME_ROLE",
+    "PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG",
+  ];
+
+  function inheritedRuntimeSurfaceMarker(): string | undefined {
+    if (previousRuntimeRole !== undefined) return "PI_REVIEW_GATE_RUNTIME_ROLE";
+    for (const key of Object.keys(process.env)) {
+      if (RUNTIME_SURFACE_MARKER_NAMES.includes(key.toUpperCase())) return key;
+    }
+    return undefined;
+  }
 
   async function runPreloadedChild(options: {
     bootstrap: Record<string, unknown>;
@@ -2658,56 +2745,196 @@ describe("session-host bootstrap preload", () => {
     fixturesRoot?: string;
     /** Reporter module the child main loads (defaults to the compiled package path). */
     reporterPath?: string;
-  }): Promise<{ status: number | null; markerData: PreloadMarker; output: string }> {
-    const ownsDir = options.fixturesRoot === undefined;
-    const dir = ownsDir
-      ? mkdtempSync(join(tmpdir(), "sh-preload-"))
-      : join(options.fixturesRoot!, "fixtures");
-    if (!ownsDir) mkdirSync(dir, { recursive: true });
-    try {
-      const userFixture = join(dir, "user-fixture.js");
-      const childMain = join(dir, "child-main.js");
-      const marker = join(dir, "marker.json");
-      writeFileSync(userFixture, USER_FIXTURE_SOURCE);
-      writeFileSync(childMain, CHILD_MAIN_SOURCE);
-
-      const restoreFrame = options.restoreFrameFor(userFixture);
-      const childEnv: NodeJS.ProcessEnv = { ...process.env };
-      delete childEnv.PI_REVIEW_GATE_RUNTIME_ROLE; // hermetic top-level surface
-      childEnv.NODE_OPTIONS = options.nodeOptionsFor(userFixture);
-      if (restoreFrame === undefined) delete childEnv[NODE_OPTIONS_RESTORE_ENV];
-      else childEnv[NODE_OPTIONS_RESTORE_ENV] = restoreFrame;
-      childEnv[HOST_BOOTSTRAP_ENV] = JSON.stringify(options.bootstrap);
-      childEnv.SH_TEST_MARKER = marker;
-      childEnv.SH_TEST_RELATIVE_SOCKET = rootRelativeSocketAddress(options.bootstrap.socketPath as string);
-      childEnv.SH_TEST_REPORTER = options.reporterPath ?? REPORTER_PATH;
-      childEnv.SH_TEST_ORIGINAL_NODE_OPTIONS = options.expectedNodeOptionsFor(userFixture);
-      childEnv.SH_TEST_INSTANCE_ID = options.bootstrap.instanceId as string;
-
-      let output = "";
-      const status = await new Promise<number | null>((resolve, reject) => {
-        const child = spawn(process.execPath, [childMain], { env: childEnv });
-        const watchdog = setTimeout(() => {
-          child.kill("SIGKILL");
-          reject(new Error(`preloaded child timed out\n${output}`));
-        }, 15_000);
-        child.stdout.on("data", (chunk: Buffer) => { output += chunk.toString("utf8"); });
-        child.stderr.on("data", (chunk: Buffer) => { output += chunk.toString("utf8"); });
-        child.on("error", (err) => {
-          clearTimeout(watchdog);
-          reject(err);
-        });
-        child.on("close", (code) => {
-          clearTimeout(watchdog);
-          resolve(code);
-        });
-      });
-      const markerData = JSON.parse(readFileSync(marker, "utf8")) as PreloadMarker;
-      return { status, markerData, output };
-    } finally {
-      if (ownsDir) rmSync(dir, { recursive: true, force: true });
+  }): Promise<{ status: number; markerData: PreloadMarker; userFixturePath: string }> {
+    // Refuse an inherited original runtime-surface marker before any helper or
+    // spaced-fixture mutation; it is never stripped to authorize a child.
+    const surfaceMarker = inheritedRuntimeSurfaceMarker();
+    if (surfaceMarker !== undefined) {
+      throw new Error(`inherited runtime-surface marker ${surfaceMarker} refuses the preloaded child`);
     }
+    // Every invocation gets a fresh, exclusively created fixture directory that
+    // is retained as evidence for that attempt: no teardown sweep can drop a
+    // later attempt's marker, and an earlier attempt's marker can never be
+    // mistaken for this invocation's.
+    const dir = options.fixturesRoot === undefined
+      ? mkdtempSync(join(tmpdir(), "sh-preload-"))
+      : mkdtempSync(join(options.fixturesRoot, "fixture-"));
+    const userFixture = join(dir, "user-fixture.js");
+    const childMain = join(dir, "child-main.js");
+    const grandchildCli = join(dir, "grandchild-cli.js");
+    const marker = join(dir, "marker.json");
+    writeFileSync(userFixture, USER_FIXTURE_SOURCE, { flag: "wx", mode: 0o600 });
+    writeFileSync(childMain, CHILD_MAIN_SOURCE, { flag: "wx", mode: 0o600 });
+    writeFileSync(grandchildCli, GRANDCHILD_CLI_SOURCE, { flag: "wx", mode: 0o600 });
+
+    const restoreFrame = options.restoreFrameFor(userFixture);
+    // The parent environment is preserved as-is: the marker guard above already
+    // refused any inherited runtime-surface marker, and only the explicit
+    // synthetic NODE_OPTIONS/bootstrap/restore frames below are test-local
+    // injections. No general env laundering.
+    const childEnv: NodeJS.ProcessEnv = { ...process.env };
+    childEnv.NODE_OPTIONS = options.nodeOptionsFor(userFixture);
+    if (restoreFrame === undefined) delete childEnv[NODE_OPTIONS_RESTORE_ENV];
+    else childEnv[NODE_OPTIONS_RESTORE_ENV] = restoreFrame;
+    childEnv[HOST_BOOTSTRAP_ENV] = JSON.stringify(options.bootstrap);
+    childEnv.SH_TEST_MARKER = marker;
+    childEnv.SH_TEST_GRANDCHILD_CLI = grandchildCli;
+    childEnv.SH_TEST_RELATIVE_SOCKET = rootRelativeSocketAddress(options.bootstrap.socketPath as string);
+    childEnv.SH_TEST_REPORTER = options.reporterPath ?? REPORTER_PATH;
+    childEnv.SH_TEST_ORIGINAL_NODE_OPTIONS = options.expectedNodeOptionsFor(userFixture);
+    childEnv.SH_TEST_INSTANCE_ID = options.bootstrap.instanceId as string;
+
+    // Bounded settlement only (code/signal/spawn failure/unsettled): raw
+    // output, env, and arguments are never captured or surfaced. The original
+    // ChildProcess and its exit/close observers are retained in the ownership
+    // record until exact process/stdio settlement; a timeout is force intent,
+    // never exit proof, and any error latches failure so no later zero exit
+    // can admit the marker.
+    type ChildSettlement =
+      | { kind: "exited"; code: number | null; forced: boolean; errored: boolean }
+      | { kind: "signal"; signal: NodeJS.Signals; forced: boolean; errored: boolean }
+      | { kind: "spawn-failure" }
+      | { kind: "unsettled" };
+    const ownership: {
+      child: ChildProcess | undefined;
+      settled: boolean;
+      code: number | null;
+      signal: NodeJS.Signals | null;
+    } = { child: undefined, settled: false, code: null, signal: null };
+    const settlement = await new Promise<ChildSettlement>((resolve) => {
+      let reported = false;
+      let forceIntent = false;
+      let errorLatched = false;
+      let forceWatchdog: NodeJS.Timeout | undefined;
+      const child = spawn(process.execPath, [childMain], { env: childEnv, stdio: ["ignore", "ignore", "ignore"] });
+      ownership.child = child;
+      // Bounded result reporting is separate from original settlement: the
+      // close observer keeps recording the eventual exact settlement in the
+      // ownership record even after a bounded result was reported.
+      const report = (result: ChildSettlement): void => {
+        if (reported) return;
+        reported = true;
+        resolve(result);
+      };
+      const watchdog = setTimeout(() => {
+        if (reported) return;
+        // Timeout is failure/force intent, never exit proof: attempt the kill
+        // honestly (it may throw or refuse), then wait for the original close
+        // within a second finite bound.
+        forceIntent = true;
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // A refused or failed kill is not settlement either.
+        }
+        forceWatchdog = setTimeout(() => {
+          if (reported) return;
+          // Bounded result reported UNSETTLED; the original owner and its
+          // close observer stay retained in the ownership record for the
+          // eventual exact settlement.
+          report({ kind: "unsettled" });
+        }, 5_000);
+      }, 15_000);
+      child.on("error", () => {
+        errorLatched = true;
+        if (reported) return;
+        // Positive no-spawn evidence: a spawn failure never assigns a pid. A
+        // post-spawn error latches failure but is not settlement; the close
+        // observer and watchdogs stay in charge of the finite outcome.
+        if (child.pid === undefined) {
+          clearTimeout(watchdog);
+          if (forceWatchdog !== undefined) clearTimeout(forceWatchdog);
+          report({ kind: "spawn-failure" });
+        }
+      });
+      // The original close observer is the settlement witness (process exit
+      // plus all stdio closed). It records the eventual settlement in the
+      // ownership record even after a bounded result was reported, and it is
+      // never removed or replaced.
+      child.on("close", (code, signal) => {
+        ownership.settled = true;
+        ownership.code = code;
+        ownership.signal = signal;
+        clearTimeout(watchdog);
+        if (forceWatchdog !== undefined) clearTimeout(forceWatchdog);
+        report(signal === null
+          ? { kind: "exited", code, forced: forceIntent, errored: errorLatched }
+          : { kind: "signal", signal, forced: forceIntent, errored: errorLatched });
+      });
+    });
+
+    // The original child settlement is the launch result. A timeout, force,
+    // error, signal, or unsettled outcome can never admit marker success even
+    // if a prior/current marker exists; only an unforced clean exit does. A
+    // missing marker can never replace a failed settlement with ENOENT or
+    // accept an earlier attempt's success; it is only read after this
+    // invocation exited cleanly.
+    if (settlement.kind === "spawn-failure") throw new Error("preloaded child failed to start");
+    if (settlement.kind === "unsettled") {
+      throw new Error("preloaded child UNSETTLED: original exit could not be confirmed within the finite bound");
+    }
+    if (settlement.errored) throw new Error("preloaded child failed with a post-spawn error before settlement");
+    if (settlement.forced) {
+      throw new Error(settlement.kind === "signal"
+        ? `preloaded child timed out; force settlement by signal ${settlement.signal}`
+        : `preloaded child timed out; force settlement with exit code ${settlement.code}`);
+    }
+    if (settlement.kind === "signal") throw new Error(`preloaded child terminated by signal ${settlement.signal}`);
+    const status = settlement.code;
+    if (status !== 0) throw new Error(`preloaded child exited with code ${status}`);
+
+    let markerData: PreloadMarker;
+    try {
+      markerData = JSON.parse(readFileSync(marker, "utf8")) as PreloadMarker;
+    } catch {
+      throw new Error("preloaded child settled cleanly but its exclusive marker is missing");
+    }
+    return { status, markerData, userFixturePath: userFixture };
   }
+
+  it("refuses inherited runtime-role/catalog markers before any fixture mutation", async () => {
+    // Source witness: runPreloadedChild's first act is the marker guard,
+    // before mkdtempSync/writeFileSync/spawn. This regression is zero-IO: pure
+    // env inspection and a rejected promise; no fixture, no child. Every
+    // touched marker entry is captured before injection and restored exactly
+    // in finally (env names are case-insensitive on Windows), so an originally
+    // inherited surface is never laundered by this test.
+    const inheritedCases: Array<[string, string]> = [
+      ["PI_REVIEW_GATE_RUNTIME_ROLE", "executor"],
+      ["PI_REVIEW_GATE_RUNTIME_ROLE", ""],
+      ["pi_review_gate_runtime_role", "executor"],
+      ["PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG", "1"],
+      ["Pi_Review_Gate_Executor_Tool_Catalog", ""],
+    ];
+    const originalResidual = inheritedRuntimeSurfaceMarker();
+    const originalValues = new Map<string, string | undefined>();
+    for (const [key] of inheritedCases) originalValues.set(key, process.env[key]);
+    try {
+      for (const [key, value] of inheritedCases) {
+        process.env[key] = value;
+        await assert.rejects(
+          runPreloadedChild({
+            bootstrap: makeBootstrap("/tmp/sh-refused.sock"),
+            restoreFrameFor: () => undefined,
+            nodeOptionsFor: () => "",
+            expectedNodeOptionsFor: () => "",
+          }),
+          /inherited runtime-surface marker/,
+          `${key} refuses the preloaded child`,
+        );
+      }
+    } finally {
+      for (const [key] of inheritedCases) {
+        const original = originalValues.get(key);
+        if (original === undefined) delete process.env[key];
+        else process.env[key] = original;
+      }
+    }
+    // A clean surface is only claimed when the original surface had no marker.
+    if (originalResidual === undefined) {
+      assert.equal(inheritedRuntimeSurfaceMarker(), undefined, "restored surface matches the original clean surface");
+    }
+  });
 
   it("preloaded Node process restores env before user fixtures and reports via the default factory", async () => {
     const server = await startTestServer();
@@ -2767,29 +2994,370 @@ describe("session-host bootstrap preload", () => {
     assert.equal(hello.message.token, bootstrap.token);
   });
 
+  // Bounded per-leaf byte bound for staged compiled sources.
+  const STAGED_LEAF_MAX_BYTES = 1_048_576;
+
+  interface PathIdentity {
+    dev: bigint;
+    ino: bigint;
+  }
+
+  /**
+   * Ownership ledger for the spaced fixture tree: the BigInt identity of every
+   * retained ancestor, every created directory, and every staged leaf. One
+   * ledger spans all six leaves so an ancestor or leaf replacement between
+   * leaves can never become the next accepted baseline. It is revalidated
+   * before and after each mutation and on failure.
+   */
+  interface StagingLedger {
+    root: string;
+    identities: Map<string, PathIdentity>;
+  }
+
+  // Retained ownership evidence on both success and failure; never swept.
+  const retainedStagingLedgers = new Set<StagingLedger>();
+
+  function lstatFixture(path: string, label: string) {
+    try {
+      return lstatSync(path, { bigint: true });
+    } catch {
+      throw new Error(`staged fixture path missing for ${label}`);
+    }
+  }
+
+  function assertGenuineDirectory(path: string, label: string): PathIdentity {
+    const stats = lstatFixture(path, label);
+    if (!stats.isDirectory()) throw new Error(`staged fixture ancestor is not a genuine directory for ${label}`);
+    return { dev: BigInt(stats.dev), ino: BigInt(stats.ino) };
+  }
+
+  function assertIdentityUnchanged(path: string, label: string, expected: PathIdentity): void {
+    const stats = lstatFixture(path, label);
+    if (BigInt(stats.dev) !== expected.dev || BigInt(stats.ino) !== expected.ino) {
+      throw new Error(`staged fixture identity changed for ${label}`);
+    }
+  }
+
+  /** Fixture-rooted chain from root (inclusive) down to target (inclusive). */
+  function ancestorChain(root: string, target: string): string[] {
+    const chain = [root];
+    let current = root;
+    for (const segment of relative(root, target).split(sep)) {
+      if (segment === "" || segment === ".") continue;
+      current = join(current, segment);
+      chain.push(current);
+    }
+    return chain;
+  }
+
+  function ledgerLabel(ledger: StagingLedger, path: string): string {
+    return path === ledger.root ? "fixture root" : relative(ledger.root, path);
+  }
+
+  /** Revalidates every ledger entry against the live tree. */
+  function revalidateLedger(ledger: StagingLedger): void {
+    for (const [path, identity] of ledger.identities) {
+      assertIdentityUnchanged(path, ledgerLabel(ledger, path), identity);
+    }
+  }
+
+  function createStagingLedger(root: string): StagingLedger {
+    return { root, identities: new Map([[root, assertGenuineDirectory(root, "fixture root")]]) };
+  }
+
+  /**
+   * Ensures the chain from the ledger root down to leafDir exists. Each
+   * missing directory is created individually and exclusively (non-recursive
+   * mkdir: a concurrent creation or preexisting entry of any type refuses),
+   * and its identity is captured in the ledger. Retained ancestors are
+   * revalidated before and after each creation. Fresh roots and prechecks are
+   * not atomic containment: swaps are detected, never claimed impossible.
+   */
+  function ensureAncestorChain(ledger: StagingLedger, leafDir: string): void {
+    for (const path of ancestorChain(ledger.root, leafDir)) {
+      if (ledger.identities.has(path)) continue; // retained or created earlier
+      const label = ledgerLabel(ledger, path);
+      revalidateLedger(ledger);
+      try {
+        mkdirSync(path); // non-recursive: exclusive creation of this level only
+      } catch {
+        throw new Error(`staged fixture ancestor creation refused; entry retained: ${label}`);
+      }
+      ledger.identities.set(path, assertGenuineDirectory(path, label));
+      revalidateLedger(ledger);
+    }
+  }
+
+  /** Exclusive (wx) destination create: any preexisting leaf of any type refuses. */
+  function openExclusiveLeaf(path: string, label: string): number {
+    try {
+      return openSync(path, "wx");
+    } catch {
+      throw new Error(`staged destination already exists and is retained: ${label}`);
+    }
+  }
+
+  /**
+   * Flag policy for the staged-leaf source open, as a pure function of the
+   * platform and available constants so it can be regression-tested with
+   * explicit inputs:
+   * - win32: plain read-only. Windows exposes neither O_NONBLOCK nor
+   *   O_NOFOLLOW; safety comes from the descriptor-identity revalidation in
+   *   stageCompiledLeaf (a followed symlink or swapped entry presents a
+   *   descriptor whose BigInt dev/ino differ from the pre-lstat regular file
+   *   and is refused). Matches the established bounded-copier strategy in
+   *   scripts/ci/session-host-windows-acceptance.cjs and
+   *   src/session-host/saved-sessions.ts; observational public-API checks
+   *   only, no atomic containment claimed.
+   * - every other platform: strict fail-closed — both O_NONBLOCK and
+   *   O_NOFOLLOW must be nonzero numbers, otherwise the policy refuses
+   *   (undefined) rather than open with weakened flags.
+   */
+  function stagedSourceOpenFlags(platform: string, oRdonly: number, oNonblock: unknown, oNofollow: unknown): number | undefined {
+    if (platform === "win32") return oRdonly;
+    if (typeof oNonblock !== "number" || oNonblock === 0
+      || typeof oNofollow !== "number" || oNofollow === 0) return undefined;
+    return oRdonly | oNonblock | oNofollow;
+  }
+
+  /** Structural stats view for admitted-source revalidation. */
+  interface SourceSnapshot {
+    isFile(): boolean;
+    dev: number | bigint;
+    ino: number | bigint;
+    size: number | bigint;
+  }
+
+  /**
+   * Exact admitted-source comparison: regular type, identity, and the
+   * initially observed size must all hold. Applied to the source descriptor
+   * after open (admission-to-open drift) and to both the descriptor and the
+   * path after copy (in-place mutation).
+   */
+  function sameAdmittedSource(snapshot: SourceSnapshot, identity: PathIdentity, admittedSize: bigint): boolean {
+    return snapshot.isFile() && BigInt(snapshot.dev) === identity.dev
+      && BigInt(snapshot.ino) === identity.ino && BigInt(snapshot.size) === admittedSize;
+  }
+
+  /**
+   * Stages one explicit compiled leaf from a genuine regular nonsymlink source
+   * into an exclusively created destination inside the spaced fixture root.
+   * Any refusal retains whatever exists; nothing is overwritten, deleted, or
+   * cleaned up here.
+   */
+  function stageCompiledLeaf(ledger: StagingLedger, leafRelative: string, sourcePath: string): void {
+    const destination = join(ledger.root, leafRelative);
+    const leafDir = dirname(destination);
+
+    // Source: genuine regular nonsymlink file with bounded bytes. lstat does
+    // not follow symlinks, so a symlinked source is refused here.
+    const sourceLstat = lstatFixture(sourcePath, leafRelative);
+    if (!sourceLstat.isFile()) throw new Error(`staged source is not a regular nonsymlink file: ${leafRelative}`);
+    if (sourceLstat.size > STAGED_LEAF_MAX_BYTES) throw new Error(`staged source exceeds the byte bound: ${leafRelative}`);
+    const admittedSize = BigInt(sourceLstat.size);
+    const sourceIdentity = { dev: BigInt(sourceLstat.dev), ino: BigInt(sourceLstat.ino) };
+
+    revalidateLedger(ledger);
+    ensureAncestorChain(ledger, leafDir);
+
+    // Exclusive destination write: any preexisting leaf of any type refuses;
+    // it is retained, never overwritten or deleted.
+    const destFd = openExclusiveLeaf(destination, leafRelative);
+    let sourceFd: number | undefined;
+    let totalBytes = 0;
+    let destIdentity: PathIdentity | undefined;
+    try {
+      // Record output ownership before copying: the created descriptor's
+      // identity enters the ledger immediately, so failure revalidation
+      // covers partial outputs too.
+      const createdDestination = fstatSync(destFd, { bigint: true });
+      if (!createdDestination.isFile()) {
+        throw new Error(`staged destination is not a regular file: ${leafRelative}`);
+      }
+      destIdentity = { dev: BigInt(createdDestination.dev), ino: BigInt(createdDestination.ino) };
+      ledger.identities.set(destination, destIdentity);
+      revalidateLedger(ledger);
+      // Platform contract: POSIX opens with strict nonblocking + nofollow
+      // protection and refuses to weaken it; Windows opens plain read-only
+      // and relies on the descriptor identity check below — a reparse-point
+      // follow or swapped entry yields a descriptor whose BigInt identity
+      // differs from the pre-lstat entry.
+      const sourceFlags = stagedSourceOpenFlags(process.platform, constants.O_RDONLY, constants.O_NONBLOCK, constants.O_NOFOLLOW);
+      if (sourceFlags === undefined) {
+        throw new Error(`bounded nonsymlink source open unsupported on ${process.platform}: ${leafRelative}`);
+      }
+      try {
+        sourceFd = openSync(sourcePath, sourceFlags);
+      } catch {
+        throw new Error(`staged source could not be opened: ${leafRelative}`);
+      }
+      const sourceFstat = fstatSync(sourceFd, { bigint: true });
+      if (!sourceFstat.isFile() || BigInt(sourceFstat.dev) !== sourceIdentity.dev || BigInt(sourceFstat.ino) !== sourceIdentity.ino) {
+        throw new Error(`staged source identity changed: ${leafRelative}`);
+      }
+      // The descriptor must be the exact admitted entry, including its size:
+      // a same-identity mutation between admission and open is refused.
+      if (!sameAdmittedSource(sourceFstat, sourceIdentity, admittedSize)) {
+        throw new Error(`staged source size changed before copy: ${leafRelative}`);
+      }
+      if (sourceFstat.size > STAGED_LEAF_MAX_BYTES) throw new Error(`staged source exceeds the byte bound: ${leafRelative}`);
+      // Path revalidated against the original identity after the open.
+      assertIdentityUnchanged(sourcePath, leafRelative, sourceIdentity);
+
+      // Bounded copy of exactly the admitted size, position-tracked; short
+      // writes are refused. The ledger is revalidated before and after every
+      // write; these remain observational checks, not atomic containment.
+      totalBytes = Number(admittedSize);
+      const buffer = Buffer.alloc(64 * 1024);
+      let offset = 0;
+      while (offset < totalBytes) {
+        const toRead = Math.min(buffer.length, totalBytes - offset);
+        const bytesRead = readSync(sourceFd, buffer, 0, toRead, offset);
+        if (bytesRead === 0) throw new Error(`staged source ended before its declared size: ${leafRelative}`);
+        revalidateLedger(ledger);
+        const bytesWritten = writeSync(destFd, buffer, 0, bytesRead, offset);
+        revalidateLedger(ledger);
+        if (bytesWritten !== bytesRead) throw new Error(`staged destination short write: ${leafRelative}`);
+        offset += bytesRead;
+      }
+
+      // Destination byte count verified on the open descriptor.
+      const destFstat = fstatSync(destFd, { bigint: true });
+      if (!destFstat.isFile() || Number(destFstat.size) !== totalBytes) {
+        throw new Error(`staged destination size mismatch: ${leafRelative}`);
+      }
+
+      // Source revalidation after the copy, on both the open descriptor and
+      // the path: regular type, identity, and the admitted size must all
+      // hold; any drift makes the staged output ambiguous; refuse and retain.
+      if (!sameAdmittedSource(fstatSync(sourceFd, { bigint: true }), sourceIdentity, admittedSize)) {
+        throw new Error(`staged source changed during copy: ${leafRelative}`);
+      }
+      const sourceAfter = lstatFixture(sourcePath, leafRelative);
+      if (!sameAdmittedSource(sourceAfter, sourceIdentity, admittedSize)) {
+        throw new Error(`staged source changed during copy: ${leafRelative}`);
+      }
+    } finally {
+      try {
+        if (sourceFd !== undefined) closeSync(sourceFd);
+      } finally {
+        closeSync(destFd);
+      }
+    }
+
+    // Final identity revalidation: a genuine regular nonsymlink leaf whose
+    // path identity matches the created descriptor; ledger retained.
+    if (destIdentity === undefined) throw new Error(`staged destination identity missing: ${leafRelative}`);
+    const destLstat = lstatFixture(destination, leafRelative);
+    if (!destLstat.isFile() || BigInt(destLstat.dev) !== destIdentity.dev || BigInt(destLstat.ino) !== destIdentity.ino
+      || Number(destLstat.size) !== totalBytes) {
+      throw new Error(`staged destination identity changed: ${leafRelative}`);
+    }
+    revalidateLedger(ledger);
+  }
+
+  /**
+   * Stages the explicit six-leaf closure under one shared ownership ledger.
+   * On failure the ledger is revalidated to surface concurrent tampering, and
+   * everything created is retained.
+   */
+  function stageModuleClosure(root: string, leaves: Array<{ relative: string; source: string }>): void {
+    const ledger = createStagingLedger(root);
+    retainedStagingLedgers.add(ledger);
+    for (const leaf of leaves) {
+      try {
+        stageCompiledLeaf(ledger, leaf.relative, leaf.source);
+      } catch (error) {
+        try {
+          revalidateLedger(ledger);
+        } catch (tamperError) {
+          throw tamperError;
+        }
+        throw error;
+      }
+    }
+  }
+
+  it("staged source open flags follow the platform contract", () => {
+    // Source-test-only platform pin for the staged-leaf copier: POSIX keeps
+    // the strict nonblocking + nofollow source open and refuses to weaken it;
+    // Windows has neither constant, so it stages with a plain read-only open
+    // whose safety comes from the descriptor-identity revalidation (a followed
+    // symlink or swapped entry presents a different BigInt dev/ino and is
+    // refused). No unavailable kernel guarantee is claimed on Windows.
+    const live = stagedSourceOpenFlags(process.platform, constants.O_RDONLY, constants.O_NONBLOCK, constants.O_NOFOLLOW);
+    assert.notEqual(live, undefined, "the live platform must support the staged source open");
+    if (process.platform === "win32") {
+      assert.equal(live, constants.O_RDONLY, "Windows stages with a plain read-only source open");
+    } else {
+      assert.equal(live, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
+        "POSIX staging keeps strict nonblocking + nofollow protection");
+    }
+
+    // Pure policy regressions with explicit platform/constants inputs: the
+    // plain read-only fallback is Windows-only; every other platform requires
+    // both nonzero numeric flags and refuses otherwise.
+    assert.equal(stagedSourceOpenFlags("win32", 1024, undefined, undefined), 1024);
+    assert.equal(stagedSourceOpenFlags("win32", 1024, 0, 0), 1024);
+    assert.equal(stagedSourceOpenFlags("linux", 1, 2048, 256), 1 | 2048 | 256);
+    assert.equal(stagedSourceOpenFlags("darwin", 1, undefined, 256), undefined, "missing O_NONBLOCK refuses on POSIX");
+    assert.equal(stagedSourceOpenFlags("linux", 1, 2048, undefined), undefined, "missing O_NOFOLLOW refuses on POSIX");
+    assert.equal(stagedSourceOpenFlags("darwin", 1, 0, 256), undefined, "zero O_NONBLOCK refuses on POSIX");
+    assert.equal(stagedSourceOpenFlags("linux", 1, 2048, 0), undefined, "zero O_NOFOLLOW refuses on POSIX");
+  });
+
+  it("staged source admission binds the initially observed size", () => {
+    // Pure snapshot-comparison regression: identity and regular type alone do
+    // not admit a source; the initially observed size is part of the
+    // admission, so a same-identity growth or shrinkage between admission and
+    // open (or during copy) is refused.
+    const identity = { dev: 42n, ino: 7n };
+    const admittedSize = 100n;
+    assert.ok(sameAdmittedSource({ isFile: () => true, dev: 42n, ino: 7n, size: 100n }, identity, admittedSize),
+      "the exact admitted entry holds");
+    assert.ok(!sameAdmittedSource({ isFile: () => true, dev: 42n, ino: 7n, size: 101n }, identity, admittedSize),
+      "same-identity growth refuses");
+    assert.ok(!sameAdmittedSource({ isFile: () => true, dev: 42n, ino: 7n, size: 99n }, identity, admittedSize),
+      "same-identity shrinkage refuses");
+    assert.ok(!sameAdmittedSource({ isFile: () => false, dev: 42n, ino: 7n, size: 100n }, identity, admittedSize),
+      "non-regular type refuses");
+    assert.ok(!sameAdmittedSource({ isFile: () => true, dev: 43n, ino: 7n, size: 100n }, identity, admittedSize),
+      "identity change refuses");
+  });
+
   it("preloaded Node process strips a spaced quoted self flag from a spaced compiled path", async () => {
+    // Refuse an inherited original runtime-surface marker before any spaced
+    // fixture mutation (server, root, staging); the helper's entry guard is
+    // defense in depth.
+    const surfaceMarker = inheritedRuntimeSurfaceMarker();
+    if (surfaceMarker !== undefined) {
+      throw new Error(`inherited runtime-surface marker ${surfaceMarker} refuses the spaced preload scenario`);
+    }
     const server = await startTestServer();
     const bootstrap = makeBootstrap(server.socketPath);
-    // Compiled output copied into a temporary tree whose paths contain spaces,
+    // Compiled output staged into a temporary tree whose paths contain spaces,
     // matching the authorized host's quoted-path launch form.
     const root = mkdtempSync(join(tmpdir(), "sh preload "));
     try {
-      for (const [from, to] of [
-        [join(__dirname, "../src/pi.js"), join(root, "src/pi.js")],
-        [join(__dirname, "../src/session-host/protocol.js"), join(root, "src/session-host/protocol.js")],
-        [join(__dirname, "../src/session-host/reporter.js"), join(root, "src/session-host/reporter.js")],
-        [join(__dirname, "../src/session-host/bootstrap-preload.js"), join(root, "src/session-host/bootstrap-preload.js")],
-      ]) {
-        mkdirSync(dirname(to), { recursive: true });
-        copyFileSync(from, to);
-      }
+      // The exact staged module closure the spaced preload and reporter load:
+      // six explicit compiled leaves under one shared ownership ledger, each
+      // descriptor-checked and written exclusively; no stubs, no dynamic
+      // substitution, no tree copying.
+      stageModuleClosure(root, [
+        { relative: "src/pi.js", source: join(__dirname, "..", "src/pi.js") },
+        { relative: "src/session-host/protocol.js", source: join(__dirname, "..", "src/session-host/protocol.js") },
+        { relative: "src/session-host/reporter.js", source: join(__dirname, "..", "src/session-host/reporter.js") },
+        { relative: "src/session-host/bootstrap-preload.js", source: join(__dirname, "..", "src/session-host/bootstrap-preload.js") },
+        { relative: "src/session-host/native-persistence.js", source: join(__dirname, "..", "src/session-host/native-persistence.js") },
+        { relative: "src/session-host/owned-activity.js", source: join(__dirname, "..", "src/session-host/owned-activity.js") },
+      ]);
       const spacedPreload = join(root, "src/session-host/bootstrap-preload.js");
       assert.ok(spacedPreload.includes(" "), "fixture preload path contains spaces");
 
       // Malformed and oversized restoration frames must both fall back to the
       // quote-aware strip of the spaced self flag.
       for (const restoreFrame of ["malformed", JSON.stringify({ original: "é".repeat(5_000) })]) {
-        const { status, markerData, output } = await runPreloadedChild({
+        const { status, markerData, userFixturePath } = await runPreloadedChild({
           bootstrap,
           restoreFrameFor: () => restoreFrame,
           nodeOptionsFor: (userFixture) => `${nodeRequireOption(spacedPreload, true)} ${nodeRequireOption(userFixture, true)}`,
@@ -2797,10 +3365,11 @@ describe("session-host bootstrap preload", () => {
           fixturesRoot: root,
           reporterPath: join(root, "src/session-host/reporter.js"),
         });
-        assert.equal(status, 0, `preloaded child exits cleanly (spaced self flag stripped)\n${output}`);
+        assert.equal(status, 0, "preloaded child exits cleanly (spaced self flag stripped)");
+        assert.ok(userFixturePath.includes(" "), "per-invocation fixture directory stays inside the spaced tree");
         assert.equal(
           markerData.userFixture.nodeOptions,
-          nodeRequireOption(join(root, "fixtures/user-fixture.js"), true),
+          nodeRequireOption(userFixturePath, true),
           "user fixture receives exactly the original NODE_OPTIONS",
         );
         assert.ok(
@@ -2816,7 +3385,8 @@ describe("session-host bootstrap preload", () => {
         );
       }
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      // Retain the spaced tree and every per-invocation fixture directory/marker
+      // as evidence; only the test server is torn down.
       await server.close();
     }
   });

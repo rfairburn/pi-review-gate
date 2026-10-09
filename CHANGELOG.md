@@ -45,6 +45,20 @@ dates.
   fences. Answer completion clears observed pending status without inventing
   lifecycle events or inferring clearance from idle state (#323).
 
+### Known limitations
+
+- Windows hosted **Main** mouse routing remains unresolved (#334): the pane does not
+  accept ordinary terminal mouse tracking/SGR reporting, so terminal-like selection
+  can span panes and wheel input can move editor history rather than the full
+  conversation. Windows remains experimental and uncertified, with no proven cause.
+  The mouse-specific assertion is temporarily deferred to that ticket, not fixed;
+  production ownership guards and the remaining tests stay enabled.
+- The recurring Windows delegated Pi RPC descendant-proof launch failure remains
+  unresolved (#335). The Windows-only alias-independent RPC case is temporarily
+  deferred to that ticket, not fixed; production ownership guards and the remaining
+  tests stay enabled. Ordinary standalone launchers, POSIX behavior, and shared
+  native configuration remain unchanged.
+
 ## [0.1.0-dev.127]
 
 ### Fixed

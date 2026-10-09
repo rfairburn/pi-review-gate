@@ -16,10 +16,24 @@ verification.
 Component, mock, or socket tests alone do not prove compatibility with a real native
 Pi wrapper. macOS and Linux are the intended POSIX host platforms; intended platform
 scope is not evidence that end-to-end runtime compatibility has been proven. Windows
-startup, public named-pipe, and pinned node-pty ConPTY source paths are being prepared
-for native validation only. Source implementation is not Windows runtime support or
-readiness evidence: the parent phase still requires real Windows Node 22.19 and 24
-Main, PTY, kernel, graceful-shutdown, and terminal-restoration tests.
+startup, public named-pipe, and pinned node-pty ConPTY source paths are experimental
+only; they are not Windows runtime support or readiness evidence. The Windows hosted
+mouse path is a known unresolved limitation in this prerelease (see below). The parent
+phase still requires real Windows Node 22.19 and 24 Main, PTY, kernel,
+graceful-shutdown, and terminal-restoration evidence.
+
+## Known limitation: Windows hosted mouse
+
+In this prerelease the Windows hosted **Main** pane does not accept ordinary terminal
+mouse tracking/SGR reporting, so normal terminal-like selection can span panes and
+wheel input can move editor history instead of scrolling the full conversation. This
+is an unresolved functional routing limitation, not deferred smoothness and not the
+separate sidebar-click feature, and its underlying cause is not established. It is not
+a Windows compatibility promise: Windows source paths remain experimental and
+uncertified. This limitation is tracked in
+https://github.com/rfairburn/pi-review-gate/issues/334, and its fix is not part of
+this prerelease. The parent phase still requires the Windows Main, PTY, kernel,
+graceful-shutdown, and terminal-restoration evidence noted above.
 
 ## Requirements and launch
 
@@ -312,7 +326,10 @@ Pi menu will remain readable.
 
 The intended mouse path is cell-based and applies only to the active native frame;
 events outside that frame are dropped before coordinate translation, never clamped to
-the pane edge. Pixel-coordinate mouse reporting and
+the pane edge. On Windows that path is a known unresolved limitation in this
+prerelease: the hosted Main pane does not accept ordinary mouse tracking/SGR reporting,
+so terminal-like selection and wheel scrolling behave as described in the known
+limitation above rather than as routed mouse input. Pixel-coordinate mouse reporting and
 terminal-focus forwarding are not supported, and the alpha makes no promise of mouse
 controls for the host sidebar. Keyboard negotiation is designed around independent
 Kitty keyboard flags 1, 2, and 4, preserves modified Enter through Pi's

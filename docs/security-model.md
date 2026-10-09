@@ -13,9 +13,12 @@ accept from an untrusted repository, task, or process environment:
   inherited value from a parent pi session cannot redirect the gate).
 - `PI_CODING_AGENT_DIR` — Pi's native override of the Pi agent directory, which also
   relocates implicitly discovered review-gate config
-  ([Configuration](configuration.md#config-discovery)) and the private non-Git review
+  ([Configuration](configuration.md#config-discovery)), the private non-Git review
   checkpoint records under `sessions/pi-review-gate/`
-  ([Review workflow](review-workflow.md#non-git-checkpoint-storage)).
+  ([Review workflow](review-workflow.md#non-git-checkpoint-storage)), and the optional
+  `pi-review-sessions` host's global sidebar roster plus its single-host ownership
+  record under `session-host/`
+  ([Session host](session-host-alpha.md#requirements-and-launch)).
 - `PI_REVIEW_GATE_DISABLED` — the documented kill switch.
 - `PI_REVIEW_GATE_DDGS_VENV`, `XDG_CACHE_HOME` / `HOME` — venv and cache locations for
   the web search bridge. The default venv lives in a user-writable cache by design.
@@ -55,6 +58,32 @@ integration, ConPTY behavior, and restoration remain incomplete and require sepa
 native-platform validation. This IPC support does not establish Windows host parity,
 delivery readiness, security equivalence with the POSIX filesystem boundary, or a
 private Windows ACL guarantee.
+
+### Session-host global roster and single-host ownership
+
+The optional `pi-review-sessions` host stores one ordered sidebar roster and one
+exclusive ownership record in the canonical Pi agent directory's private
+`session-host/` subdirectory. Both are ordinary user-owned files: the roster holds only
+remembered session ids, explicit workspaces, and bounded display names (never
+transcripts, tool arguments, question text, or credentials), and the ownership record
+holds an opaque host id, the owning process id, and the agent directory path. The state
+directory is created mode `0700`, the roster is published mode `0600` through a
+same-directory exclusive temporary file plus atomic rename, and the ownership record is
+created mode `0600` with an exclusive create. Both files are read descriptor-based with a
+pre-open type check and a bounded, never-blocking, no-follow open, so a symlinked, FIFO,
+device, replaced, oversized, or malformed entry is refused instead of being opened,
+followed, or read; an unsafe entry is preserved untouched. That exclusive create is the whole
+arbitration: an existing or unreadable ownership record refuses startup before any
+child exists, and the record is never stolen, repaired, or bypassed by process
+inspection or signalling. It is removed only by the host that created it, and only after
+every owned child's exit was positively confirmed with settlement evidence; an
+unconfirmed or unconfirmable child-exit state keeps it (a forced termination alone does
+not, once exit is confirmed). A malformed,
+oversized,
+unsafe, or unreadable roster is reported truthfully and left untouched, so a damaged
+read can never erase or silently overwrite valid remembered state. This is not a
+sandbox: another process running with the user's authority can read or modify these
+files and the recorded workspaces exactly as it can the native conversations themselves.
 
 ## Web egress hardening
 

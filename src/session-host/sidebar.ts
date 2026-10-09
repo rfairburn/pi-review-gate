@@ -97,6 +97,12 @@ export interface SidebarItem {
   readonly lifecycle: "starting" | "alive" | "exited" | "error";
   /** True only while the host still owns the instance's native process handle. */
   readonly hasLiveProcess?: boolean;
+  /**
+   * True only for a remembered conversation that owns no process and cannot be
+   * restarted (its row is a bounded placeholder, not a session). Such an entry
+   * is never activatable: Enter must not change focus or input ownership.
+   */
+  readonly unavailable?: boolean;
   /** true/false when observed; null means unknown (never rendered as false). */
   readonly busy: boolean | null;
   readonly pendingInput: boolean | null;
@@ -824,6 +830,7 @@ function copyItem(item: SidebarItem): SidebarItem {
     agentDir: typeof item.agentDir === "string" ? item.agentDir : "",
     lifecycle: item.lifecycle,
     ...(typeof item.hasLiveProcess === "boolean" ? { hasLiveProcess: item.hasLiveProcess } : {}),
+    ...(item.unavailable === true ? { unavailable: true } : {}),
     busy: item.busy,
     pendingInput: item.pendingInput,
     inputSurface: item.inputSurface,
@@ -1642,6 +1649,13 @@ export class SidebarController {
       return;
     }
     if (entry.kind === "item" && entry.item !== undefined) {
+      if (entry.item.unavailable === true) {
+        // A remembered conversation that owns no process never becomes the Main
+        // input owner: refusing here leaves focus and input ownership exactly
+        // where they were instead of handing the child input to a sibling.
+        this.noticeError = "This remembered conversation is unavailable; remove it to forget it";
+        return;
+      }
       if (entry.item.lifecycle === "exited") {
         if (this.pendingRowResume) { this.noticeError = "This conversation is already starting"; return; }
         const requestId = this.nextRequestId++;

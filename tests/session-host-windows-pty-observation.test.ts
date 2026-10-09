@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import test from "node:test";
+import { types as nodeUtilTypes } from "node:util";
 import { runInNewContext } from "node:vm";
 
 // SYNTHETIC exact-source observer contracts only. No native PTY, process,
@@ -13,7 +14,7 @@ const source = readFileSync(resolve(__dirname, "../../tests/fixtures/session-hos
 const declaration = source.slice(source.indexOf("function observePtyModule("), source.indexOf("module.exports"));
 assert.ok(declaration.startsWith("function observePtyModule("));
 
-function fixture(options: { failJournal?: boolean; throwKill?: boolean; immediatePid?: number } = {}) {
+function fixture(options: { failJournal?: boolean; throwKill?: boolean; immediatePid?: number; spawnOptions?: Record<string, unknown> } = {}) {
   const records: Record<string, unknown>[] = [];
   const dataListeners: ((data: string) => void)[] = [];
   const exitListeners: ((event: { exitCode: number }) => void)[] = [];
@@ -42,6 +43,7 @@ function fixture(options: { failJournal?: boolean; throwKill?: boolean; immediat
   const module = { spawn: originalSpawn };
   const install = runInNewContext(`${declaration}\nobservePtyModule`, {
     process: { platform: "win32", on: (name: string, handler: () => void) => { assert.equal(name, "exit"); exitHandlers.push(handler); } },
+    types: nodeUtilTypes,
     appendMetadata: (_destination: string, record: Record<string, unknown>) => {
       if (options.failJournal) throw new Error("SYNTHETIC journal failure");
       records.push({ ...record });
@@ -52,7 +54,7 @@ function fixture(options: { failJournal?: boolean; throwKill?: boolean; immediat
     restore(): void;
   };
   const observation = install(module, "/synthetic/journal");
-  const args = ["SYNTHETIC-node", ["SYNTHETIC-cli"], { cwd: "/synthetic/workspace" }];
+  const args = ["SYNTHETIC-node", ["SYNTHETIC-cli"], options.spawnOptions ?? { cwd: "/synthetic/workspace" }];
   assert.equal(Reflect.apply(module.spawn, module, args), handle, "observer returns the identical public handle");
   assert.equal(spawnReceiver, module, "original spawn receiver is preserved");
   assert.equal(spawnArguments[0], args[0]);
@@ -110,4 +112,31 @@ test("synthetic observation failure and changed public PID can never qualify as 
   changed.data(735);
   assert.equal(changed.observation.snapshot().journalFailed, true);
   assert.equal(changed.records.find(r => r.type === "pty_spawn")!.pid, 734, "first observed identity is not silently replaced");
+});
+
+test("synthetic Windows PTY observation journals the genuine bundled-ConPTY spawn option without invoking accessors", () => {
+  const on = fixture({ spawnOptions: { cwd: "/synthetic/workspace", useConptyDll: true } });
+  assert.equal(on.records[0]!.conptyDll, true,
+    "an own boolean-true data value is the genuine bundled-ConPTY selection production forwarded");
+  const off = fixture({ spawnOptions: { cwd: "/synthetic/workspace", useConptyDll: false } });
+  assert.equal(off.records[0]!.conptyDll, false, "an explicit false is not silently promoted");
+  const absent = fixture();
+  assert.equal(absent.records[0]!.conptyDll, false, "an absent option is never guessed as bundled");
+  let getterReads = 0;
+  const accessor = fixture({
+    spawnOptions: {
+      cwd: "/synthetic/workspace",
+      get useConptyDll() { getterReads += 1; return true; },
+    },
+  });
+  assert.equal(accessor.records[0]!.conptyDll, false, "an accessor is refused rather than trusted");
+  assert.equal(getterReads, 0, "the bundled-ConPTY observation never invokes an accessor");
+  let descriptorTraps = 0;
+  const proxy = fixture({
+    spawnOptions: new Proxy({ cwd: "/synthetic/workspace", useConptyDll: true }, {
+      getOwnPropertyDescriptor() { descriptorTraps += 1; throw new Error("descriptor trap must not run"); },
+    }),
+  });
+  assert.equal(proxy.records[0]!.conptyDll, false, "proxy options are refused before descriptor inspection");
+  assert.equal(descriptorTraps, 0, "the bundled-ConPTY observation never invokes a proxy descriptor trap");
 });

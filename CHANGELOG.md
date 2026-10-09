@@ -15,6 +15,32 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.133]
+
+### Changed
+
+- The optional Windows session host selects the Microsoft ConPTY implementation
+  bundled with the pinned public `@lydell/node-pty` dependency instead of Windows'
+  inbox implementation; its real Windows acceptance fixtures request the same
+  public option. Hermetic native fixtures deny ambient project resources without
+  changing user trust policy and require the complete geometry-wrapped Quit pane.
+  POSIX PTYs, ordinary standalone launchers, and input/ownership/shutdown safeguards
+  are unchanged.
+
+### Known limitations
+
+- Manual Windows validation observed clicks working. That observation does not
+  certify other physical mouse input or runtime parity: wheel/conversation
+  scrolling, pane-confined selection, complete original Main/outer process
+  settlement, the cold hosted launchers, and full terminal restoration remain
+  unproven. The real native Main case and both cold hosted-source wrapper legs stay
+  explicitly skipped, so green CI still does not certify Windows runtime support
+  (#345).
+- A cosmetic child-pane flicker on pointer movement and clicks has been observed; it
+  is not breakage and not a release blocker (#343).
+- Native Pi/review-gate startup latency on Windows has been present since before this
+  release and is unrelated to it (#344).
+
 ## [0.1.0-dev.132]
 
 ### Changed

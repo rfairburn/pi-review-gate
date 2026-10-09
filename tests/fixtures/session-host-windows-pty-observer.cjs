@@ -167,14 +167,37 @@ function observePtyModule(nodePty, ptyJournal, options = {}) {
       return undefined; // unsupported/foreign: private binding stays unknown
     }
   };
+  /**
+   * TESTONLY bounded observation of the public Windows bundled-ConPTY spawn
+   * option. It reads ONLY the own data descriptor of `options.useConptyDll`,
+   * before the original spawn and without ever invoking an accessor or a
+   * proxy trap; an absent, accessor, proxy, or non-`true` input is reported as
+   * `false`, never guessed. This is the genuine runtime option production hands
+   * the pinned public `@lydell/node-pty`, not a source or env restatement, and
+   * not independent evidence that a particular DLL was loaded.
+   */
+  const captureConptyDll = (args) => {
+    try {
+      const spawnOptions = args[2];
+      if (spawnOptions === null || typeof spawnOptions !== 'object') return false;
+      if (types.isProxy(spawnOptions)) return false; // refused before any descriptor trap
+      const descriptor = Object.getOwnPropertyDescriptor(spawnOptions, 'useConptyDll');
+      if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) return false;
+      return descriptor.value === true;
+    } catch {
+      return false; // unsupported/foreign: reported as not selected, never guessed
+    }
+  };
   const observedSpawn = function observedSpawn(...args) {
     // Preserve the real receiver, exact arguments, spawn errors, and handle.
     const offeredBootstrap = captureOfferedBootstrap(args);
+    const conptyDll = captureConptyDll(args);
     const handle = Reflect.apply(originalSpawn, this, args);
     const spawnOptions = args[2];
     const record = {
       incarnation: ownedHandles.length + 1,
       cwd: spawnOptions && typeof spawnOptions.cwd === 'string' ? spawnOptions.cwd : undefined,
+      conptyDll,
     };
     const owner = {
       handle, record, exited: false, observationFailed: false, pidChanged: false,

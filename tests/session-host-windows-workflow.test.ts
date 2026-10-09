@@ -449,10 +449,18 @@ test("alpha launcher acceptance exercises both real source wrappers with require
     "frame-wait diagnostics must be fixed-metadata only and never read terminal content");
   assert.doesNotMatch(launcherHelper, /frame=\$\{|; frame=/,
     "no diagnostic may interpolate a terminal frame");
+  assert.match(launcherHelper, /useConptyDll: true/,
+    "the launcher outer transport must select the same bundled public ConPTY as the shipped source path");
+  assert.doesNotMatch(launcherHelper, /useConpty\s*:/,
+    "the deprecated ignored useConpty hint is never used by the launcher outer transport");
 
   const harness = readFileSync(join(projectRoot, "tests", "helpers", "session-host-native-windows-harness.ts"), "utf8");
   assert.match(harness, /Windows native Main acceptance requires public Pi 1\.1\.0/,
     "the independently required direct Main lane must pin the same exact Pi 1.1.0 fixture");
+  assert.match(harness, /useConptyDll: true/,
+    "the direct Main outer transport must select the same bundled public ConPTY as the shipped source path");
+  assert.doesNotMatch(harness, /useConpty\s*:/,
+    "the deprecated ignored useConpty hint is never used by the direct Main outer transport");
 });
 
 test("alpha installs no .NET SDK or external toolchain", () => {
@@ -472,4 +480,25 @@ test("the opt-in Main test fails closed without its Windows prerequisites", () =
     "the runtime resolver must fail closed off Windows");
   assert.match(harness, /Windows native Main acceptance requires explicit staged candidate and pinned public Pi runtime env/,
     "missing pinned runtime/candidate env must fail closed after opt-in");
+});
+
+test("Windows bundled-ConPTY and geometry-aware Quit witness corrections stay in place", () => {
+  const observer = readFileSync(join(projectRoot, "tests", "fixtures", "session-host-windows-pty-observer.cjs"), "utf8");
+  assert.match(observer, /conptyDll,\n\s*\};/,
+    "the shared PTY observer journals the genuine inner spawn bundled-ConPTY boolean");
+  assert.doesNotMatch(observer, /PRG334/,
+    "the bundled-ConPTY selection must never depend on a test-only env switch");
+
+  const harnessSource = readFileSync(join(projectRoot, "tests", "helpers", "session-host-native-windows-harness.ts"), "utf8");
+  assert.match(harnessSource, /windowsQuitConfirmationFrameMatches\(/,
+    "the direct Main confirmation uses the exact canonical-row witness at the actual pane geometry");
+  assert.doesNotMatch(harnessSource, /isQuitConfirmationFrame\(/,
+    "the direct Main confirmation never falls back to the substring membership witness");
+  assert.doesNotMatch(harnessSource, /frame\.includes\("2 session\(s\) starting, alive, or host-owned"\)/,
+    "the unwrapped whole-frame count substring is not a valid 32-column confirmation witness");
+  const launcherHelperSource = readFileSync(join(projectRoot, "tests", "helpers", "session-host-native-windows-launcher.ts"), "utf8");
+  assert.match(launcherHelperSource, /windowsQuitConfirmationFrameMatches\(/,
+    "the launcher confirmation uses the same exact canonical-row witness");
+  assert.doesNotMatch(launcherHelperSource, /isQuitConfirmationFrame\(/,
+    "the launcher confirmation never falls back to the substring membership witness");
 });

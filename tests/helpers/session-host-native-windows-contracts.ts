@@ -1,4 +1,7 @@
-/** Pure, runtime-independent contracts shared by the Windows native test harness. */
+/** Shared Windows native acceptance contracts; Quit witnesses use the production renderer. */
+
+import { SidebarController, type SidebarItem } from "../../src/session-host/sidebar";
+import { stripGeneratedSgr } from "../../src/session-host/terminal-surface";
 
 export interface FileIdentity {
   readonly dev: bigint;
@@ -200,4 +203,84 @@ export function requireFolderCompletedObservation(
     throw new Error("direct submission is not completion evidence; a verified folder completion is required before submission");
   }
   return observation;
+}
+
+/**
+ * The complete canonical 32-column Quit confirmation sidebar rows for one
+ * expected owned-live count at the exact pane geometry. The rows are derived
+ * from the real public `SidebarController` with a freshly rendered confirmation
+ * pane, so they stay byte-identical to what production draws for that count
+ * (including the wrapped count rows and both hint rows). Returns `undefined` if
+ * the public controller cannot render the confirmation at this geometry.
+ */
+export function windowsQuitConfirmationCanonicalRows(
+  liveCount: number,
+  sidebarColumns: number,
+  sidebarRows: number,
+): string[] | undefined {
+  if (!Number.isSafeInteger(liveCount) || liveCount < 1
+    || !Number.isSafeInteger(sidebarColumns) || sidebarColumns < 1
+    || !Number.isSafeInteger(sidebarRows) || sidebarRows < 1) return undefined;
+  try {
+    const controller = new SidebarController();
+    const items: SidebarItem[] = Array.from({ length: liveCount }, (_, index) => ({
+      id: `windows-quit-expected-${index}`,
+      label: `windows-quit-expected-${index}`,
+      workspace: "/owned/windows-quit-expected",
+      agentDir: "/owned/windows-quit-agent",
+      lifecycle: "alive",
+      busy: false,
+      pendingInput: false,
+      inputSurface: false,
+      activity: [],
+    }));
+    controller.updateItems(items);
+    controller.handleInput("q");
+    if (controller.focus !== "confirm") return undefined;
+    const lines = controller.render(sidebarColumns, sidebarRows).lines.map(stripGeneratedSgr);
+    // A matching "pane too small" render is never confirmation authority.
+    // Validate all ordered semantic content independently before comparing the
+    // actual pane against these canonical rows (including blank-row geometry).
+    const content = lines.map((line) => line.trim()).filter(Boolean).join(" ");
+    const complete = `Quit host? ${liveCount} session(s) starting, alive, or host-owned enter/y = quit host esc/n = cancel`;
+    if (lines.length !== sidebarRows || content !== complete) return undefined;
+    return lines;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Strict Windows-only Quit confirmation witness. Unlike the shared 32-column
+ * membership witness (which whitespace-normalizes the sidebar and substring
+ * checks the count), this derives the complete canonical sidebar rows for the
+ * exact expected owned-live count from the real public `SidebarController` at
+ * the exact pane geometry and requires the actual composed frame's ordered,
+ * complete sidebar rows to equal them byte-for-byte after stripping generated
+ * SGR. A drifted count (for example 12 when 2 are expected), a duplicated or
+ * reordered header/count/hint row, a corrupted body, or a partial pane all fail
+ * closed. POSIX and saved-conversation paths keep the shared membership witness
+ * unchanged.
+ */
+export function windowsQuitConfirmationFrameMatches(
+  frame: string,
+  expectedLiveCount: number,
+  sidebarColumns: number,
+  sidebarRows: number,
+  totalRows: number,
+): boolean {
+  if (!Number.isSafeInteger(totalRows) || totalRows < 2) return false;
+  const expected = windowsQuitConfirmationCanonicalRows(expectedLiveCount, sidebarColumns, sidebarRows);
+  if (expected === undefined) return false;
+  const rows = frame.split("\n");
+  if (rows.length !== totalRows) return false;
+  // Row 0 is the compositor header; every later row is the sidebar|divider|native
+  // panes. Require the divider at the actual pane boundary: native-only output
+  // with a hidden sidebar is not confirmation authority. Normalize both sources
+  // to the same fixed pane width; trailing padding is not meaningful content.
+  const paneRows = rows.slice(1).map(stripGeneratedSgr);
+  if (paneRows.some((line) => line[sidebarColumns] !== "│")) return false;
+  const actual = paneRows.map((line) => line.slice(0, sidebarColumns).padEnd(sidebarColumns));
+  const canonical = expected.map((line) => line.slice(0, sidebarColumns).padEnd(sidebarColumns));
+  return actual.length === canonical.length && actual.every((line, index) => line === canonical[index]);
 }

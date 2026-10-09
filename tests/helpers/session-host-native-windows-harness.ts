@@ -39,6 +39,7 @@ import {
   renderedTitleMatches,
   selectedRosterEntry,
   sidebarRosterHidden,
+  SIDEBAR_COLUMNS,
 } from "./session-host-native-roster-witness";
 import { isCompleteMainFocusedRoster } from "./session-host-native-row-lifecycle";
 import {
@@ -51,6 +52,7 @@ import {
   classifyFirstWorkspaceEnter,
   requireFolderCompletedObservation,
   windowsDirectoryCompletionCandidates,
+  windowsQuitConfirmationFrameMatches,
   sameFileIdentity,
   validateWindowsExitWitness,
   type FileIdentity,
@@ -233,6 +235,8 @@ export interface NativePtyModule {
       cwd: string;
       env: NodeJS.ProcessEnv;
       encoding: "utf8";
+      /** Public Windows-only option selecting the ConPTY DLL bundled with the pinned node-pty. */
+      useConptyDll?: boolean;
     },
   ): NativePtyHandle;
 }
@@ -617,6 +621,42 @@ export function createNativeAgentRoot(root: string): string {
   return agentDir;
 }
 
+/**
+ * The one supported synthetic-native-agent settings boundary. Pi's
+ * `resolveProjectTrusted` (core/project-trust.js) gates any workspace under a
+ * `.agents/skills` ancestor behind its interactive "Trust project folder?"
+ * prompt. The harness gives the native child a disposable fake HOME while the
+ * owned workspace stays under the real user profile tree, so the real
+ * `~/.agents/skills` becomes an untrusted project resource ancestor of every
+ * owned workspace. An unconfigured synthetic agent therefore shows that prompt,
+ * which the harness never answers: a genuine native child blocks and never
+ * reaches session_start. Explicitly DENYING project trust in the disposable
+ * synthetic agent's own settings makes Pi skip those ambient resources without
+ * a prompt, so the harness keeps a hermetic boundary and never trusts or loads
+ * real user configuration. Production policy and the user's own agent
+ * directory are untouched; only the task-created synthetic agent root is
+ * configured.
+ */
+export function ownedNativeSettings(): { defaultProjectTrust: "never" } {
+  return { defaultProjectTrust: "never" };
+}
+
+/**
+ * Writes the synthetic native agent root's deterministic settings before any
+ * native child is spawned. Refuses a non task-created agent directory and an
+ * already-present settings file (exclusive create), so it can never change an
+ * unowned root's policy or clobber user state.
+ */
+export function denyAmbientNativeProjectTrust(nativeAgentDir: string): void {
+  assertCreatedDirectoryIdentity(nativeAgentDir);
+  assertRealDirectory(nativeAgentDir);
+  writeFileSync(join(nativeAgentDir, "settings.json"), `${JSON.stringify(ownedNativeSettings(), null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+    flag: "wx",
+  });
+}
+
 export function boundedJsonl<T extends object>(path: string, maximumBytes = MAX_JOURNAL_BYTES): T[] {
   try {
     const stats = lstatSync(path, { bigint: true });
@@ -793,6 +833,11 @@ interface MainResult {
 
 export class WindowsMainPtyDriver {
   readonly pty: NativePtyHandle;
+  /**
+   * The bundled-ConPTY option requested by this driver's public outer spawn.
+   * This records the request, not independent runtime backend activation.
+   */
+  readonly outerUseConptyDll: boolean;
   readonly root: string;
   readonly optionsFile: string;
   readonly resultFile: string;
@@ -841,6 +886,7 @@ export class WindowsMainPtyDriver {
 
   private constructor(options: {
     pty: NativePtyHandle;
+    outerUseConptyDll: boolean;
     root: string;
     optionsFile: string;
     resultFile: string;
@@ -853,6 +899,7 @@ export class WindowsMainPtyDriver {
     providerWatcher: FSWatcher;
   }) {
     this.pty = options.pty;
+    this.outerUseConptyDll = options.outerUseConptyDll;
     this.root = options.root;
     assertCreatedDirectoryIdentity(this.root);
     // The census root chain is retained from driver creation, never
@@ -989,16 +1036,21 @@ export class WindowsMainPtyDriver {
     const logWatcher = watch(options.root);
     const nativeWatcher = watch(dirname(observerFile));
     const providerWatcher = watch(options.fixtureState);
+    // Request the same public bundled-ConPTY option as the shipped source path.
+    // Retain the requested boolean, without treating it as independent proof of
+    // backend activation or successful mouse/device-attributes behavior.
+    const outerSpawnOptions = {
+      name: "xterm-256color",
+      cols: WINDOWS_OUTER_COLS,
+      rows: WINDOWS_OUTER_ROWS,
+      cwd: process.cwd(),
+      env: hostEnv,
+      encoding: "utf8" as const,
+      useConptyDll: true,
+    };
     let pty: NativePtyHandle;
     try {
-      pty = options.runtime.pty.spawn(process.execPath, [runnerFixture], {
-        name: "xterm-256color",
-        cols: WINDOWS_OUTER_COLS,
-        rows: WINDOWS_OUTER_ROWS,
-        cwd: process.cwd(),
-        env: hostEnv,
-        encoding: "utf8",
-      });
+      pty = options.runtime.pty.spawn(process.execPath, [runnerFixture], outerSpawnOptions);
     } catch (error) {
       logWatcher.close();
       nativeWatcher.close();
@@ -1012,6 +1064,7 @@ export class WindowsMainPtyDriver {
     try {
       return new WindowsMainPtyDriver({
         pty,
+        outerUseConptyDll: outerSpawnOptions.useConptyDll,
         root: options.root,
         optionsFile,
         resultFile,
@@ -1871,10 +1924,6 @@ export class WindowsMainPtyDriver {
     if (this.parserError) throw this.parserError;
     const modes = this.modeSnapshots;
     const bracketedPasteObserved = modes.some((mode) => mode.bracketedPaste);
-    // Diagnostic-only observation while the Windows Main mouse/SGR witness is
-    // deferred (see the TODO(#334) block below): the value is still recorded
-    // and reported in the bounded failure diagnostic, but it is no longer a
-    // gate anywhere in this method.
     const mouseTrackingSgrObserved = modes.some((mode) => mode.mouseTracking !== "none" && mode.mouseEncoding === "sgr");
     const nonBaselineKeyboardObserved = modes.some((mode) => mode.kittyFlags > 0 || mode.applicationCursorKeys || mode.applicationKeypad || mode.modifyOtherKeys > 0);
     // Only a real failure pays for the bounded metadata-only diagnostic, and
@@ -1887,36 +1936,12 @@ export class WindowsMainPtyDriver {
       : ` (${this.modeWitnessDiagnostic()}${this.mainCensus === undefined ? "" : ` ${formatMainCensusDiagnostic(this.mainCensus)}`}${this.nativeCensus === undefined ? "" : ` ${formatNativeCensusDiagnostic(this.nativeCensus)}`})`;
     assert.ok(this.sawAlternateEnter, `actual Main output entered the outer VT alternate buffer${diagnostic}`);
     assert.ok(bracketedPasteObserved, `actual outer VT observed Main bracketed-paste negotiation${diagnostic}`);
-    // TODO(#334): temporarily deferred, mouse-only assertion. On genuine
-    // Windows the observed outer VT Main mouse/SGR witness is absent. The
-    // native original stdout offers a positive mouse/tracking value, while the
-    // original inner receive reported supported mouse 0 and the parsed pane
-    // reported none/default. Neither the kernel's raw bytes nor a
-    // ConPTY-specific cause is proven, and the offered native-stdout count is
-    // not mode proof of the current mode. This Windows-only observation is deferred
-    // rather than weakened in production: the production mouse routing, mode
-    // negotiation, and every other live gate in this method are untouched.
-    // Restore this assertion byte-for-byte, and re-gate
-    // mouseTrackingSgrObserved above, once
-    // https://github.com/rfairburn/pi-review-gate/issues/334 lands the genuine
-    // Windows native mouse-routing fix and the witness is observed on the real
-    // Windows native path. The alternate-buffer, bracketed-paste, non-baseline
-    // keyboard, device-attributes, and Kitty-query assertions remain live.
-    // assert.ok(mouseTrackingSgrObserved,
-    //   `actual outer VT observed Main mouse tracking and SGR encoding${diagnostic}`);
+    assert.ok(mouseTrackingSgrObserved,
+      `actual outer VT observed Main mouse tracking and SGR encoding${diagnostic}`);
     assert.ok(nonBaselineKeyboardObserved,
       `actual outer VT observed a non-baseline keyboard mode during Main ownership${diagnostic}`);
-    // TODO(#337): temporarily deferred, device-attributes-only assertion. The
-    // expected device-attributes reply was not observed in either Windows
-    // 22.19/24 alpha lane; the preceding live alternate-buffer, paste, and
-    // non-baseline-keyboard checks passed. The
-    // valid query/reply contract and cause are unknown — a newly exposed
-    // Windows terminal-query compatibility question, not a proven ConPTY or
-    // application defect. Restore this assertion byte-for-byte once
-    // https://github.com/rfairburn/pi-review-gate/issues/337 lands a validated
-    // genuine Windows fix and the reply is observed on the real path.
-    // assert.ok(this.replyLog.some((reply) => /^\x1b\[\?[\d;]*c$/.test(reply)),
-    //   "actual outer ConPTY answered the real public device-attributes query");
+    assert.ok(this.replyLog.some((reply) => /^\x1b\[\?[\d;]*c$/.test(reply)),
+      "actual outer ConPTY answered the real public device-attributes query");
     assert.ok(this.replyLog.some((reply) => /^\x1b\[\?\d+u$/.test(reply)),
       "actual outer ConPTY answered the real public Kitty keyboard-state query");
   }
@@ -1959,10 +1984,9 @@ export class WindowsMainPtyDriver {
     await this.moveRosterTo("Quit host");
     const before = this.frameRevision;
     this.pty.write(WINDOWS_KEYS.enter);
-    await this.waitFrame((frame) => frame.includes("Quit host?")
-      && frame.includes("2 session(s) starting, alive, or host-owned")
-      && frame.includes("enter/y = quit host"),
-    "Quit with both live native children requires the real public confirmation pane", before);
+    await this.waitFrame((frame) => windowsQuitConfirmationFrameMatches(
+      frame, 2, SIDEBAR_COLUMNS, WINDOWS_OUTER_ROWS - 1, WINDOWS_OUTER_ROWS),
+      "Quit with both live native children requires the real public confirmation pane", before);
     assert.equal(this.ptyRecords().filter((entry) => entry.type === "pty_exit").length, 0,
       "confirmed Quit is requested while both actual native PTY handles are still live");
     this.pty.write(WINDOWS_KEYS.enter);

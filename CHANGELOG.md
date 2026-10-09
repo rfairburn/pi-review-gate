@@ -70,6 +70,34 @@ dates.
   claim is made. It belongs to the broader #334 Windows-host follow-up. Production
   ownership guards and the remaining tests stay enabled.
 
+## [0.1.0-dev.128]
+
+### Fixed
+
+- A Claude Code executor no longer ends its run on a successful turn result while
+  native background work is still running (#218). The adapter tracks the Agent SDK's
+  authoritative `background_tasks_changed` level signal — the complete live background
+  task set under replace semantics, covering Bash `run_in_background` commands and
+  background subagents — and holds a successful result instead of treating it as final
+  while that set is non-empty. The streaming session stays open, so live steering and
+  explicit interruption keep working, and once the level reports no live task the
+  adapter requests one inspection turn so the worker reads the completed task results
+  before normal settlement, and a later turn that replaces or interrupts that
+  inspection earns a replacement inspection so normal success always follows a
+  completed one; a failed turn result stays terminal and is never replaced by a later
+  turn. The configured executor timeout is unchanged and remains the
+  absolute bound of the whole run — unlike the Pi executor's verified process-group
+  readiness, native Claude background work never suspends it — and cancellation,
+  interruption, steering retargeting, and research restrictions are unchanged. When a
+  successful background launch is never reported in the SDK membership level, that
+  membership is malformed, or the stream ends while background work is still
+  outstanding, the run fails closed as a protocol failure instead of normalizing on a
+  result that predates the unfinished work; a rejected background launch is not treated
+  as in flight, and earlier membership evidence never discharges a later launch — a
+  launch is verified only by a membership update reported at or after it started.
+  Terminal results that cannot be correlated to the current completion target are
+  buffered rather than treated as that target's outcome.
+
 ## [0.1.0-dev.127]
 
 ### Fixed

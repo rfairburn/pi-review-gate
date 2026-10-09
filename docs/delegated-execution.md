@@ -893,6 +893,35 @@ review. Executor timeouts are suspended while verified background work remains a
 (a POSIX process group or Windows owned job); external or unparseable `ShellStart`
 success responses fail closed.
 
+A Claude Code executor keeps its Agent SDK streaming session open for the same purpose
+through the SDK's authoritative `background_tasks_changed` level signal rather than
+through its own process bookkeeping. While that level reports any live native
+background task — Bash `run_in_background` commands and background subagents alike — a
+successful turn result is held rather than treated as final, and the session keeps
+accepting steering and interruption. Once the level reports no live task, the adapter
+requests one inspection turn so the worker reads the completed task results before
+normal settlement, so a job that drained before the turn result arrived is still
+inspected without repeating the follow-up indefinitely; a later turn that replaces or
+interrupts that inspection before it completes earns a replacement inspection, so
+normal success always follows a completed inspection. A failed turn result stays
+terminal and is never replaced by a later turn, and a drain that arrives while steering
+owns completion keeps its obligation until that target's own result is handled. Unlike
+the Pi executor, the configured
+executor timeout is not suspended: it remains the absolute bound on the whole run, so
+background work that never completes ends the run as a timeout, and the existing
+cancellation and interruption semantics are unchanged.
+
+That level signal is authoritative and per-process, and earlier evidence never covers a later
+launch: each background launch is verified only by a membership update reported at or after
+it started. A successful native background launch with no such update, malformed membership
+evidence, or a stream that ends while background work is still outstanding fails closed: the
+run is reported as a protocol failure instead of normalizing on a result that predates the
+unfinished work. A rejected background launch is not treated as in flight, no other tool is
+inferred to background work, and native background state is never reconstructed from model
+prose. A terminal result that cannot be correlated to the current completion target — a
+foreign or untagged result — is buffered rather than treated as that target's outcome, and
+the configured timeout remains the absolute bound when no correlated result arrives.
+
 An exit wake remains outstanding until its custom message is observed. If a Pi run
 settles first, one hidden recovery turn resumes drainage of Pi's retained follow-up
 queue; the extension does not enqueue a duplicate completion or clear unrelated

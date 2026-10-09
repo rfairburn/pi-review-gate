@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.131]
+
+### Changed
+
+- The optional Windows session host selects the Microsoft ConPTY implementation
+  bundled with the pinned public `@lydell/node-pty` dependency instead of Windows'
+  inbox implementation; its real Windows acceptance fixtures request the same
+  public option. Hermetic native fixtures deny ambient project resources without
+  changing user trust policy and require the complete geometry-wrapped Quit pane.
+  POSIX PTYs, ordinary standalone launchers, and input/ownership/shutdown safeguards
+  are unchanged. Windows runtime cases remain explicitly deferred: protocol
+  observations do not certify physical mouse behavior, complete original Main/outer
+  process settlement, cold hosted launchers, or full terminal restoration (#334).
+
 ## [0.1.0-dev.130]
 
 ### Added

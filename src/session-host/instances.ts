@@ -361,6 +361,11 @@ interface LoadedNodePty {
 		rows: number;
 		cwd: string;
 		env: NodeJS.ProcessEnv;
+		/**
+		 * Windows-only public option of the pinned node-pty: prefer the ConPTY
+		 * DLL bundled with the platform package over the host's system ConPTY.
+		 */
+		useConptyDll?: boolean;
 	}): IPty;
 }
 
@@ -398,6 +403,12 @@ export function createDefaultPtyFactory(): PtyFactory {
 			rows: descriptor.rows,
 			cwd: descriptor.cwd,
 			env: descriptor.env,
+			// Windows-only: explicitly select the ConPTY DLL bundled with the
+			// pinned public @lydell/node-pty instead of the host's system ConPTY,
+			// so the shipped source path matches the acceptance transport.
+			// POSIX options are unchanged, and the deprecated ignored
+			// `useConpty` hint is never set.
+			...(process.platform === "win32" ? { useConptyDll: true } : {}),
 		});
 	};
 }

@@ -32,6 +32,7 @@ import {
   randomDigits,
   resolveWindowsRuntime,
   sameFileIdentity,
+  denyAmbientNativeProjectTrust,
   type WindowsOwnedSession,
 } from "./helpers/session-host-native-windows-harness";
 import { SIDEBAR_COLUMNS, frameHeader, frameHeaderMatches } from "./helpers/session-host-native-roster-witness";
@@ -68,6 +69,12 @@ test.skip("real public Main exits two live Windows ConPTY native Pi sessions thr
 
   const nativeAgentDir = createNativeAgentRoot(root);
   assertCreatedDirectoryIdentity(nativeAgentDir);
+  // Pi would otherwise gate these owned workspaces behind its interactive
+  // "Trust project folder?" prompt (untrusted real-home `.agents/skills`
+  // ancestor under the harness's disposable fake HOME), which the harness never
+  // answers. Deny project trust in this task-created synthetic agent root so the
+  // child never prompts and never loads or trusts ambient user resources.
+  denyAmbientNativeProjectTrust(nativeAgentDir);
   const observerFile = join(observerDirectory, "native-main.jsonl");
   const providerJournal = join(fixtureState, "provider-journal.jsonl");
   const driver = WindowsMainPtyDriver.start({
@@ -99,6 +106,8 @@ test.skip("real public Main exits two live Windows ConPTY native Pi sessions thr
   await driver.waitFrame((frame) => frame.includes("Welcome") && frame.includes("New session") && frame.includes("Quit host"),
     "actual public runSessionHost renders its welcome frame inside the owned outer Windows ConPTY");
   const originalMainPid = driver.admitOriginalMainPid();
+  assert.equal(driver.outerUseConptyDll, true,
+    "the outer acceptance transport requests bundled ConPTY through the public spawn option, without independently attesting backend activation");
   assert.ok(typeof originalMainPid === "number" && originalMainPid > 1,
     "the exact owned outer ConPTY exposes its positive public PID after real output, not synchronously at spawn");
   assert.ok(existsSync(nativeAgentDir), "one fresh ordinary native agent root is shared by both children");
@@ -192,6 +201,8 @@ test.skip("real public Main exits two live Windows ConPTY native Pi sessions thr
     const starts = childPtyRecords.filter((record) => record.type === "pty_spawn"
       && record.pid === session.record.pid && record.cwd && samePathForTest(record.cwd, session.workspace));
     assert.equal(starts.length, 1, `${session.label} session_start PID/cwd is cross-bound to its actual public node-pty spawn`);
+    assert.equal(starts[0]!.conptyDll, true,
+      `${session.label} original inner public spawn journal records the bundled-ConPTY option request before any behavior comparison`);
     assert.equal(childPtyRecords.some((record) => record.type === "pty_exit" && record.pid === session.record.pid), false,
       `${session.label} has no exit before intentional confirmed Quit`);
     const observer = new WindowsOwnedExitObserver({

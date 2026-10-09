@@ -598,6 +598,62 @@ test("public SidebarController renders wrapped Quit confirmation at the 32-colum
     "the native-frame predicate reads only the rendered 32-column sidebar, not Main's wider content pane");
 });
 
+// The corrected geometry-aware witness must reject every partial, stale, or
+// foreign stand-in: a footer-only pane, a missing header/count, altered hints,
+// a mismatched live count, or the same text appearing only in the wider native
+// content pane are all non-evidence for the sidebar confirmation body.
+test("the 32-column Quit confirmation witness rejects missing, altered, count-drifted, and native-pane-only bodies", () => {
+  const renderConfirm = (liveIds: readonly string[]): string[] => {
+    const controller = new SidebarController();
+    controller.updateItems(liveIds.map((id) => ({
+      id,
+      label: id,
+      workspace: "/owned/workspace",
+      agentDir: "/owned/native-agent",
+      lifecycle: "alive",
+      busy: false,
+      pendingInput: false,
+      inputSurface: false,
+      activity: [],
+    })));
+    controller.handleInput("q");
+    assert.equal(controller.focus, "confirm");
+    return controller.render(32, 50).lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  };
+  const compose = (sidebar: readonly string[], native = "native surface"): string =>
+    ["Session host", ...sidebar.map((line) => `${line.slice(0, 32).padEnd(32)}│${native}`)].join("\n");
+  const complete = renderConfirm(["saved-process-a", "new-process-b"]);
+  assert.equal(isQuitConfirmationFrame(compose(complete), 2), true,
+    "the genuine complete rendered 32-column confirmation is accepted");
+
+  const footerOnly = complete.filter((line) => /enter\/y = quit host|esc\/n = cancel/.test(line));
+  assert.equal(isQuitConfirmationFrame(compose(footerOnly), 2), false,
+    "footer hints alone never prove the confirmation body");
+  const noCount = complete.filter((line) => !/session\(s\)/.test(line));
+  assert.equal(isQuitConfirmationFrame(compose(noCount), 2), false,
+    "a missing owned/live session count is rejected");
+  const noHeader = complete.filter((line) => !/Quit host\?/.test(line));
+  assert.equal(isQuitConfirmationFrame(compose(noHeader), 2), false,
+    "a missing confirmation header is rejected");
+  const noHints = complete.filter((line) => !/enter\/y = quit host|esc\/n = cancel/.test(line));
+  assert.equal(isQuitConfirmationFrame(compose(noHints), 2), false,
+    "missing confirmation hints are rejected");
+  assert.equal(isQuitConfirmationFrame(compose(complete), 1), false,
+    "a mismatched owned/live count is rejected even when every row is present");
+  const alteredHints = compose(complete).replace("esc/n = cancel", "esc/n = close");
+  assert.equal(isQuitConfirmationFrame(alteredHints, 2), false,
+    "altered confirmation hint text is rejected");
+  const corruptedHeader = compose(complete).replace("Quit host?", "Quit hosts");
+  assert.equal(isQuitConfirmationFrame(corruptedHeader, 2), false,
+    "a corrupted confirmation header is rejected");
+  const nativePaneOnly = ["Session host", ...complete.map((line) => `${" ".repeat(32)}│${line}`)].join("\n");
+  assert.equal(isQuitConfirmationFrame(nativePaneOnly, 2), false,
+    "the same text appearing only in the wider native content pane is never sidebar body authority");
+  const staleSingleLine = compose([complete.join(" ")]);
+  assert.equal(isQuitConfirmationFrame(staleSingleLine, 2), false,
+    "a single flattened line outside the canonical 32-column rows is rejected");
+});
+
 // The synthetic contract is deliberately separate from native UI evidence: it
 // verifies only that the append-only ledger never keys process labels by cwd.
 test("pure process-incarnation ledger retains same-cwd processes and /new binding history", () => {

@@ -215,7 +215,8 @@ nodeTest("the staged compile plan is a direct installed-TypeScript invocation wi
     "the compiler entry is the real JS file, never a .bin or cmd shell shim");
   assert.deepEqual(plan.args, ["-p", join(stage, "tsconfig.json")],
     "the compile is a direct tsc project invocation, never `npm run build`");
-  assert.doesNotMatch(String(plan.env.PATH ?? ""), /node_modules[/\\]\.bin/u, "the compile PATH never gains a node_modules/.bin entry");
+  assert.equal(plan.env.PATH, fixtureEnv(fixture).PATH,
+    "the compile preserves the exact caller PATH, including inherited npm entries, without adding a stage .bin shim");
   assert.equal(plan.env.NODE_OPTIONS, SYNTHETIC_NODE_OPTIONS, "the original caller startup options plus the synthetic fixture flag are preserved for the compile");
   assert.equal(plan.env.ANTHROPIC_API_KEY, "provider-secret", "trusted provider variables are preserved for the compile");
   assert.equal(existsSync(join(stage, "dist")), false, "no output exists before the compiled stage runs");

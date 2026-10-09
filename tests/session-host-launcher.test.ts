@@ -977,13 +977,14 @@ test("production source-build runs in an owned staging root and preserves the li
   const stagingRoot = invocation.cwd;
   // The compile runs against an owned staging package root under the agent
   // directory cache — never the live checkout — as one direct TypeScript
-  // project invocation through public Node, with no `.bin` PATH shim.
+  // project invocation through public Node, without adding a `.bin` PATH shim.
   assert.equal(compilePlans.length, 1, "the compile phase is a single direct TypeScript invocation");
   const compilePlan = compilePlans[0];
   assert.equal(compilePlan.compilerCli, join(stagingRoot, "node_modules", "typescript", "bin", "tsc"), "the compile uses the stage's own installed TypeScript CLI");
   assert.deepEqual(compilePlan.args, ["-p", join(stagingRoot, "tsconfig.json")], "the compile is a direct tsc project invocation, never `npm run build`");
   assert.equal(compilePlan.cwd, stagingRoot);
-  assert.doesNotMatch(String(compilePlan.env.PATH ?? ""), /node_modules[/\\]\.bin/u, "the compile PATH never gains a node_modules/.bin shim entry");
+  assert.equal(compilePlan.env.PATH, env.PATH,
+    "the compile preserves the exact caller PATH, including inherited npm entries, without adding a stage .bin shim");
   const agentDir = join(fixture.root, ".pi", "agent");
   assert.ok(stagingRoot.startsWith(`${agentDir}/.pi-review-gate/build/pi-review-sessions-`), `staged root must be owned: ${stagingRoot}`);
   // The host receives the staged root so every runtime lookup stays in the stage.

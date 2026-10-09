@@ -116,6 +116,8 @@ for (const leg of LAUNCHER_LEGS) {
       -1, LAUNCHER_STARTUP_TIMEOUT_MS);
     assert.ok(typeof driver.pty.pid === "number" && Number.isSafeInteger(driver.pty.pid) && driver.pty.pid > 1,
       "the exact owned outer ConPTY exposes its positive public PID after real output, not synchronously at spawn");
+    assert.equal(driver.outerUseConptyDll, true,
+      "the outer launcher transport requests bundled ConPTY through the public spawn option, without independently attesting backend activation");
     assert.equal(existsSync(join(layout.nativeAgentDir, ".pi-review-gate", "build")), true,
       "the real launcher created its owned source build stage under the per-leg agent root");
     assert.deepEqual(driver.records(), [], "no native lifecycle record exists before Workspace-only New");
@@ -205,6 +207,8 @@ for (const leg of LAUNCHER_LEGS) {
       const starts = childPtyRecords.filter((record) => record.type === "pty_spawn"
         && record.pid === session.record.pid && record.cwd && samePathForTest(record.cwd, session.workspace));
       assert.equal(starts.length, 1, `${session.label} session_start PID/cwd is cross-bound to its actual public node-pty spawn`);
+      assert.equal(starts[0]!.conptyDll, true,
+        `${session.label} original inner public spawn journal records the bundled-ConPTY option request before any behavior comparison`);
       assert.equal(childPtyRecords.some((record) => record.type === "pty_exit" && record.pid === session.record.pid), false,
         `${session.label} has no exit before intentional confirmed Quit`);
       // No observer is created after the leg is cancelled.

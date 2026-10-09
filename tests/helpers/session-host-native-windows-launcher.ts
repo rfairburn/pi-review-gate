@@ -43,6 +43,7 @@ import {
   isSidebarFocusedFrame,
   selectedRosterEntry,
   sidebarRosterHidden,
+  SIDEBAR_COLUMNS,
 } from "./session-host-native-roster-witness";
 import {
   assertNativeEditorFieldEmpty,
@@ -50,6 +51,7 @@ import {
   classifyFirstWorkspaceEnter,
   requireFolderCompletedObservation,
   windowsDirectoryCompletionCandidates,
+  windowsQuitConfirmationFrameMatches,
 } from "./session-host-native-windows-contracts";
 import {
   ChangeSignal,
@@ -74,6 +76,7 @@ import {
   resolveInstalledPiRuntime,
   safeWindowsPath,
   sameFileIdentity,
+  denyAmbientNativeProjectTrust,
   writeOwnedFile,
   type FileIdentity,
   type NativeJournalRecord,
@@ -273,6 +276,12 @@ export function createLauncherLegLayout(leg: LauncherLegName): LauncherLegLayout
     workspaceA: createOwnedDirectory(workspaces, "a"),
     workspaceB: createOwnedDirectory(workspaces, "b"),
   };
+  // Pi gates these owned workspaces behind its interactive "Trust project
+  // folder?" prompt (untrusted real-home `.agents/skills` ancestor under the
+  // harness's disposable fake HOME). Deny project trust in this task-created
+  // synthetic agent root so the child never prompts and never loads or trusts
+  // ambient user resources.
+  denyAmbientNativeProjectTrust(layout.nativeAgentDir);
   for (const ownedDirectory of [layout.root, layout.home, layout.temporary, layout.cache, layout.stateRoot,
     layout.fixtureState, layout.observerDirectory, layout.exitObserverRoot, layout.nativeAgentDir,
     workspaces, layout.workspaceA, layout.workspaceB]) assertCreatedDirectoryIdentity(ownedDirectory);
@@ -461,6 +470,11 @@ export function assertNativeRestoration(records: readonly PtyJournalRecord[], na
 
 export class LauncherPtyDriver {
   readonly pty: NativePtyHandle;
+  /**
+   * The bundled-ConPTY option requested by this driver's public outer spawn.
+   * This records the request, not independent runtime backend activation.
+   */
+  readonly outerUseConptyDll: boolean;
   readonly leg: LauncherLegName;
   readonly root: string;
   readonly observerFile: string;
@@ -493,6 +507,7 @@ export class LauncherPtyDriver {
 
   private constructor(options: {
     pty: NativePtyHandle;
+    outerUseConptyDll: boolean;
     leg: LauncherLegName;
     root: string;
     observerFile: string;
@@ -505,6 +520,7 @@ export class LauncherPtyDriver {
     providerWatcher: FSWatcher;
   }) {
     this.pty = options.pty;
+    this.outerUseConptyDll = options.outerUseConptyDll;
     this.leg = options.leg;
     this.root = options.root;
     this.observerFile = options.observerFile;
@@ -621,16 +637,21 @@ export class LauncherPtyDriver {
     const logWatcher = watch(layout.root);
     const nativeWatcher = watch(layout.observerDirectory);
     const providerWatcher = watch(layout.fixtureState);
+    // Request the same public bundled-ConPTY option as the shipped source path.
+    // Retain the requested boolean, without treating it as independent proof of
+    // backend activation or successful mouse/device-attributes behavior.
+    const outerSpawnOptions = {
+      name: "xterm-256color",
+      cols: LAUNCHER_OUTER_COLS,
+      rows: LAUNCHER_OUTER_ROWS,
+      cwd: process.cwd(),
+      env,
+      encoding: "utf8" as const,
+      useConptyDll: true,
+    };
     let pty: NativePtyHandle;
     try {
-      pty = runtime.pty.spawn(file, args, {
-        name: "xterm-256color",
-        cols: LAUNCHER_OUTER_COLS,
-        rows: LAUNCHER_OUTER_ROWS,
-        cwd: process.cwd(),
-        env,
-        encoding: "utf8",
-      });
+      pty = runtime.pty.spawn(file, args, outerSpawnOptions);
     } catch (error) {
       logWatcher.close();
       nativeWatcher.close();
@@ -640,7 +661,7 @@ export class LauncherPtyDriver {
     // Public ConPTY publishes pid asynchronously after its data pipe connects.
     // Wire the exact returned handle immediately, including failure teardown.
     try {
-      return new LauncherPtyDriver({ pty, leg: options.layout.leg, root: layout.root, observerFile, providerJournal, ptyJournal, forceJournal, deadline: options.deadline, logWatcher, nativeWatcher, providerWatcher });
+      return new LauncherPtyDriver({ pty, outerUseConptyDll: outerSpawnOptions.useConptyDll, leg: options.layout.leg, root: layout.root, observerFile, providerJournal, ptyJournal, forceJournal, deadline: options.deadline, logWatcher, nativeWatcher, providerWatcher });
     } catch (error) {
       writeMetadata(forceJournal, { type: "outer_pty_force_attempt", pid: Number(pty.pid) });
       try { pty.kill(); } catch { /* exact newly owned public outer PTY, no signal */ }
@@ -958,10 +979,9 @@ export class LauncherPtyDriver {
     await this.moveRosterTo("Quit host");
     const before = this.frameRevision;
     this.write(WINDOWS_KEYS.enter, "request quit confirmation");
-    await this.waitFrame((frame) => frame.includes("Quit host?")
-      && frame.includes("2 session(s) starting, alive, or host-owned")
-      && frame.includes("enter/y = quit host"),
-    "Quit with both live native children requires the real public confirmation pane", before);
+    await this.waitFrame((frame) => windowsQuitConfirmationFrameMatches(
+      frame, 2, SIDEBAR_COLUMNS, LAUNCHER_OUTER_ROWS - 1, LAUNCHER_OUTER_ROWS),
+      "Quit with both live native children requires the real public confirmation pane", before);
     assert.equal(this.ptyRecords().filter((entry) => entry.type === "pty_exit").length, 0,
       "confirmed Quit is requested while both actual native PTY handles are still live");
     this.write(WINDOWS_KEYS.enter, "confirm quit host");

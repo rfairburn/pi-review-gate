@@ -53,7 +53,7 @@ function makeTestRoot(label: string): string {
   return realpathSync(mkdtempSync(join(process.cwd(), `.prg-instances-${label}-`)));
 }
 
-test("synthetic Windows default PTY factory lazily delegates the unchanged descriptor to public node-pty spawn", () => {
+test("synthetic Windows default PTY factory lazily delegates the unchanged descriptor to public node-pty with bundled ConPTY", () => {
   const processPlatform = Object.getOwnPropertyDescriptor(process, "platform");
   assert.ok(processPlatform);
   let moduleLoads = 0;
@@ -92,11 +92,62 @@ test("synthetic Windows default PTY factory lazily delegates the unchanged descr
         rows: 37,
         cwd: descriptor.cwd,
         env,
+        useConptyDll: true,
       },
     });
     assert.ok(captured && typeof captured.options === "object" && captured.options !== null);
+    assert.equal(Object.hasOwn(captured.options, "useConptyDll"), true,
+      "win32 explicitly selects the public ConPTY DLL bundled with the pinned node-pty");
+    assert.equal((captured.options as { useConptyDll?: unknown }).useConptyDll, true,
+      "the bundled ConPTY selection is the exact public boolean true, never a fallback hint");
     assert.equal(Object.hasOwn(captured.options, "useConpty"), false,
-      "normal node-pty spawn selects its supported Windows ConPTY implementation without a deprecated hint");
+      "the deprecated ignored useConpty hint is never set on any platform");
+  } finally {
+    Object.defineProperty(process, "platform", processPlatform);
+    instanceTestSeam.setNodePtyLoaderForTests(undefined);
+  }
+});
+
+test("POSIX default PTY factory keeps the exact node-pty spawn options without any Windows ConPTY selection", () => {
+  const processPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  assert.ok(processPlatform);
+  let captured: { file: string; args: string[]; options: unknown } | undefined;
+  const ownedPty = {} as unknown as InstancePty;
+  instanceTestSeam.setNodePtyLoaderForTests(() => ({
+    spawn(file, args, options) {
+      captured = { file, args: [...args], options: { ...options } };
+      return ownedPty as unknown as import("@lydell/node-pty").IPty;
+    },
+  }));
+  Object.defineProperty(process, "platform", { ...processPlatform, value: "linux" });
+  try {
+    const factory = createDefaultPtyFactory();
+    const env = { PATH: "/usr/bin" };
+    const descriptor: InstanceSpawnDescriptor = {
+      file: "/usr/bin/node",
+      args: ["/srv/pi/dist/cli.js", "--offline"],
+      env,
+      cwd: "/srv/workspace",
+      cols: 80,
+      rows: 24,
+    };
+    assert.equal(factory(descriptor), ownedPty, "the exact public PTY handle is returned to its owner");
+    assert.deepEqual(captured, {
+      file: descriptor.file,
+      args: descriptor.args,
+      options: {
+        name: "xterm-256color",
+        cols: 80,
+        rows: 24,
+        cwd: descriptor.cwd,
+        env,
+      },
+    }, "POSIX spawn options remain byte-for-byte the same five public fields");
+    assert.ok(captured && typeof captured.options === "object" && captured.options !== null);
+    assert.equal(Object.hasOwn(captured.options, "useConptyDll"), false,
+      "the Windows-only bundled ConPTY DLL selection is never set on a POSIX host");
+    assert.equal(Object.hasOwn(captured.options, "useConpty"), false,
+      "the deprecated ignored useConpty hint is never set on any platform");
   } finally {
     Object.defineProperty(process, "platform", processPlatform);
     instanceTestSeam.setNodePtyLoaderForTests(undefined);

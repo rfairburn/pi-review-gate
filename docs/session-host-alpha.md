@@ -17,31 +17,36 @@ Component, mock, or socket tests alone do not prove compatibility with a real na
 Pi wrapper. macOS and Linux are the intended POSIX host platforms; intended platform
 scope is not evidence that end-to-end runtime compatibility has been proven. Windows
 startup, public named-pipe, and pinned node-pty ConPTY source paths are experimental
-only; they are not Windows runtime support or readiness evidence. The Windows hosted
-mouse path is a known unresolved limitation in this prerelease (see below). A separate
-Windows device-attributes query/reply witness also remains unresolved in this
-prerelease (https://github.com/rfairburn/pi-review-gate/issues/337), with no
-established cause; it belongs to the same broader #334 Windows-host follow-up. The
-upcoming sidebar alpha release defers all Windows sidebar/host runtime acceptance to
+only; they are not Windows runtime support or readiness evidence. Physical Windows
+mouse behavior and complete host-process shutdown remain unverified (see below).
+Device-attributes negotiation also requires complete runtime acceptance; its narrow
+witness investigation is tracked in
+https://github.com/rfairburn/pi-review-gate/issues/337 under the broader #334
+Windows-host follow-up. The sidebar alpha release defers all Windows sidebar/host runtime acceptance to
 https://github.com/rfairburn/pi-review-gate/issues/334: the real native Main case
 (startup, public Quit confirmation, original-process/kernel settlement/restoration)
 and both cold hosted-source wrapper legs (cmd and direct PowerShell) are retained in
 the suite but explicitly skipped, so green CI does not certify Windows runtime
 support; the Windows sidebar/host remains optional experimental.
 
-## Known limitation: Windows hosted mouse
+## Known limitation: Windows runtime acceptance
 
-In this prerelease the Windows hosted **Main** pane does not accept ordinary terminal
-mouse tracking/SGR reporting, so normal terminal-like selection can span panes and
-wheel input can move editor history instead of scrolling the full conversation. This
-is an unresolved functional routing limitation, not deferred smoothness and not the
-separate sidebar-click feature, and its underlying cause is not established. It is not
-a Windows compatibility promise: Windows source paths remain experimental and
-uncertified. This limitation is tracked in
-https://github.com/rfairburn/pi-review-gate/issues/334, and its fix is not part of
-this prerelease. In the upcoming sidebar alpha release the Windows Main, PTY, kernel,
-graceful-shutdown, and terminal-restoration evidence is deferred with the rest of the
-Windows sidebar runtime acceptance to #334 (see above); green CI does not certify it.
+Bundled-ConPTY diagnostics have observed genuine native mouse-tracking/SGR requests
+and device-attributes negotiation. Their assertions are retained in the explicitly
+skipped runtime cases; these observations do not certify physical wheel, click, or
+selection behavior. Local interactive validation must still establish native
+conversation scrolling and pane-confined interaction, rather than editor-history
+navigation or selection crossing host panes. Sidebar single-click activation and
+scroll-smoothness tuning remain separate work.
+
+Complete graceful shutdown is also unresolved: native child exits and a returned Main
+status do not establish original Main and outer/wrapper process settlement. Current
+diagnostics have not established that complete settlement; the pinned ConPTY
+lifecycle is an investigation lead, not proof of the exact retained resource or its
+cause. The genuine Main and cold CMD/direct-PowerShell runtime cases remain deferred
+under https://github.com/rfairburn/pi-review-gate/issues/334. Result files, passing
+subtests, or forced exits cannot replace positive original-process exit and full
+terminal-restoration evidence. Green CI does not certify Windows runtime support.
 
 ## Requirements and launch
 
@@ -56,6 +61,13 @@ Windows sidebar runtime acceptance to #334 (see above); green CI does not certif
 - **Pi:** stable Pi 1.0.4 or newer; the provisioned runtime and native UI
   acceptance fixture are pinned to **1.1.0**, with the matching 1.1.0 TUI dependency.
 - An interactive terminal with both stdin and stdout attached.
+
+The Windows session-host source path selects the Microsoft ConPTY implementation
+bundled with the pinned `@lydell/node-pty` package through its public
+`useConptyDll` option, rather than Windows' inbox ConPTY. The real Windows
+acceptance fixtures request the same public option. This selection alone is not runtime
+support evidence; the acceptance deferrals and limitations above still apply.
+POSIX PTYs and the ordinary standalone launchers are unchanged.
 
 The Windows validation path uses plain Node named pipes with the existing
 per-instance token authorization and the platform's default pipe ACL behavior. It
@@ -381,10 +393,10 @@ Pi menu will remain readable.
 
 The intended mouse path is cell-based and applies only to the active native frame;
 events outside that frame are dropped before coordinate translation, never clamped to
-the pane edge. On Windows that path is a known unresolved limitation in this
-prerelease: the hosted Main pane does not accept ordinary mouse tracking/SGR reporting,
-so terminal-like selection and wheel scrolling behave as described in the known
-limitation above rather than as routed mouse input. Pixel-coordinate mouse reporting and
+the pane edge. On Windows, bundled-ConPTY protocol observations do not certify
+physical mouse behavior: pane-confined selection and native conversation wheel scrolling
+still require interactive validation, as described in the Windows runtime limitation
+above. Pixel-coordinate mouse reporting and
 terminal-focus forwarding are not supported, and the alpha makes no promise of mouse
 controls for the host sidebar. Keyboard negotiation is designed around independent
 Kitty keyboard flags 1, 2, and 4, preserves modified Enter through Pi's

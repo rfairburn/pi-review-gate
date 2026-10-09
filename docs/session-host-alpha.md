@@ -369,7 +369,22 @@ running with your account's authority.
 
 The display is text and SGR styling, not a graphics renderer. The child terminal's
 image/graphics protocol is disabled with `PI_IMAGE_PROTOCOL=none`; native Pi image
-input and model behavior are otherwise unchanged. Normal and alternate child buffers,
+input and model behavior are otherwise unchanged.
+
+Generated frames are drawn through a bounded outer writer whose default minimum
+redraw interval is 16 ms (about 60 fps), matching Pi's native minimum redraw cadence;
+there is no user-facing frame-rate option. Each submitted frame is sanitized and
+clipped synchronously and validated against the complete-frame byte bound before it
+can be drawn. At the next allowed redraw only rows that changed since the last frame
+actually written are emitted: the first frame after start, any geometry change, and
+any actual terminal resize notification (even one that returns to the previous
+dimensions) redraw fully, cursor-only changes emit only the cursor sequence, and
+an unchanged frame emits nothing. Rapid invalidations coalesce so that only the
+newest composed frame is drawn at the next allowed redraw, and when the terminal
+refuses a write (backpressure) only the newest bounded frame is retained until
+drain. This bounds
+output volume; it does not promise a particular on-screen smoothness or physical
+paint timing. Normal and alternate child buffers,
 terminal query replies, and resize state are kept per instance and routed only to that
 same child. Cell widths use the pinned Unicode 11 behavior for CJK, combining marks,
 and basic emoji; newer emoji and complex ZWJ sequences are not guaranteed to match

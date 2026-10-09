@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.131]
+## [0.1.0-dev.132]
 
 ### Changed
 
@@ -28,6 +28,19 @@ dates.
   are unchanged. Windows runtime cases remain explicitly deferred: protocol
   observations do not certify physical mouse behavior, complete original Main/outer
   process settlement, cold hosted launchers, or full terminal restoration (#334).
+
+## [0.1.0-dev.131]
+
+### Fixed
+
+- The optional session host's generated-frame writer now defaults to a 16 ms
+  minimum redraw interval (about 60 fps), matching Pi's native minimum redraw
+  cadence, and emits only rows that changed since the last written frame (full
+  redraw on start, a geometry change, or an actual resize notification — even
+  one that returns to the previous dimensions — cursor-only sequences for
+  cursor moves, no output for unchanged frames); fast invalidation bursts still
+  coalesce to the newest frame and a blocked sink retains only the newest
+  bounded frame (#332).
 
 ## [0.1.0-dev.130]
 

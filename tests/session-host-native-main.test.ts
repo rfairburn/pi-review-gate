@@ -147,6 +147,7 @@ test("the complete restored-native-editor witness rejects stale narrow frames, p
   // A visible controller starts sidebar-focused; draw the roster first so the
   // complete-card fence authorizes the roster-only Alt+Right Main-focus return.
   controller.renderRoster(32, 49);
+  const sidebarFocused = controller.renderRoster(32, 49).lines.map((line) => stripGeneratedSgr(line));
   controller.handleInput(KEYS.altRight);
   assert.equal(controller.focus, "main");
   assert.equal(controller.visible, true);
@@ -176,6 +177,20 @@ test("the complete restored-native-editor witness rejects stale narrow frames, p
     "a stale sidebar-only footer is rejected");
   assert.equal(restoredNativeEditorFrame([ownerLabel, ...Array.from({ length: 49 }, () => "")].join("\n"), options), false,
     "a missing roster and editor are rejected");
+  assert.equal(restoredNativeEditorFrame(compose(sidebarFocused, nativePane(rule, `> ${draft}`, rule)),
+    { ...options, focus: "sidebar" }), true,
+  "the complete sidebar-focused editor with its own footer is accepted");
+  assert.equal(restoredNativeEditorFrame(compose(left, nativePane(rule, `> ${draft}`, rule)),
+    { ...options, focus: "sidebar" }), false,
+  "a stale Main-focused footer is rejected while the sidebar owns focus");
+  const fullWidthRule = "─".repeat(OUTER_COLS);
+  assert.equal(restoredNativeEditorFrame(
+    [ownerLabel, ...nativePane(fullWidthRule, `> ${draft}`, fullWidthRule)].join("\n"),
+    { ...options, nativeWidth: OUTER_COLS, focus: "hidden" },
+  ), true, "the complete full-width editor is accepted while the sidebar is hidden");
+  assert.equal(restoredNativeEditorFrame(compose(left, nativePane(rule, `> ${draft}`, rule)),
+    { ...options, focus: "hidden" }), false,
+  "a still-composed wide sidebar frame is rejected while the sidebar must be hidden");
 });
 
 // Guards the immutable startup-option contract as well as this alpha's
@@ -565,6 +580,14 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
       && record.pid === session.record.pid && record.columns === 87 && record.rows === 49),
      `showing the wide sidebar creates a fresh 87x49 resize for ${session.rowProbe}`);
   }
+  // Reopening reflows B's native child back to the 87-column pane while the
+  // sidebar owns focus, so its repaint is asynchronous. Require the complete
+  // restored sidebar-focused frame for B before reading the draft, exactly as
+  // for A's show transition: a mid-redraw right pane can never pass.
+  await driver.waitFrame((text) => restoredNativeEditorFrame(text, {
+    ownerLabel: labelB, draft: draftB, sidebarColumns: 32,
+    nativeWidth: OUTER_COLS - 32 - 1, focus: "sidebar",
+  }), "the reopened wide sidebar completely redraws B's exact restored sidebar-focused native editor");
   assert.ok(driver.currentText().includes(draftB), "B's native prompt remains visible behind the reopened sidebar");
   assert.equal(processIsAlive(bPid), true, "opening the sidebar does not pause the child");
 
@@ -596,11 +619,29 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   assert.equal(driver.records().filter((record) => record.type === "resize").length, resizeCountBeforeFocus,
     "the focus-first press does not resize any native child");
   await driver.toggleSidebar();
+  // Hiding the sidebar reflows A's native child from the 87-column pane to the
+  // full outer width; its repaint is asynchronous and the focus/hide fence in
+  // toggleSidebar observes only the sidebar pane. Require the genuinely
+  // complete hidden-layout redraw — A's exact owner header, no roster remnant,
+  // and the full-width bordered native editor whose content row is exactly the
+  // unchanged draft — so a mid-reflow or partial child repaint can never pass.
+  await driver.waitFrame((text) => restoredNativeEditorFrame(text, {
+    ownerLabel: labelA, draft: draftA, sidebarColumns: 32, nativeWidth: OUTER_COLS, focus: "hidden",
+  }), "the hide transition completely redraws A's exact full-width native editor");
   assert.equal(driver.sidebarVisible, false, "the next deliberate F8 press hides the sidebar-focused pane");
   assert.equal(driver.focus, "main", "hiding the sidebar returns ownership to Main");
   assert.ok(driver.currentText().includes(draftA), "A's draft remains intact when the second press hides the sidebar");
   assert.equal(processIsAlive(sessionA.record.pid), true, "the actual second F8 press leaves A's child alive");
   await driver.toggleSidebar();
+  // Reopening reflows the child back to the 87-column pane, again with an
+  // asynchronous repaint; the sidebar fence alone can pass while the right pane
+  // is still mid-redraw. Require the complete restored sidebar-focused frame:
+  // A's exact owner header, the full roster with its sidebar-only footer, and
+  // the width-correct bordered editor whose content row is exactly draftA.
+  await driver.waitFrame((text) => restoredNativeEditorFrame(text, {
+    ownerLabel: labelA, draft: draftA, sidebarColumns: 32,
+    nativeWidth: OUTER_COLS - 32 - 1, focus: "sidebar",
+  }), "the show transition completely redraws A's exact restored sidebar-focused native editor");
   assert.ok(driver.currentText().includes(draftA), "F8 reopens the sidebar without altering A's native draft");
   await driver.moveRosterTo(labelB);
   assert.ok(driver.currentText().includes(draftA), "highlighting B does not reroute A's native input");

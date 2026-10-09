@@ -58,6 +58,11 @@ dates.
   deferred to that ticket, not fixed; production ownership guards and the remaining
   tests stay enabled. Ordinary standalone launchers, POSIX behavior, and shared
   native configuration remain unchanged.
+- The Windows device-attributes query/reply witness remains unresolved (#337):
+  the expected device-attributes reply was not observed in either Windows
+  22.19/24 alpha lane, so that single assertion is temporarily deferred to
+  that ticket, not fixed; no cause is established and no Windows compatibility
+  claim is made. Production ownership guards and the remaining tests stay enabled.
 
 ## [0.1.0-dev.127]
 

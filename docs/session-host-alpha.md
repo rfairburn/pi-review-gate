@@ -18,9 +18,11 @@ Pi wrapper. macOS and Linux are the intended POSIX host platforms; intended plat
 scope is not evidence that end-to-end runtime compatibility has been proven. Windows
 startup, public named-pipe, and pinned node-pty ConPTY source paths are experimental
 only; they are not Windows runtime support or readiness evidence. The Windows hosted
-mouse path is a known unresolved limitation in this prerelease (see below). The parent
-phase still requires real Windows Node 22.19 and 24 Main, PTY, kernel,
-graceful-shutdown, and terminal-restoration evidence.
+mouse path is a known unresolved limitation in this prerelease (see below). A separate
+Windows device-attributes query/reply witness also remains unresolved in this
+prerelease (https://github.com/rfairburn/pi-review-gate/issues/337), with no
+established cause. The parent phase still requires real Windows Node 22.19 and 24
+Main, PTY, kernel, graceful-shutdown, and terminal-restoration evidence.
 
 ## Known limitation: Windows hosted mouse
 

@@ -81,10 +81,14 @@ export interface UserQuestionSurface {
    */
   setInteractiveUi(value: boolean): void;
   /**
-   * Capture the live UI surface from a dispatch context (session hooks,
-   * shortcut). The installed host exposes widgets through the event context
-   * (`ctx.ui.setWidget`), not through the extension API object, so the panel
-   * keeps the most recent context that carries a usable setWidget.
+   * Rebind the panel's widget sink to a session_start context. The installed
+   * host exposes widgets through the event context (`ctx.ui.setWidget`), not
+   * through the extension API object, and the session context's live ui
+   * getter keeps the host's wrapped setWidget in the call chain. Every call
+   * retires the previous sink (best-effort clear of its own panel only) — a
+   * new session never renders through an old session's surface. Per-press
+   * shortcut contexts are NOT sinks: their fresh raw ui bypasses observers
+   * of the session surface.
    */
   noteContext(ctx: unknown): void;
   /**
@@ -135,26 +139,46 @@ export function registerUserQuestions(pi: unknown): UserQuestionSurface | undefi
     shortcutRegistered && interactiveUi && controller.currentSessionIdentity() !== undefined;
 
   // The installed host exposes the widget surface only through the event
-  // context (ctx.ui); the extension API object carries no ui member. Keep the
-  // most recent dispatch context that carries a usable setWidget and resolve
-  // its ui live on every refresh (the host's getter re-resolves per access; a
-  // stale context throws and is skipped, leaving no surface — the panel then
-  // simply does not render, and the host clears widgets on invalidation).
+  // context (ctx.ui); the extension API object carries no ui member. The
+  // panel's widget sink is bound to the SESSION context captured at
+  // session_start, whose live ctx.ui getter re-resolves per access so the
+  // host's wrapped setWidget stays in the call chain for every refresh.
+  // Per-press shortcut contexts carry a fresh RAW ui that bypasses any
+  // observer of the session surface: they drive the list (ui.custom, native
+  // editor, idle probe) but never become the panel's sink — a clear through
+  // one would reach the TUI while leaving observers with a stale presence.
   let uiContextSource: Record<string, unknown> | undefined;
+  /** Bumped on every session-bound rebind; fences in-flight UI openings. */
+  let bindingGeneration = 0;
   const noteContext = (ctx: unknown): void => {
-    if (!isRecord(ctx)) return;
-    try {
-      const ui = ctx.ui;
-      if (isRecord(ui) && typeof ui.setWidget === "function") uiContextSource = ctx;
-    } catch {
-      // A stale context's getter may throw; keep the previous surface.
+    // Session boundary: retire the previous sink first, using it only for a
+    // best-effort clear of any panel it displayed — never to show the new
+    // session's questions. A throwing or missing UI on the replacement
+    // retires the old sink too (fail closed: no panel).
+    const previous = uiContextSource;
+    if (previous) {
+      try {
+        const ui = previous.ui;
+        if (isRecord(ui) && typeof ui.setWidget === "function") {
+          ui.setWidget(USER_QUESTION_PANEL_KEY, undefined, { placement: "aboveEditor" });
+        }
+      } catch {
+        // A stale context's getter may throw; the host clears its own
+        // widgets on invalidation.
+      }
     }
+    bindingGeneration += 1;
+    uiContextSource = isRecord(ctx) ? ctx : undefined;
   };
   const resolveWidgetSurface = ():
     | { setWidget(key: string, lines: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }): void }
     | undefined => {
     if (uiContextSource) {
       try {
+        // Resolve the session context's ui live on every refresh (the host's
+        // getter re-resolves per access); a stale context throws and leaves
+        // no surface — the panel then simply does not render, and the host
+        // clears widgets on invalidation.
         const ui = uiContextSource.ui;
         if (isRecord(ui) && typeof ui.setWidget === "function") {
           return ui as {
@@ -209,11 +233,11 @@ export function registerUserQuestions(pi: unknown): UserQuestionSurface | undefi
         description: QUESTION_LIST_DESCRIPTION,
         // The returned promise is ignored by the host dispatcher but lets
         // tests (and diagnostics) await the open attempt. A shortcut press
-        // always carries a live context; note it so the panel can refresh
-        // through it even if an earlier hook context went stale.
+        // carries a fresh per-press context whose raw ui bypasses observers
+        // of the session surface; it drives the list only and never becomes
+        // the panel's widget sink (that stays bound to session_start).
         handler: (ctx: unknown) => {
-          noteContext(ctx);
-          return openQuestionList(pi, controller, ctx);
+          return openQuestionList(pi, controller, ctx, () => bindingGeneration);
         },
       });
       shortcutRegistered = true;
@@ -245,18 +269,41 @@ export function userQuestionsEndSession(controller: UserQuestionController | und
 // Question list UI
 // ----------------------------------------------------------------------
 
-async function openQuestionList(pi: unknown, controller: UserQuestionController, ctx: unknown): Promise<void> {
+async function openQuestionList(
+  pi: unknown,
+  controller: UserQuestionController,
+  ctx: unknown,
+  bindingGenerationNow: () => number,
+): Promise<void> {
   const identity = sessionManagerOf(ctx);
-  // Recheck the originating session before presenting anything: a stale
-  // context (session switched/newed/forked after the key was pressed) must
-  // not open another session's questions.
-  if (!controller.isSessionBound(identity)) return;
+  // Recheck the originating session before presenting anything: a missing or
+  // throwing identity is rejected outright (undefined would otherwise read as
+  // "some session is bound"), and a stale context (session switched/newed/
+  // forked after the key was pressed) must not open another session's
+  // questions.
+  if (identity === undefined || !controller.isSessionBound(identity)) return;
+  const openedAt = bindingGenerationNow();
+  const stale = (): boolean => bindingGenerationNow() !== openedAt;
   if (controller.listPending().length === 0) {
     await sendNotice(pi, "review gate: no pending questions");
     return;
   }
-  const ui = isRecord(ctx) ? (ctx as Record<string, unknown>).ui : undefined;
-  if (!isRecord(ui) || typeof ui.custom !== "function") {
+  // Resolve the per-press ui guarded: a stale context's getter may throw,
+  // and that must fail closed — never reject the handler (the dispatcher
+  // ignores its promise) or retarget the widget sink.
+  let ui: unknown;
+  try {
+    ui = isRecord(ctx) ? (ctx as Record<string, unknown>).ui : undefined;
+  } catch {
+    return; // A throwing ui getter: unavailable.
+  }
+  let custom: unknown;
+  try {
+    custom = isRecord(ui) ? ui.custom : undefined;
+  } catch {
+    return; // A throwing custom getter: unavailable.
+  }
+  if (!isRecord(ui) || typeof custom !== "function") {
     await sendNotice(
       pi,
       `review gate: the pending-question list UI is not available in this host; questions stay pending (${controller.listPending().length} pending)`,
@@ -266,15 +313,74 @@ async function openQuestionList(pi: unknown, controller: UserQuestionController,
   // Load the host pi-tui helpers (width-safe text + raw key matching). A
   // failure degrades rendering/input matching but never blocks the list.
   const tuiHost = await loadQuestionTuiHost().catch(() => undefined);
+  // A session rebind during the load retargets this press: the same
+  // SessionManager object may be reused across /new/resume, so the identity
+  // check alone cannot see it. Never open a stale context's UI.
+  if (stale()) return;
   // Acquire the host-wired native editor BEFORE the custom slot opens:
   // installing the factory mid-slot would make the host swap the visible
   // component. Unavailable seams keep the list open with an unavailable
   // free-text row (choices/Decline still work) — no non-parity fallback.
-  const acquired = await acquireNativeEditorField(ui, { semantics: QUESTION_FIELD_SEMANTICS });
+  // The acquisition sees a generation-guarded view of the per-press ui: if
+  // the session rebinds during its internal host load, the install seam goes
+  // inert so the stale press's editor is never installed into the
+  // replacement session's slot. Reads and notifications forward untouched
+  // (receivers preserved); the bridge then fails closed (no instance).
+  // Read each seam once and guarded: a stale context's getter may throw,
+  // and that must fail closed — never reject the handler (the dispatcher
+  // ignores its promise).
+  let setEditorComponent: ((factory: unknown) => void) | undefined;
+  let getEditorComponent: (() => unknown) | undefined;
+  let notifyUi: ((message: string, type?: string) => void) | undefined;
+  try {
+    const set = ui.setEditorComponent;
+    const get = ui.getEditorComponent;
+    const notify = ui.notify;
+    setEditorComponent = typeof set === "function" ? set as (factory: unknown) => void : undefined;
+    getEditorComponent = typeof get === "function" ? get as () => unknown : undefined;
+    notifyUi = typeof notify === "function" ? notify as (message: string, type?: string) => void : undefined;
+  } catch {
+    return; // A throwing seam getter: unavailable.
+  }
+  // The factory this press installed (sentinel until then), so a stale
+  // ownership-checked restore can still undo its own install.
+  const NO_INSTALLED_FACTORY = Symbol("no-installed-factory");
+  let installedFactory: unknown = NO_INSTALLED_FACTORY;
+  const acquisitionUi: Record<string, unknown> = {
+    notify: notifyUi ? (message: string, type?: string) => notifyUi.call(ui, message, type) : undefined,
+    setEditorComponent: setEditorComponent
+      ? (factory: unknown) => {
+          if (stale()) {
+            // Never install into a replacement session's slot. The single
+            // exception is undoing this press's own install: the bridge's
+            // ownership-checked restore only runs while the slot still holds
+            // our factory.
+            let current: unknown;
+            try {
+              current = getEditorComponent ? getEditorComponent.call(ui) : undefined;
+            } catch {
+              return; // Unreadable slot: leave it alone.
+            }
+            if (current !== installedFactory) return;
+          }
+          installedFactory = factory;
+          setEditorComponent.call(ui, factory);
+        }
+      : undefined,
+    getEditorComponent: getEditorComponent ? () => getEditorComponent.call(ui) : undefined,
+  };
+  const acquired = await acquireNativeEditorField(acquisitionUi, { semantics: QUESTION_FIELD_SEMANTICS });
+  // A session rebind during the acquisition retargets this press as well.
+  if (stale()) {
+    if (acquired.kind === "acquired") acquired.handle.finish();
+    return;
+  }
   const handle: NativeEditorFieldHandle | undefined =
     acquired.kind === "acquired" ? acquired.handle : undefined;
   try {
-    await ui.custom((_tui: unknown, theme: unknown, keybindings: unknown, done: (result?: unknown) => void) => {
+    // The captured method keeps its original ui receiver: receiver-dependent
+    // SDK methods and foreign forwarding wrappers rely on it.
+    await custom.call(ui, (_tui: unknown, theme: unknown, keybindings: unknown, done: (result?: unknown) => void) => {
       // The host captured its saved text before this factory ran; record it
       // and start the field empty so the displaced chat draft can never show
       // or submit as an answer.
@@ -286,6 +392,7 @@ async function openQuestionList(pi: unknown, controller: UserQuestionController,
         tuiHost,
         shortcutLabel: questionShortcutLabel(),
         nativeField: handle?.instance,
+        isStale: stale,
         onDone: () => done(undefined),
       });
       component.setSourceProbe(sourceProbeOf(ctx));
@@ -327,12 +434,19 @@ const QUESTION_FIELD_SEMANTICS: NativeEditorFieldSemantics = {
 
 /** Live idle probe from the dispatch-time context; see QuestionSubmitSource. */
 function sourceProbeOf(ctx: unknown): QuestionSubmitSource | undefined {
-  if (!isRecord(ctx) || typeof ctx.isIdle !== "function") return undefined;
-  const isIdle = ctx.isIdle.bind(ctx);
+  if (!isRecord(ctx)) return undefined;
+  let isIdle: unknown;
+  try {
+    isIdle = (ctx as Record<string, unknown>).isIdle;
+  } catch {
+    return undefined; // A throwing getter: probe unavailable.
+  }
+  if (typeof isIdle !== "function") return undefined;
+  const isIdleFn = (isIdle as () => boolean).bind(ctx);
   return {
     isIdle: () => {
       try {
-        return isIdle();
+        return isIdleFn();
       } catch {
         // A stale probe must not break delivery: treat as idle (plain send).
         return true;
@@ -343,7 +457,12 @@ function sourceProbeOf(ctx: unknown): QuestionSubmitSource | undefined {
 
 function sessionManagerOf(ctx: unknown): unknown {
   if (!isRecord(ctx)) return undefined;
-  const value = (ctx as Record<string, unknown>).sessionManager;
+  let value: unknown;
+  try {
+    value = (ctx as Record<string, unknown>).sessionManager;
+  } catch {
+    return undefined; // A throwing getter: identity unavailable.
+  }
   return typeof value === "object" && value !== null ? value : undefined;
 }
 

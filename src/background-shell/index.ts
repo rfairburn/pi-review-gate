@@ -4,6 +4,8 @@
  * Modified for pi-review-gate; see NOTICE and LICENSES/Apache-2.0.txt.
  */
 import type { ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { onExit } from "signal-exit";
 import { expandableResult, type ToolResultRenderCallback } from "../tool-result-expansion";
 import { isToolCallFingerprint, toolCallFingerprint, type StartLiveness, type SubmittedToolCallFingerprint } from "../tool-call-fingerprint";
 import { spawnBackgroundJob } from "./shell";
@@ -14,6 +16,10 @@ import {
 } from "./ownership";
 import { scheduleForceKill } from "./process";
 import { terminalColumns, truncateLineToWidth } from "./width";
+import {
+  registerOwnedActivitySource,
+  type OwnedActivitySourceHandle,
+} from "../session-host/owned-activity";
 import {
   DEFAULT_RULES,
   LineBuffer,
@@ -207,6 +213,66 @@ interface Job {
 
 const jobs = new Map<string, Job>();
 let seq = 0;
+
+/**
+ * Process-unique prefix for owned-activity tokens. A module incarnation's job
+ * ids restart at 1 on reload, so the prefix (fresh per module instance) plus
+ * the job id is what makes a token globally unique across reloads; a released
+ * token can therefore never remove a newer incarnation's ownership.
+ */
+const ownedActivityTokenPrefix = randomUUID();
+
+function ownedActivityToken(job: Job): string {
+  return `${ownedActivityTokenPrefix}:${job.id}`;
+}
+
+/**
+ * Owned-work observation for native session cards. Registered at module load;
+ * the registry stays inert (no IO, no observation) until the authenticated
+ * session-host reporter opts in, and this registration is replayed then. The
+ * resync only re-acquires tokens of jobs that are still unsettled: it never
+ * releases, because only independently confirmed settlement may do that.
+ */
+let shellOwnedActivity: OwnedActivitySourceHandle | undefined;
+shellOwnedActivity = registerOwnedActivitySource("backgroundShells", "background-shell", {
+  resync: () => {
+    const handle = shellOwnedActivity;
+    if (!handle) return; // module still initializing: `jobs` is empty anyway
+    for (const job of jobs.values()) {
+      if (!job.exited) handle.acquire(ownedActivityToken(job));
+    }
+  },
+});
+
+/**
+ * Pure telemetry decision for one close/error completion signal. Kept separate
+ * so the error-before-close semantics are covered by a synthetic regression
+ * without spawning a process: `release` may release the ownership token only
+ * on an independently confirmed exit (with verified Windows ownership where
+ * applicable); `retain` keeps it positive after a bare error or an unverified
+ * verdict. The caller's ordinary Windows ownership gate is unchanged and runs
+ * before this decision in the live path.
+ */
+function shellCompletionAction(input: {
+  confirmedExit: boolean;
+  verdict: "clear" | "running" | "unverifiable" | undefined;
+}): "release" | "retain" {
+  // Only a confirmed exit may release; a bare error (or a late confirmed close
+  // after one) is judged purely on the settled signal and the ownership verdict.
+  if (!input.confirmedExit) return "retain";
+  if (input.verdict !== undefined && input.verdict !== "clear") return "retain";
+  return "release";
+}
+
+/** Release this job's telemetry token; idempotent, only after confirmed settlement. */
+function releaseOwnedShellActivity(job: Job): void {
+  shellOwnedActivity?.release(ownedActivityToken(job));
+}
+
+/** Narrow pure seam for focused settlement tests; no process or IO is touched. */
+export const __test = Object.freeze({
+  shellCompletionAction,
+});
 let stallTimer: ReturnType<typeof setInterval> | null = null;
 let lifecycleRevision = 0;
 const lifecycleListeners = new Set<(event: BackgroundShellLifecycleEvent) => void>();
@@ -653,6 +719,7 @@ function scheduleOwnershipRelease(pi: BackgroundShellHost, job: Job, code: numbe
     job.ownershipUnverifiable = verdict === "unverifiable";
     if (verdict === "clear") {
       clearOwnershipRelease(job);
+      releaseOwnedShellActivity(job);
       settleJob(pi, job, code);
     }
   }, 1_000);
@@ -681,30 +748,38 @@ function attachStreams(pi: BackgroundShellHost, job: Job): void {
     recordStdinFailure(job, err.code || err.message || "stdin write failed");
   });
 
-  const finish = (code: number | null) => {
-    if (job.exited) return;
+  const finish = (code: number | null, confirmedExit: boolean) => {
     // Windows ownership: the shell root exiting does NOT end the job while
-    // owned descendants remain. Settle only when ownership is verified
-    // complete; a missing record after the root exited keeps the job
-    // accounted for (blocking) rather than clearing it.
-    if (process.platform === "win32" && job.ownership && job.proc.pid !== undefined) {
-      const verdict = ownershipVerdict(
-        job.ownership.markerPath,
-        processIsAlive(job.proc.pid),
-        processIsAlive,
-      );
-      if (verdict !== "clear") {
-        job.ownershipUnverifiable = verdict === "unverifiable";
-        scheduleOwnershipRelease(pi, job, code ?? 0);
-        return;
-      }
+    // owned descendants remain, and a bare ChildProcess 'error' is never proof
+    // of exit. The pure decision below keeps telemetry ownership retained until
+    // independently confirmed settlement; the ordinary ownership gate and
+    // settleJob behavior are unchanged.
+    const windowsOwned = process.platform === "win32" && job.ownership && job.proc.pid !== undefined;
+    const verdict = windowsOwned
+      ? ownershipVerdict(job.ownership!.markerPath, processIsAlive(job.proc.pid), processIsAlive)
+      : undefined;
+    const action = shellCompletionAction({ confirmedExit, verdict });
+    if (job.exited) {
+      // A confirmed close that arrives after an earlier error/abort still
+      // settles telemetry even though the ordinary record is already settled.
+      if (action === "release") releaseOwnedShellActivity(job);
+      return;
     }
+    if (windowsOwned && verdict !== "clear") {
+      job.ownershipUnverifiable = verdict === "unverifiable";
+      scheduleOwnershipRelease(pi, job, code ?? 0);
+      return;
+    }
+    // An error alone (`confirmedExit` false) retains ownership as positive
+    // outstanding; only an actual close (or the verified ownership verdict)
+    // releases it.
+    if (action === "release") releaseOwnedShellActivity(job);
     settleJob(pi, job, code ?? 0);
   };
-  job.proc.on("close", (code) => finish(code ?? 0));
+  job.proc.on("close", (code) => finish(code ?? 0, true));
   job.proc.on("error", (err) => {
     job.buffer.push(`[spawn error] ${String((err as Error)?.message ?? err)}`);
-    finish(-1);
+    finish(-1, false);
   });
 }
 
@@ -797,14 +872,21 @@ export function reapAll(): void {
 /**
  * Reap on any way pi-review-gate can stop.
  *
- * `session_shutdown` covers the orderly path. These cover the rest: ctrl+c,
- * `kill`, a closed terminal, a crash. SIGKILL cannot be caught by anyone, which
- * is exactly why each job also carries its own parent-watchdog (see
- * wrapWithParentWatchdog) — that is the backstop this cannot be.
+ * `session_shutdown` covers the orderly path. The public signal-exit observer
+ * handles supported fatal signals only when they are otherwise unowned; it
+ * never replaces or redispatches listeners owned by the native host or other
+ * extensions. When a host listener owns a signal, its normal shutdown event
+ * continues to reap jobs. The observer callback is synchronous: POSIX groups
+ * receive the existing TERM request, and Windows receives its synchronous
+ * stop-file request. Neither this callback nor the ordinary `exit` fallback
+ * can await escalation. Each job's existing parent/ownership watchdog remains
+ * the backstop for work that outlives the host or cannot be reaped inline.
  *
- * Registered once per process, and the handlers re-raise so we never change
- * pi-review-gate's own exit behaviour.
+ * Registered once per process. Returning no value from the observer preserves
+ * signal-exit's normal signal handling, including the default disposition
+ * when no other handler owns the signal.
  */
+const CLEANUP_SIGNALS = new Set<string>(["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"]);
 let exitHooksInstalled = false;
 function installExitHooks(): void {
   if (exitHooksInstalled) return;
@@ -823,19 +905,9 @@ function installExitHooks(): void {
     }
   });
 
-  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"] as NodeJS.Signals[]) {
-    process.on(sig, () => {
-      reapAll();
-      // Re-raise with our handler removed so the default disposition applies
-      // and our exit code matches what the signal would normally produce.
-      process.removeAllListeners(sig);
-      try {
-        process.kill(process.pid, sig);
-      } catch {
-        process.exit(1);
-      }
-    });
-  }
+  onExit((_code, signal) => {
+    if (signal && CLEANUP_SIGNALS.has(signal)) reapAll();
+  });
 }
 
 function statusOf(job: Job): string {
@@ -946,6 +1018,11 @@ export function registerBackgroundShell(
         ownership,
       };
       jobs.set(id, job);
+      // Owned-work observation: positive ownership starts here and is released
+      // only after independently confirmed settlement (an actual close, or the
+      // Windows ownership verdict proving the tree gone) — never by reapAll()'s
+      // map clear and never by a bare ChildProcess error.
+      shellOwnedActivity?.acquire(ownedActivityToken(job));
       publishLifecycle("started", job);
       attachStreams(pi, job);
       ensureStallTimer(pi);

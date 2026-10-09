@@ -653,8 +653,10 @@ export function replaceReviewGateState(target: ReviewGateState, restored: Review
   target.ownedBundleDirs = restored.ownedBundleDirs;
   target.pendingAcceptedReviewerQuestions = restored.pendingAcceptedReviewerQuestions;
   target.reviewsPaused = restored.reviewsPaused;
-  // A prior process cannot still own an in-process review in this runtime.
+  // Persisted metadata is not a live review owner. A same-process rebind may
+  // still have an older run settling; only that run releases its captured token.
   target.reviewInProgress = false;
+  target.reviewActivityToken = undefined;
   target.queuedUserInputsDuringReview = restored.queuedUserInputsDuringReview;
   target.pendingModelDeliveries = restored.pendingModelDeliveries;
 }

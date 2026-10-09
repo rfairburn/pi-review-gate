@@ -52,6 +52,8 @@ export async function settle(ms = 25): Promise<void> {
 
 export interface FakeBridgeEditor {
   focused: boolean;
+  /** Bridge-owned flag gating the instance's intercepted keys (set by the embedding UI). */
+  fieldActive?: boolean;
   /** Bridge-owned settle callback, set while a field is open around the instance. */
   onFieldSettle?: (value: string | undefined) => void;
   onSubmit?: (text: string) => void;

@@ -75,8 +75,12 @@ receipts of exactly what the model was told.
 
 ## Prerequisites
 
-- Node.js 22.19.0 or newer; this extension's support floor matches Pi 1.0.0's
-  verified minimum (see [Getting started](docs/getting-started.md#prerequisites)).
+- Node.js 22.19.0 or newer for package installation and direct package commands; this
+  extension's support floor matches Pi 1.0.0's verified minimum (see
+  [Getting started](docs/getting-started.md#prerequisites)). The `.sh` and `.cmd`
+  session-host entry points can bootstrap an isolated, checksum-pinned official Node
+  22.19.0 runtime on supported OS/architectures when PATH has no supported Node; a
+  supported PATH Node is retained.
 - Pi 1.0.0 or newer, installed independently; Pi versions below 1.0.0 are outside
   the supported compatibility scope.
 - Git on `PATH` for captured/worktree-based delegated execution (capture, landing,
@@ -130,6 +134,32 @@ On Windows, use the native cmd.exe/PowerShell entry point (no Bash or WSL requir
 ```bat
 scripts\pi-review-gate.cmd
 ```
+
+An optional, separate session-host alpha can run multiple independent native Pi sessions
+in one terminal on macOS/Linux. It does not replace either launcher; see the
+[session-host alpha guide](docs/session-host-alpha.md) for requirements and limitations.
+Launch it with the one-command entry points. They retain a supported Node on PATH or
+bootstrap the source-pinned official Node.js 22.19.0 archive into a fresh extraction
+under an isolated per-agent cache when Node is missing or too old (macOS/Linux x64 or
+arm64; Windows x64, arm64, or x86). Each fallback launch re-extracts rather than
+reusing an existing cache runtime; this does not replace a global Node install or
+change normal user configuration. The launcher also resolves (or provisions) the public
+Pi runtime automatically — no manual Pi CLI path is needed. The `.cmd` entry point
+performs the Node bootstrap. Experimental same-machine Windows source paths for the
+native session-host backend are prepared for validation only: they do not establish
+Windows support, parity, or readiness, and real Windows Node 22.19 and 24 native
+runtime validation remains required. POSIX macOS/Linux remains the supported alpha
+host scope:
+
+```bash
+./scripts/pi-review-sessions.sh   # macOS/Linux source checkout
+```
+
+```bat
+scripts\pi-review-sessions.cmd    # native Windows entry point (experimental validation paths only; no Windows readiness claim)
+```
+
+An installed package exposes the `pi-review-sessions` command.
 
 The persistent launcher selects the Pi agent directory's `review-gate.json`
 (`~/.pi/agent/review-gate.json` by default, following `PI_CODING_AGENT_DIR`), then

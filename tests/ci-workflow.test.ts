@@ -361,7 +361,7 @@ function readPiUiRuntimeManifest(): { dependencies?: Record<string, string> } {
   return JSON.parse(readFileSync(join(projectRoot, "scripts", "ci", "pi-ui-runtime", "package.json"), "utf8"));
 }
 
-function readPiUiRuntimeLock(): { packages?: Record<string, { version?: string }> } {
+function readPiUiRuntimeLock(): { packages?: Record<string, { version?: string; dependencies?: Record<string, string> }> } {
   return JSON.parse(readFileSync(join(projectRoot, "scripts", "ci", "pi-ui-runtime", "package-lock.json"), "utf8"));
 }
 
@@ -379,9 +379,11 @@ test("full-suite installs the locked Pi UI runtime, provisions fd, and requires 
     "the runtime install must be a lockfile-exact ci; live range re-resolution breaks on upstream publish races");
   const manifest = readPiUiRuntimeManifest();
   const pin = manifest.dependencies?.["@earendil-works/pi-coding-agent"];
-  assert.equal(pin, "1.0.2",
-    "the UI runtime must be pinned to exact Pi 1.0.2 in the canonical manifest");
+  assert.equal(pin, "1.1.0",
+    "the UI runtime must be pinned to exact Pi 1.1.0 in the canonical manifest");
   const lock = readPiUiRuntimeLock();
+  assert.equal(lock.packages?.[""]?.dependencies?.["@earendil-works/pi-coding-agent"], pin,
+    "the UI runtime lock root must match the manifest's exact Pi version");
   assert.equal(lock.packages?.["node_modules/@earendil-works/pi-coding-agent"]?.version, pin,
     "the UI runtime lock must freeze the exact pinned version, not a drifted one");
   assert.equal(lock.packages?.["node_modules/@earendil-works/pi-tui"]?.version, pin,
@@ -395,8 +397,8 @@ test("full-suite installs the locked Pi UI runtime, provisions fd, and requires 
     "the real-host helpers must be pointed at the locked runtime, not ambient installs");
   assert.match(full, /PI_REVIEW_GATE_INSTALLED_PI_BIN=\$RUNNER_TEMP\/pi-ui-runtime\/node_modules\/\.bin/,
     "the command-path smoke must resolve the fresh npm-generated pi executable shim");
-  assert.match(full, /PI_REVIEW_GATE_EXPECT_PI_VERSION=1\.0\.2/,
-    "the installed-command smoke must assert exact Pi 1.0.2");
+  assert.match(full, /PI_REVIEW_GATE_EXPECT_PI_VERSION=1\.1\.0/,
+    "the installed-command smoke must assert exact Pi 1.1.0");
   assert.match(full, /PI_REVIEW_GATE_REQUIRE_PI_HOST=1/,
     "the full suite must require real Pi hosts: gated tests fail rather than skip when Pi is missing");
   assert.doesNotMatch(full, /continue-on-error/, "the runtime steps must not be optional");
@@ -650,7 +652,7 @@ test("windows launcher job runs the native .cmd coverage on every enforced trigg
   }
 });
 
-test("native Windows launcher job freshly installs and requires exact Pi 1.0.2 command-path coverage", () => {
+test("native Windows launcher job freshly installs and requires exact Pi 1.1.0 command-path coverage", () => {
   const job = blockOf(readWorkflow(), "windows-launcher", 2);
   const installStart = job.indexOf("      - name: Install fresh locked Pi runtime (native Windows)");
   const smokeStart = job.indexOf("      - name: Installed Pi command RPC and registration smoke (native Windows)");
@@ -676,8 +678,8 @@ test("native Windows launcher job freshly installs and requires exact Pi 1.0.2 c
     "the Windows smoke must load the built candidate extension");
   assert.match(smoke, /PI_REVIEW_GATE_REQUIRE_PI_HOST: "1"/,
     "missing installed-host/bin/candidate prerequisites must hard-fail on Windows");
-  assert.match(smoke, /PI_REVIEW_GATE_EXPECT_PI_VERSION: "1\.0\.2"/,
-    "the native smoke must require the actual Pi CLI to report exact 1.0.2");
+  assert.match(smoke, /PI_REVIEW_GATE_EXPECT_PI_VERSION: "1\.1\.0"/,
+    "the native smoke must require the actual Pi CLI to report exact 1.1.0");
   assert.doesNotMatch(smoke, /continue-on-error|t\.skip\(/,
     "the native installed-command smoke is required, never an optional skip");
 
@@ -689,8 +691,8 @@ test("native Windows launcher job freshly installs and requires exact Pi 1.0.2 c
   }
   assert.match(child, /PI_REVIEW_GATE_REQUIRE_PI_HOST: "1"/,
     "the real child registration cases must fail rather than skip missing Windows prerequisites");
-  assert.match(child, /PI_REVIEW_GATE_EXPECT_PI_VERSION: "1\.0\.2"/,
-    "the Windows real child cases must use the same exact 1.0.2 runtime");
+  assert.match(child, /PI_REVIEW_GATE_EXPECT_PI_VERSION: "1\.1\.0"/,
+    "the Windows real child cases must use the same exact 1.1.0 runtime");
   assert.match(child, /run: node --test dist-test\/tests\/pi-child-launch\.test\.js dist-test\/tests\/pi-child-teardown\.test\.js/,
     "native Windows must also exercise bounded reviewer, RPC executor, and recovery teardown");
 
@@ -705,9 +707,8 @@ test("native Windows launcher job freshly installs and requires exact Pi 1.0.2 c
 });
 
 test("engine floor, CI minimum, and locked Pi fixtures stay consistent", () => {
-  // The package engine floor is the Node requirement declared by the locked
-  // Pi 1.0.2 test runtimes (>=22.19.0), and CI must exercise exactly that
-  // floor as its minimum line — never an older Node.
+  // Keep the package engine floor aligned with CI's minimum line; the
+  // independently pinned Pi test runtimes retain their own version contracts.
   const pkg = readRootPackageJson();
   assert.equal(pkg.engines?.node, ">=22.19.0",
     "the package engine floor must keep the installed Pi runtimes' Node requirement");
@@ -719,14 +720,15 @@ test("engine floor, CI minimum, and locked Pi fixtures stay consistent", () => {
     "CI's minimum matrix entry must exercise the engine floor, never an older Node");
   assert.match(source, /node-version: 22\.19\.0/,
     "the native Windows floor job must exercise the same engine floor");
-  // The locked test runtimes stay at the exact published Pi 1.0.2 release.
+  // The independently useful agent-core fixture stays at Pi 1.0.2; the full
+  // UI fixture tracks the alpha's Pi 1.1.0 pin, above its stable 1.0.4 minimum.
   const agentManifest = JSON.parse(
     readFileSync(join(projectRoot, "scripts", "ci", "pi-agent-runtime", "package.json"), "utf8"),
   ) as { dependencies?: Record<string, string> };
   assert.equal(agentManifest.dependencies?.["@earendil-works/pi-agent-core"], "1.0.2",
     "the agent-core runtime must stay pinned to the exact Pi 1.0.2 release");
-  assert.equal(readPiUiRuntimeManifest().dependencies?.["@earendil-works/pi-coding-agent"], "1.0.2",
-    "the Pi UI runtime must stay pinned to the exact Pi 1.0.2 release");
+  assert.equal(readPiUiRuntimeManifest().dependencies?.["@earendil-works/pi-coding-agent"], "1.1.0",
+    "the Pi UI runtime must stay pinned to the exact Pi 1.1.0 release");
 });
 
 test("activation tests keep the default runtime role in CI", () => {

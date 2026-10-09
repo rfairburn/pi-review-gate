@@ -34,6 +34,13 @@ import { findTriggeringCustomMessage, type ScheduledOrchestratorTurnTracker } fr
 import { sendNoticeUnlessItThrows, sendNoticeWhileSessionActive } from "./diagnostics";
 import { deliverAutomaticTransmission, releaseQueuedUserInputs } from "./pending-delivery";
 import { createReviewAbortController, type ReviewAbortHandle } from "./review-abort";
+import { beginOwnedReviewActivity, endOwnedReviewActivity, registerReviewActivitySource } from "./review-activity";
+
+// Owned-work observation for native session cards: the review source is
+// registered at module load so a session with no active automatic review can
+// still report a known zero. The registry stays inert (no IO, no observation)
+// until the authenticated session-host reporter opts in.
+registerReviewActivitySource();
 
 const orchestratorBackgroundCompletionPrompt = [
   "[pi-review-background-ready] ShellStart work that previously blocked review reached an idle transition.",
@@ -396,6 +403,8 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
   };
 
   const onAgentSettled = async (args: unknown[]): Promise<void> => {
+    // Ownership belongs to this actual run, not replaceable session metadata.
+    let ownedReviewToken: string | undefined;
     try {
       // agent_settled is the only point where Pi guarantees that no automatic
       // retry, compaction retry, or queued continuation remains for this turn,
@@ -580,6 +589,8 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
       }
 
       deps.state.reviewInProgress = true;
+      ownedReviewToken = beginOwnedReviewActivity();
+      deps.state.reviewActivityToken = ownedReviewToken;
       let settleReview!: () => void;
       const reviewSettled = new Promise<void>((resolvePromise) => { settleReview = resolvePromise; });
       activeReviewSettled = reviewSettled;
@@ -854,7 +865,14 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
       await releaseQueuedUserInputs(deps.pi, deps.state, () => deps.isSessionActive(), () => deps.persist());
     } finally {
       agentSettlementInputHold = false;
-      await deps.persist();
+      try {
+        await deps.persist();
+      } finally {
+        // Reset/rebind or a queued-input release cannot substitute for this
+        // asynchronous review's settlement, including failure/inactive exits.
+        endOwnedReviewActivity(ownedReviewToken);
+        if (deps.state.reviewActivityToken === ownedReviewToken) deps.state.reviewActivityToken = undefined;
+      }
     }
   };
 

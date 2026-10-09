@@ -37,6 +37,10 @@ import { resolveArtifactRoot } from "./evidence/sources";
 import { buildSubtaskEvidence, readConfinedOperationRecord, readSubtaskEvidence, type SubtaskEvidenceRead, type SubtaskEvidenceSelector, type SubtaskEvidenceUnavailable } from "./subtask-evidence";
 import { sourceMutationCoordinator } from "./source-mutation-lease";
 import {
+  registerOwnedActivitySource,
+  type OwnedActivitySourceHandle,
+} from "../session-host/owned-activity";
+import {
   appendActivity,
   cloneTask,
   isActiveTaskState,
@@ -417,8 +421,56 @@ export interface ScheduledStartOptions {
   launchNoticeGate?: Promise<void>;
 }
 
+/**
+ * Owned-work observation for native session cards (the execution component of
+ * `backgroundTasks`). The source is registered by the authoritative controller
+ * lifecycle, not at module load, and starts UNCERTAIN: the category stays
+ * unknown until `restore()` has accounted for this controller's owned set and
+ * whenever restoration or ownership verification fails. Positive task-id
+ * tokens track active/queued logical work plus every unsettled owned runtime
+ * or unverified operation association, and are never released merely because
+ * an in-memory task index was cleared. The registry stays inert (no IO, no
+ * observation) until the authenticated session-host reporter opts in. This is
+ * a count of logical owned work units, not of PIDs or processes.
+ */
+
+/**
+ * Pure ownership predicate for one task (shared with focused synthetic tests).
+ * A task still owns unsettled background work when it is queued/active, when a
+ * live executor runtime or force-merge exists, or when it is non-archivable and
+ * shows any evidence that it was started: a durable continuation bundle, a wave
+ * root, an in-place operation record, or a non-zero lifecycle generation. A
+ * missing continuation bundle is NOT proof of writer settlement (in-place
+ * settlement clears it, and wave recovery can fail before it is assigned), so
+ * started work is retained until an authoritative archivable outcome exists.
+ * Undispatched tasks (generation 0, no anchors) release normally.
+ */
+export function taskOwnsUnsettledWork(
+  task: {
+    state: BackgroundTaskRecord["state"];
+    generation?: number;
+    waveRoot?: string;
+    bundle?: { operationId?: string } | undefined;
+    inplaceResult?: { operationRecord?: string } | undefined;
+  },
+  hasRuntime: boolean,
+  hasForceMerge: boolean,
+): boolean {
+  if (isActiveTaskState(task.state)) return true;
+  if (hasRuntime) return true;
+  if (hasForceMerge) return true;
+  return !isArchivableTaskState(task.state) && Boolean(
+    task.bundle?.operationId
+    || task.waveRoot
+    || task.inplaceResult?.operationRecord
+    || (task.generation ?? 0) > 0,
+  );
+}
+
 export class BackgroundExecutionController {
   private readonly groups = new Map<string, BackgroundExecutionGroup>();
+  /** Owner of this controller incarnation's positive owned-work tokens. */
+  private readonly ownedActivity: OwnedActivitySourceHandle;
   private readonly runtimes = new Map<string, RuntimeTaskHandle>();
   private readonly pendingForceMerges = new Map<string, PendingForceMerge>();
   /** Reserve command admission before recovery's first await, including bundle adoption. */
@@ -496,6 +548,10 @@ export class BackgroundExecutionController {
   private readonly indicator: SubtaskIndicator;
 
   constructor(private readonly input: BackgroundControllerInput) {
+    // Register this controller incarnation as UNCERTAIN: the execution
+    // category stays unknown until restore() has accounted for every owned
+    // association (or established that there is none).
+    this.ownedActivity = registerOwnedActivitySource("backgroundTasks", "execution", { uncertain: true });
     this.pool = new ExecutorPoolScheduler(resolvedWorkerResources(input.config));
     this.ledger = new ParentCheckpointLedger({
       config: () => this.input.config,
@@ -695,6 +751,11 @@ export class BackgroundExecutionController {
   }
 
   async restore(associations: ExecutionAssociationsSnapshot): Promise<void> {
+    // Every restore invalidates prior completeness before its first await: the
+    // owned set may be changing (or unresolved) until this restore authoritatively
+    // accounts for it. A previously complete controller must not keep
+    // advertising zero while a new restoration is in flight.
+    this.ownedActivity.markUncertain();
     const initialDetach = this.detach();
     const restoreEpoch = this.detachEpoch;
     await initialDetach;
@@ -703,6 +764,7 @@ export class BackgroundExecutionController {
     const restoreIsCurrent = () =>
       !this.shuttingDown && this.detaching === 0 && this.detachEpoch === restoreEpoch;
     const roots = associations.groupRoots ?? [];
+    let restoreAccounted = true;
     for (const root of roots) {
       if (!restoreIsCurrent()) return;
       try {
@@ -768,6 +830,9 @@ export class BackgroundExecutionController {
             try {
               await this.recoverTaskAssociation(group, task);
             } catch (error) {
+              // An unresolved association is not settled ownership: the whole
+              // restore cannot establish completeness.
+              restoreAccounted = false;
               this.addActivity(task, "recovery", `Checkpoint backfill refused: ${messageOf(error)}`);
               if (task.state === "stopped_for_application_exit") {
                 transitionTaskState(task, "paused_recoverable");
@@ -837,6 +902,7 @@ export class BackgroundExecutionController {
         this.groups.set(group.executionId, group);
         await this.save(group);
       } catch (error) {
+        restoreAccounted = false;
         await this.input.notify?.(`review gate: background execution was not restored (${root}): ${messageOf(error)}`);
       }
     }
@@ -850,6 +916,7 @@ export class BackgroundExecutionController {
         await this.resolveOrAdoptTask(undefined, undefined, bundle);
         restoredOperations.add(bundle.operationId);
       } catch (error) {
+        restoreAccounted = false;
         await this.input.notify?.(`review gate: legacy execution bundle was not adopted (${bundle.operationId}): ${messageOf(error)}`);
       }
     }
@@ -865,6 +932,11 @@ export class BackgroundExecutionController {
     this.pool = new ExecutorPoolScheduler(resolvedWorkerResources(this.input.config));
     this.rebuildRecentActivity();
     this.updateIndicator();
+    // Only an unbroken restore authoritatively accounts for this controller's
+    // owned set. Any failed/unadopted association keeps execution UNKNOWN
+    // (never zero) until an authoritative re-establishment.
+    if (restoreAccounted) this.ownedActivity.resolveUncertainty();
+    else this.ownedActivity.markUncertain();
     void this.pump();
   }
 
@@ -2178,6 +2250,8 @@ export class BackgroundExecutionController {
       return await this.runForceMerge(input, group, task, pending);
     } finally {
       this.pendingForceMerges.delete(task.taskId);
+      // The owned force-merge operation settled: reconcile this task's token.
+      this.syncOwnedTask(task);
       signalDone();
     }
   }
@@ -2653,6 +2727,10 @@ export class BackgroundExecutionController {
     // but the prune callback can still be queued when cleanup returns).
     await this.quiesceSaveTails();
     this.updateIndicator();
+    // Shutdown deliberately does NOT clear source uncertainty: settled runtime
+    // promises are not proof that a recoverable operation's owned writer is
+    // gone. Outstanding tokens stay owned and any uncertainty remains until an
+    // authoritative re-establishment, so this cannot publish a false zero.
   }
 
   /**
@@ -2727,6 +2805,10 @@ export class BackgroundExecutionController {
       }
       if (settled.length === group.tasks.length && !archivedRetention) {
         await removeOwnedExecutionRoot(group.root, group.tempBase);
+        // Every task is terminal: release its owned-activity token before the
+        // group bookkeeping is dropped so retirement cannot leave a stale
+        // positive outstanding.
+        this.reconcileOwnedActivity(group);
         this.groups.delete(executionId);
         this.dropActiveTasks(executionId);
         // Issue #222: the launch-notice gate retires with the group; every
@@ -2760,6 +2842,9 @@ export class BackgroundExecutionController {
     // detached groups are rejected by save()'s attachment guard.
     try {
       await this.quiesceSaveTails(() => {
+        const outstandingOwnedWork = [...this.groups.values()]
+          .some((group) => group.tasks.some((task) => this.taskOwnsUnsettledWork(task)))
+          || [...this.activeTasks.values()].some(({ task }) => this.taskOwnsUnsettledWork(task));
         this.groups.clear();
         this.activeTasks.clear();
         this.runtimes.clear();
@@ -2777,6 +2862,13 @@ export class BackgroundExecutionController {
         // persisted snapshot re-blocks each gate on restore.
         this.conflictGates.clear();
         this.updateIndicator();
+        if (outstandingOwnedWork) {
+          // The in-memory index is gone but its owned work is not proven
+          // settled: the category stays UNKNOWN (never zero) until an
+          // authoritative re-establishment, while the outstanding tokens stay
+          // owned by this incarnation.
+          this.ownedActivity.markUncertain();
+        }
       });
     } finally {
       this.detaching -= 1;
@@ -2956,6 +3048,9 @@ export class BackgroundExecutionController {
         // and covers failures before ownership was handed down.
         lease.release();
         this.runtimes.delete(task.taskId);
+        // The owned executor runtime actually settled: reconcile its token
+        // against the remaining ownership (state, force-merge, operation).
+        this.syncOwnedTask(task);
         this.active = Math.max(0, this.active - 1);
         this.updateIndicator();
         void this.pump();
@@ -3312,6 +3407,36 @@ export class BackgroundExecutionController {
     }
   }
 
+  /**
+   * Observation only (native session cards): publish each task's stable id as
+   * a positive owned-work token while the task still owns unsettled work, and
+   * release it only when no owned runtime, force-merge, or unverified operation
+   * association remains. A cleared active-task index therefore never reads as
+   * zero: only actual settlement (or a verified/archivable outcome) releases.
+   * The registry is inert unless the authenticated session-host reporter opted
+   * in.
+   */
+  private reconcileOwnedActivity(group: BackgroundExecutionGroup): void {
+    for (const task of group.tasks) this.syncOwnedTask(task);
+  }
+
+  /**
+   * True while this task still owns unsettled background work: queued/active
+   * logical work, a live executor runtime, a live force-merge, or a terminal
+   * but non-archivable task whose durable operation association could still
+   * name a live or unverified writer. This is a count of owned work, not of
+   * PIDs or processes.
+   */
+  private taskOwnsUnsettledWork(task: BackgroundTaskRecord): boolean {
+    return taskOwnsUnsettledWork(task, this.runtimes.has(task.taskId), this.pendingForceMerges.has(task.taskId));
+  }
+
+  /** Acquire/release one task's owned-work token to match its unsettled ownership. */
+  private syncOwnedTask(task: BackgroundTaskRecord): void {
+    if (this.taskOwnsUnsettledWork(task)) this.ownedActivity.acquire(task.taskId);
+    else this.ownedActivity.release(task.taskId);
+  }
+
   private dropActiveTasks(executionId: string): void {
     for (const [key, entry] of this.activeTasks) {
       if (entry.group.executionId === executionId) this.activeTasks.delete(key);
@@ -3409,6 +3534,9 @@ export class BackgroundExecutionController {
     // synchronized in this synchronous section: widget and scheduler reads
     // never traverse settled history.
     this.syncActiveTasks(group);
+    // Owned-work observation: reflect this group's authoritative active set in
+    // the process-local registry (inert unless the reporter opted in).
+    this.reconcileOwnedActivity(group);
     const priorArchives = this.priorArchivesFor(group);
     const legacyHandles = this.legacyArchiveHandles.get(group.executionId);
     const pendingLegacyHandles = legacyHandles && !legacyHandles.persisted ? legacyHandles.entries : undefined;

@@ -82,6 +82,13 @@ export interface QuestionListComponentOptions {
    * row then renders an unavailable line and the question stays pending).
    */
   nativeField?: FieldEditorInstance;
+  /**
+   * True once the session rebound while this UI was opening or open (the
+   * same SessionManager object may be reused across /new/resume, so the
+   * controller's identity check alone cannot see it). A stale UI closes
+   * without submitting and never displays another session's questions.
+   */
+  isStale?: () => boolean;
   onDone: (result: QuestionListDone) => void;
 }
 
@@ -98,6 +105,7 @@ const DECLINE_ROW = "__decline__";
 
 export function createQuestionListComponent(options: QuestionListComponentOptions): QuestionListComponent {
   const { controller, keybindings, theme, tuiHost, shortcutLabel } = options;
+  const isStale = options.isStale ?? (() => false);
   let mode: "list" | "answer" = "list";
   let selectedId: string | undefined;
   let answerIndex = 0;
@@ -105,8 +113,8 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   let closed = false;
   let cachedLines: string[] | undefined;
   // The shortcut handler installs a live idle probe before the component is
-  // shown; it stays valid for the whole UI session because this component
-  // consumes all input while open, so no session replacement can happen.
+  // shown; if the session rebinds while open, the stale fence closes this UI
+  // before any submission can use the probe.
   let activeSourceProbe: { isIdle?: () => boolean } | undefined;
 
   const invalidate = () => {
@@ -119,6 +127,9 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   const close = (result?: SubmitResult) => {
     if (closed) return;
     closed = true;
+    // End any open editing episode so the bridge's settle callback is
+    // cleared: a late or stale settle must never act through this UI.
+    endEditingEpisode();
     unsubscribeState();
     options.onDone(result ? { kind: "submitted", result } : { kind: "closed" });
   };
@@ -176,6 +187,14 @@ export function createQuestionListComponent(options: QuestionListComponentOption
 
   /** Settle of the native submit path or an intercepted cancel-equivalent. */
   function handleFieldSettle(value: string | undefined): void {
+    if (closed || isStale()) {
+      // A closed or rebound UI must never settle into the current session:
+      // beginSession resets IDs, so this UI's selected question could resolve
+      // to the replacement session's question. Close without submitting;
+      // ending the episode clears the bridge callbacks.
+      close();
+      return;
+    }
     if (value === undefined) {
       // Esc (after any visible completion list) or empty-editor Ctrl+D:
       // back to the option rows with the draft kept in the instance.
@@ -347,11 +366,26 @@ export function createQuestionListComponent(options: QuestionListComponentOption
 
   const handleInput = (data: string) => {
     if (closed) return;
+    if (isStale()) {
+      close(); // A rebound session's UI never acts on input.
+      return;
+    }
     if (mode === "list") handleListInput(data);
     else handleAnswerInput(data);
   };
 
   const render = (width: number): string[] => {
+    if (isStale()) {
+      // The session rebound while this UI was open or opening: close without
+      // submitting; the new session presents its own questions through its
+      // own press. Never display another session's questions here — even if
+      // a stale input or settle callback already closed this component (its
+      // close cleared the cache, so the check must not depend on !closed).
+      close();
+      cachedLines = [theme.fg("dim", "Session changed; question list closed.")];
+      return cachedLines;
+    }
+    if (closed) return []; // A closed component never renders live controller state.
     if (cachedLines) return cachedLines;
     const lines = mode === "list" ? renderList(width) : renderAnswer(width);
     cachedLines = lines;

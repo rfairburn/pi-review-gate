@@ -155,6 +155,9 @@ export async function releaseQueuedUserInputs(
   persist: () => void | Promise<void>,
 ): Promise<void> {
   state.reviewInProgress = false;
+  // Queue delivery changes metadata, not the lifetime of an in-flight review.
+  // The actual review run releases its captured ownership token on settlement.
+  state.reviewActivityToken = undefined;
   // Old-only ledger occurrences without an active durable delivery record can
   // never be dispatched; identify them explicitly instead of silently
   // skipping — their contents stay preserved until the user cancels them.

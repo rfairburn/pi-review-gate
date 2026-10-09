@@ -15,6 +15,61 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.129]
+
+### Added
+
+- Optional `pi-review-sessions` terminal host alpha for same-machine POSIX
+  macOS/Linux (#323, related research #274). Each explicitly created row owns
+  an independent native Pi process, workspace and native conversation, sharing
+  ordinary native Pi configuration/resources without per-window profiles.
+  Highlighting or hiding a row changes no ownership;
+  activation is explicit and input is never broadcast. The separate launcher
+  requires Node 22.19.0+, stable Pi 1.0.4+ and a supported readable Node CLI
+  entry; provisioned Pi, the matching TUI dependency and native UI acceptance
+  fixture are pinned to 1.1.0. Parent resume/session/storage overrides are rejected; ordinary native
+  arguments and commands remain native. Public terminal APIs, independent
+  headless surfaces and bounded generated frames provide text/SGR display and
+  observed generic sidebar status, with explicit Unicode, mouse and platform
+  limits. Existing standalone launchers remain unchanged. See
+  [the alpha guide](docs/session-host-alpha.md).
+
+### Fixed
+
+- Background-shell exit cleanup preserves native and foreign asynchronous
+  signal handlers through the public, directly pinned `signal-exit` API
+  instead of deleting handlers and re-sending signals (#324). Owned-job
+  termination/watchdog cleanup and ordinary Windows behavior remain intact.
+- Pending-question widgets retain their current-session public widget sink
+  separately from fresh shortcut dialog/editor contexts, with stale-context
+  fences. Answer completion clears observed pending status without inventing
+  lifecycle events or inferring clearance from idle state (#323).
+
+### Known limitations
+
+- Windows sidebar/host runtime acceptance is deferred to #334 for this release: the
+  real native Main case (startup, public Quit confirmation, original-process/kernel
+  settlement/restoration) and both cold hosted-source wrapper legs (cmd and direct
+  PowerShell) are retained in the suite but explicitly skipped, so green CI does not
+  certify Windows runtime support; the Windows sidebar/host remains optional
+  experimental. The hosted **Main** mouse routing limitation also remains unresolved
+  (#334): the pane does not accept ordinary terminal mouse tracking/SGR reporting, so
+  terminal-like selection can span panes and wheel input can move editor history
+  rather than the full conversation; no proven cause. The mouse-specific assertion is
+  temporarily deferred to that ticket, not fixed; production ownership guards and the
+  remaining tests stay enabled.
+- The recurring Windows delegated Pi RPC descendant-proof launch failure remains
+  unresolved (#335). The Windows-only alias-independent RPC case is temporarily
+  deferred to that ticket, not fixed; production ownership guards and the remaining
+  tests stay enabled. Ordinary standalone launchers, POSIX behavior, and shared
+  native configuration remain unchanged.
+- The Windows device-attributes query/reply witness remains unresolved (#337):
+  the expected device-attributes reply was not observed in either Windows
+  22.19/24 alpha lane, so that single assertion is temporarily deferred to
+  that ticket, not fixed; no cause is established and no Windows compatibility
+  claim is made. It belongs to the broader #334 Windows-host follow-up. Production
+  ownership guards and the remaining tests stay enabled.
+
 ## [0.1.0-dev.128]
 
 ### Fixed

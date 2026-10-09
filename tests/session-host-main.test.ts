@@ -149,6 +149,7 @@ class FakeWriter {
   closeGate?: Promise<void>;
   closeStarted = false;
   submitsAfterClose = 0;
+  invalidateCalls = 0;
   readonly frames: { frame: ComposedHostFrame; cols: number; rows: number }[] = [];
   readonly order: string[];
 
@@ -163,6 +164,11 @@ class FakeWriter {
   submit(frame: ComposedHostFrame, cols: number, rows: number): void {
     if (this.closed) this.submitsAfterClose += 1;
     this.frames.push({ frame, cols, rows });
+  }
+
+  invalidate(): void {
+    this.order.push("writer.invalidate");
+    this.invalidateCalls += 1;
   }
 
   async close(): Promise<boolean> {
@@ -1668,6 +1674,54 @@ test("responsive resize resizes every owned child only when native geometry chan
   assert.equal(manager.resizeCalls.length, afterNarrow, "focus changes in narrow overlay do not resize children");
   await nextTurn();
   assert.ok(harness.writer.frames.some(({ cols, rows }) => cols === 52 && rows === 10));
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("an actual outer resize notification invalidates the writer baseline even when final geometry is unchanged", async () => {
+  const harness = createHarness();
+  await ready(harness);
+  fillForm(harness.terminal, "resize");
+  await nextTurn();
+  const invalidationsBefore = harness.writer.invalidateCalls;
+  const framesBefore = harness.writer.frames.length;
+  const frameBefore = harness.writer.frames.at(-1)!;
+
+  harness.terminal.setSize(80, 24); // a real notification that changes nothing
+  assert.equal(harness.writer.invalidateCalls, invalidationsBefore + 1,
+    "a same-geometry resize still invalidates the known baseline");
+
+  // One coalesced redraw spanning 80 -> 40 -> 80: the final geometry matches the
+  // baseline exactly, but each real notification must still invalidate so the
+  // next frame is a complete repaint of the reflowed screen.
+  harness.terminal.columns = 40;
+  harness.terminal.resizeHandler?.();
+  harness.terminal.columns = 80;
+  harness.terminal.resizeHandler?.();
+  assert.equal(harness.writer.invalidateCalls, invalidationsBefore + 3,
+    "every coalesced resize notification invalidates before layout reconciliation");
+
+  await nextTurn();
+  assert.ok(harness.writer.frames.length > framesBefore, "the coalesced resize still submits the next frame");
+  const frameAfter = harness.writer.frames.at(-1)!;
+  assert.equal(frameAfter.cols, frameBefore.cols);
+  assert.equal(frameAfter.rows, frameBefore.rows);
+  assert.equal(frameAfter.cols, 80);
+  assert.equal(frameAfter.rows, 24);
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("a writer seam without invalidation still handles resize notifications", async () => {
+  const plainWriter = {
+    started: false,
+    start(): void { this.started = true; },
+    submit(_frame: ComposedHostFrame, _cols: number, _rows: number): void {},
+    async close(): Promise<boolean> { return true; },
+  };
+  const harness = createHarness({}, { createWriter: () => plainWriter });
+  await ready(harness);
+  assert.doesNotThrow(() => harness.terminal.setSize(70, 20),
+    "the injected writer seam may omit the optional invalidate method");
+  await nextTurn();
   assert.equal(await closeWithSignal(harness), 0);
 });
 

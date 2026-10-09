@@ -23,6 +23,30 @@
  *   journaled: argv, env, credentials, and terminal transcripts are never
  *   recorded.
  *
+ * TESTONLY received-data census (only when `options.createReceivedCensus`
+ * supplies a pure bounded census factory, e.g. the shared stdout mode census):
+ * ONE owned public onData subscription per original returned handle is
+ * registered in the same synchronous spawn return turn — even when the public
+ * PID is already positive — so each public string payload is captured once,
+ * before production's later subscriber, into the pure bounded census (its
+ * internal writeCalls are public data events, never stdout writes). Non-string
+ * payloads (including proxy/Buffer/object) are sticky unknown without any
+ * property or descriptor trap; no raw bytes are retained or logged. The public
+ * onData descriptor/prototype chain is captured within a finite bound and
+ * revalidated at lookup time (by both lookups): a shadow, replacement, or
+ * changed prototype chain is sticky unknown and latches the shared
+ * private-binding scope so the exchange guard's binding lookup fails closed;
+ * a proxy handle, registration failure, PID drift, or exit leaves the
+ * received group sticky unknown. A contained census/observation failure,
+ * unsupported payload, overflow, or partial-at-snapshot sequence makes only
+ * the received counters unknown. The subscription carries the default PID
+ * observation only when the default fixture would have subscribed (pending
+ * PID), and it is disposed at most once on the original public onExit,
+ * including a reentrant exit during registration. Default/option-absent
+ * behavior stays exact, including the conditional PID onData subscription,
+ * and this fixture never copies the census dependency (the factory is
+ * runner-supplied).
+ *
  * TESTONLY offered-bootstrap retention (only when `options.bootstrap` is
  * supplied as `{ envName, parse }`): BEFORE the original spawn call, the
  * exact one-shot bootstrap env value of that one spawn is parsed with the
@@ -72,8 +96,41 @@ function observePtyModule(nodePty, ptyJournal, options = {}) {
   const bootstrapSupported = bootstrapOptions !== undefined
     && typeof bootstrapOptions.envName === 'string' && bootstrapOptions.envName.length > 0
     && typeof bootstrapOptions.parse === 'function';
+  // TESTONLY received-data census factory (runner-supplied): never a top-level
+  // dependency of this shared fixture; absent options preserve the exact
+  // default behavior, including the conditional PID onData subscription.
+  const receivedFactory = options !== null && typeof options === 'object' && typeof options.createReceivedCensus === 'function'
+    ? options.createReceivedCensus
+    : undefined;
+  const receivedSupported = receivedFactory !== undefined;
   const journal = (record) => {
     try { appendMetadata(ptyJournal, record); } catch { journalFailed = true; }
+  };
+  /**
+   * TESTONLY: revalidates one owner's captured public onData slot within the
+   * same finite descriptor/prototype bound (exact holder, exact method value,
+   * and the exact visited prototype chain). Never invokes an accessor.
+   */
+  const receivedSlotIntact = (owner) => {
+    if (owner.onDataSlot === undefined) return false;
+    const current = resolveOnDataSlot(owner.handle);
+    return current !== undefined && sameOnDataSlot(current, owner.onDataSlot);
+  };
+  /**
+   * TESTONLY: one bounded numeric census snapshot. A contained observation
+   * failure (or a throwing/malformed snapshot) is sticky unknown; only the
+   * fixed integer counters are copied, never raw data.
+   */
+  const receivedSnapshot = (owner) => {
+    try {
+      const base = owner.receivedCensus.snapshot();
+      if (base === null || typeof base !== 'object' || base.counts === null || typeof base.counts !== 'object') {
+        return { unknown: true, counts: {} };
+      }
+      return { unknown: base.unknown !== false || owner.receivedFailed, counts: base.counts };
+    } catch {
+      return { unknown: true, counts: {} };
+    }
   };
   /**
    * Captures the exact one-shot offered bootstrap of this one spawn BEFORE
@@ -119,7 +176,27 @@ function observePtyModule(nodePty, ptyJournal, options = {}) {
       incarnation: ownedHandles.length + 1,
       cwd: spawnOptions && typeof spawnOptions.cwd === 'string' ? spawnOptions.cwd : undefined,
     };
-    const owner = { handle, record, exited: false, observationFailed: false, pidChanged: false, dataSubscription: undefined, bootstrap: offeredBootstrap };
+    const owner = {
+      handle, record, exited: false, observationFailed: false, pidChanged: false,
+      dataSubscription: undefined, bootstrap: offeredBootstrap,
+      receivedCensus: undefined, onDataSlot: undefined, receivedFailed: false,
+      dataSubscriptionSettled: false, pidObservedOnData: false,
+    };
+    // TESTONLY received mode: the ONE owned onData subscription is disposed at
+    // most once (public onExit, or right after a registration that observed a
+    // reentrant exit). A dispose failure makes the received group unknown; it
+    // is a journal failure only when that same subscription also carried the
+    // default pending-PID observation (exact default parity).
+    const settleReceivedSubscription = () => {
+      if (owner.dataSubscription === undefined || owner.dataSubscriptionSettled) return;
+      owner.dataSubscriptionSettled = true;
+      try {
+        owner.dataSubscription.dispose();
+      } catch {
+        owner.receivedFailed = true;
+        if (owner.pidObservedOnData) journalFailed = true;
+      }
+    };
     ownedHandles.push(owner);
     journal({ type: 'pty_spawn_pending', ...record });
     const observePublicPid = () => {
@@ -159,13 +236,92 @@ function observePtyModule(nodePty, ptyJournal, options = {}) {
           exitCode: event && typeof event.exitCode === 'number' ? event.exitCode : undefined,
           signal: event && event.signal !== undefined ? event.signal : null,
         });
-        try { owner.dataSubscription?.dispose(); } catch { journalFailed = true; }
+        if (receivedSupported) settleReceivedSubscription();
+        else {
+          try { owner.dataSubscription?.dispose(); } catch { journalFailed = true; }
+        }
       });
       // ConPTY's public pid becomes available asynchronously. Observe it on
       // public data delivery, without inspecting data or using a private ready
       // event. The actual stream continues to production's own subscribers.
       observePublicPid();
-      if (record.pid === undefined && !owner.exited) {
+      if (receivedSupported) {
+        // TESTONLY received-data census: ONE owned onData subscription per
+        // original returned handle, registered in the same synchronous spawn
+        // return turn BEFORE production's later subscriber. Each public string
+        // payload is captured once before the original subscribers run; no raw
+        // bytes are retained or logged, and every observation failure is
+        // contained so it can never escape or alter production.
+        let receivedCensus;
+        try {
+          receivedCensus = receivedFactory();
+        } catch {
+          receivedCensus = undefined; // a throwing factory is a registration failure
+        }
+        if (receivedCensus === null || typeof receivedCensus !== 'object'
+            || typeof receivedCensus.beginOffer !== 'function'
+            || typeof receivedCensus.markUnknown !== 'function'
+            || typeof receivedCensus.snapshot !== 'function') {
+          receivedCensus = undefined; // unsupported factory result: sticky unknown
+        }
+        owner.receivedCensus = receivedCensus;
+        // Exact default parity: the default fixture subscribes for the PID only
+        // while it is still pending, and that subscription keeps observing the
+        // public PID on every later delivery. The single owned subscription
+        // carries that same PID observation only in that same case.
+        const pidObservedOnData = record.pid === undefined && !owner.exited;
+        owner.pidObservedOnData = pidObservedOnData;
+        const onDataSlot = owner.exited ? undefined : resolveOnDataSlot(handle);
+        if (owner.exited) {
+          // Exited before registration (exactly like the default fixture, no
+          // subscription is made): the received group stays sticky unknown.
+        } else if (onDataSlot === undefined && pidObservedOnData) {
+          // Unresolved/unsupported public onData: the received group is
+          // unknown, and the default pending-PID subscription still runs
+          // exactly as the option-absent fixture would register it.
+          owner.dataSubscription = handle.onData(() => observePublicPid());
+          if (owner.exited) settleReceivedSubscription();
+        } else if (onDataSlot !== undefined) {
+          const receivedListener = (data) => {
+            if (pidObservedOnData) observePublicPid();
+            try {
+              if (owner.receivedCensus === undefined || owner.receivedFailed || owner.dataSubscriptionSettled) return;
+              // typeof never invokes a proxy trap; every non-string payload
+              // (Buffer/object/proxy) is sticky unknown without inspection.
+              if (typeof data !== 'string') {
+                owner.receivedCensus.markUnknown();
+                return;
+              }
+              const offer = owner.receivedCensus.beginOffer(data, undefined);
+              if (offer !== null) offer.commit();
+            } catch {
+              owner.receivedFailed = true; // an observation failure is sticky and never escapes
+            }
+          };
+          let subscription;
+          let registered = false;
+          try {
+            // The ordinary public call form production itself uses: for the
+            // getter-backed accessor this reads the original public event
+            // function exactly once with the original handle receiver.
+            subscription = handle.onData(receivedListener);
+            registered = true;
+          } catch (error) {
+            // A registration failure that also lost the default pending-PID
+            // observation keeps the exact default failure path; otherwise it
+            // only leaves the received group sticky unknown.
+            if (pidObservedOnData) throw error;
+          }
+          if (registered) {
+            owner.onDataSlot = onDataSlot;
+            owner.dataSubscription = subscription;
+            if (subscription === null || typeof subscription !== 'object' || typeof subscription.dispose !== 'function') {
+              owner.receivedFailed = true; // an unsettleable subscription is sticky unknown
+            }
+            if (owner.exited) settleReceivedSubscription(); // reentrant exit during registration: exact once
+          }
+        }
+      } else if (record.pid === undefined && !owner.exited) {
         owner.dataSubscription = handle.onData(() => observePublicPid());
         if (owner.exited) owner.dataSubscription.dispose();
       }
@@ -234,6 +390,14 @@ function observePtyModule(nodePty, ptyJournal, options = {}) {
         }
       }
       if (match === undefined || match.exited || match.observationFailed || match.pidChanged) return undefined;
+      // TESTONLY received mode: a supported received-scope onData slot
+      // disturbance (shadow/replacement/changed prototype chain) observed here
+      // latches the shared scope, so the exchange guard's binding lookup fails
+      // closed and a change-then-revert can never certify.
+      if (receivedSupported && match.onDataSlot !== undefined && !receivedSlotIntact(match)) {
+        nativeScopeInvalid = true;
+        return undefined;
+      }
       const pid = match.record.pid;
       if (!Number.isSafeInteger(pid) || pid <= 1) return undefined; // still pending: unknown
       let currentPid;
@@ -249,10 +413,140 @@ function observePtyModule(nodePty, ptyJournal, options = {}) {
       }
       return { pid, incarnation: match.record.incarnation, bootstrap: match.bootstrap };
     },
+    /**
+     * TESTONLY private received-data census lookup, never journaled: the exact
+     * retained original-handle public onData census for one instance id, bound
+     * to the same owned public IPty and its once-positive original PID /
+     * current incarnation through the same provenance as `nativeBindingFor`.
+     * Returns undefined when the observation is not enabled or the instance id
+     * resolves to no (or a duplicate) offered-bootstrap owner; `{ disturbed:
+     * true }` for a supported-scope disturbance — registration failure, spawn
+     * slot replacement, journal failure, exit/settled subscription, PID
+     * drift, or a shadowed / replaced / prototype-changed public onData slot
+     * (sticky; a slot disturbance also latches the shared private-binding
+     * scope so the exchange guard's binding lookup fails closed); otherwise
+     * `{ pid, incarnation, snapshot }` with pid null while the public PID is
+     * still pending (the runner never publishes that as an established
+     * scope) and a sticky-unknown snapshot after any contained observation
+     * failure. The public onData descriptor /
+     * prototype chain is captured at spawn and revalidated within the same
+     * finite bound; a reverted disturbance never repairs the scope. No raw
+     * payload, id, or tuple is ever returned or journaled.
+     */
+    receivedBindingFor(instanceId) {
+      if (typeof instanceId !== 'string' || instanceId.length === 0) return undefined;
+      if (!receivedSupported) return undefined; // observation not enabled: unestablished
+      let match;
+      for (const owner of ownedHandles) {
+        if (owner.bootstrap !== undefined && owner.bootstrap.instanceId === instanceId) {
+          if (match !== undefined) return undefined; // duplicate: ambiguous, never guess
+          match = owner;
+        }
+      }
+      if (match === undefined) return undefined; // no offered-bootstrap owner: unestablished
+      if (match.receivedCensus === undefined || match.onDataSlot === undefined) {
+        return { disturbed: true }; // a registration failure is sticky unknown
+      }
+      try {
+        const slot = Object.getOwnPropertyDescriptor(nodePty, 'spawn');
+        if (slot === undefined || slot.value !== observedSpawn || journalFailed) nativeScopeInvalid = true;
+      } catch {
+        nativeScopeInvalid = true;
+      }
+      if (nativeScopeInvalid) return { disturbed: true }; // an observed scope failure is sticky, never rebound
+      if (match.exited || match.observationFailed || match.pidChanged || match.dataSubscriptionSettled) {
+        return { disturbed: true };
+      }
+      if (!receivedSlotIntact(match)) {
+        nativeScopeInvalid = true; // shadow/replacement/changed prototype: sticky, fails the guard too
+        return { disturbed: true };
+      }
+      const pid = match.record.pid;
+      if (!Number.isSafeInteger(pid) || pid <= 1) {
+        return { pid: null, incarnation: null, snapshot: receivedSnapshot(match) }; // pending: intact but unbound
+      }
+      let currentPid;
+      try {
+        currentPid = match.handle.pid; // re-read the current public PID at call time
+      } catch {
+        match.observationFailed = true; // an unreadable PID latches uncertainty without rebinding
+        return { disturbed: true };
+      }
+      if (currentPid !== pid) {
+        match.pidChanged = true; // changed PID: sticky unknown, never rebound
+        return { disturbed: true };
+      }
+      return { pid, incarnation: match.record.incarnation, snapshot: receivedSnapshot(match) };
+    },
     restore() {
       if (nodePty.spawn === observedSpawn) nodePty.spawn = originalSpawn;
     },
   };
+}
+
+/**
+ * Resolves the exact public onData slot within a finite descriptor/prototype
+ * bound, on the handle or its retained prototype chain. An ES Proxy handle is refused via genuine `types.isProxy` BEFORE any
+ * descriptor operation (no trap is ever invoked). Both supported public
+ * forms are resolved WITHOUT invoking anything: a plain data method, and the
+ * getter-backed public accessor the pinned node-pty API exposes (its getter
+ * and setter function identities are captured, never called here). An
+ * unresolved, non-function, or getter-less slot is unsupported.
+ * Returns `{ holder, kind, value, get, set, chain, prototypes }` — chain is
+ * the exact visited objects from the handle to the holder and prototypes is
+ * the immediate prototype identity of EACH visited object (including the
+ * holder) — or undefined.
+ */
+function resolveOnDataSlot(handle, bound = 16) {
+  if (handle === null || typeof handle !== 'object') return undefined;
+  let current = handle;
+  const chain = [];
+  const prototypes = [];
+  for (let depth = 0; depth < bound && current !== null && typeof current === 'object'; depth += 1) {
+    try {
+      if (types.isProxy(current)) return undefined; // a proxy handle/prototype is refused before any trap
+    } catch {
+      return undefined; // an uninspectable object is refused
+    }
+    let descriptor;
+    let parent;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(current, 'onData');
+      parent = Object.getPrototypeOf(current); // non-proxy: no trap can run
+    } catch {
+      return undefined; // an unreadable descriptor/prototype is refused, never bypassed
+    }
+    chain.push(current);
+    prototypes.push(parent);
+    if (descriptor !== undefined) {
+      if (descriptor.get !== undefined || descriptor.set !== undefined) {
+        // The public accessor form: identities only, never invoked here.
+        if (typeof descriptor.get !== 'function') return undefined;
+        return { holder: current, kind: 'accessor', value: undefined, get: descriptor.get, set: descriptor.set, chain, prototypes };
+      }
+      if (typeof descriptor.value !== 'function') return undefined;
+      return { holder: current, kind: 'data', value: descriptor.value, get: undefined, set: undefined, chain, prototypes };
+    }
+    current = parent;
+  }
+  return undefined; // unresolved within the finite bound: unsupported
+}
+
+/**
+ * Exact identity comparison of two resolved onData slots: holder, descriptor
+ * kind, method or getter/setter function identity, every visited object, and
+ * each visited object's immediate prototype. Never invokes a getter and
+ * never compares callback closures an accessor returns.
+ */
+function sameOnDataSlot(current, captured) {
+  if (current.holder !== captured.holder || current.kind !== captured.kind) return false;
+  if (current.value !== captured.value || current.get !== captured.get || current.set !== captured.set) return false;
+  if (current.chain.length !== captured.chain.length || current.prototypes.length !== captured.prototypes.length) return false;
+  for (let index = 0; index < current.chain.length; index += 1) {
+    if (current.chain[index] !== captured.chain[index]) return false;
+    if (current.prototypes[index] !== captured.prototypes[index]) return false;
+  }
+  return true;
 }
 
 module.exports = { appendMetadata, observePtyModule };

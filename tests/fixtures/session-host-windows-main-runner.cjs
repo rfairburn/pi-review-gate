@@ -38,6 +38,15 @@
  * tuple stays in private process memory; only the opaque 64-hex proof and the
  * bounded numeric/string binding fields cross the wire.
  *
+ * The same reply carries an independent bounded inner-received group: inside
+ * that same fresh pane snapshot pass, a narrow TESTONLY callback resolves the
+ * exact matched owner's private received-data census (the shared observer's
+ * one owned public onData subscription per original returned handle, fed by
+ * the runner-supplied pure bounded mode census factory) and maps it to bounded
+ * numeric fields cross-bound to the same original PID/incarnation. Diagnosis
+ * only: it never claims byte delivery to Main's parser, negotiated terminal
+ * state, or a mirror decision, and no raw payload ever leaves the runner.
+ *
  * A single original-Main-origin native exchange guard is armed exactly once,
  * inside that same fresh Main census snapshot pass, when the pass first
  * constructs a complete actual-owner native binding (before the reply is
@@ -61,6 +70,7 @@ const path = require('node:path');
 const { createRequire } = require('node:module');
 const { observePtyModule } = require('./session-host-windows-pty-observer.cjs');
 const {
+  CENSUS_COUNT_FIELDS,
   createCensusReplyService,
   createStdoutModeCensus,
   installStdoutWriteCensus,
@@ -78,6 +88,88 @@ const {
   createNativeExchangeGuard,
   isNativeExchangeGuardRequestPayload,
 } = require('./session-host-windows-native-exchange-guard.cjs');
+
+/** The bounded inner-received mode count fields: the producer's fixed DEC set/reset pairs. */
+const RECEIVED_MODE_COUNT_FIELDS = CENSUS_COUNT_FIELDS.filter((field) => field !== 'writeCalls');
+const RECEIVED_COUNT_LIMIT = 2 ** 31 - 1;
+
+/** All-null group: the received observation was never established. */
+function unestablishedReceived() {
+  const group = { scope: null, complete: null, ptyPid: null, incarnation: null };
+  for (const field of RECEIVED_MODE_COUNT_FIELDS) group[field] = null;
+  group.dataEvents = null;
+  return group;
+}
+
+/** All-null group with a disturbed scope and an honestly incomplete result. */
+function disturbedReceived() {
+  const group = unestablishedReceived();
+  group.scope = false;
+  group.complete = false;
+  return group;
+}
+
+/**
+ * Maps one private received lookup result into the bounded published group.
+ * `undefined` stays an honest unestablished unknown and a supported-scope
+ * disturbance is sticky unknown; an intact scope publishes the census counts
+ * only when every counter is bounded known AND the original PID/incarnation
+ * are positive (otherwise the known PID/incarnation are kept and ALL counters
+ * stay null). The census's internal writeCalls map to public data events —
+ * never stdout writes — and no raw payload ever leaves the runner.
+ */
+function receivedGroupFromLookup(result) {
+  try {
+    if (result === undefined) return unestablishedReceived();
+    if (result === null || typeof result !== 'object') return disturbedReceived();
+    if (result.disturbed === true) return disturbedReceived();
+    // A still-pending original PID never establishes the bound scope.
+    if (result.pid === null) return unestablishedReceived();
+    if (!Number.isSafeInteger(result.pid) || result.pid <= 1
+      || !Number.isSafeInteger(result.incarnation) || result.incarnation < 1) {
+      return disturbedReceived();
+    }
+    const snapshot = result.snapshot;
+    const counts = snapshot !== null && typeof snapshot === 'object' ? snapshot.counts : undefined;
+    let complete = snapshot !== null && typeof snapshot === 'object' && snapshot.unknown === false
+      && counts !== null && typeof counts === 'object';
+    if (complete) {
+      for (const field of CENSUS_COUNT_FIELDS) {
+        const value = counts[field];
+        if (!Number.isSafeInteger(value) || value < 0 || value > RECEIVED_COUNT_LIMIT) { complete = false; break; } // bounded known only
+      }
+    }
+    const group = { scope: true, complete, ptyPid: result.pid, incarnation: result.incarnation };
+    for (const field of RECEIVED_MODE_COUNT_FIELDS) group[field] = complete ? counts[field] : null;
+    group.dataEvents = complete ? counts.writeCalls : null;
+    return group;
+  } catch {
+    return disturbedReceived(); // observation bookkeeping never throws into the pass
+  }
+}
+
+/**
+ * Publishes the captured received group only after the resulting pane and
+ * native-binding groups prove full actual-owner scope AND the received
+ * original PID/incarnation equal the native-binding original PID/incarnation.
+ * A never-established capture stays unestablished; every other mismatch is a
+ * disturbed (scope false) all-null group. Never re-reads the public owner or
+ * roster to select a row.
+ */
+function publishReceived(pending, activePane, nativeBinding) {
+  if (pending === undefined || pending.scope === null) return unestablishedReceived();
+  if (pending.scope !== true) return disturbedReceived();
+  if (activePane === null || typeof activePane !== 'object' || activePane.scope !== true || activePane.complete !== true
+    || activePane.ownerPresent !== true || activePane.focusMain !== true || activePane.viewMatched !== true
+    || activePane.hasLiveProcess !== true || activePane.lifecycleAlive !== true
+    || activePane.surfacePresent !== true || activePane.modesReadSucceeded !== true
+    || nativeBinding === null || typeof nativeBinding !== 'object' || nativeBinding.scope !== true || nativeBinding.complete !== true
+    || nativeBinding.ptyPid === null || nativeBinding.incarnation === null
+    || nativeBinding.ptyPid !== pending.ptyPid || nativeBinding.incarnation !== pending.incarnation) {
+    return disturbedReceived();
+  }
+  return pending;
+}
 
 function installPtyObservation(mainEntry, expectedPtyModule, ptyJournal) {
   // Match production's exact lazy createRequire anchor in instances.js.
@@ -106,7 +198,12 @@ function installPtyObservation(mainEntry, expectedPtyModule, ptyJournal) {
   } catch {
     // unsupported: the private binding stays unknown
   }
-  return observePtyModule(nodePty, ptyJournal, bootstrap === undefined ? {} : { bootstrap });
+  // The runner always supplies the pure bounded received-data census factory
+  // (the shared stdout mode census); the observer registers one owned public
+  // onData subscription per original returned handle and never journals it.
+  const observationOptions = { createReceivedCensus: () => createStdoutModeCensus() };
+  if (bootstrap !== undefined) observationOptions.bootstrap = bootstrap;
+  return observePtyModule(nodePty, ptyJournal, observationOptions);
 }
 
 function writeResult(destination, value) {
@@ -153,6 +250,10 @@ async function main() {
   // session id crosses the wire or reaches a log; only bounded metadata and
   // an opaque proof cross the wire. The proof is never formatted in diagnostics.
   let paneObserver;
+  // The bounded received-data group captured for the exact matched owner
+  // inside the same fresh pane snapshot pass; published only after the
+  // resulting pane/nativeBinding full scope validation.
+  let pendingReceived;
   const exchangeGuard = createNativeExchangeGuard({
     mainPid: () => process.pid,
     geometry: () => ({ columns: outputStream.columns, rows: outputStream.rows }),
@@ -177,6 +278,11 @@ async function main() {
     nativeBinding: (row, nonce) => {
       try {
         if (row === null || typeof row !== 'object' || typeof row.id !== 'string') return undefined;
+        // Capture the bounded received-data group for this exact matched owner
+        // inside the same fresh pane snapshot pass, before the reply is
+        // published. The private lookup revalidates the original binding and
+        // public onData scope; it never journals or publishes raw payloads.
+        pendingReceived = receivedGroupFromLookup(observation.receivedBindingFor(row.id));
         const binding = observation.nativeBindingFor(row.id);
         if (binding === undefined) return undefined; // absent/pending/exited/duplicate: unknown
         let sessionId = null;
@@ -218,11 +324,25 @@ async function main() {
     censusService = createCensusReplyService({
       root: path.dirname(optionsPath),
       mainPid: () => process.pid,
-      buildSnapshot: (nonce) => ({
-        ...censusHandle.snapshot(),
-        activePane: paneObserver.snapshot(nonce),
-        nativeBinding: paneObserver.nativeBinding(),
-      }),
+      buildSnapshot: (nonce) => {
+        // Reset the candidate received group to honest unknown BEFORE the pane
+        // snapshot pass; it is captured inside the same nativeBinding callback
+        // and published only after the resulting pane/nativeBinding full scope
+        // validation. Never re-reads the public owner/roster to select a row.
+        pendingReceived = undefined;
+        const activePane = paneObserver.snapshot(nonce);
+        const nativeBinding = paneObserver.nativeBinding();
+        // Published only after full pane/native-binding scope validation and
+        // the exact original PID/incarnation cross-check.
+        const innerReceived = publishReceived(pendingReceived, activePane, nativeBinding);
+        pendingReceived = undefined;
+        return {
+          ...censusHandle.snapshot(),
+          activePane,
+          nativeBinding,
+          innerReceived,
+        };
+      },
       fs,
     });
     censusService.start();

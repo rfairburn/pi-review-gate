@@ -268,6 +268,45 @@ export function validateMainNativeBindingSnapshot(value: unknown): MainNativeBin
   return group as unknown as MainNativeBindingSnapshot;
 }
 
+/**
+ * Independent bounded diagnostic group for the actual owner's inner ConPTY
+ * original public onData deliveries at census time: the bounded numeric mode
+ * requests observed on the exact owned original-handle public data events
+ * (cumulative, not per-session-epoch), cross-bound to the same original PID /
+ * incarnation. Diagnosis only — it never claims byte delivery to Main's
+ * parser, negotiated terminal state, or a mirror decision, and it carries no
+ * raw payload, id, token, socket path, frame, environment, or proof. scope
+ * true means the received observation ran inside an intact matched live owner
+ * view with the original binding revalidated; scope null means it was never
+ * established; scope false is a sticky supported-scope disturbance.
+ */
+export interface MainInnerReceivedSnapshot {
+  /** True only when the received observation ran inside an intact matched live owner view. */
+  readonly scope: boolean | null;
+  /** True only when every counter below is positively known with the original PID/incarnation. */
+  readonly complete: boolean | null;
+  /** The once-positive original public ConPTY PID; null only when scope is not true. */
+  readonly ptyPid: number | null;
+  /** The current owned-handle incarnation, paired exactly with ptyPid. */
+  readonly incarnation: number | null;
+  /** Public string data events delivered on the exact owned original handle. */
+  readonly dataEvents: number | null;
+  readonly mouseX10Set: number | null;
+  readonly mouseX10Reset: number | null;
+  readonly mouseVt200Set: number | null;
+  readonly mouseVt200Reset: number | null;
+  readonly mouseDragSet: number | null;
+  readonly mouseDragReset: number | null;
+  readonly mouseAnySet: number | null;
+  readonly mouseAnyReset: number | null;
+  readonly mouseSgrSet: number | null;
+  readonly mouseSgrReset: number | null;
+  readonly alternateBufferSet: number | null;
+  readonly alternateBufferReset: number | null;
+  readonly bracketedPasteSet: number | null;
+  readonly bracketedPasteReset: number | null;
+}
+
 /** Exact request leaf payload the parent writes to `main-census-request.json` in the owned fixture root. */
 export interface MainModeCensusRequest {
   readonly schemaVersion: typeof MAIN_CENSUS_SCHEMA_VERSION;
@@ -338,6 +377,8 @@ export interface MainModeCensusSnapshot {
   readonly activePane: MainActivePaneSnapshot;
   /** Independent bounded native-binding group for the actual owner's native child. */
   readonly nativeBinding: MainNativeBindingSnapshot;
+  /** Independent bounded inner-received group for the actual owner's original handle. */
+  readonly innerReceived: MainInnerReceivedSnapshot;
 }
 
 const CENSUS_COUNT_FIELDS = [
@@ -353,9 +394,72 @@ const CENSUS_COUNT_FIELDS = [
 
 const CENSUS_REPLY_KEYS = [
   "schemaVersion", "nonce", "mainPid",
-  "hookActive", "sameOutputStream", "observationComplete", "activePane", "nativeBinding",
+  "hookActive", "sameOutputStream", "observationComplete", "activePane", "nativeBinding", "innerReceived",
   ...CENSUS_COUNT_FIELDS,
 ].sort();
+
+/** Exact bounded inner-received field names, sorted as the validator expects. */
+const INNER_RECEIVED_KEYS = [
+  "complete", "dataEvents", "incarnation", "ptyPid", "scope",
+  ...CENSUS_COUNT_FIELDS.filter((field) => field !== "writeCalls"),
+].sort();
+
+/** The bounded inner-received counter fields, in diagnostic order. */
+const INNER_RECEIVED_COUNT_FIELDS = [
+  "dataEvents",
+  ...CENSUS_COUNT_FIELDS.filter((field) => field !== "writeCalls"),
+];
+
+/**
+ * Strict validation of the independent inner-received group: exact key set,
+ * real scope/complete values, safe-integer bounded non-negative counters, and
+ * the PID/incarnation pair coherence. scope null keeps everything null;
+ * scope false is a sticky disturbance with complete false and all null;
+ * scope true always requires the paired positive original PID/incarnation
+ * (a pending PID never establishes it) — an incomplete positive scope keeps
+ * the known PID/incarnation but ALL counters stay null (never partial). Returns undefined for any malformed or
+ * incoherent group; it never borrows zeros or stale success.
+ */
+export function validateMainInnerReceivedSnapshot(value: unknown): MainInnerReceivedSnapshot | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const group = value as Record<string, unknown>;
+  const keys = Object.keys(group).sort();
+  if (keys.length !== INNER_RECEIVED_KEYS.length || keys.some((key, index) => key !== INNER_RECEIVED_KEYS[index])) {
+    return undefined;
+  }
+  const { scope, complete } = group;
+  if (typeof scope !== "boolean" && scope !== null) return undefined;
+  if (typeof complete !== "boolean" && complete !== null) return undefined;
+  const ptyPid = group.ptyPid;
+  if (ptyPid !== null && (!Number.isSafeInteger(ptyPid) || (ptyPid as number) <= 1)) return undefined;
+  const incarnation = group.incarnation;
+  if (incarnation !== null && (!Number.isSafeInteger(incarnation) || (incarnation as number) < 1)) return undefined;
+  // Pair coherence: the PID/incarnation pair travels together or not at all.
+  if ((ptyPid === null) !== (incarnation === null)) return undefined;
+  for (const field of INNER_RECEIVED_COUNT_FIELDS) {
+    const count = group[field];
+    if (count !== null && (!Number.isSafeInteger(count) || (count as number) < 0 || (count as number) > MAIN_CENSUS_COUNT_LIMIT)) {
+      return undefined;
+    }
+  }
+  const allCountsNull = INNER_RECEIVED_COUNT_FIELDS.every((field) => group[field] === null);
+  const allCountsKnown = INNER_RECEIVED_COUNT_FIELDS.every((field) => typeof group[field] === "number");
+  if (scope === null) {
+    if (complete !== null || ptyPid !== null || !allCountsNull) return undefined;
+  } else if (scope === false) {
+    if (complete !== false || ptyPid !== null || !allCountsNull) return undefined;
+  } else {
+    // A positive scope always requires the original positive PID/incarnation;
+    // a still-pending PID never establishes the received scope.
+    if (ptyPid === null) return undefined;
+    if (complete === true) {
+      if (!allCountsKnown) return undefined;
+    } else if (complete !== false || !allCountsNull) {
+      return undefined; // incomplete keeps the known PID/incarnation but never partial counters
+    }
+  }
+  return group as unknown as MainInnerReceivedSnapshot;
+}
 
 /**
  * Strict validation of one fresh census reply: exact key set, schema version,
@@ -415,6 +519,29 @@ export function validateMainModeCensusReply(
       && activePane.hasLiveProcess === true && activePane.lifecycleAlive === true)) {
     return undefined;
   }
+  // The inner-received group is validated independently of the producer and
+  // pane scopes — an unknown received scope never erases honest other groups
+  // and vice versa — but a positively established received scope requires the
+  // full upstream actual-owner guard chain and the identical original binding
+  // PID/incarnation: an unknown pane or binding never carries a known
+  // received scope, and a mismatched original identity is refused.
+  const innerReceived = validateMainInnerReceivedSnapshot(reply.innerReceived);
+  if (innerReceived === undefined) return undefined;
+  if (innerReceived.scope === true) {
+    if (!(activePane.scope === true && activePane.complete === true
+      && activePane.ownerPresent === true && activePane.focusMain === true && activePane.viewMatched === true
+      && activePane.hasLiveProcess === true && activePane.lifecycleAlive === true
+      && activePane.surfacePresent === true && activePane.modesReadSucceeded === true)) {
+      return undefined;
+    }
+    if (nativeBinding.scope !== true || nativeBinding.complete !== true
+      || nativeBinding.ptyPid === null || nativeBinding.incarnation === null) {
+      return undefined;
+    }
+    if (nativeBinding.ptyPid !== innerReceived.ptyPid || nativeBinding.incarnation !== innerReceived.incarnation) {
+      return undefined;
+    }
+  }
   return reply as unknown as MainModeCensusSnapshot;
 }
 
@@ -431,6 +558,7 @@ export function formatMainCensusDiagnostic(snapshot: MainModeCensusSnapshot | un
   const flag = (value: boolean | null): string => value === true ? "true" : value === false ? "false" : "null";
   const pane = snapshot.activePane;
   const binding = snapshot.nativeBinding;
+  const received = snapshot.innerReceived;
   return [
     "mainCensusDiag{",
     `complete=${snapshot.observationComplete}`,
@@ -453,5 +581,14 @@ export function formatMainCensusDiagnostic(snapshot: MainModeCensusSnapshot | un
     `nativeBinding{scope=${flag(binding.scope)} complete=${flag(binding.complete)}`,
     `pid=${count(binding.ptyPid)} inc=${count(binding.incarnation)}`,
     `epoch=${count(binding.sessionEpoch)} proof=${binding.expectedProof !== null ? "ok" : "none"}}`,
+    `innerReceived{scope=${flag(received.scope)} complete=${flag(received.complete)}`,
+    `pid=${count(received.ptyPid)} inc=${count(received.incarnation)} events=${count(received.dataEvents)}`,
+    `x10Set=${count(received.mouseX10Set)} x10Reset=${count(received.mouseX10Reset)}`,
+    `vt200Set=${count(received.mouseVt200Set)} vt200Reset=${count(received.mouseVt200Reset)}`,
+    `dragSet=${count(received.mouseDragSet)} dragReset=${count(received.mouseDragReset)}`,
+    `anySet=${count(received.mouseAnySet)} anyReset=${count(received.mouseAnyReset)}`,
+    `sgrSet=${count(received.mouseSgrSet)} sgrReset=${count(received.mouseSgrReset)}`,
+    `altSet=${count(received.alternateBufferSet)} altReset=${count(received.alternateBufferReset)}`,
+    `pasteSet=${count(received.bracketedPasteSet)} pasteReset=${count(received.bracketedPasteReset)}}}`,
   ].join(" ");
 }

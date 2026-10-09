@@ -19,8 +19,10 @@ import {
   OriginalMainPidBinding,
   formatMainCensusDiagnostic,
   validateMainActivePaneSnapshot,
+  validateMainInnerReceivedSnapshot,
   validateMainModeCensusReply,
   validateMainNativeBindingSnapshot,
+  type MainInnerReceivedSnapshot,
   type MainModeCensusSnapshot,
 } from "./helpers/session-host-windows-stdout-census-contract";
 import { WindowsMainPtyDriver } from "./helpers/session-host-native-windows-harness";
@@ -137,7 +139,12 @@ function sampleSnapshot(): Record<string, unknown> {
   (stream.write as (data?: unknown) => unknown).call(stream, Buffer.from("\x1b[?1003;1006h\x1b[?1049h"));
   const snapshot = handle.snapshot();
   handle.restore();
-  return { ...snapshot, activePane: completeActivePane(), nativeBinding: completeNativeBinding() };
+  return {
+    ...snapshot,
+    activePane: completeActivePane(),
+    nativeBinding: completeNativeBinding(),
+    innerReceived: completeInnerReceived(),
+  };
 }
 
 /** A coherent, positively-known active-pane group used by the pure regressions. */
@@ -199,6 +206,42 @@ function unestablishedNativeBinding(): Record<string, unknown> {
     incarnation: null,
     sessionEpoch: null,
     expectedProof: null,
+  };
+}
+
+/** A coherent, positively-known inner-received group used by the pure regressions. */
+function completeInnerReceived(): Record<string, unknown> {
+  return {
+    scope: true,
+    complete: true,
+    ptyPid: 4243,
+    incarnation: 1,
+    dataEvents: 1,
+    mouseX10Set: 0, mouseX10Reset: 0,
+    mouseVt200Set: 0, mouseVt200Reset: 0,
+    mouseDragSet: 0, mouseDragReset: 0,
+    mouseAnySet: 1, mouseAnyReset: 0,
+    mouseSgrSet: 1, mouseSgrReset: 0,
+    alternateBufferSet: 1, alternateBufferReset: 0,
+    bracketedPasteSet: 1, bracketedPasteReset: 0,
+  };
+}
+
+/** An honest all-null inner-received group with an explicit independent scope pair. */
+function unknownInnerReceived(scope: boolean | null, complete: boolean | null): Record<string, unknown> {
+  return {
+    scope,
+    complete,
+    ptyPid: null,
+    incarnation: null,
+    dataEvents: null,
+    mouseX10Set: null, mouseX10Reset: null,
+    mouseVt200Set: null, mouseVt200Reset: null,
+    mouseDragSet: null, mouseDragReset: null,
+    mouseAnySet: null, mouseAnyReset: null,
+    mouseSgrSet: null, mouseSgrReset: null,
+    alternateBufferSet: null, alternateBufferReset: null,
+    bracketedPasteSet: null, bracketedPasteReset: null,
   };
 }
 
@@ -1023,6 +1066,8 @@ test("fixture reply builder and parent contract agree on the exact key set", () 
   assert.equal(validated!.mouseAnySet, 1);
   assert.equal(validated!.mouseSgrSet, 1);
   assert.equal(validated!.alternateBufferSet, 1);
+  assert.equal(validated!.innerReceived.dataEvents, 1, "the received group maps internal write calls to data events");
+  assert.equal(validated!.innerReceived.ptyPid, 4243, "the received group is cross-bound to the original binding PID");
 
   const unknownSnapshot: Record<string, unknown> = {
     hookActive: true,
@@ -1030,6 +1075,7 @@ test("fixture reply builder and parent contract agree on the exact key set", () 
     observationComplete: false,
     activePane: completeActivePane(),
     nativeBinding: unestablishedNativeBinding(),
+    innerReceived: unknownInnerReceived(null, null),
   };
   for (const field of censusFixture.CENSUS_COUNT_FIELDS) unknownSnapshot[field] = null;
   assert.ok(validateMainModeCensusReply(censusFixture.buildCensusReply(NONCE, 4242, unknownSnapshot),
@@ -1058,7 +1104,7 @@ test("census reply validation is strict on keys, PID, nonce, schema, and caps", 
     assert.equal(validateMainModeCensusReply(value, expect), undefined, `${label} is refused`);
   }
   const incomplete = censusFixture.buildCensusReply(NONCE, 4242, (() => {
-    const snapshot: Record<string, unknown> = { hookActive: true, sameOutputStream: true, observationComplete: false, activePane: completeActivePane(), nativeBinding: unestablishedNativeBinding() };
+    const snapshot: Record<string, unknown> = { hookActive: true, sameOutputStream: true, observationComplete: false, activePane: completeActivePane(), nativeBinding: unestablishedNativeBinding(), innerReceived: unknownInnerReceived(null, null) };
     for (const field of censusFixture.CENSUS_COUNT_FIELDS) snapshot[field] = null;
     return snapshot;
   })());
@@ -1082,7 +1128,7 @@ test("census reply validation refuses impossible complete flags and keeps honest
     "complete=true with both flags false is impossible");
 
   const unknownReply = (hookActive: boolean, sameOutputStream: boolean): Record<string, unknown> => {
-    const snapshot: Record<string, unknown> = { hookActive, sameOutputStream, observationComplete: false, activePane: completeActivePane(), nativeBinding: unestablishedNativeBinding() };
+    const snapshot: Record<string, unknown> = { hookActive, sameOutputStream, observationComplete: false, activePane: completeActivePane(), nativeBinding: unestablishedNativeBinding(), innerReceived: unknownInnerReceived(null, null) };
     for (const field of censusFixture.CENSUS_COUNT_FIELDS) snapshot[field] = null;
     return censusFixture.buildCensusReply(NONCE, 4242, snapshot);
   };
@@ -1098,7 +1144,7 @@ test("census reply validation treats the active-pane group independently of the 
   const producerUnknownPaneComplete = (() => {
     const snapshot: Record<string, unknown> = {
       hookActive: true, sameOutputStream: true, observationComplete: false, activePane: completeActivePane(),
-      nativeBinding: unestablishedNativeBinding(),
+      nativeBinding: unestablishedNativeBinding(), innerReceived: unknownInnerReceived(null, null),
     };
     for (const field of censusFixture.CENSUS_COUNT_FIELDS) snapshot[field] = null;
     return censusFixture.buildCensusReply(NONCE, 4242, snapshot);
@@ -1116,6 +1162,7 @@ test("census reply validation treats the active-pane group independently of the 
   const producerCompletePaneUnknown = sampleSnapshot();
   producerCompletePaneUnknown.activePane = unknownActivePane(null, null);
   producerCompletePaneUnknown.nativeBinding = unestablishedNativeBinding();
+  producerCompletePaneUnknown.innerReceived = unknownInnerReceived(null, null);
   const validatedUnknownPane = validateMainModeCensusReply(
     censusFixture.buildCensusReply(NONCE, 4242, producerCompletePaneUnknown), expect);
   assert.ok(validatedUnknownPane !== undefined, "a complete producer with an unknown pane validates");
@@ -1129,6 +1176,7 @@ test("census reply validation treats the active-pane group independently of the 
   const partialPane = sampleSnapshot();
   partialPane.activePane = unknownActivePane(true, false);
   partialPane.nativeBinding = unestablishedNativeBinding();
+  partialPane.innerReceived = unknownInnerReceived(null, null);
   const validatedPartial = validateMainModeCensusReply(censusFixture.buildCensusReply(NONCE, 4242, partialPane), expect);
   assert.ok(validatedPartial !== undefined, "an intact scope with unknown fields stays a valid honest partial observation");
   assert.equal(validatedPartial!.activePane.scope, true);
@@ -1237,6 +1285,129 @@ test("native-binding validation enforces exact keys, pair coherence, and proof i
   assert.ok(validateMainNativeBindingSnapshot(attemptedUnknown) !== undefined, "an attempted unknown binding validates");
 });
 
+test("inner-received validation rejects malformed, incoherent, and partial groups", () => {
+  assert.ok(validateMainInnerReceivedSnapshot(completeInnerReceived()) !== undefined, "the known coherent group validates");
+  assert.ok(validateMainInnerReceivedSnapshot(unknownInnerReceived(null, null)) !== undefined, "an unestablished group validates");
+  assert.ok(validateMainInnerReceivedSnapshot(unknownInnerReceived(false, false)) !== undefined, "a disturbed group validates");
+  // A positive scope without the original PID/incarnation (still pending) is
+  // never established: the runner reports it as an all-null unestablished group.
+  const pending = unknownInnerReceived(true, false);
+  assert.equal(validateMainInnerReceivedSnapshot(pending), undefined, "a positive scope without the original PID is refused");
+  // An incomplete positive scope may keep the known original PID/incarnation.
+  const incompleteKnownPid = { ...unknownInnerReceived(true, false), ptyPid: 4243, incarnation: 1 };
+  assert.ok(validateMainInnerReceivedSnapshot(incompleteKnownPid) !== undefined,
+    "an incomplete positive scope keeps the known original PID/incarnation");
+
+  const invalid: Array<[string, Record<string, unknown>]> = [
+    ["extra key", { ...completeInnerReceived(), extra: 1 }],
+    ["missing key", Object.fromEntries(Object.entries(completeInnerReceived()).filter(([key]) => key !== "scope"))],
+    ["non-boolean scope", { ...completeInnerReceived(), scope: "true" }],
+    ["null scope with a false complete", unknownInnerReceived(null, false)],
+    ["disturbed scope marked complete", { ...unknownInnerReceived(false, false), complete: true }],
+    ["disturbed scope with a known PID", { ...unknownInnerReceived(false, false), ptyPid: 4243, incarnation: 1 }],
+    ["PID without its incarnation pair", { ...completeInnerReceived(), incarnation: null }],
+    ["incarnation without its PID pair", { ...completeInnerReceived(), ptyPid: null }],
+    ["zero PID", { ...completeInnerReceived(), ptyPid: 0 }],
+    ["zero incarnation", { ...completeInnerReceived(), incarnation: 0 }],
+    ["string count", { ...completeInnerReceived(), dataEvents: "1" }],
+    ["negative count", { ...completeInnerReceived(), mouseSgrSet: -1 }],
+    ["over-cap count", { ...completeInnerReceived(), mouseSgrSet: MAIN_CENSUS_COUNT_LIMIT + 1 }],
+    ["complete with a null counter", { ...completeInnerReceived(), bracketedPasteReset: null }],
+    ["incomplete with a numeric counter", { ...unknownInnerReceived(true, false), dataEvents: 0 }],
+    ["positive scope complete without the original PID", { ...completeInnerReceived(), ptyPid: null, incarnation: null }],
+  ];
+  for (const [label, value] of invalid) {
+    assert.equal(validateMainInnerReceivedSnapshot(value), undefined, `${label} is refused`);
+  }
+});
+
+test("census reply validation treats the inner-received group independently of the other scopes", () => {
+  const expect = { nonce: NONCE, expectedMainPid: 4242 };
+  // A disturbed received scope never erases honest producer/pane/binding evidence.
+  const disturbedReceived = sampleSnapshot();
+  disturbedReceived.innerReceived = unknownInnerReceived(false, false);
+  const validatedDisturbed = validateMainModeCensusReply(
+    censusFixture.buildCensusReply(NONCE, 4242, disturbedReceived), expect);
+  assert.ok(validatedDisturbed !== undefined, "a disturbed received group validates alongside honest other groups");
+  assert.equal(validatedDisturbed!.observationComplete, true, "honest producer counts survive a disturbed received scope");
+  assert.equal(validatedDisturbed!.innerReceived.scope, false);
+
+  // A positively established received scope requires the intact upstream guard
+  // chain: an unknown pane never carries a known received scope.
+  const receivedWithoutPane = sampleSnapshot();
+  receivedWithoutPane.activePane = unknownActivePane(null, null);
+  receivedWithoutPane.nativeBinding = unestablishedNativeBinding();
+  assert.equal(validateMainModeCensusReply(
+    censusFixture.buildCensusReply(NONCE, 4242, receivedWithoutPane), expect), undefined,
+    "a known received scope requires the intact actual-owner guard chain");
+
+  // A positively established received scope requires a positively established
+  // native binding with the identical original PID/incarnation.
+  const receivedWithoutBinding = sampleSnapshot();
+  receivedWithoutBinding.nativeBinding = unestablishedNativeBinding();
+  assert.equal(validateMainModeCensusReply(
+    censusFixture.buildCensusReply(NONCE, 4242, receivedWithoutBinding), expect), undefined,
+    "a known received scope never rides on an unestablished native binding");
+
+  const receivedOnIncompleteBinding = sampleSnapshot();
+  receivedOnIncompleteBinding.nativeBinding = {
+    ...completeNativeBinding(), complete: false, sessionEpoch: null, expectedProof: null,
+  };
+  assert.equal(validateMainModeCensusReply(
+    censusFixture.buildCensusReply(NONCE, 4242, receivedOnIncompleteBinding), expect), undefined,
+    "a known received scope requires the complete authenticated native binding");
+
+  for (const change of [{ focusMain: false }, { surfacePresent: false, modesReadSucceeded: false, mouseTracking: null, mouseEncoding: null }]) {
+    const withoutFullPane = sampleSnapshot();
+    withoutFullPane.activePane = { ...completeActivePane(), ...change };
+    assert.equal(validateMainModeCensusReply(
+      censusFixture.buildCensusReply(NONCE, 4242, withoutFullPane), expect), undefined,
+      "a known received scope requires complete Main-focused pane authority");
+  }
+
+  const mismatchedPid = sampleSnapshot();
+  mismatchedPid.innerReceived = { ...completeInnerReceived(), ptyPid: 9999 };
+  assert.equal(validateMainModeCensusReply(
+    censusFixture.buildCensusReply(NONCE, 4242, mismatchedPid), expect), undefined,
+    "a received scope with a different original PID is refused");
+
+  const mismatchedIncarnation = sampleSnapshot();
+  mismatchedIncarnation.innerReceived = { ...completeInnerReceived(), incarnation: 2 };
+  assert.equal(validateMainModeCensusReply(
+    censusFixture.buildCensusReply(NONCE, 4242, mismatchedIncarnation), expect), undefined,
+    "a received scope with a different incarnation is refused");
+
+  // An unestablished received scope never erases honest other groups.
+  const unestablishedReceived = sampleSnapshot();
+  unestablishedReceived.innerReceived = unknownInnerReceived(null, null);
+  assert.ok(validateMainModeCensusReply(
+    censusFixture.buildCensusReply(NONCE, 4242, unestablishedReceived), expect) !== undefined,
+    "an unestablished received group validates alongside honest other groups");
+
+  // An intact received scope whose counters went unknown (overflow, unsupported
+  // data, partial-at-snapshot) keeps the original PID/incarnation with ALL
+  // counters null and never erases honest producer/pane/binding evidence.
+  const incompleteReceived = sampleSnapshot();
+  incompleteReceived.innerReceived = { ...unknownInnerReceived(true, false), ptyPid: 4243, incarnation: 1 };
+  const validatedIncomplete = validateMainModeCensusReply(
+    censusFixture.buildCensusReply(NONCE, 4242, incompleteReceived), expect);
+  assert.ok(validatedIncomplete !== undefined, "an incomplete received group validates alongside honest other groups");
+  assert.equal(validatedIncomplete!.observationComplete, true, "honest producer counts survive unknown received counters");
+  assert.equal(validatedIncomplete!.writeCalls, 1);
+  assert.equal(validatedIncomplete!.activePane.complete, true, "the honest pane group survives unknown received counters");
+  assert.equal(validatedIncomplete!.nativeBinding.complete, true, "the honest binding group survives unknown received counters");
+  assert.equal(validatedIncomplete!.innerReceived.dataEvents, null, "unknown received counters stay null, never zero");
+
+  // A positive received scope never rides on a binding group without the PID pair.
+  const receivedOnPidlessBinding = sampleSnapshot();
+  receivedOnPidlessBinding.nativeBinding = {
+    scope: true, complete: false, ptyPid: null, incarnation: null, sessionEpoch: null, expectedProof: null,
+  };
+  assert.equal(validateMainModeCensusReply(
+    censusFixture.buildCensusReply(NONCE, 4242, receivedOnPidlessBinding), expect), undefined,
+    "a positive received scope requires the native-binding original PID/incarnation");
+});
+
 test("census diagnostic reports the bounded active-pane group without raw data", () => {
   const validated = validateMainModeCensusReply(censusFixture.buildCensusReply(NONCE, 4242, sampleSnapshot()),
     { nonce: NONCE, expectedMainPid: 4242 })!;
@@ -1244,12 +1415,18 @@ test("census diagnostic reports the bounded active-pane group without raw data",
   assert.ok(line.includes("activePane{complete=true scope=true owner=true"), "the known pane flags are disclosed");
   assert.ok(line.includes("tracking=4 encoding=1"), "the known pane modes are disclosed as bounded enums");
   assert.ok(line.includes("geomCols=null geomRows=null}"), "absent public geometry stays explicit null");
+  assert.ok(line.includes("innerReceived{scope=true complete=true"), "the known received scope is disclosed");
+  assert.ok(line.includes("events=1"), "the bounded data-event count is disclosed");
+  assert.ok(line.includes("proof=ok}"), "the binding proof is disclosed only as a present flag and its group is closed");
+  assert.ok(!line.includes("a".repeat(64)), "the opaque proof is never formatted");
+  assert.ok(!line.includes("writeCalls") && !line.includes("stdout"), "received events are never named stdout writes");
+  assert.match(line, /^mainCensusDiag\{[a-zA-Z0-9= ,{}]+\}$/, "only bounded numeric/boolean tokens are emitted");
   assert.ok(line.length < 1_024, "the extended diagnostic line stays bounded");
 
   const unknownPane = (() => {
     const snapshot: Record<string, unknown> = {
       hookActive: true, sameOutputStream: true, observationComplete: false, activePane: unknownActivePane(null, null),
-      nativeBinding: unestablishedNativeBinding(),
+      nativeBinding: unestablishedNativeBinding(), innerReceived: unknownInnerReceived(null, null),
     };
     for (const field of censusFixture.CENSUS_COUNT_FIELDS) snapshot[field] = null;
     return snapshot;
@@ -1258,6 +1435,8 @@ test("census diagnostic reports the bounded active-pane group without raw data",
     censusFixture.buildCensusReply(NONCE, 4242, unknownPane), { nonce: NONCE, expectedMainPid: 4242 })!);
   assert.ok(unknownLine.includes("activePane{complete=null scope=null owner=null"),
     "an unknown pane reports explicit nulls, never a guessed value");
+  assert.ok(unknownLine.includes("innerReceived{scope=null complete=null"),
+    "an unestablished received group reports explicit nulls, never a guessed value");
 });
 
 /**
@@ -1332,6 +1511,7 @@ test("a failing outer-VT assertion keeps complete producer counts alongside an u
   const reply = sampleSnapshot();
   reply.activePane = unknownActivePane(true, false);
   reply.nativeBinding = unestablishedNativeBinding();
+  reply.innerReceived = unknownInnerReceived(null, null);
   const census = validateMainModeCensusReply(censusFixture.buildCensusReply(NONCE, 4242, reply),
     { nonce: NONCE, expectedMainPid: 4242 });
   assert.ok(census !== undefined, "complete producer counts with a coherent unknown pane still validate");
@@ -1373,6 +1553,7 @@ test("census diagnostic is bounded, metadata-only, and free of raw output", () =
     observationComplete: false,
     activePane: completeActivePane(),
     nativeBinding: unestablishedNativeBinding(),
+    innerReceived: unknownInnerReceived(false, false),
   };
   for (const field of censusFixture.CENSUS_COUNT_FIELDS) unknownSnapshot[field] = null;
   const unknownLine = formatMainCensusDiagnostic(validateMainModeCensusReply(

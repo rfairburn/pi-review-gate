@@ -34,6 +34,7 @@ import {
   validateNativeCensusReply,
 } from "./helpers/session-host-windows-native-stdout-census-contract";
 import {
+  validateMainInnerReceivedSnapshot,
   validateMainNativeBindingSnapshot,
   type MainNativeBindingSnapshot,
 } from "./helpers/session-host-windows-stdout-census-contract";
@@ -1688,6 +1689,7 @@ function ptyFixture(options: { immediatePid?: number; throwPidOnce?: boolean; fa
     types,
   }) as (nodePty: unknown, journal: string, options?: Record<string, unknown>) => {
     nativeBindingFor(instanceId: string): { pid: number; incarnation: number; bootstrap: Record<string, unknown> } | undefined;
+    receivedBindingFor(instanceId: string): ReceivedLookup | undefined;
     snapshot(): { forceAttempted: boolean; journalFailed: boolean };
     restore(): void;
   };
@@ -1707,7 +1709,7 @@ function ptyFixture(options: { immediatePid?: number; throwPidOnce?: boolean; fa
   assert.equal(Reflect.apply(module.spawn, module, args), handle, "observer returns the identical public handle");
   assert.equal(spawnReceiver, module, "original spawn receiver is preserved");
   return {
-    handle, module, originalSpawn, observation, records,
+    handle, module, originalSpawn, observation, records, dataListeners,
     data(nextPid: number) { pid = nextPid; for (const listener of [...dataListeners]) listener("SYNTHETIC ignored terminal data"); },
     exit() { for (const listener of exitListeners) listener({ exitCode: 0 }); },
   };
@@ -1911,4 +1913,614 @@ test("pty observer bootstrap capture refuses proxy spawn options and env before 
   assert.equal(thrown, boom, "the original spawn error is thrown identically through a refused proxy env");
   assert.equal(receiver3, module3, "the original receiver is preserved for a throwing spawn");
   assert.equal(envTrapCalls2, 0, "no env descriptor trap runs before the original spawn throws");
+});
+
+// ---------------------------------------------------------------------------
+// PTY observer received-data census regressions (sliced exact source, no real
+// PTY or filesystem).
+// ---------------------------------------------------------------------------
+
+const receivedCensusFixture = require("../../tests/fixtures/session-host-windows-stdout-census.cjs") as {
+  createStdoutModeCensus(options?: { maxCarry?: number; maxCount?: number }): {
+    beginOffer(data: unknown, second?: unknown): { commit(): void; discard(): void } | null;
+    markUnknown(): void;
+    snapshot(): { readonly unknown: boolean; readonly counts: Record<string, number> };
+  };
+};
+
+interface ReceivedLookup {
+  readonly disturbed?: boolean;
+  readonly pid?: number | null;
+  readonly incarnation?: number | null;
+  readonly snapshot?: { readonly unknown: boolean; readonly counts: Record<string, number> };
+}
+
+function ptyReceivedFixture(options: {
+  immediatePid?: number;
+  maxCount?: number;
+  onDataOnPrototype?: boolean;
+  onDataAccessor?: boolean;
+  exitDuringDataRegistration?: boolean;
+  onDataThrowsOnce?: boolean;
+  createReceivedCensus?: () => unknown;
+} = {}) {
+  const records: Record<string, unknown>[] = [];
+  const dataListeners: ((data: unknown) => void)[] = [];
+  const exitListeners: ((event: { exitCode: number }) => void)[] = [];
+  let pid = options.immediatePid ?? 0;
+  let exitFiredDuringRegistration = false;
+  let onDataThrows = options.onDataThrowsOnce === true;
+  let onDataCalls = 0;
+  let disposeCalls = 0;
+  const registerDataListener = (listener: (data: unknown) => void): { dispose(): void } => {
+    onDataCalls += 1;
+    if (onDataThrows) { onDataThrows = false; throw new Error("SYNTHETIC onData registration failure"); }
+    dataListeners.push(listener);
+    if (options.exitDuringDataRegistration === true && !exitFiredDuringRegistration) {
+      exitFiredDuringRegistration = true;
+      for (const exitListener of [...exitListeners]) exitListener({ exitCode: 0 });
+    }
+    return {
+      dispose() {
+        disposeCalls += 1;
+        const i = dataListeners.indexOf(listener);
+        if (i >= 0) dataListeners.splice(i, 1);
+      },
+    };
+  };
+  let handle: Record<string, unknown>;
+  let onDataGetterCalls = 0;
+  if (options.onDataAccessor === true) {
+    // The pinned public node-pty shape: a getter-backed onData accessor on a
+    // base prototype below the concrete handle prototype. Each read returns a
+    // FRESH closure, so revalidation can never rely on comparing closures.
+    class BasePtyHandle {
+      get pid() { return pid; }
+      get onData(): (listener: (data: unknown) => void) => { dispose(): void } {
+        onDataGetterCalls += 1;
+        return (listener: (data: unknown) => void) => registerDataListener(listener);
+      }
+      kill(): unknown { return "SYNTHETIC kill return"; }
+    }
+    class ConcretePtyHandle extends BasePtyHandle {}
+    handle = new ConcretePtyHandle() as unknown as Record<string, unknown>;
+  } else if (options.onDataOnPrototype === true) {
+    class PrototypePtyHandle {
+      get pid() { return pid; }
+      onData(listener: (data: unknown) => void): { dispose(): void } { return registerDataListener(listener); }
+      kill(): unknown { return "SYNTHETIC kill return"; }
+    }
+    handle = new PrototypePtyHandle() as unknown as Record<string, unknown>;
+  } else {
+    handle = {
+      get pid() { return pid; },
+      onData: (listener: (data: unknown) => void): { dispose(): void } => registerDataListener(listener),
+      kill(): unknown { return "SYNTHETIC kill return"; },
+    };
+  }
+  Object.defineProperty(handle, "onExit", { configurable: false, get: () => (listener: (event: { exitCode: number }) => void) => {
+    exitListeners.push(listener);
+    return { dispose() {} };
+  } });
+  const originalSpawn = function(this: unknown, ...args: unknown[]): unknown { return handle; };
+  const module = { spawn: originalSpawn };
+  const install = runInNewContext(`${ptyDeclaration}\nobservePtyModule`, {
+    process: { platform: "win32", on: () => {} },
+    appendMetadata: (_destination: string, record: Record<string, unknown>) => { records.push({ ...record }); },
+    types,
+  }) as (nodePty: unknown, journal: string, options?: Record<string, unknown>) => {
+    nativeBindingFor(instanceId: string): unknown;
+    receivedBindingFor(instanceId: string): ReceivedLookup | undefined;
+    snapshot(): { forceAttempted: boolean; journalFailed: boolean };
+    restore(): void;
+  };
+  const observation = install(module, "/synthetic/journal", {
+    bootstrap: {
+      envName: BOOTSTRAP_ENV_NAME,
+      parse: (value: unknown): Record<string, unknown> | undefined => {
+        if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+        const v = value as Record<string, unknown>;
+        if (v.instanceId !== BOOTSTRAP.instanceId) return undefined;
+        return { ...BOOTSTRAP, ...v };
+      },
+    },
+    createReceivedCensus: options.createReceivedCensus
+      ?? (() => receivedCensusFixture.createStdoutModeCensus(options.maxCount === undefined ? {} : { maxCount: options.maxCount })),
+  });
+  const env: Record<string, unknown> = { [BOOTSTRAP_ENV_NAME]: JSON.stringify({ ...BOOTSTRAP }) };
+  assert.equal(Reflect.apply(module.spawn, module, ["SYNTHETIC-node", ["SYNTHETIC-cli"], { cwd: "/synthetic/workspace", env }]), handle,
+    "observer returns the identical public handle");
+  return {
+    handle, module, originalSpawn, observation, records, dataListeners,
+    get onDataCalls() { return onDataCalls; },
+    get disposeCalls() { return disposeCalls; },
+    get onDataGetterCalls() { return onDataGetterCalls; },
+    setPid(next: number) { pid = next; },
+    data(...payloads: unknown[]) { for (const payload of payloads) for (const listener of [...dataListeners]) listener(payload); },
+    exit() { for (const listener of exitListeners) listener({ exitCode: 0 }); },
+  };
+}
+
+test("pty observer received census captures first and all public string data with exactly one owned subscription", () => {
+  // Positive PID at spawn: the owned subscription is still registered once.
+  const f = ptyReceivedFixture({ immediatePid: 731 });
+  assert.equal(f.dataListeners.length, 1, "exactly one owned onData subscription per original handle");
+  const productionPayloads: unknown[] = [];
+  (f.handle.onData as (listener: (data: unknown) => void) => { dispose(): void })(
+    (data: unknown) => { productionPayloads.push(data); });
+  assert.equal(f.dataListeners.length, 2, "production's later subscriber is added after the observer's");
+  f.data("\x1b[?1003h", "\x1b[?1006h\x1b[?1049h");
+  const result = f.observation.receivedBindingFor(BOOTSTRAP.instanceId);
+  assert.ok(result !== undefined && result.disturbed !== true, "the intact scope resolves the census");
+  assert.equal(result!.pid, 731);
+  assert.equal(result!.incarnation, 1);
+  assert.equal(result!.snapshot!.unknown, false);
+  assert.equal(result!.snapshot!.counts.writeCalls, 2, "internal write calls map to public data events");
+  assert.equal(result!.snapshot!.counts.mouseAnySet, 1);
+  assert.equal(result!.snapshot!.counts.mouseSgrSet, 1);
+  assert.equal(result!.snapshot!.counts.alternateBufferSet, 1);
+  assert.deepEqual(productionPayloads, ["\x1b[?1003h", "\x1b[?1006h\x1b[?1049h"], "production sees identical payloads in order");
+
+  // Initially pending PID: the first data is captured before the positive PID.
+  const pending = ptyReceivedFixture();
+  assert.equal(pending.dataListeners.length, 1, "the subscription is registered even while the PID is pending");
+  pending.data("\x1b[?1006h");
+  let pendingResult = pending.observation.receivedBindingFor(BOOTSTRAP.instanceId);
+  assert.ok(pendingResult !== undefined && pendingResult.disturbed !== true, "a pending PID keeps the intact scope");
+  assert.equal(pendingResult!.pid, null, "a pending PID stays unbound, never guessed");
+  assert.equal(pendingResult!.incarnation, null);
+  assert.equal(pendingResult!.snapshot!.counts.mouseSgrSet, 1, "the first data event is captured before the positive PID");
+  pending.setPid(732);
+  pending.data("\x1b[?1049h");
+  pendingResult = pending.observation.receivedBindingFor(BOOTSTRAP.instanceId);
+  assert.equal(pendingResult!.pid, 732, "the once-positive original PID binds the retained census");
+  assert.equal(pendingResult!.snapshot!.counts.writeCalls, 2);
+  assert.equal(pendingResult!.snapshot!.counts.alternateBufferSet, 1);
+});
+
+test("pty observer received census splits DEC lists across deliveries and counts them once", () => {
+  const f = ptyReceivedFixture({ immediatePid: 731 });
+  f.data("\x1b[?1003;100");
+  f.data("6h");
+  const result = f.observation.receivedBindingFor(BOOTSTRAP.instanceId);
+  assert.equal(result!.snapshot!.counts.mouseAnySet, 1, "the split list counts once when complete");
+  assert.equal(result!.snapshot!.counts.mouseSgrSet, 1);
+  assert.equal(result!.snapshot!.unknown, false);
+});
+
+test("pty observer received census latches sticky unknown on snapshot-between-split, unsupported, proxy, overflow, and carry failure", () => {
+  // A snapshot observed while the DEC list is still outstanding latches unknown.
+  const split = ptyReceivedFixture({ immediatePid: 731 });
+  split.data("\x1b[?1003;100");
+  let result = split.observation.receivedBindingFor(BOOTSTRAP.instanceId);
+  assert.equal(result!.snapshot!.unknown, true, "an outstanding partial sequence is sticky unknown at snapshot time");
+  split.data("6h");
+  result = split.observation.receivedBindingFor(BOOTSTRAP.instanceId);
+  assert.equal(result!.snapshot!.unknown, true, "a later suffix never borrows known counts");
+
+  // A non-string payload is sticky unknown without any property trap.
+  const buffer = ptyReceivedFixture({ immediatePid: 731 });
+  buffer.data(Buffer.from("\x1b[?1006h"));
+  assert.equal(buffer.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.snapshot!.unknown, true, "a Buffer payload is sticky unknown");
+
+  // A proxy string payload is refused without invoking its traps.
+  let trapCalls = 0;
+  const proxied = ptyReceivedFixture({ immediatePid: 731 });
+  // A Proxy target must be an object; the proxy mimics a string-like payload.
+  const trap = (): undefined => { trapCalls += 1; return undefined; };
+  proxied.data(new Proxy({ length: 8 }, {
+    get: trap,
+    getOwnPropertyDescriptor: trap,
+    getPrototypeOf: () => { trapCalls += 1; return null; },
+    has: () => { trapCalls += 1; return false; },
+  }));
+  assert.equal(proxied.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.snapshot!.unknown, true, "a proxy payload is sticky unknown");
+  assert.equal(trapCalls, 0, "no property trap runs for a proxy payload");
+
+  // Counter overflow is sticky unknown.
+  const overflow = ptyReceivedFixture({ immediatePid: 731, maxCount: 2 });
+  overflow.data("\x1b[?1006h", "\x1b[?1006h", "\x1b[?1006h");
+  assert.equal(overflow.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.snapshot!.unknown, true, "a counter overflow is sticky unknown");
+
+  // Carry truncation is sticky unknown.
+  const carry = ptyReceivedFixture({ immediatePid: 731 });
+  carry.data("\x1b[?" + "1".repeat(70) + "h");
+  assert.equal(carry.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.snapshot!.unknown, true, "a truncated carry is sticky unknown");
+});
+
+test("pty observer received scope is sticky unknown for slot and prototype disturbances and fails the guard lookup closed", () => {
+  // A shadowed/replaced own onData slot is sticky unknown; reverting never repairs.
+  const f = ptyReceivedFixture({ immediatePid: 731 });
+  f.data("\x1b[?1006h");
+  assert.ok(f.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.disturbed !== true, "the intact scope resolves before the disturbance");
+  const originalOnData = f.handle.onData;
+  Object.defineProperty(f.handle, "onData", { value: function foreign(): unknown { return { dispose() {} }; }, writable: true, configurable: true });
+  assert.equal(f.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.disturbed, true, "a shadowed onData slot is sticky unknown");
+  assert.equal(f.observation.nativeBindingFor(BOOTSTRAP.instanceId), undefined, "the shared private-binding scope fails closed for the guard");
+  Object.defineProperty(f.handle, "onData", { value: originalOnData, writable: true, configurable: true });
+  assert.equal(f.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.disturbed, true, "a reverted shadow never repairs the scope");
+
+  // A changed prototype chain is sticky unknown; reverting never repairs.
+  const proto = ptyReceivedFixture({ immediatePid: 731, onDataOnPrototype: true });
+  proto.data("\x1b[?1006h");
+  assert.ok(proto.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.disturbed !== true, "a prototype-resolved slot resolves before the disturbance");
+  const originalPrototype = Object.getPrototypeOf(proto.handle);
+  Object.setPrototypeOf(proto.handle, {});
+  assert.equal(proto.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.disturbed, true, "a changed prototype chain is sticky unknown");
+  assert.equal(proto.observation.nativeBindingFor(BOOTSTRAP.instanceId), undefined, "the shared private-binding scope fails closed for the guard");
+  Object.setPrototypeOf(proto.handle, originalPrototype);
+  assert.equal(proto.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.disturbed, true, "a reverted prototype never repairs the scope");
+});
+
+test("pty observer received lookup refuses duplicate, foreign, changed-PID, and exited bindings", () => {
+  // A foreign instance id is unestablished.
+  const f = ptyReceivedFixture({ immediatePid: 731 });
+  assert.equal(f.observation.receivedBindingFor("other-instance-id"), undefined, "a foreign instance id is unestablished");
+
+  // A duplicate owner for the same instance id is ambiguous, never last-wins.
+  const env: Record<string, unknown> = { [BOOTSTRAP_ENV_NAME]: JSON.stringify({ ...BOOTSTRAP }) };
+  Reflect.apply(f.module.spawn, f.module, ["SYNTHETIC-node", ["SYNTHETIC-cli"], { cwd: "/synthetic/workspace", env }]);
+  assert.equal(f.observation.receivedBindingFor(BOOTSTRAP.instanceId), undefined, "a duplicate owner is ambiguous, never guessed");
+  assert.equal(f.observation.nativeBindingFor(BOOTSTRAP.instanceId), undefined, "the native binding is ambiguous too");
+
+  // A changed public PID is sticky unknown.
+  const pidDrift = ptyReceivedFixture({ immediatePid: 731 });
+  pidDrift.data("\x1b[?1006h");
+  assert.ok(pidDrift.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.disturbed !== true, "the intact scope resolves before the drift");
+  pidDrift.setPid(999);
+  pidDrift.data("ignored");
+  assert.equal(pidDrift.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.disturbed, true, "a changed PID is sticky unknown");
+
+  // An actual exit is disturbed.
+  const exited = ptyReceivedFixture({ immediatePid: 731 });
+  exited.data("\x1b[?1006h");
+  assert.ok(exited.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.disturbed !== true, "the intact scope resolves before the exit");
+  exited.exit();
+  assert.equal(exited.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.disturbed, true, "an exited handle is disturbed");
+});
+
+test("pty observer default behavior without the received factory is unchanged", () => {
+  // Positive PID at spawn: no onData subscription at all (exact existing conditional).
+  const positive = ptyFixture({ immediatePid: 731 });
+  assert.equal(positive.dataListeners.length, 0, "a positive PID needs no data subscription by default");
+  assert.equal(positive.observation.receivedBindingFor(BOOTSTRAP.instanceId), undefined, "the received lookup is unestablished without the factory");
+
+  // Pending PID: the exact conditional PID-observation subscription remains.
+  const pending = ptyFixture();
+  assert.equal(pending.dataListeners.length, 1, "a pending PID keeps the exact conditional subscription");
+  pending.data(731);
+  assert.ok(pending.observation.nativeBindingFor(BOOTSTRAP.instanceId) !== undefined, "PID observation still works by default");
+});
+
+test("pty observer received subscription disposes exactly once on exit, including reentrant exit during registration", () => {
+  const f = ptyReceivedFixture({ immediatePid: 731 });
+  assert.equal(f.dataListeners.length, 1);
+  assert.equal(f.onDataCalls, 1, "exactly one owned onData registration");
+  f.exit();
+  assert.equal(f.dataListeners.length, 0, "the exact owned subscription disposes on the original public exit");
+  assert.equal(f.disposeCalls, 1, "the owned subscription disposes exactly once");
+  f.exit(); // a repeated public exit notification never disposes twice
+  assert.equal(f.disposeCalls, 1, "a repeated exit never re-disposes the owned subscription");
+
+  // A reentrant exit during registration disposes exactly once, after registration returns.
+  const reentrant = ptyReceivedFixture({ immediatePid: 731, exitDuringDataRegistration: true });
+  assert.equal(reentrant.dataListeners.length, 0, "the reentrant exit disposed the subscription after registration");
+  assert.equal(reentrant.disposeCalls, 1, "the reentrant exit disposes exactly once");
+  reentrant.exit();
+  assert.equal(reentrant.disposeCalls, 1, "a later exit never re-disposes the reentrantly settled subscription");
+  assert.equal(reentrant.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.disturbed, true, "an exited handle is disturbed");
+  assert.equal(reentrant.observation.snapshot().journalFailed, false, "the reentrant settlement is not a journal failure");
+});
+
+test("pty observer received census forwards to production unchanged and contains observation failures", () => {
+  // A throwing census never escapes into production delivery or the journal.
+  let beginCalls = 0;
+  const throwing = ptyReceivedFixture({
+    immediatePid: 731,
+    createReceivedCensus: () => ({
+      beginOffer() { beginCalls += 1; throw new Error("SYNTHETIC census failure"); },
+      markUnknown() {},
+      snapshot() { return { unknown: false, counts: { writeCalls: 0 } }; },
+    }),
+  });
+  const delivered: unknown[] = [];
+  (throwing.handle.onData as (listener: (data: unknown) => void) => { dispose(): void })(
+    (data: unknown) => { delivered.push(data); });
+  throwing.data("\x1b[?1006h", "\x1b[?1000h");
+  assert.deepEqual(delivered, ["\x1b[?1006h", "\x1b[?1000h"], "production still receives every identical payload in order");
+  assert.equal(beginCalls, 1, "a failed observation is sticky: later payloads are not re-observed");
+  const failed = throwing.observation.receivedBindingFor(BOOTSTRAP.instanceId);
+  assert.ok(failed !== undefined && failed.disturbed !== true, "a contained census failure keeps the original binding scope");
+  assert.equal(failed!.snapshot!.unknown, true, "a contained census failure makes the received counters unknown");
+  assert.equal(throwing.observation.snapshot().journalFailed, false, "a census failure is never a journal failure");
+  assert.ok(throwing.observation.nativeBindingFor(BOOTSTRAP.instanceId) !== undefined,
+    "a received-counter failure never erases the independent native binding");
+
+  // A registration failure with a positive PID is contained: no journal failure,
+  // the received group is disturbed, and the native binding is unaffected.
+  const registration = ptyReceivedFixture({ immediatePid: 731, onDataThrowsOnce: true });
+  assert.equal(registration.onDataCalls, 1, "registration is attempted exactly once");
+  assert.equal(registration.dataListeners.length, 0, "no subscription is retained after a failed registration");
+  assert.equal(registration.observation.snapshot().journalFailed, false, "a contained registration failure is not a journal failure");
+  assert.equal(registration.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.disturbed, true,
+    "a registration failure is sticky unknown");
+  assert.ok(registration.observation.nativeBindingFor(BOOTSTRAP.instanceId) !== undefined,
+    "a contained received registration failure never erases the native binding");
+
+  // A registration failure while the PID is still pending keeps the exact
+  // default failure path (the default PID subscription would also have failed).
+  const pendingRegistration = ptyReceivedFixture({ onDataThrowsOnce: true });
+  assert.equal(pendingRegistration.observation.snapshot().journalFailed, true,
+    "a failed pending-PID registration keeps the exact default journal failure");
+  assert.ok(pendingRegistration.records.some((record) => record.type === "pty_observation_failed"));
+  assert.equal(pendingRegistration.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.disturbed, true);
+});
+
+test("pty observer received scope latches through the guard lookup and an inserted prototype link", () => {
+  // A shadow observed ONLY by the guard's binding lookup and then reverted can
+  // never certify: both lookups stay closed.
+  const guardOnly = ptyReceivedFixture({ immediatePid: 731 });
+  assert.ok(guardOnly.observation.nativeBindingFor(BOOTSTRAP.instanceId) !== undefined, "the intact binding resolves first");
+  const originalOnData = guardOnly.handle.onData;
+  Object.defineProperty(guardOnly.handle, "onData", { value: function foreign(): unknown { return { dispose() {} }; }, writable: true, configurable: true });
+  assert.equal(guardOnly.observation.nativeBindingFor(BOOTSTRAP.instanceId), undefined, "the guard lookup fails closed on a shadow");
+  Object.defineProperty(guardOnly.handle, "onData", { value: originalOnData, writable: true, configurable: true });
+  assert.equal(guardOnly.observation.nativeBindingFor(BOOTSTRAP.instanceId), undefined, "a reverted shadow never certifies the guard");
+  assert.equal(guardOnly.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.disturbed, true,
+    "the latched scope also leaves the received group disturbed");
+
+  // An inserted prototype link that still resolves the same holder/method is
+  // a changed chain and is sticky unknown.
+  const inserted = ptyReceivedFixture({ immediatePid: 731, onDataOnPrototype: true });
+  const originalPrototype = Object.getPrototypeOf(inserted.handle) as object;
+  Object.setPrototypeOf(inserted.handle, Object.create(originalPrototype));
+  assert.equal(inserted.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.disturbed, true,
+    "an inserted prototype link is a changed chain");
+  Object.setPrototypeOf(inserted.handle, originalPrototype);
+  assert.equal(inserted.observation.nativeBindingFor(BOOTSTRAP.instanceId), undefined, "the guard lookup stays closed after revert");
+
+  // An accessor onData is refused without invoking its getter.
+  let getterCalls = 0;
+  const accessor = ptyReceivedFixture({ immediatePid: 731 });
+  Object.defineProperty(accessor.handle, "onData", { get: () => { getterCalls += 1; return () => ({ dispose() {} }); }, configurable: true });
+  assert.equal(accessor.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.disturbed, true, "an accessor slot is disturbed");
+  assert.equal(getterCalls, 0, "the accessor getter is never invoked by revalidation");
+
+  // An OWN onData method with a changed-then-restored handle prototype: the
+  // holder's immediate prototype identity is part of the captured scope, so
+  // the guard lookup observes the change and both lookups stay refused.
+  const ownProto = ptyReceivedFixture({ immediatePid: 731 });
+  assert.ok(ownProto.observation.nativeBindingFor(BOOTSTRAP.instanceId) !== undefined, "the intact own-slot binding resolves first");
+  const ownOriginalPrototype = Object.getPrototypeOf(ownProto.handle) as object | null;
+  Object.setPrototypeOf(ownProto.handle, Object.create(null) as object);
+  assert.equal(ownProto.observation.nativeBindingFor(BOOTSTRAP.instanceId), undefined,
+    "the guard lookup fails closed on a changed holder prototype");
+  Object.setPrototypeOf(ownProto.handle, ownOriginalPrototype);
+  assert.equal(ownProto.observation.nativeBindingFor(BOOTSTRAP.instanceId), undefined,
+    "a restored holder prototype never certifies the guard");
+  assert.equal(ownProto.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.disturbed, true,
+    "a restored holder prototype never repairs the received scope");
+});
+
+test("pty observer received census supports the getter-backed public onData accessor without invoking it on revalidation", () => {
+  // Positive PID at spawn: the accessor is read exactly once for the single
+  // owned registration, and the census captures every public string event.
+  const positive = ptyReceivedFixture({ immediatePid: 731, onDataAccessor: true });
+  assert.equal(positive.onDataGetterCalls, 1, "registration reads the original public accessor exactly once");
+  assert.equal(positive.onDataCalls, 1, "exactly one owned subscription");
+  assert.equal(positive.dataListeners.length, 1);
+  const delivered: unknown[] = [];
+  (positive.handle.onData as (listener: (data: unknown) => void) => { dispose(): void })(
+    (data: unknown) => { delivered.push(data); });
+  const gettersAfterProduction = positive.onDataGetterCalls;
+  positive.data("\x1b[?1000h", "\x1b[?1006h");
+  assert.deepEqual(delivered, ["\x1b[?1000h", "\x1b[?1006h"], "production still sees identical payloads in order");
+  const result = positive.observation.receivedBindingFor(BOOTSTRAP.instanceId);
+  assert.ok(result !== undefined && result.disturbed !== true, "the accessor-backed scope resolves");
+  assert.equal(result!.pid, 731);
+  assert.equal(result!.snapshot!.unknown, false);
+  assert.equal(result!.snapshot!.counts.writeCalls, 2);
+  assert.equal(result!.snapshot!.counts.mouseVt200Set, 1);
+  assert.equal(result!.snapshot!.counts.mouseSgrSet, 1);
+  assert.ok(positive.observation.nativeBindingFor(BOOTSTRAP.instanceId) !== undefined, "the guard lookup stays intact");
+  assert.equal(positive.onDataGetterCalls, gettersAfterProduction, "revalidation never invokes the accessor getter");
+  positive.exit();
+  assert.equal(positive.disposeCalls, 1, "the accessor-backed subscription disposes exactly once");
+
+  // Initially pending PID: the first event is captured before the PID is known.
+  const pending = ptyReceivedFixture({ onDataAccessor: true });
+  assert.equal(pending.onDataGetterCalls, 1, "registration reads the accessor exactly once while the PID is pending");
+  assert.equal(pending.dataListeners.length, 1, "exactly one owned subscription carries the pending-PID observation");
+  pending.data("\x1b[?1002h");
+  pending.setPid(732);
+  pending.data("\x1b[?1006h");
+  const pendingResult = pending.observation.receivedBindingFor(BOOTSTRAP.instanceId);
+  assert.equal(pendingResult!.pid, 732, "the once-positive PID is observed through the same owned subscription");
+  assert.equal(pendingResult!.snapshot!.counts.writeCalls, 2, "the first data event before the PID is captured");
+  assert.equal(pendingResult!.snapshot!.counts.mouseDragSet, 1);
+  assert.equal(pendingResult!.snapshot!.counts.mouseSgrSet, 1);
+  assert.equal(pending.onDataGetterCalls, 1, "lookups never invoke the accessor getter");
+
+  // A replaced accessor getter (even one returning an equivalent closure) is a
+  // supported-scope disturbance; restoring the original never repairs it.
+  const replaced = ptyReceivedFixture({ immediatePid: 731, onDataAccessor: true });
+  const basePrototype = Object.getPrototypeOf(Object.getPrototypeOf(replaced.handle)) as object;
+  const originalDescriptor = Object.getOwnPropertyDescriptor(basePrototype, "onData")!;
+  Object.defineProperty(basePrototype, "onData", { get: () => () => ({ dispose() {} }), configurable: true });
+  try {
+    assert.equal(replaced.observation.nativeBindingFor(BOOTSTRAP.instanceId), undefined, "a replaced accessor fails the guard closed");
+  } finally {
+    Object.defineProperty(basePrototype, "onData", originalDescriptor);
+  }
+  assert.equal(replaced.observation.receivedBindingFor(BOOTSTRAP.instanceId)!.disturbed, true,
+    "a restored accessor never repairs the received scope");
+});
+
+test("pty observer preserves spawn errors and latches registration failures with the received factory", () => {
+  const declaration = ptySource.slice(ptySource.indexOf("function observePtyModule("), ptySource.indexOf("module.exports"));
+  const makeInstall = () => runInNewContext(`${declaration}\nobservePtyModule`, {
+    process: { platform: "win32", on: () => {} },
+    appendMetadata: () => {},
+    types,
+  }) as (nodePty: unknown, journal: string, options?: Record<string, unknown>) => {
+    receivedBindingFor(instanceId: string): ReceivedLookup | undefined;
+  };
+
+  // The original spawn error is thrown identically with the factory enabled.
+  const boom = new Error("SYNTHETIC spawn failure");
+  let receiver: unknown;
+  const throwingSpawn = function(this: unknown): unknown { receiver = this; throw boom; };
+  const module = { spawn: throwingSpawn };
+  const observation = makeInstall()(module, "/synthetic/journal", {
+    createReceivedCensus: () => receivedCensusFixture.createStdoutModeCensus(),
+  });
+  let thrown: unknown;
+  try {
+    Reflect.apply(module.spawn, module, ["SYNTHETIC-node", ["SYNTHETIC-cli"], { cwd: "/synthetic/workspace", env: {} }]);
+  } catch (err) {
+    thrown = err;
+  }
+  assert.equal(thrown, boom, "the original spawn error is thrown identically with the received factory");
+  assert.equal(receiver, module, "the original receiver is preserved for a throwing spawn");
+  assert.equal(observation.receivedBindingFor(BOOTSTRAP.instanceId), undefined, "a failed spawn never establishes a received scope");
+
+  // A throwing or unsupported census factory is a sticky registration failure.
+  const env: Record<string, unknown> = { [BOOTSTRAP_ENV_NAME]: JSON.stringify({ ...BOOTSTRAP }) };
+  for (const factory of [
+    () => { throw new Error("SYNTHETIC factory failure"); },
+    (): unknown => ({}),
+  ]) {
+    const handle = { pid: 731, onData: (listener: (data: unknown) => void) => ({ dispose() {} }), kill: () => "SYNTHETIC" };
+    Object.defineProperty(handle, "onExit", { configurable: false, get: () => () => ({ dispose() {} }) });
+    const spawnModule = { spawn: function(this: unknown): unknown { return handle; } };
+    const failingObservation = makeInstall()(spawnModule, "/synthetic/journal", {
+      bootstrap: {
+        envName: BOOTSTRAP_ENV_NAME,
+        parse: (value: unknown) => (value === null || typeof value !== "object" ? undefined : value as Record<string, unknown>),
+      },
+      createReceivedCensus: factory,
+    });
+    Reflect.apply(spawnModule.spawn, spawnModule, ["SYNTHETIC-node", ["SYNTHETIC-cli"], { cwd: "/synthetic/workspace", env }]);
+    const result = failingObservation.receivedBindingFor(BOOTSTRAP.instanceId);
+    assert.ok(result !== undefined && result.disturbed === true, "a registration failure is sticky unknown");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Main runner inner-received group mapping/publication regressions (sliced
+// exact runner source, no real Main, PTY, or filesystem).
+// ---------------------------------------------------------------------------
+
+const runnerSource = readFileSync(resolve(__dirname, "../../tests/fixtures/session-host-windows-main-runner.cjs"), "utf8");
+const runnerReceivedDeclaration = runnerSource.slice(
+  runnerSource.indexOf("const RECEIVED_MODE_COUNT_FIELDS"),
+  runnerSource.indexOf("function installPtyObservation("),
+);
+assert.ok(runnerReceivedDeclaration.startsWith("const RECEIVED_MODE_COUNT_FIELDS"));
+
+const runnerReceived = runInNewContext(
+  `${runnerReceivedDeclaration}\n({ receivedGroupFromLookup, publishReceived, unestablishedReceived, disturbedReceived })`,
+  { CENSUS_COUNT_FIELDS: (require("../../tests/fixtures/session-host-windows-stdout-census.cjs") as { CENSUS_COUNT_FIELDS: readonly string[] }).CENSUS_COUNT_FIELDS },
+) as {
+  receivedGroupFromLookup(result: unknown): Record<string, unknown>;
+  publishReceived(pending: unknown, activePane: unknown, nativeBinding: unknown): Record<string, unknown>;
+};
+
+function receivedCounts(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const counts: Record<string, unknown> = { writeCalls: 3 };
+  for (const field of ["mouseX10", "mouseVt200", "mouseDrag", "mouseAny", "mouseSgr", "alternateBuffer", "bracketedPaste"]) {
+    counts[`${field}Set`] = 0;
+    counts[`${field}Reset`] = 0;
+  }
+  counts.mouseSgrSet = 1;
+  return { ...counts, ...overrides };
+}
+
+const RUNNER_PANE_SCOPE = {
+  scope: true, complete: true, ownerPresent: true, focusMain: true, viewMatched: true,
+  hasLiveProcess: true, lifecycleAlive: true, surfacePresent: true, modesReadSucceeded: true,
+};
+const RUNNER_BINDING = { scope: true, complete: true, ptyPid: 731, incarnation: 1, sessionEpoch: 1, expectedProof: "b".repeat(64) };
+
+test("Main runner maps private received lookups into strict bounded groups without raw data", () => {
+  const known = runnerReceived.receivedGroupFromLookup({
+    pid: 731, incarnation: 1, snapshot: { unknown: false, counts: receivedCounts() },
+    bootstrap: { ...BOOTSTRAP }, raw: "\x1b[?1006h",
+  });
+  const validatedKnown = validateMainInnerReceivedSnapshot(known);
+  assert.ok(validatedKnown !== undefined, "a complete lookup maps to a strictly valid group");
+  assert.equal(validatedKnown!.dataEvents, 3, "internal write calls map to public data events");
+  assert.equal(validatedKnown!.mouseSgrSet, 1);
+  assert.ok(!("writeCalls" in known), "received events are never named stdout writes");
+  const serialized = JSON.stringify(known);
+  for (const forbidden of [BOOTSTRAP.token, BOOTSTRAP.socketPath, BOOTSTRAP.instanceId, "\x1b", "1006h"]) {
+    assert.ok(!serialized.includes(forbidden), `the mapped group never carries ${JSON.stringify(forbidden.slice(0, 8))}`);
+  }
+
+  // Unknown counters keep the original PID/incarnation with ALL counters null.
+  const unknown = runnerReceived.receivedGroupFromLookup({ pid: 731, incarnation: 1, snapshot: { unknown: true, counts: receivedCounts() } });
+  assert.ok(validateMainInnerReceivedSnapshot(unknown) !== undefined);
+  assert.equal(unknown.complete, false);
+  assert.equal(unknown.ptyPid, 731);
+  assert.equal(unknown.dataEvents, null, "unknown counters are null, never zero");
+  assert.equal(unknown.mouseSgrSet, null);
+
+  // Malformed counters are never published as known.
+  for (const counts of [receivedCounts({ mouseSgrSet: -1 }), receivedCounts({ writeCalls: 1.5 }),
+    receivedCounts({ mouseAnyReset: undefined }), receivedCounts({ mouseSgrSet: 2 ** 31 }),
+    receivedCounts({ writeCalls: 2 ** 31 })]) {
+    const malformed = runnerReceived.receivedGroupFromLookup({ pid: 731, incarnation: 1, snapshot: { unknown: false, counts } });
+    assert.equal(malformed.complete, false, "a malformed counter makes the received group incomplete");
+    assert.ok(validateMainInnerReceivedSnapshot(malformed) !== undefined);
+  }
+
+  // Unestablished, pending, disturbed, and malformed lookups.
+  const unestablished = runnerReceived.receivedGroupFromLookup(undefined);
+  assert.equal(unestablished.scope, null);
+  assert.ok(validateMainInnerReceivedSnapshot(unestablished) !== undefined);
+  const pending = runnerReceived.receivedGroupFromLookup({ pid: null, incarnation: null, snapshot: { unknown: false, counts: receivedCounts() } });
+  assert.equal(pending.scope, null, "a pending original PID never establishes the received scope");
+  assert.equal(pending.dataEvents, null);
+  assert.ok(validateMainInnerReceivedSnapshot(pending) !== undefined);
+  const disturbed = runnerReceived.receivedGroupFromLookup({ disturbed: true });
+  assert.equal(disturbed.scope, false);
+  assert.equal(disturbed.complete, false);
+  assert.ok(validateMainInnerReceivedSnapshot(disturbed) !== undefined);
+  for (const value of [null, 7, { pid: 1, incarnation: 1, snapshot: {} }, { pid: 731, incarnation: 0, snapshot: {} }]) {
+    const refused = runnerReceived.receivedGroupFromLookup(value);
+    assert.equal(refused.scope, false, "a malformed lookup is a disturbed all-null group");
+    assert.ok(validateMainInnerReceivedSnapshot(refused) !== undefined);
+  }
+});
+
+test("Main runner publishes the received group only after full scope and exact original PID/incarnation cross-check", () => {
+  const pending = runnerReceived.receivedGroupFromLookup({ pid: 731, incarnation: 1, snapshot: { unknown: false, counts: receivedCounts() } });
+  assert.equal(runnerReceived.publishReceived(pending, RUNNER_PANE_SCOPE, RUNNER_BINDING), pending,
+    "a positively scoped capture with the identical binding PID/incarnation is published");
+
+  // No capture in this pass (no matched live owner): unestablished.
+  assert.equal(runnerReceived.publishReceived(undefined, RUNNER_PANE_SCOPE, RUNNER_BINDING).scope, null);
+
+  // A disturbed pane pass, an unestablished binding, or a mismatched original
+  // identity never publishes the positive capture.
+  for (const [label, pane, binding] of [
+    ["disturbed pane", { scope: false }, RUNNER_BINDING],
+    ["incomplete pane", { ...RUNNER_PANE_SCOPE, complete: false }, RUNNER_BINDING],
+    ["not Main focus", { ...RUNNER_PANE_SCOPE, focusMain: false }, RUNNER_BINDING],
+    ["unreadable modes", { ...RUNNER_PANE_SCOPE, modesReadSucceeded: false }, RUNNER_BINDING],
+    ["incomplete authenticated binding", RUNNER_PANE_SCOPE, { ...RUNNER_BINDING, complete: false, sessionEpoch: null, expectedProof: null }],
+    ["unestablished binding", RUNNER_PANE_SCOPE, { ...RUNNER_BINDING, scope: null, complete: null, ptyPid: null, incarnation: null, sessionEpoch: null, expectedProof: null }],
+    ["binding without PID", RUNNER_PANE_SCOPE, { ...RUNNER_BINDING, complete: false, ptyPid: null, incarnation: null, sessionEpoch: null, expectedProof: null }],
+    ["different PID", RUNNER_PANE_SCOPE, { ...RUNNER_BINDING, ptyPid: 9999 }],
+    ["different incarnation", RUNNER_PANE_SCOPE, { ...RUNNER_BINDING, incarnation: 2 }],
+  ] as const) {
+    const published = runnerReceived.publishReceived(pending, pane, binding);
+    assert.equal(published.scope, false, `${label} is a disturbed received group`);
+    assert.equal(published.dataEvents, null, `${label} carries no counters`);
+    assert.ok(validateMainInnerReceivedSnapshot(published) !== undefined);
+  }
+
+  // A captured disturbance stays disturbed; an unestablished capture stays unestablished.
+  assert.equal(runnerReceived.publishReceived(runnerReceived.receivedGroupFromLookup({ disturbed: true }), RUNNER_PANE_SCOPE, RUNNER_BINDING).scope, false);
+  assert.equal(runnerReceived.publishReceived(runnerReceived.receivedGroupFromLookup(undefined), RUNNER_PANE_SCOPE, RUNNER_BINDING).scope, null);
 });

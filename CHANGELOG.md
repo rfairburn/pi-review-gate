@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.128]
+## [0.1.0-dev.129]
 
 ### Added
 
@@ -47,12 +47,17 @@ dates.
 
 ### Known limitations
 
-- Windows hosted **Main** mouse routing remains unresolved (#334): the pane does not
-  accept ordinary terminal mouse tracking/SGR reporting, so terminal-like selection
-  can span panes and wheel input can move editor history rather than the full
-  conversation. Windows remains experimental and uncertified, with no proven cause.
-  The mouse-specific assertion is temporarily deferred to that ticket, not fixed;
-  production ownership guards and the remaining tests stay enabled.
+- Windows sidebar/host runtime acceptance is deferred to #334 for this release: the
+  real native Main case (startup, public Quit confirmation, original-process/kernel
+  settlement/restoration) and both cold hosted-source wrapper legs (cmd and direct
+  PowerShell) are retained in the suite but explicitly skipped, so green CI does not
+  certify Windows runtime support; the Windows sidebar/host remains optional
+  experimental. The hosted **Main** mouse routing limitation also remains unresolved
+  (#334): the pane does not accept ordinary terminal mouse tracking/SGR reporting, so
+  terminal-like selection can span panes and wheel input can move editor history
+  rather than the full conversation; no proven cause. The mouse-specific assertion is
+  temporarily deferred to that ticket, not fixed; production ownership guards and the
+  remaining tests stay enabled.
 - The recurring Windows delegated Pi RPC descendant-proof launch failure remains
   unresolved (#335). The Windows-only alias-independent RPC case is temporarily
   deferred to that ticket, not fixed; production ownership guards and the remaining
@@ -62,7 +67,8 @@ dates.
   the expected device-attributes reply was not observed in either Windows
   22.19/24 alpha lane, so that single assertion is temporarily deferred to
   that ticket, not fixed; no cause is established and no Windows compatibility
-  claim is made. Production ownership guards and the remaining tests stay enabled.
+  claim is made. It belongs to the broader #334 Windows-host follow-up. Production
+  ownership guards and the remaining tests stay enabled.
 
 ## [0.1.0-dev.127]
 

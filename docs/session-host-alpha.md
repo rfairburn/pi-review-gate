@@ -21,8 +21,13 @@ only; they are not Windows runtime support or readiness evidence. The Windows ho
 mouse path is a known unresolved limitation in this prerelease (see below). A separate
 Windows device-attributes query/reply witness also remains unresolved in this
 prerelease (https://github.com/rfairburn/pi-review-gate/issues/337), with no
-established cause. The parent phase still requires real Windows Node 22.19 and 24
-Main, PTY, kernel, graceful-shutdown, and terminal-restoration evidence.
+established cause; it belongs to the same broader #334 Windows-host follow-up. The
+upcoming sidebar alpha release defers all Windows sidebar/host runtime acceptance to
+https://github.com/rfairburn/pi-review-gate/issues/334: the real native Main case
+(startup, public Quit confirmation, original-process/kernel settlement/restoration)
+and both cold hosted-source wrapper legs (cmd and direct PowerShell) are retained in
+the suite but explicitly skipped, so green CI does not certify Windows runtime
+support; the Windows sidebar/host remains optional experimental.
 
 ## Known limitation: Windows hosted mouse
 
@@ -34,15 +39,18 @@ separate sidebar-click feature, and its underlying cause is not established. It 
 a Windows compatibility promise: Windows source paths remain experimental and
 uncertified. This limitation is tracked in
 https://github.com/rfairburn/pi-review-gate/issues/334, and its fix is not part of
-this prerelease. The parent phase still requires the Windows Main, PTY, kernel,
-graceful-shutdown, and terminal-restoration evidence noted above.
+this prerelease. In the upcoming sidebar alpha release the Windows Main, PTY, kernel,
+graceful-shutdown, and terminal-restoration evidence is deferred with the rest of the
+Windows sidebar runtime acceptance to #334 (see above); green CI does not certify it.
 
 ## Requirements and launch
 
 - **Host platform:** same-machine POSIX macOS or Linux remains the documented
   runtime scope. Windows source paths now admit the same-machine host and public
   ConPTY flow for validation, but Windows is not supported/readiness-certified until
-  real Windows Node 22.19 and 24 runtime evidence passes. The ordinary standalone
+  real Windows Node 22.19 and 24 runtime evidence passes; in the upcoming sidebar
+  alpha release that runtime acceptance is deferred under
+  https://github.com/rfairburn/pi-review-gate/issues/334. The ordinary standalone
   Windows launcher remains unchanged.
 - **Node.js:** 22.19.0 or newer.
 - **Pi:** stable Pi 1.0.4 or newer; the provisioned runtime and native UI

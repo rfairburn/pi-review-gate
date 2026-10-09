@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 
 import {
   activateOwnedActivity,
+  activeActivitySnapshot,
   isOwnedActivityActive,
   ownedActivitySnapshot,
   registerOwnedActivitySource,
@@ -317,5 +318,105 @@ describe("owned-activity handle isolation", () => {
     unknown.acquire("token");
     unknown.markUncertain();
     assert.equal(ownedActivitySnapshot().backgroundTasks, 0, "an unknown source contributes nothing");
+  });
+});
+
+describe("owned-activity activity-intent channel", () => {
+  beforeEach(() => {
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+  });
+
+  afterEach(() => {
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+  });
+
+  it("stays positively known while ownership is uncertain, and releases on a stop", () => {
+    activateOwnedActivity();
+    const execution = registerOwnedActivitySource(TASKS, "execution");
+    registerOwnedActivitySource(TASKS, "review");
+    registerOwnedActivitySource(SHELLS, "background-shell");
+    assert.deepEqual(activeActivitySnapshot(), { activeTasks: 0, activeShells: 0 });
+
+    // A cleanup obligation alone is not activity.
+    execution.acquire("task-1");
+    assert.equal(activeActivitySnapshot().activeTasks, 0, "a retained ownership token is not activity");
+    execution.acquireIntent("task-1");
+    assert.equal(activeActivitySnapshot().activeTasks, 1);
+
+    // Ownership uncertainty must not keep activity unknown once activity is known.
+    execution.markUncertain();
+    assert.equal(ownedActivitySnapshot().backgroundTasks, null);
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "ownership uncertainty never contaminates a positively known activity count");
+
+    // A stop releases activity while ownership stays unknown/retained.
+    execution.releaseIntent("task-1");
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "a stopped task releases activity even with uncertain ownership");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, null);
+  });
+
+  it("keeps activity uncertainty independent and sticky until resolved", () => {
+    activateOwnedActivity();
+    const execution = registerOwnedActivitySource(TASKS, "execution");
+    registerOwnedActivitySource(TASKS, "review");
+    registerOwnedActivitySource(SHELLS, "background-shell");
+    execution.resolveUncertainty();
+    execution.markIntentUncertain();
+    assert.equal(ownedActivitySnapshot().backgroundTasks, 0, "ownership stays positively known");
+    assert.equal(activeActivitySnapshot().activeTasks, null, "activity completeness is independent");
+    execution.acquireIntent("task-2");
+    assert.equal(activeActivitySnapshot().activeTasks, null,
+      "sticky activity uncertainty outranks an outstanding token");
+    execution.resolveIntentUncertainty();
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "only an authoritative re-establishment exposes the retained activity token");
+  });
+
+  it("scopes intent tokens to their own incarnation", () => {
+    activateOwnedActivity();
+    registerOwnedActivitySource(TASKS, "execution");
+    const older = registerOwnedActivitySource(TASKS, "review");
+    older.acquireIntent("run-a");
+    const current = registerOwnedActivitySource(TASKS, "review");
+    current.acquireIntent("run-b");
+    assert.equal(activeActivitySnapshot().activeTasks, 2,
+      "superseded activity stays counted until it actually settles");
+    older.releaseIntent("run-b");
+    assert.equal(activeActivitySnapshot().activeTasks, 2,
+      "a stale handle cannot release a newer incarnation's activity token");
+    older.releaseIntent("run-a");
+    assert.equal(activeActivitySnapshot().activeTasks, 1);
+  });
+
+  it("keeps old pre-intent global records valid for ownership and unknown for activity", () => {
+    // A record written by an earlier code incarnation carries no intent data.
+    const entry = (id: string, tokens: string[]) => ({ id, tokens: new Set(tokens), uncertain: false, retired: false });
+    const oldState = {
+      active: true,
+      sources: new Map([
+        [TASKS, new Map([
+          ["execution", [entry("exec-old", ["task-old"])]],
+          ["review", [entry("rev-old", [])]],
+        ])],
+        [SHELLS, new Map([["background-shell", [entry("sh-old", [])]]])],
+      ]),
+      listeners: new Set<() => void>(),
+    };
+    (globalThis as Record<PropertyKey, unknown>)[OWNED_ACTIVITY_STATE_KEY] = oldState;
+
+    assert.deepEqual(ownedActivitySnapshot(), { backgroundTasks: 1, backgroundShells: 0 },
+      "old ownership counts stay valid and usable");
+    assert.deepEqual(activeActivitySnapshot(), { activeTasks: null, activeShells: null },
+      "an unobserved pre-intent activity set is unknown, never a fabricated zero");
+    assert.equal(isOwnedActivityActive(), true);
+
+    // A new incarnation installs alongside the old record without wiping it.
+    registerOwnedActivitySource(TASKS, "execution");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, 1, "the old ownership token is retained");
+    assert.equal(activeActivitySnapshot().activeTasks, null,
+      "a pre-intent incarnation keeps the activity source genuinely unknown");
   });
 });

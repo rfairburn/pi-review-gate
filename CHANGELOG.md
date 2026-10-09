@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.132]
+## [0.1.0-dev.133]
 
 ### Changed
 
@@ -40,6 +40,30 @@ dates.
   is not breakage and not a release blocker (#343).
 - Native Pi/review-gate startup latency on Windows has been present since before this
   release and is unrelated to it (#344).
+
+## [0.1.0-dev.132]
+
+### Changed
+
+- The optional session host's sidebar now reports background work as **activity
+  intent** rather than as unsettled cleanup ownership (#339). The displayed
+  task/shell numbers and the running/idle line read a separate nullable intent
+  channel: logical work counts while it is admitted/queued, capturing, running,
+  reviewing, accepted, waiting to land, or landing, and while an actual
+  force-merge is executing or an accepted continuation is queued/active; a shell counts
+  while it is starting/running, including known live owned descendants after a
+  Windows shell root exits. A task or shell that stopped — stopped, paused,
+  recoverable, failed, or conflict-blocked with no admitted work — reads zero
+  even while it still owns recovery artifacts or cleanup obligations. Shells
+  continue counting until their activity is observed stopped; reaping or a bare
+  error alone is not proof of exit. Unknown or unobserved activity stays unknown,
+  never a fabricated zero.
+  The status frame gains optional `activeTasks`/`activeShells` fields; an older
+  reporter that omits them stays unknown and is never substituted with the
+  ownership counts. The separate conservative ownership counts remain on the
+  wire and still gate the idle-only stop/remove confirmation and shutdown
+  preflight, so retained work is never silently dropped, and a pre-intent global
+  registry record keeps its valid ownership counts with unknown intent.
 
 ## [0.1.0-dev.131]
 

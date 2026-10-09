@@ -167,6 +167,13 @@ export interface InstanceStatusUpdate {
 	 */
 	backgroundTasks?: number | null;
 	backgroundShells?: number | null;
+	/**
+	 * Optional bounded ACTIVITY-INTENT counts, independent of ownership. Absent
+	 * or invalid normalizes to null (unknown), never zero. Display reads these;
+	 * the stop/idle gate keeps reading the ownership pair above.
+	 */
+	activeTasks?: number | null;
+	activeShells?: number | null;
 }
 
 export interface InstanceStatusHandlers {
@@ -218,6 +225,10 @@ export interface NativeInstanceView {
 	readonly backgroundTasks?: number | null;
 	/** Observed owned background shell jobs not yet confirmed settled; null means unknown, never 0. */
 	readonly backgroundShells?: number | null;
+	/** Observed admitted/running logical work intent; null means unknown, never 0. */
+	readonly activeTasks?: number | null;
+	/** Observed starting/running background shell intent; null means unknown, never 0. */
+	readonly activeShells?: number | null;
 	/** True only while this manager still owns a PTY without a confirmed exit. */
 	readonly hasLiveProcess: boolean;
 	readonly activity: readonly string[];
@@ -307,6 +318,8 @@ interface ManagedInstance {
 	inputSurface: boolean;
 	backgroundTasks: number | null;
 	backgroundShells: number | null;
+	activeTasks: number | null;
+	activeShells: number | null;
 	activity: string[];
 	exitCode?: number;
 	error?: string;
@@ -646,6 +659,8 @@ export class InstanceManager {
 				inputSurface: record.inputSurface,
 				backgroundTasks: record.backgroundTasks,
 				backgroundShells: record.backgroundShells,
+				activeTasks: record.activeTasks,
+				activeShells: record.activeShells,
 				activity: Object.freeze([...record.activity]),
 			};
 			if (record.exitCode !== undefined) {
@@ -836,6 +851,8 @@ export class InstanceManager {
 			inputSurface: false,
 			backgroundTasks: null,
 			backgroundShells: null,
+			activeTasks: null,
+			activeShells: null,
 			activity: [],
 			savedReservation: savedSession !== undefined
 				? { sessionId: savedSession.sessionId, file: savedSession.file }
@@ -1097,6 +1114,8 @@ export class InstanceManager {
 			record.inputSurface = false;
 			record.backgroundTasks = null;
 			record.backgroundShells = null;
+			record.activeTasks = null;
+			record.activeShells = null;
 			record.activity = [];
 			this.#disposeDataListener(record);
 			if (record.pty && !record.ptyExited) {
@@ -1374,6 +1393,8 @@ export class InstanceManager {
 		record.inputSurface = false;
 		record.backgroundTasks = null;
 		record.backgroundShells = null;
+		record.activeTasks = null;
+		record.activeShells = null;
 		record.activity = [];
 		if (typeof event?.exitCode === "number" && Number.isFinite(event.exitCode)) {
 			record.exitCode = event.exitCode;
@@ -1429,6 +1450,8 @@ export class InstanceManager {
 		record.inputSurface = update?.inputSurface === true;
 		record.backgroundTasks = normalizedOwnedCount(update?.backgroundTasks);
 		record.backgroundShells = normalizedOwnedCount(update?.backgroundShells);
+		record.activeTasks = normalizedOwnedCount(update?.activeTasks);
+		record.activeShells = normalizedOwnedCount(update?.activeShells);
 		record.activity = boundedActivity(update?.activity);
 		if (Object.prototype.hasOwnProperty.call(update ?? {}, "nativeSession")) {
 			const next = validatedNativeSession(update?.nativeSession);
@@ -1481,6 +1504,8 @@ export class InstanceManager {
 		record.inputSurface = false;
 		record.backgroundTasks = null;
 		record.backgroundShells = null;
+		record.activeTasks = null;
+		record.activeShells = null;
 		record.activity = [];
 		record.nativeSession = null;
 		record.label = "(session name unavailable)";

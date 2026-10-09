@@ -344,6 +344,8 @@ function statusRegistrar(broker: StatusBroker): StatusRegistrar {
             inputSurface: status.inputSurface,
             backgroundTasks: status.backgroundTasks ?? null,
             backgroundShells: status.backgroundShells ?? null,
+            activeTasks: status.activeTasks ?? null,
+            activeShells: status.activeShells ?? null,
             activity: status.activity,
             ...(status.nativeSession === undefined ? {} : { nativeSession: status.nativeSession }),
           };
@@ -370,6 +372,8 @@ function toSidebarItem(view: NativeInstanceView): SidebarItem {
     inputSurface: view.inputSurface,
     backgroundTasks: view.backgroundTasks ?? null,
     backgroundShells: view.backgroundShells ?? null,
+    activeTasks: view.activeTasks ?? null,
+    activeShells: view.activeShells ?? null,
     activity: view.activity,
     nativeSession: view.nativeSession,
   };

@@ -2753,3 +2753,55 @@ test("status updates publish bounded owned-work counts and never fabricate zero"
     cleanup(harness);
   }
 });
+
+test("status updates publish activity intent independently of the ownership counts", async () => {
+  const harness = makeHarness("activity-intent-counts");
+  try {
+    const id = await harness.manager.create({ label: "intent", workspace: harness.workspace });
+    const entry = harness.registrar.entryFor(id);
+    const view = (): { backgroundTasks?: number | null; backgroundShells?: number | null; activeTasks?: number | null; activeShells?: number | null } =>
+      viewFor(harness.manager, id);
+
+    harness.registrar.emitStatus(entry, {
+      busy: null,
+      pendingInput: null,
+      inputSurface: false,
+      activity: [],
+      backgroundTasks: 1,
+      backgroundShells: 0,
+      activeTasks: 0,
+      activeShells: 0,
+    });
+    assert.deepEqual(
+      [view().activeTasks, view().activeShells, view().backgroundTasks, view().backgroundShells],
+      [0, 0, 1, 0],
+      "a retained ownership obligation with zero activity is carried independently",
+    );
+
+    harness.registrar.emitStatus(entry, {
+      busy: false,
+      pendingInput: false,
+      inputSurface: false,
+      activity: [],
+      activeTasks: -1,
+      activeShells: 1.5,
+    });
+    assert.deepEqual([view().activeTasks, view().activeShells], [null, null], "invalid intent normalizes to unknown");
+    assert.deepEqual([view().backgroundTasks, view().backgroundShells], [null, null], "an omitted ownership count is unknown, never zero");
+
+    harness.registrar.emitStatus(entry, {
+      busy: false,
+      pendingInput: false,
+      inputSurface: false,
+      activity: [],
+      backgroundShells: 3,
+    });
+    assert.deepEqual([view().activeTasks, view().activeShells], [null, null], "an older registrar omitting intent keeps it unknown, never a fallback");
+
+    harness.registrar.emitDisconnect(entry);
+    assert.deepEqual([view().activeTasks, view().activeShells], [null, null], "a reporter disconnect collapses intent to unknown");
+    harness.spawned[0]!.emitExit(0);
+  } finally {
+    cleanup(harness);
+  }
+});

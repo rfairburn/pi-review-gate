@@ -113,13 +113,26 @@ export interface SidebarItem {
 	readonly nativeSession?: SessionHostNativeSession | null;
   readonly exitCode?: number;
   /**
-   * Observed background task count from protocol/backend telemetry. Only a
-   * nonnegative safe integer is accepted; anything else (including absence)
-   * is stored and rendered as unknown, never inferred as zero.
+   * Observed OWNERSHIP count of unsettled background task work from
+   * protocol/backend telemetry: active/queued logical work plus every retained
+   * cleanup/recovery anchor. Only a nonnegative safe integer is accepted;
+   * anything else (including absence) is stored and rendered as unknown, never
+   * inferred as zero. This conservative channel gates stop/remove confirmation;
+   * it is never used for the displayed activity number.
    */
   readonly backgroundTasks?: number | null;
-  /** Observed background shell count; same honesty rules as backgroundTasks. */
+  /** Observed ownership count of background shell jobs not yet confirmed settled. */
   readonly backgroundShells?: number | null;
+  /**
+   * Observed ACTIVITY-INTENT count of admitted/running background task work.
+   * Same honesty rules as backgroundTasks: anything but a nonnegative safe
+   * integer is unknown, never zero. This is the number the card displays and
+   * the state behind the running/idle line; an absent value is unknown, never
+   * a fallback to the ownership count.
+   */
+  readonly activeTasks?: number | null;
+  /** Observed activity-intent count of starting/running background shells. */
+  readonly activeShells?: number | null;
 }
 
 /**
@@ -716,13 +729,13 @@ function cardStatusText(item: SidebarItem): string {
       break;
     case "alive":
       parts.push(
-        item.busy === true || (sanitizeCount(item.backgroundTasks) ?? 0) > 0
-          || (sanitizeCount(item.backgroundShells) ?? 0) > 0
+        item.busy === true || (sanitizeCount(item.activeTasks) ?? 0) > 0
+          || (sanitizeCount(item.activeShells) ?? 0) > 0
           ? "agent running"
           : item.pendingInput === true || item.inputSurface === true
             ? "agent waiting"
             : item.busy === false && item.pendingInput === false
-              && sanitizeCount(item.backgroundTasks) === 0 && sanitizeCount(item.backgroundShells) === 0
+              && sanitizeCount(item.activeTasks) === 0 && sanitizeCount(item.activeShells) === 0
               ? "agent idle"
               : "agent unknown",
       );
@@ -754,10 +767,10 @@ function cardStatusText(item: SidebarItem): string {
   return parts.join(" | ");
 }
 
-/** Honest background counts: a missing/invalid count is "unknown", never 0. */
+/** Honest ACTIVITY-INTENT counts: a missing/invalid count is "unknown", never 0. */
 function cardBackgroundText(item: SidebarItem): string {
-  const tasks = sanitizeCount(item.backgroundTasks);
-  const shells = sanitizeCount(item.backgroundShells);
+  const tasks = sanitizeCount(item.activeTasks);
+  const shells = sanitizeCount(item.activeShells);
   if (tasks === null && shells === null) {
     return "background unknown";
   }
@@ -787,7 +800,10 @@ function requiresQuitConfirmation(item: SidebarItem): boolean {
 /**
  * Complete idleness, positively observed: every activity category and modal
  * input known-false or known-zero. Unknown (null) states or counts are never
- * idle. The caller already established hasLiveProcess === true.
+ * idle. The caller already established hasLiveProcess === true. This reads the
+ * conservative OWNERSHIP channel, deliberately not the displayed
+ * activity-intent counts: retained cleanup/recovery work still requires
+ * confirmation before a stop or removal.
  */
 function isCompleteIdle(item: SidebarItem): boolean {
   return (
@@ -844,6 +860,8 @@ function copyItem(item: SidebarItem): SidebarItem {
     ...(typeof item.exitCode === "number" ? { exitCode: item.exitCode } : {}),
     backgroundTasks: sanitizeCount(item.backgroundTasks),
     backgroundShells: sanitizeCount(item.backgroundShells),
+    activeTasks: sanitizeCount(item.activeTasks),
+    activeShells: sanitizeCount(item.activeShells),
   };
 }
 

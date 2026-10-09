@@ -239,7 +239,11 @@ shellOwnedActivity = registerOwnedActivitySource("backgroundShells", "background
     const handle = shellOwnedActivity;
     if (!handle) return; // module still initializing: `jobs` is empty anyway
     for (const job of jobs.values()) {
-      if (!job.exited) handle.acquire(ownedActivityToken(job));
+      if (!job.exited) {
+        handle.acquire(ownedActivityToken(job));
+        // A job that is still running is also positively active work.
+        handle.acquireIntent(ownedActivityToken(job));
+      }
     }
   },
 });
@@ -269,9 +273,119 @@ function releaseOwnedShellActivity(job: Job): void {
   shellOwnedActivity?.release(ownedActivityToken(job));
 }
 
+/**
+ * Activity-intent decision for one shell completion observation. Kept pure and
+ * separate from `shellCompletionAction`: a retained cleanup obligation never
+ * keeps intent positive, and an unverifiable ownership record is UNKNOWN rather
+ * than a fabricated stop. On POSIX a bare error (no close yet) keeps the job
+ * active until its close arrives; on Windows a verified `clear` verdict, or a
+ * verified live-descendant `running` verdict, decides independently of whether
+ * the shell root already exited.
+ */
+function shellIntentAction(input: {
+  confirmedExit: boolean;
+  verdict: "clear" | "running" | "unverifiable" | undefined;
+}): "active" | "stopped" | "unknown" {
+  if (input.verdict === "unverifiable") return "unknown";
+  if (input.verdict === "running") return "active";
+  if (input.verdict === "clear") return "stopped";
+  return input.confirmedExit ? "stopped" : "active";
+}
+
+/**
+ * Jobs whose Windows ownership evidence is missing/unreadable: their process
+ * work is genuinely unobserved, so the shell activity count is UNKNOWN until
+ * one resolves. This uncertainty is ours alone; resolving it never clears a
+ * different uncertainty a pre-opt-in replay established.
+ */
+const intentUnverifiableJobs = new Set<string>();
+let shellIntentUncertaintyHeld = false;
+
+function markShellIntentUnverifiable(job: Job): void {
+  if (intentUnverifiableJobs.has(job.id)) return;
+  intentUnverifiableJobs.add(job.id);
+  if (shellIntentUncertaintyHeld) return;
+  shellIntentUncertaintyHeld = true;
+  shellOwnedActivity?.markIntentUncertain();
+}
+
+function clearShellIntentUnverifiable(job: Job): void {
+  if (!intentUnverifiableJobs.delete(job.id)) return;
+  if (intentUnverifiableJobs.size > 0 || !shellIntentUncertaintyHeld) return;
+  shellIntentUncertaintyHeld = false;
+  shellOwnedActivity?.resolveIntentUncertainty();
+}
+
+/**
+ * Apply one activity-intent observation. Registry mutations notify synchronous
+ * subscribers (the reporter emits a frame per notification), so the ordering is
+ * safety-critical: mark the source uncertain BEFORE dropping its positive token
+ * (an unverified shell must go 1 -> null, never 1 -> 0 -> null), and acquire the
+ * positively observed token BEFORE resolving uncertainty (a verified-live shell
+ * must go null -> 1, never null -> 0 -> 1). Ownership settlement is untouched.
+ */
+function observeShellIntent(job: Job, action: "active" | "stopped" | "unknown"): void {
+  const token = ownedActivityToken(job);
+  if (action === "unknown") {
+    markShellIntentUnverifiable(job);
+    shellOwnedActivity?.releaseIntent(token);
+    return;
+  }
+  if (action === "stopped") shellOwnedActivity?.releaseIntent(token);
+  else shellOwnedActivity?.acquireIntent(token);
+  // Resolve only after the token reflects the positively observed state, so a
+  // synchronous subscriber never observes a fabricated zero in between.
+  clearShellIntentUnverifiable(job);
+}
+
+/**
+ * Intent-only observation for the shell root's own exit, made before the later
+ * stream close that settles ownership. Root exit ends the running indicator
+ * immediately (so a delayed close can never strand it) unless a verified
+ * Windows verdict still names live owned descendants (active) or ownership
+ * evidence is genuinely unreadable (unknown). This never touches ownership
+ * settlement, wakes, or the ordinary close/error handling.
+ */
+function observeShellRootExit(job: Job): void {
+  const windowsOwned = process.platform === "win32" && job.ownership && job.proc.pid !== undefined;
+  const verdict = windowsOwned
+    ? ownershipVerdict(job.ownership!.markerPath, processIsAlive(job.proc.pid), processIsAlive)
+    : undefined;
+  observeShellIntent(job, shellIntentAction({ confirmedExit: true, verdict }));
+}
+
 /** Narrow pure seam for focused settlement tests; no process or IO is touched. */
 export const __test = Object.freeze({
   shellCompletionAction,
+  shellIntentAction,
+  /**
+   * The module's real shell-source handle. It is registered at import, so a
+   * caller that opts the registry in afterward can resolve the replay
+   * uncertainty and then drive real intent observations. No process or IO.
+   */
+  shellActivityHandle(): OwnedActivitySourceHandle | undefined {
+    return shellOwnedActivity;
+  },
+  /**
+   * Run the real activity-intent observation path for a synthetic job id: the
+   * same function the shell completion/close/error callbacks invoke. No
+   * process, timer, or IO is touched.
+   */
+  observeShellIntentForTests(jobId: string, action: "active" | "stopped" | "unknown"): void {
+    observeShellIntent({ id: jobId } as Job, action);
+  },
+  /**
+   * Attach the real stream/settlement handlers to a synthetic job backed by a
+   * fake child process, so the registered exit/error/close callbacks can be
+   * exercised without spawning anything. No process or IO is touched.
+   */
+  attachStreamsForTests(pi: BackgroundShellHost, job: Job): void {
+    attachStreams(pi, job);
+  },
+  /** The exact ownership token the real settlement path releases for a job id. */
+  ownedActivityTokenForTests(jobId: string): string {
+    return `${ownedActivityTokenPrefix}:${jobId}`;
+  },
 });
 let stallTimer: ReturnType<typeof setInterval> | null = null;
 let lifecycleRevision = 0;
@@ -717,6 +831,7 @@ function scheduleOwnershipRelease(pi: BackgroundShellHost, job: Job, code: numbe
       processIsAlive,
     );
     job.ownershipUnverifiable = verdict === "unverifiable";
+    observeShellIntent(job, shellIntentAction({ confirmedExit: true, verdict }));
     if (verdict === "clear") {
       clearOwnershipRelease(job);
       releaseOwnedShellActivity(job);
@@ -759,12 +874,20 @@ function attachStreams(pi: BackgroundShellHost, job: Job): void {
       ? ownershipVerdict(job.ownership!.markerPath, processIsAlive(job.proc.pid), processIsAlive)
       : undefined;
     const action = shellCompletionAction({ confirmedExit, verdict });
+    const intent = shellIntentAction({ confirmedExit, verdict });
     if (job.exited) {
       // A confirmed close that arrives after an earlier error/abort still
       // settles telemetry even though the ordinary record is already settled.
       if (action === "release") releaseOwnedShellActivity(job);
+      // The job is already settled: activity intent can only be released here,
+      // never re-acquired from a late partial signal.
+      if (intent === "stopped") observeShellIntent(job, "stopped");
       return;
     }
+    // Activity intent is judged independently of ownership: a retained cleanup
+    // obligation must not keep it positive, and unverifiable ownership is
+    // UNKNOWN, never a fabricated stop or an invented liveness.
+    observeShellIntent(job, intent);
     if (windowsOwned && verdict !== "clear") {
       job.ownershipUnverifiable = verdict === "unverifiable";
       scheduleOwnershipRelease(pi, job, code ?? 0);
@@ -776,6 +899,7 @@ function attachStreams(pi: BackgroundShellHost, job: Job): void {
     if (action === "release") releaseOwnedShellActivity(job);
     settleJob(pi, job, code ?? 0);
   };
+  job.proc.on("exit", () => observeShellRootExit(job));
   job.proc.on("close", (code) => finish(code ?? 0, true));
   job.proc.on("error", (err) => {
     job.buffer.push(`[spawn error] ${String((err as Error)?.message ?? err)}`);
@@ -1021,8 +1145,11 @@ export function registerBackgroundShell(
       // Owned-work observation: positive ownership starts here and is released
       // only after independently confirmed settlement (an actual close, or the
       // Windows ownership verdict proving the tree gone) — never by reapAll()'s
-      // map clear and never by a bare ChildProcess error.
+      // map clear and never by a bare ChildProcess error. Activity intent starts
+      // positive here too and is released the moment the process work is
+      // observed stopped, independently of any retained cleanup obligation.
       shellOwnedActivity?.acquire(ownedActivityToken(job));
+      shellOwnedActivity?.acquireIntent(ownedActivityToken(job));
       publishLifecycle("started", job);
       attachStreams(pi, job);
       ensureStallTimer(pi);

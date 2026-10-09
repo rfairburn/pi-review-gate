@@ -467,6 +467,27 @@ export function taskOwnsUnsettledWork(
   );
 }
 
+/**
+ * Pure ACTIVITY-INTENT predicate for one task (shared with focused synthetic
+ * tests): true while the task is admitted/queued or actively capturing,
+ * running, reviewing, accepted, waiting to land, or landing, or while it has an
+ * in-flight force-merge operation. Unlike `taskOwnsUnsettledWork`, retained
+ * cleanup/recovery anchors (a resumable continuation bundle, wave root, in-place
+ * operation record, or a non-zero lifecycle generation) do NOT count: a
+ * stopped/paused/failed task is not activity merely because its artifacts are
+ * still owned. An actual force-merge operation is activity while it executes
+ * even if the task's terminal state has not changed, and a queued task counts
+ * immediately. A pending continuation admission validation does NOT count: only
+ * the accepted, queued transition does. A conflict gate with no active writer
+ * does not count.
+ */
+export function taskHasActiveIntent(
+  task: { state: BackgroundTaskRecord["state"] },
+  hasForceMerge: boolean,
+): boolean {
+  return isActiveTaskState(task.state) || hasForceMerge;
+}
+
 export class BackgroundExecutionController {
   private readonly groups = new Map<string, BackgroundExecutionGroup>();
   /** Owner of this controller incarnation's positive owned-work tokens. */
@@ -550,8 +571,14 @@ export class BackgroundExecutionController {
   constructor(private readonly input: BackgroundControllerInput) {
     // Register this controller incarnation as UNCERTAIN: the execution
     // category stays unknown until restore() has accounted for every owned
-    // association (or established that there is none).
-    this.ownedActivity = registerOwnedActivitySource("backgroundTasks", "execution", { uncertain: true });
+    // association (or established that there is none). The ACTIVITY-INTENT
+    // channel has its own uncertainty flag: the admitted/running set is not
+    // authoritative until the same restore completes, and is resolved
+    // independently so retained cleanup never keeps activity unknown.
+    this.ownedActivity = registerOwnedActivitySource("backgroundTasks", "execution", {
+      uncertain: true,
+      intentUncertain: true,
+    });
     this.pool = new ExecutorPoolScheduler(resolvedWorkerResources(input.config));
     this.ledger = new ParentCheckpointLedger({
       config: () => this.input.config,
@@ -754,8 +781,10 @@ export class BackgroundExecutionController {
     // Every restore invalidates prior completeness before its first await: the
     // owned set may be changing (or unresolved) until this restore authoritatively
     // accounts for it. A previously complete controller must not keep
-    // advertising zero while a new restoration is in flight.
+    // advertising zero while a new restoration is in flight. The activity-intent
+    // channel is invalidated independently of the ownership channel.
     this.ownedActivity.markUncertain();
+    this.ownedActivity.markIntentUncertain();
     const initialDetach = this.detach();
     const restoreEpoch = this.detachEpoch;
     await initialDetach;
@@ -765,6 +794,11 @@ export class BackgroundExecutionController {
       !this.shuttingDown && this.detaching === 0 && this.detachEpoch === restoreEpoch;
     const roots = associations.groupRoots ?? [];
     let restoreAccounted = true;
+    // Activity completeness is tracked SEPARATELY from ownership recovery: a
+    // task record that was read has an observed state (so its activity is
+    // known), even when its retained cleanup association could not be
+    // recovered and ownership must stay unknown.
+    let restoreActivityAccounted = true;
     for (const root of roots) {
       if (!restoreIsCurrent()) return;
       try {
@@ -903,6 +937,7 @@ export class BackgroundExecutionController {
         await this.save(group);
       } catch (error) {
         restoreAccounted = false;
+        restoreActivityAccounted = false;
         await this.input.notify?.(`review gate: background execution was not restored (${root}): ${messageOf(error)}`);
       }
     }
@@ -917,6 +952,7 @@ export class BackgroundExecutionController {
         restoredOperations.add(bundle.operationId);
       } catch (error) {
         restoreAccounted = false;
+        restoreActivityAccounted = false;
         await this.input.notify?.(`review gate: legacy execution bundle was not adopted (${bundle.operationId}): ${messageOf(error)}`);
       }
     }
@@ -933,10 +969,17 @@ export class BackgroundExecutionController {
     this.rebuildRecentActivity();
     this.updateIndicator();
     // Only an unbroken restore authoritatively accounts for this controller's
-    // owned set. Any failed/unadopted association keeps execution UNKNOWN
-    // (never zero) until an authoritative re-establishment.
+    // owned set. Any failed/unadopted association keeps execution OWNERSHIP
+    // UNKNOWN (never zero) until an authoritative re-establishment. The
+    // activity-intent channel is re-established from its own completeness: a
+    // task record whose state was read is observed activity even when its
+    // cleanup-association recovery failed, so a known stopped task reports zero
+    // activity while ownership stays unknown; only a genuinely unreadable
+    // group or unobserved admission keeps activity unknown.
     if (restoreAccounted) this.ownedActivity.resolveUncertainty();
     else this.ownedActivity.markUncertain();
+    if (restoreActivityAccounted) this.ownedActivity.resolveIntentUncertainty();
+    else this.ownedActivity.markIntentUncertain();
     void this.pump();
   }
 
@@ -1553,22 +1596,34 @@ export class BackgroundExecutionController {
     if (this.pendingForceMerges.has(taskId)) throw new Error(`Task ${taskId} has a force-merge in progress.`);
     const epoch = this.detachEpoch;
     this.continuationAdmissions.add(taskId);
+    // The reservation is a concurrency guard only, never accepted activity: a
+    // rejected or duplicate continuation must publish no positive intent. The
+    // finally reconciles the exact record this admission observed — including an
+    // archive-only task that was never inserted inline — so no token is stranded.
+    let observedTarget: BackgroundTaskRecord | undefined;
     try {
-      return await this.admitContinuation(input, epoch);
+      return await this.admitContinuation(input, epoch, (task) => { observedTarget = task; });
     } finally {
       this.continuationAdmissions.delete(taskId);
+      const task = observedTarget ?? this.taskById(taskId);
+      if (task) this.syncActiveIntent(task);
     }
   }
 
   private async admitContinuation(
     input: Parameters<BackgroundExecutionController["continueTask"]>[0],
     epoch: number,
+    onTarget?: (task: BackgroundTaskRecord) => void,
   ): Promise<BackgroundInspection> {
-    if (input.inPlace === true) return this.admitInPlaceContinuation(input, epoch);
+    if (input.inPlace === true) return this.admitInPlaceContinuation(input, epoch, onTarget);
     const target = await this.resolveOrAdoptTask(input.executionId, input.taskId, input.bundle);
     const { group, task } = target;
+    onTarget?.(task);
     const archiveOnly = target.archiveOnly === true;
     this.assertContinuationAdmission(task, epoch);
+    // No activity is published here: intent is acquired only when the accepted
+    // admission actually queues the task, synchronously inside save() before
+    // dispatch can run. Every earlier refusal therefore stays at the prior state.
     // #220: an in-place task continues by resuming its retained session in the
     // same workspace — there is no wave bundle, capture, or checkpoint, so the
     // bundle-required strict path must never claim otherwise. Recovery for a
@@ -1652,8 +1707,10 @@ export class BackgroundExecutionController {
   private async admitInPlaceContinuation(
     input: Parameters<BackgroundExecutionController["continueTask"]>[0],
     epoch: number,
+    onTarget?: (task: BackgroundTaskRecord) => void,
   ): Promise<BackgroundInspection> {
     const { group, task } = this.resolveTask(input.executionId, input.taskId ?? input.bundle?.taskId);
+    onTarget?.(task);
     if (group.kind !== "execute") {
       throw new Error(`In-place continuation applies only to execute tasks; ${task.taskId} is a ${group.kind} task.`);
     }
@@ -2246,6 +2303,9 @@ export class BackgroundExecutionController {
     const done = new Promise<void>((resolveDone) => { signalDone = resolveDone; });
     const pending: PendingForceMerge = { abort: new AbortController(), done, acquired: false };
     this.pendingForceMerges.set(task.taskId, pending);
+    // An actual force-merge operation is activity the moment it is registered,
+    // even if the task's durable state is already terminal and has not changed.
+    this.syncActiveIntent(task);
     try {
       return await this.runForceMerge(input, group, task, pending);
     } finally {
@@ -3435,6 +3495,29 @@ export class BackgroundExecutionController {
   private syncOwnedTask(task: BackgroundTaskRecord): void {
     if (this.taskOwnsUnsettledWork(task)) this.ownedActivity.acquire(task.taskId);
     else this.ownedActivity.release(task.taskId);
+    // The independent activity-intent channel is reconciled at exactly the same
+    // lifecycle seams; a retained ownership anchor never forces it positive.
+    this.syncActiveIntent(task);
+  }
+
+  /** True while this task is admitted/running activity (not merely unsettled cleanup). */
+  private taskHasActiveIntent(task: BackgroundTaskRecord): boolean {
+    return taskHasActiveIntent(task, this.pendingForceMerges.has(task.taskId));
+  }
+
+  /** Acquire/release one task's activity-intent token to match its admitted/running state. */
+  private syncActiveIntent(task: BackgroundTaskRecord): void {
+    if (this.taskHasActiveIntent(task)) this.ownedActivity.acquireIntent(task.taskId);
+    else this.ownedActivity.releaseIntent(task.taskId);
+  }
+
+  /** Bounded lookup of one live task record by its stable id (observation only). */
+  private taskById(taskId: string): BackgroundTaskRecord | undefined {
+    for (const group of this.groups.values()) {
+      const task = group.tasks.find((candidate) => candidate.taskId === taskId);
+      if (task) return task;
+    }
+    return undefined;
   }
 
   private dropActiveTasks(executionId: string): void {

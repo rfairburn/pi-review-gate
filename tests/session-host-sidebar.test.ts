@@ -1962,11 +1962,11 @@ test("truthful card status: observed/unknown agent and input state below the tit
   harness.send(ALT_LEFT_LEGACY);
   harness.controller.updateItems([
     makeItem({ id: "run", busy: true }),
-    makeItem({ id: "idle", busy: false, backgroundTasks: 0, backgroundShells: 0 }),
+    makeItem({ id: "idle", busy: false, activeTasks: 0, activeShells: 0 }),
     makeItem({ id: "unsure", busy: null }),
     makeItem({ id: "typed", pendingInput: true }),
     makeItem({ id: "surface", inputSurface: true }),
-    makeItem({ id: "quiet", backgroundTasks: 0, backgroundShells: 0 }),
+    makeItem({ id: "quiet", activeTasks: 0, activeShells: 0 }),
     makeItem({ id: "unobserved", pendingInput: null }),
     makeItem({ id: "gone", lifecycle: "exited", exitCode: 3, busy: null, pendingInput: null }),
     makeItem({ id: "err", lifecycle: "error", exitCode: 1 }),
@@ -1976,7 +1976,8 @@ test("truthful card status: observed/unknown agent and input state below the tit
   const texts = rosterView(harness.controller, 80, 60).texts;
   const statusFor = (id: string): string => texts[cardIndex(texts, `label-${id}`) + 1]?.trimEnd() ?? "";
   assert.equal(statusFor("run"), "  agent running | input none");
-  // Idle requires every activity category and modal input positively known.
+  // Idle requires every ACTIVITY-INTENT category and modal input positively
+  // known; the conservative ownership channel is not what this line displays.
   assert.equal(statusFor("idle"), "  agent idle | input none");
   assert.equal(statusFor("unsure"), "  agent unknown | input none");
   assert.equal(statusFor("typed"), "  agent waiting | input pending");
@@ -2022,42 +2023,55 @@ test("card title line carries only the sanitized canonical title", () => {
   }
 });
 
-test("background counts are honest: observed integers shown, anything else unknown", () => {
+test("activity-intent counts are honest: observed integers shown, anything else unknown", () => {
   const harness = makeController({ initialVisible: false });
   harness.send(ALT_LEFT_LEGACY);
   harness.controller.updateItems([
-    makeItem({ id: "known", label: "Known", backgroundTasks: 2, backgroundShells: 0, activity: ["compiling", "tests"] }),
-    makeItem({ id: "absent", label: "Absent" }),
-    makeItem({ id: "mixed", label: "Mixed", backgroundTasks: null, backgroundShells: 3 }),
-    makeItem({ id: "bogus", label: "Bogus", backgroundTasks: -1, backgroundShells: 1.5 }),
+    makeItem({ id: "known", label: "Known", backgroundTasks: 2, backgroundShells: 0, activeTasks: 2, activeShells: 0, activity: ["compiling", "tests"] }),
+    makeItem({ id: "settling", label: "Settling", backgroundTasks: 1, backgroundShells: 0, activeTasks: 0, activeShells: 0 }),
+    makeItem({ id: "mixed", label: "Mixed", activeTasks: null, activeShells: 3 }),
+    makeItem({ id: "bogus", label: "Bogus", activeTasks: -1, activeShells: 1.5 }),
     makeItem({
       id: "hostile",
       label: "Hostile",
-      backgroundTasks: "3" as unknown as number,
-      backgroundShells: Number.MAX_SAFE_INTEGER + 1,
+      activeTasks: "3" as unknown as number,
+      activeShells: Number.MAX_SAFE_INTEGER + 1,
     }),
-    makeItem({ id: "nonfinite", label: "Nonfinite", backgroundTasks: Number.NaN, backgroundShells: Number.POSITIVE_INFINITY }),
+    makeItem({ id: "nonfinite", label: "Nonfinite", activeTasks: Number.NaN, activeShells: Number.POSITIVE_INFINITY }),
   ]);
   harness.controller.select("known");
-  // 6 expanded cards (30 rows) + 3 action rows fit at 40x40.
+  // 6 expanded cards (25 rows) + 3 action rows fit at 40x40.
   const texts = rosterView(harness.controller, 40, 40).texts;
   const known = cardIndex(texts, "Known");
-  // Observed background tasks keep the row running, never idle.
+  // Observed activity intent keeps the row running, never idle.
   assert.equal(texts[known + 1]?.trimEnd(), "> agent running | input none");
   assert.equal(texts[known + 2]?.trimEnd(), "  bg tasks 2 | shells 0", "an observed zero is shown as zero");
   assert.equal(texts[known + 3]?.trimEnd(), "    compiling");
   assert.equal(texts[known + 4]?.trimEnd(), "    tests");
-  assert.equal(texts[cardIndex(texts, "Absent") + 2]?.trimEnd(), "  background unknown");
+  // Retained ownership with zero activity is displayed as an idle row with no
+  // background number: the card is activity intent, never a cleanup obligation.
+  const settling = cardIndex(texts, "Settling");
+  assert.equal(texts[settling + 1]?.trimEnd(), "  agent idle | input none");
+  assert.equal(texts[settling + 2]?.trimEnd(), "  bg tasks 0 | shells 0");
   assert.equal(texts[cardIndex(texts, "Mixed") + 2]?.trimEnd(), "  bg tasks unknown | shells 3");
   assert.equal(texts[cardIndex(texts, "Bogus") + 2]?.trimEnd(), "  background unknown");
   assert.equal(texts[cardIndex(texts, "Hostile") + 2]?.trimEnd(), "  background unknown");
   assert.equal(texts[cardIndex(texts, "Nonfinite") + 2]?.trimEnd(), "  background unknown");
   // The stored DTO copy is sanitized the same way: unknown is null, never 0.
   const items = harness.controller.items;
+  assert.deepEqual(items.map((item) => [item.activeTasks, item.activeShells]), [
+    [2, 0],
+    [0, 0],
+    [null, 3],
+    [null, null],
+    [null, null],
+    [null, null],
+  ]);
+  // The ownership channel is retained verbatim for the stop/remove gate.
   assert.deepEqual(items.map((item) => [item.backgroundTasks, item.backgroundShells]), [
     [2, 0],
+    [1, 0],
     [null, null],
-    [null, 3],
     [null, null],
     [null, null],
     [null, null],

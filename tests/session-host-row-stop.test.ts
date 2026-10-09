@@ -65,7 +65,9 @@ function preservedOriginalEnv(): NodeJS.ProcessEnv {
   return { ...process.env };
 }
 
-/** Complete observed inactivity: the only state that authorizes an idle-only stop. */
+/** Complete observed inactivity: the only state that authorizes an idle-only stop.
+ *  The stop gate reads the conservative ownership pair; the activity-intent pair
+ *  is carried alongside and must not weaken it. */
 const COMPLETE_IDLE: InstanceStatusUpdate = {
   busy: false,
   pendingInput: false,
@@ -73,6 +75,8 @@ const COMPLETE_IDLE: InstanceStatusUpdate = {
   activity: [],
   backgroundTasks: 0,
   backgroundShells: 0,
+  activeTasks: 0,
+  activeShells: 0,
 };
 
 /**
@@ -334,8 +338,10 @@ test("unconfirmed stop of fresh or non-idle rows requires confirmation and sends
     ["busy", { ...COMPLETE_IDLE, busy: true }],
     ["pending-input", { ...COMPLETE_IDLE, pendingInput: true }],
     ["input-surface", { ...COMPLETE_IDLE, inputSurface: true }],
-    ["tasks", { ...COMPLETE_IDLE, backgroundTasks: 1 }],
-    ["shells", { ...COMPLETE_IDLE, backgroundShells: 1 }],
+    // Zero ACTIVITY but a retained ownership obligation still requires
+    // confirmation: the stop gate never reads the displayed intent counts.
+    ["retained-tasks", { ...COMPLETE_IDLE, backgroundTasks: 1 }],
+    ["retained-shells", { ...COMPLETE_IDLE, backgroundShells: 1 }],
     ["unknown-tasks", { ...COMPLETE_IDLE, backgroundTasks: null }],
     ["unknown-shells", { ...COMPLETE_IDLE, backgroundShells: null }],
   ];

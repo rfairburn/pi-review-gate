@@ -33,6 +33,21 @@ dates.
   observed generic sidebar status, with explicit Unicode, mouse and platform
   limits. Existing standalone launchers remain unchanged. See
   [the alpha guide](docs/session-host-alpha.md).
+- The optional session host now remembers one global sidebar roster in the
+  canonical Pi agent directory (`PI_CODING_AGENT_DIR`, otherwise
+  `~/.pi/agent`) and restores it automatically from any launch directory:
+  remembered rows return in their original order as new independently owned
+  children started only from a freshly revalidated saved conversation in the
+  exact remembered workspace, with the remembered active entry preserved unless
+  a deliberate user action happened while restoration was still running. A
+  remembered entry that cannot be freshly admitted — including one whose saved
+  workspace changed, or one whose child never reported any conversation — keeps
+  its roster position as a bounded, non-activatable error row and never starts a
+  fresh session, and a row's remembered identity follows an in-native `/new` or
+  `/resume`. Explicit row removal forgets one entry while Quit keeps the roster,
+  and one host owns a Pi agent directory exclusively: a second host sharing it
+  is refused before it starts anything, with ownership released only after owned
+  child state positively settled and otherwise left fail closed (#331).
 
 ### Fixed
 

@@ -5,6 +5,28 @@ executor retry and failover, and what shutdown preserves or removes. Conflict re
 steps for the live gate live in
 [Delegated execution](delegated-execution.md#conflicts-and-gates).
 
+## Session-host roster recovery
+
+The optional `pi-review-sessions` host keeps one ordered sidebar roster in the canonical
+Pi agent directory (`PI_CODING_AGENT_DIR`, otherwise Pi's ordinary `~/.pi/agent`) and
+restores it automatically at startup from any launch directory. Restoration is not
+process recovery: no existing or detached process is discovered, adopted, or revived.
+Each remembered entry is restarted only when a fresh saved-conversation listing admits
+that exact conversation in the exact remembered workspace, and then as a new independently
+owned child. Entries that are unsaved, missing, ambiguous, replaced, workspace-changed,
+unsafe, refused, or never observed to have a conversation are
+not restarted and are never replaced by a fresh session; they stay visible at their
+remembered roster position as bounded
+error rows with a truthful reason until deliberately removed, and activating one never
+changes the active input owner. A row that never reported any conversation metadata stays
+remembered rather than disappearing. Quit stops owned children
+without forgetting the roster, explicit removal forgets exactly one entry, and exclusive
+ownership of the agent directory is released only once owned shutdown settled with positive
+child-state evidence. Malformed
+or unreadable roster state is reported and preserved untouched, so a damaged read never
+erases a valid roster; a symlinked, FIFO, or otherwise unsafe roster or ownership entry is
+refused without ever being opened or read.
+
 ## Session-scoped restart recovery
 
 The extension does not globally scan the filesystem for arbitrary landing manifests at

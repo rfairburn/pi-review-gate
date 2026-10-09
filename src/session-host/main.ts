@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
@@ -24,6 +25,17 @@ import {
 import { resolveNativePi, RUNTIME_ROLE_ENV, EXECUTOR_TOOL_CATALOG_ENV, snapshotNativeEnvironment } from "./launch";
 import { NativeAgentRegistry, type ProfilePreparer } from "./profiles";
 import { isValidNativeSessionId } from "./protocol";
+import {
+  MAX_ROSTER_ENTRIES,
+  ROSTER_STORE_VERSION,
+  isValidRosterName,
+  isValidRosterWorkspace,
+  openHostState as openProductionHostState,
+  type HostStateHandle,
+  type HostStateOpenResult,
+  type RosterEntry,
+  type StoredRoster,
+} from "./roster-store";
 import type { NativePersistenceReceipt } from "./native-persistence";
 import {
   admitSavedSession,
@@ -43,6 +55,11 @@ const ROW_RESUME_DUPLICATE = "This conversation is already restarting";
 const SAVED_UNAVAILABLE = "Saved conversations are unavailable in this host";
 const REMOVE_REFUSED_MESSAGE = "Session not removed; it may be live, unconfirmed, or no longer available.";
 const REMOVE_FAILURE_MESSAGE = "Session was not removed; its state could not be confirmed.";
+const ROSTER_UNAVAILABLE_MESSAGE = "That remembered conversation is unavailable; remove it or open a saved conversation";
+const ROSTER_SAVE_FAILURE_MESSAGE = "The session roster could not be saved; these rows will not be restored after a restart";
+const ROSTER_OVERFLOW_MESSAGE = "The session roster is larger than this host can save; the saved roster was left unchanged";
+const ROSTER_OWNERSHIP_MESSAGE = "Session host ownership was not confirmed released; a later host will refuse to start until it is resolved.";
+const ROSTER_RETAINED_MESSAGE = "Session host ownership is retained because shutdown did not settle.";
 const INPUT_DRAIN_MAX_MS = 250;
 const INPUT_DRAIN_IDLE_MS = 50;
 // One bounded readiness deadline for a just-spawned exited-row replacement:
@@ -105,11 +122,38 @@ interface MainDependencies {
     expectedPiVersion: string;
     signal: AbortSignal;
   }) => Promise<SavedSessionCatalog>;
+  /**
+   * Acquire exclusive ownership of the canonical Pi agent directory and read
+   * its globally persisted roster. Production resolves the real store; focused
+   * tests inject a hermetic implementation so no real user agent data or lock
+   * is ever touched.
+   */
+  readonly openHostState: (options: { agentDir: string; hostId: string }) => HostStateOpenResult;
   readonly createTerminal: () => MainTerminal;
   readonly createObserver: (options: ConstructorParameters<typeof KeyboardCapabilityObserver>[0]) => MainObserver;
   readonly createWriter: (output: Writable, options: Parameters<typeof createSessionHostFrameWriter>[1]) => MainWriter;
   readonly runExternalEditor: typeof runNativeExternalEditor;
   readonly reportError: (message: string) => void;
+}
+
+/**
+ * One remembered sidebar roster slot tracked by Main. `slotId` is stable for
+ * the slot across native /new and /resume identity changes; `rowId` is the
+ * current manager row id when this slot owns a live manager row, and is absent
+ * for a remembered conversation that could not be restored (visible as a
+ * bounded error row instead of a silently started fresh session). Identity
+ * fields stay optional: a row that never reported native metadata, or a
+ * conversation that could not be restarted, is still a remembered slot.
+ */
+interface RosterRecord {
+  readonly slotId: string;
+  rowId?: string;
+  sessionId?: string;
+  workspace?: string;
+  name?: string;
+  persistence?: "saved" | "unsaved" | "unknown";
+  /** Bounded truthful reason this remembered conversation is not restorable. */
+  unavailableReason?: string;
 }
 
 class MainFailure extends Error {
@@ -241,6 +285,20 @@ function nativeKeyHint(
   }
 }
 
+/**
+ * Canonical real path of an existing workspace directory, or undefined. Used to
+ * require that an automatically restored conversation is restarted in exactly
+ * the workspace that was remembered, never in a newly recorded one.
+ */
+function canonicalExistingDirectory(path: string | undefined): string | undefined {
+  if (typeof path !== "string" || path === "") return undefined;
+  try {
+    return realpathSync(path);
+  } catch {
+    return undefined;
+  }
+}
+
 function stableNodeVersion(version: string): boolean {
   const parsed = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
   if (!parsed) return false;
@@ -336,6 +394,7 @@ function productionDependencies(): MainDependencies {
     createManager: (options) => new InstanceManager(options),
     createSidebar: (options) => new SidebarController(options),
     listSavedCatalog: listSavedSessions,
+    openHostState: openProductionHostState,
     createTerminal: () => new ProcessTerminal(),
     createObserver: (options) => new KeyboardCapabilityObserver(options),
     createWriter: (output, options) => createSessionHostFrameWriter(output, options),
@@ -403,6 +462,35 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   // Successful removals are terminal for this host id. A delayed roster
   // notification must not resurrect a detached row.
   const removedExitedIds = new Set<string>();
+  // Globally persisted roster (issue 331): exclusive agent-directory ownership,
+  // the remembered ordered slots, and the mapping from this run's manager rows
+  // back to their slots. The store is mutated ONLY by roster changes (row
+  // create/remove/rename/activate) and never by Quit or teardown, so a normal
+  // host shutdown stops owned children without forgetting the roster.
+  let hostState: HostStateHandle | undefined;
+  const rosterRecords = new Map<string, RosterRecord>();
+  const rowSlots = new Map<string, string>();
+  // Set for exactly the synchronous stretch of one `manager.create(...)` call
+  // that continues an existing slot (startup restore or exited-row restart),
+  // so the row inserted by that call is adopted into the reserved slot instead
+  // of appending a new one. Nothing can interleave inside that stretch.
+  let adoptingSlot: string | undefined;
+  let rememberedActiveSlot: string | undefined;
+  let lastPersistedRoster = "";
+  let rosterSaveFailureNoted = false;
+  let rosterOverflowNoted = false;
+  let rosterProblemNoted = false;
+  let restoreAbort: AbortController | undefined;
+  // Every deliberate sidebar action (activation, removal, stop, navigation
+  // that reaches Main, typing) advances this generation. A delayed startup
+  // restore applies the remembered active entry only while the generation is
+  // unchanged, so a later user action is never overridden even when it left
+  // `activeId` undefined again.
+  let deliberateActionGeneration = 0;
+  // Positive evidence that this host's owned-child state settled: a successful
+  // manager shutdown result, or a live-state query that actually answered.
+  // Unknown/absent evidence never authorizes releasing exclusive ownership.
+  let ownedStateSettled = false;
   let layout: HostLayout | undefined;
   let lastNativeCols: number | undefined;
   let lastNativeRows: number | undefined;
@@ -599,6 +687,344 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     });
   }
 
+  const rosterErrorIdPrefix = "roster-error:";
+
+  function rosterErrorItemId(slotId: string): string {
+    return `${rosterErrorIdPrefix}${slotId}`;
+  }
+
+  function slotIdFromRosterErrorItemId(id: string): string | undefined {
+    if (!id.startsWith(rosterErrorIdPrefix)) return undefined;
+    const slotId = id.slice(rosterErrorIdPrefix.length);
+    return slotId.length > 0 ? slotId : undefined;
+  }
+
+  function toRosterErrorItem(record: RosterRecord): SidebarItem {
+    const name = record.name;
+    return {
+      id: rosterErrorItemId(record.slotId),
+      label: name !== undefined && name.trim().length > 0 ? name : "(unavailable conversation)",
+      workspace: record.workspace ?? "",
+      agentDir: "",
+      lifecycle: "error",
+      hasLiveProcess: false,
+      unavailable: true,
+      busy: null,
+      pendingInput: null,
+      inputSurface: false,
+      activity: [record.unavailableReason ?? "This conversation is unavailable"],
+    };
+  }
+
+  /**
+   * Adopt every current manager row into its remembered slot and refresh that
+   * slot's last-observed CURRENT conversation identity from the LATEST row in
+   * manager order. A slot whose current row left the roster was deliberately
+   * removed and is forgotten; a slot with no row stays remembered and renders
+   * as a bounded error row at its own remembered position.
+   */
+  function adoptRosterViews(currentViews: NativeInstanceView[]): void {
+    const byRow = new Map(currentViews.map((view) => [view.id, view]));
+    const assigned = new Map<string, NativeInstanceView>();
+    for (const view of currentViews) {
+      const slotId = rowSlots.get(view.id) ?? adoptingSlot;
+      const record = slotId === undefined ? undefined : rosterRecords.get(slotId);
+      if (record === undefined) {
+        const created: RosterRecord = { slotId: view.id };
+        rosterRecords.set(created.slotId, created);
+        rowSlots.set(view.id, created.slotId);
+        assigned.set(created.slotId, view);
+      } else {
+        rowSlots.set(view.id, record.slotId);
+        assigned.set(record.slotId, view);
+      }
+    }
+    for (const [slotId, view] of assigned) {
+      const record = rosterRecords.get(slotId);
+      if (record === undefined) continue;
+      record.rowId = view.id;
+      record.unavailableReason = undefined;
+      if (view.workspace.length > 0) record.workspace = view.workspace;
+      const observed = view.nativeSession ?? view.lastNativeSession;
+      if (observed !== undefined && observed !== null && isValidNativeSessionId(observed.sessionId)) {
+        record.sessionId = observed.sessionId;
+        record.persistence = observed.persistence ?? "unknown";
+        // A name outside the native display bound is dropped instead of making
+        // the whole roster unpublishable.
+        if (isValidRosterName(observed.name)) record.name = observed.name;
+        else delete record.name;
+      }
+    }
+    for (const [slotId, record] of [...rosterRecords]) {
+      if (record.rowId === undefined || byRow.has(record.rowId)) continue;
+      rosterRecords.delete(slotId);
+    }
+    // Row mappings only exist for current rows; a replaced or removed row's
+    // mapping is dropped so a stale id can never claim a slot again.
+    for (const rowId of [...rowSlots.keys()]) {
+      if (!byRow.has(rowId)) rowSlots.delete(rowId);
+    }
+  }
+
+  /**
+   * Roster DTOs at their stable remembered positions: each remembered slot
+   * contributes either its current manager row or, when it has none, its
+   * bounded unavailable error row. A slot still awaiting its restore attempt is
+   * simply not drawn yet; a live manager row is never hidden.
+   */
+  function currentRosterItems(): SidebarItem[] {
+    const byRow = new Map(views.map((view) => [view.id, view]));
+    const emitted = new Set<string>();
+    const items: SidebarItem[] = [];
+    for (const record of rosterRecords.values()) {
+      const view = record.rowId === undefined ? undefined : byRow.get(record.rowId);
+      if (view !== undefined) {
+        if (emitted.has(view.id)) continue;
+        emitted.add(view.id);
+        items.push(toSidebarItem(view));
+        continue;
+      }
+      if (record.rowId !== undefined || record.unavailableReason === undefined) continue;
+      items.push(toRosterErrorItem(record));
+    }
+    // Safety net: a manager row without a remembered slot is still drawn.
+    for (const view of views) {
+      if (!emitted.has(view.id)) items.push(toSidebarItem(view));
+    }
+    return items;
+  }
+
+  /**
+   * The persisted projection of the in-memory roster: every remembered slot, in
+   * its stable remembered order, with whatever identity it actually observed.
+   * A slot with no authenticated conversation id or no known workspace is still
+   * persisted (it can only ever restore as an unavailable error entry), and a
+   * display-only name outside the native bound is dropped rather than making the
+   * whole roster unpublishable. Undefined when the roster exceeds the publishable
+   * bound, in which case the published roster is left exactly as it was.
+   */
+  function buildRosterProjection(): StoredRoster | undefined {
+    const entries: RosterEntry[] = [];
+    for (const record of rosterRecords.values()) {
+      if (entries.length >= MAX_ROSTER_ENTRIES) return undefined;
+      entries.push({
+        slotId: record.slotId,
+        ...(record.sessionId !== undefined && isValidNativeSessionId(record.sessionId)
+          ? { sessionId: record.sessionId } : {}),
+        ...(record.workspace !== undefined && isValidRosterWorkspace(record.workspace) ? { workspace: record.workspace } : {}),
+        ...(record.name !== undefined && isValidRosterName(record.name) ? { name: record.name } : {}),
+        ...(record.persistence !== undefined ? { persistence: record.persistence } : {}),
+      });
+    }
+    const activeSlotId = activeId !== undefined ? rowSlots.get(activeId) : rememberedActiveSlot;
+    const active = activeSlotId !== undefined && entries.some((entry) => entry.slotId === activeSlotId)
+      ? { activeSlotId }
+      : {};
+    return { version: ROSTER_STORE_VERSION, entries, ...active };
+  }
+
+  /**
+   * Publish the roster only when it actually changed. A malformed or unwritable
+   * store is never overwritten: persistence stays disabled and the bounded
+   * problem is surfaced once instead.
+   */
+  function persistRoster(): void {
+    const handle = hostState;
+    if (handle === undefined) return;
+    if (handle.problem !== undefined) {
+      if (!rosterProblemNoted && sidebar) {
+        rosterProblemNoted = true;
+        sidebar.showError(handle.problem);
+        scheduleRedraw();
+      }
+      return;
+    }
+    const projection = buildRosterProjection();
+    if (projection === undefined) {
+      if (!rosterOverflowNoted && sidebar) {
+        rosterOverflowNoted = true;
+        sidebar.showError(ROSTER_OVERFLOW_MESSAGE);
+        scheduleRedraw();
+      }
+      return;
+    }
+    const serialized = JSON.stringify(projection);
+    if (serialized === lastPersistedRoster) return;
+    if (!handle.persist(projection)) {
+      if (!rosterSaveFailureNoted && sidebar) {
+        rosterSaveFailureNoted = true;
+        sidebar.showError(ROSTER_SAVE_FAILURE_MESSAGE);
+        scheduleRedraw();
+      }
+      return;
+    }
+    lastPersistedRoster = serialized;
+  }
+
+  /** Seed the remembered slots from the persisted roster observed at open. */
+  function initializeRosterRecords(stored: StoredRoster | undefined): void {
+    if (stored !== undefined) {
+      for (const entry of stored.entries) {
+        if (rosterRecords.has(entry.slotId)) continue;
+        rosterRecords.set(entry.slotId, {
+          slotId: entry.slotId,
+          ...(entry.sessionId !== undefined ? { sessionId: entry.sessionId } : {}),
+          ...(entry.workspace !== undefined ? { workspace: entry.workspace } : {}),
+          ...(entry.name !== undefined ? { name: entry.name } : {}),
+          ...(entry.persistence !== undefined ? { persistence: entry.persistence } : {}),
+        });
+      }
+    }
+    rememberedActiveSlot = stored?.activeSlotId;
+    // Baseline the published projection so an unchanged roster is never rewritten.
+    const baseline = buildRosterProjection();
+    lastPersistedRoster = baseline === undefined ? "" : JSON.stringify(baseline);
+  }
+
+  /**
+   * Deliberate removal of one remembered-but-unavailable entry. Only a slot
+   * that owns no manager row can be removed here; a live/exited row is removed
+   * through its own manager-owned path.
+   */
+  function removeRosterEntry(slotId: string): void {
+    const record = rosterRecords.get(slotId);
+    if (record === undefined || record.rowId !== undefined) {
+      sidebar?.showError(REMOVE_REFUSED_MESSAGE);
+      scheduleRedraw();
+      return;
+    }
+    rosterRecords.delete(slotId);
+    if (rememberedActiveSlot === slotId) rememberedActiveSlot = undefined;
+    syncRosterAndSchedule();
+    reconcileLayout(true);
+  }
+
+  /**
+   * Automatic global roster restoration (issue 331). Every remembered entry is
+   * revalidated against a FRESH saved-conversation catalog and restarted only
+   * through a new exact branded admission as a NEW independently owned child in
+   * the conversation's recorded workspace. Nothing is adopted, guessed, or
+   * substituted; an entry that cannot be freshly admitted stays visible as a
+   * bounded error row and never starts a fresh session.
+   */
+  async function restorePersistedRoster(): Promise<void> {
+    const handle = hostState;
+    const activeManager = manager;
+    const activeSidebar = sidebar;
+    const stored = handle?.roster;
+    if (handle === undefined || activeManager === undefined || activeSidebar === undefined) return;
+    if (handle.problem !== undefined) return; // surfaced truthfully by persistRoster
+    if (stored === undefined || stored.entries.length === 0) return;
+    // Automatic activation is fenced by the deliberate-action generation, not by
+    // the current activeId alone: a user who activates and then clears/removes a
+    // row during a slow restore must not have the remembered sibling activated
+    // afterwards. The startup fence is absolute — any deliberate action at all,
+    // including one received while keyboard negotiation is still settling,
+    // invalidates the automatic activation.
+    const generationAtStart = 0;
+    const agentDir = sessionSetup?.nativeAgentDir;
+    const activePi = pi;
+    const controller = new AbortController();
+    restoreAbort = controller;
+    let catalog: SavedSessionCatalog | undefined;
+    if (typeof agentDir === "string" && agentDir !== "" && activePi !== undefined && activePi.file && activePi.version) {
+      try {
+        catalog = await dependencies.listSavedCatalog({
+          agentDir,
+          piExecutable: activePi.file,
+          expectedPiVersion: activePi.version,
+          signal: controller.signal,
+        });
+      } catch {
+        catalog = undefined;
+      }
+    }
+    if (controller.signal.aborted || shutdownRequested || manager !== activeManager) return;
+    // Decide every entry synchronously from this one catalog snapshot, minting
+    // each branded admission BEFORE any row is created: a later listing, a
+    // catalog revision bump, or a concurrent user action can never invalidate an
+    // admission half-way through restoration.
+    const decisions = stored.entries.map((entry) => {
+      let createOptions: CreateInstanceOptions | undefined;
+      let reason = "This conversation is unavailable";
+      const entrySessionId = entry.sessionId;
+      // The remembered workspace is part of the contract: a conversation whose
+      // current header resolves elsewhere is never silently launched there.
+      const rememberedWorkspace = canonicalExistingDirectory(entry.workspace);
+      const matching = entrySessionId === undefined
+        ? []
+        : (catalog?.rows.filter((row) => row.id === entrySessionId) ?? []);
+      const row = matching[0];
+      if (entrySessionId === undefined) {
+        reason = "This remembered session never reported a conversation; it was not restarted";
+      } else if (catalog === undefined) {
+        reason = "The saved conversation list is unavailable; this conversation was not restarted";
+      } else if (matching.length > 1) {
+        reason = "More than one saved conversation matches this session; it was not restarted";
+      } else if (row === undefined) {
+        reason = catalog.issueCount !== 0
+          ? "The saved conversation list is incomplete; this conversation was not restarted"
+          : entry.persistence === "unsaved"
+            ? "This conversation was never saved to disk; it was not restarted"
+            : "This conversation is no longer saved to disk; it was not restarted";
+      } else {
+        let admitted: SavedSessionAdmissionResult;
+        try {
+          admitted = admitSavedSession(catalog, row, { ownedLiveSessions: activeManager.ownedLiveSessions() });
+        } catch {
+          admitted = { status: "refused", reason: "unknown-row" };
+        }
+        if (admitted.status === "refused") {
+          reason = `This conversation could not be revalidated: ${savedRefusalNotice(admitted.reason)}`;
+        } else if (rememberedWorkspace === undefined || rememberedWorkspace !== admitted.admission.workspace) {
+          reason = "This conversation's recorded workspace changed; it was not restarted";
+        } else {
+          createOptions = { workspace: admitted.admission.workspace, savedSession: admitted.admission };
+        }
+      }
+      return { entry, createOptions, reason };
+    });
+    for (const decision of decisions) {
+      if (shutdownRequested || manager !== activeManager) return;
+      const record = rosterRecords.get(decision.entry.slotId);
+      if (record === undefined) continue;
+      if (decision.createOptions === undefined) {
+        record.rowId = undefined;
+        record.unavailableReason = decision.reason;
+        continue;
+      }
+      adoptingSlot = decision.entry.slotId;
+      let created: Promise<string>;
+      try {
+        created = activeManager.create(decision.createOptions);
+      } finally {
+        adoptingSlot = undefined;
+      }
+      try {
+        await created;
+      } catch {
+        const live = rosterRecords.get(decision.entry.slotId);
+        if (live !== undefined && live.rowId === undefined) {
+          live.unavailableReason = "This conversation could not be started; it was not replaced";
+        }
+      }
+    }
+    if (shutdownRequested || manager !== activeManager) return;
+    // The remembered active entry is applied only after every restore attempt
+    // and only while no deliberate user action occurred since restoration began,
+    // so a slow restore can never override a user's own focus or action.
+    if (deliberateActionGeneration === generationAtStart) {
+      const activeSlot = stored.activeSlotId;
+      const activeRecord = activeSlot === undefined ? undefined : rosterRecords.get(activeSlot);
+      if (activeRecord?.rowId !== undefined) {
+        activeId = activeRecord.rowId;
+        rememberedActiveSlot = activeRecord.slotId;
+        reconcileLayout(true);
+      }
+    }
+    syncRosterAndSchedule();
+  }
+
   function syncRosterAndSchedule(): void {
     if (!manager || !sidebar || shutdownRequested) return;
     if (rosterSyncInProgress) {
@@ -614,14 +1040,17 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     rosterSyncInProgress = true;
     try {
       views = manager.list().filter((view) => !removedExitedIds.has(view.id));
+      adoptRosterViews(views);
       if (activeId !== undefined && !views.some((view) => view.id === activeId)) {
         activeId = undefined;
+        rememberedActiveSlot = undefined;
       }
       // View-only observer: the sidebar's white title highlight follows the
       // actual active Main owner; clearing it here (owner row gone) prevents a
       // false sibling highlight. It never changes activation or ownership.
       sidebar.setActiveMainOwner(activeId);
-      sidebar.updateItems(views.map(toSidebarItem));
+      sidebar.updateItems(currentRosterItems());
+      persistRoster();
       syncOuterMouseModes();
       scheduleRedraw();
     } catch {
@@ -681,7 +1110,17 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   function handleTerminalInput(data: string): void {
     if (shutdownRequested || externalEditorActive || !sidebar) return;
     try {
+      // Focus-only and selection-only host actions (for example the roster-only
+      // Alt+Right return to Main) emit no SidebarAction, so the deliberate-action
+      // generation is advanced from the sidebar's own observable state as well.
+      const previousFocus = sidebar.focus;
+      const previousSelection = sidebar.selectedId;
+      const previousVisibility = sidebar.visible;
       sidebar.handleInput(data);
+      if (sidebar.focus !== previousFocus || sidebar.selectedId !== previousSelection
+        || sidebar.visible !== previousVisibility) {
+        deliberateActionGeneration += 1;
+      }
       reconcileLayout(false);
       scheduleRedraw();
     } catch {
@@ -1120,6 +1559,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // later UI/listing cancel must never discard this already-started child.
     record.spawned = true;
     let createdId: string;
+    // The replacement is a NEW, independently remembered slot until it actually
+    // replaces the old placeholder: adopting it into the old slot before
+    // readiness succeeds would collapse two visible rows into one persisted
+    // entry and lose a retained row without any explicit removal. The stable
+    // slot moves only when the old placeholder is removed below.
     try {
       createdId = await owner.create(createOptions);
     } catch (error) {
@@ -1175,20 +1619,41 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // placeholder instead of completing the restart mid-shutdown.
     if (shutdownRequested || !sidebar) return;
     sidebar.completeRowResume(requestId, oldId, createdId);
-    removeExitedRow(oldId, { replaced: true });
+    removeExitedRow(oldId, { replaced: true, replacementId: createdId });
     reconcileLayout(true);
   }
 
-  function removeExitedRow(id: string, options?: { readonly replaced?: boolean }): void {
+  /**
+   * Remove one row, optionally completing a confirmed deliberate replacement.
+   *
+   * A successful replacement transfers its stable roster slot into the old
+   * placeholder's position: the slot id, its remembered position, and its
+   * active-slot mapping all follow the replaced row, so restarting A in an A,B
+   * roster never reorders it to B,A. The transfer happens only after the old
+   * row's removal is confirmed, and synchronous roster synchronization is
+   * suppressed across that confirmation so the old slot cannot be dropped
+   * before the transfer runs.
+   */
+  function removeExitedRow(id: string, options?: { readonly replaced?: boolean; readonly replacementId?: string }): void {
     if (!manager || !sidebar) return;
     const replacing = options?.replaced === true;
+    const replacementId = options?.replacementId;
+    const oldSlot = rowSlots.get(id);
+    const replacementSlot = replacementId === undefined ? undefined : rowSlots.get(replacementId);
+    const replacementRecord = replacementSlot === undefined ? undefined : rosterRecords.get(replacementSlot);
+    const wasSyncing = rosterSyncInProgress;
     if (replacing) sidebar.noteRowReplacement(id);
     let removed: boolean;
-    try { removed = manager.closeExited(id); }
+    try {
+      if (replacing) rosterSyncInProgress = true;
+      removed = manager.closeExited(id);
+    }
     catch {
       if (replacing) sidebar.clearRowReplacement(id);
       else { sidebar.showError(REMOVE_FAILURE_MESSAGE); scheduleRedraw(); }
       return;
+    } finally {
+      rosterSyncInProgress = wasSyncing;
     }
     if (!removed && !replacing) {
       // A settled error row without an owned PTY exit is closed only through
@@ -1205,6 +1670,17 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       return;
     }
     removedExitedIds.add(id);
+    if (replacing && replacementId !== undefined && oldSlot !== undefined
+      && replacementSlot !== undefined && replacementSlot !== oldSlot
+      && replacementRecord !== undefined && rosterRecords.has(oldSlot)) {
+      // Updating an existing Map key preserves its original remembered position;
+      // the replacement's own appended slot is dropped at the same moment.
+      rosterRecords.set(oldSlot, { ...replacementRecord, slotId: oldSlot, rowId: replacementId });
+      rosterRecords.delete(replacementSlot);
+      rowSlots.delete(id);
+      rowSlots.set(replacementId, oldSlot);
+      if (rememberedActiveSlot === replacementSlot) rememberedActiveSlot = oldSlot;
+    }
     if (activeId === id) activeId = undefined;
     // Authoritatively settled removal never activates a sibling or loses its owner.
     syncRosterAndSchedule();
@@ -1259,16 +1735,28 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
 
   function handleSidebarAction(action: SidebarAction): void {
     if (shutdownRequested) return;
+    // Any deliberate user action invalidates a pending automatic activation.
+    deliberateActionGeneration += 1;
     switch (action.type) {
       case "forward":
         routeForward(action.data);
         return;
-      case "select":
-        // This action is emitted only by an explicit roster activation.
+      case "select": {
+        // This action is emitted only by an explicit roster activation. A
+        // remembered-but-unavailable entry has no process to own, so it never
+        // becomes the input owner; the refusal is surfaced instead.
+        const unavailableSlot = slotIdFromRosterErrorItemId(action.id);
+        if (unavailableSlot !== undefined) {
+          sidebar?.showError(ROSTER_UNAVAILABLE_MESSAGE);
+          scheduleRedraw();
+          return;
+        }
         activeId = action.id;
+        rememberedActiveSlot = rowSlots.get(action.id);
         syncRosterAndSchedule();
         reconcileLayout(true);
         return;
+      }
       case "create":
         if (negotiationReady) launchCreate(action);
         else deferredCreates.set(action.requestId, action);
@@ -1317,9 +1805,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         );
         return;
       }
-      case "remove":
+      case "remove": {
+        const unavailableSlot = slotIdFromRosterErrorItemId(action.id);
+        if (unavailableSlot !== undefined) {
+          removeRosterEntry(unavailableSlot);
+          return;
+        }
         removeExitedRow(action.id);
         return;
+      }
       case "resume-row":
         if (negotiationReady) launchRowResume(action.requestId, action.id);
         else deferredRowResumes.set(action.requestId, { requestId: action.requestId, id: action.id });
@@ -1425,6 +1919,9 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     deferredCreates.clear();
     deferredSavedOpens.clear();
     deferredRowResumes.clear();
+    // Abort an in-flight startup roster restoration; nothing it has not already
+    // started is spawned, and an already-started child stays owned.
+    try { restoreAbort?.abort(); } catch { /* abort is best-effort */ }
     // Abort every outstanding restart listing; a started child is never killed.
     for (const record of rowResumeTasks.values()) {
       try { record.controller.abort(); } catch { /* abort is best-effort */ }
@@ -1513,6 +2010,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             else if (outcome.result) {
               shutdownResult = outcome.result;
               forcedCount = shutdownResult.forcedIds.length;
+              // The manager's own settled shutdown result is positive evidence.
+              ownedStateSettled = true;
             }
           } catch {
             // The startup-time rejection handler above keeps this defensive.
@@ -1535,17 +2034,24 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         try {
           const liveViews = manager.list().filter((view) => view.hasLiveProcess);
           remainingCount = liveViews.length;
+          // A live-state query that actually answered is positive evidence.
+          ownedStateSettled = true;
         } catch {
           remainingCount = shutdownResult?.remainingIds.length ?? 0;
           try {
             if (remainingCount === 0 && manager.hasLiveProcesses()) remainingCount = 1;
+            // The fallback liveness query answered truthfully.
+            ownedStateSettled = true;
           } catch {
-            // Preserve the bounded shutdown snapshot if the live query also fails.
+            // Both owned-child queries are unavailable: no positive settlement
+            // evidence exists, so exclusive ownership is retained fail closed.
+            cleanupFailure = true;
           }
-          cleanupFailure = true;
         }
       } else {
+        // No manager was ever constructed: this host owns no child at all.
         remainingCount = shutdownResult?.remainingIds.length ?? 0;
+        ownedStateSettled = true;
       }
       if (broker) {
         try {
@@ -1556,7 +2062,29 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       }
 
       removeOuterListeners();
-      const failed = runtimeFailure || cleanupFailure || forcedCount > 0 || remainingCount > 0;
+      let failed = runtimeFailure || cleanupFailure || forcedCount > 0 || remainingCount > 0;
+      // Exclusive agent-directory ownership is released only when owned shutdown
+      // settled: a positively settled manager result or live-state answer, and no
+      // owned process still unconfirmed. Unknown or absent child state (every
+      // query unavailable) keeps ownership held (fail closed) so a later host
+      // refuses instead of racing children that may still be running.
+      if (hostState !== undefined) {
+        if (remainingCount === 0 && ownedStateSettled) {
+          let released = false;
+          try {
+            released = hostState.release();
+          } catch {
+            released = false;
+          }
+          if (!released) {
+            cleanupFailure = true;
+            failed = true;
+            safeReport(dependencies, ROSTER_OWNERSHIP_MESSAGE);
+          }
+        } else {
+          safeReport(dependencies, ROSTER_RETAINED_MESSAGE);
+        }
+      }
       if (failed) {
         const details = forcedCount > 0 || remainingCount > 0
           ? `Session host shutdown: ${forcedCount} owned process(es) required forced termination; ${remainingCount} remain unconfirmed.`
@@ -1620,6 +2148,25 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const initialCols = clampDimension(terminal.columns, 80);
     const initialRows = clampDimension(terminal.rows, 24);
     sessionSetup = dependencies.createSessionSetup({ env: snapshot.env });
+    // Global roster and single-host ownership (issue 331): acquire exclusive
+    // ownership of the canonical Pi agent directory and read the persisted
+    // roster BEFORE any roster entry, manager row, or child exists. A host that
+    // shares the same agent directory refuses here with an actionable message
+    // and starts nothing.
+    if (sessionSetup.nativeSetup === true
+      && typeof sessionSetup.nativeAgentDir === "string" && sessionSetup.nativeAgentDir !== "") {
+      const opened = dependencies.openHostState({ agentDir: sessionSetup.nativeAgentDir, hostId: randomUUID() });
+      if (opened.status === "refused") {
+        safeReport(dependencies, opened.message);
+        runtimeFailure = true;
+        shutdownRequested = true;
+        startupComplete = true;
+        beginShutdown();
+        return await runFinished;
+      }
+      hostState = opened.state;
+      initializeRosterRecords(opened.state.roster);
+    }
     const activeSessionSetup = sessionSetup;
     const createTextField = (options: SidebarFieldFactoryOptions) => {
       if (!activeSessionSetup.nativeAgentDir) {
@@ -1736,6 +2283,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     else {
       await observer.wait();
       observedFlags = observer.flags & 7;
+      // Restore the globally persisted roster before any deliberate user action
+      // is admitted: restored rows keep their remembered order and the
+      // remembered active entry is applied only while no later deliberate
+      // activation exists.
+      if (!shutdownRequested) await restorePersistedRoster();
       negotiationReady = true;
       if (!shutdownRequested) {
         for (const action of deferredCreates.values()) launchCreate(action);

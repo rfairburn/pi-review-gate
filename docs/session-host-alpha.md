@@ -106,7 +106,23 @@ private directory and is used only as the root for the host's transient
 status-broker transport directory; that owned directory and socket are removed when
 the host closes. It is not a Pi agent,
 profile, settings, or credential root. Without it, the broker uses the operating
-system's temporary directory. The sidebar toggle defaults to `alt+left`; `f8` is an
+system's temporary directory.
+
+The host also owns one **global sidebar roster** in the canonical Pi agent directory —
+Pi's `PI_CODING_AGENT_DIR` override when set, otherwise Pi's ordinary `~/.pi/agent` —
+under `<agentDir>/session-host/`. That location follows Pi's native agent-data
+resolution: it is never the launch cwd, `--state-root`, a config-file directory, or the
+package root, so the same roster is visible from any launch directory. The same private
+directory holds the host's exclusive ownership record. One host owns a given Pi agent
+directory at a time: a second `pi-review-sessions` host sharing that directory is refused
+before it constructs a manager, resolves a roster entry, or starts a child, with a
+message naming the agent directory and the ownership record. Ownership is taken only by
+an exclusive create and is never stolen, verified around, or repaired, and no process is
+inspected or signalled to decide it. The record is removed only by the host that created
+it, and only after its owned children settled; an unsettled shutdown keeps it so a later
+host refuses instead of racing children that may still be running. Malformed, oversized,
+unsafe, or unreadable roster state is reported truthfully and left untouched: nothing is
+restored from it, persistence stays disabled, and nothing overwrites it. The sidebar toggle defaults to `alt+left`; `f8` is an
 example of a way to leave Alt+Left available for native word-left editing. Put native Pi
 arguments after a literal `--`; allowed arguments retain their original order and
 bytes. There are no initial host `--workspace`, `--profile`, or `--label` options.
@@ -142,7 +158,15 @@ unchanged.
 ## Starting and owning sessions
 
 The host opens on a welcome/sidebar picker; it does not implicitly launch a Pi session
-or treat its own startup directory as a workspace. Each **New session** asks only for an
+or treat its own startup directory as a workspace. It automatically restores its globally
+persisted roster, so a host started from **any** launch directory begins with the rows it
+remembered last time, in the same order — including a remembered row that could not be
+restarted, which keeps its own position as a bounded error entry. Restoration runs before
+any deliberate user
+action is admitted, and the remembered active entry becomes the active Main input owner
+only when no deliberate user action happened while restoration was still running, so a
+slow restoration can never take over a user's own focus or action. Each **New session**
+asks only for an
 explicit existing workspace directory; there is no separate host display-label field.
 Submitting New creates the child and immediately makes it the active Main input owner
 without a second row Enter; the sidebar stays visible.
@@ -160,7 +184,26 @@ ordinary `~/.pi/agent` default. That directory is fixed user configuration, not 
 workspace selector, and cannot also be selected as a session workspace.
 
 Each host-created row owns a separate top-level native Pi process, selected workspace,
-new conversation, input route, terminal frame, and lifecycle. All children naturally
+new conversation, input route, terminal frame, and lifecycle. Restoring a remembered row
+is not process recovery: the host does not find, adopt, attach to, or revive an existing
+or detached process, and it never guesses a newest file. Every remembered entry is
+revalidated against a fresh saved-conversation listing and restarted only through a new
+exact branded per-child `--session` admission as a new, independently owned child in that
+conversation's **recorded** workspace. A conversation whose saved record now resolves to a
+different workspace is refused instead of being launched there. A remembered entry that
+cannot be freshly admitted — never saved, missing, ambiguous, replaced, unsafe, refused,
+workspace-changed, or never observed to have a conversation at all — is not restarted and
+is never replaced by a fresh session: it stays visible at its remembered roster position as
+a bounded error row with a truthful reason until it is deliberately removed. Such a row is
+never activatable: Enter on it refuses without moving input focus or changing the active
+Main owner, so typing is never handed to a sibling session. The remembered identity is the
+last observed
+current authenticated native conversation, not the conversation the row originally
+launched with: a native `/new` or `/resume` inside a row updates its remembered entry.
+A row that never reports any conversation metadata, and a row whose launch failed, stay
+remembered as identity-unavailable entries rather than disappearing; only an explicit
+removal forgets a row.
+All children naturally
 share ordinary native Pi configuration and resources: settings, authentication,
 models, keybindings, extensions, MCP configuration, skills, and provider environment.
 The host does not clone those files, republish skills, create per-window credentials, or
@@ -174,7 +217,9 @@ entry. A positively never-saved binding can start fresh in the same workspace on
 the safe catalog confirms that exact conversation is absent. Unknown, ambiguous, unsafe,
 or missing-known-saved bindings are refused; the host never substitutes the original
 launch conversation or newest file. Successful replacement removes the old placeholder
-without taking over a later focus, pane, or draft; a failure retains the old row and any
+without taking over a later focus, pane, or draft, and keeps the replaced row's roster
+position and remembered active-slot mapping instead of reordering the roster; a failure
+retains the old row and any
 already-started child. Activating another session or hiding the sidebar
 changes only display and input focus: it does not pause, stop, or transfer ownership of
 any session. Background work can continue while another session is active. If the active
@@ -349,6 +394,12 @@ treat the design description as proof that every terminal/input combination work
 
 ## Quitting and cleanup
 
+Quitting the host stops its owned children and **preserves the global roster**: closing
+the host is not an explicit removal, so the remembered rows stay exactly as they were and
+the next host restores them. Only an explicit row removal forgets an entry — the settled
+exited/error row removal above, or an explicit removal of a remembered-but-unavailable
+error entry. Quit never rewrites the roster to an empty or differently ordered one.
+
 Quitting the host asks for confirmation whenever it still owns a live child-process
 handle, including a row marked error; the row's lifecycle badge alone does not determine
 whether a handle is live. It then asks each active authenticated status registration to
@@ -366,4 +417,10 @@ shutdown acknowledgement is never exit proof. The host does not scan for process
 promise to stop arbitrary detached descendants. A forced stop or a child whose exit
 could not be confirmed is reported truthfully; do not assume such a handle has exited.
 Native Pi configuration, credentials, conversations, and unknown files are preserved,
-not removed as part of host shutdown.
+not removed as part of host shutdown. The persistent roster and ownership record are the
+only session-host files changed by a normal run: the roster is republished atomically when
+rows are created, removed, renamed, reactivated, or change their native conversation, and
+this host's ownership record is removed only after its owned children settled. Unconfirmed
+child exit or unavailable settlement evidence keeps the ownership record so a later host
+refuses to start until the situation is resolved; forced termination alone does not retain
+ownership once exit is confirmed.

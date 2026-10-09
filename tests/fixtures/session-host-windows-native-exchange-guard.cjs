@@ -12,7 +12,8 @@
  * bootstrap tuple, expected private proof, original manager/sidebar/surface
  * identities, genuine Main self PID, public stdout geometry, readable focus)
  * in process memory only: no raw data, token, socket path, instance identity,
- * session id, or proof ever crosses the wire or reaches a log.
+ * session id crosses the wire or reaches a log; only bounded metadata and
+ * an opaque proof cross the wire. The proof is never formatted in diagnostics.
  *
  * While armed, the guard latches actual owner/binding/live/pane/geometry
  * disturbances reported by the transparent original hooks (list rows,

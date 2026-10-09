@@ -150,7 +150,8 @@ async function main() {
   // and serving at most one fresh reply through the fixed known root leaves
   // only while its private armed binding and the fresh current actual scope
   // are all intact. No raw data, token, socket path, instance identity,
-  // session id, or proof ever crosses the wire or reaches a log.
+  // session id crosses the wire or reaches a log; only bounded metadata and
+  // an opaque proof cross the wire. The proof is never formatted in diagnostics.
   let paneObserver;
   const exchangeGuard = createNativeExchangeGuard({
     mainPid: () => process.pid,

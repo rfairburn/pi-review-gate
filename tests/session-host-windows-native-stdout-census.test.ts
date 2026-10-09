@@ -1619,6 +1619,7 @@ function ptyFixture(options: { immediatePid?: number; throwPidOnce?: boolean; fa
       if (options.failJournalOnce === true && journalCalls === 1) throw new Error("SYNTHETIC journal failure");
       records.push({ ...record });
     },
+    types,
   }) as (nodePty: unknown, journal: string, options?: Record<string, unknown>) => {
     nativeBindingFor(instanceId: string): { pid: number; incarnation: number; bootstrap: Record<string, unknown> } | undefined;
     snapshot(): { forceAttempted: boolean; journalFailed: boolean };
@@ -1712,6 +1713,7 @@ test("pty observer bootstrap capture refuses getters and inherited env without i
   const install = runInNewContext(`${declaration}\nobservePtyModule`, {
     process: { platform: "win32", on: () => {} },
     appendMetadata: () => {},
+    types,
   }) as (nodePty: unknown, journal: string, options?: Record<string, unknown>) => {
     nativeBindingFor(instanceId: string): unknown;
     restore(): void;
@@ -1744,4 +1746,103 @@ test("pty observer bootstrap capture refuses getters and inherited env without i
   const inheritedEnv = Object.create({ [BOOTSTRAP_ENV_NAME]: JSON.stringify({ ...BOOTSTRAP }) });
   Reflect.apply(module2.spawn, module2, ["SYNTHETIC-node", ["SYNTHETIC-cli"], { cwd: "/synthetic/workspace", env: inheritedEnv }]);
   assert.equal(observation2.nativeBindingFor(BOOTSTRAP.instanceId), undefined, "an inherited env leaves the binding unknown");
+});
+
+test("pty observer bootstrap capture refuses proxy spawn options and env before any descriptor trap", () => {
+  const declaration = ptySource.slice(ptySource.indexOf("function observePtyModule("), ptySource.indexOf("module.exports"));
+  const journalRecords: Record<string, unknown>[] = [];
+  const install = runInNewContext(`${declaration}\nobservePtyModule`, {
+    process: { platform: "win32", on: () => {} },
+    appendMetadata: (_destination: string, record: Record<string, unknown>) => { journalRecords.push({ ...record }); },
+    types,
+  }) as (nodePty: unknown, journal: string, options?: Record<string, unknown>) => {
+    nativeBindingFor(instanceId: string): unknown;
+    restore(): void;
+  };
+  const bootstrapOptions = {
+    envName: BOOTSTRAP_ENV_NAME,
+    parse: (value: unknown): Record<string, unknown> | undefined =>
+      value === null || typeof value !== "object" ? undefined : value as Record<string, unknown>,
+  };
+  const makeHandle = (pid: number) => {
+    const handle = { pid, onData: () => ({ dispose() {} }), kill: () => "SYNTHETIC" };
+    Object.defineProperty(handle, "onExit", { configurable: false, get: () => () => ({ dispose() {} }) });
+    return handle;
+  };
+
+  // A proxy spawn options whose descriptor trap would FORGE a positive env if
+  // read; the refusal must happen before any trap runs.
+  let optionsTrapCalls = 0;
+  const forgedEnv: Record<string, unknown> = { [BOOTSTRAP_ENV_NAME]: JSON.stringify({ ...BOOTSTRAP }) };
+  const proxyOptions = new Proxy({ cwd: "/synthetic/workspace", env: {} }, {
+    getOwnPropertyDescriptor(target, prop) {
+      optionsTrapCalls += 1;
+      if (prop === "env") return { value: forgedEnv, writable: true, enumerable: true, configurable: true };
+      return Reflect.getOwnPropertyDescriptor(target, prop);
+    },
+  });
+  const handle = makeHandle(741);
+  let receiver: unknown;
+  let receivedArgs: unknown[] = [];
+  const originalSpawn = function (this: unknown, ...args: unknown[]) { receiver = this; receivedArgs = args; return handle; };
+  const module = { spawn: originalSpawn };
+  const observation = install(module, "/synthetic/journal", { bootstrap: bootstrapOptions });
+  assert.equal(Reflect.apply(module.spawn, module, ["SYNTHETIC-node", ["SYNTHETIC-cli"], proxyOptions]), handle,
+    "the original spawn returns the identical handle");
+  assert.equal(receiver, module, "the original receiver is preserved");
+  assert.equal(receivedArgs[2], proxyOptions, "the exact proxy argument object identity is forwarded");
+  assert.equal(optionsTrapCalls, 0, "no descriptor trap runs during pre-spawn bootstrap capture");
+  assert.equal(journalRecords.filter((r) => r.type === "pty_spawn_pending").length, 1, "post-spawn journaling is preserved");
+  assert.equal(observation.nativeBindingFor(BOOTSTRAP.instanceId), undefined, "a proxy spawn options leaves the binding unknown");
+
+  // Plain spawn options whose env is a proxy forging a positive bootstrap leaf.
+  journalRecords.length = 0;
+  let envTrapCalls = 0;
+  const proxyEnv = new Proxy({}, {
+    getOwnPropertyDescriptor(target, prop) {
+      envTrapCalls += 1;
+      if (prop === BOOTSTRAP_ENV_NAME) return { value: JSON.stringify({ ...BOOTSTRAP }), writable: true, enumerable: true, configurable: true };
+      return Reflect.getOwnPropertyDescriptor(target, prop);
+    },
+  });
+  const handle2 = makeHandle(742);
+  let receiver2: unknown;
+  let receivedArgs2: unknown[] = [];
+  const originalSpawn2 = function (this: unknown, ...args: unknown[]) { receiver2 = this; receivedArgs2 = args; return handle2; };
+  const module2 = { spawn: originalSpawn2 };
+  const observation2 = install(module2, "/synthetic/journal", { bootstrap: bootstrapOptions });
+  const envOptions = { cwd: "/synthetic/workspace", env: proxyEnv };
+  assert.equal(Reflect.apply(module2.spawn, module2, ["SYNTHETIC-node", ["SYNTHETIC-cli"], envOptions]), handle2,
+    "the original spawn returns the identical handle");
+  assert.equal(receiver2, module2, "the original receiver is preserved");
+  assert.equal(receivedArgs2[2], envOptions, "the exact argument object identity is forwarded");
+  assert.equal((receivedArgs2[2] as { env: unknown }).env, proxyEnv, "the exact proxy env object identity is forwarded");
+  assert.equal(envTrapCalls, 0, "no env descriptor trap runs during pre-spawn bootstrap capture");
+  assert.equal(journalRecords.filter((r) => r.type === "pty_spawn_pending").length, 1, "post-spawn journaling is preserved");
+  assert.equal(observation2.nativeBindingFor(BOOTSTRAP.instanceId), undefined, "a proxy env leaves the binding unknown");
+
+  // A throwing original spawn still throws its exact error through a refused proxy.
+  journalRecords.length = 0;
+  let envTrapCalls2 = 0;
+  const proxyEnv2 = new Proxy({}, {
+    getOwnPropertyDescriptor(target, prop) {
+      envTrapCalls2 += 1;
+      if (prop === BOOTSTRAP_ENV_NAME) return { value: JSON.stringify({ ...BOOTSTRAP }), writable: true, enumerable: true, configurable: true };
+      return Reflect.getOwnPropertyDescriptor(target, prop);
+    },
+  });
+  const boom = new Error("SYNTHETIC spawn failure");
+  let receiver3: unknown;
+  const throwingSpawn = function (this: unknown): unknown { receiver3 = this; throw boom; };
+  const module3 = { spawn: throwingSpawn };
+  install(module3, "/synthetic/journal", { bootstrap: bootstrapOptions });
+  let thrown: unknown;
+  try {
+    Reflect.apply(module3.spawn, module3, ["SYNTHETIC-node", ["SYNTHETIC-cli"], { cwd: "/synthetic/workspace", env: proxyEnv2 }]);
+  } catch (err) {
+    thrown = err;
+  }
+  assert.equal(thrown, boom, "the original spawn error is thrown identically through a refused proxy env");
+  assert.equal(receiver3, module3, "the original receiver is preserved for a throwing spawn");
+  assert.equal(envTrapCalls2, 0, "no env descriptor trap runs before the original spawn throws");
 });

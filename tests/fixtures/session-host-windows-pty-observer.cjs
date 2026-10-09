@@ -31,7 +31,9 @@
  * incarnation (pending => positive => actual exit). The capture reads ONLY
  * bounded readonly own data descriptors (`spawnOptions.env`, then the env
  * leaf), refusing inherited properties and getters/setters WITHOUT invoking
- * them, so no observable getter side effect can occur before the original
+ * them, and refusing ES Proxy spawn options/env through genuine `node:util`
+ * `types.isProxy` BEFORE any descriptor operation (no trap is ever invoked),
+ * so no observable getter or trap side effect can occur before the original
  * spawn. The env vector, options, and arguments are never mutated;
  * the original spawn runs exactly once with the exact original
  * receiver/arguments/return/error. Changed, duplicate, foreign, replaced,
@@ -48,6 +50,7 @@
  */
 
 const fs = require('node:fs');
+const { types } = require('node:util');
 
 function appendMetadata(destination, record) {
   fs.appendFileSync(destination, `${JSON.stringify(record)}\n`, 'utf8');
@@ -76,7 +79,9 @@ function observePtyModule(nodePty, ptyJournal, options = {}) {
    * Captures the exact one-shot offered bootstrap of this one spawn BEFORE
    * the original call, read-only. Every read goes through a bounded readonly
    * OWN data descriptor; inherited properties and getters/setters are refused
-   * WITHOUT being invoked, so no observable getter side effect can occur
+   * WITHOUT being invoked, and ES Proxy spawn options/env are refused via
+   * genuine `types.isProxy` before any descriptor operation, without invoking
+   * their traps, so no observable getter or trap side effect can occur
    * before the original spawn. Any unsupported/foreign/throwing input leaves
    * the private binding unknown; the spawn itself is never disturbed.
    */
@@ -85,12 +90,14 @@ function observePtyModule(nodePty, ptyJournal, options = {}) {
     try {
       const spawnOptions = args[2];
       if (spawnOptions === null || typeof spawnOptions !== 'object') return undefined;
+      if (types.isProxy(spawnOptions)) return undefined; // an ES Proxy is refused before any descriptor trap
       const envDescriptor = Object.getOwnPropertyDescriptor(spawnOptions, 'env');
       if (envDescriptor === undefined || envDescriptor.get !== undefined || envDescriptor.set !== undefined) {
         return undefined; // an accessor or inherited env is refused without invoking it
       }
       const env = envDescriptor.value;
       if (env === null || typeof env !== 'object') return undefined;
+      if (types.isProxy(env)) return undefined; // an ES Proxy env is refused before any descriptor trap
       const rawDescriptor = Object.getOwnPropertyDescriptor(env, bootstrapOptions.envName);
       if (rawDescriptor === undefined || rawDescriptor.get !== undefined || rawDescriptor.set !== undefined) {
         return undefined; // an accessor or inherited leaf is refused without invoking it

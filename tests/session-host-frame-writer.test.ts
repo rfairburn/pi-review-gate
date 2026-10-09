@@ -167,6 +167,106 @@ test("redraw interval coalesces invalidations and a blocked Writable retains onl
 	assert.equal(await coalesced.close(), true);
 });
 
+test("invalidate forces a complete repaint even when content and geometry are unchanged", async () => {
+	const output = new SyntheticWritable();
+	const driver = writer(output, { redrawIntervalMs: 0 });
+	driver.start();
+	driver.submit(frame(["same", "frame"]), 10, 2);
+	assert.equal(output.writes.length, 2, "the first frame is complete");
+	const complete = Buffer.from(output.writes[1]);
+	driver.submit(frame(["same", "frame"]), 10, 2);
+	assert.equal(output.writes.length, 2, "an unchanged frame still emits nothing before invalidation");
+	driver.invalidate();
+	driver.submit(frame(["same", "frame"]), 10, 2);
+	assert.equal(output.writes.length, 3, "an invalidated baseline repaints identical content");
+	assert.deepEqual(output.writes[2], complete, "the forced repaint is a complete frame, not a no-op diff");
+	assert.equal(await driver.close(), true);
+});
+
+test("invalidate while a write is blocked still repaints completely after drain", async () => {
+	const output = new SyntheticWritable();
+	const driver = writer(output, { redrawIntervalMs: 0 });
+	driver.start();
+	driver.submit(frame(["base"]), 20, 1);
+	assert.equal(output.writes.length, 2);
+	output.writeResults.push(false);
+	driver.submit(frame(["blocked"]), 20, 1);
+	assert.equal(output.writes.length, 3, "the refused frame is retained by the blocked sink");
+	const complete = Buffer.from(output.writes[2]);
+	driver.invalidate();
+	driver.submit(frame(["blocked"]), 20, 1);
+	assert.equal(output.writes.length, 3, "the blocked sink retains only the newest identical pending frame");
+	output.emit("drain");
+	assert.equal(output.writes.length, 4, "drain repaints the invalidated baseline");
+	assert.deepEqual(output.writes[3], complete, "the drained payload is a complete frame, not a suppressed diff");
+	assert.equal(await driver.close(), true);
+});
+
+test("default redraw cadence is 16 ms and fast bursts coalesce to the newest frame", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+	const output = new SyntheticWritable();
+	const driver = writer(output);
+	driver.start();
+	driver.submit(frame(["burst-1"]), 20, 1);
+	assert.equal(output.writes.length, 2, "the first submit after start writes immediately");
+	t.mock.timers.tick(5);
+	driver.submit(frame(["burst-2"]), 20, 1);
+	driver.submit(frame(["burst-3"]), 20, 1);
+	t.mock.timers.tick(10);
+	assert.equal(output.writes.length, 2, "a fast burst does not redraw before the default interval elapses");
+	t.mock.timers.tick(2);
+	assert.equal(output.writes.length, 3, "the scheduled redraw fires at the default 16 ms cadence");
+	assert.ok(outputText(output, 2).includes("burst-3"));
+	assert.equal(outputText(output, 2).includes("burst-2"), false, "only the newest frame is drawn");
+	driver.submit(frame(["next"]), 20, 1);
+	t.mock.timers.tick(15);
+	assert.equal(output.writes.length, 3, "the next redraw waits for a full default interval from the last write");
+	t.mock.timers.tick(2);
+	assert.equal(output.writes.length, 4);
+	assert.ok(outputText(output, 3).includes("next"));
+	assert.equal(await driver.close(), true);
+});
+
+test("default cadence keeps newest-only coalescing while a blocked sink waits for drain", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+	const output = new SyntheticWritable();
+	output.writeResults.push(false);
+	const driver = writer(output);
+	driver.start();
+	assert.equal(output.writes.length, 1, "the start write is refused and blocks the sink");
+	driver.submit(frame(["first"]), 20, 1);
+	t.mock.timers.tick(5);
+	driver.submit(frame(["second"]), 20, 1);
+	driver.submit(frame(["third"]), 20, 1);
+	assert.equal(output.writes.length, 1, "a blocked sink retains only the newest pending frame");
+	output.emit("drain");
+	assert.equal(output.writes.length, 2, "the first drained frame writes immediately (no prior redraw timestamp)");
+	assert.ok(outputText(output, 1).includes("third"));
+	assert.equal(outputText(output, 1).includes("second"), false);
+	driver.submit(frame(["fourth"]), 20, 1);
+	assert.equal(output.writes.length, 2, "the next redraw waits for the default interval from the last write");
+	t.mock.timers.tick(16);
+	assert.equal(output.writes.length, 3);
+	assert.ok(outputText(output, 2).includes("fourth"));
+	assert.equal(await driver.close(), true);
+});
+
+test("close cancels a pending default-cadence redraw", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+	const output = new SyntheticWritable();
+	const driver = writer(output);
+	driver.start();
+	driver.submit(frame(["visible"]), 20, 1);
+	t.mock.timers.tick(5);
+	driver.submit(frame(["pending redraw"]), 20, 1);
+	assert.equal(output.writes.length, 2, "the second submit is coalesced into a scheduled redraw");
+	const closing = driver.close();
+	assert.equal(await closing, true);
+	t.mock.timers.tick(1000);
+	assert.equal(output.writes.length, 3, "close cancels the scheduled redraw; only cleanup output follows");
+	assert.ok(outputText(output, 2).includes(`${ESC}[?1049l`));
+});
+
 test("synchronous write failures and throwing error callbacks are guarded and non-sensitive", async () => {
 	const output = new SyntheticWritable();
 	output.throwNextWrite = true;

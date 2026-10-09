@@ -85,7 +85,8 @@ type MainManager = Pick<InstanceManager,
   "list" | "surface" | "write" | "resize" | "hasLiveProcesses" | "create" | "rename" | "closeExited" | "shutdown" | "dispose" | "ownedLiveSessions"
 > & Partial<Pick<InstanceManager, "stop" | "closeError">>;
 type MainObserver = Pick<KeyboardCapabilityObserver, "flags" | "wait" | "dispose" | "feed">;
-type MainWriter = Pick<SessionHostFrameWriter, "start" | "submit" | "close">;
+type MainWriter = Pick<SessionHostFrameWriter, "start" | "submit" | "close">
+  & Partial<Pick<SessionHostFrameWriter, "invalidate">>;
 type MainStdin = EventEmitter & { isTTY?: boolean; readableEnded?: boolean };
 type MainStdout = Writable & EventEmitter & { isTTY?: boolean; columns?: number; rows?: number };
 type MainSignals = EventEmitter;
@@ -1129,6 +1130,13 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   }
 
   function handleTerminalResize(): void {
+    // A real outer resize can reflow the physical screen and then return to
+    // the same final geometry before the next coalesced redraw (for example
+    // 80 -> 40 -> 80). Invalidate the known baseline before recomputing so the
+    // next frame is a complete repaint even when content and geometry did not
+    // change. The injected writer seam may omit invalidation; the real writer
+    // always implements it.
+    writer?.invalidate?.();
     reconcileLayout(true);
   }
 

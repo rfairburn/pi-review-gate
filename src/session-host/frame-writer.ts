@@ -6,7 +6,7 @@ import type { ComposedHostFrame } from "./compositor";
 const MAX_DIMENSION = 1000;
 const DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const MAX_FRAME_BYTES = 64 * 1024 * 1024;
-const DEFAULT_REDRAW_INTERVAL_MS = 1000 / 30;
+const DEFAULT_REDRAW_INTERVAL_MS = 16;
 const MAX_REDRAW_INTERVAL_MS = 1000;
 const DEFAULT_CLEANUP_TIMEOUT_MS = 250;
 const MAX_CLEANUP_TIMEOUT_MS = 5000;
@@ -23,8 +23,9 @@ const TEXT_CHUNK_CODE_UNITS = 4096;
 /**
  * Options for the generated-frame-only outer terminal writer.
  *
- * `redrawIntervalMs` is a maximum redraw frequency (default ~30 fps; zero
- * disables rate limiting). `maxFrameBytes` caps the complete serialized frame
+ * `redrawIntervalMs` is the minimum redraw interval (default 16 ms, about
+ * 60 fps, matching Pi's native minimum redraw cadence; zero disables rate
+ * limiting). `maxFrameBytes` caps the complete serialized frame
  * in UTF-8 bytes (default 8 MiB). `cleanupTimeoutMs` bounds the final cleanup
  * write/callback/drain wait (default 250 ms). None of these options configures
  * stdin, raw mode, terminal input protocols, child processes, or native TUI
@@ -42,11 +43,27 @@ export interface SessionHostFrameWriterOptions {
  * Small structural API for an output-only custom session-host surface.
  *
  * Call `start()` once before submitting. `submit()` consumes only a composed
- * frame and its outer geometry; it emits generated CUP/erase/reset/SGR/cursor
- * sequences and sanitized frame text. A false Writable `write()` result pauses
- * new frames until `drain`; while paused, only the newest bounded frame is
- * retained. Call `close()` to cancel pending redraws and attempt reset, cursor
- * show, and alternate-screen exit. Its boolean is true only if that final
+ * frame and its outer geometry; it synchronously sanitizes and clips every row
+ * and validates the complete serialized frame against the byte bound (an
+ * oversized frame throws even when its delta would be small), then retains an
+ * immutable snapshot of the row bytes, cursor, and geometry — never a caller
+ * reference. At the next allowed redraw only rows that changed since the last
+ * frame actually written to the Writable are emitted as generated
+ * CUP/erase/reset/SGR sequences plus full sanitized row text: the first frame
+ * after start, any geometry change, and any explicit `invalidate()` emit a
+ * full redraw, cursor-only changes emit only the cursor sequence, and
+ * unchanged rows/cursor skip output entirely. Every nonempty diff masks the
+ * cursor before drawing. The written-frame baseline advances only on an actual
+ * successful write invocation (a false return is queued until drain, not a
+ * failure), so skipped or coalesced submissions never advance it. A false
+ * Writable `write()` result pauses new frames until `drain`; while paused, only
+ * the newest bounded frame is retained. Memory holds at most one pending
+ * candidate plus one written snapshot, each bounded by `maxFrameBytes`.
+ * `invalidate()` discards the known baseline so the next emitted frame is a
+ * complete redraw: it keeps the newest pending candidate, allocates no queue,
+ * and a blocked sink still repaints fully once its queued write drains. Call
+ * `close()` to cancel pending redraws and attempt reset, cursor show, and
+ * alternate-screen exit. Its boolean is true only if that final
  * cleanup write was accepted and its callback (and any required `drain`) was
  * observed before the deadline; it does not prove physical terminal state. If
  * the deadline expires while owned writes remain outstanding, only this
@@ -63,7 +80,26 @@ export interface SessionHostFrameWriterOptions {
 export interface SessionHostFrameWriter {
 	start(): void;
 	submit(frame: ComposedHostFrame, cols: number, rows: number): void;
+	/**
+	 * Discard the written-frame baseline so the next emitted frame is a
+	 * complete redraw. Bounded and explicit: the newest pending candidate is
+	 * preserved, no queue is allocated, and a blocked sink still repaints
+	 * fully once it drains. Used when the outer terminal may have reflowed
+	 * physically (for example an actual resize notification) even though the
+	 * submitted content and geometry are unchanged.
+	 */
+	invalidate(): void;
 	close(): Promise<boolean>;
+}
+
+/** One retained frame: immutable sanitized row content plus validated cursor/geometry. */
+interface FrameCandidate {
+	readonly cols: number;
+	readonly rows: number;
+	readonly rowTexts: readonly string[];
+	/** Display-cell width of each sanitized row (cursor resting position). */
+	readonly rowWidths: readonly number[];
+	readonly cursor: { readonly column: number; readonly row: number } | undefined;
 }
 
 /** Create an inert frame writer; no output, timers, or listeners are created yet. */
@@ -102,7 +138,8 @@ export function createSessionHostFrameWriter(
 	let failed = false;
 	let errorReported = false;
 	let blocked = false;
-	let pending: Buffer | undefined;
+	let pending: FrameCandidate | undefined;
+	let baseline: FrameCandidate | undefined;
 	let redrawTimer: ReturnType<typeof setTimeout> | undefined;
 	let lastFrameAt: number | undefined;
 	let closePromise: Promise<boolean> | undefined;
@@ -244,10 +281,20 @@ export function createSessionHostFrameWriter(
 
 	function pump(): void {
 		if (!started || closing || closed || failed || blocked || pending === undefined) return;
-		const payload = pending;
+		const candidate = pending;
 		pending = undefined;
+		const payload = baseline === undefined
+			|| baseline.cols !== candidate.cols
+			|| baseline.rows !== candidate.rows
+			? buildFullFramePayload(candidate, maxFrameBytes)
+			: buildDiffPayload(baseline, candidate, maxFrameBytes);
+		if (payload === undefined) return; // rows and cursor unchanged: skip output entirely
 		lastFrameAt = Date.now();
-		writeFrame(payload);
+		const accepted = writeFrame(payload);
+		// The baseline advances only when the write was actually invoked: a
+		// false return is queued until drain, while a throw is a failure that
+		// must not authorize newer baseline writes.
+		if (accepted !== undefined) baseline = candidate;
 	}
 
 	function schedulePump(): void {
@@ -277,6 +324,7 @@ export function createSessionHostFrameWriter(
 		if (cleanupSettled) return;
 		cleanupSettled = true;
 		closed = true;
+		baseline = undefined;
 		clearRedrawTimer();
 		if (cleanupTimer !== undefined) {
 			clearTimeout(cleanupTimer);
@@ -319,6 +367,7 @@ export function createSessionHostFrameWriter(
 			if (closing || closed) throw new Error("Session host frame writer is closed");
 			if (started) return;
 			started = true;
+			baseline = undefined; // alternate-screen entry: prior screen state unknown
 			attachListeners();
 			writeFrame(Buffer.from(ENTER_ALT_SCREEN, "ascii"));
 		},
@@ -331,8 +380,47 @@ export function createSessionHostFrameWriter(
 			if (!frame || !Array.isArray(frame.lines)) {
 				throw new TypeError("Composed host frame must contain a lines array");
 			}
-			const payload = serializeFrame(frame, cols, rows, maxFrameBytes);
-			pending = payload;
+			const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+			const cursor = validCursor(frame.cursor, cols, rows);
+			// Reserve the fixed envelope (hide prefix, per-row CUP/erase/reset,
+			// cursor suffix) up front so every row serializes against the running
+			// complete-frame budget and oversized frames reject early — before
+			// retaining or processing further rows.
+			let contentBudget = maxFrameBytes
+				- Buffer.byteLength(HIDE_CURSOR, "utf8")
+				- Buffer.byteLength(cursorSuffix(cursor), "utf8");
+			for (let row = 0; row < rows; row += 1) {
+				contentBudget -= Buffer.byteLength(rowEnvelopePrefix(row), "utf8") + Buffer.byteLength(RESET, "utf8");
+			}
+			if (contentBudget < 0) {
+				throw new RangeError("Serialized host frame exceeds its UTF-8 byte limit");
+			}
+			const rowTexts: string[] = [];
+			const rowWidths: number[] = [];
+			for (let row = 0; row < rows; row += 1) {
+				const source = typeof frame.lines[row] === "string" ? frame.lines[row] : "";
+				const serialized = serializeRowContent(source, cols, segmenter, contentBudget);
+				rowTexts.push(serialized.text);
+				rowWidths.push(serialized.width);
+				contentBudget -= Buffer.byteLength(serialized.text, "utf8");
+			}
+			const candidate: FrameCandidate = {
+				cols,
+				rows,
+				rowTexts,
+				rowWidths,
+				cursor,
+			};
+			pending = candidate;
+			schedulePump();
+		},
+
+		invalidate(): void {
+			if (!started || closing || closed || failed) return;
+			// Drop the known baseline immediately so the next pump emits a
+			// complete frame. A retained pending candidate stays pending; a
+			// blocked sink repaints fully when its queued write drains.
+			baseline = undefined;
 			schedulePump();
 		},
 
@@ -411,23 +499,81 @@ class BoundedFrameBuilder {
 	}
 }
 
-function serializeFrame(frame: ComposedHostFrame, cols: number, rows: number, maxFrameBytes: number): Buffer {
-	const builder = new BoundedFrameBuilder(maxFrameBytes);
-	const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-	const cursor = validCursor(frame.cursor, cols, rows);
+/** Sanitize and clip one row's content (the bytes between erase-row and reset). */
+function serializeRowContent(
+	source: string,
+	cols: number,
+	segmenter: Intl.Segmenter,
+	byteLimit: number,
+): { readonly text: string; readonly width: number } {
+	const builder = new BoundedFrameBuilder(byteLimit);
+	const width = appendSafeClippedLine(builder, source, cols, segmenter);
+	return { text: builder.finish().toString("utf8"), width };
+}
 
+function rowEnvelopePrefix(row: number): string {
+	return `\x1b[${row + 1};1H${RESET}${ERASE_ROW}`;
+}
+
+function cursorSuffix(cursor: FrameCandidate["cursor"]): string {
+	if (cursor) return `${SHOW_CURSOR}\x1b[${cursor.row + 1};${cursor.column + 1}H`;
+	return HIDE_CURSOR;
+}
+
+function sameCursor(a: FrameCandidate["cursor"], b: FrameCandidate["cursor"]): boolean {
+	if (a === undefined || b === undefined) return a === b;
+	return a.column === b.column && a.row === b.row;
+}
+
+function buildFullFramePayload(candidate: FrameCandidate, byteLimit: number): Buffer {
+	const builder = new BoundedFrameBuilder(byteLimit);
 	builder.append(HIDE_CURSOR);
-	for (let row = 0; row < rows; row += 1) {
-		builder.append(`\x1b[${row + 1};1H${RESET}${ERASE_ROW}`);
-		const source = typeof frame.lines[row] === "string" ? frame.lines[row] : "";
-		appendSafeClippedLine(builder, source, cols, segmenter);
+	for (let row = 0; row < candidate.rows; row += 1) {
+		builder.append(rowEnvelopePrefix(row));
+		builder.append(candidate.rowTexts[row]);
 		builder.append(RESET);
 	}
-	if (cursor) {
-		builder.append(`${SHOW_CURSOR}\x1b[${cursor.row + 1};${cursor.column + 1}H`);
-	} else {
-		builder.append(HIDE_CURSOR);
+	builder.append(cursorSuffix(candidate.cursor));
+	return builder.finish();
+}
+
+/**
+ * Row-differential payload: a leading cursor-hide, the changed rows, and the
+ * cursor suffix. Returns undefined when rows and cursor are unchanged (skip
+ * output entirely). The diff is always no larger than the complete frame
+ * validated at submit time.
+ */
+function buildDiffPayload(
+	baseline: FrameCandidate,
+	candidate: FrameCandidate,
+	byteLimit: number,
+): Buffer | undefined {
+	const builder = new BoundedFrameBuilder(byteLimit);
+	// Mask the cursor before drawing exactly like a full frame, so a transient
+	// hide/show or reposition during the diff is never visible. The hide prefix
+	// is already part of the reserved complete-frame budget.
+	builder.append(HIDE_CURSOR);
+	let changedRows = 0;
+	let lastRowChanged = false;
+	for (let row = 0; row < candidate.rows; row += 1) {
+		if (baseline.rowTexts[row] === candidate.rowTexts[row]) continue;
+		builder.append(rowEnvelopePrefix(row));
+		builder.append(candidate.rowTexts[row]);
+		builder.append(RESET);
+		changedRows += 1;
+		if (row === candidate.rows - 1) lastRowChanged = true;
 	}
+	if (changedRows === 0 && sameCursor(baseline.cursor, candidate.cursor)) return undefined;
+	// A full frame leaves the hardware cursor at the end of the last row's
+	// content; restore that resting position whenever this payload does not end
+	// there already — rows changed without rewriting the last row, or a
+	// cursor-only change whose suffix may move nothing (hiding the cursor). The
+	// resting column is clamped to the frame width so generated CUP coordinates
+	// stay inside the supplied geometry even when the last row is full-width.
+	if (!lastRowChanged) {
+		builder.append(`\x1b[${candidate.rows};${Math.min(candidate.rowWidths[candidate.rows - 1] + 1, candidate.cols)}H`);
+	}
+	builder.append(cursorSuffix(candidate.cursor));
 	return builder.finish();
 }
 
@@ -442,12 +588,13 @@ function validCursor(
 	return { column: cursor.column, row: cursor.row };
 }
 
+/** Append one sanitized, clipped row; returns its display-cell width. */
 function appendSafeClippedLine(
 	builder: BoundedFrameBuilder,
 	source: string,
 	cols: number,
 	segmenter: Intl.Segmenter,
-): void {
+): number {
 	const segments = segmenter.segment(source)[Symbol.iterator]();
 	let segment = segments.next();
 	let index = 0;
@@ -501,6 +648,7 @@ function appendSafeClippedLine(
 		index = end;
 		segment = segments.next();
 	}
+	return cells;
 }
 
 function consumeEscape(source: string, index: number): { end: number; sgr?: string } {

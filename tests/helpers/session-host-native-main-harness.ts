@@ -1443,13 +1443,31 @@ export function nativeEditorContentMatches(line: string, draft: string): boolean
 }
 
 /**
+ * Input-owner state of the composed frame that a restored native-editor
+ * witness must observe alongside the editor block.
+ *
+ * `main` (default): the sidebar is visible and Main owns input, so the
+ * complete roster must draw its Main-focused footer with no stale
+ * sidebar-only hint. `sidebar`: the sidebar is visible and owns input, so the
+ * complete sidebar-focused roster (which already includes every sidebar-only
+ * footer action) must be drawn. `hidden`: the sidebar pane is positively
+ * hidden, so the native pane is drawn at the full outer width with no roster
+ * or divider remnant.
+ */
+export type RestoredNativeEditorFocus = "main" | "sidebar" | "hidden";
+
+/**
  * Complete restored wide native-editor witness. Requires the exact owner
- * header; the complete roster with its Main-focused footer and no stale
- * sidebar-only hints; and a width-correct bordered editor block in the right
- * pane whose content row is exactly the draft. A stale narrow frame (wrong
- * rule width), a partial repaint (incomplete roster or an unbordered content
- * row), or an altered/appended draft is rejected. Pure: no timers, no output
- * or geometry shortcuts.
+ * header; the complete roster/footer for the requested `focus` state; and a
+ * width-correct bordered editor block in the native pane whose content row is
+ * exactly the draft. A stale narrow frame (wrong rule width), a partial
+ * repaint (incomplete roster, an unbordered content row, or a still-composed
+ * sidebar while the pane must be hidden), or an altered/appended draft is
+ * rejected. Pure: no timers, no output or geometry shortcuts.
+ *
+ * The native child's post-resize repaint is asynchronous, so this witness is
+ * the bounded fence for a show/hide transition: the roster pane can be complete
+ * while the native pane is still mid-repaint.
  */
 export function restoredNativeEditorFrame(
   text: string,
@@ -1458,20 +1476,28 @@ export function restoredNativeEditorFrame(
     readonly draft: string;
     readonly sidebarColumns: number;
     readonly nativeWidth: number;
+    readonly focus?: RestoredNativeEditorFocus;
   },
 ): boolean {
-  const { ownerLabel, draft, sidebarColumns, nativeWidth } = options;
+  const { ownerLabel, draft, sidebarColumns, nativeWidth, focus = "main" } = options;
   if (typeof ownerLabel !== "string" || ownerLabel.length === 0) return false;
   if (typeof draft !== "string" || draft.length === 0) return false;
   if (!Number.isSafeInteger(sidebarColumns) || sidebarColumns < 12 || sidebarColumns > 1000) return false;
   if (!Number.isSafeInteger(nativeWidth) || nativeWidth < 20 || nativeWidth > 1000) return false;
   if (!frameHeaderMatches(text, ownerLabel)) return false;
-  const footer = rosterFooterText(text, sidebarColumns);
-  if (footer === undefined) return false;
-  for (const hint of MAIN_FOCUS_FOOTER_HINTS) if (!footer.includes(hint)) return false;
-  for (const stale of SIDEBAR_ONLY_FOOTER_HINTS) if (footer.includes(stale)) return false;
+  if (focus === "sidebar") {
+    if (!isSidebarFocusedFrame(text, sidebarColumns)) return false;
+  } else if (focus === "hidden") {
+    if (!sidebarRosterHidden(text, sidebarColumns)) return false;
+  } else {
+    const footer = rosterFooterText(text, sidebarColumns);
+    if (footer === undefined) return false;
+    for (const hint of MAIN_FOCUS_FOOTER_HINTS) if (!footer.includes(hint)) return false;
+    for (const stale of SIDEBAR_ONLY_FOOTER_HINTS) if (footer.includes(stale)) return false;
+  }
   const rule = "─".repeat(nativeWidth);
-  const pane = text.split("\n").slice(1).map((line) => stripGeneratedSgr(line).slice(sidebarColumns + 1));
+  const paneStart = focus === "hidden" ? 0 : sidebarColumns + 1;
+  const pane = text.split("\n").slice(1).map((line) => stripGeneratedSgr(line).slice(paneStart));
   const trimmed = pane.map((line) => line.trimEnd());
   for (let index = 0; index + 2 < pane.length; index += 1) {
     if (trimmed[index] !== rule) continue;

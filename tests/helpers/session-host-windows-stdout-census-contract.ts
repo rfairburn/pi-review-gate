@@ -180,6 +180,94 @@ export function validateMainActivePaneSnapshot(value: unknown): MainActivePaneSn
   return pane as unknown as MainActivePaneSnapshot;
 }
 
+/**
+ * Independent bounded diagnostic group for the ACTUAL owner's native child at
+ * census time: the exact matched live owner row's current authenticated
+ * native session epoch, the inner ConPTY original PID and incarnation from
+ * the exact original PTY registry, and Main's expected fresh private proof
+ * (which binds the raw session id privately on both sides — it never crosses
+ * the wire). It is diagnosis only — it never claims transport delivery,
+ * parser state, or readiness, and it carries no token, socket path, instance
+ * identity, raw session id, or raw tuple. scope true means the binding
+ * observation ran inside an intact matched live owner view (fields report
+ * what was positively resolved); scope null means it was never established.
+ * Unknown, ambiguous, replaced, unsupported, or throwing observations report
+ * null instead of a guessed value; a proof without its full tuple is never
+ * published.
+ */
+export interface MainNativeBindingSnapshot {
+  /** True only when the binding observation ran inside an intact matched live owner view. */
+  readonly scope: boolean | null;
+  /** True only when every field below is positively known within scope true. */
+  readonly complete: boolean | null;
+  /** The inner ConPTY original PID from the exact original PTY registry. */
+  readonly ptyPid: number | null;
+  /** The current incarnation of that owned public PTY (pending => positive). */
+  readonly incarnation: number | null;
+  /** The matched owner row's current authenticated native session epoch. */
+  readonly sessionEpoch: number | null;
+  /** Main's expected fresh private proof (opaque 64-hex), never formatted elsewhere. */
+  readonly expectedProof: string | null;
+}
+
+/** Exact bounded native-binding field names, sorted as the validator expects. */
+const NATIVE_BINDING_KEYS = [
+  "complete", "expectedProof", "incarnation", "ptyPid", "scope", "sessionEpoch",
+].sort();
+
+const NATIVE_PROOF_PATTERN = /^[0-9a-f]{64}$/;
+
+/**
+ * Strict validation of one bounded native-binding group: exact key set,
+ * boolean or null scope/complete, bounded positive numerics, opaque 64-hex
+ * proof, and coherent pair implications (ptyPid/incarnation and
+ * sessionEpoch/expectedProof travel together; a proof requires its full
+ * tuple; complete is exactly all-known). The raw session id is never on the
+ * wire: the opaque proof binds it. Returns undefined for any malformed or
+ * impossible combination.
+ */
+export function validateMainNativeBindingSnapshot(value: unknown): MainNativeBindingSnapshot | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const group = value as Record<string, unknown>;
+  const keys = Object.keys(group).sort();
+  if (keys.length !== NATIVE_BINDING_KEYS.length || keys.some((key, index) => key !== NATIVE_BINDING_KEYS[index])) {
+    return undefined;
+  }
+  const { scope, complete } = group;
+  if (typeof scope !== "boolean" && scope !== null) return undefined;
+  if (typeof complete !== "boolean" && complete !== null) return undefined;
+  const ptyPid = group.ptyPid;
+  if (ptyPid !== null && (!Number.isSafeInteger(ptyPid) || (ptyPid as number) <= 1)) return undefined;
+  const incarnation = group.incarnation;
+  if (incarnation !== null && (!Number.isSafeInteger(incarnation) || (incarnation as number) < 1)) return undefined;
+  const sessionEpoch = group.sessionEpoch;
+  if (sessionEpoch !== null && (!Number.isSafeInteger(sessionEpoch) || (sessionEpoch as number) < 1)) {
+    return undefined;
+  }
+  const expectedProof = group.expectedProof;
+  if (expectedProof !== null && (typeof expectedProof !== "string" || !NATIVE_PROOF_PATTERN.test(expectedProof))) {
+    return undefined;
+  }
+  // Pair coherence: the PID/incarnation pair and the epoch/proof pair travel
+  // together or not at all; a proof requires its full tuple. The raw session
+  // id is never on the wire: the opaque proof binds it.
+  if ((ptyPid === null) !== (incarnation === null)) return undefined;
+  if ((sessionEpoch === null) !== (expectedProof === null)) return undefined;
+  if (expectedProof !== null && (ptyPid === null || incarnation === null)) return undefined;
+  if (scope === null) {
+    if (complete !== null || ptyPid !== null || incarnation !== null
+      || sessionEpoch !== null || expectedProof !== null) return undefined;
+  } else if (scope === false) {
+    if (complete !== false || ptyPid !== null || incarnation !== null
+      || sessionEpoch !== null || expectedProof !== null) return undefined;
+  } else {
+    const allKnown = ptyPid !== null && incarnation !== null && sessionEpoch !== null
+      && expectedProof !== null;
+    if (complete !== allKnown) return undefined;
+  }
+  return group as unknown as MainNativeBindingSnapshot;
+}
+
 /** Exact request leaf payload the parent writes to `main-census-request.json` in the owned fixture root. */
 export interface MainModeCensusRequest {
   readonly schemaVersion: typeof MAIN_CENSUS_SCHEMA_VERSION;
@@ -248,6 +336,8 @@ export interface MainModeCensusSnapshot {
   readonly bracketedPasteReset: number | null;
   /** Independent bounded diagnostic group for the actual active pane. */
   readonly activePane: MainActivePaneSnapshot;
+  /** Independent bounded native-binding group for the actual owner's native child. */
+  readonly nativeBinding: MainNativeBindingSnapshot;
 }
 
 const CENSUS_COUNT_FIELDS = [
@@ -263,7 +353,7 @@ const CENSUS_COUNT_FIELDS = [
 
 const CENSUS_REPLY_KEYS = [
   "schemaVersion", "nonce", "mainPid",
-  "hookActive", "sameOutputStream", "observationComplete", "activePane",
+  "hookActive", "sameOutputStream", "observationComplete", "activePane", "nativeBinding",
   ...CENSUS_COUNT_FIELDS,
 ].sort();
 
@@ -312,7 +402,19 @@ export function validateMainModeCensusReply(
   // The active-pane group is validated independently: an unknown producer
   // scope never erases honest pane data, and an unknown pane never erases
   // honest producer counts.
-  if (validateMainActivePaneSnapshot(reply.activePane) === undefined) return undefined;
+  const activePane = validateMainActivePaneSnapshot(reply.activePane);
+  if (activePane === undefined) return undefined;
+  // The native-binding group is validated independently of the producer
+  // scope, but a positively established binding requires the full upstream
+  // actual-owner guard chain in the pane group: owner present, matched live
+  // row, and alive lifecycle. An unknown pane never carries a known binding.
+  const nativeBinding = validateMainNativeBindingSnapshot(reply.nativeBinding);
+  if (nativeBinding === undefined) return undefined;
+  if (nativeBinding.scope === true
+    && !(activePane.ownerPresent === true && activePane.viewMatched === true
+      && activePane.hasLiveProcess === true && activePane.lifecycleAlive === true)) {
+    return undefined;
+  }
   return reply as unknown as MainModeCensusSnapshot;
 }
 
@@ -328,6 +430,7 @@ export function formatMainCensusDiagnostic(snapshot: MainModeCensusSnapshot | un
     typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? String(value) : "null";
   const flag = (value: boolean | null): string => value === true ? "true" : value === false ? "false" : "null";
   const pane = snapshot.activePane;
+  const binding = snapshot.nativeBinding;
   return [
     "mainCensusDiag{",
     `complete=${snapshot.observationComplete}`,
@@ -347,6 +450,8 @@ export function formatMainCensusDiagnostic(snapshot: MainModeCensusSnapshot | un
     `alive=${flag(pane.lifecycleAlive)} surface=${flag(pane.surfacePresent)} modesRead=${flag(pane.modesReadSucceeded)}`,
     `tracking=${count(pane.mouseTracking)} encoding=${count(pane.mouseEncoding)}`,
     `geomCols=${count(pane.geometryColumns)} geomRows=${count(pane.geometryRows)}}`,
-    "}",
+    `nativeBinding{scope=${flag(binding.scope)} complete=${flag(binding.complete)}`,
+    `pid=${count(binding.ptyPid)} inc=${count(binding.incarnation)}`,
+    `epoch=${count(binding.sessionEpoch)} proof=${binding.expectedProof !== null ? "ok" : "none"}}`,
   ].join(" ");
 }

@@ -54,6 +54,48 @@
  *   fallback, and restore only unwinds slots that still hold this observer's
  *   exact hook. A snapshot that observes an owned-slot replacement or a
  *   changed resolution latches sticky unknown permanently.
+ *
+ * TESTONLY native-binding extension (`options.nativeBinding`): a narrow
+ * optional callback invoked INSIDE the same fresh pane snapshot, only after
+ * the actual owner row is positively matched live and alive. It receives the
+ * exact matched row and the fresh request nonce (when supplied to
+ * `snapshot(nonce)`) and may return a bounded binding object
+ * `{ ptyPid, incarnation, sessionEpoch, expectedProof }` (the raw session id
+ * stays private to the callback; the opaque proof binds it) or undefined. The
+ * result is strictly validated into the independent bounded `nativeBinding()`
+ * group: scope true means the observation ran inside an intact matched live
+ * owner view (fields report what was positively resolved); scope null means it
+ * was never established (no callback, no owner, disturbed pane scope, or
+ * unsupported install). The group is committed only when the WHOLE snapshot
+ * pass completes with an intact scope: any later disturbance (replaced
+ * resolution, failed mode read that invalidates scope) leaves the group
+ * unestablished so a valid Main reply can never be rejected by cross-group
+ * consistency. A throwing or invalid callback result is an all-null unknown
+ * group and never changes the original call or the existing active-pane
+ * fields. No constructor, factory, DI seam, or second owner read is
+ * introduced; the callback is the only channel to the exact original PTY
+ * registry. Extra private callback-result fields (such as the raw bootstrap
+ * tuple) are never validated into or published by the group.
+ *
+ * TESTONLY exchange-guard extension (`options.guard`): an optional observation
+ * sink `{ arm, onList, onOwner, onFocus }` for the original-Main-origin native
+ * exchange guard. A THIRD owned hook wraps the original `focus` prototype
+ * accessor exactly like the two method hooks: the exact original getter runs
+ * once with the exact borrowed receiver, returns the exact value, and
+ * rethrows the identical error; observation is non-throwing and a foreign or
+ * proxy receiver is forwarded unchanged. While the guard is armed, every
+ * successful original `list` result row set, `setActiveMainOwner` argument,
+ * and `focus` getter return is forwarded to the sink (which latches sticky
+ * disturbances itself). When a snapshot pass commits a COMPLETE native-binding
+ * group with an intact scope, the sink's `arm(nonce, facts)` is invoked once
+ * for that pass with the private pass facts (actual owner id, raw focus value,
+ * matched live row, committed binding group, raw callback result, and the
+ * original manager/sidebar/surface identities) — before any reply is
+ * published. `revalidateScope(facts)` performs the fresh pure current
+ * actual-scope proof for the armed guard: owned slots, current resolutions,
+ * module identity, and the actual owner/focus/row/session/surface must all
+ * still match the armed facts; it returns the current row's session tuple or
+ * undefined and never throws.
  */
 
 const path = require('node:path');
@@ -100,6 +142,59 @@ function unknownScopeFields() {
   fields.scope = false;
   fields.complete = false;
   return fields;
+}
+
+/** Exact bounded native-binding field names shared with the parent contract validator. */
+const NATIVE_BINDING_FIELD_NAMES = Object.freeze([
+  'complete', 'expectedProof', 'incarnation', 'ptyPid', 'scope', 'sessionEpoch',
+]);
+const NATIVE_PROOF_PATTERN = /^[0-9a-f]{64}$/;
+
+/** All-null group: the native binding observation was never established. */
+function unestablishedNativeBinding() {
+  const fields = {};
+  for (const name of NATIVE_BINDING_FIELD_NAMES) fields[name] = null;
+  return fields;
+}
+
+/** Bounded unknown group from an attempted-but-unresolved binding observation. */
+function unknownNativeBinding() {
+  const fields = unestablishedNativeBinding();
+  fields.scope = true;
+  fields.complete = false;
+  return fields;
+}
+
+/**
+ * Strictly validates one TESTONLY callback result into the bounded group.
+ * Pair coherence is enforced here (ptyPid/incarnation and sessionEpoch/
+ * expectedProof are published together or not at all) so a broken callback
+ * can never publish a partial tuple; expectedProof requires its inputs. The
+ * raw sessionId may be present in the callback result (the callback needs it
+ * to compute the proof) but is never validated into or published by the
+ * group. Any unsupported value is an honest all-null unknown with scope true
+ * (the observation ran inside a valid owner view but resolved nothing).
+ */
+function buildNativeBindingGroup(result) {
+  if (result === undefined || result === null || typeof result !== 'object' || Array.isArray(result)) {
+    return unknownNativeBinding();
+  }
+  let ptyPid = Number.isSafeInteger(result.ptyPid) && result.ptyPid > 1 ? result.ptyPid : null;
+  let incarnation = Number.isSafeInteger(result.incarnation) && result.incarnation >= 1 ? result.incarnation : null;
+  let sessionEpoch = Number.isSafeInteger(result.sessionEpoch) && result.sessionEpoch >= 1 ? result.sessionEpoch : null;
+  let expectedProof = typeof result.expectedProof === 'string' && NATIVE_PROOF_PATTERN.test(result.expectedProof)
+    ? result.expectedProof
+    : null;
+  if (ptyPid !== null && incarnation === null) ptyPid = null; // pair coherence
+  if (incarnation !== null && ptyPid === null) incarnation = null;
+  if (sessionEpoch !== null && expectedProof === null) sessionEpoch = null;
+  if (expectedProof !== null && (ptyPid === null || incarnation === null || sessionEpoch === null)) {
+    expectedProof = null; // a proof without its full tuple is never published
+    sessionEpoch = null; // the epoch travels with the refused proof pair
+  }
+  const complete = ptyPid !== null && incarnation !== null && sessionEpoch !== null
+    && expectedProof !== null;
+  return { scope: true, complete, ptyPid, incarnation, sessionEpoch, expectedProof };
 }
 
 /** Non-throwing own-descriptor read; undefined covers both absence and unreadable. */
@@ -248,6 +343,8 @@ function recheckCandidateModules(classes, modules, cache) {
 function unsupportedObserver() {
   return {
     snapshot: () => unknownPaneFields(),
+    nativeBinding: () => unestablishedNativeBinding(),
+    revalidateScope: () => undefined,
     restore: () => false,
     get installed() { return false; },
     get unsupported() { return true; },
@@ -257,19 +354,26 @@ function unsupportedObserver() {
 /**
  * Installs the owned hooks atomically: any failure unwinds exactly the slots
  * that still hold this observer's own hook, and a refused or foreign slot is
- * never touched. `defineProperty` is injectable so pure tests can exercise the
- * partial-installation unwind without a proxy.
+ * never touched. Data-method slots install `{ value: hook }`; accessor slots
+ * (`slot.accessor === true`) install `{ get: hook }`. The original descriptor
+ * (data or accessor) is restored exactly on unwind. `defineProperty` is
+ * injectable so pure tests can exercise the partial-installation unwind
+ * without a proxy.
  */
 function installOwnedHooks(slots, defineProperty) {
   const installedSlots = [];
   try {
     for (const slot of slots) {
-      defineProperty(slot.prototype, slot.key, {
-        value: slot.hook,
-        writable: true,
-        enumerable: slot.descriptor.enumerable,
-        configurable: true,
-      });
+      if (slot.accessor === true) {
+        defineProperty(slot.prototype, slot.key, { get: slot.hook, configurable: true });
+      } else {
+        defineProperty(slot.prototype, slot.key, {
+          value: slot.hook,
+          writable: true,
+          enumerable: slot.descriptor.enumerable,
+          configurable: true,
+        });
+      }
       installedSlots.push(slot);
     }
     return true;
@@ -277,7 +381,7 @@ function installOwnedHooks(slots, defineProperty) {
     for (const slot of installedSlots.reverse()) {
       try {
         const current = Object.getOwnPropertyDescriptor(slot.prototype, slot.key);
-        if (current !== undefined && current.value === slot.hook) {
+        if (current !== undefined && (slot.accessor === true ? current.get === slot.hook : current.value === slot.hook)) {
           Object.defineProperty(slot.prototype, slot.key, slot.descriptor);
         }
       } catch {
@@ -288,27 +392,56 @@ function installOwnedHooks(slots, defineProperty) {
   }
 }
 
+/** Strict TESTONLY guard-sink shape; anything else is ignored (no guard). */
+function isGuardSink(value) {
+  return value !== null && typeof value === 'object'
+    && typeof value.arm === 'function' && typeof value.onList === 'function'
+    && typeof value.onOwner === 'function' && typeof value.onFocus === 'function';
+}
+
 /**
  * Installs the transparent prototype observers on the supplied original
  * candidate classes. Never throws: an unsupported install returns an observer
  * whose snapshot is an honest all-null unknown, so public Main execution is
  * unchanged and no fabricated fallback is reported.
  */
-function createPaneModeObserver(candidate) {
+function createPaneModeObserver(candidate, options = {}) {
+  const nativeBindingCallback = options !== null && typeof options === 'object' && typeof options.nativeBinding === 'function'
+    ? options.nativeBinding
+    : undefined;
+  const guard = options !== null && typeof options === 'object' && isGuardSink(options.guard)
+    ? options.guard
+    : undefined;
   const state = {
     installed: false,
     unsupported: false,
     scopeInvalid: false,
     manager: undefined,
     sidebar: undefined,
+    snapshotNonce: undefined,
   };
+  // The bounded native-binding group produced by the most recent snapshot
+  // pass (TESTONLY); reset at every snapshot start so a stale binding can
+  // never outlive its fresh pane observation. `pendingNativeBinding` is the
+  // provisional result of this pass; it is committed to lastNativeBinding
+  // ONLY when the whole pass completes with an intact scope, so a later
+  // disturbance can never leave a complete group behind an unknown pane.
+  let lastNativeBinding = unestablishedNativeBinding();
+  let pendingNativeBinding;
   const classes = candidate !== null && typeof candidate === 'object' ? candidate : undefined;
   const recheck = classes !== undefined && typeof classes.recheck === 'function' ? classes.recheck : undefined;
   let managerPrototype;
   let sidebarPrototype;
   let terminalSurfacePrototype;
   let descriptors;
+  // The complete original focus PropertyDescriptor, retained separately from
+  // its getter function: restoration and unwind must return the exact
+  // original accessor, and a non-configurable accessor is never touched.
+  let focusOriginal;
   let slots = [];
+  // The first successfully armed pane scope, retained privately so every
+  // later observation boundary can re-check its supported resolution.
+  let armedPaneScope;
 
   function classIdentitiesIntact() {
     try {
@@ -344,17 +477,23 @@ function createPaneModeObserver(candidate) {
         || isProxyObject(terminalSurfacePrototype)) {
         state.unsupported = true; // a proxy prototype is refused before any trap can run
       } else {
+        const focusDescriptor = safeGetOwnDescriptor(sidebarPrototype, 'focus');
+        focusOriginal = focusDescriptor !== undefined && typeof focusDescriptor.get === 'function'
+          && focusDescriptor.configurable === true
+          ? focusDescriptor
+          : undefined;
         descriptors = {
           list: ownDataMethod(managerPrototype, 'list'),
           surface: ownDataMethod(managerPrototype, 'surface'),
           setActiveMainOwner: ownDataMethod(sidebarPrototype, 'setActiveMainOwner'),
           activeMainOwnerID: ownAccessorGetter(sidebarPrototype, 'activeMainOwnerID'),
-          focus: ownAccessorGetter(sidebarPrototype, 'focus'),
+          focus: focusOriginal !== undefined ? focusOriginal.get : undefined,
           inputModes: ownDataMethod(terminalSurfacePrototype, 'inputModes'),
         };
         if (descriptors.list === undefined || descriptors.surface === undefined
           || descriptors.setActiveMainOwner === undefined
           || descriptors.activeMainOwnerID === undefined || descriptors.focus === undefined
+          || focusOriginal === undefined
           || descriptors.inputModes === undefined) {
           state.unsupported = true; // unsupported descriptor: report unknown, never a partial install
         } else if (!classIdentitiesIntact()) {
@@ -386,17 +525,59 @@ function createPaneModeObserver(candidate) {
     }
   }
 
+  /**
+   * Bounded non-throwing scope check at an observation boundary: while a
+   * supported original hook is running, the current descriptor/module/surface
+   * resolutions must still be intact. A disturbed boundary (even one restored
+   * before the next snapshot) latches sticky uncertainty permanently.
+   */
+  function observeScopeAtBoundary() {
+    try {
+      for (const slot of slots) {
+        if (!slotHoldsOurHook(slot)) state.scopeInvalid = true; // a replaced owned slot missed calls: sticky
+      }
+      if (!currentResolutionsIntact()) state.scopeInvalid = true;
+      if (!state.scopeInvalid && armedPaneScope !== undefined) {
+        const surface = Reflect.apply(descriptors.surface.value, state.manager, [armedPaneScope.ownerId]);
+        if (surface !== armedPaneScope.surface || resolveInputModes(surface) === undefined) {
+          state.scopeInvalid = true; // the armed pane scope was disturbed and restored: sticky
+        }
+      }
+    } catch {
+      state.scopeInvalid = true; // an unreadable scope is sticky unknown, never bypassed
+    }
+  }
+
   const listHook = function sessionHostPaneObserverList(...args) {
     // The original call happens exactly once and runs first: a throwing
     // original propagates its identical error and records no receiver.
     const result = Reflect.apply(descriptors.list.value, this, args);
     recordReceiver('manager', this, classes.InstanceManager);
+    observeScopeAtBoundary();
+    if (guard !== undefined) {
+      try { guard.onList(result); } catch { /* observation-only bookkeeping never changes the call */ }
+    }
     return result;
   };
 
   const ownerHook = function sessionHostPaneObserverSetActiveMainOwner(...args) {
     const result = Reflect.apply(descriptors.setActiveMainOwner.value, this, args);
     recordReceiver('sidebar', this, classes.SidebarController);
+    observeScopeAtBoundary();
+    if (guard !== undefined) {
+      try { guard.onOwner(args[0]); } catch { /* observation-only bookkeeping never changes the call */ }
+    }
+    return result;
+  };
+
+  const focusHook = function sessionHostPaneObserverFocus() {
+    // The original getter runs exactly once with the exact borrowed receiver:
+    // a throwing original propagates its identical error and records nothing.
+    const result = Reflect.apply(descriptors.focus, this, []);
+    observeScopeAtBoundary();
+    if (guard !== undefined) {
+      try { guard.onFocus(result, this); } catch { /* observation-only bookkeeping never changes the call */ }
+    }
     return result;
   };
 
@@ -404,6 +585,7 @@ function createPaneModeObserver(candidate) {
     slots = [
       { prototype: managerPrototype, key: 'list', descriptor: descriptors.list, hook: listHook },
       { prototype: sidebarPrototype, key: 'setActiveMainOwner', descriptor: descriptors.setActiveMainOwner, hook: ownerHook },
+      { prototype: sidebarPrototype, key: 'focus', descriptor: focusOriginal, hook: focusHook, accessor: true },
     ];
     if (installOwnedHooks(slots, Object.defineProperty)) {
       state.installed = true;
@@ -415,7 +597,8 @@ function createPaneModeObserver(candidate) {
 
   function slotHoldsOurHook(slot) {
     const current = safeGetOwnDescriptor(slot.prototype, slot.key);
-    return current !== undefined && current.value === slot.hook;
+    if (current === undefined) return false;
+    return slot.accessor === true ? current.get === slot.hook : current.value === slot.hook;
   }
 
   /**
@@ -444,7 +627,11 @@ function createPaneModeObserver(candidate) {
         const currentOwner = safeGetOwnDescriptor(sidebarPrototype, 'activeMainOwnerID');
         const currentFocus = safeGetOwnDescriptor(sidebarPrototype, 'focus');
         if (currentOwner === undefined || currentOwner.get !== descriptors.activeMainOwnerID) return false;
-        if (currentFocus === undefined || currentFocus.get !== descriptors.focus) return false;
+        // The focus slot holds our owned hook while installed; any other
+        // resolution (original or foreign) is refused, never bypassed.
+        if (currentFocus === undefined || (currentFocus.get !== descriptors.focus && currentFocus.get !== focusHook)) {
+          return false;
+        }
       }
       return true;
     } catch {
@@ -475,7 +662,7 @@ function createPaneModeObserver(candidate) {
     return typeof fields.mouseTracking === 'number' && typeof fields.mouseEncoding === 'number';
   }
 
-  function observeOwnerView(fields, ownerId) {
+  function observeOwnerView(fields, ownerId, pass) {
     let views;
     try {
       // Current production resolution was validated; the saved original is
@@ -509,12 +696,26 @@ function createPaneModeObserver(candidate) {
       return;
     }
     fields.viewMatched = true;
+    pass.row = match; // private pass fact for the TESTONLY exchange-guard arm
     fields.hasLiveProcess = match.hasLiveProcess === true;
     fields.lifecycleAlive = match.lifecycle === 'alive';
     if (!fields.hasLiveProcess || !fields.lifecycleAlive) {
       fields.surfacePresent = false; // the actual pane gate is not satisfied: no surface read
       fields.modesReadSucceeded = false;
       return;
+    }
+    // TESTONLY native binding, produced inside this same fresh pane snapshot
+    // for the exact matched live owner row. Observation bookkeeping only:
+    // a throwing callback never changes the original call or the pane fields.
+    if (nativeBindingCallback !== undefined) {
+      let result;
+      try {
+        result = nativeBindingCallback(match, state.snapshotNonce);
+      } catch {
+        result = undefined;
+      }
+      pass.rawBinding = result; // private raw callback result for the guard arm
+      pendingNativeBinding = buildNativeBindingGroup(result); // provisional until the scope stays intact
     }
     let surface;
     try {
@@ -530,6 +731,7 @@ function createPaneModeObserver(candidate) {
       fields.modesReadSucceeded = false;
       return;
     }
+    pass.surface = surface; // private pass fact for the TESTONLY exchange-guard arm
     const inputModes = resolveInputModes(surface);
     if (inputModes === undefined) {
       state.scopeInvalid = true; // a changed pane-mode resolution is persistently unknown
@@ -559,7 +761,14 @@ function createPaneModeObserver(candidate) {
     fields.mouseEncoding = typeof encoding === 'number' ? encoding : null;
   }
 
-  function snapshot() {
+  function snapshot(nonce) {
+    state.snapshotNonce = typeof nonce === 'string' ? nonce : undefined;
+    lastNativeBinding = unestablishedNativeBinding();
+    pendingNativeBinding = undefined;
+    // Pass-scoped private facts for the TESTONLY exchange-guard arm: the raw
+    // focus value, owner id, matched live row, pane surface, and raw binding
+    // callback result of THIS pass only (never retained across passes).
+    const pass = { ownerId: undefined, focusValue: undefined, row: undefined, surface: undefined, rawBinding: undefined };
     try {
       if (!state.installed) {
         return unknownPaneFields(); // complete null, scope null: the observation scope was never established
@@ -581,6 +790,7 @@ function createPaneModeObserver(candidate) {
       fields.scope = true;
       try {
         const focus = Reflect.apply(descriptors.focus, state.sidebar, []);
+        pass.focusValue = focus;
         fields.focusMain = focus === 'main' ? true
           : focus === 'sidebar' || focus === 'form' || focus === 'confirm' ? false : null;
       } catch {
@@ -606,7 +816,8 @@ function createPaneModeObserver(candidate) {
         }
       }
       if (fields.ownerPresent === true && ownerId !== undefined && state.manager !== undefined) {
-        observeOwnerView(fields, ownerId);
+        pass.ownerId = ownerId;
+        observeOwnerView(fields, ownerId, pass);
       } else if (fields.ownerPresent === false) {
         fields.viewMatched = false;
         fields.hasLiveProcess = false;
@@ -615,8 +826,36 @@ function createPaneModeObserver(candidate) {
         fields.modesReadSucceeded = false;
       }
       // Pane resolution checks can disturb scope during this very observation.
-      // Never publish an intact scope first and invalidate only a later read.
+      // Never publish an intact scope first and invalidate only a later read;
+      // a disturbed pass also never commits the provisional native binding,
+      // so the Main reply stays valid with an unestablished binding group.
       if (state.scopeInvalid) return unknownScopeFields();
+      if (pendingNativeBinding !== undefined) {
+        lastNativeBinding = pendingNativeBinding;
+        // TESTONLY: arm the single original-Main-origin exchange guard when
+        // this pass first constructs a complete actual-owner binding, before
+        // the reply is published. Observation-only bookkeeping: it never
+        // changes the pane fields or any original call.
+        if (guard !== undefined && pendingNativeBinding.complete === true) {
+          try {
+            const armedNow = guard.arm(state.snapshotNonce, {
+              ownerId: pass.ownerId,
+              focus: pass.focusValue,
+              row: pass.row,
+              binding: pendingNativeBinding,
+              bootstrap: pass.rawBinding === null || typeof pass.rawBinding !== 'object'
+                ? undefined
+                : pass.rawBinding.bootstrap,
+              manager: state.manager,
+              sidebar: state.sidebar,
+              surface: pass.surface,
+            });
+            if (armedNow === true && armedPaneScope === undefined) {
+              armedPaneScope = { ownerId: pass.ownerId, surface: pass.surface };
+            }
+          } catch { /* observation-only bookkeeping never changes the reply */ }
+        }
+      }
       fields.complete = paneFieldsAllKnown(fields);
       return fields;
     } catch {
@@ -629,8 +868,7 @@ function createPaneModeObserver(candidate) {
     let restored = false;
     for (const slot of slots) {
       try {
-        const current = Object.getOwnPropertyDescriptor(slot.prototype, slot.key);
-        if (current === undefined || current.value !== slot.hook) continue; // never clobber a foreign replacement
+        if (!slotHoldsOurHook(slot)) continue; // never clobber a foreign replacement
         Object.defineProperty(slot.prototype, slot.key, slot.descriptor);
         restored = true;
       } catch {
@@ -641,10 +879,70 @@ function createPaneModeObserver(candidate) {
     return restored;
   }
 
+  /**
+   * TESTONLY fresh pure current actual-scope proof for the armed exchange
+   * guard. `facts` is the guard's private armed object (the copies produced
+   * by createNativeExchangeGuard.arm: ownerId, focus, sessionId, sessionEpoch,
+   * manager, sidebar, surface). Every owned slot, current resolution, and
+   * module identity must still be intact, and the actual owner id, focus
+   * value, matched live row (with its current native session tuple equal to
+   * the armed copies), pane surface, and pane-mode resolution must all still
+   * match. Returns the current row's session tuple `{ sessionId,
+   * sessionEpoch }` or undefined; never throws.
+   */
+  function revalidateScope(facts) {
+    try {
+      if (facts === null || typeof facts !== 'object') return undefined;
+      if (state.unsupported || !state.installed || state.scopeInvalid) return undefined;
+      for (const slot of slots) {
+        if (!slotHoldsOurHook(slot)) return undefined; // a replaced slot missed calls: refuse
+      }
+      if (!currentResolutionsIntact()) return undefined; // own/prototype/module drift: refuse
+      if (state.manager === undefined || state.sidebar === undefined) return undefined;
+      if (state.manager !== facts.manager || state.sidebar !== facts.sidebar) return undefined; // identity must be identical
+      if (typeof facts.ownerId !== 'string' || typeof facts.focus !== 'string') return undefined;
+      // The armed tuple fields are the guard's private copies, not the live row.
+      if (typeof facts.sessionId !== 'string' || !Number.isSafeInteger(facts.sessionEpoch)) return undefined;
+      const ownerId = Reflect.apply(descriptors.activeMainOwnerID, state.sidebar, []);
+      if (ownerId !== facts.ownerId) return undefined;
+      const focus = Reflect.apply(descriptors.focus, state.sidebar, []);
+      if (focus !== facts.focus) return undefined;
+      const views = Reflect.apply(descriptors.list.value, state.manager, []);
+      if (!Array.isArray(views)) return undefined;
+      let match;
+      let matches = 0;
+      for (const view of views) {
+        if (view !== null && typeof view === 'object' && view.id === facts.ownerId) {
+          match = view;
+          matches += 1;
+        }
+      }
+      if (matches !== 1) return undefined; // absent or duplicate owner row: refuse
+      if (match.hasLiveProcess !== true || match.lifecycle !== 'alive') return undefined;
+      const session = match.nativeSession;
+      if (session === null || typeof session !== 'object') return undefined;
+      if (typeof session.sessionId !== 'string' || session.sessionId.length === 0) return undefined;
+      if (!Number.isSafeInteger(session.epoch)) return undefined;
+      if (session.sessionId !== facts.sessionId || session.epoch !== facts.sessionEpoch) {
+        return undefined; // the current native binding must match the armed tuple
+      }
+      const surface = Reflect.apply(descriptors.surface.value, state.manager, [facts.ownerId]);
+      if (surface === null || typeof surface !== 'object') return undefined;
+      if (surface !== facts.surface) return undefined; // the pane scope identity must be unchanged
+      if (resolveInputModes(surface) === undefined) return undefined; // the pane mode resolution must still be intact
+      return { sessionId: session.sessionId, sessionEpoch: session.epoch };
+    } catch {
+      return undefined; // any failure is a refusal, never an exception
+    }
+  }
+
   if (state.unsupported) return unsupportedObserver();
 
   return {
     snapshot,
+    /** TESTONLY: the bounded native-binding group from the most recent snapshot pass. */
+    nativeBinding() { return lastNativeBinding; },
+    revalidateScope,
     restore,
     get installed() { return state.installed; },
     get unsupported() { return state.unsupported; },
@@ -654,11 +952,14 @@ function createPaneModeObserver(candidate) {
 /** Convenience install that never throws: an unresolved candidate is honest unknown. */
 function installPaneModeObserver(mainEntry, options = {}) {
   try {
-    const resolved = resolveCandidatePaneClasses(mainEntry, options);
-    return createPaneModeObserver({ ...resolved.classes, recheck: resolved.recheck });
+    const resolved = resolveCandidatePaneClasses(mainEntry, { fs: options.fs });
+    return createPaneModeObserver(
+      { ...resolved.classes, recheck: resolved.recheck },
+      { nativeBinding: options.nativeBinding, guard: options.guard },
+    );
   } catch {
     try {
-      return createPaneModeObserver(undefined);
+      return createPaneModeObserver(undefined, { nativeBinding: options.nativeBinding, guard: options.guard });
     } catch {
       return unsupportedObserver();
     }
@@ -668,6 +969,7 @@ function installPaneModeObserver(mainEntry, options = {}) {
 module.exports = {
   CANDIDATE_LEAVES,
   PANE_REPLY_FIELD_NAMES,
+  NATIVE_BINDING_FIELD_NAMES,
   resolveCandidatePaneClasses,
   recheckCandidateModules,
   installOwnedHooks,

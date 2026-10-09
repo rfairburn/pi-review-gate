@@ -20,6 +20,7 @@ import {
   formatMainCensusDiagnostic,
   validateMainActivePaneSnapshot,
   validateMainModeCensusReply,
+  validateMainNativeBindingSnapshot,
   type MainModeCensusSnapshot,
 } from "./helpers/session-host-windows-stdout-census-contract";
 import { WindowsMainPtyDriver } from "./helpers/session-host-native-windows-harness";
@@ -61,6 +62,8 @@ interface CensusServiceOptions {
   buildSnapshot: () => Record<string, unknown>;
   fs: FakeFsLike;
   maxRequestBytes?: number;
+  closeAfterServe?: boolean;
+  rootChain?: Array<{ path: string; dev: bigint; ino: bigint }>;
 }
 
 interface CensusService {
@@ -134,7 +137,7 @@ function sampleSnapshot(): Record<string, unknown> {
   (stream.write as (data?: unknown) => unknown).call(stream, Buffer.from("\x1b[?1003;1006h\x1b[?1049h"));
   const snapshot = handle.snapshot();
   handle.restore();
-  return { ...snapshot, activePane: completeActivePane() };
+  return { ...snapshot, activePane: completeActivePane(), nativeBinding: completeNativeBinding() };
 }
 
 /** A coherent, positively-known active-pane group used by the pure regressions. */
@@ -172,6 +175,30 @@ function unknownActivePane(scope: boolean | null, complete: boolean | null): Rec
     mouseEncoding: null,
     geometryColumns: null,
     geometryRows: null,
+  };
+}
+
+/** A coherent, positively-known native-binding group used by the pure regressions. */
+function completeNativeBinding(): Record<string, unknown> {
+  return {
+    scope: true,
+    complete: true,
+    ptyPid: 4243,
+    incarnation: 1,
+    sessionEpoch: 1,
+    expectedProof: "a".repeat(64),
+  };
+}
+
+/** An honest all-null native-binding group: the observation was never established. */
+function unestablishedNativeBinding(): Record<string, unknown> {
+  return {
+    scope: null,
+    complete: null,
+    ptyPid: null,
+    incarnation: null,
+    sessionEpoch: null,
+    expectedProof: null,
   };
 }
 
@@ -901,6 +928,58 @@ test("census reply service degrades permanently and closes its watcher on a watc
   assert.equal(fake.watcher.closedCount, 1, "teardown close does not double-close");
 });
 
+test("census reply service requires a supplied retained chain to include its channel root", () => {
+  const missingRoot = makeFakeFs();
+  seedFakeRoot(missingRoot);
+  const badChainService = censusFixture.createCensusReplyService({
+    root: FAKE_ROOT,
+    mainPid: () => 4242,
+    buildSnapshot: () => sampleSnapshot(),
+    fs: missingRoot.fs,
+    rootChain: [{ path: dirname(FAKE_ROOT), dev: 1n, ino: 50n }],
+  });
+  assert.throws(() => badChainService.start(), /must include its channel root/,
+    "a chain that omits the watched directory would leave it unvalidated");
+
+  const empty = makeFakeFs();
+  seedFakeRoot(empty);
+  const emptyChainService = censusFixture.createCensusReplyService({
+    root: FAKE_ROOT,
+    mainPid: () => 4242,
+    buildSnapshot: () => sampleSnapshot(),
+    fs: empty.fs,
+    rootChain: [],
+  });
+  assert.throws(() => emptyChainService.start(), /must include its channel root/);
+});
+
+test("census reply service refuses a chain disturbance during snapshot construction", () => {
+  const fake = makeFakeFs();
+  seedFakeRoot(fake);
+  const rootEntry = fake.entries.get(FAKE_ROOT)!;
+  const parentEntry = fake.entries.get(dirname(FAKE_ROOT))!;
+  const chain = [
+    { path: FAKE_ROOT, dev: rootEntry.dev, ino: rootEntry.ino },
+    { path: dirname(FAKE_ROOT), dev: parentEntry.dev, ino: parentEntry.ino },
+  ];
+  fake.addFile(pathJoin(FAKE_ROOT, REQUEST_NAME), validRequest(NONCE, 4242));
+  const service = censusFixture.createCensusReplyService({
+    root: FAKE_ROOT,
+    mainPid: () => 4242,
+    buildSnapshot: () => {
+      fake.entries.set(FAKE_ROOT, { kind: "directory", dev: 1n, ino: 999_001n }); // replaced identity mid-construction
+      return sampleSnapshot();
+    },
+    fs: fake.fs,
+    rootChain: chain,
+  });
+  service.start();
+  fake.emit("change", REQUEST_NAME);
+  assert.equal(fake.entries.get(pathJoin(FAKE_ROOT, REPLY_NAME)), undefined,
+    "a mid-snapshot channel-root disturbance is an honest refusal with no reply leaf");
+  service.close();
+});
+
 test("census reply service start validates the root and is single-use", () => {
   const missing = makeFakeFs();
   const service = censusFixture.createCensusReplyService({
@@ -950,6 +1029,7 @@ test("fixture reply builder and parent contract agree on the exact key set", () 
     sameOutputStream: true,
     observationComplete: false,
     activePane: completeActivePane(),
+    nativeBinding: unestablishedNativeBinding(),
   };
   for (const field of censusFixture.CENSUS_COUNT_FIELDS) unknownSnapshot[field] = null;
   assert.ok(validateMainModeCensusReply(censusFixture.buildCensusReply(NONCE, 4242, unknownSnapshot),
@@ -978,7 +1058,7 @@ test("census reply validation is strict on keys, PID, nonce, schema, and caps", 
     assert.equal(validateMainModeCensusReply(value, expect), undefined, `${label} is refused`);
   }
   const incomplete = censusFixture.buildCensusReply(NONCE, 4242, (() => {
-    const snapshot: Record<string, unknown> = { hookActive: true, sameOutputStream: true, observationComplete: false, activePane: completeActivePane() };
+    const snapshot: Record<string, unknown> = { hookActive: true, sameOutputStream: true, observationComplete: false, activePane: completeActivePane(), nativeBinding: unestablishedNativeBinding() };
     for (const field of censusFixture.CENSUS_COUNT_FIELDS) snapshot[field] = null;
     return snapshot;
   })());
@@ -1002,7 +1082,7 @@ test("census reply validation refuses impossible complete flags and keeps honest
     "complete=true with both flags false is impossible");
 
   const unknownReply = (hookActive: boolean, sameOutputStream: boolean): Record<string, unknown> => {
-    const snapshot: Record<string, unknown> = { hookActive, sameOutputStream, observationComplete: false, activePane: completeActivePane() };
+    const snapshot: Record<string, unknown> = { hookActive, sameOutputStream, observationComplete: false, activePane: completeActivePane(), nativeBinding: unestablishedNativeBinding() };
     for (const field of censusFixture.CENSUS_COUNT_FIELDS) snapshot[field] = null;
     return censusFixture.buildCensusReply(NONCE, 4242, snapshot);
   };
@@ -1018,6 +1098,7 @@ test("census reply validation treats the active-pane group independently of the 
   const producerUnknownPaneComplete = (() => {
     const snapshot: Record<string, unknown> = {
       hookActive: true, sameOutputStream: true, observationComplete: false, activePane: completeActivePane(),
+      nativeBinding: unestablishedNativeBinding(),
     };
     for (const field of censusFixture.CENSUS_COUNT_FIELDS) snapshot[field] = null;
     return censusFixture.buildCensusReply(NONCE, 4242, snapshot);
@@ -1029,9 +1110,12 @@ test("census reply validation treats the active-pane group independently of the 
   assert.equal(validatedUnknownProducer!.activePane.ownerPresent, true);
   assert.equal(validatedUnknownProducer!.activePane.mouseTracking, 4);
 
-  // An unknown active pane never erases a complete producer scope.
+  // An unknown active pane never erases a complete producer scope. A
+  // positively established native binding requires the intact actual-owner
+  // guard chain, so an unknown pane also unestablishes the binding group.
   const producerCompletePaneUnknown = sampleSnapshot();
   producerCompletePaneUnknown.activePane = unknownActivePane(null, null);
+  producerCompletePaneUnknown.nativeBinding = unestablishedNativeBinding();
   const validatedUnknownPane = validateMainModeCensusReply(
     censusFixture.buildCensusReply(NONCE, 4242, producerCompletePaneUnknown), expect);
   assert.ok(validatedUnknownPane !== undefined, "a complete producer with an unknown pane validates");
@@ -1039,14 +1123,23 @@ test("census reply validation treats the active-pane group independently of the 
   assert.equal(validatedUnknownPane!.writeCalls, 1, "honest producer counts survive an unknown pane");
   assert.equal(validatedUnknownPane!.activePane.scope, null);
   assert.equal(validatedUnknownPane!.activePane.complete, null);
+  assert.equal(validatedUnknownPane!.nativeBinding.scope, null, "an unknown pane never carries a known native binding");
 
   // A coherent partial-but-unknown pane group is accepted alongside known counts.
   const partialPane = sampleSnapshot();
   partialPane.activePane = unknownActivePane(true, false);
+  partialPane.nativeBinding = unestablishedNativeBinding();
   const validatedPartial = validateMainModeCensusReply(censusFixture.buildCensusReply(NONCE, 4242, partialPane), expect);
   assert.ok(validatedPartial !== undefined, "an intact scope with unknown fields stays a valid honest partial observation");
   assert.equal(validatedPartial!.activePane.scope, true);
   assert.equal(validatedPartial!.activePane.complete, false);
+
+  // A complete native binding alongside a disturbed owner guard chain is refused.
+  const bindingWithoutOwner = sampleSnapshot();
+  bindingWithoutOwner.activePane = { ...completeActivePane(), hasLiveProcess: false };
+  assert.equal(validateMainModeCensusReply(
+    censusFixture.buildCensusReply(NONCE, 4242, bindingWithoutOwner), expect), undefined,
+    "a known native binding requires the intact actual-owner guard chain");
 });
 
 test("active-pane validation rejects inconsistent flags, enums, geometry, and impossible field combinations", () => {
@@ -1112,6 +1205,38 @@ test("active-pane validation rejects inconsistent flags, enums, geometry, and im
   }
 });
 
+test("native-binding validation enforces exact keys, pair coherence, and proof implications", () => {
+  assert.ok(validateMainNativeBindingSnapshot(completeNativeBinding()) !== undefined, "the known coherent group validates");
+  assert.ok(validateMainNativeBindingSnapshot(unestablishedNativeBinding()) !== undefined, "the unestablished all-null group validates");
+  const invalid: Array<[string, Record<string, unknown>]> = [
+    ["extra key", { ...completeNativeBinding(), extra: 1 }],
+    ["missing key", Object.fromEntries(Object.entries(completeNativeBinding()).filter(([key]) => key !== "scope"))],
+    ["pid without incarnation", { ...completeNativeBinding(), incarnation: null }],
+    ["incarnation without pid", { ...completeNativeBinding(), ptyPid: null }],
+    ["epoch without proof", { ...completeNativeBinding(), expectedProof: null }],
+    ["proof without its full tuple", { ...completeNativeBinding(), ptyPid: null, incarnation: null }],
+    ["epoch/proof pair without PID inputs", { scope: true, complete: false, ptyPid: null, incarnation: null, sessionEpoch: 1, expectedProof: "a".repeat(64) }],
+    ["zero epoch", { ...completeNativeBinding(), sessionEpoch: 0 }],
+    ["epoch zero is never a binding", { scope: true, complete: false, ptyPid: 4243, incarnation: 1, sessionEpoch: 0, expectedProof: null }],
+    ["malformed proof", { ...completeNativeBinding(), expectedProof: "z".repeat(64) }],
+    ["non-string proof", { ...completeNativeBinding(), expectedProof: 123 }],
+    ["raw session id is not a wire field", { ...completeNativeBinding(), sessionId: "native-session-id-1" }],
+    ["non-integer pid", { ...completeNativeBinding(), ptyPid: 4.5 }],
+    ["pid one", { ...completeNativeBinding(), ptyPid: 1 }],
+    ["incarnation zero", { ...completeNativeBinding(), incarnation: 0 }],
+    ["null scope carrying data", { ...completeNativeBinding(), scope: null, complete: true }],
+    ["scope false with data", { ...completeNativeBinding(), scope: false, complete: true }],
+    ["complete mismatch", { ...completeNativeBinding(), complete: false }],
+    ["non-boolean scope", { ...completeNativeBinding(), scope: "true" }],
+  ];
+  for (const [label, value] of invalid) {
+    assert.equal(validateMainNativeBindingSnapshot(value), undefined, `${label} is refused`);
+  }
+  // An attempted-but-unresolved binding (scope true, all-null fields) stays valid.
+  const attemptedUnknown = { scope: true, complete: false, ptyPid: null, incarnation: null, sessionEpoch: null, expectedProof: null };
+  assert.ok(validateMainNativeBindingSnapshot(attemptedUnknown) !== undefined, "an attempted unknown binding validates");
+});
+
 test("census diagnostic reports the bounded active-pane group without raw data", () => {
   const validated = validateMainModeCensusReply(censusFixture.buildCensusReply(NONCE, 4242, sampleSnapshot()),
     { nonce: NONCE, expectedMainPid: 4242 })!;
@@ -1124,6 +1249,7 @@ test("census diagnostic reports the bounded active-pane group without raw data",
   const unknownPane = (() => {
     const snapshot: Record<string, unknown> = {
       hookActive: true, sameOutputStream: true, observationComplete: false, activePane: unknownActivePane(null, null),
+      nativeBinding: unestablishedNativeBinding(),
     };
     for (const field of censusFixture.CENSUS_COUNT_FIELDS) snapshot[field] = null;
     return snapshot;
@@ -1205,6 +1331,7 @@ test("a failing outer-VT assertion keeps complete producer counts alongside an u
   };
   const reply = sampleSnapshot();
   reply.activePane = unknownActivePane(true, false);
+  reply.nativeBinding = unestablishedNativeBinding();
   const census = validateMainModeCensusReply(censusFixture.buildCensusReply(NONCE, 4242, reply),
     { nonce: NONCE, expectedMainPid: 4242 });
   assert.ok(census !== undefined, "complete producer counts with a coherent unknown pane still validate");
@@ -1245,6 +1372,7 @@ test("census diagnostic is bounded, metadata-only, and free of raw output", () =
     sameOutputStream: true,
     observationComplete: false,
     activePane: completeActivePane(),
+    nativeBinding: unestablishedNativeBinding(),
   };
   for (const field of censusFixture.CENSUS_COUNT_FIELDS) unknownSnapshot[field] = null;
   const unknownLine = formatMainCensusDiagnostic(validateMainModeCensusReply(

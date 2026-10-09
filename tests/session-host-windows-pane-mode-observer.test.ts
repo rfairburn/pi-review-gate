@@ -17,10 +17,41 @@ import test from "node:test";
 import type { TerminalInputModes } from "../src/session-host/terminal-surface";
 
 interface PaneObserver {
-  snapshot(): Record<string, unknown>;
+  snapshot(nonce?: string): Record<string, unknown>;
+  nativeBinding(): Record<string, unknown>;
+  revalidateScope(facts: unknown): { sessionId: string; sessionEpoch: number } | undefined;
   restore(): boolean;
   readonly installed: boolean;
   readonly unsupported: boolean;
+}
+
+/** The raw arm facts the pane observer offers on one complete fresh pass. */
+interface GuardArmFacts {
+  readonly ownerId: string;
+  readonly focus: unknown;
+  readonly row: Record<string, unknown>;
+  readonly binding: Record<string, unknown>;
+  readonly bootstrap: Record<string, unknown>;
+  readonly manager: unknown;
+  readonly sidebar: unknown;
+  readonly surface: unknown;
+}
+
+/** TESTONLY exchange-guard observation sink recorded by the pane observer. */
+class GuardSink {
+  armCalls: Array<{ readonly nonce: string | undefined; readonly facts: GuardArmFacts }> = [];
+  onListCalls: unknown[] = [];
+  onOwnerCalls: unknown[] = [];
+  onFocusCalls: Array<{ readonly focus: unknown; readonly receiver: unknown }> = [];
+
+  arm(nonce: string | undefined, facts: GuardArmFacts): boolean {
+    this.armCalls.push({ nonce, facts });
+    return true;
+  }
+
+  onList(rows: unknown): void { this.onListCalls.push(rows); }
+  onOwner(ownerId: unknown): void { this.onOwnerCalls.push(ownerId); }
+  onFocus(focusValue: unknown, receiver: unknown): void { this.onFocusCalls.push({ focus: focusValue, receiver }); }
 }
 
 interface PaneObserverModule {
@@ -41,8 +72,8 @@ interface PaneObserverModule {
     }>,
     defineProperty: (target: object, key: string, descriptor: PropertyDescriptor) => void,
   ): boolean;
-  createPaneModeObserver(classes: unknown): PaneObserver;
-  installPaneModeObserver(mainEntry: string, options?: { fs?: unknown }): PaneObserver;
+  createPaneModeObserver(classes: unknown, options?: { nativeBinding?: (row: unknown, nonce: string | undefined) => unknown; guard?: GuardSink }): PaneObserver;
+  installPaneModeObserver(mainEntry: string, options?: { fs?: unknown; nativeBinding?: (row: unknown, nonce: string | undefined) => unknown; guard?: GuardSink }): PaneObserver;
 }
 
 const paneFixture = require("../../tests/fixtures/session-host-windows-pane-mode-observer.cjs") as PaneObserverModule;
@@ -116,6 +147,11 @@ function makeFakes() {
     constructor(focus: SidebarFocus = "sidebar", owner?: string) {
       this.focusValue = focus;
       this.ownerValue = owner;
+    }
+
+    /** Test-only disturbance handle for the focus getter value. */
+    setFocusForTests(focus: SidebarFocus): void {
+      this.focusValue = focus;
     }
 
     get focus(): SidebarFocus {
@@ -907,4 +943,546 @@ test("an unsupported candidate class set reports an honest all-null unknown", ()
   const installed = paneFixture.installPaneModeObserver(absentEntry);
   assert.equal(installed.unsupported, true, "an unresolvable candidate is unsupported, never a fallback");
   assert.equal(installed.snapshot().scope, null);
+});
+
+test("TESTONLY native binding resolves the exact matched live owner row with the fresh nonce", () => {
+  const fakes = makeFakes();
+  const seen: Array<{ readonly row: unknown; readonly nonce: string | undefined }> = [];
+  const observer = paneFixture.createPaneModeObserver({
+    InstanceManager: fakes.FakeInstanceManager,
+    SidebarController: fakes.FakeSidebarController,
+    TerminalSurface: FakeSurface,
+  }, {
+    nativeBinding: (row: unknown, nonce: string | undefined) => {
+      seen.push({ row, nonce });
+      return { ptyPid: 4243, incarnation: 1, sessionId: "native-session-id-1", sessionEpoch: 1, expectedProof: "b".repeat(64) };
+    },
+  });
+  const manager = new fakes.FakeInstanceManager();
+  const rowA = { id: "A", hasLiveProcess: true, lifecycle: "alive" };
+  manager.views = [rowA];
+  manager.surfaces = { A: new FakeSurface(modesWith("any", "sgr")) };
+  const sidebar = new fakes.FakeSidebarController("main", "A");
+  manager.list();
+  sidebar.setActiveMainOwner("A");
+
+  const pane = observer.snapshot("nonce-0123456789abcdef");
+  assert.equal(pane.complete, true, "the pane group is unchanged by the binding extension");
+  assert.deepEqual(seen, [{ row: rowA, nonce: "nonce-0123456789abcdef" }],
+    "the callback receives the exact matched live owner row and the fresh nonce exactly once");
+  const binding = observer.nativeBinding();
+  assert.equal(binding.scope, true);
+  assert.equal(binding.complete, true);
+  assert.equal(binding.ptyPid, 4243);
+  assert.equal(binding.incarnation, 1);
+  assert.equal(binding.sessionEpoch, 1);
+  assert.equal(binding.expectedProof, "b".repeat(64));
+  assert.ok(!("sessionId" in binding), "the raw session id is never published by the group");
+
+  // A non-string nonce is passed through as undefined, never coerced.
+  observer.snapshot();
+  assert.equal(seen[1]!.nonce, undefined, "an absent nonce stays undefined");
+});
+
+test("TESTONLY native binding keeps pair coherence and refuses partial tuples", () => {
+  const fakes = makeFakes();
+  const observer = paneFixture.createPaneModeObserver({
+    InstanceManager: fakes.FakeInstanceManager,
+    SidebarController: fakes.FakeSidebarController,
+    TerminalSurface: FakeSurface,
+  }, {
+    nativeBinding: () => ({ ptyPid: 4243, incarnation: null, sessionId: "id-1", sessionEpoch: 1, expectedProof: "c".repeat(64) }),
+  });
+  const manager = new fakes.FakeInstanceManager();
+  manager.views = liveViews(["A"]);
+  manager.surfaces = { A: new FakeSurface(modesWith("any", "sgr")) };
+  const sidebar = new fakes.FakeSidebarController("main", "A");
+  manager.list();
+  sidebar.setActiveMainOwner("A");
+  observer.snapshot();
+  const binding = observer.nativeBinding();
+  assert.equal(binding.scope, true, "the observation ran inside a valid owner view");
+  assert.equal(binding.complete, false);
+  assert.equal(binding.ptyPid, null, "a PID without its incarnation is never published");
+  assert.equal(binding.incarnation, null);
+  assert.equal(binding.sessionEpoch, null, "the epoch travels with the proof and the full tuple");
+  assert.equal(binding.expectedProof, null, "a proof without its full tuple is never published");
+});
+
+test("TESTONLY native binding is uncommitted when a later disturbance invalidates the pane scope", () => {
+  const fakes = makeFakes();
+  let callbackCalls = 0;
+  const observer = paneFixture.createPaneModeObserver({
+    InstanceManager: fakes.FakeInstanceManager,
+    SidebarController: fakes.FakeSidebarController,
+    TerminalSurface: FakeSurface,
+  }, {
+    nativeBinding: () => {
+      callbackCalls += 1;
+      return { ptyPid: 4243, incarnation: 1, sessionEpoch: 1, expectedProof: "d".repeat(64) };
+    },
+  });
+  const manager = new fakes.FakeInstanceManager();
+  manager.views = liveViews(["A"]);
+  manager.surfaces = { A: new FakeSurface(modesWith("any", "sgr")) };
+  const sidebar = new fakes.FakeSidebarController("main", "A");
+  manager.list();
+  sidebar.setActiveMainOwner("A");
+
+  // A complete binding callback succeeds, but a replaced inputModes resolution
+  // later invalidates the pane scope in the same pass.
+  const originalInputModes = FakeSurface.prototype.inputModes;
+  try {
+    FakeSurface.prototype.inputModes = function replacedInputModes(): unknown {
+      return modesWith("any", "sgr");
+    };
+    const pane = observer.snapshot();
+    assert.equal(callbackCalls, 1, "the callback ran inside the disturbed pass");
+    assert.equal(pane.scope, false, "the replaced resolution latches a disturbed scope");
+    assert.equal(pane.complete, false);
+    const binding = observer.nativeBinding();
+    assert.equal(binding.scope, null, "a disturbed pass never commits the provisional binding");
+    for (const name of Object.keys(binding)) {
+      assert.equal(binding[name], null, `${name} is an explicit null after a disturbed pass`);
+    }
+  } finally {
+    FakeSurface.prototype.inputModes = originalInputModes;
+  }
+});
+
+test("TESTONLY native binding contains a throwing callback without changing the original call", () => {
+  const fakes = makeFakes();
+  const observer = paneFixture.createPaneModeObserver({
+    InstanceManager: fakes.FakeInstanceManager,
+    SidebarController: fakes.FakeSidebarController,
+    TerminalSurface: FakeSurface,
+  }, {
+    nativeBinding: () => { throw new Error("SYNTHETIC binding failure"); },
+  });
+  const manager = new fakes.FakeInstanceManager();
+  manager.views = liveViews(["A"]);
+  manager.surfaces = { A: new FakeSurface(modesWith("any", "sgr")) };
+  const sidebar = new fakes.FakeSidebarController("main", "A");
+  manager.list();
+  sidebar.setActiveMainOwner("A");
+  let pane: Record<string, unknown> | undefined;
+  assert.doesNotThrow(() => { pane = observer.snapshot(); }, "a throwing callback never changes the original call");
+  assert.equal(pane!.complete, true, "the pane group is unaffected by the binding failure");
+  const binding = observer.nativeBinding();
+  assert.equal(binding.scope, true);
+  assert.equal(binding.complete, false);
+  assert.equal(binding.ptyPid, null);
+  assert.equal(binding.expectedProof, null);
+});
+
+test("TESTONLY native binding stays unestablished without a matched live owner", () => {
+  const fakes = makeFakes();
+  let callbackCalls = 0;
+  const observer = paneFixture.createPaneModeObserver({
+    InstanceManager: fakes.FakeInstanceManager,
+    SidebarController: fakes.FakeSidebarController,
+    TerminalSurface: FakeSurface,
+  }, {
+    nativeBinding: () => { callbackCalls += 1; return undefined; },
+  });
+  const manager = new fakes.FakeInstanceManager();
+  manager.views = liveViews(["A"]);
+  manager.surfaces = { A: new FakeSurface(modesWith("any", "sgr")) };
+  const sidebar = new fakes.FakeSidebarController("main", "A");
+  manager.list();
+  sidebar.setActiveMainOwner("A");
+  observer.snapshot();
+  assert.equal(callbackCalls, 1);
+
+  // No owner: the callback is never invoked and the group stays unestablished.
+  const noOwnerFakes = makeFakes();
+  let noOwnerCalls = 0;
+  const noOwnerObserver = paneFixture.createPaneModeObserver({
+    InstanceManager: noOwnerFakes.FakeInstanceManager,
+    SidebarController: noOwnerFakes.FakeSidebarController,
+    TerminalSurface: FakeSurface,
+  }, {
+    nativeBinding: () => { noOwnerCalls += 1; return undefined; },
+  });
+  const noOwnerManager = new noOwnerFakes.FakeInstanceManager();
+  noOwnerManager.views = liveViews(["A"]);
+  noOwnerManager.surfaces = { A: new FakeSurface(modesWith("any", "sgr")) };
+  const noOwnerSidebar = new noOwnerFakes.FakeSidebarController("main");
+  noOwnerManager.list();
+  noOwnerSidebar.setActiveMainOwner(undefined);
+  noOwnerObserver.snapshot();
+  assert.equal(noOwnerCalls, 0, "no matched live owner means the callback is never invoked");
+  const unestablished = noOwnerObserver.nativeBinding();
+  for (const name of Object.keys(unestablished)) {
+    assert.equal(unestablished[name], null, `${name} is an explicit null for an unestablished binding`);
+  }
+
+  // A not-live owner row never invokes the callback either.
+  const deadFakes = makeFakes();
+  let deadCalls = 0;
+  const deadObserver = paneFixture.createPaneModeObserver({
+    InstanceManager: deadFakes.FakeInstanceManager,
+    SidebarController: deadFakes.FakeSidebarController,
+    TerminalSurface: FakeSurface,
+  }, {
+    nativeBinding: () => { deadCalls += 1; return undefined; },
+  });
+  const deadManager = new deadFakes.FakeInstanceManager();
+  deadManager.views = [{ id: "A", hasLiveProcess: false, lifecycle: "exited" }];
+  deadManager.surfaces = { A: new FakeSurface(modesWith("any", "sgr")) };
+  const deadSidebar = new deadFakes.FakeSidebarController("main", "A");
+  deadManager.list();
+  deadSidebar.setActiveMainOwner("A");
+  deadObserver.snapshot();
+  assert.equal(deadCalls, 0, "a not-live owner row never invokes the binding callback");
+  assert.equal(deadObserver.nativeBinding().scope, null);
+});
+
+test("an unsupported pane observer exposes an unestablished native binding group", () => {
+  const observer = paneFixture.createPaneModeObserver(undefined);
+  const binding = observer.nativeBinding();
+  for (const name of Object.keys(binding)) {
+    assert.equal(binding[name], null, `${name} is an explicit null for an unsupported installation`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// TESTONLY exchange-guard extension: the third owned focus getter hook, the
+// single arm on a complete fresh pass, observation forwarding, and the fresh
+// pure current-scope revalidation.
+// ---------------------------------------------------------------------------
+
+const GUARD_BOOTSTRAP = {
+  version: 1,
+  socketPath: "/tmp/fake-native-socket",
+  token: "ab".repeat(32),
+  instanceId: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  generation: "0ffeeddccbba99887766554433221100",
+};
+const GUARD_ARM_NONCE = "armnonce0123456789ab";
+
+function guardBindingResult(): Record<string, unknown> {
+  return { ptyPid: 4243, incarnation: 1, sessionEpoch: 1, expectedProof: "b".repeat(64), bootstrap: GUARD_BOOTSTRAP };
+}
+
+/**
+ * The armed-shaped facts the real guard retains from one raw arm call: the
+ * private session-tuple copies that createNativeExchangeGuard.arm extracts.
+ */
+function armedFacts(raw: GuardArmFacts): Record<string, unknown> {
+  return { ...raw, sessionId: "native-session-id-1", sessionEpoch: 1 };
+}
+
+function armedSetup(sink: GuardSink, recheck?: () => boolean) {
+  const fakes = makeFakes();
+  const observer = paneFixture.createPaneModeObserver({
+    InstanceManager: fakes.FakeInstanceManager,
+    SidebarController: fakes.FakeSidebarController,
+    TerminalSurface: FakeSurface,
+    ...(recheck === undefined ? {} : { recheck }),
+  }, {
+    nativeBinding: () => guardBindingResult(),
+    guard: sink,
+  });
+  const manager = new fakes.FakeInstanceManager();
+  const rowA = { id: "A", hasLiveProcess: true, lifecycle: "alive", nativeSession: { sessionId: "native-session-id-1", epoch: 1 } };
+  manager.views = [rowA];
+  manager.surfaces = { A: new FakeSurface(modesWith("any", "sgr")) };
+  const sidebar = new fakes.FakeSidebarController("main", "A");
+  manager.list();
+  sidebar.setActiveMainOwner("A");
+  observer.snapshot(GUARD_ARM_NONCE);
+  return { fakes, observer, manager, rowA, sidebar };
+}
+
+test("pane observer focus getter hook forwards exact receiver, return, and identical throw", () => {
+  const fakes = makeFakes();
+  const originalFocus = Object.getOwnPropertyDescriptor(fakes.FakeSidebarController.prototype, "focus")!;
+  const sink = new GuardSink();
+  const observer = paneFixture.createPaneModeObserver({
+    InstanceManager: fakes.FakeInstanceManager,
+    SidebarController: fakes.FakeSidebarController,
+    TerminalSurface: FakeSurface,
+  }, { guard: sink });
+  const manager = new fakes.FakeInstanceManager();
+  manager.views = liveViews(["A"]);
+  manager.surfaces = { A: new FakeSurface(modesWith("any", "sgr")) };
+  const sidebar = new fakes.FakeSidebarController("main", "A");
+  manager.list();
+  sidebar.setActiveMainOwner("A");
+
+  assert.equal(sidebar.focus, "main", "the original getter return is preserved through the hook");
+  assert.deepEqual(sink.onFocusCalls, [{ focus: "main", receiver: sidebar }],
+    "the exact value and borrowed receiver are observed exactly once");
+
+  const boom = new Error("SYNTHETIC focus failure");
+  sidebar.focusError = boom;
+  assert.throws(() => { void sidebar.focus; }, (error: unknown) => error === boom,
+    "the identical original thrown error is preserved");
+  assert.equal(sink.onFocusCalls.length, 1, "a throwing getter records no observation");
+
+  assert.equal(observer.restore(), true);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(fakes.FakeSidebarController.prototype, "focus"), originalFocus,
+    "restore returns the exact original focus descriptor");
+});
+
+test("pane observer arms the exchange guard on a complete fresh pass with the private facts", () => {
+  const sink = new GuardSink();
+  const { observer, manager, rowA, sidebar } = armedSetup(sink);
+
+  assert.equal(sink.armCalls.length, 1, "a complete fresh pass arms the guard exactly once");
+  assert.equal(sink.armCalls[0]!.nonce, GUARD_ARM_NONCE, "the arm binds the fresh request nonce");
+  const facts = sink.armCalls[0]!.facts;
+  assert.equal(facts.ownerId, "A", "the actual owner id is retained privately");
+  assert.equal(facts.focus, "main", "the raw focus value is retained privately");
+  assert.equal(facts.row, rowA, "the exact matched live row is retained privately");
+  assert.equal(facts.binding.ptyPid, 4243);
+  assert.equal(facts.binding.complete, true);
+  assert.equal(facts.bootstrap, GUARD_BOOTSTRAP, "the raw bootstrap tuple stays private to the arm");
+  assert.ok(!("sessionId" in facts), "no raw session id field is published by the arm facts");
+  assert.equal(facts.manager, manager, "the original manager identity is retained");
+  assert.equal(facts.sidebar, sidebar, "the original sidebar identity is retained");
+  assert.equal(facts.surface, manager.surfaces.A, "the original pane surface identity is retained");
+
+  // Every complete fresh pass offers the arm; the guard itself latches single-use.
+  const before = sink.armCalls.length;
+  observer.snapshot(GUARD_ARM_NONCE);
+  assert.equal(sink.armCalls.length, before + 1, "a later complete pass offers the arm again");
+});
+
+test("pane observer never arms the guard without a complete binding or an intact pass", () => {
+  // Incomplete binding: the callback result lacks its incarnation.
+  const partialFakes = makeFakes();
+  const partialSink = new GuardSink();
+  const partialObserver = paneFixture.createPaneModeObserver({
+    InstanceManager: partialFakes.FakeInstanceManager,
+    SidebarController: partialFakes.FakeSidebarController,
+    TerminalSurface: FakeSurface,
+  }, {
+    nativeBinding: () => ({ ptyPid: 4243, incarnation: null, sessionEpoch: 1, expectedProof: "c".repeat(64) }),
+    guard: partialSink,
+  });
+  const partialManager = new partialFakes.FakeInstanceManager();
+  partialManager.views = liveViews(["A"]);
+  partialManager.surfaces = { A: new FakeSurface(modesWith("any", "sgr")) };
+  const partialSidebar = new partialFakes.FakeSidebarController("main", "A");
+  partialManager.list();
+  partialSidebar.setActiveMainOwner("A");
+  partialObserver.snapshot(GUARD_ARM_NONCE);
+  assert.equal(partialSink.armCalls.length, 0, "an incomplete binding never arms the guard");
+
+  // Disturbed pass: a replaced inputModes resolution invalidates the scope.
+  const disturbedFakes = makeFakes();
+  const disturbedSink = new GuardSink();
+  const disturbedObserver = paneFixture.createPaneModeObserver({
+    InstanceManager: disturbedFakes.FakeInstanceManager,
+    SidebarController: disturbedFakes.FakeSidebarController,
+    TerminalSurface: FakeSurface,
+  }, {
+    nativeBinding: () => guardBindingResult(),
+    guard: disturbedSink,
+  });
+  const disturbedManager = new disturbedFakes.FakeInstanceManager();
+  disturbedManager.views = liveViews(["A"]);
+  disturbedManager.surfaces = { A: new FakeSurface(modesWith("any", "sgr")) };
+  const disturbedSidebar = new disturbedFakes.FakeSidebarController("main", "A");
+  disturbedManager.list();
+  disturbedSidebar.setActiveMainOwner("A");
+  const originalInputModes = FakeSurface.prototype.inputModes;
+  try {
+    FakeSurface.prototype.inputModes = function replacedInputModes(): unknown {
+      return modesWith("any", "sgr");
+    };
+    disturbedObserver.snapshot(GUARD_ARM_NONCE);
+  } finally {
+    FakeSurface.prototype.inputModes = originalInputModes;
+  }
+  assert.equal(disturbedSink.armCalls.length, 0, "a disturbed pass never arms the guard");
+
+  // No matched live owner: the callback is never invoked and nothing arms.
+  const noOwnerFakes = makeFakes();
+  const noOwnerSink = new GuardSink();
+  const noOwnerObserver = paneFixture.createPaneModeObserver({
+    InstanceManager: noOwnerFakes.FakeInstanceManager,
+    SidebarController: noOwnerFakes.FakeSidebarController,
+    TerminalSurface: FakeSurface,
+  }, {
+    nativeBinding: () => guardBindingResult(),
+    guard: noOwnerSink,
+  });
+  const noOwnerManager = new noOwnerFakes.FakeInstanceManager();
+  noOwnerManager.views = liveViews(["A"]);
+  noOwnerManager.surfaces = { A: new FakeSurface(modesWith("any", "sgr")) };
+  const noOwnerSidebar = new noOwnerFakes.FakeSidebarController("main");
+  noOwnerManager.list();
+  noOwnerSidebar.setActiveMainOwner(undefined);
+  noOwnerObserver.snapshot(GUARD_ARM_NONCE);
+  assert.equal(noOwnerSink.armCalls.length, 0, "no matched live owner never arms the guard");
+});
+
+test("pane observer forwards list, owner, and focus observations to the guard sink", () => {
+  const sink = new GuardSink();
+  const { manager, sidebar } = armedSetup(sink);
+  const beforeLists = sink.onListCalls.length;
+  const beforeOwners = sink.onOwnerCalls.length;
+  const beforeFocuses = sink.onFocusCalls.length;
+
+  const returned = manager.list();
+  assert.equal(sink.onListCalls.length, beforeLists + 1, "each original list result is observed");
+  assert.equal(sink.onListCalls[sink.onListCalls.length - 1], returned, "the exact returned row set is forwarded");
+
+  sidebar.setActiveMainOwner("B");
+  assert.equal(sink.onOwnerCalls.length, beforeOwners + 1, "each original setter argument is observed");
+  assert.equal(sink.onOwnerCalls[sink.onOwnerCalls.length - 1], "B", "the exact setter argument is forwarded");
+
+  void sidebar.focus;
+  assert.equal(sink.onFocusCalls.length, beforeFocuses + 1, "each original focus return is observed");
+  assert.deepEqual(sink.onFocusCalls[sink.onFocusCalls.length - 1], { focus: "main", receiver: sidebar });
+});
+
+test("pane observer revalidateScope returns the current session tuple only for an intact armed scope", () => {
+  const sink = new GuardSink();
+  const { observer, manager, rowA, sidebar } = armedSetup(sink);
+  // The armed-shaped facts the real guard retains (private session-tuple copies).
+  const facts = armedFacts(sink.armCalls[0]!.facts);
+
+  assert.deepEqual(observer.revalidateScope(facts), { sessionId: "native-session-id-1", sessionEpoch: 1 },
+    "the intact armed scope returns the current row's session tuple");
+
+  // A changed focus is refused.
+  sidebar.setFocusForTests("sidebar");
+  assert.equal(observer.revalidateScope(facts), undefined, "a changed focus is refused");
+  sidebar.setFocusForTests("main");
+
+  // A changed owner is refused.
+  sidebar.setActiveMainOwner("B");
+  assert.equal(observer.revalidateScope(facts), undefined, "a changed owner is refused");
+  sidebar.setActiveMainOwner("A");
+  assert.deepEqual(observer.revalidateScope(facts), { sessionId: "native-session-id-1", sessionEpoch: 1 },
+    "revalidateScope is a fresh current-scope proof, not a sticky latch");
+
+  // A changed current native session tuple is refused (the armed copies are
+  // private primitives; only the live row changes).
+  rowA.nativeSession.epoch = 2;
+  assert.equal(observer.revalidateScope(facts), undefined, "a changed current session epoch is refused");
+  rowA.nativeSession.epoch = 1;
+
+  // An absent owner row is refused.
+  const views = manager.views;
+  manager.views = [];
+  assert.equal(observer.revalidateScope(facts), undefined, "an absent owner row is refused");
+  manager.views = views;
+
+  // A replaced pane surface identity is refused.
+  const surface = manager.surfaces.A;
+  manager.surfaces.A = new FakeSurface(modesWith("any", "sgr"));
+  assert.equal(observer.revalidateScope(facts), undefined, "a replaced pane surface is refused");
+  manager.surfaces.A = surface;
+  assert.deepEqual(observer.revalidateScope(facts), { sessionId: "native-session-id-1", sessionEpoch: 1 });
+});
+
+test("pane observer revalidateScope refuses replaced slots, own shadows, and module drift", () => {
+  // Replaced focus getter on the observer's own candidate classes.
+  const replacedSink = new GuardSink();
+  const replacedSetup = armedSetup(replacedSink);
+  Object.defineProperty(replacedSetup.fakes.FakeSidebarController.prototype, "focus", { get: () => "main", configurable: true });
+  assert.equal(replacedSetup.observer.revalidateScope(armedFacts(replacedSink.armCalls[0]!.facts)), undefined,
+    "a replaced focus resolution is refused, never bypassed through a saved original");
+
+  // Own shadow of the owner getter.
+  const shadowSink = new GuardSink();
+  const shadowSetup = armedSetup(shadowSink);
+  Object.defineProperty(shadowSetup.sidebar, "activeMainOwnerID", { value: "A", configurable: true, writable: true });
+  assert.equal(shadowSetup.observer.revalidateScope(armedFacts(shadowSink.armCalls[0]!.facts)), undefined,
+    "an own shadow of the owner getter is refused");
+
+  // Candidate module/export identity drift.
+  const recheckFakes = makeFakes();
+  const recheckSink = new GuardSink();
+  let recheckOk = true;
+  const recheckObserver = paneFixture.createPaneModeObserver({
+    InstanceManager: recheckFakes.FakeInstanceManager,
+    SidebarController: recheckFakes.FakeSidebarController,
+    TerminalSurface: FakeSurface,
+    recheck: () => recheckOk,
+  }, {
+    nativeBinding: () => guardBindingResult(),
+    guard: recheckSink,
+  });
+  const recheckManager = new recheckFakes.FakeInstanceManager();
+  recheckManager.views = liveViews(["A"]);
+  recheckManager.surfaces = { A: new FakeSurface(modesWith("any", "sgr")) };
+  const recheckSidebar = new recheckFakes.FakeSidebarController("main", "A");
+  recheckManager.list();
+  recheckSidebar.setActiveMainOwner("A");
+  recheckObserver.snapshot(GUARD_ARM_NONCE);
+  assert.equal(recheckSink.armCalls.length, 1, "the intact pass armed the guard");
+  recheckOk = false;
+  assert.equal(recheckObserver.revalidateScope(armedFacts(recheckSink.armCalls[0]!.facts)), undefined,
+    "a changed candidate module/export identity is refused");
+
+  // An unsupported observer never revalidates.
+  const unsupported = paneFixture.createPaneModeObserver(undefined);
+  assert.equal(unsupported.revalidateScope({}), undefined, "an unsupported observer refuses every revalidation");
+});
+
+test("pane observer latches a disturbed observation boundary through the hook, sticky after restore", () => {
+  const sink = new GuardSink();
+  const setup = armedSetup(sink);
+  const facts = armedFacts(sink.armCalls[0]!.facts);
+  // Replace the surface resolution, invoke the original hooked list while the
+  // replacement exists, then restore: the boundary disturbance must stay
+  // latched even though every later read sees the restored method.
+  const originalSurface = setup.fakes.FakeInstanceManager.prototype.surface;
+  try {
+    Object.defineProperty(setup.fakes.FakeInstanceManager.prototype, "surface", {
+      value: function foreignSurface(): unknown { return null; },
+      writable: true, enumerable: false, configurable: true,
+    });
+    setup.manager.list(); // the hooked boundary observes the disturbed scope
+  } finally {
+    Object.defineProperty(setup.fakes.FakeInstanceManager.prototype, "surface", {
+      value: originalSurface, writable: true, enumerable: false, configurable: true,
+    });
+  }
+  assert.equal(setup.observer.revalidateScope(facts), undefined,
+    "a boundary disturbance observed through the hook stays refused after restore");
+  assert.equal(setup.observer.snapshot(GUARD_ARM_NONCE).scope, false,
+    "the disturbed scope is sticky unknown on a later pass");
+});
+
+test("pane observer revalidateScope refuses a disturbed pane mode resolution", () => {
+  // Replaced inputModes on the shared surface prototype after arming.
+  const driftSink = new GuardSink();
+  const driftSetup = armedSetup(driftSink);
+  const originalInputModes = FakeSurface.prototype.inputModes;
+  try {
+    FakeSurface.prototype.inputModes = function replacedInputModes(): unknown {
+      return modesWith("any", "sgr");
+    };
+    assert.equal(driftSetup.observer.revalidateScope(armedFacts(driftSink.armCalls[0]!.facts)), undefined,
+      "a replaced inputModes resolution is refused, never bypassed through a saved original");
+  } finally {
+    FakeSurface.prototype.inputModes = originalInputModes;
+  }
+
+  // Own inputModes shadow on the armed surface.
+  const shadowSink = new GuardSink();
+  const shadowSetup = armedSetup(shadowSink);
+  const shadowSurface = shadowSetup.manager.surfaces.A as object;
+  Object.defineProperty(shadowSurface, "inputModes", {
+    value: () => modesWith("any", "sgr"), configurable: true, writable: true,
+  });
+  assert.equal(shadowSetup.observer.revalidateScope(armedFacts(shadowSink.armCalls[0]!.facts)), undefined,
+    "an own inputModes shadow on the armed surface is refused");
+  delete (shadowSurface as Record<string, unknown>).inputModes;
+
+  // Drifted immediate prototype of the armed surface.
+  const protoSink = new GuardSink();
+  const protoSetup = armedSetup(protoSink);
+  const protoSurface = protoSetup.manager.surfaces.A as object;
+  Object.setPrototypeOf(protoSurface, Object.create(FakeSurface.prototype));
+  assert.equal(protoSetup.observer.revalidateScope(armedFacts(protoSink.armCalls[0]!.facts)), undefined,
+    "a drifted surface prototype is refused");
+  Object.setPrototypeOf(protoSurface, FakeSurface.prototype);
 });

@@ -68,7 +68,23 @@ import {
   formatMainCensusDiagnostic,
   validateMainModeCensusReply,
   type MainModeCensusSnapshot,
+  type MainNativeBindingSnapshot,
 } from "./session-host-windows-stdout-census-contract";
+import {
+  NATIVE_CENSUS_REPLY_FILENAME,
+  NATIVE_CENSUS_REQUEST_FILENAME,
+  NATIVE_CENSUS_SCHEMA_VERSION,
+  formatNativeCensusDiagnostic,
+  validateNativeCensusCorrelation,
+  type NativeStdoutCensusSnapshot,
+} from "./session-host-windows-native-stdout-census-contract";
+import {
+  GUARD_REPLY_FILENAME,
+  GUARD_REQUEST_FILENAME,
+  NATIVE_EXCHANGE_GUARD_SCHEMA_VERSION,
+  validateNativeExchangeGuardCorrelation,
+  type NativeExchangeGuardSnapshot,
+} from "./session-host-windows-native-exchange-guard-contract";
 
 export {
   assertNativeEditorFieldEmpty,
@@ -105,9 +121,28 @@ const CREDENTIAL_NAME = /(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|PASSWORD)/i;
 const MAX_JOURNAL_BYTES = 4 * 1024 * 1024;
 const MAX_WITNESS_BYTES = 1024;
 const MAX_CENSUS_REPLY_BYTES = 4 * 1024;
+const MAX_NATIVE_CENSUS_REPLY_BYTES = 4 * 1024;
 const CENSUS_REQUEST_FILENAME = "main-census-request.json";
 const CENSUS_REPLY_FILENAME = "main-census-reply.json";
+const NATIVE_CENSUS_PRELOAD_FIXTURE = join(process.cwd(), "tests", "fixtures", "session-host-windows-native-stdout-census-preload.cjs");
 const MAX_DIRECTORY_CHAIN_DEPTH = 32;
+
+/** Bounded --require clause for the test-only native census preload fixture. */
+function nativeCensusPreloadRequire(): string {
+  const fixture = realpathSync(NATIVE_CENSUS_PRELOAD_FIXTURE);
+  return `--require="${fixture.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+/**
+ * Test-only native census preload prepended BEFORE the inherited original
+ * NODE_OPTIONS (original bytes/order preserved exactly). After
+ * prepareNativeLaunch prepends the production bootstrap preload, the load
+ * order is real bootstrap -> test observer -> original user preloads.
+ */
+function nativeCensusNodeOptions(): string {
+  const original = process.env.NODE_OPTIONS;
+  return original === undefined ? nativeCensusPreloadRequire() : `${nativeCensusPreloadRequire()} ${original}`;
+}
 
 interface DirectoryChainEntry {
   readonly path: string;
@@ -130,6 +165,20 @@ function captureDirectoryChainIdentity(root: string): DirectoryChainEntry[] {
     current = parent;
   }
   return chain;
+}
+
+/**
+ * The retained child directory must still be the same real directory: a
+ * replaced or removed per-PID census directory invalidates the exchange.
+ */
+function childDirectoryIdentityUnchanged(childDir: string, expected: FileIdentity): boolean {
+  let stats: BigIntStats;
+  try {
+    stats = lstatSync(childDir, { bigint: true });
+  } catch {
+    return false;
+  }
+  return stats.isDirectory() && !stats.isSymbolicLink() && sameFileIdentity(stats, expected);
 }
 
 function directoryChainIdentityUnchanged(chain: DirectoryChainEntry[]): boolean {
@@ -767,6 +816,8 @@ export class WindowsMainPtyDriver {
   private readonly modeWitnesses = new ModeWitnessLedger();
   /** Fresh numeric-only Main mode-request census taken before pre-Quit (diagnosis only). */
   private mainCensus?: MainModeCensusSnapshot;
+  /** Fresh numeric-only native-child original-stdout census correlated to the actual owner (diagnosis only). */
+  private nativeCensus?: NativeStdoutCensusSnapshot;
   /** The positively admitted original Main PID, bound at first welcome-frame admission. */
   private readonly mainPidBinding = new OriginalMainPidBinding();
   private readonly censusRootChain: DirectoryChainEntry[];
@@ -893,7 +944,8 @@ export class WindowsMainPtyDriver {
       PRG_FIXTURE_AGENT_DIR: options.runtime.agentDir,
       PRG_FIXTURE_STATE_DIR: options.fixtureState,
       PRG_FIXTURE_NO_AUTO_MODEL: "1",
-      ...(process.env.NODE_OPTIONS === undefined ? {} : { NODE_OPTIONS: process.env.NODE_OPTIONS }),
+      PRG_SESSION_HOST_NATIVE_CENSUS_ROOT: options.root,
+      NODE_OPTIONS: nativeCensusNodeOptions(),
     };
     assertNoRoleOrCatalogMarkers(nativeEnv);
     assert.deepEqual(Object.keys(nativeEnv).filter((name) => CREDENTIAL_NAME.test(name)), [],
@@ -1471,7 +1523,345 @@ export class WindowsMainPtyDriver {
     return snapshot;
   }
 
+  /**
+   * One fresh bounded original-Main-origin native exchange guard reply through
+   * the fixed known exclusive leaves in the existing fixture root, for use
+   * after the fresh native census receipt and before accepting the native
+   * counts. The parent writes one exclusive 0600 request bound to a fresh
+   * nonce, the retained admitted original Main PID, the initial arm (Main
+   * census) nonce, and the expected original native PID; the runner's armed
+   * guard serves at most one reply only while its private armed binding and
+   * the fresh current actual scope (owner, focus, live row, session tuple,
+   * module identity, self PID, geometry) are all intact. The reply is read
+   * through a readonly descriptor with BigInt regular-file, identity, and
+   * bounded-size checks plus bounded reads and a post-read path check; the
+   * fixture root chain is revalidated during the exchange. A missing,
+   * replaced, or uncertain reply fails closed under the existing bounded
+   * ChangeSignal/deadline mechanics — never a caption or boolean
+   * self-declaration fallback. The raw session id, bootstrap tuple, token,
+   * socket path, and instance identity never appear in the request or reply;
+   * only the opaque expected proof plus the bounded numeric originals are
+   * published.
+   */
+  private async requestNativeExchangeGuard(expected: {
+    readonly ptyPid: number;
+    readonly proofNonce: string;
+    readonly binding: MainNativeBindingSnapshot;
+  }): Promise<NativeExchangeGuardSnapshot> {
+    const expectedMainPid = this.mainPidBinding.request(this.pty.pid, this.exitEvent !== undefined);
+    if (!directoryChainIdentityUnchanged(this.censusRootChain)) {
+      throw new Error("fresh native exchange guard original root chain identity changed");
+    }
+    const nonce = randomNonce();
+    writeOwnedFile(join(this.root, GUARD_REQUEST_FILENAME), JSON.stringify({
+      schemaVersion: NATIVE_EXCHANGE_GUARD_SCHEMA_VERSION,
+      nonce,
+      expectedMainPid,
+      proofNonce: expected.proofNonce,
+      expectedOriginalNativePID: expected.ptyPid,
+    }));
+    const replyPath = join(this.root, GUARD_REPLY_FILENAME);
+    let replyIdentity: FileIdentity | undefined;
+    let result: NativeExchangeGuardSnapshot | undefined;
+    await this.journalSignal.waitFor(() => {
+      if (!directoryChainIdentityUnchanged(this.censusRootChain)) {
+        throw new Error("fresh native exchange guard root chain identity changed during the exchange");
+      }
+      let preStats: BigIntStats;
+      try {
+        preStats = lstatSync(replyPath, { bigint: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+      if (!preStats.isFile() || preStats.isSymbolicLink() || preStats.dev <= 0n || preStats.ino <= 0n
+        || preStats.size > BigInt(MAX_CENSUS_REPLY_BYTES)) {
+        return false;
+      }
+      if (replyIdentity === undefined) replyIdentity = { dev: preStats.dev, ino: preStats.ino };
+      else if (!sameFileIdentity(replyIdentity, { dev: preStats.dev, ino: preStats.ino })) {
+        throw new Error("fresh native exchange guard reply identity changed during retained observation");
+      }
+      let fd: number;
+      try {
+        fd = openSync(replyPath, "r");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+      let payload = "";
+      let observedSize = 0n;
+      try {
+        const stats = fstatSync(fd, { bigint: true });
+        if (!stats.isFile() || stats.dev !== preStats.dev || stats.ino !== preStats.ino
+          || stats.size > BigInt(MAX_CENSUS_REPLY_BYTES)) {
+          return false; // replaced or grew after the pre-stat
+        }
+        observedSize = stats.size;
+        const buffer = Buffer.alloc(Number(stats.size));
+        let offset = 0;
+        while (offset < buffer.length) {
+          const read = readSync(fd, buffer, offset, buffer.length - offset, offset);
+          if (read === 0) break; // partial publication cannot be accepted
+          offset += read;
+        }
+        if (offset !== buffer.length) return false;
+        const afterRead = fstatSync(fd, { bigint: true });
+        if (!afterRead.isFile() || afterRead.dev !== stats.dev || afterRead.ino !== stats.ino
+          || afterRead.size !== stats.size) {
+          return false;
+        }
+        payload = buffer.toString("utf8");
+      } finally {
+        try { closeSync(fd); } catch { /* exact owned descriptor */ }
+      }
+      let postStats: BigIntStats;
+      try {
+        postStats = lstatSync(replyPath, { bigint: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+      if (!postStats.isFile() || postStats.isSymbolicLink()
+        || postStats.dev !== preStats.dev || postStats.ino !== preStats.ino
+        || postStats.size !== observedSize) {
+        throw new Error("fresh native exchange guard reply path identity changed after the bounded read");
+      }
+      if (!directoryChainIdentityUnchanged(this.censusRootChain)) {
+        throw new Error("fresh native exchange guard root chain identity changed after the bounded read");
+      }
+      try {
+        result = validateNativeExchangeGuardCorrelation(JSON.parse(payload), {
+          nonce,
+          expectedMainPid,
+          proofNonce: expected.proofNonce,
+          expectedOriginalNativePID: expected.ptyPid,
+          binding: expected.binding,
+        });
+      } catch {
+        result = undefined; // one bounded write may be observed before its final bytes
+      }
+      return result !== undefined;
+    }, WINDOWS_EVENT_TIMEOUT_MS, "fresh original-Main native exchange guard reply");
+    return result!;
+  }
+
+  /**
+   * One fresh numeric-only native-child original-stdout census through the
+   * fixed exclusive per-native-PID leaves under the existing fixture root,
+   * for use immediately after the fresh Main census and before the strict
+   * pre-Quit assertions. The Main reply's actual-owner native binding must
+   * be complete: the parent cross-checks it against its own pending=>positive
+   * pty journal ledger (incarnation), admits the exact per-PID child directory
+   * against the retained root chain AND the retained child-directory identity,
+   * writes one exclusive 0600 request bound to a fresh nonce and the expected
+   * native PID, and reads exactly one reply through readonly descriptor/BigInt
+   * identity/bounded-size checks. The reply is correlated against the binding
+   * (session epoch and the identical opaque expected proof; the raw session id
+   * stays off the wire). At receipt the retained Main PID and the native
+   * child's exit state are revalidated so a stale correlation is refused,
+   * never certified. Diagnosis only: offered mode requests never prove
+   * negotiated or delivered terminal state, and a missing, replaced, or
+   * uncertain reply fails closed under the existing bounded
+   * ChangeSignal/deadline mechanics.
+   *
+   * Final original-Main-origin exchange guard: after the fresh native census
+   * receipt and before accepting the native counts, one fresh bounded guard
+   * reply (requestNativeExchangeGuard) proves that the genuine Main process
+   * revalidated its armed private binding and current actual scope. A refusal
+   * or timeout keeps the native counts uncertified — never a fallback.
+   */
+  async requestNativeStdoutCensus(): Promise<NativeStdoutCensusSnapshot> {
+    const main = this.mainCensus;
+    if (main === undefined) throw new Error("the fresh Main census must be requested before the native census");
+    const binding = main.nativeBinding;
+    if (binding.scope !== true || binding.complete !== true) {
+      throw new Error("the fresh Main census carries no complete actual-owner native binding");
+    }
+    const ptyPid = binding.ptyPid!;
+    const incarnation = binding.incarnation!;
+    // The initial arm nonce: the exact fresh Main census nonce under which the
+    // runner armed its single original-Main-origin exchange guard and computed
+    // the expected private proof. Captured once from the narrowed snapshot so
+    // the request/receipt/guard correlation stays strict across the exchange.
+    const armNonce = main.nonce;
+    // Cross-bind the incarnation from the original pending=>positive ledger.
+    const spawns = this.ptyRecords().filter((entry) => entry.type === "pty_spawn" && entry.pid === ptyPid);
+    if (spawns.length !== 1 || spawns[0]!.incarnation !== incarnation) {
+      throw new Error("the native binding incarnation does not cross-bind to the original PTY ledger");
+    }
+    if (this.ptyRecords().some((entry) => entry.type === "pty_exit" && entry.pid === ptyPid)) {
+      throw new Error("the bound native child already exited before the fresh native census");
+    }
+    // Admit the exact per-PID child directory against the retained root chain.
+    if (!directoryChainIdentityUnchanged(this.censusRootChain)) {
+      throw new Error("fresh native census original root chain identity changed");
+    }
+    const childDir = join(this.root, `native-${ptyPid}`);
+    let dirStats: BigIntStats;
+    try {
+      dirStats = lstatSync(childDir, { bigint: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new Error("the native child never created its exclusive census directory");
+      }
+      throw error;
+    }
+    if (!dirStats.isDirectory() || dirStats.isSymbolicLink() || dirStats.dev <= 0n || dirStats.ino <= 0n) {
+      throw new Error("the native census child path is not a regular directory with a positive BigInt identity");
+    }
+    // The child directory's own identity is retained and rechecked across the
+    // exchange: request write, bounded wait, and post-read.
+    const childDirIdentity: FileIdentity = { dev: dirStats.dev, ino: dirStats.ino };
+    const nonce = randomNonce();
+    if (!childDirectoryIdentityUnchanged(childDir, childDirIdentity)) {
+      throw new Error("fresh native census child directory identity changed before the request write");
+    }
+    writeOwnedFile(join(childDir, NATIVE_CENSUS_REQUEST_FILENAME), JSON.stringify({
+      schemaVersion: NATIVE_CENSUS_SCHEMA_VERSION,
+      nonce,
+      // The initial arm (Main census) nonce: the exact fresh nonce under which
+      // Main computed the expected private proof, so both sides HMAC the
+      // identical tuple and the guard exchange binds the same arm.
+      proofNonce: armNonce,
+      expectedNativePid: ptyPid,
+    }));
+    const replyPath = join(childDir, NATIVE_CENSUS_REPLY_FILENAME);
+    let replyIdentity: FileIdentity | undefined;
+    let result: NativeStdoutCensusSnapshot | undefined;
+    let watchFailed = false;
+    const signal = new ChangeSignal();
+    const watcher = watch(childDir);
+    watcher.on("change", () => signal.notify());
+    watcher.on("rename", () => signal.notify());
+    watcher.on("error", () => {
+      watchFailed = true; // diagnostic refusal; the owned watcher closes in finally
+      signal.notify();
+    });
+    try {
+      await signal.waitFor(() => {
+        if (watchFailed) throw new Error("the native census child directory watch failed");
+        if (!directoryChainIdentityUnchanged(this.censusRootChain)) {
+          throw new Error("fresh native census root chain identity changed during the exchange");
+        }
+        if (!childDirectoryIdentityUnchanged(childDir, childDirIdentity)) {
+          throw new Error("fresh native census child directory identity changed during the exchange");
+        }
+        let preStats: BigIntStats;
+        try {
+          preStats = lstatSync(replyPath, { bigint: true });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+          throw error;
+        }
+        if (!preStats.isFile() || preStats.isSymbolicLink() || preStats.dev <= 0n || preStats.ino <= 0n
+          || preStats.size > BigInt(MAX_NATIVE_CENSUS_REPLY_BYTES)) {
+          return false;
+        }
+        if (replyIdentity === undefined) replyIdentity = { dev: preStats.dev, ino: preStats.ino };
+        else if (!sameFileIdentity(replyIdentity, { dev: preStats.dev, ino: preStats.ino })) {
+          throw new Error("fresh native census reply identity changed during retained observation");
+        }
+        let fd: number;
+        try {
+          fd = openSync(replyPath, "r");
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+          throw error;
+        }
+        let payload = "";
+        let observedSize = 0n;
+        try {
+          const stats = fstatSync(fd, { bigint: true });
+          if (!stats.isFile() || stats.dev !== preStats.dev || stats.ino !== preStats.ino
+            || stats.size > BigInt(MAX_NATIVE_CENSUS_REPLY_BYTES)) {
+            return false; // replaced or grew after the pre-stat
+          }
+          observedSize = stats.size;
+          const buffer = Buffer.alloc(Number(stats.size));
+          let offset = 0;
+          while (offset < buffer.length) {
+            const read = readSync(fd, buffer, offset, buffer.length - offset, offset);
+            if (read === 0) break; // partial publication cannot be accepted
+            offset += read;
+          }
+          if (offset !== buffer.length) return false;
+          // Post-read descriptor validation: growth after the initial fstat can
+          // leave a valid JSON prefix that is not the complete file.
+          const afterRead = fstatSync(fd, { bigint: true });
+          if (!afterRead.isFile() || afterRead.dev !== stats.dev || afterRead.ino !== stats.ino
+            || afterRead.size !== stats.size) {
+            return false;
+          }
+          payload = buffer.toString("utf8");
+        } finally {
+          try { closeSync(fd); } catch { /* exact owned descriptor */ }
+        }
+        let postStats: BigIntStats;
+        try {
+          postStats = lstatSync(replyPath, { bigint: true });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+          throw error;
+        }
+        if (!postStats.isFile() || postStats.isSymbolicLink()
+          || postStats.dev !== preStats.dev || postStats.ino !== preStats.ino
+          || postStats.size !== observedSize) {
+          throw new Error("fresh native census reply path identity changed after the bounded read");
+        }
+        if (!directoryChainIdentityUnchanged(this.censusRootChain)) {
+          throw new Error("fresh native census root chain identity changed after the bounded read");
+        }
+        if (!childDirectoryIdentityUnchanged(childDir, childDirIdentity)) {
+          throw new Error("fresh native census child directory identity changed after the bounded read");
+        }
+        try {
+          result = validateNativeCensusCorrelation(JSON.parse(payload), { nonce, expectedNativePid: ptyPid, binding });
+        } catch {
+          result = undefined; // one bounded write may be observed before its final bytes
+        }
+        return result !== undefined;
+      }, WINDOWS_EVENT_TIMEOUT_MS, "fresh native stdout census reply");
+    } finally {
+      try { watcher.close(); } catch { /* exact owned child-directory watch */ }
+    }
+    // Final original-Main-origin exchange guard: one fresh bounded reply from
+    // the genuine Main process revalidating its armed private binding (owner,
+    // current native session tuple, original native PID/incarnation, consumed
+    // bootstrap) and its current actual scope (focus, live row, surface,
+    // module identity, self PID, geometry). The reply is correlated against
+    // the Main census binding (identical opaque expected proof). A refusal or
+    // timeout keeps the native counts uncertified — never a fallback.
+    await this.requestNativeExchangeGuard({ ptyPid, proofNonce: armNonce, binding });
+    // Receipt-time revalidation: the retained Main PID must still be the live
+    // original Main (no drift, no exit) and the bound native child must not
+    // have exited during the asynchronous exchange. A stale correlation is
+    // refused, never certified.
+    this.mainPidBinding.request(this.pty.pid, this.exitEvent !== undefined);
+    if (this.ptyRecords().some((entry) => entry.type === "pty_exit" && entry.pid === ptyPid)) {
+      throw new Error("the bound native child exited during the fresh native census exchange");
+    }
+    const receiptSpawns = this.ptyRecords().filter((entry) => entry.type === "pty_spawn" && entry.pid === ptyPid);
+    if (receiptSpawns.length !== 1 || receiptSpawns[0]!.incarnation !== incarnation) {
+      throw new Error("the native binding incarnation no longer cross-binds to the original PTY ledger");
+    }
+    this.nativeCensus = result!;
+    return result!;
+  }
+
   async assertBeforeQuitModes(): Promise<void> {
+    // TESTONLY native-child original-stdout census (diagnosis only): one
+    // fresh correlated request through the exact per-PID child leaves,
+    // attempted only when the fresh Main census carries a complete
+    // actual-owner native binding. An unavailable channel never changes the
+    // genuine pre-Quit mode assertions below and never fabricates a reply.
+    if (this.nativeCensus === undefined && this.mainCensus !== undefined) {
+      try {
+        await this.requestNativeStdoutCensus();
+      } catch {
+        // diagnostic-only: an unavailable channel preserves existing behavior
+      }
+    }
     await this.surface.flush();
     // flush() completed the parse queue, so this read is the genuine
     // post-parse state of the same real outer terminal. Recording it here keeps
@@ -1490,7 +1880,7 @@ export class WindowsMainPtyDriver {
     // alternate-screen entry itself is the missing observation.
     const diagnostic = this.sawAlternateEnter && bracketedPasteObserved && mouseTrackingSgrObserved && nonBaselineKeyboardObserved
       ? ""
-      : ` (${this.modeWitnessDiagnostic()}${this.mainCensus === undefined ? "" : ` ${formatMainCensusDiagnostic(this.mainCensus)}`})`;
+      : ` (${this.modeWitnessDiagnostic()}${this.mainCensus === undefined ? "" : ` ${formatMainCensusDiagnostic(this.mainCensus)}`}${this.nativeCensus === undefined ? "" : ` ${formatNativeCensusDiagnostic(this.nativeCensus)}`})`;
     assert.ok(this.sawAlternateEnter, `actual Main output entered the outer VT alternate buffer${diagnostic}`);
     assert.ok(bracketedPasteObserved, `actual outer VT observed Main bracketed-paste negotiation${diagnostic}`);
     assert.ok(mouseTrackingSgrObserved,

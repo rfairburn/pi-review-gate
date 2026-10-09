@@ -54,6 +54,14 @@
  * degrades the channel and closes the owned watcher exactly once. All fs
  * operations are injected so pure tests can drive the service with fake IO;
  * no scanning, cleanup, retry, or polling occurs.
+ *
+ * TESTONLY extension points (defaults preserve the exact Main behavior):
+ * `options.requestFilename` / `options.replyFilename` may name different fixed
+ * bounded leaf names, `options.isRequestPayload` may supply a different strict
+ * request validator, and `options.buildReply(nonce, pid, snapshot)` may build
+ * a different reply shape. `buildSnapshot` additionally receives the fresh
+ * request nonce as its first argument and the validated request payload as
+ * its second (existing callers ignore both).
  */
 
 const path = require('node:path');
@@ -349,7 +357,17 @@ function buildCensusReply(nonce, mainPidValue, snapshot) {
  * exclusive reply leaf bound to the payload nonce and the genuine Main PID.
  * Missing, malformed, oversized, replayed, wrong-PID, changed-root/ancestor,
  * or partially published requests are honest refusals: no reply is written.
+ *
+ * TESTONLY extensions (defaults preserve the exact Main behavior):
+ * - `closeAfterServe: true` closes the owned watcher exactly once after the
+ *   single served publication (success or terminal failed write); the default
+ *   leaves closure to the runner's finally path;
+ * - a provided `rootChain` (captured by the caller BEFORE intervening work)
+ *   is validated unchanged at start instead of re-baselining; without it the
+ *   chain is captured fresh at start (the existing Main default).
  */
+const CENSUS_LEAF_NAME = /^[A-Za-z0-9._-]{1,128}$/;
+
 function createCensusReplyService(options) {
   if (!options || typeof options !== 'object') throw new TypeError('census reply service requires options');
   if (typeof options.root !== 'string' || options.root.length === 0) throw new TypeError('census reply service requires a root directory');
@@ -362,6 +380,22 @@ function createCensusReplyService(options) {
   const maxRequestBytes = options.maxRequestBytes === undefined ? DEFAULT_MAX_REQUEST_BYTES : options.maxRequestBytes;
   if (!Number.isSafeInteger(maxRequestBytes) || maxRequestBytes < 1) throw new RangeError('census maxRequestBytes must be a positive safe integer');
   const mainPid = typeof options.mainPid === 'function' ? options.mainPid : () => options.mainPid;
+  // TESTONLY extension points: fixed known leaf names, a strict request
+  // validator, and the reply builder. Defaults are the exact Main census
+  // leaves/validator/reply, so existing behavior is unchanged.
+  const requestFilename = options.requestFilename === undefined ? CENSUS_REQUEST_FILENAME : options.requestFilename;
+  const replyFilename = options.replyFilename === undefined ? CENSUS_REPLY_FILENAME : options.replyFilename;
+  if (typeof requestFilename !== 'string' || !CENSUS_LEAF_NAME.test(requestFilename)) {
+    throw new TypeError('census reply service requestFilename must be a bounded plain leaf name');
+  }
+  if (typeof replyFilename !== 'string' || !CENSUS_LEAF_NAME.test(replyFilename)) {
+    throw new TypeError('census reply service replyFilename must be a bounded plain leaf name');
+  }
+  const isRequestPayload = options.isRequestPayload === undefined ? isCensusRequestPayload : options.isRequestPayload;
+  if (typeof isRequestPayload !== 'function') throw new TypeError('census reply service isRequestPayload must be a function');
+  const buildReply = options.buildReply === undefined ? buildCensusReply : options.buildReply;
+  if (typeof buildReply !== 'function') throw new TypeError('census reply service buildReply must be a function');
+  const closeAfterServe = options.closeAfterServe === true;
 
   const root = options.root;
   let watcher;
@@ -410,7 +444,31 @@ function createCensusReplyService(options) {
   function start() {
     if (started) throw new Error('census reply service is already started');
     started = true;
-    rootChain = captureChain();
+    if (options.rootChain !== undefined) {
+      // A supplied chain replaces the normal root capture, so it must begin
+      // at the channel root itself; a chain that omits it would leave the
+      // watched directory unvalidated.
+      if (!Array.isArray(options.rootChain) || options.rootChain.length === 0
+        || options.rootChain[0].path !== root) {
+        throw new Error('the retained census chain must include its channel root');
+      }
+      // A caller-captured chain is validated unchanged, never re-baselined.
+      for (const entry of options.rootChain) {
+        let stats;
+        try {
+          stats = fs.lstatSync(entry.path, { bigint: true });
+        } catch {
+          throw new Error('the census reply channel root changed before start');
+        }
+        if (!stats.isDirectory() || stats.isSymbolicLink()
+          || stats.dev !== entry.dev || stats.ino !== entry.ino) {
+          throw new Error('the census reply channel root changed before start');
+        }
+      }
+      rootChain = options.rootChain;
+    } else {
+      rootChain = captureChain();
+    }
     try {
       watcher = fs.watch(root);
       watcher.on('change', onEvent);
@@ -432,9 +490,9 @@ function createCensusReplyService(options) {
   }
 
   function handleEvent(filename) {
-    if (filename !== CENSUS_REQUEST_FILENAME) return; // fixed known leaf only; nonce-shaped strangers are ignored
+    if (filename !== requestFilename) return; // fixed known leaf only; nonce-shaped strangers are ignored
     if (!chainUnchanged()) return; // changed root or ancestor: refusal
-    const requestPath = path.join(root, CENSUS_REQUEST_FILENAME);
+    const requestPath = path.join(root, requestFilename);
     let preStats;
     try {
       preStats = fs.lstatSync(requestPath, { bigint: true });
@@ -483,22 +541,28 @@ function createCensusReplyService(options) {
       } catch {
         return;
       }
-      if (!isCensusRequestPayload(payload)) return;
-      if (payload.expectedMainPid !== mainPid()) return; // wrong PID: refusal
+      if (!isRequestPayload(payload)) return;
+      if (payload.expectedMainPid !== mainPid() && payload.expectedNativePid !== mainPid()) return; // wrong PID: refusal
       servedNonce = payload.nonce;
-      writeReply(payload.nonce);
+      try {
+        writeReply(payload.nonce, payload);
+      } finally {
+        if (closeAfterServe) close(); // exact single-reply closure: success or terminal failed publication
+      }
     } finally {
       try { fs.closeSync(fd); } catch { /* exact owned descriptor */ }
     }
   }
 
-  function writeReply(nonce) {
+  function writeReply(nonce, requestPayload) {
     if (!chainUnchanged()) return; // root/ancestor stability after request reading
     // Build and serialize BEFORE opening the exclusive reply: a failed
-    // snapshot build leaves no reply leaf behind.
-    const payload = `${JSON.stringify(buildCensusReply(nonce, mainPid(), options.buildSnapshot()))}\n`;
+    // snapshot build leaves no reply leaf behind. The fresh request nonce and
+    // the validated request payload are passed to the snapshot builder
+    // (TESTONLY extension points).
+    const payload = `${JSON.stringify(buildReply(nonce, mainPid(), options.buildSnapshot(nonce, requestPayload)))}\n`;
     if (!chainUnchanged()) return; // rechecked after snapshot construction, right before the exclusive open
-    const fd = fs.openSync(path.join(root, CENSUS_REPLY_FILENAME), 'wx', 0o600);
+    const fd = fs.openSync(path.join(root, replyFilename), 'wx', 0o600);
     try {
       fs.writeSync(fd, payload);
     } finally {

@@ -132,13 +132,15 @@ function rootChainUnchanged(chain, fsLike) {
 }
 
 /**
- * Own DATA descriptor read that refuses proxies before any descriptor
- * operation and returns undefined for accessors, absence, and unreadable
- * targets. No trap or accessor can run through this path.
+ * Own DATA descriptor read that accepts non-null objects OR functions (the
+ * genuine reporter module exports a callable), refuses proxies before any
+ * descriptor operation, and returns undefined for accessors, absence, and
+ * unreadable targets. No trap or accessor can run through this path, and the
+ * target is never invoked.
  */
 function ownDataDescriptor(target, key) {
   try {
-    if (target === null || typeof target !== 'object' || types.isProxy(target)) return undefined;
+    if (target === null || (typeof target !== 'object' && typeof target !== 'function') || types.isProxy(target)) return undefined;
     const descriptor = Object.getOwnPropertyDescriptor(target, key);
     return descriptor !== undefined && Object.hasOwn(descriptor, 'value') ? descriptor : undefined;
   } catch {

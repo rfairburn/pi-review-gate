@@ -502,6 +502,7 @@ function makeActivation(options: {
   readonly envOverrides?: Record<string, string | undefined>;
   readonly fake?: ReturnType<typeof makeFakeFs>;
   readonly onExit?: (handler: () => void) => void;
+  readonly reporter?: unknown;
 } = {}) {
   const fake = options.fake ?? makeFakeFs();
   fake.addDir("/");
@@ -528,9 +529,9 @@ function makeActivation(options: {
   const globalScope: Record<symbol, unknown> = {};
   Object.defineProperty(globalScope, STICKY_KEY, { value: options.sticky === undefined ? primedSticky() : options.sticky, writable: true, configurable: true });
 
-  const requireModule = (request: string): Record<string, unknown> => {
+  const requireModule = (request: string): unknown => {
     if (request.endsWith("protocol.js")) return fakeProtocol;
-    return fakeReporter;
+    return options.reporter === undefined ? fakeReporter : options.reporter;
   };
 
   const result = preloadFixture.activateNativeCensusPreload({
@@ -725,6 +726,71 @@ test("preload activation is inert for every unsupported gate", () => {
   const existing = makeActivation({ preexistingChildDir: true });
   assert.equal(existing.result.installed, false, "a pre-existing child directory is refused, never reused");
   assert.equal(existing.stdout.write, existing.originalWrite, "the census hook is restored on refusal");
+});
+
+test("a genuine function-shaped reporter export admits activation and serves one correlated reply", () => {
+  // The real compiled reporter exports a CALLABLE (module.exports = activate)
+  // with the sticky key assigned as an own data property; admission must not
+  // refuse that shape before native activation.
+  let reporterCalls = 0;
+  const callableReporter = Object.assign(
+    function syntheticActivate(): void { reporterCalls += 1; },
+    { SESSION_HOST_STICKY_STATE_KEY: STICKY_KEY });
+  const made = makeActivation({ reporter: callableReporter });
+  assert.equal(made.result.installed, true, "the genuine callable reporter export admits native census activation");
+
+  // One fresh correlated reply through the existing fake root/stdout and the
+  // current sticky consumed-bootstrap tuple.
+  (made.stdout.write as (data: unknown) => unknown).call(made.stdout, Buffer.from("\x1b[?1049h"));
+  Object.defineProperty(made.globalScope, STICKY_KEY, { value: authenticatedSticky(), writable: true, configurable: true });
+  const requestPath = "/tmp/fake-native-root/native-4243/native-census-request.json";
+  made.fake.files.set(requestPath, { content: JSON.stringify({ schemaVersion: NATIVE_CENSUS_SCHEMA_VERSION, nonce: NONCE, proofNonce: PROOF_NONCE, expectedNativePid: 4243 }), dev: 1n, ino: 400n });
+  made.fake.fire("change", NATIVE_CENSUS_REQUEST_FILENAME);
+  const reply = JSON.parse(made.fake.files.get("/tmp/fake-native-root/native-4243/native-census-reply.json")!.content) as Record<string, unknown>;
+  const validated = validateNativeCensusReply(reply, { nonce: NONCE, expectedNativePid: 4243 });
+  assert.ok(validated !== undefined, "the served reply validates under the parent contract");
+  assert.equal(validated!.bindingScope, true);
+  assert.equal(validated!.sessionEpoch, 1);
+  const expectedProof = nativeFixture.computeNativeCensusProof({
+    bootstrap: BOOTSTRAP, sessionId: RAW_SESSION_ID, sessionEpoch: 1, nonce: PROOF_NONCE, pid: 4243,
+  });
+  assert.equal(validated!.proof, expectedProof, "the fresh private proof matches the shared-tuple HMAC under the Main census nonce");
+  assert.ok(expectedProof !== undefined, "the supported fixture tuple computes its expected proof");
+  assert.ok(validateNativeCensusCorrelation(reply, {
+    nonce: NONCE,
+    expectedNativePid: 4243,
+    binding: { scope: true, complete: true, ptyPid: 4243, incarnation: 1, sessionEpoch: 1, expectedProof },
+  }) !== undefined, "the callable-export reply correlates against the Main binding contract");
+  assert.equal(validated!.observationComplete, true);
+  assert.equal(validated!.alternateBufferSet, 1, "the retained stream observation remains complete");
+  assert.equal(reporterCalls, 0, "descriptor admission never invokes the reporter function");
+  assert.equal(made.fake.closedCount(), 1, "the served reply closes its owned watcher exactly once");
+});
+
+test("a callable proxy reporter is refused before any descriptor trap and an accessor sticky key is never invoked", () => {
+  // A proxy wrapping a function-shaped reporter is refused BEFORE any
+  // descriptor operation runs (no get/apply/getOwnPropertyDescriptor trap).
+  let trapCalls = 0;
+  const proxyReporter = new Proxy(function syntheticActivate(): void { /* never invoked */ }, {
+    get() { trapCalls += 1; return undefined; },
+    getOwnPropertyDescriptor() { trapCalls += 1; return undefined; },
+    apply() { trapCalls += 1; return undefined; },
+  });
+  const proxied = makeActivation({ reporter: proxyReporter });
+  assert.equal(proxied.result.installed, false, "a callable proxy reporter stays inert");
+  assert.equal(trapCalls, 0, "no proxy trap runs during reporter admission");
+
+  // A function-shaped reporter whose sticky key is an ACCESSOR is refused
+  // without invoking the getter.
+  let getterCalls = 0;
+  const accessorReporter = function syntheticActivate(): void { /* never invoked */ };
+  Object.defineProperty(accessorReporter, "SESSION_HOST_STICKY_STATE_KEY", {
+    get: () => { getterCalls += 1; return STICKY_KEY; },
+    configurable: true,
+  });
+  const accessor = makeActivation({ reporter: accessorReporter });
+  assert.equal(accessor.result.installed, false, "a function-shaped accessor sticky key stays inert");
+  assert.equal(getterCalls, 0, "the sticky-key getter is never invoked");
 });
 
 test("preload root chain capture and revalidation are exact", () => {

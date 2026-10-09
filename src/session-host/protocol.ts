@@ -115,6 +115,17 @@ export interface SessionHostStatus {
   backgroundTasks?: number | null;
   /** Owned background shell jobs whose actual settlement is not yet confirmed. */
   backgroundShells?: number | null;
+  /**
+   * Optional bounded activity-intent counts, independent of ownership.
+   * `activeTasks` counts admitted/queued or actively running/reviewing/landing
+   * logical work (including accepted continuations) plus in-flight force-merge
+   * operations; a stopped
+   * task that retains cleanup artifacts reads zero here. Absent (older
+   * reporter), null, or any invalid value means UNKNOWN (null), never zero.
+   */
+  activeTasks?: number | null;
+  /** Started/running owned background shell work; a retained cleanup-only job reads zero. */
+  activeShells?: number | null;
 }
 
 /** Bounded native conversation identity and canonical display title. */
@@ -336,6 +347,14 @@ export function parseStatus(value: unknown): SessionHostStatus | undefined {
   if (Object.prototype.hasOwnProperty.call(value, "backgroundShells")) {
     backgroundShells = parseOwnedCount(value.backgroundShells);
   }
+  let activeTasks: number | null | undefined;
+  if (Object.prototype.hasOwnProperty.call(value, "activeTasks")) {
+    activeTasks = parseOwnedCount(value.activeTasks);
+  }
+  let activeShells: number | null | undefined;
+  if (Object.prototype.hasOwnProperty.call(value, "activeShells")) {
+    activeShells = parseOwnedCount(value.activeShells);
+  }
   return {
     version: 1,
     type: "status",
@@ -348,6 +367,8 @@ export function parseStatus(value: unknown): SessionHostStatus | undefined {
     activity: [...(value.activity as string[])],
     ...(backgroundTasks === undefined ? {} : { backgroundTasks }),
     ...(backgroundShells === undefined ? {} : { backgroundShells }),
+    ...(activeTasks === undefined ? {} : { activeTasks }),
+    ...(activeShells === undefined ? {} : { activeShells }),
     ...(nativeSession === undefined ? {} : { nativeSession }),
   };
 }

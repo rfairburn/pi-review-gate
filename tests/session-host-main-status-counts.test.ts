@@ -47,9 +47,30 @@ test("Main's actual status adapter forwards known zero and positive background c
     f.callbacks.onStatus({ ...f.status, backgroundTasks: tasks, backgroundShells: shells });
     assert.deepEqual(f.updates.at(-1), {
       busy: false, pendingInput: false, inputSurface: false,
-      backgroundTasks: tasks, backgroundShells: shells, activity: ["Ready"],
+      backgroundTasks: tasks, backgroundShells: shells,
+      activeTasks: null, activeShells: null,
+      activity: ["Ready"],
     });
   }
+});
+
+test("Main's status adapter forwards activity intent independently and keeps missing intent unknown", () => {
+  const f = fixture();
+  // Ownership positive, activity positively zero: the display number is not the
+  // cleanup obligation.
+  f.callbacks.onStatus({ ...f.status, backgroundTasks: 1, backgroundShells: 0, activeTasks: 0, activeShells: 0 });
+  assert.equal(f.updates.at(-1)?.activeTasks, 0);
+  assert.equal(f.updates.at(-1)?.activeShells, 0);
+  assert.equal(f.updates.at(-1)?.backgroundTasks, 1);
+  // A null and a positive intent value both pass through unchanged.
+  f.callbacks.onStatus({ ...f.status, activeTasks: null, activeShells: 4 });
+  assert.equal(f.updates.at(-1)?.activeTasks, null);
+  assert.equal(f.updates.at(-1)?.activeShells, 4);
+  // An older reporter that omits the fields stays unknown, never a fallback to
+  // the ownership counts.
+  f.callbacks.onStatus({ ...f.status, backgroundTasks: 2, backgroundShells: 1 });
+  assert.equal(f.updates.at(-1)?.activeTasks, null, "absent intent is unknown, never the ownership count");
+  assert.equal(f.updates.at(-1)?.activeShells, null);
 });
 
 test("Main's actual status adapter preserves nullable and older missing counts as unknown, not zero", () => {

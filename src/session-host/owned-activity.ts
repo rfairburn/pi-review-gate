@@ -22,6 +22,24 @@
  * it; a token is released only when the underlying owned work is actually
  * settled. Readers (the reporter) subscribe for event-driven snapshots.
  *
+ * Two independent channels are published from the same incarnations:
+ *
+ * - the OWNERSHIP channel (`backgroundTasks` / `backgroundShells`) answers
+ *   "does this process still own unsettled background work?" It retains
+ *   tokens for cleanup/recovery anchors and is the conservative gate the
+ *   idle-stop confirmation and shutdown preflight must read;
+ * - the ACTIVITY-INTENT channel (`activeTasks` / `activeShells`) answers
+ *   "is background work admitted or running right now?" It is acquired when
+ *   work is admitted/starting and released as soon as the work is observed
+ *   stopped, independently of any retained ownership. It never fabricates a
+ *   cleanup obligation, and a settled stop releases it even while ownership
+ *   stays positive.
+ *
+ * The two channels have SEPARATE completeness flags: cleanup ownership
+ * uncertainty must not by itself keep activity positive or unknown once
+ * activity is positively known stopped, and a genuinely unobserved activity
+ * set stays unknown rather than being reported as zero.
+ *
  * Safety contract (fail closed):
  *
  * - The registry is INERT until the reporter opts in with a valid
@@ -64,6 +82,25 @@ import { randomUUID } from "node:crypto";
 /** The two independently tracked categories published on the status frame. */
 export type OwnedActivityCategory = "backgroundTasks" | "backgroundShells";
 
+/**
+ * The independent activity-intent snapshot. A positive value counts admitted
+ * or currently running work; null is UNKNOWN, never zero. This channel is
+ * separate from {@link OwnedActivitySnapshot}: a task that stopped but still
+ * owns cleanup artifacts reads zero here while its ownership count stays
+ * positive.
+ */
+export interface ActiveActivitySnapshot {
+  /**
+   * Logical execution tasks admitted/queued or actively capturing, running,
+   * reviewing, accepted, waiting to land, or landing, plus any in-flight
+   * force-merge. Accepted continuations count in their queued/active state;
+   * admission validation and cleanup-only anchors are not activity.
+   */
+  readonly activeTasks: number | null;
+  /** Owned background shell jobs whose process work is starting or running. */
+  readonly activeShells: number | null;
+}
+
 /** Bounded nullable counts; null always means UNKNOWN, never zero. */
 export interface OwnedActivitySnapshot {
   /**
@@ -99,6 +136,14 @@ export interface OwnedActivitySourceHandle {
   markUncertain(): void;
   /** Authoritative re-establishment for THIS incarnation only. */
   resolveUncertainty(): void;
+  /** Start reporting one positive activity-intent token (scoped to this incarnation). */
+  acquireIntent(token: string): void;
+  /** Stop reporting one activity-intent token (scoped to this incarnation). */
+  releaseIntent(token: string): void;
+  /** Sticky ACTIVITY-INTENT uncertainty for THIS incarnation only. */
+  markIntentUncertain(): void;
+  /** Authoritative activity-intent re-establishment for THIS incarnation only. */
+  resolveIntentUncertainty(): void;
   /** Supersede this incarnation explicitly (tokens stay owned). */
   retire(): void;
 }
@@ -110,6 +155,12 @@ export interface OwnedActivitySourceOptions {
    * authoritatively accounted for (for example work still being restored).
    */
   uncertain?: boolean;
+  /**
+   * Independent initial completeness state for the activity-intent channel.
+   * True while the source's admitted/running set is not yet authoritatively
+   * accounted for (for example during a restore).
+   */
+  intentUncertain?: boolean;
   /**
    * Re-acquire the tokens of still-unsettled work when this registration lands
    * after activity. It must never release tokens, because only an actual
@@ -143,6 +194,15 @@ interface SourceIncarnation {
   uncertain: boolean;
   /** True once a newer incarnation of the same source superseded this one. */
   retired: boolean;
+  /**
+   * Positive activity-intent tokens. Undefined only for a pre-intent global
+   * record written by an earlier code incarnation; such an incarnation's
+   * activity set was never observed and stays unknown (it never weakens the
+   * ownership channel).
+   */
+  intentTokens?: Set<string>;
+  /** Sticky activity-intent uncertainty; undefined for a pre-intent record. */
+  intentUncertain?: boolean;
 }
 
 interface RegistryState {
@@ -198,6 +258,12 @@ function isRegistryState(value: unknown): value is RegistryState {
           if (!isRecord(entry) || !isValidToken(entry.id) || !(entry.tokens instanceof Set)
             || typeof entry.uncertain !== "boolean" || typeof entry.retired !== "boolean"
             || !Number.isSafeInteger(entry.tokens.size) || entry.tokens.size < 0) return false;
+          // Old global records predate the activity-intent channel: their
+          // absence is accepted (activity unknown) so ownership stays usable.
+          if (entry.intentTokens !== undefined
+            && (!(entry.intentTokens instanceof Set)
+              || !Number.isSafeInteger(entry.intentTokens.size) || entry.intentTokens.size < 0)) return false;
+          if (entry.intentUncertain !== undefined && typeof entry.intentUncertain !== "boolean") return false;
         }
       }
     }
@@ -266,10 +332,20 @@ function installRegistration(
   }
   let entry = list.find((candidate) => candidate.id === handle.incarnation);
   if (!entry) {
-    entry = { id: handle.incarnation, tokens: new Set(), uncertain: options?.uncertain === true, retired: false };
+    entry = {
+      id: handle.incarnation,
+      tokens: new Set(),
+      uncertain: options?.uncertain === true,
+      retired: false,
+      intentTokens: new Set(),
+      intentUncertain: options?.intentUncertain === true,
+    };
     list.push(entry);
-  } else if (options?.uncertain === true) {
-    entry.uncertain = true;
+  } else {
+    if (options?.uncertain === true) entry.uncertain = true;
+    // Never fabricate intent data for a pre-intent entry: its activity set was
+    // never observed, so it stays unknown rather than becoming a known zero.
+    if (entry.intentTokens !== undefined && options?.intentUncertain === true) entry.intentUncertain = true;
   }
   // A newly installed incarnation supersedes every older one, but the
   // superseded incarnation's tokens AND uncertainty stay retained until that
@@ -313,6 +389,34 @@ function categoryCount(state: RegistryState | undefined, category: OwnedActivity
 }
 
 /**
+ * Independent activity-intent count. This deliberately does NOT consult the
+ * ownership channel's uncertainty: a retained cleanup obligation cannot keep
+ * activity unknown once every source's activity set is positively known. A
+ * pre-intent or activity-uncertain incarnation keeps its source unknown.
+ */
+function categoryIntentCount(state: RegistryState | undefined, category: OwnedActivityCategory): number | null {
+  if (!state || !state.active) return null;
+  const bySource = state.sources.get(category);
+  let total = 0;
+  for (const source of EXPECTED_SOURCES[category]) {
+    const list = bySource?.get(source);
+    if (!list || list.length === 0) return null; // source absent: unknown
+    let current: SourceIncarnation | undefined;
+    for (const entry of list) {
+      if (!entry.retired) current = entry;
+    }
+    if (!current) return null;
+    for (const entry of list) {
+      // A pre-intent incarnation and a sticky activity uncertainty both mean
+      // the source's admitted/running set was never authoritatively observed.
+      if (entry.intentTokens === undefined || entry.intentUncertain === true) return null;
+      total += entry.intentTokens.size;
+    }
+  }
+  return Number.isSafeInteger(total) && total >= 0 ? normalizeOwnedCount(total) : null;
+}
+
+/**
  * Opt this process into owned-activity observation. Called by the reporter only
  * after a valid authenticated bootstrap exists; idempotent across reloads.
  */
@@ -347,6 +451,17 @@ function createSourceHandle(
     if (!entry) return; // not installed: no observation
     if (mutate(state, entry)) notify(state);
   };
+  // Activity-intent mutations are scoped like ownership mutations, but a
+  // pre-intent entry has no activity data to mutate: it stays unknown.
+  const withIntentEntry = (
+    mutate: (state: RegistryState, entry: SourceIncarnation) => boolean,
+  ): void => {
+    const state = registryState(false);
+    if (!state || !state.active) return;
+    const entry = findIncarnation(state, category, source, incarnation);
+    if (!entry || entry.intentTokens === undefined) return;
+    if (mutate(state, entry)) notify(state);
+  };
   const handle: OwnedActivitySourceHandle = {
     category,
     source,
@@ -379,6 +494,33 @@ function createSourceHandle(
       withEntry((_state, entry) => {
         if (!entry.uncertain) return false;
         entry.uncertain = false;
+        return true;
+      });
+    },
+    acquireIntent(token: string): void {
+      if (!isValidToken(token)) return;
+      withIntentEntry((_state, entry) => {
+        const tokens = entry.intentTokens!;
+        if (tokens.has(token)) return false;
+        tokens.add(token);
+        return true;
+      });
+    },
+    releaseIntent(token: string): void {
+      if (!isValidToken(token)) return;
+      withIntentEntry((_state, entry) => entry.intentTokens!.delete(token));
+    },
+    markIntentUncertain(): void {
+      withIntentEntry((_state, entry) => {
+        if (entry.intentUncertain === true) return false;
+        entry.intentUncertain = true;
+        return true;
+      });
+    },
+    resolveIntentUncertainty(): void {
+      withIntentEntry((_state, entry) => {
+        if (entry.intentUncertain !== true) return false;
+        entry.intentUncertain = false;
         return true;
       });
     },
@@ -418,7 +560,9 @@ export function registerOwnedActivitySource(
       entry.handle.category === category && entry.handle.source === source);
     const registration: PendingRegistration = {
       handle,
-      options: { ...options, uncertain: true },
+      // Neither channel's pre-opt-in acquisitions were observed: both replay
+      // as uncertain until the source authoritatively resolves them.
+      options: { ...options, uncertain: true, intentUncertain: true },
     };
     if (existing >= 0) pendingRegistrations[existing] = registration;
     else pendingRegistrations.push(registration);
@@ -434,6 +578,18 @@ export function ownedActivitySnapshot(): OwnedActivitySnapshot {
   return {
     backgroundTasks: categoryCount(state, "backgroundTasks"),
     backgroundShells: categoryCount(state, "backgroundShells"),
+  };
+}
+
+/**
+ * Current bounded activity-intent counts, independent of ownership. Both are
+ * null until observation is active and the activity sets are complete.
+ */
+export function activeActivitySnapshot(): ActiveActivitySnapshot {
+  const state = registryState(false);
+  return {
+    activeTasks: categoryIntentCount(state, "backgroundTasks"),
+    activeShells: categoryIntentCount(state, "backgroundShells"),
   };
 }
 

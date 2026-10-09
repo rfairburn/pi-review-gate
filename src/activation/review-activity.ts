@@ -6,7 +6,10 @@
  * remains owned by review-turn.ts; this module only mirrors the authoritative
  * `reviewInProgress` lifecycle into the process-local owned-activity registry,
  * which stays inert (no IO, no observation) until the authenticated session
- * host reporter opts in.
+ * host reporter opts in. Each run mints the same token on BOTH channels: the
+ * review's ownership obligation and its activity intent begin and end together,
+ * so a running automatic review is displayed as active work and is released at
+ * settlement (success, failure, cancellation, or reset).
  *
  * A token is released only by the run that holds it. Session reset/restore and
  * a reloaded module copy therefore cannot release a newer incarnation's
@@ -38,6 +41,7 @@ export function beginOwnedReviewActivity(): string {
   const token = randomUUID();
   reviewOwners.set(token, reviewSourceHandle);
   reviewSourceHandle.acquire(token);
+  reviewSourceHandle.acquireIntent(token);
   return token;
 }
 
@@ -51,6 +55,7 @@ export function endOwnedReviewActivity(token: string | undefined): void {
   if (!owner) return;
   reviewOwners.delete(token);
   owner.release(token);
+  owner.releaseIntent(token);
 }
 
 /** Test seam: forget the module-copy handle (a fresh registration follows). */

@@ -271,8 +271,9 @@ Escape hides the sidebar. The reserved toggle is two-step: it shows and focuses 
 sidebar; from a visible Main focus one press only moves host input focus to the sidebar
 without hiding it or resizing any child; and a press from sidebar-owned focus hides it
 back to Main. A live row stops directly only with positively observed
-complete idleness, including zero background tasks and shells, and fresh authenticated
-idle revalidation. Otherwise it requires a separate, fully displayed confirmation for
+complete idleness on the conservative ownership channel — zero unsettled owned
+background tasks and shells, not merely the displayed activity-intent counts — and
+fresh authenticated idle revalidation. Otherwise it requires a separate, fully displayed confirmation for
 that frozen row; cancellation or a vanished target cannot stop a sibling. Removal waits
 for the exact owned process's exit, never merely a shutdown acknowledgement.
 Errored rows follow the same safeguards: an error badge grants neither exit nor force
@@ -329,9 +330,19 @@ need to keep that native chord.
 
 The sidebar is a bounded top-level summary: the observed native conversation name,
 busy/idle/unknown state, pending-input presence only when observed, and at most a couple
-of generic activity lines, with reporter-backed numeric background task/shell counts
-when available. Missing or uncertain count observations stay unknown, never inferred
-zero. Native names may use Pi's first-user-message fallback when
+of generic activity lines, with reporter-backed numeric background activity-task/shell
+counts when available. Those displayed numbers are **activity intent**: admitted or
+currently running logical work (including accepted continuations that are queued or
+active, capturing, running, reviewing, waiting to land, landing, and in-flight
+force-merge operations) and starting/running background shells. Continuation
+validation alone does not count; a rejected continuation leaves stopped work at zero.
+They are released as soon as work is observed stopped, independent of background
+ownership, so a task or shell that has stopped but still owns unsettled cleanup or
+recovery artifacts reads zero (or unknown when the stop itself is unproven). The
+separate conservative **ownership** state still gates an idle-only stop or removal; it
+is deliberately not displayed. Missing, invalid, or pre-intent observations stay
+unknown, never inferred zero and never silently substituted with an ownership count.
+Native names may use Pi's first-user-message fallback when
 there is no stored title. The sidebar does not monitor or coordinate reviewers, workers,
 or their children, and does not display tool arguments, question text, transcripts, or
 secrets. Status stays unknown until it is observed; an unavailable reporter, disconnect,

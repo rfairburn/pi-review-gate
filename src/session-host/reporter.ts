@@ -45,6 +45,7 @@ import { timingSafeEqual } from "node:crypto";
 import { extractContext, extractToolName, registerHook, type HookHandler } from "../pi";
 import {
   activateOwnedActivity,
+  activeActivitySnapshot,
   ownedActivitySnapshot,
   subscribeOwnedActivity,
 } from "./owned-activity";
@@ -428,6 +429,10 @@ function createReporter(
   // active and complete; a cleared tracker is never published as zero.
   let backgroundTasks: number | null = null;
   let backgroundShells: number | null = null;
+  // Independent activity-intent counts: admitted/running work, released when
+  // work is observed stopped even if it still owns unsettled cleanup.
+  let activeTasks: number | null = null;
+  let activeShells: number | null = null;
   let activity: string[] = [];
   let sessionEpoch = sticky.sessionEpoch;
   let nativeSessionId = sticky.nativeSessionId;
@@ -795,6 +800,8 @@ function createReporter(
       && lastSnapshot.inputSurface === inputSurface
       && (lastSnapshot.backgroundTasks ?? null) === backgroundTasks
       && (lastSnapshot.backgroundShells ?? null) === backgroundShells
+      && (lastSnapshot.activeTasks ?? null) === activeTasks
+      && (lastSnapshot.activeShells ?? null) === activeShells
       && lastSnapshot.activity.join("\u0000") === activity.join("\u0000")
       && JSON.stringify(lastSnapshot.nativeSession ?? null) === JSON.stringify(nativeSession)) {
       return; // Unchanged: no new frame.
@@ -810,6 +817,8 @@ function createReporter(
       inputSurface,
       backgroundTasks,
       backgroundShells,
+      activeTasks,
+      activeShells,
       activity: [...activity],
       nativeSession: nativeSession ? { ...nativeSession } : null,
     };
@@ -823,11 +832,14 @@ function createReporter(
     }
   };
 
-  /** Mirror the process-local owned-work snapshot into the next status frame. */
+  /** Mirror both process-local channels into the next status frame. */
   const syncOwnedActivity = (): void => {
     const owned = ownedActivitySnapshot();
     backgroundTasks = owned.backgroundTasks;
     backgroundShells = owned.backgroundShells;
+    const active = activeActivitySnapshot();
+    activeTasks = active.activeTasks;
+    activeShells = active.activeShells;
   };
 
   // Event-driven only: the registry notifies on a real ownership change, so no
@@ -1144,6 +1156,11 @@ function createReporter(
         applyReadiness(readiness);
         backgroundTasks = owned.backgroundTasks;
         backgroundShells = owned.backgroundShells;
+        // Keep the intent channel current for the frame; the idle-only stop
+        // gate below remains the conservative ownership channel.
+        const active = activeActivitySnapshot();
+        activeTasks = active.activeTasks;
+        activeShells = active.activeShells;
         return hasCompleteSessionIdle({ busy, pendingInput, inputSurface, backgroundTasks, backgroundShells });
       };
       if (request.requireIdle === true) {
@@ -1502,6 +1519,8 @@ function createReporter(
     // process-local registry keeps its tokens for the next incarnation.
     backgroundTasks = null;
     backgroundShells = null;
+    activeTasks = null;
+    activeShells = null;
     activity = [];
     lastSnapshot = undefined;
   };

@@ -1633,19 +1633,27 @@ test("authenticated status forwards bounded owned-work counts unchanged, degradi
     ...statusFrame(registration.bootstrap, { sequence: 1 }),
     backgroundTasks: 2,
     backgroundShells: 0,
+    activeTasks: 0,
+    activeShells: 3,
   }) + "\n");
   await waitFor(() => recorded.statuses.length === 1);
   assert.equal(recorded.statuses[0]!.backgroundTasks, 2, "an observed count reaches the authenticated consumer");
   assert.equal(recorded.statuses[0]!.backgroundShells, 0);
+  assert.equal(recorded.statuses[0]!.activeTasks, 0, "activity intent is forwarded independently of ownership");
+  assert.equal(recorded.statuses[0]!.activeShells, 3);
 
   client.write(JSON.stringify({
     ...statusFrame(registration.bootstrap, { sequence: 2 }),
     backgroundTasks: -1,
     backgroundShells: "3",
+    activeTasks: Number.NaN,
+    activeShells: 1.5,
   }) + "\n");
   await waitFor(() => recorded.statuses.length === 2);
   assert.equal(recorded.statuses[1]!.backgroundTasks, null, "an invalid count is unknown, never zero");
   assert.equal(recorded.statuses[1]!.backgroundShells, null);
+  assert.equal(recorded.statuses[1]!.activeTasks, null, "invalid intent is unknown, never zero");
+  assert.equal(recorded.statuses[1]!.activeShells, null);
 
   await disposeBroker(broker);
 });

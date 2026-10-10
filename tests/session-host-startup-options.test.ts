@@ -7,6 +7,7 @@ import test from "node:test";
 const requireCjs = createRequire(join(process.cwd(), "tests", "session-host-startup-options.test.ts"));
 const helper = requireCjs("../scripts/session-host-startup-options.cjs") as {
   assertSessionHostStartupOptions(args: readonly string[], env?: NodeJS.ProcessEnv, platform?: NodeJS.Platform): void;
+  composeFreshSessionSpawnArgs(args: readonly string[], title: string): string[];
   snapshotSessionHostEnvironment(env?: NodeJS.ProcessEnv, platform?: NodeJS.Platform): NodeJS.ProcessEnv;
   SessionHostStartupOptionError: new (message: string) => Error;
   SESSION_DIR_ENV: string;
@@ -145,6 +146,94 @@ test("allows ordinary native arguments unchanged", () => {
   ]) {
     assertAdmitted(args);
   }
+});
+
+test("fresh sibling argument composition preserves Pi options and drops inherited messages, files, and names", () => {
+  const args = [
+    "--provider", "openai",
+    "--model", "--session", // unconditional native value; admission rejects only actual session options
+    "-n", "old title",
+    "--name", "--model", // Pi consumes the flag-looking value as the old title
+    "before options",
+    "--print", "parent print message",
+    "@parent.md",
+    "--custom", "extension value",
+    "--custom=attached",
+    "--list-models", "@model-file",
+    "--mode", "@not-a-cli-file",
+    "--theme", "@theme-option-value",
+    "--scheduler", "--system-prompt", "--scheduler", // scheduler removal shifts the exact boundary
+    "after options",
+    "--", "--session", "@literal-parent-file",
+  ];
+  const before = args.slice();
+  assert.deepEqual(helper.composeFreshSessionSpawnArgs(args, " exact child title "), [
+    "--provider", "openai",
+    "--model", "--session",
+    "--print",
+    "--custom", "extension value",
+    "--custom=attached",
+    "--list-models",
+    "--mode", "@not-a-cli-file",
+    "--theme", "@theme-option-value",
+    "--system-prompt", "after options",
+    "--name", " exact child title ",
+  ]);
+  assert.deepEqual(args, before, "composition must not mutate the user's launch snapshot");
+});
+
+test("fresh sibling composition drops positionals after Pi's known valueless long options", () => {
+  for (const option of [
+    "--help",
+    "--version",
+    "--no-session",
+    "--no-tools",
+    "--no-builtin-tools",
+    "--no-extensions",
+    "--no-mcp",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-context-files",
+    "--no-themes",
+    "--offline",
+    "--approve",
+    "--no-approve",
+    "--verbose",
+  ]) {
+    assert.deepEqual(
+      helper.composeFreshSessionSpawnArgs([option, "parent prompt"], "child"),
+      [option, "--name", "child"],
+      `${option} must not make Pi's following positional message look like an extension option value`,
+    );
+  }
+  assert.deepEqual(
+    helper.composeFreshSessionSpawnArgs(["--custom-extension-option", "extension-value", "parent prompt"], "child"),
+    ["--custom-extension-option", "extension-value", "--name", "child"],
+    "unknown extension flags retain their own optional value without inheriting later positional text",
+  );
+  assert.deepEqual(
+    helper.composeFreshSessionSpawnArgs(["--json", "extension-value", "parent prompt"], "child"),
+    ["--json", "extension-value", "--name", "child"],
+    "Pi 1.1.0 parses --json as an unknown extension flag with an optional value",
+  );
+});
+
+test("fresh sibling composition mirrors conditional Pi message consumption and scheduler boundaries", () => {
+  assert.deepEqual(helper.composeFreshSessionSpawnArgs([
+    "-p", "--model", "sonnet", // -p does not consume a flag-looking token
+    "--use-theme", "theme-name",
+    "--list-models", "sonnet",
+    "--tui-mode", "unknown-mode", // Pi consumes invalid non-option values
+    "--name", "parent",
+    "--scheduler", "--system-prompt", "--scheduler", "--", "--name", "parent prompt",
+  ], "child"), [
+    "-p", "--model", "sonnet",
+    "--use-theme", "theme-name",
+    "--list-models", "sonnet",
+    "--tui-mode", "unknown-mode",
+    "--system-prompt", "--",
+    "--name", "child",
+  ]);
 });
 
 test("rejects a nonempty inherited session-dir env override; empty/absent is benign", () => {

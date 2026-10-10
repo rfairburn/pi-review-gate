@@ -24,7 +24,7 @@ import {
 } from "./instances";
 import { resolveNativePi, RUNTIME_ROLE_ENV, EXECUTOR_TOOL_CATALOG_ENV, snapshotNativeEnvironment } from "./launch";
 import { NativeAgentRegistry, type ProfilePreparer } from "./profiles";
-import { isValidNativeSessionId } from "./protocol";
+import { isValidNativeSessionId, type SessionSpawnInput, type SessionSpawnOutcome } from "./protocol";
 import {
   MAX_ROSTER_ENTRIES,
   ROSTER_STORE_VERSION,
@@ -352,6 +352,7 @@ function statusRegistrar(broker: StatusBroker): StatusRegistrar {
           handlers.onStatus(update);
         },
         onDisconnect: handlers.onDisconnect,
+        ...(handlers.onSpawnRequest ? { onSpawnRequest: handlers.onSpawnRequest } : {}),
       });
       // Keep the broker's exact registration closures and their auth/tuple fences.
       return registration satisfies InstanceStatusRegistration;
@@ -1275,6 +1276,52 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       }
     })();
     createTasks.add(task);
+  }
+
+  /**
+   * Authenticated child request: add a fresh sibling directly through the
+   * manager. This path intentionally never completes a sidebar form or
+   * activates the created row; manager onChange only refreshes the roster.
+   */
+  async function handleSessionSpawn(parentInstanceId: string, request: SessionSpawnInput): Promise<SessionSpawnOutcome> {
+    const currentManager = manager;
+    if (!currentManager || shutdownRequested) return "failed";
+    let parent: NativeInstanceView | undefined;
+    try {
+      parent = currentManager.list().find((view) => view.id === parentInstanceId);
+    } catch {
+      return "failed";
+    }
+    if (!parent || parent.lifecycle !== "alive" || parent.hasLiveProcess !== true) return "failed";
+
+    let childId: string;
+    try {
+      childId = await currentManager.create({
+        workspace: request.workspace,
+        initialRequest: { title: request.title, prompt: request.prompt },
+      });
+    } catch {
+      return "failed";
+    }
+    // A create interrupted by host teardown may have launched a child that is
+    // no longer observable here. Never report that case as a definite failure.
+    if (currentManager !== manager || shutdownRequested) return "unknown";
+    let child: NativeInstanceView | undefined;
+    try {
+      child = currentManager.list().find((view) => view.id === childId);
+    } catch {
+      return "unknown";
+    }
+    if (!child) return "unknown";
+    return child.hasLiveProcess === true || child.exitCode !== undefined ? "started" : "failed";
+  }
+
+  /** Snapshot actual title-line columns for the layout with the sidebar shown. */
+  function sidebarTitleColumnsSnapshot(): number {
+    const cols = clampDimension(terminal?.columns, 80);
+    const rows = clampDimension(terminal?.rows, 24);
+    const visibleLayout = computeHostLayout(cols, rows, { sidebarVisible: true, focus: "sidebar" });
+    return visibleLayout.sidebar?.cols ?? cols;
   }
 
   /**
@@ -2277,6 +2324,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       rows: layout.native.rows,
       getSupportedKeyboardFlags: () => terminal?.kittyProtocolActive ? observedFlags & 7 : 0,
       onChange: (id) => noteManagerChanged(id),
+      onSpawnRequest: handleSessionSpawn,
+      getSidebarTitleColumns: sidebarTitleColumnsSnapshot,
     });
     writer = createFrameWriter();
 

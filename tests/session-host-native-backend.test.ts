@@ -15,6 +15,7 @@ import {
   rmdirSync,
   statSync,
   unlinkSync,
+  watch,
   writeFileSync,
 } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -22,9 +23,11 @@ import { tmpdir } from "node:os";
 import test from "node:test";
 import {
   NODE_OPTIONS_RESTORE_ENV,
+  composeFreshSessionSpawnArgs,
   prepareNativeLaunch,
   resolveNativePi,
 } from "../src/session-host/launch";
+import { SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV } from "../src/session-host/startup-request";
 import { createStatusBroker, type StatusBroker, type StatusRegistration } from "../src/session-host/broker";
 import { HOST_BOOTSTRAP_ENV, type SessionHostStatus } from "../src/session-host/protocol";
 import { ProfileRegistry, type PreparedProfile } from "../src/session-host/profiles";
@@ -464,6 +467,10 @@ function stageCandidate(root: string, prerequisites: StaticPrerequisites): Stage
     join(repositoryRoot(), "scripts", "pi-review-gate-launcher.cjs"),
     join(packageRoot, "scripts", "pi-review-gate-launcher.cjs"),
   );
+  copyBoundedRegularFile(
+    join(repositoryRoot(), "scripts", "session-host-startup-options.cjs"),
+    join(packageRoot, "scripts", "session-host-startup-options.cjs"),
+  );
 
   const shippedFiles: readonly string[][] = [
     ["skills", "pi-review-gate-orchestrator", "SKILL.md"],
@@ -759,6 +766,24 @@ function assertOwnedStatuses(owner: NativeBackendOwner, generation: string): voi
   }
 }
 
+function sessionFileHasStoredName(sessionFile: string, expectedName: string): boolean {
+  const stats = lstatSync(sessionFile);
+  if (!stats.isFile() || stats.isSymbolicLink() || stats.size > MAX_STAGED_FILE_BYTES) {
+    throw new Error("owned native session file is not a bounded regular file");
+  }
+  let latestName: unknown;
+  for (const line of readFileSync(sessionFile, "utf8").split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line) as { type?: unknown; name?: unknown };
+      if (entry.type === "session_info") latestName = entry.name;
+    } catch {
+      // Ignore only a possibly incomplete append; complete native entries are checked.
+    }
+  }
+  return latestName === expectedName;
+}
+
 function observerRecords(path: string): Array<Record<string, unknown>> {
   if (!existsSync(path)) return [];
   return readFileSync(path, "utf8")
@@ -782,7 +807,10 @@ module.exports = (pi) => {
       hasIsIdle = true;
       try { isIdleValue = ctx.isIdle(); } catch { isIdleValue = null; }
     }
-    append({ type: 'session_start', mode: ctx && ctx.mode, hasIsIdle, isIdleValue });
+    const sessionFile = ctx && ctx.sessionManager && typeof ctx.sessionManager.getSessionFile === 'function'
+      ? ctx.sessionManager.getSessionFile()
+      : undefined;
+    append({ type: 'session_start', mode: ctx && ctx.mode, hasIsIdle, isIdleValue, sessionFile });
   });
   pi.on('agent_start', () => append({ type: 'agent_start' }));
   pi.on('session_shutdown', () => append({ type: 'session_shutdown' }));
@@ -1351,4 +1379,179 @@ test("two real native Pi PTYs retain per-owner status, draft, gate-menu, query-r
 
   await assertGracefulSigterm(ownerA);
   await assertGracefulSigterm(ownerB);
+});
+
+test("real Pi receives literal SessionSpawn prompts and preserves long native titles under native whitespace rules", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+  const prerequisites = staticPrerequisites(t, true);
+  if (!prerequisites) return;
+
+  let ptyModule: NativePtyModule;
+  let surfaceModule: TerminalSurfaceModule;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
+    ptyModule = require("@lydell/node-pty") as NativePtyModule;
+    // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
+    surfaceModule = require("../src/session-host/terminal-surface") as TerminalSurfaceModule;
+  } catch {
+    skipOrFail(t, "the pinned real native PTY binding or production TerminalSurface could not be loaded");
+    return;
+  }
+
+  const root = makeSyntheticRoot();
+  const owners: NativeBackendOwner[] = [];
+  const profiles: PreparedProfile[] = [];
+  const registrations: StatusRegistration[] = [];
+  const watchers: Array<{ close(): void }> = [];
+  let broker: StatusBroker | undefined;
+  t.after(async () => {
+    for (const watcher of watchers) watcher.close();
+    await disposeBackendResources({ root, owners, profiles, registrations, broker });
+  });
+
+  initializeSyntheticDirectories(root);
+  assertBrokerSocketPathBudget(root);
+  const pi = resolvePiExecutable(prerequisites, root, t);
+  if (!pi) return;
+  const candidate = stageCandidate(root, prerequisites);
+  const registry = new ProfileRegistry({ stateRoot: join(root, "profile-state") });
+  const providerExtension = join(repositoryRoot(), "tests", "fixtures", "session-host-native-provider.cjs");
+  const fixtureAgentDir = realpathSync(resolve(process.env.PI_REVIEW_GATE_INSTALLED_AGENT!));
+  broker = await createStatusBroker({ socketRoot: join(root, "broker") });
+
+  const cases = [
+    {
+      key: "at-leading",
+      id: randomUUID(),
+      title: `  ${"Native title beyond the advisory sidebar width ".repeat(3)}  `,
+      prompt: "@literal-at-file.txt\nThis text must not be expanded from a file.",
+    },
+    {
+      key: "flag-leading",
+      id: randomUUID(),
+      title: `Flag-leading title beyond the advisory sidebar width ${"x".repeat(32)}`,
+      prompt: "--session /tmp/not-a-session-selection.jsonl\nThis entire string is user text.",
+    },
+  ] as const;
+
+  const prepared: Array<{
+    id: string;
+    profile: PreparedProfile;
+    observer: { log: string; extension: string };
+    descriptor: ReturnType<typeof prepareNativeLaunch>;
+    statuses: StatusJournal;
+    providerState: string;
+    journal: string;
+    prompt: string;
+    title: string;
+    signal: ChangeSignal;
+  }> = [];
+  for (const request of cases) {
+    const profile = registry.prepare({ workspace: createWorkspace(root, `workspace-${request.key}`) });
+    profiles.push(profile);
+    const observer = createSessionObserverFiles(root, request.key);
+    const literalAtFile = join(profile.workspace, "literal-at-file.txt");
+    writeFileSync(literalAtFile, "FILE CONTENT MUST NOT REPLACE THE @-LEADING PROMPT\n", { mode: 0o600 });
+    const providerState = join(root, "provider-state", request.key);
+    mkdirSync(providerState, { recursive: true, mode: 0o700 });
+    writeFileSync(join(providerState, "turn-script.json"), JSON.stringify({ steps: [{ text: "fixture-turn-complete" }] }), { mode: 0o600 });
+
+    const inheritedArgs = [
+      ...makeArgs(observer.extension),
+      "--extension", candidate.entry,
+      "--extension", providerExtension,
+      "--provider", "prg-native-question",
+      "--model", "driven",
+      "--name", "parent session title",
+      "parent startup message that must not be inherited",
+      "@parent-startup-file.txt",
+    ];
+    const args = composeFreshSessionSpawnArgs(inheritedArgs, request.title);
+    assert.equal(args.includes("parent session title"), false);
+    assert.equal(args.includes("parent startup message that must not be inherited"), false);
+    assert.equal(args.includes("@parent-startup-file.txt"), false);
+    assert.deepEqual(args.slice(-2), ["--name", request.title]);
+
+    // The same composed arguments used by a fresh manager admission are
+    // supplied to the real Pi CLI; normal native setup otherwise remains
+    // untouched.
+    const nativeDescriptor = prepareNativeLaunch({
+      nativeSetup: false,
+      packageRoot: candidate.packageRoot,
+      agentDir: profile.agentDir,
+      workspace: profile.workspace,
+      piExecutable: pi.file,
+      args,
+      env: { ...makeSyntheticEnvironment(root, candidate.nodePath), PRG_NATIVE_BACKEND_OBSERVER_FILE: observer.log },
+    });
+    assert.equal(nativeDescriptor.cwd, profile.workspace, "the native child runs in the explicitly selected workspace");
+    assert.equal(nativeDescriptor.args.includes(request.prompt), false, "the prompt never reaches Pi's CLI parser");
+    const providerJournal = join(providerState, "provider-journal.jsonl");
+    const signal = new ChangeSignal();
+    watchers.push(watch(providerState, () => signal.notify()));
+    prepared.push({
+      id: request.id,
+      profile,
+      observer,
+      descriptor: nativeDescriptor,
+      statuses: new StatusJournal(),
+      providerState,
+      journal: providerJournal,
+      prompt: request.prompt,
+      title: request.title,
+      signal,
+    });
+  }
+
+  for (const entry of prepared) {
+    const registration = broker.register(entry.id, {
+      onStatus: (status) => entry.statuses.push(status),
+      onDisconnect: () => undefined,
+    });
+    registrations.push(registration);
+    const owner = await createNativeOwner(ptyModule, surfaceModule, (created) => owners.push(created), {
+      id: entry.id,
+      profile: entry.profile,
+      observerFile: entry.observer.log,
+      descriptor: entry.descriptor,
+      registration,
+      statuses: entry.statuses,
+      bootstrapEnv: {
+        [SESSION_HOST_STARTUP_REQUEST_ENV]: JSON.stringify({ title: entry.title, prompt: entry.prompt }),
+        [SESSION_HOST_TITLE_COLUMNS_ENV]: "47",
+        PRG_FIXTURE_AGENT_DIR: fixtureAgentDir,
+        PRG_FIXTURE_STATE_DIR: entry.providerState,
+      },
+    });
+    assert.equal(owner.descriptor.cwd, entry.profile.workspace);
+  }
+
+  for (const entry of prepared) {
+    const readProviderRecords = (): Array<Record<string, unknown>> => existsSync(entry.journal)
+      ? readFileSync(entry.journal, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>)
+      : [];
+    await entry.signal.waitFor(
+      () => readProviderRecords().some((record) => record.event === "model_request"),
+      EVENT_TIMEOUT_MS,
+      `${entry.id} real Pi faux-provider receives its first native user turn`,
+    );
+    const firstTurn = readProviderRecords().find((record) => record.event === "model_request");
+    assert.equal(firstTurn?.lastUserPreview, entry.prompt,
+      `${entry.id} prompt reaches the actual Pi model context byte-for-byte, without @file or option parsing`);
+    const expectedNativeTitle = entry.title.trim();
+    await entry.statuses.signal.waitFor(
+      () => entry.statuses.entries.some((status) => status.nativeSession?.name === expectedNativeTitle),
+      EVENT_TIMEOUT_MS,
+      `${entry.id} reporter observes Pi's native title after its surrounding-whitespace normalization`,
+    );
+    const storedTitle = entry.statuses.entries.find((status) => status.nativeSession?.name === expectedNativeTitle)?.nativeSession?.name;
+    assert.equal(storedTitle, expectedNativeTitle, "Pi trims surrounding whitespace according to its native session-name semantics");
+    assert.ok((storedTitle?.length ?? 0) > 47,
+      "the full post-normalization native title remains stored even though it exceeds the advisory sidebar width");
+    const sessionFile = observerRecords(entry.observer.log).find((record) => record.type === "session_start")?.sessionFile;
+    assert.equal(typeof sessionFile, "string", "the native observer identifies Pi's actual conversation file");
+    assert.equal(sessionFileHasStoredName(sessionFile as string, expectedNativeTitle), true,
+      "the Pi 1.1.0 native session_info entry persists its whitespace-normalized full title");
+  }
+
+  for (const owner of owners) await assertGracefulSigterm(owner);
 });

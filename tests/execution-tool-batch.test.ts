@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -36,6 +36,8 @@ function executionTool(tools: Array<Record<string, any>>, name: string): Record<
 }
 
 function harness(options: {
+  /** Explicit isolated source for tests that must keep a task alive through capture. */
+  cwd?: string;
   slowExecutor?: boolean;
   expandedView?: boolean;
   researchCapable?: boolean;
@@ -108,7 +110,7 @@ function harness(options: {
     pi,
     config,
     state: createState(),
-    cwd: () => process.cwd(),
+    cwd: () => options.cwd ?? process.cwd(),
     submittedFingerprintFor: options.submittedFingerprintFor,
     onNativeToolError: options.onNativeToolError,
     notify: (message) => { notices.push(message); },
@@ -446,7 +448,10 @@ test("execution review readiness reports every unfinished task and omits termina
 });
 
 test("SubtasksWatch replaces an earlier watch and emits one bounded checkpoint while work remains active", async () => {
-  const { tools, notices, manager } = harness({ slowExecutor: true });
+  // Other tests deliberately retain unsafe symlink fixtures in the checkout.
+  // This task must stay active, so capture only a fresh, independently owned source.
+  const cwd = await mkdtemp(join(tmpdir(), "pi-review-watch-source-"));
+  const { tools, notices, manager } = harness({ slowExecutor: true, cwd });
   try {
     const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
     const watch = executionTool(tools, "SubtasksWatch").execute as ExecuteTool;
@@ -475,6 +480,7 @@ test("SubtasksWatch replaces an earlier watch and emits one bounded checkpoint w
   } finally {
     await manager.shutdown();
     await manager.detach();
+    await rm(cwd, { recursive: true, force: true });
   }
 });
 
@@ -1250,6 +1256,33 @@ test("codemode absent from the parent ceiling never enters delegated catalogs (#
     const researchCatalog = research.details.tasks[0].definition.executorToolCatalog as { allowedToolCatalog: string[]; initialActiveTools: string[] };
     assert.equal(researchCatalog.allowedToolCatalog.includes("codemode"), false);
     assert.equal(researchCatalog.initialActiveTools.includes("codemode"), false);
+  } finally {
+    await manager.shutdown();
+    await manager.detach();
+  }
+});
+
+test("SessionSpawn is excluded from delegated executor catalogs even when active in the parent", async () => {
+  const { tools, manager } = harness({
+    deferredPiTools: false,
+    activeTools: ["read", "bash", "SessionSpawn", ...executionToolNames],
+  });
+  const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+  try {
+    const result = await start("session-spawn-executor-exclusion", {
+      tasks: [{
+        title: "Bounded execution",
+        instructions: "Do bounded work",
+        acceptanceCriteria: ["Work is complete"],
+      }],
+    }, undefined, undefined, {});
+    assert.equal(result.isError, false);
+    const catalog = result.details.tasks[0].definition.executorToolCatalog as {
+      allowedToolCatalog: string[];
+      initialActiveTools: string[];
+    };
+    assert.equal(catalog.allowedToolCatalog.includes("SessionSpawn"), false);
+    assert.equal(catalog.initialActiveTools.includes("SessionSpawn"), false);
   } finally {
     await manager.shutdown();
     await manager.detach();

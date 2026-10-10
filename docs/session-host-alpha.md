@@ -188,6 +188,28 @@ asks only for an
 explicit existing workspace directory; there is no separate host display-label field.
 Submitting New creates the child and immediately makes it the active Main input owner
 without a second row Enter; the sidebar stays visible.
+
+An authenticated top-level session-host child with the review-gate reporter also exposes
+`SessionSpawn`; delegated executor children do not. It requires exactly an existing
+workspace, title, and nonempty prompt. It creates a fresh native Pi process and
+conversation in that workspace, without creating a worktree, clone, or branch. Native
+settings and compatible inherited launch options remain shared, but the parent's
+conversation name and startup message/file inputs are not inherited. The supplied title is
+forwarded unchanged to Pi's native session-name API; Pi applies its own persistence
+semantics, including trimming surrounding whitespace on the pinned 1.1.0 runtime. The
+host does not crop or shorten titles to fit the sidebar, and titles longer than the
+recommendation remain stored in full after Pi's native normalization. The prompt is
+handed unchanged to Pi's public user-message API with prompt-template expansion disabled,
+so leading `@`, `/`, and option-like text are prompt content rather than CLI inputs. It is
+dispatched only after review-gate session initialization has established checkpoint scope
+and deferred-tool authorization, and is recorded in the review request context before the
+turn starts. The child is added in the background: its row appears without changing the
+selected row, focus, active Main owner, or sidebar visibility. A successful result
+confirms process launch only, not prompt processing or completion. The tool's title-width
+suggestion is a host-computed snapshot of the sidebar title area in the visible layout
+when that reporter child was launched; it is advisory and may become stale after a
+resize. Ordinary launch, New-session, and saved-conversation behavior is unchanged.
+
 The sidebar name comes from the observed native conversation metadata (the stored
 native name or Pi's native first-user-message fallback). Until that metadata is observed,
 the row reports that the session name is unavailable rather than inventing a user label.

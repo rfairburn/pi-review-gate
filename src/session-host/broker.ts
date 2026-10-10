@@ -83,6 +83,10 @@ import {
   type SessionHostRenameRequest,
   type SessionHostShutdownAck,
   type SessionHostShutdownRequest,
+  type SessionHostSpawnAck,
+  type SessionHostSpawnRequest,
+  type SessionSpawnInput,
+  type SessionSpawnOutcome,
   type SessionHostStatus,
   MAX_STATUS_FRAME_BYTES,
   PROTOCOL_VERSION,
@@ -112,6 +116,8 @@ export interface StatusBrokerStatusHandlers {
   onStatus: (status: SessionHostStatus) => void;
   /** Fired only when a currently-owned authenticated connection actually disconnects. */
   onDisconnect: () => void;
+  /** Optional host-side operation invoked only by a valid request on this registration's authenticated connection. */
+  onSpawnRequest?: (request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
 }
 
 /** One per-instance registration issued before the native PTY is spawned. */
@@ -187,13 +193,16 @@ const MAX_PENDING_UNAUTH_CONNECTIONS = 32;
 const AUTH_DEADLINE_MS = 2000;
 const RENAME_TIMEOUT_MS = 5000;
 const SHUTDOWN_TIMEOUT_MS = 5000;
+const SPAWN_TIMEOUT_MS = 60_000;
 const WINDOWS_PIPE_LISTEN_TIMEOUT_MS = 5000;
 const WINDOWS_PIPE_CLOSE_TIMEOUT_MS = 5000;
 const MAX_PENDING_RENAMES = 4;
 const MAX_PENDING_SHUTDOWNS = 1;
+const MAX_PENDING_SPAWNS = 2;
 const MAX_PENDING_CONTROL_FRAMES = 4;
 const MAX_COMPLETED_RENAME_IDS = 64;
 const MAX_COMPLETED_SHUTDOWN_IDS = 64;
+const MAX_COMPLETED_SPAWN_IDS = 64;
 
 /**
  * Conservative cap on a POSIX broker socket path in UTF-8 bytes. macOS
@@ -231,6 +240,8 @@ interface RegistrationRecord {
   completedRenameIds: Set<string>;
   pendingShutdowns: Map<string, PendingShutdown>;
   completedShutdownIds: Set<string>;
+  pendingSpawns: Map<string, PendingSpawn>;
+  completedSpawns: Map<string, CompletedSpawn>;
   shutdownResult: Promise<StatusShutdownResult> | undefined;
   active: ConnectionState | undefined;
   handlers: StatusBrokerStatusHandlers;
@@ -248,6 +259,18 @@ interface PendingShutdown {
   request: SessionHostShutdownRequest;
   timer: NodeJS.Timeout;
   resolve: (result: StatusShutdownResult) => void;
+}
+
+interface PendingSpawn {
+  readonly requestId: string;
+  readonly fingerprint: string;
+  connection: ConnectionState;
+  timer: NodeJS.Timeout;
+}
+
+interface CompletedSpawn {
+  readonly fingerprint: string;
+  readonly outcome: SessionSpawnOutcome;
 }
 
 /** Per-socket connection state machine (awaiting hello -> active -> closed). */
@@ -275,6 +298,10 @@ function timingSafeTextEqual(left: string, right: string): boolean {
     createHash("sha256").update(left, "utf8").digest(),
     createHash("sha256").update(right, "utf8").digest(),
   );
+}
+
+function isSpawnOutcome(value: unknown): value is SessionSpawnOutcome {
+  return value === "started" || value === "failed" || value === "unknown";
 }
 
 type RenameAckClassification = "matching" | "stale-session" | "invalid";
@@ -326,6 +353,7 @@ let brokerPlatformForTests: NodeJS.Platform | undefined;
 let createServerForTests: (() => Server) | undefined;
 let windowsPipeListenTimeoutForTests: number | undefined;
 let windowsPipeCloseTimeoutForTests: number | undefined;
+let spawnTimeoutMsForTests: number | undefined;
 
 /** Narrow seams for protocol policy tests and root-bound socket fixtures. */
 export const __test = Object.freeze({
@@ -343,6 +371,9 @@ export const __test = Object.freeze({
   setWindowsPipeTimeoutsForTests(listenMs: number | undefined, closeMs: number | undefined): void {
     windowsPipeListenTimeoutForTests = listenMs;
     windowsPipeCloseTimeoutForTests = closeMs;
+  },
+  setSpawnTimeoutForTests(timeoutMs: number | undefined): void {
+    spawnTimeoutMsForTests = timeoutMs;
   },
 });
 
@@ -602,6 +633,8 @@ class LocalStatusBroker implements StatusBroker {
       completedRenameIds: new Set(),
       pendingShutdowns: new Map(),
       completedShutdownIds: new Set(),
+      pendingSpawns: new Map(),
+      completedSpawns: new Map(),
       shutdownResult: undefined,
       active: undefined,
       handlers,
@@ -852,6 +885,7 @@ class LocalStatusBroker implements StatusBroker {
     for (const record of this.#registrations.values()) {
       record.released = true;
       if (record.active) this.#failPendingRenames(record, record.active, "disconnected");
+      for (const pending of [...record.pendingSpawns.values()]) this.#settleSpawn(record, pending, "unknown");
       record.active = undefined;
     }
     this.#registrations.clear();
@@ -1174,8 +1208,10 @@ class LocalStatusBroker implements StatusBroker {
       this.#onRenameAck(conn, message);
     } else if (message.type === "shutdown_result") {
       this.#onShutdownAck(conn, message);
+    } else if (message.type === "spawn_request") {
+      this.#onSpawnRequest(conn, message);
     } else {
-      this.#destroyConnection(conn); // Reporter processes may never issue host commands.
+      this.#destroyConnection(conn); // Reporters may only issue the explicitly admitted SessionSpawn request.
     }
     return !conn.destroyed && !conn.superseded;
   }
@@ -1254,6 +1290,135 @@ class LocalStatusBroker implements StatusBroker {
       record.handlers.onStatus(status);
     } catch {
       // Contained: the broker keeps serving subsequent frames.
+    }
+  }
+
+  #onSpawnRequest(conn: ConnectionState, request: SessionHostSpawnRequest): void {
+    const record = conn.registration;
+    if (!record || !conn.authed || conn.superseded || conn.destroyed || record.released || record.active !== conn) {
+      this.#destroyConnection(conn);
+      return;
+    }
+    if (!timingSafeTextEqual(request.instanceId, record.instanceId)
+      || !timingSafeTextEqual(request.generation, this.generation)
+      || !timingSafeTextEqual(request.token, record.token)) {
+      this.#destroyConnection(conn);
+      return;
+    }
+
+    // The digest lets the broker deduplicate exact replays without retaining
+    // prompt/title/workspace after a completed launch. Never include it in any
+    // result or diagnostic.
+    const fingerprint = createHash("sha256")
+      .update(JSON.stringify([request.workspace, request.title, request.prompt]), "utf8")
+      .digest("hex");
+    const completed = record.completedSpawns.get(request.requestId);
+    if (completed) {
+      if (completed.fingerprint !== fingerprint) {
+        this.#destroyConnection(conn);
+        return;
+      }
+      this.#sendSpawnAck(record, conn, request.requestId, completed.outcome);
+      return;
+    }
+    const pending = record.pendingSpawns.get(request.requestId);
+    if (pending) {
+      if (pending.fingerprint !== fingerprint) {
+        this.#destroyConnection(conn);
+        return;
+      }
+      // A caller that explicitly replays the same request on the current
+      // authenticated connection may receive the eventual result, but the
+      // host callback is never invoked twice.
+      pending.connection = conn;
+      return;
+    }
+    if (record.shutdownResult !== undefined) {
+      // A shutdown preflight/accepted Stop closes this parent's spawn authority.
+      // Only the positive idle-only `not-idle` rejection clears that fence in
+      // #shutdown; uncertain or accepted shutdowns remain fail closed.
+      this.#rememberSpawnResult(record, request.requestId, fingerprint, "failed");
+      this.#sendSpawnAck(record, conn, request.requestId, "failed");
+      return;
+    }
+    if (record.pendingSpawns.size >= MAX_PENDING_SPAWNS) {
+      this.#rememberSpawnResult(record, request.requestId, fingerprint, "failed");
+      this.#sendSpawnAck(record, conn, request.requestId, "failed");
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      const current = record.pendingSpawns.get(request.requestId);
+      if (current) this.#settleSpawn(record, current, "unknown");
+    }, spawnTimeoutMsForTests ?? SPAWN_TIMEOUT_MS);
+    timer.unref?.();
+    const operation: PendingSpawn = {
+      requestId: request.requestId,
+      fingerprint,
+      connection: conn,
+      timer,
+    };
+    record.pendingSpawns.set(request.requestId, operation);
+
+    const onSpawnRequest = record.handlers.onSpawnRequest;
+    if (typeof onSpawnRequest !== "function") {
+      this.#settleSpawn(record, operation, "failed");
+      return;
+    }
+    const input: SessionSpawnInput = {
+      workspace: request.workspace,
+      title: request.title,
+      prompt: request.prompt,
+    };
+    void Promise.resolve().then(() => onSpawnRequest(input)).then(
+      (outcome) => this.#settleSpawn(record, operation, isSpawnOutcome(outcome) ? outcome : "unknown"),
+      () => this.#settleSpawn(record, operation, "unknown"),
+    );
+  }
+
+  #rememberSpawnResult(
+    record: RegistrationRecord,
+    requestId: string,
+    fingerprint: string,
+    outcome: SessionSpawnOutcome,
+  ): void {
+    record.completedSpawns.delete(requestId);
+    record.completedSpawns.set(requestId, { fingerprint, outcome });
+    while (record.completedSpawns.size > MAX_COMPLETED_SPAWN_IDS) {
+      const oldest = record.completedSpawns.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      record.completedSpawns.delete(oldest);
+    }
+  }
+
+  #settleSpawn(record: RegistrationRecord, pending: PendingSpawn, outcome: SessionSpawnOutcome): void {
+    if (record.pendingSpawns.get(pending.requestId) !== pending) return;
+    record.pendingSpawns.delete(pending.requestId);
+    clearTimeout(pending.timer);
+    this.#rememberSpawnResult(record, pending.requestId, pending.fingerprint, outcome);
+    this.#sendSpawnAck(record, pending.connection, pending.requestId, outcome);
+  }
+
+  #sendSpawnAck(
+    record: RegistrationRecord,
+    connection: ConnectionState,
+    requestId: string,
+    outcome: SessionSpawnOutcome,
+  ): void {
+    if (connection.destroyed || connection.superseded || !connection.authed
+      || record.released || record.active !== connection) return;
+    const ack: SessionHostSpawnAck = {
+      version: PROTOCOL_VERSION,
+      type: "spawn_result",
+      instanceId: record.instanceId,
+      generation: this.generation,
+      requestId,
+      outcome,
+    };
+    try {
+      this.#queueRenameFrame(connection, encodeFrame(ack));
+    } catch {
+      this.#destroyConnection(connection);
     }
   }
 
@@ -1418,6 +1583,7 @@ class LocalStatusBroker implements StatusBroker {
         status: "disconnected",
       });
     }
+    for (const pending of [...record.pendingSpawns.values()]) this.#settleSpawn(record, pending, "unknown");
     record.active = undefined;
     this.#registrations.delete(record.instanceId);
   }

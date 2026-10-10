@@ -53,6 +53,15 @@ not eliminate connection/resource-exhaustion risk. The named pipe is not encrypt
 token authentication does not protect traffic from interception, and neither transport
 claims confidentiality in transit.
 
+Status snapshots still exclude tool arguments, prompts, question text, transcripts, and
+credentials. The separate authenticated `spawn_request` command intentionally carries
+its explicit workspace, title, and prompt to the host; its bounded launch reply contains
+only an outcome. The prompt is not copied into status snapshots or status/sidebar
+diagnostics. It is delivered to the new child's ordinary native Pi conversation, while
+the supplied title appears through that conversation's normal native name/sidebar
+display. This distinction does not add encryption, confidentiality in transit, or any
+new Windows ACL guarantee.
+
 This describes only the IPC transport. Windows native-host preflight, manager/PTY
 integration, ConPTY behavior, and restoration remain incomplete and require separate
 native-platform validation. This IPC support does not establish Windows host parity,

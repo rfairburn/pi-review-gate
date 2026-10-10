@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { afterEach, beforeEach } from "node:test";
@@ -16,6 +16,12 @@ import {
   piSettlementEnvironment,
 } from "../src/execution/pi-settlement-receipt";
 import { reapAll } from "../src/background-shell";
+import { getSessionHostSpawnCapability, SESSION_HOST_SPAWN_CAPABILITY_KEY, publishSessionHostSpawnCapability, revokeSessionHostSpawnCapability } from "../src/session-host/spawn-capability";
+import {
+  primeSessionHostStartupMetadata,
+  SESSION_HOST_STARTUP_REQUEST_ENV,
+  __test as startupRequestTest,
+} from "../src/session-host/startup-request";
 
 const CODEMODE_DEFAULT_ENV = "PI_REVIEW_GATE_CODEMODE_DEFAULT";
 
@@ -118,6 +124,8 @@ const environmentNames = [
   PI_SETTLEMENT_PATH_ENV,
   PI_SETTLEMENT_SESSION_ENV,
   PI_SETTLEMENT_CHILD_ENV,
+  SESSION_HOST_STARTUP_REQUEST_ENV,
+  "PI_CODING_AGENT_DIR",
 ];
 
 beforeEach(() => {
@@ -132,11 +140,17 @@ beforeEach(() => {
   delete process.env[PI_SETTLEMENT_PATH_ENV];
   delete process.env[PI_SETTLEMENT_SESSION_ENV];
   delete process.env[PI_SETTLEMENT_CHILD_ENV];
+  delete process.env[SESSION_HOST_STARTUP_REQUEST_ENV];
+  delete process.env.PI_CODING_AGENT_DIR;
+  startupRequestTest.clearProcessMetadata();
+  delete (globalThis as Record<PropertyKey, unknown>)[SESSION_HOST_SPAWN_CAPABILITY_KEY];
 });
 
 afterEach(() => {
   reapAll();
   resetPrimaryCodemodeDefaultForTests();
+  delete (globalThis as Record<PropertyKey, unknown>)[SESSION_HOST_SPAWN_CAPABILITY_KEY];
+  startupRequestTest.clearProcessMetadata();
   for (const [name, value] of previousEnvironment) {
     if (value === undefined) delete process.env[name];
     else process.env[name] = value;
@@ -330,6 +344,127 @@ test("a fresh manual primary activation does not inherit wrapper codemode defaul
     assert.deepEqual((result.details as { matched: string[] }).matched, []);
   } finally {
     await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("SessionSpawn is reporter-capability-gated for top-level hosted children and absent from executors", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-review-session-spawn-registration-"));
+  try {
+    await writeConfig(cwd);
+    const standalone = new NativeToolRuntime(cwd, nativeDefinitions(), ["read"]);
+    await activate(standalone.pi);
+    await startSession(standalone);
+    assert.equal(standalone.definitions.has("SessionSpawn"), false, "ordinary standalone Pi has no host capability");
+
+    const capability = { titleColumns: 32, spawn: async () => "started" as const };
+    publishSessionHostSpawnCapability(capability);
+    assert.equal(getSessionHostSpawnCapability(), capability);
+    const hostedNativeTools = nativeDefinitions();
+    const hosted = new NativeToolRuntime(cwd, hostedNativeTools, hostedNativeTools.map((tool) => tool.name));
+    await activate(hosted.pi);
+    await startSession(hosted);
+    assert.equal(hosted.definitions.has("SessionSpawn"), true, "the reporter-published top-level capability registers the tool");
+
+    const catalog = createExecutorToolCatalog(["read"], ["read"]);
+    const settlement = createPiSettlementBootstrap(cwd, "session-spawn-executor-ceiling");
+    process.env.PI_REVIEW_GATE_RUNTIME_ROLE = "executor";
+    process.env[EXECUTOR_TOOL_CATALOG_ENV] = JSON.stringify(catalog);
+    Object.assign(process.env, piSettlementEnvironment(settlement));
+    const executor = new NativeToolRuntime(cwd, nativeDefinitions(), ["read"]);
+    await activate(executor.pi);
+    await startSession(executor);
+    assert.equal(executor.definitions.has("SessionSpawn"), false, "executor role ignores even a process-local capability");
+    assert.equal(executor.activeTools().includes("SessionSpawn"), false);
+    await executor.fire("session_shutdown", executor.context);
+    revokeSessionHostSpawnCapability(capability);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("the initial hosted request waits for review initialization and is persisted before dispatch", async () => {
+  // The raw checkpoint store lives under the agent-data directory, so the
+  // workspace and agent-data must be siblings: an agent-data inside the
+  // capture workspace is a refused non-Git overlap configuration.
+  const root = await mkdtemp(join(tmpdir(), "pi-review-session-spawn-startup-gate-"));
+  const cwd = join(root, "workspace");
+  const agentDir = join(root, "agent-data");
+  try {
+    await mkdir(cwd);
+    await mkdir(agentDir);
+    await writeConfig(cwd);
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    const title = "-- exact initial title --";
+    const prompt = "  @literal-request.md\n--offline is prompt text, not a Pi option.\n  ";
+    process.env[SESSION_HOST_STARTUP_REQUEST_ENV] = JSON.stringify({ title, prompt });
+    primeSessionHostStartupMetadata(true);
+
+    const runtime = new NativeToolRuntime(cwd, nativeDefinitions(), ["read"]);
+    // The session file (and its persisted state sidecar) stay outside the
+    // capture workspace so checkpoint enumeration never sees gate-owned state.
+    const sessionFile = join(agentDir, "native-session.jsonl");
+    Object.assign(runtime.context.sessionManager, {
+      getSessionId: () => "startup-gate-session",
+      getSessionFile: () => sessionFile,
+      getCwd: () => cwd,
+    });
+    runtime.pi.appendEntry = () => undefined;
+    const submitted: Array<{ title?: string; prompt: string; options?: { expandPromptTemplates?: boolean } }> = [];
+    let extensionInput: Promise<unknown[]> | undefined;
+    let immediateTurn: Promise<unknown[]> | undefined;
+    runtime.pi.setSessionName = (name: string) => {
+      submitted.push({ title: name, prompt: "", options: undefined });
+    };
+    runtime.pi.sendUserMessage = (message: string, options?: { expandPromptTemplates?: boolean }) => {
+      assert.equal(runtime.activeTools().includes("tool_search"), true,
+        "deferred-tool authorization is established before the initial turn is submitted");
+      submitted.push({ prompt: message, options });
+      // Pi reports this public API call as extension input; the gate's normal
+      // input observer intentionally ignores it, so startup must record it itself.
+      extensionInput = runtime.fire("input", { source: "extension", text: message }, runtime.context);
+      // Model Pi's eager sendUserMessage semantics: the run may enter
+      // before_agent_start before the surrounding session_start hook returns.
+      immediateTurn = runtime.fire("before_agent_start", { systemPrompt: "" }, runtime.context);
+    };
+
+    let releaseInitialization!: () => void;
+    let signalInitializationHeld!: () => void;
+    const initialization = new Promise<void>((resolve) => { releaseInitialization = resolve; });
+    const held = new Promise<void>((resolve) => { signalInitializationHeld = resolve; });
+    await activate(runtime.pi, {
+      sessionStartInitializationTestBarrier: async () => {
+        signalInitializationHeld();
+        await initialization;
+      },
+    });
+    runtime.start();
+    const starting = runtime.fire("session_start", { cwd }, runtime.context);
+    await held;
+    assert.deepEqual(submitted, [], "no title or user turn is dispatched while gate session setup is suspended");
+    releaseInitialization();
+    await starting;
+    await extensionInput;
+    await immediateTurn;
+
+    assert.deepEqual(submitted, [
+      { title, prompt: "", options: undefined },
+      { prompt, options: { expandPromptTemplates: false } },
+    ], "the supplied title and literal prompt are dispatched only after initialization");
+    const persisted = JSON.parse(await readFile(`${sessionFile}.pi-review-gate-state.json`, "utf8")) as {
+      state: { reviewWindow?: { requestHistory: Array<{ phase: string; text: string }> } };
+    };
+    assert.deepEqual(persisted.state.reviewWindow?.requestHistory, [
+      { sequence: 1, phase: "initial", text: prompt },
+    ], "the initial extension-sourced prompt is explicitly present in review request context");
+
+    const armed = JSON.parse(await readFile(`${sessionFile}.pi-review-gate-state.json`, "utf8")) as {
+      state: { reviewWindow?: { baseline?: { kind?: string } } };
+    };
+    assert.equal(armed.state.reviewWindow?.baseline?.kind, "checkpoint",
+      "the initialized live-session checkpoint scope arms the actual first turn");
+    await runtime.fire("session_shutdown", runtime.context);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 

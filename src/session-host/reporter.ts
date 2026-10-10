@@ -41,7 +41,7 @@
 
 import net from "node:net";
 import { NativePersistenceTracker, parseNativePersistenceReceipt, readNativePersistence, type NativePersistenceReceipt } from "./native-persistence";
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { extractContext, extractToolName, registerHook, type HookHandler } from "../pi";
 import {
   activateOwnedActivity,
@@ -49,6 +49,15 @@ import {
   ownedActivitySnapshot,
   subscribeOwnedActivity,
 } from "./owned-activity";
+import {
+  publishSessionHostSpawnCapability,
+  revokeSessionHostSpawnCapability,
+  type SessionHostSpawnCapability,
+} from "./spawn-capability";
+import {
+  getSessionHostTitleColumns,
+  primeSessionHostStartupMetadata,
+} from "./startup-request";
 import {
   HOST_BOOTSTRAP_ENV,
   MAX_NATIVE_SESSION_NAME_LENGTH,
@@ -59,6 +68,7 @@ import {
   isValidRenameName,
   hasCompleteSessionIdle,
   parseBootstrap,
+  parseSpawnRequest,
   sanitizeActivityLine,
   type SessionHostBootstrap,
   type SessionHostHello,
@@ -69,6 +79,8 @@ import {
   type SessionHostShutdownAck,
   type SessionHostShutdownRequest,
   type SessionHostStatus,
+  type SessionSpawnInput,
+  type SessionSpawnOutcome,
 } from "./protocol";
 
 declare const module: {
@@ -91,10 +103,13 @@ const EXIT_HANDLER_FLAG = Symbol.for("pi-review-gate.session-host.exit-handler")
 const DEFAULT_RECONNECT_DELAY_MS = 1_000;
 const DEFAULT_MAX_RECONNECT_ATTEMPTS = 3;
 const CONNECT_TIMEOUT_MS = 3_000;
+const DEFAULT_SESSION_SPAWN_TIMEOUT_MS = 65_000;
 /** Encoded rename/shutdown replies waiting outside Node's bounded writable buffer. */
 const MAX_QUEUED_RENAME_ACKS = 4;
 const MAX_CONCURRENT_SHUTDOWN_REQUESTS = 1;
 const MAX_RECENT_SHUTDOWN_REQUEST_IDS = 64;
+const MAX_CONCURRENT_SPAWN_REQUESTS = 2;
+const MAX_RECENT_SPAWN_REQUEST_IDS = 64;
 
 export interface SessionHostReporterOptions {
   /** Test seam: reconnect delay. Production default is 1000ms. */
@@ -105,6 +120,8 @@ export interface SessionHostReporterOptions {
   onSocket?: (socket: net.Socket) => void;
   /** Test seam: supply an in-memory socket without touching a local IPC endpoint. */
   connectSocket?: (socketPath: string) => net.Socket;
+  /** Test seam: bounded caller wait for SessionSpawn. Production default is 65 seconds. */
+  spawnTimeoutMs?: number;
 }
 
 interface StickyState {
@@ -341,14 +358,17 @@ export function primeReporterBootstrap(): SessionHostBootstrap | undefined {
 export async function activate(pi: unknown, options: SessionHostReporterOptions = {}): Promise<void> {
   // Prime (or recover the preloaded sticky copy of) the bootstrap before any
   // async work so descendants never inherit the socket path or token.
-  primeReporterBootstrap();
+  const primedBootstrap = primeReporterBootstrap();
 
   // The companion is a top-level CLI-child surface; executor runtimes
   // (orchestrated workers) never report session status.
-  if (process.env.PI_REVIEW_GATE_RUNTIME_ROLE === "executor") return;
+  const isExecutor = process.env.PI_REVIEW_GATE_RUNTIME_ROLE === "executor";
+  primeSessionHostStartupMetadata(!isExecutor && (primedBootstrap !== undefined || readStickyState() !== undefined));
+  if (isExecutor) return;
 
   const sticky = readStickyState();
   if (!sticky) return; // No valid bootstrap: register nothing, perform no IO.
+  const titleColumns = getSessionHostTitleColumns();
 
   // Opt this native process into owned-activity observation only now, with a
   // valid authenticated bootstrap confirmed. Without it the registry stays
@@ -356,7 +376,7 @@ export async function activate(pi: unknown, options: SessionHostReporterOptions 
   activateOwnedActivity();
 
   installExitCleanup();
-  const reporter = createReporter(pi, sticky, options);
+  const reporter = createReporter(pi, sticky, options, titleColumns);
   writeStickyState({
     bootstrap: reporter.bootstrap,
     sequence: reporter.sequence,
@@ -366,6 +386,7 @@ export async function activate(pi: unknown, options: SessionHostReporterOptions 
     shutdownRequested: reporter.shutdownRequested,
     teardown: reporter.teardown,
   });
+  publishSessionHostSpawnCapability(reporter.spawnCapability);
 }
 
 export default activate;
@@ -399,12 +420,23 @@ interface ReporterHandle {
   nativePersistence?: NativePersistenceReceipt;
   teardown: () => void;
   shutdownRequested: boolean;
+  spawnCapability: SessionHostSpawnCapability;
+}
+
+interface PendingSpawnCall {
+  readonly socket: net.Socket;
+  readonly generation: number;
+  readonly resolve: (outcome: SessionSpawnOutcome) => void;
+  readonly timer: NodeJS.Timeout;
+  readonly signal?: AbortSignal;
+  readonly abortListener?: () => void;
 }
 
 function createReporter(
   pi: unknown,
   sticky: StickyState,
   options: SessionHostReporterOptions,
+  titleColumns: number | undefined,
 ): ReporterHandle {
   const bootstrap = sticky.bootstrap;
   const previousTeardown = sticky.teardown;
@@ -457,6 +489,8 @@ function createReporter(
   const pendingRenameRequestIds = new Set<string>();
   const recentRenameRequestIds = new Set<string>();
   const pendingShutdownRequestIds = new Set<string>();
+  const pendingSpawnCalls = new Map<string, PendingSpawnCall>();
+  const recentSpawnRequestIds = new Set<string>();
   const recentShutdownRequests = new Map<string, {
     expectedSessionId: string;
     expectedSessionEpoch: number;
@@ -671,6 +705,114 @@ function createReporter(
     }
   };
 
+  const rememberSpawnRequestId = (requestId: string): void => {
+    recentSpawnRequestIds.delete(requestId);
+    recentSpawnRequestIds.add(requestId);
+    while (recentSpawnRequestIds.size > MAX_RECENT_SPAWN_REQUEST_IDS) {
+      const oldest = recentSpawnRequestIds.values().next().value as string | undefined;
+      if (oldest === undefined) break;
+      recentSpawnRequestIds.delete(oldest);
+    }
+  };
+
+  const settleSpawnCall = (
+    requestId: string,
+    pending: PendingSpawnCall,
+    outcome: SessionSpawnOutcome,
+  ): boolean => {
+    if (pendingSpawnCalls.get(requestId) !== pending) return false;
+    pendingSpawnCalls.delete(requestId);
+    clearTimeout(pending.timer);
+    if (pending.signal && pending.abortListener) {
+      pending.signal.removeEventListener("abort", pending.abortListener);
+    }
+    rememberSpawnRequestId(requestId);
+    try {
+      pending.resolve(outcome);
+    } catch {
+      // A cancelled/stale model callback cannot affect the transport.
+    }
+    return true;
+  };
+
+  const settleSpawnCallsForConnection = (
+    candidate: net.Socket,
+    generation: number | undefined,
+    outcome: SessionSpawnOutcome = "unknown",
+  ): void => {
+    for (const [requestId, pending] of [...pendingSpawnCalls]) {
+      if (pending.socket === candidate && (generation === undefined || pending.generation === generation)) {
+        settleSpawnCall(requestId, pending, outcome);
+      }
+    }
+  };
+
+  const requestSessionSpawn = (input: SessionSpawnInput, signal?: AbortSignal): Promise<SessionSpawnOutcome> => {
+    if (signal?.aborted || shutdownRequested || !active || connecting || !socket || socket.destroyed) {
+      return Promise.resolve("failed"); // Definitely not sent: no child was requested.
+    }
+    if (pendingSpawnCalls.size >= MAX_CONCURRENT_SPAWN_REQUESTS) return Promise.resolve("failed");
+
+    let fields: { workspace: unknown; title: unknown; prompt: unknown };
+    try {
+      const raw = input as unknown as Record<string, unknown>;
+      fields = { workspace: raw.workspace, title: raw.title, prompt: raw.prompt };
+    } catch {
+      return Promise.resolve("failed");
+    }
+    const requestId = randomUUID();
+    const requestCandidate: unknown = {
+      version: 1,
+      type: "spawn_request",
+      instanceId: bootstrap.instanceId,
+      generation: bootstrap.generation,
+      token: bootstrap.token,
+      requestId,
+      ...fields,
+    };
+    const validated = parseSpawnRequest(requestCandidate);
+    if (!validated) return Promise.resolve("failed");
+    let frame: string;
+    try {
+      frame = encodeFrame(validated);
+    } catch {
+      return Promise.resolve("failed"); // Transport bounds reject before sending.
+    }
+
+    const candidate = socket;
+    const generation = sessionGeneration;
+    return new Promise<SessionSpawnOutcome>((resolve) => {
+      let pending!: PendingSpawnCall;
+      const timer = setTimeout(() => settleSpawnCall(requestId, pending, "unknown"), Math.max(
+        0,
+        options.spawnTimeoutMs ?? DEFAULT_SESSION_SPAWN_TIMEOUT_MS,
+      ));
+      timer.unref?.();
+      const abortListener = signal ? () => settleSpawnCall(requestId, pending, "unknown") : undefined;
+      pending = {
+        socket: candidate,
+        generation,
+        resolve,
+        timer,
+        ...(signal ? { signal } : {}),
+        ...(abortListener ? { abortListener } : {}),
+      };
+      pendingSpawnCalls.set(requestId, pending);
+      if (signal && abortListener) signal.addEventListener("abort", abortListener, { once: true });
+      if (signal?.aborted) {
+        settleSpawnCall(requestId, pending, "failed"); // Still before the synchronous write.
+        return;
+      }
+      if (!active || shutdownRequested || generation !== sessionGeneration || candidate !== socket || candidate.destroyed) {
+        settleSpawnCall(requestId, pending, "failed");
+        return;
+      }
+      // Once socket.write is attempted, cancellation/disconnect is unknown:
+      // the host may already be creating the child. Requests are never replayed.
+      if (!tryWriteFrame(frame)) settleSpawnCall(requestId, pending, "unknown");
+    });
+  };
+
   const flushQueuedRenameAcks = (candidate: net.Socket, generation: number): boolean => {
     if (!active || generation !== sessionGeneration || candidate !== socket) return false;
     while (renameAckQueue.length > 0) {
@@ -697,6 +839,7 @@ function createReporter(
     inboundBuffer = Buffer.alloc(0);
     if (socket) {
       const stale = socket;
+      settleSpawnCallsForConnection(stale, undefined, "unknown");
       socket = undefined;
       stale.removeAllListeners();
       try {
@@ -779,6 +922,7 @@ function createReporter(
     candidate.on("close", () => {
       candidate.setTimeout(0);
       if (candidate !== socket) return;
+      settleSpawnCallsForConnection(candidate, generation, "unknown");
       socket = undefined;
       connecting = false;
       drainPending = false;
@@ -1387,8 +1531,30 @@ function createReporter(
       return false;
     }
     const message = decodeFrame(line);
-    if (!message || (message.type !== "rename_request" && message.type !== "shutdown_request")) {
+    if (!message) {
       candidate.destroy(); // Reporter accepts only authenticated host commands.
+      return false;
+    }
+    if (message.type === "spawn_result") {
+      if (message.instanceId !== bootstrap.instanceId || message.generation !== bootstrap.generation) {
+        candidate.destroy();
+        return false;
+      }
+      const pending = pendingSpawnCalls.get(message.requestId);
+      if (!pending) {
+        if (recentSpawnRequestIds.has(message.requestId)) return true; // Late result after timeout/cancellation.
+        candidate.destroy();
+        return false;
+      }
+      if (pending.socket !== candidate || pending.generation !== generation) {
+        candidate.destroy();
+        return false;
+      }
+      settleSpawnCall(message.requestId, pending, message.outcome);
+      return !candidate.destroyed;
+    }
+    if (message.type !== "rename_request" && message.type !== "shutdown_request") {
+      candidate.destroy(); // No status or peer-originated control frame is accepted from the broker.
       return false;
     }
     if (message.type === "rename_request") processRenameRequest(candidate, generation, message);
@@ -1525,6 +1691,13 @@ function createReporter(
     lastSnapshot = undefined;
   };
 
+  const spawnCapability: SessionHostSpawnCapability = Object.freeze({
+    spawn: requestSessionSpawn,
+    // 0 is deliberately invalid: without a host-issued visible-layout budget
+    // the model-visible tool must not invent a constant width recommendation.
+    titleColumns: titleColumns ?? 0,
+  });
+
   const teardown = (): void => {
     try {
       unsubscribeOwnedActivity();
@@ -1532,6 +1705,7 @@ function createReporter(
       // Best-effort reader detach; the registry contains listener failures.
     }
     deactivate();
+    revokeSessionHostSpawnCapability(spawnCapability);
   };
 
   // ------------------------------------------------------------------
@@ -1664,5 +1838,14 @@ function createReporter(
   registerHook(pi, "session_compact", reprobesReadiness);
   registerHook(pi, "session_compact_failed", reprobesReadiness);
 
-  return { bootstrap, sequence, sessionEpoch, nativeSessionId, nativePersistence: nativePersistenceTracker.snapshot(), teardown, shutdownRequested };
+  return {
+    bootstrap,
+    sequence,
+    sessionEpoch,
+    nativeSessionId,
+    nativePersistence: nativePersistenceTracker.snapshot(),
+    teardown,
+    shutdownRequested,
+    spawnCapability,
+  };
 }

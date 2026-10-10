@@ -195,12 +195,7 @@ export function createState(): ReviewGateState {
   };
 }
 
-export function rememberUserRequest(state: ReviewGateState, request: string): void {
-  const text = request.trim();
-  if (!text) {
-    return;
-  }
-
+function appendUserRequest(state: ReviewGateState, text: string): void {
   const window = state.reviewWindow ?? openReviewWindow(state);
   if (window.requestHistory.length === 0) {
     window.requestHistory.push({
@@ -215,6 +210,18 @@ export function rememberUserRequest(state: ReviewGateState, request: string): vo
       text,
     });
   }
+}
+
+export function rememberUserRequest(state: ReviewGateState, request: string): void {
+  const text = request.trim();
+  if (!text) return;
+  appendUserRequest(state, text);
+}
+
+/** Records a hosted startup prompt verbatim, including its requested whitespace. */
+export function rememberUserRequestVerbatim(state: ReviewGateState, request: string): void {
+  if (!request) return;
+  appendUserRequest(state, request);
 }
 
 export function beginAgentRun(state: ReviewGateState): "new" | "continuation" {

@@ -20,6 +20,7 @@ import {
   type CreateInstanceOptions,
   type InstancePty,
   type InstanceSpawnDescriptor,
+  type InstanceStatusHandlers,
   type InstanceStatusRegistration,
   type InstanceStatusUpdate,
   type NativeInstanceView,
@@ -32,9 +33,10 @@ import {
   listSavedSessions,
   type SavedSessionAdmission,
 } from "../src/session-host/saved-sessions";
-import { SESSION_HOST_BOOTSTRAP_ENV, prepareNativeLaunch } from "../src/session-host/launch";
+import { SESSION_HOST_BOOTSTRAP_ENV, composeFreshSessionSpawnArgs, prepareNativeLaunch } from "../src/session-host/launch";
+import { SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV } from "../src/session-host/startup-request";
 import { TerminalSurface } from "../src/session-host/terminal-surface";
-import type { StatusRenameRequest, StatusRenameResult } from "../src/session-host/broker";
+import type { StatusRenameRequest, StatusRenameResult, StatusShutdownResult } from "../src/session-host/broker";
 
 /**
  * Focused component tests for the independent owned-PTY instance lifecycle.
@@ -350,7 +352,7 @@ class FakePty implements InstancePty {
 
 interface RegistrarEntry {
   instanceId: string;
-  handlers: { onStatus(update: InstanceStatusUpdate): void; onDisconnect(): void };
+  handlers: InstanceStatusHandlers;
   bootstrap: InstanceStatusRegistration["bootstrap"];
   released: boolean;
 }
@@ -360,6 +362,7 @@ class FakeRegistrar implements StatusRegistrar {
   readonly order: string[] = ["registrar"];
   readonly renameRequests: { instanceId: string; request: StatusRenameRequest }[] = [];
   renameHandler?: (entry: RegistrarEntry, request: StatusRenameRequest) => Promise<StatusRenameResult>;
+  shutdownHandler?: (entry: RegistrarEntry, options?: { readonly requireIdle?: boolean }) => Promise<StatusShutdownResult>;
   nextToken?: string;
 
   register(instanceId: string, handlers: RegistrarEntry["handlers"]): InstanceStatusRegistration {
@@ -390,6 +393,9 @@ class FakeRegistrar implements StatusRegistrar {
         this.renameRequests.push({ instanceId, request: { ...request } });
         return this.renameHandler!(entry, request);
       };
+    }
+    if (this.shutdownHandler) {
+      registration.shutdown = (options) => this.shutdownHandler!(entry, options);
     }
     return registration;
   }
@@ -435,6 +441,8 @@ interface HarnessOptions {
   managerEnv?: NodeJS.ProcessEnv;
   getSupportedKeyboardFlags?: () => number;
   onChange?: (instanceId: string) => void;
+  onSpawnRequest?: (parentInstanceId: string, request: import("../src/session-host/protocol").SessionSpawnInput) => Promise<import("../src/session-host/protocol").SessionSpawnOutcome>;
+  shutdownHandler?: (entry: RegistrarEntry, options?: { readonly requireIdle?: boolean }) => Promise<StatusShutdownResult>;
 }
 
 function makeHarness(label: string, options: HarnessOptions = {}): Harness {
@@ -447,6 +455,7 @@ function makeHarness(label: string, options: HarnessOptions = {}): Harness {
   mkdirSync(workspace, { recursive: true });
   mkdirSync(workspace2, { recursive: true });
   const registrar = new FakeRegistrar();
+  registrar.shutdownHandler = options.shutdownHandler;
   const spawned: FakePty[] = [];
   const profileRegistry = new ProfileRegistry({ stateRoot });
   const ptyFactory: PtyFactory = (descriptor) => {
@@ -468,6 +477,7 @@ function makeHarness(label: string, options: HarnessOptions = {}): Harness {
     getSupportedKeyboardFlags: options.getSupportedKeyboardFlags ?? (() => 7),
     ptyFactory,
     onChange: options.onChange,
+    onSpawnRequest: options.onSpawnRequest,
   });
   return {
     root,
@@ -743,6 +753,115 @@ test("default native setup shares one owned Pi root without copying resources or
     harness.spawned[1]!.exitsOnSignal = "SIGTERM";
     await manager.shutdown({ graceMs: 30, killMs: 30 });
     await manager.dispose();
+  } finally {
+    cleanup(harness);
+  }
+});
+
+test("fresh SessionSpawn launch removes inherited messages and stores exact startup data outside argv", async () => {
+  const harness = makeHarness("spawn-launch-composition");
+  try {
+    const managerEnv = cleanTestEnv();
+    managerEnv[SESSION_HOST_STARTUP_REQUEST_ENV] = "inherited request must be stripped";
+    managerEnv[SESSION_HOST_TITLE_COLUMNS_ENV] = "999";
+    const originalArgs = [
+      "--provider", "openai",
+      "--model", "test-model",
+      "-n", "old native title",
+      "--print", "parent print message",
+      "@parent-prompt.md",
+      "--custom-resource", "preserved extension value",
+      "bare parent message",
+    ];
+    const originalEnv = { ...managerEnv };
+    const manager = new InstanceManager({
+      packageRoot: harness.packageRoot,
+      piExecutable: harness.piExecutable,
+      statusRegistrar: harness.registrar,
+      nativeSetup: false,
+      profileRegistry: new ProfileRegistry({ stateRoot: harness.stateRoot }),
+      args: originalArgs,
+      env: managerEnv,
+      getSidebarTitleColumns: () => 47,
+      ptyFactory: harness.ptyFactory,
+    });
+
+    const ordinaryId = await manager.create({ workspace: harness.workspace });
+    const ordinary = harness.spawned[0]!.spawnDescriptor;
+    assert.deepEqual(ordinary.args.slice(-originalArgs.length), originalArgs,
+      "ordinary instance arguments retain the established byte-for-byte launch path");
+    assert.equal(ordinary.env[SESSION_HOST_STARTUP_REQUEST_ENV], undefined);
+    assert.equal(ordinary.env[SESSION_HOST_TITLE_COLUMNS_ENV], "47");
+    assert.equal(JSON.parse(ordinary.env[SESSION_HOST_BOOTSTRAP_ENV] as string).instanceId, ordinaryId);
+
+    const title = " Exact child title ";
+    const prompt = "@/literal-not-a-file\n--session /tmp/not-a-session-option\n/prompt-template literal\n";
+    const childId = await manager.create({
+      workspace: harness.workspace2,
+      initialRequest: { title, prompt },
+    });
+    const child = harness.spawned[1]!.spawnDescriptor;
+    assert.equal(child.cwd, realpathSync(harness.workspace2), "the requested existing workspace is the child cwd");
+    const composed = composeFreshSessionSpawnArgs(originalArgs, title);
+    assert.deepEqual(child.args.slice(-composed.length), composed,
+      "only inherited native settings survive, with the per-child name appended in option position");
+    assert.equal(child.args.includes(prompt), false, "the prompt is not sent through CLI positional/@file parsing");
+    assert.deepEqual(JSON.parse(child.env[SESSION_HOST_STARTUP_REQUEST_ENV] as string), { title, prompt },
+      "the exact title and initial prompt travel only in the one-shot startup handoff");
+    assert.equal(child.env[SESSION_HOST_TITLE_COLUMNS_ENV], "47");
+    assert.equal(JSON.parse(child.env[SESSION_HOST_BOOTSTRAP_ENV] as string).instanceId, childId);
+    assert.deepEqual(managerEnv, originalEnv, "per-child startup metadata never mutates the caller environment");
+    await manager.dispose();
+  } finally {
+    cleanup(harness);
+  }
+});
+
+test("parent Stop fences authenticated spawn requests until a positive idle-only rejection", async () => {
+  let resolveShutdown!: (result: StatusShutdownResult) => void;
+  let shutdownCalls = 0;
+  let spawnCalls = 0;
+  const harness = makeHarness("spawn-stop-admission-fence", {
+    shutdownHandler: async (_entry, options) => {
+      shutdownCalls += 1;
+      assert.equal(options?.requireIdle, true, "the first Stop attempt is an idle-only preflight");
+      return new Promise<StatusShutdownResult>((resolve) => { resolveShutdown = resolve; });
+    },
+    onSpawnRequest: async () => {
+      spawnCalls += 1;
+      return "started";
+    },
+  });
+  try {
+    const parentId = await harness.manager.create({ workspace: harness.workspace });
+    const parent = harness.registrar.entryFor(parentId);
+    harness.registrar.emitStatus(parent, {
+      busy: false,
+      pendingInput: false,
+      inputSurface: false,
+      activity: [],
+      nativeSession: { sessionId: "native-stop-parent", epoch: 1, name: "Parent" },
+      backgroundTasks: 0,
+      backgroundShells: 0,
+    });
+
+    const stopping = harness.manager.stop(parentId, { confirmed: false });
+    await until(() => shutdownCalls === 1, "parent Stop has sent its delayed authenticated shutdown preflight");
+    const request = { workspace: harness.workspace2, title: "Sibling", prompt: "Start a sibling." };
+    assert.equal(await parent.handlers.onSpawnRequest?.(request), "failed",
+      "the exact parent cannot authorize SessionSpawn while its Stop acknowledgement is pending");
+    assert.equal(spawnCalls, 0);
+    assert.equal(harness.spawned.length, 1, "the delayed Stop creates no surviving sibling");
+
+    resolveShutdown({ requestId: "idle-rejected", status: "not-idle" });
+    assert.deepEqual(await stopping, { status: "confirmation-required", forced: false });
+    assert.equal(await parent.handlers.onSpawnRequest?.(request), "started",
+      "a positive idle-only rejection reopens this parent's spawn admission");
+    assert.equal(spawnCalls, 1);
+    assert.equal(harness.spawned.length, 1, "the harness callback is admitted only after the rejection");
+
+    harness.spawned[0]!.emitExit(0);
+    await harness.manager.dispose();
   } finally {
     cleanup(harness);
   }

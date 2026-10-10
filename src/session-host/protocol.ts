@@ -11,14 +11,21 @@
  * top-level busy/idle, pending-input presence, modal input surface, a
  * two-line generic activity summary, optional canonical native-session
  * identity/name metadata, and optional bounded owned background-work counts
- * (logical execution/review work and unconfirmed background shell jobs). The host can also send narrowly scoped,
- * authenticated native rename and graceful-shutdown requests and receive their
- * observed results.
+ * (logical execution/review work and unconfirmed background shell jobs). The
+ * host can also send narrowly scoped authenticated native rename and
+ * graceful-shutdown requests and receive their observed results. Status frames
+ * still carry no tool arguments, prompts, or transcripts. A hosted child may
+ * explicitly submit one bounded authenticated SessionSpawn command containing
+ * its supplied workspace, title, and prompt; the host replies only with a
+ * bounded launch outcome.
  *
  * Privacy contract: status frames carry no tool arguments, question text,
  * transcripts, or credentials. Owned-work counts are opaque numbers only.
- * The canonical native conversation name is
- * the sole intentionally allowed prompt-derived title. The bootstrap token
+ * Spawn commands intentionally carry the supplied workspace/title/prompt, but
+ * the prompt is not copied into status snapshots or status/sidebar diagnostics.
+ * The requested title appears through ordinary native conversation-name and
+ * sidebar fields; the prompt is delivered to the new child's conversation.
+ * The bootstrap token
  * appears in the hello and authenticated command frames only. Every
  * field is strictly bounded and MAX_STATUS_FRAME_BYTES caps each wire frame;
  * this module is the shared contract for both sides and performs no IO.
@@ -39,6 +46,10 @@ export const MAX_NATIVE_SESSION_NAME_LENGTH = 256;
 /** Rename is never silently clipped: complete persisted input must fit this UTF-8 byte limit. */
 export const MAX_RENAME_NAME_BYTES = 1024;
 export const MAX_NATIVE_SESSION_ID_BYTES = 256;
+/** SessionSpawn fields have independent transport bounds; sidebar width is not a data limit. */
+export const MAX_SESSION_SPAWN_WORKSPACE_BYTES = 4096;
+export const MAX_SESSION_SPAWN_TITLE_BYTES = MAX_RENAME_NAME_BYTES;
+export const MAX_SESSION_SPAWN_PROMPT_BYTES = 8192;
 
 /** Complete observed inactivity; unknown or absent work/input state can never authorize an idle-only stop. */
 export function hasCompleteSessionIdle(state: {
@@ -195,8 +206,42 @@ export interface SessionHostShutdownAck {
   reason: "none" | "stale-session" | "unavailable" | "shutdown-failed" | "already-requested" | "not-idle";
 }
 
+/** Explicit child request; the token is checked by the broker and never passed to host/UI callbacks. */
+export interface SessionHostSpawnRequest {
+  version: 1;
+  type: "spawn_request";
+  instanceId: string;
+  generation: string;
+  token: string;
+  requestId: string;
+  workspace: string;
+  /** Complete persisted native title input; bounded only for transport safety, never clipped to sidebar width. */
+  title: string;
+  /** Exact initial user prompt; bounded only for transport safety. */
+  prompt: string;
+}
+
+/** Host acknowledgement is about launch, never model completion or prompt processing. */
+export interface SessionHostSpawnAck {
+  version: 1;
+  type: "spawn_result";
+  instanceId: string;
+  generation: string;
+  requestId: string;
+  outcome: "started" | "failed" | "unknown";
+}
+
+/** Non-wire input passed from the broker to the owning host registration. */
+export interface SessionSpawnInput {
+  workspace: string;
+  title: string;
+  prompt: string;
+}
+
+export type SessionSpawnOutcome = SessionHostSpawnAck["outcome"];
+
 export type SessionHostMessage = SessionHostHello | SessionHostStatus | SessionHostRenameRequest | SessionHostRenameAck
-  | SessionHostShutdownRequest | SessionHostShutdownAck;
+  | SessionHostShutdownRequest | SessionHostShutdownAck | SessionHostSpawnRequest | SessionHostSpawnAck;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -472,6 +517,53 @@ export function parseShutdownAck(value: unknown): SessionHostShutdownAck | undef
   };
 }
 
+/** Validates a bounded host-mediated fresh-session request without normalizing any supplied data. */
+export function parseSpawnRequest(value: unknown): SessionHostSpawnRequest | undefined {
+  if (!isRecord(value) || value.version !== PROTOCOL_VERSION || value.type !== "spawn_request") return undefined;
+  if (!isValidId(value.instanceId) || !isValidId(value.generation) || !isValidToken(value.token)
+    || !isValidId(value.requestId)) return undefined;
+  if (typeof value.workspace !== "string" || value.workspace.length === 0
+    || Buffer.byteLength(value.workspace, "utf8") > MAX_SESSION_SPAWN_WORKSPACE_BYTES
+    || value.workspace.includes("\0")) return undefined;
+  if (!isValidRenameName(value.title)
+    || Buffer.byteLength(value.title, "utf8") > MAX_SESSION_SPAWN_TITLE_BYTES) return undefined;
+  if (typeof value.prompt !== "string" || value.prompt.length === 0
+    || Buffer.byteLength(value.prompt, "utf8") > MAX_SESSION_SPAWN_PROMPT_BYTES
+    || value.prompt.includes("\0")) return undefined;
+  const parsed: SessionHostSpawnRequest = {
+    version: 1,
+    type: "spawn_request",
+    instanceId: value.instanceId,
+    generation: value.generation,
+    token: value.token,
+    requestId: value.requestId,
+    workspace: value.workspace,
+    title: value.title,
+    prompt: value.prompt,
+  };
+  // Individual fields are independently bounded, but JSON escaping (for
+  // example a prompt made of control characters) can expand them together.
+  // Reject any request that cannot fit the shared raw-frame limit before the
+  // reporter attempts a write or the broker receives user data.
+  if (Buffer.byteLength(`${JSON.stringify(parsed)}\n`, "utf8") > MAX_STATUS_FRAME_BYTES) return undefined;
+  return parsed;
+}
+
+/** Validates a correlated host launch acknowledgement; it never carries user data or credentials. */
+export function parseSpawnAck(value: unknown): SessionHostSpawnAck | undefined {
+  if (!isRecord(value) || value.version !== PROTOCOL_VERSION || value.type !== "spawn_result") return undefined;
+  if (!isValidId(value.instanceId) || !isValidId(value.generation) || !isValidId(value.requestId)) return undefined;
+  if (value.outcome !== "started" && value.outcome !== "failed" && value.outcome !== "unknown") return undefined;
+  return {
+    version: 1,
+    type: "spawn_result",
+    instanceId: value.instanceId,
+    generation: value.generation,
+    requestId: value.requestId,
+    outcome: value.outcome,
+  };
+}
+
 /**
  * Validates a raw wire line (with or without the trailing newline): bounded
  * size, JSON syntax, and message shape. Returns undefined when malformed.
@@ -494,6 +586,8 @@ export function decodeFrame(line: string): SessionHostMessage | undefined {
     case "rename_result": return parseRenameAck(parsed);
     case "shutdown_request": return parseShutdownRequest(parsed);
     case "shutdown_result": return parseShutdownAck(parsed);
+    case "spawn_request": return parseSpawnRequest(parsed);
+    case "spawn_result": return parseSpawnAck(parsed);
     default: return undefined;
   }
 }

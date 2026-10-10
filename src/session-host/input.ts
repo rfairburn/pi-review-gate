@@ -62,7 +62,7 @@ type SpecialKey =
 	| "f7" | "f8" | "f9" | "f10" | "f11" | "f12"
 	| "kpBegin";
 
-interface MouseEvent {
+export interface ParsedMouseInput {
 	readonly button: number;
 	readonly x: number;
 	readonly y: number;
@@ -641,7 +641,10 @@ function encodeKey(eventInput: KeyEvent, modes: InputTargetModes): string | unde
 	return encodeLegacyText(event, modes);
 }
 
-function parseMouse(data: string): MouseEvent | undefined | null {
+export function parseMouseInput(data: string): ParsedMouseInput | undefined | null {
+	const isSgrMouse = data.startsWith(`${CSI}<`);
+	const isX10Mouse = data.startsWith(`${CSI}M`);
+	if (!isSgrMouse && !isX10Mouse) return undefined;
 	if (data.length > MAX_CSI_PACKET_LENGTH) return null;
 	const sgr = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/.exec(data);
 	if (sgr) {
@@ -655,7 +658,7 @@ function parseMouse(data: string): MouseEvent | undefined | null {
 		return { button, x: x - 1, y: y - 1, release, motion, wheel };
 	}
 
-	if (data.startsWith(`${CSI}M`)) {
+	if (isX10Mouse) {
 		if (data.length !== 6) return null;
 		const encodedButton = data.charCodeAt(3);
 		const encodedX = data.charCodeAt(4);
@@ -667,10 +670,10 @@ function parseMouse(data: string): MouseEvent | undefined | null {
 		const release = !motion && !wheel && (button & 3) === 3;
 		return { button, x: encodedX - 33, y: encodedY - 33, release, motion, wheel };
 	}
-	return undefined;
+	return null;
 }
 
-function mouseAllowed(mouse: MouseEvent, tracking: InputTargetModes["mouseTracking"]): boolean {
+function mouseAllowed(mouse: ParsedMouseInput, tracking: InputTargetModes["mouseTracking"]): boolean {
 	if (tracking === "none") return false;
 	if (tracking === "x10") return !mouse.release && !mouse.motion && !mouse.wheel;
 	if (tracking === "vt200") return !mouse.motion;
@@ -678,7 +681,7 @@ function mouseAllowed(mouse: MouseEvent, tracking: InputTargetModes["mouseTracki
 	return true;
 }
 
-function translateMouse(mouseInput: MouseEvent, modes: InputTargetModes, viewport: InputViewport): string | Buffer | undefined {
+function translateMouse(mouseInput: ParsedMouseInput, modes: InputTargetModes, viewport: InputViewport): string | Buffer | undefined {
 	if (modes.mouseEncoding === "sgr-pixels") return undefined;
 	if (mouseInput.x < viewport.column || mouseInput.x >= viewport.column + viewport.cols
 		|| mouseInput.y < viewport.row || mouseInput.y >= viewport.row + viewport.rows) return undefined;
@@ -761,7 +764,7 @@ export function translateInput(
 	const paste = translatePaste(data, modes);
 	if (paste !== undefined) return paste === null ? undefined : paste;
 
-	const mouse = parseMouse(data);
+	const mouse = parseMouseInput(data);
 	if (mouse !== undefined) return mouse === null ? undefined : translateMouse(mouse, modes, viewport);
 
 	const key = parseLegacyKeyboardSequence(data);

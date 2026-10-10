@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { Buffer } from "node:buffer";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Writable } from "node:stream";
@@ -9,7 +10,11 @@ import test from "node:test";
 
 import type { ComposedHostFrame } from "../src/session-host/compositor";
 import type { CreateInstanceOptions, InstanceManagerOptions, NativeInstanceView, ShutdownResult } from "../src/session-host/instances";
-import type { SessionHostFrameWriterOptions } from "../src/session-host/frame-writer";
+import {
+  createSessionHostFrameWriter,
+  type SessionHostFrameDisposition,
+  type SessionHostFrameWriterOptions,
+} from "../src/session-host/frame-writer";
 import type { KeyboardCapabilityObserverOptions } from "../src/session-host/input";
 import type { StatusBroker, StatusRenameRequest, StatusRenameResult } from "../src/session-host/broker";
 import { NativeAgentRegistry, type ProfilePreparer } from "../src/session-host/profiles";
@@ -36,6 +41,47 @@ function makeMainTestDirectory(prefix: string): string {
 class FakeInput extends EventEmitter {
   readonly isTTY = true;
   readableEnded = false;
+}
+
+class QueuedFrameOutput extends EventEmitter {
+  readonly writes: Buffer[] = [];
+  private readonly queued: Array<{ readonly bytes: Buffer; readonly callback?: (error?: Error | null) => void }> = [];
+  private queueNext = false;
+  private queuedWriteAccepted = false;
+
+  get queuedCount(): number { return this.queued.length; }
+
+  refuseNextWrite(accepted = false): void {
+    this.queueNext = true;
+    this.queuedWriteAccepted = accepted;
+  }
+
+  write(chunk: Uint8Array | string, callback?: (error?: Error | null) => void): boolean {
+    const bytes = Buffer.from(chunk);
+    if (this.queueNext) {
+      this.queueNext = false;
+      this.queued.push({ bytes, callback });
+      return this.queuedWriteAccepted;
+    }
+    this.writes.push(bytes);
+    callback?.();
+    return true;
+  }
+
+  completeQueuedWrites(): void {
+    for (const item of this.queued.splice(0)) {
+      this.writes.push(item.bytes);
+      item.callback?.();
+    }
+  }
+
+  drain(): void {
+    this.completeQueuedWrites();
+    this.emit("drain");
+  }
+
+  end(): this { return this; }
+  destroy(): this { return this; }
 }
 
 class FakeOutput extends EventEmitter {
@@ -161,9 +207,15 @@ class FakeWriter {
     this.started = true;
   }
 
-  submit(frame: ComposedHostFrame, cols: number, rows: number): void {
+  submit(
+    frame: ComposedHostFrame,
+    cols: number,
+    rows: number,
+    onSettled?: (disposition: SessionHostFrameDisposition) => void,
+  ): void {
     if (this.closed) this.submitsAfterClose += 1;
     this.frames.push({ frame, cols, rows });
+    onSettled?.("written");
   }
 
   invalidate(): void {
@@ -596,6 +648,25 @@ function plainLine(frame: ComposedHostFrame | undefined, row: number): string {
   return frame?.lines[row]?.replace(/\x1b\[[0-9;]*m/g, "") ?? "";
 }
 
+function screenRowContaining(frame: ComposedHostFrame | undefined, text: string, fromRow = 1): number {
+  return frame?.lines.findIndex((line, row) => row >= fromRow
+    && line.replace(/\x1b\[[0-9;]*m/g, "").includes(text)) ?? -1;
+}
+
+function emitMouse(
+  terminal: FakeTerminal,
+  column: number,
+  row: number,
+  button = 0,
+  final: "M" | "m" = "M",
+): void {
+  terminal.emitInput(`${ESC}[<${button};${column + 1};${row + 1}${final}`);
+}
+
+function emitX10Mouse(terminal: FakeTerminal, column: number, row: number, button = 0): void {
+  terminal.emitInput(`${ESC}[M${String.fromCharCode(button + 32, column + 33, row + 33)}`);
+}
+
 test("Main module import is inert: no ProcessTerminal, native PTY, terminal listeners, or timers are constructed", () => {
   const entry = join(process.cwd(), "dist-test", "src", "session-host", "main.js");
   const script = `
@@ -958,8 +1029,8 @@ test("pending Main input stays draw-free until focus or resize changes the host 
   assert.equal(harness.writer.frames.length, baselineFrames + 1,
     "the actual focus change draws once rather than first submitting a stale input-triggered frame");
   assert.equal(manager.resizeCalls.length, baselineResizes, "focus-only changes preserve child geometry");
-  assert.deepEqual(harness.terminal.writes.slice(-2), ["\x1b[?1003l", "\x1b[?1006l"],
-    "focus change synchronously disables only the mouse modes Main enabled");
+  assert.deepEqual(harness.terminal.writes.slice(-2), ["\x1b[?1003l", "\x1b[?1000h"],
+    "focus change hands tracking to the visible host pane without releasing its cell-SGR mode");
 
   const beforeHideFrames = harness.writer.frames.length;
   harness.terminal.emitInput(ALT_LEFT); // hide the sidebar and return to Main
@@ -1063,6 +1134,9 @@ test("external editor handoff settles the frame writer, applies a normal editor 
   assert.ok(harness.events.lastIndexOf("writer.start") > harness.events.indexOf("external-editor.run"));
   const form = harness.sidebar?.renderForm(80, 24).lines.join("\n") ?? "";
   assert.match(form, /edited-in-native-editor/);
+  assert.deepEqual(harness.terminal.writes.slice(-4), [
+    "\x1b[?1000l", "\x1b[?1006l", "\x1b[?1000h", "\x1b[?1006h",
+  ], "external-editor handoff releases and restores only the host-owned mouse modes");
   assert.equal(await closeWithSignal(harness), 0);
 });
 
@@ -1737,6 +1811,497 @@ test("late create after form abandonment may finish but cannot steal focus or au
   assert.equal(await closeWithSignal(harness), 0);
 });
 
+test("visible host panes own clicks while native Main mouse keeps child modes and viewport clipping", async () => {
+  const empty = createHarness();
+  const emptyManager = await ready(empty);
+  assert.ok(empty.terminal.writes.includes("\x1b[?1000h"), "a visible sidebar enables host button reports without a child");
+  assert.ok(empty.terminal.writes.includes("\x1b[?1006h"), "host hit testing uses bounded cell-coordinate SGR packets");
+  const welcome = empty.writer.frames.at(-1)?.frame;
+  const welcomeNew = screenRowContaining(welcome, "New session");
+  assert.ok(welcomeNew > 0);
+  emitMouse(empty.terminal, 1, 0); // header: host-owned but not an entry
+  assert.equal(empty.sidebar?.focus, "sidebar");
+  emitX10Mouse(empty.terminal, 1, welcomeNew); // legacy X10 click shares the bounded decoder
+  assert.equal(empty.sidebar?.focus, "form", "one click opens the existing New form");
+  assert.equal(emptyManager.createOptions.length, 0, "opening New does not submit it");
+  assert.equal(await closeWithSignal(empty), 0);
+  assert.ok(empty.terminal.writes.includes("\x1b[?1000l"), "shutdown disables the host-owned tracking mode");
+  assert.ok(empty.terminal.writes.includes("\x1b[?1006l"), "shutdown disables the host-owned SGR mode");
+
+  const fixture = makeSavedMainFixture("mouse-open");
+  const { overrides } = savedFixtureDependencies(fixture);
+  try {
+    const harness = createHarness({}, overrides);
+    const manager = await ready(harness);
+    const initialFrame = harness.writer.frames.at(-1)?.frame;
+    const newRow = screenRowContaining(initialFrame, "New session");
+    emitMouse(harness.terminal, 1, newRow);
+    assert.equal(harness.sidebar?.focus, "form", "New action works on the initial visible sidebar");
+    completeForm(harness.terminal, fixture.workspace);
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "main", "New completion retains its existing Main activation");
+    assert.equal(manager.createOptions.length, 1);
+
+    const rosterFrame = harness.writer.frames.at(-1)?.frame;
+    const savedActionRow = screenRowContaining(rosterFrame, "Saved conversations");
+    assert.ok(savedActionRow > 0);
+    emitMouse(harness.terminal, 1, savedActionRow);
+    assert.equal(harness.sidebar?.focus, "form", "Saved action opens the existing picker");
+    await nextTurn();
+    await nextTurn();
+    const savedFrame = harness.writer.frames.at(-1)?.frame;
+    const savedRow = screenRowContaining(savedFrame, "First conversation");
+    assert.ok(savedRow > 0, "the admitted catalog row was drawn in the right-hand Saved pane");
+    emitMouse(harness.terminal, 35, savedRow);
+    emitMouse(harness.terminal, 35, savedRow); // duplicate click while the first open is pending
+    await nextTurn();
+    await nextTurn();
+    assert.equal(manager.createOptions.length, 2, "pending-click fencing admits exactly one Saved open");
+    assert.ok(isSavedSessionAdmission(manager.createOptions[1]?.savedSession), "the existing exact admission guard remains in force");
+    assert.equal(harness.sidebar?.focus, "main", "successful Saved open activates Main without Enter");
+    assert.equal(harness.sidebar?.selectedId, "native-2");
+    assert.equal(manager.views[0]?.hasLiveProcess, true, "the previously active sibling stays live");
+
+    // A later click uses the same live-catalog duplicate admission fence as
+    // Enter; the visible row cannot spawn an already-owned conversation.
+    manager.ownedLiveSessionsData = [{ id: fixture.sessionId }];
+    harness.terminal.emitInput(ALT_LEFT); // Main -> visible sidebar
+    await nextTurn();
+    const reopenedRoster = harness.writer.frames.at(-1)?.frame;
+    const savedAgain = screenRowContaining(reopenedRoster, "Saved conversations");
+    emitMouse(harness.terminal, 1, savedAgain);
+    assert.equal(harness.sidebar?.focus, "form", "the reopened Saved roster entry opens its picker");
+    await nextTurn();
+    await nextTurn();
+    const duplicateRow = screenRowContaining(harness.writer.frames.at(-1)?.frame, "First");
+    assert.ok(duplicateRow > 0);
+    emitMouse(harness.terminal, 35, duplicateRow);
+    await nextTurn();
+    assert.equal(manager.createOptions.length, 2, "known-owned catalog duplicate starts no child");
+    const duplicateFrame = plain(harness.writer.frames.at(-1)?.frame).replace(/\s+/g, " ");
+    assert.ok(duplicateFrame.includes("already open in") && duplicateFrame.includes("this host"), duplicateFrame);
+    assert.equal(await closeWithSignal(harness), 0);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("visible roster mouse activates a clicked live owner; host gestures stay fenced and native Main gestures remain routed", async () => {
+  const harness = createHarness();
+  const manager = await startTwoSessions(harness);
+  await nextTurn();
+  const surfaceA = manager.surface("native-1");
+  assert.ok(surfaceA);
+  surfaceA.modes = { ...surfaceA.modes, mouseTracking: "drag", mouseEncoding: "sgr" };
+  manager.notify("native-a-mouse-mode");
+  await nextTurn();
+  const initialFrame = harness.writer.frames.at(-1)?.frame;
+  const aRow = screenRowContaining(initialFrame, "Native native-1");
+  const bRow = screenRowContaining(initialFrame, "Native native-2");
+  assert.ok(aRow > 0 && bRow > aRow, "both live rows were drawn in roster order");
+  const initialFocus = harness.sidebar?.focus;
+  for (const button of [2, 4]) {
+    emitMouse(harness.terminal, 1, aRow, button, "M");
+    assert.equal(harness.sidebar?.focus, initialFocus, "right/modified presses never activate an entry");
+    emitMouse(harness.terminal, 1, aRow, button, "m");
+  }
+  for (const [button, final] of [[0, "m"], [32, "M"], [64, "M"]] as const) {
+    emitMouse(harness.terminal, 1, aRow, button, final);
+    assert.equal(harness.sidebar?.focus, initialFocus, "release/motion/wheel never activate an entry");
+  }
+  emitMouse(harness.terminal, 1, 0); // header is host-owned and inert
+  assert.equal(harness.sidebar?.focus, initialFocus);
+
+  emitMouse(harness.terminal, 1, aRow);
+  assert.equal(harness.sidebar?.focus, "main");
+  assert.equal(harness.sidebar?.selectedId, "native-1", "the clicked A row becomes Main owner");
+  assert.equal(manager.views[1]?.hasLiveProcess, true, "B remains live after A activation");
+  const beforeNativeWhileHostHeld = manager.writes.length;
+  emitMouse(harness.terminal, 33, 1, 1); // independent native middle-button press
+  emitMouse(harness.terminal, 34, 2, 33); // its motion remains native while host-left is held
+  emitMouse(harness.terminal, 34, 2, 1, "m");
+  assert.deepEqual(manager.writes.slice(beforeNativeWhileHostHeld).map(({ id, data }) => [id, data]), [
+    ["native-1", "\x1b[<1;1;1M"],
+    ["native-1", "\x1b[<33;2;2M"],
+    ["native-1", "\x1b[<1;2;2m"],
+  ], "independently started native buttons are not hidden by the host-left fence");
+  const beforeHostDrag = manager.writes.length;
+  emitMouse(harness.terminal, 33, 1, 32); // host press followed by Main-pane drag motion
+  emitMouse(harness.terminal, 34, 2, 0, "m"); // release also lands over Main
+  assert.equal(manager.writes.length, beforeHostDrag, "host-originated motion and release never leak to A");
+  harness.terminal.emitInput("a-input");
+  assert.equal(manager.writes.at(-1)?.id, "native-1");
+
+  harness.terminal.emitInput(ALT_LEFT); // Main -> visible sidebar
+  await nextTurn();
+  const bVisibleRow = screenRowContaining(harness.writer.frames.at(-1)?.frame, "Native native-2");
+  assert.ok(bVisibleRow > 0);
+  emitMouse(harness.terminal, 1, bVisibleRow);
+  assert.equal(harness.sidebar?.focus, "main");
+  assert.equal(harness.sidebar?.selectedId, "native-2", "one click activates B");
+  emitMouse(harness.terminal, 1, bVisibleRow, 0, "m"); // finish the host-owned click
+  const surface = manager.surface("native-2");
+  assert.ok(surface);
+  surface.modes = { ...surface.modes, mouseTracking: "any", mouseEncoding: "sgr" };
+  manager.notify("native-mouse-mode");
+  const beforeNativeGesture = manager.writes.length;
+  emitMouse(harness.terminal, 33, 1); // native press: local (0,0)
+  emitMouse(harness.terminal, 34, 2, 32); // native drag motion: local (1,1)
+  emitMouse(harness.terminal, 34, 2, 0, "m"); // native release
+  assert.deepEqual(manager.writes.slice(beforeNativeGesture).map(({ id, data }) => [id, data]), [
+    ["native-2", "\x1b[<0;1;1M"],
+    ["native-2", "\x1b[<32;2;2M"],
+    ["native-2", "\x1b[<0;2;2m"],
+  ], "independently started Main gestures preserve press/motion/release routing");
+  harness.terminal.emitInput("b-input");
+  assert.equal(manager.writes.at(-1)?.id, "native-2", "subsequent input follows B");
+  assert.equal(manager.views[0]?.hasLiveProcess, true, "A stays live beside the new owner");
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("clicking an exited row from Main transfers only the recovery intent and activates its ready replacement", async () => {
+  const fixture = makeSavedMainFixture("mouse-resume");
+  const { overrides } = savedFixtureDependencies(fixture);
+  try {
+    const harness = createHarness({}, overrides);
+    const manager = await startTwoSessions(harness);
+    await nextTurn();
+
+    const firstRow = screenRowContaining(harness.writer.frames.at(-1)?.frame, "Native native-1");
+    emitMouse(harness.terminal, 1, firstRow);
+    assert.equal(harness.sidebar?.focus, "main");
+    assert.equal(harness.sidebar?.selectedId, "native-1", "A owns Main before B exits");
+    emitMouse(harness.terminal, 1, firstRow, 0, "m");
+
+    const bIndex = manager.views.findIndex((view) => view.id === "native-2");
+    const b = manager.views[bIndex];
+    assert.ok(b);
+    manager.views[bIndex] = {
+      ...b,
+      lifecycle: "exited",
+      hasLiveProcess: false,
+      nativeSession: null,
+      lastNativeSession: {
+        sessionId: "conversation-native-2",
+        epoch: 1,
+        name: "Native native-2",
+        persistence: "unsaved",
+      },
+    };
+    manager.notify("native-2-exited");
+    await nextTurn();
+    const exitedRow = screenRowContaining(harness.writer.frames.at(-1)?.frame, "Native native-2");
+    assert.ok(exitedRow > 0);
+    emitMouse(harness.terminal, 1, exitedRow);
+    assert.equal(harness.sidebar?.focus, "sidebar", "the exited-row restart is a sidebar-owned intent");
+    assert.equal(harness.sidebar?.selectedId, "native-2");
+
+    for (let attempt = 0; attempt < 10 && harness.sidebar?.focus !== "main"; attempt += 1) {
+      await nextTurn();
+    }
+    assert.equal(harness.sidebar?.focus, "main", "a ready replacement returns focus to Main");
+    assert.equal(harness.sidebar?.selectedId, "native-3");
+    assert.deepEqual(manager.views.map((view) => view.id), ["native-1", "native-3"]);
+    assert.equal(manager.views[0]?.hasLiveProcess, true, "A remains live while B is replaced");
+    assert.equal(manager.views[1]?.hasLiveProcess, true);
+    harness.terminal.emitInput("replacement-input");
+    assert.equal(manager.writes.at(-1)?.id, "native-3", "subsequent Main input belongs to the replacement");
+    assert.equal(await closeWithSignal(harness), 0);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("wide equal-sized panes dispatch Saved hit tests only in the right form", async () => {
+  const fixture = makeSavedMainFixture("mouse-pane-identity");
+  const { overrides } = savedFixtureDependencies(fixture);
+  try {
+    const harness = createHarness({}, overrides);
+    harness.terminal.columns = 65; // sidebar and Saved form are both exactly 32 columns
+    harness.stdout.columns = 65;
+    const manager = await ready(harness);
+    const initial = harness.writer.frames.at(-1)?.frame;
+    const savedAction = screenRowContaining(initial, "Saved conversations");
+    emitMouse(harness.terminal, 1, savedAction);
+    emitMouse(harness.terminal, 1, savedAction, 0, "m");
+    await nextTurn();
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "form");
+    const savedFrame = harness.writer.frames.at(-1)?.frame;
+    const savedRow = screenRowContaining(savedFrame, "First");
+    assert.ok(savedRow > 0);
+    assert.equal(manager.createOptions.length, 0);
+
+    // The left Saved action shares the first result's local row; pane identity
+    // must prevent it from hitting the right-hand Saved row's hit region.
+    emitMouse(harness.terminal, 1, savedRow);
+    emitMouse(harness.terminal, 1, savedRow, 0, "m");
+    assert.equal(manager.createOptions.length, 0, "left-pane rows cannot hit Saved rows in the right form");
+    assert.equal(harness.sidebar?.focus, "form");
+
+    emitMouse(harness.terminal, 34, savedRow); // the actual right-hand Saved row
+    emitMouse(harness.terminal, 34, savedRow, 0, "m");
+    await nextTurn();
+    await nextTurn();
+    assert.equal(manager.createOptions.length, 1);
+    assert.ok(isSavedSessionAdmission(manager.createOptions[0]?.savedSession));
+    assert.equal(harness.sidebar?.focus, "main");
+    assert.equal(harness.sidebar?.selectedId, "native-1");
+    assert.equal(await closeWithSignal(harness), 0);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+for (const identicalCaptions of [false, true]) for (const acceptedWhileQueued of [false, true]) for (const returnToOriginal of [false, true]) test(
+  `real frame-writer preserves Saved clickability across a pending target change (identical captions: ${identicalCaptions}, accepted while queued: ${acceptedWhileQueued}, return to original: ${returnToOriginal})`,
+  async () => {
+  const fixture = makeSavedMainFixture("mouse-frame-boundary");
+  const secondFile = join(fixture.agentDir, "sessions", "proj", "scroll-second.jsonl");
+  writeFileSync(secondFile, [
+    JSON.stringify({ type: "session", version: 3, id: "saved-scroll-second", timestamp: "2025-02-01T00:00:00.000Z", cwd: fixture.workspace }),
+    JSON.stringify({ type: "message", id: "m2", message: { role: "user", content: [{ type: "text", text: identicalCaptions ? "First conversation mouse-frame-boundary" : "Second conversation mouse-frame-boundary" }] } }),
+  ].join("\n") + "\n", "utf8");
+  let catalog: SavedSessionCatalog | undefined;
+  const { overrides } = savedFixtureDependencies(fixture, async (options) => {
+    catalog = await listSavedSessions({
+      agentDir: options.agentDir,
+      listAll: makeSavedListAll(),
+      signal: options.signal,
+    });
+    return catalog;
+  });
+  const output = new QueuedFrameOutput();
+  let harnessForCleanup: Harness | undefined;
+  let shutDown = false;
+  try {
+    const harness = createHarness({}, {
+      ...overrides,
+      createWriter: (_stdout, writerOptions) => createSessionHostFrameWriter(
+        output as unknown as Writable,
+        { ...writerOptions, redrawIntervalMs: 0 },
+      ),
+    });
+    harnessForCleanup = harness;
+    harness.terminal.rows = 8; // one Saved list row: scrolling replaces its hit target at the same coordinate
+    harness.stdout.rows = 8;
+    const manager = await ready(harness);
+    openSavedPicker(harness.terminal);
+    for (let attempt = 0; attempt < 10 && catalog?.rows.length !== 2; attempt += 1) await nextTurn();
+    assert.ok(catalog);
+    assert.equal(catalog.rows.length, 2, "the catalog has the initially displayed row and its scroll replacement");
+    const savedA = catalog.rows[0]!;
+    const savedB = catalog.rows[1]!;
+    if (identicalCaptions) {
+      assert.equal(savedA.caption, savedB.caption);
+      assert.equal(savedA.cwd, savedB.cwd);
+    }
+    for (let attempt = 0; attempt < 10 && !output.writes.some((bytes) => bytes.toString("utf8").includes(savedA.caption)); attempt += 1) {
+      await nextTurn();
+    }
+    assert.ok(output.writes.some((bytes) => bytes.toString("utf8").includes(savedA.caption)),
+      "the actual frame writer has emitted the first Saved row");
+
+    output.refuseNextWrite(acceptedWhileQueued);
+    harness.terminal.emitInput("\x1b[B"); // Scroll the one-row window from A to B.
+    await nextTurn();
+    assert.equal(output.queuedCount, 1, "the real frame writer submitted B to a delayed Writable");
+
+    // A is still the only row on the sink's emitted surface. Even though Main's
+    // render has already built B's newer mutable hit map, the pending map must
+    // not authorize the same coordinate as B, even when write() returned true.
+    emitMouse(harness.terminal, 34, 2);
+    assert.equal(manager.createOptions.length, 0, "a click before callback completion cannot open undisplayed B");
+    emitMouse(harness.terminal, 34, 2, 0, "m");
+
+    if (returnToOriginal) {
+      harness.terminal.emitInput("\x1b[A"); // Return from B to A while B's write is still pending.
+      await nextTurn();
+      assert.equal(output.queuedCount, 1, "the pending A frame stays behind the incomplete B write");
+    }
+
+    output.completeQueuedWrites();
+    if (!acceptedWhileQueued) {
+      assert.equal(manager.createOptions.length, 0,
+        "a successful callback alone cannot settle a write() that returned false");
+      output.emit("drain");
+    }
+    emitMouse(harness.terminal, 34, 2);
+    for (let attempt = 0; attempt < 10 && manager.createOptions.length === 0; attempt += 1) await nextTurn();
+    assert.equal(manager.createOptions.length, 1,
+      "the final emitted Saved row is clickable after its callback and any required drain settle the frame");
+    const admission = manager.createOptions[0]?.savedSession;
+    assert.ok(isSavedSessionAdmission(admission));
+    assert.equal((admission as { sessionId: string }).sessionId, returnToOriginal ? savedA.id : savedB.id,
+      "the same coordinate opens the row actually emitted by the frame writer");
+    assert.notEqual(savedA.id, savedB.id);
+    assert.equal(await closeWithSignal(harness), 0);
+    shutDown = true;
+  } finally {
+    if (harnessForCleanup && !shutDown) {
+      harnessForCleanup.signals.emit("SIGTERM");
+      if (output.queuedCount > 0) output.drain();
+      await harnessForCleanup.result.catch(() => undefined);
+    }
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("real frame-writer backpressure cannot redirect the Main owner through a scrolled roster row", async () => {
+  const output = new QueuedFrameOutput();
+  const submittedFrames: Array<{ readonly frame: ComposedHostFrame; readonly cols: number; readonly rows: number }> = [];
+  const harness = createHarness({}, {
+    createWriter: (_stdout, writerOptions) => {
+      const driver = createSessionHostFrameWriter(output as unknown as Writable, {
+        ...writerOptions,
+        redrawIntervalMs: 0,
+      });
+      return {
+        start: () => driver.start(),
+        submit: (frame, cols, rows, onSettled) => {
+          submittedFrames.push({ frame, cols, rows });
+          driver.submit(frame, cols, rows, onSettled);
+        },
+        invalidate: () => driver.invalidate(),
+        close: () => driver.close(),
+      };
+    },
+  });
+  let shutDown = false;
+  try {
+    harness.terminal.rows = 14; // sidebar viewport fits one expanded card, so Down scrolls B into A's row
+    harness.stdout.rows = 14;
+    const manager = await startTwoSessions(harness);
+    harness.terminal.emitInput("\x1b[A"); // Select A while leaving B as the active Main owner.
+    await nextTurn();
+    let oldFrame = submittedFrames.at(-1)?.frame;
+    let rowA = screenRowContaining(oldFrame, "Native native-1");
+    assert.ok(rowA > 0, "the emitted roster has A at the coordinate that will be reused");
+
+    const viewIndex = manager.views.findIndex((view) => view.id === "native-1");
+    assert.ok(viewIndex >= 0);
+    const activeTasksBeforeMetadata = manager.views[viewIndex]!.activeTasks;
+    const writesBeforeUnchangedFrame = output.writes.length;
+    manager.views[viewIndex] = { ...manager.views[viewIndex]!, backgroundTasks: 3 };
+    assert.equal(manager.views[viewIndex]!.activeTasks, activeTasksBeforeMetadata,
+      "the activity-intent count stays unchanged while ownership metadata updates");
+    manager.notify("background-task-metadata-only");
+    await nextTurn();
+    assert.equal(output.writes.length, writesBeforeUnchangedFrame,
+      "background ownership metadata changes without changing the rendered frame bytes");
+    emitMouse(harness.terminal, 1, rowA); // An unchanged submission must not permanently disable clicks.
+    emitMouse(harness.terminal, 1, rowA, 0, "m");
+    assert.equal(harness.sidebar?.selectedId, "native-1",
+      "the prior emitted hit map remains usable after an identical frame is skipped");
+    assert.equal(harness.sidebar?.focus, "main", "clicking A activates it using the last emitted map");
+    await nextTurn();
+    harness.terminal.emitInput(ALT_LEFT); // Return to the visible roster without changing Main ownership.
+    await nextTurn();
+    oldFrame = submittedFrames.at(-1)?.frame;
+    rowA = screenRowContaining(oldFrame, "Native native-1");
+    assert.ok(rowA > 0, "A is still the displayed roster row before the scroll");
+
+    output.refuseNextWrite();
+    harness.terminal.emitInput("\x1b[B"); // Select/scroll B into A's previous row while A remains Main owner.
+    await nextTurn();
+    assert.equal(output.queuedCount, 1, "the real writer has the scrolled B-first frame queued behind backpressure");
+    const pendingFrame = submittedFrames.at(-1)?.frame;
+    assert.equal(screenRowContaining(pendingFrame, "Native native-2"), rowA,
+      "the undisplayed render has already placed B at A's old coordinate");
+
+    emitMouse(harness.terminal, 1, rowA);
+    emitMouse(harness.terminal, 1, rowA, 0, "m");
+    assert.equal(harness.sidebar?.focus, "sidebar",
+      "an old displayed coordinate cannot activate B from the newer mutable hit map");
+    harness.terminal.emitInput("\x1b[1;3C"); // Alt+Right returns input ownership to Main without hiding the roster.
+    await nextTurn(); // The Main-focus candidate coalesces behind B's refused write.
+    harness.terminal.emitInput("while-frame-pending");
+    assert.equal(manager.writes.at(-1)?.id, "native-1", "the pending row cannot redirect Main input ownership");
+
+    output.drain();
+    emitMouse(harness.terminal, 1, rowA);
+    assert.equal(harness.sidebar?.selectedId, "native-2",
+      "after the B-first frame settles, the same coordinate activates its emitted owner");
+    emitMouse(harness.terminal, 1, rowA, 0, "m");
+    harness.terminal.emitInput("after-frame-emitted");
+    assert.equal(manager.writes.at(-1)?.id, "native-2", "Main ownership changes only after B's frame is emitted");
+    assert.equal(manager.views.find((view) => view.id === "native-1")?.hasLiveProcess, true,
+      "A remains live while the emitted B row becomes Main owner");
+    assert.equal(await closeWithSignal(harness), 0);
+    shutDown = true;
+  } finally {
+    if (!shutDown) {
+      harness.signals.emit("SIGTERM");
+      await harness.result.catch(() => undefined);
+    }
+  }
+});
+
+test("native-only output pending at the default redraw cadence keeps the emitted roster clickable", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const output = new QueuedFrameOutput();
+  const submittedFrames: Array<{ readonly frame: ComposedHostFrame; readonly cols: number; readonly rows: number }> = [];
+  const harness = createHarness({}, {
+    createWriter: (_stdout, writerOptions) => {
+      // Preserve the production default redraw interval (16 ms).
+      const driver = createSessionHostFrameWriter(output as unknown as Writable, writerOptions);
+      return {
+        start: () => driver.start(),
+        submit: (frame, cols, rows, onSettled) => {
+          submittedFrames.push({ frame, cols, rows });
+          driver.submit(frame, cols, rows, onSettled);
+        },
+        invalidate: () => driver.invalidate(),
+        close: () => driver.close(),
+      };
+    },
+  });
+  let shutDown = false;
+  try {
+    const manager = await startTwoSessions(harness);
+    harness.terminal.emitInput("\x1b[A"); // Highlight A without changing the active Main owner.
+    harness.terminal.emitInput(ENTER); // Make A the Main owner.
+    harness.terminal.emitInput(ALT_LEFT); // Keep the roster visible with B as a mouse target.
+    await nextTurn();
+    t.mock.timers.tick(100); // Settle startup/coalesced output using the writer's default 16 ms cadence.
+    await nextTurn();
+
+    const emittedFrame = submittedFrames.at(-1)?.frame;
+    const rowB = screenRowContaining(emittedFrame, "Native native-2");
+    assert.ok(rowB > 0, "the emitted roster contains B before native-only output changes");
+    assert.ok(output.writes.some((bytes) => bytes.toString("utf8").includes("Native native-2")));
+    const writesBeforeNativeOutput = output.writes.length;
+
+    const activeSurface = manager.surface("native-1");
+    assert.ok(activeSurface);
+    activeSurface.writesAsFrame.push(" native-only-output");
+    manager.notify("native-only-output");
+    await nextTurn();
+    const pendingFrame = submittedFrames.at(-1)?.frame;
+    assert.notEqual(plain(pendingFrame), plain(emittedFrame), "the pending frame contains changed native-pane output");
+    assert.equal(output.writes.length, writesBeforeNativeOutput,
+      "the default redraw interval has not emitted the native-only candidate yet");
+
+    emitMouse(harness.terminal, 1, rowB);
+    emitMouse(harness.terminal, 1, rowB, 0, "m");
+    assert.equal(harness.sidebar?.focus, "main", "B remains clickable through an unrelated pending Main update");
+    harness.terminal.emitInput("verify-native-only-hit");
+    assert.equal(manager.writes.at(-1)?.id, "native-2", "the emitted B row takes Main ownership");
+
+    t.mock.timers.tick(16);
+    await nextTurn();
+    assert.ok(output.writes.length > writesBeforeNativeOutput, "the pending native update is emitted at the cadence boundary");
+    assert.equal(await closeWithSignal(harness), 0);
+    shutDown = true;
+  } finally {
+    if (!shutDown) {
+      harness.signals.emit("SIGTERM");
+      if (output.queuedCount > 0) output.drain();
+      await harness.result.catch(() => undefined);
+    }
+  }
+});
+
 test("mouse routing uses active live child modes, mode-only changes, native viewport clipping, and owned resets", async () => {
   const harness = createHarness();
   const manager = await ready(harness);
@@ -1763,16 +2328,18 @@ test("mouse routing uses active live child modes, mode-only changes, native view
 
   const beforeFocusReset = harness.terminal.writes.length;
   // Main -> Sidebar focus is focus-only: the layout and native geometry are
-  // untouched, and the host disables only its own tracking/encoding.
+  // untouched, while visible host panes continue to own button tracking.
   harness.terminal.emitInput(ALT_LEFT);
-  assert.deepEqual(harness.terminal.writes.slice(beforeFocusReset), ["\x1b[?1000l", "\x1b[?1006l"]);
+  assert.deepEqual(harness.terminal.writes.slice(beforeFocusReset), [],
+    "the still-visible host pane keeps button tracking and SGR enabled beside the native pane");
   assert.equal(harness.sidebar?.focus, "sidebar");
   assert.equal(harness.sidebar?.visible, true);
   const beforeFocusReenable = harness.terminal.writes.length;
   // Sidebar -> hide/Main is the deliberate visibility change that re-enables
   // exactly the active child's own observed modes.
   harness.terminal.emitInput(ALT_LEFT);
-  assert.deepEqual(harness.terminal.writes.slice(beforeFocusReenable), ["\x1b[?1000h", "\x1b[?1006h"]);
+  assert.deepEqual(harness.terminal.writes.slice(beforeFocusReenable), [],
+    "the active child's own tracking and cell-SGR mode remain enabled after hiding the host pane");
   assert.equal(harness.sidebar?.focus, "main");
   assert.equal(harness.sidebar?.visible, false);
   assert.equal(await closeWithSignal(harness), 0);

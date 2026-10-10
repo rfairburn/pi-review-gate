@@ -221,6 +221,67 @@ test("recovery — abort during retry backoff settles cancelled with the failure
   }
 });
 
+test("recovery — zero-base retry skips jitter draws and retains retry numbering", async () => {
+  const scenario = await startRecoveryScenario("task-zero-base-retry");
+  const { capture, worktree, operation, artifactDir } = scenario;
+  const turns: number[] = [];
+  let randomDraws = 0;
+  const originalRandom = Math.random;
+  Math.random = () => {
+    randomDraws += 1;
+    return 0.5;
+  };
+  try {
+    const result = await runExecutorWithRecovery({
+      adapter: {
+        kind: "fake",
+        model: "fake-model",
+        run: async (request) => {
+          turns.push(request.turn);
+          if (turns.length === 1) return failingTurn(artifactDir, "zero-base-session");
+          return {
+            text: "recovered",
+            session: { adapter: "fake", id: "zero-base-session" },
+            stdoutPath: join(artifactDir, "stdout.log"),
+            stderrPath: join(artifactDir, "stderr.log"),
+            code: 0,
+            timedOut: false,
+            aborted: false,
+          };
+        },
+      },
+      request: {
+        cwd: worktree.effectiveCwd,
+        artifactDir,
+        workspaceAccess: "workspace-write",
+      },
+      prompt: "Do bounded work.",
+      startingTurn: 7,
+      capture,
+      worktree,
+      taskId: "task-zero-base-retry",
+      title: "Zero-base retry task",
+      retryPolicy: {
+        maxRetries: 1,
+        baseDelayMs: 0,
+        maxDelayMs: 0,
+        jitter: true,
+        maxSameIncidentRepeats: 1,
+      },
+      operation,
+    });
+
+    assert.equal(result.status, "completed");
+    assert.deepEqual(turns, [7, 8], "the first generic retry advances the executor turn once");
+    assert.equal(randomDraws, 0, "recovery's base-zero guard runs before the shared computation");
+    assert.equal(operation.attempts[0]?.outcome, "retry");
+    assert.equal(operation.attempts[1]?.outcome, "completed");
+  } finally {
+    Math.random = originalRandom;
+    await scenario.cleanup();
+  }
+});
+
 test("recovery fences a late prior-attempt exit from the newer durable child owner", async () => {
   const scenario = await startRecoveryScenario("task-late-child-exit-fence");
   const { capture, worktree, operation, artifactDir } = scenario;

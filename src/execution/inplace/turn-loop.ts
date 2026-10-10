@@ -20,6 +20,7 @@ import {
 } from "../operation-record";
 import { resolveExecutorToolCatalog } from "../tool-catalog";
 import type { InPlaceBaseline } from "./basis";
+import { computeRetryDelay } from "../retry-delay";
 
 // ── executor turn loop (no checkpoints, fail closed) ─────────────────────────
 
@@ -156,8 +157,7 @@ async function inPlaceRetryDelay(
   signal?: AbortSignal,
 ): Promise<void> {
   if (base === 0) return;
-  const ceiling = Math.min(max, base * 2 ** Math.max(0, retry - 1));
-  const wait = jitter ? Math.floor(ceiling * (0.5 + Math.random() * 0.5)) : ceiling;
+  const wait = computeRetryDelay(base, max, jitter, retry);
   await new Promise<void>((resolvePromise, reject) => {
     const finish = () => {
       signal?.removeEventListener("abort", abort);

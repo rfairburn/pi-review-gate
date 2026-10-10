@@ -717,7 +717,7 @@ test("retryable provider 429 failover preserves the in-place root, partial write
   await writeFile(join(workspace, "seed.txt"), "launch state\n", "utf8");
   const config = inplaceExternalConfig({ script: "unused" }, {
     backupExecutor: true,
-    retryPolicy: { maxRetries: 1, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 3 },
+    retryPolicy: { maxRetries: 1, baseDelayMs: 0, maxDelayMs: 0, jitter: true, maxSameIncidentRepeats: 3 },
   });
   const [firstEntry, backupEntry] = resolvedExecutorPool(config);
   assert.ok(firstEntry);
@@ -776,21 +776,33 @@ test("retryable provider 429 failover preserves the in-place root, partial write
     },
   };
   try {
-    const result = await runInplaceLifecycle({
-      taskId: "inplace-provider-failover",
-      task: { title: "Continue in place", instructions: "Finish the task", acceptanceCriteria: ["replacement file exists"] },
-      workspaceRoot: workspace,
-      artifactDir,
-      config,
-      executorAssignment: first,
-      acquireFailover: async (current) => {
-        assert.equal(current.entry.entryId, firstEntry.entryId);
-        return backup;
-      },
-      adapterFactory: (_config, selection) => selection.source === "external" && selection.id === "inplace-backup" ? backupAdapter : firstAdapter,
-    });
+    const originalRandom = Math.random;
+    let randomDraws = 0;
+    Math.random = () => {
+      randomDraws += 1;
+      return 0.5;
+    };
+    let result: Awaited<ReturnType<typeof runInplaceLifecycle>>;
+    try {
+      result = await runInplaceLifecycle({
+        taskId: "inplace-provider-failover",
+        task: { title: "Continue in place", instructions: "Finish the task", acceptanceCriteria: ["replacement file exists"] },
+        workspaceRoot: workspace,
+        artifactDir,
+        config,
+        executorAssignment: first,
+        acquireFailover: async (current) => {
+          assert.equal(current.entry.entryId, firstEntry.entryId);
+          return backup;
+        },
+        adapterFactory: (_config, selection) => selection.source === "external" && selection.id === "inplace-backup" ? backupAdapter : firstAdapter,
+      });
+    } finally {
+      Math.random = originalRandom;
+    }
     assert.equal(result.status, "unreviewed");
     assert.equal(firstCalls, 2, "the configured same-adapter retry is honored before pool failover");
+    assert.equal(randomDraws, 0, "the in-place base-zero guard skips the shared computation and jitter draw");
     assert.equal(backupCalls, 1);
     assert.deepEqual(result.changedSinceLaunch.map(({ path }) => path).sort(), ["partial.txt", "replacement.txt"]);
     assert.equal(await readFile(partialPath, "utf8"), "partial work must survive\n");

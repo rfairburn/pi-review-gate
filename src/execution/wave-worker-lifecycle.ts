@@ -93,6 +93,7 @@ import {
   type OperationDiagnostics,
 } from "./operation-record";
 import { DEFAULT_EXECUTION_RETRY_POLICY } from "../config";
+import { computeRetryDelay } from "./retry-delay";
 
 // ── types ────────────────────────────────────────────────────────────────────
 
@@ -490,8 +491,7 @@ export async function recordReviewIncident(artifactDir: string, message: string,
 /** Retry-backoff delay; shared by the execute and #220 in-place lifecycles. */
 export async function executionRetryDelay(base: number, max: number, jitter: boolean, retry: number, signal?: AbortSignal): Promise<void> {
   if (base === 0) return;
-  const ceiling = Math.min(max, base * 2 ** Math.max(0, retry - 1));
-  const delay = jitter ? Math.floor(ceiling * (0.5 + Math.random() * 0.5)) : ceiling;
+  const delay = computeRetryDelay(base, max, jitter, retry);
   await new Promise<void>((resolvePromise, reject) => {
     const finish = () => {
       signal?.removeEventListener("abort", abort);

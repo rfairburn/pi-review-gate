@@ -126,13 +126,30 @@ test("creation alone persists definitions without activating resources, routes, 
   });
 });
 
-for (const cancel of ["Cancel", undefined]) test(`root ${cancel ?? "Escape"} discards definitions and explicit selections`, async () => {
+for (const cancel of ["Cancel", undefined]) test(`root ${cancel ?? "Escape"} never writes the file; Escape applies session-only`, async () => {
   await workspace(async (path, config, original) => {
     const activeBefore = structuredClone(config);
     creations = structuredClone(definitions);
     await menu(path, config, [...createBoth, ...selectExplicitly, cancel]);
-    assert.deepEqual(config, activeBefore);
     assert.equal(await readFile(path, "utf8"), original);
+    if (cancel === "Cancel") {
+      // Explicit Cancel discards every staged change.
+      assert.deepEqual(config, activeBefore);
+      return;
+    }
+    // Issue #294: root Escape applies the staged settings to the live config
+    // without writing the file.
+    assert.equal(config.externalAgents!.codex.model, "custom-codex");
+    assert.equal(config.externalAgents!.claude.model, "custom-claude");
+    assert.deepEqual(config.execution!.workerResources, {
+      "external-codex": { selection: { source: "external", id: "codex" }, maxConcurrent: 1 },
+      "external-claude": { selection: { source: "external", id: "claude" }, maxConcurrent: 1 },
+    });
+    for (const role of ["execute", "research"] as const) assert.deepEqual(config.execution!.routes![role], [
+      { resourceId: "external-codex", thinkingLevel: undefined }, { resourceId: "external-claude", thinkingLevel: undefined },
+    ]);
+    assert.deepEqual(effectiveReviewSettings(config).primaryReviewers, [{ source: "external", id: "codex" }, { source: "external", id: "claude" }]);
+    assert.deepEqual(effectiveReviewSettings(config).subtaskReviewers, [{ source: "external", id: "claude" }, { source: "external", id: "codex" }]);
   });
 });
 
@@ -282,11 +299,16 @@ for (const finish of ["Save changes", "Cancel", undefined]) test(`native rename 
     await menu(path, config, ["External workers", "A [claude-cli]", "Identifier:", "Advanced execution overrides", "Timeout (ms):", "Back", "Shared model:", undefined, "Apply edit", "B [claude-cli]", "Identifier:", "Apply edit", "Back", finish], async () => {
       assert.deepEqual(config, before); assert.equal(await readFile(path, "utf8"), original);
     }, ["B", "60000", "__proto__"]);
-    if (finish !== "Save changes") {
-      assert.deepEqual(config, before); assert.equal(await readFile(path, "utf8"), original); return;
+    if (finish !== "Save changes") assert.equal(await readFile(path, "utf8"), original);
+    if (finish === "Cancel") {
+      // Explicit Cancel discards every staged change.
+      assert.deepEqual(config, before); return;
     }
-    const saved = normalizeConfig(JSON.parse(await readFile(path, "utf8")));
-    assert.deepEqual(saved, config); assert.equal(saved.externalAgents!.A, undefined); assert.equal(saved.externalAgents!.B, undefined);
+    // Issue #294: Save persists the cascade; root Escape applies it to the
+    // live config only. Both end in the same effective state.
+    const saved = finish === "Save changes" ? normalizeConfig(JSON.parse(await readFile(path, "utf8"))) : config;
+    if (finish === "Save changes") assert.deepEqual(saved, config);
+    assert.equal(saved.externalAgents!.A, undefined); assert.equal(saved.externalAgents!.B, undefined);
     assert.equal(saved.externalAgents!.__proto__.command, "claude"); assert.equal(saved.externalAgents!.__proto__.model, "custom-model");
     assert.equal(saved.externalAgents!.__proto__.execution!.model, "custom-role"); assert.equal(saved.externalAgents!.__proto__.execution!.timeoutMs, 60000);
     assert.deepEqual(saved.externalAgents!.__proto__.env, before.externalAgents!.A.env);
@@ -326,14 +348,19 @@ for (const finish of ["Save changes", "Cancel", undefined]) test(`${adapter} del
     const noticeText = notices.join("\n");
     for (const expected of ["Staged deletion of external worker X", "Cancel discards", "Removed worker resource arbitrary", "Removed execute route", "Removed primary layer reviewer X", "Removed subtask layer reviewer X", "removed pin arbitrary", "empty selected-reviewer override reset to inheritance", "Task task disabled", "Later enabling uses configured defaults"]) assert.ok(noticeText.includes(expected), expected);
     if (adapter !== "run-as-binary") assert.ok(noticeText.includes("Removed research route"));
-    if (finish !== "Save changes") {
-      assert.deepEqual(config, before); assert.equal(await readFile(path, "utf8"), original); return;
+    if (finish !== "Save changes") assert.equal(await readFile(path, "utf8"), original);
+    if (finish === "Cancel") {
+      // Explicit Cancel discards every staged change.
+      assert.deepEqual(config, before); return;
     }
-    const saved = normalizeConfig(JSON.parse(await readFile(path, "utf8")));
-    assert.deepEqual(saved, config);
-    assert.deepEqual(Object.keys(saved.externalAgents!).sort(), ["latest", "untouched"]);
+    // Issue #294: Save persists the cascade (merging the concurrent on-disk
+    // addition); root Escape applies it to the live config only, without the
+    // disk-only "latest" definition.
+    const saved = finish === "Save changes" ? normalizeConfig(JSON.parse(await readFile(path, "utf8"))) : config;
+    if (finish === "Save changes") assert.deepEqual(saved, config);
+    assert.deepEqual(Object.keys(saved.externalAgents!).sort(), finish === "Save changes" ? ["latest", "untouched"] : ["untouched"]);
     assert.deepEqual(saved.externalAgents!.untouched, before.externalAgents!.untouched);
-    assert.equal(saved.externalAgents!.latest.model, "latest-custom");
+    if (finish === "Save changes") assert.equal(saved.externalAgents!.latest.model, "latest-custom");
     assert.equal(saved.externalAgents!["unapplied-name"], undefined);
     assert.deepEqual(saved.execution!.workerResources, {}); assert.deepEqual(saved.execution!.routes, { execute: [], research: [] });
     assert.deepEqual(saved.review!.primaryReviewers, []); assert.deepEqual(saved.review!.subtaskReviewers, []);
@@ -382,13 +409,15 @@ for (const finish of ["Save changes", "Cancel", undefined]) test(`${adapter}: re
         assert.equal(await readFile(path, "utf8"), original);
       }, ["new-worker"], notices);
       assert.deepEqual(warnings, []);
-      if (finish !== "Save changes") {
+      if (finish !== "Save changes") assert.equal(await readFile(path, "utf8"), original);
+      if (finish === "Cancel") {
+        // Explicit Cancel discards every staged change.
         assert.deepEqual(config, before);
-        assert.equal(await readFile(path, "utf8"), original);
       } else {
-        assert.deepEqual(normalizeConfig(JSON.parse(await readFile(path, "utf8"))), config);
-        // Root Save still materializes its existing scalar defaults. The
-        // create/delete transaction leaves no definition or activation behind.
+        if (finish === "Save changes") assert.deepEqual(normalizeConfig(JSON.parse(await readFile(path, "utf8"))), config);
+        // Save and the session-only Escape apply both materialize their
+        // existing scalar defaults. The create/delete transaction leaves no
+        // definition or activation behind.
         assert.deepEqual(config.externalAgents, before.externalAgents);
         assert.deepEqual(config.execution!.workerResources, {});
         assert.deepEqual(config.execution!.routes, { execute: [], research: [] });
@@ -409,5 +438,104 @@ test("creation-form cancellation stages no definition", async () => {
     await menu(path, config, ["External workers", "Create worker", "Back", "Cancel"]);
     assert.deepEqual(config, activeBefore);
     assert.equal(await readFile(path, "utf8"), original);
+  });
+});
+
+// Review pass 1 regression: reference baselines must come from the session's
+// opening snapshot, not the already-cascaded draft — a rename earlier in the
+// same transaction must not make a later deletion look like a concurrent
+// on-disk reference change.
+function overlappingCascadeConfig(config: ReviewGateConfig): void {
+  Object.assign(config, normalizeConfig({ ...config,
+    externalAgents: {
+      A: { adapter: "claude-cli", command: process.execPath, model: "model-a", review: {}, execution: {} },
+      Y: { adapter: "codex-cli", command: process.execPath, model: "model-y", review: {}, execution: {} },
+    },
+    review: { ...config.review, primaryReviewers: [{ source: "external", id: "A" }, { source: "external", id: "Y" }] },
+  }));
+}
+
+for (const finish of ["Save changes", undefined]) test(`overlapping cascades (rename + delete) ${finish ?? "Escape"} without a false reference conflict`, async () => {
+  await workspace(async (path, config) => {
+    overlappingCascadeConfig(config);
+    const original = JSON.stringify(config); await writeFile(path, original);
+    await menu(path, config, [
+      "External workers", "A [claude-cli]", "Identifier:", "Apply edit",
+      "Y [codex-cli]", "Delete Y", "Back", finish,
+    ], undefined, ["B"]);
+    if (finish !== "Save changes") {
+      assert.equal(config.externalAgents!.A, undefined, "the live cascade renamed A → B");
+      assert.equal(config.externalAgents!.Y, undefined, "the live cascade removed Y");
+      assert.equal(await readFile(path, "utf8"), original, "Escape must not write the config file");
+      // Reopen and Save: the seeded operations keep their opening baselines.
+      await menu(path, config, ["Save changes"]);
+    }
+    const saved = normalizeConfig(JSON.parse(await readFile(path, "utf8")));
+    assert.equal(saved.externalAgents!.A, undefined);
+    assert.equal(saved.externalAgents!.Y, undefined);
+    assert.equal(saved.externalAgents!.B.model, "model-a");
+    assert.deepEqual(effectiveReviewSettings(saved).primaryReviewers, [{ source: "external", id: "B" }]);
+  });
+});
+
+// Review pass 1 regression: a reviewer selection edit (draft-only) made
+// BEFORE the agent deletion must not look like a concurrent on-disk change.
+for (const finish of ["Save changes", undefined]) test(`a reviewer selection edit before an agent deletion ${finish ?? "Escape"} without a false conflict`, async () => {
+  await workspace(async (path, config) => {
+    overlappingCascadeConfig(config);
+    const original = JSON.stringify(config); await writeFile(path, original);
+    await menu(path, config, [
+      "Reviewers", "Primary reviewers", "Y [codex-cli] ✓", "Back", "Back",
+      "External workers", "Y [codex-cli]", "Delete Y", "Back", finish,
+    ]);
+    if (finish !== "Save changes") {
+      assert.equal(config.externalAgents!.Y, undefined, "the live cascade removed Y");
+      assert.deepEqual(effectiveReviewSettings(config).primaryReviewers, [{ source: "external", id: "A" }]);
+      assert.equal(await readFile(path, "utf8"), original, "Escape must not write the config file");
+      await menu(path, config, ["Save changes"]);
+    }
+    const saved = normalizeConfig(JSON.parse(await readFile(path, "utf8")));
+    assert.equal(saved.externalAgents!.Y, undefined);
+    assert.deepEqual(effectiveReviewSettings(saved).primaryReviewers, [{ source: "external", id: "A" }]);
+  });
+});
+
+// Review pass 2 regression: the same overlapping cascades split across
+// SEPARATE Escape/reopen invocations — the second invocation's opening
+// snapshot is post-cascade, so its baselines must come from the retained
+// pre-transaction projections, not the reopened state.
+test("rename + delete split across Escape/reopen invocations saves without a false conflict", async () => {
+  await workspace(async (path, config) => {
+    overlappingCascadeConfig(config);
+    const original = JSON.stringify(config); await writeFile(path, original);
+    // Invocation 1: rename A → B, root Escape.
+    await menu(path, config, [
+      "External workers", "A [claude-cli]", "Identifier:", "Apply edit", "Back", undefined,
+    ], undefined, ["B"]);
+    assert.equal(config.externalAgents!.A, undefined, "the live cascade renamed A → B");
+    assert.equal(await readFile(path, "utf8"), original, "Escape must not write the config file");
+    // Invocation 2: delete Y, Save.
+    await menu(path, config, ["External workers", "Y [codex-cli]", "Delete Y", "Back", "Save changes"]);
+    const saved = normalizeConfig(JSON.parse(await readFile(path, "utf8")));
+    assert.equal(saved.externalAgents!.A, undefined);
+    assert.equal(saved.externalAgents!.Y, undefined);
+    assert.equal(saved.externalAgents!.B.model, "model-a");
+    assert.deepEqual(effectiveReviewSettings(saved).primaryReviewers, [{ source: "external", id: "B" }]);
+  });
+});
+
+test("a reviewer selection edit and a later deletion split across invocations save without a false conflict", async () => {
+  await workspace(async (path, config) => {
+    overlappingCascadeConfig(config);
+    const original = JSON.stringify(config); await writeFile(path, original);
+    // Invocation 1: drop Y from the primary selection, root Escape.
+    await menu(path, config, ["Reviewers", "Primary reviewers", "Y [codex-cli] ✓", "Back", "Back", undefined]);
+    assert.deepEqual(effectiveReviewSettings(config).primaryReviewers, [{ source: "external", id: "A" }], "the live selection dropped Y");
+    assert.equal(await readFile(path, "utf8"), original, "Escape must not write the config file");
+    // Invocation 2: delete Y, Save.
+    await menu(path, config, ["External workers", "Y [codex-cli]", "Delete Y", "Back", "Save changes"]);
+    const saved = normalizeConfig(JSON.parse(await readFile(path, "utf8")));
+    assert.equal(saved.externalAgents!.Y, undefined);
+    assert.deepEqual(effectiveReviewSettings(saved).primaryReviewers, [{ source: "external", id: "A" }]);
   });
 });

@@ -149,7 +149,9 @@ identity, ignoring unapplied renames/edits, and also works for newly staged entr
 Renames keep references paired. Deletion reports resource/route/reviewer cleanup,
 disables schedules with invalid pins or emptied explicit reviewer sets, and resets
 only those invalid overrides to inheritance, explaining defaults on later re-enable.
-Root Save/Cancel persists/discards these staged changes together.
+Root **Save changes** (or Ctrl+S) persists these staged changes; root **Cancel**
+discards them, while root Escape applies them to the running session only, without
+saving them (see [Settings menu](settings.md#review-settings)).
 
 The new or edited definition is immediately available for explicit **Worker resources**
 or **Reviewers** selection before saving. Creation alone activates nothing; select

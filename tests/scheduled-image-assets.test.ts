@@ -25,6 +25,7 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { Key, matchesKey } from "pi-session-host-tui";
 import { normalizeConfig, type ScheduledTaskCatalog } from "../src/config";
 import { registerReviewSettings } from "../src/settings/command";
 import { setMenuTuiHost } from "../src/settings/menu";
@@ -911,8 +912,9 @@ async function registerFlowHandler(configPath: string): Promise<(ctx: unknown) =
  * the temp path Pi's native image-paste handler inserts (its terminal act on
  * the editor's public insertTextAtCursor, wrapped by the bridge's
  * observation-only onHostInsert seam); `fieldDriver` settles that field, and
- * `outcome` drives the root menu: save, a failed save (Save, then Esc from
- * the re-shown root), or cancel (Esc at the root, no Save).
+ * `outcome` drives the root menu: save, a failed save (Save, then an explicit
+ * Cancel from the re-shown root — issue #294: root Escape would retry the
+ * same failing apply), or cancel (Esc at the root, no Save).
  */
 async function runImageFlow(
   dir: string,
@@ -957,7 +959,9 @@ async function runImageFlow(
         ? [keys(KEY_ESCAPE)] // root: leave without saving
         : [
             keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (scheduled, index 15) → Save changes (row 17)
-            ...(options.outcome === "fail" ? [keys(KEY_ESCAPE)] : []), // failed save re-shows the root; leave
+            ...(options.outcome === "fail"
+              ? [keys(KEY_DOWN, KEY_ENTER)] // failed save re-shows the root on Save (17); explicit Cancel (18) — issue #294: root Escape would retry the same failing apply
+              : []),
           ]),
     ],
   });
@@ -1172,5 +1176,111 @@ test("full TUI flow: a __proto__-keyed entry survives Save instead of being dele
     assert.equal(saved.scheduledTasks["task-sibling"].instructions, "no path here either");
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+  }
+});
+
+// Issue #294 follow-on: root Escape makes the validated managed copy live
+// WITHOUT a config write; a reopened menu's Ctrl+S then persists the managed
+// path through the same Save path — no re-paste, no second copy.
+test("full TUI flow: Escape applies the managed copy session-only; reopen Ctrl+S persists it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-sched-escape-"));
+  const temp = await writeTempImage();
+  try {
+    const configPath = join(dir, "review-gate.json");
+    const original = JSON.stringify(await defaultFlowConfig(dir), null, 2);
+    await writeFile(configPath, original);
+    // One live config object across both runs: the pending session-only delta
+    // is keyed by its identity, exactly like one process in the product.
+    const config = normalizeConfig(JSON.parse(original));
+    let handler: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+    let savedCount = 0;
+    registerReviewSettings({
+      pi: {
+        registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> }) {
+          if (name === "review-settings") handler = options.handler;
+        },
+      },
+      config,
+      configPath,
+      onSaved: () => { savedCount += 1; },
+    });
+    assert.ok(handler, "the /review-settings command registered");
+    const instances: FakeBridgeEditor[] = [];
+    setMenuTuiHost({ ...createFakeMenuTuiHost(), matchesCtrlS: (data) => matchesKey(data, Key.ctrl("s")) });
+    setNativeEditorHost(fakeHost(instances));
+
+    // Run 1: paste the image, submit the field, back to root, Escape.
+    const notifyCalls: Array<{ message: string; type?: string }> = [];
+    const { ui } = createBridgeUi({
+      keybindings: fakeKeybindingsManager(),
+      draft: "chat draft",
+      drivers: [
+        keys(...Array(15).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 15)
+        keys(KEY_ENTER), // list → task entry (row 0)
+        keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → instructions (row 4)
+        async (component: { handleInput?(data: string): void }): Promise<void> => {
+          const editor = instances[0];
+          assert.ok(editor, "the bridge editor instance exists");
+          editor.insertTextAtCursor(` ${temp}`);
+          assert.ok(editor.getText().includes(temp), "the pasted path is in the field text");
+          component.handleInput?.(ENTER); // native Enter submits
+        },
+        keys(...Array(8).fill(KEY_DOWN), KEY_ENTER), // entry re-show (instructions, row 4) → Back (row 12)
+        keys(...Array(3).fill(KEY_DOWN), KEY_ENTER), // list re-show (two entries) → Back (row 3)
+        keys(KEY_ESCAPE), // root: session-only Escape apply
+      ],
+    });
+    const wrapped = {
+      ...ui,
+      notify(message: string, type?: string): void { notifyCalls.push({ message, type }); },
+      async select(): Promise<string | undefined> {
+        throw new Error("plain select must not be used in TUI mode with a loadable host");
+      },
+    };
+    await handler!("", { mode: "tui", scopedModels: [], cwd: dir, ui: wrapped });
+
+    assert.deepEqual(notifyCalls.filter((call) => call.type === "error"), [], "Escape applied cleanly");
+    assert.ok(notifyCalls.some((call) => call.message === "Review settings applied for this session (not saved to disk)."));
+    assert.equal(savedCount, 1, "the Escape apply runs the same onSaved runtime hook as Save");
+    const liveInstructions = config.scheduledTasks!["task-imageaa"].instructions;
+    assert.match(liveInstructions, /^Analyze the attached screenshot /);
+    const managed = liveInstructions.replace("Analyze the attached screenshot ", "");
+    assert.ok(managed.startsWith(join(dir, "scheduled-image-assets", "task-imageaa") + "/"), `the managed path is live: ${managed}`);
+    assert.deepEqual(await readFile(managed), PNG_BYTES, "the approved managed copy exists live");
+    assert.equal((await stat(managed)).mode & 0o777, 0o600, "managed files are private 0600");
+    assert.equal(await readFile(configPath, "utf8"), original, "Escape must not write the config file");
+
+    // Run 2: reopen and press Ctrl+S at root — persists without re-paste.
+    const notifyCalls2: Array<{ message: string; type?: string }> = [];
+    const { ui: ui2 } = createBridgeUi({
+      keybindings: fakeKeybindingsManager(),
+      draft: "chat draft",
+      drivers: [keys("\x13")], // root: Ctrl+S save
+    });
+    const wrapped2 = {
+      ...ui2,
+      notify(message: string, type?: string): void { notifyCalls2.push({ message, type }); },
+      async select(): Promise<string | undefined> {
+        throw new Error("plain select must not be used in TUI mode with a loadable host");
+      },
+    };
+    await handler!("", { mode: "tui", scopedModels: [], cwd: dir, ui: wrapped2 });
+
+    assert.deepEqual(notifyCalls2.filter((call) => call.type === "error"), [], "the reopen Save succeeded cleanly");
+    assert.ok(notifyCalls2.some((call) => call.message === "Review settings saved."));
+    assert.equal(savedCount, 2);
+    const saved = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(saved.scheduledTasks["task-imageaa"].instructions, `Analyze the attached screenshot ${managed}`);
+    assert.equal(saved.scheduledTasks["task-imagebb"].instructions, "Summarize upstream releases");
+    const names = (await readdir(join(dir, "scheduled-image-assets", "task-imageaa"))).filter((name) => !name.startsWith("."));
+    assert.equal(names.length, 1, "the reopen Save makes no second copy");
+    // The later-run path: the saved entry references a readable managed asset.
+    await assertScheduledImagesPresent(saved.scheduledTasks["task-imageaa"].instructions, managedScheduledImageRoot(configPath));
+  } finally {
+    setMenuTuiHost(undefined);
+    setNativeEditorHost(undefined);
+    __resetActiveNativeEditorFieldForTest();
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    await rm(temp, { force: true });
   }
 });

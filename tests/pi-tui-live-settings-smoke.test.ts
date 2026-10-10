@@ -279,16 +279,25 @@ test("live Pi TUI smoke: /review-settings workspace field drives the real native
     // Esc (no list visible) cancels the field itself.
     { type: "send", hex: KEYS.escape },
     { type: "assert_latest", excludes: ["Authorized target workspace directory"] },
-    // Walk back out of every menu to the chat prompt.
+    // Walk back out of every menu to the root settings menu.
     { type: "send", hex: KEYS.escape },
     { type: "assert_latest", includes: ["Add scheduled task"] },
     { type: "send", hex: KEYS.escape },
     { type: "assert_latest", includes: ["Review settings"] },
-    { type: "send", hex: KEYS.escape },
+    // Root Escape no longer discards (issue #294): it validates and applies
+    // the staged settings session-only, and this intentionally incomplete
+    // schedule fails validation, keeping the menu open with the previously
+    // active row retained. Confirm the explicit Cancel row instead: from the
+    // retained "Scheduled tasks" highlight the rows below are Scheduler
+    // runtime, Web, Save changes, then Cancel — four downs reach it.
+    { type: "send_slow", hex: slowDowns(4), delayMs: 120 },
+    { type: "assert_latest", includes: ["→ Cancel"] },
+    { type: "send", hex: KEYS.enter },
     // Apply the real VT cursor/erase stream since startup, then inspect the
-    // current terminal buffer after the final Esc. Old raw menu text cannot
-    // satisfy these screen assertions; this is not a claim about unrendered
-    // internal state or field contents that are not visible on screen.
+    // current terminal buffer after the explicit Cancel. Old raw menu text
+    // cannot satisfy these screen assertions; this is not a claim about
+    // unrendered internal state or field contents that are not visible on
+    // screen.
     { type: "settle", seconds: 2 },
     { type: "assert_terminal", includes: ["operating mode:"], excludes: ["Review settings", "ext-edit-mark", "docs/Z", "No API key"] },
     // Ctrl+C twice is the documented host exit: proves real Ctrl+C delivery

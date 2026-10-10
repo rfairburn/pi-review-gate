@@ -23,7 +23,7 @@ consumes.
 | `enabled` | `true` | Disabled entries stay configured but are never dispatched. |
 | `kind` | `"execute"` | `execute` (write-capable subtask), `research` (read-only subtask), or `inplace` (writes directly in its scoped directory through the `execute` worker route, with no capture or landing; the directory is not a sandbox and review is post-hoc, never a rollback). Applies to the subtask destination; see [Schedule destinations](#schedule-destinations) and [In-place kind](delegated-execution.md#in-place-subtask-kind). |
 | `destination` | `"subtask"` | Where a due occurrence is delivered: `"subtask"` (the existing isolated scheduled-subtask dispatch) or `"orchestrator-turn"` (a turn to the existing primary agent). See [Schedule destinations](#schedule-destinations). |
-| `instructions` | (required) | Instructions carried verbatim to the scheduled subtask or orchestrator turn. An image pasted through the native host editor is copied into a private managed store at Save and the instructions keep the managed absolute path — see [Scheduled instruction images](#scheduled-instruction-images). |
+| `instructions` | (required) | Instructions carried verbatim to the scheduled subtask or orchestrator turn. An image pasted through the native host editor is copied into a private managed store at Save (or at a session-only root Escape) and the instructions keep the managed absolute path — see [Scheduled instruction images](#scheduled-instruction-images). |
 | `workspace` | required for `subtask`; otherwise absent | Explicit authorized target directory for a scheduled subtask. A leading `~` or `~/...` expands against the user's home (the same Pi-native rule as the built-in file tools); every other spelling, including `~user`, is used verbatim. Save persists the expanded absolute spelling of a tilde workspace (the runtime separately resolves the target's realpath). Orchestrator-turn entries may omit it or leave it empty; any stored value is unused and never overrides the existing agent's current Pi launch workspace. Switching an entry back to `subtask` requires a valid workspace. |
 | `workerResourceId` | absent | Optional override naming an `execution.workerResources` entry. See below. Unused while the destination is `orchestrator-turn`. |
 | `review` | absent | Task-local review choice. See below. Unused while the destination is `orchestrator-turn`. |
@@ -219,17 +219,18 @@ An image pasted through the native editor in a scheduled task's
 **Instructions** field (Ctrl+V in the interactive TUI) inserts a path to one
 of Pi's temporary clipboard files — a path, never image bytes, and Pi deletes
 those files, so a temporary path saved as instruction text would break on a
-later run. At Save, such a paste is made durable instead:
+later run. At Save (and at a session-only root Escape), such a paste is made
+durable instead:
 
-- Save verifies each pasted path against the **final staged instructions**
-  (an observation of the paste is only provenance; a token that was deleted or
-  edited away copies nothing), opens the file and validates it by content
-  (PNG, JPEG, GIF, or WebP; regular file; at most 10 MiB), copies the bytes
-  into a private managed store next to the config file
+- Save (and root Escape) verifies each pasted path against the **final staged
+  instructions** (an observation of the paste is only provenance; a token that
+  was deleted or edited away copies nothing), opens the file and validates it by
+  content (PNG, JPEG, GIF, or WebP; regular file; at most 10 MiB), copies the
+  bytes into a private managed store next to the config file
   (`<config dir>/scheduled-image-assets/<task id>/`), and replaces the
-  temporary path in the instructions with that managed absolute path before
-  the ordinary atomic config write. The config file never contains image
-  bytes.
+  temporary path in the instructions with that managed absolute path. Save then
+  performs the ordinary atomic config write; root Escape leaves the configuration
+  file untouched. The config file never contains image bytes.
 - Only text Pi's image paste itself could have produced is treated as a
   pasted image: a single absolute path in the OS temp directory named
   `pi-clipboard-<UUID>.<png|jpg|jpeg|gif|webp>` (Pi's own paste naming, with
@@ -251,18 +252,18 @@ later run. At Save, such a paste is made durable instead:
   manually. A bounded garbage-collection pass is a possible follow-up, not
   current behavior.
 - Fail closed: a pasted source that is missing (Pi's temp file already
-  deleted), not a supported image, or too large fails the whole Save with an
-  actionable notice, leaving the config and the store untouched; the same
-  applies if the copy fails, or if a source grows past the limit between the
-  size check and the read, and only copies that Save positively created are
-  removed (if a persistence failure lands after the config write, the copies
-  the persisted text references are kept, matched against the parsed saved
-  config). Cancel at any level copies
+  deleted), not a supported image, or too large fails the whole Save or root
+  Escape with an actionable notice, leaving the config and the store untouched;
+  the same applies if the copy fails, or if a source grows past the limit between
+  the size check and the read, and only copies that Save or root Escape
+  positively created are removed (if a persistence failure lands after the config
+  write, the copies the persisted text references are kept, matched against the
+  parsed saved config). Cancel at any level copies
   nothing, and a pasted path must remain separated by spaces from surrounding
-  text — a path glued to adjacent text fails Save with a message asking for
-  the separating space. A pasted image therefore has to
-  be re-pasted and Saved while its source still exists (paste, then Save — do
-  not close and reopen the settings menu in between without saving). Text
+  text — a path glued to adjacent text fails Save or root Escape with a message
+  asking for the separating space. A pasted image therefore has to
+  be re-pasted and applied while its source still exists (paste, then Save or
+  root Escape — do not close and reopen the settings menu in between). Text
   glued directly after a pasted path (for example a `.bak` suffix) also fails
   Save: the saved reference would never resolve; trailing sentence punctuation
   (`<path>.`, `<path>,`) is still accepted.
@@ -273,10 +274,10 @@ later run. At Save, such a paste is made durable instead:
   editor/input fallback — cannot be verified and fails Save with an actionable
   message instead of being copied or persisted; Pi deletes its clipboard temp
   files, so persisting such a reference would promise image availability it
-  cannot keep. Save checks every staged scheduled entry, so a pre-existing
-  unobserved clipboard-temp reference also blocks an otherwise unrelated
-  settings Save until that reference is removed. This gate is broader than
-  the copy recognition: any `pi-clipboard-...` reference without an observed
+  cannot keep. Save and root Escape check every staged scheduled entry, so a
+  pre-existing unobserved clipboard-temp reference also blocks an otherwise
+  unrelated Save or root Escape until that reference is removed. This gate is
+  broader than the copy recognition: any `pi-clipboard-...` reference without an observed
   paste fails Save, even
   with a non-image extension or a non-UUID name. Ordinary typed paths and
   commands are never touched, and
@@ -327,10 +328,11 @@ than from any fire-time computation:
 Entries are created and edited under **Scheduled tasks** in `/review-settings`
 — or directly through the `/scheduled-tasks` command, which opens that same
 submenu first; Esc or **Back** from it lands at the settings root with the
-**Scheduled tasks** row highlighted, where **Save changes** / **Cancel**
-behave exactly as for the ordinary entry.
+**Scheduled tasks** row highlighted, where **Save changes**, **Cancel**, and
+root Escape behave exactly as for the ordinary entry (see
+[Settings menu](settings.md#review-settings)).
 Either way entries are staged like every other section behind **Save changes**
-/ **Cancel**. Save
+/ **Cancel**, with root Escape applying them to the running session only. Save
 validates every entry (a real cron expression, non-empty instructions, an
 existing workspace directory — relative paths are checked against the session
 working directory and a leading `~`/`~/...` is expanded against the user's

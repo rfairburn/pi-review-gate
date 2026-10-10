@@ -11,7 +11,7 @@ import {
   type WebBrowserPermissions,
 } from "../config";
 import { alignedSettingsRows, formatByteSize, notify, type UiContext } from "./ui";
-import { retainedSelect } from "./menu";
+import { retainedChoice, retainedSelect } from "./menu";
 import { editSettingText } from "./text-input";
 
 export const BROWSER_APPROVAL_CHOICES: Record<BrowserInteractionApproval, string> = {
@@ -63,7 +63,7 @@ export async function selectWebSettings(
     lastKey = choice;
     if (choice === "visibility") {
       await notify(ui, "Headless (default) keeps the QA browser without a window. Headed shows a real browser window with a native address bar. Saving a changed visibility applies it immediately to the live browser: the browser is replaced and its tabs, active page, and in-memory cookies/localStorage/IndexedDB are restored best-effort (never lossless; failures and redirects are reported). With no open browser it applies at the next BrowserOpen. The model's tools stay exactly the same either way.", "info");
-      const selected = await ui.select("Browser visibility", ["Headless · no window (default)", "Headed · visible browser window"]);
+      const selected = await retainedChoice(ui, "Browser visibility", ["Headless · no window (default)", "Headed · visible browser window"]);
       if (selected === "Headed · visible browser window") browserVisible = true;
       else if (selected === "Headless · no window (default)") browserVisible = false;
       continue;
@@ -74,7 +74,7 @@ export async function selectWebSettings(
     }
     if (choice === "approval") {
       await notify(ui, "Only confirmation-required actions: Ask prompts (no UI rejects); Automatically Accept approves without UI; Automatically Deny rejects. Already-permitted observations/local actions stay permitted; hard safety and role restrictions remain. Saved changes apply locally now and to newly launched workers.", "info");
-      const selected = await ui.select("Browser interaction approval", Object.values(BROWSER_APPROVAL_CHOICES));
+      const selected = await retainedChoice(ui, "Browser interaction approval", Object.values(BROWSER_APPROVAL_CHOICES));
       const entry = Object.entries(BROWSER_APPROVAL_CHOICES).find(([, label]) => label === selected);
       if (entry) browserInteractionApproval = entry[0] as BrowserInteractionApproval;
       continue;

@@ -31,7 +31,7 @@ import {
 } from "./state";
 import { registerReviewSettings } from "./settings/command";
 import { scopedModelChoices } from "./settings/models";
-import { captureScheduledAlreadyRun, persistSubtasksViewPreference, replaceConfig } from "./settings/persistence";
+import { persistSubtasksViewPreference } from "./settings/persistence";
 import { assertScheduledImagesPresent, managedScheduledImageRoot } from "./settings/scheduled-image-assets";
 import { registerStreamFailureReporting } from "./stream-failure-report";
 import { ExecutionToolManager } from "./execution/tool";
@@ -377,12 +377,15 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       if (!loaded.path) {
         throw new Error("No persistent review-gate config file is loaded.");
       }
-      // #306: capture the live already-run state before this asynchronous
-      // save so a later install can preserve changes made while in flight.
-      const scheduledTasksAlreadyRunBeforeSave = captureScheduledAlreadyRun(config);
-      replaceConfig(config, await persistSubtasksViewPreference(loaded.path, expanded), {
-        scheduledTasksAlreadyRunBeforeSave,
-      });
+      // The view toggle persists only its owned disk preference. Installing
+      // the disk-derived result into the live config here would reset
+      // session-only (Escape-applied) executor, reviewer, mode, and catalog
+      // choices while their pending-delta metadata still references them;
+      // the live config is the sole active state, so only its owned ui field
+      // changes after the awaited persistence. Live scheduled-task fields
+      // (including one-shot alreadyRun) are never touched by this path.
+      await persistSubtasksViewPreference(loaded.path, expanded);
+      config.ui = { ...config.ui, subtasksViewExpanded: expanded };
     },
     onScheduledDispatchRecorded: consumeOneShot,
   });

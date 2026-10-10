@@ -1251,6 +1251,9 @@ test("a Save fails closed on a ~/ workspace that is not an existing directory", 
         rootSettingsRow("Scheduled tasks", "1 of 1 enabled"),
         "Back",
         "Save changes",
+        // Issue #294: root Escape would retry the same failing validation; an
+        // explicit Cancel exits the re-shown menu and nothing is written.
+        "Cancel",
       ])));
       assert.equal(await readFile(configPath, "utf8"), before, "a rejected ~/ workspace must not change the config file");
     } finally {
@@ -1285,6 +1288,9 @@ test("a Save fails closed when a ~/ workspace names an existing file, not a dire
         rootSettingsRow("Scheduled tasks", "1 of 1 enabled"),
         "Back",
         "Save changes",
+        // Issue #294: root Escape would retry the same failing validation; an
+        // explicit Cancel exits the re-shown menu and nothing is written.
+        "Cancel",
       ])));
       assert.equal(await readFile(configPath, "utf8"), before, "a non-directory ~/ workspace must not change the config file");
     } finally {
@@ -1523,7 +1529,10 @@ test("/review-settings stages the orchestrator-turn destination with unused work
     "Back",
     "Back",
     "Save changes",
-    undefined,
+    // The failed Save keeps the menu open; an explicit Cancel exits without
+    // applying the invalid staged state (issue #294: root Escape would retry
+    // the same failing validation).
+    "Cancel",
   ]));
   assert.equal(await readFile(configPath, "utf8"), previous, "a switch to subtask without a workspace must leave saved config untouched");
 
@@ -1567,8 +1576,9 @@ test("/review-settings saves an orchestrator-turn entry with a stale worker refe
   assert.equal(saved.scheduledTasks["task-abcdef12"].enabled, true);
 
   // Switch the entry to the subtask destination in the menu: the same stored
-  // reference is re-validated and fails the Save closed. The menu stays up
-  // (values exhausted cancel it) and the file keeps the orchestrator staging.
+  // reference is re-validated and fails the Save closed. The explicit Cancel
+  // exits without applying the invalid staged state (issue #294) and the file
+  // keeps the orchestrator staging.
   const previous = await readFile(configPath, "utf8");
   const config2 = normalizeConfig(saved);
   const registered2 = commandHarness();
@@ -1581,7 +1591,7 @@ test("/review-settings saves an orchestrator-turn entry with a stale worker refe
     "Back",
     "Back",
     "Save changes",
-    undefined,
+    "Cancel",
   ]));
   assert.equal(await readFile(configPath, "utf8"), previous, "the failed subtask re-validation save must mutate nothing");
 

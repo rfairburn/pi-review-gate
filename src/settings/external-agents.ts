@@ -94,17 +94,30 @@ export type ExternalAgentEditResult =
   | { kind: "apply"; agent: ExternalAgentConfig }
   | { kind: "delete"; id: string };
 
+async function withSaveSuspended<T>(ui: UiContext, operation: () => Promise<T>): Promise<T> {
+  const control = ui.saveControl;
+  if (!control) return operation();
+  control.suspended += 1;
+  try {
+    return await operation();
+  } finally {
+    control.suspended -= 1;
+  }
+}
+
 /** Creates a definition only: no catalog mutations, enrollment, activation or CLI calls. */
 export async function selectExternalAgentCreation(ui: UiContext, config: ReviewGateConfig): Promise<ExternalAgentConfig | undefined> {
-  const adapter = await selectAdapter(ui);
-  if (!adapter) return undefined;
-  const result = await editExternalAgent(ui, config, { id: "", adapter });
-  return result?.kind === "apply" ? result.agent : undefined;
+  return withSaveSuspended(ui, async () => {
+    const adapter = await selectAdapter(ui);
+    if (!adapter) return undefined;
+    const result = await editExternalAgent(ui, config, { id: "", adapter });
+    return result?.kind === "apply" ? result.agent : undefined;
+  });
 }
 
 export async function selectExternalAgentEdit(ui: UiContext, config: ReviewGateConfig, existing: ExternalAgentConfig): Promise<ExternalAgentEditResult | undefined> {
   if (existing.adapter !== "claude-cli" && existing.adapter !== "codex-cli") return undefined;
-  return editExternalAgent(ui, config, existing, existing.id);
+  return withSaveSuspended(ui, () => editExternalAgent(ui, config, existing, existing.id));
 }
 
 async function editExternalAgent(ui: UiContext, config: ReviewGateConfig, initial: ExternalAgentConfig, originalId?: string): Promise<ExternalAgentEditResult | undefined> {

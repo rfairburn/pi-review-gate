@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.140]
+
+### Changed
+
+- Config fingerprints and session-state digests now share one internal, dependency-free
+  canonical JSON serializer (#245). The exact serialized bytes and hash inputs are
+  unchanged, so existing digests remain valid; the tests' independent legacy/tamper
+  fixture serializers are retained.
+
 ## [0.1.0-dev.139]
 
 ### Fixed

@@ -39,6 +39,9 @@ export interface SessionHostFrameWriterOptions {
 	readonly onError?: (error: Error) => void;
 }
 
+/** Result of settling one submitted frame against the Writable output. */
+export type SessionHostFrameDisposition = "written" | "unchanged";
+
 /**
  * Small structural API for an output-only custom session-host surface.
  *
@@ -61,7 +64,11 @@ export interface SessionHostFrameWriterOptions {
  * candidate plus one written snapshot, each bounded by `maxFrameBytes`.
  * `invalidate()` discards the known baseline so the next emitted frame is a
  * complete redraw: it keeps the newest pending candidate, allocates no queue,
- * and a blocked sink still repaints fully once its queued write drains. Call
+ * and a blocked sink still repaints fully once its queued write drains. An
+ * optional submit callback settles when that exact candidate is written (or
+ * when it is confirmed unchanged); for a `write()` that returns false, the
+ * written notification waits for `drain`. This is a Writable boundary, not
+ * proof of physical terminal display. Call
  * `close()` to cancel pending redraws and attempt reset, cursor show, and
  * alternate-screen exit. Its boolean is true only if that final
  * cleanup write was accepted and its callback (and any required `drain`) was
@@ -79,7 +86,12 @@ export interface SessionHostFrameWriterOptions {
  */
 export interface SessionHostFrameWriter {
 	start(): void;
-	submit(frame: ComposedHostFrame, cols: number, rows: number): void;
+	submit(
+		frame: ComposedHostFrame,
+		cols: number,
+		rows: number,
+		onSettled?: (disposition: SessionHostFrameDisposition) => void,
+	): void;
 	/**
 	 * Discard the written-frame baseline so the next emitted frame is a
 	 * complete redraw. Bounded and explicit: the newest pending candidate is
@@ -100,6 +112,11 @@ interface FrameCandidate {
 	/** Display-cell width of each sanitized row (cursor resting position). */
 	readonly rowWidths: readonly number[];
 	readonly cursor: { readonly column: number; readonly row: number } | undefined;
+}
+
+interface PendingFrame {
+	readonly candidate: FrameCandidate;
+	readonly onSettled?: (disposition: SessionHostFrameDisposition) => void;
 }
 
 /** Create an inert frame writer; no output, timers, or listeners are created yet. */
@@ -138,7 +155,8 @@ export function createSessionHostFrameWriter(
 	let failed = false;
 	let errorReported = false;
 	let blocked = false;
-	let pending: FrameCandidate | undefined;
+	let pending: PendingFrame | undefined;
+	let blockedSettlement: (() => void) | undefined;
 	let baseline: FrameCandidate | undefined;
 	let redrawTimer: ReturnType<typeof setTimeout> | undefined;
 	let lastFrameAt: number | undefined;
@@ -167,6 +185,9 @@ export function createSessionHostFrameWriter(
 		}
 		if (blocked) {
 			blocked = false;
+			const settle = blockedSettlement;
+			blockedSettlement = undefined;
+			settle?.();
 			schedulePump();
 		}
 	};
@@ -195,6 +216,7 @@ export function createSessionHostFrameWriter(
 	function recordOutputFailure(): void {
 		failed = true;
 		pending = undefined;
+		blockedSettlement = undefined;
 		clearRedrawTimer();
 		if (closing && cleanupAttempted) cleanupFailed = true;
 		if (errorReported) return;
@@ -279,22 +301,43 @@ export function createSessionHostFrameWriter(
 		return accepted;
 	}
 
+	function notifySettled(
+		submission: PendingFrame,
+		disposition: SessionHostFrameDisposition,
+	): void {
+		try {
+			submission.onSettled?.(disposition);
+		} catch {
+			// Presentation bookkeeping is isolated from output and stream lifecycle.
+		}
+	}
+
 	function pump(): void {
 		if (!started || closing || closed || failed || blocked || pending === undefined) return;
-		const candidate = pending;
+		const submission = pending;
 		pending = undefined;
+		const candidate = submission.candidate;
 		const payload = baseline === undefined
 			|| baseline.cols !== candidate.cols
 			|| baseline.rows !== candidate.rows
 			? buildFullFramePayload(candidate, maxFrameBytes)
 			: buildDiffPayload(baseline, candidate, maxFrameBytes);
-		if (payload === undefined) return; // rows and cursor unchanged: skip output entirely
+		if (payload === undefined) {
+			notifySettled(submission, "unchanged");
+			return; // rows and cursor unchanged: skip output entirely
+		}
 		lastFrameAt = Date.now();
 		const accepted = writeFrame(payload);
 		// The baseline advances only when the write was actually invoked: a
 		// false return is queued until drain, while a throw is a failure that
 		// must not authorize newer baseline writes.
-		if (accepted !== undefined) baseline = candidate;
+		if (accepted !== undefined) {
+			baseline = candidate;
+			if (accepted) notifySettled(submission, "written");
+			else if (submission.onSettled !== undefined) {
+				blockedSettlement = () => notifySettled(submission, "written");
+			}
+		}
 	}
 
 	function schedulePump(): void {
@@ -372,7 +415,12 @@ export function createSessionHostFrameWriter(
 			writeFrame(Buffer.from(ENTER_ALT_SCREEN, "ascii"));
 		},
 
-		submit(frame: ComposedHostFrame, cols: number, rows: number): void {
+		submit(
+			frame: ComposedHostFrame,
+			cols: number,
+			rows: number,
+			onSettled?: (disposition: SessionHostFrameDisposition) => void,
+		): void {
 			if (!started) throw new Error("Session host frame writer has not started");
 			if (closing || closed) throw new Error("Session host frame writer is closed");
 			if (failed) throw new Error("Session host frame output is unavailable");
@@ -411,7 +459,7 @@ export function createSessionHostFrameWriter(
 				rowWidths,
 				cursor,
 			};
-			pending = candidate;
+			pending = { candidate, onSettled };
 			schedulePump();
 		},
 
@@ -429,6 +477,7 @@ export function createSessionHostFrameWriter(
 			closing = true;
 			clearRedrawTimer();
 			pending = undefined;
+			blockedSettlement = undefined;
 			closePromise = new Promise<boolean>((resolve) => {
 				finishClose = resolve;
 			});

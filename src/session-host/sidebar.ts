@@ -204,6 +204,15 @@ export interface SidebarControllerOptions {
   readonly onAction?: (action: SidebarAction) => void;
 }
 
+export interface SidebarMousePresentation {
+  /** Stable signature of the captured maps' activation targets and pane-relative positions. */
+  readonly authorizationKey: string;
+  /** Activates only entries captured by the exact sidebar render this token represents. */
+  activateRosterAt(column: number, row: number, cols: number, rows: number): boolean;
+  /** Activates only saved rows captured by the exact sidebar render this token represents. */
+  activateSavedAt(column: number, row: number, cols: number, rows: number): boolean;
+}
+
 export interface SidebarFieldFactoryOptions {
   readonly kind: "name" | "path";
   readonly initialText: string;
@@ -263,6 +272,31 @@ interface SidebarEntry {
   readonly item?: SidebarItem;
 }
 
+// updateItems rebuilds bounded DTO snapshots even when their content is
+// unchanged; a skipped frame may keep the prior emitted map active. Compare
+// the activation identity and safety state, not display/telemetry metadata.
+function sameSidebarEntry(a: SidebarEntry, b: SidebarEntry): boolean {
+  if (a.key !== b.key || a.kind !== b.kind) return false;
+  if (a.item === undefined || b.item === undefined) return a.item === b.item;
+  return a.item.id === b.item.id
+    && a.item.lifecycle === b.item.lifecycle
+    && (a.item.unavailable === true) === (b.item.unavailable === true)
+    && a.item.hasLiveProcess === b.item.hasLiveProcess
+    && (a.item.lifecycle !== "exited"
+      || (a.item.nativeSession?.sessionId === b.item.nativeSession?.sessionId
+        && a.item.nativeSession?.epoch === b.item.nativeSession?.epoch));
+}
+
+function sidebarActivationIdentity(entry: SidebarEntry): readonly unknown[] {
+  const item = entry.item;
+  return item === undefined
+    ? [entry.key, entry.kind]
+    : [entry.key, entry.kind, item.id, item.lifecycle, item.unavailable === true,
+      item.hasLiveProcess, item.lifecycle === "exited"
+        ? [item.nativeSession?.sessionId ?? null, item.nativeSession?.epoch ?? null]
+        : null];
+}
+
 interface DisplayedRosterRegion {
   readonly row: number;
   readonly height: number;
@@ -273,6 +307,33 @@ interface DisplayedSavedRow {
   readonly paneRow: number;
   readonly index: number;
   readonly entry: SidebarSavedRow;
+}
+
+interface DisplayedSavedRows {
+  readonly cols: number;
+  readonly rows: number;
+  readonly entries: readonly DisplayedSavedRow[];
+}
+
+interface DisplayedRoster {
+  readonly signature: string;
+  readonly heights: ReadonlyMap<string, number>;
+  readonly regions: ReadonlyMap<string, DisplayedRosterRegion>;
+  readonly cols: number;
+  readonly rows: number;
+  readonly focus: SidebarFocus;
+}
+
+function mouseAuthorizationKey(
+  roster: DisplayedRoster | undefined,
+  saved: DisplayedSavedRows | undefined,
+): string {
+  return JSON.stringify({
+    roster: roster === undefined ? null : [roster.cols, roster.rows,
+      [...roster.regions.values()].map((region) => [region.row, region.height, sidebarActivationIdentity(region.entry)])],
+    saved: saved === undefined ? null : [saved.cols, saved.rows,
+      saved.entries.map(({ paneRow, entry }) => [paneRow, entry.id, entry.file])],
+  });
 }
 
 const DEFAULT_TOGGLE_KEY = "alt+left";
@@ -939,9 +1000,7 @@ export class SidebarController {
    * too-small fallback or an undrawn/hidden row can never be opened. Invalidated
    * on fallback, dismissal, and catalog replacement.
    */
-  private displayedSavedRows:
-    | { readonly cols: number; readonly rows: number; readonly entries: readonly DisplayedSavedRow[] }
-    | undefined;
+  private displayedSavedRows: DisplayedSavedRows | undefined;
   private editTarget?: { readonly id: string; readonly nativeSession: SessionHostNativeSession; readonly currentName: string };
   private workspaceDraft: string;
   private editDraft = "";
@@ -1014,16 +1073,7 @@ export class SidebarController {
    * (Enter, edit, remove) act only on an entry present here at its current
    * height, so nothing invisible or since-changed can be activated.
    */
-  private displayedRoster:
-    | {
-        readonly signature: string;
-        readonly heights: ReadonlyMap<string, number>;
-        readonly regions: ReadonlyMap<string, DisplayedRosterRegion>;
-        readonly cols: number;
-        readonly rows: number;
-        readonly focus: SidebarFocus;
-      }
-    | undefined;
+  private displayedRoster: DisplayedRoster | undefined;
 
   constructor(options: SidebarControllerOptions = {}) {
     this.toggleKey = normalizeToggleKey(options.toggleKey);
@@ -1342,21 +1392,50 @@ export class SidebarController {
   }
 
   /**
+   * Capture the immutable draw-derived hit maps for one render. Main retains
+   * this token beside the composed frame until the frame writer settles it;
+   * later renders replace the controller's current maps without mutating this
+   * presentation.
+   */
+  captureMousePresentation(): SidebarMousePresentation {
+    const displayedRoster = this.displayedRoster;
+    const displayedSavedRows = this.displayedSavedRows;
+    return Object.freeze({
+      authorizationKey: mouseAuthorizationKey(displayedRoster, displayedSavedRows),
+      activateRosterAt: (column: number, row: number, cols: number, rows: number): boolean =>
+        this.activateRosterAtFrom(displayedRoster, column, row, cols, rows, false),
+      activateSavedAt: (column: number, row: number, cols: number, rows: number): boolean =>
+        this.activateSavedAtFrom(displayedSavedRows, column, row, cols, rows),
+    });
+  }
+
+  /**
    * Activates the exact roster entry whose complete row/card was drawn at this
    * pane-relative coordinate. Main consumes all other gestures in the visible
    * pane; this method never derives row positions independently of rendering.
    */
   activateRosterAt(column: number, row: number, cols: number, rows: number): boolean {
+    return this.activateRosterAtFrom(this.displayedRoster, column, row, cols, rows, true);
+  }
+
+  private activateRosterAtFrom(
+    shown: DisplayedRoster | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+    requireCurrentSignature: boolean,
+  ): boolean {
     if (!this._visible || (this._focus !== "main" && this._focus !== "sidebar")
       || !validHitGeometry(column, row, cols, rows)) return false;
-    const shown = this.displayedRoster;
-    if (shown === undefined || shown.signature !== this.rosterSignature()
-      || shown.cols !== cols || shown.rows !== rows || shown.focus !== this._focus) return false;
+    if (shown === undefined || (requireCurrentSignature
+      && (shown.signature !== this.rosterSignature() || shown.focus !== this._focus))
+      || shown.cols !== cols || shown.rows !== rows) return false;
     const region = [...shown.regions.values()].find((candidate) => row >= candidate.row
       && row < candidate.row + candidate.height);
     if (region === undefined || region.height !== this.entryHeight(region.entry)) return false;
     const current = this.entries.find((entry) => entry.key === region.entry.key);
-    if (current !== region.entry) return false;
+    if (current === undefined || !sameSidebarEntry(current, region.entry)) return false;
     this.selectedEntryKey = current.key;
     this.desiredSelectionId = undefined;
     this.noticeError = undefined;
@@ -1374,13 +1453,25 @@ export class SidebarController {
 
   /** Activates a fully drawn saved row in the currently owned Saved pane. */
   activateSavedAt(column: number, row: number, cols: number, rows: number): boolean {
+    return this.activateSavedAtFrom(this.displayedSavedRows, column, row, cols, rows);
+  }
+
+  private activateSavedAtFrom(
+    shown: DisplayedSavedRows | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+  ): boolean {
     if (!this._visible || this._focus !== "form" || this.formKind !== "saved"
       || !validHitGeometry(column, row, cols, rows)) return false;
-    const shown = this.displayedSavedRows;
     if (shown === undefined || shown.cols !== cols || shown.rows !== rows) return false;
     const displayed = shown.entries.find((candidate) => candidate.paneRow === row);
-    if (displayed === undefined || this.savedRows[displayed.index] !== displayed.entry) return false;
-    this.savedSelectedIndex = displayed.index;
+    if (displayed === undefined) return false;
+    const currentIndex = this.savedRows.findIndex((candidate) => candidate.id === displayed.entry.id
+      && candidate.file === displayed.entry.file);
+    if (currentIndex < 0) return false;
+    this.savedSelectedIndex = currentIndex;
     this.activateSavedRow();
     return true;
   }

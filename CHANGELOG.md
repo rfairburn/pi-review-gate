@@ -23,8 +23,10 @@ dates.
   that row's existing Enter action: a live instance becomes the active Main input owner
   and focuses Main while sibling sessions continue. A fully displayed Saved-picker row
   follows the existing exact-open, admission, duplicate-open, and lifecycle guards; a
-  successful open focuses Main. Clicking existing New/Saved/Quit action entries keeps
-  their forms, picker, and Quit confirmation behavior. Keyboard controls and native Main
+  successful open focuses Main. Click targets are tied to emitted frames, not pending
+  redraws, so rate limiting or output backpressure cannot activate an undisplayed entry.
+  Clicking existing New/Saved/Quit action entries keeps their forms, picker, and Quit
+  confirmation behavior. Keyboard controls and native Main
   mouse handling are unchanged, and sidebar clicks are handled by the host rather than
   forwarded to a native child. No new lifecycle action or conversation wheel/trackpad
   scrolling (#332) is added; Windows runtime caveats remain and this does not certify

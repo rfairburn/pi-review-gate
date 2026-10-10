@@ -202,6 +202,37 @@ test("invalidate while a write is blocked still repaints completely after drain"
 	assert.equal(await driver.close(), true);
 });
 
+test("settlement follows written, unchanged, and drained backpressure candidates", async () => {
+	const output = new SyntheticWritable();
+	const driver = writer(output, { redrawIntervalMs: 0 });
+	const dispositions: string[] = [];
+	driver.start();
+	driver.submit(frame(["A"]), 20, 1, (value) => dispositions.push(`A:${value}`));
+	assert.deepEqual(dispositions, ["A:written"]);
+
+	driver.submit(frame(["A"]), 20, 1, (value) => dispositions.push(`same:${value}`));
+	assert.deepEqual(dispositions, ["A:written", "same:unchanged"],
+		"an unchanged submission settles without claiming a new emitted hit map");
+
+	output.writeResults.push(false);
+	driver.submit(frame(["B"]), 20, 1, (value) => dispositions.push(`B:${value}`));
+	assert.equal(dispositions.includes("B:written"), false,
+		"a false Writable return is accepted but not settled until drain");
+	driver.submit(frame(["C"]), 20, 1, (value) => dispositions.push(`C:${value}`));
+	output.emit("drain");
+	assert.deepEqual(dispositions, ["A:written", "same:unchanged", "B:written", "C:written"],
+		"drain settles the queued candidate before pumping the newest coalesced frame");
+	assert.ok(outputText(output, 3).includes("C"));
+
+	const writesBeforeInvalidatedIdentical = output.writes.length;
+	driver.invalidate();
+	driver.submit(frame(["C"]), 20, 1, (value) => dispositions.push(`identical:${value}`));
+	assert.equal(output.writes.length, writesBeforeInvalidatedIdentical + 1,
+		"an identical candidate written after invalidation has its own write boundary");
+	assert.equal(dispositions.at(-1), "identical:written");
+	assert.equal(await driver.close(), true);
+});
+
 test("default redraw cadence is 16 ms and fast bursts coalesce to the newest frame", async (t) => {
 	t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
 	const output = new SyntheticWritable();

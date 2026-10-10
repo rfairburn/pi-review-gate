@@ -8,7 +8,11 @@ import { ProcessTerminal, matchesKey } from "pi-session-host-tui";
 import { createStatusBroker, type StatusBroker } from "./broker";
 import { composeHostFrame, computeHostLayout, type HostFocus, type HostLayout, type HostPaneRect, type RenderedSidebar } from "./compositor";
 import { chooseExitedRestart } from "./exited-restart";
-import { createSessionHostFrameWriter, type SessionHostFrameWriter } from "./frame-writer";
+import {
+  createSessionHostFrameWriter,
+  type SessionHostFrameDisposition,
+  type SessionHostFrameWriter,
+} from "./frame-writer";
 import { createSessionHostTextField, type SessionHostFieldKeybindings } from "./field-editor";
 import { loadNativeFieldKeybindings, runNativeExternalEditor } from "./form-support";
 import { normalizeNativeSourceInput, parseMouseInput, translateInput, KeyboardCapabilityObserver, type ParsedMouseInput } from "./input";
@@ -44,7 +48,13 @@ import {
   type SavedSessionCatalog,
   type SavedSessionRefusalReason,
 } from "./saved-sessions";
-import { SidebarController, type SidebarAction, type SidebarFieldFactoryOptions, type SidebarItem } from "./sidebar";
+import {
+  SidebarController,
+  type SidebarAction,
+  type SidebarFieldFactoryOptions,
+  type SidebarItem,
+  type SidebarMousePresentation,
+} from "./sidebar";
 import type { TerminalInputModes } from "./terminal-surface";
 
 const STARTUP_OPTIONS_HELPER = join("scripts", "session-host-startup-options.cjs");
@@ -87,6 +97,23 @@ type MainManager = Pick<InstanceManager,
 type MainObserver = Pick<KeyboardCapabilityObserver, "flags" | "wait" | "dispose" | "feed">;
 type MainWriter = Pick<SessionHostFrameWriter, "start" | "submit" | "close">
   & Partial<Pick<SessionHostFrameWriter, "invalidate">>;
+interface MouseFramePresentation {
+  readonly layout: HostLayout;
+  readonly focus: SidebarController["focus"];
+  readonly sidebar: SidebarMousePresentation;
+}
+
+function sameMouseAuthorization(a: MouseFramePresentation, b: MouseFramePresentation): boolean {
+  const pane = (rect: HostPaneRect | undefined): readonly number[] | null => rect === undefined
+    ? null
+    : [rect.column, rect.row, rect.cols, rect.rows];
+  if (a.layout.sidebarOverlay !== b.layout.sidebarOverlay
+    || pane(a.layout.sidebar)?.join(",") !== pane(b.layout.sidebar)?.join(",")
+    || pane(a.layout.form)?.join(",") !== pane(b.layout.form)?.join(",")) return false;
+  if (a.layout.sidebar === undefined && a.layout.form === undefined) return true;
+  return a.sidebar.authorizationKey === b.sidebar.authorizationKey;
+}
+
 type MainStdin = EventEmitter & { isTTY?: boolean; readableEnded?: boolean };
 type MainStdout = Writable & EventEmitter & { isTTY?: boolean; columns?: number; rows?: number };
 type MainSignals = EventEmitter;
@@ -516,6 +543,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   // Unknown/absent evidence never authorizes releasing exclusive ownership.
   let ownedStateSettled = false;
   let layout: HostLayout | undefined;
+  let displayedMousePresentation: MouseFramePresentation | undefined;
+  let latestMousePresentation: MouseFramePresentation | undefined;
   let lastNativeCols: number | undefined;
   let lastNativeRows: number | undefined;
   let resizeInProgress = false;
@@ -714,7 +743,22 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           header,
           focus,
         });
-        writer.submit(composed, cols, rows);
+        const mousePresentation: MouseFramePresentation = {
+          layout: currentLayout,
+          focus,
+          sidebar: sidebar.captureMousePresentation(),
+        };
+        // Distinct targets can render identical bytes (for example Saved
+        // conversations with matching captions and workspaces). Their maps
+        // still need a written boundary before mouse authorization changes.
+        if (displayedMousePresentation !== undefined
+          && !sameMouseAuthorization(displayedMousePresentation, mousePresentation)) {
+          writer.invalidate?.();
+        }
+        latestMousePresentation = mousePresentation;
+        writer.submit(composed, cols, rows, (disposition: SessionHostFrameDisposition) => {
+          if (disposition === "written") displayedMousePresentation = mousePresentation;
+        });
       } catch {
         requestShutdown(true);
       }
@@ -1149,6 +1193,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
 
   function handleMouseInput(data: string, mouse: ParsedMouseInput): void {
     if (shutdownRequested || externalEditorActive || !sidebar || !layout) return;
+    const presentation = displayedMousePresentation;
+    const hitLayout = presentation?.layout ?? layout;
+    const hitMapPending = presentation === undefined || latestMousePresentation === undefined
+      || !sameMouseAuthorization(presentation, latestMousePresentation);
     const buttonId = mouseButtonId(mouse);
     if (mouse.release) {
       if (buttonId !== undefined && hostMouseButtons.delete(buttonId)) return;
@@ -1161,26 +1209,26 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }
     if (mouse.motion && buttonId !== undefined && hostMouseButtons.has(buttonId)) return;
 
-    const formPane = layout.form !== undefined && containsHostPoint(layout.form, mouse.x, mouse.y)
-      ? layout.form
+    const formPane = hitLayout.form !== undefined && containsHostPoint(hitLayout.form, mouse.x, mouse.y)
+      ? hitLayout.form
       : undefined;
-    const sidebarPane = layout.sidebar !== undefined && containsHostPoint(layout.sidebar, mouse.x, mouse.y)
-      ? layout.sidebar
+    const sidebarPane = hitLayout.sidebar !== undefined && containsHostPoint(hitLayout.sidebar, mouse.x, mouse.y)
+      ? hitLayout.sidebar
       : undefined;
     const pane = formPane ?? sidebarPane;
     if (pane !== undefined) {
       if (isMouseButtonPress(mouse) && buttonId !== undefined) hostMouseButtons.add(buttonId);
-      if (isLeftMousePress(mouse)) {
+      if (isLeftMousePress(mouse) && presentation !== undefined && !hitMapPending) {
         const previousFocus = sidebar.focus;
         const previousSelection = sidebar.selectedId;
         const previousVisibility = sidebar.visible;
-        // Keep the source pane identity: a wide left roster must never hit-test
-        // Saved rows drawn only in the separate right-hand form pane.
+        // Keep the emitted frame's source pane identity and its render-derived
+        // maps: a newer coalesced render must never retarget this coordinate.
         const activated = formPane !== undefined
-          ? sidebar.activateSavedAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows)
-          : layout.sidebarOverlay && sidebar.focus === "form"
-            ? sidebar.activateSavedAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows)
-            : sidebar.activateRosterAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows);
+          ? presentation.sidebar.activateSavedAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows)
+          : hitLayout.sidebarOverlay && presentation.focus === "form"
+            ? presentation.sidebar.activateSavedAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows)
+            : presentation.sidebar.activateRosterAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows);
         if (activated) {
           if (sidebar.focus !== previousFocus || sidebar.selectedId !== previousSelection
             || sidebar.visible !== previousVisibility) {
@@ -1264,6 +1312,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       if (shutdownRequested || controller.signal.aborted) return undefined;
       const activeWriter = writer;
       writer = undefined;
+      displayedMousePresentation = undefined;
+      latestMousePresentation = undefined;
       if (!activeWriter) {
         requestShutdown(true);
         throw new Error("external editor handoff is unavailable");

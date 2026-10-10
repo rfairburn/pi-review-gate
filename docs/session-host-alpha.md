@@ -265,8 +265,9 @@ this host is refused while its row is live or its creation is pending, and can b
 again after that child has confirmed exit. The picker shows truthful loading, empty,
 unavailable, and partial issue-count notices; Up/Down moves the highlight. Enter opens
 the highlighted conversation, and a single left-click opens the clicked conversation,
-only when that row was fully drawn by the last picker render (a too-small fallback or an
-undrawn/hidden row is refused).
+only when that row belongs to the last emitted picker frame (a too-small fallback or an
+undrawn/hidden row is refused). A queued redraw cannot authorize a newly mapped row:
+click activation is refused while its changed hit targets are awaiting output.
 A click uses the same exact-entry revalidation, admission, duplicate-open, and lifecycle
 guards as Enter. Escape returns to the roster without pausing or stopping anything. A
 successful open makes the restored child the active Main input owner and focuses Main

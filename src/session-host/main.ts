@@ -101,9 +101,15 @@ interface MouseFramePresentation {
   readonly layout: HostLayout;
   readonly focus: SidebarController["focus"];
   readonly sidebar: SidebarMousePresentation;
+  /** Current active owner only when its complete native frame matched this layout. */
+  readonly nativeOwnerId: string | undefined;
 }
 
 function sameMouseAuthorization(a: MouseFramePresentation, b: MouseFramePresentation): boolean {
+  // Focus and owner are part of native click authorization even when a
+  // too-small fallback and a hidden native cursor make the composed bytes
+  // identical. Keep their transitions behind the writer's written boundary.
+  if (a.focus !== b.focus || a.nativeOwnerId !== b.nativeOwnerId) return false;
   const pane = (rect: HostPaneRect | undefined): readonly number[] | null => rect === undefined
     ? null
     : [rect.column, rect.row, rect.cols, rect.rows];
@@ -112,6 +118,27 @@ function sameMouseAuthorization(a: MouseFramePresentation, b: MouseFramePresenta
     || pane(a.layout.form)?.join(",") !== pane(b.layout.form)?.join(",")) return false;
   if (a.layout.sidebar === undefined && a.layout.form === undefined) return true;
   return a.sidebar.authorizationKey === b.sidebar.authorizationKey;
+}
+
+function samePaneGeometry(a: HostPaneRect | undefined, b: HostPaneRect | undefined): boolean {
+  return a === undefined
+    ? b === undefined
+    : b !== undefined && a.column === b.column && a.row === b.row && a.cols === b.cols && a.rows === b.rows;
+}
+
+function sameNativePaneGeometry(a: HostLayout, b: HostLayout): boolean {
+  return a.cols === b.cols && a.rows === b.rows
+    && a.sidebarOverlay === b.sidebarOverlay
+    && !a.sidebarOverlay && a.sidebar !== undefined && b.sidebar !== undefined
+    && a.form === undefined && b.form === undefined
+    && samePaneGeometry(a.native, b.native)
+    && samePaneGeometry(a.sidebar, b.sidebar);
+}
+
+function sameNativeMouseTarget(a: MouseFramePresentation, b: MouseFramePresentation): boolean {
+  return a.focus === "sidebar" && b.focus === "sidebar"
+    && a.nativeOwnerId !== undefined && a.nativeOwnerId === b.nativeOwnerId
+    && sameNativePaneGeometry(a.layout, b.layout);
 }
 
 type MainStdin = EventEmitter & { isTTY?: boolean; readableEnded?: boolean };
@@ -744,10 +771,16 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           header,
           focus,
         });
+        const nativeOwnerId = view?.hasLiveProcess === true && view.lifecycle === "alive"
+          && mainFrame !== undefined
+          && mainFrame.cols === currentLayout.native.cols && mainFrame.rows === currentLayout.native.rows
+          ? view.id
+          : undefined;
         const mousePresentation: MouseFramePresentation = {
           layout: currentLayout,
           focus,
           sidebar: sidebar.captureMousePresentation(),
+          nativeOwnerId,
         };
         // Distinct targets can render identical bytes (for example Saved
         // conversations with matching captions and workspaces). Their maps
@@ -1194,6 +1227,26 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }
   }
 
+  function canFocusMainFromNativeClick(
+    mouse: ParsedMouseInput,
+    presentation: MouseFramePresentation | undefined,
+  ): boolean {
+    const latest = latestMousePresentation;
+    if (!sidebar || !manager || !presentation || !latest || !layout
+      || !sidebar.visible || sidebar.focus !== "sidebar"
+      || !sameNativeMouseTarget(presentation, latest)
+      || !sameNativePaneGeometry(presentation.layout, layout)
+      || !containsHostPoint(presentation.layout.native, mouse.x, mouse.y)
+      || activeId !== presentation.nativeOwnerId) return false;
+    const view = findActiveView();
+    if (!view || view.id !== presentation.nativeOwnerId || !view.hasLiveProcess || view.lifecycle !== "alive") return false;
+    try {
+      return manager.surface(view.id) !== undefined;
+    } catch {
+      return false;
+    }
+  }
+
   function handleMouseInput(data: string, mouse: ParsedMouseInput): void {
     if (shutdownRequested || externalEditorActive || !sidebar || !layout) return;
     const presentation = displayedMousePresentation;
@@ -1246,9 +1299,25 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // activate a draw-derived row.
       return;
     }
-    // A visible native pane is not an input target while a host form, dialog,
-    // or roster owns focus. Main-focused native mouse packets continue through
-    // the exact existing child-mode translator and viewport clipping.
+    // With the roster focused, a left click in the actually displayed, current
+    // native pane is a focus gesture only. The activation press and its matching
+    // release/motion stay host-owned; no part of that first click reaches Pi.
+    if (isLeftMousePress(mouse) && buttonId !== undefined
+      && canFocusMainFromNativeClick(mouse, presentation)) {
+      const focused = sidebar.focusMainFromNativeClick();
+      hostMouseButtons.add(buttonId);
+      if (focused) {
+        deliberateActionGeneration += 1;
+        reconcileLayout(false);
+        scheduleRedraw();
+      }
+      // Even if the focus recheck refuses a raced state change, never replay
+      // the click that was evaluated as a host-owned focus gesture.
+      return;
+    }
+    // Native mouse packets never reach Pi while a host form, dialog, or roster
+    // owns focus; the roster's eligible Main-pane click above is focus-only.
+    // Main-focused packets keep the existing translator and viewport clipping.
     if (sidebar.focus === "main") routeForward(data);
   }
 

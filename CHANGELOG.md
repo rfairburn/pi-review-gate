@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.141]
+
+### Added
+
+- Clicking the displayed native Main pane while the sidebar roster has focus now
+  returns focus to the unchanged active Main owner and consumes the activating click;
+  subsequent input reaches that owner. Sidebar selection and visibility, siblings,
+  keyboard controls, and already-focused native mouse behavior remain unchanged.
+  Forms, confirmations, and the narrow overlay are excluded (#361).
+
 ## [0.1.0-dev.140]
 
 ### Changed

@@ -1108,6 +1108,14 @@ export class SidebarController {
     return this._focus;
   }
 
+  /** Return from the roster to Main without changing its selection or visibility. */
+  focusMainFromNativeClick(): boolean {
+    if (!this._visible || this._focus !== "sidebar") return false;
+    this._focus = "main";
+    this.onInvalidate?.();
+    return true;
+  }
+
   /** Currently highlighted roster item id (undefined for non-item rows). */
   get selectedId(): string | undefined {
     const entry = this.currentEntry();

@@ -237,6 +237,7 @@ class FakeSurface {
   rows: number;
   readonly writesAsFrame: string[];
   frameCalls = 0;
+  cursorVisible = true;
   modes: TerminalInputModes = {
     kittyFlags: 0,
     modifyOtherKeys: 0,
@@ -260,7 +261,7 @@ class FakeSurface {
       cols: this.cols,
       rows: this.rows,
       lines,
-      cursor: { column: 2, row: 0, visible: true },
+      cursor: { column: 2, row: 0, visible: this.cursorVisible },
     };
   }
 
@@ -1884,6 +1885,295 @@ test("visible host panes own clicks while native Main mouse keeps child modes an
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }
+});
+
+test("a click on the displayed native Main pane returns focus without forwarding the activating click", async () => {
+  const harness = createHarness();
+  const manager = await startTwoSessions(harness);
+
+  harness.terminal.emitInput("\x1b[A"); // Select A without changing B's active Main ownership.
+  harness.terminal.emitInput(ENTER); // Explicitly make A the Main owner.
+  const surfaceA = manager.surface("native-1");
+  assert.ok(surfaceA);
+  surfaceA.modes = { ...surfaceA.modes, mouseTracking: "any", mouseEncoding: "sgr" };
+  manager.notify("native-a-mouse-mode");
+  harness.terminal.emitInput(ALT_LEFT); // Keep the visible roster open and return its focus.
+  harness.terminal.emitInput("\x1b[B"); // Highlight B while A remains the Main owner.
+  await nextTurn();
+
+  assert.equal(harness.sidebar?.focus, "sidebar");
+  assert.equal(harness.sidebar?.visible, true);
+  assert.equal(harness.sidebar?.selectedId, "native-2");
+  assert.equal(harness.sidebar?.activeMainOwnerID, "native-1");
+  assert.ok(plainLine(harness.writer.frames.at(-1)?.frame, 1).slice(33).startsWith("frame:native-1"),
+    "the visible right pane is A's complete native frame");
+
+  const selectedBefore = harness.sidebar?.selectedId;
+  const ownerBefore = harness.sidebar?.activeMainOwnerID;
+  const visibilityBefore = harness.sidebar?.visible;
+  const resizeCountBefore = manager.resizeCalls.length;
+  const viewStateBefore = manager.views.map(({ id, lifecycle, hasLiveProcess }) => [id, lifecycle, hasLiveProcess]);
+  const writesBeforeClick = manager.writes.length;
+  emitMouse(harness.terminal, 33, 1); // Native pane origin: focus only, never a Pi mouse press.
+  assert.equal(harness.sidebar?.focus, "main");
+  assert.equal(manager.writes.length, writesBeforeClick, "the activating click is consumed before Pi sees it");
+  emitMouse(harness.terminal, 33, 1, 0, "m"); // Its matching release is consumed as part of the same click.
+  assert.equal(manager.writes.length, writesBeforeClick, "the activating click's release is not replayed to Pi");
+  assert.equal(harness.sidebar?.selectedId, selectedBefore, "returning focus does not move the sidebar selection");
+  assert.equal(harness.sidebar?.activeMainOwnerID, ownerBefore, "the existing Main owner remains A");
+  assert.equal(harness.sidebar?.visible, visibilityBefore, "the sidebar remains visible");
+  assert.equal(manager.resizeCalls.length, resizeCountBefore, "focus-only transfer preserves native geometry");
+  assert.deepEqual(manager.views.map(({ id, lifecycle, hasLiveProcess }) => [id, lifecycle, hasLiveProcess]), viewStateBefore,
+    "neither A nor its live sibling is started, stopped, or otherwise changed");
+
+  harness.terminal.emitInput("typed-after-native-focus");
+  assert.deepEqual(manager.writes.slice(writesBeforeClick), [
+    { id: "native-1", data: "typed-after-native-focus" },
+  ], "subsequent typing is routed only to the unchanged active owner A");
+
+  const writesBeforeFocusedMouse = manager.writes.length;
+  emitMouse(harness.terminal, 33, 1); // Once Main is focused, keep the existing native Pi behavior.
+  emitMouse(harness.terminal, 33, 1, 0, "m");
+  assert.deepEqual(manager.writes.slice(writesBeforeFocusedMouse), [
+    { id: "native-1", data: `${ESC}[<0;1;1M` },
+    { id: "native-1", data: `${ESC}[<0;1;1m` },
+  ], "a later click is translated and delivered unchanged through A's native mouse mode");
+  assert.equal(harness.sidebar?.focus, "main");
+  assert.equal(harness.sidebar?.selectedId, selectedBefore);
+  assert.equal(manager.views[1]?.hasLiveProcess, true, "B remains live and receives no input");
+
+  harness.terminal.emitInput(ALT_LEFT); // Existing keyboard focus control still returns to the roster.
+  assert.equal(harness.sidebar?.focus, "sidebar");
+  assert.equal(harness.sidebar?.visible, true);
+  assert.equal(harness.sidebar?.selectedId, selectedBefore);
+  assert.equal(harness.sidebar?.activeMainOwnerID, ownerBefore);
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("native Main click focus requires a written frame for the current owner and geometry", async () => {
+  const output = new QueuedFrameOutput();
+  output.refuseNextWrite(); // The first frame is not displayed until this sink drains.
+  const harness = createHarness({}, {
+    createWriter: (_stdout, writerOptions) => createSessionHostFrameWriter(
+      output as unknown as Writable,
+      { ...writerOptions, redrawIntervalMs: 0 },
+    ),
+  });
+  let shutDown = false;
+  try {
+    const manager = await startTwoSessions(harness);
+    assert.equal(harness.sidebar?.focus, "sidebar");
+    assert.equal(output.queuedCount, 1, "the composed host frame is still waiting for output acceptance");
+    const writesBeforeUndisplayedClick = manager.writes.length;
+    emitMouse(harness.terminal, 33, 1);
+    emitMouse(harness.terminal, 33, 1, 0, "m");
+    assert.equal(harness.sidebar?.focus, "sidebar", "an undisplayed native pane cannot claim Main focus");
+    assert.equal(manager.writes.length, writesBeforeUndisplayedClick, "no click is routed through a speculative frame");
+
+    output.drain();
+    for (let attempt = 0; attempt < 10 && !output.writes.some((bytes) => bytes.toString("utf8").includes("Native native-2")); attempt += 1) {
+      await nextTurn();
+    }
+    assert.ok(output.writes.some((bytes) => bytes.toString("utf8").includes("Native native-2")),
+      "the real frame writer emitted the current active-owner frame");
+    const writesBeforeDisplayedClick = manager.writes.length;
+    emitMouse(harness.terminal, 33, 1);
+    emitMouse(harness.terminal, 33, 1, 0, "m");
+    assert.equal(harness.sidebar?.focus, "main", "the current displayed owner can receive focus");
+    assert.equal(manager.writes.length, writesBeforeDisplayedClick, "the accepted activating click is still consumed");
+
+    harness.terminal.emitInput(ALT_LEFT);
+    harness.terminal.emitInput("\x1b[A"); // Select A while B remains the owner.
+    harness.terminal.emitInput(ENTER); // Make A the active owner.
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "sidebar");
+    assert.equal(harness.sidebar?.activeMainOwnerID, "native-1");
+
+    output.refuseNextWrite();
+    harness.terminal.emitInput("\x1b[B"); // Select B.
+    await nextTurn();
+    harness.terminal.emitInput(ENTER); // Change the actual Main owner to B while A's frame is still displayed.
+    await nextTurn();
+    harness.terminal.emitInput(ALT_LEFT); // Keep the sidebar focused while B's new frame remains pending.
+    await nextTurn();
+    assert.equal(output.queuedCount, 1);
+    assert.equal(harness.sidebar?.focus, "sidebar");
+    assert.equal(harness.sidebar?.activeMainOwnerID, "native-2");
+    const writesBeforeStaleOwnerClick = manager.writes.length;
+    emitMouse(harness.terminal, 33, 1);
+    emitMouse(harness.terminal, 33, 1, 0, "m");
+    assert.equal(harness.sidebar?.focus, "sidebar", "A's still-displayed frame cannot authorize focus for active B");
+    assert.equal(manager.writes.length, writesBeforeStaleOwnerClick, "the stale-owner click reaches neither child");
+
+    output.drain();
+    await nextTurn();
+    const writesBeforeCurrentOwnerClick = manager.writes.length;
+    emitMouse(harness.terminal, 33, 1);
+    emitMouse(harness.terminal, 33, 1, 0, "m");
+    assert.equal(harness.sidebar?.focus, "main", "B can receive focus after its own frame is emitted");
+    assert.equal(manager.writes.length, writesBeforeCurrentOwnerClick);
+
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    output.refuseNextWrite();
+    harness.terminal.setSize(90, 24); // Same native pane origin, but new native geometry is not yet displayed.
+    await nextTurn();
+    assert.equal(output.queuedCount, 1);
+    assert.equal(harness.sidebar?.focus, "sidebar");
+    const writesBeforeStaleGeometryClick = manager.writes.length;
+    emitMouse(harness.terminal, 33, 1);
+    emitMouse(harness.terminal, 33, 1, 0, "m");
+    assert.equal(harness.sidebar?.focus, "sidebar", "old displayed geometry cannot authorize the resized pane");
+    assert.equal(manager.writes.length, writesBeforeStaleGeometryClick);
+
+    output.drain();
+    await nextTurn();
+    emitMouse(harness.terminal, 33, 1);
+    assert.equal(harness.sidebar?.focus, "main", "the resized pane becomes eligible only after its frame is emitted");
+    emitMouse(harness.terminal, 33, 1, 0, "m");
+    assert.equal(await closeWithSignal(harness), 0);
+    shutDown = true;
+  } finally {
+    if (!shutDown) {
+      harness.signals.emit("SIGTERM");
+      if (output.queuedCount > 0) output.drain();
+      await harness.result.catch(() => undefined);
+    }
+  }
+});
+
+test("real writer settles identical Main and too-small roster frames before native click focus", async () => {
+  const output = new QueuedFrameOutput();
+  const submissions: Array<{ frame: ComposedHostFrame; disposition?: SessionHostFrameDisposition }> = [];
+  const harness = createHarness({}, {
+    createWriter: (_stdout, writerOptions) => {
+      const realWriter = createSessionHostFrameWriter(
+        output as unknown as Writable,
+        { ...writerOptions, redrawIntervalMs: 0 },
+      );
+      return {
+        start: () => realWriter.start(),
+        submit: (frame, cols, rows, onSettled) => {
+          const submission: { frame: ComposedHostFrame; disposition?: SessionHostFrameDisposition } = { frame };
+          submissions.push(submission);
+          realWriter.submit(frame, cols, rows, (disposition) => {
+            submission.disposition = disposition;
+            onSettled?.(disposition);
+          });
+        },
+        invalidate: () => realWriter.invalidate(),
+        close: () => realWriter.close(),
+      };
+    },
+  });
+  let shutDown = false;
+  try {
+    const manager = await ready(harness);
+    fillForm(harness.terminal, "/tiny-native-pane/workspace");
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "main");
+    const owner = harness.sidebar?.activeMainOwnerID;
+    assert.equal(owner, "native-1");
+    assert.ok(owner);
+    const surface = manager.surface(owner);
+    assert.ok(surface);
+    surface.cursorVisible = false;
+
+    harness.terminal.setSize(80, 2);
+    await nextTurn();
+    const mainSubmission = submissions.at(-1);
+    assert.ok(mainSubmission);
+    assert.equal(mainSubmission.disposition, "written");
+    assert.equal(mainSubmission.frame.cursor.visible, false, "the native cursor is hidden");
+    assert.ok(plain(mainSubmission.frame).includes("pane 32x1 too small"), "the one-row roster uses its too-small fallback");
+
+    const ownerBefore = harness.sidebar?.activeMainOwnerID;
+    const selectionBefore = harness.sidebar?.selectedId;
+    const writesBeforeFocus = output.writes.length;
+    harness.terminal.emitInput(ALT_LEFT); // Main -> roster; the composed bytes and hidden cursor are unchanged.
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "sidebar");
+    const rosterSubmission = submissions.at(-1);
+    assert.ok(rosterSubmission);
+    assert.deepEqual(rosterSubmission.frame, mainSubmission.frame, "focus changes without changing the composed frame");
+    assert.equal(rosterSubmission.disposition, "written", "authorization changes still cross the real writer boundary");
+    assert.ok(output.writes.length > writesBeforeFocus, "the invalidated byte-identical frame is emitted");
+
+    const writesBeforeClick = manager.writes.length;
+    emitMouse(harness.terminal, 33, 1);
+    assert.equal(harness.sidebar?.focus, "main");
+    assert.equal(manager.writes.length, writesBeforeClick, "the activating press is consumed");
+    emitMouse(harness.terminal, 33, 1, 0, "m");
+    assert.equal(manager.writes.length, writesBeforeClick, "the matching release is consumed");
+    assert.equal(harness.sidebar?.activeMainOwnerID, ownerBefore);
+    assert.equal(harness.sidebar?.selectedId, selectionBefore);
+
+    harness.terminal.emitInput("typing-after-identical-focus-frame");
+    assert.deepEqual(manager.writes.slice(writesBeforeClick), [
+      { id: "native-1", data: "typing-after-identical-focus-frame" },
+    ], "subsequent typing reaches the unchanged Main owner");
+    assert.equal(await closeWithSignal(harness), 0);
+    shutDown = true;
+  } finally {
+    if (!shutDown) {
+      harness.signals.emit("SIGTERM");
+      if (output.queuedCount > 0) output.drain();
+      await harness.result.catch(() => undefined);
+    }
+  }
+});
+
+test("native Main focus clicks stay unavailable without an owner and on host-owned surfaces", async () => {
+  const empty = createHarness();
+  await ready(empty);
+  emitMouse(empty.terminal, 33, 1);
+  assert.equal(empty.sidebar?.focus, "sidebar", "the welcome pane is not an active native Main owner");
+  assert.equal(await closeWithSignal(empty), 0);
+
+  const harness = createHarness();
+  const manager = await ready(harness);
+  fillForm(harness.terminal, "/native-click-guard/workspace");
+  await nextTurn();
+  assert.equal(harness.sidebar?.focus, "main");
+  const owner = harness.sidebar?.activeMainOwnerID;
+  assert.equal(owner, "native-1");
+
+  harness.terminal.emitInput(ALT_LEFT);
+  harness.terminal.emitInput("\x1b[B"); // Saved conversations.
+  harness.terminal.emitInput("\x1b[B"); // New session.
+  harness.terminal.emitInput(ENTER);
+  await nextTurn();
+  assert.equal(harness.sidebar?.focus, "form");
+  const writesBeforeFormClick = manager.writes.length;
+  emitMouse(harness.terminal, 33, 1); // The right pane belongs to the New form, not native Main.
+  emitMouse(harness.terminal, 33, 1, 0, "m");
+  assert.equal(harness.sidebar?.focus, "form");
+  assert.equal(manager.writes.length, writesBeforeFormClick, "form clicks remain host-owned");
+
+  harness.terminal.emitInput(ESC); // Cancel the form to the roster.
+  harness.terminal.emitInput("q"); // Open the existing Quit confirmation.
+  await nextTurn();
+  assert.equal(harness.sidebar?.focus, "confirm");
+  const writesBeforeConfirmClick = manager.writes.length;
+  emitMouse(harness.terminal, 33, 1); // Main is visible, but the confirmation owns keyboard focus.
+  emitMouse(harness.terminal, 33, 1, 0, "m");
+  assert.equal(harness.sidebar?.focus, "confirm", "a confirmation is not a native Main click-focus surface");
+  assert.equal(manager.writes.length, writesBeforeConfirmClick, "confirmation-owned clicks do not reach Pi");
+
+  harness.terminal.emitInput("n"); // Return to the roster without quitting.
+  assert.equal(harness.sidebar?.focus, "sidebar");
+  harness.terminal.setSize(52, 24); // Narrow layout overlays the native geometry with the sidebar.
+  await nextTurn();
+  const selectedBeforeOverlayClick = harness.sidebar?.selectedId;
+  const writesBeforeOverlayClick = manager.writes.length;
+  emitMouse(harness.terminal, 33, 22); // Blank lower overlay row, not a roster card.
+  emitMouse(harness.terminal, 33, 22, 0, "m");
+  assert.equal(harness.sidebar?.focus, "sidebar", "an overlay-covered coordinate cannot focus hidden native Main");
+  assert.equal(harness.sidebar?.selectedId, selectedBeforeOverlayClick);
+  assert.equal(harness.sidebar?.activeMainOwnerID, owner);
+  assert.equal(manager.writes.length, writesBeforeOverlayClick, "overlay clicks remain host-owned");
+  assert.equal(await closeWithSignal(harness), 0);
 });
 
 test("visible roster mouse activates a clicked live owner; host gestures stay fenced and native Main gestures remain routed", async () => {

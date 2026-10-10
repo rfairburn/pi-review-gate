@@ -957,6 +957,53 @@ review: { activeReviewers: [
   assert.notEqual(reviewerConfigFingerprint(thinkingA), reviewerConfigFingerprint(thinkingB));
 });
 
+test("reviewerConfigFingerprint matches literal golden digests for supported reviewer shapes", () => {
+  // Golden vectors pin the exact canonical-JSON byte contract feeding the
+  // fingerprint: sorted keys, ordered arrays, and undefined optional fields
+  // omitted before serialization. Each digest is the sha256 of a hand-written
+  // literal canonical form, not serializer output.
+  const fullGenericCli: DeciderConfig = {
+    id: "one",
+    adapter: "generic-cli",
+    command: "/usr/bin/review",
+    args: ["-e", "review.js"],
+    env: { REVIEW_MODE: "strict" },
+    timeoutMs: 15000,
+  };
+  // Canonical form: {"adapter":"generic-cli","args":["-e","review.js"],"command":"/usr/bin/review","env":{"REVIEW_MODE":"strict"},"id":"one","timeoutMs":15000}
+  assert.equal(
+    reviewerConfigFingerprint(fullGenericCli),
+    "ea6c6a05750fb1dd7571491bc48563a87893fffb9bcc7f36bc004256fdb4545c",
+  );
+
+  // Optional fields left undefined are omitted from the canonical form.
+  const codexMinimal: DeciderConfig = {
+    id: "two",
+    adapter: "codex-cli",
+    model: "gpt-reviewer",
+    args: undefined,
+    env: undefined,
+    timeoutMs: undefined,
+  };
+  // Canonical form: {"adapter":"codex-cli","id":"two","model":"gpt-reviewer"}
+  assert.equal(
+    reviewerConfigFingerprint(codexMinimal),
+    "87fce3ee2077f0de52d588b4003afca289ca8fcbe8f0d932f572e160cbb2dc46",
+  );
+
+  const piThinking: DeciderConfig = {
+    id: "pi-1",
+    adapter: "pi-model",
+    model: "m1",
+    thinkingLevel: "low",
+  };
+  // Canonical form: {"adapter":"pi-model","id":"pi-1","model":"m1","thinkingLevel":"low"}
+  assert.equal(
+    reviewerConfigFingerprint(piThinking),
+    "55090b7848a000ddb33077043b389f784c62c9b882489420b1f7dd2d42978193",
+  );
+});
+
 test("executorAgentFingerprint covers the fully merged invocation with canonical hash-only encoding", () => {
   const secret = "top-secret-env-value";
   const baseRaw = {

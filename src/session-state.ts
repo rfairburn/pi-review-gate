@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { canonicalStableJson as stableJson } from "./canonical-json";
 import { link, open, readFile, realpath, rename, unlink, type FileHandle } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import {
@@ -1272,14 +1273,6 @@ async function syncDirectoryBestEffort(path: string): Promise<void> {
  * Field insertion order does not change ownership or create duplicate pins. */
 export function reviewCheckpointDescriptorIdentity(cwd: string, descriptor: ReviewCheckpointDescriptor): string {
   return stableJson({ cwd, descriptor });
-}
-
-function stableJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
-  if (isRecord(value)) {
-    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
-  }
-  return JSON.stringify(value) ?? "null";
 }
 
 function callString(target: Record<string, unknown>, name: string): string | undefined {

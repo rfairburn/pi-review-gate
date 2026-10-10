@@ -30,7 +30,7 @@ import { editSettingText } from "./text-input";
 import { alignedSettingsRows, notify, type UiContext } from "./ui";
 import { validateSelection, type SettingsValidationPolicy } from "./validation";
 import { executorSelectionLabel, sortedCatalogKeys } from "./workers";
-import { retainedSelect } from "./menu";
+import { retainedChoice, retainedSelect } from "./menu";
 
 /** One-line state of the staged scheduled-task catalog for the root row. */
 export function scheduledSummary(catalog: ScheduledTaskCatalog): string {
@@ -290,7 +290,7 @@ async function editScheduledTaskEntry(
         `Research — read-only subtask${entry.kind === "research" ? "  current" : ""}`,
         `In-place — write in a selected directory (no capture/landing)${entry.kind === "inplace" ? "  current" : ""}`,
       ];
-      const selected = await ui.select((entry.destination ?? "subtask") === "subtask"
+      const selected = await retainedChoice(ui, (entry.destination ?? "subtask") === "subtask"
         ? "Scheduled task kind"
         : "Scheduled task kind (used when the destination is Subtask)", kindOptions);
       if (selected?.startsWith("Execute")) setCatalogKey(catalog, id, { ...entry, kind: "execute" });
@@ -300,7 +300,7 @@ async function editScheduledTaskEntry(
     }
     if (choice === "destination") {
       const options = scheduledTaskDestinationOptions(entry);
-      const selected = await ui.select("Schedule destination", options);
+      const selected = await retainedChoice(ui, "Schedule destination", options);
       if (selected?.startsWith("Subtask")) {
         // Absence is the subtask default: the stored entry never carries a
         // redundant "subtask" destination key (issue #26 inheritance rule).
@@ -448,7 +448,7 @@ async function selectScheduledTaskWorker(
       return `${executorSelectionLabel(resource.selection, config, scoped)}${entry.workerResourceId === resourceId ? "  current" : ""}`;
     }),
   ];
-  const selected = await ui.select(`Worker for scheduled task — ${entry.name}`, options);
+  const selected = await retainedChoice(ui, `Worker for scheduled task — ${entry.name}`, options);
   if (selected === undefined) return entry.workerResourceId;
   if (selected.startsWith("Inherit global route")) return undefined;
   const index = options.indexOf(selected);
@@ -477,7 +477,7 @@ async function selectScheduledTaskReview(
     `${offLabel}${entry.review?.mode === "off" ? `  current` : ""}`,
     `${reviewersLabel} — ${scheduledTaskReviewSummary(entry)}`,
   ];
-  const selected = await ui.select("Review for scheduled task — " + entry.name, options);
+  const selected = await retainedChoice(ui, "Review for scheduled task — " + entry.name, options);
   if (selected === undefined) return "unchanged";
   if (selected.startsWith(inheritLabel)) return undefined;
   if (selected.startsWith(offLabel)) return { mode: "off" };

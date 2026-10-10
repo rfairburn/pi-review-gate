@@ -338,7 +338,9 @@ in their supported selectors. Creating, listing, or editing a definition
 never enrolls it in a resource or reviewer pool or invokes a provider.
 **Save changes** saves the definitions together
 with explicit resource, route, and reviewer selections; reopening/reloading retains
-them. Cancel or leaving the root menu with Escape discards the current edits.
+them. **Cancel** discards the current edits; leaving the root menu with Escape applies
+them to the running session only, without saving them (see
+[Settings menu](settings.md#review-settings)).
 Untouched definitions and unrelated configuration are preserved; conflicting
 catalog changes by another writer are rejected rather than overwritten. Missing
 Claude Code or Codex CLI binaries warn rather than block Save, whether the definition
@@ -392,8 +394,10 @@ inheritance. Other task settings and remaining reviewers are retained. The menu
 reports removed references, disabled tasks, and inheritance resets; a later explicit
 re-enable uses the configured defaults rather than the deleted worker.
 
-Edits, renames, and deletion cascades are staged until root **Save changes**. Root
-Cancel or Escape discards them together. Saving rejects conflicting catalog changes
+Edits, renames, and deletion cascades are staged until root **Save changes** (or
+Ctrl+S). Root **Cancel** discards them; root Escape applies them to the running
+session only, without saving them (see [Settings menu](settings.md#review-settings)).
+Saving rejects conflicting catalog changes
 rather than overwriting another writer's definition. These controls do not add guided
 configuration for generic executables or change runtime adapter safeguards.
 
@@ -833,9 +837,10 @@ boundaries are owned by [Web tools](web-tools.md) and
 ## `/review-settings`
 
 The staged settings menu is documented on the [Settings menu](settings.md#review-settings)
-page: its seventeen ordinary rows, the conditional **Scheduler runtime** row, Save/Cancel
-staging and apply semantics, and the shared native text-field behavior. Raw field values
-and defaults stay in this reference — see [Top-level fields](#top-level-fields),
+page: its seventeen ordinary rows, the conditional **Scheduler runtime** row,
+Escape/Cancel/Save/Ctrl+S apply and persistence semantics, and the shared native
+text-field behavior. Raw field values and defaults stay in this reference — see
+[Top-level fields](#top-level-fields),
 [Operating modes](#operating-modes), [Reviewers](#reviewers), and
 [Web fields](#web-fields) — and scheduled-task semantics are owned by
 [Scheduled tasks](scheduled-tasks.md#scheduled-task-fields).

@@ -15,7 +15,7 @@ each other instead of duplicating detail.
 | --- | --- |
 | [Getting started](getting-started.md) | Prerequisites, installation, first configuration, launch paths, first review walkthrough. |
 | [Configuration](configuration.md) | Config discovery, core JSON fields and defaults, operating modes, reviewer catalogs/layers, legacy compatibility, and web settings. |
-| [Settings menu](settings.md) | `/review-settings` sections, staged edits, Save/Cancel, reload requirements, and separate live runtime actions. |
+| [Settings menu](settings.md) | `/review-settings` sections, staged edits, Escape/Cancel/Save/Ctrl+S apply and persistence semantics, reload requirements, and separate live runtime actions. |
 | [Scheduled tasks](scheduled-tasks.md) | Schedule catalog, destinations, worker/review overrides, instruction images, local time/DST, and runtime dispatch. |
 | [Review workflow](review-workflow.md) | Review windows, evidence bundles, reviewer adapters, corrections, transmission, commands, cancellation. |
 | [Delegated execution](delegated-execution.md) | Subtask kinds and tools, worker resources/routes, capture and landing, conflicts, steering, notifications, background shell tools. |

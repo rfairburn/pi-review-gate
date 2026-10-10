@@ -164,7 +164,7 @@ for (const targetKind of ["missing", "existing file"] as const) {
       keys(...Array(7).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 12)
       keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
       keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 15) → Save changes (row 17)
-      keys(ESCAPE), // failed save re-shows the root menu; Esc leaves without saving
+      keys(KEY_DOWN, KEY_ENTER), // failed save re-shows the root on Save (17); explicit Cancel (18) — issue #294: root Escape would retry the same failing apply
     ], { cwd: dir });
 
     await run(harness.ctx);

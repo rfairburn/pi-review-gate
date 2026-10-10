@@ -154,16 +154,15 @@ export interface TuiSettingsHarness {
   context: unknown;
   /** The fake host to inject with setMenuTuiHost before running the flow. */
   host: MenuTuiHost;
-  /** One initial rendered frame per custom() call (real or fake component). */
+  /** Initial frames for structural menus; scripted retained choices are kept out. */
   frames: string[][];
-  /** The selectedIndex of each fake list right after its initial frame, i.e.
-   * the preselection before any scripted key was fed. */
+  /** Initial selected indexes for structural menus; scripted choices are kept out. */
   initialIndexes: number[];
-  /** Every FakeSelectList created by the adapter, in show order. */
+  /** Fake lists for structural menus; scripted retained choices are kept out. */
   lists: FakeSelectList[];
   /** Every manager the adapter passed to the host's setKeybindings(). */
   setKeybindingsCalls: unknown[];
-  /** Plain ui.select calls (one-shot pickers and fallback only). */
+  /** Plain/RPC fallback calls plus retained choices driven by legacy selectScript entries. */
   selectCalls: Array<{ title: string; options: string[] }>;
   inputCalls: Array<{ title: string; placeholder?: string }>;
   confirmCalls(): number;
@@ -175,8 +174,9 @@ export interface TuiSettingsHarness {
 /**
  * Builds a TUI-mode command context whose ui.custom drives real fake
  * components. `steps` holds one raw-key sequence per custom() call, in order;
- * each sequence must end by resolving the menu (Enter or Esc). One-shot
- * pickers still use plain ui.select and are scripted through `selectScript`.
+ * each sequence must end by resolving the menu (Enter or Esc). `selectScript`
+ * scripts plain/RPC fallbacks; a matching value also selects a retained
+ * choice row directly so integration scripts need not add key steps.
  */
 export function createTuiSettingsContext(
   steps: string[][],
@@ -218,6 +218,24 @@ export function createTuiSettingsContext(
         if (Array.isArray(frame)) frames.push(frame);
         const lastList = lists[lists.length - 1];
         if (lastList) initialIndexes.push(lastList.selectedIndex);
+        const scriptedChoice = (options.selectScript ?? [])[selectIndex];
+        const scriptedChoiceIndex = scriptedChoice === undefined
+          ? -1
+          : lastList?.items.findIndex((item) => item.value === scriptedChoice || item.label === scriptedChoice) ?? -1;
+        if (scriptedChoiceIndex >= 0 && lastList) {
+          selectIndex += 1;
+          const title = frames.at(-1)?.[1] ?? "";
+          selectCalls.push({ title, options: lastList.items.map((item) => item.label) });
+          // Legacy integration assertions index only the structural menus.
+          // The choice component was still created and rendered above; drive
+          // its real input path, then remove only its observations here.
+          if (lists.at(-1) === lastList) lists.pop();
+          frames.pop();
+          initialIndexes.pop();
+          lastList.setSelectedIndex(scriptedChoiceIndex);
+          component.handleInput?.(KEY_ENTER);
+          return;
+        }
         const step = steps[stepIndex++];
         if (step === undefined) {
           exhausted = true;

@@ -274,8 +274,9 @@ test("the Review submenu displays both imported sets immediately and Cancel keep
   assert.deepEqual(effectiveReviewSettings(config).primaryReviewers, [LEGACY_ONE]);
   assert.deepEqual(effectiveReviewSettings(config).subtaskReviewers, [LEGACY_ONE]);
 
-  // Reopening after Cancel re-derives the same imported state from the
-  // unchanged file; toggling a layer and cancelling still writes nothing.
+  // Reopening after the session-only apply re-derives the same imported
+  // state from the unchanged file; toggling a layer and escaping at the root
+  // applies it to the live config only (issue #294) — still no disk write.
   const before = await readFile(configPath, "utf8");
   await registered.run([
     rootReviewersRow("primary 1/1 selected · auto · subtask 1/1 selected · auto"),
@@ -284,7 +285,7 @@ test("the Review submenu displays both imported sets immediately and Cancel keep
     undefined,
   ]);
   assert.equal(await readFile(configPath, "utf8"), before);
-  assert.equal(effectiveReviewSettings(config).subtaskEnabled, true);
+  assert.equal(effectiveReviewSettings(config).subtaskEnabled, false);
 });
 
 test("Save without edits persists the effective split fields and removes the legacy key", async () => {

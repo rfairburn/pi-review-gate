@@ -6,6 +6,7 @@
 import type { ThinkingLevel } from "../config";
 import type { ScopedModelChoice } from "./models";
 import type { UiContext } from "./ui";
+import { retainedChoice } from "./menu";
 
 export async function selectThinkingLevel(
   ui: UiContext,
@@ -15,7 +16,7 @@ export async function selectThinkingLevel(
   const options = model.supportedThinkingLevels.map((level) =>
     `${thinkingLevelLabel(level)}${level === current ? "  current" : ""}`
   );
-  const selected = await ui.select(`Reasoning — ${model.label}`, options);
+  const selected = await retainedChoice(ui, `Reasoning — ${model.label}`, options);
   return model.supportedThinkingLevels.find((level) =>
     selected === `${thinkingLevelLabel(level)}${level === current ? "  current" : ""}`
   ) ?? current;

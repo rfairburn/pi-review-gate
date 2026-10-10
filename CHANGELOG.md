@@ -15,6 +15,23 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.134]
+
+### Changed
+
+- `/review-settings` separates applying settings from persisting them (#294). Root
+  Escape applies the edited configuration in memory for the current session only —
+  through the same validation and managed-image preparation as a save — and never
+  writes the configuration file, so a later `/reload` re-reads the file and may
+  discard those choices. Reopening the menu shows the in-memory choices, and an
+  immediate **Save changes** or Ctrl+S persists them. Explicit **Cancel** discards
+  this menu's edits and restores the settings that were live when it opened,
+  including any earlier session-only choices, and copies no images. **Save changes**
+  and Ctrl+S are equivalent permanent saves, and Ctrl+S works from any settings
+  submenu. Submenu Escape/**Back** navigation, the current-process-only scheduler
+  runtime On/Off switch, and existing validation and running-work capture semantics
+  are unchanged.
+
 ## [0.1.0-dev.133]
 
 ### Changed

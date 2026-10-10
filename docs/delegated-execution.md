@@ -367,8 +367,9 @@ also deletable. Unsupported types offer only **Delete**/**Back**. The staged cas
 removes affected resources/routes and primary/subtask/scheduled reviewer references;
 invalidated schedules are disabled, with only invalid pins or emptied reviewer
 overrides reset to inheritance. Notices explain cleanup and defaults used on later
-re-enable. Root Save/Cancel persists/discards the whole draft. Missing native CLIs
-on `PATH` warn without blocking Save, even for selected workers; runtime failures
+re-enable. Root **Save changes** (or Ctrl+S) persists the whole draft, **Cancel**
+discards it, and root Escape applies it to the running session only. Missing native
+CLIs on `PATH` warn without blocking Save, even for selected workers; runtime failures
 remain errors. See [External worker management](configuration.md#manage-existing-external-workers)
 and [Native reasoning effort](configuration.md#native-reasoning-effort).
 Explicitly adding a worker resource enrolls it in each supported role's

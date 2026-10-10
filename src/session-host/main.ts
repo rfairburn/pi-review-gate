@@ -1126,8 +1126,20 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         || sidebar.visible !== previousVisibility) {
         deliberateActionGeneration += 1;
       }
-      reconcileLayout(false);
-      scheduleRedraw();
+      // Main-owned native input does not change host presentation unless the
+      // focus/selection/visibility snapshot changed (for example, the reserved
+      // toggle). Keep all non-Main input on the normal redraw path: roster
+      // navigation and form input can change presentation without changing the
+      // pane geometry. Child surface onChange remains responsible for drawing
+      // native output changes.
+      const unchangedMainPresentation = previousFocus === "main"
+        && sidebar.focus === "main"
+        && sidebar.selectedId === previousSelection
+        && sidebar.visible === previousVisibility;
+      if (!unchangedMainPresentation) {
+        reconcileLayout(false);
+        scheduleRedraw();
+      }
     } catch {
       requestShutdown(true);
     }

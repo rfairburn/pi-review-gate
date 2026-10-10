@@ -399,9 +399,14 @@ dimensions) redraw fully, cursor-only changes emit only the cursor sequence, and
 an unchanged frame emits nothing. Rapid invalidations coalesce so that only the
 newest composed frame is drawn at the next allowed redraw, and when the terminal
 refuses a write (backpressure) only the newest bounded frame is retained until
-drain. This bounds
-output volume; it does not promise a particular on-screen smoothness or physical
-paint timing. Normal and alternate child buffers,
+drain. Main-focus input that leaves the child screen unchanged no longer reconciles host
+layout or prepares/submits a speculative frame for that unchanged screen. The child's
+existing output `onChange` path still updates the display; host UI, focus, layout, and
+resize actions remain immediate. This changes only redundant redraw work: it does not
+filter terminal output or ANSI sequences, alter wheel, keyboard, paste, or click
+forwarding, or change redraw cadence, coalescing, or backpressure. This bounds output
+volume; it does not promise a particular on-screen smoothness or physical paint
+timing. Normal and alternate child buffers,
 terminal query replies, and resize state are kept per instance and routed only to that
 same child. Cell widths use the pinned Unicode 11 behavior for CJK, combining marks,
 and basic emoji; newer emoji and complex ZWJ sequences are not guaranteed to match

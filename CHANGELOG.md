@@ -23,9 +23,9 @@ dates.
   when the child screen is unchanged (#350). Child-output `onChange` updates and host
   UI, focus, layout, and resize actions remain immediate and are not gated by this
   check; wheel, keyboard, paste, and click forwarding, ANSI handling, redraw cadence,
-  and backpressure are unchanged. Manual Ghostty trackpad smoothness/catch-up
-  acceptance remains pending, so this is not a claim of full resolution or smoother
-  physical display.
+  and backpressure are unchanged. Interactive trackpad scrolling in Ghostty was
+  manually confirmed smooth with this change; this is a single interactive check,
+  not a measured latency result or a guarantee for other terminals or platforms.
 
 ## [0.1.0-dev.134]
 

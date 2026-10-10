@@ -596,6 +596,25 @@ function plainLine(frame: ComposedHostFrame | undefined, row: number): string {
   return frame?.lines[row]?.replace(/\x1b\[[0-9;]*m/g, "") ?? "";
 }
 
+function screenRowContaining(frame: ComposedHostFrame | undefined, text: string, fromRow = 1): number {
+  return frame?.lines.findIndex((line, row) => row >= fromRow
+    && line.replace(/\x1b\[[0-9;]*m/g, "").includes(text)) ?? -1;
+}
+
+function emitMouse(
+  terminal: FakeTerminal,
+  column: number,
+  row: number,
+  button = 0,
+  final: "M" | "m" = "M",
+): void {
+  terminal.emitInput(`${ESC}[<${button};${column + 1};${row + 1}${final}`);
+}
+
+function emitX10Mouse(terminal: FakeTerminal, column: number, row: number, button = 0): void {
+  terminal.emitInput(`${ESC}[M${String.fromCharCode(button + 32, column + 33, row + 33)}`);
+}
+
 test("Main module import is inert: no ProcessTerminal, native PTY, terminal listeners, or timers are constructed", () => {
   const entry = join(process.cwd(), "dist-test", "src", "session-host", "main.js");
   const script = `
@@ -921,8 +940,8 @@ test("pending Main input stays draw-free until focus or resize changes the host 
   assert.equal(harness.writer.frames.length, baselineFrames + 1,
     "the actual focus change draws once rather than first submitting a stale input-triggered frame");
   assert.equal(manager.resizeCalls.length, baselineResizes, "focus-only changes preserve child geometry");
-  assert.deepEqual(harness.terminal.writes.slice(-2), ["\x1b[?1003l", "\x1b[?1006l"],
-    "focus change synchronously disables only the mouse modes Main enabled");
+  assert.deepEqual(harness.terminal.writes.slice(-2), ["\x1b[?1003l", "\x1b[?1000h"],
+    "focus change hands tracking to the visible host pane without releasing its cell-SGR mode");
 
   const beforeHideFrames = harness.writer.frames.length;
   harness.terminal.emitInput(ALT_LEFT); // hide the sidebar and return to Main
@@ -1026,6 +1045,9 @@ test("external editor handoff settles the frame writer, applies a normal editor 
   assert.ok(harness.events.lastIndexOf("writer.start") > harness.events.indexOf("external-editor.run"));
   const form = harness.sidebar?.renderForm(80, 24).lines.join("\n") ?? "";
   assert.match(form, /edited-in-native-editor/);
+  assert.deepEqual(harness.terminal.writes.slice(-4), [
+    "\x1b[?1000l", "\x1b[?1006l", "\x1b[?1000h", "\x1b[?1006h",
+  ], "external-editor handoff releases and restores only the host-owned mouse modes");
   assert.equal(await closeWithSignal(harness), 0);
 });
 
@@ -1700,6 +1722,248 @@ test("late create after form abandonment may finish but cannot steal focus or au
   assert.equal(await closeWithSignal(harness), 0);
 });
 
+test("visible host panes own clicks while native Main mouse keeps child modes and viewport clipping", async () => {
+  const empty = createHarness();
+  const emptyManager = await ready(empty);
+  assert.ok(empty.terminal.writes.includes("\x1b[?1000h"), "a visible sidebar enables host button reports without a child");
+  assert.ok(empty.terminal.writes.includes("\x1b[?1006h"), "host hit testing uses bounded cell-coordinate SGR packets");
+  const welcome = empty.writer.frames.at(-1)?.frame;
+  const welcomeNew = screenRowContaining(welcome, "New session");
+  assert.ok(welcomeNew > 0);
+  emitMouse(empty.terminal, 1, 0); // header: host-owned but not an entry
+  assert.equal(empty.sidebar?.focus, "sidebar");
+  emitX10Mouse(empty.terminal, 1, welcomeNew); // legacy X10 click shares the bounded decoder
+  assert.equal(empty.sidebar?.focus, "form", "one click opens the existing New form");
+  assert.equal(emptyManager.createOptions.length, 0, "opening New does not submit it");
+  assert.equal(await closeWithSignal(empty), 0);
+  assert.ok(empty.terminal.writes.includes("\x1b[?1000l"), "shutdown disables the host-owned tracking mode");
+  assert.ok(empty.terminal.writes.includes("\x1b[?1006l"), "shutdown disables the host-owned SGR mode");
+
+  const fixture = makeSavedMainFixture("mouse-open");
+  const { overrides } = savedFixtureDependencies(fixture);
+  try {
+    const harness = createHarness({}, overrides);
+    const manager = await ready(harness);
+    const initialFrame = harness.writer.frames.at(-1)?.frame;
+    const newRow = screenRowContaining(initialFrame, "New session");
+    emitMouse(harness.terminal, 1, newRow);
+    assert.equal(harness.sidebar?.focus, "form", "New action works on the initial visible sidebar");
+    completeForm(harness.terminal, fixture.workspace);
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "main", "New completion retains its existing Main activation");
+    assert.equal(manager.createOptions.length, 1);
+
+    const rosterFrame = harness.writer.frames.at(-1)?.frame;
+    const savedActionRow = screenRowContaining(rosterFrame, "Saved conversations");
+    assert.ok(savedActionRow > 0);
+    emitMouse(harness.terminal, 1, savedActionRow);
+    assert.equal(harness.sidebar?.focus, "form", "Saved action opens the existing picker");
+    await nextTurn();
+    await nextTurn();
+    const savedFrame = harness.writer.frames.at(-1)?.frame;
+    const savedRow = screenRowContaining(savedFrame, "First conversation");
+    assert.ok(savedRow > 0, "the admitted catalog row was drawn in the right-hand Saved pane");
+    emitMouse(harness.terminal, 35, savedRow);
+    emitMouse(harness.terminal, 35, savedRow); // duplicate click while the first open is pending
+    await nextTurn();
+    await nextTurn();
+    assert.equal(manager.createOptions.length, 2, "pending-click fencing admits exactly one Saved open");
+    assert.ok(isSavedSessionAdmission(manager.createOptions[1]?.savedSession), "the existing exact admission guard remains in force");
+    assert.equal(harness.sidebar?.focus, "main", "successful Saved open activates Main without Enter");
+    assert.equal(harness.sidebar?.selectedId, "native-2");
+    assert.equal(manager.views[0]?.hasLiveProcess, true, "the previously active sibling stays live");
+
+    // A later click uses the same live-catalog duplicate admission fence as
+    // Enter; the visible row cannot spawn an already-owned conversation.
+    manager.ownedLiveSessionsData = [{ id: fixture.sessionId }];
+    harness.terminal.emitInput(ALT_LEFT); // Main -> visible sidebar
+    await nextTurn();
+    const reopenedRoster = harness.writer.frames.at(-1)?.frame;
+    const savedAgain = screenRowContaining(reopenedRoster, "Saved conversations");
+    emitMouse(harness.terminal, 1, savedAgain);
+    assert.equal(harness.sidebar?.focus, "form", "the reopened Saved roster entry opens its picker");
+    await nextTurn();
+    await nextTurn();
+    const duplicateRow = screenRowContaining(harness.writer.frames.at(-1)?.frame, "First");
+    assert.ok(duplicateRow > 0);
+    emitMouse(harness.terminal, 35, duplicateRow);
+    await nextTurn();
+    assert.equal(manager.createOptions.length, 2, "known-owned catalog duplicate starts no child");
+    const duplicateFrame = plain(harness.writer.frames.at(-1)?.frame).replace(/\s+/g, " ");
+    assert.ok(duplicateFrame.includes("already open in") && duplicateFrame.includes("this host"), duplicateFrame);
+    assert.equal(await closeWithSignal(harness), 0);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("visible roster mouse activates a clicked live owner; host gestures stay fenced and native Main gestures remain routed", async () => {
+  const harness = createHarness();
+  const manager = await startTwoSessions(harness);
+  await nextTurn();
+  const surfaceA = manager.surface("native-1");
+  assert.ok(surfaceA);
+  surfaceA.modes = { ...surfaceA.modes, mouseTracking: "drag", mouseEncoding: "sgr" };
+  manager.notify("native-a-mouse-mode");
+  await nextTurn();
+  const initialFrame = harness.writer.frames.at(-1)?.frame;
+  const aRow = screenRowContaining(initialFrame, "Native native-1");
+  const bRow = screenRowContaining(initialFrame, "Native native-2");
+  assert.ok(aRow > 0 && bRow > aRow, "both live rows were drawn in roster order");
+  const initialFocus = harness.sidebar?.focus;
+  for (const button of [2, 4]) {
+    emitMouse(harness.terminal, 1, aRow, button, "M");
+    assert.equal(harness.sidebar?.focus, initialFocus, "right/modified presses never activate an entry");
+    emitMouse(harness.terminal, 1, aRow, button, "m");
+  }
+  for (const [button, final] of [[0, "m"], [32, "M"], [64, "M"]] as const) {
+    emitMouse(harness.terminal, 1, aRow, button, final);
+    assert.equal(harness.sidebar?.focus, initialFocus, "release/motion/wheel never activate an entry");
+  }
+  emitMouse(harness.terminal, 1, 0); // header is host-owned and inert
+  assert.equal(harness.sidebar?.focus, initialFocus);
+
+  emitMouse(harness.terminal, 1, aRow);
+  assert.equal(harness.sidebar?.focus, "main");
+  assert.equal(harness.sidebar?.selectedId, "native-1", "the clicked A row becomes Main owner");
+  assert.equal(manager.views[1]?.hasLiveProcess, true, "B remains live after A activation");
+  const beforeNativeWhileHostHeld = manager.writes.length;
+  emitMouse(harness.terminal, 33, 1, 1); // independent native middle-button press
+  emitMouse(harness.terminal, 34, 2, 33); // its motion remains native while host-left is held
+  emitMouse(harness.terminal, 34, 2, 1, "m");
+  assert.deepEqual(manager.writes.slice(beforeNativeWhileHostHeld).map(({ id, data }) => [id, data]), [
+    ["native-1", "\x1b[<1;1;1M"],
+    ["native-1", "\x1b[<33;2;2M"],
+    ["native-1", "\x1b[<1;2;2m"],
+  ], "independently started native buttons are not hidden by the host-left fence");
+  const beforeHostDrag = manager.writes.length;
+  emitMouse(harness.terminal, 33, 1, 32); // host press followed by Main-pane drag motion
+  emitMouse(harness.terminal, 34, 2, 0, "m"); // release also lands over Main
+  assert.equal(manager.writes.length, beforeHostDrag, "host-originated motion and release never leak to A");
+  harness.terminal.emitInput("a-input");
+  assert.equal(manager.writes.at(-1)?.id, "native-1");
+
+  harness.terminal.emitInput(ALT_LEFT); // Main -> visible sidebar
+  await nextTurn();
+  const bVisibleRow = screenRowContaining(harness.writer.frames.at(-1)?.frame, "Native native-2");
+  assert.ok(bVisibleRow > 0);
+  emitMouse(harness.terminal, 1, bVisibleRow);
+  assert.equal(harness.sidebar?.focus, "main");
+  assert.equal(harness.sidebar?.selectedId, "native-2", "one click activates B");
+  emitMouse(harness.terminal, 1, bVisibleRow, 0, "m"); // finish the host-owned click
+  const surface = manager.surface("native-2");
+  assert.ok(surface);
+  surface.modes = { ...surface.modes, mouseTracking: "any", mouseEncoding: "sgr" };
+  manager.notify("native-mouse-mode");
+  const beforeNativeGesture = manager.writes.length;
+  emitMouse(harness.terminal, 33, 1); // native press: local (0,0)
+  emitMouse(harness.terminal, 34, 2, 32); // native drag motion: local (1,1)
+  emitMouse(harness.terminal, 34, 2, 0, "m"); // native release
+  assert.deepEqual(manager.writes.slice(beforeNativeGesture).map(({ id, data }) => [id, data]), [
+    ["native-2", "\x1b[<0;1;1M"],
+    ["native-2", "\x1b[<32;2;2M"],
+    ["native-2", "\x1b[<0;2;2m"],
+  ], "independently started Main gestures preserve press/motion/release routing");
+  harness.terminal.emitInput("b-input");
+  assert.equal(manager.writes.at(-1)?.id, "native-2", "subsequent input follows B");
+  assert.equal(manager.views[0]?.hasLiveProcess, true, "A stays live beside the new owner");
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("clicking an exited row from Main transfers only the recovery intent and activates its ready replacement", async () => {
+  const fixture = makeSavedMainFixture("mouse-resume");
+  const { overrides } = savedFixtureDependencies(fixture);
+  try {
+    const harness = createHarness({}, overrides);
+    const manager = await startTwoSessions(harness);
+    await nextTurn();
+
+    const firstRow = screenRowContaining(harness.writer.frames.at(-1)?.frame, "Native native-1");
+    emitMouse(harness.terminal, 1, firstRow);
+    assert.equal(harness.sidebar?.focus, "main");
+    assert.equal(harness.sidebar?.selectedId, "native-1", "A owns Main before B exits");
+    emitMouse(harness.terminal, 1, firstRow, 0, "m");
+
+    const bIndex = manager.views.findIndex((view) => view.id === "native-2");
+    const b = manager.views[bIndex];
+    assert.ok(b);
+    manager.views[bIndex] = {
+      ...b,
+      lifecycle: "exited",
+      hasLiveProcess: false,
+      nativeSession: null,
+      lastNativeSession: {
+        sessionId: "conversation-native-2",
+        epoch: 1,
+        name: "Native native-2",
+        persistence: "unsaved",
+      },
+    };
+    manager.notify("native-2-exited");
+    await nextTurn();
+    const exitedRow = screenRowContaining(harness.writer.frames.at(-1)?.frame, "Native native-2");
+    assert.ok(exitedRow > 0);
+    emitMouse(harness.terminal, 1, exitedRow);
+    assert.equal(harness.sidebar?.focus, "sidebar", "the exited-row restart is a sidebar-owned intent");
+    assert.equal(harness.sidebar?.selectedId, "native-2");
+
+    for (let attempt = 0; attempt < 10 && harness.sidebar?.focus !== "main"; attempt += 1) {
+      await nextTurn();
+    }
+    assert.equal(harness.sidebar?.focus, "main", "a ready replacement returns focus to Main");
+    assert.equal(harness.sidebar?.selectedId, "native-3");
+    assert.deepEqual(manager.views.map((view) => view.id), ["native-1", "native-3"]);
+    assert.equal(manager.views[0]?.hasLiveProcess, true, "A remains live while B is replaced");
+    assert.equal(manager.views[1]?.hasLiveProcess, true);
+    harness.terminal.emitInput("replacement-input");
+    assert.equal(manager.writes.at(-1)?.id, "native-3", "subsequent Main input belongs to the replacement");
+    assert.equal(await closeWithSignal(harness), 0);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("wide equal-sized panes dispatch Saved hit tests only in the right form", async () => {
+  const fixture = makeSavedMainFixture("mouse-pane-identity");
+  const { overrides } = savedFixtureDependencies(fixture);
+  try {
+    const harness = createHarness({}, overrides);
+    harness.terminal.columns = 65; // sidebar and Saved form are both exactly 32 columns
+    harness.stdout.columns = 65;
+    const manager = await ready(harness);
+    const initial = harness.writer.frames.at(-1)?.frame;
+    const savedAction = screenRowContaining(initial, "Saved conversations");
+    emitMouse(harness.terminal, 1, savedAction);
+    emitMouse(harness.terminal, 1, savedAction, 0, "m");
+    await nextTurn();
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "form");
+    const savedFrame = harness.writer.frames.at(-1)?.frame;
+    const savedRow = screenRowContaining(savedFrame, "First");
+    assert.ok(savedRow > 0);
+    assert.equal(manager.createOptions.length, 0);
+
+    // The left Saved action shares the first result's local row; pane identity
+    // must prevent it from hitting the right-hand Saved row's hit region.
+    emitMouse(harness.terminal, 1, savedRow);
+    emitMouse(harness.terminal, 1, savedRow, 0, "m");
+    assert.equal(manager.createOptions.length, 0, "left-pane rows cannot hit Saved rows in the right form");
+    assert.equal(harness.sidebar?.focus, "form");
+
+    emitMouse(harness.terminal, 34, savedRow); // the actual right-hand Saved row
+    emitMouse(harness.terminal, 34, savedRow, 0, "m");
+    await nextTurn();
+    await nextTurn();
+    assert.equal(manager.createOptions.length, 1);
+    assert.ok(isSavedSessionAdmission(manager.createOptions[0]?.savedSession));
+    assert.equal(harness.sidebar?.focus, "main");
+    assert.equal(harness.sidebar?.selectedId, "native-1");
+    assert.equal(await closeWithSignal(harness), 0);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("mouse routing uses active live child modes, mode-only changes, native viewport clipping, and owned resets", async () => {
   const harness = createHarness();
   const manager = await ready(harness);
@@ -1726,16 +1990,18 @@ test("mouse routing uses active live child modes, mode-only changes, native view
 
   const beforeFocusReset = harness.terminal.writes.length;
   // Main -> Sidebar focus is focus-only: the layout and native geometry are
-  // untouched, and the host disables only its own tracking/encoding.
+  // untouched, while visible host panes continue to own button tracking.
   harness.terminal.emitInput(ALT_LEFT);
-  assert.deepEqual(harness.terminal.writes.slice(beforeFocusReset), ["\x1b[?1000l", "\x1b[?1006l"]);
+  assert.deepEqual(harness.terminal.writes.slice(beforeFocusReset), [],
+    "the still-visible host pane keeps button tracking and SGR enabled beside the native pane");
   assert.equal(harness.sidebar?.focus, "sidebar");
   assert.equal(harness.sidebar?.visible, true);
   const beforeFocusReenable = harness.terminal.writes.length;
   // Sidebar -> hide/Main is the deliberate visibility change that re-enables
   // exactly the active child's own observed modes.
   harness.terminal.emitInput(ALT_LEFT);
-  assert.deepEqual(harness.terminal.writes.slice(beforeFocusReenable), ["\x1b[?1000h", "\x1b[?1006h"]);
+  assert.deepEqual(harness.terminal.writes.slice(beforeFocusReenable), [],
+    "the active child's own tracking and cell-SGR mode remain enabled after hiding the host pane");
   assert.equal(harness.sidebar?.focus, "main");
   assert.equal(harness.sidebar?.visible, false);
   assert.equal(await closeWithSignal(harness), 0);

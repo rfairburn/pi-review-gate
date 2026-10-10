@@ -16,7 +16,7 @@ import {
 import { OPERATING_MODE_LABELS } from "../operating-mode";
 import { findOccupiedHostBindings } from "../host-keybindings";
 import { alignedSettingsRows, formatDuration, notify, type UiContext } from "./ui";
-import { retainedSelect } from "./menu";
+import { retainedChoice, retainedSelect } from "./menu";
 import { editSettingText } from "./text-input";
 
 export async function selectSubtaskNotifications(
@@ -28,13 +28,13 @@ export async function selectSubtaskNotifications(
     { label: "Noisy — include running and reviewing", value: "noisy" },
   ];
   const options = rows.map((row) => `${row.label}${row.value === current ? "  current" : ""}`);
-  const selected = await ui.select("Subtask notifications", options);
+  const selected = await retainedChoice(ui, "Subtask notifications", options);
   return rows.find((row) => selected === `${row.label}${row.value === current ? "  current" : ""}`)?.value ?? current;
 }
 
 export async function selectOperatingMode(ui: UiContext, current: OperatingMode): Promise<OperatingMode> {
   const options = OPERATING_MODES.map((mode) => `${OPERATING_MODE_LABELS[mode]}${mode === current ? "  current" : ""}`);
-  const selected = await ui.select("Operating mode", options);
+  const selected = await retainedChoice(ui, "Operating mode", options);
   return OPERATING_MODES.find((mode) => selected === `${OPERATING_MODE_LABELS[mode]}${mode === current ? "  current" : ""}`) ?? current;
 }
 
@@ -83,14 +83,14 @@ export async function selectBundleRetention(ui: UiContext, current: RetainBundle
     { label: "Never", value: "never" },
   ];
   const options = rows.map((row) => `${row.label}${row.value === current ? "  current" : ""}`);
-  const selected = await ui.select("Bundle retention", options);
+  const selected = await retainedChoice(ui, "Bundle retention", options);
   return rows.find((row) => selected === `${row.label}${row.value === current ? "  current" : ""}`)?.value ?? current;
 }
 
 export async function selectMaxWorkers(ui: UiContext, current: number): Promise<number> {
   const options = Array.from({ length: MAX_EXECUTION_WORKERS }, (_, index) => String(index + 1))
     .map((v) => `${v}${v === String(current) ? "  current" : ""}`);
-  const selected = await ui.select(`Global concurrency (1–${MAX_EXECUTION_WORKERS})`, options);
+  const selected = await retainedChoice(ui, `Global concurrency (1–${MAX_EXECUTION_WORKERS})`, options);
   const parsed = Number(selected?.split(" ")[0]);
   return Number.isInteger(parsed) && parsed >= 1 && parsed <= MAX_EXECUTION_WORKERS ? parsed : current;
 }

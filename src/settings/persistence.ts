@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { setCatalogKey } from "./catalog-key";
-import { guardExternalAgentReferences, type ExternalAgentOperation } from "./external-agent-catalog";
+import { guardExternalAgentReferenceBaseline, guardExternalAgentReferences, type ExternalAgentOperation, type ExternalAgentReferenceBaseline } from "./external-agent-catalog";
 import { open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import {
@@ -33,6 +33,14 @@ export interface ReviewSettingsSelection {
   externalAgentAdditions?: ExternalAgentCatalog;
   externalAgentOperations?: ExternalAgentOperation[];
   externalAgentOpening?: ReviewGateConfig;
+  /**
+   * Pre-cascade reference baselines for session-only applied external-agent
+   * operations (issue #294), keyed by the operation's original id. Save runs
+   * the optimistic reference guard against these captured projections instead
+   * of this session's opening snapshot, which is post-cascade for seeded
+   * operations and would conflict with unchanged on-disk references.
+   */
+  externalAgentReferenceBaselines?: Record<string, ExternalAgentReferenceBaseline>;
   operatingMode: OperatingMode;
   /** Direct operating-mode cycle hotkey (issue #20). */
   modeCycleShortcut: string;
@@ -103,6 +111,105 @@ export interface UpdateReviewGateConfigOptions {
   afterValidate?: (parsed: Record<string, unknown>, normalized: ReviewGateConfig) => void;
 }
 
+/**
+ * The canonical staged-selection field assembly (issue #294): applies the
+ * staged scalar and section selections to a raw config record. Shared by
+ * Save (over the latest disk record) and the session-only Escape apply (over
+ * the live config), so both paths stage identical fields through one code
+ * path. Catalog-level merges — the external-agent cascade and the
+ * scheduled-task foreign-entry preservation — stay at their respective
+ * boundaries; this function never reads or writes the disk.
+ */
+function applyStagedSelectionFields(parsed: Record<string, unknown>, selection: ReviewSettingsSelection): void {
+  const execution = isRecord(parsed.execution) ? { ...parsed.execution } : {};
+  // Both catalogs persist in canonical keyed-object form; routes persist
+  // exactly as selected. Missing or empty routes stay empty — the catalog
+  // never infers role priorities.
+  execution.workerResources = cloneWorkerCatalog(selection.workerResources);
+  execution.routes = {
+    execute: (selection.executeRoute ?? []).map((entry) => ({ ...entry })),
+    research: (selection.researchRoute ?? []).map((entry) => ({ ...entry })),
+  };
+  execution.maxWorkers = selection.maxWorkers;
+  execution.retryPolicy = { ...selection.retryPolicy };
+  execution.subtaskNotifications = selection.subtaskNotifications;
+  execution.deferredPiTools = selection.deferredPiTools
+    ?? (typeof execution.deferredPiTools === "boolean" ? execution.deferredPiTools : true);
+  delete execution.parallelEnabled;
+  parsed.execution = execution;
+  const review = isRecord(parsed.review) ? { ...parsed.review } : {};
+  // The split reviewer fields are the only canonical reviewer state (issue
+  // #175): every save persists them and removes the legacy single-set key,
+  // even when no manual reviewer edit was staged, so the stored record
+  // never keeps a second reviewer set after the first save.
+  review.primaryReviewers = selection.primaryReviewers.map((reviewer) => ({ ...reviewer }));
+  review.subtaskReviewers = selection.subtaskReviewers.map((reviewer) => ({ ...reviewer }));
+  review.primaryEnabled = selection.primaryEnabled;
+  review.subtaskEnabled = selection.subtaskEnabled;
+  review.reviewLandedChanges = selection.reviewLandedChanges;
+  delete review.activeReviewers;
+  parsed.review = review;
+  parsed.operatingMode = selection.operatingMode;
+  parsed.modeCycleShortcut = selection.modeCycleShortcut;
+  parsed.reviewerTimeoutMs = selection.reviewerTimeoutMs;
+  parsed.executorTimeoutMs = selection.executorTimeoutMs;
+  parsed.maxCorrectionCycles = selection.maxCorrectionCycles;
+  parsed.implementationGuidanceAfterCorrectionAttempts = selection.implementationGuidanceAfterCorrectionAttempts;
+  parsed.retainBundles = selection.retainBundles;
+  const ui = isRecord(parsed.ui) ? { ...parsed.ui } : {};
+  ui.subtasksViewExpanded = selection.subtasksViewExpanded;
+  parsed.ui = ui;
+  if (selection.webMaxDownloadBytes !== undefined || selection.browserInteractionApproval !== undefined || selection.browserIdleExpiryMinutes !== undefined || selection.browserDownloadRetention !== undefined || selection.browserVisible !== undefined || selection.webBrowserPermissions !== undefined) {
+    const web = isRecord(parsed.web) ? { ...parsed.web } : {};
+    if (selection.webMaxDownloadBytes !== undefined) {
+      const fetch = isRecord(web.fetch) ? { ...web.fetch } : {};
+      fetch.maxDownloadBytes = selection.webMaxDownloadBytes;
+      web.fetch = fetch;
+    }
+    if (selection.browserInteractionApproval !== undefined) {
+      web.browserInteractionApproval = selection.browserInteractionApproval;
+    }
+    if (selection.browserIdleExpiryMinutes !== undefined) {
+      web.browserIdleExpiryMinutes = selection.browserIdleExpiryMinutes;
+    }
+    if (selection.browserDownloadRetention !== undefined) {
+      web.browserDownloadRetention = selection.browserDownloadRetention;
+    }
+    if (selection.browserVisible !== undefined) {
+      web.browserVisible = selection.browserVisible;
+    }
+    if (selection.webBrowserPermissions !== undefined) {
+      // Persist the complete object: YOLO is a master override that preserves
+      // the individual values beneath it, so no field is dropped or invented.
+      // Strict validation runs in normalizeConfig before the atomic write.
+      web.browserPermissions = { ...selection.webBrowserPermissions };
+    }
+    parsed.web = web;
+  }
+}
+
+/**
+ * Assemble a normalized config from staged selections over the current live
+ * config (issue #294): the canonical selection assembly for the session-only
+ * Escape apply, sharing {@link applyStagedSelectionFields} with Save. The
+ * base supplies every non-staged field; the supplied catalogs replace the
+ * base's catalogs wholesale (the menu draft already carries the staged
+ * external-agent cascade, and the staged scheduled catalog is final). No disk
+ * read or merge happens here: foreign-entry preservation and the
+ * external-agent optimistic cascade stay at the persistence boundary.
+ */
+export function assembleStagedSelectionConfig(
+  base: ReviewGateConfig,
+  selection: ReviewSettingsSelection,
+  catalogs: { externalAgents?: ExternalAgentCatalog; scheduledTasks?: ScheduledTaskCatalog } = {},
+): ReviewGateConfig {
+  const next: Record<string, unknown> = { ...base };
+  applyStagedSelectionFields(next, selection);
+  if (catalogs.externalAgents !== undefined) next.externalAgents = cloneExternalAgentCatalog(catalogs.externalAgents);
+  if (catalogs.scheduledTasks !== undefined) next.scheduledTasks = cloneScheduledTaskCatalog(catalogs.scheduledTasks);
+  return normalizeConfig(next);
+}
+
 export async function persistReviewSettings(
   configPath: string,
   selection: ReviewSettingsSelection,
@@ -167,9 +274,22 @@ export async function persistReviewSettings(
           }
           // Same-ID role/option edits also must not erase newly added
           // related resources or break their preserved foreign schedules.
-          if (!selection.externalAgentOpening) throw new Error("Missing external worker opening baseline. Reopen settings.");
-          guardExternalAgentReferences(selection.externalAgentOpening, latest, operation.id);
-        } else if (operation.nextId !== undefined && exists) {
+          const referenceBaseline = selection.externalAgentReferenceBaselines?.[operation.id];
+          if (referenceBaseline !== undefined) {
+            // Issue #294: this operation was applied session-only in an
+            // earlier menu session; guard against its captured pre-cascade
+            // baseline, not this session's post-cascade opening snapshot.
+            guardExternalAgentReferenceBaseline(referenceBaseline, latest, operation.id);
+          } else {
+            if (!selection.externalAgentOpening) throw new Error("Missing external worker opening baseline. Reopen settings.");
+            guardExternalAgentReferences(selection.externalAgentOpening, latest, operation.id);
+          }
+        } else if (operation.nextId !== undefined && exists && !releasedIds.has(operation.id)) {
+          // A creation at an ID released by a baseline-guarded pending rename
+          // is safe: that rename's definition and reference checks above
+          // already cover the original on-disk entry, and it releases the ID
+          // in this same transaction (issue #294). Unrelated disk collisions
+          // remain blocking.
           throw new Error("An external worker ID created in this menu already exists on disk. Reopen settings.");
         }
         if (operation.nextId !== undefined && operation.nextId !== operation.id && Object.hasOwn(merged, operation.nextId) && !releasedIds.has(operation.nextId)) {
@@ -184,22 +304,7 @@ export async function persistReviewSettings(
       }
       parsed.externalAgents = merged;
     }
-    const execution = isRecord(parsed.execution) ? { ...parsed.execution } : {};
-    // Both catalogs persist in canonical keyed-object form; routes persist
-    // exactly as selected. Missing or empty routes stay empty — the catalog
-    // never infers role priorities.
-    execution.workerResources = cloneWorkerCatalog(selection.workerResources);
-    execution.routes = {
-      execute: (selection.executeRoute ?? []).map((entry) => ({ ...entry })),
-      research: (selection.researchRoute ?? []).map((entry) => ({ ...entry })),
-    };
-    execution.maxWorkers = selection.maxWorkers;
-    execution.retryPolicy = { ...selection.retryPolicy };
-    execution.subtaskNotifications = selection.subtaskNotifications;
-    execution.deferredPiTools = selection.deferredPiTools
-      ?? (typeof execution.deferredPiTools === "boolean" ? execution.deferredPiTools : true);
-    delete execution.parallelEnabled;
-    parsed.execution = execution;
+    applyStagedSelectionFields(parsed, selection);
     // Import the latest catalog (including legacy arrays), never the stale
     // menu snapshot. Existing definitions remain owned by disk; creation
     // cannot overwrite even an identical definition saved by another menu.
@@ -214,28 +319,6 @@ export async function persistReviewSettings(
       }
       parsed.externalAgents = merged;
     }
-    const review = isRecord(parsed.review) ? { ...parsed.review } : {};
-    // The split reviewer fields are the only canonical reviewer state (issue
-    // #175): every save persists them and removes the legacy single-set key,
-    // even when no manual reviewer edit was staged, so the stored record
-    // never keeps a second reviewer set after the first save.
-    review.primaryReviewers = selection.primaryReviewers.map((reviewer) => ({ ...reviewer }));
-    review.subtaskReviewers = selection.subtaskReviewers.map((reviewer) => ({ ...reviewer }));
-    review.primaryEnabled = selection.primaryEnabled;
-    review.subtaskEnabled = selection.subtaskEnabled;
-    review.reviewLandedChanges = selection.reviewLandedChanges;
-    delete review.activeReviewers;
-    parsed.review = review;
-    parsed.operatingMode = selection.operatingMode;
-    parsed.modeCycleShortcut = selection.modeCycleShortcut;
-    parsed.reviewerTimeoutMs = selection.reviewerTimeoutMs;
-    parsed.executorTimeoutMs = selection.executorTimeoutMs;
-    parsed.maxCorrectionCycles = selection.maxCorrectionCycles;
-    parsed.implementationGuidanceAfterCorrectionAttempts = selection.implementationGuidanceAfterCorrectionAttempts;
-    parsed.retainBundles = selection.retainBundles;
-    const ui = isRecord(parsed.ui) ? { ...parsed.ui } : {};
-    ui.subtasksViewExpanded = selection.subtasksViewExpanded;
-    parsed.ui = ui;
     if (selection.scheduledTasks !== undefined) {
       // Entries are the single canonical copy of each schedule (issue #26), so
       // omitted fields stay absent and no inherited global setting is copied
@@ -280,33 +363,6 @@ export async function persistReviewSettings(
       // the staged catalog: this process sees another process's saved edits
       // only on its own reload, which matches the documented visibility rule.
       parsed.scheduledTasks = staged;
-    }
-    if (selection.webMaxDownloadBytes !== undefined || selection.browserInteractionApproval !== undefined || selection.browserIdleExpiryMinutes !== undefined || selection.browserDownloadRetention !== undefined || selection.browserVisible !== undefined || selection.webBrowserPermissions !== undefined) {
-      const web = isRecord(parsed.web) ? { ...parsed.web } : {};
-      if (selection.webMaxDownloadBytes !== undefined) {
-        const fetch = isRecord(web.fetch) ? { ...web.fetch } : {};
-        fetch.maxDownloadBytes = selection.webMaxDownloadBytes;
-        web.fetch = fetch;
-      }
-      if (selection.browserInteractionApproval !== undefined) {
-        web.browserInteractionApproval = selection.browserInteractionApproval;
-      }
-      if (selection.browserIdleExpiryMinutes !== undefined) {
-        web.browserIdleExpiryMinutes = selection.browserIdleExpiryMinutes;
-      }
-      if (selection.browserDownloadRetention !== undefined) {
-        web.browserDownloadRetention = selection.browserDownloadRetention;
-      }
-      if (selection.browserVisible !== undefined) {
-        web.browserVisible = selection.browserVisible;
-      }
-      if (selection.webBrowserPermissions !== undefined) {
-        // Persist the complete object: YOLO is a master override that preserves
-        // the individual values beneath it, so no field is dropped or invented.
-        // Strict validation runs in normalizeConfig before the atomic write.
-        web.browserPermissions = { ...selection.webBrowserPermissions };
-      }
-      parsed.web = web;
     }
   }, {
     afterValidate: (finalParsed, normalized) => {

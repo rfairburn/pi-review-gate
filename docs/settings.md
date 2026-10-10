@@ -1,10 +1,10 @@
 # Settings menu
 
 This page owns the staged `/review-settings` settings menu: its seventeen ordinary rows,
-the conditional **Scheduler runtime** row, Save/Cancel staging and apply semantics, and
-the shared native text-field behavior. Raw field values and defaults are owned by the
-[Configuration](configuration.md) reference, and scheduled-task semantics are documented
-on [Scheduled tasks](scheduled-tasks.md#scheduled-task-fields).
+the conditional **Scheduler runtime** row, Escape/Cancel/Save/Ctrl+S apply and
+persistence semantics, and the shared native text-field behavior. Raw field values and
+defaults are owned by the [Configuration](configuration.md) reference, and scheduled-task
+semantics are documented on [Scheduled tasks](scheduled-tasks.md#scheduled-task-fields).
 
 ## `/review-settings`
 
@@ -18,7 +18,9 @@ supplies the live switch (the ordinary extension entry point always does):
 - **Operating mode** stages the primary assistant posture; **Save changes** persists it
   ([Operating modes](configuration.md#operating-modes)).
 - **Mode cycle hotkey** edits the `modeCycleShortcut` binding in the same staged
-  transaction; a changed hotkey takes effect after `/reload`
+  transaction; a changed hotkey requires **Save changes** (or Ctrl+S), then
+  `/reload`. Escape retains the edited value for later saving but does not change
+  the currently registered binding; reloading before saving discards it
   ([Direct mode-cycle hotkey](configuration.md#direct-mode-cycle-hotkey)).
 - **Worker resources** defines Pi-scoped models and execution-capable entries from
   `externalAgents`, each with one physical maximum concurrency shared by every
@@ -49,9 +51,10 @@ supplies the live switch (the ordinary extension entry point always does):
   Unsupported types offer only **Delete**/**Back**. Deletion reports reference
   cleanup, disables invalidated schedules, and resets only invalid pins or emptied
   review overrides to inheritance, with notice of defaults used on later re-enable.
-  No creation/listing/editing enrolls workers or invokes providers. Root Save/Cancel
-  atomically persists/discards the draft; missing native CLIs on `PATH` warn without
-  blocking Save, including selected workers, and runtime failures remain errors.
+  No creation/listing/editing enrolls workers or invokes providers. Root **Save
+  changes** (or Ctrl+S) atomically persists the draft, **Cancel** discards it, and root
+  Escape applies it to the running session only; missing native CLIs on `PATH` warn
+  without blocking Save, including selected workers, and runtime failures remain errors.
   See [External worker management](configuration.md#manage-existing-external-workers)
   and [Native reasoning effort](configuration.md#native-reasoning-effort).
 - **Execution priority** and **Research priority** are independently ordered subsets of
@@ -124,7 +127,7 @@ supplies the live switch (the ordinary extension entry point always does):
   the switch; the ordinary extension entry point supplies it) is a
   live, current-process-only On/Off toggle for scheduled execution: it applies
   immediately, is never persisted in the config file, and stays outside the
-  staged Save/Cancel transaction. See
+  staged transaction — Escape, Save, and Cancel never set or revert it. See
   [Scheduled task fields](scheduled-tasks.md#settings-behavior-and-process-visibility).
 - **Web** includes maximum acquisition size and **Browser interaction approval**:
   **Ask**, **Automatically Accept**, or **Automatically Deny**. Ask prompts when
@@ -139,7 +142,7 @@ supplies the live switch (the ordinary extension entry point always does):
   submission, uploads, download saving, clipboard read/write, camera, microphone,
   geolocation, service workers, popup restriction override, local networks (human
   and model), and **YOLO / allow everything** — each staged like every other
-  section until **Save changes**. Enabling a capability presents its risk-appropriate
+  section and persisted with **Save changes**. Enabling a capability presents its risk-appropriate
   notice; enabling YOLO additionally requires an explicit interactive confirmation
   after a prominent warning (cancellation or an unavailable dialog leaves it off),
   shows the enabled state prominently on the Web row, and disables straightforwardly
@@ -159,8 +162,8 @@ transaction: it opens the **Scheduled tasks** submenu immediately, and Esc or
 **Back** from there returns to the settings root with the **Scheduled tasks**
 row highlighted — the root's own retained-selection state. It introduces no
 second menu, state, or save path — staged edits use the identical Save
-validation and persistence, and Cancel discards them exactly as for
-`/review-settings`.
+validation and persistence, Cancel discards them, and root Escape applies them to
+the running session only, exactly as for `/review-settings`.
 
 Re-shown menus keep your position: after a staged change (a toggle, an add, a move),
 the next display of the same menu highlights the row you last selected — even when its
@@ -181,13 +184,15 @@ controls apply unmodified — Tab path completion for relative or `~/...` paths
 files; a single match is applied directly, exactly as in the chat editor), the
 fd-backed `@` file picker, Ctrl+C clear, Ctrl+G external editing for long values
 such as scheduled-task instructions, image paste, and Shift+Enter newlines.
-For scheduled instructions, a native image paste is persisted durably at Save
-into the private managed store described in
-[Scheduled instruction images](scheduled-tasks.md#scheduled-instruction-images) — the pasted
+For scheduled instructions, a native image paste is persisted durably at Save —
+and at a session-only root Escape — into the private managed store described in
+[Scheduled instruction images](scheduled-tasks.md#scheduled-instruction-images): the pasted
 temporary path is validated by content, copied there, and replaced by the
-managed absolute path before the config write. There is no second editor or
-clipboard surface; recognition for this persistence stays bounded to Pi's
-clipboard temp naming and this config's own managed store root.
+managed absolute path before the config write. Save then writes the config; root
+Escape makes the same validated copies but leaves the configuration file untouched,
+so the session-only instructions keep working. Cancel copies nothing. There is no
+second editor or clipboard surface; recognition for this persistence stays bounded to
+Pi's clipboard temp naming and this config's own managed store root.
 Enter submits the field's own text (never a chat message); Esc first dismisses a
 visible completion list, then cancels the field, leaving the staged value
 unchanged. Every editable field shares the same native absolute-path behavior
@@ -234,15 +239,30 @@ a compact heading above its editable prefilled text mapping all five fields in
 order (minute, hour, day-of-month, month, day-of-week), stating machine-local
 time and `* * * * * = every minute`.
 
-Escape from a submenu returns to the settings root. Escape or **Cancel** at the root
-discards all staged changes; **Save changes** atomically persists every section while
-preserving unrelated JSON keys.
+Escape from a submenu returns to the settings root; nested Escape/**Back** navigation is
+unchanged. The root has three distinct exits:
 
-Saved values are authoritative for execution stages that have not started.
+- **Escape** applies the edited choices to the running session in memory only, using
+  the same validation and image handling as a save, and never writes the configuration
+  file. The choices stay in effect for the current session; a later `/reload` re-reads
+  the file and may discard them.
+- **Cancel** discards every edit made in this menu and restores the live settings that
+  were in effect when it opened — including session-only choices applied by an earlier
+  Escape. It copies no images.
+- **Save changes** and Ctrl+S are equivalent: both apply the active edited choices and
+  atomically persist every section while preserving unrelated JSON keys. Ctrl+S works
+  from any settings submenu, not only the root. Finish typed fields and unfinished
+  external-worker Create/Edit forms first; Ctrl+S does not interrupt them.
+
+Because Escape applies in memory, reopening `/review-settings` shows those choices and
+an immediate **Save changes** or Ctrl+S persists them without re-entering them.
+
+Applied values (session-only or saved) are authoritative for execution stages that
+have not started.
 Already-running executor and reviewer processes finish with their launch values, while
 queued dispatch, waiting failover, later continuation turns, and later review cycles use
 the current routes, capacities, policies, and reviewer selection. Open review windows
-reconcile to the new reviewer selection immediately on save: the preserved baseline,
+reconcile to the new reviewer selection immediately on apply: the preserved baseline,
 evidence, and completed history are unchanged, a review already in flight finishes under
 its original selection, and later reviews use the new one (a window frozen with no
 usable reviewers becomes reviewable as soon as its settings are fixed). Subtask notification

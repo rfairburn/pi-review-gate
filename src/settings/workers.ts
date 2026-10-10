@@ -25,7 +25,7 @@ import type { ScopedModelChoice } from "./models";
 import { alignedSettingsRows, notify, type UiContext } from "./ui";
 import { effectiveThinkingLevel, selectThinkingLevel, thinkingLevelLabel } from "./thinking";
 import { setCatalogKey } from "./catalog-key";
-import { retainedSelect } from "./menu";
+import { retainedChoice, retainedSelect } from "./menu";
 
 /** Plain staged slice edited by the resources visit; no shared draft object. */
 export interface WorkerResourceVisitResult {
@@ -281,7 +281,7 @@ export async function selectWorkerRoute(
       const used = new Set(route.map((entry) => entry.resourceId));
       const availableKeys = sortedCatalogKeys(resources, config, scoped).filter((key) => !used.has(key));
       const labels = availableKeys.map((key) => executorSelectionLabel(resources[key]!.selection, config, scoped));
-      const selected = await ui.select(`${title} — add`, labels.length ? [...labels, "Back"] : ["No additional resources", "Back"]);
+      const selected = await retainedChoice(ui, `${title} — add`, labels.length ? [...labels, "Back"] : ["No additional resources", "Back"]);
       const index = labels.indexOf(selected ?? "");
       if (index >= 0) {
         const key = availableKeys[index]!;
@@ -421,7 +421,7 @@ async function selectExecutorModel(
     })),
   ].filter((choice) => !unavailable.has(executorSelectionKey(choice.selection)));
   const rows = choices.map((choice) => `${choice.label}${current && executorSelectionKey(current) === executorSelectionKey(choice.selection) ? "  current" : ""}`);
-  const selected = await ui.select("Executor model", rows.length > 0 ? [...rows, "Back"] : ["No additional executors available", "Back"]);
+  const selected = await retainedChoice(ui, "Executor model", rows.length > 0 ? [...rows, "Back"] : ["No additional executors available", "Back"]);
   if (!selected || selected === "Back") return undefined;
   const found = choices.find((_choice, index) => selected === rows[index]);
   if (!found) return undefined;
@@ -431,7 +431,7 @@ async function selectExecutorModel(
 async function selectExecutorCapacity(ui: UiContext, current: number): Promise<number> {
   const values = Array.from({ length: MAX_EXECUTION_WORKERS }, (_, index) => index + 1);
   const rows = values.map((value) => `${value}${value === current ? "  current" : ""}`);
-  const selected = await ui.select(`Maximum concurrency (1–${MAX_EXECUTION_WORKERS})`, rows);
+  const selected = await retainedChoice(ui, `Maximum concurrency (1–${MAX_EXECUTION_WORKERS})`, rows);
   return values.find((_value, index) => selected === rows[index]) ?? current;
 }
 

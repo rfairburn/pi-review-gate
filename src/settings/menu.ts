@@ -64,6 +64,14 @@ export interface RetainedSelectInput {
   rows: readonly RetainedRow[];
   /** Row to highlight when re-shown; ignored when absent from `rows`. */
   initialKey?: string;
+  /** Caller-owned meaning of the native cancel key (root Escape applies). */
+  cancelHint?: string;
+}
+
+/** Per-root-transaction save signal shared by settings menus and hotkeys. */
+export interface SettingsSaveControl {
+  saveRequested: boolean;
+  suspended: number;
 }
 
 /** The theme passed to custom component factories (the host Theme). */
@@ -86,6 +94,8 @@ export interface RetainedUi {
   custom?(factory: MenuCustomFactory): Promise<string | undefined>;
   /** Host run mode ("tui" | "rpc" | ...); absent outside Pi. */
   mode?: string;
+  /** Optional root-owned Ctrl+S signal; never copied into settings drafts. */
+  saveControl?: SettingsSaveControl;
 }
 
 /** pi-tui SelectItem shape. */
@@ -136,6 +146,8 @@ export interface MenuTuiHost {
    * resolve tui.select.* through the app's user keybindings.json.
    */
   setKeybindings?: (keybindings: unknown) => void;
+  /** Public pi-tui matchesKey(Key.ctrl("s")) matcher, when available. */
+  matchesCtrlS?: (data: string) => boolean;
   /** Host DynamicBorder; an explicit color function is always passed. */
   DynamicBorder?: new (color?: (segment: string) => string) => unknown;
   /** Host getSelectListTheme(); used when loadable and render-safe. */
@@ -188,6 +200,16 @@ async function loadMenuTuiHost(): Promise<MenuTuiHost | undefined> {
   if (typeof tui.setKeybindings === "function") {
     host.setKeybindings = tui.setKeybindings as MenuTuiHost["setKeybindings"];
   }
+  const matchesKey = tui.matchesKey;
+  const key = tui.Key as { ctrl?: (name: string) => unknown } | undefined;
+  if (typeof matchesKey === "function" && typeof key?.ctrl === "function") {
+    try {
+      const ctrlS = key.ctrl("s");
+      host.matchesCtrlS = (data) => Boolean(matchesKey(data, ctrlS));
+    } catch {
+      // A partial peer can still render menus, just without the save chord.
+    }
+  }
   const agent = await loadHostPeerModule(PI_AGENT_PACKAGE_NAME, { entryProvider: hostEntryProvider, packageMainFallback: true });
   if (agent) {
     if (typeof agent.DynamicBorder === "function") host.DynamicBorder = agent.DynamicBorder as MenuTuiHost["DynamicBorder"];
@@ -234,6 +256,9 @@ function isSelectListProvider(
  * exactly as it did with label-based dispatch.
  */
 export async function retainedSelect(ui: RetainedUi, input: RetainedSelectInput): Promise<string | undefined> {
+  // A latched request unwinds one selector at a time through its normal
+  // cancellation return path, preserving each caller's local staged fields.
+  if (saveIsRequested(ui.saveControl)) return undefined;
   if (ui.mode === "tui" && typeof ui.custom === "function") {
     // Resolution must stay fail-safe at the call site: any future loader
     // rejection degrades to the plain selector instead of breaking the menu.
@@ -247,6 +272,23 @@ export async function retainedSelect(ui: RetainedUi, input: RetainedSelectInput)
     }
   }
   return plainSelect(ui, input);
+}
+
+/**
+ * Choice-only host selectors use the same retainedSelect seam, gaining the
+ * custom-TUI save signal without changing labels, order, cancellation, or the
+ * plain/RPC fallback. Typed fields deliberately continue to use their native
+ * editor seams instead.
+ */
+export async function retainedChoice(
+  ui: RetainedUi,
+  title: string,
+  options: readonly string[],
+): Promise<string | undefined> {
+  return retainedSelect(ui, {
+    title,
+    rows: options.map((label) => ({ key: label, label })),
+  });
 }
 
 /** Renders the menu with the host SelectList and resolves on Enter/Esc. */
@@ -281,13 +323,21 @@ function customSelect(ui: RetainedUi, host: MenuTuiHost, input: RetainedSelectIn
     selectList.onSelect = (item) => done(item.value);
     selectList.onCancel = () => done(undefined);
     container.addChild(selectList);
-    container.addChild(new host.Text(hintText(host), 1, 0));
+    const saveHintAvailable = ui.saveControl !== undefined
+      && ui.saveControl.suspended === 0
+      && host.matchesCtrlS !== undefined;
+    container.addChild(new host.Text(hintText(host, saveHintAvailable, input.cancelHint), 1, 0));
     if (host.DynamicBorder) container.addChild(new host.DynamicBorder(borderColor(theme)));
 
     return {
       render: (width: number): string[] => container.render(width),
       invalidate: (): void => container.invalidate(),
       handleInput: (data: string): void => {
+        if (ui.saveControl && ui.saveControl.suspended === 0 && matchesCtrlS(host, data)) {
+          ui.saveControl.saveRequested = true;
+          done(undefined);
+          return;
+        }
         selectList.handleInput(data);
         tui.requestRender?.();
       },
@@ -355,15 +405,31 @@ function selectListTheme(host: MenuTuiHost, theme: MenuTheme): MenuSelectListThe
   };
 }
 
-function hintText(host: MenuTuiHost): string {
+function hintText(host: MenuTuiHost, saveHintAvailable: boolean, cancelHint = "cancel"): string {
+  let hints: string;
   try {
     if (typeof host.rawKeyHint === "function" && typeof host.keyHint === "function") {
       // The host's live keybinding text, so user keybindings.json overrides
       // are honored instead of hard-coded keys.
-      return `${host.rawKeyHint("↑↓", "navigate")}  ${host.keyHint("tui.select.confirm", "select")}  ${host.keyHint("tui.select.cancel", "cancel")}`;
+      hints = `${host.rawKeyHint("↑↓", "navigate")}  ${host.keyHint("tui.select.confirm", "select")}  ${host.keyHint("tui.select.cancel", cancelHint)}`;
+    } else {
+      hints = `↑↓ navigate · enter select · esc ${cancelHint}`;
     }
   } catch {
-    // Fall through to the static hint.
+    hints = `↑↓ navigate · enter select · esc ${cancelHint}`;
   }
-  return "↑↓ navigate · enter select · esc cancel";
+  return saveHintAvailable ? `${hints} · Ctrl+S save` : hints;
+}
+
+function saveIsRequested(control: SettingsSaveControl | undefined): boolean {
+  return control?.saveRequested === true && control.suspended === 0;
+}
+
+function matchesCtrlS(host: MenuTuiHost, data: string): boolean {
+  try {
+    return host.matchesCtrlS?.(data) === true;
+  } catch {
+    // A broken/unavailable public host parser must not eat an ordinary key.
+    return false;
+  }
 }

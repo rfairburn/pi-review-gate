@@ -12,10 +12,29 @@ export interface ExternalAgentOperation {
   definition?: ExternalAgentValue;
 }
 
-export function stageExternalAgentOperation(operations: ExternalAgentOperation[], opening: ReviewGateConfig, id: string, nextId?: string, definition?: ExternalAgentValue): void {
+/**
+ * Stage one external-agent transaction step, returning the operation it
+ * landed on. A step chains onto a rename whose destination is this id; a
+ * recreation of an id a pending deletion removed composes with that deletion
+ * (issue #294) — the original definition and reference baselines are retained
+ * for the optimistic guards, and the final outcome becomes the recreated
+ * definition, so delete → Escape → reopen → create-same-ID → Save is one
+ * valid transaction instead of a creation collision.
+ *
+ * `isCreation` marks a brand-new agent
+ * (one this transaction added): it has no on-disk original, so no opening
+ * baseline is captured — inventing one from the live catalog would make a
+ * later Save reject a valid transaction (issue #294). Composition with an
+ * existing guarded deletion keeps that deletion's baseline.
+ */
+export function stageExternalAgentOperation(operations: ExternalAgentOperation[], opening: ReviewGateConfig, id: string, nextId?: string, definition?: ExternalAgentValue, isCreation = false): ExternalAgentOperation {
   const prior = operations.find((operation) => operation.nextId === id);
-  if (prior) { prior.nextId = nextId; prior.definition = definition && structuredClone(definition); }
-  else operations.push({ id, baseline: Object.hasOwn(opening.externalAgents ?? {}, id) ? structuredClone(opening.externalAgents![id]) : undefined, nextId, definition: definition && structuredClone(definition) });
+  if (prior) { prior.nextId = nextId; prior.definition = definition && structuredClone(definition); return prior; }
+  const pendingDeletion = operations.find((operation) => operation.id === id && operation.nextId === undefined);
+  if (pendingDeletion) { pendingDeletion.nextId = nextId; pendingDeletion.definition = definition && structuredClone(definition); return pendingDeletion; }
+  const created: ExternalAgentOperation = { id, baseline: !isCreation && Object.hasOwn(opening.externalAgents ?? {}, id) ? structuredClone(opening.externalAgents![id]) : undefined, nextId, definition: definition && structuredClone(definition) };
+  operations.push(created);
+  return created;
 }
 
 /** One isolated draft transaction, touching structured references only. */
@@ -96,6 +115,44 @@ export function externalAgentReferences(config: ReviewGateConfig, id: string, ex
 export function guardExternalAgentReferences(opening: ReviewGateConfig, latest: ReviewGateConfig, id: string): void {
   const resourceIds = Object.entries(resolvedWorkerCatalog(opening)).filter(([, r]) => r.selection.source === "external" && r.selection.id === id).map(([key]) => key);
   if (!isDeepStrictEqual(externalAgentReferences(opening, id, resourceIds), externalAgentReferences(latest, id, resourceIds))) {
+    throw new Error("External worker references changed on disk. Reopen settings to review the rename/deletion cascade before saving.");
+  }
+}
+
+/**
+ * A captured pre-cascade reference baseline for one external agent id
+ * (issue #294): the resource keys and reference projection of the config
+ * BEFORE a session-only cascade was applied, so a later Save can run the
+ * same optimistic reference guard without a post-cascade opening snapshot
+ * (which would conflict with unchanged on-disk references to the old id).
+ */
+export interface ExternalAgentReferenceBaseline {
+  /** Resource keys in the pre-cascade config that selected the agent. */
+  resourceIds: string[];
+  /** The reference projection captured pre-cascade (deep-compared at Save). */
+  projection: unknown;
+}
+
+/** Capture the pre-cascade reference baseline for one agent id (issue #294). */
+export function captureExternalAgentReferenceBaseline(config: ReviewGateConfig, id: string): ExternalAgentReferenceBaseline {
+  const resourceIds = Object.entries(resolvedWorkerCatalog(config))
+    .filter(([, resource]) => resource.selection.source === "external" && resource.selection.id === id)
+    .map(([key]) => key);
+  return { resourceIds, projection: externalAgentReferences(config, id, resourceIds) };
+}
+
+/**
+ * Optimistic reference guard against a captured baseline (issue #294): the
+ * same comparison as {@link guardExternalAgentReferences}, with the opening
+ * side replaced by the stored pre-cascade projection for operations applied
+ * session-only in an earlier menu session.
+ */
+export function guardExternalAgentReferenceBaseline(
+  baseline: ExternalAgentReferenceBaseline,
+  latest: ReviewGateConfig,
+  id: string,
+): void {
+  if (!isDeepStrictEqual(baseline.projection, externalAgentReferences(latest, id, baseline.resourceIds))) {
     throw new Error("External worker references changed on disk. Reopen settings to review the rename/deletion cascade before saving.");
   }
 }

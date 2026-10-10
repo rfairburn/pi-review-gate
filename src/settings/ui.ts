@@ -5,7 +5,7 @@
  * formatters, and the notify seam. Nothing here knows the staged settings
  * draft or the root menu.
  */
-import type { MenuCustomFactory } from "./menu";
+import type { MenuCustomFactory, SettingsSaveControl } from "./menu";
 
 export interface UiContext {
   select(title: string, options: string[]): Promise<string | undefined>;
@@ -20,6 +20,8 @@ export interface UiContext {
   mode?: string;
   /** The host session's working directory, carried from the command context. */
   cwd?: string;
+  /** Optional root-owned save signal shared with settings menu selectors. */
+  saveControl?: SettingsSaveControl;
 }
 
 export function alignedSettingsRows(entries: ReadonlyArray<readonly [label: string, value: string]>): string[] {

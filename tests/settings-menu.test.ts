@@ -536,7 +536,7 @@ test("route Move up keeps editing the moved entry and the outer list retains it"
   ]);
 });
 
-test("escape at the root discards staged changes without saving", async () => {
+test("escape at the root applies staged changes session-only without saving", async () => {
   const { configPath, config } = await makeConfig({ enabled: false });
   const before = await readFile(configPath, "utf8");
   let savedCallbackCalls = 0;
@@ -551,7 +551,7 @@ test("escape at the root discards staged changes without saving", async () => {
   });
   const harness = createTuiSettingsContext([
     [...downs(ROOT.deferredTools), KEY_ENTER],  // toggle Deferred Pi tools Off
-    [KEY_ESCAPE],                               // cancel at root
+    [KEY_ESCAPE],                               // session-only apply at root (issue #294)
   ]);
   setMenuTuiHost(harness.host);
   await registered.handler("", harness.context);
@@ -563,7 +563,10 @@ test("escape at the root discards staged changes without saving", async () => {
   assert.equal(harness.initialIndexes[0], 0);
   assert.equal(harness.initialIndexes[1], ROOT.deferredTools);
   assert.ok(root2!.items[ROOT.deferredTools]!.label.includes("Off"));
-  assert.equal(savedCallbackCalls, 0);
+  // Issue #294: root Escape applies the staged settings to the live config
+  // (onSaved runs) without writing the config file.
+  assert.equal(savedCallbackCalls, 1);
+  assert.equal(config.execution?.deferredPiTools, false);
   assert.equal(await readFile(configPath, "utf8"), before);
 });
 

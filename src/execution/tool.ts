@@ -11,6 +11,7 @@ import {
   isInterruptibleTaskState,
   type BackgroundInspection,
   type BackgroundReviewReadinessTask,
+  type BackgroundControllerRestoreOptions,
   type BackgroundTaskDefinition,
   type BackgroundTaskKind,
   type ParentCheckpointSaveResult,
@@ -234,8 +235,11 @@ export class ExecutionToolManager {
     return this.controller.associations();
   }
 
-  async restoreAssociations(value: ExecutionAssociationsSnapshot): Promise<void> {
-    await this.controller.restore(value);
+  async restoreAssociations(
+    value: ExecutionAssociationsSnapshot,
+    options?: BackgroundControllerRestoreOptions,
+  ): Promise<void> {
+    await this.controller.restore(value, options);
   }
 
   setScopedModels(models: readonly string[]): void {

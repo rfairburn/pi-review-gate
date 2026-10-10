@@ -60,16 +60,17 @@
  *   stale handle from an older session/reload can therefore never release or
  *   resolve a newer incarnation's ownership (nor clear its own uncertainty from
  *   a newer handle). Tokens AND uncertainty of retired incarnations are retained
- *   until that incarnation itself resolves or releases them, so an old source
- *   settling or a newer empty source registering leaves the current ownership
- *   positive or unknown rather than zero.
+ *   until that exact incarnation releases them or its optional event-driven proof
+ *   callback establishes a complete channel-specific census. A newer empty
+ *   source can never resolve another incarnation's ownership or activity.
  * - Registrations made before opt-in are replayed as uncertain: lifecycle
  *   acquisitions before activation were never observed, so an empty replay
  *   cannot establish an empty owned set. The source must authoritatively resolve
  *   it (for example after its own restore/resync).
  * - The snapshot is process-local and reload-durable: the state object is
  *   stored on a `globalThis` symbol, so a reporter reload (same native
- *   process) observes the same registrations and outstanding tokens. The wire
+ *   process) observes the same registrations, outstanding tokens, and any
+ *   exact-incarnation read-only census callback. The wire
  *   generation/sequence fences remain owned by the reporter and protocol.
  * - Tokens are opaque bounded strings that never carry labels, commands,
  *   paths, arguments, or transcripts; only their positive count is exposed.
@@ -148,6 +149,34 @@ export interface OwnedActivitySourceHandle {
   retire(): void;
 }
 
+/** Opaque positive tokens retained by one exact source incarnation. */
+export interface RetiredOwnedActivityTokens {
+  readonly ownership: readonly string[];
+  /** Undefined only for a legacy pre-intent registry entry. */
+  readonly intent: readonly string[] | undefined;
+}
+
+/** One independently complete, read-only census channel. */
+export interface RetiredOwnedActivityChannel {
+  /** True only when the callback accounted for the complete exact inventory. */
+  readonly complete: true;
+  /** All tokens that remain owned after the census. */
+  readonly tokens: readonly string[];
+  /** Existing tokens removed only with channel-specific validated proof. */
+  readonly released: readonly string[];
+}
+
+/** Result returned by a retired source's asynchronous, read-only census. */
+export interface RetiredOwnedActivityReconciliation {
+  readonly ownership?: RetiredOwnedActivityChannel;
+  readonly intent?: RetiredOwnedActivityChannel;
+}
+
+/** Reload-durable callback for one source incarnation's retired census. */
+export type RetiredOwnedActivityReconciler = (
+  retained: RetiredOwnedActivityTokens,
+) => Promise<RetiredOwnedActivityReconciliation>;
+
 /** Registration options for one source incarnation. */
 export interface OwnedActivitySourceOptions {
   /**
@@ -167,6 +196,8 @@ export interface OwnedActivitySourceOptions {
    * settlement event may do that.
    */
   resync?: () => void;
+  /** Optional read-only census for this exact source after it is retired. */
+  reconcileRetired?: RetiredOwnedActivityReconciler;
 }
 
 /** Process-local registry state, stored on this symbol and shared across reloads. */
@@ -203,6 +234,14 @@ interface SourceIncarnation {
   intentTokens?: Set<string>;
   /** Sticky activity-intent uncertainty; undefined for a pre-intent record. */
   intentUncertain?: boolean;
+  /** Optional reload-durable census closure retained with this source. */
+  reconcileRetired?: RetiredOwnedActivityReconciler;
+  /** Legacy field retained for reload compatibility; it does not gate retries. */
+  reconciliationAttempted?: boolean;
+  /** True only while this exact incarnation's retired census is in flight. */
+  reconciliationInFlight?: boolean;
+  /** Changed on any same-incarnation mutation; fences stale async reads. */
+  revision?: number;
 }
 
 interface RegistryState {
@@ -264,6 +303,11 @@ function isRegistryState(value: unknown): value is RegistryState {
             && (!(entry.intentTokens instanceof Set)
               || !Number.isSafeInteger(entry.intentTokens.size) || entry.intentTokens.size < 0)) return false;
           if (entry.intentUncertain !== undefined && typeof entry.intentUncertain !== "boolean") return false;
+          if (entry.reconcileRetired !== undefined && typeof entry.reconcileRetired !== "function") return false;
+          if (entry.reconciliationAttempted !== undefined && typeof entry.reconciliationAttempted !== "boolean") return false;
+          if (entry.reconciliationInFlight !== undefined && typeof entry.reconciliationInFlight !== "boolean") return false;
+          if (entry.revision !== undefined && (typeof entry.revision !== "number"
+            || !Number.isSafeInteger(entry.revision) || entry.revision < 0)) return false;
         }
       }
     }
@@ -339,6 +383,9 @@ function installRegistration(
       retired: false,
       intentTokens: new Set(),
       intentUncertain: options?.intentUncertain === true,
+      ...(options?.reconcileRetired ? { reconcileRetired: options.reconcileRetired } : {}),
+      reconciliationInFlight: false,
+      revision: 0,
     };
     list.push(entry);
   } else {
@@ -346,13 +393,18 @@ function installRegistration(
     // Never fabricate intent data for a pre-intent entry: its activity set was
     // never observed, so it stays unknown rather than becoming a known zero.
     if (entry.intentTokens !== undefined && options?.intentUncertain === true) entry.intentUncertain = true;
+    if (options?.reconcileRetired) entry.reconcileRetired = options.reconcileRetired;
   }
   // A newly installed incarnation supersedes every older one, but the
   // superseded incarnation's tokens AND uncertainty stay retained until that
   // incarnation itself resolves or releases them.
   for (const other of list) {
-    if (other !== entry) other.retired = true;
+    if (other !== entry) {
+      other.retired = true;
+      other.revision = (other.revision ?? 0) + 1;
+    }
   }
+  entry.revision = (entry.revision ?? 0) + 1;
   if (options?.resync) {
     // A throwing resync leaves ownership unaccounted for: sticky unknown.
     try {
@@ -449,7 +501,10 @@ function createSourceHandle(
     if (!state || !state.active) return;
     const entry = findIncarnation(state, category, source, incarnation);
     if (!entry) return; // not installed: no observation
-    if (mutate(state, entry)) notify(state);
+    if (mutate(state, entry)) {
+      entry.revision = (entry.revision ?? 0) + 1;
+      notify(state);
+    }
   };
   // Activity-intent mutations are scoped like ownership mutations, but a
   // pre-intent entry has no activity data to mutate: it stays unknown.
@@ -460,7 +515,10 @@ function createSourceHandle(
     if (!state || !state.active) return;
     const entry = findIncarnation(state, category, source, incarnation);
     if (!entry || entry.intentTokens === undefined) return;
-    if (mutate(state, entry)) notify(state);
+    if (mutate(state, entry)) {
+      entry.revision = (entry.revision ?? 0) + 1;
+      notify(state);
+    }
   };
   const handle: OwnedActivitySourceHandle = {
     category,
@@ -601,6 +659,146 @@ export function subscribeOwnedActivity(listener: () => void): () => void {
   return () => {
     state.listeners.delete(listener);
   };
+}
+
+function validReconciliationChannel(value: unknown): value is RetiredOwnedActivityChannel {
+  if (!isRecord(value) || value.complete !== true || !Array.isArray(value.tokens) || !Array.isArray(value.released)) return false;
+  for (const list of [value.tokens, value.released]) {
+    if (list.some((token) => !isValidToken(token))) return false;
+  }
+  return new Set(value.tokens).size === value.tokens.length
+    && new Set(value.released).size === value.released.length;
+}
+
+function applyRetiredChannel(
+  entry: SourceIncarnation,
+  channel: unknown,
+  tokens: Set<string> | undefined,
+  setUncertain: (uncertain: boolean) => void,
+): boolean {
+  if (!tokens || !validReconciliationChannel(channel)) return false;
+  const result = channel as RetiredOwnedActivityChannel;
+  const next = new Set(result.tokens);
+  const released = new Set(result.released);
+  // A retained positive can disappear only with explicit per-channel proof.
+  for (const prior of tokens) {
+    if (!next.has(prior) && !released.has(prior)) return false;
+  }
+  for (const proof of released) {
+    if (!tokens.has(proof) || next.has(proof)) return false;
+  }
+  tokens.clear();
+  for (const token of next) tokens.add(token);
+  setUncertain(false);
+  entry.revision = (entry.revision ?? 0) + 1;
+  return true;
+}
+
+/**
+ * Bounded, event-driven recovery of retired execution telemetry. Each call
+ * snapshots the eligible exact retired sources once, reads each independently,
+ * and never restarts the pass if registration changes that snapshot. The caller
+ * is the authenticated reporter's existing session_start hook and awaits this
+ * before ordinary association restoration. Failed, incomplete, or stale reads
+ * may be retried by a later explicit session_start; no timer or polling is used.
+ * Review and shell sources, legacy entries without callbacks, and the current
+ * incarnation are never queried.
+ */
+export async function reconcileRetiredExecutionActivity(): Promise<void> {
+  const state = registryState(false);
+  if (!state?.active) return;
+  const sources = state.sources;
+  const bySource = sources.get("backgroundTasks");
+  const list = bySource?.get("execution");
+  if (!list) return;
+  const sourceSnapshot = [...list];
+  const sameSourceSnapshot = (): boolean => {
+    const currentState = registryState(false);
+    const currentBySource = currentState?.sources.get("backgroundTasks");
+    const currentList = currentBySource?.get("execution");
+    return currentState === state && currentState.active
+      && currentState.sources === sources && currentBySource === bySource
+      && currentList === list && currentList.length === sourceSnapshot.length
+      && currentList.every((entry, index) => entry === sourceSnapshot[index]);
+  };
+  const candidates = sourceSnapshot.flatMap((entry) => {
+    const reconcile = entry.reconcileRetired;
+    const provenCompleteEmpty = !entry.uncertain && entry.tokens.size === 0
+      && entry.intentTokens !== undefined && entry.intentUncertain !== true
+      && entry.intentTokens.size === 0;
+    if (!entry.retired || typeof reconcile !== "function" || entry.reconciliationInFlight === true
+      || provenCompleteEmpty) return [];
+    return [{
+      entry,
+      reconcile,
+      revision: entry.revision ?? 0,
+      retained: {
+        ownership: [...entry.tokens],
+        intent: entry.intentTokens === undefined ? undefined : [...entry.intentTokens],
+      } satisfies RetiredOwnedActivityTokens,
+    }];
+  });
+  if (candidates.length === 0) return;
+
+  // Reserve the complete candidate snapshot before invoking any callback.
+  // Reentrant events (including callbacks which re-enter this function) can
+  // therefore never duplicate an exact source's in-flight read.
+  for (const candidate of candidates) candidate.entry.reconciliationInFlight = true;
+  const pending: Array<{
+    candidate: typeof candidates[number];
+    result: Promise<RetiredOwnedActivityReconciliation>;
+  }> = [];
+  try {
+    for (const candidate of candidates) {
+      // A synchronous callback may re-enter registration. Discard the rest of
+      // this pass rather than reading a candidate set that no longer exists.
+      if (!sameSourceSnapshot()) break;
+      const { entry, reconcile, revision, retained } = candidate;
+      if (!entry.retired || entry.reconcileRetired !== reconcile
+        || (entry.revision ?? 0) !== revision) continue;
+      try {
+        pending.push({ candidate, result: reconcile(retained) });
+      } catch {
+        // A synchronous failure is isolated to this owner; independent owners
+        // in the same captured pass still get their one read.
+        pending.push({ candidate, result: Promise.reject(new Error("retired census failed")) });
+      }
+    }
+    const settled = await Promise.allSettled(pending.map(({ result }) => result));
+    // A changed registry/source list invalidates every result from this captured
+    // pass. Do not restart or add newly registered owners until another event.
+    if (!sameSourceSnapshot()) return;
+
+    const applicable = settled.flatMap((outcome, index) => {
+      if (outcome.status !== "fulfilled") return [];
+      const candidate = pending[index]!.candidate;
+      const { entry, reconcile, revision } = candidate;
+      if (sourceSnapshot.includes(entry) && entry.retired
+        && entry.reconcileRetired === reconcile && (entry.revision ?? 0) === revision) {
+        return [{ entry, result: outcome.value }];
+      }
+      return [];
+    });
+    let changed = false;
+    for (const { entry, result } of applicable) {
+      try {
+        if (!isRecord(result)) continue;
+        changed = applyRetiredChannel(entry, result.ownership, entry.tokens, (uncertain) => { entry.uncertain = uncertain; }) || changed;
+        // Never fabricate independent activity history for a legacy record.
+        if (entry.intentTokens !== undefined) {
+          changed = applyRetiredChannel(entry, result.intent, entry.intentTokens, (uncertain) => { entry.intentUncertain = uncertain; }) || changed;
+        }
+      } catch {
+        // A malformed result has no authority for this owner and cannot prevent
+        // independent eligible owners from applying their own validated proof.
+      }
+    }
+    if (changed) notify(state);
+  } finally {
+    // Clear even on rejection/stale snapshots so a later explicit lifecycle
+    // event can retry. This scheduling bit is not a source mutation/revision.
+    for (const candidate of candidates) candidate.entry.reconciliationInFlight = false;
+  }
 }
 
 /** Test seam: drop the process-local state and inert pending registrations. */

@@ -360,6 +360,26 @@ recovery artifacts reads zero (or unknown when the stop itself is unproven). The
 separate conservative **ownership** state still gates an idle-only stop or removal; it
 is deliberately not displayed. Missing, invalid, or pre-intent observations stay
 unknown, never inferred zero and never silently substituted with an ownership count.
+After a same-process extension reload, each existing authenticated `session_start` may
+make one bounded read-only pass over its snapshot of eligible retired execution
+controllers whose exact association inventories were sealed by completed detaches. Each
+eligible exact owner is read at most once in that pass; an in-flight read is not
+duplicated, and a retired source already proven complete and empty is skipped. Failed,
+incomplete, or stale reads remain unknown and may be retried on a later explicit
+`session_start`; a source-list change discards that pass's snapshot and results without
+restarting it. Recovery is event-driven only, with no periodic polling or transport
+heartbeat trigger. Any later admission or local state/token mutation invalidates that
+owner's seal. Only validated, identity-matched manifests, task archives, and
+operation-owner evidence can resolve that old incarnation; known stopped work may clear
+activity intent while its recovery/cleanup token remains owned. The pass runs before
+ordinary association restoration and does not restore/adopt tasks, write state, send
+task/user notifications, or start/resume work. A missing, corrupt, unmatched, ambiguous, stale, or unavailable
+reference; uncertain operation/liveness; lost runtime/force-merge owner; or post-detach
+mutation leaves that channel unknown, with prior positive tokens retained. Replacement
+controller emptiness is not evidence about a retired owner, and legacy registry entries
+without a retained census callback remain unknown. This intentionally conservative
+recovery repairs only cases the old owner can prove; it does not establish the
+historical onset or cause of any earlier unknown status.
 Native names may use Pi's first-user-message fallback when
 there is no stored title. The sidebar does not monitor or coordinate reviewers, workers,
 or their children, and does not display tool arguments, question text, transcripts, or

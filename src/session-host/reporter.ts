@@ -47,6 +47,7 @@ import {
   activateOwnedActivity,
   activeActivitySnapshot,
   ownedActivitySnapshot,
+  reconcileRetiredExecutionActivity,
   subscribeOwnedActivity,
 } from "./owned-activity";
 import {
@@ -1548,14 +1549,24 @@ function createReporter(
     };
   };
 
-  registerHook(pi, "session_start", safe((...args) => {
-    const ctx = extractSafeContext(args);
-    if (!contextModeIsTui(ctx)) {
-      deactivate(); // print/no-op/unreadable hosts: no observation, no reporting, no UI mutation
-      return;
+  registerHook(pi, "session_start", async (...args) => {
+    try {
+      const ctx = extractSafeContext(args);
+      if (!contextModeIsTui(ctx)) {
+        deactivate(); // print/no-op/unreadable hosts: no observation, no reporting, no UI mutation
+        return;
+      }
+      // Fence the prior session synchronously before the first await: a public
+      // getter can re-enter session_start while a shutdown request is handled.
+      installSession(ctx);
+      // The reporter extension is loaded before the review-gate extension, so
+      // this awaited, read-only census completes before its ordinary
+      // restoreAssociations hook can detach/rebuild controller state.
+      await reconcileRetiredExecutionActivity();
+    } catch {
+      // Telemetry recovery/reporting never changes native session startup.
     }
-    installSession(ctx);
-  }));
+  });
 
   registerHook(pi, "session_shutdown", safe(() => {
     deactivate();

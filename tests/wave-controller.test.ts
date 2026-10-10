@@ -1719,6 +1719,67 @@ test("integration error before worktree creation omits worktree path via execute
   }
 });
 
+test("wave infrastructure retry draws jitter at zero base without waiting", async () => {
+  const artifactDir = await mkTmp("pi-wc-zero-base-retry-");
+  const sourceDir = await mkTmp("pi-wc-zero-base-retry-src-");
+  await git(["init", "--quiet"], sourceDir);
+  await writeFile(join(sourceDir, "readme.md"), "# hello\n", "utf8");
+  await git(["add", "."], sourceDir);
+  await git(["commit", "--quiet", "-m", "init"], sourceDir);
+  const config = makeConfigWithWritingExecutor();
+  config.execution!.retryPolicy = {
+    maxRetries: 1,
+    baseDelayMs: 0,
+    maxDelayMs: 0,
+    jitter: true,
+    maxSameIncidentRepeats: 1,
+  };
+  let beforeWorktreeCalls = 0;
+  let countingRetryDraw = false;
+  let randomDraws = 0;
+  let zeroDelayTimers = 0;
+  const originalRandom = Math.random;
+  const originalSetTimeout = globalThis.setTimeout;
+  Math.random = () => {
+    if (countingRetryDraw) randomDraws += 1;
+    return 0.5;
+  };
+  globalThis.setTimeout = ((...args: Parameters<typeof globalThis.setTimeout>) => {
+    if (countingRetryDraw && args[1] === 0) zeroDelayTimers += 1;
+    return originalSetTimeout(...args);
+  }) as typeof globalThis.setTimeout;
+  try {
+    const result = await executeWave({
+      cwd: sourceDir,
+      tasks: [{ title: "test task", instructions: "write a file", acceptanceCriteria: ["file exists"] }],
+      config,
+      maxWorkers: 1,
+      artifactDir,
+      waveId: "wc-zero-base-retry",
+      integrationHooks: {
+        beforeWorktree: () => {
+          beforeWorktreeCalls += 1;
+          if (beforeWorktreeCalls === 1) {
+            countingRetryDraw = true;
+            throw new Error("transient integration setup failure");
+          }
+          countingRetryDraw = false;
+        },
+      },
+    });
+
+    assert.equal(beforeWorktreeCalls, 2, "the transient infrastructure failure is retried once");
+    assert.equal(result.integration?.status, "integrated");
+    assert.equal(randomDraws, 1, "the inline wave route draws jitter even with zero base delay");
+    assert.equal(zeroDelayTimers, 0, "the inline wave route skips the wait when computed delay is zero");
+  } finally {
+    Math.random = originalRandom;
+    globalThis.setTimeout = originalSetTimeout;
+    await rm(artifactDir, { recursive: true, force: true });
+    await rm(sourceDir, { recursive: true, force: true });
+  }
+});
+
 // ── Capture consistency exhaustion produces structured error ─────────────────
 
 test("capture consistency exhaustion throws WaveCaptureError with workspace_changing_during_capture code", async () => {

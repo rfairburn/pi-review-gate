@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.141]
+## [0.1.0-dev.142]
 
 ### Added
 
@@ -24,6 +24,15 @@ dates.
   subsequent input reaches that owner. Sidebar selection and visibility, siblings,
   keyboard controls, and already-focused native mouse behavior remain unchanged.
   Forms, confirmations, and the narrow overlay are excluded (#361).
+
+## [0.1.0-dev.141]
+
+### Changed
+
+- Equivalent executor, review, in-place, wave infrastructure, and operation retry
+  delays now share one internal exponential-cap/jitter calculation (#240). Existing
+  retry numbering, random draws, wait guards, abort behavior, and settlement policies
+  are unchanged.
 
 ## [0.1.0-dev.140]
 

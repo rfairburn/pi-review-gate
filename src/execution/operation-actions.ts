@@ -41,6 +41,7 @@ import { ExecutorPoolScheduler, type ExecutorPoolLease } from "./executor-pool";
 import { acquireWaveOwner, heartbeatWaveOwner, inspectWaveOwner, releaseWaveOwner } from "./wave-owner";
 import type { ContinuationProgressUpdate, ExecutorLiveControl } from "./types";
 import { sourceMutationCoordinator } from "./source-mutation-lease";
+import { computeRetryDelay } from "./retry-delay";
 
 export interface OperationInspection {
   bundle: ReattachmentBundle;
@@ -1283,8 +1284,7 @@ async function retryOperationStage<T>(
       await writeOperationRecord(record);
       if (!retryable) throw error;
       retries += 1;
-      const ceiling = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** Math.max(0, retries - 1));
-      const delay = policy.jitter ? Math.floor(ceiling * (0.5 + Math.random() * 0.5)) : ceiling;
+      const delay = computeRetryDelay(policy.baseDelayMs, policy.maxDelayMs, policy.jitter, retries);
       if (delay > 0) await new Promise((resolvePromise) => setTimeout(resolvePromise, delay));
     }
   }

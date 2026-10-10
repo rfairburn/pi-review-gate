@@ -3,6 +3,7 @@ import { normalizeCandidate, type PriorCandidate } from "./wave-commits";
 import type { WaveCaptureResult } from "./wave-repository";
 import { ExecutorLifecycleError, type ExecutorAdapter, type ExecutorRequest, type ExecutorTurn, type SubtaskDispatchRecord } from "./types";
 import type { WorkerWorktree } from "./wave-worktrees";
+import { computeRetryDelay } from "./retry-delay";
 import {
   acquireOperationOwner,
   createIncident,
@@ -479,8 +480,7 @@ function recoveryPrompt(message: string, compaction: boolean, checkpoint: Recove
 
 async function retryDelay(policy: ExecutionRetryPolicy, retry: number, signal?: AbortSignal): Promise<void> {
   if (policy.baseDelayMs === 0) return;
-  const exponential = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** Math.max(0, retry - 1));
-  const delay = policy.jitter ? Math.floor(exponential * (0.5 + Math.random() * 0.5)) : exponential;
+  const delay = computeRetryDelay(policy.baseDelayMs, policy.maxDelayMs, policy.jitter, retry);
   await new Promise<void>((resolve, reject) => {
     const finish = () => {
       signal?.removeEventListener("abort", abort);

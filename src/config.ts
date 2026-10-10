@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
+import { canonicalStableJson } from "./canonical-json";
 import type { ConfigPathResolution } from "./config-path";
 import { reviewGateConfigCandidates, resolveConfigPathResolution } from "./config-path";
 import { parseCronExpression } from "./scheduling/cron";
@@ -1400,15 +1401,6 @@ export function reviewerConfigFingerprint(reviewer: DeciderConfig): string {
     if (value !== undefined) canonical[key] = value;
   }
   return createHash("sha256").update(canonicalStableJson(canonical)).digest("hex");
-}
-
-function canonicalStableJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalStableJson).join(",")}]`;
-  if (value !== null && typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalStableJson(record[key])}`).join(",")}}`;
-  }
-  return JSON.stringify(value) ?? "null";
 }
 
 function findConfigPath(

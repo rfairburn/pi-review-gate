@@ -125,6 +125,102 @@ workerResources: { "default": { selection: { source: "external", id: "continuabl
   }
 });
 
+test("operation landing retry waits without a signal and preserves its stage settlement", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "pi-operation-retry-delay-")));
+  try {
+    await execFileAsync("git", ["init"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "test"], { cwd: root });
+    await writeFile(join(root, "README.md"), "base\n", "utf8");
+    await execFileAsync("git", ["add", "README.md"], { cwd: root });
+    await execFileAsync("git", ["commit", "-m", "base"], { cwd: root });
+
+    const script = [
+      "process.stdin.resume();process.stdin.on('end',()=>{",
+      "const fs=require('node:fs'),path=require('node:path');",
+      "const turn=process.env.PI_REVIEW_EXECUTOR_TURN;",
+      "fs.appendFileSync(path.join(process.cwd(),'continued.txt'),`turn-${turn}\\n`);",
+      "console.log(JSON.stringify({type:'session',sessionId:'retry-delay-session'}));",
+      "console.log(JSON.stringify({type:'assistant',text:'completed'}));",
+      "});",
+    ].join("");
+    const config = normalizeConfig({
+      enabled: false,
+      review: { activeReviewers: [] },
+      externalAgents: {
+        "continuable": {
+          adapter: "run-as-binary",
+          command: process.execPath,
+          execution: { protocol: "pi-review-executor-jsonl-v1", args: ["-e", script], timeoutMs: 30000 },
+        },
+      },
+      execution: {
+        retryPolicy: { maxRetries: 1, baseDelayMs: 6, maxDelayMs: 8, jitter: true, maxSameIncidentRepeats: 1 },
+        workerResources: { "default": { selection: { source: "external", id: "continuable" }, maxConcurrent: 1 } },
+        routes: { execute: [{ resourceId: "default" }], research: [] },
+      },
+    });
+    const wave = await executeWave({
+      cwd: root,
+      tasks: [{ title: "continuable", instructions: "write the turn marker", acceptanceCriteria: ["marker exists"] }],
+      config,
+      maxWorkers: 1,
+    });
+    assert.equal(wave.landing?.status, "landed");
+    const inspection = await inspectOperation(wave.taskResults[0]!.bundle!);
+
+    const landingModule = await import("../src/execution/wave-landing");
+    const mutableLandingModule = landingModule as unknown as {
+      planWaveLanding: typeof landingModule.planWaveLanding;
+    };
+    const originalPlanWaveLanding = mutableLandingModule.planWaveLanding;
+    let planAttempts = 0;
+    let countingRetryDraw = false;
+    mutableLandingModule.planWaveLanding = async (...args) => {
+      planAttempts += 1;
+      if (planAttempts === 1) {
+        countingRetryDraw = true;
+        throw new Error("transient landing-plan failure");
+      }
+      countingRetryDraw = false;
+      return originalPlanWaveLanding(...args);
+    };
+
+    const originalRandom = Math.random;
+    const originalSetTimeout = globalThis.setTimeout;
+    let randomDraws = 0;
+    const retryDelays: number[] = [];
+    Math.random = () => {
+      if (countingRetryDraw) randomDraws += 1;
+      return 0.5;
+    };
+    globalThis.setTimeout = ((...args: Parameters<typeof globalThis.setTimeout>) => {
+      if (args[1] === 4) retryDelays.push(args[1]);
+      return originalSetTimeout(...args);
+    }) as typeof globalThis.setTimeout;
+    try {
+      const continued = await continueOperation({
+        bundle: inspection.bundle,
+        instructions: "append the next turn marker",
+        instructionId: "retry-delay-continuation",
+        config,
+      });
+
+      assert.equal(continued.landing?.status, "landed");
+      assert.equal(planAttempts, 2, "the public continuation retries its transient landing-stage failure");
+      assert.equal(randomDraws, 1);
+      assert.deepEqual(retryDelays, [4], "operation retry 1 waits the independently expected 4ms jitter delay");
+      assert.equal(await readFile(join(root, "continued.txt"), "utf8"), "turn-1\nturn-2\n");
+    } finally {
+      Math.random = originalRandom;
+      globalThis.setTimeout = originalSetTimeout;
+      mutableLandingModule.planWaveLanding = originalPlanWaveLanding;
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("reviewed continuation of a -gN original wave lands and keeps its immutable review alias", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "pi-operation-reviewed-")));
   try {

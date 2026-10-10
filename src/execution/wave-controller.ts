@@ -43,6 +43,7 @@ import { ExecutorPoolScheduler, type ExecutorPoolLease } from "./executor-pool";
 import { acquireWaveOwner, heartbeatWaveOwner, releaseWaveOwner } from "./wave-owner";
 import { sourceMutationCoordinator } from "./source-mutation-lease";
 import { validateSafeId } from "./wave-validation";
+import { computeRetryDelay } from "./retry-delay";
 
 // ── public input / result contract ───────────────────────────────────────────
 
@@ -396,8 +397,7 @@ async function retryInfrastructure<T>(
       priorMessage = message;
       if (retries >= policy.maxRetries || repeats > policy.maxSameIncidentRepeats) throw error;
       retries += 1;
-      const ceiling = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** Math.max(0, retries - 1));
-      const delay = policy.jitter ? Math.floor(ceiling * (0.5 + Math.random() * 0.5)) : ceiling;
+      const delay = computeRetryDelay(policy.baseDelayMs, policy.maxDelayMs, policy.jitter, retries);
       if (delay > 0) {
         await new Promise<void>((resolvePromise, reject) => {
           const finish = () => {

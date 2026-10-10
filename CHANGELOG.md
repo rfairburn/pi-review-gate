@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.136]
+
+### Fixed
+
+- Main-focus input no longer reconciles layout or prepares/submits a speculative frame
+  when the child screen is unchanged (#350). Child-output `onChange` updates and host
+  UI, focus, layout, and resize actions remain immediate and are not gated by this
+  check; wheel, keyboard, paste, and click forwarding, ANSI handling, redraw cadence,
+  and backpressure are unchanged. Interactive trackpad scrolling in Ghostty was
+  manually confirmed smooth with this change; this is a single interactive check,
+  not a measured latency result or a guarantee for other terminals or platforms.
+
 ## [0.1.0-dev.135]
 
 ### Changed

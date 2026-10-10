@@ -184,6 +184,7 @@ class FakeSurface {
   cols: number;
   rows: number;
   readonly writesAsFrame: string[];
+  frameCalls = 0;
   modes: TerminalInputModes = {
     kittyFlags: 0,
     modifyOtherKeys: 0,
@@ -201,6 +202,7 @@ class FakeSurface {
   }
 
   frame(): TerminalFrame {
+    this.frameCalls += 1;
     const lines = Array.from({ length: this.rows }, (_, index) => index === 0 ? this.writesAsFrame.join("") : "");
     return {
       cols: this.cols,
@@ -847,6 +849,98 @@ test("a successful New submission activates the created row as the Main input ow
   assert.equal(harness.writer.frames.at(-1)?.frame.cursor.visible, false, "non-alive native frames never retain an owned cursor");
 
   assert.deepEqual(manager.createOptions[1], { workspace: "/another/explicit/workspace" });
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("unchanged Main input forwards every packet without speculative frames; child changes draw the latest surface", async () => {
+  const harness = createHarness();
+  const manager = await ready(harness);
+  fillForm(harness.terminal, "main-input-redraw");
+  await nextTurn();
+  const surface = manager.surface("native-1");
+  assert.ok(surface);
+  surface.modes = { ...surface.modes, mouseTracking: "any", mouseEncoding: "sgr" };
+  manager.notify("native-input-modes");
+  await nextTurn();
+
+  const inputs: ReadonlyArray<readonly [string, string]> = [
+    ["\x1b[<64;35;2M", "\x1b[<64;2;1M"], // wheel up
+    ["\x1b[<64;36;2M", "\x1b[<64;3;1M"], // another wheel packet, a separate turn
+    ["\x1b[<65;35;2M", "\x1b[<65;2;1M"], // reverse wheel direction
+    ["k", "k"],
+    ["\x1b[200~pasted text\x1b[201~", "pasted text"],
+    ["\x1b[<0;35;2M", "\x1b[<0;2;1M"], // click
+  ];
+  const writesBefore = manager.writes.length;
+  const frameCallsBefore = surface.frameCalls;
+  const submissionsBefore = harness.writer.frames.length;
+  const resizesBefore = manager.resizeCalls.length;
+  let forwardedCount = 0;
+  for (const [input, expected] of inputs) {
+    harness.terminal.emitInput(input);
+    forwardedCount += 1;
+    assert.equal(manager.writes.length, writesBefore + forwardedCount, "each packet is forwarded synchronously");
+    assert.equal(manager.writes.at(-1)?.id, "native-1");
+    assert.equal(manager.writes.at(-1)?.data, expected, `forwarded packet ${JSON.stringify(input)}`);
+    await nextTurn(); // prove separate turns do not schedule stale frames
+  }
+  assert.deepEqual(manager.writes.slice(writesBefore).map(({ id, data }) => [id, data]),
+    inputs.map(([, expected]) => ["native-1", expected]), "all packets retain their original order");
+  assert.equal(manager.writes.length, writesBefore + inputs.length, "no packet is dropped or coalesced");
+  assert.equal(surface.frameCalls, frameCallsBefore, "unchanged native state is never extracted for plain Main input");
+  assert.equal(harness.writer.frames.length, submissionsBefore, "plain Main input submits no speculative host frame");
+  assert.equal(manager.resizeCalls.length, resizesBefore, "plain Main input never reconciles or resizes layout");
+
+  surface.writesAsFrame.splice(0, surface.writesAsFrame.length, "latest native output");
+  manager.notify("native-output-changed");
+  await nextTurn();
+  assert.equal(surface.frameCalls, frameCallsBefore + 1, "the authoritative child change extracts one fresh native frame");
+  assert.equal(harness.writer.frames.length, submissionsBefore + 1);
+  assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("latest native output"),
+    "the next composed frame contains the latest parsed child state");
+  assert.equal(manager.resizeCalls.length, resizesBefore);
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("pending Main input stays draw-free until focus or resize changes the host presentation", async () => {
+  const harness = createHarness();
+  const manager = await ready(harness);
+  fillForm(harness.terminal, "main-input-boundaries");
+  await nextTurn();
+  const surface = manager.surface("native-1");
+  assert.ok(surface);
+  surface.modes = { ...surface.modes, mouseTracking: "any", mouseEncoding: "sgr" };
+  manager.notify("native-input-modes");
+  await nextTurn();
+
+  const baselineFrames = harness.writer.frames.length;
+  const baselineResizes = manager.resizeCalls.length;
+  harness.terminal.emitInput("pending Main input");
+  harness.terminal.emitInput(ALT_LEFT); // Main -> sidebar focus still updates owned mouse modes and redraws
+  await nextTurn();
+  assert.equal(harness.writer.frames.length, baselineFrames + 1,
+    "the actual focus change draws once rather than first submitting a stale input-triggered frame");
+  assert.equal(manager.resizeCalls.length, baselineResizes, "focus-only changes preserve child geometry");
+  assert.deepEqual(harness.terminal.writes.slice(-2), ["\x1b[?1003l", "\x1b[?1006l"],
+    "focus change synchronously disables only the mouse modes Main enabled");
+
+  const beforeHideFrames = harness.writer.frames.length;
+  harness.terminal.emitInput(ALT_LEFT); // hide the sidebar and return to Main
+  await nextTurn();
+  assert.equal(harness.writer.frames.length, beforeHideFrames + 1, "a deliberate toggle still produces a complete frame");
+  assert.equal(manager.resizeCalls.length, baselineResizes + 1, "visibility still resizes the native child layout");
+
+  const beforeResizeFrames = harness.writer.frames.length;
+  const beforeResizeCalls = manager.resizeCalls.length;
+  const beforeInvalidations = harness.writer.invalidateCalls;
+  harness.terminal.emitInput("input before outer resize");
+  harness.terminal.setSize(70, 24);
+  await nextTurn();
+  assert.equal(harness.writer.frames.length, beforeResizeFrames + 1, "the resize boundary submits one full redraw");
+  assert.equal(manager.resizeCalls.length, beforeResizeCalls + 1, "the real resize still propagates changed native geometry");
+  assert.equal(harness.writer.invalidateCalls, beforeInvalidations + 1, "the resize still invalidates the writer baseline");
+  const resizedFrame = harness.writer.frames.at(-1);
+  assert.deepEqual({ cols: resizedFrame?.cols, rows: resizedFrame?.rows }, { cols: 70, rows: 24 });
   assert.equal(await closeWithSignal(harness), 0);
 });
 

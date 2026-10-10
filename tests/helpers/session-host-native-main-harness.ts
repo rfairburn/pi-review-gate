@@ -57,11 +57,14 @@ import {
   frameHeader,
   frameHeaderMatches,
   isSidebarFocusedFrame,
+  nextRosterNavigationTarget,
   parseRosterFrame,
+  rosterNavigationTargets as parseRosterNavigationTargets,
   renderedTitleMatches,
   selectedRosterEntry,
   sidebarPaneLines,
   sidebarRosterHidden,
+  type RosterNavigationTarget,
 } from "./session-host-native-roster-witness";
 
 export const TEST_TIMEOUT_MS = 8 * 60_000;
@@ -1998,24 +2001,42 @@ export class MainPtyDriver {
     return selected.label === label;
   }
 
+  private rosterNavigationTargets(text: string): readonly RosterNavigationTarget[] | undefined {
+    return parseRosterNavigationTargets(
+      parseRosterFrame(text, this.sidebarColumnCount()),
+      this.sessions(),
+    );
+  }
+
+  private rosterTargetSelectedAt(text: string, target: RosterNavigationTarget): boolean {
+    const selected = selectedRosterEntry(text, this.sidebarColumnCount());
+    return selected !== undefined && selected.position === target.position
+      && this.rosterTargetSelected(text, target.label);
+  }
+
   async moveRosterTo(label: string, maximumDowns = 5, timeoutMs = EVENT_TIMEOUT_MS): Promise<void> {
     if (this.rosterTargetSelected(this.currentText(), label)) {
       this.rememberSelectedTarget(label);
       return;
     }
     this.selectedNativeTarget = undefined;
-    const labels = this.sessions().map((session) => session.rowProbe)
-      .concat(["Saved conversations", "New session", "Quit host"]);
     if (this.rosterSelectionClearedByRemoval) {
-      assert.equal(this.rosterIsComplete(this.currentText()), true,
+      const beforeText = this.currentText();
+      assert.equal(this.rosterIsComplete(beforeText), true,
         "a fully drawn roster is observed before the cleared highlight is trusted");
-      assert.equal(this.selectedCardTitle(this.currentText()), undefined,
+      assert.equal(this.selectedCardTitle(beforeText), undefined,
         "confirmed selected-row removal leaves the host highlight empty instead of selecting a sibling");
-      const activeHeader = this.currentText().split("\n")[0];
+      const firstTarget = this.rosterNavigationTargets(beforeText)?.[0];
+      assert.ok(firstTarget, "the cleared highlight is followed by the first actual complete roster entry");
+      const activeHeader = beforeText.split("\n")[0];
       const beforeHighlight = this.frameRevision;
       this.pty.write(KEYS.down); // Explicit UI navigation only, never activation.
-      await this.waitFrame((text) => this.rosterTargetSelected(text, labels[0]!)
-        && text.split("\n")[0] === activeHeader,
+      await this.waitFrame((text) => {
+        const first = this.rosterNavigationTargets(text)?.find((target) =>
+          target.position === firstTarget.position && target.label === firstTarget.label);
+        return first !== undefined && this.rosterTargetSelectedAt(text, first)
+          && text.split("\n")[0] === activeHeader;
+      },
       "explicit Down establishes the first actual roster highlight without transferring Main ownership", beforeHighlight, timeoutMs);
       this.rosterSelectionClearedByRemoval = false;
       if (this.rosterTargetSelected(this.currentText(), label)) {
@@ -2025,18 +2046,29 @@ export class MainPtyDriver {
     }
     for (let count = 0; count < maximumDowns; count += 1) {
       // Observe an actual known row before authorizing any navigation key.
-      await this.waitFrame((text) => labels.some((candidate) => this.rosterTargetSelected(text, candidate)),
+      await this.waitFrame((text) => this.rosterNavigationTargets(text)
+        ?.some((target) => this.rosterTargetSelectedAt(text, target)) ?? false,
         "the current owned roster finishes painting its actual highlighted row before navigation", -1, timeoutMs);
-      const selectedIndex = labels.findIndex((candidate) => this.rosterTargetSelected(this.currentText(), candidate));
-      assert.ok(selectedIndex >= 0,
-        `the owned roster has an observed highlighted row before navigation\nActual owned Main frame:\n${this.currentText()}`);
-      const nextLabel = labels[(selectedIndex + 1) % labels.length]!;
+      const currentText = this.currentText();
+      const targets = this.rosterNavigationTargets(currentText);
+      const selected = selectedRosterEntry(currentText, this.sidebarColumnCount());
+      const selectedTarget = selected === undefined ? undefined
+        : targets?.find((target) => target.position === selected.position);
+      assert.ok(targets !== undefined && selected !== undefined && selectedTarget !== undefined
+        && this.rosterTargetSelectedAt(currentText, selectedTarget),
+      `the owned roster has an observed highlighted row before navigation\nActual owned Main frame:\n${this.currentText()}`);
+      const nextTarget = nextRosterNavigationTarget(targets, selected.position);
+      assert.ok(nextTarget, "the current complete roster has an actual next entry after its highlight");
       const after = this.frameRevision;
       this.pty.write(KEYS.down);
       // Native output and status can repaint before this key changes the roster.
       // Wait for the actual next highlight, not merely any parsed frame.
-      await this.waitFrame((text) => this.rosterTargetSelected(text, nextLabel),
-        `sidebar advances to ${nextLabel} toward ${label}`, after, timeoutMs);
+      await this.waitFrame((text) => {
+        const currentTarget = this.rosterNavigationTargets(text)?.find((target) =>
+          target.position === nextTarget.position && target.label === nextTarget.label);
+        return currentTarget !== undefined && this.rosterTargetSelectedAt(text, currentTarget);
+      },
+      `sidebar advances to ${nextTarget.label} toward ${label}`, after, timeoutMs);
       if (this.rosterTargetSelected(this.currentText(), label)) {
         this.rememberSelectedTarget(label);
         return;

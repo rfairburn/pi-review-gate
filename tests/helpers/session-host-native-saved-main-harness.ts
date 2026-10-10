@@ -335,7 +335,8 @@ function workspaceFieldValue(text: string): string | undefined {
  * Actual native/action entries from the rendered sidebar roster only. Each
  * native entry correlates its complete title-only card (3 collapsed or 5
  * expanded rows: title, marker/status, background, optional activity) with the
- * ordered three-action tail; captions elsewhere are never entries.
+ * ordered required actions and optional final Host shortcuts row; captions
+ * elsewhere are never entries.
  */
 export function rosterEntries(text: string): RosterEntry[] {
   return [...parseRosterFrame(text, SIDEBAR_COLS).entries];

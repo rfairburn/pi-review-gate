@@ -239,6 +239,68 @@ test("constructor opens a usable visible welcome picker", () => {
   assert.deepEqual(harness.actions.filter((action) => action.type === "forward"), []);
 });
 
+test("draw-derived roster mouse activation targets only current complete entry regions", () => {
+  const harness = makeRoster(["a", "b"]);
+  const view = rosterView(harness.controller, 40, 30);
+  const rowA = view.texts.findIndex((line) => line.trim() === "label-a");
+  assert.ok(rowA > 0, "the first card was drawn below the header");
+  assert.equal(harness.controller.activateRosterAt(0, rowA, 40, 30), true);
+  assert.equal(harness.controller.focus, "main");
+  assert.equal(harness.controller.selectedId, "a");
+  assert.deepEqual(harness.focusedActions(), [{ type: "select", id: "a" }]);
+
+  const offTarget = makeRoster(["a"]);
+  const rows = rosterView(offTarget.controller, 40, 20).texts;
+  const newRow = rows.findIndex((line) => line.includes("New session"));
+  const savedRow = rows.findIndex((line) => line.includes("Saved conversations"));
+  assert.equal(offTarget.controller.activateRosterAt(0, 0, 40, 20), false, "the header is not an entry");
+  assert.equal(offTarget.controller.activateRosterAt(40, newRow, 40, 20), false, "the right pane edge is exclusive");
+  assert.equal(offTarget.controller.activateRosterAt(0, rows.length - 1, 40, 20), false, "footer hints are not entries");
+  assert.equal(offTarget.controller.activateRosterAt(0, savedRow, 40, 20), true, "Saved uses its existing open action");
+  assert.equal(offTarget.controller.focus, "form");
+  assert.equal(offTarget.focusedActions().at(-1)?.type, "saved-list");
+
+  const stale = makeRoster(["a", "b"]);
+  const staleView = rosterView(stale.controller, 40, 30).texts;
+  const staleRow = staleView.findIndex((line) => line.trim() === "label-a");
+  stale.controller.updateItems([makeItem({ id: "b" }), makeItem({ id: "a" })]);
+  assert.equal(stale.controller.activateRosterAt(0, staleRow, 40, 30), false,
+    "an item update/reorder invalidates the exact entries captured by the old draw");
+  assert.deepEqual(stale.focusedActions(), []);
+
+  const clipped = makeRoster(["a", "b", "c"]);
+  const clippedView = rosterView(clipped.controller, 40, 10).texts;
+  assert.ok(!clippedView.some((line) => line.includes("label-a")), "the scrolled card is not drawn");
+  const quitRow = clippedView.findIndex((line) => line.includes("Quit host"));
+  const blankRow = clippedView.findIndex((line, index) => index > quitRow && line.trim() === "");
+  assert.ok(blankRow > quitRow, "the remaining list space is blank, not an entry");
+  assert.equal(clipped.controller.activateRosterAt(0, blankRow, 40, 10), false,
+    "undrawn/clipped entries and blank rows have no hit region");
+
+  const tiny = makeRoster(["a"]);
+  const tinyView = rosterView(tiny.controller, 40, 3).texts;
+  assert.ok(tinyView.some((line) => line.includes("too small")));
+  assert.equal(tiny.controller.activateRosterAt(0, 1, 40, 3), false, "too-small fallback exposes no hit regions");
+  tiny.send(ALT_LEFT_LEGACY);
+  assert.equal(tiny.controller.activateRosterAt(0, 1, 40, 30), false, "hidden roster regions are forgotten");
+});
+
+test("draw-derived action-row mouse activation reuses New and Quit behavior", () => {
+  const newAction = makeRoster([]);
+  const newRows = rosterView(newAction.controller, 40, 20).texts;
+  const newRow = newRows.findIndex((line) => line.includes("New session"));
+  assert.equal(newAction.controller.activateRosterAt(0, newRow, 40, 20), true);
+  assert.equal(newAction.controller.focus, "form");
+  assert.deepEqual(newAction.focusedActions(), [], "opening the existing New form does not submit a create");
+
+  const quitAction = makeRoster(["live"]);
+  const quitRows = rosterView(quitAction.controller, 40, 30).texts;
+  const quitRow = quitRows.findIndex((line) => line.includes("Quit host"));
+  assert.equal(quitAction.controller.activateRosterAt(0, quitRow, 40, 30), true);
+  assert.equal(quitAction.controller.focus, "confirm", "live rows keep the existing Quit confirmation");
+  assert.deepEqual(quitAction.focusedActions(), []);
+});
+
 test("initialVisible is honored in both directions", () => {
   const hidden = makeController({ initialVisible: false });
   assert.equal(hidden.controller.visible, false);
@@ -2647,6 +2709,38 @@ test("saved picker lists, highlights without acting, and opens a deliberate save
   assert.equal(harness.controller.focus, "main", "the restored row becomes the active Main owner");
   assert.equal(harness.controller.selectedId, "new-row", "the restored row is highlighted as the active owner");
   assert.deepEqual(harness.focusedActions().at(-1), { type: "select", id: "new-row" });
+});
+
+test("saved mouse activation is draw-derived and retains pending-open duplicate guards", () => {
+  const harness = savedPaneWith();
+  const list = harness.actions.at(-1);
+  assert.ok(list?.type === "saved-list");
+  harness.controller.completeSavedList(list!.requestId, [...SAVED_ROWS], 0);
+  const rows = savedView(harness, 40, 10);
+  const firstRow = rows.findIndex((line) => line.includes("First conversation"));
+  assert.ok(firstRow > 0);
+  assert.equal(harness.controller.activateSavedAt(0, 0, 40, 10), false, "the saved header is not clickable");
+  assert.equal(harness.controller.activateSavedAt(0, 7, 40, 10), false, "fixed details/footer rows are not entries");
+  assert.equal(harness.controller.activateSavedAt(0, firstRow, 40, 10), true);
+  assert.equal(harness.focusedActions().length, 1);
+  assert.deepEqual(harness.focusedActions()[0], {
+    type: "saved-open", requestId: list!.requestId + 1, file: SAVED_ROWS[0].file, sessionId: "conv-1",
+  });
+  assert.equal(harness.controller.activateSavedAt(0, firstRow, 40, 10), true,
+    "a repeated click reaches the existing pending-open guard");
+  assert.equal(harness.focusedActions().length, 1, "the click does not emit duplicate saved-open actions");
+  assert.ok(savedView(harness, 40, 10).join(" ").replace(/\s+/g, " ").includes("A saved conversation is already starting"));
+
+  const stale = savedPaneWith();
+  const staleList = stale.actions.at(-1)!;
+  assert.equal(staleList.type, "saved-list");
+  stale.controller.completeSavedList(staleList.requestId, [...SAVED_ROWS], 0);
+  const staleRows = savedView(stale, 40, 10);
+  const staleFirst = staleRows.findIndex((line) => line.includes("First conversation"));
+  stale.send(ESC); // dismissal invalidates the render-derived saved row map
+  assert.equal(stale.controller.activateSavedAt(0, staleFirst, 40, 10), false,
+    "a dismissed/stale render cannot authorize a row click");
+  assert.deepEqual(stale.focusedActions(), []);
 });
 
 test("saved picker fencing: stale listings and late completions never seize the pane", () => {

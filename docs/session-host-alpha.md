@@ -19,7 +19,8 @@ scope is not evidence that end-to-end runtime compatibility has been proven. Win
 startup, public named-pipe, and pinned node-pty ConPTY source paths are experimental
 only; they are not Windows runtime support or readiness evidence. Manual Windows
 validation has observed mouse clicks working, but that observation does not certify
-other physical input or complete host-process shutdown (see below).
+sidebar single-click activation, other physical input, or complete host-process shutdown
+(see below).
 Device-attributes negotiation also requires complete runtime acceptance; its narrow
 witness investigation is tracked in
 https://github.com/rfairburn/pi-review-gate/issues/337 under the broader #334
@@ -40,7 +41,9 @@ selection behavior. Manual Windows validation has observed mouse clicks working,
 that observation is limited to clicks: wheel/conversation scrolling and
 pane-confined selection still require interactive validation, rather than
 editor-history navigation or selection crossing host panes. Sidebar single-click
-activation and scroll-smoothness tuning remain separate work. A cosmetic child-pane
+activation is described below, but this does not certify Windows runtime behavior
+(#323, #345). Conversation wheel/trackpad scrolling remains outside this change and
+separate under #332; scroll-smoothness tuning remains separate work. A cosmetic child-pane
 flicker on pointer movement and clicks has been observed; it is not breakage and not
 a release blocker (#343). Native Pi/review-gate startup latency on Windows has been
 present since before this release and is unrelated to it (#344).
@@ -227,7 +230,10 @@ models, keybindings, extensions, MCP configuration, skills, and provider environ
 The host does not clone those files, republish skills, create per-window credentials, or
 require a separate login. It does not attach to existing or detached processes, adopt
 them, or reparent work. Moving the sidebar highlight does not change the active
-session; press Enter to activate a row. A successful New submission or saved-conversation
+session. A single left-click on a displayed instance card invokes that row's existing
+Enter action: activating a live row makes it the active Main input owner and focuses
+Main, while sibling sessions continue running; exited and error rows retain their
+existing Enter behavior and guards. A successful New submission or saved-conversation
 open activates the created or restored child directly, without a second row Enter.
 Enter on an exited row instead starts a new
 owned process for its current observed conversation, using a freshly revalidated saved
@@ -257,12 +263,16 @@ workspace with an exact per-child `--session` admission; it never adopts an exte
 process or attaches a child to another live conversation. A conversation already open in
 this host is refused while its row is live or its creation is pending, and can be opened
 again after that child has confirmed exit. The picker shows truthful loading, empty,
-unavailable, and partial issue-count notices; Up/Down moves the highlight, Enter opens
-the highlighted conversation only when that row was fully drawn by the last picker
-render (a too-small fallback or an undrawn/hidden row is refused), and Escape returns
-to the roster without pausing or stopping anything. A successful open makes the restored
-child the active Main input owner without a second Enter, with the pane still visible. A late listing or creation result never takes over a later-opened or
-dismissed pane.
+unavailable, and partial issue-count notices; Up/Down moves the highlight. Enter opens
+the highlighted conversation, and a single left-click opens the clicked conversation,
+only when that row belongs to the last emitted picker frame (a too-small fallback or an
+undrawn/hidden row is refused). A queued redraw cannot authorize a newly mapped row:
+click activation is refused while its changed hit targets are awaiting output.
+A click uses the same exact-entry revalidation, admission, duplicate-open, and lifecycle
+guards as Enter. Escape returns to the roster without pausing or stopping anything. A
+successful open makes the restored child the active Main input owner and focuses Main
+without a second Enter, with the pane still visible. A late listing or creation result
+never takes over a later-opened or dismissed pane.
 
 The native review-gate configuration is initialized with the ordinary zero-model
 default only when no native/explicit configuration exists. Existing configuration bytes
@@ -279,7 +289,11 @@ and delegated-execution policies still apply to native activity.
 
 Host keyboard controls apply only while the corresponding host surface has focus. In
 the sidebar, Up/Down moves the selection, Enter opens the selected session or activates
-the New session/Quit host row, `d`/`D` or Delete stops/removes precisely the selected
+an existing action entry. A single left-click on a displayed New, Saved, or Quit action
+entry invokes that same existing action: New still opens its form, Saved its picker, and
+Quit follows its existing confirmation rules. These sidebar clicks are handled by the
+host, not forwarded to a native child; existing keyboard controls remain available.
+The `d`/`D` or Delete keys stop/remove precisely the selected
 fully displayed row (`x` is the Delete fallback when Delete is configured as the sidebar
 toggle), `q`/`Q` activates Quit host,
 Alt+Right returns input focus to the existing Main owner without activating the
@@ -428,15 +442,15 @@ plus a usable pane, that pane shows a truthful too-small message rather than
 half-hints. Very small terminals show bounded text, not a promise that every native
 Pi menu will remain readable.
 
-The intended mouse path is cell-based and applies only to the active native frame;
+The native Main mouse path is cell-based and applies only to the active native frame;
 events outside that frame are dropped before coordinate translation, never clamped to
-the pane edge. On Windows, bundled-ConPTY protocol observations do not certify
-physical mouse behavior: manual validation has observed clicks working, but
-pane-confined selection and native conversation wheel scrolling still require
-interactive validation, as described in the Windows runtime limitation above.
-Pixel-coordinate mouse reporting and
-terminal-focus forwarding are not supported, and the alpha makes no promise of mouse
-controls for the host sidebar. Keyboard negotiation is designed around independent
+the pane edge. Sidebar-target clicks are handled by the host and are not forwarded to a
+native child. This does not add conversation wheel/trackpad scrolling (#332). On
+Windows, bundled-ConPTY protocol observations do not certify physical mouse behavior:
+manual validation has observed clicks working, but pane-confined selection and native
+conversation wheel scrolling still require interactive validation, as described in the
+Windows runtime limitation above. Pixel-coordinate mouse reporting and terminal-focus
+forwarding are not supported. Keyboard negotiation is designed around independent
 Kitty keyboard flags 1, 2, and 4, preserves modified Enter through Pi's
 `modifyOtherKeys` fallback, and drops key-release events when the child has no event
 reporting support. These input paths are still being integrated and verified; do not

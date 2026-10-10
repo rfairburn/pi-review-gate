@@ -433,6 +433,7 @@ async function runSettingsMenu(
     // staged state, but the key never changes (issue #140).
     let choice: string | undefined = await retainedSelect(input.ui, {
       title: "Review settings",
+      cancelHint: "apply for session",
       rows: [
         ...rootSections.map((section, index) => ({ key: section.key, label: renderedRootRows[index]! })),
         { key: "save", label: "Save changes" },

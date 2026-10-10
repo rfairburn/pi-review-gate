@@ -117,11 +117,13 @@ const down = (n: number): string[] => Array.from({ length: n }, () => KEY_DOWN);
 test("root Ctrl+S persists the staged settings through the same Save path", async (t) => {
   const h = await hotkeyWorkspace({ enabled: false, review: { primaryReviewers: [], subtaskReviewers: [] } });
   t.after(() => h.cleanup());
-  await h.run("review-settings", [
+  const rendered = await h.run("review-settings", [
     [...down(12), KEY_ENTER], // root → Subtask notifications
     [KEY_DOWN, KEY_ENTER], // Quiet → Noisy
     [CTRL_S], // root re-show: request save
   ]);
+  assert.ok(rendered.frames[0]!.some((line) => line.includes("apply for session")), "root Escape hint must describe apply, not discard");
+  assert.ok(rendered.frames[1]!.some((line) => line.includes("cancel")), "nested picker cancellation hint stays unchanged");
   assertNoErrors(h);
   assert.ok(h.notices.some((n) => n.type === "info" && n.message === "Review settings saved."));
   assert.equal(h.saved.length, 1, "onSaved fires exactly once for the hotkey save");

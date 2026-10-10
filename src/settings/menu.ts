@@ -64,6 +64,8 @@ export interface RetainedSelectInput {
   rows: readonly RetainedRow[];
   /** Row to highlight when re-shown; ignored when absent from `rows`. */
   initialKey?: string;
+  /** Caller-owned meaning of the native cancel key (root Escape applies). */
+  cancelHint?: string;
 }
 
 /** Per-root-transaction save signal shared by settings menus and hotkeys. */
@@ -324,7 +326,7 @@ function customSelect(ui: RetainedUi, host: MenuTuiHost, input: RetainedSelectIn
     const saveHintAvailable = ui.saveControl !== undefined
       && ui.saveControl.suspended === 0
       && host.matchesCtrlS !== undefined;
-    container.addChild(new host.Text(hintText(host, saveHintAvailable), 1, 0));
+    container.addChild(new host.Text(hintText(host, saveHintAvailable, input.cancelHint), 1, 0));
     if (host.DynamicBorder) container.addChild(new host.DynamicBorder(borderColor(theme)));
 
     return {
@@ -403,18 +405,18 @@ function selectListTheme(host: MenuTuiHost, theme: MenuTheme): MenuSelectListThe
   };
 }
 
-function hintText(host: MenuTuiHost, saveHintAvailable: boolean): string {
+function hintText(host: MenuTuiHost, saveHintAvailable: boolean, cancelHint = "cancel"): string {
   let hints: string;
   try {
     if (typeof host.rawKeyHint === "function" && typeof host.keyHint === "function") {
       // The host's live keybinding text, so user keybindings.json overrides
       // are honored instead of hard-coded keys.
-      hints = `${host.rawKeyHint("↑↓", "navigate")}  ${host.keyHint("tui.select.confirm", "select")}  ${host.keyHint("tui.select.cancel", "cancel")}`;
+      hints = `${host.rawKeyHint("↑↓", "navigate")}  ${host.keyHint("tui.select.confirm", "select")}  ${host.keyHint("tui.select.cancel", cancelHint)}`;
     } else {
-      hints = "↑↓ navigate · enter select · esc cancel";
+      hints = `↑↓ navigate · enter select · esc ${cancelHint}`;
     }
   } catch {
-    hints = "↑↓ navigate · enter select · esc cancel";
+    hints = `↑↓ navigate · enter select · esc ${cancelHint}`;
   }
   return saveHintAvailable ? `${hints} · Ctrl+S save` : hints;
 }

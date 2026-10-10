@@ -137,7 +137,8 @@ scripts\pi-review-gate.cmd
 
 An optional, separate session-host alpha can run multiple independent native Pi sessions
 in one terminal on macOS/Linux. It does not replace either launcher; see the
-[session-host alpha guide](docs/session-host-alpha.md) for requirements and limitations.
+[session-host alpha guide](docs/session-host-alpha.md) for requirements, limitations,
+and the host-only shortcut configuration/editor.
 Launch it with the one-command entry points. They retain a supported Node on PATH or
 bootstrap the source-pinned official Node.js 22.19.0 archive into a fresh extraction
 under an isolated per-agent cache when Node is missing or too old (macOS/Linux x64 or

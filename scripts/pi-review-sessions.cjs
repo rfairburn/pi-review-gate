@@ -64,8 +64,8 @@ manual Pi CLI path is needed. Starts an empty welcome/sidebar picker; choose
 a workspace explicitly in the UI.
 The startup working directory is not selected as a workspace.
 Basic controls only; terminal graphics rendering is disabled.
-Native image/model input behavior stays native. The sidebar toggle defaults
-to alt+left. Parent startup session overrides
+Native image/model input behavior stays native. Host toggle/roster-return shortcuts default
+to alt+left/alt+right and can be configured in session-host/keybindings.json. Parent startup session overrides
 (--continue/-c, --resume/-r, --session, --session-id, --fork, --session-dir,
 --no-session, PI_CODING_AGENT_SESSION_DIR) are not accepted: every instance
 starts a new native conversation using Pi's normal session storage.`;
@@ -125,6 +125,38 @@ let activeBoundedProcessCount = 0;
 
 class SessionHostArgumentError extends Error {}
 class PiRuntimeError extends Error {}
+
+function canonicalSessionHostShortcut(value) {
+  const symbols = new Set(["`", "-", "=", "[", "]", "\\", ";", "'", ",", ".", "/", "!", "@", "#", "$", "%", "^", "&", "*", "(", ")", "_", "|", "~", "{", "}", ":", "<", ">", "?"]);
+  const navigation = new Set(["up", "down", "left", "right", "home", "end", "pageup", "pagedown"]);
+  const modifierOrder = ["ctrl", "shift", "alt", "super"];
+  const fail = () => { throw new SessionHostArgumentError("Invalid value for --sidebar-key."); };
+  if (typeof value !== "string" || value.length === 0 || value.length > MAX_TOGGLE_KEY_LENGTH
+    || /[\u0000-\u001f\u007f-\u009f\s]/u.test(value)) fail();
+  const parts = value.toLowerCase().split("+");
+  const base = parts.at(-1);
+  const modifiers = parts.slice(0, -1);
+  if (!base || modifiers.some((modifier) => !modifierOrder.includes(modifier))
+    || new Set(modifiers).size !== modifiers.length) fail();
+  if (base === "escape" || base === "esc" || (base === "[" && modifiers.includes("ctrl"))
+    || (base === "c" && modifiers.length === 1 && modifiers[0] === "ctrl")
+     || ((base === "m" || base === "j") && modifiers.length === 1 && modifiers[0] === "ctrl")
+    || (base === "q" && (modifiers.length === 0 || (modifiers.length === 1 && modifiers[0] === "shift")))) fail();
+  if (/^f(?:1[0-2]|[1-9])$/u.test(base)) {
+    if (modifiers.length !== 0) fail();
+    return base;
+  }
+  const printable = /^[a-z0-9]$/u.test(base) || symbols.has(base);
+  if (printable) {
+    if (!modifiers.some((modifier) => modifier !== "shift")) fail();
+  } else if (navigation.has(base)) {
+    if (modifiers.length === 0) fail();
+  } else {
+    fail();
+  }
+  const canonicalBase = base === "pageup" ? "pageUp" : base === "pagedown" ? "pageDown" : base;
+  return [...modifierOrder.filter((modifier) => modifiers.includes(modifier)), canonicalBase].join("+");
+}
 
 /** Parse only wrapper-owned options; every byte after `--` belongs to Pi. */
 function parseSessionHostArguments(argv) {
@@ -193,7 +225,7 @@ function parseSessionHostArguments(argv) {
     }
     if (canonical === "pi-executable") piExecutable = value;
     else if (canonical === "state-root") stateRoot = value;
-    else toggleKey = value;
+    else toggleKey = canonicalSessionHostShortcut(value);
   }
 
   const result = { help };

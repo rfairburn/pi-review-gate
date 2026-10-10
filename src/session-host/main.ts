@@ -30,6 +30,18 @@ import { resolveNativePi, RUNTIME_ROLE_ENV, EXECUTOR_TOOL_CATALOG_ENV, snapshotN
 import { NativeAgentRegistry, type ProfilePreparer } from "./profiles";
 import { isValidNativeSessionId, type SessionSpawnInput, type SessionSpawnOutcome } from "./protocol";
 import {
+  assertHostShortcutsDistinct,
+  DEFAULT_HOST_SHORTCUTS,
+  normalizeHostShortcutBindings,
+  normalizeHostShortcutKey,
+  type HostShortcutBindings,
+} from "./host-shortcuts";
+import {
+  readHostShortcutConfig,
+  writeHostShortcutConfig,
+  type HostShortcutConfigReadResult,
+} from "./host-shortcuts-store";
+import {
   MAX_ROSTER_ENTRIES,
   ROSTER_STORE_VERSION,
   isValidRosterName,
@@ -184,6 +196,12 @@ interface MainDependencies {
    * is ever touched.
    */
   readonly openHostState: (options: { agentDir: string; hostId: string }) => HostStateOpenResult;
+  readonly readHostShortcutConfig: (agentDir: string) => HostShortcutConfigReadResult;
+  readonly writeHostShortcutConfig: (
+    agentDir: string,
+    bindings: HostShortcutBindings,
+    legacyToggleOverride?: string,
+  ) => HostShortcutBindings;
   readonly createTerminal: () => MainTerminal;
   readonly createObserver: (options: ConstructorParameters<typeof KeyboardCapabilityObserver>[0]) => MainObserver;
   readonly createWriter: (output: Writable, options: Parameters<typeof createSessionHostFrameWriter>[1]) => MainWriter;
@@ -216,6 +234,8 @@ class MainFailure extends Error {
     super(phase);
   }
 }
+
+class HostShortcutStartupFailure extends Error {}
 
 type RowResumeReadiness = "ready" | "pending" | "failed";
 
@@ -302,6 +322,7 @@ function assertStartupOptions(snapshot: HostSnapshot): string {
   }
   try {
     (assertOptions as (args: readonly string[], env: NodeJS.ProcessEnv) => void)(snapshot.args, snapshot.env);
+    if (snapshot.toggleKey !== undefined) normalizeHostShortcutKey(snapshot.toggleKey, "toggle");
   } catch {
     // The shared helper's message is already bounded, but keep Main's
     // diagnostics fixed as a defense against unexpected helper failures.
@@ -474,6 +495,8 @@ function productionDependencies(): MainDependencies {
     createSidebar: (options) => new SidebarController(options),
     listSavedCatalog: listSavedSessions,
     openHostState: openProductionHostState,
+    readHostShortcutConfig,
+    writeHostShortcutConfig,
     createTerminal: () => new ProcessTerminal(),
     createObserver: (options) => new KeyboardCapabilityObserver(options),
     createWriter: (output, options) => createSessionHostFrameWriter(output, options),
@@ -536,6 +559,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let shutdownRequested = false;
   let runtimeFailure = false;
   let cleanupFailure = false;
+  let shortcutStartupDiagnosticReported = false;
+  let configuredHostShortcuts: HostShortcutBindings = DEFAULT_HOST_SHORTCUTS;
+  let effectiveHostShortcuts: HostShortcutBindings = DEFAULT_HOST_SHORTCUTS;
+  let hostShortcutAgentDir: string | undefined;
+  const legacyToggleOverride = snapshot.toggleKey !== undefined;
   let activeId: string | undefined;
   let views: NativeInstanceView[] = [];
   // Successful removals are terminal for this host id. A delayed roster
@@ -2177,6 +2205,40 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         }
         return;
       }
+      case "host-shortcuts-save": {
+        if (!sidebar) return;
+        if (hostShortcutAgentDir === undefined) {
+          sidebar.failHostShortcutSave(action.requestId, "The native Pi agent directory is unavailable; settings were not saved");
+          scheduleRedraw();
+          return;
+        }
+        try {
+          const proposed = normalizeHostShortcutBindings(action.bindings);
+          const effectiveToggle = legacyToggleOverride ? effectiveHostShortcuts.toggle : proposed.toggle;
+          assertHostShortcutsDistinct(effectiveToggle, proposed.returnToMain);
+          const saved = dependencies.writeHostShortcutConfig(
+            hostShortcutAgentDir,
+            proposed,
+            legacyToggleOverride ? effectiveToggle : undefined,
+          );
+          const effective = {
+            toggle: legacyToggleOverride ? effectiveToggle : saved.toggle,
+            returnToMain: saved.returnToMain,
+          };
+          assertHostShortcutsDistinct(effective.toggle, effective.returnToMain);
+          configuredHostShortcuts = saved;
+          effectiveHostShortcuts = effective;
+          sidebar.completeHostShortcutSave(action.requestId, saved);
+          reconcileLayout(true);
+          scheduleRedraw();
+        } catch (error) {
+          sidebar.failHostShortcutSave(action.requestId, error instanceof Error
+            ? error.message
+            : "Host shortcut settings could not be saved; previous bindings remain active");
+          scheduleRedraw();
+        }
+        return;
+      }
       case "saved-open": {
         if (!manager || !sidebar) return;
         if (negotiationReady) launchSavedOpen(action.requestId, action.file, action.sessionId);
@@ -2373,7 +2435,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           safeReport(dependencies, ROSTER_RETAINED_MESSAGE);
         }
       }
-      if (failed) {
+      if (failed && !shortcutStartupDiagnosticReported) {
         const details = forcedCount > 0 || remainingCount > 0
           ? `Session host shutdown: ${forcedCount} owned process(es) required forced termination; ${remainingCount} remain unconfirmed.`
           : GENERIC_FAILURE_MESSAGE;
@@ -2384,7 +2446,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       // A final controller-level guard: no rejected teardown promise escapes.
       cleanupFailure = true;
       removeOuterListeners();
-      safeReport(dependencies, GENERIC_FAILURE_MESSAGE);
+      if (!shortcutStartupDiagnosticReported) safeReport(dependencies, GENERIC_FAILURE_MESSAGE);
       finishRun(1);
     });
   }
@@ -2436,6 +2498,32 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const initialCols = clampDimension(terminal.columns, 80);
     const initialRows = clampDimension(terminal.rows, 24);
     sessionSetup = dependencies.createSessionSetup({ env: snapshot.env });
+    if (typeof sessionSetup.nativeAgentDir === "string" && sessionSetup.nativeAgentDir !== "") {
+      hostShortcutAgentDir = sessionSetup.nativeAgentDir;
+      let readResult: HostShortcutConfigReadResult;
+      try {
+        readResult = dependencies.readHostShortcutConfig(hostShortcutAgentDir);
+      } catch {
+        throw new HostShortcutStartupFailure(
+          "Session host refused: host shortcut settings could not be safely read. Fix or move the file before restarting.",
+        );
+      }
+      if (readResult.status === "unavailable") throw new HostShortcutStartupFailure(readResult.message);
+      configuredHostShortcuts = normalizeHostShortcutBindings(readResult.bindings);
+    }
+    try {
+      const effectiveToggle = normalizeHostShortcutKey(
+        snapshot.toggleKey ?? configuredHostShortcuts.toggle,
+        "toggle",
+      );
+      const returnToMain = normalizeHostShortcutKey(configuredHostShortcuts.returnToMain, "returnToMain");
+      assertHostShortcutsDistinct(effectiveToggle, returnToMain);
+      effectiveHostShortcuts = { toggle: effectiveToggle, returnToMain };
+    } catch {
+      throw new HostShortcutStartupFailure(
+        "Session host refused: the effective toggle and return-to-Main shortcuts conflict or are unsupported. Fix the host settings or --sidebar-key value before restarting.",
+      );
+    }
     // Global roster and single-host ownership (issue 331): acquire exclusive
     // ownership of the canonical Pi agent directory and read the persisted
     // roster BEFORE any roster entry, manager row, or child exists. A host that
@@ -2515,7 +2603,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       };
     };
     sidebar = dependencies.createSidebar({
-      toggleKey: snapshot.toggleKey,
+      toggleKey: effectiveHostShortcuts.toggle,
+      returnToMainKey: effectiveHostShortcuts.returnToMain,
+      configuredShortcuts: configuredHostShortcuts,
+      legacyToggleOverride,
+      settingsAvailable: hostShortcutAgentDir !== undefined,
       workspaceBasePath: snapshot.startupCwd,
       createTextField,
       initialVisible: true,
@@ -2594,7 +2686,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         scheduleRedraw();
       }
     }
-  } catch {
+  } catch (error) {
+    if (error instanceof HostShortcutStartupFailure) {
+      shortcutStartupDiagnosticReported = true;
+      safeReport(dependencies, error.message);
+    }
     runtimeFailure = true;
     shutdownRequested = true;
     startupComplete = true;

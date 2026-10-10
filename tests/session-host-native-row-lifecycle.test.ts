@@ -31,6 +31,7 @@ import { join, sep } from "node:path";
 import test from "node:test";
 
 import { SidebarController, type SidebarAction } from "../src/session-host/sidebar";
+import { ROSTER_ACTIONS } from "./helpers/session-host-native-roster-witness";
 
 import {
   KEYS,
@@ -548,12 +549,26 @@ test("real public Main proves current-binding exited-restart and isolated d-stop
   assert.ok(processIsStillOwnedAndLive(processA));
   assert.ok(processIsStillOwnedAndLive(processB));
   const rosterAfterCreation = rosterEntries(driver.currentText());
-  assert.equal(rosterAfterCreation.length, 5, "two native cards plus the exact ordered three-action tail");
+  const parsedRosterAfterCreation = parseRosterFrame(driver.currentText(), 32);
+  assert.equal(parsedRosterAfterCreation.complete, true);
+  assert.equal(rosterAfterCreation.length, parsedRosterAfterCreation.entries.length,
+    "the helper exposes exactly the entries actually rendered by the complete roster");
+  assert.equal(parsedRosterAfterCreation.cards.length, 2);
   assert.equal(renderedTitleOf(rosterAfterCreation[0]), nameA);
   assert.equal(renderedTitleOf(rosterAfterCreation[1]), nameB);
-  assert.deepEqual(rosterAfterCreation.slice(2).map((entry) => entry.label),
-    ["Saved conversations", "New session", "Quit host"], "the ordered action tail is exact");
-  assert.equal(parseRosterFrame(driver.currentText(), 32).count, 2, "the roster header declares exactly two native sessions");
+  assert.ok(parsedRosterAfterCreation.actions.length === ROSTER_ACTIONS.length
+    || parsedRosterAfterCreation.actions.length === ROSTER_ACTIONS.length + 1,
+  "the rendered roster has the required action tail and at most its optional settings action");
+  assert.deepEqual(parsedRosterAfterCreation.actions.slice(0, ROSTER_ACTIONS.length).map((entry) => entry.label),
+    [...ROSTER_ACTIONS], "the required action tail remains in order");
+  if (parsedRosterAfterCreation.actions.length > ROSTER_ACTIONS.length) {
+    assert.equal(parsedRosterAfterCreation.actions.at(-1)?.label, "Host shortcuts",
+      "the only optional rendered action follows Quit host");
+  }
+  assert.deepEqual(parsedRosterAfterCreation.actions.map((entry) => rosterAfterCreation[entry.position]?.label),
+    parsedRosterAfterCreation.actions.map((entry) => entry.label),
+  "action navigation positions correlate to the actual rendered entry array");
+  assert.equal(parsedRosterAfterCreation.count, 2, "the roster header declares exactly two native sessions");
 
   // --- Phase 2: switching, hiding, and Space never stop either child. ---
   const phase2Before = driver.snapshot();

@@ -13,9 +13,10 @@
  *   row 5  generic sanitized activity (expanded only)
  *
  * A card is therefore exactly 5 rows expanded (default) or 3 rows collapsed,
- * one card's extent never overlaps another's, and the three fixed actions
- * ("Saved conversations", "New session", "Quit host") follow every native
- * card as ordered one-row entries. Only the leftmost sidebar columns (the wide
+ * one card's extent never overlaps another's, and the three required fixed
+ * actions ("Saved conversations", "New session", "Quit host") follow every
+ * native card as ordered one-row entries, with an optional final "Host
+ * shortcuts" action when settings are available. Only the leftmost sidebar columns (the wide
  * 32-column pane or the full narrow-overlay width) are inspected, extracted by
  * the pinned terminal-cell width model so wide/combining characters can never
  * pull the divider or native right pane into scope.
@@ -24,10 +25,11 @@
  * cards under this grammar and yield no parse: a stale witness cannot silently
  * accept them. Public consumers are fail-closed: a frame is only usable when
  * the header-declared native count, every native card's full 3/5-row extent,
- * and the ordered unique three-action tail all agree, so a partially painted
- * roster can never satisfy an entry, card, selection, or "hidden" witness.
+ * the ordered required action tail, and any optional final settings action
+ * all agree, so a partially painted roster can never satisfy an entry, card,
+ * selection, or "hidden" witness.
  */
-import { sliceByColumn, visibleWidth } from "pi-session-host-tui";
+import { sliceByColumn, truncateToWidth, visibleWidth } from "pi-session-host-tui";
 
 /**
  * The serializer-generated SGR pattern (`\x1b[<params>m`) documented by
@@ -54,9 +56,11 @@ const ACTIVITY_PREFIX = "    ";
 /** Two-cell marker + one-cell separator are always ASCII and never clipped. */
 const MARKER_CELLS = 2;
 
-/** The three fixed host actions that always terminate the roster in order. */
+/** The three required fixed host actions, in their rendered order. */
 export const ROSTER_ACTIONS = ["Saved conversations", "New session", "Quit host"] as const;
-export type RosterActionLabel = (typeof ROSTER_ACTIONS)[number];
+const HOST_SHORTCUTS_ACTION = "Host shortcuts";
+const HOST_SHORTCUTS_OVERRIDE_ACTION = "Host shortcuts (--sidebar-key override active)";
+export type RosterActionLabel = (typeof ROSTER_ACTIONS)[number] | typeof HOST_SHORTCUTS_ACTION;
 
 export interface RosterCardEntry {
   readonly kind: "native";
@@ -90,6 +94,16 @@ export interface RosterActionEntry {
 
 export type RosterEntry = RosterCardEntry | RosterActionEntry;
 
+export interface RosterNavigationTarget {
+  readonly position: number;
+  readonly label: string;
+}
+
+export interface OwnedRosterLabel {
+  readonly rowProbe: string;
+  readonly displayName: string;
+}
+
 export interface ParsedRoster {
   /** Sidebar header text, or the first line when no roster header is present. */
   readonly header: string | undefined;
@@ -109,7 +123,8 @@ export interface ParsedRoster {
   readonly entryEnd: number;
   /**
    * True only for a complete roster: exactly `count` full native cards followed
-   * by the ordered unique three-action tail, with no extra entry-shaped row.
+   * by the ordered required three-action tail and optional final Host shortcuts action,
+   * with no extra entry-shaped row.
    */
   readonly complete: boolean;
 }
@@ -186,6 +201,47 @@ function statusMarker(line: string): "selected" | "unselected" | undefined {
   if (line.startsWith(MARKER_SELECTED)) return "selected";
   if (line.startsWith(MARKER_PLAIN) && !line.startsWith(ACTIVITY_PREFIX)) return "unselected";
   return undefined;
+}
+
+/** The exact plain-text row exposed by truncateToWidth after pane extraction. */
+function renderedActionRow(text: string, width: number): string {
+  return stripSgr(truncateToWidth(text, width, "...", true)).trimEnd();
+}
+
+/**
+ * Returns the canonical label only for a complete action row the production
+ * renderer can draw at this pane width. In particular, the legacy annotation
+ * is matched against its exact width-clipped form, never an arbitrary suffix.
+ */
+function rosterActionLabel(line: string, width: number): RosterActionLabel | undefined {
+  const marker = statusMarker(line);
+  if (marker === undefined) return undefined;
+  const prefix = marker === "selected" ? MARKER_SELECTED : MARKER_PLAIN;
+  const rendered = line.trimEnd();
+  for (const label of ROSTER_ACTIONS) {
+    if (rendered === renderedActionRow(`${prefix}${label}`, width)) return label;
+  }
+  const shortcuts = renderedActionRow(`${prefix}${HOST_SHORTCUTS_ACTION}`, width);
+  const legacyOverride = renderedActionRow(`${prefix}${HOST_SHORTCUTS_OVERRIDE_ACTION}`, width);
+  return rendered === shortcuts || rendered === legacyOverride ? HOST_SHORTCUTS_ACTION : undefined;
+}
+
+/**
+ * A partial repaint of the settings row is still a visible sidebar remnant,
+ * but is never a parsed action. Match only proper prefixes of renderer-valid
+ * Host shortcuts rows so unrelated native-pane text cannot block the witness.
+ */
+function isHostShortcutsActionRemnant(line: string, width: number): boolean {
+  const marker = statusMarker(line);
+  if (marker === undefined) return false;
+  const prefix = marker === "selected" ? MARKER_SELECTED : MARKER_PLAIN;
+  const rendered = line.trimEnd();
+  const candidates = [
+    renderedActionRow(`${prefix}${HOST_SHORTCUTS_ACTION}`, width),
+    renderedActionRow(`${prefix}${HOST_SHORTCUTS_OVERRIDE_ACTION}`, width),
+  ];
+  return candidates.some((candidate) => rendered.length < candidate.length
+    && candidate.slice(0, rendered.length) === rendered);
 }
 
 interface CardRead {
@@ -271,20 +327,38 @@ export function parseRosterLines(lines: readonly string[], width: number = SIDEB
   }
 
   const actions: RosterActionEntry[] = [];
-  for (let offset = 0; offset < ROSTER_ACTIONS.length; offset += 1) {
-    const expected = ROSTER_ACTIONS[offset];
+  for (const expected of ROSTER_ACTIONS) {
     const line = body[index];
     const marker = line === undefined ? undefined : statusMarker(line);
-    if (line === undefined || marker === undefined || line.slice(MARKER_CELLS).trimEnd() !== expected) {
+    if (line === undefined || marker === undefined || rosterActionLabel(line, width) !== expected) {
       return incomplete(header, count, index);
     }
     const action: RosterActionEntry = {
       kind: "action",
-      position: count + offset,
+      position: entries.length,
       label: expected,
       selected: marker === "selected",
       rows: 1,
       raw: line,
+    };
+    actions.push(action);
+    entries.push(action);
+    index += 1;
+  }
+
+  // Host shortcuts is the existing settings action and is appended only when
+  // settings are available. Its legacy-override suffix is accepted only in
+  // the exact complete or width-clipped form produced by the renderer.
+  const optionalLine = body[index];
+  if (optionalLine !== undefined && rosterActionLabel(optionalLine, width) === HOST_SHORTCUTS_ACTION) {
+    const marker = statusMarker(optionalLine)!;
+    const action: RosterActionEntry = {
+      kind: "action",
+      position: entries.length,
+      label: HOST_SHORTCUTS_ACTION,
+      selected: marker === "selected",
+      rows: 1,
+      raw: optionalLine,
     };
     actions.push(action);
     entries.push(action);
@@ -298,7 +372,7 @@ export function parseRosterLines(lines: readonly string[], width: number = SIDEB
     const line = body[cursor]!;
     if (isBlank(line)) continue;
     if (statusMarker(line) !== undefined) return incomplete(header, count, index);
-    if (readCard(body, cursor, count + ROSTER_ACTIONS.length, width) !== undefined) {
+    if (readCard(body, cursor, entries.length, width) !== undefined) {
       return incomplete(header, count, index);
     }
   }
@@ -372,6 +446,44 @@ export function renderedTitleMatches(rendered: string | undefined, canonical: st
   return clippedPrefix.length > 0 && canonical.startsWith(clippedPrefix) && canonical.length > clippedPrefix.length;
 }
 
+/**
+ * Maps a complete rendered roster to its real navigation order. Native cards
+ * must correlate one-to-one with owned session labels; action entries come
+ * only from the parsed frame, including an optional final settings row.
+ */
+export function rosterNavigationTargets(
+  parsed: ParsedRoster,
+  owned: readonly OwnedRosterLabel[],
+): readonly RosterNavigationTarget[] | undefined {
+  if (!parsed.complete || parsed.entries.length === 0) return undefined;
+  const matched = new Set<OwnedRosterLabel>();
+  const targets: RosterNavigationTarget[] = [];
+  for (const entry of parsed.entries) {
+    if (entry.kind === "action") {
+      targets.push({ position: entry.position, label: entry.label });
+      continue;
+    }
+    const owners = owned.filter((session) => renderedTitleMatches(entry.title, session.displayName));
+    if (owners.length !== 1 || matched.has(owners[0]!)) return undefined;
+    matched.add(owners[0]!);
+    targets.push({ position: entry.position, label: owners[0]!.rowProbe });
+  }
+  if (matched.size !== owned.length
+    || new Set(targets.map((target) => target.label)).size !== targets.length
+    || new Set(targets.map((target) => target.position)).size !== targets.length) return undefined;
+  return targets;
+}
+
+/** The next actual roster target after the uniquely highlighted position. */
+export function nextRosterNavigationTarget(
+  targets: readonly RosterNavigationTarget[],
+  currentPosition: number,
+): RosterNavigationTarget | undefined {
+  if (targets.length === 0) return undefined;
+  const currentIndex = targets.findIndex((target) => target.position === currentPosition);
+  return currentIndex < 0 ? undefined : targets[(currentIndex + 1) % targets.length];
+}
+
 /** Outer header line (line 0), sans generated SGR and trailing padding. */
 export function frameHeader(text: string): string {
   const first = text.split("\n")[0] ?? "";
@@ -427,7 +539,8 @@ export function sidebarRosterHidden(text: string, sidebarColumns: number = SIDEB
       const contents = line.slice(MARKER_CELLS).trimEnd();
       if (STATUS_PATTERN.test(contents)
         || isBackgroundRow(contents, sidebarColumns)
-        || ROSTER_ACTIONS.some((action) => action === contents)) return true;
+        || rosterActionLabel(line, sidebarColumns) !== undefined
+        || isHostShortcutsActionRemnant(line, sidebarColumns)) return true;
     }
     return /(?:F8 toggle|e edit name|d stop\/remove|esc hide|q quit|space expand)/u.test(line);
   });

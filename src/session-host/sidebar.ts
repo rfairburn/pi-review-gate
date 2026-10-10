@@ -41,8 +41,8 @@
  *   stop/remove) act only on an entry the last roster render completely
  *   drew at its current height and order; hiding or overlaying the roster
  *   forgets it.
- * - `d` (and Delete, or x when Delete is the reserved toggle) stops/removes
- *   the highlighted session row: an exited row removes immediately; a settled
+ * - `d` and Delete stop/remove the highlighted session row: an exited row
+ *   removes immediately; a settled
  *   error row without a live process requests the same deliberate removal
  *   (the manager stays authoritative and may still refuse); a live owned
  *   process stops only after explicit confirmation unless complete idleness
@@ -87,6 +87,14 @@ import {
 	type SessionHostTextField,
 } from "./field-editor";
 import { isValidNativeSessionId, isValidRenameName, type SessionHostNativeSession } from "./protocol";
+import {
+  asHostKeyId,
+  assertHostShortcutsDistinct,
+  DEFAULT_HOST_SHORTCUTS,
+  normalizeHostShortcutBindings,
+  normalizeHostShortcutKey,
+  type HostShortcutBindings,
+} from "./host-shortcuts";
 
 /** One roster row: a top-level snapshot of one host-owned instance. */
 export interface SidebarItem {
@@ -186,11 +194,23 @@ export type SidebarAction =
       readonly name: string;
     }
   | { readonly type: "quit" }
+  | {
+      readonly type: "host-shortcuts-save";
+      readonly requestId: number;
+      readonly bindings: HostShortcutBindings;
+    }
   | { readonly type: "visibility"; readonly visible: boolean };
 
 export interface SidebarControllerOptions {
   /** Canonical native KeyId or a bounded known alternative (e.g. "f8"). */
   readonly toggleKey?: string;
+  /** Effective roster-only return chord (defaults to Alt+Right). */
+  readonly returnToMainKey?: string;
+  /** Stored editor values; distinct from an active legacy toggle override. */
+  readonly configuredShortcuts?: HostShortcutBindings;
+  readonly legacyToggleOverride?: boolean;
+  /** Main disables persistence UI only when no canonical native agent dir exists. */
+  readonly settingsAvailable?: boolean;
   /** Suggested editable workspace path pre-filled in the New session form. */
   readonly initialWorkspace?: string;
   /** Host-startup cwd used by the native path completer for relative input. */
@@ -268,7 +288,7 @@ const SGR_ACTIVE_MAIN_WHITE = "\x1b[1;97m";
 interface SidebarEntry {
   /** Internal key; real item ids are namespaced with "item:" to stay unique. */
   readonly key: string;
-  readonly kind: "item" | "saved" | "new" | "quit";
+  readonly kind: "item" | "saved" | "new" | "quit" | "settings";
   readonly item?: SidebarItem;
 }
 
@@ -336,7 +356,6 @@ function mouseAuthorizationKey(
   });
 }
 
-const DEFAULT_TOGGLE_KEY = "alt+left";
 // The pinned matcher knows legacy F1-F12 packets but not parameterized CSI
 // forms. These tables cover only standard function-key codes with no key
 // modifier (Caps/Num Lock bits are ignored, matching public matcher behavior).
@@ -394,82 +413,8 @@ const PANE_MAX_ROWS = 1000;
 const ENTRY_NEW_KEY = "new";
 const ENTRY_QUIT_KEY = "quit";
 const ENTRY_SAVED_KEY = "saved";
+const ENTRY_SETTINGS_KEY = "host-shortcuts";
 const ITEM_KEY_PREFIX = "item:";
-
-const SPECIAL_BASE_KEYS = [
-  "escape",
-  "esc",
-  "enter",
-  "return",
-  "tab",
-  "space",
-  "backspace",
-  "delete",
-  "insert",
-  "clear",
-  "home",
-  "end",
-  "pageUp",
-  "pageDown",
-  "up",
-  "down",
-  "left",
-  "right",
-  "f1",
-  "f2",
-  "f3",
-  "f4",
-  "f5",
-  "f6",
-  "f7",
-  "f8",
-  "f9",
-  "f10",
-  "f11",
-  "f12",
-] as const;
-const SYMBOL_BASE_KEYS = [
-  "`",
-  "-",
-  "=",
-  "[",
-  "]",
-  "\\",
-  ";",
-  "'",
-  ",",
-  ".",
-  "/",
-  "!",
-  "@",
-  "#",
-  "$",
-  "%",
-  "^",
-  "&",
-  "*",
-  "(",
-  ")",
-  "_",
-  "|",
-  "~",
-  "{",
-  "}",
-  ":",
-  "<",
-  ">",
-  "?",
-] as const;
-const MODIFIER_NAMES = ["ctrl", "shift", "alt", "super"] as const;
-
-// Key ids are validated case-insensitively (canonical lib ids like pageUp
-// and configured variants like pageup must both pass).
-const BASE_KEY_IDS: ReadonlySet<string> = new Set<string>([
-  ...SPECIAL_BASE_KEYS.map((key) => key.toLowerCase()),
-  ...SYMBOL_BASE_KEYS,
-  ..."abcdefghijklmnopqrstuvwxyz",
-  ..."0123456789",
-]);
 
 const LIFECYCLE_VALUES: ReadonlySet<string> = new Set([
   "starting",
@@ -644,66 +589,13 @@ function eventTypeFromDigit(value: string | undefined): KeyEventType | undefined
   }
 }
 
-/**
- * Validates and normalizes the reserved toggle chord against the bounded set
- * supported by the pinned matcher and the exact F-key event fallback. Protected
- * native keys cannot be configured as toggles.
- */
-function normalizeToggleKey(raw: string | undefined): string {
-  const value = raw ?? DEFAULT_TOGGLE_KEY;
-  if (typeof value !== "string" || value.length === 0) {
-    throw new Error("toggleKey must be a nonempty canonical KeyId string");
-  }
-  const parts = value.toLowerCase().split("+");
-  const base = parts[parts.length - 1];
-  if (!base || !BASE_KEY_IDS.has(base)) {
-    throw new Error(
-      `toggleKey base must be a known native key id, got ${JSON.stringify(base)}`,
-    );
-  }
-  const seen = new Set<string>();
-  for (const part of parts.slice(0, -1)) {
-    if (!(MODIFIER_NAMES as readonly string[]).includes(part)) {
-      throw new Error(`toggleKey has unknown modifier ${JSON.stringify(part)}`);
-    }
-    if (seen.has(part)) {
-      throw new Error(`toggleKey repeats modifier ${JSON.stringify(part)}`);
-    }
-    seen.add(part);
-  }
-  if (base === "escape" || base === "esc") {
-    throw new Error(
-      seen.size === 0
-        ? "toggleKey conflicts with native Escape"
-        : "toggleKey cannot use modifiers with Escape",
-    );
-  }
-  if (base === "[" && seen.size === 1 && seen.has("ctrl")) {
-    throw new Error("toggleKey conflicts with native Escape");
-  }
-  if (
-    base === "q" &&
-    (seen.size === 0 || (seen.size === 1 && seen.has("shift")))
-  ) {
-    throw new Error("toggleKey conflicts with native q/Q");
-  }
-  if (base === "c" && seen.size === 1 && seen.has("ctrl")) {
-    throw new Error("toggleKey conflicts with native Ctrl+C");
-  }
-  if (/^f(?:[1-9]|1[0-2])$/.test(base) && seen.size > 0) {
-    throw new Error("toggleKey cannot use modifiers with function keys");
-  }
-  if (
-    base === "clear" &&
-    seen.size > 0 &&
-    !(seen.size === 1 && (seen.has("ctrl") || seen.has("shift")))
-  ) {
-    throw new Error("toggleKey Clear supports only Ctrl or Shift alone");
-  }
-  // Rewrite the pinned lib's mixed-case ids canonically so validation is
-  // case-insensitive but the stored id stays a canonical KeyId.
-  const canonicalBase = base === "pageup" ? "pageUp" : base === "pagedown" ? "pageDown" : base;
-  return [...seen, canonicalBase].join("+");
+/** Match one already-validated host chord, including supported F-key event packets. */
+function hostKeyEventType(data: string, key: string): KeyEventType | undefined {
+  const fallback = functionKeyEventType(data, key);
+  if (!matchesKey(data, asHostKeyId(key)) && fallback === undefined) return undefined;
+  if (isKeyRelease(data) || fallback === "release") return "release";
+  if (isKeyRepeat(data) || fallback === "repeat") return "repeat";
+  return "press";
 }
 
 /** Fixed, generated display label for a normalized toggle key id. */
@@ -961,8 +853,13 @@ function markerSuffixLength(value: string, marker: string): number {
 }
 
 export class SidebarController {
-  private readonly toggleKey: string;
-  private readonly toggleLabel: string;
+  private toggleKey: string;
+  private toggleLabel: string;
+  private returnToMainKey: string;
+  private returnToMainLabel: string;
+  private configuredShortcuts: HostShortcutBindings;
+  private readonly legacyToggleOverride: boolean;
+  private readonly settingsAvailable: boolean;
   private readonly onAction?: (action: SidebarAction) => void;
   private readonly onInvalidate?: () => void;
   private readonly workspaceBasePath: string;
@@ -983,7 +880,10 @@ export class SidebarController {
   private formHints = DEFAULT_FORM_HINTS;
   private formNotice: string | undefined;
   private formGeneration = 0;
-  private formKind: "new" | "edit" | "saved" | undefined;
+  private formKind: "new" | "edit" | "saved" | "shortcuts" | undefined;
+  private shortcutDraft: { toggle: string; returnToMain: string } = { ...DEFAULT_HOST_SHORTCUTS };
+  private shortcutFieldIndex: 0 | 1 = 0;
+  private pendingShortcutSave: { readonly requestId: number } | undefined;
   /** Outstanding saved-conversation listing request (issue 323). */
   private pendingSavedList: { readonly requestId: number } | undefined;
   /** Deliberate saved-open in flight; late results are fenced by requestId. */
@@ -1018,12 +918,14 @@ export class SidebarController {
    */
   private activeMainOwnerID_: string | undefined;
   /**
-   * Provenance fence for a host-claimed Alt+Right press: once the roster
-   * claims an initial Alt+Right to return focus to Main, the held key's
-   * repeat/release events are consumed instead of leaking into the child.
-   * A fresh (initial) Alt+Right in Main focus is ordinary native input.
+   * Provenance fence for every host-claimed return chord. Retain each chord's
+   * identity across successful rebinding so its repeat/release cannot leak
+   * into Main under the new binding; the set is bounded by the finite accepted
+   * chord vocabulary. A fresh press clears that chord's old claim.
    */
-  private altRightClaimed = false;
+  private readonly claimedReturnToMainKeys = new Set<string>();
+  /** Preserve toggle chord identity across a successful settings rebind. */
+  private readonly claimedToggleKeys = new Set<string>();
   /**
    * Provenance fence for a host-owned form Escape: a fresh Escape that cancels
    * only the New or Edit form — or that the native field consumes to dismiss
@@ -1076,8 +978,17 @@ export class SidebarController {
   private displayedRoster: DisplayedRoster | undefined;
 
   constructor(options: SidebarControllerOptions = {}) {
-    this.toggleKey = normalizeToggleKey(options.toggleKey);
+    this.configuredShortcuts = normalizeHostShortcutBindings(options.configuredShortcuts ?? DEFAULT_HOST_SHORTCUTS);
+    this.toggleKey = normalizeHostShortcutKey(options.toggleKey ?? this.configuredShortcuts.toggle, "toggle");
+    this.returnToMainKey = normalizeHostShortcutKey(
+      options.returnToMainKey ?? this.configuredShortcuts.returnToMain,
+      "returnToMain",
+    );
+    assertHostShortcutsDistinct(this.toggleKey, this.returnToMainKey);
     this.toggleLabel = toggleDisplayName(this.toggleKey);
+    this.returnToMainLabel = toggleDisplayName(this.returnToMainKey);
+    this.legacyToggleOverride = options.legacyToggleOverride === true;
+    this.settingsAvailable = options.settingsAvailable ?? false;
     this.onAction = options.onAction;
     this.onInvalidate = options.onInvalidate;
     this._visible = options.initialVisible ?? true;
@@ -1551,6 +1462,9 @@ export class SidebarController {
     if (this.formKind === "saved") {
       return this.renderSavedPane(cols, rows);
     }
+    if (this.formKind === "shortcuts") {
+      return this.renderHostShortcutPane(cols, rows);
+    }
     return this.renderFormPane(cols, rows);
   }
 
@@ -1581,13 +1495,19 @@ export class SidebarController {
 
   /** Consumes every matcher-recognized toggle event; only initial presses act. */
   private handleReservedToggle(data: string, beforePress?: () => void): boolean {
-    const fallbackEventType = functionKeyEventType(data, this.toggleKey);
-    if (!matchesKey(data, this.toggleKey as KeyId) && fallbackEventType === undefined) {
-      return false;
+    let consumedClaim = false;
+    for (const key of [...this.claimedToggleKeys]) {
+      const event = hostKeyEventType(data, key);
+      if (event === undefined) continue;
+      if (event !== "repeat") this.claimedToggleKeys.delete(key);
+      if (event === "repeat" || event === "release") consumedClaim = true;
     }
-    const isRelease = isKeyRelease(data) || fallbackEventType === "release";
-    const isRepeat = isKeyRepeat(data) || fallbackEventType === "repeat";
-    if (!isRelease && !isRepeat) {
+    if (consumedClaim) return true;
+
+    const eventType = hostKeyEventType(data, this.toggleKey);
+    if (eventType === undefined) return false;
+    if (eventType === "press") {
+      this.claimedToggleKeys.add(this.toggleKey);
       beforePress?.();
       this.toggle();
     }
@@ -1638,9 +1558,27 @@ export class SidebarController {
     return false;
   }
 
+  /** Consume repeats/releases for host-claimed return chords across rebinding. */
+  private consumeClaimedReturnChord(data: string): boolean {
+    let consumed = false;
+    for (const key of [...this.claimedReturnToMainKeys]) {
+      const event = hostKeyEventType(data, key);
+      if (event === undefined) continue;
+      if (event === "repeat") consumed = true;
+      else this.claimedReturnToMainKeys.delete(key); // release or fresh press
+      if (event === "release") consumed = true;
+    }
+    return consumed;
+  }
+
+  private claimReturnToMainChord(): void {
+    this.claimedReturnToMainKeys.add(this.returnToMainKey);
+  }
+
   // --- Main focus: everything is forwarded unchanged except the toggle. ---
 
   private handleMainInput(data: string): void {
+    if (this.consumeClaimedReturnChord(data)) return;
     if (this.handleReservedToggle(data)) {
       return;
     }
@@ -1656,16 +1594,8 @@ export class SidebarController {
     if (this.consumeFormSubmitClaim(data)) {
       return;
     }
-    // A held Alt+Right whose initial press a host-owned surface claimed must
-    // not leak into the child as input; a fresh (initial) Alt+Right in Main
-    // focus is ordinary native input and stays forwarded.
-    if (matchesKey(data, "alt+right")) {
-      if (this.altRightClaimed && (isKeyRepeat(data) || isKeyRelease(data))) {
-        if (isKeyRelease(data)) this.altRightClaimed = false;
-        return; // consume the held-key repeat/release
-      }
-      this.altRightClaimed = false; // fresh press: clear any stale claim
-    }
+    // A fresh return chord in Main is ordinary native input; a claimed held
+    // repeat or release was consumed by its original chord identity above.
     // Nonreserved releases and repeats are forwarded verbatim for the child
     // adapter to interpret under its own Kitty-protocol state.
     this.emitForward(data);
@@ -1675,33 +1605,29 @@ export class SidebarController {
 
   private handleSidebarInput(data: string): void {
     // Bracketed paste is opaque in roster focus: a streamed body that merely
-    // equals a host chord (e.g. Alt+Right) must not change focus or leak the
-    // remaining pasted content into Main.
+    // equals a host chord must not change focus or leak the remaining pasted
+    // content into Main.
     if (this.routeBracketedPaste(data)) return;
     // Fence the held Escape that canceled only a host-owned form across focus
     // domains until its release or a fresh Escape press.
     if (this.consumeFormEscapeClaim(data)) return;
-    // The reserved toggle takes precedence over Alt+Right (the user may
-    // configure the toggle as alt+right), so it is handled first.
+    if (this.consumeClaimedReturnChord(data)) return;
+    // The reserved toggle takes precedence over the separate return chord.
     if (this.handleReservedToggle(data)) {
       return;
     }
-    if (isKeyRelease(data)) {
-      // A held Alt+Right whose press was claimed: its release clears the claim
-      // so a later fresh Alt+Right in Main focus is ordinary native input.
-      if (matchesKey(data, "alt+right")) this.altRightClaimed = false;
-      return;
-    }
-    // Alt+Right (roster-only) returns input focus to the existing Main owner
-    // without activating the highlighted row, resizing, or hiding. Only an
-    // initial deliberate press acts, and only when the selected card was fully
-    // drawn by the last roster render (the complete-card action fence).
-    if (matchesKey(data, "alt+right")) {
-      if (isKeyRepeat(data)) return;
-      this.altRightClaimed = true; // claim for the cross-surface repeat/release fence
-      if (!this.selectionFitsLastRoster()) return; // refuse: selection not fully drawn
+    const returnEvent = hostKeyEventType(data, this.returnToMainKey);
+    if (returnEvent !== undefined) {
+      if (returnEvent === "release" || returnEvent === "repeat") return;
+      this.claimReturnToMainChord();
+      // A roster-only return never activates a row and is fenced by the exact
+      // complete draw just like the existing Alt+Right action.
+      if (!this.selectionFitsLastRoster()) return;
       this._focus = "main";
       this.onInvalidate?.();
+      return;
+    }
+    if (isKeyRelease(data)) {
       return;
     }
     if (matchesKey(data, "up")) {
@@ -1727,10 +1653,7 @@ export class SidebarController {
       if (!isKeyRepeat(data)) this.toggleSelectedExpansion();
       return;
     }
-    if (
-      matchesKey(data, "delete") ||
-      (this.toggleKey === "delete" && ["x", "X"].includes(printableOf(data) ?? ""))
-    ) {
+    if (matchesKey(data, "delete")) {
       // A held Delete/x never stops; only a deliberate initial press does.
       if (isKeyRepeat(data)) return;
       if (!this.selectionFitsLastRoster()) return;
@@ -1869,6 +1792,10 @@ export class SidebarController {
       this.openNewForm();
       return;
     }
+    if (entry.kind === "settings") {
+      this.openHostShortcutForm();
+      return;
+    }
     this.activateQuit();
   }
 
@@ -1888,8 +1815,8 @@ export class SidebarController {
   }
 
   /**
-   * d / Delete (x when Delete is the reserved toggle): an exited row removes
-   * immediately; a settled error row without a live process requests the same
+   * d / Delete: an exited row removes immediately; a settled error row without
+   * a live process requests the same
    * deliberate removal (the manager stays authoritative and may still refuse);
    * a live owned process requests a stop — directly only when complete
    * idleness is positively observed, otherwise after explicit confirmation.
@@ -2007,15 +1934,20 @@ export class SidebarController {
     // Fence the held Escape that canceled only a host-owned form across focus
     // domains until its release or a fresh Escape press.
     if (this.consumeFormEscapeClaim(data)) return;
+    if (this.consumeClaimedReturnChord(data)) return;
     if (this.handleReservedToggle(data, () => this.abandonForm())) return;
-    // Host-owned form UI: Alt+Right never dismisses, submits, forwards to the
+    // Host-owned form UI: the configured return chord never dismisses, submits, forwards to the
     // child, or steals ownership; it is consumed in every event form. An
     // initial press is claimed so its repeat/release stays fenced if a focus
     // change (e.g. the reserved toggle) happens while the key is still held;
     // the release clears the claim.
-    if (matchesKey(data, "alt+right")) {
-      if (isKeyRelease(data)) { this.altRightClaimed = false; return; }
-      if (!isKeyRepeat(data)) this.altRightClaimed = true;
+    const returnEvent = hostKeyEventType(data, this.returnToMainKey);
+    if (returnEvent !== undefined) {
+      if (returnEvent === "press") this.claimReturnToMainChord();
+      return;
+    }
+    if (this.formKind === "shortcuts" && matchesKey(data, "tab")) {
+      if (!isKeyRelease(data) && !isKeyRepeat(data)) this.switchShortcutField();
       return;
     }
     if (isKeyRelease(data)) return;
@@ -2024,7 +1956,7 @@ export class SidebarController {
     // New or Edit, hide the roster, or reach the child. Only a fresh press
     // cancels; the field's own completion-list Escape precedence is intact.
     if (matchesKey(data, "escape") && isKeyRepeat(data)) return;
-    if (this.pendingCreate || this.pendingRename) {
+    if (this.pendingCreate || this.pendingRename || this.pendingShortcutSave) {
       // The configured cancel binding still abandons a pending New/Edit form;
       // a held repeat never cancels a pending Edit rename (existing rule).
       if (this.formMatchesCancel(data)
@@ -2093,6 +2025,7 @@ export class SidebarController {
     this.editTarget = undefined;
     this.pendingCreate = undefined;
     this.pendingRename = undefined;
+    this.pendingShortcutSave = undefined;
     this.pendingSavedOpen = undefined;
     this.formError = undefined;
     this.noticeError = undefined;
@@ -2133,14 +2066,15 @@ export class SidebarController {
     // Fence the held Escape that canceled only a host-owned form across focus
     // domains until its release or a fresh Escape press.
     if (this.consumeFormEscapeClaim(data)) return;
+    if (this.consumeClaimedReturnChord(data)) return;
     if (this.handleReservedToggle(data, () => this.dismissSavedPane())) return;
-    // Host-owned picker UI: Alt+Right is consumed, never a row action. An
+    // Host-owned picker UI: the configured return chord is consumed, never a row action. An
     // initial press is claimed so its repeat/release stays fenced across any
     // subsequent focus change while the key is still held; the release clears
     // the claim.
-    if (matchesKey(data, "alt+right")) {
-      if (isKeyRelease(data)) { this.altRightClaimed = false; return; }
-      if (!isKeyRepeat(data)) this.altRightClaimed = true;
+    const returnEvent = hostKeyEventType(data, this.returnToMainKey);
+    if (returnEvent !== undefined) {
+      if (returnEvent === "press") this.claimReturnToMainChord();
       return;
     }
     if (isKeyRelease(data)) return;
@@ -2271,14 +2205,93 @@ export class SidebarController {
     this.editTarget = undefined;
     this.pendingCreate = undefined;
     this.pendingRename = undefined;
+    this.pendingShortcutSave = undefined;
     this.formError = undefined;
     this._focus = "form";
     this.createFormField(this.workspaceDraft);
   }
 
+  private openHostShortcutForm(): void {
+    this.forgetDisplayedRoster();
+    this.disposeFormField();
+    this.pendingCreate = undefined;
+    this.pendingRename = undefined;
+    this.pendingShortcutSave = undefined;
+    this.formKind = "shortcuts";
+    this.editTarget = undefined;
+    this.shortcutDraft = { ...this.configuredShortcuts };
+    this.shortcutFieldIndex = 0;
+    this.formError = undefined;
+    this.noticeError = undefined;
+    this._focus = "form";
+    this.createFormField(this.shortcutDraft.toggle);
+  }
+
+  /** Apply a completed atomic Save without changing focus or session ownership. */
+  completeHostShortcutSave(requestId: number, bindings: HostShortcutBindings): boolean {
+    if (this.pendingShortcutSave?.requestId !== requestId || this.formKind !== "shortcuts") return false;
+    const configured = normalizeHostShortcutBindings(bindings);
+    const effectiveToggle = this.legacyToggleOverride ? this.toggleKey : configured.toggle;
+    assertHostShortcutsDistinct(effectiveToggle, configured.returnToMain);
+    this.pendingShortcutSave = undefined;
+    this.configuredShortcuts = configured;
+    if (!this.legacyToggleOverride) {
+      this.toggleKey = configured.toggle;
+      this.toggleLabel = toggleDisplayName(configured.toggle);
+    }
+    this.returnToMainKey = configured.returnToMain;
+    this.returnToMainLabel = toggleDisplayName(configured.returnToMain);
+    this.shortcutDraft = { ...configured };
+    this.disposeFormField();
+    this.formKind = undefined;
+    this.formError = undefined;
+    this._focus = "sidebar";
+    this.onInvalidate?.();
+    return true;
+  }
+
+  /** A refused validation/write leaves the same editor open and the active chords unchanged. */
+  failHostShortcutSave(requestId: number, message: string): void {
+    if (this.pendingShortcutSave?.requestId !== requestId || this.formKind !== "shortcuts") return;
+    this.pendingShortcutSave = undefined;
+    this.formError = sanitizeBounded(message, ERROR_TEXT_MAX_CODEPOINTS);
+    this.createFormField(this.shortcutFieldIndex === 0 ? this.shortcutDraft.toggle : this.shortcutDraft.returnToMain);
+    this.onInvalidate?.();
+  }
+
+  private switchShortcutField(): void {
+    if (this.formKind !== "shortcuts" || this.pendingShortcutSave !== undefined) return;
+    if (this.shortcutFieldIndex === 0) this.shortcutDraft.toggle = this.formField?.getValue() ?? this.shortcutDraft.toggle;
+    else this.shortcutDraft.returnToMain = this.formField?.getValue() ?? this.shortcutDraft.returnToMain;
+    this.shortcutFieldIndex = this.shortcutFieldIndex === 0 ? 1 : 0;
+    this.formError = undefined;
+    this.createFormField(this.shortcutFieldIndex === 0 ? this.shortcutDraft.toggle : this.shortcutDraft.returnToMain);
+  }
+
+  private submitHostShortcutForm(): void {
+    if (this.formKind !== "shortcuts" || this.pendingShortcutSave !== undefined) return;
+    if (this.shortcutFieldIndex === 0) this.shortcutDraft.toggle = this.formField?.getValue() ?? this.shortcutDraft.toggle;
+    else this.shortcutDraft.returnToMain = this.formField?.getValue() ?? this.shortcutDraft.returnToMain;
+    let bindings: HostShortcutBindings;
+    try {
+      bindings = normalizeHostShortcutBindings(this.shortcutDraft);
+      const effectiveToggle = this.legacyToggleOverride ? this.toggleKey : bindings.toggle;
+      assertHostShortcutsDistinct(effectiveToggle, bindings.returnToMain);
+    } catch (error) {
+      this.formError = sanitizeBounded(error instanceof Error ? error.message : "Shortcut settings are invalid", ERROR_TEXT_MAX_CODEPOINTS);
+      this.createFormField(this.shortcutFieldIndex === 0 ? this.shortcutDraft.toggle : this.shortcutDraft.returnToMain);
+      this.onInvalidate?.();
+      return;
+    }
+    const requestId = this.nextRequestId++;
+    this.pendingShortcutSave = { requestId };
+    this.formError = undefined;
+    this.emit({ type: "host-shortcuts-save", requestId, bindings });
+  }
+
   private createFormField(initialText: string): void {
     this.disposeFormField();
-    const kind = this.formKind === "edit" ? "name" : "path";
+    const kind = this.formKind === "edit" || this.formKind === "shortcuts" ? "name" : "path";
     const generation = this.formGeneration;
     const fieldOptions: SidebarFieldFactoryOptions = {
       kind,
@@ -2290,6 +2303,7 @@ export class SidebarController {
         if (generation !== this.formGeneration) return;
         if (this.formKind === "edit") this.submitRename(submission);
         else if (this.formKind === "new") this.submitCreate(submission);
+        else if (this.formKind === "shortcuts") this.submitHostShortcutForm();
       },
       onCancel: () => {
         if (generation === this.formGeneration) this.escapeFromForm();
@@ -2410,8 +2424,13 @@ export class SidebarController {
   private abandonForm(): void {
     if (this.formKind === "new" && this.formField) this.workspaceDraft = this.formField.getValue();
     if (this.formKind === "edit" && this.formField) this.editDraft = this.formField.getValue();
+    if (this.formKind === "shortcuts" && this.formField) {
+      if (this.shortcutFieldIndex === 0) this.shortcutDraft.toggle = this.formField.getValue();
+      else this.shortcutDraft.returnToMain = this.formField.getValue();
+    }
     this.pendingCreate = undefined;
     this.pendingRename = undefined;
+    this.pendingShortcutSave = undefined;
     this.disposeFormField();
     this.formKind = undefined;
     this.editTarget = undefined;
@@ -2423,21 +2442,17 @@ export class SidebarController {
     // Fence the held Escape that canceled only a host-owned form across focus
     // domains until its release or a fresh Escape press.
     if (this.consumeFormEscapeClaim(data)) return;
-    // The reserved toggle takes precedence over Alt+Right (the user may
-    // configure the toggle as alt+right), so it is handled first.
+    if (this.consumeClaimedReturnChord(data)) return;
+    // The reserved toggle takes precedence over the separate return chord.
     if (this.handleReservedToggle(data)) {
       return;
     }
-    if (isKeyRelease(data)) {
-      // A held Alt+Right whose press was claimed: its release clears the claim.
-      if (matchesKey(data, "alt+right")) this.altRightClaimed = false;
+    const returnEvent = hostKeyEventType(data, this.returnToMainKey);
+    if (returnEvent !== undefined) {
+      if (returnEvent === "press") this.claimReturnToMainChord();
       return;
     }
-    // Host-owned confirmation UI: Alt+Right is consumed, never confirm/cancel.
-    // An initial press is claimed so its repeat/release stays fenced across any
-    // subsequent focus change while the key is still held.
-    if (matchesKey(data, "alt+right")) {
-      if (!isKeyRepeat(data)) this.altRightClaimed = true;
+    if (isKeyRelease(data)) {
       return;
     }
     if (this.confirmPurpose === "stop-remove") {
@@ -2557,6 +2572,7 @@ export class SidebarController {
       { key: ENTRY_SAVED_KEY, kind: "saved" },
       { key: ENTRY_NEW_KEY, kind: "new" },
       { key: ENTRY_QUIT_KEY, kind: "quit" },
+      ...(this.settingsAvailable ? [{ key: ENTRY_SETTINGS_KEY, kind: "settings" as const }] : []),
     ];
   }
 
@@ -2585,15 +2601,15 @@ export class SidebarController {
         "enter open",
         ...(this._focus === "sidebar" ? ["e edit name"] : []),
         ...(this._focus === "sidebar"
-          ? [this.toggleKey === "delete" ? "d/x stop/remove" : "d stop/remove"]
+          ? ["d stop/remove"]
           : []),
         "esc hide",
         "q quit",
         ...(this._focus === "sidebar" && this.rowStore.length > 0 ? ["space expand"] : []),
-        // Alt+Right returns input focus to the existing Main owner (roster-only);
+        // The configured return chord focuses the existing Main owner (roster-only);
         // it never activates the highlighted row. Shown only while the roster
         // owns focus, where the key actually acts.
-        ...(this._focus === "sidebar" ? ["alt+right main"] : []),
+        ...(this._focus === "sidebar" ? [`${this.returnToMainLabel.toLowerCase()} main`] : []),
       ],
       cols,
     );
@@ -2735,7 +2751,9 @@ export class SidebarController {
       ? `${marker}Saved conversations`
       : entry.kind === "new"
         ? `${marker}New session`
-        : `${marker}Quit host`;
+        : entry.kind === "settings"
+          ? `${marker}Host shortcuts${this.legacyToggleOverride ? " (--sidebar-key override active)" : ""}`
+          : `${marker}Quit host`;
     // Host-owned action rows take the blue selection target while a
     // sidebar-owned surface has focus; they are never the native active owner.
     return [wrapRow(text, cols, selected && this._focus !== "main" ? SGR_SELECTION_BLUE : undefined)];
@@ -2798,6 +2816,75 @@ export class SidebarController {
       cursor: {
         column: Math.min(prefixWidth + fieldFrame.cursor.column, cols - 1),
         row: fieldTopRow + fieldFrame.cursor.row,
+      },
+    };
+  }
+
+  /** Host-owned editor for the two reserved sidebar chords. */
+  private renderHostShortcutPane(
+    cols: number,
+    rows: number,
+  ): { lines: string[]; cursor?: { column: number; row: number } } {
+    const header = " Host shortcuts ";
+    const footerLines = wrapHintLines([
+      `${this.formHints.submit} Save`,
+      `${this.formHints.cancel} Cancel`,
+      "tab switch field",
+    ], cols);
+    const contextLines = wrapHintLines([
+      "Separate from native Pi keybindings; terminal/OS delivery may vary.",
+      ...(this.legacyToggleOverride
+        ? [`Legacy --sidebar-key override active: ${this.toggleLabel}`]
+        : []),
+    ], cols);
+    const errorLines = this.formError === undefined ? [] : wrapHintLines([`! ${this.formError}`], cols);
+    if (!this.formField || footerLines === undefined || contextLines === undefined || errorLines === undefined
+      || visibleWidth(header) > cols) return this.renderTooSmall(cols, rows);
+
+    const togglePrefix = this.shortcutFieldIndex === 0 ? "> Toggle (stored): " : "  Toggle (stored): ";
+    const returnPrefix = this.shortcutFieldIndex === 1 ? "> Return to Main: " : "  Return to Main: ";
+    const inactivePrefix = this.shortcutFieldIndex === 0 ? returnPrefix : togglePrefix;
+    const inactiveValue = this.shortcutFieldIndex === 0 ? this.shortcutDraft.returnToMain : this.shortcutDraft.toggle;
+    const inactivePrefixWidth = Math.min(visibleWidth(inactivePrefix), cols - 1);
+    const inactiveLines = wrapHintLines([inactiveValue], Math.max(1, cols - inactivePrefixWidth));
+    if (inactiveLines === undefined) return this.renderTooSmall(cols, rows);
+
+    const fixedRows = 1 + contextLines.length + inactiveLines.length + 1 + 1 + errorLines.length + footerLines.length;
+    const activeRows = rows - fixedRows;
+    if (activeRows < 1) return this.renderTooSmall(cols, rows);
+    const activePrefix = this.shortcutFieldIndex === 0 ? togglePrefix : returnPrefix;
+    const activePrefixWidth = Math.min(visibleWidth(activePrefix), cols - 1);
+    const fieldWidth = Math.max(1, cols - activePrefixWidth);
+    const fieldFrame = this.formField.render(fieldWidth, activeRows);
+    if (!fieldFrame.cursor.visible || fieldFrame.lines.length === 0) return this.renderTooSmall(cols, rows);
+
+    const lines = [wrapRow(header, cols, "\x1b[1m")];
+    for (const contextLine of contextLines) lines.push(wrapRow(contextLine, cols));
+    const activeLines = fieldFrame.lines.slice(0, activeRows);
+    const inactiveRows = inactiveLines.map((line, index) => wrapRow(
+      `${index === 0 ? inactivePrefix : " ".repeat(inactivePrefixWidth)}${line}`,
+      cols,
+    ));
+    const activeRowsToDraw = activeLines.map((line, index) => wrapRow(
+      `${index === 0 ? activePrefix : " ".repeat(activePrefixWidth)}${line}`,
+      cols,
+    ));
+    const toggleRows = this.shortcutFieldIndex === 0 ? activeRowsToDraw : inactiveRows;
+    const returnRows = this.shortcutFieldIndex === 1 ? activeRowsToDraw : inactiveRows;
+    lines.push(...toggleRows, ...returnRows);
+    const status = this.pendingShortcutSave !== undefined
+      ? " Saving host shortcuts... "
+      : errorLines.length === 0 ? "" : errorLines[0];
+    lines.push(wrapRow(status, cols));
+    for (const errorLine of errorLines.slice(1)) lines.push(wrapRow(errorLine, cols));
+    const fieldRow = 1 + contextLines.length + (this.shortcutFieldIndex === 0 ? 0 : toggleRows.length);
+    lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
+    for (const footerLine of footerLines) lines.push(wrapRow(footerLine, cols));
+    return {
+      lines,
+      cursor: {
+        column: Math.min(activePrefixWidth + fieldFrame.cursor.column, cols - 1),
+        row: fieldRow + fieldFrame.cursor.row,
       },
     };
   }

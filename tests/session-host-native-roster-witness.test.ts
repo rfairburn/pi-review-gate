@@ -1,23 +1,27 @@
 /**
  * Pure source witnesses for the shared rendered-roster parser. These tests do
  * not start a PTY, SDK, child process, command, install, or home/Git read: they
- * exercise the parser against synthetic frames only, so they add no runtime
- * or native claim.
+ * exercise the parser against synthetic frames and real pure-controller
+ * renders, so they add no runtime or native claim.
  */
 import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth } from "pi-session-host-tui";
+import { SidebarController } from "../src/session-host/sidebar";
 
 import {
   NATIVE_PANE_START,
+  type OwnedRosterLabel,
   ROSTER_ACTIONS,
   SIDEBAR_COLUMNS,
   frameHeader,
   frameHeaderMatches,
   isSidebarFocusedFrame,
+  nextRosterNavigationTarget,
   parseRosterFrame,
   renderedTitleMatches,
   rosterCards,
+  rosterNavigationTargets,
   selectedRosterCard,
   selectedRosterEntry,
   sidebarPaneLines,
@@ -346,4 +350,249 @@ test("pane-only renderer output parses without an outer composed header", () => 
   const rendered = pane([HEADER(1), ...expandedCard("Rendered title"), ...ACTIONS]);
   assert.equal(parseRosterFrame(rendered).complete, true);
   assert.equal(rosterCards(rendered)[0]!.title, "Rendered title");
+});
+
+test("production-rendered Host shortcuts roster rows parse at wide and narrow pane widths", () => {
+  for (const width of [32, 24]) {
+    const withoutSettings = new SidebarController({
+      toggleKey: "f8",
+      settingsAvailable: false,
+      legacyToggleOverride: false,
+    });
+    const noSettingsFrame = withoutSettings.renderRoster(width, 40).lines.join("\n");
+    const noSettings = parseRosterFrame(noSettingsFrame, width);
+    assert.equal(noSettings.complete, true);
+    assert.deepEqual(noSettings.actions.map((entry) => entry.label), [...ROSTER_ACTIONS],
+      "the production renderer keeps the existing three-action roster when settings are unavailable");
+    assert.equal(isSidebarFocusedFrame(noSettingsFrame, width), true);
+
+    for (const legacyToggleOverride of [false, true]) {
+      const controller = new SidebarController({
+        toggleKey: "f8",
+        settingsAvailable: true,
+        legacyToggleOverride,
+      });
+      const frame = controller.renderRoster(width, 40).lines.join("\n");
+      const parsed = parseRosterFrame(frame, width);
+      assert.equal(parsed.complete, true, `complete production roster at width ${width}, override=${legacyToggleOverride}`);
+      assert.deepEqual(parsed.actions.map((entry) => entry.label), [...ROSTER_ACTIONS, "Host shortcuts"]);
+      assert.deepEqual(parsed.actions.map((entry) => entry.position),
+        parsed.actions.map((entry) => parsed.entries.indexOf(entry)),
+      "each action position comes from its actual rendered entry order");
+      assert.equal(isSidebarFocusedFrame(frame, width), true,
+        "the complete sidebar-focus footer follows the actual optional action row");
+
+      const shortcutsRow = parsed.actions.at(-1)!.raw.replace(/\x1b\[[0-9;]*m/g, "").trimEnd();
+      if (legacyToggleOverride) {
+        assert.ok(shortcutsRow.startsWith("  Host shortcuts ("), shortcutsRow);
+        assert.ok(shortcutsRow.endsWith("..."), `legacy annotation is width-clipped at ${width}: ${shortcutsRow}`);
+      } else {
+        assert.equal(shortcutsRow, "  Host shortcuts");
+      }
+      assert.equal(sidebarRosterHidden(parsed.actions.at(-1)!.raw, width), false,
+        "a stale Host shortcuts row alone is not mistaken for a hidden sidebar");
+    }
+  }
+});
+
+test("production Host shortcuts selection navigation uses its actual parsed entry position", () => {
+  for (const width of [32, 24]) {
+    const controller = new SidebarController({
+      toggleKey: "f8",
+      settingsAvailable: true,
+      legacyToggleOverride: true,
+    });
+    void controller.renderRoster(width, 40);
+    controller.handleInput("\x1b[B"); // New session -> Quit host
+    controller.handleInput("\x1b[B"); // Quit host -> Host shortcuts
+    const frame = controller.renderRoster(width, 40).lines.join("\n");
+    const parsed = parseRosterFrame(frame, width);
+    const selected = selectedRosterEntry(frame, width);
+    assert.equal(parsed.complete, true);
+    assert.ok(selected);
+    assert.equal(selected.kind, "action");
+    assert.equal(selected.label, "Host shortcuts");
+    const renderedPosition = parsed.entries.findIndex((entry) => entry.kind === "action"
+      && entry.label === "Host shortcuts");
+    assert.notEqual(renderedPosition, -1);
+    assert.equal(selected.position, renderedPosition);
+    assert.equal(parsed.entries[selected.position]?.label, "Host shortcuts",
+      "keyboard navigation and the witness agree on the rendered entry index");
+  }
+});
+
+test("production-rendered roster navigation wraps through Host shortcuts and handles a three-action tail", () => {
+  const pressAndAssertNext = (
+    controller: SidebarController,
+    width: number,
+    owned: readonly OwnedRosterLabel[],
+  ): string => {
+    const before = controller.renderRoster(width, 40).lines.join("\n");
+    const parsed = parseRosterFrame(before, width);
+    const selected = selectedRosterEntry(before, width);
+    assert.equal(parsed.complete, true);
+    assert.ok(selected);
+    const targets = rosterNavigationTargets(parsed, owned);
+    assert.ok(targets);
+    const expected = nextRosterNavigationTarget(targets, selected.position);
+    assert.ok(expected);
+    controller.handleInput("\x1b[B");
+    const after = controller.renderRoster(width, 40).lines.join("\n");
+    const actual = selectedRosterEntry(after, width);
+    assert.ok(actual);
+    assert.equal(actual.position, expected.position);
+    const actualTarget = targets.find((target) => target.position === actual.position);
+    assert.ok(actualTarget);
+    assert.equal(actualTarget.label, expected.label);
+    return actualTarget.label;
+  };
+
+  for (const width of [32]) {
+    const owned: readonly OwnedRosterLabel[] = [
+      { rowProbe: "owned-a", displayName: "Native A" },
+      { rowProbe: "owned-b", displayName: "Native B" },
+    ];
+    const nativeItems = [
+      {
+        id: "native-a",
+        label: "Native A",
+        workspace: "/workspace/a",
+        agentDir: "/agents",
+        lifecycle: "alive" as const,
+        busy: false,
+        pendingInput: false,
+        inputSurface: false,
+        activity: [],
+      },
+      {
+        id: "native-b",
+        label: "Native B",
+        workspace: "/workspace/b",
+        agentDir: "/agents",
+        lifecycle: "alive" as const,
+        busy: false,
+        pendingInput: false,
+        inputSurface: false,
+        activity: [],
+      },
+    ];
+    const withSettings = new SidebarController({
+      toggleKey: "f8",
+      settingsAvailable: true,
+      legacyToggleOverride: true,
+    });
+    withSettings.updateItems(nativeItems);
+    assert.equal(pressAndAssertNext(withSettings, width, owned), "Quit host");
+    assert.equal(pressAndAssertNext(withSettings, width, owned), "Host shortcuts",
+      "Quit host advances to the actual optional fourth action");
+    assert.equal(pressAndAssertNext(withSettings, width, owned), "owned-a",
+      "the selected Host shortcuts row wraps to the first owned native entry");
+
+    const startingOnShortcuts = new SidebarController({
+      toggleKey: "f8",
+      settingsAvailable: true,
+      legacyToggleOverride: true,
+    });
+    startingOnShortcuts.updateItems(nativeItems);
+    void startingOnShortcuts.renderRoster(width, 40);
+    startingOnShortcuts.handleInput("\x1b[B");
+    startingOnShortcuts.handleInput("\x1b[B");
+    const hostFrame = startingOnShortcuts.renderRoster(width, 40).lines.join("\n");
+    const hostParsed = parseRosterFrame(hostFrame, width);
+    assert.equal(selectedRosterEntry(hostFrame, width)?.label, "Host shortcuts");
+    assert.ok(rosterNavigationTargets(hostParsed, owned)?.some((target) => target.label === "Host shortcuts"),
+      "the known-highlight fence includes the actual optional action");
+    assert.equal(pressAndAssertNext(startingOnShortcuts, width, owned), "owned-a",
+      "navigation can start on Host shortcuts and advance to the first owned native entry");
+
+    const withoutSettings = new SidebarController({
+      toggleKey: "f8",
+      settingsAvailable: false,
+      legacyToggleOverride: false,
+    });
+    withoutSettings.updateItems(nativeItems);
+    assert.equal(pressAndAssertNext(withoutSettings, width, owned), "Quit host");
+    const noSettingsFrame = withoutSettings.renderRoster(width, 40).lines.join("\n");
+    const noSettingsParsed = parseRosterFrame(noSettingsFrame, width);
+    assert.deepEqual(noSettingsParsed.actions.map((entry) => entry.label), [...ROSTER_ACTIONS]);
+    assert.equal(pressAndAssertNext(withoutSettings, width, owned), "owned-a",
+      "the no-settings three-action tail wraps directly from Quit to the first owned native entry");
+  }
+});
+
+test("navigation targets retain one-to-one owned-session correlation", () => {
+  const controller = new SidebarController({
+    toggleKey: "f8",
+    settingsAvailable: true,
+    legacyToggleOverride: true,
+  });
+  controller.updateItems([{
+    id: "native-a",
+    label: "Native A",
+    workspace: "/workspace/a",
+    agentDir: "/agents",
+    lifecycle: "alive",
+    busy: false,
+    pendingInput: false,
+    inputSurface: false,
+    activity: [],
+  }]);
+  const frame = controller.renderRoster(32, 40).lines.join("\n");
+  const parsed = parseRosterFrame(frame, 32);
+  assert.equal(parsed.complete, true);
+  const targets = rosterNavigationTargets(parsed, [{ rowProbe: "owned-a", displayName: "Native A" }]);
+  assert.ok(targets);
+  const card = parsed.cards[0]!;
+  assert.equal(targets.find((target) => target.position === card.position)?.label, "owned-a");
+  assert.equal(rosterNavigationTargets(parsed, []), undefined,
+    "an actual native card without one owned-session witness cannot enter the navigation order");
+  assert.equal(rosterNavigationTargets(parsed, [{ rowProbe: "owned-a", displayName: "Other" }]), undefined,
+    "a nonmatching owned-session title cannot be guessed into the navigation order");
+});
+
+test("Host shortcuts tails reject partial, unknown, out-of-order, and duplicate rows", () => {
+  for (const width of [32, 24]) {
+    const controller = new SidebarController({
+      toggleKey: "f8",
+      settingsAvailable: true,
+      legacyToggleOverride: true,
+    });
+    const renderedLines = controller.renderRoster(width, 40).lines;
+    const completeFrame = renderedLines.join("\n");
+    const complete = parseRosterFrame(completeFrame, width);
+    assert.equal(complete.complete, true);
+    const actionRows = complete.actions.map((entry) => renderedLines[1 + entry.position]!);
+    const requiredRows = complete.actions.slice(0, ROSTER_ACTIONS.length)
+      .map((entry) => renderedLines[1 + entry.position]!);
+    const shortcutsIndex = complete.actions.findIndex((entry) => entry.label === "Host shortcuts");
+    assert.notEqual(shortcutsIndex, -1);
+    const shortcutsRow = actionRows[shortcutsIndex]!;
+    const footer = renderedLines.slice(1 + complete.entryEnd);
+    const frameWithTail = (tail: readonly string[]): string => [renderedLines[0]!, ...tail, ...footer].join("\n");
+    const plainShortcuts = shortcutsRow.replace(/\x1b\[[0-9;]*m/g, "").trimEnd();
+    assert.ok(plainShortcuts.endsWith("..."), plainShortcuts);
+    const partialShortcuts = plainShortcuts.slice(0, -3);
+    const outOfOrder = [...requiredRows.slice(0, -1), shortcutsRow, requiredRows.at(-1)!];
+
+    const malformedTails: readonly (readonly string[])[] = [
+      [...requiredRows, partialShortcuts],
+      [...requiredRows, "  Unknown action"],
+      [...requiredRows, "  Host shortcuts (unknown suffix)"],
+      outOfOrder,
+      [...actionRows, shortcutsRow],
+    ];
+    for (const tail of malformedTails) {
+      const frame = frameWithTail(tail);
+      const parsed = parseRosterFrame(frame, width);
+      assert.equal(parsed.complete, false, `rejects malformed tail at width ${width}: ${JSON.stringify(tail)}`);
+      assert.deepEqual(parsed.entries, []);
+      assert.deepEqual(parsed.actions, []);
+      assert.equal(rosterNavigationTargets(parsed, []), undefined);
+      assert.equal(selectedRosterEntry(frame, width), undefined);
+      assert.equal(isSidebarFocusedFrame(frame, width), false);
+    }
+
+    assert.equal(sidebarRosterHidden(partialShortcuts, width), false,
+      "a partially painted settings row remains a visible remnant, not a hidden witness");
+  }
 });

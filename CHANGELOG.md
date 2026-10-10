@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.143]
+
+### Added
+
+- The optional session host can independently remap its existing sidebar toggle and
+  roster-only return-to-Main chords (#362) through the private
+  `<agentDir>/session-host/keybindings.json` file or the Host shortcuts editor. Missing
+  settings retain Alt+Left/Alt+Right; the existing `--sidebar-key` remains a toggle-only
+  override. Unsupported, conflicting, unsafe, or unreadable settings fail closed, and
+  editor saves are atomic and take effect immediately without changing either action's
+  behavior or native Pi keybindings.
+
 ## [0.1.0-dev.142]
 
 ### Added

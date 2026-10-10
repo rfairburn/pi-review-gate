@@ -462,6 +462,7 @@ interface Harness {
   brokerOptions?: { socketRoot?: string };
   reports: string[];
   events: string[];
+  agentDir: string;
   result: Promise<number>;
 }
 
@@ -577,7 +578,7 @@ function createHarness(
     ...dependencyOverrides,
   });
   harness = {
-    options: options(overrides), stdin, stdout, signals, terminal, observer, writer, writers, broker, reports, events, manager, sidebar, result,
+    options: options(overrides), stdin, stdout, signals, terminal, observer, writer, writers, broker, reports, events, agentDir: defaultAgentDir, manager, sidebar, result,
     get brokerOptions() { return brokerOptions; },
   };
   // Manager and sidebar construction occur after the broker's first asynchronous boundary.
@@ -848,6 +849,226 @@ test("Main native mode binds the captured Pi environment, not --state-root, to t
     harness.signals.emit("SIGTERM");
     await harness.result;
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("host shortcut editor persists F8/F9, applies them immediately, and preserves active Main identity", async () => {
+  const harness = createHarness();
+  const manager = await ready(harness);
+  fillForm(harness.terminal, "/shortcut-owner");
+  await nextTurn();
+  assert.equal(harness.sidebar?.activeMainOwnerID, "native-1");
+  harness.terminal.emitInput(ALT_LEFT); // focus the visible roster without resizing
+  for (let index = 0; index < 4; index += 1) harness.terminal.emitInput("\x1b[B"); // row -> Saved -> New -> Quit -> Host shortcuts
+  harness.terminal.emitInput(ENTER);
+  assert.equal(harness.sidebar?.focus, "form");
+
+  harness.terminal.emitInput("\x15");
+  harness.terminal.emitInput("f8");
+  harness.terminal.emitInput("\t");
+  harness.terminal.emitInput("\x15");
+  harness.terminal.emitInput("f9");
+  harness.terminal.emitInput(ENTER); // Save through the host-owned form
+  await nextTurn();
+
+  const configPath = join(harness.agentDir, "session-host", "keybindings.json");
+  assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), {
+    version: 1,
+    toggle: "f8",
+    returnToMain: "f9",
+  });
+  assert.equal(harness.sidebar?.focus, "sidebar");
+  assert.equal(harness.sidebar?.visible, true);
+  assert.equal(harness.sidebar?.activeMainOwnerID, "native-1", "saving does not change active Main identity");
+  assert.equal(manager.writes.length, 0, "editor input is never sent to the active native child");
+
+  harness.terminal.emitInput("\x1b[19~"); // configured F8 hides from roster focus
+  assert.equal(harness.sidebar?.visible, false);
+  harness.terminal.emitInput("\x1b[19~"); // hidden F8 shows and focuses the roster
+  await nextTurn();
+  assert.equal(harness.sidebar?.visible, true);
+  assert.equal(harness.sidebar?.focus, "sidebar");
+  harness.terminal.emitInput("\x1b[20~"); // configured F9 returns to Main only
+  assert.equal(harness.sidebar?.visible, true);
+  assert.equal(harness.sidebar?.focus, "main");
+  assert.equal(harness.sidebar?.activeMainOwnerID, "native-1");
+  harness.terminal.emitInput("\x1b[20~"); // fresh F9 in Main remains native input
+  harness.terminal.emitInput(ALT_LEFT); // the old default toggle is native input now
+  assert.deepEqual(manager.writes.slice(-2).map(({ id }) => id), ["native-1", "native-1"]);
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("Main loads the dedicated host shortcut file without changing native Pi keybindings", async () => {
+  const harness = createHarness();
+  const hostDir = join(harness.agentDir, "session-host");
+  mkdirSync(hostDir, { recursive: true });
+  writeFileSync(join(hostDir, "keybindings.json"), JSON.stringify({
+    version: 1,
+    toggle: "f8",
+    returnToMain: "f9",
+  }), "utf8");
+
+  await ready(harness);
+  harness.terminal.emitInput("\x1b[19~"); // loaded F8 toggles the sidebar
+  assert.equal(harness.sidebar?.visible, false);
+  harness.terminal.emitInput("\x1b[19~"); // hidden F8 restores and focuses it
+  await nextTurn();
+  assert.equal(harness.sidebar?.visible, true);
+  assert.equal(harness.sidebar?.focus, "sidebar");
+  harness.terminal.emitInput("\x1b[20~"); // loaded F9 returns to Main
+  assert.equal(harness.sidebar?.focus, "main");
+  harness.terminal.emitInput("\x1b[19~"); // visible Main only transfers focus to roster
+  await nextTurn();
+  assert.equal(harness.sidebar?.visible, true);
+  assert.equal(harness.sidebar?.focus, "sidebar");
+  harness.terminal.emitInput("\x1b[20~");
+  assert.equal(harness.sidebar?.focus, "main");
+  assert.equal(readFileSync(join(harness.agentDir, "keybindings.json"), "utf8"), "{}",
+    "host shortcut loading never modifies native Pi keybindings");
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("legacy --sidebar-key overrides configured toggle and the editor identifies the override", async () => {
+  const harness = createHarness({ toggleKey: "f7" });
+  await ready(harness);
+  harness.terminal.emitInput("\x1b[B"); // New -> Quit host
+  harness.terminal.emitInput("\x1b[B"); // -> Host shortcuts
+  harness.terminal.emitInput(ENTER);
+  const formText = harness.sidebar?.renderForm(80, 24).lines.join(" ").replace(/\x1b\[[0-9;]*m/g, "") ?? "";
+  assert.match(formText, /Legacy --sidebar-key override active: F7/);
+
+  harness.terminal.emitInput("\x15");
+  harness.terminal.emitInput("f8");
+  harness.terminal.emitInput("\t");
+  harness.terminal.emitInput("\x15");
+  harness.terminal.emitInput("f9");
+  harness.terminal.emitInput(ENTER);
+  await nextTurn();
+  assert.deepEqual(JSON.parse(readFileSync(join(harness.agentDir, "session-host", "keybindings.json"), "utf8")), {
+    version: 1,
+    toggle: "f8",
+    returnToMain: "f9",
+  }, "the editor persists the configured binding, not the CLI override");
+  harness.terminal.emitInput("\x1b[19~"); // configured F8 is not effective under --sidebar-key
+  assert.equal(harness.sidebar?.visible, true);
+  harness.terminal.emitInput("\x1b[18~"); // legacy F7 remains the active toggle
+  assert.equal(harness.sidebar?.visible, false);
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("failed host shortcut write keeps the editor open and the previous active toggle", async () => {
+  const harness = createHarness({}, {
+    writeHostShortcutConfig: () => { throw new Error("synthetic settings write failure"); },
+  });
+  await ready(harness);
+  harness.terminal.emitInput("\x1b[B");
+  harness.terminal.emitInput("\x1b[B");
+  harness.terminal.emitInput(ENTER);
+  harness.terminal.emitInput("\x15");
+  harness.terminal.emitInput("f8");
+  harness.terminal.emitInput("\t");
+  harness.terminal.emitInput("\x15");
+  harness.terminal.emitInput("f9");
+  harness.terminal.emitInput(ENTER);
+  assert.equal(harness.sidebar?.focus, "form");
+  const errorText = harness.sidebar?.renderForm(80, 24).lines.join(" ").replace(/\x1b\[[0-9;]*m/g, "") ?? "";
+  assert.match(errorText, /synthetic settings write failure/);
+  harness.terminal.emitInput("\x1b"); // Cancel does not commit the draft
+  assert.equal(harness.sidebar?.focus, "sidebar");
+  harness.terminal.emitInput(ALT_LEFT);
+  assert.equal(harness.sidebar?.visible, false, "the previous Alt+Left toggle remains active after failed Save");
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("invalid existing host shortcut file refuses startup even with --sidebar-key", async () => {
+  const harness = createHarness({ toggleKey: "f8" }, {
+    readHostShortcutConfig: () => ({
+      status: "unavailable",
+      message: "Session host refused: host shortcut settings contain malformed JSON. The file was left untouched; fix or move it before restarting.",
+    }),
+  });
+  assert.equal(await harness.result, 1);
+  assert.equal(harness.manager, undefined, "invalid settings refuse before manager or child construction");
+  assert.ok(harness.reports.some((message) => message.includes("file was left untouched")));
+});
+
+test("legacy toggle override and file return chord aliases are refused at startup", async () => {
+  for (const [toggleKey, returnToMain] of [["f9", "f9"], ["ctrl+-", "ctrl+_"], ["ctrl+alt+-", "ctrl+alt+_"], ["alt+f", "alt+right"]] as const) {
+    const harness = createHarness({ toggleKey }, {
+      readHostShortcutConfig: () => ({
+        status: "loaded",
+        bindings: { toggle: "f8", returnToMain },
+      }),
+    });
+    assert.equal(await harness.result, 1, `${toggleKey} / ${returnToMain}`);
+    assert.equal(harness.manager, undefined);
+    assert.ok(harness.reports.some((message) => message.includes("effective toggle and return-to-Main shortcuts conflict")));
+  }
+});
+
+test("Save refuses a configured return chord that conflicts with the active legacy override", async () => {
+  let writes = 0;
+  const harness = createHarness({ toggleKey: "f9" }, {
+    writeHostShortcutConfig: () => {
+      writes += 1;
+      return { toggle: "f8", returnToMain: "f9" };
+    },
+  });
+  await ready(harness);
+  harness.terminal.emitInput("\x1b[B");
+  harness.terminal.emitInput("\x1b[B");
+  harness.terminal.emitInput(ENTER);
+  harness.terminal.emitInput("\x15");
+  harness.terminal.emitInput("f8");
+  harness.terminal.emitInput("\t");
+  harness.terminal.emitInput("\x15");
+  harness.terminal.emitInput("f9");
+  harness.terminal.emitInput(ENTER);
+
+  assert.equal(writes, 0, "the effective collision is refused before persistence");
+  assert.equal(harness.sidebar?.focus, "form", "the validation error keeps the editor open");
+  const text = harness.sidebar?.renderForm(80, 24).lines.join(" ").replace(/\x1b\[[0-9;]*m/g, "") ?? "";
+  assert.match(text, /different shortcut chords/);
+  harness.terminal.emitInput("\x1b");
+  assert.equal(harness.sidebar?.focus, "sidebar");
+  harness.terminal.emitInput("\x1b[20~"); // legacy F9 remains the active toggle
+  assert.equal(harness.sidebar?.visible, false);
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("Save refuses matcher-overlapping legacy/file pairs before calling persistence", async () => {
+  for (const [legacyToggle, returnToMain] of [
+    ["ctrl+-", "ctrl+_"],
+    ["ctrl+alt+-", "ctrl+alt+_"],
+    ["alt+f", "alt+right"],
+  ] as const) {
+    let writes = 0;
+    const harness = createHarness({ toggleKey: legacyToggle }, {
+      readHostShortcutConfig: () => ({
+        status: "loaded",
+        bindings: { toggle: "f8", returnToMain: "f9" },
+      }),
+      writeHostShortcutConfig: () => {
+        writes += 1;
+        return { toggle: "f8", returnToMain };
+      },
+    });
+    await ready(harness);
+    harness.terminal.emitInput("\x1b[B");
+    harness.terminal.emitInput("\x1b[B");
+    harness.terminal.emitInput(ENTER);
+    harness.terminal.emitInput("\x15");
+    harness.terminal.emitInput("f8");
+    harness.terminal.emitInput("\t");
+    harness.terminal.emitInput("\x15");
+    harness.terminal.emitInput(returnToMain);
+    harness.terminal.emitInput(ENTER);
+
+    assert.equal(writes, 0, `${legacyToggle} / ${returnToMain} must be rejected before persistence`);
+    assert.equal(harness.sidebar?.focus, "form");
+    const text = harness.sidebar?.renderForm(80, 24).lines.join(" ").replace(/\x1b\[[0-9;]*m/g, "") ?? "";
+    assert.match(text, /different shortcut chords/);
+    assert.equal(await closeWithSignal(harness), 0);
   }
 });
 
@@ -1395,6 +1616,10 @@ test("absent native keybindings are silent with real defaults while unavailable/
       nativeSetup: false,
       nativeAgentDir,
       profileRegistry: { prepare: () => { throw new Error("synthetic profile preparation is not expected"); } } satisfies ProfilePreparer,
+    }),
+    readHostShortcutConfig: () => ({
+      status: "absent",
+      bindings: { toggle: "alt+left", returnToMain: "alt+right" },
     }),
   });
   const noticeInForm = (harness: Harness): string => {

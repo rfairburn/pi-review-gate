@@ -29,6 +29,7 @@ import test from "node:test";
 import type { StatusBroker } from "../src/session-host/broker";
 import type { ComposedHostFrame } from "../src/session-host/compositor";
 import type { InstanceManagerOptions, NativeInstanceView, ShutdownResult } from "../src/session-host/instances";
+import { DEFAULT_HOST_SHORTCUTS } from "../src/session-host/host-shortcuts";
 import { EXECUTOR_TOOL_CATALOG_ENV, RUNTIME_ROLE_ENV } from "../src/session-host/launch";
 import type { ProfilePreparer } from "../src/session-host/profiles";
 import type { SessionHostNativeSession } from "../src/session-host/protocol";
@@ -485,6 +486,13 @@ function createHarness(
         prepare: () => { throw new Error("the fake Main manager must not prepare sessions"); },
       } satisfies ProfilePreparer,
     }),
+    readHostShortcutConfig: (agentDir) => {
+      assert.equal(agentDir, "/synthetic-agent");
+      return { status: "absent", bindings: DEFAULT_HOST_SHORTCUTS };
+    },
+    writeHostShortcutConfig: () => {
+      throw new Error("the synthetic row-resume harness must not write shortcut settings");
+    },
     createObserver: (observerOptions) => {
       observer.onChange = observerOptions?.onChange;
       return observer;

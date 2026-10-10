@@ -33,6 +33,7 @@ const SGR_PATTERN = /\x1b\[[0-9;]*m/g;
 const ALT_LEFT_LEGACY = "\x1b[1;3D";
 const ALT_LEFT_ALTCHAT_LEGACY = "\x1bb";
 const F8_LEGACY = "\x1b[19~";
+const F9_LEGACY = "\x1b[20~";
 const FUNCTION_KEY_EVENT_CASES = [
   ["f1", "11", "P"],
   ["f2", "12", "Q"],
@@ -50,6 +51,12 @@ const FUNCTION_KEY_EVENT_CASES = [
 const KITTY_ALT_LEFT_PRESS = "\x1b[1;3:1D";
 const KITTY_ALT_LEFT_REPEAT = "\x1b[1;3:2D";
 const KITTY_ALT_LEFT_RELEASE = "\x1b[1;3:3D";
+const KITTY_ALT_RIGHT_PRESS = "\x1b[1;3:1C";
+const KITTY_ALT_RIGHT_REPEAT = "\x1b[1;3:2C";
+const KITTY_ALT_RIGHT_RELEASE = "\x1b[1;3:3C";
+const KITTY_F9_PRESS = "\x1b[20;1:1~";
+const KITTY_F9_REPEAT = "\x1b[20;1:2~";
+const KITTY_F9_RELEASE = "\x1b[20;1:3~";
 const KITTY_Q = "\x1b[113u";
 const KITTY_ENTER = "\x1b[13u";
 const KITTY_Q_REPEAT = "\x1b[113;1:2u";
@@ -363,6 +370,247 @@ test("configured F8 toggle toggles; the default chord is plain main-focus data",
   ]);
 });
 
+test("Shift-only navigation chords are valid host bindings and match pinned packets", () => {
+  const harness = makeController({ toggleKey: "shift+left", initialVisible: false });
+  harness.send("\x1b[d"); // pinned xterm Shift+Left legacy packet
+  assert.equal(harness.controller.visible, true);
+  assert.equal(harness.controller.focus, "sidebar");
+  assert.deepEqual(harness.actions, [{ type: "visibility", visible: true }]);
+});
+
+test("Enter aliases cannot replace either host action", () => {
+  for (const chord of ["ctrl+m", "ctrl+j"]) {
+    assert.throws(() => new SidebarController({ toggleKey: chord }), /native Enter/);
+    assert.throws(() => new SidebarController({ returnToMainKey: chord }), /native Enter/);
+  }
+});
+
+test("configured return-to-Main is roster-only and its held F-key events stay fenced", () => {
+  const previous = isKittyProtocolActive();
+  setKittyProtocolActive(true);
+  try {
+    const harness = makeRoster(["active", "sibling"], { toggleKey: "f8", returnToMainKey: "f9" });
+    harness.controller.select("active");
+    harness.controller.setActiveMainOwner("active");
+    rosterView(harness.controller, 50, 24);
+    harness.baseline = harness.actions.length;
+
+    harness.send("\x1b[20;1:1~"); // roster-only F9 return
+    assert.equal(harness.controller.focus, "main");
+    assert.equal(harness.controller.visible, true);
+    assert.equal(harness.controller.selectedId, "active");
+    assert.equal(harness.controller.activeMainOwnerID, "active");
+    assert.deepEqual(harness.sinceActions(), [], "return does not select or change the active identity");
+    harness.send("\x1b[20;1:2~"); // held repeat stays claimed after focus transfer
+    harness.send("\x1b[20;1:3~"); // release clears the fence
+    assert.deepEqual(harness.sinceActions(), []);
+
+    harness.send("\x1b[20;1:1~"); // fresh F9 in Main is ordinary native input
+    assert.deepEqual(harness.sinceActions(), [{ type: "forward", data: "\x1b[20;1:1~" }]);
+    harness.send(ALT_LEFT_LEGACY); // old default toggle chord is ordinary native input
+    assert.equal(harness.controller.visible, true);
+    assert.deepEqual(harness.sinceActions().slice(-2), [
+      { type: "forward", data: "\x1b[20;1:1~" },
+      { type: "forward", data: ALT_LEFT_LEGACY },
+    ]);
+  } finally {
+    setKittyProtocolActive(previous);
+  }
+});
+
+test("the configured return chord is consumed in host forms and confirmations", () => {
+  const form = formWith({ options: { toggleKey: "f8", returnToMainKey: "f9" } });
+  form.send(F9_LEGACY);
+  assert.equal(form.controller.focus, "form");
+  assert.deepEqual(form.sinceActions(), []);
+
+  const saved = makeRoster([], { toggleKey: "f8", returnToMainKey: "f9" });
+  saved.send(UP); // New -> Saved conversations
+  void saved.controller.render(50, 24);
+  saved.send(ENTER);
+  assert.equal(saved.controller.focus, "form");
+  saved.baseline = saved.actions.length;
+  saved.send(F9_LEGACY);
+  assert.equal(saved.controller.focus, "form", "Saved picker consumes return rather than taking focus");
+  assert.deepEqual(saved.focusedActions(), []);
+
+  const confirmation = makeRoster(["live"], { toggleKey: "f8", returnToMainKey: "f9" });
+  confirmation.controller.updateItems([makeItem({ id: "live", busy: true, hasLiveProcess: true })]);
+  confirmation.controller.select("live");
+  rosterView(confirmation.controller, 50, 24);
+  confirmation.send("d");
+  assert.equal(confirmation.controller.focus, "confirm");
+  confirmation.send(F9_LEGACY);
+  assert.equal(confirmation.controller.focus, "confirm");
+  assert.deepEqual(confirmation.focusedActions(), []);
+});
+
+test("host shortcut settings edit configured bindings and Cancel leaves active bindings unchanged", () => {
+  const harness = makeController({ settingsAvailable: true });
+  const open = (): void => {
+    void harness.controller.render(60, 20);
+    harness.send(DOWN); // New -> Quit host
+    harness.send(DOWN); // -> Host shortcuts
+    void harness.controller.render(60, 20);
+    harness.send(ENTER);
+    assert.equal(harness.controller.focus, "form");
+  };
+  open();
+  harness.send("\x15");
+  harness.send("f8");
+  harness.send("\t");
+  harness.send("\x15");
+  harness.send("f9");
+  harness.send(ESC); // Cancel is local and emits no save action
+  assert.equal(harness.controller.focus, "sidebar");
+  assert.deepEqual(harness.focusedActions(), []);
+  harness.send(ALT_LEFT_LEGACY);
+  assert.equal(harness.controller.visible, false, "the old active toggle remains in force after Cancel");
+});
+
+test("host shortcut Save validates the pair and applies only after successful completion", () => {
+  const harness = makeController({ settingsAvailable: true });
+  void harness.controller.render(60, 20);
+  harness.send(DOWN);
+  harness.send(DOWN);
+  void harness.controller.render(60, 20);
+  harness.send(ENTER);
+  harness.send("\x15");
+  harness.send("f8");
+  harness.send("\t");
+  harness.send("\x15");
+  harness.send("f9");
+  harness.send(ENTER);
+  const save = harness.sinceActions().find((action) => action.type === "host-shortcuts-save");
+  assert.ok(save && save.type === "host-shortcuts-save");
+  assert.deepEqual(save.bindings, { toggle: "f8", returnToMain: "f9" });
+  assert.equal(harness.controller.focus, "form", "the editor waits for its Save result");
+  assert.equal(harness.controller.completeHostShortcutSave(save.requestId, save.bindings), true);
+  assert.equal(harness.controller.focus, "sidebar");
+  harness.send(F8_LEGACY);
+  assert.equal(harness.controller.visible, false, "the successful Save immediately activates F8");
+});
+
+test("a held old toggle chord stays fenced across Save and its fresh press remains native", () => {
+  const previous = isKittyProtocolActive();
+  setKittyProtocolActive(true);
+  try {
+    const harness = makeController({ initialVisible: false, settingsAvailable: true });
+    harness.send(KITTY_ALT_LEFT_PRESS); // show the sidebar and claim Alt+Left
+    assert.equal(harness.controller.visible, true);
+    assert.equal(harness.controller.focus, "sidebar");
+    void harness.controller.render(60, 20);
+    harness.send(DOWN); // New -> Quit host
+    harness.send(DOWN); // -> Host shortcuts
+    void harness.controller.render(60, 20);
+    harness.send(ENTER);
+    harness.send("\x15");
+    harness.send("f8");
+    harness.send("\t");
+    harness.send("\x15");
+    harness.send("f9");
+    harness.send(ENTER);
+    const save = harness.sinceActions().find((action) => action.type === "host-shortcuts-save");
+    assert.ok(save && save.type === "host-shortcuts-save");
+    assert.equal(harness.controller.completeHostShortcutSave(save.requestId, save.bindings), true);
+    harness.baseline = harness.actions.length;
+
+    harness.send(F8_LEGACY); // hide to Main while the original Alt+Left is held
+    assert.equal(harness.controller.focus, "main");
+    harness.send(KITTY_ALT_LEFT_REPEAT);
+    harness.send(KITTY_ALT_LEFT_RELEASE);
+    assert.deepEqual(harness.sinceActions(), [{ type: "visibility", visible: false }],
+      "the old toggle's held repeat/release must not leak to Main");
+    harness.send(KITTY_ALT_LEFT_PRESS); // retired binding is fresh native input
+    assert.deepEqual(harness.sinceActions(), [
+      { type: "visibility", visible: false },
+      { type: "forward", data: KITTY_ALT_LEFT_PRESS },
+    ]);
+  } finally {
+    setKittyProtocolActive(previous);
+  }
+});
+
+test("a held return chord keeps its original repeat/release fence through Save and Main transfer", () => {
+  const previous = isKittyProtocolActive();
+  setKittyProtocolActive(true);
+  try {
+    const harness = makeController({
+      toggleKey: "f8",
+      returnToMainKey: "alt+right",
+      configuredShortcuts: { toggle: "f8", returnToMain: "alt+right" },
+      settingsAvailable: true,
+    });
+    void harness.controller.render(60, 20);
+    harness.send(DOWN); // New -> Quit host
+    harness.send(DOWN); // -> Host shortcuts
+    void harness.controller.render(60, 20);
+    harness.send(ENTER);
+    harness.send(KITTY_ALT_RIGHT_PRESS); // old return binding is claimed by the editor
+    harness.send("\x15");
+    harness.send("f8");
+    harness.send("\t");
+    harness.send("\x15");
+    harness.send("f9");
+    harness.send(ENTER);
+    const save = harness.sinceActions().find((action) => action.type === "host-shortcuts-save");
+    assert.ok(save && save.type === "host-shortcuts-save");
+    assert.equal(harness.controller.completeHostShortcutSave(save.requestId, save.bindings), true);
+    harness.baseline = harness.actions.length;
+
+    harness.send(F8_LEGACY); // hide to Main while Alt+Right remains held
+    assert.equal(harness.controller.focus, "main");
+    harness.send(KITTY_ALT_RIGHT_REPEAT);
+    harness.send(KITTY_ALT_RIGHT_RELEASE);
+    assert.deepEqual(harness.sinceActions(), [{ type: "visibility", visible: false }],
+      "the held old chord cannot leak after the configured return binding changes");
+    harness.send(KITTY_ALT_RIGHT_PRESS); // a fresh old chord is native in Main
+    assert.deepEqual(harness.sinceActions().slice(-1), [{ type: "forward", data: KITTY_ALT_RIGHT_PRESS }]);
+  } finally {
+    setKittyProtocolActive(previous);
+  }
+});
+
+test("a fresh press of the originally claimed return chord clears its old fence", () => {
+  const previous = isKittyProtocolActive();
+  setKittyProtocolActive(true);
+  try {
+    const harness = makeController({
+      toggleKey: "f8",
+      returnToMainKey: "f9",
+      configuredShortcuts: { toggle: "f8", returnToMain: "f9" },
+      settingsAvailable: true,
+    });
+    void harness.controller.render(60, 20);
+    harness.send(DOWN);
+    harness.send(DOWN);
+    void harness.controller.render(60, 20);
+    harness.send(ENTER);
+    harness.send(KITTY_F9_PRESS); // claimed by the editor before rebinding
+    harness.send("\t");
+    harness.send("\x15");
+    harness.send("alt+right");
+    harness.send(ENTER);
+    const save = harness.sinceActions().find((action) => action.type === "host-shortcuts-save");
+    assert.ok(save && save.type === "host-shortcuts-save");
+    assert.equal(harness.controller.completeHostShortcutSave(save.requestId, save.bindings), true);
+    harness.baseline = harness.actions.length;
+
+    harness.send(F8_LEGACY);
+    harness.send(KITTY_F9_PRESS); // new press of the old chord clears its prior claim
+    harness.send(KITTY_F9_REPEAT);
+    harness.send(KITTY_F9_RELEASE);
+    assert.deepEqual(harness.sinceActions(), [
+      { type: "visibility", visible: false },
+      { type: "forward", data: KITTY_F9_PRESS },
+      { type: "forward", data: KITTY_F9_REPEAT },
+      { type: "forward", data: KITTY_F9_RELEASE },
+    ]);
+  } finally {
+    setKittyProtocolActive(previous);
+  }
+});
+
 test("bare F1-F12 CSI event packets consume press/repeat/release without double-toggle", () => {
   const previous = isKittyProtocolActive();
   setKittyProtocolActive(true);
@@ -517,8 +765,7 @@ test("invalid toggle chords fail construction instead of going silently dead", (
     "ctrl+q",
     "super+q",
     "ctrl+shift+c",
-    "pageUp",
-    "pageDown",
+    "ctrl+pageUp",
     "ctrl+pageDown",
   ]) {
     assert.doesNotThrow(
@@ -585,7 +832,7 @@ test("modified Escape toggle chords fail construction", () => {
   }
 });
 
-test("unmatchable modified function and Clear toggles fail construction", () => {
+test("unmatchable modified function and unsupported special-key toggles fail construction", () => {
   const modifiers = ["ctrl", "shift", "alt", "super"];
   for (let mask = 1; mask < 16; mask += 1) {
     const selected = modifiers.filter((_, index) => (mask & (1 << index)) !== 0);
@@ -596,32 +843,18 @@ test("unmatchable modified function and Clear toggles fail construction", () => 
         /toggleKey/,
       );
     }
-    if (!(selected.length === 1 && (prefix === "ctrl" || prefix === "shift"))) {
-      assert.throws(
-        () => new SidebarController({ toggleKey: `${prefix}+clear` }),
-        /toggleKey/,
-      );
-    }
+    assert.throws(
+      () => new SidebarController({ toggleKey: `${prefix}+clear` }),
+      /toggleKey/,
+    );
+  }
+  for (const key of ["a", "shift+a", "left", "up", "enter", "return", "space", "ctrl+enter", "ctrl+space", "clear", "delete"]) {
+    assert.throws(() => new SidebarController({ toggleKey: key }), /toggleKey/);
   }
 });
 
-test("supported Clear toggles match pinned legacy packets", () => {
-  for (const [toggleKey, packet] of [
-    ["clear", "\x1b[E"],
-    ["ctrl+clear", "\x1bOe"],
-    ["shift+clear", "\x1b[e"],
-  ]) {
-    const harness = makeController({ toggleKey, initialVisible: false });
-    harness.send(packet);
-    assert.equal(harness.controller.visible, true);
-    assert.deepEqual(harness.actions, [{ type: "visibility", visible: true }]);
-  }
-});
-
-test("page key and modified page key toggles validate and match pinned packets", () => {
+test("modified page-navigation toggle matches pinned packets", () => {
   const cases = [
-    ["pageUp", "\x1b[5~"],
-    ["pageDown", "\x1b[6~"],
     ["ctrl+pageDown", "\x1b[6^"],
   ] as const;
   for (const [toggleKey, packet] of cases) {
@@ -772,24 +1005,8 @@ test("sidebar Delete visibly requests removal using the selected row's stable id
   assert.equal(harness.controller.focus, "sidebar");
 });
 
-test("a configured Delete toggle keeps its identity and exposes x as the removal key", () => {
-  const id = "opaque-delete-toggle-row";
-  const harness = makeController({ toggleKey: "delete", initialVisible: false });
-  harness.controller.updateItems([
-    makeItem({ id, lifecycle: "exited", hasLiveProcess: false }),
-  ]);
-  harness.send(DELETE); // configured toggle shows the sidebar
-  assert.equal(harness.controller.focus, "sidebar");
-  harness.send(DOWN); // New -> Quit
-  harness.send(DOWN); // -> exited row
-  const texts = rosterView(harness.controller, 40, 10).texts;
-  assert.ok(texts.join(" ").includes("d/x stop/remove"), JSON.stringify(texts));
-  harness.baseline = harness.actions.length;
-  harness.send("x");
-  assert.deepEqual(harness.focusedActions(), [{ type: "remove", id }]);
-  harness.send(DELETE); // the original configured toggle still hides the sidebar
-  assert.equal(harness.controller.visible, false);
-  assert.deepEqual(harness.focusedActions().at(-1), { type: "visibility", visible: false });
+test("Delete is not accepted as a remapped host shortcut", () => {
+  assert.throws(() => new SidebarController({ toggleKey: "delete" }), /toggleKey/);
 });
 
 test("arrows select roster items then Saved conversations, New session, and Quit host with wrap", () => {
@@ -1205,7 +1422,7 @@ test("stop confirmation ignores held repeats and releases", () => {
   }
 });
 
-test("held d, Delete, and reserved-Delete x repeats never stop an idle owned row", () => {
+test("held d and Delete repeats never stop an idle owned row", () => {
   const previous = isKittyProtocolActive();
   setKittyProtocolActive(true);
   try {
@@ -1231,20 +1448,6 @@ test("held d, Delete, and reserved-Delete x repeats never stop an idle owned row
       assert.deepEqual(harness.focusedActions(), [], "Delete repeat never stops");
       assert.equal(harness.controller.focus, "sidebar");
       harness.send(DELETE); // a deliberate initial press requests the stop
-      assert.deepEqual(harness.focusedActions(), [{ type: "stop-remove", id: "a", confirmed: false }]);
-    }
-    // A reserved-Delete x repeat on a completely idle row never requests a stop.
-    {
-      const harness = makeController({ toggleKey: "delete", initialVisible: false });
-      harness.controller.updateItems([liveItem("a")]);
-      harness.send(DELETE); // the configured toggle shows the sidebar
-      harness.controller.select("a");
-      rosterView(harness.controller, 40, 10);
-      harness.baseline = harness.actions.length;
-      harness.send("\x1b[120;1:2u"); // x repeat
-      assert.deepEqual(harness.focusedActions(), [], "x repeat never stops");
-      assert.equal(harness.controller.focus, "sidebar");
-      harness.send("x"); // a deliberate initial press requests the stop
       assert.deepEqual(harness.focusedActions(), [{ type: "stop-remove", id: "a", confirmed: false }]);
     }
     // A repeat arriving after a MAIN-to-sidebar focus transfer never acts.
@@ -1429,7 +1632,7 @@ test("d on a non-session row is a bounded notice, never an action", () => {
   );
 });
 
-test("hints advertise d stop/remove; Delete stays an alias and x follows a reserved Delete toggle", () => {
+test("hints advertise d stop/remove; Delete stays an alias", () => {
   const harness = makeRoster(["a"]);
   const texts = rosterView(harness.controller, 40, 10).texts;
   assert.ok(texts.join(" ").includes("d stop/remove"), JSON.stringify(texts));
@@ -1444,20 +1647,6 @@ test("hints advertise d stop/remove; Delete stays an alias and x follows a reser
   assert.deepEqual(harness.focusedActions(), []);
   harness.send("n");
 
-  // With Delete reserved as the toggle, x carries the stop/remove behavior.
-  const reserved = makeController({ toggleKey: "delete", initialVisible: false });
-  reserved.controller.updateItems([liveItem("a", { busy: true })]);
-  reserved.send(DELETE); // the configured toggle shows the sidebar
-  assert.equal(reserved.controller.focus, "sidebar");
-  const reservedTexts = rosterView(reserved.controller, 40, 10).texts;
-  assert.ok(reservedTexts.join(" ").includes("d/x stop/remove"), JSON.stringify(reservedTexts));
-  reserved.send(DOWN); // New session -> Quit host
-  reserved.send(DOWN); // -> the live row
-  rosterView(reserved.controller, 40, 10);
-  reserved.baseline = reserved.actions.length;
-  reserved.send("x");
-  assert.equal(reserved.controller.focus, "confirm");
-  assert.deepEqual(reserved.focusedActions(), []);
 });
 
 test("reserved toggle still hides from stop confirmation and resets the frozen target", () => {

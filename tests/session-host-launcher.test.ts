@@ -703,9 +703,12 @@ test("parser forwards exact native bytes only after -- and leaves argv untouched
 
 test("parser accepts bounded Unicode paths and key IDs, rejects malformed wrapper options safely", () => {
   const path2048 = "x".repeat(2048);
-  const key80 = "k".repeat(80);
+  const supportedChord = "ctrl+shift+alt+super+left";
   assert.equal(launcher.parseSessionHostArguments(["--state-root", path2048]).stateRoot, path2048);
-  assert.equal(launcher.parseSessionHostArguments(["--sidebar-key", key80]).toggleKey, key80);
+  assert.equal(launcher.parseSessionHostArguments(["--sidebar-key", supportedChord]).toggleKey, supportedChord);
+  assert.equal(launcher.parseSessionHostArguments(["--sidebar-key", "SUPER+ALT+LEFT"]).toggleKey, "alt+super+left");
+  assert.equal(launcher.parseSessionHostArguments(["--sidebar-key", "shift+left"]).toggleKey, "shift+left");
+  assert.equal(launcher.parseSessionHostArguments(["--sidebar-key", "ctrl+shift+m"]).toggleKey, "ctrl+shift+m");
 
   const invalid: Array<{ argv: string[]; diagnostic: string; secret?: string }> = [
     { argv: ["--state-root"], diagnostic: "Missing value for --state-root." },
@@ -722,6 +725,9 @@ test("parser accepts bounded Unicode paths and key IDs, rejects malformed wrappe
     { argv: ["--pi-executable", "x".repeat(2049)], diagnostic: "Invalid value for --pi-executable." },
     { argv: ["--sidebar-key", "k".repeat(81)], diagnostic: "Invalid value for --sidebar-key." },
     { argv: ["--sidebar-key", "ctrl\u0000left"], diagnostic: "Invalid value for --sidebar-key." },
+    ...["a", "shift+a", "left", "enter", "space", "ctrl+c", "ctrl+[", "ctrl+m", "ctrl+j", "ctrl+f8"].map((key) => ({
+      argv: ["--sidebar-key", key], diagnostic: "Invalid value for --sidebar-key.",
+    })),
     { argv: ["--sidebar-key=a"], diagnostic: "Unknown pi-review-sessions option." },
   ];
   for (const entry of invalid) {

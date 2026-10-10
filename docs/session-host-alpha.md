@@ -144,10 +144,75 @@ inspected or signalled to decide it. The record is removed only by the host that
 it, and only after its owned children settled; an unsettled shutdown keeps it so a later
 host refuses instead of racing children that may still be running. Malformed, oversized,
 unsafe, or unreadable roster state is reported truthfully and left untouched: nothing is
-restored from it, persistence stays disabled, and nothing overwrites it. The sidebar toggle defaults to `alt+left`; `f8` is an
-example of a way to leave Alt+Left available for native word-left editing. Put native Pi
-arguments after a literal `--`; allowed arguments retain their original order and
-bytes. There are no initial host `--workspace`, `--profile`, or `--label` options.
+restored from it, persistence stays disabled, and nothing overwrites it. Host shortcut
+settings and the defaults are described below. Put native Pi arguments after a literal
+`--`; allowed arguments retain their original order and bytes. There are no initial host
+`--workspace`, `--profile`, or `--label` options.
+
+### Host shortcut configuration
+
+The host's two existing keyboard actions have independent bindings. Their dedicated
+private JSON file is `<agentDir>/session-host/keybindings.json`, under the same native
+Pi agent directory used by the roster. It is separate from Pi's native
+`<agentDir>/keybindings.json`, workspace/project keybindings, `/review-settings`, and
+review-gate configuration. A missing host file uses defaults without creating the file:
+`toggle` is `alt+left`, and `returnToMain` is `alt+right`. For example:
+
+```json
+{
+  "version": 1,
+  "toggle": "f8",
+  "returnToMain": "f9"
+}
+```
+
+The Host shortcuts roster entry opens a host-owned editor. Tab switches between the two
+configured fields; the current native form submit binding saves, and the current native
+cancel binding cancels. Save validates both configured chords and the effective pair,
+then atomically writes the file and applies the bindings immediately. Cancel changes
+nothing. A failed or invalid save keeps the editor open with an error and keeps the
+previous file and active bindings. The editor shows configured values, not an active
+legacy override.
+
+Each action takes one supported chord string. Supported chords are modified letters,
+digits, symbols, and navigation keys using the pinned matcher's `ctrl`, `shift`, `alt`,
+and `super` modifiers, or unmodified F1-F12. Shift-only navigation chords (such as
+`shift+left`) are supported; Shift-only printable keys remain ordinary typing. Plain
+navigation, Enter/Return (including Ctrl+M/Ctrl+J), Space, Escape, Ctrl+[ (Escape),
+Ctrl+C, and duplicate bindings are refused; modified function keys and unsupported
+special keys are also refused.
+Equivalent modifier order/case is canonicalized, and legacy aliases recognized as the
+same packet by Pi's pinned matcher are refused too (for example, `ctrl+-`/`ctrl+_` and
+`alt+f`/`alt+right`).
+Omitting an action in a version-1 file keeps that action's default; there are no aliases
+for actions and no disabling value. An invalid, unreadable, oversized, symlinked, or
+otherwise unsafe existing file refuses host startup with an actionable diagnostic and
+is left untouched, even when `--sidebar-key` is supplied.
+
+The existing `--sidebar-key` option remains a legacy toggle-only override. It uses the
+same supported-key validation and takes precedence over the file's `toggle` value. The
+editor identifies the override explicitly; Save still writes the configured toggle,
+while the command-line override remains effective for that run. If the override and
+configured return chord collide, startup and Save refuse the pair rather than choosing
+an action by precedence. No additional command-line options are introduced.
+
+Bindings change only the existing host actions. The toggle keeps its two-step behavior:
+a hidden sidebar is shown and focused; a visible sidebar with Main focus only moves
+focus to the roster; and a sidebar-owned focus hides and returns to Main. The
+return-to-Main chord remains roster-only: it focuses the existing Main input owner
+without selecting the highlighted sibling, hiding the sidebar, resizing children, or
+changing active-session identity, and only when the selected roster entry was completely
+drawn. Its held repeat/release stays fenced; in Main, a fresh return chord is native
+input. Forms, the Saved picker, and confirmations consume the return chord. Existing
+paste opacity, focus/visibility ownership, input routing, and action safeguards are
+unchanged. Ordinary arrow/Enter/Space navigation, other session actions, mouse behavior,
+review authorization, and native Pi bindings are not remapped.
+
+There is no automatic collision rejection against native Pi bindings: the host reserves
+its chords only in the existing host contexts, so native Alt+Left/Alt+Right editor or
+tree bindings may be intercepted while their corresponding host action is active. The
+terminal and operating system must deliver a chord for the host to match it; in
+particular, Super chords require a terminal/platform combination that sends them.
 
 Parent startup arguments apply to **every new instance**. The alpha rejects
 `--continue`/`-c`, `--resume`/`-r`, `--session`, `--session-id`, `--fork`,
@@ -312,9 +377,9 @@ and delegated-execution policies still apply to native activity.
 
 Host keyboard controls apply only while the corresponding host surface has focus. In
 the sidebar, Up/Down moves the selection, Enter opens the selected session or activates
-an existing action entry. A single left-click on a displayed New, Saved, or Quit action
-entry invokes that same existing action: New still opens its form, Saved its picker, and
-Quit follows its existing confirmation rules. These sidebar clicks are handled by the
+an existing action entry. A single left-click on a displayed New, Saved, Quit, or Host shortcuts action entry
+invokes that same action: New still opens its form, Saved its picker, Quit follows its
+existing confirmation rules, and Host shortcuts opens its dedicated editor. These sidebar clicks are handled by the
 host, not forwarded to a native child; existing keyboard controls remain available.
 With the roster focused, a single left click inside a currently displayed native Main
 pane returns keyboard focus to the unchanged active Main owner and consumes that first
@@ -324,16 +389,15 @@ This applies only when the visible native pane still belongs to the current live
 at the displayed geometry. Forms, confirmations, and the narrow sidebar overlay are not
 native Main click targets. Once Main already has focus, mouse input keeps its existing
 native behavior.
-The `d`/`D` or Delete keys stop/remove precisely the selected
-fully displayed row (`x` is the Delete fallback when Delete is configured as the sidebar
-toggle), `q`/`Q` activates Quit host,
-Alt+Right returns input focus to the existing Main owner without activating the
-highlighted row, resizing, or hiding (its repeats and releases are fenced so a held key
-never leaks into the child; in Main focus Alt+Right is ordinary native input), and
-Escape hides the sidebar. The reserved toggle is two-step: it shows and focuses a hidden
-sidebar; from a visible Main focus one press only moves host input focus to the sidebar
-without hiding it or resizing any child; and a press from sidebar-owned focus hides it
-back to Main. A live row stops directly only with positively observed
+The `d`/`D` or Delete keys stop/remove precisely the selected, fully displayed row,
+`q`/`Q` activates Quit host, and the configured return-to-Main chord (Alt+Right by
+default) returns input focus to the existing Main owner without activating the highlighted
+row, resizing, or hiding. Its repeats and releases are fenced so a held key never leaks
+into the child; a fresh return chord in Main focus is ordinary native input. Escape hides
+the sidebar. The configured toggle (Alt+Left by default) is two-step: it shows and focuses
+a hidden sidebar; from a visible Main focus one press only moves host input focus to the
+sidebar without hiding it or resizing any child; and a press from sidebar-owned focus
+hides it back to Main. A live row stops directly only with positively observed
 complete idleness on the conservative ownership channel — zero unsettled owned
 background tasks and shells, not merely the displayed activity-intent counts — and
 fresh authenticated idle revalidation. Otherwise it requires a separate, fully displayed confirmation for
@@ -387,9 +451,10 @@ frame has focus, input is sent only to the explicitly activated, live child; it 
 broadcast to hidden or sibling sessions. Native Escape, `q`/`Q`, and Ctrl+C remain Pi's
 keys whenever the native frame has focus. They cannot be configured as the sidebar
 toggle; conflicting Escape aliases are rejected too. Only the admitted configured
-sidebar-toggle chord is reserved there, including its repeat and release events. The default `alt+left` therefore intentionally takes precedence over
-Pi's native word-left chord; set `--sidebar-key f8` (or another supported key) if you
-need to keep that native chord.
+toggle chord is reserved there, including its repeat and release events. The default
+`alt+left` therefore intentionally takes precedence over Pi's native word-left chord;
+use the Host shortcuts editor or the legacy `--sidebar-key f8` override (or another
+supported key) if you need to keep that native chord.
 
 The sidebar is a bounded top-level summary: the observed native conversation name,
 busy/idle/unknown state, pending-input presence only when observed, and at most a couple

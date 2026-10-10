@@ -2016,8 +2016,8 @@ test("wide equal-sized panes dispatch Saved hit tests only in the right form", a
   }
 });
 
-for (const identicalCaptions of [false, true]) for (const acceptedWhileQueued of [false, true]) test(
-  `real frame-writer waits for callback completion before retargeting a Saved row (identical captions: ${identicalCaptions}, accepted while queued: ${acceptedWhileQueued})`,
+for (const identicalCaptions of [false, true]) for (const acceptedWhileQueued of [false, true]) for (const returnToOriginal of [false, true]) test(
+  `real frame-writer preserves Saved clickability across a pending target change (identical captions: ${identicalCaptions}, accepted while queued: ${acceptedWhileQueued}, return to original: ${returnToOriginal})`,
   async () => {
   const fixture = makeSavedMainFixture("mouse-frame-boundary");
   const secondFile = join(fixture.agentDir, "sessions", "proj", "scroll-second.jsonl");
@@ -2077,6 +2077,12 @@ for (const identicalCaptions of [false, true]) for (const acceptedWhileQueued of
     assert.equal(manager.createOptions.length, 0, "a click before callback completion cannot open undisplayed B");
     emitMouse(harness.terminal, 34, 2, 0, "m");
 
+    if (returnToOriginal) {
+      harness.terminal.emitInput("\x1b[A"); // Return from B to A while B's write is still pending.
+      await nextTurn();
+      assert.equal(output.queuedCount, 1, "the pending A frame stays behind the incomplete B write");
+    }
+
     output.completeQueuedWrites();
     if (!acceptedWhileQueued) {
       assert.equal(manager.createOptions.length, 0,
@@ -2086,11 +2092,11 @@ for (const identicalCaptions of [false, true]) for (const acceptedWhileQueued of
     emitMouse(harness.terminal, 34, 2);
     for (let attempt = 0; attempt < 10 && manager.createOptions.length === 0; attempt += 1) await nextTurn();
     assert.equal(manager.createOptions.length, 1,
-      "the emitted B row is clickable after its callback and any required drain settle the frame");
+      "the final emitted Saved row is clickable after its callback and any required drain settle the frame");
     const admission = manager.createOptions[0]?.savedSession;
     assert.ok(isSavedSessionAdmission(admission));
-    assert.equal((admission as { sessionId: string }).sessionId, savedB.id,
-      "the same coordinate now opens the row actually emitted by the frame writer");
+    assert.equal((admission as { sessionId: string }).sessionId, returnToOriginal ? savedA.id : savedB.id,
+      "the same coordinate opens the row actually emitted by the frame writer");
     assert.notEqual(savedA.id, savedB.id);
     assert.equal(await closeWithSignal(harness), 0);
     shutDown = true;

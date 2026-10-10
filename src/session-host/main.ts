@@ -751,8 +751,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         // Distinct targets can render identical bytes (for example Saved
         // conversations with matching captions and workspaces). Their maps
         // still need a written boundary before mouse authorization changes.
-        if (displayedMousePresentation !== undefined
-          && !sameMouseAuthorization(displayedMousePresentation, mousePresentation)) {
+        if ((displayedMousePresentation !== undefined
+          && !sameMouseAuthorization(displayedMousePresentation, mousePresentation))
+          || (latestMousePresentation !== undefined
+            && !sameMouseAuthorization(latestMousePresentation, mousePresentation))) {
           writer.invalidate?.();
         }
         latestMousePresentation = mousePresentation;

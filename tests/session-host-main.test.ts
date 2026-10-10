@@ -9,7 +9,7 @@ import type { Writable } from "node:stream";
 import test from "node:test";
 
 import type { ComposedHostFrame } from "../src/session-host/compositor";
-import type { InstanceManagerOptions, NativeInstanceView, ShutdownResult } from "../src/session-host/instances";
+import type { CreateInstanceOptions, InstanceManagerOptions, NativeInstanceView, ShutdownResult } from "../src/session-host/instances";
 import {
   createSessionHostFrameWriter,
   type SessionHostFrameDisposition,
@@ -276,7 +276,7 @@ class FakeManager {
   readonly closeExitedCalls: string[] = [];
   readonly refusedCloseIds = new Set<string>();
   readonly resizeCalls: { cols: number; rows: number; ids: string[] }[] = [];
-  readonly createOptions: { workspace: string; savedSession?: unknown }[] = [];
+  readonly createOptions: CreateInstanceOptions[] = [];
   /** Known-owned live session data served to deliberate saved-conversation admission. */
   ownedLiveSessionsData: { id?: string; file?: string }[] = [];
   readonly renameCalls: { id: string; request: StatusRenameRequest }[] = [];
@@ -323,7 +323,7 @@ class FakeManager {
 
   ownedLiveSessions(): { id?: string; file?: string }[] { return [...this.ownedLiveSessionsData]; }
 
-  create(options: { workspace: string; savedSession?: unknown }): Promise<string> {
+  create(options: CreateInstanceOptions): Promise<string> {
     this.createOptions.push({ ...options });
     const id = `native-${this.nextId++}`;
     const error = this.nextError;
@@ -920,6 +920,43 @@ test("a successful New submission activates the created row as the Main input ow
   assert.equal(harness.writer.frames.at(-1)?.frame.cursor.visible, false, "non-alive native frames never retain an owned cursor");
 
   assert.deepEqual(manager.createOptions[1], { workspace: "/another/explicit/workspace" });
+  assert.equal(await closeWithSignal(harness), 0);
+});
+
+test("authenticated SessionSpawn adds a sibling without changing selection, focus, Main owner, or visibility", async () => {
+  const harness = createHarness();
+  const manager = await startTwoSessions(harness);
+  const sidebar = harness.sidebar;
+  assert.ok(sidebar);
+  assert.equal(sidebar.focus, "sidebar");
+  assert.equal(sidebar.selectedId, "native-2");
+  const before = {
+    selectedId: sidebar.selectedId,
+    focus: sidebar.focus,
+    activeMainOwnerID: sidebar.activeMainOwnerID,
+    visible: sidebar.visible,
+  };
+  const spawn = manager.options.onSpawnRequest;
+  assert.equal(typeof spawn, "function", "the host routes only broker-authenticated child requests to its manager");
+  const request = {
+    workspace: "/requested/existing/workspace",
+    title: "Exact sibling title",
+    prompt: "@/literal\n--session is prompt content\n",
+  };
+  assert.equal(await spawn!("native-2", request), "started");
+  assert.deepEqual(manager.createOptions.at(-1), {
+    workspace: request.workspace,
+    initialRequest: { title: request.title, prompt: request.prompt },
+  }, "the explicit workspace/title/prompt are forwarded unchanged, with no defaults");
+  assert.equal(manager.views.length, 3, "the new row appears in the top-level sidebar roster");
+  assert.deepEqual({
+    selectedId: sidebar.selectedId,
+    focus: sidebar.focus,
+    activeMainOwnerID: sidebar.activeMainOwnerID,
+    visible: sidebar.visible,
+  }, before, "the background child does not alter any host presentation or Main ownership state");
+  assert.equal(await spawn!("missing-parent", request), "failed", "a request cannot create a row for an unknown parent child");
+  assert.equal(manager.views.length, 3);
   assert.equal(await closeWithSignal(harness), 0);
 });
 

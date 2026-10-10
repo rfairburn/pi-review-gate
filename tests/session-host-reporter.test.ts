@@ -17,6 +17,12 @@ import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { NODE_OPTIONS_RESTORE_ENV, restoreNodeOptions } from "../src/session-host/bootstrap-preload";
 import activate, { __test as reporterTest, primeReporterBootstrap, SESSION_HOST_STICKY_STATE_KEY } from "../src/session-host/reporter";
+import { getSessionHostSpawnCapability, SESSION_HOST_SPAWN_CAPABILITY_KEY } from "../src/session-host/spawn-capability";
+import {
+  SESSION_HOST_STARTUP_REQUEST_ENV,
+  SESSION_HOST_TITLE_COLUMNS_ENV,
+  __test as startupRequestTest,
+} from "../src/session-host/startup-request";
 import {
   OWNED_ACTIVITY_STATE_KEY,
   ownedActivitySnapshot,
@@ -28,6 +34,7 @@ import {
   MAX_STATUS_FRAME_BYTES,
   MAX_NATIVE_SESSION_NAME_LENGTH,
   MAX_RENAME_NAME_BYTES,
+  type SessionSpawnInput,
   decodeFrame,
   encodeFrame,
   parseBootstrap,
@@ -319,26 +326,40 @@ const lastStatusSequence = (server: TestServer): number => {
 
 let previousBootstrapEnv: string | undefined;
 let previousRuntimeRole: string | undefined;
+let previousStartupRequestEnv: string | undefined;
+let previousTitleColumnsEnv: string | undefined;
 const servers: TestServer[] = [];
 
 beforeEach(() => {
   previousBootstrapEnv = process.env[HOST_BOOTSTRAP_ENV];
+  previousStartupRequestEnv = process.env[SESSION_HOST_STARTUP_REQUEST_ENV];
+  previousTitleColumnsEnv = process.env[SESSION_HOST_TITLE_COLUMNS_ENV];
   delete process.env[HOST_BOOTSTRAP_ENV];
+  delete process.env[SESSION_HOST_STARTUP_REQUEST_ENV];
+  delete process.env[SESSION_HOST_TITLE_COLUMNS_ENV];
   // Hermetic top-level surface: an inherited executor role (orchestrated
   // workers set it) would divert activate() to its no-op guard.
   previousRuntimeRole = process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
   delete process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
   delete (globalThis as Record<PropertyKey, unknown>)[SESSION_HOST_STICKY_STATE_KEY];
   ownedActivityTest.resetOwnedActivityForTests();
+  delete (globalThis as Record<PropertyKey, unknown>)[SESSION_HOST_SPAWN_CAPABILITY_KEY];
+  startupRequestTest.clearProcessMetadata();
 });
 
 afterEach(async () => {
   if (previousBootstrapEnv === undefined) delete process.env[HOST_BOOTSTRAP_ENV];
   else process.env[HOST_BOOTSTRAP_ENV] = previousBootstrapEnv;
+  if (previousStartupRequestEnv === undefined) delete process.env[SESSION_HOST_STARTUP_REQUEST_ENV];
+  else process.env[SESSION_HOST_STARTUP_REQUEST_ENV] = previousStartupRequestEnv;
+  if (previousTitleColumnsEnv === undefined) delete process.env[SESSION_HOST_TITLE_COLUMNS_ENV];
+  else process.env[SESSION_HOST_TITLE_COLUMNS_ENV] = previousTitleColumnsEnv;
   if (previousRuntimeRole === undefined) delete process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
   else process.env.PI_REVIEW_GATE_RUNTIME_ROLE = previousRuntimeRole;
   delete (globalThis as Record<PropertyKey, unknown>)[SESSION_HOST_STICKY_STATE_KEY];
   ownedActivityTest.resetOwnedActivityForTests();
+  delete (globalThis as Record<PropertyKey, unknown>)[SESSION_HOST_SPAWN_CAPABILITY_KEY];
+  startupRequestTest.clearProcessMetadata();
   for (const server of servers.splice(0)) {
     await server.close().catch(() => undefined);
   }
@@ -614,6 +635,7 @@ describe("session-host reporter activation", () => {
     await activate(pi);
     assert.equal(hooks.size, 0);
     assert.equal((globalThis as Record<PropertyKey, unknown>)[SESSION_HOST_STICKY_STATE_KEY], undefined);
+    assert.equal(getSessionHostSpawnCapability(), undefined, "standalone runs have no SessionSpawn capability");
     // Even a TUI session_start must not connect: no hooks were registered.
     await sleep(20);
     assert.equal(server.connections, 0);
@@ -709,6 +731,7 @@ describe("session-host reporter activation", () => {
     await activate(pi);
     assert.equal(hooks.size, 0);
     assert.equal(process.env[HOST_BOOTSTRAP_ENV], undefined);
+    assert.equal(getSessionHostSpawnCapability(), undefined, "executor processes never publish SessionSpawn authority");
   });
 });
 
@@ -724,16 +747,30 @@ describe("session-host reporter status frames", () => {
     ui?: TestUi;
     isIdle?: () => boolean;
     sessionManager?: TestCtx["sessionManager"];
+    startupRequest?: { readonly title: string; readonly prompt: string };
+    titleColumns?: number;
+    onStartupApi?: {
+      setSessionName(name: string): void;
+      sendUserMessage(message: string, options?: { expandPromptTemplates?: boolean }): void;
+    };
     reporterOptions?: {
       reconnectDelayMs?: number;
       maxReconnectAttempts?: number;
+      spawnTimeoutMs?: number;
       connectSocket?: (socketPath: string) => net.Socket;
       onSocket?: (socket: net.Socket) => void;
     };
   }): Promise<{ testPi: TestPi; ctx: TestCtx; bootstrap: Record<string, unknown> }> {
     const bootstrap = options.bootstrap ?? makeBootstrap(options.server.socketPath);
     process.env[HOST_BOOTSTRAP_ENV] = JSON.stringify(bootstrap);
+    process.env[SESSION_HOST_TITLE_COLUMNS_ENV] = String(options.titleColumns ?? 32);
+    if (options.startupRequest !== undefined) {
+      process.env[SESSION_HOST_STARTUP_REQUEST_ENV] = JSON.stringify(options.startupRequest);
+    }
     const testPi = createPi();
+    if (options.onStartupApi) {
+      Object.assign(testPi.pi as object, options.onStartupApi);
+    }
     await activate(testPi.pi, options.reporterOptions);
     const ui = options.ui ?? makeUi();
     const ctx = makeCtx(ui.ui, options.mode ?? "tui", options.isIdle ?? (() => true));
@@ -741,6 +778,104 @@ describe("session-host reporter status frames", () => {
     await testPi.trigger("session_start", { type: "session_start", reason: "startup" }, ctx);
     return { testPi, ctx, bootstrap };
   }
+
+  it("publishes an authenticated, exact-once SessionSpawn capability only for a hosted TUI child", async () => {
+    const server = await startTestServer();
+    const { testPi, bootstrap } = await startSession({ server });
+    const capability = getSessionHostSpawnCapability();
+    assert.ok(capability, "valid reporter bootstrap publishes the process-local tool capability");
+    assert.equal(capability.titleColumns, 32, "the capability carries host-issued title-space metadata, not an auth token");
+    await server.waitForFrame((frame) => frame.message.type === "hello");
+    const input: SessionSpawnInput = {
+      workspace: "/existing exact workspace",
+      title: "A title beyond the sidebar recommendation ".repeat(7),
+      prompt: "--session is prompt content, not a native option\nPreserve this exactly.\n",
+    };
+    const pending = capability.spawn(input);
+    const request = await server.waitForFrame((frame) => frame.message.type === "spawn_request");
+    assert.equal(request.message.instanceId, bootstrap.instanceId);
+    assert.equal(request.message.generation, bootstrap.generation);
+    assert.equal(request.message.token, bootstrap.token, "only the authenticated local protocol carries the capability token");
+    assert.equal(request.message.workspace, input.workspace);
+    assert.equal(request.message.title, input.title);
+    assert.equal(request.message.prompt, input.prompt);
+    assert.equal(server.frames.filter((frame) => frame.message.type === "spawn_request").length, 1);
+    assert.equal(statusFrames(server).some((frame) => JSON.stringify(frame.message).includes(input.prompt)), false,
+      "the initial prompt never enters status frames");
+
+    server.sendToClients(encodeFrame({
+      version: 1,
+      type: "spawn_result",
+      instanceId: bootstrap.instanceId,
+      generation: bootstrap.generation,
+      requestId: request.message.requestId,
+      outcome: "started",
+    } as never));
+    assert.equal(await pending, "started");
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("does not dispatch the initial request from the reporter's early session_start hook", async () => {
+    const server = await startTestServer();
+    const title = "A title retained for the gate initializer";
+    const prompt = "@/path-that-must-not-be-read\n--session /tmp/old.jsonl\n/prompt-template run\n";
+    const submittedNames: string[] = [];
+    const submitted: Array<{ message: string; options?: { expandPromptTemplates?: boolean } }> = [];
+    const { testPi } = await startSession({
+      server,
+      startupRequest: { title, prompt },
+      titleColumns: 47,
+      onStartupApi: {
+        setSessionName: (name) => { submittedNames.push(name); },
+        sendUserMessage: (message, options) => { submitted.push({ message, options }); },
+      },
+    });
+    assert.deepEqual(submittedNames, [], "review-gate session initialization owns native title dispatch");
+    assert.deepEqual(submitted, [], "the reporter must not start a turn before gate authorization/checkpoint setup");
+    assert.equal(process.env[SESSION_HOST_STARTUP_REQUEST_ENV], undefined, "the authenticated reporter consumes the one-shot request env");
+    assert.equal(getSessionHostSpawnCapability()?.titleColumns, 47, "title guidance uses the host's actual visible-layout snapshot");
+    assert.equal(statusFrames(server).some((frame) => JSON.stringify(frame.message).includes(prompt)), false,
+      "the exact prompt is not retained in reporter status frames");
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("returns unknown after post-send cancellation and does not retry on a later acknowledgement", async () => {
+    const server = await startTestServer();
+    const { testPi, bootstrap } = await startSession({ server });
+    await server.waitForFrame((frame) => frame.message.type === "hello");
+    const capability = getSessionHostSpawnCapability();
+    assert.ok(capability);
+    const controller = new AbortController();
+    const pending = capability.spawn({ workspace: "/existing", title: "Child", prompt: "Explicit prompt." }, controller.signal);
+    const request = await server.waitForFrame((frame) => frame.message.type === "spawn_request");
+    controller.abort();
+    assert.equal(await pending, "unknown", "cancellation after write cannot claim no child");
+    server.sendToClients(encodeFrame({
+      version: 1,
+      type: "spawn_result",
+      instanceId: bootstrap.instanceId,
+      generation: bootstrap.generation,
+      requestId: request.message.requestId,
+      outcome: "started",
+    } as never));
+    await sleep(20);
+    assert.equal(server.frames.filter((frame) => frame.message.type === "spawn_request").length, 1,
+      "the reporter never resends after cancellation or a later connection event");
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
+
+  it("bounds the caller wait and reports unknown without claiming a child was not created", async () => {
+    const server = await startTestServer();
+    const { testPi } = await startSession({ server, reporterOptions: { spawnTimeoutMs: 15 } });
+    await server.waitForFrame((frame) => frame.message.type === "hello");
+    const capability = getSessionHostSpawnCapability();
+    assert.ok(capability);
+    const outcome = capability.spawn({ workspace: "/existing", title: "Child", prompt: "Start." });
+    await server.waitForFrame((frame) => frame.message.type === "spawn_request");
+    assert.equal(await outcome, "unknown");
+    assert.equal(server.frames.filter((frame) => frame.message.type === "spawn_request").length, 1);
+    await testPi.trigger("session_shutdown", { type: "session_shutdown" });
+  });
 
   it("sends hello with the token, then an initial Ready status", async () => {
     const server = await startTestServer();
@@ -3414,6 +3549,8 @@ describe("session-host bootstrap preload", () => {
         { relative: "src/session-host/bootstrap-preload.js", source: join(__dirname, "..", "src/session-host/bootstrap-preload.js") },
         { relative: "src/session-host/native-persistence.js", source: join(__dirname, "..", "src/session-host/native-persistence.js") },
         { relative: "src/session-host/owned-activity.js", source: join(__dirname, "..", "src/session-host/owned-activity.js") },
+        { relative: "src/session-host/spawn-capability.js", source: join(__dirname, "..", "src/session-host/spawn-capability.js") },
+        { relative: "src/session-host/startup-request.js", source: join(__dirname, "..", "src/session-host/startup-request.js") },
       ]);
       const spacedPreload = join(root, "src/session-host/bootstrap-preload.js");
       assert.ok(spacedPreload.includes(" "), "fixture preload path contains spaces");

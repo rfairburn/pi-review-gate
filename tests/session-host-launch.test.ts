@@ -1653,10 +1653,14 @@ test("the startup options helper resolves only the own compiled package scripts 
   const compiledConfigPath = join(process.cwd(), "dist-test", "src", "config-path.js");
   const compiledSavedSessions = join(process.cwd(), "dist-test", "src", "session-host", "saved-sessions.js");
   const compiledNativeSessionSdk = join(process.cwd(), "dist-test", "src", "session-host", "native-session-sdk.js");
+  const compiledStartupRequest = join(process.cwd(), "dist-test", "src", "session-host", "startup-request.js");
+  const compiledProtocol = join(process.cwd(), "dist-test", "src", "session-host", "protocol.js");
   assert.ok(existsSync(compiledLaunch), "the compiled launch module under test must exist");
   assert.ok(existsSync(compiledConfigPath), "the compiled native config-path helper must exist");
   assert.ok(existsSync(compiledSavedSessions), "the compiled saved-session catalog module must exist");
   assert.ok(existsSync(compiledNativeSessionSdk), "the compiled public SDK loader module must exist");
+  assert.ok(existsSync(compiledStartupRequest), "the compiled startup-request module must exist");
+  assert.ok(existsSync(compiledProtocol), "the compiled session-host protocol module must exist");
 
   // Tree A: the own package scripts/ is missing, but a MALICIOUS ancestor
   // scripts/ helper exists. The loader must reject fail-closed without ever
@@ -1667,6 +1671,8 @@ test("the startup options helper resolves only the own compiled package scripts 
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "launch.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "saved-sessions.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "native-session-sdk.js"),
+    join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "startup-request.js"),
+    join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "protocol.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "config-path.js"),
     join(rootA, "scripts", "session-host-startup-options.cjs"),
     markerA,
@@ -1685,6 +1691,8 @@ test("the startup options helper resolves only the own compiled package scripts 
   await cp(compiledLaunch, join(distA, "launch.js"));
   await cp(compiledSavedSessions, join(distA, "saved-sessions.js"));
   await cp(compiledNativeSessionSdk, join(distA, "native-session-sdk.js"));
+  await cp(compiledStartupRequest, join(distA, "startup-request.js"));
+  await cp(compiledProtocol, join(distA, "protocol.js"));
   await cp(compiledConfigPath, join(pkgA, "dist", "src", "config-path.js"));
   await mkdir(join(rootA, "scripts"), { recursive: true });
   await writeFile(
@@ -1709,6 +1717,8 @@ test("the startup options helper resolves only the own compiled package scripts 
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "launch.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "saved-sessions.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "native-session-sdk.js"),
+    join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "startup-request.js"),
+    join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "protocol.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "config-path.js"),
     join(rootB, "node_modules", "pi-review-gate", "scripts", "session-host-startup-options.cjs"),
   ], [
@@ -1726,6 +1736,8 @@ test("the startup options helper resolves only the own compiled package scripts 
   await cp(compiledLaunch, join(distB, "launch.js"));
   await cp(compiledSavedSessions, join(distB, "saved-sessions.js"));
   await cp(compiledNativeSessionSdk, join(distB, "native-session-sdk.js"));
+  await cp(compiledStartupRequest, join(distB, "startup-request.js"));
+  await cp(compiledProtocol, join(distB, "protocol.js"));
   await cp(compiledConfigPath, join(pkgB, "dist", "src", "config-path.js"));
   await mkdir(join(pkgB, "scripts"), { recursive: true });
   await cp(join(process.cwd(), "scripts", "session-host-startup-options.cjs"), join(pkgB, "scripts", "session-host-startup-options.cjs"));

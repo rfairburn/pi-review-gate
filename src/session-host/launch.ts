@@ -28,6 +28,7 @@ import {
   SavedSessionAdmission,
   validateSavedSessionLocation,
 } from "./saved-sessions";
+import { SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV } from "./startup-request";
 
 /**
  * Native standalone Pi launch preparation (alpha, backend descriptor stage).
@@ -369,6 +370,7 @@ function loadLauncherHelper(): LauncherHelper {
 /** Minimal typed view of the shared startup-options admission helper (single shared implementation). */
 interface SessionHostStartupOptionsHelper {
   assertSessionHostStartupOptions(args: readonly string[], env?: NodeJS.ProcessEnv): void;
+  composeFreshSessionSpawnArgs(args: readonly string[], title: string): string[];
 }
 
 let cachedStartupOptionsHelper: SessionHostStartupOptionsHelper | undefined;
@@ -396,11 +398,17 @@ function loadStartupOptionsHelper(): SessionHostStartupOptionsHelper {
   // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
   const helperModule: unknown = require(candidate);
   const helper = helperModule as SessionHostStartupOptionsHelper;
-  if (typeof helper.assertSessionHostStartupOptions !== "function") {
-    throw new Error("the shared session host startup options helper is missing assertSessionHostStartupOptions");
+  if (typeof helper.assertSessionHostStartupOptions !== "function"
+    || typeof helper.composeFreshSessionSpawnArgs !== "function") {
+    throw new Error("the shared session host startup options helper is missing a required startup-options operation");
   }
   cachedStartupOptionsHelper = helper;
   return helper;
+}
+
+/** Compose a fresh child's inherited native settings without inheriting parent messages or @files. */
+export function composeFreshSessionSpawnArgs(args: readonly string[], title: string): string[] {
+  return loadStartupOptionsHelper().composeFreshSessionSpawnArgs(args, title);
 }
 
 function unsupportedPlatformDiagnostic(platform: string): string {
@@ -415,7 +423,8 @@ function assertSupportedPlatform(platform: NodeJS.Platform): void {
 
 /** Windows has case-insensitive environment names; these stale capabilities are dropped in every casing. */
 function isStaleHostCapabilityName(name: string): boolean {
-  if (name === SESSION_HOST_BOOTSTRAP_ENV || name === NODE_OPTIONS_RESTORE_ENV) return true;
+  if (name === SESSION_HOST_BOOTSTRAP_ENV || name === NODE_OPTIONS_RESTORE_ENV
+    || name === SESSION_HOST_STARTUP_REQUEST_ENV || name === SESSION_HOST_TITLE_COLUMNS_ENV) return true;
   return SETTLEMENT_ENV_SUFFIXES.some((suffix) =>
     name === `PI_REVIEW_GATE_SETTLEMENT_${suffix}` || name === `PI_REVIEW_GATE_QUIESCENCE_${suffix}`,
   );
@@ -473,6 +482,8 @@ function rejectAndStripInheritedHostCapabilities(env: NodeJS.ProcessEnv): void {
   delete env[RUNTIME_ROLE_ENV];
   delete env[EXECUTOR_TOOL_CATALOG_ENV];
   delete env[SESSION_HOST_BOOTSTRAP_ENV];
+  delete env[SESSION_HOST_STARTUP_REQUEST_ENV];
+  delete env[SESSION_HOST_TITLE_COLUMNS_ENV];
   delete env[NODE_OPTIONS_RESTORE_ENV];
   for (const suffix of SETTLEMENT_ENV_SUFFIXES) delete env[`PI_REVIEW_GATE_SETTLEMENT_${suffix}`];
   for (const suffix of SETTLEMENT_ENV_SUFFIXES) delete env[`PI_REVIEW_GATE_QUIESCENCE_${suffix}`];

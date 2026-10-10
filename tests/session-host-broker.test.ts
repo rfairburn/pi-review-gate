@@ -22,8 +22,11 @@ import {
   type SessionHostStatus,
   MAX_STATUS_FRAME_BYTES,
   decodeFrame,
+  encodeFrame,
   parseBootstrap,
   parseShutdownAck,
+  type SessionSpawnInput,
+  type SessionSpawnOutcome,
 } from "../src/session-host/protocol";
 
 const INSTANCE_A = "11111111-1111-4111-8111-111111111111";
@@ -265,6 +268,7 @@ async function withDeadline<T>(promise: Promise<T>, label: string, timeoutMs = S
 }
 
 afterEach(async () => {
+  brokerTest.setSpawnTimeoutForTests(undefined);
   brokerTest.setSocketPathLimitForTests(undefined);
   brokerTest.setPlatformForTests(undefined);
   brokerTest.setCreateServerForTests(undefined);
@@ -1000,6 +1004,79 @@ test("registration shutdown is authenticated, idempotent, session-fenced, and ne
   await waitFor(() => recorded.disconnects === 1);
 });
 
+test("pending Stop fences new SessionSpawn requests until an idle-only rejection is confirmed", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  let spawnCalls = 0;
+  let statuses = 0;
+  const registration = broker.register(INSTANCE_A, {
+    onStatus: () => { statuses += 1; },
+    onDisconnect: () => undefined,
+    onSpawnRequest: () => {
+      spawnCalls += 1;
+      return Promise.resolve("started");
+    },
+  });
+  const client = await connectClient(broker.socketPath);
+  const outbound: Record<string, unknown>[] = [];
+  let buffer = "";
+  client.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    let newline: number;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const message = decodeFrame(buffer.slice(0, newline + 1));
+      buffer = buffer.slice(newline + 1);
+      if (message) outbound.push(message as unknown as Record<string, unknown>);
+    }
+  });
+  const nativeSession = { sessionId: "native-stop-fence", epoch: 3, name: "Parent" };
+  client.write(encodeFrame(helloFrame(registration.bootstrap) as never)
+    + encodeFrame(statusFrame(registration.bootstrap, { sequence: 1, nativeSession }) as never));
+  await waitFor(() => statuses === 1);
+  const stopping = registration.shutdown({ requireIdle: true });
+  await waitFor(() => outbound.some((frame) => frame.type === "shutdown_request"));
+  const shutdown = outbound.find((frame) => frame.type === "shutdown_request")!;
+  const blockedSpawn = {
+    version: 1,
+    type: "spawn_request",
+    instanceId: registration.bootstrap.instanceId,
+    generation: registration.bootstrap.generation,
+    token: registration.bootstrap.token,
+    requestId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    workspace: "/existing workspace",
+    title: "Blocked while stopping",
+    prompt: "This must not launch during Stop.",
+  };
+  client.write(encodeFrame(blockedSpawn as never));
+  await waitFor(() => outbound.some((frame) => frame.type === "spawn_result" && frame.requestId === blockedSpawn.requestId));
+  assert.equal(outbound.find((frame) => frame.type === "spawn_result" && frame.requestId === blockedSpawn.requestId)?.outcome,
+    "failed", "the broker refuses the request without invoking the host while shutdown is pending");
+  assert.equal(spawnCalls, 0);
+
+  client.write(encodeFrame({
+    version: 1,
+    type: "shutdown_result",
+    instanceId: registration.bootstrap.instanceId,
+    generation: registration.bootstrap.generation,
+    requestId: shutdown.requestId,
+    expectedSessionId: nativeSession.sessionId,
+    expectedSessionEpoch: nativeSession.epoch,
+    outcome: "rejected",
+    reason: "not-idle",
+  } as never));
+  assert.equal((await stopping).status, "not-idle");
+
+  const retry = { ...blockedSpawn, requestId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee" };
+  client.write(encodeFrame(retry as never));
+  await waitFor(() => outbound.some((frame) => frame.type === "spawn_result" && frame.requestId === retry.requestId));
+  assert.equal(outbound.find((frame) => frame.type === "spawn_result" && frame.requestId === retry.requestId)?.outcome,
+    "started", "a positively rejected idle-only preflight restores spawn admission");
+  assert.equal(spawnCalls, 1);
+  assert.equal(outbound.find((frame) => frame.type === "spawn_result" && frame.requestId === blockedSpawn.requestId)?.outcome,
+    "failed", "the request rejected during Stop remains deduplicated after recovery");
+
+  await disposeBroker(broker);
+});
+
 test("shutdown acknowledgements arriving after a session change are rejected", async () => {
   const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
   const recorded = recording();
@@ -1655,5 +1732,167 @@ test("authenticated status forwards bounded owned-work counts unchanged, degradi
   assert.equal(recorded.statuses[1]!.activeTasks, null, "invalid intent is unknown, never zero");
   assert.equal(recorded.statuses[1]!.activeShells, null);
 
+  await disposeBroker(broker);
+});
+
+test("authenticated SessionSpawn is routed once and returns only a correlated launch outcome", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  let resolveSpawn!: (outcome: SessionSpawnOutcome) => void;
+  const hostOperation = new Promise<SessionSpawnOutcome>((resolve) => { resolveSpawn = resolve; });
+  const received: SessionSpawnInput[] = [];
+  let calls = 0;
+  const registration = broker.register(INSTANCE_A, {
+    onStatus: () => undefined,
+    onDisconnect: () => undefined,
+    onSpawnRequest: (input) => {
+      calls += 1;
+      received.push(input);
+      return hostOperation;
+    },
+  });
+  const client = await connectClient(broker.socketPath);
+  const replies: Record<string, unknown>[] = [];
+  let buffer = "";
+  client.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    let newline: number;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, newline + 1);
+      buffer = buffer.slice(newline + 1);
+      const message = decodeFrame(line);
+      if (message) replies.push(message as unknown as Record<string, unknown>);
+    }
+  });
+  const request = {
+    version: 1 as const,
+    type: "spawn_request" as const,
+    instanceId: registration.bootstrap.instanceId,
+    generation: registration.bootstrap.generation,
+    token: registration.bootstrap.token,
+    requestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    workspace: "/existing workspace",
+    title: "A long friendly title " + "x".repeat(280),
+    prompt: "--session must remain prompt text\nKeep this exact.\n",
+  };
+  const encoded = encodeFrame(request as never);
+  client.write(encodeFrame(helloFrame(registration.bootstrap) as never) + encoded + encoded);
+  await waitFor(() => calls === 1);
+  assert.deepEqual(received, [{ workspace: request.workspace, title: request.title, prompt: request.prompt }]);
+  assert.equal(Object.hasOwn(received[0]!, "token"), false, "the credential never reaches the host callback");
+  assert.equal(replies.length, 0, "the broker waits for the host's actual launch decision");
+
+  resolveSpawn("started");
+  await waitFor(() => replies.length === 1);
+  assert.deepEqual(replies[0], {
+    version: 1,
+    type: "spawn_result",
+    instanceId: request.instanceId,
+    generation: request.generation,
+    requestId: request.requestId,
+    outcome: "started",
+  });
+  assert.equal(JSON.stringify(replies).includes(request.prompt), false, "the reply never echoes prompt content");
+  client.write(encoded); // A completed exact replay is acknowledged without launching twice.
+  await waitFor(() => replies.length === 2);
+  assert.equal(calls, 1);
+  await disposeBroker(broker);
+});
+
+test("SessionSpawn rejects a spoofed token and deduplicates across connection supersession", async () => {
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  let resolveSpawn!: (outcome: SessionSpawnOutcome) => void;
+  const hostOperation = new Promise<SessionSpawnOutcome>((resolve) => { resolveSpawn = resolve; });
+  let calls = 0;
+  const registration = broker.register(INSTANCE_A, {
+    onStatus: () => undefined,
+    onDisconnect: () => undefined,
+    onSpawnRequest: () => { calls += 1; return hostOperation; },
+  });
+  const request = {
+    version: 1 as const,
+    type: "spawn_request" as const,
+    instanceId: registration.bootstrap.instanceId,
+    generation: registration.bootstrap.generation,
+    token: registration.bootstrap.token,
+    requestId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    workspace: "/existing workspace",
+    title: "Hosted child",
+    prompt: "Start.",
+  };
+  const spoofed = await connectClient(broker.socketPath);
+  spoofed.write(encodeFrame(helloFrame(registration.bootstrap) as never) + encodeFrame({ ...request, token: "0".repeat(64) } as never));
+  await expectClientClose(spoofed);
+  assert.equal(calls, 0, "a valid hello does not authorize a forged per-request token");
+
+  const first = await connectClient(broker.socketPath);
+  first.write(encodeFrame(helloFrame(registration.bootstrap) as never) + encodeFrame(request as never));
+  await waitFor(() => calls === 1);
+  const second = await connectClient(broker.socketPath);
+  const replies: Record<string, unknown>[] = [];
+  let buffer = "";
+  second.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    let newline: number;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const message = decodeFrame(buffer.slice(0, newline + 1));
+      buffer = buffer.slice(newline + 1);
+      if (message) replies.push(message as unknown as Record<string, unknown>);
+    }
+  });
+  second.write(encodeFrame(helloFrame(registration.bootstrap) as never) + encodeFrame(request as never));
+  await expectClientClose(first);
+  assert.equal(calls, 1, "a replay on the replacement connection attaches to the in-flight request");
+  resolveSpawn("started");
+  await waitFor(() => replies.length === 1);
+  assert.equal(replies[0]!.requestId, request.requestId);
+  assert.equal(replies[0]!.outcome, "started");
+  await disposeBroker(broker);
+});
+
+test("SessionSpawn timeout is an unknown result and permanently deduplicates that request id", async () => {
+  brokerTest.setSpawnTimeoutForTests(25);
+  const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
+  let resolveSpawn!: (outcome: SessionSpawnOutcome) => void;
+  const hostOperation = new Promise<SessionSpawnOutcome>((resolve) => { resolveSpawn = resolve; });
+  let calls = 0;
+  const registration = broker.register(INSTANCE_A, {
+    onStatus: () => undefined,
+    onDisconnect: () => undefined,
+    onSpawnRequest: () => { calls += 1; return hostOperation; },
+  });
+  const client = await connectClient(broker.socketPath);
+  const replies: Record<string, unknown>[] = [];
+  let buffer = "";
+  client.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    let newline: number;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const message = decodeFrame(buffer.slice(0, newline + 1));
+      buffer = buffer.slice(newline + 1);
+      if (message) replies.push(message as unknown as Record<string, unknown>);
+    }
+  });
+  const request = {
+    version: 1,
+    type: "spawn_request",
+    instanceId: registration.bootstrap.instanceId,
+    generation: registration.bootstrap.generation,
+    token: registration.bootstrap.token,
+    requestId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    workspace: "/existing workspace",
+    title: "Hosted child",
+    prompt: "Start.",
+  };
+  const frame = encodeFrame(helloFrame(registration.bootstrap) as never) + encodeFrame(request as never);
+  client.write(frame);
+  await waitFor(() => replies.length === 1);
+  assert.equal(replies[0]!.outcome, "unknown");
+  client.write(encodeFrame(request as never));
+  await waitFor(() => replies.length === 2);
+  assert.equal(replies[1]!.outcome, "unknown");
+  resolveSpawn("started"); // Late completion cannot upgrade the unknown acknowledgement.
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(replies.length, 2);
+  assert.equal(calls, 1);
   await disposeBroker(broker);
 });

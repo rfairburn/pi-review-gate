@@ -26,6 +26,7 @@ import {
   reconcileRestoredReviewWindows,
   reconcileWindowReviewerSelection,
   rememberUserRequest,
+  rememberUserRequestVerbatim,
   setReviewWindowCheckpointBaseline,
   type ReviewGateState,
 } from "./state";
@@ -56,6 +57,9 @@ import { DeferredToolManager, isDeferredToolHost } from "./deferred-tools";
 import { loadOperatingModeSegments, OPERATING_MODE_LABELS } from "./operating-mode";
 import { registerModeCycleShortcut } from "./mode-cycle";
 import { contextIsInteractiveTui, registerUserQuestions, userQuestionsBeginSession, userQuestionsEndSession } from "./user-question";
+import { getSessionHostSpawnCapability } from "./session-host/spawn-capability";
+import { registerSessionSpawnTool } from "./session-host/spawn-tool";
+import { consumeSessionHostStartupRequest } from "./session-host/startup-request";
 import {
   registerNotificationMessageRenderers,
   warmPiTuiHost,
@@ -97,6 +101,8 @@ interface ActivationDependencies {
    * scope always comes from the live session context at session_start.
    */
   initialCheckpointScope?: ReviewCheckpointScope;
+  /** Deterministically suspends session-start setup in lifecycle tests; absent in production. */
+  sessionStartInitializationTestBarrier?: () => Promise<void>;
 }
 
 export async function activate(pi: unknown, dependencies: ActivationDependencies = {}): Promise<void> {
@@ -187,6 +193,14 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   // authoritative, so this never force-enables the tool through setActiveTools.
   if (canRegisterGitReadTool(pi)) {
     registerGitReadTool(pi, () => currentCwd);
+  }
+
+  // SessionSpawn exists only in the reporter-authenticated top-level sidebar
+  // child. Register before deferred-tool authorization capture so ordinary
+  // native allowlists, deferred discovery, and plan/research visibility keep
+  // their existing authority; executor processes never receive this tool.
+  if (!executorRole) {
+    registerSessionSpawnTool(pi, getSessionHostSpawnCapability());
   }
 
   if (executorRole) {
@@ -578,6 +592,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   });
 
   registerHook(pi, "session_start", async (...args) => {
+    await dependencies.sessionStartInitializationTestBarrier?.();
     // Issue #222: session boundaries reset orchestrator-turn correlation —
     // only runs of the CURRENT session may settle its deliveries.
     orchestratorTurnTracker.resetSession();
@@ -758,6 +773,31 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     scheduledRuntime.attach();
     await sessionPersistence.persist();
     await sendNotice(extractContext(args) ?? pi, `review gate: loaded (${loaded.path ?? "no config path"})`);
+
+    // The hosted child's one-shot initial request is dispatched only after this
+    // session's checkpoint scope, restored state, and deferred-tool boundary are
+    // initialized. Record it here because Pi marks sendUserMessage as extension
+    // input, which intentionally bypasses the ordinary user-input observer.
+    const startupRequest = consumeSessionHostStartupRequest();
+    const nativeApi = typeof pi === "object" && pi !== null ? pi as Record<string, unknown> : undefined;
+    const sendUserMessage = nativeApi?.sendUserMessage;
+    if (startupRequest) {
+      try {
+        const setSessionName = nativeApi?.setSessionName;
+        if (typeof setSessionName === "function") setSessionName.call(pi, startupRequest.title);
+      } catch {
+        // Pi's native --name option remains in place if the public setter fails.
+      }
+      rememberUserRequestVerbatim(state, startupRequest.prompt);
+      await sessionPersistence.persist();
+      if (typeof sendUserMessage === "function") {
+        try {
+          sendUserMessage.call(pi, startupRequest.prompt, { expandPromptTemplates: false });
+        } catch {
+          // Startup stays owned and reportable even if Pi rejects its initial turn.
+        }
+      }
+    }
   });
 
   // #84: the same diagnostic bridge, registered after the critical review

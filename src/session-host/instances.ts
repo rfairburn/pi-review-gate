@@ -7,12 +7,23 @@ import { NativeAgentRegistry, PreparedProfile, ProfilePreparer } from "./profile
 import {
   SESSION_HOST_BOOTSTRAP_ENV,
   NativeLaunchDescriptor,
+  composeFreshSessionSpawnArgs,
   prepareNativeLaunch,
 } from "./launch";
 import { TerminalSurface } from "./terminal-surface";
-import { hasCompleteSessionIdle, isValidNativeSessionId, isValidRenameName, type SessionHostNativeSession } from "./protocol";
+import {
+	hasCompleteSessionIdle,
+	MAX_SESSION_SPAWN_PROMPT_BYTES,
+	MAX_SESSION_SPAWN_TITLE_BYTES,
+	isValidNativeSessionId,
+	isValidRenameName,
+	type SessionHostNativeSession,
+	type SessionSpawnInput,
+	type SessionSpawnOutcome,
+} from "./protocol";
 import { isSavedSessionAdmission, type OwnedLiveSession, type SavedSessionAdmission } from "./saved-sessions";
 import type { StatusRenameRequest, StatusRenameResult, StatusShutdownResult } from "./broker";
+import { SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV } from "./startup-request";
 
 /**
  * Independent owned-PTY process lifecycle for the optional per-instance
@@ -179,6 +190,8 @@ export interface InstanceStatusUpdate {
 export interface InstanceStatusHandlers {
 	onStatus(update: InstanceStatusUpdate): void;
 	onDisconnect(): void;
+	/** An authenticated model request routed through this exact child registration. */
+	onSpawnRequest?(request: SessionSpawnInput): Promise<SessionSpawnOutcome>;
 }
 
 export interface InstanceStatusBootstrap {
@@ -254,6 +267,8 @@ export interface CreateInstanceOptions {
 	 * passed verbatim to prepareNativeLaunch.
 	 */
 	savedSession?: SavedSessionAdmission;
+	/** Fresh model-request child only: the exact title and prompt to deliver at native session start. */
+	initialRequest?: { readonly title: string; readonly prompt: string };
 }
 
 export interface InstanceManagerOptions {
@@ -279,6 +294,10 @@ export interface InstanceManagerOptions {
 	getSupportedKeyboardFlags?: () => number;
 	/** Called with an instance id whenever that row changed (frontend hook). */
 	onChange?: (instanceId: string) => void;
+	/** Host-owned routing for reporter requests; the parent id is supplied by the manager, never by model input. */
+	onSpawnRequest?: (parentInstanceId: string, request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
+	/** Current hypothetical-visible sidebar title width; captured per row as advisory presentation metadata. */
+	getSidebarTitleColumns?: () => number;
 	/** PTY factory; defaults to the pinned real @lydell/node-pty (lazily loaded). */
 	ptyFactory?: PtyFactory;
 }
@@ -357,6 +376,8 @@ interface ManagedInstance {
 	surface?: TerminalSurface;
 	pty?: InstancePty;
 	ptyExited: boolean;
+	/** Spawn admission closes while an idle preflight or confirmed Stop is unresolved. */
+	stopAdmissionClosed: boolean;
 	sigtermSent: boolean;
 	sigkillSent: boolean;
 	stopPromise?: Promise<boolean>;
@@ -581,6 +602,21 @@ function validateLabel(label: unknown): string {
 	return label;
 }
 
+function validateInitialRequest(value: unknown): { title: string; prompt: string } {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		throw new Error("session-host: initial request requires exact title and prompt strings");
+	}
+	const request = value as Record<string, unknown>;
+	const keys = Object.keys(request);
+	if (keys.length !== 2 || !keys.includes("title") || !keys.includes("prompt")
+		|| !isValidRenameName(request.title) || Buffer.byteLength(request.title, "utf8") > MAX_SESSION_SPAWN_TITLE_BYTES
+		|| typeof request.prompt !== "string" || request.prompt.length === 0
+		|| Buffer.byteLength(request.prompt, "utf8") > MAX_SESSION_SPAWN_PROMPT_BYTES || request.prompt.includes("\0")) {
+		throw new Error("session-host: initial request title and prompt must be nonempty and within transport safety bounds");
+	}
+	return { title: request.title, prompt: request.prompt };
+}
+
 /**
  * Manager of independently owned native session-host instances. See the
  * module documentation for the ownership, isolation, and shutdown rules.
@@ -597,6 +633,8 @@ export class InstanceManager {
 	#rows: number;
 	readonly #getSupportedKeyboardFlags?: () => number;
 	readonly #onChange?: (instanceId: string) => void;
+	readonly #onSpawnRequest?: (parentInstanceId: string, request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
+	readonly #getSidebarTitleColumns?: () => number;
 	readonly #ptyFactory: PtyFactory;
 	readonly #shutdownPlatform: NodeJS.Platform;
 	readonly #records = new Map<string, ManagedInstance>();
@@ -637,6 +675,8 @@ export class InstanceManager {
 		this.#profilePreparer = options.profileRegistry ?? new NativeAgentRegistry({ env: this.#env });
 		this.#getSupportedKeyboardFlags = options.getSupportedKeyboardFlags;
 		this.#onChange = options.onChange;
+		this.#onSpawnRequest = options.onSpawnRequest;
+		this.#getSidebarTitleColumns = options.getSidebarTitleColumns;
 		this.#ptyFactory = options.ptyFactory ?? createDefaultPtyFactory();
 		this.#shutdownPlatform = shutdownPlatformForTests ?? process.platform;
 	}
@@ -783,13 +823,22 @@ export class InstanceManager {
 			if (!hasCompleteSessionIdle(record)) return { status: "confirmation-required", forced: false };
 			const registration = record.registration;
 			if (!registration || record.registrationReleased) return { status: "confirmation-required", forced: false };
+			let shutdown: InstanceStatusRegistration["shutdown"];
+			try {
+				shutdown = registration.shutdown;
+			} catch {
+				return { status: "confirmation-required", forced: false };
+			}
+			if (typeof shutdown !== "function") return { status: "confirmation-required", forced: false };
+			// Fence child-originated spawn requests before the authenticated
+			// shutdown preflight can yield. A positive idle-only rejection below
+			// reopens admission because no stop was actually accepted.
+			record.stopAdmissionClosed = true;
 			// Register before the public request, because it may synchronously exit.
 			// This bounded preflight never sends a fallback signal or force attempt.
 			const exit = this.#waitForExit(record, DEFAULT_SHUTDOWN_GRACE_MS);
 			let request: Promise<StatusShutdownResult | undefined>;
 			try {
-				const shutdown = registration.shutdown;
-				if (typeof shutdown !== "function") return { status: "confirmation-required", forced: false };
 				request = Promise.resolve(shutdown.call(registration, { requireIdle: true })).catch(() => undefined);
 			} catch {
 				return { status: "confirmation-required", forced: false };
@@ -801,9 +850,15 @@ export class InstanceManager {
 			if (record.ptyExited) return outcome();
 			if (this.#records.get(id) !== record || this.#disposed) return { status: "unavailable", forced: record.sigkillSent };
 			if (first.kind !== "request" || !validShutdownRequest(first.result)) {
+				if (first.kind === "request" && first.result?.status === "not-idle") {
+					record.stopAdmissionClosed = false;
+				}
 				return { status: "confirmation-required", forced: record.sigkillSent };
 			}
 			alreadyRequested = true;
+		} else {
+			// Explicit confirmation starts this exact row's terminal stop path.
+			record.stopAdmissionClosed = true;
 		}
 		await this.#gracefulStop(record, DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SHUTDOWN_KILL_MS, alreadyRequested);
 		return outcome();
@@ -830,6 +885,10 @@ export class InstanceManager {
 		// conflicting explicit workspace is refused, never silently substituted.
 		if (savedSession !== undefined && options.workspace !== savedSession.workspace) {
 			throw new Error("session-host: a saved-session selection uses the conversation's recorded workspace");
+		}
+		const initialRequest = options.initialRequest === undefined ? undefined : validateInitialRequest(options.initialRequest);
+		if (initialRequest !== undefined && savedSession !== undefined) {
+			throw new Error("session-host: a fresh initial request cannot be combined with a saved conversation");
 		}
 		// Synchronous known-owned duplicate fence and reservation BEFORE any
 		// await: concurrent deliberate opens of the same saved conversation
@@ -863,13 +922,14 @@ export class InstanceManager {
 			registrationReleased: false,
 			registrationReleaseSettled: false,
 			ptyExited: false,
+			stopAdmissionClosed: false,
 			sigtermSent: false,
 			sigkillSent: false,
 			exitWaiters: [],
 		};
 		this.#records.set(id, record);
 		this.#safeChanged(id);
-		const launch = this.#launchInstance(record, { workspace: options.workspace, profile, savedSession });
+		const launch = this.#launchInstance(record, { workspace: options.workspace, profile, savedSession, initialRequest });
 		this.#inflightCreates.add(launch);
 		try {
 			await launch;
@@ -1142,6 +1202,17 @@ export class InstanceManager {
 		}
 	}
 
+	#sidebarTitleColumnsSnapshot(): number | undefined {
+		try {
+			const columns = this.#getSidebarTitleColumns?.();
+			return Number.isSafeInteger(columns) && (columns as number) >= 1 && (columns as number) <= 1000
+				? columns as number
+				: undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
 	/**
 	 * The whole launch is guarded at every async boundary; the spawn itself
 	 * (factory call through handler wiring) is one synchronous stretch, so a
@@ -1152,7 +1223,7 @@ export class InstanceManager {
 	 */
 	async #launchInstance(
 			record: ManagedInstance,
-			options: { workspace: string; profile?: string; savedSession?: SavedSessionAdmission },
+			options: { workspace: string; profile?: string; savedSession?: SavedSessionAdmission; initialRequest?: { title: string; prompt: string } },
 		): Promise<void> {
 		try {
 			// 1. Setup admission. Native mode shares the fixed Pi root; legacy
@@ -1186,7 +1257,9 @@ export class InstanceManager {
 				agentDir: profile.agentDir,
 				workspace: profile.workspace,
 				piExecutable: this.#piExecutable,
-				args: this.#args,
+				args: options.initialRequest === undefined
+					? this.#args
+					: composeFreshSessionSpawnArgs(this.#args, options.initialRequest.title),
 				env: this.#env,
 				...(options.savedSession !== undefined ? { savedSession: options.savedSession } : {}),
 			});
@@ -1200,6 +1273,12 @@ export class InstanceManager {
 			const handle = this.#statusRegistrar.register(record.id, {
 				onStatus: (update) => this.#onStatus(record, registration, update),
 				onDisconnect: () => this.#onDisconnect(record, registration),
+				onSpawnRequest: (request) => {
+					if (this.#records.get(record.id) !== record || record.ptyExited || record.stopAdmissionClosed || this.#stopping || this.#disposed) {
+						return Promise.resolve("failed");
+					}
+					return this.#onSpawnRequest?.(record.id, request) ?? Promise.resolve("failed");
+				},
 			});
 			registration.current = handle;
 			record.registration = handle;
@@ -1211,6 +1290,11 @@ export class InstanceManager {
 			let pty: InstancePty | undefined;
 			try {
 				const spawnEnv = { ...descriptor.env };
+				const titleColumns = this.#sidebarTitleColumnsSnapshot();
+				if (titleColumns !== undefined) spawnEnv[SESSION_HOST_TITLE_COLUMNS_ENV] = String(titleColumns);
+				if (options.initialRequest !== undefined) {
+					spawnEnv[SESSION_HOST_STARTUP_REQUEST_ENV] = JSON.stringify(options.initialRequest);
+				}
 				spawnEnv[SESSION_HOST_BOOTSTRAP_ENV] = JSON.stringify(handle.bootstrap);
 				pty = this.#ptyFactory({
 					file: descriptor.file,

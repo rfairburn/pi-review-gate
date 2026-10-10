@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.138]
+## [0.1.0-dev.139]
 
 ### Fixed
 
@@ -37,6 +37,21 @@ dates.
   task resume, or change to ordinary task token formats.
   Historical onset and any screenshot/Claude-link causation remain unproven; this does
   not claim full resolution of #353.
+
+## [0.1.0-dev.138]
+
+### Added
+
+- Authenticated top-level session-host children can use `SessionSpawn` to create a fresh
+  native Pi sibling with an explicit existing workspace, title, and initial prompt.
+  The child starts in the background without changing selection, focus, active Main
+  ownership, or sidebar visibility; no worktree, clone, or branch is created. The new
+  title and prompt are delivered through Pi's public session APIs, with inherited parent
+  name/message inputs excluded so literal `@`- and flag-leading prompts are not parsed as
+  CLI inputs. Ordinary launches, New sessions, and saved-conversation behavior remain
+  unchanged. The spawn IPC privacy boundary and launch-only acknowledgement are
+  documented in [the session-host guide](docs/session-host-alpha.md) and
+  [security model](docs/security-model.md).
 
 ## [0.1.0-dev.137]
 

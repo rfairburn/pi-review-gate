@@ -41,6 +41,7 @@ import {
 } from "./tool-catalog";
 import { GIT_READ_TOOL_NAME } from "../git-read/tool";
 import { isToolCallFingerprint, toolCallFingerprint, type StartLiveness, type SubmittedToolCallFingerprint } from "../tool-call-fingerprint";
+import { SESSION_SPAWN_TOOL_NAME } from "../session-host/spawn-tool";
 
 /** Per-call batch bound, independent of worker concurrency and group admission. */
 const MAX_TASKS_PER_SUBMISSION = 128;
@@ -1028,11 +1029,14 @@ export class ExecutionToolManager {
     // #220: inplace children additionally lose every Subtasks*-prefixed
     // delegation control — the parent's other authorized capabilities stay
     // intact, but an in-place worker cannot launch recursive subtasks.
-    const childTools = kind === "research"
+    const childTools = (kind === "research"
       ? researchToolIntersection(allowedTools)
       : (kind === "inplace"
         ? allowedTools.filter((tool) => tool !== GIT_READ_TOOL_NAME && !tool.startsWith("Subtasks"))
-        : allowedTools.filter((tool) => tool !== GIT_READ_TOOL_NAME));
+        : allowedTools.filter((tool) => tool !== GIT_READ_TOOL_NAME)))
+      // The hosted parent may have SessionSpawn, but it is never part of any
+      // delegated executor ceiling, including execute/in-place catalogs.
+      .filter((tool) => tool !== SESSION_SPAWN_TOOL_NAME);
     return tasks.map((task) => {
       // Validate any supplied contract, but preserve only an explicitly named
       // initial set. The authoritative parent snapshot always determines the

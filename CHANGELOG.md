@@ -15,6 +15,22 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.134]
+
+### Changed
+
+- Dependency security refresh (#329): the direct `undici` floor moves to `^6.29.0`,
+  and the lockfile now resolves `@modelcontextprotocol/sdk` 1.32.1, `fast-uri` 3.1.8,
+  `hono` 4.13.13, `ip-address` 10.7.3, and `proxy-addr` 2.0.8, clearing every advisory
+  the previous resolution reported: undici WebSocket/retry issues, the MCP SDK OAuth
+  authorization-server credential leak, `fast-uri` authority/host confusion,
+  `hono` path and parsing issues, `ip-address` IPv6 classifier gaps, and the critical
+  `proxy-addr` IPv4-mapped trust-subnet spoofing issue. No audit suppression, install
+  scope reduction, or unrelated dependency upgrade is involved; installed behavior,
+  the Node >=22.19.0 floor, and the optional `@lydell/node-pty` dependency are
+  unchanged, and a fresh unlocked install of the packed package resolves the same
+  fixed versions.
+
 ## [0.1.0-dev.133]
 
 ### Changed

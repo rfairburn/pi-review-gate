@@ -19,8 +19,8 @@ scope is not evidence that end-to-end runtime compatibility has been proven. Win
 startup, public named-pipe, and pinned node-pty ConPTY source paths are experimental
 only; they are not Windows runtime support or readiness evidence. Manual Windows
 validation has observed mouse clicks working, but that observation does not certify
-sidebar single-click activation, other physical input, or complete host-process shutdown
-(see below).
+sidebar single-click activation, native Main click-to-focus, other physical input, or
+complete host-process shutdown (see below).
 Device-attributes negotiation also requires complete runtime acceptance; its narrow
 witness investigation is tracked in
 https://github.com/rfairburn/pi-review-gate/issues/337 under the broader #334
@@ -41,12 +41,13 @@ selection behavior. Manual Windows validation has observed mouse clicks working,
 that observation is limited to clicks: wheel/conversation scrolling and
 pane-confined selection still require interactive validation, rather than
 editor-history navigation or selection crossing host panes. Sidebar single-click
-activation is described below, but this does not certify Windows runtime behavior
-(#323, #345). Conversation wheel/trackpad scrolling remains outside this change and
-separate under #332; scroll-smoothness tuning remains separate work. A cosmetic child-pane
-flicker on pointer movement and clicks has been observed; it is not breakage and not
-a release blocker (#343). Native Pi/review-gate startup latency on Windows has been
-present since before this release and is unrelated to it (#344).
+activation and native Main click-to-focus are described below, but neither certifies
+Windows runtime behavior (#323, #345). Conversation wheel/trackpad scrolling remains
+outside this change and separate under #332; scroll-smoothness tuning remains separate
+work. A cosmetic child-pane flicker on pointer movement and clicks has been observed;
+it is not breakage and not a release blocker (#343). Native Pi/review-gate startup
+latency on Windows has been present since before this release and is unrelated to
+it (#344).
 
 Complete graceful shutdown is also unresolved: native child exits and a returned Main
 status do not establish original Main and outer/wrapper process settlement. Current
@@ -315,6 +316,14 @@ an existing action entry. A single left-click on a displayed New, Saved, or Quit
 entry invokes that same existing action: New still opens its form, Saved its picker, and
 Quit follows its existing confirmation rules. These sidebar clicks are handled by the
 host, not forwarded to a native child; existing keyboard controls remain available.
+With the roster focused, a single left click inside a currently displayed native Main
+pane returns keyboard focus to the unchanged active Main owner and consumes that first
+click, including its release. It does not change the sidebar's visibility or selection,
+activate a row, or change any sibling; subsequent typing goes to the same Main owner.
+This applies only when the visible native pane still belongs to the current live owner
+at the displayed geometry. Forms, confirmations, and the narrow sidebar overlay are not
+native Main click targets. Once Main already has focus, mouse input keeps its existing
+native behavior.
 The `d`/`D` or Delete keys stop/remove precisely the selected
 fully displayed row (`x` is the Delete fallback when Delete is configured as the sidebar
 toggle), `q`/`Q` activates Quit host,
@@ -489,7 +498,9 @@ Pi menu will remain readable.
 The native Main mouse path is cell-based and applies only to the active native frame;
 events outside that frame are dropped before coordinate translation, never clamped to
 the pane edge. Sidebar-target clicks are handled by the host and are not forwarded to a
-native child. This does not add conversation wheel/trackpad scrolling (#332). On
+native child. The first left click in the visible native pane while the roster owns
+focus is consumed to return focus to that active Main owner; subsequent mouse input is
+forwarded normally. This does not add conversation wheel/trackpad scrolling (#332). On
 Windows, bundled-ConPTY protocol observations do not certify physical mouse behavior:
 manual validation has observed clicks working, but pane-confined selection and native
 conversation wheel scrolling still require interactive validation, as described in the

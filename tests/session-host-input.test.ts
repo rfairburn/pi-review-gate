@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import test from "node:test";
-import { Key, matchesKey, parseKey, setKittyProtocolActive } from "pi-session-host-tui";
+import { Key, matchesKey, parseKey, setKittyProtocolActive, StdinBuffer } from "pi-session-host-tui";
 import {
 	InputTargetModes,
 	InputViewport,
 	KeyboardCapabilityObserver,
 	normalizeNativeSourceInput,
+	parseMouseInput,
 	translateInput,
 } from "../src/session-host/input";
 
@@ -328,6 +329,31 @@ test("bracketed paste is opaque and follows the selected child's mode", () => {
 	assert.equal(translated(packet), body);
 	assert.equal(translated(packet, { bracketedPaste: true }), packet);
 	assert.equal(translated(`${CSI}200~unterminated`), undefined);
+});
+
+test("shared bounded mouse decoding identifies only exact SGR/X10 events and reassembles pinned callback packets", () => {
+	const sgr = parseMouseInput(`${CSI}<0;35;2M`);
+	assert.deepEqual(sgr, { button: 0, x: 34, y: 1, release: false, motion: false, wheel: false });
+	assert.deepEqual(parseMouseInput(`${CSI}<2;35;2M`), {
+		button: 2, x: 34, y: 1, release: false, motion: false, wheel: false,
+	});
+	assert.equal(parseMouseInput(`${CSI}<0;35;2m`)?.release, true);
+	assert.equal(parseMouseInput(`${CSI}<32;35;2M`)?.motion, true);
+	assert.equal(parseMouseInput(`${CSI}<64;35;2M`)?.wheel, true);
+	const x10 = `${CSI}M${String.fromCharCode(32, 68, 34)}`;
+	assert.deepEqual(parseMouseInput(x10), { button: 0, x: 35, y: 1, release: false, motion: false, wheel: false });
+	assert.equal(parseMouseInput(`${CSI}<0;0;2M`), null, "malformed cell coordinates are rejected");
+	assert.equal(parseMouseInput(`${CSI}<${"1".repeat(300)};2;2M`), null, "mouse packets stay bounded");
+	assert.equal(parseMouseInput("plain text"), undefined, "ordinary input is not classified as mouse");
+
+	const input = new StdinBuffer({ timeout: 50, escapeTimeout: 10 });
+	const packets: string[] = [];
+	input.on("data", (packet: string) => packets.push(packet));
+	input.process(`${CSI}<0;`);
+	assert.deepEqual(packets, [], "a partial SGR packet does not reach ProcessTerminal's callback");
+	input.process("35;2M");
+	assert.deepEqual(packets, [`${CSI}<0;35;2M`], "the pinned StdinBuffer emits one complete callback packet");
+	input.destroy();
 });
 
 test("mouse ownership is clipped before offsets without edge clamping", () => {

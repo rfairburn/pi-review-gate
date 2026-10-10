@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.137]
+## [0.1.0-dev.138]
 
 ### Fixed
 
@@ -35,6 +35,23 @@ dates.
   task resume, or change to ordinary task token formats.
   Historical onset and any screenshot/Claude-link causation remain unproven; this does
   not claim full resolution of #353.
+
+## [0.1.0-dev.137]
+
+### Changed
+
+- The session-host sidebar accepts a single left-click on a displayed instance card as
+  that row's existing Enter action: a live instance becomes the active Main input owner
+  and focuses Main while sibling sessions continue. A fully displayed Saved-picker row
+  follows the existing exact-open, admission, duplicate-open, and lifecycle guards; a
+  successful open focuses Main. Click targets are tied to emitted frames, not pending
+  redraws, so rate limiting or output backpressure cannot activate an undisplayed entry.
+  Clicking existing New/Saved/Quit action entries keeps their forms, picker, and Quit
+  confirmation behavior. Keyboard controls and native Main
+  mouse handling are unchanged, and sidebar clicks are handled by the host rather than
+  forwarded to a native child. No new lifecycle action or conversation wheel/trackpad
+  scrolling (#332) is added; Windows runtime caveats remain and this does not certify
+  Windows behavior (#323, #345).
 
 ## [0.1.0-dev.136]
 

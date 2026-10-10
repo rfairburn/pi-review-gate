@@ -23,10 +23,12 @@ dates.
   bounded snapshot pass over eligible retired execution sources whose exact
   association inventories were sealed by completed detaches. It reads each eligible
   owner at most once, skips already-proven complete empty sources, and does not
-  duplicate an in-flight read. Failed, incomplete, or stale reads remain unknown and
-  can be retried only on a later explicit `session_start`; a source-list change
-  discards the captured pass and is not retried within that event. Later admissions or
-  local state/token mutations invalidate the owner's seal. A complete census can
+  duplicate an in-flight read. Failed or fresh incomplete/unavailable reads leave the
+  affected channel unknown and can be retried only on a later explicit `session_start`.
+  A controller/source-fenced stale result leaves that exact incarnation's channels and
+  tokens unchanged and can be retried on a later event; a source-list change discards
+  the captured pass without restarting it within that event. Later admissions or local
+  state/token mutations invalidate the owner's seal. A complete census can
   resolve only that old incarnation's uncertainty, and tokens leave only with
   channel-specific release proof; stopped cleanup ownership remains paired with its
   token, and replacements cannot clear it. Missing, corrupt, unmatched, ambiguous,

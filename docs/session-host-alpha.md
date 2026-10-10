@@ -378,10 +378,12 @@ After a same-process extension reload, each existing authenticated `session_star
 make one bounded read-only pass over its snapshot of eligible retired execution
 controllers whose exact association inventories were sealed by completed detaches. Each
 eligible exact owner is read at most once in that pass; an in-flight read is not
-duplicated, and a retired source already proven complete and empty is skipped. Failed,
-incomplete, or stale reads remain unknown and may be retried on a later explicit
-`session_start`; a source-list change discards that pass's snapshot and results without
-restarting it. Recovery is event-driven only, with no periodic polling or transport
+duplicated, and a retired source already proven complete and empty is skipped. Failed
+or fresh incomplete/unavailable reads leave the affected channel unknown and may be
+retried on a later explicit `session_start`. A stale/discarded read leaves the exact
+incarnation's existing channels and tokens unchanged and may be retried on that later
+event; a source-list change discards that pass's snapshot and results without restarting
+it. Recovery is event-driven only, with no periodic polling or transport
 heartbeat trigger. Any later admission or local state/token mutation invalidates that
 owner's seal. Only validated, identity-matched manifests, task archives, and
 operation-owner evidence can resolve that old incarnation; known stopped work may clear

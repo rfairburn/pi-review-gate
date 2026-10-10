@@ -37,6 +37,7 @@ import { resolveArtifactRoot } from "./evidence/sources";
 import { buildSubtaskEvidence, readConfinedOperationRecord, readSubtaskEvidence, type SubtaskEvidenceRead, type SubtaskEvidenceSelector, type SubtaskEvidenceUnavailable } from "./subtask-evidence";
 import { sourceMutationCoordinator } from "./source-mutation-lease";
 import {
+  RETIRED_ACTIVITY_CENSUS_DISCARDED,
   registerOwnedActivitySource,
   type OwnedActivitySourceHandle,
   type RetiredOwnedActivityReconciliation,
@@ -1256,17 +1257,15 @@ export class BackgroundExecutionController {
     }
 
     if (this.censusRevision !== generation || inventory.revision !== inventoryRevision
-      || this.retiredCensus !== inventory) return {};
+      || this.retiredCensus !== inventory) return RETIRED_ACTIVITY_CENSUS_DISCARDED;
 
     const channel = (complete: boolean, tokens: Set<string>, released: Set<string>) => complete
       ? { complete: true as const, tokens: [...tokens], released: [...released] }
-      : undefined;
+      : { complete: false as const };
     return {
-      ...(channel(ownershipComplete, ownershipTokens, releasedOwnership)
-        ? { ownership: channel(ownershipComplete, ownershipTokens, releasedOwnership)! }
-        : {}),
-      ...(retained.intent !== undefined && channel(intentComplete, intentTokens, releasedIntent)
-        ? { intent: channel(intentComplete, intentTokens, releasedIntent)! }
+      ownership: channel(ownershipComplete, ownershipTokens, releasedOwnership),
+      ...(retained.intent !== undefined
+        ? { intent: channel(intentComplete, intentTokens, releasedIntent) }
         : {}),
     };
   }

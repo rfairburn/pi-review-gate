@@ -156,21 +156,34 @@ export interface RetiredOwnedActivityTokens {
   readonly intent: readonly string[] | undefined;
 }
 
-/** One independently complete, read-only census channel. */
-export interface RetiredOwnedActivityChannel {
-  /** True only when the callback accounted for the complete exact inventory. */
-  readonly complete: true;
-  /** All tokens that remain owned after the census. */
-  readonly tokens: readonly string[];
-  /** Existing tokens removed only with channel-specific validated proof. */
-  readonly released: readonly string[];
-}
+/** One independently complete or incomplete, read-only census channel. */
+export type RetiredOwnedActivityChannel =
+  | {
+    /** True only when the callback accounted for the complete exact inventory. */
+    readonly complete: true;
+    /** All tokens that remain owned after the census. */
+    readonly tokens: readonly string[];
+    /** Existing tokens removed only with channel-specific validated proof. */
+    readonly released: readonly string[];
+  }
+  | {
+    /** This channel could not be completely established; retained tokens stay untouched. */
+    readonly complete: false;
+  };
+
+/** Exact outcome for a census invalidated by its source/controller revision fence. */
+export const RETIRED_ACTIVITY_CENSUS_DISCARDED: unique symbol = Symbol.for(
+  "pi-review-gate.session-host.owned-activity.retired-census-discarded.v1",
+) as never;
 
 /** Result returned by a retired source's asynchronous, read-only census. */
-export interface RetiredOwnedActivityReconciliation {
-  readonly ownership?: RetiredOwnedActivityChannel;
-  readonly intent?: RetiredOwnedActivityChannel;
-}
+export type RetiredOwnedActivityReconciliation =
+  | {
+    /** Missing or incomplete channels remain unknown; the other channel is independent. */
+    readonly ownership?: RetiredOwnedActivityChannel;
+    readonly intent?: RetiredOwnedActivityChannel;
+  }
+  | typeof RETIRED_ACTIVITY_CENSUS_DISCARDED;
 
 /** Reload-durable callback for one source incarnation's retired census. */
 export type RetiredOwnedActivityReconciler = (
@@ -661,37 +674,59 @@ export function subscribeOwnedActivity(listener: () => void): () => void {
   };
 }
 
-function validReconciliationChannel(value: unknown): value is RetiredOwnedActivityChannel {
-  if (!isRecord(value) || value.complete !== true || !Array.isArray(value.tokens) || !Array.isArray(value.released)) return false;
-  for (const list of [value.tokens, value.released]) {
-    if (list.some((token) => !isValidToken(token))) return false;
+function validatedReconciliationChannel(value: unknown): { tokens: string[]; released: string[] } | undefined {
+  try {
+    if (!isRecord(value) || value.complete !== true) return undefined;
+    const rawTokens = value.tokens;
+    const rawReleased = value.released;
+    if (!Array.isArray(rawTokens) || !Array.isArray(rawReleased)) return undefined;
+    const tokens: unknown[] = Array.from(rawTokens);
+    const released: unknown[] = Array.from(rawReleased);
+    if (tokens.some((token) => !isValidToken(token)) || released.some((token) => !isValidToken(token))) return undefined;
+    if (new Set(tokens).size !== tokens.length || new Set(released).size !== released.length) return undefined;
+    return { tokens: tokens as string[], released: released as string[] };
+  } catch {
+    return undefined; // A hostile or malformed result is incomplete, never proof.
   }
-  return new Set(value.tokens).size === value.tokens.length
-    && new Set(value.released).size === value.released.length;
 }
 
 function applyRetiredChannel(
   entry: SourceIncarnation,
-  channel: unknown,
+  result: ReturnType<typeof validatedReconciliationChannel>,
   tokens: Set<string> | undefined,
+  isUncertain: () => boolean,
   setUncertain: (uncertain: boolean) => void,
 ): boolean {
-  if (!tokens || !validReconciliationChannel(channel)) return false;
-  const result = channel as RetiredOwnedActivityChannel;
-  const next = new Set(result.tokens);
-  const released = new Set(result.released);
-  // A retained positive can disappear only with explicit per-channel proof.
-  for (const prior of tokens) {
-    if (!next.has(prior) && !released.has(prior)) return false;
+  if (!tokens) return false; // Legacy pre-intent entries remain unknown without invented history.
+  const markUnknown = (): boolean => {
+    if (isUncertain()) return false;
+    setUncertain(true);
+    entry.revision = (entry.revision ?? 0) + 1;
+    return true;
+  };
+  try {
+    if (!result) return markUnknown();
+    const next = new Set(result.tokens);
+    const released = new Set(result.released);
+    // A retained positive can disappear only with explicit per-channel proof.
+    for (const prior of tokens) {
+      if (!next.has(prior) && !released.has(prior)) return markUnknown();
+    }
+    for (const proof of released) {
+      if (!tokens.has(proof) || next.has(proof)) return markUnknown();
+    }
+    const changed = isUncertain() || tokens.size !== next.size || [...tokens].some((token) => !next.has(token));
+    if (!changed) return false;
+    tokens.clear();
+    for (const token of next) tokens.add(token);
+    setUncertain(false);
+    entry.revision = (entry.revision ?? 0) + 1;
+    return true;
+  } catch {
+    // Unexpected application failures invalidate only this exact channel and
+    // never alter its retained positive tokens.
+    return markUnknown();
   }
-  for (const proof of released) {
-    if (!tokens.has(proof) || next.has(proof)) return false;
-  }
-  tokens.clear();
-  for (const token of next) tokens.add(token);
-  setUncertain(false);
-  entry.revision = (entry.revision ?? 0) + 1;
-  return true;
 }
 
 /**
@@ -770,27 +805,41 @@ export async function reconcileRetiredExecutionActivity(): Promise<void> {
     if (!sameSourceSnapshot()) return;
 
     const applicable = settled.flatMap((outcome, index) => {
-      if (outcome.status !== "fulfilled") return [];
       const candidate = pending[index]!.candidate;
       const { entry, reconcile, revision } = candidate;
       if (sourceSnapshot.includes(entry) && entry.retired
         && entry.reconcileRetired === reconcile && (entry.revision ?? 0) === revision) {
-        return [{ entry, result: outcome.value }];
+        return [{ entry, candidate, outcome }];
       }
       return [];
     });
     let changed = false;
-    for (const { entry, result } of applicable) {
-      try {
-        if (!isRecord(result)) continue;
-        changed = applyRetiredChannel(entry, result.ownership, entry.tokens, (uncertain) => { entry.uncertain = uncertain; }) || changed;
-        // Never fabricate independent activity history for a legacy record.
-        if (entry.intentTokens !== undefined) {
-          changed = applyRetiredChannel(entry, result.intent, entry.intentTokens, (uncertain) => { entry.intentUncertain = uncertain; }) || changed;
+    for (const { entry, candidate, outcome } of applicable) {
+      if (outcome.status === "fulfilled" && outcome.value === RETIRED_ACTIVITY_CENSUS_DISCARDED) continue;
+      const readChannel = (channel: "ownership" | "intent"): ReturnType<typeof validatedReconciliationChannel> => {
+        try {
+          if (outcome.status !== "fulfilled" || !isRecord(outcome.value)) return undefined;
+          return validatedReconciliationChannel(outcome.value[channel]);
+        } catch {
+          // A throwing accessor invalidates only this channel; read the other independently.
+          return undefined;
         }
-      } catch {
-        // A malformed result has no authority for this owner and cannot prevent
-        // independent eligible owners from applying their own validated proof.
+      };
+      const ownership = readChannel("ownership");
+      const intent = readChannel("intent");
+      // Normalize all result properties and arrays before checking the fences;
+      // applying these plain snapshots must not execute result accessors.
+      if (!sameSourceSnapshot() || !entry.retired || entry.reconcileRetired !== candidate.reconcile
+        || (entry.revision ?? 0) !== candidate.revision) continue;
+      // Missing, rejected, malformed, and explicitly incomplete channels all
+      // invalidate only this exact old channel. A complete independent channel
+      // can still resolve, and no incomplete result can release retained tokens.
+      changed = applyRetiredChannel(entry, ownership, entry.tokens,
+        () => entry.uncertain, (uncertain) => { entry.uncertain = uncertain; }) || changed;
+      // Never fabricate independent activity history for a legacy record.
+      if (entry.intentTokens !== undefined) {
+        changed = applyRetiredChannel(entry, intent, entry.intentTokens,
+          () => entry.intentUncertain === true, (uncertain) => { entry.intentUncertain = uncertain; }) || changed;
       }
     }
     if (changed) notify(state);

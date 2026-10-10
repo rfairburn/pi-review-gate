@@ -14,6 +14,7 @@ import {
   registerOwnedActivitySource,
   OWNED_ACTIVITY_STATE_KEY,
   type OwnedActivitySourceHandle,
+  type RetiredOwnedActivityReconciliation,
   __test as ownedActivityTest,
 } from "../src/session-host/owned-activity";
 import {
@@ -26,6 +27,7 @@ import {
   acquireOperationOwner,
   createOperationRecord,
   createReattachmentBundle,
+  recordOperationChildProcess,
   releaseOperationOwner,
   writeOperationRecord,
 } from "../src/execution/operation-record";
@@ -185,6 +187,220 @@ test("a failed or incomplete retired read retries only on a later explicit event
   assert.equal(calls, 3);
   assert.equal(ownedActivitySnapshot().backgroundTasks, 0,
     "a later complete exact-owner read can clear the prior uncertainty");
+});
+
+test("failed, missing, and incomplete censuses invalidate formerly known channels without releasing tokens", async () => {
+  completeExpectedSources();
+  let calls = 0;
+  const old = registerOwnedActivitySource("backgroundTasks", "execution", {
+    reconcileRetired: async (retained) => {
+      calls += 1;
+      if (calls === 1) throw new Error("retired inventory read failed");
+      if (calls === 2) return {}; // No applicable proof is not complete evidence.
+      if (calls === 3) return {
+        ownership: { complete: false },
+        intent: { complete: false },
+      };
+      return {
+        ownership: { complete: true, tokens: [...retained.ownership], released: [] },
+        intent: { complete: true, tokens: [], released: [] },
+      };
+    },
+  });
+  old.acquire("retained-owner");
+  const newer = registerOwnedActivitySource("backgroundTasks", "execution");
+  newer.resolveUncertainty();
+  newer.resolveIntentUncertainty();
+
+  assert.equal(ownedActivitySnapshot().backgroundTasks, 1);
+  assert.equal(activeActivitySnapshot().activeTasks, 0,
+    "the old intent channel was known zero before its retained owner was censused");
+  const registry = (globalThis as Record<PropertyKey, unknown>)[OWNED_ACTIVITY_STATE_KEY] as {
+    sources: Map<string, Map<string, Array<{
+      id: string;
+      retired: boolean;
+      tokens: Set<string>;
+      intentTokens: Set<string>;
+      uncertain: boolean;
+      intentUncertain: boolean;
+    }>>>;
+  };
+  const entries = registry.sources.get("backgroundTasks")!.get("execution")!;
+  const retired = entries.find((entry) => entry.id === old.incarnation)!;
+  const current = entries.find((entry) => entry.id === newer.incarnation)!;
+
+  await reconcileRetiredExecutionActivity();
+  assert.equal(calls, 1);
+  assert.equal(ownedActivitySnapshot().backgroundTasks, null);
+  assert.equal(activeActivitySnapshot().activeTasks, null,
+    "a failed fresh read cannot preserve an unjustified known-zero intent channel");
+  assert.deepEqual([...retired.tokens], ["retained-owner"]);
+  assert.equal(retired.intentUncertain, true);
+  assert.equal(current.intentUncertain, false, "the newer incarnation stays untouched");
+
+  await reconcileRetiredExecutionActivity();
+  assert.equal(calls, 2);
+  assert.equal(activeActivitySnapshot().activeTasks, null,
+    "a missing channel proof remains unknown on a later explicit event");
+  assert.deepEqual([...retired.tokens], ["retained-owner"]);
+
+  await reconcileRetiredExecutionActivity();
+  assert.equal(calls, 3);
+  assert.equal(activeActivitySnapshot().activeTasks, null,
+    "an explicit incomplete result cannot claim zero");
+  assert.deepEqual([...retired.tokens], ["retained-owner"]);
+
+  await reconcileRetiredExecutionActivity();
+  assert.equal(calls, 4);
+  assert.equal(ownedActivitySnapshot().backgroundTasks, 1,
+    "a later complete ownership proof retains the exact positive token");
+  assert.equal(activeActivitySnapshot().activeTasks, 0,
+    "a later complete stopped proof can re-establish zero activity");
+  assert.deepEqual([...retired.tokens], ["retained-owner"]);
+  assert.equal(current.intentUncertain, false);
+});
+
+test("stale incomplete channels cannot invalidate recovered exact or newer source data", async () => {
+  completeExpectedSources();
+  let finish!: (value: {
+    ownership: { complete: false };
+    intent: { complete: false };
+  }) => void;
+  let signalEntered!: () => void;
+  const callbackEntered = new Promise<void>((resolve) => { signalEntered = resolve; });
+  const pending = new Promise<{
+    ownership: { complete: false };
+    intent: { complete: false };
+  }>((resolve) => { finish = resolve; });
+  const old = registerOwnedActivitySource("backgroundTasks", "execution", {
+    reconcileRetired: async () => {
+      signalEntered();
+      return pending;
+    },
+  });
+  old.acquire("stale-owner");
+  const newer = registerOwnedActivitySource("backgroundTasks", "execution");
+  newer.resolveUncertainty();
+  newer.resolveIntentUncertainty();
+  const registry = (globalThis as Record<PropertyKey, unknown>)[OWNED_ACTIVITY_STATE_KEY] as {
+    sources: Map<string, Map<string, Array<{
+      id: string;
+      retired: boolean;
+      tokens: Set<string>;
+      intentTokens: Set<string>;
+      uncertain: boolean;
+      intentUncertain: boolean;
+      revision: number;
+    }>>>;
+  };
+  const entries = registry.sources.get("backgroundTasks")!.get("execution")!;
+  const current = entries.find((entry) => entry.id === newer.incarnation)!;
+  const currentRevision = current.revision;
+
+  const pass = reconcileRetiredExecutionActivity();
+  await callbackEntered;
+  // An exact-source recovery/mutation supersedes the pending read while the
+  // replacement remains known zero.
+  old.markIntentUncertain();
+  old.resolveIntentUncertainty();
+  finish({ ownership: { complete: false }, intent: { complete: false } });
+  await pass;
+
+  assert.equal(old.retired, true);
+  assert.equal(entries.find((entry) => entry.id === old.incarnation)!.intentUncertain, false);
+  assert.equal(activeActivitySnapshot().activeTasks, 0,
+    "the stale incomplete output does not undo later recovered zero");
+  assert.equal(ownedActivitySnapshot().backgroundTasks, 1,
+    "stale incomplete ownership output cannot drop the retained positive token");
+  assert.deepEqual([...entries.find((entry) => entry.id === old.incarnation)!.tokens], ["stale-owner"]);
+  assert.equal(current.intentUncertain, false);
+  assert.equal(current.revision, currentRevision, "the newer source is not mutated by the stale result");
+});
+
+test("a throwing ownership result accessor does not suppress valid intent proof", async () => {
+  completeExpectedSources();
+  const old = registerOwnedActivitySource("backgroundTasks", "execution", {
+    intentUncertain: true,
+    reconcileRetired: async () => {
+      const result: RetiredOwnedActivityReconciliation = {
+        intent: { complete: true, tokens: ["retained-intent"], released: [] },
+      };
+      Object.defineProperty(result, "ownership", {
+        enumerable: true,
+        get() {
+          throw new Error("synthetic ownership channel accessor failure");
+        },
+      });
+      return result;
+    },
+  });
+  old.acquire("retained-owner");
+  old.acquireIntent("retained-intent");
+  const newer = registerOwnedActivitySource("backgroundTasks", "execution");
+  newer.resolveUncertainty();
+  newer.resolveIntentUncertainty();
+  const registry = (globalThis as Record<PropertyKey, unknown>)[OWNED_ACTIVITY_STATE_KEY] as {
+    sources: Map<string, Map<string, Array<{
+      id: string;
+      retired: boolean;
+      tokens: Set<string>;
+      intentTokens: Set<string>;
+      uncertain: boolean;
+      intentUncertain: boolean;
+      revision: number;
+    }>>>;
+  };
+  const entries = registry.sources.get("backgroundTasks")!.get("execution")!;
+  const retired = entries.find((entry) => entry.id === old.incarnation)!;
+  const current = entries.find((entry) => entry.id === newer.incarnation)!;
+  const currentRevision = current.revision;
+
+  assert.equal(ownedActivitySnapshot().backgroundTasks, 1);
+  assert.equal(activeActivitySnapshot().activeTasks, null);
+  await reconcileRetiredExecutionActivity();
+
+  assert.equal(retired.uncertain, true,
+    "the throwing ownership property fails closed only for ownership");
+  assert.equal(retired.intentUncertain, false,
+    "the independent complete intent channel resolves despite the ownership accessor failure");
+  assert.deepEqual([...retired.tokens], ["retained-owner"], "ownership tokens are not released");
+  assert.deepEqual([...retired.intentTokens], ["retained-intent"]);
+  assert.equal(ownedActivitySnapshot().backgroundTasks, null);
+  assert.equal(activeActivitySnapshot().activeTasks, 1);
+  assert.equal(current.revision, currentRevision, "the newer source remains untouched");
+});
+
+test("nested channel accessors cannot overwrite newer exact-source recovery", async () => {
+  completeExpectedSources();
+  let calls = 0;
+  let old!: OwnedActivitySourceHandle;
+  old = registerOwnedActivitySource("backgroundTasks", "execution", {
+    reconcileRetired: async (retained) => {
+      calls += 1;
+      return {
+        ownership: { complete: true as const, tokens: [...retained.ownership], released: [] },
+        intent: calls === 1 ? {
+          get complete(): false {
+            old.markIntentUncertain();
+            old.resolveIntentUncertainty();
+            return false;
+          },
+        } : { complete: true as const, tokens: [], released: [] },
+      };
+    },
+  });
+  old.acquire("retained-owner");
+  registerOwnedActivitySource("backgroundTasks", "execution");
+  assert.equal(activeActivitySnapshot().activeTasks, 0);
+  await reconcileRetiredExecutionActivity();
+  assert.equal(activeActivitySnapshot().activeTasks, 0,
+    "nested accessor recovery supersedes the stale incomplete result");
+  assert.equal(ownedActivitySnapshot().backgroundTasks, 1);
+  assert.equal(calls, 1);
+  await reconcileRetiredExecutionActivity();
+  assert.equal(calls, 2, "a later explicit event can retry");
+  assert.equal(activeActivitySnapshot().activeTasks, 0);
+  assert.equal(ownedActivitySnapshot().backgroundTasks, 1);
 });
 
 test("one owner's read error does not skip independent eligible owners", async () => {
@@ -539,6 +755,138 @@ test("a stopped task keeps cleanup ownership while a validated stop clears only 
     assert.equal(notifications, 0, "retired reconciliation does not notify");
     assert.equal(task.state, "failed", "retired reconciliation does not auto-resume work");
     await replacement.detach();
+  } finally {
+    ownedActivityTest.resetOwnedActivityForTests();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("controller-stale retired reads are discarded before fresh live-child evidence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-retired-live-stopped-"));
+  try {
+    await initGitRepo(root);
+    completeExpectedSources();
+    const old = controller(() => root);
+    await old.restore(EMPTY_ASSOCIATIONS);
+    const started = await old.start([{ title: "live-stopped", instructions: "work", acceptanceCriteria: ["done"] }]);
+    const internals = old as unknown as {
+      groups: Map<string, BackgroundExecutionGroup>;
+      save(group: BackgroundExecutionGroup): Promise<unknown>;
+      syncOwnedTask(task: BackgroundTaskRecord): void;
+      readCensusOperation(
+        group: BackgroundExecutionGroup,
+        task: BackgroundTaskRecord,
+        associationRevision?: number,
+      ): Promise<{ status: "released" | "dead" | "live" | "uncertain" }>;
+    };
+    const group = internals.groups.get(started.executionId)!;
+    const task = group.tasks[0]!;
+    const artifactDir = join(group.root, "artifacts", task.taskId);
+    await mkdir(artifactDir, { recursive: true });
+    const operation = createOperationRecord({
+      waveId: "wave-retired-live-stopped",
+      taskId: task.taskId,
+      title: task.definition.title,
+      worktreeRoot: group.cwd,
+      effectiveCwd: group.cwd,
+      artifactDir,
+      retryBudget: 0,
+    });
+    acquireOperationOwner(operation);
+    // Synthetic lifecycle evidence only: this records the test process as a
+    // live child lease; no executor/private session is started.
+    recordOperationChildProcess(operation, process.pid);
+    await writeOperationRecord(operation);
+    task.waveRoot = group.root;
+    task.generation = 1;
+    task.bundle = createReattachmentBundle(operation, group.root);
+    transitionTaskState(task, "stopped_for_application_exit");
+    internals.syncOwnedTask(task);
+    await internals.save(group);
+
+    assert.equal(ownedActivitySnapshot().backgroundTasks, 1);
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "the stopped task starts with a positively known-zero activity channel");
+    await old.detach();
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "detach sees no in-memory runtime/admission and leaves the persisted stopped state provisionally known zero");
+
+    const nextCwd = join(root, "next-session");
+    await mkdir(nextCwd);
+    const newer = controller(() => nextCwd);
+    await newer.restore(EMPTY_ASSOCIATIONS);
+    const registry = (globalThis as Record<PropertyKey, unknown>)[OWNED_ACTIVITY_STATE_KEY] as {
+      sources: Map<string, Map<string, Array<{
+        id: string;
+        retired: boolean;
+        tokens: Set<string>;
+        intentTokens: Set<string>;
+        uncertain: boolean;
+        intentUncertain: boolean;
+        revision: number;
+      }>>>;
+    };
+    const entries = registry.sources.get("backgroundTasks")!.get("execution")!;
+    const retired = entries.find((entry) => entry.retired)!;
+    const current = entries.find((entry) => !entry.retired)!;
+    const currentRevision = current.revision;
+    const retiredRevision = retired.revision;
+    const originalRead = internals.readCensusOperation.bind(old);
+    let gateFirstRead = true;
+    let signalRead!: () => void;
+    const readEntered = new Promise<void>((resolve) => { signalRead = resolve; });
+    let releaseRead!: () => void;
+    const readBarrier = new Promise<void>((resolve) => { releaseRead = resolve; });
+    internals.readCensusOperation = async (readGroup, readTask, associationRevision) => {
+      if (gateFirstRead) {
+        gateFirstRead = false;
+        signalRead();
+        await readBarrier;
+      }
+      return originalRead(readGroup, readTask, associationRevision);
+    };
+
+    const stalePass = reconcileRetiredExecutionActivity();
+    await readEntered;
+    await old.detach(); // Controller-local census revision changes; registry telemetry does not.
+    assert.equal(retired.revision, retiredRevision);
+    assert.equal(current.revision, currentRevision);
+    releaseRead();
+    await stalePass;
+    assert.equal(retired.uncertain, true,
+      "the controller-fenced stale result does not resolve ownership");
+    assert.equal(retired.intentUncertain, false,
+      "the discarded stale result does not turn known-zero intent into unknown");
+    assert.deepEqual([...retired.tokens], [task.taskId]);
+    assert.deepEqual([...retired.intentTokens], []);
+    assert.equal(ownedActivitySnapshot().backgroundTasks, null);
+    assert.equal(activeActivitySnapshot().activeTasks, 0);
+    assert.equal(current.revision, currentRevision, "stale evidence does not mutate the newer source");
+
+    await reconcileRetiredExecutionActivity(); // A later event retries against the newly sealed controller revision.
+    assert.equal(retired.uncertain, false,
+      "the independently complete ownership census resolves its exact channel");
+    assert.equal(retired.intentUncertain, true,
+      "the unverified live child prevents the stopped record from claiming zero activity");
+    assert.deepEqual([...retired.tokens], [task.taskId], "the retained cleanup token is not released");
+    assert.deepEqual([...retired.intentTokens], [], "the census does not fabricate a running intent token");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, 1);
+    assert.equal(activeActivitySnapshot().activeTasks, null);
+    assert.equal(current.revision, currentRevision, "the recovered current incarnation is untouched");
+    assert.equal(current.uncertain, false);
+    assert.equal(current.intentUncertain, false);
+
+    releaseOperationOwner(operation);
+    await writeOperationRecord(operation);
+    await reconcileRetiredExecutionActivity();
+    assert.equal(retired.intentUncertain, false,
+      "a later explicit read after validated stopped proof can recover activity zero");
+    assert.equal(activeActivitySnapshot().activeTasks, 0);
+    assert.equal(ownedActivitySnapshot().backgroundTasks, 1,
+      "activity recovery does not release the separate positive cleanup owner");
+    assert.deepEqual([...retired.tokens], [task.taskId]);
+    assert.equal(current.revision, currentRevision, "later old-owner proof still does not mutate the current source");
+    await newer.detach();
   } finally {
     ownedActivityTest.resetOwnedActivityForTests();
     await rm(root, { recursive: true, force: true });

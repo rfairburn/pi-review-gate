@@ -720,7 +720,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
             sessionPersistence.adoptRestoredOwners();
           }
         } else {
-          await executionTools.restoreAssociations({ waveRoots: [], bundles: [] });
+          // A readable absence for this exact native session is an authoritative
+          // empty association set, unlike the fallbacks below after restore failure.
+          await executionTools.restoreAssociations({ waveRoots: [], bundles: [], groupRoots: [] });
         }
       } catch (error) {
         if (error instanceof SessionStateCwdMismatchError) {
@@ -735,10 +737,10 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
         }
         // Only after the store is guarded (or the sidecar already quarantined)
         // may any code path run that could persist state.
-        await executionTools.restoreAssociations({ waveRoots: [], bundles: [] });
+        await executionTools.restoreAssociations({ waveRoots: [], bundles: [] }, { authoritative: false });
       }
     } else {
-      await executionTools.restoreAssociations({ waveRoots: [], bundles: [] });
+      await executionTools.restoreAssociations({ waveRoots: [], bundles: [] }, { authoritative: false });
     }
     executionTools.sync();
     // Late loader registration: after every legitimately available top-level

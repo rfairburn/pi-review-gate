@@ -15,6 +15,29 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.139]
+
+### Fixed
+
+- Partial follow-up to #353: each existing authenticated `session_start` takes one
+  bounded snapshot pass over eligible retired execution sources whose exact
+  association inventories were sealed by completed detaches. It reads each eligible
+  owner at most once, skips already-proven complete empty sources, and does not
+  duplicate an in-flight read. Failed or fresh incomplete/unavailable reads leave the
+  affected channel unknown and can be retried only on a later explicit `session_start`.
+  A controller/source-fenced stale result leaves that exact incarnation's channels and
+  tokens unchanged and can be retried on a later event; a source-list change discards
+  the captured pass without restarting it within that event. Later admissions or local
+  state/token mutations invalidate the owner's seal. A complete census can
+  resolve only that old incarnation's uncertainty, and tokens leave only with
+  channel-specific release proof; stopped cleanup ownership remains paired with its
+  token, and replacements cannot clear it. Missing, corrupt, unmatched, ambiguous,
+  stale, or unavailable evidence, uncertain liveness, and lost runtime/force-merge
+  ownership remain unknown. There is no polling, task/user notification, state write,
+  task resume, or change to ordinary task token formats.
+  Historical onset and any screenshot/Claude-link causation remain unproven; this does
+  not claim full resolution of #353.
+
 ## [0.1.0-dev.138]
 
 ### Added

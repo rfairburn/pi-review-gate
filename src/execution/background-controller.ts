@@ -37,8 +37,11 @@ import { resolveArtifactRoot } from "./evidence/sources";
 import { buildSubtaskEvidence, readConfinedOperationRecord, readSubtaskEvidence, type SubtaskEvidenceRead, type SubtaskEvidenceSelector, type SubtaskEvidenceUnavailable } from "./subtask-evidence";
 import { sourceMutationCoordinator } from "./source-mutation-lease";
 import {
+  RETIRED_ACTIVITY_CENSUS_DISCARDED,
   registerOwnedActivitySource,
   type OwnedActivitySourceHandle,
+  type RetiredOwnedActivityReconciliation,
+  type RetiredOwnedActivityTokens,
 } from "../session-host/owned-activity";
 import {
   appendActivity,
@@ -223,6 +226,85 @@ interface RecentBackgroundActivity {
   taskId: string;
   title: string;
   event: BackgroundActivityEvent;
+}
+
+interface RetiredCensusRoot {
+  root: string;
+  executionId?: string;
+  sessionCwd?: string;
+  invalid?: boolean;
+}
+
+interface RetiredExecutionCensusInventory {
+  /** Complete root/reference union retained before any controller map is lost. */
+  roots: Map<string, RetiredCensusRoot>;
+  bundles: Map<string, ReattachmentBundle>;
+  waveRoots: Set<string>;
+  unresolvedTaskIds: Set<string>;
+  /** An admission with no stable task/root identity was in flight at detach. */
+  unresolvedAll: boolean;
+  initialized: boolean;
+  authoritative: boolean;
+  ownershipComplete: boolean;
+  intentComplete: boolean;
+  /** Only a completed detach may seal the retained inventory for recovery. */
+  detachComplete: boolean;
+  /** Any post-detach admission/state/token mutation invalidates this revision. */
+  detachedRevision: number | undefined;
+  revision: number;
+}
+
+interface CensusTaskOwner {
+  group: BackgroundExecutionGroup;
+  task?: BackgroundTaskRecord;
+  archived?: boolean;
+  archiveIntegritySha256?: string;
+}
+
+interface CensusOperationEvidence {
+  status: "released" | "dead" | "live" | "uncertain";
+}
+
+function validCensusTimestamp(value: unknown): boolean {
+  return typeof value === "string"
+    && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value)
+    && Number.isFinite(Date.parse(value));
+}
+
+function validRetiredOperationOwner(value: unknown): value is NonNullable<OperationRecord["owner"]> {
+  if (!isRecord(value)) return false;
+  const owner = value;
+  if (owner.version !== 1
+    || typeof owner.instanceId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(owner.instanceId)
+    || !Number.isSafeInteger(owner.hostPid) || owner.hostPid <= 0
+    || !validCensusTimestamp(owner.acquiredAt)
+    || !validCensusTimestamp(owner.heartbeatAt)
+    || (owner.status !== "active" && owner.status !== "released")) return false;
+  if (owner.status === "released") {
+    if (!validCensusTimestamp(owner.releasedAt)) return false;
+  } else if (owner.releasedAt !== undefined) {
+    return false;
+  }
+
+  const hasChildEvidence = owner.childPid !== undefined
+    || owner.childProcessGroupId !== undefined
+    || owner.childLifecycleId !== undefined
+    || owner.childStartedAt !== undefined
+    || owner.childExitedAt !== undefined;
+  if (hasChildEvidence) {
+    if (!Number.isSafeInteger(owner.childPid) || owner.childPid <= 0
+      || typeof owner.childLifecycleId !== "string" || owner.childLifecycleId.length === 0
+      || !validCensusTimestamp(owner.childStartedAt)
+      || (owner.childProcessGroupId !== undefined
+        && (!Number.isSafeInteger(owner.childProcessGroupId) || owner.childProcessGroupId <= 0))
+      || (owner.childExitedAt !== undefined && !validCensusTimestamp(owner.childExitedAt))) return false;
+  }
+  return true;
+}
+
+export interface BackgroundControllerRestoreOptions {
+  /** False when a caller supplies empty fallback data after a failed restore. */
+  authoritative?: boolean;
 }
 
 /** A force-merge request that is not a runtime task but must stay cancellable. */
@@ -492,6 +574,11 @@ export class BackgroundExecutionController {
   private readonly groups = new Map<string, BackgroundExecutionGroup>();
   /** Owner of this controller incarnation's positive owned-work tokens. */
   private readonly ownedActivity: OwnedActivitySourceHandle;
+  /** Retained exact owner inventory survives restore/detach map clearing. */
+  private retiredCensus?: RetiredExecutionCensusInventory;
+  /** Async read fence for controller-local mutation during a retired census. */
+  private censusRevision = 0;
+  private startAdmissions = 0;
   private readonly runtimes = new Map<string, RuntimeTaskHandle>();
   private readonly pendingForceMerges = new Map<string, PendingForceMerge>();
   /** Reserve command admission before recovery's first await, including bundle adoption. */
@@ -578,6 +665,7 @@ export class BackgroundExecutionController {
     this.ownedActivity = registerOwnedActivitySource("backgroundTasks", "execution", {
       uncertain: true,
       intentUncertain: true,
+      reconcileRetired: (retained) => this.reconcileRetiredActivity(retained),
     });
     this.pool = new ExecutorPoolScheduler(resolvedWorkerResources(input.config));
     this.ledger = new ParentCheckpointLedger({
@@ -777,7 +865,417 @@ export class BackgroundExecutionController {
     };
   }
 
-  async restore(associations: ExecutionAssociationsSnapshot): Promise<void> {
+  /**
+   * Retain the source's own association union before restore/detach drops its
+   * maps. Caller snapshots are added, never used as replacement data; local
+   * groups and in-flight ownership are included independently.
+   */
+  private retainRetiredCensus(
+    associations: ExecutionAssociationsSnapshot,
+    authoritative: boolean,
+    includeCurrent: boolean,
+    callerSnapshot = false,
+  ): void {
+    const inventory = this.retiredCensus ??= {
+      roots: new Map(),
+      bundles: new Map(),
+      waveRoots: new Set(),
+      unresolvedTaskIds: new Set(),
+      unresolvedAll: false,
+      initialized: false,
+      authoritative: false,
+      ownershipComplete: false,
+      intentComplete: false,
+      detachComplete: false,
+      detachedRevision: undefined,
+      revision: 0,
+    };
+    inventory.detachComplete = false;
+    inventory.detachedRevision = undefined;
+    let sessionCwd: string | undefined;
+    try {
+      sessionCwd = resolve(this.input.cwd());
+    } catch {
+      inventory.ownershipComplete = false;
+      inventory.intentComplete = false;
+    }
+
+    const addRoot = (root: unknown, identity?: { executionId?: string; sessionCwd?: string }): void => {
+      if (typeof root !== "string" || root.length === 0) {
+        inventory.ownershipComplete = false;
+        inventory.intentComplete = false;
+        return;
+      }
+      let key: string;
+      try {
+        key = resolve(root);
+      } catch {
+        inventory.ownershipComplete = false;
+        inventory.intentComplete = false;
+        return;
+      }
+      const expectedCwd = identity?.sessionCwd;
+      const prior = inventory.roots.get(key);
+      if (!prior) {
+        inventory.roots.set(key, {
+          root: key,
+          ...(identity?.executionId ? { executionId: identity.executionId } : {}),
+          ...(expectedCwd ? { sessionCwd: resolve(expectedCwd) } : {}),
+          ...(!expectedCwd ? { invalid: true } : {}),
+        });
+        return;
+      }
+      if ((prior.executionId && identity?.executionId && prior.executionId !== identity.executionId)
+        || (prior.sessionCwd && expectedCwd && prior.sessionCwd !== resolve(expectedCwd))) {
+        prior.invalid = true;
+        inventory.ownershipComplete = false;
+        inventory.intentComplete = false;
+      }
+      if (!prior.executionId && identity?.executionId) prior.executionId = identity.executionId;
+      if (!prior.sessionCwd && expectedCwd) prior.sessionCwd = resolve(expectedCwd);
+      if (!prior.sessionCwd) prior.invalid = true;
+    };
+
+    if (callerSnapshot) {
+      const hasRootList = Array.isArray(associations.groupRoots);
+      const hasBundleList = Array.isArray(associations.bundles);
+      const hasWaveRootList = Array.isArray(associations.waveRoots);
+      if (!inventory.initialized) {
+        inventory.initialized = true;
+        inventory.authoritative = authoritative && hasRootList && hasBundleList && hasWaveRootList;
+        inventory.ownershipComplete = inventory.authoritative;
+        inventory.intentComplete = inventory.authoritative;
+      } else if (authoritative && (!hasRootList || !hasBundleList || !hasWaveRootList)) {
+        inventory.ownershipComplete = false;
+        inventory.intentComplete = false;
+      }
+      if (!authoritative) {
+        // Empty fallback data after a failed sidecar read is never a complete
+        // replacement for the source's previously retained owner inventory.
+        const addsUnknownReference = (associations.groupRoots?.length ?? 0) > 0
+          || (associations.bundles?.length ?? 0) > 0
+          || (associations.waveRoots?.length ?? 0) > 0;
+        if (!inventory.authoritative || addsUnknownReference) {
+          inventory.ownershipComplete = false;
+          inventory.intentComplete = false;
+        }
+      }
+      if (!hasRootList || !hasBundleList || !hasWaveRootList) {
+        inventory.ownershipComplete = false;
+        inventory.intentComplete = false;
+      }
+      for (const root of associations.groupRoots ?? []) addRoot(root, { sessionCwd });
+      for (const bundle of associations.bundles ?? []) {
+        if (!bundle || typeof bundle !== "object") {
+          inventory.ownershipComplete = false;
+          inventory.intentComplete = false;
+          continue;
+        }
+        inventory.bundles.set(JSON.stringify(bundle), { ...bundle });
+      }
+      for (const root of associations.waveRoots ?? []) {
+        if (typeof root !== "string" || root.length === 0) {
+          inventory.ownershipComplete = false;
+          inventory.intentComplete = false;
+        } else inventory.waveRoots.add(resolve(root));
+      }
+    }
+
+    if (includeCurrent) {
+      const currentAssociations = this.associations();
+      for (const group of this.groups.values()) {
+        addRoot(group.root, { executionId: group.executionId, sessionCwd: this.sessionCwdOf(group) });
+      }
+      for (const entry of this.activeTasks.values()) {
+        addRoot(entry.group.root, { executionId: entry.group.executionId, sessionCwd: this.sessionCwdOf(entry.group) });
+      }
+      for (const bundle of currentAssociations.bundles) inventory.bundles.set(JSON.stringify(bundle), { ...bundle });
+      for (const root of currentAssociations.waveRoots) inventory.waveRoots.add(resolve(root));
+
+      for (const taskId of this.runtimes.keys()) inventory.unresolvedTaskIds.add(taskId);
+      for (const taskId of this.pendingForceMerges.keys()) inventory.unresolvedTaskIds.add(taskId);
+      for (const taskId of this.continuationAdmissions) inventory.unresolvedTaskIds.add(taskId);
+      for (const group of this.groups.values()) {
+        for (const task of group.tasks) {
+          // A persisted non-queued active state without its runtime map is a
+          // lost liveness owner, not evidence that execution stopped.
+          if (task.state !== "queued" && isActiveTaskState(task.state) && !this.runtimes.has(task.taskId)) {
+            inventory.unresolvedTaskIds.add(task.taskId);
+          }
+        }
+      }
+      if (this.startAdmissions > 0) inventory.unresolvedAll = true;
+    }
+    if (inventory.unresolvedAll || inventory.unresolvedTaskIds.size > 0) {
+      inventory.ownershipComplete = false;
+      inventory.intentComplete = false;
+    }
+    inventory.revision += 1;
+    this.censusRevision += 1;
+  }
+
+  /** Read-only operation identity/liveness evidence for one exact task. */
+  private async readCensusOperation(
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    associationRevision?: number,
+  ): Promise<CensusOperationEvidence> {
+    const expectedWaveRoot = task.waveRoot ?? task.bundle?.waveRoot;
+    let artifactDir: string;
+    if (expectedWaveRoot) {
+      const waveRoot = await realpath(resolve(expectedWaveRoot));
+      if (task.waveRoot && await realpath(resolve(task.waveRoot)) !== waveRoot) {
+        throw new Error("Task wave root changed during census.");
+      }
+      if (task.bundle && await realpath(resolve(task.bundle.waveRoot)) !== waveRoot) {
+        throw new Error("Task bundle wave root does not match its retained task.");
+      }
+      artifactDir = join(waveRoot, "artifacts", task.taskId);
+    } else if (isInPlaceKind(group.kind)) {
+      artifactDir = join(group.root, "artifacts", task.taskId);
+    } else {
+      throw new Error("Started task has no exact operation root.");
+    }
+    const resolvedArtifactDir = await realpath(artifactDir);
+    if (resolvedArtifactDir !== resolve(artifactDir)) throw new Error("Operation artifact directory is redirected.");
+    const expectedRecordPath = operationRecordPath(resolvedArtifactDir);
+    if (task.inplaceResult?.operationRecord
+      && resolve(task.inplaceResult.operationRecord) !== resolve(expectedRecordPath)) {
+      throw new Error("In-place operation record is outside its exact task artifact directory.");
+    }
+    const operation = await readOperationRecord(expectedRecordPath);
+    if (operation.taskId !== task.taskId
+      || operation.operationId !== `${operation.waveId}/${task.taskId}`
+      || await realpath(operation.artifactDir) !== resolvedArtifactDir) {
+      throw new Error("Operation record identity does not match the retained task.");
+    }
+    if (task.bundle && (!Number.isSafeInteger(task.bundle.expectedRevision)
+      || task.bundle.expectedRevision < 0
+      || operation.operationId !== task.bundle.operationId
+      || operation.waveId !== task.bundle.waveId
+      || operation.revision < task.bundle.expectedRevision)) {
+      throw new Error("Operation record does not match the retained recovery bundle.");
+    }
+    if (associationRevision !== undefined && operation.revision < associationRevision) {
+      throw new Error("Operation record predates a retained association revision.");
+    }
+    if (!Number.isSafeInteger(operation.revision) || operation.revision < 0
+      || !validRetiredOperationOwner(operation.owner)) {
+      throw new Error("Operation revision or owner lease evidence is incomplete or malformed.");
+    }
+    return { status: operationOwnershipStatus(operation).status };
+  }
+
+  /**
+   * Exact old-controller census. It only reads validated manifests, archives,
+   * and operation ownership metadata; no restore/adoption/save/pump/notify or
+   * task-state transition is reachable from this path.
+   */
+  private async reconcileRetiredActivity(
+    retained: RetiredOwnedActivityTokens,
+  ): Promise<RetiredOwnedActivityReconciliation> {
+    const inventory = this.retiredCensus;
+    if (!inventory || !inventory.initialized || !inventory.authoritative
+      || this.detaching > 0 || !inventory.detachComplete
+      || inventory.detachedRevision !== this.censusRevision) return {};
+    const generation = this.censusRevision;
+    const inventoryRevision = inventory.revision;
+    let ownershipComplete = inventory.ownershipComplete;
+    let intentComplete = inventory.intentComplete;
+    const ownershipTokens = new Set(retained.ownership);
+    const intentTokens = new Set(retained.intent ?? []);
+    const releasedOwnership = new Set<string>();
+    const releasedIntent = new Set<string>();
+    const rowsByTaskId = new Map<string, CensusTaskOwner[]>();
+    const associationRevisions = new Map<string, number>();
+
+    const addRow = (taskId: string, row: CensusTaskOwner): void => {
+      const rows = rowsByTaskId.get(taskId) ?? [];
+      rows.push(row);
+      rowsByTaskId.set(taskId, rows);
+    };
+    for (const expected of inventory.roots.values()) {
+      try {
+        if (expected.invalid || !expected.sessionCwd) throw new Error("Retained execution root has ambiguous identity.");
+        const restored = await readGroup(expected.root);
+        const group = restored.group;
+        if (resolve(group.root) !== resolve(expected.root)
+          || (expected.executionId && expected.executionId !== group.executionId)
+          || resolve(this.sessionCwdOf(group)) !== resolve(expected.sessionCwd)) {
+          throw new Error("Retained execution root identity changed.");
+        }
+        const inlineIds = new Set(group.tasks.map((task) => task.taskId));
+        for (const task of group.tasks) addRow(task.taskId, { group, task });
+        for (const [taskId, archive] of restored.legacyArchives) {
+          if (!inlineIds.has(taskId)) addRow(taskId, {
+            group,
+            archived: true,
+            archiveIntegritySha256: archive.archiveIntegritySha256,
+          });
+        }
+      } catch {
+        ownershipComplete = false;
+        intentComplete = false;
+      }
+    }
+
+    const duplicateIdentity = [...rowsByTaskId.values()].some((rows) => rows.length !== 1);
+    if (duplicateIdentity) {
+      // Task ids are source tokens; duplicate logical records cannot be
+      // collapsed into a Set without losing an owned unit.
+      ownershipComplete = false;
+      intentComplete = false;
+    }
+
+    const loadRow = async (taskId: string, row: CensusTaskOwner): Promise<BackgroundTaskRecord> => {
+      if (row.task) return row.task;
+      const task = await readOwnedTaskArchive(row.group.root, taskId, {
+        executionId: row.group.executionId,
+        archiveIntegritySha256: row.archiveIntegritySha256,
+      });
+      if (!task) throw new Error("Authenticated retained task archive is missing.");
+      row.task = task;
+      return task;
+    };
+
+    for (const bundle of inventory.bundles.values()) {
+      try {
+        const rows = rowsByTaskId.get(bundle.taskId);
+        if (!rows || rows.length !== 1) throw new Error("Recovery bundle has no unique retained task.");
+        const task = await loadRow(bundle.taskId, rows[0]!);
+        if (!Number.isSafeInteger(bundle.expectedRevision) || bundle.expectedRevision < 0) {
+          throw new Error("Recovery bundle revision is invalid.");
+        }
+        associationRevisions.set(bundle.taskId, Math.max(associationRevisions.get(bundle.taskId) ?? 0, bundle.expectedRevision));
+        if (!task.bundle
+          || task.bundle.taskId !== bundle.taskId
+          || task.bundle.operationId !== bundle.operationId
+          || task.bundle.waveId !== bundle.waveId
+          || resolve(task.bundle.waveRoot) !== resolve(bundle.waveRoot)) {
+          throw new Error("Recovery bundle does not match its exact retained task.");
+        }
+      } catch {
+        ownershipComplete = false;
+        intentComplete = false;
+      }
+    }
+    for (const waveRoot of inventory.waveRoots) {
+      let matched = false;
+      for (const rows of rowsByTaskId.values()) {
+        if (rows.length !== 1) continue;
+        const row = rows[0]!;
+        if (row.task?.waveRoot && resolve(row.task.waveRoot) === resolve(waveRoot)) matched = true;
+        if (row.task?.bundle?.waveRoot && resolve(row.task.bundle.waveRoot) === resolve(waveRoot)) matched = true;
+      }
+      if (!matched) {
+        ownershipComplete = false;
+        intentComplete = false;
+      }
+    }
+
+    // Each retained token must resolve to exactly one inline task or an
+    // authenticated archive; otherwise it remains positive and unknown.
+    for (const token of new Set([...retained.ownership, ...(retained.intent ?? [])])) {
+      const rows = rowsByTaskId.get(token);
+      if (!rows || rows.length !== 1) {
+        ownershipComplete = false;
+        intentComplete = false;
+        continue;
+      }
+      if (!rows[0]!.task) {
+        try {
+          await loadRow(token, rows[0]!);
+        } catch {
+          ownershipComplete = false;
+          intentComplete = false;
+        }
+      }
+    }
+
+    for (const [taskId, rows] of rowsByTaskId) {
+      if (rows.length !== 1) continue;
+      const row = rows[0]!;
+      let task: BackgroundTaskRecord;
+      try {
+        task = await loadRow(taskId, row);
+      } catch {
+        ownershipComplete = false;
+        intentComplete = false;
+        continue;
+      }
+      if (task.taskId !== taskId) {
+        ownershipComplete = false;
+        intentComplete = false;
+        continue;
+      }
+      if (inventory.unresolvedAll || inventory.unresolvedTaskIds.has(taskId)) {
+        ownershipComplete = false;
+        intentComplete = false;
+        continue;
+      }
+      let operationStatus: CensusOperationEvidence["status"] | undefined;
+      const needsOperation = Boolean(task.bundle || task.waveRoot || task.inplaceResult?.operationRecord || (task.generation ?? 0) > 0);
+      if (needsOperation) {
+        try {
+          operationStatus = (await this.readCensusOperation(row.group, task, associationRevisions.get(taskId))).status;
+        } catch {
+          ownershipComplete = false;
+          intentComplete = false;
+          continue;
+        }
+        if (operationStatus === "uncertain") {
+          ownershipComplete = false;
+          intentComplete = false;
+          continue;
+        }
+      }
+      if (isArchivableTaskState(task.state)) {
+        if (operationStatus === "live") {
+          ownershipComplete = false;
+          intentComplete = false;
+          continue;
+        }
+        if (ownershipTokens.delete(taskId)) releasedOwnership.add(taskId);
+        if (intentTokens.delete(taskId)) releasedIntent.add(taskId);
+        continue;
+      }
+
+      if (taskOwnsUnsettledWork(task, false, false)) ownershipTokens.add(taskId);
+      else if (ownershipTokens.delete(taskId)) releasedOwnership.add(taskId);
+
+      if (task.state === "queued" && operationStatus !== "live" && operationStatus !== "uncertain") {
+        intentTokens.add(taskId); // queued logical work is intent, not a resumed process
+      } else if (!isActiveTaskState(task.state)
+        && (!needsOperation || operationStatus === "released" || operationStatus === "dead")) {
+        if (intentTokens.delete(taskId)) releasedIntent.add(taskId);
+      } else {
+        // Durable active state alone is not runtime evidence. A retained live
+        // owner is positive ownership, but its current activity remains unknown.
+        intentComplete = false;
+        if (operationStatus === "live" && taskOwnsUnsettledWork(task, false, false)) ownershipTokens.add(taskId);
+      }
+    }
+
+    if (this.censusRevision !== generation || inventory.revision !== inventoryRevision
+      || this.retiredCensus !== inventory) return RETIRED_ACTIVITY_CENSUS_DISCARDED;
+
+    const channel = (complete: boolean, tokens: Set<string>, released: Set<string>) => complete
+      ? { complete: true as const, tokens: [...tokens], released: [...released] }
+      : { complete: false as const };
+    return {
+      ownership: channel(ownershipComplete, ownershipTokens, releasedOwnership),
+      ...(retained.intent !== undefined
+        ? { intent: channel(intentComplete, intentTokens, releasedIntent) }
+        : {}),
+    };
+  }
+
+  async restore(
+    associations: ExecutionAssociationsSnapshot,
+    options: BackgroundControllerRestoreOptions = {},
+  ): Promise<void> {
+    this.censusRevision += 1;
+    this.retainRetiredCensus(associations, options.authoritative !== false, true, true);
     // Every restore invalidates prior completeness before its first await: the
     // owned set may be changing (or unresolved) until this restore authoritatively
     // accounts for it. A previously complete controller must not keep
@@ -792,6 +1290,12 @@ export class BackgroundExecutionController {
     // register a save tail) after a later detach completed its quiescence.
     const restoreIsCurrent = () =>
       !this.shuttingDown && this.detaching === 0 && this.detachEpoch === restoreEpoch;
+    if (!restoreIsCurrent()) return;
+    if (this.retiredCensus) {
+      this.retiredCensus.detachComplete = false;
+      this.retiredCensus.detachedRevision = undefined;
+    }
+    this.censusRevision += 1;
     const roots = associations.groupRoots ?? [];
     let restoreAccounted = true;
     // Activity completeness is tracked SEPARATELY from ownership recovery: a
@@ -976,9 +1480,9 @@ export class BackgroundExecutionController {
     // cleanup-association recovery failed, so a known stopped task reports zero
     // activity while ownership stays unknown; only a genuinely unreadable
     // group or unobserved admission keeps activity unknown.
-    if (restoreAccounted) this.ownedActivity.resolveUncertainty();
+    if (restoreAccounted && options.authoritative !== false) this.ownedActivity.resolveUncertainty();
     else this.ownedActivity.markUncertain();
-    if (restoreActivityAccounted) this.ownedActivity.resolveIntentUncertainty();
+    if (restoreActivityAccounted && options.authoritative !== false) this.ownedActivity.resolveIntentUncertainty();
     else this.ownedActivity.markIntentUncertain();
     void this.pump();
   }
@@ -988,6 +1492,22 @@ export class BackgroundExecutionController {
     kind: BackgroundTaskKind = "execute",
     workspace?: string,
     options?: ScheduledStartOptions,
+  ): Promise<BackgroundInspection> {
+    this.startAdmissions += 1;
+    this.censusRevision += 1;
+    try {
+      return await this.startAdmitted(tasks, kind, workspace, options);
+    } finally {
+      this.startAdmissions -= 1;
+      this.censusRevision += 1;
+    }
+  }
+
+  private async startAdmitted(
+    tasks: BackgroundTaskDefinition[],
+    kind: BackgroundTaskKind,
+    workspace: string | undefined,
+    options: ScheduledStartOptions | undefined,
   ): Promise<BackgroundInspection> {
     const detachEpoch = this.detachEpoch;
     if (this.shuttingDown || this.detaching > 0) throw new Error("Application shutdown or controller detach is in progress.");
@@ -1596,6 +2116,7 @@ export class BackgroundExecutionController {
     if (this.pendingForceMerges.has(taskId)) throw new Error(`Task ${taskId} has a force-merge in progress.`);
     const epoch = this.detachEpoch;
     this.continuationAdmissions.add(taskId);
+    this.censusRevision += 1;
     // The reservation is a concurrency guard only, never accepted activity: a
     // rejected or duplicate continuation must publish no positive intent. The
     // finally reconciles the exact record this admission observed — including an
@@ -1605,6 +2126,7 @@ export class BackgroundExecutionController {
       return await this.admitContinuation(input, epoch, (task) => { observedTarget = task; });
     } finally {
       this.continuationAdmissions.delete(taskId);
+      this.censusRevision += 1;
       const task = observedTarget ?? this.taskById(taskId);
       if (task) this.syncActiveIntent(task);
     }
@@ -2303,6 +2825,7 @@ export class BackgroundExecutionController {
     const done = new Promise<void>((resolveDone) => { signalDone = resolveDone; });
     const pending: PendingForceMerge = { abort: new AbortController(), done, acquired: false };
     this.pendingForceMerges.set(task.taskId, pending);
+    this.censusRevision += 1;
     // An actual force-merge operation is activity the moment it is registered,
     // even if the task's durable state is already terminal and has not changed.
     this.syncActiveIntent(task);
@@ -2310,6 +2833,7 @@ export class BackgroundExecutionController {
       return await this.runForceMerge(input, group, task, pending);
     } finally {
       this.pendingForceMerges.delete(task.taskId);
+      this.censusRevision += 1;
       // The owned force-merge operation settled: reconcile this task's token.
       this.syncOwnedTask(task);
       signalDone();
@@ -2891,6 +3415,10 @@ export class BackgroundExecutionController {
   }
 
   async detach(): Promise<void> {
+    this.censusRevision += 1;
+    this.retainRetiredCensus(this.associations(), false, true);
+    if (!this.retiredCensus?.ownershipComplete) this.ownedActivity.markUncertain();
+    if (!this.retiredCensus?.intentComplete) this.ownedActivity.markIntentUncertain();
     this.detaching += 1;
     this.detachEpoch += 1;
     this.wakes.clearWatches();
@@ -2902,13 +3430,21 @@ export class BackgroundExecutionController {
     // detached groups are rejected by save()'s attachment guard.
     try {
       await this.quiesceSaveTails(() => {
+        // Capture ownership admitted or launched while save tails drained,
+        // before clearing the maps that provide its exact liveness evidence.
+        this.retainRetiredCensus(this.associations(), false, true);
         const outstandingOwnedWork = [...this.groups.values()]
           .some((group) => group.tasks.some((task) => this.taskOwnsUnsettledWork(task)))
           || [...this.activeTasks.values()].some(({ task }) => this.taskOwnsUnsettledWork(task));
+        const outstandingIntent = this.runtimes.size > 0 || this.pendingForceMerges.size > 0
+          || this.continuationAdmissions.size > 0 || this.startAdmissions > 0
+          || [...this.groups.values()].some((group) => group.tasks.some((task) =>
+            task.state !== "queued" && isActiveTaskState(task.state) && !this.runtimes.has(task.taskId)));
         this.groups.clear();
         this.activeTasks.clear();
         this.runtimes.clear();
         this.pendingForceMerges.clear();
+        this.censusRevision += 1;
         this.archivedTasks.clear();
         this.legacyArchiveHandles.clear();
         // Issue #222: no pending launch-notice gate survives detach; a later
@@ -2922,6 +3458,7 @@ export class BackgroundExecutionController {
         // persisted snapshot re-blocks each gate on restore.
         this.conflictGates.clear();
         this.updateIndicator();
+        if (outstandingIntent) this.ownedActivity.markIntentUncertain();
         if (outstandingOwnedWork) {
           // The in-memory index is gone but its owned work is not proven
           // settled: the category stays UNKNOWN (never zero) until an
@@ -2932,6 +3469,10 @@ export class BackgroundExecutionController {
       });
     } finally {
       this.detaching -= 1;
+    }
+    if (this.retiredCensus) {
+      this.retiredCensus.detachComplete = true;
+      this.retiredCensus.detachedRevision = this.censusRevision;
     }
   }
 
@@ -3108,6 +3649,7 @@ export class BackgroundExecutionController {
         // and covers failures before ownership was handed down.
         lease.release();
         this.runtimes.delete(task.taskId);
+        this.censusRevision += 1;
         // The owned executor runtime actually settled: reconcile its token
         // against the remaining ownership (state, force-merge, operation).
         this.syncOwnedTask(task);
@@ -3116,6 +3658,7 @@ export class BackgroundExecutionController {
         void this.pump();
       });
     this.runtimes.set(task.taskId, { abort, promise, controlStatus: "pending" });
+    this.censusRevision += 1;
     this.updateIndicator();
   }
 
@@ -3493,6 +4036,7 @@ export class BackgroundExecutionController {
 
   /** Acquire/release one task's owned-work token to match its unsettled ownership. */
   private syncOwnedTask(task: BackgroundTaskRecord): void {
+    this.censusRevision += 1;
     if (this.taskOwnsUnsettledWork(task)) this.ownedActivity.acquire(task.taskId);
     else this.ownedActivity.release(task.taskId);
     // The independent activity-intent channel is reconciled at exactly the same
@@ -3507,6 +4051,7 @@ export class BackgroundExecutionController {
 
   /** Acquire/release one task's activity-intent token to match its admitted/running state. */
   private syncActiveIntent(task: BackgroundTaskRecord): void {
+    this.censusRevision += 1;
     if (this.taskHasActiveIntent(task)) this.ownedActivity.acquireIntent(task.taskId);
     else this.ownedActivity.releaseIntent(task.taskId);
   }
@@ -3602,6 +4147,7 @@ export class BackgroundExecutionController {
     if (this.groups.get(group.executionId) !== group) {
       throw new Error(`Execution ${group.executionId} was detached before it could be saved.`);
     }
+    this.censusRevision += 1;
     // Everything up to the tail registration is synchronous: once save() has
     // been entered, its tail is registered before any other code can run, so
     // quiescing the tail map can never miss a save that is already in flight.

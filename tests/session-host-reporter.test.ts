@@ -24,6 +24,12 @@ import {
   __test as startupRequestTest,
 } from "../src/session-host/startup-request";
 import {
+  OWNED_ACTIVITY_STATE_KEY,
+  ownedActivitySnapshot,
+  registerOwnedActivitySource,
+  __test as ownedActivityTest,
+} from "../src/session-host/owned-activity";
+import {
   HOST_BOOTSTRAP_ENV,
   MAX_STATUS_FRAME_BYTES,
   MAX_NATIVE_SESSION_NAME_LENGTH,
@@ -336,6 +342,7 @@ beforeEach(() => {
   previousRuntimeRole = process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
   delete process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
   delete (globalThis as Record<PropertyKey, unknown>)[SESSION_HOST_STICKY_STATE_KEY];
+  ownedActivityTest.resetOwnedActivityForTests();
   delete (globalThis as Record<PropertyKey, unknown>)[SESSION_HOST_SPAWN_CAPABILITY_KEY];
   startupRequestTest.clearProcessMetadata();
 });
@@ -350,6 +357,7 @@ afterEach(async () => {
   if (previousRuntimeRole === undefined) delete process.env.PI_REVIEW_GATE_RUNTIME_ROLE;
   else process.env.PI_REVIEW_GATE_RUNTIME_ROLE = previousRuntimeRole;
   delete (globalThis as Record<PropertyKey, unknown>)[SESSION_HOST_STICKY_STATE_KEY];
+  ownedActivityTest.resetOwnedActivityForTests();
   delete (globalThis as Record<PropertyKey, unknown>)[SESSION_HOST_SPAWN_CAPABILITY_KEY];
   startupRequestTest.clearProcessMetadata();
   for (const server of servers.splice(0)) {
@@ -641,6 +649,62 @@ describe("session-host reporter activation", () => {
     await activate(pi);
     assert.equal(process.env[HOST_BOOTSTRAP_ENV], undefined);
     assert.ok(hooks.size > 0, "hooks registered with a valid bootstrap");
+  });
+
+  it("awaits a bounded retired execution read and retries it on a later session_start", async () => {
+    const server = await startTestServer();
+    const order: string[] = [];
+    let censusCalls = 0;
+    registerOwnedActivitySource("backgroundTasks", "execution", {
+      uncertain: true,
+      intentUncertain: true,
+      reconcileRetired: async () => {
+        censusCalls += 1;
+        order.push("census-start");
+        await Promise.resolve();
+        order.push("census-complete");
+        if (censusCalls === 1) return {}; // Incomplete evidence stays unknown and may retry next event.
+        return {
+          ownership: { complete: true, tokens: [], released: [] },
+          intent: { complete: true, tokens: [], released: [] },
+        };
+      },
+    });
+    process.env[HOST_BOOTSTRAP_ENV] = JSON.stringify(makeBootstrap(server.socketPath));
+    const first = createPi();
+    await activate(first.pi); // authenticated opt-in replays the pre-opt-in callback
+    registerOwnedActivitySource("backgroundTasks", "review");
+    const replacement = registerOwnedActivitySource("backgroundTasks", "execution", { uncertain: true, intentUncertain: true });
+    replacement.resolveUncertainty();
+    replacement.resolveIntentUncertainty();
+    (first.pi as { on(name: string, handler: (...args: unknown[]) => unknown): void })
+      .on("session_start", () => { order.push("restoreAssociations"); });
+    const ctx = makeCtx(makeUi().ui, "tui", () => true);
+    await first.trigger("session_start", { type: "session_start", reason: "reload" }, ctx);
+    assert.deepEqual(order, ["census-start", "census-complete", "restoreAssociations"],
+      "the existing reporter hook awaits read-only recovery before ordinary restoration");
+    assert.equal(censusCalls, 1);
+    assert.equal(ownedActivitySnapshot().backgroundTasks, null, "incomplete evidence remains unknown");
+
+    order.length = 0;
+    const reloaded = createPi();
+    await activate(reloaded.pi); // same process and reload-durable registry
+    (reloaded.pi as { on(name: string, handler: (...args: unknown[]) => unknown): void })
+      .on("session_start", () => { order.push("restoreAssociations"); });
+    await reloaded.trigger("session_start", { type: "session_start", reason: "same-process-reactivation" }, ctx);
+    assert.deepEqual(order, ["census-start", "census-complete", "restoreAssociations"],
+      "a later explicit lifecycle event retries once before restoration");
+    assert.equal(censusCalls, 2);
+    const registry = (globalThis as Record<PropertyKey, unknown>)[OWNED_ACTIVITY_STATE_KEY] as {
+      sources: Map<string, Map<string, Array<{
+        retired: boolean;
+        uncertain: boolean;
+        intentUncertain?: boolean;
+      }>>>;
+    };
+    const retired = registry.sources.get("backgroundTasks")!.get("execution")!.find((entry) => entry.retired)!;
+    assert.equal(retired.uncertain, false, "the later census resolves the exact retired owner's ownership uncertainty");
+    assert.equal(retired.intentUncertain, false, "the later census independently resolves its activity uncertainty");
   });
 
   it("treats malformed bootstrap env as absent", async () => {

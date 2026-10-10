@@ -233,6 +233,89 @@ test("settlement follows written, unchanged, and drained backpressure candidates
 	assert.equal(await driver.close(), true);
 });
 
+test("asynchronous accepted writes gate unchanged checks and coalesce to the newest candidate", async () => {
+	const output = new SyntheticWritable();
+	output.deferCallbacks = true;
+	const driver = writer(output, { redrawIntervalMs: 0 });
+	const dispositions: string[] = [];
+	driver.start();
+	driver.submit(frame(["A"]), 20, 1, (value) => dispositions.push(`A:${value}`));
+	assert.equal(output.writes.length, 1, "the initial frame waits for alternate-screen write completion");
+	output.completeCallback(0);
+	assert.equal(output.writes.length, 2, "the first frame starts after the initial write callback");
+	assert.equal(dispositions.length, 0, "write() returning true alone does not settle A");
+
+	driver.submit(frame(["A"]), 20, 1, (value) => dispositions.push(`same:${value}`));
+	assert.equal(dispositions.length, 0, "an unchanged candidate cannot settle against an incomplete baseline");
+	output.completeCallback(1);
+	assert.deepEqual(dispositions, ["A:written", "same:unchanged"]);
+
+	driver.submit(frame(["B"]), 20, 1, (value) => dispositions.push(`B:${value}`));
+	driver.submit(frame(["C"]), 20, 1, (value) => dispositions.push(`C:${value}`));
+	driver.submit(frame(["D"]), 20, 1, (value) => dispositions.push(`D:${value}`));
+	assert.equal(output.writes.length, 3, "only B is in flight while C and D coalesce");
+	assert.deepEqual(dispositions, ["A:written", "same:unchanged"]);
+	output.completeCallback(2);
+	assert.equal(output.writes.length, 4, "the newest pending candidate is emitted after B completes");
+	assert.ok(outputText(output, 3).includes("D"));
+	assert.equal(outputText(output, 3).includes("C"), false);
+	output.completeCallback(3);
+	assert.deepEqual(dispositions, ["A:written", "same:unchanged", "B:written", "D:written"]);
+	output.deferCallbacks = false;
+	assert.equal(await driver.close(), true);
+});
+
+for (const drainFirst of [false, true]) test(
+	`false-return frame waits for callback and drain in either order (drain first: ${drainFirst})`,
+	async () => {
+		const output = new SyntheticWritable();
+		const driver = writer(output, { redrawIntervalMs: 0 });
+		const dispositions: string[] = [];
+		driver.start();
+		output.deferCallbacks = true;
+		output.writeResults.push(false);
+		driver.submit(frame(["A"]), 20, 1, (value) => dispositions.push(`A:${value}`));
+		driver.submit(frame(["B"]), 20, 1, (value) => dispositions.push(`B:${value}`));
+		assert.equal(output.writes.length, 2, "B remains pending behind the one in-flight frame");
+
+		if (drainFirst) {
+			output.emit("drain");
+			assert.equal(dispositions.length, 0, "drain alone is not successful write completion");
+			output.completeCallback(0);
+		} else {
+			output.completeCallback(0);
+			assert.equal(dispositions.length, 0, "callback alone is insufficient when write() returned false");
+			output.emit("drain");
+		}
+		assert.deepEqual(dispositions, ["A:written"]);
+		assert.equal(output.writes.length, 3, "B starts only after both completion signals");
+		assert.ok(outputText(output, 2).includes("B"));
+		output.completeCallback(1);
+		assert.deepEqual(dispositions, ["A:written", "B:written"]);
+		output.deferCallbacks = false;
+		assert.equal(await driver.close(), true);
+	},
+);
+
+test("frame callback errors never settle written and fail the writer closed", async () => {
+	const output = new SyntheticWritable();
+	let errorCount = 0;
+	const driver = writer(output, {
+		redrawIntervalMs: 0,
+		onError: () => { errorCount += 1; },
+	});
+	const dispositions: string[] = [];
+	driver.start();
+	output.deferCallbacks = true;
+	driver.submit(frame(["A"]), 20, 1, (value) => dispositions.push(value));
+	output.completeCallback(0, new Error("synthetic-secret-frame-callback"));
+	assert.equal(dispositions.length, 0);
+	assert.equal(errorCount, 1);
+	assert.throws(() => driver.submit(frame(["B"]), 20, 1), /unavailable/);
+	output.deferCallbacks = false;
+	assert.equal(await driver.close(), true, "cleanup can still complete after the failed frame write");
+});
+
 test("default redraw cadence is 16 ms and fast bursts coalesce to the newest frame", async (t) => {
 	t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
 	const output = new SyntheticWritable();

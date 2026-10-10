@@ -46,29 +46,37 @@ class FakeInput extends EventEmitter {
 class QueuedFrameOutput extends EventEmitter {
   readonly writes: Buffer[] = [];
   private readonly queued: Array<{ readonly bytes: Buffer; readonly callback?: (error?: Error | null) => void }> = [];
-  private refuseNext = false;
+  private queueNext = false;
+  private queuedWriteAccepted = false;
 
   get queuedCount(): number { return this.queued.length; }
 
-  refuseNextWrite(): void { this.refuseNext = true; }
+  refuseNextWrite(accepted = false): void {
+    this.queueNext = true;
+    this.queuedWriteAccepted = accepted;
+  }
 
   write(chunk: Uint8Array | string, callback?: (error?: Error | null) => void): boolean {
     const bytes = Buffer.from(chunk);
-    if (this.refuseNext) {
-      this.refuseNext = false;
+    if (this.queueNext) {
+      this.queueNext = false;
       this.queued.push({ bytes, callback });
-      return false;
+      return this.queuedWriteAccepted;
     }
     this.writes.push(bytes);
     callback?.();
     return true;
   }
 
-  drain(): void {
+  completeQueuedWrites(): void {
     for (const item of this.queued.splice(0)) {
       this.writes.push(item.bytes);
       item.callback?.();
     }
+  }
+
+  drain(): void {
+    this.completeQueuedWrites();
     this.emit("drain");
   }
 
@@ -2008,8 +2016,8 @@ test("wide equal-sized panes dispatch Saved hit tests only in the right form", a
   }
 });
 
-for (const identicalCaptions of [false, true]) test(
-  `real frame-writer backpressure cannot retarget an old Saved row before the scrolled frame drains (identical captions: ${identicalCaptions})`,
+for (const identicalCaptions of [false, true]) for (const acceptedWhileQueued of [false, true]) test(
+  `real frame-writer waits for callback completion before retargeting a Saved row (identical captions: ${identicalCaptions}, accepted while queued: ${acceptedWhileQueued})`,
   async () => {
   const fixture = makeSavedMainFixture("mouse-frame-boundary");
   const secondFile = join(fixture.agentDir, "sessions", "proj", "scroll-second.jsonl");
@@ -2057,22 +2065,28 @@ for (const identicalCaptions of [false, true]) test(
     assert.ok(output.writes.some((bytes) => bytes.toString("utf8").includes(savedA.caption)),
       "the actual frame writer has emitted the first Saved row");
 
-    output.refuseNextWrite();
+    output.refuseNextWrite(acceptedWhileQueued);
     harness.terminal.emitInput("\x1b[B"); // Scroll the one-row window from A to B.
     await nextTurn();
-    assert.equal(output.queuedCount, 1, "the real frame writer submitted B into a backpressured Writable");
+    assert.equal(output.queuedCount, 1, "the real frame writer submitted B to a delayed Writable");
 
     // A is still the only row on the sink's emitted surface. Even though Main's
-    // render has already built B's newer mutable hit map, that pending map must
-    // not authorize the same coordinate as B.
+    // render has already built B's newer mutable hit map, the pending map must
+    // not authorize the same coordinate as B, even when write() returned true.
     emitMouse(harness.terminal, 34, 2);
-    assert.equal(manager.createOptions.length, 0, "a click during backpressure cannot open undisplayed B");
+    assert.equal(manager.createOptions.length, 0, "a click before callback completion cannot open undisplayed B");
     emitMouse(harness.terminal, 34, 2, 0, "m");
 
-    output.drain();
+    output.completeQueuedWrites();
+    if (!acceptedWhileQueued) {
+      assert.equal(manager.createOptions.length, 0,
+        "a successful callback alone cannot settle a write() that returned false");
+      output.emit("drain");
+    }
     emitMouse(harness.terminal, 34, 2);
     for (let attempt = 0; attempt < 10 && manager.createOptions.length === 0; attempt += 1) await nextTurn();
-    assert.equal(manager.createOptions.length, 1, "the emitted B row is clickable after drain settles its frame");
+    assert.equal(manager.createOptions.length, 1,
+      "the emitted B row is clickable after its callback and any required drain settle the frame");
     const admission = manager.createOptions[0]?.savedSession;
     assert.ok(isSavedSessionAdmission(admission));
     assert.equal((admission as { sessionId: string }).sessionId, savedB.id,

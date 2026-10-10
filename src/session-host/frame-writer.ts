@@ -56,19 +56,21 @@ export type SessionHostFrameDisposition = "written" | "unchanged";
  * after start, any geometry change, and any explicit `invalidate()` emit a
  * full redraw, cursor-only changes emit only the cursor sequence, and
  * unchanged rows/cursor skip output entirely. Every nonempty diff masks the
- * cursor before drawing. The written-frame baseline advances only on an actual
- * successful write invocation (a false return is queued until drain, not a
- * failure), so skipped or coalesced submissions never advance it. A false
- * Writable `write()` result pauses new frames until `drain`; while paused, only
- * the newest bounded frame is retained. Memory holds at most one pending
- * candidate plus one written snapshot, each bounded by `maxFrameBytes`.
+ * cursor before drawing. The written-frame baseline advances when a
+ * nonthrowing `write()` invocation accepts a payload (a false return is queued
+ * until drain, not a failure), but only one frame write may be in flight: it
+ * is considered written only after its callback succeeds and, when `write()`
+ * returned false, after `drain` is observed. While a frame is in flight or the
+ * sink is backpressured, only the newest bounded candidate is retained.
+ * Memory holds at most one pending candidate plus one written snapshot, each
+ * bounded by `maxFrameBytes`.
  * `invalidate()` discards the known baseline so the next emitted frame is a
  * complete redraw: it keeps the newest pending candidate, allocates no queue,
  * and a blocked sink still repaints fully once its queued write drains. An
- * optional submit callback settles when that exact candidate is written (or
- * when it is confirmed unchanged); for a `write()` that returns false, the
- * written notification waits for `drain`. This is a Writable boundary, not
- * proof of physical terminal display. Call
+ * optional submit callback settles when that exact candidate completes
+ * (successful write callback and, when required, `drain`; or when it is
+ * confirmed unchanged). Callback and drain may arrive in either order. This is
+ * a Writable completion boundary, not proof of physical terminal display. Call
  * `close()` to cancel pending redraws and attempt reset, cursor show, and
  * alternate-screen exit. Its boolean is true only if that final
  * cleanup write was accepted and its callback (and any required `drain`) was
@@ -155,6 +157,7 @@ export function createSessionHostFrameWriter(
 	let failed = false;
 	let errorReported = false;
 	let blocked = false;
+	let frameInFlight = false;
 	let pending: PendingFrame | undefined;
 	let blockedSettlement: (() => void) | undefined;
 	let baseline: FrameCandidate | undefined;
@@ -176,8 +179,10 @@ export function createSessionHostFrameWriter(
 	let closeListenerAttached = false;
 	let streamClosed = false;
 	let streamErrorObserved = false;
+	let drainSequence = 0;
 
 	const onDrain = (): void => {
+		drainSequence += 1;
 		if (closing) {
 			cleanupDrainObserved = true;
 			maybeFinishCleanup();
@@ -215,6 +220,7 @@ export function createSessionHostFrameWriter(
 
 	function recordOutputFailure(): void {
 		failed = true;
+		frameInFlight = false;
 		pending = undefined;
 		blockedSettlement = undefined;
 		clearRedrawTimer();
@@ -287,9 +293,12 @@ export function createSessionHostFrameWriter(
 		return { callback, cancel };
 	}
 
-	function writeFrame(payload: Buffer): boolean | undefined {
+	function writeFrame(
+		payload: Buffer,
+		onComplete?: (error?: Error | null) => void,
+	): boolean | undefined {
 		let accepted: boolean;
-		const write = beginOwnedWrite();
+		const write = beginOwnedWrite(onComplete);
 		try {
 			accepted = output.write(payload, write.callback);
 		} catch {
@@ -313,7 +322,7 @@ export function createSessionHostFrameWriter(
 	}
 
 	function pump(): void {
-		if (!started || closing || closed || failed || blocked || pending === undefined) return;
+		if (!started || closing || closed || failed || blocked || frameInFlight || pending === undefined) return;
 		const submission = pending;
 		pending = undefined;
 		const candidate = submission.candidate;
@@ -327,21 +336,54 @@ export function createSessionHostFrameWriter(
 			return; // rows and cursor unchanged: skip output entirely
 		}
 		lastFrameAt = Date.now();
-		const accepted = writeFrame(payload);
+		frameInFlight = true;
+		let accepted: boolean | undefined;
+		let callbackSucceeded = false;
+		let drainObserved = false;
+		let settled = false;
+		const drainSequenceBeforeWrite = drainSequence;
+		const settleWritten = (): void => {
+			if (settled || failed || closing || closed || accepted === undefined || !callbackSucceeded
+				|| (!accepted && !drainObserved)) return;
+			settled = true;
+			frameInFlight = false;
+			notifySettled(submission, "written");
+			schedulePump();
+		};
+		accepted = writeFrame(payload, (error) => {
+			if (!error) callbackSucceeded = true;
+			settleWritten();
+		});
 		// The baseline advances only when the write was actually invoked: a
-		// false return is queued until drain, while a throw is a failure that
-		// must not authorize newer baseline writes.
-		if (accepted !== undefined) {
+		// false return is queued until drain, while a throw or callback failure
+		// must not authorize newer baseline writes. The in-flight fence prevents
+		// pending candidates from settling against this baseline before completion.
+		if (accepted !== undefined && !failed && !closing && !closed) {
 			baseline = candidate;
-			if (accepted) notifySettled(submission, "written");
-			else if (submission.onSettled !== undefined) {
-				blockedSettlement = () => notifySettled(submission, "written");
+			if (!accepted) {
+				if (drainSequence !== drainSequenceBeforeWrite) {
+					drainObserved = true;
+					blocked = false;
+					blockedSettlement = undefined;
+				}
+				if (!drainObserved) {
+					blockedSettlement = () => {
+						drainObserved = true;
+						settleWritten();
+					};
+				}
 			}
+		} else {
+			frameInFlight = false;
+			return;
 		}
+		// Covers successful synchronous callbacks after the accepted result is known.
+		settleWritten();
 	}
 
 	function schedulePump(): void {
-		if (!started || closing || closed || failed || blocked || pending === undefined || redrawTimer !== undefined) return;
+		if (!started || closing || closed || failed || blocked || frameInFlight
+			|| pending === undefined || redrawTimer !== undefined) return;
 		if (redrawIntervalMs === 0 || lastFrameAt === undefined) {
 			pump();
 			return;
@@ -412,7 +454,42 @@ export function createSessionHostFrameWriter(
 			started = true;
 			baseline = undefined; // alternate-screen entry: prior screen state unknown
 			attachListeners();
-			writeFrame(Buffer.from(ENTER_ALT_SCREEN, "ascii"));
+			frameInFlight = true;
+			let accepted: boolean | undefined;
+			let callbackSucceeded = false;
+			let drainObserved = false;
+			let settled = false;
+			const drainSequenceBeforeWrite = drainSequence;
+			const settleStart = (): void => {
+				if (settled || failed || closing || closed || accepted === undefined || !callbackSucceeded
+					|| (!accepted && !drainObserved)) return;
+				settled = true;
+				frameInFlight = false;
+				schedulePump();
+			};
+			accepted = writeFrame(Buffer.from(ENTER_ALT_SCREEN, "ascii"), (error) => {
+				if (!error) callbackSucceeded = true;
+				settleStart();
+			});
+			if (accepted !== undefined && !failed && !closing && !closed) {
+				if (!accepted) {
+					if (drainSequence !== drainSequenceBeforeWrite) {
+						drainObserved = true;
+						blocked = false;
+						blockedSettlement = undefined;
+					}
+					if (!drainObserved) {
+						blockedSettlement = () => {
+							drainObserved = true;
+							settleStart();
+						};
+					}
+				}
+			} else {
+				frameInFlight = false;
+				return;
+			}
+			settleStart();
 		},
 
 		submit(

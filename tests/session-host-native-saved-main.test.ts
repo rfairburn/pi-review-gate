@@ -125,9 +125,12 @@ function rosterEntryAt(driver: SavedMainDriver, position: number): RosterEntry |
 }
 
 function assertEarlierNativeRowsStayAtTheirObservedPositions(before: readonly RosterEntry[], after: readonly RosterEntry[]): void {
-  const actions = new Set(["Saved conversations", "New session", "Quit host"]);
   for (const entry of before) {
-    if (actions.has(entry.label)) continue;
+    // Actions move when another process card is added; only creation-correlated
+    // native cards must retain their positions, even if their titles name actions.
+    if (entry.kind !== "native") continue;
+    assert.equal(after[entry.position]?.kind, "native",
+      `previous process row ${entry.position} remains a native card, never an action`);
     assert.equal(after[entry.position]?.label, entry.label,
       `previous process row ${entry.position} stays at its creation-correlated visible roster position`);
   }
@@ -454,6 +457,37 @@ async function openSavedSuccessfully(
   assert.equal(opened.process.exitWatcher.observedExit, false);
   return opened;
 }
+
+test("native roster-position witness permits moving actions but rejects displaced or renamed process cards", () => {
+  const items: SidebarItem[] = ["Host shortcuts", "Saved conversations"].map((label, index) => ({
+    id: `owned-${index}`, label, workspace: "/owned/workspace", agentDir: "/owned/agent",
+    lifecycle: "alive", busy: false, pendingInput: false, inputSurface: false, activity: [],
+  }));
+  const entries = (rows: readonly SidebarItem[]): readonly RosterEntry[] => {
+    const controller = new SidebarController({ toggleKey: "f8", settingsAvailable: true });
+    controller.updateItems(rows);
+    const pane = controller.renderRoster(32, 49).lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+    const text = ["Session host", ...pane.map((line) => `${line.padEnd(32)}│native pane`)].join("\n");
+    assert.equal(isCompleteRosterFrame(text), true);
+    return rosterEntries(text);
+  };
+  const before = entries(items);
+  const after = entries([...items, { ...items[0]!, id: "owned-new", label: "New native process" }]);
+  assert.equal(before.filter((entry) => entry.kind === "native").length, 2);
+  assert.equal(before.filter((entry) => entry.kind === "action").length, 4);
+  const shortcutsPosition = (rows: readonly RosterEntry[]): number | undefined => rows.find((entry) =>
+    entry.kind === "action" && entry.label === "Host shortcuts")?.position;
+  assert.equal(shortcutsPosition(after), shortcutsPosition(before)! + 1,
+    "the actual Host shortcuts action moves when a new native card is appended");
+  assert.doesNotThrow(() => assertEarlierNativeRowsStayAtTheirObservedPositions(before, after));
+  assert.throws(() => assertEarlierNativeRowsStayAtTheirObservedPositions(before,
+    entries([{ ...items[0]!, label: "Changed native title" }, items[1]!])), /previous process row 0/);
+  assert.throws(() => assertEarlierNativeRowsStayAtTheirObservedPositions(before,
+    entries([items[1]!, items[0]!])), /previous process row 0/);
+  assert.throws(() => assertEarlierNativeRowsStayAtTheirObservedPositions(before,
+    entries([items[0]!])), /previous process row 1 remains a native card/,
+  "an action with the removed native card's same caption cannot substitute for that process");
+});
 
 test("pure saved-pane predicate distinguishes the real right picker from roster text and cancellation", () => {
   const compose = (left: readonly string[], right: readonly string[]): string => {
@@ -1089,8 +1123,7 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
   // remove the independently observed exited P2 row through the real Delete UI.
   await ensureSidebarFocus(driver);
   const beforeDeleteRows = rosterEntries(driver.currentText());
-  const nativeRowsBeforeDelete = beforeDeleteRows.filter((entry) =>
-    !["Saved conversations", "New session", "Quit host"].includes(entry.label));
+  const nativeRowsBeforeDelete = beforeDeleteRows.filter((entry) => entry.kind === "native");
   assert.equal(nativeRowsBeforeDelete.length, 3);
   assert.equal(entryStatus(beforeDeleteRows[p2Position]), "exited (code 0)",
     "the exact exited row is still present immediately before its explicit native removal");
@@ -1101,7 +1134,7 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
   driver.pty.write(KEYS.delete);
   await driver.waitFrame((text) => {
     const rows = rosterEntries(text);
-    const nativeRows = rows.filter((entry) => !["Saved conversations", "New session", "Quit host"].includes(entry.label));
+    const nativeRows = rows.filter((entry) => entry.kind === "native");
     return text.includes(`Sessions (${nativeRowsBeforeDelete.length - 1})`)
       && nativeRows.length === nativeRowsBeforeDelete.length - 1
       && nativeRows.some((entry) => entry.label === "(no messages)")

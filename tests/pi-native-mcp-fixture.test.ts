@@ -87,7 +87,8 @@ test("native Pi codemode executes real fixture MCP echo and counter calls", { ti
 
   const echoName = mcpToolName(fixture.serverName, "echo");
   const counterName = mcpToolName(fixture.serverName, "counter");
-  const inventory = await fixture.probeDump();
+  // Server initialize precedes client registration; require this test's tools.
+  const inventory = await fixture.waitForRegisteredTools([echoName, counterName]);
   assert.equal(
     observedMcpTool(inventory, echoName).exposure,
     REGISTERED_EXPOSURE_FOR_CODENAME_SERVER,
@@ -120,7 +121,7 @@ test("fixture probe simulation (NOT the review gate): ordinary tool_call denial 
   if (!fixture) return;
 
   const counterName = mcpToolName(fixture.serverName, "counter");
-  const inventory = await fixture.probeDump();
+  const inventory = await fixture.waitForRegisteredTools([counterName]);
   observedMcpTool(inventory, counterName);
   const beforeEvents = await fixture.readServerEvents();
   const beforeCalls = beforeEvents.filter((event) => event.event === "tool_call").length;
@@ -163,7 +164,7 @@ test("native MCP list rotation withdraws/re-registers tools and reconnect preser
   const oldEchoName = mcpToolName(fixture.serverName, "echo");
   const newEchoName = mcpToolName(fixture.serverName, "echo_second");
   const counterName = mcpToolName(fixture.serverName, "counter");
-  const initial = await fixture.probeDump();
+  const initial = await fixture.waitForRegisteredTools([oldEchoName, counterName]);
   observedMcpTool(initial, oldEchoName);
   const eventsBeforeRotation = (await fixture.readServerEvents()).length;
 
@@ -246,7 +247,8 @@ test("explicit piArgs tool exclusion is observed in native Pi metadata", { timeo
     event.event === "tools_list" && Array.isArray(event.tools) && event.tools.includes("counter"),
   );
   assert.ok(advertisedCounter, "the fixture server should advertise counter before native --exclude-tools filters its registration");
-  const inventory = await fixture.probeDump();
+  // The excluded counter must remain absent: wait only for the allowed echo.
+  const inventory = await fixture.waitForRegisteredTools([echoName]);
   const echo = observedMcpTool(inventory, echoName);
   assert.equal(echo.exposure, "direct", "native Pi metadata should report the configured direct tool registration");
   assert.equal(

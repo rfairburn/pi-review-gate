@@ -446,6 +446,10 @@ function createHarness(
         prepare: () => { throw new Error("the fake Main manager must not prepare sessions"); },
       } satisfies ProfilePreparer,
     }),
+    readHostShortcutConfig: () => ({
+      status: "absent",
+      bindings: { toggle: "alt+left", returnToMain: "alt+right" },
+    }),
     createObserver: (observerOptions) => {
       observer.onChange = observerOptions?.onChange;
       return observer;
@@ -877,14 +881,17 @@ test("a not-fully-displayed error row selection cannot be removed before the ros
   assert.equal(await closeWithSignal(harness), 0);
 });
 
-test("the reserved-Delete x fallback drives the same error-row removal", async () => {
-  const harness = createHarness([errorView("err")], { optionOverrides: { toggleKey: "delete" } });
+test("Delete remains the error-row removal action; x is not a shortcut alias", async () => {
+  const harness = createHarness([errorView("err")]);
   const manager = await ready(harness);
   highlightRow(harness, 2);
   harness.terminal.emitInput("x");
   await nextTurn();
+  assert.deepEqual(manager.views.map((view) => view.id), ["err"], "ordinary x never removes a row");
+  harness.terminal.emitInput(DELETE);
+  await nextTurn();
 
-  assert.deepEqual(manager.views, [], "x removes the settled error row when Delete is reserved");
+  assert.deepEqual(manager.views, [], "Delete retains its existing removal action");
   assert.deepEqual(manager.closeErrorCalls, ["err"]);
   assert.equal(await closeWithSignal(harness), 0);
 });

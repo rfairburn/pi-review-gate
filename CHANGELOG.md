@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.145]
+
+### Changed
+
+- Explicit **Add Resource** enrollment now inserts newly added entries at priority slot 1
+  in each supported execution or research route, preserving existing order and
+  model/reasoning pairings. Existing entries are not duplicated or promoted, passive
+  settings actions do not reorder routes, and slot 1 remains a preference under the
+  existing capacity, scheduler, and failover rules (#370).
+
 ## [0.1.0-dev.144]
 
 ### Added

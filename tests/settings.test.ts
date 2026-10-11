@@ -117,13 +117,14 @@ workerResources: {},
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
   // The catalog is keyed and unordered: saves persist insertion order, and
-  // role priorities live in the explicit routes.
+  // role priorities live in the explicit routes. Each explicit Add inserts its
+  // new entry at slot 1 (#370), so the later add leads the route.
   assert.deepEqual(saved.execution.workerResources, {
     "external-qwen": { selection: { source: "external", id: "qwen" }, maxConcurrent: 1 },
     "external-deepseek": { selection: { source: "external", id: "deepseek" }, maxConcurrent: 3 },
   });
   assert.deepEqual(saved.execution.routes, {
-    execute: [{ resourceId: "external-qwen" }, { resourceId: "external-deepseek" }],
+    execute: [{ resourceId: "external-deepseek" }, { resourceId: "external-qwen" }],
     research: [],
   });
   assert.equal(saved.execution.activeExecutor, undefined);

@@ -67,9 +67,10 @@ export async function visitWorkerResources(
       const enrolledSelectionKeys = new Map<string, string>();
       workerResources = await selectExecutorPool(ui, workerResources, agents, config, scoped, (id, value) => {
         // Explicit Add enrolls the new resource in each supported role priority
-        // directly at the action, in addition order, with the model's default
-        // reasoning. Passive load/save never enrolls: missing or empty routes
-        // stay empty.
+        // directly at the action as the first (highest-priority) entry —
+        // successive Adds therefore appear most-recent-first — with the model's
+        // default reasoning. Passive load/save never enrolls: missing or empty
+        // routes stay empty.
         enrollResourceInRoleRoutes(id, value.selection, executeRoute, researchRoute, config, scoped);
         enrolledSelectionKeys.set(id, executorSelectionKey(value.selection));
       });
@@ -231,8 +232,11 @@ function defaultWorkerRouteEntry(resourceId: string, selection: ExecutorSelectio
  * The explicit-Add enrollment rule shared by the Add action and the
  * changed-final-model reconciliation: list the resource in each role route it
  * is not already listed in — execute unconditionally, research only when its
- * selection supports research — with the model's default reasoning. The
- * membership guards keep add/remove/re-add of one identity duplicate-free.
+ * selection supports research — with the model's default reasoning. A newly
+ * inserted entry takes slot 1 (issue #370), so successive explicit Adds appear
+ * most-recent-first while preexisting entries preserve their relative order;
+ * the membership guards keep add/remove/re-add of one identity duplicate-free
+ * and never promote an already-present entry.
  */
 function enrollResourceInRoleRoutes(
   resourceId: string,
@@ -243,11 +247,11 @@ function enrollResourceInRoleRoutes(
   scoped: ScopedModelChoice[],
 ): void {
   if (!executeRoute.some((entry) => entry.resourceId === resourceId)) {
-    executeRoute.push({ ...defaultWorkerRouteEntry(resourceId, selection, scoped) });
+    executeRoute.unshift({ ...defaultWorkerRouteEntry(resourceId, selection, scoped) });
   }
   if (workerResourceSupportsResearch(config, selection)
       && !researchRoute.some((entry) => entry.resourceId === resourceId)) {
-    researchRoute.push({ ...defaultWorkerRouteEntry(resourceId, selection, scoped) });
+    researchRoute.unshift({ ...defaultWorkerRouteEntry(resourceId, selection, scoped) });
   }
 }
 
@@ -289,7 +293,9 @@ export async function selectWorkerRoute(
         const modelChoice = selection.source === "pi"
           ? scoped.find((candidate) => candidate.model === selection.model)
           : undefined;
-        route.push({
+        // An explicit Add inserts the new entry at slot 1 (issue #370);
+        // existing entries keep their order and reasoning.
+        route.unshift({
           resourceId: key,
           thinkingLevel: selection.source === "pi" && modelChoice
             ? effectiveThinkingLevel(selection.thinkingLevel, modelChoice)

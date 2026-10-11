@@ -105,8 +105,10 @@ test("created definitions resolve for explicit resources and both reviewer layer
       "external-codex": { selection: { source: "external", id: "codex" }, maxConcurrent: 1 },
       "external-claude": { selection: { source: "external", id: "claude" }, maxConcurrent: 1 },
     });
+    // Each explicit Add inserts its entry at slot 1 (#370), so the later
+    // claude add leads both role routes.
     for (const role of ["execute", "research"] as const) assert.deepEqual(reloaded.execution!.routes![role], [
-      { resourceId: "external-codex", thinkingLevel: undefined }, { resourceId: "external-claude", thinkingLevel: undefined },
+      { resourceId: "external-claude", thinkingLevel: undefined }, { resourceId: "external-codex", thinkingLevel: undefined },
     ]);
     assert.deepEqual(effectiveReviewSettings(reloaded).primaryReviewers, [{ source: "external", id: "codex" }, { source: "external", id: "claude" }]);
     assert.deepEqual(effectiveReviewSettings(reloaded).subtaskReviewers, [{ source: "external", id: "claude" }, { source: "external", id: "codex" }]);
@@ -145,8 +147,10 @@ for (const cancel of ["Cancel", undefined]) test(`root ${cancel ?? "Escape"} nev
       "external-codex": { selection: { source: "external", id: "codex" }, maxConcurrent: 1 },
       "external-claude": { selection: { source: "external", id: "claude" }, maxConcurrent: 1 },
     });
+    // Each explicit Add inserts its entry at slot 1 (#370), so the later
+    // claude add leads both role routes.
     for (const role of ["execute", "research"] as const) assert.deepEqual(config.execution!.routes![role], [
-      { resourceId: "external-codex", thinkingLevel: undefined }, { resourceId: "external-claude", thinkingLevel: undefined },
+      { resourceId: "external-claude", thinkingLevel: undefined }, { resourceId: "external-codex", thinkingLevel: undefined },
     ]);
     assert.deepEqual(effectiveReviewSettings(config).primaryReviewers, [{ source: "external", id: "codex" }, { source: "external", id: "claude" }]);
     assert.deepEqual(effectiveReviewSettings(config).subtaskReviewers, [{ source: "external", id: "claude" }, { source: "external", id: "codex" }]);

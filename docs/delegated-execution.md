@@ -372,14 +372,25 @@ discards it, and root Escape applies it to the running session only. Missing nat
 CLIs on `PATH` warn without blocking Save, even for selected workers; runtime failures
 remain errors. See [External worker management](configuration.md#manage-existing-external-workers)
 and [Native reasoning effort](configuration.md#native-reasoning-effort).
-Explicitly adding a worker resource enrolls it in each supported role's
-priority (in addition order, with the model's default reasoning); if its model is
-changed before leaving the pool editor, enrollment and reasoning are re-derived
-from the final selection — enrolling it in any supported route it is not yet
-listed in. An explicit exclusion made through a priority route sticks: a
-resource that exists when the pool editor opens is never enrolled into a route
-it was excluded from just because its model changed later. Opening or saving
-settings never enrolls preexisting resources into missing or empty priorities.
+An explicit **Add Resource** that newly enrolls a worker in a supported role's
+priority route places that entry in slot 1, with the model's default reasoning.
+Adding C to `[A, B]` gives `[C, A, B]`; adding D afterward gives
+`[D, C, A, B]`. Execution and Research routes are independent. Existing entries
+retain their relative order and model/reasoning pairing; reconciliation neither
+duplicates nor promotes them. Eligibility, membership checks, stable resource IDs,
+duplicate guards, and manual route ordering are unchanged. Add-time enrollment and
+the existing changed-final-model reconciliation still happen at their current
+points: if a resource added during the visit changes model before leaving the pool
+editor, enrollment and reasoning are re-derived from the final selection —
+enrolling it in any supported route it is not yet listed in. An explicit exclusion
+made through a priority route sticks: a resource that exists when the pool editor
+opens is never enrolled into a route it was excluded from just because its model
+changed later, and ordinary edits to existing resources do not reorder routes or
+auto-enroll them. Opening or saving settings never enrolls preexisting resources
+into missing or empty priorities and does not reorder routes. Slot 1 is a priority
+preference only; existing capacity limits, scheduler selection, and failover
+continue to determine which worker runs. Settings apply/save/cancel behavior is
+unchanged.
 
 For Pi-scoped selections, when `/review-settings` switches a resource to a different
 model, the previous model's

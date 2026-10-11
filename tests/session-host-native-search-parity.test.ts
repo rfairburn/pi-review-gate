@@ -66,11 +66,17 @@ test("native saved search reads synthetic global files through the public SDK an
   const sessionsRoot = directory(join(agentDir, "sessions"));
   const workspaces = [directory(join(root, "workspace-alpha")), directory(join(root, "workspace-beta"))];
   const projects = [directory(join(sessionsRoot, "--alpha--")), directory(join(sessionsRoot, "--beta--"))];
+  // Long literal phrases cannot accidentally match an ambient checkout path.
+  // Short unquoted tokens still exercise native fuzzy matches across all fields.
+  const fullNativeName = `${"Long name ".repeat(40)}FullNameTail`;
+  const assistantText = `${"assistant-marker ".repeat(20)}SdkMessageTail`;
+  const fullNameQuery = `"${fullNativeName}"`;
+  const assistantQuery = `"${assistantText}"`;
   const entries = [
     { id: "id-hit-older", name: "node CVE triage", text: "repair dependency warnings", workspace: 0, age: 1 },
     { id: "message-only", name: "Rollout", text: "Investigate NODE\n   cve; another deployment token", workspace: 1, age: 4 },
     { id: "quoted-literal", name: "Search", text: 'The literal "node cve is unbalanced in this example', workspace: 0, age: 3 },
-    { id: "name-tail", name: `${"Long name ".repeat(40)}FullNameTail`, text: "assistant-marker", workspace: 1, age: 2 },
+    { id: "name-tail", name: fullNativeName, text: assistantText, workspace: 1, age: 2 },
     { id: "tie-newer", name: "Rollout", text: "repair dependency warnings", workspace: 1, age: 5 },
   ];
   for (const entry of entries) {
@@ -99,7 +105,7 @@ test("native saved search reads synthetic global files through the public SDK an
     "", " \t ", "d", "node", "nd cv", "  NoDe\tCvE  ", '"node cve"', '"NODE   CVE"',
     'node "deployment token"', '""', 'node"cve"', '"node cve', 'node "',
     "re:node.*cve", "re:NODE[\\s\\S]*CVE", "re:^id-hit", "re:workspace-beta$",
-    "re:FullNameTail", "FullNameTail", "assistant-marker", "workspace-alpha", "repair warnings",
+    "re:FullNameTail", "FullNameTail", "assistant-marker", fullNameQuery, assistantQuery, "workspace-alpha", "repair warnings",
     "re:", "re:   ", "re:[", "re:(", "RE:node", "re:.*",
   ];
   for (const query of queries) {
@@ -108,7 +114,10 @@ test("native saved search reads synthetic global files through the public SDK an
     assert.deepEqual(actual.map((row) => row.file), expected.map((info) => realpathSync(info.path)), `query ${JSON.stringify(query)}`);
     for (const row of actual) assert.ok(catalog.rows.includes(row), "matching retains exact admitted row references");
   }
-  assert.equal(searchSavedSessions(catalog, "FullNameTail").length, 1, "full native name remains searchable beyond caption limit");
-  assert.equal(searchSavedSessions(catalog, "assistant-marker").length, 1, "native assistant text is indexed through the real public SDK");
+  const fullTextFile = realpathSync(join(projects[1]!, "name-tail.jsonl"));
+  assert.deepEqual(searchSavedSessions(catalog, fullNameQuery).map((row) => row.file), [fullTextFile],
+    "the full native name, including its tail beyond the caption limit, matches the exact saved file");
+  assert.deepEqual(searchSavedSessions(catalog, assistantQuery).map((row) => row.file), [fullTextFile],
+    "the complete native assistant text is indexed through the real public SDK and matches the exact saved file");
   assert.equal(JSON.stringify(catalog).includes("assistant-marker"), false, "message-only match text never becomes a public row field");
 });

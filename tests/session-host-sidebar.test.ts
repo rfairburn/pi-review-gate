@@ -2890,7 +2890,7 @@ test("saved picker lists, highlights without acting, and opens a deliberate save
   // A second Enter while the open is pending is refused with a notice.
   harness.send(ENTER);
   assert.equal(harness.sinceActions().length, 1, "no duplicate saved-open");
-  assert.ok(savedView(harness).join(" ").replace(/\s+/g, " ").includes("A saved conversation is already starting"));
+  assert.ok(savedView(harness, 40, 16).join(" ").replace(/\s+/g, " ").includes("A saved conversation is already starting"));
 
   // Completion activates the restored row as the Main input owner.
   harness.controller.updateItems([makeItem({ id: "a" }), makeItem({ id: "new-row" })]);
@@ -2918,7 +2918,7 @@ test("saved mouse activation is draw-derived and retains pending-open duplicate 
   assert.equal(harness.controller.activateSavedAt(0, firstRow, 40, 10), true,
     "a repeated click reaches the existing pending-open guard");
   assert.equal(harness.focusedActions().length, 1, "the click does not emit duplicate saved-open actions");
-  assert.ok(savedView(harness, 40, 10).join(" ").replace(/\s+/g, " ").includes("A saved conversation is already starting"));
+  assert.ok(savedView(harness, 40, 16).join(" ").replace(/\s+/g, " ").includes("A saved conversation is already starting"));
 
   const stale = savedPaneWith();
   const staleList = stale.actions.at(-1)!;
@@ -2929,7 +2929,57 @@ test("saved mouse activation is draw-derived and retains pending-open duplicate 
   stale.send(ESC); // dismissal invalidates the render-derived saved row map
   assert.equal(stale.controller.activateSavedAt(0, staleFirst, 40, 10), false,
     "a dismissed/stale render cannot authorize a row click");
-  assert.deepEqual(stale.focusedActions(), []);
+  assert.deepEqual(stale.focusedActions(), [{ type: "saved-dismiss", pickerId: staleList.requestId }]);
+});
+
+test("Saved deletion confirms only a fully displayed target and consumes held confirm repeats", () => {
+  const harness = savedPaneWith();
+  const list = harness.actions.at(-1)!;
+  assert.equal(list.type, "saved-list");
+  harness.controller.completeSavedList(list.requestId, [...SAVED_ROWS], 0);
+  savedView(harness, 40, 16);
+
+  harness.send("\x04"); // native default app.session.delete = Ctrl+D
+  const prepare = harness.actions.at(-1);
+  assert.ok(prepare?.type === "saved-delete-prepare");
+  assert.equal(prepare.id, SAVED_ROWS[0].id);
+  assert.equal(prepare.file, SAVED_ROWS[0].file);
+  assert.equal(harness.controller.completeSavedDeleteCheck(prepare.requestId, true), true);
+  assert.equal(harness.controller.focus, "confirm");
+  assert.equal(harness.controller.savedPickerRequestId, list.requestId);
+
+  // A too-small fallback never enables Enter, even though the target remains frozen.
+  assert.ok(harness.controller.render(20, 4).lines.some((line) => line.includes("too small")));
+  harness.send(ENTER);
+  assert.equal(harness.actions.filter((action) => action.type === "saved-delete").length, 0);
+
+  const confirmation = assertPaneSafe(harness.controller.render(40, 20).lines, 40, 20).join("\n");
+  assert.ok(confirmation.includes("Delete saved conversation?"));
+  assert.ok(confirmation.replace(/\s/g, "").includes(SAVED_ROWS[0].file.replace(/\s/g, "")),
+    "the full selected file path is rendered as the confirmation target");
+  const renderToken = harness.controller.savedDeleteConfirmationRenderTokenNumber;
+  assert.ok(renderToken !== undefined, "a complete render produces a candidate token, not authority");
+  harness.send(ENTER);
+  assert.equal(harness.actions.filter((action) => action.type === "saved-delete").length, 0,
+    "rendering alone cannot authorize deletion before the output writer settles the frame");
+  assert.equal(harness.controller.settleSavedDeleteConfirmationRender(renderToken), true);
+  harness.send(ENTER);
+  harness.send("\x1b[13;1:2u"); // held Enter repeat
+  harness.send("\x1b[13;1:3u"); // release
+  const deletions = harness.actions.filter((action) => action.type === "saved-delete");
+  assert.equal(deletions.length, 1, "one deliberate confirm emits exactly one deletion request");
+  assert.deepEqual(deletions[0], {
+    type: "saved-delete",
+    pickerId: list.requestId,
+    requestId: prepare.requestId,
+    id: SAVED_ROWS[0].id,
+    file: SAVED_ROWS[0].file,
+    revision: prepare.revision,
+  });
+  assert.equal(harness.controller.completeSavedDelete(prepare.requestId, "No file was deleted", false), true);
+  assert.equal(harness.controller.focus, "form");
+  assert.equal(harness.controller.savedPickerRequestId, list.requestId);
+  assert.equal(harness.controller.savedQuery, "", "a refusal keeps the same query draft");
 });
 
 test("saved picker fencing: stale listings and late completions never seize the pane", () => {
@@ -2940,7 +2990,10 @@ test("saved picker fencing: stale listings and late completions never seize the 
 
   // Dismiss while the listing is pending: cancel is emitted, roster restored.
   harness.send(ESC);
-  assert.deepEqual(harness.sinceActions(), [{ type: "saved-cancel", requestId: r1 }]);
+  assert.deepEqual(harness.sinceActions(), [
+    { type: "saved-dismiss", pickerId: r1 },
+    { type: "saved-cancel", requestId: r1 },
+  ]);
   assert.equal(harness.controller.focus, "sidebar");
   assert.ok(savedView(harness).some((line) => line.includes("Sessions (0)")));
 
@@ -3007,10 +3060,11 @@ test("saved picker: bracketed paste and Kitty repeats/releases never activate or
   const r1 = list!.type === "saved-list" ? list.requestId : -1;
   harness.controller.completeSavedList(r1, [...SAVED_ROWS], 0);
 
-  // A bracketed paste containing Enter is opaque: no activation.
-  harness.send("\x1b[200~\r\x1b[201~");
-  assert.deepEqual(harness.sinceActions(), [], "paste never activates a row");
+  // A bracketed paste containing the reserved toggle is query text, never a host action.
+  harness.send(`\x1b[200~${ALT_LEFT_LEGACY}\x1b[201~`);
+  assert.ok(harness.sinceActions().every((action) => action.type === "saved-search"), "paste may search, but never dismisses or activates");
   assert.equal(harness.controller.focus, "form");
+  harness.baseline = harness.actions.length;
 
   // Kitty repeat and release of Enter/Escape are inert.
   harness.send("\x1b[13;1:2u"); // Enter repeat
@@ -3089,7 +3143,7 @@ test("streamed paste containing the toggle packet never dismisses the saved pick
   harness.send("\x1b[200~");
   harness.send(ALT_LEFT_LEGACY);
   harness.send("\x1b[201~");
-  assert.deepEqual(harness.sinceActions(), [], "paste body never dismisses or cancels");
+  assert.ok(harness.sinceActions().every((action) => action.type === "saved-search"), "paste may search but never dismisses or cancels");
   assert.equal(harness.controller.focus, "form", "the picker stays open");
 
   // A fresh toggle press outside any paste still dismisses.
@@ -3103,7 +3157,7 @@ test("saved picker distinguishes empty, failed, and issue-bearing zero-row listi
   const rf = failed.actions.at(-1)!;
   assert.equal(rf.type, "saved-list");
   failed.controller.failSavedList(rf.requestId, "Saved conversations are unavailable in this host");
-  let texts = savedView(failed);
+  let texts = savedView(failed, 40, 16);
   assert.ok(texts.some((line) => line.includes("unavailable")));
   assert.ok(!texts.some((line) => line.includes("No saved conversations")), "failure is not an empty catalog");
 
@@ -3112,7 +3166,7 @@ test("saved picker distinguishes empty, failed, and issue-bearing zero-row listi
   const ri = issues.actions.at(-1)!;
   assert.equal(ri.type, "saved-list");
   issues.controller.completeSavedList(ri.requestId, [], 2);
-  texts = savedView(issues);
+  texts = savedView(issues, 40, 16);
   assert.ok(texts.some((line) => line.includes("No conversations could be listed")));
   assert.ok(!texts.some((line) => line.includes("No saved conversations")));
 
@@ -3159,7 +3213,7 @@ test("saved picker footer shows the complete keyboard hints with tiny-terminal f
   assert.ok(list?.type === "saved-list");
   harness.controller.completeSavedList(list!.requestId, [...SAVED_ROWS], 0);
   const texts = savedView(harness, 48, 12).join(" ").replace(/\s+/g, " ");
-  for (const hint of ["toggle", "up/down select", "enter open", "esc back"]) {
+  for (const hint of ["toggle", "up/down select", "enter open", "esc/ctrl+c back", "ctrl+d delete", "ctrl+backspace empty"]) {
     assert.ok(texts.includes(hint), `missing hint ${hint} in: ${texts}`);
   }
   // Tiny geometry falls back to the truthful too-small pane.

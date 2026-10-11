@@ -337,7 +337,7 @@ changes only display and input focus: it does not pause, stop, or transfer owner
 any session. Background work can continue while another session is active. If the active
 owner exits or disappears, the host does not automatically send input to a sibling.
 
-**Saved conversations** is a deliberate, read-only picker in the sidebar. It lists the
+**Saved conversations** is a deliberate, always-global picker in the sidebar. It lists the
 shared native agent root's saved conversations showing each conversation's canonical
 caption and, when the catalog recorded one, its workspace on one bounded line (long
 captions/paths are visibly ellipsized) — never transcripts, tool arguments, question
@@ -361,6 +361,43 @@ guards as Enter. Escape returns to the roster without pausing or stopping anythi
 successful open makes the restored child the active Main input owner and focuses Main
 without a second Enter, with the pane still visible. A late listing or creation result
 never takes over a later-opened or dismissed pane.
+
+Type in the Saved search bar to filter this global catalog with native Pi 1.1.0
+`/resume` query semantics: fuzzy tokens, quoted phrases such as `"node cve"`, and
+case-insensitive regular expressions such as `re:node.*cve`. Search covers the native
+session ID, full stored name, native all-message text, and recorded workspace. Message
+text is held only in a transient search index; it is never displayed in picker rows,
+sent over status IPC, logged, or persisted in the roster. All tokens/phrases must match;
+phrases ignore case and normalize whitespace. Unbalanced quotes fall back to native
+whitespace-token matching (including the quote characters). The `re:` prefix is
+case-sensitive; an empty or invalid regex yields no matches without crashing. Nonempty
+queries use native relevance ordering with newest-modified ties; clearing the query
+restores the catalog's existing recent-first order. There are no folder/global,
+sort, named-only, path-display, or rename controls in this picker.
+
+Plain `d` edits the search query. The native Saved delete action defaults to **Ctrl+D**;
+**Ctrl+Backspace** is its noninvasive alias only when the query buffer is completely
+empty (not merely whitespace). Deletion asks for confirmation of the selected saved
+conversation: the native selection-confirm binding (Enter by default) confirms, and
+the selection-cancel binding (Escape or Ctrl+C by default) cancels without changing the
+file or row. Other keys do not confirm. Confirmation revalidates the exact catalog
+entry and file identity/header; it never substitutes another path. Deletion tries the
+native `trash` command first, with permanent unlink fallback when trash fails, and
+reports its actual outcome. Success refreshes the global picker; failure stays visible
+without falsely removing its row. Only the selected eligible saved conversation file
+is removed—not its workspace, sibling files, roster entries, or review metadata.
+
+The host protects its current conversation by canonical file identity, and refuses
+other conversations loaded by its owned children or reserved for a pending open with a
+warning to close the conversation first. It never automatically stops or closes a
+child to delete its saved file. An unavailable current-file observation (including an
+older or disconnected reporter) cannot establish that a selected file is safe to
+delete. The authenticated current path is private guard data, not sidebar display or
+roster metadata. The host cannot discover conversations open in unrelated Pi
+processes: close those windows before deleting their saved files. Search, confirmation,
+cancellation, and deletion never change the active Main owner or a sibling's draft;
+ordinary native `/resume` inside each child remains unchanged. The roster's `d`/Delete
+stop/remove action below is separate and still never deletes saved files.
 
 The native review-gate configuration is initialized with the ordinary zero-model
 default only when no native/explicit configuration exists. Existing configuration bytes
@@ -601,8 +638,9 @@ shutdown acknowledgement is never exit proof. The host does not scan for process
 promise to stop arbitrary detached descendants. A forced stop or a child whose exit
 could not be confirmed is reported truthfully; do not assume such a handle has exited.
 Native Pi configuration, credentials, conversations, and unknown files are preserved,
-not removed as part of host shutdown. The persistent roster and ownership record are the
-only session-host files changed by a normal run: the roster is republished atomically when
+not removed as part of host shutdown. Apart from deliberate Saved-file deletion and
+Host shortcuts saves, the persistent roster and ownership record are the only
+session-host files changed by a normal run: the roster is republished atomically when
 rows are created, removed, renamed, reactivated, or change their native conversation, and
 this host's ownership record is removed only after its owned children settled. Unconfirmed
 child exit or unavailable settlement evidence keeps the ownership record so a later host

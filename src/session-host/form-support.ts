@@ -15,7 +15,10 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
+  getKeybindings,
   KeybindingsManager,
+  Input,
+  setKeybindings,
   TUI_KEYBINDINGS,
   type KeybindingsConfig,
   type KeybindingsManager as KeybindingsManagerType,
@@ -32,7 +35,74 @@ const FORM_KEYBINDING_DEFINITIONS = {
   "app.clear": { defaultKeys: "ctrl+c", description: "Clear the session-host field" },
   "app.interrupt": { defaultKeys: "escape", description: "Cancel the session-host field" },
   "app.editor.external": { defaultKeys: "ctrl+g", description: "Edit the session-host field externally" },
+  "app.session.delete": { defaultKeys: "ctrl+d", description: "Delete saved session" },
+  "app.session.deleteNoninvasive": { defaultKeys: "ctrl+backspace", description: "Delete saved session when query is empty" },
 } as const;
+
+export type SavedPickerAction =
+  | "tui.select.confirm"
+  | "tui.select.cancel"
+  | "tui.select.up"
+  | "tui.select.down"
+  | "app.session.delete"
+  | "app.session.deleteNoninvasive";
+
+/** Native public Input plus the shared, read-only Pi keybinding manager. */
+export interface NativeSavedQueryInput {
+  getValue(): string;
+  handleInput(data: string): void;
+  render(width: number): string[];
+  matches(data: string, action: SavedPickerAction): boolean;
+  keys(action: SavedPickerAction): readonly string[];
+  dispose(): void;
+  readonly notice?: string;
+}
+
+/**
+ * Build the native single-line `/resume` query editor with only the pinned
+ * public TUI Input and the same safe native global-keybindings reader used by
+ * host forms. Global manager replacement is synchronous and restored in a
+ * finally block, so the picker never leaves keybinding state installed.
+ */
+export function createNativeSavedQueryInput(agentDir: string): NativeSavedQueryInput {
+  const loaded = loadNativeFieldKeybindings(agentDir);
+  const input = new Input();
+  input.focused = true;
+  const withManager = <T>(operation: () => T): T => withNativeFieldKeybindings(loaded.manager, operation);
+  const manager = loaded.manager as SessionHostFieldKeybindings & { getKeys?: (action: string) => string[] };
+  return {
+    getValue: () => input.getValue(),
+    handleInput: (data) => { withManager(() => input.handleInput(data)); },
+    render: (width) => withManager(() => input.render(width)),
+    matches: (data, action) => loaded.manager.matches(data, action),
+    keys: (action) => manager.getKeys?.(action) ?? [],
+    dispose: () => {
+      input.focused = false;
+      input.setValue("");
+    },
+    ...(loaded.notice !== undefined ? { notice: loaded.notice } : {}),
+  };
+}
+
+/** Temporarily expose a host-owned native manager to components using getKeybindings(). */
+export function withNativeFieldKeybindings<T>(manager: SessionHostFieldKeybindings, operation: () => T): T {
+  let previous: KeybindingsManagerType | undefined;
+  try {
+    previous = getKeybindings();
+    setKeybindings(manager as KeybindingsManagerType);
+  } catch {
+    return operation();
+  }
+  try {
+    return operation();
+  } finally {
+    try {
+      if (getKeybindings() === manager && previous !== undefined) setKeybindings(previous);
+    } catch {
+      // Do not overwrite a newer manager installed by a synchronous callback.
+    }
+  }
+}
 
 const MAX_KEYBINDINGS_BYTES = 256 * 1024;
 const MAX_NATIVE_SETTINGS_BYTES = 256 * 1024;

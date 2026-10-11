@@ -194,7 +194,7 @@ test("a successful New submission activates the created child and keeps the visi
 
 test("a successful Saved open activates the restored child and keeps the visible sidebar", () => {
   const harness = makeRoster();
-  const { openRequestId } = openSaved(harness);
+  const { listRequestId, openRequestId } = openSaved(harness);
   harness.baseline = harness.actions.length;
 
   harness.controller.updateItems([makeItem({ id: "a" }), makeItem({ id: "restored" })]);
@@ -202,7 +202,10 @@ test("a successful Saved open activates the restored child and keeps the visible
   assert.equal(harness.controller.focus, "main", "the restored child owns Main input");
   assert.equal(harness.controller.visible, true, "the sidebar visibility is unchanged");
   assert.equal(harness.controller.selectedId, "restored");
-  assert.deepEqual(harness.focusedActions(), [{ type: "select", id: "restored" }]);
+  assert.deepEqual(harness.focusedActions(), [
+    { type: "saved-dismiss", pickerId: listRequestId },
+    { type: "select", id: "restored" },
+  ], "the private catalog is released for this picker before Main selects the launched child");
 });
 
 // ---------------------------------------------------------------------------

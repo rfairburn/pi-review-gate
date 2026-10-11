@@ -46,3 +46,19 @@ diffs for the ApplyPatch tool as documented at
 https://developers.openai.com/api/docs/guides/tools-apply-patch; the
 modifications are described in the header comment of
 src/apply-patch/engine.ts.
+
+--------------------------------------------------------------------------
+Attribution to Pi Coding Agent (saved-session search)
+--------------------------------------------------------------------------
+
+This product includes the adapted saved-session search parser, matcher, and
+relevance ordering in src/session-host/saved-sessions.ts, based on Pi Coding
+Agent v1.1.0's packages/coding-agent/src/modes/interactive/components/
+session-selector-search.ts:
+
+Pi Coding Agent (https://github.com/earendil-works/pi)
+Copyright 2025 Mario Zechner
+
+Licensed under the MIT License; the full text and adaptation details are in
+LICENSES/MIT-pi-session-search.txt. The fuzzy matcher is imported from the
+pinned pi-session-host-tui dependency and is not copied.

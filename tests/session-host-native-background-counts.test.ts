@@ -86,6 +86,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
+  appendFileSync,
   closeSync,
   constants,
   existsSync,
@@ -98,7 +99,9 @@ import {
   readFileSync,
   readSync,
   realpathSync,
+  renameSync,
   symlinkSync,
+  truncateSync,
   watch as fsWatch,
   writeFileSync,
 } from "node:fs";
@@ -162,6 +165,7 @@ const HANDLE_PATTERN = /^job\d{1,12}$/u;
 
 /** Bounded metadata bounds for the confined service directory. */
 const MAX_READINESS_LEAF_BYTES = 4_096;
+const MAX_PROVIDER_JOURNAL_BYTES = 256 * 1024;
 const MAX_SERVICE_DIR_ENTRIES = 32;
 const MAX_SERVICE_DIR_BYTES = 256 * 1024;
 
@@ -228,10 +232,11 @@ function shellQuote(value: string): string {
   return `'${value.split("'").join("'\\''")}'`;
 }
 
+/** Strict settled-journal inspection; any size change during this read still fails closed. */
 function readJournalText(file: string): string {
   jobFixtureModule.validateAncestors(dirname(file));
   const before = lstatSync(file, { bigint: true });
-  assert.ok(before.isFile() && !before.isSymbolicLink() && before.size <= 256n * 1024n,
+  assert.ok(before.isFile() && !before.isSymbolicLink() && before.size <= BigInt(MAX_PROVIDER_JOURNAL_BYTES),
     "the metadata-only journal is a bounded regular nonsymlink leaf");
   const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
@@ -249,8 +254,93 @@ function readJournalText(file: string): string {
   } finally { closeSync(fd); }
 }
 
-function readJsonl(file: string): Array<Record<string, unknown>> {
-  const text = readJournalText(file);
+/** Same-file identity without size, used only for the append-only active journal. */
+function sameLeafObject(a: LeafIdentity, b: LeafIdentity): boolean {
+  return a.dev === b.dev && a.ino === b.ino;
+}
+
+function readJournalBytes(fd: number, size: bigint): Buffer {
+  assert.ok(size >= 0n && size <= BigInt(MAX_PROVIDER_JOURNAL_BYTES), "the journal observation stays within its byte bound");
+  const bytes = Buffer.alloc(Number(size));
+  let offset = 0;
+  while (offset < bytes.length) {
+    const n = readSync(fd, bytes, offset, bytes.length - offset, offset);
+    assert.ok(n > 0, "the journal did not shrink below its observed prefix while reading");
+    offset += n;
+  }
+  return bytes;
+}
+
+interface ActiveJournalTestHooks {
+  readonly afterInitialRead?: () => void;
+  readonly afterConfirmationRead?: () => void;
+  readonly afterDescriptorConfirmation?: () => void;
+}
+
+/**
+ * Active-observation variant for the fixture-owned append-only provider journal.
+ * It may accept size growth only on the same regular inode, within the journal
+ * bound, and only after byte-comparing the original prefix and a bounded newer
+ * snapshot twice. Path swaps, shrinkage, or in-place mutation fail closed.
+ * Test hooks make the filesystem races deterministic without changing live reads.
+ */
+function readActiveJournalText(file: string, hooks?: ActiveJournalTestHooks): string {
+  jobFixtureModule.validateAncestors(dirname(file));
+  const before = lstatSync(file, { bigint: true });
+  assert.ok(before.isFile() && !before.isSymbolicLink(), "the active metadata journal is a regular nonsymlink leaf");
+  assert.ok(before.size <= BigInt(MAX_PROVIDER_JOURNAL_BYTES), "the active metadata journal stays within its byte bound");
+  let highestObservedSize = before.size;
+  const observeSize = (observed: LeafIdentity, description: string): void => {
+    assert.ok(observed.size >= highestObservedSize, `${description}: active journal size decreased between observations`);
+    assert.ok(observed.size <= BigInt(MAX_PROVIDER_JOURNAL_BYTES), `${description}: active journal exceeds its byte bound`);
+    highestObservedSize = observed.size;
+  };
+  const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    assert.ok(opened.isFile() && sameLeafObject(before, opened), "the active journal descriptor matches the observed inode");
+    observeSize(opened, "descriptor open");
+
+    const initial = readJournalBytes(fd, opened.size);
+    hooks?.afterInitialRead?.();
+
+    const descriptorAfterInitial = fstatSync(fd, { bigint: true });
+    assert.ok(descriptorAfterInitial.isFile() && sameLeafObject(opened, descriptorAfterInitial),
+      "the active journal descriptor kept its inode after the initial read");
+    observeSize(descriptorAfterInitial, "descriptor after initial read");
+    const pathAfterInitial = lstatSync(file, { bigint: true });
+    assert.ok(pathAfterInitial.isFile() && !pathAfterInitial.isSymbolicLink() && sameLeafObject(opened, pathAfterInitial),
+      "the active journal path kept its regular inode after the initial read");
+    observeSize(pathAfterInitial, "path after initial read");
+
+    // Use the smaller of the paired post-read sizes: both name the same inode,
+    // so this is the largest prefix witnessed by both observations without
+    // chasing an ongoing writer or polling for quiescence.
+    const stableSize = descriptorAfterInitial.size < pathAfterInitial.size
+      ? descriptorAfterInitial.size : pathAfterInitial.size;
+    const snapshot = readJournalBytes(fd, stableSize);
+    assert.deepEqual(snapshot.subarray(0, initial.length), initial,
+      "the active journal's original prefix stayed byte-identical across append growth");
+    assert.deepEqual(readJournalBytes(fd, stableSize), snapshot,
+      "the active journal snapshot stayed byte-identical across its bounded confirmation read");
+    hooks?.afterConfirmationRead?.();
+
+    const descriptorAfterConfirmation = fstatSync(fd, { bigint: true });
+    assert.ok(descriptorAfterConfirmation.isFile() && sameLeafObject(opened, descriptorAfterConfirmation),
+      "the active journal descriptor kept its inode through confirmation");
+    observeSize(descriptorAfterConfirmation, "descriptor after confirmation");
+    hooks?.afterDescriptorConfirmation?.();
+    const pathAfterConfirmation = lstatSync(file, { bigint: true });
+    assert.ok(pathAfterConfirmation.isFile() && !pathAfterConfirmation.isSymbolicLink()
+      && sameLeafObject(opened, pathAfterConfirmation), "the active journal path kept its regular inode through confirmation");
+    observeSize(pathAfterConfirmation, "path after confirmation");
+    return snapshot.toString("utf8");
+  } finally { closeSync(fd); }
+}
+
+/** Active watcher observations use the append-aware reader; incomplete tails stay unadmitted. */
+function readJsonl(file: string, hooks?: ActiveJournalTestHooks): Array<Record<string, unknown>> {
+  const text = readActiveJournalText(file, hooks);
   const lines = text.split("\n");
   if (!text.endsWith("\n")) lines.pop(); // an incomplete append is not an admitted event
   return lines.filter((line) => line.trim()).map((line) => {
@@ -396,7 +486,11 @@ interface ReadinessInspection {
  * never modified or removed. Point-in-time checks only — no atomic
  * containment claim.
  */
-function inspectReadinessLeaf(leafPath: string, expectedStatus: "ready" | "closed" = "ready"): ReadinessInspection {
+function inspectReadinessLeaf(
+  leafPath: string,
+  expectedStatus: "ready" | "closed" = "ready",
+  afterInitialRead?: () => void,
+): ReadinessInspection {
   jobFixtureModule.validateAncestors(dirname(leafPath)); // revalidate admitted ancestors
   const observed = lstatSync(leafPath, { bigint: true });
   assert.ok(observed.isFile() && !observed.isSymbolicLink(), "the readiness leaf is a regular nonsymlink file");
@@ -424,6 +518,7 @@ function inspectReadinessLeaf(leafPath: string, expectedStatus: "ready" | "close
       return Buffer.concat(chunks);
     };
     const bytes = readAll();
+    afterInitialRead?.(); // deterministic mutation seam for the strict-leaf regression test only
     // The pathname must still identify the same file at the same size after
     // the read: a swap or growth in between is rejected.
     const after = lstatSync(leafPath, { bigint: true });
@@ -1050,6 +1145,67 @@ test("the background-count job fixture retains its evidence and exposes bounded 
   }
 });
 
+test("active provider journal observations admit only byte-stable same-inode append growth", () => {
+  assertOriginalEnvironmentAdmissible(process.env); // guard before any fixture mutation
+  const tmpParent = realpathSync(tmpdir());
+  jobFixtureModule.validateAncestors(tmpParent);
+  const root = mkdtempSync(join(tmpParent, "prg-bg-count-journal-"));
+  const makeJournal = (name: string, contents: string): string => {
+    const file = join(root, name);
+    writeFileSync(file, contents, { flag: "wx", mode: 0o600 });
+    return file;
+  };
+
+  // Deterministically append a complete record and an incomplete tail after
+  // the first descriptor read. The same inode grows; only complete JSONL lines
+  // become events, and the tail remains unadmitted.
+  const initial = '{"event":"initial"}\n';
+  const journal = makeJournal("append.jsonl", initial);
+  const before = lstatSync(journal, { bigint: true });
+  const records = readJsonl(journal, { afterInitialRead: () => {
+    appendFileSync(journal, '{"event":"appended"}\n{"event":"partial"', { encoding: "utf8" });
+  } });
+  const after = lstatSync(journal, { bigint: true });
+  assert.equal(after.dev, before.dev, "active append growth preserves the original device");
+  assert.equal(after.ino, before.ino, "active append growth preserves the original inode");
+  assert.ok(after.size > before.size, "the synthetic journal actually grew during the controlled observation");
+  assert.deepEqual(records, [{ event: "initial" }, { event: "appended" }],
+    "the byte-stable complete-line prefix admits records but not the incomplete appended tail");
+
+  // Replacing the path while the original descriptor remains open is refused.
+  const swapped = makeJournal("swapped.jsonl", initial);
+  const displaced = join(root, "swapped-original.jsonl");
+  assert.throws(() => readJsonl(swapped, { afterInitialRead: () => {
+    renameSync(swapped, displaced);
+    writeFileSync(swapped, initial, { flag: "wx", mode: 0o600 });
+  } }), /path kept its regular inode/u, "a pathname replacement is never treated as append growth");
+
+  // Same-inode truncation is refused even though it is not a pathname swap.
+  const shrunk = makeJournal("shrunk.jsonl", initial);
+  assert.throws(() => readJsonl(shrunk, { afterInitialRead: () => writeFileSync(shrunk, "") }), /size decreased/u,
+    "a same-file truncation cannot be admitted as append growth");
+
+  // A same-size rewrite of the original bytes fails the explicit prefix
+  // comparison rather than being excused as journal growth.
+  const mutated = makeJournal("mutated.jsonl", initial);
+  const replacement = '{"event":"changed"}\n';
+  assert.equal(Buffer.byteLength(replacement), Buffer.byteLength(initial), "the mutation keeps the same file size");
+  assert.throws(() => readJsonl(mutated, { afterInitialRead: () => writeFileSync(mutated, replacement) }), /original prefix/u,
+    "same-inode content mutation is not append growth");
+
+  // Preserve the already confirmed initial prefix while a later descriptor
+  // observation sees growth and the following pathname observation sees a
+  // same-file truncation back to that prefix. The size high-water mark must
+  // reject this witnessed non-append sequence.
+  const truncatedAfterGrowth = makeJournal("truncated-after-growth.jsonl", initial);
+  assert.throws(() => readJsonl(truncatedAfterGrowth, {
+    afterConfirmationRead: () => appendFileSync(truncatedAfterGrowth, "x".repeat(100)),
+    afterDescriptorConfirmation: () => truncateSync(truncatedAfterGrowth, Buffer.byteLength(initial)),
+  }), /size decreased/u, "a confirmed prefix does not excuse later growth followed by truncation");
+  assert.equal(readFileSync(truncatedAfterGrowth, "utf8"), initial,
+    "the deterministic truncation preserves the byte-identical confirmed initial prefix");
+});
+
 test("readiness leaf inspection fails closed on missing leaves, symlinks, growth, and malformed records", () => {
   assertOriginalEnvironmentAdmissible(process.env); // guard before any fixture mutation
   const tmpParent = realpathSync(tmpdir()); // canonical parent (macOS /var is a symlink)
@@ -1078,6 +1234,13 @@ test("readiness leaf inspection fails closed on missing leaves, symlinks, growth
   const grown = join(dir, "grown.json");
   writeFileSync(grown, "x".repeat(MAX_READINESS_LEAF_BYTES + 1), { flag: "wx", mode: 0o600 });
   assert.throws(() => inspectReadinessLeaf(grown), /byte bound/u);
+
+  // Unlike the active journal, readiness is immutable: deterministic same-file
+  // growth between its descriptor read and pathname check must still refuse.
+  const immutable = join(dir, "immutable.json");
+  writeFileSync(immutable, jobFixtureModule.buildReadinessRecord(4242, 31337), { flag: "wx", mode: 0o600 });
+  assert.throws(() => inspectReadinessLeaf(immutable, "ready", () => appendFileSync(immutable, " ")),
+    /not swapped or resized/u, "readiness growth remains a hard failure");
 
   // A FIFO at the leaf path is refused without blocking: the exact inspection
   // open flags return immediately instead of waiting for a writer, and the

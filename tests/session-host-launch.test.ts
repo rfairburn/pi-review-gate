@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, realpathSync, rmSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, realpathSync, rmSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { chmod, cp, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
@@ -58,6 +58,45 @@ async function makePiFixture(
   return { root, bin };
 }
 
+// Used only by the saved-file replacement fixture. Never scan or adopt descendants.
+class FixtureOwnership {
+  private readonly entries = new Map<string, import("node:fs").BigIntStats>();
+
+  track(path: string): void { this.entries.set(path, lstatSync(path, { bigint: true })); }
+  untrack(path: string): void { this.entries.delete(path); }
+
+  cleanup(): void {
+    const failures: unknown[] = [];
+    const verify = (path: string, expected: import("node:fs").BigIntStats) => {
+      const current = lstatSync(path, { bigint: true });
+      assert.ok(current.dev === expected.dev && current.ino === expected.ino &&
+        (current.mode & 0o170000n) === (expected.mode & 0o170000n), `changed fixture entry preserved: ${path}`);
+    };
+    for (const [path, entry] of [...this.entries].sort(([a], [b]) => b.length - a.length)) {
+      try {
+        try { verify(path, entry); } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+          throw error;
+        }
+        for (let parent = dirname(path); this.entries.has(parent); parent = dirname(parent)) {
+          verify(parent, this.entries.get(parent)!);
+        }
+        if (entry.isDirectory()) rmdirSync(path); // Unknown contents remain and cause ENOTEMPTY.
+        else unlinkSync(path); // Never follow a symlink target.
+      } catch (error) { failures.push(error); }
+    }
+    if (failures.length) throw new AggregateError(failures, "fixture ownership cleanup failed");
+  }
+}
+
+async function runWithCleanup(body: () => Promise<void>, cleanup: () => void): Promise<void> {
+  const failures: unknown[] = [];
+  try { await body(); } catch (error) { failures.push(error); }
+  try { cleanup(); } catch (error) { failures.push(error); }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) throw new AggregateError(failures, "test body and cleanup failed", { cause: failures[0] });
+}
+
 interface PackageFixture {
   /** Real (symlink-resolved) root of the synthetic fixture tree. */
   root: string;
@@ -68,37 +107,65 @@ interface PackageFixture {
   skillsRoot: string;
 }
 
-async function makePackageFixture(prefix = "pi-native-host-pkg"): Promise<PackageFixture> {
+async function makePackageFixture(prefix = "pi-native-host-pkg", ownership?: FixtureOwnership): Promise<PackageFixture> {
   const root = await realpath(await mkdtemp(join(process.cwd(), `.${prefix}-`)));
+  ownership?.track(root); // record immediately so a setup failure still has the root receipt
   const packageRoot = join(root, "package");
   const bin = join(root, "bin");
   const agentDir = join(root, "home", ".pi", "agent");
   const workspace = join(root, "workspace");
-  await Promise.all([
-    mkdir(join(packageRoot, "dist", "src", "session-host"), { recursive: true }),
-    mkdir(agentDir, { recursive: true }),
-    mkdir(workspace, { recursive: true }),
-    mkdir(bin, { recursive: true }),
-  ]);
+  const dirs = [
+    packageRoot,
+    join(packageRoot, "dist"),
+    join(packageRoot, "dist", "src"),
+    join(packageRoot, "dist", "src", "session-host"),
+    join(root, "home"),
+    join(root, "home", ".pi"),
+    agentDir,
+    workspace,
+    bin,
+    join(packageRoot, "skills"),
+    join(packageRoot, "skills", "pi-review-gate-orchestrator"),
+    join(packageRoot, "skills", "pi-review-gate-orchestrator", "references"),
+    join(packageRoot, "skills", "pi-review-gate-execution"),
+    join(packageRoot, "skills", "pi-review-gate-research"),
+  ];
+  if (ownership) {
+    // Ownership path: create one level at a time (exclusive) and record each
+    // receipt immediately so a setup failure never leaves created entries
+    // untracked, and an untracked pre-existing directory is refused (EEXIST)
+    // rather than adopted.
+    for (const dir of dirs) {
+      await mkdir(dir);
+      ownership.track(dir);
+    }
+  } else {
+    await Promise.all(dirs.map((dir) => mkdir(dir, { recursive: true })));
+  }
+  const track = (path: string) => ownership?.track(path);
   await writeFile(join(bin, "pi"), `#!${process.execPath}\nprocess.stdout.write('pi 1.0.4\\n');\n`, "utf8");
+  track(join(bin, "pi"));
   await chmod(join(bin, "pi"), 0o755);
   await writeFile(join(packageRoot, "dist", "src", "index.js"), "// gate extension\n", "utf8");
+  track(join(packageRoot, "dist", "src", "index.js"));
   await writeFile(join(packageRoot, "dist", "src", "session-host", "reporter.js"), "// reporter\n", "utf8");
+  track(join(packageRoot, "dist", "src", "session-host", "reporter.js"));
   // Placeholder for the sibling's compiled bootstrap-preload (descriptor
   // tests only; early-env/spawn behavior belongs to the reporter sibling).
   await writeFile(join(packageRoot, "dist", "src", "session-host", "bootstrap-preload.js"), "// preload placeholder\n", "utf8");
+  track(join(packageRoot, "dist", "src", "session-host", "bootstrap-preload.js"));
   // Shipped skill sources, mirroring the packaged tree.
-  await Promise.all([
-    mkdir(join(packageRoot, "skills", "pi-review-gate-orchestrator", "references"), { recursive: true }),
-    mkdir(join(packageRoot, "skills", "pi-review-gate-execution"), { recursive: true }),
-    mkdir(join(packageRoot, "skills", "pi-review-gate-research"), { recursive: true }),
-  ]);
   await writeFile(join(packageRoot, "skills", "pi-review-gate-orchestrator", "SKILL.md"), "orchestrator skill\n", "utf8");
+  track(join(packageRoot, "skills", "pi-review-gate-orchestrator", "SKILL.md"));
   await writeFile(join(packageRoot, "skills", "pi-review-gate-orchestrator", "references", "recovery.md"), "recovery runbook\n", "utf8");
+  track(join(packageRoot, "skills", "pi-review-gate-orchestrator", "references", "recovery.md"));
   await writeFile(join(packageRoot, "skills", "pi-review-gate-execution", "SKILL.md"), "execution skill\n", "utf8");
+  track(join(packageRoot, "skills", "pi-review-gate-execution", "SKILL.md"));
   await writeFile(join(packageRoot, "skills", "pi-review-gate-research", "SKILL.md"), "research skill\n", "utf8");
+  track(join(packageRoot, "skills", "pi-review-gate-research", "SKILL.md"));
   const configPath = join(agentDir, "review-gate.json");
   await writeFile(configPath, JSON.stringify({ enabled: true, review: { activeReviewers: [] } }), "utf8");
+  track(configPath);
   return {
     root,
     packageRoot,
@@ -1373,11 +1440,23 @@ async function flatListAll(sessionDir: string): Promise<{ path: string; id: stri
 }
 
 /** Create one saved conversation under the fixture agent dir and admit it. */
-async function admitFixtureSavedSession(pkg: PackageFixture, id = "saved-1"): Promise<{ savedFile: string; admission: SavedSessionAdmission }> {
-  const projDir = join(pkg.agentDir, "sessions", "proj");
-  await mkdir(projDir, { recursive: true });
+async function admitFixtureSavedSession(pkg: PackageFixture, id = "saved-1", ownership?: FixtureOwnership): Promise<{ savedFile: string; admission: SavedSessionAdmission }> {
+  const sessionsDir = join(pkg.agentDir, "sessions");
+  const projDir = join(sessionsDir, "proj");
+  if (ownership) {
+    // Exclusive one-level creation, tracked immediately: refuse to adopt an
+    // untracked existing dir, and record sessions before proj so a proj
+    // failure never leaves sessions untracked.
+    await mkdir(sessionsDir);
+    ownership.track(sessionsDir);
+    await mkdir(projDir);
+    ownership.track(projDir);
+  } else {
+    await mkdir(projDir, { recursive: true });
+  }
   const savedFile = join(projDir, "saved.jsonl");
   await writeFile(savedFile, `${JSON.stringify({ type: "session", id, cwd: pkg.workspace })}\n`, "utf8");
+  ownership?.track(savedFile);
   const catalog = await listSavedSessions({ agentDir: pkg.agentDir, listAll: flatListAll });
   const result = admitSavedSession(catalog, catalog.rows[0]);
   assert.equal(result.status, "admitted", "the fixture saved session must admit");
@@ -1544,65 +1623,188 @@ test("alien receipts and foreign agent directories are refused at launch", async
   );
 });
 
-test("launch revalidates the saved file before spawn: replacement, deletion, and identity change refuse", async (t) => {
-  const pkg = await makePackageFixture();
-  // Keep generated descendants: a root fixture name is not a per-entry
-  // creation/identity receipt authorizing recursive teardown.
-  t.diagnostic(`retained saved-launch fixture: ${pkg.root}`);
-  const { savedFile, admission } = await admitFixtureSavedSession(pkg);
-  const requireOwnedIdentity = async (file: string, receipt: { dev: bigint; ino: bigint }): Promise<void> => {
-    const current = await lstat(file, { bigint: true });
-    assert.ok(current.isFile() && !current.isSymbolicLink());
-    assert.equal(current.dev, receipt.dev);
-    assert.equal(current.ino, receipt.ino);
-  };
+test("launch revalidates the saved file before spawn: replacement, deletion, and identity change refuse", async () => {
+  // Per-entry ownership receipts: teardown removes only the exact entries this
+  // fixture/test created (identity-checked), never unknown or replaced content.
+  // runWithCleanup aggregates a body failure with a cleanup failure so neither
+  // masks the other (node:test suppresses an after-hook error when the body fails).
+  const ownership = new FixtureOwnership();
+  await runWithCleanup(async () => {
+    const pkg = await makePackageFixture("pi-native-host-pkg", ownership);
+    const { savedFile, admission } = await admitFixtureSavedSession(pkg, "saved-1", ownership);
+    const requireOwnedIdentity = async (file: string, receipt: { dev: bigint; ino: bigint }): Promise<void> => {
+      const current = await lstat(file, { bigint: true });
+      assert.ok(current.isFile() && !current.isSymbolicLink());
+      assert.equal(current.dev, receipt.dev);
+      assert.equal(current.ino, receipt.ino);
+    };
 
-  // Replaced first line (different id): the live header no longer matches.
-  await requireOwnedIdentity(savedFile, admission);
-  await writeFile(savedFile, `${JSON.stringify({ type: "session", id: "replaced-1", cwd: pkg.workspace })}\n`, "utf8");
-  assert.throws(
-    () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), savedSession: admission })),
-    /no longer matches its admission/,
+    // Replaced first line (different id): the live header no longer matches.
+    await requireOwnedIdentity(savedFile, admission);
+    await writeFile(savedFile, `${JSON.stringify({ type: "session", id: "replaced-1", cwd: pkg.workspace })}\n`, "utf8");
+    assert.throws(
+      () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), savedSession: admission })),
+      /no longer matches its admission/,
+    );
+
+    // Allocate the replacement while the original inode still exists. Linux
+    // may immediately reuse an inode after unlink, so unlink+write alone does
+    // not establish the changed-identity precondition this assertion exercises.
+    const replacement = join(pkg.root, "saved-replacement.jsonl");
+    await writeFile(replacement, `${JSON.stringify({ type: "session", id: "saved-1", cwd: pkg.workspace })}\n`, { encoding: "utf8", flag: "wx" });
+    ownership.track(replacement);
+    const replacementIdentity = await lstat(replacement, { bigint: true });
+    assert.ok(replacementIdentity.dev !== admission.dev || replacementIdentity.ino !== admission.ino,
+      "both simultaneously existing files demonstrably have different identities");
+
+    // Deleted file: refused honestly. Check exact identity before unlink.
+    await requireOwnedIdentity(savedFile, admission);
+    await rm(savedFile);
+    assert.throws(
+      () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), savedSession: admission })),
+      /saved-session file is missing/,
+    );
+
+    // Publish the separately created identical-content file at the now absent
+    // path; verify the different identity survived before requiring refusal.
+    await requireOwnedIdentity(replacement, replacementIdentity);
+    assert.equal(existsSync(savedFile), false);
+    await rename(replacement, savedFile);
+    ownership.untrack(replacement); // our entry moved; stop tracking the old path
+    ownership.track(savedFile);     // re-record the owned entry at its new identity
+    await requireOwnedIdentity(savedFile, replacementIdentity);
+    assert.throws(
+      () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), savedSession: admission })),
+      /changed since admission/,
+    );
+
+    // A symlink at the admitted path is refused.
+    const target = join(pkg.root, "saved-target.jsonl");
+    await writeFile(target, `${JSON.stringify({ type: "session", id: "saved-1", cwd: pkg.workspace })}\n`, { encoding: "utf8", flag: "wx" });
+    ownership.track(target);
+    await requireOwnedIdentity(savedFile, replacementIdentity);
+    await rm(savedFile);
+    await symlink(target, savedFile);
+    ownership.track(savedFile); // the owned entry is now this symlink (its target stays external to it)
+    assert.throws(
+      () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), savedSession: admission })),
+      /saved-session file is a symlink/,
+    );
+  }, () => ownership.cleanup());
+});
+
+test("owned fixture cleanup removes an owned symlink without touching its external target", async (t) => {
+  const extRoot = await realpath(await mkdtemp(join(process.cwd(), ".pi-native-host-ownext-")));
+  t.after(() => rm(extRoot, { recursive: true, force: true }));
+  const external = join(extRoot, "target.txt");
+  await writeFile(external, "external bytes\n", "utf8");
+  const root = await realpath(await mkdtemp(join(process.cwd(), ".pi-native-host-ownlink-")));
+  const ownership = new FixtureOwnership();
+  t.after(() => ownership.cleanup()); // idempotent safety net after the explicit call below
+  ownership.track(root);
+  const link = join(root, "link.txt");
+  await symlink(external, link);
+  ownership.track(link);
+  ownership.cleanup();
+  assert.equal(existsSync(link), false, "the owned symlink is removed");
+  assert.equal(await readFile(external, "utf8"), "external bytes\n", "the external target is untouched");
+});
+
+test("owned fixture cleanup preserves an unknown entry and fails visibly", async (t) => {
+  const root = await realpath(await mkdtemp(join(process.cwd(), ".pi-native-host-ownunknown-")));
+  const ownership = new FixtureOwnership();
+  ownership.track(root);
+  await writeFile(join(root, "unknown.txt"), "not mine\n", "utf8"); // untracked: not an owned entry
+  let cleanupError: unknown;
+  try {
+    ownership.cleanup();
+  } catch (error) {
+    cleanupError = error;
+  }
+  assert.ok(cleanupError instanceof Error, "cleanup fails visibly on unknown content");
+  assert.match((cleanupError as Error).message, /failed/);
+  assert.equal(existsSync(join(root, "unknown.txt")), true, "the unknown entry survives the failed cleanup");
+  // Undo our own adversarial mutation explicitly; never delete unknown content in a finalizer.
+  unlinkSync(join(root, "unknown.txt"));
+  rmdirSync(root);
+});
+
+test("owned fixture cleanup preserves a replaced (different-identity) leaf and fails visibly", async (t) => {
+  const root = await realpath(await mkdtemp(join(process.cwd(), ".pi-native-host-ownrepl-")));
+  const ownership = new FixtureOwnership();
+  ownership.track(root);
+  const leaf = join(root, "leaf.txt");
+  await writeFile(leaf, "original\n", "utf8");
+  ownership.track(leaf);
+  // Replace the leaf with a different-identity file (unknown to the tracker):
+  // create it separately then rename over, guaranteeing a new inode.
+  const other = join(root, "other.txt");
+  await writeFile(other, "replaced\n", "utf8");
+  await rm(leaf);
+  await rename(other, leaf);
+  let cleanupError: unknown;
+  try {
+    ownership.cleanup();
+  } catch (error) {
+    cleanupError = error;
+  }
+  assert.ok(cleanupError instanceof Error, "cleanup fails visibly on a replaced leaf");
+  assert.equal(await readFile(leaf, "utf8"), "replaced\n", "the replaced leaf survives (not deleted)");
+  // Undo our own mutation explicitly.
+  unlinkSync(leaf);
+  rmdirSync(root);
+});
+
+test("runWithCleanup aggregates a body failure and a cleanup failure into one reportable error", async () => {
+  const root = await realpath(await mkdtemp(join(process.cwd(), ".pi-native-host-ownboth-")));
+  const ownership = new FixtureOwnership();
+  ownership.track(root);
+  await writeFile(join(root, "unknown.txt"), "x\n", "utf8"); // untracked → cleanup fails
+  const bodyError = new assert.AssertionError({ message: "deliberate body failure" });
+  await assert.rejects(
+    runWithCleanup(async () => { throw bodyError; }, () => ownership.cleanup()),
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.errors[0], bodyError);
+      assert.equal(error.cause, bodyError);
+      assert.match(error.errors[1].message, /cleanup failed/);
+      return true;
+    },
   );
+  // Undo our own mutation explicitly.
+  unlinkSync(join(root, "unknown.txt"));
+  rmdirSync(root);
+});
 
-  // Allocate the replacement while the original inode still exists. Linux
-  // may immediately reuse an inode after unlink, so unlink+write alone does
-  // not establish the changed-identity precondition this assertion exercises.
-  const replacement = join(pkg.root, "saved-replacement.jsonl");
-  await writeFile(replacement, `${JSON.stringify({ type: "session", id: "saved-1", cwd: pkg.workspace })}\n`, { encoding: "utf8", flag: "wx" });
-  const replacementIdentity = await lstat(replacement, { bigint: true });
-  assert.ok(replacementIdentity.dev !== admission.dev || replacementIdentity.ino !== admission.ino,
-    "both simultaneously existing files demonstrably have different identities");
-
-  // Deleted file: refused honestly. Check exact identity before unlink.
-  await requireOwnedIdentity(savedFile, admission);
-  await rm(savedFile);
-  assert.throws(
-    () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), savedSession: admission })),
-    /saved-session file is missing/,
-  );
-
-  // Publish the separately created identical-content file at the now absent
-  // path; verify the different identity survived before requiring refusal.
-  await requireOwnedIdentity(replacement, replacementIdentity);
-  assert.equal(existsSync(savedFile), false);
-  await rename(replacement, savedFile);
-  await requireOwnedIdentity(savedFile, replacementIdentity);
-  assert.throws(
-    () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), savedSession: admission })),
-    /changed since admission/,
-  );
-
-  // A symlink at the admitted path is refused.
-  const target = join(pkg.root, "saved-target.jsonl");
-  await writeFile(target, `${JSON.stringify({ type: "session", id: "saved-1", cwd: pkg.workspace })}\n`, { encoding: "utf8", flag: "wx" });
-  await requireOwnedIdentity(savedFile, replacementIdentity);
-  await rm(savedFile);
-  await symlink(target, savedFile);
-  assert.throws(
-    () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), savedSession: admission })),
-    /saved-session file is a symlink/,
-  );
+test("owned fixture cleanup refuses to rmdir through a renamed-and-symlinked ancestor", async () => {
+  const root = await realpath(await mkdtemp(join(process.cwd(), ".pi-native-host-ownanc-")));
+  const rollback = new FixtureOwnership();
+  rollback.track(root); // record immediately so a setup failure still has the root receipt
+  await runWithCleanup(async () => {
+    const ownership = new FixtureOwnership();
+    ownership.track(root);
+    const child = join(root, "child");
+    await mkdir(child);
+    ownership.track(child);
+    rollback.track(child);
+    // Rename the root away and replace it with a symlink to the moved root.
+    const moved = `${root}-moved`;
+    await rename(root, moved);
+    rollback.untrack(root);
+    rollback.untrack(child);
+    rollback.track(moved);
+    rollback.track(join(moved, "child"));
+    await symlink(moved, root);
+    rollback.track(root); // the replacement symlink (rollback only)
+    let cleanupError: unknown;
+    try {
+      ownership.cleanup();
+    } catch (error) {
+      cleanupError = error;
+    }
+    assert.ok(cleanupError instanceof Error, "cleanup fails visibly when an ancestor is replaced by a symlink");
+    assert.equal(existsSync(join(root, "child")), true, "the tracked child is not removed through the symlinked ancestor");
+  }, () => rollback.cleanup());
 });
 
 test("saved selection is bound to its admitted workspace: mismatched and retargeted workspaces refuse before spawn", async (t) => {

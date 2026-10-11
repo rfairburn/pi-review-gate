@@ -15,6 +15,17 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.143]
+
+### Fixed
+
+- The saved-session launch revalidation test now disposes its created fixture
+  entries, including the deliberately rejected symlink, on success or failure.
+  Cleanup preserves unknown or identity-replaced entries and retains original
+  assertion diagnostics. The ancestor-replacement regression also rolls back its
+  owned symlink and moved tree after assertion failures. This fixes the concrete
+  source-capture blocker in #354; broader suite-wide cleanup remains open.
+
 ## [0.1.0-dev.142]
 
 ### Added

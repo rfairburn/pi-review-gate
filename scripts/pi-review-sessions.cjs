@@ -63,7 +63,10 @@ isolated Pi 1.1.0 runtime cache under the native Pi agent directory; no
 manual Pi CLI path is needed. Starts an empty welcome/sidebar picker; choose
 a workspace explicitly in the UI.
 The startup working directory is not selected as a workspace.
-Basic controls only; terminal graphics rendering is disabled.
+Basic controls only; bounded native Kitty PNG rendering targets direct Ghostty
+(TERM_PROGRAM=ghostty, TERM=xterm-ghostty, no tmux/screen).
+Unsupported image display uses native-style text where metadata is available.
+Physical Ghostty acceptance remains pending; see docs/session-host-alpha.md.
 Native image/model input behavior stays native. Host toggle/roster-return shortcuts default
 to alt+left/alt+right and can be configured in session-host/keybindings.json. Parent startup session overrides
 (--continue/-c, --resume/-r, --session, --session-id, --fork, --session-dir,

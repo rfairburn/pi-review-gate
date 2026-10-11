@@ -29,9 +29,10 @@
  *   bounded (cap 32 per buffer, newest push retained via FIFO eviction) and
  *   whenever pops empty the stack, ALL flags reset to zero, per protocol.
  * - Window operations (CSI t), OSC 52 clipboard writes, and title setting
- *   are swallowed (default deny). There is no graphical renderer here: the
- *   headless instance safely consumes image/graphics sequences without
- *   forwarding them, and no graphics or native menu parity is claimed.
+ *   are swallowed (default deny). A narrow native Kitty PNG subset is split
+ *   before VT parsing, validated, and exposed only as typed image/placement
+ *   and native-style fallback metadata; there is no renderer or host notice,
+ *   and unsupported graphics commands are swallowed rather than forwarded.
  * - The Kitty keyboard handling uses typed parser hooks
  *   (parser.registerCsiHandler) because xterm 6 core has no kittyKeyboard
  *   support and no onRender callback. Snapshot invalidation happens only
@@ -62,6 +63,14 @@
 import { Buffer } from "node:buffer";
 import { IDisposable, Terminal } from "@xterm/headless";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
+import {
+	KittyGraphicsSplitter,
+	KittyGraphicsState,
+	TerminalGraphicsBudget,
+	TerminalGraphicsFrame,
+	TerminalGraphicsPosition,
+	createTerminalGraphicsBudget,
+} from "./kitty-graphics";
 
 /** A cell color as recorded by headless: default, 256-palette index, or RGB. */
 export interface TerminalColorSpec {
@@ -120,6 +129,8 @@ export interface TerminalFrame {
 	};
 	/** Structured style runs for rows containing non-default attributes. */
 	readonly styles?: readonly TerminalLineStyles[];
+	/** Validated Kitty PNG placements and payload-free fallback metadata visible in this buffer. */
+	readonly graphics?: TerminalGraphicsFrame;
 }
 
 /**
@@ -162,6 +173,8 @@ export interface TerminalSurfaceOptions {
 	 * ProcessTerminal's actively negotiated flag mask (0..7).
 	 */
 	readonly getSupportedKeyboardFlags?: () => number;
+	/** Optional budget shared by the host's surfaces; omitted means private. */
+	readonly graphicsBudget?: TerminalGraphicsBudget;
 	/** Bounded named scrollback lines (default 1000). */
 	readonly scrollback?: number;
 	/** Maximum bytes of not-yet-parsed queued write data (default 8 MiB). */
@@ -171,6 +184,8 @@ export interface TerminalSurfaceOptions {
 interface PendingWrite {
 	/** Queued UTF-8 byte size of the still-unparsed chunk. */
 	readonly size: number;
+	/** Raw child chunk, scanned incrementally before entering xterm. */
+	readonly data: string;
 	readonly done: Promise<void>;
 	resolve: () => void;
 }
@@ -244,6 +259,7 @@ const LOW_WATERMARK_WRITES = 1024;
 const MAX_DIMENSION = 1000;
 
 const SGR_RESET = "\x1b[0m";
+const SAFE_EMPTY_APC = "\x1b_G\x1b\\";
 const GENERATED_SGR_PATTERN = /\x1b\[[0-9;]*m/g;
 
 function validateDimension(value: number, label: "cols" | "rows"): void {
@@ -425,17 +441,24 @@ export class TerminalSurface {
 	private readonly pendingWrites: PendingWrite[] = [];
 	private readonly kittyNormal: KittyState = { current: 0, stack: [] };
 	private readonly kittyAlternate: KittyState = { current: 0, stack: [] };
+	private readonly graphicsSplitter: KittyGraphicsSplitter;
+	private readonly graphics: KittyGraphicsState;
 	private options: TerminalSurfaceOptions;
 	private readonly maxPendingBytes: number;
 	private readonly highWatermarkBytes: number;
 	private readonly lowWatermarkBytes: number;
 
 	private pendingBytes = 0;
+	private pendingAlternateGraphicsInvalidation = false;
 	private cursorVisible = true;
 	private modifyOtherKeys: 0 | 1 | 2 = 0;
 	private mouseEncoding: TerminalInputModes["mouseEncoding"] = "default";
 	private paused = false;
 	private disposed = false;
+	private drainingWrites = false;
+	private processingWrite = false;
+	private activeTerminalWriteResolve?: () => void;
+	private parseFailed = false;
 	private lastInvalidateKey = "";
 
 	constructor(cols: number, rows: number, options: TerminalSurfaceOptions = {}) {
@@ -454,6 +477,9 @@ export class TerminalSurface {
 		this.highWatermarkBytes = Math.min(HIGH_WATERMARK_BYTES, Math.floor(this.maxPendingBytes * 0.75));
 		this.lowWatermarkBytes = Math.min(LOW_WATERMARK_BYTES, Math.floor(this.maxPendingBytes * 0.25));
 		this.options = options;
+		const graphicsBudget = options.graphicsBudget ?? createTerminalGraphicsBudget();
+		this.graphics = new KittyGraphicsState(graphicsBudget);
+		this.graphicsSplitter = new KittyGraphicsSplitter(graphicsBudget);
 		this.terminal = new Terminal({
 			cols,
 			rows,
@@ -463,6 +489,23 @@ export class TerminalSurface {
 		const unicode11 = new Unicode11Addon();
 		this.terminal.loadAddon(unicode11);
 		this.terminal.unicode.activeVersion = "11";
+
+		const noteAlternateGraphicsInvalidation = () => {
+			if (this.terminal.buffer.active.type === "alternate") {
+				this.pendingAlternateGraphicsInvalidation = true;
+			}
+		};
+		this.attach(this.terminal.onScroll(noteAlternateGraphicsInvalidation));
+		for (const final of ["J", "S", "T", "L", "M", "@", "P", "X"]) {
+			this.attach(this.terminal.parser.registerCsiHandler({ final }, () => {
+				noteAlternateGraphicsInvalidation();
+				return false;
+			}));
+		}
+		this.attach(this.terminal.parser.registerEscHandler({ final: "M" }, () => {
+			noteAlternateGraphicsInvalidation();
+			return false;
+		}));
 
 		// Headless-generated replies (built-in DA/DSR and friends) go to this
 		// instance's owner via onData; never to any other surface.
@@ -476,7 +519,10 @@ export class TerminalSurface {
 		// sanctioned "everything queued so far has been parsed" signal, so
 		// owner notifications never expose intermediate mid-chunk states.
 		this.attach(this.terminal.onWriteParsed(() => {
-			this.invalidate();
+			this.applyPendingAlternateGraphicsInvalidation();
+			if (!this.processingWrite) {
+				this.invalidate();
+			}
 		}));
 
 		// Hardware cursor visibility tracking. Handlers scan all private-mode
@@ -605,6 +651,9 @@ export class TerminalSurface {
 	/** Queues a raw chunk of child output for parsing. Throws on limit overrun. */
 	write(data: string): void {
 		this.assertNotDisposed();
+		if (this.parseFailed) {
+			throw new Error("TerminalSurface parse pipeline failed");
+		}
 		if (typeof data !== "string") {
 			throw new Error("TerminalSurface.write expects a string of raw child output");
 		}
@@ -632,24 +681,11 @@ export class TerminalSurface {
 		const done = new Promise<void>((res) => {
 			resolve = res;
 		});
-		const pending: PendingWrite = { size: incomingBytes, done, resolve };
+		const pending: PendingWrite = { size: incomingBytes, data, done, resolve };
 		this.pendingWrites.push(pending);
 		this.pendingBytes += incomingBytes;
-		this.terminal.write(data, () => {
-			if (this.disposed) {
-				// Writes completing after dispose must not call into peers;
-				// their promises were already settled by dispose().
-				return;
-			}
-			const index = this.pendingWrites.indexOf(pending);
-			if (index >= 0) {
-				this.pendingWrites.splice(index, 1);
-			}
-			this.pendingBytes -= pending.size;
-			pending.resolve();
-			this.updateBackpressure();
-		});
 		this.updateBackpressure();
+		this.drainPendingWrites();
 	}
 
 	/**
@@ -661,6 +697,9 @@ export class TerminalSurface {
 		this.assertNotDisposed();
 		const snapshot = [...this.pendingWrites];
 		await Promise.all(snapshot.map((pending) => pending.done));
+		if (this.parseFailed) {
+			throw new Error("TerminalSurface parse pipeline failed");
+		}
 		// Let the async onWriteParsed invalidation land so callers can observe
 		// frames/onChange deterministically after flush.
 		await new Promise<void>((resolve) => setImmediate(resolve));
@@ -671,6 +710,7 @@ export class TerminalSurface {
 		this.assertNotDisposed();
 		validateDimension(cols, "cols");
 		validateDimension(rows, "rows");
+		this.graphics.invalidatePlacements();
 		this.terminal.resize(cols, rows);
 		// Resize invalidates geometry deterministically: the underlying resize
 		// is synchronous and buffers are reflowed immediately.
@@ -764,10 +804,11 @@ export class TerminalSurface {
 			row: cursorRow,
 			visible,
 		};
+		const graphics = this.graphics.frame(buffer.type, buffer.viewportY, cols, rows);
 		if (styles.length > 0) {
-			return { cols, rows, lines, cursor, styles };
+			return { cols, rows, lines, cursor, styles, ...(graphics ? { graphics } : {}) };
 		}
-		return { cols, rows, lines, cursor };
+		return { cols, rows, lines, cursor, ...(graphics ? { graphics } : {}) };
 	}
 
 	/**
@@ -800,6 +841,9 @@ export class TerminalSurface {
 			return;
 		}
 		this.disposed = true;
+		this.activeTerminalWriteResolve?.();
+		this.graphicsSplitter.dispose();
+		this.graphics.clear();
 		this.kittyNormal.current = 0;
 		this.kittyNormal.stack.length = 0;
 		this.kittyAlternate.current = 0;
@@ -823,6 +867,144 @@ export class TerminalSurface {
 		}
 		this.pendingBytes = 0;
 		this.terminal.dispose();
+	}
+
+	private drainPendingWrites(): void {
+		if (this.disposed || this.drainingWrites) {
+			return;
+		}
+		this.drainingWrites = true;
+		void Promise.resolve().then(() => this.processPendingWrites());
+	}
+
+	private async processPendingWrites(): Promise<void> {
+		try {
+			while (!this.disposed && this.pendingWrites.length > 0) {
+				const pending = this.pendingWrites[0] as PendingWrite;
+				this.processingWrite = true;
+				const parts = this.graphicsSplitter.push(pending.data);
+				for (const part of parts) {
+					if (this.disposed) {
+						return;
+					}
+					if (part.kind === "terminal") {
+						await this.writeToTerminal(part.data);
+						this.applyPendingAlternateGraphicsInvalidation();
+						const screen = this.alternateScreenState();
+						this.graphics.validateAlternateScreen(screen.textAt, false);
+					} else if (part.kind === "graphics") {
+						// Let xterm consume a generated empty APC before the typed event.
+						// This returns a parser left mid-CSI/ESC to ground without ever
+						// forwarding the child's payload or changing cursor position.
+						await this.writeToTerminal(SAFE_EMPTY_APC);
+						this.graphics.process(part.command, this.graphicsPosition(part.command));
+					} else if (part.kind === "discard") {
+						await this.writeToTerminal(SAFE_EMPTY_APC);
+						this.graphics.discard();
+					} else {
+						await this.writeToTerminal(SAFE_EMPTY_APC);
+						this.graphics.clear();
+					}
+				}
+				this.processingWrite = false;
+				if (this.disposed) {
+					return;
+				}
+				this.pendingWrites.shift();
+				this.pendingBytes -= pending.size;
+				pending.resolve();
+				this.updateBackpressure();
+				this.invalidate();
+			}
+		} catch {
+			// A parser or protocol helper failure must not strand flush callers
+			// or silently accept later child output as if it had parsed.
+			this.parseFailed = true;
+			this.graphics.discard();
+			for (const pending of this.pendingWrites.splice(0)) {
+				pending.resolve();
+			}
+			this.pendingBytes = 0;
+			this.updateBackpressure();
+		} finally {
+			this.processingWrite = false;
+			this.drainingWrites = false;
+			if (!this.disposed && this.pendingWrites.length > 0) {
+				this.drainPendingWrites();
+			}
+		}
+	}
+
+	private writeToTerminal(data: string): Promise<void> {
+		if (this.disposed || data.length === 0) {
+			return Promise.resolve();
+		}
+		return new Promise<void>((resolve, reject) => {
+			let settled = false;
+			const settle = () => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				if (this.activeTerminalWriteResolve === settle) {
+					this.activeTerminalWriteResolve = undefined;
+				}
+				resolve();
+			};
+			const fail = () => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				if (this.activeTerminalWriteResolve === settle) {
+					this.activeTerminalWriteResolve = undefined;
+				}
+				reject(new Error("TerminalSurface terminal parser failed"));
+			};
+			this.activeTerminalWriteResolve = settle;
+			try {
+				this.terminal.write(data, settle);
+			} catch {
+				fail();
+			}
+		});
+	}
+
+	private applyPendingAlternateGraphicsInvalidation(): void {
+		if (!this.pendingAlternateGraphicsInvalidation) {
+			return;
+		}
+		this.pendingAlternateGraphicsInvalidation = false;
+		this.graphics.validateAlternateScreen(undefined, true);
+	}
+
+	private graphicsPosition(command: string): TerminalGraphicsPosition {
+		const buffer = this.terminal.buffer.active;
+		const alternateScreen = buffer.type === "alternate" ? this.alternateScreenState() : undefined;
+		const marker = KittyGraphicsState.needsPosition(command) && buffer.type === "normal"
+			? this.terminal.registerMarker(0)
+			: undefined;
+		return {
+			buffer: buffer.type,
+			column: buffer.cursorX,
+			row: buffer.baseY + buffer.cursorY,
+			...(alternateScreen === undefined ? {} : {
+				alternateTextAt: alternateScreen.textAt,
+			}),
+			cols: this.terminal.cols,
+			rows: this.terminal.rows,
+			...(marker === undefined ? {} : { marker }),
+		};
+	}
+
+	private alternateScreenState(): {
+		readonly textAt: (row: number, column: number, width: number) => string;
+	} {
+		const buffer = this.terminal.buffer.alternate;
+		return {
+			textAt: (row, column, width) => buffer.getLine(buffer.viewportY + row)
+				?.translateToString(false, column, column + width) ?? "",
+		};
 	}
 
 	private assertNotDisposed(): void {
@@ -946,7 +1128,18 @@ export class TerminalSurface {
 		// The invalidation key covers the frame and the input-mode state, so
 		// mode-only changes (bracketed paste, cursor keys, mouse tracking,
 		// kitty flags) still notify the host — after the parse completes.
-		const key = JSON.stringify(this.frame()) + "|" + JSON.stringify(this.inputModesState());
+		const frame = this.frame();
+		const { graphics, ...textFrame } = frame;
+		const graphicsKey = graphics
+			? {
+				revision: this.graphics.revision,
+				images: graphics.images.map(({ id, mimeType, widthPx, heightPx }) => ({ id, mimeType, widthPx, heightPx })),
+				placements: graphics.placements,
+				fallbacks: graphics.fallbacks,
+			}
+			: { revision: this.graphics.revision };
+		const key = JSON.stringify(textFrame) + "|" + JSON.stringify(graphicsKey)
+			+ "|" + JSON.stringify(this.inputModesState());
 		if (key !== this.lastInvalidateKey) {
 			this.lastInvalidateKey = key;
 			this.safePeerInvoke(() => this.options.onChange?.());

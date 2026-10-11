@@ -1,7 +1,10 @@
 import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
 import type { Writable } from "node:stream";
 import { visibleWidth } from "pi-session-host-tui";
-import type { ComposedHostFrame } from "./compositor";
+import type { ComposedHostFrame, HostPaneRect } from "./compositor";
+import { fallbackHostGraphics, type HostGraphicsLayer } from "./graphics-output";
+import type { TerminalGraphicsImage, TerminalGraphicsPlacement } from "./kitty-graphics";
 
 const MAX_DIMENSION = 1000;
 const DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024;
@@ -35,6 +38,8 @@ export interface SessionHostFrameWriterOptions {
 	readonly redrawIntervalMs?: number;
 	readonly maxFrameBytes?: number;
 	readonly cleanupTimeoutMs?: number;
+	/** True only for Main's positively identified direct Ghostty output path. */
+	readonly graphicsEnabled?: boolean;
 	/** Receives one generic, non-sensitive error at most; callback throws are ignored. */
 	readonly onError?: (error: Error) => void;
 }
@@ -114,6 +119,39 @@ interface FrameCandidate {
 	/** Display-cell width of each sanitized row (cursor resting position). */
 	readonly rowWidths: readonly number[];
 	readonly cursor: { readonly column: number; readonly row: number } | undefined;
+	readonly graphics?: ValidatedGraphicsPlan;
+}
+
+interface ValidatedGraphicsImage {
+	readonly generationKey: string;
+	readonly sourceId: string;
+	readonly base64: string;
+	readonly widthPx: number;
+	readonly heightPx: number;
+}
+
+interface ValidatedGraphicsPlacement {
+	readonly generationKey: string;
+	readonly sourceId: string;
+	readonly imageGenerationKey: string;
+	readonly column: number;
+	readonly row: number;
+	readonly columns: number;
+	readonly rows: number;
+	readonly crop: { readonly x: number; readonly y: number; readonly width: number; readonly height: number };
+}
+
+interface ValidatedGraphicsPlan {
+	readonly ownerId: string;
+	readonly pane: HostPaneRect;
+	readonly signature: string;
+	readonly images: readonly ValidatedGraphicsImage[];
+	readonly placements: readonly ValidatedGraphicsPlacement[];
+}
+
+interface OwnedGraphicsPlan extends ValidatedGraphicsPlan {
+	readonly images: readonly (ValidatedGraphicsImage & { readonly outputId: number })[];
+	readonly placements: readonly (ValidatedGraphicsPlacement & { readonly outputId: number })[];
 }
 
 interface PendingFrame {
@@ -147,6 +185,7 @@ export function createSessionHostFrameWriter(
 		MAX_CLEANUP_TIMEOUT_MS,
 		"cleanupTimeoutMs",
 	);
+	const graphicsEnabled = options.graphicsEnabled === true;
 	if (!Number.isSafeInteger(maxFrameBytes)) {
 		throw new RangeError("Session host frame writer maxFrameBytes must be a safe integer");
 	}
@@ -161,6 +200,15 @@ export function createSessionHostFrameWriter(
 	let pending: PendingFrame | undefined;
 	let blockedSettlement: (() => void) | undefined;
 	let baseline: FrameCandidate | undefined;
+	// Kept independently from the text baseline: invalidate() must preserve
+	// sent image ownership until a targeted delete has actually been queued.
+	let activeGraphics: OwnedGraphicsPlan | undefined;
+	// Include both sides of an in-flight replacement until its callback/drain
+	// proves success, so a concurrent close can target every possibly-sent ID.
+	let possiblyOwnedImageIds = new Set<number>();
+	let forceGraphicsRepaint = false;
+	let nextGraphicsImageId = 1;
+	let nextGraphicsPlacementId = 1;
 	let redrawTimer: ReturnType<typeof setTimeout> | undefined;
 	let lastFrameAt: number | undefined;
 	let closePromise: Promise<boolean> | undefined;
@@ -326,14 +374,89 @@ export function createSessionHostFrameWriter(
 		const submission = pending;
 		pending = undefined;
 		const candidate = submission.candidate;
-		const payload = baseline === undefined
+		const textPayload = baseline === undefined
 			|| baseline.cols !== candidate.cols
 			|| baseline.rows !== candidate.rows
 			? buildFullFramePayload(candidate, maxFrameBytes)
 			: buildDiffPayload(baseline, candidate, maxFrameBytes);
-		if (payload === undefined) {
+		const graphicsChanged = forceGraphicsRepaint
+			|| activeGraphics?.signature !== candidate.graphics?.signature;
+		let nextGraphics = activeGraphics;
+		let graphicsBefore: Buffer = Buffer.alloc(0);
+		let graphicsAfter: Buffer = Buffer.alloc(0);
+		if (graphicsChanged) {
+			graphicsBefore = buildGraphicsDeletes(activeGraphics);
+			const owned = ownGraphicsPlan(candidate.graphics, activeGraphics, nextGraphicsImageId, nextGraphicsPlacementId);
+			nextGraphics = owned.plan;
+			nextGraphicsImageId = owned.nextImageId;
+			nextGraphicsPlacementId = owned.nextPlacementId;
+			graphicsAfter = buildGraphicsRender(nextGraphics, candidate.cursor);
+		}
+		const payload = combinePayload([graphicsBefore, textPayload ?? Buffer.alloc(0), graphicsAfter], maxFrameBytes);
+		if (!payload) {
+			// A targeted delete is independently bounded. If the text diff plus
+			// that small cleanup envelope alone exceeds the configured frame cap,
+			// delete first and retry the newest text candidate after its existing
+			// callback/drain fence rather than rejecting valid text.
+			if (graphicsChanged && activeGraphics !== undefined && candidate.graphics === undefined
+				&& graphicsBefore.length > 0) {
+				frameInFlight = true;
+				let accepted: boolean | undefined;
+				let callbackSucceeded = false;
+				let drainObserved = false;
+				let settled = false;
+				const drainSequenceBeforeWrite = drainSequence;
+				const settleDelete = (): void => {
+					if (settled || failed || closing || closed || accepted === undefined || !callbackSucceeded
+						|| (!accepted && !drainObserved)) return;
+					settled = true;
+					activeGraphics = undefined;
+					possiblyOwnedImageIds = new Set();
+					forceGraphicsRepaint = false;
+					frameInFlight = false;
+					if (pending === undefined) pending = submission;
+					schedulePump();
+				};
+				accepted = writeFrame(graphicsBefore, (error) => {
+					if (!error) callbackSucceeded = true;
+					settleDelete();
+				});
+				if (accepted !== undefined && !failed && !closing && !closed) {
+					if (!accepted) {
+						if (drainSequence !== drainSequenceBeforeWrite) {
+							drainObserved = true;
+							blocked = false;
+							blockedSettlement = undefined;
+						}
+						if (!drainObserved) {
+							blockedSettlement = () => {
+								drainObserved = true;
+								settleDelete();
+							};
+						}
+					}
+				} else {
+					frameInFlight = false;
+					return;
+				}
+				settleDelete();
+				return;
+			}
+			// submit() budgets a conservative full redraw plus graphics payload;
+			// an unexpected renderer-sizing mismatch must not emit an unbounded
+			// buffer or silently continue with a partial image protocol command.
+			recordOutputFailure();
 			notifySettled(submission, "unchanged");
-			return; // rows and cursor unchanged: skip output entirely
+			return;
+		}
+		if (payload.length === 0) {
+			if (graphicsChanged) {
+				activeGraphics = nextGraphics;
+				possiblyOwnedImageIds = graphicsImageIds(nextGraphics);
+				forceGraphicsRepaint = false;
+			}
+			notifySettled(submission, "unchanged");
+			return; // rows, cursor, and visible graphics are unchanged
 		}
 		lastFrameAt = Date.now();
 		frameInFlight = true;
@@ -346,20 +469,27 @@ export function createSessionHostFrameWriter(
 			if (settled || failed || closing || closed || accepted === undefined || !callbackSucceeded
 				|| (!accepted && !drainObserved)) return;
 			settled = true;
+			if (graphicsChanged) possiblyOwnedImageIds = graphicsImageIds(nextGraphics);
 			frameInFlight = false;
 			notifySettled(submission, "written");
 			schedulePump();
 		};
+		if (graphicsChanged && nextGraphics) {
+			for (const image of nextGraphics.images) possiblyOwnedImageIds.add(image.outputId);
+		}
 		accepted = writeFrame(payload, (error) => {
 			if (!error) callbackSucceeded = true;
 			settleWritten();
 		});
-		// The baseline advances only when the write was actually invoked: a
-		// false return is queued until drain, while a throw or callback failure
-		// must not authorize newer baseline writes. The in-flight fence prevents
-		// pending candidates from settling against this baseline before completion.
+		// The baseline and image ownership advance only when write() accepted the
+		// complete bounded payload. Callback and drain still fence every newer
+		// candidate, so cleanup can never overtake an in-flight image transfer.
 		if (accepted !== undefined && !failed && !closing && !closed) {
 			baseline = candidate;
+			if (graphicsChanged) {
+				activeGraphics = nextGraphics;
+				forceGraphicsRepaint = false;
+			}
 			if (!accepted) {
 				if (drainSequence !== drainSequenceBeforeWrite) {
 					drainObserved = true;
@@ -433,7 +563,12 @@ export function createSessionHostFrameWriter(
 			maybeFinishCleanup();
 		});
 		try {
-			accepted = output.write(Buffer.from(LEAVE_ALT_SCREEN, "ascii"), write.callback);
+			const graphicsCleanup = buildGraphicsDeletesForIds(possiblyOwnedImageIds);
+			const cleanupPayload = Buffer.concat([
+				graphicsCleanup,
+				Buffer.from(LEAVE_ALT_SCREEN, "ascii"),
+			]);
+			accepted = output.write(cleanupPayload, write.callback);
 		} catch {
 			write.cancel();
 			cleanupFailed = true;
@@ -505,37 +640,52 @@ export function createSessionHostFrameWriter(
 			if (!frame || !Array.isArray(frame.lines)) {
 				throw new TypeError("Composed host frame must contain a lines array");
 			}
-			const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 			const cursor = validCursor(frame.cursor, cols, rows);
-			// Reserve the fixed envelope (hide prefix, per-row CUP/erase/reset,
-			// cursor suffix) up front so every row serializes against the running
-			// complete-frame budget and oversized frames reject early — before
-			// retaining or processing further rows.
-			let contentBudget = maxFrameBytes
-				- Buffer.byteLength(HIDE_CURSOR, "utf8")
-				- Buffer.byteLength(cursorSuffix(cursor), "utf8");
-			for (let row = 0; row < rows; row += 1) {
-				contentBudget -= Buffer.byteLength(rowEnvelopePrefix(row), "utf8") + Buffer.byteLength(RESET, "utf8");
+			let graphics = graphicsEnabled && frame.graphics
+				? prepareGraphicsPlan(frame.graphics, cols, rows)
+				: undefined;
+			let effectiveFrame = frame;
+			if (frame.graphics) {
+				effectiveFrame = graphics
+					? fallbackHostGraphics(frame, cols, rows, {
+						excludePlacementIds: new Set(graphics.placements.map((placement) => placement.sourceId)),
+						preserveGraphics: true,
+					})
+					: fallbackHostGraphics(frame, cols, rows);
 			}
-			if (contentBudget < 0) {
-				throw new RangeError("Serialized host frame exceeds its UTF-8 byte limit");
+			let candidate: FrameCandidate;
+			try {
+				candidate = serializeCandidate(effectiveFrame, cols, rows, cursor, graphics, maxFrameBytes);
+			} catch (error) {
+				if (!frame.graphics) throw error;
+				graphics = undefined;
+				try {
+					candidate = serializeCandidate(fallbackHostGraphics(frame, cols, rows), cols, rows, cursor, undefined, maxFrameBytes);
+				} catch {
+					// Fallback text must not make an otherwise valid text frame fail.
+					const { graphics: _graphics, ...plainFrame } = frame;
+					void _graphics;
+					candidate = serializeCandidate(plainFrame, cols, rows, cursor, undefined, maxFrameBytes);
+				}
 			}
-			const rowTexts: string[] = [];
-			const rowWidths: number[] = [];
-			for (let row = 0; row < rows; row += 1) {
-				const source = typeof frame.lines[row] === "string" ? frame.lines[row] : "";
-				const serialized = serializeRowContent(source, cols, segmenter, contentBudget);
-				rowTexts.push(serialized.text);
-				rowWidths.push(serialized.width);
-				contentBudget -= Buffer.byteLength(serialized.text, "utf8");
+			if (graphics && graphicsWouldExceedBudget(
+				candidate,
+				graphics,
+				activeGraphics,
+				nextGraphicsImageId,
+				nextGraphicsPlacementId,
+				maxFrameBytes,
+			)) {
+				graphics = undefined;
+				try {
+					candidate = serializeCandidate(fallbackHostGraphics(frame, cols, rows), cols, rows, cursor, undefined, maxFrameBytes);
+				} catch {
+					// Fallback text must not make an otherwise valid text frame fail.
+					const { graphics: _graphics, ...plainFrame } = frame;
+					void _graphics;
+					candidate = serializeCandidate(plainFrame, cols, rows, cursor, undefined, maxFrameBytes);
+				}
 			}
-			const candidate: FrameCandidate = {
-				cols,
-				rows,
-				rowTexts,
-				rowWidths,
-				cursor,
-			};
 			pending = { candidate, onSettled };
 			schedulePump();
 		},
@@ -546,6 +696,7 @@ export function createSessionHostFrameWriter(
 			// complete frame. A retained pending candidate stays pending; a
 			// blocked sink repaints fully when its queued write drains.
 			baseline = undefined;
+			forceGraphicsRepaint = true;
 			schedulePump();
 		},
 
@@ -712,6 +863,386 @@ function validCursor(
 	if (!Number.isSafeInteger(cursor.column) || !Number.isSafeInteger(cursor.row)) return undefined;
 	if (cursor.column < 0 || cursor.column >= cols || cursor.row < 0 || cursor.row >= rows) return undefined;
 	return { column: cursor.column, row: cursor.row };
+}
+
+function serializeCandidate(
+	frame: ComposedHostFrame,
+	cols: number,
+	rows: number,
+	cursor: FrameCandidate["cursor"],
+	graphics: ValidatedGraphicsPlan | undefined,
+	maxFrameBytes: number,
+): FrameCandidate {
+	const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+	// Reserve the fixed envelope (hide prefix, per-row CUP/erase/reset,
+	// cursor suffix) before retaining row content.
+	let contentBudget = maxFrameBytes
+		- Buffer.byteLength(HIDE_CURSOR, "utf8")
+		- Buffer.byteLength(cursorSuffix(cursor), "utf8");
+	for (let row = 0; row < rows; row += 1) {
+		contentBudget -= Buffer.byteLength(rowEnvelopePrefix(row), "utf8") + Buffer.byteLength(RESET, "utf8");
+	}
+	if (contentBudget < 0) throw new RangeError("Serialized host frame exceeds its UTF-8 byte limit");
+	const rowTexts: string[] = [];
+	const rowWidths: number[] = [];
+	for (let row = 0; row < rows; row += 1) {
+		const source = typeof frame.lines[row] === "string" ? frame.lines[row] : "";
+		const serialized = serializeRowContent(source, cols, segmenter, contentBudget);
+		rowTexts.push(serialized.text);
+		rowWidths.push(serialized.width);
+		contentBudget -= Buffer.byteLength(serialized.text, "utf8");
+	}
+	return { cols, rows, rowTexts, rowWidths, cursor, ...(graphics ? { graphics } : {}) };
+}
+
+function graphicsWouldExceedBudget(
+	candidate: FrameCandidate,
+	graphics: ValidatedGraphicsPlan,
+	active: OwnedGraphicsPlan | undefined,
+	nextImageId: number,
+	nextPlacementId: number,
+	maxFrameBytes: number,
+): boolean {
+	// A retained candidate may be force-redrawn by invalidate() after it is
+	// submitted. Always budget the complete redraw, including a scoped delete
+	// and the exact generated upload/chunk/placement envelope, even when the
+	// current graphics signature happens to match the written baseline.
+	const owned = ownGraphicsPlan(graphics, active, nextImageId, nextPlacementId).plan;
+	const cleanupBytes = buildGraphicsDeletes(active).length;
+	const renderBytes = graphicsRenderByteLength(owned, candidate.cursor);
+	return fullFrameByteLength(candidate) + cleanupBytes + renderBytes > maxFrameBytes;
+}
+
+function fullFrameByteLength(candidate: FrameCandidate): number {
+	let bytes = Buffer.byteLength(HIDE_CURSOR, "utf8") + Buffer.byteLength(cursorSuffix(candidate.cursor), "utf8");
+	for (let row = 0; row < candidate.rows; row += 1) {
+		bytes += Buffer.byteLength(rowEnvelopePrefix(row), "utf8")
+			+ Buffer.byteLength(candidate.rowTexts[row] ?? "", "utf8")
+			+ Buffer.byteLength(RESET, "utf8");
+	}
+	return bytes;
+}
+
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const MAX_GRAPHICS_BASE64_BYTES = 4 * 1024 * 1024;
+const MAX_KITTY_PAYLOAD_CHUNK_BYTES = 4096;
+const MAX_GRAPHICS_TOTAL_ENCODED_BYTES = 16 * 1024 * 1024;
+const MAX_GRAPHICS_TOTAL_DECODED_BYTES = 64 * 1024 * 1024;
+const MAX_GRAPHICS_TOTAL_PIXELS = 16 * 1024 * 1024;
+const MAX_GRAPHICS_IMAGES = 64;
+const MAX_GRAPHICS_PLACEMENTS = 256;
+const MAX_GRAPHICS_DIMENSION = 8192;
+const MAX_GRAPHICS_IMAGE_PIXELS = 8 * 1024 * 1024;
+const MAX_KITTY_ID = 0xffffffff;
+
+function prepareGraphicsPlan(layer: HostGraphicsLayer, cols: number, rows: number): ValidatedGraphicsPlan | undefined {
+	try {
+		if (!validOwner(layer.ownerId) || !validPane(layer.pane, cols, rows)
+			|| !Array.isArray(layer.frame?.images) || layer.frame.images.length > MAX_GRAPHICS_IMAGES
+			|| !Array.isArray(layer.frame?.placements) || layer.frame.placements.length > MAX_GRAPHICS_PLACEMENTS) return undefined;
+		const images = new Map<string, ValidatedGraphicsImage>();
+		let encodedBytes = 0;
+		let decodedBytes = 0;
+		let pixels = 0;
+		for (const source of layer.frame.images) {
+			const image = validateGraphicsImage(source);
+			if (!image || images.has(image.sourceId)) return undefined;
+			encodedBytes += image.base64.length;
+			decodedBytes += Math.floor(image.base64.length * 3 / 4);
+			pixels += image.widthPx * image.heightPx;
+			if (encodedBytes > MAX_GRAPHICS_TOTAL_ENCODED_BYTES
+				|| decodedBytes > MAX_GRAPHICS_TOTAL_DECODED_BYTES
+				|| pixels > MAX_GRAPHICS_TOTAL_PIXELS) return undefined;
+			const generationKey = graphicsHash(layer.ownerId, "image", image.sourceId, image.widthPx, image.heightPx, image.base64);
+			images.set(image.sourceId, { ...image, generationKey });
+		}
+		const visibleImages = new Map<string, ValidatedGraphicsImage>();
+		const placements: ValidatedGraphicsPlacement[] = [];
+		const placementKeys = new Set<string>();
+		for (const source of layer.frame.placements) {
+			const clipped = clipGraphicsPlacement(source, layer.pane, cols, rows, images);
+			if (!clipped || placementKeys.has(clipped.generationKey)) return undefined;
+			placementKeys.add(clipped.generationKey);
+			placements.push(clipped);
+			const image = [...images.values()].find((value) => value.generationKey === clipped.imageGenerationKey);
+			if (!image) return undefined;
+			visibleImages.set(image.sourceId, image);
+		}
+		if (placements.length === 0) return undefined;
+		const imageList = [...visibleImages.values()];
+		const signature = JSON.stringify([
+			layer.ownerId,
+			layer.pane.column, layer.pane.row, layer.pane.cols, layer.pane.rows,
+			imageList.map((image) => image.generationKey),
+			placements.map((placement) => [
+				placement.generationKey,
+				placement.imageGenerationKey,
+				placement.column, placement.row, placement.columns, placement.rows,
+				placement.crop.x, placement.crop.y, placement.crop.width, placement.crop.height,
+			]),
+		]);
+		return { ownerId: layer.ownerId, pane: { ...layer.pane }, signature, images: imageList, placements };
+	} catch {
+		return undefined;
+	}
+}
+
+function validateGraphicsImage(value: TerminalGraphicsImage): Omit<ValidatedGraphicsImage, "generationKey"> | undefined {
+	if (typeof value !== "object" || value === null || value.mimeType !== "image/png"
+		|| !validChildGraphicsId(value.id) || typeof value.base64 !== "string"
+		|| value.base64.length < 60 || value.base64.length > MAX_GRAPHICS_BASE64_BYTES
+		|| value.base64.length % 4 !== 0
+		|| !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value.base64)
+		|| !validImageDimension(value.widthPx) || !validImageDimension(value.heightPx)
+		|| value.widthPx * value.heightPx > MAX_GRAPHICS_IMAGE_PIXELS) return undefined;
+	const data = Buffer.from(value.base64, "base64");
+	if (data.length < 45 || data.length > 3 * 1024 * 1024
+		|| data.toString("base64") !== value.base64
+		|| !data.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)
+		|| data.toString("ascii", 12, 16) !== "IHDR"
+		|| data.readUInt32BE(16) !== value.widthPx || data.readUInt32BE(20) !== value.heightPx) return undefined;
+	return {
+		sourceId: value.id,
+		base64: value.base64,
+		widthPx: value.widthPx,
+		heightPx: value.heightPx,
+	};
+}
+
+function clipGraphicsPlacement(
+	value: TerminalGraphicsPlacement,
+	pane: HostPaneRect,
+	cols: number,
+	rows: number,
+	images: ReadonlyMap<string, ValidatedGraphicsImage>,
+): ValidatedGraphicsPlacement | undefined {
+	if (typeof value !== "object" || value === null
+		|| !validChildGraphicsId(value.id) || !validChildGraphicsId(value.imageId)
+		|| !Number.isSafeInteger(value.column) || Math.abs(value.column) > MAX_DIMENSION
+		|| !Number.isSafeInteger(value.row) || Math.abs(value.row) > MAX_DIMENSION
+		|| !validCellDimension(value.columns) || !validCellDimension(value.rows)) return undefined;
+	const image = images.get(value.imageId);
+	if (!image || !validCrop(value.crop, image.widthPx, image.heightPx) || !validPlacementClip(value.clip, value.columns, value.rows)) return undefined;
+	let left = value.clip.leftColumns;
+	let right = value.clip.rightColumns;
+	let top = value.clip.topRows;
+	let bottom = value.clip.bottomRows;
+	left += Math.max(0, -(value.column + left));
+	top += Math.max(0, -(value.row + top));
+	right += Math.max(0, value.column + value.columns - right - pane.cols);
+	bottom += Math.max(0, value.row + value.rows - bottom - pane.rows);
+	const columns = value.columns - left - right;
+	const rowsVisible = value.rows - top - bottom;
+	if (columns < 1 || rowsVisible < 1) return undefined;
+	const column = pane.column + value.column + left;
+	const row = pane.row + value.row + top;
+	if (column < pane.column || row < pane.row || column + columns > pane.column + pane.cols
+		|| row + rowsVisible > pane.row + pane.rows || column < 0 || row < 0
+		|| column + columns > cols || row + rowsVisible > rows) return undefined;
+	const crop = {
+		x: value.crop.x + Math.floor(value.crop.width * left / value.columns),
+		y: value.crop.y + Math.floor(value.crop.height * top / value.rows),
+		width: Math.ceil(value.crop.width * (value.columns - right) / value.columns)
+			- Math.floor(value.crop.width * left / value.columns),
+		height: Math.ceil(value.crop.height * (value.rows - bottom) / value.rows)
+			- Math.floor(value.crop.height * top / value.rows),
+	};
+	if (!validCrop(crop, image.widthPx, image.heightPx)) return undefined;
+	const generationKey = graphicsHash(
+		image.generationKey,
+		"placement",
+		value.id,
+		column, row, columns, rowsVisible,
+		crop.x, crop.y, crop.width, crop.height,
+	);
+	return {
+		generationKey,
+		sourceId: value.id,
+		imageGenerationKey: image.generationKey,
+		column,
+		row,
+		columns,
+		rows: rowsVisible,
+		crop,
+	};
+}
+
+function validOwner(value: string): boolean {
+	return typeof value === "string" && value.length > 0 && value.length <= 256
+		&& !/[\x00-\x1f\x7f-\x9f]/.test(value);
+}
+
+function validPane(value: HostPaneRect, cols: number, rows: number): boolean {
+	return typeof value === "object" && value !== null
+		&& Number.isSafeInteger(value.column) && value.column >= 0
+		&& Number.isSafeInteger(value.row) && value.row >= 0
+		&& Number.isSafeInteger(value.cols) && value.cols > 0 && value.cols <= MAX_DIMENSION
+		&& Number.isSafeInteger(value.rows) && value.rows > 0 && value.rows <= MAX_DIMENSION
+		&& value.column + value.cols <= cols && value.row + value.rows <= rows;
+}
+
+function validChildGraphicsId(value: string): boolean {
+	return typeof value === "string" && value.length > 0 && value.length <= 128
+		&& !/[\x00-\x1f\x7f-\x9f]/.test(value);
+}
+
+function validImageDimension(value: number): boolean {
+	return Number.isSafeInteger(value) && value > 0 && value <= MAX_GRAPHICS_DIMENSION;
+}
+
+function validCellDimension(value: number): boolean {
+	return Number.isSafeInteger(value) && value > 0 && value <= MAX_DIMENSION;
+}
+
+function validPlacementClip(
+	value: TerminalGraphicsPlacement["clip"],
+	columns: number,
+	rows: number,
+): boolean {
+	return typeof value === "object" && value !== null
+		&& [value.leftColumns, value.rightColumns].every((part) => Number.isSafeInteger(part) && part >= 0)
+		&& [value.topRows, value.bottomRows].every((part) => Number.isSafeInteger(part) && part >= 0)
+		&& value.leftColumns + value.rightColumns < columns
+		&& value.topRows + value.bottomRows < rows;
+}
+
+function validCrop(
+	value: TerminalGraphicsPlacement["crop"],
+	width: number,
+	height: number,
+): boolean {
+	return typeof value === "object" && value !== null
+		&& Number.isSafeInteger(value.x) && value.x >= 0
+		&& Number.isSafeInteger(value.y) && value.y >= 0
+		&& Number.isSafeInteger(value.width) && value.width > 0
+		&& Number.isSafeInteger(value.height) && value.height > 0
+		&& value.x + value.width <= width && value.y + value.height <= height;
+}
+
+function graphicsHash(...parts: readonly (string | number)[]): string {
+	const hash = createHash("sha256");
+	for (const part of parts) hash.update(String(part)).update("\0");
+	return hash.digest("hex");
+}
+
+function ownGraphicsPlan(
+	plan: ValidatedGraphicsPlan | undefined,
+	previous: OwnedGraphicsPlan | undefined,
+	nextImageId: number,
+	nextPlacementId: number,
+): { readonly plan: OwnedGraphicsPlan | undefined; readonly nextImageId: number; readonly nextPlacementId: number } {
+	if (!plan) return { plan: undefined, nextImageId, nextPlacementId };
+	const previousImages = new Map(previous?.images.map((image) => [image.generationKey, image.outputId]));
+	const previousPlacements = new Map(previous?.placements.map((placement) => [placement.generationKey, placement.outputId]));
+	const usedImageIds = new Set<number>(previous?.images.map((image) => image.outputId));
+	const usedPlacementIds = new Set<number>(previous?.placements.map((placement) => placement.outputId));
+	const images = plan.images.map((image) => {
+		const reusable = previousImages.get(image.generationKey);
+		const outputId = reusable ?? allocateKittyId(nextImageId, usedImageIds);
+		usedImageIds.add(outputId);
+		if (reusable === undefined) nextImageId = followingKittyId(outputId);
+		return { ...image, outputId };
+	});
+	const placements = plan.placements.map((placement) => {
+		const reusable = previousPlacements.get(placement.generationKey);
+		const outputId = reusable ?? allocateKittyId(nextPlacementId, usedPlacementIds);
+		usedPlacementIds.add(outputId);
+		if (reusable === undefined) nextPlacementId = followingKittyId(outputId);
+		return { ...placement, outputId };
+	});
+	return { plan: { ...plan, images, placements }, nextImageId, nextPlacementId };
+}
+
+function allocateKittyId(start: number, used: ReadonlySet<number>): number {
+	let candidate = start;
+	for (let attempts = 0; attempts <= used.size; attempts += 1) {
+		if (!Number.isSafeInteger(candidate) || candidate < 1 || candidate > MAX_KITTY_ID) candidate = 1;
+		if (!used.has(candidate)) return candidate;
+		candidate = followingKittyId(candidate);
+	}
+	return 1;
+}
+
+function followingKittyId(value: number): number {
+	return value >= MAX_KITTY_ID ? 1 : value + 1;
+}
+
+function buildGraphicsDeletes(plan: OwnedGraphicsPlan | undefined): Buffer {
+	return buildGraphicsDeletesForIds(graphicsImageIds(plan));
+}
+
+function graphicsImageIds(plan: OwnedGraphicsPlan | undefined): Set<number> {
+	return new Set(plan?.images.map((image) => image.outputId) ?? []);
+}
+
+function buildGraphicsDeletesForIds(ids: ReadonlySet<number>): Buffer {
+	if (ids.size === 0) return Buffer.alloc(0);
+	return Buffer.from([...ids].map((imageId) => `\x1b_Ga=d,d=I,i=${imageId},q=2\x1b\\`).join(""), "ascii");
+}
+
+function* kittyImageUploadCommands(image: ValidatedGraphicsImage & { readonly outputId: number }): IterableIterator<string> {
+	const base64 = image.base64;
+	if (base64.length <= MAX_KITTY_PAYLOAD_CHUNK_BYTES) {
+		yield `\x1b_Ga=t,f=100,q=2,i=${image.outputId};${base64}\x1b\\`;
+		return;
+	}
+	for (let offset = 0; offset < base64.length; offset += MAX_KITTY_PAYLOAD_CHUNK_BYTES) {
+		const chunk = base64.slice(offset, offset + MAX_KITTY_PAYLOAD_CHUNK_BYTES);
+		const first = offset === 0;
+		const last = offset + chunk.length >= base64.length;
+		const header = first
+			? `a=t,f=100,q=2,i=${image.outputId},m=1`
+			: `m=${last ? 0 : 1}`;
+		yield `\x1b_G${header};${chunk}\x1b\\`;
+	}
+}
+
+function graphicsPlacementCommand(
+	placement: OwnedGraphicsPlan["placements"][number],
+	imageId: number,
+): string {
+	return `\x1b[${placement.row + 1};${placement.column + 1}H`
+		+ `\x1b_Ga=p,q=2,C=1,i=${imageId},p=${placement.outputId},c=${placement.columns},r=${placement.rows}`
+		+ `,x=${placement.crop.x},y=${placement.crop.y},w=${placement.crop.width},h=${placement.crop.height}\x1b\\`;
+}
+
+function graphicsRenderByteLength(plan: OwnedGraphicsPlan | undefined, cursor: FrameCandidate["cursor"]): number {
+	if (!plan || plan.images.length === 0 || plan.placements.length === 0) return 0;
+	const imageIds = new Map(plan.images.map((image) => [image.generationKey, image.outputId]));
+	let bytes = HIDE_CURSOR.length + cursorSuffix(cursor).length;
+	for (const image of plan.images) {
+		for (const command of kittyImageUploadCommands(image)) bytes += command.length;
+	}
+	for (const placement of plan.placements) {
+		const imageId = imageIds.get(placement.imageGenerationKey);
+		if (imageId !== undefined) bytes += graphicsPlacementCommand(placement, imageId).length;
+	}
+	return bytes;
+}
+
+function buildGraphicsRender(plan: OwnedGraphicsPlan | undefined, cursor: FrameCandidate["cursor"]): Buffer {
+	if (!plan || plan.images.length === 0 || plan.placements.length === 0) return Buffer.alloc(0);
+	const images = new Map(plan.images.map((image) => [image.generationKey, image.outputId]));
+	let output = "";
+	for (const image of plan.images) {
+		for (const command of kittyImageUploadCommands(image)) output += command;
+	}
+	output += HIDE_CURSOR;
+	for (const placement of plan.placements) {
+		const imageId = images.get(placement.imageGenerationKey);
+		if (imageId !== undefined) output += graphicsPlacementCommand(placement, imageId);
+	}
+	output += cursorSuffix(cursor);
+	return Buffer.from(output, "ascii");
+}
+
+function combinePayload(parts: readonly Buffer[], byteLimit: number): Buffer | undefined {
+	let total = 0;
+	for (const part of parts) {
+		total += part.length;
+		if (total > byteLimit) return undefined;
+	}
+	return Buffer.concat(parts, total);
 }
 
 /** Append one sanitized, clipped row; returns its display-cell width. */

@@ -80,6 +80,28 @@ export const NODE_OPTIONS_RESTORE_ENV = "PI_REVIEW_GATE_SESSION_HOST_NODE_OPTION
 /** Upper bound for the serialized session-host NODE_OPTIONS restoration frame (UTF-8 bytes, the reporter's restore-frame cap). */
 export const MAX_NATIVE_NODE_OPTIONS_BYTES = 8192;
 
+/**
+ * Narrow native-like evidence for the one outer terminal whose Kitty graphics
+ * behavior this host integrates. TERM_PROGRAM alone is inherited by shells
+ * inside multiplexers, so require Ghostty's TERM too and reject tmux/screen.
+ */
+export function isDirectGhosttyTerminal(env: NodeJS.ProcessEnv): boolean {
+  return env.TERM_PROGRAM === "ghostty"
+    && env.TERM === "xterm-ghostty"
+    && !env.TMUX
+    && !env.TMUX_PANE
+    && !env.STY;
+}
+
+/** The host paints graphics only when Ghostty evidence is positive and images were not explicitly disabled. */
+export function supportsSessionHostKittyGraphics(env: NodeJS.ProcessEnv): boolean {
+  const protocol = env.PI_IMAGE_PROTOCOL?.toLowerCase();
+  // Match native Pi's environment override parsing: auto, empty, and unknown
+  // values retain detection; only explicit disabling or iTerm2 excludes Kitty.
+  return isDirectGhosttyTerminal(env)
+    && protocol !== "none" && protocol !== "0" && protocol !== "iterm2";
+}
+
 /** Executor-role markers (src/index.ts, src/execution/adapters/pi-model.ts). Reject, never forward. */
 export const RUNTIME_ROLE_ENV = "PI_REVIEW_GATE_RUNTIME_ROLE";
 export const EXECUTOR_TOOL_CATALOG_ENV = "PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG";
@@ -904,7 +926,11 @@ export function prepareNativeLaunch(options: NativeLaunchOptions): NativeLaunchD
   } else {
     // Native mode preserves every user choice and supplies only ordinary
     // defaults that are truly absent (an explicit empty value is intentional).
-    if (env.PI_IMAGE_PROTOCOL === undefined) env.PI_IMAGE_PROTOCOL = "none";
+    // The host's one supported native-like inline renderer is direct Ghostty;
+    // tmux/screen and ordinary launchers keep the no-image default.
+    if (env.PI_IMAGE_PROTOCOL === undefined) {
+      env.PI_IMAGE_PROTOCOL = isDirectGhosttyTerminal(env) ? "kitty" : "none";
+    }
     if (env.PI_REVIEW_GATE_CODEMODE_DEFAULT === undefined) env.PI_REVIEW_GATE_CODEMODE_DEFAULT = "1";
   }
 

@@ -516,9 +516,107 @@ running with your account's authority.
 
 ## Terminal and input limits
 
-The display is text and SGR styling, not a graphics renderer. The child terminal's
-image/graphics protocol is disabled with `PI_IMAGE_PROTOCOL=none`; native Pi image
-input and model behavior are otherwise unchanged.
+Text and SGR styling remain reconstructed from each child's virtual terminal;
+raw child escape streams are never forwarded. A separate, bounded graphics path
+handles native Pi's Kitty PNG image commands for a directly attached Ghostty Main
+pane. This is a display feature only: native image input, model processing, and
+ordinary standalone launchers are unchanged.
+
+### Inline images and compatibility
+
+Ghostty is the concrete image-display target, not a blanket terminal-graphics
+compatibility promise. The native protocol fixture uses Pi and pi-tui **1.1.0**.
+The hosted Kitty path requires `TERM_PROGRAM=ghostty` and `TERM=xterm-ghostty`,
+with no `TMUX`, `TMUX_PANE`, or `STY` marker. A customized terminal environment
+that does not meet this narrow gate uses text fallback, even if standalone Pi's
+broader heuristic detects images. Explicit `PI_IMAGE_PROTOCOL=none`/`0` disables
+the host renderer; `iterm2` is not rendered through this Kitty path. Native
+image-disable preferences remain native choices. No new host setting or image
+tool is introduced.
+
+The host accepts a narrow typed subset of native PNG uploads, cached placements,
+vertical crops, and deletions. It generates its own outer-terminal commands,
+remaps child image identities, and confines graphics to the actual visible Main
+owner's pane. Child-wide deletion affects that child's graphics state only,
+never sibling images or arbitrary outer-terminal graphics. Switching sessions,
+covering Main with a form or overlay, and changing geometry remove old visible
+placements before drawing replacements. Images do not authorize input, activate
+a sidebar selection, or change session/workspace ownership.
+
+Unsupported display uses Pi's image-text convention, not a host warning or a new
+configuration prompt. Native unsupported-terminal rendering retains its own image
+metadata. When the host must substitute text for a Kitty placement, it can report
+only the PNG metadata available in that terminal stream; original filenames and
+pre-conversion formats are not reconstructed. Unknown graphics protocols, file
+or shared-memory transfers, and arbitrary graphics controls are not passed through.
+Forcing an unsupported protocol is not a compatibility guarantee. Child window
+and cell-pixel queries remain suppressed, so native image sizing uses the child's
+cell-pixel defaults rather than measured outer-terminal pixels; exact physical
+size/aspect parity with direct Pi is not certified.
+
+Image transfers, retained data, decoded-size estimates, pixel dimensions, image
+counts, and placement counts have fixed internal bounds. A shared graphics budget
+also covers the manager's sessions, rather than multiplying an unbounded cache by
+the number of children. These are bounds on the host's retained graphics state,
+not an operating-system or terminal-emulator memory guarantee. Graphics output
+uses the existing bounded writer and its coalescing/backpressure boundary; cleanup
+must settle before the writer can report successful terminal restoration.
+
+Source, unit, and controlled-PTY tests establish parsing, placement commands,
+identity fences, and cleanup ordering; they do **not** prove pixels appeared in a
+physical terminal. Actual same-content direct/hosted Ghostty display and visual
+cleanup require the manual comparison below.
+
+### Manual Ghostty image comparison
+
+Run this from the PR checkout in a physical Ghostty terminal, without tmux/screen.
+Use a disposable native agent directory so a second host cannot contend with an
+existing sidebar host's ownership record or change its roster. The test-only
+extension adds an explicit image command; it makes no model/provider request.
+It is not shipped as a product tool.
+
+```sh
+proof=$(mktemp -d "${TMPDIR:-/tmp}/pi-host-image-proof.XXXXXX")
+(umask 077; mkdir "$proof/agent" "$proof/a" "$proof/b")
+fixture="$(pwd)/tests/fixtures/pi-host-image-proof.cjs"
+printf 'Workspace A: %s\nWorkspace B: %s\n' "$proof/a" "$proof/b"
+# Unset this override if present: the host deliberately rejects inherited
+# native session-directory overrides.
+unset PI_CODING_AGENT_SESSION_DIR
+PI_CODING_AGENT_DIR="$proof/agent" pi --offline --no-extensions --extension "$fixture"
+```
+
+1. In direct Pi, run `/host-image-proof red`. Verify the actual colored image,
+   not just the text label, appears. Exit normally; record the Ghostty and Pi
+   versions, terminal size, and whether Pi is in regular or fullscreen mode.
+2. Start the candidate host from the same checkout and terminal:
+
+   ```sh
+   PI_CODING_AGENT_DIR="$proof/agent" node scripts/pi-review-sessions.cjs \
+     --sidebar-key f8 -- --offline --no-extensions --extension "$fixture"
+   ```
+
+3. Use New session to select the printed `$proof/a` directory, then run
+   `/host-image-proof red`. Compare the actual image with the direct baseline.
+4. Create a second session in `$proof/b` and run `/host-image-proof blue`.
+   Switch repeatedly between A and B. Their images must stay with their own
+   Main panes even though the fixture deliberately reuses the same child image ID.
+5. Show/hide the sidebar with F8, resize the terminal, and cross the 53-column
+   overlay boundary. Open and cancel New while an image is visible. No old image
+   may remain over the sidebar, form, overlay, or the other session. When Main
+   is visible again, its own image should return at its current placement.
+6. Quit through the public host confirmation. Check that graphics disappear,
+   the ordinary terminal returns, and the original host/owned children settle.
+   Repeat the comparison with `--tui-mode regular` and `--tui-mode fullscreen`
+   on direct Pi and after the host's `--` separator, using fresh sandboxes.
+
+Also test native image disabling and an unsupported terminal: image text should
+remain usable without a new host notice. A passing protocol trace or text
+snapshot cannot substitute for these visual observations. Retain the disposable
+sandbox for inspection if shutdown is uncertain; do not delete unknown files or
+use forced termination as proof that normal cleanup passed.
+
+### Generated frames and input
 
 Generated frames are drawn through a bounded outer writer whose default minimum
 redraw interval is 16 ms (about 60 fps), matching Pi's native minimum redraw cadence;

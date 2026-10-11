@@ -5,6 +5,7 @@ import { EventEmitter } from "node:events";
 import { Buffer } from "node:buffer";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { deflateSync } from "node:zlib";
 import type { Writable } from "node:stream";
 import test from "node:test";
 
@@ -20,6 +21,7 @@ import type { StatusBroker, StatusRenameRequest, StatusRenameResult } from "../s
 import { NativeAgentRegistry, type ProfilePreparer } from "../src/session-host/profiles";
 import { runNativeExternalEditor } from "../src/session-host/form-support";
 import type { TerminalFrame, TerminalInputModes } from "../src/session-host/terminal-surface";
+import type { TerminalGraphicsFrame } from "../src/session-host/kitty-graphics";
 import { SidebarController } from "../src/session-host/sidebar";
 import { isSavedSessionAdmission, listSavedSessions, type SavedSessionCatalog } from "../src/session-host/saved-sessions";
 import type { SessionHostNativeSession } from "../src/session-host/protocol";
@@ -92,8 +94,9 @@ class FakeOutput extends EventEmitter {
   ended = false;
   destroyed = false;
 
-  write(chunk: Uint8Array | string): boolean {
+  write(chunk: Uint8Array | string, callback?: (error?: Error | null) => void): boolean {
     this.writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    callback?.();
     return true;
   }
 
@@ -236,6 +239,7 @@ class FakeSurface {
   cols: number;
   rows: number;
   readonly writesAsFrame: string[];
+  graphics?: TerminalGraphicsFrame;
   frameCalls = 0;
   cursorVisible = true;
   modes: TerminalInputModes = {
@@ -262,6 +266,7 @@ class FakeSurface {
       rows: this.rows,
       lines,
       cursor: { column: 2, row: 0, visible: this.cursorVisible },
+      ...(this.graphics ? { graphics: this.graphics } : {}),
     };
   }
 
@@ -653,6 +658,72 @@ function plainLine(frame: ComposedHostFrame | undefined, row: number): string {
 function screenRowContaining(frame: ComposedHostFrame | undefined, text: string, fromRow = 1): number {
   return frame?.lines.findIndex((line, row) => row >= fromRow
     && line.replace(/\x1b\[[0-9;]*m/g, "").includes(text)) ?? -1;
+}
+
+function graphicsPngBase64(seed: number): string {
+  const width = 4;
+  const height = 4;
+  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 8;
+  header[9] = 6;
+  const raw = Buffer.alloc(height * (width * 4 + 1));
+  for (let row = 0; row < height; row += 1) {
+    raw[row * (width * 4 + 1)] = 0;
+    raw.fill(seed, row * (width * 4 + 1) + 1, (row + 1) * (width * 4 + 1));
+  }
+  const chunk = (type: string, data: Buffer): Buffer => {
+    const typeBytes = Buffer.from(type, "ascii");
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(data.length);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(graphicsPngCrc32(Buffer.concat([typeBytes, data])));
+    return Buffer.concat([length, typeBytes, data, crc]);
+  };
+  return Buffer.concat([
+    signature,
+    chunk("IHDR", header),
+    chunk("IDAT", deflateSync(raw)),
+    chunk("IEND", Buffer.alloc(0)),
+  ]).toString("base64");
+}
+
+function graphicsPngCrc32(input: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of input) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) crc = crc & 1 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function fakeGraphicsFrame(base64: string): TerminalGraphicsFrame {
+  return {
+    images: [{ id: "kitty-7", mimeType: "image/png", widthPx: 4, heightPx: 4, base64 }],
+    placements: [{
+      id: "placement-7",
+      imageId: "kitty-7",
+      column: 2,
+      row: 1,
+      columns: 3,
+      rows: 2,
+      crop: { x: 0, y: 0, width: 4, height: 4 },
+      clip: { leftColumns: 0, topRows: 0, rightColumns: 0, bottomRows: 0 },
+    }],
+    fallbacks: [{
+      id: "placement-7",
+      mimeType: "image/png",
+      widthPx: 4,
+      heightPx: 4,
+      column: 2,
+      row: 1,
+      columns: 3,
+      rows: 2,
+      clip: { leftColumns: 0, topRows: 0, rightColumns: 0, bottomRows: 0 },
+    }],
+  };
 }
 
 function emitMouse(
@@ -2263,6 +2334,106 @@ test("native Main click focus requires a written frame for the current owner and
     if (!shutDown) {
       harness.signals.emit("SIGTERM");
       if (output.queuedCount > 0) output.drain();
+      await harness.result.catch(() => undefined);
+    }
+  }
+});
+
+test("Main paints only the actual live Ghostty owner and cleans scoped graphics across sidebar, form, resize, and overlay changes", async () => {
+  const env = {
+    PATH: process.env.PATH,
+    HOME: "/synthetic-home",
+    TERM_PROGRAM: "ghostty",
+    TERM: "xterm-ghostty",
+  };
+  let harness!: Harness;
+  harness = createHarness({ env }, {
+    createSessionSetup: () => ({
+      nativeSetup: true,
+      nativeAgentDir: harness.agentDir,
+      profileRegistry: { prepare: () => { throw new Error("the fake Main manager never prepares a profile"); } },
+    }),
+    createWriter: (output, writerOptions) => createSessionHostFrameWriter(
+      output as unknown as Writable,
+      { ...writerOptions, redrawIntervalMs: 0 },
+    ),
+  });
+  let shutDown = false;
+  try {
+    const manager = await startTwoSessions(harness);
+    const imageA = graphicsPngBase64(41);
+    const imageB = graphicsPngBase64(173);
+    const surfaceA = manager.surface("native-1");
+    const surfaceB = manager.surface("native-2");
+    assert.ok(surfaceA && surfaceB);
+    surfaceA.graphics = fakeGraphicsFrame(imageA);
+    surfaceB.graphics = fakeGraphicsFrame(imageB);
+    const beforeFirstGraphics = harness.stdout.writes.length;
+    manager.notify("typed-graphics");
+    await nextTurn();
+    const firstGraphics = harness.stdout.writes.slice(beforeFirstGraphics).join("");
+    assert.ok(firstGraphics.includes(`;${imageB}\x1b\\`), "active native-2's typed image is generated to the outer terminal");
+    assert.equal(firstGraphics.includes(`;${imageA}\x1b\\`), false, "inactive native-1's same-numbered child image is not exposed");
+    assert.match(firstGraphics, /\x1b_Ga=t,f=100,q=2,i=1;/, "the host assigns its own image id");
+    assert.ok(firstGraphics.includes("\x1b[3;36H"), "the image placement is offset into the actual native pane");
+
+    const beforeSelection = harness.stdout.writes.length;
+    harness.terminal.emitInput("\x1b[A"); // Highlight A without changing the actual Main owner.
+    await nextTurn();
+    const selectionOnly = harness.stdout.writes.slice(beforeSelection).join("");
+    assert.equal(selectionOnly.includes("\x1b_Ga=t"), false, "sidebar selection alone never retargets images");
+    assert.equal(selectionOnly.includes("\x1b_Ga=d"), false, "the visible active owner's graphics remain in place");
+    assert.equal(harness.sidebar?.activeMainOwnerID, "native-2");
+
+    const beforeOwnerSwitch = harness.stdout.writes.length;
+    harness.terminal.emitInput(ENTER); // Activate A, whose child deliberately reuses Kitty image id 7.
+    await nextTurn();
+    const ownerSwitch = harness.stdout.writes.slice(beforeOwnerSwitch).join("");
+    const deleteOldImage = ownerSwitch.indexOf("\x1b_Ga=d,d=I,i=1,q=2\x1b\\");
+    const uploadNewImage = ownerSwitch.indexOf("\x1b_Ga=t,f=100,q=2,i=2;");
+    assert.ok(deleteOldImage >= 0 && uploadNewImage > deleteOldImage, "B's writer-owned image is deleted before A's namespaced generation is uploaded");
+    assert.ok(ownerSwitch.includes(`;${imageA}\x1b\\`));
+    assert.equal(ownerSwitch.includes(`;${imageB}\x1b\\`), false);
+
+    harness.terminal.emitInput(ALT_LEFT); // Focus the wide roster while A remains the owner.
+    harness.terminal.emitInput("\x1b[B");
+    harness.terminal.emitInput("\x1b[B");
+    harness.terminal.emitInput("\x1b[B"); // New session.
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "form");
+    const formOutput = harness.stdout.writes.slice(beforeOwnerSwitch + 1).join("");
+    assert.ok(formOutput.includes("\x1b_Ga=d,d=I,i=2,q=2\x1b\\"), "the form clears only A's owned image before replacing the native pane");
+    assert.equal(formOutput.includes("\x1b_Ga=d,d=a"), false, "no terminal-global deletion is emitted");
+
+    harness.terminal.emitInput("\x1b"); // Cancel the form, then restore the same Main owner.
+    await nextTurn();
+    const beforeRestore = harness.stdout.writes.length;
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    const restored = harness.stdout.writes.slice(beforeRestore).join("");
+    assert.ok(restored.includes("\x1b_Ga=t,f=100,q=2,i=3;"), "restored visible content is safely re-uploaded as a later image generation");
+
+    const beforeResize = harness.stdout.writes.length;
+    harness.terminal.setSize(90, 24);
+    await nextTurn();
+    const resizeOutput = harness.stdout.writes.slice(beforeResize).join("");
+    assert.ok(resizeOutput.includes("\x1b_Ga=d,d=I,i=3,q=2\x1b\\"), "resize repaints after targeted cleanup of the sent geometry");
+    assert.ok(resizeOutput.includes("\x1b_Ga=t,f=100,q=2,i=3;"), "the same image generation is re-uploaded for new geometry");
+
+    harness.terminal.emitInput(ALT_LEFT); // Wide roster focus still shows the native pane.
+    await nextTurn();
+    const beforeOverlay = harness.stdout.writes.length;
+    harness.terminal.setSize(52, 24); // Sidebar becomes a narrow overlay over the native pane.
+    await nextTurn();
+    const overlayOutput = harness.stdout.writes.slice(beforeOverlay).join("");
+    assert.ok(overlayOutput.includes("\x1b_Ga=d,d=I,i=3,q=2\x1b\\"), "narrow overlay visibility change removes the previous native image");
+    assert.equal(overlayOutput.includes("\x1b_Ga=t"), false, "covered native graphics are not painted over the overlay");
+    assert.equal(await closeWithSignal(harness), 0);
+    shutDown = true;
+  } finally {
+    if (!shutDown) {
+      harness.signals.emit("SIGTERM");
       await harness.result.catch(() => undefined);
     }
   }

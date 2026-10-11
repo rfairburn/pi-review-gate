@@ -36,6 +36,7 @@ import {
 import { SESSION_HOST_BOOTSTRAP_ENV, composeFreshSessionSpawnArgs, prepareNativeLaunch } from "../src/session-host/launch";
 import { SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV } from "../src/session-host/startup-request";
 import { TerminalSurface } from "../src/session-host/terminal-surface";
+import { createTerminalGraphicsBudget, type TerminalGraphicsBudget } from "../src/session-host/kitty-graphics";
 import type { StatusRenameRequest, StatusRenameResult, StatusShutdownResult } from "../src/session-host/broker";
 
 /**
@@ -2307,6 +2308,58 @@ test("dispose without prior shutdown gracefully stops un-signaled children; alre
       cleanup(fresh);
     }
   } finally {
+    cleanup(harness);
+  }
+});
+
+test("one InstanceManager graphics budget is shared across every owned terminal surface", async () => {
+  const harness = makeHarness("shared-graphics-budget");
+  let manager: InstanceManager | undefined;
+  let pendingTransferReservations = 0;
+  const budget = createTerminalGraphicsBudget();
+  const sharedBudget: TerminalGraphicsBudget = {
+    reserveImage: (...args) => budget.reserveImage(...args),
+    reserveFallbackImage: () => budget.reserveFallbackImage(),
+    reservePlacement: (fallback) => budget.reservePlacement(fallback),
+    reservePendingTransfer: () => {
+      pendingTransferReservations += 1;
+      return pendingTransferReservations === 1 ? budget.reservePendingTransfer() : undefined;
+    },
+    reservePendingBytes: (bytes) => budget.reservePendingBytes(bytes),
+  };
+  try {
+    manager = new InstanceManager({
+      packageRoot: harness.packageRoot,
+      piExecutable: harness.piExecutable,
+      statusRegistrar: harness.registrar,
+      nativeSetup: false,
+      profileRegistry: harness.profileRegistry,
+      env: cleanTestEnv(),
+      ptyFactory: harness.ptyFactory,
+      graphicsBudget: sharedBudget,
+    });
+    const first = await manager.create({ workspace: harness.workspace });
+    const second = await manager.create({ workspace: harness.workspace2 });
+    const firstSurface = manager.surface(first);
+    const secondSurface = manager.surface(second);
+    assert.ok(firstSurface && secondSurface);
+    const pending = "\x1b_Ga=T,f=100,q=2,C=1,i=7,m=1;AAAA\x1b\\";
+    firstSurface.write(pending);
+    await firstSurface.flush();
+    secondSurface.write(pending);
+    await secondSurface.flush();
+    assert.equal(pendingTransferReservations, 2,
+      "both surfaces consult the same manager-owned reservation instead of receiving private per-surface budgets");
+    for (const pty of harness.spawned) pty.exitsOnSignal = "SIGTERM";
+    await manager.shutdown({ graceMs: 30, killMs: 30 });
+    await manager.dispose();
+    manager = undefined;
+  } finally {
+    if (manager) {
+      for (const pty of harness.spawned) pty.exitsOnSignal = "SIGTERM";
+      await manager.shutdown({ graceMs: 30, killMs: 30 });
+      await manager.dispose();
+    }
     cleanup(harness);
   }
 });

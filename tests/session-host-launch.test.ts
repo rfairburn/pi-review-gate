@@ -14,6 +14,7 @@ import {
   SESSION_HOST_BOOTSTRAP_ENV,
   prepareNativeLaunch,
   resolveNativePi,
+  supportsSessionHostKittyGraphics,
 } from "../src/session-host/launch";
 import {
   admitSavedSession,
@@ -548,6 +549,47 @@ test("nativeSetup retains native config, provider environment, resources, and sk
   await writeFile(pkg.configPath, malformed);
   prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeEnv }));
   assert.equal((await readFile(pkg.configPath)).equals(malformed), true);
+});
+
+test("host graphics gate matches native image environment overrides", () => {
+  const ghostty = { TERM_PROGRAM: "ghostty", TERM: "xterm-ghostty" };
+  for (const protocol of [undefined, "kitty", "KITTY", "auto", "AUTO", "", "unknown"]) {
+    assert.equal(supportsSessionHostKittyGraphics({ ...ghostty, PI_IMAGE_PROTOCOL: protocol }), true,
+      `native auto-detection or Kitty override remains available: ${String(protocol)}`);
+  }
+  for (const protocol of ["none", "NONE", "0", "iterm2", "ITERM2"]) {
+    assert.equal(supportsSessionHostKittyGraphics({ ...ghostty, PI_IMAGE_PROTOCOL: protocol }), false,
+      `explicit unsupported or disabled protocol stays off: ${protocol}`);
+  }
+  assert.equal(supportsSessionHostKittyGraphics({ ...ghostty, TMUX: "/tmp/tmux" }), false);
+  assert.equal(supportsSessionHostKittyGraphics({ TERM_PROGRAM: "ghostty", TERM: "xterm-256color" }), false);
+});
+
+test("native image default selects direct Ghostty only and preserves explicit disable/multiplexer boundaries", async (t) => {
+  const pkg = await makePackageFixture();
+  t.after(() => rm(pkg.root, { recursive: true, force: true }));
+  const native = (env: NodeJS.ProcessEnv) => prepareNativeLaunch(baseOptions(pkg, {
+    nativeSetup: true,
+    env: {
+      HOME: join(pkg.root, "home"),
+      PATH: process.env.PATH,
+      PI_CODING_AGENT_DIR: pkg.agentDir,
+      ...env,
+    },
+  }));
+  const ghostty = native({ TERM_PROGRAM: "ghostty", TERM: "xterm-ghostty" });
+  assert.equal(ghostty.env.PI_IMAGE_PROTOCOL, "kitty", "the hosted child may emit Kitty graphics for direct Ghostty");
+  assert.equal(native({ TERM_PROGRAM: "ghostty", TERM: "xterm-ghostty", PI_IMAGE_PROTOCOL: "none" }).env.PI_IMAGE_PROTOCOL, "none",
+    "an explicit image-disable choice is passed through unchanged");
+  assert.equal(native({ TERM_PROGRAM: "ghostty", TERM: "xterm-ghostty", TMUX: "/tmp/tmux" }).env.PI_IMAGE_PROTOCOL, "none",
+    "TERM_PROGRAM inherited inside tmux is not direct Ghostty evidence");
+  assert.equal(native({ TERM_PROGRAM: "ghostty", TERM: "screen-256color", STY: "synthetic-screen" }).env.PI_IMAGE_PROTOCOL, "none",
+    "screen TERM/STY does not opt into host Kitty output");
+  const legacy = prepareNativeLaunch(baseOptions(pkg, {
+    nativeSetup: false,
+    env: { PATH: process.env.PATH, TERM_PROGRAM: "ghostty", TERM: "xterm-ghostty" },
+  }));
+  assert.equal(legacy.env.PI_IMAGE_PROTOCOL, "none", "legacy profiles keep their existing no-image default");
 });
 
 test("nativeSetup supplies only absent ordinary defaults and resolves the native root from its explicit env", async (t) => {

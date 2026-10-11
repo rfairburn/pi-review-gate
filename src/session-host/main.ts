@@ -26,7 +26,7 @@ import {
   type ShutdownResult,
   type StatusRegistrar,
 } from "./instances";
-import { resolveNativePi, RUNTIME_ROLE_ENV, EXECUTOR_TOOL_CATALOG_ENV, snapshotNativeEnvironment } from "./launch";
+import { resolveNativePi, RUNTIME_ROLE_ENV, EXECUTOR_TOOL_CATALOG_ENV, snapshotNativeEnvironment, supportsSessionHostKittyGraphics } from "./launch";
 import { NativeAgentRegistry, type ProfilePreparer } from "./profiles";
 import { isValidNativeSessionId, type SessionSpawnInput, type SessionSpawnOutcome } from "./protocol";
 import {
@@ -607,6 +607,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let rosterSyncInProgress = false;
   let rosterSyncQueued = false;
   let redrawQueued = false;
+  let hostGraphicsEnabled = false;
   let negotiationReady = false;
   let observedFlags = 0;
   let passiveInputListener: ((data: string | Buffer) => void) | undefined;
@@ -789,6 +790,18 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             sidebarFrame = sidebar.render(currentLayout.sidebar.cols, currentLayout.sidebar.rows);
           }
         }
+        const nativeOwnerId = view?.hasLiveProcess === true && view.lifecycle === "alive"
+          && surface !== undefined
+          && mainFrame !== undefined
+          && mainFrame.cols === currentLayout.native.cols && mainFrame.rows === currentLayout.native.rows
+          ? view.id
+          : undefined;
+        // Graphics follow the real active view/surface pair, never the
+        // sidebar's highlighted row. The compositor removes this layer when
+        // an overlay or form actually covers the native pane.
+        const nativeGraphics = nativeOwnerId !== undefined && mainFrame?.graphics !== undefined
+          ? { ownerId: nativeOwnerId, pane: currentLayout.native, frame: mainFrame.graphics }
+          : undefined;
         // Title only. Lifecycle, activity and input ownership belong below
         // session-card titles, never on the active conversation's title line.
         const header = view ? view.label : "Session host";
@@ -796,14 +809,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           main: mainFrame,
           sidebar: sidebarFrame,
           form: formFrame,
+          ...(nativeGraphics ? { nativeGraphics } : {}),
           header,
           focus,
         });
-        const nativeOwnerId = view?.hasLiveProcess === true && view.lifecycle === "alive"
-          && mainFrame !== undefined
-          && mainFrame.cols === currentLayout.native.cols && mainFrame.rows === currentLayout.native.rows
-          ? view.id
-          : undefined;
         const mousePresentation: MouseFramePresentation = {
           layout: currentLayout,
           focus,
@@ -831,6 +840,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
 
   function createFrameWriter(): MainWriter {
     return dependencies.createWriter(dependencies.stdout, {
+      graphicsEnabled: hostGraphicsEnabled,
       onError: () => requestShutdown(true),
     });
   }
@@ -2498,6 +2508,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const initialCols = clampDimension(terminal.columns, 80);
     const initialRows = clampDimension(terminal.rows, 24);
     sessionSetup = dependencies.createSessionSetup({ env: snapshot.env });
+    hostGraphicsEnabled = sessionSetup.nativeSetup && supportsSessionHostKittyGraphics(snapshot.env);
     if (typeof sessionSetup.nativeAgentDir === "string" && sessionSetup.nativeAgentDir !== "") {
       hostShortcutAgentDir = sessionSetup.nativeAgentDir;
       let readResult: HostShortcutConfigReadResult;

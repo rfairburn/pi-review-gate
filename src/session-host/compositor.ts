@@ -1,4 +1,5 @@
 import { sliceByColumn, visibleWidth } from "pi-session-host-tui";
+import type { HostGraphicsLayer } from "./graphics-output";
 import type { TerminalFrame } from "./terminal-surface";
 
 const MAX_DIMENSION = 1000;
@@ -45,6 +46,8 @@ export interface ComposeHostFrameOptions {
 	readonly sidebar?: RenderedSidebar;
 	/** New session form pane; composed into layout.form when present. */
 	readonly form?: RenderedSidebar;
+	/** Typed graphics from the actual live native owner; never child escape bytes. */
+	readonly nativeGraphics?: HostGraphicsLayer;
 	/** Canonical title only, without status/prefix badges; control sequences are never trusted. */
 	readonly header: string;
 	readonly focus: HostFocus;
@@ -53,6 +56,8 @@ export interface ComposeHostFrameOptions {
 export interface ComposedHostFrame {
 	readonly lines: string[];
 	readonly cursor: { readonly column: number; readonly row: number; readonly visible: boolean };
+	/** Present only when the corresponding live native pane is actually visible. */
+	readonly graphics?: HostGraphicsLayer;
 }
 
 /**
@@ -167,41 +172,49 @@ export function composeHostFrame(layout: HostLayout, options: ComposeHostFrameOp
 		}
 	}
 
-	const cursor = hiddenCursor();
+	let cursor: ComposedHostFrame["cursor"] = hiddenCursor();
 	if (options.focus === "main" && options.main) {
 		const mainCursor = cursorInFrame(options.main, layout.native);
 		if (mainCursor) {
-			return { lines, cursor: {
+			cursor = {
 				column: layout.native.column + mainCursor.column,
 				row: layout.native.row + mainCursor.row,
 				visible: true,
-			} };
+			};
 		}
-	}
-
-	if (options.focus === "form" && layout.form !== undefined && options.form?.cursor) {
+	} else if (options.focus === "form" && layout.form !== undefined && options.form?.cursor) {
 		const formCursor = cursorInRect(options.form.cursor, layout.form);
 		if (formCursor) {
-			return { lines, cursor: {
+			cursor = {
 				column: layout.form.column + formCursor.column,
 				row: layout.form.row + formCursor.row,
 				visible: true,
-			} };
+			};
 		}
-	}
-
-	if (options.focus !== "main" && layout.sidebar && options.sidebar?.cursor) {
+	} else if (options.focus !== "main" && layout.sidebar && options.sidebar?.cursor) {
 		const sidebarCursor = cursorInRect(options.sidebar.cursor, layout.sidebar);
 		if (sidebarCursor) {
-			return { lines, cursor: {
+			cursor = {
 				column: layout.sidebar.column + sidebarCursor.column,
 				row: layout.sidebar.row + sidebarCursor.row,
 				visible: true,
-			} };
+			};
 		}
 	}
 
-	return { lines, cursor };
+	const graphics = options.nativeGraphics
+		&& options.main !== undefined
+		&& options.main.cols === layout.native.cols
+		&& options.main.rows === layout.native.rows
+		&& options.nativeGraphics.pane.column === layout.native.column
+		&& options.nativeGraphics.pane.row === layout.native.row
+		&& options.nativeGraphics.pane.cols === layout.native.cols
+		&& options.nativeGraphics.pane.rows === layout.native.rows
+		&& layout.form === undefined
+		&& !(layout.sidebarOverlay && layout.sidebar !== undefined && options.focus !== "main")
+		? options.nativeGraphics
+		: undefined;
+	return { lines, cursor, ...(graphics ? { graphics } : {}) };
 }
 
 function validateDimension(value: number, label: "cols" | "rows"): void {

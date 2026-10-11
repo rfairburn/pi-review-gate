@@ -754,7 +754,10 @@ test("--help works in the real CLI without TTY, role setup, build, or provisioni
   assert.match(result.stdout, /Node >=22\.19\.0/);
   assert.match(result.stdout, /Pi >=1\.0\.4/);
   assert.match(result.stdout, /no\s+manual Pi CLI path is needed/);
-  assert.match(result.stdout, /Basic controls only;\s*terminal\s+graphics rendering\s+is disabled/);
+  assert.match(result.stdout, /Basic controls only; bounded native Kitty PNG rendering targets direct Ghostty/);
+  assert.match(result.stdout, /TERM_PROGRAM=ghostty, TERM=xterm-ghostty, no tmux\/screen/);
+  assert.match(result.stdout, /Unsupported image display uses native-style text where metadata is available/);
+  assert.match(result.stdout, /Physical Ghostty acceptance remains pending/);
   assert.match(result.stdout, /native image\/model input behavior\s+stays\s+native/i);
   assert.match(result.stdout, /startup session\s+overrides\s+\(--continue\/-c[^)]*\) are not accepted/);
   assert.match(result.stdout, /choose\s+a workspace explicitly in the UI/);
@@ -1712,7 +1715,10 @@ test("help bypasses all environment and TTY preflight", async () => {
   });
   assert.equal(status, 0);
   assert.equal(envRead, false);
-  assert.match(output, /terminal\s+graphics rendering\s+is disabled/);
+  assert.match(output, /bounded native Kitty PNG rendering targets direct Ghostty/);
+  assert.match(output, /TERM_PROGRAM=ghostty, TERM=xterm-ghostty, no tmux\/screen/);
+  assert.match(output, /Unsupported image display uses native-style text where metadata is available/);
+  assert.match(output, /Physical Ghostty acceptance remains pending/);
   assert.match(output, /native image\/model input behavior\s+stays\s+native/i);
 });
 

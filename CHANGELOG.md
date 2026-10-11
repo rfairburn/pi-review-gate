@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.146]
+
+### Added
+
+- The optional session host gains a bounded native Kitty-image display path for
+  directly attached Ghostty Main panes (#363), with per-session image state,
+  pane-confined placement, and writer-owned graphics cleanup. Unsupported display
+  paths retain native-style image text rather than adding settings or host notices.
+  Standalone launchers and image input/model processing are unchanged. Physical
+  Ghostty display acceptance remains manual; protocol and PTY tests alone do not
+  establish it.
+
 ## [0.1.0-dev.145]
 
 ### Changed

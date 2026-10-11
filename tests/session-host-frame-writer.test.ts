@@ -3,8 +3,12 @@ import { Buffer } from "node:buffer";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import { Writable } from "node:stream";
+import { deflateSync } from "node:zlib";
+import { imageFallback } from "pi-session-host-tui";
 import { createSessionHostFrameWriter } from "../src/session-host/frame-writer";
-import type { ComposedHostFrame } from "../src/session-host/compositor";
+import type { ComposedHostFrame, HostPaneRect } from "../src/session-host/compositor";
+import type { HostGraphicsLayer } from "../src/session-host/graphics-output";
+import type { TerminalGraphicsFrame } from "../src/session-host/kitty-graphics";
 
 const ESC = "\x1b";
 
@@ -63,6 +67,79 @@ function wait(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function pngBase64(width: number, height: number, seed: number, noisy = false): string {
+	const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+	const header = Buffer.alloc(13);
+	header.writeUInt32BE(width, 0);
+	header.writeUInt32BE(height, 4);
+	header[8] = 8;
+	header[9] = 6;
+	const stride = width * 4 + 1;
+	const raw = Buffer.alloc(height * stride);
+	let random = seed >>> 0 || 1;
+	for (let row = 0; row < height; row += 1) {
+		raw[row * stride] = 0;
+		if (!noisy) {
+			raw.fill(seed, row * stride + 1, (row + 1) * stride);
+			continue;
+		}
+		for (let column = 1; column < stride; column += 1) {
+			random ^= random << 13;
+			random ^= random >>> 17;
+			random ^= random << 5;
+			raw[row * stride + column] = random & 0xff;
+		}
+	}
+	const chunk = (type: string, data: Buffer): Buffer => {
+		const typeBytes = Buffer.from(type, "ascii");
+		const length = Buffer.alloc(4);
+		length.writeUInt32BE(data.length);
+		const crc = Buffer.alloc(4);
+		crc.writeUInt32BE(pngCrc32(Buffer.concat([typeBytes, data])));
+		return Buffer.concat([length, typeBytes, data, crc]);
+	};
+	return Buffer.concat([
+		signature,
+		chunk("IHDR", header),
+		chunk("IDAT", deflateSync(raw)),
+		chunk("IEND", Buffer.alloc(0)),
+	]).toString("base64");
+}
+
+function pngCrc32(input: Buffer): number {
+	let crc = 0xffffffff;
+	for (const byte of input) {
+		crc ^= byte;
+		for (let bit = 0; bit < 8; bit += 1) crc = crc & 1 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+	}
+	return (crc ^ 0xffffffff) >>> 0;
+}
+
+function typedGraphics(ownerId: string, pane: HostPaneRect, base64: string): HostGraphicsLayer {
+	const crop = { x: 10, y: 5, width: 80, height: 60 };
+	const clip = { leftColumns: 0, topRows: 0, rightColumns: 0, bottomRows: 0 };
+	const frame: TerminalGraphicsFrame = {
+		images: [{ id: "kitty-7", mimeType: "image/png", widthPx: 200, heightPx: 120, base64 }],
+		placements: [
+			{
+				id: "placement-7a", imageId: "kitty-7", column: -1, row: 0,
+				columns: 4, rows: 2, crop, clip: { ...clip, leftColumns: 1 },
+			},
+			{
+				id: "placement-7b", imageId: "kitty-7", column: 2, row: 1,
+				columns: 4, rows: 2, crop, clip,
+			},
+		],
+		fallbacks: [
+			{ id: "placement-7a", mimeType: "image/png", widthPx: 200, heightPx: 120,
+				column: -1, row: 0, columns: 4, rows: 2, clip: { ...clip, leftColumns: 1 } },
+			{ id: "placement-7b", mimeType: "image/png", widthPx: 200, heightPx: 120,
+				column: 2, row: 1, columns: 4, rows: 2, clip },
+		],
+	};
+	return { ownerId, pane, frame };
+}
+
 test("construction is inert and start/frame/cleanup own only generated alternate-screen output", async () => {
 	const output = new SyntheticWritable();
 	const driver = writer(output, { redrawIntervalMs: 0 });
@@ -86,6 +163,289 @@ test("construction is inert and start/frame/cleanup own only generated alternate
 	assert.equal(outputText(output, 2), `${ESC}[0m${ESC}[?25h${ESC}[?1049l`);
 	assert.equal(output.endCalls, 0, "the caller's stream is not ended");
 	assert.equal(output.destroyCalls, 0, "the caller's stream is not destroyed");
+});
+
+test("typed Kitty graphics are namespaced, cropped to visible cells, and cleaned only by writer-owned IDs", async () => {
+	const output = new SyntheticWritable();
+	const driver = writer(output, { redrawIntervalMs: 0, graphicsEnabled: true });
+	driver.start();
+	const rows = Array.from({ length: 10 }, () => "");
+	const imageA = pngBase64(200, 120, 31);
+	const imageB = pngBase64(200, 120, 149);
+	const pane = { column: 5, row: 2, cols: 4, rows: 3 };
+	driver.submit({ ...frame(rows), graphics: typedGraphics("owner-A", pane, imageA) }, 20, 10);
+	const first = outputText(output, 1);
+	assert.ok(first.includes(`\x1b_Ga=t,f=100,q=2,i=1;${imageA}\x1b\\`), "the validated PNG is sent as a transmit-only generated upload");
+	assert.ok(first.includes("\x1b[3;6H\x1b_Ga=p,q=2,C=1,i=1,p=1,c=3,r=2,x=30,y=5,w=60,h=60\x1b\\"),
+		"left clipping advances source pixels and places only three cells at the pane offset");
+	assert.ok(first.includes("\x1b[4;8H\x1b_Ga=p,q=2,C=1,i=1,p=2,c=2,r=2,x=10,y=5,w=40,h=60\x1b\\"),
+		"right pane clipping crops source pixels rather than distorting a four-cell image into two cells");
+	assert.equal(first.includes("kitty-7"), false, "child numeric image IDs are never forwarded");
+
+	driver.submit({ ...frame(rows), graphics: typedGraphics("owner-B", pane, imageB) }, 20, 10);
+	const switched = outputText(output, 2);
+	const cleanup = switched.indexOf("\x1b_Ga=d,d=I,i=1,q=2\x1b\\");
+	const replacement = switched.indexOf("\x1b_Ga=t,f=100,q=2,i=2;");
+	assert.ok(cleanup >= 0 && replacement > cleanup, "owner change deletes A's owned image before uploading B's distinct generation");
+	assert.ok(switched.includes(`;${imageB}\x1b\\`));
+	assert.equal(switched.includes(`;${imageA}\x1b\\`), false);
+	assert.equal(switched.includes("\x1b_Ga=d,d=a"), false, "cleanup never issues terminal-global deletion");
+
+	const movedPane = { ...pane, column: 6 };
+	driver.submit({ ...frame(rows), graphics: typedGraphics("owner-B", movedPane, imageB) }, 20, 10);
+	const resized = outputText(output, 3);
+	assert.ok(resized.indexOf("\x1b_Ga=d,d=I,i=2,q=2\x1b\\") < resized.indexOf("\x1b_Ga=t,f=100,q=2,i=2;"),
+		"geometry replacement cleans and repaints the same owner/image generation");
+
+	driver.invalidate();
+	driver.submit({ ...frame(rows), graphics: typedGraphics("owner-B", movedPane, imageB) }, 20, 10);
+	const redraw = outputText(output, 4);
+	assert.ok(redraw.indexOf("\x1b_Ga=d,d=I,i=2,q=2\x1b\\") < redraw.indexOf("\x1b_Ga=t,f=100,q=2,i=2;"),
+		"invalidate retains sent ownership and forces scoped delete/repaint");
+
+	driver.submit(frame(rows), 20, 10);
+	assert.ok(outputText(output, 5).includes("\x1b_Ga=d,d=I,i=2,q=2\x1b\\"), "omitting the graphics layer clears the prior owner");
+	driver.submit({ ...frame(rows), graphics: typedGraphics("owner-A", pane, imageA) }, 20, 10);
+	assert.match(outputText(output, 6), /\x1b_Ga=t,f=100,q=2,i=3;/);
+	assert.equal(await driver.close(), true);
+	const final = outputText(output, 7);
+	assert.ok(final.indexOf("\x1b_Ga=d,d=I,i=3,q=2\x1b\\") < final.indexOf("\x1b[0m\x1b[?25h\x1b[?1049l"),
+		"close deletes the last owned image before reset/showcursor/leave-altscreen");
+});
+
+test("large Kitty image uploads use 4096-byte APC chunks before placing the reassembled PNG", async () => {
+	const output = new SyntheticWritable();
+	const driver = writer(output, { redrawIntervalMs: 0, graphicsEnabled: true });
+	driver.start();
+	const base64 = pngBase64(64, 64, 71, true);
+	assert.ok(base64.length > 4096);
+	const pane = { column: 0, row: 0, cols: 20, rows: 3 };
+	const layer: HostGraphicsLayer = {
+		ownerId: "large-image-owner",
+		pane,
+		frame: {
+			images: [{ id: "large-image", mimeType: "image/png", widthPx: 64, heightPx: 64, base64 }],
+			placements: [{
+				id: "large-placement", imageId: "large-image", column: 0, row: 0, columns: 4, rows: 2,
+				crop: { x: 0, y: 0, width: 64, height: 64 },
+				clip: { leftColumns: 0, topRows: 0, rightColumns: 0, bottomRows: 0 },
+			}],
+			fallbacks: [{
+				id: "large-placement", mimeType: "image/png", widthPx: 64, heightPx: 64,
+				column: 0, row: 0, columns: 4, rows: 2,
+				clip: { leftColumns: 0, topRows: 0, rightColumns: 0, bottomRows: 0 },
+			}],
+		},
+	};
+	const imageFrame = { ...frame(["", "", ""]), graphics: layer };
+	driver.submit(imageFrame, 20, 3);
+	const bytes = outputText(output, 1);
+	const chunks = [...bytes.matchAll(/\x1b_G([^;]*);([A-Za-z0-9+/=]*)\x1b\\/g)];
+	assert.ok(chunks.length > 1, "the large PNG is fragmented into Kitty APC payloads");
+	assert.ok(chunks.every((chunk) => (chunk[2]?.length ?? Infinity) <= 4096), "each Kitty payload fragment stays within 4096 bytes");
+	assert.match(chunks[0]?.[1] ?? "", /a=t,f=100,q=2,i=1,m=1/);
+	assert.match(chunks.at(-1)?.[1] ?? "", /^m=0$/);
+	assert.ok(chunks.slice(1, -1).every((chunk) => chunk[1] === "m=1"), "every continuation except the final fragment retains m=1");
+	assert.equal(chunks.map((chunk) => chunk[2]).join(""), base64, "the ordered fragments reassemble the exact validated PNG");
+	const finalChunkEnd = (chunks.at(-1)?.index ?? -1) + (chunks.at(-1)?.[0]?.length ?? 0);
+	const placement = bytes.indexOf("\x1b[1;1H\x1b_Ga=p");
+	assert.ok(placement > finalChunkEnd, "placement follows the complete multi-APC image transfer");
+	assert.equal(await driver.close(), true);
+
+	const exactOutput = new SyntheticWritable();
+	const exactBudget = writer(exactOutput, { redrawIntervalMs: 0, graphicsEnabled: true, maxFrameBytes: bytes.length });
+	exactBudget.start();
+	exactBudget.submit(imageFrame, 20, 3);
+	assert.equal(outputText(exactOutput, 1), bytes, "the exact complete chunked output fits the byte budget");
+	assert.equal(await exactBudget.close(), true);
+
+	const cappedOutput = new SyntheticWritable();
+	const cappedBudget = writer(cappedOutput, { redrawIntervalMs: 0, graphicsEnabled: true, maxFrameBytes: bytes.length - 1 });
+	cappedBudget.start();
+	cappedBudget.submit(imageFrame, 20, 3);
+	const boundedFallback = outputText(cappedOutput, 1);
+	assert.equal(boundedFallback.includes("\x1b_Ga=t"), false, "the missing byte cannot omit chunk APC envelopes from the budget");
+	assert.ok(Buffer.byteLength(boundedFallback, "utf8") <= bytes.length - 1, "fallback remains inside the configured output bound");
+	assert.equal(await cappedBudget.close(), true);
+});
+
+test("mixed renderable and fallback-only graphics keep each native fallback at its own anchor", async () => {
+	const output = new SyntheticWritable();
+	const driver = writer(output, { redrawIntervalMs: 0, graphicsEnabled: true });
+	driver.start();
+	const base64 = pngBase64(4, 4, 82);
+	const fallbackText = imageFallback("image/png", { widthPx: 12, heightPx: 8 });
+	const clip = { leftColumns: 0, topRows: 0, rightColumns: 0, bottomRows: 0 };
+	const layer: HostGraphicsLayer = {
+		ownerId: "mixed-image-owner",
+		pane: { column: 0, row: 0, cols: 40, rows: 3 },
+		frame: {
+			images: [{ id: "accepted-image", mimeType: "image/png", widthPx: 4, heightPx: 4, base64 }],
+			placements: [{
+				id: "accepted-placement", imageId: "accepted-image", column: 0, row: 0, columns: 6, rows: 1,
+				crop: { x: 0, y: 0, width: 4, height: 4 }, clip,
+			}],
+			fallbacks: [
+				{ id: "accepted-placement", mimeType: "image/png", widthPx: 4, heightPx: 4,
+					column: 0, row: 0, columns: 6, rows: 1, clip },
+				// This metadata represents a different image rejected by the shared
+				// terminal graphics budget; its fallback has no renderable placement.
+				{ id: "budget-rejected-placement", mimeType: "image/png", widthPx: 12, heightPx: 8,
+					column: 0, row: 1, columns: 40, rows: 1, clip },
+			],
+		},
+	};
+	driver.submit({ ...frame(["", "", ""]), graphics: layer }, 40, 3);
+	const bytes = outputText(output, 1);
+	assert.ok(bytes.includes("\x1b_Ga=t,f=100,q=2,i=1;"), "the accepted image remains rendered");
+	assert.equal(bytes.split(fallbackText).length - 1, 1, "only the fallback-only placement gets imageFallback text");
+	assert.ok(bytes.indexOf(fallbackText) > bytes.indexOf("\x1b[2;1H"), "rejected image text stays at its distinct second-row anchor");
+	assert.equal(await driver.close(), true);
+});
+
+test("same-image pending redraw falls back safely when invalidate forces a full bounded repaint", async () => {
+	const output = new SyntheticWritable();
+	output.writeResults.push(true, false);
+	const errors: string[] = [];
+	const driver = writer(output, {
+		redrawIntervalMs: 0,
+		maxFrameBytes: 1000,
+		graphicsEnabled: true,
+		onError: (error) => errors.push(error.message),
+	});
+	driver.start();
+	const pane = { column: 0, row: 0, cols: 40, rows: 2 };
+	const base64 = pngBase64(4, 4, 91);
+	const clip = { leftColumns: 0, topRows: 0, rightColumns: 0, bottomRows: 0 };
+	const layer: HostGraphicsLayer = {
+		ownerId: "redraw-owner",
+		pane,
+		frame: {
+			images: [{ id: "redraw-image", mimeType: "image/png", widthPx: 4, heightPx: 4, base64 }],
+			placements: [{ id: "redraw-placement", imageId: "redraw-image", column: 0, row: 0, columns: 40, rows: 1,
+				crop: { x: 0, y: 0, width: 4, height: 4 }, clip }],
+			fallbacks: [{ id: "redraw-placement", mimeType: "image/png", widthPx: 4, heightPx: 4,
+				column: 0, row: 0, columns: 40, rows: 1, clip }],
+		},
+	};
+	driver.submit({ ...frame(["", ""]), graphics: layer }, 40, 2);
+	driver.submit({ ...frame(["", `${"\x1b[31m".repeat(160)}`]), graphics: layer }, 40, 2);
+	driver.invalidate();
+	assert.equal(output.writes.length, 2, "the same-signature candidate remains retained behind backpressure");
+	output.emit("drain");
+	const afterDrain = output.writes.slice(2).map((chunk) => chunk.toString("utf8")).join("");
+	assert.ok(afterDrain.includes("\x1b_Ga=d,d=I,i=1,q=2\x1b\\"), "the prior visible generation is cleared before fallback text");
+	assert.ok(afterDrain.includes(imageFallback("image/png", { widthPx: 4, heightPx: 4 })), "oversized full redraw retains safe fallback text");
+	assert.equal(afterDrain.includes("\x1b_Ga=t"), false, "the forced redraw does not retry an over-budget image transfer");
+	assert.ok(output.writes.slice(2).every((chunk) => chunk.length <= 1000), "every fallback and scoped-cleanup write stays bounded");
+	assert.deepEqual(errors, [], "invalidate cannot turn the retained text frame into an output failure");
+	assert.equal(await driver.close(), true);
+});
+
+test("close targets both generations when an image-owner replacement is still in flight", async () => {
+	const output = new SyntheticWritable();
+	output.deferCallbacks = true;
+	const driver = writer(output, { redrawIntervalMs: 0, graphicsEnabled: true });
+	driver.start();
+	output.completeCallback(0);
+	const pane = { column: 0, row: 0, cols: 20, rows: 4 };
+	const rows = Array.from({ length: 4 }, () => "");
+	driver.submit({ ...frame(rows), graphics: typedGraphics("owner-A", pane, pngBase64(200, 120, 29)) }, 20, 4);
+	output.completeCallback(1);
+	driver.submit({ ...frame(rows), graphics: typedGraphics("owner-B", pane, pngBase64(200, 120, 181)) }, 20, 4);
+	const closing = driver.close();
+	const cleanup = outputText(output, 3);
+	assert.ok(cleanup.includes("\x1b_Ga=d,d=I,i=1,q=2\x1b\\"), "cleanup retains the prior owner's possibly visible image");
+	assert.ok(cleanup.includes("\x1b_Ga=d,d=I,i=2,q=2\x1b\\"), "cleanup also targets the replacement transfer accepted but not callback-settled");
+	output.completeCallback(2);
+	output.completeCallback(3);
+	assert.equal(await closing, true);
+});
+
+test("graphics backpressure retains only the newest bounded candidate and unsupported/oversized images become native fallback text", async () => {
+	const output = new SyntheticWritable();
+	output.writeResults.push(true, false);
+	const driver = writer(output, { redrawIntervalMs: 0, graphicsEnabled: true });
+	driver.start();
+	const imageA = pngBase64(200, 120, 11);
+	const imageB = pngBase64(200, 120, 207);
+	const pane = { column: 0, row: 0, cols: 40, rows: 2 };
+	const graphicsFrame = (ownerId: string, base64: string): ComposedHostFrame => ({
+		...frame(["" , ""]),
+		graphics: {
+			ownerId,
+			pane,
+			frame: {
+				images: [{ id: "kitty-7", mimeType: "image/png", widthPx: 200, heightPx: 120, base64 }],
+				placements: [{ id: "placement-7", imageId: "kitty-7", column: 0, row: 0, columns: 40, rows: 1,
+					crop: { x: 0, y: 0, width: 200, height: 120 },
+					clip: { leftColumns: 0, topRows: 0, rightColumns: 0, bottomRows: 0 } }],
+				fallbacks: [{ id: "placement-7", mimeType: "image/png", widthPx: 200, heightPx: 120,
+					column: 0, row: 0, columns: 40, rows: 1,
+					clip: { leftColumns: 0, topRows: 0, rightColumns: 0, bottomRows: 0 } }],
+			},
+		},
+	});
+	driver.submit(graphicsFrame("owner-A", imageA), 40, 2);
+	driver.submit(graphicsFrame("owner-B", imageB), 40, 2);
+	driver.submit(frame(["latest text", ""]), 40, 2);
+	assert.equal(output.writes.length, 2, "the blocked image write is the sole in-flight payload");
+	output.emit("drain");
+	assert.equal(output.writes.length, 3);
+	const afterDrain = outputText(output, 2);
+	assert.ok(afterDrain.includes("\x1b_Ga=d,d=I,i=1,q=2\x1b\\"), "the last pending frame cleans the sent image");
+	assert.equal(afterDrain.includes(`;${imageB}\x1b\\`), false, "the superseded B transfer is never emitted");
+	assert.ok(afterDrain.includes("latest text"));
+	assert.equal(await driver.close(), true);
+
+	const fallbackText = imageFallback("image/png", { widthPx: 200, heightPx: 120 });
+	const unsupportedOutput = new SyntheticWritable();
+	const unsupported = writer(unsupportedOutput, { redrawIntervalMs: 0 });
+	unsupported.start();
+	unsupported.submit(graphicsFrame("unsupported-owner", imageA), 40, 2);
+	const unsupportedBytes = outputText(unsupportedOutput, 1);
+	assert.ok(unsupportedBytes.includes(fallbackText), "unsupported output uses Pi's public imageFallback text");
+	assert.equal(unsupportedBytes.includes("\x1b_Ga="), false, "unsupported output emits no Kitty protocol");
+	assert.equal(await unsupported.close(), true);
+
+	const malformedOutput = new SyntheticWritable();
+	const malformed = writer(malformedOutput, { redrawIntervalMs: 0, graphicsEnabled: true });
+	malformed.start();
+	const malformedCandidate = graphicsFrame("malformed-owner", imageA);
+	const malformedLayer = malformedCandidate.graphics;
+	assert.ok(malformedLayer);
+	const malformedPlacement = malformedLayer.frame.placements[0];
+	assert.ok(malformedPlacement);
+	malformed.submit({
+		...malformedCandidate,
+		graphics: {
+			...malformedLayer,
+			frame: {
+				...malformedLayer.frame,
+				placements: [{ ...malformedPlacement, clip: { ...malformedPlacement.clip, leftColumns: -1 } }],
+			},
+		},
+	}, 40, 2);
+	const malformedBytes = outputText(malformedOutput, 1);
+	assert.ok(malformedBytes.includes(fallbackText), "malformed placement controls use bounded safe fallback text");
+	assert.equal(malformedBytes.includes("\x1b_Ga=t"), false, "malformed controls never reach Kitty output");
+	assert.equal(await malformed.close(), true);
+
+	const oversizedOutput = new SyntheticWritable();
+	const errors: string[] = [];
+	const oversized = writer(oversizedOutput, {
+		redrawIntervalMs: 0,
+		graphicsEnabled: true,
+		onError: (error) => errors.push(error.message),
+	});
+	oversized.start();
+	const oversizedLayer = graphicsFrame("oversized-owner", "A".repeat(4 * 1024 * 1024 + 4));
+	oversized.submit(oversizedLayer, 40, 2);
+	const oversizedBytes = outputText(oversizedOutput, 1);
+	assert.ok(oversizedBytes.includes(fallbackText), "graphics past the typed payload cap fall back instead of failing text output");
+	assert.equal(oversizedBytes.includes("\x1b_Ga=t"), false);
+	assert.deepEqual(errors, [], "oversized graphics do not become a host output failure");
+	assert.equal(await oversized.close(), true);
 });
 
 test("ANSI envelope rejects OSC, non-SGR CSI, controls, and C1 injection while clipping safely", async () => {

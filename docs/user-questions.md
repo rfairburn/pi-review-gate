@@ -54,9 +54,14 @@ answer.
 
 Notices and questions appear as distinguishable entry types in the existing
 session-local list, opened with **Ctrl+Alt+Up** (**Ctrl+Option+Up** on macOS).
-Question answers and notice details use the same centered, bounded native
-overlay and Markdown renderer. The complete notice body and optional context
-appear before its **More details** and **Close** actions. If native Markdown or
+Question answers and notice details use the same full-conversation-width, four-sided
+bordered, padded native overlay and Markdown renderer. On Pi hosts exposing the
+public `Theme.bg` formatter, every popup row, including blank border and padding
+cells, uses the theme's opaque surface background, so terminal selection within
+popup rows cannot interleave underlying conversation text at the pane's left or
+right margins. A parent Main sidebar is outside the child
+conversation viewport and is not covered by this overlay. The complete notice body
+and optional context appear before its **More details** and **Close** actions. If native Markdown or
 its theme is unavailable, the view visibly discloses the limitation and shows
 the complete question, notice body, and optional context as width-wrapped plain
 text; it does not silently truncate content or substitute a custom Markdown
@@ -66,10 +71,11 @@ Plain **PageUp/PageDown** remain available on hosts that deliver them to the
 popup. These popup-local shortcuts are not consumed while editing free text.
 Press **Escape** to return to the shared list; returning does not dismiss a
 notice. The only notice actions are **More details** and
-**Close**: **More details** closes the popup first, then sends the retained full
-body and optional context as an ordinary request to the originating model/session
-with a natural-language request to elaborate in a normal conversation reply. The
-notice stays pending. **Close** removes only the selected notice and sends nothing.
+**Close**: **More details** closes the popup first and consumes only the selected
+notice, then sends the retained full body and optional context as an ordinary request
+to the originating model/session with a natural-language request to elaborate in a
+normal conversation reply. A delivery failure does not restore the consumed notice.
+**Close** removes only the selected notice and sends nothing.
 The shared pending panel remains while any question or notice is still pending.
 
 Extension-owned question/notice Markdown, question-choice labels, titles, and
@@ -119,20 +125,25 @@ and `YouShouldKnow` is in the current live, authorized discovery ceiling.
   not yet been activated. The prompt is absent when the current launch authorization
   or operating mode excludes the tool. It points to the skill from the launcher's
   `~/.agents/skills/pi-review-gate-completion/SKILL.md` location, falling back to the
-  skill bundled with the extension package.
+  skill bundled with the extension package. That package fallback supports the
+  automatic pointer only; it does not install the skill in Pi's native skill-discovery
+  path.
 - The shipped completion skill declares Pi's native
   `disable-model-invocation: true`, so its description does not independently route
-  the model toward publication when completion guidance is off. It remains installed
-  and can still be explicitly loaded as `/skill:pi-review-gate-completion` regardless
-  of the guidance toggle. Manual invocation does not grant `YouShouldKnow` authority;
-  the tool must still be available and each call otherwise authorized. This extension
-  does not edit Pi's native settings or remove the skill.
+  the model toward publication when completion guidance is off. If installed and
+  discoverable in the active Pi environment, it can still be explicitly loaded as
+  `/skill:pi-review-gate-completion` regardless of the guidance toggle. Standard
+  launchers refresh all four skills under `~/.agents/skills/`; directly loading the
+  extension or using a sidebar-only native setup does not install them. The guidance
+  toggle controls the extension's automatic pointer, not skill installation or
+  discovery. Manual invocation does not grant `YouShouldKnow` authority; the tool must
+  still be available and each call otherwise authorized.
 
 The automatic prompt is ordinary model guidance, not an execution hook: it cannot
-force publication, watch turns, or guarantee that a notice is sent. If the skill file
-cannot be resolved, the extension omits the automatic prompt; explicit manual skill
-use remains a separate Pi feature. Neither setting changes the shared pending UI or
-removes existing items.
+force publication, watch turns, or guarantee that a notice is sent. If neither the
+installed nor bundled skill file can be resolved, the extension omits the automatic
+prompt; explicit manual skill use requires a copy discoverable in Pi's active skill
+path. Neither setting changes the shared pending UI or removes existing items.
 
 ## Shared pending panel and list
 
@@ -143,7 +154,7 @@ session-local list. A question-only list looks like this; pending notices appear
 as distinguishable entries alongside questions:
 
 ```
-Pending questions (2) · Ctrl+Alt+Up to close
+Pending input (2) · Ctrl+Alt+Up to close
 
 > q1: Which database should the migration target? [waiting]
   q2: Should the report include raw counts?
@@ -170,10 +181,11 @@ arrows select · Enter confirm · Esc back
 ```
 
 - Selecting a choice or submitting typed text delivers your answer.
-- The free-text row embeds Pi's own main chat editor — the same host-wired
-  component `/review-settings` uses — inside the shared question/notice
-  overlay; no nested window and no separate fallback buffer. Standard
-  text-entry keybindings work there: arrows (up/down move between the lines of a
+- The free-text row uses one Pi-native text field inside the shared
+  question/notice overlay; it does not duplicate the editor underneath. Its
+  answer draft is isolated from the chat draft, which is saved while the popup is
+  open and restored unchanged when it closes. Standard native text-entry
+  keybindings work there: arrows (up/down move between the lines of a
   multiline draft), word movement (Alt/Option+←/→, Ctrl+←/→), line start/end
   (Home/End, Ctrl+A/Ctrl+E), PageUp/PageDown, Backspace/Delete, word deletion
   (Ctrl+W, Alt+Backspace, Alt+D), delete to line start/end (Ctrl+U/Ctrl+K),

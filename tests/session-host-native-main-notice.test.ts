@@ -64,6 +64,8 @@ const CHOICE_CONTROL_RAW = "Unsafe \u001b[2J choice **plain**";
 const CHOICE_CONTROL_VISIBLE = "Unsafe \\u001b[2J choice **plain**";
 const INITIAL_PROMPT = "Please register the native notice and ask the release question.";
 const NOTICE_TITLE = "Reviewed deployment sequencing notice";
+const CLOSE_NOTICE_TITLE = "Close only this selected notice";
+const REMAINING_NOTICE_TITLE = "Preserved sibling notice";
 const NOTICE_CONTEXT_MARKER = "Origin marker native-notice-context-QA-295: this context belongs only to owner QA.";
 const NATIVE_MARKDOWN_DISPLAY_PROBE = "\u001b[31mNATIVE_TRANSCRIPT_SGR_PROBE_295\u001b[0m";
 const NATIVE_MARKDOWN_DISPLAY_PROBE_VISIBLE = "\\u001b[31mNATIVE_TRANSCRIPT_SGR_PROBE_295\\u001b[0m";
@@ -72,7 +74,7 @@ const DETAILS_REQUEST_INSTRUCTION = "Please elaborate on these details in your n
 const BODY_HEADING = "Reviewed deployment sequence";
 const BODY_BULLET = "preserve the two independent native session identities";
 const BODY_CODE = 'nativeNotice.send({ mode: "follow-up" });';
-const BODY_SENTINEL = "DISTANT_NOTICE_BODY_SENTINEL_295: retain this notice until Close.";
+const BODY_SENTINEL = "DISTANT_NOTICE_BODY_SENTINEL_295: retained details remain available through this full body.";
 const BODY_CHECKPOINT_IDENTIFIERS = Array.from({ length: 12 }, (_, index) =>
   `Checkpoint ${String(index + 1).padStart(2, "0")}`);
 // This canned response proves the details enter an ordinary assistant
@@ -86,15 +88,11 @@ const KEY_CTRL_ALT_PAGE_DOWN = "\x1b[6;7~";
 const KEY_SHIFT_ALT_UP = "\x1b[1;4A";
 const KEY_SHIFT_ALT_DOWN = "\x1b[1;4B";
 const LONG_TURN_TIMEOUT_MS = EVENT_TIMEOUT_MS * 6;
-const SHARED_OVERLAY_MARGIN = 1;
+const SHARED_OVERLAY_VERTICAL_MARGIN = 1;
 const NATIVE_PANE_COLUMNS = OUTER_COLS - NATIVE_PANE_START;
-const SHARED_OVERLAY_COLUMNS = Math.min(
-  NATIVE_PANE_COLUMNS - 2 * SHARED_OVERLAY_MARGIN,
-  Math.floor(NATIVE_PANE_COLUMNS * 0.9),
-);
-const SHARED_OVERLAY_MAX_ROWS = Math.max(1, OUTER_ROWS - 2 * SHARED_OVERLAY_MARGIN);
-const SHARED_OVERLAY_START_COLUMN = SHARED_OVERLAY_MARGIN
-  + Math.floor((NATIVE_PANE_COLUMNS - 2 * SHARED_OVERLAY_MARGIN - SHARED_OVERLAY_COLUMNS) / 2);
+const SHARED_OVERLAY_COLUMNS = NATIVE_PANE_COLUMNS;
+const SHARED_OVERLAY_MAX_ROWS = Math.max(1, OUTER_ROWS - 2 * SHARED_OVERLAY_VERTICAL_MARGIN);
+const SHARED_OVERLAY_START_COLUMN = 0;
 
 const NOTICE_BODY = [
   `# ${BODY_HEADING}`,
@@ -106,7 +104,7 @@ const NOTICE_BODY = [
   "- Keep the human-readable explanation intact, including its Markdown structure.",
   "- A request for more information is a follow-up, not an interruption or an answer to another pending question.",
   "",
-  "> The notice remains pending after its details are sent. Only the explicit Close action removes this entry.",
+  "> More details consumes only this notice before its ordinary request is delivered; the separate question remains pending.",
   "",
   "## Delivery example",
   "```ts",
@@ -179,26 +177,46 @@ function nativePaneText(frame: string): string {
   return frame.split("\n").slice(1).map((line) => line.slice(NATIVE_PANE_START)).join("\n");
 }
 
-/**
- * The shared custom component is composited as a public overlay over Main's
- * actual pane. The popup helper derives its crop from the exact public width,
- * margin, and maxHeight options so transcript text underneath is not mistaken
- * for modal content.
- */
+/** Strip the full-width popup's left/right border from one verified content row. */
+function popupLineContent(line: string): string {
+  return line.replace(/^\s*│/u, "").replace(/│\s*$/u, "").trim();
+}
+
 function nativeSharedPopupLines(frame: string): string[] {
   const paneLines = nativePaneText(frame).split("\n").map((line) =>
     line.slice(SHARED_OVERLAY_START_COLUMN, SHARED_OVERLAY_START_COLUMN + SHARED_OVERLAY_COLUMNS));
-  const firstContentRow = paneLines.findIndex((line) =>
-    /^(?:Pending questions|Pending notices|q\d+:|n\d+:)/u.test(line.trimStart()));
-  const footerRow = paneLines.findIndex((line) => line.includes("arrows select"));
-  if (firstContentRow >= 0 && footerRow >= firstContentRow) {
-    const visibleContent = paneLines.slice(firstContentRow, footerRow + 1);
-    if (visibleContent.length < SHARED_OVERLAY_MAX_ROWS) return visibleContent;
+  for (let top = SHARED_OVERLAY_VERTICAL_MARGIN; top < paneLines.length; top += 1) {
+    if (!/^┌─+┐$/u.test(paneLines[top]!)) continue;
+    const bottom = paneLines.findIndex((line, index) => index > top && /^└─+┘$/u.test(line));
+    if (bottom <= top || bottom - top + 1 > SHARED_OVERLAY_MAX_ROWS
+      || bottom >= OUTER_ROWS - SHARED_OVERLAY_VERTICAL_MARGIN) return [];
+    const popupRows = paneLines.slice(top, bottom + 1);
+    const contentRows = popupRows.slice(1, -1);
+    if (contentRows.length === 0
+      || !contentRows.every((line) => line.startsWith("│") && line.endsWith("│"))) return [];
+    return contentRows.map(popupLineContent);
   }
-  // Long detail views occupy the full margin-bounded public maxHeight. Rows
-  // outside this range belong to Main's underlying transcript, not the
-  // custom overlay.
-  return paneLines.slice(0, SHARED_OVERLAY_MAX_ROWS);
+  // Never use the maximum-height region as a substitute for locating the
+  // visible border: short centered popups leave transcript rows above/below.
+  return [];
+}
+
+function assertNativePopupSpansConversationPane(frame: string, view: string): void {
+  const paneLines = nativePaneText(frame).split("\n");
+  const top = paneLines.findIndex((line) => line.startsWith("┌") && line.endsWith("┐"));
+  const bottom = top < 0 ? -1 : paneLines.findIndex((line, index) => index > top && line.startsWith("└") && line.endsWith("┘"));
+  assert.ok(top >= 0 && bottom > top, `${view} has a bordered popup in the native conversation pane`);
+  const rows = paneLines.slice(top, bottom + 1);
+  assert.equal(rows[0]!.startsWith("┌") && rows[0]!.endsWith("┐"), true,
+    `${view} border reaches the conversation pane's left and right edges`);
+  assert.equal(rows.at(-1)!.startsWith("└") && rows.at(-1)!.endsWith("┘"), true,
+    `${view} bottom border reaches the conversation pane's left and right edges`);
+  for (const [index, row] of rows.slice(1, -1).entries()) {
+    assert.ok(row.startsWith("│") && row.endsWith("│"),
+      `${view} content row ${index} reaches both conversation pane margins`);
+  }
+  assert.equal(rows[0]!.length >= NATIVE_PANE_COLUMNS, true,
+    `${view} outer rows span the complete conversation viewport, not the sidebar`);
 }
 
 function nativeSharedPopupText(frame: string): string {
@@ -448,46 +466,41 @@ async function waitForProvider(
   return providerJournalRecords(path);
 }
 
-async function selectNoticeRow(driver: MainPtyDriver): Promise<void> {
-  const frame = driver.currentText();
-  if (selectedEntryContains(frame, NOTICE_TITLE)) return;
-  assert.ok(selectedEntryContains(frame, QUESTION_MARKER),
-    "the shared pending list exposes a selected notice or the distinguishable question row");
-  const before = driver.frameRevision;
-  driver.pty.write(KEYS.up); // the shared list uses the same native arrow/confirm contract as AskUserQuestion
-  await driver.waitFrame((text) => selectedEntryContains(text, NOTICE_TITLE),
-    "the real shared list selects the earlier notice without selecting or answering the question", before);
+function anySharedPendingListVisible(frame: string): boolean {
+  return /Pending input \(\d+\)/u.test(nativeSharedPopupText(frame));
 }
 
 function sharedPendingListVisible(frame: string): boolean {
-  return sharedPopupContains(frame, "Pending questions and notices (2)")
-    && sharedPopupContains(frame, NOTICE_TITLE) && sharedPopupContains(frame, QUESTION_MARKER)
-    && (selectedEntryContains(frame, NOTICE_TITLE) || selectedEntryContains(frame, QUESTION_MARKER));
+  return sharedPopupContains(frame, "Pending input (4)")
+    && sharedPopupContains(frame, NOTICE_TITLE)
+    && sharedPopupContains(frame, CLOSE_NOTICE_TITLE)
+    && sharedPopupContains(frame, REMAINING_NOTICE_TITLE)
+    && sharedPopupContains(frame, QUESTION_MARKER)
+    && selectedEntryContains(frame, NOTICE_TITLE);
+}
+
+function noticesAndQuestionListVisible(frame: string): boolean {
+  return sharedPopupContains(frame, "Pending input (3)")
+    && sharedPopupContains(frame, NOTICE_TITLE)
+    && sharedPopupContains(frame, REMAINING_NOTICE_TITLE)
+    && sharedPopupContains(frame, QUESTION_MARKER)
+    && !sharedPopupContains(frame, CLOSE_NOTICE_TITLE);
+}
+
+function remainingNoticeQuestionListVisible(frame: string): boolean {
+  return sharedPopupContains(frame, "Pending input (2)")
+    && sharedPopupContains(frame, REMAINING_NOTICE_TITLE)
+    && sharedPopupContains(frame, QUESTION_MARKER)
+    && !sharedPopupContains(frame, NOTICE_TITLE)
+    && !sharedPopupContains(frame, CLOSE_NOTICE_TITLE);
 }
 
 function questionOnlyListVisible(frame: string): boolean {
-  return sharedPopupContains(frame, "Pending questions (1)")
-    && selectedEntryContains(frame, QUESTION_MARKER) && !selectedEntryContains(frame, NOTICE_TITLE);
-}
-
-async function ensureNoticeDetail(driver: MainPtyDriver): Promise<void> {
-  const current = driver.currentText();
-  if (actionRows(current).length === 2
-    && sharedPopupContains(current, NOTICE_TITLE)
-    && (sharedPopupContains(current, BODY_SENTINEL)
-      || BODY_CHECKPOINT_IDENTIFIERS.some((checkpoint) => sharedPopupContains(current, checkpoint)))) return;
-  if (!sharedPendingListVisible(driver.currentText())) {
-    const before = driver.frameRevision;
-    driver.pty.write(KEY_CTRL_ALT_UP); // the public pending-question Ctrl+Alt+Up shortcut
-    await driver.waitFrame(sharedPendingListVisible,
-      "the shared pending-notice/question popup opens through the AskUserQuestion shortcut", before);
-  }
-  await selectNoticeRow(driver);
-  const beforeDetail = driver.frameRevision;
-  driver.pty.write(KEYS.enter);
-  await driver.waitFrame((text) => sharedPopupContains(text, NOTICE_TITLE)
-    && sharedPopupContains(text, BODY_HEADING),
-  "Enter opens the selected notice's shared Markdown detail surface", beforeDetail);
+  return sharedPopupContains(frame, "Pending input (1)")
+    && selectedEntryContains(frame, QUESTION_MARKER)
+    && !sharedPopupContains(frame, NOTICE_TITLE)
+    && !sharedPopupContains(frame, CLOSE_NOTICE_TITLE)
+    && !sharedPopupContains(frame, REMAINING_NOTICE_TITLE);
 }
 
 async function selectAction(driver: MainPtyDriver, target: "More details" | "Close"): Promise<void> {
@@ -504,6 +517,38 @@ async function selectAction(driver: MainPtyDriver, target: "More details" | "Clo
   }
   assert.equal(selectedAction(driver.currentText()), target);
 }
+
+test("short shared-popup matcher rejects answer/body sentinels outside the actual borders", () => {
+  const outerRows = Array.from({ length: OUTER_ROWS + 1 }, () => " ".repeat(OUTER_COLS));
+  const popupTop = 20;
+  const insideBody = "NOTICE_BODY_SENTINEL_INSIDE_BORDER";
+  const aboveAnswer = "UNDERLAY_ANSWER_SENTINEL_ABOVE_BORDER";
+  const belowBody = "UNDERLAY_BODY_SENTINEL_BELOW_BORDER";
+  const outerRow = (paneLine: string): string =>
+    " ".repeat(NATIVE_PANE_START) + paneLine.padEnd(NATIVE_PANE_COLUMNS, " ");
+  const border = (left: string, right: string): string =>
+    left + "─".repeat(NATIVE_PANE_COLUMNS - 2) + right;
+  const content = (text: string): string => `│${text}`.padEnd(NATIVE_PANE_COLUMNS - 1, " ") + "│";
+  const setPaneRow = (row: number, text: string): void => { outerRows[row + 1] = outerRow(text); };
+
+  setPaneRow(4, `Transcript ${aboveAnswer}`);
+  setPaneRow(popupTop, border("┌", "┐"));
+  setPaneRow(popupTop + 1, content(`n1: ${NOTICE_TITLE}`));
+  setPaneRow(popupTop + 2, content(insideBody));
+  setPaneRow(popupTop + 3, border("└", "┘"));
+  setPaneRow(44, `Underlying chat ${belowBody}`);
+  const frame = outerRows.join("\n");
+
+  assert.ok(4 < SHARED_OVERLAY_MAX_ROWS && 44 < SHARED_OVERLAY_MAX_ROWS,
+    "both underlay sentinels are inside the old maximum-height crop");
+  assert.ok(frameContains(frame, aboveAnswer) && frameContains(frame, belowBody),
+    "both sentinels are present in underlying pane rows");
+  assert.ok(sharedPopupContains(frame, insideBody), "complete notice body inside the actual border is matchable");
+  assert.equal(sharedPopupContains(frame, aboveAnswer), false,
+    "answer-like transcript text above the popup cannot satisfy an overlay assertion");
+  assert.equal(sharedPopupContains(frame, belowBody), false,
+    "body-like chat text below the popup cannot satisfy an overlay assertion");
+});
 
 test("real public Main shares native pending notice/question details and preserves origin/status ownership", {
   timeout: TEST_TIMEOUT_MS,
@@ -533,6 +578,14 @@ test("real public Main shares native pending notice/question details and preserv
       { toolCalls: [{
         toolName: "YouShouldKnow",
         arguments: { title: NOTICE_TITLE, body: NOTICE_BODY, context: NOTICE_CONTEXT },
+      }] },
+      { toolCalls: [{
+        toolName: "YouShouldKnow",
+        arguments: { title: CLOSE_NOTICE_TITLE, body: "Close must remove only this selected notice and send no request." },
+      }] },
+      { toolCalls: [{
+        toolName: "YouShouldKnow",
+        arguments: { title: REMAINING_NOTICE_TITLE, body: "This sibling notice remains pending until explicitly closed." },
       }] },
       { toolCalls: [{
         toolName: "AskUserQuestion",
@@ -629,16 +682,17 @@ test("real public Main shares native pending notice/question details and preserv
     && record.toolName === "AskUserQuestion" && record.pid === sessionA.record.pid),
   "the same native turn admits the real AskUserQuestion tool");
   await waitForProvider(providerSignal, providerJournalFile,
-    (records) => records.filter((record) => record.event === "model_request").length >= 3,
-    "the notice, question, and long running continuation are all real scripted model requests");
+    (records) => records.filter((record) => record.event === "model_request").length >= 5,
+    "the three notices, question, and long running continuation are real scripted model requests");
   await driver.waitFrame((text) => rowBadgeState(text, labelA) === "running"
     && rowHasInputBadge(text, labelA),
-  "A's real sidebar card observes running plus pending input while both entries are registered", beforePrompt);
+  "A's real sidebar card observes running plus pending input while notices and question are registered", beforePrompt);
 
   const beforeList = driver.frameRevision;
   driver.pty.write(KEY_CTRL_ALT_UP); // same public Ctrl+Alt+Up shortcut as the pending-question list
   await driver.waitFrame(sharedPendingListVisible,
     "the installed shared list displays the distinct notice and question entries", beforeList);
+  assertNativePopupSpansConversationPane(driver.currentText(), "shared pending list");
   assert.ok(frameContains(driver.currentText(), QUESTION_MARKER),
     "the shared list retains the rich pending question alongside the notice");
   assert.equal(selectedEntryContains(driver.currentText(), NOTICE_TITLE), true,
@@ -648,11 +702,40 @@ test("real public Main shares native pending notice/question details and preserv
   assert.equal(rowHasInputBadge(driver.currentText(), labelB), false,
     "the shared list does not leak A's pending status into B");
 
+  const requestCountBeforeClose = providerJournalRecords(providerJournalFile)
+    .filter((record) => record.event === "model_request").length;
+  assert.equal(requestCountBeforeClose, 5, "all scripted initial requests are present before either Close action");
+  const beforeCloseCandidate = driver.frameRevision;
+  driver.pty.write(KEYS.down);
+  await driver.waitFrame((frame) => selectedEntryContains(frame, CLOSE_NOTICE_TITLE),
+    "the shared list selects the separate Close candidate without disturbing the original notice or question", beforeCloseCandidate);
+  const beforeCloseCandidateDetails = driver.frameRevision;
+  driver.pty.write(KEYS.enter);
+  await driver.waitFrame((frame) => sharedPopupContains(frame, CLOSE_NOTICE_TITLE)
+    && sharedPopupContains(frame, "Close must remove only this selected notice"),
+  "the selected Close candidate opens its own native details", beforeCloseCandidateDetails);
+  await selectAction(driver, "Close");
+  const beforeCloseConfirm = driver.frameRevision;
+  driver.pty.write(KEYS.enter);
+  await driver.waitFrame(noticesAndQuestionListVisible,
+    "Close removes only its selected notice while the original notice, another notice, and question remain", beforeCloseConfirm);
+  assert.ok(!sharedPopupContains(driver.currentText(), CLOSE_NOTICE_TITLE), "the selected Close candidate is gone");
+  assert.equal(selectedEntryContains(driver.currentText(), NOTICE_TITLE), true,
+    "selection remains on a live sibling notice after Close");
+  assert.equal(rowHasInputBadge(driver.currentText(), labelA), true,
+    "the owner remains input-pending because sibling inputs remain");
+  assert.equal(rowHasInputBadge(driver.currentText(), labelB), false,
+    "closing A's notice does not affect sibling B's pending status");
+  assert.equal(providerJournalRecords(providerJournalFile)
+    .filter((record) => record.event === "model_request").length, requestCountBeforeClose,
+  "Close sends no provider request");
+
   const beforeDetail = driver.frameRevision;
   driver.pty.write(KEYS.enter);
   await driver.waitFrame((frame) => sharedPopupContains(frame, NOTICE_TITLE)
     && sharedPopupContains(frame, BODY_HEADING),
   "Enter opens the selected notice in the real shared Markdown detail surface", beforeDetail);
+  assertNativePopupSpansConversationPane(driver.currentText(), "notice detail");
   await revealFullMarkdownBody(driver, "ctrlAltPage");
   assert.equal(rowBadgeState(driver.currentText(), labelA), "running",
     "opening the long notice preserves A's observed busy state");
@@ -669,16 +752,31 @@ test("real public Main shares native pending notice/question details and preserv
   await driver.waitFrame((frame) => rowBadgeState(frame, labelA) === "running"
     && rowHasInputBadge(frame, labelA)
     && actionRows(frame).length === 0
-    && !sharedPendingListVisible(frame),
+    && !anySharedPendingListVisible(frame),
   "More details closes the shared editor-slot popup while queuing without interrupting A's actual running turn", beforeMoreDetails);
 
+  assert.equal(providerJournalRecords(providerJournalFile).filter((record) => record.event === "model_request").length, 5,
+    "A's busy continuation has not finished or begun the selected-details follow-up yet");
+  const beforeConsumedList = driver.frameRevision;
+  driver.pty.write(KEY_CTRL_ALT_UP);
+  await driver.waitFrame(remainingNoticeQuestionListVisible,
+    "More details consumes only its selected notice while the other notice and question remain pending", beforeConsumedList);
+  assert.equal(sharedPopupContains(driver.currentText(), NOTICE_TITLE), false,
+    "the selected More details notice is consumed");
+  assert.equal(rowHasInputBadge(driver.currentText(), labelA), true,
+    "the remaining notice and separate question keep A input-pending after More details");
+  const beforeRemainingListClose = driver.frameRevision;
+  driver.pty.write(KEYS.escape);
+  await driver.waitFrame((frame) => !sharedPopupContains(frame, "Pending input (1)"),
+    "Escape closes the remaining question list without dismissing its question", beforeRemainingListClose);
+
   const providerAfterDetails = await waitForProvider(providerSignal, providerJournalFile,
-    (records) => records.filter((record) => record.event === "model_request").length >= 4,
+    (records) => records.filter((record) => record.event === "model_request").length >= 6,
     "A's busy-safe More details delivery becomes a native model request after the original run",
     LONG_TURN_TIMEOUT_MS);
   assert.deepEqual(providerAfterDetails.filter((record) => record.event === "model_request")
-    .map((record) => record.requestIndex), [0, 1, 2, 3],
-  "only A issued the three initial requests and one selected-details follow-up; idle B issued none");
+    .map((record) => record.requestIndex), [0, 1, 2, 3, 4, 5],
+  "only A issued the five initial requests and one selected-details follow-up; idle B issued none");
   assert.equal(driver.records().filter((record) => record.type === "agent_start"
     && record.pid === sessionB.record.pid).length, 0, "B received no agent start or notice delivery");
   assert.equal(driver.records().filter((record) => record.type === "tool_call"
@@ -700,56 +798,56 @@ test("real public Main shares native pending notice/question details and preserv
     && frameContains(frame, DETAILS_REQUEST_INSTRUCTION)
     && frameContains(frame, NATIVE_MARKDOWN_DISPLAY_PROBE_VISIBLE)
     && actionRows(frame).length === 0
-    && !sharedPendingListVisible(frame),
+    && !anySharedPendingListVisible(frame),
   "the ordinary request and scripted assistant reply are visible in Main's native transcript after popup close, including the safely escaped SGR probe",
   -1, LONG_TURN_TIMEOUT_MS);
   // This deterministic reply verifies an ordinary native conversation turn,
-  // not the quality of model-generated elaboration. The notice remains in the
-  // pending list until the explicit Close action below.
+  // not the quality of model-generated elaboration. More details consumed the
+  // notice immediately; the independent question remains pending.
   await driver.waitForFrameQuiet("normal assistant reply and restored editor finish repainting");
-
-  await ensureNoticeDetail(driver);
-  assert.ok(sharedPopupContains(driver.currentText(), NOTICE_TITLE)
-    && sharedPopupContains(driver.currentText(), BODY_HEADING),
-  "More details leaves the notice pending and its shared detail view can be reopened at the body start");
-  await revealFullMarkdownBody(driver, "shiftAltArrow");
-  assert.ok(sharedPopupContains(driver.currentText(), BODY_SENTINEL)
-    && actionRows(driver.currentText()).length === 2,
-  "the reopened notice pages through its full body to expose the Close action");
   assert.equal(rowHasInputBadge(driver.currentText(), labelA), true,
-    "More details leaves A's shared pending-input status present");
-
-  const requestsBeforeClose = providerJournalRecords(providerJournalFile)
-    .filter((record) => record.event === "model_request").length;
-  assert.equal(requestsBeforeClose, 4, "the selected notice details have been delivered before the explicit Close");
-  await selectAction(driver, "Close");
-  const beforeClose = driver.frameRevision;
-  driver.pty.write(KEYS.enter);
-  await driver.waitFrame((frame) => rowHasInputBadge(frame, labelA)
-    && rowBadgeState(frame, labelA) === "waiting"
-    && actionRows(frame).length === 0,
-  "Close removes only the selected notice from the shared popup while the independent question keeps A input-pending", beforeClose);
-  await driver.waitForFrameQuiet("the shared popup closes or returns to the remaining question list");
+    "the pending question continues to keep A's input status present after the details reply");
   assert.equal(rowHasInputBadge(driver.currentText(), labelB), false,
-    "closing A's notice does not affect B's sidebar status");
+    "consuming A's notice does not affect B's sidebar status");
   assert.equal(providerJournalRecords(providerJournalFile)
-    .filter((record) => record.event === "model_request").length, requestsBeforeClose,
-  "Close removes the selected notice without sending any explanation or extra user turn");
+    .filter((record) => record.event === "model_request").length, 6,
+  "the selected notice details produced exactly one ordinary user turn");
 
-  // Close can return to the shared list or dismiss it; use only the already
-  // observed public shortcut when the existing question answer row is absent.
+  // Reopen the list to verify the unselected sibling notice survived More
+  // details, then Close it without creating another provider request.
   const current = driver.currentText();
-  if (!questionOnlyListVisible(current)) {
+  if (!remainingNoticeQuestionListVisible(current)) {
     const beforeQuestionList = driver.frameRevision;
     driver.pty.write(KEY_CTRL_ALT_UP);
-    await driver.waitFrame(questionOnlyListVisible,
-      "the same public shortcut reopens the remaining normal question after notice Close", beforeQuestionList);
+    await driver.waitFrame(remainingNoticeQuestionListVisible,
+      "the same public shortcut reopens the remaining notice and question after More details consumed its selection", beforeQuestionList);
   }
-  await driver.waitForFrameQuiet("the remaining native question list finishes opening before selection");
-  assert.ok(questionOnlyListVisible(driver.currentText()),
-    "the actual remaining question list is still selected after native rendering settles");
-  assert.equal(sharedPendingListVisible(driver.currentText()), false,
-    "the remaining question-only list no longer contains a pending notice");
+  await driver.waitForFrameQuiet("the remaining native notice/question list finishes opening before selection");
+  assert.ok(remainingNoticeQuestionListVisible(driver.currentText()),
+    "the unselected notice and question remain available after More details");
+  assert.equal(selectedEntryContains(driver.currentText(), REMAINING_NOTICE_TITLE), true,
+    "the remaining notice is selected in creation order");
+  const beforeRemainingNotice = driver.frameRevision;
+  driver.pty.write(KEYS.enter);
+  await driver.waitFrame((frame) => sharedPopupContains(frame, REMAINING_NOTICE_TITLE)
+    && actionRows(frame).length === 2,
+  "the preserved sibling notice opens its independent detail view", beforeRemainingNotice);
+  await selectAction(driver, "Close");
+  const requestsBeforeSiblingClose = providerJournalRecords(providerJournalFile)
+    .filter((record) => record.event === "model_request").length;
+  const beforeSiblingClose = driver.frameRevision;
+  driver.pty.write(KEYS.enter);
+  await driver.waitFrame(questionOnlyListVisible,
+    "Close removes only the preserved sibling notice and leaves the question available", beforeSiblingClose);
+  assert.equal(providerJournalRecords(providerJournalFile)
+    .filter((record) => record.event === "model_request").length, requestsBeforeSiblingClose,
+  "closing the remaining notice sends no provider request");
+  assert.equal(rowHasInputBadge(driver.currentText(), labelA), true,
+    "the remaining question keeps only owner A input-pending after Close");
+  assert.equal(rowHasInputBadge(driver.currentText(), labelB), false,
+    "closing A's sibling notice does not change B's pending status");
+  assert.equal(questionOnlyListVisible(driver.currentText()), true,
+    "the remaining question-only list contains no notice");
 
   const beforeAnswer = driver.frameRevision;
   driver.pty.write(KEYS.enter);
@@ -760,6 +858,7 @@ test("real public Main shares native pending notice/question details and preserv
     && sharedPopupContains(frame, `2. ${CHOICE_B}`)
     && sharedPopupContains(frame, `3. ${CHOICE_CONTROL_VISIBLE}`),
   "the remaining pending question still uses its normal native answer view", beforeAnswer);
+  assertNativePopupSpansConversationPane(driver.currentText(), "question answer view");
   const questionDetailLines = nativeSharedPopupLines(driver.currentText()).map((line) => line.trim());
   assert.ok(questionDetailLines.some((line) => line === "q1:"), "the native question ID stays separate from Markdown source");
   assert.ok(questionDetailLines.some((line) => line.includes(QUESTION_MARKER))
@@ -794,8 +893,8 @@ test("real public Main shares native pending notice/question details and preserv
   await driver.waitFrame((frame) => rowBadgeState(frame, labelA) === "running",
   "the question answer turn has a fresh real running sidebar observation", beforeSubmit);
   await waitForProvider(providerSignal, providerJournalFile,
-    (records) => records.filter((record) => record.event === "model_request").length >= 5,
-    "the normal question answer is the fifth A-owned scripted request");
+    (records) => records.filter((record) => record.event === "model_request").length >= 7,
+    "the normal question answer is the seventh A-owned scripted request");
   await driver.waitForRecords((records) => records.filter((record) => record.type === "agent_settled"
     && record.pid === sessionA.record.pid).length > settlesBeforeAnswer,
   "the normal native question-answer turn settles");
@@ -805,19 +904,19 @@ test("real public Main shares native pending notice/question details and preserv
   }, "the actual reporter/broker/sidebar clears A's pending status only after the question answer");
 
   const requests = providerJournalRecords(providerJournalFile).filter((record) => record.event === "model_request");
-  assert.deepEqual(requests.map((record) => record.requestIndex), [0, 1, 2, 3, 4],
+  assert.deepEqual(requests.map((record) => record.requestIndex), [0, 1, 2, 3, 4, 5, 6],
     "A's full native flow is locally scripted, ordered, and has no sibling model request");
-  assert.ok(String(requests[3]?.lastUserPreview ?? "").includes(NOTICE_TITLE),
+  assert.ok(String(requests[5]?.lastUserPreview ?? "").includes(NOTICE_TITLE),
     "the origin's model request starts with the selected notice details");
   const expectedDetailsRequest = `More details requested for "${NOTICE_TITLE}":\n\n${NOTICE_BODY}`
     + `\n\nRelevant context:\n${NOTICE_CONTEXT}\n\n${DETAILS_REQUEST_INSTRUCTION}`;
-  assert.equal(requests[3]?.lastUserMessage, expectedDetailsRequest,
+  assert.equal(requests[5]?.lastUserMessage, expectedDetailsRequest,
     "the native provider request retains the exact raw body/context and adds only explicit elaboration prose");
-  assert.ok(String(requests[3]?.lastUserMessage ?? "").includes(NATIVE_MARKDOWN_DISPLAY_PROBE),
+  assert.ok(String(requests[5]?.lastUserMessage ?? "").includes(NATIVE_MARKDOWN_DISPLAY_PROBE),
     "the controlled raw SGR probe reaches the real scripted model request unchanged");
-  assert.ok(String(requests[4]?.lastUserPreview ?? "").includes(QUESTION_TEXT),
+  assert.ok(String(requests[6]?.lastUserPreview ?? "").includes(QUESTION_TEXT),
     "the normal question answer is delivered as its own later user message");
-  assert.equal(requests[4]?.lastUserMessage,
+  assert.equal(requests[6]?.lastUserMessage,
     `Answer to pending question "${QUESTION_TEXT}": ${CHOICE_CONTROL_RAW}`,
     "the escaped native choice still reaches the owner model as its exact raw selected value");
 

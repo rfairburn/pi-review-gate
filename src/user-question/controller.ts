@@ -17,11 +17,12 @@
  *   callbacks after shutdown are rejected the same way.
  * - Async questions resolve out-of-band: an answer is delivered through the
  *   host's ordinary user-message path — `deliverAs: "steer"` while the agent
- *   is busy, a plain immediate send when idle. A notice's explicit More details
- *   request uses that same path but never removes the notice; only Close does.
- *   The optional feature gate applies only to admitting new notices; it never
- *   deletes pending notices or disables their More details/Close actions. Neither
- *   path aborts the run, and no reminder, deadline, or fabricated answer exists.
+ *   is busy, a plain immediate send when idle. More details consumes only the
+ *   selected notice before using that same path; delivery failure never
+ *   restores it. The optional feature gate applies only to admitting new
+ *   notices; it never deletes pending notices or disables their More details/
+ *   Close actions. Neither path aborts the run, and no reminder, deadline, or
+ *   fabricated answer exists.
  * - Sync questions resolve through a waiter held by the tool execution; a
  *   decline resolves it with a terminating result, and session shutdown
  *   settles every remaining waiter so nothing can hang.
@@ -140,6 +141,8 @@ export class UserQuestionController {
   private readonly noticeDetailsInFlight = new Map<string, PendingNotice>();
   private readonly stateListeners = new Set<() => void>();
   private currentIdentity: object | undefined;
+  /** Separates reused IDs even when a host rebinds the same SessionManager object. */
+  private sessionEpoch = 0;
   private nextId = 1;
   private nextNoticeId = 1;
 
@@ -168,6 +171,7 @@ export class UserQuestionController {
 
   /** Begin (or re-begin after switch/new/fork/reload) a session. Returns false when the identity is unusable. */
   beginSession(identity: unknown): boolean {
+    this.sessionEpoch += 1;
     if (!isObjectIdentity(identity)) {
       this.currentIdentity = undefined;
       return false;
@@ -188,6 +192,7 @@ export class UserQuestionController {
 
   /** End the current session: settle every waiter and drop all pending state. */
   endSession(): void {
+    this.sessionEpoch += 1;
     for (const waiter of this.waiters.values()) {
       settleWaiter(waiter, { outcome: "settled" });
     }
@@ -400,23 +405,42 @@ export class UserQuestionController {
   }
 
   /**
-   * Deliver the complete notice body and optional context through the current
-   * session's ordinary message path. The notice is never removed here; only
-   * {@link closeNotice} settles it. Delivery failures leave it available for
-   * another deliberate request.
+   * Consume the selected notice before checking delivery readiness or using
+   * the current session's ordinary message path. `expectedNotice` is the
+   * private record snapshot retained by the closing popup: it prevents a stale
+   * callback from resolving a reused per-session ID to a replacement record.
+   * Once the live selection is accepted, it is never restored after failure.
    */
-  async requestNoticeDetails(id: string, source?: QuestionSubmitSource): Promise<boolean> {
+  async requestNoticeDetails(
+    id: string,
+    source?: QuestionSubmitSource,
+    expectedNotice?: PendingNotice,
+  ): Promise<boolean> {
     const record = this.pending.get(id);
-    if (!record || !isPendingNotice(record) || !this.isCurrentPending(record)) return false;
+    if (!record || !isPendingNotice(record) || (expectedNotice !== undefined && record !== expectedNotice)
+      || !this.isCurrentPending(record) || !this.isSessionBound(record.sessionIdentity)) return false;
     if (this.noticeDetailsInFlight.get(id) === record) return false;
+
+    const epoch = this.sessionEpoch;
     this.noticeDetailsInFlight.set(id, record);
     try {
+      const message = formatNoticeDetailsDelivery(record);
+      // Consume as soon as this exact live selection is accepted. Even a
+      // missing host sender or a failing idle probe must not resurrect it.
+      if (!this.remove(id, record)) return false;
+      if (this.sessionEpoch !== epoch || this.currentIdentity !== record.sessionIdentity
+        || this.pending.has(id) || !this.isSessionBound(record.sessionIdentity)) return false;
+
       const host = this.deps.pi as Partial<QuestionMessageHost> | undefined;
       const send = isRecord(host) ? host.sendUserMessage : undefined;
-      if (typeof send !== "function" || !this.isCurrentPending(record)) return false;
-      const message = formatNoticeDetailsDelivery(record);
+      if (typeof send !== "function") return false;
+      if (this.sessionEpoch !== epoch || this.currentIdentity !== record.sessionIdentity
+        || this.pending.has(id) || !this.isSessionBound(record.sessionIdentity)) return false;
+
       const idle = source?.isIdle ? source.isIdle() : true;
-      if (!this.isCurrentPending(record)) return false;
+      if (this.sessionEpoch !== epoch || this.currentIdentity !== record.sessionIdentity
+        || this.pending.has(id) || !this.isSessionBound(record.sessionIdentity)) return false;
+
       if (!idle) {
         await send.call(host, message, { deliverAs: "steer" });
       } else {
@@ -488,9 +512,11 @@ export class UserQuestionController {
     return this.isNoticeFeatureEnabled();
   }
 
-  private remove(id: string): void {
-    this.pending.delete(id);
+  private remove(id: string, expected?: PendingUserInput): boolean {
+    if (expected !== undefined && this.pending.get(id) !== expected) return false;
+    if (!this.pending.delete(id)) return false;
     this.notifyState();
+    return true;
   }
 
   private deliverAsyncAnswer(

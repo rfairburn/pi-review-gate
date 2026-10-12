@@ -25,7 +25,8 @@
  *    driven through the same component: native Tab path completion, the
  *    fd-backed `@` picker, Ctrl+C clears (never cancels) through the host's
  *    copied app handler, Ctrl+G external editing of the field instance,
- *    Ctrl+V image paste to a temp path, Shift+Enter newlines with intact
+ *    Ctrl+V image paste to a temp path, exact bracketed multiline `.png`
+ *    paste visibility before another keypress, Shift+Enter newlines with intact
  *    multi-line submission, Esc list-first dismissal, and user keybinding
  *    overrides. Both tiers drive through the createBridgeUi host simulator
  *    and simulated app-handler bodies (the real-host tier additionally runs
@@ -34,6 +35,9 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { UserQuestionController } from "../src/user-question/controller";
 test.afterEach(() => {
@@ -188,8 +192,10 @@ async function makeWiringFixture(options: WiringFixtureOptions): Promise<WiringF
   assert.equal(acquired.kind, "acquired", `acquisition succeeds: ${JSON.stringify(acquired)}`);
   const handle = (acquired as { kind: "acquired"; handle: NativeEditorFieldHandle }).handle;
 
-  const opened = ui.custom!((_tui: unknown, _theme: unknown, _keybindings: unknown, close: (value: string | undefined) => void) => {
+  const opened = ui.custom!((tui: unknown, theme: unknown, liveKeybindings: unknown, close: (value: string | undefined) => void) => {
     handle.prepare("");
+    assert.equal(handle.isolatePromptForOverlay(tui, theme, liveKeybindings), true,
+      "the production popup path isolates prompt rendering without replacing the active editor");
     return createQuestionListComponent({
       controller,
       keybindings: options.keys ?? componentKeys(),
@@ -482,6 +488,8 @@ test("wiring: a session-reset abort ends the episode and restores the draft into
 
       assert.equal(fixture.instances[0]!.getText(), "precious draft", "the displaced chat draft is back in the instance");
       assert.equal(fixture.handle.instance.fieldActive, false, "the open episode was ended");
+      assert.deepEqual(fixture.instances[0]!.render(80), ["─".repeat(80), "[field:precious draft]"],
+        "session reset restores ordinary rendering on the same host-owned editor");
     },
   });
 
@@ -710,8 +718,19 @@ async function makeRealFixture(options: RealFixtureOptions): Promise<RealFixture
   const loaded = await loadRealBridgeHost();
   if (!loaded) return undefined;
   let fixtureRef: RealFixture | undefined;
-  setNativeEditorHost(loaded.host);
   const instances: FakeBridgeEditor[] = [];
+  const NativeCustomEditor = loaded.host.CustomEditor;
+  setNativeEditorHost({
+    ...loaded.host,
+    CustomEditor: class extends NativeCustomEditor {
+      constructor(tui: unknown, theme: unknown, keybindings: unknown, options?: unknown) {
+        super(tui, theme, keybindings, options);
+        // Observe the exact host-created instance at the public factory seam;
+        // this is the object the bridge must keep as the active slot owner.
+        instances.push(this as unknown as FakeBridgeEditor);
+      }
+    },
+  });
   const sent: RealFixture["sent"] = [];
   const controller = new UserQuestionController({
     pi: {
@@ -740,6 +759,7 @@ async function makeRealFixture(options: RealFixtureOptions): Promise<RealFixture
   }
   const { ui, state } = createBridgeUi({
     theme: REAL_IDENTITY_THEME,
+    customTheme: THEME,
     keybindings,
     draft: options.draft ?? "chat draft",
     provider,
@@ -752,8 +772,10 @@ async function makeRealFixture(options: RealFixtureOptions): Promise<RealFixture
   if (acquired.kind !== "acquired") throw new Error(`real acquisition failed: ${JSON.stringify(acquired)}`);
   const handle = acquired.handle;
 
-  const opened = ui.custom!((_tui: unknown, _theme: unknown, _keybindings: unknown, close: (value: string | undefined) => void) => {
+  const opened = ui.custom!((tui: unknown, theme: unknown, hostKeybindings: unknown, close: (value: string | undefined) => void) => {
     handle.prepare("");
+    assert.equal(handle.isolatePromptForOverlay(tui, theme, hostKeybindings), true,
+      "the production popup path isolates prompt rendering without replacing the active editor");
     return createQuestionListComponent({
       controller,
       keybindings, // the live manager drives both the component and the instance
@@ -761,6 +783,7 @@ async function makeRealFixture(options: RealFixtureOptions): Promise<RealFixture
       shortcutLabel: "Ctrl+Alt+Up",
       tuiHost: {
         matchesKey: (data: string, keyId: string) => keyId === QUESTION_LIST_SHORTCUT_KEY && data === CHORD,
+        visibleWidth: (text: string) => (loaded.tui.visibleWidth as (value: string) => number)(text),
       },
       nativeField: handle.instance,
       onDone: (result) => {
@@ -808,6 +831,82 @@ function createRealKeybindingsManagerWithOverrides(
 function plainLines(tui: Record<string, unknown>, lines: string[]): string[] {
   const marker = typeof tui.CURSOR_MARKER === "string" ? (tui.CURSOR_MARKER as string) : "\x1b_pi:c\x07";
   return lines.map((line) => line.split(marker).join(""));
+}
+
+function stripSgr(line: string): string {
+  return line.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+/**
+ * Recover the native text rows from the first bordered popup frame. The exact
+ * popup-side borders, one-cell popup padding, and two-cell answer-row indent
+ * are structural; content glyphs and editor padding are otherwise preserved.
+ */
+function nativeEditorTextRowsInPopup(
+  tui: Record<string, unknown>,
+  frameRows: string[],
+  nativeEditorBox: string[],
+): string[] {
+  const top = frameRows.findIndex((line) => /^┌─+┐$/u.test(line));
+  const bottom = top < 0 ? -1 : frameRows.findIndex((line, index) => index > top && /^└─+┘$/u.test(line));
+  assert.ok(top >= 0 && bottom > top, `the first post-paste frame has a bounded popup: ${frameRows.join("\n")}`);
+  const popupWidth = frameRows[top]!.length;
+  assert.equal(frameRows[bottom]!.length, popupWidth, "popup borders have the same measured width");
+  const popupContentRows = frameRows.slice(top + 1, bottom);
+  assert.ok(popupContentRows.every((line) => line.length === popupWidth
+    && line.startsWith("│") && line.endsWith("│")),
+  `every popup content row is enclosed by its vertical borders: ${frameRows.join("\n")}`);
+
+  const editorWidth = popupWidth - 6; // outer border + popup padding + the two-cell answer-row indent
+  const editorStart = 4; // left border + popup padding + answer-row indent
+  const editorEnd = editorStart + editorWidth;
+  assert.ok(editorWidth > 0 && editorEnd === popupWidth - 2,
+    "the measured editor box fits exactly between popup padding cells");
+  const embeddedRows = popupContentRows.map((line) => line.slice(editorStart, editorEnd));
+  assert.ok(nativeEditorBox.every((line) => typeof line === "string"),
+    `the host theme rendered editor borders rather than undefined rows: ${frameRows.join("\n")}`);
+  const renderedBox = plainLines(tui, nativeEditorBox).map(stripSgr);
+  assert.ok(renderedBox.length >= 3, "the native editor rendered its top border, content, and bottom border");
+  assert.ok(renderedBox[0]!.startsWith("─") && renderedBox.at(-1)!.startsWith("─"),
+    "the real editor's border formatter returned both horizontal borders");
+  assert.ok(renderedBox.every((line) => line.length === editorWidth),
+    "the captured native editor rows match the measured popup editor width");
+
+  let embeddedAt = -1;
+  for (let start = 0; start <= embeddedRows.length - renderedBox.length; start += 1) {
+    if (renderedBox.every((line, offset) => embeddedRows[start + offset] === line)) {
+      embeddedAt = start;
+      break;
+    }
+  }
+  assert.ok(embeddedAt >= 0,
+    `the exact native editor box is present inside the bounded popup: ${frameRows.join("\n")}`);
+  return renderedBox.slice(1, -1);
+}
+
+/** Match every expected character in order across rendered wrap rows. */
+function renderedRowsContainOrderedText(rows: readonly string[], expected: string): boolean {
+  let offset = 0;
+  for (const row of rows) {
+    if (offset === expected.length) return true;
+    if (expected[offset] === "\n") offset += 1; // logical editor newline: the next rendered row
+    if (offset === expected.length) return true;
+
+    const leadingSpaces = /^ */u.exec(row)?.[0].length ?? 0;
+    let bestMatch = 0;
+    for (let start = 0; start <= leadingSpaces; start += 1) {
+      let matched = 0;
+      while (offset + matched < expected.length
+        && expected[offset + matched] !== "\n"
+        && row[start + matched] === expected[offset + matched]) {
+        matched += 1;
+      }
+      if (matched > 0 && /^ *$/u.test(row.slice(start + matched))) bestMatch = Math.max(bestMatch, matched);
+    }
+    if (bestMatch === 0) return false;
+    offset += bestMatch;
+  }
+  return offset === expected.length;
 }
 
 test("real host: `/se` in the question free-text row never lists slash commands and submits raw text", async (t) => {
@@ -1012,6 +1111,187 @@ test("real host: Ctrl+V image paste inserts the temp path into the answer", asyn
   await fixture.settled;
   assert.equal(fixture.sent.length, 1);
   assert.match(fixture.sent[0]!.message, new RegExp(FAKE_IMAGE_PATH.replace(/\//g, "\\/")));
+});
+
+test("real host: bracketed multiline paste shows the complete owned .png path before submit and restores the draft", async (t) => {
+  const loaded = await loadRealBridgeHost();
+  if (!loaded) {
+    skipOrFail(t, "no installed Pi is resolvable in this environment");
+    return;
+  }
+  realHostAfter(t);
+
+  const imageRoot = await mkdtemp(join(tmpdir(), "pi-question-paste-"));
+  t.after(async () => rm(imageRoot, { recursive: true, force: true }));
+  const imageDirectory = join(imageRoot, "My Screenshots");
+  await mkdir(imageDirectory, { recursive: true });
+  const imagePath = join(imageDirectory, `clipboard-${"image-".repeat(6)}owned.png`);
+  await writeFile(imagePath, Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+    "base64",
+  ));
+
+  const savedDraft = "  preserve this exact chat draft\nwith its second line  ";
+  const pastedAnswer = [
+    imagePath,
+    "OCR notes: the complete clipboard path must be visible without another keypress.",
+    `long line: ${"the first settled frame preserves the full answer and attachment path. ".repeat(2)}`,
+    "tail sentinel: bracketed paste is complete",
+  ].join("\n");
+  const fixture = await makeRealFixture({
+    draft: savedDraft,
+    withProvider: false,
+    questions: [{ question: "Attach a screenshot?", choices: ["none"] }],
+    driver: (component, fixture) => {
+      enterEditing(component);
+      const field = fixture.handle.instance;
+      assert.equal(field, fixture.instances[0], "the captured host factory instance remains the active popup field");
+      const renderForPopup = field.renderForPopup;
+      assert.ok(renderForPopup, "the host field exposes its popup render path");
+      let firstNativeEditorBox: string[] | undefined;
+      field.renderForPopup = (width) => {
+        const rendered = renderForPopup.call(field, width);
+        firstNativeEditorBox ??= rendered;
+        return rendered;
+      };
+
+      const bracketedPaste = `\x1b[200~${pastedAnswer}\x1b[201~`;
+      component.handleInput?.(bracketedPaste);
+
+      // Observe the first render after the complete paste; do not send a
+      // Backspace, retype, or other input before checking the terminal frame.
+      const firstFrameRows = plainLines(loaded.tui, component.render!(120)).map(stripSgr);
+      const firstSettledFrame = firstFrameRows.join("\n");
+      assert.ok(!firstFrameRows.some((line) => line.includes("undefined")),
+        `the first frame has no undefined editor-border row: ${firstSettledFrame}`);
+      assert.ok(firstNativeEditorBox, "the first popup render observed the native editor's own rows");
+      const nativeTextRows = nativeEditorTextRowsInPopup(loaded.tui, firstFrameRows, firstNativeEditorBox);
+      assert.ok(renderedRowsContainOrderedText(nativeTextRows, imagePath),
+        `the complete owned image path, including .png, is visible in order in the first post-paste frame: ${firstSettledFrame}`);
+      assert.ok(renderedRowsContainOrderedText(nativeTextRows, pastedAnswer),
+        `the complete multiline answer is visible in order before another keypress: ${firstSettledFrame}`);
+      assert.equal(field.getText(), pastedAnswer, "the field contains the exact bracketed-paste payload");
+      component.handleInput?.(ENTER_KEY);
+    },
+  });
+  if (!fixture) return;
+
+  await fixture.settled;
+  assert.equal(fixture.sent.length, 1);
+  assert.equal(
+    fixture.sent[0]!.message,
+    `Answer to pending question "Attach a screenshot?": ${pastedAnswer}`,
+    "the submitted message preserves the exact canonical multiline answer",
+  );
+  assert.equal(fixture.state.draft, savedDraft, "submit restores the exact suspended chat draft");
+  assert.deepEqual(fixture.state.chatSubmits, [], "the pasted answer never enters the chat submit path");
+});
+
+test("real host: isolated free text keeps native actions on the popup and restores the exact chat draft", async (t) => {
+  const loaded = await loadRealBridgeHost();
+  if (!loaded) {
+    skipOrFail(t, "no installed Pi is resolvable in this environment");
+    return;
+  }
+  realHostAfter(t);
+
+  const savedDraft = "  exact chat draft\nwith a second line  ";
+  const externalEdits: string[] = [];
+  const clipboardText = " [clipboard insertion]";
+  const submitted = await makeRealFixture({
+    draft: savedDraft,
+    withProvider: false,
+    questions: [{ question: "Which database?", choices: ["SQLite"] }],
+    appHandlers: {
+      "app.editor.external": (editor) => () => {
+        const content = editor.getExpandedText();
+        externalEdits.push(content);
+        editor.setText(`${content} [externally edited]`);
+      },
+    },
+    onPasteImage: (editor) => () => editor.insertTextAtCursor(clipboardText),
+    driver: (component, fixture) => {
+      const cursorMarker = typeof loaded.tui.CURSOR_MARKER === "string"
+        ? loaded.tui.CURSOR_MARKER as string
+        : "\x1b_pi:c\x07";
+      const assertPromptIsolated = (expectedPopupText: string): void => {
+        const popup = component.render!(120).join("\n");
+        const ordinaryRows = fixture.instances[0]!.render(120);
+        const ordinaryPrompt = ordinaryRows.join("\n");
+        assert.ok(popup.includes(expectedPopupText), `answer remains visible in the popup: ${popup}`);
+        assert.equal(fixture.handle.instance.focused, true, "the same native editor owns popup input focus");
+        assert.equal(popup.split("\x1b[7m").length - 1, 1,
+          `the popup has exactly one inverse-video native caret: ${popup}`);
+        assert.equal(popup.split(cursorMarker).length - 1, 1,
+          `the popup has exactly one hardware-cursor marker: ${popup}`);
+        assert.deepEqual(ordinaryRows, [], "the underlying prompt contributes no editor rows while the popup owns the field");
+        assert.equal(ordinaryPrompt.includes(expectedPopupText), false,
+          `answer text is absent from the ordinary prompt: ${ordinaryPrompt}`);
+        assert.equal(ordinaryPrompt.includes(cursorMarker), false,
+          `the native cursor marker is absent from the ordinary prompt: ${ordinaryPrompt}`);
+        assert.equal(ordinaryPrompt.includes("\x1b[7m"), false,
+          `the unfocused native editor's inverse fake cursor is absent from the ordinary prompt: ${ordinaryPrompt}`);
+      };
+
+      assert.equal(fixture.instances.length, 1, "the host-owned native field is the only editor created for the popup");
+      assert.equal(fixture.handle.instance, fixture.instances[0],
+        "the popup field remains the host's active editor-slot owner");
+      enterEditing(component);
+      typeText(component, "discard this draft");
+      assertPromptIsolated("discard this draft");
+      component.handleInput?.(CTRL_C);
+      assert.equal(fixture.handle.instance.getText(), "", "Ctrl+C clears the popup field");
+
+      typeText(component, "answer");
+      component.handleInput?.(CTRL_G);
+      assert.deepEqual(externalEdits, ["answer"], "Ctrl+G reads the popup field through the host's dynamic editor target");
+      component.handleInput?.(CTRL_V);
+      const expectedAnswer = `answer [externally edited]${clipboardText}`;
+      assert.equal(fixture.handle.instance.getText(), expectedAnswer,
+        "external-editor and clipboard actions modify the popup field, not the prompt renderer");
+      assertPromptIsolated(expectedAnswer);
+      component.handleInput?.(ENTER_KEY);
+    },
+  });
+  if (!submitted) return;
+  await submitted.settled;
+  assert.equal(submitted.sent.length, 1);
+  assert.equal(submitted.sent[0]!.message, 'Answer to pending question "Which database?": answer [externally edited] [clipboard insertion]');
+  assert.equal(submitted.state.draft, savedDraft, "submit restores the exact suspended chat draft");
+  assert.equal(submitted.handle.instance.getText(), savedDraft, "the same host editor regains the exact independent chat draft");
+  assert.equal(submitted.handle.instance.focused, false, "the ordinary editor is unfocused after the popup closes");
+  const restoredPrompt = submitted.handle.instance.render(120).join("\n");
+  assert.ok(restoredPrompt.includes("exact chat draft"), `ordinary prompt rendering returns after submit: ${restoredPrompt}`);
+  assert.ok(restoredPrompt.includes("\x1b[7m"),
+    "the real unfocused native editor still emits its inverse fake cursor when ordinary rendering is restored");
+  assert.deepEqual(submitted.state.chatSubmits, [], "the answer never enters the chat submit path");
+
+  for (const closeMode of ["cancel", "toggle"] as const) {
+    const fixture = await makeRealFixture({
+      draft: savedDraft,
+      withProvider: false,
+      questions: [{ question: "Which database?", choices: ["SQLite"] }],
+      driver: (component) => {
+        enterEditing(component);
+        typeText(component, `partial ${closeMode} draft`);
+        if (closeMode === "cancel") {
+          component.handleInput?.(ESCAPE_KEY); // leave native editing
+          component.handleInput?.(ESCAPE_KEY); // return to the pending list
+          component.handleInput?.(ESCAPE_KEY); // close without submitting
+        } else {
+          component.handleInput?.(CHORD); // close the overlay without submitting
+        }
+      },
+    });
+    if (!fixture) return;
+    await fixture.settled;
+    assert.equal(fixture.state.draft, savedDraft, `${closeMode} restores the exact chat draft`);
+    assert.equal(fixture.handle.instance.getText(), savedDraft, `${closeMode} restores the draft into the original editor`);
+    assert.ok(fixture.handle.instance.render(120).join("\n").includes("exact chat draft"),
+      `${closeMode} restores ordinary editor rendering`);
+    assert.equal(fixture.sent.length, 0, `${closeMode} does not submit an answer`);
+    assert.equal(fixture.controller.listPending().length, 1, `${closeMode} leaves the question pending`);
+  }
 });
 
 test("real host: Shift+Enter inserts a newline and the multi-line answer submits intact", async (t) => {

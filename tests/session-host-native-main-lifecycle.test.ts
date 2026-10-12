@@ -47,6 +47,7 @@ import {
   KEYS,
   MainPtyDriver,
   OBSERVER_FIXTURE,
+  OUTER_COLS,
   TEST_TIMEOUT_MS,
   type OwnedSession,
   type RuntimePin,
@@ -100,6 +101,38 @@ function nativePaneText(frame: string): string {
 function frameContains(frame: string, needle: string): boolean {
   const collapse = (text: string): string => text.replace(/\s+/g, "");
   return collapse(nativePaneText(frame)).includes(collapse(needle));
+}
+
+function popupContains(frame: string, needle: string): boolean {
+  const paneWidth = OUTER_COLS - 33;
+  const rows = nativePaneText(frame).split("\n")
+    .map((line) => line.slice(0, paneWidth));
+  const top = rows.findIndex((line) => /^┌─+┐$/u.test(line));
+  if (top < 0) return false;
+  const bottom = rows.findIndex((line, index) => index > top && /^└─+┘$/u.test(line));
+  if (bottom < 0) return false;
+  const contentRows = rows.slice(top + 1, bottom);
+  if (!contentRows.every((line) => line.startsWith("│") && line.endsWith("│"))) return false;
+  const content = contentRows.map((line) => line.slice(1, -1)).join("\n");
+  const collapse = (text: string): string => text.replace(/\s+/g, "");
+  return collapse(content).includes(collapse(needle));
+}
+
+function assertPopupSpansConversationPane(frame: string, view: string): void {
+  const paneWidth = OUTER_COLS - 33;
+  const rows = nativePaneText(frame).split("\n").map((line) => line.slice(0, paneWidth));
+  const top = rows.findIndex((line) => /^┌─+┐$/u.test(line));
+  const bottom = top < 0 ? -1 : rows.findIndex((line, index) => index > top && /^└─+┘$/u.test(line));
+  assert.ok(top >= 0 && bottom > top, `${view} has a bordered popup in the native conversation pane`);
+  const popup = rows.slice(top, bottom + 1);
+  assert.ok(popup[0]!.startsWith("┌") && popup[0]!.endsWith("┐"),
+    `${view} top border reaches both conversation-pane margins`);
+  assert.ok(popup.at(-1)!.startsWith("└") && popup.at(-1)!.endsWith("┘"),
+    `${view} bottom border reaches both conversation-pane margins`);
+  assert.ok(popup.slice(1, -1).every((line) => line.startsWith("│") && line.endsWith("│")),
+    `${view} content rows leave no exposed left or right conversation margin`);
+  assert.ok(popup.every((line) => !line.includes(INITIAL_PROMPT)),
+    `${view} rows do not interleave the underlying prompt with popup text`);
 }
 
 function assertSidebarHasNoQuestionContent(frame: string): void {
@@ -466,8 +499,8 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
 
   // The collapsed pending-question panel line is visible in A's native pane.
   const panelLine = process.platform === "darwin"
-    ? "Pending questions · Press Ctrl+Option+Up"
-    : "Pending questions · Press Ctrl+Alt+Up";
+    ? "Pending input · Press Ctrl+Option+Up"
+    : "Pending input · Press Ctrl+Alt+Up";
   await driver.waitFrame((frame) => frameContains(frame, panelLine),
     "real pending-question panel line in A's native frame", beforePrompt);
   assertSidebarHasNoQuestionContent(driver.currentText());
@@ -507,21 +540,23 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
   // Open the real pending-question list through the public shortcut.
   const beforeList = driver.frameRevision;
   driver.pty.write(KEY_CTRL_ALT_UP);
-  await driver.waitFrame((frame) => frameContains(frame, "Pending questions (1)")
-    && frameContains(frame, `q1: ${QUESTION_TEXT}`)
-    && frameContains(frame, "arrows select · Enter answer · Esc defer and close"),
+  await driver.waitFrame((frame) => popupContains(frame, "Pending input (1)")
+    && popupContains(frame, `q1: ${QUESTION_TEXT}`)
+    && popupContains(frame, "arrows select · Enter answer · Shift+Alt+Up/Down or Ctrl+Alt+PageUp/PageDown scroll · Esc defer and close"),
     "real pending-question list opens with the scripted question", beforeList);
+  assertPopupSpansConversationPane(driver.currentText(), "pending list");
 
   // Enter answer mode.
   const beforeAnswer = driver.frameRevision;
   driver.pty.write(KEYS.enter);
-  await driver.waitFrame((frame) => frameContains(frame, `q1: ${QUESTION_TEXT}`)
-    && frameContains(frame, `1. ${CHOICE_A}`)
-    && frameContains(frame, `2. ${CHOICE_B}`)
-    && frameContains(frame, "Type something…")
-    && frameContains(frame, "Decline (no answer will be sent)")
-    && frameContains(frame, "arrows select · Enter confirm · Esc back"),
+  await driver.waitFrame((frame) => popupContains(frame, `q1: ${QUESTION_TEXT}`)
+    && popupContains(frame, `1. ${CHOICE_A}`)
+    && popupContains(frame, `2. ${CHOICE_B}`)
+    && popupContains(frame, "Type something…")
+    && popupContains(frame, "Decline (no answer will be sent)")
+    && popupContains(frame, "arrows select · Enter confirm · Shift+Alt+Up/Down or Ctrl+Alt+PageUp/PageDown scroll · Esc back"),
     "real answer mode shows the scripted choices plus free text and decline", beforeAnswer);
+  assertPopupSpansConversationPane(driver.currentText(), "question answer view");
 
   // Submit the approved canned choice.
   const beforeSubmit = driver.frameRevision;

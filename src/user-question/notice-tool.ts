@@ -3,9 +3,9 @@
  *
  * Registers a non-interactive notice in the same session-local pending list
  * as AskUserQuestion. The full Markdown body and optional context remain in
- * the controller until the user explicitly closes the notice; More details
- * closes the popup and becomes an ordinary, checked request for a normal
- * conversation elaboration without settling the notice.
+ * the controller until the user explicitly closes the notice or requests More
+ * details; that action closes the popup, consumes the notice, then makes an
+ * ordinary, checked request for a normal conversation elaboration.
  */
 
 import type { UserQuestionController } from "./controller";
@@ -36,13 +36,13 @@ export function createYouShouldKnowTool(controller: UserQuestionController): You
     label: "You should know",
     description:
       "Show the user a notice with a compact title and its full Markdown body. "
-      + "The notice stays pending until the user closes it; More details closes the popup and asks for elaboration in a normal conversation reply with the full body and optional context.",
+      + "The notice stays pending until the user closes it or requests More details; that action closes the popup and consumes the notice before delivery, and a delivery failure does not restore it.",
     promptSnippet:
-      "YouShouldKnow — show a user notice using a compact title, full Markdown body, and optional context; More details asks for an ordinary conversation elaboration, while Close dismisses only the notice.",
+      "YouShouldKnow — show a user notice using a compact title, full Markdown body, and optional context; More details consumes the notice before asking for ordinary conversation elaboration, while Close dismisses it without sending.",
     promptGuidelines: [
       "Use YouShouldKnow to present information the user should see without asking them to decide or answer.",
       "Keep title compact, and put the complete substantial content in body as Markdown; use context only for relevant additional context.",
-      "The notice remains pending until the user chooses Close. More details closes the popup and delivers its full body and context with an explicit request for elaboration in a normal conversation reply.",
+      "The notice remains pending until the user chooses Close or requests More details. More details closes the popup, consumes the notice, and delivers its full body and context with an explicit request for elaboration in a normal conversation reply.",
     ],
     executionMode: "sequential",
     parameters: youShouldKnowSchema(),
@@ -69,7 +69,7 @@ export function createYouShouldKnowTool(controller: UserQuestionController): You
           type: "text",
           text:
             `Notice registered as ${registered.notice.id}: "${visibleTerminalText(registered.notice.title)}". `
-            + "It stays pending until the user closes it from the pending-item list.",
+            + "It stays pending until the user closes it or requests More details from the pending-item list.",
         }],
         details: { status: "pending", id: registered.notice.id, kind: "notice" },
       };

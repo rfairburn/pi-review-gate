@@ -3,7 +3,7 @@ import test, { afterEach } from "node:test";
 import { setHostKeybindingLoader } from "../src/host-keybindings";
 import { safeMarkdownDisplaySource } from "../src/markdown-safety";
 import { visibleTerminalText } from "../src/tool-result-text";
-import { UserQuestionController } from "../src/user-question/controller";
+import { UserQuestionController, type PendingNotice } from "../src/user-question/controller";
 import { createQuestionListComponent, QUESTION_LIST_SHORTCUT_KEY } from "../src/user-question/components";
 import {
   registerUserQuestions,
@@ -111,6 +111,18 @@ function markdownHost(created: string[], widths: number[] = []) {
   };
 }
 
+function popupContentLines(text: string): string[] {
+  return text.split("\n").flatMap((line) => {
+    if (/^┌─+┐$/u.test(line) || /^└─+┘$/u.test(line)) return [];
+    if (line.startsWith("│") && line.endsWith("│")) return [line.slice(2, -2).replace(/ +$/u, "")];
+    return [line];
+  });
+}
+
+function popupContentText(text: string): string {
+  return popupContentLines(text).join("\n");
+}
+
 function terminalColumns(text: string): number {
   let columns = 0;
   for (const character of text.replace(/\x1b\[[0-9;]*m/g, "")) {
@@ -182,7 +194,7 @@ test("registered YouShouldKnow shares admission, controller state, and the exist
   assert.equal(fixture.widgets.at(-1)?.key, "review-gate-pending-questions", "no new status channel or widget key is introduced");
 });
 
-test("feature-off rejects only new notices and preserves existing More details, Close, and questions", async () => {
+test("feature-off rejects new notices but preserves existing More details, Close, and questions", async () => {
   let featureEnabled = true;
   const fixture = makeFixture(undefined, {
     isNoticeFeatureEnabled: () => featureEnabled,
@@ -194,6 +206,11 @@ test("feature-off rejects only new notices and preserves existing More details, 
   }, undefined, undefined, { sessionManager: fixture.identity });
   assert.equal((notice.details as { status: string }).status, "pending");
   const noticeId = (notice.details as { id: string }).id;
+  const closeCandidate = await noticeTool.execute("n-call-close", {
+    title: "Separate close candidate",
+    body: "Closing this notice sends nothing.",
+  }, undefined, undefined, { sessionManager: fixture.identity });
+  assert.equal((closeCandidate.details as { id: string }).id, "n2");
 
   featureEnabled = false;
   const disabledNotice = await noticeTool.execute("n-call-disabled", {
@@ -201,22 +218,27 @@ test("feature-off rejects only new notices and preserves existing More details, 
     body: "New notices are rejected while the feature is disabled.",
   }, undefined, undefined, { sessionManager: fixture.identity });
   assert.deepEqual(disabledNotice.details, { status: "rejected", reason: "feature-disabled" });
-  assert.equal(fixture.surface.controller.listPending().length, 1, "the rejected registration does not disturb the existing notice");
+  assert.equal(fixture.surface.controller.listPending().length, 2, "the rejected registration does not disturb existing notices");
 
-  assert.equal(await fixture.surface.controller.requestNoticeDetails(noticeId), true, "feature-off does not block More details for an existing notice");
+  const selectedNotice = fixture.surface.controller.getPending(noticeId);
+  assert.ok(selectedNotice && "kind" in selectedNotice && selectedNotice.kind === "notice");
+  assert.equal(await fixture.surface.controller.requestNoticeDetails(noticeId, undefined, selectedNotice), true,
+    "feature-off does not block More details for an existing notice");
   assert.equal(fixture.sent.length, 1);
-  assert.equal(fixture.surface.controller.listPending().length, 1, "More details leaves the notice pending");
+  assert.deepEqual(fixture.surface.controller.listPending().map((entry) => entry.id), ["n2"],
+    "More details consumes only the selected notice");
+  assert.equal(fixture.surface.controller.closeNotice("n2"), true, "feature-off still allows explicitly closing another existing notice");
+  assert.equal(fixture.surface.controller.listPending().length, 0);
 
   const question = await fixture.tools.get("AskUserQuestion")!.execute("q-call-independent", {
     question: "Is AskUserQuestion still available?",
   }, undefined, undefined, { sessionManager: fixture.identity });
   assert.equal((question.details as { status: string }).status, "pending", "the notice feature gate does not disable questions");
-  assert.equal(fixture.surface.controller.listPending().length, 2);
-  assert.equal(fixture.surface.controller.closeNotice(noticeId), true, "feature-off still allows explicitly closing an existing notice");
-  assert.equal(fixture.surface.controller.listPending()[0]!.id, "q1", "closing the notice does not touch the question");
+  assert.equal(fixture.surface.controller.listPending().length, 1);
+  assert.equal(fixture.surface.controller.listPending()[0]!.id, "q1", "notice actions do not disable or consume questions");
 });
 
-test("the shared popup renders rich questions and notices; More details closes it before delivery and retains the notice", async () => {
+test("the bordered shared popup renders rich questions and notices; More details consumes only its selected notice", async () => {
   setHostKeybindingLoader(() => ({}));
   const created: string[] = [];
   const widths: number[] = [];
@@ -250,17 +272,24 @@ test("the shared popup renders rich questions and notices; More details closes i
     onDone(result) { outcomes.push(result); },
   });
   const list = component.render(48).join("\n");
-  assert.match(list, /Pending questions and notices \(2\)/);
+  assert.match(list, /Pending input \(2\)/);
   assert.match(list, /q1: # Retention choices/);
   assert.match(list, /n1: Deployment status \[notice\]/);
 
   component.handleInput(ENTER); // open the question detail first
-  component.handleInput(PAGE_UP); // read the opening Markdown before navigating answer rows
-  const questionFrame = component.render(48).join("\n");
+  component.handleInput(PAGE_UP); // return to the opening Markdown before navigating answer rows
+  let questionFrame = component.render(48).join("\n");
+  const questionFrames = [questionFrame];
+  for (let page = 0; page < 20 && !popupContentText(questionFrame).includes("native:kind=question"); page += 1) {
+    component.handleInput(PAGE_DOWN);
+    questionFrame = component.render(48).join("\n");
+    questionFrames.push(questionFrame);
+  }
+  const questionContent = questionFrames.map(popupContentText).join("\n");
   assert.ok(created.includes(questionText), "the complete unprefixed question body uses the same Markdown renderer");
-  assert.match(questionFrame, /native:# Retention choices/, "a leading question heading stays structural Markdown");
-  assert.match(questionFrame, /native:- Keep the owning session\./);
-  assert.match(questionFrame, /native:kind=question/);
+  assert.match(questionContent, /native:# Retention choices/, "a leading question heading stays structural Markdown");
+  assert.match(questionContent, /native:- Keep the owning session\./);
+  assert.match(questionContent, /native:kind=question/);
   component.handleInput(ESCAPE); // return without answering
   component.handleInput(DOWN); // select the notice
   component.handleInput(ENTER);
@@ -271,7 +300,7 @@ test("the shared popup renders rich questions and notices; More details closes i
   assert.doesNotMatch(firstNoticeFrame, /Native Markdown unavailable/);
   assert.ok(created.includes(body), "the exact full Markdown body is sent to native Markdown");
   assert.ok(created.includes(context), "the complete context is also rendered, not summarized");
-  assert.ok(widths.includes(48), "the Markdown component receives the current render width");
+  assert.ok(widths.includes(44), "the Markdown component receives the current inner width after border and padding");
 
   // The shared custom surface pages the complete body/context through its
   // common viewport, including after a live resize.
@@ -285,10 +314,12 @@ test("the shared popup renders rich questions and notices; More details closes i
     frames.push(frame);
     if (frame === frames[frames.length - 2]) break;
   }
-  const completeView = frames.join("\n");
+  const completeView = frames.map(popupContentText).join("\n");
+  const compactCompleteView = completeView.replace(/native:/gu, "").replace(/\s+/gu, "");
   const normalizedView = completeView.replace(/\s+/gu, " ");
   for (let index = 1; index <= 18; index += 1) {
-    assert.ok(completeView.includes(`Body paragraph ${index} contains the complete detail.`), `shared popup scrolling reaches body paragraph ${index}`);
+    const expectedParagraph = `Body paragraph ${index} contains the complete detail.`.replace(/\s+/gu, "");
+    assert.ok(compactCompleteView.includes(expectedParagraph), `shared popup scrolling reaches body paragraph ${index}`);
   }
   assert.match(completeView, /BODY-END/);
   for (let index = 1; index <= 12; index += 1) {
@@ -304,11 +335,16 @@ test("the shared popup renders rich questions and notices; More details closes i
 
   component.setSourceProbe({ isIdle: () => false });
   component.handleInput(ENTER); // More details closes this custom surface first.
-  assert.deepEqual(outcomes, [{ kind: "notice-details", noticeId: "n1" }]);
+  assert.equal(outcomes.length, 1);
+  assert.equal((outcomes[0] as { kind?: string }).kind, "notice-details");
+  const noticeDetails = outcomes[0] as { kind: "notice-details"; noticeId: string; expectedNotice: PendingNotice };
+  assert.equal(noticeDetails.noticeId, "n1");
+  assert.equal(noticeDetails.expectedNotice, fixture.surface.controller.getPending("n1"),
+    "the closing UI retains the exact private record identity for the owner handoff");
   assert.deepEqual(component.render(48), [], "the normal chat/editor view is restored before owner delivery");
   assert.equal(fixture.sent.length, 0, "the component only reports the deliberate request; delivery follows custom close");
-  assert.equal(fixture.surface.controller.listPending().length, 2, "More details leaves both items pending");
-  assert.equal(await fixture.surface.controller.requestNoticeDetails("n1", { isIdle: () => false }), true);
+  assert.equal(fixture.surface.controller.listPending().length, 2, "the owning surface consumes after the popup closes");
+  assert.equal(await fixture.surface.controller.requestNoticeDetails("n1", { isIdle: () => false }, noticeDetails.expectedNotice), true);
   assert.equal(fixture.sent.length, 1);
   assert.deepEqual(fixture.sent[0]!.options, { deliverAs: "steer" });
   assert.equal(
@@ -317,6 +353,11 @@ test("the shared popup renders rich questions and notices; More details closes i
     "the ordinary owner request preserves the complete body/context and explicitly asks for elaboration",
   );
 
+  const closeCandidate = await fixture.tools.get("YouShouldKnow")!.execute("n-call-close-candidate", {
+    title: "Close candidate",
+    body: "Close must not dispatch another request.",
+  }, undefined, undefined, { sessionManager: fixture.identity });
+  assert.equal((closeCandidate.details as { id: string }).id, "n2");
   const closeComponent = createQuestionListComponent({
     controller: fixture.surface.controller,
     keybindings,
@@ -326,7 +367,7 @@ test("the shared popup renders rich questions and notices; More details closes i
     getViewportRows: viewportRows,
     onDone() {},
   });
-  closeComponent.handleInput(DOWN); // select the retained notice in the same list flow
+  closeComponent.handleInput(DOWN); // select the independent close candidate after q1
   closeComponent.handleInput(ENTER);
   closeComponent.handleInput(DOWN); // Close
   closeComponent.handleInput(ENTER);
@@ -358,23 +399,27 @@ test("question Markdown fallback discloses and preserves the complete safe quest
   component.handleInput(ENTER);
   const detail = component.render(4096).join("\n");
   assert.match(detail, /Native Markdown unavailable; showing the complete question as plain text\./);
-  assert.equal(detail.split("\n")[0], "q1:", "question ID metadata stays outside Markdown content");
-  assert.ok(detail.includes("# Full question heading"));
-  assert.ok(detail.includes("- Preserve every choice."));
-  assert.ok(detail.includes("raw=\\u001b[31mQUESTION-END"));
-  assert.match(detail, /QUESTION-END/);
+  const detailContent = popupContentLines(detail).filter((line) => line.trim().length > 0);
+  assert.equal(detailContent[0], "q1:", "question ID metadata stays outside Markdown content");
+  assert.ok(detailContent.join("\n").includes("# Full question heading"));
+  assert.ok(detailContent.join("\n").includes("- Preserve every choice."));
+  assert.ok(detailContent.join("\n").includes("raw=\\u001b[31mQUESTION-END"));
+  assert.match(detailContent.join("\n"), /QUESTION-END/);
   assertNoRawTerminalControls(detail);
 });
 
-test("notice details use normal idle delivery, preserve failures, and reject reentrant requests", async () => {
+test("More details consumes before host delivery, never restores failure, and rejects reentrant sends", async () => {
   const identity = { id: "delivery-session" };
   let fail = true;
   let calls = 0;
+  let controller: UserQuestionController;
   const deliveryOptions: Array<{ deliverAs?: "steer" | "followUp" } | undefined> = [];
-  const controller = new UserQuestionController({
+  controller = new UserQuestionController({
     uiAvailable: () => true,
     pi: {
       sendUserMessage(_message: string, options?: { deliverAs?: "steer" | "followUp" }) {
+        assert.equal(controller.listPending().some((record) => record.id === "n1"), false,
+          "the selected notice is consumed before the host send callback begins");
         calls += 1;
         deliveryOptions.push(options);
         return fail ? Promise.reject(new Error("send failed")) : Promise.resolve();
@@ -391,45 +436,94 @@ test("notice details use normal idle delivery, preserve failures, and reject ree
   assert.ok(registered.ok);
   if (!registered.ok) return;
 
-  // The first request is initiated synchronously and owns the reentrancy lock;
-  // a concurrent second click cannot dispatch a duplicate message.
-  const first = controller.requestNoticeDetails(registered.notice.id, { isIdle: () => true });
-  const duplicate = await controller.requestNoticeDetails(registered.notice.id, { isIdle: () => false });
+  // The first request removes its exact record and owns the reentrancy lock
+  // before invoking the host. A concurrent stale callback cannot duplicate it.
+  const first = controller.requestNoticeDetails(registered.notice.id, { isIdle: () => true }, registered.notice);
+  const duplicate = await controller.requestNoticeDetails(registered.notice.id, { isIdle: () => false }, registered.notice);
   assert.equal(duplicate, false);
   assert.equal(calls, 1);
   assert.equal(await first, false, "a failed host delivery is reported internally as a failure");
-  assert.equal(controller.listPending().length, 1, "failure leaves the notice pending");
+  assert.equal(controller.listPending().length, 0, "failure does not restore the selected notice");
+  assert.equal(await controller.requestNoticeDetails(registered.notice.id, { isIdle: () => true }, registered.notice), false,
+    "the consumed original cannot be retried through the same UI snapshot");
+  assert.equal(calls, 1);
 
   fail = false;
-  assert.equal(await controller.requestNoticeDetails(registered.notice.id, { isIdle: () => true }), true);
-  assert.equal(calls, 2);
-  assert.deepEqual(deliveryOptions, [undefined, undefined], "idle requests use ordinary non-steering delivery");
-  assert.equal(controller.listPending().length, 1, "successful More details still does not dismiss the notice");
+  const busy = controller.registerNotice({ toolCallId: "n2", title: "Busy delivery", body: "Body." }, identity);
+  assert.ok(busy.ok);
+  if (!busy.ok) return;
+  assert.equal(await controller.requestNoticeDetails(busy.notice.id, { isIdle: () => false }, busy.notice), true);
+  assert.deepEqual(deliveryOptions, [undefined, { deliverAs: "steer" }],
+    "idle uses ordinary delivery and actual busy state uses non-interrupting steering");
+  assert.equal(controller.listPending().length, 0);
 });
 
-test("stale notice contexts cannot deliver or close an item in a replacement session", async () => {
+test("More details consumes before delivery readiness failures", async () => {
+  const identity = { id: "readiness-session" };
+  const missingSender = new UserQuestionController({ uiAvailable: () => true, pi: {} });
+  missingSender.beginSession(identity);
+  const missing = missingSender.registerNotice({ toolCallId: "missing-sender", title: "Unavailable", body: "Full body." }, identity);
+  assert.ok(missing.ok);
+  if (!missing.ok) return;
+  assert.equal(await missingSender.requestNoticeDetails(missing.notice.id, undefined, missing.notice), false);
+  assert.equal(missingSender.listPending().length, 0, "a missing send method does not restore the selected notice");
+
+  let sends = 0;
+  const failingProbe = new UserQuestionController({
+    uiAvailable: () => true,
+    pi: { sendUserMessage() { sends += 1; } },
+  });
+  failingProbe.beginSession(identity);
+  const notice = failingProbe.registerNotice({ toolCallId: "idle-probe", title: "Probe failure", body: "Full body." }, identity);
+  assert.ok(notice.ok);
+  if (!notice.ok) return;
+  assert.equal(await failingProbe.requestNoticeDetails(notice.notice.id, {
+    isIdle() { throw new Error("readiness probe failed"); },
+  }, notice.notice), false);
+  assert.equal(sends, 0, "a failing idle probe prevents delivery");
+  assert.equal(failingProbe.listPending().length, 0, "a failing readiness probe does not restore the selected notice");
+});
+
+test("stale and reused notice IDs cannot consume or deliver a replacement record", async () => {
   const identity = { id: "source-session" };
   const sent: string[] = [];
-  const controller = new UserQuestionController({
+  let controller: UserQuestionController;
+  let replaceOnRemoval = false;
+  let replacementNotice: PendingNotice | undefined;
+  controller = new UserQuestionController({
     uiAvailable: () => true,
     pi: { sendUserMessage(message: string) { sent.push(message); } },
+    onStateChange: () => {
+      if (!replaceOnRemoval || controller.listPending().length !== 0) return;
+      replaceOnRemoval = false;
+      // Reuse the same SessionManager object and notice ID while the original
+      // consume notification is reentrant; the epoch and record guard must
+      // keep the old callback from reaching this new record.
+      controller.beginSession(identity);
+      const replacement = controller.registerNotice({
+        toolCallId: "replacement-call",
+        title: "Replacement",
+        body: "A stale callback cannot consume this body.",
+      }, identity);
+      assert.ok(replacement.ok);
+      if (replacement.ok) replacementNotice = replacement.notice;
+    },
   });
   controller.beginSession(identity);
   const registered = controller.registerNotice({ toolCallId: "n1", title: "Notice", body: "Full body." }, identity);
   assert.ok(registered.ok);
   if (!registered.ok) return;
+  replaceOnRemoval = true;
 
-  const replacement = { id: "replacement-session" };
-  const result = await controller.requestNoticeDetails(registered.notice.id, {
-    isIdle: () => {
-      controller.beginSession(replacement);
-      return true;
-    },
-  });
-  assert.equal(result, false, "identity is rechecked after the live idle probe");
-  assert.equal(controller.closeNotice(registered.notice.id), false, "a stale close cannot act in the replacement session");
+  assert.equal(await controller.requestNoticeDetails(registered.notice.id, { isIdle: () => true }, registered.notice), false,
+    "a same-object session rebind during removal prevents the old delivery");
+  assert.equal(controller.listPending().length, 1);
+  assert.equal(controller.getPending("n1"), replacementNotice, "the replacement record survives its reused ID");
+  assert.equal(await controller.requestNoticeDetails("n1", { isIdle: () => true }, registered.notice), false,
+    "a callback carrying the old record identity cannot consume the replacement notice");
+  assert.equal(controller.getPending("n1"), replacementNotice);
+  assert.equal(controller.closeNotice("n1"), true, "the current notice remains independently closable");
   assert.deepEqual(sent, []);
-  assert.equal(controller.listPending().length, 0, "the ordinary session reset fence clears old pending input");
 });
 
 test("component resizing and theme invalidation rebuild native Markdown at the new width", () => {
@@ -456,7 +550,7 @@ test("component resizing and theme invalidation rebuild native Markdown at the n
   component.handleInput(ENTER);
   component.render(70);
   component.render(32);
-  assert.deepEqual(widths.slice(0, 2), [70, 32], "a resize rerenders native Markdown with the current width");
+  assert.deepEqual(widths.slice(0, 2), [66, 28], "a resize rerenders native Markdown at terminal width minus border and padding");
   const before = created.length;
   component.invalidate(); // host theme invalidation
   component.render(32);
@@ -490,15 +584,15 @@ test("an unavailable native Markdown peer is disclosed and shows the complete wr
   component.handleInput(ENTER);
   const frames: string[] = [];
   for (let index = 0; index < 100; index += 1) {
-    frames.push(component.render(14).join("\n"));
+    frames.push(component.render(18).join("\n"));
     const previous = frames[frames.length - 1];
     component.handleInput(PAGE_DOWN);
-    const next = component.render(14).join("\n");
+    const next = component.render(18).join("\n");
     if (next === previous) break;
   }
-  const fullView = frames.join("\n");
+  const fullView = frames.map(popupContentText).join("\n");
   fallbackViewportRows = 10_000;
-  const normalizedView = component.render(14).join("\n").replace(/\s+/gu, " ");
+  const normalizedView = popupContentText(component.render(18).join("\n")).replace(/\s+/gu, " ");
   const flattened = fullView.replace(/\n/g, "");
   const visibleLines = fullView.split("\n");
   assert.match(normalizedView, /Native Markdown unavailable; showing the complete notice as plain text\./);
@@ -517,7 +611,7 @@ test("an unavailable native Markdown peer is disclosed and shows the complete wr
   assert.match(normalizedView, /More details/);
   assert.match(normalizedView, /Close/);
   for (const line of visibleLines) {
-    assert.ok(terminalColumns(line) <= 14, `plain fallback line fits the requested terminal width: ${JSON.stringify(line)}`);
+    assert.ok(terminalColumns(line) <= 18, `plain fallback line fits the requested terminal width: ${JSON.stringify(line)}`);
   }
 });
 
@@ -535,7 +629,7 @@ test("notice tool result visibly encodes title controls while canonical and More
   const resultText = (result.content as Array<{ type: string; text: string }>)[0]!.text;
   assert.equal(
     resultText,
-    `Notice registered as n1: "${visibleTerminalText(title)}". It stays pending until the user closes it from the pending-item list.`,
+    `Notice registered as n1: "${visibleTerminalText(title)}". It stays pending until the user closes it or requests More details from the pending-item list.`,
   );
   assert.ok(!resultText.includes(body), "the compact tool result must not echo substantive notice content");
   assert.ok(!resultText.includes("\u001b]"));
@@ -602,7 +696,7 @@ test("notice Markdown converts only control bytes and keeps theme ANSI and Markd
   assert.ok(!list.includes("\u009b"));
   component.handleInput(ENTER);
 
-  const nativeView = component.render(1000).join("\n");
+  const nativeView = popupContentText(component.render(1000).join("\n"));
   assert.deepEqual(nativeInputs, [expectedBody, expectedContext]);
   assert.ok(nativeInputs[0]!.includes("## Keep \\*literal emphasis\\* and **real bold**\n"));
   assert.ok(nativeInputs[0]!.includes("```ts\nconst fence = 1;\n```"), "CRLF closing fences stay structural Markdown newlines");
@@ -610,8 +704,11 @@ test("notice Markdown converts only control bytes and keeps theme ANSI and Markd
   if (!canonical || !("kind" in canonical) || canonical.kind !== "notice") assert.fail("registered notice remains canonical");
   assert.equal(canonical.body, body, "native CRLF normalization never changes the retained original");
   assert.equal(canonical.context, context, "native input preprocessing never changes retained context");
-  assert.ok(nativeView.includes(expectedBody));
-  assert.ok(nativeView.includes(expectedContext));
+  assert.ok(nativeView.includes("## Keep \\*literal emphasis\\* and **real bold**"));
+  assert.ok(nativeView.includes("const fence = 1;"));
+  assert.ok(nativeView.includes("Backslashes: \\\\ path;"));
+  assert.ok(nativeView.includes("Context \\[escaped link\\] and *real emphasis*."));
+  assert.ok(nativeView.includes("Literal slash: \\ stays literal;"));
   assert.ok(nativeView.includes(`\u001b[95mn1: ${safeTitle}\u001b[39m`), "the title is encoded before native theme styling");
   assert.ok(nativeView.includes("\u001b[92m"), "action styling is neither stripped nor encoded");
   for (const hostileControl of ["\u001b]0;title", "\u001b[31m", "\u009b", "\u009d", "\u009c", "\r", "\u0007"]) {
@@ -660,7 +757,7 @@ test("the shared safe Markdown adapter protects same-source question and notice 
   component.handleInput(ESCAPE);
   component.handleInput(DOWN);
   component.handleInput(ENTER); // notice body is the exact same source string
-  const noticeView = component.render(1000).join("\n");
+  const noticeView = popupContentText(component.render(1000).join("\n"));
 
   assert.deepEqual(nativeInputs, [
     "# Cached \\u001b[31mMarkdown\\u001b[0m with \\*literal emphasis\\*",
@@ -693,17 +790,18 @@ test("plain notice fallback visibly encodes hostile controls once and keeps comp
   });
   component.handleInput(ENTER);
   const displayed = component.render(4096).join("\n");
+  const displayedContent = popupContentText(displayed);
   const encodedBody = visibleTerminalText(body);
-  assert.match(displayed, /Native Markdown unavailable; showing the complete notice as plain text\./);
+  assert.match(displayedContent, /Native Markdown unavailable; showing the complete notice as plain text\./);
   const encodedTitle = visibleTerminalText(title);
-  assert.ok(displayed.includes(encodedTitle));
-  assert.ok(!displayed.includes(visibleTerminalText(encodedTitle)), "the title is not encoded twice");
-  assert.ok(displayed.includes(encodedBody), "the complete body appears with one reversible encoding pass");
-  assert.ok(!displayed.includes(visibleTerminalText(encodedBody)), "the body is not encoded twice");
-  assert.ok(displayed.includes(visibleTerminalText(context)), "the complete context appears with one reversible encoding pass");
-  assert.ok(displayed.includes("😀"));
-  assert.match(displayed, /BODY-END/);
-  assert.match(displayed, /CONTEXT-END/);
+  assert.ok(displayedContent.includes(encodedTitle));
+  assert.ok(!displayedContent.includes(visibleTerminalText(encodedTitle)), "the title is not encoded twice");
+  assert.ok(displayedContent.includes(encodedBody), "the complete body appears with one reversible encoding pass");
+  assert.ok(!displayedContent.includes(visibleTerminalText(encodedBody)), "the body is not encoded twice");
+  assert.ok(displayedContent.includes(visibleTerminalText(context)), "the complete context appears with one reversible encoding pass");
+  assert.ok(displayedContent.includes("😀"));
+  assert.match(displayedContent, /BODY-END/);
+  assert.match(displayedContent, /CONTEXT-END/);
   assert.match(displayed, /More details/);
   assert.match(displayed, /Close/);
   assert.notEqual(encodedBody, visibleTerminalText(encodedBody), "the encoder is intentionally not idempotent");

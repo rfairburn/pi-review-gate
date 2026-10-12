@@ -8,9 +8,9 @@
  *   (active by default under Pi's registered-tool policy, discoverable through
  *   tool_search, reasserted by the deferred manager).
  * - A persistent collapsed panel above the chat editor (a widget): it shows
- *   only "Pending questions · Press <chord>" — never question text — while
- *   questions are pending, stays visible through chat output without taking
- *   focus, and is removed when no questions remain.
+ *   only "Pending input · Press <chord>" — never question or notice content —
+ *   while any input is pending, stays visible through chat output without
+ *   taking focus, and is removed when no inputs remain.
  * - The pending-question list UI behind the approved shortcut
  *   (Ctrl+Alt+Up; Ctrl+Option+Up on macOS), registered only when the chord is
  *   not already used by a built-in Pi binding. When registration is
@@ -41,7 +41,7 @@ import {
   type NativeEditorFieldSemantics,
 } from "../native-editor-bridge";
 import { registerHook, sendNotice } from "../pi";
-import { UserQuestionController, type QuestionSubmitSource } from "./controller";
+import { UserQuestionController, type PendingNotice, type QuestionSubmitSource } from "./controller";
 import {
   createQuestionListComponent,
   QUESTION_LIST_SHORTCUT_KEY,
@@ -61,11 +61,11 @@ export const USER_QUESTION_PANEL_KEY = "review-gate-pending-questions";
  * platform chord. Question text must never appear while collapsed.
  */
 export function pendingQuestionPanelLine(): string {
-  return `Pending questions · Press ${questionShortcutLabel()}`;
+  return `Pending input · Press ${questionShortcutLabel()}`;
 }
 
-const QUESTION_LIST_DESCRIPTION = "Open the pending question and notice list (answer questions, request notice details, or close notices)";
-const QUESTION_POPUP_OVERLAY_MARGIN = 1;
+const QUESTION_LIST_DESCRIPTION = "Open the pending input list (answer questions, request notice details, or close notices)";
+const QUESTION_POPUP_VERTICAL_MARGIN = 1;
 
 /** Platform label for the approved chord; Alt is Option on macOS. */
 export function questionShortcutLabel(): string {
@@ -297,7 +297,7 @@ async function openQuestionList(
   const openedAt = bindingGenerationNow();
   const stale = (): boolean => bindingGenerationNow() !== openedAt;
   if (controller.listPending().length === 0) {
-    await sendNotice(pi, "review gate: no pending questions");
+    await sendNotice(pi, "review gate: no pending input");
     return;
   }
   // Resolve the per-press ui guarded: a stale context's getter may throw,
@@ -318,7 +318,7 @@ async function openQuestionList(
   if (!isRecord(ui) || typeof custom !== "function") {
     await sendNotice(
       pi,
-      `review gate: the pending-question list UI is not available in this host; questions stay pending (${controller.listPending().length} pending)`,
+      `review gate: the pending input list UI is not available in this host; inputs stay pending (${controller.listPending().length} pending)`,
     );
     return;
   }
@@ -404,13 +404,14 @@ async function openQuestionList(
       // and start the field empty so the displaced chat draft can never show
       // or submit as an answer.
       handle?.prepare("");
+      const nativeField = handle?.isolatePromptForOverlay(tui, theme, keybindings) ? handle.instance : undefined;
       const component = createQuestionListComponent({
         controller,
         keybindings: resolveLiveKeybindings(keybindings, tuiHost),
         theme: toUiTheme(theme),
         tuiHost,
         shortcutLabel: questionShortcutLabel(),
-        nativeField: handle?.instance,
+        nativeField,
         isStale: stale,
         requestRender,
         getViewportRows: () => questionPopupViewportRows(tui),
@@ -433,9 +434,14 @@ async function openQuestionList(
   const noticeDetails = noticeDetailsResult(customResult);
   if (noticeDetails && !stale()) {
     // `ui.custom()` has resolved and restored the normal editor before the
-    // ordinary owner-session message is delivered. Request failure or a stale
-    // session leaves the notice pending in the controller.
-    await controller.requestNoticeDetails(noticeDetails.noticeId, sourceProbeOf(ctx));
+    // ordinary owner-session message is delivered. The controller consumes
+    // only the exact notice snapshot selected by this UI before starting the
+    // send; a delivery failure does not restore it.
+    await controller.requestNoticeDetails(
+      noticeDetails.noticeId,
+      sourceProbeOf(ctx),
+      noticeDetails.expectedNotice,
+    );
   }
 }
 
@@ -452,22 +458,27 @@ function requestRenderOf(tui: unknown): (() => void) | undefined {
 }
 
 /**
- * Public overlay options use a percentage maxHeight so pi-tui resolves it
- * against the current terminal dimensions on every layout pass. Its one-row
- * margins bound the actual height to `terminal.rows - 2`; the component reads
- * that same live budget before returning lines, so it never exceeds the
- * compositor's resized viewport.
+ * Public overlay options fill the active conversation viewport horizontally
+ * while preserving one row of vertical margin. pi-tui resolves the percentage
+ * width and maxHeight against current dimensions on every layout pass; the
+ * component reads the matching live row budget and emits full-width opaque
+ * rows. A parent Main sidebar is outside this child conversation viewport.
  */
 function questionPopupOverlayOptions(): {
-  width: "90%";
+  width: "100%";
   anchor: "center";
-  margin: number;
+  margin: { top: number; right: 0; bottom: number; left: 0 };
   maxHeight: "100%";
 } {
   return {
-    width: "90%",
+    width: "100%",
     anchor: "center",
-    margin: QUESTION_POPUP_OVERLAY_MARGIN,
+    margin: {
+      top: QUESTION_POPUP_VERTICAL_MARGIN,
+      right: 0,
+      bottom: QUESTION_POPUP_VERTICAL_MARGIN,
+      left: 0,
+    },
     maxHeight: "100%",
   };
 }
@@ -482,24 +493,28 @@ function questionPopupViewportRows(tui: unknown): number {
     rows = undefined;
   }
   const maxHeight = typeof rows === "number" && Number.isFinite(rows)
-    ? Math.max(1, Math.floor(rows) - QUESTION_POPUP_OVERLAY_MARGIN * 2)
+    ? Math.max(1, Math.floor(rows) - QUESTION_POPUP_VERTICAL_MARGIN * 2)
     : 1;
   return maxHeight;
 }
 
-function noticeDetailsResult(value: unknown): { noticeId: string } | undefined {
+function noticeDetailsResult(value: unknown): { noticeId: string; expectedNotice: PendingNotice } | undefined {
   if (!isRecord(value) || value.kind !== "notice-details"
-    || typeof value.noticeId !== "string" || value.noticeId.length === 0) return undefined;
-  return { noticeId: value.noticeId };
+    || typeof value.noticeId !== "string" || value.noticeId.length === 0
+    || !isRecord(value.expectedNotice) || value.expectedNotice.kind !== "notice"
+    || value.expectedNotice.id !== value.noticeId) return undefined;
+  return { noticeId: value.noticeId, expectedNotice: value.expectedNotice as unknown as PendingNotice };
 }
 
 function toUiTheme(theme: unknown): QuestionUiTheme {
   if (isRecord(theme) && typeof theme.fg === "function" && typeof theme.bold === "function") {
     const fg = theme.fg.bind(theme);
     const bold = theme.bold.bind(theme);
+    const bg = typeof theme.bg === "function" ? theme.bg.bind(theme) : undefined;
     return {
       fg: (color, text) => String(fg(color, text)),
       bold: (text) => String(bold(text)),
+      ...(bg ? { bg: (color: string, text: string) => String(bg(color, text)) } : {}),
     };
   }
   // Degraded (non-Pi hosts, tests): plain text, no styling.

@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 import test from "node:test";
 import { UserQuestionController } from "../src/user-question/controller";
 import { createQuestionListComponent, QUESTION_LIST_SHORTCUT_KEY } from "../src/user-question/components";
+import type { QuestionUiTheme } from "../src/user-question/components";
 import { visibleTerminalText } from "../src/tool-result-text";
 
 /** Raw sequence used by the fakes for the approved chord (Kitty-style). */
@@ -29,6 +30,9 @@ type EditorLineChunk = { text: string; startIndex: number; endIndex: number };
 const editorWordWrapLine = (createRequire(__filename)("pi-session-host-tui/dist/components/editor.js") as {
   wordWrapLine: (text: string, width: number) => EditorLineChunk[];
 }).wordWrapLine;
+const compositeTuiLine = (createRequire(__filename)("pi-session-host-tui/dist/tui.js") as {
+  compositeTuiLine: (baseLine: string, overlayLine: string, startCol: number, overlayWidth: number, totalWidth: number) => string;
+}).compositeTuiLine;
 
 function makeKeybindings(overrides: Record<string, string[]> = {}) {
   const bindings: Record<string, string[]> = {
@@ -124,7 +128,7 @@ class FakeNativeField {
 
   render(width: number): string[] {
     const textLines = this.text.split("\n");
-    const layoutWidth = Math.max(1, width - 1); // Editor reserves one cursor cell with zero padding.
+    const layoutWidth = Math.max(1, width - 1); // The native Editor reserves one cursor cell with zero padding.
     const chunksByLine = textLines.map((line) => editorWordWrapLine(line, layoutWidth));
     const cursorLine = this.getCursor().line;
     const cursorColumn = this.getCursor().col;
@@ -148,7 +152,7 @@ class FakeNativeField {
     const visibleLines = layoutLines.slice(this.scrollOffset, this.scrollOffset + this.maxVisibleLines);
     const lines = ["─".repeat(width), ...visibleLines.map((visualLine, index) => {
       const absoluteRow = this.scrollOffset + index;
-      const prefix = visualLine.logicalLine === 0 && visualLine.chunk.startIndex === 0 ? "[field:" : "  ";
+      const prefix = visualLine.logicalLine === 0 && visualLine.chunk.startIndex === 0 ? "[field:" : "";
       const suffix = visualLine.logicalLine === textLines.length - 1 && visualLine.isLastChunk ? "]" : "";
       const cursor = absoluteRow === cursorVisualRow ? "\x1b_pi:c\x07" : "";
       return `${prefix}${visualLine.chunk.text}${suffix}${cursor}`;
@@ -240,7 +244,7 @@ class FakeNativeField {
 }
 
 function makeTuiHost() {
-  const visibleWidth = (text: string): number => text.replace(/\x1b\[[0-9;]*m/g, "").length;
+  const visibleWidth = (text: string): number => text.replace(/\x1b\[[0-9;]*m/g, "").replace(/\x1b_pi:c\x07/g, "").length;
   return {
     matchesKey(data: string, keyId: string): boolean {
       if (keyId === QUESTION_LIST_SHORTCUT_KEY) return data === CHORD;
@@ -292,6 +296,7 @@ function makeFixture(options: {
   field?: boolean;
   getViewportRows?: () => number;
   keybindings?: ReturnType<typeof makeKeybindings>;
+  theme?: QuestionUiTheme;
 } = {}): Fixture {
   const sent: Fixture["sent"] = [];
   const controller = new UserQuestionController({
@@ -310,7 +315,7 @@ function makeFixture(options: {
   const component = createQuestionListComponent({
     controller,
     keybindings: options.keybindings ?? makeKeybindings(),
-    theme: THEME,
+    theme: options.theme ?? THEME,
     tuiHost: makeTuiHost(),
     shortcutLabel: "Ctrl+Alt+Up",
     nativeField: field,
@@ -319,6 +324,52 @@ function makeFixture(options: {
   });
   return { controller, identity, sent, done, component, field };
 }
+
+test("all shared-popup rows fill the viewport opaquely in list, answer, notice, and resized views", () => {
+  const backgroundStart = "\x1b[48;5;236m";
+  const backgroundEnd = "\x1b[49m";
+  const theme: QuestionUiTheme = {
+    fg: (_color, text) => `\x1b[38;5;203m${text}\x1b[0m`,
+    bold: (text) => `\x1b[1m${text}\x1b[22m`,
+    bg: (color, text) => {
+      assert.equal(color, "customMessageBg", "the shared popup uses Pi's native message surface token");
+      return `${backgroundStart}${text}${backgroundEnd}`;
+    },
+  };
+  const fixture = makeFixture({ theme, getViewportRows: () => 20 });
+  register(fixture, "Which database?", { choices: ["SQLite"] });
+  registerNotice(fixture, "# Notice body\nA retained detail row.");
+
+  const assertOpaqueFullWidth = (rows: string[], width: number, view: string): void => {
+    assert.ok(rows.length > 0, `${view} renders popup rows`);
+    for (const [index, row] of rows.entries()) {
+      assert.equal(makeTuiHost().visibleWidth(row), width, `${view} row ${index} fills the current viewport width`);
+      assert.ok(row.startsWith(backgroundStart), `${view} row ${index} starts with the opaque surface background`);
+      const resetParts = row.split(/\x1b\[0?m/);
+      for (const tail of resetParts.slice(1)) {
+        assert.ok(tail.length === 0 || tail.startsWith(backgroundStart),
+          `${view} row ${index} reapplies the opaque background after nested full resets`);
+      }
+
+      const leftUnderlay = "CHAT_LEFT_UNDERLAY";
+      const rightUnderlay = "CHAT_RIGHT_UNDERLAY";
+      const underlay = `${leftUnderlay}${".".repeat(Math.max(0, width - leftUnderlay.length - rightUnderlay.length))}${rightUnderlay}`;
+      const composed = compositeTuiLine(underlay, row, 0, width, width)
+        .replace(/\x1b\[[0-9;]*m/g, "");
+      assert.equal(composed.includes(leftUnderlay) || composed.includes(rightUnderlay), false,
+        `${view} row ${index} removes both left and right underlying conversation margins`);
+    }
+  };
+
+  assertOpaqueFullWidth(fixture.component.render(72), 72, "pending list");
+  fixture.component.handleInput(ENTER);
+  assertOpaqueFullWidth(fixture.component.render(72), 72, "question answer");
+  fixture.component.handleInput(ESCAPE);
+  fixture.component.handleInput(DOWN);
+  fixture.component.handleInput(ENTER);
+  assertOpaqueFullWidth(fixture.component.render(72), 72, "notice details");
+  assertOpaqueFullWidth(fixture.component.render(43), 43, "resized notice details");
+});
 
 function register(fixture: Fixture, question: string, options: { choices?: string[]; mode?: "async" | "sync" } = {}) {
   const result = fixture.controller.register(
@@ -347,11 +398,27 @@ test("the list renders pending questions with the shortcut hint and waiting tags
   register(fixture, "Include raw counts?");
   const lines = fixture.component.render(80);
   const text = lines.join("\n");
-  assert.match(text, /Pending questions \(2\)/);
+  assert.match(text, /Pending input \(2\)/);
   assert.match(text, /Ctrl\+Alt\+Up to close/);
   assert.match(text, /q1: Which database\? \[waiting\]/);
   assert.match(text, /q2: Include raw counts\?/);
   assert.ok(!/\[waiting\]/.test(lines.find((line) => line.includes("q2")) ?? ""), "async questions are not waiting");
+});
+
+test("the shared question popup has a hard four-sided border and padding", () => {
+  const fixture = makeFixture();
+  register(fixture, "Which database?");
+  const lines = fixture.component.render(36);
+  const header = lines.findIndex((line) => line.includes("Pending input (1)"));
+
+  assert.ok(header > 1, `header follows the top border and vertical padding: ${lines.join("\n")}`);
+  assert.match(lines[0]!, /^┌─+┐$/);
+  assert.match(lines.at(-1)!, /^└─+┘$/);
+  assert.match(lines[header]!, /^│ Pending input \(1\)/);
+  assert.match(lines[header - 1]!, /^│ +│$/, "the header has a blank row of vertical padding above it");
+  assert.match(lines.at(-2)!, /^│ +│$/, "the content has a blank row of vertical padding below it");
+  assert.ok(lines.every((line) => line.length === 36 && line.startsWith("│") && line.endsWith("│")
+    || line === lines[0] || line === lines.at(-1)), "every popup row fits inside the four-sided border");
 });
 
 test("popup page shortcuts scroll with overlap and preserve plain PageUp/PageDown fallback", () => {
@@ -367,13 +434,12 @@ test("popup page shortcuts scroll with overlap and preserve plain PageUp/PageDow
     fixture.component.handleInput(key);
     const after = fixture.component.render(80);
     assert.equal(after.length, 6);
-    if (direction === "down") {
-      assert.deepEqual(after.slice(0, -1), before.slice(1),
-        "the layout-less fallback advances exactly one line and cannot skip unseen content");
-    } else {
-      assert.deepEqual(after.slice(1), before.slice(0, -1),
-        "the layout-less fallback moves back one line with overlapping coverage");
-    }
+    const contentRows = (lines: readonly string[]): readonly string[] => lines.slice(2, -2);
+    const beforeContent = contentRows(before);
+    const afterContent = contentRows(after);
+    assert.equal(afterContent.length, beforeContent.length, "the border and padding keep a stable viewport budget");
+    const overlap = afterContent.filter((line) => beforeContent.includes(line));
+    assert.ok(overlap.length > 0, "each popup-local page retains visible content overlap");
     return after;
   };
 
@@ -387,15 +453,17 @@ test("popup page shortcuts scroll with overlap and preserve plain PageUp/PageDow
   record(frame);
   frame = assertOneLineOverlap(frame, PAGE_DOWN);
   record(frame);
-  for (let page = 0; page < 100 && !(frame.some((line) => line.includes("DISTANT_NOTICE_SCROLL_SENTINEL"))
-    && frame.some((line) => line.includes("Close"))); page += 1) {
+  let sentinelSeen = frame.some((line) => line.includes("DISTANT_NOTICE_SCROLL_SENTINEL"));
+  let closeSeen = frame.some((line) => line.includes("Close"));
+  for (let page = 0; page < 100 && !(sentinelSeen && closeSeen); page += 1) {
     frame = assertOneLineOverlap(frame, page % 2 === 0 ? CTRL_ALT_PAGE_DOWN : SHIFT_ALT_DOWN);
     record(frame);
+    sentinelSeen ||= frame.some((line) => line.includes("DISTANT_NOTICE_SCROLL_SENTINEL"));
+    closeSeen ||= frame.some((line) => line.includes("Close"));
   }
-  assert.ok(frame.some((line) => line.includes("DISTANT_NOTICE_SCROLL_SENTINEL")), "the distant body sentinel is reachable");
-  assert.ok(frame.some((line) => line.includes("More details")) && frame.some((line) => line.includes("Close")),
-    "both notice actions remain reachable after the complete body");
   const observed = [...observedLines].join("\n");
+  assert.ok(sentinelSeen && observed.includes("DISTANT_NOTICE_SCROLL_SENTINEL"), "the distant body sentinel is reachable");
+  assert.ok(observed.includes("More details") && closeSeen, "both notice actions remain reachable after the complete body");
   for (let line = 1; line <= 18; line += 1) {
     assert.ok(observed.includes(`Unique notice line ${String(line).padStart(2, "0")}`), `scrolling exposes body line ${line}`);
   }
@@ -416,7 +484,7 @@ test("bounded pending-list navigation keeps the selected identifier visible", ()
     assert.ok(frame.some((line) => line.includes(`> q${index}: Question ${index}?`)));
     if (index < 6) fixture.component.handleInput(DOWN);
   }
-  rows = 2;
+  rows = 5; // Border and vertical padding leave one content row at this height.
   assert.match(fixture.component.render(80).join("\n"), /> q6: Question 6\?/);
   for (let index = 5; index >= 1; index -= 1) {
     fixture.component.handleInput(UP);
@@ -519,7 +587,7 @@ test("backing out of free text keeps the draft in the shared instance", async ()
 });
 
 test("the bounded answer viewport follows selected rows and keeps the native editor box/completions visible", () => {
-  const viewportRows = 5;
+  const viewportRows = 11;
   const fixture = makeFixture({ getViewportRows: () => viewportRows });
   const question = [
     "# A long Markdown question",
@@ -609,7 +677,7 @@ test("an oversized native field keeps its active cursor row visible through comp
 });
 
 test("popup focus accounts for text hidden by the native editor's internal scroll", () => {
-  let viewportRows = 3;
+  let viewportRows = 7;
   const fixture = makeFixture({ getViewportRows: () => viewportRows });
   register(fixture, "Which deployment lane?", { choices: ["Canary"] });
   fixture.component.handleInput(ENTER); // answer view
@@ -640,7 +708,7 @@ test("popup focus accounts for text hidden by the native editor's internal scrol
   assert.ok(frame.some((row) => row.includes("line 7") && row.includes("\x1b_pi:c\x07")),
     "the cursor remains visible when the native box also contains an oversized completion list");
 
-  viewportRows = 2;
+  viewportRows = 5;
   frame = fixture.component.render(48);
   assert.ok(frame.length <= viewportRows, "the popup respects the shrunken viewport");
   assert.ok(frame.some((row) => row.includes("line 7") && row.includes("\x1b_pi:c\x07")),
@@ -655,14 +723,14 @@ test("native cursor mapping preserves wrapped whitespace rows", () => {
   fixture.component.handleInput(ENTER); // editing
   fixture.component.handleInput(`\x1b[200~a${" ".repeat(100)}\nb\x1b[201~`);
 
-  // Component width 14 gives the native Editor width 12 and its eleven-cell
-  // layout after the reserved cursor cell, matching the review regression.
-  const frame = fixture.component.render(14);
-  assert.equal(fixture.field!.getRenderedHiddenLineCount(), 6,
-    "the five-row native viewport clips six visual rows above the cursor");
+  // The outer width 13 leaves nine cells inside the border/padding, two of
+  // which indent the native editor; its public layout wraps at six cells.
+  const frame = fixture.component.render(13);
+  assert.equal(fixture.field!.getRenderedHiddenLineCount(), 13,
+    "the five-row native viewport clips thirteen visual rows above the cursor after border-aware wrapping");
   assert.ok(frame.length <= 3);
   assert.ok(frame.some((row) => row.includes("b") && row.includes("\x1b_pi:c\x07")),
-    "the cursor-bearing row after preserved whitespace wraps remains visible");
+    `the cursor-bearing row after preserved whitespace wraps remains visible: frame=${frame.join("\n")} field=${fixture.field!.render(8).join("\n")}`);
 });
 
 test("native cursor mapping uses complete-line chunks at an interior word-wrap boundary", () => {
@@ -682,13 +750,13 @@ test("native cursor mapping uses complete-line chunks at an interior word-wrap b
   fixture.field!.completionItems = Array.from({ length: 8 }, (_, index) => `suggestion ${index + 1}`);
   fixture.component.handleInput(TAB);
 
-  const frame = fixture.component.render(9); // Native Editor width seven; layout width six.
+  const frame = fixture.component.render(13); // Border/padding leave editor width seven; layout width six.
   assert.deepEqual(fixture.field!.getCursor(), { line: 0, col: cursorColumn });
   assert.equal(fixture.field!.getRenderedHiddenLineCount(), 0);
   assert.equal(fixture.field!.isShowingAutocomplete(), true);
   assert.ok(frame.length <= 3);
   assert.ok(frame.some((row) => row.includes("epsilo") && row.includes("\x1b_pi:c\x07")),
-    "the cursor at the word-wrap boundary remains visible despite an oversized completion list");
+    `the cursor at the word-wrap boundary remains visible despite an oversized completion list: frame=${frame.join("\n")} field=${fixture.field!.render(7).join("\n")} cursor=${JSON.stringify(fixture.field!.getCursor())} hidden=${fixture.field!.getRenderedHiddenLineCount()}`);
 });
 
 test("Ctrl+C clears the field draft and never cancels", async () => {
@@ -897,7 +965,7 @@ test("Escape never declines: it backs out of the answer view and then closes the
   assert.equal(fixture.controller.listPending().length, 1);
   assert.equal(fixture.done.length, 0);
   const text = fixture.component.render(80).join("\n");
-  assert.match(text, /Pending questions \(1\)/);
+  assert.match(text, /Pending input \(1\)/);
   fixture.component.handleInput(ESCAPE); // close the list (defer)
   assert.deepEqual(fixture.done, [{ kind: "closed" }]);
   assert.equal(fixture.controller.listPending().length, 1, "deferring keeps the question pending");
@@ -931,7 +999,7 @@ test("a question registered while the list is open appears without re-opening", 
   assert.ok(!fixture.component.render(80).join("\n").includes("q2"));
   register(fixture, "Include raw counts?");
   const text = fixture.component.render(80).join("\n");
-  assert.match(text, /Pending questions \(2\)/);
+  assert.match(text, /Pending input \(2\)/);
   assert.match(text, /q2: Include raw counts\?/);
 });
 
@@ -946,7 +1014,7 @@ test("resolving one of several questions keeps the list open on a live selection
   fixture.component.handleInput(ENTER); // open q1's answer view
   fixture.component.handleInput(ENTER); // confirm choice "a"
   const text = fixture.component.render(80).join("\n");
-  assert.match(text, /Pending questions \(1\)/);
+  assert.match(text, /Pending input \(1\)/);
   assert.match(text, /> q2: Second question\?/, "selection falls back to a live question");
   assert.equal(fixture.done.length, 0, "the list stays open while questions remain");
 });
@@ -989,7 +1057,7 @@ test("rendering is width-aware and degrades without host helpers", () => {
   const registered = controller.register({ toolCallId: "t1", question: "short?", mode: "async" }, identity);
   assert.ok(registered.ok);
   const lines = component.render(40);
-  assert.match(lines.join("\n"), /Pending questions \(1\)/);
+  assert.match(lines.join("\n"), /Pending input \(1\)/);
   component.handleInput(ESCAPE);
   assert.deepEqual(done, [{ kind: "closed" }]);
 });

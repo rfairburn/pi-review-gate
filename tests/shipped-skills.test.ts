@@ -173,7 +173,7 @@ test("completion skill publishes truthful handoffs only through an available You
   const skill = await readSkillFlat("pi-review-gate-completion");
   for (const phrase of [
     "disable-model-invocation: true",
-    "The launcher-installed skill remains manually available as `/skill:pi-review-gate-completion` regardless of `youShouldKnow.completionGuidance`",
+    "Standard launchers refresh it under `~/.agents/skills/`; it is manually available as `/skill:pi-review-gate-completion` only when installed and discoverable in the active Pi environment, regardless of `youShouldKnow.completionGuidance`",
     "`youShouldKnow.enabled` (on by default) governs the overall notice feature",
     "When disabled, the tool is absent from `tool_search` and cannot be activated or used",
     "`youShouldKnow.completionGuidance` (on by default) controls whether the extension supplies an automatic prompt pointing to this skill",
@@ -196,10 +196,9 @@ test("completion skill publishes truthful handoffs only through an available You
     "actionable manual test steps with expected observable results",
     "limitations, unresolved risks",
     "pending popup/list/status",
-    "**More details** closes the shared popup, then sends the retained body and optional context with an explicit request to elaborate in a normal conversation reply",
-    "the notice stays pending",
-    "**Close** to dismiss it without sending anything",
-    "The user chooses **Close** to dismiss it",
+    "**More details** closes the shared popup and consumes only the selected notice before sending its retained body and optional context",
+    "A delivery failure does not restore the consumed notice",
+    "The user chooses **Close** to dismiss the selected notice without sending anything",
     "Do not treat the contextual request as a separate publication channel",
     "normal conversation summary",
     "not an automatic execution hook or background observer",

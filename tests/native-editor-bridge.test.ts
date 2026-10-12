@@ -30,6 +30,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   abortActiveNativeEditorField,
+  acquireNativeEditorField,
   editTextWithNativeEditor,
   setNativeEditorHost,
   setNativeEditorHostEntryProvider as setNativeEditorHostEntryProviderForTest,
@@ -87,6 +88,54 @@ test("prefill applies after the host's draft capture; Enter submits the edited f
   assert.equal(state.slotFactory, undefined, "prior (default) factory restored");
   assert.equal(state.draft, "my chat draft", "chat draft survives the round trip");
   assert.deepEqual(state.chatSubmits, [], "no chat message was sent");
+});
+
+test("an embedded answer suppresses ordinary editor rendering without displacing Pi's active editor", async () => {
+  const instances: FakeBridgeEditor[] = [];
+  setNativeEditorHost(fakeHost(instances));
+  const customTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+  const { ui, state } = createBridgeUi({
+    theme: REAL_IDENTITY_THEME,
+    customTheme,
+    keybindings: fakeKeybindingsManager(),
+    draft: "saved chat draft",
+    appHandlers: {
+      "app.editor.external": (editor) => () => editor.setText(`${editor.getText()} [external]`),
+    },
+    onPasteImage: (editor) => () => editor.insertTextAtCursor(" [paste]"),
+    drivers: [],
+  });
+  const acquired = await acquireNativeEditorField(ui, { semantics: { onSubmitKey: (text) => text } });
+  assert.equal(acquired.kind, "acquired");
+  if (acquired.kind !== "acquired") return;
+
+  const handle = acquired.handle;
+  handle.prepare("");
+  assert.equal(handle.instance.getText(), "", "the answer field starts empty rather than inheriting the draft");
+  const installedFactory = state.slotFactory;
+  assert.equal(handle.isolatePromptForOverlay({}, customTheme, fakeKeybindingsManager()), true);
+  assert.equal(state.slotFactory, installedFactory, "isolation leaves the popup field as Pi's active editor");
+  assert.equal(instances.length, 1, "the host-owned field remains the only editor instance");
+  assert.equal(handle.instance, instances[0], "the popup and host action target are the same editor instance");
+  assert.deepEqual(handle.instance.render(80), [], "the ordinary prompt contributes no editor rows while the popup owns it");
+
+  handle.instance.setText("native popup answer");
+  instances[0]!.actionHandlers.get("app.editor.external")?.();
+  instances[0]!.onPasteImage?.();
+  assert.equal(handle.instance.getText(), "native popup answer [external] [paste]",
+    "dynamic native actions still target the popup field through Pi's active editor slot");
+  assert.ok(handle.instance.renderForPopup?.(80).join("\n").includes("native popup answer"),
+    "the popup render path displays the answer from the same native instance");
+  assert.deepEqual(handle.instance.render(80), [], "native actions do not reactivate the underlying prompt render");
+  assert.deepEqual(state.chatSubmits, [], "the popup field never submitted a chat message");
+
+  handle.finish();
+  assert.equal(state.draft, "saved chat draft", "closing restores the saved chat draft exactly");
+  assert.equal(handle.instance.getText(), "saved chat draft", "the original editor instance retains the independent chat draft");
+  assert.deepEqual(handle.instance.render(80), ["─".repeat(80), "[field:saved chat draft]"],
+    "the ordinary host editor render returns after the overlay closes");
+  assert.equal(state.slotFactory, undefined, "the original editor ownership is restored");
+  assert.deepEqual(state.chatSubmits, [], "no answer or displaced draft was submitted as chat");
 });
 
 test("the owned native editor reports hidden text rows from its border hook", async () => {

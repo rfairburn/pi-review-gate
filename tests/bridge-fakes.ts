@@ -52,6 +52,7 @@ export async function settle(ms = 25): Promise<void> {
 
 export interface FakeBridgeEditor {
   focused: boolean;
+  theme: unknown;
   /** Bridge-owned flag gating the instance's intercepted keys (set by the embedding UI). */
   fieldActive?: boolean;
   /** Bridge-owned settle callback, set while a field is open around the instance. */
@@ -91,6 +92,7 @@ export function createFakeCustomEditorClass(
 ): new (tui: unknown, theme: unknown, keybindings: unknown) => FakeBridgeEditor {
   return class FakeCustomEditor {
     focused = false;
+    theme: unknown;
     onSubmit?: (text: string) => void;
     onChange?: (text: string) => void;
     onEscape?: () => void;
@@ -103,7 +105,8 @@ export function createFakeCustomEditorClass(
     hiddenRows = 0;
     received: string[] = [];
 
-    constructor(_tui: unknown, _theme: unknown, _keybindings: unknown) {
+    constructor(_tui: unknown, theme: unknown, _keybindings: unknown) {
+      this.theme = theme;
       instances.push(this as unknown as FakeBridgeEditor);
     }
 
@@ -209,6 +212,8 @@ export interface BridgeUiOptions {
   keybindings?: unknown;
   /** The editor theme the host passes to factories (defaults to IDENTITY_THEME). */
   theme?: unknown;
+  /** General Pi Theme supplied to custom-component factories. */
+  customTheme?: unknown;
   /** The chat draft before the field opens. */
   draft?: string;
   /** A foreign editor factory already installed by another extension. */
@@ -216,10 +221,11 @@ export interface BridgeUiOptions {
   /** The host's autocomplete provider, attached like the real host does. */
   provider?: unknown;
   /**
-   * Additional app-level handlers the host copies onto CustomEditor instances
-   * (action -> factory bound to the created instance). The default app.clear
-   * simulation (single: clear, double within 500ms: exit) is always present;
-   * entries here override or extend it.
+   * Additional app-level handlers copied onto CustomEditor instances. Their
+   * callbacks resolve the current host editor when invoked, matching Pi's
+   * dynamic `this.editor` actions. The default app.clear simulation (single:
+   * clear, double within 500ms: exit) is always present; entries here override
+   * or extend it.
    */
   appHandlers?: Record<string, (editor: FakeBridgeEditor) => () => void>;
   /** The host's onPasteImage wiring (its terminal act on the instance). */
@@ -251,6 +257,19 @@ export function createBridgeUi(options: BridgeUiOptions): { ui: NativeEditorFiel
   };
   let instance: { getText(): string; setText(text: string): void } = defaultEditor;
   let driverIndex = 0;
+  // Pi's app-level editor callbacks resolve this.editor when invoked rather
+  // than retaining the editor that existed when a callback was copied.
+  const liveEditor = new Proxy({} as FakeBridgeEditor, {
+    get(_target, property) {
+      const current = instance as unknown as Record<PropertyKey, unknown>;
+      const value = Reflect.get(current, property, current);
+      return typeof value === "function" ? value.bind(current) : value;
+    },
+    set(_target, property, value) {
+      const current = instance as unknown as Record<PropertyKey, unknown>;
+      return Reflect.set(current, property, value, current);
+    },
+  });
 
   const ui: NativeEditorFieldUi = {
     setEditorComponent(factory) {
@@ -282,7 +301,7 @@ export function createBridgeUi(options: BridgeUiOptions): { ui: NativeEditorFiel
             const now = Date.now();
             if (now - lastSigint < 500) state.shutdowns += 1;
             else {
-              editor.setText("");
+              liveEditor.setText("");
               lastSigint = now;
             }
           },
@@ -291,11 +310,11 @@ export function createBridgeUi(options: BridgeUiOptions): { ui: NativeEditorFiel
           editor.actionHandlers.set(action, handler);
         }
         for (const [action, make] of Object.entries(options.appHandlers ?? {})) {
-          editor.actionHandlers.set(action, make(editor));
+          editor.actionHandlers.set(action, make(liveEditor));
         }
       }
       if (options.onPasteImage && !editor.onPasteImage) {
-        editor.onPasteImage = options.onPasteImage(editor);
+        editor.onPasteImage = options.onPasteImage(liveEditor);
       }
       instance = editor;
     },
@@ -318,7 +337,7 @@ export function createBridgeUi(options: BridgeUiOptions): { ui: NativeEditorFiel
           if (!isOverlay) instance.setText(savedText);
           resolve(result);
         };
-        Promise.resolve(factory(GEOMETRY_TUI, options.theme ?? IDENTITY_THEME, options.keybindings ?? null, close))
+        Promise.resolve(factory(GEOMETRY_TUI, options.customTheme ?? options.theme ?? IDENTITY_THEME, options.keybindings ?? null, close))
           .then((component) => {
             if (closed) return;
             const driver = options.drivers[driverIndex++];
@@ -376,7 +395,7 @@ export const REAL_IDENTITY_THEME: Record<string, unknown> = {
   underline: (text: string) => text,
   inverse: (text: string) => text,
   strikethrough: (text: string) => text,
-  borderColor: (_color: unknown, text: string) => text,
+  borderColor: (text: string) => text,
   selectList: {
     selectedPrefix: (text: string) => text,
     selectedText: (text: string) => text,

@@ -59,17 +59,35 @@ async function until(predicate: () => boolean, ms = 1000): Promise<void> {
   }
 }
 
+type PublicOverlayMargin = number | { top?: number; right?: number; bottom?: number; left?: number };
+type PublicOverlayOptions = { anchor?: string; width?: number | string; maxHeight?: number | string; margin?: PublicOverlayMargin };
+
 function publicOverlayHeight(
-  options: { maxHeight?: number | string; margin?: number },
+  options: PublicOverlayOptions,
   terminalRows: number,
 ): number {
   const percentage = typeof options.maxHeight === "string" ? options.maxHeight.match(/^(\d+(?:\.\d+)?)%$/u) : null;
   const requested = percentage
     ? Math.floor(terminalRows * Number(percentage[1]) / 100)
     : typeof options.maxHeight === "number" ? options.maxHeight : Number.POSITIVE_INFINITY;
-  const margin = typeof options.margin === "number" ? Math.max(0, options.margin) : 0;
-  const available = Math.max(1, terminalRows - margin * 2);
+  const margins = typeof options.margin === "number"
+    ? { top: options.margin, bottom: options.margin }
+    : options.margin ?? {};
+  const verticalMargin = Math.max(0, margins.top ?? 0) + Math.max(0, margins.bottom ?? 0);
+  const available = Math.max(1, terminalRows - verticalMargin);
   return Math.max(1, Math.min(requested, available));
+}
+
+function publicOverlayWidth(options: PublicOverlayOptions, terminalColumns: number): number {
+  const percentage = typeof options.width === "string" ? options.width.match(/^(\d+(?:\.\d+)?)%$/u) : null;
+  const requested = percentage
+    ? Math.floor(terminalColumns * Number(percentage[1]) / 100)
+    : typeof options.width === "number" ? options.width : terminalColumns;
+  const margins = typeof options.margin === "number"
+    ? { left: options.margin, right: options.margin }
+    : options.margin ?? {};
+  const horizontalMargin = Math.max(0, margins.left ?? 0) + Math.max(0, margins.right ?? 0);
+  return Math.max(1, Math.min(requested, terminalColumns - horizontalMargin));
 }
 
 /** The live keybinding manager the host passes to the custom/editor factories. */
@@ -193,7 +211,7 @@ test("activate registers AskUserQuestion and the pending-question shortcut", asy
     assert.ok(noticeTool, "YouShouldKnow is registered beside the question tool");
     assert.equal(fixture.shortcuts.has("ctrl+alt+up"), true, "the approved chord is registered");
     const shortcut = fixture.shortcuts.get("ctrl+alt+up")!;
-    assert.match(shortcut.description ?? "", /pending question and notice list/i);
+    assert.match(shortcut.description ?? "", /pending input list/i);
 
     await trigger(fixture.hooks, "session_start", { cwd: fixture.dir }, tuiContext(fixture));
 
@@ -207,7 +225,7 @@ test("activate registers AskUserQuestion and the pending-question shortcut", asy
     assert.deepEqual(panel!.lines, [pendingQuestionPanelLine()]);
     assert.equal(
       panel!.lines![0],
-      `Pending questions · Press ${questionShortcutLabel()}`,
+      `Pending input · Press ${questionShortcutLabel()}`,
       "the collapsed line names the approved chord",
     );
     assert.ok(!panel!.lines!.join("\n").includes("database"), "no question text while collapsed");
@@ -277,12 +295,20 @@ test("resolving every pending question removes the panel", async () => {
     let openedComponent: any;
     let customOptions: {
       overlay?: boolean;
-      overlayOptions?: { anchor?: string; width?: string; maxHeight?: number | string; margin?: number };
+      overlayOptions?: PublicOverlayOptions;
     } | undefined;
     const popupTui = { terminal: { rows: 40 }, requestRender() {} };
+    const backgroundTokens: string[] = [];
     const custom = (factory: (...args: unknown[]) => unknown, options?: typeof customOptions) => {
       customOptions = options;
-      openedComponent = factory(popupTui, { fg: (_c: string, t: string) => t, bold: (t: string) => t }, fakeKeybindings(), () => undefined);
+      openedComponent = factory(popupTui, {
+        fg: (_c: string, t: string) => t,
+        bold: (t: string) => t,
+        bg: (color: string, text: string) => {
+          backgroundTokens.push(color);
+          return `\x1b[48;5;236m${text}\x1b[49m`;
+        },
+      }, fakeKeybindings(), () => undefined);
       return Promise.resolve();
     };
     const handler = fixture.shortcuts.get("ctrl+alt+up")!.handler;
@@ -290,9 +316,16 @@ test("resolving every pending question removes the panel", async () => {
     assert.ok(openedComponent, "the shortcut opens the question list over the persistent panel");
     assert.equal(customOptions?.overlay, true, "the question list uses the public custom overlay");
     assert.deepEqual(customOptions?.overlayOptions, {
-      width: "90%", anchor: "center", margin: 1, maxHeight: "100%",
-    }, "the overlay's maxHeight is derived from its actual margins and terminal rows");
+      width: "100%", anchor: "center", margin: { top: 1, right: 0, bottom: 1, left: 0 }, maxHeight: "100%",
+    }, "the public overlay fills the conversation width and keeps only vertical margins");
     assert.equal(publicOverlayHeight(customOptions!.overlayOptions!, 40), 38);
+    assert.equal(publicOverlayWidth(customOptions!.overlayOptions!, 80), 80,
+      "the full-width public overlay leaves no exposed conversation columns at either side");
+    const firstRows = openedComponent.render(80);
+    assert.ok(backgroundTokens.length > 0 && backgroundTokens.every((color) => color === "customMessageBg"),
+      "the public custom-component Theme.bg reaches the shared popup as its opaque native message surface");
+    assert.ok(firstRows.every((line: string) => line.startsWith("\x1b[48;5;236m")),
+      "the public native surface background wraps all list rows, including border and padding");
 
     openedComponent.handleInput("\r"); // open answer view (first question selected)
     openedComponent.handleInput("\x1b[B"); // row 2: Postgres
@@ -312,9 +345,24 @@ test("the shared custom overlay pages native Markdown within its responsive publ
   const fixture = await makeFixture({ onSend: () => assert.equal(customActive, false, "owner delivery follows custom close") });
   try {
     let terminalRows = 40;
+    let terminalColumns = 80;
     const markdownSources: string[] = [];
+    const stripSgr = (text: string): string => text.replace(/\x1b\[[0-9;]*m/gu, "");
+    const terminalVisibleWidth = (text: string): number => stripSgr(text).length;
+    const popupInteriorRows = (frame: readonly string[], width: number): string[] => {
+      const rows = frame.map(stripSgr);
+      assert.equal(rows[0], `┌${"─".repeat(width - 2)}┐`, "projection uses the popup's actual top border");
+      assert.equal(rows.at(-1), `└${"─".repeat(width - 2)}┘`, "projection uses the popup's actual bottom border");
+      return rows.slice(1, -1).map((row) => {
+        assert.equal(terminalVisibleWidth(row), width, "every projected row keeps its measured width");
+        assert.ok(row.startsWith("│") && row.endsWith("│"), `content row has actual vertical borders: ${row}`);
+        assert.equal(row[1], " ", "one padding cell follows the left border");
+        assert.equal(row[row.length - 2], " ", "one padding cell precedes the right border");
+        return row.slice(2, -2).replace(/ +$/u, ""); // Trim only right-side cell fill after slicing the known frame.
+      }).filter((row) => row.length > 0);
+    };
     setUserQuestionTuiHost({
-      visibleWidth: (text) => text.replace(/\x1b\[[0-9;]*m/gu, "").length,
+      visibleWidth: terminalVisibleWidth,
       wrapTextWithAnsi: (text) => [text],
       createMarkdown(source) {
         markdownSources.push(source);
@@ -335,14 +383,19 @@ test("the shared custom overlay pages native Markdown within its responsive publ
       context,
     }, undefined, undefined, { sessionManager: fixture.sessionManager });
     assert.equal((notice.details as { status: string }).status, "pending");
+    const closeOnlyNotice = await noticeTool.execute("n2", {
+      title: "Follow-up status",
+      body: "Close this notice without sending a request.",
+    }, undefined, undefined, { sessionManager: fixture.sessionManager });
+    assert.equal((closeOnlyNotice.details as { status: string }).status, "pending");
 
     const components: any[] = [];
-    type PopupCustomOptions = {
-      overlay?: boolean;
-      overlayOptions?: { anchor?: string; width?: string; maxHeight?: number | string; margin?: number };
-    };
+    type PopupCustomOptions = { overlay?: boolean; overlayOptions?: PublicOverlayOptions };
     const options: Array<PopupCustomOptions | undefined> = [];
-    const tui = { requestRender() {}, terminal: { get rows() { return terminalRows; } } };
+    const tui = {
+      requestRender() {},
+      terminal: { get rows() { return terminalRows; }, get columns() { return terminalColumns; } },
+    };
     const custom = (factory: (...args: unknown[]) => unknown, customOptions?: PopupCustomOptions) => {
       options.push(customOptions);
       customActive = true;
@@ -360,10 +413,13 @@ test("the shared custom overlay pages native Markdown within its responsive publ
     assert.ok(sharedList, "the existing shortcut opens the shared list in its custom overlay");
     assert.equal(options[0]?.overlay, true, "the shared question/notice factory opens as an overlay");
     assert.deepEqual(options[0]?.overlayOptions, {
-      width: "90%", anchor: "center", margin: 1, maxHeight: "100%",
+      width: "100%", anchor: "center", margin: { top: 1, right: 0, bottom: 1, left: 0 }, maxHeight: "100%",
     });
-    assert.ok(sharedList.render(80).length <= publicOverlayHeight(options[0]!.overlayOptions!, terminalRows),
+    assert.ok(sharedList.render(terminalColumns).length <= publicOverlayHeight(options[0]!.overlayOptions!, terminalRows),
       "the component render fits the same maxHeight the public overlay compositor receives");
+    assert.equal(publicOverlayWidth(options[0]!.overlayOptions!, terminalColumns), terminalColumns);
+    assert.ok(sharedList.render(terminalColumns).every((line: string) => terminalVisibleWidth(line) === terminalColumns),
+      "every list row fills the conversation viewport sent to the public overlay");
 
     assert.ok(lastWidget(fixture, USER_QUESTION_PANEL_KEY)?.lines, "the persistent pending widget remains visible behind the overlay");
     sharedList.handleInput("\r"); // open the rich question detail in the shared component
@@ -380,29 +436,40 @@ test("the shared custom overlay pages native Markdown within its responsive publ
     assert.equal(options[0]?.overlay, true, "question and notice details share the same overlay interaction");
 
     const noticeView = sharedList;
-    const frames = [noticeView.render(80).join("\n")];
+    const initialNoticeRows = noticeView.render(terminalColumns);
     assert.ok(markdownSources.includes(body), "the complete notice still uses native Markdown");
     assert.ok(markdownSources.includes(context), "the complete context still uses native Markdown");
-    assert.equal(noticeView.render(80).length, publicOverlayHeight(options[0]!.overlayOptions!, terminalRows),
+    assert.equal(initialNoticeRows.length, publicOverlayHeight(options[0]!.overlayOptions!, terminalRows),
       "the long notice viewport fills, but never exceeds, the overlay's exact initial maxHeight");
     terminalRows = 7;
+    terminalColumns = 55;
     assert.equal(publicOverlayHeight(options[0]!.overlayOptions!, terminalRows), 5,
       "the percentage maxHeight resolves to the resized terminal's margin-bounded height");
-    const resizedFrame = noticeView.render(80).join("\n");
+    assert.equal(publicOverlayWidth(options[0]!.overlayOptions!, terminalColumns), terminalColumns,
+      "the percentage width resolves again after horizontal resize");
+    const resizedRows = noticeView.render(terminalColumns);
+    assert.ok(resizedRows.every((line: string) => terminalVisibleWidth(line) === terminalColumns),
+      "all notice rows fill the resized conversation viewport width");
+    const resizedFrame = resizedRows.join("\n");
     assert.equal(resizedFrame.split("\n").length, publicOverlayHeight(options[0]!.overlayOptions!, terminalRows),
       "resize keeps the manual viewport within the same public overlay maxHeight");
-    frames.push(resizedFrame);
+    const scrollFrames: string[][] = [resizedRows];
     for (let index = 0; index < 100; index += 1) {
-      noticeView.handleInput("\x1b[6~"); // PageDown advances in the shared custom component.
-      const frame = noticeView.render(80).join("\n");
-      frames.push(frame);
-      if (frame === frames[frames.length - 2]) break;
+      noticeView.handleInput("\x1b[6~"); // PageDown advances one content row in the shared custom component.
+      scrollFrames.push(noticeView.render(terminalColumns));
     }
-    const completeView = frames.join("\n");
-    for (let index = 1; index <= 18; index += 1) {
-      assert.ok(completeView.includes(`Body paragraph ${index} contains the complete detail.`), `shared popup scrolling reaches body paragraph ${index}`);
+    const projectedText = scrollFrames
+      .flatMap((frame) => popupInteriorRows(frame, terminalColumns))
+      .map((row) => row.startsWith("native:") ? row.slice("native:".length) : row)
+      .join(" "); // Join visual wrap continuations after removing only the fixture's native-render marker.
+    const completeView = projectedText;
+    const expectedLines = [...body.split("\n"), ...context.split("\n")].filter((line) => line.length > 0);
+    let contentOffset = 0;
+    for (const line of expectedLines) {
+      const found = projectedText.indexOf(line, contentOffset);
+      assert.notEqual(found, -1, `ordered popup rows include the complete native Markdown line: ${line}`);
+      contentOffset = found + line.length;
     }
-    assert.match(completeView, /BODY-END/);
     for (let index = 1; index <= 12; index += 1) {
       assert.ok(completeView.includes(`Context detail ${index}\.`), `shared popup scrolling reaches context detail ${index}`);
     }
@@ -410,33 +477,31 @@ test("the shared custom overlay pages native Markdown within its responsive publ
     assert.match(completeView, /More details/);
     assert.match(completeView, /Close/);
 
-    noticeView.handleInput("\r"); // More details closes the shared component
+    terminalRows = 40; // restore enough rows to inspect both pending entries after the short-viewport scroll proof
+    terminalColumns = 80;
+    noticeView.render(terminalColumns);
+    noticeView.handleInput("\x1b"); // return to the list without consuming the first notice
+    noticeView.handleInput("\x1b[B"); // select the separate notice
+    noticeView.handleInput("\r"); // open its details
+    assert.match(noticeView.render(terminalColumns).join("\n"), /Follow-up status/);
+    noticeView.handleInput("\x1b[B"); // select Close
+    noticeView.handleInput("\r");
+    const afterClose = noticeView.render(80).join("\n");
+    assert.match(afterClose, /Pending input \(2\)/);
+    assert.match(afterClose, /q1: # Keep the pending question/);
+    assert.match(afterClose, /n1: Deployment status \[notice\]/);
+    assert.doesNotMatch(afterClose, /n2: Follow-up status/, "Close removes only the selected notice");
+
+    noticeView.handleInput("\x1b[B"); // the removed selection falls back to q1; select the first notice
+    noticeView.handleInput("\r"); // reopen its details
+    assert.match(noticeView.render(80).join("\n"), /Deployment status/);
+    noticeView.handleInput("\r"); // More details consumes and closes the shared component
     await opening;
     assert.equal(customActive, false, "the normal chat/editor view is restored before delivery");
     assert.deepEqual(noticeView.render(80), [], "closed UI cannot remain as a notice viewer");
     assert.equal(fixture.sent.length, 1);
     assert.equal(fixture.sent[0]!.message,
       `More details requested for "Deployment status":\n\n${body}\n\nRelevant context:\n${context}\n\nPlease elaborate on these details in your normal conversation reply.`);
-
-    const closing = fixture.shortcuts.get("ctrl+alt+up")!.handler(uiContext) as Promise<unknown>;
-    await until(() => components.length === 2);
-    assert.equal(options[1]?.overlay, true, "reopening uses the same public custom overlay contract");
-    const closePopup = components[1]!;
-    const reopenedList = closePopup.render(80).join("\n");
-    assert.match(reopenedList, /q1: # Keep the pending question/);
-    assert.match(reopenedList, /n1: Deployment status \[notice\]/, "More details retains both pending entries");
-    closePopup.handleInput("\x1b[B");
-    closePopup.handleInput("\r");
-    closePopup.handleInput("\x1b[B"); // Close
-    closePopup.handleInput("\r");
-    const remainingList = closePopup.render(80).join("\n");
-    assert.match(remainingList, /Pending questions \(1\)/);
-    assert.match(remainingList, /q1: # Keep the pending question/);
-    assert.doesNotMatch(remainingList, /n1: Deployment status/, "Close removes only the notice");
-    assert.equal(fixture.sent.length, 1, "Close sends no additional request");
-    closePopup.handleInput("\x1b");
-    await closing;
-    assert.equal(customActive, false);
   } finally {
     await rm(fixture.dir, { recursive: true, force: true });
   }
@@ -471,13 +536,13 @@ test("the shortcut handler opens only for questions of its own session", async (
     const handler = fixture.shortcuts.get("ctrl+alt+up")!.handler;
     await handler({ ui: {}, sessionManager: { id: "other" } });
     assert.equal(fixture.sent.length, 0);
-    assert.ok(!fixture.notices.some((notice) => /no pending questions/.test(notice)), "stale contexts are ignored silently");
+    assert.ok(!fixture.notices.some((notice) => /no pending input/.test(notice)), "stale contexts are ignored silently");
 
-    // The current session with no pending questions gets a notice instead of an empty list.
+    // The current session with no pending input gets a notice instead of an empty list.
     await trigger(fixture.hooks, "session_shutdown", { cwd: fixture.dir }, tuiContext(fixture));
     await trigger(fixture.hooks, "session_start", { cwd: fixture.dir }, tuiContext(fixture));
     await handler({ ui: {}, sessionManager: fixture.sessionManager, isIdle: () => true });
-    assert.ok(fixture.notices.some((notice) => /no pending questions/.test(notice)));
+    assert.ok(fixture.notices.some((notice) => /no pending input/.test(notice)));
   } finally {
     await rm(fixture.dir, { recursive: true, force: true });
   }
@@ -622,7 +687,8 @@ test("an answer submitted from the opened list is delivered through the host use
 
     await trigger(fixture.hooks, "session_start", { cwd: fixture.dir }, tuiContext(fixture));
     const tool = fixture.tools.get("AskUserQuestion");
-    await tool.execute("c1", { question: "Which database?", choices: ["SQLite", "Postgres"] }, undefined, undefined, { sessionManager: fixture.sessionManager });
+    const firstQuestion = await tool.execute("c1", { question: "Which database?", choices: ["SQLite", "Postgres"] }, undefined, undefined, { sessionManager: fixture.sessionManager });
+    assert.equal((firstQuestion.details as { status: string }).status, "pending");
 
     const handler = fixture.shortcuts.get("ctrl+alt+up")!.handler;
     // Busy at submission time → steering delivery. The fake's driver hook
@@ -636,11 +702,13 @@ test("an answer submitted from the opened list is delivered through the host use
       }],
     });
     const openedFirst = handler({ ui: firstUi.ui, sessionManager: fixture.sessionManager, isIdle: () => false }) as Promise<void>;
-    await until(() => instances.length === 1);
+    await until(() => instances.length >= 1);
+    assert.equal(instances.length, 1, "only the host-owned native field is created for the overlay");
     assert.equal(instances[0]!.getText(), "", "prepare(\"\") emptied the field after the host's draft capture");
+    assert.deepEqual(instances[0]!.render(80), [], "the ordinary prompt is suppressed while the overlay owns the field");
     await until(() => openedComponent !== undefined);
     const rendered = openedComponent.render(80).join("\n");
-    assert.match(rendered, /Pending questions \(1\)/);
+    assert.match(rendered, /Pending input \(1\)/);
 
     openedComponent.handleInput!("\r"); // open answer view (first question selected)
     openedComponent.handleInput!("\x1b[B"); // row 2: Postgres
@@ -650,6 +718,9 @@ test("an answer submitted from the opened list is delivered through the host use
     assert.match(fixture.sent[0]!.message, /Answer to pending question "Which database\?": Postgres/);
     assert.deepEqual(fixture.sent[0]!.options, { deliverAs: "steer" }, "busy delivery uses steering");
     assert.equal(firstUi.state.draft, "chat draft", "the chat draft survived the round trip exactly once");
+    assert.equal(instances[0]!.getText(), "chat draft", "the original editor regains the chat draft after busy delivery");
+    assert.deepEqual(instances[0]!.render(80), ["─".repeat(80), "[field:chat draft]"],
+      "ordinary rendering returns after the busy overlay closes");
 
     // A second question answered while idle uses the plain path — free text
     // through the embedded native field.
@@ -663,18 +734,25 @@ test("an answer submitted from the opened list is delivered through the host use
       }],
     });
     const openedSecondPromise = handler({ ui: secondUi.ui, sessionManager: fixture.sessionManager, isIdle: () => true }) as Promise<void>;
-    await until(() => instances.length === 2);
+    await until(() => instances.length >= 2);
     await until(() => openedSecond !== undefined);
-    assert.equal(instances[1]!.getText(), "", "the second field instance started empty too");
+    assert.equal(instances.length, 2, "the second overlay also creates only one host-owned editor");
+    assert.equal(instances[1]!.getText(), "", "the second field instance starts empty too");
     openedSecond.handleInput!("\r"); // open answer view (no choices → Type row selected)
     openedSecond.handleInput!("\r"); // start editing the native field
     for (const ch of "yes") openedSecond.handleInput!(ch); // one keypress per call
+    assert.equal(instances[1]!.getText(), "yes", "the active host editor owns the free-text answer");
+    assert.deepEqual(instances[1]!.render(80), [], "the ordinary prompt render stays suppressed during free-text input");
+    assert.equal(secondUi.state.draft, "", "free-text answer typing leaves the underlying chat draft empty");
     openedSecond.handleInput!("\r"); // submit the whole answer
     await openedSecondPromise;
     assert.equal(fixture.sent.length, 2);
     assert.match(fixture.sent[1]!.message, /Answer to pending question "Include raw counts\?": yes/);
     assert.equal(fixture.sent[1]!.options, undefined, "idle delivery uses the plain path");
     assert.deepEqual(secondUi.state.chatSubmits, [], "no chat message was sent from the field");
+    assert.equal(instances[1]!.getText(), "", "the original editor restores its empty chat draft after idle delivery");
+    assert.deepEqual(instances[1]!.render(80), ["─".repeat(80), "[field:]"],
+      "ordinary editor rendering returns after the idle overlay closes");
   } finally {
     await rm(fixture.dir, { recursive: true, force: true });
   }

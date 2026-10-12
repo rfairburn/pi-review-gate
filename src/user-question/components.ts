@@ -20,9 +20,11 @@
  * - Notice mode: the selected notice's complete Markdown body and optional
  *   context use the same host Markdown component as question content and have
  *   exactly More details and Close actions. More details closes this popup and
- *   reports the selected notice for ordinary owner-session delivery; Close
- *   removes only it. The overlay's public maxHeight and margins define the
- *   manual viewport, which pages the shared content within that geometry.
+ *   reports the exact selected notice snapshot for ordinary owner-session
+ *   delivery; the controller consumes it before sending. Close removes only
+ *   it. A full-width, theme-background-filled hard border and padding frame
+ *   every shared-content row; the overlay's public maxHeight and vertical
+ *   margins define the responsive viewport inside it.
  *
  * Navigation, confirm, cancel, cursor movement, and deletion resolve through
  * the host's live KeybindingsManager (`tui.select.*`, `tui.editor.*`), so
@@ -69,12 +71,14 @@ export interface QuestionUiKeybindings {
 export interface QuestionUiTheme {
   fg(color: string, text: string): string;
   bold(text: string): string;
+  /** Pi's public background formatter, used to make every overlay cell opaque. */
+  bg?(color: string, text: string): string;
 }
 
 export type QuestionListDone =
   | { kind: "closed" }
   | { kind: "submitted"; result: SubmitResult }
-  | { kind: "notice-details"; noticeId: string };
+  | { kind: "notice-details"; noticeId: string; expectedNotice: PendingNotice };
 
 export interface QuestionListComponentOptions {
   controller: UserQuestionController;
@@ -127,6 +131,9 @@ const NOTICE_CLOSE = "__close_notice__";
 const SCROLL_PAGE_UP_KEYS = ["ctrl+alt+pageup", "shift+alt+up"] as const;
 const SCROLL_PAGE_DOWN_KEYS = ["ctrl+alt+pagedown", "shift+alt+down"] as const;
 const POPUP_SCROLL_HINT = "Shift+Alt+Up/Down or Ctrl+Alt+PageUp/PageDown scroll";
+const POPUP_HORIZONTAL_PADDING = 1;
+const POPUP_VERTICAL_PADDING = 1;
+const POPUP_BACKGROUND_FULL_RESET_SPLIT = /(\x1b\[0?m|\x1b\[49m)/;
 export function createQuestionListComponent(options: QuestionListComponentOptions): QuestionListComponent {
   const { controller, keybindings, theme, tuiHost, shortcutLabel } = options;
   const isStale = options.isStale ?? (() => false);
@@ -177,7 +184,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   // Live questions (registered while the list is open) must refresh the view.
   const unsubscribeState = controller.addStateListener(invalidate);
 
-  const close = (result?: SubmitResult | { kind: "notice-details"; noticeId: string }) => {
+  const close = (result?: SubmitResult | { kind: "notice-details"; noticeId: string; expectedNotice: PendingNotice }) => {
     if (closed) return;
     closed = true;
     // End any open editing episode so the bridge's settle callback is
@@ -416,7 +423,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       if (rows[noticeActionIndex] === NOTICE_MORE_DETAILS) {
         // Closing first restores Pi's normal editor/transcript surface. The
         // owner then sends only after this custom interaction has resolved.
-        close({ kind: "notice-details", noticeId: id });
+        close({ kind: "notice-details", noticeId: id, expectedNotice: record });
         return;
       }
       if (rows[noticeActionIndex] === NOTICE_CLOSE) {
@@ -555,42 +562,144 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     }
     if (closed) return []; // A closed component never renders live controller state.
     if (cachedContent?.width === width) return cachedContent.lines;
-    const lines = mode === "list"
+    const rawLines = mode === "list"
       ? renderList(width)
       : mode === "answer"
         ? renderAnswer(width)
         : renderNotice(width);
+    const lineCounts: number[] = [];
+    const lines = rawLines.flatMap((line) => {
+      const fitted = visibleWidth(line) <= width ? [line] : wrapNoticeLine(line, width);
+      lineCounts.push(fitted.length);
+      return fitted;
+    });
+    if (lineCounts.some((count) => count !== 1)) {
+      listViewportFocus = remapViewportFocus(listViewportFocus, lineCounts);
+      answerViewportFocus = remapViewportFocus(answerViewportFocus, lineCounts);
+    }
     cachedContent = { width, lines };
     return lines;
   };
 
+  function remapViewportFocus(
+    focus: { start: number; end: number; anchor: number } | undefined,
+    lineCounts: readonly number[],
+  ): { start: number; end: number; anchor: number } | undefined {
+    if (!focus) return undefined;
+    const offset = (line: number): number => lineCounts.slice(0, Math.max(0, line)).reduce((sum, count) => sum + count, 0);
+    const start = offset(focus.start);
+    const end = Math.max(start, offset(focus.end + 1) - 1);
+    const anchor = Math.min(end, offset(focus.anchor));
+    return { start, end, anchor };
+  }
+
+  function popupContentWidth(width: number): number {
+    const boundedWidth = Math.max(1, Math.floor(width));
+    const borderCells = boundedWidth >= 3 ? 2 : 0;
+    const paddingCells = boundedWidth >= 5 ? POPUP_HORIZONTAL_PADDING * 2 : 0;
+    return Math.max(1, boundedWidth - borderCells - paddingCells);
+  }
+
+  function popupContentRows(height: number): number {
+    const boundedHeight = Math.max(1, Math.floor(height));
+    const borderRows = boundedHeight >= 2 ? 2 : 1;
+    const paddingRows = boundedHeight >= 4 ? POPUP_VERTICAL_PADDING * 2 : 0;
+    return Math.max(0, boundedHeight - borderRows - paddingRows);
+  }
+
+  function framePopup(content: readonly string[], width: number, maxHeight?: number): string[] {
+    const boundedWidth = Math.max(1, Math.floor(width));
+    const hasHorizontalBorder = boundedWidth >= 3;
+    const padding = hasHorizontalBorder && boundedWidth >= 5 ? POPUP_HORIZONTAL_PADDING : 0;
+    const innerWidth = popupContentWidth(boundedWidth);
+    const framedContent = content.flatMap((line) =>
+      visibleWidth(line) <= innerWidth ? [line] : wrapNoticeLine(line, innerWidth));
+    const height = maxHeight === undefined ? undefined : Math.max(1, Math.floor(maxHeight));
+    const verticalPadding = height === undefined || height >= 4 ? POPUP_VERTICAL_PADDING : 0;
+    const contentLimit = height === undefined ? Number.POSITIVE_INFINITY : popupContentRows(height);
+    const visible = framedContent.slice(0, contentLimit);
+    const borderText = (left: string, right: string): string => {
+      if (!hasHorizontalBorder) return opaquePopupLine("─".repeat(boundedWidth));
+      return opaquePopupLine(theme.fg("borderMuted", left + "─".repeat(Math.max(0, boundedWidth - 2)) + right));
+    };
+    const row = (line: string): string => {
+      if (!hasHorizontalBorder) {
+        return opaquePopupLine(line + " ".repeat(Math.max(0, boundedWidth - visibleWidth(line))));
+      }
+      const left = theme.fg("borderMuted", "│");
+      const right = theme.fg("borderMuted", "│");
+      const measured = visibleWidth(line);
+      const inner = line + " ".repeat(Math.max(0, innerWidth - measured));
+      return opaquePopupLine(left + " ".repeat(padding) + inner + " ".repeat(padding) + right);
+    };
+
+    const top = borderText("┌", "┐");
+    const bottom = borderText("└", "┘");
+    if (height === 1) return [top];
+    if (height === 2) return [top, bottom];
+    const output = [top];
+    if (verticalPadding > 0) output.push(row(""));
+    for (const line of visible) output.push(row(line));
+    if (verticalPadding > 0) output.push(row(""));
+    output.push(bottom);
+    return height === undefined ? output : output.slice(0, height);
+  }
+
+  /**
+   * Fill every rendered cell with Pi's native custom-message surface. Reopen
+   * the background after full SGR resets in nested foreground styling so the
+   * trailing border and padding remain opaque as well as the text itself.
+   */
+  function opaquePopupLine(line: string): string {
+    const bg = theme.bg;
+    if (typeof bg !== "function") return line;
+    const parts = line.split(POPUP_BACKGROUND_FULL_RESET_SPLIT);
+    if (parts.length === 1) return bg("customMessageBg", line);
+    let output = "";
+    for (const part of parts) {
+      if (part === "\x1b[0m" || part === "\x1b[m" || part === "\x1b[49m") {
+        output += part;
+      } else if (part.length > 0) {
+        output += bg("customMessageBg", part);
+      }
+    }
+    return output;
+  }
+
   const renderFallback = (width: number): string[] => {
+    if (closed) return [];
     const height = options.getViewportRows ? viewportRows() : undefined;
-    const lines = renderContent(width);
-    if (height === undefined) return lines;
-    manualScrollOffset = Math.min(Math.max(0, manualScrollOffset), Math.max(0, lines.length - height));
-    if ((mode === "answer" && (answerFocusPending || editing)) || (mode === "list" && listFocusPending)) {
+    const contentWidth = popupContentWidth(width);
+    const lines = renderContent(contentWidth);
+    if (height === undefined) return framePopup(lines, width);
+    const contentHeight = popupContentRows(height);
+    manualScrollOffset = Math.min(Math.max(0, manualScrollOffset), Math.max(0, lines.length - contentHeight));
+    if (contentHeight > 0
+      && ((mode === "answer" && (answerFocusPending || editing)) || (mode === "list" && listFocusPending))) {
       manualScrollOffset = offsetForAnswerFocus(
         manualScrollOffset,
-        height,
+        contentHeight,
         lines.length,
         mode === "list" ? listViewportFocus : answerViewportFocus,
       );
       answerFocusPending = false;
       listFocusPending = false;
     }
-    return lines.slice(manualScrollOffset, manualScrollOffset + height);
+    return framePopup(lines.slice(manualScrollOffset, manualScrollOffset + contentHeight), width, height);
   };
 
   const renderNativeScrollView = (width: number): string[] => {
+    if (closed) return [];
     const scrollView = nativeScrollView!;
     const height = scrollView.viewportHeight;
     if (height <= 0) {
       lastNativeViewportHeight = 0;
       return renderFallback(width);
     }
-    const lines = renderContent(width);
-    const viewportHeight = Math.max(1, Math.floor(height));
+    const contentWidth = popupContentWidth(width);
+    const lines = renderContent(contentWidth);
+    const outerHeight = Math.max(1, Math.floor(height));
+    const contentHeight = popupContentRows(outerHeight);
     if (lastNativeViewportHeight !== height && mode === "list") listFocusPending = true;
     if (lastNativeViewportHeight <= 0) {
       scrollView.scrollToStart();
@@ -600,11 +709,12 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       answerFocusPending = true;
     }
     lastNativeViewportHeight = height;
-    manualScrollOffset = Math.min(Math.max(0, manualScrollOffset), Math.max(0, lines.length - viewportHeight));
-    if ((mode === "answer" && (answerFocusPending || editing)) || (mode === "list" && listFocusPending)) {
+    manualScrollOffset = Math.min(Math.max(0, manualScrollOffset), Math.max(0, lines.length - contentHeight));
+    if (contentHeight > 0
+      && ((mode === "answer" && (answerFocusPending || editing)) || (mode === "list" && listFocusPending))) {
       const desiredOffset = offsetForAnswerFocus(
         manualScrollOffset,
-        viewportHeight,
+        contentHeight,
         lines.length,
         mode === "list" ? listViewportFocus : answerViewportFocus,
       );
@@ -613,7 +723,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       answerFocusPending = false;
       listFocusPending = false;
     }
-    return scrollView.render(width);
+    return framePopup(scrollView.render(contentWidth).slice(0, contentHeight), width, outerHeight);
   };
 
   function scrollNativeBy(amount: number): void {
@@ -621,7 +731,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     if (!scrollView || scrollView.viewportHeight <= 0) return;
     scrollView.scrollBy(amount);
     const lineCount = cachedContent?.lines.length;
-    const height = Math.max(1, Math.floor(scrollView.viewportHeight));
+    const height = popupContentRows(scrollView.viewportHeight);
     const maximum = lineCount === undefined ? Number.POSITIVE_INFINITY : Math.max(0, lineCount - height);
     manualScrollOffset = Math.min(Math.max(0, manualScrollOffset + amount), maximum);
   }
@@ -697,15 +807,13 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     const pending = pendingNow();
     const lines: string[] = [];
     if (pending.length === 0) {
-      lines.push(theme.fg("dim", "No pending questions or notices."));
+      lines.push(theme.fg("dim", "No pending input."));
       return lines;
     }
     const selection = currentListSelection() ?? undefined;
     const hasNotice = pending.some(isNotice);
     const hasQuestion = pending.some((record) => !isNotice(record));
-    const header = theme.bold(hasNotice
-      ? `${hasQuestion ? "Pending questions and notices" : "Pending notices"} (${pending.length})`
-      : `Pending questions (${pending.length})`)
+    const header = theme.bold(`Pending input (${pending.length})`)
       + theme.fg("dim", ` · ${shortcutLabel} to close`);
     for (const line of wrapLine(header, width)) lines.push(line);
     lines.push("");
@@ -760,7 +868,8 @@ export function createQuestionListComponent(options: QuestionListComponentOption
         // line stays within `width`. Focus follows its public cursor location,
         // never a parsed terminal cursor-marker escape.
         const editorWidth = Math.max(1, width - 2);
-        const box = options.nativeField.render(editorWidth);
+        const box = options.nativeField.renderForPopup?.(editorWidth)
+          ?? options.nativeField.render(editorWidth);
         lines.push(`  ${box[0] ?? ""}`);
         for (const rest of box.slice(1)) lines.push(`  ${rest}`);
         if (selected) {
@@ -778,7 +887,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       if (row === TYPE_ROW) {
         text = options.nativeField
           ? theme.fg("muted", "Type something…")
-          : theme.fg("dim", "Free text unavailable — the host's native editor is not loadable; choices and Decline still work");
+          : theme.fg("dim", "Free text unavailable — the host's native editor is unavailable for safe popup editing; choices and Decline still work");
       } else if (row === DECLINE_ROW) {
         text = theme.fg("warning", "Decline (no answer will be sent)");
       } else {
@@ -859,9 +968,10 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     const nativeHeight = nativeScrollView?.viewportHeight;
     // The custom overlay uses the owned manual viewport, so no measured
     // ScrollView height is available. Advance one line rather than skipping
-    // unseen content with a terminal-sized page.
+    // unseen content with a terminal-sized page. A layout-backed view pages
+    // only its inner content area, excluding the popup border and padding.
     if (nativeHeight === undefined || nativeHeight <= 0) return 1;
-    return Math.max(1, Math.floor(nativeHeight) - 1);
+    return Math.max(1, popupContentRows(nativeHeight) - 1);
   }
 
   function resetScroll(): void {

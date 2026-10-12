@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { deflateSync } from "node:zlib";
 import test from "node:test";
+import { createTerminalGraphicsBudget, type TerminalGraphicsBudget } from "../src/session-host/kitty-graphics";
 import { TerminalSurface, TerminalFrame, TerminalInputModes, TerminalSurfaceOptions } from "../src/session-host/terminal-surface";
 
 /**
@@ -30,8 +32,87 @@ import { TerminalSurface, TerminalFrame, TerminalInputModes, TerminalSurfaceOpti
 const ESC = "\x1b";
 const SGR_PATTERN = /\x1b\[[0-9;]*m/g;
 
+function budgetTestPngBase64(): string {
+	const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+	const header = Buffer.alloc(13);
+	header.writeUInt32BE(1, 0);
+	header.writeUInt32BE(1, 4);
+	header[8] = 8;
+	header[9] = 6;
+	const chunk = (type: string, data: Buffer) => {
+		const typeBytes = Buffer.from(type, "ascii");
+		const length = Buffer.alloc(4);
+		length.writeUInt32BE(data.length);
+		const crc = Buffer.alloc(4);
+		crc.writeUInt32BE(crc32(Buffer.concat([typeBytes, data])));
+		return Buffer.concat([length, typeBytes, data, crc]);
+	};
+	return Buffer.concat([
+		signature,
+		chunk("IHDR", header),
+		chunk("IDAT", deflateSync(Buffer.from([0, 0, 0, 0, 0]))),
+		chunk("IEND", Buffer.alloc(0)),
+	]).toString("base64");
+}
+
+function crc32(input: Buffer): number {
+	let crc = 0xffffffff;
+	for (const byte of input) {
+		crc ^= byte;
+		for (let bit = 0; bit < 8; bit += 1) {
+			crc = crc & 1 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+		}
+	}
+	return (crc ^ 0xffffffff) >>> 0;
+}
+
 function makeSurface(rows = 4, cols = 20, options: TerminalSurfaceOptions = {}) {
 	return new TerminalSurface(cols, rows, options);
+}
+
+function watchTerminalPipeline(surface: TerminalSurface): {
+	counts: () => { readonly writes: number; readonly parses: number; readonly snapshots: number };
+	dispose: () => void;
+} {
+	const internals = surface as unknown as {
+		terminal: {
+			write(data: string, callback?: () => void): void;
+			onWriteParsed(listener: () => void): { dispose(): void };
+		};
+	};
+	let writes = 0;
+	let parses = 0;
+	let snapshots = 0;
+	const originalWrite = internals.terminal.write.bind(internals.terminal);
+	internals.terminal.write = (data, callback) => {
+		writes += 1;
+		originalWrite(data, callback);
+	};
+	const parsed = internals.terminal.onWriteParsed(() => {
+		parses += 1;
+	});
+	const originalFrame = surface.frame.bind(surface);
+	surface.frame = () => {
+		snapshots += 1;
+		return originalFrame();
+	};
+	return {
+		counts: () => ({ writes, parses, snapshots }),
+		dispose: () => parsed.dispose(),
+	};
+}
+
+function nativeFullFrame(index: number, final = false): string {
+	const chunks = [`${ESC}[2J`];
+	for (let row = 0; row < 42; row += 1) {
+		const label = `frame-${String(index).padStart(2, "0")} row-${String(row).padStart(2, "0")}`;
+		const text = label.padEnd(120, row % 2 === 0 ? "." : " ").slice(0, 120);
+		chunks.push(`${ESC}[${row + 1};1H${ESC}[${31 + (index % 7)}m${text}${ESC}[0m`);
+	}
+	if (final) {
+		chunks.push(`${ESC}[?2004h${ESC}[>7u${ESC}[?u${ESC}[c${ESC}[6n`);
+	}
+	return chunks.join("");
 }
 
 function plainText(line: string): string {
@@ -99,6 +180,141 @@ test("onChange fires after parsed writes, never synchronously on write", async (
 	await surface.flush();
 	assert.deepEqual(changes, before);
 	surface.dispose();
+});
+
+test("queued full-frame bursts batch real xterm parses and snapshots in normal and alternate buffers", async () => {
+	const frames = Array.from({ length: 64 }, (_, index) => nativeFullFrame(index, index === 63));
+	for (const alternate of [false, true]) {
+		let changes = 0;
+		const replies: string[] = [];
+		const batched = makeSurface(42, 120, {
+			onChange: () => { changes += 1; },
+			onReply: (reply) => { replies.push(reply); },
+		});
+		const referenceReplies: string[] = [];
+		const reference = makeSurface(42, 120, {
+			onReply: (reply) => { referenceReplies.push(reply); },
+		});
+		if (alternate) {
+			await writeAll(batched, [`${ESC}[?1049h`]);
+			await writeAll(reference, [`${ESC}[?1049h`]);
+			changes = 0;
+		}
+		const watch = watchTerminalPipeline(batched);
+		try {
+			for (let start = 0; start < frames.length; start += 8) {
+				for (const chunk of frames.slice(start, start + 8)) {
+					batched.write(chunk);
+				}
+				await batched.flush();
+			}
+			reference.write(frames.join(""));
+			await reference.flush();
+
+			assert.deepEqual(watch.counts(), { writes: 8, parses: 8, snapshots: 8 });
+			assert.equal(changes, 8, "one coherent notification per queued group of eight frames");
+			assert.deepEqual(batched.frame(), reference.frame(), "batched final cells, styles, and cursor match one real xterm parse");
+			assert.deepEqual(batched.inputModes(), reference.inputModes(), "protocol modes match the unbatched reference");
+			assert.deepEqual(replies, referenceReplies, "query replies preserve parse order and payload");
+			const replyStream = replies.join("");
+			assert.ok(replyStream.startsWith(`${ESC}[?7u${ESC}[?1;`), "Kitty reply precedes DA");
+			assert.match(replyStream, /\x1b\[\d+;\d+R$/, "DSR reply follows DA");
+		} finally {
+			watch.dispose();
+			batched.dispose();
+			reference.dispose();
+		}
+	}
+});
+
+test("single-frame writes retain one real xterm parse and one snapshot notification", async () => {
+	let changes = 0;
+	const surface = makeSurface(4, 20, { onChange: () => { changes += 1; } });
+	const watch = watchTerminalPipeline(surface);
+	try {
+		surface.write(`${ESC}[31msingle frame`);
+		await surface.flush();
+		assert.deepEqual(watch.counts(), { writes: 1, parses: 1, snapshots: 1 });
+		assert.equal(changes, 1);
+		assert.equal(plainText(surface.frame().lines[0]).trimEnd(), "single frame");
+	} finally {
+		watch.dispose();
+		surface.dispose();
+	}
+});
+
+test("graphics splitter waits for preceding reply callbacks before reserving shared budget", async () => {
+	const base = createTerminalGraphicsBudget();
+	const pendingLimit = 1024;
+	let pendingBytes = 0;
+	const graphicsBudget: TerminalGraphicsBudget = {
+		reserveImage: (...args) => base.reserveImage(...args),
+		reserveFallbackImage: () => base.reserveFallbackImage(),
+		reservePlacement: (fallback) => base.reservePlacement(fallback),
+		reservePendingTransfer: () => base.reservePendingTransfer(),
+		reservePendingBytes: (bytes) => {
+			if (pendingBytes + bytes > pendingLimit) {
+				return undefined;
+			}
+			const lease = base.reservePendingBytes(bytes);
+			if (!lease) {
+				return undefined;
+			}
+			pendingBytes += bytes;
+			let active = true;
+			return {
+				release: () => {
+					if (active) {
+						active = false;
+						pendingBytes -= bytes;
+						lease.release();
+					}
+				},
+			};
+		},
+	};
+	const holder = makeSurface(4, 20, { graphicsBudget });
+	let replyReleasedBudget = false;
+	const surface = makeSurface(4, 20, {
+		graphicsBudget,
+		onReply: (reply) => {
+			if (reply.endsWith("R")) {
+				replyReleasedBudget = true;
+				holder.dispose();
+			}
+		},
+	});
+	const png = budgetTestPngBase64();
+	try {
+		holder.write(`${ESC}_G`);
+		await holder.flush();
+		holder.write("A".repeat((pendingLimit - 2) / 2));
+		await holder.flush();
+		assert.equal(pendingBytes, pendingLimit, "an incomplete APC fills the shared pending-byte budget");
+
+		surface.write(`${ESC}[6n`);
+		const split = Math.floor(png.length / 2);
+		// Split both the APC introducer and its payload/terminator across child
+		// writes to cover preflight state carried between splitter pushes.
+		surface.write(ESC);
+		surface.write("_");
+		surface.write(`Ga=T,f=100,q=2,C=1,c=1,r=1,i=41;${png.slice(0, split)}`);
+		surface.write(png.slice(split));
+		surface.write(ESC);
+		surface.write("\\");
+		await surface.flush();
+
+		assert.equal(replyReleasedBudget, true, "the preceding DSR callback ran and disposed the budget holder");
+		assert.equal(pendingBytes, 0, "the completed APC released its pending-byte lease");
+		assert.equal(
+			surface.frame().graphics?.images.find(({ id }) => id === "kitty-41")?.base64,
+			png,
+			"the valid transfer was accepted after the reply callback freed capacity",
+		);
+	} finally {
+		surface.dispose();
+		holder.dispose();
+	}
 });
 
 test("buffer switches never expose intermediate state: invalidation only after full parse", async () => {
@@ -781,6 +997,21 @@ test("owner callback exceptions never strand the parser's parse lifecycle", asyn
 	surface.write("after");
 	await surface.flush();
 	assert.equal(plainText(surface.frame().lines[0]).trimEnd(), "after");
+	surface.dispose();
+});
+
+test("batched terminal parser failure settles queued flushes and fails closed", async () => {
+	const surface = makeSurface(3, 10);
+	const terminal = (surface as unknown as {
+		terminal: { write: (data: string, callback?: () => void) => void };
+	}).terminal;
+	terminal.write = () => {
+		throw new Error("synthetic terminal write failure");
+	};
+	surface.write("first");
+	surface.write("second");
+	await assert.rejects(surface.flush(), /parse pipeline failed/);
+	assert.throws(() => surface.write("later"), /parse pipeline failed/);
 	surface.dispose();
 });
 

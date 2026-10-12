@@ -8,7 +8,8 @@
  * genuine installed pi-tui Image with distinct constant PNG bytes and the same
  * child image ID in both processes. A small test-only trace observes the real
  * Main PTY output: the production writer's `a=t` uploads, translated `a=p`
- * placements, `d=I` deletes, and final screen restoration.
+ * placements, writer-scoped `d=I` image cleanup and `d=i` placement deletes,
+ * and final screen restoration.
  */
 import assert from "node:assert/strict";
 import { join } from "node:path";
@@ -78,6 +79,12 @@ interface ImageDelete {
   readonly sequence: number;
 }
 
+interface PlacementDelete {
+  readonly imageId: string;
+  readonly placementId: string;
+  readonly sequence: number;
+}
+
 interface PendingUpload {
   readonly id: string;
   readonly chunks: string[];
@@ -88,14 +95,17 @@ interface PendingUpload {
  * Bounded, test-only observer for the exact Kitty subset emitted by the real
  * Main frame writer. It is intentionally not a terminal parser: it tracks CSI
  * cursor positioning, complete Kitty APC/ST boundaries, PNG upload chunks,
- * placements, and image deletes only.
+ * placements, and the exact writer-generated image/placement delete forms
+ * only. It is deliberately stricter than a general Kitty terminal parser.
  */
 class HostedGraphicsTrace {
   readonly signal = new ChangeSignal();
   readonly uploads: ImageUse[] = [];
   readonly deletes: ImageDelete[] = [];
+  readonly placementDeletes: PlacementDelete[] = [];
   readonly primaryRestores: number[] = [];
   readonly images = new Map<string, TracedImage>();
+  readonly ownedImageIds = new Set<string>();
   readonly placements = new Map<string, TracedPlacement>();
   failure?: Error;
 
@@ -215,9 +225,14 @@ class HostedGraphicsTrace {
       this.consumePlacement(params);
       return;
     }
-    if (params.get("a") === "d" && params.get("d") === "I") {
+    if (params.get("a") === "d") {
+      const kind = params.get("d");
       const id = params.get("i");
-      if (id) {
+      if (params.get("q") !== "2" || !id || !isWriterKittyId(id)) {
+        throw new Error("hosted graphics trace saw an unscoped or unsuppressed delete");
+      }
+      if (kind === "I" && params.size === 4) {
+        if (!this.ownedImageIds.has(id)) throw new Error("hosted graphics trace saw an image delete for an unowned ID");
         if (this.deletes.length >= 256) throw new Error("hosted graphics trace exceeded its delete bound");
         const sequence = ++this.sequence;
         this.deletes.push({ id, sequence });
@@ -225,8 +240,20 @@ class HostedGraphicsTrace {
         for (const [placementId, placement] of this.placements) {
           if (placement.imageId === id) this.placements.delete(placementId);
         }
+        return;
       }
-      return;
+      if (kind === "i" && params.size === 5) {
+        const placementId = params.get("p");
+        const placement = placementId ? this.placements.get(placementId) : undefined;
+        if (!placementId || !isWriterKittyId(placementId) || !this.images.has(id) || placement?.imageId !== id) {
+          throw new Error("hosted graphics trace saw a placement delete outside its exact image/placement pair");
+        }
+        if (this.placementDeletes.length >= 256) throw new Error("hosted graphics trace exceeded its placement-delete bound");
+        this.placementDeletes.push({ imageId: id, placementId, sequence: ++this.sequence });
+        this.placements.delete(placementId);
+        return;
+      }
+      throw new Error("hosted graphics trace saw a Kitty delete outside the writer's scoped subset");
     }
     if (this.pendingUpload) throw new Error("hosted graphics APC interrupted a split image upload");
   }
@@ -273,6 +300,7 @@ class HostedGraphicsTrace {
       throw new Error("hosted graphics trace exceeded its image bound");
     }
     this.images.set(id, image);
+    this.ownedImageIds.add(id);
     this.uploads.push({ id, base64, sequence: ++this.sequence });
   }
 
@@ -331,6 +359,11 @@ function finiteNonNegative(value: string | undefined): number | undefined {
   if (value === undefined || !/^\d+$/.test(value)) return undefined;
   const number = Number(value);
   return Number.isSafeInteger(number) ? number : undefined;
+}
+
+function isWriterKittyId(value: string): boolean {
+  const number = finiteNonNegative(value);
+  return number !== undefined && number > 0 && number <= 0xffffffff && String(number) === value;
 }
 
 interface PlacementWaitOptions {

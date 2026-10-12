@@ -2406,20 +2406,33 @@ test("Main paints only the actual live Ghostty owner and cleans scoped graphics 
     assert.ok(formOutput.includes("\x1b_Ga=d,d=I,i=2,q=2\x1b\\"), "the form clears only A's owned image before replacing the native pane");
     assert.equal(formOutput.includes("\x1b_Ga=d,d=a"), false, "no terminal-global deletion is emitted");
 
-    harness.terminal.emitInput("\x1b"); // Cancel the form, then restore the same Main owner.
-    await nextTurn();
     const beforeRestore = harness.stdout.writes.length;
-    harness.terminal.emitInput(ALT_LEFT);
+    harness.terminal.emitInput("\x1b"); // Cancel the form: the wide roster already exposes the same Main owner.
     await nextTurn();
     const restored = harness.stdout.writes.slice(beforeRestore).join("");
-    assert.ok(restored.includes("\x1b_Ga=t,f=100,q=2,i=3;"), "restored visible content is safely re-uploaded as a later image generation");
+    assert.ok(restored.includes("\x1b_Ga=t,f=100,q=2,i=3;"), "restoring the released image uploads a later writer-owned generation");
+    assert.ok(restored.includes(`;${imageA}\x1b\\`), "the restored payload still belongs to actual owner A");
+    assert.equal(restored.includes(`;${imageB}\x1b\\`), false, "restoration never exposes the inactive owner's payload");
+    const restoredPlacement = /\x1b_Ga=p,q=2,C=1,i=3,p=(\d+),/.exec(restored);
+    assert.ok(restoredPlacement, "restoration places the new generation using a writer-owned placement ID");
+    const placementID = restoredPlacement[1]!;
+
+    const beforeFocus = harness.stdout.writes.length;
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    const focusOnly = harness.stdout.writes.slice(beforeFocus).join("");
+    assert.equal(focusOnly.includes("\x1b_Ga=t"), false, "focusing the already-visible owner does not retransmit PNG bytes");
+    assert.equal(focusOnly.includes("\x1b_Ga=d,d=I"), false, "focus alone does not discard resident image data");
 
     const beforeResize = harness.stdout.writes.length;
     harness.terminal.setSize(90, 24);
     await nextTurn();
     const resizeOutput = harness.stdout.writes.slice(beforeResize).join("");
-    assert.ok(resizeOutput.includes("\x1b_Ga=d,d=I,i=3,q=2\x1b\\"), "resize repaints after targeted cleanup of the sent geometry");
-    assert.ok(resizeOutput.includes("\x1b_Ga=t,f=100,q=2,i=3;"), "the same image generation is re-uploaded for new geometry");
+    const deletePlacement = resizeOutput.indexOf(`\x1b_Ga=d,d=i,i=3,p=${placementID},q=2\x1b\\`);
+    const replacePlacement = resizeOutput.indexOf(`\x1b_Ga=p,q=2,C=1,i=3,p=${placementID},`);
+    assert.ok(deletePlacement >= 0 && replacePlacement > deletePlacement, "resize cleans the exact owned placement before repainting its geometry");
+    assert.equal(resizeOutput.includes("\x1b_Ga=d,d=I"), false, "same-owner resize retains the resident PNG");
+    assert.equal(resizeOutput.includes("\x1b_Ga=t"), false, "same-owner resize does not retransmit image data");
 
     harness.terminal.emitInput(ALT_LEFT); // Wide roster focus still shows the native pane.
     await nextTurn();

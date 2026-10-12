@@ -190,6 +190,17 @@ interface PendingWrite {
 	resolve: () => void;
 }
 
+type GraphicsPreflightState =
+	| "ground"
+	| "escape"
+	| "apc-start"
+	| "kitty"
+	| "kitty-escape"
+	| "opaque-osc"
+	| "opaque-string"
+	| "opaque-osc-escape"
+	| "opaque-string-escape";
+
 /** Per-screen-mode Kitty keyboard state (independent normal vs alternate). */
 interface KittyState {
 	/** Current effective flags of this buffer's mode (already masked). */
@@ -254,6 +265,10 @@ const LOW_WATERMARK_BYTES = 256 * 1024;
 // Queued writes are also bounded by count: pause above the high watermark
 // and hard-fail at this cap so tiny chunks cannot enqueue unbounded promises.
 const MAX_QUEUED_WRITES = 4096;
+// Keep each parse batch bounded while allowing xterm's WriteBuffer to coalesce
+// adjacent text-only chunks into one event-loop cycle.
+const MAX_TERMINAL_BATCH_WRITES = 64;
+const MAX_TERMINAL_BATCH_BYTES = 256 * 1024;
 const HIGH_WATERMARK_WRITES = 2048;
 const LOW_WATERMARK_WRITES = 1024;
 const MAX_DIMENSION = 1000;
@@ -443,6 +458,7 @@ export class TerminalSurface {
 	private readonly kittyAlternate: KittyState = { current: 0, stack: [] };
 	private readonly graphicsSplitter: KittyGraphicsSplitter;
 	private readonly graphics: KittyGraphicsState;
+	private graphicsPreflightState: GraphicsPreflightState = "ground";
 	private options: TerminalSurfaceOptions;
 	private readonly maxPendingBytes: number;
 	private readonly highWatermarkBytes: number;
@@ -843,6 +859,7 @@ export class TerminalSurface {
 		this.disposed = true;
 		this.activeTerminalWriteResolve?.();
 		this.graphicsSplitter.dispose();
+		this.graphicsPreflightState = "ground";
 		this.graphics.clear();
 		this.kittyNormal.current = 0;
 		this.kittyNormal.stack.length = 0;
@@ -877,44 +894,263 @@ export class TerminalSurface {
 		void Promise.resolve().then(() => this.processPendingWrites());
 	}
 
+	/** Detect splitter mutations that must wait for preceding xterm callbacks. */
+	private preflightGraphicsChunk(data: string): boolean {
+		let state = this.graphicsPreflightState;
+		let sensitive = state === "escape" || state === "apc-start" || state === "kitty" || state === "kitty-escape";
+		let offset = 0;
+		while (offset < data.length) {
+			switch (state) {
+				case "ground": {
+					const control = this.nextGraphicsPreflightControl(data, offset);
+					if (control < 0) {
+						offset = data.length;
+						break;
+					}
+					offset = control;
+					const code = data.charCodeAt(offset);
+					if (code === 0x1b) {
+						if (offset + 1 >= data.length) {
+							state = "escape";
+							sensitive = true;
+							offset += 1;
+						} else {
+							const next = data[offset + 1] as string;
+							if (next === "_") {
+								state = "apc-start";
+								sensitive = true;
+							} else if (next === "]") {
+								state = "opaque-osc";
+							} else if (next === "P" || next === "^" || next === "X") {
+								state = "opaque-string";
+							} else {
+								state = "ground";
+							}
+							offset += 2;
+						}
+					} else if (code === 0x9f) {
+						state = "apc-start";
+						sensitive = true;
+						offset += 1;
+					} else if (code === 0x9d) {
+						state = "opaque-osc";
+						offset += 1;
+					} else {
+						state = "opaque-string";
+						offset += 1;
+					}
+					break;
+				}
+				case "escape": {
+					const next = data[offset] as string;
+					if (next === "_") {
+						state = "apc-start";
+						sensitive = true;
+					} else if (next === "]") {
+						state = "opaque-osc";
+					} else if (next === "P" || next === "^" || next === "X") {
+						state = "opaque-string";
+					} else {
+						state = "ground";
+					}
+					offset += 1;
+					break;
+				}
+				case "apc-start": {
+					const next = data[offset] as string;
+					if (next === "G") {
+						state = "kitty";
+						sensitive = true;
+					} else if (next === "\x9c") {
+						state = "ground";
+					} else if (next === "\x1b") {
+						state = "opaque-string-escape";
+					} else {
+						state = "opaque-string";
+					}
+					offset += 1;
+					break;
+				}
+				case "kitty": {
+					const c1Terminator = data.indexOf("\x9c", offset);
+					const escape = data.indexOf("\x1b", offset);
+					if (c1Terminator >= 0 && (escape < 0 || c1Terminator < escape)) {
+						state = "ground";
+						offset = c1Terminator + 1;
+					} else if (escape < 0) {
+						offset = data.length;
+					} else if (escape + 1 >= data.length) {
+						state = "kitty-escape";
+						offset = escape + 1;
+					} else if (data[escape + 1] === "\\") {
+						state = "ground";
+						offset = escape + 2;
+					} else {
+						offset = escape + 2;
+					}
+					break;
+				}
+				case "kitty-escape":
+					if (data[offset] === "\\") {
+						state = "ground";
+						offset += 1;
+					} else {
+						state = "kitty";
+					}
+					break;
+				case "opaque-osc-escape":
+				case "opaque-string-escape":
+					if (data[offset] === "\\") {
+						state = "ground";
+						offset += 1;
+					} else {
+						state = state === "opaque-osc-escape" ? "opaque-osc" : "opaque-string";
+					}
+					break;
+				case "opaque-osc":
+				case "opaque-string": {
+					const isOsc = state === "opaque-osc";
+					let terminator = data.indexOf("\x9c", offset);
+					const escape = data.indexOf("\x1b", offset);
+					const bell = isOsc ? data.indexOf("\x07", offset) : -1;
+					if (escape >= 0 && (terminator < 0 || escape < terminator)) {
+						terminator = escape;
+					}
+					if (bell >= 0 && (terminator < 0 || bell < terminator)) {
+						terminator = bell;
+					}
+					if (terminator < 0) {
+						if (data[data.length - 1] === "\x1b") {
+							state = isOsc ? "opaque-osc-escape" : "opaque-string-escape";
+						}
+						offset = data.length;
+					} else if (data[terminator] === "\x9c" || data[terminator] === "\x07") {
+						state = "ground";
+						offset = terminator + 1;
+					} else if (terminator + 1 < data.length && data[terminator + 1] === "\\") {
+						state = "ground";
+						offset = terminator + 2;
+					} else if (terminator + 1 < data.length) {
+						offset = terminator + 2;
+					} else {
+						state = isOsc ? "opaque-osc-escape" : "opaque-string-escape";
+						offset = terminator + 1;
+					}
+					break;
+				}
+			}
+		}
+		this.graphicsPreflightState = state;
+		return sensitive;
+	}
+
+	private nextGraphicsPreflightControl(data: string, start: number): number {
+		for (let index = start; index < data.length; index += 1) {
+			const code = data.charCodeAt(index);
+			if (code === 0x1b || code === 0x9f || code === 0x90 || code === 0x9e || code === 0x98 || code === 0x9d) {
+				return index;
+			}
+		}
+		return -1;
+	}
+
 	private async processPendingWrites(): Promise<void> {
 		try {
 			while (!this.disposed && this.pendingWrites.length > 0) {
-				const pending = this.pendingWrites[0] as PendingWrite;
 				this.processingWrite = true;
-				const parts = this.graphicsSplitter.push(pending.data);
-				for (const part of parts) {
+				const maxBatchWrites = this.hasAlternateGraphicsPlacements()
+					? 1
+					: MAX_TERMINAL_BATCH_WRITES;
+				const batch: PendingWrite[] = [];
+				let batchBytes = 0;
+				for (const pending of this.pendingWrites) {
+					if (batch.length >= maxBatchWrites) {
+						break;
+					}
+					if (batch.length > 0 && batchBytes + pending.size > MAX_TERMINAL_BATCH_BYTES) {
+						break;
+					}
+					batch.push(pending);
+					batchBytes += pending.size;
+					if (batchBytes >= MAX_TERMINAL_BATCH_BYTES) {
+						break;
+					}
+				}
+				const terminalParts: string[] = [];
+				const textPending: PendingWrite[] = [];
+
+				for (const pending of batch) {
 					if (this.disposed) {
 						return;
 					}
-					if (part.kind === "terminal") {
-						await this.writeToTerminal(part.data);
-						this.applyPendingAlternateGraphicsInvalidation();
-						const screen = this.alternateScreenState();
-						this.graphics.validateAlternateScreen(screen.textAt, false);
-					} else if (part.kind === "graphics") {
-						// Let xterm consume a generated empty APC before the typed event.
-						// This returns a parser left mid-CSI/ESC to ground without ever
-						// forwarding the child's payload or changing cursor position.
-						await this.writeToTerminal(SAFE_EMPTY_APC);
-						this.graphics.process(part.command, this.graphicsPosition(part.command));
-					} else if (part.kind === "discard") {
-						await this.writeToTerminal(SAFE_EMPTY_APC);
-						this.graphics.discard();
-					} else {
-						await this.writeToTerminal(SAFE_EMPTY_APC);
-						this.graphics.clear();
+					if (this.preflightGraphicsChunk(pending.data)) {
+						// Preflight before mutating the splitter: it can reserve shared
+						// pending-byte budget even when this APC continues in a later
+						// child chunk and emits no typed event yet.
+						await this.flushTerminalBatch(terminalParts, textPending);
+						terminalParts.length = 0;
+						textPending.length = 0;
+						if (this.disposed) {
+							return;
+						}
+						const parts = this.graphicsSplitter.push(pending.data);
+						for (const part of parts) {
+							if (this.disposed) {
+								return;
+							}
+							if (part.kind === "terminal") {
+								await this.writeToTerminal(part.data);
+								if (this.disposed) {
+									return;
+								}
+								this.afterTerminalWrite();
+							} else if (part.kind === "graphics") {
+								// Let xterm consume a generated empty APC before the typed event.
+								// This returns a parser left mid-CSI/ESC to ground without ever
+								// forwarding the child's payload or changing cursor position.
+								await this.writeToTerminal(SAFE_EMPTY_APC);
+								if (this.disposed) {
+									return;
+								}
+								this.graphics.process(part.command, this.graphicsPosition(part.command));
+							} else if (part.kind === "discard") {
+								await this.writeToTerminal(SAFE_EMPTY_APC);
+								if (this.disposed) {
+									return;
+								}
+								this.graphics.discard();
+							} else {
+								await this.writeToTerminal(SAFE_EMPTY_APC);
+								if (this.disposed) {
+									return;
+								}
+								this.graphics.clear();
+							}
+						}
+						this.completePendingWrites([pending]);
+						if (!this.disposed) {
+							this.invalidate();
+						}
+						// Potential graphics chunks are batch boundaries, including
+						// incomplete prefixes and payload continuations. The next chunk
+						// must not mutate the splitter until these bytes have parsed.
+						break;
 					}
+					const parts = this.graphicsSplitter.push(pending.data);
+					if (parts.some((part) => part.kind !== "terminal")) {
+						throw new Error("TerminalSurface graphics preflight missed a splitter barrier");
+					}
+					for (const part of parts) {
+						if (part.kind === "terminal") {
+							terminalParts.push(part.data);
+						}
+					}
+					textPending.push(pending);
 				}
-				this.processingWrite = false;
-				if (this.disposed) {
-					return;
+
+				if (textPending.length > 0) {
+					await this.flushTerminalBatch(terminalParts, textPending);
 				}
-				this.pendingWrites.shift();
-				this.pendingBytes -= pending.size;
-				pending.resolve();
-				this.updateBackpressure();
-				this.invalidate();
 			}
 		} catch {
 			// A parser or protocol helper failure must not strand flush callers
@@ -933,6 +1169,54 @@ export class TerminalSurface {
 				this.drainPendingWrites();
 			}
 		}
+	}
+
+	/** Parse a bounded run of adjacent text chunks with one xterm write. */
+	private async flushTerminalBatch(parts: string[], pending: PendingWrite[]): Promise<void> {
+		if (this.disposed) {
+			return;
+		}
+		if (parts.length > 0) {
+			await this.writeToTerminal(parts.join(""));
+			if (this.disposed) {
+				return;
+			}
+			this.afterTerminalWrite();
+		}
+		if (this.disposed) {
+			return;
+		}
+		this.completePendingWrites(pending);
+		if (!this.disposed && parts.length > 0) {
+			this.invalidate();
+		}
+	}
+
+	private afterTerminalWrite(): void {
+		this.applyPendingAlternateGraphicsInvalidation();
+		const screen = this.alternateScreenState();
+		this.graphics.validateAlternateScreen(screen.textAt, false);
+	}
+
+	private completePendingWrites(pending: readonly PendingWrite[]): void {
+		for (const item of pending) {
+			if (this.disposed) {
+				return;
+			}
+			if (this.pendingWrites.shift() !== item) {
+				throw new Error("TerminalSurface pending-write order was corrupted");
+			}
+			this.pendingBytes -= item.size;
+			item.resolve();
+			this.updateBackpressure();
+		}
+	}
+
+	/** Alternate anchors require per-chunk validation, including across buffer switches. */
+	private hasAlternateGraphicsPlacements(): boolean {
+		const buffer = this.terminal.buffer.alternate;
+		const graphics = this.graphics.frame("alternate", buffer.viewportY, this.terminal.cols, this.terminal.rows);
+		return (graphics?.placements.length ?? 0) > 0 || (graphics?.fallbacks.length ?? 0) > 0;
 	}
 
 	private writeToTerminal(data: string): Promise<void> {

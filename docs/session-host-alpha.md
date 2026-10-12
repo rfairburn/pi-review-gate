@@ -562,7 +562,27 @@ Pi menu will remain readable.
 
 The native Main mouse path is cell-based and applies only to the active native frame;
 events outside that frame are dropped before coordinate translation, never clamped to
-the pane edge. Sidebar-target clicks are handled by the host and are not forwarded to a
+the pane edge. The one exception is an owned Main gesture: when Main has focus and a
+left, middle, or right button press was actually delivered to the current live Main owner whose native child
+requested release-reporting mouse tracking, that button's held motion and its release
+stay with that same owner even when the pointer crosses the sidebar, a form, the header,
+or the divider. Only those continuation events are clamped to the edge of the unchanged
+native pane, keeping their button, modifier bits, and source encoding. They never activate
+a roster row or form. Wheel input, extended mouse buttons, hover motion without a held
+button, and every other outside event keep the drop rule. The gesture ends without a
+synthetic release if any of these happens first: Main loses focus, the owner, its
+terminal surface, the pane geometry, or the child's mouse mode changes, a host-pane
+gesture starts, an external editor handoff occurs, or the host shuts down. A legacy
+X10 release while several buttons may still be held is ambiguous. This includes a
+button whose press was dropped outside the native pane. Such a release ends the gesture
+the same way. Once a gesture ends this way, the rest of its motion and its
+release are discarded, inside or outside the native pane. They are not delivered to the
+original owner, a newly focused owner, or a host pane. This lasts until that button's
+unambiguous release or its next press, and it persists across a pause in mouse reporting
+or an external editor handoff. A legacy release that does not identify its button is
+also discarded, without guessing which button ended, while any such button may still
+be held.
+Sidebar-target clicks are handled by the host and are not forwarded to a
 native child. The first left click in the visible native pane while the roster owns
 focus is consumed to return focus to that active Main owner; subsequent mouse input is
 forwarded normally. This does not add conversation wheel/trackpad scrolling (#332). On

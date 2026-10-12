@@ -42,6 +42,11 @@ dates.
 
 ### Fixed
 
+- Main-owned primary-button gestures retain motion and release delivery when
+  crossing Session Host panes. Only continuations of a press delivered to the
+  same live Main owner are clamped to its unchanged native pane; owner, focus,
+  surface, geometry, mouse-mode, editor-handoff, and shutdown changes cancel
+  ownership. Ordinary outside events and wheel routing remain unchanged.
 - The shared answer popup uses the host-owned native editor for both input and
   popup rendering, suppressing its ordinary prompt rows instead of creating a
   second render-only editor. Native actions and the single caret stay in the

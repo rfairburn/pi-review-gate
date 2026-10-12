@@ -543,6 +543,12 @@ interface StoredPlacement {
 	readonly fallbackHeightPx?: number;
 	readonly fallbackOnly?: boolean;
 	readonly alternateRows?: readonly AlternateRowSnapshot[];
+	/**
+	 * Alternate placement made inside an open synchronized frame. Its exact
+	 * event-time cell position and crop are kept; its footprint text is
+	 * anchored only when that frame completes (or is aborted).
+	 */
+	readonly provisional?: boolean;
 	readonly geometryCols: number;
 	readonly geometryRows: number;
 }
@@ -570,6 +576,12 @@ export class KittyGraphicsState {
 	private pending?: PendingTransfer;
 	private nextImageId = 1;
 	private revisionValue = 0;
+	private deferAlternateAnchors = false;
+	/** Image/placement identities referenced by the surface's held published snapshot. */
+	private readonly publishedImages = new Map<string, TerminalGraphicsImage>();
+	private readonly publishedPlacements = new Map<string, StoredPlacement>();
+	/** Leases of removed state that the held published snapshot still references. */
+	private readonly retainedLeases: TerminalGraphicsBudgetLease[] = [];
 
 	constructor(private readonly budget: TerminalGraphicsBudget = createTerminalGraphicsBudget()) {}
 
@@ -631,8 +643,8 @@ export class KittyGraphicsState {
 
 	clear(): void {
 		this.invalidatePlacements();
-		for (const lease of this.imageLeases.values()) {
-			lease.release();
+		for (const [id, lease] of this.imageLeases) {
+			this.releaseImageLease(id, lease);
 		}
 		for (const lease of this.fallbackLeases.values()) {
 			lease.release();
@@ -644,6 +656,98 @@ export class KittyGraphicsState {
 		this.fallbackLeases.clear();
 		this.cancelPending();
 		this.revisionValue += 1;
+	}
+
+	/** Final teardown: release live state and anything a held snapshot retained. */
+	dispose(): void {
+		this.releasePublished();
+		this.deferAlternateAnchors = false;
+		this.clear();
+	}
+
+	/**
+	 * Start deferring alternate anchor capture: placements made while a
+	 * synchronized frame is open keep their exact event-time cell position and
+	 * crop, but their footprint text is captured against the completed frame.
+	 */
+	beginDeferredAlternateAnchors(): void {
+		this.deferAlternateAnchors = true;
+	}
+
+	/**
+	 * Anchor every provisional alternate placement against `textAt` (the
+	 * completed frame's alternate cells) and stop deferring. Without a readable
+	 * alternate screen the provisional placements are removed, never guessed.
+	 */
+	finalizeDeferredAlternateAnchors(textAt: TerminalGraphicsPosition["alternateTextAt"]): void {
+		this.deferAlternateAnchors = false;
+		for (const [key, placement] of this.placements) {
+			if (!placement.provisional) {
+				continue;
+			}
+			const alternateRows = textAt === undefined
+				? undefined
+				: captureAlternateRows(
+					textAt,
+					placement.column,
+					placement.row,
+					placement.columns,
+					placement.rows,
+					placement.geometryRows,
+				);
+			if (alternateRows === undefined) {
+				this.removePlacement(key);
+				continue;
+			}
+			const { provisional, ...rest } = placement;
+			void provisional;
+			this.placements.set(key, Object.freeze({ ...rest, alternateRows }));
+		}
+	}
+
+	/** Drop provisional alternate placements whose frame cannot be completed. */
+	discardDeferredAlternateAnchors(): void {
+		this.finalizeDeferredAlternateAnchors(undefined);
+	}
+
+	/**
+	 * Mark the images and placements referenced by a held published snapshot.
+	 * While held, removing them from live state moves their budget leases to a
+	 * retained list instead of releasing them, so payload the snapshot still
+	 * references stays charged to the shared budget. Re-pinning releases the
+	 * previous snapshot's retained leases.
+	 */
+	retainPublished(frame: TerminalGraphicsFrame | undefined, buffer: "normal" | "alternate"): void {
+		this.releasePublished();
+		if (!frame) {
+			return;
+		}
+		for (const image of frame.images) {
+			if (this.images.get(image.id) === image) {
+				this.publishedImages.set(image.id, image);
+			}
+		}
+		for (const placement of [...frame.placements, ...frame.fallbacks]) {
+			const key = `${buffer}:${placement.id}`;
+			const stored = this.placements.get(key);
+			if (stored) {
+				this.publishedPlacements.set(key, stored);
+			}
+		}
+	}
+
+	/** The held snapshot is no longer referenced: release everything it retained. */
+	releasePublished(): void {
+		this.publishedImages.clear();
+		this.publishedPlacements.clear();
+		for (const lease of this.retainedLeases.splice(0)) {
+			lease.release();
+		}
+	}
+
+	/** Number of removed-state leases still charged for a held snapshot. */
+	get retainedLeaseCount(): number {
+		return this.retainedLeases.length;
 	}
 
 	/** Track alternate anchors by bounded footprint hashes; destructive controls clear them. */
@@ -659,7 +763,7 @@ export class KittyGraphicsState {
 			return;
 		}
 		for (const [key, placement] of this.placements) {
-			if (placement.buffer !== "alternate") {
+			if (placement.buffer !== "alternate" || placement.provisional) {
 				continue;
 			}
 			const anchors = placement.alternateRows;
@@ -1145,7 +1249,10 @@ export class KittyGraphicsState {
 			return;
 		}
 		const image = this.images.get(imageIdValue) as TerminalGraphicsImage;
-		const alternateRows = position.buffer === "alternate" ? captureAlternateRows(position, columns, rows) : undefined;
+		const provisional = position.buffer === "alternate" && this.deferAlternateAnchors;
+		const alternateRows = position.buffer === "alternate" && !provisional
+			? capturePositionAlternateRows(position, columns, rows)
+			: undefined;
 		this.placements.set(key, {
 			id,
 			imageId: imageIdValue,
@@ -1159,6 +1266,7 @@ export class KittyGraphicsState {
 			fallbackWidthPx: image.widthPx,
 			fallbackHeightPx: image.heightPx,
 			...(alternateRows === undefined ? {} : { alternateRows }),
+			...(provisional ? { provisional } : {}),
 			geometryCols: position.cols,
 			geometryRows: position.rows,
 		});
@@ -1203,7 +1311,10 @@ export class KittyGraphicsState {
 			position.marker?.dispose();
 			return;
 		}
-		const alternateRows = position.buffer === "alternate" ? captureAlternateRows(position, columns, rows) : undefined;
+		const provisional = position.buffer === "alternate" && this.deferAlternateAnchors;
+		const alternateRows = position.buffer === "alternate" && !provisional
+			? capturePositionAlternateRows(position, columns, rows)
+			: undefined;
 		this.placements.set(key, {
 			id,
 			imageId: imageIdValue,
@@ -1217,6 +1328,7 @@ export class KittyGraphicsState {
 			...(heightPx === undefined ? {} : { fallbackHeightPx: heightPx }),
 			fallbackOnly: true,
 			...(alternateRows === undefined ? {} : { alternateRows }),
+			...(provisional ? { provisional } : {}),
 			geometryCols: position.cols,
 			geometryRows: position.rows,
 		});
@@ -1230,10 +1342,28 @@ export class KittyGraphicsState {
 			return;
 		}
 		this.placements.delete(id);
-		this.placementLeases.get(id)?.release();
+		const lease = this.placementLeases.get(id);
 		this.placementLeases.delete(id);
+		if (lease && this.publishedPlacements.get(id) === placement) {
+			// The held snapshot still shows this placement; keep it charged.
+			this.publishedPlacements.delete(id);
+			this.retainedLeases.push(lease);
+		} else {
+			lease?.release();
+		}
 		placement.marker?.dispose();
 		this.revisionValue += 1;
+	}
+
+	private releaseImageLease(id: string, lease: TerminalGraphicsBudgetLease): void {
+		const image = this.images.get(id);
+		if (image !== undefined && this.publishedImages.get(id) === image) {
+			// The held snapshot still references this exact payload string.
+			this.publishedImages.delete(id);
+			this.retainedLeases.push(lease);
+			return;
+		}
+		lease.release();
 	}
 
 	private clearPlacements(buffer?: "normal" | "alternate"): void {
@@ -1250,9 +1380,12 @@ export class KittyGraphicsState {
 			|| this.fallbackImages.has(id)
 			|| this.imageLeases.has(id)
 			|| this.fallbackLeases.has(id);
+		const imageLease = this.imageLeases.get(id);
+		if (imageLease) {
+			this.releaseImageLease(id, imageLease);
+		}
 		this.images.delete(id);
 		this.imageSizes.delete(id);
-		this.imageLeases.get(id)?.release();
 		this.imageLeases.delete(id);
 		this.fallbackImages.delete(id);
 		this.fallbackLeases.get(id)?.release();
@@ -1665,7 +1798,7 @@ function validFallbackCrop(params: ReadonlyMap<string, string>, info: ImageFallb
 	return true;
 }
 
-function captureAlternateRows(
+function capturePositionAlternateRows(
 	position: TerminalGraphicsPosition,
 	columns: number,
 	rows: number,
@@ -1674,13 +1807,24 @@ function captureAlternateRows(
 	if (!textAt) {
 		return undefined;
 	}
+	return captureAlternateRows(textAt, position.column, position.row, columns, rows, position.rows);
+}
+
+function captureAlternateRows(
+	textAt: (row: number, column: number, width: number) => string,
+	column: number,
+	topRow: number,
+	columns: number,
+	rows: number,
+	screenRows: number,
+): readonly AlternateRowSnapshot[] | undefined {
 	const snapshots: AlternateRowSnapshot[] = [];
-	const firstRow = Math.max(0, position.row);
-	const endRow = Math.min(position.rows, position.row + rows);
+	const firstRow = Math.max(0, topRow);
+	const endRow = Math.min(screenRows, topRow + rows);
 	for (let row = firstRow; row < endRow; row += 1) {
 		snapshots.push(Object.freeze({
-			offset: row - position.row,
-			textHash: alternateTextHash(textAt(row, position.column, columns)),
+			offset: row - topRow,
+			textHash: alternateTextHash(textAt(row, column, columns)),
 		}));
 	}
 	return snapshots.length === 0 ? undefined : Object.freeze(snapshots);

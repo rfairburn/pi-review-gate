@@ -20,7 +20,7 @@ import type { KeyboardCapabilityObserverOptions } from "../src/session-host/inpu
 import type { StatusBroker, StatusRenameRequest, StatusRenameResult } from "../src/session-host/broker";
 import { NativeAgentRegistry, type ProfilePreparer } from "../src/session-host/profiles";
 import { runNativeExternalEditor } from "../src/session-host/form-support";
-import type { TerminalFrame, TerminalInputModes } from "../src/session-host/terminal-surface";
+import { TerminalSurface, type TerminalFrame, type TerminalInputModes, type TerminalMouseReportingRequest } from "../src/session-host/terminal-surface";
 import type { TerminalGraphicsFrame } from "../src/session-host/kitty-graphics";
 import { SidebarController } from "../src/session-host/sidebar";
 import { isSavedSessionAdmission, listSavedSessions, type SavedSessionCatalog } from "../src/session-host/saved-sessions";
@@ -271,6 +271,12 @@ class FakeSurface {
   }
 
   inputModes(): TerminalInputModes { return { ...this.modes }; }
+
+  // This fake never holds a synchronized frame, so the child's request equals
+  // its live modes; held-frame behavior is covered with a real TerminalSurface.
+  requestedMouseReporting(): TerminalMouseReportingRequest {
+    return { mouseTracking: this.modes.mouseTracking, mouseEncoding: this.modes.mouseEncoding };
+  }
 }
 
 class FakeManager {
@@ -3044,6 +3050,129 @@ test("mouse routing uses active live child modes, mode-only changes, native view
   assert.equal(await closeWithSignal(harness), 0);
   assert.ok(harness.terminal.writes.includes("\x1b[?1000l"), "cleanup disables only the active owned tracking mode");
   assert.ok(harness.terminal.writes.includes("\x1b[?1006l"), "cleanup disables only owned cell-SGR encoding");
+});
+
+test("held synchronized frames keep outer mouse capture stable while native packets stay fenced (real TerminalSurface)", async () => {
+  const BEGIN = "\x1b[?2026h";
+  const END = "\x1b[?2026l";
+  const CLICK = "\x1b[<0;35;2M"; // absolute (35,2) => native pane origin + (1,0)
+  const FORWARDED_CLICK = "\x1b[<0;2;1M";
+  const harness = createHarness();
+  const manager = await ready(harness);
+  fillForm(harness.terminal, "held-frame mouse owner");
+  await nextTurn();
+  const fake = manager.surface("native-1");
+  assert.ok(fake);
+  assert.equal(harness.sidebar?.focus, "main");
+  assert.equal(harness.sidebar?.visible, true);
+  // Swap in a real surface at the fake's current native geometry; its owner
+  // callback is the manager change notification, as in the real manager.
+  const surface = new TerminalSurface(fake.cols, fake.rows, { onChange: () => manager.notify("native-1") });
+  manager.surfaces.set("native-1", surface as unknown as FakeSurface);
+  const child = async (data: string): Promise<void> => {
+    surface.write(data);
+    await surface.flush();
+    await nextTurn();
+  };
+  const outerWrites = (): number => harness.terminal.writes.length;
+  try {
+    await child("\x1b[?1049h\x1b[1;1Hcommitted row\x1b[?1002h\x1b[?1006h");
+    assert.deepEqual(harness.terminal.writes.slice(-2), ["\x1b[?1000l", "\x1b[?1002h"],
+      "the child's drag mode replaces the visible host pane's button reports");
+    assert.ok(harness.terminal.writes.includes("\x1b[?1006h"), "cell-SGR reports are enabled");
+    const before = manager.writes.length;
+    harness.terminal.emitInput(CLICK);
+    assert.deepEqual(manager.writes.slice(before).map((entry) => entry.data), [FORWARDED_CLICK],
+      "an authorized click is forwarded before any hold");
+
+    // Held frame: keyboard mode changes, no text/graphics/mouse change.
+    const heldStart = outerWrites();
+    await child(`${BEGIN}\x1b[1;1H\x1b[2Kcommitted row\x1b[?1h`);
+    assert.equal(surface.inputModes().mouseTracking, "none", "packet authorization is withheld while held");
+    assert.equal(surface.inputModes().applicationCursorKeys, true, "keyboard modes stay live while held");
+    assert.deepEqual(surface.requestedMouseReporting(), { mouseTracking: "drag", mouseEncoding: "sgr" });
+    manager.notify("sibling-roster-update"); // a sibling/roster change synchronizes outer modes mid-hold
+    await nextTurn();
+    assert.deepEqual(harness.terminal.writes.slice(heldStart), [],
+      "a mid-hold roster sync neither disables nor downgrades the child's outer capture");
+    const heldPackets = manager.writes.length;
+    harness.terminal.emitInput(CLICK);
+    assert.equal(manager.writes.length, heldPackets, "native mouse packets stay fenced during the hold");
+    harness.terminal.emitInput("\x1b[A");
+    assert.deepEqual(manager.writes.slice(heldPackets).map((entry) => entry.data), ["\x1bOA"],
+      "keyboard input uses the live application-cursor mode during the hold");
+
+    // Commit without any text, graphics, or mouse-mode change: no change
+    // notification is required for capture to remain correct.
+    await child(END);
+    manager.notify("sibling-roster-update");
+    await nextTurn();
+    assert.deepEqual(harness.terminal.writes.slice(heldStart), [],
+      "outer capture is unchanged across the hold and its no-change commit");
+    const resumed = manager.writes.length;
+    harness.terminal.emitInput(CLICK);
+    assert.deepEqual(manager.writes.slice(resumed).map((entry) => entry.data), [FORWARDED_CLICK],
+      "post-commit packets resume for the same authorized owner");
+
+    // A real revocation inside a held frame applies when the frame ends,
+    // without mid-frame off/on churn from roster syncs.
+    const revokeStart = outerWrites();
+    await child(`${BEGIN}\x1b[?1002l`);
+    manager.notify("sibling-roster-update");
+    await nextTurn();
+    assert.deepEqual(harness.terminal.writes.slice(revokeStart), [], "no churn while the revocation is uncommitted");
+    await child(END);
+    assert.deepEqual(harness.terminal.writes.slice(revokeStart), ["\x1b[?1002l", "\x1b[?1000h"],
+      "the committed revocation notifies and leaves only the visible host pane's button reports");
+    const revoked = manager.writes.length;
+    harness.terminal.emitInput(CLICK);
+    assert.equal(manager.writes.length, revoked, "no packet is forwarded after the child revoked reporting");
+
+    // Re-grant unframed, then hold again: focus changes are real owner
+    // changes and still reconfigure capture during a hold.
+    const regrantStart = outerWrites();
+    await child("\x1b[?1002h");
+    assert.deepEqual(harness.terminal.writes.slice(regrantStart), ["\x1b[?1000l", "\x1b[?1002h"]);
+    await child(BEGIN);
+    const focusStart = outerWrites();
+    harness.terminal.emitInput(ALT_LEFT); // Main -> sidebar focus
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "sidebar");
+    assert.deepEqual(harness.terminal.writes.slice(focusStart), ["\x1b[?1002l", "\x1b[?1000h"],
+      "leaving Main during a hold still drops the child's mode to host button reports");
+    // A left click on the displayed native pane is a host-owned focus
+    // gesture (geometry unchanged, so the hold is not dropped by a resize).
+    const focusClickPackets = manager.writes.length;
+    harness.terminal.emitInput(CLICK);
+    harness.terminal.emitInput("\x1b[<0;35;2m");
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "main");
+    assert.equal(harness.sidebar?.visible, true);
+    assert.equal(manager.writes.length, focusClickPackets, "the focus gesture's press and release stay host-owned");
+    assert.deepEqual(harness.terminal.writes.slice(focusStart),
+      ["\x1b[?1002l", "\x1b[?1000h", "\x1b[?1000l", "\x1b[?1002h"],
+      "returning to Main mid-hold restores the committed request, not the withheld packet mode");
+    const focusedHeld = manager.writes.length;
+    harness.terminal.emitInput(CLICK);
+    assert.equal(manager.writes.length, focusedHeld, "the native fence still holds after the focus round trip");
+    await child(END);
+    assert.deepEqual(harness.terminal.writes.slice(focusStart),
+      ["\x1b[?1002l", "\x1b[?1000h", "\x1b[?1000l", "\x1b[?1002h"], "the no-change commit adds no outer writes");
+    const focusedResumed = manager.writes.length;
+    harness.terminal.emitInput(CLICK);
+    assert.deepEqual(manager.writes.slice(focusedResumed).map((entry) => [entry.id, entry.data]),
+      [["native-1", FORWARDED_CLICK]], "the committed frame re-authorizes the same owner");
+
+    // Shutdown during a hold disables exactly the owned modes.
+    await child(BEGIN);
+    const shutdownStart = outerWrites();
+    assert.equal(await closeWithSignal(harness), 0);
+    const cleanup = harness.terminal.writes.slice(shutdownStart);
+    assert.ok(cleanup.includes("\x1b[?1002l"), "shutdown disables the child's owned tracking mode");
+    assert.ok(cleanup.includes("\x1b[?1006l"), "shutdown disables owned cell-SGR encoding");
+  } finally {
+    surface.dispose();
+  }
 });
 
 test("responsive resize resizes every owned child only when native geometry changes; overlays keep geometry stable", async () => {

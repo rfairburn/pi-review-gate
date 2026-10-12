@@ -67,7 +67,7 @@ import {
   type SidebarItem,
   type SidebarMousePresentation,
 } from "./sidebar";
-import type { TerminalInputModes } from "./terminal-surface";
+import type { TerminalMouseReportingRequest } from "./terminal-surface";
 
 const STARTUP_OPTIONS_HELPER = join("scripts", "session-host-startup-options.cjs");
 const GENERIC_FAILURE_MESSAGE = "Session host could not complete startup or cleanup.";
@@ -710,9 +710,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     let desiredTracking: number | undefined;
     let useSgr = false;
     if (sidebar.focus === "main" && surface) {
-      let modes: TerminalInputModes | undefined;
+      // Outer capture follows the child's requested reporting, which stays at
+      // the committed frame's request while a synchronized frame is held, so
+      // a sibling or roster sync mid-frame cannot drop or downgrade capture.
+      // Packet forwarding remains gated per packet by inputModes(), which
+      // withholds mouse reporting until the frame commits.
+      let modes: TerminalMouseReportingRequest | undefined;
       try {
-        modes = surface.inputModes();
+        modes = surface.requestedMouseReporting();
       } catch {
         modes = undefined;
       }

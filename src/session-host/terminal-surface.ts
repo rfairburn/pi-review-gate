@@ -42,6 +42,27 @@
  *   state so mode-only changes (bracketed paste, cursor keys/keypad, mouse
  *   tracking/encoding, modifyOtherKeys, kitty flags) notify the host after
  *   the parse completes.
+ * - Native synchronized output (`CSI ? 2026 h` ... `CSI ? 2026 l`) is
+ *   recognized only through the same typed parser hooks, so it follows the
+ *   pinned parser exactly (string payloads, split Kitty APCs, and invalid or
+ *   intermediate-bearing CSI never toggle it). While a frame is open,
+ *   `frame()` and change notifications expose only the complete state
+ *   captured at the frame's start; the frame's text, cursor, and graphics
+ *   are published together when it ends. Alternate-buffer Kitty placements
+ *   made inside the frame keep their exact event-time position/crop but are
+ *   anchored against the completed frame's covered rows, and older anchors
+ *   are validated (never re-anchored) against it. Destructive controls and
+ *   scoped deletes still apply in order; their result simply becomes visible
+ *   at commit. Holding is bounded (1 s, 8 MiB, 8192 child chunks); exceeding
+ *   a bound or DECSTR ends the hold early and the rest is processed as
+ *   unframed output, while resize, buffer switches, RIS, parse failure, and
+ *   disposal drop the hold and discard not-yet-anchored placements. Image and
+ *   placement leases referenced by a held snapshot stay charged to the shared
+ *   graphics budget until the snapshot is released. Keyboard modes are always
+ *   live; mouse reporting is withheld (`none`) from `inputModes()` while any
+ *   frame is held (outer capture instead follows `requestedMouseReporting()`,
+ *   the committed frame's request, so it stays stable mid-frame), and
+ *   colon sub-parameter forms of 2026 are not frame markers.
  * - Queued write data is bounded in UTF-8 bytes (not UTF-16 code units) and
  *   in queued-write count; overruns fail explicitly rather than silently
  *   truncating, and empty writes are no-ops so they cannot enqueue unbounded
@@ -157,6 +178,19 @@ export interface TerminalInputModes {
 	readonly mouseEncoding: "default" | "sgr" | "sgr-pixels";
 }
 
+/**
+ * The child's requested mouse reporting, used only to configure the outer
+ * terminal's mouse capture. It is never packet-forwarding authorization:
+ * forwarding uses `inputModes()`, which withholds mouse reporting while a
+ * synchronized frame is held. While a frame is held this reports the last
+ * committed frame's request, so outer capture neither drops nor churns
+ * mid-frame; changes made inside the frame apply when it ends.
+ */
+export interface TerminalMouseReportingRequest {
+	readonly mouseTracking: TerminalInputModes["mouseTracking"];
+	readonly mouseEncoding: TerminalInputModes["mouseEncoding"];
+}
+
 export interface TerminalSurfaceOptions {
 	/** Called with replies this instance generates for its child (owner only). */
 	readonly onReply?: (data: string) => void;
@@ -188,6 +222,20 @@ interface PendingWrite {
 	readonly data: string;
 	readonly done: Promise<void>;
 	resolve: () => void;
+}
+
+/**
+ * A held native synchronized-output frame (`CSI ? 2026 h` ... `CSI ? 2026 l`).
+ * While held, `frame()` and change notifications expose only `committed`, the
+ * complete state captured when the frame opened.
+ */
+interface SyncFrame {
+	readonly committed: TerminalFrame;
+	readonly committedRevision: number;
+	readonly committedModes: TerminalInputModes;
+	readonly timer: ReturnType<typeof setTimeout>;
+	bytes: number;
+	writes: number;
 }
 
 type GraphicsPreflightState =
@@ -272,6 +320,14 @@ const MAX_TERMINAL_BATCH_BYTES = 256 * 1024;
 const HIGH_WATERMARK_WRITES = 2048;
 const LOW_WATERMARK_WRITES = 1024;
 const MAX_DIMENSION = 1000;
+// Bounds for holding one native synchronized-output frame. Exceeding any of
+// them ends the hold early (fail-closed: the live state is published and the
+// rest of that frame is processed exactly like unframed output).
+const MAX_SYNC_FRAME_MS = 1000;
+const MAX_SYNC_FRAME_BYTES = 8 * 1024 * 1024;
+const MAX_SYNC_FRAME_WRITES = 8192;
+const SYNCHRONIZED_OUTPUT_MODE = 2026;
+const BUFFER_SWITCH_MODES = [47, 1047, 1049] as const;
 
 const SGR_RESET = "\x1b[0m";
 const SAFE_EMPTY_APC = "\x1b_G\x1b\\";
@@ -476,6 +532,7 @@ export class TerminalSurface {
 	private activeTerminalWriteResolve?: () => void;
 	private parseFailed = false;
 	private lastInvalidateKey = "";
+	private syncFrame?: SyncFrame;
 
 	constructor(cols: number, rows: number, options: TerminalSurfaceOptions = {}) {
 		validateDimension(cols, "cols");
@@ -544,19 +601,28 @@ export class TerminalSurface {
 		// Hardware cursor visibility tracking. Handlers scan all private-mode
 		// parameters (combined sequences like CSI ?1;5;25 h/l are valid) and
 		// return false so the native builtin parser also processes them.
+		//
+		// The same typed hooks recognize native synchronized output (?2026)
+		// only as a real parsed DECSET/DECRST, so look-alike bytes inside
+		// OSC/DCS/APC/PM/SOS strings, Kitty APC payloads (split before xterm),
+		// or invalid/intermediate-bearing CSI never open or close a frame.
+		// Parameters are applied in order, matching xterm's own handling.
 		this.attach(this.terminal.parser.registerCsiHandler({ prefix: "?", final: "h" }, (params) => {
-			if (this.paramsContain(params, 25)) {
-				this.cursorVisible = true;
-			}
+			this.observePrivateModes(params, true);
 			this.observeMouseEncoding(params, true);
 			return false;
 		}));
 		this.attach(this.terminal.parser.registerCsiHandler({ prefix: "?", final: "l" }, (params) => {
-			if (this.paramsContain(params, 25)) {
-				this.cursorVisible = false;
-			}
+			this.observePrivateModes(params, false);
 			this.observeMouseEncoding(params, false);
 			return false;
+		}));
+		// Backstop: any buffer switch the mode hooks did not already settle
+		// (for example RIS) ends a held frame without guessing anchors.
+		this.attach(this.terminal.buffer.onBufferChange(() => {
+			if (this.syncFrame) {
+				this.endSyncFrame("discard");
+			}
 		}));
 
 		// xterm 6 does not expose modifyOtherKeys in its public mode object.
@@ -580,10 +646,19 @@ export class TerminalSurface {
 		// Supported reset sequences restore native cursor visibility; handlers
 		// observe and return false so the builtin parser still processes them.
 		this.attach(this.terminal.parser.registerEscHandler({ final: "c" }, () => {
+			// RIS clears both buffers and synchronized output: a held frame
+			// cannot complete, so its provisional anchors are discarded.
+			if (this.syncFrame) {
+				this.endSyncFrame("discard");
+			}
 			this.resetObservedProtocolState();
 			return false;
 		}));
 		this.attach(this.terminal.parser.registerCsiHandler({ intermediates: "!", final: "p" }, () => {
+			// DECSTR resets xterm's synchronized-output mode: end the hold early.
+			if (this.syncFrame) {
+				this.endSyncFrame("abort");
+			}
 			this.cursorVisible = true;
 			return false;
 		}));
@@ -726,6 +801,9 @@ export class TerminalSurface {
 		this.assertNotDisposed();
 		validateDimension(cols, "cols");
 		validateDimension(rows, "rows");
+		// A held frame was captured at the old geometry: drop it so frame()
+		// never reports stale cols/rows, then invalidate geometry-bound state.
+		this.cancelSyncFrame();
 		this.graphics.invalidatePlacements();
 		this.terminal.resize(cols, rows);
 		// Resize invalidates geometry deterministically: the underlying resize
@@ -733,9 +811,21 @@ export class TerminalSurface {
 		this.invalidate();
 	}
 
-	/** Builds the current snapshot frame from the active buffer. */
+	/**
+	 * Builds the current snapshot frame from the active buffer. While a native
+	 * synchronized frame is held, returns the last complete committed state
+	 * instead, so unrelated host redraws never observe a half-drawn frame.
+	 */
 	frame(): TerminalFrame {
 		this.assertNotDisposed();
+		const held = this.syncFrame?.committed;
+		if (held) {
+			return { ...held, lines: [...held.lines] };
+		}
+		return this.liveFrame();
+	}
+
+	private liveFrame(): TerminalFrame {
 		const buffer = this.terminal.buffer.active;
 		const cols = this.terminal.cols;
 		const rows = this.terminal.rows;
@@ -835,16 +925,26 @@ export class TerminalSurface {
 	 */
 	inputModes(): TerminalInputModes {
 		this.assertNotDisposed();
-		const modes = this.terminal.modes;
-		return {
-			kittyFlags: this.effectiveKittyFlags(),
-			applicationCursorKeys: modes.applicationCursorKeysMode,
-			applicationKeypad: modes.applicationKeypadMode,
-			bracketedPaste: modes.bracketedPasteMode,
-			mouseTracking: modes.mouseTrackingMode,
-			modifyOtherKeys: this.modifyOtherKeys,
-			mouseEncoding: this.mouseEncoding,
-		};
+		return this.inputModesState();
+	}
+
+	/**
+	 * Mouse reporting the child requested, for outer-terminal capture only
+	 * (see `TerminalMouseReportingRequest`). Never use this to forward a
+	 * mouse packet: `inputModes()` is the per-packet authorization. While a
+	 * frame is held this is the committed frame's request (captured before
+	 * the hold began, so not withheld); otherwise it is the live parsed
+	 * state. Any difference between the two at commit changes the
+	 * invalidation key, so the owner is notified and a real revocation
+	 * reaches the outer terminal when the frame ends.
+	 */
+	requestedMouseReporting(): TerminalMouseReportingRequest {
+		this.assertNotDisposed();
+		const committed = this.syncFrame?.committedModes;
+		if (committed) {
+			return { mouseTracking: committed.mouseTracking, mouseEncoding: committed.mouseEncoding };
+		}
+		return { mouseTracking: this.terminal.modes.mouseTrackingMode, mouseEncoding: this.mouseEncoding };
 	}
 
 	/**
@@ -858,9 +958,10 @@ export class TerminalSurface {
 		}
 		this.disposed = true;
 		this.activeTerminalWriteResolve?.();
+		this.cancelSyncFrame();
 		this.graphicsSplitter.dispose();
 		this.graphicsPreflightState = "ground";
-		this.graphics.clear();
+		this.graphics.dispose();
 		this.kittyNormal.current = 0;
 		this.kittyNormal.stack.length = 0;
 		this.kittyAlternate.current = 0;
@@ -1156,6 +1257,7 @@ export class TerminalSurface {
 			// A parser or protocol helper failure must not strand flush callers
 			// or silently accept later child output as if it had parsed.
 			this.parseFailed = true;
+			this.cancelSyncFrame();
 			this.graphics.discard();
 			for (const pending of this.pendingWrites.splice(0)) {
 				pending.resolve();
@@ -1194,6 +1296,11 @@ export class TerminalSurface {
 
 	private afterTerminalWrite(): void {
 		this.applyPendingAlternateGraphicsInvalidation();
+		if (this.syncFrame) {
+			// Destructive controls inside a frame still apply at once; anchor
+			// validation waits for the completed frame's covered rows.
+			return;
+		}
 		const screen = this.alternateScreenState();
 		this.graphics.validateAlternateScreen(screen.textAt, false);
 	}
@@ -1209,6 +1316,130 @@ export class TerminalSurface {
 			this.pendingBytes -= item.size;
 			item.resolve();
 			this.updateBackpressure();
+			this.accountSyncFrameWrite(item.size);
+		}
+	}
+
+	/** Bound a held frame by child bytes and chunks; overflow ends the hold. */
+	private accountSyncFrameWrite(size: number): void {
+		const frame = this.syncFrame;
+		if (!frame || this.disposed) {
+			return;
+		}
+		frame.bytes += size;
+		frame.writes += 1;
+		if (frame.bytes > MAX_SYNC_FRAME_BYTES || frame.writes > MAX_SYNC_FRAME_WRITES) {
+			this.endSyncFrame("abort");
+		}
+	}
+
+	/**
+	 * Apply typed DECSET/DECRST observations in parameter order. A frame
+	 * marker must be the exact numeric parameter 2026: colon sub-parameter
+	 * forms (for example `CSI ? 2026 : 1 h`) are not a supported marker and
+	 * never open or close a held frame. Cursor visibility and buffer-switch
+	 * observation keep following xterm, which acts on the leading value.
+	 */
+	private observePrivateModes(params: (number | number[])[], set: boolean): void {
+		for (let index = 0; index < params.length; index += 1) {
+			const mode = params[index];
+			if (typeof mode !== "number") {
+				// xterm delivers a parameter's colon sub-parameters as the
+				// following array entry; they are never mode numbers themselves.
+				continue;
+			}
+			const exact = !Array.isArray(params[index + 1]);
+			if (mode === 25) {
+				this.cursorVisible = set;
+			} else if (mode === SYNCHRONIZED_OUTPUT_MODE) {
+				if (!exact) {
+					continue;
+				}
+				if (set) {
+					this.openSyncFrame();
+				} else if (this.syncFrame) {
+					this.endSyncFrame("complete");
+				}
+			} else if ((BUFFER_SWITCH_MODES as readonly number[]).includes(mode) && this.syncFrame) {
+				// Runs before xterm switches buffers: provisional anchors of the
+				// buffer being left can never be completed, so they are dropped.
+				this.endSyncFrame("discard");
+			}
+		}
+	}
+
+	/**
+	 * Open a held frame (parser-hook time, exact stream position). Repeated
+	 * begin markers are idempotent like DECSET; the hold stays bounded by the
+	 * first open's timer and byte/count limits.
+	 */
+	private openSyncFrame(): void {
+		if (this.syncFrame || this.disposed || this.parseFailed) {
+			return;
+		}
+		// Settle everything parsed before the marker exactly as a write
+		// boundary would, so the committed snapshot is a coherent state.
+		this.applyPendingAlternateGraphicsInvalidation();
+		this.graphics.validateAlternateScreen(this.alternateScreenState().textAt, false);
+		const committed = this.liveFrame();
+		// Captured before `syncFrame` is set, so its mouse fields are the
+		// child's actual request (see requestedMouseReporting()).
+		const committedModes = this.inputModesState();
+		this.graphics.retainPublished(committed.graphics, this.terminal.buffer.active.type);
+		this.graphics.beginDeferredAlternateAnchors();
+		const timer = setTimeout(() => this.expireSyncFrame(), MAX_SYNC_FRAME_MS);
+		timer.unref?.();
+		this.syncFrame = {
+			committed,
+			committedRevision: this.graphics.revision,
+			committedModes,
+			timer,
+			bytes: 0,
+			writes: 0,
+		};
+	}
+
+	/**
+	 * Stop holding. `complete` (a parsed end marker) and `abort` (time/byte/
+	 * count bound, DECSTR) anchor provisional placements against the alternate
+	 * cells as they are now and validate older anchors against them; `discard`
+	 * (buffer switch, RIS) removes provisional placements instead. Notification
+	 * is left to the caller's post-parse path.
+	 */
+	private endSyncFrame(mode: "complete" | "abort" | "discard"): void {
+		const frame = this.syncFrame;
+		if (!frame) {
+			return;
+		}
+		this.syncFrame = undefined;
+		clearTimeout(frame.timer);
+		this.applyPendingAlternateGraphicsInvalidation();
+		if (mode === "discard") {
+			this.graphics.discardDeferredAlternateAnchors();
+		} else {
+			const textAt = this.alternateScreenState().textAt;
+			this.graphics.finalizeDeferredAlternateAnchors(textAt);
+			this.graphics.validateAlternateScreen(textAt, false);
+		}
+		this.graphics.releasePublished();
+	}
+
+	/** Drop a held frame without anchoring (resize, parse failure, disposal). */
+	private cancelSyncFrame(): void {
+		if (this.syncFrame) {
+			this.endSyncFrame("discard");
+		}
+	}
+
+	private expireSyncFrame(): void {
+		if (this.disposed || !this.syncFrame) {
+			return;
+		}
+		// xterm parses each write synchronously, so a timer always observes a
+		// write boundary. The in-flight pipeline notifies after its own write.
+		this.endSyncFrame("abort");
+		if (!this.processingWrite) {
+			this.invalidate();
 		}
 	}
 
@@ -1358,12 +1589,6 @@ export class TerminalSurface {
 		}
 	}
 
-	private paramsContain(params: (number | number[])[], value: number): boolean {
-		return params.some((param) =>
-			param === value || (Array.isArray(param) && param[0] === value)
-		);
-	}
-
 	/**
 	 * Tracks only xterm's actual DECSET/DECRST mouse encodings. DECSET uses
 	 * the last relevant parameter (1006 = SGR, 1016 = SGR pixels); DECRST of
@@ -1413,31 +1638,45 @@ export class TerminalSurface {
 		// mode-only changes (bracketed paste, cursor keys, mouse tracking,
 		// kitty flags) still notify the host — after the parse completes.
 		const frame = this.frame();
+		const revision = this.syncFrame?.committedRevision ?? this.graphics.revision;
 		const { graphics, ...textFrame } = frame;
 		const graphicsKey = graphics
 			? {
-				revision: this.graphics.revision,
+				revision,
 				images: graphics.images.map(({ id, mimeType, widthPx, heightPx }) => ({ id, mimeType, widthPx, heightPx })),
 				placements: graphics.placements,
 				fallbacks: graphics.fallbacks,
 			}
-			: { revision: this.graphics.revision };
+			: { revision };
+		// While a frame is held the key is the committed state only, so mode
+		// changes inside an incomplete frame do not notify until it commits.
+		const modes = this.syncFrame?.committedModes ?? this.inputModesState();
 		const key = JSON.stringify(textFrame) + "|" + JSON.stringify(graphicsKey)
-			+ "|" + JSON.stringify(this.inputModesState());
+			+ "|" + JSON.stringify(modes);
 		if (key !== this.lastInvalidateKey) {
 			this.lastInvalidateKey = key;
 			this.safePeerInvoke(() => this.options.onChange?.());
 		}
 	}
 
+	/**
+	 * Keyboard protocol state is always the child's latest parsed state (the
+	 * child already switched; delaying would mis-encode keys). Mouse reporting
+	 * is withheld (`none`) for the whole time a synchronized frame is held:
+	 * the displayed committed frame and the child's partially redrawn screen
+	 * may disagree about what is under any cell, so no click is forwarded
+	 * until the frame commits (or a bound ends the hold). Revocation therefore
+	 * also takes effect immediately.
+	 */
 	private inputModesState(): TerminalInputModes {
 		const modes = this.terminal.modes;
+		const mouseHeldBack = this.syncFrame !== undefined;
 		return {
 			kittyFlags: this.effectiveKittyFlags(),
 			applicationCursorKeys: modes.applicationCursorKeysMode,
 			applicationKeypad: modes.applicationKeypadMode,
 			bracketedPaste: modes.bracketedPasteMode,
-			mouseTracking: modes.mouseTrackingMode,
+			mouseTracking: mouseHeldBack ? "none" : modes.mouseTrackingMode,
 			modifyOtherKeys: this.modifyOtherKeys,
 			mouseEncoding: this.mouseEncoding,
 		};

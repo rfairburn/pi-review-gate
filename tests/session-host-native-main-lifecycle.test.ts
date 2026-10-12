@@ -103,34 +103,46 @@ function frameContains(frame: string, needle: string): boolean {
   return collapse(nativePaneText(frame)).includes(collapse(needle));
 }
 
-function popupContains(frame: string, needle: string): boolean {
+/**
+ * Locate the shared popup by its exact geometry: a full-pane-width top rule,
+ * a blank vertical-padding row, content rows with one padding cell on both
+ * sides, a blank vertical-padding row, and a matching bottom rule. A padded
+ * content row can never equal the full-width rule, so body rules or box
+ * glyphs are never taken for the frame; unpadded transcript rules are skipped.
+ */
+function nativePopupRows(frame: string): string[] | undefined {
   const paneWidth = OUTER_COLS - 33;
-  const rows = nativePaneText(frame).split("\n")
-    .map((line) => line.slice(0, paneWidth));
-  const top = rows.findIndex((line) => /^┌─+┐$/u.test(line));
-  if (top < 0) return false;
-  const bottom = rows.findIndex((line, index) => index > top && /^└─+┘$/u.test(line));
-  if (bottom < 0) return false;
-  const contentRows = rows.slice(top + 1, bottom);
-  if (!contentRows.every((line) => line.startsWith("│") && line.endsWith("│"))) return false;
-  const content = contentRows.map((line) => line.slice(1, -1)).join("\n");
+  const rule = "─".repeat(paneWidth);
+  const blank = " ".repeat(paneWidth);
+  const rows = nativePaneText(frame).split("\n").map((line) => line.slice(0, paneWidth));
+  for (let top = 0; top < rows.length; top += 1) {
+    if (rows[top] !== rule || rows[top + 1] !== blank) continue;
+    const bottom = rows.findIndex((line, index) => index > top && line === rule);
+    if (bottom < 0) continue;
+    const contentRows = rows.slice(top + 1, bottom);
+    if (contentRows.length < 3 || contentRows.at(-1) !== blank
+      || !contentRows.every((line) => line.startsWith(" ") && line.endsWith(" "))) continue;
+    return rows.slice(top, bottom + 1);
+  }
+  return undefined;
+}
+
+function popupContains(frame: string, needle: string): boolean {
+  const popup = nativePopupRows(frame);
+  if (!popup) return false;
+  const content = popup.slice(1, -1).map((line) => line.slice(1, -1)).join("\n");
   const collapse = (text: string): string => text.replace(/\s+/g, "");
   return collapse(content).includes(collapse(needle));
 }
 
 function assertPopupSpansConversationPane(frame: string, view: string): void {
   const paneWidth = OUTER_COLS - 33;
-  const rows = nativePaneText(frame).split("\n").map((line) => line.slice(0, paneWidth));
-  const top = rows.findIndex((line) => /^┌─+┐$/u.test(line));
-  const bottom = top < 0 ? -1 : rows.findIndex((line, index) => index > top && /^└─+┘$/u.test(line));
-  assert.ok(top >= 0 && bottom > top, `${view} has a bordered popup in the native conversation pane`);
-  const popup = rows.slice(top, bottom + 1);
-  assert.ok(popup[0]!.startsWith("┌") && popup[0]!.endsWith("┐"),
-    `${view} top border reaches both conversation-pane margins`);
-  assert.ok(popup.at(-1)!.startsWith("└") && popup.at(-1)!.endsWith("┘"),
-    `${view} bottom border reaches both conversation-pane margins`);
-  assert.ok(popup.slice(1, -1).every((line) => line.startsWith("│") && line.endsWith("│")),
-    `${view} content rows leave no exposed left or right conversation margin`);
+  const popup = nativePopupRows(frame);
+  assert.ok(popup, `${view} has a ruled, padded popup in the native conversation pane`);
+  assert.equal(popup[0], "─".repeat(paneWidth), `${view} top rule reaches both conversation-pane margins`);
+  assert.equal(popup.at(-1), "─".repeat(paneWidth), `${view} bottom rule reaches both conversation-pane margins`);
+  assert.ok(popup.slice(1, -1).every((line) => line.startsWith(" ") && line.endsWith(" ")),
+    `${view} content rows reach both pane margins with one padding cell per side and no side border`);
   assert.ok(popup.every((line) => !line.includes(INITIAL_PROMPT)),
     `${view} rows do not interleave the underlying prompt with popup text`);
 }

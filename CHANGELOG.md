@@ -29,8 +29,9 @@ dates.
   not restored after a delivery failure. **Close** removes only the selected notice
   and sends nothing. Contextual ordinary user requests stay scoped to the originating
   session and use existing busy-steering or idle non-interrupting delivery. The shared
-  `Pending input` list uses a bordered, padded popup, and the single active native answer
-  field stays isolated from the saved chat draft. Default-on `youShouldKnow.enabled`
+  `Pending input` list uses a padded popup framed only by full-width top and bottom
+  separator lines, and the single active native answer field stays isolated from the
+  saved chat draft. Default-on `youShouldKnow.enabled`
   and `youShouldKnow.completionGuidance` settings control notice availability and the
   supplemental completion prompt; the prompt is supplied only when both settings are
   On and live authorized discovery exposes the tool. Disabling availability preserves
@@ -42,11 +43,6 @@ dates.
 
 ### Fixed
 
-- Main-owned primary-button gestures retain motion and release delivery when
-  crossing Session Host panes. Only continuations of a press delivered to the
-  same live Main owner are clamped to its unchanged native pane; owner, focus,
-  surface, geometry, mouse-mode, editor-handoff, and shutdown changes cancel
-  ownership. Ordinary outside events and wheel routing remain unchanged.
 - The shared answer popup uses the host-owned native editor for both input and
   popup rendering, suppressing its ordinary prompt rows instead of creating a
   second render-only editor. Native actions and the single caret stay in the

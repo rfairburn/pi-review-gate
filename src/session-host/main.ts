@@ -147,44 +147,6 @@ function sameNativePaneGeometry(a: HostLayout, b: HostLayout): boolean {
     && samePaneGeometry(a.sidebar, b.sidebar);
 }
 
-/**
- * One Main-owned mouse gesture: held buttons whose press was actually written
- * to this exact live owner while Main had focus. Every field is the evidence
- * the gesture's continuation is checked against before it is delivered.
- */
-interface MainMouseCapture {
-  readonly ownerId: string;
-  readonly surface: object;
-  readonly layout: HostLayout;
-  readonly mouseTracking: TerminalInputModes["mouseTracking"];
-  readonly mouseEncoding: TerminalInputModes["mouseEncoding"];
-  readonly buttons: Set<number>;
-}
-
-function sameHostGeometry(a: HostLayout, b: HostLayout): boolean {
-  return a.cols === b.cols && a.rows === b.rows && a.headerRows === b.headerRows
-    && a.sidebarOverlay === b.sidebarOverlay
-    && samePaneGeometry(a.native, b.native)
-    && samePaneGeometry(a.sidebar, b.sidebar)
-    && samePaneGeometry(a.form, b.form);
-}
-
-/**
- * Re-encode one owned gesture packet in its original source encoding with the
- * endpoint clamped into `rect`. Button and modifier bits are retained exactly;
- * a legacy X10 coordinate that cannot be represented is refused, not wrapped.
- */
-function clampOwnedMousePacket(data: string, mouse: ParsedMouseInput, rect: HostPaneRect): string | undefined {
-  const x = Math.min(Math.max(mouse.x, rect.column), rect.column + rect.cols - 1);
-  const y = Math.min(Math.max(mouse.y, rect.row), rect.row + rect.rows - 1);
-  if (data.startsWith("\x1b[<")) {
-    return `\x1b[<${mouse.button};${x + 1};${y + 1}${data.endsWith("m") ? "m" : "M"}`;
-  }
-  if (!data.startsWith("\x1b[M") || data.length !== 6) return undefined;
-  if (x + 33 > 255 || y + 33 > 255) return undefined;
-  return `\x1b[M${String.fromCharCode(data.charCodeAt(3), x + 33, y + 33)}`;
-}
-
 function sameNativeMouseTarget(a: MouseFramePresentation, b: MouseFramePresentation): boolean {
   return a.focus === "sidebar" && b.focus === "sidebar"
     && a.nativeOwnerId !== undefined && a.nativeOwnerId === b.nativeOwnerId
@@ -290,21 +252,6 @@ function mouseButtonId(mouse: ParsedMouseInput): number | undefined {
 
 function isMouseButtonPress(mouse: ParsedMouseInput): boolean {
   return !mouse.release && !mouse.motion && !mouse.wheel && mouseButtonId(mouse) !== undefined;
-}
-
-/**
- * Complete identity of a button that a Main gesture capture may own: only the
- * three primary buttons. Wheel and extended buttons (bit 128) never alias a
- * primary button; a buttonless legacy release (low bits 3) has no identity.
- */
-function capturableMouseButton(mouse: ParsedMouseInput): number | undefined {
-  if (mouse.wheel || (mouse.button & 128) !== 0) return undefined;
-  const id = mouse.button & 3;
-  return id === 3 ? undefined : id;
-}
-
-function isLegacyAmbiguousRelease(mouse: ParsedMouseInput): boolean {
-  return mouse.release && !mouse.wheel && (mouse.button & 128) === 0 && (mouse.button & 3) === 3;
 }
 
 function isLeftMousePress(mouse: ParsedMouseInput): boolean {
@@ -668,23 +615,6 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   // Buttons pressed over a host pane remain host-owned through drag/motion and
   // release, even if the pointer crosses into Main after activation.
   const hostMouseButtons = new Set<number>();
-  // Buttons whose press was actually delivered to the current Main owner keep
-  // their held-button motion and release with that same owner, even when the
-  // pointer leaves the native pane, until any owner/focus/surface/geometry/
-  // mode transition, host gesture, editor handoff, or shutdown voids it.
-  let mainMouseCapture: MainMouseCapture | undefined;
-  // Buttons of a voided Main capture. Their continuations are consumed (never
-  // delivered to any owner, never synthesized) until an identified release or
-  // a fresh press of that button resolves them; only terminal shutdown clears
-  // them wholesale. Bounded by the three primary buttons.
-  const cancelledMainButtons = new Set<number>();
-  // Primary presses not represented by a Main capture or owned by a host pane
-  // (dropped under any focus, delivered but refused capture, or host buttons
-  // forgotten without an identified release) may still be physically held.
-  // This is only release-ambiguity evidence: it grants no ownership and never
-  // fences or reroutes motion. An identified release or a fresh press of that
-  // button resolves it.
-  const unforwardedMainButtons = new Set<number>();
   let forcedCount = 0;
   let remainingCount = 0;
   let shutdownPromise: Promise<void> | undefined;
@@ -771,52 +701,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }
   }
 
-  function mainMouseCaptureValid(capture: MainMouseCapture): boolean {
-    if (shutdownRequested || externalEditorActive || !terminalStarted || !sidebar || !manager || !layout) return false;
-    if (sidebar.focus !== "main" || activeId !== capture.ownerId || hostMouseButtons.size > 0) return false;
-    if (!sameHostGeometry(capture.layout, layout)) return false;
-    const view = findActiveView();
-    if (!view || view.id !== capture.ownerId || !view.hasLiveProcess || view.lifecycle !== "alive") return false;
-    try {
-      const surface = manager.surface(view.id);
-      if (!surface || surface !== capture.surface) return false;
-      const modes = surface.inputModes();
-      return modes.mouseTracking === capture.mouseTracking && modes.mouseEncoding === capture.mouseEncoding;
-    } catch {
-      return false;
-    }
-  }
-
-  /** Void the current capture; its held buttons stay suppressed, not forwarded. */
-  function cancelMainMouseCapture(): void {
-    if (mainMouseCapture === undefined) return;
-    for (const button of mainMouseCapture.buttons) cancelledMainButtons.add(button);
-    mainMouseCapture = undefined;
-  }
-
-  /**
-   * Stop host ownership of held buttons without proof of their release: they
-   * remain release-ambiguity evidence so no later Main capture can claim an
-   * unidentified release they might have produced.
-   */
-  function forgetHostMouseButtons(): void {
-    for (const button of hostMouseButtons) unforwardedMainButtons.add(button);
-    hostMouseButtons.clear();
-  }
-
-  /** Drop all Main gesture state at terminal shutdown. */
-  function clearMainMouseGestures(): void {
-    mainMouseCapture = undefined;
-    cancelledMainButtons.clear();
-    unforwardedMainButtons.clear();
-  }
-
-  function revalidateMainMouseCapture(): void {
-    if (mainMouseCapture !== undefined && !mainMouseCaptureValid(mainMouseCapture)) cancelMainMouseCapture();
-  }
-
   function syncOuterMouseModes(): void {
-    revalidateMainMouseCapture();
     if (!terminal || !terminalStarted || !sidebar || shutdownRequested) return;
     const view = findActiveView();
     const surface = view?.hasLiveProcess && view.lifecycle === "alive" ? manager?.surface(view.id) : undefined;
@@ -848,10 +733,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     } else if (desiredTracking === undefined || desiredTracking === 9) {
       // With no host pane and no release-capable native mode, a retained
       // press cannot receive its matching release; discard that stale owner.
-      // Reporting may resume while a Main button is still held, so a Main
-      // capture is voided but its suppression fence is retained.
-      forgetHostMouseButtons();
-      cancelMainMouseCapture();
+      hostMouseButtons.clear();
     }
 
     if (mouseTrackingMode !== desiredTracking) {
@@ -1357,108 +1239,20 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     }
   }
 
-  /**
-   * Forward one packet to the current live Main owner. Returns the exact
-   * owner, surface, and modes only when translated bytes were actually
-   * written; an undelivered packet returns undefined.
-   */
-  function routeForward(data: string): { readonly ownerId: string; readonly surface: object; readonly modes: TerminalInputModes } | undefined {
-    if (!terminal || !sidebar || sidebar.focus !== "main" || shutdownRequested || externalEditorActive) return undefined;
+  function routeForward(data: string): void {
+    if (!terminal || !sidebar || sidebar.focus !== "main" || shutdownRequested || externalEditorActive) return;
     const view = findActiveView();
-    if (!view || !view.hasLiveProcess || view.lifecycle !== "alive" || !layout || !manager) return undefined;
+    if (!view || !view.hasLiveProcess || view.lifecycle !== "alive" || !layout || !manager) return;
     const surface = manager.surface(view.id);
-    if (!surface) return undefined;
+    if (!surface) return;
     try {
       const sourceNormalized = normalizeNativeSourceInput(data, terminal.kittyProtocolActive);
-      const modes = surface.inputModes();
-      const translated = translateInput(sourceNormalized, modes, layout.native);
-      if (translated === undefined) return undefined;
-      manager.write(view.id, translated);
-      return { ownerId: view.id, surface, modes };
+      const translated = translateInput(sourceNormalized, surface.inputModes(), layout.native);
+      if (translated !== undefined) manager.write(view.id, translated);
     } catch {
       // The process may have exited between the snapshot and write. Never
       // retry against a sibling or expose the underlying native diagnostic.
-      return undefined;
     }
-  }
-
-  /**
-   * Record a Main press only after it was actually delivered to the current
-   * owner whose native child requested release-reporting cell tracking. Any
-   * competing host gesture or owner/surface/mode mismatch leaves no capture.
-   */
-  function noteMainMousePress(
-    buttonId: number,
-    delivered: { readonly ownerId: string; readonly surface: object; readonly modes: TerminalInputModes } | undefined,
-  ): void {
-    const tracking = delivered?.modes.mouseTracking;
-    if (!delivered || !layout || hostMouseButtons.size > 0
-      || (tracking !== "vt200" && tracking !== "drag" && tracking !== "any")
-      || delivered.modes.mouseEncoding === "sgr-pixels") {
-      unforwardedMainButtons.add(buttonId);
-      // An undelivered or non-tracking press never owns a gesture; a repeated
-      // press of a held button also proves its earlier release was lost.
-      mainMouseCapture?.buttons.delete(buttonId);
-      if (mainMouseCapture?.buttons.size === 0) mainMouseCapture = undefined;
-      return;
-    }
-    if (mainMouseCapture !== undefined
-      && (mainMouseCapture.ownerId !== delivered.ownerId || mainMouseCapture.surface !== delivered.surface
-        || mainMouseCapture.mouseTracking !== delivered.modes.mouseTracking
-        || mainMouseCapture.mouseEncoding !== delivered.modes.mouseEncoding
-        || !sameHostGeometry(mainMouseCapture.layout, layout))) {
-      cancelMainMouseCapture();
-    }
-    mainMouseCapture ??= {
-      ownerId: delivered.ownerId,
-      surface: delivered.surface,
-      layout,
-      mouseTracking: delivered.modes.mouseTracking,
-      mouseEncoding: delivered.modes.mouseEncoding,
-      buttons: new Set<number>(),
-    };
-    mainMouseCapture.buttons.add(buttonId);
-  }
-
-  /**
-   * Route a held-button motion or release that continues a captured Main
-   * gesture. Returns true when this packet belonged to a still-valid capture
-   * and was delivered to its owner with only its endpoint clamped (or refused
-   * as unencodable). An invalid capture or an ambiguous legacy release voids
-   * the capture and returns false so the cancelled-button fence consumes the
-   * packet; unrelated packets return false and keep ordinary routing.
-   */
-  function routeCapturedMainMouse(data: string, mouse: ParsedMouseInput): boolean {
-    const capture = mainMouseCapture;
-    if (capture === undefined || mouse.wheel || (!mouse.release && !mouse.motion)) return false;
-    const buttonId = capturableMouseButton(mouse);
-    let button: number;
-    if (buttonId !== undefined) {
-      if (!capture.buttons.has(buttonId)) return false;
-      button = buttonId;
-    } else {
-      // Buttonless motion (any-motion hover) and extended buttons are never
-      // part of a captured primary-button gesture.
-      if (!isLegacyAmbiguousRelease(mouse)) return false;
-      // A legacy release names no button: it is attributable only when
-      // exactly one captured button is held. Otherwise fail closed.
-      if (capture.buttons.size !== 1) {
-        cancelMainMouseCapture();
-        return false;
-      }
-      button = capture.buttons.values().next().value as number;
-    }
-    if (!mainMouseCaptureValid(capture) || !layout) {
-      cancelMainMouseCapture();
-      return false;
-    }
-    if (mouse.release) {
-      capture.buttons.delete(button);
-      if (capture.buttons.size === 0) mainMouseCapture = undefined;
-    }
-    const owned = clampOwnedMousePacket(data, mouse, layout.native);
-    if (owned !== undefined) routeForward(owned);
-    return true;
   }
 
   function canFocusMainFromNativeClick(
@@ -1488,45 +1282,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const hitMapPending = presentation === undefined || latestMousePresentation === undefined
       || !sameMouseAuthorization(presentation, latestMousePresentation);
     const buttonId = mouseButtonId(mouse);
-    // A gesture whose press really reached the current Main owner keeps its
-    // held-button motion and release with that owner before any host pane
-    // hit-test, so crossing the sidebar, form, or header cannot end it early.
-    const captureButton = capturableMouseButton(mouse);
-    if (captureButton !== undefined && (isMouseButtonPress(mouse) || mouse.release)) {
-      unforwardedMainButtons.delete(captureButton);
-    }
-    // A fresh press resolves any lost release of a cancelled button.
-    if (isMouseButtonPress(mouse) && captureButton !== undefined) cancelledMainButtons.delete(captureButton);
-    if (isLegacyAmbiguousRelease(mouse) && (cancelledMainButtons.size > 0
-      || (mainMouseCapture !== undefined && unforwardedMainButtons.size > 0))) {
-      // A cancelled or undelivered button may still be held, so no capture can
-      // claim this unidentified release exclusively. Void it and consume it.
-      cancelMainMouseCapture();
-      return;
-    }
-    if (routeCapturedMainMouse(data, mouse)) return;
-    // Continuations of a voided Main capture are consumed: never forwarded to
-    // the old owner, a new owner, or a host pane, and never replaced by a
-    // synthetic release.
-    if (cancelledMainButtons.size > 0 && (mouse.release || mouse.motion) && !mouse.wheel) {
-      // An identified release resolves only its own button's fence.
-      if (captureButton !== undefined && cancelledMainButtons.has(captureButton)) {
-        if (mouse.release) cancelledMainButtons.delete(captureButton);
-        return;
-      }
-      // An unidentified release (including one that just voided a multi-button
-      // capture) is consumed without guessing or retiring any fence.
-      if (isLegacyAmbiguousRelease(mouse)) return;
-    }
     if (mouse.release) {
       if (buttonId !== undefined && hostMouseButtons.delete(buttonId)) return;
       // Legacy X10 release reports button 3 without identifying which button
       // ended; the host can only own this ambiguous release if it owns a press.
       if (buttonId === undefined && hostMouseButtons.size > 0) {
-        // Only a sole held host button with no other possibly-held button is
-        // provably the one released; otherwise keep every candidate ambiguous.
-        if (hostMouseButtons.size === 1 && unforwardedMainButtons.size === 0) hostMouseButtons.clear();
-        else forgetHostMouseButtons();
+        hostMouseButtons.clear();
         return;
       }
     }
@@ -1540,10 +1301,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       : undefined;
     const pane = formPane ?? sidebarPane;
     if (pane !== undefined) {
-      if (isMouseButtonPress(mouse) && buttonId !== undefined) {
-        hostMouseButtons.add(buttonId);
-        cancelMainMouseCapture(); // a competing host gesture voids Main ownership
-      }
+      if (isMouseButtonPress(mouse) && buttonId !== undefined) hostMouseButtons.add(buttonId);
       if (isLeftMousePress(mouse) && presentation !== undefined && !hitMapPending) {
         const previousFocus = sidebar.focus;
         const previousSelection = sidebar.selectedId;
@@ -1588,15 +1346,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // Native mouse packets never reach Pi while a host form, dialog, or roster
     // owns focus; the roster's eligible Main-pane click above is focus-only.
     // Main-focused packets keep the existing translator and viewport clipping.
-    if (sidebar.focus === "main") {
-      const delivered = routeForward(data);
-      if (isMouseButtonPress(mouse) && captureButton !== undefined) noteMainMousePress(captureButton, delivered);
-    } else if (isMouseButtonPress(mouse) && captureButton !== undefined) {
-      // Host-owned presses returned above. This dropped press may still be
-      // physically held across a focus change, so it keeps a later unidentified
-      // Main release ambiguous. It grants no capture and changes no routing.
-      unforwardedMainButtons.add(captureButton);
-    }
+    if (sidebar.focus === "main") routeForward(data);
   }
 
   function handleTerminalInput(data: string): void {
@@ -1653,10 +1403,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       throw new Error("external editor handoff is unavailable");
     }
     externalEditorActive = true;
-    forgetHostMouseButtons(); // no terminal gesture ownership survives a tty handoff
-    // The button may still be held when the host resumes: void the Main
-    // capture but keep its suppression fence across the handoff.
-    cancelMainMouseCapture();
+    hostMouseButtons.clear(); // no terminal gesture ownership survives a tty handoff
     const controller = new AbortController();
     externalEditorAbort = controller;
     let terminalPaused = false;
@@ -2519,7 +2266,6 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     shutdownPromise = Promise.resolve();
     shutdownRequested = true;
     hostMouseButtons.clear();
-    clearMainMouseGestures();
     deferredCreates.clear();
     deferredSavedOpens.clear();
     deferredRowResumes.clear();

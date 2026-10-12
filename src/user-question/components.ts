@@ -22,9 +22,10 @@
  *   exactly More details and Close actions. More details closes this popup and
  *   reports the exact selected notice snapshot for ordinary owner-session
  *   delivery; the controller consumes it before sending. Close removes only
- *   it. A full-width, theme-background-filled hard border and padding frame
- *   every shared-content row; the overlay's public maxHeight and vertical
- *   margins define the responsive viewport inside it.
+ *   it. Full-width top and bottom rules and theme-background-filled
+ *   one-cell side padding frame every shared-content row, with no side
+ *   borders; the overlay's public maxHeight and vertical margins define the
+ *   responsive viewport inside it.
  *
  * Navigation, confirm, cancel, cursor movement, and deletion resolve through
  * the host's live KeybindingsManager (`tui.select.*`, `tui.editor.*`), so
@@ -593,11 +594,15 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     return { start, end, anchor };
   }
 
+  /**
+   * The frame has full-width top and bottom rules only; content rows keep one
+   * opaque padding cell on each side when the width allows, so the body gains
+   * the columns side borders would otherwise occupy.
+   */
   function popupContentWidth(width: number): number {
     const boundedWidth = Math.max(1, Math.floor(width));
-    const borderCells = boundedWidth >= 3 ? 2 : 0;
-    const paddingCells = boundedWidth >= 5 ? POPUP_HORIZONTAL_PADDING * 2 : 0;
-    return Math.max(1, boundedWidth - borderCells - paddingCells);
+    const paddingCells = boundedWidth >= 3 ? POPUP_HORIZONTAL_PADDING * 2 : 0;
+    return Math.max(1, boundedWidth - paddingCells);
   }
 
   function popupContentRows(height: number): number {
@@ -609,8 +614,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
 
   function framePopup(content: readonly string[], width: number, maxHeight?: number): string[] {
     const boundedWidth = Math.max(1, Math.floor(width));
-    const hasHorizontalBorder = boundedWidth >= 3;
-    const padding = hasHorizontalBorder && boundedWidth >= 5 ? POPUP_HORIZONTAL_PADDING : 0;
+    const padding = boundedWidth >= 3 ? POPUP_HORIZONTAL_PADDING : 0;
     const innerWidth = popupContentWidth(boundedWidth);
     const framedContent = content.flatMap((line) =>
       visibleWidth(line) <= innerWidth ? [line] : wrapNoticeLine(line, innerWidth));
@@ -618,37 +622,26 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     const verticalPadding = height === undefined || height >= 4 ? POPUP_VERTICAL_PADDING : 0;
     const contentLimit = height === undefined ? Number.POSITIVE_INFINITY : popupContentRows(height);
     const visible = framedContent.slice(0, contentLimit);
-    const borderText = (left: string, right: string): string => {
-      if (!hasHorizontalBorder) return opaquePopupLine("─".repeat(boundedWidth));
-      return opaquePopupLine(theme.fg("borderMuted", left + "─".repeat(Math.max(0, boundedWidth - 2)) + right));
-    };
+    const rule = opaquePopupLine(theme.fg("borderMuted", "─".repeat(boundedWidth)));
     const row = (line: string): string => {
-      if (!hasHorizontalBorder) {
-        return opaquePopupLine(line + " ".repeat(Math.max(0, boundedWidth - visibleWidth(line))));
-      }
-      const left = theme.fg("borderMuted", "│");
-      const right = theme.fg("borderMuted", "│");
-      const measured = visibleWidth(line);
-      const inner = line + " ".repeat(Math.max(0, innerWidth - measured));
-      return opaquePopupLine(left + " ".repeat(padding) + inner + " ".repeat(padding) + right);
+      const inner = line + " ".repeat(Math.max(0, innerWidth - visibleWidth(line)));
+      return opaquePopupLine(" ".repeat(padding) + inner + " ".repeat(padding));
     };
 
-    const top = borderText("┌", "┐");
-    const bottom = borderText("└", "┘");
-    if (height === 1) return [top];
-    if (height === 2) return [top, bottom];
-    const output = [top];
+    if (height === 1) return [rule];
+    if (height === 2) return [rule, rule];
+    const output = [rule];
     if (verticalPadding > 0) output.push(row(""));
     for (const line of visible) output.push(row(line));
     if (verticalPadding > 0) output.push(row(""));
-    output.push(bottom);
+    output.push(rule);
     return height === undefined ? output : output.slice(0, height);
   }
 
   /**
    * Fill every rendered cell with Pi's native custom-message surface. Reopen
    * the background after full SGR resets in nested foreground styling so the
-   * trailing border and padding remain opaque as well as the text itself.
+   * frame rules and side padding remain opaque as well as the text itself.
    */
   function opaquePopupLine(line: string): string {
     const bg = theme.bg;
@@ -969,7 +962,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     // The custom overlay uses the owned manual viewport, so no measured
     // ScrollView height is available. Advance one line rather than skipping
     // unseen content with a terminal-sized page. A layout-backed view pages
-    // only its inner content area, excluding the popup border and padding.
+    // only its inner content area, excluding the popup rules and padding.
     if (nativeHeight === undefined || nativeHeight <= 0) return 1;
     return Math.max(1, popupContentRows(nativeHeight) - 1);
   }

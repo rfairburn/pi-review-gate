@@ -177,45 +177,59 @@ function nativePaneText(frame: string): string {
   return frame.split("\n").slice(1).map((line) => line.slice(NATIVE_PANE_START)).join("\n");
 }
 
-/** Strip the full-width popup's left/right border from one verified content row. */
+const SHARED_OVERLAY_RULE = "─".repeat(SHARED_OVERLAY_COLUMNS);
+const SHARED_OVERLAY_BLANK_ROW = " ".repeat(SHARED_OVERLAY_COLUMNS);
+
+/** Remove exactly the one-cell side padding from one verified content row. */
 function popupLineContent(line: string): string {
-  return line.replace(/^\s*│/u, "").replace(/│\s*$/u, "").trim();
+  return line.slice(1, -1).trim();
+}
+
+/**
+ * Locate the shared popup by its exact geometry: a full-overlay-width top
+ * rule, a blank vertical-padding row, content rows that each keep one padding
+ * cell on both sides, a blank vertical-padding row, and a matching bottom
+ * rule. A padded content row can never equal the full-width rule, so body
+ * horizontal rules or code/table box glyphs are never mistaken for the frame,
+ * and transcript rules without the padding structure are skipped.
+ */
+function locateNativeSharedPopup(paneLines: readonly string[]): string[] | undefined {
+  for (let top = SHARED_OVERLAY_VERTICAL_MARGIN; top < paneLines.length; top += 1) {
+    if (paneLines[top] !== SHARED_OVERLAY_RULE || paneLines[top + 1] !== SHARED_OVERLAY_BLANK_ROW) continue;
+    const bottom = paneLines.findIndex((line, index) => index > top && line === SHARED_OVERLAY_RULE);
+    if (bottom <= top || bottom - top + 1 > SHARED_OVERLAY_MAX_ROWS
+      || bottom >= OUTER_ROWS - SHARED_OVERLAY_VERTICAL_MARGIN) continue;
+    const popupRows = paneLines.slice(top, bottom + 1);
+    const contentRows = popupRows.slice(1, -1);
+    if (contentRows.length < 3 || contentRows.at(-1) !== SHARED_OVERLAY_BLANK_ROW
+      || !contentRows.every((line) => line.startsWith(" ") && line.endsWith(" "))) continue;
+    return popupRows;
+  }
+  // Never use the maximum-height region as a substitute for locating the
+  // visible rules: short centered popups leave transcript rows above/below.
+  return undefined;
 }
 
 function nativeSharedPopupLines(frame: string): string[] {
   const paneLines = nativePaneText(frame).split("\n").map((line) =>
     line.slice(SHARED_OVERLAY_START_COLUMN, SHARED_OVERLAY_START_COLUMN + SHARED_OVERLAY_COLUMNS));
-  for (let top = SHARED_OVERLAY_VERTICAL_MARGIN; top < paneLines.length; top += 1) {
-    if (!/^┌─+┐$/u.test(paneLines[top]!)) continue;
-    const bottom = paneLines.findIndex((line, index) => index > top && /^└─+┘$/u.test(line));
-    if (bottom <= top || bottom - top + 1 > SHARED_OVERLAY_MAX_ROWS
-      || bottom >= OUTER_ROWS - SHARED_OVERLAY_VERTICAL_MARGIN) return [];
-    const popupRows = paneLines.slice(top, bottom + 1);
-    const contentRows = popupRows.slice(1, -1);
-    if (contentRows.length === 0
-      || !contentRows.every((line) => line.startsWith("│") && line.endsWith("│"))) return [];
-    return contentRows.map(popupLineContent);
-  }
-  // Never use the maximum-height region as a substitute for locating the
-  // visible border: short centered popups leave transcript rows above/below.
-  return [];
+  const popupRows = locateNativeSharedPopup(paneLines);
+  return popupRows ? popupRows.slice(1, -1).map(popupLineContent) : [];
 }
 
 function assertNativePopupSpansConversationPane(frame: string, view: string): void {
   const paneLines = nativePaneText(frame).split("\n");
-  const top = paneLines.findIndex((line) => line.startsWith("┌") && line.endsWith("┐"));
-  const bottom = top < 0 ? -1 : paneLines.findIndex((line, index) => index > top && line.startsWith("└") && line.endsWith("┘"));
-  assert.ok(top >= 0 && bottom > top, `${view} has a bordered popup in the native conversation pane`);
-  const rows = paneLines.slice(top, bottom + 1);
-  assert.equal(rows[0]!.startsWith("┌") && rows[0]!.endsWith("┐"), true,
-    `${view} border reaches the conversation pane's left and right edges`);
-  assert.equal(rows.at(-1)!.startsWith("└") && rows.at(-1)!.endsWith("┘"), true,
-    `${view} bottom border reaches the conversation pane's left and right edges`);
+  const rows = locateNativeSharedPopup(paneLines);
+  assert.ok(rows, `${view} has a ruled, padded popup in the native conversation pane`);
+  assert.equal(rows[0], SHARED_OVERLAY_RULE,
+    `${view} top rule reaches the conversation pane's left and right edges`);
+  assert.equal(rows.at(-1), SHARED_OVERLAY_RULE,
+    `${view} bottom rule reaches the conversation pane's left and right edges`);
   for (const [index, row] of rows.slice(1, -1).entries()) {
-    assert.ok(row.startsWith("│") && row.endsWith("│"),
-      `${view} content row ${index} reaches both conversation pane margins`);
+    assert.ok(row.startsWith(" ") && row.endsWith(" "),
+      `${view} content row ${index} keeps one padding cell at both conversation pane margins, with no side border`);
   }
-  assert.equal(rows[0]!.length >= NATIVE_PANE_COLUMNS, true,
+  assert.equal(rows[0]!.length, NATIVE_PANE_COLUMNS,
     `${view} outer rows span the complete conversation viewport, not the sidebar`);
 }
 
@@ -518,24 +532,28 @@ async function selectAction(driver: MainPtyDriver, target: "More details" | "Clo
   assert.equal(selectedAction(driver.currentText()), target);
 }
 
-test("short shared-popup matcher rejects answer/body sentinels outside the actual borders", () => {
+test("short shared-popup matcher rejects answer/body sentinels outside the actual rules", () => {
   const outerRows = Array.from({ length: OUTER_ROWS + 1 }, () => " ".repeat(OUTER_COLS));
   const popupTop = 20;
-  const insideBody = "NOTICE_BODY_SENTINEL_INSIDE_BORDER";
-  const aboveAnswer = "UNDERLAY_ANSWER_SENTINEL_ABOVE_BORDER";
-  const belowBody = "UNDERLAY_BODY_SENTINEL_BELOW_BORDER";
+  const insideBody = "NOTICE_BODY_SENTINEL_INSIDE_RULES";
+  const aboveAnswer = "UNDERLAY_ANSWER_SENTINEL_ABOVE_RULE";
+  const belowBody = "UNDERLAY_BODY_SENTINEL_BELOW_RULE";
   const outerRow = (paneLine: string): string =>
     " ".repeat(NATIVE_PANE_START) + paneLine.padEnd(NATIVE_PANE_COLUMNS, " ");
-  const border = (left: string, right: string): string =>
-    left + "─".repeat(NATIVE_PANE_COLUMNS - 2) + right;
-  const content = (text: string): string => `│${text}`.padEnd(NATIVE_PANE_COLUMNS - 1, " ") + "│";
+  const rule = "─".repeat(NATIVE_PANE_COLUMNS);
+  const content = (text: string): string => ` ${text}`.padEnd(NATIVE_PANE_COLUMNS, " ");
   const setPaneRow = (row: number, text: string): void => { outerRows[row + 1] = outerRow(text); };
 
   setPaneRow(4, `Transcript ${aboveAnswer}`);
-  setPaneRow(popupTop, border("┌", "┐"));
-  setPaneRow(popupTop + 1, content(`n1: ${NOTICE_TITLE}`));
-  setPaneRow(popupTop + 2, content(insideBody));
-  setPaneRow(popupTop + 3, border("└", "┘"));
+  setPaneRow(6, rule); // A transcript-wide rule without popup padding is not the frame.
+  setPaneRow(7, `Transcript after rule ${aboveAnswer}`);
+  setPaneRow(popupTop, rule);
+  setPaneRow(popupTop + 1, content(""));
+  setPaneRow(popupTop + 2, content(`n1: ${NOTICE_TITLE}`));
+  setPaneRow(popupTop + 3, content("─".repeat(NATIVE_PANE_COLUMNS - 2))); // body rule inside the padding
+  setPaneRow(popupTop + 4, content(`│ ${insideBody} │`)); // body table/code glyphs stay content
+  setPaneRow(popupTop + 5, content(""));
+  setPaneRow(popupTop + 6, rule);
   setPaneRow(44, `Underlying chat ${belowBody}`);
   const frame = outerRows.join("\n");
 
@@ -543,7 +561,10 @@ test("short shared-popup matcher rejects answer/body sentinels outside the actua
     "both underlay sentinels are inside the old maximum-height crop");
   assert.ok(frameContains(frame, aboveAnswer) && frameContains(frame, belowBody),
     "both sentinels are present in underlying pane rows");
-  assert.ok(sharedPopupContains(frame, insideBody), "complete notice body inside the actual border is matchable");
+  assert.ok(sharedPopupContains(frame, insideBody), "complete notice body inside the actual rules is matchable");
+  const popupLines = nativeSharedPopupLines(frame);
+  assert.deepEqual(popupLines, ["", `n1: ${NOTICE_TITLE}`, "─".repeat(NATIVE_PANE_COLUMNS - 2), `│ ${insideBody} │`, ""],
+    "the projection is exactly the padded interior between the two full-width rules, keeping body glyphs");
   assert.equal(sharedPopupContains(frame, aboveAnswer), false,
     "answer-like transcript text above the popup cannot satisfy an overlay assertion");
   assert.equal(sharedPopupContains(frame, belowBody), false,

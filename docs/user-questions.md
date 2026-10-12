@@ -54,13 +54,17 @@ answer.
 
 Notices and questions appear as distinguishable entry types in the existing
 session-local list, opened with **Ctrl+Alt+Up** (**Ctrl+Option+Up** on macOS).
-Question answers and notice details use the same full-conversation-width, four-sided
-bordered, padded native overlay and Markdown renderer. On Pi hosts exposing the
-public `Theme.bg` formatter, every popup row, including blank border and padding
-cells, uses the theme's opaque surface background, so terminal selection within
-popup rows cannot interleave underlying conversation text at the pane's left or
-right margins. A parent Main sidebar is outside the child
-conversation viewport and is not covered by this overlay. The complete notice body
+Question answers and notice details use the same full-conversation-width, padded
+native overlay and Markdown renderer. The popup is framed only by full-width
+horizontal separator lines at its top and bottom; it has no left or right border,
+and each content row keeps one blank padding cell on either side. On Pi hosts
+exposing the public `Theme.bg` formatter, every popup row, including the separator
+lines and blank padding cells, uses the theme's opaque surface background across
+the whole conversation viewport width. Mouse selection and copying follow the
+terminal's and Pi's existing native behavior; the popup adds no selection
+scoping or automatic clipboard copy of its own.
+A parent Main sidebar is outside the child conversation viewport and is not
+covered by this overlay. The complete notice body
 and optional context appear before its **More details** and **Close** actions. If native Markdown or
 its theme is unavailable, the view visibly discloses the limitation and shows
 the complete question, notice body, and optional context as width-wrapped plain

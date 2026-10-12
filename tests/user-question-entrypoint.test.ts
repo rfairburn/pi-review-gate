@@ -325,7 +325,7 @@ test("resolving every pending question removes the panel", async () => {
     assert.ok(backgroundTokens.length > 0 && backgroundTokens.every((color) => color === "customMessageBg"),
       "the public custom-component Theme.bg reaches the shared popup as its opaque native message surface");
     assert.ok(firstRows.every((line: string) => line.startsWith("\x1b[48;5;236m")),
-      "the public native surface background wraps all list rows, including border and padding");
+      "the public native surface background wraps all list rows, including rules and padding");
 
     openedComponent.handleInput("\r"); // open answer view (first question selected)
     openedComponent.handleInput("\x1b[B"); // row 2: Postgres
@@ -351,14 +351,13 @@ test("the shared custom overlay pages native Markdown within its responsive publ
     const terminalVisibleWidth = (text: string): number => stripSgr(text).length;
     const popupInteriorRows = (frame: readonly string[], width: number): string[] => {
       const rows = frame.map(stripSgr);
-      assert.equal(rows[0], `┌${"─".repeat(width - 2)}┐`, "projection uses the popup's actual top border");
-      assert.equal(rows.at(-1), `└${"─".repeat(width - 2)}┘`, "projection uses the popup's actual bottom border");
+      assert.equal(rows[0], "─".repeat(width), "projection uses the popup's actual full-width top rule");
+      assert.equal(rows.at(-1), "─".repeat(width), "projection uses the popup's actual full-width bottom rule");
       return rows.slice(1, -1).map((row) => {
         assert.equal(terminalVisibleWidth(row), width, "every projected row keeps its measured width");
-        assert.ok(row.startsWith("│") && row.endsWith("│"), `content row has actual vertical borders: ${row}`);
-        assert.equal(row[1], " ", "one padding cell follows the left border");
-        assert.equal(row[row.length - 2], " ", "one padding cell precedes the right border");
-        return row.slice(2, -2).replace(/ +$/u, ""); // Trim only right-side cell fill after slicing the known frame.
+        assert.equal(row[0], " ", `one padding cell occupies the left column, with no side border: ${row}`);
+        assert.equal(row[row.length - 1], " ", `one padding cell occupies the right column, with no side border: ${row}`);
+        return row.slice(1, -1).replace(/ +$/u, ""); // Trim only right-side cell fill after slicing the known padding.
       }).filter((row) => row.length > 0);
     };
     setUserQuestionTuiHost({

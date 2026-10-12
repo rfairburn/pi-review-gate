@@ -838,29 +838,29 @@ function stripSgr(line: string): string {
 }
 
 /**
- * Recover the native text rows from the first bordered popup frame. The exact
- * popup-side borders, one-cell popup padding, and two-cell answer-row indent
- * are structural; content glyphs and editor padding are otherwise preserved.
+ * Recover the native text rows from the first popup frame. The popup's own
+ * first and last rows are its full-width rules; between them, the exact
+ * one-cell popup side padding and two-cell answer-row indent are structural;
+ * content glyphs and editor padding are otherwise preserved.
  */
 function nativeEditorTextRowsInPopup(
   tui: Record<string, unknown>,
   frameRows: string[],
   nativeEditorBox: string[],
 ): string[] {
-  const top = frameRows.findIndex((line) => /^┌─+┐$/u.test(line));
-  const bottom = top < 0 ? -1 : frameRows.findIndex((line, index) => index > top && /^└─+┘$/u.test(line));
-  assert.ok(top >= 0 && bottom > top, `the first post-paste frame has a bounded popup: ${frameRows.join("\n")}`);
-  const popupWidth = frameRows[top]!.length;
-  assert.equal(frameRows[bottom]!.length, popupWidth, "popup borders have the same measured width");
-  const popupContentRows = frameRows.slice(top + 1, bottom);
+  assert.ok(frameRows.length >= 2, `the first post-paste frame has a bounded popup: ${frameRows.join("\n")}`);
+  const popupWidth = frameRows[0]!.length;
+  assert.equal(frameRows[0], "─".repeat(popupWidth), `the popup starts with its full-width top rule: ${frameRows.join("\n")}`);
+  assert.equal(frameRows.at(-1), "─".repeat(popupWidth), `the popup ends with its full-width bottom rule: ${frameRows.join("\n")}`);
+  const popupContentRows = frameRows.slice(1, -1);
   assert.ok(popupContentRows.every((line) => line.length === popupWidth
-    && line.startsWith("│") && line.endsWith("│")),
-  `every popup content row is enclosed by its vertical borders: ${frameRows.join("\n")}`);
+    && line.startsWith(" ") && line.endsWith(" ")),
+  `every popup content row keeps one padding cell per side and no side border: ${frameRows.join("\n")}`);
 
-  const editorWidth = popupWidth - 6; // outer border + popup padding + the two-cell answer-row indent
-  const editorStart = 4; // left border + popup padding + answer-row indent
+  const editorWidth = popupWidth - 4; // popup side padding + the two-cell answer-row indent
+  const editorStart = 3; // left popup padding + answer-row indent
   const editorEnd = editorStart + editorWidth;
-  assert.ok(editorWidth > 0 && editorEnd === popupWidth - 2,
+  assert.ok(editorWidth > 0 && editorEnd === popupWidth - 1,
     "the measured editor box fits exactly between popup padding cells");
   const embeddedRows = popupContentRows.map((line) => line.slice(editorStart, editorEnd));
   assert.ok(nativeEditorBox.every((line) => typeof line === "string"),

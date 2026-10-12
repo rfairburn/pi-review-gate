@@ -405,20 +405,23 @@ test("the list renders pending questions with the shortcut hint and waiting tags
   assert.ok(!/\[waiting\]/.test(lines.find((line) => line.includes("q2")) ?? ""), "async questions are not waiting");
 });
 
-test("the shared question popup has a hard four-sided border and padding", () => {
+test("the shared question popup has full-width top and bottom rules with padded, side-border-free rows", () => {
   const fixture = makeFixture();
   register(fixture, "Which database?");
   const lines = fixture.component.render(36);
   const header = lines.findIndex((line) => line.includes("Pending input (1)"));
 
-  assert.ok(header > 1, `header follows the top border and vertical padding: ${lines.join("\n")}`);
-  assert.match(lines[0]!, /^┌─+┐$/);
-  assert.match(lines.at(-1)!, /^└─+┘$/);
-  assert.match(lines[header]!, /^│ Pending input \(1\)/);
-  assert.match(lines[header - 1]!, /^│ +│$/, "the header has a blank row of vertical padding above it");
-  assert.match(lines.at(-2)!, /^│ +│$/, "the content has a blank row of vertical padding below it");
-  assert.ok(lines.every((line) => line.length === 36 && line.startsWith("│") && line.endsWith("│")
-    || line === lines[0] || line === lines.at(-1)), "every popup row fits inside the four-sided border");
+  assert.ok(header > 1, `header follows the top rule and vertical padding: ${lines.join("\n")}`);
+  assert.equal(lines[0], "─".repeat(36), "the top rule spans the full popup width");
+  assert.equal(lines.at(-1), "─".repeat(36), "the bottom rule spans the full popup width");
+  assert.match(lines[header]!, /^ Pending input \(1\)/, "content starts after exactly one padding cell");
+  assert.equal(lines[header - 1], " ".repeat(36), "the header has a blank row of vertical padding above it");
+  assert.equal(lines.at(-2), " ".repeat(36), "the content has a blank row of vertical padding below it");
+  for (const line of lines.slice(1, -1)) {
+    assert.equal(line.length, 36, `every content row fills the popup width: ${JSON.stringify(line)}`);
+    assert.equal(line[0], " ", `the left column is padding, not a side border: ${JSON.stringify(line)}`);
+    assert.equal(line.at(-1), " ", `the right column is padding, not a side border: ${JSON.stringify(line)}`);
+  }
 });
 
 test("popup page shortcuts scroll with overlap and preserve plain PageUp/PageDown fallback", () => {
@@ -437,7 +440,7 @@ test("popup page shortcuts scroll with overlap and preserve plain PageUp/PageDow
     const contentRows = (lines: readonly string[]): readonly string[] => lines.slice(2, -2);
     const beforeContent = contentRows(before);
     const afterContent = contentRows(after);
-    assert.equal(afterContent.length, beforeContent.length, "the border and padding keep a stable viewport budget");
+    assert.equal(afterContent.length, beforeContent.length, "the rules and padding keep a stable viewport budget");
     const overlap = afterContent.filter((line) => beforeContent.includes(line));
     assert.ok(overlap.length > 0, "each popup-local page retains visible content overlap");
     return after;
@@ -723,11 +726,11 @@ test("native cursor mapping preserves wrapped whitespace rows", () => {
   fixture.component.handleInput(ENTER); // editing
   fixture.component.handleInput(`\x1b[200~a${" ".repeat(100)}\nb\x1b[201~`);
 
-  // The outer width 13 leaves nine cells inside the border/padding, two of
-  // which indent the native editor; its public layout wraps at six cells.
-  const frame = fixture.component.render(13);
+  // The outer width 11 leaves nine cells inside the one-cell side padding, two
+  // of which indent the native editor; its public layout wraps at six cells.
+  const frame = fixture.component.render(11);
   assert.equal(fixture.field!.getRenderedHiddenLineCount(), 13,
-    "the five-row native viewport clips thirteen visual rows above the cursor after border-aware wrapping");
+    "the five-row native viewport clips thirteen visual rows above the cursor after padding-aware wrapping");
   assert.ok(frame.length <= 3);
   assert.ok(frame.some((row) => row.includes("b") && row.includes("\x1b_pi:c\x07")),
     `the cursor-bearing row after preserved whitespace wraps remains visible: frame=${frame.join("\n")} field=${fixture.field!.render(8).join("\n")}`);
@@ -750,7 +753,7 @@ test("native cursor mapping uses complete-line chunks at an interior word-wrap b
   fixture.field!.completionItems = Array.from({ length: 8 }, (_, index) => `suggestion ${index + 1}`);
   fixture.component.handleInput(TAB);
 
-  const frame = fixture.component.render(13); // Border/padding leave editor width seven; layout width six.
+  const frame = fixture.component.render(11); // Side padding leaves editor width seven; layout width six.
   assert.deepEqual(fixture.field!.getCursor(), { line: 0, col: cursorColumn });
   assert.equal(fixture.field!.getRenderedHiddenLineCount(), 0);
   assert.equal(fixture.field!.isShowingAutocomplete(), true);

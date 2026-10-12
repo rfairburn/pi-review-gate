@@ -758,39 +758,42 @@ function frameContains(frame: string, needle: string): boolean {
   return collapse(frame).includes(collapse(needle));
 }
 
+const QUESTION_POPUP_RULE = "─".repeat(QUESTION_POPUP_COLUMNS);
+const QUESTION_POPUP_BLANK_ROW = " ".repeat(QUESTION_POPUP_COLUMNS);
+
 /**
- * Return only content rows enclosed by the popup's actual full-width borders.
- * Missing or malformed borders fail closed; maximum-height geometry is never
+ * Return only the padded interior between the popup's actual full-width top
+ * and bottom rules, with exactly one side-padding cell removed per side. The
+ * frame is located by geometry: a full-width rule, a blank vertical-padding
+ * row, content rows that each keep a padding cell on both sides, a blank
+ * vertical-padding row, and a matching rule. A padded content row can never
+ * equal the full-width rule, so body rules and box glyphs stay content.
+ * Missing or malformed frames fail closed; maximum-height geometry is never
  * used as a substitute for the visible popup bounds.
  */
 function nativeQuestionPopupLines(frame: string): string[] {
   const terminalLines = frame.split("\n").map((line) =>
     line.slice(QUESTION_POPUP_START_COLUMN, QUESTION_POPUP_START_COLUMN + QUESTION_POPUP_COLUMNS));
   for (let top = QUESTION_POPUP_VERTICAL_MARGIN; top < terminalLines.length; top += 1) {
-    if (!/^┌─+┐$/u.test(terminalLines[top]!)) continue;
-    const bottom = terminalLines.findIndex((line, index) => index > top && /^└─+┘$/u.test(line));
+    if (terminalLines[top] !== QUESTION_POPUP_RULE || terminalLines[top + 1] !== QUESTION_POPUP_BLANK_ROW) continue;
+    const bottom = terminalLines.findIndex((line, index) => index > top && line === QUESTION_POPUP_RULE);
     if (bottom <= top || bottom - top + 1 > QUESTION_POPUP_MAX_ROWS
-      || bottom >= PTY_ROWS - QUESTION_POPUP_VERTICAL_MARGIN) return [];
-    const popupRows = terminalLines.slice(top, bottom + 1);
-    const contentRows = popupRows.slice(1, -1);
-    if (contentRows.length === 0
-      || !contentRows.every((line) => line.startsWith("│") && line.endsWith("│"))) return [];
-    return contentRows;
+      || bottom >= PTY_ROWS - QUESTION_POPUP_VERTICAL_MARGIN) continue;
+    const contentRows = terminalLines.slice(top + 1, bottom);
+    if (contentRows.length < 3 || contentRows.at(-1) !== QUESTION_POPUP_BLANK_ROW
+      || !contentRows.every((line) => line.startsWith(" ") && line.endsWith(" "))) continue;
+    return contentRows.map((line) => line.slice(1, -1));
   }
   return [];
 }
 
 function popupContains(frame: string, needle: string): boolean {
-  const content = nativeQuestionPopupLines(frame)
-    .map((line) => line.replace(/[┌┐└┘─│]/g, " "))
-    .join("\n");
-  return frameContains(content, needle);
+  return frameContains(nativeQuestionPopupLines(frame).join("\n"), needle);
 }
 
 /** Require the complete Markdown body between the popup's standalone ID and first answer choice. */
 function questionBodyBetweenHeaderAndFirstChoice(frame: string): boolean {
-  const popupLines = nativeQuestionPopupLines(frame)
-    .map((line) => line.replace(/[┌┐└┘─│]/g, " "));
+  const popupLines = nativeQuestionPopupLines(frame);
   const questionHeader = popupLines.findIndex((line) => line.trim() === "q1:");
   if (questionHeader < 0) return false;
   const firstChoice = popupLines.findIndex((line, index) =>
@@ -803,21 +806,23 @@ function questionBodyBetweenHeaderAndFirstChoice(frame: string): boolean {
 test("question popup matcher excludes transcript text outside the modal geometry", () => {
   const lines = Array.from({ length: PTY_ROWS }, () => " ".repeat(PTY_COLS));
   lines[0] = `Question registered as q1: \"${QUESTION_TEXT}\"`.padEnd(PTY_COLS);
-  const popupRow = (text: string): string => `│${text}`.padEnd(PTY_COLS - 1, " ") + "│";
-  const border = (left: string, right: string): string => left + "─".repeat(PTY_COLS - 2) + right;
-  lines[QUESTION_POPUP_START_ROW] = border("┌", "┐");
-  lines[QUESTION_POPUP_START_ROW + 1] = popupRow("q1:");
-  lines[QUESTION_POPUP_START_ROW + 2] = popupRow(`> 1. ${CHOICE_A}`);
-  lines[QUESTION_POPUP_START_ROW + 3] = border("└", "┘");
+  const popupRow = (text: string): string => ` ${text}`.padEnd(PTY_COLS, " ");
+  const rule = "─".repeat(PTY_COLS);
+  lines[QUESTION_POPUP_START_ROW] = rule;
+  lines[QUESTION_POPUP_START_ROW + 1] = popupRow("");
+  lines[QUESTION_POPUP_START_ROW + 2] = popupRow("q1:");
+  lines[QUESTION_POPUP_START_ROW + 3] = popupRow(`> 1. ${CHOICE_A}`);
+  lines[QUESTION_POPUP_START_ROW + 4] = popupRow("");
+  lines[QUESTION_POPUP_START_ROW + 5] = rule;
   const frame = lines.join("\n");
   const popupLines = nativeQuestionPopupLines(frame);
-  const contentLines = popupLines.map((line) => line.replace(/[┌┐└┘─│]/g, " "));
 
   assert.ok(frameContains(frame, QUESTION_TEXT), "the synthetic underlying tool result contains the complete question text");
-  assert.ok(popupLines.slice(0, 2).every((line) => line.startsWith("│") && line.endsWith("│")),
-    "each rendered question-popup content row reaches both conversation viewport margins");
-  assert.ok(contentLines.some((line) => line.trim() === "q1:"), "the bodyless popup has its standalone question ID");
-  assert.ok(contentLines.some((line) => line.includes(`1. ${CHOICE_A}`)), "the bodyless popup has its first choice");
+  assert.equal(popupLines.length, 4, "the projection is exactly the padded interior between the two full-width rules");
+  assert.ok(popupLines.every((line) => line.length === PTY_COLS - 2),
+    "each projected question-popup row spans the conversation viewport minus one padding cell per side");
+  assert.ok(popupLines.some((line) => line.trim() === "q1:"), "the bodyless popup has its standalone question ID");
+  assert.ok(popupLines.some((line) => line.includes(`1. ${CHOICE_A}`)), "the bodyless popup has its first choice");
   assert.equal(
     questionBodyBetweenHeaderAndFirstChoice(frame),
     false,
@@ -825,21 +830,25 @@ test("question popup matcher excludes transcript text outside the modal geometry
   );
 });
 
-test("short question popup matcher rejects answer/body sentinels above and below its actual borders", () => {
+test("short question popup matcher rejects answer/body sentinels above and below its actual rules", () => {
   const lines = Array.from({ length: PTY_ROWS }, () => " ".repeat(PTY_COLS));
   const top = 20;
   const insideAnswer = "ANSWER_SENTINEL_INSIDE_POPUP";
-  const aboveAnswer = "UNDERLAY_ANSWER_SENTINEL_ABOVE_BORDER";
-  const belowBody = "UNDERLAY_BODY_SENTINEL_BELOW_BORDER";
-  const border = (left: string, right: string): string =>
-    left + "─".repeat(PTY_COLS - 2) + right;
-  const content = (text: string): string => `│${text}`.padEnd(PTY_COLS - 1, " ") + "│";
+  const aboveAnswer = "UNDERLAY_ANSWER_SENTINEL_ABOVE_RULE";
+  const belowBody = "UNDERLAY_BODY_SENTINEL_BELOW_RULE";
+  const rule = "─".repeat(PTY_COLS);
+  const content = (text: string): string => ` ${text}`.padEnd(PTY_COLS, " ");
 
   lines[4] = `Transcript row contains ${aboveAnswer}`.padEnd(PTY_COLS);
-  lines[top] = border("┌", "┐");
-  lines[top + 1] = content(`q1: ${QUESTION_TEXT}`);
-  lines[top + 2] = content(insideAnswer);
-  lines[top + 3] = border("└", "┘");
+  lines[6] = rule; // A transcript-wide rule without popup padding is not the frame.
+  lines[7] = `Transcript after rule ${aboveAnswer}`.padEnd(PTY_COLS);
+  lines[top] = rule;
+  lines[top + 1] = content("");
+  lines[top + 2] = content(`q1: ${QUESTION_TEXT}`);
+  lines[top + 3] = content("─".repeat(PTY_COLS - 2)); // body rule inside the padding
+  lines[top + 4] = content(`│ ${insideAnswer} │`); // body table/code glyphs stay content
+  lines[top + 5] = content("");
+  lines[top + 6] = rule;
   lines[44] = `Underlying chat contains ${belowBody}`.padEnd(PTY_COLS);
   const frame = lines.join("\n");
   const popupLines = nativeQuestionPopupLines(frame);
@@ -848,12 +857,14 @@ test("short question popup matcher rejects answer/body sentinels above and below
     "both underlay sentinels lie inside the old maximum-height crop");
   assert.ok(frameContains(frame, aboveAnswer) && frameContains(frame, belowBody),
     "the sentinels are genuinely present in underlying terminal rows");
-  assert.ok(popupLines.some((line) => line.includes(insideAnswer)),
-    "complete content inside the actual four-sided popup remains matchable");
+  assert.ok(popupLines.some((line) => line.includes(`│ ${insideAnswer} │`)),
+    "complete content, including body box glyphs, inside the actual ruled popup remains matchable");
+  assert.ok(popupLines.some((line) => line === "─".repeat(PTY_COLS - 2)),
+    "a body horizontal rule inside the padding is content, not the popup frame");
   assert.equal(popupContains(frame, aboveAnswer), false,
-    "answer-like text above the actual popup border cannot satisfy a popup assertion");
+    "answer-like text above the actual popup rule cannot satisfy a popup assertion");
   assert.equal(popupContains(frame, belowBody), false,
-    "body-like text below the actual popup border cannot satisfy a popup assertion");
+    "body-like text below the actual popup rule cannot satisfy a popup assertion");
 });
 
 /** Event-driven directory watch that notifies when the named file changes. */

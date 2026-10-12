@@ -111,11 +111,24 @@ function markdownHost(created: string[], widths: number[] = []) {
   };
 }
 
+/**
+ * Project one rendered popup frame onto its interior: the first and last rows
+ * are the full-width rules, and every interior row loses exactly its one-cell
+ * side padding. Body rows are never classified by their glyphs.
+ */
 function popupContentLines(text: string): string[] {
-  return text.split("\n").flatMap((line) => {
-    if (/^┌─+┐$/u.test(line) || /^└─+┘$/u.test(line)) return [];
-    if (line.startsWith("│") && line.endsWith("│")) return [line.slice(2, -2).replace(/ +$/u, "")];
-    return [line];
+  const sgr = /\x1b\[[0-9;]*m/gu;
+  const rows = text.split("\n");
+  const rule = rows[0]!.replace(sgr, "");
+  assert.match(rule, /^─+$/u, `the frame starts with a full-width top rule: ${JSON.stringify(rows[0])}`);
+  assert.ok(rows.length >= 2, "the frame has a bottom rule");
+  assert.equal(rows.at(-1)!.replace(sgr, ""), rule, "the bottom rule matches the top rule's full width");
+  return rows.slice(1, -1).map((row) => {
+    const plain = row.replace(sgr, "");
+    assert.equal(terminalColumns(plain), rule.length, `interior row fills the frame width: ${JSON.stringify(row)}`);
+    assert.ok(plain.startsWith(" ") && plain.endsWith(" "), `interior row keeps one padding cell per side: ${JSON.stringify(row)}`);
+    // Remove exactly the known padding cells; theme styling around them stays intact.
+    return row.replace(/^((?:\x1b\[[0-9;]*m)*) /u, "$1").replace(/ ((?:\x1b\[[0-9;]*m)*)$/u, "$1").replace(/ +$/u, "");
   });
 }
 
@@ -238,7 +251,7 @@ test("feature-off rejects new notices but preserves existing More details, Close
   assert.equal(fixture.surface.controller.listPending()[0]!.id, "q1", "notice actions do not disable or consume questions");
 });
 
-test("the bordered shared popup renders rich questions and notices; More details consumes only its selected notice", async () => {
+test("the ruled shared popup renders rich questions and notices; More details consumes only its selected notice", async () => {
   setHostKeybindingLoader(() => ({}));
   const created: string[] = [];
   const widths: number[] = [];
@@ -300,7 +313,7 @@ test("the bordered shared popup renders rich questions and notices; More details
   assert.doesNotMatch(firstNoticeFrame, /Native Markdown unavailable/);
   assert.ok(created.includes(body), "the exact full Markdown body is sent to native Markdown");
   assert.ok(created.includes(context), "the complete context is also rendered, not summarized");
-  assert.ok(widths.includes(44), "the Markdown component receives the current inner width after border and padding");
+  assert.ok(widths.includes(46), "the Markdown component receives the current inner width after one-cell side padding");
 
   // The shared custom surface pages the complete body/context through its
   // common viewport, including after a live resize.
@@ -550,7 +563,7 @@ test("component resizing and theme invalidation rebuild native Markdown at the n
   component.handleInput(ENTER);
   component.render(70);
   component.render(32);
-  assert.deepEqual(widths.slice(0, 2), [66, 28], "a resize rerenders native Markdown at terminal width minus border and padding");
+  assert.deepEqual(widths.slice(0, 2), [68, 30], "a resize rerenders native Markdown at terminal width minus one-cell side padding");
   const before = created.length;
   component.invalidate(); // host theme invalidation
   component.render(32);
@@ -582,17 +595,21 @@ test("an unavailable native Markdown peer is disclosed and shows the complete wr
     onDone() {},
   });
   component.handleInput(ENTER);
+  // Outer width 16 leaves a fourteen-cell interior inside the one-cell side
+  // padding, so consecutive wrapped emoji rows differ and paging terminates
+  // only at the real end of the notice.
+  const fallbackWidth = 16;
   const frames: string[] = [];
   for (let index = 0; index < 100; index += 1) {
-    frames.push(component.render(18).join("\n"));
+    frames.push(component.render(fallbackWidth).join("\n"));
     const previous = frames[frames.length - 1];
     component.handleInput(PAGE_DOWN);
-    const next = component.render(18).join("\n");
+    const next = component.render(fallbackWidth).join("\n");
     if (next === previous) break;
   }
   const fullView = frames.map(popupContentText).join("\n");
   fallbackViewportRows = 10_000;
-  const normalizedView = popupContentText(component.render(18).join("\n")).replace(/\s+/gu, " ");
+  const normalizedView = popupContentText(component.render(fallbackWidth).join("\n")).replace(/\s+/gu, " ");
   const flattened = fullView.replace(/\n/g, "");
   const visibleLines = fullView.split("\n");
   assert.match(normalizedView, /Native Markdown unavailable; showing the complete notice as plain text\./);
@@ -611,7 +628,8 @@ test("an unavailable native Markdown peer is disclosed and shows the complete wr
   assert.match(normalizedView, /More details/);
   assert.match(normalizedView, /Close/);
   for (const line of visibleLines) {
-    assert.ok(terminalColumns(line) <= 18, `plain fallback line fits the requested terminal width: ${JSON.stringify(line)}`);
+    assert.ok(terminalColumns(line) <= fallbackWidth - 2,
+      `plain fallback line fits the popup interior inside its side padding: ${JSON.stringify(line)}`);
   }
 });
 

@@ -441,36 +441,97 @@ test("runPromptProcess bounds a never-settling start callback without prompting 
   }
 });
 
-test("runPromptProcess does not signal a naturally closed child when late startup persistence crosses the deadline", { skip: process.platform === "win32" }, async () => {
+test("runPromptProcess does not signal a naturally closed child when late startup persistence crosses the deadline", { skip: process.platform === "win32" }, async (t) => {
   const fixtureRoot = await mkdtemp(join(tmpdir(), "pi-process-late-start-close-"));
   const exitMarker = join(fixtureRoot, "closed");
+  const realSetTimeout = globalThis.setTimeout.bind(globalThis);
+  const realClearTimeout = globalThis.clearTimeout.bind(globalThis);
+  const withRealTimerGuard = async <T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> => {
+    let guard: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<never>((_, rejectPromise) => {
+          guard = realSetTimeout(() => rejectPromise(new Error(label)), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (guard) realClearTimeout(guard);
+    }
+  };
   const processKillDescriptor = Object.getOwnPropertyDescriptor(process, "kill");
   const childKillDescriptor = Object.getOwnPropertyDescriptor(ChildProcess.prototype, "kill");
+  const childEmitDescriptor = Object.getOwnPropertyDescriptor(ChildProcess.prototype, "emit");
   assert.ok(processKillDescriptor?.value);
   assert.ok(childKillDescriptor?.value);
   const originalProcessKill = processKillDescriptor.value as typeof process.kill;
   const originalChildKill = childKillDescriptor.value as typeof ChildProcess.prototype.kill;
+  const originalChildEmit = ChildProcess.prototype.emit;
   const terminationAttempts: Array<NodeJS.Signals | number | undefined> = [];
   let rootPid: number | undefined;
   const processKill = (pid: number | string, signal?: NodeJS.Signals | number): boolean => {
-    if (typeof pid === "number" && rootPid !== undefined && pid === -rootPid) terminationAttempts.push(signal);
+    if (typeof pid === "number" && rootPid !== undefined && pid === -rootPid) {
+      // Record but never forward a signal to the possibly recycled owned group id.
+      terminationAttempts.push(signal);
+      return false;
+    }
     return Reflect.apply(originalProcessKill, process, [pid, signal]) as boolean;
   };
   const childKill = function (this: ChildProcess, signal?: NodeJS.Signals | number): boolean {
-    if (this.pid === rootPid) terminationAttempts.push(signal);
+    if (this.pid === rootPid) {
+      terminationAttempts.push(signal);
+      return false;
+    }
     return Reflect.apply(originalChildKill, this, [signal]) as boolean;
   };
-  Object.defineProperty(process, "kill", { ...processKillDescriptor, value: processKill });
-  Object.defineProperty(ChildProcess.prototype, "kill", { ...childKillDescriptor, value: childKill });
+  type CloseObservation = {
+    child: ChildProcess;
+    pid: number;
+    code: number | null;
+    signal: NodeJS.Signals | null;
+  };
+  let announceClosed!: (observation: CloseObservation) => void;
+  const childClosed = new Promise<CloseObservation>((resolvePromise) => { announceClosed = resolvePromise; });
+  const childEmit = function (this: ChildProcess, event: string | symbol, ...args: unknown[]): boolean {
+    // Let runPromptProcess observe close and clear its deadline before waking the test.
+    const emitted = Reflect.apply(originalChildEmit, this, [event, ...args]) as boolean;
+    if (event === "close" && this.pid !== undefined && this.pid === rootPid) {
+      const [code, signal] = args as [number | null, NodeJS.Signals | null];
+      announceClosed({ child: this, pid: this.pid, code, signal });
+    }
+    return emitted;
+  };
 
   let announceStart!: () => void;
   let releaseStart!: () => void;
+  let startPersistenceReleased = false;
   const startEntered = new Promise<void>((resolvePromise) => { announceStart = resolvePromise; });
-  const startGate = new Promise<void>((resolvePromise) => { releaseStart = resolvePromise; });
+  const startGate = new Promise<void>((resolvePromise) => {
+    releaseStart = () => {
+      startPersistenceReleased = true;
+      resolvePromise();
+    };
+  });
   let observedExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   let running: ReturnType<typeof runPromptProcess> | undefined;
-  const startedAt = Date.now();
+  let timersEnabled = false;
+  let processKillPatched = false;
+  let childKillPatched = false;
+  let childEmitPatched = false;
   try {
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+    timersEnabled = true;
+    Object.defineProperty(process, "kill", { ...processKillDescriptor, value: processKill });
+    processKillPatched = true;
+    Object.defineProperty(ChildProcess.prototype, "kill", { ...childKillDescriptor, value: childKill });
+    childKillPatched = true;
+    Object.defineProperty(ChildProcess.prototype, "emit", {
+      ...(childEmitDescriptor ?? { configurable: true, writable: true }),
+      value: childEmit,
+    });
+    childEmitPatched = true;
+
+    const startedAt = Date.now();
     running = runPromptProcess({
       command: process.execPath,
       args: ["-e", `const fs=require('node:fs');setTimeout(()=>{fs.writeFileSync(${JSON.stringify(exitMarker)},'closed');process.exit(0)},25)`],
@@ -485,55 +546,47 @@ test("runPromptProcess does not signal a naturally closed child when late startu
       onProcessExit: ({ code, signal }) => { observedExit = { code, signal }; },
     });
     void running.catch(() => undefined);
-    let startupGuard: NodeJS.Timeout | undefined;
-    await Promise.race([
-      startEntered,
-      new Promise<never>((_, rejectPromise) => {
-        startupGuard = setTimeout(() => rejectPromise(new Error("natural-exit fixture did not enter lifecycle startup")), 2_000);
-      }),
-    ]).finally(() => { if (startupGuard) clearTimeout(startupGuard); });
-    const markerDeadline = Date.now() + 2_000;
-    for (;;) {
-      try {
-        await access(exitMarker);
-        break;
-      } catch {
-        if (Date.now() >= markerDeadline) assert.fail("the owned child did not record its natural exit");
-        await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
-      }
-    }
-    const processExitDeadline = Date.now() + 2_000;
-    for (;;) {
-      try {
-        process.kill(rootPid!, 0);
-        if (Date.now() >= processExitDeadline) assert.fail("the owned child did not close after its exit marker");
-        await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-        break;
-      }
-    }
-    const untilPastDeadline = startedAt + 150 - Date.now();
-    if (untilPastDeadline > 0) await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, untilPastDeadline));
-    assert.ok(Date.now() - startedAt > 100, "startup persistence resolves after the model deadline");
+    await withRealTimerGuard(startEntered, 2_000, "natural-exit fixture did not enter lifecycle startup");
+    const close = await withRealTimerGuard(childClosed, 2_000, "the owned child did not emit its natural close event");
+    assert.equal(close.pid, rootPid);
+    assert.equal(close.child.pid, rootPid);
+    assert.deepEqual({ code: close.code, signal: close.signal }, { code: 0, signal: null });
+    assert.equal(close.child.exitCode, 0, "the exact child completed with a real zero exit status");
+    assert.equal(close.child.signalCode, null, "the exact child was not closed by a signal");
+    assert.equal(close.child.killed, false, "the child was not killed by the parent");
+    assert.equal(await readFile(exitMarker, "utf8"), "closed", "the naturally exiting child wrote its marker before close");
+    assert.equal(startPersistenceReleased, false, "startup persistence remains gated at the real child close");
+    assert.equal(observedExit, undefined, "exit persistence remains ordered behind the gated startup callback");
+
+    t.mock.timers.tick(101);
+    assert.ok(Date.now() - startedAt > 100, "startup persistence remains pending after the virtual model deadline");
+    assert.equal(startPersistenceReleased, false, "advancing the model clock does not release startup persistence");
     releaseStart();
-    let guardTimer: NodeJS.Timeout | undefined;
-    const result = await Promise.race([
-      running,
-      new Promise<never>((_, rejectPromise) => {
-        guardTimer = setTimeout(() => rejectPromise(new Error("closed child lifecycle did not settle after start persistence")), 2_000);
-      }),
-    ]).finally(() => { if (guardTimer) clearTimeout(guardTimer); });
+    const result = await withRealTimerGuard(running, 2_000, "closed child lifecycle did not settle after start persistence");
     assert.equal(result.code, 0);
     assert.equal(result.timedOut, false);
     assert.deepEqual(observedExit, { code: 0, signal: null });
     assert.deepEqual(terminationAttempts, [], "a settled lifecycle must not signal a possibly recycled process-group id");
   } finally {
     releaseStart();
-    await running?.catch(() => undefined);
-    Object.defineProperty(process, "kill", processKillDescriptor);
-    Object.defineProperty(ChildProcess.prototype, "kill", childKillDescriptor);
-    await rm(fixtureRoot, { recursive: true, force: true });
+    try {
+      if (running) {
+        await withRealTimerGuard(
+          running.then(() => undefined, () => undefined),
+          2_000,
+          "closed child lifecycle did not settle during test cleanup",
+        );
+      }
+    } finally {
+      if (timersEnabled) t.mock.timers.reset();
+      if (childEmitPatched) {
+        if (childEmitDescriptor) Object.defineProperty(ChildProcess.prototype, "emit", childEmitDescriptor);
+        else Reflect.deleteProperty(ChildProcess.prototype, "emit");
+      }
+      if (childKillPatched) Object.defineProperty(ChildProcess.prototype, "kill", childKillDescriptor);
+      if (processKillPatched) Object.defineProperty(process, "kill", processKillDescriptor);
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
   }
 });
 

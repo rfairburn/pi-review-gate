@@ -719,3 +719,8 @@ bridge (`src/stream-failure-report.ts`), consumed by both tool families
   copied. Only the headerless update application is retained from the upstream engine:
   create-file mode was removed with the legacy structured `operation` argument because
   canonical `*** Add File:` hunks carry their final content directly.
+- The saved-session search parser, matcher, and relevance ordering are adapted from
+  Pi Coding Agent v1.1.0 under the MIT License. See [NOTICE](../NOTICE) and
+  [LICENSES/MIT-pi-session-search.txt](../LICENSES/MIT-pi-session-search.txt). The
+  fuzzy matcher is imported from the pinned `pi-session-host-tui` dependency and is not
+  copied.

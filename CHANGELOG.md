@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.146]
+## [0.1.0-dev.147]
 
 ### Added
 
@@ -58,6 +58,21 @@ dates.
   extension-owned rendering but cannot sanitize their transcript renderer. CRLF
   remains a structural newline, and printable text, ordinary Markdown, and backslash
   escaping are preserved.
+
+## [0.1.0-dev.146]
+
+### Added
+
+- The session host's always-global Saved conversations picker now supports native
+  Pi 1.1.0 `/resume` fuzzy-token, quoted-phrase, and `re:` regex search across native
+  session fields, plus confirmed Ctrl+D deletion (Ctrl+Backspace only with an empty
+  query). The complete delete confirmation occupies the right/Main pane on wide layouts,
+  with the roster retained left and cancel returning to the same picker/query/selection.
+  Deletion is trash-first with permanent-unlink fallback, revalidates the exact selected
+  saved file, protects current and host-loaded conversations, and refreshes the picker
+  with truthful outcomes. Plain `d` remains query text; independent children, Main
+  ownership, ordinary native `/resume`, and roster stop/remove behavior are unchanged
+  (#372).
 
 ## [0.1.0-dev.145]
 

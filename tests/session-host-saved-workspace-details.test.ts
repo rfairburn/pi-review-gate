@@ -242,11 +242,11 @@ test("wide Unicode in the workspace is column-safe and bounded", () => {
 
 test("the saved pane stays usable at a narrow width (footer and selection preserved)", () => {
   const harness = openSavedPane([makeRow({ id: "a", cwd: "/work/a" })]);
-  const texts = savedTexts(harness.controller, 26, 10);
+  const texts = savedTexts(harness.controller, 26, 12);
   assert.ok(texts.some((line) => line.includes("Saved conversations")), JSON.stringify(texts));
   // The single-line summary uses a fair half-width allocation, so at this
   // narrow width the caption is visibly ellipsized while the workspace stays.
-  const selected = texts.find((line) => line.startsWith("> "));
+  const selected = texts.find((line) => /^> \S/u.test(line) && line.includes(" | ") && line.includes("/work/a"));
   assert.ok(selected, `missing selected row: ${JSON.stringify(texts)}`);
   assert.ok(selected.includes("..."), `caption should be ellipsized: ${JSON.stringify(selected)}`);
   assert.ok(selected.includes("/work/a"), `workspace should be visible: ${JSON.stringify(selected)}`);
@@ -260,12 +260,21 @@ test("the saved pane stays usable at a narrow width (footer and selection preser
 
 test("the saved pane is honestly too-small when it cannot fit list + details + footer", () => {
   const harness = openSavedPane([makeRow({ id: "a", cwd: "/work/a" })]);
-  const texts = savedTexts(harness.controller, 26, 7);
+  const nativeFooterFallback = savedTexts(harness.controller, 26, 10);
+  assert.ok(nativeFooterFallback.some((line) => line.includes("too small")), JSON.stringify(nativeFooterFallback));
+  assert.equal(nativeFooterFallback.some((line) => line.startsWith("> ")), false,
+    "the native cancel/footer hints leave no list row at 26x10, so no saved target is drawn");
+  harness.send(ENTER);
+  assert.equal(harness.actions.some((action) => action.type === "saved-open"), false,
+    "Enter at the 26x10 tiny fallback cannot open its hidden selection");
+
+  const smallPaneHarness = openSavedPane([makeRow({ id: "a", cwd: "/work/a" })]);
+  const texts = savedTexts(smallPaneHarness.controller, 26, 7);
   assert.ok(texts.some((line) => line.includes("too small")), JSON.stringify(texts));
 });
 
 test("Saved Enter refuses a selection after every too-small fallback", () => {
-  for (const [cols, rows] of [[20, 12], [40, 5], [26, 7]]) {
+  for (const [cols, rows] of [[20, 12], [40, 5], [26, 10], [26, 7]]) {
     const harness = openSavedPane([makeRow({ id: "a", cwd: "/work/a" })]);
     savedTexts(harness.controller, 40, 12);
     const fallback = savedTexts(harness.controller, cols, rows);
@@ -291,7 +300,9 @@ test("Saved Enter refuses an undrawn selection until redraw", () => {
     "Enter before a picker render must not open",
   );
   // Render at a narrow width that draws only the first row(s).
-  savedTexts(harness.controller, 26, 9);
+  const narrow = savedTexts(harness.controller, 32, 10);
+  assert.ok(narrow.some((line) => line.startsWith("> Conversation a ")),
+    `the narrow render shows only its selected first row: ${JSON.stringify(narrow)}`);
   harness.send(DOWN);
   harness.send(DOWN); // select row "c", which was not drawn
   harness.send(ENTER);
@@ -301,7 +312,7 @@ test("Saved Enter refuses an undrawn selection until redraw", () => {
     "Enter on an undrawn row must not open",
   );
   // Redraw so the selected row is now displayed; Enter now opens it.
-  savedTexts(harness.controller, 26, 9);
+  savedTexts(harness.controller, 32, 10);
   harness.send(ENTER);
   assert.deepEqual(harness.actions.at(-1), {
     type: "saved-open", requestId: 2, file: "c.jsonl", sessionId: "c",
@@ -313,5 +324,5 @@ test("workspace wrapping preserves a width-changing grapheme at the boundary", (
   const suffix = "\u2764\uFE0F/b";
   const harness = openSavedPane([makeRow({ id: "a", cwd: prefix + suffix })]);
   const texts = savedTexts(harness.controller, 40, 12);
-  assert.deepEqual(texts.slice(8, 10).map((line) => line.trimEnd()), [prefix, suffix]);
+  assert.deepEqual(texts.slice(7, 9).map((line) => line.trimEnd()), [prefix, suffix]);
 });

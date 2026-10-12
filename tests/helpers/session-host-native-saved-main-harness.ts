@@ -356,7 +356,7 @@ function rightPaneText(text: string): string {
 export function isSavedConversationsPane(text: string): boolean {
   const rows = rightPaneText(text).split("\n").map((line) => line.trim());
   return rows.includes("Saved conversations")
-    && rows.some((line) => line.split(" | ").includes("up/down select"));
+    && rows.some((line) => line.split(" | ").includes("F8 toggle / up/down select"));
 }
 
 /** Public 32-column Quit renderer assertion shared by native and synthetic coverage. */
@@ -392,12 +392,19 @@ export function savedRowsVisible(text: string): string[] {
 export function isCompleteSavedSelection(text: string, caption: string, cwd: string): boolean {
   if (!isSavedConversationsPane(text)) return false;
   const pane = rightPaneText(text).split("\n").map((line) => line.trimEnd());
-  const footer = pane.findIndex((line) => line.trim() === "F8 toggle | up/down select | enter open | esc back");
-  if (footer < 4 || pane.slice(footer + 1).some((line) => line.trim() !== "")) return false;
+  const footerLines = [
+    "F8 toggle / up/down select | enter open / esc/ctrl+c back",
+    "ctrl+d delete / ctrl+backspace empty",
+  ];
+  const footer = pane.findIndex((line) => line.trim() === footerLines[0]);
+  if (footer < 3 || footerLines.some((line, index) => pane[footer + index]?.trim() !== line)
+    || pane.slice(footer + footerLines.length).some((line) => line.trim() !== "")) return false;
   const details = pane.slice(footer - 3, footer);
   if (details[0] !== caption || details.slice(1).join("") !== cwd) return false;
   const visible = savedRowsVisible(text);
   if (visible.length !== 1) return false;
+  const selectedRow = pane.findIndex((line) => line.startsWith("> ") && line.slice(2) === visible[0]);
+  if (selectedRow < 2 || selectedRow >= footer - 3) return false;
   const separator = visible[0].indexOf(" | ");
   if (separator < 0 || visible[0].slice(0, separator).trimEnd() !== caption) return false;
   const summary = visible[0].slice(separator + 3);

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
+import net from "node:net";
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync as readBytesSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import test from "node:test";
@@ -36,18 +37,28 @@ import {
 import { SESSION_HOST_BOOTSTRAP_ENV, composeFreshSessionSpawnArgs, prepareNativeLaunch } from "../src/session-host/launch";
 import { SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV } from "../src/session-host/startup-request";
 import { TerminalSurface } from "../src/session-host/terminal-surface";
-import type { StatusRenameRequest, StatusRenameResult, StatusShutdownResult } from "../src/session-host/broker";
+import type {
+  StatusBroker,
+  StatusBrokerStatusHandlers,
+  StatusRegistration,
+  StatusRenameRequest,
+  StatusRenameResult,
+  StatusShutdownResult,
+} from "../src/session-host/broker";
+import activateReporter, { SESSION_HOST_STICKY_STATE_KEY } from "../src/session-host/reporter";
+import { __test as mainTest } from "../src/session-host/main";
+import { HOST_BOOTSTRAP_ENV, decodeFrame, type SessionHostStatus } from "../src/session-host/protocol";
 
 /**
  * Focused component tests for the independent owned-PTY instance lifecycle.
  *
- * IMPORTANT EVIDENCE SCOPE: all manager cases use a FAKE status registrar;
- * everything except the final native-addon case also uses FAKE PTYs. These
- * include one own-root native-setup descriptor/preservation case, but do not
- * prove native Pi runtime behavior. The final case exercises the pinned PTY
- * binding with an owned Node shim. None proves real Pi 1.0.4, actual
- * preload/gate behavior, broker/protocol integration, or native Main
- * compatibility; the parent owns those integrated checks. Broker/protocol
+ * IMPORTANT EVIDENCE SCOPE: manager cases use synthetic PTYs and broker
+ * callbacks. The current-file regression additionally runs the production
+ * reporter and protocol through Main's status adapter over an authenticated
+ * in-memory transport. These do not prove native Pi runtime behavior or the
+ * real broker's socket authentication; the parent owns broader integration.
+ * The final native-addon case exercises the pinned PTY binding with an owned
+ * Node shim, not a real Pi child. Broker/protocol
  * components have landed, but this file does not exercise them.
  */
 
@@ -2623,8 +2634,9 @@ test("saved-session duplicate fencing: concurrent and live reservations, release
       /already open in this host/,
     );
     assert.deepEqual(harness.manager.ownedLiveSessions(), [
-      { id: "saved-fence-1", file: admission.file },
-    ], "the pending/live reservation is known-owned data");
+      { kind: "reservation", id: "saved-fence-1", file: admission.file },
+      { kind: "current" },
+    ], "the exact reservation stays paired and live current binding remains independently unknown");
 
     // Only the exact owned PTY's actual exit releases the reservation.
     harness.spawned[0]!.emitExit(0);
@@ -2715,6 +2727,258 @@ test("known native bindings fence duplicate saved admissions across disconnect a
   }
 });
 
+test("current-file ownership stays private, rebinds from status, and never borrows a saved reservation path", { skip: process.platform === "win32" }, async () => {
+  const harness = makeSavedHarness("current-file-rebind");
+  try {
+    writeSavedSessionFile(join(harness.agentDir, "sessions", "proj"), "x.jsonl", "saved-current-x", harness.workspace);
+    const admission = await admissionFor(harness, "saved-current-x");
+    const id = await harness.manager.create({ workspace: admission.workspace, savedSession: admission });
+    const entry = harness.registrar.entryFor(id);
+
+    harness.registrar.emitStatus(entry, {
+      busy: null,
+      pendingInput: null,
+      inputSurface: false,
+      activity: [],
+      nativeSession: {
+        sessionId: admission.sessionId,
+        epoch: 1,
+        name: "Loaded conversation",
+        currentFile: admission.file,
+      },
+    });
+    assert.deepEqual(harness.manager.ownedLiveSessions(), [
+      { kind: "reservation", id: admission.sessionId, file: admission.file },
+      { kind: "current", id: admission.sessionId, file: admission.file },
+    ], "current and pending bindings are distinct even when they currently name the same file");
+    assert.equal(viewFor(harness.manager, id).nativeSession?.currentFile, undefined,
+      "private file observations do not enter the manager's display view");
+
+    const plannedNewFile = "/synthetic/not-yet-saved-new.jsonl";
+    harness.registrar.emitStatus(entry, {
+      busy: null,
+      pendingInput: null,
+      inputSurface: false,
+      activity: [],
+      nativeSession: {
+        sessionId: "native-new-id",
+        epoch: 2,
+        name: "New conversation",
+        currentFile: plannedNewFile,
+      },
+    });
+    assert.deepEqual(harness.manager.ownedLiveSessions(), [
+      { kind: "current", id: "native-new-id", file: plannedNewFile },
+    ], "native /new or /resume replaces both current ID and actual planned file, not an old reservation");
+
+    harness.registrar.emitStatus(entry, {
+      busy: null,
+      pendingInput: null,
+      inputSurface: false,
+      activity: [],
+      nativeSession: {
+        sessionId: "native-new-id",
+        epoch: 2,
+        name: "New conversation",
+        currentFile: "relative/invalid.jsonl",
+      },
+    });
+    assert.deepEqual(harness.manager.ownedLiveSessions(), [
+      { kind: "current", id: "native-new-id" },
+    ], "an invalid optional path revokes the earlier current-file observation");
+
+    harness.registrar.emitDisconnect(entry);
+    assert.deepEqual(harness.manager.ownedLiveSessions(), [
+      { kind: "current" },
+      { kind: "known-id", id: "native-new-id" },
+    ], "disconnect revokes current path while retaining only a separately classified launch duplicate fence");
+  } finally {
+    cleanup(harness);
+  }
+});
+
+test("reporter protocol current file reaches the production manager and Main deletion guard", { skip: process.platform === "win32" }, async () => {
+  const harness = makeSavedHarness("reporter-main-current-file");
+  const savedFile = writeSavedSessionFile(
+    join(harness.agentDir, "sessions", "proj"),
+    "same-file-different-catalog-id.jsonl",
+    "catalog-header-id-b",
+    harness.workspace,
+  );
+  const catalog = await listSavedSessions({ agentDir: harness.agentDir, listAll: makeSavedListAll() });
+  const row = catalog.rows.find((candidate) => candidate.id === "catalog-header-id-b");
+  assert.ok(row);
+
+  const channels = new Map<string, StatusBrokerStatusHandlers>();
+  const bootstraps = new Map<string, StatusRegistration["bootstrap"]>();
+  const socketPath = `/tmp/prg-synthetic-${randomUUID()}.sock`;
+  const generation = randomUUID();
+  const token = "a".repeat(64);
+  const broker: StatusBroker = {
+    socketPath,
+    generation,
+    register(instanceId, handlers) {
+      const bootstrap: StatusRegistration["bootstrap"] = {
+        version: 1,
+        socketPath,
+        token,
+        instanceId,
+        generation,
+      };
+      channels.set(instanceId, handlers);
+      bootstraps.set(instanceId, bootstrap);
+      return {
+        bootstrap,
+        rename: async (request) => ({
+          requestId: randomUUID(),
+          status: "unavailable",
+          expectedSessionId: request.expectedSessionId,
+          expectedSessionEpoch: request.expectedSessionEpoch,
+          observedSessionId: null,
+          observedSessionEpoch: null,
+        }),
+        shutdown: async () => ({ requestId: randomUUID(), status: "unavailable" }),
+        release: () => { channels.delete(instanceId); },
+      };
+    },
+    async dispose() { channels.clear(); },
+  };
+  const manager = new InstanceManager({
+    packageRoot: harness.packageRoot,
+    piExecutable: harness.piExecutable,
+    statusRegistrar: mainTest.statusRegistrar(broker),
+    nativeSetup: false,
+    profileRegistry: harness.profileRegistry,
+    env: harness.env,
+    ptyFactory: harness.ptyFactory,
+  });
+
+  const envNames = [HOST_BOOTSTRAP_ENV, SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV,
+    "PI_REVIEW_GATE_RUNTIME_ROLE"] as const;
+  const oldEnv = new Map(envNames.map((key) => [key, process.env[key]] as const));
+  const globalScope = globalThis as Record<PropertyKey, unknown>;
+  const privateGlobalKeys = [
+    SESSION_HOST_STICKY_STATE_KEY,
+    Symbol.for("pi-review-gate.session-host.startup-request.v1"),
+    Symbol.for("pi-review-gate.session-host.title-columns.v1"),
+  ] as const;
+  const oldGlobal = new Map(privateGlobalKeys.map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const));
+  for (const key of privateGlobalKeys) delete globalScope[key];
+
+  const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+  const pi = { on(name: string, callback: (...args: unknown[]) => unknown) {
+    hooks.set(name, [...(hooks.get(name) ?? []), callback]);
+  } };
+  const trigger = async (name: string, ...args: unknown[]): Promise<void> => {
+    for (const callback of hooks.get(name) ?? []) await callback(...args);
+  };
+  const sockets: net.Socket[] = [];
+  let currentId = "old-live-id-a";
+  let currentFile: string | undefined = savedFile;
+  const context = () => ({
+    mode: "tui",
+    ui: { setWidget() {} },
+    isIdle: () => false,
+    sessionManager: {
+      getSessionId: () => currentId,
+      getSessionName: () => "Synthetic current conversation",
+      getEntries: () => [],
+      getSessionFile: () => currentFile,
+    },
+  });
+  let reporterStarted = false;
+  let instanceId: string | undefined;
+  try {
+    for (const key of envNames) delete process.env[key];
+    const id = await manager.create({ workspace: harness.workspace });
+    instanceId = id;
+    const bootstrap = bootstraps.get(id);
+    assert.ok(bootstrap);
+    process.env[HOST_BOOTSTRAP_ENV] = JSON.stringify(bootstrap);
+
+    await activateReporter(pi, {
+      reconnectDelayMs: 60_000,
+      maxReconnectAttempts: 0,
+      connectSocket: (address) => {
+        assert.equal(address, bootstrap.socketPath);
+        const socket = new net.Socket();
+        let buffered = "";
+        let authenticated = false;
+        socket.write = ((chunk: string | Uint8Array) => {
+          buffered += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+          let newline: number;
+          while ((newline = buffered.indexOf("\n")) >= 0) {
+            const line = buffered.slice(0, newline + 1);
+            buffered = buffered.slice(newline + 1);
+            const message = decodeFrame(line);
+            if (message?.type === "hello") {
+              authenticated = message.instanceId === bootstrap.instanceId
+                && message.generation === bootstrap.generation
+                && message.token === bootstrap.token;
+            } else if (message?.type === "status" && authenticated
+              && message.instanceId === bootstrap.instanceId
+              && message.generation === bootstrap.generation) {
+              channels.get(id)?.onStatus(message as SessionHostStatus);
+            }
+          }
+          return true;
+        }) as typeof socket.write;
+        sockets.push(socket);
+        return socket;
+      },
+    });
+    reporterStarted = true;
+
+    await trigger("session_start", { type: "session_start" }, context());
+    sockets.at(-1)?.emit("connect");
+    assert.equal(manager.list()[0]?.nativeSession?.sessionId, currentId);
+    assert.equal(manager.list()[0]?.nativeSession?.currentFile, undefined,
+      "the manager's display view strips authenticated path data");
+    assert.equal(JSON.stringify(manager.list()).includes(savedFile), false,
+      "the actual saved path never enters the public manager view");
+    assert.notEqual(currentId, row.id, "the live session ID remains the pre-catalog value while the saved header has changed");
+    const firstGuardSnapshot = mainTest.savedDeletionOwnedSessions(manager);
+    assert.deepEqual(firstGuardSnapshot, [{ kind: "current", id: currentId, file: savedFile }]);
+    assert.equal(mainTest.validateOwnedSavedSessionDeletion(manager, catalog, row), "known-owned-duplicate",
+      "Main blocks deletion by current real file even though the live ID differs from the catalog header ID");
+
+    currentId = "new-live-id-b";
+    currentFile = join(harness.root, "planned-new-unsaved.jsonl");
+    await trigger("session_start", { type: "session_start", reason: "synthetic-resume" }, context());
+    sockets.at(-1)?.emit("connect");
+    const reboundSnapshot = mainTest.savedDeletionOwnedSessions(manager);
+    assert.deepEqual(reboundSnapshot, [{ kind: "current", id: currentId, file: currentFile }],
+      "the production reporter/protocol/manager path replaces the current loaded file on /new or /resume");
+    assert.equal(mainTest.validateOwnedSavedSessionDeletion(manager, catalog, row), undefined,
+      "once rebound, the old actual file is no longer protected by an unrelated live ID");
+
+    currentFile = undefined;
+    await trigger("session_info_changed", { type: "session_info_changed" }, context());
+    const unavailableSnapshot = mainTest.savedDeletionOwnedSessions(manager);
+    assert.deepEqual(unavailableSnapshot, [{ kind: "current", id: currentId }],
+      "a missing current-file observation clears the last path instead of retaining it as current");
+    assert.equal(mainTest.validateOwnedSavedSessionDeletion(manager, catalog, row), "unknown-live-binding",
+      "Main fails closed when the live reporter cannot observe its current file");
+  } finally {
+    if (reporterStarted) await trigger("session_shutdown", { type: "session_shutdown" }, context()).catch(() => undefined);
+    for (const socket of sockets) socket.destroy();
+    if (instanceId !== undefined) {
+      harness.spawned.at(-1)?.emitExit(0);
+      manager.closeExited(instanceId);
+    }
+    await manager.dispose().catch(() => undefined);
+    for (const [key, value] of oldEnv) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    for (const [key, descriptor] of oldGlobal) {
+      if (descriptor === undefined) delete globalScope[key];
+      else Object.defineProperty(globalThis, key, descriptor);
+    }
+    cleanup(harness);
+  }
+});
+
 test("saved-origin rebind releases the initial reservation; the new binding stays fenced", { skip: process.platform === "win32" }, async () => {
   const harness = makeSavedHarness("rebind-saved");
   try {
@@ -2753,9 +3017,10 @@ test("saved-origin rebind releases the initial reservation; the new binding stay
       /already open in this host/,
     );
     assert.deepEqual(harness.manager.ownedLiveSessions(), [
-      { id: "conv-y" },
-      { id: "conv-x", file: rowX.file },
-    ], "the rebound row reports only its current binding; the new child keeps its reservation");
+      { kind: "current", id: "conv-y" },
+      { kind: "reservation", id: "conv-x", file: rowX.file },
+      { kind: "current" },
+    ], "the rebound current ID is never paired with the new sibling's reserved file");
   } finally {
     cleanup(harness);
   }
@@ -2792,16 +3057,17 @@ test("ownedLiveSessions reports live bindings and reservations only; exited rows
 
     const pending = harness.manager.create({ workspace: admission.workspace, savedSession: admission });
     assert.deepEqual(harness.manager.ownedLiveSessions(), [
-      { id: "saved-owned-1", file: admission.file },
-    ], "a pending creation reservation is known-owned before its spawn settles");
+      { kind: "reservation", id: "saved-owned-1", file: admission.file },
+    ], "a reservation exists before a PTY-backed current binding is live");
     const idA = await pending;
 
     const idB = await harness.manager.create({ label: "ordinary", workspace: harness.workspace2 });
     const entry = harness.registrar.entryFor(idB);
     harness.registrar.emitStatus(entry, { busy: null, pendingInput: null, inputSurface: false, activity: [], nativeSession: { sessionId: "observed-binding", epoch: 1, name: "Observed" } });
     assert.deepEqual(harness.manager.ownedLiveSessions(), [
-      { id: "saved-owned-1", file: admission.file },
-      { id: "observed-binding" },
+      { kind: "reservation", id: "saved-owned-1", file: admission.file },
+      { kind: "current" },
+      { kind: "current", id: "observed-binding" },
     ]);
 
     harness.spawned[0]!.emitExit(0);

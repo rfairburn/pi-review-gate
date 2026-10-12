@@ -420,7 +420,15 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   assert.equal(sessionA.currentName, labelA, "A returns to its short persisted alias before the remaining row/header checks");
   assert.equal(sessionFileHasStoredName(sessionA.record.sessionFile!, labelA), true,
     "restoring the short alias persists a separately navigable native row name");
+  const beforeInactiveEditReturn = driver.frameRevision;
   await driver.toggleSidebar();
+  // Hiding proves host focus/visibility first, but also resizes the native
+  // pane. Require its complete current-width repaint before inspecting B's
+  // draft; a merely hidden roster is not a settled native-editor witness.
+  await driver.waitFrame((text) => restoredNativeEditorFrame(text, {
+    ownerLabel: labelB, draft: draftB, sidebarColumns: 32,
+    nativeWidth: OUTER_COLS, focus: "hidden",
+  }), "returning from inactive A's Edit repaints B's exact full-width native draft and owner", beforeInactiveEditReturn);
   assert.equal(driver.focus, "main", "editing inactive A leaves B as the active input owner");
   assert.ok(driver.currentText().includes(draftB), "editing inactive A preserves B's native prompt draft");
   assert.equal(processIsAlive(bPid), true, "B stays live while the host edits inactive A");

@@ -183,6 +183,80 @@ test("wide form focus replaces only the right native pane while the roster stays
 	assert.equal(closedResult.cursor.visible, false);
 });
 
+test("only the explicit Saved-delete placement replaces the right pane while confirm keeps dialog focus", () => {
+	const layout = computeHostLayout(80, 10, {
+		sidebarVisible: true,
+		focus: "confirm",
+		savedDeleteConfirmation: true,
+	});
+	assert.deepEqual(layout.form, layout.native, "the confirmation uses the existing right-pane slot without changing native geometry");
+	const result = composeHostFrame(layout, {
+		main: mainFrame(47, 9, ["native child frame"]),
+		sidebar: { lines: ["Sessions (1)", "Saved conversations"] },
+		form: { lines: [
+			"Delete saved conversation?",
+			"Conversation: target caption",
+			"Saved file: /synthetic/saved.jsonl",
+			"Only this saved file is removed; the host",
+			"will not stop any child.",
+			"If trash fails, this file is permanently",
+			"unlinked.",
+			"enter confirm",
+			"esc cancel",
+		] },
+		header: "host",
+		focus: "confirm",
+	});
+	assertBounded(result.lines, 80, 10);
+	const rows = result.lines.slice(1).map(plain);
+	const left = rows.map((line) => line.slice(0, 32)).join("\n");
+	const right = rows.map((line) => line.slice(33)).join("\n").replace(/\s+/g, " ");
+	assert.ok(left.includes("Sessions (1)"));
+	assert.ok(left.includes("Saved conversations"));
+	assert.equal(left.includes("Delete saved conversation?"), false);
+	assert.equal(left.includes("Only this saved file is removed"), false);
+	assert.equal(left.includes("/synthetic/saved.jsonl"), false);
+	for (const text of [
+		"Delete saved conversation?",
+		"Conversation: target caption",
+		"Saved file: /synthetic/saved.jsonl",
+		"Only this saved file is removed; the host will not stop any child.",
+		"If trash fails, this file is permanently unlinked.",
+		"enter confirm",
+		"esc cancel",
+	]) assert.ok(right.includes(text), `right panel keeps complete confirmation text: ${text}`);
+	assert.equal(result.cursor.visible, false, "dialog placement does not create a native/form cursor");
+
+	const ordinaryConfirm = computeHostLayout(80, 10, { sidebarVisible: true, focus: "confirm" });
+	assert.equal(ordinaryConfirm.form, undefined, "quit and stop/remove confirmations keep their original placement");
+	const ordinaryResult = composeHostFrame(ordinaryConfirm, {
+		main: mainFrame(47, 9, ["native child frame"]),
+		sidebar: { lines: ["Stop session?"] },
+		form: { lines: ["must not be composed"] },
+		header: "host",
+		focus: "confirm",
+	});
+	assert.ok(plain(ordinaryResult.lines[1]!).slice(0, 32).includes("Stop session?"));
+	assert.ok(plain(ordinaryResult.lines[1]!).slice(33).includes("native child frame"));
+	assert.equal(ordinaryResult.lines.join("\n").includes("must not be composed"), false);
+	const quitResult = composeHostFrame(ordinaryConfirm, {
+		main: mainFrame(47, 9, ["native child frame"]),
+		sidebar: { lines: ["Quit host?"] },
+		header: "host",
+		focus: "confirm",
+	});
+	assert.ok(plain(quitResult.lines[1]!).slice(0, 32).includes("Quit host?"));
+	assert.ok(plain(quitResult.lines[1]!).slice(33).includes("native child frame"));
+
+	const narrow = computeHostLayout(52, 4, {
+		sidebarVisible: true,
+		focus: "confirm",
+		savedDeleteConfirmation: true,
+	});
+	assert.equal(narrow.sidebarOverlay, true);
+	assert.equal(narrow.form, undefined, "narrow Saved confirmation retains the full-content overlay path");
+});
+
 test("wide form focus keeps a hidden-cursor fallback when the form is too small for its pane", () => {
 	const layout = computeHostLayout(53, 4, { sidebarVisible: true, focus: "form" });
 	assert.deepEqual(layout.form, layout.native); // 20-column native pane

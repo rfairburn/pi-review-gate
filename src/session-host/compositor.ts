@@ -26,9 +26,10 @@ export interface HostLayout {
 	readonly sidebar?: HostPaneRect;
 	readonly dividerColumn?: number;
 	/**
-	 * Present only while the New session form temporarily replaces the native
-	 * pane in the wide (non-overlay) layout. It mirrors the native rect so the
-	 * underlying child keeps its geometry underneath.
+	 * Present while a host form/picker or explicitly placed Saved-delete
+	 * confirmation replaces the native pane in the wide layout. It mirrors the
+	 * native rect; its presence does not imply that the native child changed
+	 * geometry or that this pane owns input focus.
 	 */
 	readonly form?: HostPaneRect;
 	readonly sidebarOverlay: boolean;
@@ -43,7 +44,7 @@ export interface RenderedSidebar {
 export interface ComposeHostFrameOptions {
 	readonly main?: TerminalFrame;
 	readonly sidebar?: RenderedSidebar;
-	/** New session form pane; composed into layout.form when present. */
+	/** Host form/picker or explicitly placed Saved-delete confirmation for layout.form. */
 	readonly form?: RenderedSidebar;
 	/** Canonical title only, without status/prefix badges; control sequences are never trusted. */
 	readonly header: string;
@@ -62,7 +63,12 @@ export interface ComposedHostFrame {
 export function computeHostLayout(
 	cols: number,
 	rows: number,
-	options: { readonly sidebarVisible: boolean; readonly focus: HostFocus },
+	options: {
+		readonly sidebarVisible: boolean;
+		readonly focus: HostFocus;
+		/** Display-only placement; focus remains `confirm` and input stays host-owned. */
+		readonly savedDeleteConfirmation?: boolean;
+	},
 ): HostLayout {
 	validateDimension(cols, "cols");
 	validateDimension(rows, "rows");
@@ -98,9 +104,11 @@ export function computeHostLayout(
 		} else {
 			layout.sidebar = { column: 0, row: headerRows, cols: SIDEBAR_WIDTH, rows: contentRows };
 			layout.dividerColumn = SIDEBAR_WIDTH;
-			if (options.focus === "form") {
-				// The form temporarily replaces the native pane; the roster stays
-				// in the left sidebar and the native child keeps its geometry.
+			if (options.focus === "form"
+				|| (options.focus === "confirm" && options.savedDeleteConfirmation === true)) {
+				// Forms and only the explicitly selected Saved-delete confirmation
+				// replace the native pane; the roster stays left and the child keeps
+				// its geometry. Placement never changes the actual focused owner.
 				layout.form = { ...native };
 			}
 		}
@@ -145,8 +153,9 @@ export function composeHostFrame(layout: HostLayout, options: ComposeHostFrameOp
 		if (layout.dividerColumn !== undefined && layout.sidebar !== undefined) {
 			const sidebarRow = panelRow(sidebarLines[row], layout.sidebar.cols);
 			const divider = `${SGR_RESET}│${SGR_RESET}`;
-			// While the form is open it temporarily replaces the native pane;
-			// the child frame stays composed only after the form closes.
+			// While a form or explicitly placed Saved-delete warning is open it
+			// temporarily replaces the native pane; the child frame stays composed
+			// only after that host-owned pane closes.
 			const rightLines = layout.form !== undefined ? formLines : mainLines;
 			const nativeRow = panelRow(rightLines[row], layout.native.cols);
 			lines[outerRow] = `${sidebarRow}${divider}${nativeRow}`;

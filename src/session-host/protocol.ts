@@ -31,7 +31,7 @@
  * this module is the shared contract for both sides and performs no IO.
  */
 
-import { posix as posixPath } from "node:path";
+import { isAbsolute, posix as posixPath } from "node:path";
 
 export const HOST_BOOTSTRAP_ENV = "PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP";
 
@@ -46,6 +46,8 @@ export const MAX_NATIVE_SESSION_NAME_LENGTH = 256;
 /** Rename is never silently clipped: complete persisted input must fit this UTF-8 byte limit. */
 export const MAX_RENAME_NAME_BYTES = 1024;
 export const MAX_NATIVE_SESSION_ID_BYTES = 256;
+/** Private native manager current-file observation bound; paths never enter presentation/roster data. */
+export const MAX_NATIVE_SESSION_FILE_BYTES = 4096;
 /** SessionSpawn fields have independent transport bounds; sidebar width is not a data limit. */
 export const MAX_SESSION_SPAWN_WORKSPACE_BYTES = 4096;
 export const MAX_SESSION_SPAWN_TITLE_BYTES = MAX_RENAME_NAME_BYTES;
@@ -148,6 +150,8 @@ export interface SessionHostNativeSession {
   name: string;
   /** Last actual planned-file observation; missing on older reporters means unknown. */
   persistence?: "saved" | "unsaved" | "unknown";
+  /** Authenticated public SessionManager.getSessionFile() observation; private to deletion/ownership guards. */
+  currentFile?: string;
 }
 
 /** Broker-to-reporter command; the capability token is never forwarded to status/UI callbacks. */
@@ -283,6 +287,15 @@ export function isValidNativeSessionId(value: unknown): value is string {
     && !/[\x00-\x1f\x7f\u0080-\u009f\u2028\u2029]/.test(value);
 }
 
+/** A bounded absolute native current-file path; no filesystem/workspace admission is performed. */
+export function isValidNativeSessionFile(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && Buffer.byteLength(value, "utf8") <= MAX_NATIVE_SESSION_FILE_BYTES
+    && isAbsolute(value)
+    && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value);
+}
+
 /** Validate user-supplied persisted rename input without clipping or normalization. */
 export function isValidRenameName(value: unknown): value is string {
   return typeof value === "string"
@@ -306,12 +319,14 @@ function parseNativeSession(value: unknown): SessionHostNativeSession | undefine
     || !Number.isSafeInteger(value.epoch)
     || (value.epoch as number) < 1
     || !isValidDisplayName(value.name)) return undefined;
+  const currentFile = value.currentFile;
   return {
     sessionId: value.sessionId,
     epoch: value.epoch as number,
     name: value.name,
     ...(value.persistence === "saved" || value.persistence === "unsaved" || value.persistence === "unknown"
       ? { persistence: value.persistence } : {}),
+    ...(isValidNativeSessionFile(currentFile) ? { currentFile } : {}),
   };
 }
 

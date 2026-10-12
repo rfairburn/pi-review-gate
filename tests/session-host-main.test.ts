@@ -3,10 +3,11 @@ import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { Buffer } from "node:buffer";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Writable } from "node:stream";
 import test from "node:test";
+import { isKittyProtocolActive, setKittyProtocolActive } from "pi-session-host-tui";
 
 import type { ComposedHostFrame } from "../src/session-host/compositor";
 import type { CreateInstanceOptions, InstanceManagerOptions, NativeInstanceView, ShutdownResult } from "../src/session-host/instances";
@@ -18,10 +19,11 @@ import {
 import type { KeyboardCapabilityObserverOptions } from "../src/session-host/input";
 import type { StatusBroker, StatusRenameRequest, StatusRenameResult } from "../src/session-host/broker";
 import { NativeAgentRegistry, type ProfilePreparer } from "../src/session-host/profiles";
-import { runNativeExternalEditor } from "../src/session-host/form-support";
-import type { TerminalFrame, TerminalInputModes } from "../src/session-host/terminal-surface";
+import { createNativeSavedQueryInput, runNativeExternalEditor } from "../src/session-host/form-support";
+import { TerminalSurface, type TerminalFrame, type TerminalInputModes } from "../src/session-host/terminal-surface";
 import { SidebarController } from "../src/session-host/sidebar";
 import { isSavedSessionAdmission, listSavedSessions, type SavedSessionCatalog } from "../src/session-host/saved-sessions";
+import { deleteSavedSessionFile, type SavedSessionDeletionOptions } from "../src/session-host/saved-deletion";
 import type { SessionHostNativeSession } from "../src/session-host/protocol";
 import { __test, type SessionHostOptions } from "../src/session-host/main";
 import { sidebarNoticeRows } from "./helpers/session-host-notice-witness";
@@ -50,6 +52,7 @@ class QueuedFrameOutput extends EventEmitter {
   private queuedWriteAccepted = false;
 
   get queuedCount(): number { return this.queued.length; }
+  get queuedTexts(): string[] { return this.queued.map(({ bytes }) => bytes.toString("utf8")); }
 
   refuseNextWrite(accepted = false): void {
     this.queueNext = true;
@@ -653,6 +656,63 @@ function plainLine(frame: ComposedHostFrame | undefined, row: number): string {
 function screenRowContaining(frame: ComposedHostFrame | undefined, text: string, fromRow = 1): number {
   return frame?.lines.findIndex((line, row) => row >= fromRow
     && line.replace(/\x1b\[[0-9;]*m/g, "").includes(text)) ?? -1;
+}
+
+function assertSavedDeleteConfirmationRightPanel(frame: { readonly lines: readonly string[] }, expectedFile: string): void {
+  const body = frame.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const left = body.map((line) => line.slice(0, 32)).join("\n");
+  const right = body.map((line) => line.slice(33)).join("\n");
+  const normalize = (value: string): string => value.replace(/\s+/g, " ");
+  const rightText = normalize(right);
+  const leftText = normalize(left);
+  assert.equal(body[0]?.[32], "│", "the right/main panel begins at column 33 after the divider");
+  assert.ok(leftText.includes("Sessions"), "the roster remains in columns 0..31");
+  for (const text of ["Delete saved conversation?", "Conversation:", "Only this saved file is removed", "If trash fails"])
+    assert.equal(leftText.includes(text), false, `left roster must not contain confirmation text: ${text}`);
+  assert.equal(left.replace(/\s/g, "").includes(expectedFile.replace(/\s/g, "")), false,
+    "the exact target path is absent from the left roster");
+  for (const text of [
+    "Delete saved conversation?",
+    "Conversation:",
+    "Only this saved file is removed; the host will not stop any child.",
+    "If trash fails, this file is permanently unlinked.",
+    "enter confirm",
+    "cancel",
+  ]) assert.ok(rightText.includes(text), `right pane retains complete confirmation text: ${text}`);
+  assert.match(rightText, /(?:esc|escape|ctrl\+c).*cancel/, "the native cancel binding is visible with its label");
+  assert.ok(right.replace(/\s/g, "").includes(expectedFile.replace(/\s/g, "")),
+    "the exact selected file path is wholly in the right pane");
+}
+
+function assertSavedPickerRightPanel(
+  frame: { readonly lines: readonly string[] },
+  query: string,
+  selectedCaption: string,
+): void {
+  const body = frame.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const left = body.map((line) => line.slice(0, 32)).join("\n");
+  const right = body.map((line) => line.slice(33)).join("\n");
+  assert.ok(left.includes("Sessions"), "the roster returns to the left pane");
+  assert.ok(right.includes("Saved conversations"), "the same Saved picker returns to the right pane");
+  assert.ok(right.includes(query), "the query draft remains displayed in the picker");
+  assert.ok(right.includes(`> ${selectedCaption}`), "the same Saved row remains selected after cancel");
+}
+
+async function emittedTerminalFrame(
+  output: QueuedFrameOutput,
+  cols: number,
+  rows: number,
+  includeQueued = false,
+): Promise<TerminalFrame> {
+  const surface = new TerminalSurface(cols, rows);
+  try {
+    const writes = [...output.writes, ...(includeQueued ? output.queuedTexts.map((text) => Buffer.from(text)) : [])];
+    for (const bytes of writes) surface.write(bytes.toString("utf8"));
+    await surface.flush();
+    return surface.frame();
+  } finally {
+    surface.dispose();
+  }
 }
 
 function emitMouse(
@@ -1917,9 +1977,15 @@ test("failed, live, and unconfirmed removals leave the row and owner in place wi
   assert.equal(manager.closeExitedCalls.length, closeCallsBeforeGuardedStop,
     "a rendered live card never reaches closeExited directly");
   assert.equal(harness.sidebar?.focus, "confirm", "a rendered live card enters the guarded stop confirmation");
-  const stopConfirmText = plain(harness.writer.frames.at(-1)?.frame);
+  const stopConfirmFrame = harness.writer.frames.at(-1)!.frame;
+  const stopConfirmText = plain(stopConfirmFrame);
   assert.ok(stopConfirmText.includes("Stop session?"), `the guarded stop confirmation is drawn: ${stopConfirmText}`);
   assert.ok(stopConfirmText.includes("esc/n = cancel"), "the confirmation exposes its cancel binding before any stop");
+  const stopBody = stopConfirmFrame.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  assert.ok(stopBody.map((line) => line.slice(0, 32)).join("\n").includes("Stop session?"),
+    "stop/remove confirmation stays in the left pane");
+  assert.ok(stopBody.map((line) => line.slice(33)).join("\n").includes("frame:native-1"),
+    "stop/remove confirmation does not replace the native right pane");
   assert.equal(manager.shutdownCalls, 0);
   assert.equal(harness.terminal.stopCount, 0);
 
@@ -2598,8 +2664,8 @@ for (const identicalCaptions of [false, true]) for (const acceptedWhileQueued of
       ),
     });
     harnessForCleanup = harness;
-    harness.terminal.rows = 8; // one Saved list row: scrolling replaces its hit target at the same coordinate
-    harness.stdout.rows = 8;
+    harness.terminal.rows = 10; // one Saved list row: scrolling replaces its hit target at the same coordinate
+    harness.stdout.rows = 10;
     const manager = await ready(harness);
     openSavedPicker(harness.terminal);
     for (let attempt = 0; attempt < 10 && catalog?.rows.length !== 2; attempt += 1) await nextTurn();
@@ -2616,18 +2682,28 @@ for (const identicalCaptions of [false, true]) for (const acceptedWhileQueued of
     }
     assert.ok(output.writes.some((bytes) => bytes.toString("utf8").includes(savedA.caption)),
       "the actual frame writer has emitted the first Saved row");
+    const emittedA = await emittedTerminalFrame(output, harness.terminal.columns, harness.terminal.rows);
+    const emittedARight = emittedA.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(33)).join("\n");
+    assert.ok(emittedARight.includes("Saved conversations") && emittedARight.includes(savedA.caption),
+      "the emitted Saved picker and selected row occupy the right/main pane");
 
     output.refuseNextWrite(acceptedWhileQueued);
     harness.terminal.emitInput("\x1b[B"); // Scroll the one-row window from A to B.
     await nextTurn();
     assert.equal(output.queuedCount, 1, "the real frame writer submitted B to a delayed Writable");
+    const coalescedCandidate = await emittedTerminalFrame(output, harness.terminal.columns, harness.terminal.rows, true);
+    const candidateRight = coalescedCandidate.lines.slice(1)
+      .map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(33)).join("\n");
+    assert.ok(candidateRight.includes("Saved conversations") && candidateRight.includes(savedB.caption),
+      "the coalesced candidate is still a right-pane Saved picker, not a left-only render");
 
     // A is still the only row on the sink's emitted surface. Even though Main's
     // render has already built B's newer mutable hit map, the pending map must
     // not authorize the same coordinate as B, even when write() returned true.
-    emitMouse(harness.terminal, 34, 2);
+    // The native query field shifts the first result down one screen row.
+    emitMouse(harness.terminal, 34, 3);
     assert.equal(manager.createOptions.length, 0, "a click before callback completion cannot open undisplayed B");
-    emitMouse(harness.terminal, 34, 2, 0, "m");
+    emitMouse(harness.terminal, 34, 3, 0, "m");
 
     if (returnToOriginal) {
       harness.terminal.emitInput("\x1b[A"); // Return from B to A while B's write is still pending.
@@ -2641,7 +2717,7 @@ for (const identicalCaptions of [false, true]) for (const acceptedWhileQueued of
         "a successful callback alone cannot settle a write() that returned false");
       output.emit("drain");
     }
-    emitMouse(harness.terminal, 34, 2);
+    emitMouse(harness.terminal, 34, 3);
     for (let attempt = 0; attempt < 10 && manager.createOptions.length === 0; attempt += 1) await nextTurn();
     assert.equal(manager.createOptions.length, 1,
       "the final emitted Saved row is clickable after its callback and any required drain settle the frame");
@@ -3389,6 +3465,785 @@ test("shutdown while a saved listing is pending aborts it and exits cleanly", as
     await nextTurn();
     assert.equal(await closeWithSignal(harness), 0, "a pending read-only listing never blocks shutdown");
   } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("Saved picker uses native Input and private-catalog search without leaking indexed session fields", async () => {
+  const fixture = makeSavedMainFixture("native-query");
+  const secondFile = join(fixture.agentDir, "sessions", "proj", "second.jsonl");
+  const secondId = "saved-main-native-query-second";
+  const nameSuffix = "PrivateNativeNameSuffix";
+  const transcriptNeedle = "private-regex-needle-729";
+  writeFileSync(secondFile, [
+    JSON.stringify({ type: "session", version: 3, id: secondId, timestamp: "2025-02-01T00:00:00.000Z", cwd: fixture.workspace }),
+    JSON.stringify({ type: "message", id: "m2", message: { role: "user", content: [{ type: "text", text: `Second conversation native-query ${fixture.sessionId}` }] } }),
+  ].join("\n") + "\n", "utf8");
+  writeFileSync(join(fixture.agentDir, "keybindings.json"), JSON.stringify({
+    "tui.select.down": "ctrl+n",
+    "app.session.delete": "ctrl+x",
+    "app.session.deleteNoninvasive": "ctrl+backspace",
+  }), "utf8");
+  const { overrides } = savedFixtureDependencies(fixture, (options) => listSavedSessions({
+    agentDir: options.agentDir,
+    signal: options.signal,
+    listAll: async () => [
+      {
+        path: fixture.file,
+        id: fixture.sessionId,
+        cwd: fixture.workspace,
+        name: `Deep Blue Phrase ${"N".repeat(300)}${nameSuffix}`,
+        allMessagesText: "private indexed transcript for phrase and fuzzy searching",
+        firstMessage: "First conversation native-query",
+        modified: new Date("2025-02-02T00:00:00.000Z"),
+      },
+      {
+        path: secondFile,
+        id: secondId,
+        cwd: fixture.workspace,
+        allMessagesText: `search-only ${transcriptNeedle}`,
+        firstMessage: "Second conversation native-query",
+        modified: new Date("2025-02-01T00:00:00.000Z"),
+      },
+    ],
+  }));
+  const harness = createHarness({}, overrides);
+  let closed = false;
+  try {
+    const manager = await ready(harness);
+    openSavedPicker(harness.terminal);
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await nextTurn();
+      const frame = plain(harness.writer.frames.at(-1)?.frame);
+      if (frame.includes("Deep Blue Phrase") && frame.includes("Second conversatio")) break;
+    }
+    let frame = plain(harness.writer.frames.at(-1)?.frame);
+    assert.ok(frame.includes("Deep Blue Phrase") && frame.includes("Second conversatio"), JSON.stringify(frame));
+    assert.ok(!frame.includes(nameSuffix), "native name remains private until the user searches for it");
+    assert.ok(!frame.includes(transcriptNeedle), "full transcript search text never enters the picker display");
+
+    harness.terminal.emitInput("\x0e"); // remapped native tui.select.down = Ctrl+N
+    await nextTurn();
+    frame = plain(harness.writer.frames.at(-1)?.frame);
+    assert.ok(frame.includes("> Second conversatio"), "Pi's remapped navigation binding moves the highlight: " + frame);
+
+    harness.terminal.emitInput("d"); // ordinary d is query text, not deletion
+    await nextTurn();
+    assert.equal(harness.sidebar?.savedQuery, "d");
+    assert.equal(harness.sidebar?.focus, "form");
+    assert.equal(manager.createOptions.length, 0);
+    assert.ok(existsSync(fixture.file));
+
+    const clearQuery = async (): Promise<void> => {
+      harness.terminal.emitInput("\x15"); // native Input's Ctrl+U delete-to-line-start action
+      await nextTurn();
+    };
+    await clearQuery();
+    harness.terminal.emitInput('"Deep Blue Phrase"');
+    await nextTurn();
+    frame = plain(harness.writer.frames.at(-1)?.frame);
+    assert.ok(frame.includes("> Deep Blue Phrase"), "quoted native phrase search includes the full native name index");
+    assert.ok(!frame.includes("Second conversation native-query"));
+    assert.ok(!frame.includes(nameSuffix), "only the user's query, not the unsearched name suffix, is displayed");
+
+    await clearQuery();
+    harness.terminal.emitInput(`re:${transcriptNeedle}`);
+    await nextTurn();
+    frame = plain(harness.writer.frames.at(-1)?.frame);
+    assert.ok(frame.includes("Second conversation native-query"), "native regex search includes private full-message text");
+    assert.ok(!frame.includes("First conversation native-query"));
+    assert.equal(frame.split(transcriptNeedle).length - 1, 1, "the regex token appears only as the user's query, not as an indexed result field");
+
+    await clearQuery();
+    harness.terminal.emitInput("re:[");
+    await nextTurn();
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("No matching saved conversations"),
+      "invalid native regex is an empty result, not a thrown UI error");
+
+    await clearQuery();
+    harness.terminal.emitInput("privateword");
+    await nextTurn();
+    harness.terminal.emitInput("\x1b[127;5u"); // Ctrl+Backspace: noninvasive delete only for an empty query
+    await nextTurn();
+    assert.equal(harness.sidebar?.savedQuery, "privateword", "with a nonempty query native Input receives and ignores Ctrl+Backspace");
+    assert.equal(harness.sidebar?.focus, "form");
+    assert.ok(existsSync(fixture.file));
+
+    await clearQuery();
+    harness.terminal.emitInput("\x1b[127;5u");
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "confirm", "the native noninvasive chord deletes only while the query is empty");
+    frame = plain(harness.writer.frames.at(-1)?.frame);
+    assert.ok(frame.includes("Delete saved conversation?"), JSON.stringify(frame));
+    harness.terminal.emitInput("\x03"); // native tui.select.cancel = Ctrl+C
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "form", "native cancel returns to the same picker");
+
+    harness.terminal.emitInput("Deep");
+    await nextTurn();
+    const pickerBeforeCancel = harness.sidebar?.savedPickerRequestId;
+    harness.terminal.emitInput("\x18"); // remapped app.session.delete = Ctrl+X
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "confirm", "the configured native delete chord opens confirmation");
+    frame = plain(harness.writer.frames.at(-1)?.frame);
+    assert.ok(frame.includes("Delete saved conversation?"));
+    harness.terminal.emitInput("\x03");
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "form");
+    assert.equal(harness.sidebar?.savedQuery, "Deep", "cancel preserves the native search draft");
+    assert.equal(harness.sidebar?.savedPickerRequestId, pickerBeforeCancel, "cancel keeps the same picker owner");
+    assert.ok(existsSync(fixture.file), "cancel never mutates the selected file");
+    assert.equal(manager.createOptions.length, 0, "query/edit/delete/cancel never changes Main ownership");
+    assert.equal(await closeWithSignal(harness), 0);
+    closed = true;
+  } finally {
+    if (!closed) await closeWithSignal(harness).catch(() => undefined);
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("production Saved picker preserves native Kitty editing repeats and fences repeated actions", async () => {
+  const fixture = makeSavedMainFixture("kitty-query-repeats");
+  writeFileSync(join(fixture.agentDir, "keybindings.json"), JSON.stringify({ "app.session.delete": "ctrl+x" }), "utf8");
+  const { overrides } = savedFixtureDependencies(fixture);
+  let deletionCalls = 0;
+  const harness = createHarness({}, {
+    ...overrides,
+    deleteSavedFile: (_file, options) => {
+      deletionCalls += 1;
+      const refusal = options.validate();
+      return refusal === undefined
+        ? { ok: false, method: "unlink", error: "synthetic no-op deletion" }
+        : { ok: false, method: "unlink", refusal };
+    },
+  });
+  const previousKittyProtocol = isKittyProtocolActive();
+  setKittyProtocolActive(true);
+  let referenceInput: ReturnType<typeof createNativeSavedQueryInput> | undefined;
+  let closed = false;
+  try {
+    await ready(harness);
+    harness.terminal.kittyProtocolActive = true;
+    openSavedPicker(harness.terminal);
+    for (let attempt = 0; attempt < 10 && !plain(harness.writer.frames.at(-1)?.frame).includes("First conversation kitty-query-repeats"); attempt += 1) {
+      await nextTurn();
+    }
+    referenceInput = createNativeSavedQueryInput(fixture.agentDir);
+    const sendEditingPacket = (packet: string): void => {
+      // The native TUI dispatches Kitty releases as key-state events, not to Input;
+      // mirror that boundary while still asserting releases do not edit the picker.
+      if (!/:3(?:u|[A-Z])$/.test(packet)) referenceInput!.handleInput(packet);
+      harness.terminal.emitInput(packet);
+      assert.equal(harness.sidebar?.savedQuery, referenceInput!.getValue(),
+        `the production picker follows native Input for ${JSON.stringify(packet)}`);
+    };
+
+    sendEditingPacket("d");
+    sendEditingPacket("\x1b[100;1:2u"); // printable d repeat
+    sendEditingPacket("\x1b[100;1:3u"); // release
+    assert.equal(harness.sidebar?.savedQuery, "dd");
+
+    sendEditingPacket("\x1b[127;1:1u"); // Backspace press
+    sendEditingPacket("\x1b[127;1:2u"); // Backspace repeat
+    sendEditingPacket("\x1b[127;1:3u"); // release
+    assert.equal(harness.sidebar?.savedQuery, "", "Backspace repeats delete exactly as native Input does");
+
+    sendEditingPacket("d");
+    sendEditingPacket("d");
+    sendEditingPacket("\x1b[1;1:1D"); // Left press
+    sendEditingPacket("\x1b[1;1:2D"); // Left repeat
+    sendEditingPacket("\x1b[1;1:3D"); // release
+    sendEditingPacket("x");
+    assert.equal(harness.sidebar?.savedQuery, "xdd", "repeated Left moves the insertion point like native Input");
+    sendEditingPacket("\x1b[1;1:1C"); // Right press
+    sendEditingPacket("\x1b[1;1:2C"); // Right repeat
+    sendEditingPacket("\x1b[1;1:3C"); // release
+    sendEditingPacket("y");
+    assert.equal(harness.sidebar?.savedQuery, "xddy", "repeated Right moves the insertion point like native Input");
+
+    sendEditingPacket("\x15"); // Native Input Ctrl+U clears the query.
+    await nextTurn();
+    await nextTurn(); // redraws the displayed Saved row after filtering
+    assert.equal(harness.sidebar?.savedQuery, "");
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("First conversation kitty-query-repeats"));
+
+    const ctrlXPress = "\x1b[120;5:1u";
+    const ctrlXRepeat = "\x1b[120;5:2u";
+    const ctrlXRelease = "\x1b[120;5:3u";
+    harness.terminal.emitInput(ctrlXPress); // app.session.delete
+    assert.equal(harness.sidebar?.focus, "confirm");
+    harness.terminal.emitInput(ctrlXRepeat);
+    harness.terminal.emitInput(ctrlXRelease);
+    assert.equal(harness.sidebar?.focus, "confirm", "delete repeat/release cannot start another action or reach Input");
+    assert.equal(deletionCalls, 0);
+
+    const ctrlCPress = "\x1b[99;5:1u";
+    harness.terminal.emitInput(ctrlCPress); // tui.select.cancel
+    assert.equal(harness.sidebar?.focus, "form");
+    harness.terminal.emitInput("\x1b[99;5:2u");
+    harness.terminal.emitInput("\x1b[99;5:3u");
+    assert.equal(harness.sidebar?.focus, "form", "cancel repeat/release cannot dismiss or otherwise reactivate the picker");
+    assert.equal(harness.sidebar?.savedQuery, "");
+    assert.equal(deletionCalls, 0);
+    await nextTurn(); // redraws the Saved row before the next deliberate delete press
+
+    harness.terminal.emitInput(ctrlXPress);
+    assert.equal(harness.sidebar?.focus, "confirm");
+    harness.terminal.emitInput(ctrlXRepeat);
+    harness.terminal.emitInput(ctrlXRelease);
+    await nextTurn(); // settle the exact confirmation frame
+    harness.terminal.emitInput("\x1b[13;1:1u"); // tui.select.confirm
+    assert.equal(deletionCalls, 1);
+    harness.terminal.emitInput("\x1b[13;1:2u");
+    harness.terminal.emitInput("\x1b[13;1:3u");
+    assert.equal(deletionCalls, 1, "confirm repeat/release cannot start a second deletion");
+    assert.equal(harness.sidebar?.focus, "form");
+    assert.equal(harness.sidebar?.savedQuery, "");
+    assert.ok(existsSync(fixture.file), "the test deletion seam never mutates the saved file");
+    assert.equal(await closeWithSignal(harness), 0);
+    closed = true;
+  } finally {
+    referenceInput?.dispose();
+    setKittyProtocolActive(previousKittyProtocol);
+    if (!closed) await closeWithSignal(harness).catch(() => undefined);
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("confirmed Saved deletion uses shell-free trash fallback for only the displayed file and preserves Main owner", async () => {
+  const fixture = makeSavedMainFixture("delete-confirmed");
+  const siblingFile = join(fixture.agentDir, "sessions", "proj", "sibling.jsonl");
+  writeFileSync(siblingFile, [
+    JSON.stringify({ type: "session", version: 3, id: "saved-delete-sibling", timestamp: "2025-02-01T00:00:00.000Z", cwd: fixture.workspace }),
+    JSON.stringify({ type: "message", id: "sibling", message: { role: "user", content: [{ type: "text", text: "Sibling conversation stays" }] } }),
+  ].join("\n") + "\n", "utf8");
+  writeFileSync(join(fixture.agentDir, "keybindings.json"), JSON.stringify({ "app.session.delete": "ctrl+x" }), "utf8");
+  const { overrides } = savedFixtureDependencies(fixture);
+  const trashCalls: Array<{ command: string; args: readonly string[] }> = [];
+  const trashFailure = ((command: string, args: readonly string[]) => {
+    trashCalls.push({ command, args: [...args] });
+    return { pid: 9, output: [null, "", "trash unavailable"], stdout: "", stderr: "trash unavailable", status: 1, signal: null };
+  }) as NonNullable<SavedSessionDeletionOptions["spawnSync"]>;
+  const dependencies: MainTestDependencies = {
+    ...overrides,
+    deleteSavedFile: (file, options) => deleteSavedSessionFile(file, { ...options, spawnSync: trashFailure }),
+  };
+  const harness = createHarness({}, dependencies);
+  let closed = false;
+  try {
+    const manager = await ready(harness);
+    fillForm(harness.terminal, "/saved-delete-owner");
+    await nextTurn();
+    assert.equal(harness.sidebar?.activeMainOwnerID, "native-1");
+    const ownerBefore = harness.sidebar?.activeMainOwnerID;
+    const createsBefore = manager.createOptions.length;
+
+    harness.terminal.emitInput(ALT_LEFT); // focus the roster without changing owner
+    await nextTurn();
+    harness.terminal.emitInput("\x1b[B"); // active owner -> Saved conversations
+    await nextTurn();
+    harness.terminal.emitInput(ENTER);
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await nextTurn();
+      const current = plain(harness.writer.frames.at(-1)?.frame);
+      if (current.includes("First conversation delete-confirmed") && current.includes("Sibling conversati")) break;
+    }
+    assert.equal(harness.sidebar?.focus, "form");
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("Sibling conversati"), JSON.stringify(plain(harness.writer.frames.at(-1)?.frame)));
+    const selectionBefore = harness.sidebar?.selectedId;
+    const savedQuery: string = "First conversation delete-confirmed";
+    harness.terminal.emitInput(savedQuery);
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await nextTurn();
+      const frame = harness.writer.frames.at(-1)?.frame;
+      if (plain(frame).includes(savedQuery) && plain(frame).includes("> First convers")
+        && !plain(frame).includes("Sibling conversation stays")) break;
+    }
+    assert.equal(harness.sidebar?.savedQuery, savedQuery);
+    assertSavedPickerRightPanel(harness.writer.frames.at(-1)!.frame, savedQuery, "First convers");
+    const pickerBeforeCancel = harness.sidebar?.savedPickerRequestId;
+    const surface = manager.surface(ownerBefore!);
+    assert.ok(surface);
+    const childBefore = {
+      cols: surface.cols,
+      rows: surface.rows,
+      frame: [...surface.writesAsFrame],
+      resizeCalls: manager.resizeCalls.length,
+    };
+
+    harness.terminal.emitInput("\x18"); // user-configured Ctrl+X delete action
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "confirm");
+    const confirmationFrame = harness.writer.frames.at(-1)!.frame;
+    assertSavedDeleteConfirmationRightPanel(confirmationFrame, fixture.file);
+    const confirmation = plain(confirmationFrame);
+    assert.ok(confirmation.includes("Delete saved conversation?"));
+    assert.ok(confirmation.includes("Conversation:"), "the confirmation labels its bounded caption hint");
+    assert.ok(!confirmation.includes(fixture.sessionId), "private session id is not shown in the confirmation");
+    assert.deepEqual(trashCalls, [], "no mutation process starts before confirmation");
+
+    const leftSavedRow = screenRowContaining(confirmationFrame, "Saved conversations");
+    assert.ok(leftSavedRow > 0 && plainLine(confirmationFrame, leftSavedRow).slice(0, 32).includes("Saved conversations"),
+      "the visible left roster is present beside the right-pane confirmation");
+    const writesBeforeDialogInput = manager.writes.length;
+    emitMouse(harness.terminal, 2, leftSavedRow); // dialog clicks cannot activate the left roster
+    emitMouse(harness.terminal, 2, leftSavedRow, 0, "m");
+    emitMouse(harness.terminal, 34, 1); // or the right/main confirmation pane
+    emitMouse(harness.terminal, 34, 1, 0, "m");
+    harness.terminal.emitInput("x"); // confirmation owns all keyboard input; arbitrary text is not forwarded
+    assert.equal(harness.sidebar?.focus, "confirm");
+    assert.equal(harness.sidebar?.savedPickerRequestId, pickerBeforeCancel);
+    assert.equal(harness.sidebar?.savedQuery, savedQuery);
+    assert.equal(manager.writes.length, writesBeforeDialogInput);
+    assert.deepEqual(trashCalls, [], "dialog pointer and nonconfirm keyboard input cannot start deletion");
+    assert.ok(existsSync(fixture.file));
+    assert.deepEqual(manager.resizeCalls.length, childBefore.resizeCalls, "dialog input never resizes the native child");
+    assert.equal(surface.cols, childBefore.cols);
+    assert.equal(surface.rows, childBefore.rows);
+    assert.deepEqual(surface.writesAsFrame, childBefore.frame, "the native child's retained viewport content is unchanged");
+
+    harness.terminal.emitInput(ESC);
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "form");
+    assert.equal(harness.sidebar?.savedPickerRequestId, pickerBeforeCancel, "cancel restores the same picker owner");
+    assert.equal(harness.sidebar?.savedQuery, savedQuery, "cancel restores the same query draft");
+    assert.equal(harness.sidebar?.selectedId, selectionBefore, "cancel leaves roster selection unchanged");
+    assert.equal(harness.sidebar?.activeMainOwnerID, ownerBefore, "cancel keeps the same native Main owner");
+    assertSavedPickerRightPanel(harness.writer.frames.at(-1)!.frame, savedQuery, "First convers");
+    assert.equal(manager.writes.length, writesBeforeDialogInput, "the child draft/input stream remains untouched");
+
+    harness.terminal.emitInput("\x15"); // clear only for the subsequent successful refresh assertion
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await nextTurn();
+      if (harness.sidebar?.savedQuery === ""
+        && plain(harness.writer.frames.at(-1)?.frame).includes("First conversation delete-confirmed")
+        && plain(harness.writer.frames.at(-1)?.frame).includes("Sibling conversati")) break;
+    }
+    let pickerFrame = harness.writer.frames.at(-1)!.frame;
+    if (!plain(pickerFrame).includes("> First convers")) {
+      harness.terminal.emitInput("\x1b[B");
+      await nextTurn();
+      pickerFrame = harness.writer.frames.at(-1)!.frame;
+    }
+    assert.ok(plain(pickerFrame).includes("> First convers"), "the exact intended saved row is selected before re-confirming");
+
+    harness.terminal.emitInput("\x18");
+    await nextTurn();
+    assertSavedDeleteConfirmationRightPanel(harness.writer.frames.at(-1)!.frame, fixture.file);
+    harness.terminal.emitInput(ENTER);
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await nextTurn();
+      const current = plain(harness.writer.frames.at(-1)?.frame);
+      if (!existsSync(fixture.file) && current.includes("Sibling conversation stays")) break;
+    }
+    assert.deepEqual(trashCalls, [{ command: "trash", args: [fixture.file] }],
+      "the native trash command receives only the exact selected absolute path, without a shell");
+    assert.equal(existsSync(fixture.file), false, "failed trash falls back to unlink of the selected file");
+    assert.equal(existsSync(siblingFile), true, "the sibling saved file is untouched");
+    assert.equal(harness.sidebar?.focus, "form");
+    assert.equal(harness.sidebar?.savedQuery, "", "successful refresh preserves the query draft");
+    assert.equal(harness.sidebar?.activeMainOwnerID, ownerBefore, "deletion never changes the active Main owner");
+    assert.equal(harness.sidebar?.selectedId, selectionBefore, "deletion never changes roster selection");
+    assert.equal(manager.createOptions.length, createsBefore, "deletion never creates a replacement Pi child");
+    const refreshed = plain(harness.writer.frames.at(-1)?.frame);
+    assert.ok(refreshed.includes("Sibling conversation stays"), "the global catalog refresh shows the surviving sibling");
+    assert.ok(!refreshed.includes("First conversation delete-confirmed"));
+    assert.equal(await closeWithSignal(harness), 0);
+    closed = true;
+  } finally {
+    if (!closed) await closeWithSignal(harness).catch(() => undefined);
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("real frame-writer settlement gates Saved file deletion before callback, before drain, and after drain", async () => {
+  const fixture = makeSavedMainFixture("delete-writer-settlement");
+  writeFileSync(join(fixture.agentDir, "keybindings.json"), JSON.stringify({ "app.session.delete": "ctrl+x" }), "utf8");
+  const { overrides } = savedFixtureDependencies(fixture);
+  const output = new QueuedFrameOutput();
+  const trashCalls: Array<{ command: string; args: readonly string[] }> = [];
+  const trashFailure = ((command: string, args: readonly string[]) => {
+    trashCalls.push({ command, args: [...args] });
+    return { pid: 11, output: [null, "", "trash unavailable"], stdout: "", stderr: "trash unavailable", status: 1, signal: null };
+  }) as NonNullable<SavedSessionDeletionOptions["spawnSync"]>;
+  const harness = createHarness({}, {
+    ...overrides,
+    deleteSavedFile: (file, options) => deleteSavedSessionFile(file, { ...options, spawnSync: trashFailure }),
+    createWriter: (_stdout, writerOptions) => createSessionHostFrameWriter(
+      output as unknown as Writable,
+      { ...writerOptions, redrawIntervalMs: 0 },
+    ),
+  });
+  let closed = false;
+  try {
+    await ready(harness);
+    openSavedPicker(harness.terminal);
+    for (let attempt = 0; attempt < 10 && !output.writes.some((bytes) => bytes.toString("utf8").includes("First conversation delete-writer-settlement")); attempt += 1) {
+      await nextTurn();
+    }
+    assert.ok(output.writes.some((bytes) => bytes.toString("utf8").includes("First conversation delete-writer-settlement")),
+      "the current Saved picker frame settled before opening its confirmation");
+
+    output.refuseNextWrite(false);
+    harness.terminal.emitInput("\x18"); // Configured Saved delete action.
+    for (let attempt = 0; attempt < 10 && output.queuedCount === 0; attempt += 1) await nextTurn();
+    assert.equal(harness.sidebar?.focus, "confirm");
+    assert.equal(output.queuedCount, 1, "the exact confirmation frame is held behind output backpressure");
+    assertSavedDeleteConfirmationRightPanel(
+      await emittedTerminalFrame(output, harness.terminal.columns, harness.terminal.rows, true),
+      fixture.file,
+    );
+    harness.terminal.emitInput(ENTER);
+    assert.deepEqual(trashCalls, [], "rendering and queueing the warning do not grant confirmation authority");
+    assert.ok(existsSync(fixture.file));
+
+    output.completeQueuedWrites(); // callback succeeds, but write() returned false and drain is still pending
+    assertSavedDeleteConfirmationRightPanel(
+      await emittedTerminalFrame(output, harness.terminal.columns, harness.terminal.rows),
+      fixture.file,
+    );
+    harness.terminal.emitInput(ENTER);
+    assert.deepEqual(trashCalls, [], "a callback without the required drain still cannot authorize deletion");
+    assert.ok(existsSync(fixture.file));
+
+    output.drain();
+    await nextTurn();
+    assertSavedDeleteConfirmationRightPanel(
+      await emittedTerminalFrame(output, harness.terminal.columns, harness.terminal.rows),
+      fixture.file,
+    );
+    harness.terminal.emitInput(ENTER);
+    assert.deepEqual(trashCalls, [{ command: "trash", args: [fixture.file] }],
+      "only the exact settled confirmation permits the shell-free trash attempt");
+    assert.equal(existsSync(fixture.file), false, "failed trash falls back to unlink after the exact frame settles");
+    assert.equal(await closeWithSignal(harness), 0);
+    closed = true;
+  } finally {
+    if (!closed) {
+      harness.signals.emit("SIGTERM");
+      if (output.queuedCount > 0) output.drain();
+      await harness.result.catch(() => undefined);
+    }
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("real writer resize revokes a queued Saved warning until the complete exact target is redrawn", async () => {
+  const fixture = makeSavedMainFixture("delete-resize-writer");
+  writeFileSync(join(fixture.agentDir, "keybindings.json"), JSON.stringify({ "app.session.delete": "ctrl+x" }), "utf8");
+  const { overrides } = savedFixtureDependencies(fixture);
+  const output = new QueuedFrameOutput();
+  let trashCalls = 0;
+  const trashFailure = ((command: string, args: readonly string[]) => {
+    trashCalls += 1;
+    assert.equal(command, "trash");
+    assert.deepEqual(args, [fixture.file]);
+    return { pid: 12, output: [null, "", "trash unavailable"], stdout: "", stderr: "trash unavailable", status: 1, signal: null };
+  }) as NonNullable<SavedSessionDeletionOptions["spawnSync"]>;
+  const harness = createHarness({}, {
+    ...overrides,
+    deleteSavedFile: (file, options) => deleteSavedSessionFile(file, { ...options, spawnSync: trashFailure }),
+    createWriter: (_stdout, writerOptions) => createSessionHostFrameWriter(
+      output as unknown as Writable,
+      { ...writerOptions, redrawIntervalMs: 0 },
+    ),
+  });
+  let closed = false;
+  try {
+    await ready(harness);
+    openSavedPicker(harness.terminal);
+    for (let attempt = 0; attempt < 10 && !output.writes.some((bytes) => bytes.toString("utf8").includes("First conversation delete-resize-writer")); attempt += 1) {
+      await nextTurn();
+    }
+    assert.ok(output.writes.some((bytes) => bytes.toString("utf8").includes("First conversation delete-resize-writer")));
+
+    output.refuseNextWrite(false);
+    harness.terminal.emitInput("\x18");
+    for (let attempt = 0; attempt < 10 && output.queuedCount === 0; attempt += 1) await nextTurn();
+    assert.equal(harness.sidebar?.focus, "confirm");
+    assert.equal(output.queuedCount, 1);
+    assertSavedDeleteConfirmationRightPanel(
+      await emittedTerminalFrame(output, harness.terminal.columns, harness.terminal.rows, true),
+      fixture.file,
+    );
+    harness.terminal.setSize(11, 3); // synchronous invalidation precedes the coalesced too-small redraw
+    harness.terminal.emitInput(ENTER);
+    assert.equal(trashCalls, 0, "Enter immediately after Main receives resize cannot use the old displayed warning");
+    assert.ok(existsSync(fixture.file));
+    await nextTurn(); // the tiny fallback is now the newest writer candidate
+
+    output.completeQueuedWrites(); // obsolete full-warning bytes arrive after the resize
+    harness.terminal.emitInput(ENTER);
+    assert.equal(trashCalls, 0, "a stale confirmation callback cannot restore authority after geometry changed");
+    output.drain();
+    await nextTurn();
+    const tinyOutputFrame = await emittedTerminalFrame(output, 11, 3);
+    const tinyOutputText = tinyOutputFrame.lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+    assert.ok(tinyOutputText.includes("too small"), "the emitted narrow overlay contains only its bounded tiny fallback");
+    assert.equal(tinyOutputText.includes("Saved file:"), false, "the clipped/stale warning is absent after the tiny redraw");
+    harness.terminal.emitInput(ENTER);
+    assert.equal(trashCalls, 0, "the too-small frame itself never enables confirmation");
+    assert.ok(existsSync(fixture.file));
+
+    harness.terminal.setSize(80, 24);
+    harness.terminal.emitInput(ENTER);
+    assert.equal(trashCalls, 0, "restoring geometry does not reuse the old settlement before a new complete frame");
+    await nextTurn();
+    const restoredWarning = await emittedTerminalFrame(output, 80, 24);
+    assertSavedDeleteConfirmationRightPanel(restoredWarning, fixture.file);
+
+    harness.terminal.emitInput(ENTER);
+    assert.equal(trashCalls, 1, "a fresh Enter succeeds after the restored exact warning settles");
+    assert.equal(existsSync(fixture.file), false);
+    assert.equal(await closeWithSignal(harness), 0);
+    closed = true;
+  } finally {
+    if (!closed) {
+      harness.signals.emit("SIGTERM");
+      if (output.queuedCount > 0) output.drain();
+      await harness.result.catch(() => undefined);
+    }
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("an incomplete wide right-pane Saved warning cannot authorize deletion", async () => {
+  const fixture = makeSavedMainFixture("delete-clipped-right-pane");
+  writeFileSync(join(fixture.agentDir, "keybindings.json"), JSON.stringify({ "app.session.delete": "ctrl+x" }), "utf8");
+  const { overrides } = savedFixtureDependencies(fixture);
+  const output = new QueuedFrameOutput();
+  let deleteCalls = 0;
+  const harness = createHarness({}, {
+    ...overrides,
+    deleteSavedFile: () => {
+      deleteCalls += 1;
+      return { ok: false, method: "unlink", error: "synthetic refusal" };
+    },
+    createWriter: (_stdout, writerOptions) => createSessionHostFrameWriter(
+      output as unknown as Writable,
+      { ...writerOptions, redrawIntervalMs: 0 },
+    ),
+  });
+  let closed = false;
+  try {
+    await ready(harness);
+    openSavedPicker(harness.terminal);
+    for (let attempt = 0; attempt < 10 && !output.writes.some((bytes) => bytes.toString("utf8").includes("First conversation delete-clipped-right-pane")); attempt += 1) {
+      await nextTurn();
+    }
+    assert.ok(output.writes.some((bytes) => bytes.toString("utf8").includes("First conversation delete-clipped-right-pane")));
+
+    harness.terminal.emitInput("\x18");
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "confirm");
+    harness.terminal.setSize(53, 2); // still wide: 20-column right pane, one content row
+    harness.terminal.emitInput(ENTER); // resize synchronously revokes the previously settled wide warning
+    assert.equal(deleteCalls, 0);
+    await nextTurn();
+
+    const clipped = await emittedTerminalFrame(output, 53, 2);
+    const body = clipped.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+    const right = body.map((line) => line.slice(33)).join("\n");
+    assert.ok(right.includes("too small"), "the actual right/main pane emits its too-small refusal");
+    assert.equal(right.includes("Delete saved conversation?"), false);
+    assert.equal(right.includes("Saved file:"), false, "an incomplete exact target is not displayed as a confirmation");
+    harness.terminal.emitInput(ENTER);
+    assert.equal(deleteCalls, 0, "the emitted clipped right-pane fallback cannot authorize deletion");
+    assert.ok(existsSync(fixture.file));
+    assert.equal(await closeWithSignal(harness), 0);
+    closed = true;
+  } finally {
+    if (!closed) {
+      harness.signals.emit("SIGTERM");
+      if (output.queuedCount > 0) output.drain();
+      await harness.result.catch(() => undefined);
+    }
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("Saved deletion refuses an unavailable current live binding despite unrelated historical evidence", async () => {
+  for (const phase of ["preparation", "confirmation", "fallback"] as const) {
+    const fixture = makeSavedMainFixture(`delete-unavailable-binding-${phase}`);
+    writeFileSync(join(fixture.agentDir, "keybindings.json"), JSON.stringify({ "app.session.delete": "ctrl+x" }), "utf8");
+    const { overrides } = savedFixtureDependencies(fixture);
+    let manager: FakeManager | undefined;
+    let trashCalls = 0;
+    let unlinkCalls = 0;
+    const addUnavailableLiveBinding = (): void => {
+      assert.ok(manager);
+      manager.ownedLiveSessionsData = [{ id: "historical-unrelated-conversation" }];
+      if (manager.views.some((view) => view.id === "unknown-current-binding")) return;
+      manager.views.push({
+        id: "unknown-current-binding",
+        label: "Unavailable live binding",
+        workspace: "/unknown-binding-workspace",
+        agentDir: "/unknown-binding-agent",
+        lifecycle: "alive",
+        hasLiveProcess: true,
+        busy: null,
+        pendingInput: null,
+        inputSurface: false,
+        activity: [],
+        nativeSession: null,
+      });
+    };
+    const trashFailure = ((command: string, args: readonly string[]) => {
+      trashCalls += 1;
+      assert.equal(command, "trash");
+      assert.deepEqual(args, [fixture.file]);
+      if (phase === "fallback") addUnavailableLiveBinding();
+      return { pid: 13, output: [null, "", "trash unavailable"], stdout: "", stderr: "trash unavailable", status: 1, signal: null };
+    }) as NonNullable<SavedSessionDeletionOptions["spawnSync"]>;
+    const harness = createHarness({}, {
+      ...overrides,
+      deleteSavedFile: (file, options) => deleteSavedSessionFile(file, {
+        ...options,
+        spawnSync: trashFailure,
+        unlink: (path) => { unlinkCalls += 1; unlinkSync(path); },
+      }),
+    });
+    let closed = false;
+    try {
+      manager = await ready(harness);
+      if (phase === "preparation") addUnavailableLiveBinding();
+      openSavedPicker(harness.terminal);
+      for (let attempt = 0; attempt < 10 && !plain(harness.writer.frames.at(-1)?.frame).includes("First conversation delete-"); attempt += 1) {
+        await nextTurn();
+      }
+      assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("First conversation delete-"));
+
+      harness.terminal.emitInput("\x18");
+      await nextTurn();
+      if (phase === "preparation") {
+        assert.equal(harness.sidebar?.focus, "form", "unknown current binding refuses before confirmation opens");
+        assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("Close the Pi session using this conversation"));
+        assert.equal(trashCalls, 0);
+        assert.equal(unlinkCalls, 0);
+        assert.ok(existsSync(fixture.file));
+      } else {
+        assert.equal(harness.sidebar?.focus, "confirm");
+        await nextTurn(); // settle the exact warning before changing current live-binding state
+        if (phase === "confirmation") addUnavailableLiveBinding();
+        harness.terminal.emitInput(ENTER);
+        await nextTurn();
+        assert.equal(harness.sidebar?.focus, "form");
+        assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("Close the Pi session using this conversation"),
+          `${phase}: current-binding uncertainty produces the close-first warning`);
+        assert.equal(trashCalls, phase === "fallback" ? 1 : 0,
+          `${phase}: no trash attempt follows an uncertainty detected before that mutation stage`);
+        assert.equal(unlinkCalls, 0, `${phase}: no unlink follows the newly unknown live binding`);
+        assert.ok(existsSync(fixture.file), `${phase}: the selected saved file remains intact`);
+      }
+      assert.equal(await closeWithSignal(harness), 0);
+      closed = true;
+    } finally {
+      if (!closed) await closeWithSignal(harness).catch(() => undefined);
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("Saved deletion cancellation and current live/unknown bindings fail closed", async () => {
+  const fixture = makeSavedMainFixture("delete-live-guard");
+  writeFileSync(join(fixture.agentDir, "keybindings.json"), JSON.stringify({ "app.session.delete": "ctrl+x" }), "utf8");
+  const { overrides } = savedFixtureDependencies(fixture);
+  let mutationCalls = 0;
+  const fakeTrash = ((..._args: unknown[]) => {
+    mutationCalls += 1;
+    return { pid: 1, output: [null, "", ""], stdout: "", stderr: "", status: 0, signal: null };
+  }) as NonNullable<SavedSessionDeletionOptions["spawnSync"]>;
+  const harness = createHarness({}, {
+    ...overrides,
+    deleteSavedFile: (file, options) => deleteSavedSessionFile(file, { ...options, spawnSync: fakeTrash }),
+  });
+  let closed = false;
+  try {
+    const manager = await ready(harness);
+    openSavedPicker(harness.terminal);
+    await nextTurn();
+    await nextTurn();
+
+    harness.terminal.emitInput("\x18");
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "confirm");
+    harness.terminal.emitInput(ESC);
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "form", "cancel restores the picker instead of dismissing it");
+    assert.equal(harness.sidebar?.savedQuery, "", "cancel preserves the query");
+    assert.ok(existsSync(fixture.file));
+    assert.equal(mutationCalls, 0);
+
+    manager.ownedLiveSessionsData = [{}]; // unknown binding is never treated as definitely unrelated
+    harness.terminal.emitInput("\x18");
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "form", "unknown live ownership refuses before confirmation");
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("Close the Pi session using this conversation"));
+    assert.ok(existsSync(fixture.file));
+    assert.equal(mutationCalls, 0);
+
+    manager.ownedLiveSessionsData = [];
+    harness.terminal.emitInput("\x18");
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "confirm");
+    await nextTurn(); // exact target warning is now displayed
+    manager.ownedLiveSessionsData = [{ id: fixture.sessionId }]; // becomes live after preflight
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "form", "Main rechecks current owned sessions immediately before mutation");
+    assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("Close the Pi session using this conversation"));
+    assert.equal(mutationCalls, 0, "current live ownership prevents even starting trash");
+    assert.ok(existsSync(fixture.file));
+    assert.equal(harness.sidebar?.savedQuery, "");
+    assert.equal(await closeWithSignal(harness), 0);
+    closed = true;
+  } finally {
+    if (!closed) await closeWithSignal(harness).catch(() => undefined);
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("Saved unlink fallback refuses a file replaced during the trash attempt", async () => {
+  const fixture = makeSavedMainFixture("delete-replacement-race");
+  const { overrides } = savedFixtureDependencies(fixture);
+  const heldOriginal = `${fixture.file}.held`;
+  let unlinkAttempts = 0;
+  const replaceDuringTrash = ((command: string, args: readonly string[]) => {
+    assert.equal(command, "trash");
+    assert.deepEqual(args, [fixture.file]);
+    renameSync(fixture.file, heldOriginal);
+    writeFileSync(fixture.file, `${JSON.stringify({ type: "session", version: 3, id: "replacement-session", timestamp: "2025-03-01T00:00:00.000Z", cwd: fixture.workspace })}\n`, "utf8");
+    return { pid: 2, output: [null, "", "trash unavailable"], stdout: "", stderr: "trash unavailable", status: 1, signal: null };
+  }) as NonNullable<SavedSessionDeletionOptions["spawnSync"]>;
+  const harness = createHarness({}, {
+    ...overrides,
+    deleteSavedFile: (file, options) => deleteSavedSessionFile(file, {
+      ...options,
+      spawnSync: replaceDuringTrash,
+      unlink: (path) => { unlinkAttempts += 1; unlinkSync(path); },
+    }),
+  });
+  let closed = false;
+  try {
+    await ready(harness);
+    openSavedPicker(harness.terminal);
+    await nextTurn();
+    await nextTurn();
+    harness.terminal.emitInput("\x04"); // default app.session.delete = Ctrl+D
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "confirm");
+    await nextTurn();
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.equal(unlinkAttempts, 0, "replacement is caught by fallback-stage validation before unlink");
+    assert.equal(existsSync(heldOriginal), true, "the originally cataloged file is preserved at its moved location");
+    assert.equal(existsSync(fixture.file), true, "the replacement at the selected path is not removed");
+    assert.match(readFileSync(fixture.file, "utf8"), /replacement-session/);
+    assert.equal(harness.sidebar?.focus, "form");
+    assert.equal(await closeWithSignal(harness), 0);
+    closed = true;
+  } finally {
+    if (!closed) await closeWithSignal(harness).catch(() => undefined);
     rmSync(fixture.root, { recursive: true, force: true });
   }
 });

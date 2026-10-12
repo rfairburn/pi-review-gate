@@ -84,6 +84,8 @@ export interface NativeSessionSdkInfo {
   cwd: string;
   /** Persisted session name, when present. */
   name?: string;
+  /** Full public SDK search text; retained transiently, never copied to catalog rows. */
+  allMessagesText?: string;
   /** First user message text, when present (caption fallback only). */
   firstMessage?: string;
   created?: Date;

@@ -11,10 +11,12 @@ import {
   statSync,
 } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fuzzyMatch } from "pi-session-host-tui";
 import {
   NativeSessionSdkInfo,
   resolveNativeSessionSdk,
 } from "./native-session-sdk";
+import { isValidNativeSessionFile, isValidNativeSessionId } from "./protocol";
 
 /**
  * Read-only native saved-conversation catalog and deliberate per-child resume
@@ -158,10 +160,12 @@ export type SavedSessionAdmissionResult =
 
 /** Caller-supplied owned live native session (data supplied by the caller; no PID scan). */
 export interface OwnedLiveSession {
-  /** Live native session ID. */
+  /** Current native session ID, exact pending-reservation ID, or historical launch-fence ID. */
   id?: string;
-  /** Live native session file path. */
+  /** Current native file or exact pending-reservation file. */
   file?: string;
+  /** Separates current loaded-file evidence from pending and historical duplicate fences. */
+  kind?: "current" | "reservation" | "known-id";
 }
 
 export interface AdmitSavedSessionOptions {
@@ -172,6 +176,16 @@ export interface AdmitSavedSessionOptions {
    */
   ownedLiveSessions?: readonly OwnedLiveSession[];
 }
+
+export interface ValidateSavedSessionDeletionOptions {
+  /** The host's owned live children and pending saved-session reservations. */
+  readonly ownedLiveSessions?: readonly OwnedLiveSession[];
+}
+
+/** Deletion validation is deliberately separate from launch admission. */
+export type SavedSessionDeletionRefusalReason =
+  | Exclude<SavedSessionRefusalReason, "workspace-unavailable">
+  | "unknown-live-binding";
 
 export interface ListSavedSessionsOptions {
   /** Native agent directory to catalog (absolute). */
@@ -204,6 +218,12 @@ export interface ListSavedSessionsOptions {
 const catalogBrand = new WeakSet<object>();
 const admissionBrand = new WeakSet<object>();
 /**
+ * Full native search text is private process-local state, indexed by both the
+ * branded catalog and its exact minted row. It is never copied onto a display
+ * row, IPC shape, log, or persisted roster.
+ */
+const catalogSearchIndexes = new WeakMap<SavedSessionCatalog, WeakMap<SavedSessionRow, string>>();
+/**
  * Authoritative file identity observed when each row was minted (safe bigint
  * dev/ino). Kept outside the mutable row objects so a caller can never
  * retarget a row's identity; rows themselves are deeply frozen at mint time.
@@ -218,6 +238,119 @@ export function isSavedSessionCatalog(value: unknown): value is SavedSessionCata
 /** True only for admission receipts minted by admitSavedSession. */
 export function isSavedSessionAdmission(value: unknown): value is SavedSessionAdmission {
   return typeof value === "object" && value !== null && admissionBrand.has(value);
+}
+
+/**
+ * Search parsing and scoring are adapted from Pi 1.1.0's native
+ * `session-selector-search.ts` (MIT; attribution in NOTICE). The selector's
+ * threaded/recent UI modes and controls are intentionally not part of this
+ * saved-catalog data API.
+ */
+interface SavedSearchToken {
+  kind: "fuzzy" | "phrase";
+  value: string;
+}
+
+interface ParsedSavedSearchQuery {
+  mode: "tokens" | "regex";
+  tokens: SavedSearchToken[];
+  regex: RegExp | null;
+  error?: string;
+}
+
+function parseSavedSearchQuery(query: string): ParsedSavedSearchQuery {
+  const trimmed = query.trim();
+  if (!trimmed) return { mode: "tokens", tokens: [], regex: null };
+
+  if (trimmed.startsWith("re:")) {
+    const pattern = trimmed.slice(3).trim();
+    if (!pattern) return { mode: "regex", tokens: [], regex: null, error: "Empty regex" };
+    try {
+      return { mode: "regex", tokens: [], regex: new RegExp(pattern, "i") };
+    } catch (error) {
+      return {
+        mode: "regex",
+        tokens: [],
+        regex: null,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  const tokens: SavedSearchToken[] = [];
+  let buffer = "";
+  let inQuote = false;
+  let hadUnclosedQuote = false;
+  const flush = (kind: SavedSearchToken["kind"]): void => {
+    const value = buffer.trim();
+    buffer = "";
+    if (value) tokens.push({ kind, value });
+  };
+
+  for (let index = 0; index < trimmed.length; index += 1) {
+    const character = trimmed[index]!;
+    if (character === '"') {
+      if (inQuote) {
+        flush("phrase");
+        inQuote = false;
+      } else {
+        flush("fuzzy");
+        inQuote = true;
+      }
+      continue;
+    }
+    if (!inQuote && /\s/.test(character)) {
+      flush("fuzzy");
+      continue;
+    }
+    buffer += character;
+  }
+
+  if (inQuote) hadUnclosedQuote = true;
+  if (hadUnclosedQuote) {
+    return {
+      mode: "tokens",
+      tokens: trimmed.split(/\s+/)
+        .map((token) => token.trim())
+        .filter((token) => token.length > 0)
+        .map((value) => ({ kind: "fuzzy" as const, value })),
+      regex: null,
+    };
+  }
+
+  flush(inQuote ? "phrase" : "fuzzy");
+  return { mode: "tokens", tokens, regex: null };
+}
+
+function normalizeSearchWhitespace(text: string): string {
+  return text.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function matchSavedSearchText(text: string, parsed: ParsedSavedSearchQuery): { matches: boolean; score: number } {
+  if (parsed.mode === "regex") {
+    if (!parsed.regex) return { matches: false, score: 0 };
+    const index = text.search(parsed.regex);
+    return index < 0 ? { matches: false, score: 0 } : { matches: true, score: index * 0.1 };
+  }
+  if (parsed.tokens.length === 0) return { matches: true, score: 0 };
+
+  let totalScore = 0;
+  let normalizedText: string | null = null;
+  for (const token of parsed.tokens) {
+    if (token.kind === "phrase") {
+      normalizedText ??= normalizeSearchWhitespace(text);
+      const phrase = normalizeSearchWhitespace(token.value);
+      if (!phrase) continue;
+      const index = normalizedText.indexOf(phrase);
+      if (index < 0) return { matches: false, score: 0 };
+      totalScore += index * 0.1;
+      continue;
+    }
+    const match = fuzzyMatch(token.value, text);
+    if (!match.matches) return { matches: false, score: 0 };
+    totalScore += match.score;
+  }
+  return { matches: true, score: totalScore };
 }
 
 /** Per-agent-directory query revision: a newer list supersedes older catalogs. */
@@ -349,6 +482,18 @@ function canonicalizePath(path: string): string {
   } catch {
     return resolve(path);
   }
+}
+
+/** Native current-file identity: canonical realpath when available, otherwise the exact observed raw path. */
+function sameNativeFile(left: string, right: string): boolean {
+  const nativeIdentity = (path: string): string => {
+    try {
+      return realpathSync(path);
+    } catch {
+      return path;
+    }
+  };
+  return nativeIdentity(left) === nativeIdentity(right);
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
@@ -551,6 +696,7 @@ function emptyCatalog(
   Object.freeze(catalog.rows);
   Object.freeze(catalog);
   catalogBrand.add(catalog);
+  catalogSearchIndexes.set(catalog, new WeakMap<SavedSessionRow, string>());
   return catalog;
 }
 
@@ -630,6 +776,7 @@ export async function listSavedSessions(options: ListSavedSessionsOptions): Prom
 
   const { dirs: projectDirs, identities } = discoverProjectSessionDirs(sessionsRoot, addIssue);
   const rows: SavedSessionRow[] = [];
+  const searchIndex = new WeakMap<SavedSessionRow, string>();
 
   const sessionsRootReal = realpathSync(sessionsRoot);
   const perDirResults = await mapWithConcurrency(projectDirs, MAX_PROJECT_LIST_CONCURRENCY, async (projectDir) => {
@@ -722,6 +869,7 @@ export async function listSavedSessions(options: ListSavedSessionsOptions): Prom
       // admission can detect a file replaced after cataloging (identical
       // header bytes, new inode) instead of trusting the current inode.
       rowIdentity.set(row, { dev: stats.dev, ino: stats.ino });
+      searchIndex.set(row, `${info.id} ${info.name ?? ""} ${info.allMessagesText ?? ""} ${info.cwd}`);
       dirRows.push(row);
     }
     return dirRows;
@@ -759,7 +907,44 @@ export async function listSavedSessions(options: ListSavedSessionsOptions): Prom
   Object.freeze(rows);
   Object.freeze(catalog);
   catalogBrand.add(catalog);
+  catalogSearchIndexes.set(catalog, searchIndex);
   return catalog;
+}
+
+/**
+ * Filter a branded catalog using the native session-selector query language.
+ * Empty/whitespace queries preserve the catalog's existing recent order;
+ * nonempty searches sort by match score, then modification time descending.
+ * Every result is the exact identity-bearing row minted into this catalog.
+ */
+export function searchSavedSessions(
+  catalog: SavedSessionCatalog,
+  query: string,
+): readonly SavedSessionRow[] {
+  if (!isSavedSessionCatalog(catalog) || typeof query !== "string") return [];
+  const trimmed = query.trim();
+  if (!trimmed) return catalog.rows;
+
+  const parsed = parseSavedSearchQuery(query);
+  if (parsed.error) return [];
+  const searchIndex = catalogSearchIndexes.get(catalog);
+  if (!searchIndex) return [];
+
+  const scored: Array<{ row: SavedSessionRow; score: number }> = [];
+  for (const row of catalog.rows) {
+    const text = searchIndex.get(row);
+    if (text === undefined) continue;
+    const match = matchSavedSearchText(text, parsed);
+    if (match.matches) scored.push({ row, score: match.score });
+  }
+  scored.sort((left, right) => {
+    if (left.score !== right.score) return left.score - right.score;
+    const leftModified = left.row.modifiedAt?.getTime() ?? Number.NEGATIVE_INFINITY;
+    const rightModified = right.row.modifiedAt?.getTime() ?? Number.NEGATIVE_INFINITY;
+    if (leftModified !== rightModified) return rightModified - leftModified;
+    return 0;
+  });
+  return Object.freeze(scored.map(({ row }) => row));
 }
 
 /**
@@ -902,4 +1087,76 @@ export function admitSavedSession(
   Object.freeze(admission);
   admissionBrand.add(admission);
   return { status: "admitted", admission };
+}
+
+/**
+ * Revalidate an exact branded catalog row for deletion without creating a
+ * launch receipt. Unlike launch admission, deletion does not require the
+ * recorded workspace to exist. The sessions-root/project/file, catalog
+ * revision, observed inode, and bounded first-line header checks are shared
+ * safety requirements; an owned current session or an unknown live binding
+ * refuses with close-first guidance at the caller.
+ */
+export function validateSavedSessionDeletion(
+  catalog: SavedSessionCatalog,
+  row: SavedSessionRow,
+  options: ValidateSavedSessionDeletionOptions = {},
+): SavedSessionDeletionRefusalReason | undefined {
+  if (!isSavedSessionCatalog(catalog) || !catalog.rows.includes(row)) return "unknown-row";
+  if ((catalogRevisions.get(catalog.agentDir) ?? 0) !== catalog.revision) return "stale-catalog";
+
+  const structureIssue = validateSavedSessionLocation(catalog.agentDir, row.file);
+  if (structureIssue !== undefined) return structureIssue === "workspace-unavailable" ? "unknown-row" : structureIssue;
+
+  let stats;
+  try {
+    stats = lstatSync(row.file, { bigint: true });
+  } catch {
+    return "missing-file";
+  }
+  if (stats.isSymbolicLink()) return "symlink-file";
+  if (!stats.isFile()) return "not-a-regular-file";
+  const observed = rowIdentity.get(row);
+  if (observed === undefined) return "unknown-row";
+  if (stats.dev !== observed.dev || stats.ino !== observed.ino) return "replaced-file";
+
+  const header = readSavedSessionHeader(row.file);
+  if (header === undefined) return "malformed-header";
+  if (header.id !== row.id || header.cwd !== row.cwd) return "replaced-file";
+
+  let sawHistoricalId = false;
+  let sawCurrentBinding = false;
+  for (const owned of options.ownedLiveSessions ?? []) {
+    const kind = owned?.kind;
+    if (kind === "known-id") {
+      if (!isValidNativeSessionId(owned?.id)) return "unknown-live-binding";
+      sawHistoricalId = true;
+      continue; // Historical duplicate evidence never authorizes file deletion.
+    }
+    if (kind !== undefined && kind !== "current" && kind !== "reservation") return "unknown-live-binding";
+
+    if (kind === "reservation") {
+      // Reservations are exact paired admissions and remain independently
+      // protected even before a reporter establishes the current binding.
+      const reservationId = owned?.id;
+      const reservationFile = owned?.file;
+      if (!isValidNativeSessionId(reservationId) || !isValidNativeSessionFile(reservationFile)) {
+        return "unknown-live-binding";
+      }
+      if (reservationId === row.id || sameNativeFile(reservationFile, row.file)) return "known-owned-duplicate";
+      continue;
+    }
+
+    // Explicit current bindings and legacy untagged entries both require a
+    // bounded absolute current file. An id-only live record (including an old
+    // reporter) is uncertainty, not proof that the loaded file is elsewhere.
+    sawCurrentBinding = true;
+    const currentFile = owned?.file;
+    const currentId = owned?.id;
+    if (!isValidNativeSessionFile(currentFile)) return "unknown-live-binding";
+    if ((typeof currentId === "string" && currentId === row.id)
+      || sameNativeFile(currentFile, row.file)) return "known-owned-duplicate";
+  }
+  if (sawHistoricalId && !sawCurrentBinding) return "unknown-live-binding";
+  return undefined;
 }

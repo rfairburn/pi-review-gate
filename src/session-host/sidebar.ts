@@ -1176,6 +1176,11 @@ export class SidebarController {
     return this.savedQueryRevision;
   }
 
+  /** True only for the Saved-file confirmation; this is a placement signal, not an input-focus alias. */
+  get savedDeleteConfirmationActive(): boolean {
+    return this._visible && this._focus === "confirm" && this.confirmPurpose === "saved-delete";
+  }
+
   /** Opaque token for the last fully rendered Saved-delete warning candidate. */
   get savedDeleteConfirmationRenderTokenNumber(): number | undefined {
     return this.savedDeleteConfirmationRenderToken;
@@ -1729,6 +1734,20 @@ export class SidebarController {
       return this.renderHostShortcutPane(cols, rows);
     }
     return this.renderFormPane(cols, rows);
+  }
+
+  /**
+   * Renders only the Saved-file warning into Main's right-pane slot. The
+   * roster render remains independent, and only a complete exact warning
+   * produces the usual writer-settled confirmation token.
+   */
+  renderSavedDeleteConfirmation(cols: number, rows: number): { lines: string[] } {
+    assertPaneDimension(cols, PANE_MAX_COLS, "cols");
+    assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
+    this.invalidateSavedDeleteConfirmationDisplay();
+    if (!this.savedDeleteConfirmationActive) return { lines: [] };
+    if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) return this.renderTooSmall(cols, rows);
+    return this.renderSavedDeleteConfirmPane(cols, rows);
   }
 
   private renderForFocus(

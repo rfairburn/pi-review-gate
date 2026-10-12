@@ -2953,12 +2953,27 @@ test("Saved deletion confirms only a fully displayed target and consumes held co
   harness.send(ENTER);
   assert.equal(harness.actions.filter((action) => action.type === "saved-delete").length, 0);
 
-  const confirmation = assertPaneSafe(harness.controller.render(40, 20).lines, 40, 20).join("\n");
-  assert.ok(confirmation.includes("Delete saved conversation?"));
-  assert.ok(confirmation.replace(/\s/g, "").includes(SAVED_ROWS[0].file.replace(/\s/g, "")),
-    "the full selected file path is rendered as the confirmation target");
+  const focusedConfirmation = assertPaneSafe(harness.controller.render(40, 20).lines, 40, 20).join("\n");
+  assert.ok(focusedConfirmation.includes("Delete saved conversation?"), "standalone Sidebar rendering remains supported");
+  const focusedToken = harness.controller.savedDeleteConfirmationRenderTokenNumber;
+  assert.ok(focusedToken !== undefined);
+
+  const roster = assertPaneSafe(harness.controller.renderRoster(32, 20).lines, 32, 20).join("\n");
+  const rightConfirmation = assertPaneSafe(harness.controller.renderSavedDeleteConfirmation(47, 20).lines, 47, 20).join("\n");
+  assert.ok(roster.includes("Sessions"), "the left roster can render without changing confirmation focus");
+  assert.ok(rightConfirmation.includes("Delete saved conversation?"));
+  assert.ok(rightConfirmation.replace(/\s/g, "").includes(SAVED_ROWS[0].file.replace(/\s/g, "")),
+    "the right-pane rendering also requires the complete exact file path");
+  assert.equal(harness.controller.focus, "confirm", "placement does not change keyboard ownership");
   const renderToken = harness.controller.savedDeleteConfirmationRenderTokenNumber;
-  assert.ok(renderToken !== undefined, "a complete render produces a candidate token, not authority");
+  assert.ok(renderToken !== undefined && renderToken !== focusedToken,
+    "the right-pane warning gets its own render token after the roster render revoked the earlier token");
+  assert.equal(harness.controller.settleSavedDeleteConfirmationRender(focusedToken), false,
+    "a superseded focused-pane candidate cannot authorize this placement");
+
+  const confirmation = rightConfirmation;
+  assert.ok(confirmation.includes("Delete saved conversation?"));
+  assert.ok(renderToken !== undefined, "a complete right-pane render produces a candidate token, not authority");
   harness.send(ENTER);
   assert.equal(harness.actions.filter((action) => action.type === "saved-delete").length, 0,
     "rendering alone cannot authorize deletion before the output writer settles the frame");

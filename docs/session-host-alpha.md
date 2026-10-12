@@ -380,10 +380,12 @@ Plain `d` edits the search query. The native Saved delete action defaults to **C
 empty (not merely whitespace). Deletion asks for confirmation of the selected saved
 conversation: the native selection-confirm binding (Enter by default) confirms, and
 the selection-cancel binding (Escape or Ctrl+C by default) cancels without changing the
-file or row. Other keys do not confirm. Confirmation revalidates the exact catalog
-entry and file identity/header; it never substitutes another path. Deletion tries the
-native `trash` command first, with permanent unlink fallback when trash fails, and
-reports its actual outcome. Success refreshes the global picker; failure stays visible
+file or row. On wide layouts, the complete confirmation replaces the right/Main pane
+while the roster remains left; cancel restores the same right-pane picker, query, and
+selection. Narrow layouts keep the existing full-content overlay. Other keys do not
+confirm. Confirmation revalidates the exact catalog entry and file identity/header; it
+never substitutes another path. Deletion tries the native `trash` command first, with
+permanent unlink fallback when trash fails, and reports its actual outcome. Success refreshes the global picker; failure stays visible
 without falsely removing its row. Only the selected eligible saved conversation file
 is removed—not its workspace, sibling files, roster entries, or review metadata.
 

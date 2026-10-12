@@ -833,6 +833,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         const currentLayout = computeHostLayout(cols, rows, {
           sidebarVisible: sidebar.visible,
           focus: sidebarFocus(sidebar.focus),
+          savedDeleteConfirmation: sidebar.savedDeleteConfirmationActive,
         });
         savedDeleteConfirmationFrame = undefined;
         sidebar.invalidateSavedDeleteConfirmationDisplay();
@@ -846,9 +847,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             cursor: { ...mainFrame.cursor, visible: false },
           };
         }
-        // Wide layout with the form open: the roster stays in the left pane
-        // while the form temporarily replaces the native (right) pane. Narrow
-        // overlays and every other focus render a single sidebar-owned pane.
+        // Wide layout with the form or Saved-delete warning open: the roster
+        // stays left while that content temporarily replaces the native
+        // right pane. Narrow overlays and every other focus render a single
+        // sidebar-owned pane.
         const focus = sidebarFocus(sidebar.focus);
         let sidebarFrame: RenderedSidebar = { lines: [] };
         let formFrame: RenderedSidebar | undefined;
@@ -856,6 +858,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           if (focus === "form" && currentLayout.form !== undefined) {
             sidebarFrame = sidebar.renderRoster(currentLayout.sidebar.cols, currentLayout.sidebar.rows);
             formFrame = sidebar.renderForm(currentLayout.form.cols, currentLayout.form.rows);
+          } else if (focus === "confirm" && sidebar.savedDeleteConfirmationActive
+            && currentLayout.form !== undefined) {
+            sidebarFrame = sidebar.renderRoster(currentLayout.sidebar.cols, currentLayout.sidebar.rows);
+            formFrame = sidebar.renderSavedDeleteConfirmation(currentLayout.form.cols, currentLayout.form.rows);
           } else {
             sidebarFrame = sidebar.render(currentLayout.sidebar.cols, currentLayout.sidebar.rows);
           }
@@ -1331,6 +1337,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       const next = computeHostLayout(cols, rows, {
         sidebarVisible: sidebar.visible,
         focus: sidebarFocus(sidebar.focus),
+        savedDeleteConfirmation: sidebar.savedDeleteConfirmationActive,
       });
       layout = next;
       const changed = next.native.cols !== lastNativeCols || next.native.rows !== lastNativeRows;
@@ -1417,7 +1424,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const pane = formPane ?? sidebarPane;
     if (pane !== undefined) {
       if (isMouseButtonPress(mouse) && buttonId !== undefined) hostMouseButtons.add(buttonId);
-      if (isLeftMousePress(mouse) && presentation !== undefined && !hitMapPending) {
+      const savedDeleteDialogOwnsPointer = presentation?.focus === "confirm"
+        && presentation.layout.form !== undefined;
+      if (isLeftMousePress(mouse) && presentation !== undefined && !hitMapPending
+        && !savedDeleteDialogOwnsPointer) {
         const previousFocus = sidebar.focus;
         const previousSelection = sidebar.selectedId;
         const previousVisibility = sidebar.visible;
@@ -2905,6 +2915,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     layout = computeHostLayout(initialCols, initialRows, {
       sidebarVisible: sidebar.visible,
       focus: sidebarFocus(sidebar.focus),
+      savedDeleteConfirmation: sidebar.savedDeleteConfirmationActive,
     });
     lastNativeCols = layout.native.cols;
     lastNativeRows = layout.native.rows;

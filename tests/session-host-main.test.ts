@@ -20,7 +20,7 @@ import type { KeyboardCapabilityObserverOptions } from "../src/session-host/inpu
 import type { StatusBroker, StatusRenameRequest, StatusRenameResult } from "../src/session-host/broker";
 import { NativeAgentRegistry, type ProfilePreparer } from "../src/session-host/profiles";
 import { createNativeSavedQueryInput, runNativeExternalEditor } from "../src/session-host/form-support";
-import type { TerminalFrame, TerminalInputModes } from "../src/session-host/terminal-surface";
+import { TerminalSurface, type TerminalFrame, type TerminalInputModes } from "../src/session-host/terminal-surface";
 import { SidebarController } from "../src/session-host/sidebar";
 import { isSavedSessionAdmission, listSavedSessions, type SavedSessionCatalog } from "../src/session-host/saved-sessions";
 import { deleteSavedSessionFile, type SavedSessionDeletionOptions } from "../src/session-host/saved-deletion";
@@ -656,6 +656,63 @@ function plainLine(frame: ComposedHostFrame | undefined, row: number): string {
 function screenRowContaining(frame: ComposedHostFrame | undefined, text: string, fromRow = 1): number {
   return frame?.lines.findIndex((line, row) => row >= fromRow
     && line.replace(/\x1b\[[0-9;]*m/g, "").includes(text)) ?? -1;
+}
+
+function assertSavedDeleteConfirmationRightPanel(frame: { readonly lines: readonly string[] }, expectedFile: string): void {
+  const body = frame.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const left = body.map((line) => line.slice(0, 32)).join("\n");
+  const right = body.map((line) => line.slice(33)).join("\n");
+  const normalize = (value: string): string => value.replace(/\s+/g, " ");
+  const rightText = normalize(right);
+  const leftText = normalize(left);
+  assert.equal(body[0]?.[32], "│", "the right/main panel begins at column 33 after the divider");
+  assert.ok(leftText.includes("Sessions"), "the roster remains in columns 0..31");
+  for (const text of ["Delete saved conversation?", "Conversation:", "Only this saved file is removed", "If trash fails"])
+    assert.equal(leftText.includes(text), false, `left roster must not contain confirmation text: ${text}`);
+  assert.equal(left.replace(/\s/g, "").includes(expectedFile.replace(/\s/g, "")), false,
+    "the exact target path is absent from the left roster");
+  for (const text of [
+    "Delete saved conversation?",
+    "Conversation:",
+    "Only this saved file is removed; the host will not stop any child.",
+    "If trash fails, this file is permanently unlinked.",
+    "enter confirm",
+    "cancel",
+  ]) assert.ok(rightText.includes(text), `right pane retains complete confirmation text: ${text}`);
+  assert.match(rightText, /(?:esc|escape|ctrl\+c).*cancel/, "the native cancel binding is visible with its label");
+  assert.ok(right.replace(/\s/g, "").includes(expectedFile.replace(/\s/g, "")),
+    "the exact selected file path is wholly in the right pane");
+}
+
+function assertSavedPickerRightPanel(
+  frame: { readonly lines: readonly string[] },
+  query: string,
+  selectedCaption: string,
+): void {
+  const body = frame.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const left = body.map((line) => line.slice(0, 32)).join("\n");
+  const right = body.map((line) => line.slice(33)).join("\n");
+  assert.ok(left.includes("Sessions"), "the roster returns to the left pane");
+  assert.ok(right.includes("Saved conversations"), "the same Saved picker returns to the right pane");
+  assert.ok(right.includes(query), "the query draft remains displayed in the picker");
+  assert.ok(right.includes(`> ${selectedCaption}`), "the same Saved row remains selected after cancel");
+}
+
+async function emittedTerminalFrame(
+  output: QueuedFrameOutput,
+  cols: number,
+  rows: number,
+  includeQueued = false,
+): Promise<TerminalFrame> {
+  const surface = new TerminalSurface(cols, rows);
+  try {
+    const writes = [...output.writes, ...(includeQueued ? output.queuedTexts.map((text) => Buffer.from(text)) : [])];
+    for (const bytes of writes) surface.write(bytes.toString("utf8"));
+    await surface.flush();
+    return surface.frame();
+  } finally {
+    surface.dispose();
+  }
 }
 
 function emitMouse(
@@ -1920,9 +1977,15 @@ test("failed, live, and unconfirmed removals leave the row and owner in place wi
   assert.equal(manager.closeExitedCalls.length, closeCallsBeforeGuardedStop,
     "a rendered live card never reaches closeExited directly");
   assert.equal(harness.sidebar?.focus, "confirm", "a rendered live card enters the guarded stop confirmation");
-  const stopConfirmText = plain(harness.writer.frames.at(-1)?.frame);
+  const stopConfirmFrame = harness.writer.frames.at(-1)!.frame;
+  const stopConfirmText = plain(stopConfirmFrame);
   assert.ok(stopConfirmText.includes("Stop session?"), `the guarded stop confirmation is drawn: ${stopConfirmText}`);
   assert.ok(stopConfirmText.includes("esc/n = cancel"), "the confirmation exposes its cancel binding before any stop");
+  const stopBody = stopConfirmFrame.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  assert.ok(stopBody.map((line) => line.slice(0, 32)).join("\n").includes("Stop session?"),
+    "stop/remove confirmation stays in the left pane");
+  assert.ok(stopBody.map((line) => line.slice(33)).join("\n").includes("frame:native-1"),
+    "stop/remove confirmation does not replace the native right pane");
   assert.equal(manager.shutdownCalls, 0);
   assert.equal(harness.terminal.stopCount, 0);
 
@@ -2619,11 +2682,20 @@ for (const identicalCaptions of [false, true]) for (const acceptedWhileQueued of
     }
     assert.ok(output.writes.some((bytes) => bytes.toString("utf8").includes(savedA.caption)),
       "the actual frame writer has emitted the first Saved row");
+    const emittedA = await emittedTerminalFrame(output, harness.terminal.columns, harness.terminal.rows);
+    const emittedARight = emittedA.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(33)).join("\n");
+    assert.ok(emittedARight.includes("Saved conversations") && emittedARight.includes(savedA.caption),
+      "the emitted Saved picker and selected row occupy the right/main pane");
 
     output.refuseNextWrite(acceptedWhileQueued);
     harness.terminal.emitInput("\x1b[B"); // Scroll the one-row window from A to B.
     await nextTurn();
     assert.equal(output.queuedCount, 1, "the real frame writer submitted B to a delayed Writable");
+    const coalescedCandidate = await emittedTerminalFrame(output, harness.terminal.columns, harness.terminal.rows, true);
+    const candidateRight = coalescedCandidate.lines.slice(1)
+      .map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").slice(33)).join("\n");
+    assert.ok(candidateRight.includes("Saved conversations") && candidateRight.includes(savedB.caption),
+      "the coalesced candidate is still a right-pane Saved picker, not a left-only render");
 
     // A is still the only row on the sink's emitted surface. Even though Main's
     // render has already built B's newer mutable hit map, the pending map must
@@ -3679,18 +3751,85 @@ test("confirmed Saved deletion uses shell-free trash fallback for only the displ
     assert.equal(harness.sidebar?.focus, "form");
     assert.ok(plain(harness.writer.frames.at(-1)?.frame).includes("Sibling conversati"), JSON.stringify(plain(harness.writer.frames.at(-1)?.frame)));
     const selectionBefore = harness.sidebar?.selectedId;
+    const savedQuery: string = "First conversation delete-confirmed";
+    harness.terminal.emitInput(savedQuery);
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await nextTurn();
+      const frame = harness.writer.frames.at(-1)?.frame;
+      if (plain(frame).includes(savedQuery) && plain(frame).includes("> First convers")
+        && !plain(frame).includes("Sibling conversation stays")) break;
+    }
+    assert.equal(harness.sidebar?.savedQuery, savedQuery);
+    assertSavedPickerRightPanel(harness.writer.frames.at(-1)!.frame, savedQuery, "First convers");
+    const pickerBeforeCancel = harness.sidebar?.savedPickerRequestId;
+    const surface = manager.surface(ownerBefore!);
+    assert.ok(surface);
+    const childBefore = {
+      cols: surface.cols,
+      rows: surface.rows,
+      frame: [...surface.writesAsFrame],
+      resizeCalls: manager.resizeCalls.length,
+    };
 
     harness.terminal.emitInput("\x18"); // user-configured Ctrl+X delete action
     await nextTurn();
     assert.equal(harness.sidebar?.focus, "confirm");
-    const confirmation = plain(harness.writer.frames.at(-1)?.frame);
+    const confirmationFrame = harness.writer.frames.at(-1)!.frame;
+    assertSavedDeleteConfirmationRightPanel(confirmationFrame, fixture.file);
+    const confirmation = plain(confirmationFrame);
     assert.ok(confirmation.includes("Delete saved conversation?"));
     assert.ok(confirmation.includes("Conversation:"), "the confirmation labels its bounded caption hint");
-    assert.ok(confirmation.replace(/[│\s]/g, "").includes(fixture.file.replace(/\s/g, "")),
-      "the exact selected file path is fully displayed before confirmation is enabled: " + confirmation);
     assert.ok(!confirmation.includes(fixture.sessionId), "private session id is not shown in the confirmation");
     assert.deepEqual(trashCalls, [], "no mutation process starts before confirmation");
 
+    const leftSavedRow = screenRowContaining(confirmationFrame, "Saved conversations");
+    assert.ok(leftSavedRow > 0 && plainLine(confirmationFrame, leftSavedRow).slice(0, 32).includes("Saved conversations"),
+      "the visible left roster is present beside the right-pane confirmation");
+    const writesBeforeDialogInput = manager.writes.length;
+    emitMouse(harness.terminal, 2, leftSavedRow); // dialog clicks cannot activate the left roster
+    emitMouse(harness.terminal, 2, leftSavedRow, 0, "m");
+    emitMouse(harness.terminal, 34, 1); // or the right/main confirmation pane
+    emitMouse(harness.terminal, 34, 1, 0, "m");
+    harness.terminal.emitInput("x"); // confirmation owns all keyboard input; arbitrary text is not forwarded
+    assert.equal(harness.sidebar?.focus, "confirm");
+    assert.equal(harness.sidebar?.savedPickerRequestId, pickerBeforeCancel);
+    assert.equal(harness.sidebar?.savedQuery, savedQuery);
+    assert.equal(manager.writes.length, writesBeforeDialogInput);
+    assert.deepEqual(trashCalls, [], "dialog pointer and nonconfirm keyboard input cannot start deletion");
+    assert.ok(existsSync(fixture.file));
+    assert.deepEqual(manager.resizeCalls.length, childBefore.resizeCalls, "dialog input never resizes the native child");
+    assert.equal(surface.cols, childBefore.cols);
+    assert.equal(surface.rows, childBefore.rows);
+    assert.deepEqual(surface.writesAsFrame, childBefore.frame, "the native child's retained viewport content is unchanged");
+
+    harness.terminal.emitInput(ESC);
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "form");
+    assert.equal(harness.sidebar?.savedPickerRequestId, pickerBeforeCancel, "cancel restores the same picker owner");
+    assert.equal(harness.sidebar?.savedQuery, savedQuery, "cancel restores the same query draft");
+    assert.equal(harness.sidebar?.selectedId, selectionBefore, "cancel leaves roster selection unchanged");
+    assert.equal(harness.sidebar?.activeMainOwnerID, ownerBefore, "cancel keeps the same native Main owner");
+    assertSavedPickerRightPanel(harness.writer.frames.at(-1)!.frame, savedQuery, "First convers");
+    assert.equal(manager.writes.length, writesBeforeDialogInput, "the child draft/input stream remains untouched");
+
+    harness.terminal.emitInput("\x15"); // clear only for the subsequent successful refresh assertion
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await nextTurn();
+      if (harness.sidebar?.savedQuery === ""
+        && plain(harness.writer.frames.at(-1)?.frame).includes("First conversation delete-confirmed")
+        && plain(harness.writer.frames.at(-1)?.frame).includes("Sibling conversati")) break;
+    }
+    let pickerFrame = harness.writer.frames.at(-1)!.frame;
+    if (!plain(pickerFrame).includes("> First convers")) {
+      harness.terminal.emitInput("\x1b[B");
+      await nextTurn();
+      pickerFrame = harness.writer.frames.at(-1)!.frame;
+    }
+    assert.ok(plain(pickerFrame).includes("> First convers"), "the exact intended saved row is selected before re-confirming");
+
+    harness.terminal.emitInput("\x18");
+    await nextTurn();
+    assertSavedDeleteConfirmationRightPanel(harness.writer.frames.at(-1)!.frame, fixture.file);
     harness.terminal.emitInput(ENTER);
     for (let attempt = 0; attempt < 10; attempt += 1) {
       await nextTurn();
@@ -3736,8 +3875,6 @@ test("real frame-writer settlement gates Saved file deletion before callback, be
     ),
   });
   let closed = false;
-  const plainOutput = (chunks: readonly Buffer[]): string => chunks.map((bytes) => bytes.toString("utf8"))
-    .join("").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/│/g, "");
   try {
     await ready(harness);
     openSavedPicker(harness.terminal);
@@ -3752,22 +3889,29 @@ test("real frame-writer settlement gates Saved file deletion before callback, be
     for (let attempt = 0; attempt < 10 && output.queuedCount === 0; attempt += 1) await nextTurn();
     assert.equal(harness.sidebar?.focus, "confirm");
     assert.equal(output.queuedCount, 1, "the exact confirmation frame is held behind output backpressure");
-    const pendingWarning = plainOutput(output.queuedTexts.map((text) => Buffer.from(text)));
-    assert.ok(pendingWarning.includes("Delete saved conversation?"));
-    assert.ok(pendingWarning.replace(/\s/g, "").includes(fixture.file.replace(/\s/g, "")),
-      "the queued warning names exactly the selected file across wrapped pane rows");
-
+    assertSavedDeleteConfirmationRightPanel(
+      await emittedTerminalFrame(output, harness.terminal.columns, harness.terminal.rows, true),
+      fixture.file,
+    );
     harness.terminal.emitInput(ENTER);
     assert.deepEqual(trashCalls, [], "rendering and queueing the warning do not grant confirmation authority");
     assert.ok(existsSync(fixture.file));
 
     output.completeQueuedWrites(); // callback succeeds, but write() returned false and drain is still pending
+    assertSavedDeleteConfirmationRightPanel(
+      await emittedTerminalFrame(output, harness.terminal.columns, harness.terminal.rows),
+      fixture.file,
+    );
     harness.terminal.emitInput(ENTER);
     assert.deepEqual(trashCalls, [], "a callback without the required drain still cannot authorize deletion");
     assert.ok(existsSync(fixture.file));
 
     output.drain();
     await nextTurn();
+    assertSavedDeleteConfirmationRightPanel(
+      await emittedTerminalFrame(output, harness.terminal.columns, harness.terminal.rows),
+      fixture.file,
+    );
     harness.terminal.emitInput(ENTER);
     assert.deepEqual(trashCalls, [{ command: "trash", args: [fixture.file] }],
       "only the exact settled confirmation permits the shell-free trash attempt");
@@ -3805,8 +3949,6 @@ test("real writer resize revokes a queued Saved warning until the complete exact
     ),
   });
   let closed = false;
-  const plainOutput = (chunks: readonly Buffer[]): string => chunks.map((bytes) => bytes.toString("utf8"))
-    .join("").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/│/g, "");
   try {
     await ready(harness);
     openSavedPicker(harness.terminal);
@@ -3820,9 +3962,10 @@ test("real writer resize revokes a queued Saved warning until the complete exact
     for (let attempt = 0; attempt < 10 && output.queuedCount === 0; attempt += 1) await nextTurn();
     assert.equal(harness.sidebar?.focus, "confirm");
     assert.equal(output.queuedCount, 1);
-    assert.ok(plainOutput(output.queuedTexts.map((text) => Buffer.from(text))).replace(/\s/g, "").includes(fixture.file.replace(/\s/g, "")),
-      "the queued warning names the exact selected file across wrapped pane rows");
-
+    assertSavedDeleteConfirmationRightPanel(
+      await emittedTerminalFrame(output, harness.terminal.columns, harness.terminal.rows, true),
+      fixture.file,
+    );
     harness.terminal.setSize(11, 3); // synchronous invalidation precedes the coalesced too-small redraw
     harness.terminal.emitInput(ENTER);
     assert.equal(trashCalls, 0, "Enter immediately after Main receives resize cannot use the old displayed warning");
@@ -3834,7 +3977,10 @@ test("real writer resize revokes a queued Saved warning until the complete exact
     assert.equal(trashCalls, 0, "a stale confirmation callback cannot restore authority after geometry changed");
     output.drain();
     await nextTurn();
-    assert.ok(plainOutput([output.writes.at(-1)!]).includes("too small"), "the actual output now contains only the tiny fallback");
+    const tinyOutputFrame = await emittedTerminalFrame(output, 11, 3);
+    const tinyOutputText = tinyOutputFrame.lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+    assert.ok(tinyOutputText.includes("too small"), "the emitted narrow overlay contains only its bounded tiny fallback");
+    assert.equal(tinyOutputText.includes("Saved file:"), false, "the clipped/stale warning is absent after the tiny redraw");
     harness.terminal.emitInput(ENTER);
     assert.equal(trashCalls, 0, "the too-small frame itself never enables confirmation");
     assert.ok(existsSync(fixture.file));
@@ -3843,14 +3989,67 @@ test("real writer resize revokes a queued Saved warning until the complete exact
     harness.terminal.emitInput(ENTER);
     assert.equal(trashCalls, 0, "restoring geometry does not reuse the old settlement before a new complete frame");
     await nextTurn();
-    const restoredWarning = plainOutput([output.writes.at(-1)!]);
-    assert.ok(restoredWarning.includes("Delete saved conversation?"));
-    assert.ok(restoredWarning.replace(/\s/g, "").includes(fixture.file.replace(/\s/g, "")),
-      "the reauthorized frame contains the exact selected path across wrapped rows");
+    const restoredWarning = await emittedTerminalFrame(output, 80, 24);
+    assertSavedDeleteConfirmationRightPanel(restoredWarning, fixture.file);
 
     harness.terminal.emitInput(ENTER);
     assert.equal(trashCalls, 1, "a fresh Enter succeeds after the restored exact warning settles");
     assert.equal(existsSync(fixture.file), false);
+    assert.equal(await closeWithSignal(harness), 0);
+    closed = true;
+  } finally {
+    if (!closed) {
+      harness.signals.emit("SIGTERM");
+      if (output.queuedCount > 0) output.drain();
+      await harness.result.catch(() => undefined);
+    }
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("an incomplete wide right-pane Saved warning cannot authorize deletion", async () => {
+  const fixture = makeSavedMainFixture("delete-clipped-right-pane");
+  writeFileSync(join(fixture.agentDir, "keybindings.json"), JSON.stringify({ "app.session.delete": "ctrl+x" }), "utf8");
+  const { overrides } = savedFixtureDependencies(fixture);
+  const output = new QueuedFrameOutput();
+  let deleteCalls = 0;
+  const harness = createHarness({}, {
+    ...overrides,
+    deleteSavedFile: () => {
+      deleteCalls += 1;
+      return { ok: false, method: "unlink", error: "synthetic refusal" };
+    },
+    createWriter: (_stdout, writerOptions) => createSessionHostFrameWriter(
+      output as unknown as Writable,
+      { ...writerOptions, redrawIntervalMs: 0 },
+    ),
+  });
+  let closed = false;
+  try {
+    await ready(harness);
+    openSavedPicker(harness.terminal);
+    for (let attempt = 0; attempt < 10 && !output.writes.some((bytes) => bytes.toString("utf8").includes("First conversation delete-clipped-right-pane")); attempt += 1) {
+      await nextTurn();
+    }
+    assert.ok(output.writes.some((bytes) => bytes.toString("utf8").includes("First conversation delete-clipped-right-pane")));
+
+    harness.terminal.emitInput("\x18");
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "confirm");
+    harness.terminal.setSize(53, 2); // still wide: 20-column right pane, one content row
+    harness.terminal.emitInput(ENTER); // resize synchronously revokes the previously settled wide warning
+    assert.equal(deleteCalls, 0);
+    await nextTurn();
+
+    const clipped = await emittedTerminalFrame(output, 53, 2);
+    const body = clipped.lines.slice(1).map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+    const right = body.map((line) => line.slice(33)).join("\n");
+    assert.ok(right.includes("too small"), "the actual right/main pane emits its too-small refusal");
+    assert.equal(right.includes("Delete saved conversation?"), false);
+    assert.equal(right.includes("Saved file:"), false, "an incomplete exact target is not displayed as a confirmation");
+    harness.terminal.emitInput(ENTER);
+    assert.equal(deleteCalls, 0, "the emitted clipped right-pane fallback cannot authorize deletion");
+    assert.ok(existsSync(fixture.file));
     assert.equal(await closeWithSignal(harness), 0);
     closed = true;
   } finally {

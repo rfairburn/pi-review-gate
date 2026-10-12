@@ -749,6 +749,7 @@ test("launcher helper packaged mode uses the packaged artifact and fails closed 
     await mkdir(join(stage, "skills", "pi-review-gate-orchestrator", "references"), { recursive: true });
     await mkdir(join(stage, "skills", "pi-review-gate-execution"), { recursive: true });
     await mkdir(join(stage, "skills", "pi-review-gate-research"), { recursive: true });
+    await mkdir(join(stage, "skills", "pi-review-gate-completion"), { recursive: true });
     await copyFile(helperPath, join(stage, "scripts", "pi-review-gate-launcher.cjs"));
     if (isWindows) await copyFile(cmdPath, join(stage, "scripts", "pi-review-gate.cmd"));
     await copyFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), join(stage, "skills/pi-review-gate-orchestrator/SKILL.md"));
@@ -758,6 +759,7 @@ test("launcher helper packaged mode uses the packaged artifact and fails closed 
     );
     await copyFile(resolve("skills/pi-review-gate-execution/SKILL.md"), join(stage, "skills/pi-review-gate-execution/SKILL.md"));
     await copyFile(resolve("skills/pi-review-gate-research/SKILL.md"), join(stage, "skills/pi-review-gate-research/SKILL.md"));
+    await copyFile(resolve("skills/pi-review-gate-completion/SKILL.md"), join(stage, "skills/pi-review-gate-completion/SKILL.md"));
 
     const missingFixture = await makeFixture("pi-review-cmd-packmiss-");
     // The staged tree has no src and no dist: packaged failure, exit 2.
@@ -791,13 +793,13 @@ test("launcher helper packaged mode uses the packaged artifact and fails closed 
 
     // Any missing manifest source must fail closed before publication and
     // before pi is launched, never with partially provisioned skills.
-    await rm(join(stage, "skills", "pi-review-gate-research", "SKILL.md"));
+    await rm(join(stage, "skills", "pi-review-gate-completion", "SKILL.md"));
     const missingSkillFixture = await makeFixture("pi-review-cmd-package-skillmiss-");
     const missingSkill = await runStagedHelperExpectingFailure(
       join(stage, "scripts", "pi-review-gate-launcher.cjs"), ["--model", "example"], fixtureEnv(missingSkillFixture), scratch,
     );
     assert.equal(missingSkill.status, 2, `stderr: ${missingSkill.stderr}`);
-    assert.match(missingSkill.stderr, /packaged skill file is missing: .*research.SKILL\.md/);
+    assert.match(missingSkill.stderr, /packaged skill file is missing: .*completion.SKILL\.md/);
     assert.equal(await launchStarted(missingSkillFixture), false);
     assert.equal(
       await pathExists(join(missingSkillFixture.home, ".agents", "skills", "pi-review-gate-orchestrator", "SKILL.md")),
@@ -932,7 +934,7 @@ test("launcher helper management verbs pass straight through to pi without setup
   }
 });
 
-test("launcher helper refreshes a stale installed orchestrator skill", async () => {
+test("launcher helper refreshes stale installed orchestrator and completion skills", async () => {
   const fixture = await makeFixture("pi-review-cmd-skill-");
   await mkdir(join(fixture.fallbackConfigPath, ".."), { recursive: true });
   await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
@@ -960,6 +962,18 @@ test("launcher helper refreshes a stale installed orchestrator skill", async () 
   await assertNoTempLitter(skillDir);
   assert.deepEqual(await readdir(join(skillDir, "references")), ["recovery.md"],
     "no temporary skill files may be left behind");
+  const completionDir = join(fixture.home, ".agents", "skills", "pi-review-gate-completion");
+  await mkdir(completionDir, { recursive: true });
+  await writeFile(join(completionDir, "SKILL.md"), "stale completion skill\n", "utf8");
+  await runHelper([], fixtureEnv(fixture));
+
+  assert.equal(
+    await readFile(join(completionDir, "SKILL.md"), "utf8"),
+    await readFile(resolve("skills/pi-review-gate-completion/SKILL.md"), "utf8"),
+    "a stale completion skill must be atomically refreshed from its packaged source",
+  );
+  if (!isWindows) assert.equal(await posixMode(join(completionDir, "SKILL.md")), 0o644);
+  await assertNoTempLitter(completionDir);
   for (const name of ["pi-review-gate-execution", "pi-review-gate-research"]) {
     const dir = join(fixture.home, ".agents", "skills", name);
     assert.equal(
@@ -992,7 +1006,7 @@ test("launcher helper preserves unrelated custom skills under ~/.agents/skills",
     customContent,
     "unrelated custom skills must be preserved untouched by provisioning",
   );
-  for (const name of ["pi-review-gate-orchestrator", "pi-review-gate-execution", "pi-review-gate-research"]) {
+  for (const name of ["pi-review-gate-orchestrator", "pi-review-gate-execution", "pi-review-gate-research", "pi-review-gate-completion"]) {
     assert.equal(
       await readFile(join(fixture.home, ".agents", "skills", name, "SKILL.md"), "utf8"),
       await readFile(resolve(`skills/${name}/SKILL.md`), "utf8"),
@@ -1001,7 +1015,7 @@ test("launcher helper preserves unrelated custom skills under ~/.agents/skills",
   }
   // Issue 151: a fresh launch installs the namespaced skills only — the
   // generic pre-#151 locations are never created by provisioning.
-  for (const generic of ["orchestrator", "execution", "research"]) {
+  for (const generic of ["orchestrator", "execution", "research", "completion"]) {
     assert.equal(
       await pathExists(join(fixture.home, ".agents", "skills", generic)),
       false,
@@ -1044,7 +1058,7 @@ test("launcher helper migrates proven pre-#151 generic skill copies and preserve
 
   await runHelper([], fixtureEnv(fixture));
 
-  for (const name of ["pi-review-gate-orchestrator", "pi-review-gate-execution", "pi-review-gate-research"]) {
+  for (const name of ["pi-review-gate-orchestrator", "pi-review-gate-execution", "pi-review-gate-research", "pi-review-gate-completion"]) {
     assert.equal(
       await readFile(join(fixture.home, ".agents", "skills", name, "SKILL.md"), "utf8"),
       await readFile(resolve(`skills/${name}/SKILL.md`), "utf8"),
@@ -2175,6 +2189,7 @@ if (isWindows) {
       await mkdir(join(stage, "skills", "pi-review-gate-orchestrator", "references"), { recursive: true });
       await mkdir(join(stage, "skills", "pi-review-gate-execution"), { recursive: true });
       await mkdir(join(stage, "skills", "pi-review-gate-research"), { recursive: true });
+      await mkdir(join(stage, "skills", "pi-review-gate-completion"), { recursive: true });
       await copyFile(helperPath, join(stage, "scripts", "pi-review-gate-launcher.cjs"));
       await copyFile(cmdPath, join(stage, "scripts", "pi-review-gate.cmd"));
       await copyFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), join(stage, "skills/pi-review-gate-orchestrator/SKILL.md"));
@@ -2184,6 +2199,7 @@ if (isWindows) {
       );
       await copyFile(resolve("skills/pi-review-gate-execution/SKILL.md"), join(stage, "skills/pi-review-gate-execution/SKILL.md"));
       await copyFile(resolve("skills/pi-review-gate-research/SKILL.md"), join(stage, "skills/pi-review-gate-research/SKILL.md"));
+      await copyFile(resolve("skills/pi-review-gate-completion/SKILL.md"), join(stage, "skills/pi-review-gate-completion/SKILL.md"));
 
       const missingFixture = await makeFixture("pi-review-cmd-native-packmiss-");
       const missing = runCmd(
@@ -2207,6 +2223,11 @@ if (isWindows) {
       // (RUNNER~1) in one spelling and not the other; realpath normalizes.
       assert.equal(await realpath(launch.args[1]), join(await realpath(stage), "dist", "src", "index.js"),
         "packaged mode must use the staged artifact through the .cmd entry point");
+      assert.equal(
+        await readFile(join(fixture.home, ".agents", "skills", "pi-review-gate-completion", "SKILL.md"), "utf8"),
+        await readFile(resolve("skills/pi-review-gate-completion/SKILL.md"), "utf8"),
+        "the native .cmd launcher must publish the completion skill from its packaged source",
+      );
     } finally {
       await rm(scratch, { recursive: true, force: true });
     }
@@ -2268,6 +2289,7 @@ if (isWindows) {
       await mkdir(join(stage, "skills", "pi-review-gate-orchestrator", "references"), { recursive: true });
       await mkdir(join(stage, "skills", "pi-review-gate-execution"), { recursive: true });
       await mkdir(join(stage, "skills", "pi-review-gate-research"), { recursive: true });
+      await mkdir(join(stage, "skills", "pi-review-gate-completion"), { recursive: true });
       await copyFile(helperPath, join(stage, "scripts", "pi-review-gate-launcher.cjs"));
       await copyFile(cmdPath, join(stage, "scripts", "pi-review-gate.cmd"));
       await copyFile(resolve("skills/pi-review-gate-orchestrator/SKILL.md"), join(stage, "skills/pi-review-gate-orchestrator/SKILL.md"));
@@ -2277,6 +2299,7 @@ if (isWindows) {
       );
       await copyFile(resolve("skills/pi-review-gate-execution/SKILL.md"), join(stage, "skills/pi-review-gate-execution/SKILL.md"));
       await copyFile(resolve("skills/pi-review-gate-research/SKILL.md"), join(stage, "skills/pi-review-gate-research/SKILL.md"));
+      await copyFile(resolve("skills/pi-review-gate-completion/SKILL.md"), join(stage, "skills/pi-review-gate-completion/SKILL.md"));
       await mkdir(join(stage, "dist", "src"), { recursive: true });
       await writeFile(join(stage, "dist", "src", "index.js"), "module.exports = { activate() {} };\n", "utf8");
 

@@ -20,6 +20,7 @@ import {
   type ScheduledTaskCatalog,
   type WebBrowserPermissions,
   type WorkerResourceCatalog,
+  type YouShouldKnowConfig,
   type WorkerRouteEntry,
   type ExecutionRetryPolicy,
   type OperatingMode,
@@ -96,6 +97,8 @@ export interface ReviewSettingsSelection {
   browserVisible?: boolean;
   /** Complete a-la-carte browser permission object (issue #27); persisted as a whole. */
   webBrowserPermissions?: WebBrowserPermissions;
+  /** Independent YouShouldKnow availability and completion-guidance toggles. */
+  youShouldKnow?: YouShouldKnowConfig;
 }
 
 const configUpdateTails = new Map<string, Promise<void>>();
@@ -151,6 +154,9 @@ function applyStagedSelectionFields(parsed: Record<string, unknown>, selection: 
   parsed.review = review;
   parsed.operatingMode = selection.operatingMode;
   parsed.modeCycleShortcut = selection.modeCycleShortcut;
+  if (selection.youShouldKnow !== undefined) {
+    parsed.youShouldKnow = { ...selection.youShouldKnow };
+  }
   parsed.reviewerTimeoutMs = selection.reviewerTimeoutMs;
   parsed.executorTimeoutMs = selection.executorTimeoutMs;
   parsed.maxCorrectionCycles = selection.maxCorrectionCycles;

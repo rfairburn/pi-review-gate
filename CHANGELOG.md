@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.146]
+## [0.1.0-dev.148]
 
 ### Added
 
@@ -36,17 +36,77 @@ dates.
   retransmitting the PNG. Ownership, clipping, bounded output/backpressure, and
   cleanup/restoration fences remain intact (#363).
 - Native synchronized redraws now commit text, cursor, and graphics together,
-  with alternate-screen image anchors checked against the completed covered rows instead
-  of stale text from an unfinished redraw. This prevents false image disappearance
-  and repeated PNG uploads between a native placement deletion and its replacement.
-  Frame holds are bounded; retained graphics remain budgeted, and incomplete frames
-  cannot authorize native mouse clicks against stale contents (#363).
+  with alternate-screen image anchors checked against the completed covered rows
+  instead of stale text from an unfinished redraw. This prevents false image
+  disappearance and repeated PNG uploads between a native placement deletion and
+  its replacement. Frame holds are bounded; retained graphics remain budgeted,
+  and incomplete frames cannot authorize native mouse clicks against stale contents
+  (#363).
 - Unchanged eligible source-sidebar launches reuse a verified completed staged
   build instead of installing dependencies and compiling the extension every time.
   Exact source/toolchain changes invalidate reuse; unsafe or incomplete cached
   artifacts are preserved and rebuilt privately. Per-launch Pi/DDGS validation,
   startup guards, ordinary package/standalone launchers, and native user settings
   remain unchanged (#363).
+
+## [0.1.0-dev.147]
+
+### Added
+
+- `YouShouldKnow` adds session-local notices alongside `AskUserQuestion` (#295).
+  Notices use a compact title, complete Markdown body, and optional context retained
+  in full. Questions and notice details use one shared native question popup and
+  Markdown renderer; question text is rendered as Markdown as well. **More details**
+  closes that popup before sending the complete retained body/context as an ordinary
+  owner-session request with an explicit natural-language request to elaborate in a
+  normal conversation reply. The selected notice is consumed before delivery and is
+  not restored after a delivery failure. **Close** removes only the selected notice
+  and sends nothing. Contextual ordinary user requests stay scoped to the originating
+  session and use existing busy-steering or idle non-interrupting delivery. The shared
+  `Pending input` list uses a padded popup framed only by full-width top and bottom
+  separator lines, and the single active native answer field stays isolated from the
+  saved chat draft. Default-on `youShouldKnow.enabled`
+  and `youShouldKnow.completionGuidance` settings control notice availability and the
+  supplemental completion prompt; the prompt is supplied only when both settings are
+  On and live authorized discovery exposes the tool. Disabling availability preserves
+  pending notice actions, and disabling guidance does not block authorized calls. The
+  completion skill opts out of native automatic skill routing; it is manually available
+  only when installed and discoverable in Pi's active environment. Existing question
+  answer/decline behavior and in-memory lifecycle remain unchanged; notices add no
+  permission grants, dashboard, or notification channel.
+
+### Fixed
+
+- The shared answer popup uses the host-owned native editor for both input and
+  popup rendering, suppressing its ordinary prompt rows instead of creating a
+  second render-only editor. Native actions and the single caret stay in the
+  popup, and closing restores the independent chat draft and ordinary rendering.
+- Background activity counts remain independent of restore-persistence and
+  cleanup-ownership failures. Ordinary task updates can recover counts through
+  a fresh, authenticated same-owner census; incomplete, unreadable, foreign, or
+  superseded evidence remains unknown, and cleanup ownership stays conservative.
+- Extension-owned question/notice Markdown, titles, and tool results visibly escape
+  terminal controls for display without changing stored data or ordinary model
+  requests. A guarded optional Pi Markdown display transformer applies the same
+  adapter to native conversation Markdown when available; older hosts retain safe
+  extension-owned rendering but cannot sanitize their transcript renderer. CRLF
+  remains a structural newline, and printable text, ordinary Markdown, and backslash
+  escaping are preserved.
+
+## [0.1.0-dev.146]
+
+### Added
+
+- The session host's always-global Saved conversations picker now supports native
+  Pi 1.1.0 `/resume` fuzzy-token, quoted-phrase, and `re:` regex search across native
+  session fields, plus confirmed Ctrl+D deletion (Ctrl+Backspace only with an empty
+  query). The complete delete confirmation occupies the right/Main pane on wide layouts,
+  with the roster retained left and cancel returning to the same picker/query/selection.
+  Deletion is trash-first with permanent-unlink fallback, revalidates the exact selected
+  saved file, protects current and host-loaded conversations, and refreshes the picker
+  with truthful outcomes. Plain `d` remains query text; independent children, Main
+  ownership, ordinary native `/resume`, and roster stop/remove behavior are unchanged
+  (#372).
 
 ## [0.1.0-dev.145]
 

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, lstatSync, mkdirSync, renameSync, symlinkSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, rmdir, symlink, writeFile } from "node:fs/promises";
@@ -19,8 +20,13 @@ import {
   readSavedSessionHeader,
   SavedSessionCatalog,
   SavedSessionRow,
+  searchSavedSessions,
+  validateSavedSessionDeletion,
 } from "../src/session-host/saved-sessions";
-import { MAX_SDK_ANCESTOR_STEPS, PI_PACKAGE_NAME } from "../src/session-host/native-session-sdk";
+import { deleteSavedSessionFile, type SavedSessionDeletionOptions } from "../src/session-host/saved-deletion";
+import { MAX_SDK_ANCESTOR_STEPS, PI_PACKAGE_NAME, type NativeSessionSdkInfo } from "../src/session-host/native-session-sdk";
+import { findInstalledAgentDirs } from "./menu-tui-fakes";
+import { skipOrFail } from "./bridge-fakes";
 
 /**
  * Owned private fixture subtree: all synthetic fixture trees live inside the
@@ -161,7 +167,10 @@ interface NativeSessionSdkInfoLike {
   id: string;
   cwd: string;
   name?: string;
+  allMessagesText?: string;
   firstMessage?: string;
+  created?: Date;
+  modified?: Date;
 }
 
 /**
@@ -1714,4 +1723,311 @@ test("fixture cleanup preserves failed-run witnesses and cleans successful ones"
   await pruneAndRemove(failedRoot);
   await pruneAndRemove(replacedRoot);
   await pruneAndRemove(moved);
+});
+
+interface SyntheticSearchSession extends NativeSessionSdkInfo {
+  allMessagesText: string;
+  modified: Date;
+}
+
+interface NativeSessionSelectorSearch {
+  filterAndSortSessions(
+    sessions: Array<{
+      id: string;
+      name?: string;
+      allMessagesText: string;
+      cwd: string;
+      modified: Date;
+    }>,
+    query: string,
+    sortMode: "relevance",
+  ): Array<{ id: string }>;
+}
+
+test("saved catalog search keeps full names/transcripts private and returns admitted minted rows", async (t) => {
+  const fixture = await makeCatalogFixture("pi-saved-search-privacy");
+  t.after(() => removeFixtureTree(fixture.root));
+  const projectDir = join(fixture.sessionsRoot, "search-project");
+  await mkdir(projectDir, { recursive: true });
+  const hiddenNameTail = "NameTailPrivateMarker";
+  const privateTranscript = "PRIVATE_TRANSCRIPT_ONLY_TOKEN";
+  const fullName = `${"N".repeat(320)}${hiddenNameTail}`;
+  const path = await writeSessionFile(projectDir, "private.jsonl", "private-search-row", fixture.workspace, { name: fullName });
+  const info: NativeSessionSdkInfo = {
+    path,
+    id: "private-search-row",
+    cwd: fixture.workspace,
+    name: fullName,
+    allMessagesText: `An internal transcript mentions ${privateTranscript} only for search.`,
+    modified: new Date("2025-01-10T00:00:00.000Z"),
+  };
+  const catalog = await listSavedSessions({
+    agentDir: fixture.agentDir,
+    listAll: async () => [info],
+  });
+  const row = catalog.rows[0]!;
+
+  assert.equal(searchSavedSessions(catalog, "   \n\t"), catalog.rows,
+    "empty search preserves the existing recent row array and order");
+  const byFullName = searchSavedSessions(catalog, hiddenNameTail);
+  const byTranscript = searchSavedSessions(catalog, privateTranscript);
+  assert.equal(byFullName.length, 1);
+  assert.equal(byTranscript.length, 1);
+  assert.strictEqual(byFullName[0], row, "name search returns the exact row minted by the catalog");
+  assert.strictEqual(byTranscript[0], row, "transcript search returns the exact row minted by the catalog");
+  assert.equal("name" in row, false);
+  assert.equal("allMessagesText" in row, false);
+  assert.equal("firstMessage" in row, false);
+  assert.doesNotMatch(JSON.stringify(row), new RegExp(hiddenNameTail));
+  assert.doesNotMatch(JSON.stringify(catalog), new RegExp(hiddenNameTail));
+  assert.doesNotMatch(JSON.stringify(row), new RegExp(privateTranscript));
+  assert.doesNotMatch(JSON.stringify(catalog), new RegExp(privateTranscript));
+  assert.deepEqual(searchSavedSessions({ ...catalog } as SavedSessionCatalog, hiddenNameTail), [],
+    "a structurally copied but unbranded catalog cannot search or fabricate rows");
+  assert.deepEqual(searchSavedSessions(catalog, "re:"), [], "empty regex is a non-match, not an exception");
+  assert.deepEqual(searchSavedSessions(catalog, "re:["), [], "invalid regex is a non-match, not an exception");
+
+  const admitted = admitSavedSession(catalog, byTranscript[0]!);
+  assert.equal(admitted.status, "admitted", "search preserves the identity proof used by catalog admission");
+});
+
+test("saved deletion validation requires current file identity but not workspace availability", async (t) => {
+  const fixture = await makeCatalogFixture("pi-saved-delete-validation");
+  t.after(() => removeFixtureTree(fixture.root));
+  const projectDir = join(fixture.sessionsRoot, "delete-project");
+  await mkdir(projectDir, { recursive: true });
+  const missingWorkspace = join(fixture.root, "workspace-no-longer-present");
+  const file = await writeSessionFile(projectDir, "selected.jsonl", "delete-row", missingWorkspace);
+  const catalog = await listSavedSessions({
+    agentDir: fixture.agentDir,
+    listAll: async () => [{ path: file, id: "delete-row", cwd: missingWorkspace }],
+  });
+  const row = catalog.rows[0]!;
+
+  assert.equal(validateSavedSessionDeletion(catalog, row), undefined,
+    "deletion remains available even though launch admission needs the workspace");
+  assert.deepEqual(admitSavedSession(catalog, row), { status: "refused", reason: "workspace-unavailable" });
+  assert.equal(validateSavedSessionDeletion(catalog, { ...row } as SavedSessionRow), "unknown-row");
+  assert.equal(validateSavedSessionDeletion(catalog, row, { ownedLiveSessions: [{ id: row.id }] }), "unknown-live-binding",
+    "an ID-only live binding cannot establish that the loaded file differs");
+  assert.equal(validateSavedSessionDeletion(catalog, row, { ownedLiveSessions: [{ file: row.file }] }), "known-owned-duplicate");
+  assert.equal(validateSavedSessionDeletion(catalog, row, { ownedLiveSessions: [{}] }), "unknown-live-binding");
+
+  const alias = join(projectDir, "selected-alias.jsonl");
+  await symlink(file, alias);
+  assert.equal(validateSavedSessionDeletion(catalog, row, {
+    ownedLiveSessions: [{ kind: "current", id: "still-old-live-id", file: alias }],
+  }), "known-owned-duplicate", "the current realpath protects the cataloged file even when its header ID changed");
+  assert.equal(validateSavedSessionDeletion(catalog, row, {
+    ownedLiveSessions: [{ kind: "current", id: "still-old-live-id", file: join(fixture.root, "planned-new.jsonl") }],
+  }), undefined, "a fresh /new file path is not paired with the old session ID or reservation");
+  assert.equal(validateSavedSessionDeletion(catalog, row, {
+    ownedLiveSessions: [
+      { kind: "known-id", id: row.id },
+      { kind: "current", id: "new-live-id", file: join(fixture.root, "planned-new.jsonl") },
+    ],
+  }), undefined, "historical duplicate IDs do not stand in for current-file identity");
+  assert.equal(validateSavedSessionDeletion(catalog, row, {
+    ownedLiveSessions: [{ kind: "reservation", id: row.id, file: join(fixture.root, "reservation.jsonl") }],
+  }), "known-owned-duplicate", "pending reservations independently preserve their exact ID/file pair");
+  await rm(alias);
+
+  const heldOriginal = join(projectDir, "held-original.txt");
+  await rename(file, heldOriginal);
+  await writeFile(file, `${sessionHeaderLine(row.id, missingWorkspace)}\n`, "utf8");
+  assert.equal(validateSavedSessionDeletion(catalog, row), "replaced-file",
+    "an atomic same-header replacement is not the cataloged file");
+  await rm(file);
+  await symlink(heldOriginal, file);
+  assert.equal(validateSavedSessionDeletion(catalog, row), "symlink-file");
+
+  await listSavedSessions({ agentDir: fixture.agentDir, listAll: async () => [] });
+  assert.equal(validateSavedSessionDeletion(catalog, row), "stale-catalog",
+    "a newer listing invalidates deletion authority from the old catalog");
+});
+
+test("saved-file deletion matches trash-first status/gone semantics and revalidates unlink fallback", () => {
+  const file = "/synthetic/saved-session.jsonl";
+  const calls: Array<{ command: string; args: readonly string[] }> = [];
+  const makeTrash = (status: number | null, stderr = ""): NonNullable<SavedSessionDeletionOptions["spawnSync"]> =>
+    ((command: string, args: readonly string[]) => {
+      calls.push({ command, args: [...args] });
+      return {
+        pid: 7,
+        output: [null, "", stderr],
+        stdout: "",
+        stderr,
+        status,
+        signal: null,
+      };
+    }) as NonNullable<SavedSessionDeletionOptions["spawnSync"]>;
+
+  let unlinks = 0;
+  let validations = 0;
+  const statusSuccess = deleteSavedSessionFile(file, {
+    validate: () => undefined,
+    spawnSync: makeTrash(0),
+    exists: () => true,
+    unlink: () => { unlinks += 1; },
+  });
+  assert.deepEqual(statusSuccess, { ok: true, method: "trash" },
+    "status zero is native success even when the fake trash command leaves the path present");
+
+  const goneAfterFailure = deleteSavedSessionFile(file, {
+    validate: () => undefined,
+    spawnSync: makeTrash(1, "trash reported failure"),
+    exists: () => false,
+    unlink: () => { unlinks += 1; },
+  });
+  assert.deepEqual(goneAfterFailure, { ok: true, method: "trash" },
+    "native success also includes a path already gone after a nonzero trash result");
+
+  const fallback = deleteSavedSessionFile(file, {
+    validate: () => { validations += 1; return undefined; },
+    spawnSync: makeTrash(1, "trash unavailable"),
+    exists: () => true,
+    unlink: (path) => { assert.equal(path, file); unlinks += 1; },
+  });
+  assert.deepEqual(fallback, { ok: true, method: "unlink" });
+  assert.equal(validations, 2, "fallback unlink has a fresh validation immediately before mutation");
+  assert.equal(unlinks, 1);
+
+  let replacementValidations = 0;
+  const replacement = deleteSavedSessionFile(file, {
+    validate: () => ++replacementValidations === 1 ? undefined : "replaced-file",
+    spawnSync: makeTrash(1, "trash failed"),
+    exists: () => true,
+    unlink: () => { unlinks += 1; },
+  });
+  assert.equal(replacement.ok, false);
+  assert.equal(replacement.refusal, "replaced-file");
+  assert.equal(unlinks, 1, "a path replaced during trash is never passed to unlink");
+
+  let spawnedAfterRefusal = false;
+  const refused = deleteSavedSessionFile(file, {
+    validate: () => "known-owned-duplicate",
+    spawnSync: ((..._args: unknown[]) => { spawnedAfterRefusal = true; }) as NonNullable<SavedSessionDeletionOptions["spawnSync"]>,
+  });
+  assert.equal(refused.ok, false);
+  assert.equal(spawnedAfterRefusal, false, "preflight refusal starts no trash process");
+  assert.deepEqual(calls, [
+    { command: "trash", args: [file] },
+    { command: "trash", args: [file] },
+    { command: "trash", args: [file] },
+    { command: "trash", args: [file] },
+  ], "every trash call is a shell-free single-path argv invocation");
+});
+
+async function loadNativeSessionSelectorSearch(
+  t: TestContext,
+): Promise<NativeSessionSelectorSearch | undefined> {
+  let reason = "no installed Pi 1.1.0 native session-selector search module is available";
+  for (const agentDir of findInstalledAgentDirs()) {
+    try {
+      const manifest = JSON.parse(await readFile(join(agentDir, "package.json"), "utf8")) as {
+        name?: unknown;
+        version?: unknown;
+      };
+      if (manifest.name !== PI_PACKAGE_NAME || manifest.version !== "1.1.0") continue;
+      const searchModulePath = join(agentDir, "dist", "modes", "interactive", "components", "session-selector-search.js");
+      if (!existsSync(searchModulePath)) continue;
+      const loaded = createRequire(join(agentDir, "package.json"))(searchModulePath) as Partial<NativeSessionSelectorSearch>;
+      if (typeof loaded.filterAndSortSessions === "function") return loaded as NativeSessionSelectorSearch;
+    } catch {
+      reason = "the installed Pi 1.1.0 native session-selector search module could not be loaded";
+    }
+  }
+  skipOrFail(t, reason);
+  return undefined;
+}
+
+test("branded saved catalog search matches the actual Pi 1.1.0 native matcher", async (t) => {
+  const nativeSearch = await loadNativeSessionSelectorSearch(t);
+  if (!nativeSearch) return;
+
+  const workspace = await makeCatalogFixture("pi-saved-search-native");
+  t.after(() => removeFixtureTree(workspace.root));
+  const projectDir = join(workspace.sessionsRoot, "search-project");
+  await mkdir(projectDir, { recursive: true });
+  const sourceEntries: Array<Omit<SyntheticSearchSession, "path">> = [
+    {
+      id: "z-recent",
+      cwd: workspace.workspace,
+      name: "Kubernetes rollout",
+      allMessagesText: "Fix retry logic for the background queue\nand deployment errors",
+      modified: new Date("2025-01-10T00:00:00.000Z"),
+    },
+    {
+      id: "a-older",
+      cwd: workspace.workspace,
+      name: "SearchIndex migration",
+      allMessagesText: "Implement session catalog   search using matcher",
+      modified: new Date("2025-01-08T00:00:00.000Z"),
+    },
+    {
+      id: "m-oldest",
+      cwd: workspace.workspace,
+      name: "Build pipeline",
+      allMessagesText: "Update docs; debug matcher\nwith whitespace",
+      modified: new Date("2025-01-07T00:00:00.000Z"),
+    },
+    {
+      id: "n-middle",
+      cwd: workspace.workspace,
+      allMessagesText: "Search tool on migration for the user",
+      modified: new Date("2025-01-09T00:00:00.000Z"),
+    },
+  ];
+  const sdkEntries: SyntheticSearchSession[] = [];
+  for (const [index, entry] of sourceEntries.entries()) {
+    const path = await writeSessionFile(
+      projectDir,
+      `native-${index}.jsonl`,
+      entry.id,
+      entry.cwd,
+      { ...(entry.name !== undefined ? { name: entry.name } : {}) },
+    );
+    sdkEntries.push({ ...entry, path });
+  }
+  const catalog = await listSavedSessions({
+    agentDir: workspace.agentDir,
+    listAll: async (sessionDir) => sessionDir === projectDir ? sdkEntries : [],
+  });
+  const byId = new Map(sdkEntries.map((entry) => [entry.id, entry]));
+  const nativeInput = catalog.rows.map((row) => {
+    const source = byId.get(row.id)!;
+    return {
+      id: source.id,
+      ...(source.name !== undefined ? { name: source.name } : {}),
+      allMessagesText: source.allMessagesText,
+      cwd: source.cwd,
+      modified: source.modified,
+    };
+  });
+  const queries = [
+    "",
+    "   ",
+    "matcher",
+    'search "catalog   search"',
+    '"DEBUG matcher"',
+    '"background queue and deployment"',
+    "re:DEPLOYMENT",
+    "re:^z-recent",
+    "re:workspace$",
+    "re:.*",
+    "re:",
+    "re:[",
+    'search "catalog search',
+    "RE:deployment",
+  ];
+
+  for (const query of queries) {
+    const expected = nativeSearch.filterAndSortSessions(nativeInput, query, "relevance");
+    const actual = searchSavedSessions(catalog, query);
+    assert.deepEqual(actual.map((row) => row.id), expected.map((session) => session.id), `query ${JSON.stringify(query)}`);
+    for (const row of actual) {
+      assert.strictEqual(row, catalog.rows.find((candidate) => candidate.id === row.id),
+        `query ${JSON.stringify(query)} preserves the exact branded row reference`);
+    }
+  }
 });

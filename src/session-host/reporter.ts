@@ -66,6 +66,7 @@ import {
   decodeFrame,
   encodeFrame,
   isValidNativeSessionId,
+  isValidNativeSessionFile,
   isValidRenameName,
   hasCompleteSessionIdle,
   parseBootstrap,
@@ -144,6 +145,8 @@ interface NativeSessionRead {
   displayName: string;
   /** Native stored name, only retained locally for exact setter read-back. */
   storedName?: string;
+  /** Exact bounded current public manager file observation; never persisted or displayed. */
+  currentFile?: string;
 }
 
 /** Clips only display metadata; persisted rename commands are validated separately and never clipped. */
@@ -209,12 +212,40 @@ function readNativeSession(context: unknown): NativeSessionRead | undefined {
     if (!isValidNativeSessionId(sessionId)) return undefined;
     const storedName: unknown = getSessionName.call(manager);
     if (storedName !== undefined && storedName !== null && typeof storedName !== "string") return undefined;
+    let displayName: string;
+    let observedStoredName: string | undefined;
     if (typeof storedName === "string" && storedName.trim()) {
-      return { sessionId, displayName: displayNameFromPieces([storedName]), storedName };
+      displayName = displayNameFromPieces([storedName]);
+      observedStoredName = storedName;
+    } else {
+      const entries: unknown = getEntries.call(manager);
+      if (!Array.isArray(entries)) return undefined;
+      displayName = firstUserMessageDisplayName(entries);
     }
-    const entries: unknown = getEntries.call(manager);
-    if (!Array.isArray(entries)) return undefined;
-    return { sessionId, displayName: firstUserMessageDisplayName(entries) };
+
+    // This field is deliberately read as a separate optional observation:
+    // older Pi managers and a throwing/unavailable public getter still report
+    // ordinary session metadata, but cannot authorize current-file deletion.
+    let currentFile: string | undefined;
+    try {
+      const getSessionFile = manager.getSessionFile;
+      if (typeof getSessionFile === "function") {
+        const candidate: unknown = getSessionFile.call(manager);
+        if (isValidNativeSessionFile(candidate)) currentFile = candidate;
+      }
+    } catch {
+      // Current-file uncertainty is represented by omission, never a guessed
+      // catalog/reservation path and never by dropping unrelated status.
+    }
+    // Fence a re-entrant file getter that changed the native selection: never
+    // pair the first ID with a path observed from a later session.
+    if (getSessionId.call(manager) !== sessionId) return undefined;
+    return {
+      sessionId,
+      displayName,
+      ...(observedStoredName === undefined ? {} : { storedName: observedStoredName }),
+      ...(currentFile === undefined ? {} : { currentFile }),
+    };
   } catch {
     return undefined;
   }
@@ -1016,6 +1047,7 @@ function createReporter(
       epoch: Math.max(1, sessionEpoch),
       name: read.displayName,
       persistence: nativePersistenceTracker.observe(read.sessionId, readNativePersistence(ctx, read.sessionId))?.persistence ?? "unknown",
+      ...(read.currentFile === undefined ? {} : { currentFile: read.currentFile }),
     };
     if (sessionEpoch < 1) sessionEpoch = nativeSession.epoch;
     writeStickyState({ bootstrap, sequence, sessionEpoch, nativeSessionId, nativePersistence: nativePersistenceTracker.snapshot(), shutdownRequested, teardown });

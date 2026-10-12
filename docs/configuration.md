@@ -67,6 +67,23 @@ described only briefly here is owned by the linked page.
 | `waveArtifactTtlMs` | `2592000000` (30 days) | Age after which completed non-recovery wave artifact roots are garbage-collected; `0` disables collection. |
 | `retainBundles` | `"on-failure"` | Review-bundle retention policy: `never`, `on-failure`, or `always`. `always` disables age-based wave GC while the application is running. |
 
+## YouShouldKnow settings
+
+`youShouldKnow` is a separate optional top-level object. Both fields default to `true`
+when missing, including when the object or config file predates these settings. Present
+field values must be JSON booleans; invalid fields recover independently to `true` with
+startup warnings.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `youShouldKnow.enabled` | `true` | Controls whether new `YouShouldKnow` notices are available through authorized tool discovery and calls. It only narrows the role/mode/launch authorization ceiling; it never grants authority. Turning it off does not remove existing pending notices, their **More details**/**Close** actions, or `AskUserQuestion`. |
+| `youShouldKnow.completionGuidance` | `true` | Controls whether the extension may supply its automatic completion prompt. The prompt appears only when this and `youShouldKnow.enabled` are `true` and `YouShouldKnow` is in the live authorized discovery ceiling; current activation is not required. Turning guidance off neither disables the tool nor blocks an otherwise-authorized call. |
+
+Both settings are independently staged in `/review-settings`; root Escape applies them to
+the current session without writing the file, Cancel discards the staged edits, and Save
+persists them. See [User questions and notices](user-questions.md#availability-and-completion-guidance)
+for runtime behavior and Pi skill-routing limits.
+
 ## Operating modes
 
 Choose **Operating mode** in `/review-settings`, then **Save changes**:
@@ -837,7 +854,7 @@ boundaries are owned by [Web tools](web-tools.md) and
 ## `/review-settings`
 
 The staged settings menu is documented on the [Settings menu](settings.md#review-settings)
-page: its seventeen ordinary rows, the conditional **Scheduler runtime** row,
+page: its nineteen ordinary rows, the conditional **Scheduler runtime** row,
 Escape/Cancel/Save/Ctrl+S apply and persistence semantics, and the shared native
 text-field behavior. Raw field values and defaults stay in this reference — see
 [Top-level fields](#top-level-fields),

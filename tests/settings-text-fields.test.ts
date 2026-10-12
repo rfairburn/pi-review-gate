@@ -57,6 +57,8 @@ const ROOT_SETTING_LABELS = [
   "Retry policy",
   "Subtask notifications",
   "Deferred Pi tools",
+  "YouShouldKnow notices",
+  "Completion guidance",
   "Subtasks view",
   "Scheduled tasks",
   "Web",
@@ -504,7 +506,7 @@ test("in the interactive TUI a text field opens through the native editor bridge
   // — the same embedded host editor every other text field uses. The public
   // ui.editor chain is a non-interactive fallback only.
   const harness = tuiFlowContext([
-    tuiKeys(...Array(15).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 15)
+    tuiKeys(...Array(17).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 17)
     tuiKeys(KEY_ENTER), // list → task entry (row 0)
     tuiKeys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → instructions (row 4)
     async (component) => {
@@ -516,7 +518,7 @@ test("in the interactive TUI a text field opens through the native editor bridge
     },
     tuiKeys(...Array(8).fill(KEY_DOWN), KEY_ENTER), // entry re-show (instructions, row 4) → Back (row 12)
     tuiKeys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
-    tuiKeys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 15) → Save changes (row 17)
+    tuiKeys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 17) → Save changes (row 19)
   ]);
 
   await registered.handler("", harness.ctx);
@@ -550,7 +552,7 @@ test("an interactive TUI without the native editor seams fails closed: error not
   // The field never opens a surface when the bridge is unavailable, so no
   // driver is consumed for it; the entry editor re-shows after the notice.
   const harness = tuiFlowContext([
-    tuiKeys(...Array(15).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 15)
+    tuiKeys(...Array(17).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 17)
     tuiKeys(KEY_ENTER), // list → task entry (row 0)
     tuiKeys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → instructions (row 4)
     tuiKeys(...Array(8).fill(KEY_DOWN), KEY_ENTER), // entry re-show (instructions, row 4) → Back (row 12)

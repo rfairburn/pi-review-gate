@@ -292,6 +292,8 @@ export interface JournalSnapshot {
 export interface SavedMainStartOptions {
   readonly ptyModule: NativePtyModule;
   readonly scratchRoot: string;
+  /** Distinct per-host artifact namespace when one fixture agent root is reopened. */
+  readonly runLabel?: string;
   readonly candidate: CandidatePackage;
   readonly runtime: RuntimePin;
   readonly observerFile: string;
@@ -354,7 +356,7 @@ function rightPaneText(text: string): string {
 export function isSavedConversationsPane(text: string): boolean {
   const rows = rightPaneText(text).split("\n").map((line) => line.trim());
   return rows.includes("Saved conversations")
-    && rows.some((line) => line.split(" | ").includes("up/down select"));
+    && rows.some((line) => line.split(" | ").includes("F8 toggle / up/down select"));
 }
 
 /** Public 32-column Quit renderer assertion shared by native and synthetic coverage. */
@@ -390,12 +392,19 @@ export function savedRowsVisible(text: string): string[] {
 export function isCompleteSavedSelection(text: string, caption: string, cwd: string): boolean {
   if (!isSavedConversationsPane(text)) return false;
   const pane = rightPaneText(text).split("\n").map((line) => line.trimEnd());
-  const footer = pane.findIndex((line) => line.trim() === "F8 toggle | up/down select | enter open | esc back");
-  if (footer < 4 || pane.slice(footer + 1).some((line) => line.trim() !== "")) return false;
+  const footerLines = [
+    "F8 toggle / up/down select | enter open / esc/ctrl+c back",
+    "ctrl+d delete / ctrl+backspace empty",
+  ];
+  const footer = pane.findIndex((line) => line.trim() === footerLines[0]);
+  if (footer < 3 || footerLines.some((line, index) => pane[footer + index]?.trim() !== line)
+    || pane.slice(footer + footerLines.length).some((line) => line.trim() !== "")) return false;
   const details = pane.slice(footer - 3, footer);
   if (details[0] !== caption || details.slice(1).join("") !== cwd) return false;
   const visible = savedRowsVisible(text);
   if (visible.length !== 1) return false;
+  const selectedRow = pane.findIndex((line) => line.startsWith("> ") && line.slice(2) === visible[0]);
+  if (selectedRow < 2 || selectedRow >= footer - 3) return false;
   const separator = visible[0].indexOf(" | ");
   if (separator < 0 || visible[0].slice(0, separator).trimEnd() !== caption) return false;
   const summary = visible[0].slice(separator + 3);
@@ -450,7 +459,7 @@ export class SavedMainDriver {
 
   private constructor(options: {
     readonly pty: NativePtyHandle;
-    readonly scratchRoot: string;
+    readonly stateRoot: string;
     readonly observerFile: string;
     readonly resultFile: string;
     readonly ptyJournalFile: string;
@@ -463,7 +472,7 @@ export class SavedMainDriver {
     this.resultFile = options.resultFile;
     this.ptyJournalFile = options.ptyJournalFile;
     this.controlFile = options.controlFile;
-    this.stateRoot = join(options.scratchRoot, "saved-main-state");
+    this.stateRoot = options.stateRoot;
     this.observerWatcher = options.observerWatcher;
     this.ptyWatcher = options.ptyWatcher;
     this.surface = new TerminalSurface(OUTER_COLS, OUTER_ROWS, {
@@ -508,12 +517,17 @@ export class SavedMainDriver {
     const state = join(home, ".local", "state");
     for (const path of [home, config, cache, data, state, temporary]) mkdirSync(path, { recursive: true, mode: 0o700 });
 
-    const stateRoot = join(options.scratchRoot, "saved-main-state");
+    const runLabel = options.runLabel ?? "";
+    if (runLabel !== "" && !/^[a-z0-9-]{1,32}$/u.test(runLabel)) {
+      throw new Error("Saved Main run label must be a bounded lowercase path component");
+    }
+    const stem = `saved-main${runLabel ? `-${runLabel}` : ""}`;
+    const stateRoot = join(options.scratchRoot, `${stem}-state`);
     mkdirSync(stateRoot, { mode: 0o700 });
-    const resultFile = join(options.scratchRoot, "saved-main-result.json");
-    const ptyJournalFile = join(options.scratchRoot, "saved-main-pty-journal.jsonl");
-    const controlFile = join(options.scratchRoot, "saved-main-control.json");
-    const optionsFile = join(options.scratchRoot, "saved-main-options.json");
+    const resultFile = join(options.scratchRoot, `${stem}-result.json`);
+    const ptyJournalFile = join(options.scratchRoot, `${stem}-pty-journal.jsonl`);
+    const controlFile = join(options.scratchRoot, `${stem}-control.json`);
+    const optionsFile = join(options.scratchRoot, `${stem}-options.json`);
     for (const [path, contents] of [
       [resultFile, ""], [ptyJournalFile, ""], [controlFile, ""], [optionsFile, ""],
     ] as const) writeFileSync(path, contents, { flag: "wx", mode: 0o600 });
@@ -579,7 +593,7 @@ export class SavedMainDriver {
     }
     return new SavedMainDriver({
       pty,
-      scratchRoot: options.scratchRoot,
+      stateRoot,
       observerFile: options.observerFile,
       resultFile,
       ptyJournalFile,

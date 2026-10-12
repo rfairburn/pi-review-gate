@@ -14,7 +14,7 @@ import {
   type SessionHostFrameWriter,
 } from "./frame-writer";
 import { createSessionHostTextField, type SessionHostFieldKeybindings } from "./field-editor";
-import { loadNativeFieldKeybindings, runNativeExternalEditor } from "./form-support";
+import { createNativeSavedQueryInput, loadNativeFieldKeybindings, runNativeExternalEditor } from "./form-support";
 import { normalizeNativeSourceInput, parseMouseInput, translateInput, KeyboardCapabilityObserver, type ParsedMouseInput } from "./input";
 import {
   InstanceManager,
@@ -55,11 +55,17 @@ import {
 import type { NativePersistenceReceipt } from "./native-persistence";
 import {
   admitSavedSession,
+  isSavedSessionCatalog,
   listSavedSessions,
+  searchSavedSessions,
   type SavedSessionAdmissionResult,
   type SavedSessionCatalog,
+  type SavedSessionDeletionRefusalReason,
   type SavedSessionRefusalReason,
+  type SavedSessionRow,
+  validateSavedSessionDeletion,
 } from "./saved-sessions";
+import { deleteSavedSessionFile, type SavedSessionDeletionResult } from "./saved-deletion";
 import {
   SidebarController,
   type SidebarAction,
@@ -115,6 +121,13 @@ interface MouseFramePresentation {
   readonly sidebar: SidebarMousePresentation;
   /** Current active owner only when its complete native frame matched this layout. */
   readonly nativeOwnerId: string | undefined;
+}
+
+interface SavedDeleteConfirmationFrame {
+  readonly renderToken: number;
+  readonly cols: number;
+  readonly rows: number;
+  settled: boolean;
 }
 
 function sameMouseAuthorization(a: MouseFramePresentation, b: MouseFramePresentation): boolean {
@@ -189,6 +202,7 @@ interface MainDependencies {
     expectedPiVersion: string;
     signal: AbortSignal;
   }) => Promise<SavedSessionCatalog>;
+  readonly deleteSavedFile: typeof deleteSavedSessionFile;
   /**
    * Acquire exclusive ownership of the canonical Pi agent directory and read
    * its globally persisted roster. Production resolves the real store; focused
@@ -427,6 +441,47 @@ function savedRefusalNotice(reason: SavedSessionRefusalReason): string {
   }
 }
 
+function savedDeletionOwnedSessions(owner: MainManager): ReturnType<MainManager["ownedLiveSessions"]> {
+  const owned = owner.ownedLiveSessions();
+  // Historical duplicate evidence does not establish the current binding of
+  // a live child whose reporter disconnected or became unavailable.
+  return owner.list().some((view) => view.hasLiveProcess && !view.nativeSession)
+    ? [...owned, {}]
+    : owned;
+}
+
+function validateOwnedSavedSessionDeletion(
+  owner: MainManager,
+  catalog: SavedSessionCatalog,
+  row: SavedSessionRow,
+): SavedSessionDeletionRefusalReason | undefined {
+  return validateSavedSessionDeletion(catalog, row, { ownedLiveSessions: savedDeletionOwnedSessions(owner) });
+}
+
+function savedDeletionRefusalNotice(reason: SavedSessionDeletionRefusalReason): string {
+  if (reason === "known-owned-duplicate" || reason === "unknown-live-binding") {
+    return "Close the Pi session using this conversation before deleting its saved file";
+  }
+  if (reason === "stale-catalog" || reason === "unknown-row") {
+    return "The saved list changed; reopen Saved conversations before deleting";
+  }
+  if (reason === "replaced-file" || reason === "malformed-header") {
+    return "The saved file changed since it was listed; no file was deleted";
+  }
+  return "The saved file is unavailable or unsafe; no file was deleted";
+}
+
+function savedDeletionFailureMessage(result: SavedSessionDeletionResult): string {
+  if (result.refusal !== undefined) {
+    const reason = result.refusal as SavedSessionDeletionRefusalReason;
+    const notice = savedDeletionRefusalNotice(reason);
+    return result.error === undefined ? notice : `${notice} (${result.error})`;
+  }
+  return result.error === undefined
+    ? "The saved conversation was not deleted"
+    : `The saved conversation was not deleted: ${result.error}`;
+}
+
 function statusRegistrar(broker: StatusBroker): StatusRegistrar {
   return {
     register(instanceId, handlers) {
@@ -455,6 +510,16 @@ function statusRegistrar(broker: StatusBroker): StatusRegistrar {
 }
 
 function toSidebarItem(view: NativeInstanceView): SidebarItem {
+  const current = view.nativeSession;
+  // The authenticated current-file observation is private guard data. Never
+  // let it cross into the sidebar DTO even if a manager implementation passes
+  // the protocol object through unchanged.
+  const nativeSession = current === null ? null : {
+    sessionId: current.sessionId,
+    epoch: current.epoch,
+    name: current.name,
+    ...(current.persistence === undefined ? {} : { persistence: current.persistence }),
+  };
   const item: SidebarItem = {
     id: view.id,
     label: view.label,
@@ -470,7 +535,7 @@ function toSidebarItem(view: NativeInstanceView): SidebarItem {
     activeTasks: view.activeTasks ?? null,
     activeShells: view.activeShells ?? null,
     activity: view.activity,
-    nativeSession: view.nativeSession,
+    nativeSession,
   };
   if (view.exitCode !== undefined) {
     return { ...item, exitCode: view.exitCode };
@@ -494,6 +559,7 @@ function productionDependencies(): MainDependencies {
     createManager: (options) => new InstanceManager(options),
     createSidebar: (options) => new SidebarController(options),
     listSavedCatalog: listSavedSessions,
+    deleteSavedFile: deleteSavedSessionFile,
     openHostState: openProductionHostState,
     readHostShortcutConfig,
     writeHostShortcutConfig,
@@ -601,6 +667,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let layout: HostLayout | undefined;
   let displayedMousePresentation: MouseFramePresentation | undefined;
   let latestMousePresentation: MouseFramePresentation | undefined;
+  let savedDeleteConfirmationFrame: SavedDeleteConfirmationFrame | undefined;
   let lastNativeCols: number | undefined;
   let lastNativeRows: number | undefined;
   let resizeInProgress = false;
@@ -641,6 +708,8 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   // catalog mints admissions; listing controllers are aborted on dismiss and
   // shutdown so late completions never contribute.
   let savedCatalog: SavedSessionCatalog | undefined;
+  let savedCatalogPickerId: number | undefined;
+  let savedCatalogRequestId: number | undefined;
   const savedListControllers = new Map<number, AbortController>();
   const savedOpenTasks = new Set<Promise<void>>();
   const deferredSavedOpens = new Map<number, { readonly file: string; readonly sessionId: string }>();
@@ -770,7 +839,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         const currentLayout = computeHostLayout(cols, rows, {
           sidebarVisible: sidebar.visible,
           focus: sidebarFocus(sidebar.focus),
+          savedDeleteConfirmation: sidebar.savedDeleteConfirmationActive,
         });
+        savedDeleteConfirmationFrame = undefined;
+        sidebar.invalidateSavedDeleteConfirmationDisplay();
         layout = currentLayout;
         const view = findActiveView();
         const surface = view ? manager?.surface(view.id) : undefined;
@@ -781,9 +853,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             cursor: { ...mainFrame.cursor, visible: false },
           };
         }
-        // Wide layout with the form open: the roster stays in the left pane
-        // while the form temporarily replaces the native (right) pane. Narrow
-        // overlays and every other focus render a single sidebar-owned pane.
+        // Wide layout with the form or Saved-delete warning open: the roster
+        // stays left while that content temporarily replaces the native
+        // right pane. Narrow overlays and every other focus render a single
+        // sidebar-owned pane.
         const focus = sidebarFocus(sidebar.focus);
         let sidebarFrame: RenderedSidebar = { lines: [] };
         let formFrame: RenderedSidebar | undefined;
@@ -791,6 +864,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           if (focus === "form" && currentLayout.form !== undefined) {
             sidebarFrame = sidebar.renderRoster(currentLayout.sidebar.cols, currentLayout.sidebar.rows);
             formFrame = sidebar.renderForm(currentLayout.form.cols, currentLayout.form.rows);
+          } else if (focus === "confirm" && sidebar.savedDeleteConfirmationActive
+            && currentLayout.form !== undefined) {
+            sidebarFrame = sidebar.renderRoster(currentLayout.sidebar.cols, currentLayout.sidebar.rows);
+            formFrame = sidebar.renderSavedDeleteConfirmation(currentLayout.form.cols, currentLayout.form.rows);
           } else {
             sidebarFrame = sidebar.render(currentLayout.sidebar.cols, currentLayout.sidebar.rows);
           }
@@ -807,6 +884,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         const nativeGraphics = nativeOwnerId !== undefined && mainFrame?.graphics !== undefined
           ? { ownerId: nativeOwnerId, pane: currentLayout.native, frame: mainFrame.graphics }
           : undefined;
+        const savedDeleteRenderToken = sidebar.savedDeleteConfirmationRenderTokenNumber;
         // Title only. Lifecycle, activity and input ownership belong below
         // session-card titles, never on the active conversation's title line.
         const header = view ? view.label : "Session host";
@@ -834,13 +912,56 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           writer.invalidate?.();
         }
         latestMousePresentation = mousePresentation;
+        const activeSidebar = sidebar;
+        const confirmationFrame: SavedDeleteConfirmationFrame | undefined = savedDeleteRenderToken === undefined
+          ? undefined
+          : { renderToken: savedDeleteRenderToken, cols, rows, settled: false };
+        savedDeleteConfirmationFrame = confirmationFrame;
         writer.submit(composed, cols, rows, (disposition: SessionHostFrameDisposition) => {
           if (disposition === "written") displayedMousePresentation = mousePresentation;
+          if (confirmationFrame === undefined || savedDeleteConfirmationFrame !== confirmationFrame) return;
+          if (!isCurrentSavedDeleteConfirmationFrame(confirmationFrame)) {
+            invalidateSavedDeleteConfirmationDisplay();
+            return;
+          }
+          if (activeSidebar.settleSavedDeleteConfirmationRender(confirmationFrame.renderToken)) {
+            confirmationFrame.settled = true;
+          }
         });
       } catch {
         requestShutdown(true);
       }
     });
+  }
+
+  /** Revoke confirmation authority synchronously before any Saved target or geometry invalidation. */
+  function invalidateSavedDeleteConfirmationDisplay(): void {
+    savedDeleteConfirmationFrame = undefined;
+    sidebar?.invalidateSavedDeleteConfirmationDisplay();
+  }
+
+  function isCurrentSavedDeleteConfirmationFrame(frame: SavedDeleteConfirmationFrame): boolean {
+    return terminal !== undefined && sidebar !== undefined && sidebar.visible && sidebar.focus === "confirm"
+      && clampDimension(terminal.columns, 80) === frame.cols
+      && clampDimension(terminal.rows, 24) === frame.rows
+      && sidebar.isSavedDeleteConfirmationRenderCurrent(frame.renderToken);
+  }
+
+  function hasSettledSavedDeleteConfirmationFrame(): boolean {
+    const frame = savedDeleteConfirmationFrame;
+    if (!frame) return false;
+    if (!isCurrentSavedDeleteConfirmationFrame(frame)) {
+      if (savedDeleteConfirmationFrame === frame) invalidateSavedDeleteConfirmationDisplay();
+      return false;
+    }
+    return frame.settled;
+  }
+
+  /** Revoke old draw-derived mouse authority before picker rows/query change. */
+  function invalidateMouseAuthorization(): void {
+    displayedMousePresentation = undefined;
+    latestMousePresentation = undefined;
+    writer?.invalidate?.();
   }
 
   function createFrameWriter(): MainWriter {
@@ -1231,6 +1352,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       const next = computeHostLayout(cols, rows, {
         sidebarVisible: sidebar.visible,
         focus: sidebarFocus(sidebar.focus),
+        savedDeleteConfirmation: sidebar.savedDeleteConfirmationActive,
       });
       layout = next;
       const changed = next.native.cols !== lastNativeCols || next.native.rows !== lastNativeRows;
@@ -1317,7 +1439,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const pane = formPane ?? sidebarPane;
     if (pane !== undefined) {
       if (isMouseButtonPress(mouse) && buttonId !== undefined) hostMouseButtons.add(buttonId);
-      if (isLeftMousePress(mouse) && presentation !== undefined && !hitMapPending) {
+      const savedDeleteDialogOwnsPointer = presentation?.focus === "confirm"
+        && presentation.layout.form !== undefined;
+      if (isLeftMousePress(mouse) && presentation !== undefined && !hitMapPending
+        && !savedDeleteDialogOwnsPointer) {
         const previousFocus = sidebar.focus;
         const previousSelection = sidebar.selectedId;
         const previousVisibility = sidebar.visible;
@@ -1403,6 +1528,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   }
 
   function handleTerminalResize(): void {
+    invalidateSavedDeleteConfirmationDisplay();
     // A real outer resize can reflow the physical screen and then return to
     // the same final geometry before the next coalesced redraw (for example
     // 80 -> 40 -> 80). Invalidate the known baseline before recomputing so the
@@ -1593,11 +1719,15 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
    */
   function launchSavedOpen(requestId: number, file: string, sessionId: string): void {
     if (!manager || !sidebar || shutdownRequested) return;
+    const pickerId = sidebar.savedPickerRequestId;
     const catalog = savedCatalog;
-    const row = catalog === undefined ? undefined : catalog.rows.find(
+    const row = catalog === undefined || pickerId === undefined || savedCatalogPickerId !== pickerId
+      ? undefined
+      : catalog.rows.find(
       (candidate) => candidate.file === file && candidate.id === sessionId,
     );
-    if (catalog === undefined || row === undefined) {
+    if (catalog === undefined || row === undefined || savedCatalogRequestId === undefined
+      || !searchSavedSessions(catalog, sidebar.savedQuery).includes(row)) {
       sidebar.failSavedOpen(requestId, "That saved conversation is no longer available; reopen the list");
       scheduleRedraw();
       return;
@@ -1644,6 +1774,73 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       }
     })();
     savedOpenTasks.add(task);
+  }
+
+  /** List or refresh one active picker, retaining only its newest branded catalog. */
+  function startSavedCatalogList(requestId: number, pickerId: number): void {
+    const owner = manager;
+    const activeSidebar = sidebar;
+    const activePi = pi;
+    const agentDir = sessionSetup?.nativeAgentDir;
+    if (!activeSidebar || shutdownRequested) return;
+    invalidateSavedDeleteConfirmationDisplay();
+    if (!owner || !activePi || !agentDir) {
+      activeSidebar.failSavedList(requestId, SAVED_UNAVAILABLE);
+      scheduleRedraw();
+      return;
+    }
+
+    for (const controller of savedListControllers.values()) {
+      try { controller.abort(); } catch { /* best-effort cancellation of the exact old listing */ }
+    }
+    savedListControllers.clear();
+    savedCatalog = undefined;
+    savedCatalogPickerId = undefined;
+    savedCatalogRequestId = requestId;
+    invalidateMouseAuthorization();
+
+    const controller = new AbortController();
+    savedListControllers.set(requestId, controller);
+    let listing: Promise<SavedSessionCatalog>;
+    try {
+      listing = dependencies.listSavedCatalog({
+        agentDir,
+        piExecutable: activePi.file,
+        expectedPiVersion: activePi.version,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      listing = Promise.reject(error);
+    }
+    void Promise.resolve(listing).then(
+      (catalog) => {
+        savedListControllers.delete(requestId);
+        if (controller.signal.aborted || shutdownRequested || manager !== owner || sidebar !== activeSidebar
+          || activeSidebar.savedPickerRequestId !== pickerId) return;
+        const filtered = searchSavedSessions(catalog, activeSidebar.savedQuery);
+        const accepted = activeSidebar.completeSavedList(
+          requestId,
+          filtered.map((row) => ({ id: row.id, file: row.file, caption: row.caption, cwd: row.cwd })),
+          catalog.issueCount,
+          pickerId,
+        );
+        if (accepted) {
+          savedCatalog = catalog;
+          savedCatalogPickerId = pickerId;
+          savedCatalogRequestId = requestId;
+          invalidateMouseAuthorization();
+        }
+        scheduleRedraw();
+      },
+      () => {
+        savedListControllers.delete(requestId);
+        if (controller.signal.aborted || shutdownRequested || manager !== owner || sidebar !== activeSidebar
+          || activeSidebar.savedPickerRequestId !== pickerId) return;
+        activeSidebar.failSavedList(requestId, SAVED_UNAVAILABLE);
+        invalidateMouseAuthorization();
+        scheduleRedraw();
+      },
+    );
   }
 
   /**
@@ -2167,46 +2364,133 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         launchRowStop(action.id, action.confirmed);
         return;
       case "saved-list": {
-        if (!manager || !sidebar || !pi || !sessionSetup) return;
-        const agentDir = sessionSetup.nativeAgentDir;
-        if (agentDir === undefined || agentDir === "") {
-          sidebar.failSavedList(action.requestId, SAVED_UNAVAILABLE);
+        if (!sidebar || sidebar.savedPickerRequestId !== action.requestId) return;
+        startSavedCatalogList(action.requestId, action.requestId);
+        reconcileLayout(true);
+        scheduleRedraw();
+        return;
+      }
+      case "saved-refresh":
+        if (!sidebar || sidebar.savedPickerRequestId !== action.pickerId) return;
+        startSavedCatalogList(action.requestId, action.pickerId);
+        scheduleRedraw();
+        return;
+      case "saved-search": {
+        const activeSidebar = sidebar;
+        const catalog = savedCatalog;
+        if (!activeSidebar || activeSidebar.savedPickerRequestId !== action.pickerId
+          || action.revision !== activeSidebar.savedQueryRevisionNumber
+          || action.query !== activeSidebar.savedQuery
+          || !isSavedSessionCatalog(catalog) || savedCatalogPickerId !== action.pickerId
+          || savedCatalogRequestId === undefined) return;
+        invalidateSavedDeleteConfirmationDisplay();
+        const filtered = searchSavedSessions(catalog, action.query);
+        invalidateMouseAuthorization();
+        activeSidebar.completeSavedSearch(
+          action.pickerId,
+          action.revision,
+          filtered.map((row) => ({ id: row.id, file: row.file, caption: row.caption, cwd: row.cwd })),
+        );
+        scheduleRedraw();
+        return;
+      }
+      case "saved-dismiss": {
+        if (sidebar?.savedPickerRequestId !== action.pickerId) return;
+        invalidateSavedDeleteConfirmationDisplay();
+        if (savedCatalogPickerId === action.pickerId) {
+          savedCatalog = undefined;
+          savedCatalogPickerId = undefined;
+          savedCatalogRequestId = undefined;
+        }
+        for (const [requestId, controller] of savedListControllers) {
+          try { controller.abort(); } catch { /* exact picker listings are best-effort canceled */ }
+          savedListControllers.delete(requestId);
+        }
+        invalidateMouseAuthorization();
+        return;
+      }
+      case "saved-delete-prepare": {
+        invalidateSavedDeleteConfirmationDisplay();
+        invalidateMouseAuthorization();
+        const activeSidebar = sidebar;
+        const owner = manager;
+        const catalog = savedCatalog;
+        let allowed = false;
+        let message = "The saved conversation is no longer available; reopen the picker";
+        const currentRequest = activeSidebar?.isSavedDeletePreparationCurrent(
+          action.requestId, action.pickerId, action.id, action.file, action.revision,
+        ) === true && activeSidebar?.savedPickerRequestId === action.pickerId;
+        if (activeSidebar && currentRequest) {
+          if (owner && isSavedSessionCatalog(catalog) && savedCatalogPickerId === action.pickerId
+            && savedCatalogRequestId !== undefined) {
+            const row = catalog.rows.find((candidate) => candidate.id === action.id && candidate.file === action.file);
+            if (row !== undefined && searchSavedSessions(catalog, activeSidebar.savedQuery).includes(row)) {
+              let refusal: SavedSessionDeletionRefusalReason | undefined;
+              try {
+                refusal = validateOwnedSavedSessionDeletion(owner, catalog, row);
+              } catch {
+                refusal = "unknown-live-binding";
+              }
+              if (refusal === undefined) {
+                allowed = true;
+                message = "";
+              } else {
+                message = savedDeletionRefusalNotice(refusal);
+              }
+            }
+          }
+          activeSidebar.completeSavedDeleteCheck(action.requestId, allowed, message);
+        }
+        scheduleRedraw();
+        return;
+      }
+      case "saved-delete": {
+        const activeSidebar = sidebar;
+        const owner = manager;
+        const catalog = savedCatalog;
+        if (!activeSidebar || !owner || !activeSidebar.isSavedDeleteConfirmationCurrent(
+          action.requestId, action.pickerId, action.id, action.file, action.revision,
+        ) || !hasSettledSavedDeleteConfirmationFrame()) return;
+        if (!isSavedSessionCatalog(catalog) || savedCatalogPickerId !== action.pickerId
+          || savedCatalogRequestId === undefined) {
+          activeSidebar.completeSavedDelete(action.requestId, "The saved list changed; no file was deleted", false);
           scheduleRedraw();
           return;
         }
-        const controller = new AbortController();
-        savedListControllers.set(action.requestId, controller);
-        void dependencies.listSavedCatalog({
-          agentDir,
-          piExecutable: pi.file,
-          expectedPiVersion: pi.version,
-          signal: controller.signal,
-        }).then(
-          (catalog) => {
-            savedListControllers.delete(action.requestId);
-            if (shutdownRequested || !sidebar) return;
-            const accepted = sidebar.completeSavedList(
-              action.requestId,
-              // Display metadata only: the exact recorded workspace (header
-              // cwd) flows to the picker's single-line summary and details.
-              // Admission always revalidates the raw catalog row, never this.
-              catalog.rows.map((row) => ({ id: row.id, file: row.file, caption: row.caption, cwd: row.cwd })),
-              catalog.issueCount,
-            );
-            if (accepted) savedCatalog = catalog;
-            scheduleRedraw();
-          },
-          () => {
-            savedListControllers.delete(action.requestId);
-            if (shutdownRequested || !sidebar) return;
-            // A dismissed or shut-down listing is fenced by the sidebar's own
-            // requestId; an aborted signal never renders as a failure notice.
-            if (controller.signal.aborted) return;
-            sidebar.failSavedList(action.requestId, SAVED_UNAVAILABLE);
-            scheduleRedraw();
-          },
-        );
-        reconcileLayout(true);
+        const row = catalog.rows.find((candidate) => candidate.id === action.id && candidate.file === action.file);
+        if (row === undefined || !searchSavedSessions(catalog, activeSidebar.savedQuery).includes(row)) {
+          activeSidebar.completeSavedDelete(action.requestId, "The selected saved conversation is no longer in this query; no file was deleted", false);
+          scheduleRedraw();
+          return;
+        }
+        const expectedCatalogRequestId = savedCatalogRequestId;
+        const validate = (): string | undefined => {
+          if (shutdownRequested || manager !== owner || sidebar !== activeSidebar
+            || activeSidebar.savedPickerRequestId !== action.pickerId
+            || !activeSidebar.isSavedDeleteConfirmationCurrent(
+              action.requestId, action.pickerId, action.id, action.file, action.revision,
+            ) || !hasSettledSavedDeleteConfirmationFrame()
+            || savedCatalog !== catalog || savedCatalogPickerId !== action.pickerId
+            || savedCatalogRequestId !== expectedCatalogRequestId
+            || !searchSavedSessions(catalog, activeSidebar.savedQuery).includes(row)) {
+            return "stale-catalog";
+          }
+          try {
+            return validateOwnedSavedSessionDeletion(owner, catalog, row);
+          } catch {
+            return "unknown-live-binding";
+          }
+        };
+        let result: SavedSessionDeletionResult;
+        try {
+          result = dependencies.deleteSavedFile(row.file, { validate });
+        } catch {
+          result = { ok: false, method: "unlink", error: "saved conversation could not be deleted" };
+        }
+        const message = result.ok
+          ? result.method === "trash" ? "Saved conversation moved to trash" : "Saved conversation permanently deleted"
+          : savedDeletionFailureMessage(result);
+        activeSidebar.completeSavedDelete(action.requestId, message, result.ok);
         scheduleRedraw();
         return;
       }
@@ -2262,6 +2546,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         return;
       }
       case "visibility":
+        invalidateSavedDeleteConfirmationDisplay();
         reconcileLayout(true);
         syncOuterMouseModes();
         scheduleRedraw();
@@ -2281,6 +2566,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     shutdownPromise = Promise.resolve();
     shutdownRequested = true;
     hostMouseButtons.clear();
+    savedCatalog = undefined;
+    savedCatalogPickerId = undefined;
+    savedCatalogRequestId = undefined;
+    invalidateSavedDeleteConfirmationDisplay();
+    sidebar?.disposeSavedPicker();
+    invalidateMouseAuthorization();
     deferredCreates.clear();
     deferredSavedOpens.clear();
     deferredRowResumes.clear();
@@ -2626,13 +2917,21 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       settingsAvailable: hostShortcutAgentDir !== undefined,
       workspaceBasePath: snapshot.startupCwd,
       createTextField,
+      createSavedQueryInput: () => {
+        if (!activeSessionSetup.nativeAgentDir) throw new Error("native Pi agent directory is unavailable");
+        return createNativeSavedQueryInput(activeSessionSetup.nativeAgentDir);
+      },
       initialVisible: true,
       onAction: handleSidebarAction,
-      onInvalidate: scheduleRedraw,
+      onInvalidate: () => {
+        invalidateSavedDeleteConfirmationDisplay();
+        scheduleRedraw();
+      },
     });
     layout = computeHostLayout(initialCols, initialRows, {
       sidebarVisible: sidebar.visible,
       focus: sidebarFocus(sidebar.focus),
+      savedDeleteConfirmation: sidebar.savedDeleteConfirmationActive,
     });
     lastNativeCols = layout.native.cols;
     lastNativeRows = layout.native.rows;
@@ -2721,6 +3020,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
 export const __test = Object.freeze({
   /** Production broker-to-manager adapter, exposed only for wiring regressions. */
   statusRegistrar,
+  /** Exact production deletion-ownership snapshot wrapper, for wiring regressions. */
+  savedDeletionOwnedSessions,
+  /** Exact production deletion preflight, including owned binding data. */
+  validateOwnedSavedSessionDeletion,
   /** Pure readiness decision exposed for source regressions (no runtime effect). */
   rowResumeReadiness: (
     view: NativeInstanceView | undefined,

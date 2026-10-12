@@ -17,6 +17,7 @@ import {
 	MAX_SESSION_SPAWN_PROMPT_BYTES,
 	MAX_SESSION_SPAWN_TITLE_BYTES,
 	isValidNativeSessionId,
+	isValidNativeSessionFile,
 	isValidRenameName,
 	type SessionHostNativeSession,
 	type SessionSpawnInput,
@@ -367,6 +368,8 @@ interface ManagedInstance {
 	 * observed binding (native /new or /resume); never a UI badge.
 	 */
 	knownNativeSessionId?: string;
+	/** Fresh current-file observation only; revoked on every unavailable binding/disconnect. */
+	currentNativeSessionFile?: string;
 	registration?: InstanceStatusRegistration;
 	registrationReleased: boolean;
 	/**
@@ -585,10 +588,25 @@ function validatedNativeSession(value: unknown): SessionHostNativeSession | null
 		|| candidate.name.trim().length === 0 || candidate.name.trim() !== candidate.name
 		|| [...candidate.name].length > 256 || Buffer.byteLength(candidate.name, "utf8") > 1024
 		|| /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(candidate.name)) return undefined;
-	return {
+	const session: SessionHostNativeSession = {
 		sessionId: candidate.sessionId, epoch: candidate.epoch as number, name: candidate.name,
 		...(candidate.persistence === "saved" || candidate.persistence === "unsaved" || candidate.persistence === "unknown"
 			? { persistence: candidate.persistence } : {}),
+	};
+	const currentFile = candidate.currentFile;
+	return {
+		...session,
+		...(isValidNativeSessionFile(currentFile) ? { currentFile } : {}),
+	};
+}
+
+/** Presentation/roster copy: private current-file authority never leaves the manager's deletion guard. */
+function nativeSessionForPresentation(value: SessionHostNativeSession): SessionHostNativeSession {
+	return {
+		sessionId: value.sessionId,
+		epoch: value.epoch,
+		name: value.name,
+		...(value.persistence === undefined ? {} : { persistence: value.persistence }),
 	};
 }
 
@@ -693,8 +711,8 @@ export class InstanceManager {
 			const view: NativeInstanceView & { exitCode?: number; error?: string } = {
 				id: record.id,
 				label: record.label,
-				nativeSession: record.nativeSession ? Object.freeze({ ...record.nativeSession }) : null,
-				...(record.lastNativeSession ? { lastNativeSession: Object.freeze({ ...record.lastNativeSession }) } : {}),
+				nativeSession: record.nativeSession ? Object.freeze(nativeSessionForPresentation(record.nativeSession)) : null,
+				...(record.lastNativeSession ? { lastNativeSession: Object.freeze(nativeSessionForPresentation(record.lastNativeSession)) } : {}),
 				workspace: record.workspace,
 				agentDir: record.agentDir,
 				lifecycle: record.lifecycle,
@@ -970,26 +988,42 @@ export class InstanceManager {
 	}
 
 	/**
-	 * Known-owned live native session data for deliberate saved-conversation
-	 * duplicate fencing (issue 323): the last-observed current conversation id
-	 * of every live row plus admitted saved-session reservations, including
-	 * pending creations. Data only — no process discovery, scan, daemon, or
-	 * lock. Exited and removed rows contribute nothing.
+	 * Known-owned bindings for saved-conversation admission and deletion
+	 * fencing: separately tagged current ID/file observations, exact admitted
+	 * reservations (including pending creations), and historical ID-only
+	 * launch fences. Data only — no process discovery, scan, daemon, or lock.
+	 * Exited and removed rows contribute nothing.
 	 */
 	ownedLiveSessions(): readonly OwnedLiveSession[] {
 		const sessions: OwnedLiveSession[] = [];
 		for (const record of this.#records.values()) {
 			const live = Boolean(record.pty && !record.ptyExited);
 			if (!live && record.savedReservation === undefined) continue;
-			const entry: OwnedLiveSession = {};
 			if (record.savedReservation !== undefined) {
-				entry.id = record.savedReservation.sessionId;
-				entry.file = record.savedReservation.file;
+				// Keep the initial exact admission as its own paired binding. It is
+				// never reused as the current native file after /new or /resume.
+				sessions.push({
+					kind: "reservation",
+					id: record.savedReservation.sessionId,
+					file: record.savedReservation.file,
+				});
 			}
-			if (live && record.knownNativeSessionId !== undefined) {
-				entry.id = record.knownNativeSessionId;
+			if (live) {
+				// Emit a current binding even when no native metadata/path is
+				// available: deletion then refuses instead of treating absence as
+				// evidence that this child is unrelated.
+				sessions.push({
+					kind: "current",
+					...(record.nativeSession ? { id: record.nativeSession.sessionId } : {}),
+					...(record.currentNativeSessionFile === undefined ? {} : { file: record.currentNativeSessionFile }),
+				});
+				// Preserve the historical ID duplicate fence for launch admission,
+				// but never present that retained ID as deletion evidence.
+				if (record.knownNativeSessionId !== undefined
+					&& record.knownNativeSessionId !== record.nativeSession?.sessionId) {
+					sessions.push({ kind: "known-id", id: record.knownNativeSessionId });
+				}
 			}
-			sessions.push(entry);
 		}
 		return sessions;
 	}
@@ -1548,36 +1582,45 @@ export class InstanceManager {
 			const previous = record.lastNativeSession ?? record.nativeSession;
 			if (next === null) {
 				record.nativeSession = null;
+				record.currentNativeSessionFile = undefined;
 				record.label = "(session name unavailable)";
 			} else if (next !== undefined) {
-				if (previous && (next.epoch < previous.epoch
-					|| (next.sessionId !== previous.sessionId && next.epoch <= previous.epoch))) {
+				const { currentFile, ...nextSession } = next;
+				if (previous && (nextSession.epoch < previous.epoch
+					|| (nextSession.sessionId !== previous.sessionId && nextSession.epoch <= previous.epoch))) {
 					record.nativeSession = null;
+					record.currentNativeSessionFile = undefined;
 					record.label = "(session name unavailable)";
 				} else {
 					// Never forget positive saved evidence for the SAME current binding.
-					if (previous?.sessionId === next.sessionId && previous.persistence === "saved") next.persistence = "saved";
-					record.nativeSession = next;
-					record.lastNativeSession = { ...next };
-					record.label = next.name;
+					if (previous?.sessionId === nextSession.sessionId && previous.persistence === "saved") nextSession.persistence = "saved";
+					record.nativeSession = nextSession;
+					record.lastNativeSession = { ...nextSession };
+					record.currentNativeSessionFile = currentFile;
+					record.label = nextSession.name;
 					// Private duplicate-fencing binding: the CURRENT observed
 					// conversation replaces any older one (native /new or
 					// /resume) and is retained across later disconnects.
-					record.knownNativeSessionId = next.sessionId;
+					record.knownNativeSessionId = nextSession.sessionId;
 					// A valid newer binding that supersedes the initial saved
 					// conversation releases its reservation: this row no longer
 					// represents that saved file, so the conversation can be
 					// opened again while the new binding stays fenced. Pending
 					// (unobserved) reservations are untouched.
 					if (record.savedReservation !== undefined
-						&& record.savedReservation.sessionId !== next.sessionId) {
+						&& record.savedReservation.sessionId !== nextSession.sessionId) {
 						record.savedReservation = undefined;
 					}
 				}
 			} else {
 				record.nativeSession = null;
+				record.currentNativeSessionFile = undefined;
 				record.label = "(session name unavailable)";
 			}
+		} else {
+			// An older reporter cannot refresh current-file authority. Keep prior
+			// display/duplicate metadata, but revoke its path observation.
+			record.currentNativeSessionFile = undefined;
 		}
 		this.#safeChanged(record.id);
 	}
@@ -1598,6 +1641,7 @@ export class InstanceManager {
 		record.activeShells = null;
 		record.activity = [];
 		record.nativeSession = null;
+		record.currentNativeSessionFile = undefined;
 		record.label = "(session name unavailable)";
 		this.#safeChanged(record.id);
 	}

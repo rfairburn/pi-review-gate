@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { extractInputSource, extractInputText, extractSignal, isEscapeTerminalInput, onTerminalInput } from "../src/pi";
+import { captureSessionNotice, extractInputSource, extractInputText, extractSignal, isEscapeTerminalInput, onTerminalInput } from "../src/pi";
 import { createState, rememberUserRequest } from "../src/state";
 
 test("extractInputSource reads pi input event source", () => {
@@ -102,6 +102,20 @@ test("onTerminalInput survives a throwing registration target and reports unavai
 
   // No eligible target left: return undefined (interception unavailable) instead of throwing.
   assert.equal(onTerminalInput({ ui: throwingUi }, handler), undefined);
+});
+
+test("captured session notices use the event UI and suppress a late retired-owner notice", async () => {
+  const pi = { on() {} };
+  const notices: string[] = [];
+  let currentEpoch = 7;
+  const context = { ui: { notify: (message: string) => notices.push(message) } };
+  const notify = captureSessionNotice(pi, context, () => currentEpoch === 7);
+
+  await notify("restore failure is visible through the event context");
+  currentEpoch += 1;
+  await notify("this late error belongs to the retired session");
+
+  assert.deepEqual(notices, ["restore failure is visible through the event context"]);
 });
 
 test("extension follow-up input should not reset correction cycle state", () => {

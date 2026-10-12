@@ -130,6 +130,7 @@ async function makePackageFixture(prefix = "pi-native-host-pkg", ownership?: Fix
     join(packageRoot, "skills", "pi-review-gate-orchestrator", "references"),
     join(packageRoot, "skills", "pi-review-gate-execution"),
     join(packageRoot, "skills", "pi-review-gate-research"),
+    join(packageRoot, "skills", "pi-review-gate-completion"),
   ];
   if (ownership) {
     // Ownership path: create one level at a time (exclusive) and record each
@@ -164,6 +165,8 @@ async function makePackageFixture(prefix = "pi-native-host-pkg", ownership?: Fix
   track(join(packageRoot, "skills", "pi-review-gate-execution", "SKILL.md"));
   await writeFile(join(packageRoot, "skills", "pi-review-gate-research", "SKILL.md"), "research skill\n", "utf8");
   track(join(packageRoot, "skills", "pi-review-gate-research", "SKILL.md"));
+  await writeFile(join(packageRoot, "skills", "pi-review-gate-completion", "SKILL.md"), "completion skill\n", "utf8");
+  track(join(packageRoot, "skills", "pi-review-gate-completion", "SKILL.md"));
   const configPath = join(agentDir, "review-gate.json");
   await writeFile(configPath, JSON.stringify({ enabled: true, review: { activeReviewers: [] } }), "utf8");
   track(configPath);

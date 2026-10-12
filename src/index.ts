@@ -17,7 +17,7 @@ import {
   shouldRecordToolCallEvidence,
   shouldRecordToolResultEvidence,
 } from "./evidence";
-import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractToolArgs, extractToolName, sendNotice, setStatus, type HookHandler } from "./pi";
+import { registerHook, captureSessionNotice, extractContext, extractCwd, extractInputSource, extractInputText, extractToolArgs, extractToolName, sendNotice, setStatus, type HookHandler } from "./pi";
 import { createReviewCancellationCoordinator } from "./review-cancellation";
 import {
   beginAgentRun,
@@ -47,6 +47,7 @@ import {
 import { boundPath, handleCwdMismatchRestore, safeRestoreFailureDiagnostic, sendNoticeUnlessItThrows } from "./activation/diagnostics";
 import { createSessionPersistence } from "./activation/persistence";
 import { deferredToolPromptInjection, executionPromptInjection, extractSystemPrompt } from "./activation/prompt-composition";
+import { buildCompletionGuidancePrompt, resolveCompletionSkillPath } from "./activation/completion-guidance";
 import { capturePrimaryCodemodeDefault } from "./activation/primary-codemode-default";
 import { recoverPendingModelDeliveries, releaseQueuedUserInputs } from "./activation/pending-delivery";
 import { createReviewTurnCoordinator, isToolError } from "./activation/review-turn";
@@ -57,6 +58,8 @@ import { DeferredToolManager, isDeferredToolHost } from "./deferred-tools";
 import { loadOperatingModeSegments, OPERATING_MODE_LABELS } from "./operating-mode";
 import { registerModeCycleShortcut } from "./mode-cycle";
 import { contextIsInteractiveTui, registerUserQuestions, userQuestionsBeginSession, userQuestionsEndSession } from "./user-question";
+import { YOU_SHOULD_KNOW_TOOL_NAME } from "./user-question/notice-tool";
+import { registerSafeMarkdownDisplayTransformer } from "./markdown-safety";
 import { getSessionHostSpawnCapability } from "./session-host/spawn-capability";
 import { registerSessionSpawnTool } from "./session-host/spawn-tool";
 import { consumeSessionHostStartupRequest } from "./session-host/startup-request";
@@ -106,6 +109,7 @@ interface ActivationDependencies {
 }
 
 export async function activate(pi: unknown, dependencies: ActivationDependencies = {}): Promise<void> {
+  registerSafeMarkdownDisplayTransformer(pi);
   // Capture wrapper intent and consume its one-shot environment marker before
   // any await, tool registration, or model-spawned subprocess can inherit it.
   const executorRole = process.env.PI_REVIEW_GATE_RUNTIME_ROLE === "executor";
@@ -321,15 +325,21 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   // session's boundary. Late registration keeps Pi's load-time replaceable-
   // builtin collision pass from seeing a competing tool_search definition, and
   // registerWithNativeSchema reuses the host-native parameter schema.
-  const deferredTools = new DeferredToolManager(pi, () => config.operatingMode, wrapperCodemodeDefault);
+  const deferredTools = new DeferredToolManager(
+    pi,
+    () => config.operatingMode,
+    wrapperCodemodeDefault,
+    (name) => name !== YOU_SHOULD_KNOW_TOOL_NAME || config.youShouldKnow?.enabled !== false,
+  );
   registerDeferredToolLifecycleHooks(pi, deferredTools);
 
-  // Pending questions (issue #95): AskUserQuestion registers before
-  // session_start so it enters the deferred-tool authorization boundary like
-  // every other top-level tool; the pending-question list shortcut and the
-  // persistent panel widget are registered here as well. Top level only — executor
-  // runtimes have no question UI surface.
-  const userQuestions = registerUserQuestions(pi);
+  // Pending questions and notices (issues #95/#295): both user-input tools
+  // register before session_start so they enter the same deferred-tool
+  // authorization boundary; the pending list shortcut and persistent panel
+  // widget are shared. Top level only — executor runtimes gain no input tool.
+  const userQuestions = registerUserQuestions(pi, {
+    isNoticeFeatureEnabled: () => config.youShouldKnow?.enabled !== false,
+  });
 
   // Issue #92: automatic notification consumers of unified expansion. The five
   // orchestrator-facing custom messages (subtask event/watch, background-shell
@@ -358,6 +368,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   state.checkpointScope = dependencies.initialCheckpointScope;
   let currentScopedModels: string[] = [];
   let sessionActive = true;
+  let sessionEpoch = 0;
   let checkpointRestartBlocked: string | undefined;
   const reviewCancellation = createReviewCancellationCoordinator();
   const sessionAbortController = new AbortController();
@@ -560,6 +571,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
 
   registerHook(pi, "session_shutdown", async (...args) => {
     nativeToolPreflight.reset();
+    sessionEpoch += 1;
     sessionActive = false;
     setStatus(extractContext(args) ?? pi, "review-gate", undefined);
     setStatus(extractContext(args) ?? pi, "review-gate-mode", undefined);
@@ -592,7 +604,12 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   });
 
   registerHook(pi, "session_start", async (...args) => {
+    const restoreSessionEpoch = ++sessionEpoch;
+    const context = extractContext(args);
+    const notifyRestore = captureSessionNotice(pi, context, () =>
+      sessionActive && sessionEpoch === restoreSessionEpoch);
     await dependencies.sessionStartInitializationTestBarrier?.();
+    if (sessionEpoch !== restoreSessionEpoch) return;
     // Issue #222: session boundaries reset orchestrator-turn correlation —
     // only runs of the CURRENT session may settle its deliveries.
     orchestratorTurnTracker.resetSession();
@@ -623,11 +640,10 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     reviewTurn.resetForSessionStart();
     updateScopedModels(args);
     executionTools.setScopedModels(currentScopedModels);
-    executionTools.setUiContext(extractContext(args) ?? pi);
+    executionTools.setUiContext(context ?? pi);
     discardSessionState(state);
     checkpointRestartBlocked = undefined;
     sessionPersistence.resetLedger();
-    const context = extractContext(args);
     // #301: raw checkpoints live in this live session's external namespace
     // under Pi's agent-data directory, for persisted and in-memory sessions
     // alike. The scope comes from the live session id, never from a session
@@ -651,6 +667,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     userQuestions?.noteContext(context);
     userQuestions?.syncPanel();
     const identity = sessionPersistenceIdentity(context, currentCwd);
+    const activityRestoreOptions = identity
+      ? { sessionOwner: JSON.stringify([identity.sessionId, identity.sessionFile, identity.cwd]) }
+      : {};
     const appendEntry = typeof pi === "object" && pi !== null && "appendEntry" in pi && typeof pi.appendEntry === "function"
       ? pi.appendEntry.bind(pi) as (customType: string, data: unknown) => void
       : undefined;
@@ -681,7 +700,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
               `review gate: previous review cannot resume (checkpoint ${restored.damagedCheckpointReason}); preserved prior state at ${boundPath(preserved)} and its owned records in place. Already-present edits become the new baseline; prior edits were not reviewed. Starting a fresh checkpoint without confirmation.`);
           }
           replaceReviewGateState(state, restored.state);
-          await executionTools.restoreAssociations(restored.execution);
+          await executionTools.restoreAssociations(restored.execution, activityRestoreOptions, notifyRestore);
           // Persisted windows never carry their frozen reviewer configuration;
           // they are re-frozen against the current settings. When the review
           // settings changed since the last save, reconcile by continuing with
@@ -722,7 +741,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
         } else {
           // A readable absence for this exact native session is an authoritative
           // empty association set, unlike the fallbacks below after restore failure.
-          await executionTools.restoreAssociations({ waveRoots: [], bundles: [], groupRoots: [] });
+          await executionTools.restoreAssociations({ waveRoots: [], bundles: [], groupRoots: [] }, activityRestoreOptions, notifyRestore);
         }
       } catch (error) {
         if (error instanceof SessionStateCwdMismatchError) {
@@ -737,10 +756,10 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
         }
         // Only after the store is guarded (or the sidecar already quarantined)
         // may any code path run that could persist state.
-        await executionTools.restoreAssociations({ waveRoots: [], bundles: [] }, { authoritative: false });
+        await executionTools.restoreAssociations({ waveRoots: [], bundles: [] }, { ...activityRestoreOptions, authoritative: false }, notifyRestore);
       }
     } else {
-      await executionTools.restoreAssociations({ waveRoots: [], bundles: [] }, { authoritative: false });
+      await executionTools.restoreAssociations({ waveRoots: [], bundles: [] }, { ...activityRestoreOptions, authoritative: false }, notifyRestore);
     }
     executionTools.sync();
     // Late loader registration: after every legitimately available top-level
@@ -901,7 +920,16 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   registerHook(pi, "before_agent_start", async (...args) => {
     const armed = await reviewTurn.armAgentRun(args);
     if (armed === "blocked") throw new Error(`review gate: fresh checkpoint restart failed (${checkpointRestartBlocked}); repair and restart before review`);
-    return executionPromptInjection(executionTools.criticalPrompt(), deferredTools.startupGuidance(), operatingModeSystemPrompt(args));
+    const authorizedToolGuidance = deferredTools.startupGuidance();
+    const completionGuidance = config.youShouldKnow?.enabled !== false
+      && config.youShouldKnow?.completionGuidance !== false
+      && deferredTools.isToolDiscoveryEligible(YOU_SHOULD_KNOW_TOOL_NAME)
+      ? buildCompletionGuidancePrompt(resolveCompletionSkillPath())
+      : undefined;
+    const promptGuidance = [authorizedToolGuidance, completionGuidance]
+      .filter((part): part is string => typeof part === "string" && part.length > 0)
+      .join("\n\n") || undefined;
+    return executionPromptInjection(executionTools.criticalPrompt(), promptGuidance, operatingModeSystemPrompt(args));
   });
 
   toolCallObserver = async (...args) => {

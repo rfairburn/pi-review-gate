@@ -160,8 +160,10 @@ test("the shortcut path acquires the host-wired editor before opening the list",
   register(fixture, "Which database?", ["SQLite"]);
 
   const opened = pressShortcut(fixture);
-  await until(() => fixture.instances.length === 1);
+  await until(() => fixture.instances.length >= 1);
+  assert.equal(fixture.instances.length, 1, "the host-owned field is the only editor created for the overlay");
   assert.equal(fixture.instances[0]!.getText(), "", "prepare(\"\") emptied the field after the host's draft capture");
+  assert.deepEqual(fixture.instances[0]!.render(80), [], "the ordinary prompt contributes no editor rows beneath the overlay");
   await until(() => fixture.component.current !== undefined);
 
   // Drive: answer view → free-text row → type → submit the whole answer.
@@ -170,12 +172,20 @@ test("the shortcut path acquires the host-wired editor before opening the list",
   component.handleInput!(DOWN); // Type something…
   component.handleInput!(ENTER); // start editing the native field
   for (const ch of "yes please") component.handleInput!(ch);
+  assert.equal(fixture.instances[0]!.getText(), "yes please", "the active host editor owns the answer draft");
+  assert.ok((component.render?.(80) ?? []).join("\n").includes("yes please"), "the popup renders the answer draft");
+  assert.deepEqual(fixture.instances[0]!.render(80), [],
+    "the ordinary prompt remains suppressed while the popup renders the same host-owned answer field");
+  assert.equal(fixture.instances.length, 1, "answer input never creates a second render-only editor");
   component.handleInput!(ENTER); // submit the whole answer
 
   await opened;
   assert.equal(fixture.sent.length, 1);
   assert.match(fixture.sent[0]!.message, /Answer to pending question "Which database\?": yes please/);
   assert.equal(fixture.state.draft, "chat draft", "the chat draft survived the round trip exactly once");
+  assert.equal(fixture.instances[0]!.getText(), "chat draft", "the original editor regains the exact independent draft");
+  assert.deepEqual(fixture.instances[0]!.render(80), ["─".repeat(80), "[field:chat draft]"],
+    "ordinary rendering returns after the overlay closes");
   assert.equal(fixture.state.slotFactory, undefined, "the prior (default) factory was restored in finally");
   assert.deepEqual(fixture.state.chatSubmits, [], "no chat message was sent");
 });
@@ -267,7 +277,7 @@ test("a stale session identity never opens another session's list", async () => 
   assert.equal(fixture.component.current, undefined, "the list never opened");
 });
 
-test("with no pending questions the shortcut only notifies", async () => {
+test("with no pending input the shortcut only notifies", async () => {
   const fixture = makeFixture();
 
   const opened = pressShortcut(fixture);
@@ -276,7 +286,7 @@ test("with no pending questions the shortcut only notifies", async () => {
   assert.equal(fixture.instances.length, 0);
   assert.equal(fixture.component.current, undefined, "the list never opened");
   assert.ok(
-    fixture.notices.some((n) => /no pending questions/i.test(n)),
+    fixture.notices.some((n) => /no pending input/i.test(n)),
     `an explicit notice is sent: ${JSON.stringify(fixture.notices)}`,
   );
 });

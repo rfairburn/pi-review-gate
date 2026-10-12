@@ -12,9 +12,14 @@ the checkout, not shipped in the npm package).
 - `tests/` — Node test files compiled to `dist-test/`.
 - `scripts/` — launcher, web CLI wrapper, DDGS provisioning, Playwright provisioning,
   package smoke, docs validation, fake reviewer, and the operating-mode prompt segments.
-- `skills/pi-review-gate-orchestrator/`, `skills/pi-review-gate-execution/`, `skills/pi-review-gate-research/` — the shipped skills (issue 151 namespacing)
-  refreshed by the launcher (orchestration with its recovery runbook, direct/delegated
-  execution, and read-only research).
+- `skills/pi-review-gate-orchestrator/`, `skills/pi-review-gate-execution/`,
+  `skills/pi-review-gate-research/`, and `skills/pi-review-gate-completion/` — shipped
+  skills refreshed by the launcher (orchestration with its recovery runbook,
+  direct/delegated execution, read-only research, and completion handoff). The completion
+  skill opts out of native automatic model invocation; the extension points to it only
+  when completion guidance and notice availability are enabled and live authorized
+  discovery exposes `YouShouldKnow`. Explicit `/skill:pi-review-gate-completion` use
+  remains available.
 - `examples/` — runnable JSON configs ([Getting started](getting-started.md#minimal-configuration)).
 - `docs/` — this documentation tree.
 - Root policy docs: `AGENTS.md` (agent orientation), [CONTRIBUTING](../CONTRIBUTING.md),
@@ -245,11 +250,13 @@ It also re-scans the source-only `.github/**` surface for private artifact refer
 - Runs `scripts/ensure-ddgs.sh` to create, validate, and repair the pinned web-search
   venv (creating or repairing it requires a `python3` interpreter on `PATH`; fails
   closed when the environment cannot be established).
-- Refreshes the discoverable shipped skills under
-  `~/.agents/skills/` — pi-review-gate-orchestrator (including its recovery runbook),
-  pi-review-gate-execution, and pi-review-gate-research — from the packaged
-  sources, then executes the installed `pi` with the extension, forwarding all
-  remaining arguments unchanged.
+- Refreshes the shipped skills under `~/.agents/skills/` — pi-review-gate-orchestrator
+  (including its recovery runbook), pi-review-gate-execution, pi-review-gate-research,
+  and pi-review-gate-completion — from packaged sources, then executes the installed
+  `pi` with the extension, forwarding all remaining arguments unchanged. The completion
+  skill remains explicitly invocable but is excluded from native automatic model routing;
+  the extension supplies its prompt only when both guidance settings are On and live
+  authorized discovery exposes `YouShouldKnow`.
 
 `scripts/pi-review-web.sh` similarly provisions DDGS, builds when sources are present,
 and executes `dist/src/web/cli.js`.
@@ -712,3 +719,8 @@ bridge (`src/stream-failure-report.ts`), consumed by both tool families
   copied. Only the headerless update application is retained from the upstream engine:
   create-file mode was removed with the legacy structured `operation` argument because
   canonical `*** Add File:` hunks carry their final content directly.
+- The saved-session search parser, matcher, and relevance ordering are adapted from
+  Pi Coding Agent v1.1.0 under the MIT License. See [NOTICE](../NOTICE) and
+  [LICENSES/MIT-pi-session-search.txt](../LICENSES/MIT-pi-session-search.txt). The
+  fuzzy matcher is imported from the pinned `pi-session-host-tui` dependency and is not
+  copied.

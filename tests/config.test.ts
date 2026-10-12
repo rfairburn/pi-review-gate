@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   BROWSER_PERMISSION_FIELDS,
+  DEFAULT_CONFIG,
   activeExternalExecutor,
   automaticReviewEnabled,
   deferredPiToolsEnabled,
@@ -195,6 +196,36 @@ test("native web resource limits accept exact caps and reject oversized values",
   assert.throws(() => normalizeConfig({ web: { fetch: { maxOutputChars: 1_000_000_000 } } }), /web\.fetch\.maxOutputChars must be between 1 and/);
   assert.throws(() => normalizeConfig({ web: { fetch: { cacheMaxBytes: 1_000_000_000 } } }), /web\.fetch\.cacheMaxBytes must be between 1 and/);
   assert.throws(() => normalizeConfig({ web: { fetch: { cacheMaxEntries: 1_000_000_000 } } }), /web\.fetch\.cacheMaxEntries must be between 1 and/);
+});
+
+test("YouShouldKnow notice availability and completion guidance are independent strict default-on settings", () => {
+  assert.deepEqual(DEFAULT_CONFIG.youShouldKnow, { enabled: true, completionGuidance: true });
+  for (const value of [undefined, {}, { enabled: true }, { completionGuidance: true }]) {
+    assert.deepEqual(normalizeConfig({ youShouldKnow: value }).youShouldKnow, { enabled: true, completionGuidance: true });
+  }
+  assert.deepEqual(normalizeConfig({ youShouldKnow: { enabled: false } }).youShouldKnow, {
+    enabled: false,
+    completionGuidance: true,
+  });
+  assert.deepEqual(normalizeConfig({ youShouldKnow: { completionGuidance: false } }).youShouldKnow, {
+    enabled: true,
+    completionGuidance: false,
+  });
+  assert.deepEqual(normalizeConfig({ youShouldKnow: { enabled: false, completionGuidance: false } }).youShouldKnow, {
+    enabled: false,
+    completionGuidance: false,
+  });
+  for (const value of [null, false, true, 0, "on", []]) {
+    assert.throws(() => normalizeConfig({ youShouldKnow: value }), /youShouldKnow must be an object/);
+  }
+  for (const field of ["enabled", "completionGuidance"] as const) {
+    for (const value of [null, 0, 1, "true", "off", []]) {
+      assert.throws(
+        () => normalizeConfig({ youShouldKnow: { [field]: value } }),
+        new RegExp(`youShouldKnow\\.${field} must be a boolean`),
+      );
+    }
+  }
 });
 
 test("normalizeConfig preserves the global subtasks view preference", () => {

@@ -39,7 +39,8 @@
  *   exports PI_REVIEW_GATE_DDGS_PYTHON for the extension.
  * - Refreshes the discoverable shipped skills under
  *   ~/.agents/skills/ (pi-review-gate-orchestrator with its recovery runbook,
- *   pi-review-gate-execution, and pi-review-gate-research; namespaced by
+ *   pi-review-gate-execution, pi-review-gate-research, and
+ *   pi-review-gate-completion; namespaced by
  *   issue 151) from the packaged sources, staged to temporary files and
  *   published with atomic renames so concurrent launches replace whole files
  *   only. On
@@ -733,6 +734,7 @@ const SKILL_PUBLISH_PLAN = [
   },
   { name: "pi-review-gate-execution", label: "execution", files: [{ source: ["skills", "pi-review-gate-execution", "SKILL.md"], destination: ["SKILL.md"] }] },
   { name: "pi-review-gate-research", label: "research", files: [{ source: ["skills", "pi-review-gate-research", "SKILL.md"], destination: ["SKILL.md"] }] },
+  { name: "pi-review-gate-completion", label: "completion", files: [{ source: ["skills", "pi-review-gate-completion", "SKILL.md"], destination: ["SKILL.md"] }] },
 ];
 
 /**

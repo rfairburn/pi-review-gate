@@ -205,6 +205,7 @@ function makeHarness(label: string): Harness {
 		["pi-review-gate-orchestrator", ["SKILL.md", "references/recovery.md"]],
 		["pi-review-gate-execution", ["SKILL.md"]],
 		["pi-review-gate-research", ["SKILL.md"]],
+		["pi-review-gate-completion", ["SKILL.md"]],
 	] as const) {
 		for (const file of files) {
 			const path = join(packageRoot, "skills", skill, ...file.split("/"));

@@ -1,7 +1,7 @@
 'use strict';
 /**
- * Test-only scripted provider for the session-host Main lifecycle question
- * case (tests/session-host-native-main-lifecycle.test.ts).
+ * Test-only scripted provider for the session-host Main lifecycle and
+ * native-notice cases.
  *
  * This is a small, clearly scoped specialization of
  * tests/fixtures/session-host-native-provider.cjs: same public
@@ -19,7 +19,7 @@
  * The existing standalone fixture (session-host-native-provider.cjs) is left
  * untouched for its own question test.
  *
- * Environment contract (set by tests/session-host-native-main-lifecycle.test.ts):
+ * Environment contract (set by the native Main integration tests):
  * - PRG_FIXTURE_AGENT_DIR   installed pi-coding-agent package root (pi-ai import)
  * - PRG_FIXTURE_STATE_DIR   fixture scratch state dir (turn script, journal)
  */
@@ -120,18 +120,21 @@ module.exports = async function (pi) {
 		return [];
 	}
 
+	function messageText(message) {
+		if (typeof message?.content === 'string') return message.content;
+		if (Array.isArray(message?.content)) {
+			return message.content
+				.filter((block) => block && block.type === 'text' && typeof block.text === 'string')
+				.map((block) => block.text)
+				.join('\n');
+		}
+		return '';
+	}
+
 	function lastUserText(messages) {
 		for (let index = messages.length - 1; index >= 0; index -= 1) {
 			const message = messages[index];
-			if (message.role !== 'user') continue;
-			if (typeof message.content === 'string') return message.content;
-			if (Array.isArray(message.content)) {
-				return message.content
-					.filter((block) => block && block.type === 'text' && typeof block.text === 'string')
-					.map((block) => block.text)
-					.join('\n');
-			}
-			return '';
+			if (message.role === 'user') return messageText(message);
 		}
 		return '';
 	}
@@ -167,12 +170,32 @@ module.exports = async function (pi) {
 		provider.appendResponses([respondFromScript]);
 		contextMessages = context?.messages ?? [];
 		const requestIndex = provider.state.callCount - 1; // callCount was incremented for this request
-		journal('model_request', {
+		const step = readTurnScript()[requestIndex];
+		const requestFields = {
 			requestIndex,
 			stepsAvailable: readTurnScript().length,
-			lastUserPreview: lastUserText(contextMessages).slice(0, 400),
-		});
-		return stepToMessage(readTurnScript()[requestIndex], requestIndex);
+		};
+		// The native resume-task acceptance opts into metadata-only journaling;
+		// every existing fixture consumer retains its bounded prompt preview.
+		if (process.env.PRG_FIXTURE_METADATA_ONLY !== '1') {
+			requestFields.lastUserPreview = lastUserText(contextMessages).slice(0, 400);
+		}
+		if (step?.captureHistoryMarkers && typeof step.captureHistoryMarkers === 'object') {
+			const userMarker = step.captureHistoryMarkers.user;
+			const assistantMarker = step.captureHistoryMarkers.assistant;
+			requestFields.historyMarkers = {
+				user: typeof userMarker === 'string' && contextMessages.some((message) =>
+					message?.role === 'user' && messageText(message).includes(userMarker)),
+				assistant: typeof assistantMarker === 'string' && contextMessages.some((message) =>
+					message?.role === 'assistant' && messageText(message).includes(assistantMarker)),
+			};
+		}
+		// Only a test-script step that opts in records its complete controlled
+		// synthetic request, for assertions that display transforms never alter
+		// model input. Other fixture tests keep the bounded preview only.
+		if (step?.captureLastUser === true) requestFields.lastUserMessage = lastUserText(contextMessages);
+		journal('model_request', requestFields);
+		return stepToMessage(step, requestIndex);
 	}
 
 	provider.appendResponses([respondFromScript]);

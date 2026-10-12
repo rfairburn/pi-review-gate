@@ -239,8 +239,9 @@ export class ExecutionToolManager {
   async restoreAssociations(
     value: ExecutionAssociationsSnapshot,
     options?: BackgroundControllerRestoreOptions,
+    notify?: (message: string) => void | Promise<void>,
   ): Promise<void> {
-    await this.controller.restore(value, options);
+    await this.controller.restore(value, options, notify);
   }
 
   setScopedModels(models: readonly string[]): void {

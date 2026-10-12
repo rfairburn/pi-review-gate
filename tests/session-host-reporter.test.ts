@@ -33,6 +33,7 @@ import {
   HOST_BOOTSTRAP_ENV,
   MAX_STATUS_FRAME_BYTES,
   MAX_NATIVE_SESSION_NAME_LENGTH,
+  MAX_NATIVE_SESSION_FILE_BYTES,
   MAX_RENAME_NAME_BYTES,
   type SessionSpawnInput,
   decodeFrame,
@@ -142,6 +143,7 @@ interface TestCtx {
     getSessionId: () => string;
     getSessionName?: () => string | undefined;
     getEntries?: () => unknown[];
+    getSessionFile?: () => string | undefined;
   };
 }
 
@@ -448,6 +450,17 @@ describe("session-host protocol", () => {
     };
     const nativeSession = { sessionId: "native-session-id", epoch: 3, name: "first user prompt" };
     assert.deepEqual(parseStatus({ ...base, nativeSession })?.nativeSession, nativeSession);
+    const planned = { ...nativeSession, currentFile: "/synthetic/not-yet-saved.jsonl" };
+    assert.deepEqual(parseStatus({ ...base, nativeSession: planned })?.nativeSession, planned,
+      "an absolute bounded planned file is accepted without filesystem admission");
+    const plannedFrame = decodeFrame(encodeFrame({ ...base, nativeSession: planned } as SessionHostStatus));
+    assert.deepEqual(plannedFrame?.type === "status" ? plannedFrame.nativeSession : undefined, planned,
+      "the current file observation is authenticated and bounded on the wire");
+    for (const currentFile of ["relative/session.jsonl", `/x${"y".repeat(MAX_NATIVE_SESSION_FILE_BYTES)}.jsonl`, "/bad\u0001path.jsonl"]) {
+      const parsedPath = parseStatus({ ...base, nativeSession: { ...planned, currentFile } });
+      assert.ok(parsedPath, "invalid optional current-file data does not drop otherwise valid status");
+      assert.equal(parsedPath.nativeSession?.currentFile, undefined, "invalid file observations fail closed as absent");
+    }
     assert.equal(parseStatus({ ...base, nativeSession: null })?.nativeSession, null, "unavailable APIs stay explicitly unknown");
     assert.equal(parseStatus(base)?.nativeSession, undefined, "older reporters may omit the optional metadata");
     assert.equal(parseStatus({ ...base, nativeSession: { ...nativeSession, epoch: 0 } }), undefined);
@@ -534,6 +547,30 @@ describe("session-host protocol", () => {
       getEntries: () => [],
     } });
     assert.equal(noMessages?.displayName, "(no messages)");
+    const planned = reporterTest.readNativeSession({ sessionManager: {
+      getSessionId: () => "native-id",
+      getSessionName: () => "Native title",
+      getEntries: () => [],
+      getSessionFile: () => "/synthetic/planned/current.jsonl",
+    } });
+    assert.equal(planned?.currentFile, "/synthetic/planned/current.jsonl",
+      "the public current file is reported even before it exists on disk");
+    const unavailableFile = reporterTest.readNativeSession({ sessionManager: {
+      getSessionId: () => "native-id",
+      getSessionName: () => "Native title",
+      getEntries: () => [],
+      getSessionFile: () => { throw new Error("synthetic unavailable getter"); },
+    } });
+    assert.ok(unavailableFile, "an unavailable path getter does not suppress ordinary native metadata");
+    assert.equal(unavailableFile.currentFile, undefined, "an unavailable path remains unknown");
+    let idReads = 0;
+    const reentrantFile = reporterTest.readNativeSession({ sessionManager: {
+      getSessionId: () => ++idReads === 1 ? "native-id" : "changed-session",
+      getSessionName: () => "Native title",
+      getEntries: () => [],
+      getSessionFile: () => "/synthetic/other-session.jsonl",
+    } });
+    assert.equal(reentrantFile, undefined, "a re-entrant native selection change cannot pair a later file with the earlier id");
     const clipped = reporterTest.readNativeSession({ sessionManager: {
       getSessionId: () => "native-id",
       getSessionName: () => "n".repeat(MAX_NATIVE_SESSION_NAME_LENGTH + 10),
@@ -902,6 +939,7 @@ describe("session-host reporter status frames", () => {
     const native = {
       id: "native-session-one",
       name: undefined as string | undefined,
+      file: "/synthetic/native-session-one.jsonl",
       entries: [
         { type: "message", message: { role: "assistant", content: "not the fallback" } },
         { type: "message", message: { role: "user", content: [{ type: "text", text: "\u0001  first\nuser prompt  " }] } },
@@ -911,6 +949,7 @@ describe("session-host reporter status frames", () => {
       getSessionId: () => native.id,
       getSessionName: () => native.name,
       getEntries: () => native.entries,
+      getSessionFile: () => native.file,
     };
     const { testPi, ctx, bootstrap } = await startSession({ server, sessionManager });
     let setterCalls = 0;
@@ -925,8 +964,8 @@ describe("session-host reporter status frames", () => {
       sessionId: native.id,
       epoch: 1,
       name: "first user prompt",
-      // The stub manager has no getSessionFile, so persistence fails closed to unknown.
-      persistence: "unknown",
+      currentFile: native.file,
+      persistence: "unsaved",
     }, "native first stored user message is the fallback; assistant text is ignored");
 
     const rename = {
@@ -965,6 +1004,7 @@ describe("session-host reporter status frames", () => {
     // A native /resume selection changes the manager's ID within this child.
     const oldEpoch = firstNative.epoch;
     native.id = "native-session-two";
+    native.file = "/synthetic/native-session-two.jsonl";
     native.name = undefined;
     native.entries = [];
     await testPi.trigger("session_start", { type: "session_start", reason: "resume" }, ctx);
@@ -975,6 +1015,8 @@ describe("session-host reporter status frames", () => {
     const resumedNative = resumed.message.nativeSession as { sessionId: string; epoch: number; name: string };
     assert.ok(resumedNative.epoch > oldEpoch, "the session epoch advances across native selection/reload boundaries");
     assert.equal(resumedNative.name, "(no messages)", "empty native sessions use Pi's native fallback");
+    assert.equal((resumed.message.nativeSession as { currentFile?: string }).currentFile, native.file,
+      "the current file rebinds with the native /resume identity");
 
     const staleRename = { ...rename, requestId: randomUUID(), name: "must not rename session two" };
     server.sendToClients(encodeFrame(staleRename as never));
@@ -1616,7 +1658,7 @@ describe("session-host reporter status frames", () => {
     const key = "review-gate-pending-questions";
     // A panel already present before the reporter registered: no getter can
     // see it, so it must read as unknown, not fabricated false.
-    ui.original.call(ui.ui, key, ["Pending questions · Press Ctrl+Alt+Up"]);
+    ui.original.call(ui.ui, key, ["Pending input · Press Ctrl+Alt+Up"]);
     const { testPi, ctx } = await startSession({ server, ui });
 
     const initial = await server.waitForFrame((f) => f.message.type === "status");
@@ -1628,7 +1670,7 @@ describe("session-host reporter status frames", () => {
     assert.ok((cleared.message.sequence as number) > (initial.message.sequence as number));
 
     // First observed set resolves to true.
-    setWidget(ctx, key, ["Pending questions · Press Ctrl+Alt+Up"]);
+    setWidget(ctx, key, ["Pending input · Press Ctrl+Alt+Up"]);
     const set = await server.waitForFrame((f) => f.message.type === "status" && f.message.pendingInput === true);
     assert.ok((set.message.sequence as number) > (cleared.message.sequence as number));
     await testPi.trigger("session_shutdown", { type: "session_shutdown" });
@@ -1710,7 +1752,7 @@ describe("session-host reporter status frames", () => {
     await server.waitForFrame((f) => f.message.type === "status" && f.message.busy === true);
 
     // Panel set (array) while busy: pending presence updates asynchronously.
-    const returnValue = setWidget(ctx, key, ["Pending questions · Press Ctrl+Alt+Up"], { placement: "aboveEditor" });
+    const returnValue = setWidget(ctx, key, ["Pending input · Press Ctrl+Alt+Up"], { placement: "aboveEditor" });
     assert.equal(returnValue, "widget-result", "wrapper preserves the original return value");
     let status = await server.waitForFrame((f) => f.message.type === "status" && f.message.pendingInput === true);
     assert.equal(status.message.busy, true, "pending updates while runtime busy");
@@ -1730,7 +1772,7 @@ describe("session-host reporter status frames", () => {
     assert.equal(status.message.busy, true);
 
     // Question text never enters a frame.
-    assert.ok(!server.frames.some((f) => f.raw.includes("Pending questions")), "panel line text stays out of frames");
+    assert.ok(!server.frames.some((f) => f.raw.includes("Pending input")), "panel line text stays out of frames");
     await testPi.trigger("session_shutdown", { type: "session_shutdown" });
   });
 
@@ -1767,7 +1809,7 @@ describe("session-host reporter status frames", () => {
     await testPi.trigger("session_shutdown", { type: "session_shutdown" });
   });
 
-  it("does not report a failed native clear as no pending questions", async () => {
+  it("does not report a failed native clear as no pending input", async () => {
     const server = await startTestServer();
     const ui = makeUi();
     const key = "review-gate-pending-questions";

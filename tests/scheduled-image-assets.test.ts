@@ -931,7 +931,7 @@ async function runImageFlow(
     keybindings: fakeKeybindingsManager(),
     draft: "chat draft",
     drivers: [
-      keys(...Array(15).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 15)
+      keys(...Array(17).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 17)
       keys(KEY_ENTER), // list → task entry (row 0)
       ...(options.skipField
         ? [keys(...Array(12).fill(KEY_DOWN), KEY_ENTER)] // entry editor → Back (row 12)
@@ -958,9 +958,9 @@ async function runImageFlow(
       ...(options.outcome === "cancel"
         ? [keys(KEY_ESCAPE)] // root: leave without saving
         : [
-            keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (scheduled, index 15) → Save changes (row 17)
+            keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (scheduled, index 17) → Save changes (row 19)
             ...(options.outcome === "fail"
-              ? [keys(KEY_DOWN, KEY_ENTER)] // failed save re-shows the root on Save (17); explicit Cancel (18) — issue #294: root Escape would retry the same failing apply
+              ? [keys(KEY_DOWN, KEY_ENTER)] // failed save re-shows the root on Save (19); explicit Cancel (20) — issue #294: root Escape would retry the same failing apply
               : []),
           ]),
     ],
@@ -1215,7 +1215,7 @@ test("full TUI flow: Escape applies the managed copy session-only; reopen Ctrl+S
       keybindings: fakeKeybindingsManager(),
       draft: "chat draft",
       drivers: [
-        keys(...Array(15).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 15)
+        keys(...Array(17).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 17)
         keys(KEY_ENTER), // list → task entry (row 0)
         keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → instructions (row 4)
         async (component: { handleInput?(data: string): void }): Promise<void> => {

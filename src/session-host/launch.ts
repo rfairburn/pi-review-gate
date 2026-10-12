@@ -134,7 +134,7 @@ const PROFILE_SKILLS_DIRNAME = "skills";
  * Shipped-skill publication map used only by legacy profiles, mirroring
  * SKILL_PUBLISH_PLAN in scripts/pi-review-gate.sh and
  * scripts/pi-review-gate-launcher.cjs (orchestrator SKILL.md plus its
- * recovery runbook, execution, and research). Publication targets stay the
+ * recovery runbook, execution, research, and completion). Publication targets stay the
  * Pi reserved namespace (pi-review-gate-*) inside the profile's own agent
  * directory: with PI_CODING_AGENT_DIR pointing at the profile, Pi discovers
  * `<agent-dir>/skills/`, so per-instance skills live per-instance. Sources
@@ -158,6 +158,10 @@ export const NATIVE_SKILL_PUBLISH_PLAN: readonly {
   {
     name: "pi-review-gate-research",
     files: [{ source: ["skills", "pi-review-gate-research", "SKILL.md"], destination: ["SKILL.md"] }],
+  },
+  {
+    name: "pi-review-gate-completion",
+    files: [{ source: ["skills", "pi-review-gate-completion", "SKILL.md"], destination: ["SKILL.md"] }],
   },
 ];
 

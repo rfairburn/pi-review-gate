@@ -70,9 +70,12 @@
  */
 
 import {
+  CURSOR_MARKER,
   decodeKittyPrintable,
+  getKeybindings,
   isKeyRelease,
   isKeyRepeat,
+  Input,
   type KeyId,
   matchesKey,
   parseKey,
@@ -160,6 +163,25 @@ export interface SidebarSavedRow {
   readonly cwd?: string;
 }
 
+export type SidebarSavedPickerAction =
+  | "tui.select.confirm"
+  | "tui.select.cancel"
+  | "tui.select.up"
+  | "tui.select.down"
+  | "app.session.delete"
+  | "app.session.deleteNoninvasive";
+
+/** A native pi-tui single-line Input and the shared native keybinding matcher. */
+export interface SidebarSavedQueryInput {
+  getValue(): string;
+  handleInput(data: string): void;
+  render(width: number): string[];
+  matches(data: string, action: SidebarSavedPickerAction): boolean;
+  keys?(action: SidebarSavedPickerAction): readonly string[];
+  dispose(): void;
+  readonly notice?: string;
+}
+
 /** Actions the sidebar asks the backend to perform. */
 export type SidebarAction =
   | { readonly type: "forward"; readonly data: string }
@@ -176,6 +198,16 @@ export type SidebarAction =
   | { readonly type: "edit"; readonly id: string; readonly nativeSession: SessionHostNativeSession }
   /** Open the saved-conversation picker and list the shared native catalog. */
   | { readonly type: "saved-list"; readonly requestId: number }
+  /** Re-list after a successful saved-file deletion without losing the query. */
+  | { readonly type: "saved-refresh"; readonly requestId: number; readonly pickerId: number }
+  /** Query changes are resolved only from Main's current branded catalog. */
+  | { readonly type: "saved-search"; readonly pickerId: number; readonly revision: number; readonly query: string }
+  /** Drop Main's private catalog/search references when this pane is dismissed. */
+  | { readonly type: "saved-dismiss"; readonly pickerId: number }
+  /** Synchronous Main-side eligibility check before opening a confirmation. */
+  | { readonly type: "saved-delete-prepare"; readonly pickerId: number; readonly requestId: number; readonly id: string; readonly file: string; readonly revision: number }
+  /** Confirmed deletion of the frozen, prevalidated target. */
+  | { readonly type: "saved-delete"; readonly pickerId: number; readonly requestId: number; readonly id: string; readonly file: string; readonly revision: number }
   /** Cancel an outstanding listing (dismiss or shutdown); Main aborts its signal. */
   | { readonly type: "saved-cancel"; readonly requestId: number }
   /** Deliberately open one listed conversation as a new independently owned child. */
@@ -217,6 +249,8 @@ export interface SidebarControllerOptions {
   readonly workspaceBasePath?: string;
   /** Optional Main-owned factory; production supplies current native keybindings and external-editor ownership. */
   readonly createTextField?: (options: SidebarFieldFactoryOptions) => SidebarFieldFactoryResult;
+  /** Main supplies native global keybindings and owns the safe Input manager bridge. */
+  readonly createSavedQueryInput?: () => SidebarSavedQueryInput;
   /** Redraw hook for asynchronous native completion and Editor invalidation. */
   readonly onInvalidate?: () => void;
   /** Initial visibility (default true: the empty welcome picker shows). */
@@ -335,6 +369,15 @@ interface DisplayedSavedRows {
   readonly entries: readonly DisplayedSavedRow[];
 }
 
+interface SavedDeleteContext {
+  readonly pickerId: number;
+  readonly requestId: number;
+  readonly id: string;
+  readonly file: string;
+  readonly revision: number;
+  readonly row: SidebarSavedRow;
+}
+
 interface DisplayedRoster {
   readonly signature: string;
   readonly heights: ReadonlyMap<string, number>;
@@ -354,6 +397,70 @@ function mouseAuthorizationKey(
     saved: saved === undefined ? null : [saved.cols, saved.rows,
       saved.entries.map(({ paneRow, entry }) => [paneRow, entry.id, entry.file])],
   });
+}
+
+const DEFAULT_SAVED_ACTION_KEYS: Readonly<Record<SidebarSavedPickerAction, readonly string[]>> = {
+  "tui.select.confirm": ["enter"],
+  "tui.select.cancel": ["escape", "ctrl+c"],
+  "tui.select.up": ["up"],
+  "tui.select.down": ["down"],
+  "app.session.delete": ["ctrl+d"],
+  "app.session.deleteNoninvasive": ["ctrl+backspace"],
+};
+
+function defaultSavedActionMatch(data: string, action: SidebarSavedPickerAction): boolean {
+  let manager: ReturnType<typeof getKeybindings> | undefined;
+  try { manager = getKeybindings(); } catch { /* native defaults below */ }
+  if (manager !== undefined) {
+    try {
+      const source = manager as unknown as { matches(data: string, action: string): boolean; getDefinition?: (id: string) => unknown };
+      if (source.getDefinition?.(action) !== undefined) return source.matches(data, action);
+    } catch { /* use a bounded default action chord */ }
+  }
+  return (DEFAULT_SAVED_ACTION_KEYS[action] ?? []).some((key) => matchesKey(data, key as KeyId));
+}
+
+function createDefaultSavedQueryInput(): SidebarSavedQueryInput {
+  const input = new Input();
+  input.focused = true;
+  return {
+    getValue: () => input.getValue(),
+    handleInput: (data) => input.handleInput(data),
+    render: (width) => input.render(width),
+    matches: defaultSavedActionMatch,
+    keys: (action) => {
+      let manager: ReturnType<typeof getKeybindings> | undefined;
+      try { manager = getKeybindings(); } catch { /* native defaults below */ }
+      try {
+        const getKeys = (manager as unknown as { getKeys?: (id: string) => string[] } | undefined)?.getKeys;
+        const keys = getKeys?.call(manager, action);
+        if (Array.isArray(keys) && keys.length > 0) return keys;
+      } catch { /* use the built-in Pi defaults */ }
+      return DEFAULT_SAVED_ACTION_KEYS[action] ?? [];
+    },
+    dispose: () => {
+      input.focused = false;
+      input.setValue("");
+    },
+  };
+}
+
+function sanitizeSavedRows(rows: readonly SidebarSavedRow[]): SidebarSavedRow[] {
+  const accepted: SidebarSavedRow[] = [];
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!row || typeof row.id !== "string" || row.id.length === 0
+      || typeof row.file !== "string" || row.file.length === 0
+      || typeof row.caption !== "string") continue;
+    accepted.push({
+      id: row.id,
+      file: row.file,
+      caption: sanitizeBounded(row.caption, SAVED_CAPTION_MAX_CODEPOINTS),
+      ...(typeof row.cwd === "string" && row.cwd.length > 0
+        ? { cwd: sanitizeBounded(row.cwd, SAVED_WORKSPACE_MAX_CODEPOINTS) }
+        : {}),
+    });
+  }
+  return accepted;
 }
 
 // The pinned matcher knows legacy F1-F12 packets but not parameterized CSI
@@ -397,6 +504,7 @@ const CARD_EXPANDED_ROWS = 5;
 const ACTIVITY_LINES_MAX = CARD_EXPANDED_ROWS - CARD_COLLAPSED_ROWS;
 const ACTIVITY_INPUT_MAX_CODEPOINTS = 400;
 const SAVED_CAPTION_MAX_CODEPOINTS = 256;
+const MAX_SAVED_QUERY_DISPLAY_CODEPOINTS = 4096;
 /** Bounded recorded-workspace (cwd) display limit; the raw catalog keeps the full value for admission. */
 const SAVED_WORKSPACE_MAX_CODEPOINTS = 4096;
 /** Fixed reserved details-area height between the saved list and the footer. */
@@ -864,6 +972,8 @@ export class SidebarController {
   private readonly onInvalidate?: () => void;
   private readonly workspaceBasePath: string;
   private readonly createTextField?: SidebarControllerOptions["createTextField"];
+  private readonly createSavedQueryInput?: SidebarControllerOptions["createSavedQueryInput"];
+  private savedQueryInput?: SidebarSavedQueryInput;
   private formField?: SessionHostTextField;
   private formMatchesCancel: (data: string) => boolean = (data) => matchesKey(data, "escape");
   /** Effective native submit-key matcher for the current form field. */
@@ -890,6 +1000,17 @@ export class SidebarController {
   private pendingSavedOpen: { readonly requestId: number } | undefined;
   private pendingRowResume: { readonly requestId: number; readonly id: string } | undefined;
   private savedRows: SidebarSavedRow[] = [];
+  private savedPickerId: number | undefined;
+  private savedQueryRevision = 0;
+  private savedQueryNotice: string | undefined;
+  private pendingSavedDeleteCheck: SavedDeleteContext | undefined;
+  private savedDeleteTarget: SavedDeleteContext | undefined;
+  private savedDeleteOperation: SavedDeleteContext | undefined;
+  private savedDeleteConfirmationDisplayed = false;
+  private savedDeleteConfirmationRenderToken: number | undefined;
+  private nextSavedDeleteConfirmationRenderToken = 1;
+  /** Held native action packets remain consumed across cancel, dismiss, or focus changes. */
+  private savedActionClaims: Array<(data: string) => boolean> = [];
   private savedIssueCount = 0;
   private savedError: string | undefined;
   private savedSelectedIndex = 0;
@@ -946,7 +1067,7 @@ export class SidebarController {
   private pendingCreate: { readonly requestId: number } | undefined;
   private pendingRename: { readonly requestId: number } | undefined;
   /** Explicit confirmation purpose: quit the host or stop one owned session. */
-  private confirmPurpose: "quit" | "stop-remove" = "quit";
+  private confirmPurpose: "quit" | "stop-remove" | "saved-delete" = "quit";
   /** Frozen stop target id; later navigation never retargets the confirmation. */
   private stopRemoveTargetId: string | undefined;
   /** True only while the last render drew the complete stop warning dialog. */
@@ -994,6 +1115,7 @@ export class SidebarController {
     this._visible = options.initialVisible ?? true;
     this.workspaceBasePath = resolve(options.workspaceBasePath ?? "/");
     this.createTextField = options.createTextField;
+    this.createSavedQueryInput = options.createSavedQueryInput;
 
     const suggestedWorkspace = sanitizeCellText(options.initialWorkspace ?? "");
     if (countCodePoints(suggestedWorkspace) > PATH_FIELD_MAX_CODEPOINTS) {
@@ -1038,6 +1160,149 @@ export class SidebarController {
   /** View-only: the host's actual active Main owner id (undefined when none). */
   get activeMainOwnerID(): string | undefined {
     return this.activeMainOwnerID_;
+  }
+
+  /** Opaque identity of the currently open Saved picker, when one owns the pane. */
+  get savedPickerRequestId(): number | undefined {
+    return this.formKind === "saved" || this.confirmPurpose === "saved-delete" ? this.savedPickerId : undefined;
+  }
+
+  /** Current native Input query; never copied into display rows or persisted state. */
+  get savedQuery(): string {
+    return this.savedQueryInput?.getValue() ?? "";
+  }
+
+  get savedQueryRevisionNumber(): number {
+    return this.savedQueryRevision;
+  }
+
+  /** True only for the Saved-file confirmation; this is a placement signal, not an input-focus alias. */
+  get savedDeleteConfirmationActive(): boolean {
+    return this._visible && this._focus === "confirm" && this.confirmPurpose === "saved-delete";
+  }
+
+  /** Opaque token for the last fully rendered Saved-delete warning candidate. */
+  get savedDeleteConfirmationRenderTokenNumber(): number | undefined {
+    return this.savedDeleteConfirmationRenderToken;
+  }
+
+  /** Revoke Saved-delete display authority before any focus, target, or geometry invalidation. */
+  invalidateSavedDeleteConfirmationDisplay(): void {
+    this.savedDeleteConfirmationDisplayed = false;
+    this.savedDeleteConfirmationRenderToken = undefined;
+  }
+
+  /** Whether a still-current complete warning render is awaiting/has reached writer settlement. */
+  isSavedDeleteConfirmationRenderCurrent(token: number): boolean {
+    const target = this.savedDeleteTarget;
+    return token === this.savedDeleteConfirmationRenderToken
+      && this._visible && this._focus === "confirm" && this.confirmPurpose === "saved-delete"
+      && target !== undefined && this.savedPickerId === target.pickerId
+      && this.savedQueryRevision === target.revision;
+  }
+
+  /** Grant input authority only after Main's writer settles this exact render token. */
+  settleSavedDeleteConfirmationRender(token: number): boolean {
+    if (!this.isSavedDeleteConfirmationRenderCurrent(token)) return false;
+    this.savedDeleteConfirmationDisplayed = true;
+    return true;
+  }
+
+  /** Release the picker Input and its bounded UI rows during host shutdown. */
+  disposeSavedPicker(): void {
+    const wasSavedConfirmation = this.confirmPurpose === "saved-delete";
+    this.clearSavedPickerState();
+    this.savedError = undefined;
+    this.displayedSavedRows = undefined;
+    if (this.formKind === "saved") this.formKind = undefined;
+    if (wasSavedConfirmation && this._focus === "confirm") this._focus = "sidebar";
+  }
+
+  /** Verify that a deletion preflight came from the exact selected displayed row. */
+  isSavedDeletePreparationCurrent(
+    requestId: number,
+    pickerId: number,
+    id: string,
+    file: string,
+    revision: number,
+  ): boolean {
+    const check = this.pendingSavedDeleteCheck;
+    return this._visible && this._focus === "form" && this.formKind === "saved"
+      && this.savedPickerId === pickerId && this.savedQueryRevision === revision
+      && check !== undefined && check.requestId === requestId && check.pickerId === pickerId
+      && check.id === id && check.file === file && check.revision === revision
+      && this.savedRows[this.savedSelectedIndex]?.id === id
+      && this.savedRows[this.savedSelectedIndex]?.file === file;
+  }
+
+  /** Confirmation-phase authority checked again by Main immediately before mutation. */
+  isSavedDeleteConfirmationCurrent(
+    requestId: number,
+    pickerId: number,
+    id: string,
+    file: string,
+    revision: number,
+  ): boolean {
+    const target = this.savedDeleteTarget;
+    const operation = this.savedDeleteOperation;
+    return this._visible && this._focus === "confirm" && this.confirmPurpose === "saved-delete"
+      && this.savedDeleteConfirmationDisplayed && this.savedPickerId === pickerId
+      && this.savedQueryRevision === revision
+      && target !== undefined && operation !== undefined
+      && target.requestId === requestId && operation.requestId === requestId
+      && target.pickerId === pickerId && operation.pickerId === pickerId
+      && target.id === id && operation.id === id && target.file === file && operation.file === file
+      && target.revision === revision && operation.revision === revision;
+  }
+
+  /** Main has rechecked the exact row and live-child guard synchronously. */
+  completeSavedDeleteCheck(requestId: number, allowed: boolean, message?: string): boolean {
+    const context = this.pendingSavedDeleteCheck;
+    if (!context || context.requestId !== requestId) return false;
+    this.pendingSavedDeleteCheck = undefined;
+    if (!this.isSavedDeletePreparationStillCurrent(context)) return false;
+    if (!allowed) {
+      this.savedError = sanitizeBounded(message ?? "Saved conversation is not safe to delete", ERROR_TEXT_MAX_CODEPOINTS);
+      this.onInvalidate?.();
+      return true;
+    }
+    this.invalidateSavedDeleteConfirmationDisplay();
+    this.savedDeleteTarget = context;
+    this.savedDeleteOperation = undefined;
+    this.displayedSavedRows = undefined;
+    this.confirmPurpose = "saved-delete";
+    this._focus = "confirm";
+    this.onInvalidate?.();
+    return true;
+  }
+
+  /** Complete or refuse the one confirmed deletion while preserving the picker draft. */
+  completeSavedDelete(requestId: number, message: string, refresh: boolean): boolean {
+    const context = this.savedDeleteOperation;
+    if (!context || context.requestId !== requestId || !this.isSavedDeleteConfirmationCurrent(
+      requestId, context.pickerId, context.id, context.file, context.revision,
+    )) return false;
+    this.savedDeleteOperation = undefined;
+    this.savedDeleteTarget = undefined;
+    this.invalidateSavedDeleteConfirmationDisplay();
+    this.confirmPurpose = "quit";
+    this._focus = "form";
+    this.savedError = sanitizeBounded(message, ERROR_TEXT_MAX_CODEPOINTS);
+    if (refresh && this.savedPickerId === context.pickerId) {
+      const requestId = this.nextRequestId++;
+      this.pendingSavedList = { requestId };
+      this.displayedSavedRows = undefined;
+      this.emit({ type: "saved-refresh", requestId, pickerId: context.pickerId });
+    }
+    this.onInvalidate?.();
+    return true;
+  }
+
+  private isSavedDeletePreparationStillCurrent(context: SavedDeleteContext): boolean {
+    return this._visible && this._focus === "form" && this.formKind === "saved"
+      && this.savedPickerId === context.pickerId && this.savedQueryRevision === context.revision
+      && this.savedRows[this.savedSelectedIndex]?.id === context.id
+      && this.savedRows[this.savedSelectedIndex]?.file === context.file;
   }
 
   /**
@@ -1428,6 +1693,7 @@ export class SidebarController {
     assertPaneDimension(cols, PANE_MAX_COLS, "cols");
     assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
     if (!this._visible) {
+      this.invalidateSavedDeleteConfirmationDisplay();
       return { lines: [] };
     }
     return this.renderForFocus(cols, rows);
@@ -1441,6 +1707,7 @@ export class SidebarController {
   renderRoster(cols: number, rows: number): { lines: string[] } {
     assertPaneDimension(cols, PANE_MAX_COLS, "cols");
     assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
+    this.invalidateSavedDeleteConfirmationDisplay();
     if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
       return this.renderRosterTooSmall(cols, rows);
     }
@@ -1455,6 +1722,7 @@ export class SidebarController {
   renderForm(cols: number, rows: number): { lines: string[]; cursor?: { column: number; row: number } } {
     assertPaneDimension(cols, PANE_MAX_COLS, "cols");
     assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
+    this.invalidateSavedDeleteConfirmationDisplay();
     this.displayedSavedRows = undefined;
     if (cols < FORM_MIN_COLS || rows < FORM_MIN_ROWS) {
       return this.renderTooSmall(cols, rows);
@@ -1466,6 +1734,20 @@ export class SidebarController {
       return this.renderHostShortcutPane(cols, rows);
     }
     return this.renderFormPane(cols, rows);
+  }
+
+  /**
+   * Renders only the Saved-file warning into Main's right-pane slot. The
+   * roster render remains independent, and only a complete exact warning
+   * produces the usual writer-settled confirmation token.
+   */
+  renderSavedDeleteConfirmation(cols: number, rows: number): { lines: string[] } {
+    assertPaneDimension(cols, PANE_MAX_COLS, "cols");
+    assertPaneDimension(rows, PANE_MAX_ROWS, "rows");
+    this.invalidateSavedDeleteConfirmationDisplay();
+    if (!this.savedDeleteConfirmationActive) return { lines: [] };
+    if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) return this.renderTooSmall(cols, rows);
+    return this.renderSavedDeleteConfirmPane(cols, rows);
   }
 
   private renderForFocus(
@@ -1483,10 +1765,12 @@ export class SidebarController {
       this.forgetDisplayedRoster();
       if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
         this.stopConfirmDisplayed = false;
+        this.invalidateSavedDeleteConfirmationDisplay();
         return this.renderTooSmall(cols, rows);
       }
       return this.renderConfirmPane(cols, rows);
     }
+    this.invalidateSavedDeleteConfirmationDisplay();
     if (cols < ROSTER_MIN_COLS || rows < ROSTER_MIN_ROWS) {
       return this.renderRosterTooSmall(cols, rows);
     }
@@ -1588,6 +1872,7 @@ export class SidebarController {
     if (this.consumeFormEscapeClaim(data)) {
       return;
     }
+    if (this.consumeSavedActionClaim(data)) return;
     // The held Enter that submitted the New form or opened a saved
     // conversation must not replay its repeat/release into the newly focused
     // child after that success transferred ownership.
@@ -1627,6 +1912,7 @@ export class SidebarController {
       this.onInvalidate?.();
       return;
     }
+    if (this.consumeSavedActionClaim(data)) return;
     if (isKeyRelease(data)) {
       return;
     }
@@ -2020,6 +2306,7 @@ export class SidebarController {
    */
   private openSavedPane(): void {
     this.forgetDisplayedRoster(); // narrow layouts overlay the roster
+    this.disposeSavedQueryInput();
     this.disposeFormField();
     this.formKind = "saved";
     this.editTarget = undefined;
@@ -2027,6 +2314,10 @@ export class SidebarController {
     this.pendingRename = undefined;
     this.pendingShortcutSave = undefined;
     this.pendingSavedOpen = undefined;
+    this.pendingSavedDeleteCheck = undefined;
+    this.savedDeleteTarget = undefined;
+    this.savedDeleteOperation = undefined;
+    this.invalidateSavedDeleteConfirmationDisplay();
     this.formError = undefined;
     this.noticeError = undefined;
     this.savedRows = [];
@@ -2037,6 +2328,16 @@ export class SidebarController {
     this._focus = "form";
     this.displayedSavedRows = undefined;
     const requestId = this.nextRequestId++;
+    this.savedPickerId = requestId;
+    this.savedQueryRevision = 0;
+    let inputNotice: string | undefined;
+    try {
+      this.savedQueryInput = this.createSavedQueryInput?.() ?? createDefaultSavedQueryInput();
+    } catch {
+      this.savedQueryInput = createDefaultSavedQueryInput();
+      inputNotice = "Native query input is unavailable; using Pi's default keys";
+    }
+    this.savedQueryNotice = inputNotice ?? this.savedQueryInput.notice;
     this.pendingSavedList = { requestId };
     this.emit({ type: "saved-list", requestId });
   }
@@ -2048,11 +2349,14 @@ export class SidebarController {
    * backend; its late result is fenced by requestId.
    */
   private dismissSavedPane(): void {
+    const pickerId = this.savedPickerId;
+    if (pickerId !== undefined) this.emit({ type: "saved-dismiss", pickerId });
     if (this.pendingSavedList !== undefined) {
       this.emit({ type: "saved-cancel", requestId: this.pendingSavedList.requestId });
       this.pendingSavedList = undefined;
     }
     this.pendingSavedOpen = undefined; // UI ownership only; the backend op continues
+    this.clearSavedPickerState();
     this.abandonForm();
     this.savedError = undefined;
     this.displayedSavedRows = undefined; // dismissal invalidates the display record
@@ -2061,8 +2365,12 @@ export class SidebarController {
 
   private handleSavedPaneInput(data: string): void {
     // Bracketed paste is opaque in the picker and never activates a row; a
-    // streamed body chunk that merely equals the toggle must not dismiss.
-    if (this.routeBracketedPaste(data)) return;
+    // streamed body chunk that merely equals a host/native action must not
+    // dismiss or delete. The native Input still owns paste insertion.
+    if (this.routeBracketedPaste(data)) {
+      this.feedSavedQueryInput(data);
+      return;
+    }
     // Fence the held Escape that canceled only a host-owned form across focus
     // domains until its release or a fresh Escape press.
     if (this.consumeFormEscapeClaim(data)) return;
@@ -2077,25 +2385,138 @@ export class SidebarController {
       if (returnEvent === "press") this.claimReturnToMainChord();
       return;
     }
+    if (this.consumeSavedActionClaim(data)) return;
     if (isKeyRelease(data)) return;
-    if (matchesKey(data, "up")) {
+    if (this.savedMatches(data, "tui.select.up")) {
       this.moveSavedSelection(-1);
+      this.onInvalidate?.();
       return;
     }
-    if (matchesKey(data, "down")) {
+    if (this.savedMatches(data, "tui.select.down")) {
       this.moveSavedSelection(1);
+      this.onInvalidate?.();
       return;
     }
-    // Key repeats never activate or dismiss; only initial presses do.
-    if (isKeyRepeat(data)) return;
-    if (matchesKey(data, "enter")) {
+    // Suppress repeats of host actions while preserving native Input editing repeats.
+    if (isKeyRepeat(data)) {
+      const actionRepeat = this.savedMatches(data, "app.session.delete")
+        || this.savedMatches(data, "tui.select.confirm")
+        || this.savedMatches(data, "tui.select.cancel")
+        || (this.savedQuery.length === 0
+          && this.savedMatches(data, "app.session.deleteNoninvasive"));
+      if (!actionRepeat) this.feedSavedQueryInput(data);
+      return;
+    }
+    if (this.savedMatches(data, "app.session.delete")) {
+      this.beginSavedDeleteCheck("app.session.delete");
+      return;
+    }
+    if (this.savedMatches(data, "app.session.deleteNoninvasive")) {
+      if (this.savedQuery.length === 0) this.beginSavedDeleteCheck("app.session.deleteNoninvasive");
+      else this.feedSavedQueryInput(data);
+      return;
+    }
+    if (this.savedMatches(data, "tui.select.confirm")) {
       this.activateSavedRow();
       return;
     }
-    if (matchesKey(data, "escape")) {
+    if (this.savedMatches(data, "tui.select.cancel")) {
+      this.claimSavedAction(this.savedActionMatcher("tui.select.cancel"));
+      if (matchesKey(data, "escape")) this.formEscapeClaimed = true;
       this.dismissSavedPane();
       return;
     }
+    this.feedSavedQueryInput(data);
+  }
+
+  private savedMatches(data: string, action: SidebarSavedPickerAction): boolean {
+    try {
+      return this.savedQueryInput?.matches(data, action) ?? defaultSavedActionMatch(data, action);
+    } catch {
+      return false;
+    }
+  }
+
+  private feedSavedQueryInput(data: string): void {
+    const input = this.savedQueryInput;
+    if (!input) return;
+    const before = input.getValue();
+    try { input.handleInput(data); } catch { return; }
+    const after = input.getValue();
+    if (after !== before) {
+      this.displayedSavedRows = undefined;
+      this.savedQueryRevision += 1;
+      if (this.savedPickerId !== undefined) {
+        this.emit({
+          type: "saved-search",
+          pickerId: this.savedPickerId,
+          revision: this.savedQueryRevision,
+          query: after,
+        });
+      }
+    }
+    this.onInvalidate?.();
+  }
+
+  private beginSavedDeleteCheck(action: "app.session.delete" | "app.session.deleteNoninvasive"): void {
+    if (this.pendingSavedList !== undefined || this.pendingSavedOpen !== undefined
+      || this.pendingSavedDeleteCheck !== undefined || this.savedDeleteTarget !== undefined) return;
+    const row = this.savedRows[this.savedSelectedIndex];
+    const shown = this.displayedSavedRows;
+    const pickerId = this.savedPickerId;
+    if (row === undefined || shown === undefined || pickerId === undefined
+      || !shown.entries.some((entry) => entry.index === this.savedSelectedIndex && entry.entry === row)) return;
+    const requestId = this.nextRequestId++;
+    const context: SavedDeleteContext = Object.freeze({
+      pickerId,
+      requestId,
+      id: row.id,
+      file: row.file,
+      revision: this.savedQueryRevision,
+      row: Object.freeze({ ...row }),
+    });
+    this.pendingSavedDeleteCheck = context;
+    this.displayedSavedRows = undefined;
+    this.savedError = undefined;
+    this.claimSavedAction(this.savedActionMatcher(action));
+    this.emit({
+      type: "saved-delete-prepare",
+      pickerId,
+      requestId,
+      id: row.id,
+      file: row.file,
+      revision: this.savedQueryRevision,
+    });
+  }
+
+  private claimSavedAction(matches: (data: string) => boolean): void {
+    this.savedActionClaims.push(matches);
+    if (this.savedActionClaims.length > 8) this.savedActionClaims.splice(0, this.savedActionClaims.length - 8);
+  }
+
+  private savedActionMatcher(action: SidebarSavedPickerAction): (data: string) => boolean {
+    const input = this.savedQueryInput;
+    return input === undefined
+      ? (data) => defaultSavedActionMatch(data, action)
+      : (data) => input.matches(data, action);
+  }
+
+  private consumeSavedActionClaim(data: string): boolean {
+    let consumed = false;
+    for (const matches of [...this.savedActionClaims]) {
+      let matched = false;
+      try { matched = matches(data); } catch { /* malformed event is not a match */ }
+      if (!matched) continue;
+      if (isKeyRelease(data)) {
+        this.savedActionClaims.splice(this.savedActionClaims.indexOf(matches), 1);
+        consumed = true;
+      } else if (isKeyRepeat(data)) {
+        consumed = true;
+      } else {
+        this.savedActionClaims.splice(this.savedActionClaims.indexOf(matches), 1);
+      }
+    }
+    return consumed;
   }
 
   private moveSavedSelection(delta: number): void {
@@ -2128,7 +2549,9 @@ export class SidebarController {
     // Claim the fresh submit key that opened the saved conversation: its
     // repeat/release must not reach the newly focused native child after a
     // successful completion. The picker's open key is Enter.
-    this.formSubmitClaim = (data) => matchesKey(data, "enter");
+    const confirmMatcher = this.savedActionMatcher("tui.select.confirm");
+    this.formSubmitClaim = confirmMatcher;
+    this.claimSavedAction(confirmMatcher);
     this.emit({ type: "saved-open", requestId, file: row.file, sessionId: row.id });
   }
 
@@ -2137,28 +2560,32 @@ export class SidebarController {
    * the pane. Stale completions (dismissed or superseded panes) are ignored
    * entirely and never seize a later-opened or dismissed UI.
    */
-  completeSavedList(requestId: number, rows: readonly SidebarSavedRow[], issueCount: number): boolean {
+  completeSavedList(
+    requestId: number,
+    rows: readonly SidebarSavedRow[],
+    issueCount: number,
+    pickerId = requestId,
+  ): boolean {
     if (this.pendingSavedList?.requestId !== requestId) return false; // stale: ignore
+    if (this.savedPickerId !== pickerId || (this.formKind !== "saved" && this.confirmPurpose !== "saved-delete")) return false;
     this.pendingSavedList = undefined;
-    const accepted: SidebarSavedRow[] = [];
-    for (const row of Array.isArray(rows) ? rows : []) {
-      if (!row || typeof row.id !== "string" || row.id.length === 0
-        || typeof row.file !== "string" || row.file.length === 0
-        || typeof row.caption !== "string") continue;
-      accepted.push({
-        id: row.id,
-        file: row.file,
-        caption: sanitizeBounded(row.caption, SAVED_CAPTION_MAX_CODEPOINTS),
-        ...(typeof row.cwd === "string" && row.cwd.length > 0
-          ? { cwd: sanitizeBounded(row.cwd, SAVED_WORKSPACE_MAX_CODEPOINTS) }
-          : {}),
-      });
-    }
-    this.savedRows = accepted;
+    this.savedRows = sanitizeSavedRows(rows);
     this.displayedSavedRows = undefined; // catalog replacement invalidates the display record
     this.savedIssueCount = Number.isSafeInteger(issueCount) && issueCount > 0 ? issueCount : 0;
-    this.savedError = undefined;
-    if (this.savedSelectedIndex >= this.savedRows.length) this.savedSelectedIndex = 0;
+    this.savedError = this.savedError ?? this.savedQueryNotice;
+    if (this.savedSelectedIndex >= this.savedRows.length) this.savedSelectedIndex = Math.max(0, this.savedRows.length - 1);
+    return true;
+  }
+
+  /** Replace picker rows only for the exact current private-catalog query revision. */
+  completeSavedSearch(pickerId: number, revision: number, rows: readonly SidebarSavedRow[]): boolean {
+    if (this.savedPickerId !== pickerId || this.savedQueryRevision !== revision
+      || this.formKind !== "saved" || this.pendingSavedList !== undefined) return false;
+    const accepted = sanitizeSavedRows(rows);
+    this.displayedSavedRows = undefined;
+    this.savedRows = accepted;
+    if (this.savedSelectedIndex >= this.savedRows.length) this.savedSelectedIndex = Math.max(0, this.savedRows.length - 1);
+    this.onInvalidate?.();
     return true;
   }
 
@@ -2167,6 +2594,7 @@ export class SidebarController {
     if (this.pendingSavedList?.requestId !== requestId) return; // stale: ignore
     this.pendingSavedList = undefined;
     this.savedError = sanitizeBounded(message, ERROR_TEXT_MAX_CODEPOINTS);
+    this.displayedSavedRows = undefined;
   }
 
   /**
@@ -2181,6 +2609,9 @@ export class SidebarController {
     this.pendingSavedOpen = undefined;
     if (this._focus === "form" && this.formKind === "saved") {
       this.savedError = undefined;
+      if (this.savedPickerId !== undefined) this.emit({ type: "saved-dismiss", pickerId: this.savedPickerId });
+      this.clearSavedPickerState();
+      this.displayedSavedRows = undefined;
       this.disposeFormField();
       this.formKind = undefined;
       this.acceptCompletedRow(id);
@@ -2196,6 +2627,28 @@ export class SidebarController {
     if (this._focus === "form" && this.formKind === "saved") {
       this.savedError = sanitizeBounded(message, ERROR_TEXT_MAX_CODEPOINTS);
     }
+  }
+
+  private clearSavedPickerState(): void {
+    this.disposeSavedQueryInput();
+    this.savedPickerId = undefined;
+    this.savedQueryRevision = 0;
+    this.savedQueryNotice = undefined;
+    this.savedRows = [];
+    this.savedIssueCount = 0;
+    this.savedSelectedIndex = 0;
+    this.savedListTop = 0;
+    this.pendingSavedDeleteCheck = undefined;
+    this.savedDeleteTarget = undefined;
+    this.savedDeleteOperation = undefined;
+    this.invalidateSavedDeleteConfirmationDisplay();
+    this.confirmPurpose = "quit";
+  }
+
+  private disposeSavedQueryInput(): void {
+    const input = this.savedQueryInput;
+    this.savedQueryInput = undefined;
+    try { input?.dispose(); } catch { /* private query text is discarded even if UI cleanup fails */ }
   }
 
   private openNewForm(): void {
@@ -2444,7 +2897,9 @@ export class SidebarController {
     if (this.consumeFormEscapeClaim(data)) return;
     if (this.consumeClaimedReturnChord(data)) return;
     // The reserved toggle takes precedence over the separate return chord.
-    if (this.handleReservedToggle(data)) {
+    if (this.handleReservedToggle(data, () => {
+      if (this.confirmPurpose === "saved-delete") this.dismissSavedPane();
+    })) {
       return;
     }
     const returnEvent = hostKeyEventType(data, this.returnToMainKey);
@@ -2452,7 +2907,12 @@ export class SidebarController {
       if (returnEvent === "press") this.claimReturnToMainChord();
       return;
     }
+    if (this.consumeSavedActionClaim(data)) return;
     if (isKeyRelease(data)) {
+      return;
+    }
+    if (this.confirmPurpose === "saved-delete") {
+      this.handleSavedDeleteConfirmInput(data);
       return;
     }
     if (this.confirmPurpose === "stop-remove") {
@@ -2477,6 +2937,39 @@ export class SidebarController {
     if (printable === "n" || printable === "N") {
       this._focus = "sidebar";
     }
+  }
+
+  private handleSavedDeleteConfirmInput(data: string): void {
+    if (this.consumeSavedActionClaim(data)) return;
+    if (isKeyRepeat(data) || isKeyRelease(data)) return;
+    if (this.savedMatches(data, "tui.select.cancel")) {
+      this.claimSavedAction(this.savedActionMatcher("tui.select.cancel"));
+      if (matchesKey(data, "escape")) this.formEscapeClaimed = true;
+      this.cancelSavedDeleteConfirmation();
+      return;
+    }
+    if (!this.savedDeleteConfirmationDisplayed || !this.savedMatches(data, "tui.select.confirm")) return;
+    const target = this.savedDeleteTarget;
+    if (!target || this.savedPickerId !== target.pickerId) return;
+    this.savedDeleteOperation = target;
+    this.claimSavedAction(this.savedActionMatcher("tui.select.confirm"));
+    this.emit({
+      type: "saved-delete",
+      pickerId: target.pickerId,
+      requestId: target.requestId,
+      id: target.id,
+      file: target.file,
+      revision: target.revision,
+    });
+  }
+
+  private cancelSavedDeleteConfirmation(): void {
+    this.savedDeleteTarget = undefined;
+    this.savedDeleteOperation = undefined;
+    this.invalidateSavedDeleteConfirmationDisplay();
+    this.confirmPurpose = "quit";
+    this._focus = "form";
+    this.onInvalidate?.();
   }
 
   /**
@@ -2895,18 +3388,23 @@ export class SidebarController {
    * hints. It occupies the same form-pane slot (right pane on wide layouts,
    * full-content overlay on narrow ones) as New/Edit.
    */
-  private renderSavedPane(cols: number, rows: number): { lines: string[] } {
+  private renderSavedPane(cols: number, rows: number): { lines: string[]; cursor?: { column: number; row: number } } {
     // A fresh render starts with no displayed rows; a too-small fallback never
     // establishes a displayable selection, so the saved-open guard stays closed.
     this.displayedSavedRows = undefined;
     const header = " Saved conversations ";
+    const queryLine = this.renderSavedQueryLine(cols);
     const footerLines = wrapHintLines(
-      [`${this.toggleLabel} toggle`, "up/down select", "enter open", "esc back"],
+      [
+        `${this.toggleLabel} toggle / ${this.savedKeyHint("tui.select.up", "up")}/${this.savedKeyHint("tui.select.down", "down")} select`,
+        `${this.savedKeyHint("tui.select.confirm", "enter")} open / ${this.savedKeyHint("tui.select.cancel", "esc")} back`,
+        `${this.savedKeyHint("app.session.delete", "ctrl+d")} delete / ${this.savedKeyHint("app.session.deleteNoninvasive", "ctrl+backspace")} empty`,
+      ],
       cols,
     );
-    const noticeLines = this.savedError === undefined
-      ? []
-      : wrapHintLines([`! ${this.savedError}`], cols);
+    const notices = [this.savedError, this.savedQueryNotice]
+      .filter((message, index, all): message is string => message !== undefined && all.indexOf(message) === index);
+    const noticeLines = notices.length === 0 ? [] : wrapHintLines(notices.map((message) => `! ${message}`), cols);
     const issueLines = this.pendingSavedList === undefined && this.savedIssueCount > 0
       ? wrapHintLines([`${this.savedIssueCount} catalog issue(s) not shown`], cols)
       : [];
@@ -2916,13 +3414,13 @@ export class SidebarController {
     }
     // The fixed details area is reserved between the list and the footer so
     // notices can never displace it or make an impossible action look done.
-    const fixedRows = 1 + SAVED_DETAILS_ROWS + noticeLines.length + issueLines.length + footerLines.length;
+    const fixedRows = 2 + SAVED_DETAILS_ROWS + noticeLines.length + issueLines.length + footerLines.length;
     const listRows = rows - fixedRows;
     if (listRows < 1) {
       return this.renderTooSmall(cols, rows);
     }
 
-    const lines: string[] = [wrapRow(header, cols, "\x1b[1m")];
+    const lines: string[] = [wrapRow(header, cols, "\x1b[1m"), queryLine.line];
     let y = 0;
     if (this.pendingSavedList !== undefined) {
       lines.push(wrapRow(" Loading saved conversations... ", cols));
@@ -2932,7 +3430,8 @@ export class SidebarController {
       // successful issue-free empty one says "No saved conversations".
       if (this.savedError === undefined) {
         lines.push(wrapRow(
-          this.savedIssueCount > 0 ? " No conversations could be listed " : " No saved conversations ",
+          this.savedQuery.trim().length > 0 ? " No matching saved conversations "
+            : this.savedIssueCount > 0 ? " No conversations could be listed " : " No saved conversations ",
           cols,
         ));
         y += 1;
@@ -2968,7 +3467,35 @@ export class SidebarController {
     for (const issueLine of issueLines) lines.push(wrapRow(issueLine, cols));
     lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
     for (const footerLine of footerLines) lines.push(wrapRow(footerLine, cols));
-    return { lines };
+    return { lines, cursor: queryLine.cursor };
+  }
+
+  private renderSavedQueryLine(cols: number): { readonly line: string; readonly cursor: { column: number; row: number } } {
+    let rendered: string[];
+    try { rendered = this.savedQueryInput?.render(cols) ?? []; } catch { rendered = []; }
+    const source = rendered[0] ?? "";
+    const markerIndex = source.indexOf(CURSOR_MARKER);
+    const beforeMarker = markerIndex >= 0 ? source.slice(0, markerIndex) : source;
+    const safeBefore = sanitizeBounded(beforeMarker, MAX_SAVED_QUERY_DISPLAY_CODEPOINTS);
+    const withoutMarker = source.split(CURSOR_MARKER).join("");
+    const safeLine = sanitizeBounded(withoutMarker, MAX_SAVED_QUERY_DISPLAY_CODEPOINTS);
+    return {
+      line: wrapRow(safeLine, cols),
+      cursor: {
+        column: Math.min(visibleWidth(safeBefore), cols - 1),
+        row: 1,
+      },
+    };
+  }
+
+  private savedKeyHint(action: SidebarSavedPickerAction, fallback: string): string {
+    try {
+      const keys = this.savedQueryInput?.keys?.(action);
+      if (keys !== undefined && keys.length > 0) {
+        return keys.map((key) => key === "escape" ? "esc" : key).join("/");
+      }
+    } catch { /* render a truthful native default if the manager is unavailable */ }
+    return fallback;
   }
 
   /**
@@ -3034,6 +3561,9 @@ export class SidebarController {
   }
 
   private renderConfirmPane(cols: number, rows: number): { lines: string[] } {
+    if (this.confirmPurpose === "saved-delete") {
+      return this.renderSavedDeleteConfirmPane(cols, rows);
+    }
     if (this.confirmPurpose === "stop-remove") {
       return this.renderStopRemoveConfirmPane(cols, rows);
     }
@@ -3058,6 +3588,52 @@ export class SidebarController {
     for (const line of hintLines) {
       lines.push(wrapRow(line, cols));
     }
+    return { lines };
+  }
+
+  /** Confirmation is enabled only after the entire exact target and warning fit. */
+  private renderSavedDeleteConfirmPane(cols: number, rows: number): { lines: string[] } {
+    this.invalidateSavedDeleteConfirmationDisplay();
+    const context = this.savedDeleteTarget;
+    const header = " Delete saved conversation? ";
+    const hints = wrapHintLines([
+      `${this.savedKeyHint("tui.select.confirm", "enter")} confirm`,
+      `${this.savedKeyHint("tui.select.cancel", "esc")} cancel`,
+    ], cols);
+    const warnings = wrapHintLines([
+      "Only this saved file is removed; the host will not stop any child.",
+      "If trash fails, this file is permanently unlinked.",
+    ], cols);
+    if (!context || hints === undefined || warnings === undefined || visibleWidth(header) > cols) {
+      return this.renderTooSmall(cols, rows);
+    }
+
+    const file = sanitizeBounded(context.row.file, SAVED_WORKSPACE_MAX_CODEPOINTS);
+    const caption = sanitizeBounded(context.row.caption, SAVED_CAPTION_MAX_CODEPOINTS);
+    // The exact file path is the deletion identity and must remain complete;
+    // the caption is only a short visual aid. Private session ids are omitted.
+    if (file !== context.row.file) return this.renderTooSmall(cols, rows);
+    const captionPrefix = "Conversation: ";
+    const captionWidth = cols - visibleWidth(captionPrefix);
+    if (captionWidth < 1) return this.renderTooSmall(cols, rows);
+    const visibleCaption = truncateToWidth(caption, captionWidth, "...", true);
+    const targetText = [`${captionPrefix}${visibleCaption}`, `Saved file: ${file}`];
+    const targetLines: string[] = [];
+    const availableTargetRows = rows - 1 - warnings.length - hints.length;
+    if (availableTargetRows < targetText.length) return this.renderTooSmall(cols, rows);
+    for (const text of targetText) {
+      const wrapped = wrapExactField(text, cols, availableTargetRows - targetLines.length);
+      if (wrapped === undefined) return this.renderTooSmall(cols, rows);
+      targetLines.push(...wrapped);
+    }
+    if (1 + targetLines.length + warnings.length + hints.length > rows) return this.renderTooSmall(cols, rows);
+
+    const lines = [wrapRow(header, cols, "\x1b[1m")];
+    for (const line of targetLines) lines.push(wrapRow(line, cols));
+    for (const line of warnings) lines.push(wrapRow(line, cols));
+    lines.push(...blankLines(Math.max(0, rows - lines.length - hints.length)));
+    for (const line of hints) lines.push(wrapRow(line, cols));
+    this.savedDeleteConfirmationRenderToken = this.nextSavedDeleteConfirmationRenderToken++;
     return { lines };
   }
 
@@ -3157,6 +3733,28 @@ function wrapBoundedField(text: string, cols: number, maxLines: number): string[
   }
   while (lines.length < maxLines) lines.push("");
   return lines.slice(0, maxLines);
+}
+
+/** Wrap without clipping: undefined means the complete value cannot be shown. */
+function wrapExactField(text: string, cols: number, maxLines: number): string[] | undefined {
+  if (cols < 1 || maxLines < 1) return undefined;
+  const lines: string[] = [];
+  let line = "";
+  let width = 0;
+  for (const grapheme of detailGraphemes.segment(text)) {
+    const graphemeWidth = visibleWidth(grapheme.segment);
+    if (graphemeWidth > cols) return undefined;
+    if (width + graphemeWidth > cols) {
+      lines.push(line);
+      if (lines.length >= maxLines) return undefined;
+      line = "";
+      width = 0;
+    }
+    line += grapheme.segment;
+    width += graphemeWidth;
+  }
+  lines.push(line);
+  return lines.length <= maxLines ? lines : undefined;
 }
 
 function renderActivityLines(activity: readonly string[], cols: number): string[] {

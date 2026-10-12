@@ -501,7 +501,12 @@ test("pure saved-pane predicate distinguishes the real right picker from roster 
   );
   const openPicker = compose(
     ["Sessions (1)", "Saved conversations", "New session", "Quit host"],
-    ["Saved conversations", "up/down select", "enter open"],
+    ["Saved conversations", "F8 toggle / up/down select | enter open / esc/ctrl+c back",
+      "ctrl+d delete / ctrl+backspace empty"],
+  );
+  const stalePickerFooter = compose(
+    ["Sessions (1)", "Saved conversations", "New session", "Quit host"],
+    ["Saved conversations", "F8 toggle | up/down select | enter open | esc back"],
   );
   const canceledPicker = compose(
     ["Sessions (1)", "Saved conversations", "New session", "Quit host", "enter open"],
@@ -512,6 +517,8 @@ test("pure saved-pane predicate distinguishes the real right picker from roster 
     "the ordinary roster's Saved action and shared enter-open hint are not picker evidence");
   assert.equal(isSavedPane(openPicker), true,
     "the actual right-hand Saved header and picker-specific navigation hint identify the pane");
+  assert.equal(isSavedPane(stalePickerFooter), false,
+    "the former combined/default-only footer is not evidence of the current native picker");
   assert.equal(isSavedPane(canceledPicker), false,
     "after cancellation, left-roster text cannot make the native Main pane look like the picker");
 
@@ -525,8 +532,13 @@ test("pure saved-pane predicate distinguishes the real right picker from roster 
     lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
   const publicRoster = plain(controller.renderRoster(32, 49).lines);
   const publicForm = plain(controller.renderForm(87, 49).lines);
-  assert.ok(publicForm.some((line) => line.split(" | ").includes("up/down select")),
-    "the actual 87-column Saved renderer combines picker navigation with its other footer hints");
+  assert.ok(publicForm.some((line) => line.includes("Loading saved conversations")),
+    "the current right-hand picker remains identifiable while its native catalog is loading");
+  assert.ok(publicForm.some((line) =>
+    line.trim() === "F8 toggle / up/down select | enter open / esc/ctrl+c back"),
+    "the actual 87-column Saved renderer combines picker navigation with native configurable cancel keys");
+  assert.ok(publicForm.some((line) => line.trim() === "ctrl+d delete / ctrl+backspace empty"),
+    "the actual Saved renderer retains both native delete bindings in its footer");
   const publicPicker = compose(publicRoster, publicForm);
   assert.equal(isSavedPane(publicPicker), true,
     "the right-pane predicate recognizes the combined footer from the actual public Saved renderer");
@@ -575,14 +587,50 @@ test("native Saved witness requires a single selected summary and complete recor
   assert.equal(isCompleteSavedSelection(complete, caption, cwd), true);
   assert.equal(isCompleteSavedSelection(complete, caption, `${cwd}-wrong`), false);
   assert.equal(isCompleteSavedSelection(complete, "Wrong caption", cwd), false);
-  const noFooter = [...right]; noFooter[48] = "";
+  const footerStart = right.findIndex((line) =>
+    line.trim() === "F8 toggle / up/down select | enter open / esc/ctrl+c back");
+  assert.ok(footerStart >= 0, "the actual Saved renderer exposes the native combined footer hints");
+  const noFooter = [...right]; noFooter[footerStart + 1] = "";
   assert.equal(isCompleteSavedSelection(compose(noFooter), caption, cwd), false);
-  const partialDetails = [...right]; partialDetails[47] = "";
+  const partialDetails = [...right]; partialDetails[footerStart - 1] = "";
   assert.equal(isCompleteSavedSelection(compose(partialDetails), caption, cwd), false);
-  const duplicateRow = [...right]; duplicateRow[2] = duplicateRow[1];
+  const staleCancelHint = [...right]; staleCancelHint[footerStart] = "F8 toggle / up/down select | enter open / esc back";
+  assert.equal(isCompleteSavedSelection(compose(staleCancelHint), caption, cwd), false,
+    "the old default-only cancel hint is not a complete native Saved footer");
+  const duplicateRow = [...right];
+  const selectedSummary = right.findIndex((line) => line.startsWith("> Saved fixture") && line.includes(" | "));
+  assert.ok(selectedSummary >= 2, "the selected summary follows the query row");
+  duplicateRow[selectedSummary + 1] = right[selectedSummary]!;
   assert.equal(isCompleteSavedSelection(compose(duplicateRow), caption, cwd), false);
   assert.equal(hasFullWidthNativeEditorRule(compose(["─".repeat(47)]), 87), false);
   assert.equal(hasFullWidthNativeEditorRule(compose(["─".repeat(87)]), 87), true);
+});
+
+test("native position witness excludes shifting host actions by kind, not conversation title", () => {
+  const entries = (labels: string[]): RosterEntry[] => {
+    const controller = new SidebarController({ settingsAvailable: true });
+    controller.updateItems(labels.map((label, index) => ({
+      id: `synthetic-${index}`, label, workspace: "/owned/workspace",
+      agentDir: "/owned/agent", lifecycle: "alive" as const, busy: false,
+      pendingInput: false, inputSurface: false, activity: [],
+    })));
+    const lines = controller.renderRoster(32, 49).lines
+      .map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+    const frame = ["Session host", ...lines.map((line) => `${line.padEnd(32)}│native pane`)].join("\n");
+    assert.equal(isCompleteRosterFrame(frame), true);
+    return rosterEntries(frame);
+  };
+  const before = entries(["Quit host"]);
+  const after = entries(["Quit host", "New native"]);
+  assert.ok(before.some((entry) => entry.kind === "action" && entry.label === "Host shortcuts"));
+  assert.doesNotThrow(() => assertEarlierNativeRowsStayAtTheirObservedPositions(before, after),
+    "adding a native child shifts all host action rows, including Host shortcuts");
+  assert.throws(() => assertEarlierNativeRowsStayAtTheirObservedPositions(before, entries(["New native", "Quit host"])),
+    "a native conversation named like a host action must still retain its observed position");
+  const actionReplacement: RosterEntry[] = [...after];
+  actionReplacement[0] = { kind: "action", position: 0, label: "Quit host", selected: false, rows: 1, raw: "Quit host" };
+  assert.throws(() => assertEarlierNativeRowsStayAtTheirObservedPositions(before, actionReplacement),
+    "a same-label host action cannot stand in for the native card");
 });
 
 test("pure complete-roster witness rejects duplicate action rows during incremental repaint", () => {

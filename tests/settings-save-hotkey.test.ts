@@ -219,7 +219,7 @@ test("prior session-only catalog edit and alreadyRun edit persist on a reopen Ct
     [...down(2), KEY_ENTER], // model picker: Unset, Keep current → Opus 5.5
     [...down(3), KEY_ENTER], // edit re-show (model) → Apply edit
     [...down(2), KEY_ENTER], // list re-show → Back
-    [...down(12), KEY_ENTER], // root re-show (External workers) → Scheduled tasks
+    [...down(14), KEY_ENTER], // root re-show (External workers) → Scheduled tasks
     [KEY_ENTER], // task list → Once
     [...down(10), KEY_ENTER], // entry editor → Already run
     [...down(2), KEY_ENTER], // entry re-show (Already run) → Back
@@ -249,7 +249,7 @@ test("Ctrl+S in a deep nested permissions submenu persists the staged toggle wit
   const h = await hotkeyWorkspace({ enabled: false, review: { primaryReviewers: [], subtaskReviewers: [] } });
   t.after(() => h.cleanup());
   await h.run("review-settings", [
-    [...down(16), KEY_ENTER], // root → Web
+    [...down(18), KEY_ENTER], // root → Web
     [...down(5), KEY_ENTER], // web settings → Browser permissions
     [...down(5), KEY_ENTER], // permissions → Model camera (toggle On)
     [CTRL_S], // permissions re-show: request save from the nested submenu

@@ -78,6 +78,8 @@ const ROOT_SETTING_LABELS = [
   "Retry policy",
   "Subtask notifications",
   "Deferred Pi tools",
+  "YouShouldKnow notices",
+  "Completion guidance",
   "Subtasks view",
   "Scheduled tasks",
   "Web",
@@ -177,6 +179,38 @@ async function sessionWorkspace(body: Record<string, unknown>): Promise<Harness>
     },
   };
 }
+
+test("YouShouldKnow controls apply on Escape, cancel transactionally, and persist independently on Save", async () => {
+  const h = await sessionWorkspace({
+    enabled: true,
+    youShouldKnow: { enabled: true, completionGuidance: true },
+  });
+
+  await h.run([rootSettingsRow("YouShouldKnow notices", "On"), undefined]);
+  assert.equal(h.config.youShouldKnow?.enabled, false, "root Escape applies notice availability to this session");
+  assert.equal(h.config.youShouldKnow?.completionGuidance, true, "the guidance setting is independent");
+  assert.equal(await readFile(h.configPath, "utf8"), h.original, "session-only changes do not write the file");
+
+  await h.run([rootSettingsRow("YouShouldKnow notices", "Off"), "Cancel"]);
+  assert.equal(h.config.youShouldKnow?.enabled, false, "Cancel preserves the previously applied session state");
+  assert.equal(await readFile(h.configPath, "utf8"), h.original, "Cancel writes nothing");
+
+  await h.run([rootSettingsRow("YouShouldKnow notices", "Off"), "Save changes"]);
+  assert.equal(h.config.youShouldKnow?.enabled, true);
+  assert.equal(h.config.youShouldKnow?.completionGuidance, true);
+  assert.deepEqual(JSON.parse(await readFile(h.configPath, "utf8")).youShouldKnow, {
+    enabled: true,
+    completionGuidance: true,
+  });
+
+  await h.run([rootSettingsRow("Completion guidance", "On"), "Save changes"]);
+  assert.equal(h.config.youShouldKnow?.enabled, true, "guidance-off does not turn off notice availability");
+  assert.equal(h.config.youShouldKnow?.completionGuidance, false);
+  assert.deepEqual(JSON.parse(await readFile(h.configPath, "utf8")).youShouldKnow, {
+    enabled: true,
+    completionGuidance: false,
+  });
+});
 
 test("root Escape applies the staged executor switch session-only; Cancel after a further edit keeps it", async () => {
   const h = await sessionWorkspace({

@@ -77,6 +77,7 @@ const SKILL_FIXTURE_FILES: ReadonlyArray<readonly [string, readonly string[]]> =
   ["pi-review-gate-orchestrator", ["SKILL.md", "references/recovery.md"]],
   ["pi-review-gate-execution", ["SKILL.md"]],
   ["pi-review-gate-research", ["SKILL.md"]],
+  ["pi-review-gate-completion", ["SKILL.md"]],
 ];
 
 /** Synthetic package root with inert fixtures satisfying the legacy descriptor checks. */

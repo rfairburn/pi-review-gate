@@ -35,6 +35,12 @@ dates.
   moves/crops reuse resident data with scoped placement updates instead of
   retransmitting the PNG. Ownership, clipping, bounded output/backpressure, and
   cleanup/restoration fences remain intact (#363).
+- Native synchronized redraws now commit text, cursor, and graphics together,
+  with alternate-screen image anchors checked against the completed covered rows instead
+  of stale text from an unfinished redraw. This prevents false image disappearance
+  and repeated PNG uploads between a native placement deletion and its replacement.
+  Frame holds are bounded; retained graphics remain budgeted, and incomplete frames
+  cannot authorize native mouse clicks against stale contents (#363).
 - Unchanged eligible source-sidebar launches reuse a verified completed staged
   build instead of installing dependencies and compiling the extension every time.
   Exact source/toolchain changes invalidate reuse; unsafe or incomplete cached

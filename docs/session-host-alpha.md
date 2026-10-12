@@ -583,9 +583,22 @@ Mutable or accessor-backed image values do not receive that validation-cache tru
 
 Queued text-only output is parsed in bounded batches again, avoiding one xterm
 parse cycle and snapshot per child chunk. Potential graphics commands remain
-parse-order barriers, and existing alternate-screen graphics anchors retain their
-per-chunk checks. This preserves the earlier row-diff/coalescing optimization;
-it does not change the redraw interval or promise a physical frame rate.
+parse-order barriers. Native synchronized redraws publish text, cursor, and graphics
+as a completed frame, rather than exposing a temporary image deletion before its
+replacement. New alternate-screen image anchors are captured against the completed
+covered rows; older anchors are validated, not moved onto unrelated text. Unframed
+output retains its ordinary overwrite and destructive-control checks.
+
+A synchronized-frame hold has fixed internal limits of 1 second, 8 MiB, and 8192
+child chunks; an exceeded limit ends the hold and resumes unframed processing.
+Resize, buffer changes, reset, parser failure, and disposal cannot retain stale
+geometry or strand a hold. Snapshot-held image data and placements remain charged
+to the shared graphics budget until released. Keyboard encoding follows the child's
+live modes; native mouse packets are withheld while a frame is incomplete to avoid
+authorizing clicks against stale contents. Outer terminal mouse capture follows the
+last committed reporting request during the hold, avoiding off/on churn or stuck
+reporting after a no-change commit. No setting or redraw-rate cap is added.
+These changes preserve row-diff/coalescing; they do not promise a physical frame rate.
 
 Source, unit, and controlled-PTY tests establish parsing, placement commands,
 identity fences, and cleanup ordering; they do **not** prove pixels appeared in a

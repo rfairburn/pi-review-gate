@@ -1,12 +1,12 @@
 /**
  * Pending-question list UI (issue #95).
  *
- * One plain structural Component (render/handleInput/invalidate) with two
- * modes, shown through `ctx.ui.custom()` from the pending-question shortcut.
- * The host's showExtensionCustom saves and restores the editor text around
- * the component, so opening and closing the list preserves the user's draft
- * without any work here; while it has focus, all input — including Escape
- * — is handled by this component, so it never triggers Pi's abort.
+ * One plain structural Component (render/handleInput/invalidate) with shared
+ * list/question-answer/notice-detail modes in the shared public custom
+ * overlay. The host leaves the underlying editor in place; the native-editor
+ * bridge restores its captured draft when this interaction closes. While the
+ * overlay has focus, all input — including Escape — is handled by this
+ * component, so it never triggers Pi's abort.
  *
  * - List mode: every pending question of the current session, in creation
  *   order, read live from the controller on each render (a question that
@@ -17,6 +17,12 @@
  *   back, so nothing declines by accident. There is no length cap on
  *   answers — a long paste or typed draft is kept in full and can be
  *   submitted as-is (the controller applies no answer bound).
+ * - Notice mode: the selected notice's complete Markdown body and optional
+ *   context use the same host Markdown component as question content and have
+ *   exactly More details and Close actions. More details closes this popup and
+ *   reports the selected notice for ordinary owner-session delivery; Close
+ *   removes only it. The overlay's public maxHeight and margins define the
+ *   manual viewport, which pages the shared content within that geometry.
  *
  * Navigation, confirm, cancel, cursor movement, and deletion resolve through
  * the host's live KeybindingsManager (`tui.select.*`, `tui.editor.*`), so
@@ -27,7 +33,7 @@
  * Free-text editing: the free-text row embeds the SAME host-wired native
  * editor instance the /review-settings text fields use — acquired through
  * the shared host-wired bridge (src/native-editor-bridge.ts) before this
- * component's `ctx.ui.custom` slot opens, so no nested second modal and no
+ * component's `ctx.ui.custom` overlay opens, so no nested second modal and no
  * second editing engine exist. The instance is the single source of truth
  * for the draft text and cursor: native main-chat Tab path/subpath/`~/`
  * completion, the fd-backed `@` picker, Ctrl+C clears (never cancels),
@@ -48,8 +54,10 @@
  */
 
 import type { FieldEditorInstance } from "../native-editor-bridge";
-import type { QuestionTuiHost } from "./pi-tui-host";
-import type { SubmitResult, UserQuestionController } from "./controller";
+import { safeMarkdownDisplaySource } from "../markdown-safety";
+import { visibleTerminalText } from "../tool-result-text";
+import type { QuestionMarkdownComponent, QuestionScrollViewComponent, QuestionTuiHost } from "./pi-tui-host";
+import type { PendingNotice, PendingUserInput, SubmitResult, UserQuestionController } from "./controller";
 
 /** The approved chord; the label shown to users is platform-specific. */
 export const QUESTION_LIST_SHORTCUT_KEY = "ctrl+alt+up";
@@ -65,7 +73,8 @@ export interface QuestionUiTheme {
 
 export type QuestionListDone =
   | { kind: "closed" }
-  | { kind: "submitted"; result: SubmitResult };
+  | { kind: "submitted"; result: SubmitResult }
+  | { kind: "notice-details"; noticeId: string };
 
 export interface QuestionListComponentOptions {
   controller: UserQuestionController;
@@ -89,6 +98,12 @@ export interface QuestionListComponentOptions {
    * without submitting and never displays another session's questions.
    */
   isStale?: () => boolean;
+  /** Row budget matching the custom overlay's public maxHeight. */
+  getViewportRows?: () => number | undefined;
+  /** Invalidate the live TUI after component/controller state changes. */
+  requestRender?: () => void;
+  /** Test seam for exercising native ScrollView outside the custom overlay. */
+  scrollable?: boolean;
   onDone: (result: QuestionListDone) => void;
 }
 
@@ -100,41 +115,80 @@ export interface QuestionListComponent {
   setSourceProbe(probe: { isIdle?: () => boolean } | undefined): void;
 }
 
-const TYPE_ROW = "__type__";
-const DECLINE_ROW = "__decline__";
+interface RenderedMarkdown {
+  lines: string[];
+  native: boolean;
+}
 
+const TYPE_ROW = Symbol("type-answer");
+const DECLINE_ROW = Symbol("decline-answer");
+const NOTICE_MORE_DETAILS = "__more_details__";
+const NOTICE_CLOSE = "__close_notice__";
+const SCROLL_PAGE_UP_KEYS = ["ctrl+alt+pageup", "shift+alt+up"] as const;
+const SCROLL_PAGE_DOWN_KEYS = ["ctrl+alt+pagedown", "shift+alt+down"] as const;
+const POPUP_SCROLL_HINT = "Shift+Alt+Up/Down or Ctrl+Alt+PageUp/PageDown scroll";
 export function createQuestionListComponent(options: QuestionListComponentOptions): QuestionListComponent {
   const { controller, keybindings, theme, tuiHost, shortcutLabel } = options;
   const isStale = options.isStale ?? (() => false);
-  let mode: "list" | "answer" = "list";
+  let mode: "list" | "answer" | "notice" = "list";
   let selectedId: string | undefined;
   let answerIndex = 0;
+  let noticeActionIndex = 0;
+  let manualScrollOffset = 0;
+  let answerViewportFocus: { start: number; end: number; anchor: number } | undefined;
+  let answerFocusPending = false;
+  let listViewportFocus: { start: number; end: number; anchor: number } | undefined;
+  let listFocusPending = true;
+  let lastViewportRows: number | undefined;
+  let lastListViewportRows: number | undefined;
+  let lastRenderedWidth: number | undefined;
+  let lastNativeViewportHeight = 0;
   let editing = false;
   let closed = false;
-  let cachedLines: string[] | undefined;
+  let cachedContent: { width: number; lines: string[] } | undefined;
+  let nativeScrollView: QuestionScrollViewComponent | undefined;
+  let invalidateNativeScrollView: (() => void) | undefined;
+  const markdownComponents = new Map<string, QuestionMarkdownComponent | null>();
   // The shortcut handler installs a live idle probe before the component is
   // shown; if the session rebinds while open, the stale fence closes this UI
   // before any submission can use the probe.
   let activeSourceProbe: { isIdle?: () => boolean } | undefined;
 
+  const invalidateContent = () => {
+    cachedContent = undefined;
+  };
+
   const invalidate = () => {
-    cachedLines = undefined;
+    if (mode === "answer") answerFocusPending = true;
+    if (mode === "list") listFocusPending = true;
+    invalidateContent();
+    for (const component of markdownComponents.values()) {
+      try {
+        component?.invalidate();
+      } catch {
+        // Discard a failing Markdown instance without blocking popup refresh.
+      }
+    }
+    markdownComponents.clear();
+    invalidateNativeScrollView?.();
+    options.requestRender?.();
   };
 
   // Live questions (registered while the list is open) must refresh the view.
   const unsubscribeState = controller.addStateListener(invalidate);
 
-  const close = (result?: SubmitResult) => {
+  const close = (result?: SubmitResult | { kind: "notice-details"; noticeId: string }) => {
     if (closed) return;
     closed = true;
     // End any open editing episode so the bridge's settle callback is
     // cleared: a late or stale settle must never act through this UI.
     endEditingEpisode();
     unsubscribeState();
-    options.onDone(result ? { kind: "submitted", result } : { kind: "closed" });
+    if (result && "status" in result) options.onDone({ kind: "submitted", result });
+    else options.onDone(result ?? { kind: "closed" });
   };
 
-  const pendingNow = () => controller.listPending();
+  const pendingNow = (): readonly PendingUserInput[] => controller.listPending();
 
   /** Keep the list selection on a live question; fall back to the first. */
   function currentListSelection(): string | undefined {
@@ -144,10 +198,14 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     return pending[0]!.id;
   }
 
-  function answerRows(): string[] {
+  function answerRows(): Array<string | typeof TYPE_ROW | typeof DECLINE_ROW> {
     const record = selectedId ? controller.get(selectedId) : undefined;
     const choices = record?.choices ?? [];
     return [...choices, TYPE_ROW, DECLINE_ROW];
+  }
+
+  function noticeRows(): string[] {
+    return [NOTICE_MORE_DETAILS, NOTICE_CLOSE];
   }
 
   function submitFromAnswer(result: SubmitResult): void {
@@ -161,6 +219,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       return;
     }
     mode = "list";
+    resetScroll();
     endEditingEpisode();
   }
 
@@ -214,6 +273,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
 
   /** Enter/leave editing, keeping the native field's focus flag in step. */
   function setEditing(value: boolean): void {
+    if (editing !== value && mode === "answer") answerFocusPending = true;
     editing = value;
     const field = options.nativeField;
     if (field) {
@@ -244,23 +304,31 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     if (keybindings.matches(data, "tui.select.confirm")) {
       const id = currentListSelection();
       if (!id) return;
-      if (!controller.get(id)) return;
-      mode = "answer";
+      const record = controller.getPending(id);
+      if (!record) return;
       selectedId = id;
-      answerIndex = 0;
-      // A new answer-view session starts fresh — the shared instance's text
-      // is cleared so a previous question's draft never shows or submits as
-      // this one's (the host undo history has no public clear, so an earlier
-      // deliberate Ctrl+- could still surface prior text — same as settings).
-      const field = options.nativeField;
-      if (field) {
-        try {
-          field.setText("");
-        } catch {
-          // A failing clear must not block entering the answer view.
+      resetScroll();
+      if (isNotice(record)) {
+        mode = "notice";
+        noticeActionIndex = 0;
+      } else {
+        mode = "answer";
+        answerIndex = 0;
+        answerFocusPending = true;
+        // A new answer-view session starts fresh — the shared instance's text
+        // is cleared so a previous question's draft never shows or submits as
+        // this one's (the host undo history has no public clear, so an earlier
+        // deliberate Ctrl+- could still surface prior text — same as settings).
+        const field = options.nativeField;
+        if (field) {
+          try {
+            field.setText("");
+          } catch {
+            // A failing clear must not block entering the answer view.
+          }
         }
+        endEditingEpisode();
       }
-      endEditingEpisode();
       invalidate();
       return;
     }
@@ -284,12 +352,18 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     }
     const rows = answerRows();
     if (keybindings.matches(data, "tui.select.up")) {
-      if (answerIndex > 0) answerIndex -= 1;
+      if (answerIndex > 0) {
+        answerIndex -= 1;
+        answerFocusPending = true;
+      }
       invalidate();
       return;
     }
     if (keybindings.matches(data, "tui.select.down")) {
-      if (answerIndex < rows.length - 1) answerIndex += 1;
+      if (answerIndex < rows.length - 1) {
+        answerIndex += 1;
+        answerFocusPending = true;
+      }
       invalidate();
       return;
     }
@@ -311,12 +385,61 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     }
     if (keybindings.matches(data, "tui.select.cancel")) {
       mode = "list";
+      resetScroll();
       invalidate();
       return;
     }
     if (matchesShortcut(data)) {
       close();
     }
+  }
+
+  function handleNoticeInput(data: string): void {
+    const id = selectedId;
+    const record = id ? controller.getPending(id) : undefined;
+    if (!id || !record || !isNotice(record)) {
+      close();
+      return;
+    }
+    const rows = noticeRows();
+    if (keybindings.matches(data, "tui.select.up")) {
+      if (noticeActionIndex > 0) noticeActionIndex -= 1;
+      invalidate();
+      return;
+    }
+    if (keybindings.matches(data, "tui.select.down")) {
+      if (noticeActionIndex < rows.length - 1) noticeActionIndex += 1;
+      invalidate();
+      return;
+    }
+    if (keybindings.matches(data, "tui.select.confirm")) {
+      if (rows[noticeActionIndex] === NOTICE_MORE_DETAILS) {
+        // Closing first restores Pi's normal editor/transcript surface. The
+        // owner then sends only after this custom interaction has resolved.
+        close({ kind: "notice-details", noticeId: id });
+        return;
+      }
+      if (rows[noticeActionIndex] === NOTICE_CLOSE) {
+        if (!controller.closeNotice(id)) {
+          close();
+          return;
+        }
+        if (controller.listPending().length === 0) close();
+        else {
+          mode = "list";
+          resetScroll();
+          invalidate();
+        }
+        return;
+      }
+    }
+    if (keybindings.matches(data, "tui.select.cancel")) {
+      mode = "list";
+      resetScroll();
+      invalidate();
+      return;
+    }
+    if (matchesShortcut(data)) close();
   }
 
   function handleEditingInput(data: string): void {
@@ -352,11 +475,27 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     // through the live KeybindingsManager, exactly as in the main chat.
     field.focused = true;
     field.handleInput(data);
+    if (editing && mode === "answer") answerFocusPending = true;
     invalidate();
   }
 
+  function matchesPopupScroll(data: string, direction: "up" | "down"): boolean {
+    const nativeBinding = direction === "up" ? "tui.editor.pageUp" : "tui.editor.pageDown";
+    if (keybindings.matches(data, nativeBinding)) return true;
+    const keyIds = direction === "up" ? SCROLL_PAGE_UP_KEYS : SCROLL_PAGE_DOWN_KEYS;
+    return keyIds.some((keyId) => matchesHostKey(data, keyId));
+  }
+
+  function matchesHostKey(data: string, keyId: string): boolean {
+    try {
+      return typeof tuiHost?.matchesKey === "function" && tuiHost.matchesKey(data, keyId);
+    } catch {
+      return false;
+    }
+  }
+
   function matchesShortcut(data: string): boolean {
-    return typeof tuiHost?.matchesKey === "function" && tuiHost.matchesKey(data, QUESTION_LIST_SHORTCUT_KEY);
+    return matchesHostKey(data, QUESTION_LIST_SHORTCUT_KEY);
   }
 
   /** Live idle probe for async delivery; the UI carries no session state of its own. */
@@ -370,11 +509,41 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       close(); // A rebound session's UI never acts on input.
       return;
     }
+    // Reserve the open/close chord before page movement or list navigation;
+    // even a user binding that overlaps it must not turn it into scrolling.
+    if (matchesShortcut(data)) {
+      close();
+      return;
+    }
+    if (!editing && matchesPopupScroll(data, "up")) {
+      if (nativeScrollView && nativeScrollView.viewportHeight > 0) scrollNativeBy(-pageStep());
+      else manualScrollOffset = Math.max(0, manualScrollOffset - pageStep());
+      if (mode === "answer") answerFocusPending = false;
+      if (mode === "list") listFocusPending = false;
+      options.requestRender?.();
+      return;
+    }
+    if (!editing && matchesPopupScroll(data, "down")) {
+      if (nativeScrollView && nativeScrollView.viewportHeight > 0) scrollNativeBy(pageStep());
+      else manualScrollOffset += pageStep();
+      if (mode === "answer") answerFocusPending = false;
+      if (mode === "list") listFocusPending = false;
+      options.requestRender?.();
+      return;
+    }
     if (mode === "list") handleListInput(data);
-    else handleAnswerInput(data);
+    else if (mode === "answer") handleAnswerInput(data);
+    else handleNoticeInput(data);
   };
 
-  const render = (width: number): string[] => {
+  const renderContent = (width: number): string[] => {
+    if (lastRenderedWidth !== undefined && lastRenderedWidth !== width && mode === "answer") {
+      answerFocusPending = true;
+    }
+    if (lastRenderedWidth !== undefined && lastRenderedWidth !== width && mode === "list") {
+      listFocusPending = true;
+    }
+    lastRenderedWidth = width;
     if (isStale()) {
       // The session rebound while this UI was open or opening: close without
       // submitting; the new session presents its own questions through its
@@ -382,66 +551,226 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       // a stale input or settle callback already closed this component (its
       // close cleared the cache, so the check must not depend on !closed).
       close();
-      cachedLines = [theme.fg("dim", "Session changed; question list closed.")];
-      return cachedLines;
+      return [theme.fg("dim", "Session changed; question list closed.")];
     }
     if (closed) return []; // A closed component never renders live controller state.
-    if (cachedLines) return cachedLines;
-    const lines = mode === "list" ? renderList(width) : renderAnswer(width);
-    cachedLines = lines;
+    if (cachedContent?.width === width) return cachedContent.lines;
+    const lines = mode === "list"
+      ? renderList(width)
+      : mode === "answer"
+        ? renderAnswer(width)
+        : renderNotice(width);
+    cachedContent = { width, lines };
     return lines;
   };
 
+  const renderFallback = (width: number): string[] => {
+    const height = options.getViewportRows ? viewportRows() : undefined;
+    const lines = renderContent(width);
+    if (height === undefined) return lines;
+    manualScrollOffset = Math.min(Math.max(0, manualScrollOffset), Math.max(0, lines.length - height));
+    if ((mode === "answer" && (answerFocusPending || editing)) || (mode === "list" && listFocusPending)) {
+      manualScrollOffset = offsetForAnswerFocus(
+        manualScrollOffset,
+        height,
+        lines.length,
+        mode === "list" ? listViewportFocus : answerViewportFocus,
+      );
+      answerFocusPending = false;
+      listFocusPending = false;
+    }
+    return lines.slice(manualScrollOffset, manualScrollOffset + height);
+  };
+
+  const renderNativeScrollView = (width: number): string[] => {
+    const scrollView = nativeScrollView!;
+    const height = scrollView.viewportHeight;
+    if (height <= 0) {
+      lastNativeViewportHeight = 0;
+      return renderFallback(width);
+    }
+    const lines = renderContent(width);
+    const viewportHeight = Math.max(1, Math.floor(height));
+    if (lastNativeViewportHeight !== height && mode === "list") listFocusPending = true;
+    if (lastNativeViewportHeight <= 0) {
+      scrollView.scrollToStart();
+      manualScrollOffset = 0;
+      if (mode === "answer") answerFocusPending = true;
+    } else if (lastNativeViewportHeight !== height && mode === "answer") {
+      answerFocusPending = true;
+    }
+    lastNativeViewportHeight = height;
+    manualScrollOffset = Math.min(Math.max(0, manualScrollOffset), Math.max(0, lines.length - viewportHeight));
+    if ((mode === "answer" && (answerFocusPending || editing)) || (mode === "list" && listFocusPending)) {
+      const desiredOffset = offsetForAnswerFocus(
+        manualScrollOffset,
+        viewportHeight,
+        lines.length,
+        mode === "list" ? listViewportFocus : answerViewportFocus,
+      );
+      const delta = desiredOffset - manualScrollOffset;
+      if (delta !== 0) scrollNativeBy(delta);
+      answerFocusPending = false;
+      listFocusPending = false;
+    }
+    return scrollView.render(width);
+  };
+
+  function scrollNativeBy(amount: number): void {
+    const scrollView = nativeScrollView;
+    if (!scrollView || scrollView.viewportHeight <= 0) return;
+    scrollView.scrollBy(amount);
+    const lineCount = cachedContent?.lines.length;
+    const height = Math.max(1, Math.floor(scrollView.viewportHeight));
+    const maximum = lineCount === undefined ? Number.POSITIVE_INFINITY : Math.max(0, lineCount - height);
+    manualScrollOffset = Math.min(Math.max(0, manualScrollOffset + amount), maximum);
+  }
+
+  function offsetForAnswerFocus(
+    currentOffset: number,
+    height: number,
+    lineCount: number,
+    focus = answerViewportFocus,
+  ): number {
+    const maximum = Math.max(0, lineCount - height);
+    let offset = Math.min(Math.max(0, currentOffset), maximum);
+    if (!focus || lineCount === 0) return offset;
+
+    let start = Math.min(Math.max(0, focus.start), lineCount - 1);
+    let end = Math.min(Math.max(start, focus.end), lineCount - 1);
+    const anchor = Math.min(Math.max(start, focus.anchor), end);
+    if (end - start + 1 > height) start = end = anchor;
+    if (start < offset) offset = start;
+    else if (end >= offset + height) offset = end - height + 1;
+    return Math.min(Math.max(0, offset), maximum);
+  }
+
+  /**
+   * Locate the active row from the public Editor cursor and text APIs. The
+   * editor box can be taller than this overlay (especially with completions),
+   * so anchoring to its last rendered row can hide a cursor at the top.
+   */
+  function nativeFieldCursorBoxRow(field: FieldEditorInstance, editorWidth: number, boxLineCount: number): number {
+    const fallbackRow = Math.max(0, boxLineCount - 2);
+    try {
+      const cursor = field.getCursor?.();
+      const sourceLines = field.getLines?.();
+      if (!cursor || !Array.isArray(sourceLines) || sourceLines.length === 0
+        || !Number.isFinite(cursor.line) || !Number.isFinite(cursor.col)) return fallbackRow;
+
+      const reportedPadding = field.getPaddingX?.() ?? 0;
+      const maxPadding = Math.max(0, Math.floor((editorWidth - 1) / 2));
+      const padding = Math.min(maxPadding, Math.max(0, Math.floor(reportedPadding)));
+      const contentWidth = Math.max(1, editorWidth - padding * 2);
+      // The public Editor reserves one cell for its cursor when horizontal
+      // padding is zero; with padding, its layout uses the full content width.
+      const layoutWidth = Math.max(1, contentWidth - (padding === 0 ? 1 : 0));
+      const cursorLine = Math.min(sourceLines.length - 1, Math.max(0, Math.floor(cursor.line)));
+      let visualRow = 0;
+      for (let index = 0; index < cursorLine; index += 1) {
+        const source = sourceLines[index] ?? "";
+        const chunks = tuiHost?.wrapEditorLine?.(source, layoutWidth);
+        visualRow += chunks?.length ?? wrapLine(source, layoutWidth).length;
+      }
+      const line = sourceLines[cursorLine] ?? "";
+      const cursorColumn = Math.min(line.length, Math.max(0, Math.floor(cursor.col)));
+      const chunks = tuiHost?.wrapEditorLine?.(line, layoutWidth);
+      if (chunks?.length) {
+        const cursorChunk = chunks.findIndex((chunk, index) =>
+          cursorColumn >= chunk.startIndex
+          && (index === chunks.length - 1 || cursorColumn < chunk.endIndex));
+        visualRow += Math.max(0, cursorChunk);
+      } else {
+        visualRow += Math.max(0, wrapLine(line.slice(0, cursorColumn), layoutWidth).length - 1);
+      }
+      // Convert the absolute visual row to this rendered box's coordinates.
+      // The public protected border hook reports its hidden text prefix.
+      const hiddenRows = field.getRenderedHiddenLineCount?.() ?? 0;
+      return Math.min(Math.max(1, 1 + visualRow - hiddenRows), fallbackRow);
+    } catch {
+      return fallbackRow;
+    }
+  }
+
   function renderList(width: number): string[] {
+    listViewportFocus = undefined;
     const pending = pendingNow();
     const lines: string[] = [];
     if (pending.length === 0) {
-      lines.push(theme.fg("dim", "No pending questions."));
+      lines.push(theme.fg("dim", "No pending questions or notices."));
       return lines;
     }
     const selection = currentListSelection() ?? undefined;
-    const header = theme.bold(`Pending questions (${pending.length})`)
+    const hasNotice = pending.some(isNotice);
+    const hasQuestion = pending.some((record) => !isNotice(record));
+    const header = theme.bold(hasNotice
+      ? `${hasQuestion ? "Pending questions and notices" : "Pending notices"} (${pending.length})`
+      : `Pending questions (${pending.length})`)
       + theme.fg("dim", ` · ${shortcutLabel} to close`);
     for (const line of wrapLine(header, width)) lines.push(line);
     lines.push("");
     for (const record of pending) {
-      const tag = record.mode === "sync" ? theme.fg("warning", " [waiting]") : "";
+      const rowStart = lines.length;
       const prefix = record.id === selection ? theme.fg("accent", "> ") : "  ";
-      const text = `${record.id}: ${record.question}` + tag;
+      const tag = isNotice(record)
+        ? theme.fg("muted", " [notice]")
+        : record.mode === "sync" ? theme.fg("warning", " [waiting]") : "";
+      const label = isNotice(record) ? visibleTerminalText(record.title) : safeMarkdownDisplaySource(record.question);
+      const text = `${record.id}: ${label}` + tag;
       const first = wrapLine(text, Math.max(1, width - visibleWidth(prefix)));
       lines.push(prefix + first[0]!);
       for (const rest of first.slice(1)) {
         lines.push(" ".repeat(visibleWidth(prefix)) + rest);
       }
+      if (record.id === selection) {
+        listViewportFocus = { start: rowStart, end: rowStart, anchor: rowStart };
+      }
     }
     lines.push("");
-    lines.push(theme.fg("dim", "arrows select · Enter answer · Esc defer and close"));
+    lines.push(theme.fg("dim", hasNotice
+      ? `arrows select · Enter ${hasQuestion ? "open question/notice" : "open notice"} · ${POPUP_SCROLL_HINT} · Esc defer and close`
+      : `arrows select · Enter answer · ${POPUP_SCROLL_HINT} · Esc defer and close`));
     return lines;
   }
 
   function renderAnswer(width: number): string[] {
+    answerViewportFocus = undefined;
     const record = selectedId ? controller.get(selectedId) : undefined;
     if (!record) {
       // Defensive: the question vanished (stale state); leave on next key.
-      linesOnce(theme.fg("dim", "This question is no longer pending."));
-      return cachedLines!;
+      answerViewportFocus = { start: 0, end: 0, anchor: 0 };
+      return [theme.fg("dim", "This question is no longer pending.")];
     }
     const rows = answerRows();
     const lines: string[] = [];
-    for (const line of wrapLine(`${record.id}: ${record.question}`, width)) {
-      lines.push(line);
+    const question = renderMarkdown(record.question, width);
+    lines.push(theme.bold(`${record.id}:`));
+    if (!question.native) {
+      lines.push(...wrapLine(theme.fg("warning", "Native Markdown unavailable; showing the complete question as plain text."), width));
+      lines.push("");
     }
+    lines.push(...question.lines);
     lines.push("");
     rows.forEach((row, index) => {
       const selected = index === answerIndex;
+      const rowStart = lines.length;
       if (row === TYPE_ROW && editing && options.nativeField) {
-        // The native editor renders its own bordered box (top/bottom rules and
-        // word-wrapped lines with the hardware-cursor marker); indent it like
-        // the other rows. Every line is padded to the box width, so each
-        // total line stays within `width`.
-        const box = options.nativeField.render(Math.max(1, width - 2));
+        // The native editor renders its own bordered box; indent it like the
+        // other rows. Every line is padded to the box width, so each total
+        // line stays within `width`. Focus follows its public cursor location,
+        // never a parsed terminal cursor-marker escape.
+        const editorWidth = Math.max(1, width - 2);
+        const box = options.nativeField.render(editorWidth);
         lines.push(`  ${box[0] ?? ""}`);
         for (const rest of box.slice(1)) lines.push(`  ${rest}`);
+        if (selected) {
+          const cursorRow = rowStart + nativeFieldCursorBoxRow(options.nativeField, editorWidth, box.length);
+          answerViewportFocus = {
+            start: cursorRow,
+            end: Math.max(cursorRow, rowStart + box.length - 1),
+            anchor: cursorRow,
+          };
+        }
         return;
       }
       const prefix = selected ? theme.fg("accent", "> ") : "  ";
@@ -453,27 +782,129 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       } else if (row === DECLINE_ROW) {
         text = theme.fg("warning", "Decline (no answer will be sent)");
       } else {
-        text = `${index + 1}. ${row}`;
+        // Choice labels are plain text, not Markdown. Apply only the existing
+        // reversible display encoding; the original stored label is still
+        // submitted unchanged when selected.
+        text = `${index + 1}. ${visibleTerminalText(row)}`;
       }
       const wrapped = wrapLine(text, Math.max(1, width - visibleWidth(prefix)));
       lines.push(prefix + wrapped[0]!);
       for (const rest of wrapped.slice(1)) {
         lines.push(" ".repeat(visibleWidth(prefix)) + rest);
       }
+      if (selected) {
+        answerViewportFocus = { start: rowStart, end: lines.length - 1, anchor: rowStart };
+      }
     });
     lines.push("");
     lines.push(theme.fg("dim", editing
       ? "Enter submit · Esc back to options"
-      : "arrows select · Enter confirm · Esc back"));
+      : `arrows select · Enter confirm · ${POPUP_SCROLL_HINT} · Esc back`));
     return lines;
   }
 
-  function linesOnce(line: string): void {
-    cachedLines = [line];
+  function renderNotice(width: number): string[] {
+    const record = selectedId ? controller.getPending(selectedId) : undefined;
+    if (!record || !isNotice(record)) return [theme.fg("dim", "This notice is no longer pending.")];
+    const body = renderMarkdown(record.body, width);
+    const context = record.context === undefined ? undefined : renderMarkdown(record.context, width);
+    const hasPlainFallback = !body.native || (context !== undefined && !context.native);
+    const bodyLines = hasPlainFallback ? renderPlainText(visibleTerminalText(record.body), width) : body.lines;
+    const contextLines = hasPlainFallback && record.context !== undefined
+      ? renderPlainText(visibleTerminalText(record.context), width)
+      : context?.lines ?? [];
+    const lines = [...wrapNoticeLine(theme.bold(`${record.id}: ${visibleTerminalText(record.title)}`), width), ""];
+    if (hasPlainFallback) {
+      lines.push(
+        ...wrapNoticeLine(theme.fg("warning", "Native Markdown unavailable; showing the complete notice as plain text."), width),
+        "",
+      );
+    }
+    lines.push(...bodyLines);
+    if (record.context !== undefined) {
+      lines.push("", ...wrapNoticeLine(theme.bold("Relevant context"), width), ...contextLines);
+    }
+    lines.push("");
+    noticeRows().forEach((row, index) => {
+      appendNoticeAction(lines, row === NOTICE_MORE_DETAILS ? "More details" : "Close", index === noticeActionIndex, width);
+    });
+    lines.push("");
+    lines.push(...wrapNoticeLine(theme.fg("dim", `arrows select · Enter choose · ${POPUP_SCROLL_HINT} · Esc back`), width));
+    return lines;
+  }
+
+  function viewportRows(): number {
+    let rows: number | undefined;
+    try {
+      rows = options.getViewportRows?.();
+    } catch {
+      rows = undefined;
+    }
+    const resolved = typeof rows === "number" && Number.isFinite(rows) && rows > 0
+      ? Math.max(1, Math.floor(rows))
+      : 1;
+    if (lastViewportRows !== undefined && lastViewportRows !== resolved && mode === "answer") {
+      answerFocusPending = true;
+      // The host editor sizes its own text viewport from terminal rows. Rebuild
+      // its rendered box before applying the resized popup's focus offset.
+      cachedContent = undefined;
+    }
+    lastViewportRows = resolved;
+    if (mode === "list" && lastListViewportRows !== resolved) listFocusPending = true;
+    lastListViewportRows = resolved;
+    return resolved;
+  }
+
+  function pageStep(): number {
+    const nativeHeight = nativeScrollView?.viewportHeight;
+    // The custom overlay uses the owned manual viewport, so no measured
+    // ScrollView height is available. Advance one line rather than skipping
+    // unseen content with a terminal-sized page.
+    if (nativeHeight === undefined || nativeHeight <= 0) return 1;
+    return Math.max(1, Math.floor(nativeHeight) - 1);
+  }
+
+  function resetScroll(): void {
+    manualScrollOffset = 0;
+    answerViewportFocus = undefined;
+    answerFocusPending = false;
+    listFocusPending = true;
+    nativeScrollView?.scrollToStart();
+  }
+
+  function renderMarkdown(source: string, width: number): RenderedMarkdown {
+    let component = markdownComponents.get(source);
+    if (component === undefined) {
+      try {
+        component = tuiHost?.createMarkdown?.(safeMarkdownDisplaySource(source)) ?? null;
+      } catch {
+        component = null;
+      }
+      markdownComponents.set(source, component);
+    }
+    if (component) {
+      try {
+        const rendered = component.render(Math.max(1, width));
+        if (Array.isArray(rendered) && rendered.every((line) => typeof line === "string")) {
+          return { lines: rendered, native: true };
+        }
+      } catch {
+        // The shared question/notice view discloses the complete plain-text
+        // fallback below.
+      }
+    }
+    return {
+      lines: renderPlainText(visibleTerminalText(source), width),
+      native: false,
+    };
+  }
+
+  function renderPlainText(source: string, width: number): string[] {
+    return source.split("\n").flatMap((line) => wrapPlainTextLine(line, width));
   }
 
   // ------------------------------------------------------------------
-  // Width-safe text helpers (host pi-tui when loadable, naive fallback)
+  // Width-safe text helpers (host pi-tui when loadable, grapheme fallback)
   // ------------------------------------------------------------------
 
   function visibleWidth(text: string): number {
@@ -487,8 +918,6 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       const wrapped = tuiHost.wrapTextWithAnsi(text, bounded);
       return wrapped.length > 0 ? wrapped : [""];
     }
-    // Degraded fallback (no host helpers): plain visible-text wrap. Styles do
-    // not survive this path, which only matters outside a real Pi TUI.
     const plain = stripAnsi(text);
     if (naiveVisibleWidth(plain) <= bounded) return [text];
     const words = plain.split(/(\s+)/).filter((part) => part.length > 0);
@@ -510,10 +939,93 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     return lines.length > 0 ? lines : [""];
   }
 
+  /** Wrap complete notice fallback text without parsing Markdown or dropping characters. */
+  function wrapPlainTextLine(text: string, width: number): string[] {
+    const bounded = Math.max(1, Math.floor(width));
+    const tokens = text.match(/\s+|\S+/gu) ?? [];
+    const lines: string[] = [];
+    let current = "";
+    let currentWidth = 0;
+    for (const token of tokens) {
+      const tokenWidth = visibleWidth(token);
+      if (tokenWidth <= bounded) {
+        if (currentWidth > 0 && currentWidth + tokenWidth > bounded) {
+          lines.push(current);
+          current = "";
+          currentWidth = 0;
+        }
+        current += token;
+        currentWidth += tokenWidth;
+        continue;
+      }
+      if (current.length > 0) {
+        lines.push(current);
+        current = "";
+        currentWidth = 0;
+      }
+      for (const grapheme of graphemeSegments(token)) {
+        const graphemeWidth = visibleWidth(grapheme);
+        if (current.length > 0 && currentWidth + graphemeWidth > bounded) {
+          lines.push(current);
+          current = "";
+          currentWidth = 0;
+        }
+        current += grapheme;
+        currentWidth += graphemeWidth;
+      }
+    }
+    if (current.length > 0) lines.push(current);
+    return lines.length > 0 ? lines : [""];
+  }
+
+  function wrapNoticeLine(text: string, width: number): string[] {
+    const bounded = Math.max(1, Math.floor(width));
+    if (typeof tuiHost?.wrapTextWithAnsi === "function") {
+      const wrapped = tuiHost.wrapTextWithAnsi(text, bounded);
+      if (wrapped.length > 0 && wrapped.every((line) => visibleWidth(line) <= bounded)) return wrapped;
+    }
+    // Plain fallback loses ANSI styling rather than risking malformed escape
+    // sequences; host column helpers still measure emoji and combining marks.
+    return wrapPlainTextLine(stripAnsi(text), bounded);
+  }
+
+  function appendNoticeAction(lines: string[], label: string, selected: boolean, width: number): void {
+    if (width < 3) {
+      if (selected) lines.push(theme.fg("accent", ">"));
+      lines.push(...wrapNoticeLine(label, width));
+      return;
+    }
+    const prefix = selected ? theme.fg("accent", "> ") : "  ";
+    const prefixWidth = visibleWidth(prefix);
+    const wrapped = wrapNoticeLine(label, Math.max(1, width - prefixWidth));
+    lines.push(prefix + wrapped[0]!);
+    for (const rest of wrapped.slice(1)) lines.push(" ".repeat(prefixWidth) + rest);
+  }
+
+  function graphemeSegments(text: string): string[] {
+    const intl = Intl as unknown as {
+      Segmenter?: new (
+        locales?: string | string[],
+        options?: { granularity: "grapheme" },
+      ) => { segment(value: string): Iterable<{ segment: string }> };
+    };
+    if (typeof intl.Segmenter === "function") {
+      return Array.from(new intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text), (part) => part.segment);
+    }
+    return Array.from(text);
+  }
+
   function naiveVisibleWidth(text: string): number {
     let width = 0;
-    for (const char of text) {
-      const code = char.codePointAt(0)!;
+    for (const grapheme of graphemeSegments(stripAnsi(text))) {
+      if (/^\p{Mark}+$/u.test(grapheme)) continue;
+      if (/\p{Extended_Pictographic}/u.test(grapheme)) {
+        width += 2;
+        continue;
+      }
+      const base = Array.from(grapheme).find((char) => !/\p{Mark}/u.test(char) && char !== "\u200d");
+      if (!base) continue;
+      const code = base.codePointAt(0)!;
       if (code < 32 || (code >= 0x7f && code < 0xa0)) continue;
       width += isWideCodePoint(code) ? 2 : 1;
     }
@@ -536,12 +1048,36 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     return text.replace(/\x1b\[[0-9;]*m/g, "");
   }
 
+  function isNotice(record: PendingUserInput): record is PendingNotice {
+    return "kind" in record && record.kind === "notice";
+  }
+
   const setSourceProbe = (probe: { isIdle?: () => boolean } | undefined): void => {
     activeSourceProbe = probe;
   };
 
+  const content: QuestionMarkdownComponent = {
+    render: renderContent,
+    invalidate: invalidateContent,
+  };
+  try {
+    nativeScrollView = options.scrollable
+      ? tuiHost?.createScrollView?.(content, viewportRows)
+      : undefined;
+  } catch {
+    nativeScrollView = undefined;
+  }
+  if (nativeScrollView) {
+    invalidateNativeScrollView = nativeScrollView.invalidate.bind(nativeScrollView);
+    return {
+      render: renderNativeScrollView,
+      handleInput,
+      invalidate,
+      setSourceProbe,
+    };
+  }
   return {
-    render,
+    render: renderFallback,
     handleInput,
     invalidate,
     setSourceProbe,

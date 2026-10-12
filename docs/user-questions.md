@@ -1,16 +1,17 @@
-# User questions
+# User questions and notices
 
-The `AskUserQuestion` tool lets a model ask you a question — with optional
-suggested answers — while it works. Questions are session-local: they exist
-only for the live Pi session that asked them, in memory, and never persist
-across restarts, session switches, `/new`, or forks.
+`AskUserQuestion` lets a model ask you a question — with optional suggested
+answers — while it works. `YouShouldKnow` lets it post a notice to the same
+session-local pending surface. Questions and notices exist only in memory for
+the live Pi session that created them; they do not persist across restarts,
+session switches, `/new`, or forks.
 
 ## Asking
 
 The model calls `AskUserQuestion` with:
 
 - `question` — one focused question, shown verbatim in the pending-question
-  list.
+  list and rendered as Markdown in its answer view.
 - `choices` (optional) — up to 12 suggested answers. You may always type a
   free-text answer instead of picking one, or decline.
 - `mode` — `async` (default) or `sync`.
@@ -19,8 +20,8 @@ The model calls `AskUserQuestion` with:
 
 The call returns immediately with a pending handle (for example `q1`). The
 question stays discoverable two ways: the tool result itself and the
-persistent pending-question panel above the chat editor (`Pending questions ·
-Press Ctrl+Alt+Up`, with the platform's chord label). There is no
+shared persistent pending panel above the chat editor. Press **Ctrl+Alt+Up**
+(**Ctrl+Option+Up** on macOS) to open the shared list. There is no
 deadline, reminder, or timeout — the question simply waits until you answer
 or decline it. The model is told not to assume an answer; it continues other
 work while the question is pending.
@@ -43,13 +44,103 @@ is aborted or the session ends while a sync wait is open, the wait settles
 with an explicit "interrupted" result — it never hangs and never invents an
 answer.
 
-## Answering from the question list
+## Notices with `YouShouldKnow`
 
-While questions are pending, a persistent panel stays visible above the chat
-editor — through chat output as well. It never takes focus and shows only
-`Pending questions · Press Ctrl+Alt+Up` (**Ctrl+Option+Up** on macOS): no
-question text is ever shown while it is collapsed. Press **Ctrl+Alt+Up** to
-open the pending-question list:
+`YouShouldKnow` creates a notice, not a question that needs an answer. It accepts:
+
+- `title` — a compact identifier for the notice entry in the shared list.
+- `body` — the complete, verbose Markdown notice.
+- `context` (optional) — additional context retained in full for **More details**.
+
+Notices and questions appear as distinguishable entry types in the existing
+session-local list, opened with **Ctrl+Alt+Up** (**Ctrl+Option+Up** on macOS).
+Question answers and notice details use the same centered, bounded native
+overlay and Markdown renderer. The complete notice body and optional context
+appear before its **More details** and **Close** actions. If native Markdown or
+its theme is unavailable, the view visibly discloses the limitation and shows
+the complete question, notice body, and optional context as width-wrapped plain
+text; it does not silently truncate content or substitute a custom Markdown
+parser. Scroll the shared popup with
+**Shift+Alt+Up/Down** (the laptop-friendly shortcut) or **Ctrl+Alt+PageUp/PageDown**.
+Plain **PageUp/PageDown** remain available on hosts that deliver them to the
+popup. These popup-local shortcuts are not consumed while editing free text.
+Press **Escape** to return to the shared list; returning does not dismiss a
+notice. The only notice actions are **More details** and
+**Close**: **More details** closes the popup first, then sends the retained full
+body and optional context as an ordinary request to the originating model/session
+with a natural-language request to elaborate in a normal conversation reply. The
+notice stays pending. **Close** removes only the selected notice and sends nothing.
+The shared pending panel remains while any question or notice is still pending.
+
+Extension-owned question/notice Markdown, question-choice labels, titles, and
+tool results show terminal controls as visible escapes instead of executing
+them. Choice labels stay plain text (not Markdown); selecting one still sends
+its original value. The native Markdown path
+keeps CRLF as a structural newline (normalizing it to LF), converts other C0
+controls, DEL, and C1 controls before parsing, and preserves printable text,
+ordinary Markdown, and backslash escaping. On Pi hosts exposing the public native
+Markdown display-transformer hook, the same display-only adapter also protects
+native user/assistant transcript Markdown. Older hosts without that optional hook
+still get protected question/notice popups and tool-result text, but the extension
+cannot sanitize Markdown rendered by the host's ordinary conversation transcript.
+The plain-text fallback reversibly encodes complete content, including carriage
+returns, without truncation. Stored notice/question data and model history are not
+rewritten; More details adds only its explicit natural-language request around the
+retained notice body and context.
+
+Notice-related contextual user requests are ordinary user content addressed
+only to the originating session. They use the existing non-interrupting delivery
+path: queued as steering while that session is busy, or delivered normally when
+it is idle. A notice grants no permissions and does not add a separate dashboard,
+notification channel, or running/idle signal. It does not change the existing
+question answer, free-text, sync/async, or decline behavior.
+
+## Availability and completion guidance
+
+The strict-boolean settings `youShouldKnow.enabled` and
+`youShouldKnow.completionGuidance` both default to **On** and are available in
+`/review-settings` and the config file (see [Configuration](configuration.md#youshouldknow-settings)).
+They independently control notice availability and whether completion guidance is
+requested, but the extension supplies that prompt only when both settings are On
+and `YouShouldKnow` is in the current live, authorized discovery ceiling.
+
+- **Notice availability off** (`youShouldKnow.enabled: false`) removes `YouShouldKnow`
+  from authorized discovery and blocks new direct, stale, and nested calls. It also
+  suppresses the extension's automatic completion prompt even if completion guidance
+  is On. This only narrows the existing launch/role/mode authorization ceiling;
+  turning it back on never grants authority Pi or the current role did not already
+  allow. Existing pending notices and questions are preserved: More details and Close
+  continue to work on an existing notice. `AskUserQuestion` is unchanged.
+- **Completion guidance off** (`youShouldKnow.completionGuidance: false`) removes only
+  the extension's automatic prompt that points to the completion skill. It does not
+  hide or disable `YouShouldKnow` and does not forbid an otherwise-authorized call.
+  When both settings are On, the extension supplies the prompt only if live authorized
+  discovery currently exposes `YouShouldKnow`—including when it is deferred but has
+  not yet been activated. The prompt is absent when the current launch authorization
+  or operating mode excludes the tool. It points to the skill from the launcher's
+  `~/.agents/skills/pi-review-gate-completion/SKILL.md` location, falling back to the
+  skill bundled with the extension package.
+- The shipped completion skill declares Pi's native
+  `disable-model-invocation: true`, so its description does not independently route
+  the model toward publication when completion guidance is off. It remains installed
+  and can still be explicitly loaded as `/skill:pi-review-gate-completion` regardless
+  of the guidance toggle. Manual invocation does not grant `YouShouldKnow` authority;
+  the tool must still be available and each call otherwise authorized. This extension
+  does not edit Pi's native settings or remove the skill.
+
+The automatic prompt is ordinary model guidance, not an execution hook: it cannot
+force publication, watch turns, or guarantee that a notice is sent. If the skill file
+cannot be resolved, the extension omits the automatic prompt; explicit manual skill
+use remains a separate Pi feature. Neither setting changes the shared pending UI or
+removes existing items.
+
+## Shared pending panel and list
+
+While questions or notices are pending, the existing persistent panel stays
+visible above the chat editor — through chat output as well — and never takes
+focus. Press **Ctrl+Alt+Up** (**Ctrl+Option+Up** on macOS) to open the shared
+session-local list. A question-only list looks like this; pending notices appear
+as distinguishable entries alongside questions:
 
 ```
 Pending questions (2) · Ctrl+Alt+Up to close
@@ -62,7 +153,8 @@ arrows select · Enter answer · Esc defer and close
 
 - **Arrows** move the selection; **Enter** opens the selected question's
   answer view; **Esc** defers (the question stays pending) and closes the
-  list.
+  list. Notice entries retain their separate **More details** and **Close**
+  actions described above.
 - The answer view lists the model's suggested choices, a **Type something…**
   free-text row, and an explicit **Decline** row:
 
@@ -79,9 +171,9 @@ arrows select · Enter confirm · Esc back
 
 - Selecting a choice or submitting typed text delivers your answer.
 - The free-text row embeds Pi's own main chat editor — the same host-wired
-  component `/review-settings` uses — inside the existing question modal; no
-  second window and no separate fallback buffer. Its standard text-entry
-  keybindings work there: arrows (up/down move between the lines of a
+  component `/review-settings` uses — inside the shared question/notice
+  overlay; no nested window and no separate fallback buffer. Standard
+  text-entry keybindings work there: arrows (up/down move between the lines of a
   multiline draft), word movement (Alt/Option+←/→, Ctrl+←/→), line start/end
   (Home/End, Ctrl+A/Ctrl+E), PageUp/PageDown, Backspace/Delete, word deletion
   (Ctrl+W, Alt+Backspace, Alt+D), delete to line start/end (Ctrl+U/Ctrl+K),
@@ -104,14 +196,14 @@ arrows select · Enter confirm · Esc back
 - **Decline** is one deliberate action: select the Decline row and press
   Enter. There is no second confirmation, but Escape only goes back — it
   never declines.
-- While the list is open it has input focus: all keys, including Escape, are
-  handled by the list, so nothing triggers Pi's abort. Your editor draft is
-  saved while the list is open and restored when it closes. Pressing the
-  shortcut again (or Esc) closes the list and collapses back to the pending
-  panel.
-- The list reads live state: a question that becomes pending (or waiting)
-  while the list is open appears without re-opening, and a question you just
-  resolved disappears; when the last one is resolved the list closes itself.
+- While the overlay is open it has input focus: all keys, including Escape,
+  are handled by it, so nothing triggers Pi's abort. Your editor draft is
+  saved while the overlay is open and restored when it closes. Pressing the
+  shortcut again (or Esc) closes the overlay and returns to the pending panel.
+- The list reads live state: a question that becomes pending (or waiting), or
+  a new notice, appears without re-opening. A question you resolve or a notice
+  you close disappears; when the last question or notice is gone, the list
+  closes itself.
 
 ### What an answer does
 
@@ -125,43 +217,45 @@ arrows select · Enter confirm · Esc back
 
 ## Session isolation
 
-Questions are bound to the session that asked them. After a session switch,
-`/new`, or fork, the previous session's questions are not presented in the
-new session and cannot be answered into it; stale list callbacks after such a
-replacement are rejected without touching the model. The pending panel
-reflects only the current session: it is removed when no questions remain and
-is cleared when the session ends or is replaced.
+Questions and notices are bound to the session that created them. After a
+session switch, `/new`, or fork, the previous session's pending items are not
+presented in the new session; stale list callbacks after such a replacement are
+rejected without touching the new session. The pending panel reflects only the
+current session: it is removed when no questions or notices remain and is
+cleared when the session ends or is replaced.
 
 ## Availability and limits
 
-- **Interactive TUI only.** The question list needs Pi's interactive terminal
-  UI. In RPC or other non-TUI hosts `AskUserQuestion` still registers but
-  fails closed with an explicit "not available" result for every call; no
-  question is silently dropped or answered on your behalf.
+- **Interactive TUI only.** The shared pending list needs Pi's interactive
+  terminal UI. In RPC or other non-TUI hosts, both tools follow the same
+  fail-closed availability behavior as `AskUserQuestion`: they return an
+  explicit "not available" result instead of silently dropping a question or
+  notice.
 - **Shortcut conflicts.** If a built-in Pi binding already uses the chord,
-  the shortcut is not registered (the startup notice names the colliding
-  bindings) and `AskUserQuestion` fails closed with the same explicit result.
+  the shared shortcut is not registered (the startup notice names the colliding
+  bindings) and both tools fail closed with the explicit unavailable result.
 - **Terminal key support.** The chord requires a terminal that can report
   Ctrl+Alt on an arrow key (Pi's Kitty keyboard protocol; most modern
   terminals negotiate it automatically). On terminals without that support
-  the chord does not fire — questions remain pending and visible in the panel
-  until you answer them from a supported environment.
+  the chord does not fire — questions and notices remain pending until the
+  shared list is opened from a supported environment.
 - **Native editor required for free text.** The free-text row embeds Pi's
   host-wired chat editor. On the rare host where that editor or its keybinding
   surface cannot be loaded, the row shows an explicit "free text unavailable"
   line instead of a second, non-parity editing engine: choices and Decline
   still work, and no typeable fallback is offered.
-- **Operating modes.** Like other non-read-only tools, `AskUserQuestion`
-  follows the standard tool visibility policy: it is hidden in plan/research
-  mode and appears again in write-capable modes.
-- **No persistence.** Pending questions are in-memory session state; ending
-  or replacing the session settles them (sync waits resolve as interrupted)
-  and they do not reappear after a restart.
+- **Operating modes and roles.** `YouShouldKnow` follows the same existing
+  availability, authorization, role, and operating-mode limits as
+  `AskUserQuestion`; for example, both are hidden in plan/research mode and
+  available again in write-capable modes. A notice cannot grant permissions.
+- **No persistence.** Pending questions and notices are in-memory session
+  state; ending or replacing the session settles them (sync question waits
+  resolve as interrupted) and they do not reappear after a restart.
 
 ## Related
 
 - [Review workflow](review-workflow.md) — reviewer questions and review
-  windows are a separate surface; model-initiated user questions never open a
+  windows are a separate surface; user questions and notices never open a
   review window.
 - [Configuration](configuration.md) — operating modes that affect tool
   visibility.

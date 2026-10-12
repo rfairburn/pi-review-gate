@@ -102,7 +102,7 @@ export function registerReviewSettings(input: RegisterSettingsInput): void {
       await runSettingsMenu({ ...input, ui, scoped }, initialSection);
     };
   input.pi.registerCommand("review-settings", {
-    description: "Configure delegated execution, deferred Pi tools, reviewers, review policy, scheduled tasks, the operating-mode cycle hotkey, web tools, and retention.",
+    description: "Configure delegated execution, deferred Pi tools, YouShouldKnow notices and completion guidance, reviewers, review policy, scheduled tasks, web tools, and retention.",
     handler: openSettings("review-settings", "root"),
   });
   // Issue #190: landing shortcut into the same staged settings transaction.
@@ -190,6 +190,7 @@ async function runSettingsMenu(
   let retryPolicy = { ...(input.config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY) };
   let subtaskNotifications = input.config.execution?.subtaskNotifications ?? DEFAULT_SUBTASK_NOTIFICATION_MODE;
   let deferredPiTools = input.config.execution?.deferredPiTools ?? DEFAULT_DEFERRED_PI_TOOLS;
+  let youShouldKnow = { ...(input.config.youShouldKnow ?? DEFAULT_CONFIG.youShouldKnow!) };
   let subtasksViewExpanded = input.config.ui?.subtasksViewExpanded === true;
   let webMaxDownloadBytes = input.config.web!.fetch.maxDownloadBytes;
   let browserInteractionApproval = input.config.web!.browserInteractionApproval ?? "ask";
@@ -366,6 +367,7 @@ async function runSettingsMenu(
     retryPolicy,
     subtaskNotifications,
     deferredPiTools,
+    youShouldKnow,
     subtasksViewExpanded,
     scheduledTasks: catalogForApply,
     scheduledTasksStagedFrom,
@@ -421,6 +423,8 @@ async function runSettingsMenu(
       { key: "retry", label: "Retry policy", value: `${retryPolicy.maxRetries} retries · ${formatDuration(retryPolicy.baseDelayMs)} base` },
       { key: "notifications", label: "Subtask notifications", value: subtaskNotifications === "quiet" ? "Quiet" : "Noisy" },
       { key: "deferredTools", label: "Deferred Pi tools", value: `${deferredPiTools ? "On" : "Off"} · local now, new subtasks` },
+      { key: "youShouldKnow", label: "YouShouldKnow notices", value: youShouldKnow.enabled ? "On" : "Off" },
+      { key: "completionGuidance", label: "Completion guidance", value: youShouldKnow.completionGuidance ? "On" : "Off" },
       { key: "subtasksView", label: "Subtasks view", value: subtasksViewExpanded ? "Expanded" : "Collapsed" },
       { key: "scheduled", label: "Scheduled tasks", value: scheduledSummary(scheduledTasks) },
       ...(input.schedulerRuntime
@@ -571,6 +575,14 @@ async function runSettingsMenu(
     }
     if (choice === "deferredTools") {
       deferredPiTools = !deferredPiTools;
+      continue;
+    }
+    if (choice === "youShouldKnow") {
+      youShouldKnow = { ...youShouldKnow, enabled: !youShouldKnow.enabled };
+      continue;
+    }
+    if (choice === "completionGuidance") {
+      youShouldKnow = { ...youShouldKnow, completionGuidance: !youShouldKnow.completionGuidance };
       continue;
     }
     if (choice === "subtasksView") {

@@ -1,7 +1,7 @@
 'use strict';
 /**
- * Test-only scripted provider for the session-host Main lifecycle question
- * case (tests/session-host-native-main-lifecycle.test.ts).
+ * Test-only scripted provider for the session-host Main lifecycle and
+ * native-notice cases.
  *
  * This is a small, clearly scoped specialization of
  * tests/fixtures/session-host-native-provider.cjs: same public
@@ -19,7 +19,7 @@
  * The existing standalone fixture (session-host-native-provider.cjs) is left
  * untouched for its own question test.
  *
- * Environment contract (set by tests/session-host-native-main-lifecycle.test.ts):
+ * Environment contract (set by the native Main integration tests):
  * - PRG_FIXTURE_AGENT_DIR   installed pi-coding-agent package root (pi-ai import)
  * - PRG_FIXTURE_STATE_DIR   fixture scratch state dir (turn script, journal)
  */
@@ -167,12 +167,17 @@ module.exports = async function (pi) {
 		provider.appendResponses([respondFromScript]);
 		contextMessages = context?.messages ?? [];
 		const requestIndex = provider.state.callCount - 1; // callCount was incremented for this request
+		const step = readTurnScript()[requestIndex];
 		journal('model_request', {
 			requestIndex,
 			stepsAvailable: readTurnScript().length,
 			lastUserPreview: lastUserText(contextMessages).slice(0, 400),
+			// Only a test-script step that opts in records its complete controlled
+			// synthetic request, for assertions that display transforms never alter
+			// model input. Other fixture tests keep the bounded preview only.
+			...(step?.captureLastUser === true ? { lastUserMessage: lastUserText(contextMessages) } : {}),
 		});
-		return stepToMessage(readTurnScript()[requestIndex], requestIndex);
+		return stepToMessage(step, requestIndex);
 	}
 
 	provider.appendResponses([respondFromScript]);

@@ -452,7 +452,7 @@ test("a throwing editor-seam getter fails closed without opening UI or touching 
   }
 });
 
-test("the custom slot is invoked with its original ui receiver", async () => {
+test("the custom overlay is invoked with its original ui receiver and options", async () => {
   const fixture = makeFixture();
   userQuestionsBeginSession(fixture.surface.controller, fixture.sessionManager);
   const session = sessionContext(fixture);
@@ -462,11 +462,13 @@ test("the custom slot is invoked with its original ui receiver", async () => {
   const component: { current: BridgeComponent | undefined } = { current: undefined };
   const shortcut = makeShortcutContext(fixture, component);
   const ui = shortcut.ctx.ui as Record<string, unknown>;
-  const originalCustom = ui.custom as (factory: (...args: unknown[]) => unknown) => Promise<unknown>;
+  const originalCustom = ui.custom as (factory: (...args: unknown[]) => unknown, options?: unknown) => Promise<unknown>;
   // A receiver-dependent forwarding wrapper (like a foreign decorator).
-  ui.custom = function (this: unknown, factory: (...args: unknown[]) => unknown) {
+  ui.custom = function (this: unknown, factory: (...args: unknown[]) => unknown, options?: unknown) {
     assert.equal(this, ui, "the custom slot keeps its ui receiver");
-    return originalCustom.call(ui, factory);
+    assert.equal((options as { overlay?: boolean } | undefined)?.overlay, true,
+      "the forwarding wrapper receives the shared public overlay option");
+    return originalCustom.call(ui, factory, options);
   };
 
   const opened = pressShortcut(fixture, shortcut.ctx);

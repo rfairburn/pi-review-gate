@@ -12,9 +12,14 @@ public docs.
 - `scripts/` — launcher, provisioning, docs validation (`check-docs.cjs`), package
   smoke, fake reviewer.
 - `docs/` — public documentation tree (shipped in the npm package).
-- `skills/pi-review-gate-orchestrator/`, `skills/pi-review-gate-execution/`, `skills/pi-review-gate-research/` — the shipped skills (issue 151 namespacing)
-  refreshed by the launcher (orchestration with its recovery runbook, direct/delegated
-  execution, and read-only research; product surface, not a private configuration).
+- `skills/pi-review-gate-orchestrator/`, `skills/pi-review-gate-execution/`,
+  `skills/pi-review-gate-research/`, and `skills/pi-review-gate-completion/` — shipped
+  skills refreshed by the launcher (orchestration with its recovery runbook,
+  direct/delegated execution, read-only research, and completion handoff; product surface,
+  not a private configuration). The completion skill opts out of native automatic model
+  routing but remains explicitly invocable; the extension points to it only when
+  `youShouldKnow.enabled` and `youShouldKnow.completionGuidance` are On and live
+  authorized discovery exposes `YouShouldKnow`.
 - `.github/` — issue/PR templates, CODEOWNERS, and external review guidance
   (source-only governance; not shipped in the npm package).
 - Root policy docs: [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md),

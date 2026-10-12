@@ -228,6 +228,8 @@ export class DeferredToolManager {
     // PI_REVIEW_GATE_CODEMODE_DEFAULT=1 flag); never applied to configured
     // worker ceilings and never overriding explicit registry restrictions.
     private readonly enableCodemodeDefault = false,
+    /** Additional live feature-availability filter; it can only narrow captured authority. */
+    private readonly isToolEnabledBySettings: (name: string) => boolean = () => true,
   ) {}
 
   register(parameters?: Record<string, unknown>): boolean {
@@ -389,6 +391,23 @@ export class DeferredToolManager {
     return true;
   }
 
+  /**
+   * Whether a tool is eligible for live discovery at the current authorized
+   * role/mode/launch ceiling. This deliberately ignores current activation:
+   * authorized deferred tools can still be advertised before tool_search loads
+   * them. Unreadable registry state and unavailable settings fail closed.
+   */
+  isToolDiscoveryEligible(name: string): boolean {
+    const trimmed = typeof name === "string" ? name.trim() : "";
+    if (!trimmed) return false;
+    this.reconcile();
+    return Boolean(
+      this.boundary
+      && !this.registryUnreadable
+      && this.modeVisibleAuthorizedNames().has(trimmed),
+    );
+  }
+
   startupGuidance(): string | undefined {
     this.reconcile();
     // An unreadable registry denies live discovery surfaces; the retained
@@ -535,7 +554,16 @@ export class DeferredToolManager {
       ? new Set(this.boundary.catalog.map((tool) => tool.name))
       : undefined;
     return modeNames.filter((name) => available.has(name)
-      && (!authorized || name === DEFERRED_TOOL_SEARCH_NAME || authorized.has(name)));
+      && (!authorized || name === DEFERRED_TOOL_SEARCH_NAME || authorized.has(name))
+      && this.settingAllowsTool(name));
+  }
+
+  private settingAllowsTool(name: string): boolean {
+    try {
+      return this.isToolEnabledBySettings(name) === true;
+    } catch {
+      return false;
+    }
   }
 
   /** Names visible at the live mode ceiling (authority boundary, not activation). */
@@ -547,7 +575,7 @@ export class DeferredToolManager {
     // applies on every surface derived from it.
     let visible = this.boundary.catalog
       .map((tool) => tool.name)
-      .filter((name) => planning ? planningToolVisible(name) : true);
+      .filter((name) => (planning ? planningToolVisible(name) : true) && this.settingAllowsTool(name));
     // #73: an invisible GitRead is not part of the live ceiling at all — it
     // must not reach the startup inventory, the tool_search description,
     // or any match result outside the modes/roles that expose it.
@@ -670,7 +698,7 @@ export class DeferredToolManager {
     // Configured workers continue exposing their immutable ceiling; live call
     // gates still require the current registry intersection.
     if (this.registryUnreadable && this.boundary.dynamic) return [];
-    return [...this.boundary.authorizedNames];
+    return [...this.boundary.authorizedNames].filter((name) => this.settingAllowsTool(name));
   }
 
   /**
@@ -696,7 +724,7 @@ export class DeferredToolManager {
   toolCallAllowed(name: string, nested = false): boolean {
     this.reconcile();
     const trimmed = typeof name === "string" ? name.trim() : "";
-    if (!trimmed) return false;
+    if (!trimmed || !this.settingAllowsTool(trimmed)) return false;
     // tool_search is the loader itself: startup must have succeeded and the
     // loader must still answer every live rule below — registry-visible,
     // non-hidden, exposure-legal for the mode of the call, and currently part
@@ -745,7 +773,7 @@ export class DeferredToolManager {
   /** Narrow fail-closed authority: the conservative retained set under the live mode policy. */
   private failClosedToolCallAllowed(name: string, nested: boolean): boolean {
     if (!this.failClosedAuthorized || !isDeferredToolHost(this.pi)) return false;
-    if (!this.failClosedAuthorized.has(name)) return false;
+    if (!this.failClosedAuthorized.has(name) || !this.settingAllowsTool(name)) return false;
     // #review-0004: failed startup bypasses nothing — plan/research still
     // rejects every write-capable or execution-control name here.
     if (this.getOperatingMode() === "plan-research" && !planningToolVisible(name)) return false;
@@ -997,6 +1025,7 @@ export class DeferredToolManager {
     // search can never activate it outside plan/research or a research catalog.
     const planning = this.getOperatingMode() === "plan-research";
     const catalog = this.boundary.catalog.filter((tool) => {
+      if (!this.settingAllowsTool(tool.name)) return false;
       if (tool.name === GIT_READ_TOOL_NAME) return this.gitReadVisible();
       return planning ? planningToolVisible(tool.name) : true;
     });

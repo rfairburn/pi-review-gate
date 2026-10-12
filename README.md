@@ -48,12 +48,22 @@ receipts of exactly what the model was told.
 - **Background shell tools** — `ShellStart`, `ShellList`, `ShellLog`, `ShellSend`, and
   `ShellStop` with detached process groups and lifecycle wakes
   ([Delegated execution](docs/delegated-execution.md#background-shell-tools)).
-- **User questions** — the `AskUserQuestion` tool: async by default (pending handle,
-  no deadlines or fabricated answers) or explicit sync waits; a persistent panel
-  above the editor marks pending questions without taking focus (never showing
-  their text), and the session-local question list (Ctrl+Alt+Up /
-  Ctrl+Option+Up on macOS) offers choices, free text, and an explicit decline
-  that terminates question-only batches ([User questions](docs/user-questions.md)).
+- **User questions and notices** — `AskUserQuestion` keeps its async-by-default
+  (pending handle, no deadlines or fabricated answers) and explicit sync-wait modes;
+  `YouShouldKnow` adds session-local notices with a compact title, complete Markdown
+  body, and optional full-retained context. Questions and notices share the persistent
+  pending panel, list, and native question popup (Ctrl+Alt+Up / Ctrl+Option+Up on
+  macOS); question and notice content use native Markdown when available, with a
+  disclosed complete plain-text fallback. **More details** closes the popup, asks for
+  elaboration in an ordinary reply to the originating session with the full body and
+  context, and leaves the notice pending. **Close** removes only that notice and
+  sends nothing. The extension also uses Pi's optional native Markdown display hook
+  to safely escape terminal controls in the transcript when available.
+  Separate default-on settings control notice availability and completion guidance;
+  the prompt appears only when both are On and live authorized discovery exposes the
+  tool. The shipped completion skill remains manually invocable without native
+  automatic routing. Existing question answers, free text, and explicit decline remain
+  unchanged ([User questions](docs/user-questions.md)).
 
 ## Non-goals
 

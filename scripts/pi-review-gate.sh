@@ -20,6 +20,7 @@ SKILLS_DIR="$HOME/.agents/skills"
 ORCHESTRATOR_SKILL_DIR="$SKILLS_DIR/pi-review-gate-orchestrator"
 EXECUTION_SKILL_DIR="$SKILLS_DIR/pi-review-gate-execution"
 RESEARCH_SKILL_DIR="$SKILLS_DIR/pi-review-gate-research"
+COMPLETION_SKILL_DIR="$SKILLS_DIR/pi-review-gate-completion"
 
 # Skill provisioning manifest (issue 23): packaged source path and installed
 # destination path, tab-separated, one entry per shipped skill file. Keep in
@@ -29,6 +30,7 @@ SKILL_PUBLISH_PLAN=(
   "$REVIEW_GATE_ROOT/skills/pi-review-gate-orchestrator/references/recovery.md"$'\t'"$ORCHESTRATOR_SKILL_DIR/references/recovery.md"
   "$REVIEW_GATE_ROOT/skills/pi-review-gate-execution/SKILL.md"$'\t'"$EXECUTION_SKILL_DIR/SKILL.md"
   "$REVIEW_GATE_ROOT/skills/pi-review-gate-research/SKILL.md"$'\t'"$RESEARCH_SKILL_DIR/SKILL.md"
+  "$REVIEW_GATE_ROOT/skills/pi-review-gate-completion/SKILL.md"$'\t'"$COMPLETION_SKILL_DIR/SKILL.md"
 )
 
 # Ownership-safe migration of the pre-#151 generic install locations (issue
@@ -498,6 +500,7 @@ echo "pi-review-gate extension: $REVIEW_GATE_EXTENSION"
 echo "pi-review-gate orchestrator skill: $ORCHESTRATOR_SKILL_DIR/SKILL.md"
 echo "pi-review-gate execution skill: $EXECUTION_SKILL_DIR/SKILL.md"
 echo "pi-review-gate research skill: $RESEARCH_SKILL_DIR/SKILL.md"
+echo "pi-review-gate completion skill: $COMPLETION_SKILL_DIR/SKILL.md"
 
 # Issue #26: --scheduler enables the process-local scheduled-execution runtime
 # for this launch only. The flag is consumed here and handed to the extension

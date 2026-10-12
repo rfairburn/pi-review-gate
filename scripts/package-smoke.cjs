@@ -432,6 +432,7 @@ function runPackageSmoke(scratch) {
     "skills/pi-review-gate-orchestrator/references/recovery.md",
     "skills/pi-review-gate-execution/SKILL.md",
     "skills/pi-review-gate-research/SKILL.md",
+    "skills/pi-review-gate-completion/SKILL.md",
     "scripts/fake-reviewer.cjs",
     "LICENSES/Apache-2.0.txt",
     "NOTICE",

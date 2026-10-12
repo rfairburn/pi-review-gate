@@ -10,12 +10,12 @@
  *   its own non-overlay `ctx.ui.custom` slot around the captured instance
  *   (title + editor + hint), and resolves with the submitted value, a cancel,
  *   or an unavailable reason.
- * - The AskUserQuestion list/choices modal routes through
+ * - The AskUserQuestion list/choices overlay routes through
  *   {@link acquireNativeEditorField}: the bridge installs the factory BEFORE
- *   the list's own `ctx.ui.custom` slot opens (installing it mid-list would
+ *   the list's own `ctx.ui.custom` overlay opens (installing it mid-list would
  *   make the host swap the visible component), and hands back the SAME
- *   host-wired instance for the modal to embed in its free-text row — no
- *   nested second modal, no second editing engine. The modal owns the
+ *   host-wired instance for the shared modal to embed in its free-text row —
+ *   no nested second modal, no second editing engine. The modal owns the
  *   editing episodes (Enter submits the whole answer, Esc returns to the
  *   choice rows with the draft kept) and calls `handle.finish()` when its
  *   slot closes.
@@ -35,9 +35,10 @@
  *   the field prefill is applied after that capture (settings: inside its own
  *   wrapper factory; questions: `handle.prepare("")` inside the list's
  *   factory — the displaced draft must never show or submit as the field's
- *   value). On close the host restores the captured draft into the instance,
- *   and the bridge's ownership-checked factory swap carries it back to the
- *   prior editor — the chat draft survives every open/close exactly once.
+ *   value). On close the bridge restores the captured draft into the
+ *   instance before its ownership-checked factory swap carries it back to the
+ *   prior editor — the chat draft survives every open/close exactly once,
+ *   including custom overlays that leave the underlying editor mounted.
  * - Keys: Enter runs Pi's own submit path unmodified (autocomplete confirm,
  *   backslash-Enter workaround, state clear) and settles through the
  *   consumer's {@link NativeEditorFieldSemantics} because the native submit
@@ -135,7 +136,7 @@ export type NativeEditorCustomFactory = (
 
 /** The structural UI surface the bridge needs (host ctx.ui or a mock). */
 export interface NativeEditorFieldUi {
-  /** Non-overlay custom component slot (Pi TUI hosts). */
+  /** Custom component slot (Pi TUI hosts); settings callers use its non-overlay form. */
   custom?(factory: NativeEditorCustomFactory): Promise<string | undefined>;
   /** Public Pi seam: install/replace the main editor factory. */
   setEditorComponent?(factory: NativeEditorFactory | undefined): void;
@@ -228,6 +229,14 @@ export interface NativeEditorBaseInstance {
   invalidate(): void;
   setText(text: string): void;
   getText(): string;
+  /** Public pi-tui Editor cursor position, in logical line/column coordinates. */
+  getCursor?(): { line: number; col: number };
+  /** Public pi-tui Editor text lines, used with getCursor for popup focus. */
+  getLines?(): string[];
+  /** Public pi-tui Editor sizing accessor. */
+  getPaddingX?(): number;
+  /** Text rows hidden above the last rendered native editor box. */
+  getRenderedHiddenLineCount?(): number;
   /** Stored text with paste markers expanded to their actual content. */
   getExpandedText?(): string;
   /** Whether the native completion list is currently visible. */
@@ -284,7 +293,9 @@ type NativeEditorCtor = new (
   theme: unknown,
   keybindings: unknown,
   options?: unknown,
-) => FieldEditorInstance;
+) => FieldEditorInstance & {
+  renderTopBorder(width: number, hiddenLineCount: number): string;
+};
 
 // ---------------------------------------------------------------------------
 // Absolute-path completion for every field (shared decoration)
@@ -414,6 +425,16 @@ function createFieldEditorClass(
   class FieldEditor extends Base {
     fieldActive = false;
     onFieldSettle?: (value: string | undefined) => void;
+    private renderedHiddenLineCount = 0;
+
+    renderTopBorder(width: number, hiddenLineCount: number): string {
+      this.renderedHiddenLineCount = hiddenLineCount;
+      return super.renderTopBorder(width, hiddenLineCount);
+    }
+
+    getRenderedHiddenLineCount(): number {
+      return this.renderedHiddenLineCount;
+    }
 
     handleInput(data: string): void {
       if (this.fieldActive) {
@@ -731,9 +752,10 @@ function finishSession(session: ActiveFieldSession): void {
   session.finished = true;
   if (activeSession === session) activeSession = undefined;
   if (!session.restoreOnFinish) return;
-  // Normal custom() close already restores the chat draft, but a rejecting
-  // host may not. Never copy a partial field value into the prior chat editor.
-  // Touch the instance only while our factory still owns the slot.
+  // A non-overlay custom() close may already restore the chat draft. Overlay
+  // close leaves the underlying editor mounted, so restore it here as well.
+  // Never copy a partial field value into the prior chat editor; touch the
+  // instance only while our factory still owns the slot.
   try {
     if (session.draftCaptured && session.ui.getEditorComponent?.() === session.ourFactory) {
       session.captured?.setText(session.savedDraft);
@@ -858,7 +880,7 @@ export type NativeEditorFieldAcquireResult =
  * Acquires the host-wired native editor for embedding in a custom component
  * the caller already owns. Unlike {@link editTextWithNativeEditor} this does
  * not open a slot of its own — the caller's (already-open or about-to-open)
- * non-overlay `ctx.ui.custom` component renders and drives the SAME instance
+ * `ctx.ui.custom` component renders and drives the SAME instance
  * the host wired, so no nested second modal and no second editing engine
  * exist. The caller must:
  *
@@ -868,7 +890,7 @@ export type NativeEditorFieldAcquireResult =
  *   `onFieldSettle`, both bridge-owned fields);
  * - call `handle.finish()` exactly once when its custom slot closes.
  *
- * Acquisition must happen BEFORE the caller's custom slot opens: installing
+ * Acquisition must happen BEFORE the caller's custom UI opens: installing
  * the factory mid-slot would make the host swap the visible component. When
  * the seams or the host module are unavailable the result is `{ kind:
  * "unavailable" }` and the caller keeps its fail-closed behavior (no

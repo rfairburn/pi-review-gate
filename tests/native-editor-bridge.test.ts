@@ -89,6 +89,26 @@ test("prefill applies after the host's draft capture; Enter submits the edited f
   assert.deepEqual(state.chatSubmits, [], "no chat message was sent");
 });
 
+test("the owned native editor reports hidden text rows from its border hook", async () => {
+  const instances: FakeBridgeEditor[] = [];
+  setNativeEditorHost(fakeHost(instances));
+  const { ui } = createBridgeUi({
+    keybindings: fakeKeybindingsManager(),
+    drivers: [
+      (component) => {
+        const field = instances[0]!;
+        field.hiddenRows = 4;
+        component.render?.(80);
+        assert.equal(field.getRenderedHiddenLineCount?.(), 4,
+          "the subclass captures the protected renderTopBorder scroll offset");
+        component.handleInput?.(ESCAPE);
+      },
+    ],
+  });
+
+  assert.deepEqual(await editTextWithNativeEditor(ui, { title: "T", prefill: "text" }), { kind: "cancel" });
+});
+
 test("Esc cancels with undefined and restores the prior factory", async () => {
   const instances: FakeBridgeEditor[] = [];
   setNativeEditorHost(fakeHost(instances));

@@ -1,6 +1,6 @@
 # Settings menu
 
-This page owns the staged `/review-settings` settings menu: its seventeen ordinary rows,
+This page owns the staged `/review-settings` settings menu: its nineteen ordinary rows,
 the conditional **Scheduler runtime** row, Escape/Cancel/Save/Ctrl+S apply and
 persistence semantics, and the shared native text-field behavior. Raw field values and
 defaults are owned by the [Configuration](configuration.md) reference, and scheduled-task
@@ -8,10 +8,11 @@ semantics are documented on [Scheduled tasks](scheduled-tasks.md#scheduled-task-
 
 ## `/review-settings`
 
-`/review-settings` opens one staged settings transaction with seventeen ordinary rows —
+`/review-settings` opens one staged settings transaction with nineteen ordinary rows —
 Operating mode, Mode cycle hotkey, Worker resources, External workers, Execution
 priority, Research priority, Reviewers, Timeouts, Review policy, Bundle retention, Global concurrency,
-Retry policy, Subtask notifications, Deferred Pi tools, Subtasks view, Scheduled
+Retry policy, Subtask notifications, Deferred Pi tools, YouShouldKnow notices,
+Completion guidance, Subtasks view, Scheduled
 tasks, and Web — plus a conditional **Scheduler runtime** row when the host runtime
 supplies the live switch (the ordinary extension entry point always does):
 
@@ -93,6 +94,20 @@ supplies the live switch (the ordinary extension entry point always does):
   exponential-backoff bounds, jitter, and the repeated-incident guard.
 - **Subtask notifications** defaults to **Quiet**. See
   [Delegated execution](delegated-execution.md#notifications-and-ui).
+- **YouShouldKnow notices** defaults to **On** and controls new notice availability
+  within the existing launch, role, mode, and call authorization limits. Turning it
+  off immediately removes the tool from the active/discovery surfaces but leaves any
+  pending notice and its More details/Close actions intact; `AskUserQuestion` is
+  unchanged.
+- **Completion guidance** defaults to **On** and allows an automatic prompt pointing
+  to the shipped completion skill only when notice availability is also On and the
+  current live authorized discovery ceiling includes `YouShouldKnow` (whether or not it
+  is currently activated). Turning guidance off removes that prompt only: it does not
+  disable notice availability or block otherwise-authorized calls. The skill opts out
+  of Pi's automatic model-invoked skill list but remains manually available as
+  `/skill:pi-review-gate-completion`; toggling this setting does not edit Pi's native
+  settings or uninstall the skill. See
+  [Availability and completion guidance](user-questions.md#availability-and-completion-guidance).
 - **Deferred Pi tools** defaults to **On**. Saving **Off** immediately exposes every
   authorized tool in the current top-level Pi session; saving **On** immediately restores
   the conservative active subset plus `tool_search`. For new mutation-authorized

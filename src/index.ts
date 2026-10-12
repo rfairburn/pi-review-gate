@@ -47,6 +47,7 @@ import {
 import { boundPath, handleCwdMismatchRestore, safeRestoreFailureDiagnostic, sendNoticeUnlessItThrows } from "./activation/diagnostics";
 import { createSessionPersistence } from "./activation/persistence";
 import { deferredToolPromptInjection, executionPromptInjection, extractSystemPrompt } from "./activation/prompt-composition";
+import { buildCompletionGuidancePrompt, resolveCompletionSkillPath } from "./activation/completion-guidance";
 import { capturePrimaryCodemodeDefault } from "./activation/primary-codemode-default";
 import { recoverPendingModelDeliveries, releaseQueuedUserInputs } from "./activation/pending-delivery";
 import { createReviewTurnCoordinator, isToolError } from "./activation/review-turn";
@@ -57,6 +58,8 @@ import { DeferredToolManager, isDeferredToolHost } from "./deferred-tools";
 import { loadOperatingModeSegments, OPERATING_MODE_LABELS } from "./operating-mode";
 import { registerModeCycleShortcut } from "./mode-cycle";
 import { contextIsInteractiveTui, registerUserQuestions, userQuestionsBeginSession, userQuestionsEndSession } from "./user-question";
+import { YOU_SHOULD_KNOW_TOOL_NAME } from "./user-question/notice-tool";
+import { registerSafeMarkdownDisplayTransformer } from "./markdown-safety";
 import { getSessionHostSpawnCapability } from "./session-host/spawn-capability";
 import { registerSessionSpawnTool } from "./session-host/spawn-tool";
 import { consumeSessionHostStartupRequest } from "./session-host/startup-request";
@@ -106,6 +109,7 @@ interface ActivationDependencies {
 }
 
 export async function activate(pi: unknown, dependencies: ActivationDependencies = {}): Promise<void> {
+  registerSafeMarkdownDisplayTransformer(pi);
   // Capture wrapper intent and consume its one-shot environment marker before
   // any await, tool registration, or model-spawned subprocess can inherit it.
   const executorRole = process.env.PI_REVIEW_GATE_RUNTIME_ROLE === "executor";
@@ -321,15 +325,21 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   // session's boundary. Late registration keeps Pi's load-time replaceable-
   // builtin collision pass from seeing a competing tool_search definition, and
   // registerWithNativeSchema reuses the host-native parameter schema.
-  const deferredTools = new DeferredToolManager(pi, () => config.operatingMode, wrapperCodemodeDefault);
+  const deferredTools = new DeferredToolManager(
+    pi,
+    () => config.operatingMode,
+    wrapperCodemodeDefault,
+    (name) => name !== YOU_SHOULD_KNOW_TOOL_NAME || config.youShouldKnow?.enabled !== false,
+  );
   registerDeferredToolLifecycleHooks(pi, deferredTools);
 
-  // Pending questions (issue #95): AskUserQuestion registers before
-  // session_start so it enters the deferred-tool authorization boundary like
-  // every other top-level tool; the pending-question list shortcut and the
-  // persistent panel widget are registered here as well. Top level only — executor
-  // runtimes have no question UI surface.
-  const userQuestions = registerUserQuestions(pi);
+  // Pending questions and notices (issues #95/#295): both user-input tools
+  // register before session_start so they enter the same deferred-tool
+  // authorization boundary; the pending list shortcut and persistent panel
+  // widget are shared. Top level only — executor runtimes gain no input tool.
+  const userQuestions = registerUserQuestions(pi, {
+    isNoticeFeatureEnabled: () => config.youShouldKnow?.enabled !== false,
+  });
 
   // Issue #92: automatic notification consumers of unified expansion. The five
   // orchestrator-facing custom messages (subtask event/watch, background-shell
@@ -901,7 +911,16 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   registerHook(pi, "before_agent_start", async (...args) => {
     const armed = await reviewTurn.armAgentRun(args);
     if (armed === "blocked") throw new Error(`review gate: fresh checkpoint restart failed (${checkpointRestartBlocked}); repair and restart before review`);
-    return executionPromptInjection(executionTools.criticalPrompt(), deferredTools.startupGuidance(), operatingModeSystemPrompt(args));
+    const authorizedToolGuidance = deferredTools.startupGuidance();
+    const completionGuidance = config.youShouldKnow?.enabled !== false
+      && config.youShouldKnow?.completionGuidance !== false
+      && deferredTools.isToolDiscoveryEligible(YOU_SHOULD_KNOW_TOOL_NAME)
+      ? buildCompletionGuidancePrompt(resolveCompletionSkillPath())
+      : undefined;
+    const promptGuidance = [authorizedToolGuidance, completionGuidance]
+      .filter((part): part is string => typeof part === "string" && part.length > 0)
+      .join("\n\n") || undefined;
+    return executionPromptInjection(executionTools.criticalPrompt(), promptGuidance, operatingModeSystemPrompt(args));
   });
 
   toolCallObserver = async (...args) => {

@@ -9,6 +9,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { activate } from "../src/index";
 import { reapAll } from "../src/background-shell";
+import { resolveCompletionSkillPath } from "../src/activation/completion-guidance";
 import {
   backgroundShellToolNames,
   escapeRegExp,
@@ -254,7 +255,7 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     // factory time, so Pi's load-time replaceable-builtin collision pass sees
     // no competing tool_search definition.
     assert.deepEqual(registeredTools.map((tool) => tool.name), [
-      ...webToolNames, "ApplyPatch", "GitRead", ...backgroundShellToolNames, "AskUserQuestion",
+      ...webToolNames, "ApplyPatch", "GitRead", ...backgroundShellToolNames, "AskUserQuestion", "YouShouldKnow",
     ]);
 
     runtimeInitialized = true;
@@ -263,7 +264,7 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     // The loader joins at session start after the execution tools are synced
     // and before the authorization capture.
     assert.deepEqual(registeredTools.map((tool) => tool.name), [
-      ...webToolNames, "ApplyPatch", "GitRead", ...backgroundShellToolNames, "AskUserQuestion", ...executionToolNames, "tool_search",
+      ...webToolNames, "ApplyPatch", "GitRead", ...backgroundShellToolNames, "AskUserQuestion", "YouShouldKnow", ...executionToolNames, "tool_search",
     ]);
     const deferredActive = ["read", "bash", "edit", "ApplyPatch", "SubtasksStart", "tool_search"];
     assert.deepEqual(activeTools, deferredActive);
@@ -272,7 +273,7 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     // discovery set — authorized minus baseline-loaded — comma-delimited.
     const searchDefinition = registeredTools.find((tool) => tool.name === "tool_search");
     const expectedDiscovery = [
-      "AskUserQuestion", ...webToolNames, ...backgroundShellToolNames,
+      "AskUserQuestion", "YouShouldKnow", ...webToolNames, ...backgroundShellToolNames,
       ...executionToolNames.filter((name) => name !== "SubtasksStart"),
     ].sort();
     assert.match(searchDefinition?.description ?? "", new RegExp(`Authorized tool names: ${expectedDiscovery.map(escapeRegExp).join(", ")}\\.$`));
@@ -298,7 +299,7 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     await toggleDeferredTools();
     const fullAuthorized = [
       "read", "bash", "edit", ...webToolNames, "ApplyPatch", ...backgroundShellToolNames,
-      "AskUserQuestion", ...executionToolNames,
+      "AskUserQuestion", "YouShouldKnow", ...executionToolNames,
     ];
     assert.deepEqual(activeTools, [...fullAuthorized, "tool_search"], "saving Off immediately activates the complete local catalog");
     await toggleDeferredTools();
@@ -315,7 +316,7 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     // tool_search itself are omitted, every deferred discovery tool is
     // listed with its compact canonical purpose.
     const discoveryNames = [
-      "AskUserQuestion", ...webToolNames, ...backgroundShellToolNames,
+      "AskUserQuestion", "YouShouldKnow", ...webToolNames, ...backgroundShellToolNames,
       ...executionToolNames.filter((name) => name !== "SubtasksStart"),
     ];
     for (const name of discoveryNames) {
@@ -602,6 +603,263 @@ test("GitRead registers in the top-level runtime and follows the operating mode 
     assert.ok(activeTools.includes("GitRead"), "mode switch back restores GitRead");
     assert.equal(searchTools().description, planDescription);
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("completion guidance requires its setting and live authorized YouShouldKnow discovery", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-completion-guidance-"));
+  try {
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      youShouldKnow: { enabled: true, completionGuidance: true },
+      review: { activeReviewers: [] },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const registeredTools = new Map<string, {
+      name: string;
+      description?: string;
+      execute?: (id: string, params: unknown) => Promise<Record<string, unknown>>;
+    }>();
+    let settingsHandler: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+    let activeTools = ["read", "bash", "edit"];
+    let runtimeInitialized = false;
+    const assertRuntime = () => {
+      if (!runtimeInitialized) throw new Error("Extension runtime not initialized");
+    };
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> }) {
+        if (name === "review-settings") settingsHandler = options.handler;
+      },
+      registerTool(tool: { name: string; description?: string; execute?: (id: string, params: unknown) => Promise<Record<string, unknown>> }) {
+        registeredTools.set(tool.name, tool);
+        if (!activeTools.includes(tool.name)) activeTools.push(tool.name);
+      },
+      getActiveTools() {
+        assertRuntime();
+        return [...activeTools];
+      },
+      getAllTools() {
+        assertRuntime();
+        return [
+          { name: "read", description: "Read files." },
+          { name: "bash", description: "Run shell commands." },
+          { name: "edit", description: "Edit files." },
+          ...registeredTools.values(),
+        ];
+      },
+      setActiveTools(next: string[]) {
+        assertRuntime();
+        activeTools = [...next];
+      },
+      notify() {},
+    };
+
+    await activate(pi, testActivation());
+    runtimeInitialized = true;
+    const sessionContext = { cwd: dir, ui: {}, sessionManager: {} };
+    await trigger(hooks, "session_start", { cwd: dir }, sessionContext);
+
+    const completionSkillPath = resolveCompletionSkillPath();
+    assert.ok(completionSkillPath, "the packaged or launcher-installed skill is present");
+    const prompt = async () => JSON.stringify(await triggerResults(hooks, "before_agent_start", {
+      cwd: dir,
+      systemPrompt: "native orchestrator prompt",
+    }));
+    const search = () => {
+      const tool = registeredTools.get("tool_search");
+      assert.ok(tool?.execute);
+      return tool.execute;
+    };
+    const saveToggle = async (label: string) => {
+      assert.ok(settingsHandler);
+      let selectedSetting = false;
+      await settingsHandler("", {
+        ui: {
+          select: async (title: string, options: string[]) => {
+            if (title !== "Review settings") throw new Error(`Unexpected menu: ${title}`);
+            if (!selectedSetting) {
+              selectedSetting = true;
+              const option = options.find((candidate) => candidate.startsWith(label));
+              assert.ok(option, `missing setting ${label}: ${options.join(" | ")}`);
+              return option;
+            }
+            return "Save changes";
+          },
+          input: async () => undefined,
+          confirm: async () => false,
+          notify() {},
+        },
+      });
+    };
+
+    const initiallyEnabled = await prompt();
+    assert.match(initiallyEnabled, /native orchestrator prompt/);
+    assert.ok(initiallyEnabled.includes(completionSkillPath), "enabled guidance points to the installed/package skill");
+
+    await saveToggle("Completion guidance");
+    const guidanceOff = await prompt();
+    assert.doesNotMatch(guidanceOff, /pi-review-gate-completion|meaningful completion point/);
+    assert.match(registeredTools.get("tool_search")?.description ?? "", /YouShouldKnow/, "turning guidance off leaves the tool discoverable");
+    const enabledSearch = await search()("guidance-off-search", { query: "YouShouldKnow" });
+    const enabledSearchDetails = enabledSearch.details as { activated: string[]; alreadyActive: string[]; matched: string[] };
+    assert.ok(
+      [...enabledSearchDetails.activated, ...enabledSearchDetails.alreadyActive].includes("YouShouldKnow"),
+      `guidance-off keeps the tool searchable: ${JSON.stringify(enabledSearchDetails)}`,
+    );
+    assert.ok(activeTools.includes("YouShouldKnow"), "guidance-off preserves authorized tool activation");
+
+    await saveToggle("YouShouldKnow notices");
+    assert.equal(activeTools.includes("YouShouldKnow"), false, "availability-off removes the tool from the active set");
+    assert.doesNotMatch(registeredTools.get("tool_search")?.description ?? "", /YouShouldKnow/, "availability-off removes it from discovery");
+    const disabledSearch = await search()("availability-off-search", { query: "YouShouldKnow" });
+    assert.deepEqual((disabledSearch.details as { activated: string[] }).activated, []);
+    for (const [label, extra] of [
+      ["direct", {}],
+      ["nested", { parentToolCallId: "parent-call" }],
+    ] as const) {
+      const decision = await triggerResults(hooks, "tool_call", {
+        cwd: dir,
+        toolCallId: `availability-off-${label}`,
+        toolName: "YouShouldKnow",
+        input: {},
+        ...extra,
+      });
+      assert.ok(decision.some((value) => (value as { block?: unknown } | undefined)?.block === true), `${label} calls are rejected live`);
+    }
+    const featureOffPrompt = await prompt();
+    assert.doesNotMatch(featureOffPrompt, /pi-review-gate-completion|meaningful completion point/);
+
+    await saveToggle("Completion guidance");
+    const guidanceOnWithoutTool = await prompt();
+    assert.doesNotMatch(guidanceOnWithoutTool, /pi-review-gate-completion|meaningful completion point/, "notice availability off suppresses the prompt even when guidance is on");
+    assert.doesNotMatch(registeredTools.get("tool_search")?.description ?? "", /YouShouldKnow/);
+    const stillUnavailable = await search()("guidance-on-tool-off", { query: "YouShouldKnow" });
+    assert.deepEqual((stillUnavailable.details as { activated: string[] }).activated, []);
+    const guidanceDoesNotGrantAuthority = await triggerResults(hooks, "tool_call", {
+      cwd: dir,
+      toolCallId: "guidance-does-not-grant-authority",
+      toolName: "YouShouldKnow",
+      input: {},
+    });
+    assert.ok(guidanceDoesNotGrantAuthority.some((value) => (value as { block?: unknown } | undefined)?.block === true));
+
+    await saveToggle("YouShouldKnow notices");
+    assert.match(registeredTools.get("tool_search")?.description ?? "", /YouShouldKnow/, "re-enabling restores discovery within the original authorization ceiling");
+    const restoredSearch = await search()("availability-restored-search", { query: "YouShouldKnow" });
+    const restoredDetails = restoredSearch.details as { activated: string[]; alreadyActive: string[]; matched: string[] };
+    assert.ok(
+      [...restoredDetails.activated, ...restoredDetails.alreadyActive].includes("YouShouldKnow"),
+      `re-enabled tool is available through search: ${JSON.stringify(restoredDetails)}`,
+    );
+    const guidanceRestored = await prompt();
+    assert.ok(guidanceRestored.includes(completionSkillPath), "the prompt returns when both settings and authorized discovery allow it");
+
+    const selectOperatingMode = async (label: string) => {
+      assert.ok(settingsHandler);
+      let rootVisits = 0;
+      await settingsHandler("", {
+        ui: {
+          select: async (title: string, options: string[]) => {
+            if (title === "Review settings") return rootVisits++ === 0
+              ? options.find((option) => option.startsWith("Operating mode"))
+              : "Save changes";
+            if (title === "Operating mode") return options.find((option) => option.startsWith(label));
+            throw new Error(`Unexpected menu: ${title}`);
+          },
+          notify() {},
+        },
+      });
+    };
+    await selectOperatingMode("Plan/research");
+    assert.doesNotMatch(await prompt(), /pi-review-gate-completion|meaningful completion point/, "plan/research mode suppresses completion guidance when the tool is not visible");
+    assert.doesNotMatch(registeredTools.get("tool_search")?.description ?? "", /YouShouldKnow/, "plan/research mode excludes YouShouldKnow from discovery");
+    await selectOperatingMode("Prefer orchestration");
+    assert.ok((await prompt()).includes(completionSkillPath), "guidance returns when the live mode-visible authorized tool returns");
+  } finally {
+    await reapAll();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("completion guidance is omitted when Pi's launch authorization excludes YouShouldKnow", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-completion-launch-ceiling-"));
+  try {
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      youShouldKnow: { enabled: true, completionGuidance: true },
+      review: { activeReviewers: [] },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const registeredTools = new Map<string, {
+      name: string;
+      description?: string;
+      execute?: (id: string, params: unknown) => Promise<Record<string, unknown>>;
+    }>();
+    let activeTools = ["read", "bash", "edit"];
+    let runtimeInitialized = false;
+    const assertRuntime = () => {
+      if (!runtimeInitialized) throw new Error("Extension runtime not initialized");
+    };
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerCommand() {},
+      registerTool(tool: { name: string; description?: string; execute?: (id: string, params: unknown) => Promise<Record<string, unknown>> }) {
+        registeredTools.set(tool.name, tool);
+        // Model Pi's launch allowlist excluding this registered tool. It remains
+        // in the registry, but it is not part of the captured authorization set.
+        if (tool.name !== "YouShouldKnow" && !activeTools.includes(tool.name)) activeTools.push(tool.name);
+      },
+      getActiveTools() {
+        assertRuntime();
+        return [...activeTools];
+      },
+      getAllTools() {
+        assertRuntime();
+        return [
+          { name: "read", description: "Read files." },
+          { name: "bash", description: "Run shell commands." },
+          { name: "edit", description: "Edit files." },
+          ...registeredTools.values(),
+        ];
+      },
+      setActiveTools(next: string[]) {
+        assertRuntime();
+        activeTools = [...next];
+      },
+      notify() {},
+    };
+
+    await activate(pi, testActivation());
+    runtimeInitialized = true;
+    const sessionContext = { cwd: dir, ui: {}, sessionManager: {} };
+    await trigger(hooks, "session_start", { cwd: dir }, sessionContext);
+
+    const completionSkillPath = resolveCompletionSkillPath();
+    assert.ok(completionSkillPath, "the packaged or launcher-installed skill is present");
+    const beforeAgentStart = await triggerResults(hooks, "before_agent_start", {
+      cwd: dir,
+      systemPrompt: "native orchestrator prompt",
+    });
+    const prompt = JSON.stringify(beforeAgentStart);
+    assert.match(prompt, /native orchestrator prompt/);
+    assert.doesNotMatch(prompt, /pi-review-gate-completion|meaningful completion point/);
+    assert.doesNotMatch(registeredTools.get("tool_search")?.description ?? "", /YouShouldKnow/);
+  } finally {
+    await reapAll();
     await rm(dir, { recursive: true, force: true });
   }
 });

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test, { afterEach, beforeEach } from "node:test";
 import { activate } from "../src/index";
 import { setHostKeybindingLoader } from "../src/host-keybindings";
+import { safeMarkdownDisplaySource } from "../src/markdown-safety";
 import { USER_QUESTION_PANEL_KEY, pendingQuestionPanelLine, questionShortcutLabel } from "../src/user-question";
 import { setUserQuestionTuiHost } from "../src/user-question/pi-tui-host";
 import {
@@ -58,6 +59,19 @@ async function until(predicate: () => boolean, ms = 1000): Promise<void> {
   }
 }
 
+function publicOverlayHeight(
+  options: { maxHeight?: number | string; margin?: number },
+  terminalRows: number,
+): number {
+  const percentage = typeof options.maxHeight === "string" ? options.maxHeight.match(/^(\d+(?:\.\d+)?)%$/u) : null;
+  const requested = percentage
+    ? Math.floor(terminalRows * Number(percentage[1]) / 100)
+    : typeof options.maxHeight === "number" ? options.maxHeight : Number.POSITIVE_INFINITY;
+  const margin = typeof options.margin === "number" ? Math.max(0, options.margin) : 0;
+  const available = Math.max(1, terminalRows - margin * 2);
+  return Math.max(1, Math.min(requested, available));
+}
+
 /** The live keybinding manager the host passes to the custom/editor factories. */
 function liveKeybindings() {
   const table: Record<string, string[]> = {
@@ -86,6 +100,7 @@ interface EntrypointFixture {
   }>;
   notices: string[];
   sent: Array<{ message: string; options?: unknown }>;
+  markdownTransformers: Array<(markdown: string, context?: unknown) => string>;
   sessionManager: object;
 }
 
@@ -97,7 +112,11 @@ function lastWidget(
   return [...fixture.widgets].reverse().find((entry) => entry.key === key);
 }
 
-async function makeFixture(options: { withShortcutApi?: boolean } = {}): Promise<EntrypointFixture> {
+async function makeFixture(options: {
+  withShortcutApi?: boolean;
+  withMarkdownTransformer?: boolean;
+  onSend?: () => void;
+} = {}): Promise<EntrypointFixture> {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-questions-"));
   const configPath = join(dir, "review-gate.json");
   await writeFile(configPath, JSON.stringify({ ...indexTestConfig, review: { activeReviewers: [] } }), "utf8");
@@ -111,6 +130,7 @@ async function makeFixture(options: { withShortcutApi?: boolean } = {}): Promise
   const widgets: EntrypointFixture["widgets"] = [];
   const notices: string[] = [];
   const sent: EntrypointFixture["sent"] = [];
+  const markdownTransformers: EntrypointFixture["markdownTransformers"] = [];
   const sessionManager = { id: "entrypoint-session" };
   const pi: Record<string, unknown> = {
     on(name: string, handler: (...args: unknown[]) => unknown) {
@@ -121,7 +141,7 @@ async function makeFixture(options: { withShortcutApi?: boolean } = {}): Promise
     },
     registerCommand() {},
     notify(message: string) { notices.push(message); },
-    sendUserMessage(message: string, options?: unknown) { sent.push({ message, options }); return Promise.resolve(); },
+    sendUserMessage(message: string, deliveryOptions?: unknown) { sent.push({ message, options: deliveryOptions }); options.onSend?.(); return Promise.resolve(); },
     // Faithful to the installed host: the extension API object carries no ui
     // surface (only ctx.ui does), so setWidget is deliberately absent here —
     // any code path that targets the API object leaves nothing recorded.
@@ -134,8 +154,14 @@ async function makeFixture(options: { withShortcutApi?: boolean } = {}): Promise
       shortcuts.set(shortcut, options);
     };
   }
+  if (options.withMarkdownTransformer) {
+    pi.registerMarkdownTransformer = function (this: unknown, transformer: (markdown: string, context?: unknown) => string) {
+      assert.equal(this, pi, "the optional native hook receives its ExtensionAPI receiver");
+      markdownTransformers.push(transformer);
+    };
+  }
   await activate(pi);
-  return { dir, hooks, tools, shortcuts, statuses, widgets, notices, sent, sessionManager };
+  return { dir, hooks, tools, shortcuts, statuses, widgets, notices, sent, markdownTransformers, sessionManager };
 }
 
 async function trigger(hooks: Map<string, Array<(...args: unknown[]) => unknown>>, name: string, ...args: unknown[]): Promise<void> {
@@ -162,10 +188,12 @@ test("activate registers AskUserQuestion and the pending-question shortcut", asy
   const fixture = await makeFixture();
   try {
     const tool = fixture.tools.get("AskUserQuestion");
+    const noticeTool = fixture.tools.get("YouShouldKnow");
     assert.ok(tool, "AskUserQuestion is registered at the top level");
+    assert.ok(noticeTool, "YouShouldKnow is registered beside the question tool");
     assert.equal(fixture.shortcuts.has("ctrl+alt+up"), true, "the approved chord is registered");
     const shortcut = fixture.shortcuts.get("ctrl+alt+up")!;
-    assert.match(shortcut.description ?? "", /pending-question list/i);
+    assert.match(shortcut.description ?? "", /pending question and notice list/i);
 
     await trigger(fixture.hooks, "session_start", { cwd: fixture.dir }, tuiContext(fixture));
 
@@ -183,11 +211,36 @@ test("activate registers AskUserQuestion and the pending-question shortcut", asy
       "the collapsed line names the approved chord",
     );
     assert.ok(!panel!.lines!.join("\n").includes("database"), "no question text while collapsed");
+    const noticeResult = await noticeTool.execute("n1", {
+      title: "Build status",
+      body: "## Full status\n\nThe complete notice stays in the shared list.",
+    }, undefined, undefined, { sessionManager: fixture.sessionManager });
+    assert.equal((noticeResult.details as { status: string }).status, "pending");
+    assert.equal((noticeResult.details as { kind: string }).kind, "notice");
+    assert.deepEqual(lastWidget(fixture, USER_QUESTION_PANEL_KEY)?.lines, [pendingQuestionPanelLine()], "notices reuse the existing pending widget");
     // The old status-line indicator is replaced, not duplicated.
     assert.ok(
       !fixture.statuses.some((entry) => /pending question/i.test(entry.text ?? "")),
       "no status-line pending indicator remains",
     );
+  } finally {
+    await rm(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("activation connects the optional native Markdown hook to the shared display-only adapter", async () => {
+  const fixture = await makeFixture({ withMarkdownTransformer: true });
+  try {
+    assert.equal(fixture.markdownTransformers.length, 1, "activation registers one native display transformer");
+    const source = "# Native transcript\r\n\u001b[31munsafe\u001b[0m \u009b31m";
+    const transformed = fixture.markdownTransformers[0]!(source, {
+      messageType: "user",
+      isStreaming: false,
+      availableWidth: 80,
+    });
+    assert.equal(transformed, safeMarkdownDisplaySource(source));
+    assert.equal(transformed, "# Native transcript\n\\u001b[31munsafe\\u001b[0m \\u009b31m");
+    assert.equal(source, "# Native transcript\r\n\u001b[31munsafe\u001b[0m \u009b31m", "native rendering does not rewrite the model source");
   } finally {
     await rm(fixture.dir, { recursive: true, force: true });
   }
@@ -222,13 +275,24 @@ test("resolving every pending question removes the panel", async () => {
     assert.ok(lastWidget(fixture, USER_QUESTION_PANEL_KEY)?.lines, "panel visible while pending");
 
     let openedComponent: any;
-    const custom = (factory: (...args: unknown[]) => unknown) => {
-      openedComponent = factory({}, { fg: (_c: string, t: string) => t, bold: (t: string) => t }, fakeKeybindings(), () => undefined);
+    let customOptions: {
+      overlay?: boolean;
+      overlayOptions?: { anchor?: string; width?: string; maxHeight?: number | string; margin?: number };
+    } | undefined;
+    const popupTui = { terminal: { rows: 40 }, requestRender() {} };
+    const custom = (factory: (...args: unknown[]) => unknown, options?: typeof customOptions) => {
+      customOptions = options;
+      openedComponent = factory(popupTui, { fg: (_c: string, t: string) => t, bold: (t: string) => t }, fakeKeybindings(), () => undefined);
       return Promise.resolve();
     };
     const handler = fixture.shortcuts.get("ctrl+alt+up")!.handler;
     await handler({ ui: { custom }, sessionManager: fixture.sessionManager, isIdle: () => true });
     assert.ok(openedComponent, "the shortcut opens the question list over the persistent panel");
+    assert.equal(customOptions?.overlay, true, "the question list uses the public custom overlay");
+    assert.deepEqual(customOptions?.overlayOptions, {
+      width: "90%", anchor: "center", margin: 1, maxHeight: "100%",
+    }, "the overlay's maxHeight is derived from its actual margins and terminal rows");
+    assert.equal(publicOverlayHeight(customOptions!.overlayOptions!, 40), 38);
 
     openedComponent.handleInput("\r"); // open answer view (first question selected)
     openedComponent.handleInput("\x1b[B"); // row 2: Postgres
@@ -238,6 +302,141 @@ test("resolving every pending question removes the panel", async () => {
     const panel = lastWidget(fixture, USER_QUESTION_PANEL_KEY);
     assert.ok(panel, "a widget update follows the resolution");
     assert.equal(panel!.lines, undefined, "the panel is removed when no questions remain");
+  } finally {
+    await rm(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("the shared custom overlay pages native Markdown within its responsive public geometry", async () => {
+  let customActive = false;
+  const fixture = await makeFixture({ onSend: () => assert.equal(customActive, false, "owner delivery follows custom close") });
+  try {
+    let terminalRows = 40;
+    const markdownSources: string[] = [];
+    setUserQuestionTuiHost({
+      visibleWidth: (text) => text.replace(/\x1b\[[0-9;]*m/gu, "").length,
+      wrapTextWithAnsi: (text) => [text],
+      createMarkdown(source) {
+        markdownSources.push(source);
+        return { render: () => source.split("\n").map((line) => `native:${line}`), invalidate() {} };
+      },
+    });
+    await trigger(fixture.hooks, "session_start", { cwd: fixture.dir }, tuiContext(fixture));
+    const questionText = "# Keep the pending question\n\nWhich lane?\n\n- Canary preserves scope.\n\n```text\nowner=A\n```";
+    await fixture.tools.get("AskUserQuestion")!.execute("q-background", {
+      question: questionText,
+    }, undefined, undefined, { sessionManager: fixture.sessionManager });
+    const body = `## Full deployment status\n\n${Array.from({ length: 18 }, (_, index) => `Body paragraph ${index + 1} contains the complete detail.`).join("\n\n")}\n\nBODY-END`;
+    const context = `Context beginning\n${Array.from({ length: 12 }, (_, index) => `Context detail ${index + 1}.`).join("\n")}\nCONTEXT-END`;
+    const noticeTool = fixture.tools.get("YouShouldKnow")!;
+    const notice = await noticeTool.execute("n1", {
+      title: "Deployment status",
+      body,
+      context,
+    }, undefined, undefined, { sessionManager: fixture.sessionManager });
+    assert.equal((notice.details as { status: string }).status, "pending");
+
+    const components: any[] = [];
+    type PopupCustomOptions = {
+      overlay?: boolean;
+      overlayOptions?: { anchor?: string; width?: string; maxHeight?: number | string; margin?: number };
+    };
+    const options: Array<PopupCustomOptions | undefined> = [];
+    const tui = { requestRender() {}, terminal: { get rows() { return terminalRows; } } };
+    const custom = (factory: (...args: unknown[]) => unknown, customOptions?: PopupCustomOptions) => {
+      options.push(customOptions);
+      customActive = true;
+      return new Promise((resolve) => {
+        components.push(factory(tui, { fg: (_c: string, t: string) => t, bold: (t: string) => t }, fakeKeybindings(), (result: unknown) => {
+          customActive = false;
+          resolve(result);
+        }));
+      });
+    };
+    const uiContext = { ui: { custom }, sessionManager: fixture.sessionManager, isIdle: () => true };
+    const opening = fixture.shortcuts.get("ctrl+alt+up")!.handler(uiContext) as Promise<unknown>;
+    await until(() => components.length === 1);
+    const sharedList = components[0];
+    assert.ok(sharedList, "the existing shortcut opens the shared list in its custom overlay");
+    assert.equal(options[0]?.overlay, true, "the shared question/notice factory opens as an overlay");
+    assert.deepEqual(options[0]?.overlayOptions, {
+      width: "90%", anchor: "center", margin: 1, maxHeight: "100%",
+    });
+    assert.ok(sharedList.render(80).length <= publicOverlayHeight(options[0]!.overlayOptions!, terminalRows),
+      "the component render fits the same maxHeight the public overlay compositor receives");
+
+    assert.ok(lastWidget(fixture, USER_QUESTION_PANEL_KEY)?.lines, "the persistent pending widget remains visible behind the overlay");
+    sharedList.handleInput("\r"); // open the rich question detail in the shared component
+    const questionFrame = sharedList.render(80).join("\n");
+    assert.ok(markdownSources.includes(questionText));
+    assert.match(questionFrame, /native:# Keep the pending question/);
+    assert.match(questionFrame, /native:- Canary preserves scope\./);
+    assert.match(questionFrame, /native:owner=A/);
+    sharedList.handleInput("\x1b"); // return to the list
+    sharedList.handleInput("\x1b[B"); // select the notice after the pending question
+    sharedList.handleInput("\r"); // switch modes in the same component
+    assert.equal(components.length, 1, "notice detail stays in the one shared custom overlay");
+    assert.equal(options.length, 1);
+    assert.equal(options[0]?.overlay, true, "question and notice details share the same overlay interaction");
+
+    const noticeView = sharedList;
+    const frames = [noticeView.render(80).join("\n")];
+    assert.ok(markdownSources.includes(body), "the complete notice still uses native Markdown");
+    assert.ok(markdownSources.includes(context), "the complete context still uses native Markdown");
+    assert.equal(noticeView.render(80).length, publicOverlayHeight(options[0]!.overlayOptions!, terminalRows),
+      "the long notice viewport fills, but never exceeds, the overlay's exact initial maxHeight");
+    terminalRows = 7;
+    assert.equal(publicOverlayHeight(options[0]!.overlayOptions!, terminalRows), 5,
+      "the percentage maxHeight resolves to the resized terminal's margin-bounded height");
+    const resizedFrame = noticeView.render(80).join("\n");
+    assert.equal(resizedFrame.split("\n").length, publicOverlayHeight(options[0]!.overlayOptions!, terminalRows),
+      "resize keeps the manual viewport within the same public overlay maxHeight");
+    frames.push(resizedFrame);
+    for (let index = 0; index < 100; index += 1) {
+      noticeView.handleInput("\x1b[6~"); // PageDown advances in the shared custom component.
+      const frame = noticeView.render(80).join("\n");
+      frames.push(frame);
+      if (frame === frames[frames.length - 2]) break;
+    }
+    const completeView = frames.join("\n");
+    for (let index = 1; index <= 18; index += 1) {
+      assert.ok(completeView.includes(`Body paragraph ${index} contains the complete detail.`), `shared popup scrolling reaches body paragraph ${index}`);
+    }
+    assert.match(completeView, /BODY-END/);
+    for (let index = 1; index <= 12; index += 1) {
+      assert.ok(completeView.includes(`Context detail ${index}\.`), `shared popup scrolling reaches context detail ${index}`);
+    }
+    assert.match(completeView, /CONTEXT-END/);
+    assert.match(completeView, /More details/);
+    assert.match(completeView, /Close/);
+
+    noticeView.handleInput("\r"); // More details closes the shared component
+    await opening;
+    assert.equal(customActive, false, "the normal chat/editor view is restored before delivery");
+    assert.deepEqual(noticeView.render(80), [], "closed UI cannot remain as a notice viewer");
+    assert.equal(fixture.sent.length, 1);
+    assert.equal(fixture.sent[0]!.message,
+      `More details requested for "Deployment status":\n\n${body}\n\nRelevant context:\n${context}\n\nPlease elaborate on these details in your normal conversation reply.`);
+
+    const closing = fixture.shortcuts.get("ctrl+alt+up")!.handler(uiContext) as Promise<unknown>;
+    await until(() => components.length === 2);
+    assert.equal(options[1]?.overlay, true, "reopening uses the same public custom overlay contract");
+    const closePopup = components[1]!;
+    const reopenedList = closePopup.render(80).join("\n");
+    assert.match(reopenedList, /q1: # Keep the pending question/);
+    assert.match(reopenedList, /n1: Deployment status \[notice\]/, "More details retains both pending entries");
+    closePopup.handleInput("\x1b[B");
+    closePopup.handleInput("\r");
+    closePopup.handleInput("\x1b[B"); // Close
+    closePopup.handleInput("\r");
+    const remainingList = closePopup.render(80).join("\n");
+    assert.match(remainingList, /Pending questions \(1\)/);
+    assert.match(remainingList, /q1: # Keep the pending question/);
+    assert.doesNotMatch(remainingList, /n1: Deployment status/, "Close removes only the notice");
+    assert.equal(fixture.sent.length, 1, "Close sends no additional request");
+    closePopup.handleInput("\x1b");
+    await closing;
+    assert.equal(customActive, false);
   } finally {
     await rm(fixture.dir, { recursive: true, force: true });
   }
@@ -307,6 +506,7 @@ test("hosts without the shortcut API keep the tool but fail closed per question"
   const fixture = await makeFixture({ withShortcutApi: false });
   try {
     assert.ok(fixture.tools.has("AskUserQuestion"));
+    assert.ok(fixture.tools.has("YouShouldKnow"));
     await trigger(fixture.hooks, "session_start", { cwd: fixture.dir }, tuiContext(fixture));
     const result = await fixture.tools.get("AskUserQuestion").execute(
       "c1",
@@ -317,6 +517,14 @@ test("hosts without the shortcut API keep the tool but fail closed per question"
     );
     assert.equal((result.details as { status: string; reason: string }).status, "rejected");
     assert.equal((result.details as { reason: string }).reason, "unavailable");
+    const noticeResult = await fixture.tools.get("YouShouldKnow").execute(
+      "n1",
+      { title: "Info", body: "Full notice body." },
+      undefined,
+      undefined,
+      { sessionManager: fixture.sessionManager },
+    );
+    assert.equal((noticeResult.details as { reason: string }).reason, "unavailable");
   } finally {
     await rm(fixture.dir, { recursive: true, force: true });
   }
@@ -354,6 +562,14 @@ test("non-TUI host modes fail closed for every question, sync included", async (
       );
       assert.equal((syncResult.details as { status: string }).status, "rejected", `${mode}: sync`);
       assert.equal((syncResult.details as { reason: string }).reason, "unavailable", `${mode}: sync`);
+      const noticeResult = await fixture.tools.get("YouShouldKnow").execute(
+        "n3",
+        { title: "Info", body: "Full notice body." },
+        undefined,
+        undefined,
+        { sessionManager: fixture.sessionManager, mode },
+      );
+      assert.equal((noticeResult.details as { reason: string }).reason, "unavailable", `${mode}: notice`);
     } finally {
       await rm(fixture.dir, { recursive: true, force: true });
     }
@@ -385,6 +601,8 @@ function fakeKeybindings() {
     "tui.select.down": ["\x1b[B"],
     "tui.select.confirm": ["\r"],
     "tui.select.cancel": ["\x1b"],
+    "tui.editor.pageUp": ["\x1b[5~"],
+    "tui.editor.pageDown": ["\x1b[6~"],
   };
   return { matches(data: string, keybinding: string): boolean { return (bindings[keybinding] ?? []).includes(data); } };
 }

@@ -105,6 +105,45 @@ test("write starts active only when authorized and not in planning (#45)", () =>
   }
 });
 
+test("the live tool-availability filter narrows discovery, activation, and direct/nested calls without expanding captured authority", async () => {
+  const fixture = hostFixture();
+  fixture.pi.registerTool(tool("YouShouldKnow", "Show the user a notice with a title and full body."));
+  let enabled = true;
+  const manager = new DeferredToolManager(
+    fixture.pi,
+    undefined,
+    false,
+    (name) => name !== "YouShouldKnow" || enabled,
+  );
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity);
+
+  assert.ok(manager.authorizedToolNames()?.includes("YouShouldKnow"));
+  assert.ok(manager.startupGuidance()?.includes("YouShouldKnow"));
+  assert.equal(fixture.active().includes("YouShouldKnow"), false, "the authorized notice tool is deferred, not currently activated");
+  assert.equal(manager.isToolDiscoveryEligible("YouShouldKnow"), true, "prompt eligibility uses the authorized discovery ceiling, not activation");
+  const available = await fixture.search()("notice-on", { query: "YouShouldKnow" });
+  assert.deepEqual((available.details as { activated: string[] }).activated, ["YouShouldKnow"]);
+  assert.ok(manager.toolCallAllowed("YouShouldKnow"));
+  assert.ok(manager.toolCallAllowed("YouShouldKnow", true));
+
+  enabled = false;
+  manager.setDeferredEnabled(true);
+  assert.equal(fixture.active().includes("YouShouldKnow"), false);
+  assert.equal(manager.authorizedToolNames()?.includes("YouShouldKnow"), false);
+  assert.equal(manager.startupGuidance()?.includes("YouShouldKnow"), false);
+  assert.equal(manager.isToolDiscoveryEligible("YouShouldKnow"), false, "live availability-off suppresses prompt eligibility");
+  const unavailable = await fixture.search()("notice-off", { query: "YouShouldKnow" });
+  assert.deepEqual((unavailable.details as { activated: string[] }).activated, []);
+  assert.equal(manager.toolCallAllowed("YouShouldKnow"), false, "direct calls are denied live");
+  assert.equal(manager.toolCallAllowed("YouShouldKnow", true), false, "nested calls are denied live");
+
+  enabled = true;
+  manager.setDeferredEnabled(true);
+  assert.ok(manager.authorizedToolNames()?.includes("YouShouldKnow"), "re-enable only restores the name within the captured boundary");
+  assert.ok(manager.toolCallAllowed("YouShouldKnow"), "the existing activation is restored only after availability returns");
+});
+
 test("a captured worker catalog does not gain initial write activation on restore (#45)", () => {
   const fixture = hostFixture();
   const manager = new DeferredToolManager(fixture.pi);

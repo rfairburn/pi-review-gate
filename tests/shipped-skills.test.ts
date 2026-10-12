@@ -6,9 +6,9 @@ import test from "node:test";
 
 // Shipped-skill capability and discovery matrix (issue 23).
 //
-// The launcher provisions three skills — orchestrator (with its recovery
-// runbook), execution, and research — and each operating-mode prompt segment
-// opens with a startup cue directing the model to the matching skill. These
+// The launcher provisions four skills — orchestrator (with its recovery
+// runbook), execution, research, and completion. Existing operating-mode prompt
+// segments open with cues directing the model to their matching role skill. These
 // tests guard the observable capability matrix the skills teach (mode versus
 // delegate boundaries, tool discovery, reporting semantics) and the cue /
 // discovery wiring, not particular prose claims: content must stay
@@ -31,6 +31,7 @@ const SHIPPED_SKILLS = [
   "pi-review-gate-orchestrator",
   "pi-review-gate-execution",
   "pi-review-gate-research",
+  "pi-review-gate-completion",
 ] as const;
 
 test("every shipped skill declares valid frontmatter matching its directory", async () => {
@@ -166,6 +167,48 @@ test("research skill teaches the same discovery contract as execution", async ()
     assert.ok(skill.includes(phrase), `research skill missing: ${phrase}`);
   }
   assert.doesNotMatch(skill, /carries the authorized tool names at live permissions/);
+});
+
+test("completion skill publishes truthful handoffs only through an available YouShouldKnow tool", async () => {
+  const skill = await readSkillFlat("pi-review-gate-completion");
+  for (const phrase of [
+    "disable-model-invocation: true",
+    "The launcher-installed skill remains manually available as `/skill:pi-review-gate-completion` regardless of `youShouldKnow.completionGuidance`",
+    "`youShouldKnow.enabled` (on by default) governs the overall notice feature",
+    "When disabled, the tool is absent from `tool_search` and cannot be activated or used",
+    "`youShouldKnow.completionGuidance` (on by default) controls whether the extension supplies an automatic prompt pointing to this skill",
+    "the prompt is supplied only when this and `youShouldKnow.enabled` are On and live authorized discovery exposes `YouShouldKnow`",
+    "Use normal authorized tool discovery",
+    "absent from `tool_search` or the authorized tool surface",
+    "do not attempt to activate or call it",
+    "not a tool-admission filter",
+    "does not by itself disable `YouShouldKnow` or forbid an otherwise-authorized model call",
+    "If it is unavailable or a call is not otherwise authorized",
+    "Do not read hidden private configuration or invent additional setting names",
+    "Disabling either setting leaves existing pending notices and questions intact",
+    "do not clear, dismiss, cancel, or alter them",
+    "ordinary conversation summary instead",
+    "pending or failed",
+    "label it partial or blocked",
+    "actual deliverables",
+    "commands and their observed results",
+    "Distinguish manual testing performed from testing not performed",
+    "actionable manual test steps with expected observable results",
+    "limitations, unresolved risks",
+    "pending popup/list/status",
+    "**More details** closes the shared popup, then sends the retained body and optional context with an explicit request to elaborate in a normal conversation reply",
+    "the notice stays pending",
+    "**Close** to dismiss it without sending anything",
+    "The user chooses **Close** to dismiss it",
+    "Do not treat the contextual request as a separate publication channel",
+    "normal conversation summary",
+    "not an automatic execution hook or background observer",
+    "does not authorize unrelated actions, PR merges, releases, or other channels",
+  ]) {
+    assert.ok(skill.includes(phrase), `completion skill missing: ${phrase}`);
+  }
+  assert.match(skill, /Call `YouShouldKnow` only when/);
+  assert.match(skill, /Use `YouShouldKnow`'s `title` and `body`/);
 });
 
 test("orchestrator skill directs workers to the shipped role skills and keeps recovery guidance", async () => {

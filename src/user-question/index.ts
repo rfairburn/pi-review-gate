@@ -3,7 +3,7 @@
  *
  * Wires the three approved surfaces together:
  *
- * - The AskUserQuestion tool, registered before session_start so it enters
+ * - The AskUserQuestion and YouShouldKnow tools, registered before session_start so they enter
  *   the deferred-tool authorization boundary like every other top-level tool
  *   (active by default under Pi's registered-tool policy, discoverable through
  *   tool_search, reasserted by the deferred manager).
@@ -15,15 +15,15 @@
  *   (Ctrl+Alt+Up; Ctrl+Option+Up on macOS), registered only when the chord is
  *   not already used by a built-in Pi binding. When registration is
  *   impossible (no shortcut API, occupied chord, non-TUI host) the surface is
- *   unavailable and AskUserQuestion fails closed with an explicit result —
- *   questions are never silently dropped or answered for the user.
+ *   unavailable and both tools fail closed with an explicit result — pending
+ *   input is never silently dropped or answered for the user.
  *
  * The free-text answer row embeds the SAME host-wired native editor instance
  * the /review-settings text fields use, acquired through the shared bridge
- * (src/native-editor-bridge.ts) BEFORE the list's `ctx.ui.custom` slot opens
- * — no nested second modal, no second editing engine. When the host's native
- * seams are unavailable the row renders an unavailable line: the question
- * stays pending and the choices/Decline still work.
+ * (src/native-editor-bridge.ts) BEFORE the shared `ctx.ui.custom` overlay
+ * opens — no nested second modal, no second editing engine. When the host's
+ * native seams are unavailable, the row renders an unavailable line; the
+ * question stays pending and the choices/Decline still work.
  *
  * Session isolation: the controller is bound to the session identity
  * (SessionManager object) at session_start; every registration, presentation,
@@ -51,6 +51,7 @@ import {
   loadQuestionTuiHost,
 } from "./pi-tui-host";
 import { createUserQuestionTool } from "./tool";
+import { createYouShouldKnowTool } from "./notice-tool";
 
 /** Widget key for the persistent collapsed pending-question panel (above the editor). */
 export const USER_QUESTION_PANEL_KEY = "review-gate-pending-questions";
@@ -63,11 +64,17 @@ export function pendingQuestionPanelLine(): string {
   return `Pending questions · Press ${questionShortcutLabel()}`;
 }
 
-const QUESTION_LIST_DESCRIPTION = "Open the pending-question list (answer, defer, or decline model questions)";
+const QUESTION_LIST_DESCRIPTION = "Open the pending question and notice list (answer questions, request notice details, or close notices)";
+const QUESTION_POPUP_OVERLAY_MARGIN = 1;
 
 /** Platform label for the approved chord; Alt is Option on macOS. */
 export function questionShortcutLabel(): string {
   return process.platform === "darwin" ? "Ctrl+Option+Up" : "Ctrl+Alt+Up";
+}
+
+export interface UserQuestionRegistrationOptions {
+  /** Safe, dynamic gate for admitting new notices; defaults enabled. */
+  isNoticeFeatureEnabled?: () => boolean;
 }
 
 export interface UserQuestionSurface {
@@ -116,7 +123,10 @@ export function contextIsInteractiveTui(ctx: unknown): boolean {
  * Register the pending-question surfaces. Returns undefined on hosts without
  * the tool-registration API (the executor runtime never calls this).
  */
-export function registerUserQuestions(pi: unknown): UserQuestionSurface | undefined {
+export function registerUserQuestions(
+  pi: unknown,
+  options: UserQuestionRegistrationOptions = {},
+): UserQuestionSurface | undefined {
   if (!isRecord(pi) || typeof pi.registerTool !== "function") return undefined;
 
   let shortcutRegistered = false;
@@ -128,6 +138,7 @@ export function registerUserQuestions(pi: unknown): UserQuestionSurface | undefi
   const controller = new UserQuestionController({
     pi,
     uiAvailable: () => shortcutRegistered && interactiveUi,
+    isNoticeFeatureEnabled: options.isNoticeFeatureEnabled,
     onStateChange: () => refreshPanel(),
   });
 
@@ -218,15 +229,16 @@ export function registerUserQuestions(pi: unknown): UserQuestionSurface | undefi
   });
 
   pi.registerTool(createUserQuestionTool(controller, { shortcutLabel: questionShortcutLabel() }));
+  pi.registerTool(createYouShouldKnowTool(controller));
 
   if (typeof pi.registerShortcut === "function") {
     const occupancy = findOccupiedHostBindings(QUESTION_LIST_SHORTCUT_KEY);
     if (occupancy.resolved && occupancy.bindings.length > 0) {
       // Never steal a known host binding: name the collision and leave the
-      // surface unavailable; AskUserQuestion then fails closed per question.
+      // surface unavailable; both tools then fail closed for pending input.
       void sendNotice(
         pi,
-        `review gate: pending-question shortcut '${questionShortcutLabel()}' is also used by built-in Pi binding(s) (${occupancy.bindings.join(", ")}); the question list cannot be opened and AskUserQuestion reports questions as unavailable`,
+        `review gate: pending-question shortcut '${questionShortcutLabel()}' is also used by built-in Pi binding(s) (${occupancy.bindings.join(", ")}); the pending list cannot be opened and its tools report input as unavailable`,
       );
     } else {
       pi.registerShortcut(QUESTION_LIST_SHORTCUT_KEY, {
@@ -310,15 +322,16 @@ async function openQuestionList(
     );
     return;
   }
-  // Load the host pi-tui helpers (width-safe text + raw key matching). A
-  // failure degrades rendering/input matching but never blocks the list.
+  // Load host pi-tui helpers (width-safe text, native Markdown,
+  // and raw key matching). A failure degrades rendering/input matching but
+  // never blocks the pending list.
   const tuiHost = await loadQuestionTuiHost().catch(() => undefined);
   // A session rebind during the load retargets this press: the same
   // SessionManager object may be reused across /new/resume, so the identity
   // check alone cannot see it. Never open a stale context's UI.
   if (stale()) return;
-  // Acquire the host-wired native editor BEFORE the custom slot opens:
-  // installing the factory mid-slot would make the host swap the visible
+  // Acquire the host-wired native editor BEFORE the custom overlay opens:
+  // installing the factory mid-interaction would replace the visible editor
   // component. Unavailable seams keep the list open with an unavailable
   // free-text row (choices/Decline still work) — no non-parity fallback.
   // The acquisition sees a generation-guarded view of the per-press ui: if
@@ -377,10 +390,16 @@ async function openQuestionList(
   }
   const handle: NativeEditorFieldHandle | undefined =
     acquired.kind === "acquired" ? acquired.handle : undefined;
+  let customResult: unknown;
   try {
     // The captured method keeps its original ui receiver: receiver-dependent
-    // SDK methods and foreign forwarding wrappers rely on it.
-    await custom.call(ui, (_tui: unknown, theme: unknown, keybindings: unknown, done: (result?: unknown) => void) => {
+    // SDK methods and foreign forwarding wrappers rely on it. The shared
+    // question/notice surface is a public custom overlay. Its explicit
+    // maxHeight and margin are also the manual viewport's exact geometry;
+    // the public ScrollView layout node is not propagated through this
+    // overlay, so the component owns scrolling within that measured budget.
+    customResult = await custom.call(ui, (tui: unknown, theme: unknown, keybindings: unknown, done: (result?: unknown) => void) => {
+      const requestRender = requestRenderOf(tui);
       // The host captured its saved text before this factory ran; record it
       // and start the field empty so the displaced chat draft can never show
       // or submit as an answer.
@@ -393,10 +412,15 @@ async function openQuestionList(
         shortcutLabel: questionShortcutLabel(),
         nativeField: handle?.instance,
         isStale: stale,
-        onDone: () => done(undefined),
+        requestRender,
+        getViewportRows: () => questionPopupViewportRows(tui),
+        onDone: (result) => done(result),
       });
       component.setSourceProbe(sourceProbeOf(ctx));
       return component;
+    }, {
+      overlay: true,
+      overlayOptions: questionPopupOverlayOptions(),
     });
   } catch {
     // The host surfaced the failure itself (error banner); the questions
@@ -406,6 +430,67 @@ async function openQuestionList(
     // session-reset abort (the host owns the slot from that point on).
     handle?.finish();
   }
+  const noticeDetails = noticeDetailsResult(customResult);
+  if (noticeDetails && !stale()) {
+    // `ui.custom()` has resolved and restored the normal editor before the
+    // ordinary owner-session message is delivered. Request failure or a stale
+    // session leaves the notice pending in the controller.
+    await controller.requestNoticeDetails(noticeDetails.noticeId, sourceProbeOf(ctx));
+  }
+}
+
+function requestRenderOf(tui: unknown): (() => void) | undefined {
+  if (!isRecord(tui)) return undefined;
+  try {
+    const requestRender = tui.requestRender;
+    return typeof requestRender === "function"
+      ? () => requestRender.call(tui)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Public overlay options use a percentage maxHeight so pi-tui resolves it
+ * against the current terminal dimensions on every layout pass. Its one-row
+ * margins bound the actual height to `terminal.rows - 2`; the component reads
+ * that same live budget before returning lines, so it never exceeds the
+ * compositor's resized viewport.
+ */
+function questionPopupOverlayOptions(): {
+  width: "90%";
+  anchor: "center";
+  margin: number;
+  maxHeight: "100%";
+} {
+  return {
+    width: "90%",
+    anchor: "center",
+    margin: QUESTION_POPUP_OVERLAY_MARGIN,
+    maxHeight: "100%",
+  };
+}
+
+/** Exact row budget after the public overlay resolver applies its margins. */
+function questionPopupViewportRows(tui: unknown): number {
+  let rows: unknown;
+  try {
+    const terminal = isRecord(tui) ? tui.terminal : undefined;
+    rows = isRecord(terminal) ? terminal.rows : undefined;
+  } catch {
+    rows = undefined;
+  }
+  const maxHeight = typeof rows === "number" && Number.isFinite(rows)
+    ? Math.max(1, Math.floor(rows) - QUESTION_POPUP_OVERLAY_MARGIN * 2)
+    : 1;
+  return maxHeight;
+}
+
+function noticeDetailsResult(value: unknown): { noticeId: string } | undefined {
+  if (!isRecord(value) || value.kind !== "notice-details"
+    || typeof value.noticeId !== "string" || value.noticeId.length === 0) return undefined;
+  return { noticeId: value.noticeId };
 }
 
 function toUiTheme(theme: unknown): QuestionUiTheme {

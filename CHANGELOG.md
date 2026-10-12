@@ -15,6 +15,39 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.146]
+
+### Added
+
+- `YouShouldKnow` adds session-local notices alongside `AskUserQuestion` (#295).
+  Notices use a compact title, complete Markdown body, and optional context retained
+  in full. Questions and notice details use one shared native question popup and
+  Markdown renderer; question text is rendered as Markdown as well. **More details**
+  closes that popup before sending the complete retained body/context as an ordinary
+  owner-session request with an explicit natural-language request to elaborate in a
+  normal conversation reply, while leaving the notice pending. **Close** removes only
+  the selected notice and sends nothing. Contextual ordinary user requests stay
+  scoped to the originating session and use existing busy-steering or idle
+  non-interrupting delivery. Default-on
+  `youShouldKnow.enabled` and `youShouldKnow.completionGuidance` settings control notice
+  availability and the supplemental completion prompt; the prompt is supplied only
+  when both settings are On and live authorized discovery exposes the tool. Disabling
+  availability preserves pending notice actions, and disabling guidance does not block
+  authorized calls. The shipped completion skill opts out of native automatic skill
+  routing while remaining explicitly invocable. Existing question answer/decline behavior and
+  in-memory lifecycle remain unchanged; notices add no permission grants, dashboard,
+  or notification channel.
+
+### Fixed
+
+- Extension-owned question/notice Markdown, titles, and tool results visibly escape
+  terminal controls for display without changing stored data or ordinary model
+  requests. A guarded optional Pi Markdown display transformer applies the same
+  adapter to native conversation Markdown when available; older hosts retain safe
+  extension-owned rendering but cannot sanitize their transcript renderer. CRLF
+  remains a structural newline, and printable text, ordinary Markdown, and backslash
+  escaping are preserved.
+
 ## [0.1.0-dev.145]
 
 ### Changed

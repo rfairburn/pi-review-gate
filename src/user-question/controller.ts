@@ -1,10 +1,11 @@
 /**
  * Session-local pending questions (issue #95).
  *
- * The controller owns every question a model asks through the AskUserQuestion
- * tool for one live Pi session: creation, presentation order, answers,
- * declines, and settlement. It is deliberately in-memory and session-scoped —
- * ordinary session scoping, no persistence service:
+ * The controller owns every question and notice registered through the user
+ * input tools for one live Pi session: creation, presentation order, answers,
+ * explicit notice requests/closure, and settlement. It is deliberately
+ * in-memory and session-scoped — ordinary session scoping, no persistence
+ * service:
  *
  * - Questions are created only while a session identity (the host's
  *   SessionManager object, stable for the AgentSession) is current, and they
@@ -16,8 +17,11 @@
  *   callbacks after shutdown are rejected the same way.
  * - Async questions resolve out-of-band: an answer is delivered through the
  *   host's ordinary user-message path — `deliverAs: "steer"` while the agent
- *   is busy, a plain immediate send when idle. The run is never aborted to
- *   deliver an answer, and no reminder, deadline, or fabricated answer exists.
+ *   is busy, a plain immediate send when idle. A notice's explicit More details
+ *   request uses that same path but never removes the notice; only Close does.
+ *   The optional feature gate applies only to admitting new notices; it never
+ *   deletes pending notices or disables their More details/Close actions. Neither
+ *   path aborts the run, and no reminder, deadline, or fabricated answer exists.
  * - Sync questions resolve through a waiter held by the tool execution; a
  *   decline resolves it with a terminating result, and session shutdown
  *   settles every remaining waiter so nothing can hang.
@@ -38,6 +42,23 @@ export interface PendingQuestion {
   /** The SessionManager object of the session that created the question. */
   sessionIdentity: object;
 }
+
+/** A non-interactive notice that remains pending until explicitly closed. */
+export interface PendingNotice {
+  /** Stable per-session handle, e.g. "n1". */
+  id: string;
+  toolCallId: string;
+  title: string;
+  /** Full Markdown body; retained without truncation. */
+  body: string;
+  /** Optional full context included when the user requests more details. */
+  context?: string;
+  kind: "notice";
+  /** The SessionManager object of the session that created the notice. */
+  sessionIdentity: object;
+}
+
+export type PendingUserInput = PendingQuestion | PendingNotice;
 
 export interface SyncWaitResult {
   outcome: QuestionOutcome;
@@ -72,6 +93,8 @@ export interface UserQuestionDependencies {
   pi: unknown;
   /** Reports whether the question UI surface (shortcut) is available. */
   uiAvailable: () => boolean;
+  /** Optional on-by-default gate for admitting new notices. */
+  isNoticeFeatureEnabled?: () => boolean;
   /** Invoked after every state change so the caller can refresh the widget. */
   onStateChange?: () => void;
 }
@@ -89,9 +112,20 @@ export interface RegisterQuestionInput {
   mode: QuestionMode;
 }
 
+export interface RegisterNoticeInput {
+  toolCallId: string;
+  title: string;
+  body: string;
+  context?: string;
+}
+
 export type RegisterResult =
   | { ok: true; question: PendingQuestion }
   | { ok: false; reason: "unavailable" | "identity-mismatch" | "invalid"; message: string };
+
+export type RegisterNoticeResult =
+  | { ok: true; notice: PendingNotice }
+  | { ok: false; reason: "unavailable" | "identity-mismatch" | "invalid" | "feature-disabled"; message: string };
 
 interface Waiter {
   resolve: (result: SyncWaitResult) => void;
@@ -100,11 +134,14 @@ interface Waiter {
 }
 
 export class UserQuestionController {
-  private readonly pending = new Map<string, PendingQuestion>();
+  private readonly pending = new Map<string, PendingUserInput>();
   private readonly waiters = new Map<string, Waiter>();
+  /** Prevents reentrant More details requests for the same live notice. */
+  private readonly noticeDetailsInFlight = new Map<string, PendingNotice>();
   private readonly stateListeners = new Set<() => void>();
   private currentIdentity: object | undefined;
   private nextId = 1;
+  private nextNoticeId = 1;
 
   constructor(private readonly deps: UserQuestionDependencies) {}
 
@@ -141,7 +178,9 @@ export class UserQuestionController {
     }
     this.waiters.clear();
     this.pending.clear();
+    this.noticeDetailsInFlight.clear();
     this.nextId = 1;
+    this.nextNoticeId = 1;
     this.currentIdentity = identity;
     this.notifyState();
     return true;
@@ -154,6 +193,7 @@ export class UserQuestionController {
     }
     this.waiters.clear();
     this.pending.clear();
+    this.noticeDetailsInFlight.clear();
     this.currentIdentity = undefined;
     this.notifyState();
   }
@@ -229,11 +269,68 @@ export class UserQuestionController {
     return { ok: true, question: record };
   }
 
-  listPending(): readonly PendingQuestion[] {
+  /** Register a notice through the same session/UI admission boundary as questions. */
+  registerNotice(input: RegisterNoticeInput, ctxIdentity: unknown): RegisterNoticeResult {
+    if (!this.deps.uiAvailable()) {
+      return { ok: false, reason: "unavailable", message: unavailableMessage() };
+    }
+    if (!this.noticeFeatureEnabled()) {
+      return {
+        ok: false,
+        reason: "feature-disabled",
+        message: "The YouShouldKnow notice feature is disabled; existing pending notices are unchanged.",
+      };
+    }
+    if (this.currentIdentity === undefined) {
+      return {
+        ok: false,
+        reason: "unavailable",
+        message: "Question UI is not available until the session starts.",
+      };
+    }
+    if (!isObjectIdentity(ctxIdentity) || ctxIdentity !== this.currentIdentity) {
+      return {
+        ok: false,
+        reason: "identity-mismatch",
+        message: "Notice was rejected: the calling context does not belong to the current session.",
+      };
+    }
+    if (typeof input.title !== "string" || input.title.trim().length === 0
+      || typeof input.body !== "string" || input.body.trim().length === 0
+      || (input.context !== undefined && typeof input.context !== "string")) {
+      return {
+        ok: false,
+        reason: "invalid",
+        message: "Invalid notice: title and body must be non-empty strings; context must be a string when provided.",
+      };
+    }
+    const notice: PendingNotice = {
+      id: `n${this.nextNoticeId}`,
+      toolCallId: input.toolCallId,
+      title: input.title,
+      body: input.body,
+      ...(input.context !== undefined ? { context: input.context } : {}),
+      kind: "notice",
+      sessionIdentity: this.currentIdentity,
+    };
+    this.nextNoticeId += 1;
+    this.pending.set(notice.id, notice);
+    this.notifyState();
+    return { ok: true, notice };
+  }
+
+  listPending(): readonly PendingUserInput[] {
     return [...this.pending.values()];
   }
 
+  /** Question-only lookup retained for existing question flows. */
   get(id: string): PendingQuestion | undefined {
+    const record = this.pending.get(id);
+    return record && !isPendingNotice(record) ? record : undefined;
+  }
+
+  /** Shared lookup used by the question/notice list surface. */
+  getPending(id: string): PendingUserInput | undefined {
     return this.pending.get(id);
   }
 
@@ -248,7 +345,7 @@ export class UserQuestionController {
    */
   submitAnswer(id: string, rawAnswer: string, source?: QuestionSubmitSource): SubmitResult {
     const record = this.pending.get(id);
-    if (!record || !this.belongsToCurrentSession(record)) {
+    if (!record || isPendingNotice(record) || !this.belongsToCurrentSession(record)) {
       return { status: "rejected", empty: this.pending.size === 0 };
     }
     const answer = rawAnswer.trim();
@@ -280,7 +377,7 @@ export class UserQuestionController {
    */
   submitDecline(id: string): SubmitResult {
     const record = this.pending.get(id);
-    if (!record || !this.belongsToCurrentSession(record)) {
+    if (!record || isPendingNotice(record) || !this.belongsToCurrentSession(record)) {
       return { status: "rejected", empty: this.pending.size === 0 };
     }
     this.remove(id);
@@ -294,6 +391,45 @@ export class UserQuestionController {
     return { status: "declined", empty: this.pending.size === 0 };
   }
 
+  /** Close only one live notice; no request or explanatory message is sent. */
+  closeNotice(id: string): boolean {
+    const record = this.pending.get(id);
+    if (!record || !isPendingNotice(record) || !this.belongsToCurrentSession(record)) return false;
+    this.remove(id);
+    return true;
+  }
+
+  /**
+   * Deliver the complete notice body and optional context through the current
+   * session's ordinary message path. The notice is never removed here; only
+   * {@link closeNotice} settles it. Delivery failures leave it available for
+   * another deliberate request.
+   */
+  async requestNoticeDetails(id: string, source?: QuestionSubmitSource): Promise<boolean> {
+    const record = this.pending.get(id);
+    if (!record || !isPendingNotice(record) || !this.isCurrentPending(record)) return false;
+    if (this.noticeDetailsInFlight.get(id) === record) return false;
+    this.noticeDetailsInFlight.set(id, record);
+    try {
+      const host = this.deps.pi as Partial<QuestionMessageHost> | undefined;
+      const send = isRecord(host) ? host.sendUserMessage : undefined;
+      if (typeof send !== "function" || !this.isCurrentPending(record)) return false;
+      const message = formatNoticeDetailsDelivery(record);
+      const idle = source?.isIdle ? source.isIdle() : true;
+      if (!this.isCurrentPending(record)) return false;
+      if (!idle) {
+        await send.call(host, message, { deliverAs: "steer" });
+      } else {
+        await send.call(host, message);
+      }
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (this.noticeDetailsInFlight.get(id) === record) this.noticeDetailsInFlight.delete(id);
+    }
+  }
+
   // ------------------------------------------------------------------
   // Synchronous waiting (from the tool execution)
   // ------------------------------------------------------------------
@@ -305,7 +441,7 @@ export class UserQuestionController {
    */
   waitForAnswer(id: string, signal?: AbortSignal): Promise<SyncWaitResult> {
     const record = this.pending.get(id);
-    if (!record || record.mode !== "sync" || !this.belongsToCurrentSession(record)) {
+    if (!record || isPendingNotice(record) || record.mode !== "sync" || !this.belongsToCurrentSession(record)) {
       return Promise.resolve({ outcome: "settled" });
     }
     return new Promise<SyncWaitResult>((resolvePromise) => {
@@ -335,8 +471,21 @@ export class UserQuestionController {
   // Internals
   // ------------------------------------------------------------------
 
-  private belongsToCurrentSession(record: PendingQuestion): boolean {
+  private belongsToCurrentSession(record: PendingUserInput): boolean {
     return this.currentIdentity !== undefined && record.sessionIdentity === this.currentIdentity;
+  }
+
+  private isCurrentPending(record: PendingUserInput): boolean {
+    return this.pending.get(record.id) === record && this.belongsToCurrentSession(record);
+  }
+
+  /** Public, fail-closed gate for admitting new notices. */
+  isNoticeFeatureEnabled(): boolean {
+    return readEnabled(this.deps.isNoticeFeatureEnabled);
+  }
+
+  private noticeFeatureEnabled(): boolean {
+    return this.isNoticeFeatureEnabled();
   }
 
   private remove(id: string): void {
@@ -399,6 +548,13 @@ export function formatAnswerDelivery(question: string, answer: string): string {
   return `Answer to pending question "${boundQuestion(question)}": ${answer}`;
 }
 
+/** Full, unbounded request payload for the explicit More details action. */
+export function formatNoticeDetailsDelivery(notice: Pick<PendingNotice, "title" | "body" | "context">): string {
+  return `More details requested for "${notice.title}":\n\n${notice.body}`
+    + (notice.context !== undefined ? `\n\nRelevant context:\n${notice.context}` : "")
+    + "\n\nPlease elaborate on these details in your normal conversation reply.";
+}
+
 function boundQuestion(question: string): string {
   if (question.length <= DELIVERY_QUESTION_BOUND) return question;
   return `${question.slice(0, DELIVERY_QUESTION_BOUND - 1)}…`;
@@ -414,4 +570,17 @@ function isObjectIdentity(value: unknown): value is object {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isPendingNotice(record: PendingUserInput): record is PendingNotice {
+  return "kind" in record && record.kind === "notice";
+}
+
+function readEnabled(getter: (() => boolean) | undefined): boolean {
+  if (getter === undefined) return true;
+  try {
+    return getter() === true;
+  } catch {
+    return false;
+  }
 }

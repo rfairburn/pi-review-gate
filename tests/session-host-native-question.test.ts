@@ -503,6 +503,7 @@ function stageCandidate(root: string, prerequisites: StaticPrerequisites): Stage
     ["skills", "pi-review-gate-orchestrator", "references", "recovery.md"],
     ["skills", "pi-review-gate-execution", "SKILL.md"],
     ["skills", "pi-review-gate-research", "SKILL.md"],
+    ["skills", "pi-review-gate-completion", "SKILL.md"],
   ];
   for (const parts of shippedFiles) {
     copyBoundedRegularFile(join(repositoryRoot(), ...parts), join(packageRoot, ...parts), 2 * 1024 * 1024);

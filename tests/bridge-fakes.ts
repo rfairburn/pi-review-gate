@@ -66,8 +66,11 @@ export interface FakeBridgeEditor {
   provider?: unknown;
   text: string;
   showingList: boolean;
+  hiddenRows: number;
   received: string[];
   render(width: number): string[];
+  renderTopBorder(width: number, hiddenLineCount: number): string;
+  getRenderedHiddenLineCount?(): number;
   handleInput(data: string): void;
   invalidate(): void;
   setText(text: string): void;
@@ -97,6 +100,7 @@ export function createFakeCustomEditorClass(
     provider?: unknown;
     text = "";
     showingList = false;
+    hiddenRows = 0;
     received: string[] = [];
 
     constructor(_tui: unknown, _theme: unknown, _keybindings: unknown) {
@@ -159,10 +163,14 @@ export function createFakeCustomEditorClass(
       if (data.length === 1 && data >= " ") this.text += data;
     }
 
-    render(_width: number): string[] {
-      const lines = [`[field:${this.text}]`];
+    render(width: number): string[] {
+      const lines = [this.renderTopBorder(width, this.hiddenRows), `[field:${this.text}]`];
       if (this.showingList) lines.push("-> assets/", "   guide.md");
       return lines;
+    }
+
+    renderTopBorder(width: number, _hiddenLineCount: number): string {
+      return "─".repeat(width);
     }
 
     invalidate(): void {}
@@ -294,16 +302,20 @@ export function createBridgeUi(options: BridgeUiOptions): { ui: NativeEditorFiel
     getEditorComponent() {
       return state.slotFactory as never;
     },
-    custom(factory) {
+    custom(factory, customOptions?: unknown) {
       return new Promise<string | undefined>((resolve, reject) => {
         // showExtensionCustom captures the saved text BEFORE the factory.
         const savedText = instance.getText();
+        const isOverlay = typeof customOptions === "object" && customOptions !== null
+          && (customOptions as { overlay?: unknown }).overlay === true;
         let closed = false;
         const close = (result: string | undefined): void => {
           if (closed) return;
           closed = true;
-          // restoreEditor(): put the saved text back into this.editor.
-          instance.setText(savedText);
+          // Non-overlays restore inside showExtensionCustom. Overlays leave
+          // the underlying editor mounted; the bridge must restore it when
+          // its ownership-checked field session finishes.
+          if (!isOverlay) instance.setText(savedText);
           resolve(result);
         };
         Promise.resolve(factory(GEOMETRY_TUI, options.theme ?? IDENTITY_THEME, options.keybindings ?? null, close))
@@ -317,7 +329,7 @@ export function createBridgeUi(options: BridgeUiOptions): { ui: NativeEditorFiel
           })
           .catch((error) => {
             if (!closed) {
-              instance.setText(savedText);
+              if (!isOverlay) instance.setText(savedText);
               reject(error);
             }
           });

@@ -17,7 +17,7 @@ import {
   shouldRecordToolCallEvidence,
   shouldRecordToolResultEvidence,
 } from "./evidence";
-import { registerHook, extractContext, extractCwd, extractInputSource, extractInputText, extractToolArgs, extractToolName, sendNotice, setStatus, type HookHandler } from "./pi";
+import { registerHook, captureSessionNotice, extractContext, extractCwd, extractInputSource, extractInputText, extractToolArgs, extractToolName, sendNotice, setStatus, type HookHandler } from "./pi";
 import { createReviewCancellationCoordinator } from "./review-cancellation";
 import {
   beginAgentRun,
@@ -368,6 +368,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   state.checkpointScope = dependencies.initialCheckpointScope;
   let currentScopedModels: string[] = [];
   let sessionActive = true;
+  let sessionEpoch = 0;
   let checkpointRestartBlocked: string | undefined;
   const reviewCancellation = createReviewCancellationCoordinator();
   const sessionAbortController = new AbortController();
@@ -570,6 +571,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
 
   registerHook(pi, "session_shutdown", async (...args) => {
     nativeToolPreflight.reset();
+    sessionEpoch += 1;
     sessionActive = false;
     setStatus(extractContext(args) ?? pi, "review-gate", undefined);
     setStatus(extractContext(args) ?? pi, "review-gate-mode", undefined);
@@ -602,7 +604,12 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   });
 
   registerHook(pi, "session_start", async (...args) => {
+    const restoreSessionEpoch = ++sessionEpoch;
+    const context = extractContext(args);
+    const notifyRestore = captureSessionNotice(pi, context, () =>
+      sessionActive && sessionEpoch === restoreSessionEpoch);
     await dependencies.sessionStartInitializationTestBarrier?.();
+    if (sessionEpoch !== restoreSessionEpoch) return;
     // Issue #222: session boundaries reset orchestrator-turn correlation —
     // only runs of the CURRENT session may settle its deliveries.
     orchestratorTurnTracker.resetSession();
@@ -633,11 +640,10 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     reviewTurn.resetForSessionStart();
     updateScopedModels(args);
     executionTools.setScopedModels(currentScopedModels);
-    executionTools.setUiContext(extractContext(args) ?? pi);
+    executionTools.setUiContext(context ?? pi);
     discardSessionState(state);
     checkpointRestartBlocked = undefined;
     sessionPersistence.resetLedger();
-    const context = extractContext(args);
     // #301: raw checkpoints live in this live session's external namespace
     // under Pi's agent-data directory, for persisted and in-memory sessions
     // alike. The scope comes from the live session id, never from a session
@@ -661,6 +667,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     userQuestions?.noteContext(context);
     userQuestions?.syncPanel();
     const identity = sessionPersistenceIdentity(context, currentCwd);
+    const activityRestoreOptions = identity
+      ? { sessionOwner: JSON.stringify([identity.sessionId, identity.sessionFile, identity.cwd]) }
+      : {};
     const appendEntry = typeof pi === "object" && pi !== null && "appendEntry" in pi && typeof pi.appendEntry === "function"
       ? pi.appendEntry.bind(pi) as (customType: string, data: unknown) => void
       : undefined;
@@ -691,7 +700,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
               `review gate: previous review cannot resume (checkpoint ${restored.damagedCheckpointReason}); preserved prior state at ${boundPath(preserved)} and its owned records in place. Already-present edits become the new baseline; prior edits were not reviewed. Starting a fresh checkpoint without confirmation.`);
           }
           replaceReviewGateState(state, restored.state);
-          await executionTools.restoreAssociations(restored.execution);
+          await executionTools.restoreAssociations(restored.execution, activityRestoreOptions, notifyRestore);
           // Persisted windows never carry their frozen reviewer configuration;
           // they are re-frozen against the current settings. When the review
           // settings changed since the last save, reconcile by continuing with
@@ -732,7 +741,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
         } else {
           // A readable absence for this exact native session is an authoritative
           // empty association set, unlike the fallbacks below after restore failure.
-          await executionTools.restoreAssociations({ waveRoots: [], bundles: [], groupRoots: [] });
+          await executionTools.restoreAssociations({ waveRoots: [], bundles: [], groupRoots: [] }, activityRestoreOptions, notifyRestore);
         }
       } catch (error) {
         if (error instanceof SessionStateCwdMismatchError) {
@@ -747,10 +756,10 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
         }
         // Only after the store is guarded (or the sidecar already quarantined)
         // may any code path run that could persist state.
-        await executionTools.restoreAssociations({ waveRoots: [], bundles: [] }, { authoritative: false });
+        await executionTools.restoreAssociations({ waveRoots: [], bundles: [] }, { ...activityRestoreOptions, authoritative: false }, notifyRestore);
       }
     } else {
-      await executionTools.restoreAssociations({ waveRoots: [], bundles: [] }, { authoritative: false });
+      await executionTools.restoreAssociations({ waveRoots: [], bundles: [] }, { ...activityRestoreOptions, authoritative: false }, notifyRestore);
     }
     executionTools.sync();
     // Late loader registration: after every legitimately available top-level

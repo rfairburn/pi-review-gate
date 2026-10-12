@@ -292,6 +292,8 @@ export interface JournalSnapshot {
 export interface SavedMainStartOptions {
   readonly ptyModule: NativePtyModule;
   readonly scratchRoot: string;
+  /** Distinct per-host artifact namespace when one fixture agent root is reopened. */
+  readonly runLabel?: string;
   readonly candidate: CandidatePackage;
   readonly runtime: RuntimePin;
   readonly observerFile: string;
@@ -450,7 +452,7 @@ export class SavedMainDriver {
 
   private constructor(options: {
     readonly pty: NativePtyHandle;
-    readonly scratchRoot: string;
+    readonly stateRoot: string;
     readonly observerFile: string;
     readonly resultFile: string;
     readonly ptyJournalFile: string;
@@ -463,7 +465,7 @@ export class SavedMainDriver {
     this.resultFile = options.resultFile;
     this.ptyJournalFile = options.ptyJournalFile;
     this.controlFile = options.controlFile;
-    this.stateRoot = join(options.scratchRoot, "saved-main-state");
+    this.stateRoot = options.stateRoot;
     this.observerWatcher = options.observerWatcher;
     this.ptyWatcher = options.ptyWatcher;
     this.surface = new TerminalSurface(OUTER_COLS, OUTER_ROWS, {
@@ -508,12 +510,17 @@ export class SavedMainDriver {
     const state = join(home, ".local", "state");
     for (const path of [home, config, cache, data, state, temporary]) mkdirSync(path, { recursive: true, mode: 0o700 });
 
-    const stateRoot = join(options.scratchRoot, "saved-main-state");
+    const runLabel = options.runLabel ?? "";
+    if (runLabel !== "" && !/^[a-z0-9-]{1,32}$/u.test(runLabel)) {
+      throw new Error("Saved Main run label must be a bounded lowercase path component");
+    }
+    const stem = `saved-main${runLabel ? `-${runLabel}` : ""}`;
+    const stateRoot = join(options.scratchRoot, `${stem}-state`);
     mkdirSync(stateRoot, { mode: 0o700 });
-    const resultFile = join(options.scratchRoot, "saved-main-result.json");
-    const ptyJournalFile = join(options.scratchRoot, "saved-main-pty-journal.jsonl");
-    const controlFile = join(options.scratchRoot, "saved-main-control.json");
-    const optionsFile = join(options.scratchRoot, "saved-main-options.json");
+    const resultFile = join(options.scratchRoot, `${stem}-result.json`);
+    const ptyJournalFile = join(options.scratchRoot, `${stem}-pty-journal.jsonl`);
+    const controlFile = join(options.scratchRoot, `${stem}-control.json`);
+    const optionsFile = join(options.scratchRoot, `${stem}-options.json`);
     for (const [path, contents] of [
       [resultFile, ""], [ptyJournalFile, ""], [controlFile, ""], [optionsFile, ""],
     ] as const) writeFileSync(path, contents, { flag: "wx", mode: 0o600 });
@@ -579,7 +586,7 @@ export class SavedMainDriver {
     }
     return new SavedMainDriver({
       pty,
-      scratchRoot: options.scratchRoot,
+      stateRoot,
       observerFile: options.observerFile,
       resultFile,
       ptyJournalFile,

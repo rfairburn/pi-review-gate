@@ -229,12 +229,24 @@ conversation selection happens only through the sidebar's deliberate Saved conve
 picker (below); parent startup arguments still cannot select a session.
 
 The launcher rejects unsupported platform, Node version, non-interactive use, and
-runtime-role contexts before starting a host. It builds from a source checkout or uses
-the compiled package, then validates or provisions the existing DDGS environment once
-before starting the host or creating any instance capability. Source builds use fresh
-bounded staging and locked `npm ci --include=dev --ignore-scripts`. It then runs the
-stage-installed TypeScript compiler directly through trusted Node, without the package
-build script's recursive clean step; ordinary package scripts are unchanged. Public
+runtime-role contexts before starting a host. Installed packages use their compiled
+output. Source launches can reuse a previously completed private stage when the exact
+build/runtime input contents and modes, Node/npm implementation, platform, and build
+configuration still match. Cache hits skip dependency installation and TypeScript
+compilation, not Pi identity/version checks or DDGS validation. Cached artifact contents
+and filesystem identities are checked before any cached setup helper or host is loaded.
+Uncommitted source, script, skill, lockfile, manifest, or tsconfig changes invalidate reuse.
+
+First or changed source builds still use fresh bounded staging and locked
+`npm ci --include=dev --ignore-scripts`, followed by the stage-installed TypeScript
+compiler directly through trusted Node, without the package build script's recursive
+clean step. Unknown external Node preload/loader, dependency, or environment modes
+(including proxy overrides) bypass reuse rather than assuming unchanged build inputs.
+Invalid, incomplete, unsafe, or raced cache entries are preserved; the launcher builds
+privately instead of loading unverifiable output. Cache manifests are corruption/freshness
+checks, not protection against a same-user writer forging both artifacts and metadata;
+filesystem identity fences are not an atomic filesystem sandbox. No cache pruning or
+uncertain descendant cleanup is added. Ordinary package scripts are unchanged. Public
 Node can terminate only the directly owned Windows setup child, so abnormal timeout
 settlement is not represented as descendant-tree proof and uncertain stages are kept.
 Setup preserves trusted original `NODE_OPTIONS` and provider values while removing only
@@ -562,6 +574,19 @@ not an operating-system or terminal-emulator memory guarantee. Graphics output
 uses the existing bounded writer and its coalescing/backpressure boundary; cleanup
 must settle before the writer can report successful terminal restoration.
 
+Retained immutable PNG metadata is validated and hashed once, not on every text
+redraw. Moving or cropping an unchanged image for the same Main owner reuses its
+resident outer image data: the writer removes/replaces only the scoped placements,
+rather than deleting and retransmitting the PNG. Owner changes, hidden/covered
+Main panes, changed content, and shutdown still remove obsolete owned graphics.
+Mutable or accessor-backed image values do not receive that validation-cache trust.
+
+Queued text-only output is parsed in bounded batches again, avoiding one xterm
+parse cycle and snapshot per child chunk. Potential graphics commands remain
+parse-order barriers, and existing alternate-screen graphics anchors retain their
+per-chunk checks. This preserves the earlier row-diff/coalescing optimization;
+it does not change the redraw interval or promise a physical frame rate.
+
 Source, unit, and controlled-PTY tests establish parsing, placement commands,
 identity fences, and cleanup ordering; they do **not** prove pixels appeared in a
 physical terminal. Actual same-content direct/hosted Ghostty display and visual
@@ -615,6 +640,12 @@ remain usable without a new host notice. A passing protocol trace or text
 snapshot cannot substitute for these visual observations. Retain the disposable
 sandbox for inspection if shutdown is uncertain; do not delete unknown files or
 use forced termination as proof that normal cleanup passed.
+
+For scrolling performance, also compare the same existing image-bearing
+conversation in direct Pi and the candidate host. The small red/blue fixture
+proves identity and cleanup behavior, not representative large-PNG throughput.
+Exercise ordinary text scrolling with and without an image visible; confirm
+ownership and visual cleanup still hold while comparing responsiveness.
 
 ### Generated frames and input
 

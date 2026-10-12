@@ -27,6 +27,21 @@ dates.
   Ghostty display acceptance remains manual; protocol and PTY tests alone do not
   establish it.
 
+### Fixed
+
+- Hosted output again batches queued text-only chunks before xterm snapshots,
+  preserving the earlier scrolling row-diff optimization. Unchanged immutable
+  PNGs no longer repeat validation/hash work per redraw, and same-owner image
+  moves/crops reuse resident data with scoped placement updates instead of
+  retransmitting the PNG. Ownership, clipping, bounded output/backpressure, and
+  cleanup/restoration fences remain intact (#363).
+- Unchanged eligible source-sidebar launches reuse a verified completed staged
+  build instead of installing dependencies and compiling the extension every time.
+  Exact source/toolchain changes invalidate reuse; unsafe or incomplete cached
+  artifacts are preserved and rebuilt privately. Per-launch Pi/DDGS validation,
+  startup guards, ordinary package/standalone launchers, and native user settings
+  remain unchanged (#363).
+
 ## [0.1.0-dev.145]
 
 ### Changed

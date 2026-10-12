@@ -181,6 +181,11 @@ test("persistent launcher uses the compatibility fallback config and forwards ar
     await readFile(join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator", "references", "recovery.md"), "utf8"),
     await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"),
   );
+  assert.equal(
+    await readFile(join(fixture.home, ".agents", "skills", "pi-review-gate-completion", "SKILL.md"), "utf8"),
+    await readFile(resolve("skills/pi-review-gate-completion/SKILL.md"), "utf8"),
+    "the completion skill must be installed from its packaged source",
+  );
   // The launcher no longer bakes the orchestrator prompt in with
   // --append-system-prompt: the extension owns the operating-mode segment.
   assert.equal(
@@ -367,17 +372,20 @@ test("persistent launcher management passthrough (including native pi mcp) skips
   );
 });
 
-test("persistent launcher refreshes a stale installed orchestrator skill", async () => {
+test("persistent launcher refreshes stale installed orchestrator and completion skills", async () => {
   const fixture = await makeLauncherFixture("pi-review-launcher-skill-");
   const installedSkill = join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator", "SKILL.md");
   const installedRecovery = join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator", "references", "recovery.md");
+  const installedCompletion = join(fixture.home, ".agents", "skills", "pi-review-gate-completion", "SKILL.md");
   await Promise.all([
     mkdir(join(fixture.fallbackConfigPath, ".."), { recursive: true }),
     mkdir(join(fixture.home, ".agents", "skills", "pi-review-gate-orchestrator", "references"), { recursive: true }),
+    mkdir(join(fixture.home, ".agents", "skills", "pi-review-gate-completion"), { recursive: true }),
   ]);
   await writeFile(fixture.fallbackConfigPath, "{}\n", "utf8");
   await writeFile(installedSkill, "stale\n", "utf8");
   await writeFile(installedRecovery, "stale recovery\n", "utf8");
+  await writeFile(installedCompletion, "stale completion skill\n", "utf8");
 
   const result = await runLauncher([], launcherEnv(fixture));
 
@@ -389,6 +397,11 @@ test("persistent launcher refreshes a stale installed orchestrator skill", async
     await readFile(installedRecovery, "utf8"),
     await readFile(resolve("skills/pi-review-gate-orchestrator/references/recovery.md"), "utf8"),
   );
+  assert.equal(
+    await readFile(installedCompletion, "utf8"),
+    await readFile(resolve("skills/pi-review-gate-completion/SKILL.md"), "utf8"),
+    "a stale completion skill must be atomically refreshed from its packaged source",
+  );
   for (const name of ["pi-review-gate-execution", "pi-review-gate-research"]) {
     assert.equal(
       await readFile(join(fixture.home, ".agents", "skills", name, "SKILL.md"), "utf8"),
@@ -399,6 +412,7 @@ test("persistent launcher refreshes a stale installed orchestrator skill", async
   assert.match(result.stdout, /pi-review-gate orchestrator skill: /);
   assert.match(result.stdout, /pi-review-gate execution skill: /);
   assert.match(result.stdout, /pi-review-gate research skill: /);
+  assert.match(result.stdout, /pi-review-gate completion skill: /);
 });
 
 test("persistent launcher preserves unrelated custom skills under ~/.agents/skills", async () => {
@@ -419,7 +433,7 @@ test("persistent launcher preserves unrelated custom skills under ~/.agents/skil
     customContent,
     "unrelated custom skills must be preserved untouched by provisioning",
   );
-  for (const name of ["pi-review-gate-orchestrator", "pi-review-gate-execution", "pi-review-gate-research"]) {
+  for (const name of ["pi-review-gate-orchestrator", "pi-review-gate-execution", "pi-review-gate-research", "pi-review-gate-completion"]) {
     assert.equal(
       await readFile(join(fixture.home, ".agents", "skills", name, "SKILL.md"), "utf8"),
       await readFile(resolve(`skills/${name}/SKILL.md`), "utf8"),
@@ -428,7 +442,7 @@ test("persistent launcher preserves unrelated custom skills under ~/.agents/skil
   }
   // Issue 151: a fresh launch installs the namespaced skills only — the
   // generic pre-#151 locations are never created by provisioning.
-  for (const generic of ["orchestrator", "execution", "research"]) {
+  for (const generic of ["orchestrator", "execution", "research", "completion"]) {
     assert.equal(
       await pathExists(join(fixture.home, ".agents", "skills", generic)),
       false,
@@ -438,6 +452,7 @@ test("persistent launcher preserves unrelated custom skills under ~/.agents/skil
   assert.match(result.stdout, /pi-review-gate orchestrator skill: /);
   assert.match(result.stdout, /pi-review-gate execution skill: /);
   assert.match(result.stdout, /pi-review-gate research skill: /);
+  assert.match(result.stdout, /pi-review-gate completion skill: /);
 });
 
 test("persistent launcher migrates proven pre-#151 generic skill copies and preserves modified or unrelated files (#151)", async () => {
@@ -472,7 +487,7 @@ test("persistent launcher migrates proven pre-#151 generic skill copies and pres
   const result = await runLauncher([], launcherEnv(fixture));
 
   // The namespaced skills are provisioned regardless.
-  for (const name of ["pi-review-gate-orchestrator", "pi-review-gate-execution", "pi-review-gate-research"]) {
+  for (const name of ["pi-review-gate-orchestrator", "pi-review-gate-execution", "pi-review-gate-research", "pi-review-gate-completion"]) {
     assert.equal(
       await readFile(join(fixture.home, ".agents", "skills", name, "SKILL.md"), "utf8"),
       await readFile(resolve(`skills/${name}/SKILL.md`), "utf8"),
@@ -1378,7 +1393,7 @@ test("persistent launcher publishes skills over a concurrently published destina
   assert.deepEqual(await readdir(join(skillDir, "references")), ["recovery.md"]);
   // Every shipped skill shares the publication seam, so every destination must
   // have been planted and atomically replaced (manifest order).
-  for (const name of ["pi-review-gate-execution", "pi-review-gate-research"]) {
+  for (const name of ["pi-review-gate-execution", "pi-review-gate-research", "pi-review-gate-completion"]) {
     const dir = join(fixture.home, ".agents", "skills", name);
     assert.equal(
       await readFile(join(dir, "SKILL.md"), "utf8"),
@@ -1398,6 +1413,7 @@ test("persistent launcher publishes skills over a concurrently published destina
     join(skillDir, "references", "recovery.md"),
     join(fixture.home, ".agents", "skills", "pi-review-gate-execution", "SKILL.md"),
     join(fixture.home, ".agents", "skills", "pi-review-gate-research", "SKILL.md"),
+    join(fixture.home, ".agents", "skills", "pi-review-gate-completion", "SKILL.md"),
   ], "the seam must have planted every shipped skill destination before publication");
 });
 

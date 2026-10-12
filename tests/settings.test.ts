@@ -1906,6 +1906,8 @@ const ROOT_SETTING_LABELS = [
   "Retry policy",
   "Subtask notifications",
   "Deferred Pi tools",
+  "YouShouldKnow notices",
+  "Completion guidance",
   "Subtasks view",
   "Scheduled tasks",
   "Web",

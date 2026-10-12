@@ -10,15 +10,19 @@
  *   its own non-overlay `ctx.ui.custom` slot around the captured instance
  *   (title + editor + hint), and resolves with the submitted value, a cancel,
  *   or an unavailable reason.
- * - The AskUserQuestion list/choices modal routes through
+ * - The AskUserQuestion list/choices overlay routes through
  *   {@link acquireNativeEditorField}: the bridge installs the factory BEFORE
- *   the list's own `ctx.ui.custom` slot opens (installing it mid-list would
- *   make the host swap the visible component), and hands back the SAME
- *   host-wired instance for the modal to embed in its free-text row — no
- *   nested second modal, no second editing engine. The modal owns the
- *   editing episodes (Enter submits the whole answer, Esc returns to the
- *   choice rows with the draft kept) and calls `handle.finish()` when its
- *   slot closes.
+ *   the list's own `ctx.ui.custom` overlay opens (installing it mid-list would
+ *   make the host swap the visible component), and hands back that
+ *   host-wired instance for the shared modal to embed in its free-text row.
+ *   Before the overlay accepts input, the bridge uses the public editor-factory
+ *   seam to suppress only the captured field's ordinary prompt render while
+ *   keeping it as Pi's active editor/action target; the popup uses its native
+ *   `renderForPopup` path on that same instance. No second editor is created,
+ *   and ordinary rendering is restored when the overlay ends. The modal owns
+ *   the editing episodes (Enter submits the whole answer, Esc returns to the
+ *   choice rows with the draft kept) and calls `handle.finish()` when its slot
+ *   closes.
  *
  * Shared mechanics for both:
  *
@@ -35,9 +39,10 @@
  *   the field prefill is applied after that capture (settings: inside its own
  *   wrapper factory; questions: `handle.prepare("")` inside the list's
  *   factory — the displaced draft must never show or submit as the field's
- *   value). On close the host restores the captured draft into the instance,
- *   and the bridge's ownership-checked factory swap carries it back to the
- *   prior editor — the chat draft survives every open/close exactly once.
+ *   value). On close the bridge restores the captured draft into the
+ *   instance before its ownership-checked factory swap carries it back to the
+ *   prior editor — the chat draft survives every open/close exactly once,
+ *   including custom overlays that leave the underlying editor mounted.
  * - Keys: Enter runs Pi's own submit path unmodified (autocomplete confirm,
  *   backslash-Enter workaround, state clear) and settles through the
  *   consumer's {@link NativeEditorFieldSemantics} because the native submit
@@ -135,7 +140,7 @@ export type NativeEditorCustomFactory = (
 
 /** The structural UI surface the bridge needs (host ctx.ui or a mock). */
 export interface NativeEditorFieldUi {
-  /** Non-overlay custom component slot (Pi TUI hosts). */
+  /** Custom component slot (Pi TUI hosts); settings callers use its non-overlay form. */
   custom?(factory: NativeEditorCustomFactory): Promise<string | undefined>;
   /** Public Pi seam: install/replace the main editor factory. */
   setEditorComponent?(factory: NativeEditorFactory | undefined): void;
@@ -228,6 +233,14 @@ export interface NativeEditorBaseInstance {
   invalidate(): void;
   setText(text: string): void;
   getText(): string;
+  /** Public pi-tui Editor cursor position, in logical line/column coordinates. */
+  getCursor?(): { line: number; col: number };
+  /** Public pi-tui Editor text lines, used with getCursor for popup focus. */
+  getLines?(): string[];
+  /** Public pi-tui Editor sizing accessor. */
+  getPaddingX?(): number;
+  /** Text rows hidden above the last rendered native editor box. */
+  getRenderedHiddenLineCount?(): number;
   /** Stored text with paste markers expanded to their actual content. */
   getExpandedText?(): string;
   /** Whether the native completion list is currently visible. */
@@ -244,6 +257,12 @@ export interface FieldEditorInstance extends NativeEditorBaseInstance {
   onFieldSettle?: (value: string | undefined) => void;
   /** Bridge-owned: routes the host-wired native submit path through the field semantics. */
   nativeSubmit(text: string): void;
+  /** Render this field in its popup while the ordinary editor slot is isolated. */
+  renderForPopup?(width: number): string[];
+  /** Isolate ordinary slot rendering without replacing the host's active editor. */
+  isolatePromptRendering?(tui: unknown, theme: unknown, keybindings: unknown): boolean;
+  /** Restore ordinary slot rendering when the popup closes. */
+  restorePromptRendering?(): void;
 }
 
 /**
@@ -284,7 +303,9 @@ type NativeEditorCtor = new (
   theme: unknown,
   keybindings: unknown,
   options?: unknown,
-) => FieldEditorInstance;
+) => FieldEditorInstance & {
+  renderTopBorder(width: number, hiddenLineCount: number): string;
+};
 
 // ---------------------------------------------------------------------------
 // Absolute-path completion for every field (shared decoration)
@@ -410,10 +431,46 @@ function createFieldEditorClass(
   Base: NativeEditorCtor,
   resolveKeyMatcher: () => KeyMatcher | undefined,
   semantics: NativeEditorFieldSemantics,
-): new (tui: unknown, theme: unknown, keybindings: unknown, options?: unknown) => FieldEditorInstance {
+): NativeEditorCtor {
   class FieldEditor extends Base {
     fieldActive = false;
     onFieldSettle?: (value: string | undefined) => void;
+    private renderedHiddenLineCount = 0;
+    private promptRenderingIsolated = false;
+
+    constructor(tui: unknown, theme: unknown, keybindings: unknown, options?: unknown) {
+      super(tui, theme, keybindings, options);
+    }
+
+    render(width: number): string[] {
+      if (this.promptRenderingIsolated) return [];
+      return super.render(width);
+    }
+
+    renderForPopup(width: number): string[] {
+      return super.render(width);
+    }
+
+    isolatePromptRendering(_tui: unknown, _theme: unknown, _keybindings: unknown): boolean {
+      // The host keeps this field as its active editor/action target. The
+      // popup renders the same instance through renderForPopup(); omit only
+      // its ordinary prompt rows so an unfocused fake cursor cannot leak below.
+      this.promptRenderingIsolated = true;
+      return true;
+    }
+
+    restorePromptRendering(): void {
+      this.promptRenderingIsolated = false;
+    }
+
+    renderTopBorder(width: number, hiddenLineCount: number): string {
+      this.renderedHiddenLineCount = hiddenLineCount;
+      return super.renderTopBorder(width, hiddenLineCount);
+    }
+
+    getRenderedHiddenLineCount(): number {
+      return this.renderedHiddenLineCount;
+    }
 
     handleInput(data: string): void {
       if (this.fieldActive) {
@@ -465,17 +522,15 @@ function createFieldEditorClass(
     theme: unknown,
     keybindings: unknown,
     options?: unknown,
-  ) => FieldEditorInstance & { setAutocompleteProvider(provider: unknown): void };
+  ) => FieldEditorInstance & {
+    renderTopBorder(width: number, hiddenLineCount: number): string;
+    setAutocompleteProvider(provider: unknown): void;
+  };
   const fieldClass = class AbsolutePathFieldEditor extends inner {
     setAutocompleteProvider(provider: unknown): void {
       super.setAutocompleteProvider(wrapAbsolutePathProvider(provider));
     }
-  } as unknown as new (
-    tui: unknown,
-    theme: unknown,
-    keybindings: unknown,
-    options?: unknown,
-  ) => FieldEditorInstance;
+  } as unknown as NativeEditorCtor;
   return fieldClass;
 }
 
@@ -530,6 +585,11 @@ export function abortActiveNativeEditorField(): void {
     }
   }
   const captured = session.captured;
+  try {
+    captured.restorePromptRendering?.();
+  } catch {
+    // The host reset still owns the slot if render restoration fails.
+  }
   if (captured && captured.fieldActive) {
     captured.fieldActive = false;
     try {
@@ -551,6 +611,11 @@ export function __resetActiveNativeEditorFieldForTest(): void {
   if (!session) return;
   session.settled = true;
   session.finished = true;
+  try {
+    session.captured.restorePromptRendering?.();
+  } catch {
+    // Test cleanup must not leave the one-field latch held.
+  }
   activeSession = undefined;
 }
 
@@ -730,21 +795,37 @@ function finishSession(session: ActiveFieldSession): void {
   if (session.finished) return;
   session.finished = true;
   if (activeSession === session) activeSession = undefined;
-  if (!session.restoreOnFinish) return;
-  // Normal custom() close already restores the chat draft, but a rejecting
-  // host may not. Never copy a partial field value into the prior chat editor.
-  // Touch the instance only while our factory still owns the slot.
+  if (!session.restoreOnFinish) {
+    try {
+      session.captured.restorePromptRendering?.();
+    } catch {
+      // Restoration remains best-effort; the host owns the slot after abort.
+    }
+    return;
+  }
+  // A non-overlay custom() close may already restore the chat draft. Overlay
+  // close leaves the underlying editor mounted, so restore it here as well.
+  // The popup field remains Pi's active editor for native actions. Restore
+  // the saved chat draft into it before returning ownership to the prior
+  // factory; the popup answer is never copied into the chat draft.
+  const ownedFactory = session.ourFactory;
+  const ownedEditor = session.captured;
   try {
-    if (session.draftCaptured && session.ui.getEditorComponent?.() === session.ourFactory) {
-      session.captured?.setText(session.savedDraft);
+    if (session.draftCaptured && session.ui.getEditorComponent?.() === ownedFactory) {
+      ownedEditor.setText(session.savedDraft);
     }
   } catch {
     // Restoration remains best-effort if the host editor itself has failed.
   }
+  try {
+    session.captured.restorePromptRendering?.();
+  } catch {
+    // The saved draft is already restored (or the host editor failed).
+  }
   tryRestorePrior(
     session.ui.getEditorComponent!,
     session.ui.setEditorComponent!,
-    session.ourFactory,
+    ownedFactory,
     session.priorFactory,
   );
 }
@@ -843,6 +924,13 @@ export interface NativeEditorFieldHandle {
    */
   prepare(prefill?: string): void;
   /**
+   * Isolate the underlying prompt's rendering while keeping `instance` as
+   * Pi's active editor, so native actions such as Ctrl+C, Ctrl+G, and Ctrl+V
+   * continue to target the popup field. Call after `prepare()` from the
+   * public custom-component factory and before accepting input.
+   */
+  isolatePromptForOverlay(tui: unknown, theme: unknown, keybindings: unknown): boolean;
+  /**
    * Ownership-checked restore of the prior editor factory plus best-effort
    * chat-draft restoration. Call exactly once when the surrounding custom
    * slot closes; a no-op after an abort (the host owns the slot) or repeat.
@@ -858,7 +946,7 @@ export type NativeEditorFieldAcquireResult =
  * Acquires the host-wired native editor for embedding in a custom component
  * the caller already owns. Unlike {@link editTextWithNativeEditor} this does
  * not open a slot of its own — the caller's (already-open or about-to-open)
- * non-overlay `ctx.ui.custom` component renders and drives the SAME instance
+ * `ctx.ui.custom` component renders and drives the SAME instance
  * the host wired, so no nested second modal and no second editing engine
  * exist. The caller must:
  *
@@ -868,7 +956,7 @@ export type NativeEditorFieldAcquireResult =
  *   `onFieldSettle`, both bridge-owned fields);
  * - call `handle.finish()` exactly once when its custom slot closes.
  *
- * Acquisition must happen BEFORE the caller's custom slot opens: installing
+ * Acquisition must happen BEFORE the caller's custom UI opens: installing
  * the factory mid-slot would make the host swap the visible component. When
  * the seams or the host module are unavailable the result is `{ kind:
  * "unavailable" }` and the caller keeps its fail-closed behavior (no
@@ -924,6 +1012,15 @@ export async function acquireNativeEditorField(
         // A failing prefill rejects the caller's custom factory, which
         // restores the host editor instead of presenting wrong content.
         instance.setText(prefill);
+      }
+    },
+    isolatePromptForOverlay(tui: unknown, theme: unknown, keybindings: unknown): boolean {
+      if (!prepared || session.finished || session.settled) return false;
+      try {
+        if (session.ui.getEditorComponent?.() !== session.ourFactory) return false;
+        return instance.isolatePromptRendering?.(tui, theme, keybindings) === true;
+      } catch {
+        return false;
       }
     },
     finish(): void {

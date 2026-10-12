@@ -38,6 +38,18 @@ test("invalid scalar and nested web value preserve configured reviewers, workers
   assert.equal(JSON.stringify(input), before);
 });
 
+test("invalid YouShouldKnow fields recover independently with secure default-on values", () => {
+  const { config, warnings } = recoverConfig({
+    youShouldKnow: { enabled: false, completionGuidance: "off" },
+  });
+  assert.deepEqual(config.youShouldKnow, { enabled: false, completionGuidance: true });
+  assert.deepEqual(warnings, ["youShouldKnow.completionGuidance is invalid or unsupported; using its default."]);
+
+  const invalidObject = recoverConfig({ youShouldKnow: "off" });
+  assert.deepEqual(invalidObject.config.youShouldKnow, { enabled: true, completionGuidance: true });
+  assert.deepEqual(invalidObject.warnings, ["youShouldKnow is invalid or unsupported; using its default."]);
+});
+
 test("invalid browser permission fields are dropped individually without granting capabilities", () => {
   const input = { web: { browserPermissions: { yolo: "yes", modelUploads: true, localNetworks: 1 } } };
   const before = JSON.stringify(input);

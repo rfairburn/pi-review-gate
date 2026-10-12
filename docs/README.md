@@ -23,7 +23,7 @@ each other instead of duplicating detail.
 | [Web tools](web-tools.md) | `WebSearch`, `WebFetch`, `BrowserExtract`, page cache, and the standalone web CLI. |
 | [Browser guide](browser.md) | Interactive sessions and tools, semantic observations, browser visibility, ownership and cleanup. |
 | [Browser approvals and permissions](browser-permissions.md) | Human interaction approval and opt-in capability permissions, their distinct lifetimes, limits and failure boundaries. |
-| [User questions](user-questions.md) | The `AskUserQuestion` tool: async/sync modes, the persistent pending panel above the editor and question list (Ctrl+Alt+Up), answer/decline semantics, session isolation, availability limits. |
+| [User questions and notices](user-questions.md) | `AskUserQuestion` async/sync modes and `YouShouldKnow` notices in the shared pending panel/list (Ctrl+Alt+Up), answer/decline and More details/Close semantics, session isolation, availability limits. |
 | [Security model](security-model.md) | Trust boundaries, egress hardening, read-only enforcement, isolation limits, secrets handling. |
 | [Recovery](recovery.md) | Crash recovery for landing manifests, exact-session restart, executor retry and failover. |
 | [Development](development.md) | Build and test commands, test tiers, static checks, package smoke, launcher internals. |
@@ -42,7 +42,7 @@ each other instead of duplicating detail.
   [Settings menu](settings.md) for staged setup.
 - **Research and browse:** [Web tools](web-tools.md), [Browser guide](browser.md),
   then [Browser approvals and permissions](browser-permissions.md) before enabling capabilities.
-- **Ask for user decisions:** [User questions](user-questions.md).
+- **Ask for user decisions or read notices:** [User questions and notices](user-questions.md).
 - **Assess risk:** [Security model](security-model.md).
 - **Extend or verify the codebase:** [Development](development.md).
 

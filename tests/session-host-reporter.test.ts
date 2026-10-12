@@ -1658,7 +1658,7 @@ describe("session-host reporter status frames", () => {
     const key = "review-gate-pending-questions";
     // A panel already present before the reporter registered: no getter can
     // see it, so it must read as unknown, not fabricated false.
-    ui.original.call(ui.ui, key, ["Pending questions · Press Ctrl+Alt+Up"]);
+    ui.original.call(ui.ui, key, ["Pending input · Press Ctrl+Alt+Up"]);
     const { testPi, ctx } = await startSession({ server, ui });
 
     const initial = await server.waitForFrame((f) => f.message.type === "status");
@@ -1670,7 +1670,7 @@ describe("session-host reporter status frames", () => {
     assert.ok((cleared.message.sequence as number) > (initial.message.sequence as number));
 
     // First observed set resolves to true.
-    setWidget(ctx, key, ["Pending questions · Press Ctrl+Alt+Up"]);
+    setWidget(ctx, key, ["Pending input · Press Ctrl+Alt+Up"]);
     const set = await server.waitForFrame((f) => f.message.type === "status" && f.message.pendingInput === true);
     assert.ok((set.message.sequence as number) > (cleared.message.sequence as number));
     await testPi.trigger("session_shutdown", { type: "session_shutdown" });
@@ -1752,7 +1752,7 @@ describe("session-host reporter status frames", () => {
     await server.waitForFrame((f) => f.message.type === "status" && f.message.busy === true);
 
     // Panel set (array) while busy: pending presence updates asynchronously.
-    const returnValue = setWidget(ctx, key, ["Pending questions · Press Ctrl+Alt+Up"], { placement: "aboveEditor" });
+    const returnValue = setWidget(ctx, key, ["Pending input · Press Ctrl+Alt+Up"], { placement: "aboveEditor" });
     assert.equal(returnValue, "widget-result", "wrapper preserves the original return value");
     let status = await server.waitForFrame((f) => f.message.type === "status" && f.message.pendingInput === true);
     assert.equal(status.message.busy, true, "pending updates while runtime busy");
@@ -1772,7 +1772,7 @@ describe("session-host reporter status frames", () => {
     assert.equal(status.message.busy, true);
 
     // Question text never enters a frame.
-    assert.ok(!server.frames.some((f) => f.raw.includes("Pending questions")), "panel line text stays out of frames");
+    assert.ok(!server.frames.some((f) => f.raw.includes("Pending input")), "panel line text stays out of frames");
     await testPi.trigger("session_shutdown", { type: "session_shutdown" });
   });
 
@@ -1809,7 +1809,7 @@ describe("session-host reporter status frames", () => {
     await testPi.trigger("session_shutdown", { type: "session_shutdown" });
   });
 
-  it("does not report a failed native clear as no pending questions", async () => {
+  it("does not report a failed native clear as no pending input", async () => {
     const server = await startTestServer();
     const ui = makeUi();
     const key = "review-gate-pending-questions";

@@ -1,15 +1,16 @@
 /**
  * Native question UI/lifecycle proof (session-host native question phase).
  *
- * Drives ONE real native Pi 1.0.4 TUI session — the REAL review gate
+ * Drives ONE explicitly pinned real native Pi TUI session — the REAL review gate
  * extension, the production session-host reporter/broker/TerminalSurface,
  * in an isolated owned PTY under a synthetic HOME/profile — through the full
  * AskUserQuestion lifecycle:
  *
  *   scripted faux toolCall (public pi.registerProvider + fauxProvider, zero
  *   external AI/API calls) → real pending-question panel and list UI →
- *   answer through the real UI (Ctrl+Alt+Up, Enter, Enter) → normal next
- *   turn whose model context actually contains the delivered answer →
+ *   exact owned multiline `.png` path through the real free-text editor
+ *   (including first post-paste frame, canonical delivery, and draft restore) →
+ *   normal next turn whose model context actually contains the delivered answer →
  *   orderly Ctrl+C-twice host exit with a genuine session_shutdown.
  *
  * No bypass, no fabricated events, no skip: every prerequisite that cannot
@@ -56,6 +57,14 @@ const EVENT_TIMEOUT_MS = 30_000;
 const CHILD_EXIT_TIMEOUT_MS = 15_000;
 const PTY_COLS = 120;
 const PTY_ROWS = 50;
+// Mirror questionPopupOverlayOptions(): full conversation width, one-row
+// vertical margins, and a 100%-height cap resolved against this owned PTY.
+const QUESTION_POPUP_VERTICAL_MARGIN = 1;
+const QUESTION_POPUP_COLUMNS = PTY_COLS;
+const QUESTION_POPUP_MAX_ROWS = Math.max(1, PTY_ROWS - 2 * QUESTION_POPUP_VERTICAL_MARGIN);
+const QUESTION_POPUP_START_COLUMN = 0;
+const QUESTION_POPUP_START_ROW = QUESTION_POPUP_VERTICAL_MARGIN
+  + Math.floor((PTY_ROWS - 2 * QUESTION_POPUP_VERTICAL_MARGIN - QUESTION_POPUP_MAX_ROWS) / 2);
 const MAX_STAGED_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_STAGED_TREE_BYTES = 128 * 1024 * 1024;
 const MAX_STAGED_TREE_FILES = 20_000;
@@ -66,10 +75,15 @@ const QUESTION_TEXT = "Native question probe: which option should the fixture us
 const CHOICE_A = "Alpha option";
 const CHOICE_B = "Beta option";
 const INITIAL_PROMPT = "Please ask me which option to use.";
+const CHAT_DRAFT_FIRST = "unsent chat draft preserved across the question popup";
+const CHAT_DRAFT_SECOND = "second exact draft line";
+const CHAT_DRAFT = `${CHAT_DRAFT_FIRST}\n${CHAT_DRAFT_SECOND}`;
 const ECHO_PREFIX = "Fixture echo of delivered answer: ";
 
 // --- Key sequences (xterm) ---
 const KEY_ENTER = "\r";
+const KEY_DOWN = "\x1b[B";
+const KEY_SHIFT_ENTER = "\x1b[13;2u";
 /** CSI for Ctrl+Alt+Up; pi-tui's matchesKey maps this to `ctrl+alt+up`. */
 const KEY_CTRL_ALT_UP = "\x1b[1;7A";
 const KEY_CTRL_C = "\x03";
@@ -503,6 +517,7 @@ function stageCandidate(root: string, prerequisites: StaticPrerequisites): Stage
     ["skills", "pi-review-gate-orchestrator", "references", "recovery.md"],
     ["skills", "pi-review-gate-execution", "SKILL.md"],
     ["skills", "pi-review-gate-research", "SKILL.md"],
+    ["skills", "pi-review-gate-completion", "SKILL.md"],
   ];
   for (const parts of shippedFiles) {
     copyBoundedRegularFile(join(repositoryRoot(), ...parts), join(packageRoot, ...parts), 2 * 1024 * 1024);
@@ -743,6 +758,115 @@ function frameContains(frame: string, needle: string): boolean {
   return collapse(frame).includes(collapse(needle));
 }
 
+const QUESTION_POPUP_RULE = "─".repeat(QUESTION_POPUP_COLUMNS);
+const QUESTION_POPUP_BLANK_ROW = " ".repeat(QUESTION_POPUP_COLUMNS);
+
+/**
+ * Return only the padded interior between the popup's actual full-width top
+ * and bottom rules, with exactly one side-padding cell removed per side. The
+ * frame is located by geometry: a full-width rule, a blank vertical-padding
+ * row, content rows that each keep a padding cell on both sides, a blank
+ * vertical-padding row, and a matching rule. A padded content row can never
+ * equal the full-width rule, so body rules and box glyphs stay content.
+ * Missing or malformed frames fail closed; maximum-height geometry is never
+ * used as a substitute for the visible popup bounds.
+ */
+function nativeQuestionPopupLines(frame: string): string[] {
+  const terminalLines = frame.split("\n").map((line) =>
+    line.slice(QUESTION_POPUP_START_COLUMN, QUESTION_POPUP_START_COLUMN + QUESTION_POPUP_COLUMNS));
+  for (let top = QUESTION_POPUP_VERTICAL_MARGIN; top < terminalLines.length; top += 1) {
+    if (terminalLines[top] !== QUESTION_POPUP_RULE || terminalLines[top + 1] !== QUESTION_POPUP_BLANK_ROW) continue;
+    const bottom = terminalLines.findIndex((line, index) => index > top && line === QUESTION_POPUP_RULE);
+    if (bottom <= top || bottom - top + 1 > QUESTION_POPUP_MAX_ROWS
+      || bottom >= PTY_ROWS - QUESTION_POPUP_VERTICAL_MARGIN) continue;
+    const contentRows = terminalLines.slice(top + 1, bottom);
+    if (contentRows.length < 3 || contentRows.at(-1) !== QUESTION_POPUP_BLANK_ROW
+      || !contentRows.every((line) => line.startsWith(" ") && line.endsWith(" "))) continue;
+    return contentRows.map((line) => line.slice(1, -1));
+  }
+  return [];
+}
+
+function popupContains(frame: string, needle: string): boolean {
+  return frameContains(nativeQuestionPopupLines(frame).join("\n"), needle);
+}
+
+/** Require the complete Markdown body between the popup's standalone ID and first answer choice. */
+function questionBodyBetweenHeaderAndFirstChoice(frame: string): boolean {
+  const popupLines = nativeQuestionPopupLines(frame);
+  const questionHeader = popupLines.findIndex((line) => line.trim() === "q1:");
+  if (questionHeader < 0) return false;
+  const firstChoice = popupLines.findIndex((line, index) =>
+    index > questionHeader && line.includes(`1. ${CHOICE_A}`));
+  if (firstChoice <= questionHeader) return false;
+  const body = popupLines.slice(questionHeader + 1, firstChoice).join("\n");
+  return frameContains(body, QUESTION_TEXT);
+}
+
+test("question popup matcher excludes transcript text outside the modal geometry", () => {
+  const lines = Array.from({ length: PTY_ROWS }, () => " ".repeat(PTY_COLS));
+  lines[0] = `Question registered as q1: \"${QUESTION_TEXT}\"`.padEnd(PTY_COLS);
+  const popupRow = (text: string): string => ` ${text}`.padEnd(PTY_COLS, " ");
+  const rule = "─".repeat(PTY_COLS);
+  lines[QUESTION_POPUP_START_ROW] = rule;
+  lines[QUESTION_POPUP_START_ROW + 1] = popupRow("");
+  lines[QUESTION_POPUP_START_ROW + 2] = popupRow("q1:");
+  lines[QUESTION_POPUP_START_ROW + 3] = popupRow(`> 1. ${CHOICE_A}`);
+  lines[QUESTION_POPUP_START_ROW + 4] = popupRow("");
+  lines[QUESTION_POPUP_START_ROW + 5] = rule;
+  const frame = lines.join("\n");
+  const popupLines = nativeQuestionPopupLines(frame);
+
+  assert.ok(frameContains(frame, QUESTION_TEXT), "the synthetic underlying tool result contains the complete question text");
+  assert.equal(popupLines.length, 4, "the projection is exactly the padded interior between the two full-width rules");
+  assert.ok(popupLines.every((line) => line.length === PTY_COLS - 2),
+    "each projected question-popup row spans the conversation viewport minus one padding cell per side");
+  assert.ok(popupLines.some((line) => line.trim() === "q1:"), "the bodyless popup has its standalone question ID");
+  assert.ok(popupLines.some((line) => line.includes(`1. ${CHOICE_A}`)), "the bodyless popup has its first choice");
+  assert.equal(
+    questionBodyBetweenHeaderAndFirstChoice(frame),
+    false,
+    "transcript-only question text cannot fill the body between popup anchors",
+  );
+});
+
+test("short question popup matcher rejects answer/body sentinels above and below its actual rules", () => {
+  const lines = Array.from({ length: PTY_ROWS }, () => " ".repeat(PTY_COLS));
+  const top = 20;
+  const insideAnswer = "ANSWER_SENTINEL_INSIDE_POPUP";
+  const aboveAnswer = "UNDERLAY_ANSWER_SENTINEL_ABOVE_RULE";
+  const belowBody = "UNDERLAY_BODY_SENTINEL_BELOW_RULE";
+  const rule = "─".repeat(PTY_COLS);
+  const content = (text: string): string => ` ${text}`.padEnd(PTY_COLS, " ");
+
+  lines[4] = `Transcript row contains ${aboveAnswer}`.padEnd(PTY_COLS);
+  lines[6] = rule; // A transcript-wide rule without popup padding is not the frame.
+  lines[7] = `Transcript after rule ${aboveAnswer}`.padEnd(PTY_COLS);
+  lines[top] = rule;
+  lines[top + 1] = content("");
+  lines[top + 2] = content(`q1: ${QUESTION_TEXT}`);
+  lines[top + 3] = content("─".repeat(PTY_COLS - 2)); // body rule inside the padding
+  lines[top + 4] = content(`│ ${insideAnswer} │`); // body table/code glyphs stay content
+  lines[top + 5] = content("");
+  lines[top + 6] = rule;
+  lines[44] = `Underlying chat contains ${belowBody}`.padEnd(PTY_COLS);
+  const frame = lines.join("\n");
+  const popupLines = nativeQuestionPopupLines(frame);
+
+  assert.ok(QUESTION_POPUP_START_ROW < 4 && 44 < QUESTION_POPUP_START_ROW + QUESTION_POPUP_MAX_ROWS,
+    "both underlay sentinels lie inside the old maximum-height crop");
+  assert.ok(frameContains(frame, aboveAnswer) && frameContains(frame, belowBody),
+    "the sentinels are genuinely present in underlying terminal rows");
+  assert.ok(popupLines.some((line) => line.includes(`│ ${insideAnswer} │`)),
+    "complete content, including body box glyphs, inside the actual ruled popup remains matchable");
+  assert.ok(popupLines.some((line) => line === "─".repeat(PTY_COLS - 2)),
+    "a body horizontal rule inside the padding is content, not the popup frame");
+  assert.equal(popupContains(frame, aboveAnswer), false,
+    "answer-like text above the actual popup rule cannot satisfy a popup assertion");
+  assert.equal(popupContains(frame, belowBody), false,
+    "body-like text below the actual popup rule cannot satisfy a popup assertion");
+});
+
 /** Event-driven directory watch that notifies when the named file changes. */
 function watchOwnedFile(directory: string, fileName: string, signal: ChangeSignal): () => void {
   const watcher = fsWatch(directory, (_event, filename) => {
@@ -919,7 +1043,7 @@ async function disposeQuestionResources(options: {
   if (cleanupError) throw cleanupError;
 }
 
-test("native Pi TUI answers a scripted AskUserQuestion through the real question UI", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+test("native Pi TUI accepts an exact bracketed image-path answer in its first frame and restores the chat draft", { timeout: TEST_TIMEOUT_MS }, async (t) => {
   const prerequisites = staticPrerequisites(t);
   if (!prerequisites) return;
 
@@ -945,6 +1069,22 @@ test("native Pi TUI answers a scripted AskUserQuestion through the real question
   t.after(async () => disposeQuestionResources({ root, owner, profile, registration, broker }));
 
   initializeSyntheticDirectories(root);
+  const imageDirectory = join(root, "clipboard images");
+  mkdirSync(imageDirectory, { recursive: true, mode: 0o700 });
+  const imagePath = join(imageDirectory, `clipboard-${"image-".repeat(4)}owned.png`);
+  writeFileSync(imagePath, Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+    "base64",
+  ), { mode: 0o600 });
+  assert.ok(existsSync(imagePath), "the exact bracketed-paste path is an owned image file in the synthetic root");
+  const pastedAnswer = [
+    imagePath,
+    "OCR: preserve the complete clipboard path on the first frame.",
+    "Long detail: This multiline answer retains the complete tail in the popup.",
+    "tail: no follow-up key",
+  ].join("\n");
+  const expectedDeliveredAnswer = `Answer to pending question "${QUESTION_TEXT}": ${pastedAnswer}`;
+  assert.ok(expectedDeliveredAnswer.length < 400, "the complete answer fits the faux provider's exact request preview");
   assertBrokerSocketPathBudget(root);
   const pi = resolvePiExecutable(prerequisites, root, t);
   if (!pi) return;
@@ -1106,7 +1246,7 @@ test("native Pi TUI answers a scripted AskUserQuestion through the real question
     // The reporter observed the busy window and the pending-question panel.
     const busyStatus = await statuses.waitFor((status) => status.busy === true, EVENT_TIMEOUT_MS, "reporter observed the first run as busy");
     assert.equal(busyStatus.instanceId, id, "the busy status belongs to this registration");
-    const pendingStatus = await statuses.waitFor(
+    await statuses.waitFor(
       (status) => status.pendingInput === true && status.busy === false,
       EVENT_TIMEOUT_MS,
       "reporter observed the real pending-question panel widget after the first run settled",
@@ -1115,46 +1255,88 @@ test("native Pi TUI answers a scripted AskUserQuestion through the real question
     // The collapsed panel line is visible in the real native frame.
     // The panel renders during the first run, so scope this wait from before
     // the prompt was submitted: an idle TUI emits no new frames after it.
-    const panelLine = process.platform === "darwin" ? "Pending questions · Press Ctrl+Option+Up" : "Pending questions · Press Ctrl+Alt+Up";
+    const panelLine = process.platform === "darwin" ? "Pending input · Press Ctrl+Option+Up" : "Pending input · Press Ctrl+Alt+Up";
     await liveOwner.frames.waitFor((frame) => frameContains(frame, panelLine), EVENT_TIMEOUT_MS, "real pending-question panel line in the native frame", beforePrompt);
+
+    // Preserve a multiline unsent chat draft through the pending-input overlay.
+    const beforeDraft = liveOwner.frames.revision;
+    liveOwner.pty!.write(`${CHAT_DRAFT_FIRST}${KEY_SHIFT_ENTER}${CHAT_DRAFT_SECOND}`);
+    await liveOwner.frames.waitFor(
+      (frame) => frameContains(frame, CHAT_DRAFT),
+      EVENT_TIMEOUT_MS,
+      "the exact multiline unsent chat draft is visible before opening the popup",
+      beforeDraft,
+    );
 
     // --- Open the real pending-question list (Ctrl+Alt+Up) ---
     const beforeList = liveOwner.frames.revision;
     liveOwner.pty!.write(KEY_CTRL_ALT_UP);
     await liveOwner.frames.waitFor(
-      (frame) => frameContains(frame, "Pending questions (1)")
-        && frameContains(frame, `q1: ${QUESTION_TEXT}`)
-        && frameContains(frame, "arrows select · Enter answer · Esc defer and close"),
+      (frame) => popupContains(frame, "Pending input (1)")
+        && popupContains(frame, `q1: ${QUESTION_TEXT}`)
+        && popupContains(frame, "arrows select · Enter answer · Shift+Alt+Up/Down or Ctrl+Alt+PageUp/PageDown scroll · Esc defer and close"),
       EVENT_TIMEOUT_MS,
       "real pending-question list opens with the scripted question",
       beforeList,
     );
+    assert.equal(popupContains(liveOwner.frames.text, INITIAL_PROMPT), false,
+      "the full-width popup rows replace conversation text that would otherwise remain in side margins");
 
     // --- Enter answer mode (Enter on the selected question) ---
     const beforeAnswer = liveOwner.frames.revision;
     liveOwner.pty!.write(KEY_ENTER);
     await liveOwner.frames.waitFor(
-      (frame) => frameContains(frame, `q1: ${QUESTION_TEXT}`)
+      (frame) => questionBodyBetweenHeaderAndFirstChoice(frame)
+        && frameContains(frame, "q1:")
+        && frameContains(frame, QUESTION_TEXT)
         && frameContains(frame, `1. ${CHOICE_A}`)
         && frameContains(frame, `2. ${CHOICE_B}`)
         && frameContains(frame, "Type something…")
-        && frameContains(frame, "Decline (no answer will be sent)")
-        && frameContains(frame, "arrows select · Enter confirm · Esc back"),
+        && popupContains(frame, "Decline (no answer will be sent)")
+        && popupContains(frame, "arrows select · Enter confirm · Shift+Alt+Up/Down or Ctrl+Alt+PageUp/PageDown scroll · Esc back"),
       EVENT_TIMEOUT_MS,
       "real answer mode shows the scripted choices plus free text and decline",
       beforeAnswer,
     );
 
-    // --- Submit the first choice (Enter) ---
+    // --- Enter free text, then verify one exact bracketed paste in the first changed frame ---
+    const beforeEdit = liveOwner.frames.revision;
+    liveOwner.pty!.write(KEY_DOWN + KEY_DOWN + KEY_ENTER);
+    await liveOwner.frames.waitFor(
+      (frame) => popupContains(frame, "Enter submit · Esc back to options"),
+      EVENT_TIMEOUT_MS,
+      "the real native editor owns the free-text answer row before paste",
+      beforeEdit,
+    );
+    const beforePasteRevision = liveOwner.frames.revision;
+    const beforePasteText = liveOwner.frames.text;
+    liveOwner.pty!.write(`\x1b[200~${pastedAnswer}\x1b[201~`);
+    await liveOwner.frames.signal.waitFor(
+      () => liveOwner.frames.revision > beforePasteRevision && liveOwner.frames.text !== beforePasteText,
+      EVENT_TIMEOUT_MS,
+      "the first changed native terminal frame after bracketed image-path paste",
+    );
+    const firstPasteFrame = liveOwner.frames.text;
+    assert.ok(popupContains(firstPasteFrame, pastedAnswer),
+      `the complete multiline paste, including the .png suffix, appears in the first changed frame without another keypress: ${nativeQuestionPopupLines(firstPasteFrame).join("\n")}`);
+    assert.ok(popupContains(firstPasteFrame, imagePath) && popupContains(firstPasteFrame, ".png"),
+      "the exact owned image path and final .png are visible before submission");
+
     const beforeSubmit = liveOwner.frames.revision;
     // The reporter also observes the session_start panel clear, so the
     // post-answer clearance must be proven strictly after this history point.
     const statusIndexBeforeAnswer = statuses.entries.length - 1;
-    // The panel is visible while the answer UI is open (widget above the editor).
-    assert.ok(
-      frameContains(liveOwner.frames.text, panelLine),
-      "the pending-question panel is visible in the real frame while the answer UI is open",
-    );
+    // The shared native modal may occlude the underlying panel. Check the
+    // latest authenticated reporter snapshot instead of requiring old inline
+    // widget placement to remain visible over it; unchanged snapshots are
+    // intentionally deduplicated, so no fresh event is required.
+    const modalStatus = statuses.entries.at(-1);
+    assert.ok(modalStatus, "the owning reporter has an authenticated status at the modal-open checkpoint");
+    assert.equal(modalStatus.type, "status");
+    assert.equal(modalStatus.pendingInput, true, "the latest status retains pending input while the answer modal is open");
+    assert.equal(modalStatus.busy, false, "the latest status retains the actually idle owner while the answer modal is open");
+    assert.equal(modalStatus.instanceId, id, "the latest pending status belongs to this native session");
+    assert.equal(modalStatus.generation, broker.generation, "the latest pending status carries the live broker generation");
     liveOwner.pty!.write(KEY_ENTER);
 
     // The delivered answer arrives as an ordinary user message and starts a
@@ -1200,12 +1382,14 @@ test("native Pi TUI answers a scripted AskUserQuestion through the real question
 
     // The transcript shows the delivered answer and the faux echo of it.
     await liveOwner.frames.waitFor(
-      (frame) => frameContains(frame, `Answer to pending question "${QUESTION_TEXT}": ${CHOICE_A}`)
-        && frameContains(frame, `${ECHO_PREFIX}Answer to pending question "${QUESTION_TEXT}": ${CHOICE_A}`),
+      (frame) => frameContains(frame, expectedDeliveredAnswer)
+        && frameContains(frame, `${ECHO_PREFIX}${expectedDeliveredAnswer}`),
       EVENT_TIMEOUT_MS,
       "delivered answer and its echo are visible in the real native transcript",
       beforeSubmit,
     );
+    assert.ok(frameContains(liveOwner.frames.text, CHAT_DRAFT),
+      "the exact suspended multiline chat draft is restored after the popup submits");
 
     // Require the answer turn's settled status to carry observed clearance,
     // strictly after its busy status. Neither startup history, UI text, nor
@@ -1239,10 +1423,8 @@ test("native Pi TUI answers a scripted AskUserQuestion through the real question
     assert.equal(requests.length, 3, "exactly three scripted faux model requests (no external AI/API calls)");
     const answerRequest = requests[2] as Record<string, unknown> | undefined;
     assert.ok(answerRequest, "the third request exists for the delivered answer");
-    assert.ok(
-      String(answerRequest.lastUserPreview).includes(`Answer to pending question "${QUESTION_TEXT}": ${CHOICE_A}`),
-      "the UI-delivered answer reached the model context as an ordinary user message",
-    );
+    assert.equal(answerRequest.lastUserPreview, expectedDeliveredAnswer,
+      "the exact canonical multiline answer reached the model context as an ordinary user message");
 
     // Every status carried this owner's identity and generation.
     assert.ok(statuses.entries.length > 0, "the real reporter delivered at least one authenticated status");

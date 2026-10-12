@@ -38,8 +38,8 @@ interface FakePiInstall {
 /**
  * Fake pi-tui module source. The full variant exposes the width helpers, raw
  * key matching, and a getKeybindings that returns a recording manager; the
- * width-only variant exposes just the width helpers (the loader must still
- * resolve it).
+ * width-only variant exposes only width helpers and ScrollView (the loader
+ * must still resolve it without the key surface).
  */
 function fakeTuiModuleSource(variant: Variant): string {
   const extras =
@@ -55,6 +55,8 @@ function fakeTuiModuleSource(variant: Variant): string {
     "export function visibleWidth(text) { return text.length; }",
     "export function truncateToWidth(text, width, ellipsis) { return text.length > width ? text.slice(0, Math.max(0, width - (ellipsis?.length ?? 0))) + (ellipsis ?? '') : text; }",
     "export function wrapTextWithAnsi(text, width) { return [text]; }",
+    "export class Markdown { constructor(markdown, paddingX, paddingY, theme) { this.markdown = markdown; globalThis.__fakeQuestionMarkdown = { markdown, paddingX, paddingY, theme }; } render(width) { return [this.markdown, String(width)]; } invalidate() {} }",
+    "export class ScrollView { constructor(child, options) { this.child = child; this.options = options; this.viewportHeight = 0; } render(width) { return this.child.render(width); } invalidate() { this.child.invalidate(); } scrollBy(lines) { return lines; } scrollToStart() {} }",
     ...extras,
   ].join("\n");
 }
@@ -64,7 +66,7 @@ async function makeFakePiInstall(variant: Variant): Promise<FakePiInstall> {
   const root = join(base, "@earendil-works", "pi-coding-agent");
   const tuiDir = join(root, "node_modules", "@earendil-works", "pi-tui");
   await mkdir(join(root, "dist", "bundle"), { recursive: true });
-  await mkdir(join(tuiDir, "dist"), { recursive: true });
+  await mkdir(join(tuiDir, "dist", "components"), { recursive: true });
   await writeFile(
     join(root, "package.json"),
     JSON.stringify({
@@ -75,13 +77,17 @@ async function makeFakePiInstall(variant: Variant): Promise<FakePiInstall> {
       exports: { ".": { import: "./dist/index.js" } },
     }),
   );
-  await writeFile(join(root, "dist", "index.js"), "// fake agent entry\n");
+  await writeFile(join(root, "dist", "index.js"), "export function getMarkdownTheme() { return { marker: 'application-markdown-theme' }; }\n");
   await writeFile(join(root, "dist", "bundle", "cli.js"), "// fake pi entry\n");
   await writeFile(
     join(tuiDir, "package.json"),
     JSON.stringify({ name: "@earendil-works/pi-tui", version: "0.0.0-fake", type: "module", main: "dist/index.js" }),
   );
   await writeFile(join(tuiDir, "dist", "index.js"), fakeTuiModuleSource(variant));
+  await writeFile(
+    join(tuiDir, "dist", "components", "editor.js"),
+    "export function wordWrapLine(text, width) { if (!text || width <= 0) return [{ text: '', startIndex: 0, endIndex: 0 }]; return Array.from({ length: Math.ceil(text.length / width) }, (_, index) => { const startIndex = index * width; const endIndex = Math.min(text.length, startIndex + width); return { text: text.slice(startIndex, endIndex), startIndex, endIndex }; }); }\n",
+  );
   return { base, entry: join(root, "dist", "bundle", "cli.js") };
 }
 
@@ -91,7 +97,7 @@ function clearSeams(): void {
 }
 
 function clearFakeGlobals(): void {
-  for (const key of ["__fakeUserQuestionTuiEvals", "__fakeQuestionTuiMatchesCalls"]) {
+  for (const key of ["__fakeUserQuestionTuiEvals", "__fakeQuestionTuiMatchesCalls", "__fakeQuestionMarkdown"]) {
     delete (globalThis as Record<string, unknown>)[key];
   }
 }
@@ -114,6 +120,11 @@ test("production load path: exposes the width helpers, key matching, and the liv
   assert.equal(typeof host?.truncateToWidth, "function");
   assert.equal(host!.truncateToWidth!("abcdef", 3, "…"), "ab…");
   assert.deepEqual(host!.wrapTextWithAnsi!("one two", 80), ["one two"]);
+  assert.equal(typeof host?.wrapEditorLine, "function", "the public Editor wrapper preserves source offsets");
+  assert.deepEqual(host!.wrapEditorLine!("abcdef", 3), [
+    { text: "abc", startIndex: 0, endIndex: 3 },
+    { text: "def", startIndex: 3, endIndex: 6 },
+  ]);
   assert.equal(typeof host?.matchesKey, "function");
   assert.equal(host!.matchesKey!("\r", "enter"), true);
   assert.equal(host!.matchesKey!("\x1b", "enter"), false);
@@ -124,6 +135,21 @@ test("production load path: exposes the width helpers, key matching, and the liv
   assert.equal(typeof manager?.matches, "function");
   manager!.matches!("\r", "tui.input.submit");
   assert.equal(fakeGlobal("__fakeQuestionTuiMatchesCalls"), 1, "the exposed manager is the module's own");
+
+  const markdown = host!.createMarkdown!("# Full Markdown\n\nComplete body");
+  assert.ok(markdown, "the native pi-tui Markdown component is exposed");
+  assert.deepEqual(markdown!.render(73), ["# Full Markdown\n\nComplete body", "73"]);
+  assert.deepEqual(fakeGlobal("__fakeQuestionMarkdown"), {
+    markdown: "# Full Markdown\n\nComplete body",
+    paddingX: 0,
+    paddingY: 0,
+    theme: { marker: "application-markdown-theme" },
+  }, "Markdown receives the application's getMarkdownTheme result");
+  assert.equal(typeof host?.createScrollView, "function", "the native ScrollView provider remains exposed to layout-owned components");
+  const scrollView = host!.createScrollView!({ render: () => ["one", "two"], invalidate() {} });
+  assert.equal(scrollView?.viewportHeight, 0, "without host layout the native ScrollView has no measured viewport");
+  assert.deepEqual(scrollView?.render(80), ["one", "two"], "an unlaid-out ScrollView leaves row sizing to the shared component fallback");
+  assert.equal(scrollView?.scrollBy(4), 4, "native scrolling cannot advance before layout assigns a viewport");
 
   // The loader no longer exposes a standalone editor surface for the
   // free-text row (that path now goes through the shared bridge).

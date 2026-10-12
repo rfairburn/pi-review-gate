@@ -516,6 +516,14 @@ export interface ReviewGateUiConfig {
   subtasksViewExpanded?: boolean;
 }
 
+/** Independent user-notice availability and optional completion guidance (#295). */
+export interface YouShouldKnowConfig {
+  /** Whether new YouShouldKnow notices are available through authorized tool discovery. Defaults on. */
+  enabled: boolean;
+  /** Whether the model receives the additional completion-handoff guidance. Defaults on. */
+  completionGuidance: boolean;
+}
+
 export interface ReviewGateConfig {
   enabled: boolean;
   /** Top-level operating posture; hot-replaces the mode prompt on the next run. */
@@ -538,6 +546,8 @@ export interface ReviewGateConfig {
   /** Independently scheduled task entries (issue #26); the only canonical copy. */
   scheduledTasks?: ScheduledTaskCatalog;
   ui?: ReviewGateUiConfig;
+  /** YouShouldKnow availability and completion-handoff prompt controls (#295). */
+  youShouldKnow?: YouShouldKnowConfig;
   web?: WebConfig;
 }
 
@@ -562,6 +572,7 @@ export const DEFAULT_CONFIG: ReviewGateConfig = {
   maxSnapshotBytes: 52_428_800,
   waveArtifactTtlMs: 30 * 24 * 60 * 60 * 1000,
   retainBundles: "on-failure",
+  youShouldKnow: { enabled: true, completionGuidance: true },
   web: {
     enabled: true,
     browserInteractionApproval: "ask",
@@ -638,7 +649,7 @@ export function recoverConfig(value: unknown): Pick<LoadedConfig, "config" | "wa
   // Only these objects contain independently defaultable settings. Selections,
   // agent definitions and route/resource entries remain atomic: never invent
   // a model, reasoning pair, command or authorization reference to repair one.
-  const containers = new Set(["web", "web.search", "web.fetch", "web.browserPermissions", "ui", "review",
+  const containers = new Set(["web", "web.search", "web.fetch", "web.browserPermissions", "ui", "review", "youShouldKnow",
     "execution", "execution.retryPolicy", "execution.routes",
     "execution.workerResources", "externalAgents", "scheduledTasks"]);
   const recover = (parent: Record<string, unknown>, key: string, input: unknown, path: string): void => {
@@ -748,6 +759,7 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
     execution: value.execution === undefined ? undefined : normalizeExecution(value.execution),
     scheduledTasks: value.scheduledTasks === undefined ? undefined : normalizeScheduledTasks(value.scheduledTasks),
     ui: value.ui === undefined ? undefined : normalizeUi(value.ui),
+    youShouldKnow: normalizeYouShouldKnow(value.youShouldKnow),
     web: normalizeWeb(value.web),
   };
 
@@ -1017,6 +1029,22 @@ function normalizeUi(value: unknown): ReviewGateUiConfig {
     ...(value.subtasksViewExpanded !== undefined
       ? { subtasksViewExpanded: value.subtasksViewExpanded }
       : {}),
+  };
+}
+
+function normalizeYouShouldKnow(value: unknown): YouShouldKnowConfig {
+  const defaults = DEFAULT_CONFIG.youShouldKnow!;
+  if (value === undefined) return { ...defaults };
+  if (!isRecord(value)) throw new Error("youShouldKnow must be an object");
+  if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
+    throw new Error("youShouldKnow.enabled must be a boolean");
+  }
+  if (value.completionGuidance !== undefined && typeof value.completionGuidance !== "boolean") {
+    throw new Error("youShouldKnow.completionGuidance must be a boolean");
+  }
+  return {
+    enabled: value.enabled ?? defaults.enabled,
+    completionGuidance: value.completionGuidance ?? defaults.completionGuidance,
   };
 }
 

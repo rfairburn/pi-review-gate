@@ -3,27 +3,27 @@
  *
  * Wires the three approved surfaces together:
  *
- * - The AskUserQuestion tool, registered before session_start so it enters
+ * - The AskUserQuestion and YouShouldKnow tools, registered before session_start so they enter
  *   the deferred-tool authorization boundary like every other top-level tool
  *   (active by default under Pi's registered-tool policy, discoverable through
  *   tool_search, reasserted by the deferred manager).
  * - A persistent collapsed panel above the chat editor (a widget): it shows
- *   only "Pending questions · Press <chord>" — never question text — while
- *   questions are pending, stays visible through chat output without taking
- *   focus, and is removed when no questions remain.
+ *   only "Pending input · Press <chord>" — never question or notice content —
+ *   while any input is pending, stays visible through chat output without
+ *   taking focus, and is removed when no inputs remain.
  * - The pending-question list UI behind the approved shortcut
  *   (Ctrl+Alt+Up; Ctrl+Option+Up on macOS), registered only when the chord is
  *   not already used by a built-in Pi binding. When registration is
  *   impossible (no shortcut API, occupied chord, non-TUI host) the surface is
- *   unavailable and AskUserQuestion fails closed with an explicit result —
- *   questions are never silently dropped or answered for the user.
+ *   unavailable and both tools fail closed with an explicit result — pending
+ *   input is never silently dropped or answered for the user.
  *
  * The free-text answer row embeds the SAME host-wired native editor instance
  * the /review-settings text fields use, acquired through the shared bridge
- * (src/native-editor-bridge.ts) BEFORE the list's `ctx.ui.custom` slot opens
- * — no nested second modal, no second editing engine. When the host's native
- * seams are unavailable the row renders an unavailable line: the question
- * stays pending and the choices/Decline still work.
+ * (src/native-editor-bridge.ts) BEFORE the shared `ctx.ui.custom` overlay
+ * opens — no nested second modal, no second editing engine. When the host's
+ * native seams are unavailable, the row renders an unavailable line; the
+ * question stays pending and the choices/Decline still work.
  *
  * Session isolation: the controller is bound to the session identity
  * (SessionManager object) at session_start; every registration, presentation,
@@ -41,7 +41,7 @@ import {
   type NativeEditorFieldSemantics,
 } from "../native-editor-bridge";
 import { registerHook, sendNotice } from "../pi";
-import { UserQuestionController, type QuestionSubmitSource } from "./controller";
+import { UserQuestionController, type PendingNotice, type QuestionSubmitSource } from "./controller";
 import {
   createQuestionListComponent,
   QUESTION_LIST_SHORTCUT_KEY,
@@ -51,6 +51,7 @@ import {
   loadQuestionTuiHost,
 } from "./pi-tui-host";
 import { createUserQuestionTool } from "./tool";
+import { createYouShouldKnowTool } from "./notice-tool";
 
 /** Widget key for the persistent collapsed pending-question panel (above the editor). */
 export const USER_QUESTION_PANEL_KEY = "review-gate-pending-questions";
@@ -60,14 +61,20 @@ export const USER_QUESTION_PANEL_KEY = "review-gate-pending-questions";
  * platform chord. Question text must never appear while collapsed.
  */
 export function pendingQuestionPanelLine(): string {
-  return `Pending questions · Press ${questionShortcutLabel()}`;
+  return `Pending input · Press ${questionShortcutLabel()}`;
 }
 
-const QUESTION_LIST_DESCRIPTION = "Open the pending-question list (answer, defer, or decline model questions)";
+const QUESTION_LIST_DESCRIPTION = "Open the pending input list (answer questions, request notice details, or close notices)";
+const QUESTION_POPUP_VERTICAL_MARGIN = 1;
 
 /** Platform label for the approved chord; Alt is Option on macOS. */
 export function questionShortcutLabel(): string {
   return process.platform === "darwin" ? "Ctrl+Option+Up" : "Ctrl+Alt+Up";
+}
+
+export interface UserQuestionRegistrationOptions {
+  /** Safe, dynamic gate for admitting new notices; defaults enabled. */
+  isNoticeFeatureEnabled?: () => boolean;
 }
 
 export interface UserQuestionSurface {
@@ -116,7 +123,10 @@ export function contextIsInteractiveTui(ctx: unknown): boolean {
  * Register the pending-question surfaces. Returns undefined on hosts without
  * the tool-registration API (the executor runtime never calls this).
  */
-export function registerUserQuestions(pi: unknown): UserQuestionSurface | undefined {
+export function registerUserQuestions(
+  pi: unknown,
+  options: UserQuestionRegistrationOptions = {},
+): UserQuestionSurface | undefined {
   if (!isRecord(pi) || typeof pi.registerTool !== "function") return undefined;
 
   let shortcutRegistered = false;
@@ -128,6 +138,7 @@ export function registerUserQuestions(pi: unknown): UserQuestionSurface | undefi
   const controller = new UserQuestionController({
     pi,
     uiAvailable: () => shortcutRegistered && interactiveUi,
+    isNoticeFeatureEnabled: options.isNoticeFeatureEnabled,
     onStateChange: () => refreshPanel(),
   });
 
@@ -218,15 +229,16 @@ export function registerUserQuestions(pi: unknown): UserQuestionSurface | undefi
   });
 
   pi.registerTool(createUserQuestionTool(controller, { shortcutLabel: questionShortcutLabel() }));
+  pi.registerTool(createYouShouldKnowTool(controller));
 
   if (typeof pi.registerShortcut === "function") {
     const occupancy = findOccupiedHostBindings(QUESTION_LIST_SHORTCUT_KEY);
     if (occupancy.resolved && occupancy.bindings.length > 0) {
       // Never steal a known host binding: name the collision and leave the
-      // surface unavailable; AskUserQuestion then fails closed per question.
+      // surface unavailable; both tools then fail closed for pending input.
       void sendNotice(
         pi,
-        `review gate: pending-question shortcut '${questionShortcutLabel()}' is also used by built-in Pi binding(s) (${occupancy.bindings.join(", ")}); the question list cannot be opened and AskUserQuestion reports questions as unavailable`,
+        `review gate: pending-question shortcut '${questionShortcutLabel()}' is also used by built-in Pi binding(s) (${occupancy.bindings.join(", ")}); the pending list cannot be opened and its tools report input as unavailable`,
       );
     } else {
       pi.registerShortcut(QUESTION_LIST_SHORTCUT_KEY, {
@@ -285,7 +297,7 @@ async function openQuestionList(
   const openedAt = bindingGenerationNow();
   const stale = (): boolean => bindingGenerationNow() !== openedAt;
   if (controller.listPending().length === 0) {
-    await sendNotice(pi, "review gate: no pending questions");
+    await sendNotice(pi, "review gate: no pending input");
     return;
   }
   // Resolve the per-press ui guarded: a stale context's getter may throw,
@@ -306,19 +318,20 @@ async function openQuestionList(
   if (!isRecord(ui) || typeof custom !== "function") {
     await sendNotice(
       pi,
-      `review gate: the pending-question list UI is not available in this host; questions stay pending (${controller.listPending().length} pending)`,
+      `review gate: the pending input list UI is not available in this host; inputs stay pending (${controller.listPending().length} pending)`,
     );
     return;
   }
-  // Load the host pi-tui helpers (width-safe text + raw key matching). A
-  // failure degrades rendering/input matching but never blocks the list.
+  // Load host pi-tui helpers (width-safe text, native Markdown,
+  // and raw key matching). A failure degrades rendering/input matching but
+  // never blocks the pending list.
   const tuiHost = await loadQuestionTuiHost().catch(() => undefined);
   // A session rebind during the load retargets this press: the same
   // SessionManager object may be reused across /new/resume, so the identity
   // check alone cannot see it. Never open a stale context's UI.
   if (stale()) return;
-  // Acquire the host-wired native editor BEFORE the custom slot opens:
-  // installing the factory mid-slot would make the host swap the visible
+  // Acquire the host-wired native editor BEFORE the custom overlay opens:
+  // installing the factory mid-interaction would replace the visible editor
   // component. Unavailable seams keep the list open with an unavailable
   // free-text row (choices/Decline still work) — no non-parity fallback.
   // The acquisition sees a generation-guarded view of the per-press ui: if
@@ -377,26 +390,38 @@ async function openQuestionList(
   }
   const handle: NativeEditorFieldHandle | undefined =
     acquired.kind === "acquired" ? acquired.handle : undefined;
+  let customResult: unknown;
   try {
     // The captured method keeps its original ui receiver: receiver-dependent
-    // SDK methods and foreign forwarding wrappers rely on it.
-    await custom.call(ui, (_tui: unknown, theme: unknown, keybindings: unknown, done: (result?: unknown) => void) => {
+    // SDK methods and foreign forwarding wrappers rely on it. The shared
+    // question/notice surface is a public custom overlay. Its explicit
+    // maxHeight and margin are also the manual viewport's exact geometry;
+    // the public ScrollView layout node is not propagated through this
+    // overlay, so the component owns scrolling within that measured budget.
+    customResult = await custom.call(ui, (tui: unknown, theme: unknown, keybindings: unknown, done: (result?: unknown) => void) => {
+      const requestRender = requestRenderOf(tui);
       // The host captured its saved text before this factory ran; record it
       // and start the field empty so the displaced chat draft can never show
       // or submit as an answer.
       handle?.prepare("");
+      const nativeField = handle?.isolatePromptForOverlay(tui, theme, keybindings) ? handle.instance : undefined;
       const component = createQuestionListComponent({
         controller,
         keybindings: resolveLiveKeybindings(keybindings, tuiHost),
         theme: toUiTheme(theme),
         tuiHost,
         shortcutLabel: questionShortcutLabel(),
-        nativeField: handle?.instance,
+        nativeField,
         isStale: stale,
-        onDone: () => done(undefined),
+        requestRender,
+        getViewportRows: () => questionPopupViewportRows(tui),
+        onDone: (result) => done(result),
       });
       component.setSourceProbe(sourceProbeOf(ctx));
       return component;
+    }, {
+      overlay: true,
+      overlayOptions: questionPopupOverlayOptions(),
     });
   } catch {
     // The host surfaced the failure itself (error banner); the questions
@@ -406,15 +431,90 @@ async function openQuestionList(
     // session-reset abort (the host owns the slot from that point on).
     handle?.finish();
   }
+  const noticeDetails = noticeDetailsResult(customResult);
+  if (noticeDetails && !stale()) {
+    // `ui.custom()` has resolved and restored the normal editor before the
+    // ordinary owner-session message is delivered. The controller consumes
+    // only the exact notice snapshot selected by this UI before starting the
+    // send; a delivery failure does not restore it.
+    await controller.requestNoticeDetails(
+      noticeDetails.noticeId,
+      sourceProbeOf(ctx),
+      noticeDetails.expectedNotice,
+    );
+  }
+}
+
+function requestRenderOf(tui: unknown): (() => void) | undefined {
+  if (!isRecord(tui)) return undefined;
+  try {
+    const requestRender = tui.requestRender;
+    return typeof requestRender === "function"
+      ? () => requestRender.call(tui)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Public overlay options fill the active conversation viewport horizontally
+ * while preserving one row of vertical margin. pi-tui resolves the percentage
+ * width and maxHeight against current dimensions on every layout pass; the
+ * component reads the matching live row budget and emits full-width opaque
+ * rows. A parent Main sidebar is outside this child conversation viewport.
+ */
+function questionPopupOverlayOptions(): {
+  width: "100%";
+  anchor: "center";
+  margin: { top: number; right: 0; bottom: number; left: 0 };
+  maxHeight: "100%";
+} {
+  return {
+    width: "100%",
+    anchor: "center",
+    margin: {
+      top: QUESTION_POPUP_VERTICAL_MARGIN,
+      right: 0,
+      bottom: QUESTION_POPUP_VERTICAL_MARGIN,
+      left: 0,
+    },
+    maxHeight: "100%",
+  };
+}
+
+/** Exact row budget after the public overlay resolver applies its margins. */
+function questionPopupViewportRows(tui: unknown): number {
+  let rows: unknown;
+  try {
+    const terminal = isRecord(tui) ? tui.terminal : undefined;
+    rows = isRecord(terminal) ? terminal.rows : undefined;
+  } catch {
+    rows = undefined;
+  }
+  const maxHeight = typeof rows === "number" && Number.isFinite(rows)
+    ? Math.max(1, Math.floor(rows) - QUESTION_POPUP_VERTICAL_MARGIN * 2)
+    : 1;
+  return maxHeight;
+}
+
+function noticeDetailsResult(value: unknown): { noticeId: string; expectedNotice: PendingNotice } | undefined {
+  if (!isRecord(value) || value.kind !== "notice-details"
+    || typeof value.noticeId !== "string" || value.noticeId.length === 0
+    || !isRecord(value.expectedNotice) || value.expectedNotice.kind !== "notice"
+    || value.expectedNotice.id !== value.noticeId) return undefined;
+  return { noticeId: value.noticeId, expectedNotice: value.expectedNotice as unknown as PendingNotice };
 }
 
 function toUiTheme(theme: unknown): QuestionUiTheme {
   if (isRecord(theme) && typeof theme.fg === "function" && typeof theme.bold === "function") {
     const fg = theme.fg.bind(theme);
     const bold = theme.bold.bind(theme);
+    const bg = typeof theme.bg === "function" ? theme.bg.bind(theme) : undefined;
     return {
       fg: (color, text) => String(fg(color, text)),
       bold: (text) => String(bold(text)),
+      ...(bg ? { bg: (color: string, text: string) => String(bg(color, text)) } : {}),
     };
   }
   // Degraded (non-Pi hosts, tests): plain text, no styling.

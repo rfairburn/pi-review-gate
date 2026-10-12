@@ -47,6 +47,7 @@ import {
   KEYS,
   MainPtyDriver,
   OBSERVER_FIXTURE,
+  OUTER_COLS,
   TEST_TIMEOUT_MS,
   type OwnedSession,
   type RuntimePin,
@@ -100,6 +101,50 @@ function nativePaneText(frame: string): string {
 function frameContains(frame: string, needle: string): boolean {
   const collapse = (text: string): string => text.replace(/\s+/g, "");
   return collapse(nativePaneText(frame)).includes(collapse(needle));
+}
+
+/**
+ * Locate the shared popup by its exact geometry: a full-pane-width top rule,
+ * a blank vertical-padding row, content rows with one padding cell on both
+ * sides, a blank vertical-padding row, and a matching bottom rule. A padded
+ * content row can never equal the full-width rule, so body rules or box
+ * glyphs are never taken for the frame; unpadded transcript rules are skipped.
+ */
+function nativePopupRows(frame: string): string[] | undefined {
+  const paneWidth = OUTER_COLS - 33;
+  const rule = "─".repeat(paneWidth);
+  const blank = " ".repeat(paneWidth);
+  const rows = nativePaneText(frame).split("\n").map((line) => line.slice(0, paneWidth));
+  for (let top = 0; top < rows.length; top += 1) {
+    if (rows[top] !== rule || rows[top + 1] !== blank) continue;
+    const bottom = rows.findIndex((line, index) => index > top && line === rule);
+    if (bottom < 0) continue;
+    const contentRows = rows.slice(top + 1, bottom);
+    if (contentRows.length < 3 || contentRows.at(-1) !== blank
+      || !contentRows.every((line) => line.startsWith(" ") && line.endsWith(" "))) continue;
+    return rows.slice(top, bottom + 1);
+  }
+  return undefined;
+}
+
+function popupContains(frame: string, needle: string): boolean {
+  const popup = nativePopupRows(frame);
+  if (!popup) return false;
+  const content = popup.slice(1, -1).map((line) => line.slice(1, -1)).join("\n");
+  const collapse = (text: string): string => text.replace(/\s+/g, "");
+  return collapse(content).includes(collapse(needle));
+}
+
+function assertPopupSpansConversationPane(frame: string, view: string): void {
+  const paneWidth = OUTER_COLS - 33;
+  const popup = nativePopupRows(frame);
+  assert.ok(popup, `${view} has a ruled, padded popup in the native conversation pane`);
+  assert.equal(popup[0], "─".repeat(paneWidth), `${view} top rule reaches both conversation-pane margins`);
+  assert.equal(popup.at(-1), "─".repeat(paneWidth), `${view} bottom rule reaches both conversation-pane margins`);
+  assert.ok(popup.slice(1, -1).every((line) => line.startsWith(" ") && line.endsWith(" ")),
+    `${view} content rows reach both pane margins with one padding cell per side and no side border`);
+  assert.ok(popup.every((line) => !line.includes(INITIAL_PROMPT)),
+    `${view} rows do not interleave the underlying prompt with popup text`);
 }
 
 function assertSidebarHasNoQuestionContent(frame: string): void {
@@ -466,8 +511,8 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
 
   // The collapsed pending-question panel line is visible in A's native pane.
   const panelLine = process.platform === "darwin"
-    ? "Pending questions · Press Ctrl+Option+Up"
-    : "Pending questions · Press Ctrl+Alt+Up";
+    ? "Pending input · Press Ctrl+Option+Up"
+    : "Pending input · Press Ctrl+Alt+Up";
   await driver.waitFrame((frame) => frameContains(frame, panelLine),
     "real pending-question panel line in A's native frame", beforePrompt);
   assertSidebarHasNoQuestionContent(driver.currentText());
@@ -507,21 +552,23 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
   // Open the real pending-question list through the public shortcut.
   const beforeList = driver.frameRevision;
   driver.pty.write(KEY_CTRL_ALT_UP);
-  await driver.waitFrame((frame) => frameContains(frame, "Pending questions (1)")
-    && frameContains(frame, `q1: ${QUESTION_TEXT}`)
-    && frameContains(frame, "arrows select · Enter answer · Esc defer and close"),
+  await driver.waitFrame((frame) => popupContains(frame, "Pending input (1)")
+    && popupContains(frame, `q1: ${QUESTION_TEXT}`)
+    && popupContains(frame, "arrows select · Enter answer · Shift+Alt+Up/Down or Ctrl+Alt+PageUp/PageDown scroll · Esc defer and close"),
     "real pending-question list opens with the scripted question", beforeList);
+  assertPopupSpansConversationPane(driver.currentText(), "pending list");
 
   // Enter answer mode.
   const beforeAnswer = driver.frameRevision;
   driver.pty.write(KEYS.enter);
-  await driver.waitFrame((frame) => frameContains(frame, `q1: ${QUESTION_TEXT}`)
-    && frameContains(frame, `1. ${CHOICE_A}`)
-    && frameContains(frame, `2. ${CHOICE_B}`)
-    && frameContains(frame, "Type something…")
-    && frameContains(frame, "Decline (no answer will be sent)")
-    && frameContains(frame, "arrows select · Enter confirm · Esc back"),
+  await driver.waitFrame((frame) => popupContains(frame, `q1: ${QUESTION_TEXT}`)
+    && popupContains(frame, `1. ${CHOICE_A}`)
+    && popupContains(frame, `2. ${CHOICE_B}`)
+    && popupContains(frame, "Type something…")
+    && popupContains(frame, "Decline (no answer will be sent)")
+    && popupContains(frame, "arrows select · Enter confirm · Shift+Alt+Up/Down or Ctrl+Alt+PageUp/PageDown scroll · Esc back"),
     "real answer mode shows the scripted choices plus free text and decline", beforeAnswer);
+  assertPopupSpansConversationPane(driver.currentText(), "question answer view");
 
   // Submit the approved canned choice.
   const beforeSubmit = driver.frameRevision;

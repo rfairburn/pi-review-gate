@@ -40,6 +40,19 @@ export async function sendNotice(pi: unknown, message: string): Promise<void> {
   }
 }
 
+/** Capture one native event's UI target while suppressing notices after its session owner retires. */
+export function captureSessionNotice(
+  pi: unknown,
+  context: unknown,
+  isCurrent: () => boolean,
+): (message: string) => Promise<void> {
+  const target = context ?? pi;
+  return async (message) => {
+    if (!isCurrent()) return;
+    await sendNotice(target, message);
+  };
+}
+
 export function extractContext(args: unknown[]): unknown {
   return args.find((arg) => isRecord(arg) && isRecord(arg.ui)) ?? undefined;
 }

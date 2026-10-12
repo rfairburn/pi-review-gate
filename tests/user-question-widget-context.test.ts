@@ -452,7 +452,7 @@ test("a throwing editor-seam getter fails closed without opening UI or touching 
   }
 });
 
-test("the custom slot is invoked with its original ui receiver", async () => {
+test("the custom overlay is invoked with its original ui receiver and options", async () => {
   const fixture = makeFixture();
   userQuestionsBeginSession(fixture.surface.controller, fixture.sessionManager);
   const session = sessionContext(fixture);
@@ -462,11 +462,13 @@ test("the custom slot is invoked with its original ui receiver", async () => {
   const component: { current: BridgeComponent | undefined } = { current: undefined };
   const shortcut = makeShortcutContext(fixture, component);
   const ui = shortcut.ctx.ui as Record<string, unknown>;
-  const originalCustom = ui.custom as (factory: (...args: unknown[]) => unknown) => Promise<unknown>;
+  const originalCustom = ui.custom as (factory: (...args: unknown[]) => unknown, options?: unknown) => Promise<unknown>;
   // A receiver-dependent forwarding wrapper (like a foreign decorator).
-  ui.custom = function (this: unknown, factory: (...args: unknown[]) => unknown) {
+  ui.custom = function (this: unknown, factory: (...args: unknown[]) => unknown, options?: unknown) {
     assert.equal(this, ui, "the custom slot keeps its ui receiver");
-    return originalCustom.call(ui, factory);
+    assert.equal((options as { overlay?: boolean } | undefined)?.overlay, true,
+      "the forwarding wrapper receives the shared public overlay option");
+    return originalCustom.call(ui, factory, options);
   };
 
   const opened = pressShortcut(fixture, shortcut.ctx);
@@ -610,9 +612,8 @@ test("a stale free-text settle callback never submits into the replacement sessi
   staleSettle!("stale answer");
   assert.equal(fixture.sent.length, 0, "the stale settle never delivered an answer");
 
-  const staleFrame = component.current!.render!(80).join("\n");
-  assert.ok(staleFrame.includes("Session changed"), "the closed stale UI renders its inert notice");
-  assert.ok(!staleFrame.includes("New session question"), "no replacement-session question is displayed");
+  const staleRows = component.current!.render!(80);
+  assert.deepEqual(staleRows, [], "a stale settle closes the component before the next render, leaving it inert");
   assert.equal(
     fixture.surface.controller.listPending().length,
     1,
@@ -622,6 +623,7 @@ test("a stale free-text settle callback never submits into the replacement sessi
   assert.equal(field.onFieldSettle, undefined, "the settle callback was cleared");
 
   await opened;
+  assert.equal(shortcut.bridgeState.slotFactory, undefined, "the editor factory was restored after the stale close");
 });
 
 test("stale input closing first never renders the replacement session", async () => {
@@ -645,10 +647,12 @@ test("stale input closing first never renders the replacement session", async ()
   // Stale input closes the component first (clearing its cache); the next
   // render must not fall through to live controller state.
   component.current!.handleInput!(ENTER);
-  const frame = component.current!.render!(80).join("\n");
-  assert.ok(frame.includes("Session changed"), "the closed stale UI renders its inert notice");
-  assert.ok(!frame.includes("New session question"), "no replacement-session question is displayed");
+  assert.deepEqual(component.current!.render!(80), [], "stale input closes the component, whose subsequent render is inert");
   assert.equal(fixture.sent.length, 0, "a stale UI never submits an answer");
+  assert.equal(fixture.surface.controller.listPending().length, 1, "the replacement session's question stays pending");
+  assert.equal(shortcut.instances[0]!.fieldActive, false, "the stale editing episode was ended");
+  assert.equal(shortcut.instances[0]!.onFieldSettle, undefined, "the stale settle callback was cleared");
 
   await opened;
+  assert.equal(shortcut.bridgeState.slotFactory, undefined, "the editor factory was restored after the stale close");
 });

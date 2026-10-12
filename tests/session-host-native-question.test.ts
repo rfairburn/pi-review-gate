@@ -56,6 +56,18 @@ const EVENT_TIMEOUT_MS = 30_000;
 const CHILD_EXIT_TIMEOUT_MS = 15_000;
 const PTY_COLS = 120;
 const PTY_ROWS = 50;
+// Mirror questionPopupOverlayOptions(): centered 90%-width overlay, one-cell
+// margin, and a 100%-height cap resolved against this owned PTY geometry.
+const QUESTION_POPUP_MARGIN = 1;
+const QUESTION_POPUP_COLUMNS = Math.min(
+  PTY_COLS - 2 * QUESTION_POPUP_MARGIN,
+  Math.floor(PTY_COLS * 0.9),
+);
+const QUESTION_POPUP_MAX_ROWS = Math.max(1, PTY_ROWS - 2 * QUESTION_POPUP_MARGIN);
+const QUESTION_POPUP_START_COLUMN = QUESTION_POPUP_MARGIN
+  + Math.floor((PTY_COLS - 2 * QUESTION_POPUP_MARGIN - QUESTION_POPUP_COLUMNS) / 2);
+const QUESTION_POPUP_START_ROW = QUESTION_POPUP_MARGIN
+  + Math.floor((PTY_ROWS - 2 * QUESTION_POPUP_MARGIN - QUESTION_POPUP_MAX_ROWS) / 2);
 const MAX_STAGED_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_STAGED_TREE_BYTES = 128 * 1024 * 1024;
 const MAX_STAGED_TREE_FILES = 20_000;
@@ -744,6 +756,50 @@ function frameContains(frame: string, needle: string): boolean {
   return collapse(frame).includes(collapse(needle));
 }
 
+/**
+ * Crop the shared question/notice overlay from the standalone native PTY.
+ * This mirrors its public width/margin/maxHeight geometry so transcript text
+ * outside the centered modal can never satisfy a popup-content assertion.
+ */
+function nativeQuestionPopupLines(frame: string): string[] {
+  const terminalLines = frame.split("\n");
+  return terminalLines
+    .slice(QUESTION_POPUP_START_ROW, QUESTION_POPUP_START_ROW + QUESTION_POPUP_MAX_ROWS)
+    .map((line) => line.slice(QUESTION_POPUP_START_COLUMN, QUESTION_POPUP_START_COLUMN + QUESTION_POPUP_COLUMNS));
+}
+
+/** Require the complete Markdown body between the popup's standalone ID and first answer choice. */
+function questionBodyBetweenHeaderAndFirstChoice(frame: string): boolean {
+  const popupLines = nativeQuestionPopupLines(frame);
+  const questionHeader = popupLines.findIndex((line) => line.trim() === "q1:");
+  if (questionHeader < 0) return false;
+  const firstChoice = popupLines.findIndex((line, index) =>
+    index > questionHeader && line.includes(`1. ${CHOICE_A}`));
+  if (firstChoice <= questionHeader) return false;
+  const body = popupLines.slice(questionHeader + 1, firstChoice).join("\n");
+  return frameContains(body, QUESTION_TEXT);
+}
+
+test("question popup matcher excludes transcript text outside the modal geometry", () => {
+  const lines = Array.from({ length: PTY_ROWS }, () => " ".repeat(PTY_COLS));
+  lines[0] = `Question registered as q1: \"${QUESTION_TEXT}\"`.padEnd(PTY_COLS);
+  const popupRow = (text: string): string =>
+    `${" ".repeat(QUESTION_POPUP_START_COLUMN)}${text}`.padEnd(PTY_COLS);
+  lines[QUESTION_POPUP_START_ROW] = popupRow("q1:");
+  lines[QUESTION_POPUP_START_ROW + 1] = popupRow(`> 1. ${CHOICE_A}`);
+  const frame = lines.join("\n");
+  const popupLines = nativeQuestionPopupLines(frame);
+
+  assert.ok(frameContains(frame, QUESTION_TEXT), "the synthetic underlying tool result contains the complete question text");
+  assert.ok(popupLines.some((line) => line.trim() === "q1:"), "the bodyless popup has its standalone question ID");
+  assert.ok(popupLines.some((line) => line.includes(`1. ${CHOICE_A}`)), "the bodyless popup has its first choice");
+  assert.equal(
+    questionBodyBetweenHeaderAndFirstChoice(frame),
+    false,
+    "transcript-only question text cannot fill the body between popup anchors",
+  );
+});
+
 /** Event-driven directory watch that notifies when the named file changes. */
 function watchOwnedFile(directory: string, fileName: string, signal: ChangeSignal): () => void {
   const watcher = fsWatch(directory, (_event, filename) => {
@@ -1107,7 +1163,7 @@ test("native Pi TUI answers a scripted AskUserQuestion through the real question
     // The reporter observed the busy window and the pending-question panel.
     const busyStatus = await statuses.waitFor((status) => status.busy === true, EVENT_TIMEOUT_MS, "reporter observed the first run as busy");
     assert.equal(busyStatus.instanceId, id, "the busy status belongs to this registration");
-    const pendingStatus = await statuses.waitFor(
+    await statuses.waitFor(
       (status) => status.pendingInput === true && status.busy === false,
       EVENT_TIMEOUT_MS,
       "reporter observed the real pending-question panel widget after the first run settled",
@@ -1125,7 +1181,7 @@ test("native Pi TUI answers a scripted AskUserQuestion through the real question
     await liveOwner.frames.waitFor(
       (frame) => frameContains(frame, "Pending questions (1)")
         && frameContains(frame, `q1: ${QUESTION_TEXT}`)
-        && frameContains(frame, "arrows select · Enter answer · Esc defer and close"),
+        && frameContains(frame, "arrows select · Enter answer · Shift+Alt+Up/Down or Ctrl+Alt+PageUp/PageDown scroll · Esc defer and close"),
       EVENT_TIMEOUT_MS,
       "real pending-question list opens with the scripted question",
       beforeList,
@@ -1135,12 +1191,14 @@ test("native Pi TUI answers a scripted AskUserQuestion through the real question
     const beforeAnswer = liveOwner.frames.revision;
     liveOwner.pty!.write(KEY_ENTER);
     await liveOwner.frames.waitFor(
-      (frame) => frameContains(frame, `q1: ${QUESTION_TEXT}`)
+      (frame) => questionBodyBetweenHeaderAndFirstChoice(frame)
+        && frameContains(frame, "q1:")
+        && frameContains(frame, QUESTION_TEXT)
         && frameContains(frame, `1. ${CHOICE_A}`)
         && frameContains(frame, `2. ${CHOICE_B}`)
         && frameContains(frame, "Type something…")
         && frameContains(frame, "Decline (no answer will be sent)")
-        && frameContains(frame, "arrows select · Enter confirm · Esc back"),
+        && frameContains(frame, "arrows select · Enter confirm · Shift+Alt+Up/Down or Ctrl+Alt+PageUp/PageDown scroll · Esc back"),
       EVENT_TIMEOUT_MS,
       "real answer mode shows the scripted choices plus free text and decline",
       beforeAnswer,
@@ -1151,11 +1209,17 @@ test("native Pi TUI answers a scripted AskUserQuestion through the real question
     // The reporter also observes the session_start panel clear, so the
     // post-answer clearance must be proven strictly after this history point.
     const statusIndexBeforeAnswer = statuses.entries.length - 1;
-    // The panel is visible while the answer UI is open (widget above the editor).
-    assert.ok(
-      frameContains(liveOwner.frames.text, panelLine),
-      "the pending-question panel is visible in the real frame while the answer UI is open",
-    );
+    // The shared native modal may occlude the underlying panel. Check the
+    // latest authenticated reporter snapshot instead of requiring old inline
+    // widget placement to remain visible over it; unchanged snapshots are
+    // intentionally deduplicated, so no fresh event is required.
+    const modalStatus = statuses.entries.at(-1);
+    assert.ok(modalStatus, "the owning reporter has an authenticated status at the modal-open checkpoint");
+    assert.equal(modalStatus.type, "status");
+    assert.equal(modalStatus.pendingInput, true, "the latest status retains pending input while the answer modal is open");
+    assert.equal(modalStatus.busy, false, "the latest status retains the actually idle owner while the answer modal is open");
+    assert.equal(modalStatus.instanceId, id, "the latest pending status belongs to this native session");
+    assert.equal(modalStatus.generation, broker.generation, "the latest pending status carries the live broker generation");
     liveOwner.pty!.write(KEY_ENTER);
 
     // The delivered answer arrives as an ordinary user message and starts a

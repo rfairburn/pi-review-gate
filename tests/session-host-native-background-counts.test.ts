@@ -936,6 +936,10 @@ test("real native Main reports one owned shell 0 to 1 to 0 in a single card and 
     await driver.writeAndWait(PROMPT_STOP, (text) => text.includes(PROMPT_STOP),
       "the stop prompt is typed into the real native editor");
     await driver.writeKeys(KEYS.enter, "the stop prompt is submitted to the real native child");
+    // The provider appends several metadata events during this turn. Its real
+    // settlement fences those writes before the strict identity/size-checked
+    // journal read; never relax that reader to admit a changing file.
+    await waitForSettled(beforeStop, "the exact-handle stop turn settles");
     await waitForProvider((records) => records.some((record) => record.event === "shell_handle_selected"),
       "the opt-in provider step read the exact ShellStart result and issued ShellStop");
     const handleRecord = readJsonl(providerJournalFile).find((record) => record.event === "shell_handle_selected");
@@ -945,7 +949,6 @@ test("real native Main reports one owned shell 0 to 1 to 0 in a single card and 
     assert.ok(Number.isSafeInteger(handleRecord.pid) && (handleRecord.pid as number) > 0,
       "the selected handle carries the exact bounded numeric pid from the ShellStart result");
     const handle = String(handleRecord.handle);
-    await waitForSettled(beforeStop, "the exact-handle stop turn settles");
     assert.ok(toolCallCount("ShellStop") >= 1,
       "the real native child dispatched the public ShellStop tool call for the exact handle");
 
@@ -985,12 +988,13 @@ test("real native Main reports one owned shell 0 to 1 to 0 in a single card and 
     await driver.writeAndWait(PROMPT_LIST, (text) => text.includes(PROMPT_LIST),
       "the list prompt is typed into the real native editor");
     await driver.writeKeys(KEYS.enter, "the list prompt is submitted to the real native child");
+    // As for Stop, read only after the provider has finished appending this turn.
+    await waitForSettled(beforeList, "the list turn settles");
     await waitForProvider((records) => records.some((record) => {
       if (record.event !== "shell_list_status" || !Array.isArray(record.jobs)) return false;
       return (record.jobs as Array<{ id?: unknown; status?: unknown }>)
         .some((job) => job.id === handle && job.status === "done");
     }), "the public ShellList result reports the exact job as done");
-    await waitForSettled(beforeList, "the list turn settles");
     assert.ok(toolCallCount("ShellList") >= 1,
       "the real native child dispatched the public ShellList tool call that corroborated the exact job");
     assert.equal(cardCounts(driver.currentText(), ROW_LABEL)?.shells, 0,

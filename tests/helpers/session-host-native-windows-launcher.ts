@@ -130,7 +130,7 @@ const STAGE_REQUIRED = [
   join("dist", "src", "session-host", "bootstrap-preload.js"),
   join("scripts", "pi-review-sessions.cjs"),
 ] as const;
-const BUILT_STAGE_DIRNAME = "pi-review-sessions-";
+const BUILT_STAGE_DIRNAME = /^pi-review-sessions-[0-9a-f]{32}$/;
 
 export interface LauncherRuntimePin {
   readonly sourceRoot: string;
@@ -422,7 +422,9 @@ export interface LauncherStageEvidence {
 export function assertLauncherStageEvidence(runtime: LauncherRuntimePin, layout: LauncherLegLayout): LauncherStageEvidence {
   const buildRoot = join(layout.nativeAgentDir, ".pi-review-gate", "build");
   const entries = readdirSync(buildRoot);
-  const stages = entries.filter((entry) => entry.startsWith(BUILT_STAGE_DIRNAME));
+  // Install scratch has a distinct pi-review-sessions-setup-* receipt;
+  // only exact compiled-stage names contribute to this one-stage proof.
+  const stages = entries.filter((entry) => BUILT_STAGE_DIRNAME.test(entry));
   assert.equal(stages.length, 1, "exactly one retained launcher-owned source build stage exists for the fresh per-leg agent root");
   const stage = join(buildRoot, stages[0]!);
   const stageStats = lstatSync(stage);

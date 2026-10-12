@@ -7,6 +7,8 @@ import {
 	computeHostLayout,
 	RenderedSidebar,
 } from "../src/session-host/compositor";
+import type { HostGraphicsLayer } from "../src/session-host/graphics-output";
+import type { TerminalGraphicsFrame } from "../src/session-host/kitty-graphics";
 import { TerminalFrame, TerminalSurface } from "../src/session-host/terminal-surface";
 
 const ESC = "\x1b";
@@ -181,6 +183,76 @@ test("wide form focus replaces only the right native pane while the roster stays
 	});
 	assert.ok(plain(closedResult.lines[1]).slice(33).startsWith("native frame"), "same child frame returns after the form closes");
 	assert.equal(closedResult.cursor.visible, false);
+});
+
+test("graphics composition follows the matching native pane and disappears behind forms or narrow overlays", () => {
+	const wide = computeHostLayout(80, 8, { sidebarVisible: true, focus: "sidebar" });
+	const graphics: TerminalGraphicsFrame = { images: [], placements: [], fallbacks: [] };
+	const layer: HostGraphicsLayer = { ownerId: "actual-owner", pane: wide.native, frame: graphics };
+	const main = mainFrame(wide.native.cols, wide.native.rows, Array.from({ length: wide.native.rows }, () => "native"));
+	const wideResult = composeHostFrame(wide, {
+		main,
+		sidebar: { lines: ["> selected sibling"] },
+		nativeGraphics: layer,
+		header: "host",
+		focus: "sidebar",
+	});
+	assert.equal(wideResult.graphics, layer, "roster focus leaves the wide native pane visible");
+
+	const formLayout = computeHostLayout(80, 8, { sidebarVisible: true, focus: "form" });
+	assert.equal(composeHostFrame(formLayout, {
+		main,
+		sidebar: { lines: ["roster"] },
+		form: { lines: ["form"] },
+		nativeGraphics: { ...layer, pane: formLayout.native },
+		header: "host",
+		focus: "form",
+	}).graphics, undefined, "a form replacing the native pane hides its graphics");
+
+	const savedDelete = computeHostLayout(80, 8, {
+		sidebarVisible: true,
+		focus: "confirm",
+		savedDeleteConfirmation: true,
+	});
+	assert.equal(composeHostFrame(savedDelete, {
+		main,
+		sidebar: { lines: ["roster"] },
+		form: { lines: ["Delete saved conversation?"] },
+		nativeGraphics: { ...layer, pane: savedDelete.native },
+		header: "host",
+		focus: "confirm",
+	}).graphics, undefined, "a Saved-delete confirmation covering Main also hides its graphics");
+	assert.equal(composeHostFrame(wide, {
+		main,
+		sidebar: { lines: ["roster"] },
+		nativeGraphics: layer,
+		header: "host",
+		focus: "sidebar",
+	}).graphics, layer, "the same owned graphics return when the confirmation closes");
+
+	const overlay = computeHostLayout(52, 8, { sidebarVisible: true, focus: "sidebar" });
+	const overlayMain = mainFrame(overlay.native.cols, overlay.native.rows, Array.from({ length: overlay.native.rows }, () => "native"));
+	assert.equal(composeHostFrame(overlay, {
+		main: overlayMain,
+		sidebar: { lines: ["overlay"] },
+		nativeGraphics: { ...layer, pane: overlay.native },
+		header: "host",
+		focus: "sidebar",
+	}).graphics, undefined, "a narrow sidebar overlay hides the native graphics");
+	assert.ok(composeHostFrame(computeHostLayout(52, 8, { sidebarVisible: true, focus: "main" }), {
+		main: overlayMain,
+		nativeGraphics: { ...layer, pane: overlay.native },
+		header: "host",
+		focus: "main",
+	}).graphics, "the native pane returns when focus leaves the overlay");
+
+	const mismatched = { ...main, cols: main.cols - 1 };
+	assert.equal(composeHostFrame(wide, {
+		main: mismatched,
+		nativeGraphics: layer,
+		header: "host",
+		focus: "sidebar",
+	}).graphics, undefined, "stale frame geometry cannot retain an image owner");
 });
 
 test("only the explicit Saved-delete placement replaces the right pane while confirm keeps dialog focus", () => {

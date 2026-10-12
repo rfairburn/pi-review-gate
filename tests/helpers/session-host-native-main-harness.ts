@@ -61,6 +61,7 @@ import {
   parseRosterFrame,
   rosterNavigationTargets as parseRosterNavigationTargets,
   renderedTitleMatches,
+  selectedRosterCard,
   selectedRosterEntry,
   sidebarPaneLines,
   sidebarRosterHidden,
@@ -1470,7 +1471,10 @@ export type RestoredNativeEditorFocus = "main" | "sidebar" | "hidden";
  *
  * The native child's post-resize repaint is asynchronous, so this witness is
  * the bounded fence for a show/hide transition: the roster pane can be complete
- * while the native pane is still mid-repaint.
+ * while the native pane is still mid-repaint. When `selectedRosterLabel` is
+ * supplied, the complete roster must also show exactly that native row
+ * highlighted, distinguishing the active Main owner from a different sidebar
+ * navigation highlight.
  */
 export function restoredNativeEditorFrame(
   text: string,
@@ -1480,14 +1484,20 @@ export function restoredNativeEditorFrame(
     readonly sidebarColumns: number;
     readonly nativeWidth: number;
     readonly focus?: RestoredNativeEditorFocus;
+    readonly selectedRosterLabel?: string;
   },
 ): boolean {
-  const { ownerLabel, draft, sidebarColumns, nativeWidth, focus = "main" } = options;
+  const { ownerLabel, draft, sidebarColumns, nativeWidth, focus = "main", selectedRosterLabel } = options;
   if (typeof ownerLabel !== "string" || ownerLabel.length === 0) return false;
   if (typeof draft !== "string" || draft.length === 0) return false;
   if (!Number.isSafeInteger(sidebarColumns) || sidebarColumns < 12 || sidebarColumns > 1000) return false;
   if (!Number.isSafeInteger(nativeWidth) || nativeWidth < 20 || nativeWidth > 1000) return false;
   if (!frameHeaderMatches(text, ownerLabel)) return false;
+  if (selectedRosterLabel !== undefined) {
+    if (typeof selectedRosterLabel !== "string" || selectedRosterLabel.length === 0) return false;
+    const selected = selectedRosterCard(text, sidebarColumns);
+    if (selected === undefined || selected.title !== selectedRosterLabel) return false;
+  }
   if (focus === "sidebar") {
     if (!isSidebarFocusedFrame(text, sidebarColumns)) return false;
   } else if (focus === "hidden") {

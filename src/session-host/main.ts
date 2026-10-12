@@ -26,7 +26,7 @@ import {
   type ShutdownResult,
   type StatusRegistrar,
 } from "./instances";
-import { resolveNativePi, RUNTIME_ROLE_ENV, EXECUTOR_TOOL_CATALOG_ENV, snapshotNativeEnvironment } from "./launch";
+import { resolveNativePi, RUNTIME_ROLE_ENV, EXECUTOR_TOOL_CATALOG_ENV, snapshotNativeEnvironment, supportsSessionHostKittyGraphics } from "./launch";
 import { NativeAgentRegistry, type ProfilePreparer } from "./profiles";
 import { isValidNativeSessionId, type SessionSpawnInput, type SessionSpawnOutcome } from "./protocol";
 import {
@@ -73,7 +73,7 @@ import {
   type SidebarItem,
   type SidebarMousePresentation,
 } from "./sidebar";
-import type { TerminalInputModes } from "./terminal-surface";
+import type { TerminalMouseReportingRequest } from "./terminal-surface";
 
 const STARTUP_OPTIONS_HELPER = join("scripts", "session-host-startup-options.cjs");
 const GENERIC_FAILURE_MESSAGE = "Session host could not complete startup or cleanup.";
@@ -674,6 +674,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   let rosterSyncInProgress = false;
   let rosterSyncQueued = false;
   let redrawQueued = false;
+  let hostGraphicsEnabled = false;
   let negotiationReady = false;
   let observedFlags = 0;
   let passiveInputListener: ((data: string | Buffer) => void) | undefined;
@@ -778,9 +779,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     let desiredTracking: number | undefined;
     let useSgr = false;
     if (sidebar.focus === "main" && surface) {
-      let modes: TerminalInputModes | undefined;
+      // Outer capture follows the child's requested reporting, which stays at
+      // the committed frame's request while a synchronized frame is held, so
+      // a sibling or roster sync mid-frame cannot drop or downgrade capture.
+      // Packet forwarding remains gated per packet by inputModes(), which
+      // withholds mouse reporting until the frame commits.
+      let modes: TerminalMouseReportingRequest | undefined;
       try {
-        modes = surface.inputModes();
+        modes = surface.requestedMouseReporting();
       } catch {
         modes = undefined;
       }
@@ -866,6 +872,18 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
             sidebarFrame = sidebar.render(currentLayout.sidebar.cols, currentLayout.sidebar.rows);
           }
         }
+        const nativeOwnerId = view?.hasLiveProcess === true && view.lifecycle === "alive"
+          && surface !== undefined
+          && mainFrame !== undefined
+          && mainFrame.cols === currentLayout.native.cols && mainFrame.rows === currentLayout.native.rows
+          ? view.id
+          : undefined;
+        // Graphics follow the real active view/surface pair, never the
+        // sidebar's highlighted row. The compositor removes this layer when
+        // an overlay or form actually covers the native pane.
+        const nativeGraphics = nativeOwnerId !== undefined && mainFrame?.graphics !== undefined
+          ? { ownerId: nativeOwnerId, pane: currentLayout.native, frame: mainFrame.graphics }
+          : undefined;
         const savedDeleteRenderToken = sidebar.savedDeleteConfirmationRenderTokenNumber;
         // Title only. Lifecycle, activity and input ownership belong below
         // session-card titles, never on the active conversation's title line.
@@ -874,14 +892,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           main: mainFrame,
           sidebar: sidebarFrame,
           form: formFrame,
+          ...(nativeGraphics ? { nativeGraphics } : {}),
           header,
           focus,
         });
-        const nativeOwnerId = view?.hasLiveProcess === true && view.lifecycle === "alive"
-          && mainFrame !== undefined
-          && mainFrame.cols === currentLayout.native.cols && mainFrame.rows === currentLayout.native.rows
-          ? view.id
-          : undefined;
         const mousePresentation: MouseFramePresentation = {
           layout: currentLayout,
           focus,
@@ -952,6 +966,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
 
   function createFrameWriter(): MainWriter {
     return dependencies.createWriter(dependencies.stdout, {
+      graphicsEnabled: hostGraphicsEnabled,
       onError: () => requestShutdown(true),
     });
   }
@@ -2789,6 +2804,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     const initialCols = clampDimension(terminal.columns, 80);
     const initialRows = clampDimension(terminal.rows, 24);
     sessionSetup = dependencies.createSessionSetup({ env: snapshot.env });
+    hostGraphicsEnabled = sessionSetup.nativeSetup && supportsSessionHostKittyGraphics(snapshot.env);
     if (typeof sessionSetup.nativeAgentDir === "string" && sessionSetup.nativeAgentDir !== "") {
       hostShortcutAgentDir = sessionSetup.nativeAgentDir;
       let readResult: HostShortcutConfigReadResult;

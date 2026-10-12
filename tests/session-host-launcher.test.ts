@@ -754,7 +754,10 @@ test("--help works in the real CLI without TTY, role setup, build, or provisioni
   assert.match(result.stdout, /Node >=22\.19\.0/);
   assert.match(result.stdout, /Pi >=1\.0\.4/);
   assert.match(result.stdout, /no\s+manual Pi CLI path is needed/);
-  assert.match(result.stdout, /Basic controls only;\s*terminal\s+graphics rendering\s+is disabled/);
+  assert.match(result.stdout, /Basic controls only; bounded native Kitty PNG rendering targets direct Ghostty/);
+  assert.match(result.stdout, /TERM_PROGRAM=ghostty, TERM=xterm-ghostty, no tmux\/screen/);
+  assert.match(result.stdout, /Unsupported image display uses native-style text where metadata is available/);
+  assert.match(result.stdout, /Physical Ghostty acceptance remains pending/);
   assert.match(result.stdout, /native image\/model input behavior\s+stays\s+native/i);
   assert.match(result.stdout, /startup session\s+overrides\s+\(--continue\/-c[^)]*\) are not accepted/);
   assert.match(result.stdout, /choose\s+a workspace explicitly in the UI/);
@@ -993,12 +996,16 @@ test("production source-build runs in an owned staging root and preserves the li
     "the compile preserves the exact caller PATH, including inherited npm entries, without adding a stage .bin shim");
   const agentDir = join(fixture.root, ".pi", "agent");
   assert.ok(stagingRoot.startsWith(`${agentDir}/.pi-review-gate/build/pi-review-sessions-`), `staged root must be owned: ${stagingRoot}`);
-  // The host receives the staged root so every runtime lookup stays in the stage.
+  // The completed stage remains at its exclusively created private path; a
+  // separate O_EXCL cache record maps its content key to this retained stage.
   assert.equal(captured[0].packageRoot, stagingRoot);
+  assert.equal(existsSync(captured[0].packageRoot), true);
+  const cacheManifest = JSON.parse(readFileSync(join(stagingRoot, ".pi-review-gate-source-build.json"), "utf8")) as { cacheKey: string };
+  const cacheRecord = join(agentDir, ".pi-review-gate", "build", `source-${cacheManifest.cacheKey}.json`);
+  assert.equal(existsSync(cacheRecord), true, "the completed stage is discoverable through its exclusive content-key record");
   assert.equal(captured[0].env.NODE_ENV, "production", "the native host environment remains unchanged");
   // Main can settle gracefully, but root identity does not authorize deleting
   // npm/compile descendants without complete per-entry creation receipts.
-  assert.equal(existsSync(stagingRoot), true);
   assert.match(diagnostics[0], /^pi-review-sessions: pi runtime: \/synthetic\/pi \(v1\.0\.4, npm-global\)\n$/);
   assert.match(diagnostics[1], /preserving the source stage because per-entry descendant creation receipts are unavailable/);
   // The live checkout dist is preserved byte-for-byte.
@@ -1014,8 +1021,11 @@ test("production source-build runs in an owned staging root and preserves the li
   assert.equal(compilePlan.env.ANTHROPIC_API_KEY, "provider-secret", "the compile environment preserves trusted provider variables");
   assert.equal(env.PI_REVIEW_GATE_SETTLEMENT_SECRET, "settlement-secret", "the injected caller environment is not mutated");
   assert.equal(env.PI_REVIEW_GATE_QUIESCENCE_CHILD, "quiescence-secret");
+  const setupRoot = dirname(invocation.home);
+  assert.ok(setupRoot.startsWith(join(agentDir, ".pi-review-gate", "build", "pi-review-sessions-setup-")),
+    `npm setup resources must remain in a separate exclusive private root: ${setupRoot}`);
   for (const ownedPath of [invocation.home, invocation.cache, invocation.logs, invocation.temp]) {
-    assert.ok(ownedPath.startsWith(`${stagingRoot}/`), `npm resources must remain in the owned stage: ${ownedPath}`);
+    assert.ok(ownedPath.startsWith(`${setupRoot}/`), `npm resources must remain in the owned setup root: ${ownedPath}`);
   }
   assert.deepEqual(captured[0].args, ["--scheduler"]);
 });
@@ -1068,7 +1078,7 @@ test("a failed staged build preserves the live dist and retains its stage", { sk
   // descendants have no complete per-entry creation receipts.
   const buildCacheRoot = join(fixture.root, ".pi", "agent", ".pi-review-gate", "build");
   const stages = existsSync(buildCacheRoot)
-    ? readdirNames(buildCacheRoot).filter((entry) => /^pi-review-sessions-/.test(entry))
+    ? readdirNames(buildCacheRoot).filter((entry) => /^pi-review-sessions-[a-f0-9]{32}$/u.test(entry))
     : [];
   assert.equal(stages.length, 1);
   assert.match(stderr, /a source stage was retained because per-entry descendant creation receipts are unavailable/);
@@ -1487,9 +1497,11 @@ test("a relative PI_CODING_AGENT_DIR anchors staging and host paths against the 
   const stagingRoot = invocations[0].cwd;
   assert.ok(isAbsolute(stagingRoot), `staged root must be absolute: ${stagingRoot}`);
   assert.ok(stagingRoot.startsWith(`${anchoredAgentDir}/.pi-review-gate/build/pi-review-sessions-`), `staged root must be anchored: ${stagingRoot}`);
-  // The host receives an absolute package root and the anchored override.
+  // The host receives the exact fresh stage path; the separate content-key
+  // record, when eligible, points to this same retained directory.
   assert.equal(captured[0].packageRoot, stagingRoot);
   assert.ok(isAbsolute(captured[0].packageRoot));
+  assert.equal(existsSync(captured[0].packageRoot), true);
   assert.equal(captured[0].env.PI_CODING_AGENT_DIR, anchoredAgentDir);
 });
 
@@ -1712,7 +1724,10 @@ test("help bypasses all environment and TTY preflight", async () => {
   });
   assert.equal(status, 0);
   assert.equal(envRead, false);
-  assert.match(output, /terminal\s+graphics rendering\s+is disabled/);
+  assert.match(output, /bounded native Kitty PNG rendering targets direct Ghostty/);
+  assert.match(output, /TERM_PROGRAM=ghostty, TERM=xterm-ghostty, no tmux\/screen/);
+  assert.match(output, /Unsupported image display uses native-style text where metadata is available/);
+  assert.match(output, /Physical Ghostty acceptance remains pending/);
   assert.match(output, /native image\/model input behavior\s+stays\s+native/i);
 });
 

@@ -15,6 +15,40 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.148]
+
+### Added
+
+- The optional session host gains a bounded native Kitty-image display path for
+  directly attached Ghostty Main panes (#363), with per-session image state,
+  pane-confined placement, and writer-owned graphics cleanup. Unsupported display
+  paths retain native-style image text rather than adding settings or host notices.
+  Standalone launchers and image input/model processing are unchanged. Physical
+  Ghostty display acceptance remains manual; protocol and PTY tests alone do not
+  establish it.
+
+### Fixed
+
+- Hosted output again batches queued text-only chunks before xterm snapshots,
+  preserving the earlier scrolling row-diff optimization. Unchanged immutable
+  PNGs no longer repeat validation/hash work per redraw, and same-owner image
+  moves/crops reuse resident data with scoped placement updates instead of
+  retransmitting the PNG. Ownership, clipping, bounded output/backpressure, and
+  cleanup/restoration fences remain intact (#363).
+- Native synchronized redraws now commit text, cursor, and graphics together,
+  with alternate-screen image anchors checked against the completed covered rows
+  instead of stale text from an unfinished redraw. This prevents false image
+  disappearance and repeated PNG uploads between a native placement deletion and
+  its replacement. Frame holds are bounded; retained graphics remain budgeted,
+  and incomplete frames cannot authorize native mouse clicks against stale contents
+  (#363).
+- Unchanged eligible source-sidebar launches reuse a verified completed staged
+  build instead of installing dependencies and compiling the extension every time.
+  Exact source/toolchain changes invalidate reuse; unsafe or incomplete cached
+  artifacts are preserved and rebuilt privately. Per-launch Pi/DDGS validation,
+  startup guards, ordinary package/standalone launchers, and native user settings
+  remain unchanged (#363).
+
 ## [0.1.0-dev.147]
 
 ### Added

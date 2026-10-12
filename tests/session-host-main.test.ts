@@ -5,6 +5,7 @@ import { EventEmitter } from "node:events";
 import { Buffer } from "node:buffer";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { deflateSync } from "node:zlib";
 import type { Writable } from "node:stream";
 import test from "node:test";
 import { isKittyProtocolActive, setKittyProtocolActive } from "pi-session-host-tui";
@@ -20,7 +21,8 @@ import type { KeyboardCapabilityObserverOptions } from "../src/session-host/inpu
 import type { StatusBroker, StatusRenameRequest, StatusRenameResult } from "../src/session-host/broker";
 import { NativeAgentRegistry, type ProfilePreparer } from "../src/session-host/profiles";
 import { createNativeSavedQueryInput, runNativeExternalEditor } from "../src/session-host/form-support";
-import { TerminalSurface, type TerminalFrame, type TerminalInputModes } from "../src/session-host/terminal-surface";
+import { TerminalSurface, type TerminalFrame, type TerminalInputModes, type TerminalMouseReportingRequest } from "../src/session-host/terminal-surface";
+import type { TerminalGraphicsFrame } from "../src/session-host/kitty-graphics";
 import { SidebarController } from "../src/session-host/sidebar";
 import { isSavedSessionAdmission, listSavedSessions, type SavedSessionCatalog } from "../src/session-host/saved-sessions";
 import { deleteSavedSessionFile, type SavedSessionDeletionOptions } from "../src/session-host/saved-deletion";
@@ -95,8 +97,9 @@ class FakeOutput extends EventEmitter {
   ended = false;
   destroyed = false;
 
-  write(chunk: Uint8Array | string): boolean {
+  write(chunk: Uint8Array | string, callback?: (error?: Error | null) => void): boolean {
     this.writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    callback?.();
     return true;
   }
 
@@ -239,6 +242,7 @@ class FakeSurface {
   cols: number;
   rows: number;
   readonly writesAsFrame: string[];
+  graphics?: TerminalGraphicsFrame;
   frameCalls = 0;
   cursorVisible = true;
   modes: TerminalInputModes = {
@@ -265,10 +269,17 @@ class FakeSurface {
       rows: this.rows,
       lines,
       cursor: { column: 2, row: 0, visible: this.cursorVisible },
+      ...(this.graphics ? { graphics: this.graphics } : {}),
     };
   }
 
   inputModes(): TerminalInputModes { return { ...this.modes }; }
+
+  // This fake never holds a synchronized frame, so the child's request equals
+  // its live modes; held-frame behavior is covered with a real TerminalSurface.
+  requestedMouseReporting(): TerminalMouseReportingRequest {
+    return { mouseTracking: this.modes.mouseTracking, mouseEncoding: this.modes.mouseEncoding };
+  }
 }
 
 class FakeManager {
@@ -656,6 +667,72 @@ function plainLine(frame: ComposedHostFrame | undefined, row: number): string {
 function screenRowContaining(frame: ComposedHostFrame | undefined, text: string, fromRow = 1): number {
   return frame?.lines.findIndex((line, row) => row >= fromRow
     && line.replace(/\x1b\[[0-9;]*m/g, "").includes(text)) ?? -1;
+}
+
+function graphicsPngBase64(seed: number): string {
+  const width = 4;
+  const height = 4;
+  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 8;
+  header[9] = 6;
+  const raw = Buffer.alloc(height * (width * 4 + 1));
+  for (let row = 0; row < height; row += 1) {
+    raw[row * (width * 4 + 1)] = 0;
+    raw.fill(seed, row * (width * 4 + 1) + 1, (row + 1) * (width * 4 + 1));
+  }
+  const chunk = (type: string, data: Buffer): Buffer => {
+    const typeBytes = Buffer.from(type, "ascii");
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(data.length);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(graphicsPngCrc32(Buffer.concat([typeBytes, data])));
+    return Buffer.concat([length, typeBytes, data, crc]);
+  };
+  return Buffer.concat([
+    signature,
+    chunk("IHDR", header),
+    chunk("IDAT", deflateSync(raw)),
+    chunk("IEND", Buffer.alloc(0)),
+  ]).toString("base64");
+}
+
+function graphicsPngCrc32(input: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of input) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) crc = crc & 1 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function fakeGraphicsFrame(base64: string): TerminalGraphicsFrame {
+  return {
+    images: [{ id: "kitty-7", mimeType: "image/png", widthPx: 4, heightPx: 4, base64 }],
+    placements: [{
+      id: "placement-7",
+      imageId: "kitty-7",
+      column: 2,
+      row: 1,
+      columns: 3,
+      rows: 2,
+      crop: { x: 0, y: 0, width: 4, height: 4 },
+      clip: { leftColumns: 0, topRows: 0, rightColumns: 0, bottomRows: 0 },
+    }],
+    fallbacks: [{
+      id: "placement-7",
+      mimeType: "image/png",
+      widthPx: 4,
+      heightPx: 4,
+      column: 2,
+      row: 1,
+      columns: 3,
+      rows: 2,
+      clip: { leftColumns: 0, topRows: 0, rightColumns: 0, bottomRows: 0 },
+    }],
+  };
 }
 
 function assertSavedDeleteConfirmationRightPanel(frame: { readonly lines: readonly string[] }, expectedFile: string): void {
@@ -2334,6 +2411,119 @@ test("native Main click focus requires a written frame for the current owner and
   }
 });
 
+test("Main paints only the actual live Ghostty owner and cleans scoped graphics across sidebar, form, resize, and overlay changes", async () => {
+  const env = {
+    PATH: process.env.PATH,
+    HOME: "/synthetic-home",
+    TERM_PROGRAM: "ghostty",
+    TERM: "xterm-ghostty",
+  };
+  let harness!: Harness;
+  harness = createHarness({ env }, {
+    createSessionSetup: () => ({
+      nativeSetup: true,
+      nativeAgentDir: harness.agentDir,
+      profileRegistry: { prepare: () => { throw new Error("the fake Main manager never prepares a profile"); } },
+    }),
+    createWriter: (output, writerOptions) => createSessionHostFrameWriter(
+      output as unknown as Writable,
+      { ...writerOptions, redrawIntervalMs: 0 },
+    ),
+  });
+  let shutDown = false;
+  try {
+    const manager = await startTwoSessions(harness);
+    const imageA = graphicsPngBase64(41);
+    const imageB = graphicsPngBase64(173);
+    const surfaceA = manager.surface("native-1");
+    const surfaceB = manager.surface("native-2");
+    assert.ok(surfaceA && surfaceB);
+    surfaceA.graphics = fakeGraphicsFrame(imageA);
+    surfaceB.graphics = fakeGraphicsFrame(imageB);
+    const beforeFirstGraphics = harness.stdout.writes.length;
+    manager.notify("typed-graphics");
+    await nextTurn();
+    const firstGraphics = harness.stdout.writes.slice(beforeFirstGraphics).join("");
+    assert.ok(firstGraphics.includes(`;${imageB}\x1b\\`), "active native-2's typed image is generated to the outer terminal");
+    assert.equal(firstGraphics.includes(`;${imageA}\x1b\\`), false, "inactive native-1's same-numbered child image is not exposed");
+    assert.match(firstGraphics, /\x1b_Ga=t,f=100,q=2,i=1;/, "the host assigns its own image id");
+    assert.ok(firstGraphics.includes("\x1b[3;36H"), "the image placement is offset into the actual native pane");
+
+    const beforeSelection = harness.stdout.writes.length;
+    harness.terminal.emitInput("\x1b[A"); // Highlight A without changing the actual Main owner.
+    await nextTurn();
+    const selectionOnly = harness.stdout.writes.slice(beforeSelection).join("");
+    assert.equal(selectionOnly.includes("\x1b_Ga=t"), false, "sidebar selection alone never retargets images");
+    assert.equal(selectionOnly.includes("\x1b_Ga=d"), false, "the visible active owner's graphics remain in place");
+    assert.equal(harness.sidebar?.activeMainOwnerID, "native-2");
+
+    const beforeOwnerSwitch = harness.stdout.writes.length;
+    harness.terminal.emitInput(ENTER); // Activate A, whose child deliberately reuses Kitty image id 7.
+    await nextTurn();
+    const ownerSwitch = harness.stdout.writes.slice(beforeOwnerSwitch).join("");
+    const deleteOldImage = ownerSwitch.indexOf("\x1b_Ga=d,d=I,i=1,q=2\x1b\\");
+    const uploadNewImage = ownerSwitch.indexOf("\x1b_Ga=t,f=100,q=2,i=2;");
+    assert.ok(deleteOldImage >= 0 && uploadNewImage > deleteOldImage, "B's writer-owned image is deleted before A's namespaced generation is uploaded");
+    assert.ok(ownerSwitch.includes(`;${imageA}\x1b\\`));
+    assert.equal(ownerSwitch.includes(`;${imageB}\x1b\\`), false);
+
+    harness.terminal.emitInput(ALT_LEFT); // Focus the wide roster while A remains the owner.
+    harness.terminal.emitInput("\x1b[B");
+    harness.terminal.emitInput("\x1b[B");
+    harness.terminal.emitInput("\x1b[B"); // New session.
+    harness.terminal.emitInput(ENTER);
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "form");
+    const formOutput = harness.stdout.writes.slice(beforeOwnerSwitch + 1).join("");
+    assert.ok(formOutput.includes("\x1b_Ga=d,d=I,i=2,q=2\x1b\\"), "the form clears only A's owned image before replacing the native pane");
+    assert.equal(formOutput.includes("\x1b_Ga=d,d=a"), false, "no terminal-global deletion is emitted");
+
+    const beforeRestore = harness.stdout.writes.length;
+    harness.terminal.emitInput("\x1b"); // Cancel the form: the wide roster already exposes the same Main owner.
+    await nextTurn();
+    const restored = harness.stdout.writes.slice(beforeRestore).join("");
+    assert.ok(restored.includes("\x1b_Ga=t,f=100,q=2,i=3;"), "restoring the released image uploads a later writer-owned generation");
+    assert.ok(restored.includes(`;${imageA}\x1b\\`), "the restored payload still belongs to actual owner A");
+    assert.equal(restored.includes(`;${imageB}\x1b\\`), false, "restoration never exposes the inactive owner's payload");
+    const restoredPlacement = /\x1b_Ga=p,q=2,C=1,i=3,p=(\d+),/.exec(restored);
+    assert.ok(restoredPlacement, "restoration places the new generation using a writer-owned placement ID");
+    const placementID = restoredPlacement[1]!;
+
+    const beforeFocus = harness.stdout.writes.length;
+    harness.terminal.emitInput(ALT_LEFT);
+    await nextTurn();
+    const focusOnly = harness.stdout.writes.slice(beforeFocus).join("");
+    assert.equal(focusOnly.includes("\x1b_Ga=t"), false, "focusing the already-visible owner does not retransmit PNG bytes");
+    assert.equal(focusOnly.includes("\x1b_Ga=d,d=I"), false, "focus alone does not discard resident image data");
+
+    const beforeResize = harness.stdout.writes.length;
+    harness.terminal.setSize(90, 24);
+    await nextTurn();
+    const resizeOutput = harness.stdout.writes.slice(beforeResize).join("");
+    const deletePlacement = resizeOutput.indexOf(`\x1b_Ga=d,d=i,i=3,p=${placementID},q=2\x1b\\`);
+    const replacePlacement = resizeOutput.indexOf(`\x1b_Ga=p,q=2,C=1,i=3,p=${placementID},`);
+    assert.ok(deletePlacement >= 0 && replacePlacement > deletePlacement, "resize cleans the exact owned placement before repainting its geometry");
+    assert.equal(resizeOutput.includes("\x1b_Ga=d,d=I"), false, "same-owner resize retains the resident PNG");
+    assert.equal(resizeOutput.includes("\x1b_Ga=t"), false, "same-owner resize does not retransmit image data");
+
+    harness.terminal.emitInput(ALT_LEFT); // Wide roster focus still shows the native pane.
+    await nextTurn();
+    const beforeOverlay = harness.stdout.writes.length;
+    harness.terminal.setSize(52, 24); // Sidebar becomes a narrow overlay over the native pane.
+    await nextTurn();
+    const overlayOutput = harness.stdout.writes.slice(beforeOverlay).join("");
+    assert.ok(overlayOutput.includes("\x1b_Ga=d,d=I,i=3,q=2\x1b\\"), "narrow overlay visibility change removes the previous native image");
+    assert.equal(overlayOutput.includes("\x1b_Ga=t"), false, "covered native graphics are not painted over the overlay");
+    assert.equal(await closeWithSignal(harness), 0);
+    shutDown = true;
+  } finally {
+    if (!shutDown) {
+      harness.signals.emit("SIGTERM");
+      await harness.result.catch(() => undefined);
+    }
+  }
+});
+
 test("real writer settles identical Main and too-small roster frames before native click focus", async () => {
   const output = new QueuedFrameOutput();
   const submissions: Array<{ frame: ComposedHostFrame; disposition?: SessionHostFrameDisposition }> = [];
@@ -2936,6 +3126,129 @@ test("mouse routing uses active live child modes, mode-only changes, native view
   assert.equal(await closeWithSignal(harness), 0);
   assert.ok(harness.terminal.writes.includes("\x1b[?1000l"), "cleanup disables only the active owned tracking mode");
   assert.ok(harness.terminal.writes.includes("\x1b[?1006l"), "cleanup disables only owned cell-SGR encoding");
+});
+
+test("held synchronized frames keep outer mouse capture stable while native packets stay fenced (real TerminalSurface)", async () => {
+  const BEGIN = "\x1b[?2026h";
+  const END = "\x1b[?2026l";
+  const CLICK = "\x1b[<0;35;2M"; // absolute (35,2) => native pane origin + (1,0)
+  const FORWARDED_CLICK = "\x1b[<0;2;1M";
+  const harness = createHarness();
+  const manager = await ready(harness);
+  fillForm(harness.terminal, "held-frame mouse owner");
+  await nextTurn();
+  const fake = manager.surface("native-1");
+  assert.ok(fake);
+  assert.equal(harness.sidebar?.focus, "main");
+  assert.equal(harness.sidebar?.visible, true);
+  // Swap in a real surface at the fake's current native geometry; its owner
+  // callback is the manager change notification, as in the real manager.
+  const surface = new TerminalSurface(fake.cols, fake.rows, { onChange: () => manager.notify("native-1") });
+  manager.surfaces.set("native-1", surface as unknown as FakeSurface);
+  const child = async (data: string): Promise<void> => {
+    surface.write(data);
+    await surface.flush();
+    await nextTurn();
+  };
+  const outerWrites = (): number => harness.terminal.writes.length;
+  try {
+    await child("\x1b[?1049h\x1b[1;1Hcommitted row\x1b[?1002h\x1b[?1006h");
+    assert.deepEqual(harness.terminal.writes.slice(-2), ["\x1b[?1000l", "\x1b[?1002h"],
+      "the child's drag mode replaces the visible host pane's button reports");
+    assert.ok(harness.terminal.writes.includes("\x1b[?1006h"), "cell-SGR reports are enabled");
+    const before = manager.writes.length;
+    harness.terminal.emitInput(CLICK);
+    assert.deepEqual(manager.writes.slice(before).map((entry) => entry.data), [FORWARDED_CLICK],
+      "an authorized click is forwarded before any hold");
+
+    // Held frame: keyboard mode changes, no text/graphics/mouse change.
+    const heldStart = outerWrites();
+    await child(`${BEGIN}\x1b[1;1H\x1b[2Kcommitted row\x1b[?1h`);
+    assert.equal(surface.inputModes().mouseTracking, "none", "packet authorization is withheld while held");
+    assert.equal(surface.inputModes().applicationCursorKeys, true, "keyboard modes stay live while held");
+    assert.deepEqual(surface.requestedMouseReporting(), { mouseTracking: "drag", mouseEncoding: "sgr" });
+    manager.notify("sibling-roster-update"); // a sibling/roster change synchronizes outer modes mid-hold
+    await nextTurn();
+    assert.deepEqual(harness.terminal.writes.slice(heldStart), [],
+      "a mid-hold roster sync neither disables nor downgrades the child's outer capture");
+    const heldPackets = manager.writes.length;
+    harness.terminal.emitInput(CLICK);
+    assert.equal(manager.writes.length, heldPackets, "native mouse packets stay fenced during the hold");
+    harness.terminal.emitInput("\x1b[A");
+    assert.deepEqual(manager.writes.slice(heldPackets).map((entry) => entry.data), ["\x1bOA"],
+      "keyboard input uses the live application-cursor mode during the hold");
+
+    // Commit without any text, graphics, or mouse-mode change: no change
+    // notification is required for capture to remain correct.
+    await child(END);
+    manager.notify("sibling-roster-update");
+    await nextTurn();
+    assert.deepEqual(harness.terminal.writes.slice(heldStart), [],
+      "outer capture is unchanged across the hold and its no-change commit");
+    const resumed = manager.writes.length;
+    harness.terminal.emitInput(CLICK);
+    assert.deepEqual(manager.writes.slice(resumed).map((entry) => entry.data), [FORWARDED_CLICK],
+      "post-commit packets resume for the same authorized owner");
+
+    // A real revocation inside a held frame applies when the frame ends,
+    // without mid-frame off/on churn from roster syncs.
+    const revokeStart = outerWrites();
+    await child(`${BEGIN}\x1b[?1002l`);
+    manager.notify("sibling-roster-update");
+    await nextTurn();
+    assert.deepEqual(harness.terminal.writes.slice(revokeStart), [], "no churn while the revocation is uncommitted");
+    await child(END);
+    assert.deepEqual(harness.terminal.writes.slice(revokeStart), ["\x1b[?1002l", "\x1b[?1000h"],
+      "the committed revocation notifies and leaves only the visible host pane's button reports");
+    const revoked = manager.writes.length;
+    harness.terminal.emitInput(CLICK);
+    assert.equal(manager.writes.length, revoked, "no packet is forwarded after the child revoked reporting");
+
+    // Re-grant unframed, then hold again: focus changes are real owner
+    // changes and still reconfigure capture during a hold.
+    const regrantStart = outerWrites();
+    await child("\x1b[?1002h");
+    assert.deepEqual(harness.terminal.writes.slice(regrantStart), ["\x1b[?1000l", "\x1b[?1002h"]);
+    await child(BEGIN);
+    const focusStart = outerWrites();
+    harness.terminal.emitInput(ALT_LEFT); // Main -> sidebar focus
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "sidebar");
+    assert.deepEqual(harness.terminal.writes.slice(focusStart), ["\x1b[?1002l", "\x1b[?1000h"],
+      "leaving Main during a hold still drops the child's mode to host button reports");
+    // A left click on the displayed native pane is a host-owned focus
+    // gesture (geometry unchanged, so the hold is not dropped by a resize).
+    const focusClickPackets = manager.writes.length;
+    harness.terminal.emitInput(CLICK);
+    harness.terminal.emitInput("\x1b[<0;35;2m");
+    await nextTurn();
+    assert.equal(harness.sidebar?.focus, "main");
+    assert.equal(harness.sidebar?.visible, true);
+    assert.equal(manager.writes.length, focusClickPackets, "the focus gesture's press and release stay host-owned");
+    assert.deepEqual(harness.terminal.writes.slice(focusStart),
+      ["\x1b[?1002l", "\x1b[?1000h", "\x1b[?1000l", "\x1b[?1002h"],
+      "returning to Main mid-hold restores the committed request, not the withheld packet mode");
+    const focusedHeld = manager.writes.length;
+    harness.terminal.emitInput(CLICK);
+    assert.equal(manager.writes.length, focusedHeld, "the native fence still holds after the focus round trip");
+    await child(END);
+    assert.deepEqual(harness.terminal.writes.slice(focusStart),
+      ["\x1b[?1002l", "\x1b[?1000h", "\x1b[?1000l", "\x1b[?1002h"], "the no-change commit adds no outer writes");
+    const focusedResumed = manager.writes.length;
+    harness.terminal.emitInput(CLICK);
+    assert.deepEqual(manager.writes.slice(focusedResumed).map((entry) => [entry.id, entry.data]),
+      [["native-1", FORWARDED_CLICK]], "the committed frame re-authorizes the same owner");
+
+    // Shutdown during a hold disables exactly the owned modes.
+    await child(BEGIN);
+    const shutdownStart = outerWrites();
+    assert.equal(await closeWithSignal(harness), 0);
+    const cleanup = harness.terminal.writes.slice(shutdownStart);
+    assert.ok(cleanup.includes("\x1b[?1002l"), "shutdown disables the child's owned tracking mode");
+    assert.ok(cleanup.includes("\x1b[?1006l"), "shutdown disables owned cell-SGR encoding");
+  } finally {
+    surface.dispose();
+  }
 });
 
 test("responsive resize resizes every owned child only when native geometry changes; overlays keep geometry stable", async () => {

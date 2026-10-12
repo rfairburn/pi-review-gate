@@ -140,16 +140,27 @@ async function settingsSmoke(driver: MainPtyDriver, session: OwnedSession, works
 
 test("the complete restored-native-editor witness rejects stale narrow frames, partial repaints, and altered drafts", () => {
   const controller = new SidebarController({ toggleKey: "f8" });
-  controller.updateItems([{
-    id: "owned-native-row", label: "BGT", workspace: "/owned/workspace", agentDir: "/owned/agent",
-    lifecycle: "alive", busy: false, pendingInput: false, inputSurface: false, activity: [],
-  }]);
-  const ownerLabel = "BGT";
-  const draft = "nativeDraftB";
+  const ownerLabel = "A";
+  const highlightedLabel = "B";
+  const controllerItem = (id: string, label: string) => ({
+    id, label, workspace: "/owned/workspace", agentDir: "/owned/agent",
+    lifecycle: "alive" as const, busy: false, pendingInput: false, inputSurface: false, activity: [],
+  });
+  controller.updateItems([
+    controllerItem("owned-native-row-a", ownerLabel),
+    controllerItem("owned-native-row-b", highlightedLabel),
+  ]);
+  const draft = "nativeDraftA";
   const nativeWidth = OUTER_COLS - 32 - 1;
-  // A visible controller starts sidebar-focused; draw the roster first so the
-  // complete-card fence authorizes the roster-only Alt+Right Main-focus return.
+  // A visible controller starts sidebar-focused on New. Draw the roster, move
+  // through Quit to highlight A, then highlight B while keeping A as the
+  // separate Main owner. The complete-card fence authorizes the roster-only
+  // Alt+Right Main-focus return.
   controller.renderRoster(32, 49);
+  controller.handleInput(KEYS.down); // New -> Quit host
+  controller.handleInput(KEYS.down); // Quit host -> A
+  const ownerSelected = controller.renderRoster(32, 49).lines.map((line) => stripGeneratedSgr(line));
+  controller.handleInput(KEYS.down); // A -> B
   const sidebarFocused = controller.renderRoster(32, 49).lines.map((line) => stripGeneratedSgr(line));
   controller.handleInput(KEYS.altRight);
   assert.equal(controller.focus, "main");
@@ -162,12 +173,22 @@ test("the complete restored-native-editor witness rejects stale narrow frames, p
     rows[22] = closing;
     return rows;
   };
-  const compose = (sidebar: readonly string[], main: readonly string[]): string =>
-    [ownerLabel, ...sidebar.map((line, index) => `${line.padEnd(32)}│${main[index] ?? ""}`)].join("\n");
+  const compose = (sidebar: readonly string[], main: readonly string[], header = ownerLabel): string =>
+    [header, ...sidebar.map((line, index) => `${line.padEnd(32)}│${main[index] ?? ""}`)].join("\n");
   const rule = "─".repeat(nativeWidth);
   const options = { ownerLabel, draft, sidebarColumns: 32, nativeWidth };
-  assert.equal(restoredNativeEditorFrame(compose(left, nativePane(rule, `> ${draft}`, rule)), options), true,
-    "the complete restored editor at the current width is accepted");
+  const selectedOptions = { ...options, selectedRosterLabel: highlightedLabel };
+  assert.equal(restoredNativeEditorFrame(compose(left, nativePane(rule, `> ${draft}`, rule)), selectedOptions), true,
+    "the complete restored A editor is accepted while B is the highlighted roster row");
+  assert.equal(restoredNativeEditorFrame(compose(ownerSelected, nativePane(rule, `> ${draft}`, rule)),
+    { ...selectedOptions, focus: "sidebar" }), false,
+  "a complete A-highlighted roster is rejected when the witness requires B");
+  const partialSidebar = sidebarFocused.map((line) => line.replace("Quit host", "Quit hos"));
+  assert.equal(restoredNativeEditorFrame(compose(partialSidebar, nativePane(rule, `> ${draft}`, rule)),
+    { ...selectedOptions, focus: "sidebar" }), false,
+  "a partial roster cannot satisfy B's selected-row presentation witness");
+  assert.equal(restoredNativeEditorFrame(compose(left, nativePane(rule, `> ${draft}`, rule), highlightedLabel), selectedOptions), false,
+    "highlighting B never substitutes B's header for A's active Main owner");
   assert.equal(restoredNativeEditorFrame(compose(left, nativePane("─".repeat(52), `> ${draft}`, "─".repeat(52))), options), false,
     "a resized stale narrow frame is rejected");
   assert.equal(restoredNativeEditorFrame(compose(left, nativePane(rule, `> ${draft}`, "")), options), false,
@@ -176,15 +197,17 @@ test("the complete restored-native-editor witness rejects stale narrow frames, p
     "an appended draft is rejected");
   assert.equal(restoredNativeEditorFrame(compose(left, nativePane(rule, `> x-${draft}`, rule)), options), false,
     "an altered draft is rejected");
+  assert.equal(restoredNativeEditorFrame(compose(left, nativePane(rule, "> nativeDraftB", rule)), selectedOptions), false,
+    "B's private draft is never accepted as A's retained native draft");
   assert.equal(restoredNativeEditorFrame(compose([...left, "e edit name"], nativePane(rule, `> ${draft}`, rule)), options), false,
     "a stale sidebar-only footer is rejected");
   assert.equal(restoredNativeEditorFrame([ownerLabel, ...Array.from({ length: 49 }, () => "")].join("\n"), options), false,
     "a missing roster and editor are rejected");
   assert.equal(restoredNativeEditorFrame(compose(sidebarFocused, nativePane(rule, `> ${draft}`, rule)),
-    { ...options, focus: "sidebar" }), true,
-  "the complete sidebar-focused editor with its own footer is accepted");
+    { ...selectedOptions, focus: "sidebar" }), true,
+  "the complete sidebar-focused editor is accepted with B highlighted and A still owning Main");
   assert.equal(restoredNativeEditorFrame(compose(left, nativePane(rule, `> ${draft}`, rule)),
-    { ...options, focus: "sidebar" }), false,
+    { ...selectedOptions, focus: "sidebar" }), false,
   "a stale Main-focused footer is rejected while the sidebar owns focus");
   const fullWidthRule = "─".repeat(OUTER_COLS);
   assert.equal(restoredNativeEditorFrame(
@@ -654,7 +677,22 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
     nativeWidth: OUTER_COLS - 32 - 1, focus: "sidebar",
   }), "the show transition completely redraws A's exact restored sidebar-focused native editor");
   assert.ok(driver.currentText().includes(draftA), "F8 reopens the sidebar without altering A's native draft");
+  // Sidebar navigation fences only the complete selected roster row. A fresh
+  // host frame can still expose an in-progress native repaint, so require both
+  // panes to present their exact current state before reading A's draft.
+  assert.equal(driver.selected(labelA), true, "A remains the highlighted roster row before moving the highlight to B");
+  const beforeSelectedBPresentation = driver.frameRevision;
   await driver.moveRosterTo(labelB);
+  await driver.waitFrame((text) => restoredNativeEditorFrame(text, {
+    ownerLabel: labelA,
+    draft: draftA,
+    sidebarColumns: 32,
+    nativeWidth: OUTER_COLS - 32 - 1,
+    focus: "sidebar",
+    selectedRosterLabel: labelB,
+  }), "after B is highlighted, a fresh complete frame retains A's owner, draft, native geometry, and sidebar focus",
+  beforeSelectedBPresentation);
+  assert.equal(driver.selected(labelB), true, "B is highlighted without changing A's Main ownership");
   assert.ok(driver.currentText().includes(draftA), "highlighting B does not reroute A's native input");
   const beforeSelectB = driver.frameRevision;
   driver.pty.write(KEYS.enter);

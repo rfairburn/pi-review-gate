@@ -29,9 +29,10 @@
  *   bounded (cap 32 per buffer, newest push retained via FIFO eviction) and
  *   whenever pops empty the stack, ALL flags reset to zero, per protocol.
  * - Window operations (CSI t), OSC 52 clipboard writes, and title setting
- *   are swallowed (default deny). There is no graphical renderer here: the
- *   headless instance safely consumes image/graphics sequences without
- *   forwarding them, and no graphics or native menu parity is claimed.
+ *   are swallowed (default deny). A narrow native Kitty PNG subset is split
+ *   before VT parsing, validated, and exposed only as typed image/placement
+ *   and native-style fallback metadata; there is no renderer or host notice,
+ *   and unsupported graphics commands are swallowed rather than forwarded.
  * - The Kitty keyboard handling uses typed parser hooks
  *   (parser.registerCsiHandler) because xterm 6 core has no kittyKeyboard
  *   support and no onRender callback. Snapshot invalidation happens only
@@ -41,6 +42,27 @@
  *   state so mode-only changes (bracketed paste, cursor keys/keypad, mouse
  *   tracking/encoding, modifyOtherKeys, kitty flags) notify the host after
  *   the parse completes.
+ * - Native synchronized output (`CSI ? 2026 h` ... `CSI ? 2026 l`) is
+ *   recognized only through the same typed parser hooks, so it follows the
+ *   pinned parser exactly (string payloads, split Kitty APCs, and invalid or
+ *   intermediate-bearing CSI never toggle it). While a frame is open,
+ *   `frame()` and change notifications expose only the complete state
+ *   captured at the frame's start; the frame's text, cursor, and graphics
+ *   are published together when it ends. Alternate-buffer Kitty placements
+ *   made inside the frame keep their exact event-time position/crop but are
+ *   anchored against the completed frame's covered rows, and older anchors
+ *   are validated (never re-anchored) against it. Destructive controls and
+ *   scoped deletes still apply in order; their result simply becomes visible
+ *   at commit. Holding is bounded (1 s, 8 MiB, 8192 child chunks); exceeding
+ *   a bound or DECSTR ends the hold early and the rest is processed as
+ *   unframed output, while resize, buffer switches, RIS, parse failure, and
+ *   disposal drop the hold and discard not-yet-anchored placements. Image and
+ *   placement leases referenced by a held snapshot stay charged to the shared
+ *   graphics budget until the snapshot is released. Keyboard modes are always
+ *   live; mouse reporting is withheld (`none`) from `inputModes()` while any
+ *   frame is held (outer capture instead follows `requestedMouseReporting()`,
+ *   the committed frame's request, so it stays stable mid-frame), and
+ *   colon sub-parameter forms of 2026 are not frame markers.
  * - Queued write data is bounded in UTF-8 bytes (not UTF-16 code units) and
  *   in queued-write count; overruns fail explicitly rather than silently
  *   truncating, and empty writes are no-ops so they cannot enqueue unbounded
@@ -62,6 +84,14 @@
 import { Buffer } from "node:buffer";
 import { IDisposable, Terminal } from "@xterm/headless";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
+import {
+	KittyGraphicsSplitter,
+	KittyGraphicsState,
+	TerminalGraphicsBudget,
+	TerminalGraphicsFrame,
+	TerminalGraphicsPosition,
+	createTerminalGraphicsBudget,
+} from "./kitty-graphics";
 
 /** A cell color as recorded by headless: default, 256-palette index, or RGB. */
 export interface TerminalColorSpec {
@@ -120,6 +150,8 @@ export interface TerminalFrame {
 	};
 	/** Structured style runs for rows containing non-default attributes. */
 	readonly styles?: readonly TerminalLineStyles[];
+	/** Validated Kitty PNG placements and payload-free fallback metadata visible in this buffer. */
+	readonly graphics?: TerminalGraphicsFrame;
 }
 
 /**
@@ -146,6 +178,19 @@ export interface TerminalInputModes {
 	readonly mouseEncoding: "default" | "sgr" | "sgr-pixels";
 }
 
+/**
+ * The child's requested mouse reporting, used only to configure the outer
+ * terminal's mouse capture. It is never packet-forwarding authorization:
+ * forwarding uses `inputModes()`, which withholds mouse reporting while a
+ * synchronized frame is held. While a frame is held this reports the last
+ * committed frame's request, so outer capture neither drops nor churns
+ * mid-frame; changes made inside the frame apply when it ends.
+ */
+export interface TerminalMouseReportingRequest {
+	readonly mouseTracking: TerminalInputModes["mouseTracking"];
+	readonly mouseEncoding: TerminalInputModes["mouseEncoding"];
+}
+
 export interface TerminalSurfaceOptions {
 	/** Called with replies this instance generates for its child (owner only). */
 	readonly onReply?: (data: string) => void;
@@ -162,6 +207,8 @@ export interface TerminalSurfaceOptions {
 	 * ProcessTerminal's actively negotiated flag mask (0..7).
 	 */
 	readonly getSupportedKeyboardFlags?: () => number;
+	/** Optional budget shared by the host's surfaces; omitted means private. */
+	readonly graphicsBudget?: TerminalGraphicsBudget;
 	/** Bounded named scrollback lines (default 1000). */
 	readonly scrollback?: number;
 	/** Maximum bytes of not-yet-parsed queued write data (default 8 MiB). */
@@ -171,9 +218,36 @@ export interface TerminalSurfaceOptions {
 interface PendingWrite {
 	/** Queued UTF-8 byte size of the still-unparsed chunk. */
 	readonly size: number;
+	/** Raw child chunk, scanned incrementally before entering xterm. */
+	readonly data: string;
 	readonly done: Promise<void>;
 	resolve: () => void;
 }
+
+/**
+ * A held native synchronized-output frame (`CSI ? 2026 h` ... `CSI ? 2026 l`).
+ * While held, `frame()` and change notifications expose only `committed`, the
+ * complete state captured when the frame opened.
+ */
+interface SyncFrame {
+	readonly committed: TerminalFrame;
+	readonly committedRevision: number;
+	readonly committedModes: TerminalInputModes;
+	readonly timer: ReturnType<typeof setTimeout>;
+	bytes: number;
+	writes: number;
+}
+
+type GraphicsPreflightState =
+	| "ground"
+	| "escape"
+	| "apc-start"
+	| "kitty"
+	| "kitty-escape"
+	| "opaque-osc"
+	| "opaque-string"
+	| "opaque-osc-escape"
+	| "opaque-string-escape";
 
 /** Per-screen-mode Kitty keyboard state (independent normal vs alternate). */
 interface KittyState {
@@ -239,11 +313,24 @@ const LOW_WATERMARK_BYTES = 256 * 1024;
 // Queued writes are also bounded by count: pause above the high watermark
 // and hard-fail at this cap so tiny chunks cannot enqueue unbounded promises.
 const MAX_QUEUED_WRITES = 4096;
+// Keep each parse batch bounded while allowing xterm's WriteBuffer to coalesce
+// adjacent text-only chunks into one event-loop cycle.
+const MAX_TERMINAL_BATCH_WRITES = 64;
+const MAX_TERMINAL_BATCH_BYTES = 256 * 1024;
 const HIGH_WATERMARK_WRITES = 2048;
 const LOW_WATERMARK_WRITES = 1024;
 const MAX_DIMENSION = 1000;
+// Bounds for holding one native synchronized-output frame. Exceeding any of
+// them ends the hold early (fail-closed: the live state is published and the
+// rest of that frame is processed exactly like unframed output).
+const MAX_SYNC_FRAME_MS = 1000;
+const MAX_SYNC_FRAME_BYTES = 8 * 1024 * 1024;
+const MAX_SYNC_FRAME_WRITES = 8192;
+const SYNCHRONIZED_OUTPUT_MODE = 2026;
+const BUFFER_SWITCH_MODES = [47, 1047, 1049] as const;
 
 const SGR_RESET = "\x1b[0m";
+const SAFE_EMPTY_APC = "\x1b_G\x1b\\";
 const GENERATED_SGR_PATTERN = /\x1b\[[0-9;]*m/g;
 
 function validateDimension(value: number, label: "cols" | "rows"): void {
@@ -425,18 +512,27 @@ export class TerminalSurface {
 	private readonly pendingWrites: PendingWrite[] = [];
 	private readonly kittyNormal: KittyState = { current: 0, stack: [] };
 	private readonly kittyAlternate: KittyState = { current: 0, stack: [] };
+	private readonly graphicsSplitter: KittyGraphicsSplitter;
+	private readonly graphics: KittyGraphicsState;
+	private graphicsPreflightState: GraphicsPreflightState = "ground";
 	private options: TerminalSurfaceOptions;
 	private readonly maxPendingBytes: number;
 	private readonly highWatermarkBytes: number;
 	private readonly lowWatermarkBytes: number;
 
 	private pendingBytes = 0;
+	private pendingAlternateGraphicsInvalidation = false;
 	private cursorVisible = true;
 	private modifyOtherKeys: 0 | 1 | 2 = 0;
 	private mouseEncoding: TerminalInputModes["mouseEncoding"] = "default";
 	private paused = false;
 	private disposed = false;
+	private drainingWrites = false;
+	private processingWrite = false;
+	private activeTerminalWriteResolve?: () => void;
+	private parseFailed = false;
 	private lastInvalidateKey = "";
+	private syncFrame?: SyncFrame;
 
 	constructor(cols: number, rows: number, options: TerminalSurfaceOptions = {}) {
 		validateDimension(cols, "cols");
@@ -454,6 +550,9 @@ export class TerminalSurface {
 		this.highWatermarkBytes = Math.min(HIGH_WATERMARK_BYTES, Math.floor(this.maxPendingBytes * 0.75));
 		this.lowWatermarkBytes = Math.min(LOW_WATERMARK_BYTES, Math.floor(this.maxPendingBytes * 0.25));
 		this.options = options;
+		const graphicsBudget = options.graphicsBudget ?? createTerminalGraphicsBudget();
+		this.graphics = new KittyGraphicsState(graphicsBudget);
+		this.graphicsSplitter = new KittyGraphicsSplitter(graphicsBudget);
 		this.terminal = new Terminal({
 			cols,
 			rows,
@@ -463,6 +562,23 @@ export class TerminalSurface {
 		const unicode11 = new Unicode11Addon();
 		this.terminal.loadAddon(unicode11);
 		this.terminal.unicode.activeVersion = "11";
+
+		const noteAlternateGraphicsInvalidation = () => {
+			if (this.terminal.buffer.active.type === "alternate") {
+				this.pendingAlternateGraphicsInvalidation = true;
+			}
+		};
+		this.attach(this.terminal.onScroll(noteAlternateGraphicsInvalidation));
+		for (const final of ["J", "S", "T", "L", "M", "@", "P", "X"]) {
+			this.attach(this.terminal.parser.registerCsiHandler({ final }, () => {
+				noteAlternateGraphicsInvalidation();
+				return false;
+			}));
+		}
+		this.attach(this.terminal.parser.registerEscHandler({ final: "M" }, () => {
+			noteAlternateGraphicsInvalidation();
+			return false;
+		}));
 
 		// Headless-generated replies (built-in DA/DSR and friends) go to this
 		// instance's owner via onData; never to any other surface.
@@ -476,25 +592,37 @@ export class TerminalSurface {
 		// sanctioned "everything queued so far has been parsed" signal, so
 		// owner notifications never expose intermediate mid-chunk states.
 		this.attach(this.terminal.onWriteParsed(() => {
-			this.invalidate();
+			this.applyPendingAlternateGraphicsInvalidation();
+			if (!this.processingWrite) {
+				this.invalidate();
+			}
 		}));
 
 		// Hardware cursor visibility tracking. Handlers scan all private-mode
 		// parameters (combined sequences like CSI ?1;5;25 h/l are valid) and
 		// return false so the native builtin parser also processes them.
+		//
+		// The same typed hooks recognize native synchronized output (?2026)
+		// only as a real parsed DECSET/DECRST, so look-alike bytes inside
+		// OSC/DCS/APC/PM/SOS strings, Kitty APC payloads (split before xterm),
+		// or invalid/intermediate-bearing CSI never open or close a frame.
+		// Parameters are applied in order, matching xterm's own handling.
 		this.attach(this.terminal.parser.registerCsiHandler({ prefix: "?", final: "h" }, (params) => {
-			if (this.paramsContain(params, 25)) {
-				this.cursorVisible = true;
-			}
+			this.observePrivateModes(params, true);
 			this.observeMouseEncoding(params, true);
 			return false;
 		}));
 		this.attach(this.terminal.parser.registerCsiHandler({ prefix: "?", final: "l" }, (params) => {
-			if (this.paramsContain(params, 25)) {
-				this.cursorVisible = false;
-			}
+			this.observePrivateModes(params, false);
 			this.observeMouseEncoding(params, false);
 			return false;
+		}));
+		// Backstop: any buffer switch the mode hooks did not already settle
+		// (for example RIS) ends a held frame without guessing anchors.
+		this.attach(this.terminal.buffer.onBufferChange(() => {
+			if (this.syncFrame) {
+				this.endSyncFrame("discard");
+			}
 		}));
 
 		// xterm 6 does not expose modifyOtherKeys in its public mode object.
@@ -518,10 +646,19 @@ export class TerminalSurface {
 		// Supported reset sequences restore native cursor visibility; handlers
 		// observe and return false so the builtin parser still processes them.
 		this.attach(this.terminal.parser.registerEscHandler({ final: "c" }, () => {
+			// RIS clears both buffers and synchronized output: a held frame
+			// cannot complete, so its provisional anchors are discarded.
+			if (this.syncFrame) {
+				this.endSyncFrame("discard");
+			}
 			this.resetObservedProtocolState();
 			return false;
 		}));
 		this.attach(this.terminal.parser.registerCsiHandler({ intermediates: "!", final: "p" }, () => {
+			// DECSTR resets xterm's synchronized-output mode: end the hold early.
+			if (this.syncFrame) {
+				this.endSyncFrame("abort");
+			}
 			this.cursorVisible = true;
 			return false;
 		}));
@@ -605,6 +742,9 @@ export class TerminalSurface {
 	/** Queues a raw chunk of child output for parsing. Throws on limit overrun. */
 	write(data: string): void {
 		this.assertNotDisposed();
+		if (this.parseFailed) {
+			throw new Error("TerminalSurface parse pipeline failed");
+		}
 		if (typeof data !== "string") {
 			throw new Error("TerminalSurface.write expects a string of raw child output");
 		}
@@ -632,24 +772,11 @@ export class TerminalSurface {
 		const done = new Promise<void>((res) => {
 			resolve = res;
 		});
-		const pending: PendingWrite = { size: incomingBytes, done, resolve };
+		const pending: PendingWrite = { size: incomingBytes, data, done, resolve };
 		this.pendingWrites.push(pending);
 		this.pendingBytes += incomingBytes;
-		this.terminal.write(data, () => {
-			if (this.disposed) {
-				// Writes completing after dispose must not call into peers;
-				// their promises were already settled by dispose().
-				return;
-			}
-			const index = this.pendingWrites.indexOf(pending);
-			if (index >= 0) {
-				this.pendingWrites.splice(index, 1);
-			}
-			this.pendingBytes -= pending.size;
-			pending.resolve();
-			this.updateBackpressure();
-		});
 		this.updateBackpressure();
+		this.drainPendingWrites();
 	}
 
 	/**
@@ -661,6 +788,9 @@ export class TerminalSurface {
 		this.assertNotDisposed();
 		const snapshot = [...this.pendingWrites];
 		await Promise.all(snapshot.map((pending) => pending.done));
+		if (this.parseFailed) {
+			throw new Error("TerminalSurface parse pipeline failed");
+		}
 		// Let the async onWriteParsed invalidation land so callers can observe
 		// frames/onChange deterministically after flush.
 		await new Promise<void>((resolve) => setImmediate(resolve));
@@ -671,15 +801,31 @@ export class TerminalSurface {
 		this.assertNotDisposed();
 		validateDimension(cols, "cols");
 		validateDimension(rows, "rows");
+		// A held frame was captured at the old geometry: drop it so frame()
+		// never reports stale cols/rows, then invalidate geometry-bound state.
+		this.cancelSyncFrame();
+		this.graphics.invalidatePlacements();
 		this.terminal.resize(cols, rows);
 		// Resize invalidates geometry deterministically: the underlying resize
 		// is synchronous and buffers are reflowed immediately.
 		this.invalidate();
 	}
 
-	/** Builds the current snapshot frame from the active buffer. */
+	/**
+	 * Builds the current snapshot frame from the active buffer. While a native
+	 * synchronized frame is held, returns the last complete committed state
+	 * instead, so unrelated host redraws never observe a half-drawn frame.
+	 */
 	frame(): TerminalFrame {
 		this.assertNotDisposed();
+		const held = this.syncFrame?.committed;
+		if (held) {
+			return { ...held, lines: [...held.lines] };
+		}
+		return this.liveFrame();
+	}
+
+	private liveFrame(): TerminalFrame {
 		const buffer = this.terminal.buffer.active;
 		const cols = this.terminal.cols;
 		const rows = this.terminal.rows;
@@ -764,10 +910,11 @@ export class TerminalSurface {
 			row: cursorRow,
 			visible,
 		};
+		const graphics = this.graphics.frame(buffer.type, buffer.viewportY, cols, rows);
 		if (styles.length > 0) {
-			return { cols, rows, lines, cursor, styles };
+			return { cols, rows, lines, cursor, styles, ...(graphics ? { graphics } : {}) };
 		}
-		return { cols, rows, lines, cursor };
+		return { cols, rows, lines, cursor, ...(graphics ? { graphics } : {}) };
 	}
 
 	/**
@@ -778,16 +925,26 @@ export class TerminalSurface {
 	 */
 	inputModes(): TerminalInputModes {
 		this.assertNotDisposed();
-		const modes = this.terminal.modes;
-		return {
-			kittyFlags: this.effectiveKittyFlags(),
-			applicationCursorKeys: modes.applicationCursorKeysMode,
-			applicationKeypad: modes.applicationKeypadMode,
-			bracketedPaste: modes.bracketedPasteMode,
-			mouseTracking: modes.mouseTrackingMode,
-			modifyOtherKeys: this.modifyOtherKeys,
-			mouseEncoding: this.mouseEncoding,
-		};
+		return this.inputModesState();
+	}
+
+	/**
+	 * Mouse reporting the child requested, for outer-terminal capture only
+	 * (see `TerminalMouseReportingRequest`). Never use this to forward a
+	 * mouse packet: `inputModes()` is the per-packet authorization. While a
+	 * frame is held this is the committed frame's request (captured before
+	 * the hold began, so not withheld); otherwise it is the live parsed
+	 * state. Any difference between the two at commit changes the
+	 * invalidation key, so the owner is notified and a real revocation
+	 * reaches the outer terminal when the frame ends.
+	 */
+	requestedMouseReporting(): TerminalMouseReportingRequest {
+		this.assertNotDisposed();
+		const committed = this.syncFrame?.committedModes;
+		if (committed) {
+			return { mouseTracking: committed.mouseTracking, mouseEncoding: committed.mouseEncoding };
+		}
+		return { mouseTracking: this.terminal.modes.mouseTrackingMode, mouseEncoding: this.mouseEncoding };
 	}
 
 	/**
@@ -800,6 +957,11 @@ export class TerminalSurface {
 			return;
 		}
 		this.disposed = true;
+		this.activeTerminalWriteResolve?.();
+		this.cancelSyncFrame();
+		this.graphicsSplitter.dispose();
+		this.graphicsPreflightState = "ground";
+		this.graphics.dispose();
 		this.kittyNormal.current = 0;
 		this.kittyNormal.stack.length = 0;
 		this.kittyAlternate.current = 0;
@@ -823,6 +985,541 @@ export class TerminalSurface {
 		}
 		this.pendingBytes = 0;
 		this.terminal.dispose();
+	}
+
+	private drainPendingWrites(): void {
+		if (this.disposed || this.drainingWrites) {
+			return;
+		}
+		this.drainingWrites = true;
+		void Promise.resolve().then(() => this.processPendingWrites());
+	}
+
+	/** Detect splitter mutations that must wait for preceding xterm callbacks. */
+	private preflightGraphicsChunk(data: string): boolean {
+		let state = this.graphicsPreflightState;
+		let sensitive = state === "escape" || state === "apc-start" || state === "kitty" || state === "kitty-escape";
+		let offset = 0;
+		while (offset < data.length) {
+			switch (state) {
+				case "ground": {
+					const control = this.nextGraphicsPreflightControl(data, offset);
+					if (control < 0) {
+						offset = data.length;
+						break;
+					}
+					offset = control;
+					const code = data.charCodeAt(offset);
+					if (code === 0x1b) {
+						if (offset + 1 >= data.length) {
+							state = "escape";
+							sensitive = true;
+							offset += 1;
+						} else {
+							const next = data[offset + 1] as string;
+							if (next === "_") {
+								state = "apc-start";
+								sensitive = true;
+							} else if (next === "]") {
+								state = "opaque-osc";
+							} else if (next === "P" || next === "^" || next === "X") {
+								state = "opaque-string";
+							} else {
+								state = "ground";
+							}
+							offset += 2;
+						}
+					} else if (code === 0x9f) {
+						state = "apc-start";
+						sensitive = true;
+						offset += 1;
+					} else if (code === 0x9d) {
+						state = "opaque-osc";
+						offset += 1;
+					} else {
+						state = "opaque-string";
+						offset += 1;
+					}
+					break;
+				}
+				case "escape": {
+					const next = data[offset] as string;
+					if (next === "_") {
+						state = "apc-start";
+						sensitive = true;
+					} else if (next === "]") {
+						state = "opaque-osc";
+					} else if (next === "P" || next === "^" || next === "X") {
+						state = "opaque-string";
+					} else {
+						state = "ground";
+					}
+					offset += 1;
+					break;
+				}
+				case "apc-start": {
+					const next = data[offset] as string;
+					if (next === "G") {
+						state = "kitty";
+						sensitive = true;
+					} else if (next === "\x9c") {
+						state = "ground";
+					} else if (next === "\x1b") {
+						state = "opaque-string-escape";
+					} else {
+						state = "opaque-string";
+					}
+					offset += 1;
+					break;
+				}
+				case "kitty": {
+					const c1Terminator = data.indexOf("\x9c", offset);
+					const escape = data.indexOf("\x1b", offset);
+					if (c1Terminator >= 0 && (escape < 0 || c1Terminator < escape)) {
+						state = "ground";
+						offset = c1Terminator + 1;
+					} else if (escape < 0) {
+						offset = data.length;
+					} else if (escape + 1 >= data.length) {
+						state = "kitty-escape";
+						offset = escape + 1;
+					} else if (data[escape + 1] === "\\") {
+						state = "ground";
+						offset = escape + 2;
+					} else {
+						offset = escape + 2;
+					}
+					break;
+				}
+				case "kitty-escape":
+					if (data[offset] === "\\") {
+						state = "ground";
+						offset += 1;
+					} else {
+						state = "kitty";
+					}
+					break;
+				case "opaque-osc-escape":
+				case "opaque-string-escape":
+					if (data[offset] === "\\") {
+						state = "ground";
+						offset += 1;
+					} else {
+						state = state === "opaque-osc-escape" ? "opaque-osc" : "opaque-string";
+					}
+					break;
+				case "opaque-osc":
+				case "opaque-string": {
+					const isOsc = state === "opaque-osc";
+					let terminator = data.indexOf("\x9c", offset);
+					const escape = data.indexOf("\x1b", offset);
+					const bell = isOsc ? data.indexOf("\x07", offset) : -1;
+					if (escape >= 0 && (terminator < 0 || escape < terminator)) {
+						terminator = escape;
+					}
+					if (bell >= 0 && (terminator < 0 || bell < terminator)) {
+						terminator = bell;
+					}
+					if (terminator < 0) {
+						if (data[data.length - 1] === "\x1b") {
+							state = isOsc ? "opaque-osc-escape" : "opaque-string-escape";
+						}
+						offset = data.length;
+					} else if (data[terminator] === "\x9c" || data[terminator] === "\x07") {
+						state = "ground";
+						offset = terminator + 1;
+					} else if (terminator + 1 < data.length && data[terminator + 1] === "\\") {
+						state = "ground";
+						offset = terminator + 2;
+					} else if (terminator + 1 < data.length) {
+						offset = terminator + 2;
+					} else {
+						state = isOsc ? "opaque-osc-escape" : "opaque-string-escape";
+						offset = terminator + 1;
+					}
+					break;
+				}
+			}
+		}
+		this.graphicsPreflightState = state;
+		return sensitive;
+	}
+
+	private nextGraphicsPreflightControl(data: string, start: number): number {
+		for (let index = start; index < data.length; index += 1) {
+			const code = data.charCodeAt(index);
+			if (code === 0x1b || code === 0x9f || code === 0x90 || code === 0x9e || code === 0x98 || code === 0x9d) {
+				return index;
+			}
+		}
+		return -1;
+	}
+
+	private async processPendingWrites(): Promise<void> {
+		try {
+			while (!this.disposed && this.pendingWrites.length > 0) {
+				this.processingWrite = true;
+				const maxBatchWrites = this.hasAlternateGraphicsPlacements()
+					? 1
+					: MAX_TERMINAL_BATCH_WRITES;
+				const batch: PendingWrite[] = [];
+				let batchBytes = 0;
+				for (const pending of this.pendingWrites) {
+					if (batch.length >= maxBatchWrites) {
+						break;
+					}
+					if (batch.length > 0 && batchBytes + pending.size > MAX_TERMINAL_BATCH_BYTES) {
+						break;
+					}
+					batch.push(pending);
+					batchBytes += pending.size;
+					if (batchBytes >= MAX_TERMINAL_BATCH_BYTES) {
+						break;
+					}
+				}
+				const terminalParts: string[] = [];
+				const textPending: PendingWrite[] = [];
+
+				for (const pending of batch) {
+					if (this.disposed) {
+						return;
+					}
+					if (this.preflightGraphicsChunk(pending.data)) {
+						// Preflight before mutating the splitter: it can reserve shared
+						// pending-byte budget even when this APC continues in a later
+						// child chunk and emits no typed event yet.
+						await this.flushTerminalBatch(terminalParts, textPending);
+						terminalParts.length = 0;
+						textPending.length = 0;
+						if (this.disposed) {
+							return;
+						}
+						const parts = this.graphicsSplitter.push(pending.data);
+						for (const part of parts) {
+							if (this.disposed) {
+								return;
+							}
+							if (part.kind === "terminal") {
+								await this.writeToTerminal(part.data);
+								if (this.disposed) {
+									return;
+								}
+								this.afterTerminalWrite();
+							} else if (part.kind === "graphics") {
+								// Let xterm consume a generated empty APC before the typed event.
+								// This returns a parser left mid-CSI/ESC to ground without ever
+								// forwarding the child's payload or changing cursor position.
+								await this.writeToTerminal(SAFE_EMPTY_APC);
+								if (this.disposed) {
+									return;
+								}
+								this.graphics.process(part.command, this.graphicsPosition(part.command));
+							} else if (part.kind === "discard") {
+								await this.writeToTerminal(SAFE_EMPTY_APC);
+								if (this.disposed) {
+									return;
+								}
+								this.graphics.discard();
+							} else {
+								await this.writeToTerminal(SAFE_EMPTY_APC);
+								if (this.disposed) {
+									return;
+								}
+								this.graphics.clear();
+							}
+						}
+						this.completePendingWrites([pending]);
+						if (!this.disposed) {
+							this.invalidate();
+						}
+						// Potential graphics chunks are batch boundaries, including
+						// incomplete prefixes and payload continuations. The next chunk
+						// must not mutate the splitter until these bytes have parsed.
+						break;
+					}
+					const parts = this.graphicsSplitter.push(pending.data);
+					if (parts.some((part) => part.kind !== "terminal")) {
+						throw new Error("TerminalSurface graphics preflight missed a splitter barrier");
+					}
+					for (const part of parts) {
+						if (part.kind === "terminal") {
+							terminalParts.push(part.data);
+						}
+					}
+					textPending.push(pending);
+				}
+
+				if (textPending.length > 0) {
+					await this.flushTerminalBatch(terminalParts, textPending);
+				}
+			}
+		} catch {
+			// A parser or protocol helper failure must not strand flush callers
+			// or silently accept later child output as if it had parsed.
+			this.parseFailed = true;
+			this.cancelSyncFrame();
+			this.graphics.discard();
+			for (const pending of this.pendingWrites.splice(0)) {
+				pending.resolve();
+			}
+			this.pendingBytes = 0;
+			this.updateBackpressure();
+		} finally {
+			this.processingWrite = false;
+			this.drainingWrites = false;
+			if (!this.disposed && this.pendingWrites.length > 0) {
+				this.drainPendingWrites();
+			}
+		}
+	}
+
+	/** Parse a bounded run of adjacent text chunks with one xterm write. */
+	private async flushTerminalBatch(parts: string[], pending: PendingWrite[]): Promise<void> {
+		if (this.disposed) {
+			return;
+		}
+		if (parts.length > 0) {
+			await this.writeToTerminal(parts.join(""));
+			if (this.disposed) {
+				return;
+			}
+			this.afterTerminalWrite();
+		}
+		if (this.disposed) {
+			return;
+		}
+		this.completePendingWrites(pending);
+		if (!this.disposed && parts.length > 0) {
+			this.invalidate();
+		}
+	}
+
+	private afterTerminalWrite(): void {
+		this.applyPendingAlternateGraphicsInvalidation();
+		if (this.syncFrame) {
+			// Destructive controls inside a frame still apply at once; anchor
+			// validation waits for the completed frame's covered rows.
+			return;
+		}
+		const screen = this.alternateScreenState();
+		this.graphics.validateAlternateScreen(screen.textAt, false);
+	}
+
+	private completePendingWrites(pending: readonly PendingWrite[]): void {
+		for (const item of pending) {
+			if (this.disposed) {
+				return;
+			}
+			if (this.pendingWrites.shift() !== item) {
+				throw new Error("TerminalSurface pending-write order was corrupted");
+			}
+			this.pendingBytes -= item.size;
+			item.resolve();
+			this.updateBackpressure();
+			this.accountSyncFrameWrite(item.size);
+		}
+	}
+
+	/** Bound a held frame by child bytes and chunks; overflow ends the hold. */
+	private accountSyncFrameWrite(size: number): void {
+		const frame = this.syncFrame;
+		if (!frame || this.disposed) {
+			return;
+		}
+		frame.bytes += size;
+		frame.writes += 1;
+		if (frame.bytes > MAX_SYNC_FRAME_BYTES || frame.writes > MAX_SYNC_FRAME_WRITES) {
+			this.endSyncFrame("abort");
+		}
+	}
+
+	/**
+	 * Apply typed DECSET/DECRST observations in parameter order. A frame
+	 * marker must be the exact numeric parameter 2026: colon sub-parameter
+	 * forms (for example `CSI ? 2026 : 1 h`) are not a supported marker and
+	 * never open or close a held frame. Cursor visibility and buffer-switch
+	 * observation keep following xterm, which acts on the leading value.
+	 */
+	private observePrivateModes(params: (number | number[])[], set: boolean): void {
+		for (let index = 0; index < params.length; index += 1) {
+			const mode = params[index];
+			if (typeof mode !== "number") {
+				// xterm delivers a parameter's colon sub-parameters as the
+				// following array entry; they are never mode numbers themselves.
+				continue;
+			}
+			const exact = !Array.isArray(params[index + 1]);
+			if (mode === 25) {
+				this.cursorVisible = set;
+			} else if (mode === SYNCHRONIZED_OUTPUT_MODE) {
+				if (!exact) {
+					continue;
+				}
+				if (set) {
+					this.openSyncFrame();
+				} else if (this.syncFrame) {
+					this.endSyncFrame("complete");
+				}
+			} else if ((BUFFER_SWITCH_MODES as readonly number[]).includes(mode) && this.syncFrame) {
+				// Runs before xterm switches buffers: provisional anchors of the
+				// buffer being left can never be completed, so they are dropped.
+				this.endSyncFrame("discard");
+			}
+		}
+	}
+
+	/**
+	 * Open a held frame (parser-hook time, exact stream position). Repeated
+	 * begin markers are idempotent like DECSET; the hold stays bounded by the
+	 * first open's timer and byte/count limits.
+	 */
+	private openSyncFrame(): void {
+		if (this.syncFrame || this.disposed || this.parseFailed) {
+			return;
+		}
+		// Settle everything parsed before the marker exactly as a write
+		// boundary would, so the committed snapshot is a coherent state.
+		this.applyPendingAlternateGraphicsInvalidation();
+		this.graphics.validateAlternateScreen(this.alternateScreenState().textAt, false);
+		const committed = this.liveFrame();
+		// Captured before `syncFrame` is set, so its mouse fields are the
+		// child's actual request (see requestedMouseReporting()).
+		const committedModes = this.inputModesState();
+		this.graphics.retainPublished(committed.graphics, this.terminal.buffer.active.type);
+		this.graphics.beginDeferredAlternateAnchors();
+		const timer = setTimeout(() => this.expireSyncFrame(), MAX_SYNC_FRAME_MS);
+		timer.unref?.();
+		this.syncFrame = {
+			committed,
+			committedRevision: this.graphics.revision,
+			committedModes,
+			timer,
+			bytes: 0,
+			writes: 0,
+		};
+	}
+
+	/**
+	 * Stop holding. `complete` (a parsed end marker) and `abort` (time/byte/
+	 * count bound, DECSTR) anchor provisional placements against the alternate
+	 * cells as they are now and validate older anchors against them; `discard`
+	 * (buffer switch, RIS) removes provisional placements instead. Notification
+	 * is left to the caller's post-parse path.
+	 */
+	private endSyncFrame(mode: "complete" | "abort" | "discard"): void {
+		const frame = this.syncFrame;
+		if (!frame) {
+			return;
+		}
+		this.syncFrame = undefined;
+		clearTimeout(frame.timer);
+		this.applyPendingAlternateGraphicsInvalidation();
+		if (mode === "discard") {
+			this.graphics.discardDeferredAlternateAnchors();
+		} else {
+			const textAt = this.alternateScreenState().textAt;
+			this.graphics.finalizeDeferredAlternateAnchors(textAt);
+			this.graphics.validateAlternateScreen(textAt, false);
+		}
+		this.graphics.releasePublished();
+	}
+
+	/** Drop a held frame without anchoring (resize, parse failure, disposal). */
+	private cancelSyncFrame(): void {
+		if (this.syncFrame) {
+			this.endSyncFrame("discard");
+		}
+	}
+
+	private expireSyncFrame(): void {
+		if (this.disposed || !this.syncFrame) {
+			return;
+		}
+		// xterm parses each write synchronously, so a timer always observes a
+		// write boundary. The in-flight pipeline notifies after its own write.
+		this.endSyncFrame("abort");
+		if (!this.processingWrite) {
+			this.invalidate();
+		}
+	}
+
+	/** Alternate anchors require per-chunk validation, including across buffer switches. */
+	private hasAlternateGraphicsPlacements(): boolean {
+		const buffer = this.terminal.buffer.alternate;
+		const graphics = this.graphics.frame("alternate", buffer.viewportY, this.terminal.cols, this.terminal.rows);
+		return (graphics?.placements.length ?? 0) > 0 || (graphics?.fallbacks.length ?? 0) > 0;
+	}
+
+	private writeToTerminal(data: string): Promise<void> {
+		if (this.disposed || data.length === 0) {
+			return Promise.resolve();
+		}
+		return new Promise<void>((resolve, reject) => {
+			let settled = false;
+			const settle = () => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				if (this.activeTerminalWriteResolve === settle) {
+					this.activeTerminalWriteResolve = undefined;
+				}
+				resolve();
+			};
+			const fail = () => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				if (this.activeTerminalWriteResolve === settle) {
+					this.activeTerminalWriteResolve = undefined;
+				}
+				reject(new Error("TerminalSurface terminal parser failed"));
+			};
+			this.activeTerminalWriteResolve = settle;
+			try {
+				this.terminal.write(data, settle);
+			} catch {
+				fail();
+			}
+		});
+	}
+
+	private applyPendingAlternateGraphicsInvalidation(): void {
+		if (!this.pendingAlternateGraphicsInvalidation) {
+			return;
+		}
+		this.pendingAlternateGraphicsInvalidation = false;
+		this.graphics.validateAlternateScreen(undefined, true);
+	}
+
+	private graphicsPosition(command: string): TerminalGraphicsPosition {
+		const buffer = this.terminal.buffer.active;
+		const alternateScreen = buffer.type === "alternate" ? this.alternateScreenState() : undefined;
+		const marker = KittyGraphicsState.needsPosition(command) && buffer.type === "normal"
+			? this.terminal.registerMarker(0)
+			: undefined;
+		return {
+			buffer: buffer.type,
+			column: buffer.cursorX,
+			row: buffer.baseY + buffer.cursorY,
+			...(alternateScreen === undefined ? {} : {
+				alternateTextAt: alternateScreen.textAt,
+			}),
+			cols: this.terminal.cols,
+			rows: this.terminal.rows,
+			...(marker === undefined ? {} : { marker }),
+		};
+	}
+
+	private alternateScreenState(): {
+		readonly textAt: (row: number, column: number, width: number) => string;
+	} {
+		const buffer = this.terminal.buffer.alternate;
+		return {
+			textAt: (row, column, width) => buffer.getLine(buffer.viewportY + row)
+				?.translateToString(false, column, column + width) ?? "",
+		};
 	}
 
 	private assertNotDisposed(): void {
@@ -892,12 +1589,6 @@ export class TerminalSurface {
 		}
 	}
 
-	private paramsContain(params: (number | number[])[], value: number): boolean {
-		return params.some((param) =>
-			param === value || (Array.isArray(param) && param[0] === value)
-		);
-	}
-
 	/**
 	 * Tracks only xterm's actual DECSET/DECRST mouse encodings. DECSET uses
 	 * the last relevant parameter (1006 = SGR, 1016 = SGR pixels); DECRST of
@@ -946,21 +1637,46 @@ export class TerminalSurface {
 		// The invalidation key covers the frame and the input-mode state, so
 		// mode-only changes (bracketed paste, cursor keys, mouse tracking,
 		// kitty flags) still notify the host — after the parse completes.
-		const key = JSON.stringify(this.frame()) + "|" + JSON.stringify(this.inputModesState());
+		const frame = this.frame();
+		const revision = this.syncFrame?.committedRevision ?? this.graphics.revision;
+		const { graphics, ...textFrame } = frame;
+		const graphicsKey = graphics
+			? {
+				revision,
+				images: graphics.images.map(({ id, mimeType, widthPx, heightPx }) => ({ id, mimeType, widthPx, heightPx })),
+				placements: graphics.placements,
+				fallbacks: graphics.fallbacks,
+			}
+			: { revision };
+		// While a frame is held the key is the committed state only, so mode
+		// changes inside an incomplete frame do not notify until it commits.
+		const modes = this.syncFrame?.committedModes ?? this.inputModesState();
+		const key = JSON.stringify(textFrame) + "|" + JSON.stringify(graphicsKey)
+			+ "|" + JSON.stringify(modes);
 		if (key !== this.lastInvalidateKey) {
 			this.lastInvalidateKey = key;
 			this.safePeerInvoke(() => this.options.onChange?.());
 		}
 	}
 
+	/**
+	 * Keyboard protocol state is always the child's latest parsed state (the
+	 * child already switched; delaying would mis-encode keys). Mouse reporting
+	 * is withheld (`none`) for the whole time a synchronized frame is held:
+	 * the displayed committed frame and the child's partially redrawn screen
+	 * may disagree about what is under any cell, so no click is forwarded
+	 * until the frame commits (or a bound ends the hold). Revocation therefore
+	 * also takes effect immediately.
+	 */
 	private inputModesState(): TerminalInputModes {
 		const modes = this.terminal.modes;
+		const mouseHeldBack = this.syncFrame !== undefined;
 		return {
 			kittyFlags: this.effectiveKittyFlags(),
 			applicationCursorKeys: modes.applicationCursorKeysMode,
 			applicationKeypad: modes.applicationKeypadMode,
 			bracketedPaste: modes.bracketedPasteMode,
-			mouseTracking: modes.mouseTrackingMode,
+			mouseTracking: mouseHeldBack ? "none" : modes.mouseTrackingMode,
 			modifyOtherKeys: this.modifyOtherKeys,
 			mouseEncoding: this.mouseEncoding,
 		};

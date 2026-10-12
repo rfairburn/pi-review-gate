@@ -10,6 +10,7 @@ import {
   composeFreshSessionSpawnArgs,
   prepareNativeLaunch,
 } from "./launch";
+import { createTerminalGraphicsBudget, type TerminalGraphicsBudget } from "./kitty-graphics";
 import { TerminalSurface } from "./terminal-surface";
 import {
 	hasCompleteSessionIdle,
@@ -293,6 +294,8 @@ export interface InstanceManagerOptions {
 	rows?: number;
 	/** Kitty keyboard flags support passed through to each terminal surface. */
 	getSupportedKeyboardFlags?: () => number;
+	/** Optional manager-wide graphics budget shared by every owned terminal surface. */
+	graphicsBudget?: TerminalGraphicsBudget;
 	/** Called with an instance id whenever that row changed (frontend hook). */
 	onChange?: (instanceId: string) => void;
 	/** Host-owned routing for reporter requests; the parent id is supplied by the manager, never by model input. */
@@ -650,6 +653,7 @@ export class InstanceManager {
 	#cols: number;
 	#rows: number;
 	readonly #getSupportedKeyboardFlags?: () => number;
+	readonly #graphicsBudget: TerminalGraphicsBudget;
 	readonly #onChange?: (instanceId: string) => void;
 	readonly #onSpawnRequest?: (parentInstanceId: string, request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
 	readonly #getSidebarTitleColumns?: () => number;
@@ -692,6 +696,7 @@ export class InstanceManager {
 		this.#nativeSetup = options.nativeSetup ?? true;
 		this.#profilePreparer = options.profileRegistry ?? new NativeAgentRegistry({ env: this.#env });
 		this.#getSupportedKeyboardFlags = options.getSupportedKeyboardFlags;
+		this.#graphicsBudget = options.graphicsBudget ?? createTerminalGraphicsBudget();
 		this.#onChange = options.onChange;
 		this.#onSpawnRequest = options.onSpawnRequest;
 		this.#getSidebarTitleColumns = options.getSidebarTitleColumns;
@@ -1354,6 +1359,7 @@ export class InstanceManager {
 					onChange: () => this.#safeChanged(record.id),
 					onBackpressure: (paused) => this.#onBackpressure(record, paused),
 					getSupportedKeyboardFlags: this.#getSupportedKeyboardFlags,
+					graphicsBudget: this.#graphicsBudget,
 				});
 				if (!record.ptyExited) {
 					record.readErrorDisposable = subscribePtyReadErrors(pty, () => this.#onPtyReadError(record));

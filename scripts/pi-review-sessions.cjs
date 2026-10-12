@@ -9,17 +9,19 @@
  * implementation is not proof of native runtime support; real ConPTY and
  * lifecycle validation remains a parent-owned Windows task.
  *
- * - Source checkouts are copied to a fresh stage, install unchanged
- *   package-lock dependencies with npm ci, then compile there with the
- *   stage's own installed TypeScript CLI (`tsc -p tsconfig.json`) through
- *   public Node directly. The package's own build script is never run, so
- *   its recursive `clean:build` removal can never touch the stage or the
- *   live checkout. DDGS
- *   provisioning uses the shared Node helper (ensureDdgs in scripts/
- *   pi-review-gate-launcher.cjs) in a bounded owned process. Automatic stage
- *   cleanup is disabled because root identity does not prove ownership of
- *   npm/build/runtime descendants and complete per-entry creation receipts
- *   with BigInt identities are not recorded.
+ * - Source checkouts use a content-derived identity of the exact staged
+ *   package/source paths and build toolchain. A completed privately staged
+ *   build can be reused only after bounded no-follow manifest and content
+ *   validation; otherwise inputs are copied to a fresh stage, locked
+ *   dependencies are installed with npm ci, and the stage's own TypeScript
+ *   CLI compiles through public Node directly. Untracked Node preload/loader
+ *   hooks and external dependency modes bypass reuse. The package's own build
+ *   script is never run, so recursive `clean:build` cannot touch the stage or
+ *   live checkout. DDGS provisioning uses the shared Node helper (ensureDdgs
+ *   in scripts/pi-review-gate-launcher.cjs) in a bounded owned process.
+ *   Automatic stage cleanup is disabled because root identity does not prove
+ *   ownership of npm/build/runtime descendants and complete per-entry creation
+ *   receipts with BigInt identities are not recorded.
  * - Runtime selection resolves the public @earendil-works/pi-coding-agent
  *   CLI without parsing or executing opaque shims: an explicit
  *   --pi-executable Node entry is honored when valid; otherwise the npm
@@ -63,7 +65,10 @@ isolated Pi 1.1.0 runtime cache under the native Pi agent directory; no
 manual Pi CLI path is needed. Starts an empty welcome/sidebar picker; choose
 a workspace explicitly in the UI.
 The startup working directory is not selected as a workspace.
-Basic controls only; terminal graphics rendering is disabled.
+Basic controls only; bounded native Kitty PNG rendering targets direct Ghostty
+(TERM_PROGRAM=ghostty, TERM=xterm-ghostty, no tmux/screen).
+Unsupported image display uses native-style text where metadata is available.
+Physical Ghostty acceptance remains pending; see docs/session-host-alpha.md.
 Native image/model input behavior stays native. Host toggle/roster-return shortcuts default
 to alt+left/alt+right and can be configured in session-host/keybindings.json. Parent startup session overrides
 (--continue/-c, --resume/-r, --session, --session-id, --fork, --session-dir,
@@ -120,8 +125,17 @@ const NODE_ENTRY_HEAD_BYTES = 512;
 const MAX_SOURCE_DEPTH = 64;
 const MAX_SOURCE_FILES = 100_000;
 const MAX_SOURCE_BYTES = 2 * 1024 * 1024 * 1024;
+const MAX_SOURCE_FINGERPRINT_METADATA_BYTES = 32 * 1024 * 1024;
 const SOURCE_COPY_CHUNK_BYTES = 64 * 1024;
+const SOURCE_CACHE_MANIFEST = ".pi-review-gate-source-build.json";
+const MAX_SOURCE_CACHE_RECORD_BYTES = 16 * 1024;
+const MAX_CACHE_ENTRIES = 100_000;
+const MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024;
+const MAX_CACHE_MANIFEST_BYTES = 64 * 1024 * 1024;
+const CACHE_SCAN_TIMEOUT_MS = 10_000;
+const MAX_TOOLCHAIN_FILE_BYTES = 512 * 1024 * 1024;
 let activeBoundedProcessCount = 0;
+let cachedNodeToolchainIdentity;
 
 class SessionHostArgumentError extends Error {}
 class PiRuntimeError extends Error {}
@@ -393,8 +407,8 @@ function sameFileIdentity(file, identity) {
   }
 }
 
-function sourceCopyBudget() {
-  return { files: 0, bytes: 0, entries: 0, startedAt: Date.now(), directories: [] };
+function sourceCopyBudget(testHooks) {
+  return { files: 0, bytes: 0, entries: 0, startedAt: Date.now(), directories: [], testHooks };
 }
 
 function assertSourceCopyWithinBounds(budget) {
@@ -418,14 +432,17 @@ function copySourceFile(source, destination, budget) {
   let destinationFd;
   try {
     const opened = fs.fstatSync(sourceFd, { bigint: true });
-    if (!opened.isFile() || !sameStatIdentity(before, opened)
-      || !sameStatIdentity(before, lstatRegularFile(source))) throw new Error("source file changed during staging");
+    if (!opened.isFile() || !sameFileSnapshot(before, opened)
+      || !sameFileSnapshot(before, lstatRegularFile(source))) throw new Error("source file changed during staging");
     assertSourceCopyWithinBounds(budget);
     destinationFd = fs.openSync(destination, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow, 0o600);
     const destinationOpened = fs.fstatSync(destinationFd, { bigint: true });
     if (!destinationOpened.isFile() || !hasPositiveIdentity(destinationOpened)
       || !sameStatIdentity(destinationOpened, lstatRegularFile(destination))) {
       throw new Error("staged file identity is unavailable");
+    }
+    if (typeof budget.testHooks?.beforeSourceCopyRead === "function") {
+      budget.testHooks.beforeSourceCopyRead(source, destination);
     }
     const buffer = Buffer.alloc(SOURCE_COPY_CHUNK_BYTES);
     let position = 0;
@@ -442,11 +459,13 @@ function copySourceFile(source, destination, budget) {
       position += read;
       budget.bytes += read;
     }
+    if (typeof budget.testHooks?.afterSourceCopyRead === "function") {
+      budget.testHooks.afterSourceCopyRead(source, destination);
+    }
     const after = fs.fstatSync(sourceFd, { bigint: true });
     assertSourceCopyWithinBounds(budget);
-    if (!sameStatIdentity(before, after)
-      || !sameStatIdentity(after, lstatRegularFile(source))
-      || before.size !== after.size) throw new Error("source file changed during staging");
+    if (!sameFileSnapshot(before, after)
+      || !sameFileSnapshot(after, lstatRegularFile(source))) throw new Error("source file changed during staging");
     // POSIX execute/mode bits preserve source metadata for the local build.
     // Windows uses its ordinary inherited ACLs; Node mode bits are not a
     // privacy control there and are not treated as one.
@@ -457,7 +476,7 @@ function copySourceFile(source, destination, budget) {
     const destinationAfter = fs.fstatSync(destinationFd, { bigint: true });
     const destinationPathStats = lstatRegularFile(destination);
     if (!sameStatIdentity(destinationOpened, destinationAfter)
-      || !sameStatIdentity(destinationAfter, destinationPathStats)
+      || !sameFileSnapshot(destinationAfter, destinationPathStats)
       || destinationAfter.size !== before.size) {
       throw new Error("staged file changed before publication");
     }
@@ -519,20 +538,231 @@ function copySourceDirectory(source, destination, budget, depth, ownedStage) {
   }
 }
 
+function sourceFingerprintBudget(testHooks) {
+  return {
+    entries: 0,
+    files: 0,
+    bytes: 0,
+    metadataBytes: 0,
+    startedAt: Date.now(),
+    directories: [],
+    directorySnapshots: [],
+    fileSnapshots: [],
+    linkSnapshots: [],
+    activeDirectories: [],
+    testHooks,
+  };
+}
+
+function addSourceFingerprintEntry(entries, budget, entry) {
+  budget.metadataBytes += Buffer.byteLength(JSON.stringify(entry), "utf8") + 1;
+  if (budget.metadataBytes > MAX_SOURCE_FINGERPRINT_METADATA_BYTES) throw new Error("source fingerprint metadata limit exceeded");
+  entries.push(entry);
+}
+
+function assertFingerprintWithinBounds(budget) {
+  if (Date.now() - budget.startedAt > CACHE_SCAN_TIMEOUT_MS) throw new Error("source fingerprint elapsed deadline exceeded");
+  if (budget.entries > MAX_SOURCE_FILES || budget.files > MAX_SOURCE_FILES || budget.bytes > MAX_SOURCE_BYTES) {
+    throw new Error("source fingerprint limit exceeded");
+  }
+  if (!directoryChainIsSame(budget.activeDirectories)) throw new Error("source directory changed during fingerprinting");
+}
+
+function sameFileSnapshot(left, right) {
+  return sameStatIdentity(left, right)
+    && left.size === right.size
+    && left.mode === right.mode
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
+
+function verifyFingerprintSnapshots(budget, message = "source file changed during fingerprinting") {
+  for (const snapshot of budget.fileSnapshots) {
+    assertFingerprintWithinBounds(budget);
+    if (!directoryChainIsSame(snapshot.ancestors)) throw new Error(message);
+    let current;
+    try { current = lstatRegularFile(snapshot.target); } catch { throw new Error(message); }
+    if (!sameFileSnapshot(snapshot.stats, current) || !directoryChainIsSame(snapshot.ancestors)) throw new Error(message);
+  }
+  for (const snapshot of budget.linkSnapshots) {
+    assertFingerprintWithinBounds(budget);
+    if (!directoryChainIsSame(snapshot.ancestors)) throw new Error("toolchain link changed during identity check");
+    let current;
+    try { current = fs.lstatSync(snapshot.target, { bigint: true }); } catch { throw new Error("toolchain link changed during identity check"); }
+    if (!current.isSymbolicLink() || !sameFileSnapshot(snapshot.stats, current)
+      || !directoryChainIsSame(snapshot.ancestors)) throw new Error("toolchain link changed during identity check");
+  }
+  for (const { target, stats, ancestors } of budget.directorySnapshots) {
+    assertFingerprintWithinBounds(budget);
+    if (!directoryChainIsSame(ancestors)) throw new Error("source directory changed during fingerprinting");
+    let current;
+    try { current = fs.lstatSync(target, { bigint: true }); } catch { throw new Error("source directory changed during fingerprinting"); }
+    if (!sameFileSnapshot(stats, current) || !directoryChainIsSame(ancestors)) {
+      throw new Error("source directory changed during fingerprinting");
+    }
+  }
+}
+
+/** Hash one no-follow regular file while fencing its BigInt identity and content metadata. */
+function hashFileForFingerprint(file, budget) {
+  assertFingerprintWithinBounds(budget);
+  const before = lstatRegularFile(file);
+  if (before.size > BigInt(MAX_SOURCE_BYTES - budget.bytes)) throw new Error("source fingerprint byte limit exceeded");
+  budget.files += 1;
+  if (budget.files > MAX_SOURCE_FILES) throw new Error("source fingerprint file limit exceeded");
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = fs.fstatSync(fd, { bigint: true });
+    if (!opened.isFile() || !sameFileSnapshot(before, opened)
+      || !sameFileSnapshot(before, lstatRegularFile(file))) throw new Error("source file changed before fingerprinting");
+    const hash = crypto.createHash("sha256");
+    const chunk = Buffer.alloc(SOURCE_COPY_CHUNK_BYTES);
+    let position = 0;
+    for (;;) {
+      assertFingerprintWithinBounds(budget);
+      const count = fs.readSync(fd, chunk, 0, chunk.length, position);
+      if (count === 0) break;
+      budget.bytes += count;
+      if (budget.bytes > MAX_SOURCE_BYTES) throw new Error("source fingerprint byte limit exceeded");
+      hash.update(chunk.subarray(0, count));
+      position += count;
+    }
+    const after = fs.fstatSync(fd, { bigint: true });
+    if (!sameFileSnapshot(before, after)
+      || !sameFileSnapshot(after, lstatRegularFile(file))) throw new Error("source file changed during fingerprinting");
+    budget.fileSnapshots.push({ target: file, stats: after, ancestors: [...budget.activeDirectories] });
+    if (typeof budget.testHooks?.afterSourceFileHashed === "function") {
+      budget.testHooks.afterSourceFileHashed(file);
+    }
+    return { mode: Number(before.mode & 0o777n), size: before.size.toString(), digest: hash.digest("hex") };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** Content-derived identity of precisely the package files and trees staged for a source build. */
+function fingerprintSourcePackage(packageRoot, testHooks) {
+  const root = path.resolve(packageRoot);
+  const rootIdentity = identityOfDirectory(root);
+  const budget = sourceFingerprintBudget(testHooks);
+  budget.directories = [{ target: root, identity: rootIdentity }];
+  budget.activeDirectories = budget.directories;
+  const entries = [];
+  for (const name of ["package.json", "package-lock.json", "tsconfig.json"]) {
+    assertFingerprintWithinBounds(budget);
+    const file = path.join(root, name);
+    const item = hashFileForFingerprint(file, budget);
+    addSourceFingerprintEntry(entries, budget, { path: name, type: "file", mode: item.mode, size: item.size, digest: item.digest });
+  }
+
+  const visit = (source, relative, depth, ancestors) => {
+    if (depth > MAX_SOURCE_DEPTH) throw new Error("source fingerprint depth limit exceeded");
+    assertFingerprintWithinBounds(budget);
+    const before = fs.lstatSync(source, { bigint: true });
+    if (!before.isDirectory() || before.isSymbolicLink() || !hasPositiveIdentity(before)) {
+      throw new Error("source tree contains an unsafe directory");
+    }
+    const identity = { dev: before.dev, ino: before.ino };
+    const directoryEntry = { target: source, identity };
+    const chain = [...ancestors, directoryEntry];
+    const previousActiveDirectories = budget.activeDirectories;
+    budget.directorySnapshots.push({ target: source, stats: before, ancestors: chain });
+    budget.activeDirectories = chain;
+    addSourceFingerprintEntry(entries, budget, { path: relative, type: "dir", mode: Number(before.mode & 0o777n) });
+    let directory;
+    try {
+      assertFingerprintWithinBounds(budget);
+      directory = fs.opendirSync(source);
+      if (!sameDirectoryIdentity(source, identity)) throw new Error("source directory changed while fingerprinting");
+      for (;;) {
+        assertFingerprintWithinBounds(budget);
+        const entry = directory.readSync();
+        assertFingerprintWithinBounds(budget);
+        if (!entry) break;
+        budget.entries += 1;
+        if (budget.entries > MAX_SOURCE_FILES) throw new Error("source fingerprint entry limit exceeded");
+        const name = entry.name;
+        // Initialized Terraform trees are deliberately irrelevant and must be pruned before lstat or descent.
+        if (name === ".terraform") continue;
+        if (name.includes("\\")) throw new Error("source tree contains a non-portable path");
+        const child = path.join(source, name);
+        const childRelative = `${relative}/${name}`;
+        if (childRelative.length > MAX_PATH_LENGTH) throw new Error("source fingerprint path limit exceeded");
+        const stats = fs.lstatSync(child, { bigint: true });
+        if (!directoryChainIsSame(chain)) throw new Error("source directory changed during fingerprinting");
+        if (stats.isSymbolicLink()) throw new Error("source tree contains a symlink");
+        if (stats.isDirectory()) {
+          visit(child, childRelative, depth + 1, chain);
+        } else if (stats.isFile()) {
+          const item = hashFileForFingerprint(child, budget);
+          addSourceFingerprintEntry(entries, budget, { path: childRelative, type: "file", mode: item.mode, size: item.size, digest: item.digest });
+        } else {
+          throw new Error("source tree contains a special file");
+        }
+      }
+      assertFingerprintWithinBounds(budget);
+      const after = fs.lstatSync(source, { bigint: true });
+      if (!sameFileSnapshot(before, after)) throw new Error("source directory changed during fingerprinting");
+    } finally {
+      if (directory) closeDirectory(directory);
+      budget.activeDirectories = previousActiveDirectories;
+    }
+  };
+
+  for (const name of ["src", "scripts", "skills"]) visit(path.join(root, name), name, 0, budget.activeDirectories);
+  entries.sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
+  const serializedEntries = JSON.stringify({ schema: 1, entries });
+  if (Buffer.byteLength(serializedEntries, "utf8") > MAX_SOURCE_FINGERPRINT_METADATA_BYTES) {
+    throw new Error("source fingerprint metadata limit exceeded");
+  }
+  const digest = crypto.createHash("sha256").update(serializedEntries).digest("hex");
+  verifyFingerprintSnapshots(budget);
+  assertFingerprintWithinBounds(budget);
+  return {
+    digest,
+    entries: entries.length,
+    files: budget.files,
+    bytes: budget.bytes,
+    inventory: entries,
+    fence: {
+      directorySnapshots: budget.directorySnapshots,
+      fileSnapshots: budget.fileSnapshots,
+      linkSnapshots: budget.linkSnapshots,
+    },
+  };
+}
+
+function stagedSourceMatchesFingerprint(sourceFingerprint, stagedFingerprint) {
+  if (!sourceFingerprint || !Array.isArray(sourceFingerprint.inventory)
+    || !stagedFingerprint || !Array.isArray(stagedFingerprint.inventory)
+    || sourceFingerprint.inventory.length !== stagedFingerprint.inventory.length) return false;
+  for (let index = 0; index < sourceFingerprint.inventory.length; index += 1) {
+    const source = sourceFingerprint.inventory[index];
+    const staged = stagedFingerprint.inventory[index];
+    if (source.path !== staged.path || source.type !== staged.type
+      || source.size !== staged.size || source.digest !== staged.digest) return false;
+    if (process.platform !== "win32") {
+      const expectedMode = source.type === "dir" ? 0o700 : 0o600 | (source.mode & 0o111);
+      if (staged.mode !== expectedMode) return false;
+    }
+  }
+  return true;
+}
+
 /**
  * Stage only explicit build/runtime inputs into a fresh private root. Copies
  * are bounded and reject symlinks/special files; package-lock.json is copied
  * byte-for-byte, source .terraform directories are pruned before descent, and
  * the live checkout's node_modules/dist are never followed or copied.
  */
-function stageSourcePackage(packageRoot, buildCacheRoot) {
+function stageSourcePackage(packageRoot, buildCacheRoot, testHooks) {
   const ownedStage = createOwnedStage(buildCacheRoot, "pi-review-sessions-");
   try {
     const resolvedPackageRoot = path.resolve(packageRoot);
     const packageChain = process.platform === "win32"
       ? assertDirectoryChain(path.parse(resolvedPackageRoot).root, resolvedPackageRoot)
       : [{ target: resolvedPackageRoot, identity: identityOfDirectory(resolvedPackageRoot) }];
-    const budget = sourceCopyBudget();
+    const budget = sourceCopyBudget(testHooks);
     budget.directories = [
       ...packageChain,
       ...ownedStage.chain,
@@ -560,13 +790,13 @@ function stageSourcePackage(packageRoot, buildCacheRoot) {
   return ownedStage;
 }
 
-function stageNpmEnvironment(env, ownedStage) {
+function stageNpmEnvironment(env, ownedStage, setupRoot = ownedStage.root) {
   if (!directoryChainIsSame(ownedStage.chain)) throw new Error("staging directory chain changed");
   const npmPaths = {
-    cache: path.join(ownedStage.root, ".npm-cache"),
-    logs: path.join(ownedStage.root, ".npm-logs"),
-    temp: path.join(ownedStage.root, ".npm-tmp"),
-    home: path.join(ownedStage.root, ".home"),
+    cache: path.join(setupRoot, ".npm-cache"),
+    logs: path.join(setupRoot, ".npm-logs"),
+    temp: path.join(setupRoot, ".npm-tmp"),
+    home: path.join(setupRoot, ".home"),
   };
   for (const directory of Object.values(npmPaths)) fs.mkdirSync(directory, { mode: 0o700 });
   const ownEnv = { ...env };
@@ -581,8 +811,8 @@ function stageNpmEnvironment(env, ownedStage) {
     TEMP: npmPaths.temp,
     npm_config_cache: npmPaths.cache,
     npm_config_logs_dir: npmPaths.logs,
-    npm_config_userconfig: path.join(ownedStage.root, ".npmrc"),
-    npm_config_globalconfig: path.join(ownedStage.root, ".npm-globalrc"),
+    npm_config_userconfig: path.join(setupRoot, ".npmrc"),
+    npm_config_globalconfig: path.join(setupRoot, ".npm-globalrc"),
   });
   return ownEnv;
 }
@@ -936,20 +1166,128 @@ async function buildSourceExtension(options) {
   const { packageRoot, agentDir, env } = options;
   const executeNpm = options.runNpm || runNpm;
   const executeCompile = options.runCompile || runNodeJs;
+  const forceFresh = options.forceFresh === true;
   const sourceBuildTimeoutMs = Number.isFinite(options.sourceBuildTimeoutMs)
     ? options.sourceBuildTimeoutMs
     : SOURCE_BUILD_TIMEOUT_MS;
+  const buildCacheRoot = path.join(agentDir, RUNTIME_CACHE_DIRNAME, "build");
+  let sourceFingerprint;
+  let npmCli;
+  let cacheParentChain;
+  let cacheMetadata;
+  let toolchainFence;
+  let cacheLock;
+  let mayPublish = false;
   let ownedStage;
   try {
-    ownedStage = stageSourcePackage(packageRoot, path.join(agentDir, RUNTIME_CACHE_DIRNAME, "build"));
+    sourceFingerprint = fingerprintSourcePackage(packageRoot);
+    npmCli = findNpmCli(env);
+    if (!npmCli) throw new Error("npm is unavailable");
+    if (!forceFresh && sourceBuildCacheEligible(packageRoot, env)) {
+      try {
+        const toolchainIdentity = sourceBuildToolchainFingerprint(env, npmCli);
+        toolchainFence = toolchainIdentity.fence;
+        if (typeof options.testHooks?.afterToolchainFingerprint === "function") {
+          options.testHooks.afterToolchainFingerprint();
+        }
+        const toolchainFingerprint = toolchainIdentity.fingerprint;
+        const cacheKey = crypto.createHash("sha256")
+          .update(JSON.stringify({ schema: 1, sourceFingerprint: sourceFingerprint.digest, toolchainFingerprint }))
+          .digest("hex");
+        cacheMetadata = { cacheKey, sourceFingerprint: sourceFingerprint.digest, toolchainFingerprint };
+        cacheParentChain = ensureDirectoryTree(buildCacheRoot);
+      } catch {
+        // Unverifiable toolchain/configuration means a safe fresh build only.
+        cacheMetadata = undefined;
+      }
+    }
+
+    const returnCached = () => {
+      if (!cacheMetadata || !cacheParentChain) return undefined;
+      if (!verifyToolchainFence(toolchainFence)) return undefined;
+      const recordPath = sourceBuildCacheRecordPath(buildCacheRoot, cacheMetadata.cacheKey);
+      if (!pathExists(recordPath)) return undefined;
+      const candidate = readSourceBuildCacheRecord(recordPath, buildCacheRoot, cacheMetadata, cacheParentChain);
+      if (!candidate) return undefined;
+      const candidateRoot = candidate.root;
+      const chain = [...cacheParentChain, { target: candidateRoot, identity: candidate.identity }];
+      const cachedStage = {
+        root: candidateRoot,
+        identity: candidate.identity,
+        parentChain: cacheParentChain,
+        chain,
+      };
+      return {
+        status: 0,
+        stagingRoot: candidateRoot,
+        ownedStage: cachedStage,
+        sourceFingerprint: sourceFingerprint.digest,
+        toolchainFingerprint: cacheMetadata.toolchainFingerprint,
+        cacheKey: cacheMetadata.cacheKey,
+        cacheParentChain,
+        cacheHit: true,
+        cachePublished: false,
+        verificationEntries: candidate.manifest.entries.length,
+        ...(toolchainFence ? { toolchainFence } : {}),
+        ...(options.testHooks ? { testHooks: options.testHooks } : {}),
+      };
+    };
+
+    let cached = returnCached();
+    if (cached) return cached;
+    if (cacheMetadata && cacheParentChain && !forceFresh) {
+      const recordPath = sourceBuildCacheRecordPath(buildCacheRoot, cacheMetadata.cacheKey);
+      if (!pathExists(recordPath)) {
+        cacheLock = acquireSourceCacheLock(buildCacheRoot, cacheMetadata.cacheKey, cacheParentChain);
+        if (cacheLock) {
+          cached = returnCached();
+          if (cached) {
+            cacheLock.release();
+            cacheLock = undefined;
+            return cached;
+          }
+          mayPublish = !pathExists(recordPath);
+        } else {
+          // Another launcher owns publication. Never join its partial stage;
+          // a one-time completed-cache check is safe, otherwise build privately.
+          cached = returnCached();
+          if (cached) return cached;
+        }
+      }
+    }
   } catch (error) {
+    if (cacheLock) cacheLock.release();
+    return {
+      status: 1,
+      stage: "stage",
+      error: new Error(error && error.message === "npm is unavailable"
+        ? "npm is unavailable"
+        : "could not fingerprint the source package for building"),
+      diagnostics: formatStageErrorDiagnostics(error),
+      retainedStage: false,
+    };
+  }
+
+  try {
+    ownedStage = stageSourcePackage(packageRoot, buildCacheRoot, options.testHooks);
+  } catch (error) {
+    if (cacheLock) cacheLock.release();
     return { status: 1, stage: "stage", error: new Error("could not stage the source package for building"), retainedStage: Boolean(error && error.retainedStage) };
   }
   const stagingRoot = ownedStage.root;
   try {
-    const buildEnv = stageNpmEnvironment(env, ownedStage);
-    const npmCli = findNpmCli(env);
-    if (!npmCli) throw new Error("npm is unavailable");
+    if (typeof options.testHooks?.afterSourceStageCreated === "function") {
+      options.testHooks.afterSourceStageCreated(stagingRoot);
+    }
+    const setupStage = createOwnedStage(buildCacheRoot, "pi-review-sessions-setup-");
+    const buildEnv = stageNpmEnvironment(env, ownedStage, setupStage.root);
+    const stagedFingerprint = fingerprintSourcePackage(stagingRoot);
+    if (!stagedSourceMatchesFingerprint(sourceFingerprint, stagedFingerprint)) {
+      throw new Error("staged source inputs do not match the initially fingerprinted package");
+    }
+    const stagedInputFingerprint = fingerprintSourcePackage(packageRoot);
+    if (stagedInputFingerprint.digest !== sourceFingerprint.digest) throw new Error("source changed while preparing the staged build");
+    if (toolchainFence && !verifyToolchainFence(toolchainFence)) throw new Error("toolchain identity changed before npm ci");
     const install = await executeNpm(npmCli, ["ci", "--include=dev", "--ignore-scripts", "--no-audit", "--no-fund", "--registry", "https://registry.npmjs.org"], {
       cwd: stagingRoot,
       env: buildEnv,
@@ -974,6 +1312,7 @@ async function buildSourceExtension(options) {
       };
     }
     if (!directoryChainIsSame(ownedStage.chain)) throw new Error("staging directory chain changed");
+    if (toolchainFence && !verifyToolchainFence(toolchainFence)) throw new Error("toolchain identity changed during npm ci");
     if (pathExists(path.join(stagingRoot, "dist"))) throw new Error("staging root unexpectedly contains build output");
     // Compile with the staged locked install's own TypeScript CLI through
     // public Node directly: `-p <stage>/tsconfig.json`, no `npm run build`,
@@ -981,14 +1320,14 @@ async function buildSourceExtension(options) {
     // and no shell. The public package build scripts stay unchanged and the
     // live checkout (or any existing output) is never touched. The compiler
     // entry and its real ancestor chain are identity-checked first; the
-    // checks are not atomic openat containment and claim nothing of the sort.
+    // checks are not atomic openat containment and make no such claim.
     const compiler = resolveStageTypeScriptCli(stagingRoot);
-    // Fence the compiler immediately before dispatch: the stage and compiler
-    // directory chains and the compiler entry's own BigInt identity must all
-    // still match what admission observed.
     if (!directoryChainIsSame(ownedStage.chain) || !directoryChainIsSame(compiler.chain)
       || !sameFileIdentity(compiler.file, compiler.identity)) {
       throw new Error("staging directory chain changed before the TypeScript compile");
+    }
+    if (toolchainFence && !verifyToolchainFence(toolchainFence)) {
+      throw new Error("toolchain identity changed before the TypeScript compile");
     }
     const compile = await executeCompile(compiler.file, ["-p", compiler.tsconfig], {
       cwd: stagingRoot,
@@ -1017,7 +1356,68 @@ async function buildSourceExtension(options) {
       || !sameFileIdentity(compiler.file, compiler.identity)) {
       throw new Error("staging directory chain changed during the TypeScript compile");
     }
-    return { status: 0, stagingRoot, ownedStage };
+    if (toolchainFence && !verifyToolchainFence(toolchainFence)) {
+      throw new Error("toolchain identity changed during the TypeScript compile");
+    }
+    const finalFingerprint = fingerprintSourcePackage(packageRoot);
+    if (finalFingerprint.digest !== sourceFingerprint.digest) throw new Error("source changed during the staged build");
+    if (toolchainFence && !verifyToolchainFence(toolchainFence)) throw new Error("toolchain identity changed during the staged build");
+
+    let cachePublished = false;
+    let verificationEntries;
+    let verificationBytes;
+    if (cacheMetadata && cacheParentChain && mayPublish && cacheLock) {
+      let manifest;
+      try {
+        manifest = writeSourceBuildManifest(stagingRoot, cacheMetadata);
+      } catch {
+        // A cache that cannot be inventoried within strict bounds is simply
+        // non-reusable; this just-built stage remains available for this run.
+      }
+      if (manifest) {
+        const recordPath = sourceBuildCacheRecordPath(buildCacheRoot, cacheMetadata.cacheKey);
+        if (directoryChainIsSame(cacheParentChain) && directoryChainIsSame(ownedStage.chain)
+          && !pathExists(recordPath)) {
+          try {
+            if (typeof options.testHooks?.beforeCacheRecord === "function") {
+              options.testHooks.beforeCacheRecord(recordPath, stagingRoot);
+            }
+            const recordIdentity = writeSourceBuildCacheRecord(recordPath, buildCacheRoot, cacheMetadata, ownedStage, cacheParentChain);
+            const visibleRecord = readSourceBuildCacheRecord(recordPath, buildCacheRoot, cacheMetadata, cacheParentChain);
+            if (!visibleRecord || visibleRecord.recordIdentity.dev !== recordIdentity.dev
+              || visibleRecord.recordIdentity.ino !== recordIdentity.ino
+              || visibleRecord.identity.dev !== ownedStage.identity.dev
+              || visibleRecord.identity.ino !== ownedStage.identity.ino) {
+              throw new Error("exclusive source cache record failed post-publication validation");
+            }
+            cachePublished = true;
+            verificationEntries = manifest.entries.length;
+            verificationBytes = manifest.entries.reduce((sum, entry) => sum + Number(entry.size || 0), 0);
+          } catch {
+            // Exclusive record creation never replaces an existing target.
+            // A competing or partial record is preserved with this fresh stage.
+          }
+        }
+      }
+    }
+    const result = {
+      status: 0,
+      stagingRoot: ownedStage.root,
+      ownedStage,
+      sourceFingerprint: sourceFingerprint.digest,
+      ...(toolchainFence ? { toolchainFence } : {}),
+      ...(cacheMetadata ? {
+        toolchainFingerprint: cacheMetadata.toolchainFingerprint,
+        cacheKey: cacheMetadata.cacheKey,
+        cacheParentChain,
+      } : {}),
+      cacheHit: false,
+      cachePublished,
+      ...(options.testHooks ? { testHooks: options.testHooks } : {}),
+      ...(verificationEntries !== undefined ? { verificationEntries } : {}),
+      ...(verificationBytes !== undefined ? { verificationBytes } : {}),
+    };
+    return result;
   } catch (error) {
     const cleanupUnconfirmed = Boolean(error && error.cleanupUnconfirmed);
     const removed = !cleanupUnconfirmed && removeOwnedStage(ownedStage);
@@ -1029,6 +1429,8 @@ async function buildSourceExtension(options) {
       diagnostics: formatStageErrorDiagnostics(error),
       retainedStage: !removed,
     };
+  } finally {
+    if (cacheLock) cacheLock.release();
   }
 }
 
@@ -1360,6 +1762,732 @@ function findNpmCli(env) {
     }
   }
   return undefined;
+}
+
+function sourceBuildNpmPackage(npmCli) {
+  let directory;
+  try { directory = path.dirname(fs.realpathSync(npmCli)); } catch { return undefined; }
+  for (let depth = 0; depth < 16; depth += 1) {
+    const manifestPath = path.join(directory, "package.json");
+    if (pathExists(manifestPath)) {
+      try {
+        const manifest = JSON.parse(readBoundedRegularFile(manifestPath, MAX_MANIFEST_BYTES).toString("utf8"));
+        if (manifest && manifest.name === "npm" && parseStableVersion(manifest.version)) {
+          identityOfDirectory(directory);
+          return { root: directory, version: manifest.version };
+        }
+      } catch {
+        // A malformed package manifest is not a positive npm identity.
+      }
+    }
+    const parent = path.dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
+  return undefined;
+}
+
+function toolchainFileIdentity(file, maxBytes = MAX_TOOLCHAIN_FILE_BYTES) {
+  const absolute = fs.realpathSync(file);
+  const before = lstatRegularFile(absolute);
+  if (before.size > BigInt(maxBytes)) throw new Error("toolchain file exceeds the bounded identity size");
+  const cacheKey = [absolute, before.dev, before.ino, before.size, before.mode, before.mtimeNs, before.ctimeNs].join(":");
+  const parentChain = assertDirectoryChain(path.parse(absolute).root, path.dirname(absolute));
+  if (absolute === fs.realpathSync(process.execPath)
+    && cachedNodeToolchainIdentity && cachedNodeToolchainIdentity.cacheKey === cacheKey) {
+    return {
+      ...cachedNodeToolchainIdentity.identity,
+      fence: { target: absolute, stats: before, ancestors: parentChain },
+    };
+  }
+  const budget = sourceFingerprintBudget();
+  budget.directories = parentChain;
+  budget.activeDirectories = budget.directories;
+  const fileHash = hashFileForFingerprint(absolute, budget);
+  const after = lstatRegularFile(absolute);
+  if (!sameFileSnapshot(before, after)) throw new Error("toolchain file changed during identity check");
+  verifyFingerprintSnapshots(budget, "toolchain file changed during identity check");
+  const identity = {
+    path: absolute,
+    dev: before.dev.toString(),
+    ino: before.ino.toString(),
+    size: before.size.toString(),
+    mode: Number(before.mode & 0o777n),
+    digest: fileHash.digest,
+  };
+  if (absolute === fs.realpathSync(process.execPath)) cachedNodeToolchainIdentity = { cacheKey, identity };
+  return { ...identity, fence: { target: absolute, stats: after, ancestors: parentChain } };
+}
+
+function fingerprintNpmImplementation(packageRoot) {
+  const root = path.resolve(packageRoot);
+  const rootStats = fs.lstatSync(root, { bigint: true });
+  if (!rootStats.isDirectory() || rootStats.isSymbolicLink() || !hasPositiveIdentity(rootStats)) {
+    throw new Error("npm implementation root is unsafe");
+  }
+  const rootChain = assertDirectoryChain(path.parse(root).root, root);
+  const rootIdentity = { dev: rootStats.dev, ino: rootStats.ino };
+  if (rootChain.at(-1)?.identity.dev !== rootIdentity.dev || rootChain.at(-1)?.identity.ino !== rootIdentity.ino) {
+    throw new Error("npm implementation root changed while admitting its path");
+  }
+  const budget = sourceFingerprintBudget();
+  budget.directories = rootChain;
+  budget.activeDirectories = budget.directories;
+  const entries = [];
+  const visit = (directory, relativeDirectory, depth, ancestors) => {
+    if (depth > MAX_SOURCE_DEPTH) throw new Error("npm implementation depth limit exceeded");
+    assertFingerprintWithinBounds(budget);
+    const before = fs.lstatSync(directory, { bigint: true });
+    if (!before.isDirectory() || before.isSymbolicLink() || !hasPositiveIdentity(before)
+      || (relativeDirectory === "" && !sameFileSnapshot(rootStats, before))) {
+      throw new Error("npm implementation contains an unsafe or changed directory");
+    }
+    const current = { target: directory, identity: { dev: before.dev, ino: before.ino } };
+    const chain = [...ancestors, current];
+    const previousActiveDirectories = budget.activeDirectories;
+    budget.activeDirectories = chain;
+    budget.directorySnapshots.push({ target: directory, stats: before, ancestors: chain });
+    if (relativeDirectory !== "") {
+      addSourceFingerprintEntry(entries, budget, {
+        path: relativeDirectory,
+        type: "directory",
+        mode: Number(before.mode & 0o777n),
+      });
+    }
+    let handle;
+    try {
+      assertFingerprintWithinBounds(budget);
+      handle = fs.opendirSync(directory);
+      if (!sameDirectoryIdentity(directory, current.identity)) throw new Error("npm implementation directory changed while opening");
+      for (;;) {
+        assertFingerprintWithinBounds(budget);
+        const entry = handle.readSync();
+        assertFingerprintWithinBounds(budget);
+        if (!entry) break;
+        budget.entries += 1;
+        if (budget.entries > MAX_SOURCE_FILES) throw new Error("npm implementation entry limit exceeded");
+        const name = entry.name;
+        if (name === ".terraform") throw new Error("npm implementation contains an excluded Terraform subtree");
+        if (name.includes("\\")) throw new Error("npm implementation contains a non-portable path");
+        const absolute = path.join(directory, name);
+        const relative = relativeDirectory ? `${relativeDirectory}/${name}` : name;
+        if (relative.length > MAX_PATH_LENGTH) throw new Error("npm implementation path limit exceeded");
+        if (!directoryChainIsSame(chain)) throw new Error("npm implementation directory changed during fingerprinting");
+        const stats = fs.lstatSync(absolute, { bigint: true });
+        if (!hasPositiveIdentity(stats)) throw new Error("npm implementation entry identity is unavailable");
+        if (stats.isSymbolicLink()) {
+          const target = fs.readlinkSync(absolute);
+          if (target.length === 0 || target.length > MAX_PATH_LENGTH || path.isAbsolute(target)
+            || /[\u0000-\u001f\u007f]/u.test(target)) throw new Error("npm implementation contains an unsafe link");
+          const targetPath = path.resolve(path.dirname(absolute), target);
+          if (!pathIsWithin(root, targetPath)) throw new Error("npm implementation link escapes its package");
+          const targetRelative = path.relative(root, targetPath).split(path.sep).join("/");
+          const targetStats = lstatRegularFile(targetPath);
+          const after = fs.lstatSync(absolute, { bigint: true });
+          if (!sameFileSnapshot(stats, after) || !sameFileSnapshot(targetStats, lstatRegularFile(targetPath))) {
+            throw new Error("npm implementation link changed during fingerprinting");
+          }
+          budget.linkSnapshots.push({ target: absolute, stats: after, ancestors: [...chain] });
+          addSourceFingerprintEntry(entries, budget, {
+            path: relative,
+            type: "symlink",
+            mode: Number(stats.mode & 0o777n),
+            target: targetRelative,
+          });
+        } else if (stats.isDirectory()) {
+          visit(absolute, relative, depth + 1, chain);
+        } else if (stats.isFile()) {
+          const item = hashFileForFingerprint(absolute, budget);
+          addSourceFingerprintEntry(entries, budget, {
+            path: relative,
+            type: "file",
+            mode: item.mode,
+            size: item.size,
+            digest: item.digest,
+          });
+        } else {
+          throw new Error("npm implementation contains a special file");
+        }
+      }
+      const after = fs.lstatSync(directory, { bigint: true });
+      if (!sameFileSnapshot(before, after)) throw new Error("npm implementation directory changed during fingerprinting");
+    } finally {
+      if (handle) closeDirectory(handle);
+      budget.activeDirectories = previousActiveDirectories;
+    }
+  };
+  visit(root, "", 0, rootChain.slice(0, -1));
+  entries.sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
+  const byPath = new Map(entries.map((entry) => [entry.path, entry]));
+  for (const entry of entries) {
+    if (entry.type === "symlink" && byPath.get(entry.target)?.type !== "file") {
+      throw new Error("npm implementation link target is not a verified regular file");
+    }
+  }
+  const serialized = JSON.stringify({ schema: 1, rootMode: Number(rootStats.mode & 0o777n), entries });
+  if (Buffer.byteLength(serialized, "utf8") > MAX_SOURCE_FINGERPRINT_METADATA_BYTES) {
+    throw new Error("npm implementation fingerprint exceeds its metadata limit");
+  }
+  const digest = crypto.createHash("sha256").update(serialized).digest("hex");
+  verifyFingerprintSnapshots(budget, "npm implementation file changed during fingerprinting");
+  assertFingerprintWithinBounds(budget);
+  return {
+    digest,
+    fence: {
+      directorySnapshots: budget.directorySnapshots,
+      fileSnapshots: budget.fileSnapshots,
+      linkSnapshots: budget.linkSnapshots,
+      entries: budget.entries,
+      files: budget.files,
+      bytes: budget.bytes,
+    },
+  };
+}
+
+function sourceBuildCacheEligible(packageRoot, env) {
+  const nodeOptions = typeof env.NODE_OPTIONS === "string" ? env.NODE_OPTIONS : "";
+  // Only a narrowly understood warning-only option is reusable. Arbitrary
+  // --require/--import/loader hooks and future Node flags may load or execute
+  // external code even when their text is unchanged.
+  if (nodeOptions !== "" && nodeOptions !== "--no-warnings") return false;
+  if (process.execArgv.some((arg) => /^(?:-r|--require(?:=|$)|--import(?:=|$)|--loader(?:=|$)|--experimental-loader(?:=|$))/u.test(arg))) return false;
+  if (typeof env.NODE_PATH === "string" && env.NODE_PATH.length > 0) return false;
+  for (const [name, value] of Object.entries(env)) {
+    if (typeof value !== "string" || value.length === 0) continue;
+    if (/^(?:LD_|DYLD_)/iu.test(name) || name.toUpperCase() === "LIBPATH") return false;
+    if (/^(?:HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY)$/iu.test(name)) return false;
+    if (/^NODE_/iu.test(name) && !["NODE_ENV", "NODE_OPTIONS", "NODE_PATH"].includes(name.toUpperCase())) return false;
+  }
+  try {
+    const lock = JSON.parse(readBoundedRegularFile(path.join(packageRoot, "package-lock.json"), 32 * 1024 * 1024).toString("utf8"));
+    const packages = lock && typeof lock === "object" && lock.packages && typeof lock.packages === "object" ? Object.values(lock.packages) : [];
+    for (const pkg of packages) {
+      if (!pkg || typeof pkg !== "object") continue;
+      if (pkg.link === true || (typeof pkg.resolved === "string" && /^(?:git\+|git:|github:|file:|link:)/iu.test(pkg.resolved))) return false;
+    }
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+function sourceBuildToolchainFingerprint(env, npmCli) {
+  const npmPackage = sourceBuildNpmPackage(npmCli);
+  if (!npmPackage) throw new Error("the public npm toolchain identity is unavailable");
+  const npmVersion = npmPackage.version;
+  const npmIdentity = toolchainFileIdentity(npmCli);
+  const npmImplementation = fingerprintNpmImplementation(npmPackage.root);
+  const nodeIdentity = toolchainFileIdentity(process.execPath);
+  // PATH is intentionally excluded: this build invokes the positively
+  // identified npm and Node JS entries directly, and supported shell fallback
+  // may re-extract those same toolchains at a transient absolute path.
+  const configNames = ["NODE_OPTIONS", "NODE_ENV", "NODE_PATH", "LANG", "LC_ALL", "TZ", "SOURCE_DATE_EPOCH"];
+  const config = configNames.map((name) => {
+    if (!Object.hasOwn(env, name)) return [name, null];
+    const value = `${env[name]}`;
+    if (Buffer.byteLength(value, "utf8") > 1024 * 1024) throw new Error("source build environment configuration exceeds its bound");
+    return [name, crypto.createHash("sha256").update(value).digest("hex")];
+  });
+  const versions = Object.fromEntries(Object.entries(process.versions).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0));
+  const identity = {
+    schema: 1,
+    node: { digest: nodeIdentity.digest, version: process.version, versions, release: process.release, execArgv: process.execArgv },
+    npm: { cliDigest: npmIdentity.digest, version: npmVersion, implementation: npmImplementation.digest },
+    platform: process.platform,
+    arch: process.arch,
+    config,
+  };
+  const fence = {
+    directorySnapshots: npmImplementation.fence.directorySnapshots,
+    fileSnapshots: [
+      { target: npmIdentity.path, stats: npmIdentity.fence.stats, ancestors: npmIdentity.fence.ancestors },
+      { target: nodeIdentity.path, stats: nodeIdentity.fence.stats, ancestors: nodeIdentity.fence.ancestors },
+      ...npmImplementation.fence.fileSnapshots,
+    ],
+    linkSnapshots: npmImplementation.fence.linkSnapshots,
+  };
+  return { fingerprint: crypto.createHash("sha256").update(JSON.stringify(identity)).digest("hex"), fence };
+}
+
+function verifyToolchainFence(fence) {
+  if (!fence || !Array.isArray(fence.directorySnapshots)
+    || !Array.isArray(fence.fileSnapshots) || !Array.isArray(fence.linkSnapshots)) return false;
+  const budget = {
+    startedAt: Date.now(),
+    entries: 0,
+    files: 0,
+    bytes: 0,
+    activeDirectories: [],
+    directorySnapshots: fence.directorySnapshots,
+    fileSnapshots: fence.fileSnapshots,
+    linkSnapshots: fence.linkSnapshots,
+  };
+  try {
+    verifyFingerprintSnapshots(budget, "toolchain identity changed during validation");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function cacheScanBudget(root, identity, testHooks) {
+  return {
+    root,
+    startedAt: Date.now(),
+    entries: 0,
+    files: 0,
+    bytes: 0,
+    metadataBytes: 0,
+    directories: [{ target: root, identity }],
+    directorySnapshots: [],
+    fileSnapshots: [],
+    linkSnapshots: [],
+    activeDirectories: [{ target: root, identity }],
+    testHooks,
+  };
+}
+
+function addCacheInventoryEntry(entries, budget, entry) {
+  budget.metadataBytes += Buffer.byteLength(JSON.stringify(entry), "utf8") + 1;
+  if (budget.metadataBytes > MAX_CACHE_MANIFEST_BYTES - 1024) throw new Error("cached build manifest metadata limit exceeded");
+  entries.push(entry);
+}
+
+function assertCacheScanWithinBounds(budget) {
+  if (Date.now() - budget.startedAt > CACHE_SCAN_TIMEOUT_MS) throw new Error("cached build verification elapsed deadline exceeded");
+  if (budget.entries > MAX_CACHE_ENTRIES || budget.files > MAX_CACHE_ENTRIES || budget.bytes > MAX_CACHE_BYTES) {
+    throw new Error("cached build verification limit exceeded");
+  }
+  if (!directoryChainIsSame(budget.activeDirectories)) throw new Error("cached build directory changed during verification");
+}
+
+function verifyCacheSnapshotSet(budget) {
+  for (const { target, stats, ancestors } of budget.directorySnapshots) {
+    assertCacheScanWithinBounds(budget);
+    if (!directoryChainIsSame(ancestors)) throw new Error("cached build directory changed during verification");
+    let current;
+    try { current = fs.lstatSync(target, { bigint: true }); } catch { throw new Error("cached build directory changed during verification"); }
+    if (!sameFileSnapshot(stats, current) || !directoryChainIsSame(ancestors)) throw new Error("cached build directory changed during verification");
+  }
+  for (const [snapshots, isExpectedType] of [
+    [budget.fileSnapshots, (stats) => stats.isFile()],
+    [budget.linkSnapshots, (stats) => stats.isSymbolicLink()],
+  ]) {
+    for (const snapshot of snapshots) {
+      assertCacheScanWithinBounds(budget);
+      if (!directoryChainIsSame(snapshot.ancestors)) throw new Error("cached build entry changed during verification");
+      let current;
+      try { current = fs.lstatSync(snapshot.target, { bigint: true }); } catch { throw new Error("cached build entry changed during verification"); }
+      if (!isExpectedType(current) || !sameFileSnapshot(snapshot.stats, current)
+        || !directoryChainIsSame(snapshot.ancestors)) throw new Error("cached build entry changed during verification");
+    }
+  }
+}
+
+function cachePathName(relativePath) {
+  if (path.sep !== "/" && relativePath.includes("/")) throw new Error("cached build contains a non-portable path");
+  return relativePath.split(path.sep).join("/");
+}
+
+function scanBuildArtifact(root, rootIdentity, testHooks, expectedEntries) {
+  const budget = cacheScanBudget(root, rootIdentity, testHooks);
+  const entries = [];
+  if (expectedEntries !== undefined && (!Array.isArray(expectedEntries) || expectedEntries.length > MAX_CACHE_ENTRIES)) {
+    throw new Error("cached build manifest inventory is invalid");
+  }
+  const expectedByPath = expectedEntries === undefined ? undefined : new Map(expectedEntries.map((entry) => [entry.path, entry]));
+  const addEntry = (entry) => {
+    addCacheInventoryEntry(entries, budget, entry);
+    if (!expectedByPath) return;
+    const expected = expectedByPath.get(entry.path);
+    if (!expected || JSON.stringify(entry) !== JSON.stringify(expected)) {
+      throw new Error("cached build contents do not match their manifest");
+    }
+    expectedByPath.delete(entry.path);
+  };
+  const visit = (directoryPath, relativeDirectory, depth, ancestors) => {
+    if (depth > MAX_SOURCE_DEPTH) throw new Error("cached build depth limit exceeded");
+    assertCacheScanWithinBounds(budget);
+    const before = fs.lstatSync(directoryPath, { bigint: true });
+    if (!before.isDirectory() || before.isSymbolicLink() || !hasPositiveIdentity(before)) {
+      throw new Error("cached build contains an unsafe directory");
+    }
+    const identity = { dev: before.dev, ino: before.ino };
+    const current = { target: directoryPath, identity };
+    const chain = [...ancestors, current];
+    const previousActiveDirectories = budget.activeDirectories;
+    budget.directorySnapshots.push({ target: directoryPath, stats: before, ancestors: chain });
+    budget.activeDirectories = chain;
+    if (relativeDirectory !== "") {
+      addEntry({
+        path: relativeDirectory,
+        type: "directory",
+        mode: Number(before.mode & 0o777n),
+        size: before.size.toString(),
+        dev: before.dev.toString(),
+        ino: before.ino.toString(),
+      });
+    }
+    let directory;
+    try {
+      assertCacheScanWithinBounds(budget);
+      directory = fs.opendirSync(directoryPath);
+      if (!sameDirectoryIdentity(directoryPath, identity)) throw new Error("cached build directory changed while opening");
+      for (;;) {
+        assertCacheScanWithinBounds(budget);
+        const entry = directory.readSync();
+        assertCacheScanWithinBounds(budget);
+        if (!entry) break;
+        budget.entries += 1;
+        if (budget.entries > MAX_CACHE_ENTRIES) throw new Error("cached build entry limit exceeded");
+        const name = entry.name;
+        // No initialized Terraform content participates in this cache; prune before lstat or descent.
+        if (name === ".terraform") continue;
+        if (relativeDirectory === "" && name === SOURCE_CACHE_MANIFEST) continue;
+        if (name.includes("\\")) throw new Error("cached build contains a non-portable path");
+        const absolute = path.join(directoryPath, name);
+        const relative = relativeDirectory ? `${relativeDirectory}/${name}` : name;
+        if (relative.length > MAX_PATH_LENGTH) throw new Error("cached build path limit exceeded");
+        if (!directoryChainIsSame(chain)) throw new Error("cached build directory changed during verification");
+        const stats = fs.lstatSync(absolute, { bigint: true });
+        if (!hasPositiveIdentity(stats)) throw new Error("cached build entry identity is unavailable");
+        if (stats.isSymbolicLink()) {
+          if (!relative.startsWith("node_modules/.bin/")) throw new Error("cached build contains an unexpected symlink");
+          const target = fs.readlinkSync(absolute);
+          if (target.length === 0 || target.length > MAX_PATH_LENGTH || path.isAbsolute(target)
+            || /[\u0000-\u001f\u007f]/u.test(target)) throw new Error("cached build contains an unsafe binary link");
+          const targetPath = path.resolve(path.dirname(absolute), target);
+          if (!pathIsWithin(root, targetPath)) throw new Error("cached build binary link escapes its stage");
+          const targetRelative = cachePathName(path.relative(root, targetPath));
+          const targetStats = lstatRegularFile(targetPath);
+          const after = fs.lstatSync(absolute, { bigint: true });
+          if (!sameFileSnapshot(stats, after) || !sameFileSnapshot(targetStats, lstatRegularFile(targetPath))) {
+            throw new Error("cached build binary link changed during verification");
+          }
+          budget.linkSnapshots.push({ target: absolute, stats: after, ancestors: [...chain] });
+          addEntry({
+            path: relative,
+            type: "symlink",
+            mode: Number(stats.mode & 0o777n),
+            size: stats.size.toString(),
+            dev: stats.dev.toString(),
+            ino: stats.ino.toString(),
+            target: targetRelative,
+          });
+        } else if (stats.isDirectory()) {
+          visit(absolute, relative, depth + 1, chain);
+        } else if (stats.isFile()) {
+          const before = lstatRegularFile(absolute);
+          if (before.size > BigInt(MAX_CACHE_BYTES - budget.bytes)) throw new Error("cached build byte limit exceeded");
+          budget.files += 1;
+          if (budget.files > MAX_CACHE_ENTRIES) throw new Error("cached build file limit exceeded");
+          const fd = fs.openSync(absolute, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
+          try {
+            const opened = fs.fstatSync(fd, { bigint: true });
+            if (!opened.isFile() || !sameFileSnapshot(before, opened)
+              || !sameFileSnapshot(before, lstatRegularFile(absolute))) throw new Error("cached build file changed before verification");
+            const hash = crypto.createHash("sha256");
+            const buffer = Buffer.alloc(SOURCE_COPY_CHUNK_BYTES);
+            let position = 0;
+            for (;;) {
+              assertCacheScanWithinBounds(budget);
+              const count = fs.readSync(fd, buffer, 0, buffer.length, position);
+              if (count === 0) break;
+              budget.bytes += count;
+              if (budget.bytes > MAX_CACHE_BYTES) throw new Error("cached build byte limit exceeded");
+              hash.update(buffer.subarray(0, count));
+              position += count;
+            }
+            const after = fs.fstatSync(fd, { bigint: true });
+            if (!sameFileSnapshot(before, after)
+              || !sameFileSnapshot(after, lstatRegularFile(absolute))) throw new Error("cached build file changed during verification");
+            budget.fileSnapshots.push({ target: absolute, stats: after, ancestors: [...chain] });
+            addEntry({
+              path: relative,
+              type: "file",
+              mode: Number(before.mode & 0o777n),
+              size: before.size.toString(),
+              dev: before.dev.toString(),
+              ino: before.ino.toString(),
+              digest: hash.digest("hex"),
+            });
+            if (typeof budget.testHooks?.afterArtifactFileHashed === "function") {
+              budget.testHooks.afterArtifactFileHashed(absolute, relative);
+            }
+          } finally {
+            fs.closeSync(fd);
+          }
+        } else {
+          throw new Error("cached build contains a special file");
+        }
+      }
+      assertCacheScanWithinBounds(budget);
+      const after = fs.lstatSync(directoryPath, { bigint: true });
+      if (!sameFileSnapshot(before, after)) throw new Error("cached build directory changed during verification");
+    } finally {
+      if (directory) closeDirectory(directory);
+      budget.activeDirectories = previousActiveDirectories;
+    }
+  };
+
+  visit(root, "", 0, []);
+  entries.sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
+  const byPath = new Map(entries.map((entry) => [entry.path, entry]));
+  for (const entry of entries) {
+    if (entry.type === "symlink" && byPath.get(entry.target)?.type !== "file") {
+      throw new Error("cached build binary link target is not a verified regular file");
+    }
+  }
+  if (byPath.get("dist/src/session-host/main.js")?.type !== "file") {
+    throw new Error("cached build has no compiled native session host entry");
+  }
+  if (expectedByPath && expectedByPath.size !== 0) throw new Error("cached build contents do not match their manifest");
+  verifyCacheSnapshotSet(budget);
+  return {
+    entries,
+    files: budget.files,
+    bytes: budget.bytes,
+  };
+}
+
+function validCacheEntries(entries) {
+  if (!Array.isArray(entries) || entries.length > MAX_CACHE_ENTRIES) return false;
+  let previous = "";
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)
+      || typeof entry.path !== "string" || entry.path.length === 0 || entry.path.length > MAX_PATH_LENGTH
+      || entry.path.startsWith("/") || entry.path.includes("\\")
+      || entry.path.split("/").some((component) => component === "" || component === "." || component === "..")
+      || (previous !== "" && entry.path <= previous)
+      || !["directory", "file", "symlink"].includes(entry.type)
+      || !Number.isInteger(entry.mode) || entry.mode < 0 || entry.mode > 0o777
+      || !/^(?:0|[1-9]\d*)$/u.test(entry.size)
+      || !/^(?:0|[1-9]\d*)$/u.test(entry.dev) || !/^[1-9]\d*$/u.test(entry.ino)) return false;
+    const expectedKeys = entry.type === "directory"
+      ? ["path", "type", "mode", "size", "dev", "ino"]
+      : entry.type === "file"
+        ? ["path", "type", "mode", "size", "dev", "ino", "digest"]
+        : ["path", "type", "mode", "size", "dev", "ino", "target"];
+    if (Object.keys(entry).sort().join(",") !== expectedKeys.sort().join(",")) return false;
+    if (entry.type === "file" && !/^[a-f0-9]{64}$/u.test(entry.digest)) return false;
+    if (entry.type === "symlink" && (typeof entry.target !== "string" || entry.target.length === 0
+      || entry.target.startsWith("/") || entry.target.includes("\\")
+      || entry.target.split("/").some((component) => component === "" || component === "." || component === ".."))) return false;
+    previous = entry.path;
+  }
+  return true;
+}
+
+function writeSourceBuildManifest(stageRoot, metadata) {
+  const identity = identityOfDirectory(stageRoot);
+  const inventory = scanBuildArtifact(stageRoot, identity);
+  const manifest = {
+    schema: 1,
+    cacheKey: metadata.cacheKey,
+    sourceFingerprint: metadata.sourceFingerprint,
+    toolchainFingerprint: metadata.toolchainFingerprint,
+    root: { dev: identity.dev.toString(), ino: identity.ino.toString(), mode: Number(fs.lstatSync(stageRoot, { bigint: true }).mode & 0o777n) },
+    entries: inventory.entries,
+  };
+  if (!validCacheEntries(manifest.entries)) throw new Error("cached build manifest entries are invalid");
+  const bytes = Buffer.from(JSON.stringify(manifest), "utf8");
+  if (bytes.length > MAX_CACHE_MANIFEST_BYTES) throw new Error("cached build manifest exceeds its bounded size");
+  const file = path.join(stageRoot, SOURCE_CACHE_MANIFEST);
+  const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+  try {
+    const opened = fs.fstatSync(fd, { bigint: true });
+    if (!opened.isFile() || !hasPositiveIdentity(opened) || !sameStatIdentity(opened, lstatRegularFile(file))) {
+      throw new Error("cached build manifest identity is unavailable");
+    }
+    let offset = 0;
+    while (offset < bytes.length) offset += fs.writeSync(fd, bytes, offset, bytes.length - offset);
+    fs.fsyncSync(fd);
+    const after = fs.fstatSync(fd, { bigint: true });
+    if (!sameStatIdentity(opened, after) || after.size !== BigInt(bytes.length)
+      || !sameStatIdentity(after, lstatRegularFile(file))) throw new Error("cached build manifest changed during publication");
+  } finally {
+    fs.closeSync(fd);
+  }
+  return manifest;
+}
+
+/**
+ * Validate every file and directory that can participate in loading a staged
+ * package. Cache metadata is integrity evidence, not an adversarial same-user
+ * sandbox: a same-user actor able to rewrite both artifacts and manifest can
+ * forge this cache, but symlinks, partial output, races, and ordinary damage
+ * fail closed. Every artifact byte is rehashed under fixed count/byte/time caps.
+ */
+function readSourceBuildCandidate(stageRoot, metadata, expectedParentChain) {
+  try {
+    if (expectedParentChain && !directoryChainIsSame(expectedParentChain)) return undefined;
+    const rootStats = fs.lstatSync(stageRoot, { bigint: true });
+    if (!rootStats.isDirectory() || rootStats.isSymbolicLink() || !hasPositiveIdentity(rootStats)) return undefined;
+    if (process.platform !== "win32" && (rootStats.mode & 0o077n) !== 0n) return undefined;
+    const rootIdentity = { dev: rootStats.dev, ino: rootStats.ino };
+    const manifestPath = path.join(stageRoot, SOURCE_CACHE_MANIFEST);
+    const manifestBefore = lstatRegularFile(manifestPath);
+    if (process.platform !== "win32" && (manifestBefore.mode & 0o077n) !== 0n) return undefined;
+    if (manifestBefore.size > BigInt(MAX_CACHE_MANIFEST_BYTES)) return undefined;
+    const manifestBytes = readBoundedRegularFile(manifestPath, MAX_CACHE_MANIFEST_BYTES);
+    const manifestAfter = lstatRegularFile(manifestPath);
+    if (!sameFileSnapshot(manifestBefore, manifestAfter)) return undefined;
+    const manifest = JSON.parse(manifestBytes.toString("utf8"));
+    if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)
+      || Object.keys(manifest).sort().join(",") !== ["schema", "cacheKey", "sourceFingerprint", "toolchainFingerprint", "root", "entries"].sort().join(",")
+      || manifest.schema !== 1 || manifest.cacheKey !== metadata.cacheKey
+      || manifest.sourceFingerprint !== metadata.sourceFingerprint
+      || manifest.toolchainFingerprint !== metadata.toolchainFingerprint
+      || !manifest.root || typeof manifest.root !== "object" || Array.isArray(manifest.root)
+      || Object.keys(manifest.root).sort().join(",") !== ["dev", "ino", "mode"].sort().join(",")
+      || manifest.root.dev !== rootStats.dev.toString() || manifest.root.ino !== rootStats.ino.toString()
+      || manifest.root.mode !== Number(rootStats.mode & 0o777n)
+      || !validCacheEntries(manifest.entries)) return undefined;
+    if (!directoryChainIsSame(expectedParentChain ?? []) || !sameDirectoryIdentity(stageRoot, rootIdentity)
+      || !sameFileSnapshot(manifestAfter, lstatRegularFile(manifestPath))) return undefined;
+    return { root: stageRoot, identity: rootIdentity, manifest, manifestIdentity: manifestAfter };
+  } catch {
+    return undefined;
+  }
+}
+
+function sourceBuildCacheRecordPath(cacheRoot, cacheKey) {
+  return path.join(path.resolve(cacheRoot), `source-${cacheKey}.json`);
+}
+
+function readSourceBuildCacheRecord(recordPath, cacheRoot, metadata, expectedParentChain) {
+  try {
+    if (!directoryChainIsSame(expectedParentChain ?? [])) return undefined;
+    const recordBefore = lstatRegularFile(recordPath);
+    if (process.platform !== "win32" && (recordBefore.mode & 0o077n) !== 0n) return undefined;
+    if (recordBefore.size > BigInt(MAX_SOURCE_CACHE_RECORD_BYTES)) return undefined;
+    const bytes = readBoundedRegularFile(recordPath, MAX_SOURCE_CACHE_RECORD_BYTES);
+    const recordAfter = lstatRegularFile(recordPath);
+    if (!sameFileSnapshot(recordBefore, recordAfter)) return undefined;
+    const record = JSON.parse(bytes.toString("utf8"));
+    if (!record || typeof record !== "object" || Array.isArray(record)
+      || Object.keys(record).sort().join(",") !== ["schema", "cacheKey", "sourceFingerprint", "toolchainFingerprint", "stageName", "root"].sort().join(",")
+      || record.schema !== 1 || record.cacheKey !== metadata.cacheKey
+      || record.sourceFingerprint !== metadata.sourceFingerprint
+      || record.toolchainFingerprint !== metadata.toolchainFingerprint
+      || typeof record.stageName !== "string" || !/^pi-review-sessions-[a-f0-9]{32}$/u.test(record.stageName)
+      || !record.root || typeof record.root !== "object" || Array.isArray(record.root)
+      || Object.keys(record.root).sort().join(",") !== ["dev", "ino", "mode"].sort().join(",")
+      || !/^(?:0|[1-9]\d*)$/u.test(record.root.dev) || !/^[1-9]\d*$/u.test(record.root.ino)
+      || !Number.isInteger(record.root.mode) || record.root.mode < 0 || record.root.mode > 0o777) return undefined;
+    const stageRoot = path.join(path.resolve(cacheRoot), record.stageName);
+    if (path.dirname(stageRoot) !== path.resolve(cacheRoot)) return undefined;
+    const rootStats = fs.lstatSync(stageRoot, { bigint: true });
+    if (!rootStats.isDirectory() || rootStats.isSymbolicLink() || !hasPositiveIdentity(rootStats)
+      || rootStats.dev.toString() !== record.root.dev || rootStats.ino.toString() !== record.root.ino
+      || Number(rootStats.mode & 0o777n) !== record.root.mode
+      || (process.platform !== "win32" && (rootStats.mode & 0o077n) !== 0n)) return undefined;
+    const candidate = readSourceBuildCandidate(stageRoot, metadata, expectedParentChain);
+    if (!candidate || candidate.identity.dev.toString() !== record.root.dev || candidate.identity.ino.toString() !== record.root.ino
+      || !sameFileSnapshot(recordAfter, lstatRegularFile(recordPath))
+      || !directoryChainIsSame(expectedParentChain ?? [])) return undefined;
+    return { ...candidate, recordIdentity: recordAfter, recordPath };
+  } catch {
+    return undefined;
+  }
+}
+
+function writeSourceBuildCacheRecord(recordPath, cacheRoot, metadata, ownedStage, cacheParentChain) {
+  if (!directoryChainIsSame(cacheParentChain) || !directoryChainIsSame(ownedStage.chain)) {
+    throw new Error("source cache publication ancestors changed");
+  }
+  const stageName = path.basename(ownedStage.root);
+  if (!/^pi-review-sessions-[a-f0-9]{32}$/u.test(stageName) || path.dirname(ownedStage.root) !== path.resolve(cacheRoot)) {
+    throw new Error("source cache stage name is not publishable");
+  }
+  const rootStats = fs.lstatSync(ownedStage.root, { bigint: true });
+  if (!rootStats.isDirectory() || rootStats.isSymbolicLink() || !hasPositiveIdentity(rootStats)
+    || rootStats.dev !== ownedStage.identity.dev || rootStats.ino !== ownedStage.identity.ino
+    || (process.platform !== "win32" && (rootStats.mode & 0o077n) !== 0n)) {
+    throw new Error("source cache stage identity changed before publication");
+  }
+  const record = {
+    schema: 1,
+    cacheKey: metadata.cacheKey,
+    sourceFingerprint: metadata.sourceFingerprint,
+    toolchainFingerprint: metadata.toolchainFingerprint,
+    stageName,
+    root: { dev: rootStats.dev.toString(), ino: rootStats.ino.toString(), mode: Number(rootStats.mode & 0o777n) },
+  };
+  const bytes = Buffer.from(JSON.stringify(record), "utf8");
+  if (bytes.length > MAX_SOURCE_CACHE_RECORD_BYTES) throw new Error("source cache record exceeds its bounded size");
+  const fd = fs.openSync(recordPath,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+  try {
+    const opened = fs.fstatSync(fd, { bigint: true });
+    if (!opened.isFile() || !hasPositiveIdentity(opened) || !sameStatIdentity(opened, lstatRegularFile(recordPath))) {
+      throw new Error("source cache record identity is unavailable");
+    }
+    let offset = 0;
+    while (offset < bytes.length) offset += fs.writeSync(fd, bytes, offset, bytes.length - offset);
+    fs.fsyncSync(fd);
+    const after = fs.fstatSync(fd, { bigint: true });
+    if (!sameStatIdentity(opened, after) || after.size !== BigInt(bytes.length)
+      || !sameFileSnapshot(after, lstatRegularFile(recordPath))
+      || !directoryChainIsSame(cacheParentChain) || !directoryChainIsSame(ownedStage.chain)) {
+      throw new Error("source cache record changed during publication");
+    }
+    return { dev: after.dev, ino: after.ino };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function validateSourceBuildArtifact(stageRoot, metadata, expectedParentChain, testHooks) {
+  const candidate = readSourceBuildCandidate(stageRoot, metadata, expectedParentChain);
+  if (!candidate) return undefined;
+  try {
+    const inventory = scanBuildArtifact(stageRoot, candidate.identity, testHooks, candidate.manifest.entries);
+    const manifestPath = path.join(stageRoot, SOURCE_CACHE_MANIFEST);
+    if (!directoryChainIsSame(expectedParentChain ?? []) || !sameDirectoryIdentity(stageRoot, candidate.identity)
+      || !sameFileSnapshot(candidate.manifestIdentity, lstatRegularFile(manifestPath))) return undefined;
+    return { root: stageRoot, identity: candidate.identity, entries: inventory.entries, files: inventory.files, bytes: inventory.bytes };
+  } catch {
+    return undefined;
+  }
+}
+
+function acquireSourceCacheLock(cacheRoot, cacheKey, parentChain) {
+  const file = path.join(cacheRoot, `.source-build-${cacheKey}.lock`);
+  let fd;
+  try {
+    if (!directoryChainIsSame(parentChain)) return undefined;
+    fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+    const stats = fs.fstatSync(fd, { bigint: true });
+    if (!stats.isFile() || !hasPositiveIdentity(stats) || !directoryChainIsSame(parentChain)
+      || !sameStatIdentity(stats, lstatRegularFile(file))) {
+      fs.closeSync(fd);
+      return undefined;
+    }
+    fs.writeSync(fd, `${process.pid}:${cacheKey}\n`);
+    fs.fsyncSync(fd);
+    const identity = { dev: stats.dev, ino: stats.ino };
+    let released = false;
+    return {
+      release() {
+        if (released) return;
+        released = true;
+        try {
+          if (directoryChainIsSame(parentChain) && sameFileIdentity(file, identity)) fs.unlinkSync(file);
+        } catch {
+          // Unknown or changed lock contents are preserved.
+        } finally {
+          fs.closeSync(fd);
+        }
+      },
+    };
+  } catch (error) {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+    if (error.code === "EEXIST") return undefined;
+    return undefined;
+  }
 }
 
 /** The npm global package root (single bounded absolute line), or undefined. */
@@ -1837,6 +2965,7 @@ async function runSessionHostLauncher(argv, overrides = {}) {
   // redirects it to the owned stage so nothing is read from the live dist.
   let hostPackageRoot = packageRoot;
   let ownedSourceStage;
+  let sourceBuildResult;
   let sourceStageHostStarted = false;
   let sourceStageSetupUnconfirmed = false;
   const finish = (status) => {
@@ -1895,6 +3024,7 @@ async function runSessionHostLauncher(argv, overrides = {}) {
       if (build && build.retainedStage) deps.writeError("pi-review-sessions: a source stage was retained because per-entry descendant creation receipts are unavailable.\n");
       return statusCode(build);
     }
+    sourceBuildResult = build;
     if (typeof build.stagingRoot === "string" && build.stagingRoot.length > 0) {
       hostPackageRoot = build.stagingRoot;
       compiledEntry = path.join(build.stagingRoot, "dist", "src", "session-host", "main.js");
@@ -1902,7 +3032,8 @@ async function runSessionHostLauncher(argv, overrides = {}) {
     }
   }
 
-  if (!deps.isRegularFile(compiledEntry)) {
+  if (!deps.isRegularFile(compiledEntry)
+    && !(sourceBuildResult && (sourceBuildResult.cacheHit || sourceBuildResult.cachePublished))) {
     deps.writeError("pi-review-sessions: compiled native session host is unavailable.\n");
     return finish(2);
   }
@@ -1932,34 +3063,136 @@ async function runSessionHostLauncher(argv, overrides = {}) {
   }
   deps.writeError(`pi-review-sessions: pi runtime: ${piRuntime.file} (v${piRuntime.version}, ${piRuntime.source})\n`);
 
+  const sourceBuildNeedsFresh = () => {
+    if (!sourceBuildResult || typeof sourceBuildResult.sourceFingerprint !== "string") return false;
+    try {
+      const sourceIdentity = fingerprintSourcePackage(packageRoot);
+      if (sourceIdentity.digest !== sourceBuildResult.sourceFingerprint) return true;
+      if (sourceBuildResult.cacheHit || sourceBuildResult.cachePublished) {
+        if (typeof sourceBuildResult.cacheKey !== "string" || typeof sourceBuildResult.toolchainFingerprint !== "string"
+          || !verifyToolchainFence(sourceBuildResult.toolchainFence)) return true;
+        const artifact = validateSourceBuildArtifact(hostPackageRoot, {
+          cacheKey: sourceBuildResult.cacheKey,
+          sourceFingerprint: sourceBuildResult.sourceFingerprint,
+          toolchainFingerprint: sourceBuildResult.toolchainFingerprint,
+        }, sourceBuildResult.cacheParentChain, sourceBuildResult.testHooks);
+        return !artifact || !verifyToolchainFence(sourceIdentity.fence)
+          || !verifyToolchainFence(sourceBuildResult.toolchainFence);
+      }
+      return false;
+    } catch {
+      return true;
+    }
+  };
+
+  const refreshSourceBuildIfNeeded = async () => {
+    if (!sourceBuildNeedsFresh()) return { ok: true, changed: false };
+    const previousRoot = hostPackageRoot;
+    let freshBuild;
+    try {
+      freshBuild = await deps.build({ packageRoot, agentDir, env: setupEnv, forceFresh: true });
+    } catch {
+      deps.writeError("pi-review-sessions: extension build failed.\n");
+      return { ok: false, changed: false };
+    }
+    if (!freshBuild || freshBuild.status !== 0 || freshBuild.error || freshBuild.signal
+      || freshBuild.timedOut || freshBuild.outputExceeded || freshBuild.cleanupConfirmed === false
+      || typeof freshBuild.stagingRoot !== "string" || freshBuild.stagingRoot.length === 0
+      || freshBuild.stagingRoot === previousRoot || freshBuild.cacheHit === true) {
+      deps.writeError("pi-review-sessions: extension build failed while replacing an invalid cached source build.\n");
+      if (freshBuild && typeof freshBuild.diagnostics === "string" && freshBuild.diagnostics.length > 0) deps.writeError(freshBuild.diagnostics);
+      return { ok: false, changed: false };
+    }
+    sourceBuildResult = freshBuild;
+    hostPackageRoot = freshBuild.stagingRoot;
+    compiledEntry = path.join(hostPackageRoot, "dist", "src", "session-host", "main.js");
+    ownedSourceStage = freshBuild.ownedStage && freshBuild.ownedStage.root === hostPackageRoot ? freshBuild.ownedStage : undefined;
+    if (!deps.isRegularFile(compiledEntry)) {
+      deps.writeError("pi-review-sessions: compiled native session host is unavailable.\n");
+      return { ok: false, changed: false };
+    }
+    if (typeof freshBuild.sourceFingerprint === "string") {
+      try {
+        if (fingerprintSourcePackage(packageRoot).digest !== freshBuild.sourceFingerprint) {
+          deps.writeError("pi-review-sessions: source changed during startup; refusing a stale source build.\n");
+          return { ok: false, changed: false };
+        }
+      } catch {
+        deps.writeError("pi-review-sessions: source changed during startup; refusing an unverifiable source build.\n");
+        return { ok: false, changed: false };
+      }
+    }
+    return { ok: true, changed: true };
+  };
+
+  // No source-cached script is invoked before its complete artifact tree is
+  // verified. If the candidate is unsafe or raced, use a separate fresh stage.
+  const beforeDdgs = await refreshSourceBuildIfNeeded();
+  if (!beforeDdgs.ok) return finish(1);
+
   // The shared DDGS helper runs in a bounded owned Node process (a POSIX
   // group, but only the direct Windows child). setupEnv is already scrubbed.
-  const savedTokens = {};
-  for (const name of HOST_ENV_TO_CLEAR) {
-    if (name in process.env) {
-      savedTokens[name] = process.env[name];
-      delete process.env[name];
+  const ensureDdgsForRoot = async (runtimePackageRoot) => {
+    const savedTokens = {};
+    for (const name of HOST_ENV_TO_CLEAR) {
+      if (name in process.env) {
+        savedTokens[name] = process.env[name];
+        delete process.env[name];
+      }
     }
-  }
-  let ddgs;
-  try {
-    ddgs = await deps.ensureDdgs(homeDir, setupEnv, hostPackageRoot);
-  } catch (error) {
-    sourceStageSetupUnconfirmed = Boolean(error && error.cleanupUnconfirmed);
+    let result;
+    let error;
+    try {
+      result = await deps.ensureDdgs(homeDir, setupEnv, runtimePackageRoot);
+    } catch (caught) {
+      error = caught;
+    } finally {
+      for (const [name, value] of Object.entries(savedTokens)) process.env[name] = value;
+    }
+    sourceStageSetupUnconfirmed = Boolean(error && error.cleanupUnconfirmed)
+      || Boolean(result && result.cleanupUnconfirmed);
+    return { result, error };
+  };
+  let ddgsAttempt = await ensureDdgsForRoot(hostPackageRoot);
+  if (ddgsAttempt.error) {
     deps.writeError("pi-review-sessions: DDGS setup failed.\n");
     return finish(1);
-  } finally {
-    for (const [name, value] of Object.entries(savedTokens)) process.env[name] = value;
   }
-  sourceStageSetupUnconfirmed = Boolean(ddgs && ddgs.cleanupUnconfirmed);
+  let ddgs = ddgsAttempt.result;
   if (!ddgs || ddgs.cleanupUnconfirmed || ddgs.ok !== true || typeof ddgs.python !== "string") {
     deps.writeError("pi-review-sessions: DDGS setup failed.\n");
     return finish(ddgs && Number.isInteger(ddgs.exitCode) ? ddgs.exitCode : 1);
   }
-  const python = ddgs.python;
+  let python = ddgs.python;
   if (python.length > MAX_PATH_LENGTH || !path.isAbsolute(python) || /[\u0000-\u001f\u007f]/u.test(python)) {
     deps.writeError("pi-review-sessions: DDGS setup failed.\n");
     return finish(1);
+  }
+
+  // Recheck after DDGS and before require. A changed cache is rebuilt privately;
+  // DDGS is then revalidated against the replacement package root.
+  const afterDdgs = await refreshSourceBuildIfNeeded();
+  if (!afterDdgs.ok) return finish(1);
+  if (afterDdgs.changed) {
+    ddgsAttempt = await ensureDdgsForRoot(hostPackageRoot);
+    if (ddgsAttempt.error) {
+      deps.writeError("pi-review-sessions: DDGS setup failed.\n");
+      return finish(1);
+    }
+    ddgs = ddgsAttempt.result;
+    if (!ddgs || ddgs.cleanupUnconfirmed || ddgs.ok !== true || typeof ddgs.python !== "string") {
+      deps.writeError("pi-review-sessions: DDGS setup failed.\n");
+      return finish(ddgs && Number.isInteger(ddgs.exitCode) ? ddgs.exitCode : 1);
+    }
+    python = ddgs.python;
+    if (python.length > MAX_PATH_LENGTH || !path.isAbsolute(python) || /[\u0000-\u001f\u007f]/u.test(python)) {
+      deps.writeError("pi-review-sessions: DDGS setup failed.\n");
+      return finish(1);
+    }
+    if (sourceBuildNeedsFresh()) {
+      deps.writeError("pi-review-sessions: source build changed during final startup validation.\n");
+      return finish(1);
+    }
   }
 
   const hostEnv = { ...setupEnv, PI_REVIEW_GATE_DDGS_PYTHON: python };
@@ -2020,6 +3253,12 @@ module.exports = {
     probePiVersion,
     runDdgsSetup,
     stageSourcePackage,
+    fingerprintSourcePackage,
+    sourceBuildCacheEligible,
+    verifyToolchainFence,
+    readSourceBuildCandidate,
+    validateSourceBuildArtifact,
+    scanBuildArtifact,
     createOwnedStage,
     removeOwnedStage,
     findNpmCli,

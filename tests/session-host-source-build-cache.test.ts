@@ -218,6 +218,9 @@ async function launch(fixture: Fixture, counters: Counters, buildResults: BuildR
       assert.equal(typeof root, "string");
       return { ok: true, python: "/synthetic/ddgs-python" };
     },
+    // The real skill provisioning is exercised by the focused
+    // session-host-skill-provisioning tests; cache flow tests stay hermetic.
+    refreshShippedSkills: () => ({ ok: true }),
     loadMain: (entry: string) => {
       counters.load += 1;
       loaded.push(entry);

@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.154]
+## [0.1.0-dev.155]
 
 ### Changed
 
@@ -27,6 +27,28 @@ dates.
   including the permissive guards that accept arrays (deferred native
   `tool_search` schema selection, `/review-settings` UI detection, and scoped
   model thinking maps). New parity tests pin both strict and permissive behavior.
+
+## [0.1.0-dev.154]
+
+### Added
+
+- Direct sidebar launches (`scripts/pi-review-sessions.sh` / `scripts\pi-review-sessions.cmd`
+  → the shared `scripts/pi-review-sessions.cjs`) now provision the shipped skills
+  themselves before host startup, with no wrapper prerequisite (#378). Every file in
+  the canonical publication manifest — orchestrator (with its recovery runbook),
+  execution, research, and completion — is refreshed into `~/.agents/skills/` using
+  the shared atomic per-file publication, followed by the ownership-safe pre-#151
+  generic-location migration. Repeat launches refresh stale skills and reuse
+  byte-identical installed files untouched; a missing packaged source or failed
+  publication stops startup with an actionable error before the host loads.
+  User-owned generic skills, customized copies, overrides, namespacing/discovery,
+  session/input isolation, roles/capabilities, cancellation/process settlement,
+  and fail-closed provenance/runtime checks are unchanged; per-instance native
+  launches still do not republish skills. Focused parity/provisioning tests cover
+  the shared and supported POSIX/Windows seams (native filesystem evidence on each
+  platform, mocked flow ordering/failure semantics), and the CI `windows-launcher`
+  job now runs them natively for direct entrypoint setup evidence — real Windows
+  ConPTY and sidebar UI readiness remain out of scope.
 
 ## [0.1.0-dev.153]
 

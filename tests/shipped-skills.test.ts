@@ -173,7 +173,7 @@ test("completion skill publishes truthful handoffs only through an available You
   const skill = await readSkillFlat("pi-review-gate-completion");
   for (const phrase of [
     "disable-model-invocation: true",
-    "Standard launchers refresh it under `~/.agents/skills/`; it is manually available as `/skill:pi-review-gate-completion` only when installed and discoverable in the active Pi environment, regardless of `youShouldKnow.completionGuidance`",
+    "Standard launchers — including the session-host sidebar launchers, which refresh it before host startup — keep it current under `~/.agents/skills/`; it is manually available as `/skill:pi-review-gate-completion` only when installed and discoverable in the active Pi environment, regardless of `youShouldKnow.completionGuidance`",
     "`youShouldKnow.enabled` (on by default) governs the overall notice feature",
     "When disabled, the tool is absent from `tool_search` and cannot be activated or used",
     "`youShouldKnow.completionGuidance` (on by default) controls whether the extension supplies an automatic prompt pointing to this skill",

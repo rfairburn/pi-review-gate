@@ -824,9 +824,11 @@ export interface NativeLaunchOptions {
  *   validation or publication runs. The argv loads the reporter extension
  *   FIRST, then the gate extension, then the native arguments.
  * - Legacy profile mode refreshes the standard shipped skills into its
- *   reserved `pi-review-gate-*` directories. Native setup does not republish
- *   skills: Pi and the ordinary launcher discover the user's existing native
- *   skill locations naturally.
+ *   reserved `pi-review-gate-*` directories. Per-instance native launch does
+ *   not republish skills: the direct sidebar launcher
+ *   (scripts/pi-review-sessions.cjs) refreshes every shipped skill under
+ *   ~/.agents/skills/ before host startup (issue 378), and Pi discovers those
+ *   native skill locations naturally.
  *
  * POSIX descriptors execute the validated CLI directly. Windows descriptors
  * run the same validated JS CLI through process.execPath, with its exact

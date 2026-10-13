@@ -35,6 +35,17 @@
  *   files are never modified; failed or unknown cache resources are
  *   preserved, and staging trees are retained without complete per-entry
  *   creation receipts.
+ * - Shipped-skill provisioning (issue 378) gives the direct sidebar entry
+ *   points wrapper-equivalent setup without a wrapper prerequisite: every file
+ *   in the canonical SKILL_PUBLISH_PLAN (scripts/pi-review-gate-launcher.cjs)
+ *   is refreshed into the native discovery home's .agents/skills/ under the
+ *   pi-review-gate- namespace — USERPROFILE via os.homedir() on Windows
+ *   (which can differ from HOME), HOME-first elsewhere — orchestrator with its
+ *   recovery runbook, execution, research, and completion — using the shared
+ *   atomic per-file publication, followed by the ownership-safe pre-#151
+ *   generic-location migration. A missing packaged source or a failed
+ *   publication stops startup with an actionable error; byte-identical
+ *   installed files are left untouched on repeat launches.
  * - Probes and provisioning occur BEFORE the host broker/token exists, on a
  *   scrubbed setup environment (bootstrap/restore/settlement markers removed,
  *   role authorization rejected earlier), while trusted provider variables and
@@ -2841,6 +2852,52 @@ async function runDdgsSetup(homeDir, env, packageRoot, processRunner = runBounde
   return { ok: false, exitCode: 1 };
 }
 
+/**
+ * Wrapper-equivalent shipped-skill provisioning for direct sidebar launches
+ * (issue 378). Refreshes every file in the canonical SKILL_PUBLISH_PLAN from
+ * the package root into <home>/.agents/skills/<name>/... using the shared
+ * atomic per-file publication (byte-identical files are reused untouched),
+ * then runs the ownership-safe pre-#151 generic-location migration. Fails
+ * closed BEFORE any publication when a packaged source is missing, and a
+ * failed publication or directory creation stops the launch with an
+ * actionable error. The platform seam mirrors the wrapper: win32 path
+ * semantics on Windows, POSIX elsewhere.
+ *
+ * @returns {{ ok: true } | { ok: false, error: string }}
+ */
+function refreshShippedSkills(packageRoot, homeDir, platform) {
+  const joinFor = platform === "win32" ? path.win32 : path.posix;
+  // Fail closed before any publication when a packaged skill file is missing.
+  for (const skill of gateLauncher.SKILL_PUBLISH_PLAN) {
+    for (const file of skill.files) {
+      const source = joinFor.join(packageRoot, ...file.source);
+      if (!isRegularFile(source)) {
+        return { ok: false, error: `packaged skill file is missing: ${source}` };
+      }
+    }
+  }
+  for (const skill of gateLauncher.SKILL_PUBLISH_PLAN) {
+    const skillDir = joinFor.join(homeDir, ".agents", "skills", skill.name);
+    for (const file of skill.files) {
+      const source = joinFor.join(packageRoot, ...file.source);
+      const destination = joinFor.join(skillDir, ...file.destination);
+      try {
+        fs.mkdirSync(joinFor.dirname(destination), { recursive: true });
+      } catch {
+        return { ok: false, error: `could not create the skill directory ${joinFor.dirname(destination)} (permission denied?)` };
+      }
+      if (!gateLauncher.refreshSkillFile(source, destination)) {
+        return { ok: false, error: `could not refresh the shipped skill file at ${destination}; re-run the launcher` };
+      }
+    }
+  }
+  // Only after every namespaced skill published successfully: best-effort,
+  // fail-safe removal of the historical generic install locations (owned
+  // copies only; user-owned files are preserved).
+  gateLauncher.migrateGenericSkillFiles(homeDir, platform);
+  return { ok: true };
+}
+
 function defaultDependencies() {
   return {
     getEnv: () => process.env,
@@ -2855,6 +2912,14 @@ function defaultDependencies() {
     // Its ordinary helper semantics stay unchanged; only its JSON result crosses
     // back, and bootstrap/restore values are absent from the setup environment.
     ensureDdgs: (homeDir, env, packageRoot) => runDdgsSetup(homeDir, env, packageRoot),
+    refreshShippedSkills: (packageRoot, homeDir) => {
+      // Wrapper-equivalent skill publication home (issue 378): on native
+      // Windows Pi's discovery home is USERPROFILE via os.homedir() — the
+      // wrapper's exact semantics — which can differ from HOME; POSIX keeps
+      // the HOME-first setup home. DDGS/cache behavior is unchanged.
+      const platform = process.platform;
+      return refreshShippedSkills(packageRoot, platform === "win32" ? os.homedir() : homeDir, platform);
+    },
     resolvePiRuntime: (options) => resolvePiRuntime(options),
     isRegularFile,
     loadMain: (entry) => require(entry),
@@ -3195,6 +3260,17 @@ async function runSessionHostLauncher(argv, overrides = {}) {
     }
   }
 
+  // Wrapper-equivalent shipped-skill provisioning (issue 378): the direct
+  // sidebar entry points prepare the discoverable skills themselves — no
+  // wrapper prerequisite. Runs after the final build/DDGS revalidation so it
+  // publishes from the exact package root the host will load.
+  const skills = deps.refreshShippedSkills(hostPackageRoot, homeDir);
+  if (!skills || skills.ok !== true) {
+    const detail = skills && typeof skills.error === "string" ? `: ${skills.error}` : "";
+    deps.writeError(`pi-review-sessions: shipped skill provisioning failed${detail}.\n`);
+    return finish(1);
+  }
+
   const hostEnv = { ...setupEnv, PI_REVIEW_GATE_DDGS_PYTHON: python };
   let hostModule;
   try {
@@ -3246,6 +3322,7 @@ module.exports = {
   // an environment-variable bypass for role or preflight checks.
   __test: {
     runSessionHostLauncher,
+    refreshShippedSkills,
     resolvePiRuntime,
     buildSourceExtension,
     provisionPiRuntime,

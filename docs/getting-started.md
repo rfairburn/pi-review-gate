@@ -248,10 +248,13 @@ on macOS/Linux or the native Node helper on Windows (see
 refreshes the four shipped skills under
 `~/.agents/skills/` (pi-review-gate-orchestrator — including its recovery runbook —
 pi-review-gate-execution, pi-review-gate-research, and pi-review-gate-completion), and
-then executes the installed `pi` with the extension. The completion-guidance setting
+then executes the installed `pi` with the extension. The session-host sidebar launchers
+(`scripts/pi-review-sessions.sh` on macOS/Linux, `scripts\pi-review-sessions.cmd`
+on Windows) refresh the same skills before starting the host, so a direct sidebar
+launch needs no wrapper prerequisite. The completion-guidance setting
 controls only whether the extension supplies its automatic pointer; manual skill
 discovery depends on the skill being installed in Pi's active skill path. Loading the
-extension directly or using a sidebar-only native setup does not install these skills.
+extension directly — without either launcher — does not install these skills.
 On macOS/Linux, the persistent launcher is a Bash script; on Windows the native entry point
 (`scripts\pi-review-gate.cmd`, or `pi-review-gate-cmd` from an npm installation) mirrors
 the same behavior from cmd.exe or PowerShell without Bash or WSL. The extension selects the

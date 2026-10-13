@@ -42,6 +42,82 @@ Describe what must be true without over-prescribing incidental implementation de
 
 Default to one concrete, coherent outcome per subtask. Minimize simultaneous unresolved decisions without assuming advance knowledge of which model will serve the worker: a smaller-model success should follow from good task construction, not from model selection or routing changes. Resolve architectural uncertainty before dispatching implementation slices that depend on it; do not bundle broad investigation, a large implementation, documentation, and broad validation into one assignment, and keep each change with the focused tests and documentation necessary to establish its coherent outcome. Keep genuinely dependent source-writing slices sequential, and parallelize independent slices only when their shared contracts are settled.
 
+## Author self-contained AskUserQuestion items
+
+When `AskUserQuestion` is available and authorized, write questions that can be
+answered later from the shared pending list without reconstructing preceding chat.
+This guidance applies only to `AskUserQuestion`, not notices or other tools.
+
+Include the context needed to make each question independently understandable:
+
+- **Relevant task:** identify the work/component and affected scope using safe,
+  relevant identifiers, rather than only “that change” or “option B”.
+- **Truthful observation or uncertainty:** summarize the actual observation/result
+  the decision relies on and what it establishes. Distinguish a focused check from
+  broader validation. If evidence is unavailable or a check was not run, state that
+  uncertainty; never invent evidence, a successful result, or a cause.
+- **Concrete decision:** say what the user is deciding, not just “Should I proceed?”
+  Name the proposed action and what would stay unchanged.
+- **Meaningful choices:** explain the scope and consequences of each choice,
+  including material tradeoffs and what would or would not happen. If supplying
+  optional suggested choices, make their labels understandable with the question;
+  do not rely on unexplained yes/no answers or references to earlier options.
+
+Prioritize clarity over needless terseness within the unchanged tool schema limits.
+There is no additional prose length prescription and no mandatory template or new
+schema fields. Use only relevant context, not entire transcripts: do not copy
+transcripts or expose credentials, private paths, or unrelated conversation contents.
+Sanitize identifiers and evidence summaries without hiding decision-relevant facts;
+do not pull context from another session to fill a gap. Before sending, read the
+question and choices as if the preceding chat were unavailable.
+
+### Sanitized examples
+
+These are illustrative scenarios, not evidence about the current task. Use actual
+observations for real questions, or explicitly state what is unknown.
+
+**Observed-result example — vague:** “Given that result, should I proceed?”
+
+**Self-contained question:**
+
+> For the CSV export bug, the focused comma-containing-field test failed: the
+> exported value `north,west` became two columns instead of one. This identifies
+> an escaping failure; broader export tests have not run. Should I fix the CSV
+> serializer and add a regression test, leaving other export formats unchanged,
+> or stop with a diagnosis only and leave all files unchanged?
+
+**Suggested choices:**
+
+- Fix CSV escaping and add the regression test; other export formats stay unchanged.
+- Report the CSV escaping diagnosis only; make no file changes and leave the bug unresolved.
+
+**Unknown-evidence example — vague:** “Can I use option B?”
+
+**Self-contained question:**
+
+> For the login redirect patch, I do not have a retained result from the focused
+> redirect test, so I cannot say whether the patch passes that check. Should I
+> rerun the focused test in a disposable test environment to obtain evidence
+> without changing the patch, or pause patch finalization until test evidence is
+> available? Neither choice deploys the patch or establishes broader validation.
+
+**Suggested choices:**
+
+- Rerun the focused login redirect test; obtain evidence without patch changes or deployment.
+- Pause login redirect patch finalization; leave the test result unknown and do not deploy.
+
+### Preserve delivery, privacy, and authority
+
+This is authoring guidance, not a UI, routing, history-retrieval, or process change.
+Keep async as the default: it returns immediately, remains pending, and does not
+interrupt the run when answered. Continue only other authorized work while waiting;
+do not assume an answer or proceed with the decision-gated action. Sync remains for
+work that cannot proceed at all without the answer, not for compensating for vague
+wording. Questions and answers stay bound to the originating session; added context
+does not change session isolation or permit disclosure across sessions. Existing
+authorization and confirmation rules are unchanged: extra context does not grant
+permission, turn an unanswered question into approval, or replace required confirmation.
+
 ## Supervise deliberately
 
 - Retain execution and task handles. Inspect only when a current diagnostic snapshot will inform a decision; ordinary state changes arrive as events.

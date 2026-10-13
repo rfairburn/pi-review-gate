@@ -210,6 +210,113 @@ test("completion skill publishes truthful handoffs only through an available You
   assert.match(skill, /Use `YouShouldKnow`'s `title` and `body`/);
 });
 
+// These assertions guard shipped authoring guidance and examples, not model
+// compliance or changed tool/runtime behavior (#373).
+const readQuestionGuidance = async (): Promise<string> => {
+  const skill = await readSkill("pi-review-gate-orchestrator");
+  const section = skill.match(/## Author self-contained AskUserQuestion items\n([\s\S]*?)(?=\n## |$)/);
+  assert.ok(section, "orchestrator skill must own the canonical question-authoring section");
+  return section[1];
+};
+
+test("shipped AskUserQuestion guidance covers delayed decisions and both execution paths (#373)", async () => {
+  const guidance = normalize(await readQuestionGuidance());
+  for (const phrase of [
+    "answered later from the shared pending list without reconstructing preceding chat",
+    "**Relevant task:**",
+    "**Truthful observation or uncertainty:**",
+    "summarize the actual observation/result",
+    "If evidence is unavailable or a check was not run, state that uncertainty",
+    "never invent evidence, a successful result, or a cause",
+    "**Concrete decision:**",
+    "Name the proposed action and what would stay unchanged",
+    "**Meaningful choices:** explain the scope and consequences of each choice",
+    "optional suggested choices",
+    "read the question and choices as if the preceding chat were unavailable",
+  ]) {
+    assert.ok(guidance.includes(phrase), `question guidance missing: ${phrase}`);
+  }
+  const execution = await readSkillFlat("pi-review-gate-execution");
+  assert.match(execution, /Before using an available, authorized `AskUserQuestion`, read the canonical/);
+  assert.match(execution, /\]\(\.\.\/pi-review-gate-orchestrator\/SKILL\.md#author-self-contained-askuserquestion-items\)/);
+  assert.match(execution, /both primary execution and delegated executor roles/);
+});
+
+test("shipped question examples independently explain observed and unknown evidence with choice effects (#373)", async () => {
+  const guidance = await readQuestionGuidance();
+  assert.match(normalize(guidance), /illustrative scenarios, not evidence about the current task/);
+  assert.match(guidance, /Given that result, should I proceed\?/);
+  assert.match(guidance, /Can I use option B\?/);
+  const examples = [...guidance.matchAll(/\*\*Self-contained question:\*\*\n\n((?:>.*\n)+)\n\*\*Suggested choices:\*\*\n\n((?:-.*\n)+)/g)];
+  assert.equal(examples.length, 2, "retain observed-result and unknown-evidence examples");
+  // Inspect just each question and its choices, without introductory chat/prose.
+  const [[, observedQuestion, observedChoices], [, unknownQuestion, unknownChoices]] = examples;
+  const observed = normalize(observedQuestion.replace(/^> /gm, ""));
+  for (const phrase of [
+    "For the CSV export bug",
+    "test failed",
+    "`north,west` became two columns instead of one",
+    "broader export tests have not run",
+    "fix the CSV serializer and add a regression test",
+    "leaving other export formats unchanged",
+    "stop with a diagnosis only and leave all files unchanged",
+  ]) assert.ok(observed.includes(phrase), `observed-result question missing: ${phrase}`);
+  assert.match(observedChoices, /Fix CSV escaping.*other export formats stay unchanged/);
+  assert.match(observedChoices, /diagnosis only.*no file changes.*bug unresolved/);
+
+  const unknown = normalize(unknownQuestion.replace(/^> /gm, ""));
+  for (const phrase of [
+    "For the login redirect patch",
+    "I do not have a retained result from the focused redirect test",
+    "I cannot say whether the patch passes",
+    "rerun the focused test in a disposable test environment",
+    "without changing the patch",
+    "pause patch finalization until test evidence is available",
+    "Neither choice deploys the patch or establishes broader validation",
+  ]) assert.ok(unknown.includes(phrase), `unknown-evidence question missing: ${phrase}`);
+  assert.match(unknownChoices, /Rerun.*evidence without patch changes or deployment/);
+  assert.match(unknownChoices, /Pause.*test result unknown.*do not deploy/);
+});
+
+test("question-authoring guidance and user docs preserve schema, privacy, delivery, and authority (#373)", async () => {
+  const guidance = normalize(await readQuestionGuidance());
+  for (const phrase of [
+    "applies only to `AskUserQuestion`, not notices or other tools",
+    "Prioritize clarity over needless terseness within the unchanged tool schema limits",
+    "no additional prose length prescription and no mandatory template or new schema fields",
+    "do not copy transcripts or expose credentials, private paths, or unrelated conversation contents",
+    "do not pull context from another session",
+    "not a UI, routing, history-retrieval, or process change",
+    "Keep async as the default",
+    "does not interrupt the run when answered",
+    "do not assume an answer or proceed with the decision-gated action",
+    "Sync remains for work that cannot proceed at all without the answer",
+    "Questions and answers stay bound to the originating session",
+    "Existing authorization and confirmation rules are unchanged",
+    "extra context does not grant permission",
+    "replace required confirmation",
+  ]) assert.ok(guidance.includes(phrase), `question boundary missing: ${phrase}`);
+  assert.doesNotMatch(guidance, /unlimited|no length cap/i);
+
+  const docs = await readFile(path.join(repoRoot, "docs", "user-questions.md"), "utf8");
+  const section = docs.match(/### Self-contained question authoring\n([\s\S]*?)(?=\n### |$)/);
+  assert.ok(section, "user docs must describe authoring guidance separately from UI behavior");
+  const authoring = normalize(section[1]);
+  for (const phrase of [
+    "execution skill links to that same guidance",
+    "actual observation/result or explicitly state uncertainty",
+    "concrete decision",
+    "scope and consequences of each choice without relying on earlier chat",
+    "not a changed UI or a guarantee of model compliance",
+    "within existing schema limits",
+    "no additional prose length prescription, mandatory template, or new fields",
+    "relevant, sanitized context",
+    "Async noninterrupting delivery, originating-session isolation",
+    "authorization and confirmation rules are unchanged",
+  ]) assert.ok(authoring.includes(phrase), `user docs missing authoring boundary: ${phrase}`);
+  assert.doesNotMatch(authoring, /unlimited|no length cap/i);
+});
+
 test("orchestrator skill directs workers to the shipped role skills and keeps recovery guidance", async () => {
   const skill = await readSkillFlat("pi-review-gate-orchestrator");
   assert.match(skill, /execution workers at the execution skill/);

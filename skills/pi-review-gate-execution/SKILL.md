@@ -47,6 +47,16 @@ execution role may do, how tools are discovered, and how results must be reporte
   real role, mode, or permission boundary changes. Detailed usage for the
   capabilities below lives in this skill.
 
+## AskUserQuestion authoring
+
+Before using an available, authorized `AskUserQuestion`, read the canonical
+[self-contained question guidance](../pi-review-gate-orchestrator/SKILL.md#author-self-contained-askuserquestion-items).
+It applies to both primary execution and delegated executor roles: delayed questions
+opened from the shared pending list need relevant task, truthful result or uncertainty,
+concrete decision, and meaningful choice consequences without preceding chat.
+This is guidance only; it preserves schema limits, async noninterrupting delivery,
+originating-session isolation/privacy, and existing authorization and confirmation.
+
 ## Background shells versus delegation
 
 Decide per piece of work; both use existing semantics, no new tools.

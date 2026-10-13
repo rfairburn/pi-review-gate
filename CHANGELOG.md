@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.150]
+## [0.1.0-dev.151]
 
 ### Fixed
 
@@ -26,6 +26,18 @@ dates.
   and original error stacks or arbitrary properties. The 64 MiB/15-second bounds,
   capture eligibility, temporary-enumerator cleanup, cancellation handling, and
   fail-closed worker admission are unchanged.
+
+## [0.1.0-dev.150]
+
+### Changed
+
+- Shipped skills guide `AskUserQuestion` callers to make delayed/shared-pending
+  questions self-contained with relevant task, truthful result or uncertainty,
+  concrete decision, and meaningful choice consequences (#373). The orchestrator
+  skill owns sanitized observed-result and unknown-evidence examples; the execution
+  skill links to that guidance. This is instructional guidance, not guaranteed model
+  compliance. Tool schema limits, UI/routing/history behavior, async noninterrupting
+  delivery, session isolation/privacy, and authorization/confirmation remain unchanged.
 
 ## [0.1.0-dev.149]
 

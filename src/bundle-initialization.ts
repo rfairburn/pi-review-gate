@@ -48,7 +48,15 @@ function same(left: Identity, right: Identity): boolean {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
-/** Exclusive allocation + immediate no-follow identity capture, without an async scheduling gap. */
+/**
+ * Exclusive allocation + immediate no-follow identity capture. Synchronous calls prevent
+ * in-process interleaving, not external process races. Ownership assumes no hostile
+ * external same-UID mutation during allocation/capture (for bundle and cleanup roots)
+ * or private cleanup. Public Node APIs lack an atomic creation-bound directory handle:
+ * substitution between mkdtempSync and the first lstatSync can be captured as owned
+ * and later recursively deleted. Detected substitutions, symlinks, or failed capture
+ * instead leave identity uncertain and refuse recursive deletion.
+ */
 export function allocateBundleRoot(prefix: string): OwnedDirectory {
   const owned: OwnedDirectory = { path: mkdtempSync(prefix) };
   try {
@@ -95,11 +103,16 @@ export function releaseBundleRoot(owned: OwnedDirectory): void {
 
 /**
  * Never recursively delete the public temp pathname after a check. Move it into a
- * fresh private directory and verify the moved inode first: substitution between
- * the check and rename is preserved, not recursively removed. All final proof and
- * deletion steps are synchronous (no in-process callbacks/awaits in that window).
- * Public Node APIs do not provide fd-relative recursive deletion; this fence is not
- * a defense against a hostile same-UID actor mutating the private directory itself.
+ * fresh private directory and verify the moved inode first: detected substitution
+ * between the check and rename is preserved, not recursively removed. Ownership
+ * assumes no hostile external same-UID mutation during allocation/identity capture
+ * of either root or private cleanup, as described by allocateBundleRoot above.
+ * All final proof and deletion steps are synchronous: they prevent in-process
+ * interleaving, not external races. Public Node APIs lack an atomic creation-bound
+ * directory handle and fd-relative recursive deletion; this fence cannot protect
+ * against pre-capture substitution or private-directory mutation during cleanup.
+ * Detected substitutions, symlinks, and uncertain capture still preserve/refuse;
+ * callers still settle all started work and retain the original initialization error.
  */
 export function cleanupFailedBundleRoot(owned: OwnedDirectory): void {
   let quarantine: OwnedDirectory | undefined;

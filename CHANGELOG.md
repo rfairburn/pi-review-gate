@@ -21,11 +21,19 @@ dates.
 
 - Failed initialization of a newly allocated review or reviewer-question bundle now
   drains all started setup work before removing its proven-owned temporary root
-  (#376). Caller-supplied, replaced, symlinked, and uncertain roots are preserved;
-  private relocation and identity checks fence deletion of the original pathname.
+  (#376). Ownership assumes no hostile external same-user (same-UID) mutation during
+  allocation/identity capture of either the bundle or private cleanup root, or during
+  private cleanup. Within that boundary, caller-supplied roots, detected substitutions,
+  symlinks, and failed or uncertain identity capture preserve/refuse deletion; private
+  relocation and identity checks fence deletion of the original pathname. Synchronous
+  calls prevent in-process interleaving, not external process races: public Node APIs
+  lack an atomic creation-bound directory handle and fd-relative recursive deletion.
+  Substitution between `mkdtempSync` and the first `lstatSync` can be captured as owned
+  and later recursively deleted; that race and private-directory mutation during
+  cleanup are outside the guarantee.
   Cleanup failures/refusals are reported without masking the initialization error.
-  Successful creation, configured retention, and recovery/checkpoint evidence are
-  unchanged; no historical temporary-directory sweeping is added.
+  Successful creation, configured retention, recovery/checkpoint evidence, and cache
+  behavior are unchanged; no historical temporary-directory sweeping is added.
 
 ## [0.1.0-dev.149]
 

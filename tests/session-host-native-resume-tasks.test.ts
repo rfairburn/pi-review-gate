@@ -365,6 +365,10 @@ async function ensureSidebarFocus(driver: SavedMainDriver): Promise<void> {
   await driver.waitFrame((text) => isSidebarFocusedFrame(text, SIDEBAR_COLUMNS)
     || isMainFocusFrame(text) || sidebarRosterHidden(text),
   "a complete sidebar, Main, or hidden-pane witness establishes the current focus domain");
+  // A renamed roster card may paint before the focus footer in the same
+  // repaint. F8 toggles differently in Main and sidebar focus, so settle the
+  // prior action's frame before deciding whether one real F8 is needed.
+  await driver.waitForQuietFrame("the native focus frame finishes repainting before the F8 decision");
   if (isSidebarFocusedFrame(driver.currentText(), SIDEBAR_COLUMNS)) return;
   const snapshot = driver.snapshot();
   driver.pty.write(KEYS.f8);

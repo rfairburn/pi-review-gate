@@ -15,6 +15,29 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.149]
+
+### Changed
+
+- Pi 1.2.0 is now the targeted runtime (#388). The optional session host's
+  `pi-session-host-tui` dependency is now the `@earendil-works/pi-tui` 1.2.0 alias,
+  and `pi-review-sessions` provisions an isolated Pi 1.2.0 runtime when no supported
+  installation exists. The locked CI Pi UI and agent-core fixtures and the
+  exact-version host checks moved to 1.2.0 too. The supported floors are unchanged:
+  stable Pi 1.0.4 or newer for the session host, Pi 1.0.0 or newer for the
+  extension, and Node.js 22.19.0 or newer. Canonical Pi packages are still never
+  hoisted beside the alias. Host form fields remove only the exact fake-cursor
+  markers that pi-tui 1.2.0 wraps around the caret before the unchanged sanitizer
+  runs, so text after a mid-line caret stays visible. Saved-session search remains
+  adapted from Pi 1.1.0, whose native matcher is unchanged in 1.2.0.
+- The replacement `tool_search` declares Pi 1.2's public `reachesTools` contract
+  so native MCP discovery and server readiness work, while retaining older-host
+  schema recognition and the unchanged authorization ceiling (#388).
+- Pi 1.2's new idle custom-run `before_agent_start` event arms the review gate
+  without adding user-turn prompt guidance to scheduler or wake messages.
+  Message-start attribution, older-host fallback arming, and settlement remain
+  unchanged (#388).
+
 ## [0.1.0-dev.148]
 
 ### Added

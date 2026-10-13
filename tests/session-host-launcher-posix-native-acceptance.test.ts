@@ -4,7 +4,7 @@
  * This lane exercises the REAL shipped POSIX source wrapper end to end:
  *
  *   /bin/bash <fresh-copied-fixture>/scripts/pi-review-sessions.sh \
- *     --pi-executable <pinned Pi 1.1.0 CLI> --state-root <owned> --sidebar-key f8 \
+ *     --pi-executable <pinned Pi 1.2.0 CLI> --state-root <owned> --sidebar-key f8 \
  *     -- --offline --no-context-files --no-themes --no-tools \
  *        --extension <observer> --extension <provider>
  *
@@ -88,7 +88,7 @@ function assertCredentialNamesPreserved(records: readonly { credentialLikeEnviro
 // bounded arithmetic the POSIX acceptance relies on.
 test("POSIX source-launcher acceptance bounds are finite and fit the whole-file budget", () => {
   assertPosixLegArithmetic();
-  assert.equal(POSIX_LAUNCHER_EXPECT_PI_VERSION, "1.1.0");
+  assert.equal(POSIX_LAUNCHER_EXPECT_PI_VERSION, "1.2.0");
   assert.equal(POSIX_LAUNCHER_LEG_DEADLINE_MS, 9 * 60_000);
   assert.ok(POSIX_LAUNCHER_STARTUP_TIMEOUT_MS < POSIX_LAUNCHER_LEG_DEADLINE_MS);
 });
@@ -106,7 +106,7 @@ test("real POSIX source launcher stages, builds, runs a native Pi child, and res
   // Pre-mutation original role/catalog refusal and pinned-runtime resolution
   // happen before any fixture copy or child spawn.
   const runtime = resolveLauncherRuntime(layout);
-  assert.equal(runtime.version, "1.1.0", "the POSIX launcher lane pins exact Pi 1.1.0");
+  assert.equal(runtime.version, "1.2.0", "the POSIX launcher lane pins exact Pi 1.2.0");
   assertSourceFixtureUnchanged(runtime);
 
   const rootIdentity = identityOfRealDirectory(layout.root);

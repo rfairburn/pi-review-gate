@@ -8,6 +8,7 @@ import {
   getKeybindings,
   matchesKey,
   parseKey,
+  renderFakeCursor,
   setKeybindings,
   sliceByColumn,
   TuiMainScreen,
@@ -22,6 +23,12 @@ import {
 } from "pi-session-host-tui";
 
 const DEFAULT_NAME_MAX_BYTES = MAX_RENAME_NAME_BYTES;
+// The pinned native Editor wraps its rendered caret grapheme in exact
+// BEL-terminated APC fake-cursor markers. Only those exact wrappers, derived
+// from the public renderer, are removed from trusted Editor render output; the
+// enclosed grapheme and the following text stay, and everything else still
+// passes through the unchanged fail-closed single-line sanitizer.
+const NATIVE_FAKE_CURSOR_WRAPPERS = nativeFakeCursorWrappers();
 const PATH_MAX_CODE_POINTS = 2048;
 const MAX_PASTE_BYTES = 8192;
 const BRACKETED_PASTE_START = "\x1b[200~";
@@ -342,14 +349,14 @@ export class SessionHostTextField {
       const source = rendered[row] ?? "";
       const markerIndex = source.indexOf(CURSOR_MARKER);
       if (markerIndex >= 0 && !cursor.visible) {
-        const beforeMarker = sanitizeSingleLine(source.slice(0, markerIndex));
+        const beforeMarker = sanitizeSingleLine(stripNativeFakeCursor(source.slice(0, markerIndex)));
         cursor = {
           column: Math.min(Math.max(visibleWidth(beforeMarker), 0), cols - 1),
           row,
           visible: true,
         };
       }
-      const withoutMarker = source.split(CURSOR_MARKER).join("");
+      const withoutMarker = stripNativeFakeCursor(source.split(CURSOR_MARKER).join(""));
       const safe = sanitizeSingleLine(withoutMarker);
       const clipped = sliceByColumn(safe, 0, cols, true);
       const used = Math.min(visibleWidth(clipped), cols);
@@ -1176,6 +1183,19 @@ class FieldTerminalPort implements Terminal {
   // field owns no real terminal and never starts its local TUI, so neither
   // title/progress nor program-wide status may escape into the host writer.
   setProgramStatus(_status: unknown): void {}
+}
+
+function nativeFakeCursorWrappers(): readonly string[] {
+  const sentinel = "\uE000";
+  const parts = renderFakeCursor(sentinel).split(sentinel);
+  if (parts.length !== 2) return [];
+  return parts.filter((part) => part.length > 0 && part.startsWith("\x1b") && part !== CURSOR_MARKER);
+}
+
+function stripNativeFakeCursor(source: string): string {
+  let result = source;
+  for (const wrapper of NATIVE_FAKE_CURSOR_WRAPPERS) result = result.split(wrapper).join("");
+  return result;
 }
 
 function sanitizeSingleLine(source: string): string {

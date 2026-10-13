@@ -5,7 +5,7 @@
  *
  * This module owns the owned-PTY driver around the real public Main API
  * (`runSessionHost` in a privately staged candidate package), the pinned real
- * Pi 1.1.0 fixture resolution, bounded scratch staging, and the exact-PID
+ * Pi 1.2.0 fixture resolution, bounded scratch staging, and the exact-PID
  * kernel exit watchers. It is test infrastructure only: no production source,
  * CI, package, docs, or SDK surface changes; no `__test` dependency-injection
  * seam is added to production. The driver's optional `args`/`env` overrides
@@ -392,8 +392,8 @@ export function resolveRuntimePin(t: { skip(message?: string): void }): RuntimeP
     requiredOrSkip(t, "explicit installed Pi package, Node CLI, and version pins are required");
     return undefined;
   }
-  if (expectedVersion !== "1.1.0") {
-    requiredOrSkip(t, "this native Main integration phase pins Pi 1.1.0");
+  if (expectedVersion !== "1.2.0") {
+    requiredOrSkip(t, "this native Main integration phase pins Pi 1.2.0");
     return undefined;
   }
 
@@ -407,7 +407,7 @@ export function resolveRuntimePin(t: { skip(message?: string): void }): RuntimeP
     return undefined;
   }
   if (packageInfo.name !== "@earendil-works/pi-coding-agent" || packageInfo.version !== expectedVersion) {
-    requiredOrSkip(t, "the explicit runtime pin is not the expected @earendil-works/pi-coding-agent 1.1.0 package");
+    requiredOrSkip(t, "the explicit runtime pin is not the expected @earendil-works/pi-coding-agent 1.2.0 package");
     return undefined;
   }
 

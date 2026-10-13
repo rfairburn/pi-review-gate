@@ -321,6 +321,17 @@ module.exports = async function (pi) {
 		handler: async (_args, ctx) => { await ctx.reload(); },
 	});
 
+	/** JSON-safe summary of a registry entry's reachesTools: absent, its reach, or a thrown error. */
+	function reachSummary(tool) {
+		if (typeof tool.reachesTools !== 'function') return undefined;
+		try {
+			const reach = tool.reachesTools({});
+			return reach === 'all' || Array.isArray(reach) ? reach : `unexpected:${typeof reach}`;
+		} catch (error) {
+			return `threw:${String(error)}`;
+		}
+	}
+
 	// --- Inventory dump command (native extension-command seam) ---
 	pi.registerCommand('native-mcp-probe', {
 		description: 'Write the live session tool/command inventory for the native MCP fixture',
@@ -334,6 +345,8 @@ module.exports = async function (pi) {
 					namespace: tool.namespace === undefined || tool.namespace === null ? undefined : tool.namespace.name,
 					annotations: tool.annotations,
 					description: typeof tool.description === 'string' ? tool.description.slice(0, 200) : tool.description,
+					// Pi 1.2+ reports a reaching tool's reachesTools (#388); record what an empty-input call reaches.
+					reachesTools: reachSummary(tool),
 				}));
 				const dump = {
 					ts: Date.now(),

@@ -1,5 +1,5 @@
 /**
- * Real public Pi 1.1.0 POSIX (macOS/Linux; Windows ConPTY is a separate
+ * Real public Pi 1.2.0 POSIX (macOS/Linux; Windows ConPTY is a separate
  * acceptance) native row-lifecycle acceptance for followup #323/PR328:
  *
  * - Two independently live native children share one ordinary agent dir in
@@ -411,7 +411,7 @@ test("real public Main proves current-binding exited-restart and isolated d-stop
   requirePublicRuntimeDependencies(runtime);
   assert.equal(shortBaselineFitsTwentyFourColumns(), true,
     "the complete primary-screen witness fits in a 24-column terminal baseline");
-  assert.equal(runtime.version, "1.1.0", "the row-lifecycle proof pins the actual public Pi 1.1.0 runtime");
+  assert.equal(runtime.version, "1.2.0", "the row-lifecycle proof pins the actual public Pi 1.2.0 runtime");
 
   const suffix = Math.random().toString(16).slice(2, 8);
   const nameA = `RowA-${suffix}`;

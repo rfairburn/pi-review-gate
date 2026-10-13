@@ -15,6 +15,7 @@ interface RegisteredTool {
   promptSnippet?: string;
   exposure?: string;
   parameters?: unknown;
+  reachesTools?: (input?: unknown) => unknown;
   execute?: (id: string, params: unknown) => Promise<Record<string, unknown>>;
   renderResult?: (value: unknown, options: unknown, theme: unknown, context?: unknown) => unknown;
 }
@@ -2667,6 +2668,7 @@ test("late registration borrows the live host tool_search parameter schema by ex
   assert.equal(await manager.registerWithNativeSchema(), true);
   const descriptor = () => fixture.definitions.find((definition) => definition.name === "tool_search")!;
   assert.equal(descriptor().parameters, nativeParameters, "the live native schema is reused by exact reference");
+  assertReachesAll(descriptor(), "late registration");
   assert.equal(registerCalls, 1, "registered once, at session start");
 
   // The reference persists across every descriptor refresh: boundary capture
@@ -2676,11 +2678,68 @@ test("late registration borrows the live host tool_search parameter schema by ex
   mode = "plan-research";
   manager.reapply();
   assert.equal(descriptor().parameters, nativeParameters, "identity survives a mode-change refresh");
+  assertReachesAll(descriptor(), "mode-change refresh");
 
   // A second late registration is rejected: one loader per session incarnation.
   const callsBefore = registerCalls;
   assert.equal(await manager.registerWithNativeSchema(), false);
   assert.equal(registerCalls, callsBefore, "no competing re-registration");
+});
+
+/**
+ * #388: Pi 1.2 recognizes a replacement tool_search only when it declares
+ * `reachesTools` (the builtin's contract is "all" for every input); Pi <= 1.1
+ * keeps recognizing it by schema identity, asserted separately.
+ */
+function assertReachesAll(descriptor: RegisteredTool, context: string): void {
+  assert.equal(typeof descriptor.reachesTools, "function", `${context}: tool_search declares reachesTools`);
+  for (const input of [{ query: "mcp__docs__search" }, { query: "public web", limit: 2 }, {}, undefined]) {
+    assert.equal(descriptor.reachesTools!(input), "all", `${context}: every tool_search call may reach all tools`);
+  }
+}
+
+test("reachesTools is recognition metadata only: schema identity and fail-closed gates are unchanged (#388)", async () => {
+  const fixture = hostFixture();
+  const nativeParameters = {
+    type: "object",
+    required: ["query"],
+    properties: { query: { type: "string" }, limit: { type: "number" } },
+  };
+  fixture.registerInactive({ name: "tool_search", description: "native builtin", parameters: nativeParameters });
+  fixture.registerInactive(tool("mcp__docs__search", "Search remote docs entries.", { exposure: "deferred" }));
+  let mode: OperatingMode = "execute";
+  const manager = new DeferredToolManager(fixture.pi, () => mode);
+  assert.equal(await manager.registerWithNativeSchema(), true);
+  const descriptor = () => fixture.definitions.find((definition) => definition.name === "tool_search")!;
+  // Both recognition seams at once: reachesTools for Pi 1.2+, the exact
+  // native schema reference for Pi 1.0.4/1.1.x.
+  assertReachesAll(descriptor(), "before startup");
+  assert.equal(descriptor().parameters, nativeParameters, "native schema identity is kept beside reachesTools");
+
+  // Declaring "all" grants nothing: before a boundary is captured the loader
+  // and every non-conservative call stay blocked, and search is unavailable.
+  assert.equal(manager.toolCallAllowed(DEFERRED_TOOL_SEARCH_NAME), false);
+  assert.equal(manager.toolCallAllowed("mcp__docs__search"), false);
+  const early = await fixture.search()("before-capture", { query: "mcp__docs__search" });
+  assert.equal(early.isError, true, "search fails closed before startup despite reachesTools");
+  assert.equal(fixture.active().includes("mcp__docs__search"), false);
+
+  // After capture, plan/research still excludes MCP from search and calls.
+  assert.equal(manager.sessionStart(fixture.sessionIdentity), true);
+  mode = "plan-research";
+  manager.reapply();
+  assertReachesAll(descriptor(), "plan-research refresh");
+  assert.equal(descriptor().parameters, nativeParameters);
+  const planned = await fixture.search()("plan", { query: "mcp__docs__search" });
+  assert.deepEqual((planned.details as { activated?: string[] } | undefined)?.activated ?? [], []);
+  assert.equal(fixture.active().includes("mcp__docs__search"), false);
+  assert.equal(manager.toolCallAllowed("mcp__docs__search", true), false);
+
+  // Execute mode activates only through the authorized search path.
+  mode = "execute";
+  manager.reapply();
+  const executed = await fixture.search()("execute", { query: "mcp__docs__search" });
+  assert.deepEqual((executed.details as { activated: string[] }).activated, ["mcp__docs__search"]);
 });
 
 /**
@@ -2743,6 +2802,7 @@ test("late registration captures the bundled-factory schema when no live builtin
     // Same module record through the loader's require: exact reference.
     assert.equal(descriptor.parameters, factoryModule.__parameters,
       "the bundled factory's exact parameters reference is reused");
+    assertReachesAll(descriptor, "bundled-factory registration");
   } finally {
     await rm(host.root, { recursive: true, force: true });
   }
@@ -2823,6 +2883,7 @@ test("late registration keeps the local fallback schema when no running host res
   const parameters = descriptor.parameters as { properties: Record<string, unknown> };
   assert.ok(parameters.properties.query, "the local fallback keeps the query property");
   assert.equal(parameters.properties.limit, undefined, "no native limit property is invented");
+  assertReachesAll(descriptor, "fallback-schema registration");
 
   // Unsupported hosts are rejected exactly like the sync register.
   const unsupported = new DeferredToolManager({});

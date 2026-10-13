@@ -60,9 +60,12 @@ competing definition whether the builtin tool search is enabled, disabled, or
 toggled across a reload. The descriptor reuses the host-native `tool_search`
 parameter schema by exact reference (borrowed from the live registry when the
 builtin is loaded, otherwise captured from the running install's own bundled
-factory), so Pi's identity-based tool-search recognition accepts it and its
-genuine diagnostics — including the warning for a truly missing discovery path —
-remain intact. When no running Pi host resolves (unit tests, non-Pi processes),
+factory) for Pi 1.1 and older hosts' identity-based recognition. On Pi 1.2 and
+newer, the descriptor declares `reachesTools: () => "all"`, the public contract
+Pi uses to recognize a replacement and wait for native MCP server readiness.
+Neither mechanism grants tool access: the captured authorization ceiling and
+loading gates remain authoritative, and genuine diagnostics — including the
+warning for a truly missing discovery path — remain intact. When no running Pi host resolves (unit tests, non-Pi processes),
 the loader keeps its local fallback schema and startup proceeds unchanged; when
 a host resolves but its native schema cannot be acquired, session start fails
 explicitly instead of registering an incompatible descriptor that would silently

@@ -50,7 +50,7 @@ const optIn = process.env[LAUNCHER_REQUIRE_ENV] === "1";
 // bounded CI arithmetic the alpha workflow step relies on.
 test("source-launcher acceptance bounds are finite and fit the whole-file budget", () => {
   assertLegArithmetic();
-  assert.equal(LAUNCHER_EXPECT_PI_VERSION, "1.1.0");
+  assert.equal(LAUNCHER_EXPECT_PI_VERSION, "1.2.0");
   assert.equal(LAUNCHER_LEG_DEADLINE_MS, 9 * 60_000);
   assert.ok(LAUNCHER_LEGS.length === 2,
     "both real wrapper legs (cmd and direct PowerShell) are retained; runtime coverage deferred under #345");
@@ -67,7 +67,7 @@ for (const leg of LAUNCHER_LEGS) {
     // Once opted in, all missing platform/runtime prerequisites are hard failures.
     assert.equal(process.env[LAUNCHER_REQUIRE_ENV], "1");
     const runtime = resolveLauncherRuntime();
-    assert.equal(runtime.version, "1.1.0", "the launcher lane pins exact Pi 1.1.0");
+    assert.equal(runtime.version, "1.2.0", "the launcher lane pins exact Pi 1.2.0");
     assertSourceFixtureUnchanged(runtime);
 
     const layout = createLauncherLegLayout(leg);

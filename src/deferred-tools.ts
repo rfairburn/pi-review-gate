@@ -193,6 +193,15 @@ const BOUNDARY_REGISTRY_KEY = Symbol.for("pi-review-gate.deferred-tool-authoriza
  * when a host DOES resolve but its native schema cannot be acquired, session
  * start fails explicitly — a concrete compatibility failure, never a silent
  * registration of the known-incompatible fallback.
+ *
+ * #388: Pi 1.2 no longer recognizes a replacement tool_search by schema
+ * identity; its MCP extension activates (and stops warning about) a
+ * replacement only when the definition declares `reachesTools`, and uses it to
+ * wait for the servers a call may reach. The descriptor therefore declares
+ * `reachesTools: () => "all"` (the builtin's contract) while keeping the
+ * native schema identity Pi 1.0.4/1.1.x still require. Both are recognition
+ * metadata only; authority remains the captured boundary and search()'s
+ * fail-closed gates.
  */
 export class DeferredToolManager {
   private boundary: AuthorizationBoundary | undefined;
@@ -251,8 +260,9 @@ export class DeferredToolManager {
    * Pi host resolves, the local fallback schema is kept and startup proceeds
    * unchanged; when a host resolves but its native schema cannot be acquired,
    * this rejects with an explicit compatibility failure instead of registering
-   * the known-incompatible fallback (which would fail Pi's identity-based
-   * tool_search recognition and restore the false discovery warning).
+   * the known-incompatible fallback (which would fail Pi <= 1.1's
+   * identity-based tool_search recognition and restore the false discovery
+   * warning there).
    */
   async registerWithNativeSchema(): Promise<boolean> {
     if (this.registered || !isDeferredToolHost(this.pi)) return false;
@@ -293,8 +303,10 @@ export class DeferredToolManager {
    * No resolved host yields undefined (the caller keeps the local fallback
    * schema); a RESOLVED host whose bundle, factory, or captured schema cannot
    * be acquired throws — registering the incompatible fallback there would
-   * fail Pi's identity-based recognition and restore the false discovery
-   * warning, so this is an explicit compatibility failure instead.
+   * fail Pi <= 1.1's identity-based recognition and restore the false
+   * discovery warning, so this is an explicit compatibility failure instead
+   * (kept on Pi 1.2+, which recognizes reachesTools, so one fail-closed rule
+   * covers every supported host).
    */
   private async factoryToolSearchParameters(): Promise<Record<string, unknown> | undefined> {
     const sdkFile = resolveHostPeerFile(PI_AGENT_PACKAGE_NAME, { packageMainFallback: true });
@@ -641,9 +653,18 @@ export class DeferredToolManager {
       description: this.renderSearchToolDescription(),
       promptSnippet: this.renderSearchToolSnippet(),
       executionMode: "sequential" as const,
+      // #388: Pi 1.2 recognizes a replacement tool_search (MCP activation,
+      // the "neither is active" discovery warning, and server readiness waits
+      // before a call) only when the definition declares `reachesTools`; like
+      // the builtin, a query may match any not-yet-declared tool, so every
+      // call reaches "all". Earlier hosts ignore the field. It is recognition
+      // metadata only: authorization, mode filtering, and the fail-closed
+      // activation gates in search() are unchanged.
+      reachesTools: () => "all" as const,
       // The host-native schema reference when one was resolved at late
-      // registration (identity Pi's own tool_search recognition requires);
-      // the local fallback otherwise. Never cloned or mutated.
+      // registration (identity Pi <= 1.1's tool_search recognition requires,
+      // retained alongside reachesTools); the local fallback otherwise.
+      // Never cloned or mutated.
       parameters: this.nativeSearchParameters ?? {
         type: "object",
         properties: {

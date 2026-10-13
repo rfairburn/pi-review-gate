@@ -272,12 +272,16 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
    * for every agent run this extension observes. The review gate's
    * before_agent_start calls it for every normal user turn; the scheduled
    * custom-message observation (message_start) calls it for the idle and
-   * queued scheduled runs whose submit path on real Pi hosts bypasses
-   * before_agent_start entirely. Idempotent for an already-armed run (a busy
-   * queued turn shares the exchange window the running cycle armed) and
-   * capturing a fresh checkpoint baseline for an idle run. It cannot modify
-   * the system prompt (message_start has no prompt result): the model-facing
-   * injection stays on the before_agent_start path only.
+   * queued scheduled runs whose submit path on Pi <= 1.1 hosts bypasses
+   * before_agent_start entirely. #388: Pi 1.2 emits before_agent_start
+   * (messageType "custom") for an idle custom-message run before its
+   * agent_start, so that run arms here first and its message_start arming is
+   * the idempotent re-assertion; attribution still happens only at
+   * message_start. Idempotent for an already-armed run (a busy queued turn
+   * shares the exchange window the running cycle armed) and capturing a fresh
+   * checkpoint baseline for an idle run. It cannot modify the system prompt
+   * (message_start has no prompt result): the model-facing injection stays on
+   * the before_agent_start path, and only for user-prompt runs.
    */
   const armAgentRun = async (args: unknown[]): Promise<"armed" | "blocked"> => {
     // Pi may auto-activate tools registered after session_start. Reassert the

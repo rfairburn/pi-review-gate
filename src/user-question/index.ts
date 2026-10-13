@@ -40,7 +40,8 @@ import {
   type NativeEditorFieldHandle,
   type NativeEditorFieldSemantics,
 } from "../native-editor-bridge";
-import { registerHook, sendNotice } from "../pi";
+import { onTerminalInput, registerHook, sendNotice } from "../pi";
+import { publishForegroundEscape, routeForegroundEscape } from "../foreground-escape";
 import { UserQuestionController, type PendingNotice, type QuestionSubmitSource } from "./controller";
 import {
   createQuestionListComponent,
@@ -161,11 +162,14 @@ export function registerUserQuestions(
   let uiContextSource: Record<string, unknown> | undefined;
   /** Bumped on every session-bound rebind; fences in-flight UI openings. */
   let bindingGeneration = 0;
+  let retirePopupEscape: (() => void) | undefined;
+  const retirePopup = () => { retirePopupEscape?.(); retirePopupEscape = undefined; };
   const noteContext = (ctx: unknown): void => {
     // Session boundary: retire the previous sink first, using it only for a
     // best-effort clear of any panel it displayed — never to show the new
     // session's questions. A throwing or missing UI on the replacement
     // retires the old sink too (fail closed: no panel).
+    retirePopup();
     const previous = uiContextSource;
     if (previous) {
       try {
@@ -225,6 +229,7 @@ export function registerUserQuestions(
   // native field as a cancel and put the displaced chat draft back so the
   // reset carries the draft — not a partial answer — into the default editor.
   registerHook(pi, "session_shutdown", () => {
+    retirePopup();
     abortActiveNativeEditorField();
   });
 
@@ -249,7 +254,10 @@ export function registerUserQuestions(
         // of the session surface; it drives the list only and never becomes
         // the panel's widget sink (that stays bound to session_start).
         handler: (ctx: unknown) => {
-          return openQuestionList(pi, controller, ctx, () => bindingGeneration);
+          return openQuestionList(pi, controller, ctx, () => bindingGeneration, (retire) => {
+            retirePopup();
+            retirePopupEscape = retire;
+          });
         },
       });
       shortcutRegistered = true;
@@ -261,6 +269,7 @@ export function registerUserQuestions(
     uiAvailable: shortcutRegistered,
     setInteractiveUi: (value: boolean) => {
       interactiveUi = value;
+      if (!value) retirePopup();
     },
     noteContext: (ctx: unknown) => noteContext(ctx),
     syncPanel: () => refreshPanel(),
@@ -286,6 +295,7 @@ async function openQuestionList(
   controller: UserQuestionController,
   ctx: unknown,
   bindingGenerationNow: () => number,
+  noteEscapeLease: (retire: () => void) => void,
 ): Promise<void> {
   const identity = sessionManagerOf(ctx);
   // Recheck the originating session before presenting anything: a missing or
@@ -391,6 +401,18 @@ async function openQuestionList(
   const handle: NativeEditorFieldHandle | undefined =
     acquired.kind === "acquired" ? acquired.handle : undefined;
   let customResult: unknown;
+  let retireEscape: (() => void) | undefined;
+  let unsubscribeEscape: (() => void) | undefined;
+  let overlayHandle: { isFocused(): boolean } | undefined;
+  let closed = false;
+  const retire = () => {
+    if (closed) return;
+    closed = true;
+    retireEscape?.();
+    try { unsubscribeEscape?.(); } catch {
+      // Stale UI cleanup must not prevent done() or native draft restoration.
+    }
+  };
   try {
     // The captured method keeps its original ui receiver: receiver-dependent
     // SDK methods and foreign forwarding wrappers rely on it. The shared
@@ -415,18 +437,38 @@ async function openQuestionList(
         isStale: stale,
         requestRender,
         getViewportRows: () => questionPopupViewportRows(tui),
-        onDone: (result) => done(result),
+        onDone: (result) => {
+          retire(); // Synchronous: the next, separate Escape cancels normally.
+          done(result);
+        },
       });
       component.setSourceProbe(sourceProbeOf(ctx));
+      retireEscape = publishForegroundEscape(ctx, {
+        handleInput: (data) => { component.handleInput(data); requestRender?.(); },
+        isCurrent: () => !closed && !stale() && controller.isSessionBound(identity),
+        isForeground: () => overlayHandle?.isFocused() === true,
+      });
+      noteEscapeLease(retire);
+      // Whichever registers first (popup or review) routes and consumes the
+      // Escape before native focus dispatch or any later raw listener.
+      unsubscribeEscape = onTerminalInput(ctx, (data) => !closed && !stale()
+        && controller.isSessionBound(identity) && routeForegroundEscape(ctx, data)
+        ? { consume: true } : undefined);
       return component;
     }, {
       overlay: true,
       overlayOptions: questionPopupOverlayOptions(),
+      onHandle: (value: unknown) => {
+        if (!closed && isRecord(value) && typeof value.isFocused === "function") {
+          overlayHandle = value as unknown as { isFocused(): boolean };
+        }
+      },
     });
   } catch {
     // The host surfaced the failure itself (error banner); the questions
     // remain pending and the panel stays visible.
   } finally {
+    retire();
     // Ownership-checked restore of the prior editor factory; a no-op after a
     // session-reset abort (the host owns the slot from that point on).
     handle?.finish();

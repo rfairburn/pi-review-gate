@@ -234,10 +234,15 @@ arrows select · Enter confirm · Esc back
 - **Decline** is one deliberate action: select the Decline row and press
   Enter. There is no second confirmation, but Escape only goes back — it
   never declines.
-- While the overlay is open it has input focus: all keys, including Escape,
-  are handled by it, so nothing triggers Pi's abort. Your editor draft is
-  saved while the overlay is open and restored when it closes. Pressing the
-  shortcut again (or Esc) closes the overlay and returns to the pending panel.
+- While the shared question/notice overlay has foreground input focus,
+  Escape performs only its existing close, back, or native completion-dismiss
+  action. It does not abort Pi or cancel an automatic or command-driven review
+  underneath it; that review continues to its real verdict. Once the overlay
+  closes, a separate Escape — even immediately afterward — cancels an active
+  review normally. Pending input with no foreground popup does not intercept
+  review cancellation. Your editor draft is saved while the overlay is open
+  and restored when it closes. Pressing the shortcut again (or Esc in the
+  list) closes the overlay and returns to the pending panel.
 - The list reads live state: a question that becomes pending (or waiting), or
   a new notice, appears without re-opening. A question you resolve or a notice
   you close disappears; when the last question or notice is gone, the list

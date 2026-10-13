@@ -252,6 +252,13 @@ capped JSONL stream separately as `raw-stream.jsonl`.
 
 ## Cancellation
 
+The foreground [pending-input popup](user-questions.md#shared-pending-panel-and-list)
+(question or notice) owns Escape before review cancellation: it performs only the
+popup's existing close, back, or native completion-dismiss action. An automatic or
+command-driven review underneath continues unchanged to its real verdict. After the
+popup closes, a separate Escape, even immediately afterward, cancels normally.
+Pending input without a foreground popup does not suppress cancellation.
+
 Canceling a running review with Escape cancels the whole parallel review, even if one
 reviewer has already completed. Escape is recognized in legacy terminals (raw ESC) and
 in Kitty-keyboard-protocol / CSI-u and xterm `modifyOtherKeys` terminals, where

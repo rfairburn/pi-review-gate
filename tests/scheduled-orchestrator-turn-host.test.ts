@@ -780,6 +780,82 @@ test(`a busy queued scheduled turn shares the existing armed window and settles 
 });
 }
 
+test("an idle third-party custom-message run arms and persists the review baseline before its model request without prompt injection or scheduled attribution (pi-1.2 host)", async () => {
+  const foreignCustomType = "third-party-background-ready";
+  const foreignContent = "Another extension's background job is ready.";
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-turn-host-foreign-"));
+  let started: StartedSession | undefined;
+  let releaseForeignRun: (() => void) | undefined;
+  try {
+    // The foreign run's model phase is held at its model request so the
+    // in-run state is asserted before the run ends and settles.
+    const foreignRunGate = new Promise<void>((resolvePromise) => { releaseForeignRun = resolvePromise; });
+    started = await startScheduledSession(dir, (message) => (
+      message.customType === foreignCustomType ? foreignRunGate : undefined
+    ), "pi-1.2");
+    const { machine, tracker } = started;
+
+    // Another extension's idle triggered send (the scheduler clock never
+    // advances, so no scheduled occurrence exists in this session).
+    const foreignSend = machine.pi.sendMessage(
+      { role: "custom", customType: foreignCustomType, content: foreignContent, display: false },
+      { triggerTurn: true },
+    );
+    await waitForCondition(() => started!.probes.some((probe) => probe.customType === foreignCustomType));
+
+    // Pi 1.2 emitted exactly one custom before_agent_start for the foreign
+    // run; the extension armed there without failing and without injecting
+    // any model-facing content (every handler result is undefined).
+    assert.deepEqual(machine.beforeAgentStartEvents.map((event) => [event.messageType, event.customType]), [["custom", foreignCustomType]]);
+    const foreignEvent = machine.beforeAgentStartEvents[0]!;
+    assert.deepEqual(foreignEvent.errors, [], "custom-run arming succeeded");
+    assert.ok(foreignEvent.results.length > 0 && foreignEvent.results.every((result) => result === undefined),
+      `a third-party custom-message run receives no prompt injection: ${JSON.stringify(foreignEvent.results)}`);
+    assert.equal(machine.beforeAgentStarts.length, 0, "no user-prompt path ran");
+
+    // The baseline was persisted by the extension's own before_agent_start
+    // handler, with nothing attributed or recorded as a scheduled request.
+    assert.equal(started.beforeAgentStartProbes.length, 1);
+    const armedProbe = started.beforeAgentStartProbes[0]!;
+    assert.equal(armedProbe.messageType, "custom");
+    assert.equal(armedProbe.customType, foreignCustomType);
+    assert.equal(armedProbe.sawReviewWindow, true, "the foreign run's review baseline was persisted at before_agent_start");
+    assert.deepEqual(armedProbe.pendingProcessed, [], "no scheduled occurrence exists or is attributed");
+    assert.equal(armedProbe.settledOccurrences, 0);
+    assert.equal(armedProbe.requestTexts.some((request) => request.includes(foreignContent)), false,
+      "the foreign message is never recorded as a scheduled request");
+
+    // At the model request (run held there): the persisted baseline is still
+    // in place and the foreign message was never attributed as an occurrence.
+    const foreignProbes = started.probes.filter((probe) => probe.customType === foreignCustomType);
+    assert.equal(foreignProbes.length, 1);
+    assert.equal(foreignProbes[0]!.sawReviewWindow, true, `the review window must be armed before model work (${foreignProbes[0]!.sidecarError ?? "ok"})`);
+    assert.equal(foreignProbes[0]!.requestTexts.some((request) => request.includes(foreignContent)), false);
+    assert.equal(foreignProbes[0]!.pendingOccurrences, 0, "the foreign message_start attributed no scheduled occurrence");
+    assert.equal(foreignProbes[0]!.settledOccurrences, 0);
+    assert.equal(started.probes.length, 1, "only the foreign run reached a model request");
+
+    // Release the held run; its end and settlement complete without ever
+    // creating, attributing, or settling a scheduled occurrence.
+    releaseForeignRun!();
+    await foreignSend;
+    await Promise.allSettled(machine.sendPromises);
+    assert.equal(tracker.pendingOccurrences().length, 0);
+    assert.equal(tracker.settledOccurrences().length, 0, "a third-party run never counts as a scheduled occurrence");
+    assert.deepEqual(machine.sendMessageDeliveries.map((delivery) => delivery.customType), [foreignCustomType],
+      "the extension sent no scheduled turn or wake of its own");
+    assert.equal(machine.notices.some((notice) => notice.includes("could not reassert") || notice.includes("could not be correlated")), false,
+      `no review/auth arming failure was reported: ${JSON.stringify(machine.notices)}`);
+  } finally {
+    releaseForeignRun?.();
+    try {
+      await started?.cleanup();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
 test("a host without the message_start hook has the scheduled orchestrator dispatch rejected before anything is sent", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-turn-host-nohooks-"));
   const originalWarn = console.warn;

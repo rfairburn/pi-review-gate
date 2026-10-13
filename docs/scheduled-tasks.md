@@ -194,11 +194,18 @@ inconsistent is shown as its full retained text and carries no expand/collapse h
 unrelated content. See [Development → Shared native presentation
 expansion](development.md#shared-native-presentation-expansion).
 
-Installed Pi starts an idle custom-message turn without emitting
-`before_agent_start`; for both idle and queued custom messages, the extension
-therefore arms the fail-closed review baseline and reasserts the deferred-tool
-authorization at the host's `message_start`, before that message's model
-request. A busy queued message shares the already-armed review window. The
+Pi 1.1 and earlier start an idle custom-message turn without emitting
+`before_agent_start`. Pi 1.2 emits `before_agent_start` for that idle run
+(discriminated as a custom message) before the run starts; the extension arms
+the fail-closed
+[review baseline](review-workflow.md#review-windows-and-evidence) there
+first, without adding any model-facing prompt content. On every host version,
+for both idle and queued scheduled messages, the extension also arms the review
+baseline and reasserts the deferred-tool authorization at the host's
+`message_start`, before that message's model request: this is the only place
+a scheduled occurrence is attributed, and an idempotent re-arm when the
+baseline is already in place. A busy queued message shares the already-armed
+review window. The
 occurrence is correlated only by its opaque id on that exact `message_start`,
 then completed after its consuming run ends and the submit-cycle settles; an
 unrelated human turn, message delivery, or downstream subtask completion

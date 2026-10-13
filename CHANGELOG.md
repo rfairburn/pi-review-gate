@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.151]
+## [0.1.0-dev.152]
 
 ### Fixed
 
@@ -25,6 +25,18 @@ dates.
   immediately after the popup closes still cancels the review normally;
   pending input alone does not intercept cancellation. Review verdicts,
   cancellation settlement, answers, declines, and notice actions are unchanged.
+
+## [0.1.0-dev.151]
+
+### Fixed
+
+- Non-Git delegated source inventory buffer overflows now identify the actual
+  inventory command, safely encoded selected workspace, 64 MiB limit, and original
+  overflow code with truthful stdout/stderr context, and recommend choosing a
+  narrower workspace (#355). Diagnostics exclude inventory output, file contents,
+  and original error stacks or arbitrary properties. The 64 MiB/15-second bounds,
+  capture eligibility, temporary-enumerator cleanup, cancellation handling, and
+  fail-closed worker admission are unchanged.
 
 ## [0.1.0-dev.150]
 

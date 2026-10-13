@@ -381,11 +381,44 @@ async function enumerateNonGitPaths(
       GIT_WORK_TREE: root,
     };
 
-    const { stdout } = await execFileAsync(
-      "git",
-      ["ls-files", "--others", "--exclude-standard", "-z"],
-      { cwd: root, env, timeout: 15_000, maxBuffer: 64 * 1024 * 1024, signal },
-    );
+    let stdout: string;
+    try {
+      ({ stdout } = await execFileAsync(
+        "git",
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+        { cwd: root, env, timeout: 15_000, maxBuffer: 64 * 1024 * 1024, signal },
+      ));
+    } catch (error) {
+      // Only Node's explicit buffer-overflow code warrants narrower-scope
+      // guidance. Cancellation and other command failures keep their handling.
+      if (signal?.aborted || isAbortError(error)
+        || !(error instanceof Error)
+        || (error as NodeJS.ErrnoException).code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+        throw error;
+      }
+      // Node identifies the overflowing stream in these exact messages. Never
+      // copy an arbitrary message, stdout/stderr, stack, cause, or error fields:
+      // they can contain inventory paths, file contents, or credentials.
+      const context = error.message === "stdout maxBuffer length exceeded"
+        || error.message === "stderr maxBuffer length exceeded"
+        ? `: ${error.message}`
+        : " (overflowing stream not identified)";
+      // JSON quotes/escapes C0 controls and backslashes; also encode Unicode
+      // controls, format characters and line separators so workspace text stays
+      // inert. Encode UTF-16 units so even supplementary controls are reversible.
+      const workspace = JSON.stringify(root).replace(
+        /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu,
+        (character) => character.split("").map(
+          (unit) => `\\u${unit.charCodeAt(0).toString(16).padStart(4, "0")}`,
+        ).join(""),
+      );
+      throw new Error(
+        `Non-Git source inventory command \`git ls-files --others --exclude-standard -z\` ` +
+        `failed for selected workspace ${workspace}: the 64 MiB (67108864 bytes) maxBuffer limit was exceeded. ` +
+        `Original failure: ERR_CHILD_PROCESS_STDIO_MAXBUFFER${context}. ` +
+        `Choose a narrower workspace (the intended project directory) and retry.`,
+      );
+    }
 
     return filterAndSort(stdout.split("\0").filter(Boolean).map(normalizeRelative));
   } finally {

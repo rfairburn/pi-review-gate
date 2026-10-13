@@ -35,8 +35,9 @@ dates.
   schema recognition and the unchanged authorization ceiling (#388).
 - Pi 1.2's new idle custom-run `before_agent_start` event arms the review gate
   without adding user-turn prompt guidance to scheduler or wake messages.
-  Message-start attribution, older-host fallback arming, and settlement remain
-  unchanged (#388).
+  Idle custom runs started by other extensions also gain review-baseline coverage
+  on Pi 1.2. Message-start attribution for this extension's messages, older-host
+  fallback arming, and settlement remain unchanged (#388).
 
 ## [0.1.0-dev.148]
 

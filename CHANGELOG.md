@@ -15,25 +15,33 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.150]
+## [0.1.0-dev.151]
 
 ### Fixed
 
 - Failed initialization of a newly allocated review or reviewer-question bundle now
-  drains all started setup work before removing its proven-owned temporary root
-  (#376). Ownership assumes no hostile external same-user (same-UID) mutation during
-  allocation/identity capture of either the bundle or private cleanup root, or during
-  private cleanup. Within that boundary, caller-supplied roots, detected substitutions,
-  symlinks, and failed or uncertain identity capture preserve/refuse deletion; private
-  relocation and identity checks fence deletion of the original pathname. Synchronous
-  calls prevent in-process interleaving, not external process races: public Node APIs
-  lack an atomic creation-bound directory handle and fd-relative recursive deletion.
-  Substitution between `mkdtempSync` and the first `lstatSync` can be captured as owned
-  and later recursively deleted; that race and private-directory mutation during
-  cleanup are outside the guarantee.
+  drains all started setup work before removing its positively identified temporary
+  root (#376). Caller-supplied roots, detected substitutions, symlinks, and uncertain
+  identities are preserved; private relocation and identity checks fence deletion.
   Cleanup failures/refusals are reported without masking the initialization error.
-  Successful creation, configured retention, recovery/checkpoint evidence, and cache
-  behavior are unchanged; no historical temporary-directory sweeping is added.
+  Ownership assumes no hostile external same-user mutation during allocation/identity
+  capture or private cleanup: public Node APIs cannot atomically bind creation to a
+  directory handle or provide fd-relative recursive deletion. That extreme edge case
+  remains outside the guarantee, as detailed in the review workflow documentation.
+  Successful creation, retention, recovery/checkpoint evidence, and cache behavior
+  are unchanged; no historical temporary-directory sweeping is added.
+
+## [0.1.0-dev.150]
+
+### Changed
+
+- Shipped skills guide `AskUserQuestion` callers to make delayed/shared-pending
+  questions self-contained with relevant task, truthful result or uncertainty,
+  concrete decision, and meaningful choice consequences (#373). The orchestrator
+  skill owns sanitized observed-result and unknown-evidence examples; the execution
+  skill links to that guidance. This is instructional guidance, not guaranteed model
+  compliance. Tool schema limits, UI/routing/history behavior, async noninterrupting
+  delivery, session isolation/privacy, and authorization/confirmation remain unchanged.
 
 ## [0.1.0-dev.149]
 

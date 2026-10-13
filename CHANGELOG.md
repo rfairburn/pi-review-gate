@@ -15,6 +15,21 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.156]
+
+### Tests
+
+- The two native Windows PowerShell 7 (pwsh.exe) ShellStart cases — pwsh
+  preference when both editions resolve, and the pwsh exit-status matrix — now
+  treat PowerShell 7 as an optional prerequisite (#406). A verified absence
+  (`where pwsh.exe` ran cleanly and found nothing) skips them with a truthful
+  reason; a present pwsh runs all existing assertions unchanged. A failed,
+  timed-out, or malformed lookup fails with diagnostics instead of skipping.
+  Focused tests cover the present, verified-absent, and error/timeout/malformed
+  outcomes through an injectable lookup runner. The Windows PowerShell 5.1
+  fallback, fail-closed ownership/settlement coverage, and production discovery
+  are unchanged.
+
 ## [0.1.0-dev.154]
 
 ### Added

@@ -16,6 +16,28 @@ The model calls `AskUserQuestion` with:
   free-text answer instead of picking one, or decline.
 - `mode` — `async` (default) or `sync`.
 
+### Self-contained question authoring
+
+The shipped orchestrator skill teaches `AskUserQuestion` callers to make delayed
+questions independently understandable from the shared pending list; the execution
+skill links to that same guidance for both primary and delegated execution. A
+question should identify the relevant task, summarize the actual observation/result
+or explicitly state uncertainty, ask for a concrete decision, and explain the
+meaningful scope and consequences of each choice without relying on earlier chat.
+For example, instead of “Given that result, should I proceed?”, a question can
+explain that a CSV escaping test failed because one comma-containing value became
+two columns, then ask whether to fix the serializer with a regression test or
+report the diagnosis without changing files. If no test result is available, the
+question should say so rather than imply success.
+
+This is authoring guidance, not a changed UI or a guarantee of model compliance.
+Clarity takes priority over needless terseness within existing schema limits; no
+additional prose length prescription, mandatory template, or new fields are added.
+Only relevant, sanitized context belongs in a question — not entire transcripts,
+credentials, private paths, unrelated conversation, or another session's contents.
+Async noninterrupting delivery, originating-session isolation, and existing
+authorization and confirmation rules are unchanged; extra context grants no authority.
+
 ### Async mode (default)
 
 The call returns immediately with a pending handle (for example `q1`). The

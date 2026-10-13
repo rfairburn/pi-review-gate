@@ -293,6 +293,14 @@ test("executor role defers to the durable initial subset and activates authorize
     assert.match(guidance, /"WebSearch" \(Search the public web\)/);
     assert.doesNotMatch(guidance, /Read files|Edit files|parameters|properties/);
 
+    // #388: a Pi 1.2 idle custom-message run keeps the worker's boundary
+    // reassertion but gains no inventory injection it never had before.
+    const customStart = await Promise.all((hooks.get("before_agent_start") ?? []).map((hook) =>
+      hook({ cwd: dir, messageType: "custom", message: { role: "custom", customType: "pi-review-background-ready", content: "resume" }, systemPrompt: "native Pi prompt" }, ctx)
+    ));
+    assert.ok(customStart.every((value) => value === undefined), `no worker prompt injection on a custom run: ${JSON.stringify(customStart)}`);
+    assert.deepEqual(active, ["read", "edit", "tool_search"], "the custom run reasserted the captured worker set");
+
     const search = definitions.get("tool_search");
     assert.ok(search?.execute);
     const loaded = await search.execute("load-web", { query: "WebSearch" });

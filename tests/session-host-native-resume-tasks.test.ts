@@ -2,7 +2,7 @@
  * Focused source-only regression harness for automatic native Main resume,
  * truthful 0→1→0 activity, and event-driven recovery after a retained stopped,
  * recovery-required execution record is repaired. The authorized
- * primary macOS run uses a real pinned Pi 1.1.0 Main and an actual native saved
+ * primary macOS run uses a real pinned Pi 1.2.0 Main and an actual native saved
  * conversation; this test file is intentionally not runnable from an executor
  * role or without explicit runtime pins.
  *
@@ -365,6 +365,10 @@ async function ensureSidebarFocus(driver: SavedMainDriver): Promise<void> {
   await driver.waitFrame((text) => isSidebarFocusedFrame(text, SIDEBAR_COLUMNS)
     || isMainFocusFrame(text) || sidebarRosterHidden(text),
   "a complete sidebar, Main, or hidden-pane witness establishes the current focus domain");
+  // A renamed roster card may paint before the focus footer in the same
+  // repaint. F8 toggles differently in Main and sidebar focus, so settle the
+  // prior action's frame before deciding whether one real F8 is needed.
+  await driver.waitForQuietFrame("the native focus frame finishes repainting before the F8 decision");
   if (isSidebarFocusedFrame(driver.currentText(), SIDEBAR_COLUMNS)) return;
   const snapshot = driver.snapshot();
   driver.pty.write(KEYS.f8);
@@ -587,7 +591,7 @@ test("real native Main restores a saved conversation and reauthenticates activit
   const runtime = resolveSavedRuntimePin(t);
   if (!runtime) return;
   requirePublicRuntimeDependencies(runtime);
-  assert.equal(runtime.version, "1.1.0");
+  assert.equal(runtime.version, "1.2.0");
   assert.equal(Buffer.byteLength(join("/tmp", "shm-XXXXXX", "tmp", "prg-st-XXXXXX", "s.sock"), "utf8") <= 103, true,
     "the harness's short /tmp-owned broker socket path remains within the macOS limit");
 

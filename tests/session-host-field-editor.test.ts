@@ -176,6 +176,27 @@ test("native Editor supplies grapheme, word/cursor, kill-ring yank, undo, and si
   }
 });
 
+test("mid-line native fake caret keeps the caret grapheme and following text visible", () => {
+  const field = createSessionHostTextField({ kind: "name", keybindings: getKeybindings() });
+  try {
+    field.setText("abcdef");
+    field.handleInput("\x01"); // Ctrl+A, native line start
+    field.handleInput("\x1b[C");
+    field.handleInput("\x1b[C");
+    assert.equal(field.getCursor().col, 2);
+    const frame = field.render(24, 3);
+    const text = frame.lines.join("\n");
+    assert.ok(text.includes("abcdef"), JSON.stringify(frame.lines));
+    assert.equal(text.includes("\x1b"), false, "native caret wrappers never reach pane text");
+    assert.equal(frame.cursor.visible, true);
+    const row = frame.lines[frame.cursor.row] ?? "";
+    assert.equal(row.slice(frame.cursor.column, frame.cursor.column + 1), "c",
+      "the caret column stays on the native caret grapheme");
+  } finally {
+    field.dispose();
+  }
+});
+
 test("encoded native editing bindings work at the field limit", () => {
   const manager = new KeybindingsManager(TUI_KEYBINDINGS, {
     "tui.editor.cursorLineStart": "a",

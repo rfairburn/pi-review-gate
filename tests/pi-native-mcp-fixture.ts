@@ -157,6 +157,8 @@ export interface ProbeDump {
 		namespace?: string;
 		annotations?: Record<string, unknown>;
 		description?: string;
+		/** What reachesTools({}) returned when Pi reports the field (Pi 1.2+); absent otherwise. */
+		reachesTools?: "all" | string[] | string;
 	}>;
 	commands?: string[];
 }

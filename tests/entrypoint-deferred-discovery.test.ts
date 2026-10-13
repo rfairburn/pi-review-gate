@@ -337,6 +337,26 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     assert.doesNotMatch(inventory, /parameters|properties/);
     assert.equal(activeTools.includes("LateIdleTool"), false, "request boundary removes the host's late auto-activation");
 
+    // #388: Pi 1.2 discriminates the run start. An explicit "user" prompt
+    // keeps the identical injection; a run started by an idle custom message
+    // still reasserts the authorization boundary but receives no inventory,
+    // operating-mode, critical, or completion prompt (pre-1.2 hosts never ran
+    // this hook for such runs).
+    const userStart = await triggerResults(hooks, "before_agent_start", {
+      cwd: dir, messageType: "user", prompt: "hi", images: [], systemPrompt: "native orchestrator prompt",
+    });
+    assert.equal(JSON.stringify(userStart), inventory, "an explicit user run keeps the legacy injection byte-for-byte");
+    pi.registerTool({ name: "LateCustomRunTool", description: "Registered before a custom-message run." });
+    assert.ok(activeTools.includes("LateCustomRunTool"));
+    const customStart = await triggerResults(hooks, "before_agent_start", {
+      cwd: dir,
+      messageType: "custom",
+      message: { role: "custom", customType: "pi-review-background-ready", content: "resume", display: true },
+      systemPrompt: "native orchestrator prompt",
+    });
+    assert.ok(customStart.every((value) => value === undefined), `no model-facing injection on a custom run: ${JSON.stringify(customStart)}`);
+    assert.equal(activeTools.includes("LateCustomRunTool"), false, "a custom run still reasserts the captured boundary");
+
     pi.registerTool({ name: "LateToolResultTool", description: "Registered during a tool execution." });
     assert.ok(activeTools.includes("LateToolResultTool"));
     await trigger(hooks, "tool_result", { cwd: dir, toolName: "read", input: {}, isError: false });

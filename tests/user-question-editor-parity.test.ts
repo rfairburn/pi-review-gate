@@ -827,10 +827,44 @@ function createRealKeybindingsManagerWithOverrides(
   return manager;
 }
 
-/** Rendered lines with the hardware-cursor marker and ANSI styles removed. */
+/**
+ * #388: the delimiters the real host's native editor wraps its fake-cursor
+ * cell in at component level, derived from the host's own export. pi-tui
+ * builds that export `renderFakeCursor()` (zero-width marker codes the TUI
+ * later resolves to reverse video, or hides behind the hardware cursor);
+ * older builds without it emit the reverse-video SGR directly. The cell's
+ * own text is never part of a delimiter.
+ */
+function fakeCursorDelimiters(tui: Record<string, unknown>): { start: string; end?: string } {
+  if (typeof tui.renderFakeCursor !== "function") return { start: "\x1b[7m" };
+  const probe = "\u{F8FF}";
+  const wrapped = (tui.renderFakeCursor as (text: string) => unknown)(probe);
+  assert.equal(typeof wrapped, "string", "the host's renderFakeCursor returns a rendered string");
+  const at = (wrapped as string).indexOf(probe);
+  assert.ok(at > 0 && (wrapped as string).indexOf(probe, at + probe.length) === -1,
+    `the host's renderFakeCursor wraps the cursor cell exactly once: ${JSON.stringify(wrapped)}`);
+  const start = (wrapped as string).slice(0, at);
+  const end = (wrapped as string).slice(at + probe.length);
+  assert.ok(end.length > 0 && start !== end, `the host's fake-cursor delimiters are distinct: ${JSON.stringify(wrapped)}`);
+  return { start, end };
+}
+
+/** How many fake-cursor carets the real host rendered into `text`. */
+function fakeCursorCount(tui: Record<string, unknown>, text: string): number {
+  return text.split(fakeCursorDelimiters(tui).start).length - 1;
+}
+
+/**
+ * Rendered lines with the zero-width hardware-cursor marker and the host's
+ * zero-width fake-cursor delimiters removed (the caret cell's text stays);
+ * SGR styles are removed separately by stripSgr. Caret and marker counts are
+ * asserted on the raw render, never on these plain lines.
+ */
 function plainLines(tui: Record<string, unknown>, lines: string[]): string[] {
   const marker = typeof tui.CURSOR_MARKER === "string" ? (tui.CURSOR_MARKER as string) : "\x1b_pi:c\x07";
-  return lines.map((line) => line.split(marker).join(""));
+  const { start, end } = fakeCursorDelimiters(tui);
+  const zeroWidth = [marker, ...(start.startsWith("\x1b[") ? [] : [start]), ...(end && !end.startsWith("\x1b[") ? [end] : [])];
+  return lines.map((line) => zeroWidth.reduce((plain, code) => plain.split(code).join(""), line));
 }
 
 function stripSgr(line: string): string {
@@ -1220,8 +1254,8 @@ test("real host: isolated free text keeps native actions on the popup and restor
         const ordinaryPrompt = ordinaryRows.join("\n");
         assert.ok(popup.includes(expectedPopupText), `answer remains visible in the popup: ${popup}`);
         assert.equal(fixture.handle.instance.focused, true, "the same native editor owns popup input focus");
-        assert.equal(popup.split("\x1b[7m").length - 1, 1,
-          `the popup has exactly one inverse-video native caret: ${popup}`);
+        assert.equal(fakeCursorCount(loaded.tui, popup), 1,
+          `the popup has exactly one native fake-cursor caret: ${JSON.stringify(popup)}`);
         assert.equal(popup.split(cursorMarker).length - 1, 1,
           `the popup has exactly one hardware-cursor marker: ${popup}`);
         assert.deepEqual(ordinaryRows, [], "the underlying prompt contributes no editor rows while the popup owns the field");
@@ -1229,8 +1263,8 @@ test("real host: isolated free text keeps native actions on the popup and restor
           `answer text is absent from the ordinary prompt: ${ordinaryPrompt}`);
         assert.equal(ordinaryPrompt.includes(cursorMarker), false,
           `the native cursor marker is absent from the ordinary prompt: ${ordinaryPrompt}`);
-        assert.equal(ordinaryPrompt.includes("\x1b[7m"), false,
-          `the unfocused native editor's inverse fake cursor is absent from the ordinary prompt: ${ordinaryPrompt}`);
+        assert.equal(fakeCursorCount(loaded.tui, ordinaryPrompt), 0,
+          `the native fake cursor is absent from the ordinary prompt: ${JSON.stringify(ordinaryPrompt)}`);
       };
 
       assert.equal(fixture.instances.length, 1, "the host-owned native field is the only editor created for the popup");
@@ -1262,8 +1296,8 @@ test("real host: isolated free text keeps native actions on the popup and restor
   assert.equal(submitted.handle.instance.focused, false, "the ordinary editor is unfocused after the popup closes");
   const restoredPrompt = submitted.handle.instance.render(120).join("\n");
   assert.ok(restoredPrompt.includes("exact chat draft"), `ordinary prompt rendering returns after submit: ${restoredPrompt}`);
-  assert.ok(restoredPrompt.includes("\x1b[7m"),
-    "the real unfocused native editor still emits its inverse fake cursor when ordinary rendering is restored");
+  assert.equal(fakeCursorCount(loaded.tui, restoredPrompt), 1,
+    `the real unfocused native editor still emits exactly one fake cursor when ordinary rendering is restored: ${JSON.stringify(restoredPrompt)}`);
   assert.deepEqual(submitted.state.chatSubmits, [], "the answer never enters the chat submit path");
 
   for (const closeMode of ["cancel", "toggle"] as const) {

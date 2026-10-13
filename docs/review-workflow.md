@@ -12,6 +12,12 @@ diff, tool calls and results, assistant summary, usage, and before/after artifac
 The bundle also maintains the cumulative baseline-to-current patch and numbered
 reviewer invocations.
 
+On Pi 1.2 and newer, idle custom-message runs also arm a review baseline through
+Pi's `before_agent_start` event, including runs started by other extensions.
+Custom runs receive no user-turn prompt-guidance injection. This extension's
+scheduled and wake messages retain their authoritative `message_start` attribution
+and fallback review arming on older hosts; their settlement semantics are unchanged.
+
 Parent review uses one durable checkpoint mechanism for Git and non-Git workspaces.
 Each settlement freezes one after-checkpoint. In a Git checkout, even when Pi starts in a
 subdirectory, the parent checkpoint covers the enclosing repository: tracked changes

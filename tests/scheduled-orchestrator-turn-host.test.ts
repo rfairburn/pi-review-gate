@@ -21,6 +21,21 @@
  * (delivery and processing never count it); and a host without the required
  * message_start hook has the unsafe dispatch rejected before anything is
  * sent.
+ *
+ * #388: the machine also reproduces Pi 1.2's real ordering (verified against
+ * 1.2.0 `AgentSession._startRun`/`_prepareRun` and the extension runner):
+ *
+ * - an IDLE custom triggerTurn send DOES emit `before_agent_start`, with
+ *   `messageType: "custom"` and the starting `message` (no `prompt`), BEFORE
+ *   `agent_start`; handler failures are reported and the run continues;
+ * - text prompts carry `messageType: "user"`; the session counts as busy
+ *   while a run starts (during before_agent_start);
+ * - a BUSY send still queues as a follow-up and emits no before_agent_start.
+ *
+ * Lifecycle tests run against BOTH host variants and additionally pin that a
+ * custom-message run receives no new model-facing injection on Pi 1.2 while
+ * user prompts keep theirs, and that attribution still happens only at the
+ * scheduled message's own message_start.
  */
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -34,6 +49,29 @@ import { getSchedulerRuntime, resetSchedulerRuntimeForTests } from "../src/sched
 import { indexTestConfig, waitForCondition } from "./entrypoint-harness";
 
 type HookHandler = (...args: unknown[]) => unknown;
+
+/** Pi <= 1.1 ("legacy") or Pi 1.2 run-start semantics (#388). */
+type HostVariant = "legacy" | "pi-1.2";
+const HOST_VARIANTS: readonly HostVariant[] = ["legacy", "pi-1.2"];
+
+/** One host-emitted before_agent_start and what every handler returned. */
+interface BeforeAgentStartRecord {
+  messageType?: string;
+  customType?: string;
+  prompt?: string;
+  results: unknown[];
+  errors: string[];
+}
+
+/** Persisted review/tracker state observed AFTER the extension's before_agent_start handler. */
+interface BeforeAgentStartProbe {
+  messageType?: string;
+  customType?: string;
+  sawReviewWindow: boolean;
+  requestTexts: string[];
+  pendingProcessed: boolean[];
+  settledOccurrences: number;
+}
 
 interface MachineMessage {
   role: "user" | "custom";
@@ -74,6 +112,8 @@ class HostMachine {
   /** Each machine-driven run's completion promise, in send order (tests await teardown). */
   readonly sendPromises: Promise<unknown>[] = [];
   readonly beforeAgentStarts: string[] = [];
+  /** Every before_agent_start the host emitted, user and (Pi 1.2) custom, with handler results. */
+  readonly beforeAgentStartEvents: BeforeAgentStartRecord[] = [];
   readonly notices: string[] = [];
   readonly entries: Array<{ type: string; data: unknown }> = [];
   /** Event names the host refuses to register (simulates a host without them). */
@@ -86,11 +126,18 @@ class HostMachine {
   private emittingAgentSettled = false;
   private readonly deferredSettledActions: Array<() => Promise<void>> = [];
   private readonly modelPhase: (message: MachineMessage) => Promise<void> | void;
+  readonly variant: HostVariant;
 
-  constructor(dir: string, sessionFile: string, modelPhase: (message: MachineMessage) => Promise<void> | void) {
+  constructor(
+    dir: string,
+    sessionFile: string,
+    modelPhase: (message: MachineMessage) => Promise<void> | void,
+    variant: HostVariant = "legacy",
+  ) {
     this.dir = dir;
     this.sessionFile = sessionFile;
     this.modelPhase = modelPhase;
+    this.variant = variant;
   }
 
   get pi() {
@@ -108,7 +155,8 @@ class HostMachine {
       },
       // sendCustomMessage (verified against the installed host): followUp
       // queues while streaming; an idle triggerTurn send starts the run
-      // directly; everything else appends without a turn.
+      // directly (Pi 1.2: through before_agent_start, messageType "custom");
+      // everything else appends without a turn.
       async sendMessage(raw: MachineMessage, delivery: { deliverAs?: string; triggerTurn?: boolean }): Promise<void> {
         if (!isRecord(raw)) throw new Error("host received a non-message send");
         const message: MachineMessage = { role: "custom", content: raw.content, display: raw.display, customType: raw.customType, details: raw.details };
@@ -124,11 +172,11 @@ class HostMachine {
         if (delivery?.triggerTurn) {
           if (machine.emittingAgentSettled) {
             machine.deferredSettledActions.push(async () => {
-              await machine.submitCycle([message]);
+              await machine.startCustomRun(message);
             });
             return;
           }
-          const cycle = machine.submitCycle([message]).catch((error) => {
+          const cycle = machine.startCustomRun(message).catch((error) => {
             throw error;
           });
           machine.sendPromises.push(cycle);
@@ -208,22 +256,80 @@ class HostMachine {
   async prompt(text: string, source: "user" | "extension" = "user"): Promise<void> {
     await this.emit("input", { type: "input", cwd: this.dir, text, source }, this.buildCtx());
     this.beforeAgentStarts.push(text);
-    await this.emit(
-      "before_agent_start",
-      { type: "before_agent_start", prompt: text, images: [], systemPrompt: "base", systemPromptOptions: { selectedTools: [] } },
-      this.buildCtx(),
-    );
+    // Pi 1.2 counts the session busy while a run starts (sends queue into it)
+    // and discriminates the event; legacy hosts carry no messageType.
+    if (this.variant === "pi-1.2") this.isStreaming = true;
+    await this.emitBeforeAgentStart({
+      type: "before_agent_start",
+      ...(this.variant === "pi-1.2" ? { messageType: "user" } : {}),
+      prompt: text,
+      images: [],
+      systemPrompt: "base",
+      systemPromptOptions: { selectedTools: [] },
+    });
     const cycle = this.submitCycle([{ role: "user", text }]);
     this.sendPromises.push(cycle);
     await cycle;
   }
 
   /**
+   * An idle triggerTurn custom send. Legacy hosts start the low-level run
+   * directly; Pi 1.2 `_startRun({ messageType: "custom", message })` marks the
+   * session busy, emits before_agent_start BEFORE agent_start, then runs.
+   */
+  async startCustomRun(message: MachineMessage): Promise<void> {
+    if (this.variant === "legacy") {
+      await this.submitCycle([message]);
+      return;
+    }
+    this.isStreaming = true;
+    try {
+      await this.emitBeforeAgentStart({
+        type: "before_agent_start",
+        messageType: "custom",
+        message,
+        systemPrompt: "base",
+        systemPromptOptions: { selectedTools: [] },
+      });
+    } catch (error) {
+      this.isStreaming = false;
+      throw error;
+    }
+    await this.submitCycle([message]);
+  }
+
+  /**
+   * Emit before_agent_start, recording every handler result. Pi 1.2's runner
+   * reports a handler failure and continues the run; the legacy machine keeps
+   * its existing propagate-on-throw behavior.
+   */
+  private async emitBeforeAgentStart(event: Record<string, unknown>): Promise<void> {
+    const message = isRecord(event.message) ? event.message : undefined;
+    const record: BeforeAgentStartRecord = {
+      ...(typeof event.messageType === "string" ? { messageType: event.messageType } : {}),
+      ...(typeof message?.customType === "string" ? { customType: message.customType } : {}),
+      ...(typeof event.prompt === "string" ? { prompt: event.prompt } : {}),
+      results: [],
+      errors: [],
+    };
+    this.beforeAgentStartEvents.push(record);
+    for (const handler of this.hooks.get("before_agent_start") ?? []) {
+      try {
+        record.results.push(await handler(event, this.buildCtx()));
+      } catch (error) {
+        if (this.variant === "legacy") throw error;
+        record.errors.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+  }
+
+  /**
    * One submit-cycle through the low-level run: agent_start … message events
    * with their model requests … (follow-ups drained inside the loop) …
-   * agent_end, then exactly ONE agent_settled for the cycle. The host emits
-   * NO before_agent_start on this path — the real gap for custom-message
-   * runs (both idle runs and the busy queued drain).
+   * agent_end, then exactly ONE agent_settled for the cycle. The low-level
+   * run itself emits NO before_agent_start — the legacy gap for idle
+   * custom-message runs and, on every host, the busy queued drain (Pi 1.2
+   * emits it earlier, from startCustomRun, for idle custom runs only).
    */
   async submitCycle(initial: MachineMessage[]): Promise<void> {
     this.isStreaming = true;
@@ -337,10 +443,18 @@ interface StartedSession {
   sidecarPath: string;
   invocationMarker: string;
   probes: ProbeRecord[];
+  /** State observed right after the extension's own before_agent_start handler. */
+  beforeAgentStartProbes: BeforeAgentStartProbe[];
   advanceMinute: () => void;
   /** Stops the scheduler timers for tests that stop at a gated run. */
   stopScheduler: () => void;
   shutdownSession: () => Promise<void>;
+  /**
+   * Idempotent teardown for success, failure, and partial setup: stop the
+   * scheduler, emit the session boundary once, and give machine-driven cycles
+   * a bounded chance to settle (deliberately gated cycles never finish).
+   */
+  cleanup: () => Promise<void>;
 }
 
 /**
@@ -354,6 +468,7 @@ interface StartedSession {
 async function startScheduledSession(
   dir: string,
   modelPhase: (message: MachineMessage) => Promise<void> | void,
+  variant: HostVariant = "legacy",
 ): Promise<StartedSession> {
   mkdirSync(join(dir, "sessions"), { recursive: true });
   // The reviewer appends to this test-only marker and session-state persistence
@@ -373,8 +488,9 @@ async function startScheduledSession(
   const schedulerRuntime = getSchedulerRuntime();
   schedulerRuntime.setEnabled(true);
 
-  const machine = new HostMachine(dir, sessionsFile(dir), modelPhase);
+  const machine = new HostMachine(dir, sessionsFile(dir), modelPhase, variant);
   const probes: StartedSession["probes"] = [];
+  const beforeAgentStartProbes: BeforeAgentStartProbe[] = [];
   let tracker!: ScheduledOrchestratorTurnTracker;
   const sidecarPath = `${sessionsFile(dir)}.pi-review-gate-state.json`;
   machine.probe("model_request_probe", (event) => {
@@ -392,24 +508,91 @@ async function startScheduledSession(
   });
   const minuteBase = Math.floor(Date.now() / 60_000) * 60_000;
   let now = minuteBase + 30_000; // mid-minute start; beginAt samples the in-progress minute
-  await activate(machine.pi, {
-    schedulerTimer: { now: () => now, tickIntervalMs: 5 },
-    orchestratorTurnsTestAccess: (exposed) => { tracker = exposed; },
-  });
-  await machine.emit("session_start", { type: "session_start", reason: "startup" }, machine.buildCtx());
+  let shutDown = false;
+  const shutdownSession = async (): Promise<void> => {
+    schedulerRuntime.setEnabled(false);
+    if (shutDown) return;
+    shutDown = true;
+    await machine.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, machine.buildCtx());
+  };
+  const cleanup = async (): Promise<void> => {
+    try {
+      await shutdownSession();
+    } finally {
+      await Promise.race([
+        Promise.allSettled(machine.sendPromises),
+        new Promise((resolvePromise) => setTimeout(resolvePromise, 2_000).unref()),
+      ]);
+    }
+  };
+  try {
+    await activate(machine.pi, {
+      schedulerTimer: { now: () => now, tickIntervalMs: 5 },
+      orchestratorTurnsTestAccess: (exposed) => { tracker = exposed; },
+    });
+    // Registered AFTER activation, so it observes the state the extension's
+    // own before_agent_start handler left (arming, attribution, requests).
+    machine.probe("before_agent_start", (event) => {
+      const info = sidecarReviewWindow(sidecarPath);
+      const message = isRecord(event) && isRecord(event.message) ? event.message : undefined;
+      beforeAgentStartProbes.push({
+        ...(isRecord(event) && typeof event.messageType === "string" ? { messageType: event.messageType } : {}),
+        ...(typeof message?.customType === "string" ? { customType: message.customType } : {}),
+        sawReviewWindow: info.window?.baseline !== undefined,
+        requestTexts: info.window?.requestHistory?.map((request) => request.text) ?? [],
+        pendingProcessed: tracker ? tracker.pendingOccurrences().map((occurrence) => occurrence.processedAt instanceof Date) : [],
+        settledOccurrences: tracker ? tracker.settledOccurrences().length : -1,
+      });
+    });
+    await machine.emit("session_start", { type: "session_start", reason: "startup" }, machine.buildCtx());
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
   return {
     machine,
     tracker,
     sidecarPath,
     invocationMarker,
     probes,
+    beforeAgentStartProbes,
     advanceMinute: () => { now += 60_000; },
     stopScheduler: () => schedulerRuntime.setEnabled(false),
-    shutdownSession: async () => {
-      await machine.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, machine.buildCtx());
-      schedulerRuntime.setEnabled(false);
-    },
+    shutdownSession,
+    cleanup,
   };
+}
+
+/** A handler result that would add model-facing content to the run. */
+function injectedContent(result: unknown): boolean {
+  return isRecord(result) && (result.message !== undefined || result.systemPrompt !== undefined);
+}
+
+/**
+ * #388 owner contract: user prompts keep the review gate's model-facing
+ * injection on every host (missing or "user" discriminator), while a Pi 1.2
+ * custom-message run receives none, exactly as legacy hosts never ran it.
+ */
+function assertPromptInjectionContract(machine: HostMachine, scheduledCustomType: string): void {
+  const userEvents = machine.beforeAgentStartEvents.filter((event) => event.customType === undefined);
+  assert.ok(userEvents.length >= 1, "a user prompt went through before_agent_start");
+  for (const event of userEvents) {
+    assert.equal(event.messageType, machine.variant === "pi-1.2" ? "user" : undefined);
+    assert.ok(event.results.some(injectedContent),
+      `a ${machine.variant} user prompt keeps its review-gate prompt injection: ${JSON.stringify(event.results)}`);
+  }
+  const customEvents = machine.beforeAgentStartEvents.filter((event) => event.customType !== undefined);
+  if (machine.variant === "legacy") {
+    assert.deepEqual(customEvents, [], "legacy hosts never emit before_agent_start for custom-message runs");
+    return;
+  }
+  assert.deepEqual(customEvents.map((event) => [event.messageType, event.customType]), [["custom", scheduledCustomType]],
+    "Pi 1.2 emits exactly one custom before_agent_start, for the idle scheduled run");
+  for (const event of customEvents) {
+    assert.deepEqual(event.errors, [], "custom-run arming succeeded");
+    assert.equal(event.results.some(injectedContent), false,
+      `a custom-message run receives no hidden critical, operating-mode, inventory, or completion prompt: ${JSON.stringify(event.results)}`);
+  }
 }
 
 /** Count reviewer invocations recorded in the marker file. */
@@ -418,18 +601,20 @@ function invocationCount(path: string): number {
   return (readFileSync(path, "utf8").match(/invoked/g) ?? []).length;
 }
 
-test("an idle scheduled orchestrator turn arms review before its model request and completes only at its own turn end", async () => {
+for (const variant of HOST_VARIANTS) {
+test(`an idle scheduled orchestrator turn arms review before its model request and completes only at its own turn end (${variant} host)`, async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-turn-host-idle-"));
   const editedPath = join(dir, "index.ts");
   writeFileSync(editedPath, "before\n", "utf8");
+  let started: StartedSession | undefined;
   try {
-    const started = await startScheduledSession(dir, (message) => {
+    started = await startScheduledSession(dir, (message) => {
       // The "model" performs one workspace edit during the scheduled turn so
       // its review has changes to settle.
       if (typeof message.customType === "string" && message.customType.startsWith("pi-review-")) {
         writeFileSync(editedPath, "after\n", "utf8");
       }
-    });
+    }, variant);
     const { machine, tracker } = started;
 
     // One due tick: the scheduler dispatches the orchestrator entry.
@@ -438,17 +623,17 @@ test("an idle scheduled orchestrator turn arms review before its model request a
     assert.equal(machine.sendMessageDeliveries.length, 1, "the scheduler delivery rode the follow-up triggered-turn lane");
     assert.equal(machine.sendMessageDeliveries[0]!.delivery.triggerTurn, true);
     assert.equal(machine.sendMessageDeliveries[0]!.delivery.deliverAs, "followUp");
-    await waitForCondition(() => tracker.pendingOccurrences().length === 1);
-    const pending = tracker.pendingOccurrences()[0]!;
-    assert.equal(pending.entryId, "task-turn");
+    await waitForCondition(() => tracker.pendingOccurrences().length === 1 || tracker.settledOccurrences().length >= 1);
+    const occurrenceId = String(machine.sendMessageDeliveries[0]!.details?.occurrenceId ?? "");
+    assert.ok(occurrenceId, "the delivery carries its opaque occurrence identity");
 
     // The initiating turn's end plus its settlement complete the occurrence;
     // the machine drives the idle run inline, so wait for its cycle.
-    await waitForCondition(() => invocationCount(started.invocationMarker) >= 1);
+    await waitForCondition(() => invocationCount(started!.invocationMarker) >= 1);
     await waitForCondition(() => tracker.settledOccurrences().length >= 1);
     const settled = tracker.settledOccurrences()[0]!;
     assert.equal(settled.entryId, "task-turn");
-    assert.equal(settled.occurrenceId, pending.occurrenceId);
+    assert.equal(settled.occurrenceId, occurrenceId, "the settled occurrence is exactly the delivered request identity");
     assert.ok(settled.settledAt instanceof Date);
     assert.equal(tracker.pendingOccurrences().length, 0);
 
@@ -456,10 +641,28 @@ test("an idle scheduled orchestrator turn arms review before its model request a
     // deferred behind the settlement) before asserting aggregate paths.
     await waitForCondition(() => machine.sendPromises.length >= 2);
     await Promise.allSettled(machine.sendPromises);
-    // Only the post-review transmission prompt uses before_agent_start: the
-    // custom run itself bypassed it — the real-host gap this correction arms
-    // on message_start instead.
+    // Only the post-review transmission prompt uses the user-prompt path:
+    // the custom run itself bypassed it on legacy hosts (armed on
+    // message_start instead) and is discriminated as "custom" on Pi 1.2.
     assert.equal(machine.beforeAgentStarts.length, 1, `unexpected prompt paths: ${machine.beforeAgentStarts.join(",")}`);
+    assertPromptInjectionContract(machine, "pi-review-scheduled-orchestrator-turn");
+
+    if (variant === "pi-1.2") {
+      // Pi 1.2 runs before_agent_start BEFORE agent_start: the review gate
+      // armed (baseline persisted) there, but attribution waits for the
+      // scheduled message's own message_start — the occurrence was not yet
+      // processed and its request was not yet recorded.
+      const customStart = started.beforeAgentStartProbes.filter((probe) => probe.messageType === "custom");
+      assert.equal(customStart.length, 1);
+      assert.equal(customStart[0]!.customType, "pi-review-scheduled-orchestrator-turn");
+      assert.equal(customStart[0]!.sawReviewWindow, true, "the custom run armed its review baseline at before_agent_start");
+      assert.deepEqual(customStart[0]!.pendingProcessed, [false], "before_agent_start never attributes the occurrence");
+      assert.equal(customStart[0]!.settledOccurrences, 0);
+      assert.equal(customStart[0]!.requestTexts.some((request) => request.includes(orchestratorEntry.instructions)), false,
+        "the scheduled request is recorded at message_start, not at before_agent_start");
+    } else {
+      assert.equal(started.beforeAgentStartProbes.some((probe) => probe.customType !== undefined), false);
+    }
 
     // The model-request probe proves ordering: the arming was persisted
     // BEFORE the scheduled message's model request, and the occurrence was
@@ -468,6 +671,8 @@ test("an idle scheduled orchestrator turn arms review before its model request a
     assert.equal(customProbes.length, 1);
     assert.equal(customProbes[0]!.sawReviewWindow, true, `the review window must be armed before model work (${customProbes[0]!.sidecarError ?? "ok"})`);
     assert.ok(customProbes[0]!.requestTexts.some((request) => request.includes(orchestratorEntry.instructions)), "the reviewer must receive the scheduled request, not only its file diff");
+    assert.equal(customProbes[0]!.requestTexts.filter((request) => request.includes(orchestratorEntry.instructions)).length, 1,
+      "the scheduled request is recorded exactly once despite both arming seams");
     assert.equal(customProbes[0]!.pendingOccurrences, 1, "the occurrence was observed but still not settled at the model request");
     assert.equal(customProbes[0]!.settledOccurrences, 0, "delivery and processing never counted the occurrence");
 
@@ -481,30 +686,29 @@ test("an idle scheduled orchestrator turn arms review before its model request a
     // Exactly one reviewer invocation covers the scheduled turn's changes;
     // the follow-up review-transmission turn finds no new changes and runs
     // no reviewer.
-    await waitForCondition(() => invocationCount(started.invocationMarker) === 1);
+    await waitForCondition(() => invocationCount(started!.invocationMarker) === 1);
     assert.equal(invocationCount(started.invocationMarker), 1);
-
-    // Drain every machine-driven cycle before teardown (the review
-    // transmission prompt was deferred behind the settlement).
-    await waitForCondition(() => machine.sendPromises.length >= 2);
-    await Promise.allSettled(machine.sendPromises);
-
-    await started.shutdownSession();
+    assert.equal(tracker.settledOccurrences().length, 1, "the occurrence settled exactly once");
   } finally {
-    await rm(dir, { recursive: true, force: true });
+    try {
+      await started?.cleanup();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   }
 });
 
-test("a busy queued scheduled turn shares the existing armed window and settles with its consuming cycle", async () => {
+test(`a busy queued scheduled turn shares the existing armed window and settles with its consuming cycle (${variant} host)`, async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-turn-host-busy-"));
   const editedPath = join(dir, "index.ts");
   writeFileSync(editedPath, "before\n", "utf8");
+  let started: StartedSession | undefined;
+  let releaseGate: (() => void) | undefined;
   try {
     // The human turn's model phase is gated so the scheduled dispatch lands
     // while the unrelated human cycle is streaming.
-    let releaseGate!: () => void;
     const humanPhaseGate = new Promise<void>((resolvePromise) => { releaseGate = resolvePromise; });
-    const started = await startScheduledSession(dir, (message) => {
+    started = await startScheduledSession(dir, (message) => {
       if (message.role === "user") {
         // The human turn blocks mid-cycle until the test releases it.
         const gated = humanPhaseGate.then(() => {
@@ -516,12 +720,12 @@ test("a busy queued scheduled turn shares the existing armed window and settles 
       // The scheduled queued segment's model phase edits again.
       writeFileSync(editedPath, "human+scheduled\n", "utf8");
       return;
-    });
+    }, variant);
     const { machine, tracker } = started;
 
     // Begin the human turn: before_agent_start fires and arms the window.
     const humanCycle = machine.sendUserMessageForTest("run the human change");
-    await waitForCondition(() => started.probes.some((probe) => probe.kind === "user"));
+    await waitForCondition(() => started!.probes.some((probe) => probe.kind === "user"));
 
     // While the human cycle streams, its window is already armed.
     const humanProbe = started.probes[0]!;
@@ -541,7 +745,7 @@ test("a busy queued scheduled turn shares the existing armed window and settles 
     // Release the human phase: the loop drains the queued scheduled message
     // inside the SAME cycle, arms nothing new (window shared), and the
     // cycle's settlement reviews ALL of the cycle's changes.
-    releaseGate();
+    releaseGate!();
     await humanCycle;
     const scheduledProbes = started.probes.filter((probe) => probe.customType === "pi-review-scheduled-orchestrator-turn");
     assert.equal(scheduledProbes.length, 1, "the queued scheduled message was consumed inside the running cycle");
@@ -550,18 +754,105 @@ test("a busy queued scheduled turn shares the existing armed window and settles 
     assert.ok(scheduledProbes[0]!.requestTexts.some((request) => request.includes(orchestratorEntry.instructions)), "the scheduled request joins the current review exchange");
     assert.equal(scheduledProbes[0]!.pendingOccurrences, 1, "the occurrence was observed in-run");
     assert.equal(scheduledProbes[0]!.settledOccurrences, 0, "still not settled at its model request");
+    // A busy queued drain emits no custom before_agent_start on any host.
+    assert.equal(machine.beforeAgentStartEvents.some((event) => event.customType !== undefined), false,
+      "the queued scheduled turn never emitted a custom before_agent_start");
 
     // The consuming cycle's end plus its settlement complete the occurrence.
     await waitForCondition(() => tracker.settledOccurrences().length >= 1);
     assert.equal(tracker.settledOccurrences()[0]!.occurrenceId, queuedOccurrence.occurrenceId);
     assert.equal(tracker.pendingOccurrences().length, 0);
     // One review ran for the whole cycle (human + queued scheduled changes).
-    await waitForCondition(() => invocationCount(started.invocationMarker) >= 1);
+    await waitForCondition(() => invocationCount(started!.invocationMarker) >= 1);
     assert.ok(invocationCount(started.invocationMarker) >= 1, "the consuming cycle's workspace changes reached the existing review gate");
-
-    await started.shutdownSession();
+    for (const event of machine.beforeAgentStartEvents) {
+      assert.equal(event.messageType, variant === "pi-1.2" ? "user" : undefined);
+      assert.ok(event.results.some(injectedContent), "user prompts keep their review-gate prompt injection");
+    }
   } finally {
-    await rm(dir, { recursive: true, force: true });
+    releaseGate?.();
+    try {
+      await started?.cleanup();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+}
+
+test("an idle third-party custom-message run arms and persists the review baseline before its model request without prompt injection or scheduled attribution (pi-1.2 host)", async () => {
+  const foreignCustomType = "third-party-background-ready";
+  const foreignContent = "Another extension's background job is ready.";
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-turn-host-foreign-"));
+  let started: StartedSession | undefined;
+  let releaseForeignRun: (() => void) | undefined;
+  try {
+    // The foreign run's model phase is held at its model request so the
+    // in-run state is asserted before the run ends and settles.
+    const foreignRunGate = new Promise<void>((resolvePromise) => { releaseForeignRun = resolvePromise; });
+    started = await startScheduledSession(dir, (message) => (
+      message.customType === foreignCustomType ? foreignRunGate : undefined
+    ), "pi-1.2");
+    const { machine, tracker } = started;
+
+    // Another extension's idle triggered send (the scheduler clock never
+    // advances, so no scheduled occurrence exists in this session).
+    const foreignSend = machine.pi.sendMessage(
+      { role: "custom", customType: foreignCustomType, content: foreignContent, display: false },
+      { triggerTurn: true },
+    );
+    await waitForCondition(() => started!.probes.some((probe) => probe.customType === foreignCustomType));
+
+    // Pi 1.2 emitted exactly one custom before_agent_start for the foreign
+    // run; the extension armed there without failing and without injecting
+    // any model-facing content (every handler result is undefined).
+    assert.deepEqual(machine.beforeAgentStartEvents.map((event) => [event.messageType, event.customType]), [["custom", foreignCustomType]]);
+    const foreignEvent = machine.beforeAgentStartEvents[0]!;
+    assert.deepEqual(foreignEvent.errors, [], "custom-run arming succeeded");
+    assert.ok(foreignEvent.results.length > 0 && foreignEvent.results.every((result) => result === undefined),
+      `a third-party custom-message run receives no prompt injection: ${JSON.stringify(foreignEvent.results)}`);
+    assert.equal(machine.beforeAgentStarts.length, 0, "no user-prompt path ran");
+
+    // The baseline was persisted by the extension's own before_agent_start
+    // handler, with nothing attributed or recorded as a scheduled request.
+    assert.equal(started.beforeAgentStartProbes.length, 1);
+    const armedProbe = started.beforeAgentStartProbes[0]!;
+    assert.equal(armedProbe.messageType, "custom");
+    assert.equal(armedProbe.customType, foreignCustomType);
+    assert.equal(armedProbe.sawReviewWindow, true, "the foreign run's review baseline was persisted at before_agent_start");
+    assert.deepEqual(armedProbe.pendingProcessed, [], "no scheduled occurrence exists or is attributed");
+    assert.equal(armedProbe.settledOccurrences, 0);
+    assert.equal(armedProbe.requestTexts.some((request) => request.includes(foreignContent)), false,
+      "the foreign message is never recorded as a scheduled request");
+
+    // At the model request (run held there): the persisted baseline is still
+    // in place and the foreign message was never attributed as an occurrence.
+    const foreignProbes = started.probes.filter((probe) => probe.customType === foreignCustomType);
+    assert.equal(foreignProbes.length, 1);
+    assert.equal(foreignProbes[0]!.sawReviewWindow, true, `the review window must be armed before model work (${foreignProbes[0]!.sidecarError ?? "ok"})`);
+    assert.equal(foreignProbes[0]!.requestTexts.some((request) => request.includes(foreignContent)), false);
+    assert.equal(foreignProbes[0]!.pendingOccurrences, 0, "the foreign message_start attributed no scheduled occurrence");
+    assert.equal(foreignProbes[0]!.settledOccurrences, 0);
+    assert.equal(started.probes.length, 1, "only the foreign run reached a model request");
+
+    // Release the held run; its end and settlement complete without ever
+    // creating, attributing, or settling a scheduled occurrence.
+    releaseForeignRun!();
+    await foreignSend;
+    await Promise.allSettled(machine.sendPromises);
+    assert.equal(tracker.pendingOccurrences().length, 0);
+    assert.equal(tracker.settledOccurrences().length, 0, "a third-party run never counts as a scheduled occurrence");
+    assert.deepEqual(machine.sendMessageDeliveries.map((delivery) => delivery.customType), [foreignCustomType],
+      "the extension sent no scheduled turn or wake of its own");
+    assert.equal(machine.notices.some((notice) => notice.includes("could not reassert") || notice.includes("could not be correlated")), false,
+      `no review/auth arming failure was reported: ${JSON.stringify(machine.notices)}`);
+  } finally {
+    releaseForeignRun?.();
+    try {
+      await started?.cleanup();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   }
 });
 
@@ -612,50 +903,77 @@ test("a host without the message_start hook has the scheduled orchestrator dispa
   }
 });
 
-test("a message_start arming failure blocks tool calls and never counts an unreviewed scheduled turn", async () => {
+for (const variant of HOST_VARIANTS) {
+test(`a message_start arming failure blocks tool calls and never counts an unreviewed scheduled turn (${variant} host)`, async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-turn-host-arming-failure-"));
   const editedPath = join(dir, "index.ts");
   writeFileSync(editedPath, "before\n", "utf8");
   let host!: HostMachine;
   let blockedCalls = 0;
+  const blockReasons: string[] = [];
+  let started: StartedSession | undefined;
   try {
-    const started = await startScheduledSession(dir, async (message) => {
+    started = await startScheduledSession(dir, async (message) => {
       if (message.customType !== "pi-review-scheduled-orchestrator-turn") return;
       const results = await host.emit("tool_call", { id: "call-1", name: "Write", input: { path: editedPath } });
+      for (const result of results) {
+        if (isRecord(result) && result.block === true) blockReasons.push(String(result.reason ?? ""));
+      }
       if (results.some((result) => isRecord(result) && result.block === true)) blockedCalls += 1;
-    });
+    }, variant);
     host = started.machine;
-    // Force the checkpoint capture at message_start to fail closed after
-    // activation; delivery itself remains otherwise available.
-    mkdirSync(join(dir, ".pi-review-gate"), { recursive: true });
-    writeFileSync(join(dir, ".pi-review-gate", "unrelated"), "not an owned checkpoint\n", "utf8");
+    // Force the checkpoint capture to fail closed after activation (at
+    // message_start, and on Pi 1.2 already at the custom before_agent_start):
+    // unreadable Git metadata at the workspace root makes the capture refuse
+    // its raw fallback. Delivery itself remains otherwise available.
+    writeFileSync(join(dir, ".git"), `gitdir: ${join(dir, "missing-git-dir")}\n`, "utf8");
     started.advanceMinute();
     await waitForCondition(() => host.sendMessageDeliveries.some((delivery) => delivery.customType === "pi-review-scheduled-orchestrator-turn"));
     await waitForCondition(() => blockedCalls === 1);
-    await waitForCondition(() => started.tracker.pendingOccurrences().length === 1);
+    await waitForCondition(() => started!.tracker.pendingOccurrences().length === 1);
     assert.equal(started.tracker.pendingOccurrences()[0]!.processedAt instanceof Date, true, "the host message_start saw this occurrence");
     assert.equal(started.tracker.settledOccurrences().length, 0, "failed review arming cannot complete the occurrence");
     assert.equal(blockedCalls, 1, "every model tool call is stopped before execution after the arming failure");
+    assert.ok(blockReasons.length > 0 && blockReasons.every((reason) => reason.includes("review/auth boundary")),
+      `blocked by the review/auth fail-closed gate, not merely by tool authorization: ${JSON.stringify(blockReasons)}`);
+    assert.ok(host.notices.some((notice) => notice.includes("could not reassert the review baseline")),
+      `the message_start arming failure was reported: ${JSON.stringify(host.notices)}`);
     assert.equal(readFileSync(editedPath, "utf8"), "before\n", "no unreviewed workspace change escaped the gate");
     assert.equal(invocationCount(started.invocationMarker), 0, "no reviewer pass is fabricated without a baseline");
-    await started.shutdownSession();
+    const customEvents = host.beforeAgentStartEvents.filter((event) => event.customType !== undefined);
+    if (variant === "pi-1.2") {
+      // The host reports the before_agent_start arming failure and keeps
+      // running (as Pi 1.2's runner does); message_start stays the
+      // fail-closed fallback that blocked the tool call above.
+      assert.equal(customEvents.length, 1);
+      assert.ok(customEvents[0]!.errors.some((error) => error.includes("baseline capture failed")),
+        `the custom before_agent_start arming failure surfaced as a host-reported error: ${JSON.stringify(customEvents)}`);
+      assert.equal(customEvents[0]!.results.some(injectedContent), false, "no prompt injection on the failed custom run");
+    } else {
+      assert.deepEqual(customEvents, []);
+    }
   } finally {
-    await rm(dir, { recursive: true, force: true });
+    try {
+      await started?.cleanup();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   }
 });
 
-test("a queued scheduled turn that never runs is cleared by the session boundary and never counted", async () => {
+test(`a queued scheduled turn that never runs is cleared by the session boundary and never counted (${variant} host)`, async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-turn-host-reset-"));
+  let started: StartedSession | undefined;
   try {
     // The human turn's model phase never completes in this test: the
     // scheduled delivery is queued but the cycle never drains it.
     const neverGates = new Promise<never>(() => {});
-    const started = await startScheduledSession(dir, () => neverGates);
+    started = await startScheduledSession(dir, () => neverGates, variant);
     const { machine, tracker } = started;
 
     // Never awaited: the model phase never completes in this test.
     void machine.sendUserMessageForTest("start work then never finish");
-    await waitForCondition(() => started.probes.some((probe) => probe.kind === "user"));
+    await waitForCondition(() => started!.probes.some((probe) => probe.kind === "user"));
     started.advanceMinute();
     await waitForCondition(() => machine.sendMessageDeliveries.some((delivery) => delivery.customType === "pi-review-scheduled-orchestrator-turn"));
     await waitForCondition(() => tracker.pendingOccurrences().length === 1);
@@ -665,7 +983,14 @@ test("a queued scheduled turn that never runs is cleared by the session boundary
     await started.shutdownSession();
     assert.equal(tracker.pendingOccurrences().length, 0, "the session boundary dropped the uncorrelated occurrence");
     assert.equal(tracker.settledOccurrences().length, 0, "no run in this session completed it");
+    assert.equal(machine.beforeAgentStartEvents.some((event) => event.customType !== undefined), false,
+      "a queued (busy) scheduled delivery never emits a custom before_agent_start");
   } finally {
-    await rm(dir, { recursive: true, force: true });
+    try {
+      await started?.cleanup();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   }
 });
+}

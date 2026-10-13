@@ -11,10 +11,14 @@
  * Host reality this correction encodes (verified against the installed Pi
  * runtime): `sendCustomMessage` invoked on an idle agent starts its turn
  * through the low-level run path and a busy agent queues the message as a
- * follow-up that the running turn's loop consumes — NEITHER path emits
- * `before_agent_start`, while `agent_start` precedes `message_start` for
- * every consuming run, `message_start` for the custom message precedes its
- * model request, and `agent_settled` fires once per submit-cycle. The
+ * follow-up that the running turn's loop consumes — on Pi <= 1.1 NEITHER
+ * path emits `before_agent_start`, while `agent_start` precedes
+ * `message_start` for every consuming run, `message_start` for the custom
+ * message precedes its model request, and `agent_settled` fires once per
+ * submit-cycle. #388: Pi 1.2 additionally emits `before_agent_start` with
+ * `messageType: "custom"` (before `agent_start`) for the idle path only; the
+ * review gate arms there too, idempotently, without prompt injection, and
+ * the message_start rules below are unchanged and remain authoritative. The
  * extension therefore:
  *
  * - arms the fail-closed review gate from the host's `message_start` for the

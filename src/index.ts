@@ -261,6 +261,9 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     });
     registerHook(pi, "before_agent_start", (...args) => {
       deferredTools.reapply();
+      // #388: Pi 1.2 also reaches this hook for idle custom-message runs;
+      // earlier hosts never injected the inventory into those runs.
+      if (isCustomMessageRunStart(args)) return undefined;
       return deferredToolPromptInjection(deferredTools.startupGuidance(), extractSystemPrompt(args));
     });
     registerHook(pi, "tool_result", () => {
@@ -489,7 +492,8 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
    * Issue #222: fail-closed orchestrator-turn admission guard, read at each
    * dispatch: a host without every essential run-lifecycle hook can neither
    * arm the review gate before a scheduled turn's model request (nothing on
-   * the idle path emits before_agent_start) nor attribute and settle the
+   * a Pi <= 1.1 idle path emits before_agent_start, so message_start is the
+   * one seam every supported host provides) nor attribute and settle the
    * occurrence, and a blocked review restart cannot settle reviews at all.
    * The unsafe scheduled turn is never delivered.
    */
@@ -860,11 +864,13 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
   /**
    * Issue #222 (corrected): scheduled orchestrator-turn lifecycle observation
    * and review arming against the real host's event machine. On an idle host
-   * a scheduled custom send starts its run directly (before_agent_start is
-   * never emitted for it); on a busy host the queued message is consumed by
-   * the running cycle's loop. Both host paths emit agent_start before the
-   * consuming run's message_start, whose message_start handler runs before
-   * that message's model request — so here:
+   * a scheduled custom send starts its run directly (Pi <= 1.1 never emits
+   * before_agent_start for it; Pi 1.2 emits it with messageType "custom"
+   * before agent_start, where the review gate arms without prompt injection
+   * — #388); on a busy host the queued message is consumed by the running
+   * cycle's loop. Both host paths emit agent_start before the consuming run's
+   * message_start, whose message_start handler runs before that message's
+   * model request — so here:
    *
    * - agent_start/agent_end track the run-lifecycle sequences the tracker
    *   uses to bind an observation to its consuming run and to know when that
@@ -916,10 +922,22 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
    * Issue #222 (corrected): the review gate's run-arming for normal user
    * turns. Unchanged in behavior; the arming body is shared with the
    * scheduled custom-message observation below.
+   *
+   * #388: Pi 1.2 also emits before_agent_start for a run started by an idle
+   * `sendMessage(..., { triggerTurn: true })`, discriminated by
+   * `event.messageType === "custom"` (and fires it before that run's
+   * agent_start). Such a run still arms here — fail-closed and idempotent
+   * with the message_start arming, which stays the authoritative scheduled
+   * attribution and the fallback for hosts that never emit this hook — but
+   * receives none of the model-facing injection (critical message,
+   * operating-mode segment, authorized-tool inventory, completion guidance)
+   * that pre-1.2 hosts never applied to custom-message runs. A missing
+   * discriminator (Pi <= 1.1) or "user" keeps the full prompt path.
    */
   registerHook(pi, "before_agent_start", async (...args) => {
     const armed = await reviewTurn.armAgentRun(args);
     if (armed === "blocked") throw new Error(`review gate: fresh checkpoint restart failed (${checkpointRestartBlocked}); repair and restart before review`);
+    if (isCustomMessageRunStart(args)) return undefined;
     const authorizedToolGuidance = deferredTools.startupGuidance();
     const completionGuidance = config.youShouldKnow?.enabled !== false
       && config.youShouldKnow?.completionGuidance !== false
@@ -1207,6 +1225,17 @@ function registerDeferredToolLifecycleHooks(pi: unknown, deferredTools: Deferred
   for (const event of ["turn_start", "session_tree", "mcp_servers_change"]) {
     registerHook(pi, event, () => deferredTools.reapply());
   }
+}
+
+/**
+ * #388: whether a before_agent_start event explicitly reports a run started by
+ * a custom message (Pi 1.2+ `messageType: "custom"`). Only the explicit
+ * discriminator counts; a legacy event without one is a user prompt.
+ */
+function isCustomMessageRunStart(args: unknown[]): boolean {
+  const event = args[0];
+  return typeof event === "object" && event !== null
+    && (event as { messageType?: unknown }).messageType === "custom";
 }
 
 function hasNestedToolCallParent(args: unknown[]): boolean {

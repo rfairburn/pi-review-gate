@@ -26,6 +26,12 @@ import { skipOrFail } from "./bridge-fakes";
  * late-registered, native-schema loader — builtin enabled AND disabled at
  * startup, across /reload toggles — while discover→activate→echo keeps
  * working, and a genuinely missing tool_search still warns (negative control).
+ *
+ * #388: Pi 1.2 recognizes the replacement by its declared `reachesTools`
+ * instead of schema identity (Pi 1.0.4/1.1.x). The same no-warning and
+ * discover→activate→echo assertions run on every host; on Pi 1.2+ the real
+ * registry must also report the loader's reach as "all", and on older hosts
+ * any reported reach must still be "all".
  */
 
 const ECHO_TOOL = "mcp__prg_native_mcp__echo";
@@ -65,10 +71,10 @@ async function startFixture(
     ...(options.withCandidate ? {} : { candidateEntry: null }),
     gateConfig: gateConfig(),
     // Deferred exposure is the surface that makes Pi's discovery check require
-    // a RECOGNIZED tool_search (isToolSearchTool identity check): with it, a
-    // non-native parameter schema produces the false "MCP tools are only
-    // reachable..." warning, while codemode exposure would be masked by
-    // codemode auto-enablement.
+    // a RECOGNIZED tool_search (Pi <= 1.1: isToolSearchTool schema identity;
+    // Pi 1.2+: a declared reachesTools): without it the false "MCP tools are
+    // only reachable..." warning appears, while codemode exposure would be
+    // masked by codemode auto-enablement.
     serverExposure: "deferred",
     // Real user-level Pi settings: the builtin tool-search extension enabled
     // (default) or explicitly disabled, exactly as a user would configure it.
@@ -236,12 +242,33 @@ function requireTool(dump: ProbeDump, name: string): NonNullable<ProbeDump["allT
   return tool;
 }
 
+function versionAtLeast(version: string, major: number, minor: number): boolean {
+  const match = /^(\d+)\.(\d+)\./.exec(version);
+  if (!match) return false;
+  const [hostMajor, hostMinor] = [Number(match[1]), Number(match[2])];
+  return hostMajor > major || (hostMajor === major && hostMinor >= minor);
+}
+
+/** The live registry entry is our loader and carries the recognition Pi needs on this host (#388). */
+function requireRecognizableLoader(fixture: NativeMcpFixture, dump: ProbeDump, context: string): void {
+  const loader = requireTool(dump, "tool_search");
+  assert.ok(String(loader.description ?? "").startsWith("Activate authorized tools."),
+    `${context}: the registered tool_search is the review-gate loader, not the builtin: ${JSON.stringify(loader)}`);
+  if (versionAtLeast(fixture.host.version, 1, 2)) {
+    assert.equal(loader.reachesTools, "all",
+      `${context}: Pi ${fixture.host.version} recognizes a replacement tool_search only by reachesTools: ${JSON.stringify(loader)}`);
+  } else {
+    assert.ok(loader.reachesTools === undefined || loader.reachesTools === "all",
+      `${context}: Pi ${fixture.host.version} reports no other reach for the loader: ${JSON.stringify(loader)}`);
+  }
+}
+
 test("builtin tool_search enabled at startup: late loader registration stays warning-free and recognized (#279)", { timeout: 180_000 }, async (t) => {
   const fixture = await startFixture(t, { builtinEnabled: true, withCandidate: true });
   if (!fixture) return;
 
   const initial = await fixture.probeDump();
-  assert.ok(requireTool(initial, "tool_search"), "the review-gate loader is registered");
+  requireRecognizableLoader(fixture, initial, "startup (builtin enabled)");
   assertNoMisleadingSurfaces(fixture, "startup (builtin enabled)");
 
   await searchActivateEcho(fixture, "compat-enabled-ok");
@@ -256,7 +283,7 @@ test("builtin tool_search disabled at startup: bundled-factory schema keeps reco
   // no live native schema to borrow, so the loader must capture the exact
   // reference from the running install's bundled factory.
   const initial = await fixture.probeDump();
-  assert.ok(requireTool(initial, "tool_search"), "the review-gate loader is registered");
+  requireRecognizableLoader(fixture, initial, "startup (builtin disabled)");
   assertNoMisleadingSurfaces(fixture, "startup (builtin disabled)");
 
   await searchActivateEcho(fixture, "compat-disabled-ok");
@@ -268,7 +295,7 @@ test("toggling the builtin across a settings reload retains our loader and recog
   if (!fixture) return;
 
   const initial = await fixture.probeDump();
-  assert.ok(requireTool(initial, "tool_search"), "the review-gate loader is registered");
+  requireRecognizableLoader(fixture, initial, "startup (toggle base)");
   await searchActivateEcho(fixture, "compat-toggle-base-ok");
 
   // The reload reuses the SessionManager but runs a FRESH extension factory:
@@ -299,7 +326,7 @@ test("toggling the builtin across a settings reload retains our loader and recog
   // on the bundled-factory reference for this session incarnation.
   await reloadSettings({ extensions: ["-builtin:tool-search"] });
   const afterOff = await fixture.probeDump();
-  assert.ok(requireTool(afterOff, "tool_search"), "our loader survives the builtin-off reload");
+  requireRecognizableLoader(fixture, afterOff, "after builtin-off /reload");
   await searchActivateEcho(fixture, "compat-toggle-off-ok");
   assertNoMisleadingSurfaces(fixture, "after builtin-off /reload");
 
@@ -307,7 +334,7 @@ test("toggling the builtin across a settings reload retains our loader and recog
   // still recognized (no competing definition, no false discovery warning).
   await reloadSettings({});
   const afterOn = await fixture.probeDump();
-  assert.ok(requireTool(afterOn, "tool_search"), "our loader survives the builtin-on reload");
+  requireRecognizableLoader(fixture, afterOn, "after builtin-on /reload");
   await searchActivateEcho(fixture, "compat-toggle-on-ok");
   assertNoMisleadingSurfaces(fixture, "after builtin-on /reload");
 });

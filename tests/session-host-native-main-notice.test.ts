@@ -364,6 +364,14 @@ async function revealFullMarkdownBody(
   for (let page = 0; page < 128 && !noticeBodyStartVisible(frame); page += 1) {
     frame = await scrollNoticePage("PageUp", page + 1);
   }
+  // A PTY read can end mid-repaint: the heading arrives before the list item.
+  // Require both inside the ruled popup before inspecting the opening page;
+  // a missing item still fails this bounded wait and the assertions below.
+  await driver.waitFrame((next) => noticeBodyStartVisible(next)
+    && sharedPopupContains(next, BODY_HEADING) && sharedPopupContains(next, BODY_BULLET),
+  "the native Markdown opening page renders its heading and complete list item");
+  frame = driver.currentText();
+  recordPage("opening (complete)", driver.frameRevision, frame);
   assert.ok(noticeBodyStartVisible(frame) && sharedPopupContains(frame, BODY_HEADING),
     "the notice returns to the beginning of its native Markdown body");
   const openingPopupLines = nativeSharedPopupLines(frame).map((line) => line.trim());

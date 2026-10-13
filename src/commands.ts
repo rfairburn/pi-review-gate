@@ -23,6 +23,7 @@ import type { ReviewFinding, ReviewResult } from "./schema";
 import { createReviewTransmissionMessage, deliverReviewTransmission, type ReviewTransmissionAction } from "./transmission";
 import { dispatchModelDelivery, queueModelDelivery } from "./durable-delivery";
 import { editNativeTextField, type NativeTextFieldUi } from "./native-text-field";
+import { routeForegroundEscape } from "./foreground-escape";
 
 export interface RegisterCommandsInput {
   pi: unknown;
@@ -656,7 +657,8 @@ function createCommandReviewAbort(
   if (sessionSignal?.aborted) abortFromSession();
   sessionSignal?.addEventListener("abort", abortFromSession, { once: true });
   const unsubscribeTerminalInput = onTerminalInput(ctx, (terminalInput) => {
-    if (!isEscapeTerminalInput(terminalInput)) return undefined;
+    if (!options.isSessionActive() || !isEscapeTerminalInput(terminalInput)) return undefined;
+    if (routeForegroundEscape(ctx, terminalInput)) return { consume: true };
     if (!controller.signal.aborted) controller.abort("escape");
     // Immediate acknowledgement only; the completion notice is emitted after
     // the run has returned and cleanup ran.

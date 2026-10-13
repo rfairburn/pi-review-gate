@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.152]
+## [0.1.0-dev.153]
 
 ### Fixed
 
@@ -30,6 +30,17 @@ dates.
   remains outside the guarantee, as detailed in the review workflow documentation.
   Successful creation, retention, recovery/checkpoint evidence, and cache behavior
   are unchanged; no historical temporary-directory sweeping is added.
+
+## [0.1.0-dev.152]
+
+### Fixed
+
+- Escape in the foreground pending-input popup now performs only its existing
+  close, back, or native completion-dismiss action, without cancelling an
+  automatic or command-driven review underneath it (#387). A separate Escape
+  immediately after the popup closes still cancels the review normally;
+  pending input alone does not intercept cancellation. Review verdicts,
+  cancellation settlement, answers, declines, and notice actions are unchanged.
 
 ## [0.1.0-dev.151]
 

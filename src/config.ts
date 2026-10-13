@@ -5,6 +5,7 @@ import type { ConfigPathResolution } from "./config-path";
 import { reviewGateConfigCandidates, resolveConfigPathResolution } from "./config-path";
 import { parseCronExpression } from "./scheduling/cron";
 import { isNativeReasoningEffort, nativeReasoningArgs, type NativeReasoningEffort } from "./external-agent-reasoning";
+import { isRecord } from "./record-guard";
 
 export type RetainBundles = "never" | "on-failure" | "always";
 /**
@@ -2138,8 +2139,4 @@ function isTruthy(value: string | undefined): boolean {
 
 function firstTruthyEnv(env: NodeJS.ProcessEnv, names: string[]): string | undefined {
   return names.find((name) => isTruthy(env[name]));
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

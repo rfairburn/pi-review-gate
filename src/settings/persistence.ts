@@ -28,6 +28,7 @@ import {
   type ReviewGateConfig,
   type SubtaskNotificationMode,
 } from "../config";
+import { isRecord } from "../record-guard";
 
 export interface ReviewSettingsSelection {
   /** New definitions only; merged into the latest disk catalog at Save. */
@@ -611,8 +612,4 @@ export function replaceConfig(
       else delete nextEntry.alreadyRun;
     }
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

@@ -34,6 +34,7 @@
 
 import { pathToFileURL } from "node:url";
 import { resolveHostPeerFile } from "./host-peer-loader";
+import { isRecord } from "./record-guard";
 
 /** The running host agent package (the same peer name both consumers load). */
 const PI_AGENT_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
@@ -88,8 +89,4 @@ async function runPrewarm(): Promise<Record<string, unknown> | undefined> {
     // actually needs the module (fail-closed semantics unchanged).
     return undefined;
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

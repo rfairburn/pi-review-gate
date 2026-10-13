@@ -79,6 +79,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { isRecord } from "../record-guard";
 
 /** The two independently tracked categories published on the status frame. */
 export type OwnedActivityCategory = "backgroundTasks" | "backgroundShells";
@@ -276,10 +277,6 @@ interface PendingRegistration {
  * sources) loads, so registrations land directly.
  */
 const pendingRegistrations: PendingRegistration[] = [];
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function isCategory(value: unknown): value is OwnedActivityCategory {
   return value === "backgroundTasks" || value === "backgroundShells";

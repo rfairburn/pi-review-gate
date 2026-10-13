@@ -38,6 +38,7 @@ import { createRequire } from "node:module";
 import { readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { isRecord } from "./record-guard";
 
 /** Package names of the running host (current plus legacy scope). */
 const PI_AGENT_PACKAGE_NAMES = new Set(["@earendil-works/pi-coding-agent", "@mariozechner/pi-coding-agent"]);
@@ -233,8 +234,4 @@ function readPackageJson(dir: string): Record<string, unknown> | undefined {
   } catch {
     return undefined;
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

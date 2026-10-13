@@ -29,6 +29,7 @@
  */
 
 import { auditRepository, EMPTY_TREE_SHA, GitReadError, pinRevision, resolveRepoRoot, runGit, runGitBytePrefix, runGitPagedLines, snapshotToken } from "./git";
+import { isRecord } from "../record-guard";
 
 // ---------------------------------------------------------------------------
 // Limits (documented in the tool schema)
@@ -297,10 +298,6 @@ type AnyParams =
 // ---------------------------------------------------------------------------
 // Validation helpers
 // ---------------------------------------------------------------------------
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 /** Revision specs: non-empty, bounded, no control chars, no leading dash. */
 function validateRevision(value: unknown, field: string): string {

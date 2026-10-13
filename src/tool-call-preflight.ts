@@ -1,5 +1,6 @@
 import { registerHook } from "./pi";
 import { isToolCallFingerprint, toolCallFingerprint, type StartLiveness } from "./tool-call-fingerprint";
+import { isRecord } from "./record-guard";
 
 const CODEMODE_TOOL_NAME = "codemode";
 
@@ -884,8 +885,4 @@ function toolSpecificNextStep(name: string, earlierResultObserved: boolean): str
     default:
       return "Use the evidence already available.";
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

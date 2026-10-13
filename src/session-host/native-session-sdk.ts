@@ -9,6 +9,7 @@ import {
   realpathSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { isRecord as isPlainObject } from "../record-guard";
 
 /**
  * Public SDK loader for the native saved-session catalog (issue 323).
@@ -134,10 +135,6 @@ interface SdkPackageManifest {
   main?: unknown;
   exports?: unknown;
   bin?: unknown;
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 /** True when `path` lexically escapes `root`. */

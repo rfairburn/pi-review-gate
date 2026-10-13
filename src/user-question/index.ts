@@ -53,6 +53,7 @@ import {
 } from "./pi-tui-host";
 import { createUserQuestionTool } from "./tool";
 import { createYouShouldKnowTool } from "./notice-tool";
+import { isRecord } from "../record-guard";
 
 /** Widget key for the persistent collapsed pending-question panel (above the editor). */
 export const USER_QUESTION_PANEL_KEY = "review-gate-pending-questions";
@@ -606,8 +607,4 @@ function sessionManagerOf(ctx: unknown): unknown {
     return undefined; // A throwing getter: identity unavailable.
   }
   return typeof value === "object" && value !== null ? value : undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

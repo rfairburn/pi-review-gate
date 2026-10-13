@@ -53,6 +53,7 @@ import { randomUUID } from "node:crypto";
 import { capNotificationText } from "../execution/subtask-notifications";
 import { redactSensitiveText } from "../redaction";
 import type { ScheduledTaskEntryConfig } from "../config";
+import { isRecord } from "../record-guard";
 
 /** The delivered message shape for one orchestrator-turn delivery. */
 export interface ScheduledOrchestratorTurnMessage {
@@ -172,10 +173,6 @@ export function findTriggeringCustomMessage(args: unknown[]): { customType: stri
 
 function isCustomShape(value: unknown): boolean {
   return typeof value === "object" && value !== null && !Array.isArray(value) && "customType" in (value as Record<string, unknown>);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**

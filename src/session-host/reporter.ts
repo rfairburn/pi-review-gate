@@ -84,6 +84,7 @@ import {
   type SessionSpawnInput,
   type SessionSpawnOutcome,
 } from "./protocol";
+import { isRecord } from "../record-guard";
 
 declare const module: {
   exports: unknown;
@@ -134,10 +135,6 @@ interface StickyState {
   nativePersistence?: NativePersistenceReceipt;
   shutdownRequested?: boolean;
   teardown?: () => void;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 interface NativeSessionRead {

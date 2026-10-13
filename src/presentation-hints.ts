@@ -69,6 +69,7 @@ import { createRequire } from "node:module";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { loadHostPeerModule, resolveHostPeerPackageRoot } from "./host-peer-loader";
+import { isRecord } from "./record-guard";
 
 /** The keybinding id Pi binds tool-output expansion to (default Ctrl+O). */
 export const EXPANSION_KEYBINDING_ID = "app.tools.expand";
@@ -180,10 +181,6 @@ const AGENT_KEYBINDINGS_SUBPATH = "./dist/core/keybindings.js";
 const nativeDynamicImport = new Function("specifier", "return import(specifier)") as (
   specifier: string,
 ) => Promise<unknown>;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 /**
  * The running host's agent package keybinding definitions module (the class

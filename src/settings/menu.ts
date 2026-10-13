@@ -50,6 +50,7 @@
  */
 
 import { loadHostPeerModule } from "../host-peer-loader";
+import { isRecord } from "../record-guard";
 
 /** One selectable row: a stable logical key plus its rendered label. */
 export interface RetainedRow {
@@ -218,10 +219,6 @@ async function loadMenuTuiHost(): Promise<MenuTuiHost | undefined> {
     if (typeof agent.keyHint === "function") host.keyHint = agent.keyHint as MenuTuiHost["keyHint"];
   }
   return host;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** True when the injected keybindings argument is a live KeybindingsManager. */

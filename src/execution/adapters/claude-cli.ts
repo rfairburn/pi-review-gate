@@ -23,6 +23,7 @@ import { ClaudeStreamJsonParser, ClaudeStreamActivityExtractor } from "../progre
 import { writeExecutorArtifacts } from "../artifacts";
 import type { ExecutorAdapter, ExecutorInteractionAcknowledgement, ExecutorRequest, ExecutorTurn } from "../types";
 import { createExecutorToolCatalog, rejectPreCutoverRequestFields } from "../tool-catalog";
+import { isRecord } from "../../record-guard";
 
 const dynamicImport = new Function("specifier", "return import(specifier)") as (specifier: string) => Promise<typeof import("@anthropic-ai/claude-agent-sdk")>;
 
@@ -1024,10 +1025,6 @@ async function ownedGroupEmpty(processGroupId: number, signalDelivered: boolean,
     if (Date.now() >= deadline) return false;
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function messageOf(error: unknown): string {

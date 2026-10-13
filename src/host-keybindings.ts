@@ -11,6 +11,7 @@
  */
 
 import { canonicalModeCycleChord } from "./config";
+import { isRecord } from "./record-guard";
 
 export interface HostKeybindingCheck {
   /** True when Pi's live resolution could be read at all. */
@@ -47,10 +48,6 @@ function loadHostKeybindingResolution(): HostKeybindingResolution | undefined {
     // Outside Pi (unit tests, tooling) the peer is simply not resolvable.
     return undefined;
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**

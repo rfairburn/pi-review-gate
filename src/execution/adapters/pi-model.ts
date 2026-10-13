@@ -38,6 +38,7 @@ import {
   removePiSettlementReceipt,
   type PiSettlementBootstrap,
 } from "../pi-settlement-receipt";
+import { isRecord } from "../../record-guard";
 
 export interface PiExecutorOptions {
   model: string;
@@ -1252,10 +1253,6 @@ function rpcError(event: Record<string, unknown>): string {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function abortError(signal?: AbortSignal): Error {

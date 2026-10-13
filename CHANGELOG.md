@@ -30,6 +30,19 @@ dates.
   fallback, fail-closed ownership/settlement coverage, and production discovery
   are unchanged.
 
+## [0.1.0-dev.155]
+
+### Changed
+
+- Internal cleanup with no behavior change (#241): 34 identical strict
+  unknown-valued record guards now share one dependency-free helper. It still
+  rejects only `null`, non-objects, and arrays, and still accepts null-prototype
+  and non-plain objects such as `Date` and `Buffer`. The evidence parser's
+  exported `isRecord` stays available, and every other guard is unchanged —
+  including the permissive guards that accept arrays (deferred native
+  `tool_search` schema selection, `/review-settings` UI detection, and scoped
+  model thinking maps). New parity tests pin both strict and permissive behavior.
+
 ## [0.1.0-dev.154]
 
 ### Added

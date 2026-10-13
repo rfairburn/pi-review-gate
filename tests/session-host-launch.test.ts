@@ -1898,12 +1898,14 @@ test("launch revalidates the sessions path structure: a project directory swappe
 test("the startup options helper resolves only the own compiled package scripts (no ancestor fallback)", async (t) => {
   const compiledLaunch = join(process.cwd(), "dist-test", "src", "session-host", "launch.js");
   const compiledConfigPath = join(process.cwd(), "dist-test", "src", "config-path.js");
+  const compiledRecordGuard = join(process.cwd(), "dist-test", "src", "record-guard.js");
   const compiledSavedSessions = join(process.cwd(), "dist-test", "src", "session-host", "saved-sessions.js");
   const compiledNativeSessionSdk = join(process.cwd(), "dist-test", "src", "session-host", "native-session-sdk.js");
   const compiledStartupRequest = join(process.cwd(), "dist-test", "src", "session-host", "startup-request.js");
   const compiledProtocol = join(process.cwd(), "dist-test", "src", "session-host", "protocol.js");
   assert.ok(existsSync(compiledLaunch), "the compiled launch module under test must exist");
   assert.ok(existsSync(compiledConfigPath), "the compiled native config-path helper must exist");
+  assert.ok(existsSync(compiledRecordGuard), "the compiled record guard must exist");
   assert.ok(existsSync(compiledSavedSessions), "the compiled saved-session catalog module must exist");
   assert.ok(existsSync(compiledNativeSessionSdk), "the compiled public SDK loader module must exist");
   assert.ok(existsSync(compiledStartupRequest), "the compiled startup-request module must exist");
@@ -1921,6 +1923,7 @@ test("the startup options helper resolves only the own compiled package scripts 
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "startup-request.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "protocol.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "config-path.js"),
+    join(rootA, "node_modules", "pi-review-gate", "dist", "src", "record-guard.js"),
     join(rootA, "scripts", "session-host-startup-options.cjs"),
     markerA,
   ], [
@@ -1941,6 +1944,7 @@ test("the startup options helper resolves only the own compiled package scripts 
   await cp(compiledStartupRequest, join(distA, "startup-request.js"));
   await cp(compiledProtocol, join(distA, "protocol.js"));
   await cp(compiledConfigPath, join(pkgA, "dist", "src", "config-path.js"));
+  await cp(compiledRecordGuard, join(pkgA, "dist", "src", "record-guard.js"));
   await mkdir(join(rootA, "scripts"), { recursive: true });
   await writeFile(
     join(rootA, "scripts", "session-host-startup-options.cjs"),
@@ -1967,6 +1971,7 @@ test("the startup options helper resolves only the own compiled package scripts 
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "startup-request.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "protocol.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "config-path.js"),
+    join(rootB, "node_modules", "pi-review-gate", "dist", "src", "record-guard.js"),
     join(rootB, "node_modules", "pi-review-gate", "scripts", "session-host-startup-options.cjs"),
   ], [
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host"),
@@ -1986,6 +1991,7 @@ test("the startup options helper resolves only the own compiled package scripts 
   await cp(compiledStartupRequest, join(distB, "startup-request.js"));
   await cp(compiledProtocol, join(distB, "protocol.js"));
   await cp(compiledConfigPath, join(pkgB, "dist", "src", "config-path.js"));
+  await cp(compiledRecordGuard, join(pkgB, "dist", "src", "record-guard.js"));
   await mkdir(join(pkgB, "scripts"), { recursive: true });
   await cp(join(process.cwd(), "scripts", "session-host-startup-options.cjs"), join(pkgB, "scripts", "session-host-startup-options.cjs"));
   const launchB = require(join(distB, "launch.js")) as CompiledLaunchModule;

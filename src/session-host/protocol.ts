@@ -32,6 +32,7 @@
  */
 
 import { isAbsolute, posix as posixPath } from "node:path";
+import { isRecord } from "../record-guard";
 
 export const HOST_BOOTSTRAP_ENV = "PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP";
 
@@ -246,10 +247,6 @@ export type SessionSpawnOutcome = SessionHostSpawnAck["outcome"];
 
 export type SessionHostMessage = SessionHostHello | SessionHostStatus | SessionHostRenameRequest | SessionHostRenameAck
   | SessionHostShutdownRequest | SessionHostShutdownAck | SessionHostSpawnRequest | SessionHostSpawnAck;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function isValidId(value: unknown): value is string {
   return typeof value === "string" && value.length >= 1 && value.length <= MAX_ID_LENGTH && ID_PATTERN.test(value);

@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { isRecord } from "./record-guard";
 
 /**
  * Shared alias-independent launch resolution for Pi child processes (issues #204 and #290).
@@ -129,8 +130,4 @@ export function resolvePiChildSpawn(
     return { ...invocation, error: missingPiDiagnostic() };
   }
   return invocation;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

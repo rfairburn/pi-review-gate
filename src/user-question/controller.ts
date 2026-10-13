@@ -28,6 +28,8 @@
  *   settles every remaining waiter so nothing can hang.
  */
 
+import { isRecord } from "../record-guard";
+
 export type QuestionMode = "async" | "sync";
 
 /** How a pending question left the pending set. */
@@ -592,10 +594,6 @@ function unavailableMessage(): string {
 
 function isObjectIdentity(value: unknown): value is object {
   return typeof value === "object" && value !== null;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isPendingNotice(record: PendingUserInput): record is PendingNotice {

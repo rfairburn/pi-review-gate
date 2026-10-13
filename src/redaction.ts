@@ -1,3 +1,5 @@
+import { isRecord } from "./record-guard";
+
 const SENSITIVE_KEY = String.raw`(?:api[_-]?key|access[_-]?token|refresh[_-]?token|session[_-]?token|auth[_-]?token|token|auth(?:orization)?|bearer|password|passwd|secret|cookie)`;
 
 // A generated "[REDACTED]" marker is matched explicitly as the first value
@@ -193,10 +195,6 @@ export function redactSensitiveValue(value: unknown, key?: string): unknown {
       [childKey, redactSensitiveValue(child, childKey)]));
   }
   return value;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isStructurallyPlausibleJwt(candidate: string): boolean {

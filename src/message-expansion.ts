@@ -124,6 +124,7 @@ import { loadHostPeerModule } from "./host-peer-loader";
 import { visibleTerminalText } from "./tool-result-text";
 import { BACKGROUND_TASK_STATES, type BackgroundTaskKind } from "./execution/task-state";
 import { TRUNCATION_MARKER, subtaskSuccessVerb } from "./execution/subtask-notifications";
+import { isRecord } from "./record-guard";
 
 // ── Structural host types ────────────────────────────────────────────────────
 
@@ -374,10 +375,6 @@ function nativeCard(row: MessageComponent, theme: unknown): MessageComponent {
 }
 
 // ── Shared display helpers ───────────────────────────────────────────────────
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function isRenderableComponent(value: unknown): boolean {
   return typeof value === "object" && value !== null

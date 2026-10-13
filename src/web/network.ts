@@ -8,6 +8,7 @@ import type { Readable } from "node:stream";
 import { Agent, request, type Dispatcher } from "undici";
 import { isBlockedAddress } from "./ip";
 import type { BrokerDial } from "./egress-broker";
+import { isRecord } from "../record-guard";
 
 export interface NetworkOptions {
   timeoutMs: number;
@@ -578,10 +579,6 @@ function parseDdgsOutput(value: Record<string, unknown>): DdgsSearchOutput {
     };
   });
   return { results };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function normalizedSearchResultUrl(value: string): string | undefined {

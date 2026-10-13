@@ -10,6 +10,9 @@
  */
 import { capRawContent } from "./artifacts";
 import type { RawEvidenceRecord, SubtaskEvidenceStatus } from "./types";
+import { isRecord } from "../../record-guard";
+
+export { isRecord };
 
 export interface ParsedLines {
   records: RawEvidenceRecord[];
@@ -19,10 +22,6 @@ export interface ParsedLines {
 // ---------------------------------------------------------------------------
 // Small value helpers
 // ---------------------------------------------------------------------------
-
-export function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function str(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;

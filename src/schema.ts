@@ -1,5 +1,6 @@
 import type { DeciderConfig } from "./config";
 import type { TokenUsage } from "./usage";
+import { isRecord } from "./record-guard";
 
 export type ReviewVerdict = "pass" | "needs_changes" | "error";
 
@@ -409,10 +410,6 @@ function schemaError(reviewerId: string, summary: string, rawOutputPath?: string
     rawOutputPath,
     error: "schema_error",
   };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function hasAllowedKeysOrNullExtras(

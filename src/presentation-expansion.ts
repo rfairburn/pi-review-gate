@@ -61,6 +61,7 @@ import {
   withExpansionHint,
   type PresentationViewComponent,
 } from "./presentation-hints";
+import { isRecord } from "./record-guard";
 
 /** Structural theme subset used by presentation renderers. */
 export interface PresentationTheme {
@@ -333,10 +334,6 @@ function withDetailViewFailureNotice(
       inner.invalidate?.();
     },
   };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** Host render slots must return a component with a render(width) method. */

@@ -31,6 +31,8 @@
  * chat editor, including user keybindings.json overrides.
  */
 
+import { isRecord } from "./record-guard";
+
 /**
  * Select-list styling the host editor theme requires. Identity-mapped by
  * default; only visible when a consumer attaches an autocomplete provider
@@ -208,8 +210,4 @@ function safeThemeFg(theme: unknown, color: string, text: string): string {
 /** True only for a real KeybindingsManager instance (live defaults + overrides). */
 function isLiveKeybindingsManager(value: unknown): boolean {
   return isRecord(value) && typeof value.matches === "function";
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

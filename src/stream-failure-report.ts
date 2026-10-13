@@ -56,6 +56,7 @@
 
 import { registerHook } from "./pi";
 import { redactSensitiveText } from "./redaction";
+import { isRecord } from "./record-guard";
 
 // ── Captured shapes (all fields allowlisted and bounded) ────────────────
 
@@ -796,10 +797,6 @@ export function streamFailureCollapsedLines(report: StreamFailureReport): Stream
 }
 
 // ── Hook wiring ─────────────────────────────────────────────────────────
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function sessionManagerOf(args: unknown[]): unknown {
   for (const arg of args) {

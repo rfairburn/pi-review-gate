@@ -37,6 +37,7 @@
  */
 
 import { loadHostPeerModule } from "../host-peer-loader";
+import { isRecord } from "../record-guard";
 
 const PI_TUI_PACKAGE_NAME = "@earendil-works/pi-tui";
 const PI_AGENT_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
@@ -194,8 +195,4 @@ async function doLoadQuestionTuiHost(): Promise<QuestionTuiHost | undefined> {
     };
   }
   return Object.keys(host).length > 0 ? host : undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

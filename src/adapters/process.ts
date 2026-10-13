@@ -4,6 +4,7 @@ import { isAbsolute, join } from "node:path";
 import type { ReviewerInvocationTelemetry, ReviewResult } from "../schema";
 import { BoundedJsonlDecoder, MEBIBYTE, utf8Prefix } from "../jsonl";
 import { DEFAULT_PI_COMMAND, resolvePiChildSpawn, translateDefaultPiSpawnError } from "../pi-invocation";
+import { isRecord } from "../record-guard";
 
 export interface ProcessRunResult {
   stdout: string;
@@ -674,10 +675,6 @@ function collectToolResults(event: Record<string, unknown>): Array<{ id?: string
 function isCompactionEvent(event: Record<string, unknown>): boolean {
   return [event.type, event.event, event.subtype].some((value) =>
     typeof value === "string" && /compact/i.test(value));
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function cappedChunk(chunk: string, remainingBytes: number): { value: string; bytes: number; truncated: boolean } {

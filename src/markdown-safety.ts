@@ -1,4 +1,5 @@
 import { visibleTerminalText } from "./tool-result-text";
+import { isRecord } from "./record-guard";
 
 const registeredHosts = new WeakSet<object>();
 
@@ -36,8 +37,4 @@ export function registerSafeMarkdownDisplayTransformer(pi: unknown): boolean {
     // request data is changed and no model call is blocked.
     return false;
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

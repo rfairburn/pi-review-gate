@@ -17,6 +17,7 @@
  */
 import type { ReviewGateConfig } from "../config";
 import { updateReviewGateConfig } from "../settings/persistence";
+import { isRecord } from "../record-guard";
 
 export interface OneShotConsumeOptions {
   /** The live in-memory config (the scheduler's catalog source). */
@@ -66,10 +67,6 @@ export function consumeOneShotExecution(entryId: string, options: OneShotConsume
       `review gate: scheduled task ${entryId} started its one-shot execution, but recording alreadyRun in the config file failed: ${messageOf(error)}`,
     );
   });
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function messageOf(error: unknown): string {

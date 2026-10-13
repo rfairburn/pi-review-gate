@@ -119,6 +119,7 @@
 
 import { loadHostPeerModule } from "./host-peer-loader";
 import { pointHostEditorModuleAtLiveKeybindings, type HostEditorProvider } from "./host-editor";
+import { isRecord } from "./record-guard";
 
 const PI_AGENT_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 const PI_TUI_PACKAGE_NAME = "@earendil-works/pi-tui";
@@ -292,10 +293,6 @@ const SETTINGS_FIELD_SEMANTICS: NativeEditorFieldSemantics = {
 
 interface KeyMatcher {
   matches(data: string, keybinding: string): boolean;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 type NativeEditorCtor = new (

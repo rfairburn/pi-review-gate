@@ -18,6 +18,7 @@ import { EvidenceRefusalError, capped, evidenceErrorMessage, finalizeSource, omi
 import { readBoundedTextFile } from "../../bounded-file";
 import { compactJson } from "./parsers";
 import { EVIDENCE_REVIEW_RECORD_BYTES, type IndexedSource, type RawEvidenceRecord, type RawRetentionBudget, type SubtaskEvidenceUnavailable } from "./types";
+import { isRecord } from "../../record-guard";
 
 const REVIEW_AGGREGATES = new Set(["pass", "pass_with_warnings", "needs_changes", "error"]);
 
@@ -28,10 +29,6 @@ export const INPLACE_REVIEW_WAVE_ID = "inplace";
 export const REVIEW_CYCLE_RECORD_NAME = /^cycle-\d{6}\.json$/;
 /** File name of a publication-failure marker for one completed cycle. */
 export const REVIEW_CYCLE_MARKER_NAME = /^cycle-\d{6}\.json\.unpublished$/;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 /**
  * Structural validation and ownership check for one durable review cycle

@@ -3498,7 +3498,7 @@ describe("session-host bootstrap preload", () => {
   }
 
   /**
-   * Stages the explicit six-leaf closure under one shared ownership ledger.
+   * Stages the explicit compiled-leaf closure under one shared ownership ledger.
    * On failure the ledger is revalidated to surface concurrent tampering, and
    * everything created is retained.
    */
@@ -3581,11 +3581,12 @@ describe("session-host bootstrap preload", () => {
     const root = mkdtempSync(join(tmpdir(), "sh preload "));
     try {
       // The exact staged module closure the spaced preload and reporter load:
-      // six explicit compiled leaves under one shared ownership ledger, each
+      // explicit compiled leaves under one shared ownership ledger, each
       // descriptor-checked and written exclusively; no stubs, no dynamic
       // substitution, no tree copying.
       stageModuleClosure(root, [
         { relative: "src/pi.js", source: join(__dirname, "..", "src/pi.js") },
+        { relative: "src/record-guard.js", source: join(__dirname, "..", "src/record-guard.js") },
         { relative: "src/session-host/protocol.js", source: join(__dirname, "..", "src/session-host/protocol.js") },
         { relative: "src/session-host/reporter.js", source: join(__dirname, "..", "src/session-host/reporter.js") },
         { relative: "src/session-host/bootstrap-preload.js", source: join(__dirname, "..", "src/session-host/bootstrap-preload.js") },

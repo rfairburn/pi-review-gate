@@ -7,6 +7,7 @@ import {
   type SessionSpawnOutcome,
 } from "./protocol";
 import type { SessionHostSpawnCapability } from "./spawn-capability";
+import { isRecord } from "../record-guard";
 
 export const SESSION_SPAWN_TOOL_NAME = "SessionSpawn";
 
@@ -110,8 +111,4 @@ export function sessionSpawnResult(outcome: SessionSpawnOutcome): Record<string,
     content: [{ type: "text", text }],
     details: { outcome },
   };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

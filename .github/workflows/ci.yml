@@ -234,6 +234,14 @@ jobs:
         run: node --test dist-test/tests/wave-source-identity.test.js
       - name: Launcher tests (helper pipeline + native .cmd cases)
         run: node --test dist-test/tests/launcher-cmd.test.js
+      - name: Direct sidebar skill provisioning parity (native Windows)
+        # The shared session-host launcher provisions the shipped skills before
+        # host startup (issue 378). These compiled tests exercise that setup
+        # natively on Windows — real filesystem publication, refresh reuse,
+        # ownership-safe migration, and fail-closed behavior. This is direct
+        # entrypoint setup evidence only, never real Windows ConPTY or sidebar
+        # UI readiness.
+        run: node --test dist-test/tests/session-host-skill-provisioning.test.js
       - name: Launcher development-build seam on native Windows
         # The same npm script the launcher's development branch executes
         # (npm --prefix <root> run build), validating the toolchain natively.

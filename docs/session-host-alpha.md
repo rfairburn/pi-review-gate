@@ -250,9 +250,14 @@ uncertain descendant cleanup is added. Ordinary package scripts are unchanged. P
 Node can terminate only the directly owned Windows setup child, so abnormal timeout
 settlement is not represented as descendant-tree proof and uncertain stages are kept.
 Setup preserves trusted original `NODE_OPTIONS` and provider values while removing only
-stale host capabilities. Setup failures stop startup rather than falling back to a
-shell wrapper. The normal review-gate launchers, their behavior, and user settings are
-unchanged.
+stale host capabilities. Before starting the host, the launcher also refreshes the
+shipped skills under `~/.agents/skills/` from the same canonical publication manifest
+as the review-gate wrapper — orchestrator (with its recovery runbook), execution,
+research, and completion — followed by the ownership-safe pre-#151 generic-location
+migration, so a direct sidebar launch needs no wrapper prerequisite; byte-identical
+installed files are reused untouched on repeat launches. Setup failures stop startup
+rather than falling back to a shell wrapper. The normal review-gate launchers, their
+behavior, and user settings are unchanged.
 
 ## Starting and owning sessions
 
@@ -327,8 +332,9 @@ removal forgets a row.
 All children naturally
 share ordinary native Pi configuration and resources: settings, authentication,
 models, keybindings, extensions, MCP configuration, skills, and provider environment.
-The host does not clone those files, republish skills, create per-window credentials, or
-require a separate login. It does not attach to existing or detached processes, adopt
+The launcher refreshes the shipped skills before host startup (above); the host itself
+does not clone those files, republish skills per window, create per-window credentials,
+or require a separate login. It does not attach to existing or detached processes, adopt
 them, or reparent work. Moving the sidebar highlight does not change the active
 session. A single left-click on a displayed instance card invokes that row's existing
 Enter action: activating a live row makes it the active Main input owner and focuses

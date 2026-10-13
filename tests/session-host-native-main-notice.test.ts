@@ -371,6 +371,7 @@ async function revealFullMarkdownBody(
     && sharedPopupContains(next, BODY_HEADING) && sharedPopupContains(next, BODY_BULLET),
   "the native Markdown opening page renders its heading and complete list item");
   frame = driver.currentText();
+  recordPage("opening (complete)", driver.frameRevision, frame);
   assert.ok(noticeBodyStartVisible(frame) && sharedPopupContains(frame, BODY_HEADING),
     "the notice returns to the beginning of its native Markdown body");
   const openingPopupLines = nativeSharedPopupLines(frame).map((line) => line.trim());

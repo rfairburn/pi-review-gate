@@ -17,7 +17,11 @@
  * background-shell-integration.test.ts on Linux/macOS; nothing in this file
  * mocks a shell — the PATH fixture below changes what `where` really finds,
  * and every fallback case proves its preconditions (pwsh.exe genuinely
- * absent, real 5.x powershell.exe retained) before it runs. Test-owned
+ * absent, real 5.x powershell.exe retained) before it runs. The two
+ * pwsh-specific cases treat PowerShell 7 as an optional prerequisite: a
+ * verified absence skips them with a truthful reason, while a failed,
+ * timed-out, or malformed lookup fails with diagnostics instead (tests/
+ * helpers/pwsh-prerequisite.ts). Test-owned
  * temp-file cleanup uses bounded retry (tests/helpers/temp-file-cleanup.ts):
  * a just-killed process can hold its redirected-output handles open briefly
  * on Windows, and a transient EPERM in cleanup must neither fail an
@@ -34,6 +38,7 @@ import registerBackgroundShell, { reapAll } from "../src/background-shell";
 import { POWERSHELL_ARGS, wrapWithPowerShellWatchdog } from "../src/background-shell/jobs";
 import { findWindowsExecutable, resolveWindowsPowerShell, spawnBackgroundJob } from "../src/background-shell/shell";
 import { BackgroundProcessReadiness } from "../src/background-process-readiness";
+import { probePwshPrerequisite } from "./helpers/pwsh-prerequisite";
 
 const IS_WINDOWS = process.platform === "win32";
 const SKIP = { skip: !IS_WINDOWS };
@@ -257,7 +262,16 @@ afterEach(() => {
 });
 
 describe("ShellStart on native Windows: PowerShell discovery (#99)", () => {
-  it("prefers pwsh.exe when both PowerShell editions resolve", SKIP, async () => {
+  it("prefers pwsh.exe when both PowerShell editions resolve", SKIP, async (t) => {
+    // Optional prerequisite: a verified absence skips with a truthful reason;
+    // a failed, timed-out, or malformed lookup fails with diagnostics instead
+    // of masquerading as absence.
+    const prereq = probePwshPrerequisite();
+    if (prereq.kind === "absent") {
+      t.skip("PowerShell 7 (pwsh.exe) is not on PATH; optional prerequisite for pwsh-specific coverage");
+      return;
+    }
+    if (prereq.kind === "error") throw new Error(`pwsh prerequisite lookup failed: ${prereq.reason}`);
     const { call } = wire();
     const result = await call("ShellStart", {
       command: "Write-Output (Get-Process -Id $PID).Path; exit 0",
@@ -361,8 +375,19 @@ describe("ShellStart on native Windows: invocation and encoding (#99)", () => {
       expect(sent[0].content, `${edition}: ${testCase.name}`).toContain(`exited ${testCase.code}`);
     }
   }
-  it("maps exit status correctly on PowerShell 7 (pwsh)", SKIP, async () => {
-    // Prove the edition before trusting the label: default PATH resolves pwsh.
+  it("maps exit status correctly on PowerShell 7 (pwsh)", SKIP, async (t) => {
+    // Optional prerequisite: a verified absence skips with a truthful reason;
+    // a failed, timed-out, or malformed lookup fails with diagnostics instead
+    // of masquerading as absence.
+    const prereq = probePwshPrerequisite();
+    if (prereq.kind === "absent") {
+      t.skip("PowerShell 7 (pwsh.exe) is not on PATH; optional prerequisite for pwsh-specific coverage");
+      return;
+    }
+    if (prereq.kind === "error") throw new Error(`pwsh prerequisite lookup failed: ${prereq.reason}`);
+    // Prove the edition before trusting the label: production resolution
+    // itself must pick pwsh.exe — the probe alone does not subsume this,
+    // since production performs its own separate lookups.
     const exe = resolveWindowsPowerShell();
     expect(basename(exe).toLowerCase(), "default PATH resolves pwsh.exe").toBe("pwsh.exe");
     await runExitMatrix("pwsh");

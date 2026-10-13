@@ -159,8 +159,9 @@ and `YouShouldKnow` is in the current live, authorized discovery ceiling.
   the model toward publication when completion guidance is off. If installed and
   discoverable in the active Pi environment, it can still be explicitly loaded as
   `/skill:pi-review-gate-completion` regardless of the guidance toggle. Standard
-  launchers refresh all four skills under `~/.agents/skills/`; directly loading the
-  extension or using a sidebar-only native setup does not install them. The guidance
+  launchers — including the session-host sidebar launchers, which refresh them before
+  host startup — keep all four skills under `~/.agents/skills/` current; only loading
+  the extension directly, without either launcher, skips installation. The guidance
   toggle controls the extension's automatic pointer, not skill installation or
   discovery. Manual invocation does not grant `YouShouldKnow` authority; the tool must
   still be available and each call otherwise authorized.

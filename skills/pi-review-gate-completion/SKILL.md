@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # Completion handoff
 
-This skill is excluded from Pi's automatic model-invoked skill list. Standard launchers refresh it under `~/.agents/skills/`; it is manually available as `/skill:pi-review-gate-completion` only when installed and discoverable in the active Pi environment, regardless of `youShouldKnow.completionGuidance`. Direct extension loading and sidebar-only native setup do not install the skill. The extension supplies its automatic pointer only when both notice availability and completion guidance are On and live authorized discovery exposes `YouShouldKnow`. Manual invocation does not grant tool authority.
+This skill is excluded from Pi's automatic model-invoked skill list. Standard launchers — including the session-host sidebar launchers, which refresh it before host startup — keep it current under `~/.agents/skills/`; it is manually available as `/skill:pi-review-gate-completion` only when installed and discoverable in the active Pi environment, regardless of `youShouldKnow.completionGuidance`. Only loading the extension directly, without either launcher, skips installation. The extension supplies its automatic pointer only when both notice availability and completion guidance are On and live authorized discovery exposes `YouShouldKnow`. Manual invocation does not grant tool authority.
 
 Use this skill when substantial work has reached a meaningful completion point. The handoff supplements the normal conversation summary; it never replaces it.
 

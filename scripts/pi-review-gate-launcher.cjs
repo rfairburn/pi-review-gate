@@ -1156,6 +1156,13 @@ module.exports = {
   DDGS_VERSION,
   MANAGEMENT_VERBS,
   SKILL_MIGRATION_PLAN,
+  // Canonical shipped-skill publication manifest and per-file refresh helpers
+  // (issue 378): the direct sidebar launcher (scripts/pi-review-sessions.cjs)
+  // reuses these so skill coverage derives from exactly this manifest rather
+  // than a parallel inventory.
+  SKILL_PUBLISH_PLAN,
+  publishSkillFile,
+  refreshSkillFile,
   SKILL_PUBLISH_RETRY_ATTEMPTS,
   SKILL_PUBLISH_RETRY_DELAY_MS,
   buildExtension,

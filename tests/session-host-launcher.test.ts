@@ -68,6 +68,7 @@ interface LauncherOverrides {
   processEnv?: NodeJS.ProcessEnv;
   build?: (options: { packageRoot: string; agentDir: string; env: NodeJS.ProcessEnv }) => BuildResult | Promise<BuildResult>;
   ensureDdgs?: (homeDir: string, env: NodeJS.ProcessEnv, packageRoot?: string) => { ok: boolean; python?: string; exitCode?: number; cleanupUnconfirmed?: boolean } | Promise<{ ok: boolean; python?: string; exitCode?: number; cleanupUnconfirmed?: boolean }>;
+  refreshShippedSkills?: (packageRoot: string, homeDir: string) => { ok: true } | { ok: false; error: string };
   resolvePiRuntime?: (options: { explicit?: string; env: NodeJS.ProcessEnv; agentDir: string; cwd: string; writeError: (text: string) => void }) => PiRuntimeResult | Promise<PiRuntimeResult>;
   isRegularFile?: (file: string) => boolean;
   loadMain?: (entry: string) => { runSessionHost(options: HostOptions): Promise<number> | number };
@@ -485,6 +486,9 @@ function baseOverrides(
       void homeDir;
       return { ok: true, python: "/synthetic/ddgs/bin/python" };
     },
+    // The real skill provisioning is exercised by the focused
+    // session-host-skill-provisioning tests; flow tests stay hermetic.
+    refreshShippedSkills: () => ({ ok: true }),
     loadMain: (entry) => {
       events.push("load");
       assert.equal(entry, join(packageRoot, "dist", "src", "session-host", "main.js"));
@@ -943,6 +947,7 @@ test("production source-build runs in an owned staging root and preserves the li
     }),
     resolvePiRuntime: (options) => { events.push("pi"); return { file: "/synthetic/pi", version: "1.0.4", source: "npm-global" }; },
     ensureDdgs: (root) => { events.push("ddgs"); void root; return { ok: true, python: "/synthetic/python" }; },
+    refreshShippedSkills: () => ({ ok: true }),
     loadMain: (entry) => {
       events.push("load");
       assert.ok(existsSync(entry));
@@ -1162,6 +1167,7 @@ test("synthetic stage cleanup retains source stages across setup and host outcom
           ? { ok: false, exitCode: 1, cleanupUnconfirmed: true }
           : { ok: true, python: "/synthetic/python" };
       },
+      refreshShippedSkills: () => ({ ok: true }),
       loadMain: () => {
         events.push("load");
         return {
@@ -1482,6 +1488,7 @@ test("a relative PI_CODING_AGENT_DIR anchors staging and host paths against the 
     }),
     resolvePiRuntime: () => { events.push("pi"); return { file: "/synthetic/pi", version: "1.0.4", source: "npm-global" }; },
     ensureDdgs: (root) => { events.push("ddgs"); void root; return { ok: true, python: "/synthetic/python" }; },
+    refreshShippedSkills: () => ({ ok: true }),
     loadMain: () => { events.push("load"); return { runSessionHost: (options) => { events.push("run"); captured.push(options); return 0; } }; },
     writeOut: () => undefined,
     writeError: () => undefined,

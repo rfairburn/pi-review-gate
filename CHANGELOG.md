@@ -15,6 +15,22 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.153]
+
+### Fixed
+
+- Failed initialization of a newly allocated review or reviewer-question bundle now
+  drains all started setup work before removing its positively identified temporary
+  root (#376). Caller-supplied roots, detected substitutions, symlinks, and uncertain
+  identities are preserved; private relocation and identity checks fence deletion.
+  Cleanup failures/refusals are reported without masking the initialization error.
+  Ownership assumes no hostile external same-user mutation during allocation/identity
+  capture or private cleanup: public Node APIs cannot atomically bind creation to a
+  directory handle or provide fd-relative recursive deletion. That extreme edge case
+  remains outside the guarantee, as detailed in the review workflow documentation.
+  Successful creation, retention, recovery/checkpoint evidence, and cache behavior
+  are unchanged; no historical temporary-directory sweeping is added.
+
 ## [0.1.0-dev.152]
 
 ### Fixed

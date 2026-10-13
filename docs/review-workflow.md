@@ -12,6 +12,31 @@ diff, tool calls and results, assistant summary, usage, and before/after artifac
 The bundle also maintains the cumulative baseline-to-current patch and numbered
 reviewer invocations.
 
+If initialization of a newly allocated temporary bundle fails, all started setup
+operations (including nested artifact writes) settle before cleanup. The ownership
+contract assumes no hostile external same-user (same-UID) process mutates directories
+during allocation/identity capture of either the bundle root or the private cleanup
+directory, or during private cleanup. Within that boundary, cleanup removes only that
+invocation's positively identified root; caller-supplied bundle directories are never
+included. Detected substitutions, symlinks, and failed or unverifiable identity capture
+preserve remaining resources and refuse recursive deletion. Deletion uses a private
+relocation and rechecks the moved directory identity, rather than recursively removing
+the original temporary pathname after a check. Cleanup failures or refusals emit an
+explicit unconfirmed-cleanup diagnostic (including the attempted relocation target when
+applicable) without replacing the original initialization error. If the filesystem
+cannot supply a pinned directory identity, cleanup refuses deletion.
+
+Synchronous allocation/capture and final identity-check/deletion calls prevent
+in-process interleaving, not races with external processes. Public Node APIs provide
+neither an atomic creation-bound directory handle nor fd-relative recursive deletion.
+A hostile same-user process could substitute a directory between `mkdtempSync` and the
+first `lstatSync`, causing the replacement to be captured as owned and later recursively
+deleted, or mutate the private cleanup directory between verification and deletion.
+These races are outside the
+ownership guarantee; the identity fences do not make those cases safe. Successful
+bundle creation, configured retention of completed bundles, recovery records,
+checkpoints, and cache behavior are unchanged; no old temporary directories are swept.
+
 On Pi 1.2 and newer, idle custom-message runs also arm a review baseline through
 Pi's `before_agent_start` event, including runs started by other extensions.
 Custom runs receive no user-turn prompt-guidance injection. This extension's

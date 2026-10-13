@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { rm } from "node:fs/promises";
+import { allocateBundleRoot, BundleInitialization, cleanupFailedBundleRoot, releaseBundleRoot } from "./bundle-initialization";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ChangedFile, SnapshotOmission } from "./capture";
@@ -65,11 +66,25 @@ type CreateBundleInput =
   | ({ kind: "question" } & ReviewerQuestionBundleInput);
 
 async function createBundle(input: CreateBundleInput): Promise<ReviewBundle> {
+  // Caller-provided roots are never acquired by this invocation or eligible for failure cleanup.
+  const owned = input.dir === undefined ? allocateBundleRoot(join(tmpdir(), "pi-review-gate-")) : undefined;
+  const work = new BundleInitialization();
+  try {
+    return await initializeBundle(input, input.dir ?? owned!.path, work);
+  } catch (error) {
+    await work.drain();
+    if (owned) cleanupFailedBundleRoot(owned);
+    throw error;
+  } finally {
+    if (owned) releaseBundleRoot(owned);
+  }
+}
+
+async function initializeBundle(input: CreateBundleInput, dir: string, work: BundleInitialization): Promise<ReviewBundle> {
   const question = input.kind === "question";
-  const dir = input.dir ?? await mkdtemp(join(tmpdir(), "pi-review-gate-"));
   const reviewSequence = input.reviewSequence ?? 1;
   const invocationDir = join(dir, question ? "questions" : "reviews", sequencePath(reviewSequence));
-  await mkdir(invocationDir, { recursive: true });
+  await work.mkdir(invocationDir, { recursive: true });
   const workspaceRoot = input.workspaceRoot ?? input.cwd;
   const pathRoots: EvidencePathRoots | undefined = input.workspaceRoot
     ? { selectedCwd: input.cwd, workspaceRoot: input.workspaceRoot }
@@ -100,11 +115,11 @@ async function createBundle(input: CreateBundleInput): Promise<ReviewBundle> {
   });
 
   const writes: Array<Promise<void>> = [
-    writeFile(join(invocationDir, "request.md"), input.request, "utf8"),
-    writeFile(join(invocationDir, "changed-files.json"), JSON.stringify(changedFiles, null, 2), "utf8"),
-    writeFile(join(invocationDir, "patch.diff"), input.patch, "utf8"),
-    writeFile(join(invocationDir, "side-effect.patch.diff"), input.sideEffectPatch ?? "", "utf8"),
-    writeFile(join(invocationDir, "metadata.json"), JSON.stringify({
+    work.writeFile(join(invocationDir, "request.md"), input.request, "utf8"),
+    work.writeFile(join(invocationDir, "changed-files.json"), JSON.stringify(changedFiles, null, 2), "utf8"),
+    work.writeFile(join(invocationDir, "patch.diff"), input.patch, "utf8"),
+    work.writeFile(join(invocationDir, "side-effect.patch.diff"), input.sideEffectPatch ?? "", "utf8"),
+    work.writeFile(join(invocationDir, "metadata.json"), JSON.stringify({
       cwd: input.cwd,
       ...(workspaceRoot !== input.cwd ? { workspaceRoot } : {}),
       createdAt: new Date().toISOString(),
@@ -112,19 +127,19 @@ async function createBundle(input: CreateBundleInput): Promise<ReviewBundle> {
       ...(input.changeIdentity ? { changeIdentity: input.changeIdentity } : {}),
       ...input.metadata,
     }, null, 2), "utf8"),
-    writeFile(join(invocationDir, "reviewer-context.md"), prompt, "utf8"),
-    writeFile(join(invocationDir, "reviewer-instructions.md"), buildReviewerInstructions(input.guidanceEscalation), "utf8"),
-    writeFile(join(invocationDir, "evidence.json"), JSON.stringify(input.evidence ?? null, null, 2), "utf8"),
-    writeFile(join(invocationDir, "evidence.md"), input.evidence?.markdown ?? "", "utf8"),
-    writeReviewArtifacts(invocationDir, input.submittedChanges, input.sideEffectChanges ?? [], input.evidence),
-    writeCurrentReviewFiles(dir, input.request, changedFiles, input.patch, input.sideEffectPatch ?? "", prompt, input.evidence, input.changeIdentity),
-    writeExchangeArtifacts(dir, input.dir ? (input.exchanges ?? []).slice(-1) : input.exchanges ?? [], pathRoots),
-    writeReviewIndex(dir, workspaceRoot, input.cwd, reviewSequence, input.exchanges ?? [], question),
+    work.writeFile(join(invocationDir, "reviewer-context.md"), prompt, "utf8"),
+    work.writeFile(join(invocationDir, "reviewer-instructions.md"), buildReviewerInstructions(input.guidanceEscalation), "utf8"),
+    work.writeFile(join(invocationDir, "evidence.json"), JSON.stringify(input.evidence ?? null, null, 2), "utf8"),
+    work.writeFile(join(invocationDir, "evidence.md"), input.evidence?.markdown ?? "", "utf8"),
+    work.run(() => writeReviewArtifacts(invocationDir, input.submittedChanges, input.sideEffectChanges ?? [], input.evidence, work)),
+    work.run(() => writeCurrentReviewFiles(dir, input.request, changedFiles, input.patch, input.sideEffectPatch ?? "", prompt, input.evidence, input.changeIdentity, work)),
+    work.run(() => writeExchangeArtifacts(dir, input.dir ? (input.exchanges ?? []).slice(-1) : input.exchanges ?? [], pathRoots, work)),
+    work.run(() => writeReviewIndex(dir, workspaceRoot, input.cwd, reviewSequence, input.exchanges ?? [], question, work)),
   ];
   if (question) {
-    writes.push(writeFile(join(invocationDir, "question.md"), input.question, "utf8"));
+    writes.push(work.writeFile(join(invocationDir, "question.md"), input.question, "utf8"));
   } else {
-    writes.push(writeFile(join(invocationDir, "acting-model-usage.json"), JSON.stringify(input.actingUsage ?? null, null, 2), "utf8"));
+    writes.push(work.writeFile(join(invocationDir, "acting-model-usage.json"), JSON.stringify(input.actingUsage ?? null, null, 2), "utf8"));
   }
   await Promise.all(writes);
 
@@ -176,28 +191,30 @@ async function writeCurrentReviewFiles(
   prompt: string,
   evidence: EvidenceBundle | undefined,
   changeIdentity: ChangeIdentity | undefined,
+  work = new BundleInitialization(),
 ): Promise<void> {
   const currentDir = join(dir, "current");
-  await mkdir(currentDir, { recursive: true });
+  await work.mkdir(currentDir, { recursive: true });
   const writes: Array<Promise<void>> = [
-    writeFile(join(dir, "request.md"), request, "utf8"),
-    writeFile(join(currentDir, "changed-files.json"), JSON.stringify(changedFiles, null, 2), "utf8"),
-    writeFile(join(currentDir, "cumulative.patch"), patch, "utf8"),
-    writeFile(join(currentDir, "side-effect.patch"), sideEffectPatch, "utf8"),
-    writeFile(join(currentDir, "reviewer-context.md"), prompt, "utf8"),
-    writeFile(join(currentDir, "evidence.json"), JSON.stringify(evidence ?? null, null, 2), "utf8"),
-    writeFile(join(currentDir, "evidence.md"), evidence?.markdown ?? "", "utf8"),
+    work.writeFile(join(dir, "request.md"), request, "utf8"),
+    work.writeFile(join(currentDir, "changed-files.json"), JSON.stringify(changedFiles, null, 2), "utf8"),
+    work.writeFile(join(currentDir, "cumulative.patch"), patch, "utf8"),
+    work.writeFile(join(currentDir, "side-effect.patch"), sideEffectPatch, "utf8"),
+    work.writeFile(join(currentDir, "reviewer-context.md"), prompt, "utf8"),
+    work.writeFile(join(currentDir, "evidence.json"), JSON.stringify(evidence ?? null, null, 2), "utf8"),
+    work.writeFile(join(currentDir, "evidence.md"), evidence?.markdown ?? "", "utf8"),
   ];
   if (changeIdentity) {
-    writes.push(writeFile(join(currentDir, "change-identity.json"), JSON.stringify(changeIdentity, null, 2), "utf8"));
+    writes.push(work.writeFile(join(currentDir, "change-identity.json"), JSON.stringify(changeIdentity, null, 2), "utf8"));
   } else {
-    writes.push(rm(join(currentDir, "change-identity.json"), { force: true }));
+    writes.push(work.rm(join(currentDir, "change-identity.json"), { force: true }));
   }
   await Promise.all(writes);
 }
 
 async function writeExchangeArtifacts(
   dir: string, exchanges: ReviewExchangeContext[], pathRoots?: EvidencePathRoots,
+  work = new BundleInitialization(),
 ): Promise<void> {
   for (const exchange of exchanges) {
     const evidenceEvents = normalizeEvidenceEventPaths(exchange.evidenceEvents, pathRoots);
@@ -205,12 +222,12 @@ async function writeExchangeArtifacts(
     const exchangeDir = join(dir, "exchanges", sequencePath(exchange.sequence));
     const metadataPath = join(exchangeDir, "metadata.json");
     const completionPath = join(exchangeDir, ".complete");
-    if (await access(completionPath).then(() => true, () => false)) {
+    if (await work.access(completionPath).then(() => true, () => false)) {
       continue;
     }
-    await mkdir(exchangeDir, { recursive: true });
+    await work.mkdir(exchangeDir, { recursive: true });
     await Promise.all([
-      writeFile(metadataPath, JSON.stringify({
+      work.writeFile(metadataPath, JSON.stringify({
         sequence: exchange.sequence,
         startedAt: exchange.startedAt,
         endedAt: exchange.endedAt,
@@ -218,16 +235,16 @@ async function writeExchangeArtifacts(
         causedByReviewVerdict: exchange.causedByReviewVerdict,
         reviewResponseMode: exchange.reviewResponseMode,
       }, null, 2), "utf8"),
-      writeFile(join(exchangeDir, "submitted.patch"), exchange.workspacePatch || "(no submitted workspace changes)", "utf8"),
-      writeFile(join(exchangeDir, "side-effects.patch"), exchange.sideEffectPatch || "(no captured side-effect changes)", "utf8"),
-      writeFile(join(exchangeDir, "tool-events.json"), JSON.stringify(evidenceEvents, null, 2), "utf8"),
-      writeFile(join(exchangeDir, "tool-events.md"), renderExchangeEvents(artifactExchange), "utf8"),
-      writeFile(join(exchangeDir, "assistant-summary.md"), exchange.assistantSummaries.join("\n\n---\n\n"), "utf8"),
-      writeFile(join(exchangeDir, "user-guidance.md"), exchange.userRequests.map((request) => request.text).join("\n\n---\n\n"), "utf8"),
-      writeFile(join(exchangeDir, "acting-model-usage.json"), JSON.stringify(exchange.actingUsage ?? null, null, 2), "utf8"),
-      writeReviewArtifacts(exchangeDir, exchange.workspaceChanges, exchange.sideEffectChanges, undefined),
+      work.writeFile(join(exchangeDir, "submitted.patch"), exchange.workspacePatch || "(no submitted workspace changes)", "utf8"),
+      work.writeFile(join(exchangeDir, "side-effects.patch"), exchange.sideEffectPatch || "(no captured side-effect changes)", "utf8"),
+      work.writeFile(join(exchangeDir, "tool-events.json"), JSON.stringify(evidenceEvents, null, 2), "utf8"),
+      work.writeFile(join(exchangeDir, "tool-events.md"), renderExchangeEvents(artifactExchange), "utf8"),
+      work.writeFile(join(exchangeDir, "assistant-summary.md"), exchange.assistantSummaries.join("\n\n---\n\n"), "utf8"),
+      work.writeFile(join(exchangeDir, "user-guidance.md"), exchange.userRequests.map((request) => request.text).join("\n\n---\n\n"), "utf8"),
+      work.writeFile(join(exchangeDir, "acting-model-usage.json"), JSON.stringify(exchange.actingUsage ?? null, null, 2), "utf8"),
+      work.run(() => writeReviewArtifacts(exchangeDir, exchange.workspaceChanges, exchange.sideEffectChanges, undefined, work)),
     ]);
-    await writeFile(completionPath, "", "utf8");
+    await work.writeFile(completionPath, "", "utf8");
   }
 }
 
@@ -238,6 +255,7 @@ async function writeReviewIndex(
   reviewSequence: number,
   exchanges: ReviewExchangeContext[],
   question: boolean,
+  work = new BundleInitialization(),
 ): Promise<void> {
   const latestExchange = exchanges.at(-1)?.sequence;
   const manifest = {
@@ -293,8 +311,8 @@ async function writeReviewIndex(
     "",
   ];
   await Promise.all([
-    writeFile(join(dir, "manifest.json"), JSON.stringify(manifest, null, 2), "utf8"),
-    writeFile(join(dir, "REVIEW.md"), lines.join("\n"), "utf8"),
+    work.writeFile(join(dir, "manifest.json"), JSON.stringify(manifest, null, 2), "utf8"),
+    work.writeFile(join(dir, "REVIEW.md"), lines.join("\n"), "utf8"),
   ]);
 }
 
@@ -332,15 +350,16 @@ async function writeReviewArtifacts(
   submittedChanges: ChangedFile[],
   sideEffectChanges: ChangedFile[],
   evidence: EvidenceBundle | undefined,
+  work = new BundleInitialization(),
 ): Promise<void> {
   const writes: Array<Promise<void>> = [];
   const artifactIndex: Array<{ kind: string; path: string; artifactPath: string; omitted?: string }> = [];
 
   for (const change of submittedChanges) {
-    writes.push(...writeChangeContent(dir, "submitted", change, artifactIndex));
+    writes.push(...writeChangeContent(dir, "submitted", change, artifactIndex, work));
   }
   for (const change of sideEffectChanges) {
-    writes.push(...writeChangeContent(dir, "side-effect", change, artifactIndex));
+    writes.push(...writeChangeContent(dir, "side-effect", change, artifactIndex, work));
   }
   for (const candidate of evidence?.candidates ?? []) {
     const snapshot = candidate.baselineSnapshot;
@@ -354,11 +373,11 @@ async function writeReviewArtifacts(
       continue;
     }
     const artifactPath = join("artifacts", "evidence-baseline", safeArtifactPath(candidate.path));
-    writes.push(writeArtifact(dir, artifactPath, snapshot.content));
+    writes.push(work.run(() => writeArtifact(dir, artifactPath, snapshot.content!, work)));
     artifactIndex.push({ kind: "evidence-baseline", path: candidate.path, artifactPath });
   }
 
-  writes.push(writeArtifact(dir, join("artifacts", "index.json"), JSON.stringify(artifactIndex, null, 2)));
+  writes.push(work.run(() => writeArtifact(dir, join("artifacts", "index.json"), JSON.stringify(artifactIndex, null, 2), work)));
   await Promise.all(writes);
 }
 
@@ -367,6 +386,7 @@ function writeChangeContent(
   kind: "submitted" | "side-effect",
   change: ChangedFile,
   artifactIndex: Array<{ kind: string; path: string; artifactPath: string; omitted?: string }>,
+  work: BundleInitialization,
 ): Array<Promise<void>> {
   const writes: Array<Promise<void>> = [];
   for (const side of ["before", "after"] as const) {
@@ -381,16 +401,16 @@ function writeChangeContent(
       continue;
     }
     const artifactPath = join("artifacts", kind, side, safeArtifactPath(change.path));
-    writes.push(writeArtifact(dir, artifactPath, content));
+    writes.push(work.run(() => writeArtifact(dir, artifactPath, content, work)));
     artifactIndex.push({ kind: `${kind}-${side}`, path: change.path, artifactPath });
   }
   return writes;
 }
 
-async function writeArtifact(dir: string, relativePath: string, content: string): Promise<void> {
+async function writeArtifact(dir: string, relativePath: string, content: string, work: BundleInitialization): Promise<void> {
   const path = join(dir, relativePath);
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, content, "utf8");
+  await work.mkdir(dirname(path), { recursive: true });
+  await work.writeFile(path, content, "utf8");
 }
 
 function safeArtifactPath(path: string): string {

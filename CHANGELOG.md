@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.150]
+
+### Fixed
+
+- Failed initialization of a newly allocated review or reviewer-question bundle now
+  drains all started setup work before removing its proven-owned temporary root
+  (#376). Caller-supplied, replaced, symlinked, and uncertain roots are preserved;
+  private relocation and identity checks fence deletion of the original pathname.
+  Cleanup failures/refusals are reported without masking the initialization error.
+  Successful creation, configured retention, and recovery/checkpoint evidence are
+  unchanged; no historical temporary-directory sweeping is added.
+
 ## [0.1.0-dev.149]
 
 ### Changed

@@ -12,6 +12,20 @@ diff, tool calls and results, assistant summary, usage, and before/after artifac
 The bundle also maintains the cumulative baseline-to-current patch and numbered
 reviewer invocations.
 
+If initialization of a newly allocated temporary bundle fails, all started setup
+operations (including nested artifact writes) settle before cleanup. Cleanup removes
+only that invocation's positively identified root; caller-supplied bundle directories
+are never included. Replaced, symlinked, or unverifiable roots are preserved. Deletion
+uses a private relocation and rechecks the moved directory identity, rather than
+recursively removing the original temporary pathname after a check. Cleanup failures
+or refusals emit an explicit unconfirmed-cleanup diagnostic (including the attempted
+relocation target when applicable) without replacing the original initialization error. If the
+filesystem cannot supply a pinned directory identity, cleanup refuses deletion.
+These public-Node identity fences do not protect against a hostile same-user actor
+mutating the private cleanup directory itself. Successful bundle creation and
+configured retention of completed bundles, recovery records, and checkpoints are
+unchanged; no old temporary directories are swept.
+
 On Pi 1.2 and newer, idle custom-message runs also arm a review baseline through
 Pi's `before_agent_start` event, including runs started by other extensions.
 Custom runs receive no user-turn prompt-guidance injection. This extension's

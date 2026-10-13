@@ -1,4 +1,5 @@
 import { isEscapeTerminalInput, onTerminalInput, sendNotice } from "../pi";
+import { routeForegroundEscape } from "../foreground-escape";
 import { type ActiveReviewCancellation, type ReviewCancelReason, type ReviewCancellationCoordinator } from "../review-cancellation";
 import { type ReviewGateState } from "../state";
 
@@ -65,9 +66,10 @@ export function createReviewAbortController(input: {
   input.signal?.addEventListener("abort", abortFromParent, { once: true });
 
   const unsubscribeTerminalInput = onTerminalInput(input.noticeTarget, (terminalInput) => {
-    if (!input.state.reviewInProgress || !isEscapeTerminalInput(terminalInput)) {
+    if (!input.isSessionActive() || !input.state.reviewInProgress || !isEscapeTerminalInput(terminalInput)) {
       return undefined;
     }
+    if (routeForegroundEscape(input.noticeTarget, terminalInput)) return { consume: true };
     abortReview("escape");
     // Immediate acknowledgement only; the completion notice claims reviewer
     // quiescence only after runReview has returned and cleanup ran.

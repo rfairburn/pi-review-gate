@@ -522,6 +522,19 @@ POSIX safe-number root identity and worktree mode handling are unchanged. Landin
 stages temporary files beside their destination on the same volume; recovery
 validates those native paths before acting.
 
+For a non-Git workspace, source inventory uses
+`git ls-files --others --exclude-standard -z` with a temporary Git directory and the
+selected workspace as its worktree. The command retains a 64 MiB output-buffer limit
+and a 15-second timeout, separate from the file-content snapshot budget. An output
+buffer overflow fails capture before worker startup; its diagnostic identifies the
+command, selected workspace (with control characters visibly escaped), limit, and
+original overflow code. It identifies stdout or stderr only when the original failure
+names that stream, without including inventory output, file contents, or the original
+stack. Choose a narrower workspace—the intended project directory—and retry. Capture
+does not truncate a successful inventory, skip eligible files, or increase these limits;
+the temporary inventory repository is cleaned up on success and failure. Other command
+failures and cancellation retain their existing handling.
+
 During task capture, `maxSnapshotBytes` limits only the cumulative size of non-ignored
 untracked files (50 MiB by default). This private task capture, candidate review, and
 landing path remains separate from the parent review checkpoint. Parent review uses a

@@ -146,6 +146,8 @@ export interface OwnedActivitySourceHandle {
   markIntentUncertain(): void;
   /** Authoritative activity-intent re-establishment for THIS incarnation only. */
   resolveIntentUncertainty(): void;
+  /** Observe a source readiness/lifecycle change; invalidate pending intent reads. */
+  requestIntentRefresh(): void;
   /** Supersede this incarnation explicitly (tokens stay owned). */
   retire(): void;
 }
@@ -191,6 +193,32 @@ export type RetiredOwnedActivityReconciler = (
   retained: RetiredOwnedActivityTokens,
 ) => Promise<RetiredOwnedActivityReconciliation>;
 
+/**
+ * Complete, verified exact current activity intent tokens from one owning
+ * source's own authoritative state, or incomplete when the source cannot yet
+ * prove its full inventory. A complete result replaces the registry's stored
+ * tokens for that exact incarnation and clears its intent uncertainty; an
+ * incomplete result (or a throw) leaves the count unknown — never zero.
+ */
+export type OwnedActivityIntentRefresh =
+  | {
+      readonly status: "complete";
+      readonly intentTokens: ReadonlySet<string>;
+      /**
+       * Owning-source freshness predicate, evaluated again immediately before
+       * application: source-local changes (controller generation, session cwd,
+       * readiness) after the read make the result stale even when no registry
+       * mutation happened. A throwing or false fence rejects the result.
+       */
+      readonly isCurrent?: () => boolean;
+    }
+  | {
+      readonly status: "incomplete";
+    };
+
+/** Authoritative activity refresher for one source incarnation. */
+export type OwnedActivityIntentRefresher = () => Promise<OwnedActivityIntentRefresh> | OwnedActivityIntentRefresh;
+
 /** Registration options for one source incarnation. */
 export interface OwnedActivitySourceOptions {
   /**
@@ -212,6 +240,13 @@ export interface OwnedActivitySourceOptions {
   resync?: () => void;
   /** Optional read-only census for this exact source after it is retired. */
   reconcileRetired?: RetiredOwnedActivityReconciler;
+  /**
+   * Optional authoritative activity refresher for this exact incarnation. The
+   * registry's coalesced intent-refresh pass invokes it while the current
+   * incarnation is intent-uncertain and applies a complete result through the
+   * same fencing as ordinary mutations.
+   */
+  refreshActivity?: OwnedActivityIntentRefresher;
 }
 
 /** Process-local registry state, stored on this symbol and shared across reloads. */
@@ -250,6 +285,8 @@ interface SourceIncarnation {
   intentUncertain?: boolean;
   /** Optional reload-durable census closure retained with this source. */
   reconcileRetired?: RetiredOwnedActivityReconciler;
+  /** Authoritative activity refresher retained with this source incarnation. */
+  refreshActivity?: OwnedActivityIntentRefresher;
   /** Legacy field retained for reload compatibility; it does not gate retries. */
   reconciliationAttempted?: boolean;
   /** True only while this exact incarnation's retired census is in flight. */
@@ -314,6 +351,7 @@ function isRegistryState(value: unknown): value is RegistryState {
               || !Number.isSafeInteger(entry.intentTokens.size) || entry.intentTokens.size < 0)) return false;
           if (entry.intentUncertain !== undefined && typeof entry.intentUncertain !== "boolean") return false;
           if (entry.reconcileRetired !== undefined && typeof entry.reconcileRetired !== "function") return false;
+          if (entry.refreshActivity !== undefined && typeof entry.refreshActivity !== "function") return false;
           if (entry.reconciliationAttempted !== undefined && typeof entry.reconciliationAttempted !== "boolean") return false;
           if (entry.reconciliationInFlight !== undefined && typeof entry.reconciliationInFlight !== "boolean") return false;
           if (entry.revision !== undefined && (typeof entry.revision !== "number"
@@ -369,6 +407,209 @@ function notify(state: RegistryState): void {
   }
 }
 
+/** Bumped whenever an intent-uncertain cause is added; fences stale reschedules. */
+let intentUncertainSeq = 0;
+let intentRefreshScheduled = false;
+let intentRefreshInFlight: Promise<boolean> | undefined;
+let intentRefreshPassesRun = 0;
+
+/**
+ * True when ANY incarnation (current or retired) is intent-uncertain with an
+ * authoritative refresher. A retired incarnation's retained inventory is only
+ * provable by its own source state — a newer source's emptiness is not proof
+ * about the older work — so retired uncertainty stays refreshable too.
+ */
+function hasRefreshableIntentUncertainty(state: RegistryState): boolean {
+  for (const bySource of state.sources.values()) {
+    for (const list of bySource.values()) {
+      for (const entry of list) {
+        if (entry.intentUncertain === true && entry.refreshActivity !== undefined
+          && entry.intentTokens !== undefined) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Mark one incarnation's activity-intent channel uncertain, bumping the
+ * uncertainty sequence so an in-flight refresh pass schedules exactly one
+ * follow-up for a cause that appeared while it ran.
+ */
+function markEntryIntentUncertain(entry: SourceIncarnation): boolean {
+  if (entry.intentUncertain === true) return false;
+  entry.intentUncertain = true;
+  intentUncertainSeq += 1;
+  return true;
+}
+
+/**
+ * Bump the uncertainty sequence when a refreshable uncertain incarnation is
+ * mutated in a way that can invalidate an in-flight pass's fence: any
+ * same-incarnation mutation, retirement, or (re)registration. This is what
+ * turns "a result was rejected by its fence" into exactly one follow-up pass.
+ * Incomplete results alone never bump: they get no retry.
+ */
+function noteRefreshableUncertainty(entry: SourceIncarnation): void {
+  if (entry.intentUncertain === true && entry.refreshActivity !== undefined) intentUncertainSeq += 1;
+}
+
+/**
+ * Schedule ONE coalesced authoritative activity-intent refresh pass. No timer
+ * and no retry loop: a pass that finds only incomplete sources leaves the
+ * counts unknown until a later genuine lifecycle event (registration, restore,
+ * settlement, or an explicit session_start) schedules another one.
+ */
+function scheduleOwnedActivityIntentRefresh(): void {
+  const state = registryState(false);
+  if (!state?.active || intentRefreshScheduled || intentRefreshInFlight !== undefined) return;
+  if (!hasRefreshableIntentUncertainty(state)) return;
+  intentRefreshScheduled = true;
+  setImmediate(() => {
+    intentRefreshScheduled = false;
+    // Re-check at fire time: an explicit pass or a concurrent settlement may
+    // have recovered every candidate since the schedule, and a stray pass
+    // would only burn a redundant read.
+    const state = registryState(false);
+    if (!state?.active || !hasRefreshableIntentUncertainty(state)) return;
+    void runOwnedActivityIntentRefreshPass();
+  });
+}
+
+/**
+ * One bounded, coalesced pass over every source incarnation (current or
+ * retired) that is intent-uncertain and carries an authoritative refresher.
+ * Each refresher must return its complete exact activity-intent token set or
+ * incomplete; a complete result is applied only while the registry state,
+ * incarnation identity, and same-incarnation revision fences all still hold —
+ * revalidated immediately before each application — replacing obsolete tokens
+ * and clearing the uncertainty. Incomplete results, throws, and stale reads
+ * leave the count unknown — never zero. A new uncertainty cause that appears
+ * while the pass is in flight gets exactly one follow-up pass; incomplete
+ * refreshers never reschedule themselves.
+ */
+async function runOwnedActivityIntentRefreshPass(): Promise<void> {
+  // Coalesce callers onto an already-running pass: an awaited refresh (the
+  // reporter's session_start hook) must not return while its authoritative
+  // refresh is still pending. Bounded so a pathological chain cannot wedge a
+  // caller. A caller that coalesced onto a running pass returns once it
+  // settles — that pass (plus any follow-up it schedules) already covers the
+  // current state, so starting another one here would only burn redundant reads.
+  let awaited = 0;
+  while (intentRefreshInFlight !== undefined && awaited < 8) {
+    await intentRefreshInFlight;
+    awaited += 1;
+  }
+  if (awaited > 0 || intentRefreshInFlight !== undefined) return;
+  const state = registryState(false);
+  if (!state?.active) return;
+  // Snapshot candidates BEFORE any async work: reentrant registration during
+  // the pass cannot duplicate or extend this exact candidate set. Retired
+  // incarnations with a refresher are candidates too: their retained inventory
+  // is only provable by their own source state, never by a newer source.
+  const candidates: Array<{
+    category: OwnedActivityCategory;
+    source: string;
+    entry: SourceIncarnation;
+    revision: number;
+  }> = [];
+  for (const [category, bySource] of state.sources) {
+    for (const [source, list] of bySource) {
+      for (const entry of list) {
+        if (entry.intentUncertain === true && entry.refreshActivity !== undefined
+          && entry.intentTokens !== undefined) {
+          candidates.push({ category, source, entry, revision: entry.revision ?? 0 });
+        }
+      }
+    }
+  }
+  const seqAtStart = intentUncertainSeq;
+  const pass = (async () => {
+    // Yield so the in-flight guard is installed before any source callback
+    // runs: a reentrant registration during a synchronous refresher must see
+    // this pass as in flight, not start a second one.
+    await Promise.resolve();
+    const results = await Promise.all(candidates.map(async (candidate) => {
+      let result: OwnedActivityIntentRefresh;
+      try {
+        result = await candidate.entry.refreshActivity!();
+      } catch {
+        return undefined; // fail closed: the uncertainty stays
+      }
+      if (result?.status !== "complete") return undefined;
+      const reported = result.intentTokens;
+      if (!(reported instanceof Set)) return undefined;
+      const exact = new Set<string>();
+      for (const token of reported) {
+        if (!isValidToken(token)) return undefined; // malformed: incomplete, never proof
+        exact.add(token);
+      }
+      // Fence: same registry state and no same-incarnation mutation since the
+      // pass started. Retirement is NOT a fence: a retired incarnation's
+      // retained inventory is exactly what its refresher proves, and the
+      // revision fence still rejects any settlement that raced this read.
+      const liveState = registryState(false);
+      if (liveState !== state || !liveState.active) return undefined;
+      const liveEntry = findIncarnation(liveState, candidate.category, candidate.source, candidate.entry.id);
+      if (liveEntry === undefined || liveEntry.intentTokens === undefined
+        || (liveEntry.revision ?? 0) !== candidate.revision) return undefined;
+      return { entry: liveEntry, revision: candidate.revision, tokens: exact, isCurrent: result.isCurrent };
+    }));
+    let changed = false;
+    for (const outcome of results) {
+      if (outcome === undefined) continue;
+      // The owning source's own freshness predicate, evaluated at commit time:
+      // controller/session changes after its read make the result stale even
+      // when no registry mutation happened. A throwing fence is incomplete
+      // proof, never success.
+      try {
+        if (outcome.isCurrent !== undefined && !outcome.isCurrent()) continue;
+      } catch {
+        continue;
+      }
+      // Revalidate IMMEDIATELY before applying: a fast source can pass its
+      // fence, then acquire new work or be retired while another source is
+      // still pending. The captured revision must still hold at apply time.
+      const liveState = registryState(false);
+      if (liveState !== state || !liveState.active) break;
+      if ((outcome.entry.revision ?? 0) !== outcome.revision) continue;
+      const tokens = outcome.entry.intentTokens!;
+      tokens.clear();
+      for (const token of outcome.tokens) tokens.add(token);
+      outcome.entry.intentUncertain = false;
+      outcome.entry.revision = (outcome.entry.revision ?? 0) + 1;
+      changed = true;
+    }
+    intentRefreshPassesRun += 1;
+    if (changed) notify(state);
+    // A new uncertainty cause that appeared while this pass was in flight gets
+    // exactly one follow-up pass. Incomplete refreshers never reschedule.
+    return intentUncertainSeq !== seqAtStart;
+  })();
+  intentRefreshInFlight = pass;
+  let rescheduleNeeded = false;
+  try {
+    rescheduleNeeded = await pass;
+  } finally {
+    // Clear the in-flight marker BEFORE scheduling the follow-up: the
+    // scheduler refuses to queue while a pass is still marked in flight.
+    intentRefreshInFlight = undefined;
+  }
+  if (rescheduleNeeded) scheduleOwnedActivityIntentRefresh();
+}
+
+/**
+ * Run one bounded, coalesced authoritative activity-intent refresh pass now.
+ * The authenticated reporter awaits this on session_start (and safe reconnect)
+ * so a loaded/restored process recovers deliberately stale or unknown activity
+ * telemetry from each owning source's own state — without polling, manual
+ * refresh, a new prompt, or a new task. Sources without a refresher, and every
+ * incomplete result, stay unknown.
+ */
+export async function refreshOwnedActivityIntent(): Promise<void> {
+  await runOwnedActivityIntentRefreshPass();
+}
+
 function installRegistration(
   state: RegistryState,
   handle: OwnedActivitySourceHandle,
@@ -392,38 +633,54 @@ function installRegistration(
       uncertain: options?.uncertain === true,
       retired: false,
       intentTokens: new Set(),
-      intentUncertain: options?.intentUncertain === true,
+      intentUncertain: false,
       ...(options?.reconcileRetired ? { reconcileRetired: options.reconcileRetired } : {}),
+      ...(options?.refreshActivity ? { refreshActivity: options.refreshActivity } : {}),
       reconciliationInFlight: false,
       revision: 0,
     };
     list.push(entry);
+    if (options?.intentUncertain === true) markEntryIntentUncertain(entry);
   } else {
     if (options?.uncertain === true) entry.uncertain = true;
     // Never fabricate intent data for a pre-intent entry: its activity set was
     // never observed, so it stays unknown rather than becoming a known zero.
-    if (entry.intentTokens !== undefined && options?.intentUncertain === true) entry.intentUncertain = true;
+    if (entry.intentTokens !== undefined && options?.intentUncertain === true) {
+      markEntryIntentUncertain(entry);
+    }
     if (options?.reconcileRetired) entry.reconcileRetired = options.reconcileRetired;
+    if (options?.refreshActivity) {
+      entry.refreshActivity = options.refreshActivity;
+      noteRefreshableUncertainty(entry);
+    }
   }
   // A newly installed incarnation supersedes every older one, but the
   // superseded incarnation's tokens AND uncertainty stay retained until that
-  // incarnation itself resolves or releases them.
+  // incarnation itself resolves or releases them. Retiring a refreshable
+  // uncertain incarnation invalidates any in-flight result for it: note it so
+  // exactly one follow-up pass consults its own refresher.
   for (const other of list) {
     if (other !== entry) {
       other.retired = true;
       other.revision = (other.revision ?? 0) + 1;
+      noteRefreshableUncertainty(other);
     }
   }
   entry.revision = (entry.revision ?? 0) + 1;
   if (options?.resync) {
-    // A throwing resync leaves ownership unaccounted for: sticky unknown.
+    // A throwing resync leaves ownership unaccounted for: sticky unknown. The
+    // source cannot prove its own current state, so the activity-intent channel
+    // is incomplete too when it carries intent data — the authoritative refresh
+    // pass can still recover it from the source's own knowledge.
     try {
       options.resync();
     } catch {
       entry.uncertain = true;
+      if (entry.intentTokens !== undefined) markEntryIntentUncertain(entry);
     }
   }
   notify(state);
+  scheduleOwnedActivityIntentRefresh();
 }
 
 function categoryCount(state: RegistryState | undefined, category: OwnedActivityCategory): number | null {
@@ -487,11 +744,38 @@ export function activateOwnedActivity(): void {
   if (!state) return;
   const wasActive = state.active;
   state.active = true;
-  // Replay source registrations made while the registry was still inert.
-  for (const registration of pendingRegistrations.splice(0)) {
-    installRegistration(state, registration.handle, registration.options);
+  // Retain every incarnation before any resync can establish completeness:
+  // a newer same-name registration must not discard an older source's
+  // callback and inventory, and replay must not transiently publish zero
+  // from a newer empty source while older work is still active.
+  const pending = pendingRegistrations.splice(0);
+  for (const registration of pending) {
+    installRegistration(state, registration.handle, {
+      ...registration.options,
+      resync: undefined,
+    });
   }
-  if (!wasActive) notify(state);
+  for (const registration of pending) {
+    try {
+      registration.options?.resync?.();
+    } catch {
+      // A throwing resync leaves that incarnation's state unaccounted for:
+      // sticky unknown on both channels, with one follow-up pass allowed to
+      // consult its own refresher.
+      const entry = findIncarnation(state, registration.handle.category,
+        registration.handle.source, registration.handle.incarnation);
+      if (entry) {
+        entry.uncertain = true;
+        if (entry.intentTokens !== undefined) markEntryIntentUncertain(entry);
+        entry.revision = (entry.revision ?? 0) + 1;
+        noteRefreshableUncertainty(entry);
+      }
+    }
+  }
+  if (!wasActive || pending.length > 0) notify(state);
+  // A replayed pre-opt-in registration lands uncertain; let the coalesced pass
+  // recover what each source authoritatively knows right now.
+  scheduleOwnedActivityIntentRefresh();
 }
 
 /** True only once an authenticated reporter has opted in. */
@@ -513,7 +797,9 @@ function createSourceHandle(
     if (!entry) return; // not installed: no observation
     if (mutate(state, entry)) {
       entry.revision = (entry.revision ?? 0) + 1;
+      noteRefreshableUncertainty(entry);
       notify(state);
+      scheduleOwnedActivityIntentRefresh();
     }
   };
   // Activity-intent mutations are scoped like ownership mutations, but a
@@ -527,7 +813,9 @@ function createSourceHandle(
     if (!entry || entry.intentTokens === undefined) return;
     if (mutate(state, entry)) {
       entry.revision = (entry.revision ?? 0) + 1;
+      noteRefreshableUncertainty(entry);
       notify(state);
+      scheduleOwnedActivityIntentRefresh();
     }
   };
   const handle: OwnedActivitySourceHandle = {
@@ -579,11 +867,7 @@ function createSourceHandle(
       withIntentEntry((_state, entry) => entry.intentTokens!.delete(token));
     },
     markIntentUncertain(): void {
-      withIntentEntry((_state, entry) => {
-        if (entry.intentUncertain === true) return false;
-        entry.intentUncertain = true;
-        return true;
-      });
+      withIntentEntry((_state, entry) => markEntryIntentUncertain(entry));
     },
     resolveIntentUncertainty(): void {
       withIntentEntry((_state, entry) => {
@@ -591,6 +875,14 @@ function createSourceHandle(
         entry.intentUncertain = false;
         return true;
       });
+    },
+    requestIntentRefresh(): void {
+      // A genuine readiness/lifecycle observation invalidates any pending
+      // intent read for this incarnation (revision bump) and lets the
+      // coalesced scheduler retry diverged registry telemetry — even when the
+      // source's own uncertainty boolean is false. Incomplete refresh results
+      // never call this: they get no retry.
+      withEntry(() => true);
     },
     retire(): void {
       withEntry((_state, entry) => {
@@ -624,16 +916,17 @@ export function registerOwnedActivitySource(
     // registration alone cannot establish that the owned set is empty (a review
     // may already be running, or a shell may already have been reaped out of its
     // map). Fail closed as uncertain until the source authoritatively resolves.
-    const existing = pendingRegistrations.findIndex((entry) =>
-      entry.handle.category === category && entry.handle.source === source);
+    // Every pre-opt-in incarnation is retained: a newer same-name
+    // registration must not discard an older source's callback and inventory.
+    // Newer emptiness is never proof that older work is absent, so all of
+    // them replay at activation (older ones retired but retained).
     const registration: PendingRegistration = {
       handle,
       // Neither channel's pre-opt-in acquisitions were observed: both replay
       // as uncertain until the source authoritatively resolves them.
       options: { ...options, uncertain: true, intentUncertain: true },
     };
-    if (existing >= 0) pendingRegistrations[existing] = registration;
-    else pendingRegistrations.push(registration);
+    pendingRegistrations.push(registration);
     return handle;
   }
   installRegistration(state, handle, options);
@@ -852,6 +1145,47 @@ export const __test = Object.freeze({
   resetOwnedActivityForTests(): void {
     delete (globalThis as Record<PropertyKey, unknown>)[OWNED_ACTIVITY_STATE_KEY];
     pendingRegistrations.length = 0;
+    intentRefreshScheduled = false;
+    intentRefreshInFlight = undefined;
+    intentRefreshPassesRun = 0;
+    intentUncertainSeq = 0;
+  },
+  /** Test seam: number of completed intent-refresh passes in this module copy. */
+  ownedActivityIntentRefreshPassCount(): number {
+    return intentRefreshPassesRun;
+  },
+  /**
+   * Test seam: await any in-flight or scheduled intent-refresh pass (bounded,
+   * so a test cannot hang on a foreign scheduling loop).
+   */
+  async settleOwnedActivityIntentRefreshForTests(): Promise<void> {
+    for (let i = 0; i < 16; i++) {
+      if (intentRefreshInFlight !== undefined) { await intentRefreshInFlight; continue; }
+      if (intentRefreshScheduled) { await new Promise((resolve) => setImmediate(resolve)); continue; }
+      return;
+    }
+  },
+  /**
+   * Test seam: deliberately mark the current incarnation of one expected
+   * source intent-uncertain through the same mutation path as a real handle,
+   * simulating registry telemetry that diverged from the source's own state.
+   */
+  markCurrentSourceIntentUncertainForTests(category: string, source: string): boolean {
+    const state = registryState(false);
+    if (!state?.active || !isCategory(category) || !isExpectedSource(category, source)) return false;
+    let changed = false;
+    for (const entry of state.sources.get(category)?.get(source) ?? []) {
+      if (entry.retired || entry.intentTokens === undefined) continue;
+      if (markEntryIntentUncertain(entry)) {
+        entry.revision = (entry.revision ?? 0) + 1;
+        changed = true;
+      }
+    }
+    if (changed) {
+      notify(state);
+      scheduleOwnedActivityIntentRefresh();
+    }
+    return changed;
   },
   EXPECTED_SOURCES,
   MAX_OWNED_TOKEN_LENGTH,

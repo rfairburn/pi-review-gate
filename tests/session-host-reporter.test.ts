@@ -25,10 +25,17 @@ import {
 } from "../src/session-host/startup-request";
 import {
   OWNED_ACTIVITY_STATE_KEY,
+  activeActivitySnapshot,
   ownedActivitySnapshot,
   registerOwnedActivitySource,
   __test as ownedActivityTest,
 } from "../src/session-host/owned-activity";
+import {
+  beginOwnedReviewActivity,
+  endOwnedReviewActivity,
+  registerReviewActivitySource,
+  __test as reviewActivityTest,
+} from "../src/activation/review-activity";
 import {
   HOST_BOOTSTRAP_ENV,
   MAX_STATUS_FRAME_BYTES,
@@ -742,6 +749,136 @@ describe("session-host reporter activation", () => {
     const retired = registry.sources.get("backgroundTasks")!.get("execution")!.find((entry) => entry.retired)!;
     assert.equal(retired.uncertain, false, "the later census resolves the exact retired owner's ownership uncertainty");
     assert.equal(retired.intentUncertain, false, "the later census independently resolves its activity uncertainty");
+  });
+
+  it("recovers stale loaded activity telemetry at session_start before ordinary restoration", async () => {
+    const server = await startTestServer();
+    try {
+      await runSessionStartRecoveryScenario(server);
+    } finally {
+      reviewActivityTest.resetReviewActivityForTests();
+    }
+  });
+
+  async function runSessionStartRecoveryScenario(server: Awaited<ReturnType<typeof startTestServer>>): Promise<void> {
+    // The loaded execution source's registry telemetry is intent-uncertain. Its
+    // own refresher cannot prove the state until its readiness completes —
+    // modelled by `sourceReady`, which flips only for the session_start pass.
+    // The activation pass sees incomplete; the session_start pass (which the
+    // reporter awaits before ordinary restoration proceeds) sees the exact zero.
+    let sourceReady = false;
+    const executionOptions = {
+      intentUncertain: true,
+      refreshActivity: () => sourceReady
+        ? { status: "complete", intentTokens: new Set<string>() }
+        : { status: "incomplete" },
+    } as unknown as Parameters<typeof registerOwnedActivitySource>[2];
+    registerOwnedActivitySource("backgroundTasks", "execution", executionOptions);
+    registerReviewActivitySource();
+    process.env[HOST_BOOTSTRAP_ENV] = JSON.stringify(makeBootstrap(server.socketPath));
+    const first = createPi();
+    await activate(first.pi); // authenticated opt-in replays the pre-opt-in registration
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    assert.equal(activeActivitySnapshot().activeTasks, null,
+      "the activation pass sees an incomplete source and stays unknown, never zero");
+
+    const order: string[] = [];
+    (first.pi as { on(name: string, handler: (...args: unknown[]) => unknown): void })
+      .on("session_start", () => { order.push("restoreAssociations"); });
+    sourceReady = true; // the source's readiness completes by session_start
+    const ctx = makeCtx(makeUi().ui, "tui", () => true);
+    await first.trigger("session_start", { type: "session_start", reason: "startup" }, ctx);
+    assert.deepEqual(order, ["restoreAssociations"]);
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "the awaited session_start pass recovers the exact value before restoration proceeds");
+  }
+
+  it("does not run restoration until an already-blocked authoritative refresh settles", async () => {
+    const server = await startTestServer();
+    try {
+      let releaseRefresh!: () => void;
+      const refreshGate = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+      let sourceReady = false;
+      registerOwnedActivitySource("backgroundTasks", "execution", {
+        intentUncertain: true,
+        refreshActivity: async () => {
+          await refreshGate;
+          return sourceReady
+            ? { status: "complete", intentTokens: new Set<string>() }
+            : { status: "incomplete" };
+        },
+      } as unknown as Parameters<typeof registerOwnedActivitySource>[2]);
+      registerReviewActivitySource();
+      process.env[HOST_BOOTSTRAP_ENV] = JSON.stringify(makeBootstrap(server.socketPath));
+      const first = createPi();
+      await activate(first.pi); // the activation pass starts and blocks on the gate
+      await new Promise((resolve) => setImmediate(resolve));
+      const order: string[] = [];
+      (first.pi as { on(name: string, handler: (...args: unknown[]) => unknown): void })
+        .on("session_start", () => { order.push("restoreAssociations"); });
+      sourceReady = true;
+      const ctx = makeCtx(makeUi().ui, "tui", () => true);
+      const triggerPromise = first.trigger("session_start", { type: "session_start", reason: "startup" }, ctx);
+      await sleep(50); // the hook reaches its awaited refresh and blocks behind the pass
+      assert.deepEqual(order, [],
+        "restoration cannot proceed while the authoritative refresh is blocked");
+      releaseRefresh();
+      await triggerPromise;
+      assert.deepEqual(order, ["restoreAssociations"]);
+      assert.equal(activeActivitySnapshot().activeTasks, 0,
+        "the settled pass published the exact value before restoration ran");
+    } finally {
+      reviewActivityTest.resetReviewActivityForTests();
+    }
+  });
+
+  it("recovers deliberately stale loaded telemetry through the production review source and publishes it on the wire", async () => {
+    const server = await startTestServer();
+    try {
+      // A real automatic-review run is held before opt-in: no admission, prompt, or task.
+      const run = beginOwnedReviewActivity();
+      registerOwnedActivitySource("backgroundTasks", "execution", {
+        intentUncertain: true,
+        refreshActivity: () => ({ status: "complete", intentTokens: new Set<string>() }),
+      } as unknown as Parameters<typeof registerOwnedActivitySource>[2]);
+      registerReviewActivitySource();
+      process.env[HOST_BOOTSTRAP_ENV] = JSON.stringify(makeBootstrap(server.socketPath));
+      const first = createPi();
+      await activate(first.pi); // replays both registrations; the pass recovers execution to zero
+      await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+      assert.equal(activeActivitySnapshot().activeTasks, 1, "the held review run is positively known");
+
+      const ctx = makeCtx(makeUi().ui, "tui", () => true);
+      await first.trigger("session_start", { type: "session_start", reason: "startup" }, ctx);
+      // Startup recovery publishes the held run as known nonzero on the wire.
+      const startup = await server.waitForFrame(
+        (f) => f.message.type === "status" && f.message.activeTasks === 1);
+      const startupIndex = server.frames.indexOf(startup);
+
+      // Deliberately stale loaded telemetry: the registry loses the review
+      // source's exact state while the run is still held.
+      assert.ok(ownedActivityTest.markCurrentSourceIntentUncertainForTests("backgroundTasks", "review"));
+      const unknown = await server.waitForFrame(
+        (f) => f.message.type === "status" && f.message.activeTasks === null, 3000, startupIndex);
+      const unknownIndex = server.frames.indexOf(unknown);
+
+      // Automatic recovery from the source's own inventory: no admission, no prompt.
+      const recovered = await server.waitForFrame(
+        (f) => f.message.type === "status" && f.message.activeTasks === 1, 3000, unknownIndex);
+      const recoveredIndex = server.frames.indexOf(recovered);
+      // Unknown was never fabricated as zero between the stale frame and recovery.
+      for (let i = unknownIndex + 1; i < recoveredIndex; i += 1) {
+        const frame = server.frames[i]!.message;
+        if (frame.type === "status") assert.notEqual(frame.activeTasks, 0);
+      }
+
+      // Authoritative zero: the run settles and the exact zero is published.
+      endOwnedReviewActivity(run);
+      await server.waitForFrame(
+        (f) => f.message.type === "status" && f.message.activeTasks === 0, 3000, recoveredIndex);
+    } finally {
+      reviewActivityTest.resetReviewActivityForTests();
+    }
   });
 
   it("treats malformed bootstrap env as absent", async () => {

@@ -17,6 +17,7 @@ import {
   activeActivitySnapshot,
   ownedActivitySnapshot,
   subscribeOwnedActivity,
+  __test as ownedActivityTest,
 } from "../src/session-host/owned-activity";
 
 /** Minimal synthetic job backed by a fake ChildProcess: no process, timer, or IO. */
@@ -39,6 +40,60 @@ function fakeShellJob(id: string, pid: number): { job: never; proc: EventEmitter
   };
   return { job: job as never, proc };
 }
+
+describe("background-shell pre-opt-in unsettled recovery", () => {
+  it("recovers a reaped unsettled job at activation from the source's own ledger", () => {
+    // Before opt-in, a job was started and then reaped out of the jobs map
+    // (reapAll clears the map without settling). The source's unsettled ledger
+    // still knows it; an acquire-only replay that reads only the jobs map can
+    // never recover it.
+    const trackReaped = (backgroundShellTest as unknown as {
+      trackReapedShellJobForTests?: (jobId: string, exited: boolean) => string;
+    }).trackReapedShellJobForTests;
+    assert.equal(typeof trackReaped, "function", "the unsettled-ledger seam exists");
+    trackReaped!("reaped-1", false);
+
+    activateOwnedActivity();
+    assert.equal(ownedActivitySnapshot().backgroundShells, 1,
+      "the reaped unsettled job's ownership token is recovered at activation");
+    assert.equal(activeActivitySnapshot().activeShells, 1,
+      "its activity intent is recovered too");
+
+    // The real settlement path still settles it: exit drops activity, close
+    // releases ownership and the ledger entry.
+    const { job, proc } = fakeShellJob("reaped-1", 909_900);
+    backgroundShellTest.attachStreamsForTests({} as never, job);
+    proc.emit("exit", 0, null);
+    assert.equal(activeActivitySnapshot().activeShells, 0, "root exit releases the running indicator");
+    proc.emit("close", 0, null);
+    assert.equal(ownedActivitySnapshot().backgroundShells, 0, "the confirmed close settles ownership");
+  });
+
+  it("keeps a root-exited unverifiable job unknown through automatic refresh until its verdict resolves", async () => {
+    // A reaped job's root exits with an UNVERIFIABLE ownership verdict before
+    // close arrives: the intent-unverifiable ledger is the authoritative
+    // unknown, while the job record's own verdict field may still be unset.
+    const token = backgroundShellTest.trackReapedShellJobForTests("unver-1", false);
+    activateOwnedActivity();
+    const handle = backgroundShellTest.shellActivityHandle();
+    assert.ok(handle, "the shell source is registered");
+    handle.acquireIntent(token);
+    assert.equal(activeActivitySnapshot().activeShells, 1);
+
+    backgroundShellTest.observeShellIntentForTests("unver-1", "unknown");
+    assert.equal(activeActivitySnapshot().activeShells, null,
+      "an unverifiable verdict is unknown, never a fabricated zero");
+
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    assert.equal(activeActivitySnapshot().activeShells, null,
+      "the automatic refresh stays fail-closed on the intent-unverifiable ledger");
+
+    // The delayed close resolves the verdict: activity settles to the exact zero.
+    backgroundShellTest.observeShellIntentForTests("unver-1", "stopped");
+    assert.equal(activeActivitySnapshot().activeShells, 0,
+      "the resolved verdict publishes the exact stopped state");
+  });
+});
 
 describe("background-shell owned-activity settlement decision", () => {
   it("holds ownership through a bare error and releases only on a confirmed exit", () => {

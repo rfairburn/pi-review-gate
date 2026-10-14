@@ -27,10 +27,14 @@ import { transitionTaskState } from "../src/execution/task-state";
 import { createState } from "../src/state";
 import { registerReviewActivitySource, __test as reviewActivityTest } from "../src/activation/review-activity";
 import {
+  OWNED_ACTIVITY_STATE_KEY,
   activateOwnedActivity,
   activeActivitySnapshot,
   ownedActivitySnapshot,
+  refreshOwnedActivityIntent,
+  registerOwnedActivitySource,
   subscribeOwnedActivity,
+  type OwnedActivityIntentRefresh,
   __test as ownedActivityTest,
 } from "../src/session-host/owned-activity";
 import { boundedScalingConfig, initGitRepo, settleOldestUnsettled } from "./helpers/background-controller-fixtures";
@@ -317,6 +321,349 @@ test("a stopped task with a failed cleanup-association recovery reports zero act
       "an unresolved cleanup association keeps ownership unknown");
     assert.equal(activeActivitySnapshot().activeTasks, 0,
       "a known stopped task reports zero activity even when ownership recovery failed");
+    await controller.detach();
+  } finally {
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+/** The live execution source entry in the global registry state (test corruption seam). */
+function currentExecutionEntry(): { intentTokens: Set<string>; refreshActivity?: () => Promise<OwnedActivityIntentRefresh> | OwnedActivityIntentRefresh } {
+  const registry = (globalThis as Record<PropertyKey, unknown>)[OWNED_ACTIVITY_STATE_KEY] as {
+    sources: Map<string, Map<string, Array<{ retired: boolean; intentTokens?: Set<string>; refreshActivity?: () => Promise<OwnedActivityIntentRefresh> | OwnedActivityIntentRefresh }>>>;
+  };
+  const entry = registry.sources.get("backgroundTasks")!.get("execution")!
+    .find((candidate) => !candidate.retired)!;
+  assert.ok(entry.intentTokens, "the execution source carries intent data");
+  return entry as { intentTokens: Set<string>; refreshActivity?: () => Promise<OwnedActivityIntentRefresh> | OwnedActivityIntentRefresh };
+}
+
+test("a corrupted registry token set recovers to the exact census inventory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-active-intent-corrupt-"));
+  ownedActivityTest.resetOwnedActivityForTests();
+  reviewActivityTest.resetReviewActivityForTests();
+  try {
+    await initGitRepo(root);
+    activateOwnedActivity();
+    registerReviewActivitySource();
+    const controller = new BackgroundExecutionController({
+      pi: {},
+      config: boundedScalingConfig(),
+      state: createState(),
+      cwd: () => root,
+    });
+    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [] });
+
+    // Idle: the registry entry carries a stale token the source never held.
+    currentExecutionEntry().intentTokens.add("execution:stale");
+    assert.ok(ownedActivityTest.markCurrentSourceIntentUncertainForTests("backgroundTasks", "execution"));
+    assert.equal(activeActivitySnapshot().activeTasks, null, "the corrupted entry publishes unknown");
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "the exact idle census replaces the corrupted token set — never a stale positive");
+
+    // Running: the registry loses the real token while work is held.
+    const started = await controller.start([{
+      title: "corrupt target",
+      instructions: "work",
+      acceptanceCriteria: ["done"],
+    }]);
+    assert.equal(activeActivitySnapshot().activeTasks, 1);
+    currentExecutionEntry().intentTokens.clear();
+    assert.ok(ownedActivityTest.markCurrentSourceIntentUncertainForTests("backgroundTasks", "execution"));
+    assert.equal(activeActivitySnapshot().activeTasks, null);
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "the census restores the exact running token the registry lost");
+    void started;
+
+    await controller.detach();
+  } finally {
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a changed session generation keeps the authoritative refresh fail-closed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-active-intent-generation-"));
+  ownedActivityTest.resetOwnedActivityForTests();
+  reviewActivityTest.resetReviewActivityForTests();
+  try {
+    await initGitRepo(root);
+    let currentCwd = root;
+    activateOwnedActivity();
+    registerReviewActivitySource();
+    const controller = new BackgroundExecutionController({
+      pi: {},
+      config: boundedScalingConfig(),
+      state: createState(),
+      cwd: () => currentCwd,
+    });
+    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [] });
+    const started = await controller.start([{
+      title: "generation target",
+      instructions: "work",
+      acceptanceCriteria: ["done"],
+    }]);
+    assert.equal(activeActivitySnapshot().activeTasks, 1);
+
+    // The session generation moved: the census must refuse to speak for a
+    // different cwd rather than publish a stale or fabricated value.
+    currentCwd = join(root, "elsewhere");
+    assert.ok(ownedActivityTest.markCurrentSourceIntentUncertainForTests("backgroundTasks", "execution"));
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, null,
+      "a stale-generation census is incomplete — unknown, never zero");
+
+    // A later genuine readiness observation (the session returns) recovers it.
+    currentCwd = root;
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "the recovered generation publishes the exact value again");
+    void started;
+
+    await controller.detach();
+  } finally {
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a settling save recovers diverged registry telemetry without an explicit refresh", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-active-intent-savetail-"));
+  ownedActivityTest.resetOwnedActivityForTests();
+  reviewActivityTest.resetReviewActivityForTests();
+  try {
+    await initGitRepo(root);
+    activateOwnedActivity();
+    registerReviewActivitySource();
+    // Gateable save fault seam: while the gate is held, every save tail stays pending.
+    let saveGate: Promise<void> | undefined;
+    const controller = new BackgroundExecutionController({
+      pi: {},
+      config: boundedScalingConfig(),
+      state: createState(),
+      cwd: () => root,
+      faults: { save: async () => { await saveGate; } },
+    });
+    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [] });
+    const internals = controller as unknown as {
+      groups: Map<string, BackgroundExecutionGroup>;
+      save: (group: BackgroundExecutionGroup) => Promise<unknown>;
+    };
+
+    // Held work: a queued task is positively known.
+    const started = await controller.start([{
+      title: "save-tail target",
+      instructions: "work",
+      acceptanceCriteria: ["done"],
+    }]);
+    assert.equal(activeActivitySnapshot().activeTasks, 1);
+    const group = internals.groups.get(started.executionId)!;
+
+    // Hold an unchanged group's save: the automatic pass must come back incomplete.
+    let releaseSave!: () => void;
+    saveGate = new Promise<void>((resolve) => { releaseSave = resolve; });
+    const heldSave = internals.save(group);
+    void heldSave.catch(() => undefined);
+    assert.ok(ownedActivityTest.markCurrentSourceIntentUncertainForTests("backgroundTasks", "execution"));
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    assert.equal(activeActivitySnapshot().activeTasks, null,
+      "a pending save tail keeps the census incomplete — unknown, never zero");
+    const passesAfterIncomplete = ownedActivityTest.ownedActivityIntentRefreshPassCount();
+
+    // Incomplete alone does not retry.
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(ownedActivityTest.ownedActivityIntentRefreshPassCount(), passesAfterIncomplete,
+      "an incomplete result schedules no retry");
+
+    // The save settles: the genuine readiness observation retries automatically.
+    releaseSave();
+    saveGate = undefined;
+    await heldSave;
+    await new Promise((resolve) => setImmediate(resolve)); // let the tail's settle hook schedule
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "the settled save recovers the exact held work without an explicit refresh");
+
+    // Stopped work: the same readiness observation recovers an exact zero.
+    const task = group.tasks[0]!;
+    transitionTaskState(task, "failed");
+    await internals.save(group);
+    assert.equal(activeActivitySnapshot().activeTasks, 0);
+    let releaseSave2!: () => void;
+    saveGate = new Promise<void>((resolve) => { releaseSave2 = resolve; });
+    const heldSave2 = internals.save(group);
+    void heldSave2.catch(() => undefined);
+    assert.ok(ownedActivityTest.markCurrentSourceIntentUncertainForTests("backgroundTasks", "execution"));
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    assert.equal(activeActivitySnapshot().activeTasks, null,
+      "the pending save tail keeps the stopped-work census incomplete too");
+    releaseSave2();
+    saveGate = undefined;
+    await heldSave2;
+    await new Promise((resolve) => setImmediate(resolve));
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "the settled save recovers the exact zero without an explicit refresh");
+
+    await controller.detach();
+  } finally {
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a stale execution census result is fenced by its own freshness predicate at apply time", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-active-intent-commit-race-"));
+  ownedActivityTest.resetOwnedActivityForTests();
+  reviewActivityTest.resetReviewActivityForTests();
+  try {
+    await initGitRepo(root);
+    let currentCwd = root;
+    activateOwnedActivity();
+    registerReviewActivitySource();
+    // Gateable census fault seam: holds the execution census mid-read.
+    let censusGate: Promise<void> | undefined;
+    const controller = new BackgroundExecutionController({
+      pi: {},
+      config: boundedScalingConfig(),
+      state: createState(),
+      cwd: () => currentCwd,
+      faults: { currentActivityCensus: async () => { await censusGate; } },
+    });
+    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [] });
+    const internals = controller as unknown as {
+      groups: Map<string, BackgroundExecutionGroup>;
+      save: (group: BackgroundExecutionGroup) => Promise<unknown>;
+    };
+    const started = await controller.start([{
+      title: "commit race target",
+      instructions: "work",
+      acceptanceCriteria: ["done"],
+    }]);
+    assert.equal(activeActivitySnapshot().activeTasks, 1);
+
+    // A second source with a gated refresher keeps the apply loop pending.
+    let releaseSecond!: () => void;
+    const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    const shell = registerOwnedActivitySource("backgroundShells", "background-shell", {
+      refreshActivity: async () => {
+        await secondGate;
+        return { status: "complete", intentTokens: new Set<string>() };
+      },
+    });
+    shell.markIntentUncertain();
+    assert.ok(ownedActivityTest.markCurrentSourceIntentUncertainForTests("backgroundTasks", "execution"));
+
+    // Observe the execution refresher's completion so the session change lands
+    // AFTER the census finished (past its own final fence) but BEFORE the
+    // apply loop runs while the second source is still pending.
+    const executionEntry = currentExecutionEntry();
+    assert.ok(executionEntry.refreshActivity !== undefined, "the execution source carries a refresher");
+    const originalRefresher = executionEntry.refreshActivity!;
+    let censusResult: OwnedActivityIntentRefresh | undefined;
+    let resolveCensusDone!: () => void;
+    const censusDone = new Promise<void>((resolve) => { resolveCensusDone = resolve; });
+    executionEntry.refreshActivity = async () => {
+      censusResult = await originalRefresher();
+      resolveCensusDone();
+      return censusResult;
+    };
+
+    let releaseCensus!: () => void;
+    censusGate = new Promise<void>((resolve) => { releaseCensus = resolve; });
+    const pass = refreshOwnedActivityIntent();
+    releaseCensus();
+    await censusDone;
+    assert.equal(censusResult?.status, "complete", "the census finished complete before the session change");
+
+    // The session generation moves AFTER the census finished but BEFORE the
+    // apply loop runs: no registry mutation happens, so only the owning
+    // source's freshness predicate can reject the stale result.
+    currentCwd = join(root, "elsewhere");
+    releaseSecond();
+    await pass;
+    assert.equal(activeActivitySnapshot().activeShells, 0, "the second source's fresh result applies");
+    assert.equal(activeActivitySnapshot().activeTasks, null,
+      "the stale execution census is rejected by its own freshness predicate");
+
+    // A later genuine readiness observation recovers the actual inventory.
+    currentCwd = root;
+    const group = internals.groups.get(started.executionId)!;
+    await internals.save(group);
+    await new Promise((resolve) => setImmediate(resolve));
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "the genuine readiness observation recovers the exact inventory");
+
+    await controller.detach();
+  } finally {
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a diverged registry recovers from the controller's own census without source-local uncertainty", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-active-intent-divergence-"));
+  ownedActivityTest.resetOwnedActivityForTests();
+  reviewActivityTest.resetReviewActivityForTests();
+  try {
+    await initGitRepo(root);
+    activateOwnedActivity();
+    registerReviewActivitySource();
+    const controller = new BackgroundExecutionController({
+      pi: {},
+      config: boundedScalingConfig(),
+      state: createState(),
+      cwd: () => root,
+    });
+    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [] });
+    const internals = controller as unknown as {
+      groups: Map<string, BackgroundExecutionGroup>;
+      save: (group: BackgroundExecutionGroup) => Promise<unknown>;
+      activityIntentUncertain: boolean;
+    };
+    const started = await controller.start([{
+      title: "divergence target",
+      instructions: "do the thing",
+      acceptanceCriteria: ["done"],
+    }]);
+    assert.equal(activeActivitySnapshot().activeTasks, 1, "queued work is positively known");
+
+    // The registry telemetry diverges from the source's own state: the
+    // controller's local uncertainty boolean is false (it knows its tokens),
+    // but the loaded registry entry is uncertain. Recovery must come from the
+    // source's authoritative census, not from the local boolean.
+    assert.equal(internals.activityIntentUncertain, false, "the source itself is not uncertain");
+    assert.ok(ownedActivityTest.markCurrentSourceIntentUncertainForTests("backgroundTasks", "execution"),
+      "the exact current incarnation is marked uncertain");
+    assert.equal(activeActivitySnapshot().activeTasks, null, "the diverged registry publishes unknown");
+
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "the census reconstructs the exact nonzero value from the source's own state");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, 1);
+
+    // The zero case: with no active work, the same recovery establishes an exact zero.
+    const group = internals.groups.get(started.executionId)!;
+    const task = group.tasks[0]!;
+    transitionTaskState(task, "failed");
+    await internals.save(group);
+    assert.equal(activeActivitySnapshot().activeTasks, 0);
+    assert.ok(ownedActivityTest.markCurrentSourceIntentUncertainForTests("backgroundTasks", "execution"));
+    assert.equal(activeActivitySnapshot().activeTasks, null);
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "the census reconstructs the exact zero, never a fabricated one");
+
     await controller.detach();
   } finally {
     ownedActivityTest.resetOwnedActivityForTests();

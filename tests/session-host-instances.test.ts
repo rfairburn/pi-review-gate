@@ -49,6 +49,16 @@ import type {
 import activateReporter, { SESSION_HOST_STICKY_STATE_KEY } from "../src/session-host/reporter";
 import { __test as mainTest } from "../src/session-host/main";
 import { HOST_BOOTSTRAP_ENV, decodeFrame, type SessionHostStatus } from "../src/session-host/protocol";
+import {
+  registerOwnedActivitySource,
+  __test as ownedActivityTest,
+} from "../src/session-host/owned-activity";
+import {
+  beginOwnedReviewActivity,
+  endOwnedReviewActivity,
+  registerReviewActivitySource,
+  __test as reviewActivityTest,
+} from "../src/activation/review-activity";
 
 /**
  * Focused component tests for the independent owned-PTY instance lifecycle.
@@ -3020,6 +3030,158 @@ test("reporter protocol current file reaches the production manager and Main del
       manager.closeExited(instanceId);
     }
     await manager.dispose().catch(() => undefined);
+    for (const [key, value] of oldEnv) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    for (const [key, descriptor] of oldGlobal) {
+      if (descriptor === undefined) delete globalScope[key];
+      else Object.defineProperty(globalThis, key, descriptor);
+    }
+    cleanup(harness);
+  }
+});
+
+test("loaded activity telemetry recovers through the production reporter/protocol/manager path", { skip: process.platform === "win32" }, async () => {
+  const harness = makeSavedHarness("reporter-main-activity-recovery");
+  ownedActivityTest.resetOwnedActivityForTests();
+  reviewActivityTest.resetReviewActivityForTests();
+  const channels = new Map<string, StatusBrokerStatusHandlers>();
+  const bootstraps = new Map<string, StatusRegistration["bootstrap"]>();
+  const socketPath = `/tmp/prg-synthetic-${randomUUID()}.sock`;
+  const generation = randomUUID();
+  const token = "a".repeat(64);
+  const broker: StatusBroker = {
+    socketPath,
+    generation,
+    register(instanceId, handlers) {
+      const bootstrap: StatusRegistration["bootstrap"] = { version: 1, socketPath, token, instanceId, generation };
+      channels.set(instanceId, handlers);
+      bootstraps.set(instanceId, bootstrap);
+      return {
+        bootstrap,
+        rename: async (request) => ({ requestId: randomUUID(), status: "unavailable", expectedSessionId: request.expectedSessionId, expectedSessionEpoch: request.expectedSessionEpoch, observedSessionId: null, observedSessionEpoch: null }),
+        shutdown: async () => ({ requestId: randomUUID(), status: "unavailable" }),
+        release: () => { channels.delete(instanceId); },
+      };
+    },
+    async dispose() { channels.clear(); },
+  };
+  const manager = new InstanceManager({
+    packageRoot: harness.packageRoot,
+    piExecutable: harness.piExecutable,
+    statusRegistrar: mainTest.statusRegistrar(broker),
+    nativeSetup: false,
+    profileRegistry: harness.profileRegistry,
+    env: harness.env,
+    ptyFactory: harness.ptyFactory,
+  });
+
+  const envNames = [HOST_BOOTSTRAP_ENV, SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV, "PI_REVIEW_GATE_RUNTIME_ROLE"] as const;
+  const oldEnv = new Map(envNames.map((key) => [key, process.env[key]] as const));
+  const globalScope = globalThis as Record<PropertyKey, unknown>;
+  const privateGlobalKeys = [SESSION_HOST_STICKY_STATE_KEY, Symbol.for("pi-review-gate.session-host.startup-request.v1"), Symbol.for("pi-review-gate.session-host.title-columns.v1")] as const;
+  const oldGlobal = new Map(privateGlobalKeys.map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const));
+  for (const key of privateGlobalKeys) delete globalScope[key];
+
+  const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+  const pi = { on(name: string, callback: (...args: unknown[]) => unknown) { hooks.set(name, [...(hooks.get(name) ?? []), callback]); } };
+  const trigger = async (name: string, ...args: unknown[]): Promise<void> => { for (const callback of hooks.get(name) ?? []) await callback(...args); };
+  const sockets: net.Socket[] = [];
+  const context = () => ({ mode: "tui", ui: { setWidget() {} }, isIdle: () => false, sessionManager: { getSessionId: () => "activity-recovery-id", getSessionName: () => "Activity recovery", getEntries: () => [], getSessionFile: () => undefined } });
+
+  // Production source registration: hold a real review run before opt-in.
+  const run = beginOwnedReviewActivity();
+  registerReviewActivitySource();
+  let executionReady = false;
+  registerOwnedActivitySource("backgroundTasks", "execution", {
+    intentUncertain: true,
+    refreshActivity: () => executionReady ? { status: "complete", intentTokens: new Set<string>() } : { status: "incomplete" },
+  });
+
+  let instanceId: string | undefined;
+  let settled = false;
+  try {
+    for (const key of envNames) delete process.env[key];
+    const id = await manager.create({ workspace: harness.workspace });
+    instanceId = id;
+    const bootstrap = bootstraps.get(id);
+    assert.ok(bootstrap);
+    process.env[HOST_BOOTSTRAP_ENV] = JSON.stringify(bootstrap);
+
+    await activateReporter(pi, {
+      reconnectDelayMs: 60_000,
+      maxReconnectAttempts: 0,
+      connectSocket: (address) => {
+        assert.equal(address, bootstrap.socketPath);
+        const socket = new net.Socket();
+        let buffered = "";
+        let authenticated = false;
+        socket.write = ((chunk: string | Uint8Array) => {
+          buffered += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+          let newline: number;
+          while ((newline = buffered.indexOf("\n")) >= 0) {
+            const line = buffered.slice(0, newline + 1);
+            buffered = buffered.slice(newline + 1);
+            const message = decodeFrame(line);
+            if (message?.type === "hello") {
+              authenticated = message.instanceId === bootstrap.instanceId && message.generation === bootstrap.generation;
+            } else if (message?.type === "status" && authenticated && message.instanceId === bootstrap.instanceId && message.generation === bootstrap.generation) {
+              channels.get(id)?.onStatus(message as SessionHostStatus);
+            }
+          }
+          return true;
+        }) as typeof socket.write;
+        sockets.push(socket);
+        return socket;
+      },
+    });
+
+    const viewActivity = (): number | null | undefined => manager.list().find((entry) => entry.id === id)?.activeTasks;
+    const waitForActivity = async (expected: number | null, what: string): Promise<void> => {
+      const deadline = Date.now() + 3000;
+      for (;;) {
+        if (viewActivity() === expected) return;
+        if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}; loaded activeTasks is ${String(viewActivity())}`);
+        await sleep(5);
+      }
+    };
+
+    // Startup with the execution source still incomplete: the loaded host must
+    // stay unknown — never a fabricated zero.
+    await trigger("session_start", { type: "session_start" }, context());
+    sockets.at(-1)?.emit("connect");
+    assert.equal(viewActivity(), null, "incomplete startup evidence stays unknown on the loaded host");
+
+    // The execution source's readiness completes at a later genuine lifecycle
+    // event; the held review run must publish as known nonzero.
+    executionReady = true;
+    await trigger("session_start", { type: "session_start", reason: "synthetic-readiness" }, context());
+    sockets.at(-1)?.emit("connect");
+    await waitForActivity(1, "the held review run to publish as known nonzero");
+
+    // Deliberately stale loaded telemetry while the run is still held.
+    assert.ok(ownedActivityTest.markCurrentSourceIntentUncertainForTests("backgroundTasks", "review"), "mark the held review source uncertain");
+    await waitForActivity(null, "stale telemetry to publish unknown on the loaded host");
+    await waitForActivity(1, "automatic recovery to publish nonzero without a prompt or admission");
+
+    // Settle the run; authoritative state is now idle.
+    endOwnedReviewActivity(run);
+    settled = true;
+    await waitForActivity(0, "settlement to publish the exact zero");
+
+    // Deliberately stale telemetry again while the source already knows zero:
+    // independent unknown-to-zero recovery through the same publication path.
+    assert.ok(ownedActivityTest.markCurrentSourceIntentUncertainForTests("backgroundTasks", "review"), "mark the idle review source uncertain");
+    await waitForActivity(null, "stale telemetry to publish unknown again");
+    await waitForActivity(0, "automatic recovery to publish the exact idle zero");
+  } finally {
+    if (!settled) endOwnedReviewActivity(run);
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+    for (const socket of sockets) socket.destroy();
+    await manager.dispose().catch(() => {});
+    await broker.dispose();
     for (const [key, value] of oldEnv) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;

@@ -40,6 +40,7 @@ import {
   RETIRED_ACTIVITY_CENSUS_DISCARDED,
   isOwnedActivityActive,
   registerOwnedActivitySource,
+  type OwnedActivityIntentRefresh,
   type OwnedActivitySourceHandle,
   type RetiredOwnedActivityReconciliation,
   type RetiredOwnedActivityTokens,
@@ -700,6 +701,10 @@ export class BackgroundExecutionController {
       uncertain: true,
       intentUncertain: true,
       reconcileRetired: (retained) => this.reconcileRetiredActivity(retained),
+      // The registry's coalesced intent-refresh pass recovers a diverged or
+      // stale loaded status from this controller's own authoritative census —
+      // independent of the local uncertainty boolean.
+      refreshActivity: () => this.refreshCurrentActivityIntent(),
     });
     this.pool = new ExecutorPoolScheduler(resolvedWorkerResources(input.config));
     this.ledger = new ParentCheckpointLedger({
@@ -1372,9 +1377,27 @@ export class BackgroundExecutionController {
    * ownership or performs restore/adoption/scheduling work.
    */
   private async reconcileCurrentActivityIntent(): Promise<void> {
+    if (!this.activityIntentUncertain) return;
+    await this.runCurrentActivityCensus({ publish: true });
+  }
+
+  /**
+   * Authoritative activity census for the current incarnation: validates the
+   * complete exact inventory against disk and returns it. With `publish`, the
+   * ordinary reconcile path applies the exact intent tokens itself, resolving
+   * the uncertainty only when every row is accounted for. Without `publish`
+   * (the registry refresh path) the census is strictly read-only: it returns
+   * the verified exact token set and the registry applies it atomically behind
+   * its own commit-time fences. Every skipped, failed, or stale path returns
+   * undefined — success is never inferred from the pre-existing local boolean.
+   */
+  private async runCurrentActivityCensus(options: { publish: boolean }): Promise<{
+    tokens: Set<string>;
+    isCurrent: () => boolean;
+  } | undefined> {
     const inventory = this.currentActivityInventory;
     if (!inventory || !inventory.authoritative || !inventory.ready || inventory.invalid
-      || !this.activityIntentUncertain || this.ownedActivity.retired || !isOwnedActivityActive()
+      || this.ownedActivity.retired || !isOwnedActivityActive()
       || this.detaching > 0 || this.shuttingDown || this.startAdmissions > 0
       || this.recoveryAdmissions > 0 || this.continuationAdmissions.size > 0
       || this.pendingForceMerges.size > 0 || this.saveTails.size > 0
@@ -1653,23 +1676,35 @@ export class BackgroundExecutionController {
       if (!task || !currentGroups.has(rows[0]!.group.executionId) || !isActiveTaskState(task.state)) return;
     }
 
-    if (!isCurrent()) return;
-    for (const token of [...this.activityIntentTokens]) {
-      if (expectedIntentTokens.has(token)) continue;
-      this.ownedActivity.releaseIntent(token);
-      this.activityIntentTokens.delete(token);
-      if (!isCurrent()) return;
+    if (!isCurrent()) return undefined;
+    // Publication is the caller's decision: the ordinary reconcile path applies
+    // the exact inventory to its registry channel, while the authoritative
+    // refresh path returns it read-only so the registry can replace tokens and
+    // clear uncertainty atomically behind its commit-time fences. A census that
+    // mutates the registry before returning would bump its own revision fence
+    // and get discarded — or worse, clear uncertainty under a diverged token set.
+    if (options.publish) {
+      for (const token of [...this.activityIntentTokens]) {
+        if (expectedIntentTokens.has(token)) continue;
+        this.ownedActivity.releaseIntent(token);
+        this.activityIntentTokens.delete(token);
+        if (!isCurrent()) return undefined;
+      }
+      for (const token of expectedIntentTokens) {
+        if (this.activityIntentTokens.has(token)) continue;
+        this.ownedActivity.acquireIntent(token);
+        this.activityIntentTokens.add(token);
+        if (!isCurrent()) return undefined;
+      }
+      if (!isCurrent()) return undefined;
+      this.activityIntentUncertain = false;
+      this.ownedActivity.resolveIntentUncertainty();
     }
-    for (const token of expectedIntentTokens) {
-      if (this.activityIntentTokens.has(token)) continue;
-      this.ownedActivity.acquireIntent(token);
-      this.activityIntentTokens.add(token);
-      if (!isCurrent()) return;
-    }
-    if (!isCurrent()) return;
-    this.activityIntentUncertain = false;
-    this.ownedActivity.resolveIntentUncertainty();
-    if (!isCurrent()) return;
+    if (!isCurrent()) return undefined;
+    // The read-only refresh path must NOT rewrite the controller inventory:
+    // its isCurrent fence compares against the pre-census inventory identity,
+    // and a self-rewrite would silently retire the very evidence it vouches for.
+    if (!options.publish) return { tokens: expectedIntentTokens, isCurrent };
     this.currentActivityInventory = {
       authoritative: true,
       ready: true,
@@ -1681,6 +1716,29 @@ export class BackgroundExecutionController {
       waveRoots: [],
       revision: ++this.currentActivityInventoryRevision,
     };
+    return { tokens: expectedIntentTokens, isCurrent };
+  }
+
+  /**
+   * Authoritative activity refresher for the registry's coalesced intent-
+   * refresh pass: runs the current census READ-ONLY and reports its outcome.
+   * Complete carries this invocation's freshly verified exact token set — never
+   * a cached mirror, and never inferred from the pre-existing local boolean.
+   * Every skipped, failed, or stale census path (unreadable record, blocked
+   * save/admission tails, changed session generation, retired incarnation,
+   * inactive registry) is incomplete: the count stays unknown, never zero.
+   */
+  private async refreshCurrentActivityIntent(): Promise<OwnedActivityIntentRefresh> {
+    let census: { tokens: Set<string>; isCurrent: () => boolean } | undefined;
+    try {
+      census = await this.runCurrentActivityCensus({ publish: false });
+    } catch {
+      return { status: "incomplete" };
+    }
+    if (census === undefined) return { status: "incomplete" };
+    // The registry re-evaluates the owning-source fence immediately before
+    // applying: a session/controller change after this read rejects the result.
+    return { status: "complete", intentTokens: census.tokens, isCurrent: census.isCurrent };
   }
 
   private markCurrentIntentUncertain(): void {
@@ -1699,6 +1757,11 @@ export class BackgroundExecutionController {
   }
 
   private scheduleCurrentActivityCensus(): void {
+    // A genuine lifecycle/readiness observation also retries diverged registry
+    // telemetry, even when this controller's local uncertainty is false: a
+    // blocked save that made an automatic refresh incomplete settles here, and
+    // the loaded counts must recover without polling or a manual refresh.
+    this.ownedActivity.requestIntentRefresh();
     if (this.currentActivityCensusInFlight) {
       this.currentActivityCensusDirty = true;
       return;

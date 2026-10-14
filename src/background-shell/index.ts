@@ -18,6 +18,7 @@ import { scheduleForceKill } from "./process";
 import { terminalColumns, truncateLineToWidth } from "./width";
 import {
   registerOwnedActivitySource,
+  type OwnedActivityIntentRefresh,
   type OwnedActivitySourceHandle,
 } from "../session-host/owned-activity";
 import {
@@ -215,6 +216,15 @@ const jobs = new Map<string, Job>();
 let seq = 0;
 
 /**
+ * Unsettled work observed by this module copy, retained until independently
+ * confirmed settlement — including jobs reaped out of `jobs` (reapAll clears
+ * the map without settling). This is the authoritative exact inventory the
+ * resync and the registry's intent-refresh pass reconstruct from: a reaped
+ * job's token must survive until its close/verdict, never vanish with the map.
+ */
+const unsettledShellJobs = new Map<string, { job: Job; intentHeld: boolean }>();
+
+/**
  * Process-unique prefix for owned-activity tokens. A module incarnation's job
  * ids restart at 1 on reload, so the prefix (fresh per module instance) plus
  * the job id is what makes a token globally unique across reloads; a released
@@ -237,14 +247,37 @@ let shellOwnedActivity: OwnedActivitySourceHandle | undefined;
 shellOwnedActivity = registerOwnedActivitySource("backgroundShells", "background-shell", {
   resync: () => {
     const handle = shellOwnedActivity;
-    if (!handle) return; // module still initializing: `jobs` is empty anyway
-    for (const job of jobs.values()) {
-      if (!job.exited) {
-        handle.acquire(ownedActivityToken(job));
-        // A job that is still running is also positively active work.
-        handle.acquireIntent(ownedActivityToken(job));
-      }
+    if (!handle) return; // module still initializing: no unsettled work observed
+    // The unsettled ledger is the exact authoritative inventory: it covers live
+    // jobs AND jobs reaped out of `jobs` before confirmed settlement. Re-acquire
+    // every positive token; never release, because only an actual settlement
+    // event may do that.
+    for (const entry of unsettledShellJobs.values()) {
+      const token = ownedActivityToken(entry.job);
+      handle.acquire(token);
+      if (entry.intentHeld) handle.acquireIntent(token);
     }
+    handle.resolveUncertainty();
+    // Intent is fully accounted for only when no job's liveness is unverified;
+    // an unverifiable record stays unknown until its verdict resolves.
+    if (intentUnverifiableJobs.size === 0) handle.resolveIntentUncertainty();
+  },
+  refreshActivity: (): OwnedActivityIntentRefresh => {
+    const handle = shellOwnedActivity;
+    if (handle === undefined) return { status: "incomplete" };
+    // Retirement is not incompleteness: this incarnation's own ledger is still
+    // the only proof of its unsettled jobs, and the registry fences the result
+    // against this exact incarnation's revision.
+    const tokens = new Set<string>();
+    for (const [token, entry] of unsettledShellJobs) {
+      // The intent-unverifiable ledger is authoritative: a root exit with an
+      // unverifiable ownership verdict lands here BEFORE close arrives, while
+      // the job record's own verdict field may still be unset. Genuinely
+      // unobserved work stays unknown — never a fabricated zero.
+      if (intentUnverifiableJobs.has(entry.job.id)) return { status: "incomplete" };
+      if (entry.intentHeld) tokens.add(token);
+    }
+    return { status: "complete", intentTokens: tokens };
   },
 });
 
@@ -270,7 +303,9 @@ function shellCompletionAction(input: {
 
 /** Release this job's telemetry token; idempotent, only after confirmed settlement. */
 function releaseOwnedShellActivity(job: Job): void {
-  shellOwnedActivity?.release(ownedActivityToken(job));
+  const token = ownedActivityToken(job);
+  unsettledShellJobs.delete(token);
+  shellOwnedActivity?.release(token);
 }
 
 /**
@@ -326,6 +361,10 @@ function clearShellIntentUnverifiable(job: Job): void {
  */
 function observeShellIntent(job: Job, action: "active" | "stopped" | "unknown"): void {
   const token = ownedActivityToken(job);
+  // Keep the unsettled ledger's intent view exact; a missing entry means this
+  // observation predates ledger tracking (or the job already settled).
+  const unsettled = unsettledShellJobs.get(token);
+  if (unsettled) unsettled.intentHeld = action === "active";
   if (action === "unknown") {
     markShellIntentUnverifiable(job);
     shellOwnedActivity?.releaseIntent(token);
@@ -385,6 +424,18 @@ export const __test = Object.freeze({
   /** The exact ownership token the real settlement path releases for a job id. */
   ownedActivityTokenForTests(jobId: string): string {
     return `${ownedActivityTokenPrefix}:${jobId}`;
+  },
+  /**
+   * Test seam: record one synthetic started-then-reaped job in the real
+   * unsettled ledger WITHOUT adding it to `jobs` (reapAll's map clear), so the
+   * resync/refresh paths can be exercised without spawning or reaping a
+   * process. The entry settles through the ordinary close path for the same id.
+   */
+  trackReapedShellJobForTests(jobId: string, exited: boolean): string {
+    const job = { id: jobId, exited } as Job;
+    const token = `${ownedActivityTokenPrefix}:${jobId}`;
+    unsettledShellJobs.set(token, { job, intentHeld: !exited });
+    return token;
   },
 });
 let stallTimer: ReturnType<typeof setInterval> | null = null;
@@ -1147,9 +1198,13 @@ export function registerBackgroundShell(
       // Windows ownership verdict proving the tree gone) — never by reapAll()'s
       // map clear and never by a bare ChildProcess error. Activity intent starts
       // positive here too and is released the moment the process work is
-      // observed stopped, independently of any retained cleanup obligation.
-      shellOwnedActivity?.acquire(ownedActivityToken(job));
-      shellOwnedActivity?.acquireIntent(ownedActivityToken(job));
+      // observed stopped, independently of any retained cleanup obligation. The
+      // unsettled ledger mirrors both until confirmed settlement so a reaped
+      // job's tokens survive the `jobs` map clear.
+      const ownedToken = ownedActivityToken(job);
+      shellOwnedActivity?.acquire(ownedToken);
+      shellOwnedActivity?.acquireIntent(ownedToken);
+      unsettledShellJobs.set(ownedToken, { job, intentHeld: true });
       publishLifecycle("started", job);
       attachStreams(pi, job);
       ensureStallTimer(pi);

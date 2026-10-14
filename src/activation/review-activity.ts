@@ -16,7 +16,11 @@
  * unsettled review.
  */
 import { randomUUID } from "node:crypto";
-import { registerOwnedActivitySource, type OwnedActivitySourceHandle } from "../session-host/owned-activity";
+import {
+  registerOwnedActivitySource,
+  type OwnedActivityIntentRefresh,
+  type OwnedActivitySourceHandle,
+} from "../session-host/owned-activity";
 
 /** The current review source incarnation for this module copy (if any). */
 let reviewSourceHandle: OwnedActivitySourceHandle | undefined;
@@ -25,11 +29,40 @@ let reviewSourceHandle: OwnedActivitySourceHandle | undefined;
 const reviewOwners = new Map<string, OwnedActivitySourceHandle>();
 
 /**
+ * The review source's recovery contract: re-acquire the authoritative exact
+ * inventory on replay and report it to the registry's coalesced intent-refresh
+ * pass. Shared by every entry point that can create the source so a pre-opt-in
+ * registration is always replayable, whichever ran first. A pre-opt-in
+ * registration is replayed as uncertain on both channels; the resync re-
+ * acquires every in-flight run this module copy still owns (the `reviewOwners`
+ * map is the authoritative exact inventory, retained across reloads) and then
+ * resolves both channels.
+ */
+const reviewSourceOptions = {
+  resync: () => {
+    for (const [token] of reviewOwners) {
+      reviewSourceHandle?.acquire(token);
+      reviewSourceHandle?.acquireIntent(token);
+    }
+    reviewSourceHandle?.resolveUncertainty();
+    reviewSourceHandle?.resolveIntentUncertainty();
+  },
+  refreshActivity: (): OwnedActivityIntentRefresh => {
+    const handle = reviewSourceHandle;
+    if (handle === undefined) return { status: "incomplete" };
+    // Retirement is not incompleteness: this incarnation's own inventory is
+    // still the only proof of its retained runs, and the registry fences the
+    // result against this exact incarnation's revision.
+    return { status: "complete", intentTokens: new Set(reviewOwners.keys()) };
+  },
+};
+
+/**
  * Register the review source for this module incarnation so a session with no
  * automatic review can still report a known zero. Idempotent per copy.
  */
 export function registerReviewActivitySource(): void {
-  reviewSourceHandle ??= registerOwnedActivitySource("backgroundTasks", "review");
+  reviewSourceHandle ??= registerOwnedActivitySource("backgroundTasks", "review", reviewSourceOptions);
 }
 
 /**
@@ -37,7 +70,7 @@ export function registerReviewActivitySource(): void {
  * run; the token is positive until `endOwnedReviewActivity` releases it.
  */
 export function beginOwnedReviewActivity(): string {
-  reviewSourceHandle ??= registerOwnedActivitySource("backgroundTasks", "review");
+  reviewSourceHandle ??= registerOwnedActivitySource("backgroundTasks", "review", reviewSourceOptions);
   const token = randomUUID();
   reviewOwners.set(token, reviewSourceHandle);
   reviewSourceHandle.acquire(token);

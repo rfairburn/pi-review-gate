@@ -15,6 +15,7 @@ import {
   activeActivitySnapshot,
   isOwnedActivityActive,
   ownedActivitySnapshot,
+  refreshOwnedActivityIntent,
   registerOwnedActivitySource,
   subscribeOwnedActivity,
   OWNED_ACTIVITY_STATE_KEY,
@@ -418,5 +419,363 @@ describe("owned-activity activity-intent channel", () => {
     assert.equal(ownedActivitySnapshot().backgroundTasks, 1, "the old ownership token is retained");
     assert.equal(activeActivitySnapshot().activeTasks, null,
       "a pre-intent incarnation keeps the activity source genuinely unknown");
+  });
+});
+
+describe("owned-activity authoritative intent refresh", () => {
+  beforeEach(() => {
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+  });
+
+  afterEach(async () => {
+    // Drain any pass scheduled by this test so it cannot bleed into the next
+    // test's pass count.
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    ownedActivityTest.resetOwnedActivityForTests();
+    reviewActivityTest.resetReviewActivityForTests();
+  });
+
+  it("recovers a pre-opt-in in-flight review at activation without a prompt or new task", async () => {
+    // The review run begins while the registry is still inert (pre-opt-in), so
+    // its acquisition was never observed. Activation must recover it from the
+    // review module's own inventory — no fresh admission, prompt, or task.
+    let execution: ReturnType<typeof registerOwnedActivitySource> | undefined;
+    execution = registerOwnedActivitySource(TASKS, "execution", {
+      resync: () => { execution?.resolveUncertainty(); },
+      refreshActivity: () => ({ status: "complete", intentTokens: new Set<string>() }),
+    } as unknown as Parameters<typeof registerOwnedActivitySource>[2]);
+    const run = beginOwnedReviewActivity();
+    assert.deepEqual(ownedActivitySnapshot(), { backgroundTasks: null, backgroundShells: null });
+
+    activateOwnedActivity();
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    assert.equal(ownedActivitySnapshot().backgroundTasks, 1,
+      "the replayed registration's resync re-acquires the in-flight run");
+    assert.equal(activeActivitySnapshot().activeTasks, 1, "activity recovers too");
+
+    endOwnedReviewActivity(run);
+    assert.equal(ownedActivitySnapshot().backgroundTasks, 0);
+    assert.equal(activeActivitySnapshot().activeTasks, 0);
+  });
+
+  it("recovers a deliberately stale registry from the review source's own inventory", async () => {
+    activateOwnedActivity();
+    registerOwnedActivitySource(TASKS, "execution");
+    registerReviewActivitySource();
+    const run = beginOwnedReviewActivity();
+    assert.equal(activeActivitySnapshot().activeTasks, 1);
+
+    // The registry telemetry diverges from the source's own state: the review
+    // module still knows its in-flight run, but the registry is uncertain.
+    assert.ok(ownedActivityTest.markCurrentSourceIntentUncertainForTests(TASKS, "review"),
+      "the exact current incarnation is marked uncertain");
+    assert.equal(activeActivitySnapshot().activeTasks, null, "the stale registry publishes unknown");
+
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "the pass recovers the exact nonzero value from the source's own state");
+
+    endOwnedReviewActivity(run);
+    assert.equal(activeActivitySnapshot().activeTasks, 0);
+  });
+
+  it("replaces obsolete tokens with the source's exact inventory on a complete refresh", async () => {
+    activateOwnedActivity();
+    registerOwnedActivitySource(TASKS, "execution");
+    registerOwnedActivitySource(TASKS, "review");
+    const shell = registerOwnedActivitySource(SHELLS, "background-shell", {
+      refreshActivity: () => ({ status: "complete", intentTokens: new Set(["job-real"]) }),
+    });
+    shell.acquireIntent("job-stale");
+    shell.markIntentUncertain();
+    assert.equal(activeActivitySnapshot().activeShells, null);
+
+    await refreshOwnedActivityIntent();
+    assert.equal(activeActivitySnapshot().activeShells, 1,
+      "the exact current inventory replaces the stale token");
+
+    shell.releaseIntent("job-real");
+    assert.equal(activeActivitySnapshot().activeShells, 0);
+  });
+
+  it("keeps an incomplete refresher unknown without retrying or fabricating zero", async () => {
+    activateOwnedActivity();
+    registerOwnedActivitySource(TASKS, "execution");
+    registerOwnedActivitySource(TASKS, "review");
+    const shell = registerOwnedActivitySource(SHELLS, "background-shell", {
+      refreshActivity: () => ({ status: "incomplete" }),
+    });
+    shell.markIntentUncertain();
+    assert.equal(activeActivitySnapshot().activeShells, null);
+
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    assert.equal(ownedActivityTest.ownedActivityIntentRefreshPassCount(), 1, "one coalesced pass");
+    assert.equal(activeActivitySnapshot().activeShells, null, "incomplete stays unknown, never zero");
+
+    // No retry loop: an incomplete result schedules nothing further.
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(ownedActivityTest.ownedActivityIntentRefreshPassCount(), 1, "no automatic retry");
+
+    shell.resolveIntentUncertainty();
+    assert.equal(activeActivitySnapshot().activeShells, 0);
+  });
+
+  it("coalesces uncertainty that appears mid-pass into exactly one follow-up pass", async () => {
+    activateOwnedActivity();
+    registerOwnedActivitySource(TASKS, "execution");
+    const review = registerOwnedActivitySource(TASKS, "review", {
+      refreshActivity: () => ({ status: "complete", intentTokens: new Set<string>() }),
+    });
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const shell = registerOwnedActivitySource(SHELLS, "background-shell", {
+      refreshActivity: async () => {
+        await firstGate;
+        return { status: "complete", intentTokens: new Set<string>() };
+      },
+    });
+    shell.markIntentUncertain();
+    const pass = refreshOwnedActivityIntent(); // explicit pass, in flight
+    review.markIntentUncertain(); // appears while the pass is in flight
+    releaseFirst();
+    await pass;
+    assert.equal(ownedActivityTest.ownedActivityIntentRefreshPassCount(), 1);
+    assert.equal(activeActivitySnapshot().activeShells, 0, "the first candidate recovered");
+    assert.equal(activeActivitySnapshot().activeTasks, null, "the mid-pass uncertainty is still unknown");
+
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    assert.equal(ownedActivityTest.ownedActivityIntentRefreshPassCount(), 2, "exactly one follow-up pass");
+    assert.equal(activeActivitySnapshot().activeTasks, 0, "the follow-up recovers the second source");
+  });
+
+  it("fences a stale refresh result when the incarnation is retired mid-pass", async () => {
+    activateOwnedActivity();
+    registerOwnedActivitySource(TASKS, "execution");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const older = registerOwnedActivitySource(TASKS, "review", {
+      refreshActivity: async () => {
+        await gate;
+        return { status: "complete", intentTokens: new Set(["run-old"]) };
+      },
+    });
+    older.acquireIntent("run-stale");
+    older.markIntentUncertain();
+    const pass = refreshOwnedActivityIntent();
+    // A newer incarnation supersedes the candidate before its result arrives.
+    registerOwnedActivitySource(TASKS, "review");
+    release();
+    await pass;
+    assert.equal(older.retired, true);
+    assert.equal(activeActivitySnapshot().activeTasks, null,
+      "the stale result is fenced: the retired candidate stays unknown");
+
+    older.releaseIntent("run-stale");
+    older.resolveIntentUncertainty();
+    assert.equal(activeActivitySnapshot().activeTasks, 0, "the retired incarnation settles through its own handle");
+  });
+
+  it("recovers activity when a throwing resync left the source incomplete", async () => {
+    activateOwnedActivity();
+    registerOwnedActivitySource(TASKS, "execution");
+    registerOwnedActivitySource(TASKS, "review");
+    const shell = registerOwnedActivitySource(SHELLS, "background-shell", {
+      resync: () => { throw new Error("source cannot prove its state"); },
+      refreshActivity: () => ({ status: "complete", intentTokens: new Set<string>() }),
+    });
+    assert.equal(ownedActivitySnapshot().backgroundShells, null, "ownership stays unknown");
+    assert.equal(activeActivitySnapshot().activeShells, null,
+      "a throwing resync marks the activity channel incomplete too — never a fabricated zero");
+
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    assert.equal(activeActivitySnapshot().activeShells, 0,
+      "the authoritative refresher re-establishes the exact zero");
+  });
+
+  it("revalidates each result immediately before applying it", async () => {
+    activateOwnedActivity();
+    registerOwnedActivitySource(TASKS, "execution");
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const review = registerOwnedActivitySource(TASKS, "review", {
+      refreshActivity: async () => {
+        await firstGate;
+        return { status: "complete", intentTokens: new Set<string>() };
+      },
+    });
+    let releaseSecond!: () => void;
+    const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    const shell = registerOwnedActivitySource(SHELLS, "background-shell", {
+      refreshActivity: async () => {
+        await secondGate;
+        return { status: "complete", intentTokens: new Set<string>() };
+      },
+    });
+    review.markIntentUncertain();
+    shell.markIntentUncertain();
+    const pass = refreshOwnedActivityIntent();
+    releaseFirst();
+    // Let the first worker finish its fence check (microtasks drain first).
+    await new Promise((resolve) => setImmediate(resolve));
+    // The first source acquires new work AFTER its result was fenced but
+    // BEFORE the apply loop runs (the second worker is still pending).
+    review.acquireIntent("run-late");
+    releaseSecond();
+    await pass;
+    assert.equal(activeActivitySnapshot().activeShells, 0, "the second source's fresh result applies");
+    assert.equal(activeActivitySnapshot().activeTasks, null,
+      "the first source's stale result is revalidated at apply time and rejected");
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "the follow-up pass recovers the changed source from its own inventory");
+  });
+
+  it("schedules a follow-up when new uncertainty arrives during an auto-scheduled pass", async () => {
+    activateOwnedActivity();
+    registerOwnedActivitySource(TASKS, "execution");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const shell = registerOwnedActivitySource(SHELLS, "background-shell", {
+      refreshActivity: async () => {
+        await gate;
+        return { status: "complete", intentTokens: new Set<string>() };
+      },
+    });
+    shell.markIntentUncertain(); // schedules the coalesced pass
+    // Let the auto-scheduled pass start; it blocks on the gate.
+    await new Promise((resolve) => setImmediate(resolve));
+    const review = registerOwnedActivitySource(TASKS, "review", {
+      refreshActivity: () => ({ status: "complete", intentTokens: new Set<string>() }),
+    });
+    review.markIntentUncertain(); // arrives while the pass is in flight
+    release();
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    assert.equal(ownedActivityTest.ownedActivityIntentRefreshPassCount(), 2, "exactly one follow-up pass");
+    assert.equal(activeActivitySnapshot().activeShells, 0);
+    assert.equal(activeActivitySnapshot().activeTasks, 0, "the mid-pass uncertainty is recovered");
+  });
+
+  it("recovers a source registered uncertain while a pass is in flight", async () => {
+    activateOwnedActivity();
+    registerOwnedActivitySource(TASKS, "execution");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const shell = registerOwnedActivitySource(SHELLS, "background-shell", {
+      refreshActivity: async () => {
+        await gate;
+        return { status: "complete", intentTokens: new Set<string>() };
+      },
+    });
+    shell.markIntentUncertain();
+    await new Promise((resolve) => setImmediate(resolve)); // pass now in flight, blocked
+    registerOwnedActivitySource(TASKS, "review", {
+      intentUncertain: true,
+      refreshActivity: () => ({ status: "complete", intentTokens: new Set<string>() }),
+    });
+    release();
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    assert.equal(ownedActivityTest.ownedActivityIntentRefreshPassCount(), 2, "exactly one follow-up pass");
+    assert.equal(activeActivitySnapshot().activeTasks, 0, "the mid-pass registration is recovered");
+  });
+
+  it("recovers a retired source's retained uncertain inventory through its own refresher", async () => {
+    activateOwnedActivity();
+    registerOwnedActivitySource(TASKS, "execution");
+    const older = registerOwnedActivitySource(TASKS, "review", {
+      refreshActivity: () => ({ status: "complete", intentTokens: new Set(["run-retained"]) }),
+    });
+    older.acquireIntent("run-retained");
+    older.markIntentUncertain();
+    // Source replacement retires the uncertain incarnation; its retained work is
+    // only provable by its own source state, never by the newer source's emptiness.
+    registerOwnedActivitySource(TASKS, "review");
+    assert.equal(activeActivitySnapshot().activeTasks, null,
+      "retired uncertainty keeps the category unknown");
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "the retired incarnation's exact inventory is recovered through its own refresher");
+    older.releaseIntent("run-retained");
+    assert.equal(activeActivitySnapshot().activeTasks, 0, "later settlement releases the retained token");
+  });
+
+  it("awaits an already-running refresh pass before returning", async () => {
+    activateOwnedActivity();
+    registerOwnedActivitySource(TASKS, "execution");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const shell = registerOwnedActivitySource(SHELLS, "background-shell", {
+      refreshActivity: async () => {
+        await gate;
+        return { status: "complete", intentTokens: new Set<string>() };
+      },
+    });
+    shell.markIntentUncertain();
+    await new Promise((resolve) => setImmediate(resolve)); // auto-scheduled pass in flight, blocked
+    const pass = refreshOwnedActivityIntent(); // must coalesce onto the in-flight pass
+    assert.equal(activeActivitySnapshot().activeShells, null, "still unknown while blocked");
+    release();
+    await pass;
+    assert.equal(activeActivitySnapshot().activeShells, 0, "the awaited pass settled before returning");
+  });
+
+  it("retains an older pre-opt-in incarnation's work when a newer same-name source registers", async () => {
+    // The older incarnation holds real work in its own state: its resync
+    // re-acquires the token and its refresher proves the exact inventory.
+    const oldWork = "old-work";
+    let older: OwnedActivitySourceHandle | undefined;
+    older = registerOwnedActivitySource(TASKS, "execution", {
+      resync: () => { older?.acquireIntent(oldWork); },
+      refreshActivity: () => ({ status: "complete", intentTokens: new Set([oldWork]) }),
+    } as unknown as Parameters<typeof registerOwnedActivitySource>[2]);
+    // A newer same-name incarnation with an authoritatively empty inventory.
+    registerOwnedActivitySource(TASKS, "execution", {
+      refreshActivity: () => ({ status: "complete", intentTokens: new Set<string>() }),
+    });
+    registerReviewActivitySource();
+
+    activateOwnedActivity();
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    assert.equal(activeActivitySnapshot().activeTasks, 1,
+      "the older incarnation's held work survives the newer empty registration");
+  });
+
+  it("keeps older incomplete pre-opt-in evidence unknown despite a newer empty same-name source", async () => {
+    // The older incarnation cannot prove its inventory.
+    registerOwnedActivitySource(TASKS, "execution", {
+      refreshActivity: () => ({ status: "incomplete" }),
+    });
+    // A newer same-name incarnation that is authoritatively empty.
+    registerOwnedActivitySource(TASKS, "execution", {
+      refreshActivity: () => ({ status: "complete", intentTokens: new Set<string>() }),
+    });
+    registerReviewActivitySource();
+
+    activateOwnedActivity();
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    assert.equal(activeActivitySnapshot().activeTasks, null,
+      "newer emptiness is not proof that the older incarnation's work is absent");
+  });
+
+  it("replays resync after every install so no intermediate observation reports zero", async () => {
+    // A source that starts empty and whose resync establishes busy work.
+    let handle: OwnedActivitySourceHandle | undefined;
+    handle = registerOwnedActivitySource(TASKS, "execution", {
+      resync: () => { handle?.acquireIntent("busy-work"); },
+      refreshActivity: () => ({ status: "complete", intentTokens: new Set(["busy-work"]) }),
+    } as unknown as Parameters<typeof registerOwnedActivitySource>[2]);
+    registerReviewActivitySource();
+
+    activateOwnedActivity();
+    // Production-timing subscriber: the reporter subscribes right after
+    // activation, before the coalesced pass runs.
+    const observed: Array<number | null> = [];
+    const unsubscribe = subscribeOwnedActivity(() => { observed.push(activeActivitySnapshot().activeTasks); });
+    await ownedActivityTest.settleOwnedActivityIntentRefreshForTests();
+    unsubscribe();
+    assert.equal(activeActivitySnapshot().activeTasks, 1, "the resynced busy work is known");
+    assert.ok(!observed.includes(0),
+      `no observation may report zero: ${JSON.stringify(observed)}`);
   });
 });

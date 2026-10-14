@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.159]
+
+### Fixed
+
+- Loaded sidebar sessions re-establish truthful current activity from fresh,
+  exact owning-source observations at startup/restore and event-driven recovery
+  points (#382). Stale unknown telemetry can recover to idle/zero or actual
+  running/nonzero work without a new prompt, task, or manual refresh. Source
+  initialization and replacement no longer leave avoidable uncertainty sticky;
+  incomplete observations remain unknown and stale replies are rejected.
+  Ephemeral activity reconstruction leaves durable records, cleanup ownership,
+  cancellation, and stop/remove settlement safeguards unchanged. No polling,
+  blanket zero fallback, or Pi compatibility-floor change is added.
+
 ## [0.1.0-dev.158]
 
 ### Tests

@@ -527,6 +527,15 @@ recovery artifacts reads zero (or unknown when the stop itself is unproven). The
 separate conservative **ownership** state still gates an idle-only stop or removal; it
 is deliberately not displayed. Missing, invalid, or pre-intent observations stay
 unknown, never inferred zero and never silently substituted with an ownership count.
+Loaded sessions automatically re-establish activity from fresh, complete observations
+of their exact owning sources at startup/restore and safe event-driven resynchronization
+points. Deliberately stale or unknown activity can recover to the actual idle/zero or
+running/nonzero state without a prompt, new task, or manual refresh. A Ready label is
+not proof of idleness: unavailable or incomplete source observations remain unknown,
+and stale source/session observations cannot replace a current incarnation's state.
+This refresh reconstructs ephemeral activity only; it does not clear cleanup ownership,
+delete recovery records, resume work, or weaken stop/remove safeguards. It adds no
+periodic polling.
 After a same-process extension reload, each existing authenticated `session_start` may
 make one bounded read-only pass over its snapshot of eligible retired execution
 controllers whose exact association inventories were sealed by completed detaches. Each

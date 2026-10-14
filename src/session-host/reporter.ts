@@ -47,6 +47,7 @@ import {
   activateOwnedActivity,
   activeActivitySnapshot,
   ownedActivitySnapshot,
+  refreshOwnedActivityIntent,
   reconcileRetiredExecutionActivity,
   subscribeOwnedActivity,
 } from "./owned-activity";
@@ -919,6 +920,12 @@ function createReporter(
     candidate.on("connect", () => {
       if (generation !== sessionGeneration || !active || candidate !== socket) return; // Stale callback.
       connecting = false;
+      // A safe reconnect re-establishes transport: request ONE coalesced
+      // authoritative activity refresh so a diverged or unknown loaded status
+      // recovers from each owning source's own state, instead of republishing
+      // only this reporter's possibly stale local snapshot. The pass is a no-op
+      // while every source is already complete and known.
+      void refreshOwnedActivityIntent();
       // The retry budget is NOT reset here: an accept-then-close broker must
       // not mint fresh attempts forever. installSession resets it instead.
       candidate.setTimeout(0);
@@ -1766,6 +1773,12 @@ function createReporter(
       // this awaited, read-only census completes before its ordinary
       // restoreAssociations hook can detach/rebuild controller state.
       await reconcileRetiredExecutionActivity();
+      // One bounded coalesced pass over every current source that is still
+      // intent-uncertain: each refresher returns its complete exact activity
+      // tokens or incomplete, so a deliberately stale/unknown loaded status
+      // recovers to the actual idle/zero or running/nonzero value at startup
+      // without polling, manual refresh, a new prompt, or a new task.
+      await refreshOwnedActivityIntent();
     } catch {
       // Telemetry recovery/reporting never changes native session startup.
     }

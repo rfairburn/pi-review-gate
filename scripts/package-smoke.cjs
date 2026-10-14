@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 "use strict";
 const assert = require("node:assert/strict");
-const { execFileSync } = require("node:child_process");
+const { execFileSync, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -350,6 +350,98 @@ function runSessionHostHelp(binPath) {
   return { status: 0, stdout };
 }
 
+/**
+ * Exercise the installed package's actual POSIX web-bin target with a
+ * hermetic DDGS environment and recording npm/node/python commands. The
+ * wrappers themselves are the packed production files; no launcher logic is
+ * duplicated in this fixture, no live provisioning/search occurs, and the
+ * owned root is removed only after spawnSync has settled the child.
+ */
+function smokeInstalledWebLauncher(installed) {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "pi-review-web-package-bin-"));
+  try {
+    const bin = path.join(fixture, "bin");
+    const capture = path.join(fixture, "capture");
+    const venv = path.join(fixture, "ddgs-venv");
+    fs.mkdirSync(bin, { recursive: true });
+    fs.mkdirSync(capture, { recursive: true });
+    fs.mkdirSync(path.join(venv, "bin"), { recursive: true });
+
+    const python = path.join(venv, "bin", "python");
+    fs.writeFileSync(python, [
+      "#!/bin/bash",
+      "{ printf '%s\\t' \"$@\"; printf '\\n'; } >> \"$CAPTURE_DIR/python-calls\"",
+      '[[ "$1" == "-I" && "$2" == "-c" && "$4" == "9.16.0" ]] && exit 0',
+      '[[ "$1" == "-I" && "$2" == "-m" && "$3" == "pip" && "$4" == "check" ]] && exit 0',
+      "exit 97",
+      "",
+    ].join("\n"));
+    fs.chmodSync(python, 0o755);
+
+    const npm = path.join(bin, "npm");
+    fs.writeFileSync(npm, "#!/bin/bash\nprintf called > \"$CAPTURE_DIR/npm-called\"\nexit 98\n");
+    fs.chmodSync(npm, 0o755);
+    const python3 = path.join(bin, "python3");
+    fs.writeFileSync(python3, "#!/bin/bash\nprintf called > \"$CAPTURE_DIR/python3-called\"\nexit 99\n");
+    fs.chmodSync(python3, 0o755);
+
+    const node = path.join(bin, "node");
+    fs.writeFileSync(node, [
+      `#!${process.execPath}`,
+      '"use strict";',
+      'const fs = require("node:fs");',
+      'const path = require("node:path");',
+      'const args = process.argv.slice(2);',
+      'fs.writeFileSync(path.join(process.env.CAPTURE_DIR, "node.json"), JSON.stringify({',
+      '  args,',
+      '  cliExists: fs.existsSync(args[0]),',
+      '  ddgsPython: process.env.PI_REVIEW_GATE_DDGS_PYTHON,',
+      '}));',
+      'process.exit(23);',
+      "",
+    ].join("\n"));
+    fs.chmodSync(node, 0o755);
+
+    const args = ["--package-smoke", "two words", "", "semi;colon", "--", "-x"];
+    const result = spawnSync(path.join(installed, "scripts", "pi-review-web.sh"), args, {
+      cwd: fixture,
+      env: {
+        HOME: fixture,
+        TMPDIR: fixture,
+        XDG_CACHE_HOME: path.join(fixture, "cache"),
+        PATH: `${bin}${path.delimiter}/usr/bin:/bin`,
+        CAPTURE_DIR: capture,
+        PI_REVIEW_GATE_DDGS_VENV: venv,
+        PI_REVIEW_GATE_DDGS_PYTHON: "/inherited/incorrect/python",
+      },
+      encoding: "utf8",
+      timeout: 20_000,
+      maxBuffer: 256 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    assert.ifError(result.error);
+    assert.equal(result.signal, null, `installed web launcher was signaled: ${result.stderr}`);
+    assert.equal(result.status, 23, `installed web launcher must preserve the CLI status: ${result.stderr}`);
+    const invocation = JSON.parse(fs.readFileSync(path.join(capture, "node.json"), "utf8"));
+    assert.deepEqual(invocation.args, [path.join(installed, "dist", "src", "web", "cli.js"), ...args]);
+    assert.equal(invocation.cliExists, true, "the installed CLI must be the actual Node entry path");
+    assert.equal(invocation.ddgsPython, python, "the installed helper must export its validated interpreter");
+    assert.ok(!fs.existsSync(path.join(capture, "npm-called")), "the source-less installed package must not build");
+    assert.ok(!fs.existsSync(path.join(capture, "python3-called")), "an existing valid venv must not be recreated");
+
+    const pythonCalls = fs.readFileSync(path.join(capture, "python-calls"), "utf8")
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => line.split("\t"));
+    assert.equal(pythonCalls.length, 4, "the actual helper must run both validation passes and their pip checks");
+    assert.ok(pythonCalls.every((call) => call[0] === "-I"), "all packaged helper invocations must use isolated mode");
+    assert.equal(pythonCalls.filter((call) => call[1] === "-c" && call[3] === "9.16.0").length, 2, "both DDGS validation passes must retain the version pin");
+    assert.equal(pythonCalls.filter((call) => call[1] === "-m" && call[2] === "pip" && call[3] === "check").length, 2);
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+}
+
 function runPackageSmoke(scratch) {
   const cache = path.join(scratch, "npm-cache");
   // Stage the packaged inputs in scratch so the smoke never depends on (or
@@ -414,8 +506,13 @@ function runPackageSmoke(scratch) {
     stdio: "pipe",
   });
   const installed = path.join(consumer, "node_modules", "pi-review-gate");
+  assert.ok(
+    !fs.existsSync(path.join(installed, "src", "web", "cli.ts")),
+    "the installed package fixture must exercise the source-less packaged branch",
+  );
   for (const required of [
     "dist/src/index.js",
+    "dist/src/web/cli.js",
     "scripts/pi-review-gate.sh",
     // Native Windows entry point and its Node helper (issue 108): shipped so
     // the .cmd launcher works from an npm installation without Bash/WSL,
@@ -424,6 +521,7 @@ function runPackageSmoke(scratch) {
     "scripts/pi-review-gate-launcher.cjs",
     "scripts/ensure-ddgs.sh",
     "scripts/ddgs-search.py",
+    "scripts/pi-review-web.sh",
     "scripts/orchestrator-system-prompt.md",
     "scripts/execution-system-prompt.md",
     "scripts/planning-system-prompt.md",
@@ -488,6 +586,10 @@ function runPackageSmoke(scratch) {
   );
   fs.accessSync(path.join(consumer, "node_modules", ".bin", "pi-review-gate"), fs.constants.X_OK);
   fs.accessSync(path.join(consumer, "node_modules", ".bin", "pi-review-gate-cmd"), fs.constants.X_OK);
+  fs.accessSync(path.join(consumer, "node_modules", ".bin", "pi-review-web"), fs.constants.X_OK);
+  const installedManifest = JSON.parse(fs.readFileSync(path.join(installed, "package.json"), "utf8"));
+  assert.equal(installedManifest.bin && installedManifest.bin["pi-review-web"], "scripts/pi-review-web.sh");
+  smokeInstalledWebLauncher(installed);
   // Optional session host (#323): exact bin metadata, executable consumer
   // shim, side-effect-free --help, derived compiled-module shipment, and
   // fresh-consumer runtime loads with a lazy optional PTY. No normal host

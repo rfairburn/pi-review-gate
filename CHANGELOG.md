@@ -15,6 +15,27 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.157]
+
+### Fixed
+
+- An in-place task whose terminal `result.json` publication failed (leaving no
+  stored result after the executor had already run and written) is now
+  recoverable by an explicit continuation instead of failing before dispatch on
+  the write-once launch baseline (#253). A continuation without a stored result
+  reuses and verifies the retained original baseline — integrity, task, and
+  workspace-root checks unchanged — and recovers the executor session and the
+  next monotonic turn number from the durable operation record, resuming the
+  session only while the existing selection/fingerprint compatibility checks
+  pass; a missing or incompatible session falls back to a disclosed fresh
+  session in the same workspace. A missing launch baseline is proof of first
+  dispatch only when the durable operation record retains no prior execution —
+  after recorded execution it fails closed instead of re-baselining over an
+  already-modified workspace — and corrupt, foreign-task, mis-rooted, and
+  failed-critical retained state still fails closed. The recorded delta
+  keeps pre-fault writes against the original baseline; no automatic retry,
+  new marker, or publication-policy change.
+
 ## [0.1.0-dev.156]
 
 ### Tests

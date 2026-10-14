@@ -6,7 +6,8 @@
 // path, and subtask-tool exclusion from the child catalog). Execute/research
 // behavior stays covered by its existing suites and is unchanged here.
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, readFile, rmdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -29,6 +30,7 @@ import {
   type InPlaceWorkerResult,
 } from "../src/execution/inplace-worker";
 import { normalizeConfig, resolvedExecutorPool, type ReviewGateConfig } from "../src/config";
+import { createOperationRecord, writeOperationRecord } from "../src/execution/operation-record";
 import type { ExecutorAdapter } from "../src/execution/types";
 import { ExecutionToolManager } from "../src/execution/tool";
 import { createState } from "../src/state";
@@ -1794,6 +1796,452 @@ test("an aborted in-place turn whose started child never reports a verified exit
     assert.equal(operation.owner?.status, "active");
     assert.equal(operation.owner?.childPid, 900310);
     assert.equal(operation.owner?.childExitedAt, undefined);
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+// ── #253: terminal result.json publication failure and explicit continuation ──
+
+/** Executor that logs every invocation (operation/turn/session) to a JSONL
+ *  file; the start turn writes the payload and waits at a gate, and later
+ *  turns append to it. The reported session id is fixed so resumption of the
+ *  retained session is observable through PI_REVIEW_EXECUTOR_SESSION_ID. */
+async function writePublicationFailureExecutor(scratch: string, log: string, payload: string, gate: string): Promise<string> {
+  const script = join(scratch, "inplace-pubfail-executor.cjs");
+  await writeFile(script, [
+    "#!/usr/bin/env node",
+    "const fs=require('node:fs');let prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>prompt+=c);",
+    "process.stdin.on('end',()=>{",
+    "const op=process.env.PI_REVIEW_EXECUTOR_OPERATION;const turn=Number(process.env.PI_REVIEW_EXECUTOR_TURN);",
+    `fs.appendFileSync(${JSON.stringify(log)},JSON.stringify({op,turn,sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID})+'\\n');`,
+    "const finish=()=>{",
+    "console.log(JSON.stringify({type:'session',sessionId:'inplace-253-session'}));",
+    "console.log(JSON.stringify({type:'assistant',text:`completed turn ${turn}`}));",
+    "};",
+    `if(op==='start'){fs.writeFileSync(${JSON.stringify(payload)},'pre-fault work\\n');`,
+    // Bounded gate wait: a setup failure that never releases the gate cannot
+    // leave this child alive indefinitely after the test's scratch removal.
+    `const startedAt=Date.now();const wait=()=>{if(fs.existsSync(${JSON.stringify(gate)}))finish();else if(Date.now()-startedAt>120000)process.exit(3);else setTimeout(wait,10);};wait();return;}`,
+    `fs.appendFileSync(${JSON.stringify(payload)},'continuation work\\n');finish();`,
+    "});",
+  ].join("\n"), "utf8");
+  await chmod(script, 0o755);
+  return script;
+}
+
+async function readPublicationFailureTurns(log: string): Promise<Array<{ op: string; turn: number; sessionId: string }>> {
+  if (!existsSync(log)) return [];
+  return (await readFile(log, "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
+
+/** Drive one in-place task to a terminal result.json publication failure:
+ *  the executor writes and stalls at a gate, the test pre-creates the
+ *  terminal artifact path as a directory (the owned fault seam), then
+ *  releases the gate so settlement rejects with EISDIR. Returns the failed
+ *  task's artifact dir and original baseline bytes. */
+async function driveToPublicationFailure(
+  scratch: string,
+  unique: string,
+): Promise<{
+  instance: BackgroundExecutionController;
+  executionId: string;
+  taskId: string;
+  workspace: string;
+  payload: string;
+  log: string;
+  artifacts: string;
+  baselineBefore: string;
+  cleanup: () => Promise<void>;
+}> {
+  const workspace = join(scratch, `workspace-${unique}`);
+  await mkdir(workspace, { recursive: true });
+  const payload = join(workspace, "made.txt");
+  const gate = join(scratch, `release-gate-${unique}`);
+  const log = join(scratch, `turns-${unique}.jsonl`);
+  const script = await writePublicationFailureExecutor(scratch, log, payload, gate);
+  const instance = new BackgroundExecutionController({
+    pi: { sendMessage: () => undefined },
+    config: inplaceExternalConfig({ script }),
+    state: createState(),
+    cwd: () => scratch,
+  });
+  try {
+    const started = await instance.start(
+      [{ title: `publication failure ${unique}`, instructions: "write made.txt in place", acceptanceCriteria: ["made.txt exists"] }],
+      "inplace",
+      workspace,
+    );
+    const taskId = instance.inspect(started.executionId).tasks[0]!.taskId;
+    // The executor wrote and stalled at the gate: the baseline is already
+    // persisted (the coordinator persists it before dispatch).
+    await waitForAsyncTrue(async () => {
+      try { return (await readFile(payload, "utf8")) === "pre-fault work\n"; } catch { return false; }
+    }, 15_000);
+    const artifacts = instance.inspect(started.executionId, taskId).tasks[0]!.artifactDir!;
+    const baselineBefore = await readFile(join(artifacts, INPLACE_BASELINE_FILE), "utf8");
+    // FAULT SEAM: the terminal publication target exists as a directory.
+    await mkdir(join(artifacts, "result.json"));
+    await writeFile(gate, "release\n", "utf8");
+    await waitFor(() => instance.inspect(started.executionId, taskId).tasks[0]?.state === "failed", 30_000);
+    return {
+      instance,
+      executionId: started.executionId,
+      taskId,
+      workspace,
+      payload,
+      log,
+      artifacts,
+      baselineBefore,
+      cleanup: async () => {
+        await instance.shutdown().catch(() => undefined);
+        await instance.detach().catch(() => undefined);
+      },
+    };
+  } catch (error) {
+    // Setup failed before the fault was released (or while driving it): settle
+    // the controller so the gated executor child cannot outlive the test's
+    // scratch removal, then rethrow for the caller's cleanup.
+    await instance.shutdown().catch(() => undefined);
+    await instance.detach().catch(() => undefined);
+    throw error;
+  }
+}
+
+async function assertPublicationFailureState(artifacts: string, payload: string): Promise<void> {
+  const operation = JSON.parse(await readFile(join(artifacts, "operation.json"), "utf8")) as {
+    state: string;
+    session?: { id?: string };
+    attempts: Array<{ turn: number; outcome?: string }>;
+  };
+  assert.equal(operation.state, "completed", "the executor turn completed before publication failed");
+  assert.equal(operation.session?.id, "inplace-253-session", "the operation record retained the executor session");
+  assert.deepEqual(operation.attempts.map((attempt) => attempt.turn), [1]);
+  assert.equal(await readFile(payload, "utf8"), "pre-fault work\n", "the pre-fault workspace write remains");
+}
+
+test("a terminal result.json publication failure leaves a recoverable task whose same-controller continuation resumes the retained baseline, session, and turn (#253)", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "pi-review-inplace-pubfail-"));
+  try {
+    const setup = await driveToPublicationFailure(scratch, "same");
+    try {
+      const failed = setup.instance.inspect(setup.executionId, setup.taskId).tasks[0]!;
+      assert.match(failed.error ?? "", /EISDIR/, "the terminal publication fault is the recorded failure");
+      assert.equal(failed.inplaceResult, undefined, "no stored result survived the publication failure");
+      assert.equal(failed.result, undefined);
+      await assertPublicationFailureState(setup.artifacts, setup.payload);
+
+      // Remove only the owned obstruction; the explicit continuation must now
+      // dispatch against the retained context instead of EEXIST.
+      await rmdir(join(setup.artifacts, "result.json"));
+      await continueWhenSettled(setup.instance, setup.executionId, {
+        instructions: "Finish the in-place work",
+        instructionId: "pubfail-cont-1",
+        actor: "user",
+      });
+      await waitFor(() => setup.instance.inspect(setup.executionId).tasks.every((task) => task.state === "reported"), 60_000);
+      const settled = setup.instance.inspect(setup.executionId, setup.taskId).tasks[0]!;
+      assert.equal(settled.inplaceResult?.session?.id, "inplace-253-session");
+      assert.equal(settled.inplaceResult?.lastExecutorTurn, 2);
+      const turns = await readPublicationFailureTurns(setup.log);
+      assert.deepEqual(turns.map((turn) => turn.turn), [1, 2], "the continuation dispatched the next monotonic turn, not a re-dispatched turn 1");
+      assert.equal(turns[1]!.op, "resume", "the retained operation session was resumed");
+      assert.equal(turns[1]!.sessionId, "inplace-253-session");
+      const resultJson = JSON.parse(await readFile(join(setup.artifacts, "result.json"), "utf8")) as {
+        status: string;
+        changedSinceLaunch: Array<{ status: string; path: string }>;
+      };
+      assert.equal(resultJson.status, "unreviewed");
+      assert.deepEqual(resultJson.changedSinceLaunch, [{ status: "added", path: "made.txt" }], "the pre-fault write is in the delta against the ORIGINAL baseline");
+      assert.equal(await readFile(join(setup.artifacts, INPLACE_BASELINE_FILE), "utf8"), setup.baselineBefore, "the original baseline bytes were reused, not re-captured");
+      assert.equal(await readFile(setup.payload, "utf8"), "pre-fault work\ncontinuation work\n");
+    } finally {
+      await setup.cleanup();
+    }
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test("a restored controller continues a terminal-publication-failure task against the retained baseline and session (#253)", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "pi-review-inplace-pubfail-restore-"));
+  let setup: Awaited<ReturnType<typeof driveToPublicationFailure>> | undefined;
+  let restored: BackgroundExecutionController | undefined;
+  try {
+    const driven = await driveToPublicationFailure(scratch, "restore");
+    setup = driven;
+    const failed = driven.instance.inspect(driven.executionId, driven.taskId).tasks[0]!;
+    assert.match(failed.error ?? "", /EISDIR/);
+    await assertPublicationFailureState(driven.artifacts, driven.payload);
+    // Remove the owned obstruction; the original controller's cleanup is owned
+    // by the finally block below so an assertion failure before restore cannot
+    // leak it.
+    await rmdir(join(driven.artifacts, "result.json"));
+    const associations = driven.instance.associations();
+    await driven.cleanup();
+    restored = new BackgroundExecutionController({
+      pi: { sendMessage: () => undefined },
+      config: inplaceExternalConfig({ script: join(scratch, "inplace-pubfail-executor.cjs") }),
+      state: createState(),
+      cwd: () => scratch,
+    });
+    await restored.restore(associations);
+    const restoredTask = restored!.inspect(driven.executionId, driven.taskId).tasks[0]!;
+    assert.equal(restoredTask.state, "failed", "the durable failure state is restored");
+    assert.equal(restoredTask.inplaceResult, undefined, "no stored result exists to restore");
+    await continueWhenSettled(restored!, driven.executionId, {
+      instructions: "Finish the in-place work after restart",
+      instructionId: "pubfail-cont-2",
+      actor: "user",
+    });
+    await waitFor(() => restored!.inspect(driven.executionId).tasks.every((task) => task.state === "reported"), 60_000);
+    const settled = restored!.inspect(driven.executionId, driven.taskId).tasks[0]!;
+    assert.equal(settled.inplaceResult?.session?.id, "inplace-253-session");
+    assert.equal(settled.inplaceResult?.lastExecutorTurn, 2);
+    const turns = await readPublicationFailureTurns(driven.log);
+    assert.deepEqual(turns.map((turn) => turn.turn), [1, 2], "the restored continuation dispatched the next monotonic turn");
+    assert.equal(turns[1]!.op, "resume", "the retained operation session was resumed after restore");
+    assert.equal(turns[1]!.sessionId, "inplace-253-session");
+    const resultJson = JSON.parse(await readFile(join(driven.artifacts, "result.json"), "utf8")) as {
+      status: string;
+      changedSinceLaunch: Array<{ status: string; path: string }>;
+    };
+    assert.equal(resultJson.status, "unreviewed");
+    assert.deepEqual(resultJson.changedSinceLaunch, [{ status: "added", path: "made.txt" }], "the pre-fault write is in the delta against the ORIGINAL baseline");
+    assert.equal(await readFile(join(driven.artifacts, INPLACE_BASELINE_FILE), "utf8"), driven.baselineBefore, "the original baseline bytes were reused after restore");
+    assert.equal(await readFile(driven.payload, "utf8"), "pre-fault work\ncontinuation work\n");
+  } finally {
+    await setup?.cleanup();
+    await restored?.shutdown().catch(() => undefined);
+    await restored?.detach().catch(() => undefined);
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test("an executor that still cannot recover after publication failure reports failure, not a successful settlement (#253)", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "pi-review-inplace-pubfail-unrecoverable-"));
+  try {
+    const setup = await driveToPublicationFailure(scratch, "unrecoverable");
+    try {
+      await rmdir(join(setup.artifacts, "result.json"));
+      // Replace only this test's executor after its initial process has settled.
+      // Keep the same configured command/path so the retained session is tried.
+      await writeFile(join(scratch, "inplace-pubfail-executor.cjs"), [
+        "const fs=require('node:fs');process.stdin.resume();process.stdin.on('end',()=>{",
+        `fs.appendFileSync(${JSON.stringify(setup.log)},JSON.stringify({op:process.env.PI_REVIEW_EXECUTOR_OPERATION,turn:Number(process.env.PI_REVIEW_EXECUTOR_TURN),sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID})+'\\n');`,
+        "process.stderr.write('retained executor cannot recover\\n');process.exit(1);});",
+      ].join("\n"), "utf8");
+      await continueWhenSettled(setup.instance, setup.executionId, {
+        instructions: "Try to finish the retained work",
+        instructionId: "pubfail-unrecoverable-1",
+        actor: "user",
+      });
+      await waitFor(() => setup.instance.inspect(setup.executionId).tasks.every((task) => ["paused_recoverable", "failed", "reported"].includes(task.state)), 60_000);
+      const stopped = setup.instance.inspect(setup.executionId, setup.taskId).tasks[0]!;
+      assert.equal(stopped.state, "paused_recoverable", "a failed recovery attempt is not reported as completion");
+      assert.equal(stopped.inplaceResult?.status, "executor_error");
+      assert.ok(stopped.error, "the executor failure is disclosed");
+      assert.equal(stopped.result, undefined, "no successful task result is fabricated");
+      const turns = await readPublicationFailureTurns(setup.log);
+      assert.ok(turns.length >= 2, "continuation actually attempted execution");
+      assert.equal(turns[1]!.op, "resume");
+      assert.equal(turns[1]!.turn, 2);
+      assert.equal(turns[1]!.sessionId, "inplace-253-session");
+      const resultJson = JSON.parse(await readFile(join(setup.artifacts, "result.json"), "utf8"));
+      assert.equal(resultJson.status, "executor_error");
+      assert.deepEqual(resultJson.changedSinceLaunch, [{ status: "added", path: "made.txt" }]);
+      assert.equal(await readFile(join(setup.artifacts, INPLACE_BASELINE_FILE), "utf8"), setup.baselineBefore);
+      assert.equal(await readFile(setup.payload, "utf8"), "pre-fault work\n");
+    } finally {
+      await setup.cleanup();
+    }
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test("a continuation after publication failure with the retained baseline removed refuses instead of re-baselining over prior execution (#253)", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "pi-review-inplace-pubfail-nobase-"));
+  try {
+    const setup = await driveToPublicationFailure(scratch, "nobase");
+    try {
+      // Remove the owned obstruction AND the retained baseline. The operation
+      // record still retains the completed turn and session, so capturing a
+      // fresh basis over the already-modified workspace must be refused.
+      await rmdir(join(setup.artifacts, "result.json"));
+      await rm(join(setup.artifacts, INPLACE_BASELINE_FILE));
+      await continueWhenSettled(setup.instance, setup.executionId, {
+        instructions: "Finish the in-place work",
+        instructionId: "pubfail-nobase-1",
+        actor: "user",
+      });
+      await waitFor(() => setup.instance.inspect(setup.executionId).tasks.every((task) => task.state === "failed" || task.state === "reported"), 60_000);
+      const settled = setup.instance.inspect(setup.executionId, setup.taskId).tasks[0]!;
+      assert.equal(settled.state, "failed", "the missing-baseline refusal settles the continuation as failed");
+      assert.match(settled.error ?? "", /continuation refused/, "the refusal names the missing launch baseline");
+      const turns = await readPublicationFailureTurns(setup.log);
+      assert.deepEqual(turns.map((turn) => turn.turn), [1], "no second dispatch after the missing-baseline refusal");
+      await assert.rejects(stat(join(setup.artifacts, INPLACE_BASELINE_FILE)), { code: "ENOENT" }, "no replacement baseline was captured");
+    } finally {
+      await setup.cleanup();
+    }
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test("a continuation without a stored result fails closed on corrupt, foreign-task, or mis-rooted baselines and failed_critical operations, and discloses a fresh session when no operation context remains (#253)", async () => {
+  // Realpath the scratch root: the lifecycle resolves its artifact dir to a
+  // real path, and the operation record's identity check is lexical.
+  const scratch = await realpath(await mkdtemp(join(tmpdir(), "pi-review-inplace-pubfail-closed-")));
+  const config = inplaceExternalConfig({ script: "unused" });
+  const entry = resolvedExecutorPool(config)[0];
+  assert.ok(entry);
+  const task = { title: "recovered continuation", instructions: "finish the work", acceptanceCriteria: ["the work is finished"] };
+  try {
+    // Corrupt baseline document: the verifier cannot read it, so the
+    // continuation refuses instead of re-capturing over it.
+    const corruptWorkspace = join(scratch, "corrupt-workspace");
+    const corruptArtifacts = join(scratch, "corrupt-artifacts");
+    await mkdir(corruptWorkspace, { recursive: true });
+    await mkdir(corruptArtifacts, { recursive: true });
+    await writeFile(join(corruptArtifacts, INPLACE_BASELINE_FILE), "not a baseline document", "utf8");
+    await assert.rejects(
+      runInplaceLifecycle({
+        taskId: "task-corrupt",
+        task,
+        workspaceRoot: corruptWorkspace,
+        artifactDir: corruptArtifacts,
+        config,
+        executorAssignment: { entry, priority: 0 },
+        continuation: { instructions: "finish" },
+      }),
+      /could not be read/,
+      "a corrupt retained baseline fails closed",
+    );
+
+    // Foreign-task baseline: the integrity/task verifier refuses it.
+    const foreignWorkspace = join(scratch, "foreign-workspace");
+    const foreignArtifacts = join(scratch, "foreign-artifacts");
+    await mkdir(foreignWorkspace, { recursive: true });
+    await mkdir(foreignArtifacts, { recursive: true });
+    await writeFile(join(foreignWorkspace, "seed.txt"), "seed\n", "utf8");
+    const foreignBaseline = await createInPlaceBaseline(foreignWorkspace, config);
+    await persistInPlaceBaseline(foreignBaseline, "task-OTHER", foreignArtifacts);
+    await assert.rejects(
+      runInplaceLifecycle({
+        taskId: "task-foreign",
+        task,
+        workspaceRoot: foreignWorkspace,
+        artifactDir: foreignArtifacts,
+        config,
+        executorAssignment: { entry, priority: 0 },
+        continuation: { instructions: "finish" },
+      }),
+      /malformed or tampered/,
+      "a foreign-task retained baseline fails closed",
+    );
+
+    // Mis-rooted baseline: the document names a different workspace root.
+    const misrootWorkspace = join(scratch, "misroot-workspace");
+    const misrootOther = join(scratch, "misroot-other");
+    const misrootArtifacts = join(scratch, "misroot-artifacts");
+    await mkdir(misrootWorkspace, { recursive: true });
+    await mkdir(misrootOther, { recursive: true });
+    await mkdir(misrootArtifacts, { recursive: true });
+    await writeFile(join(misrootOther, "seed.txt"), "seed\n", "utf8");
+    const misrootBaseline = await createInPlaceBaseline(misrootOther, config);
+    await persistInPlaceBaseline(misrootBaseline, "task-misroot", misrootArtifacts);
+    await assert.rejects(
+      runInplaceLifecycle({
+        taskId: "task-misroot",
+        task,
+        workspaceRoot: misrootWorkspace,
+        artifactDir: misrootArtifacts,
+        config,
+        executorAssignment: { entry, priority: 0 },
+        continuation: { instructions: "finish" },
+      }),
+      /names workspace/,
+      "a mis-rooted retained baseline fails closed",
+    );
+
+    // failed_critical operation: the existing dispatch-time guard refuses the
+    // continuation before any executor runs.
+    const criticalWorkspace = join(scratch, "critical-workspace");
+    const criticalArtifacts = join(scratch, "critical-artifacts");
+    await mkdir(criticalWorkspace, { recursive: true });
+    await mkdir(criticalArtifacts, { recursive: true });
+    await writeFile(join(criticalWorkspace, "seed.txt"), "seed\n", "utf8");
+    const criticalBaseline = await createInPlaceBaseline(criticalWorkspace, config);
+    await persistInPlaceBaseline(criticalBaseline, "task-critical", criticalArtifacts);
+    const criticalRecord = createOperationRecord({
+      waveId: "inplace",
+      taskId: "task-critical",
+      title: task.title,
+      worktreeRoot: criticalWorkspace,
+      effectiveCwd: criticalWorkspace,
+      artifactDir: criticalArtifacts,
+      retryBudget: 3,
+    });
+    criticalRecord.state = "failed_critical";
+    await writeOperationRecord(criticalRecord);
+    // The dispatch-time guard refuses before any executor runs; the lifecycle
+    // settles the refusal as an executor error (never a dispatched turn).
+    const criticalResult = await runInplaceLifecycle({
+      taskId: "task-critical",
+      task,
+      workspaceRoot: criticalWorkspace,
+      artifactDir: criticalArtifacts,
+      config,
+      executorAssignment: { entry, priority: 0 },
+      adapterFactory: () => {
+        throw new Error("no executor may run for a failed_critical operation");
+      },
+      continuation: { instructions: "finish" },
+    });
+    assert.equal(criticalResult.status, "executor_error");
+    assert.match(criticalResult.error ?? "", /fail-closed after an unverified process settlement/, "a failed_critical retained operation refuses the continuation");
+
+    // No baseline and no operation record: a genuinely first effective
+    // dispatch captures the basis now and runs a disclosed fresh session at
+    // turn 1 — never a resumed one.
+    const freshWorkspace = join(scratch, "fresh-workspace");
+    const freshArtifacts = join(scratch, "fresh-artifacts");
+    await mkdir(freshWorkspace, { recursive: true });
+    await mkdir(freshArtifacts, { recursive: true });
+    let observedSession: unknown;
+    let observedTurn: number | undefined;
+    const adapter: ExecutorAdapter = {
+      kind: "pi-model",
+      async run(request) {
+        observedSession = request.session;
+        observedTurn = request.turn;
+        return {
+          text: "completed with no changes",
+          session: { adapter: "pi-model", id: "fresh-253-session" },
+          stdoutPath: "",
+          stderrPath: "",
+          code: 0,
+          timedOut: false,
+          aborted: false,
+        };
+      },
+    };
+    const freshResult = await runInplaceLifecycle({
+      taskId: "task-fresh",
+      task,
+      workspaceRoot: freshWorkspace,
+      artifactDir: freshArtifacts,
+      config,
+      executorAssignment: { entry, priority: 0 },
+      adapterFactory: () => adapter,
+      continuation: { instructions: "finish" },
+    });
+    assert.equal(freshResult.status, "no_changes");
+    assert.equal(observedSession, undefined, "no retained session exists to resume; the fresh session is disclosed by the prompt path");
+    assert.equal(observedTurn, 1);
+    assert.ok(existsSync(join(freshArtifacts, INPLACE_BASELINE_FILE)), "the first effective dispatch captured and persisted the basis");
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }

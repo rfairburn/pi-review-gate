@@ -222,11 +222,22 @@ Attribution and review:
   the observed Git HEAD when the root is inside a repository (and nothing when it is
   not), and persists that launch baseline durably (write-once) in the task's artifact
   directory before any executor runs. Every continuation restores and verifies that
-  same basis — a persisted basis that is missing, malformed, fails its integrity check,
-  or is rooted elsewhere fails closed instead of silently re-baselining, so writes made
-  before a pause stay inside the original attribution window. This detects integrity
+  same basis — a persisted basis that is missing after prior execution, malformed,
+  fails its integrity check, or is rooted elsewhere fails closed instead of silently
+  re-baselining, so writes made before a pause stay inside the original attribution
+  window. This detects integrity
   mismatches; it is not a guarantee against a writer who can rewrite both the artifact
   and its integrity metadata.
+- When a terminal result was never stored (for example because its publication failed
+  after the executor ran), an explicit continuation still recovers from the durable
+  operation record: the retained executor session when it is compatible with the
+  current assignment, and the next monotonic turn number — always against the original
+  baseline. A missing or incompatible session falls back to a disclosed fresh session
+  in the same workspace; a failed critical operation still refuses continuation.
+- The missing-baseline refusal holds even when no stored result exists: after any
+  recorded prior execution, a missing launch baseline fails closed instead of
+  re-capturing over an already-modified workspace. Only a genuinely first effective
+  dispatch — no retained execution context and no baseline document — captures one.
 - A task's own reviewer reviews the content-anchored recorded delta of that workspace
   since launch — the same workspace-snapshot review scope direct orchestrator work would
   receive in that workspace — and follows the ordinary correction loop

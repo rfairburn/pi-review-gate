@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.158]
+
+### Tests
+
+- Test-only web launcher coverage (#246) invokes byte-for-byte copies of the
+  production `pi-review-web.sh` / `ensure-ddgs.sh` files in isolated fixtures and
+  smoke-tests the installed package wrapper/helper with controlled dependencies. It
+  pins source build ordering and status, packaged no-build behavior, exact argument
+  boundaries and CLI status, missing-CLI and provisioning fail-closed paths, and DDGS
+  creation/repair, version pin, isolated Python calls, and environment export. The
+  package smoke also runs the installed web-bin target against a controlled valid
+  venv. Production launchers and defaults are unchanged; these stubs do not prove
+  native DDGS installation, live search, or Windows behavior.
+
 ## [0.1.0-dev.157]
 
 ### Fixed

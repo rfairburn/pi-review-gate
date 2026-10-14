@@ -1,10 +1,13 @@
 import { createHash } from "node:crypto";
-import { join } from "node:path";
-import { resolveReviewers, type ReviewGateConfig } from "../../config";
+import { stat } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { executorAgentFingerprint, executorSelectionKey, resolveReviewers, type ReviewGateConfig } from "../../config";
 import { runReview, type ReviewRunOutput } from "../../review";
 import { hasPartialReviewerFailure } from "../../review-report";
 import { rememberFinalAssistantSummaryText } from "../../evidence";
-import type { SubtaskProgressUpdate } from "../types";
+import type { ExecutorPoolAssignment } from "../executor-pool";
+import { readOperationRecord } from "../operation-record";
+import type { ExecutorSession, SubtaskProgressUpdate } from "../types";
 import {
   buildReviewTransmission,
   createWorkerReviewState,
@@ -18,7 +21,7 @@ import {
   inPlaceDeltaIdentity,
   type InPlaceAttribution,
 } from "./basis";
-import { loadInPlaceBaseline, persistInPlaceBaseline } from "./baseline-store";
+import { INPLACE_BASELINE_FILE, loadInPlaceBaseline, persistInPlaceBaseline } from "./baseline-store";
 import type { InPlaceLifecycleInput, InPlaceLifecycleResult, InPlaceLifecycleStatus, InPlaceReviewCycle, InPlaceWorkerResult } from "./contracts";
 import { ensureArtifactDir } from "./containment";
 import { runInplaceTurnWorker } from "./adapter-workflow";
@@ -29,6 +32,69 @@ import { settleInPlace } from "./settlement";
 
 function reportLifecycleProgress(input: InPlaceLifecycleInput, update: Omit<SubtaskProgressUpdate, "subtaskId">): void {
   input.onUpdate?.({ subtaskId: input.taskId, ...update });
+}
+
+/**
+ * #253: recover retained continuation context from the durable operation
+ * record when no stored task result exists. A terminal publication failure
+ * (or any interruption between dispatch and settlement) leaves the executor's
+ * session and turn numbers only in that record. The existing selection/
+ * fingerprint compatibility checks decide whether the retained session is
+ * resumable against the current assignment; anything unverifiable falls to a
+ * disclosed fresh session. A missing or identity-mismatched record means no
+ * prior execution is verifiable — the caller's fresh-dispatch path applies.
+ * Dispatch-time protections (identity, failed_critical) stay in the turn
+ * worker; this read only recovers context.
+ */
+type InPlaceContinuationRecovery = {
+  session?: ExecutorSession;
+  lastExecutorTurn: number;
+  disclosure?: string;
+  /**
+   * True when the durable operation record retains evidence that an executor
+   * already ran for this task (attempts or a recorded session). A missing
+   * baseline is proof of first dispatch only when this is false; after
+   * recorded execution it must fail closed instead of re-baselining over an
+   * already-modified workspace.
+   */
+  hadPriorExecution: boolean;
+};
+
+async function recoverInPlaceContinuationContext(input: {
+  taskId: string;
+  artifactDir: string;
+  config: ReviewGateConfig;
+  assignment?: ExecutorPoolAssignment;
+}): Promise<InPlaceContinuationRecovery> {
+  const record = await readOperationRecord(join(input.artifactDir, "operation.json")).catch(() => undefined);
+  if (!record || record.taskId !== input.taskId || resolve(record.artifactDir) !== resolve(input.artifactDir)) {
+    return { lastExecutorTurn: 0, hadPriorExecution: false };
+  }
+  // Malformed attempt entries (no numeric turn) contribute nothing: the
+  // monotonic floor stays 0 and the next dispatch re-derives from what is
+  // verifiable rather than a NaN turn.
+  const lastExecutorTurn = record.attempts.reduce((max, attempt) => Math.max(max, typeof attempt.turn === "number" ? attempt.turn : 0), 0);
+  const hadPriorExecution = record.attempts.length > 0 || Boolean(record.session);
+  if (!record.session || !input.assignment) return { lastExecutorTurn, hadPriorExecution };
+  // Reuse the wave-worker session compatibility checks. This must precede
+  // beginInPlaceAssignment, which overwrites the record's selection and
+  // fingerprint with the current assignment at dispatch.
+  const priorSelection = record.executorSelection;
+  const selectionChanged = priorSelection !== undefined
+    && executorSelectionKey(priorSelection) !== executorSelectionKey(input.assignment.entry.selection);
+  const selectionUnrecorded = priorSelection === undefined;
+  const resolutionDrifted = !selectionChanged && !selectionUnrecorded
+    && priorSelection!.source === "external"
+    && (record.executorAgentFingerprint ?? "") !== executorAgentFingerprint(input.config, input.assignment.entry.selection);
+  if (!selectionChanged && !selectionUnrecorded && !resolutionDrifted) {
+    return { session: record.session, lastExecutorTurn, hadPriorExecution };
+  }
+  const disclosure = selectionChanged
+    ? "the current executor assignment differs from the one that created the retained session; starting a new session in the same workspace"
+    : selectionUnrecorded
+      ? "the prior executor assignment is not durably recorded, so the retained session cannot be verified against the current assignment; starting a new session in the same workspace"
+      : "the recorded executor agent no longer resolves to the adapter and model that created the previous session; starting a new session in the same workspace";
+  return { lastExecutorTurn, disclosure, hadPriorExecution };
 }
 
 // ── main in-place lifecycle ──────────────────────────────────────────────────
@@ -95,13 +161,36 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
   // a continuation with a prior turn must load and verify the original basis
   // and fails closed when that is impossible — writes made before a pause
   // remain part of the original attribution window instead of silently
-  // becoming the new baseline. A continuation without any prior turn is the
-  // task's first effective dispatch and captures the basis now.
+  // becoming the new baseline. A continuation without a stored result still
+  // reuses and verifies the retained original basis (#253: terminal
+  // publication can fail after the executor ran, leaving no stored result).
+  // A missing baseline is proof of first dispatch ONLY when the durable
+  // operation record retains no prior execution; after recorded execution it
+  // fails closed instead of re-baselining over an already-modified workspace.
+  let recoveredContinuation: InPlaceContinuationRecovery | undefined;
+  if (input.continuation && !input.initialResult) {
+    recoveredContinuation = await recoverInPlaceContinuationContext({
+      taskId,
+      artifactDir: resolvedArtifactDir,
+      config,
+      assignment: input.executorAssignment,
+    });
+  }
   const restoredBaseline = input.baseline ?? (
     input.continuation
-      ? (input.initialResult
+      ? (input.initialResult || recoveredContinuation?.hadPriorExecution
         ? await loadInPlaceBaseline(taskId, resolvedArtifactDir, workspaceRoot)
         : await (async () => {
+          let retained: "absent" | "present";
+          try {
+            await stat(join(resolvedArtifactDir, INPLACE_BASELINE_FILE));
+            retained = "present";
+          } catch (error) {
+            // Only ENOENT is absence; any other read failure fails closed.
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            retained = "absent";
+          }
+          if (retained === "present") return await loadInPlaceBaseline(taskId, resolvedArtifactDir, workspaceRoot);
           const captured = await createInPlaceBaseline(workspaceRoot, config, signal);
           await persistInPlaceBaseline(captured, taskId, resolvedArtifactDir);
           return captured;
@@ -155,12 +244,25 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
   // and is never treated as the continuation's outcome.
   if (input.continuation) {
     const prior = input.initialResult;
-    const priorSession = prior?.session;
-    const priorTurn = prior?.lastExecutorTurn ?? 0;
+    let priorSession = prior?.session;
+    let priorTurn = prior?.lastExecutorTurn ?? 0;
+    let recoveryDisclosure: string | undefined;
+    if (!prior) {
+      // #253: absence of a stored result is not proof that no prior execution
+      // happened — terminal publication can fail after the executor ran,
+      // leaving its session and turn numbers only in the durable operation
+      // record. The context was recovered above (before the baseline decision)
+      // so the continuation dispatches the next monotonic turn and resumes the
+      // retained session while it stays compatible; unverifiable context falls
+      // to the disclosed fresh-session path below.
+      priorSession = recoveredContinuation?.session;
+      priorTurn = recoveredContinuation?.lastExecutorTurn ?? 0;
+      recoveryDisclosure = recoveredContinuation?.disclosure;
+    }
     if (!priorSession) {
       reportLifecycleProgress(input, {
         phase: "correcting",
-        message: "no resumable executor session survived the prior run; dispatching the admitted continuation with a fresh session disclosure",
+        message: recoveryDisclosure ?? "no resumable executor session survived the prior run; dispatching the admitted continuation with a fresh session disclosure",
         artifactDir: resolvedArtifactDir,
       });
     } else if (prior && prior.status !== "completed") {

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -45,6 +45,35 @@ test("atomicWrite replaces target content, uses restrictive modes, and leaves no
     assert.deepEqual(await tempFiles(root), ["nested"], "no temp files may survive a successful write");
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("durable writers create missing parents at 0700 and never re-model an existing parent", { skip: process.platform === "win32" }, async () => {
+  // The 0700 request is masked by the process umask exactly like any other
+  // create, so the expectation is the requested mode under the running mask.
+  const createdDirMode = 0o700 & ~process.umask();
+  for (const write of [atomicWrite, atomicWriteExclusive]) {
+    const root = await tempDir(`durable-mkdir-${write === atomicWrite ? "replace" : "exclusive"}-`);
+    try {
+      const nested = join(root, "records", "nested");
+      await write(join(nested, "record.json"), "body\n");
+      assert.equal((await stat(join(root, "records"))).mode & 0o777, createdDirMode,
+        "a created parent directory must carry the restrictive 0700 request");
+      assert.equal((await stat(nested)).mode & 0o777, createdDirMode,
+        "every created level must carry the restrictive 0700 request");
+
+      // mkdir never tightens a directory that already exists: the writer must
+      // leave an existing parent's mode exactly as it found it.
+      const existing = join(root, "loose");
+      await mkdir(existing, { recursive: true, mode: 0o755 });
+      await chmod(existing, 0o755);
+      await write(join(existing, "record.json"), "body\n");
+      assert.equal((await stat(existing)).mode & 0o777, 0o755,
+        "an existing parent directory must not be re-modeled by a durable write");
+      assert.deepEqual(await tempFiles(root), ["loose", "records"], "no temp litter may survive");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   }
 });
 

@@ -103,6 +103,14 @@ Recovery manifests live in the wave root directory:
 The wave root is the parent of the private bare Git repository created during capture.
 Each manifest is scoped to a single transaction via a unique UUID.
 
+The wave root's own capture record — `<waveRoot>/capture.json`, reloaded by
+continuation, landing, and recovery — is published through the shared durable atomic
+writer: the complete record is staged in an owned same-directory temporary file,
+file-synced, and atomically renamed onto its final name before a successful capture
+returns, so a reader sees either the complete record or none. Directory sync stays
+best-effort, and a missing, truncated, mismatched, or unsupported record stays
+refused rather than repaired.
+
 ### Recovery API
 
 The `recoverLandingManifest(manifestPath)` function in `src/execution/wave-landing.ts`

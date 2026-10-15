@@ -20,6 +20,10 @@ import { dirname } from "node:path";
  * ownership of serialization and write ordering; this helper only strengthens
  * the durability of each individual write.
  *
+ * Staged files are created mode 0o600. A caller whose record already published
+ * with the filesystem's default mode opts in to `useDefaultFileMode` to keep
+ * publishing exactly that mode; callers that do not opt in are unaffected.
+ *
  * `atomicWriteExclusive` provides the same durability for exclusive-create
  * publication (atomic hard-link of fsynced staged content onto the final
  * target, e.g. lease acquisition).
@@ -50,6 +54,26 @@ export interface DurableWriteOptions {
    * collision never deletes a file this invocation does not own.
    */
   tempSuffixForTesting?: string;
+  /**
+   * Opt in to the filesystem's default file mode — `0o666` masked by the
+   * process umask, exactly what a plain `fs.writeFile` produces — instead of
+   * this helper's owner-only `0o600`. This exists only so a caller can keep
+   * publishing a record with the mode it already used; omitting it (every
+   * other caller) keeps the restrictive `0o600` default. The mode applies to
+   * the staged file, so the published target carries the same mode either way.
+   */
+  useDefaultFileMode?: boolean;
+}
+
+/** Owner-only staged-file mode unless a caller opts in to the default mode. */
+const DEFAULT_FILE_MODE = 0o600;
+
+/**
+ * Mode handed to the exclusive temp-file open. `undefined` makes the platform
+ * apply `0o666` masked by the process umask, matching a plain `fs.writeFile`.
+ */
+function stagedFileMode(options: DurableWriteOptions): number | undefined {
+  return options.useDefaultFileMode ? undefined : DEFAULT_FILE_MODE;
 }
 
 type GlobalFaultInjection = (stage: DurableWriteStage, path: string) => void | Promise<void>;
@@ -91,7 +115,7 @@ export async function atomicWrite(path: string, body: string, options: DurableWr
   // collision at the temp path belongs to someone else and must be preserved.
   let ownsTemp = false;
   try {
-    file = await open(temporary, "wx", 0o600);
+    file = await open(temporary, "wx", stagedFileMode(options));
     ownsTemp = true;
     await file.writeFile(body, "utf8");
     await runStage("after_temp_write", path, hooks, "afterTempWrite");
@@ -145,7 +169,7 @@ export async function atomicWriteExclusive(path: string, body: string, options: 
   // collision at the temp path belongs to someone else and must be preserved.
   let ownsTemp = false;
   try {
-    file = await open(temporary, "wx", 0o600);
+    file = await open(temporary, "wx", stagedFileMode(options));
     ownsTemp = true;
     await file.writeFile(body, "utf8");
     await runStage("after_temp_write", path, hooks, "afterTempWrite");

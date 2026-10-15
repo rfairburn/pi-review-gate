@@ -277,6 +277,83 @@ test("atomicWriteExclusive does not expose the final target before publication",
   }
 });
 
+test("durable writers keep 0600 by default and opt in to the filesystem default mode", async () => {
+  const root = await tempDir("durable-write-mode-");
+  try {
+    // A plain writeFile in the same directory pins the contract the opt-in must
+    // reproduce: 0o666 masked by the process umask.
+    const plain = join(root, "plain.json");
+    await writeFile(plain, "plain\n", "utf8");
+    const platformMode = (await stat(plain)).mode & 0o777;
+
+    // Callers that do not opt in are unchanged.
+    await atomicWrite(join(root, "default-rename.json"), "body\n");
+    await atomicWriteExclusive(join(root, "default-exclusive.json"), "body\n");
+    assert.equal((await stat(join(root, "default-rename.json"))).mode & 0o777, 0o600);
+    assert.equal((await stat(join(root, "default-exclusive.json"))).mode & 0o777, 0o600);
+
+    // The opt-in publishes the same mode a plain writeFile would have produced.
+    await atomicWrite(join(root, "optin-rename.json"), "body\n", { useDefaultFileMode: true });
+    await atomicWriteExclusive(join(root, "optin-exclusive.json"), "body\n", { useDefaultFileMode: true });
+    assert.equal((await stat(join(root, "optin-rename.json"))).mode & 0o777, platformMode);
+    assert.equal((await stat(join(root, "optin-exclusive.json"))).mode & 0o777, platformMode);
+    assert.deepEqual(
+      await tempFiles(root),
+      ["default-exclusive.json", "default-rename.json", "optin-exclusive.json", "optin-rename.json", "plain.json"],
+      "no staged temp name may survive either publication",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the default-mode opt-in keeps staged-name collision ownership intact", async () => {
+  const root = await tempDir("durable-write-default-mode-collision-");
+  try {
+    // The rename writer (capture's path): a pre-existing staged name is not
+    // this invocation's claim, so cleanup leaves it alone and the previous
+    // target bytes stay untouched.
+    const previousTarget = join(root, "capture.json");
+    await writeFile(previousTarget, "previous bytes\n", "utf8");
+    const renameTemp = `${previousTarget}.tmp.hostile-collision`;
+    await writeFile(renameTemp, "not ours\n", "utf8");
+    await assert.rejects(
+      atomicWrite(previousTarget, "replacement\n", { useDefaultFileMode: true, tempSuffixForTesting: "hostile-collision" }),
+      /EEXIST/,
+    );
+    assert.equal(await readFile(renameTemp, "utf8"), "not ours\n", "an unowned staged name must survive");
+    assert.equal(
+      await readFile(previousTarget, "utf8"),
+      "previous bytes\n",
+      "a failed publication must not touch the previous target bytes",
+    );
+
+    // The exclusive writer treats an unowned staged name the same way and keeps
+    // its absent final name absent.
+    const freshTarget = join(root, "fresh.json");
+    const exclusiveTemp = `${freshTarget}.tmp.hostile-collision`;
+    await writeFile(exclusiveTemp, "not ours either\n", "utf8");
+    await assert.rejects(
+      atomicWriteExclusive(freshTarget, "ours\n", { useDefaultFileMode: true, tempSuffixForTesting: "hostile-collision" }),
+      /EEXIST/,
+    );
+    assert.equal(await readFile(exclusiveTemp, "utf8"), "not ours either\n", "an unowned staged name must survive");
+    await assert.rejects(readFile(freshTarget, "utf8"), /ENOENT/, "a failed publication leaves no final record");
+
+    assert.deepEqual(
+      await tempFiles(root),
+      [
+        "capture.json",
+        "capture.json.tmp.hostile-collision",
+        "fresh.json.tmp.hostile-collision",
+      ],
+      "only positively owned staged names may be removed",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("acquireWaveOwner keeps exclusive claim semantics and cleans partial leases on failure", async () => {
   const root = await tempDir("durable-wave-acquire-");
   try {

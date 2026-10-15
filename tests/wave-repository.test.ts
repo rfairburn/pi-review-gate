@@ -1,15 +1,20 @@
 import assert from "node:assert/strict";
 import { execFile, execSync } from "node:child_process";
-import { access, chmod, mkdir, readFile, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, readdir, readFile, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
+import {
+  setDurableWriteFaultInjectionForTesting,
+  type DurableWriteStage,
+} from "../src/execution/durable-write";
 import {
   captureWaveBase as captureWaveBaseImpl,
   discoverWaveSource,
   enumerateWaveSourcePaths,
   pruneCompletedWaveRoots,
+  readWaveCaptureRecord,
   WaveCaptureError,
   type WaveCaptureOptions,
   type WaveEntry,
@@ -1829,5 +1834,329 @@ test("discoverWaveSource — inaccessible .git directory causes capture_failed, 
     );
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ── Durable atomic capture-record publication ───────────────────────────────
+// captureWaveBase must not report success before the recovery-critical capture
+// record is completely written and file-synced at its final name. These tests
+// drive the real capture entrypoint and observe or fail publication through the
+// shared durable-write seam (narrowed to the capture record by name), so no
+// fixture reimplements the writer. Injected faults exercise the production
+// code path's ordering and failure handling only; they are not crash, power-loss,
+// or native Windows evidence.
+
+/** Observe or fail capture-record publication through the shared durable-write seam. */
+function instrumentRecordPublication(
+  observe: (stage: DurableWriteStage, path: string) => void | Promise<void>,
+  failAt?: DurableWriteStage,
+): void {
+  setDurableWriteFaultInjectionForTesting(async (stage, path) => {
+    if (basename(path) !== "capture.json") return;
+    if (stage === failAt) throw new Error(`injected capture publication fault at ${stage}`);
+    await observe(stage, path);
+  });
+}
+
+/**
+ * Arm a Git source with one committed file. The directory is this helper's own
+ * setup, so a partially armed directory is removed before rethrowing.
+ */
+async function committedSource(dir: string): Promise<string> {
+  try {
+    await mkdir(dir);
+    await git(["init", "--quiet"], dir);
+    await writeFile(join(dir, "file.txt"), "content\n", "utf8");
+    await git(["add", "."], dir);
+    await git(["commit", "--quiet", "-m", "init"], dir);
+    return dir;
+  } catch (error) {
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+test("capture — the record is written, file-synced, and published before capture resolves", async () => {
+  const fixture = await mkTmp("pi-cb-publish-");
+  const stages: DurableWriteStage[] = [];
+  try {
+    const dir = await committedSource(join(fixture, "source"));
+    const artifactDir = join(fixture, "artifacts");
+    await mkdir(artifactDir);
+    instrumentRecordPublication(async (stage, path) => {
+      stages.push(stage);
+      if (stage === "before_rename") {
+        await assert.rejects(readFile(path, "utf8"), /ENOENT/,
+          "the record name is absent before the atomic rename on this fresh-root production path");
+      }
+    });
+
+    const capture = await captureWaveBase({
+      cwd: dir,
+      maxSnapshotBytes: 1_000_000,
+      waveId: "publish-contract",
+      artifactDir,
+      artifactTtlMs: 0,
+    });
+
+    assert.deepEqual(stages, [
+      "after_temp_write",
+      "after_file_sync",
+      "before_rename",
+      "after_rename",
+      "before_dir_sync",
+    ], "the record body is staged, file-synced, and renamed into place (then best-effort directory-synced) before success resolves");
+
+    const recordPath = join(capture.waveRoot, "capture.json");
+    const published = await readFile(recordPath, "utf8");
+    assert.equal(published, `${JSON.stringify(capture, null, 2)}\n`,
+      "the published bytes are the exact pretty record including its trailing newline");
+    const reloaded = await readWaveCaptureRecord(capture.waveRoot);
+    assert.deepEqual(reloaded, capture, "the real reader round-trips the published record exactly");
+    assert.equal(reloaded.baseCommit, capture.baseCommit);
+    assert.equal(reloaded.baseRef, capture.baseRef);
+    assert.deepEqual(reloaded.sourceIdentity, capture.sourceIdentity);
+    assert.equal(reloaded.rootWaveId, capture.waveId);
+    assert.equal(reloaded.continuationGeneration, 0);
+
+    const rootEntries = await readdir(capture.waveRoot);
+    assert.ok(rootEntries.includes("capture.json") && rootEntries.includes("wave-repo.git"));
+    assert.deepEqual(rootEntries.filter((name) => name.includes(".tmp.")), [],
+      "no staged capture-record name may survive a successful publication");
+  } finally {
+    setDurableWriteFaultInjectionForTesting(undefined);
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test("capture — the shared rename writer replaces the target name it publishes", async () => {
+  const fixture = await mkTmp("pi-cb-replace-");
+  try {
+    const dir = await committedSource(join(fixture, "source"));
+    const artifactDir = join(fixture, "artifacts");
+    await mkdir(artifactDir);
+    let publishedAtRename: string | undefined;
+    instrumentRecordPublication(async (stage, path) => {
+      if (stage === "before_rename") {
+        // This fixture owns the wave root, so it may plant a placeholder at the
+        // target name to observe the rename's replacement behavior.
+        await writeFile(path, "placeholder record\n", "utf8");
+      }
+      if (stage === "after_rename") publishedAtRename = await readFile(path, "utf8");
+    });
+
+    const capture = await captureWaveBase({
+      cwd: dir,
+      maxSnapshotBytes: 1_000_000,
+      waveId: "publish-replace",
+      artifactDir,
+      artifactTtlMs: 0,
+    });
+
+    assert.ok(publishedAtRename, "the after_rename stage must observe the published name");
+    assert.ok(publishedAtRename.startsWith('{\n  "waveId": "publish-replace"'),
+      "the rename replaces the target name's bytes with the complete record");
+    assert.ok(!publishedAtRename.includes("placeholder record"),
+      "the placeholder content is replaced rather than kept or appended");
+    assert.equal(await readFile(join(capture.waveRoot, "capture.json"), "utf8"),
+      `${JSON.stringify(capture, null, 2)}\n`);
+    // Scope of this pin: replacement of the target name's content behind a
+    // test-planted placeholder. Existing-inode, mode, hard-link, and symlink
+    // replacement behavior is not reachable on the legitimate fresh-root path
+    // and is deliberately not claimed here.
+  } finally {
+    setDurableWriteFaultInjectionForTesting(undefined);
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+for (const stage of ["after_temp_write", "after_file_sync", "before_rename"] as const) {
+  test(`capture — a ${stage} publication fault rejects truthfully and cleans the wave root`, async () => {
+    const fixture = await mkTmp("pi-cb-pubfault-");
+    try {
+      const dir = await committedSource(join(fixture, "source"));
+      const artifactDir = join(fixture, "artifacts");
+      await mkdir(artifactDir);
+      instrumentRecordPublication(() => undefined, stage);
+      await assert.rejects(
+        captureWaveBase({
+          cwd: dir,
+          maxSnapshotBytes: 1_000_000,
+          waveId: "pub-fault",
+          artifactDir,
+          artifactTtlMs: 0,
+          maxCaptureAttempts: 1,
+        }),
+        (error: unknown) => {
+          assert.match((error as Error).message, new RegExp(`injected capture publication fault at ${stage}`));
+          assert.ok(!(error instanceof WaveCaptureError),
+            "a publication failure propagates through the ordinary error path instead of being reclassified");
+          assert.ok(!/Workspace changed during capture/.test((error as Error).message),
+            "a publication failure is never reported as torn-snapshot retry exhaustion");
+          return true;
+        },
+      );
+      // Nothing was published at this stage, so only this invocation's wave root
+      // existed and the existing failure cleanup owns all of it.
+      assert.deepEqual(await readdir(artifactDir), [],
+        "the existing whole-owned-wave-root failure cleanup leaves no capture behind");
+    } finally {
+      setDurableWriteFaultInjectionForTesting(undefined);
+      await rm(fixture, { recursive: true, force: true });
+    }
+  });
+}
+
+test("capture — an after_rename fault rejects even though the rename may already have committed the name", async () => {
+  const fixture = await mkTmp("pi-cb-postrename-");
+  try {
+    const dir = await committedSource(join(fixture, "source"));
+    const artifactDir = join(fixture, "artifacts");
+    await mkdir(artifactDir);
+    instrumentRecordPublication(() => undefined, "after_rename");
+    await assert.rejects(
+      captureWaveBase({
+        cwd: dir,
+        maxSnapshotBytes: 1_000_000,
+        waveId: "post-rename",
+        artifactDir,
+        artifactTtlMs: 0,
+        maxCaptureAttempts: 1,
+      }),
+      /injected capture publication fault at after_rename/,
+    );
+    // The rename itself may already have committed the final name, yet the
+    // capture is reported as failed: no successful result escapes, and the
+    // existing best-effort cleanup removes this invocation's whole wave root.
+    assert.deepEqual(await readdir(artifactDir), [],
+      "the existing best-effort whole-owned-wave-root cleanup removed the root (a suppressed cleanup failure would leave it visible here)");
+  } finally {
+    setDurableWriteFaultInjectionForTesting(undefined);
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test("capture — a before_dir_sync fault is tolerated because directory sync is explicit best-effort", async () => {
+  const fixture = await mkTmp("pi-cb-dirsync-");
+  try {
+    const dir = await committedSource(join(fixture, "source"));
+    const artifactDir = join(fixture, "artifacts");
+    await mkdir(artifactDir);
+    instrumentRecordPublication(() => undefined, "before_dir_sync");
+    const capture = await captureWaveBase({
+      cwd: dir,
+      maxSnapshotBytes: 1_000_000,
+      waveId: "dir-sync-fault",
+      artifactDir,
+      artifactTtlMs: 0,
+      maxCaptureAttempts: 1,
+    });
+    // The record content was already renamed into place, so the capture stays
+    // successful; only the surviving-directory durability step is skipped.
+    assert.equal(await readFile(join(capture.waveRoot, "capture.json"), "utf8"),
+      `${JSON.stringify(capture, null, 2)}\n`);
+    assert.equal((await readWaveCaptureRecord(capture.waveRoot)).waveId, "dir-sync-fault");
+    assert.deepEqual((await readdir(capture.waveRoot)).filter((name) => name.includes(".tmp.")), [],
+      "no staged capture-record name is observed in the wave root after publication");
+  } finally {
+    setDurableWriteFaultInjectionForTesting(undefined);
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test("capture — the capture record keeps the plain-writeFile default mode under the process umask", async () => {
+  // A fresh process is required because the umask is process-wide: setting it in
+  // this test runner would restyle every unrelated concurrent write.
+  const modulePath = join(__dirname, "..", "src", "execution", "wave-repository.js");
+  const childScript = [
+    "const m = require(process.argv[1]);",
+    "const fs = require('fs');",
+    "(async () => {",
+    "  process.umask(parseInt(process.argv[2], 8));",
+    "  const capture = await m.captureWaveBase({",
+    "    cwd: process.argv[3],",
+    "    artifactDir: process.argv[4],",
+    "    maxSnapshotBytes: 1000000,",
+    "    waveId: 'umask-contract',",
+    "    maxCaptureAttempts: 1,",
+    "    artifactTtlMs: 0,",
+    "  });",
+    "  const recordPath = capture.waveRoot + '/capture.json';",
+    "  const published = fs.readFileSync(recordPath, 'utf8');",
+    "  fs.writeFileSync(capture.waveRoot + '/plain-comparison.txt', 'x');",
+    "  fs.writeFileSync(process.argv[5], JSON.stringify({",
+    "    recordMode: fs.statSync(recordPath).mode & 0o777,",
+    "    plainMode: fs.statSync(capture.waveRoot + '/plain-comparison.txt').mode & 0o777,",
+    "    rootMode: fs.statSync(capture.waveRoot).mode & 0o777,",
+    "    exactBytes: published === JSON.stringify(capture, null, 2) + '\\n',",
+    "  }));",
+    "  process.exit(0);",
+    "})().catch((e) => { console.error(String((e && e.message) || e)); process.exit(1); });",
+  ].join("\n");
+
+  for (const umask of [0o022, 0o077]) {
+    const fixture = await mkTmp("pi-cb-umask-");
+    try {
+      const source = join(fixture, "source");
+      const artifacts = join(fixture, "artifacts");
+      const resultFile = join(fixture, "result.json");
+      await mkdir(source);
+      await mkdir(artifacts);
+      await writeFile(join(source, "file.txt"), "content\n", "utf8");
+      // execFile settles only once the child has exited (including after a
+      // timeout kill), so the finally cleanup below can never race the child.
+      await execFileAsync(process.execPath, ["-e", childScript, modulePath, umask.toString(8), source, artifacts, resultFile], {
+        timeout: 120_000,
+      });
+      const observed = JSON.parse(await readFile(resultFile, "utf8")) as {
+        recordMode: number; plainMode: number; rootMode: number; exactBytes: boolean;
+      };
+      const label = `umask 0${umask.toString(8)}`;
+      assert.equal(observed.recordMode, 0o666 & ~umask, `${label}: the record keeps the filesystem default mode`);
+      assert.equal(observed.recordMode, observed.plainMode, `${label}: the mode matches a plain writeFile in the same directory`);
+      assert.equal(observed.rootMode, 0o700, `${label}: the mkdtemp wave root keeps its 0700 mode (no restyled parent)`);
+      assert.equal(observed.exactBytes, true, `${label}: pretty bytes and trailing newline are umask-independent`);
+    } finally {
+      await rm(fixture, { recursive: true, force: true });
+    }
+  }
+});
+
+test("capture — a torn or damaged capture record stays refused by the real reader", async () => {
+  const fixture = await mkTmp("pi-cb-record-damaged-");
+  try {
+    const dir = await committedSource(join(fixture, "source"));
+    const artifactDir = join(fixture, "artifacts");
+    await mkdir(artifactDir);
+    const capture = await captureWaveBase({
+      cwd: dir,
+      maxSnapshotBytes: 1_000_000,
+      waveId: "record-damaged",
+      artifactDir,
+      artifactTtlMs: 0,
+    });
+    const recordPath = join(capture.waveRoot, "capture.json");
+    const complete = await readFile(recordPath, "utf8");
+
+    // A torn record (a truncated prefix of the real one) is never repaired or
+    // partially accepted, whichever JSON parse error the cut point produces.
+    await writeFile(recordPath, complete.slice(0, Math.floor(complete.length / 2)), "utf8");
+    await assert.rejects(readWaveCaptureRecord(capture.waveRoot), SyntaxError);
+    await writeFile(recordPath, complete.slice(0, complete.lastIndexOf(",")), "utf8");
+    await assert.rejects(readWaveCaptureRecord(capture.waveRoot), SyntaxError);
+
+    // A complete record with an unsupported shape is refused structurally.
+    await writeFile(recordPath, `${JSON.stringify({ waveId: "record-damaged" })}\n`, "utf8");
+    await assert.rejects(readWaveCaptureRecord(capture.waveRoot), /Invalid wave capture record/);
+
+    // A structurally complete record naming a different root is refused.
+    await writeFile(recordPath, `${JSON.stringify({ ...capture, waveRoot: artifactDir })}\n`, "utf8");
+    await assert.rejects(readWaveCaptureRecord(capture.waveRoot), /does not match its containing directory/);
+
+    // Only the exact published bytes read back; nothing is salvaged.
+    await writeFile(recordPath, complete, "utf8");
+    assert.equal((await readWaveCaptureRecord(capture.waveRoot)).waveId, "record-damaged");
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
   }
 });

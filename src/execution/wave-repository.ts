@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { coreFilemodeOverrideFor } from "../git-checkpoint";
+import { atomicWrite } from "./durable-write";
 import { encodeSourceIdentityComponent, isSourceIdentity, sourceIdentitiesEqual, type SourceIdentity } from "./source-identity";
 export type { SourceIdentity } from "./source-identity";
 import { GIT_NO_LOCKS_ENV as GIT_ENV, isAbortError, validateSafeId } from "./wave-validation";
@@ -782,7 +783,25 @@ export async function captureWaveBase(options: WaveCaptureOptions): Promise<Wave
         paths: staged.entries.map((e) => e.path),
         sourceIdentity,
       };
-      await fs.writeFile(join(waveRoot, "capture.json"), `${JSON.stringify(capture, null, 2)}\n`, "utf8");
+      // Publish the capture record before reporting success: the complete
+      // pretty-JSON body is written to an owned same-directory temp file,
+      // file-synced, and atomically renamed onto its final name, so a reader
+      // observes either the complete record or no record at all. On the
+      // legitimate production path the target name is absent because the wave
+      // root comes from this invocation's fresh `mkdtemp`; the shared writer is
+      // the ordinary rename form, so it replaces a target name when one is
+      // present and adds no exclusive-create or hard-link requirement.
+      // `useDefaultFileMode` keeps the record's previous file mode (the
+      // filesystem default, 0o666 masked by the process umask) inside the 0o700
+      // wave root instead of the helper's 0o600 default. Durability limits: the
+      // staged file is file-synced before publication and the parent directory
+      // sync is explicit best-effort, so this is not a power-loss or multi-file
+      // transaction guarantee.
+      await atomicWrite(
+        join(waveRoot, "capture.json"),
+        `${JSON.stringify(capture, null, 2)}\n`,
+        { useDefaultFileMode: true },
+      );
       return capture;
     } catch (err) {
       // Clean up wave root on any failure after creation.

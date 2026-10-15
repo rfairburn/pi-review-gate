@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.160]
+
+### Fixed
+
+- The wave capture record (`<waveRoot>/capture.json`) is published through the shared
+  durable atomic writer: the complete record is staged in an owned same-directory
+  temporary file, file-synced, and atomically renamed onto its final name before a
+  successful capture returns, so a reader sees either the complete record or none
+  (#235). The record keeps its previous file mode (the filesystem default inside the
+  private `0700` wave root) through an opt-in that leaves other durable records at
+  `0600`. Record fields, bytes, identity, lineage, retry, cancellation, failure
+  cleanup, and fail-closed reader validation are unchanged, and directory sync stays
+  best-effort rather than a power-loss guarantee.
+
 ## [0.1.0-dev.159]
 
 ### Fixed

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { canonicalStableJson as stableJson } from "./canonical-json";
 import { link, open, readFile, realpath, rename, unlink, type FileHandle } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { syncDirectoryBestEffort } from "./file-publication";
 import {
   duplicateReviewerSelectionsFor,
   resolveReviewers,
@@ -1044,16 +1045,7 @@ async function atomicWrite(path: string, body: string): Promise<void> {
     if (ownsTemp) await unlink(temporary).catch(() => undefined);
     throw error;
   }
-  try {
-    const directory = await open(dirname(path), "r");
-    try {
-      await directory.sync();
-    } finally {
-      await directory.close();
-    }
-  } catch {
-    // Some platforms/filesystems do not permit directory fsync.
-  }
+  await syncDirectoryBestEffort(dirname(path));
 }
 
 function isPersistedSessionState(value: unknown): value is PersistedSessionState {
@@ -1254,19 +1246,6 @@ function summarizePendingDeliveries(deliveries: ReadonlyArray<{ status?: unknown
     byStatus: Object.fromEntries(byStatus),
     byKind: Object.fromEntries(byKind),
   };
-}
-
-async function syncDirectoryBestEffort(path: string): Promise<void> {
-  try {
-    const directory = await open(path, "r");
-    try {
-      await directory.sync();
-    } finally {
-      await directory.close();
-    }
-  } catch {
-    // Some supported platforms and filesystems reject directory handles/fsync.
-  }
 }
 
 /** Canonical descriptor identity shared by persistence refs and runtime ownership.

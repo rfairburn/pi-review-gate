@@ -190,8 +190,13 @@ function setupRoot(label: string): { root: string; finalPath: string; sessionFil
   const root = mkdtempSync(join(tmpdir(), `pi-review-243-${label}-`));
   const sessionFile = join(root, "conversation.jsonl");
   const finalPath = `${sessionFile}.pi-review-gate-state.json`;
-  writeFileSync(finalPath, PRIOR_SIDECAR_BYTES, "utf8");
-  return { root, finalPath, sessionFile };
+  try {
+    writeFileSync(finalPath, PRIOR_SIDECAR_BYTES, "utf8");
+    return { root, finalPath, sessionFile };
+  } catch (error) {
+    rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 /** Other writers' temp files that must survive every failure-path cleanup. */
@@ -432,6 +437,30 @@ test("pre-existing collision at the temp path: exclusive open fails before owner
   }
 });
 
+test("missing parent directory: publication fails closed with no directory created and no cleanup attempted (no-mkdir contract)", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-review-243-no-mkdir-"));
+  const missingDir = join(root, "missing-namespace");
+  const sessionFile = join(missingDir, "conversation.jsonl");
+  const finalPath = `${sessionFile}.pi-review-gate-state.json`;
+  try {
+    const store = new SessionStateStore({ sessionId: "atomic-write-no-mkdir", sessionFile, cwd: root });
+    const outcome = await withInjectedFault({}, () => store.save(createState(), { waveRoots: [], bundles: [] }));
+    const error = outcome.error as NodeJS.ErrnoException | undefined;
+    assert.ok(error, "save must fail when the sidecar's parent directory does not exist");
+    assert.equal(error?.code, "ENOENT", "the genuine missing-directory error must propagate, never a silent success");
+    assert.equal(exists(missingDir), false,
+      "the sidecar writer must never create a missing parent directory (unlike the durable execution writers, which mkdir 0700)");
+    assert.ok(outcome.tempPath && outcome.tempPath.startsWith(`${finalPath}.tmp.`),
+      `the staged name must stay beside the intended final path: ${outcome.tempPath}`);
+    assert.equal(exists(finalPath), false, "no sidecar may be published");
+    assert.deepEqual(outcome.unlinkAttempts, [],
+      "the exclusive open failed before ownership was acquired, so cleanup must not even attempt an unlink");
+    assert.deepEqual(readdirSync(root).sort(), [], "nothing may be created in the existing parent directory");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("successful publication is unchanged: 0600 mode, stage ordering, no temp leftovers, reload round-trips", async () => {
   const { root, finalPath, sessionFile } = setupRoot("success");
   try {
@@ -480,6 +509,107 @@ test("successful publication is unchanged: 0600 mode, stage ordering, no temp le
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+/**
+ * Separate, additive wrapper for the post-rename parent-directory sync stage:
+ * only the read-only directory open is wrapped (every other call delegates to
+ * the genuine implementation), so the shared best-effort directory-sync
+ * primitive stays observable for this writer without changing what the
+ * owned-cleanup and error-precedence tests above record.
+ */
+async function withDirectorySyncFault(
+  directory: string,
+  plan: { failDirOpen?: Error; failDirSync?: Error; failDirClose?: Error },
+  run: () => Promise<unknown>,
+): Promise<{ error?: unknown; dirPath?: string; dirEvents: string[] }> {
+  const bareRequire = createRequire(__filename);
+  const fsp = bareRequire("node:fs/promises") as FspModule;
+  const realOpen = fsp.open;
+  const openBinding = realOpen.bind(fsp);
+  const outcome: { error?: unknown; dirPath?: string; dirEvents: string[] } = { dirEvents: [] };
+  const trackedHandles: Array<{ real: any; productionClosed: boolean }> = [];
+  fsp.open = async (path: string, flags: string | number, mode?: number) => {
+    if (flags === "r" && path === directory) {
+      outcome.dirPath = path;
+      outcome.dirEvents.push("dir-open");
+      if (plan.failDirOpen) throw plan.failDirOpen;
+      // Windows directory handles/fsync are not portable. On that host this
+      // tests call ordering and fault tolerance with a mock, not native fsync.
+      const real = process.platform === "win32"
+        ? { sync: async () => undefined, close: async () => undefined }
+        : await openBinding(path, flags, mode);
+      const tracked = { real, productionClosed: false };
+      trackedHandles.push(tracked);
+      return {
+        sync: async () => {
+          outcome.dirEvents.push("dir-sync");
+          if (plan.failDirSync) throw plan.failDirSync;
+          await real.sync();
+          outcome.dirEvents.push("dir-synced");
+        },
+        close: async () => {
+          outcome.dirEvents.push("dir-close");
+          if (plan.failDirClose) throw plan.failDirClose;
+          const value = await real.close();
+          tracked.productionClosed = true;
+          outcome.dirEvents.push("dir-closed");
+          return value;
+        },
+      };
+    }
+    return openBinding(path, flags, mode);
+  };
+  try {
+    await run();
+    return outcome;
+  } catch (error) {
+    return { ...outcome, error };
+  } finally {
+    fsp.open = realOpen;
+    await Promise.all(trackedHandles.map((tracked) => {
+      if (tracked.productionClosed) return Promise.resolve();
+      tracked.productionClosed = true;
+      return tracked.real.close().catch(() => undefined);
+    }));
+  }
+}
+
+test("successful publication syncs the sidecar's parent directory after the rename, in open -> sync -> close order", async () => {
+  const { root, finalPath, sessionFile } = setupRoot("dir-sync-order");
+  try {
+    const store = new SessionStateStore({ sessionId: "atomic-write-dir-sync", sessionFile, cwd: root });
+    const outcome = await withDirectorySyncFault(root, {}, () => store.save(createState(), { waveRoots: [], bundles: [] }));
+    assert.equal(outcome.error, undefined, "publication must succeed");
+    assert.equal(outcome.dirPath, root, "the directory sync must target the sidecar's own directory");
+    assert.deepEqual(outcome.dirEvents, ["dir-open", "dir-sync", "dir-synced", "dir-close", "dir-closed"],
+      "the shared best-effort directory sync must open, fsync and close the directory exactly once, after the rename");
+    assertSurvivalSet(root, finalPath, []);
+    assert.ok(readFileSync(finalPath, "utf8").endsWith("\n"), "the committed sidecar is the renamed body");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+for (const [label, plan] of [
+  ["open", { failDirOpen: Object.assign(new Error("directory open refused"), { code: "EPERM" }) }],
+  ["sync", { failDirSync: Object.assign(new Error("directory fsync refused"), { code: "EINVAL" }) }],
+  ["close", { failDirClose: Object.assign(new Error("directory close refused"), { code: "EIO" }) }],
+] as const) {
+  test(`parent-directory ${label} failure is tolerated: the committed sidecar still publishes`, async () => {
+    const { root, finalPath, sessionFile } = setupRoot(`dir-${label}`);
+    try {
+      const store = new SessionStateStore({ sessionId: "atomic-write-dir-fault", sessionFile, cwd: root });
+      const outcome = await withDirectorySyncFault(root, plan, () => store.save(createState(), { waveRoots: [], bundles: [] }));
+      assert.equal(outcome.error, undefined,
+        `a parent-directory ${label} failure must never fail a save whose rename already committed`);
+      const doc = JSON.parse(readFileSync(finalPath, "utf8")) as { revision: number };
+      assert.equal(doc.revision, 1, "the renamed sidecar content is committed");
+      assertSurvivalSet(root, finalPath, []);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
 
 /** Test-local copy of the production canonical-JSON algorithm (stableJson). */
 function stableJson(value: unknown): string {

@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.161]
+
+### Changed
+
+- Consolidate equivalent durable-publication mechanics behind the execution writer's
+  existing replace/exclusive facades and a shared best-effort directory-sync helper
+  (#244). Per-writer permissions, directory creation, publication, fault, and cleanup
+  policies remain unchanged, including capture-record default modes and the session
+  sidecar's private no-mkdir contract.
+
 ## [0.1.0-dev.160]
 
 ### Fixed

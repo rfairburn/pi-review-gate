@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
+import { syncDirectoryBestEffort } from "./file-publication";
 import { redactSensitiveText } from "./redaction";
 import type { ReviewFinding, ReviewResult } from "./schema";
 
@@ -166,12 +167,9 @@ async function writeReviewDeliveryReceiptAtomically(path: string, content: strin
     await reviewDeliveryReceiptTestHooks?.beforeRename?.(temporaryPath, path);
     await rename(temporaryPath, path);
 
-    // Directory fsync is not portable across all supported platforms/filesystems.
-    const directory = await open(dirname(path), "r").catch(() => undefined);
-    if (directory) {
-      await directory.sync().catch(() => undefined);
-      await directory.close().catch(() => undefined);
-    }
+    // Directory fsync is not portable across all supported platforms/filesystems,
+    // and a failure here must never fail a receipt whose rename already committed.
+    await syncDirectoryBestEffort(dirname(path));
   } catch (error) {
     await handle?.close().catch(() => undefined);
     await unlink(temporaryPath).catch(() => undefined);

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { link, open, mkdir, rename, unlink, type FileHandle } from "node:fs/promises";
 import { dirname } from "node:path";
+import { syncDirectoryBestEffort } from "../file-publication";
 
 /**
  * Durable atomic write policy for recovery-critical execution records.
@@ -27,6 +28,13 @@ import { dirname } from "node:path";
  * `atomicWriteExclusive` provides the same durability for exclusive-create
  * publication (atomic hard-link of fsynced staged content onto the final
  * target, e.g. lease acquisition).
+ *
+ * Both facades run one shared internal owned-temp publication lifecycle
+ * (`publishStaged`); the commit primitive is their only mechanical difference.
+ * The best-effort parent-directory sync is shared with the other publication
+ * consumers in `src/file-publication.ts`. Per-writer policy — staged naming,
+ * staged mode, mkdir, cleanup ownership, error precedence, serialization —
+ * stays in this module and at its call sites.
  */
 
 /** Stages at which a fault may be injected for deterministic testing. */
@@ -101,42 +109,17 @@ async function runStage(
 }
 
 /**
+ * Which commit primitive publishes the staged file. The facade a caller chooses
+ * is the only place this decision is made — never a runtime feature flag.
+ */
+type StagedPublication = "replace" | "exclusive";
+
+/**
  * Atomically replace `path` with `body`, durably.
  * See the module documentation for the exact durability guarantees.
  */
 export async function atomicWrite(path: string, body: string, options: DurableWriteOptions = {}): Promise<void> {
-  const hooks = options.hooks;
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const temporary = options.tempSuffixForTesting !== undefined
-    ? `${path}.tmp.${options.tempSuffixForTesting}`
-    : `${path}.tmp.${randomUUID()}`;
-  let file: FileHandle | undefined;
-  // Only unlink a temp file this invocation actually created; a pre-existing
-  // collision at the temp path belongs to someone else and must be preserved.
-  let ownsTemp = false;
-  try {
-    file = await open(temporary, "wx", stagedFileMode(options));
-    ownsTemp = true;
-    await file.writeFile(body, "utf8");
-    await runStage("after_temp_write", path, hooks, "afterTempWrite");
-    await file.sync();
-    await runStage("after_file_sync", path, hooks, "afterFileSync");
-    await file.close();
-    file = undefined;
-    await runStage("before_rename", path, hooks, "beforeRename");
-    await rename(temporary, path);
-    ownsTemp = false;
-    await runStage("after_rename", path, hooks, "afterRename");
-  } catch (error) {
-    if (file) await file.close().catch(() => undefined);
-    // The temp file must never outlive a failed write; the previous target
-    // contents are untouched because the rename has not happened yet (or the
-    // hook fired after an already-completed rename, in which case the temp
-    // path no longer exists).
-    if (ownsTemp) await unlink(temporary).catch(() => undefined);
-    throw error;
-  }
-  await bestEffortDirectorySync(path, hooks);
+  await publishStaged(path, body, options, "replace");
 }
 
 /**
@@ -159,6 +142,35 @@ export async function atomicWrite(path: string, body: string, options: DurableWr
  * claim naming their own identity already exists.
  */
 export async function atomicWriteExclusive(path: string, body: string, options: DurableWriteOptions = {}): Promise<void> {
+  await publishStaged(path, body, options, "exclusive");
+}
+
+/**
+ * The single owned-temp publication lifecycle behind both facades: create the
+ * staged file exclusively in the target's own directory (mode 0o600, or the
+ * platform default for the `useDefaultFileMode` opt-in), write, fsync and close
+ * it, run the caller's hooks in their established positions, commit with the
+ * facade's primitive, then best-effort fsync the parent directory.
+ *
+ * The `publication` parameter is the only difference between the facades:
+ *   - `replace` commits with `rename` and then reports an `afterRename` hook
+ *     failure. The rename consumes the staged name, so cleanup never runs.
+ *   - `exclusive` commits with `link`. Once the link succeeds the write is
+ *     committed, so a post-commit hook failure is swallowed and the staged-name
+ *     cleanup is best-effort: neither may turn a published claim into a reported
+ *     acquisition failure.
+ *
+ * Both keep the same ownership rule and error precedence: only a staged file
+ * this invocation created (ownership begins when the exclusive create succeeds)
+ * is ever unlinked, a failing close can never replace the publication error, and
+ * the previous target bytes stay untouched until the commit.
+ */
+async function publishStaged(
+  path: string,
+  body: string,
+  options: DurableWriteOptions,
+  publication: StagedPublication,
+): Promise<void> {
   const hooks = options.hooks;
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const temporary = options.tempSuffixForTesting !== undefined
@@ -177,35 +189,31 @@ export async function atomicWriteExclusive(path: string, body: string, options: 
     await runStage("after_file_sync", path, hooks, "afterFileSync");
     await file.close();
     file = undefined;
-    // Atomic exclusive publication: the fully fsynced staged content becomes
-    // visible at the final path in one step, or not at all.
     await runStage("before_rename", path, hooks, "beforeRename");
-    await link(temporary, path);
-    // link() is the commit point. Do not report failure after the final claim
-    // exists, and always continue to the directory fsync.
-    await runStage("after_rename", path, hooks, "afterRename").catch(() => undefined);
-    await unlink(temporary).catch(() => undefined);
-    ownsTemp = false;
+    if (publication === "exclusive") {
+      // Atomic exclusive publication: the fully fsynced staged content becomes
+      // visible at the final path in one step, or not at all.
+      await link(temporary, path);
+      // link() is the commit point. Do not report failure after the final claim
+      // exists, and always continue to the directory fsync.
+      await runStage("after_rename", path, hooks, "afterRename").catch(() => undefined);
+      await unlink(temporary).catch(() => undefined);
+      ownsTemp = false;
+    } else {
+      await rename(temporary, path);
+      ownsTemp = false;
+      await runStage("after_rename", path, hooks, "afterRename");
+    }
   } catch (error) {
     if (file) await file.close().catch(() => undefined);
+    // The temp file must never outlive a failed write; the previous target
+    // contents are untouched because the commit has not happened yet (or, for
+    // the replace writer, the hook fired after an already-completed rename, in
+    // which case the temp path no longer exists).
     if (ownsTemp) await unlink(temporary).catch(() => undefined);
     throw error;
   }
-  await bestEffortDirectorySync(path, hooks);
-}
-
-/** fsync the parent directory so the rename is durable; best-effort only. */
-async function bestEffortDirectorySync(path: string, hooks: DurableWriteHooks | undefined): Promise<void> {
-  try {
-    await runStage("before_dir_sync", path, hooks, "beforeDirSync");
-    const directory = await open(dirname(path), "r");
-    try {
-      await directory.sync();
-    } finally {
-      await directory.close();
-    }
-  } catch {
-    // Some filesystems do not permit directory fsync; the atomic rename still
-    // protects readers from partial content.
-  }
+  await syncDirectoryBestEffort(dirname(path), {
+    beforeSync: () => runStage("before_dir_sync", path, hooks, "beforeDirSync"),
+  });
 }

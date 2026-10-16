@@ -182,16 +182,15 @@ async function buildPoolHarness(
     ? passingReviewerSource()
     : needsChangesThenPassReviewerSource(join(root, "reviewer-state"));
 
-  const resources = order.map((key) => ({
-    resourceId: `res-${key}`,
+  // Keyed catalog; the ordered execute route alone carries the priority.
+  const resources = Object.fromEntries(order.map((key) => [`res-${key}`, {
     selection: { source: "external" as const, id: `exec-${key}` },
     maxConcurrent: 1,
-  }));
-  const agents = [
-    { id: "exec-a", adapter: "run-as-binary" as const, command: process.execPath, model: "model-a", execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: [scripts.a], timeoutMs: 30_000 } },
-    { id: "exec-b", adapter: "run-as-binary" as const, command: process.execPath, model: "model-b", execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: [scripts.b], timeoutMs: 30_000 } },
-    {
-      id: "gate-reviewer",
+  }]));
+  const agents = {
+    "exec-a": { adapter: "run-as-binary" as const, command: process.execPath, model: "model-a", execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: [scripts.a], timeoutMs: 30_000 } },
+    "exec-b": { adapter: "run-as-binary" as const, command: process.execPath, model: "model-b", execution: { protocol: "pi-review-executor-jsonl-v1" as const, args: [scripts.b], timeoutMs: 30_000 } },
+    "gate-reviewer": {
       adapter: "generic-cli" as const,
       command: process.execPath,
       args: [],
@@ -200,12 +199,12 @@ async function buildPoolHarness(
         timeoutMs: 20_000,
       },
     },
-  ];
+  };
   const base = {
     execution: {
       workerResources: resources,
       routes: {
-        execute: resources.map((resource) => ({ resourceId: resource.resourceId })),
+        execute: order.map((key) => ({ resourceId: `res-${key}` })),
         research: [],
       },
       retryPolicy: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 1 },

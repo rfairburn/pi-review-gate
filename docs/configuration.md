@@ -317,12 +317,11 @@ Untouched custom commands remain compatible. Runtime command failures remain err
 Other adapters retain their existing executable validation. Pi-scoped internal models
 are never copied into the external catalog.
 
-The legacy array form (entries carrying their own `id`) is deprecated but still
-imported at load time and converted to the keyed object, preserving every identity,
-reference, and setting. That import support will be removed in a future version without
-a fixed date or version ([#116](https://github.com/rfairburn/pi-review-gate/issues/116));
-save the canonical object form now — `/review-settings` saves already write it. The
-worker catalog follows the same shape and deprecation; see
+Only the canonical keyed object form is accepted. The former legacy array form
+(entries carrying their own `id`) is no longer imported or converted; see
+[Removed legacy array catalogs](#removed-legacy-array-catalogs) for the behavior and
+the migration path through a published conversion-capable release. The worker catalog
+follows the same shape; see
 [Delegated execution](delegated-execution.md#worker-resources-routes-and-concurrency).
 
 ### Create external workers in the settings menu
@@ -530,13 +529,73 @@ reviewer or worker selections; this is not a successful review. Explicit configu
 writes still validate strictly. The environment kill switch and worker tool ceilings
 remain authoritative.
 
+### Removed legacy array catalogs
+
+`externalAgents` and `execution.workerResources` accept only the canonical object
+form keyed by stable ID. The deprecated legacy array form of either catalog (agent
+entries carrying their own `id`; resource entries carrying a `resourceId` or using a
+generated identity) is no longer imported or converted ([#116](https://github.com/rfairburn/pi-review-gate/issues/116)),
+and there is no replacement automatic conversion:
+
+- Strict validation rejects an array catalog instead of converting it.
+- Startup recovery (above) reports an array catalog as an unsupported field, uses
+  that catalog's default (no entries), and continues with the remaining valid
+  settings. Priority entries that referenced the array's resources are omitted, and
+  reviewer selections naming its agents are reported as unavailable selections; no
+  replacement worker, reviewer, or model is chosen.
+- Loading never converts, rewrites, or deletes the stored file, so the original
+  arrays remain on disk until something explicitly writes the file.
+- A `/review-settings` Save in a release without the import writes only the catalogs
+  that release loaded; it never carries unsupported arrays forward. Migrate (below)
+  before saving settings there, and keep a backup.
+
+Canonical catalogs and their consumers are unchanged: the ordered
+`execution.routes.execute` and `execution.routes.research` priorities and their
+per-entry reasoning, the ordered `review.primaryReviewers` and
+`review.subtaskReviewers` lists, resource IDs and the shared `maxConcurrent` capacity,
+and the rule that a missing or empty priority means no models for that role.
+
+**Migrating a legacy array config.** Convert it with a published release that still
+imports the array form, save it there, and only then upgrade. The prerelease
+[b164 (`pi-review-gate@0.1.0-dev.164`)](https://github.com/rfairburn/pi-review-gate/releases/tag/b164)
+is a published conversion-capable release: its installed package was verified to
+load both array catalogs and to write canonical objects on an explicit Save.
+
+1. Back up the config file, for example `cp review-gate.json review-gate.json.bak`.
+2. Download `pi-review-gate-0.1.0-dev.164.tgz` and `SHA256SUMS` from the b164
+   release, verify the tarball (`shasum -a 256 -c SHA256SUMS`), and install it in an
+   empty directory (`npm install ./pi-review-gate-0.1.0-dev.164.tgz`).
+3. Load the old config with that release, for example
+   `PI_REVIEW_GATE_CONFIG=/path/to/review-gate.json pi -e <dir>/node_modules/pi-review-gate/dist/src/index.js`.
+   Run it with the Pi models and Claude/Codex CLIs the config references available,
+   because Save validates every selection as usual. Loading converts in memory only;
+   the file is not changed yet.
+4. Open `/review-settings`, check **Worker resources**, **Execution priority**,
+   **Research priority**, and **Reviewers**, then choose **Save changes** (or
+   Ctrl+S). Root Escape applies to the session only and **Cancel** discards; neither
+   writes the file. A settings Save keeps Pi reasoning on priority entries, not on
+   the worker resource itself (`selection.thinkingLevel`), so set the reasoning you
+   rely on for each Pi priority entry before saving.
+5. Confirm that the saved file stores both `externalAgents` and
+   `execution.workerResources` as objects. Resource entries without a `resourceId`
+   keep their established generated IDs (`external-<agentId>` or
+   `pi-<base64url model>`), which the saved priorities reference; a missing priority
+   may be written as `[]`, which still means no models.
+6. Upgrade to the newer release. The saved canonical config loads without
+   conversion. Keep the backup until you have confirmed the upgraded setup.
+
+If you already upgraded without converting, run these steps with b164 on the
+unchanged file. If you saved settings in the newer release in the meantime, run them
+on your backup instead.
+
 ## Delegated execution fields
 
 The `execution` block (`workerResources`, `routes`, `maxWorkers`,
 `subtaskNotifications`, `deferredPiTools`, `retryPolicy`) and the reviewer/execution route matrix are
 documented with the behavior they control in
 [Delegated execution](delegated-execution.md#worker-resources-routes-and-concurrency),
-including the keyed-catalog shape, legacy array import, and deprecation.
+including the keyed-catalog shape; the legacy array import is removed (see
+[Removed legacy array catalogs](#removed-legacy-array-catalogs)).
 A complete end-to-end example is `examples/delegated-execution.json`.
 
 Defaults: `execution.maxWorkers` is `4` (allowed range 1–128) and

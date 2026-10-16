@@ -9,7 +9,6 @@ import {
   cloneExternalAgentCatalog,
   type ExternalAgentCatalog,
   cloneWorkerCatalog,
-  executorEntryId,
   normalizeConfig,
   externalAgentSupportsExecution,
   externalAgentSupportsReview,
@@ -250,17 +249,13 @@ export async function persistReviewSettings(
       // preserved foreign schedules may pin resources appended meanwhile.
       const touchedIds = new Set(selection.externalAgentOperations.flatMap((operation) => [operation.id, ...(operation.nextId ? [operation.nextId] : [])]));
       const storedResources = isRecord(parsed.execution) ? parsed.execution.workerResources : undefined;
-      const resourceEntries: [string, unknown][] = Array.isArray(storedResources)
-        ? storedResources.flatMap((resource): [string, unknown][] => {
-          if (!isRecord(resource) || !isRecord(resource.selection) || resource.selection.source !== "external" || typeof resource.selection.id !== "string") return [];
-          // Match the legacy importer: resourceId, or its generated selection
-          // identity when omitted. Agent catalog entries use a different id.
-          const resourceId = typeof resource.resourceId === "string" && resource.resourceId.trim()
-            ? resource.resourceId.trim()
-            : executorEntryId({ source: "external", id: resource.selection.id.trim() });
-          return [[resourceId, resource]];
-        })
-        : isRecord(storedResources) ? Object.entries(storedResources) : [];
+      // The keyed object is the sole catalog shape. Any other stored shape
+      // (including a removed legacy array) cannot be inspected for pins, so
+      // the catalog transaction fails closed instead of overwriting it.
+      if (storedResources !== undefined && !isRecord(storedResources)) {
+        throw new Error("External worker settings changed or are invalid on disk. Reopen settings before saving.");
+      }
+      const resourceEntries = Object.entries(storedResources ?? {});
       for (const [resourceId, resource] of resourceEntries) {
         if (isRecord(resource) && isRecord(resource.selection) && resource.selection.source === "external" && typeof resource.selection.id === "string" && touchedIds.has(resource.selection.id.trim())) {
           latestAffectedPins.add(resourceId.trim());
@@ -312,9 +307,9 @@ export async function persistReviewSettings(
       parsed.externalAgents = merged;
     }
     applyStagedSelectionFields(parsed, selection);
-    // Import the latest catalog (including legacy arrays), never the stale
-    // menu snapshot. Existing definitions remain owned by disk; creation
-    // cannot overwrite even an identical definition saved by another menu.
+    // Validate the latest keyed catalog, never the stale menu snapshot.
+    // Existing definitions remain owned by disk; creation cannot overwrite
+    // even an identical definition saved by another menu.
     if (selection.externalAgentAdditions && Object.keys(selection.externalAgentAdditions).length > 0) {
       const stored = normalizeConfig({ externalAgents: parsed.externalAgents }).externalAgents ?? {};
       const merged = cloneExternalAgentCatalog(stored);
@@ -473,14 +468,13 @@ export async function updateReviewGateConfig(
 }
 
 /**
- * The single save boundary that persists both catalogs in canonical
- * keyed-object form. The legacy array-to-keyed conversion also happens in
- * memory on load (normalizeConfig) — loading never writes to disk; this helper
- * serializes the normalized catalog at save time, after mutation and
- * validation, so an invalid conversion fails before the atomic write. Absent
- * fields stay absent, and every other raw field survives untouched, so a save
- * can never clobber newer on-disk agent definitions with a stale in-memory
- * snapshot.
+ * The single save boundary that persists both catalogs in their normalized
+ * keyed-object form, after mutation and validation, so an invalid catalog
+ * fails before the atomic write. The keyed object is the sole accepted shape:
+ * any other stored shape (including a removed legacy array) fails
+ * normalizeConfig first, and loading never writes to disk. Absent fields stay
+ * absent, and every other raw field survives untouched, so a save can never
+ * clobber newer on-disk agent definitions with a stale in-memory snapshot.
  */
 function canonicalizeCatalogs(parsed: Record<string, unknown>, normalized: ReviewGateConfig): void {
   if (parsed.externalAgents !== undefined) {

@@ -425,6 +425,11 @@ to limit the orchestrator, pass Pi's native allowlist through the wrapper, for e
   converting them into reviewer or worker selections — and doubled records consume the
   canonical shape alone without rewriting the stored record
   ([Configuration](configuration.md#pre-cutover-configuration-fields)).
+- The legacy array forms of `externalAgents` and `execution.workerResources` are no
+  longer imported: strict validation rejects them, while startup recovery reports the
+  unsupported catalog and continues without converting it or rewriting the stored
+  file. Migration goes through a published conversion-capable release and an explicit
+  Save there ([Configuration](configuration.md#removed-legacy-array-catalogs)).
 
 ## Shared native presentation expansion
 

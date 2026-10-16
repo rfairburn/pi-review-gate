@@ -49,6 +49,30 @@ dates.
   any persistence failure first seen during shutdown, is reported as a cleanup
   failure. No setting, transmission, polling, or daemon is added.
 
+## [0.1.0-dev.165]
+
+### Removed
+
+- The deprecated legacy array forms of the `externalAgents` and
+  `execution.workerResources` catalogs are no longer imported or converted
+  ([#116](https://github.com/rfairburn/pi-review-gate/issues/116)); only the
+  canonical ID-keyed object catalogs load. Strict validation rejects an array
+  catalog, and startup recovery reports it as an unsupported field and continues
+  with the remaining valid settings under the existing recovery rules, without
+  converting, rewriting, or deleting the stored file. No replacement automatic
+  conversion exists. Canonical catalogs and their consumers are unchanged: ordered
+  execute/research priorities with per-entry reasoning, ordered primary/subtask
+  reviewer lists, resource IDs and shared `maxConcurrent` capacity, and the rule
+  that a missing or empty priority means no models.
+- Migration for a legacy array config: back up the file, load it with the published
+  conversion-capable prerelease
+  [b164](https://github.com/rfairburn/pi-review-gate/releases/tag/b164)
+  (`0.1.0-dev.164`), explicitly save once through `/review-settings` there, and
+  then upgrade; the saved canonical config loads without conversion. Do not save
+  settings with a release lacking the import while the file still holds arrays,
+  because that save does not carry them forward. Full steps are in
+  [Configuration](docs/configuration.md#removed-legacy-array-catalogs).
+
 ## [0.1.0-dev.164]
 
 ### Changed

@@ -455,35 +455,17 @@ review: { activeReviewers: [
   assert.deepEqual(resolveReviewers(loaded).reviewers.map((reviewer) => reviewer.id), ["codex", "claude"]);
 });
 
-test("normalizeConfig rejects duplicate reviewer ids", () => {
-  assert.throws(
-    () => normalizeConfig({
-enabled: true,
-externalAgents: [
-        { id: "same", adapter: "codex-cli", args: [], review: {} },
-        { id: "same", adapter: "claude-cli", args: [], review: {} },
-      ],
-review: { activeReviewers: [
-        { source: "external", id: "same" },
-        { source: "external", id: "same" }
-      ] },
-    }),
-    /external agent id must be unique: same/,
-  );
-});
-
 test("normalizeConfig rejects agent ids that could share an output directory", () => {
   for (const id of ["review/a", "review?a"]) {
     assert.throws(
       () => normalizeConfig({
 enabled: true,
-externalAgents: [
-          {
-            id,
+externalAgents: {
+          [id]: {
             adapter: "codex-cli",
             args: [],
           review: {}}
-        ],
+        },
       }),
       /external agent id may contain only letters, numbers, underscores, periods, and hyphens/,
     );
@@ -495,13 +477,12 @@ test("normalizeConfig rejects path-reserved agent ids", () => {
     assert.throws(
       () => normalizeConfig({
 enabled: true,
-externalAgents: [
-          {
-            id,
+externalAgents: {
+          [id]: {
             adapter: "codex-cli",
             args: [],
           review: {}}
-        ],
+        },
       }),
       /external agent id may contain only letters, numbers, underscores, periods, and hyphens/,
     );
@@ -705,11 +686,9 @@ test("worker resources have shared capacity and independently ordered, excluding
 });
 
 test("worker routes reject unknown and duplicate resource references", () => {
-  const resources = [{
-    resourceId: "qwen",
-    selection: { source: "external", id: "qwen" },
-    maxConcurrent: 1,
-  }];
+  const resources = {
+    qwen: { selection: { source: "external", id: "qwen" }, maxConcurrent: 1 },
+  };
   assert.throws(() => normalizeConfig({
     enabled: true,
     execution: { workerResources: resources, routes: { research: [{ resourceId: "missing" }] } },
@@ -720,36 +699,71 @@ test("worker routes reject unknown and duplicate resource references", () => {
   }), /execution\.routes\.research resource id must be unique/);
 });
 
-test("normalizeConfig imports legacy array catalogs as keyed objects", () => {
-  const config = normalizeConfig({
-    enabled: true,
-    externalAgents: [
-      { id: "codex-a", adapter: "codex-cli", command: "codex", review: {} },
-    ],
-    execution: {
-      workerResources: [
-        { resourceId: "kept-name", selection: { source: "external", id: "codex-a" }, maxConcurrent: 1 },
-        { selection: { source: "pi", model: "qwen/local" }, maxConcurrent: 2 },
-      ],
-    },
-  });
-  assert.deepEqual(Object.keys(config.externalAgents!), ["codex-a"]);
-  assert.equal(config.externalAgents!["codex-a"].adapter, "codex-cli");
-  const generatedId = executorEntryId({ source: "pi", model: "qwen/local" });
-  assert.deepEqual(Object.keys(config.execution!.workerResources!), ["kept-name", generatedId]);
-  assert.equal(config.execution!.workerResources![generatedId]!.maxConcurrent, 2);
+test("normalizeConfig rejects legacy array catalogs instead of converting them", () => {
+  const agent = { id: "codex-a", adapter: "codex-cli", command: "codex", review: {}, execution: {} };
+  const resource = { resourceId: "kept-name", selection: { source: "external", id: "codex-a" }, maxConcurrent: 1 };
+  const keyedAgents = { "codex-a": { adapter: "codex-cli", command: "codex", review: {}, execution: {} } };
+  const keyedResources = { "kept-name": { selection: { source: "external", id: "codex-a" }, maxConcurrent: 1 } };
+  for (const externalAgents of [[agent], [], [agent, { ...agent, adapter: "claude-cli" }]]) {
+    assert.throws(() => normalizeConfig({ enabled: true, externalAgents }), /^Error: externalAgents must be an object$/);
+    // A canonical worker catalog cannot rescue a legacy agent array.
+    assert.throws(
+      () => normalizeConfig({ enabled: true, externalAgents, execution: { workerResources: keyedResources } }),
+      /externalAgents must be an object/,
+    );
+  }
+  const generatedEntry = { selection: { source: "pi", model: "qwen/local" }, maxConcurrent: 2 };
+  for (const workerResources of [[resource], [], [generatedEntry], [resource, { ...resource, maxConcurrent: 2 }]]) {
+    assert.throws(
+      () => normalizeConfig({ enabled: true, externalAgents: keyedAgents, execution: { workerResources } }),
+      /^Error: execution\.workerResources must be an object$/,
+    );
+    // Routes naming the legacy entry's resourceId are not resolved through it.
+    assert.throws(
+      () => normalizeConfig({
+        enabled: true,
+        externalAgents: keyedAgents,
+        execution: { workerResources, routes: { execute: [{ resourceId: "kept-name" }] } },
+      }),
+      /execution\.workerResources must be an object/,
+    );
+  }
 });
 
-test("keyed catalogs reject duplicate resource ids and duplicate selections", () => {
-  assert.throws(() => normalizeConfig({
+test("keyed catalogs accept previously generated resource keys as ordinary stable identities", () => {
+  const piSelection = { source: "pi" as const, model: "qwen/local" };
+  const externalSelection = { source: "external" as const, id: "codex-a" };
+  const piKey = executorEntryId(piSelection);
+  const externalKey = executorEntryId(externalSelection);
+  assert.equal(externalKey, "external-codex-a");
+  const config = normalizeConfig({
     enabled: true,
+    externalAgents: { "codex-a": { adapter: "codex-cli", command: "codex", execution: {} } },
     execution: {
-      workerResources: [
-        { resourceId: "same", selection: { source: "pi", model: "a/local" }, maxConcurrent: 1 },
-        { resourceId: "same", selection: { source: "pi", model: "b/local" }, maxConcurrent: 2 },
-      ],
+      workerResources: {
+        [externalKey]: { selection: externalSelection, maxConcurrent: 1 },
+        [piKey]: { selection: piSelection, maxConcurrent: 2 },
+      },
+      routes: {
+        execute: [{ resourceId: piKey, thinkingLevel: "high" }, { resourceId: externalKey }],
+        research: [{ resourceId: piKey, thinkingLevel: "low" }],
+      },
     },
-  }), /worker resource id must be unique: same/);
+  });
+  assert.deepEqual(Object.keys(config.execution!.workerResources!), [externalKey, piKey]);
+  assert.deepEqual(resolvedWorkerRoute(config, "execute").map((entry) => [entry.entryId, entry.selection, entry.maxConcurrent]), [
+    [piKey, { ...piSelection, thinkingLevel: "high" }, 2],
+    [externalKey, externalSelection, 1],
+  ]);
+  assert.deepEqual(resolvedWorkerRoute(config, "research").map((entry) => [entry.entryId, entry.selection]), [
+    [piKey, { ...piSelection, thinkingLevel: "low" }],
+  ]);
+  // The normalized catalog is already canonical: a JSON save/load round trip
+  // reproduces it exactly without any conversion step.
+  assert.deepEqual(normalizeConfig(JSON.parse(JSON.stringify(config))), config);
+});
+
+test("keyed catalogs reject duplicate selections and non-object entries", () => {
   assert.throws(() => normalizeConfig({
     enabled: true,
     execution: {
@@ -759,6 +773,14 @@ test("keyed catalogs reject duplicate resource ids and duplicate selections", ()
       },
     },
   }), /duplicate worker resource selection/);
+  assert.throws(() => normalizeConfig({
+    enabled: true,
+    execution: { workerResources: { broken: [{ selection: { source: "pi", model: "a/local" }, maxConcurrent: 1 }] } },
+  }), /execution\.workerResources\.broken must be an object/);
+  assert.throws(() => normalizeConfig({
+    enabled: true,
+    externalAgents: { broken: [{ adapter: "codex-cli", command: "codex", review: {} }] },
+  }), /external agent must be an object/);
 });
 
 test("missing or empty routes resolve to no models without catalog fallback", () => {

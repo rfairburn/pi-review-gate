@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, stat, writeFile, chmod } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
-import { effectiveReviewSettings, normalizeConfig, type ReviewGateConfig } from "../src/config";
+import { effectiveReviewSettings, executorEntryId, normalizeConfig, type ReviewGateConfig } from "../src/config";
 import { changeExternalAgent, stageExternalAgentOperation, type ExternalAgentOperation } from "../src/settings/external-agent-catalog";
 import { persistReviewSettings, type ReviewSettingsSelection } from "../src/settings/persistence";
 
@@ -22,11 +22,11 @@ async function workspace(run: (path: string, opening: ReviewGateConfig) => Promi
   const directory = await mkdtemp(join(__dirname, "catalog-persistence-"));
   try {
     const path = join(directory, "config.json");
-    const raw = { future: { preserve: true }, externalAgents: [
-      { id: "A", adapter: "codex-cli", command: "codex", model: "custom", execution: { model: "custom-execution", args: ["literal secret"], env: { TOKEN: "literal secret" }, timeoutMs: 5678 }, review: { model: "custom-review" } },
-      { id: "X", adapter: "run-as-binary", command: "binary", execution: { protocol: "pi-review-executor-jsonl-v1" }, review: { protocol: "pi-reviewer-json-v1" } },
-      { id: "other", adapter: "claude-cli", execution: {} },
-    ], execution: { workerResources: { r: { selection: { source: "external", id: "A" }, maxConcurrent: 1 }, arbitrary: { selection: { source: "external", id: "X" }, maxConcurrent: 1 } }, routes: { execute: [{ resourceId: "r" }, { resourceId: "arbitrary" }], research: [] } },
+    const raw = { future: { preserve: true }, externalAgents: {
+      A: { adapter: "codex-cli", command: "codex", model: "custom", execution: { model: "custom-execution", args: ["literal secret"], env: { TOKEN: "literal secret" }, timeoutMs: 5678 }, review: { model: "custom-review" } },
+      X: { adapter: "run-as-binary", command: "binary", execution: { protocol: "pi-review-executor-jsonl-v1" }, review: { protocol: "pi-reviewer-json-v1" } },
+      other: { adapter: "claude-cli", execution: {} },
+    }, execution: { workerResources: { r: { selection: { source: "external", id: "A" }, maxConcurrent: 1 }, arbitrary: { selection: { source: "external", id: "X" }, maxConcurrent: 1 } }, routes: { execute: [{ resourceId: "r" }, { resourceId: "arbitrary" }], research: [] } },
     review: { primaryReviewers: [{ source: "external", id: "A" }, { source: "external", id: "X" }], subtaskReviewers: [{ source: "external", id: "X" }, { source: "external", id: "A" }] },
     scheduledTasks: { t: { name: "Task", cron: "0 * * * *", instructions: "keep A X", workspace: __dirname, kind: "execute", enabled: true, workerResourceId: "arbitrary", review: { mode: "selected", reviewers: [{ source: "external", id: "X" }, { source: "external", id: "A" }] } } } };
     await writeFile(path, JSON.stringify(raw)); await chmod(path, 0o600);
@@ -46,7 +46,7 @@ test("rename/repeated edits and deletion round-trip atomically with resource ide
     stageExternalAgentOperation(operations, opening, "B", "__proto__", draft.externalAgents!.__proto__);
     draft = changeExternalAgent(draft, "X").config;
     stageExternalAgentOperation(operations, opening, "X");
-    await latest(path, (raw) => { raw.externalAgents.find((a: any) => a.id === "other").model = "newest-other"; raw.scheduledTasks.foreign = { malformed: "preserve verbatim" }; });
+    await latest(path, (raw) => { raw.externalAgents.other.model = "newest-other"; raw.scheduledTasks.foreign = { malformed: "preserve verbatim" }; });
     const result = await persistReviewSettings(path, selection(draft, opening, operations));
     const raw = JSON.parse(await readFile(path, "utf8"));
     assert.equal(raw.externalAgents.other.model, "newest-other");
@@ -74,9 +74,9 @@ for (const conflict of ["changed", "disappeared", "destination", "resource", "ro
     const draft = changeExternalAgent(opening, "A", "B", opening.externalAgents!.A).config;
     stageExternalAgentOperation(operations, opening, "A", "B", draft.externalAgents!.B);
     await latest(path, (raw) => {
-      if (conflict === "changed") raw.externalAgents[0].model = "concurrent";
-      if (conflict === "disappeared") raw.externalAgents.shift();
-      if (conflict === "destination") raw.externalAgents.push({ id: "B", adapter: "codex-cli", execution: {} });
+      if (conflict === "changed") raw.externalAgents.A.model = "concurrent";
+      if (conflict === "disappeared") delete raw.externalAgents.A;
+      if (conflict === "destination") raw.externalAgents.B = { adapter: "codex-cli", execution: {} };
       if (conflict === "resource") raw.execution.workerResources.new = { selection: { source: "external", id: "A" }, maxConcurrent: 1 };
       if (conflict === "route") raw.execution.routes.execute.push({ resourceId: "r" });
       if (conflict === "reviewer") raw.review.primaryReviewers.unshift({ source: "external", id: "other" });
@@ -122,7 +122,31 @@ for (const edit of ["role", "model"] as const) test(`same-ID ${edit} edit reject
   });
 });
 
-for (const form of ["keyed", "legacy-explicit", "legacy-generated"] as const) test(`creation rejects a preserved schedule pin dropped from the latest ${form} resource catalog`, async () => {
+for (const form of ["keyed", "generated-key"] as const) test(`creation rejects a preserved schedule pin dropped from the latest ${form} resource catalog`, async () => {
+  await workspace(async (path, opening) => {
+    const draft = structuredClone(opening);
+    const definition = { adapter: "codex-cli" as const, execution: {} };
+    draft.externalAgents!.created = definition;
+    const operations: ExternalAgentOperation[] = [];
+    stageExternalAgentOperation(operations, opening, "created", "created", definition);
+    // A previously generated identity is an ordinary key of the keyed catalog.
+    const resourceId = form === "generated-key" ? executorEntryId({ source: "external", id: "created" }) : "future";
+    await latest(path, (raw) => {
+      raw.execution.workerResources[resourceId] = { selection: { source: "external", id: "created" }, maxConcurrent: 1 };
+      // Derive the pin through the real validator, so this regression cannot
+      // accidentally test an unsupported identity field.
+      const normalized = normalizeConfig({ execution: { workerResources: raw.execution.workerResources } });
+      const pin = Object.entries(normalized.execution!.workerResources!).find(([, resource]) => resource.selection.source === "external" && resource.selection.id === "created")![0];
+      assert.equal(pin, form === "generated-key" ? "external-created" : "future");
+      raw.scheduledTasks.foreign = { ...raw.scheduledTasks.t, workerResourceId: ` ${pin} `, review: { mode: "off" } };
+    });
+    const before = await readFile(path, "utf8");
+    await assert.rejects(persistReviewSettings(path, selection(draft, opening, operations)), /preserved schedule still pins.*Reopen/);
+    assert.equal(await readFile(path, "utf8"), before);
+  });
+});
+
+for (const form of ["explicit", "generated", "agents"] as const) test(`creation rejects a latest legacy array catalog (${form}) without converting or writing`, async () => {
   await workspace(async (path, opening) => {
     const draft = structuredClone(opening);
     const definition = { adapter: "codex-cli" as const, execution: {} };
@@ -130,19 +154,18 @@ for (const form of ["keyed", "legacy-explicit", "legacy-generated"] as const) te
     const operations: ExternalAgentOperation[] = [];
     stageExternalAgentOperation(operations, opening, "created", "created", definition);
     await latest(path, (raw) => {
+      if (form === "agents") {
+        raw.externalAgents = Object.entries(raw.externalAgents).map(([id, agent]) => ({ id, ...(agent as object) }));
+        return;
+      }
       raw.execution.workerResources.future = { selection: { source: "external", id: "created" }, maxConcurrent: 1 };
-      if (form !== "keyed") raw.execution.workerResources = Object.entries(raw.execution.workerResources).map(([resourceId, resource]) => ({
-        ...(resource as object), ...(form === "legacy-generated" && resourceId === "future" ? {} : { resourceId }),
+      raw.execution.workerResources = Object.entries(raw.execution.workerResources).map(([resourceId, resource]) => ({
+        ...(resource as object), ...(form === "generated" && resourceId === "future" ? {} : { resourceId }),
       }));
-      // Derive the pin through the real importer, so this regression cannot
-      // accidentally test an unsupported legacy identity field.
-      const imported = normalizeConfig({ execution: { workerResources: raw.execution.workerResources } });
-      const pin = Object.entries(imported.execution!.workerResources!).find(([, resource]) => resource.selection.source === "external" && resource.selection.id === "created")![0];
-      assert.equal(pin, form === "legacy-generated" ? "external-created" : "future");
-      raw.scheduledTasks.foreign = { ...raw.scheduledTasks.t, workerResourceId: ` ${pin} `, review: { mode: "off" } };
+      raw.scheduledTasks.foreign = { ...raw.scheduledTasks.t, workerResourceId: form === "generated" ? "external-created" : "future", review: { mode: "off" } };
     });
     const before = await readFile(path, "utf8");
-    await assert.rejects(persistReviewSettings(path, selection(draft, opening, operations)), /preserved schedule still pins.*Reopen/);
+    await assert.rejects(persistReviewSettings(path, selection(draft, opening, operations)), /invalid on disk.*Reopen/);
     assert.equal(await readFile(path, "utf8"), before);
   });
 });
@@ -218,7 +241,7 @@ test("unsaved create/rename is one insertion; collision rejects and unrelated la
     stageExternalAgentOperation(operations, opening, "new", "new", definition);
     stageExternalAgentOperation(operations, opening, "new", "back", definition);
     Object.defineProperty(draft.externalAgents!, "back", { value: definition, enumerable: true });
-    await latest(path, (raw) => { raw.externalAgents.push({ id: "newest", adapter: "claude-cli", review: {} }); });
+    await latest(path, (raw) => { raw.externalAgents.newest = { adapter: "claude-cli", review: {} }; });
     await persistReviewSettings(path, selection(draft, opening, operations));
     const saved = JSON.parse(await readFile(path, "utf8"));
     assert.ok(saved.externalAgents.back); assert.ok(saved.externalAgents.newest); assert.equal(saved.externalAgents.new, undefined);

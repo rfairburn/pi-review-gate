@@ -3,12 +3,12 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { DEFAULT_CONFIG, loadConfig, normalizeConfig, recoverConfig } from "../src/config";
+import { DEFAULT_CONFIG, loadConfig, normalizeConfig, recoverConfig, resolvedExecutorPool, resolvedWorkerRoute } from "../src/config";
 
-const resources = [{ resourceId: "worker", selection: { source: "pi", model: "test/model", thinkingLevel: "low" }, maxConcurrent: 2 }];
-// Recovery inputs stay in the deprecated legacy array form on purpose; every
-// recovered config carries the canonical keyed catalog.
-const recoveredResources = { worker: { selection: { source: "pi", model: "test/model", thinkingLevel: "low" }, maxConcurrent: 2 } };
+// The ID-keyed object is the sole catalog shape: recovery inputs and the
+// recovered config both carry it.
+const resources = { worker: { selection: { source: "pi", model: "test/model", thinkingLevel: "low" }, maxConcurrent: 2 } };
+const recoveredResources = resources;
 const reviewers = [{ source: "pi", model: "test/reviewer", thinkingLevel: "high" }];
 const configured = {
   review: { activeReviewers: reviewers },
@@ -82,13 +82,17 @@ test("invalid collection entries do not discard healthy siblings or invent repla
     review: { activeReviewers: [...reviewers, { source: "pi", model: "other", thinkingLevel: "invalid" }] },
     execution: {
       routes: { execute: [{ resourceId: "missing" }, { resourceId: "worker" }] },
-      workerResources: [null, ...resources],
+      workerResources: { broken: null, ...resources },
     },
   });
   assert.deepEqual(config.review?.activeReviewers, reviewers);
   assert.deepEqual(config.execution?.workerResources, recoveredResources);
   assert.deepEqual(config.execution?.routes?.execute, [{ resourceId: "worker", thinkingLevel: undefined }]);
-  assert.equal(warnings?.length, 3);
+  assert.deepEqual(warnings, [
+    "review.activeReviewers[1] is invalid; entry omitted.",
+    "execution.workerResources.broken is invalid or unsupported; using its default.",
+    "execution.routes.execute[0] is invalid; entry omitted.",
+  ]);
 });
 
 test("keyed catalogs recover per key, dropping only the corrupted entry", () => {
@@ -136,6 +140,91 @@ test("file loading recovers without overwriting settings and keeps the explicit 
       if (text.startsWith('{"')) assert.deepEqual(loaded.config.execution?.workerResources, recoveredResources);
     }
     assert.equal(loadConfig({ PI_REVIEW_GATE_CONFIG: path, PI_REVIEW_GATE_DISABLED: "1" }).globallyDisabled, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Removed legacy array catalogs are invalid shapes, not import inputs: startup
+// recovery applies its established warning/default contract and never invents
+// keyed entries, route fallbacks, or enrollment from the array contents.
+const legacyCatalogs = {
+  enabled: true,
+  web: { enabled: false },
+  externalAgents: [{ id: "codex-a", adapter: "codex-cli", command: "codex", review: {}, execution: {} }],
+  review: { primaryReviewers: [{ source: "pi", model: "test/reviewer" }, { source: "external", id: "codex-a" }] },
+  execution: {
+    maxWorkers: 3,
+    workerResources: [
+      { resourceId: "kept-name", selection: { source: "external", id: "codex-a" }, maxConcurrent: 1 },
+      { selection: { source: "pi", model: "test/model" }, maxConcurrent: 2 },
+    ],
+    routes: { execute: [{ resourceId: "kept-name" }, { resourceId: "pi-dGVzdC9tb2RlbA" }], research: [{ resourceId: "kept-name" }] },
+  },
+};
+
+test("legacy array catalogs recover through the established warning/default contract without conversion", () => {
+  const before = JSON.stringify(legacyCatalogs);
+  const { config, warnings } = recoverConfig(legacyCatalogs);
+  assert.equal(config.externalAgents, undefined);
+  assert.equal(config.execution?.workerResources, undefined);
+  // Routes cannot resolve through the dropped legacy entries; missing
+  // resources mean no models, never a fallback to array order.
+  assert.deepEqual(config.execution?.routes, { execute: [], research: [] });
+  assert.deepEqual(resolvedWorkerRoute(config, "execute"), []);
+  assert.deepEqual(resolvedWorkerRoute(config, "research"), []);
+  assert.deepEqual(resolvedExecutorPool(config), []);
+  // Healthy siblings, including ordered reviewer priorities, survive verbatim.
+  assert.equal(config.enabled, true);
+  assert.equal(config.web?.enabled, false);
+  assert.equal(config.execution?.maxWorkers, 3);
+  assert.deepEqual(config.review?.primaryReviewers, legacyCatalogs.review.primaryReviewers);
+  assert.deepEqual(warnings, [
+    "externalAgents is invalid or unsupported; using its default.",
+    "execution.workerResources is invalid or unsupported; using its default.",
+    "execution.routes.execute[0] is invalid; entry omitted.",
+    "execution.routes.execute[1] is invalid; entry omitted.",
+    "execution.routes.research[0] is invalid; entry omitted.",
+  ]);
+  assert.equal(JSON.stringify(legacyCatalogs), before);
+});
+
+test("a legacy array catalog alongside a keyed one drops only the legacy catalog", () => {
+  const agents = { "codex-a": { adapter: "codex-cli", command: "codex", review: {}, execution: {} } };
+  const { config, warnings } = recoverConfig({
+    externalAgents: agents,
+    execution: { workerResources: legacyCatalogs.execution.workerResources, routes: { execute: [] } },
+  });
+  assert.deepEqual(Object.keys(config.externalAgents!), ["codex-a"]);
+  assert.equal(config.execution?.workerResources, undefined);
+  assert.deepEqual(warnings, ["execution.workerResources is invalid or unsupported; using its default."]);
+  const keyedResources = recoverConfig({
+    externalAgents: legacyCatalogs.externalAgents,
+    execution: { workerResources: resources, routes: configured.execution.routes },
+  });
+  assert.equal(keyedResources.config.externalAgents, undefined);
+  assert.deepEqual(keyedResources.config.execution?.workerResources, resources);
+  assert.deepEqual(keyedResources.config.execution?.routes?.execute, [{ resourceId: "worker", thinkingLevel: undefined }]);
+  assert.deepEqual(keyedResources.warnings, ["externalAgents is invalid or unsupported; using its default."]);
+});
+
+test("startup loading of legacy array catalogs warns, keeps the source file untouched, and stays enabled", () => {
+  const dir = mkdtempSync(join(tmpdir(), "config-recovery-legacy-"));
+  const path = join(dir, "config.json");
+  try {
+    const text = JSON.stringify(legacyCatalogs, null, 2);
+    writeFileSync(path, text);
+    const loaded = loadConfig({ PI_REVIEW_GATE_CONFIG: path });
+    assert.equal(loaded.path, path);
+    assert.equal(loaded.globallyDisabled, undefined);
+    assert.equal(loaded.disabledReason, undefined);
+    assert.equal(loaded.config.enabled, true);
+    assert.deepEqual(loaded.config, recoverConfig(legacyCatalogs).config);
+    assert.ok(loaded.warnings?.includes("externalAgents is invalid or unsupported; using its default."));
+    assert.ok(loaded.warnings?.includes("execution.workerResources is invalid or unsupported; using its default."));
+    // Loading never rewrites the legacy document into a keyed catalog.
+    assert.equal(readFileSync(path, "utf8"), text);
+    assert.throws(() => normalizeConfig(JSON.parse(readFileSync(path, "utf8"))), /externalAgents must be an object/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

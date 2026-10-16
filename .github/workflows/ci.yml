@@ -297,6 +297,64 @@ jobs:
         # this native evidence must still be collected when an earlier case in the
         # step fails. Every existing case and failure status is unchanged.
         run: node --test dist-test/tests/pi-child-launch.test.js dist-test/tests/pi-child-teardown.test.js dist-test/tests/pi-settlement-lineage-diagnostics.test.js
+      # Issue #335 follow-up: fixed-size native compaction lineage sampling.
+      # Manual dispatch ONLY — the step is inert for pull_request and push, so it
+      # never changes what the required Windows launcher check proves. It exists
+      # because the initial exact-head diagnostic run collected no refusal: this is
+      # finite sampling for evidence, not retry-for-green. Five predetermined fresh
+      # invocations of the ONE existing compiled case, each in its own `node --test`
+      # process, so every sample starts its own owned `cmd.exe`-rooted children and
+      # the unmodified production lineage query verifies each fresh child once.
+      # An earlier failure never stops a later sample, no sample is ever rerun, and
+      # every sample's exit code is collected: any nonzero exit fails the step.
+      # The case, its assertions, and its fixtures stay untouched (disposable fake
+      # pi bin, no provider/model call), the environment is exactly the pinned Pi
+      # 1.3.0 runtime env of the child-launch step above, and no process, lineage,
+      # or job deadline is extended — only this step carries its own finite cap
+      # inside the job's existing 20-minute budget. Five greens are five more
+      # samples: they prove no cause and apply no correction.
+      - name: Compaction lineage sampling (manual dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        # Bounded inside the job's existing 20-minute cap; nothing else in this job
+        # (or in the tested process/lineage paths) gains or loses a deadline.
+        timeout-minutes: 10
+        env:
+          PI_REVIEW_GATE_INSTALLED_PI_BIN: ${{ runner.temp }}\pi-ui-runtime\node_modules\.bin
+          PI_REVIEW_GATE_INSTALLED_AGENT: ${{ runner.temp }}\pi-ui-runtime\node_modules\@earendil-works\pi-coding-agent
+          PI_REVIEW_GATE_CANDIDATE_ENTRY: ${{ github.workspace }}\dist\src\index.js
+          PI_REVIEW_GATE_REQUIRE_PI_HOST: "1"
+          PI_REVIEW_GATE_EXPECT_PI_VERSION: "1.3.0"
+        run: |
+          $title = 'executor compaction recovery launches the default pi child through the same resolver'
+          $pattern = '^' + $title + '$'
+          $suite = 'dist-test/tests/pi-child-launch.test.js'
+          $samples = 0
+          $failed = 0
+          while ($samples -lt 5) {
+            $samples++
+            $evidence = Join-Path $env:RUNNER_TEMP ("compaction-lineage-sample-{0}.tap" -f $samples)
+            Write-Output "compaction lineage sample $samples of 5"
+            node --test --test-name-pattern="$pattern" --test-reporter=spec --test-reporter-destination=stdout --test-reporter=tap --test-reporter-destination="$evidence" $suite
+            $exit = $LASTEXITCODE
+            # A sample counts only when the anchored pattern's case actually ran:
+            # a filtered zero-test invocation reports green, which would be false
+            # evidence, so a sample with no recorded case counts as failed.
+            $ran = (Test-Path -LiteralPath $evidence) -and (Select-String -LiteralPath $evidence -Pattern $title -SimpleMatch -Quiet)
+            if ($exit -ne 0) {
+              Write-Output "compaction lineage sample $samples failed with exit code $exit"
+              $failed++
+            } elseif (-not $ran) {
+              Write-Output "::error::compaction lineage sample $samples ran no matching test; the anchored case did not execute"
+              $failed++
+            } else {
+              Write-Output "compaction lineage sample $samples passed"
+            }
+          }
+          Write-Output "compaction lineage sampling: $($samples - $failed) of $samples fixed samples passed"
+          if ($failed -gt 0) {
+            Write-Output "::error::compaction lineage sampling: $failed of $samples fixed samples failed (a failed sample is evidence, not a confirmed cause)"
+            exit 1
+          }
       - name: Static docs validation
         run: node scripts/check-docs.cjs
       - name: Docs checker regression tests

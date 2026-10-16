@@ -379,6 +379,28 @@ root, guards each step separately, waits for each fixture's actual `close` event
 (an error event is not closure evidence), and keeps the ownership records on disk
 whenever settlement stays unconfirmed instead of deleting its only evidence.
 
+The native launcher job also carries one manual-dispatch-only sampling step for the
+same unresolved question. `Compaction lineage sampling (manual dispatch only)` is
+gated on `workflow_dispatch`, so pull-request and push runs of the required Windows
+launcher check never execute or report it. It runs exactly five predetermined fresh
+invocations of the existing
+`executor compaction recovery launches the default pi child through the same resolver`
+case — selected by a `--test-name-pattern` anchored to that exact title, each in its
+own `node --test` process, against the same pinned installed Pi 1.3.0 environment as
+the required child-launch step — so each sample starts its own owned `cmd.exe`-rooted
+children and the unmodified production lineage query verifies each fresh child once.
+The case, its assertions, and its disposable fake `pi` fixture are unchanged and no
+provider or model call is made. All five samples always run: an earlier failure never
+stops a later sample, no sample is ever rerun, and every sample's exit code is
+collected, so any nonzero exit fails the step; a sample whose anchored case is absent
+from its recorded TAP evidence also counts as failed, so a renamed or filtered case
+cannot report green. The step carries its own finite timeout inside the job's existing
+20-minute cap and extends no process, lineage, or job deadline. Fixed sampling is
+evidence only: five passing samples establish no cause and apply no correction, and a
+failing sample identifies only that one sample of a still-unproven refusal. The
+`ci-workflow` contract tests pin the event gate, the fixed count, the reused
+installed-Pi environment, and the accumulate-then-fail behavior.
+
 The extension selects the configured [operating-mode prompt](configuration.md#operating-modes)
 for each new run; each prompt opens with a startup cue to read the matching shipped
 skill, which provides deeper guidance — decomposition, beneficial

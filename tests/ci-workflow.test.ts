@@ -706,6 +706,172 @@ test("native Windows launcher job freshly installs and requires exact Pi 1.3.0 c
   }
 });
 
+// --- Manual-dispatch compaction lineage sampling (#335 follow-up) ----------
+// The exact-head diagnostic run of the settlement-lineage stage codes collected
+// no refusal, so the workflow carries one finite sampling step. These assertions
+// pin it as evidence collection and nothing else: inert on every required-check
+// trigger path, exactly five fresh invocations of the one existing compiled case,
+// every predetermined sample run regardless of an earlier failure, any failure
+// failing the step, and no new configuration, model call, or deadline.
+
+const SAMPLING_STEP = "Compaction lineage sampling (manual dispatch only)";
+const CHILD_LAUNCH_STEP = "Pi child launch tests (alias-independent, native Windows)";
+const COMPACTION_CASE_TITLE = "executor compaction recovery launches the default pi child through the same resolver";
+const COMPACTION_SAMPLE_COUNT = 5;
+
+/** One named step inside a job block: from its entry to the next step entry. */
+function stepOf(jobBlock: string, stepName: string): string {
+  const start = jobBlock.indexOf(`      - name: ${stepName}`);
+  assert.ok(start >= 0, `the ${stepName} step must exist`);
+  const after = jobBlock.slice(start + 1);
+  const next = after.search(/^      - /m);
+  return next === -1 ? after : after.slice(0, next);
+}
+
+/** Every step entry in a job block, in file order. */
+function stepsOf(jobBlock: string): string[] {
+  const steps: string[] = [];
+  let current: string[] | null = null;
+  for (const line of jobBlock.split("\n")) {
+    if (/^      - /.test(line)) {
+      if (current) steps.push(current.join("\n"));
+      current = [line];
+      continue;
+    }
+    if (current) current.push(line);
+  }
+  if (current) steps.push(current.join("\n"));
+  return steps;
+}
+
+/** A step's `env:` mapping lines, or the empty string when it declares none. */
+function stepEnvOf(stepBlock: string): string {
+  const match = stepBlock.match(/^        env:\n((?:          .*\n?)*)/m);
+  return match ? match[1] : "";
+}
+
+/** A step's block-scalar `run:` body. */
+function stepRunOf(stepBlock: string): string {
+  const match = stepBlock.match(/^        run: \|\n((?:          .*\n?)*)/m);
+  assert.ok(match, "the step must carry a block-scalar run body");
+  return match[1];
+}
+
+/** The sampling loop body: from the counted `while` line to its own closing brace. */
+function samplingLoopBody(run: string): string {
+  const lines = run.split("\n");
+  const start = lines.findIndex((line) => /^          while \(\$samples -lt \d+\) \{$/.test(line));
+  assert.ok(start !== -1, "the samples must be driven by a counted while loop over $samples");
+  const body: string[] = [];
+  for (const line of lines.slice(start + 1)) {
+    if (line === "          }") break;
+    body.push(line);
+  }
+  assert.ok(body.length > 0, "the sampling loop must have a body");
+  return body.join("\n");
+}
+
+test("compaction lineage sampling runs only on manual dispatch with the pinned Pi environment", () => {
+  const job = blockOf(readWorkflow(), "windows-launcher", 2);
+  assert.doesNotMatch(readWorkflow(), /^  [a-z-]*sampl[a-z-]*:$/m,
+    "sampling must stay a step of the existing Windows launcher job, never a new job");
+  assert.doesNotMatch(job, /^    if:/m,
+    "the Windows launcher job itself must stay unconditional so every enforced trigger path keeps its required native coverage");
+
+  const dispatchGated = stepsOf(job).filter((step) => /^        if: github\.event_name == 'workflow_dispatch'$/m.test(step));
+  assert.equal(dispatchGated.length, 1, "exactly one Windows launcher step may be manual-dispatch gated");
+  assert.ok(dispatchGated[0].includes(`- name: ${SAMPLING_STEP}`),
+    "the manual-dispatch gate belongs to the compaction lineage sampling step alone");
+
+  const step = stepOf(job, SAMPLING_STEP);
+  assert.match(step, /^        if: github\.event_name == 'workflow_dispatch'\s*$/m,
+    "the sampling step must be gated on the workflow_dispatch event alone");
+
+  // Same pinned installed Pi 1.3.0 environment as the required child-launch step:
+  // no new configuration surface, and missing prerequisites still hard-fail.
+  const child = stepOf(job, CHILD_LAUNCH_STEP);
+  assert.ok(job.indexOf(`- name: ${CHILD_LAUNCH_STEP}`) < job.indexOf(`- name: ${SAMPLING_STEP}`),
+    "the samples must run against the installed runtime the child-launch step provisions");
+  assert.equal(stepEnvOf(step), stepEnvOf(child),
+    "the sampling step must reuse the child-launch step's pinned installed-Pi environment exactly: no new flags, no relaxed host gate");
+  assert.match(stepEnvOf(step), /PI_REVIEW_GATE_REQUIRE_PI_HOST: "1"/,
+    "missing installed-host prerequisites must fail the sample rather than skip it");
+  assert.match(stepEnvOf(step), /PI_REVIEW_GATE_EXPECT_PI_VERSION: "1\.3\.0"/,
+    "the samples must use the same exact Pi 1.3.0 runtime as the required native step");
+  assert.doesNotMatch(step, /continue-on-error/,
+    "a sampling failure must fail the step; it can never be tolerated into green");
+  assert.doesNotMatch(step, /--model|API_KEY|OPENAI|ANTHROPIC|provider/i,
+    "the samples must not add a provider or model call");
+
+  // Bounded, and bounded only by this step: the job cap and every deadline inside
+  // the tested process/lineage paths stay exactly as they were.
+  assert.match(step, /^        timeout-minutes: 10\s*$/m,
+    "the sampling step must carry its own finite cap");
+  assert.match(job, /^    timeout-minutes: 20\s*$/m,
+    "the Windows launcher job cap must stay exactly 20 minutes; the samples fit inside it");
+  assert.doesNotMatch(stepRunOf(step), /--test-timeout|--test-concurrency|--test-only/,
+    "the sampling command must not add or relax per-test bounds or selection beyond the anchored name pattern");
+});
+
+test("compaction lineage sampling runs five fixed fresh samples and fails on any failed sample", () => {
+  const job = blockOf(readWorkflow(), "windows-launcher", 2);
+  const run = stepRunOf(stepOf(job, SAMPLING_STEP));
+
+  // The sampled case is the existing compiled case, selected by an anchored
+  // exact-title pattern that matches exactly one test in the file. A rename must
+  // fail here rather than turn every sample into a vacuous green.
+  const testSource = readFileSync(join(projectRoot, "tests", "pi-child-launch.test.ts"), "utf8");
+  const titles = [...testSource.matchAll(/^test\("([^"]+)"/gm)].map((match) => match[1]);
+  assert.ok(titles.includes(COMPACTION_CASE_TITLE),
+    "the sampled case must keep its exact title in tests/pi-child-launch.test.ts");
+  assert.doesNotMatch(COMPACTION_CASE_TITLE, /[.*+?^${}()|[\]\\]/,
+    "the anchored-pattern assertions below assume a metacharacter-free case title");
+  const titleAssignment = run.match(/^          \$title = '([^']+)'\s*$/m);
+  assert.ok(titleAssignment, "the sampled case title must be pinned verbatim in the step");
+  assert.equal(titleAssignment[1], COMPACTION_CASE_TITLE);
+  assert.match(run, /^          \$pattern = '\^' \+ \$title \+ '\$'$/m,
+    "the selection pattern must anchor the exact case title with ^ and $");
+  assert.equal(titles.filter((title) => new RegExp(`^${COMPACTION_CASE_TITLE}$`).test(title)).length, 1,
+    "the anchored pattern must select exactly the one sampled case");
+
+  // Exactly one test invocation exists in the step: the five samples come from the
+  // counted loop, never from duplicated, fallback, or retry command lines.
+  const invocations = run.match(/^\s*node --test .*$/gm) ?? [];
+  assert.equal(invocations.length, 1,
+    "the step must contain exactly one test invocation: five samples come from the counted loop, never from repeated or fallback command lines");
+  assert.match(invocations[0], /--test-name-pattern="\$pattern"/,
+    "each sample must select the case through the anchored pattern");
+  assert.match(run, /^          \$suite = 'dist-test\/tests\/pi-child-launch\.test\.js'\s*$/m,
+    "the sampled suite must be the existing compiled child-launch file");
+  assert.ok(invocations[0].trim().endsWith("$suite"),
+    "each sample must run only that one existing compiled suite file, with no additional targets");
+  assert.equal((run.match(/dist-test\/tests\/[\w.-]+/g) ?? []).length, 1,
+    "exactly one compiled test file may be named anywhere in the step");
+  assert.doesNotMatch(invocations[0], /--test-update|sed |perl |Set-Content|Out-File|Add-Content/,
+    "the step must not rewrite the sampled test, its assertions, or its fixtures");
+
+  // Fixed size, one increment per iteration, no early exit, accumulated failure.
+  assert.match(run, new RegExp(`^          while \\(\\$samples -lt ${COMPACTION_SAMPLE_COUNT}\\) \\{$`, "m"),
+    `the loop must be fixed at exactly ${COMPACTION_SAMPLE_COUNT} predetermined samples`);
+  assert.equal((run.match(/-lt \d+/g) ?? []).length, 1, "the sample count must appear exactly once, as the loop bound");
+  const loop = samplingLoopBody(run);
+  assert.equal((loop.match(/\$samples\+\+/g) ?? []).length, 1,
+    "one sample consumed per iteration: no sample is ever rerun");
+  assert.doesNotMatch(loop, /^\s*(?:break|continue|exit)\b|;\s*(?:break|continue|exit)\b/m,
+    "an earlier failure must never stop a later predetermined sample or leave the loop early");
+  assert.match(loop, /\$ran = \(Test-Path[\s\S]*Select-String[\s\S]*-SimpleMatch -Quiet\)/,
+    "a sample counts only when the anchored case actually ran: a filtered zero-test run must not report green");
+  assert.equal((loop.match(/\$failed\+\+/g) ?? []).length, 2,
+    "both failure paths must accumulate: a nonzero sample exit and a sample that ran no matching case");
+  assert.match(run, /if \(\$failed -gt 0\) \{[\s\S]*exit 1/,
+    "any accumulated sample failure must fail the step");
+  assert.equal((run.match(/^\s*exit \d+$/gm) ?? []).length, 1,
+    "the step exits exactly once, after every sample has run");
+  assert.ok(run.indexOf("exit 1") > run.indexOf("fixed samples passed"),
+    "the failure exit must come after the post-loop summary, never inside the sampling loop");
+  assert.doesNotMatch(run, /\|\| *true|-RetryCount|retry/i, "no retry-for-green path is allowed anywhere in the step");
+});
+
 test("engine floor, CI minimum, and locked Pi fixtures stay consistent", () => {
   // Keep the package engine floor aligned with CI's minimum line; the
   // independently pinned Pi test runtimes retain their own version contracts.

@@ -31,6 +31,17 @@ dates.
   query child with no retry, owned-root ownership, PID binding, and the receipt
   wire schema and HMAC identity are unchanged, and no query output, error text,
   command line, host path, or PID is ever reported.
+- The Windows launcher workflow adds one manual-dispatch-only sampling step (#335):
+  five fixed fresh invocations of the existing compaction-recovery child case, each
+  in its own `node --test` process selected by a name pattern anchored to that exact
+  title and reusing the pinned installed Pi 1.3.0 environment, so every sample starts
+  its own owned children and the unmodified lineage query verifies each fresh child
+  once. All five samples run regardless of an earlier failure, every exit code is
+  collected, and any failed sample fails the step; nothing is rerun, no sample stops
+  the loop early, and a sample that ran no matching case counts as failed. Required
+  checks, the case and its assertions, and every process, lineage, and job deadline
+  are unchanged: fixed sampling is diagnostic evidence, and a green run establishes no
+  cause and applies no correction.
 
 ## [0.1.0-dev.163]
 

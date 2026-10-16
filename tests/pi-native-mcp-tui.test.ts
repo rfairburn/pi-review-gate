@@ -322,6 +322,125 @@ async function runDriver(
 }
 
 /**
+ * Loads only the driver's original top-level `pump` definition via AST (no
+ * driver top-level process setup runs) and drives it with a stubbed monotonic
+ * clock against the real `select.select` on an idle pipe. Each case reports
+ * the select timeouts it observed, how often the child was polled, the final
+ * clock, and any exception.
+ */
+const PUMP_HARNESS = String.raw`
+import ast, json, os, select, sys, types
+
+driver_path = sys.argv[1]
+with open(driver_path, encoding="utf-8") as handle:
+    tree = ast.parse(handle.read(), driver_path)
+pumps = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "pump"]
+if len(pumps) != 1:
+    raise SystemExit("driver must define exactly one top-level pump()")
+code = compile(ast.fix_missing_locations(ast.Module(body=pumps, type_ignores=[])), driver_path, "exec")
+
+class DriverAbort(Exception):
+    pass
+
+def run(start, seconds, overall_deadline, on_poll=None):
+    clock = {"now": start}
+    timeouts, polls = [], []
+    read_fd, write_fd = os.pipe()
+    def monotonic():
+        return clock["now"]
+    def recording_select(rlist, wlist, xlist, timeout):
+        timeouts.append(timeout)
+        result = select.select(rlist, wlist, xlist, timeout)
+        clock["now"] += timeout
+        return result
+    namespace = {
+        "__builtins__": __builtins__,
+        "time": types.SimpleNamespace(monotonic=monotonic),
+        "select": types.SimpleNamespace(select=recording_select),
+        "os": os,
+        "master": read_fd,
+        "buffer": bytearray(),
+        "alive": True,
+        "OVERALL_SECONDS": 360,
+        "overall_deadline": overall_deadline,
+        "DriverAbort": DriverAbort,
+    }
+    def poll_child():
+        polls.append(clock["now"])
+        if on_poll:
+            on_poll(clock, namespace)
+    namespace["poll_child"] = poll_child
+    exec(code, namespace)
+    error = None
+    try:
+        namespace["pump"](seconds)
+    except Exception as caught:
+        error = f"{type(caught).__name__}: {caught}"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+    return {"error": error, "timeouts": timeouts, "polls": len(polls), "finalClock": clock["now"]}
+
+def cross_deadline(clock, _namespace):
+    # Scheduling delay lands after the loop's deadline check but before the
+    # select timeout is computed.
+    if clock["now"] < 101.0:
+        clock["now"] = 101.25
+
+def child_exits(_clock, namespace):
+    namespace["alive"] = False
+
+print(json.dumps({
+    "crossing": run(100.0, 1.0, 1000.0, cross_deadline),
+    "slices": run(100.0, 0.4, 1000.0),
+    "overallCap": run(100.0, 5.0, 100.2),
+    "overallAbort": run(100.0, 1.0, 100.0),
+    "childExit": run(100.0, 1.0, 1000.0, child_exits),
+}))
+`;
+
+type PumpCase = { error: string | null; timeouts: number[]; polls: number; finalClock: number };
+
+test("PTY driver pump never passes a negative select timeout when its deadline passes mid-iteration", { timeout: 60_000 }, (t) => {
+  if (!hasPython3()) {
+    skipOrFail(t, "native MCP TUI driver regression prerequisite unavailable: python3");
+    return;
+  }
+  const driverPath = join(projectRoot, "tests", "fixtures", "pi-native-mcp-tui-driver.py");
+  const run = spawnSync("python3", ["-I", "-c", PUMP_HARNESS, driverPath], { encoding: "utf8", timeout: 30_000 });
+  assert.equal(run.status, 0, `pump harness failed: ${String(run.error ?? "")}\n${run.stdout}\n${run.stderr}`);
+  const cases = JSON.parse(run.stdout) as Record<string, PumpCase>;
+  const near = (actual: number, expected: number, label: string): void =>
+    assert.ok(Math.abs(actual - expected) < 1e-9, `${label}: expected ${expected}, got ${actual}`);
+
+  const crossing = cases.crossing!;
+  assert.equal(crossing.error, null, "a deadline crossed between monotonic reads must not reach select as a negative timeout");
+  assert.deepEqual(crossing.timeouts, [0], "the crossed deadline clamps to one non-blocking select, never a negative or extended wait");
+  assert.equal(crossing.polls, 1, "the loop terminates on the original deadline after the crossed iteration");
+  near(crossing.finalClock, 101.25, "crossing final clock");
+
+  const slices = cases.slices!;
+  assert.equal(slices.error, null);
+  assert.equal(slices.timeouts.length, 3, "a 0.4s pump still waits in 0.15s slices up to its deadline");
+  for (const timeout of slices.timeouts) assert.ok(timeout > 0 && timeout <= 0.15, `slice timeout out of bounds: ${timeout}`);
+  near(slices.finalClock, 100.4, "the original per-call deadline is not extended");
+
+  const overallCap = cases.overallCap!;
+  assert.equal(overallCap.error, null);
+  near(overallCap.finalClock, 100.2, "the overall elapsed deadline still caps a longer pump");
+
+  const overallAbort = cases.overallAbort!;
+  assert.match(overallAbort.error ?? "", /^DriverAbort: PTY lifecycle exceeded its 360s overall deadline$/,
+    "an exhausted overall deadline still aborts before any select");
+  assert.deepEqual(overallAbort.timeouts, []);
+
+  const childExit = cases.childExit!;
+  assert.equal(childExit.error, null);
+  assert.deepEqual(childExit.timeouts, [], "a reaped child still ends the pump before select");
+  assert.equal(childExit.polls, 1);
+});
+
+/**
  * Prerequisites shared by every candidate TUI session test. Returns the host
  * and compiled-candidate prerequisites, or skips with the real reasons.
  */

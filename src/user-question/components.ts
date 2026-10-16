@@ -49,6 +49,22 @@
  * option rows with the draft kept; Ctrl+D on an empty editor returns to the
  * option rows instead of exiting Pi.
  *
+ * Fullscreen pointer input (#431): the public custom overlay hands this
+ * component to pi-tui directly, so pointer events arrive in coordinates local
+ * to the last frame it returned. Each render maps every drawn row of a list
+ * row, answer choice, Type something, Decline, or notice action back to the
+ * exact controller record it showed — through content wrapping, framing, and
+ * the manual viewport offset — covering only the row's drawn prefix and text.
+ * A left press highlights that item (while editing, a transient highlight
+ * leaves the native field untouched); the completed native click on the same
+ * live item, in a frame with unchanged bounds and viewport budget, runs the
+ * item's existing confirm action, exactly as Enter on that selection would.
+ * A menu click while editing first leaves editing with the draft kept; the
+ * editor box is not a menu entry and never submits by pointer. Every
+ * non-wheel pointer event inside the popup is consumed (wheel stays the
+ * host's), keyboard input cancels a pending gesture, and a closed popup
+ * intercepts nothing. Regular mode delivers no pointer input at all.
+ *
  * When the host's native seams are unavailable (no
  * setEditorComponent/getEditorComponent, or the agent module cannot be
  * loaded) the free-text row renders an unavailable line: the question stays
@@ -60,7 +76,7 @@ import type { FieldEditorInstance } from "../native-editor-bridge";
 import { safeMarkdownDisplaySource } from "../markdown-safety";
 import { visibleTerminalText } from "../tool-result-text";
 import type { QuestionMarkdownComponent, QuestionScrollViewComponent, QuestionTuiHost } from "./pi-tui-host";
-import type { PendingNotice, PendingUserInput, SubmitResult, UserQuestionController } from "./controller";
+import type { PendingNotice, PendingQuestion, PendingUserInput, SubmitResult, UserQuestionController } from "./controller";
 
 /** The approved chord; the label shown to users is platform-specific. */
 export const QUESTION_LIST_SHORTCUT_KEY = "ctrl+alt+up";
@@ -105,6 +121,14 @@ export interface QuestionListComponentOptions {
   isStale?: () => boolean;
   /** Row budget matching the custom overlay's public maxHeight. */
   getViewportRows?: () => number | undefined;
+  /**
+   * Live terminal dimensions. The host only schedules a redraw on resize, so
+   * a pointer gesture can complete before the popup's geometry is redrawn;
+   * each published frame snapshots this probe and a gesture is rejected when
+   * the live size no longer matches. Undefined (or a throwing probe) means
+   * the size is unknown, which never matches a known snapshot.
+   */
+  getTerminalSize?: () => { columns: number; rows: number } | undefined;
   /** Invalidate the live TUI after component/controller state changes. */
   requestRender?: () => void;
   /** Test seam for exercising native ScrollView outside the custom overlay. */
@@ -112,12 +136,68 @@ export interface QuestionListComponentOptions {
   onDone: (result: QuestionListDone) => void;
 }
 
+/**
+ * Structural subset of pi-tui's normalized fullscreen mouse event. The public
+ * custom overlay passes this component to the host compositor directly, so
+ * `x`/`y` are local to its last drawn frame and `width`/`height` are that
+ * frame's composited bounds (or, while a gesture is active, the bounds
+ * captured when its press was dispatched).
+ */
+export interface QuestionMouseEvent {
+  type: "press" | "release" | "move" | "drag" | "click" | "wheel";
+  button: "left" | "middle" | "right" | "none";
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  screenX?: number;
+  screenY?: number;
+  /** Ignored: like the native SelectList, every completed click is one activation. */
+  clickCount?: number;
+}
+
+/** Structural subset of pi-tui's mouse handler result. */
+export interface QuestionMouseResult {
+  handled?: boolean;
+  render?: boolean;
+}
+
 export interface QuestionListComponent {
   render(width: number): string[];
   handleInput(data: string): void;
+  /**
+   * Fullscreen pointer input. A left press highlights a visible menu item; a
+   * completed left click on the same live item runs that item's existing
+   * confirm action. Non-wheel pointer events inside the popup are consumed so
+   * nothing reaches the background; wheel events are left to the host.
+   */
+  handleMouse(event: QuestionMouseEvent): QuestionMouseResult | undefined;
   invalidate(): void;
   /** Installs the live idle probe used for async answer delivery. */
   setSourceProbe(probe: { isIdle?: () => boolean } | undefined): void;
+}
+
+/** One actionable popup item, bound to the exact controller record it rendered. */
+type PopupItemRef =
+  | { kind: "list"; record: PendingUserInput }
+  | { kind: "answer"; record: PendingQuestion; row: number }
+  | { kind: "notice"; record: PendingNotice; action: number };
+
+/** The drawn cells of one item on one frame row (local columns, end exclusive). */
+interface PopupFrameRow {
+  ref: PopupItemRef;
+  start: number;
+  end: number;
+}
+
+/** Item geometry of the frame most recently returned to the host compositor. */
+interface PopupFrame {
+  width: number;
+  height: number;
+  viewportRows: number | undefined;
+  /** Live terminal size when this frame was produced ("unprobed" without a probe). */
+  terminal: string;
+  rows: ReadonlyArray<PopupFrameRow | undefined>;
 }
 
 interface RenderedMarkdown {
@@ -153,7 +233,18 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   let lastNativeViewportHeight = 0;
   let editing = false;
   let closed = false;
-  let cachedContent: { width: number; lines: string[] } | undefined;
+  let cachedContent: { width: number; lines: string[]; owners: Array<PopupItemRef | undefined> } | undefined;
+  // Item ranges recorded by the active list/answer/notice renderer, in its
+  // raw line coordinates, before content wrapping and framing remap them.
+  let renderedItemRanges: Array<{ start: number; end: number; ref: PopupItemRef }> = [];
+  // Mouse gesture state: the frame last returned to the compositor, the item a
+  // left press resolved in it, the same press once released (consumed by the
+  // native click that immediately follows a stationary release), and the
+  // transient editing-mode highlight that must not move the native field focus.
+  let lastFrame: PopupFrame | undefined;
+  let pressedItem: { ref: PopupItemRef; frame: PopupFrame } | undefined;
+  let releasedItem: { ref: PopupItemRef; frame: PopupFrame } | undefined;
+  let pressHighlight: PopupItemRef | undefined;
   let nativeScrollView: QuestionScrollViewComponent | undefined;
   let invalidateNativeScrollView: (() => void) | undefined;
   const markdownComponents = new Map<string, QuestionMarkdownComponent | null>();
@@ -188,6 +279,9 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   const close = (result?: SubmitResult | { kind: "notice-details"; noticeId: string; expectedNotice: PendingNotice }) => {
     if (closed) return;
     closed = true;
+    // A closed popup owns no pointer gesture or item geometry.
+    clearMouseGesture();
+    lastFrame = undefined;
     // End any open editing episode so the bridge's settle callback is
     // cleared: a late or stale settle must never act through this UI.
     endEditingEpisode();
@@ -314,34 +408,77 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       if (!id) return;
       const record = controller.getPending(id);
       if (!record) return;
-      selectedId = id;
-      resetScroll();
-      if (isNotice(record)) {
-        mode = "notice";
-        noticeActionIndex = 0;
-      } else {
-        mode = "answer";
-        answerIndex = 0;
-        answerFocusPending = true;
-        // A new answer-view session starts fresh — the shared instance's text
-        // is cleared so a previous question's draft never shows or submits as
-        // this one's (the host undo history has no public clear, so an earlier
-        // deliberate Ctrl+- could still surface prior text — same as settings).
-        const field = options.nativeField;
-        if (field) {
-          try {
-            field.setText("");
-          } catch {
-            // A failing clear must not block entering the answer view.
-          }
-        }
-        endEditingEpisode();
-      }
-      invalidate();
+      openPendingRecord(id, record);
       return;
     }
     if (keybindings.matches(data, "tui.select.cancel") || matchesShortcut(data)) {
       close();
+    }
+  }
+
+  /** The list confirm action: open the selected question's answer view or notice details. */
+  function openPendingRecord(id: string, record: PendingUserInput): void {
+    selectedId = id;
+    resetScroll();
+    if (isNotice(record)) {
+      mode = "notice";
+      noticeActionIndex = 0;
+    } else {
+      mode = "answer";
+      answerIndex = 0;
+      answerFocusPending = true;
+      // A new answer-view session starts fresh — the shared instance's text
+      // is cleared so a previous question's draft never shows or submits as
+      // this one's (the host undo history has no public clear, so an earlier
+      // deliberate Ctrl+- could still surface prior text — same as settings).
+      const field = options.nativeField;
+      if (field) {
+        try {
+          field.setText("");
+        } catch {
+          // A failing clear must not block entering the answer view.
+        }
+      }
+      endEditingEpisode();
+    }
+    invalidate();
+  }
+
+  /** The answer-view confirm action for one row of the selected question. */
+  function confirmAnswerRow(id: string, row: string | typeof TYPE_ROW | typeof DECLINE_ROW | undefined): void {
+    if (row === undefined) return;
+    if (row === TYPE_ROW) {
+      // No-op when the native field is unavailable: the question stays
+      // pending and the choices/Decline remain usable.
+      beginEditingEpisode();
+      return;
+    }
+    if (row === DECLINE_ROW) {
+      submitFromAnswer(controller.submitDecline(id));
+      return;
+    }
+    submitFromAnswer(controller.submitAnswer(id, row, sourceProbe()));
+  }
+
+  /** The notice-view confirm action for More details or Close. */
+  function confirmNoticeAction(id: string, record: PendingNotice, action: string | undefined): void {
+    if (action === NOTICE_MORE_DETAILS) {
+      // Closing first restores Pi's normal editor/transcript surface. The
+      // owner then sends only after this custom interaction has resolved.
+      close({ kind: "notice-details", noticeId: id, expectedNotice: record });
+      return;
+    }
+    if (action === NOTICE_CLOSE) {
+      if (!controller.closeNotice(id)) {
+        close();
+        return;
+      }
+      if (controller.listPending().length === 0) close();
+      else {
+        mode = "list";
+        resetScroll();
+        invalidate();
+      }
     }
   }
 
@@ -376,19 +513,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       return;
     }
     if (keybindings.matches(data, "tui.select.confirm")) {
-      const row = rows[answerIndex];
-      if (row === undefined) return;
-      if (row === TYPE_ROW) {
-        // No-op when the native field is unavailable: the question stays
-        // pending and the choices/Decline remain usable.
-        beginEditingEpisode();
-        return;
-      }
-      if (row === DECLINE_ROW) {
-        submitFromAnswer(controller.submitDecline(id));
-        return;
-      }
-      submitFromAnswer(controller.submitAnswer(id, row, sourceProbe()));
+      confirmAnswerRow(id, rows[answerIndex]);
       return;
     }
     if (keybindings.matches(data, "tui.select.cancel")) {
@@ -421,23 +546,9 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       return;
     }
     if (keybindings.matches(data, "tui.select.confirm")) {
-      if (rows[noticeActionIndex] === NOTICE_MORE_DETAILS) {
-        // Closing first restores Pi's normal editor/transcript surface. The
-        // owner then sends only after this custom interaction has resolved.
-        close({ kind: "notice-details", noticeId: id, expectedNotice: record });
-        return;
-      }
-      if (rows[noticeActionIndex] === NOTICE_CLOSE) {
-        if (!controller.closeNotice(id)) {
-          close();
-          return;
-        }
-        if (controller.listPending().length === 0) close();
-        else {
-          mode = "list";
-          resetScroll();
-          invalidate();
-        }
+      const action = rows[noticeActionIndex];
+      if (action === NOTICE_MORE_DETAILS || action === NOTICE_CLOSE) {
+        confirmNoticeAction(id, record, action);
         return;
       }
     }
@@ -513,6 +624,9 @@ export function createQuestionListComponent(options: QuestionListComponentOption
 
   const handleInput = (data: string) => {
     if (closed) return;
+    // Keyboard input ends any pointer gesture: a later click can never act on
+    // a press resolved before the keyboard changed selection or mode.
+    if (clearMouseGesture()) invalidateContent();
     if (isStale()) {
       close(); // A rebound session's UI never acts on input.
       return;
@@ -544,6 +658,150 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     else handleNoticeInput(data);
   };
 
+  // ------------------------------------------------------------------
+  // Fullscreen pointer input (native-style single click)
+  // ------------------------------------------------------------------
+
+  /** Drop the gesture; true when a visible transient highlight was removed. */
+  function clearMouseGesture(): boolean {
+    pressedItem = undefined;
+    releasedItem = undefined;
+    const hadHighlight = pressHighlight !== undefined;
+    pressHighlight = undefined;
+    return hadHighlight;
+  }
+
+  function sameItem(left: PopupItemRef, right: PopupItemRef): boolean {
+    if (left.kind !== right.kind || left.record !== right.record) return false;
+    if (left.kind === "answer" && right.kind === "answer") return left.row === right.row;
+    if (left.kind === "notice" && right.kind === "notice") return left.action === right.action;
+    return true;
+  }
+
+  /**
+   * The item still exists exactly as rendered: the same controller record
+   * object (never just a reused per-session ID), in the view it was drawn
+   * for. The editor box replaces the type row while editing and is not a
+   * menu entry, so that row is never live then.
+   */
+  function isLiveItem(ref: PopupItemRef): boolean {
+    if (ref.kind === "list") {
+      return mode === "list" && controller.getPending(ref.record.id) === ref.record;
+    }
+    if (selectedId !== ref.record.id || controller.getPending(ref.record.id) !== ref.record) return false;
+    if (ref.kind === "notice") return mode === "notice" && noticeRows()[ref.action] !== undefined;
+    if (mode !== "answer") return false;
+    const row = answerRows()[ref.row];
+    if (row === undefined) return false;
+    return !(row === TYPE_ROW && editing);
+  }
+
+  /** Resolve the drawn item under a local cell of the last composited frame. */
+  function itemAt(frame: PopupFrame | undefined, event: QuestionMouseEvent): PopupItemRef | undefined {
+    if (!frame || event.width !== frame.width || event.height !== frame.height) return undefined;
+    const { x, y } = event;
+    if (!Number.isInteger(x) || !Number.isInteger(y) || y < 0 || y >= frame.height || x < 0 || x >= frame.width) {
+      return undefined;
+    }
+    const row = frame.rows[y];
+    return row && x >= row.start && x < row.end ? row.ref : undefined;
+  }
+
+  /** Same bounds and viewport budget: the compositor placed both frames at one origin. */
+  function sameGeometry(left: PopupFrame, right: PopupFrame): boolean {
+    return left.width === right.width && left.height === right.height && left.viewportRows === right.viewportRows
+      && left.terminal === right.terminal;
+  }
+
+  /** Press feedback: move the existing selection, never the viewport. */
+  function highlightItem(ref: PopupItemRef): void {
+    if (ref.kind === "answer" && editing) {
+      // The native field keeps its selection, focus, and draft while the
+      // pointer is down; only the pressed menu row shows as highlighted.
+      pressHighlight = ref;
+      invalidateContent();
+      return;
+    }
+    const keepListFocus = listFocusPending;
+    const keepAnswerFocus = answerFocusPending;
+    if (ref.kind === "list") selectedId = ref.record.id;
+    else if (ref.kind === "answer") answerIndex = ref.row;
+    else noticeActionIndex = ref.action;
+    invalidate();
+    // A press never scrolls: the item under the pointer must stay put until
+    // the click that completes it.
+    listFocusPending = keepListFocus;
+    answerFocusPending = keepAnswerFocus;
+  }
+
+  /** Run the item's existing confirm action, exactly as Enter on that selection. */
+  function activateItem(ref: PopupItemRef): void {
+    if (ref.kind === "list") {
+      openPendingRecord(ref.record.id, ref.record);
+      return;
+    }
+    if (ref.kind === "notice") {
+      noticeActionIndex = ref.action;
+      confirmNoticeAction(ref.record.id, ref.record, noticeRows()[ref.action]);
+      return;
+    }
+    // A visible choice/Decline clicked while editing first leaves editing
+    // with the draft kept (as Escape does); the draft is never submitted.
+    if (editing) endEditingEpisode();
+    answerIndex = ref.row;
+    confirmAnswerRow(ref.record.id, answerRows()[ref.row]);
+  }
+
+  const handleMouse = (event: QuestionMouseEvent): QuestionMouseResult | undefined => {
+    // A closed popup intercepts nothing: ordinary routing resumes at once.
+    if (closed || typeof event !== "object" || event === null) return undefined;
+    // Wheel scrolling over the popup is outside this click contract.
+    if (event.type === "wheel") return undefined;
+    if (event.type !== "press" && event.type !== "release" && event.type !== "click"
+      && event.type !== "move" && event.type !== "drag") return undefined;
+    if (isStale()) {
+      close(); // A rebound session's popup never acts on pointer input.
+      return { handled: true };
+    }
+    if (event.type === "press") {
+      const hadHighlight = clearMouseGesture();
+      if (hadHighlight) invalidateContent();
+      // A resize that has not been redrawn yet invalidates every drawn cell.
+      const frame = lastFrame && frameIsCurrent(lastFrame) ? lastFrame : undefined;
+      const ref = event.button === "left" ? itemAt(frame, event) : undefined;
+      if (!ref || !frame || !isLiveItem(ref)) return { handled: true, render: hadHighlight };
+      pressedItem = { ref, frame };
+      highlightItem(ref);
+      return { handled: true, render: true };
+    }
+    if (event.type === "release") {
+      releasedItem = event.button === "left" ? pressedItem : undefined;
+      pressedItem = undefined;
+      const hadHighlight = pressHighlight !== undefined;
+      pressHighlight = undefined;
+      if (hadHighlight) invalidateContent();
+      return { handled: true, render: hadHighlight };
+    }
+    if (event.type === "click") {
+      const candidate = releasedItem;
+      releasedItem = undefined;
+      // Only a stationary left press-release on one live item activates; the
+      // click count is ignored like the native SelectList.
+      // The release/click carry press-time bounds; a resize since then (even
+      // one the host has not redrawn yet) leaves no trustworthy geometry.
+      if (event.button !== "left" || !candidate || !lastFrame || !sameGeometry(lastFrame, candidate.frame)
+        || !frameIsCurrent(lastFrame)) {
+        return { handled: true, render: false };
+      }
+      const ref = itemAt(lastFrame, event);
+      if (!ref || !sameItem(ref, candidate.ref) || !isLiveItem(ref)) return { handled: true, render: false };
+      activateItem(ref);
+      return { handled: true, render: true };
+    }
+    // Pointer motion inside the popup never reaches the background.
+    return { handled: true, render: false };
+  };
+
   const renderContent = (width: number): string[] => {
     if (lastRenderedWidth !== undefined && lastRenderedWidth !== width && mode === "answer") {
       answerFocusPending = true;
@@ -563,24 +821,37 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     }
     if (closed) return []; // A closed component never renders live controller state.
     if (cachedContent?.width === width) return cachedContent.lines;
+    renderedItemRanges = [];
     const rawLines = mode === "list"
       ? renderList(width)
       : mode === "answer"
         ? renderAnswer(width)
         : renderNotice(width);
+    const rawOwners: Array<PopupItemRef | undefined> = rawLines.map(() => undefined);
+    for (const range of renderedItemRanges) {
+      for (let line = range.start; line < range.end && line < rawOwners.length; line += 1) rawOwners[line] = range.ref;
+    }
+    renderedItemRanges = [];
     const lineCounts: number[] = [];
-    const lines = rawLines.flatMap((line) => {
+    const owners: Array<PopupItemRef | undefined> = [];
+    const lines = rawLines.flatMap((line, index) => {
       const fitted = visibleWidth(line) <= width ? [line] : wrapNoticeLine(line, width);
       lineCounts.push(fitted.length);
+      for (let count = 0; count < fitted.length; count += 1) owners.push(rawOwners[index]);
       return fitted;
     });
     if (lineCounts.some((count) => count !== 1)) {
       listViewportFocus = remapViewportFocus(listViewportFocus, lineCounts);
       answerViewportFocus = remapViewportFocus(answerViewportFocus, lineCounts);
     }
-    cachedContent = { width, lines };
+    cachedContent = { width, lines, owners };
     return lines;
   };
+
+  /** Item owners of the content lines most recently produced for this width. */
+  function contentOwners(width: number, lines: readonly string[]): ReadonlyArray<PopupItemRef | undefined> {
+    return cachedContent?.width === width && cachedContent.lines === lines ? cachedContent.owners : [];
+  }
 
   function remapViewportFocus(
     focus: { start: number; end: number; anchor: number } | undefined,
@@ -612,12 +883,24 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     return Math.max(0, boundedHeight - borderRows - paddingRows);
   }
 
-  function framePopup(content: readonly string[], width: number, maxHeight?: number): string[] {
+  /**
+   * Frame content rows and, in the same pass, map every drawn row back to the
+   * item that rendered it. A row's hit cells are exactly its drawn prefix and
+   * text inside the side padding; rules, padding rows, side padding, and
+   * trailing blank cells belong to no item.
+   */
+  function framePopup(
+    content: readonly string[],
+    width: number,
+    maxHeight?: number,
+    owners: ReadonlyArray<PopupItemRef | undefined> = [],
+  ): { lines: string[]; rows: Array<PopupFrameRow | undefined> } {
     const boundedWidth = Math.max(1, Math.floor(width));
     const padding = boundedWidth >= 3 ? POPUP_HORIZONTAL_PADDING : 0;
     const innerWidth = popupContentWidth(boundedWidth);
-    const framedContent = content.flatMap((line) =>
-      visibleWidth(line) <= innerWidth ? [line] : wrapNoticeLine(line, innerWidth));
+    const framedContent = content.flatMap((line, index) =>
+      (visibleWidth(line) <= innerWidth ? [line] : wrapNoticeLine(line, innerWidth))
+        .map((fitted) => ({ line: fitted, owner: owners[index] })));
     const height = maxHeight === undefined ? undefined : Math.max(1, Math.floor(maxHeight));
     const verticalPadding = height === undefined || height >= 4 ? POPUP_VERTICAL_PADDING : 0;
     const contentLimit = height === undefined ? Number.POSITIVE_INFINITY : popupContentRows(height);
@@ -627,15 +910,75 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       const inner = line + " ".repeat(Math.max(0, innerWidth - visibleWidth(line)));
       return opaquePopupLine(" ".repeat(padding) + inner + " ".repeat(padding));
     };
+    const itemCells = (line: string, owner: PopupItemRef | undefined): PopupFrameRow | undefined => {
+      if (!owner) return undefined;
+      const drawn = Math.min(innerWidth, visibleWidth(stripAnsi(line).replace(/\s+$/u, "")));
+      return drawn > 0 ? { ref: owner, start: padding, end: padding + drawn } : undefined;
+    };
 
-    if (height === 1) return [rule];
-    if (height === 2) return [rule, rule];
+    if (height === 1) return { lines: [rule], rows: [undefined] };
+    if (height === 2) return { lines: [rule, rule], rows: [undefined, undefined] };
     const output = [rule];
-    if (verticalPadding > 0) output.push(row(""));
-    for (const line of visible) output.push(row(line));
-    if (verticalPadding > 0) output.push(row(""));
+    const rows: Array<PopupFrameRow | undefined> = [undefined];
+    if (verticalPadding > 0) {
+      output.push(row(""));
+      rows.push(undefined);
+    }
+    for (const { line, owner } of visible) {
+      output.push(row(line));
+      rows.push(itemCells(line, owner));
+    }
+    if (verticalPadding > 0) {
+      output.push(row(""));
+      rows.push(undefined);
+    }
     output.push(rule);
-    return height === undefined ? output : output.slice(0, height);
+    rows.push(undefined);
+    return height === undefined
+      ? { lines: output, rows }
+      : { lines: output.slice(0, height), rows: rows.slice(0, height) };
+  }
+
+  /** Record the frame just returned to the compositor as the only clickable geometry. */
+  function publishFrame(
+    framed: { lines: string[]; rows: Array<PopupFrameRow | undefined> },
+    width: number,
+    viewportRows: number | undefined,
+  ): string[] {
+    lastFrame = closed
+      ? undefined
+      : {
+          width: Math.max(1, Math.floor(width)),
+          height: framed.lines.length,
+          viewportRows,
+          terminal: liveTerminalSize(),
+          rows: framed.rows,
+        };
+    return framed.lines;
+  }
+
+  /**
+   * The live terminal size as a comparable key. Without a probe the frame is
+   * "unprobed" (component-only hosts); a missing, malformed, or throwing
+   * probe reports "unknown", which never equals a recorded size.
+   */
+  function liveTerminalSize(): string {
+    if (!options.getTerminalSize) return "unprobed";
+    try {
+      const size = options.getTerminalSize();
+      const columns = size?.columns;
+      const rows = size?.rows;
+      return typeof columns === "number" && typeof rows === "number" && Number.isFinite(columns) && Number.isFinite(rows)
+        ? `${Math.floor(columns)}x${Math.floor(rows)}`
+        : "unknown";
+    } catch {
+      return "unknown";
+    }
+  }
+
+  /** The frame still describes the live terminal: no resize awaits a redraw. */
+  function frameIsCurrent(frame: PopupFrame): boolean {
+    return frame.terminal !== "unknown" && frame.terminal === liveTerminalSize();
   }
 
   /**
@@ -660,11 +1003,15 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   }
 
   const renderFallback = (width: number): string[] => {
-    if (closed) return [];
+    if (closed) {
+      lastFrame = undefined;
+      return [];
+    }
     const height = options.getViewportRows ? viewportRows() : undefined;
     const contentWidth = popupContentWidth(width);
     const lines = renderContent(contentWidth);
-    if (height === undefined) return framePopup(lines, width);
+    const owners = contentOwners(contentWidth, lines);
+    if (height === undefined) return publishFrame(framePopup(lines, width, undefined, owners), width, undefined);
     const contentHeight = popupContentRows(height);
     manualScrollOffset = Math.min(Math.max(0, manualScrollOffset), Math.max(0, lines.length - contentHeight));
     if (contentHeight > 0
@@ -678,11 +1025,21 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       answerFocusPending = false;
       listFocusPending = false;
     }
-    return framePopup(lines.slice(manualScrollOffset, manualScrollOffset + contentHeight), width, height);
+    // The same offset slices the drawn lines and their item owners, so a
+    // scrolled row maps to exactly the item it shows.
+    return publishFrame(framePopup(
+      lines.slice(manualScrollOffset, manualScrollOffset + contentHeight),
+      width,
+      height,
+      owners.slice(manualScrollOffset, manualScrollOffset + contentHeight),
+    ), width, height);
   };
 
   const renderNativeScrollView = (width: number): string[] => {
-    if (closed) return [];
+    if (closed) {
+      lastFrame = undefined;
+      return [];
+    }
     const scrollView = nativeScrollView!;
     const height = scrollView.viewportHeight;
     if (height <= 0) {
@@ -716,7 +1073,9 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       answerFocusPending = false;
       listFocusPending = false;
     }
-    return framePopup(scrollView.render(contentWidth).slice(0, contentHeight), width, outerHeight);
+    // The ScrollView seam keeps its own scroll position, so its rows carry no
+    // item map: pointer input stays consumed but never activates an item.
+    return publishFrame(framePopup(scrollView.render(contentWidth).slice(0, contentHeight), width, outerHeight), width, outerHeight);
   };
 
   function scrollNativeBy(amount: number): void {
@@ -823,6 +1182,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       for (const rest of first.slice(1)) {
         lines.push(" ".repeat(visibleWidth(prefix)) + rest);
       }
+      renderedItemRanges.push({ start: rowStart, end: lines.length, ref: { kind: "list", record } });
       if (record.id === selection) {
         listViewportFocus = { start: rowStart, end: rowStart, anchor: rowStart };
       }
@@ -875,7 +1235,10 @@ export function createQuestionListComponent(options: QuestionListComponentOption
         }
         return;
       }
-      const prefix = selected ? theme.fg("accent", "> ") : "  ";
+      // While editing, a pressed menu row shows the press highlight without
+      // moving the native field's selection, focus, or draft.
+      const pressed = pressHighlight?.kind === "answer" && pressHighlight.record === record && pressHighlight.row === index;
+      const prefix = selected || pressed ? theme.fg("accent", "> ") : "  ";
       let text: string;
       if (row === TYPE_ROW) {
         text = options.nativeField
@@ -894,6 +1257,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       for (const rest of wrapped.slice(1)) {
         lines.push(" ".repeat(visibleWidth(prefix)) + rest);
       }
+      renderedItemRanges.push({ start: rowStart, end: lines.length, ref: { kind: "answer", record, row: index } });
       if (selected) {
         answerViewportFocus = { start: rowStart, end: lines.length - 1, anchor: rowStart };
       }
@@ -928,7 +1292,9 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     }
     lines.push("");
     noticeRows().forEach((row, index) => {
+      const start = lines.length;
       appendNoticeAction(lines, row === NOTICE_MORE_DETAILS ? "More details" : "Close", index === noticeActionIndex, width);
+      renderedItemRanges.push({ start, end: lines.length, ref: { kind: "notice", record, action: index } });
     });
     lines.push("");
     lines.push(...wrapNoticeLine(theme.fg("dim", `arrows select · Enter choose · ${POPUP_SCROLL_HINT} · Esc back`), width));
@@ -1175,6 +1541,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     return {
       render: renderNativeScrollView,
       handleInput,
+      handleMouse,
       invalidate,
       setSourceProbe,
     };
@@ -1182,6 +1549,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   return {
     render: renderFallback,
     handleInput,
+    handleMouse,
     invalidate,
     setSourceProbe,
   };

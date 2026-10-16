@@ -207,6 +207,21 @@ q1: Which database should the migration target? [waiting]
 arrows select · Enter confirm · Esc back
 ```
 
+- In Pi's **fullscreen mode**, visible shared-popup menu entries also accept a
+  **single left click**: pressing highlights the item, and completing the click
+  invokes the same action as Enter. This applies to pending question/notice rows,
+  suggested choices, **Type something…**, **Decline**, **More details**, and
+  **Close**. Clicking a suggested choice sends that answer immediately; clicking
+  **Decline** declines without a second confirmation. No double click is required.
+  Wrapped item text targets the same item; borders, padding, blank space, headings,
+  and content that is not a menu entry do not activate an item. Mouse interaction
+  uses the visible layout after scrolling or resizing and does not pass the click
+  through to the conversation underneath. After the popup closes, normal native
+  mouse routing resumes. In regular mode the terminal retains mouse ownership;
+  use the existing keyboard controls. While the free-form editor is active,
+  clicking its box never submits the draft; still-visible choice and Decline
+  rows remain clickable. Clicking one leaves editing and invokes that menu
+  action. Merely leaving editing without resolving the question keeps the draft.
 - Selecting a choice or submitting typed text delivers your answer.
 - The free-text row uses one Pi-native text field inside the shared
   question/notice overlay; it does not duplicate the editor underneath. Its
@@ -233,8 +248,8 @@ arrows select · Enter confirm · Esc back
   never cancels or closes the list; **Ctrl+D** on an empty field returns to
   the choice rows instead of exiting Pi.
 - **Decline** is one deliberate action: select the Decline row and press
-  Enter. There is no second confirmation, but Escape only goes back — it
-  never declines.
+  Enter, or complete a single left click on it in fullscreen mode. There is no
+  second confirmation, but Escape only goes back — it never declines.
 - While the shared question/notice overlay has foreground input focus,
   Escape performs only its existing close, back, or native completion-dismiss
   action. It does not abort Pi or cancel an automatic or command-driven review

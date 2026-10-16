@@ -63,6 +63,14 @@
  *   frame is held (outer capture instead follows `requestedMouseReporting()`,
  *   the committed frame's request, so it stays stable mid-frame), and
  *   colon sub-parameter forms of 2026 are not frame markers.
+ * - xterm's logger diagnostics never reach the host console (#428). Each
+ *   surface hands xterm a private `ILogger` (see terminal-diagnostics.ts)
+ *   instead of the default `console`, so a malformed child sequence such as
+ *   an unterminated CSI followed by a non-ASCII character cannot paint
+ *   `xterm.js: Parsing error` text onto the real terminal outside the
+ *   composed frame. The log level and parser recovery are unchanged; bounded
+ *   structured records reach the owner through `onDiagnostic` after the
+ *   parse step, never inside a parser callback and never after disposal.
  * - Queued write data is bounded in UTF-8 bytes (not UTF-16 code units) and
  *   in queued-write count; overruns fail explicitly rather than silently
  *   truncating, and empty writes are no-ops so they cannot enqueue unbounded
@@ -92,6 +100,7 @@ import {
 	TerminalGraphicsPosition,
 	createTerminalGraphicsBudget,
 } from "./kitty-graphics";
+import { XtermDiagnosticCollector, type TerminalDiagnosticEvent } from "./terminal-diagnostics";
 
 /** A cell color as recorded by headless: default, 256-palette index, or RGB. */
 export interface TerminalColorSpec {
@@ -207,6 +216,14 @@ export interface TerminalSurfaceOptions {
 	 * ProcessTerminal's actively negotiated flag mask (0..7).
 	 */
 	readonly getSupportedKeyboardFlags?: () => number;
+	/**
+	 * Called after a parse step with bounded xterm logger diagnostics (#428).
+	 * xterm's logger never writes to the host console; its log-service output
+	 * (all levels) arrives only here. A few xterm internals that call the
+	 * console directly (listener-leak/disposal/option warnings) bypass any
+	 * per-terminal logger and are outside this path.
+	 */
+	readonly onDiagnostic?: (event: TerminalDiagnosticEvent) => void;
 	/** Optional budget shared by the host's surfaces; omitted means private. */
 	readonly graphicsBudget?: TerminalGraphicsBudget;
 	/** Bounded named scrollback lines (default 1000). */
@@ -514,6 +531,7 @@ export class TerminalSurface {
 	private readonly kittyAlternate: KittyState = { current: 0, stack: [] };
 	private readonly graphicsSplitter: KittyGraphicsSplitter;
 	private readonly graphics: KittyGraphicsState;
+	private readonly diagnostics: XtermDiagnosticCollector;
 	private graphicsPreflightState: GraphicsPreflightState = "ground";
 	private options: TerminalSurfaceOptions;
 	private readonly maxPendingBytes: number;
@@ -553,11 +571,25 @@ export class TerminalSurface {
 		const graphicsBudget = options.graphicsBudget ?? createTerminalGraphicsBudget();
 		this.graphics = new KittyGraphicsState(graphicsBudget);
 		this.graphicsSplitter = new KittyGraphicsSplitter(graphicsBudget);
+		// A per-surface logger replaces xterm's default console logger. The log
+		// level stays at xterm's default; delivery is post-parse and contained.
+		this.diagnostics = new XtermDiagnosticCollector({
+			deliver: (event) => {
+				if (!this.disposed) this.safePeerInvoke(() => this.options.onDiagnostic?.(event));
+			},
+			context: () => ({
+				cols: this.terminal.cols,
+				rows: this.terminal.rows,
+				buffer: this.terminal.buffer.active.type === "alternate" ? "alternate" : "normal",
+				synchronizedFrameHeld: this.syncFrame !== undefined,
+			}),
+		});
 		this.terminal = new Terminal({
 			cols,
 			rows,
 			scrollback,
 			allowProposedApi: true,
+			logger: this.diagnostics.logger,
 		});
 		const unicode11 = new Unicode11Addon();
 		this.terminal.loadAddon(unicode11);
@@ -956,7 +988,11 @@ export class TerminalSurface {
 		if (this.disposed) {
 			return;
 		}
+		// Hand over diagnostics already collected before owner callbacks are
+		// dropped; nothing is delivered after disposal.
+		this.diagnostics.flushNow();
 		this.disposed = true;
+		this.diagnostics.dispose();
 		this.activeTerminalWriteResolve?.();
 		this.cancelSyncFrame();
 		this.graphicsSplitter.dispose();

@@ -772,6 +772,107 @@ Kitty keyboard flags 1, 2, and 4, preserves modified Enter through Pi's
 reporting support. These input paths are still being integrated and verified; do not
 treat the design description as proof that every terminal/input combination works.
 
+### Terminal parser diagnostics
+
+Each child's virtual terminal hands the pinned xterm parser its own private logger, so
+xterm diagnostics never go to the host's console. Before this change, a malformed
+child control sequence (for example an unterminated CSI immediately followed by a
+non-ASCII character) could make xterm print a `Parsing error` dump onto the real
+terminal's stderr, outside the composed frame. Later redraws could leave that text on
+screen until a full repaint. The parser's own recovery is unchanged: it returns to
+ground and later valid text, styling, graphics, and clipping render as before. Valid
+sequences, including ones split across child output chunks, produce no diagnostic.
+The xterm log level is not changed, escape sequences are not newly accepted or
+stripped, redraw is not disabled, and the host console is not intercepted. A few
+internal xterm messages (for example listener-leak or invalid-option warnings) call
+the console directly rather than through the logger, and are outside this per-terminal
+containment.
+
+When xterm reports a warning or error, the host shows a clearable warning in its own UI:
+
+- a right-aligned header notice, for example
+  `! Terminal diagnostics: 3 (clear in sidebar)`, visible even while the sidebar is
+  hidden;
+- a three-row **Terminal diagnostics** entry in the roster, below the session cards,
+  showing the count since the last clear, `details: diagnostics log` (or a
+  `NOT saved: ...` reason once a persistence failure is known), and
+  `enter clears warning`. Records are written asynchronously, so the pointer means
+  only that no failure is known yet, not that a write has completed.
+
+To clear the warning, highlight that roster entry and press Enter while the roster
+has focus, or single-left-click the drawn entry. Only a fully drawn entry can be
+cleared. The clear covers exactly the count that was drawn, so an error that arrives
+later warns again. Clearing never deletes, rotates, truncates, or resets the log. It
+does not change focus, the active Main owner, sidebar visibility, the selection of any
+session, or any child's input. Keys typed while a native Main frame has focus,
+including Enter, remain native input. There is no new host key binding or setting.
+
+Records are saved under the canonical native agent directory (Pi's
+`PI_CODING_AGENT_DIR` override when set, otherwise `~/.pi/agent`) at
+`<agentDir>/session-host/terminal-diagnostics.jsonl`. The file is created only when the
+first diagnostic of a run is recorded. Retention is exactly three files: the active file
+plus `terminal-diagnostics.jsonl.1` and `terminal-diagnostics.jsonl.2`, each at most
+5 MiB (15 MiB total). Before a line would push the active file past 5 MiB, `.2` is
+removed, `.1` becomes `.2`, and the active file becomes `.1`. Each line is a JSON
+record whose first key is the schema marker
+`pi-review-gate.session-host.terminal-diagnostics.v1`:
+
+- a `host-run` record at the start of every file a run writes, including each file
+  after rotation (numbered by `segment`), so retained records keep their run's
+  identities. It carries the identities that are actually available: package
+  name and version, Node.js version, platform and architecture, the resolved Pi
+  version, and the installed `@xterm/headless`, `@xterm/addon-unicode11`, and pinned
+  pi-tui versions. Missing values are omitted, never guessed;
+- `diagnostic` records with time, run and session-row identifiers, level, category,
+  a fixed message identifier, and pane geometry, buffer, and synchronized-frame
+  state. For parser errors they add the parser state, the rejected code point, its
+  offset, the collected intermediates, and only the active parameters (bounded);
+- a bounded stack labelled `logger-call-site`: the host call stack at the moment
+  xterm called the logger. xterm parser errors are state reports, not exceptions, so
+  records state `not-applicable-parser-state-report` and never invent an originating
+  child stack or cause. A genuine Error passed to the logger keeps only its own
+  frames, labelled `logged-error`;
+- `dropped`, `diagnostic-omitted`, and `host-run-end` summary records.
+
+Logger message text, arbitrary logger arguments, raw terminal bytes, conversation or
+tool text, credentials, and environment values are never retained. Per session pane,
+at most 16 detailed records are kept in a burst, then one every 2 seconds. Further
+calls are counted, and the next detailed record carries that count. Unwritten lines
+are held in a bounded queue (256 lines, 1 MiB); overflow is recorded as a dropped
+count, not as growing memory. Nothing is transmitted, and there is no polling, daemon,
+or new setting.
+
+Persistence is ownership-safe and fails closed:
+
+- The state directory must be a real directory, not a symlink. On POSIX it must also
+  be owned by the current user and must not be writable by group or others.
+- Log files must be regular, single-link files owned by the current user, opened
+  without following symlinks. New files are created exclusively with mode `0600`.
+  On POSIX, an existing active or rotation file with any group or other permission
+  is refused (`unsafe log file`). Its contents, mode, and path are left unchanged;
+  the host never changes its mode. On Windows the agent directory's OS access
+  control applies; the host sets no custom ACL.
+- A rotation slot or an existing active file is moved, removed, or appended to only
+  when its first line carries the schema marker. Any other file, including an empty
+  one, is left untouched.
+
+When persistence fails or is unavailable, the warning says so with a fixed phrase,
+for example `NOT saved: unsafe log file` or `unknown file at log path`. No path or
+payload is printed to the terminal, nothing falls back to the console, and child
+sessions keep running. A failed log stays disabled for the rest of that run. At
+shutdown the host flushes each pane's pending diagnostics, appends the end record,
+syncs, and closes the log within a bounded wait. Each file is also synced before it
+rotates; a failed sync stops persistence (`log sync failed`) before any file is moved,
+and the file is still closed. Some write errors only surface at a sync. The host reports a cleanup failure, and never success, when:
+
+- the log cannot settle in time;
+- the final sync fails (`log sync failed`; the file is still closed);
+- any other persistence failure is first seen after shutdown began.
+
+None of these by itself keeps the host ownership record. Focused tests drive constructed malformed input through the
+production parser, compositor, writer, and host. They do not identify the cause of
+any earlier on-screen corruption and do not certify physical terminal behavior.
+
 ## Quitting and cleanup
 
 Quitting the host stops its owned children and **preserves the global roster**: closing
@@ -797,8 +898,10 @@ shutdown acknowledgement is never exit proof. The host does not scan for process
 promise to stop arbitrary detached descendants. A forced stop or a child whose exit
 could not be confirmed is reported truthfully; do not assume such a handle has exited.
 Native Pi configuration, credentials, conversations, and unknown files are preserved,
-not removed as part of host shutdown. Apart from deliberate Saved-file deletion and
-Host shortcuts saves, the persistent roster and ownership record are the only
+not removed as part of host shutdown. Apart from deliberate Saved-file deletion,
+Host shortcuts saves, and the bounded terminal diagnostics log (written only after a
+diagnostic, see [Terminal parser diagnostics](#terminal-parser-diagnostics)), the
+persistent roster and ownership record are the only
 session-host files changed by a normal run: the roster is republished atomically when
 rows are created, removed, renamed, reactivated, or change their native conversation, and
 this host's ownership record is removed only after its owned children settled. Unconfirmed

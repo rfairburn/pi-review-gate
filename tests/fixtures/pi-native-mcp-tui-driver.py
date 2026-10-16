@@ -73,8 +73,11 @@ def pump(seconds):
         poll_child()
         if not alive:
             break
+        # The deadline can pass between the loop check and this read; clamp to
+        # a non-blocking poll so the next loop check ends on the same deadline.
+        remaining = max(0.0, deadline - time.monotonic())
         try:
-            ready, _, _ = select.select([master], [], [], min(0.15, deadline - time.monotonic()))
+            ready, _, _ = select.select([master], [], [], min(0.15, remaining))
             if ready:
                 data = os.read(master, 65536)
                 if not data:

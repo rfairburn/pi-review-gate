@@ -51,6 +51,12 @@ export interface ComposeHostFrameOptions {
 	readonly nativeGraphics?: HostGraphicsLayer;
 	/** Canonical title only, without status/prefix badges; control sequences are never trusted. */
 	readonly header: string;
+	/**
+	 * Optional host-owned notice (for example the clearable terminal
+	 * diagnostics warning). It is drawn right-aligned on the header row and
+	 * keeps priority over the title, which is clipped first. Text-only.
+	 */
+	readonly headerNotice?: string;
 	readonly focus: HostFocus;
 }
 
@@ -132,7 +138,7 @@ export function composeHostFrame(layout: HostLayout, options: ComposeHostFrameOp
 
 	const lines = Array.from({ length: layout.rows }, () => "");
 	if (layout.headerRows > 0) {
-		lines[0] = fitText(sanitizeControls(options.header, false), layout.cols);
+		lines[0] = headerRow(options.header, options.headerNotice, layout.cols);
 	}
 
 	const mainMissing = options.main === undefined;
@@ -230,6 +236,19 @@ function validateDimension(value: number, label: "cols" | "rows"): void {
 	if (!Number.isSafeInteger(value) || value < 1 || value > MAX_DIMENSION) {
 		throw new Error(`Host compositor ${label} must be a safe integer between 1 and ${MAX_DIMENSION}`);
 	}
+}
+
+const HEADER_NOTICE_SEPARATOR = " | ";
+
+/** Title clipped first so a host notice stays visible; both are text-only. */
+function headerRow(header: string, notice: string | undefined, cols: number): string {
+	const title = sanitizeControls(typeof header === "string" ? header : "", false);
+	const safeNotice = typeof notice === "string" ? sanitizeControls(notice, false) : "";
+	if (safeNotice.length === 0) return fitText(title, cols);
+	const noticeWidth = visibleWidth(safeNotice);
+	const titleRoom = cols - noticeWidth - visibleWidth(HEADER_NOTICE_SEPARATOR);
+	if (titleRoom < 1) return fitText(safeNotice, cols);
+	return fitText(`${fitText(title, titleRoom)}${HEADER_NOTICE_SEPARATOR}${safeNotice}`, cols);
 }
 
 function panelRow(source: string | undefined, width: number): string {

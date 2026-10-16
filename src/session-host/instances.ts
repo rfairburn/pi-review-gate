@@ -12,6 +12,7 @@ import {
 } from "./launch";
 import { createTerminalGraphicsBudget, type TerminalGraphicsBudget } from "./kitty-graphics";
 import { TerminalSurface } from "./terminal-surface";
+import type { TerminalDiagnosticEvent } from "./terminal-diagnostics";
 import {
 	hasCompleteSessionIdle,
 	MAX_SESSION_SPAWN_PROMPT_BYTES,
@@ -298,6 +299,11 @@ export interface InstanceManagerOptions {
 	graphicsBudget?: TerminalGraphicsBudget;
 	/** Called with an instance id whenever that row changed (frontend hook). */
 	onChange?: (instanceId: string) => void;
+	/**
+	 * Bounded xterm diagnostics from one row's terminal surface (#428), after
+	 * its parse step. Payload-free of child bytes; exceptions are contained.
+	 */
+	onTerminalDiagnostic?: (instanceId: string, event: TerminalDiagnosticEvent) => void;
 	/** Host-owned routing for reporter requests; the parent id is supplied by the manager, never by model input. */
 	onSpawnRequest?: (parentInstanceId: string, request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
 	/** Current hypothetical-visible sidebar title width; captured per row as advisory presentation metadata. */
@@ -655,6 +661,7 @@ export class InstanceManager {
 	readonly #getSupportedKeyboardFlags?: () => number;
 	readonly #graphicsBudget: TerminalGraphicsBudget;
 	readonly #onChange?: (instanceId: string) => void;
+	readonly #onTerminalDiagnostic?: (instanceId: string, event: TerminalDiagnosticEvent) => void;
 	readonly #onSpawnRequest?: (parentInstanceId: string, request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
 	readonly #getSidebarTitleColumns?: () => number;
 	readonly #ptyFactory: PtyFactory;
@@ -698,6 +705,7 @@ export class InstanceManager {
 		this.#getSupportedKeyboardFlags = options.getSupportedKeyboardFlags;
 		this.#graphicsBudget = options.graphicsBudget ?? createTerminalGraphicsBudget();
 		this.#onChange = options.onChange;
+		this.#onTerminalDiagnostic = options.onTerminalDiagnostic;
 		this.#onSpawnRequest = options.onSpawnRequest;
 		this.#getSidebarTitleColumns = options.getSidebarTitleColumns;
 		this.#ptyFactory = options.ptyFactory ?? createDefaultPtyFactory();
@@ -1358,6 +1366,7 @@ export class InstanceManager {
 					onReply: (data) => this.#onQueryReply(record, data),
 					onChange: () => this.#safeChanged(record.id),
 					onBackpressure: (paused) => this.#onBackpressure(record, paused),
+					onDiagnostic: (event) => this.#safeTerminalDiagnostic(record.id, event),
 					getSupportedKeyboardFlags: this.#getSupportedKeyboardFlags,
 					graphicsBudget: this.#graphicsBudget,
 				});
@@ -1885,6 +1894,15 @@ export class InstanceManager {
 			forcedIds: outcomes.filter((outcome) => outcome.forced).map((outcome) => outcome.id),
 			remainingIds: targets.filter((record) => record.pty && !record.ptyExited).map((record) => record.id),
 		};
+	}
+
+	/** Forward one surface's bounded diagnostics; delivery failures stay contained. */
+	#safeTerminalDiagnostic(id: string, event: TerminalDiagnosticEvent): void {
+		try {
+			this.#onTerminalDiagnostic?.(id, event);
+		} catch {
+			// The frontend sink owns its own failures; parsing continues.
+		}
 	}
 
 	/** Contains host callback failures; lifecycle callbacks of the manager never break rows. */

@@ -98,6 +98,10 @@ import {
   normalizeHostShortcutKey,
   type HostShortcutBindings,
 } from "./host-shortcuts";
+import {
+  terminalDiagnosticsFailurePhrase,
+  type TerminalDiagnosticsWarningView,
+} from "./terminal-diagnostics";
 
 /** One roster row: a top-level snapshot of one host-owned instance. */
 export interface SidebarItem {
@@ -226,6 +230,12 @@ export type SidebarAction =
       readonly name: string;
     }
   | { readonly type: "quit" }
+  /**
+   * Clear the host-owned terminal diagnostics warning the user actually saw
+   * (#428): warning events up to `throughCount`, and a persistence failure only
+   * when it was displayed. Never deletes, rotates, or resets the log.
+   */
+  | { readonly type: "terminal-diagnostics-clear"; readonly throughCount: number; readonly failureShown: boolean }
   | {
       readonly type: "host-shortcuts-save";
       readonly requestId: number;
@@ -322,8 +332,10 @@ const SGR_ACTIVE_MAIN_WHITE = "\x1b[1;97m";
 interface SidebarEntry {
   /** Internal key; real item ids are namespaced with "item:" to stay unique. */
   readonly key: string;
-  readonly kind: "item" | "saved" | "new" | "quit" | "settings";
+  readonly kind: "item" | "saved" | "new" | "quit" | "settings" | "diagnostics";
   readonly item?: SidebarItem;
+  /** Warning snapshot rendered by a `diagnostics` entry (display and clear fence). */
+  readonly warning?: TerminalDiagnosticsWarningView;
 }
 
 // updateItems rebuilds bounded DTO snapshots even when their content is
@@ -522,6 +534,10 @@ const ENTRY_NEW_KEY = "new";
 const ENTRY_QUIT_KEY = "quit";
 const ENTRY_SAVED_KEY = "saved";
 const ENTRY_SETTINGS_KEY = "host-shortcuts";
+const ENTRY_DIAGNOSTICS_KEY = "terminal-diagnostics";
+/** Fixed height of the host-owned terminal diagnostics warning entry. */
+const DIAGNOSTICS_ENTRY_ROWS = 3;
+const DIAGNOSTICS_CLEARED_NOTICE = "Terminal warning cleared; the diagnostics log was kept";
 const ITEM_KEY_PREFIX = "item:";
 
 const LIFECYCLE_VALUES: ReadonlySet<string> = new Set([
@@ -1097,6 +1113,8 @@ export class SidebarController {
    * height, so nothing invisible or since-changed can be activated.
    */
   private displayedRoster: DisplayedRoster | undefined;
+  /** Current host-owned terminal diagnostics warning (#428); undefined hides the entry. */
+  private diagnosticsWarning: TerminalDiagnosticsWarningView | undefined;
 
   constructor(options: SidebarControllerOptions = {}) {
     this.configuredShortcuts = normalizeHostShortcutBindings(options.configuredShortcuts ?? DEFAULT_HOST_SHORTCUTS);
@@ -1570,6 +1588,32 @@ export class SidebarController {
     if (pending) this.emit({ type: "resume-row-cancel", requestId: pending.requestId });
   }
 
+  /**
+   * Main-owned terminal diagnostics warning (#428). A defined view shows one
+   * host-owned roster entry whose explicit activation clears exactly what was
+   * displayed; undefined removes it. Never changes focus, the active Main
+   * owner, visibility, or a sibling; a highlighted warning that disappears
+   * leaves no selection rather than retargeting Enter.
+   */
+  setTerminalDiagnosticsWarning(view: TerminalDiagnosticsWarningView | undefined): void {
+    this.diagnosticsWarning = view === undefined ? undefined : {
+      count: Math.max(0, Math.trunc(view.count) || 0),
+      throughCount: Math.max(0, Math.trunc(view.throughCount) || 0),
+      logStatus: view.logStatus,
+      ...(view.logFailure === undefined ? {} : { logFailure: view.logFailure }),
+      failureNotice: view.failureNotice === true,
+    };
+    this.rebuildEntries();
+    if (this.selectedEntryKey === ENTRY_DIAGNOSTICS_KEY && this.currentEntry() === undefined) {
+      this.selectedEntryKey = undefined;
+    }
+  }
+
+  /** Read-only view of the current terminal diagnostics warning (tests/Main). */
+  get terminalDiagnosticsWarning(): TerminalDiagnosticsWarningView | undefined {
+    return this.diagnosticsWarning === undefined ? undefined : { ...this.diagnosticsWarning };
+  }
+
   /** Shows a bounded, sanitized error near the pane's footer. */
   showError(message: string): void {
     this.noticeError = sanitizeBounded(message, ERROR_TEXT_MAX_CODEPOINTS);
@@ -1631,7 +1675,7 @@ export class SidebarController {
       && this._focus === "main") {
       this._focus = "sidebar";
     }
-    this.activateEntry();
+    this.activateEntry(region.entry);
     return true;
   }
 
@@ -1930,7 +1974,9 @@ export class SidebarController {
       if (isKeyRepeat(data)) return;
       // Never activate a target the last roster render could not show whole.
       if (!this.selectionFitsLastRoster()) return;
-      this.activateEntry();
+      this.activateEntry(this.selectedEntryKey === undefined
+        ? undefined
+        : this.displayedRoster?.regions.get(this.selectedEntryKey)?.entry);
       return;
     }
     if (matchesKey(data, "space") || printableOf(data) === " ") {
@@ -2006,6 +2052,7 @@ export class SidebarController {
 
   /** Rendered height of one entry: cards are 3 or 5 rows, actions 1 row. */
   private entryHeight(entry: SidebarEntry | undefined): number {
+    if (entry?.kind === "diagnostics") return DIAGNOSTICS_ENTRY_ROWS;
     if (entry?.kind !== "item" || entry.item === undefined) {
       return 1;
     }
@@ -2040,9 +2087,26 @@ export class SidebarController {
     this.displayedRoster = undefined;
   }
 
-  private activateEntry(): void {
+  /**
+   * Activate the highlighted entry. `displayed` is the entry exactly as the
+   * emitted roster drew it; display-fenced actions (the diagnostics clear) use
+   * that snapshot so they act only on what the user saw.
+   */
+  private activateEntry(displayed?: SidebarEntry): void {
     const entry = this.currentEntry();
     if (entry === undefined) {
+      return;
+    }
+    if (entry.kind === "diagnostics") {
+      const shown = displayed?.kind === "diagnostics" ? displayed.warning : undefined;
+      if (shown === undefined) return;
+      this.cancelRowResume();
+      this.noticeError = DIAGNOSTICS_CLEARED_NOTICE;
+      this.emit({
+        type: "terminal-diagnostics-clear",
+        throughCount: shown.throughCount,
+        failureShown: shown.failureNotice,
+      });
       return;
     }
     if (entry.kind === "item" && entry.item !== undefined) {
@@ -3062,6 +3126,9 @@ export class SidebarController {
       ...this.rowStore.map(
         (item): SidebarEntry => ({ key: ITEM_KEY_PREFIX + item.id, kind: "item", item }),
       ),
+      ...(this.diagnosticsWarning === undefined
+        ? []
+        : [{ key: ENTRY_DIAGNOSTICS_KEY, kind: "diagnostics" as const, warning: this.diagnosticsWarning }]),
       { key: ENTRY_SAVED_KEY, kind: "saved" },
       { key: ENTRY_NEW_KEY, kind: "new" },
       { key: ENTRY_QUIT_KEY, kind: "quit" },
@@ -3239,6 +3306,22 @@ export class SidebarController {
         lines.push(...activity);
       }
       return lines;
+    }
+    if (entry.kind === "diagnostics" && entry.warning !== undefined) {
+      const warning = entry.warning;
+      const count = warning.count > 9999 ? "9999+" : String(warning.count);
+      const title = warning.count > 0 ? `! Terminal diagnostics (${count})` : "! Terminal diagnostics";
+      // Appends are queued asynchronously with no per-record acknowledgement,
+      // so a healthy status only points at the log and never claims a save
+      // completed. A known persistence failure is shown explicitly.
+      const status = warning.logStatus === "ok"
+        ? "details: diagnostics log"
+        : `NOT saved: ${terminalDiagnosticsFailurePhrase(warning.logFailure)}`;
+      return [
+        wrapRow(`${marker}${title}`, cols, selected && this._focus !== "main" ? SGR_SELECTION_BLUE : "\x1b[1m"),
+        wrapRow(`  ${status}`, cols),
+        wrapRow("  enter clears warning", cols),
+      ];
     }
     const text = entry.kind === "saved"
       ? `${marker}Saved conversations`

@@ -1080,3 +1080,507 @@ test("Codex abort while holding a split multibyte tail settles with torn-tail de
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// ===== #239: Codex JSON-RPC line framing accumulation =====
+//
+// The adapter formerly appended every decoded stdout event to one pending
+// string and searched it for LF from offset zero on every event, so a long
+// incomplete line was rescanned (and recopied) once per data event. These
+// regressions drive the real production adapter against fixture-owned,
+// finite children (reusing the captured-identity cleanup and the chunk
+// barrier above) and check framing compatibility plus a deterministic work
+// oracle: across a run, the adapter's newline searches must examine exactly
+// as many characters as the decoded stdout contains — each character once.
+// The former whole-buffer rescan exceeds that by the sum of the pending
+// prefix lengths at every data event, so it fails whenever a line spans
+// events, independent of timing, memory, or machine speed.
+//
+// Nothing here establishes a frame-size or total-memory bound: none exists,
+// and an unterminated line is still retained in full until its LF arrives.
+
+/** One fixture-child write: exact bytes (`hex`) or a generated `prefix + fill×count + suffix` UTF-8 text; optionally gated on the barrier (`release` = strict stdout FIFO index) or followed by a normal child exit once flushed. */
+interface FrameStep {
+  hex?: string;
+  prefix?: string;
+  fill?: string;
+  count?: number;
+  suffix?: string;
+  release?: number;
+  exit?: boolean;
+}
+
+/** Child script: per-request response steps (written only when that request arrives) and turn steps played after the turn/start response steps. */
+interface FramePlan {
+  responses: Partial<Record<"initialize" | "thread/start" | "turn/start", FrameStep[]>>;
+  turn: FrameStep[];
+}
+
+function exactStep(bytes: Buffer, options: { release?: number; exit?: boolean } = {}): FrameStep {
+  return { hex: bytes.toString("hex"), ...options };
+}
+
+/** Framing-child stdout ceiling: fits the fixed plans here (at most two 17 MiB frames plus small records); the child enforces it independently and the runner refuses a larger plan before spawning. */
+const FRAMING_CHILD_STDOUT_BUDGET = 40 * 1024 * 1024;
+
+function plannedStdoutBytes(plan: FramePlan): number {
+  const steps = [...Object.values(plan.responses).flatMap((list) => list ?? []), ...plan.turn];
+  return steps.reduce((total, step) => total + (step.hex !== undefined
+    ? step.hex.length / 2
+    : Buffer.byteLength(step.prefix ?? "") + Buffer.byteLength(step.fill ?? "") * (step.count ?? 0) + Buffer.byteLength(step.suffix ?? "")), 0);
+}
+
+/** A #239 fixture root. It is removed only when every child launched from it has an observed close; otherwise it is retained and the run's failure names it. */
+interface FramingRoot {
+  path: string;
+  retained: string[];
+}
+
+async function withFramingRoot(prefix: string, body: (root: FramingRoot) => Promise<void>): Promise<void> {
+  const root: FramingRoot = { path: await mkdtemp(join(tmpdir(), prefix)), retained: [] };
+  try {
+    await body(root);
+  } finally {
+    if (root.retained.length === 0) await rm(root.path, { recursive: true, force: true });
+  }
+}
+
+type ChildClose = { code: number | null; signal: NodeJS.Signals | null };
+
+/** Bounded join: the observed value, or undefined when the work did not settle within the bound. Used for the captured handle's actual 'close' (attached at spawn) and the adapter run; never fabricates an exit. */
+async function boundedJoin<T>(work: Promise<T>, boundMs: number): Promise<T | undefined> {
+  let timer: NodeJS.Timeout | undefined;
+  const bound = new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), boundMs); });
+  try {
+    return await Promise.race([work, bound]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function framingChildSource(): string {
+  return [
+    "#!/usr/bin/env node",
+    "const fs=require('node:fs');const net=require('node:net');",
+    "const plan=JSON.parse(fs.readFileSync(process.env.PRG_FRAME_PLAN,'utf8'));",
+    "const barrierEndpoint=process.env.PRG_FRAME_BARRIER||'';",
+    // Independent finite lifetime and output ceiling: the child ends itself
+    // (exit 124) at its watchdog even if no parent signal ever reaches it, and
+    // refuses (exit 125) any write that would exceed its stdout byte budget.
+    "const watchdogMs=Number(process.env.PRG_FRAME_WATCHDOG_MS);const stdoutBudget=Number(process.env.PRG_FRAME_STDOUT_BUDGET);",
+    "if(!(watchdogMs>0)||!(stdoutBudget>0))process.exit(2);",
+    "setTimeout(()=>process.exit(124),watchdogMs).unref();",
+    "let written=0;",
+    "function release(index){if(!barrierEndpoint)return Promise.resolve();const sep=barrierEndpoint.lastIndexOf(':');return new Promise((resolve,reject)=>{const client=net.connect({host:barrierEndpoint.slice(0,sep),port:Number(barrierEndpoint.slice(sep+1))});let settled=false;let acked=false;const finish=(fn,value)=>{if(settled)return;settled=true;fn(value);};client.once('data',()=>{acked=true;client.end();});client.once('close',()=>{if(acked)finish(resolve,undefined);else finish(reject,new Error('barrier stdout:'+index+' closed before the go ACK'));});client.once('error',(error)=>finish(reject,error));client.write('stdout:'+index+'\\n');});}",
+    "function bytes(step){return step.hex!==undefined?Buffer.from(step.hex,'hex'):Buffer.from(step.prefix+step.fill.repeat(step.count)+step.suffix,'utf8');}",
+    "function write(buffer){if(written+buffer.length>stdoutBudget)process.exit(125);written+=buffer.length;return new Promise((resolve,reject)=>{process.stdout.write(buffer,(error)=>error?reject(error):resolve());});}",
+    "async function play(steps){for(const step of steps){await write(bytes(step));if(step.release!==undefined)await release(step.release);if(step.exit)process.exit(0);}}",
+    "let input='';process.stdin.setEncoding('utf8');",
+    "process.stdin.on('data',(chunk)=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);if(!c.id||typeof c.method!=='string')continue;",
+    "const steps=[...(plan.responses[c.method]||[]),...(c.method==='turn/start'?plan.turn:[])];play(steps).catch(()=>process.exit(1));}});",
+  ].join("\n");
+}
+
+/** Scoped observation of the adapter's newline-search workload: counts characters examined by String.prototype.indexOf("\n") calls made directly from the Codex adapter module, and nothing else. Installed only for one run in this per-file test process (top-level tests run sequentially) and always restored. */
+interface NewlineSearchProbe {
+  calls: number;
+  examined: number;
+  restore(): void;
+}
+
+const ADAPTER_MODULE_FRAME = /[\\/]execution[\\/]adapters[\\/]codex-cli\.(?:js|ts):\d+:\d+\)?$/;
+
+function installAdapterNewlineSearchProbe(): NewlineSearchProbe {
+  const original = String.prototype.indexOf;
+  let inside = false;
+  const probe: NewlineSearchProbe = {
+    calls: 0,
+    examined: 0,
+    restore: () => { String.prototype.indexOf = original; },
+  };
+  function observedIndexOf(this: string, search: string, position?: number): number {
+    const found = Reflect.apply(original, this, [search, position]) as number;
+    if (search !== "\n" || inside) return found;
+    inside = true;
+    try {
+      const site: { stack?: string } = {};
+      Error.captureStackTrace(site, observedIndexOf);
+      const caller = (site.stack ?? "").split("\n")[1]?.trim() ?? "";
+      if (ADAPTER_MODULE_FRAME.test(caller)) {
+        const length = String(this).length;
+        const from = Math.min(Math.max(Math.trunc(Number(position ?? 0)) || 0, 0), length);
+        probe.calls += 1;
+        probe.examined += found >= 0 ? found - from + 1 : length - from;
+      }
+    } finally {
+      inside = false;
+    }
+    return found;
+  }
+  String.prototype.indexOf = observedIndexOf as typeof String.prototype.indexOf;
+  return probe;
+}
+
+interface FramingRun {
+  result: ExecutorTurn;
+  rawStream: string;
+  processResult: Record<string, unknown>;
+  exits: Array<{ pid: number; code: number | null; signal: NodeJS.Signals | null }>;
+  observations: ExecutorToolObservation[];
+  stdoutChunks: Buffer[];
+  newlineSearch: { calls: number; examined: number };
+  spawnedPid: number | undefined;
+  cleanup: CleanupOutcome;
+  childClose: ChildClose | undefined;
+}
+
+/**
+ * Run the real adapter against the framing child. With `strictStdout`, every
+ * stdout data event must equal the next listed chunk and gated steps are
+ * released only after their chunk was observed as its own event (the #238
+ * barrier); otherwise chunking is whatever the pipe delivers and is only
+ * recorded. Bounds, innermost first: the adapter's own timeout, the outer
+ * guard, and the child's independent watchdog and stdout budget. On every
+ * path the shared identity-verified fail-closed settle runs (it never signals
+ * a settled, foreign, recycled, or unverified identity), then the actual
+ * 'close' of the captured handle — observed from spawn — is joined with a
+ * bound past the child watchdog, followed by the adapter run itself (which
+ * settles once its child closed). A child or run still unsettled fails the
+ * run and keeps its fixture root; a primary failure is reported together with
+ * the cleanup outcome and close evidence.
+ */
+async function runFramingFixture(
+  root: FramingRoot,
+  name: string,
+  plan: FramePlan,
+  options: { strictStdout?: Buffer[]; adapterTimeoutMs?: number; guardMs?: number } = {},
+): Promise<FramingRun> {
+  const plannedBytes = plannedStdoutBytes(plan);
+  if (plannedBytes > FRAMING_CHILD_STDOUT_BUDGET) {
+    throw new Error(`${name} plan writes ${plannedBytes} stdout bytes, above the ${FRAMING_CHILD_STDOUT_BUDGET}-byte fixture budget`);
+  }
+  const guardMs = options.guardMs ?? 20_000;
+  const childWatchdogMs = guardMs + 5_000;
+  const closeJoinMs = childWatchdogMs + 5_000;
+  const dir = join(root.path, name);
+  const artifactDir = join(dir, "artifacts");
+  const childScript = join(dir, "framing-child.cjs");
+  const planPath = join(dir, "plan.json");
+  await mkdir(artifactDir, { recursive: true });
+  await writeFile(childScript, framingChildSource(), "utf8");
+  await writeFile(planPath, JSON.stringify(plan), "utf8");
+
+  const state: ObserverState = {
+    stdout: createObserver(options.strictStdout ?? [], options.strictStdout !== undefined),
+    stderr: createObserver([], false),
+  };
+  const barrierServer = options.strictStdout !== undefined ? await startBarrierServer(state) : undefined;
+  const realSpawn = childProcessExports.spawn;
+  const captured = createCapturedChild(dir);
+  let closed: Promise<ChildClose> | undefined;
+
+  const exits: FramingRun["exits"] = [];
+  const observations: ExecutorToolObservation[] = [];
+  let probe: NewlineSearchProbe | undefined;
+  let result: ExecutorTurn | undefined;
+  let primaryFailure: unknown;
+  let cleanup: CleanupOutcome = { action: "no-child" };
+  let childClose: ChildClose | undefined;
+  let runPromise: Promise<ExecutorTurn> | undefined;
+  let runSettled = true;
+  try {
+    childProcessExports.spawn = ((file: string, args?: readonly string[], spawnOptions?: SpawnOptions) => {
+      const proc = realSpawn(file, args ?? [], spawnOptions ?? {});
+      if (closed === undefined && captured.proc === undefined && proc.pid !== undefined) {
+        // Actual close of this captured handle, observed before any adapter
+        // listener or await.
+        closed = new Promise<ChildClose>((resolve) => { proc.once("close", (code, signal) => resolve({ code, signal })); });
+      }
+      attachCapture(captured, proc);
+      proc.stdout?.on("data", (chunk: Buffer) => observeChunk("stdout", chunk, state));
+      proc.stderr?.on("data", (chunk: Buffer) => observeChunk("stderr", chunk, state));
+      return proc;
+    }) as TestSpawn;
+    const adapter = new CodexExecutorAdapter({
+      id: "codex",
+      adapter: "codex-cli",
+      command: process.execPath,
+      args: [childScript],
+      model: "gpt-test",
+      timeoutMs: options.adapterTimeoutMs ?? 15_000,
+      env: {
+        PRG_FRAME_PLAN: planPath,
+        PRG_FRAME_BARRIER: barrierServer ? barrierServer.endpoint : "",
+        PRG_FRAME_WATCHDOG_MS: String(childWatchdogMs),
+        PRG_FRAME_STDOUT_BUDGET: String(FRAMING_CHILD_STDOUT_BUDGET),
+      },
+    });
+    probe = installAdapterNewlineSearchProbe();
+    runPromise = adapter.run({
+      cwd: dir,
+      prompt: "work",
+      artifactDir,
+      turn: 1,
+      onProcessExit: (exit) => { exits.push(exit); },
+      onToolObservation: (observation) => { observations.push(observation); },
+    });
+    result = await withTimeout(runPromise, `Codex ${name} framing fixture`, guardMs);
+  } catch (error) {
+    primaryFailure = error;
+  } finally {
+    probe?.restore();
+    childProcessExports.spawn = realSpawn;
+    cleanup = settleFixtureChild(captured);
+    // Closing the barrier first releases a child held on a gate promptly.
+    if (barrierServer) await barrierServer.close();
+    if (closed !== undefined) childClose = await boundedJoin(closed, closeJoinMs);
+    // An abandoned run (outer guard fired) still settles after its child
+    // closes; join it so nothing writes into the root after removal.
+    if (runPromise !== undefined && (closed === undefined || childClose !== undefined)) {
+      runSettled = (await boundedJoin(runPromise.then(() => true, () => true), 10_000)) === true;
+    }
+  }
+  const closeUnproven = closed !== undefined && childClose === undefined;
+  if (closeUnproven || !runSettled) {
+    root.retained.push(dir);
+    const detail = closeUnproven
+      ? `${name} fixture child pid ${String(captured.pid)} has no observed close within ${closeJoinMs}ms `
+        + `(cleanup: ${JSON.stringify(cleanup)}); fixture root retained at ${root.path}`
+      : `${name} adapter run did not settle after child close ${JSON.stringify(childClose)}; fixture root retained at ${root.path}`;
+    throw new Error(primaryFailure === undefined ? detail : `${errorMessage(primaryFailure)} | ${detail}`, {
+      cause: primaryFailure instanceof Error ? primaryFailure : undefined,
+    });
+  }
+  if (barrierServer) throwIfBarrierErrors(barrierServer, name, primaryFailure);
+  if (primaryFailure !== undefined || result === undefined) {
+    throw new Error(`${errorMessage(primaryFailure)} | ${name} fixture cleanup: ${JSON.stringify(cleanup)}; child close: ${JSON.stringify(childClose ?? "no child spawned")}`, {
+      cause: primaryFailure instanceof Error ? primaryFailure : undefined,
+    });
+  }
+  if (options.strictStdout !== undefined) assertObservedExactly("stdout", state);
+
+  const turnDir = join(artifactDir, "executor", "0001");
+  const [rawStream, processResultJson] = await Promise.all([
+    readFile(join(turnDir, "raw-stream.txt"), "utf8"),
+    readFile(join(turnDir, "process-result.json"), "utf8"),
+  ]);
+  return {
+    result,
+    rawStream,
+    processResult: JSON.parse(processResultJson) as Record<string, unknown>,
+    exits,
+    observations,
+    stdoutChunks: state.stdout.observed,
+    newlineSearch: { calls: probe?.calls ?? 0, examined: probe?.examined ?? 0 },
+    spawnedPid: captured.pid,
+    cleanup,
+    childClose,
+  };
+}
+
+function frameLine(value: unknown): string {
+  return JSON.stringify(value);
+}
+
+function agentMessageFrame(text: string): string {
+  return frameLine({ jsonrpc: "2.0", method: "item/completed", params: { item: { type: "agentMessage", text } } });
+}
+
+const turnCompletedFrame = frameLine({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: THREAD_ID, turn: { id: TURN_ID, status: "completed" } } });
+
+function assertSettledBy(run: FramingRun, expected: { code: number | null; signal: NodeJS.Signals | null }, label: string): void {
+  assert.ok(run.spawnedPid !== undefined, `${label}: the fixture must observe the real spawned child`);
+  assert.equal(run.exits.length, 1, `${label}: exactly one real child close`);
+  assert.equal(run.exits[0]?.pid, run.spawnedPid);
+  assert.equal(run.exits[0]?.code, expected.code);
+  assert.equal(run.exits[0]?.signal, expected.signal);
+  assert.equal(run.cleanup.action, "already-settled", `${label}: cleanup must find the child settled and send no signal`);
+  assert.deepEqual(run.childClose, expected, `${label}: the captured handle's actual close must be observed`);
+}
+
+test("Codex app-server frames split, glued, CRLF, blank, and malformed lines while searching each character once (#239)", async () => {
+  await withFramingRoot("pi-review-codex-framing-", async (root) => {
+    const alpha = agentMessageFrame("alpha 日本語 🚀");
+    const command = frameLine({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: { item: { type: "commandExecution", id: "cmd-1", command: "echo hi", aggregatedOutput: "hi 🚀\n", exitCode: 0, status: "completed" } },
+    });
+    const bravo = agentMessageFrame("bravo");
+    const charlie = agentMessageFrame("charlie ✓");
+    const unknownResponse = frameLine({ jsonrpc: "2.0", id: 99, result: { ignored: true } });
+
+    // Many tiny events for the first line (5-byte pieces, several cutting a
+    // multibyte sequence), then events carrying blank and CRLF lines, several
+    // records, an LF-straddling record, a malformed line followed by a valid
+    // record that spans two more events, an LF arriving alone, and finally an
+    // ignored unknown-id response glued to turn/completed.
+    const alphaBytes = Buffer.from(`${alpha}\n`, "utf8");
+    const turnChunks: Buffer[] = [];
+    for (let offset = 0; offset < alphaBytes.length; offset += 5) turnChunks.push(alphaBytes.subarray(offset, offset + 5));
+    turnChunks.push(
+      Buffer.from(`\n  \r\n${command}\r\n${bravo.slice(0, 10)}`, "utf8"),
+      Buffer.from(`${bravo.slice(10)}\nnot json {日本語\n${charlie.slice(0, 20)}`, "utf8"),
+      Buffer.from(charlie.slice(20), "utf8"),
+      Buffer.from("\n", "utf8"),
+      Buffer.from(`${unknownResponse}\n${turnCompletedFrame}\n`, "utf8"),
+    );
+    const base = [initResponseLine, threadResponseLine, turnResponseLine];
+    const plan: FramePlan = {
+      responses: {
+        initialize: [exactStep(initResponseLine)],
+        "thread/start": [exactStep(threadResponseLine)],
+        "turn/start": [exactStep(turnResponseLine, { release: 2 })],
+      },
+      // The final chunk is not gated: the adapter terminates the child once
+      // turn/completed routes, so it must not be left waiting on the barrier.
+      turn: turnChunks.map((chunk, index) => exactStep(chunk, index === turnChunks.length - 1 ? {} : { release: base.length + index })),
+    };
+    const run = await runFramingFixture(root, "split", plan, { strictStdout: [...base, ...turnChunks] });
+
+    const expectedStdout = Buffer.concat([...base, ...turnChunks]).toString("utf8");
+    assert.equal(run.rawStream, expectedStdout);
+    assert.equal(run.result.failure, undefined);
+    assert.equal(run.result.code, 0);
+    assert.equal(run.result.session.id, THREAD_ID);
+    assert.equal(run.result.text, "alpha 日本語 🚀\nbravo\ncharlie ✓");
+    const commandEnd = run.observations.find((event) => event.observationId === "cmd-1" && event.stage === "end");
+    assert.ok(commandEnd, "the CRLF-terminated commandExecution record must route as a tool observation");
+    assert.equal(commandEnd.toolName, "bash");
+    assert.deepEqual(commandEnd.result, { output: "hi 🚀\n", exitCode: 0, status: "completed" });
+    assert.equal(run.processResult.stdoutTruncated, false);
+
+    // Deterministic work oracle: each decoded character examined exactly once.
+    // The strict barrier (asserted inside the runner) proves the first line
+    // alone arrived as this many separate data events, so a rescan of the
+    // pending prefix on any of them cannot satisfy the equality below.
+    assert.ok(turnChunks.length - 5 >= 10, "the first line must span many separate data events");
+    assert.ok(run.newlineSearch.calls > 0, "the scoped probe must observe the adapter's newline searches");
+    assert.equal(run.newlineSearch.examined, expectedStdout.length,
+      "newline search must examine each decoded stdout character exactly once, never rescanning a pending prefix");
+    assertSettledBy(run, { code: null, signal: "SIGTERM" }, "split framing");
+  });
+});
+
+test("Codex app-server routes valid frames above 16 MiB unchanged with linear newline search (#239)", async () => {
+  await withFramingRoot("pi-review-codex-framing-large-", async (root) => {
+    // Synthetic valid wire shapes the adapter consumes — a thread/start
+    // response and an agentMessage completion, each a single 17 MiB line —
+    // not claimed real-world maxima. There is no frame cap to cross; this
+    // pins that both still route completely.
+    const size = 17 * 1024 * 1024;
+    const threadPrefix = `{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"${THREAD_ID}"},"padding":"`;
+    const agentPrefix = '{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"type":"agentMessage","text":"';
+    const agentSuffix = " — fin 🚀";
+    const plan: FramePlan = {
+      responses: {
+        initialize: [exactStep(initResponseLine)],
+        "thread/start": [{ prefix: threadPrefix, fill: "p", count: size, suffix: '"}}\n' }],
+        "turn/start": [exactStep(turnResponseLine)],
+      },
+      turn: [
+        { prefix: agentPrefix, fill: "x", count: size, suffix: `${agentSuffix}"}}}\n` },
+        exactStep(Buffer.from(`${turnCompletedFrame}\n`, "utf8")),
+      ],
+    };
+    const run = await runFramingFixture(root, "large", plan, { adapterTimeoutMs: 45_000, guardMs: 60_000 });
+
+    const expectedText = `${"x".repeat(size)}${agentSuffix}`;
+    assert.equal(run.result.failure, undefined);
+    assert.equal(run.result.code, 0);
+    assert.equal(run.result.session.id, THREAD_ID, "the 17 MiB thread/start response must resolve its pending request");
+    assert.equal(run.result.text.length, expectedText.length);
+    assert.ok(run.result.text === expectedText, "the 17 MiB agent message must be the final text, intact");
+    const expectedStdoutLength = initResponseLine.toString("utf8").length
+      + threadPrefix.length + size + '"}}\n'.length
+      + turnResponseLine.toString("utf8").length
+      + agentPrefix.length + size + `${agentSuffix}"}}}\n`.length
+      + turnCompletedFrame.length + 1;
+    assert.equal(run.rawStream.length, expectedStdoutLength);
+    assert.equal(run.processResult.stdoutTruncated, false);
+    assert.ok(run.stdoutChunks.length > 2, "the large frames must arrive across multiple data events");
+    assert.equal(run.newlineSearch.examined, expectedStdoutLength,
+      "newline search must examine each decoded stdout character exactly once across large frames");
+    assertSettledBy(run, { code: null, signal: "SIGTERM" }, "large framing");
+  });
+});
+
+test("Codex app-server leaves a final line without LF unparsed and settles pending work at close (#239)", async () => {
+  await withFramingRoot("pi-review-codex-framing-tail-", async (root) => {
+    // Pending request: the thread/start response arrives complete except for
+    // its LF, then the child exits normally. The request must reject through
+    // the existing close path, not resolve from the unterminated tail.
+    const threadNoLf = frameLine({ jsonrpc: "2.0", id: 2, result: { thread: { id: THREAD_ID } } });
+    const requestRun = await runFramingFixture(root, "request-tail", {
+      responses: {
+        initialize: [exactStep(initResponseLine)],
+        "thread/start": [exactStep(Buffer.from(threadNoLf, "utf8"), { exit: true })],
+      },
+      turn: [],
+    });
+    assert.equal(requestRun.result.code, 1);
+    assert.equal(requestRun.result.failure?.category, "protocol");
+    assert.equal(requestRun.result.failure?.message, "Codex app-server exited before completing pending protocol work (0).");
+    assert.equal(requestRun.result.session.id, "missing");
+    assert.equal(requestRun.rawStream, `${initResponseLine.toString("utf8")}${threadNoLf}`);
+    assertSettledBy(requestRun, { code: 0, signal: null }, "request tail");
+
+    // Pending turn wait: a complete agent message routes, then a valid
+    // turn/completed line padded to span several data events arrives without
+    // LF and the child exits. The retained fragments are never parsed, so the
+    // turn wait rejects at close rather than completing.
+    const paddedCompletion = frameLine({
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: { threadId: THREAD_ID, turn: { id: TURN_ID, status: "completed" }, padding: "z".repeat(512 * 1024) },
+    });
+    const turnRun = await runFramingFixture(root, "turn-tail", {
+      responses: {
+        initialize: [exactStep(initResponseLine)],
+        "thread/start": [exactStep(threadResponseLine)],
+        "turn/start": [exactStep(turnResponseLine)],
+      },
+      turn: [
+        exactStep(Buffer.from(`${agentMessageFrame("delivered")}\n`, "utf8")),
+        exactStep(Buffer.from(paddedCompletion, "utf8"), { exit: true }),
+      ],
+    });
+    assert.equal(turnRun.result.code, 1);
+    assert.equal(turnRun.result.failure?.category, "protocol");
+    assert.equal(turnRun.result.failure?.message, "Codex app-server exited before completing pending protocol work (0).");
+    assert.equal(turnRun.result.text, "delivered");
+    assert.ok(turnRun.rawStream.endsWith(paddedCompletion), "the unterminated tail is retained in the capture");
+    assert.ok(turnRun.stdoutChunks.length > 4, "the unterminated tail must span multiple data events");
+    assert.equal(turnRun.newlineSearch.examined, turnRun.rawStream.length);
+    assertSettledBy(turnRun, { code: 0, signal: null }, "turn tail");
+  });
+});
+
+test("Codex framing fixture settles and joins a hung child's actual close before removing its root (#239)", async () => {
+  // Fixture failure path, not adapter behavior: the child never answers
+  // thread/start, the outer guard fires first, and the shared fail-closed
+  // settle must run before the captured handle's actual close and the
+  // abandoned adapter run are joined. The root is removed only afterwards.
+  let observedRoot: FramingRoot | undefined;
+  await withFramingRoot("pi-review-codex-framing-hung-", async (root) => {
+    observedRoot = root;
+    await assert.rejects(
+      runFramingFixture(root, "hung", { responses: { initialize: [exactStep(initResponseLine)] }, turn: [] }, { adapterTimeoutMs: 60_000, guardMs: 500 }),
+      (error: unknown) => {
+        const message = errorMessage(error);
+        assert.match(message, /did not settle within the bounded guard/);
+        if (process.platform === "win32") {
+          // No portable cwd verification: no signal; the child's own watchdog ends it.
+          assert.match(message, /"action":"unverified-identity"/);
+          assert.match(message, /child close: \{"code":124,"signal":null\}/);
+        } else {
+          assert.match(message, /"action":"signaled"/);
+          assert.match(message, /child close: \{"code":null,"signal":"SIGKILL"\}/);
+        }
+        return true;
+      },
+    );
+    assert.deepEqual(root.retained, [], "a joined close must not retain the fixture root");
+  });
+  assert.ok(observedRoot !== undefined);
+  await assert.rejects(readFile(join(observedRoot.path, "hung", "plan.json")), { code: "ENOENT" }, "the fixture root is removed after settlement");
+});

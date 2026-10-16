@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.163]
+## [0.1.0-dev.164]
 
 ### Changed
 
@@ -31,6 +31,18 @@ dates.
   query child with no retry, owned-root ownership, PID binding, and the receipt
   wire schema and HMAC identity are unchanged, and no query output, error text,
   command line, host path, or PID is ever reported.
+
+## [0.1.0-dev.163]
+
+### Fixed
+
+- Reduce Codex app-server JSON-RPC line-framing CPU and allocation amplification
+  (#239): each stdout data event is now searched for line breaks only within its own
+  decoded text, and an incomplete line is assembled once when its newline arrives
+  instead of the whole pending prefix being rescanned and recopied on every event.
+  The protocol and framing semantics are unchanged: there is still no frame-size cap
+  (an unterminated line is retained in full), a final line without a newline is still
+  never parsed, and the retained stdout/stderr capture limits are unchanged.
 
 ## [0.1.0-dev.162]
 

@@ -3311,8 +3311,11 @@ export class SidebarController {
       const warning = entry.warning;
       const count = warning.count > 9999 ? "9999+" : String(warning.count);
       const title = warning.count > 0 ? `! Terminal diagnostics (${count})` : "! Terminal diagnostics";
+      // Appends are queued asynchronously with no per-record acknowledgement,
+      // so a healthy status only points at the log and never claims a save
+      // completed. A known persistence failure is shown explicitly.
       const status = warning.logStatus === "ok"
-        ? "saved to diagnostics log"
+        ? "details: diagnostics log"
         : `NOT saved: ${terminalDiagnosticsFailurePhrase(warning.logFailure)}`;
       return [
         wrapRow(`${marker}${title}`, cols, selected && this._focus !== "main" ? SGR_SELECTION_BLUE : "\x1b[1m"),

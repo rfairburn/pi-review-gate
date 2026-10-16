@@ -794,8 +794,10 @@ When xterm reports a warning or error, the host shows a clearable warning in its
   `! Terminal diagnostics: 3 (clear in sidebar)`, visible even while the sidebar is
   hidden;
 - a three-row **Terminal diagnostics** entry in the roster, below the session cards,
-  showing the count since the last clear, whether records were saved, and
-  `enter clears warning`.
+  showing the count since the last clear, `details: diagnostics log` (or a
+  `NOT saved: ...` reason once a persistence failure is known), and
+  `enter clears warning`. Records are written asynchronously, so the pointer means
+  only that no failure is known yet, not that a write has completed.
 
 To clear the warning, highlight that roster entry and press Enter while the roster
 has focus, or single-left-click the drawn entry. Only a fully drawn entry can be
@@ -846,9 +848,13 @@ Persistence is ownership-safe and fails closed:
   be owned by the current user and must not be writable by group or others.
 - Log files must be regular, single-link files owned by the current user, opened
   without following symlinks. New files are created exclusively with mode `0600`.
-- A rotation slot, or an existing non-empty active file, is moved, removed, or
-  appended to only when its first line carries the schema marker. Any other file is
-  left untouched.
+  On POSIX, an existing active or rotation file with any group or other permission
+  is refused (`unsafe log file`). Its contents, mode, and path are left unchanged;
+  the host never changes its mode. On Windows the agent directory's OS access
+  control applies; the host sets no custom ACL.
+- A rotation slot or an existing active file is moved, removed, or appended to only
+  when its first line carries the schema marker. Any other file, including an empty
+  one, is left untouched.
 
 When persistence fails or is unavailable, the warning says so with a fixed phrase,
 for example `NOT saved: unsafe log file` or `unknown file at log path`. No path or

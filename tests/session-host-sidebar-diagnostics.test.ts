@@ -87,11 +87,27 @@ test("the warning is one 3-row host-owned entry after the session cards; setting
 	const lines = harness.render();
 	const title = lines.findIndex((line) => line.includes("! Terminal diagnostics (3)"));
 	assert.ok(title > lines.findIndex((line) => line.includes("label-b")), "after the session cards");
-	assert.equal(lines[title + 1], "  saved to diagnostics log");
+	assert.equal(lines[title + 1], "  details: diagnostics log");
 	assert.equal(lines[title + 2], "  enter clears warning");
 	assert.equal(lines[title + 3]?.trim(), "Saved conversations");
 	harness.controller.setTerminalDiagnosticsWarning(undefined);
 	assert.ok(!harness.render().some((line) => line.includes("Terminal diagnostics")));
+});
+
+test("a healthy status only points at the log; it never claims a queued write was saved", () => {
+	// appendDiagnostic is queued asynchronously with no per-record
+	// acknowledgement, so logStatus "ok" means only that no failure is known.
+	const harness = setup([]);
+	harness.controller.setTerminalDiagnosticsWarning(warning(1));
+	const lines = harness.render();
+	const title = lines.findIndex((line) => line.includes("! Terminal diagnostics (1)"));
+	assert.equal(lines[title + 1], "  details: diagnostics log");
+	const entry = lines.slice(title, title + 3).join("\n");
+	assert.ok(!/\bsaved\b/i.test(entry), "no completed-save claim");
+	// A later known failure is still shown explicitly in place of the pointer.
+	harness.controller.setTerminalDiagnosticsWarning(warning(1, { logStatus: "failed", logFailure: "write-failed", failureNotice: true }));
+	const failed = harness.render();
+	assert.equal(failed[failed.findIndex((line) => line.includes("! Terminal diagnostics (1)")) + 1], "  NOT saved: log write failed");
 });
 
 test("persistence failure text is fixed and payload-free", () => {

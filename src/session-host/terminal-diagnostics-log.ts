@@ -18,12 +18,16 @@
  * - Every log file must be a regular, single-link file owned by the current
  *   user and opened without following symlinks; the opened descriptor is
  *   rechecked against the inspected identity. New files are created
- *   exclusively with mode 0600.
- * - A rotation slot (`.1`/`.2`) or an existing non-empty active file is only
- *   moved, removed, or appended to when its first line carries this log's
- *   schema marker. Anything else is an unknown file: it is left untouched and
- *   persistence stops with a visible, payload-free failure. Nothing is ever
- *   truncated.
+ *   exclusively with mode 0600. On POSIX an existing active or rotation file
+ *   with any group/other permission bit is refused (`unsafe-log-path`) and
+ *   left untouched: its mode is never changed, so new private records are
+ *   never added to an overly accessible file. Windows relies on the OS ACLs
+ *   of the agent directory; no custom ACL is applied.
+ * - A rotation slot (`.1`/`.2`) or an existing active file is only moved,
+ *   removed, or appended to when its first line carries this log's schema
+ *   marker. Anything else, including a pre-existing empty file, is an unknown
+ *   file: it is left untouched and persistence stops with a visible,
+ *   payload-free failure. Nothing is ever truncated.
  * - Writes are serialized through one bounded in-memory queue; overflow is
  *   counted and recorded as a `dropped` line rather than growing memory.
  *   `close()` drains, syncs, and closes within a bounded wait and reports
@@ -206,6 +210,12 @@ function safeFileStats(stats: BigIntStats): boolean {
 	const uid = currentUid();
 	if (uid !== undefined && stats.uid !== BigInt(uid)) return false;
 	return stats.nlink === 1n;
+}
+
+/** POSIX: no group/other permission bits. Windows: governed by the OS ACL boundary. */
+function privateFileMode(stats: BigIntStats): boolean {
+	if (process.platform === "win32") return true;
+	return (stats.mode & 0o077n) === 0n;
 }
 
 export class TerminalDiagnosticsLog implements TerminalDiagnosticsLogLike {
@@ -522,7 +532,7 @@ export class TerminalDiagnosticsLog implements TerminalDiagnosticsLogLike {
 		if (existing === undefined) {
 			await this.createActive(path);
 		} else {
-			if (!safeFileStats(existing)) throw new LogFailure("unsafe-log-path");
+			if (!safeFileStats(existing) || !privateFileMode(existing)) throw new LogFailure("unsafe-log-path");
 			let handle: FileHandle;
 			try {
 				handle = await open(path, fsConstants.O_RDWR | fsConstants.O_APPEND
@@ -532,14 +542,15 @@ export class TerminalDiagnosticsLog implements TerminalDiagnosticsLogLike {
 			}
 			try {
 				const stats = await handle.stat({ bigint: true });
-				if (!stats.isFile() || stats.dev !== existing.dev || stats.ino !== existing.ino) {
+				if (!stats.isFile() || stats.dev !== existing.dev || stats.ino !== existing.ino
+					|| !safeFileStats(stats) || !privateFileMode(stats)) {
 					throw new LogFailure("unsafe-log-path");
 				}
-				if (stats.size > 0n && !(await this.recognizedHead(handle))) {
+				// A pre-existing empty file carries no marker, so it is no evidence
+				// that this log owns it; only a file this run created exclusively is
+				// written without one.
+				if (stats.size === 0n || !(await this.recognizedHead(handle))) {
 					throw new LogFailure("unrecognized-log-file");
-				}
-				if (process.platform !== "win32") {
-					try { await handle.chmod(0o600); } catch { /* recognized own file; mode tightening is best effort */ }
 				}
 				this.handle = handle;
 				this.activeIdentity = { dev: stats.dev, ino: stats.ino };
@@ -594,6 +605,7 @@ export class TerminalDiagnosticsLog implements TerminalDiagnosticsLogLike {
 			throw new LogFailure("rotate-failed");
 		}
 		if (!safeFileStats(stats) || stats.size === 0n) throw new LogFailure("unrecognized-log-file");
+		if (!privateFileMode(stats)) throw new LogFailure("unsafe-log-path");
 		let handle: FileHandle;
 		try {
 			handle = await open(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
@@ -606,6 +618,7 @@ export class TerminalDiagnosticsLog implements TerminalDiagnosticsLogLike {
 				|| !(await this.recognizedHead(handle))) {
 				throw new LogFailure("unrecognized-log-file");
 			}
+			if (!privateFileMode(opened)) throw new LogFailure("unsafe-log-path");
 		} finally {
 			try { await handle.close(); } catch { /* inspection only */ }
 		}
@@ -647,7 +660,7 @@ export class TerminalDiagnosticsLog implements TerminalDiagnosticsLogLike {
 		} catch {
 			throw new LogFailure("unsafe-log-path");
 		}
-		if (!safeFileStats(active) || active.dev !== identity.dev || active.ino !== identity.ino) {
+		if (!safeFileStats(active) || !privateFileMode(active) || active.dev !== identity.dev || active.ino !== identity.ino) {
 			throw new LogFailure("unsafe-log-path");
 		}
 		try {

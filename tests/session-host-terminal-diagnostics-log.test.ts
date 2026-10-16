@@ -421,3 +421,123 @@ test("every rotated descriptor and the final descriptor are synchronized before 
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
+
+function snapshot(stateDir: string): Record<string, { bytes: string; mode: number; ino: number }> {
+	const result: Record<string, { bytes: string; mode: number; ino: number }> = {};
+	for (const name of readdirSync(stateDir).filter((entry) => entry.startsWith("terminal-diagnostics")).sort()) {
+		const path = join(stateDir, name);
+		const stats = lstatSync(path);
+		result[name] = { bytes: readFileSync(path, "utf8"), mode: stats.mode & 0o777, ino: stats.ino };
+	}
+	return result;
+}
+
+test("a recognized log made group/other accessible is refused before append or rotation and left unchanged", { skip: !POSIX }, async () => {
+	const dir = agentDir();
+	try {
+		const maxFileBytes = 1024;
+		const stateDir = join(dir, "session-host");
+		const active = join(stateDir, TERMINAL_DIAGNOSTICS_FILENAME);
+		const seed = new TerminalDiagnosticsLog({ agentDir: dir, maxFileBytes, maxLineBytes: 512 });
+		for (let index = 0; index < 20; index += 1) seed.appendDiagnostic("seed", record());
+		assert.deepEqual(await seed.close(), { settled: true, flushed: true, status: "ok" });
+		assert.deepEqual(Object.keys(snapshot(stateDir)), [
+			"terminal-diagnostics.jsonl",
+			"terminal-diagnostics.jsonl.1",
+			"terminal-diagnostics.jsonl.2",
+		]);
+
+		for (const name of ["terminal-diagnostics.jsonl", "terminal-diagnostics.jsonl.1", "terminal-diagnostics.jsonl.2"]) {
+			chmodSync(join(stateDir, name), 0o644);
+			const before = snapshot(stateDir);
+			const seen = statuses();
+			const log = new TerminalDiagnosticsLog({ agentDir: dir, maxFileBytes, maxLineBytes: 512, onStatus: seen.onStatus });
+			// The active file case is refused at open; the slot cases need a rotation.
+			const appends = name === "terminal-diagnostics.jsonl" ? 1 : 20;
+			for (let index = 0; index < appends; index += 1) log.appendDiagnostic("row", record());
+			assert.deepEqual(await log.close(), { settled: true, flushed: false, status: "failed", failure: "unsafe-log-path" }, name);
+			assert.deepEqual(seen.seen, [{ status: "failed", failure: "unsafe-log-path" }], `${name}: payload-free failure`);
+			const after = snapshot(stateDir);
+			assert.deepEqual(Object.keys(after), Object.keys(before), `${name}: no path added, moved, or removed`);
+			assert.deepEqual(after[name], before[name], `${name}: refused file keeps its bytes, mode, and identity`);
+			assert.equal(after[name]!.mode, 0o644, `${name}: its mode was not changed`);
+			if (name === "terminal-diagnostics.jsonl") {
+				assert.deepEqual(after, before, "nothing was appended to or rotated from the accessible active file");
+			} else {
+				// The private 0600 active file may receive this run's records, but it
+				// is never moved while a slot is refused.
+				assert.equal(after["terminal-diagnostics.jsonl"]!.ino, before["terminal-diagnostics.jsonl"]!.ino);
+				for (const other of Object.keys(before).filter((key) => key !== name && key !== "terminal-diagnostics.jsonl")) {
+					assert.deepEqual(after[other], before[other], `${name}: ${other} untouched`);
+				}
+			}
+			chmodSync(join(stateDir, name), 0o600);
+		}
+
+		// Regular private logs keep appending and rotating.
+		const activeIno = lstatSync(active).ino;
+		const next = new TerminalDiagnosticsLog({ agentDir: dir, maxFileBytes, maxLineBytes: 512 });
+		for (let index = 0; index < 20; index += 1) next.appendDiagnostic("later", record());
+		assert.deepEqual(await next.close(), { settled: true, flushed: true, status: "ok" });
+		const final = snapshot(stateDir);
+		assert.equal(Object.keys(final).length, 3);
+		assert.notEqual(final["terminal-diagnostics.jsonl"]!.ino, activeIno, "the run rotated");
+		for (const entry of Object.values(final)) assert.equal(entry.mode, 0o600);
+		assert.ok(lines(active).some((entry) => entry.instance === "later"));
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("a pre-existing empty active file is not ownership evidence: refused and left untouched", async () => {
+	const dir = agentDir();
+	try {
+		const stateDir = join(dir, "session-host");
+		mkdirSync(stateDir, { mode: 0o700 });
+		const active = join(stateDir, TERMINAL_DIAGNOSTICS_FILENAME);
+		writeFileSync(active, "", { mode: 0o600 });
+		const before = lstatSync(active);
+		const seen = statuses();
+		const log = new TerminalDiagnosticsLog({ agentDir: dir, onStatus: seen.onStatus });
+		log.appendDiagnostic("row", record());
+		assert.deepEqual(await log.close(), { settled: true, flushed: false, status: "failed", failure: "unrecognized-log-file" });
+		assert.deepEqual(seen.seen, [{ status: "failed", failure: "unrecognized-log-file" }]);
+		const after = lstatSync(active);
+		assert.equal(after.size, 0, "the empty file was not written");
+		assert.equal(after.ino, before.ino);
+		assert.equal(after.mode, before.mode);
+		assert.deepEqual(readdirSync(stateDir), [TERMINAL_DIAGNOSTICS_FILENAME], "no rotation slot was created");
+
+		// A file this run creates exclusively is written normally.
+		rmSync(active);
+		const fresh = new TerminalDiagnosticsLog({ agentDir: dir });
+		fresh.appendDiagnostic("row", record());
+		assert.deepEqual(await fresh.close(), { settled: true, flushed: true, status: "ok" });
+		assert.deepEqual(lines(active).map((entry) => entry.kind), ["host-run", "diagnostic", "host-run-end"]);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("an accepted append is only queued: an ok status is no persistence acknowledgement", async () => {
+	const dir = agentDir();
+	try {
+		const fresh = new TerminalDiagnosticsLog({ agentDir: dir });
+		fresh.appendDiagnostic("row", record());
+		assert.equal(fresh.status, "ok");
+		assert.equal(existsSync(TerminalDiagnosticsLog.pathFor(dir)), false, "nothing is written when append returns");
+		assert.equal((await fresh.close()).flushed, true);
+		rmSync(join(dir, "session-host"), { recursive: true, force: true });
+
+		const stateDir = join(dir, "session-host");
+		mkdirSync(stateDir, { mode: 0o700 });
+		writeFileSync(join(stateDir, TERMINAL_DIAGNOSTICS_FILENAME), "not ours\n", { mode: 0o600 });
+		const log = new TerminalDiagnosticsLog({ agentDir: dir });
+		log.appendDiagnostic("row", record());
+		assert.equal(log.status, "ok", "status is still ok while the write is pending");
+		assert.deepEqual(await log.close(), { settled: true, flushed: false, status: "failed", failure: "unrecognized-log-file" });
+		assert.equal(readFileSync(join(stateDir, TERMINAL_DIAGNOSTICS_FILENAME), "utf8"), "not ours\n");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});

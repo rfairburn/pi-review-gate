@@ -2,6 +2,7 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { lstat, readFile, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { atomicWrite } from "./durable-write";
+import { isWindowsLineageRefusalReason } from "./windows-process-lineage";
 
 export const PI_SETTLEMENT_SECRET_ENV = "PI_REVIEW_GATE_SETTLEMENT_SECRET";
 export const PI_SETTLEMENT_PATH_ENV = "PI_REVIEW_GATE_SETTLEMENT_PATH";
@@ -14,6 +15,15 @@ const RECEIPT_VERSION = 2;
 const MAX_RECEIPT_BYTES = 2_048;
 const TOKEN = /^[A-Za-z0-9_-]{16,200}$/;
 
+/**
+ * Optional typed outcome of the parent-only Windows lineage proof. Plain
+ * boolean callers keep working unchanged; a typed outcome may carry one fixed
+ * sanitized stage code, which is appended to the existing refusal wording.
+ * Only `verified === true` (strict) accepts — a truthy object, string, or
+ * number never does, and a malformed/unknown stage reports `unknown`.
+ */
+export type PiSettlementLineageOutcome = { verified: boolean; reason?: unknown };
+
 export interface PiSettlementBootstrap {
   path: string;
   sessionId: string;
@@ -21,7 +31,9 @@ export interface PiSettlementBootstrap {
   secret: string;
   pid?: number;
   /** Parent-only proof used once for cmd.exe-rooted Windows Pi launches. */
-  verifySpawnedPid?: (pid: number) => boolean | Promise<boolean>;
+  verifySpawnedPid?: (
+    pid: number,
+  ) => boolean | PiSettlementLineageOutcome | Promise<boolean | PiSettlementLineageOutcome>;
 }
 
 interface PiSettlementReceipt {
@@ -199,15 +211,21 @@ async function verifyReceipt(
     throw new Error("Pi executor settlement acknowledgement does not match this child/session/settlement.");
   }
   let verified = false;
+  let stage: string | undefined;
   try {
-    verified = await bootstrap.verifySpawnedPid(receipt.pid);
+    const outcome = await bootstrap.verifySpawnedPid(receipt.pid);
+    verified = lineageVerificationAccepted(outcome);
+    stage = verified ? undefined : lineageRefusalStage(outcome);
   } catch {
     // Lineage is a fail-closed identity check. Keep host/query details out of
-    // the receipt diagnostics and never bind a PID when verification errors.
+    // the receipt diagnostics and never bind a PID when verification errors:
+    // only the fixed stage below is reported, never the thrown value.
     verified = false;
+    stage = LINEAGE_VERIFIER_ERROR_STAGE;
   }
   if (!verified) {
-    throw new Error("Pi executor settlement acknowledgement PID is not a verified live descendant of its owned shell.");
+    throw new Error("Pi executor settlement acknowledgement PID is not a verified live descendant of its owned shell."
+      + (stage === undefined ? "" : ` [lineage stage: ${stage}]`));
   }
   // Concurrent first-receipt waiters must not race two otherwise valid PIDs
   // into the bootstrap's initial identity binding.
@@ -215,6 +233,33 @@ async function verifyReceipt(
     throw new Error("Pi executor settlement acknowledgement does not match this child/session/settlement.");
   }
   bootstrap.pid = receipt.pid;
+}
+
+/** Fixed stage reported when the lineage verifier itself throws. */
+const LINEAGE_VERIFIER_ERROR_STAGE = "verifier-error";
+/** Fixed stage reported for a missing, unknown, or malformed stage value. */
+const LINEAGE_UNKNOWN_STAGE = "unknown";
+
+/** Acceptance requires `true` or a typed outcome with strict `verified === true`. */
+function lineageVerificationAccepted(outcome: unknown): boolean {
+  if (typeof outcome === "boolean") return outcome;
+  if (outcome === null || typeof outcome !== "object" || Array.isArray(outcome)) return false;
+  return (outcome as { verified?: unknown }).verified === true;
+}
+
+/**
+ * Sanitized refusal stage. Legacy boolean callers report no stage (their
+ * existing wording is unchanged); any other value yields only a fixed literal
+ * from the lineage stage list, `verifier-error`, or `unknown`.
+ */
+function lineageRefusalStage(outcome: unknown): string | undefined {
+  if (typeof outcome === "boolean") return undefined;
+  if (outcome === null || typeof outcome !== "object" || Array.isArray(outcome)) return LINEAGE_UNKNOWN_STAGE;
+  const reason = (outcome as { reason?: unknown }).reason;
+  if (typeof reason === "string" && (reason === LINEAGE_VERIFIER_ERROR_STAGE || isWindowsLineageRefusalReason(reason))) {
+    return reason;
+  }
+  return LINEAGE_UNKNOWN_STAGE;
 }
 
 function receiptMac(

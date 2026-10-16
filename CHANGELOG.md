@@ -15,6 +15,23 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.163]
+
+### Changed
+
+- The Windows `cmd.exe`-rooted settlement descendant check reports which bounded
+  stage refused: the existing settlement refusal keeps its exact wording and
+  appends one fixed sanitized stage code (`[lineage stage: <code>]`) covering
+  preflight, the single bounded query child (spawn failure, nonzero exit, output
+  cap, or a timeout positively witnessed by the verifier's own deadline callback
+  rather than inferred from a kill flag, signal, or elapsed time), the native
+  ancestry script's sentinel branches, the local evidence validator, and the
+  final owned-root liveness check. This is diagnostic-only (#335) and identifies
+  no cause: acceptance conditions, the 5-second/4KiB/64-step bounds, the single
+  query child with no retry, owned-root ownership, PID binding, and the receipt
+  wire schema and HMAC identity are unchanged, and no query output, error text,
+  command line, host path, or PID is ever reported.
+
 ## [0.1.0-dev.162]
 
 ### Changed

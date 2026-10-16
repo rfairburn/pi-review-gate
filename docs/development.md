@@ -325,9 +325,26 @@ that the reported live PID descends from the still-owned command root. The
 query rechecks process creation times and parent links and requires each parent
 to predate its child, rejecting recycled PIDs. That verified PID is bound for
 exact equality on later receipts; the receipt wire schema and HMAC identity
-remain unchanged. Focused tests cover command generation, PID binding, and
-owned-tree teardown; native `.cmd` cleanup verifies the actual Pi PID exits and
-waits for process close before removing its sandbox.
+remain unchanged. When that verification refuses, the existing settlement
+refusal is kept verbatim and one fixed sanitized stage code is appended
+(`[lineage stage: <code>]`), naming the bounded stage that refused: preflight
+(non-Windows host, invalid identity, already-exited owned root, unvalidated host
+root), the one query child (spawn failure, nonzero exit, output-cap, or a
+timeout positively witnessed by the verifier's own deadline callback — never
+inferred from a kill flag, signal, or elapsed time), the native ancestry script's
+own sentinel (missing candidate/ancestor/root record, absent parent, cycle,
+64-step limit, live-snapshot count/creation/parent incoherence), the local
+evidence validator, or the final owned-root liveness check. Stage codes are a
+closed fixed list; a thrown verifier reports `verifier-error` and a missing,
+unknown, or malformed stage reports `unknown`. No query output, raw
+stdout/stderr, error text, command line, host path, PID, or process inventory
+is ever appended; plain-boolean verification callers keep the original wording
+unchanged, and only strict `verified === true` accepts — a truthy result object
+never does. The 5-second/4KiB/64-step bounds, single query child, no-retry
+behavior, owned-root ownership, and PID binding are unchanged; the stage is
+diagnostic only. Focused tests cover command generation, PID binding,
+owned-tree teardown, and every refusal stage; native `.cmd` cleanup verifies the
+actual Pi PID exits and waits for process close before removing its sandbox.
 
 Terminal teardown bounds inherited-pipe waits separately from root exit. Reviewer
 cleanup drains for its escalation interval plus a five-second grace period; RPC
@@ -348,7 +365,19 @@ records carry an optional lifecycle identity so a late exit from an earlier atte
 cannot clear a newer child's ownership, even if its PID is reused.
 The required native Windows child suite includes
 `tests/pi-child-teardown.test.ts` for reviewer, RPC executor, recovery, and
-root-exit-during-background-readiness paths.
+root-exit-during-background-readiness paths. The native launcher job runs
+`tests/pi-settlement-lineage-diagnostics.test.ts` in that same child-process
+step, so its native evidence is still collected when an earlier case in the step
+fails. Its win32-only cases drive
+the real production lineage query against real processes (a genuine descendant
+must verify, an unrelated PID must be refused by a native chain/evidence stage),
+while its cross-platform cases drive the same orchestration through a mocked
+bounded query child to cover every refusal stage on every host. Native fixture
+cleanup adopts a descendant identity only from a complete validated ownership
+frame or ownership record, terminates the still-owned tree rather than only the
+root, guards each step separately, waits for each fixture's actual `close` event
+(an error event is not closure evidence), and keeps the ownership records on disk
+whenever settlement stays unconfirmed instead of deleting its only evidence.
 
 The extension selects the configured [operating-mode prompt](configuration.md#operating-modes)
 for each new run; each prompt opens with a startup cue to read the matching shipped

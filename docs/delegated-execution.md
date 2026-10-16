@@ -315,7 +315,11 @@ while background work remains active. The extension publishes a version-2 authen
 child/session identity, and monotonic settlement generation; signatures and one-shot
 consumption prevent stale or forged completion. Legacy zero-browser-resource receipts
 and bootstrap names are not compatible. RPC `agent_end` and process exit alone are
-still insufficient evidence of successful model settlement.
+still insufficient evidence of successful model settlement. On a Windows
+`.cmd`-rooted launch, the first receipt's descendant-proof refusal keeps its
+original wording and appends one fixed sanitized stage code naming the bounded
+lineage stage that refused — no query output, path, or PID is included
+([launcher internals](development.md#launcher-behavior)).
 
 Terminal worker shutdown closes the browser, and the parent adapter awaits process exit
 before returning completion for capture/review. After closing stdin, it allows a separate

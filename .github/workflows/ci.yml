@@ -288,8 +288,15 @@ jobs:
           PI_REVIEW_GATE_REQUIRE_PI_HOST: "1"
           PI_REVIEW_GATE_EXPECT_PI_VERSION: "1.3.0"
         # Include bounded teardown when an exited root leaves inherited pipes
-        # open in reviewer, RPC executor, and compaction recovery paths.
-        run: node --test dist-test/tests/pi-child-launch.test.js dist-test/tests/pi-child-teardown.test.js
+        # open in reviewer, RPC executor, and compaction recovery paths, plus the
+        # #335 settlement-lineage diagnostics suite: its win32-only cases run the
+        # REAL production lineage query against real processes (a genuine
+        # descendant must still verify, an unrelated PID must be refused by a
+        # native chain/evidence stage) and its cross-platform cases drive the same
+        # orchestration through a mocked bounded query child. Same step on purpose:
+        # this native evidence must still be collected when an earlier case in the
+        # step fails. Every existing case and failure status is unchanged.
+        run: node --test dist-test/tests/pi-child-launch.test.js dist-test/tests/pi-child-teardown.test.js dist-test/tests/pi-settlement-lineage-diagnostics.test.js
       - name: Static docs validation
         run: node scripts/check-docs.cjs
       - name: Docs checker regression tests

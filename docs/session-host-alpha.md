@@ -69,7 +69,7 @@ terminal-restoration evidence. Green CI does not certify Windows runtime support
   Windows launcher remains unchanged.
 - **Node.js:** 22.19.0 or newer.
 - **Pi:** stable Pi 1.0.4 or newer; the provisioned runtime and native UI
-  acceptance fixture are pinned to **1.2.0**, with the matching 1.2.0 TUI dependency.
+  acceptance fixture are pinned to **1.3.0**, with the matching 1.3.0 TUI dependency.
 - An interactive terminal with both stdin and stdout attached.
 
 The Windows session-host source path selects the Microsoft ConPTY implementation
@@ -282,7 +282,7 @@ conversation in that workspace, without creating a worktree, clone, or branch. N
 settings and compatible inherited launch options remain shared, but the parent's
 conversation name and startup message/file inputs are not inherited. The supplied title is
 forwarded unchanged to Pi's native session-name API; Pi applies its own persistence
-semantics, including trimming surrounding whitespace on the pinned 1.2.0 runtime. The
+semantics, including trimming surrounding whitespace on the pinned 1.3.0 runtime. The
 host does not crop or shorten titles to fit the sidebar, and titles longer than the
 recommendation remain stored in full after Pi's native normalization. The prompt is
 handed unchanged to Pi's public user-message API with prompt-template expansion disabled,
@@ -381,7 +381,7 @@ without a second Enter, with the pane still visible. A late listing or creation 
 never takes over a later-opened or dismissed pane.
 
 Type in the Saved search bar to filter this global catalog with native Pi `/resume`
-query semantics (adapted from Pi 1.1.0 and unchanged in the pinned 1.2.0 runtime): fuzzy tokens, quoted phrases such as `"node cve"`, and
+query semantics (adapted from Pi 1.1.0 and unchanged in the pinned 1.3.0 runtime): fuzzy tokens, quoted phrases such as `"node cve"`, and
 case-insensitive regular expressions such as `re:node.*cve`. Search covers the native
 session ID, full stored name, native all-message text, and recorded workspace. Message
 text is held only in a transient search index; it is never displayed in picker rows,
@@ -591,7 +591,7 @@ ordinary standalone launchers are unchanged.
 ### Inline images and compatibility
 
 Ghostty is the concrete image-display target, not a blanket terminal-graphics
-compatibility promise. The native protocol fixture uses Pi and pi-tui **1.2.0**.
+compatibility promise. The native protocol fixture uses Pi and pi-tui **1.3.0**.
 The hosted Kitty path requires `TERM_PROGRAM=ghostty` and `TERM=xterm-ghostty`,
 with no `TMUX`, `TMUX_PANE`, or `STY` marker. A customized terminal environment
 that does not meet this narrow gate uses text fallback, even if standalone Pi's

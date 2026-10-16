@@ -94,7 +94,7 @@ export type { NativePtyHandle };
 export const LAUNCHER_REQUIRE_ENV = "PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST";
 export const LAUNCHER_SOURCE_ROOT_ENV = "PI_REVIEW_GATE_LAUNCHER_SOURCE_ROOT";
 export const LAUNCHER_PYTHON_ENV = "PI_REVIEW_GATE_LAUNCHER_PYTHON";
-export const LAUNCHER_EXPECT_PI_VERSION = "1.2.0";
+export const LAUNCHER_EXPECT_PI_VERSION = "1.3.0";
 export const LAUNCHER_PTY_VERSION = "1.2.0-beta.15";
 export const LAUNCHER_LEG_DEADLINE_MS = 9 * 60_000;
 export const LAUNCHER_TEST_TIMEOUT_MS = 20 * 60_000;
@@ -136,7 +136,7 @@ export interface LauncherRuntimePin {
   readonly sourceRoot: string;
   readonly agentDir: string;
   readonly piExecutable: string;
-  readonly version: "1.2.0";
+  readonly version: "1.3.0";
   readonly python: string;
   readonly cmd: string;
   readonly powershell: string;

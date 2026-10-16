@@ -105,7 +105,7 @@ export type { FileIdentity, NativeJournalRecord, PtyJournalRecord, NativePtyHand
 export const POSIX_LAUNCHER_REQUIRE_ENV = "PI_REVIEW_GATE_REQUIRE_PI_HOST";
 export const POSIX_LAUNCHER_SOURCE_ROOT_ENV = "PI_REVIEW_GATE_LAUNCHER_SOURCE_ROOT";
 export const POSIX_LAUNCHER_PYTHON_ENV = "PI_REVIEW_GATE_LAUNCHER_PYTHON";
-export const POSIX_LAUNCHER_EXPECT_PI_VERSION = "1.2.0";
+export const POSIX_LAUNCHER_EXPECT_PI_VERSION = "1.3.0";
 export const POSIX_LAUNCHER_PTY_VERSION = "1.2.0-beta.15";
 export const POSIX_LAUNCHER_LEG_DEADLINE_MS = 9 * 60_000;
 export const POSIX_LAUNCHER_TEST_TIMEOUT_MS = 20 * 60_000;
@@ -151,7 +151,7 @@ export interface PosixLauncherRuntimePin {
   readonly sourceRoot: string;
   readonly agentDir: string;
   readonly piExecutable: string;
-  readonly version: "1.2.0";
+  readonly version: "1.3.0";
   readonly python: string;
   readonly bash: string;
   readonly nodeBinDir: string;
@@ -1328,5 +1328,5 @@ export function assertPosixLegArithmetic(): void {
     "event waits are bounded below the exact-process observer timeout");
   assert.equal(POSIX_LAUNCHER_OUTER_COLS, 120);
   assert.equal(POSIX_LAUNCHER_OUTER_ROWS, 50);
-  assert.equal(POSIX_LAUNCHER_EXPECT_PI_VERSION, "1.2.0");
+  assert.equal(POSIX_LAUNCHER_EXPECT_PI_VERSION, "1.3.0");
 }

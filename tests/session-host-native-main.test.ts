@@ -876,7 +876,7 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
   assert.equal(hostExit.signal ?? 0, 0, "the public Main returned after every owned native child had exited normally");
 
   // Keep explicit local verification assertions close to the end-to-end proof.
-  assert.equal(runtime.version, "1.2.0");
+  assert.equal(runtime.version, "1.3.0");
   assert.ok(runtime.piExecutable.endsWith(".js"), "the integration uses the pinned Node CLI entry, never a shell shim");
   assert.equal(candidate.entry, join(candidate.root, "dist", "src", "index.js"));
   assertionsCompleted = true;

@@ -230,7 +230,7 @@ function assertUserFeedback(entry: Sent | undefined, expect: { taskId: string; e
   return text;
 }
 
-test("#191 /subtask-interrupt on a queued task reports it never started; merge reports nothing to merge", () => withHarness("queued", { maxConcurrent: 1 }, async (h) => {
+test("#191 /subtask-interrupt on a queued task reports the queued attempt never started; merge reports no merge by this request", () => withHarness("queued", { maxConcurrent: 1 }, async (h) => {
   const started = await h.controller.start([
     { title: "occupies the only slot", instructions: "work", acceptanceCriteria: ["done"] },
     { title: "waits in queue", instructions: "work", acceptanceCriteria: ["done"] },
@@ -243,7 +243,7 @@ test("#191 /subtask-interrupt on a queued task reports it never started; merge r
   await h.slash(`${started.executionId} ${second} failure`);
   assert.equal(h.feedback().length, 1);
   const failure = assertUserFeedback(h.feedback()[0], { taskId: second!, executionId: started.executionId, kind: "execute", mode: "interrupt_as_failure" });
-  assert.match(failure, /Stop: acknowledged before executor startup; the task never started\./);
+  assert.match(failure, /Stop: acknowledged before executor startup of the current queued attempt; that queued attempt never started\. This says nothing about earlier attempts or any work, session, or checkpoint they retained\./);
   assert.doesNotMatch(failure, /Merge:/);
   assert.equal(h.feedback()[0]!.message.details?.stop, "stopped_before_start");
   assert.match(h.notices.at(-1)?.message ?? "", /interrupted/, "the existing UI result is unchanged");
@@ -254,10 +254,99 @@ test("#191 /subtask-interrupt on a queued task reports it never started; merge r
   const intent = assertUserFeedback(requested, { taskId: third!, executionId: started.executionId, kind: "execute", mode: "interrupt_with_merge" });
   assert.match(intent, /does not claim that the task stopped or that anything landed/);
   const merged = assertUserFeedback(settled, { taskId: third!, executionId: started.executionId, kind: "execute", mode: "interrupt_with_merge" });
-  assert.match(merged, /Merge: no merge was attempted: the task never started, so there was no checkpoint to merge\./);
+  assert.match(merged, /Merge: no merge was attempted by this request for the current queued attempt; this does not indicate whether earlier work or a retained checkpoint exists\./);
   assert.equal(settled!.message.details?.merge, "not_attempted");
   assert.equal(h.sent.filter((entry) => entry.message.customType !== SUBTASK_INTERRUPT_FEEDBACK_CUSTOM_TYPE).length, 0, "no wake or other notification was produced");
 }));
+
+test("#191 /subtask-interrupt on a queued continuation describes only the queued attempt, never the absence of earlier work or checkpoint", () => withHarness("queued-continuation", { maxConcurrent: 1 }, async (h) => {
+  // A real first attempt runs, writes worker edits, and is stopped; its
+  // verified checkpoint, resumable session, and continuation bundle survive.
+  const prior = await startRunning(h, "continued after prior work");
+  await h.controller.interrupt({ executionId: prior.executionId, taskId: prior.taskId, mode: "interrupt_as_failure", instructionId: "setup-prior-stop", actor: "user" });
+  assert.equal(h.feedback().length, 0, "direct controller calls queue no command feedback");
+  const stopped = h.controller.inspect(prior.executionId, prior.taskId).tasks[0]!;
+  assert.equal(stopped.state, "interrupted");
+  assert.ok(stopped.initialDispatch, "an earlier attempt was dispatched to an executor");
+  assert.ok(stopped.bundle, "the earlier attempt retains a continuation bundle");
+  const priorResult = stopped.result?.taskResults[0];
+  const checkpoint = priorResult?.checkpoint;
+  assert.equal(checkpoint?.verified, true, "the earlier attempt retains a verified checkpoint");
+  assert.deepEqual(checkpoint?.changedPaths, ["draft.txt"]);
+  assert.equal(priorResult?.diagnostics?.session?.resumable, true, "the earlier attempt retains a resumable session");
+  assert.equal(checkpoint?.differsFromBase, true, "the earlier attempt's edits are captured in its checkpoint");
+
+  // Occupy the only slot, then queue the continuation behind it.
+  const occupant = await startRunning(h, "occupies the only slot");
+  const queued = await h.controller.continueTask({ executionId: prior.executionId, taskId: prior.taskId, instructions: "continue the retained work", instructionId: "setup-continue", actor: "user" });
+  assert.equal(queued.tasks.find((task) => task.taskId === prior.taskId)?.state, "queued");
+  assert.equal(h.controller.inspect(occupant.executionId, occupant.taskId).tasks[0]?.state, "running");
+
+  await h.slash(`${prior.executionId} ${prior.taskId} merge`);
+  const settledEntry = h.feedback().at(-1);
+  const settled = assertUserFeedback(settledEntry, { taskId: prior.taskId, executionId: prior.executionId, kind: "execute", mode: "interrupt_with_merge" });
+  assert.equal(settledEntry!.message.details?.stop, "stopped_before_start");
+  assert.equal(settledEntry!.message.details?.merge, "not_attempted");
+  assert.match(settled, /Stop: acknowledged before executor startup of the current queued attempt; that queued attempt never started\. This says nothing about earlier attempts or any work, session, or checkpoint they retained\./);
+  assert.match(settled, /Merge: no merge was attempted by this request for the current queued attempt; this does not indicate whether earlier work or a retained checkpoint exists\./);
+  // The ENTIRE note, including any carried controller wording, never infers
+  // that no earlier work or checkpoint exists.
+  assert.doesNotMatch(settled, /no (task )?checkpoint|no earlier work|(the )?task never started/i, "the note never infers no earlier work or checkpoint");
+  assert.match(settled, /Current task state: interrupted\.$/m, "the state is still reported without the controller's pre-start outcome");
+  assert.doesNotMatch(settled, /Authoritative outcome:|Recorded interrupt activity:/);
+  assert.match(h.controller.inspect(prior.executionId, prior.taskId).tasks[0]!.summary ?? "", /no task checkpoint to merge/, "the controller's persisted summary is unchanged");
+  // The earlier attempt's checkpoint and bundle are still retained after the stop.
+  const after = h.controller.inspect(prior.executionId, prior.taskId).tasks[0]!;
+  assert.equal(after.state, "interrupted");
+  assert.ok(after.bundle, "the retained bundle survives the queued-attempt stop");
+  assert.equal(after.result?.taskResults[0]?.checkpoint?.commitSha, checkpoint!.commitSha, "the retained checkpoint survives the queued-attempt stop");
+  assert.equal(after.commands.some((command) => command.action === "force_merge"), false, "no merge was attempted");
+  await assert.rejects(readFile(join(h.root, "draft.txt"), "utf8"), /ENOENT/, "nothing landed in main");
+}));
+
+test("#191 /subtask-interrupt merge whose save fails after an acknowledged stop and before forceMerge reports the merge unrecorded, not failed", async () => {
+  let controller: BackgroundExecutionController | undefined;
+  let target: string | undefined;
+  let injected = false;
+  await withHarness("save-before-merge", {
+    faults: {
+      // Narrow seam: fail only the persistence of this request's acknowledged
+      // quiescence, which the controller performs before it calls forceMerge.
+      save: () => {
+        if (injected || !target) return;
+        for (const group of controllerInternals(controller!).groups.values()) {
+          const task = group.tasks.find((candidate) => candidate.taskId === target);
+          if (!task) continue;
+          const acknowledged = task.commands.some((command) => command.action === "interrupt" && command.instructionId.startsWith("user-interrupt-") && command.status === "acknowledged");
+          const merging = task.commands.some((command) => command.action === "force_merge");
+          if (acknowledged && !merging && /^Writer quiesced\./.test(task.activity.at(-1)?.message ?? "")) {
+            injected = true;
+            throw new Error("injected save failure after quiescence");
+          }
+        }
+      },
+    },
+  }, async (h) => {
+    controller = h.controller;
+    const { executionId, taskId } = await startRunning(h, "save fails before merge");
+    target = taskId;
+    await h.slash(`${executionId} ${taskId} merge`);
+    assert.equal(injected, true, "the save fault fired");
+    assert.equal(h.notices.at(-1)?.level, "error", "the command still fails in the UI");
+    const entry = h.feedback().at(-1);
+    const settled = assertUserFeedback(entry, { taskId, executionId, kind: "execute", mode: "interrupt_with_merge" });
+    assert.match(settled, /Stop: acknowledged\./);
+    assert.match(settled, /Merge: no merge record exists for this request; it failed after the stop was acknowledged, so whether a merge was attempted is unknown and no landing is confirmed\. See the request error\./);
+    assert.match(settled, /Request error: injected save failure after quiescence/);
+    assert.doesNotMatch(settled, /mechanical merge failed|merge attempt was acknowledged|failed before it was recorded/);
+    assert.equal(entry!.message.details?.merge, "unrecorded");
+    assert.equal(entry!.message.details?.stop, "acknowledged");
+    const task = h.controller.inspect(executionId, taskId).tasks[0]!;
+    assert.equal(task.commands.some((command) => command.action === "force_merge"), false, "forceMerge was never called");
+    assert.equal(h.sent.filter((sent) => sent.message.customType === "pi-review-subtask-event").length, 0, "no landing wake");
+    await assert.rejects(readFile(join(h.root, "draft.txt"), "utf8"), /ENOENT/, "nothing landed in main");
+  });
+});
 
 test("#191 /subtask-interrupt merge orders intent before the completion wake and reports the acknowledged landing", () => withHarness("merge-landed", async (h) => {
   const { executionId, taskId } = await startRunning(h, "merge me");
@@ -386,7 +475,7 @@ async function assertNothingLanded(h: Harness): Promise<void> {
   assert.equal(h.sent.filter((entry) => /landed mechanically|force-merged/.test(entry.message.content)).length, 0, "no landing was claimed");
 }
 
-test("#191 research /subtask-interrupt: rejected merges stop nothing, a queued failure never started, an active failure reports the transport stop and no landing", () => withHarness("research", { research: true, maxConcurrent: 1 }, async (h) => {
+test("#191 research /subtask-interrupt: rejected merges stop nothing, a queued failure stopped before its attempt started, an active failure reports the transport stop and no landing", () => withHarness("research", { research: true, maxConcurrent: 1 }, async (h) => {
   const { executionId, taskIds: [active, queued] } = await startResearch(h, ["active research", "queued research"]);
   assert.equal(h.controller.inspect(executionId, queued).tasks[0]?.state, "queued");
 
@@ -406,8 +495,9 @@ test("#191 research /subtask-interrupt: rejected merges stop nothing, a queued f
 
   await h.slash(`${executionId} ${queued} failure`);
   const neverStarted = assertUserFeedback(h.feedback().at(-1), { taskId: queued!, executionId, kind: "research", mode: "interrupt_as_failure" });
-  assert.match(neverStarted, /Stop: acknowledged before executor startup; the task never started\./);
-  assert.match(neverStarted, /Current task state: interrupted\. Authoritative outcome: Interrupted before executor startup; the source workspace is unchanged\./);
+  assert.match(neverStarted, /Stop: acknowledged before executor startup of the current queued attempt; that queued attempt never started\. This says nothing about earlier attempts or any work, session, or checkpoint they retained\./);
+  assert.match(neverStarted, /Current task state: interrupted\.$/m);
+  assert.doesNotMatch(neverStarted, /Authoritative outcome:|Recorded interrupt activity:/, "a stop before startup carries no pre-start controller wording");
   assert.doesNotMatch(neverStarted, /Merge:/);
   assert.equal(h.feedback().at(-1)!.message.details?.stop, "stopped_before_start");
 
@@ -466,7 +556,10 @@ test("#191 model SubtasksInterrupt keeps its model origin and queues no user fee
   assert.match(failedText, /SubtasksInterrupt failed: injected force-merge failure/);
   assert.match(failedText, /origin: model SubtasksInterrupt call/);
   assert.match(failedText, /Stop: acknowledged\./);
-  assert.match(failedText, /Merge: the mechanical merge failed before it was recorded: injected force-merge failure/);
+  // The override throws before any force-merge record exists, so the
+  // feedback has no proof that a merge was attempted and must not claim one.
+  assert.match(failedText, /Merge: no merge record exists for this request; it failed after the stop was acknowledged, so whether a merge was attempted is unknown and no landing is confirmed\./);
+  assert.doesNotMatch(failedText, /mechanical merge failed|merge attempt was acknowledged/);
   assert.doesNotMatch(failedText, /interrupted by user/);
   assert.equal(h.feedback().length, 0);
 }));

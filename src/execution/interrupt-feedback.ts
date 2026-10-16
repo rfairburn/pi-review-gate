@@ -10,7 +10,11 @@
  *
  * The user-intent line is always qualified as intent: it states what the user
  * asked for, while the stop and merge settlement are reported separately and
- * truthfully (acknowledged, never started, unconfirmed, failed, or rejected).
+ * truthfully (acknowledged, stopped before this queued attempt's executor
+ * startup, unconfirmed, failed, unrecorded, or rejected). A stop before
+ * startup describes only the queued attempt: a queued continuation may follow
+ * earlier attempts whose edits, session, or checkpoint are retained, so the
+ * feedback never infers that no earlier work or checkpoint exists.
  * The same settlement lines are appended to a model `SubtasksInterrupt`
  * result with the model origin, never a user label.
  */
@@ -34,15 +38,23 @@ export type InterruptActor = "model" | "user" | "system";
 export type InterruptStopSettlement =
   /** No command record exists for this request: it did not take effect. */
   | "rejected"
-  /** The task was still queued; it never reached executor startup. */
+  /**
+   * The current queued attempt was stopped before its executor startup. Says
+   * nothing about earlier attempts (a queued continuation may retain work).
+   */
   | "stopped_before_start"
   /** The controller acknowledged the stop. */
   | "acknowledged"
   /** The command failed or is not yet acknowledged: the stop is not confirmed. */
   | "unconfirmed";
 
-/** How the merge half settled; only interrupt_with_merge requests a merge. */
-export type InterruptMergeSettlement = "not_requested" | "not_attempted" | "acknowledged" | "failed" | "pending";
+/**
+ * How the merge half settled; only interrupt_with_merge requests a merge.
+ * `unrecorded`: the request failed after its stop was acknowledged but no
+ * force-merge record exists for it, so whether a merge was attempted at all is
+ * unknown (the failure may precede the merge call, e.g. a persistence error).
+ */
+export type InterruptMergeSettlement = "not_requested" | "not_attempted" | "acknowledged" | "failed" | "pending" | "unrecorded";
 
 export interface InterruptSettlement {
   executionId: string;
@@ -91,7 +103,7 @@ export function interruptSettlementOf(input: {
     stopDetail = "this request was not recorded for the task, so it did not stop anything.";
   } else if (command.status === "acknowledged" && !command.deliveredAt) {
     stop = "stopped_before_start";
-    stopDetail = "acknowledged before executor startup; the task never started.";
+    stopDetail = "acknowledged before executor startup of the current queued attempt; that queued attempt never started. This says nothing about earlier attempts or any work, session, or checkpoint they retained.";
   } else if (command.status === "acknowledged") {
     stop = "acknowledged";
     stopDetail = "acknowledged.";
@@ -114,18 +126,25 @@ export function interruptSettlementOf(input: {
       merge = "pending";
       mergeDetail = `the mechanical merge is not settled (command ${forceMerge.status}).`;
     } else if (stop === "acknowledged" && input.requestError) {
-      merge = "failed";
-      mergeDetail = `the mechanical merge failed before it was recorded: ${clip(input.requestError, 400)}`;
+      // No force-merge record correlates with this request: the error may have
+      // occurred before any merge was called (for example a persistence failure
+      // after quiescence), so never claim that a merge was attempted or failed.
+      merge = "unrecorded";
+      mergeDetail = "no merge record exists for this request; it failed after the stop was acknowledged, so whether a merge was attempted is unknown and no landing is confirmed. See the request error.";
     } else {
       merge = "not_attempted";
       mergeDetail = stop === "stopped_before_start"
-        ? "no merge was attempted: the task never started, so there was no checkpoint to merge."
+        ? "no merge was attempted by this request for the current queued attempt; this does not indicate whether earlier work or a retained checkpoint exists."
         : stop === "unconfirmed"
           ? "no merge was attempted because the stop was not confirmed."
           : "no merge was attempted by this request.";
     }
   }
-  const evidence = command
+  // A stop before executor startup records only the controller's own
+  // pre-start summary as interrupt activity; that legacy wording can claim no
+  // checkpoint exists even when a queued continuation retains earlier work, so
+  // it is never echoed here (the Stop/Merge lines carry the proved outcome).
+  const evidence = command && stop !== "stopped_before_start"
     ? task.activity
       .filter((event) => event.phase === "interrupt" && event.at >= command.createdAt)
       .slice(-3)
@@ -197,14 +216,23 @@ export function formatUserInterruptRequestedFeedback(target: {
   };
 }
 
-/** The settlement note for one human /subtask-interrupt request. */
+/**
+ * The settlement note for one human /subtask-interrupt request. A stop before
+ * executor startup omits the carried task summary: the controller's pre-start
+ * wording may claim that no checkpoint exists, which a queued continuation
+ * with retained earlier work would contradict; the Stop/Merge lines already
+ * state everything proved about the current queued attempt.
+ */
 export function formatUserInterruptSettlementFeedback(settlement: InterruptSettlement): InterruptFeedbackMessage {
+  const outcome = settlement.summary && settlement.stop !== "stopped_before_start"
+    ? ` Authoritative outcome: ${clip(settlement.summary, 500)}`
+    : "";
   const lines = [
     "Subtask interrupt result from the human /subtask-interrupt command (context only).",
     taskLine(settlement),
     USER_INTERRUPT_INTENT_LINE,
     ...settlementLines(settlement),
-    `Current task state: ${settlement.state}.${settlement.summary ? ` Authoritative outcome: ${clip(settlement.summary, 500)}` : ""}`,
+    `Current task state: ${settlement.state}.${outcome}`,
   ];
   if (settlement.requestError) lines.push(`Request error: ${clip(settlement.requestError, 400)}`);
   return {

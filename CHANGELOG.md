@@ -23,9 +23,11 @@ dates.
   model request. Previously the command reported only to the UI. It now queues a context
   note in its own session, which never starts a turn. The note carries `User intent:
   interrupted by user; do not restart without authorization.` beside the truthful
-  settlement from the request's own command records: stop acknowledged, stopped
-  before startup, not confirmed, or rejected; and for `interrupt_with_merge`, merge
-  acknowledged, failed, or not attempted. An execute merge queues the intent before any
+  settlement from the request's own command records: stop acknowledged, the current
+  queued attempt stopped before startup (never implying that earlier attempts left no
+  work or checkpoint), not confirmed, or rejected; and for `interrupt_with_merge`,
+  merge acknowledged, failed, pending, not attempted, or unrecorded when the request
+  failed without any merge record (attempt unknown, no landing confirmed). An execute merge queues the intent before any
   landing or conflict notification it triggers. Model `SubtasksInterrupt` results add
   the same settlement lines with the model origin, also when the merge throws.
   Nothing is queued after the owning session ends. Interrupt, landing, review, and

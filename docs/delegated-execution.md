@@ -662,9 +662,15 @@ authorization.` That line states what the user asked for, not that anything stop
 The note reports the actual settlement separately, read from the request's own
 command records:
 
-- the stop was acknowledged, happened before executor startup, was not confirmed, or
-  was rejected without effect
-- for `interrupt_with_merge`: the merge was acknowledged, failed, or not attempted
+- the stop was acknowledged, stopped the current queued attempt before its executor
+  startup, was not confirmed, or was rejected without effect. A stop before startup
+  describes only that queued attempt: a queued continuation may follow earlier
+  attempts whose work, session, or checkpoint is retained, and the note never infers
+  otherwise
+- for `interrupt_with_merge`: the merge was acknowledged, failed, pending, or not
+  attempted; or it is unrecorded when the request failed after the stop was
+  acknowledged without any merge record, so whether a merge was attempted is unknown
+  and no landing is confirmed
 - the task's current state and authoritative outcome
 
 An execute `interrupt_with_merge` queues the intent line first. Any landing or

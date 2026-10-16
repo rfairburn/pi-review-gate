@@ -284,13 +284,13 @@ test("alpha installs the locked Pi UI runtime with real exit propagation", () =>
   const manifest = JSON.parse(readFileSync(join(projectRoot, "scripts", "ci", "pi-ui-runtime", "package.json"), "utf8")) as {
     dependencies?: Record<string, string>;
   };
-  assert.equal(manifest.dependencies?.["@earendil-works/pi-coding-agent"], "1.2.0",
-    "the UI runtime must be pinned to exact Pi 1.2.0 in the canonical manifest");
+  assert.equal(manifest.dependencies?.["@earendil-works/pi-coding-agent"], "1.3.0",
+    "the UI runtime must be pinned to exact Pi 1.3.0 in the canonical manifest");
   const lock = JSON.parse(readFileSync(join(projectRoot, "scripts", "ci", "pi-ui-runtime", "package-lock.json"), "utf8")) as {
     packages?: Record<string, { version?: string }>;
   };
-  assert.equal(lock.packages?.["node_modules/@earendil-works/pi-coding-agent"]?.version, "1.2.0",
-    "the lock must freeze exact Pi 1.2.0, not a drifted version");
+  assert.equal(lock.packages?.["node_modules/@earendil-works/pi-coding-agent"]?.version, "1.3.0",
+    "the lock must freeze exact Pi 1.3.0, not a drifted version");
 });
 
 test("alpha root dependency install is lockfile-exact, script-free, and bounded", () => {
@@ -325,8 +325,8 @@ test("alpha exports the pinned agent, canonical JS CLI, and staged candidate ent
     "the harness must receive the explicit installed agent root");
   assert.match(exportStep, /PI_REVIEW_GATE_INSTALLED_PI_BIN=\$cli/,
     "the harness must receive the canonical CLI pin");
-  assert.match(exportStep, /PI_REVIEW_GATE_EXPECT_PI_VERSION=1\.2\.0/,
-    "the acceptance must assert exact Pi 1.2.0");
+  assert.match(exportStep, /PI_REVIEW_GATE_EXPECT_PI_VERSION=1\.3\.0/,
+    "the acceptance must assert exact Pi 1.3.0");
   assert.match(exportStep, /Join-Path \$env:PRG_ALPHA_CANDIDATE "dist\\src\\index\.js"/,
     "the candidate entry must be the staged scratch build");
   assert.match(exportStep, /PI_REVIEW_GATE_CANDIDATE_ENTRY=\$entry/,
@@ -411,7 +411,7 @@ test("alpha launcher acceptance exercises both real source wrappers with require
     "both the .cmd and direct PowerShell wrappers are exercised");
   assert.match(helper, /"\/d", "\/s", "\/c", cmdEntry/, "the .cmd leg must go through trusted cmd.exe /d /s /c");
   assert.match(helper, /"-File", psEntry/, "the direct leg must go through trusted PowerShell -File");
-  assert.match(helper, /LAUNCHER_EXPECT_PI_VERSION = "1\.2\.0"/, "the launcher lane pins exact Pi 1.2.0");
+  assert.match(helper, /LAUNCHER_EXPECT_PI_VERSION = "1\.3\.0"/, "the launcher lane pins exact Pi 1.3.0");
   assert.match(helper, /LAUNCHER_PTY_VERSION = "1\.2\.0-beta\.15"/, "the lane pins the exact public node-pty version");
   assert.match(helper, /assertShellSafeArguments/, "unverifiable shell quoting must fail loud instead of being faked");
 
@@ -455,8 +455,8 @@ test("alpha launcher acceptance exercises both real source wrappers with require
     "the deprecated ignored useConpty hint is never used by the launcher outer transport");
 
   const harness = readFileSync(join(projectRoot, "tests", "helpers", "session-host-native-windows-harness.ts"), "utf8");
-  assert.match(harness, /Windows native Main acceptance requires public Pi 1\.2\.0/,
-    "the independently required direct Main lane must pin the same exact Pi 1.2.0 fixture");
+  assert.match(harness, /Windows native Main acceptance requires public Pi 1\.3\.0/,
+    "the independently required direct Main lane must pin the same exact Pi 1.3.0 fixture");
   assert.match(harness, /useConptyDll: true/,
     "the direct Main outer transport must select the same bundled public ConPTY as the shipped source path");
   assert.doesNotMatch(harness, /useConpty\s*:/,

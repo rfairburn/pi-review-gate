@@ -28,7 +28,7 @@
  *   global package root's declared bin entry is validated (package name,
  *   stable version floor, bin containment, regular readable positive Node
  *   entry), then a PATH `pi` that resolves into such a package. When no
- *   supported installation exists, an isolated Pi 1.2.0 runtime is
+ *   supported installation exists, an isolated Pi 1.3.0 runtime is
  *   provisioned under the native Pi agent directory's cache
  *   (<agent-dir>/.pi-review-gate/pi-runtime) with npm --ignore-scripts and
  *   re-validated before publication. Global installs and existing user
@@ -72,7 +72,7 @@ for native validation only (not a Windows readiness claim). Requires Node >=22.1
 and Pi >=1.0.4 with a positively identified Node CLI entry. Without --pi-executable the
 launcher resolves the public @earendil-works/pi-coding-agent installation
 (npm global root, then PATH) and, when none is supported, provisions an
-isolated Pi 1.2.0 runtime cache under the native Pi agent directory; no
+isolated Pi 1.3.0 runtime cache under the native Pi agent directory; no
 manual Pi CLI path is needed. Starts an empty welcome/sidebar picker; choose
 a workspace explicitly in the UI.
 The startup working directory is not selected as a workspace.
@@ -108,7 +108,7 @@ const MIN_NODE_VERSION = [22, 19, 0];
 // src/session-host/launch.ts (Pi 1.0.4 minimum).
 const PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 const PI_MIN_VERSION = [1, 0, 4];
-const PI_PROVISION_VERSION = "1.2.0";
+const PI_PROVISION_VERSION = "1.3.0";
 const RUNTIME_CACHE_DIRNAME = ".pi-review-gate";
 const PI_RUNTIME_DIRNAME = "pi-runtime";
 

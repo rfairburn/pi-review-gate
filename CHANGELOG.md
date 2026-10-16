@@ -15,6 +15,14 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.162]
+
+### Changed
+
+- Upgrade the current Pi integration target to 1.3.0 across isolated runtimes,
+  native-host acceptance, and the pinned pi-tui alias (#417). Supported floors and
+  older compatibility fixtures remain unchanged.
+
 ## [0.1.0-dev.161]
 
 ### Changed

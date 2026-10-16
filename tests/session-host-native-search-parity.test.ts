@@ -20,11 +20,11 @@ test("native saved search reads synthetic global files through the public SDK an
   const agentPackage = findInstalledAgentDirs().find((path) => {
     try {
       const manifest = JSON.parse(readFileSync(join(path, "package.json"), "utf8"));
-      return manifest.name === "@earendil-works/pi-coding-agent" && manifest.version === "1.2.0";
+      return manifest.name === "@earendil-works/pi-coding-agent" && manifest.version === "1.3.0";
     } catch { return false; }
   });
   if (!agentPackage) {
-    skipOrFail(t, "no installed Pi 1.2.0 for global saved search parity");
+    skipOrFail(t, "no installed Pi 1.3.0 for global saved search parity");
     return;
   }
   // Private imports are reference-only in tests; production resolves only the
@@ -33,7 +33,7 @@ test("native saved search reads synthetic global files through the public SDK an
     join(agentPackage, "dist", "modes", "interactive", "components", "session-selector-search.js"),
   ) as NativeSearch;
   const piExecutable = join(agentPackage, "dist", "cli.js");
-  const sdk = resolveNativeSessionSdk(piExecutable, { expectedPiVersion: "1.2.0" });
+  const sdk = resolveNativeSessionSdk(piExecutable, { expectedPiVersion: "1.3.0" });
 
   // Every file and directory below is created exclusively by this test.
   // Cleanup checks individual creation identities, never recursively scans,
@@ -95,7 +95,7 @@ test("native saved search reads synthetic global files through the public SDK an
     files.push({ path, dev: stat.dev, ino: stat.ino });
   }
   const nativeInfos = (await Promise.all(projects.map((project) => sdk.SessionManager.listAll(project)))).flat() as SearchSession[];
-  const catalog = await listSavedSessions({ agentDir, piExecutable, expectedPiVersion: "1.2.0" });
+  const catalog = await listSavedSessions({ agentDir, piExecutable, expectedPiVersion: "1.3.0" });
   assert.equal(catalog.issueCount, 0);
   assert.equal(catalog.rows.length, entries.length);
   assert.equal(new Set(catalog.rows.map((row) => row.cwd)).size, 2, "production catalog is global across recorded workspaces");

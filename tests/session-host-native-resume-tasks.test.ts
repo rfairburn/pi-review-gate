@@ -2,7 +2,7 @@
  * Focused source-only regression harness for automatic native Main resume,
  * truthful 0→1→0 activity, and event-driven recovery after a retained stopped,
  * recovery-required execution record is repaired. The authorized
- * primary macOS run uses a real pinned Pi 1.2.0 Main and an actual native saved
+ * primary macOS run uses a real pinned Pi 1.3.0 Main and an actual native saved
  * conversation; this test file is intentionally not runnable from an executor
  * role or without explicit runtime pins.
  *
@@ -591,7 +591,7 @@ test("real native Main restores a saved conversation and reauthenticates activit
   const runtime = resolveSavedRuntimePin(t);
   if (!runtime) return;
   requirePublicRuntimeDependencies(runtime);
-  assert.equal(runtime.version, "1.2.0");
+  assert.equal(runtime.version, "1.3.0");
   assert.equal(Buffer.byteLength(join("/tmp", "shm-XXXXXX", "tmp", "prg-st-XXXXXX", "s.sock"), "utf8") <= 103, true,
     "the harness's short /tmp-owned broker socket path remains within the macOS limit");
 

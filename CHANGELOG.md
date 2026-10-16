@@ -15,6 +15,40 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.166]
+
+### Fixed
+
+- Optional session host (#428): xterm parser diagnostics no longer reach the real
+  terminal outside the composed frame. Each child's virtual terminal hands the pinned
+  xterm parser its own private logger instead of the host console. A malformed child
+  sequence (for example an unterminated CSI followed by a non-ASCII character) can no
+  longer paint a `Parsing error` dump onto stderr that later redraws leave on screen.
+  The log level, parser recovery, valid and chunk-split sequence rendering, graphics,
+  clipping, input routing, focus, and session ownership are unchanged. A few internal
+  xterm messages that call the console directly remain outside this per-terminal
+  logger. Constructed-input tests do not establish the cause of any earlier on-screen
+  corruption.
+
+### Added
+
+- The session host shows a clearable warning when xterm reports a warning or error:
+  a right-aligned header notice plus a host-owned **Terminal diagnostics** roster
+  entry. Pressing Enter on the fully drawn entry while the roster has focus, or
+  clicking it, clears exactly the drawn count. A later error warns again. Clearing
+  never touches the log or changes focus, the active Main owner, or any child's
+  input; Main-focused keys stay native input. Bounded structured records (run
+  identities, parser state and active parameters, labelled logger-call-site stacks,
+  and no raw terminal bytes, conversation text, credentials, or logger arguments) are
+  kept privately at `<agentDir>/session-host/terminal-diagnostics.jsonl`. Retention
+  is exactly the active file plus `.1` and `.2`, at 5 MiB each. Every file a run
+  writes, including each file after rotation, starts with that run's identity record.
+  Persistence creates nothing until a diagnostic occurs, refuses unsafe or
+  unrecognized files without modifying them, shows a payload-free save-failure
+  warning without stopping work, and settles at shutdown. A failed final sync, or
+  any persistence failure first seen during shutdown, is reported as a cleanup
+  failure. No setting, transmission, polling, or daemon is added.
+
 ## [0.1.0-dev.164]
 
 ### Changed

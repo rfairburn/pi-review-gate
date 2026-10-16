@@ -74,6 +74,17 @@ import {
   type SidebarMousePresentation,
 } from "./sidebar";
 import type { TerminalMouseReportingRequest } from "./terminal-surface";
+import {
+  TerminalDiagnosticsWarning,
+  terminalDiagnosticsHeaderNotice,
+  type TerminalDiagnosticEvent,
+} from "./terminal-diagnostics";
+import {
+  TerminalDiagnosticsLog,
+  collectTerminalDiagnosticsIdentity,
+  type TerminalDiagnosticsLogLike,
+  type TerminalDiagnosticsLogOptions,
+} from "./terminal-diagnostics-log";
 
 const STARTUP_OPTIONS_HELPER = join("scripts", "session-host-startup-options.cjs");
 const GENERIC_FAILURE_MESSAGE = "Session host could not complete startup or cleanup.";
@@ -220,6 +231,11 @@ interface MainDependencies {
   readonly createObserver: (options: ConstructorParameters<typeof KeyboardCapabilityObserver>[0]) => MainObserver;
   readonly createWriter: (output: Writable, options: Parameters<typeof createSessionHostFrameWriter>[1]) => MainWriter;
   readonly runExternalEditor: typeof runNativeExternalEditor;
+  /**
+   * Private bounded terminal diagnostics log under the canonical native agent
+   * directory (#428). Focused tests may inject small rotation limits.
+   */
+  readonly createTerminalDiagnosticsLog: (options: TerminalDiagnosticsLogOptions) => TerminalDiagnosticsLogLike;
   readonly reportError: (message: string) => void;
 }
 
@@ -567,6 +583,7 @@ function productionDependencies(): MainDependencies {
     createObserver: (options) => new KeyboardCapabilityObserver(options),
     createWriter: (output, options) => createSessionHostFrameWriter(output, options),
     runExternalEditor: runNativeExternalEditor,
+    createTerminalDiagnosticsLog: (logOptions) => new TerminalDiagnosticsLog(logOptions),
     reportError: (message) => { process.stderr.write(`${message}\n`); },
   };
 }
@@ -713,6 +730,10 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   const savedListControllers = new Map<number, AbortController>();
   const savedOpenTasks = new Set<Promise<void>>();
   const deferredSavedOpens = new Map<number, { readonly file: string; readonly sessionId: string }>();
+  // Terminal parser diagnostics (#428): a host-owned clearable warning plus a
+  // private bounded log. Clearing the warning never touches the log.
+  const diagnosticsWarning = new TerminalDiagnosticsWarning();
+  let diagnosticsLog: TerminalDiagnosticsLogLike | undefined;
   let finishRun!: (status: number) => void;
   const runFinished = new Promise<number>((resolve) => { finishRun = resolve; });
 
@@ -888,12 +909,14 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         // Title only. Lifecycle, activity and input ownership belong below
         // session-card titles, never on the active conversation's title line.
         const header = view ? view.label : "Session host";
+        const headerNotice = terminalDiagnosticsHeaderNotice(diagnosticsWarning.view());
         const composed = composeHostFrame(currentLayout, {
           main: mainFrame,
           sidebar: sidebarFrame,
           form: formFrame,
           ...(nativeGraphics ? { nativeGraphics } : {}),
           header,
+          ...(headerNotice === undefined ? {} : { headerNotice }),
           focus,
         });
         const mousePresentation: MouseFramePresentation = {
@@ -962,6 +985,30 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     displayedMousePresentation = undefined;
     latestMousePresentation = undefined;
     writer?.invalidate?.();
+  }
+
+  function publishDiagnosticsWarning(): void {
+    try {
+      sidebar?.setTerminalDiagnosticsWarning(diagnosticsWarning.view());
+    } catch {
+      // The warning is advisory UI; it must never stop ongoing work.
+    }
+    scheduleRedraw();
+  }
+
+  /**
+   * One surface's post-parse diagnostics: persist bounded records (when the
+   * private log is available) and update the clearable composed warning. The
+   * child, its input route, focus, and the active owner are untouched.
+   */
+  function handleTerminalDiagnostic(instanceId: string, event: TerminalDiagnosticEvent): void {
+    try {
+      for (const record of event.records) diagnosticsLog?.appendDiagnostic(instanceId, record);
+      diagnosticsLog?.noteSuppressed(event.suppressed);
+      if (diagnosticsWarning.note(event.warningCount)) publishDiagnosticsWarning();
+    } catch {
+      // Diagnostics are best effort; parsing and rendering continue.
+    }
   }
 
   function createFrameWriter(): MainWriter {
@@ -2551,6 +2598,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         syncOuterMouseModes();
         scheduleRedraw();
         return;
+      case "terminal-diagnostics-clear":
+        // Clears only the warning the user saw; the private log is never
+        // deleted, rotated, or reset, and focus/ownership are unchanged.
+        if (diagnosticsWarning.clear(action.throughCount, action.failureShown)) publishDiagnosticsWarning();
+        else scheduleRedraw();
+        return;
       case "quit":
         // SidebarController emits this only after its required confirmation.
         requestShutdown(false);
@@ -2709,6 +2762,20 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         remainingCount = shutdownResult?.remainingIds.length ?? 0;
         ownedStateSettled = true;
       }
+      // Settled rows' surfaces were disposed above (each flushes its pending
+      // diagnostics first). Settle the private log's owned IO before
+      // reporting; anything an unsettled child emits after this is not
+      // persisted (the log no longer accepts records once closing).
+      if (diagnosticsLog) {
+        try {
+          const closed = await diagnosticsLog.close();
+          // An unsettled close or a failed final flush (including a rejected
+          // data sync) is a cleanup failure, never reported as success.
+          if (!closed.settled || !closed.flushed) cleanupFailure = true;
+        } catch {
+          cleanupFailure = true;
+        }
+      }
       if (broker) {
         try {
           await broker.dispose();
@@ -2817,6 +2884,24 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       }
       if (readResult.status === "unavailable") throw new HostShortcutStartupFailure(readResult.message);
       configuredHostShortcuts = normalizeHostShortcutBindings(readResult.bindings);
+    }
+    if (typeof sessionSetup.nativeAgentDir === "string" && sessionSetup.nativeAgentDir !== "") {
+      // Created lazily on disk: no file exists until a diagnostic is recorded.
+      try {
+        diagnosticsLog = dependencies.createTerminalDiagnosticsLog({
+          agentDir: sessionSetup.nativeAgentDir,
+          identity: collectTerminalDiagnosticsIdentity({ packageRoot, piVersion: pi.version }),
+          onStatus: (status, failure) => {
+            if (diagnosticsWarning.setLogStatus(status, failure)) publishDiagnosticsWarning();
+          },
+        });
+      } catch {
+        // Shown with the warning only if a diagnostic actually occurs.
+        diagnosticsLog = undefined;
+        diagnosticsWarning.setLogStatus("unavailable", "open-failed");
+      }
+    } else {
+      diagnosticsWarning.setLogStatus("unavailable", "agent-dir-unavailable");
     }
     try {
       const effectiveToggle = normalizeHostShortcutKey(
@@ -2948,6 +3033,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
       rows: layout.native.rows,
       getSupportedKeyboardFlags: () => terminal?.kittyProtocolActive ? observedFlags & 7 : 0,
       onChange: (id) => noteManagerChanged(id),
+      onTerminalDiagnostic: (id, event) => handleTerminalDiagnostic(id, event),
       onSpawnRequest: handleSessionSpawn,
       getSidebarTitleColumns: sidebarTitleColumnsSnapshot,
     });

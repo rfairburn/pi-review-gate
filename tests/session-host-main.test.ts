@@ -22,6 +22,7 @@ import type { StatusBroker, StatusRenameRequest, StatusRenameResult } from "../s
 import { NativeAgentRegistry, type ProfilePreparer } from "../src/session-host/profiles";
 import { createNativeSavedQueryInput, runNativeExternalEditor } from "../src/session-host/form-support";
 import { TerminalSurface, type TerminalFrame, type TerminalInputModes, type TerminalMouseReportingRequest } from "../src/session-host/terminal-surface";
+import { TerminalDiagnosticsLog } from "../src/session-host/terminal-diagnostics-log";
 import type { TerminalGraphicsFrame } from "../src/session-host/kitty-graphics";
 import { SidebarController } from "../src/session-host/sidebar";
 import { isSavedSessionAdmission, listSavedSessions, type SavedSessionCatalog } from "../src/session-host/saved-sessions";
@@ -4559,4 +4560,214 @@ test("Saved unlink fallback refuses a file replaced during the trash attempt", a
     if (!closed) await closeWithSignal(harness).catch(() => undefined);
     rmSync(fixture.root, { recursive: true, force: true });
   }
+});
+
+// --- #428: contained xterm diagnostics, clearable warning, private log -------
+
+const MALFORMED_CSI_ELLIPSIS = "\x1b[3…";
+
+function attachRealSurface(manager: FakeManager, id: string): TerminalSurface {
+  const view = manager.views.find((candidate) => candidate.id === id);
+  assert.ok(view, `row ${id} exists`);
+  const fake = manager.surfaces.get(id)!;
+  const surface = new TerminalSurface(fake.cols, fake.rows, {
+    onChange: () => manager.options.onChange?.(id),
+    onDiagnostic: (event) => manager.options.onTerminalDiagnostic?.(id, event),
+  });
+  manager.surfaces.set(id, surface as never);
+  return surface;
+}
+
+/** A test-owned agent directory that outlives the harness run (cleaned by the test). */
+function ownedAgentSetup(): { readonly agentDir: string; readonly overrides: MainTestDependencies } {
+  const agentDir = makeMainTestDirectory("diagnostics-agent");
+  writeFileSync(join(agentDir, "keybindings.json"), "{}", "utf8");
+  return {
+    agentDir,
+    overrides: {
+      createSessionSetup: () => ({
+        nativeSetup: false,
+        nativeAgentDir: agentDir,
+        profileRegistry: { prepare: () => { throw new Error("fake manager"); } } satisfies ProfilePreparer,
+      }),
+    },
+  };
+}
+
+function diagnosticsLogPath(agentDir: string): string {
+  return join(agentDir, "session-host", "terminal-diagnostics.jsonl");
+}
+
+async function waitFor(predicate: () => boolean, label: string): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (predicate()) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  }
+  assert.fail(`timed out waiting for ${label}`);
+}
+
+function captureConsoleAndStderr(): { readonly output: string[]; restore(): void } {
+  const output: string[] = [];
+  const methods = ["log", "info", "warn", "error", "debug", "trace"] as const;
+  const originals = methods.map((method) => console[method]);
+  for (const method of methods) {
+    (console as unknown as Record<string, unknown>)[method] = (...args: unknown[]) => output.push(`${method}:${String(args[0])}`);
+  }
+  const originalWrite = process.stderr.write;
+  process.stderr.write = ((chunk: unknown) => { output.push(`stderr:${String(chunk)}`); return true; }) as typeof process.stderr.write;
+  return {
+    output,
+    restore() {
+      methods.forEach((method, index) => { (console as unknown as Record<string, unknown>)[method] = originals[index]; });
+      process.stderr.write = originalWrite;
+    },
+  };
+}
+
+test("#428 malformed child CSI warns in the composed UI, persists privately, and clears without touching the log", async (t) => {
+  const owned = ownedAgentSetup();
+  t.after(() => rmSync(owned.agentDir, { recursive: true, force: true }));
+  const harness = createHarness({}, owned.overrides);
+  harness.agentDir = owned.agentDir;
+  const manager = await ready(harness);
+  fillForm(harness.terminal, "/diagnostics/workspace");
+  await nextTurn();
+  assert.equal(harness.sidebar?.focus, "main");
+  assert.equal(harness.sidebar?.activeMainOwnerID, "native-1");
+  const surface = attachRealSurface(manager, "native-1");
+  const capture = captureConsoleAndStderr();
+  try {
+    surface.write(`visible api_key=sk-SECRET ${MALFORMED_CSI_ELLIPSIS}after\r\nlater valid text`);
+    await surface.flush();
+    await nextTurn();
+  } finally {
+    capture.restore();
+  }
+  assert.deepEqual(capture.output, [], "no out-of-composition diagnostic output");
+  assert.deepEqual(harness.reports, []);
+  let frame = harness.writer.frames.at(-1)?.frame;
+  assert.ok(plainLine(frame, 0).endsWith("! Terminal diagnostics: 1 (clear in sidebar)"), plainLine(frame, 0));
+  assert.ok(plain(frame).includes("! Terminal diagnostics (1)"));
+  assert.ok(plain(frame).includes("later valid text"), "the composed child frame keeps rendering");
+  assert.ok(!plain(frame).includes("Parsing error") && !plain(frame).includes("xterm.js"));
+  assert.equal(harness.sidebar?.focus, "main", "the warning never moves focus");
+
+  await waitFor(() => existsSync(diagnosticsLogPath(harness.agentDir)), "private diagnostics log");
+  await waitFor(() => readFileSync(diagnosticsLogPath(harness.agentDir), "utf8").includes("\"kind\":\"diagnostic\""), "diagnostic line");
+  const logged = readFileSync(diagnosticsLogPath(harness.agentDir), "utf8");
+  assert.ok(!logged.includes("SECRET") && !logged.includes("visible") && !logged.includes("…"), "no child text persisted");
+  const diagnostic = logged.trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>)
+    .find((entry) => entry.kind === "diagnostic")!;
+  assert.equal(diagnostic.instance, "native-1");
+  assert.equal(diagnostic.messageId, "parser-error");
+  assert.equal((diagnostic.identity as unknown), undefined);
+
+  // Explicit host-owned clear: roster focus, highlight the warning, Enter.
+  const writesBefore = manager.writes.length;
+  harness.terminal.emitInput(ALT_LEFT);
+  await nextTurn();
+  harness.terminal.emitInput("\x1b[B"); // native-1 card -> warning entry
+  await nextTurn();
+  harness.terminal.emitInput(ENTER);
+  await nextTurn();
+  frame = harness.writer.frames.at(-1)?.frame;
+  assert.ok(!plainLine(frame, 0).includes("Terminal diagnostics"), "header warning cleared");
+  assert.ok(!plain(frame).includes("! Terminal diagnostics ("), "sidebar warning cleared");
+  assert.equal(harness.sidebar?.focus, "sidebar", "clearing does not activate or refocus anything");
+  assert.equal(harness.sidebar?.activeMainOwnerID, "native-1");
+  assert.equal(manager.writes.length, writesBefore, "no clear keystroke reached the child");
+  assert.equal(readFileSync(diagnosticsLogPath(harness.agentDir), "utf8"), logged, "the log is preserved byte for byte");
+
+  // A later error re-warns.
+  surface.write(MALFORMED_CSI_ELLIPSIS);
+  await surface.flush();
+  await nextTurn();
+  frame = harness.writer.frames.at(-1)?.frame;
+  assert.ok(plainLine(frame, 0).endsWith("! Terminal diagnostics: 1 (clear in sidebar)"));
+
+  assert.equal(await closeWithSignal(harness), 0);
+  surface.dispose();
+  const entries = readFileSync(diagnosticsLogPath(harness.agentDir), "utf8").trim().split("\n")
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+  assert.deepEqual(entries.map((entry) => entry.kind), ["host-run", "diagnostic", "diagnostic", "host-run-end"]);
+  assert.equal((entries[0]!.identity as Record<string, string>).piVersion, "1.0.4");
+});
+
+test("#428 an unsafe log path shows a payload-free save-failure warning without interrupting work", { skip: process.platform === "win32" }, async (t) => {
+  const owned = ownedAgentSetup();
+  t.after(() => rmSync(owned.agentDir, { recursive: true, force: true }));
+  const harness = createHarness({}, owned.overrides);
+  harness.agentDir = owned.agentDir;
+  const manager = await ready(harness);
+  const stateDir = join(harness.agentDir, "session-host");
+  if (!existsSync(stateDir)) mkdirSync(stateDir, { mode: 0o700 });
+  const outside = join(harness.agentDir, "outside.txt");
+  writeFileSync(outside, "keep\n");
+  execFileSync("ln", ["-s", outside, diagnosticsLogPath(harness.agentDir)]);
+  fillForm(harness.terminal, "/diagnostics/workspace");
+  await nextTurn();
+  const surface = attachRealSurface(manager, "native-1");
+  surface.write(`secret-text ${MALFORMED_CSI_ELLIPSIS}`);
+  await surface.flush();
+  await waitFor(() => plainLine(harness.writer.frames.at(-1)?.frame, 0).includes("unsafe log file"), "save-failure warning");
+  const frame = harness.writer.frames.at(-1)?.frame;
+  assert.ok(plainLine(frame, 0).endsWith("! Terminal diagnostics: 1; unsafe log file (clear in sidebar)"));
+  assert.ok(plain(frame).includes("NOT saved: unsafe log file"));
+  assert.ok(!plain(frame).includes(outside) && !plain(frame).includes("Parsing error"), "no path or payload dump");
+  assert.equal(readFileSync(outside, "utf8"), "keep\n", "the symlink target is untouched");
+  // Ongoing work continues: Main input still routes to the same child.
+  harness.terminal.emitInput("x");
+  await nextTurn();
+  assert.deepEqual(manager.writes.at(-1), { id: "native-1", data: "x" });
+  assert.equal(await closeWithSignal(harness), 0);
+  surface.dispose();
+  assert.deepEqual(harness.reports, []);
+});
+
+test("#428 an unsettled diagnostics log is reported as cleanup failure, never as success", async () => {
+  let closes = 0;
+  const harness = createHarness({}, {
+    createTerminalDiagnosticsLog: () => ({
+      status: "ok",
+      appendDiagnostic: () => undefined,
+      noteSuppressed: () => undefined,
+      close: async () => { closes += 1; return { settled: false, flushed: false, status: "ok" }; },
+    }),
+  });
+  await ready(harness);
+  assert.equal(await closeWithSignal(harness), 1);
+  assert.equal(closes, 1);
+  assert.deepEqual(harness.reports, ["Session host could not complete startup or cleanup."]);
+});
+
+test("#428 a rejected final log sync makes host shutdown report cleanup failure without payload", async (t) => {
+  const owned = ownedAgentSetup();
+  t.after(() => rmSync(owned.agentDir, { recursive: true, force: true }));
+  let syncAttempts = 0;
+  const harness = createHarness({}, {
+    ...owned.overrides,
+    createTerminalDiagnosticsLog: (logOptions) => new TerminalDiagnosticsLog({
+      ...logOptions,
+      syncFile: async () => {
+        syncAttempts += 1;
+        throw new Error(`EIO at ${owned.agentDir}`);
+      },
+    }),
+  });
+  harness.agentDir = owned.agentDir;
+  const manager = await ready(harness);
+  fillForm(harness.terminal, "/diagnostics/workspace");
+  await nextTurn();
+  const surface = attachRealSurface(manager, "native-1");
+  surface.write(MALFORMED_CSI_ELLIPSIS);
+  await surface.flush();
+  await waitFor(() => existsSync(diagnosticsLogPath(owned.agentDir))
+    && readFileSync(diagnosticsLogPath(owned.agentDir), "utf8").includes("\"kind\":\"diagnostic\""), "diagnostic line");
+  assert.equal(await closeWithSignal(harness), 1, "a failed final flush is never a successful shutdown");
+  surface.dispose();
+  assert.equal(syncAttempts, 1);
+  assert.deepEqual(harness.reports, ["Session host could not complete startup or cleanup."]);
+  assert.ok(harness.reports.every((report) => !report.includes(owned.agentDir) && !report.includes("EIO")));
+  assert.ok(readFileSync(diagnosticsLogPath(owned.agentDir), "utf8").includes("\"kind\":\"host-run-end\""),
+    "accepted records were written before the sync failure");
 });

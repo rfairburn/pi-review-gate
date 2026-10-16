@@ -226,40 +226,40 @@ test("global config updates serialize without losing unrelated concurrent change
   }
 });
 
-test("a non-catalog preference save converts legacy array catalogs to canonical objects", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-review-legacy-convert-"));
+test("a non-catalog preference save persists keyed catalogs in normalized canonical form", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-keyed-save-"));
   const configPath = join(dir, "config.json");
-  const legacy = JSON.stringify({
+  const keyed = JSON.stringify({
     enabled: true,
     customFutureKey: { keep: true },
-    externalAgents: [
-      { id: "one", adapter: "generic-cli", command: "node", review: {} },
-    ],
+    externalAgents: { one: { adapter: "generic-cli", command: "node", review: {} } },
     execution: {
-      workerResources: [
-        { resourceId: "primary", selection: { source: "external", id: "one" }, maxConcurrent: 2 },
-      ],
+      workerResources: { primary: { selection: { source: "external", id: "one" }, maxConcurrent: 2 } },
+      routes: { execute: [{ resourceId: "primary", thinkingLevel: "high" }] },
     },
   });
-  await writeFile(configPath, legacy);
+  await writeFile(configPath, keyed);
   try {
     // Loading (parsing + normalizing) never rewrites the file.
-    normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
-    assert.equal(await readFile(configPath, "utf8"), legacy);
+    const loaded = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
+    assert.equal(await readFile(configPath, "utf8"), keyed);
 
     const normalized = await persistSubtasksViewPreference(configPath, true);
     assert.equal(normalized.ui?.subtasksViewExpanded, true);
+    assert.deepEqual(normalized.externalAgents, loaded.externalAgents);
+    assert.deepEqual(normalized.execution?.workerResources, loaded.execution?.workerResources);
     const saved = JSON.parse(await readFile(configPath, "utf8"));
-    // Both catalogs converted to keyed objects at the save boundary.
     assert.deepEqual(saved.externalAgents, {
       one: { adapter: "generic-cli", command: "node", args: [], review: { args: [] } },
     });
     assert.deepEqual(saved.execution.workerResources, {
       primary: { selection: { source: "external", id: "one" }, maxConcurrent: 2 },
     });
+    assert.deepEqual(saved.execution.routes, { execute: [{ resourceId: "primary", thinkingLevel: "high" }] });
     // Unrelated raw fields and the new preference both survive.
     assert.deepEqual(saved.customFutureKey, { keep: true });
     assert.equal(saved.ui.subtasksViewExpanded, true);
+    assert.deepEqual(normalizeConfig(saved), normalized);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -291,23 +291,23 @@ test("settings saves preserve the latest on-disk external agent definitions", as
   }
 });
 
-test("staged external definitions merge with latest legacy catalog and preserve role overrides and adapters", async () => {
+test("staged external definitions merge with latest keyed catalog and preserve role overrides and adapters", async () => {
   const dir = await mkdtemp(join(__dirname, "external-merge-"));
   const configPath = join(dir, "config.json");
   try {
     await writeFile(configPath, JSON.stringify({
       futureRoot: { keep: true },
-      externalAgents: [
-        { id: "old", adapter: "codex-cli", model: "unknown-existing-model", review: { model: "review-override", args: ["review"], env: { PRIVATE_SETTING: "keep" } }, execution: { model: "execution-override" } },
-        { id: "generic", adapter: "generic-cli", command: "custom-tool", review: {} },
-        { id: "binary", adapter: "run-as-binary", command: "custom-binary", execution: { protocol: "pi-review-executor-jsonl-v1" } },
-      ],
+      externalAgents: {
+        old: { adapter: "codex-cli", model: "unknown-existing-model", review: { model: "review-override", args: ["review"], env: { PRIVATE_SETTING: "keep" } }, execution: { model: "execution-override" } },
+        generic: { adapter: "generic-cli", command: "custom-tool", review: {} },
+        binary: { adapter: "run-as-binary", command: "custom-binary", execution: { protocol: "pi-review-executor-jsonl-v1" } },
+      },
       execution: { futureExecution: true },
       review: { futureReview: true },
     }));
     // A different settings instance appends an entry after this menu opened.
     await updateReviewGateConfig(configPath, (raw) => {
-      (raw.externalAgents as unknown[]).push({ id: "concurrent", adapter: "claude-cli", model: "future-model", review: {} });
+      (raw.externalAgents as Record<string, unknown>).concurrent = { adapter: "claude-cli", model: "future-model", review: {} };
     });
     const existing = normalizeConfig(JSON.parse(await readFile(configPath, "utf8"))).externalAgents!;
     const next = await persistReviewSettings(configPath, {
@@ -386,27 +386,35 @@ test("external addition merges are prototype-safe and final validation rejects i
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test("an invalid legacy catalog conversion fails the save before any write", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-review-legacy-invalid-"));
+for (const catalog of ["externalAgents", "workerResources", "both"] as const) test(`a save over a legacy array ${catalog} catalog rejects without converting or writing`, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-legacy-reject-"));
   const configPath = join(dir, "config.json");
-  const invalid = JSON.stringify({
+  const keyedAgents = { one: { adapter: "generic-cli", command: "node", review: {} } };
+  const keyedResources = { primary: { selection: { source: "external", id: "one" }, maxConcurrent: 2 } };
+  const legacy = JSON.stringify({
     enabled: true,
-    externalAgents: [
-      { id: "one", adapter: "generic-cli", command: "node", review: {} },
-      { id: "two", adapter: "generic-cli", command: "node", review: {} },
-    ],
+    customFutureKey: { keep: true },
+    externalAgents: catalog === "workerResources" ? keyedAgents : [{ id: "one", adapter: "generic-cli", command: "node", review: {} }],
     execution: {
-      workerResources: [
-        { resourceId: "dup", selection: { source: "external", id: "one" }, maxConcurrent: 1 },
-        { resourceId: "dup", selection: { source: "external", id: "two" }, maxConcurrent: 2 },
-      ],
+      workerResources: catalog === "externalAgents"
+        ? keyedResources
+        : [{ resourceId: "primary", selection: { source: "external", id: "one" }, maxConcurrent: 2 }],
     },
   });
-  await writeFile(configPath, invalid);
+  await writeFile(configPath, legacy);
   try {
-    const before = await readFile(configPath, "utf8");
-    await assert.rejects(persistSubtasksViewPreference(configPath, true), /worker resource id must be unique/);
-    assert.equal(await readFile(configPath, "utf8"), before);
+    const expected = catalog === "workerResources" ? /execution\.workerResources must be an object/ : /externalAgents must be an object/;
+    await assert.rejects(persistSubtasksViewPreference(configPath, true), expected);
+    assert.equal(await readFile(configPath, "utf8"), legacy);
+    // Staged agent additions also validate the latest keyed catalog rather
+    // than importing a legacy array.
+    if (catalog !== "workerResources") {
+      await assert.rejects(persistReviewSettings(configPath, {
+        ...selection,
+        externalAgentAdditions: { created: { adapter: "claude-cli", review: {} } },
+      }), /externalAgents must be an object/);
+      assert.equal(await readFile(configPath, "utf8"), legacy);
+    }
     assert.deepEqual((await readdir(dir)).filter((name) => name.endsWith(".tmp")), []);
   } finally {
     await rm(dir, { recursive: true, force: true });

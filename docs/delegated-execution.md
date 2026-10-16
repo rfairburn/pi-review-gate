@@ -348,16 +348,16 @@ a role's route is not used by that role.
 `execution.workerResources` is an object keyed by stable resource ID; each value holds
 the selection and the shared `maxConcurrent` capacity. `externalAgents` is likewise an
 object keyed by agent ID. Ordered behavior lives only in the route arrays, which are
-lists of `{ resourceId, thinkingLevel? }` references. The legacy array forms of both
-catalogs are deprecated: they are still imported at load time and converted to the
-keyed form (identities, references, routes, and reasoning are preserved), but that
-import support will be removed in a future version without a fixed date or version
-([#116](https://github.com/rfairburn/pi-review-gate/issues/116)). Save the canonical
-object form now — `/review-settings` saves already write both catalogs as objects, so
-a saved config no longer depends on the legacy import. If you are still on a legacy
-array when a release removes that import, first run an intervening release that still
-supports the conversion and save once through `/review-settings` to persist the
-canonical object form, then upgrade to the removing release. In `/review-settings`
+lists of `{ resourceId, thinkingLevel? }` references. Only the keyed object form of
+both catalogs is accepted: the former legacy array forms are no longer imported or
+converted ([#116](https://github.com/rfairburn/pi-review-gate/issues/116)). Strict
+validation rejects them, and startup recovery reports them and continues without
+converting or rewriting the stored file. To migrate a legacy array config, back it
+up, load it with the published conversion-capable prerelease
+[b164](https://github.com/rfairburn/pi-review-gate/releases/tag/b164), explicitly
+save once through `/review-settings` there, and then upgrade; see
+[Removed legacy array catalogs](configuration.md#removed-legacy-array-catalogs) for
+the full steps. In `/review-settings`
 the worker-resource catalog displays alphabetically and edits by key with no reorder
 controls; ordering is set only in the two priority routes. Edit Claude/Codex external
 agent definitions separately under **External workers**; renaming an agent updates

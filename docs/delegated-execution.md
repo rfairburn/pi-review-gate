@@ -654,6 +654,35 @@ not verification that the requested changes are present or correct. The main wor
 must always be inspected manually afterward, including when the task's authoritative
 state is `landed`.
 
+**Interrupt feedback for the model** (#191): `/subtask-interrupt` still reports its
+result in the UI. It also queues one context note in the session that ran the command,
+which the next model request sees outside any tool result. The note never starts a
+turn. It includes the line `User intent: interrupted by user; do not restart without
+authorization.` That line states what the user asked for, not that anything stopped.
+The note reports the actual settlement separately, read from the request's own
+command records:
+
+- the stop was acknowledged, stopped the current queued attempt before its executor
+  startup, was not confirmed, or was rejected without effect. A stop before startup
+  describes only that queued attempt: a queued continuation may follow earlier
+  attempts whose work, session, or checkpoint is retained, and the note never infers
+  otherwise
+- for `interrupt_with_merge`: the merge was acknowledged, failed, pending, or not
+  attempted; or it is unrecorded when the request failed after the stop was
+  acknowledged without any merge record, so whether a merge was attempted is unknown
+  and no landing is confirmed
+- the task's current state and authoritative outcome
+
+An execute `interrupt_with_merge` queues the intent line first. Any landing or
+conflict notification that the merge triggers therefore reaches the model after the
+user's intent. Research and in-place tasks remain failure-only. The note is redacted
+and bounded. Nothing is queued after the owning session ends or when the host rejects
+the send. A model `SubtasksInterrupt` result gains the same settlement lines labeled
+with the model origin, including when the merge throws. Other interruptions, such as
+shutdown or `SubtasksSteer` with `interrupt: true`, keep their existing reporting.
+The note is feedback only: it adds no restart lock, automatic restart, or
+authorization rule.
+
 ### Explicit salvage
 
 When a stopped task has no ordinary verified checkpoint — for

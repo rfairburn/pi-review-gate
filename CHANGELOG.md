@@ -15,6 +15,24 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.167]
+
+### Fixed
+
+- Delegated execution (#191): a human `/subtask-interrupt` is now visible to the next
+  model request. Previously the command reported only to the UI. It now queues a context
+  note in its own session, which never starts a turn. The note carries `User intent:
+  interrupted by user; do not restart without authorization.` beside the truthful
+  settlement from the request's own command records: stop acknowledged, the current
+  queued attempt stopped before startup (never implying that earlier attempts left no
+  work or checkpoint), not confirmed, or rejected; and for `interrupt_with_merge`,
+  merge acknowledged, failed, pending, not attempted, or unrecorded when the request
+  failed without any merge record (attempt unknown, no landing confirmed). An execute merge queues the intent before any
+  landing or conflict notification it triggers. Model `SubtasksInterrupt` results add
+  the same settlement lines with the model origin, also when the merge throws.
+  Nothing is queued after the owning session ends. Interrupt, landing, review, and
+  wake behavior are unchanged.
+
 ## [0.1.0-dev.166]
 
 ### Fixed

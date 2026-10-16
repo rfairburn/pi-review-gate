@@ -18,6 +18,15 @@ import {
 } from "./background-controller";
 import type { ReattachmentBundle } from "./operation-record";
 import { deliverSubtaskLaunchNotice, launchNoticeGate, type LaunchNoticeGate, type SubtaskLaunchNotice } from "./launch-notice";
+import {
+  deliverInterruptFeedback,
+  formatInterruptSettlementForTool,
+  formatUserInterruptRequestedFeedback,
+  formatUserInterruptSettlementFeedback,
+  interruptSettlementOf,
+  type InterruptFeedbackMessage,
+  type InterruptMode,
+} from "./interrupt-feedback";
 import { EVIDENCE_FILTERS, EVIDENCE_LIMIT_DEFAULT, EVIDENCE_LIMIT_MAX, EvidenceCursorError, EvidenceNavigationError, type SubtaskEvidenceSelector } from "./subtask-evidence";
 import { redactSensitiveText } from "../redaction";
 import { renderSubtaskResultCollapsed } from "./subtask-result-collapsed";
@@ -219,6 +228,9 @@ interface NormalizedInput {
 export class ExecutionToolManager {
   private registered = false;
   private commandsRegistered = false;
+  /** Issue #191: bumped when this manager's session retires, so feedback for an
+   *  in-flight /subtask-interrupt is never queued after its owner session ended. */
+  private ownerGeneration = 0;
   private launchAllowedExecutionTools: Set<string> | undefined;
   /**
    * Per-row dispatch subscription ownership, keyed by the renderer context's
@@ -374,10 +386,12 @@ export class ExecutionToolManager {
   }
 
   async shutdown(): Promise<void> {
+    this.ownerGeneration += 1;
     await this.controller.shutdown();
   }
 
   async detach(): Promise<void> {
+    this.ownerGeneration += 1;
     await this.controller.detach();
   }
 
@@ -524,13 +538,7 @@ export class ExecutionToolManager {
       if (!["failure", "merge"].includes(mode)) {
         throw new Error("mode must be failure or merge");
       }
-      return this.controller.interrupt({
-        executionId,
-        taskId,
-        mode: mode === "merge" ? "interrupt_with_merge" : "interrupt_as_failure",
-        instructionId: `user-interrupt-${randomUUID()}`,
-        actor: "user",
-      });
+      return this.userInterruptWithFeedback(executionId, taskId, mode === "merge" ? "interrupt_with_merge" : "interrupt_as_failure");
     });
     register("subtask-force-merge", "Merge all identified work of a stopped task into main — landing its verified checkpoint or salvaging identified worker work, materializing standard conflict markers for ordinary text conflicts in the same call — then manually inspect the workspace; explicit arguments remain optional.", async (args, ctx) => {
       let [executionId, taskId, legacyMode] = words(args);
@@ -561,6 +569,59 @@ export class ExecutionToolManager {
     });
     register("subtask-mark-clean", "Validate resolved conflict markers and resume queued landings.", async () => this.controller.markClean({ actor: "user" }));
     this.commandsRegistered = true;
+  }
+
+  /**
+   * Issue #191: run a human /subtask-interrupt through the unchanged controller
+   * path and queue model-visible feedback for it on this manager's own session
+   * (non-triggering). The settlement is read from the request's own durable
+   * command records after the controller returns or throws. An execute
+   * interrupt_with_merge also queues the qualified intent first, so a landing
+   * or conflict notification the merge triggers cannot reach the model before
+   * the user's intent. Nothing is sent once this manager's session retired.
+   */
+  private async userInterruptWithFeedback(executionId: string, taskId: string, mode: InterruptMode): Promise<BackgroundInspection> {
+    const owner = this.ownerGeneration;
+    const instructionId = `user-interrupt-${randomUUID()}`;
+    const send = (message: InterruptFeedbackMessage): void => {
+      if (owner !== this.ownerGeneration) return;
+      if (!deliverInterruptFeedback(this.input.pi, message)) {
+        console.warn(`review gate: /subtask-interrupt feedback for ${taskId} could not be queued for the model; the interrupt itself is unaffected`);
+      }
+    };
+    let target: { executionId: string; kind: BackgroundTaskKind; taskId: string; title: string; mode: InterruptMode } | undefined;
+    try {
+      const before = this.controller.inspect(executionId, taskId);
+      const task = before.tasks.find((candidate) => candidate.taskId === taskId);
+      if (task) target = { executionId: before.executionId, kind: before.kind, taskId, title: task.definition.title, mode };
+    } catch {
+      // Unknown targets keep the controller's own rejection and get no feedback.
+    }
+    if (target && target.kind === "execute" && mode === "interrupt_with_merge") send(formatUserInterruptRequestedFeedback(target));
+    let requestError: string | undefined;
+    try {
+      return await this.controller.interrupt({ executionId, taskId, mode, instructionId, actor: "user" });
+    } catch (error) {
+      requestError = messageOf(error);
+      throw error;
+    } finally {
+      if (target) {
+        let settlement: ReturnType<typeof interruptSettlementOf>;
+        try {
+          settlement = interruptSettlementOf({
+            inspection: this.controller.inspect(target.executionId, taskId),
+            taskId,
+            instructionId,
+            mode,
+            actor: "user",
+            requestError,
+          });
+        } catch {
+          settlement = undefined;
+        }
+        if (settlement) send(formatUserInterruptSettlementFeedback(settlement));
+      }
+    }
   }
 
   /** #120: command submissions reuse the tool path's context wiring so scoped
@@ -936,7 +997,14 @@ export class ExecutionToolManager {
             instructionId,
             actor: "model",
           });
-          return backgroundResult("interrupt", inspection, false);
+          const settlement = interruptSettlementOf({
+            inspection,
+            taskId: normalized.taskId!,
+            instructionId,
+            mode: normalized.interruptMode!,
+            actor: "model",
+          });
+          return backgroundResult("interrupt", inspection, false, undefined, settlement ? formatInterruptSettlementForTool(settlement) : undefined);
         }
         case "force_merge": {
           const inspection = await this.controller.forceMerge({
@@ -997,8 +1065,24 @@ export class ExecutionToolManager {
       const sourceWorkspace = this.controller.criticalPrompt()
         ? { disposition: "conflicted", instruction: this.controller.criticalPrompt()! }
         : { disposition: "unchanged_or_independently_landed", instruction: "Inspect task-specific landing state before claiming changes are in main." };
+      // Issue #191: an interrupt_with_merge whose merge threw still reports the
+      // truthful stop settlement of this exact request beside the failure.
+      const interruptOwner = normalized.action === "interrupt"
+        ? inspections.find((inspection) => inspection.tasks.some((task) => task.taskId === normalized.taskId))
+        : undefined;
+      const interruptSettlement = interruptOwner
+        ? interruptSettlementOf({
+          inspection: interruptOwner,
+          taskId: normalized.taskId!,
+          instructionId,
+          mode: normalized.interruptMode!,
+          actor: "model",
+          requestError: diagnostic,
+        })
+        : undefined;
       const failureSummary = [
         `${toolName} failed: ${diagnostic}`,
+        ...(interruptSettlement ? [formatInterruptSettlementForTool(interruptSettlement)] : []),
         `Source workspace: ${sourceWorkspace.disposition}. ${sourceWorkspace.instruction}`,
         "Recovery guidance:",
         ...recovery.map((item) => `- ${item.action}: ${item.instruction}`),
@@ -1387,6 +1471,7 @@ function backgroundResult(
   inspection: BackgroundInspection,
   isError: boolean,
   config?: ReviewGateConfig,
+  addendum?: string,
 ): Record<string, unknown> {
   const active = inspection.tasks.filter((task) => isActiveTaskState(task.state)).length;
   const startupDelay = action === "start" || action === "add"
@@ -1412,6 +1497,7 @@ function backgroundResult(
   if (inspection.completionAggregate) {
     summary += `\nGroup aggregate for this synchronous landing, folded into this result instead of a separate completion notification:\n${inspection.completionAggregate}`;
   }
+  if (addendum) summary += `\n${addendum}`;
   return result(formatInspectionForModel(summary, inspection, action === "inspect"), { action, ...inspection }, isError);
 }
 

@@ -396,7 +396,18 @@ function codexResearchThreadConfig(allowedTools: readonly string[] | undefined):
 class AppServerRpc {
   private nextId = 1;
   private pending = new Map<number, PendingRequest>();
-  private buffer = "";
+  // JSON-RPC line framing (#239): the LF-free decoded fragments of the current
+  // incomplete stdout line. Each data event searches only its own text for LF;
+  // a completed line is assembled from its fragments once, when its LF
+  // arrives, and the fragments are released. This removes repeated rescanning
+  // and recopying of a long pending prefix; it is not a frame-size or memory
+  // bound — an unterminated line is still retained in full, and a final line
+  // without LF is still never parsed.
+  private lineFragments: string[] = [];
+  // Text not yet searched for LF because routing an earlier line in the same
+  // event threw. It is searched again ahead of the next event, as the former
+  // whole-buffer rescan did; always empty on the normal path.
+  private unscannedText = "";
   private turnWaiters = new Map<string, Array<{ resolve: (turn: Record<string, unknown>) => void; reject: (error: Error) => void }>>();
   private completedTurns = new Map<string, Record<string, unknown>>();
   private forceKillTimer: NodeJS.Timeout | undefined;
@@ -565,51 +576,67 @@ class AppServerRpc {
 
   private consume(chunk: string): void {
     this.stdoutCapture.append(chunk);
-    this.buffer += chunk;
-    for (;;) {
-      const newline = this.buffer.indexOf("\n");
-      if (newline < 0) break;
-      const line = this.buffer.slice(0, newline).trim();
-      this.buffer = this.buffer.slice(newline + 1);
-      if (!line) continue;
-      let value: unknown;
-      try { value = JSON.parse(line); } catch { continue; }
-      if (!isRecord(value)) continue;
-      if (typeof value.id === "number" && ("result" in value || "error" in value)) {
-        const response = value as unknown as JsonRpcResponse;
-        const pending = this.pending.get(response.id);
-        if (!pending) continue;
-        this.pending.delete(response.id);
-        if (response.error) pending.reject(new Error(`${response.error.message ?? "Codex app-server error"}: ${JSON.stringify(response.error.data ?? {})}`));
-        else pending.resolve(response.result);
-        continue;
-      }
-      if (typeof value.id === "number" && typeof value.method === "string") {
-        // A reply write can fail synchronously once the input channel is
-        // dead; contain it through the same settlement path instead of letting
-        // it escape the stdout callback as an uncaught exception (#268). No
-        // further replies are attempted after the transport has failed.
-        if (!this.stdinFailure) {
-          try {
-            this.write({ jsonrpc: "2.0", id: value.id, error: { code: -32601, message: `Client does not support server request ${value.method}.` } });
-          } catch (error) {
-            this.failTransport(error instanceof Error ? error : new Error(String(error)));
-          }
+    const text = this.unscannedText ? this.unscannedText + chunk : chunk;
+    this.unscannedText = "";
+    let start = 0;
+    try {
+      for (let newline = text.indexOf("\n", start); newline >= 0; newline = text.indexOf("\n", start)) {
+        const segment = text.slice(start, newline);
+        start = newline + 1;
+        let line = segment;
+        if (this.lineFragments.length > 0) {
+          this.lineFragments.push(segment);
+          line = this.lineFragments.join("");
+          this.lineFragments = [];
         }
-        continue;
+        this.routeLine(line.trim());
       }
-      if (typeof value.method !== "string") continue;
-      this.onNotification(value.method, value.params);
-      if (value.method === "turn/completed" && isRecord(value.params) && isRecord(value.params.turn)) {
-        const threadId = typeof value.params.threadId === "string" ? value.params.threadId : "";
-        const turnId = typeof value.params.turn.id === "string" ? value.params.turn.id : "";
-        const key = `${threadId}:${turnId}`;
-        this.completedTurns.set(key, value.params.turn);
-        const waiters = this.turnWaiters.get(key);
-        if (waiters) {
-          this.turnWaiters.delete(key);
-          for (const waiter of waiters) waiter.resolve(value.params.turn);
+    } catch (error) {
+      this.unscannedText = text.slice(start);
+      throw error;
+    }
+    if (start < text.length) this.lineFragments.push(text.slice(start));
+  }
+
+  private routeLine(line: string): void {
+    if (!line) return;
+    let value: unknown;
+    try { value = JSON.parse(line); } catch { return; }
+    if (!isRecord(value)) return;
+    if (typeof value.id === "number" && ("result" in value || "error" in value)) {
+      const response = value as unknown as JsonRpcResponse;
+      const pending = this.pending.get(response.id);
+      if (!pending) return;
+      this.pending.delete(response.id);
+      if (response.error) pending.reject(new Error(`${response.error.message ?? "Codex app-server error"}: ${JSON.stringify(response.error.data ?? {})}`));
+      else pending.resolve(response.result);
+      return;
+    }
+    if (typeof value.id === "number" && typeof value.method === "string") {
+      // A reply write can fail synchronously once the input channel is
+      // dead; contain it through the same settlement path instead of letting
+      // it escape the stdout callback as an uncaught exception (#268). No
+      // further replies are attempted after the transport has failed.
+      if (!this.stdinFailure) {
+        try {
+          this.write({ jsonrpc: "2.0", id: value.id, error: { code: -32601, message: `Client does not support server request ${value.method}.` } });
+        } catch (error) {
+          this.failTransport(error instanceof Error ? error : new Error(String(error)));
         }
+      }
+      return;
+    }
+    if (typeof value.method !== "string") return;
+    this.onNotification(value.method, value.params);
+    if (value.method === "turn/completed" && isRecord(value.params) && isRecord(value.params.turn)) {
+      const threadId = typeof value.params.threadId === "string" ? value.params.threadId : "";
+      const turnId = typeof value.params.turn.id === "string" ? value.params.turn.id : "";
+      const key = `${threadId}:${turnId}`;
+      this.completedTurns.set(key, value.params.turn);
+      const waiters = this.turnWaiters.get(key);
+      if (waiters) {
+        this.turnWaiters.delete(key);
+        for (const waiter of waiters) waiter.resolve(value.params.turn);
       }
     }
   }

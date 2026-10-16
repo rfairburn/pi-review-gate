@@ -18,7 +18,7 @@ import { ExecutorLifecycleError, type ExecutorAdapter, type ExecutorInteractionA
 import type { ThinkingLevel } from "../../config";
 import { BackgroundProcessReadiness } from "../../background-process-readiness";
 import { assertNoPiToolPolicyArgs } from "../../pi-tool-policy";
-import { isLiveWindowsProcessDescendant } from "../windows-process-lineage";
+import { verifyWindowsProcessLineage } from "../windows-process-lineage";
 import {
   DEFERRED_TOOL_SEARCH_NAME,
   EXECUTOR_TOOL_CATALOG_ENV,
@@ -156,8 +156,10 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     if (invocation.windowsVerbatimArguments) {
       // cmd.exe is the owned cleanup/lifecycle root, not the actual Pi Node
       // process. The first signed child receipt must prove native process
-      // ancestry before binding its PID; the callback remains parent-only.
-      settlementBootstrap.verifySpawnedPid = (pid) => isLiveWindowsProcessDescendant(proc, pid);
+      // ancestry before binding its PID; the callback remains parent-only, and
+      // a refusal carries only a fixed sanitized stage appended to the existing
+      // receipt wording (issue #335 diagnosis) — never query output or paths.
+      settlementBootstrap.verifySpawnedPid = (pid) => verifyWindowsProcessLineage(proc, pid);
     } else {
       // Direct spawns bind the known child PID exactly as before.
       settlementBootstrap.pid = proc.pid;

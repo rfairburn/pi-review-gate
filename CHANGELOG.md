@@ -15,6 +15,34 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.164]
+
+### Changed
+
+- The Windows `cmd.exe`-rooted settlement descendant check reports which bounded
+  stage refused: the existing settlement refusal keeps its exact wording and
+  appends one fixed sanitized stage code (`[lineage stage: <code>]`) covering
+  preflight, the single bounded query child (spawn failure, nonzero exit, output
+  cap, or a timeout positively witnessed by the verifier's own deadline callback
+  rather than inferred from a kill flag, signal, or elapsed time), the native
+  ancestry script's sentinel branches, the local evidence validator, and the
+  final owned-root liveness check. This is diagnostic-only (#335) and identifies
+  no cause: acceptance conditions, the 5-second/4KiB/64-step bounds, the single
+  query child with no retry, owned-root ownership, PID binding, and the receipt
+  wire schema and HMAC identity are unchanged, and no query output, error text,
+  command line, host path, or PID is ever reported.
+- The Windows launcher workflow adds one manual-dispatch-only sampling step (#335):
+  five fixed fresh invocations of the existing compaction-recovery child case, each
+  in its own `node --test` process selected by a name pattern anchored to that exact
+  title and reusing the pinned installed Pi 1.3.0 environment, so every sample starts
+  its own owned children and the unmodified lineage query verifies each fresh child
+  once. All five samples run regardless of an earlier failure, every exit code is
+  collected, and any failed sample fails the step; nothing is rerun, no sample stops
+  the loop early, and a sample that ran no matching case counts as failed. Required
+  checks, the case and its assertions, and every process, lineage, and job deadline
+  are unchanged: fixed sampling is diagnostic evidence, and a green run establishes no
+  cause and applies no correction.
+
 ## [0.1.0-dev.163]
 
 ### Fixed

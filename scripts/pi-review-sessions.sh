@@ -24,6 +24,7 @@ if [[ -n "${PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG:-}" ]]; then
   exit 1
 fi
 unset PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE
+unset PI_REVIEW_GATE_NODE_GENERATION PI_REVIEW_GATE_NODE_HOLDER
 
 # Pure-bash script directory resolution: do not depend on an external dirname
 # when the caller's PATH is minimal.
@@ -189,7 +190,7 @@ fi
 
 # Capture stable filesystem identities for the cache and exclusive work root.
 # These checks detect collisions/replaced paths; they are not a same-user race
-# sandbox. No cache-name-based cleanup or recursive deletion is attempted.
+# sandbox. Native admission below uses bounded, identity-checked no-follow cleanup.
 path_identity() {
   local path="$1" output
   [[ ! -L "$path" && ( -d "$path" || -f "$path" ) ]] || return 1
@@ -198,7 +199,7 @@ path_identity() {
   else
     output="$("$STAT_BIN" -c '%d:%i' "$path" 2>/dev/null)" || return 1
   fi
-  [[ "$output" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+  [[ "$output" =~ ^[0-9]+:[1-9][0-9]*$ ]] || return 1
   printf '%s' "$output"
 }
 
@@ -213,31 +214,22 @@ NODE_CACHE_ROOT_ID="$(path_identity "$NODE_CACHE_ROOT")" || {
   exit 1
 }
 
-# A random mktemp directory is the positively owned extraction/download root.
-# It stays mode 0700 as a retained failure witness; the verified extracted
-# runtime is kept for the lifetime of the launched CJS, and future launches
-# always re-extract.
+# Admission happens BEFORE mktemp/download/extraction, including failed stages.
+# shellcheck source=scripts/node-generations.sh
+source "$SCRIPT_DIR/node-generations.sh"
+NODE_UNLINK_BIN="$(type -P unlink || true)"
+NODE_RMDIR_BIN="$(type -P rmdir || true)"
+NODE_MOVE_BIN="$(type -P mv || true)"
+NODE_MOUNT_BIN="$(type -P mount || true)"
+if [[ -z "$NODE_UNLINK_BIN" || -z "$NODE_RMDIR_BIN" || -z "$NODE_MOVE_BIN" ]]; then
+  echo 'pi-review-sessions: Node admission requires unlink, rmdir, and mv.' >&2
+  exit 1
+fi
 ORIGINAL_UMASK="$(umask)"
 umask 077
-if ! WORK_ROOT="$(mktemp -d "$NODE_CACHE_ROOT/bootstrap.XXXXXXXX" 2>/dev/null)"; then
-  echo "pi-review-sessions: could not create an exclusive Node bootstrap workspace." >&2
-  exit 1
-fi
-if [[ "${WORK_ROOT%/*}" != "$NODE_CACHE_ROOT" || "${WORK_ROOT##*/}" != bootstrap.* ]]; then
-  echo "pi-review-sessions: mktemp returned a workspace outside the isolated Node cache." >&2
-  exit 1
-fi
-WORK_ROOT_ID="$(path_identity "$WORK_ROOT")" || {
-  echo "pi-review-sessions: could not capture the exclusive Node workspace identity." >&2
-  exit 1
-}
-shopt -s nullglob dotglob
-WORK_ROOT_ENTRIES=("$WORK_ROOT"/*)
-shopt -u nullglob dotglob
-if (( ${#WORK_ROOT_ENTRIES[@]} != 0 )); then
-  echo "pi-review-sessions: exclusive Node workspace was not empty; existing contents were preserved." >&2
-  exit 1
-fi
+node_capture_fence || exit 1
+trap 'node_unlock || true' EXIT
+node_admit || exit 1
 ARCHIVE_PATH="$WORK_ROOT/$NODE_ARCHIVE"
 LISTING_PATH="$WORK_ROOT/archive-members.txt"
 EXTRACT_ROOT="$WORK_ROOT/extracted"
@@ -245,10 +237,14 @@ EXTRACT_ROOT="$WORK_ROOT/extracted"
 bootstrap_failure() {
   echo "pi-review-sessions: $1" >&2
   echo "pi-review-sessions: retained bootstrap witness: $WORK_ROOT" >&2
+  # Only explicit synchronous failures settle setup. Signals/unexpected exits
+  # leave the canonical pin protected, never a PID/status-based inference.
+  node_set_state protected inactive || true
   exit 1
 }
 
 assert_workspace_identity() {
+  node_check_fence || return 1
   assert_path_identity "$NODE_CACHE_ROOT" "$NODE_CACHE_ROOT_ID" || return 1
   assert_path_identity "$WORK_ROOT" "$WORK_ROOT_ID"
 }
@@ -383,4 +379,57 @@ else
   export PATH="$NODE_DIST_ROOT/bin"
 fi
 umask "$ORIGINAL_UMASK"
-exec "$NODE_BIN" "$CJS_ENTRY" "$@"
+# Supervise the exact CJS child in the caller's foreground process group.
+# Async launch makes Bash traps responsive while waiting; explicit stdin and
+# disabled job control prevent /dev/null input or a background TTY process group.
+# Reset the async subshell's inherited ignored INT/QUIT before exec, too.
+CJS_PID=''
+CJS_WAIT_INTERRUPTED=0
+CJS_PENDING_SIGNALS=()
+forward_cjs_signal() {
+  local signal="$1" running
+  CJS_WAIT_INTERRUPTED=1
+  if [[ -z "$CJS_PID" ]]; then
+    CJS_PENDING_SIGNALS+=("$signal")
+    return
+  fi
+  # Only a live (running or stopped) job owned by this shell may receive a signal. Never
+  # signal a process group, infer ownership from kill -0, or target a reaped PID.
+  while IFS= read -r running; do
+    if [[ "$running" == "$CJS_PID" ]]; then
+      kill -s "$signal" "$CJS_PID" 2>/dev/null || true
+      break
+    fi
+  done < <(jobs -pr; jobs -ps)
+}
+trap 'forward_cjs_signal TERM' TERM
+trap 'forward_cjs_signal HUP' HUP
+trap 'forward_cjs_signal INT' INT
+set +m
+(
+  trap - TERM HUP INT QUIT EXIT
+  # Only this exact child receives the one-shot bootstrap context, never the
+  # supervisor's job-table helpers or later lifetime-publication commands.
+  export PI_REVIEW_GATE_NODE_GENERATION="$WORK_ROOT"
+  export PI_REVIEW_GATE_NODE_HOLDER="${WORK_ROOT##*/}"
+  exec "$NODE_BIN" "$CJS_ENTRY" "$@"
+) <&0 &
+CJS_PID=$!
+# Bash 3.2 treats expansion of an empty array as unbound under set -u.
+if (( ${#CJS_PENDING_SIGNALS[@]} > 0 )); then
+  for CJS_PENDING_SIGNAL in "${CJS_PENDING_SIGNALS[@]}"; do forward_cjs_signal "$CJS_PENDING_SIGNAL"; done
+fi
+while :; do
+  CJS_WAIT_INTERRUPTED=0
+  CJS_STATUS=0
+  wait "$CJS_PID" || CJS_STATUS=$?
+  # A trapped signal interrupts wait BEFORE the child necessarily exits. Only
+  # an uninterrupted exact-child wait permits finalization or supplies status.
+  (( CJS_WAIT_INTERRUPTED == 0 )) && break
+done
+CJS_PID=''
+trap - TERM HUP INT
+unset PI_REVIEW_GATE_NODE_GENERATION PI_REVIEW_GATE_NODE_HOLDER
+umask 077
+node_set_state quiescent inactive || true
+exit "$CJS_STATUS"

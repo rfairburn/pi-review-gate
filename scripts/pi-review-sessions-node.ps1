@@ -14,6 +14,8 @@ if (-not [string]::IsNullOrEmpty($env:PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG)) {
 }
 $env:PI_REVIEW_GATE_SESSION_HOST_BOOTSTRAP = $null
 $env:PI_REVIEW_GATE_SESSION_HOST_NODE_OPTIONS_RESTORE = $null
+$env:PI_REVIEW_GATE_NODE_GENERATION = $null
+$env:PI_REVIEW_GATE_NODE_HOLDER = $null
 
 $CjsEntry = Join-Path $PSScriptRoot 'pi-review-sessions.cjs'
 $MinimumNode = [version]'22.19.0'
@@ -164,56 +166,29 @@ function Get-ExistingAttributes([string]$Path) {
   catch [IO.DirectoryNotFoundException] { return $null }
 }
 
-# Capture the Windows volume serial and file index from an open handle. Add-Type
-# may use the process temp path while compiling, so compile only inside this
-# owned workspace and restore the user's original temp environment immediately.
-function Initialize-IdentityType([string]$TemporaryDirectory) {
-  $tempWasSet = Test-Path Env:TEMP
-  $tmpWasSet = Test-Path Env:TMP
-  $originalTemp = $env:TEMP
-  $originalTmp = $env:TMP
-  try {
-    $env:TEMP = $TemporaryDirectory
-    $env:TMP = $TemporaryDirectory
-    Add-Type -TypeDefinition @'
-using System;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
-using Microsoft.Win32.SafeHandles;
-public static class PiReviewGateNodeIdentity {
-  [StructLayout(LayoutKind.Sequential)]
-  private struct FileTime { public uint Low; public uint High; }
-  [StructLayout(LayoutKind.Sequential)]
-  private struct FileInformation {
-    public uint Attributes;
-    public FileTime CreationTime;
-    public FileTime LastAccessTime;
-    public FileTime LastWriteTime;
-    public uint VolumeSerialNumber;
-    public uint SizeHigh;
-    public uint SizeLow;
-    public uint NumberOfLinks;
-    public uint FileIndexHigh;
-    public uint FileIndexLow;
+# In-memory P/Invoke: identities exist BEFORE admission or compiler scratch.
+# Reflection.Emit works in Windows PowerShell 5.1 without Add-Type's disk compiler.
+function Initialize-IdentityType {
+  $name = New-Object Reflection.AssemblyName 'PiReviewGateNodeNative'
+  if ($PSVersionTable.PSEdition -eq 'Core') {
+    $assembly = [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly($name, [Reflection.Emit.AssemblyBuilderAccess]::Run)
+  } else {
+    $assembly = [AppDomain]::CurrentDomain.DefineDynamicAssembly($name, [Reflection.Emit.AssemblyBuilderAccess]::Run)
   }
-  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-  private static extern SafeFileHandle CreateFile(string path, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
-  [DllImport("kernel32.dll", SetLastError = true)]
-  private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out FileInformation information);
-  public static string Read(string path) {
-    using (SafeFileHandle handle = CreateFile(path, 0x80, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero)) {
-      if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
-      FileInformation information;
-      if (!GetFileInformationByHandle(handle, out information)) throw new Win32Exception(Marshal.GetLastWin32Error());
-      return information.VolumeSerialNumber.ToString("x8") + ":" + information.FileIndexHigh.ToString("x8") + information.FileIndexLow.ToString("x8");
-    }
+  $module = $assembly.DefineDynamicModule('Native')
+  $builder = $module.DefineType('PiReviewGateNodeIdentity', [Reflection.TypeAttributes]'Public, Sealed, Abstract')
+  $attributes = [Reflection.MethodAttributes]'Public, Static, PinvokeImpl'
+  $methods = @(
+    @('CreateFileW', [IntPtr], [Type[]]@([string], [uint32], [uint32], [IntPtr], [uint32], [uint32], [IntPtr])),
+    @('GetFileInformationByHandle', [bool], [Type[]]@([IntPtr], [IntPtr])),
+    @('GetFileInformationByHandleEx', [bool], [Type[]]@([IntPtr], [uint32], [IntPtr], [uint32])),
+    @('CloseHandle', [bool], [Type[]]@([IntPtr]))
+  )
+  foreach ($definition in $methods) {
+    $method = $builder.DefinePInvokeMethod($definition[0], 'kernel32.dll', $attributes, [Reflection.CallingConventions]::Standard, $definition[1], $definition[2], [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Unicode)
+    $method.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
   }
-}
-'@
-  } finally {
-    if ($tempWasSet) { $env:TEMP = $originalTemp } else { Remove-Item Env:TEMP -ErrorAction SilentlyContinue }
-    if ($tmpWasSet) { $env:TMP = $originalTmp } else { Remove-Item Env:TMP -ErrorAction SilentlyContinue }
-  }
+  $script:IdentityType = $builder.CreateType()
 }
 
 function New-LiteralDirectory([string]$Path) {
@@ -227,10 +202,33 @@ function Get-PathIdentity([string]$Path) {
   if ($null -eq $attributes -or ($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
     throw 'Bootstrap path is missing or a reparse point.'
   }
-  return [PiReviewGateNodeIdentity]::Read($Path)
+  $handle = $script:IdentityType::CreateFileW($Path, 0x80, 7, [IntPtr]::Zero, 3, 0x02200000, [IntPtr]::Zero)
+  if ($handle -eq [IntPtr]::new(-1)) { throw 'Cannot open bootstrap identity.' }
+  $buffer = [Runtime.InteropServices.Marshal]::AllocHGlobal(52)
+  $idBuffer = [Runtime.InteropServices.Marshal]::AllocHGlobal(24)
+  try {
+    if (-not $script:IdentityType::GetFileInformationByHandle($handle, $buffer)) { throw 'Cannot read bootstrap identity.' }
+    # FILE_FLAG_OPEN_REPARSE_POINT + BACKUP_SEMANTICS, then handle attributes.
+    $nativeAttributes = [Runtime.InteropServices.Marshal]::ReadInt32($buffer, 0)
+    if (($nativeAttributes -band 0x400) -ne 0) { throw 'Native reparse point refused.' }
+    # FILE_ID_INFO (class 18): preserve all 64 volume bits and all 128 file-ID
+    # bits. Truncating ReFS/native IDs to the legacy 64-bit file index is unsafe.
+    if (-not $script:IdentityType::GetFileInformationByHandleEx($handle, 18, $idBuffer, 24)) { throw 'Full native file identity is unavailable.' }
+    $nativeId = New-Object byte[] 24
+    [Runtime.InteropServices.Marshal]::Copy($idBuffer, $nativeId, 0, 24)
+    $volume = ([BitConverter]::ToString($nativeId, 0, 8)).Replace('-', '').ToLowerInvariant()
+    $fileId = ([BitConverter]::ToString($nativeId, 8, 16)).Replace('-', '').ToLowerInvariant()
+    if ($fileId -eq ('0' * 32)) { throw 'Native identity is unavailable.' }
+    return $volume + ':' + $fileId
+  } finally {
+    [Runtime.InteropServices.Marshal]::FreeHGlobal($buffer)
+    [Runtime.InteropServices.Marshal]::FreeHGlobal($idBuffer)
+    [void]$script:IdentityType::CloseHandle($handle)
+  }
 }
 
 function Assert-PathIdentity([string]$Path, [string]$Expected) {
+  if ($null -ne $script:BootstrapCacheFence) { Assert-NodeFence $script:BootstrapCacheFence }
   return (Get-PathIdentity $Path) -ceq $Expected
 }
 
@@ -238,6 +236,13 @@ function Assert-PathIdentity([string]$Path, [string]$Expected) {
 # claim protection against a malicious same-user process racing filesystem ops.
 function Ensure-DirectoryTree([string]$Path) {
   $fullPath = [IO.Path]::GetFullPath($Path)
+  if ($fullPath -notmatch '^[A-Za-z]:\\' -or $Path -match ':[^\\/]') { throw 'Unsupported native path alias.' }
+  foreach ($part in $Path.Substring([IO.Path]::GetPathRoot($Path).Length).Split([char[]]@('\', '/'), [StringSplitOptions]::RemoveEmptyEntries)) {
+    # Lexical . and .. retain ordinary relative override semantics; reject
+    # Windows trailing-dot/space, device-name and alternate-stream aliases.
+    if ($part -eq '.' -or $part -eq '..') { continue }
+    if ($part.EndsWith(' ') -or $part.EndsWith('.') -or $part.Contains(':') -or $part -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$') { throw 'Unsupported native path alias.' }
+  }
   $root = [IO.Path]::GetPathRoot($fullPath)
   $current = $root
   $relative = $fullPath.Substring($root.Length)
@@ -415,15 +420,67 @@ function Expand-VerifiedZip([string]$Archive, [string]$Destination, [string]$Exp
   }
 }
 
+function Get-NodeFence([string]$Root) {
+  $chain = @()
+  $current = [IO.Path]::GetPathRoot($Root)
+  $chain += ,@($current, (Get-PathIdentity $current))
+  foreach ($part in $Root.Substring($current.Length).Split([char]'\')) {
+    $current = [IO.Path]::Combine($current, $part)
+    $chain += ,@($current, (Get-PathIdentity $current))
+  }
+  return ,$chain
+}
+function Assert-NodeFence($Chain) {
+  foreach ($entry in $Chain) {
+    if ((Get-PathIdentity $entry[0]) -cne $entry[1]) { throw 'Node cache ancestor identity changed.' }
+  }
+}
+function New-NodeGeneration([string]$Root) {
+  $chain = Get-NodeFence $Root
+  $lockPath = Join-Path $Root '.admission.lock'
+  $lock = $null
+  $lockIdentity = $null
+  try {
+    Assert-NodeFence $chain
+    $lock = [IO.File]::Open($lockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    $lockIdentity = Get-PathIdentity $lockPath
+    Assert-NodeFence $chain
+    # Windows reclamation is deliberately disabled. Every existing entry,
+    # including malformed/legacy/failed stages, counts without descending.
+    $count = 0
+    foreach ($entry in [IO.Directory]::EnumerateFileSystemEntries($Root)) {
+      if ([IO.Path]::GetFileName($entry) -cne '.admission.lock') { $count++ }
+      if ($count -ge 5) { throw 'Node generation capacity exhausted: maximum 5; native Windows reclamation is unavailable.' }
+    }
+    Assert-NodeFence $chain
+    $candidate = Join-Path $Root ('bootstrap-' + [Guid]::NewGuid().ToString('N'))
+    New-ExclusiveDirectory $candidate
+    $identity = Get-PathIdentity $candidate
+    Assert-NodeFence $chain
+    $text = "pi-review-gate-node-v1`n$identity`n$([IO.Path]::GetFileName($candidate))`nprotected`n"
+    $record = Join-Path $candidate '.node-lifetime'
+    $stream = [IO.File]::Open($record, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $bytes = [Text.Encoding]::UTF8.GetBytes($text); $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+    return $candidate
+  } finally {
+    if ($null -ne $lock) {
+      $lock.Dispose()
+      try {
+        Assert-NodeFence $chain
+        if ($null -ne $lockIdentity -and (Assert-PathIdentity $lockPath $lockIdentity)) { [IO.File]::Delete($lockPath) }
+      } catch { # Uncertain lock ownership is retained.
+      }
+    }
+  }
+}
+
 $WorkRoot = $null
 try {
   $agentDirectory = Get-AgentDirectory
   $cacheRoot = Ensure-DirectoryTree (Join-Path (Join-Path $agentDirectory '.pi-review-gate') 'node')
-  $candidateWorkRoot = Join-Path $cacheRoot ('bootstrap-' + [Guid]::NewGuid().ToString('N'))
-  New-ExclusiveDirectory $candidateWorkRoot
-  if ([IO.Directory]::GetFileSystemEntries($candidateWorkRoot).Length -ne 0) { throw 'Exclusive bootstrap workspace was not empty.' }
-  $WorkRoot = $candidateWorkRoot
-  Initialize-IdentityType $WorkRoot | Out-Null
+  Initialize-IdentityType
+  $script:BootstrapCacheFence = Get-NodeFence $cacheRoot
+  $WorkRoot = New-NodeGeneration $cacheRoot
   $cacheIdentity = Get-PathIdentity $cacheRoot
   $workIdentity = Get-PathIdentity $WorkRoot
   $archivePath = Join-Path $WorkRoot $NodeArchive
@@ -472,7 +529,7 @@ try {
   $FallbackNodeExecutable = $nodeExe
   $FallbackNodeDirectory = $nodeRoot
 } catch {
-  [Console]::Error.WriteLine('pi-review-sessions: isolated Node bootstrap failed; no existing runtime or cache resource was changed.')
+  [Console]::Error.WriteLine('pi-review-sessions: isolated Node bootstrap failed: admission busy, capacity exhausted (maximum 5), unsafe path, or download/validation failure; native Windows reclamation is unavailable.')
   if ($null -ne $WorkRoot) {
     [Console]::Error.WriteLine('pi-review-sessions: retained bootstrap witness: ' + $WorkRoot)
   }

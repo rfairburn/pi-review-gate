@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmdirSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmdirSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { createInterface } from "node:readline";
 import test, { type TestContext } from "node:test";
 
 /**
@@ -167,6 +168,9 @@ function writeBootstrapNode(fixture: EntrypointFixture, exitCode = 0): string {
     "record_phase dispatch",
     "for arg in \"$@\"; do printf '%s\\n' \"$arg\" >> \"$FAKE_NODE_LOG\"; done",
     "printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"$PATH\" \"$PWD\" \"${NODE_OPTIONS:-}\" \"${PI_CODING_AGENT_DIR:-}\" \"$(umask)\" >> \"$FAKE_FALLBACK_ENV_LOG\"",
+    `if [[ "\${FAKE_BOOTSTRAP_DISPATCH_CJS:-}" == 1 ]]; then exec "${process.execPath}" "$@"; fi`,
+    `if [[ "\${FAKE_BOOTSTRAP_HOLD:-}" == 1 ]]; then exec "${process.execPath}" -e 'require(process.env.FAKE_NODE_LIFETIME_MODULE).consume(process.env)(); process.stdout.write("QUIESCENT\\n"); process.stdin.once("data", () => process.exit(0));'; fi`,
+    `if [[ -n "\${FAKE_BOOTSTRAP_SIGNAL_CHILD:-}" ]]; then exec "${process.execPath}" "$FAKE_BOOTSTRAP_SIGNAL_CHILD" "$@"; fi`,
     `exit ${exitCode}`,
     "",
   ].join("\n"));
@@ -200,6 +204,7 @@ function writeBootstrapTools(
     "if [[ \"$1\" == \"-s\" ]]; then printf '%s\\n' \"${FAKE_UNAME_S:-Linux}\"; else printf '%s\\n' \"${FAKE_UNAME_M:-x86_64}\"; fi",
     "",
   ].join("\n"));
+  writeExecutable(join(fixture.bin, "mount"), '#!/bin/bash\nif [[ -n "${FAKE_MOUNT_TABLE_FILE:-}" ]]; then while IFS= read -r line; do printf "%s\\n" "$line"; done < "$FAKE_MOUNT_TABLE_FILE"; elif [[ "${FAKE_UNAME_S:-Linux}" == Darwin ]]; then printf "%s\\n" "fixture on / (local)"; else printf "%s\\n" "fixture on / type fixture (rw)"; fi\n');
   writeExecutable(join(fixture.bin, "mkdir"), "#!/bin/bash\nexec /bin/mkdir \"$@\"\n");
   writeExecutable(join(fixture.bin, "mktemp"), [
     "#!/bin/bash",
@@ -211,18 +216,23 @@ function writeBootstrapTools(
     "printf '%s\\n' \"$candidate\"",
     "",
   ].join("\n"));
+  for (const tool of ["unlink", "rmdir", "mv"]) {
+    const native = spawnSync("/bin/bash", ["-c", `type -P ${tool}`], { encoding: "utf8" }).stdout.trim();
+    writeExecutable(join(fixture.bin, tool), `#!/bin/bash\nexec "${native}" "$@"\n`);
+  }
   writeExecutable(join(fixture.bin, "wc"), "#!/bin/bash\nexec /usr/bin/wc \"$@\"\n");
   writeExecutable(join(fixture.bin, "readlink"), "#!/bin/bash\nexec /usr/bin/readlink \"$@\"\n");
   writeExecutable(join(fixture.bin, "stat"), [
     "#!/bin/bash",
-    "if [[ \"$1\" == \"-f\" && \"${FAKE_STAT_NATIVE:-Linux}\" == Linux ]]; then exec /usr/bin/stat -c \"$2\" \"$3\"; fi",
-    "if [[ \"$1\" == \"-c\" && \"${FAKE_STAT_NATIVE:-Linux}\" == Darwin ]]; then exec /usr/bin/stat -f \"$2\" \"$3\"; fi",
+    "if [[ \"$1\" == \"-f\" && \"${FAKE_STAT_NATIVE:-Linux}\" == Linux ]]; then format=\"$2\"; format=\"${format//%Lp/%a}\"; format=\"${format//%p/%f}\"; format=\"${format//%l/%h}\"; format=\"${format//%z/%s}\"; format=\"${format//%m/%Y}\"; format=\"${format//%c/%Z}\"; shift 2; exec /usr/bin/stat -c \"$format\" \"$@\"; fi",
+    "if [[ \"$1\" == \"-c\" && \"${FAKE_STAT_NATIVE:-Linux}\" == Darwin ]]; then format=\"$2\"; format=\"${format//%a/%Lp}\"; format=\"${format//%f/%p}\"; format=\"${format//%h/%l}\"; format=\"${format//%s/%z}\"; format=\"${format//%Y/%m}\"; format=\"${format//%Z/%c}\"; shift 2; exec /usr/bin/stat -f \"$format\" \"$@\"; fi",
     "exec /usr/bin/stat \"$@\"",
     "",
   ].join("\n"));
   writeExecutable(join(fixture.bin, "curl"), [
     ...commonHeader,
     "record_phase curl",
+    "if [[ \"${FAKE_CURL_HOLD:-}\" == 1 ]]; then printf 'DOWNLOAD_READY\\n' >&3; IFS= read -r release || exit 1; fi",
     "archive= url= writeout=",
     "while (($#)); do",
     "  case \"$1\" in",
@@ -233,6 +243,7 @@ function writeBootstrapTools(
     "done",
     "printf '%s\\n' \"$url\" > \"$FAKE_CURL_LOG\"",
     "printf '%s\\n' 'synthetic archive fixture' > \"$archive\"",
+    "if [[ \"${FAKE_SWAP_CACHE_PARENT:-}\" == 1 ]]; then gate=\"${archive%/node/*}\"; /bin/mv \"$gate\" \"$gate.displaced\"; /bin/ln -s \"$gate.displaced\" \"$gate\"; fi",
     "printf '%s' \"${FAKE_HTTP_STATUS:-200}\"",
     "exit \"${FAKE_CURL_EXIT:-0}\"",
     "",
@@ -277,12 +288,9 @@ function writeBootstrapTools(
 
 const fixtureSetupEnv = new Map<string, NodeJS.ProcessEnv>();
 
-function runSh(fixture: EntrypointFixture, args: string[], envOverrides: NodeJS.ProcessEnv = {}): { status: number | null; stdout: string; stderr: string } {
+function entrypointEnv(fixture: EntrypointFixture, envOverrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const fixtureEnv = fixtureSetupEnv.get(fixture.root) ?? {};
-  const result = spawnSync("/bin/bash", [shPath, ...args], {
-    cwd: process.cwd(),
-    encoding: "utf8",
-    env: {
+  return {
       PATH: fixture.bin,
       HOME: fixture.home,
       FAKE_NODE_LOG: fixture.nodeLog,
@@ -292,8 +300,14 @@ function runSh(fixture: EntrypointFixture, args: string[], envOverrides: NodeJS.
       FAKE_CURL_LOG: fixture.curlLog,
       FAKE_STAT_NATIVE: process.platform === "darwin" ? "Darwin" : "Linux",
       ...fixtureEnv,
+      FAKE_NODE_LIFETIME_MODULE: resolve("scripts/node-bootstrap-lifetime.cjs"),
       ...envOverrides,
-    },
+  };
+}
+function runSh(fixture: EntrypointFixture, args: string[], envOverrides: NodeJS.ProcessEnv = {}): { status: number | null; stdout: string; stderr: string } {
+  const result = spawnSync("/bin/bash", [shPath, ...args], {
+    cwd: process.cwd(), encoding: "utf8", timeout: 30_000,
+    env: entrypointEnv(fixture, envOverrides),
   });
   return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
@@ -543,9 +557,329 @@ test(".sh requires HTTP 200 and retains a failed-download witness without archiv
 });
 
 // ---------------------------------------------------------------------------
-// Native Windows entry point source contract. Native runtime behavior is
-// deliberately reserved for parent-owned tests on a Windows host.
+// Node admission: actual POSIX producer fixtures, native Windows admission
+// (Windows-only), then cross-platform source contracts. No native cleanup claim.
 // ---------------------------------------------------------------------------
+
+function nodeRoots(fixture: EntrypointFixture): string[] {
+  const cache = join(fixture.agentDir, ".pi-review-gate", "node");
+  return readdirSync(cache).filter((name) => name !== ".admission.lock").map((name) => join(cache, name));
+}
+function lifetime(root: string): string {
+  return readFileSync(join(root, ".node-lifetime"), "utf8");
+}
+function syntheticLifetime(root: string, state: string): void {
+  const s = lstatSync(root, { bigint: true });
+  writeFileSync(join(root, ".node-lifetime"), `pi-review-gate-node-v1\n${s.dev}:${s.ino}\n${root.split(/[\\/]/).at(-1)}\n${state}\n`, { mode: 0o600 });
+}
+
+for (const nativeOs of ["Linux", "Darwin"] as const) {
+test(`.sh actual ${nativeOs} fallback producer rolls past five settled extractions and deletes path-owned descendants without following outside links`, { skip: isWindows }, (t) => {
+  const f = makeEntrypointFixture(`.node-cap-roll-${nativeOs}-`);
+  cleanupFixture(t, f);
+  writeBootstrapTools(f, { os: nativeOs, digest: POSIX_PINS[nativeOs === "Linux" ? "linux-x64" : "darwin-x64"] });
+  const env = { PI_CODING_AGENT_DIR: f.agentDir, FAKE_BOOTSTRAP_DISPATCH_CJS: "1" };
+  const produced = new Set<string>();
+  const sentinel = join(f.root, "outside-sentinel");
+  writeFileSync(sentinel, "outside remains");
+  for (let i = 0; i < 8; i++) {
+    const result = runSh(f, ["--help"], env);
+    assert.equal(result.status, 0, result.stderr);
+    const roots = nodeRoots(f);
+    assert.equal(roots.length, Math.min(i + 1, 5));
+    for (const root of roots) assert.match(lifetime(root), /\ninactive\n$/);
+    for (const root of roots) {
+      if (produced.has(root)) continue;
+      produced.add(root);
+      mkdirSync(join(root, "arbitrary-existing-failed", "nested"), { recursive: true });
+      writeFileSync(join(root, "arbitrary-existing-failed", "nested", "unreceipted.txt"), "disposable by path");
+      symlinkSync(sentinel, join(root, "outside-link"));
+    }
+  }
+  assert.equal(produced.size, 8);
+  assert.equal([...produced].filter((root) => !existsSync(root)).length, 3, "actual disposable extractions and arbitrary descendants were removed; no oldest-first policy is assumed");
+  assert.equal(readFileSync(sentinel, "utf8"), "outside remains");
+  assert.equal(recordedPhases(f).filter((p) => p === "curl").length, 8, "no mutable Node reuse");
+  f.markAssertionsPassed();
+});
+}
+
+test(".sh settled checksum failures remain counted but reclaimable before the sixth download", { skip: isWindows }, (t) => {
+  const f = makeEntrypointFixture(".node-cap-failure-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f, { digest: "0".repeat(64) });
+  const produced = new Set<string>();
+  for (let i = 0; i < 7; i++) {
+    const result = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /checksum did not match/);
+    const roots = nodeRoots(f);
+    assert.equal(roots.length, Math.min(i + 1, 5));
+    for (const root of roots) assert.match(lifetime(root), /\ninactive\n$/);
+    for (const root of roots) produced.add(root);
+  }
+  assert.equal(produced.size, 7);
+  assert.equal([...produced].filter((root) => !existsSync(root)).length, 2);
+  assert.ok(!recordedPhases(f).includes("tar-list"));
+  f.markAssertionsPassed();
+});
+
+test(".sh zero status without positive CJS handoff protects all five outputs and refuses before download", { skip: isWindows }, (t) => {
+  const f = makeEntrypointFixture(".node-cap-no-witness-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const env = { PI_CODING_AGENT_DIR: f.agentDir };
+  for (let i = 0; i < 5; i++) assert.equal(runSh(f, ["--help"], env).status, 0);
+  const before = nodeRoots(f).map((root) => [root, lifetime(root)]);
+  const result = runSh(f, ["--help"], env);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /capacity exhausted: maximum 5/);
+  assert.deepEqual(nodeRoots(f).map((root) => [root, lifetime(root)]), before);
+  assert.equal(recordedPhases(f).filter((p) => p === "curl").length, 5);
+  f.markAssertionsPassed();
+});
+
+test(".sh malformed, legacy, replaced, hardlinked and excluded roots all count and remain untouched", { skip: isWindows }, (t) => {
+  const f = makeEntrypointFixture(".node-cap-unsafe-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const cache = join(f.agentDir, ".pi-review-gate", "node");
+  const names = ["bootstrap.malformed", "bootstrap.legacy", "bootstrap.replaced", "bootstrap.hardlink", "bootstrap.excluded"];
+  for (const name of names) mkdirSync(join(cache, name), { recursive: true });
+  writeFileSync(join(cache, names[0]!, ".node-lifetime"), "malformed");
+  syntheticLifetime(join(cache, names[2]!), "inactive");
+  const originalRecord = lifetime(join(cache, names[2]!));
+  writeFileSync(join(cache, names[2]!, ".node-lifetime"), originalRecord.replace(/\n\d+:\d+\n/, "\n0:0\n"));
+  const sentinel = join(f.root, "outside");
+  writeFileSync(sentinel, "hardlinked outside");
+  syntheticLifetime(join(cache, names[3]!), "inactive");
+  linkSync(sentinel, join(cache, names[3]!, "hardlink"));
+  syntheticLifetime(join(cache, names[4]!), "inactive");
+  mkdirSync(join(cache, names[4]!, ".terraform"));
+  writeFileSync(join(cache, names[4]!, ".terraform", "sentinel"), "excluded");
+  const result = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /capacity exhausted/);
+  assert.deepEqual(readdirSync(cache), names.sort());
+  assert.equal(readFileSync(sentinel, "utf8"), "hardlinked outside");
+  assert.equal(lifetime(join(cache, "bootstrap.malformed")), "malformed");
+  // The test deliberately never enters or removes the excluded subtree during
+  // fixture teardown either; it remains in the ignored synthetic fixture.
+  f.markAssertionsPassed();
+});
+
+test(".sh CJS quiescence remains protected until the exact foreground process exits", { skip: isWindows, timeout: 30_000 }, async (t) => {
+  const f = makeEntrypointFixture(".node-cap-quiescent-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const child = spawn("/bin/bash", [shPath, "--help"], {
+    env: entrypointEnv(f, { PI_CODING_AGENT_DIR: f.agentDir, FAKE_BOOTSTRAP_HOLD: "1" }),
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const closed = new Promise<number | null>((accept, reject) => { child.once("error", reject); child.once("close", accept); });
+  t.after(async () => { if (!child.stdin.writableEnded) child.stdin.end("exit\n"); await closed; });
+  await new Promise<void>((accept, reject) => {
+    const timer = setTimeout(() => reject(new Error("no quiescence witness")), 15_000);
+    child.stdout.on("data", (bytes: Buffer) => { if (bytes.toString().includes("QUIESCENT")) { clearTimeout(timer); accept(); } });
+    child.once("close", () => { clearTimeout(timer); reject(new Error("process closed before witness")); });
+  });
+  const first = nodeRoots(f)[0]!;
+  assert.match(lifetime(first), /\nquiescent\n$/);
+  for (let i = 0; i < 4; i++) assert.equal(runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir }).status, 0);
+  const refused = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir });
+  assert.equal(refused.status, 1, refused.stderr);
+  assert.match(lifetime(first), /\nquiescent\n$/);
+  child.stdin.end("exit\n");
+  assert.equal(await closed, 0);
+  assert.match(lifetime(first), /\ninactive\n$/);
+  const next = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir });
+  assert.equal(next.status, 0, next.stderr);
+  assert.equal(nodeRoots(f).length, 5);
+  assert.equal(existsSync(first), false);
+  f.markAssertionsPassed();
+});
+
+for (const signal of ["SIGTERM", "SIGHUP", "SIGINT"] as const) {
+  for (const settled of [true, false]) {
+    test(`.sh forwards wrapper-PID-only ${signal} and waits for exact child exit (${settled ? "settled" : "uncertain"})`, { skip: isWindows, timeout: 30_000 }, async (t) => {
+      const f = makeEntrypointFixture(".node-supervisor-signal-");
+      cleanupFixture(t, f);
+      writeBootstrapTools(f);
+      const script = join(f.root, "signal-child.cjs");
+      writeFileSync(script, [
+        "const publish = require(process.env.FAKE_NODE_LIFETIME_MODULE).consume(process.env);",
+        "const report = value => process.stdout.write(JSON.stringify(value) + '\\n');",
+        "let received;",
+        "for (const signal of ['SIGTERM','SIGHUP','SIGINT']) process.on(signal, () => { received = signal; report({state:'received', signal}); });",
+        "process.stdin.setEncoding('utf8');",
+        "process.stdin.on('data', data => {",
+        "  if (data.includes('ping')) report({state:'still-running'});",
+        `  if (data.includes('finish')) { if (received && ${settled}) { if (!publish()) process.exit(91); } report({state:'finished'}); process.exit(23); }`,
+        "});",
+        "report({state:'ready', pid:process.pid, args:process.argv.slice(2)});",
+      ].join("\n"));
+      const args = ["--", "signal argv π", 'quoted "argument"'];
+      const wrapper = spawn("/bin/bash", [shPath, ...args], {
+        env: entrypointEnv(f, { PI_CODING_AGENT_DIR: f.agentDir, FAKE_BOOTSTRAP_SIGNAL_CHILD: script }),
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      const closed = new Promise<number | null>((accept, reject) => { wrapper.once("error", reject); wrapper.once("close", accept); });
+      const lines = createInterface({ input: wrapper.stdout });
+      const rows = lines[Symbol.asyncIterator]();
+      const readReport = async (): Promise<{ state: string; signal?: string; pid?: number; args?: string[] }> => {
+        let deadline: NodeJS.Timeout | undefined;
+        try {
+          const row = await Promise.race([
+            rows.next(),
+            new Promise<never>((_accept, reject) => { deadline = setTimeout(() => reject(new Error("no child signal/settlement witness")), 10_000); }),
+          ]);
+          assert.equal(row.done, false, "child closed before the expected witness");
+          return JSON.parse(row.value!);
+        } finally { clearTimeout(deadline); }
+      };
+      t.after(async () => {
+        if (!wrapper.stdin.writableEnded) wrapper.stdin.end("finish\n");
+        await closed;
+        lines.close();
+      });
+      const ready = await readReport();
+      assert.equal(ready.state, "ready");
+      assert.deepEqual(ready.args, [cjsPath, ...args]);
+      assert.notEqual(ready.pid, wrapper.pid);
+      const group = (pid: number) => spawnSync("/bin/ps", ["-o", "pgid=", "-p", String(pid)], { encoding: "utf8" }).stdout.trim();
+      const wrapperGroup = group(wrapper.pid!);
+      assert.ok(wrapperGroup);
+      assert.equal(group(ready.pid!), wrapperGroup, "CJS retains the inherited terminal process group");
+      const root = nodeRoots(f)[0]!;
+      assert.match(lifetime(root), /\nprotected\n$/);
+      assert.equal(wrapper.kill(signal), true, "signal only the wrapper PID, NEVER its process group");
+      assert.deepEqual(await readReport(), { state: "received", signal });
+      wrapper.stdin.write("ping\n");
+      assert.equal((await readReport()).state, "still-running", "stdin remains inherited after the interrupted wait");
+      assert.equal(wrapper.exitCode, null, "the wrapper must not exit while the child is still settling");
+      assert.doesNotThrow(() => process.kill(wrapper.pid!, 0));
+      assert.match(lifetime(root), /\nprotected\n$/, "a signal/interrupted wait never releases lifetime protection");
+      wrapper.stdin.end("finish\n");
+      assert.equal((await readReport()).state, "finished");
+      assert.equal(await closed, 23, "return the child's eventual status, not the interrupted wait's signal status");
+      assert.equal(wrapper.signalCode, null);
+      assert.throws(() => process.kill(ready.pid!, 0), { code: "ESRCH" }, "the exact CJS process exited before the wrapper closed");
+      assert.match(lifetime(root), settled ? /\ninactive\n$/ : /\nprotected\n$/);
+      f.markAssertionsPassed();
+    });
+  }
+}
+
+test(".sh same-device mounted descendants are refused before traversal (synthetic native mount inventory)", { skip: isWindows }, (t) => {
+  const f = makeEntrypointFixture(".node-cap-mounted-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const cache = join(f.agentDir, ".pi-review-gate", "node");
+  const lines = ["fixture on / type fixture (rw)"];
+  for (let i = 0; i < 5; i++) {
+    const root = join(cache, `bootstrap.mounted-${i}`);
+    mkdirSync(join(root, "mounted"), { recursive: true });
+    syntheticLifetime(root, "inactive");
+    writeFileSync(join(root, "mounted", "sentinel"), "do not enter");
+    lines.push(`fixture on ${join(root, "mounted").replaceAll(" ", "\\040")} type fixture (rw,bind)`);
+  }
+  const table = join(f.root, "native-mount-inventory");
+  writeFileSync(table, lines.join("\n") + "\n");
+  const result = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir, FAKE_MOUNT_TABLE_FILE: table });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /capacity exhausted/);
+  for (const root of nodeRoots(f)) assert.equal(readFileSync(join(root, "mounted", "sentinel"), "utf8"), "do not enter");
+  assert.ok(!recordedPhases(f).includes("curl"));
+  f.markAssertionsPassed();
+});
+
+test(".sh a replaced cache parent cannot hide behind matching descendant identities", { skip: isWindows }, (t) => {
+  const f = makeEntrypointFixture(".node-cap-parent-replaced-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const sentinel = join(f.root, "outside-sentinel");
+  writeFileSync(sentinel, "outside");
+  const result = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir, FAKE_SWAP_CACHE_PARENT: "1" });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /workspace identity changed during download/);
+  assert.ok(!recordedPhases(f).includes("shasum"));
+  assert.equal(readFileSync(sentinel, "utf8"), "outside");
+  const displaced = join(f.agentDir, ".pi-review-gate.displaced", "node");
+  const root = join(displaced, readdirSync(displaced)[0]!);
+  assert.match(lifetime(root), /\nprotected\n$/, "uncertain parent replacement retains pin");
+  f.markAssertionsPassed();
+});
+
+test(".sh concurrent download/extraction producers reserve capacity before staging and never create a sixth", { skip: isWindows, timeout: 60_000 }, async (t) => {
+  const f = makeEntrypointFixture(".node-cap-concurrent-");
+  cleanupFixture(t, f);
+  writeBootstrapTools(f);
+  const env = { PI_CODING_AGENT_DIR: f.agentDir };
+  for (let i = 0; i < 4; i++) assert.equal(runSh(f, ["--help"], env).status, 0);
+  const child = spawn("/bin/bash", [shPath, "--help"], {
+    env: entrypointEnv(f, { ...env, FAKE_CURL_HOLD: "1" }),
+    stdio: ["pipe", "pipe", "pipe", "pipe"],
+  });
+  const closed = new Promise<number | null>((accept, reject) => { child.once("error", reject); child.once("close", accept); });
+  t.after(async () => { if (!child.stdin!.writableEnded) child.stdin!.end("release\n"); await closed; });
+  await new Promise<void>((accept, reject) => {
+    const timer = setTimeout(() => reject(new Error("no download witness")), 15_000);
+    child.stdio[3]!.on("data", (bytes: Buffer) => { if (bytes.toString().includes("DOWNLOAD_READY")) { clearTimeout(timer); accept(); } });
+    child.once("close", () => { clearTimeout(timer); reject(new Error("producer exited before download witness")); });
+  });
+  assert.equal(nodeRoots(f).length, 5);
+  const result = runSh(f, ["--help"], env);
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /capacity exhausted/);
+  assert.equal(nodeRoots(f).length, 5);
+  assert.equal(recordedPhases(f).filter((p) => p === "curl").length, 5);
+  child.stdin!.end("release\n");
+  assert.equal(await closed, 0);
+  assert.equal(nodeRoots(f).length, 5);
+  f.markAssertionsPassed();
+});
+
+test("native Windows fallback admission precedes setup and refuses a sixth artifact without compiler scratch or reclamation", { skip: !isWindows, timeout: 60_000 }, (t) => {
+  const f = makeEntrypointFixture(".node-cap-native-windows-");
+  cleanupFixture(t, f);
+  const helper = join(f.root, "bootstrap.ps1");
+  const downloads = join(f.root, "download-witness");
+  // Network is the only substituted operation. Native path/identity/admission,
+  // exclusive generation creation and lifetime publication execute unchanged.
+  const source = readFileSync(psPath, "utf8").replace("  Receive-OfficialArchive $url $archivePath", "  [IO.File]::AppendAllText($env:DOWNLOAD_WITNESS, 'download`n'); throw 'synthetic download failure'");
+  assert.notEqual(source, readFileSync(psPath, "utf8"));
+  writeFileSync(helper, source);
+  const powershell = join(process.env.SystemRoot!, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const env = { ...process.env, PATH: f.bin, PI_CODING_AGENT_DIR: f.agentDir, DOWNLOAD_WITNESS: downloads, TEMP: f.root, TMP: f.root };
+  for (let i = 0; i < 6; i++) {
+    const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "--help"], {
+      env: i === 0 ? { ...env, PI_CODING_AGENT_DIR: ".\\agent dir π" } : env,
+      cwd: f.root, encoding: "utf8", timeout: 10_000,
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.equal(nodeRoots(f).length, Math.min(i + 1, 5), result.stderr);
+    assert.equal(readFileSync(downloads, "utf8").split("download").length - 1, Math.min(i + 1, 5));
+  }
+  for (const root of nodeRoots(f)) {
+    assert.deepEqual(readdirSync(root), [".node-lifetime", "extracted"], "no compiler scratch; extraction stays inside the counted generation");
+    assert.match(lifetime(root), /^pi-review-gate-node-v1\n[0-9a-f]{16}:[0-9a-f]{32}\nbootstrap-[0-9a-f]{32}\nprotected\n$/);
+  }
+  const outside = join(f.root, "outside");
+  mkdirSync(outside);
+  writeFileSync(join(outside, "sentinel"), "outside");
+  symlinkSync(outside, join(nodeRoots(f)[0]!, "junction"), "junction");
+  const aliasAgent = join(f.root, "alias-agent");
+  mkdirSync(aliasAgent);
+  symlinkSync(outside, join(aliasAgent, ".pi-review-gate"), "junction");
+  const refused = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper], {
+    env: { ...env, PI_CODING_AGENT_DIR: aliasAgent }, encoding: "utf8", timeout: 10_000,
+  });
+  assert.equal(refused.status, 1);
+  assert.deepEqual(readdirSync(outside), ["sentinel"]);
+  assert.equal(readFileSync(join(outside, "sentinel"), "utf8"), "outside");
+  assert.equal(readFileSync(downloads, "utf8").split("download").length - 1, 5);
+  f.markAssertionsPassed();
+});
 
 test(".cmd delegates arguments to the PowerShell Node bootstrap after fail-closed capability isolation", async () => {
   const source = readFileSync(cmdPath, "utf8");

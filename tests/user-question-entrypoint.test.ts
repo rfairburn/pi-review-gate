@@ -315,13 +315,10 @@ test("resolving every pending question removes the panel", async () => {
     await handler({ ui: { custom }, sessionManager: fixture.sessionManager, isIdle: () => true });
     assert.ok(openedComponent, "the shortcut opens the question list over the persistent panel");
     assert.equal(customOptions?.overlay, true, "the question list uses the public custom overlay");
-    // #413: the overlay has zero margins so its public mouse hit rectangle can
-    // cover the whole viewport in fullscreen; the component keeps the frame's
-    // one-row vertical inset itself (regular mode: a shorter centered frame).
     assert.deepEqual(customOptions?.overlayOptions, {
-      width: "100%", anchor: "center", margin: { top: 0, right: 0, bottom: 0, left: 0 }, maxHeight: "100%",
-    }, "the public overlay fills the conversation viewport with no margins");
-    assert.equal(publicOverlayHeight(customOptions!.overlayOptions!, 40), 40);
+      width: "100%", anchor: "center", margin: { top: 1, right: 0, bottom: 1, left: 0 }, maxHeight: "100%",
+    }, "the public overlay fills the conversation width and keeps only vertical margins");
+    assert.equal(publicOverlayHeight(customOptions!.overlayOptions!, 40), 38);
     assert.equal(publicOverlayWidth(customOptions!.overlayOptions!, 80), 80,
       "the full-width public overlay leaves no exposed conversation columns at either side");
     const firstRows = openedComponent.render(80);
@@ -415,12 +412,10 @@ test("the shared custom overlay pages native Markdown within its responsive publ
     assert.ok(sharedList, "the existing shortcut opens the shared list in its custom overlay");
     assert.equal(options[0]?.overlay, true, "the shared question/notice factory opens as an overlay");
     assert.deepEqual(options[0]?.overlayOptions, {
-      width: "100%", anchor: "center", margin: { top: 0, right: 0, bottom: 0, left: 0 }, maxHeight: "100%",
+      width: "100%", anchor: "center", margin: { top: 1, right: 0, bottom: 1, left: 0 }, maxHeight: "100%",
     });
-    // Regular mode keeps the frame one row inside the top and bottom edges.
-    const framedRows = (rows: number): number => publicOverlayHeight(options[0]!.overlayOptions!, rows) - 2;
-    assert.ok(sharedList.render(terminalColumns).length <= framedRows(terminalRows),
-      "the component render fits the inset frame inside the maxHeight the public overlay compositor receives");
+    assert.ok(sharedList.render(terminalColumns).length <= publicOverlayHeight(options[0]!.overlayOptions!, terminalRows),
+      "the component render fits the same maxHeight the public overlay compositor receives");
     assert.equal(publicOverlayWidth(options[0]!.overlayOptions!, terminalColumns), terminalColumns);
     assert.ok(sharedList.render(terminalColumns).every((line: string) => terminalVisibleWidth(line) === terminalColumns),
       "every list row fills the conversation viewport sent to the public overlay");
@@ -443,20 +438,20 @@ test("the shared custom overlay pages native Markdown within its responsive publ
     const initialNoticeRows = noticeView.render(terminalColumns);
     assert.ok(markdownSources.includes(body), "the complete notice still uses native Markdown");
     assert.ok(markdownSources.includes(context), "the complete context still uses native Markdown");
-    assert.equal(initialNoticeRows.length, framedRows(terminalRows),
-      "the long notice viewport fills, but never exceeds, the inset frame inside the overlay's initial maxHeight");
+    assert.equal(initialNoticeRows.length, publicOverlayHeight(options[0]!.overlayOptions!, terminalRows),
+      "the long notice viewport fills, but never exceeds, the overlay's exact initial maxHeight");
     terminalRows = 7;
     terminalColumns = 55;
-    assert.equal(framedRows(terminalRows), 5,
-      "the percentage maxHeight resolves against the resized terminal, keeping the one-row inset");
+    assert.equal(publicOverlayHeight(options[0]!.overlayOptions!, terminalRows), 5,
+      "the percentage maxHeight resolves to the resized terminal's margin-bounded height");
     assert.equal(publicOverlayWidth(options[0]!.overlayOptions!, terminalColumns), terminalColumns,
       "the percentage width resolves again after horizontal resize");
     const resizedRows = noticeView.render(terminalColumns);
     assert.ok(resizedRows.every((line: string) => terminalVisibleWidth(line) === terminalColumns),
       "all notice rows fill the resized conversation viewport width");
     const resizedFrame = resizedRows.join("\n");
-    assert.equal(resizedFrame.split("\n").length, framedRows(terminalRows),
-      "resize keeps the manual viewport within the same inset public overlay maxHeight");
+    assert.equal(resizedFrame.split("\n").length, publicOverlayHeight(options[0]!.overlayOptions!, terminalRows),
+      "resize keeps the manual viewport within the same public overlay maxHeight");
     const scrollFrames: string[][] = [resizedRows];
     for (let index = 0; index < 100; index += 1) {
       noticeView.handleInput("\x1b[6~"); // PageDown advances one body row in the shared custom component.

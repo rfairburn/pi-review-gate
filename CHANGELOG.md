@@ -29,20 +29,11 @@ dates.
   the scroll position within the new bounds with the complete re-wrapped content
   reachable. Small popups first shorten the hint and then drop their blank padding
   rows; in three- or four-row terminals the frame rules give way too, so at least one
-  content row always stays visible and scrollable. The scroll shortcuts and their one-line
-  step, choice, free-text, Decline, notice-action, and Escape/review behavior are
-  unchanged.
-
-### Added
-
-- Fullscreen mode (#413): the mouse wheel scrolls the shared popup's content in both
-  directions, including while editing a free-text answer, without changing or submitting
-  the draft. Wheel input over any popup row, including at the bounds of its content,
-  no longer scrolls the transcript underneath. To cover every row, the fullscreen popup
-  fills the conversation viewport: the row above and below the unchanged frame, which
-  previously showed transcript edges, is now opaque surface. Other mouse input keeps
-  Pi's native behavior, and the wheel scrolls the transcript again once the popup
-  closes. Regular mode adds no mouse handling and keeps the frame's size and position.
+  content row always stays visible and scrollable. The popup keeps its content-sized
+  height and position with the conversation visible around it. Scrolling stays
+  keyboard-only: the popup adds no mouse handling, so mouse wheel behavior is Pi's and
+  the terminal's own. The scroll shortcuts and their one-line step, choice, free-text,
+  Decline, notice-action, and Escape/review behavior are unchanged.
 
 ## [0.1.0-dev.167]
 

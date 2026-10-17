@@ -67,14 +67,7 @@ export function pendingQuestionPanelLine(): string {
 }
 
 const QUESTION_LIST_DESCRIPTION = "Open the pending input list (answer questions, request notice details, or close notices)";
-/**
- * Rows kept between the framed popup and the conversation viewport's top and
- * bottom edges. The overlay itself has zero margins so its public mouse hit
- * rectangle can span the whole viewport in fullscreen mode; the component
- * keeps this inset (as opaque surface rows in fullscreen, or by rendering a
- * shorter centered frame in regular mode).
- */
-const QUESTION_POPUP_VERTICAL_INSET = 1;
+const QUESTION_POPUP_VERTICAL_MARGIN = 1;
 
 /** Platform label for the approved chord; Alt is Option on macOS. */
 export function questionShortcutLabel(): string {
@@ -424,11 +417,10 @@ async function openQuestionList(
   try {
     // The captured method keeps its original ui receiver: receiver-dependent
     // SDK methods and foreign forwarding wrappers rely on it. The shared
-    // question/notice surface is a public custom overlay. The public
-    // ScrollView layout node is not propagated through this overlay, so the
-    // component owns scrolling within the measured live-terminal budget, and
-    // in fullscreen it fills the overlay's full height so wheel input over
-    // any popup row reaches its public handleMouse instead of the transcript.
+    // question/notice surface is a public custom overlay. Its explicit
+    // maxHeight and margin are also the manual viewport's exact geometry;
+    // the public ScrollView layout node is not propagated through this
+    // overlay, so the component owns scrolling within that measured budget.
     customResult = await custom.call(ui, (tui: unknown, theme: unknown, keybindings: unknown, done: (result?: unknown) => void) => {
       const requestRender = requestRenderOf(tui);
       // The host captured its saved text before this factory ran; record it
@@ -446,7 +438,6 @@ async function openQuestionList(
         isStale: stale,
         requestRender,
         getViewportRows: () => questionPopupViewportRows(tui),
-        getSurfaceRows: () => questionPopupSurfaceRows(tui),
         onDone: (result) => {
           retire(); // Synchronous: the next, separate Escape cancels normally.
           done(result);
@@ -510,28 +501,33 @@ function requestRenderOf(tui: unknown): (() => void) | undefined {
 }
 
 /**
- * Public overlay options fill the active conversation viewport with no
- * margins. pi-tui resolves the percentage width and maxHeight against current
- * dimensions on every layout pass; the component reads the matching live row
- * budget, keeps its framed popup one row inside the top and bottom edges, and
- * emits full-width opaque rows. A parent Main sidebar is outside this child
- * conversation viewport.
+ * Public overlay options fill the active conversation viewport horizontally
+ * while preserving one row of vertical margin. pi-tui resolves the percentage
+ * width and maxHeight against current dimensions on every layout pass; the
+ * component reads the matching live row budget and emits full-width opaque
+ * rows. A parent Main sidebar is outside this child conversation viewport.
  */
 function questionPopupOverlayOptions(): {
   width: "100%";
   anchor: "center";
-  margin: { top: 0; right: 0; bottom: 0; left: 0 };
+  margin: { top: number; right: 0; bottom: number; left: 0 };
   maxHeight: "100%";
 } {
   return {
     width: "100%",
     anchor: "center",
-    margin: { top: 0, right: 0, bottom: 0, left: 0 },
+    margin: {
+      top: QUESTION_POPUP_VERTICAL_MARGIN,
+      right: 0,
+      bottom: QUESTION_POPUP_VERTICAL_MARGIN,
+      left: 0,
+    },
     maxHeight: "100%",
   };
 }
 
-function terminalRowsOf(tui: unknown): number | undefined {
+/** Exact row budget after the public overlay resolver applies its margins. */
+function questionPopupViewportRows(tui: unknown): number {
   let rows: unknown;
   try {
     const terminal = isRecord(tui) ? tui.terminal : undefined;
@@ -539,31 +535,10 @@ function terminalRowsOf(tui: unknown): number | undefined {
   } catch {
     rows = undefined;
   }
-  return typeof rows === "number" && Number.isFinite(rows) ? Math.floor(rows) : undefined;
-}
-
-/** Framed popup row budget: the live terminal height minus the vertical inset. */
-function questionPopupViewportRows(tui: unknown): number {
-  const rows = terminalRowsOf(tui);
-  return rows === undefined ? 1 : Math.max(1, rows - QUESTION_POPUP_VERTICAL_INSET * 2);
-}
-
-/**
- * Full overlay height in fullscreen (alternate-screen) mode, where the host
- * routes normalized mouse events to the overlay under the pointer; undefined
- * in regular mode, which leaves the mouse and scrollback to the terminal.
- * Read live so a renderer switch is honored on the next render.
- */
-function questionPopupSurfaceRows(tui: unknown): number | undefined {
-  let mode: unknown;
-  try {
-    mode = isRecord(tui) ? tui.mode : undefined;
-  } catch {
-    mode = undefined;
-  }
-  if (mode !== "fullscreen") return undefined;
-  const rows = terminalRowsOf(tui);
-  return rows === undefined || rows < 1 ? undefined : rows;
+  const maxHeight = typeof rows === "number" && Number.isFinite(rows)
+    ? Math.max(1, Math.floor(rows) - QUESTION_POPUP_VERTICAL_MARGIN * 2)
+    : 1;
+  return maxHeight;
 }
 
 function noticeDetailsResult(value: unknown): { noticeId: string; expectedNotice: PendingNotice } | undefined {

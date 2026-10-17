@@ -24,7 +24,8 @@
  *   delivery; the controller consumes it before sending. Close removes only
  *   it. Full-width top and bottom rules and theme-background-filled
  *   one-cell side padding frame every shared-content row, with no side
- *   borders; the live terminal row budget defines the responsive viewport.
+ *   borders; the overlay's public maxHeight and vertical margins define the
+ *   responsive viewport inside it.
  *
  * Shared viewport (issue #413): one authoritative scroll offset per open
  * mode. All body content — question/notice text, context, choices, Type,
@@ -35,12 +36,11 @@
  * only the body). Opening a
  * question or notice starts at its beginning; Up/Down (even at a bound) and
  * editing input bring the selected row or native cursor into view; keyboard
- * paging and the fullscreen wheel move only the offset. Resize clamps the
- * offset to the new bounds and re-reveals only the list selection or an
- * active editing cursor. In fullscreen mode the frame is centered inside
- * full-height opaque rows so wheel input anywhere over the overlay reaches
- * handleMouse, which always reports wheel events handled and leaves every
- * other mouse event to the host.
+ * paging moves only the offset. Resize clamps the offset to the new bounds
+ * and re-reveals only the list selection or an active editing cursor. The
+ * popup keeps its content-sized height up to the overlay's row budget; it
+ * adds no mouse handling, so Pi and the terminal keep their native mouse and
+ * wheel behavior.
  *
  * Navigation, confirm, cancel, cursor movement, and deletion resolve through
  * the host's live KeybindingsManager (`tui.select.*`, `tui.editor.*`), so
@@ -119,38 +119,18 @@ export interface QuestionListComponentOptions {
    */
   isStale?: () => boolean;
   /**
-   * Row budget for the framed popup (its top/bottom rules, padding, scrolled
-   * body, and fixed hint area) inside the overlay.
+   * Row budget matching the custom overlay's public maxHeight: the framed
+   * popup's rules, padding, scrolled body, and fixed hint area.
    */
   getViewportRows?: () => number | undefined;
-  /**
-   * Full overlay height when the host is in fullscreen (alternate-screen)
-   * mode, else undefined. When set, the framed popup is centered inside this
-   * many opaque rows so the overlay's public mouse hit surface covers the
-   * whole conversation viewport and wheel input never reaches the transcript.
-   */
-  getSurfaceRows?: () => number | undefined;
   /** Invalidate the live TUI after component/controller state changes. */
   requestRender?: () => void;
   onDone: (result: QuestionListDone) => void;
 }
 
-/** Structural subset of pi-tui's normalized TuiMouseEvent. */
-export interface QuestionMouseEvent {
-  type: string;
-  /** Logical lines; negative values scroll up (already wheel-accelerated by the host). */
-  wheelDelta?: number;
-}
-
 export interface QuestionListComponent {
   render(width: number): string[];
   handleInput(data: string): void;
-  /**
-   * Public fullscreen mouse seam: wheel events scroll the shared viewport and
-   * are always handled (including at its bounds); other mouse events are left
-   * to the host's native behavior.
-   */
-  handleMouse(event: QuestionMouseEvent): { handled: true } | undefined;
   invalidate(): void;
   /** Installs the live idle probe used for async answer delivery. */
   setSourceProbe(probe: { isIdle?: () => boolean } | undefined): void;
@@ -194,8 +174,8 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   let noticeActionIndex = 0;
   // The single authoritative viewport: the first visible body line, the
   // current mode's selected row (or native cursor) range, and whether the next
-  // layout should bring that range into view. Keyboard paging and the wheel
-  // move only the offset; selection/editing input requests a reveal.
+  // layout should bring that range into view. Keyboard paging moves only the
+  // offset; selection/editing input requests a reveal.
   let scrollOffset = 0;
   let viewportFocus: ViewportFocus | undefined;
   let focusPending = true;
@@ -204,7 +184,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   let lastMaxScrollOffset: number | undefined;
   let editing = false;
   let closed = false;
-  let cachedContent: { width: number; fullscreen: boolean; content: PopupContent } | undefined;
+  let cachedContent: { width: number; content: PopupContent } | undefined;
   const markdownComponents = new Map<string, QuestionMarkdownComponent | null>();
   // The shortcut handler installs a live idle probe before the component is
   // shown; if the session rebinds while open, the stale fence closes this UI
@@ -538,8 +518,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     // through the live KeybindingsManager, exactly as in the main chat.
     field.focused = true;
     field.handleInput(data);
-    // The next editing input restores the cursor's visibility even after a
-    // wheel scroll moved the viewport away from it.
+    // Editing input keeps the native cursor row in view.
     if (editing && mode === "answer") focusPending = true;
     invalidate();
   }
@@ -597,26 +576,6 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     else handleNoticeInput(data);
   };
 
-  /**
-   * Fullscreen wheel input moves the same authoritative viewport as keyboard
-   * paging — in every mode, including while the native field is editing,
-   * without touching its draft. A wheel event is always reported handled,
-   * even at a bound, so the host never falls back to scrolling the
-   * transcript underneath. Every other mouse event stays with the host.
-   */
-  const handleMouse = (event: QuestionMouseEvent): { handled: true } | undefined => {
-    if (closed || !isRecordLike(event) || event.type !== "wheel") return undefined;
-    if (isStale()) {
-      close(); // A rebound session's UI never scrolls; it only closes.
-      return { handled: true };
-    }
-    const delta = typeof event.wheelDelta === "number" && Number.isFinite(event.wheelDelta)
-      ? Math.trunc(event.wheelDelta)
-      : 0;
-    if (delta !== 0) scrollViewportBy(delta);
-    return { handled: true };
-  };
-
   /** Move the viewport by whole lines within the last laid-out bounds. */
   function scrollViewportBy(amount: number): void {
     const maximum = lastMaxScrollOffset ?? Number.POSITIVE_INFINITY;
@@ -627,7 +586,6 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   }
 
   const renderContent = (width: number): PopupContent => {
-    const fullscreen = isFullscreen();
     if (lastRenderedWidth !== undefined && lastRenderedWidth !== width && (mode === "list" || editing)) {
       focusPending = true;
     }
@@ -642,11 +600,11 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       return { lines: [theme.fg("dim", "Session changed; question list closed.")] };
     }
     if (closed) return { lines: [] }; // A closed component never renders live controller state.
-    if (cachedContent?.width === width && cachedContent.fullscreen === fullscreen) return cachedContent.content;
+    if (cachedContent?.width === width) return cachedContent.content;
     const raw = mode === "list"
       ? renderList(width)
       : mode === "answer"
-        ? renderAnswer(width, fullscreen)
+        ? renderAnswer(width)
         : renderNotice(width);
     const lineCounts: number[] = [];
     const lines = raw.lines.flatMap((line) => {
@@ -656,7 +614,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     });
     if (lineCounts.some((count) => count !== 1)) viewportFocus = remapViewportFocus(viewportFocus, lineCounts);
     const content = { lines, hint: raw.hint, compactHint: raw.compactHint };
-    cachedContent = { width, fullscreen, content };
+    cachedContent = { width, content };
     return content;
   };
 
@@ -768,37 +726,6 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     return [theme.fg("dim", truncatePlain(compactHint, width))];
   }
 
-  /**
-   * Fullscreen only: center the framed popup inside opaque full-height rows so
-   * the overlay's public hit rectangle spans the entire conversation viewport.
-   * The frame keeps the same inner geometry and screen position it had with
-   * one-row overlay margins; those outer rows are now opaque surface instead
-   * of exposed transcript edges. Regular mode renders the frame unchanged.
-   */
-  function fillSurface(frame: string[], width: number): string[] {
-    const surfaceRows = surfaceRowCount();
-    if (surfaceRows === undefined || frame.length === 0) return frame;
-    if (frame.length >= surfaceRows) return frame.slice(0, surfaceRows);
-    const blank = opaquePopupLine(" ".repeat(Math.max(1, Math.floor(width))));
-    const top = Math.floor((surfaceRows - frame.length) / 2);
-    const bottom = surfaceRows - top - frame.length;
-    return [...Array.from({ length: top }, () => blank), ...frame, ...Array.from({ length: bottom }, () => blank)];
-  }
-
-  function surfaceRowCount(): number | undefined {
-    let rows: number | undefined;
-    try {
-      rows = options.getSurfaceRows?.();
-    } catch {
-      rows = undefined;
-    }
-    return typeof rows === "number" && Number.isFinite(rows) && rows >= 1 ? Math.floor(rows) : undefined;
-  }
-
-  function isFullscreen(): boolean {
-    return surfaceRowCount() !== undefined;
-  }
-
   const renderPopup = (width: number): string[] => {
     if (closed) return [];
     const height = options.getViewportRows ? viewportRows() : undefined;
@@ -807,7 +734,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     if (height === undefined) {
       // Unbounded (no row budget): the complete content and hint, framed.
       const hint = content.hint === undefined ? [] : ["", ...wrapNoticeLine(theme.fg("dim", content.hint), contentWidth)];
-      return fillSurface(framePopup([...content.lines, ...hint], width), width);
+      return framePopup([...content.lines, ...hint], width);
     }
     // Tiny budgets give up the blank vertical padding rows before the fixed
     // hint, and below three rows the rules too, so at least one content row
@@ -825,7 +752,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     }
     lastMaxScrollOffset = maximum;
     const body = content.lines.slice(scrollOffset, scrollOffset + bodyRows);
-    return fillSurface(framePopup([...body, ...hint], width, height, padded, ruled), width);
+    return framePopup([...body, ...hint], width, height, padded, ruled);
   };
 
   function offsetForFocus(
@@ -932,7 +859,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     return { lines, hint, compactHint: POPUP_SCROLL_HINT };
   }
 
-  function renderAnswer(width: number, fullscreen: boolean): PopupContent {
+  function renderAnswer(width: number): PopupContent {
     viewportFocus = undefined;
     const record = selectedId ? controller.get(selectedId) : undefined;
     if (!record) {
@@ -997,11 +924,9 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       }
     });
     // The native field owns every key while editing, so keyboard scrolling is
-    // advertised only after Esc; the fullscreen wheel keeps scrolling meanwhile.
+    // advertised only after Esc.
     const hint = editing
-      ? fullscreen
-        ? "Enter submit · Esc back to options for scroll keys · mouse wheel scrolls"
-        : "Enter submit · Esc back to options to scroll"
+      ? "Enter submit · Esc back to options to scroll"
       : `arrows select · Enter confirm · ${POPUP_SCROLL_HINT} · Esc back`;
     return { lines, hint, compactHint: editing ? "Enter submit · Esc back to options" : POPUP_SCROLL_HINT };
   }
@@ -1067,8 +992,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   /**
    * Keyboard scrolling keeps its existing one-line step, so successive views
    * overlap and no unseen line is skipped; the offset is bounded by the body
-   * viewport that remains after the rules, padding, and fixed hint area. The
-   * fullscreen wheel moves by the host's (accelerated) line delta instead.
+   * viewport that remains after the rules, padding, and fixed hint area.
    */
   function pageStep(): number {
     return 1;
@@ -1292,12 +1216,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   return {
     render: renderPopup,
     handleInput,
-    handleMouse,
     invalidate,
     setSourceProbe,
   };
-}
-
-function isRecordLike(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
 }

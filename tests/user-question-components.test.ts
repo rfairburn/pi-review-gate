@@ -295,7 +295,6 @@ interface Fixture {
 function makeFixture(options: {
   field?: boolean;
   getViewportRows?: () => number;
-  getSurfaceRows?: () => number | undefined;
   isStale?: () => boolean;
   keybindings?: ReturnType<typeof makeKeybindings>;
   theme?: QuestionUiTheme;
@@ -322,7 +321,6 @@ function makeFixture(options: {
     shortcutLabel: "Ctrl+Alt+Up",
     nativeField: field,
     getViewportRows: options.getViewportRows,
-    getSurfaceRows: options.getSurfaceRows,
     isStale: options.isStale,
     onDone: (result) => done.push(result),
   });
@@ -1075,7 +1073,7 @@ test("rendering is width-aware and degrades without host helpers", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Shared viewport: fixed hints, initial position, selection reveal, wheel (#413)
+// Shared viewport: fixed hints, initial position, selection reveal (#413)
 // ---------------------------------------------------------------------------
 
 const NOTICE_KEY_HINT = "arrows select · Enter choose · Shift+Alt+Up/Down or Ctrl+Alt+PageUp/PageDown scroll · Esc back";
@@ -1211,64 +1209,46 @@ test("notice actions are revealed by Up/Down and keep their semantics", () => {
   assert.equal(fixture.sent.length, 0, "Close sends nothing");
 });
 
-test("wheel input scrolls the shared viewport in both directions and is always handled", () => {
-  const rows = 12;
-  const fixture = makeFixture({ getViewportRows: () => rows });
+test("the popup is keyboard-only: it exposes no mouse handler, so Pi keeps native wheel behavior", () => {
+  const fixture = makeFixture({ getViewportRows: () => 12 });
   registerNotice(fixture, longNoticeBody(30));
-  assert.deepEqual(fixture.component.handleMouse({ type: "wheel", wheelDelta: 2 }), { handled: true },
-    "the list view also contains wheel input");
+  // pi-tui routes mouse events only to components with a handleMouse method;
+  // without one, wheel input keeps Pi's (and the terminal's) own behavior.
+  assert.equal("handleMouse" in fixture.component, false, "the shared popup registers no mouse handling");
   fixture.component.handleInput(ENTER);
-  const opening = fixture.component.render(60);
-  const bodyOf = (lines: readonly string[]) => splitFixedHint(frameInterior(lines), NOTICE_KEY_HINT, rows).body;
-
-  assert.deepEqual(fixture.component.handleMouse({ type: "wheel", wheelDelta: -3 }), { handled: true },
-    "wheel up at the beginning bound is still handled");
-  assert.deepEqual(fixture.component.render(60), opening, "the beginning bound does not move");
-  assert.deepEqual(fixture.component.handleMouse({ type: "wheel", wheelDelta: 3 }), { handled: true });
-  const moved = bodyOf(fixture.component.render(60));
-  assert.deepEqual(moved.slice(0, -3), bodyOf(opening).slice(3), "wheel down moves the body by exactly the reported lines");
-  for (let index = 0; index < 20; index += 1) fixture.component.handleMouse({ type: "wheel", wheelDelta: 5 });
-  const end = fixture.component.render(60);
-  assert.ok(end.some((line) => line.includes("Close")), "accelerated wheel input reaches the end");
-  assert.deepEqual(fixture.component.handleMouse({ type: "wheel", wheelDelta: 4 }), { handled: true },
-    "wheel down at the end bound is still handled");
-  assert.deepEqual(fixture.component.render(60), end, "the end bound does not move");
-  fixture.component.handleMouse({ type: "wheel", wheelDelta: -1 });
-  assert.notDeepEqual(fixture.component.render(60), end, "a single wheel line up leaves the end immediately");
-  fixture.component.handleMouse({ type: "wheel", wheelDelta: -500 });
-  assert.deepEqual(fixture.component.render(60), opening, "wheel up returns to the exact beginning");
-
-  for (const type of ["press", "release", "click", "drag", "move"]) {
-    assert.equal(fixture.component.handleMouse({ type }), undefined, `${type} events stay with the host`);
-  }
-  assert.deepEqual(fixture.component.handleMouse({ type: "wheel" }), { handled: true }, "a wheel event without a delta is still contained");
-  assert.deepEqual(fixture.component.render(60), opening, "a wheel event without a delta does not move the viewport");
-  assert.equal(fixture.sent.length, 0);
-  assert.equal(fixture.done.length, 0, "wheel input never closes or chooses an action");
+  const text = fixture.component.render(60).join("\n");
+  assert.doesNotMatch(text, /wheel|mouse/iu, "no view advertises mouse behavior");
 });
 
-test("wheel scrolling while editing keeps the native draft; the next editing input re-reveals the cursor", async () => {
-  const fixture = makeFixture({ getViewportRows: () => 12, getSurfaceRows: () => 14 });
+test("keyboard scrolling while editing stays with the native field; the next editing input re-reveals the cursor", async () => {
+  const fixture = makeFixture({ getViewportRows: () => 12 });
   register(fixture, Array.from({ length: 12 }, (_, index) => `Detail ${index + 1}.`).join("\n\n"), { choices: ["Canary"] });
   fixture.component.handleInput(ENTER);
   fixture.component.handleInput(DOWN); // Type something…
   fixture.component.handleInput(ENTER); // editing
   fixture.component.handleInput("draft");
   let frame = fixture.component.render(60);
-  assert.equal(frame.length, 14, "the fullscreen surface fills its full row count");
+  assert.ok(frame.length <= 12, "the editing popup stays within its bounded frame");
   assert.ok(frame.some((line) => line.includes("[field:draft]") && line.includes("\x1b_pi:c\x07")), "the cursor row is visible");
-  assert.ok(frame.join(" ").replace(/\s+/gu, " ").includes("Enter submit · Esc back to options for scroll keys · mouse wheel scrolls"),
-    "the fullscreen editing hint names the Esc exception and the working wheel");
+  assert.ok(frame.join(" ").replace(/\s+/gu, " ").includes("Enter submit · Esc back to options to scroll"),
+    "the editing hint names the Esc exception for the scroll keys");
 
-  assert.deepEqual(fixture.component.handleMouse({ type: "wheel", wheelDelta: -100 }), { handled: true });
+  // While editing, the popup scroll keys belong to the native field.
+  fixture.component.handleInput(SHIFT_ALT_UP);
   frame = fixture.component.render(60);
-  assert.ok(frame.some((line) => line.trim() === "q1:"), "the wheel scrolls back to the question while editing");
-  assert.ok(!frame.some((line) => line.includes("[field:")), "rendering does not snap back to the editing cursor");
-  fixture.component.render(60);
-  assert.ok(!fixture.component.render(60).some((line) => line.includes("[field:")), "the scrolled position is stable across renders");
-  assert.equal(fixture.field!.getText(), "draft", "wheel input never edits the draft");
-  assert.equal(fixture.sent.length, 0, "wheel input never submits");
+  assert.ok(fixture.field!.inputLog.includes(SHIFT_ALT_UP), "the scroll key reaches the native field while editing");
+  assert.ok(frame.some((line) => line.includes("[field:draft]")), "the viewport keeps the editing cursor in view");
 
+  // After Esc the scroll keys page the shared viewport without touching the draft.
+  fixture.component.handleInput(ESCAPE);
+  for (let page = 0; page < 100; page += 1) fixture.component.handleInput(SHIFT_ALT_UP);
+  frame = fixture.component.render(60);
+  assert.ok(frame.some((line) => line.trim() === "q1:"), "keyboard paging returns to the question beginning");
+  assert.ok(!frame.some((line) => line.includes("[field:")), "rendering does not snap back to the field");
+  assert.equal(fixture.field!.getText(), "draft", "paging never edits the draft");
+  assert.equal(fixture.sent.length, 0, "paging never submits");
+
+  fixture.component.handleInput(ENTER); // Type something… is still selected: edit again
   fixture.component.handleInput("!");
   frame = fixture.component.render(60);
   assert.ok(frame.some((line) => line.includes("[field:draft!]") && line.includes("\x1b_pi:c\x07")),
@@ -1287,7 +1267,7 @@ test("regular-mode editing hints explain that keyboard scrolling resumes after E
   fixture.component.handleInput(ENTER);
   const text = fixture.component.render(60).join("\n");
   assert.match(text, /Enter submit · Esc back to options to scroll/);
-  assert.doesNotMatch(text, /wheel/, "regular mode advertises no mouse behavior");
+  assert.doesNotMatch(text, /wheel|mouse/iu, "the popup advertises no mouse behavior");
 });
 
 test("resize keeps the authoritative offset within its new bounds and all wrapped content reachable", () => {
@@ -1299,9 +1279,9 @@ test("resize keeps the authoritative offset within its new bounds and all wrappe
   fixture.component.handleInput(ENTER);
   const bodyOf = (lines: readonly string[]) => splitFixedHint(frameInterior(lines), NOTICE_KEY_HINT, rows).body;
   const openingBody = bodyOf(fixture.component.render(width));
-  fixture.component.handleMouse({ type: "wheel", wheelDelta: 6 });
+  for (let step = 0; step < 6; step += 1) fixture.component.handleInput(SHIFT_ALT_DOWN);
   const scrolledFirst = bodyOf(fixture.component.render(width))[0];
-  assert.equal(scrolledFirst, openingBody[6], "the wheel moved six lines");
+  assert.equal(scrolledFirst, openingBody[6], "six keyboard steps moved six lines");
 
   rows = 11;
   assert.equal(bodyOf(fixture.component.render(width))[0], scrolledFirst, "a shorter viewport keeps the same offset");
@@ -1316,7 +1296,7 @@ test("resize keeps the authoritative offset within its new bounds and all wrappe
     const frame = fixture.component.render(width);
     for (const line of frame) assert.ok(line.length <= width, `every row fits the resized width: ${JSON.stringify(line)}`);
     for (const line of splitFixedHint(frameInterior(frame), NOTICE_KEY_HINT, rows).body) reached.add(line);
-    fixture.component.handleMouse({ type: "wheel", wheelDelta: 1 });
+    fixture.component.handleInput(SHIFT_ALT_DOWN);
   }
   const joined = [...reached].join(" ");
   for (let index = 1; index <= 60; index += 1) {
@@ -1335,7 +1315,6 @@ test("short content renders a compact popup with its hint and nothing to scroll"
   const parts = splitFixedHint(frameInterior(frame), NOTICE_KEY_HINT, rows);
   assert.equal(parts.hint.join(" ").replace(/\s+/gu, " "), NOTICE_KEY_HINT);
   assert.ok(parts.body.includes("One short row.") && parts.body.includes("  Close"));
-  assert.deepEqual(fixture.component.handleMouse({ type: "wheel", wheelDelta: 3 }), { handled: true });
   fixture.component.handleInput(SHIFT_ALT_DOWN);
   assert.deepEqual(fixture.component.render(60), frame, "nothing moves when everything fits");
 });
@@ -1399,8 +1378,8 @@ test("one- and two-row budgets drop the rules so retained content stays visible 
     }
     for (let row = 1; row <= 6; row += 1) assert.ok(reached.has(`Body row 0${row}`), `${rows}-row budget reaches body row ${row}`);
     assert.ok(reached.has("CONTEXT-END") && reached.has("  Close"), `${rows}-row budget reaches the context and actions`);
-    fixture.component.handleMouse({ type: "wheel", wheelDelta: -100 });
-    assert.equal(contentRow(), "n1: Scroll regression notice", "the wheel returns a tiny popup to its beginning");
+    for (let page = 0; page < 100; page += 1) fixture.component.handleInput(SHIFT_ALT_UP);
+    assert.equal(contentRow(), "n1: Scroll regression notice", "keyboard paging returns a tiny popup to its beginning");
     fixture.component.handleInput(DOWN); // select Close
     assert.equal(contentRow(), "> Close", "selection still reveals the chosen action in a one-row body");
   }
@@ -1415,49 +1394,48 @@ test("one- and two-row budgets drop the rules so retained content stays visible 
   assert.match(frame[0]!, /\[field:draft\]/, "the active editor's cursor row remains visible in a one-row budget");
 });
 
-test("the fullscreen surface keeps the regular frame and its position inside full-height opaque rows", () => {
-  const surfaceBg = "\x1b[48;5;236m";
-  const theme: QuestionUiTheme = {
-    fg: (_color, text) => text,
-    bold: (text) => text,
-    bg: (_color, text) => `${surfaceBg}${text}\x1b[49m`,
+test("short popups keep their natural content height; long content grows only to the viewport cap", () => {
+  const rows = 38; // A 40-row terminal minus the overlay's one-row top and bottom margins.
+  const height = (setup: (fixture: Fixture) => void): number => {
+    const fixture = makeFixture({ getViewportRows: () => rows });
+    setup(fixture);
+    return fixture.component.render(160).length;
   };
-  for (const terminalRows of [24, 9]) {
-    const regular = makeFixture({ theme, getViewportRows: () => terminalRows - 2 });
-    const fullscreen = makeFixture({ theme, getViewportRows: () => terminalRows - 2, getSurfaceRows: () => terminalRows });
-    for (const fixture of [regular, fullscreen]) {
-      registerNotice(fixture, terminalRows > 10 ? "Short body." : longNoticeBody(12));
-      fixture.component.handleInput(ENTER);
-    }
-    const frame = regular.component.render(50);
-    const surface = fullscreen.component.render(50);
-    assert.equal(surface.length, terminalRows, "the fullscreen surface spans every terminal row");
-    // A margin-free centered overlay of this frame starts where the old
-    // one-row-margin overlay did: 1 + floor((rows - 2 - h) / 2).
-    const top = 1 + Math.floor((terminalRows - 2 - frame.length) / 2);
-    assert.equal(Math.floor((terminalRows - frame.length) / 2), top);
-    assert.deepEqual(surface.slice(top, top + frame.length), frame, "the framed popup is unchanged inside the surface");
-    for (const [index, row] of surface.entries()) {
-      assert.ok(row.startsWith(surfaceBg), `surface row ${index} is opaque`);
-      assert.equal(row.replace(/\x1b\[[0-9;]*m/gu, "").length, 50, `surface row ${index} fills the width`);
-    }
-    for (const row of [...surface.slice(0, top), ...surface.slice(top + frame.length)]) {
-      assert.equal(row.replace(/\x1b\[[0-9;]*m/gu, "").trim(), "", "outer rows are blank opaque fill");
-    }
-  }
+  // Pre-#413 natural layout: two rules, two blank padding rows, the content
+  // lines, one blank separator, and the hint (one row at this wide width).
+  const natural = (contentLines: number): number => 2 + 2 + contentLines + 1 + 1;
+  // List: "Pending input (n)", a blank row, then one row per entry.
+  assert.equal(height((fixture) => register(fixture, "One?")), natural(2 + 1), "a one-item list is sized to its entry");
+  assert.equal(height((fixture) => { register(fixture, "One?"); register(fixture, "Two?"); }), natural(2 + 2),
+    "a two-item list grows by exactly one row");
+  // This fixture host has no native Markdown, so question and notice views
+  // add the visible plain-text disclosure line and its blank separator.
+  // A short question: "q1:", the disclosure and a blank row, its text, a
+  // blank row, Type something…, and Decline.
+  assert.equal(height((fixture) => { register(fixture, "Short question?"); fixture.component.handleInput(ENTER); }),
+    natural(7), "a short question uses only its natural rows");
+  // A notice: its title and a blank row, the disclosure and a blank row, its
+  // body rows, a blank row, More details, and Close.
+  const noticeLines = (bodyRows: number): number => 2 + 2 + bodyRows + 1 + 2;
+  assert.equal(height((fixture) => { registerNotice(fixture, "One short row."); fixture.component.handleInput(ENTER); }),
+    natural(noticeLines(1)), "a short notice uses only its natural rows");
+  const sizes = [4, 12, 24, 60].map((bodyRows) => height((fixture) => {
+    registerNotice(fixture, longNoticeBody(bodyRows));
+    fixture.component.handleInput(ENTER);
+  }));
+  assert.deepEqual(sizes.slice(0, 3), [natural(noticeLines(4)), natural(noticeLines(12)), natural(noticeLines(24))],
+    "growing content grows the popup row for row");
+  assert.equal(sizes[3], rows, "long content is capped at the overlay's row budget, never the full terminal");
 });
 
-test("stale or closed popups never route wheel input", () => {
+test("stale popups close on scroll input instead of scrolling", () => {
   let stale = false;
   const fixture = makeFixture({ getViewportRows: () => 10, isStale: () => stale });
   registerNotice(fixture, longNoticeBody(20));
   fixture.component.handleInput(ENTER);
   stale = true;
-  assert.deepEqual(fixture.component.handleMouse({ type: "wheel", wheelDelta: 3 }), { handled: true },
-    "a rebound session's popup contains the wheel event while it closes");
+  fixture.component.handleInput(SHIFT_ALT_DOWN);
   assert.deepEqual(fixture.done, [{ kind: "closed" }], "the stale popup closes without acting");
-  assert.equal(fixture.component.handleMouse({ type: "wheel", wheelDelta: 3 }), undefined,
-    "a closed popup no longer owns wheel input");
   assert.deepEqual(fixture.component.render(60), []);
   assert.equal(fixture.sent.length, 0);
 });

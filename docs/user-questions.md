@@ -116,19 +116,15 @@ within the content's start and end.
   shorten the hint to its scroll keys and then drop the blank padding rows
   inside the frame; in a terminal only three or four rows tall the frame's top
   and bottom rules give way too, and when only a single content row fits, that
-  row shows content rather than the hint. Short content uses a compact popup with nothing to
-  scroll.
-- **Fullscreen mode only** (Pi's alternate-screen TUI, which reports the mouse to
-  Pi): the mouse wheel scrolls the popup content in both directions, including
-  while you edit a free-text answer. Wheel scrolling never changes, submits, or
-  selects anything. Wheel input anywhere over the popup — including at the start
-  or end of its content — never scrolls the transcript underneath. To cover every
-  row, the fullscreen popup fills the whole conversation viewport: the row above
-  and below its frame, which previously showed the edge of the transcript, is now
-  opaque surface. Other mouse input such as text selection keeps Pi's native
-  behavior. After the popup closes, the wheel scrolls the transcript normally.
-- **Regular mode** adds no mouse handling: the terminal keeps owning the wheel
-  and its scrollback, and the popup frame keeps its size and position.
+  row shows content rather than the hint.
+- The popup is sized to its content: a short list, question, or notice uses
+  only the rows it needs, with nothing to scroll, and longer content grows up
+  to one row inside the top and bottom of the conversation viewport; any
+  further content scrolls within that cap. The conversation stays visible
+  around the popup.
+- Scrolling the popup is keyboard-only. The popup adds no mouse handling, so
+  the mouse wheel keeps Pi's and the terminal's native behavior and does not
+  scroll the popup content.
 
 Press **Escape** to return to the shared list; returning does not dismiss a
 notice. The only notice actions are **More details** and

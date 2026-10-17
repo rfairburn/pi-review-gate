@@ -25,9 +25,9 @@
  * authorized full, width-wrapped plain-text fallback (no custom Markdown
  * parser). The shared question/notice component is a public overlay, whose
  * compositor clips lines to `maxHeight` but does not lay out a ScrollView.
- * The component therefore owns the single manual viewport (scroll offset,
- * fixed keyboard-hint area, and fullscreen wheel handling) within a row
- * budget recalculated from the live terminal on every render. The
+ * The component therefore owns the single manual viewport (scroll offset and
+ * fixed keyboard-hint area) within a row budget that matches the overlay's
+ * explicit maxHeight and margins, recalculated on every render. The
  * free-text answer row embeds the host-wired native
  * editor acquired through the shared bridge (src/native-editor-bridge.ts);
  * this loader no longer exposes a standalone Editor for it — without the

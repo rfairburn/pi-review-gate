@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.169]
+## [0.1.0-dev.170]
 
 ### Fixed
 
@@ -52,6 +52,23 @@ dates.
   rather than kept as loaded, and direct calls now require Pi's actual active set
   (nested codemode/deferred callability is unchanged). Pi's policy and `/mcp` exposure
   are unchanged.
+
+## [0.1.0-dev.169]
+
+### Added
+
+- Shared pending-input popup (#431): in Pi fullscreen mode, a left-button press
+  highlights a visible menu entry and a completed single click invokes its existing
+  Enter action, including submitting a suggested question answer. Pending-item rows,
+  free-text entry and Decline rows, and notice More details/Close actions use the same
+  shared interaction. Hit testing follows the drawn layout, including wrapped rows, the
+  current keyboard scroll position, the fixed keyboard hint area, small and resized
+  popups; non-item content and the hint never activate a neighboring or hidden action,
+  and a press never scrolls the popup. Popup clicks stay with the foreground popup, and
+  normal native routing resumes on close. Scrolling remains keyboard-only and the mouse
+  wheel keeps its native behavior. Keyboard controls, action meanings,
+  originating-session delivery, content, and tool schemas are unchanged; regular mode
+  remains terminal-owned.
 
 ## [0.1.0-dev.168]
 

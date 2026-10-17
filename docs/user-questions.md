@@ -84,7 +84,11 @@ exposing the public `Theme.bg` formatter, every popup row, including the separat
 lines and blank padding cells, uses the theme's opaque surface background across
 the whole conversation viewport width. Mouse selection and copying follow the
 terminal's and Pi's existing native behavior; the popup adds no selection
-scoping or automatic clipboard copy of its own.
+scoping or automatic clipboard copy of its own. In Pi's fullscreen mode, a
+mouse press or drag that starts inside the open popup belongs to the popup's
+item clicks, so it does not start a conversation text selection; selections
+starting outside the popup, and all mouse handling in regular mode, are
+unchanged.
 A parent Main sidebar is outside the child conversation viewport and is not
 covered by this overlay. The complete notice body
 and optional context appear before its **More details** and **Close** actions. If native Markdown or
@@ -122,9 +126,11 @@ within the content's start and end.
   to one row inside the top and bottom of the conversation viewport; any
   further content scrolls within that cap. The conversation stays visible
   around the popup.
-- Scrolling the popup is keyboard-only. The popup adds no mouse handling, so
-  the mouse wheel keeps Pi's and the terminal's native behavior and does not
-  scroll the popup content.
+- Scrolling the popup is keyboard-only. The popup does not handle the mouse
+  wheel, so the wheel keeps Pi's and the terminal's native behavior and does
+  not scroll the popup content. In fullscreen mode the popup does accept
+  single left clicks on its visible menu entries (see below); clicks use the
+  current scroll position, and the fixed hint area is not clickable.
 
 Press **Escape** to return to the shared list; returning does not dismiss a
 notice. The only notice actions are **More details** and
@@ -239,6 +245,21 @@ q1: Which database should the migration target? [waiting]
 arrows select · Enter confirm · Esc back
 ```
 
+- In Pi's **fullscreen mode**, visible shared-popup menu entries also accept a
+  **single left click**: pressing highlights the item, and completing the click
+  invokes the same action as Enter. This applies to pending question/notice rows,
+  suggested choices, **Type something…**, **Decline**, **More details**, and
+  **Close**. Clicking a suggested choice sends that answer immediately; clicking
+  **Decline** declines without a second confirmation. No double click is required.
+  Wrapped item text targets the same item; borders, padding, blank space, headings,
+  and content that is not a menu entry do not activate an item. Mouse interaction
+  uses the visible layout after scrolling or resizing and does not pass the click
+  through to the conversation underneath. After the popup closes, normal native
+  mouse routing resumes. In regular mode the terminal retains mouse ownership;
+  use the existing keyboard controls. While the free-form editor is active,
+  clicking its box never submits the draft; still-visible choice and Decline
+  rows remain clickable. Clicking one leaves editing and invokes that menu
+  action. Merely leaving editing without resolving the question keeps the draft.
 - Selecting a choice or submitting typed text delivers your answer.
 - The free-text row uses one Pi-native text field inside the shared
   question/notice overlay; it does not duplicate the editor underneath. Its
@@ -265,8 +286,8 @@ arrows select · Enter confirm · Esc back
   never cancels or closes the list; **Ctrl+D** on an empty field returns to
   the choice rows instead of exiting Pi.
 - **Decline** is one deliberate action: select the Decline row and press
-  Enter. There is no second confirmation, but Escape only goes back — it
-  never declines.
+  Enter, or complete a single left click on it in fullscreen mode. There is no
+  second confirmation, but Escape only goes back — it never declines.
 - While the shared question/notice overlay has foreground input focus,
   Escape performs only its existing close, back, or native completion-dismiss
   action. It does not abort Pi or cancel an automatic or command-driven review

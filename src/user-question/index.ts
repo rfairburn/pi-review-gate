@@ -438,6 +438,7 @@ async function openQuestionList(
         isStale: stale,
         requestRender,
         getViewportRows: () => questionPopupViewportRows(tui),
+        getTerminalSize: () => questionPopupTerminalSize(tui),
         onDone: (result) => {
           retire(); // Synchronous: the next, separate Escape cancels normally.
           done(result);
@@ -539,6 +540,18 @@ function questionPopupViewportRows(tui: unknown): number {
     ? Math.max(1, Math.floor(rows) - QUESTION_POPUP_VERTICAL_MARGIN * 2)
     : 1;
   return maxHeight;
+}
+
+/** Live terminal dimensions; a resize changes them before the host redraws. */
+function questionPopupTerminalSize(tui: unknown): { columns: number; rows: number } | undefined {
+  try {
+    const terminal = isRecord(tui) ? tui.terminal : undefined;
+    const columns = isRecord(terminal) ? terminal.columns : undefined;
+    const rows = isRecord(terminal) ? terminal.rows : undefined;
+    return typeof columns === "number" && typeof rows === "number" ? { columns, rows } : undefined;
+  } catch {
+    return undefined; // An unreadable terminal: size unknown, so no click activates.
+  }
 }
 
 function noticeDetailsResult(value: unknown): { noticeId: string; expectedNotice: PendingNotice } | undefined {

@@ -264,7 +264,7 @@ export class ParentCheckpointLedger {
           if (advanced.status !== "ok") throw new Error(`Parent checkpoint advance refused: ${advanced.reason} ${advanced.detail ?? ""}`);
           descriptor = advanced.value;
         }
-        updates.set(old.descriptor, { kind: "checkpoint", descriptor, cwd: old.cwd, capturedAt: new Date().toISOString() });
+        updates.set(old.descriptor, { ...old, descriptor, capturedAt: new Date().toISOString() });
       }
       if (state.reviewWindow !== window || window.id !== reviewWindowId
         || window.baseline !== oldWindow || window.activeExchange?.baseline !== oldExchange) return;

@@ -8,7 +8,10 @@ import { activate } from "../src/index";
 import { normalizeConfig } from "../src/config";
 import { createWorkspaceSnapshot } from "../src/capture";
 import { runReview } from "../src/review";
-import { ReviewEvidenceCaptureFailure } from "../src/review-evidence";
+import { ReviewEvidenceCaptureFailure, TOOL_ONLY_HISTORY_NOTICE } from "../src/review-evidence";
+import { BackgroundExecutionController } from "../src/execution/background-controller";
+import { isActiveTaskState } from "../src/execution/task-state";
+import { initGitRepo, waitFor } from "./helpers/background-controller-fixtures";
 import { removeReviewBundle } from "../src/bundle";
 import { GenericCliAdapter } from "../src/adapters/generic-cli";
 import * as reviewActivity from "../src/activation/review-activity";
@@ -325,6 +328,141 @@ test("real settings apply resets/warns only Primary Off->On; disable retains evi
     assert.match(side, /RETAIN_THIS_TOOL_WORK/);
   } finally { await f.dispose(); }
 });
+
+// #303: independently reviewed landings may advance the snapshot interval,
+// but cannot retroactively certify work preceding a recovery/policy baseline.
+for (const strategy of ["raw", "git"] as const) {
+  for (const mode of ["disable-distinct", "disable-shared", "fallback", "snapshot"] as const) {
+    test(`${strategy} parent advancement preserves historical coverage: ${mode}`, async () => {
+      const historical = mode !== "snapshot";
+      const f = await fixture(mode.startsWith("disable") ? { primaryToolOnly: true }
+        : mode === "fallback" ? { snapshotFailureFallback: true } : {}, true, 3, async (stage, owned) => {
+        if (stage === "beforeActivation" && strategy === "git") {
+          await initGitRepo(join(owned.root, "workspace"), { SCRIPT: "BEFORE_SCRIPT\n" });
+        }
+      });
+      let controller: BackgroundExecutionController | undefined;
+      const ownedExecutionRoots = new Set<string>();
+      try {
+        if (mode === "fallback") {
+          // Exercise the real initial-fallback -> recovered snapshot path,
+          // not a history flag injected into a checkpoint fixture.
+          const failed = mock.method(checkpoints, "captureReviewCheckpoint", async () => ({
+            status: "failed" as const, reason: "patch_too_large" as const, evidenceCaptureFailure: true as const,
+          }));
+          await f.start();
+          assert.equal((await f.restored())!.state.reviewWindow!.baseline?.kind, "tool");
+          failed.mock.restore();
+        } else await f.start();
+        await f.writeScript("EARLIER_TOOL_SCRIPT\n");
+        if (mode.startsWith("disable")) {
+          await f.settings(["Reviewers", "Evidence methods", "Primary /", "Back", "Back", "Save changes"]);
+        }
+        if (mode !== "disable-shared") {
+          // Real review settlement arms a distinct after-checkpoint on the
+          // exchange, while the window retains its accumulated baseline.
+          await f.end();
+          await f.start("continue parent work while a reviewed worker lands");
+          if (mode === "fallback") {
+            // Recovery itself establishes a shared NEW baseline. A subsequent
+            // real snapshot review supplies the distinct exchange owner.
+            await writeFile(join(f.cwd, "REPORT"), "SUBSEQUENT_SNAPSHOT_INTERVAL\n");
+            await f.end();
+            await f.start("continue after snapshot recovery review");
+          }
+        }
+        const state = (await f.restored())!.state;
+        const scope = { agentDir: testAgentDir, sessionId: "primary-evidence" };
+        state.checkpointScope = scope;
+        const window = state.reviewWindow!;
+        const oldWindow = window.baseline;
+        const oldExchange = window.activeExchange?.baseline;
+        assert.ok(oldWindow?.kind === "checkpoint" && oldExchange?.kind === "checkpoint");
+        assert.equal(oldWindow.descriptor.kind, strategy);
+        assert.equal(Boolean(oldWindow.toolOnlyHistory), historical);
+        assert.equal(Boolean(oldExchange.toolOnlyHistory), historical);
+        assert.equal(JSON.stringify(oldWindow.descriptor) === JSON.stringify(oldExchange.descriptor), mode === "disable-shared");
+        const events = structuredClone(window.evidence.events);
+        await writeFile(join(f.cwd, "REPORT"), "PARENT_CONTEXT_REMAINS_REVIEWABLE\n");
+        const script = join(f.root, "landing.cjs");
+        await writeFile(script, `const fs=require('node:fs');process.stdin.resume();process.stdin.on('end',()=>{
+          fs.writeFileSync('LANDED','INDEPENDENTLY_REVIEWED_WORKER\\n');
+          console.log(JSON.stringify({type:'assistant',text:'landed requested file'}));
+        });`);
+        const configured = JSON.parse(await readFile(f.configPath, "utf8"));
+        const config = normalizeConfig({ ...configured,
+          review: { ...configured.review, subtaskEnabled: true, reviewLandedChanges: true,
+            subtaskReviewers: [{ source: "external", id: "fake" }] },
+          externalAgents: { ...configured.externalAgents, worker: { adapter: "run-as-binary", command: process.execPath,
+            execution: { protocol: "pi-review-executor-jsonl-v1", args: [script] } } },
+          execution: { maxWorkers: 1, subtaskNotifications: "quiet",
+            workerResources: { worker: { selection: { source: "external", id: "worker" }, maxConcurrent: 1 } },
+            routes: { execute: [{ resourceId: "worker" }], research: [] } },
+        });
+        const store = new SessionStateStore({ sessionId: "primary-evidence", sessionFile: join(f.root, "advanced.jsonl"), cwd: f.cwd });
+        controller = new BackgroundExecutionController({ config, state, cwd: () => f.cwd, pi: {},
+          onAssociationsChanged: (associations) => store.save(state, associations, config),
+        });
+        const started = await controller.start([{ title: "reviewed landing", instructions: "Write LANDED only.", acceptanceCriteria: ["LANDED exists"] }]);
+        ownedExecutionRoots.add(started.root);
+        await waitFor(() => !isActiveTaskState(controller!.inspect(started.executionId).tasks[0]!.state), 60_000);
+        const landed = controller.inspect(started.executionId).tasks[0]!;
+        if (landed.waveRoot) ownedExecutionRoots.add(landed.waveRoot);
+        assert.equal(landed.state, "landed", landed.error ?? landed.summary);
+        assert.equal(await readFile(join(f.cwd, "LANDED"), "utf8"), "INDEPENDENTLY_REVIEWED_WORKER\n");
+        const owners = [window.baseline, window.activeExchange?.baseline];
+        const now = await checkpoints.captureReviewCheckpoint(f.cwd, "after-reviewed-landing", { scope });
+        assert.equal(now.status, "ok");
+        if (now.status !== "ok") throw new Error("after-checkpoint capture failed");
+        for (const [index, owner] of owners.entries()) {
+          assert.ok(owner?.kind === "checkpoint");
+          assert.notDeepEqual(owner.descriptor, [oldWindow, oldExchange][index]!.descriptor, "both checkpoint owners actually advance");
+          const compared = await checkpoints.compareReviewCheckpoints(f.cwd, owner.descriptor, now.value, { scope });
+          assert.equal(compared.status, "ok");
+          if (compared.status !== "ok") throw new Error("comparison failed");
+          const paths = compared.value.changes.map(change => change.path);
+          assert.ok(paths.includes("REPORT"), "pre-existing parent work remains reviewable");
+          assert.equal(paths.includes("LANDED"), false, "successfully reviewed worker bytes are selectively advanced");
+        }
+        assert.deepEqual(window.evidence.events, events, "advancement does not reset earlier tool evidence");
+        const durable = await store.restore(f.cwd, scope);
+        assert.deepEqual(durable!.state.reviewWindow!.baseline, owners[0]);
+        assert.deepEqual(durable!.state.reviewWindow!.activeExchange!.baseline, owners[1]);
+        // Inspect only the next actual reviewer invocation, not disclosure
+        // left in the prompt dump by the earlier review or worker reviewer.
+        await writeFile(f.prompt, "");
+        const result = await runReview({ cwd: f.cwd, request: "Assess the retained parent history and REPORT.",
+          before: window.baseline!, config, evidence: window.evidence, window, checkpointScope: scope });
+        assert.equal(result.result?.verdict, "pass");
+        assert.ok(result.bundleDir && result.reviewSequence);
+        const reviewDir = join(result.bundleDir, "reviews", String(result.reviewSequence).padStart(4, "0"));
+        const metadata = JSON.parse(await readFile(join(reviewDir, "metadata.json"), "utf8"));
+        const request = await readFile(join(reviewDir, "request.md"), "utf8");
+        const prompt = await readFile(f.prompt, "utf8");
+        assert.deepEqual({
+          ownerHistory: owners.map(owner => owner?.kind === "checkpoint" && Boolean(owner.toolOnlyHistory)),
+          bundleDisclosure: request.includes(TOOL_ONLY_HISTORY_NOTICE),
+          reviewerDisclosure: prompt.includes(TOOL_ONLY_HISTORY_NOTICE),
+          exactSnapshotReviewed: metadata.exactSnapshotReviewed,
+        }, { ownerHistory: [historical, historical], bundleDisclosure: historical, reviewerDisclosure: historical,
+          exactSnapshotReviewed: !historical });
+        const side = await readFile(join(reviewDir, "side-effect.patch.diff"), "utf8");
+        const patch = await readFile(join(reviewDir, "patch.diff"), "utf8");
+        assert.match(`${patch}\n${side}`, /BEFORE_SCRIPT/);
+        assert.match(`${patch}\n${side}`, /EARLIER_TOOL_SCRIPT/);
+        assert.match(prompt, /EARLIER_TOOL_SCRIPT/);
+        assert.match(patch, /PARENT_CONTEXT_REMAINS_REVIEWABLE/);
+      } finally {
+        // Confirm all owned children/lifecycle owners settle before removal;
+        // a cleanup failure preserves the fixture rather than guessing safety.
+        await controller?.shutdown();
+        await controller?.detach();
+        await f.dispose();
+        for (const root of ownedExecutionRoots) await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+}
 
 for (const initial of [true, false]) {
   for (const enabled of [false, true]) {

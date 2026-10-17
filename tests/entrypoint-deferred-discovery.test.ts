@@ -839,8 +839,10 @@ test("completion guidance is omitted when Pi's launch authorization excludes You
       registerCommand() {},
       registerTool(tool: { name: string; description?: string; execute?: (id: string, params: unknown) => Promise<Record<string, unknown>> }) {
         registeredTools.set(tool.name, tool);
-        // Model Pi's launch allowlist excluding this registered tool. It remains
-        // in the registry, but it is not part of the captured authorization set.
+        // Model Pi's explicit launch restriction (--tools/--exclude-tools)
+        // excluding this tool: real Pi drops such a registration from its
+        // registry (getAllTools below), so it is neither activated nor
+        // listed. #421: mere inactivity would NOT exclude it at top level.
         if (tool.name !== "YouShouldKnow" && !activeTools.includes(tool.name)) activeTools.push(tool.name);
       },
       getActiveTools() {
@@ -853,7 +855,7 @@ test("completion guidance is omitted when Pi's launch authorization excludes You
           { name: "read", description: "Read files." },
           { name: "bash", description: "Run shell commands." },
           { name: "edit", description: "Edit files." },
-          ...registeredTools.values(),
+          ...[...registeredTools.values()].filter((tool) => tool.name !== "YouShouldKnow"),
         ];
       },
       setActiveTools(next: string[]) {

@@ -2,7 +2,6 @@ import { dirname, join } from "node:path";
 import {
   DEFERRED_TOOL_SEARCH_NAME,
   DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER,
-  NATIVE_DISCOVERY_TOOLS,
   createExecutorToolCatalog,
   type ExecutorToolCatalog,
 } from "./execution/tool-catalog";
@@ -12,6 +11,7 @@ import { GIT_READ_TOOL_NAME } from "./git-read/tool";
 import { DEFAULT_OPERATING_MODE, type OperatingMode } from "./config";
 import { renderAuthorizedToolInventory } from "./tool-inventory";
 import { deferredToolSearchRenderResult } from "./deferred-tools-result-renderer";
+import { isNativePowerShellBuiltinEntry, probeNativePowerShellHostSupport } from "./native-powershell-support";
 
 const MAX_QUERY_CHARS = 256;
 /**
@@ -24,13 +24,13 @@ const PI_AGENT_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 
 /**
  * Native Pi tool that runs codemode scripts (Pi 1.0 `builtin:codemode`).
- * Issue #224: the wrapper can opt in to a registered-but-inactive codemode as
- * an authorized, discoverable tool via the manager constructor flag.
- * The ordinary toggle requires tool_search when deferred tools are on and
- * selects permitted tools normally when off. Plan/research disables it;
- * the wrapper default never overrides an explicit
- * native registry restriction, and no builtin is ever re-registered by this
- * extension.
+ * #421: at the top level a registered, non-hidden codemode is an ordinary
+ * discovery candidate like every other registered tool (no launch or
+ * transcript observation); it is never part of the baseline. The ordinary
+ * toggle requires tool_search when deferred tools are on and selects
+ * permitted tools normally when off. Plan/research disables it, explicit
+ * native registry restrictions remove it, and no builtin is ever
+ * re-registered by this extension.
  */
 export const CODEMODE_TOOL_NAME = "codemode";
 
@@ -59,6 +59,12 @@ interface ToolMetadata {
   description: string;
   /** Resolved native exposure; "direct" is the registry default. */
   exposure: string;
+  /**
+   * True only for Pi's own `powershell` builtin, identified from the public
+   * `sourceInfo` provenance (`builtin:powershell`); never inferred from the
+   * name alone (#421).
+   */
+  nativePowerShell?: boolean;
 }
 
 interface DeferredToolHost {
@@ -88,30 +94,30 @@ interface AuthorizationBoundary {
   /** Metadata for the live-visible authorized tools (reconciled registry intersection). */
   catalog: readonly ToolMetadata[];
   /**
-   * Dynamic (top-level): the current host-derived authority; reconciled live so
-   * late registrations join and removed/hidden/withdrawn ones leave. Frozen
-   * (configured worker): the immutable `allowedToolCatalog` ceiling, never
-   * expanded, never mutated.
+   * Dynamic (top-level, #421): derived afresh from Pi's CURRENT permitted
+   * registry on every reconciliation — every registered non-hidden tool
+   * except the loader itself (codemode included, #421) — so nothing the
+   * session transcript restored, activated, or omitted decides authority.
+   * Registered is not the same as declarable: Pi's own activation policy
+   * still decides what setActiveTools() declares, and tool_search confirms
+   * that from Pi's public active set rather than presuming it.
+   * Frozen (configured worker): the immutable `allowedToolCatalog` ceiling,
+   * never expanded, never mutated.
    */
   authorizedNames: ReadonlySet<string>;
-  /** Frozen initial-active baseline for the role (top-level conservative subset / worker durable subset). */
+  /**
+   * Frozen worker initial-active subset (durable catalog). Unused for dynamic
+   * boundaries, whose baseline is recomputed from the live authority.
+   */
   initialActiveNames: readonly string[];
   /** True: dynamic host authority reconciled live. False: frozen worker ceiling. */
   dynamic: boolean;
-  /** Captured wrapper default intent (#224 codemode). Sticky across reloads. */
-  codemodeDefault: boolean;
-  /** Registry names present at the first authoritative capture; launch exclusions stay excluded. */
-  registryBaselineNames: ReadonlySet<string>;
-  /** False only when top-level capture happened while the host registry was unreadable. */
-  registryBaselineCaptured: boolean;
   /**
    * Last successful full registry snapshot (name + resolved exposure) and
    * the exposure lookup for the loader's own live gate. Preserved across
    * unreadable reads for recovery.
    */
   registryEntries: ReadonlyMap<string, ToolMetadata>;
-  /** Names withdrawn after capture, plus hidden canonical native MCP names whose later Pi exposure change may grant dynamic authority. */
-  withdrawnNames: ReadonlySet<string>;
 }
 
 interface SearchMatch extends ToolMetadata {
@@ -154,20 +160,25 @@ function planningToolVisible(name: string): boolean {
 // sessionManager object remains stable for the AgentSession. Keep the registry
 // itself process-scoped so it survives module cache replacement, but key each
 // captured boundary by that session identity so concurrent AgentSessions
-// cannot inherit one another's authorization. v4: the boundary shape gained
-// a stable registry baseline so temporary disappearance/outages cannot turn
-// ordinary capture-time exclusions into late registrations; only an explicit
-// hidden-to-visible canonical native MCP exposure transition is also adopted.
+// cannot inherit one another's authorization. v5 (#421): top-level authority
+// is no longer a capture-time record at all (no launch-active set, registry
+// baseline, or withdrawal memory); it is recomputed from the live registry.
 // Old-shape retained boundaries fail closed instead of being reinterpreted.
-const BOUNDARY_REGISTRY_KEY = Symbol.for("pi-review-gate.deferred-tool-authorization-boundaries.v4");
+const BOUNDARY_REGISTRY_KEY = Symbol.for("pi-review-gate.deferred-tool-authorization-boundaries.v5");
 
 /**
- * Top-level Pi-native deferred activation. Authorization is captured once from
- * the launch-active set plus the registry's native-callable exposures, while
- * getAllTools contributes metadata only. Top-level (dynamic) boundaries
- * reconcile against the live registry afterward: Pi-permitted tools registered
- * after capture become authorized and discoverable, and removed, hidden, or
- * withdrawn entries disappear from discovery and lose activation. Configured
+ * Top-level Pi-native deferred activation (#421). Top-level (dynamic)
+ * authority is never captured from the session's active set — Pi restores a
+ * resumed, switched, or forked transcript's previous declarations before
+ * session_start, so activity is not permission. Instead, every reconciliation
+ * derives authority afresh from Pi's CURRENT registry: every registered
+ * non-hidden tool is a discovery candidate (explicit `--tools`,
+ * `--exclude-tools`, and `--no-tools` restrictions remove names from that
+ * registry and stay authoritative), bounded at every surface by the live
+ * operating mode and feature settings. Registered-but-inactive tools still
+ * require this loader's tool_search activation; tools appearing later join,
+ * and removed or hidden ones leave, at the next seam. Nothing is persisted
+ * or restored. Configured
  * worker (frozen) boundaries remain an immutable ceiling: the live visible set
  * is its intersection with the current registry, so initially unavailable
  * (late MCP) ceiling names stay retained but only become usable once the
@@ -200,7 +211,7 @@ const BOUNDARY_REGISTRY_KEY = Symbol.for("pi-review-gate.deferred-tool-authoriza
  * wait for the servers a call may reach. The descriptor therefore declares
  * `reachesTools: () => "all"` (the builtin's contract) while keeping the
  * native schema identity Pi 1.0.4/1.1.x still require. Both are recognition
- * metadata only; authority remains the captured boundary and search()'s
+ * metadata only; authority remains the reconciled boundary and search()'s
  * fail-closed gates.
  */
 export class DeferredToolManager {
@@ -230,16 +241,44 @@ export class DeferredToolManager {
   constructor(
     private readonly pi: unknown,
     private readonly getOperatingMode: () => OperatingMode = () => DEFAULT_OPERATING_MODE,
-    // #224 wrapper default: when true, an inactive registered codemode joins
-    // the top-level authorization and discovery sets. The ordinary toggle
-    // controls selection: tool_search when on, normal loading when off. Only for
-    // wrapper-launched sessions (the parent passes the captured
-    // PI_REVIEW_GATE_CODEMODE_DEFAULT=1 flag); never applied to configured
-    // worker ceilings and never overriding explicit registry restrictions.
-    private readonly enableCodemodeDefault = false,
     /** Additional live feature-availability filter; it can only narrow captured authority. */
     private readonly isToolEnabledBySettings: (name: string) => boolean = () => true,
+    /**
+     * Native host support for Pi's builtin `powershell` (#421/#94). Consulted
+     * lazily, at most once per refresh (session start and operating-mode
+     * transitions), and only when the live registry actually carries the
+     * native builtin: for top-level (dynamic) authority and to narrow a
+     * failed startup's retained set. Frozen worker ceilings never consult it.
+     * A throwing probe counts as unsupported.
+     */
+    private readonly probeNativePowerShellHost: () => boolean = probeNativePowerShellHostSupport,
   ) {}
+
+  /** Cached probe answer; undefined until first needed after the latest refresh. */
+  private nativePowerShellSupported: boolean | undefined;
+
+  /**
+   * Discard the cached native PowerShell host-support answer so the next
+   * reconciliation that meets Pi's builtin `powershell` probes again. The
+   * parent calls this on operating-mode transitions; sessionStart refreshes
+   * on its own. It never probes eagerly and never widens a frozen ceiling.
+   */
+  refreshNativeHostSupport(): void {
+    this.nativePowerShellSupported = undefined;
+  }
+
+  private nativePowerShellHostSupported(): boolean {
+    if (this.nativePowerShellSupported === undefined) {
+      let supported = false;
+      try {
+        supported = this.probeNativePowerShellHost() === true;
+      } catch {
+        supported = false;
+      }
+      this.nativePowerShellSupported = supported;
+    }
+    return this.nativePowerShellSupported;
+  }
 
   register(parameters?: Record<string, unknown>): boolean {
     if (this.registered || !isDeferredToolHost(this.pi)) return false;
@@ -347,7 +386,7 @@ export class DeferredToolManager {
     return parameters;
   }
 
-  /** Capture authorization before the first shrink, or install a durable worker boundary. */
+  /** Install the live-derived top-level boundary (#421), or a durable worker boundary, before the first managed write. */
   sessionStart(
     sessionIdentity: unknown,
     configuredCatalog?: ExecutorToolCatalog,
@@ -365,6 +404,7 @@ export class DeferredToolManager {
     this.registryUnreadable = false;
     this.activeSetEstablished = false;
     this.sessionDeferred = deferredEnabled;
+    this.nativePowerShellSupported = undefined;
     if (!isDeferredToolHost(this.pi)) return false;
     if (!isObjectIdentity(sessionIdentity)) return this.failClosed(this.pi);
     const registry = authorizationBoundaryRegistry();
@@ -382,20 +422,15 @@ export class DeferredToolManager {
     }
     const configured = retained || configuredCatalog === undefined
       ? undefined
-      : captureConfiguredAuthorizationBoundary(this.pi, configuredCatalog, this.enableCodemodeDefault);
+      : captureConfiguredAuthorizationBoundary(this.pi, configuredCatalog);
     if (!retained && configuredCatalog !== undefined && !configured) return this.failClosed(this.pi);
-    // Sticky wrapper default (#224): a retained boundary keeps its previously
-    // captured intent — a constructor false on reload must never erase it —
-    // while a constructor true upgrades the retained boundary permanently.
-    const boundary = retained
-      ? withCodemodeDefault(retained, retained.codemodeDefault || this.enableCodemodeDefault)
-      : configured ?? captureAuthorizationBoundary(this.pi, this.enableCodemodeDefault);
+    const boundary = retained ?? configured ?? createDynamicBoundary();
     registry.set(sessionIdentity, boundary);
     this.sessionIdentity = sessionIdentity;
     this.boundary = boundary;
-    // Reconcile the live registry before building the desired base so a
-    // retained boundary also adopts registrations that happened between
-    // incarnations (and applies a newly upgraded codemode intent immediately).
+    // Reconcile the live registry before building the desired base: a dynamic
+    // boundary derives its whole authority here, and a retained one adopts
+    // registrations that happened between incarnations.
     this.reconcile();
     this.desiredActiveNames = this.computeDesiredBase();
     this.activeSetEstablished = true;
@@ -460,7 +495,21 @@ export class DeferredToolManager {
       || this.boundary.initialActiveNames.includes(GIT_READ_TOOL_NAME);
   }
 
-  /** Apply a local settings change immediately within the captured boundary. */
+  /**
+   * The role's conservative baseline (automatically loaded while deferred
+   * tools are on). Dynamic top-level boundaries recompute it from the live
+   * authority (#421), so a restored transcript can neither drop a baseline
+   * tool Pi currently permits nor keep one Pi no longer provides; frozen
+   * worker boundaries keep their durable initial subset.
+   */
+  private baselineNames(): readonly string[] {
+    const boundary = this.boundary;
+    if (!boundary) return [];
+    if (!boundary.dynamic) return boundary.initialActiveNames;
+    return dynamicBaselineNames(boundary.authorizedNames);
+  }
+
+  /** Apply a local settings change immediately within the current boundary. */
   setDeferredEnabled(enabled: boolean): boolean {
     if (!this.boundary || !isDeferredToolHost(this.pi)) return false;
     if (this.sessionDeferred === enabled) {
@@ -494,7 +543,7 @@ export class DeferredToolManager {
     const nativeCallableNames = new Set(boundary.catalog
       .filter((tool) => isNativeCallableExposure(tool.exposure))
       .map((tool) => tool.name));
-    const baseNames = this.sessionDeferred ? boundary.initialActiveNames : [...boundary.authorizedNames];
+    const baseNames = this.sessionDeferred ? this.baselineNames() : [...boundary.authorizedNames];
     // Reloads and deferred-setting changes never reintroduce a name the live
     // registry does not currently provide: the base intersection keeps a
     // withdrawn baseline tool out of every rebuilt desired set. Native
@@ -522,6 +571,30 @@ export class DeferredToolManager {
     this.syncSearchToolDescription();
     const names = this.computeActiveNames();
     this.pi.setActiveTools(names);
+    this.pruneDeclinedSelections(names);
+  }
+
+  /**
+   * Post-write confirmation (#421): an explicit loader selection that this
+   * write requested but Pi's public active set does not contain was declined
+   * by Pi's own policy (for example an exposure that became `direct` under a
+   * `--tools` allowlist naming no `mcp__` entry). It is not loaded: drop the
+   * selection — whenever it was made — and its non-base desired entry, so no
+   * later write keeps requesting it and a reappearance needs tool_search
+   * again. Base names stay as the rebuilt base defines them (the call gate
+   * still requires actual native activity). An unreadable active set or
+   * registry proves nothing and prunes nothing.
+   */
+  private pruneDeclinedSelections(requested: readonly string[]): void {
+    if (!this.boundary || this.registryUnreadable || this.loaderSelectionNames.length === 0) return;
+    const active = nativeActiveSet(this.pi);
+    if (!active) return;
+    const requestedSet = new Set(requested);
+    const declined = new Set(this.loaderSelectionNames.filter((name) => requestedSet.has(name) && !active.has(name)));
+    if (declined.size === 0) return;
+    const base = new Set(this.computeDesiredBase());
+    this.loaderSelectionNames = this.loaderSelectionNames.filter((name) => !declined.has(name));
+    this.desiredActiveNames = this.desiredActiveNames.filter((name) => !declined.has(name) || base.has(name));
   }
 
   /** The exact array reapply would write, without performing the write. */
@@ -601,16 +674,16 @@ export class DeferredToolManager {
   /**
    * Stable deferred discovery set: the authorized catalog at the live
    * permission ceiling minus the role's baseline automatically-loaded tools
-   * (tool_search itself is baseline and excluded). Derived from the captured
-   * boundary's frozen initialActiveNames — never from mutable activation
-   * state — so search activations cannot change startup guidance or the
+   * (tool_search itself is baseline and excluded). Derived from the role
+   * baseline (live authority at the top level, the durable subset for
+   * workers) — never from mutable activation state — so search activations cannot change startup guidance or the
    * tool_search description (no needless prompt-cache invalidation). Only
    * role/mode/permission boundary changes (and live registry reconciliation)
    * recompute this set.
    */
   private deferredDiscoveryNames(): ReadonlySet<string> {
     if (!this.boundary || !this.sessionDeferred) return new Set<string>();
-    const baseline = new Set(this.boundary.initialActiveNames);
+    const baseline = new Set(this.baselineNames());
     // #73: a visible GitRead is active from the first request, so it is
     // excluded from the deferred discovery set exactly like baseline tools —
     // the inventory and search description never promise an activation step
@@ -740,7 +813,7 @@ export class DeferredToolManager {
    * false live and unknown/absent names are never permitted. In plan/research
    * the existing read-only allow policy applies to every callee (unknown MCP
    * tools are not presumed read-only) and codemode is disabled there, so the
-   * wrapper-default tool and its transport use require a write-capable mode.
+   * codemode tool and its transport use require a write-capable mode.
    */
   toolCallAllowed(name: string, nested = false): boolean {
     this.reconcile();
@@ -767,13 +840,13 @@ export class DeferredToolManager {
     if (entry.exposure === "hidden" || entry.exposure === "model-only" && nested) {
       return false;
     }
-    const declared = this.computeActiveNames();
-    if (nested) {
-      // Native callable rule: codemode/deferred stay callable while inactive.
-      if (NATIVE_CALLABLE_EXPOSURES.has(entry.exposure)) return true;
-      return declared.includes(trimmed);
-    }
-    return declared.includes(trimmed);
+    // Native callable rule: codemode/deferred stay callable while inactive.
+    if (nested && NATIVE_CALLABLE_EXPOSURES.has(entry.exposure)) return true;
+    // Declared means both requested by the managed write AND actually in
+    // Pi's public active set: a name Pi's own policy declined (deferred-off
+    // base included) is not loaded, and an unreadable active set denies.
+    if (!this.computeActiveNames().includes(trimmed)) return false;
+    return nativeActiveSet(this.pi)?.has(trimmed) === true;
   }
 
   /**
@@ -817,6 +890,15 @@ export class DeferredToolManager {
       // If the host cannot disclose authorization, no tool name is trusted.
     }
     const activeNames = new Set(normalizedActiveNames(active));
+    // Failed startup retains only conservative already-active names, and
+    // never a native powershell builtin this host cannot run (#421/#94).
+    const read = readRegistryMetadata(pi);
+    if (read.ok && read.metadata.some((tool) => tool.nativePowerShell === true)
+      && !this.nativePowerShellHostSupported()) {
+      for (const tool of read.metadata) {
+        if (tool.nativePowerShell === true) activeNames.delete(tool.name);
+      }
+    }
     this.desiredActiveNames = DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER.filter((name) => activeNames.has(name));
     this.failClosedAuthorized = new Set(this.desiredActiveNames);
     this.activeSetEstablished = true;
@@ -825,29 +907,26 @@ export class DeferredToolManager {
   }
 
   /**
-   * Reconcile the captured boundary with the current live registry.
+   * Reconcile the boundary with the current live registry.
    *
    * - Successful reads are authoritative: an empty registry collapses live
    *   availability for both boundary kinds. A failing read denies live
-   *   discovery and calls while the captured boundary and wrapper intent are
-   *   retained for recovery.
-   * - Dynamic (top-level): registry-present names that appeared after capture
-   *   (or reappeared after a withdrawal) are adopted into authority; names
-   *   that vanished from the registry or flipped to `hidden` exposure are
-   *   dropped from authority, discovery, and the desired active set, so no
-   *   stale successful activation survives. Names the registry already knew
-   *   but never authorized at capture stay excluded, except a canonical
-   *   native MCP name captured as hidden: Pi's later permitted visible
-   *   exposure is an explicit transition that can add the name to authority.
+   *   discovery and calls while the boundary is retained for recovery.
+   * - Dynamic (top-level, #421): authority is recomputed from this snapshot —
+   *   every registered non-hidden tool except the loader itself, codemode
+   *   included. Nothing from a previous snapshot, the session transcript, or
+   *   the active set widens or narrows it: a tool Pi registers later joins,
+   *   and a removed, hidden, or excluded one leaves. Withdrawn names lose any
+   *   loaded selection, so a later reappearance needs tool_search again.
    * - Frozen (configured worker): the ceiling never changes authority; the
    *   live visible set (and every catalog derived from it) is the ceiling's
    *   intersection with the current non-hidden registry, withdrawn selections
    *   are pruned, and baseline tools resume when a permitted re-enable makes
    *   them live.
-   * - Sticky #224 wrapper default: a dynamic boundary re-authorizes the
-   *   codemode registration (discovery only, never the base active set)
-   *   whenever the captured wrapper intent applies and the registry currently
-   *   provides one.
+   * - Plan/research (#421): names the mode forbids are removed from the
+   *   retained selections, not merely hidden, so leaving the mode rebuilds
+   *   the loadout from the registry as it is at that moment rather than from
+   *   pre-mode selections.
    *
    * There is no public tools-changed event in Pi; registry diffs on these
    * entry points are the reconciliation channel and the parent owns wiring
@@ -860,128 +939,68 @@ export class DeferredToolManager {
     if (!read.ok) {
       // An unreadable registry cannot be trusted for adoption, removal, or
       // availability: deny live discovery and calls while retaining the
-      // captured boundary and wrapper intent, and let an authoritative read
-      // recover normally.
+      // boundary, and let an authoritative read recover.
       this.registryUnreadable = true;
       return;
     }
-    // A successful read is authoritative: an empty registry means every tool
-    // is absent or withdrawn, so live availability collapses for both
-    // boundary kinds while the retained ceiling and wrapper intent stay
-    // recoverable from the withdrawn record and registry snapshot.
     this.registryUnreadable = false;
-    const metadata = read.metadata;
-    const registryEntries = new Map(metadata.map((tool) => [tool.name, tool]));
+    const registryEntries = new Map(read.metadata.map((tool) => [tool.name, tool]));
     const liveAvailable = (name: string): boolean => {
       const entry = registryEntries.get(name);
       return entry !== undefined && entry.exposure !== "hidden";
     };
 
-    let authorizedNames = boundary.authorizedNames;
-    let registryBaselineNames = new Set(boundary.registryBaselineNames);
-    let registryBaselineCaptured = boundary.registryBaselineCaptured;
-    if (!registryBaselineCaptured) {
-      // If capture happened during an outage, the first successful snapshot
-      // establishes the baseline rather than being mistaken for a batch of
-      // post-start registrations. Only launch-captured names and the explicit
-      // wrapper codemode default may recover immediately; a hidden canonical
-      // native MCP name gets only the later hidden-to-visible transition marker.
-      registryBaselineNames = new Set(registryEntries.keys());
-      registryBaselineCaptured = true;
-    }
-    const initialActiveNames = boundary.initialActiveNames;
-    const withdrawnNames = new Set(boundary.withdrawnNames);
-    if (!boundary.registryBaselineCaptured) {
-      for (const tool of registryEntries.values()) {
-        if (isCanonicalNativeMcpToolName(tool.name) && tool.exposure === "hidden") {
-          withdrawnNames.add(tool.name);
-        }
-      }
-    }
+    // The host-support probe runs only when the dynamic registry actually
+    // carries Pi's native powershell builtin, and then at most once per
+    // refresh (cached), never per reconciliation.
+    const authorizedNames = boundary.dynamic
+      ? dynamicAuthorizedNames(
+        registryEntries,
+        [...registryEntries.values()].some((entry) => entry.nativePowerShell === true)
+          && this.nativePowerShellHostSupported(),
+      )
+      : boundary.authorizedNames;
     let desired = this.desiredActiveNames;
 
     // Withdrawal reconciles live for both boundary kinds: names the registry
     // no longer provides (absent or removed) or that flipped to hidden
     // exposure lose loaded deferred selections, discovery, and any managed
-    // write. The frozen worker ceiling stays immutable; the dynamic authority
-    // drops the names and records them for re-adoption on a permitted
-    // re-registration.
-    const drops = [...authorizedNames].filter((name) => !liveAvailable(name));
-    if (drops.length > 0) {
-      const dropSet = new Set(drops);
-      desired = desired.filter((name) => !dropSet.has(name));
-      this.loaderSelectionNames = this.loaderSelectionNames.filter((name) => !dropSet.has(name));
-      if (boundary.dynamic) {
-        authorizedNames = new Set([...authorizedNames].filter((name) => !dropSet.has(name)));
-        for (const name of drops) withdrawnNames.add(name);
-      }
-    }
-
-    if (boundary.dynamic) {
-      const adopted = [...registryEntries.keys()].filter((name) =>
-        !authorizedNames.has(name)
-        && (name !== CODEMODE_TOOL_NAME || withdrawnNames.has(name))
-        && liveAvailable(name)
-        // Baseline names need a recorded withdrawal, except for the narrowly
-        // seeded hidden-native-MCP marker described at capture. The loader
-        // itself is baseline-registered and special-cased outside authority.
-        && (!registryBaselineNames.has(name) || withdrawnNames.has(name)));
-      if (adopted.length > 0) {
-        authorizedNames = new Set([...authorizedNames, ...adopted]);
-        for (const name of adopted) withdrawnNames.delete(name);
-        // Deferred-off loads newly adopted ordinary tools, but native
-        // codemode/deferred callees stay undeclared until this loader's search
-        // activates them. Deferred-on keeps every adopted tool in discovery.
-        if (!this.sessionDeferred) {
-          const ordinaryAdopted = adopted.filter((name) =>
-            !isNativeCallableExposure(registryEntries.get(name)?.exposure)
-          );
-          desired = desireAdd(desired, ordinaryAdopted);
-        }
-      }
-      if (
-        boundary.codemodeDefault
-        && liveAvailable(CODEMODE_TOOL_NAME)
-        && !authorizedNames.has(CODEMODE_TOOL_NAME)
-      ) {
-        // Wrapper default authorizes discovery only (#224 correction): the
-        // codemode registration joins authority and the deferred discovery
-        // set, but never the initial/base active set and never a default
-        // activation — tool_search is required before use in deferred-on
-        // sessions. A native auto activation is likewise not promoted: the
-        // next managed write strips it. Deferred-off runs the ordinary
-        // full-active set, so the newly authorized codemode joins the
-        // declared set like any other adopted authority.
-        authorizedNames = new Set([...authorizedNames, CODEMODE_TOOL_NAME]);
-        if (!this.sessionDeferred) desired = desireAdd(desired, [CODEMODE_TOOL_NAME]);
-      }
+    // write. The frozen worker ceiling stays immutable.
+    const dropped = new Set([...boundary.authorizedNames, ...desired, ...this.loaderSelectionNames]
+      .filter((name) => name !== DEFERRED_TOOL_SEARCH_NAME && (!authorizedNames.has(name) || !liveAvailable(name))));
+    if (dropped.size > 0) {
+      desired = desired.filter((name) => !dropped.has(name));
+      this.loaderSelectionNames = this.loaderSelectionNames.filter((name) => !dropped.has(name));
     }
 
     // Rebuilt base plus retained selections: the live-intersected base
-    // (baseline initial-active tools, or any live authorized tool while
-    // deferred tools are off) resumes its normal state, the loader follows
-    // the base as always, and retained non-base selections re-append after it
-    // in their existing order. A retained name is either an ordinary tool
-    // (existing search/toggle behavior) or an explicit loader selection for a
-    // native codemode/deferred exposure (#279: the loader is their sole
-    // declaration path). A name whose live exposure became native-callable
-    // after it was auto-declared by a previous mode or exposure state must
-    // not be re-declared here — only tool_search may declare it, and its
-    // native script callability is unaffected by the strip. Loaded deferred
-    // selections that were withdrawn are never auto-reenabled — restoration
-    // requires search loading again — and consecutive reconciles never churn
-    // the managed write layout.
+    // (the role baseline, or every live authorized tool while deferred tools
+    // are off) resumes its normal state, the loader follows the base as
+    // always, and retained non-base selections re-append after it in their
+    // existing order. A retained name is either an ordinary tool (existing
+    // search/toggle behavior) or an explicit loader selection for a native
+    // codemode/deferred exposure (#279: the loader is their sole declaration
+    // path). A name whose live exposure became native-callable after it was
+    // auto-declared must not be re-declared here — only tool_search may
+    // declare it, and its native script callability is unaffected.
     const nativeCallableNames = new Set([...registryEntries.values()]
       .filter((tool) => isNativeCallableExposure(tool.exposure))
       .map((tool) => tool.name));
-    const rebuiltBase = (this.sessionDeferred ? initialActiveNames : [...authorizedNames])
+    const baseline = boundary.dynamic
+      ? dynamicBaselineNames(authorizedNames)
+      : boundary.initialActiveNames;
+    const rebuiltBase = (this.sessionDeferred ? baseline : [...authorizedNames])
       .filter((name) => liveAvailable(name)
         && !nativeCallableNames.has(name))
       .concat(DEFERRED_TOOL_SEARCH_NAME);
     const rebuiltSet = new Set(rebuiltBase);
+    const planning = this.getOperatingMode() === "plan-research";
     desired = [...rebuiltBase, ...desired.filter((name) =>
       !rebuiltSet.has(name)
+      // Plan/research removes forbidden selections outright (#421).
+      && (!planning || planningToolVisible(name))
       && (!nativeCallableNames.has(name) || this.loaderSelectionNames.includes(name)))];
+    if (planning) this.loaderSelectionNames = this.loaderSelectionNames.filter(planningToolVisible);
 
     const catalog = [...authorizedNames]
       .filter(liveAvailable)
@@ -991,13 +1010,9 @@ export class DeferredToolManager {
     const next = createAuthorizationBoundary({
       catalog,
       authorizedNames,
-      initialActiveNames,
+      initialActiveNames: boundary.initialActiveNames,
       dynamic: boundary.dynamic,
-      codemodeDefault: boundary.codemodeDefault,
-      registryBaselineNames,
-      registryBaselineCaptured,
       registryEntries,
-      withdrawnNames,
     });
     this.boundary = next;
     this.desiredActiveNames = desired;
@@ -1082,35 +1097,51 @@ export class DeferredToolManager {
     const limited = selected.slice(0, limit);
     const omittedCount = selected.length - limited.length;
 
-    const active = new Set(this.computeActiveNames());
-    // #73: a visible GitRead is host-active by the mode/catalog pin, not by
-    // search activation; report it as already active instead of mutating the
-    // desired set with a no-op "activation".
-    if (this.gitReadVisible()) active.add(GIT_READ_TOOL_NAME);
+    // A name is active only when it is both in this manager's declared write
+    // AND in Pi's own public active set (`getActiveTools()`, the tools Pi
+    // declares to the model — hidden declarations included). The managed
+    // write alone is a request, not proof: Pi's native policy may decline it
+    // (Pi 1.3: a `--tools` allowlist naming no `mcp__` entry keeps
+    // direct-exposure MCP tools registered but never declarable). #73: a
+    // visible GitRead is active through the mode/catalog pin, so it reports
+    // already active here without a no-op "activation".
+    const nativeActive = nativeActiveSet(this.pi) ?? new Set<string>();
+    const declaredBefore = new Set(this.computeActiveNames());
     const activated: string[] = [];
     const alreadyActive: string[] = [];
+    const refused: string[] = [];
+    const requested: string[] = [];
     for (const match of limited) {
       // The catalog is already authorization-filtered. Keep this explicit
       // guard so a future catalog refactor cannot turn metadata into authority.
       if (!this.boundary.authorizedNames.has(match.name)) continue;
-      if (active.has(match.name)) {
+      if (declaredBefore.has(match.name) && nativeActive.has(match.name)) {
         alreadyActive.push(match.name);
         continue;
       }
       // Every authorized match — ordinary, codemode/deferred-exposure, and MCP
-      // tools alike — is declared for the next model call by this loader. The
-      // activation never executes the matched operation, and native script
-      // callability of codemode/deferred exposures is unchanged by it.
-      active.add(match.name);
-      if (!this.desiredActiveNames.includes(match.name)) {
-        this.desiredActiveNames.push(match.name);
-        this.loaderSelectionNames.push(match.name);
-      } else if (!this.loaderSelectionNames.includes(match.name)) {
-        this.loaderSelectionNames.push(match.name);
-      }
-      activated.push(match.name);
+      // tools alike — is requested for the next model call by this loader.
+      // The activation never executes the matched operation, and native
+      // script callability of codemode/deferred exposures is unchanged by it.
+      if (!this.desiredActiveNames.includes(match.name)) this.desiredActiveNames.push(match.name);
+      if (!this.loaderSelectionNames.includes(match.name)) this.loaderSelectionNames.push(match.name);
+      requested.push(match.name);
     }
+    // The managed write prunes every selection Pi declines (see
+    // pruneDeclinedSelections), so a failed activation is never retained.
     this.reapply();
+    if (requested.length > 0) {
+      // Confirm the outcome from Pi's actual post-write active set (public
+      // API; no host internals, policy replica, or argv parsing). A name the
+      // host declined is a genuine refusal and is reported as such; an
+      // unreadable active set confirms nothing.
+      const nativeAfter = nativeActiveSet(this.pi) ?? new Set<string>();
+      const declaredAfter = new Set(this.computeActiveNames());
+      for (const name of requested) {
+        if (nativeAfter.has(name) && declaredAfter.has(name)) activated.push(name);
+        else refused.push(name);
+      }
+    }
 
     const matchedNames = limited.map((match) => match.name);
     const lines: string[] = [`Matched authorized tools: ${matchedNames.join(", ")}.`];
@@ -1121,44 +1152,32 @@ export class DeferredToolManager {
       lines.push(
         `Activated: ${activated.join(", ")}. Call the required tool on the next turn; tool_search did not perform the operation.`,
       );
-    } else if (alreadyActive.length > 0) {
-      lines.push("All matched authorized tools were already active. tool_search did not perform the operation.");
     }
-    return textResult(lines.join("\n"), false, {
+    if (refused.length > 0) {
+      lines.push(
+        `Not activated: ${refused.join(", ")}. Pi's tool policy for this session declined to declare ${refused.length === 1 ? "it" : "them"} `
+        + `(for example, a --tools allowlist that names no mcp__ entry never declares direct-exposure MCP tools); `
+        + `${refused.length === 1 ? "it is" : "they are"} unavailable, so do not call ${refused.length === 1 ? "it" : "them"}.`,
+      );
+    }
+    if (alreadyActive.length > 0 && activated.length === 0 && refused.length === 0) {
+      lines.push("All matched authorized tools were already active. tool_search did not perform the operation.");
+    } else if (alreadyActive.length > 0 && refused.length > 0) {
+      lines.push(`Already active: ${alreadyActive.join(", ")}.`);
+    }
+    const outcome = activated.length > 0 ? "activated" : refused.length > 0 ? "refused" : "already-active";
+    // Only refusals and nothing usable: the request failed and must not read
+    // as success.
+    const failed = refused.length > 0 && activated.length === 0 && alreadyActive.length === 0;
+    return textResult(lines.join("\n"), failed, {
       activated,
       alreadyActive,
+      refused,
       matched: matchedNames,
       omitted: omittedCount,
-      outcome: activated.length > 0 ? "activated" : "already-active",
+      outcome,
     });
   }
-}
-
-/** Add names to a desired list once, preserving insertion order. */
-function desireAdd(desired: readonly string[], additions: readonly string[]): string[] {
-  const merged = [...desired];
-  const seen = new Set(merged);
-  for (const name of additions) {
-    if (seen.has(name)) continue;
-    seen.add(name);
-    merged.push(name);
-  }
-  return merged;
-}
-
-function withCodemodeDefault(boundary: AuthorizationBoundary, codemodeDefault: boolean): AuthorizationBoundary {
-  if (boundary.codemodeDefault === codemodeDefault) return boundary;
-  return createAuthorizationBoundary({
-    catalog: boundary.catalog,
-    authorizedNames: boundary.authorizedNames,
-    initialActiveNames: boundary.initialActiveNames,
-    dynamic: boundary.dynamic,
-    codemodeDefault,
-    registryBaselineNames: boundary.registryBaselineNames,
-    registryBaselineCaptured: boundary.registryBaselineCaptured,
-    registryEntries: boundary.registryEntries,
-    withdrawnNames: boundary.withdrawnNames,
-  });
 }
 
 function authorizationBoundaryRegistry(): WeakMap<object, AuthorizationBoundary> | undefined {
@@ -1192,11 +1211,7 @@ function isAuthorizationBoundary(value: unknown): value is AuthorizationBoundary
     && value.authorizedNames instanceof Set
     && Array.isArray(value.initialActiveNames)
     && typeof value.dynamic === "boolean"
-    && typeof value.codemodeDefault === "boolean"
-    && value.registryBaselineNames instanceof Set
-    && typeof value.registryBaselineCaptured === "boolean"
-    && value.registryEntries instanceof Map
-    && value.withdrawnNames instanceof Set;
+    && value.registryEntries instanceof Map;
 }
 
 function createAuthorizationBoundary(input: {
@@ -1204,98 +1219,79 @@ function createAuthorizationBoundary(input: {
   authorizedNames: ReadonlySet<string>;
   initialActiveNames: readonly string[];
   dynamic: boolean;
-  codemodeDefault: boolean;
-  registryBaselineNames: ReadonlySet<string>;
-  registryBaselineCaptured: boolean;
   registryEntries: ReadonlyMap<string, ToolMetadata>;
-  withdrawnNames: ReadonlySet<string>;
 }): AuthorizationBoundary {
   return {
     catalog: Object.freeze(input.catalog.map((tool) => Object.freeze({ ...tool }))),
     authorizedNames: new Set(input.authorizedNames),
     initialActiveNames: Object.freeze([...input.initialActiveNames]),
     dynamic: input.dynamic,
-    codemodeDefault: input.codemodeDefault,
-    registryBaselineNames: new Set(input.registryBaselineNames),
-    registryBaselineCaptured: input.registryBaselineCaptured,
     registryEntries: new Map(input.registryEntries),
-    withdrawnNames: new Set(input.withdrawnNames),
   };
 }
 
 /**
- * Top-level capture: the launch-active set is the authority, plus the
- * registry's native-callable exposures (codemode/deferred stay callable from
- * scripts while inactive, so a registry-present match without activation is
- * authorization metadata — never promoted to declaration here), plus
- * launch-known native discovery and GitRead. The loader itself (#279) is
- * registered under Pi's replaceable builtin `tool_search` name before capture,
- * stays outside authority like every other loader, and is special-cased in the
- * active-set write and call gate instead. A wrapper codemode default adds an
- * inactive registered codemode to authorization (discovery only — it never
- * joins the initial/base active set and tool_search is required before use);
- * an already-active codemode is captured as usual regardless of the flag, and
- * a registry-absent codemode is never force-enabled (explicit restrictions
- * win).
+ * Top-level (dynamic) authority from one registry snapshot (#421): every
+ * registered non-hidden tool is a discovery candidate — Pi's registry already
+ * excludes names withheld by `--tools`/`--exclude-tools`/`--no-tools` or a
+ * disabled builtin extension — regardless of whether it is currently active,
+ * and with no per-name launch or transcript observation (codemode included).
+ * One native nuance stays Pi-owned: a `--tools` allowlist naming no `mcp__`
+ * entry keeps MCP tools registered (for codemode and tool_search) while Pi
+ * declines to declare the direct-exposure ones. Pi exposes no public
+ * per-tool activatability query, so such names remain candidates and
+ * tool_search reports Pi's refusal from the actual post-write active set. The
+ * loader itself stays outside authority (special-cased in the active-set
+ * write and call gate). Operating-mode and settings filters apply on top of
+ * this at every surface.
+ *
+ * Native host support (#421/#94): Pi registers its builtin `powershell` on
+ * every platform although it can only run it on Windows with `pwsh.exe` or
+ * `powershell.exe` available. The builtin (identified by Pi's public
+ * `sourceInfo`, never by name alone) is therefore authorized only when
+ * `nativePowerShellSupported` is true; extension or SDK tools that share the
+ * name are untouched.
  */
-function captureAuthorizationBoundary(pi: DeferredToolHost, codemodeDefault: boolean): AuthorizationBoundary {
-  const active = normalizedActiveNames(pi.getActiveTools());
-  const activeNames = new Set(active);
-  const read = readRegistryMetadata(pi);
-  const registryBaselineCaptured = read.ok;
-  const metadata = read.metadata;
-  const metadataByName = new Map(metadata.map((tool) => [tool.name, tool]));
-  const authorizedNames = new Set(active.filter((name) => name !== DEFERRED_TOOL_SEARCH_NAME));
-  // Pi registers native discovery even when initially inactive. Its registry
-  // already excludes tools withheld by --tools/--exclude-tools/--no-tools.
-  for (const name of NATIVE_DISCOVERY_TOOLS) {
-    if (metadataByName.has(name)) authorizedNames.add(name);
+function dynamicAuthorizedNames(
+  registryEntries: ReadonlyMap<string, ToolMetadata>,
+  nativePowerShellSupported: boolean,
+): Set<string> {
+  const names = new Set<string>();
+  for (const [name, entry] of registryEntries) {
+    if (entry.exposure === "hidden" || name === DEFERRED_TOOL_SEARCH_NAME) continue;
+    if (entry.nativePowerShell === true && !nativePowerShellSupported) continue;
+    names.add(name);
   }
-  // #73: GitRead is an extension-registered tool. Whenever the host registry
-  // carries it (an explicit --tools exclusion removes it from the registry
-  // and stays authoritative), the top-level boundary authorizes it; its
-  // activity is then pinned to plan/research by gitReadVisible, never to the
-  // baseline below.
-  if (metadataByName.has(GIT_READ_TOOL_NAME)) authorizedNames.add(GIT_READ_TOOL_NAME);
-  // #224: native-callable exposures without launch activation join the
-  // authority (script-callable regardless of declaration), with codemode the
-  // tool itself reserved for the explicit wrapper default below.
-  for (const [name, entry] of metadataByName) {
-    if (authorizedNames.has(name) || name === CODEMODE_TOOL_NAME) continue;
-    if (isNativeCallableExposure(entry.exposure)) authorizedNames.add(name);
-  }
-  const initialActiveNames: string[] = DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER
-    .filter((name) => name !== GIT_READ_TOOL_NAME)
-    .filter((name) => authorizedNames.has(name));
-  // #224: only an inactive registered codemode joins the base when the
-  // wrapper default is enabled; a launch-active codemode stays captured as
-  // usual regardless of the flag.
-  const codemodeEntry = metadataByName.get(CODEMODE_TOOL_NAME);
-  if (codemodeDefault && codemodeEntry && codemodeEntry.exposure !== "hidden" && !activeNames.has(CODEMODE_TOOL_NAME)) {
-    // Wrapper default authorizes discovery only (#224 correction): codemode
-    // stays outside the initial/base active set — tool_search is required
-    // before use, and a native auto activation is never promoted either.
-    authorizedNames.add(CODEMODE_TOOL_NAME);
-  }
-  const catalog = [...authorizedNames]
-    .map((name) => metadataByName.get(name) ?? { name, description: "", exposure: "direct" })
-    .sort((left, right) => compareNames(left.name, right.name));
+  return names;
+}
+
+/**
+ * Top-level conservative baseline from the live authority: the shared
+ * initial-active order, never GitRead (its activity is pinned to
+ * plan/research by gitReadVisible) and never codemode (absent from the order;
+ * tool_search loads it). Shells keep historical parity (#94/#421): `bash` and
+ * `powershell` are both baseline wherever the live authority carries them,
+ * and that authority already withholds a native `powershell` builtin the
+ * host cannot run.
+ */
+function dynamicBaselineNames(authorizedNames: ReadonlySet<string>): string[] {
+  return DEFAULT_EXECUTOR_INITIAL_TOOL_ORDER
+    .filter((name) => name !== GIT_READ_TOOL_NAME && authorizedNames.has(name));
+}
+
+/**
+ * Top-level boundary shell. Nothing is captured here — not the active set,
+ * which Pi has already restored from a resumed, switched, or forked
+ * transcript — so the immediate reconciliation in sessionStart (and every
+ * later seam) derives the whole authority from the live registry.
+ */
+function createDynamicBoundary(): AuthorizationBoundary {
   return createAuthorizationBoundary({
-    catalog,
-    authorizedNames,
-    initialActiveNames,
+    catalog: [],
+    authorizedNames: new Set(),
+    initialActiveNames: [],
     dynamic: true,
-    codemodeDefault,
-    registryBaselineNames: new Set(metadataByName.keys()),
-    registryBaselineCaptured,
-    // Names the registry already knew at capture: re-registrations of the
-    // same name later are not "new" authorities (a disabled ordinary name
-    // never gains access); only new registrations, withdrawal reversals, and
-    // explicit hidden-to-visible native MCP exposure changes adopt.
-    registryEntries: metadataByName,
-    withdrawnNames: new Set([...metadataByName.values()]
-      .filter((tool) => isCanonicalNativeMcpToolName(tool.name) && tool.exposure === "hidden")
-      .map((tool) => tool.name)),
+    registryEntries: new Map(),
   });
 }
 
@@ -1320,7 +1316,6 @@ function captureAuthorizationBoundary(pi: DeferredToolHost, codemodeDefault: boo
 function captureConfiguredAuthorizationBoundary(
   pi: DeferredToolHost,
   configuredCatalog: ExecutorToolCatalog,
-  codemodeDefault: boolean,
 ): AuthorizationBoundary | undefined {
   let normalized: ExecutorToolCatalog;
   try {
@@ -1387,11 +1382,7 @@ function captureConfiguredAuthorizationBoundary(
     // The configured ceiling is frozen authority: reconciliation never
     // expands it; the visible set below is the registry intersection.
     dynamic: false,
-    codemodeDefault,
-    registryBaselineNames: new Set(metadataByName.keys()),
-    registryBaselineCaptured: true,
     registryEntries: metadataByName,
-    withdrawnNames: new Set(),
   });
 }
 
@@ -1429,6 +1420,22 @@ function normalizedActiveNames(value: unknown): string[] {
   return names;
 }
 
+/**
+ * Pi's public active set (`getActiveTools()`, the tools declared to the
+ * model), or undefined when the host cannot disclose it — callers then
+ * confirm nothing and prune nothing.
+ */
+function nativeActiveSet(pi: unknown): Set<string> | undefined {
+  if (!isDeferredToolHost(pi)) return undefined;
+  let value: unknown;
+  try {
+    value = pi.getActiveTools();
+  } catch {
+    return undefined;
+  }
+  return Array.isArray(value) ? new Set(normalizedActiveNames(value)) : undefined;
+}
+
 /** Live active-set read; an unreadable host discloses nothing. */
 function activeToolNamesOf(pi: DeferredToolHost): string[] {
   try {
@@ -1451,6 +1458,7 @@ function toolMetadata(value: unknown): ToolMetadata[] {
       name,
       description: typeof item.description === "string" ? item.description : "",
       exposure: resolveExposure(item.exposure),
+      ...(isNativePowerShellBuiltinEntry(item) ? { nativePowerShell: true } : {}),
     });
   }
   return result;

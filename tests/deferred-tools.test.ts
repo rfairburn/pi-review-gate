@@ -36,7 +36,15 @@ function tool(name: string, description: string, extra: { exposure?: string } = 
   } as RegisteredTool;
 }
 
-function hostFixture(options: { disabled?: string[]; omit?: string[] } = {}) {
+/**
+ * Fake Pi host. `disabled` (default `disabled_private`) and `omit` model an
+ * explicit native restriction (`--tools`/`--exclude-tools`/`--no-tools`):
+ * real Pi removes such names from its registry, so they are absent from
+ * getAllTools. `inactive` models a registered tool that is merely not in the
+ * restored/default loadout (for example a resumed transcript that never
+ * declared it) — #421: inactivity is not a restriction at the top level.
+ */
+function hostFixture(options: { disabled?: string[]; omit?: string[]; inactive?: string[] } = {}) {
   const definitions: RegisteredTool[] = [
     tool("read", "Read file contents."),
     tool("bash", "Execute a shell command."),
@@ -48,9 +56,13 @@ function hostFixture(options: { disabled?: string[]; omit?: string[] } = {}) {
     tool("SubtasksInspect", "Inspect background execution state."),
     tool("WebSearch", "Search the public web for current sources."),
     tool("disabled_private", "Search a private disabled service."),
-  ].filter((definition) => !(options.omit ?? []).includes(definition.name));
-  const disabled = new Set([...(options.omit ?? []), ...((options.disabled ?? ["disabled_private"]))]);
-  let active = definitions.map((definition) => definition.name).filter((name) => !disabled.has(name));
+  ];
+  const removed = new Set([...(options.omit ?? []), ...(options.disabled ?? ["disabled_private"])]);
+  for (let index = definitions.length - 1; index >= 0; index -= 1) {
+    if (removed.has(definitions[index]!.name)) definitions.splice(index, 1);
+  }
+  const inactive = new Set(options.inactive ?? []);
+  let active = definitions.map((definition) => definition.name).filter((name) => !inactive.has(name));
   const setCalls: string[][] = [];
   const sessionIdentity = {};
   const pi = {
@@ -96,12 +108,19 @@ function hostFixture(options: { disabled?: string[]; omit?: string[] } = {}) {
 
 test("write starts active only when authorized and not in planning (#45)", () => {
   for (const mode of ["execute", "orchestrate", "plan-research"] as const) {
-    for (const excluded of [false, true]) {
-      const fixture = hostFixture({ disabled: excluded ? ["write"] : [] });
+    for (const launch of ["registered", "excluded", "restored-inactive"] as const) {
+      // "excluded" is an explicit native restriction (absent from Pi's
+      // registry); "restored-inactive" is a registered write that a resumed
+      // transcript's loadout simply did not declare (#421): not a restriction.
+      const fixture = hostFixture({
+        disabled: launch === "excluded" ? ["write"] : [],
+        inactive: launch === "restored-inactive" ? ["write"] : [],
+      });
       const manager = new DeferredToolManager(fixture.pi, () => mode);
       manager.register();
       manager.sessionStart(fixture.sessionIdentity);
-      assert.equal(fixture.active().includes("write"), !excluded && mode !== "plan-research");
+      assert.equal(fixture.active().includes("write"), launch !== "excluded" && mode !== "plan-research", `${mode}/${launch}`);
+      assert.equal(manager.authorizedToolNames()?.includes("write"), launch !== "excluded", `${mode}/${launch} authority`);
     }
   }
 });
@@ -113,7 +132,6 @@ test("the live tool-availability filter narrows discovery, activation, and direc
   const manager = new DeferredToolManager(
     fixture.pi,
     undefined,
-    false,
     (name) => name !== "YouShouldKnow" || enabled,
   );
   manager.register();
@@ -329,7 +347,10 @@ test("role-filtered research inventory lists only deferred discovery names witho
 });
 
 test("configured worker boundaries reject unavailable and unauthorized tools", async () => {
-  const fixture = hostFixture({ disabled: ["WebSearch", "disabled_private"] });
+  // Worker hard gate: a registered ceiling name the native launch did not
+  // activate is a broken worker bootstrap (unchanged by #421, which applies
+  // only to the top-level dynamic boundary).
+  const fixture = hostFixture({ disabled: [], inactive: ["WebSearch", "disabled_private"] });
   const manager = new DeferredToolManager(fixture.pi);
   manager.register();
 
@@ -795,7 +816,7 @@ test("launch-authorized native discovery is active from the first request in eve
 test("registered-but-inactive native discovery becomes active by default in every mode (#71)", async () => {
   // Pi's default startup and --no-builtin-tools both leave discovery registered
   // but inactive. Registry-authorized discovery is always on in this extension.
-  const fixture = hostFixture({ disabled: ["grep", "find", "ls"] });
+  const fixture = hostFixture({ disabled: [], inactive: ["disabled_private"] });
   for (const name of ["grep", "find", "ls"]) {
     fixture.registerInactive(tool(name, `Native read-only discovery via ${name}.`));
   }
@@ -816,6 +837,9 @@ test("registered-but-inactive native discovery becomes active by default in ever
     for (const name of ["grep", "find", "ls"]) assert.ok(fixture.active().includes(name));
   }
   assert.ok(!fixture.active().includes("disabled_private"), "other inactive tools are not promoted");
+  // #421: they are discovery candidates at the top level, loaded only by tool_search.
+  assert.equal(manager.isToolDiscoveryEligible("disabled_private"), true);
+  assert.equal(manager.toolCallAllowed("disabled_private"), false, "an undeclared candidate is not callable before loading");
 });
 
 test("explicit registry removal keeps discovery tools inactive, unauthorized, and undiscoverable (#71)", async () => {
@@ -1660,7 +1684,7 @@ test("deferred-off keeps native callees undeclared across toggles and late regis
   fixture.registerInactive(tool(hidden, "A hidden remote entry.", { exposure: "hidden" }));
   fixture.registerInactive(tool(CODEMODE_TOOL_NAME, "Run scripts that call session tools.", { exposure: "model-only" }));
 
-  const manager = new DeferredToolManager(fixture.pi, () => "orchestrate", true);
+  const manager = new DeferredToolManager(fixture.pi, () => "orchestrate");
   manager.register();
   manager.sessionStart(fixture.sessionIdentity, undefined, false, false);
   assert.ok(fixture.active().includes("write"), "ordinary permitted tools use the normal full-active loadout");
@@ -1937,7 +1961,7 @@ test("first recovered registry snapshot can establish a hidden native MCP transi
 test("wrapper codemode default authorizes discoverable codemode without activation (#224)", async () => {
   const fixture = hostFixture();
   fixture.registerInactive(tool(CODEMODE_TOOL_NAME, "Run JavaScript scripts that call the session's tools.", { exposure: "model-only" }));
-  const manager = new DeferredToolManager(fixture.pi, () => "orchestrate", true);
+  const manager = new DeferredToolManager(fixture.pi, () => "orchestrate");
   manager.register();
   manager.sessionStart(fixture.sessionIdentity);
 
@@ -1959,7 +1983,7 @@ test("wrapper codemode default authorizes discoverable codemode without activati
   assert.ok(fixture.active().includes(CODEMODE_TOOL_NAME));
 });
 
-test("late codemode registration needs the captured wrapper default (#224)", async () => {
+test("#421 a late codemode registration is a deferred candidate and a stale declaration grants nothing", async () => {
   const fixture = hostFixture();
   const manager = new DeferredToolManager(fixture.pi, () => "orchestrate");
   manager.register();
@@ -1967,17 +1991,25 @@ test("late codemode registration needs the captured wrapper default (#224)", asy
 
   fixture.pi.registerTool(tool(CODEMODE_TOOL_NAME, "Run JavaScript scripts.", { exposure: "model-only" }));
   manager.reapply();
-  assert.equal(manager.authorizedToolNames()?.includes(CODEMODE_TOOL_NAME), false);
-  assert.equal(fixture.active().includes(CODEMODE_TOOL_NAME), false, "host auto-activation does not bypass wrapper intent");
-  assert.equal(manager.toolCallAllowed(CODEMODE_TOOL_NAME), false);
+  assert.ok(manager.authorizedToolNames()?.includes(CODEMODE_TOOL_NAME), "registry presence admits codemode");
+  assert.equal(fixture.active().includes(CODEMODE_TOOL_NAME), false, "host auto-activation is never promoted");
+  assert.equal(manager.toolCallAllowed(CODEMODE_TOOL_NAME), false, "undeclared codemode is not callable");
   const search = await fixture.search()("late-codemode", { query: CODEMODE_TOOL_NAME });
-  assert.deepEqual((search.details as { matched: string[] }).matched, []);
-});
+  assert.deepEqual((search.details as { activated: string[] }).activated, [CODEMODE_TOOL_NAME]);
 
+  // A stale declaration (Pi still reports codemode active, e.g. restored from
+  // a transcript) cannot keep authority once the registry withdraws it.
+  fixture.pi.registerTool(tool(CODEMODE_TOOL_NAME, "Run JavaScript scripts.", { exposure: "hidden" }));
+  fixture.pi.setActiveTools([...fixture.active(), CODEMODE_TOOL_NAME]);
+  manager.reapply();
+  assert.equal(manager.authorizedToolNames()?.includes(CODEMODE_TOOL_NAME), false);
+  assert.equal(fixture.active().includes(CODEMODE_TOOL_NAME), false);
+  assert.equal(manager.toolCallAllowed(CODEMODE_TOOL_NAME), false);
+});
 test("an already-active codemode stays captured as usual regardless of the wrapper flag (#224)", async () => {
   const fixture = hostFixture();
   fixture.pi.registerTool(tool(CODEMODE_TOOL_NAME, "Run JavaScript scripts that call the session's tools.", { exposure: "model-only" }));
-  const manager = new DeferredToolManager(fixture.pi, () => "orchestrate", true);
+  const manager = new DeferredToolManager(fixture.pi, () => "orchestrate");
   manager.register();
   manager.sessionStart(fixture.sessionIdentity);
 
@@ -2003,7 +2035,7 @@ test("manual-session codemode authority recovers after withdrawal with deferred 
   const deferredFixture = hostFixture();
   const codemode = tool(CODEMODE_TOOL_NAME, "Run JavaScript scripts.", { exposure: "model-only" });
   deferredFixture.pi.registerTool(codemode);
-  const deferredManager = new DeferredToolManager(deferredFixture.pi, () => "orchestrate", false);
+  const deferredManager = new DeferredToolManager(deferredFixture.pi, () => "orchestrate");
   deferredManager.register();
   deferredManager.sessionStart(deferredFixture.sessionIdentity, undefined, false, true);
   assert.ok(deferredManager.authorizedToolNames()?.includes(CODEMODE_TOOL_NAME), "launch-active codemode is captured without wrapper default");
@@ -2022,7 +2054,7 @@ test("manual-session codemode authority recovers after withdrawal with deferred 
 
   const fullFixture = hostFixture();
   fullFixture.pi.registerTool(codemode);
-  const fullManager = new DeferredToolManager(fullFixture.pi, () => "orchestrate", false);
+  const fullManager = new DeferredToolManager(fullFixture.pi, () => "orchestrate");
   fullManager.register();
   fullManager.sessionStart(fullFixture.sessionIdentity, undefined, false, false);
   assert.ok(fullFixture.active().includes(CODEMODE_TOOL_NAME));
@@ -2041,7 +2073,7 @@ test("the captured wrapper default intent survives reload and later codemode reg
   // Capture with the wrapper default while codemode is not in the launch
   // registry; a constructor false on reload must never erase the intent.
   const fixture = hostFixture();
-  const first = new DeferredToolManager(fixture.pi, () => "orchestrate", true);
+  const first = new DeferredToolManager(fixture.pi, () => "orchestrate");
   first.register();
   first.sessionStart(fixture.sessionIdentity);
   assert.equal(first.authorizedToolNames()?.includes(CODEMODE_TOOL_NAME), false, "nothing to authorize while the registry lacks it");
@@ -2061,7 +2093,7 @@ test("an explicit codemode registry restriction defeats the wrapper default (#22
   // --tools/--no-tools removed the name from the registry: the manager never
   // re-registers a builtin or forces an absent name into authority.
   const fixture = hostFixture({ omit: [CODEMODE_TOOL_NAME] });
-  const manager = new DeferredToolManager(fixture.pi, () => "orchestrate", true);
+  const manager = new DeferredToolManager(fixture.pi, () => "orchestrate");
   manager.register();
   manager.sessionStart(fixture.sessionIdentity);
 
@@ -2077,7 +2109,7 @@ test("an explicit codemode registry restriction defeats the wrapper default (#22
 test("deferred-off capture runs full-active over the authorized set with no codemode exception (#224)", () => {
   const fixture = hostFixture();
   fixture.registerInactive(tool(CODEMODE_TOOL_NAME, "Run JavaScript scripts that call the session's tools.", { exposure: "model-only" }));
-  const manager = new DeferredToolManager(fixture.pi, () => "orchestrate", true);
+  const manager = new DeferredToolManager(fixture.pi, () => "orchestrate");
   manager.register();
   manager.sessionStart(fixture.sessionIdentity, undefined, false, false);
 
@@ -2158,7 +2190,7 @@ test("plan-research disables codemode in catalog and callable gates (#224)", asy
   fixture.registerInactive(tool(CODEMODE_TOOL_NAME, "Run JavaScript scripts that call the session's tools.", { exposure: "model-only" }));
   fixture.registerInactive(tool("mcp__docs__search", "Search remote docs entries.", { exposure: "codemode" }));
   let mode: OperatingMode = "orchestrate";
-  const manager = new DeferredToolManager(fixture.pi, () => mode, true);
+  const manager = new DeferredToolManager(fixture.pi, () => mode);
   manager.register();
   manager.sessionStart(fixture.sessionIdentity);
   const load = await fixture.search()("load-codemode", { query: CODEMODE_TOOL_NAME });
@@ -2183,9 +2215,17 @@ test("plan-research disables codemode in catalog and callable gates (#224)", asy
   assert.equal(manager.toolCallAllowed("mcp__docs__search", true), false, "unknown MCP tools are not presumed read-only");
   assert.equal(manager.toolCallAllowed("WebSearch", true), false, "inactive direct tools are not natively script-callable in research either");
 
+  // #421: entering plan/research removed the prior codemode selection; the
+  // return rebuilds from the current registry, so codemode is again an
+  // authorized deferred candidate that tool_search must load.
   mode = "orchestrate";
   manager.reapply();
-  assert.ok(fixture.active().includes(CODEMODE_TOOL_NAME), "search-activated codemode restores on the mode switch back");
+  assert.equal(fixture.active().includes(CODEMODE_TOOL_NAME), false, "a pre-plan selection is not resurrected on the switch back");
+  assert.equal(manager.toolCallAllowed(CODEMODE_TOOL_NAME), false);
+  assert.equal(manager.isToolDiscoveryEligible(CODEMODE_TOOL_NAME), true, "codemode is discoverable again in a write-capable mode");
+  const reload = await fixture.search()("reload-codemode", { query: CODEMODE_TOOL_NAME });
+  assert.deepEqual((reload.details as { activated: string[] }).activated, [CODEMODE_TOOL_NAME]);
+  assert.ok(fixture.active().includes(CODEMODE_TOOL_NAME));
   assert.ok(manager.toolCallAllowed(CODEMODE_TOOL_NAME));
 });
 
@@ -2271,46 +2311,57 @@ test("an unreadable registry denies live discovery and calls while retaining the
   assert.equal(manager.startupGuidance()?.includes("WebSearch"), true);
 });
 
-test("capture-time exclusions stay excluded across reconnect and empty-registry recovery (#224)", async () => {
+test("top-level authority follows only the current registry across reconnect, hidden exposure, and empty-registry recovery (#421)", async () => {
   const fixture = hostFixture();
-  fixture.registerInactive(tool("hidden_at_capture", "A restricted hidden tool.", { exposure: "hidden" }));
+  fixture.registerInactive(tool("hidden_at_start", "A restricted hidden tool.", { exposure: "hidden" }));
   const manager = new DeferredToolManager(fixture.pi);
   manager.register();
   manager.sessionStart(fixture.sessionIdentity);
+  // Explicitly excluded (absent) and hidden registrations are not authority.
   assert.equal(manager.authorizedToolNames()?.includes("disabled_private"), false);
-  assert.equal(manager.authorizedToolNames()?.includes("hidden_at_capture"), false);
+  assert.equal(manager.authorizedToolNames()?.includes("hidden_at_start"), false);
+  assert.equal(manager.toolCallAllowed("hidden_at_start"), false);
+  const hidden = await fixture.search()("hidden", { query: "hidden_at_start" });
+  assert.deepEqual((hidden.details as { matched: string[] }).matched, []);
 
-  // Reconnecting an entry that was already present but disabled at capture is
-  // not a newly authorized host registration. A capture-time hidden exposure
-  // is likewise not a deferred withdrawal that grants on later visibility.
-  fixture.removeFromRegistry("disabled_private");
-  manager.reapply();
+  // A registration Pi permits now (or a hidden one Pi re-exposes) is a
+  // discovery candidate from the next seam: no capture-time memory withholds
+  // it, and nothing activates it before tool_search loads it.
   fixture.pi.registerTool(tool("disabled_private", "Search a private disabled service."));
-  fixture.pi.registerTool(tool("hidden_at_capture", "A restricted hidden tool."));
+  fixture.pi.registerTool(tool("hidden_at_start", "A restricted hidden tool."));
+  manager.reapply();
+  for (const name of ["disabled_private", "hidden_at_start"]) {
+    assert.equal(fixture.active().includes(name), false, `${name} is not auto-declared`);
+    assert.ok(manager.authorizedToolNames()?.includes(name), `${name} joins live authority`);
+    assert.equal(manager.toolCallAllowed(name), false, `${name} is not callable before loading`);
+  }
+  const loaded = await fixture.search()("loaded", { query: "disabled_private" });
+  assert.deepEqual((loaded.details as { activated: string[] }).activated, ["disabled_private"]);
+  assert.ok(manager.toolCallAllowed("disabled_private"));
+
+  // Withdrawal to hidden removes authority and the loaded selection.
+  fixture.pi.registerTool(tool("disabled_private", "Search a private disabled service.", { exposure: "hidden" }));
   manager.reapply();
   assert.equal(fixture.active().includes("disabled_private"), false);
-  assert.equal(fixture.active().includes("hidden_at_capture"), false);
   assert.equal(manager.authorizedToolNames()?.includes("disabled_private"), false);
-  assert.equal(manager.authorizedToolNames()?.includes("hidden_at_capture"), false);
   assert.equal(manager.toolCallAllowed("disabled_private"), false);
-  assert.equal(manager.toolCallAllowed("hidden_at_capture"), false);
-  const excluded = await fixture.search()("excluded", { query: "private disabled" });
-  assert.deepEqual((excluded.details as { matched: string[] }).matched, []);
 
-  // An authoritative empty read withdraws live entries, but recovery restores
-  // only prior authority/default intent; it cannot forget launch exclusions.
+  // An authoritative empty read withdraws everything; recovery derives
+  // authority from the recovered registry only, and a selection withdrawn in
+  // between needs tool_search again.
   const healthyGetAllTools = fixture.pi.getAllTools;
   fixture.pi.getAllTools = () => [];
   manager.reapply();
+  assert.deepEqual(manager.authorizedToolNames(), []);
   fixture.pi.getAllTools = healthyGetAllTools;
+  fixture.pi.registerTool(tool("disabled_private", "Search a private disabled service."));
   manager.reapply();
-  assert.equal(manager.authorizedToolNames()?.includes("disabled_private"), false);
-  assert.equal(manager.authorizedToolNames()?.includes("hidden_at_capture"), false);
-  assert.equal(manager.toolCallAllowed("disabled_private"), false);
-  assert.equal(manager.toolCallAllowed("hidden_at_capture"), false);
+  assert.ok(manager.authorizedToolNames()?.includes("disabled_private"));
+  assert.equal(fixture.active().includes("disabled_private"), false, "a withdrawn selection is not resurrected");
+  assert.ok(manager.toolCallAllowed("read"));
 });
 
-test("first registry recovery establishes a baseline instead of adopting unknown stale names (#224)", () => {
+test("first registry recovery derives authority from the recovered registry (#421)", () => {
   const fixture = hostFixture();
   const healthyGetAllTools = fixture.pi.getAllTools;
   fixture.pi.getAllTools = () => {
@@ -2321,20 +2372,16 @@ test("first registry recovery establishes a baseline instead of adopting unknown
   assert.equal(manager.sessionStart(fixture.sessionIdentity), true);
   assert.deepEqual(manager.authorizedToolNames(), [], "an unreadable registry exposes no live dynamic catalog");
   assert.equal(manager.toolCallAllowed("read"), false);
+  assert.equal(manager.isToolDiscoveryEligible("read"), false);
+  assert.equal(manager.startupGuidance(), undefined);
 
-  // Names observed only after recovery cannot be distinguished from entries
-  // that were already restricted during the outage, so the first healthy read
-  // establishes a non-adopting baseline. Later registrations are dynamic.
   fixture.registerInactive(tool("registered_during_outage", "A name first observed during recovery."));
   fixture.pi.getAllTools = healthyGetAllTools;
   manager.reapply();
-  assert.ok(manager.toolCallAllowed("read"), "captured launch authority recovers");
-  assert.equal(manager.authorizedToolNames()?.includes("registered_during_outage"), false);
-
-  fixture.pi.registerTool(tool("registered_after_recovery", "A newly permitted registration after recovery."));
-  manager.reapply();
-  assert.ok(manager.authorizedToolNames()?.includes("registered_after_recovery"));
-  assert.equal(fixture.active().includes("registered_after_recovery"), false, "late authority stays deferred until search loads it");
+  assert.ok(manager.toolCallAllowed("read"), "baseline authority recovers from the live registry");
+  assert.ok(fixture.active().includes("write"), "the baseline is rebuilt from the recovered registry");
+  assert.ok(manager.authorizedToolNames()?.includes("registered_during_outage"), "a permitted registration is a candidate");
+  assert.equal(fixture.active().includes("registered_during_outage"), false, "candidates stay deferred until search loads them");
 });
 
 test("an empty launch set legitimately captures an empty boundary (#224)", async () => {
@@ -2530,7 +2577,7 @@ test("failed-startup writes intersect live availability (#224/review-0002)", asy
 });
 
 test("a malformed worker bootstrap fails closed under the read-only mode policy (#224/review-0004)", async () => {
-  const fixture = hostFixture({ disabled: ["WebSearch"] });
+  const fixture = hostFixture({ inactive: ["WebSearch"] });
   let mode: OperatingMode = "plan-research";
   const manager = new DeferredToolManager(fixture.pi, () => mode);
   manager.register();
@@ -2601,8 +2648,17 @@ test("plan-research has all MCP tools off by default, across exposures and late 
   manager.reapply();
   assert.ok(manager.toolCallAllowed("mcp__docs__search", true), "codemode-exposure MCP is script-callable again");
   assert.ok(manager.toolCallAllowed("mcp__docs__load", true));
-  assert.ok(manager.toolCallAllowed("mcp__direct__read"), "the search-declared direct MCP tool restores");
+  // #421: the pre-plan direct MCP selection was removed in research; the
+  // return rebuilds from the current registry, so it needs tool_search again.
+  assert.equal(manager.toolCallAllowed("mcp__direct__read"), false, "a pre-plan selection is not resurrected");
+  assert.equal(fixture.active().includes("mcp__direct__read"), false);
+  assert.ok(manager.isToolDiscoveryEligible("mcp__direct__read"));
+  const reload = await fixture.search()("reload", { query: "mcp__direct__read" });
+  assert.deepEqual((reload.details as { activated: string[] }).activated, ["mcp__direct__read"]);
+  assert.ok(manager.toolCallAllowed("mcp__direct__read"), "the reloaded direct MCP tool is callable");
   assert.equal(fixture.active().includes("mcp__docs__search"), false, "codemode exposure is still never promoted to declaration");
+  assert.equal(fixture.active().includes("mcp__late__tool"), false, "a late codemode-exposed registration is never auto-declared");
+  assert.ok(manager.toolCallAllowed("mcp__late__tool", true), "a late codemode-exposed registration keeps its native script channel");
 });
 
 function searchDescription(fixture: ReturnType<typeof hostFixture>): string {
@@ -2949,4 +3005,245 @@ test("the startup inventory stays complete beyond the search limit (#279)", asyn
   const description = searchDescription(fixture);
   for (const name of names) assert.ok(description.includes(name), `description lists ${name}`);
   for (const name of names) assert.ok(guidanceListsName(manager, name), `inventory lists ${name}`);
+});
+
+test("#421 a resumed transcript's loadout is not authority: registered tools are candidates and the baseline is rebuilt live", async () => {
+  // Pi restored a loadout that declared only `read` (e.g. a resumed plan transcript).
+  const fixture = hostFixture({
+    disabled: [],
+    inactive: ["bash", "edit", "write", "ApplyPatch", "SubtasksStart", "SubtasksAdd", "SubtasksInspect", "WebSearch", "disabled_private"],
+  });
+  // No public provenance: not provably Pi's native builtin, so it keeps the
+  // historical shell parity with bash (#94/#421).
+  fixture.registerInactive(tool("powershell", "Execute a PowerShell command."));
+  const manager = new DeferredToolManager(fixture.pi, () => "execute");
+  manager.register();
+  assert.equal(manager.sessionStart(fixture.sessionIdentity), true);
+  assert.deepEqual(fixture.active(), ["read", "bash", "powershell", "edit", "write", "ApplyPatch", "SubtasksStart", "tool_search"],
+    "the role baseline is rebuilt from the live registry, not the restored loadout");
+  for (const name of ["SubtasksAdd", "SubtasksInspect", "WebSearch", "disabled_private"]) {
+    assert.ok(manager.isToolDiscoveryEligible(name), `${name} is a discovery candidate`);
+    assert.equal(fixture.active().includes(name), false, `${name} is not auto-declared`);
+    assert.equal(manager.toolCallAllowed(name), false, `${name} needs tool_search first`);
+  }
+  assert.ok(manager.toolCallAllowed("powershell"), "an authorized shell is baseline like bash");
+  const loaded = await fixture.search()("resume", { query: "WebSearch" });
+  assert.deepEqual((loaded.details as { activated: string[] }).activated, ["WebSearch"]);
+  assert.ok(manager.toolCallAllowed("WebSearch"));
+});
+
+test("#421 shell parity is registry-derived: bash and an authorized powershell are both baseline, whatever was declared", () => {
+  // Pi declared powershell (launch selection or a restored transcript): activity grants nothing extra.
+  const both = hostFixture();
+  both.pi.registerTool(tool("powershell", "Execute a PowerShell command."));
+  const bothManager = new DeferredToolManager(both.pi, () => "execute");
+  bothManager.register();
+  bothManager.sessionStart(both.sessionIdentity);
+  assert.ok(both.active().includes("bash"));
+  assert.ok(both.active().includes("powershell"), "an authorized powershell beside bash keeps historical parity");
+  assert.equal(bothManager.isToolDiscoveryEligible("powershell"), true);
+
+  // Powershell-only registry (bash excluded natively): powershell is the baseline shell.
+  const only = hostFixture({ omit: ["bash"] });
+  only.registerInactive(tool("powershell", "Execute a PowerShell command."));
+  const onlyManager = new DeferredToolManager(only.pi, () => "execute");
+  onlyManager.register();
+  onlyManager.sessionStart(only.sessionIdentity);
+  assert.ok(only.active().includes("powershell"), "powershell-only hosts keep their shell active");
+  assert.equal(only.active().includes("bash"), false);
+});
+test("#421 leaving Plan/research rebuilds the loadout from the registry as it is at that moment", async () => {
+  const fixture = hostFixture();
+  let mode: OperatingMode = "execute";
+  const manager = new DeferredToolManager(fixture.pi, () => mode);
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity);
+  const loaded = await fixture.search()("pre", { query: "SubtasksAdd WebSearch" });
+  assert.deepEqual((loaded.details as { activated: string[] }).activated, ["SubtasksAdd", "WebSearch"]);
+
+  mode = "plan-research";
+  manager.reapply();
+  for (const name of ["write", "bash", "ApplyPatch", "SubtasksStart", "SubtasksAdd"]) {
+    assert.equal(fixture.active().includes(name), false, `${name} is removed in plan/research`);
+    assert.equal(manager.toolCallAllowed(name), false);
+  }
+  assert.ok(fixture.active().includes("WebSearch"), "a read-only research selection stays loaded");
+
+  // While restricted: one tool is withdrawn, one write is removed from Pi's
+  // registry, and a new tool registers. Pi's own registration activation is
+  // not promoted.
+  fixture.removeFromRegistry("ApplyPatch");
+  fixture.pi.registerTool(tool("SubtasksAdd", "Add tasks to an existing background execution.", { exposure: "hidden" }));
+  fixture.pi.registerTool(tool("NewWriter", "A newly registered write-capable tool."));
+  manager.reapply();
+  assert.equal(fixture.active().includes("NewWriter"), false);
+  assert.equal(manager.isToolDiscoveryEligible("NewWriter"), false, "plan/research hides the new write-capable tool");
+
+  mode = "orchestrate";
+  manager.reapply();
+  assert.deepEqual(fixture.active(), ["read", "bash", "edit", "write", "SubtasksStart", "tool_search", "WebSearch"],
+    "baseline returns only where currently registered; pre-plan non-research selections are not resurrected");
+  assert.ok(manager.isToolDiscoveryEligible("NewWriter"), "a new permitted registration is a candidate");
+  assert.equal(manager.isToolDiscoveryEligible("SubtasksAdd"), false, "a withdrawn name is not discoverable");
+  assert.equal(manager.isToolDiscoveryEligible("ApplyPatch"), false, "a removed name is not discoverable");
+  const reload = await fixture.search()("post", { query: "SubtasksAdd ApplyPatch NewWriter" });
+  assert.deepEqual((reload.details as { activated: string[] }).activated, ["NewWriter"]);
+});
+
+test("#421 tool_search reports a host-declined activation truthfully and never retains it as loaded", async () => {
+  const fixture = hostFixture({ inactive: ["WebSearch"] });
+  const declinedName = "mcp__docs__direct";
+  // A registered direct-exposure MCP tool the host lists but declines to
+  // declare (Pi 1.3: a --tools allowlist naming no mcp__ entry). The fake
+  // stands in for Pi's own setActiveTools policy, which the manager never
+  // replicates: it only observes the public post-write active set.
+  fixture.registerInactive(tool(declinedName, "Search the direct docs index.", { exposure: "direct" }));
+  const hostSet = fixture.pi.setActiveTools.bind(fixture.pi);
+  const requestedWrites: string[][] = [];
+  fixture.pi.setActiveTools = (names: string[]) => {
+    requestedWrites.push([...names]);
+    hostSet(names.filter((name) => name !== declinedName));
+  };
+  const manager = new DeferredToolManager(fixture.pi);
+  manager.register();
+  assert.equal(manager.sessionStart(fixture.sessionIdentity), true);
+
+  // The registered name stays a discovery candidate (no public per-tool
+  // activatability source), on both inventory surfaces.
+  assert.match(manager.startupGuidance() ?? "", new RegExp(declinedName));
+  assert.equal(manager.isToolDiscoveryEligible(declinedName), true);
+
+  const refusedOnly = await fixture.search()("declined", { query: declinedName });
+  const refusedDetails = refusedOnly.details as Record<string, unknown>;
+  assert.equal(refusedOnly.isError, true, "a refusal with nothing usable is a failed request");
+  assert.equal(refusedDetails.outcome, "refused");
+  assert.deepEqual(refusedDetails.matched, [declinedName]);
+  assert.deepEqual(refusedDetails.activated, [], "a declined name is never reported activated");
+  assert.deepEqual(refusedDetails.alreadyActive, [], "a declined name is never reported already active");
+  assert.deepEqual(refusedDetails.refused, [declinedName]);
+  const refusedText = (refusedOnly.content as Array<{ text: string }>)[0]!.text;
+  assert.match(refusedText, /Not activated: mcp__docs__direct\./);
+  assert.doesNotMatch(refusedText, /Activated:|already active/);
+  assert.equal(fixture.active().includes(declinedName), false);
+  assert.equal(manager.toolCallAllowed(declinedName), false, "the failed activation grants no call");
+
+  // A repeat search is still a refusal (no retained selection makes it look
+  // already active), and the declined name never leaks into later writes.
+  const repeated = await fixture.search()("declined-again", { query: declinedName });
+  assert.deepEqual((repeated.details as Record<string, unknown>).refused, [declinedName]);
+  assert.deepEqual((repeated.details as Record<string, unknown>).alreadyActive, []);
+  manager.reapply();
+  assert.ok(requestedWrites.at(-1)!.every((name) => name !== declinedName), "no retained declaration request");
+
+  // Mixed: an ordinary candidate activates and an already-active baseline
+  // name stays already active beside the refusal, which is not an error.
+  const mixed = await fixture.search()("mixed", { query: `WebSearch read ${declinedName}` });
+  const mixedDetails = mixed.details as Record<string, unknown>;
+  assert.equal(mixed.isError, false);
+  assert.equal(mixedDetails.outcome, "activated");
+  assert.deepEqual(mixedDetails.activated, ["WebSearch"]);
+  assert.deepEqual(mixedDetails.alreadyActive, ["read"]);
+  assert.deepEqual(mixedDetails.refused, [declinedName]);
+  assert.ok(fixture.active().includes("WebSearch"));
+  assert.ok(manager.toolCallAllowed("WebSearch"));
+  assert.equal(manager.toolCallAllowed(declinedName), false);
+
+  // Once the host accepts the name (for example a later launch that names it
+  // in --tools), the same search activates it normally.
+  fixture.pi.setActiveTools = hostSet;
+  const accepted = await fixture.search()("accepted", { query: declinedName });
+  assert.deepEqual((accepted.details as Record<string, unknown>).activated, [declinedName]);
+  assert.deepEqual((accepted.details as Record<string, unknown>).refused, []);
+  assert.ok(manager.toolCallAllowed(declinedName));
+  const again = await fixture.search()("again", { query: declinedName });
+  assert.deepEqual((again.details as Record<string, unknown>).alreadyActive, [declinedName]);
+  assert.equal((again.details as Record<string, unknown>).outcome, "already-active");
+});
+
+test("#421 a previously accepted selection that Pi later declines is not retained as loaded", async () => {
+  const fixture = hostFixture();
+  const name = "mcp__docs__flip";
+  // Loaded while its native exposure is deferred (Pi permits tool_search to
+  // declare it); then the exposure becomes direct under an allowlist naming
+  // no mcp__ entry, so Pi's own policy declines it.
+  fixture.registerInactive(tool(name, "Search the flipping docs index.", { exposure: "deferred" }));
+  const hostSet = fixture.pi.setActiveTools.bind(fixture.pi);
+  let declining = false;
+  // What the manager REQUESTED (before the host's policy filters it).
+  const requestedWrites: string[][] = [];
+  fixture.pi.setActiveTools = (names: string[]) => {
+    requestedWrites.push([...names]);
+    hostSet(declining ? names.filter((entry) => entry !== name) : names);
+  };
+  const manager = new DeferredToolManager(fixture.pi);
+  manager.register();
+  assert.equal(manager.sessionStart(fixture.sessionIdentity), true);
+
+  const accepted = await fixture.search()("accept", { query: name });
+  assert.deepEqual((accepted.details as Record<string, unknown>).activated, [name]);
+  assert.ok(manager.toolCallAllowed(name), "an accepted selection is callable");
+
+  fixture.registerInactive(tool(name, "Search the flipping docs index.", { exposure: "direct" }));
+  declining = true;
+  manager.reapply();
+  assert.equal(fixture.active().includes(name), false, "Pi declined the retained selection");
+  assert.equal(manager.toolCallAllowed(name), false, "a declined selection grants no direct call");
+  assert.equal(manager.toolCallAllowed(name, true), false, "a declined direct exposure is not script-callable either");
+  const writesBefore = requestedWrites.length;
+  manager.reapply();
+  assert.ok(requestedWrites.length > writesBefore);
+  assert.ok(!requestedWrites.at(-1)!.includes(name), "later writes no longer request the declined selection");
+
+  const refused = await fixture.search()("refused", { query: name });
+  const details = refused.details as Record<string, unknown>;
+  assert.deepEqual(details.refused, [name]);
+  assert.deepEqual(details.activated, []);
+  assert.deepEqual(details.alreadyActive, []);
+  assert.equal(details.outcome, "refused");
+
+  // Pi accepting it again does not resurrect the dropped selection without a
+  // new search; a search then loads it normally.
+  declining = false;
+  manager.reapply();
+  assert.equal(fixture.active().includes(name), false, "a dropped selection needs tool_search again");
+  assert.deepEqual(((await fixture.search()("again", { query: name })).details as Record<string, unknown>).activated, [name]);
+  assert.ok(manager.toolCallAllowed(name));
+});
+
+test("#421 with deferred tools off, a base name Pi declines is reported refused and denied while nested codemode/deferred callability is preserved", async () => {
+  const fixture = hostFixture();
+  const declinedName = "mcp__docs__direct";
+  const deferredName = "mcp__docs__deferred";
+  fixture.registerInactive(tool(declinedName, "Search the direct docs index.", { exposure: "direct" }));
+  fixture.registerInactive(tool(deferredName, "Search the deferred docs index.", { exposure: "deferred" }));
+  const hostSet = fixture.pi.setActiveTools.bind(fixture.pi);
+  const requestedWrites: string[][] = [];
+  fixture.pi.setActiveTools = (names: string[]) => {
+    requestedWrites.push([...names]);
+    hostSet(names.filter((name) => name !== declinedName));
+  };
+  const manager = new DeferredToolManager(fixture.pi);
+  manager.register();
+  assert.equal(manager.sessionStart(fixture.sessionIdentity, undefined, false, false), true);
+
+  // The full deferred-off base requests every authorized direct tool; Pi
+  // declines the MCP one, so it is not loaded and the call gate denies it.
+  assert.ok(requestedWrites.at(-1)!.includes(declinedName), "the deferred-off base requests the registered tool");
+  assert.equal(fixture.active().includes(declinedName), false);
+  assert.ok(fixture.active().includes("bash"), "ordinary base tools stay loaded");
+  assert.equal(manager.toolCallAllowed(declinedName), false, "a declined base name grants no direct call");
+  assert.ok(manager.toolCallAllowed("bash"));
+  // Inactive nested codemode/deferred callability is unchanged.
+  assert.equal(fixture.active().includes(deferredName), false);
+  assert.ok(manager.toolCallAllowed(deferredName, true), "deferred exposure stays script-callable while inactive");
+  assert.equal(manager.toolCallAllowed(deferredName), false, "an inactive deferred exposure is not directly callable");
+
+  const refused = await fixture.search()("declined-off", { query: declinedName });
+  const details = refused.details as Record<string, unknown>;
+  assert.equal(refused.isError, true);
+  assert.deepEqual(details.refused, [declinedName]);
+  assert.deepEqual(details.alreadyActive, [], "a declined base name is never reported already active");
+  assert.deepEqual(details.activated, []);
+  manager.reapply();
+  assert.equal(manager.toolCallAllowed(declinedName), false);
 });

@@ -394,11 +394,14 @@ jobs:
       - name: Windows prompt-process termination tests (Node 24)
         run: node --test dist-test/tests/process-telemetry.test.js
       - name: Run Windows shell tests (native)
+        # native-powershell-support runs the real pwsh.exe/powershell.exe host
+        # probe behind Pi's builtin powershell parity natively (#421).
         run: >-
           node --test
           dist-test/tests/background-shell-windows.test.js
           dist-test/tests/background-shell-jobs.test.js
           dist-test/tests/background-process-readiness.test.js
+          dist-test/tests/native-powershell-support.test.js
 
   release:
     # Publishes the numbered prerelease for a validated main push by calling the

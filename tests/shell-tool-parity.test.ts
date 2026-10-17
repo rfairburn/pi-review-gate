@@ -308,3 +308,81 @@ test("powershell tool activity renders the command like bash", () => {
     "powershell completed · updated manifest",
   ]);
 });
+// --- #421: new workers inherit the parent's host-aware shell authority -------
+
+/** Parent registry entry carrying Pi's public provenance for its own builtins. */
+function builtinEntry(name: string): Record<string, unknown> {
+  return { name, description: `${name} tool.`, sourceInfo: { path: `builtin:${name}`, source: "builtin" } };
+}
+
+async function newWorkerCatalog(nativePowerShellSupported: boolean, kind: "execute" | "research"): Promise<ExecutorToolCatalog> {
+  const registry = ["read", "grep", "find", "ls", "edit", "write", "ApplyPatch", "WebSearch", "bash", "powershell", ...executionToolNames]
+    .map(builtinEntry);
+  // A resumed parent whose restored loadout declared only `read`.
+  let active = ["read"];
+  const parentHost = {
+    registerTool(definition: Record<string, unknown>) { registry.push(definition); },
+    getActiveTools: () => [...active],
+    getAllTools: () => [...registry],
+    setActiveTools(names: string[]) { active = [...names]; },
+  };
+  const deferred = new DeferredToolManager(parentHost, () => "execute", () => true, () => nativePowerShellSupported);
+  deferred.register();
+  assert.equal(deferred.sessionStart({}), true);
+  const tools: Array<Record<string, any>> = [];
+  const config = normalizeConfig({
+    enabled: true,
+    review: { activeReviewers: [] },
+    externalAgents: { fake: { adapter: "codex-cli", command: process.execPath, execution: {} } },
+    execution: {
+      workerResources: { default: { selection: { source: "external", id: "fake" }, maxConcurrent: 4 } },
+      routes: { execute: [{ resourceId: "default" }], research: [{ resourceId: "default" }] },
+    },
+  });
+  const manager = new ExecutionToolManager({
+    pi: {
+      registerTool(tool: Record<string, any>) { tools.push(tool); },
+      registerCommand() {},
+      setToolActive() {},
+      getActiveTools: () => [...active],
+    },
+    config,
+    state: createState(),
+    cwd: () => process.cwd(),
+    notify: () => {},
+    authorizedTools: () => deferred.authorizedToolNames(),
+  });
+  manager.sync();
+  try {
+    const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+    const started = await start("native-powershell-worker", {
+      ...(kind === "research" ? { kind: "research" } : {}),
+      tasks: [{ title: "Shell parity", instructions: "Do it", acceptanceCriteria: ["done"] }],
+    }, undefined, undefined, {});
+    return structuredClone(started.details.tasks[0].definition.executorToolCatalog) as ExecutorToolCatalog;
+  } finally {
+    await manager.shutdown();
+  }
+}
+
+test("#421 new execute workers start with both shells on a supported native host and never inherit an unsupported builtin", async () => {
+  const supported = await newWorkerCatalog(true, "execute");
+  for (const name of ["bash", "powershell"]) {
+    assert.ok(supported.allowedToolCatalog.includes(name), `supported ceiling carries ${name}`);
+    assert.ok(supported.initialActiveTools.includes(name), `supported initial subset carries ${name} (no Bash-first selection)`);
+  }
+  const unsupported = await newWorkerCatalog(false, "execute");
+  assert.ok(unsupported.initialActiveTools.includes("bash"));
+  assert.equal(unsupported.allowedToolCatalog.includes("powershell"), false, "an unsupported native builtin never reaches a worker ceiling");
+  assert.equal(unsupported.initialActiveTools.includes("powershell"), false);
+});
+
+test("#421 new research workers never gain either shell, whatever the native host supports", async () => {
+  for (const supported of [true, false]) {
+    const research = await newWorkerCatalog(supported, "research");
+    for (const name of ["bash", "powershell"]) {
+      assert.equal(research.allowedToolCatalog.includes(name), false, `research excludes ${name} (supported=${supported})`);
+      assert.equal(research.initialActiveTools.includes(name), false);
+    }
+  }
+});

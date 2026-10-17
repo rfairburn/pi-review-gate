@@ -105,10 +105,14 @@ The next normal run in the same conversation receives the replacement mode promp
 no `/new`, reload, or restart is needed. Shared safety and review instructions and user
 append prompts remain. An in-flight run retains its prompt, and already-running subtasks
 retain their captured instructions and authority. Cancelling settings leaves the mode
-unchanged. Returning to a write-capable mode restores tools within the
-session's current authorization boundary — including natively reconciled MCP/codemode
-registrations (see [Native Pi tools](native-pi-tools.md#reconciliation-during-a-running-session))
-— not tools that were disabled at launch.
+unchanged. Entering Plan/research removes forbidden tools even when they were already
+loaded. Returning to a write-capable mode rebuilds the tool set from what Pi's registry
+permits at that moment — the baseline plus discovery candidates, including natively
+reconciled MCP/codemode registrations (see
+[Native Pi tools](native-pi-tools.md#top-level-authority-comes-from-the-live-registry))
+— never from the pre-mode loadout: excluded, hidden, withdrawn, or setting-disabled tools
+stay absent. Loaded read-only tools stay loaded in Plan/research; forbidden tools loaded
+with `tool_search` before the switch need `tool_search` again.
 
 Prompt files live in `scripts/orchestrator-system-prompt.md`,
 `scripts/execution-system-prompt.md`, and `scripts/planning-system-prompt.md`.
@@ -614,9 +618,9 @@ them over. The concise rules:
   and pass no `--tools` value of their own; the review-gate default there is
   availability, not activation: the registered `codemode` tool is admitted to the
   session's authorized catalog where Pi's registry carries it and no explicit
-  restriction removed it. Explicit Pi `--tools`/`--exclude-tools`/`--no-tools`
-  restrictions remain authoritative and are never broadened; a manual extension-only
-  load gets no new default.
+  restriction removed it — the same for a manual extension-only load. Explicit Pi
+  `--tools`/`--exclude-tools`/`--no-tools` restrictions remain authoritative and are
+  never broadened.
 - `codemode` follows the ordinary deferred-tools toggle
   (`execution.deferredPiTools`): with the default On it is discoverable through
   `tool_search` but never part of the initial-active subset, so the model loads it

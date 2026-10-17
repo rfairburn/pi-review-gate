@@ -29,6 +29,10 @@ export const NATIVE_DISCOVERY_TOOLS = ["grep", "find", "ls"] as const;
  * (docs/windows.md); a host exposes whichever it actually registered, so the
  * order lists both and the authorized-catalog filter below drops any shell
  * the host did not authorize. Neither name ever widens a catalog on its own.
+ * #421: both shells share this order with parity. Native-host support for Pi's
+ * builtin `powershell` (which Pi 1.3 registers on every platform but can only
+ * run on Windows) is decided upstream, where the top-level authority is
+ * derived, so an unsupported builtin never reaches this filter.
  */
 const EXECUTOR_SHELL_TOOLS = ["bash", "powershell"] as const;
 /**

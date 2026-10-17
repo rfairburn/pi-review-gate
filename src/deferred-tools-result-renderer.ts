@@ -52,6 +52,8 @@ interface SearchOutcome {
   matched: string[];
   activated: string[];
   alreadyActive: string[];
+  /** Matches Pi's own tool policy declined to declare (not activated, unavailable). */
+  refused: string[];
   /** Matches withheld upstream of this result; absent when not recorded. */
   omitted?: number;
   outcome?: string;
@@ -90,11 +92,16 @@ export const renderDeferredToolResult: DeferredToolResultRenderer = (value, opti
     lines.push({ text: collapsedHeader(outcome, `activated ${outcome.activated.join(", ")}`), color: "toolTitle", bold: true });
   } else if (outcome.alreadyActive.length > 0) {
     lines.push({ text: collapsedHeader(outcome, `already active ${outcome.alreadyActive.join(", ")}`), color: "toolTitle", bold: true });
+  } else if (outcome.refused.length > 0) {
+    lines.push({ text: collapsedHeader(outcome, `not activated ${outcome.refused.join(", ")}`), color: "toolTitle", bold: true });
   } else {
     lines.push({ text: collapsedHeader(outcome, "no matches"), color: "toolTitle", bold: true });
   }
   if (outcome.activated.length > 0 && outcome.alreadyActive.length > 0) {
     lines.push({ text: `Already active (${outcome.alreadyActive.length}): ${outcome.alreadyActive.join(", ")}.`, color: "muted" });
+  }
+  if (outcome.refused.length > 0 && (outcome.activated.length > 0 || outcome.alreadyActive.length > 0)) {
+    lines.push({ text: `Not activated by Pi (${outcome.refused.length}): ${outcome.refused.join(", ")}.`, color: "warning" });
   }
   return renderComponent(lines, theme, true);
 };
@@ -145,6 +152,10 @@ export const renderExpandedDeferredToolResult: DeferredToolResultRenderer = (val
     lines.push({ text: "Already active:", color: "accent", bold: true });
     appendNames(lines, outcome.alreadyActive);
   }
+  if (outcome.refused.length > 0) {
+    lines.push({ text: "Not activated (declined by Pi's tool policy):", color: "warning", bold: true });
+    appendNames(lines, outcome.refused);
+  }
   if (outcome.omitted !== undefined) {
     lines.push({ text: `Omitted matches: ${outcome.omitted}`, color: "muted" });
   }
@@ -161,11 +172,19 @@ export const renderExpandedDeferredToolResult: DeferredToolResultRenderer = (val
       color: "muted",
     });
   }
-  const single = outcome.activated.length === 1
-    ? outcome.activated[0]!
-    : outcome.activated.length === 0 && outcome.alreadyActive.length === 1
-      ? outcome.alreadyActive[0]!
-      : undefined;
+  if (outcome.refused.length > 0) {
+    lines.push({
+      text: `The declined ${outcome.refused.length === 1 ? "tool is" : "tools are"} unavailable in this session.`,
+      color: "warning",
+    });
+  }
+  const single = outcome.refused.length > 0
+    ? undefined
+    : outcome.activated.length === 1
+      ? outcome.activated[0]!
+      : outcome.activated.length === 0 && outcome.alreadyActive.length === 1
+        ? outcome.alreadyActive[0]!
+        : undefined;
   lines.push({
     text: single !== undefined
       ? `No ${single} operation was executed by this search.`
@@ -196,9 +215,12 @@ function decodeOutcome(value: unknown, options: DeferredToolRenderOptions, conte
   const matched = stringArrayField(details, "matched");
   const activated = stringArrayField(details, "activated");
   const explicitAlreadyActive = stringArrayField(details, "alreadyActive");
-  const alreadyActive = explicitAlreadyActive.length > 0
+  const refused = stringArrayField(details, "refused");
+  // The legacy fallback (details without an alreadyActive array) never
+  // relabels a declined match as already active.
+  const alreadyActive = explicitAlreadyActive.length > 0 || Array.isArray(details?.alreadyActive)
     ? explicitAlreadyActive
-    : matched.filter((name) => !activated.includes(name));
+    : matched.filter((name) => !activated.includes(name) && !refused.includes(name));
   const omitted = integerField(details, "omitted");
   const summary = resultText(record);
   const error = record?.isError === true;
@@ -208,8 +230,9 @@ function decodeOutcome(value: unknown, options: DeferredToolRenderOptions, conte
     && (Array.isArray(details.matched)
       || Array.isArray(details.activated)
       || Array.isArray(details.alreadyActive)
+      || Array.isArray(details.refused)
       || outcome !== undefined);
-  return { query, matched, activated, alreadyActive, omitted, outcome, error, partial, summary, known };
+  return { query, matched, activated, alreadyActive, refused, omitted, outcome, error, partial, summary, known };
 }
 
 function queryFromContext(context: unknown): string | undefined {

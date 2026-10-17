@@ -701,6 +701,8 @@ test("native Windows launcher job freshly installs and requires exact Pi 1.3.0 c
     "dist-test/tests/background-shell-windows.test.js",
     "dist-test/tests/background-shell-jobs.test.js",
     "dist-test/tests/background-process-readiness.test.js",
+    // #421: the real native PowerShell host probe behind shell parity.
+    "dist-test/tests/native-powershell-support.test.js",
   ]) {
     assert.ok(shell.includes(suite), `the separate Windows shell cleanup suite must remain required: ${suite}`);
   }

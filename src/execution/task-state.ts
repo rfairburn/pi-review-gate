@@ -13,6 +13,7 @@ import type { ContinuationProgressUpdate, SubtaskDispatchRecord, SubtaskProgress
 import type { WaveProgressUpdate, WaveResult } from "./wave-controller";
 import type { WaveWorkerResult, WaveWorkerTask } from "./wave-worker";
 import { normalizeExecutorToolCatalog, stripLegacyCatalogFields } from "./tool-catalog";
+import { normalizeWorkerReviewEvidencePolicy } from "./review-evidence-policy";
 
 /** Bounded per-task activity history retained durably and in memory. */
 export const MAX_ACTIVITY = 200;
@@ -244,6 +245,7 @@ export function newTask(definition: BackgroundTaskDefinition): BackgroundTaskRec
   const now = new Date().toISOString();
   const normalizedDefinition = JSON.parse(JSON.stringify(definition)) as BackgroundTaskDefinition;
   normalizeExecutorToolCatalog(normalizedDefinition);
+  normalizedDefinition.reviewEvidencePolicy = normalizeWorkerReviewEvidencePolicy(normalizedDefinition.reviewEvidencePolicy);
   // New durable records are canonical-only: stale pre-cutover keys on a
   // supplied input never enter the persisted definition.
   stripLegacyCatalogFields(normalizedDefinition);

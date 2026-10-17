@@ -126,6 +126,14 @@ async function createSyntheticEmptyBaseline(
   return { base, objectFormat };
 }
 
+function reviewEvidenceCaptureFailure(error: unknown, cleanupConfirmed: boolean): GitCheckpointResult<never> {
+  const result = resultFromError(error);
+  if (result.status !== "failed") return result;
+  const { evidenceCaptureFailure, ...blocked } = result;
+  return cleanupConfirmed && (evidenceCaptureFailure || result.reason === "patch_too_large" || result.reason === "untracked_too_large")
+    ? { ...blocked, evidenceCaptureFailure: true } : blocked;
+}
+
 export interface GitCheckpointArmOutcome {
   record: GitCheckpointRecord;
   /**
@@ -337,8 +345,8 @@ export async function armGitCheckpoint(
         );
       }
     } catch (error) {
-      await cleanupAfterFailedArm(gitPath, repo, windowId, base, armId, scratchDir, spec);
-      return resultFromError(error);
+      const cleanupConfirmed = await cleanupAfterFailedArm(gitPath, repo, windowId, base, armId, scratchDir, spec);
+      return reviewEvidenceCaptureFailure(error, cleanupConfirmed);
     }
 
     let untracked: GitCheckpointUntrackedEntry[];
@@ -360,8 +368,8 @@ export async function armGitCheckpoint(
         throwIfAborted(spec.signal);
       }
     } catch (error) {
-      await cleanupAfterFailedArm(gitPath, repo, windowId, base, armId, scratchDir, spec);
-      return resultFromError(error);
+      const cleanupConfirmed = await cleanupAfterFailedArm(gitPath, repo, windowId, base, armId, scratchDir, spec);
+      return reviewEvidenceCaptureFailure(error, cleanupConfirmed);
     }
 
     try {

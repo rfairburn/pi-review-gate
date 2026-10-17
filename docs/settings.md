@@ -77,6 +77,8 @@ supplies the live switch (the ordinary extension entry point always does):
   `review.activeReviewers` record displays in both
   sets immediately; see
   [Review layers](configuration.md#review-layers-and-the-legacy-activereviewers-import).
+  **Evidence methods** in this same submenu selects evidence contexts independently
+  of those toggles and reviewer sets; see [Evidence methods](#evidence-methods).
 - **Timeouts** edits the default reviewer and executor timeouts in minutes. Explicit
   `review.timeoutMs` and `execution.timeoutMs` values on an `externalAgents` entry
   override these defaults for that external harness role.
@@ -226,8 +228,9 @@ unchanged. The root has three distinct exits:
 Because Escape applies in memory, reopening `/review-settings` shows those choices and
 an immediate **Save changes** or Ctrl+S persists them without re-entering them.
 
-Applied values (session-only or saved) are authoritative for execution stages that
-have not started.
+Except for the captured worker evidence policy described under
+[Evidence methods](#evidence-methods), applied values (session-only or saved) are
+authoritative for execution stages that have not started.
 Already-running executor and reviewer processes finish with their launch values, while
 queued dispatch, waiting failover, later continuation turns, and later review cycles use
 the current routes, capacities, policies, and reviewer selection. Open review windows
@@ -240,6 +243,62 @@ already-running tasks. Running capacity leases survive pool edits; removed entri
 receive no new work. A restarted task warns when its prior runtime configuration
 differs, and an executor-selection change starts a fresh native session from the durable
 checkpoint instead of attaching an incompatible conversation.
+
+## Evidence methods
+
+Open `/review-settings` → **Reviewers** → **Evidence methods**. The four rows are:
+
+- **Primary / top-level tool-only**
+- **Isolated worktree tool-only**
+- **InPlace tool-only**
+- **Snapshot-failure fallback**
+
+All default to **Off**. Each tool-only row selects evidence for that context, not the
+operating mode, whether review runs, or who reviews. The fallback row is a separate
+opt-in for qualifying review-evidence capture failures, not a fourth execution context.
+The stored fields are documented in
+[Configuration](configuration.md#review-evidence-methods).
+
+Enter stages a toggle. Back and nested Escape only navigate; they neither apply the
+policy nor reset evidence. Root Escape applies the final draft to the running session
+without writing the config. **Save changes** or Ctrl+S applies and persists it; Ctrl+S
+also works in this nested menu. Explicit root **Cancel** discards this visit's draft
+and preserves the live values from when it opened, including any session-only values
+applied by an earlier Escape. Reopening and saving can persist those earlier values.
+
+Primary transitions are based on the effective value before and after apply, not how
+many times a row was visited or toggled:
+
+| Effective Primary transition | Effect |
+| --- | --- |
+| Off → On | Clears accumulated Primary review evidence and starts a new tool-only evidence window. A prominent warning identifies the actual reset; earlier work is not certified by resetting. |
+| On → Off | Retains accumulated evidence and establishes a new snapshot baseline for subsequent capture, without inventing earlier snapshot coverage. |
+| Unchanged | No evidence reset. |
+
+Turning Primary on in the draft warns about the pending reset, but navigation or
+Cancel never performs it. Changing only worktree, InPlace, or fallback settings does
+not reset Primary evidence. A draft toggled back to its original value has no effective
+transition, so applying it does not reset evidence either.
+
+Workers capture the applicable evidence choices, including fallback, at firing/queue
+admission. Each new `SubtasksStart`/`SubtasksAdd` task and human submission captures
+independently; scheduled subtasks capture at actual firing/admission, not schedule
+creation. Already queued or running tasks keep that policy through corrections,
+retries, and continuations; later Add tasks capture the then-current live choice.
+Applying settings does not intercept or reconfigure in-flight tasks. This guarantee
+is specific to evidence policy; it does not freeze all routing or reviewer settings.
+
+Fallback Off leaves capture failure blocking. When On actually substitutes current
+retained tool evidence for an eligible failed snapshot, the user and implementing model
+receive a prominent warning on each actual fallback identifying the originating review
+context, and the reviewer receives the truthful tool-only basis. Fallback is not sticky:
+snapshot-preferring policy retries capture on later cycles/continuations without
+inventing earlier coverage or discarding retained current-work tool evidence. The menu
+description or an optional notice alone is not that warning. Missing structured
+observations do not block degraded review; retained evidence and capture limits remain
+disclosed. See
+[Review workflow](review-workflow.md#snapshot-failure-fallback) for first-baseline
+eligibility and failures that must remain blocking.
 
 ## Tools subsection
 

@@ -6,6 +6,8 @@
  */
 import {
   externalAgentSupportsReview,
+  effectiveReviewEvidenceSettings,
+  type EffectiveReviewEvidenceSettings,
   type ActiveReviewerSelection,
   type ExternalAgentConfig,
 } from "../config";
@@ -21,6 +23,7 @@ export interface ReviewSectionState {
   primaryEnabled: boolean;
   subtaskEnabled: boolean;
   reviewLandedChanges: boolean;
+  evidence?: EffectiveReviewEvidenceSettings;
 }
 
 /**
@@ -49,6 +52,7 @@ export async function selectReviewSection(
     primaryEnabled: initial.primaryEnabled,
     subtaskEnabled: initial.subtaskEnabled,
     reviewLandedChanges: initial.reviewLandedChanges,
+    ...(initial.evidence !== undefined ? { evidence: { ...initial.evidence } } : {}),
   };
   const totalChoices = scoped.length + agents.filter(externalAgentSupportsReview).length;
   await notify(
@@ -76,12 +80,17 @@ export async function selectReviewSection(
         { key: "landed", label: landedRow },
         { key: "primaryReviewers", label: primaryReviewersRow },
         { key: "subtaskReviewers", label: subtaskReviewersRow },
+        { key: "evidence", label: "Evidence methods" },
         { key: "back", label: "Back" },
       ],
       initialKey: lastKey,
     });
     if (!choice || choice === "back") return state;
     lastKey = choice;
+    if (choice === "evidence") {
+      state.evidence = await selectReviewEvidence(ui, state.evidence ?? effectiveReviewEvidenceSettings({}));
+      continue;
+    }
     if (choice === "primaryToggle") {
       state.primaryEnabled = !state.primaryEnabled;
       continue;
@@ -105,6 +114,42 @@ export async function selectReviewSection(
     if (choice === "subtaskReviewers") {
       state.subtaskReviewers = await selectReviewers(ui, state.subtaskReviewers, agents, scoped);
       continue;
+    }
+  }
+}
+
+/** Draft-only evidence controls; runtime effects belong to the root apply boundary. */
+async function selectReviewEvidence(
+  ui: UiContext,
+  initial: EffectiveReviewEvidenceSettings,
+): Promise<EffectiveReviewEvidenceSettings> {
+  const evidence = { ...initial };
+  await notify(ui,
+    "Evidence methods only — these controls do not disable review, change operating mode, or select reviewers. Each scope is independent: Off uses snapshot evidence; On uses observed-tool evidence. Snapshot-failure fallback is an independent opt-in to tool evidence when snapshot capture fails; Off keeps failure fail-closed. Navigation only stages choices; root Escape applies for the session, Save/Ctrl+S persists, and Cancel discards.",
+    "info");
+  let lastKey: string | undefined;
+  while (true) {
+    const fields = [
+      ["primaryToolOnly", "Primary / top-level tool-only"],
+      ["worktreeToolOnly", "Isolated worktree tool-only"],
+      ["inplaceToolOnly", "InPlace tool-only"],
+      ["snapshotFailureFallback", "Snapshot-failure fallback"],
+    ] as const;
+    const labels = alignedSettingsRows(fields.map(([field, label]) => [label, evidence[field] ? "On" : "Off"] as const));
+    const choice = await retainedSelect(ui, {
+      title: "Review evidence methods",
+      rows: [...fields.map(([key], index) => ({ key, label: labels[index]! })), { key: "back", label: "Back" }],
+      initialKey: lastKey,
+    });
+    if (!choice || choice === "back") return evidence;
+    const field = fields.find(([key]) => key === choice)?.[0];
+    if (!field) continue;
+    lastKey = field;
+    evidence[field] = !evidence[field];
+    if (field === "primaryToolOnly" && evidence.primaryToolOnly) {
+      await notify(ui,
+        "WARNING: Applying Primary / top-level tool-only Off → On clears accumulated primary review evidence and starts a new evidence window. This is staged only until root Escape or Save/Ctrl+S; Cancel discards it. On → Off retains evidence and establishes a new snapshot baseline.",
+        "warning");
     }
   }
 }

@@ -85,6 +85,58 @@ Manifests outside that exact restored association remain explicit recovery opera
 through `recoverLandingManifest()`. A different conversation, session file, or cwd never
 silently adopts them.
 
+## Review evidence failure and fallback
+
+The optional `review.evidence.snapshotFailureFallback` setting defaults **Off**. A
+snapshot capture failure remains blocking unless fallback is explicitly enabled and
+the failed operation qualifies as review-evidence capture only. When eligible, fallback
+uses retained current tool evidence with a durable, truthful tool-only basis and a
+prominent warning on every actual fallback identifying the originating review context to
+the user and implementing model; reviewer input discloses the same basis and missing snapshot
+coverage. A menu description, log entry, or optional notice alone is not the warning.
+A fallback is not approval, reconstructed snapshot coverage, or a successful recovery
+checkpoint. See [Review workflow](review-workflow.md#snapshot-failure-fallback).
+
+Enabled fallback is allowed on the **first Primary or InPlace review-baseline capture
+before work**. That initial failure can establish a durable tool-only basis with the
+warning instead of blocking solely for the unavailable review snapshot. It must not be
+confused with losing an existing basis after execution: missing, corrupt, unverifiable,
+or mismatched persisted evidence remains blocking, including an InPlace continuation
+with no terminal result. Never delete a baseline to try to activate fallback or silently
+re-baseline over prior work.
+
+Fallback is not sticky: when configured/captured policy prefers snapshots, retry capture
+on later cycles/continuations and warn prominently on each actual fallback. A later
+successful baseline cannot fabricate earlier coverage or discard retained current-work
+tool evidence. Missing/unavailable structured observations do not block degraded review:
+show as much retained evidence as collected, disclose adapter/capture limits, and permit
+assessment of clearly provenance-labelled claims/context. Absence of observations is not
+proof of clean work or no effects; it is distinct from the blocking integrity failures below.
+
+The following remain governed by their ordinary fail-closed rules, not fallback:
+
+- cancellation and reviewer execution errors;
+- isolated construction input capture and workspace identity checks;
+- checkpoint staging, publication, integrity, and verification;
+- landing, conflict gates, and landing rollback/recovery;
+- missing or corrupt persisted evidence and session-state integrity failures.
+
+An isolated capture used by both review and checkpoint/landing may still block because
+its durable role cannot be replaced by tool history. Do not retry by treating every
+snapshot-related error as eligible. Ordinary reviewer aggregation is unchanged; fallback
+never converts an execution error into a verdict or suppresses any reviewer's result.
+
+Retained evidence keeps its truthful recorded basis. Workers capture applicable evidence
+and fallback policy at firing/queue admission: each Start/Add task independently, scheduled
+tasks at actual firing, not schedule creation. Live changes do not switch already queued
+or running tasks through corrections, retries, or continuations; later Add tasks capture
+the then-current live choice. This does not freeze all routes or reviewer selections.
+For Primary, applying Off → On deliberately resets the current evidence with a
+prominent warning; On → Off
+keeps evidence and establishes a new snapshot baseline, not retroactive coverage.
+This is distinct from reviewer-selection reconciliation above. See
+[Settings](settings.md#evidence-methods) for apply/save/cancel behavior.
+
 ## Crash recovery for landing manifests
 
 When a wave landing is in progress, a recovery manifest is written atomically under

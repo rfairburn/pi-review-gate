@@ -25,6 +25,7 @@ import {
   type OperatingMode,
   type RetainBundles,
   type ReviewGateConfig,
+  type ReviewEvidenceConfig,
   type ReviewGateToolsConfig,
   type SubtaskNotificationMode,
 } from "../config";
@@ -60,6 +61,8 @@ export interface ReviewSettingsSelection {
   subtaskEnabled: boolean;
   /** Landed-change re-review choice; inactive while automatic primary review is off. */
   reviewLandedChanges: boolean;
+  /** Canonical review.evidence methods, independent of review enablement. */
+  evidence?: ReviewEvidenceConfig;
   reviewerTimeoutMs: number;
   executorTimeoutMs: number;
   maxCorrectionCycles: number;
@@ -157,6 +160,10 @@ function applyStagedSelectionFields(parsed: Record<string, unknown>, selection: 
   review.primaryEnabled = selection.primaryEnabled;
   review.subtaskEnabled = selection.subtaskEnabled;
   review.reviewLandedChanges = selection.reviewLandedChanges;
+  if (selection.evidence !== undefined) {
+    // Own only the four known fields; preserve unrelated raw JSON on Save.
+    review.evidence = { ...(isRecord(review.evidence) ? review.evidence : {}), ...selection.evidence };
+  }
   delete review.activeReviewers;
   parsed.review = review;
   parsed.operatingMode = selection.operatingMode;

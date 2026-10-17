@@ -69,6 +69,8 @@ export interface InPlaceReviewCycle {
   cycle: number;
   /** External-path evidence revision reviewed in this cycle; not a content identity. */
   externalObservationRevision?: number;
+  /** Structured mutation-path observation revision reviewed in this cycle; distinct from workspace delta identity. */
+  toolObservationRevision?: number;
   verdict: import("../../schema").ReviewResult["verdict"];
   reviewOutput: ReviewRunOutput;
   /** Workspace delta that was under review in this cycle. */
@@ -101,6 +103,8 @@ export interface InPlaceLifecycleResult {
   /** Adapter/stream limitations; absence of an event is not evidence of no external action. */
   toolObservabilityNotes?: string[];
   toolObservationsTruncated?: boolean;
+  reviewEvidenceNotes?: string[];
+  reviewEvidenceNotesTruncated?: boolean;
   /**
    * Set when the stop-time attribution could not be inspected against the
    * launch baseline: the workspace delta is then UNKNOWN, never zero, and

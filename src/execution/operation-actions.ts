@@ -5,6 +5,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { resolvedExecutorPool, type ReviewGateConfig } from "../config";
 import { atomicWrite } from "./durable-write";
+import { normalizeWorkerReviewEvidencePolicy, workerReviewEvidenceScope } from "./review-evidence-policy";
 import type { ExecutorPoolAssignment } from "./executor-pool";
 import {
   normalizeCandidate,
@@ -1424,6 +1425,10 @@ async function readTask(artifactDir: string): Promise<WaveWorkerTask> {
   if (!parsed.task || typeof parsed.task.title !== "string" || !Array.isArray(parsed.task.acceptanceCriteria)) {
     throw new Error("Operation task metadata is missing or invalid.");
   }
+  parsed.task.reviewEvidencePolicy = normalizeWorkerReviewEvidencePolicy(
+    parsed.task.reviewEvidencePolicy,
+    parsed.task.backgroundKind === undefined ? undefined : workerReviewEvidenceScope(parsed.task.backgroundKind),
+  );
   return parsed.task;
 }
 

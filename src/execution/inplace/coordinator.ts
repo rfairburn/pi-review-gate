@@ -25,7 +25,7 @@ import { INPLACE_BASELINE_FILE, loadInPlaceBaseline, persistInPlaceBaseline } fr
 import type { InPlaceLifecycleInput, InPlaceLifecycleResult, InPlaceLifecycleStatus, InPlaceReviewCycle, InPlaceWorkerResult } from "./contracts";
 import { ensureArtifactDir } from "./containment";
 import { runInplaceTurnWorker } from "./adapter-workflow";
-import { persistInPlaceObservedEvidence, restoreInPlaceObservedEvidence } from "./observed-evidence";
+import { persistObservedToolEvidence, restoreObservedToolEvidence } from "../observed-evidence";
 import { buildInPlaceReviewRequest } from "./prompts";
 import { buildInPlaceReviewCycleRecord, nextInPlaceReviewCycle, persistInPlaceReviewCycleRecord } from "./review-records";
 import { settleInPlace } from "./settlement";
@@ -205,7 +205,13 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
   // The review window exists from the very first turn so corrections, steering
   // evidence, and pass observation share one serial state like execute runs.
   const { window } = createWorkerReviewState();
-  await restoreInPlaceObservedEvidence(window.evidence, resolvedArtifactDir, workspaceRoot);
+  const retainedEvidenceExpected = input.initialResult !== undefined || recoveredContinuation?.hadPriorExecution === true;
+  await restoreObservedToolEvidence(window.evidence, resolvedArtifactDir, workspaceRoot, {
+    required: retainedEvidenceExpected && (
+      task.reviewEvidencePolicy?.toolOnly === true
+      || task.reviewEvidencePolicy?.snapshotFailureFallback === true
+    ),
+  });
   let effectiveAssignment = input.executorAssignment;
   type InPlaceTurnInput = Omit<Parameters<typeof runInplaceTurnWorker>[0], "executorAssignment" | "evidence" | "baseline">;
   const runTurn = async (turnInput: InPlaceTurnInput): Promise<InPlaceWorkerResult> => {
@@ -232,7 +238,7 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
       }
       return result;
     } finally {
-      await persistInPlaceObservedEvidence(window.evidence, resolvedArtifactDir);
+      await persistObservedToolEvidence(window.evidence, resolvedArtifactDir);
     }
   };
 
@@ -824,6 +830,7 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
     const cycle: InPlaceReviewCycle = {
       cycle: reviewCycle,
       externalObservationRevision: window.evidence.externalObservationRevision ?? 0,
+      toolObservationRevision: window.evidence.toolObservationRevision ?? 0,
       verdict,
       reviewOutput,
       changedSinceLaunch: attribution.changes,
@@ -838,6 +845,7 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
         reviewSequence: reviewOutput.reviewSequence ?? reviewCycle,
         attribution,
         deltaIdentitySha256: createHash("sha256").update(currentDeltaIdentity).digest("hex"),
+        toolObservationRevision: window.evidence.toolObservationRevision ?? 0,
         reviewOutput,
       }));
     } catch (error) {

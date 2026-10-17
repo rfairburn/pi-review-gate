@@ -1,11 +1,12 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { redactSensitiveText } from "../../redaction";
 import { buildReviewReportFromOutputs } from "../../review-report";
 import { buildOperationDiagnostics, readOperationRecord, writeOperationRecord } from "../operation-record";
 import { computeInPlaceAttribution } from "./basis";
 import type { InPlaceLifecycleInput, InPlaceLifecycleResult } from "./contracts";
-import { IN_PLACE_OBSERVED_EVIDENCE_FILE } from "./observed-evidence";
+import { createEvidenceState } from "../../evidence";
+import { restoreObservedToolEvidence } from "../observed-evidence";
 
 async function writeInPlaceResult(artifactDir: string, result: InPlaceLifecycleResult): Promise<void> {
   await writeFile(
@@ -25,6 +26,8 @@ async function writeInPlaceResult(artifactDir: string, result: InPlaceLifecycleR
       observedExternalPaths: result.observedExternalPaths ?? [],
       toolObservabilityNotes: result.toolObservabilityNotes ?? [],
       toolObservationsTruncated: result.toolObservationsTruncated === true,
+      reviewEvidenceNotes: result.reviewEvidenceNotes ?? [],
+      reviewEvidenceNotesTruncated: result.reviewEvidenceNotesTruncated === true,
       ...(result.attributionError ? { attributionError: result.attributionError } : {}),
       status: result.status,
       taskId: result.taskId,
@@ -35,6 +38,7 @@ async function writeInPlaceResult(artifactDir: string, result: InPlaceLifecycleR
       reviewCycles: result.reviewCycles.map((cycle) => ({
         cycle: cycle.cycle,
         verdict: cycle.verdict,
+        toolObservationRevision: cycle.toolObservationRevision,
         changedSinceLaunchCount: cycle.changedSinceLaunch.length,
       })),
       reviewReport: result.reviewReport,
@@ -67,27 +71,30 @@ async function operationStateFor(input: Pick<InPlaceLifecycleInput, "taskId" | "
 
 /** Single settlement path: operation state, result.json, review report. */
 export async function settleInPlace(input: InPlaceLifecycleInput, result: InPlaceLifecycleResult): Promise<InPlaceLifecycleResult> {
-  try {
-    const evidence = JSON.parse(await readFile(join(result.artifactDir, IN_PLACE_OBSERVED_EVIDENCE_FILE), "utf8")) as {
-      candidates?: Array<{ externalSideEffect?: unknown; absolutePath?: unknown }>;
-      toolObservabilityNotes?: unknown;
-      toolObservationsTruncated?: unknown;
-    };
-    result.observedExternalPaths = (evidence.candidates ?? [])
-      .filter((candidate) => candidate.externalSideEffect === true && typeof candidate.absolutePath === "string")
-      .map((candidate) => redactSensitiveText(candidate.absolutePath as string));
-    result.toolObservabilityNotes = Array.isArray(evidence.toolObservabilityNotes)
-      ? evidence.toolObservabilityNotes.filter((note): note is string => typeof note === "string")
-      : [];
-    result.toolObservationsTruncated = evidence.toolObservationsTruncated === true;
-  } catch {
-    result.observedExternalPaths ??= [];
-    result.toolObservabilityNotes ??= [];
-  }
+  const evidence = createEvidenceState();
+  await restoreObservedToolEvidence(evidence, result.artifactDir, result.workspaceRoot);
+  result.observedExternalPaths = [...evidence.candidates.values()]
+    .filter((candidate) => candidate.externalSideEffect === true)
+    .map((candidate) => redactSensitiveText(candidate.absolutePath));
+  result.toolObservabilityNotes = [...(evidence.toolObservabilityNotes ?? [])];
+  result.toolObservationsTruncated = evidence.toolObservationsTruncated === true;
+  result.reviewEvidenceNotes = [...(evidence.reviewEvidenceNotes ?? [])];
+  result.reviewEvidenceNotesTruncated = evidence.reviewEvidenceNotesTruncated === true;
   if (result.status === "no_changes") {
     const notes = result.toolObservabilityNotes ?? [];
     const snapshotLimits = ` Snapshot policy excludes ignored directories (including .git, node_modules, and dist) and may omit content for oversized or unreadable files; ${result.baseline.snapshot.omissions.length} omission(s) were recorded${result.baseline.snapshot.omissionsTruncated ? " and the omission list was truncated" : ""}.`;
     result.summary = `No workspace paths changed within the recorded bounded snapshot since launch. This does not establish that no external side effects occurred.${snapshotLimits}${notes.length > 0 ? ` Tool-event observability limits: ${notes.join("; ")}` : ""}${result.toolObservationsTruncated ? " The bounded tool-event evidence limit was reached; additional observations were omitted." : ""}`;
+  }
+  const disclosureNotes = [...(result.reviewEvidenceNotes ?? []), ...(result.toolObservabilityNotes ?? [])];
+  if (result.toolObservationsTruncated && result.status !== "no_changes") {
+    disclosureNotes.push("The bounded tool-event/path evidence limit was reached; additional observations were omitted.");
+  }
+  if (result.reviewEvidenceNotesTruncated) {
+    disclosureNotes.push("Earlier method/fallback notices were omitted at the evidence bound.");
+  }
+  if (disclosureNotes.length > 0) {
+    const disclosure = `Review evidence limitations: ${disclosureNotes.slice(-4).join("; ")}`;
+    if (!result.summary.includes(disclosure)) result.summary = `${result.summary}\n\n${disclosure}`;
   }
   result.reviewReport ??= buildReviewReportFromOutputs({
     outputs: result.reviewCycles.map((cycle) => ({ reviewOutput: cycle.reviewOutput })),

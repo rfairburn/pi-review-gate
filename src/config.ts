@@ -278,7 +278,30 @@ export const REVIEW_SUBTASK_ENABLED_DEFAULT = true;
 /** Default landed-change re-review posture: landed changes stay checkpointed out of the primary window. */
 export const REVIEW_LANDED_CHANGES_DEFAULT = false;
 
+/** Independent evidence-method choices; omission preserves snapshot evidence. */
+export interface ReviewEvidenceConfig {
+  primaryToolOnly?: boolean;
+  worktreeToolOnly?: boolean;
+  inplaceToolOnly?: boolean;
+  snapshotFailureFallback?: boolean;
+}
+
+export type EffectiveReviewEvidenceSettings = Required<ReviewEvidenceConfig>;
+
+/** Canonical evidence policy, separate from reviewer selection and enablement. */
+export function effectiveReviewEvidenceSettings(config: Pick<ReviewGateConfig, "review">): EffectiveReviewEvidenceSettings {
+  const evidence = config.review?.evidence;
+  return {
+    primaryToolOnly: evidence?.primaryToolOnly ?? false,
+    worktreeToolOnly: evidence?.worktreeToolOnly ?? false,
+    inplaceToolOnly: evidence?.inplaceToolOnly ?? false,
+    snapshotFailureFallback: evidence?.snapshotFailureFallback ?? false,
+  };
+}
+
 export interface ReviewSelectionConfig {
+  /** Evidence methods only: does not disable review or select reviewers. */
+  evidence?: ReviewEvidenceConfig;
   /**
    * Legacy single reviewer set (pre-#175 records). It is never the effective
    * state by itself: `effectiveReviewSettings` imports it into both split
@@ -667,7 +690,7 @@ export function recoverConfig(value: unknown): Pick<LoadedConfig, "config" | "wa
   // Only these objects contain independently defaultable settings. Selections,
   // agent definitions and route/resource entries remain atomic: never invent
   // a model, reasoning pair, command or authorization reference to repair one.
-  const containers = new Set(["web", "web.search", "web.fetch", "web.browserPermissions", "ui", "review", "youShouldKnow", "tools",
+  const containers = new Set(["web", "web.search", "web.fetch", "web.browserPermissions", "ui", "review", "review.evidence", "youShouldKnow", "tools",
     "execution", "execution.retryPolicy", "execution.routes",
     "execution.workerResources", "externalAgents", "scheduledTasks"]);
   const recover = (parent: Record<string, unknown>, key: string, input: unknown, path: string): void => {
@@ -1527,6 +1550,7 @@ function normalizeReviewSelection(value: unknown): ReviewSelectionConfig {
     }
   }
   return {
+    ...(value.evidence !== undefined ? { evidence: normalizeReviewEvidence(value.evidence) } : {}),
     activeReviewers: value.activeReviewers === undefined
       ? undefined
       : normalizeActiveReviewers(value.activeReviewers),
@@ -1540,6 +1564,17 @@ function normalizeReviewSelection(value: unknown): ReviewSelectionConfig {
     ...(value.subtaskEnabled !== undefined ? { subtaskEnabled: value.subtaskEnabled as boolean } : {}),
     ...(value.reviewLandedChanges !== undefined ? { reviewLandedChanges: value.reviewLandedChanges as boolean } : {}),
   };
+}
+
+function normalizeReviewEvidence(value: unknown): ReviewEvidenceConfig {
+  if (!isRecord(value)) throw new Error("review.evidence must be an object");
+  const evidence: ReviewEvidenceConfig = {};
+  for (const field of ["primaryToolOnly", "worktreeToolOnly", "inplaceToolOnly", "snapshotFailureFallback"] as const) {
+    if (value[field] === undefined) continue;
+    if (typeof value[field] !== "boolean") throw new Error(`review.evidence.${field} must be a boolean`);
+    evidence[field] = value[field];
+  }
+  return evidence;
 }
 
 function normalizeActiveReviewers(value: unknown, field = "review.activeReviewers"): ActiveReviewerSelection[] {

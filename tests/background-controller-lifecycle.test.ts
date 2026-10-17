@@ -100,6 +100,10 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     assert.equal(first.scheduling.configuredWorkerLimit, 2);
     assert.equal(first.scheduling.configuredPoolCapacity, 2);
     assert.equal(first.scheduling.estimatedImmediatelyAvailableSlots, 0);
+    assert.deepEqual(first.tasks.map((task) => task.definition.reviewEvidencePolicy), [
+      { toolOnly: false, snapshotFailureFallback: false, scope: "worktree" },
+      { toolOnly: false, snapshotFailureFallback: false, scope: "worktree" },
+    ]);
     // The gate is still closed: both dispatched workers are running but
     // provably not completed, so start genuinely returned before completion.
     await waitFor(() => controller!.inspect(first.executionId).tasks.every((task) => task.state === "running"));
@@ -126,12 +130,18 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
     await waitFor(() => messages.some((message) => /Top-off opportunity: up to 1 additional task\(s\) may be submitted with SubtasksAdd/.test(message)));
 
     config.execution!.subtaskNotifications = "noisy";
+    config.review!.evidence = { worktreeToolOnly: true, snapshotFailureFallback: true };
     const toppedOff = await controller.add(first.executionId, [{
       title: "second",
       instructions: "SECOND_SENTINEL",
       acceptanceCriteria: ["second.txt records the prior landing"],
     }]);
     assert.equal(toppedOff.tasks.length, 3);
+    assert.deepEqual(toppedOff.tasks.slice(0, 2).map((task) => task.definition.reviewEvidencePolicy), [
+      { toolOnly: false, snapshotFailureFallback: false, scope: "worktree" },
+      { toolOnly: false, snapshotFailureFallback: false, scope: "worktree" },
+    ]);
+    assert.deepEqual(toppedOff.tasks[2]?.definition.reviewEvidencePolicy, { toolOnly: true, snapshotFailureFallback: true, scope: "worktree" });
     assert.notEqual(toppedOff.tasks[0]?.taskId, toppedOff.tasks[2]?.taskId);
     await waitFor(() => controller!.inspect(first.executionId).tasks.every((task) => task.state === "landed"));
     assert.equal(await readFile(join(root, "second.txt"), "utf8"), "saw first\n");

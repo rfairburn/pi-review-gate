@@ -27,6 +27,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { ScheduledTaskReviewOverride } from "../config";
 import { atomicWrite } from "./durable-write";
+import { normalizeWorkerReviewEvidencePolicy, workerReviewEvidenceScope } from "./review-evidence-policy";
 import {
   clipActivity,
   cloneTask,
@@ -449,7 +450,7 @@ export async function readGroup(root: string): Promise<ReadGroupResult> {
     if (isArchivedTaskReference(persistedTask)) {
       if (windowIds.has(persistedTask.taskId)) {
         const task = await readTaskArchive(resolved, persistedTask, parsed.executionId);
-        normalizeRestoredTask(task);
+        normalizeRestoredTask(task, parsed.kind);
         tasks.push(task);
         archives.set(persistedTask.taskId, {
           updatedAt: persistedTask.updatedAt,
@@ -466,7 +467,7 @@ export async function readGroup(root: string): Promise<ReadGroupResult> {
         });
       }
     } else {
-      normalizeRestoredTask(persistedTask);
+      normalizeRestoredTask(persistedTask, parsed.kind);
       tasks.push(persistedTask);
     }
   }
@@ -492,13 +493,22 @@ export async function readGroup(root: string): Promise<ReadGroupResult> {
   return { group, archives, legacyArchives, archiveIndex, manifestLegacy };
 }
 
-function normalizeRestoredTask(task: BackgroundTaskRecord): void {
+function normalizeRestoredTask(task: BackgroundTaskRecord, fallbackKind?: BackgroundTaskKind): void {
   delete (task as BackgroundTaskRecord & { matchedWakePatterns?: string[] }).matchedWakePatterns;
   delete (task.definition as BackgroundTaskDefinition & { wakeOn?: unknown }).wakeOn;
+  const kind = task.definition.backgroundKind ?? fallbackKind;
+  task.definition.reviewEvidencePolicy = normalizeWorkerReviewEvidencePolicy(
+    task.definition.reviewEvidencePolicy,
+    kind === undefined ? undefined : workerReviewEvidenceScope(kind),
+  );
   normalizeTaskHistory(task);
 }
 
-async function readTaskArchive(root: string, reference: ArchivedBackgroundTaskReference, executionId: string): Promise<BackgroundTaskRecord> {
+async function readTaskArchive(
+  root: string,
+  reference: ArchivedBackgroundTaskReference,
+  executionId: string,
+): Promise<BackgroundTaskRecord> {
   const expectedPath = taskArchivePath(reference.taskId);
   if (reference.archivePath !== expectedPath) throw new Error(`Invalid archive path for task ${reference.taskId}.`);
   const parsed = JSON.parse(await readFile(join(root, expectedPath), "utf8")) as PersistedBackgroundTaskArchive;

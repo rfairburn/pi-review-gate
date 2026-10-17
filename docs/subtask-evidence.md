@@ -7,6 +7,44 @@ presented. Task lifecycle, worker kinds and modes, capture and landing, conflict
 continuation, and notifications remain owned by
 [Delegated execution](delegated-execution.md).
 
+## Evidence method and provenance
+
+Worker review evidence defaults to snapshots. Optional tool-only selection and
+snapshot-failure fallback are configured separately under
+[`review.evidence`](configuration.md#review-evidence-methods); the **Evidence methods**
+menu does not change the `SubtasksInspect` navigation API or turn worker claims into
+observations. Workers pin applicable evidence/fallback policy at firing/queue admission:
+each Start/Add task captures independently, scheduled tasks at actual firing, not schedule
+creation. Already queued/running tasks retain it through corrections, retries, and
+continuations; later Add tasks capture the then-current live choice.
+
+Tool-only review retains supported observed calls and content/results for the reviewer:
+for example, a tool edit to `SCRIPT` stays evidence even when an independent generator
+also changes `REPORT`. Post-pass report additions alone do not retrigger tool-only
+review without new observed changes. This does not prove authorship or complete effect
+coverage. Pi, Claude, and Codex observations are bounded by their adapters; binary
+executors have no structured tool events. Unobserved changes are not silently upgraded
+to verified worker output, and an empty observed-change set is not proof of an unchanged
+workspace or no external side effects. Missing/unavailable observations must not block
+review: show as much retained evidence as collected, disclose adapter/capture limits,
+and permit assessment of clearly provenance-labelled claims/context. Tool-only omits
+only filesystem/Git review snapshots subject to outside-writer contamination, never
+bounded tool/path/content observations or read-only reviewer inspection.
+
+Every actual snapshot-failure fallback must disclose the originating context and retained
+tool-only basis to the reviewer, user, and implementing model, with a prominent warning
+rather than a fabricated snapshot or approval. Fallback is not sticky: snapshot-preferring
+captured policy retries capture on later cycles/continuations. Later success cannot
+fabricate earlier coverage or discard retained current-work tool evidence. A first InPlace
+baseline failure before work may use that durable tool-only basis when fallback is enabled;
+missing or corrupt
+persisted evidence still blocks. Indexed evidence, worker claims, and official reviewer
+verdicts remain distinct, regardless of which review evidence method was selected. See
+[Review workflow](review-workflow.md#snapshot-failure-fallback) for eligibility and
+[Recovery](recovery.md#review-evidence-failure-and-fallback) for blocking failures.
+
+## Indexed inspection
+
 `SubtasksInspect` accepts an optional `evidence` selector that reads a task's bounded,
 indexed executor evidence instead of the legacy activity window. The two interfaces are
 mutually exclusive: combining `evidence` with `offset`/`lines` is a hard error, and

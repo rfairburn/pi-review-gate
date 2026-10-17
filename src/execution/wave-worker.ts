@@ -3,6 +3,8 @@ import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:p
 import { promises as fs } from "node:fs";
 import { atomicWrite } from "./durable-write";
 import { createExecutorAdapter } from "./adapters/factory";
+import type { WorkerReviewEvidencePolicy } from "./review-evidence-policy";
+import { recordObservedToolEventEvidence, recordToolEventObservability, type EvidenceState } from "../evidence";
 import { normalizeCandidate, researchWorkspaceChanges, type CandidateCommit } from "./wave-commits";
 import type { WorkerWorktree } from "./wave-worktrees";
 import type { WaveCaptureResult } from "./wave-repository";
@@ -99,6 +101,7 @@ export function rewriteTaskPaths(
       ? rewriteSourcePaths(task.relevantContext, sourceRoot, workerRoot)
       : undefined,
     backgroundKind: task.backgroundKind,
+    reviewEvidencePolicy: task.reviewEvidencePolicy ? { ...task.reviewEvidencePolicy } : undefined,
     executorToolCatalog: task.executorToolCatalog ? {
       allowedToolCatalog: [...task.executorToolCatalog.allowedToolCatalog],
       initialActiveTools: [...task.executorToolCatalog.initialActiveTools],
@@ -148,6 +151,8 @@ export interface WaveWorkerTask {
   relevantContext?: string;
   /** Persisted background role for recovery-bundle adoption. */
   backgroundKind?: "execute" | "research" | "inplace";
+  /** Admission-captured evidence method; absence is legacy snapshot/off behavior. */
+  reviewEvidencePolicy?: WorkerReviewEvidencePolicy;
   /** Canonical durable authorization and initial-activation contract. */
   executorToolCatalog?: ExecutorToolCatalog;
   /** Acknowledged steering in delivery order. Later entries supersede conflicting earlier task text. */
@@ -272,6 +277,8 @@ export interface WaveWorkerInput {
   artifactDir: string;
   /** Review gate configuration. */
   config: ReviewGateConfig;
+  /** Shared, bounded evidence state for structured executor observations. */
+  evidence?: EvidenceState;
   /** Canonical source root for path rewriting. */
   sourceRoot: string;
   /** Lexical aliases for the source root (for example macOS /tmp vs /private/tmp). */
@@ -306,6 +313,8 @@ export interface WaveWorkerContinuationInput {
   artifactDir: string;
   /** Review gate configuration. */
   config: ReviewGateConfig;
+  /** Shared, bounded evidence state for structured executor observations. */
+  evidence?: EvidenceState;
   /** Canonical source root for path rewriting. */
   sourceRoot: string;
   /** Lexical aliases for the source root (for example macOS /tmp vs /private/tmp). */
@@ -710,6 +719,12 @@ async function runWithPoolFailover(input: {
     let adapter: ExecutorAdapter | undefined;
     try {
       adapter = createExecutorAdapter(input.worker.config, assignment.entry.selection);
+      if (input.worker.evidence) {
+        recordToolEventObservability(input.worker.evidence, adapter.kind, adapter.toolEventObservability ?? {
+          mode: "unavailable",
+          description: "This executor adapter does not expose a structured tool-event stream; tool-level write paths are not observed.",
+        });
+      }
       input.operation.adapter = adapter.kind;
       input.operation.model = adapter.model;
       await writeOperationRecord(input.operation);
@@ -815,6 +830,20 @@ async function runWithPoolFailover(input: {
           model: adapter!.model,
         }),
         onLiveControl: input.worker.onLiveControl,
+        onToolObservation: input.worker.evidence
+          ? (event) => recordObservedToolEventEvidence({
+            state: input.worker.evidence!,
+            cwd: input.worker.worktree.effectiveCwd,
+            selectedRoot: input.worker.worktree.worktreeRoot,
+            adapter: adapter!.kind,
+            stage: event.stage,
+            toolName: event.toolName,
+            observationId: event.observationId,
+            toolInput: event.toolInput,
+            result: event.result,
+            isError: event.isError,
+          })
+          : undefined,
       },
       prompt,
       startingTurn,

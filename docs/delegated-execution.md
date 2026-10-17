@@ -172,6 +172,46 @@ items, so a nonexistent token lists nothing and no command is offered or
 executed. On non-interactive hosts the public multi-line editor (with the legacy
 single-line input behind it) is used unchanged.
 
+## Worker review evidence selection
+
+The default-Off **Isolated worktree tool-only** and **InPlace tool-only** controls
+under `/review-settings` → **Reviewers** → **Evidence methods** select review evidence
+independently of the worker kind, reviewer set, and automatic-review toggles. They
+are stored as `review.evidence.worktreeToolOnly` and `inplaceToolOnly`; the independent
+`snapshotFailureFallback` opt-in also defaults Off. See
+[Configuration](configuration.md#review-evidence-methods).
+
+Workers capture applicable evidence and fallback policy at firing/queue admission.
+Each new model `SubtasksStart`/`SubtasksAdd` task or human submission captures independently;
+scheduled subtasks capture at actual firing/admission, not schedule creation. Already
+queued and running tasks retain that policy through corrections, retries, and
+continuations; later Add tasks capture the then-current live choice. No in-flight task
+is reconfigured, and evidence policy does not freeze all routes or reviewer selections.
+
+In tool-only review, supported observed tool edits to `SCRIPT` and their retained
+content/results reach the reviewer even while an independent generator changes
+`REPORT`. Post-pass `REPORT` additions alone do not retrigger review without new
+observed changes. This is not a universal authorship guarantee: event support and
+capture limits still apply, and binary executors have no structured tool events.
+Missing observations do not block review: show collected evidence with adapter/capture
+limits and clearly provenance-labelled claims/context, never proof of clean work or no
+effects. Tool-only omits only filesystem/Git review snapshots subject to outside-writer
+contamination, not bounded tool/path/content observations or read-only reviewer inspection.
+Snapshot-preferring captured policy retries capture on later cycles/continuations;
+fallback is not sticky and warns prominently on every occurrence. Later capture cannot
+invent earlier coverage or discard retained current-work tool evidence. The
+[review workflow](review-workflow.md#review-evidence-methods) owns that evidence
+contract and the warning-bearing fallback, including allowed first-baseline fallback
+for InPlace before work.
+
+Tool-only review never replaces the isolated input capture needed to construct a
+worker workspace, nor its verified candidate checkpoint or landing inputs. Even with
+fallback On, shared stages needed for checkpoint or landing may remain blocking;
+there is no promise that all isolated snapshot failures can fall back. Missing/corrupt
+persisted evidence, cancellation, and review execution errors remain blocking. InPlace
+writes and side effects still occur immediately: selecting evidence changes neither
+post-hoc review nor the absence of rollback.
+
 ## In-place subtask kind
 
 The `inplace` kind (#220) is a third, explicitly selected worker kind alongside `execute`
@@ -218,8 +258,9 @@ Launch paths and semantics:
 
 Attribution and review:
 
-- At dispatch the task records a bounded content snapshot of the selected workspace plus
-  the observed Git HEAD when the root is inside a repository (and nothing when it is
+- In default snapshot mode, at dispatch the task records a bounded content snapshot
+  of the selected workspace plus the observed Git HEAD when the root is inside a
+  repository (and nothing when it is
   not), and persists that launch baseline durably (write-once) in the task's artifact
   directory before any executor runs. Every continuation restores and verifies that
   same basis — a persisted basis that is missing after prior execution, malformed,
@@ -235,11 +276,13 @@ Attribution and review:
   baseline. A missing or incompatible session falls back to a disclosed fresh session
   in the same workspace; a failed critical operation still refuses continuation.
 - The missing-baseline refusal holds even when no stored result exists: after any
-  recorded prior execution, a missing launch baseline fails closed instead of
-  re-capturing over an already-modified workspace. Only a genuinely first effective
-  dispatch — no retained execution context and no baseline document — captures one.
-- A task's own reviewer reviews the content-anchored recorded delta of that workspace
-  since launch — the same workspace-snapshot review scope direct orchestrator work would
+  recorded prior execution, a missing persisted evidence basis fails closed instead of
+  re-capturing over an already-modified workspace. A genuinely first dispatch captures
+  the selected basis. With fallback explicitly enabled, failure of that first
+  review-baseline snapshot before work may establish a durable, disclosed tool-only
+  basis instead; it never invents a snapshot or repairs lost evidence.
+- In snapshot mode, a task's own reviewer reviews the content-anchored recorded delta
+  of that workspace since launch — the same workspace-snapshot review scope direct orchestrator work would
   receive in that workspace — and follows the ordinary correction loop
   (`needs_changes` resumes the same worker there). Identity binds status, path, and
   CONTENT (file hashes and snapshot-entry metadata): a turn that rewrites the content
@@ -276,29 +319,34 @@ Attribution and review:
   task evidence for continuations. Discard-output writes to `/dev/null` are excluded
   from path candidates; the original command remains in tool history. Destructive
   operations on that path remain evidence candidates.
-- `no_changes` means only that the bounded selected-root snapshot contains no recorded
-  workspace delta since launch. It does not mean that no external side effect occurred.
-  Detailed baseline and tool evidence retain snapshot exclusions and observation limits.
-- A review verdict is explicitly post-hoc: a passing verdict reports that the recorded
-  workspace delta satisfies the task; it never represents a pre-write gate, a rollback,
+- In snapshot mode, `no_changes` means only that the bounded selected-root snapshot
+  contains no recorded workspace delta since launch. In tool-only mode, absence of
+  observed changes is not proof of an unchanged filesystem. Neither means that no
+  external side effect occurred. Detailed evidence retains the selected basis,
+  snapshot exclusions where applicable, and tool-observation limits.
+- A review verdict is explicitly post-hoc: a passing verdict applies to the selected
+  evidence basis (the recorded workspace delta in snapshot mode, retained observed-tool
+  evidence in tool-only mode); it never represents a pre-write gate, a rollback,
   or an undo of network, API, process, or out-of-workspace side effects, and settled
-  in-place tasks never claim their writes were undone. Routine completion messages
-  report status, review outcome, and named workspace changes since launch. A separate
-  **Additional observed paths outside workspace** list supplements that snapshot
+  in-place tasks never claim their writes were undone. In snapshot mode, routine
+  completion messages report status, review outcome, and named workspace changes since
+  launch. A separate **Additional observed paths outside workspace** list supplements that snapshot
   evidence. Detailed attribution and observation limits remain in the review context
   and evidence rather than repeated in routine notices.
 - When existing policy invokes review, completed worker summaries—including the
   initial turn—reach the reviewer through the normal bounded, redacted evidence
   and request channels. The summaries are persisted with task evidence for retries
   and restored context; a summary-only deliverable needs no extra report file.
-  Summary capture does not change zero-delta review skipping or retry limits.
+  Summary capture alone does not introduce an observed change or change retry limits;
+  review eligibility follows the selected evidence method.
 - Durable per-cycle reviewer records are written under the task's artifact directory as
   `reviews/inplace/cycle-NNNN.json` in an in-place record shape that carries the
   attribution basis instead of a fabricated commit identity. Subtask evidence indexes
   these records; a failing publication still leaves the bounded unpublished marker
   instead of silently presenting an older readable cycle as current.
-- Settled in-place tasks end `reported` (like research groups) with the review outcome,
-  the workspace path, and a bounded named list of changed-since-launch paths in the
+- Settled in-place tasks end `reported` (like research groups). In snapshot mode they
+  include the review outcome, workspace path, and a bounded named list of
+  changed-since-launch paths in the
   summary. A failed, timed-out, or interrupted lifecycle also re-checks the recorded
   workspace delta at settlement — writes the worker already performed are reflected in the
   durable result, durable summaries, and notices instead of a false no-changes claim;

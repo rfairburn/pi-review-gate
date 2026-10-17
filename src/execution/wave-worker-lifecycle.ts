@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -52,6 +52,7 @@ import {
   type ReviewRunOutput,
 } from "../review";
 import {
+  captureObservedToolPathAfterStates,
   createEvidenceState,
   rememberFinalAssistantSummaryText,
   type EvidenceState,
@@ -75,6 +76,8 @@ import {
   type SubtaskReviewReport,
 } from "../review-report";
 import { atomicWriteExclusive } from "./durable-write";
+import { persistObservedToolEvidence, restoreObservedToolEvidence } from "./observed-evidence";
+import { normalizeWorkerReviewEvidencePolicy } from "./review-evidence-policy";
 import type { SubtaskProgressUpdate } from "./types";
 import { createWorkspaceSnapshot, type WorkspaceSnapshot } from "../capture";
 import {
@@ -126,6 +129,8 @@ export interface ReviewCycle {
   verdict: ReviewResult["verdict"];
   /** Review output details. */
   reviewOutput: ReviewRunOutput;
+  /** Observed mutation-path tool-event revision reviewed in this cycle. */
+  toolObservationRevision?: number;
 }
 
 /** Result of running a complete wave worker lifecycle. */
@@ -394,11 +399,13 @@ async function runCandidateReview(
     before: baseSnapshot,
     config: frozenConfig,
     evidence,
+    evidencePolicy: normalizeWorkerReviewEvidencePolicy(task.reviewEvidencePolicy, "worktree"),
     changeIdentity: { baseCommit: capture.baseCommit, candidateCommit: candidate.commitSha },
     exactChange,
     window,
     correctionAttemptCount,
     signal,
+    notify: onUpdate,
     onUpdate,
   });
 }
@@ -595,6 +602,7 @@ async function writeResult(artifactDir: string, result: WaveWorkerLifecycleResul
     outputs: result.reviewCycles,
     artifactDir,
   });
+  await appendEvidenceDisclosure(artifactDir, result);
   await writeFile(
     join(artifactDir, "result.json"),
     JSON.stringify({
@@ -615,6 +623,7 @@ async function writeResult(artifactDir: string, result: WaveWorkerLifecycleResul
         candidateTreeSha: c.candidateTreeSha,
         candidateRef: c.candidateRef,
         verdict: c.verdict,
+        toolObservationRevision: c.toolObservationRevision,
       })),
       reviewReport: result.reviewReport,
       operationRecord: result.operationRecord,
@@ -628,6 +637,33 @@ async function writeResult(artifactDir: string, result: WaveWorkerLifecycleResul
     }, null, 2),
     "utf8",
   );
+}
+
+async function appendEvidenceDisclosure(artifactDir: string, result: WaveWorkerLifecycleResult): Promise<void> {
+  try {
+    const value = JSON.parse(await readFile(join(artifactDir, "observed-tool-evidence.json"), "utf8")) as {
+      reviewEvidenceNotes?: unknown;
+      toolObservabilityNotes?: unknown;
+      toolObservationsTruncated?: unknown;
+      reviewEvidenceNotesTruncated?: unknown;
+    };
+    const notes = [...(Array.isArray(value.reviewEvidenceNotes) ? value.reviewEvidenceNotes : []),
+      ...(Array.isArray(value.toolObservabilityNotes) ? value.toolObservabilityNotes : [])]
+      .filter((note): note is string => typeof note === "string");
+    const disclosures = notes.slice(-4);
+    if (value.toolObservationsTruncated === true) {
+      disclosures.push("The bounded tool-event/path evidence limit was reached; additional observations were omitted.");
+    }
+    if (value.reviewEvidenceNotesTruncated === true) {
+      disclosures.push("Earlier method/fallback notices were omitted at the evidence bound.");
+    }
+    if (disclosures.length === 0) return;
+    const disclosure = `Review evidence limitations: ${disclosures.join("; ")}`;
+    if (!result.summary.includes(disclosure)) result.summary = `${result.summary}\n\n${disclosure}`;
+  } catch {
+    // The lifecycle's explicit evidence checkpoint is authoritative. Result
+    // publication must not turn an optional summary read into a new blocker.
+  }
 }
 
 function lifecycleOperationState(status: WaveWorkerLifecycleStatus): import("./operation-record").OperationState {
@@ -746,6 +782,28 @@ export async function runWaveWorkerLifecycle(
     maxSnapshotBytes: config.maxSnapshotBytes,
     signal,
   });
+  const { state: reviewState, window } = createWorkerReviewState();
+  setReviewWindowBaseline(reviewState, baseSnapshot);
+  if (input.initialResult) {
+    await restoreObservedToolEvidence(window.evidence, resolvedArtifactDir, worktree.worktreeRoot, {
+      required: input.task.reviewEvidencePolicy?.toolOnly === true
+        || input.task.reviewEvidencePolicy?.snapshotFailureFallback === true,
+    });
+  }
+  const runEvidenceTurn = async <T>(invoke: () => Promise<T>): Promise<T> => {
+    try {
+      return await invoke();
+    } finally {
+      try {
+        await captureObservedToolPathAfterStates(window.evidence, worktree.worktreeRoot, {
+          maxFileBytes: config.maxFileBytes,
+          maxSnapshotBytes: config.maxSnapshotBytes,
+        });
+      } finally {
+        await persistObservedToolEvidence(window.evidence, resolvedArtifactDir);
+      }
+    }
+  };
 
   // ── 3. Run initial executor turn ──
   reportProgress(input, {
@@ -762,7 +820,11 @@ export async function runWaveWorkerLifecycle(
 
   let initialResult: WaveWorkerResult;
   try {
-    initialResult = input.initialResult ?? await runWaveWorker({ ...input, onLiveControl: publishLiveControl });
+    initialResult = input.initialResult ?? await runEvidenceTurn(() => runWaveWorker({
+      ...input,
+      evidence: window.evidence,
+      onLiveControl: publishLiveControl,
+    }));
     effectiveAssignment = initialResult.effectiveAssignment ?? effectiveAssignment;
     await steeringEvidence.flush();
   } catch (error) {
@@ -781,7 +843,7 @@ export async function runWaveWorkerLifecycle(
   }
 
   // Handle non-completed initial results.
-  if (initialResult.status === "no_changes") {
+  if (initialResult.status === "no_changes" && !window.evidence.requiresReview) {
     const result: WaveWorkerLifecycleResult = {
       status: "no_changes",
       taskId,
@@ -854,8 +916,6 @@ export async function runWaveWorkerLifecycle(
   // Executor final responses are authoritative session evidence. Adapters
   // persist them as artifacts, but reviewers cannot inspect runtime artifacts;
   // copy the bounded, redacted text into the worker-local review evidence.
-  const { state: reviewState, window } = createWorkerReviewState();
-  setReviewWindowBaseline(reviewState, baseSnapshot);
   rememberFinalAssistantSummaryText(window.evidence, initialResult.summary);
 
   // A transport that could not steer the live command leaves the instruction
@@ -899,13 +959,14 @@ export async function runWaveWorkerLifecycle(
     ].join("\n");
     let steeredResult: WaveWorkerResult;
     try {
-      steeredResult = await resumeWaveWorker({
+      steeredResult = await runEvidenceTurn(() => resumeWaveWorker({
         taskId,
         task,
         capture,
         worktree,
         artifactDir,
         config,
+        evidence: window.evidence,
         sourceRoot: input.sourceRoot,
         sourceRootAliases: input.sourceRootAliases,
         priorResult: initialResult,
@@ -916,7 +977,7 @@ export async function runWaveWorkerLifecycle(
         onLiveControl: publishLiveControl,
         executorAssignment: effectiveAssignment,
         acquireFailover: input.acquireFailover,
-      });
+      }));
       await steeringEvidence.flush();
     } catch (error) {
       const result: WaveWorkerLifecycleResult = {
@@ -964,7 +1025,7 @@ export async function runWaveWorkerLifecycle(
   }
 
   // ── 4. Review or skip ──
-  if (!candidate.differsFromBase) {
+  if (!candidate.differsFromBase && !window.evidence.requiresReview) {
     const result: WaveWorkerLifecycleResult = {
       status: "no_changes",
       taskId,
@@ -1182,13 +1243,14 @@ export async function runWaveWorkerLifecycle(
       ].join("\n");
       let steeredResult: WaveWorkerResult;
       try {
-        steeredResult = await resumeWaveWorker({
+        steeredResult = await runEvidenceTurn(() => resumeWaveWorker({
           taskId,
           task,
           capture,
           worktree,
           artifactDir,
           config,
+          evidence: window.evidence,
           sourceRoot: input.sourceRoot,
           sourceRootAliases: input.sourceRootAliases,
           priorResult: currentResult,
@@ -1199,7 +1261,7 @@ export async function runWaveWorkerLifecycle(
           onLiveControl: publishLiveControl,
           executorAssignment: effectiveAssignment,
           acquireFailover: input.acquireFailover,
-        });
+        }));
         await steeringEvidence.flush();
       } catch (error) {
         const result: WaveWorkerLifecycleResult = {
@@ -1299,6 +1361,7 @@ export async function runWaveWorkerLifecycle(
       candidateRef: reviewAliasRef,
       verdict,
       reviewOutput,
+      toolObservationRevision: window.evidence.toolObservationRevision ?? 0,
     };
     reviewCycles.push(cycle);
 
@@ -1433,13 +1496,14 @@ export async function runWaveWorkerLifecycle(
 
       let correctionResult: WaveWorkerResult;
       try {
-        correctionResult = await resumeWaveWorker({
+        correctionResult = await runEvidenceTurn(() => resumeWaveWorker({
           taskId,
           task,
           capture,
           worktree,
           artifactDir,
           config,
+          evidence: window.evidence,
           sourceRoot: input.sourceRoot,
           sourceRootAliases: input.sourceRootAliases,
           priorResult: currentResult,
@@ -1450,7 +1514,7 @@ export async function runWaveWorkerLifecycle(
           onLiveControl: publishLiveControl,
           executorAssignment: effectiveAssignment,
           acquireFailover: input.acquireFailover,
-        });
+        }));
         await steeringEvidence.flush();
       } catch (error) {
         const result: WaveWorkerLifecycleResult = {
@@ -1588,13 +1652,14 @@ export async function runWaveWorkerLifecycle(
 
     let confirmResult: WaveWorkerResult;
     try {
-      confirmResult = await resumeWaveWorker({
+      confirmResult = await runEvidenceTurn(() => resumeWaveWorker({
         taskId,
         task,
         capture,
         worktree,
         artifactDir,
         config,
+        evidence: window.evidence,
         sourceRoot: input.sourceRoot,
         sourceRootAliases: input.sourceRootAliases,
         priorResult: currentResult,
@@ -1605,7 +1670,7 @@ export async function runWaveWorkerLifecycle(
         onLiveControl: publishLiveControl,
         executorAssignment: effectiveAssignment,
         acquireFailover: input.acquireFailover,
-      });
+      }));
       await steeringEvidence.flush();
     } catch (error) {
       // Confirmation executor threw — return executor_error without pinning.

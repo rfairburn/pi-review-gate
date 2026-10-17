@@ -21,6 +21,7 @@ import type { ReviewExchangeContext } from "./state";
 import type { TokenUsage } from "./usage";
 
 interface ReviewBundleContext {
+  evidenceMethod?: import("./review-evidence").ReviewEvidenceMethod;
   dir?: string;
   reviewSequence?: number;
   exchanges?: ReviewExchangeContext[];
@@ -90,6 +91,7 @@ async function initializeBundle(input: CreateBundleInput, dir: string, work: Bun
     ? { selectedCwd: input.cwd, workspaceRoot: input.workspaceRoot }
     : undefined;
   const promptContext = {
+    evidenceMethod: input.evidenceMethod,
     request: input.request,
     submittedChanges: input.submittedChanges,
     sideEffectChanges: input.sideEffectChanges ?? [],

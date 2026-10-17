@@ -13,6 +13,8 @@ export interface InPlaceReviewCycleRecord {
   waveId: "inplace";
   cycle: number;
   reviewSequence: number;
+  /** Tool-observation identity, independent of the exact workspace delta identity. */
+  toolObservationRevision: number;
   completedAt: string;
   /** Identity marker: distinguishes in-place records from wave candidate records. */
   inPlace: true;
@@ -38,6 +40,7 @@ export function buildInPlaceReviewCycleRecord(input: {
   reviewSequence: number;
   attribution: InPlaceAttribution;
   deltaIdentitySha256: string;
+  toolObservationRevision: number;
   reviewOutput: ReviewRunOutput;
 }): InPlaceReviewCycleRecord {
   const gate = input.reviewOutput.result;
@@ -62,6 +65,7 @@ export function buildInPlaceReviewCycleRecord(input: {
     waveId: "inplace",
     cycle: input.cycle,
     reviewSequence: input.reviewSequence ?? input.cycle,
+    toolObservationRevision: input.toolObservationRevision,
     completedAt: new Date().toISOString(),
     inPlace: true,
     attribution: {

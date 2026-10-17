@@ -11,6 +11,7 @@ import {
   extractCandidatePaths,
   recordAcceptedReviewerQuestion,
   recordObservedToolEventEvidence,
+  recordReviewEvidenceNote,
   recordToolCallEvidence,
   recordToolEventObservability,
   restoreEvidenceState,
@@ -85,11 +86,13 @@ test("observed external evidence persists across continuations and stays bounded
       toolInput: { files: [external] },
     });
     await captureObservedToolPathAfterStates(original, workspace, snapshotOptions);
+    recordReviewEvidenceNote(original, "Cycle 1 records an observation-based review basis; no workspace snapshot is certified by that record.");
     restoreEvidenceState(restored, JSON.parse(JSON.stringify(serializeEvidenceState(original))) as unknown, workspace);
     assert.equal(restored.requiresReview, true);
     assert.equal(restored.events.length, 1);
     assert.equal(original.externalObservationRevision, 1);
     assert.equal(restored.externalObservationRevision, 1, "the observation revision survives evidence restoration");
+    assert.deepEqual(restored.reviewEvidenceNotes, ["Cycle 1 records an observation-based review basis; no workspace snapshot is certified by that record."]);
     await writeFile(external, "changed after continuation\n", "utf8");
     await captureObservedToolPathAfterStates(restored, workspace, snapshotOptions);
     assert.equal([...restored.candidates.values()][0]?.prestateUnverified, true);
@@ -111,6 +114,75 @@ test("observed external evidence persists across continuations and stays bounded
   }
 });
 
+test("durable evidence clips oversized event histories and discloses the loss", () => {
+  const state = createEvidenceState();
+  for (let index = 1; index <= 205; index += 1) {
+    state.events.push({
+      sequence: index,
+      phase: "tool_call",
+      toolName: "write",
+      summary: "write",
+      candidatePaths: Array.from({ length: 30 }, (_, pathIndex) => `path-${pathIndex}`),
+      riskSignals: [],
+    });
+  }
+  state.nextSequence = 206;
+
+  const persisted = serializeEvidenceState(state);
+  assert.equal(persisted.events.length, 200);
+  assert.equal(persisted.events[0]?.sequence, 6);
+  assert.equal(persisted.events.at(-1)?.candidatePaths.length, 25);
+  assert.equal(persisted.toolObservationsTruncated, true);
+  assert.equal(persisted.requiresReview, true);
+  assert.equal(state.requiresReview, true, "truncation is reflected in the live review state too");
+});
+
+test("structured tool observations retain bounded current SCRIPT content and advance on same-path rewrites", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "pi-review-gate-script-observation-"));
+  const workspace = join(scratch, "workspace");
+  const scriptPath = join(workspace, "SCRIPT.sh");
+  await mkdir(workspace, { recursive: true });
+  const state = createEvidenceState();
+  try {
+    recordObservedToolEventEvidence({
+      state,
+      cwd: workspace,
+      selectedRoot: workspace,
+      adapter: "codex-cli",
+      stage: "start",
+      toolName: "write",
+      toolInput: { path: scriptPath, content: "echo first" },
+    });
+    await writeFile(scriptPath, "#!/bin/sh\necho first\n", "utf8");
+    await captureObservedToolPathAfterStates(state, workspace, snapshotOptions);
+    const first = buildEvidenceBundle(state, [], undefined, { selectedCwd: workspace, workspaceRoot: workspace });
+    assert.equal(first.candidates[0]?.baseline, "unverified");
+    assert.equal(first.candidates[0]?.afterSnapshot?.content, "#!/bin/sh\necho first\n");
+    assert.equal(first.changedCandidatePaths.length, 0, "a bounded after observation is not a diff");
+    assert.match(first.markdown, /Tool-observed in-workspace candidates/);
+    assert.match(first.markdown, /Redacted after-content \(not a diff\)/);
+    const firstRevision = first.toolObservationRevision;
+
+    recordObservedToolEventEvidence({
+      state,
+      cwd: workspace,
+      selectedRoot: workspace,
+      adapter: "codex-cli",
+      stage: "start",
+      toolName: "write",
+      toolInput: { path: scriptPath, content: "echo second" },
+    });
+    await writeFile(scriptPath, "#!/bin/sh\necho second\n", "utf8");
+    await captureObservedToolPathAfterStates(state, workspace, snapshotOptions);
+    const second = buildEvidenceBundle(state, [], undefined, { selectedCwd: workspace, workspaceRoot: workspace });
+    assert.ok(second.toolObservationRevision > firstRevision, "same-path content rewrites invalidate an observed review identity");
+    assert.equal(second.candidates[0]?.afterSnapshot?.content, "#!/bin/sh\necho second\n");
+    assert.equal(second.changedCandidatePaths.length, 0);
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
 test("an unavailable event stream is disclosed without inventing a tool observation", () => {
   const state = createEvidenceState();
   recordToolEventObservability(state, "run-as-binary", {
@@ -122,6 +194,8 @@ test("an unavailable event stream is disclosed without inventing a tool observat
   assert.deepEqual(bundle.events, []);
   assert.match(bundle.markdown, /No structured tool calls are forwarded/);
   assert.match(bundle.markdown, /Missing events do not prove/);
+  assert.match(bundle.markdown, /No structured mutation-path observations retained/);
+  assert.match(bundle.markdown, /The evidence limitation alone is not a review block/);
 });
 
 test("tool path and event limits stay bounded and force review when evidence is truncated", async () => {

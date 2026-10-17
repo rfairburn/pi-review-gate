@@ -304,6 +304,49 @@ configuration gate for `ApplyPatch` and no `setActiveTools` re-enabling: availab
 follows Pi's normal registered-tool policy, and an explicit Pi launch `--tools`
 allowlist remains authoritative.
 
+## Review evidence is not a durability bypass
+
+All `review.evidence` controls default Off. Selecting tool-only evidence for Primary,
+isolated worktree, or InPlace review changes the evidence basis only, not operating
+mode, tool authority, reviewer selection, automatic-review enablement, or acceptance
+rules. Tool-only omits only filesystem/Git review snapshots subject to outside-writer
+contamination; bounded tool/path/content observations, targeted candidate capture, and
+reviewer read-only inspection remain. It neither sandboxes execution nor prohibits file
+reads. The separate snapshot-failure fallback opt-in also defaults Off; failure stays
+blocking unless it
+qualifies as review-evidence-only capture with fallback enabled.
+
+An eligible fallback uses retained current tool evidence with a durable, truthful
+basis. This includes an enabled fallback on the first Primary or InPlace review-baseline
+capture before work; it does not permit replacing missing/corrupt persisted evidence.
+Every actual fallback requires a prominent origin-correct warning to the user and
+implementing model and a truthful tool-only label for the reviewer, not just a settings description,
+log entry, or optional notice. It never claims approval or full snapshot coverage.
+Fallback is not sticky: snapshot-preferring configured/captured policy retries capture
+on later cycles/continuations. Later success cannot invent earlier coverage or discard
+retained current-work tool evidence, even after an unavailable first baseline.
+Cancellation, review execution errors, isolated construction input capture, checkpoint
+and landing requirements, integrity failures, and recovery gates stay fail-closed.
+Shared isolated stages may remain blocking where checkpoint/landing needs them;
+tool history cannot substitute for durability.
+
+Tool-only observation is not proof of perfect authorship or universal side-effect
+coverage. Supported `SCRIPT` tool edits can remain reviewable without attributing an
+independent generator's `REPORT` additions to the agent; those report additions alone
+do not retrigger tool-only review after a pass without new observed changes. But
+adapter omissions, retention bounds, and concurrent writers limit attribution, and
+binary executors expose no structured tool events. Missing/unavailable observations
+must not block degraded review: show collected evidence, disclose adapter/capture limits,
+and permit assessment of clearly provenance-labelled claims/context. Missing observations
+are not proof of clean work or no effects. Neither a tool-only pass nor a
+snapshot pass attests to every external effect. InPlace review remains post-hoc and
+never gates or rolls back writes, processes, API calls, or other effects.
+
+See [Review workflow](review-workflow.md#review-evidence-methods) for the contract,
+[Settings](settings.md#evidence-methods) for warning-bearing Primary resets and
+transaction boundaries, and
+[Recovery](recovery.md#review-evidence-failure-and-fallback) for failure handling.
+
 ## Isolation limits
 
 Task isolation is worktree and instruction isolation, not an OS sandbox: a hostile

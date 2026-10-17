@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -53,6 +53,13 @@ function harness(options: {
   deferredPiTools?: boolean;
   /** Issue #434 canonical denial config installed on the manager's live config. */
   toolsDeny?: { topLevelDeny?: string[]; executorDeny?: string[] };
+  /**
+   * Deterministic executor hold for admission-only fixtures: the fake child
+   * stays alive while this file exists and exits on its own once the test
+   * removes it, so teardown settles children instead of aborting a runtime
+   * that may still be mid-launch (#434).
+   */
+  executorGatePath?: string;
   submittedFingerprintFor?: (toolCallId: string, toolName: string) => string | undefined;
   onNativeToolError?: (toolCallId: string, toolName: string) => void;
 } = {}) {
@@ -84,9 +91,16 @@ function harness(options: {
         command: process.execPath,
         execution: {
           ...(options.researchCapable ? {} : { protocol: "pi-review-executor-jsonl-v1" as const }),
-          args: options.slowExecutor
-          ? ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{},30000))"]
-          : undefined,
+          ...(options.executorGatePath !== undefined
+            ? {
+                args: ["-e", "const fs=require('node:fs');process.stdin.resume();const gate=process.env.PI_REVIEW_TEST_EXECUTOR_GATE;const timer=setInterval(()=>{if(!gate||!fs.existsSync(gate)){clearInterval(timer);process.exit(0)}},25)"],
+                env: { PI_REVIEW_TEST_EXECUTOR_GATE: options.executorGatePath },
+              }
+            : {
+                args: options.slowExecutor
+                  ? ["-e", "process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>{},30000))"]
+                  : undefined,
+              }),
         }
       }
     },
@@ -296,6 +310,14 @@ type LivenessGroupFixture = { executionId: string; startCallFingerprint?: string
 
 function controllerGroups(manager: ExecutionToolManager): Map<string, LivenessGroupFixture> {
   return (manager as unknown as { controller: { groups: Map<string, LivenessGroupFixture> } }).controller.groups;
+}
+
+/**
+ * Live lifecycle runtimes for one manager. Zero means every admitted worker
+ * has settled, so teardown cannot abort a runtime that is still launching.
+ */
+function controllerRuntimes(manager: ExecutionToolManager): Map<string, { executionId?: string }> {
+  return (manager as unknown as { controller: { runtimes: Map<string, { executionId?: string }> } }).controller.runtimes;
 }
 
 test("SubtasksStart liveness covers queued/reviewing work, unidentifiable legacy identity, and settled groups", async () => {
@@ -1578,20 +1600,30 @@ test("#421 delegated catalogs capture the parent's live registry authority once;
   }
 });
 
-test("executor denials filter new execute/in-place admissions from the pre-role-deny base, never research, never captured tasks (#434)", async () => {
+test("executor denials filter new execute/in-place admissions from the pre-role-deny base, never research, never captured tasks (#434)", { timeout: 90_000 }, async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-review-exec-deny-"));
+  // Deterministic executor hold for this admission-only fixture: the fake
+  // children stay alive through every admission below and exit on their own
+  // once the gate is released, so teardown settles them instead of aborting a
+  // runtime that may still be mid-launch (which otherwise waits out the
+  // default executor deadline).
+  const executorGate = join(cwd, "executor-gate");
   const parentTools = ["read", "bash", "edit", "write", "ApplyPatch", "WebSearch", "GitRead"];
+  let manager: ExecutionToolManager | undefined;
+  let bodyError: unknown;
   try {
+    await writeFile(executorGate, "");
     // topLevelDeny must NOT cascade: bash is denied only for the primary and
     // stays in the new executor's genuine authoritative base.
-    const { tools, config, manager, commandHandlers } = harness({
+    const { tools, config, commandHandlers, manager: admittedManager } = harness({
       cwd,
-      slowExecutor: true,
+      executorGatePath: executorGate,
       researchCapable: true,
       activeTools: [...parentTools],
       authorizedTools: () => [...parentTools],
       toolsDeny: { topLevelDeny: ["bash", "WebSearch"], executorDeny: ["WebSearch", "edit"] },
     });
+    manager = admittedManager;
     const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
     const add = executionTool(tools, "SubtasksAdd").execute as ExecuteTool;
     const task = (titleValue: string) => ({
@@ -1625,7 +1657,7 @@ test("executor denials filter new execute/in-place admissions from the pre-role-
     };
     assert.ok(researchCatalog.allowedToolCatalog.includes("WebSearch"), "executor denials never filter research tasks");
 
-    const inplace = await manager.startScheduled(task("In-place work"), "inplace", cwd, { scheduledTaskId: "sched-inplace" });
+    const inplace = await admittedManager.startScheduled(task("In-place work"), "inplace", cwd, { scheduledTaskId: "sched-inplace" });
     const inplaceCatalog = inplace.tasks[0]!.definition.executorToolCatalog as {
       allowedToolCatalog: string[];
     };
@@ -1648,7 +1680,7 @@ test("executor denials filter new execute/in-place admissions from the pre-role-
     assert.deepEqual(added.details.tasks[0].definition.executorToolCatalog, executeCatalog, "the already-admitted task keeps its captured catalog");
 
     // Scheduled dispatch goes through the same public admission boundary.
-    const scheduled = await manager.startScheduled(task("Scheduled work"), "execute", cwd, { scheduledTaskId: "sched-execute" });
+    const scheduled = await admittedManager.startScheduled(task("Scheduled work"), "execute", cwd, { scheduledTaskId: "sched-execute" });
     const scheduledCatalog = scheduled.tasks[0]!.definition.executorToolCatalog as {
       allowedToolCatalog: string[];
     };
@@ -1658,7 +1690,7 @@ test("executor denials filter new execute/in-place admissions from the pre-role-
     const humanHandler = commandHandlers.get("subtask-add");
     assert.ok(humanHandler);
     await humanHandler!("Plain human task", { cwd, scopedModels: [], ui: { notify() {} } });
-    const humanInspection = manager.associations();
+    const humanInspection = admittedManager.associations();
     assert.ok((humanInspection.groupRoots ?? []).length >= 1);
 
     // Applying a changed executor selection never rewrites an admitted task.
@@ -1672,9 +1704,33 @@ test("executor denials filter new execute/in-place admissions from the pre-role-
     };
     assert.ok(reopenedCatalog.allowedToolCatalog.includes("WebSearch"), "a cleared executor deny list reaches the next NEW admission");
     assert.deepEqual(added.details.tasks[0].definition.executorToolCatalog, executeCatalog, "the earlier admitted task keeps its captured catalog after the change");
-    await manager.shutdown();
-    await manager.detach();
+  } catch (error) {
+    bodyError = error;
+    throw error;
   } finally {
-    await rm(cwd, { recursive: true, force: true });
+    // On both success and assertion/setup failure, release every held executor
+    // and let the lifecycle runtimes drain before shutdown. Teardown then never
+    // aborts a runtime that is still inside its launch handshake — the state
+    // that would otherwise wait out the default executor deadline. The drain is
+    // bounded so a stuck child cannot hang the test; a timeout is reported on
+    // the success path instead of silently proceeding, and it never masks a
+    // body error.
+    await rm(executorGate, { force: true }).catch(() => undefined);
+    const ownedManager = manager;
+    const drained = ownedManager
+      ? await waitUntil(async () => controllerRuntimes(ownedManager).size === 0, 30_000).then(() => true, () => false)
+      : true;
+    try {
+      await ownedManager?.shutdown();
+      await ownedManager?.detach();
+      await rm(cwd, { recursive: true, force: true });
+    } catch (error) {
+      // Surface a teardown failure only when the body itself passed; never
+      // mask the original assertion or setup error.
+      if (bodyError === undefined) throw error;
+    }
+    if (bodyError === undefined && !drained) {
+      throw new Error("executor runtimes did not drain within 30s before shutdown; teardown may abort a still-launching runtime and wait out the executor deadline");
+    }
   }
 });

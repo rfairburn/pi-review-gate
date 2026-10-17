@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import type { CodexExecutorConfig } from "../../config";
-import { reviewerEnv, terminateProcessTree, type ProcessRunResult } from "../../adapters/process";
+import { reviewerEnv, terminateProcessTree, waitForProcessCloseBounded, waitForPromiseBounded, type BoundedProcessClose, type ProcessRunResult } from "../../adapters/process";
 import { BoundedTextAccumulator, MEBIBYTE } from "../../jsonl";
 import { writeExecutorArtifacts } from "../artifacts";
 import type {
@@ -23,6 +23,11 @@ interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
 }
+
+type CodexTerminalReason = "abort" | "interrupt" | "timeout" | "completed" | "failure" | "exit";
+const CODEX_TERMINAL_DRAIN_MS = 7_000;
+const CODEX_LIFECYCLE_SETTLEMENT_MS = 5_000;
+const CODEX_TERMINATION_ESCALATION_MS = 2_000;
 
 const CODEX_RESEARCH_CONFIG_KEYS = new Set([
   "model_auto_compact_token_limit",
@@ -89,16 +94,12 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
         agentTexts.push(params.item.text);
       }
     });
-    if (identity) await request.onProcessStart?.(identity);
     let threadId = request.session?.id;
     // The turn run() currently tracks. Turn-interrupt steering republishes it
     // to the replacement turn, and default steering plus terminal controls
     // always target this current id, never a frozen launch-time id (issue #63).
     let activeTurnId: string | undefined;
     let completedTurn: Record<string, unknown> | undefined;
-    let timedOut = false;
-    let aborted = false;
-    let interruptedByControl = false;
     // Turn-interrupt steering handoff (issue #63): held from the moment a
     // delivery interrupts the active turn until its replacement turn/start is
     // accepted and published, so run() cannot settle on the interrupted
@@ -115,10 +116,6 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
         },
       };
     })();
-    // Set synchronously with run()'s completion break so a steer starting
-    // after it fails truthfully instead of acknowledging into a finishing
-    // turn (issue #63).
-    let completing = false;
     // The turn a steered delivery interrupted when its replacement failed to
     // start; lets run() report that specific loss instead of a plain stop.
     let steerInterruptedWithoutReplacement: string | undefined;
@@ -126,21 +123,22 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
     let failure: ExecutorTurn["failure"];
     let code: number | null = 0;
 
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      rpc.terminate();
-    }, this.config.timeoutMs ?? 1_800_000);
+    const stop = (reason: "abort" | "interrupt" | "timeout"): Promise<unknown> | undefined =>
+      rpc.terminate(reason, threadId && activeTurnId ? { threadId, turnId: activeTurnId } : undefined);
+    const timeout = setTimeout(() => { stop("timeout"); }, this.config.timeoutMs ?? 1_800_000);
     timeout.unref?.();
-    const onAbort = () => {
-      aborted = true;
-      if (interruptedByControl) return;
-      void (threadId && activeTurnId
-        ? rpc.request("turn/interrupt", { threadId, turnId: activeTurnId }).catch(() => undefined)
-        : Promise.resolve()).finally(() => rpc.terminate());
-    };
+    const onAbort = () => { stop("abort"); };
     request.signal?.addEventListener("abort", onAbort, { once: true });
+    if (request.signal?.aborted) onAbort();
+    // Identity persistence remains the prompt barrier. Install cancellation,
+    // deadline and close observation first, so a stuck callback cannot keep
+    // the owned child alive or allow a late prompt after terminal teardown.
+    const lifecycleStart = (async () => { if (identity) await request.onProcessStart?.(identity); })();
+    void lifecycleStart.catch(() => undefined);
 
     try {
+      await Promise.race([lifecycleStart, rpc.terminal().then(() => { throw rpc.terminalError; })]);
+      rpc.assertRunning();
       const initializeResponse = await rpc.request("initialize", {
         clientInfo: { name: "pi-review-gate", version: "0.1.0" },
         capabilities: { experimentalApi: true },
@@ -177,6 +175,7 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
       // the launch turn's model, approval policy, and research configuration
       // instead of drifting copies (issue #63).
       const startTurn = async (text: string): Promise<string> => {
+        rpc.assertRunning();
         const response = await rpc.request("turn/start", {
           threadId,
           cwd: request.cwd,
@@ -193,6 +192,7 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
       // #93: the app-server accepted the turn carrying the prompt text — the
       // actual delivery boundary for this prompt.
       request.onPromptDelivery?.({ prompt: request.prompt });
+      rpc.assertRunning();
       const activeThreadId = threadId;
 
       request.onLiveControl?.({
@@ -201,8 +201,8 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
         protocol: protocolIdentity,
         capabilities: { steer: true, interrupt: true },
         steer: async (instruction, instructionId, options) => {
-          if (completing) {
-            return { status: "failed", message: "Codex turn completion is already in progress; steering was not delivered.", turnId: activeTurnId };
+          if (rpc.terminalError) {
+            return { status: "failed", message: rpc.terminalError.message, turnId: activeTurnId };
           }
           if (!options?.interrupt) {
             try {
@@ -239,7 +239,9 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
             if (activeTurnId && !rpc.isTurnCompleted(activeThreadId, activeTurnId)) {
               const current = activeTurnId;
               await rpc.request("turn/interrupt", { threadId: activeThreadId, turnId: current });
+              rpc.assertRunning();
               const terminal = await rpc.waitForTurn(activeThreadId, current);
+              rpc.assertRunning();
               if (terminal.status !== "interrupted" && terminal.status !== "completed") {
                 return { status: "failed", message: `Codex turn interruption ended in ${String(terminal.status)}.`, turnId: current };
               }
@@ -262,18 +264,21 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
           }
         },
         interrupt: async (): Promise<ExecutorInteractionAcknowledgement> => {
+          const currentTurnId = activeTurnId;
+          const nativeReply = stop("interrupt");
           try {
-            interruptedByControl = true;
-            const currentTurnId = activeTurnId;
-            if (!currentTurnId) return { status: "failed", message: "Codex turn has not started; nothing to interrupt." };
-            await rpc.request("turn/interrupt", { threadId: activeThreadId, turnId: currentTurnId });
-            const terminal = await rpc.waitForTurn(activeThreadId, currentTurnId);
-            if (terminal.status !== "interrupted" && terminal.status !== "completed") {
-              return { status: "failed", message: `Codex interrupt ended in ${String(terminal.status)}.`, turnId: currentTurnId };
+            // Teardown already started; the native reply is diagnostic, not
+            // permission to terminate. Always await actual bounded close too.
+            await nativeReply;
+            const exit = await rpc.closed();
+            const terminal = currentTurnId ? rpc.completedTurn(activeThreadId, currentTurnId) : undefined;
+            if (!nativeReply || !exit.closeObserved || rpc.terminationError || !terminal || !["interrupted", "completed"].includes(String(terminal.status))) {
+              return { status: "failed", message: "Codex terminal stop completed without confirmed native turn interruption or child cleanup.", turnId: currentTurnId };
             }
-            return { status: "acknowledged", message: "Codex app-server acknowledged turn interruption.", turnId: currentTurnId };
+            return { status: "acknowledged", message: "Codex app-server acknowledged turn interruption and its owned child closed.", turnId: currentTurnId };
           } catch (error) {
-            return { status: "failed", message: error instanceof Error ? error.message : String(error), turnId: activeTurnId };
+            await rpc.closed();
+            return { status: "failed", message: error instanceof Error ? error.message : String(error), turnId: currentTurnId };
           }
         },
       });
@@ -285,12 +290,13 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
       // newer steered turn supersedes it. The handoff ends after publishing
       // the replacement id, so waiting on it closes the interrupt-to-start gap.
       for (;;) {
-        if (steerHandoff.isPending()) await steerHandoff.wait();
+        if (steerHandoff.isPending()) await Promise.race([steerHandoff.wait(), rpc.terminal()]);
+        if (rpc.terminalError) break;
         if (activeTurnId === trackedTurnId) break;
         trackedTurnId = activeTurnId!;
         completion = await rpc.waitForTurn(activeThreadId, trackedTurnId);
       }
-      completing = true;
+      rpc.terminate("completed");
       completedTurn = completion;
       const status = typeof completion.status === "string" ? completion.status : "failed";
       if (status === "interrupted") {
@@ -301,30 +307,58 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
         failure = { category: "provider", message: stringAt(completion, "error", "message") ?? `Codex turn ended in ${status}.` };
       }
     } catch (error) {
-      if (!timedOut && !aborted) {
+      if (!rpc.timedOut && !rpc.aborted) {
         failure = { category: "protocol", message: error instanceof Error ? error.message : String(error) };
       }
       code = 1;
     } finally {
       clearTimeout(timeout);
       request.signal?.removeEventListener("abort", onAbort);
+      rpc.terminate("failure");
       request.onLiveControl?.(undefined);
-      rpc.terminate();
       const exit = await rpc.closed();
-      if (identity) await request.onProcessExit?.({ ...identity, code: exit.code, signal: exit.signal });
+      // Local pipe destruction or root disappearance is never exit evidence.
+      // Keep start/exit publication ordered even if persistence settles late.
+      const lifecycleCompletion = (async () => {
+        const start = await lifecycleStart.then(
+          () => ({ kind: "fulfilled" as const }),
+          (error: unknown) => ({ kind: "rejected" as const, error }),
+        );
+        if (identity && exit.closeObserved && !rpc.terminationError) {
+          await request.onProcessExit?.({ ...identity, code: exit.code, signal: exit.signal });
+        }
+        if (start.kind === "rejected") throw start.error;
+      })();
+      const persistence = await waitForPromiseBounded(lifecycleCompletion, CODEX_LIFECYCLE_SETTLEMENT_MS);
+      if (persistence.kind !== "fulfilled") {
+        code = 1;
+        const message = persistence.kind === "timeout"
+          ? "Codex lifecycle callbacks did not settle within 5000ms; process identity or exit persistence is unconfirmed."
+          : `Codex lifecycle callback failed: ${String(persistence.error)}`;
+        failure = { category: "process", message };
+      }
+      if (!exit.closeObserved) {
+        code = 1;
+        const message = "Codex app-server close/drain exceeded 7000ms; owned cleanup is unconfirmed; local stdio closure is not child-exit evidence.";
+        failure = { category: "process", message: failure ? `${failure.message} ${message}` : message };
+      }
     }
 
+    // A replacement already in flight may have been accepted/completed
+    // during drain. Prefer its cached final items without issuing new work.
+    completedTurn = threadId && activeTurnId ? rpc.completedTurn(threadId, activeTurnId) ?? completedTurn : completedTurn;
+    const timedOut = rpc.timedOut;
+    const aborted = rpc.aborted;
     const terminationFailure = rpc.terminationError
       ? `Codex app-server termination attempts failed before child close: ${rpc.terminationError}`
       : undefined;
     if (terminationFailure) {
-      failure = failure
-        ? { ...failure, message: `${failure.message} ${terminationFailure}` }
-        : { category: "process", message: terminationFailure };
+      code = 1;
+      failure = { category: "process", message: failure ? `${failure.message} ${terminationFailure}` : terminationFailure };
     }
 
     const text = agentTexts.join("\n").trim() || finalAgentText(completedTurn);
-    const output = rpc.output(code, timedOut, aborted || interruptedByControl);
+    const output = rpc.output(code, timedOut, aborted);
     const artifacts = await writeExecutorArtifacts({
       artifactDir: request.artifactDir,
       turn: request.turn,
@@ -340,7 +374,7 @@ export class CodexExecutorAdapter implements ExecutorAdapter {
       ...artifacts,
       code,
       timedOut,
-      aborted: aborted || interruptedByControl,
+      aborted,
       failure,
     };
   }
@@ -411,15 +445,19 @@ class AppServerRpc {
   private turnWaiters = new Map<string, Array<{ resolve: (turn: Record<string, unknown>) => void; reject: (error: Error) => void }>>();
   private completedTurns = new Map<string, Record<string, unknown>>();
   private forceKillTimer: NodeJS.Timeout | undefined;
-  private terminationRequested = false;
+  // One canonical lifecycle: terminal intent fences writes immediately; only
+  // an observed close (never local drain destruction) can confirm cleanup.
+  private lifecycle: { phase: "running" } | {
+    phase: "terminal";
+    reason: CodexTerminalReason;
+    error: Error;
+    close?: BoundedProcessClose;
+  } = { phase: "running" };
+  private resolveTerminal!: () => void;
+  private readonly terminalPromise = new Promise<void>((resolve) => { this.resolveTerminal = resolve; });
+  private resolveClose!: (close: BoundedProcessClose) => void;
   private terminationFailures = new Map<NodeJS.Signals, string>();
-  // Latched stdin transport failure (#268): once the input channel fails, the
-  // error is remembered so work registered after the failure (e.g. a turn
-  // wait installed by a continuation that ran after the error event) also
-  // settles with it, and no further writes are attempted against the dead
-  // channel.
-  private stdinFailure: Error | undefined;
-  private exitPromise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  private readonly exitPromise = new Promise<BoundedProcessClose>((resolve) => { this.resolveClose = resolve; });
   private readonly stdoutCapture = new BoundedTextAccumulator(100 * MEBIBYTE);
   private readonly stderrCapture = new BoundedTextAccumulator(16 * MEBIBYTE);
   // Incremental UTF-8 decoders: a valid multibyte sequence may straddle two
@@ -439,37 +477,31 @@ class AppServerRpc {
     // error that would crash the host (#268). The ChildProcess 'error' event
     // below covers spawn failures only, not stdio streams.
     proc.stdin?.on("error", (error) => this.failTransport(error));
-    this.exitPromise = new Promise((resolvePromise) => {
-      proc.once("close", (code, signal) => {
-        // 'close' follows every delivered 'data' event; flush any torn
-        // trailing sequence so retained captures match full-stream decoding
-        // (a genuinely incomplete final sequence decodes to U+FFFD, as a
-        // single-chunk decode always did).
-        const stdoutTail = this.stdoutDecoder.end();
-        if (stdoutTail) this.consume(stdoutTail);
-        const stderrTail = this.stderrDecoder.end();
-        if (stderrTail) this.stderrCapture.append(stderrTail);
-        if (this.forceKillTimer) clearTimeout(this.forceKillTimer);
-        this.forceKillTimer = undefined;
-        const error = new Error(`Codex app-server exited before completing pending protocol work (${code ?? signal ?? "unknown"}).`);
-        for (const pending of this.pending.values()) pending.reject(error);
-        this.pending.clear();
-        for (const waiters of this.turnWaiters.values()) {
-          for (const waiter of waiters) waiter.reject(error);
-        }
-        this.turnWaiters.clear();
-        resolvePromise({ code, signal });
-      });
-      proc.once("error", (error) => {
-        for (const pending of this.pending.values()) pending.reject(error);
-        this.pending.clear();
-      });
+    proc.once("exit", (code, signal) => {
+      this.terminate("exit", undefined, new Error(`Codex app-server exited before completing pending protocol work (${code ?? signal ?? "unknown"}).`));
     });
+    proc.once("close", (code, signal) => {
+      // 'close' follows every delivered 'data' event; flush any torn
+      // trailing sequence so retained captures match full-stream decoding
+      // (a genuinely incomplete final sequence decodes to U+FFFD, as a
+      // single-chunk decode always did).
+      const stdoutTail = this.stdoutDecoder.end();
+      if (stdoutTail) this.consume(stdoutTail);
+      const stderrTail = this.stderrDecoder.end();
+      if (stderrTail) this.stderrCapture.append(stderrTail);
+      this.latchTerminal("exit", new Error(`Codex app-server exited before completing pending protocol work (${code ?? signal ?? "unknown"}).`));
+      this.finishClose({ code, signal, closeObserved: true, exitObserved: proc.exitCode !== null || proc.signalCode !== null });
+    });
+    proc.once("error", (error) => { this.failTransport(error); });
   }
 
   request(method: string, params: unknown): Promise<unknown> {
+    if (this.terminalError) return Promise.reject(this.terminalError);
+    return this.sendRequest(method, params);
+  }
+
+  private sendRequest(method: string, params: unknown): Promise<unknown> {
     const id = this.nextId++;
-    if (this.stdinFailure) return Promise.reject(this.stdinFailure);
     return new Promise((resolvePromise, reject) => {
       this.pending.set(id, { resolve: resolvePromise, reject });
       try {
@@ -485,7 +517,7 @@ class AppServerRpc {
   }
 
   notify(method: string, params: unknown): void {
-    if (this.stdinFailure) return;
+    if (this.terminalError) return;
     try {
       this.write({ jsonrpc: "2.0", method, params });
     } catch (error) {
@@ -493,15 +525,60 @@ class AppServerRpc {
     }
   }
 
-  /** Latch a stdin transport failure and settle all outstanding protocol work with it. */
+  /** A dead input channel enters the same terminal latch as cancellation. */
   private failTransport(error: Error): void {
-    this.stdinFailure ??= error;
-    for (const pending of this.pending.values()) pending.reject(this.stdinFailure);
+    // Terminal teardown already fences all new work. A best-effort interrupt
+    // can hit EPIPE while stdout still carries acceptance of earlier writes;
+    // keep those requests routable until actual close or the drain deadline.
+    if (this.lifecycle.phase === "terminal") return;
+    this.terminate("failure", undefined, error);
+    this.rejectPending(this.terminalError!);
+  }
+
+  private rejectPending(error: Error): void {
+    for (const pending of this.pending.values()) pending.reject(error);
     this.pending.clear();
     for (const waiters of this.turnWaiters.values()) {
-      for (const waiter of waiters) waiter.reject(this.stdinFailure);
+      for (const waiter of waiters) waiter.reject(error);
     }
     this.turnWaiters.clear();
+  }
+
+  get terminalError(): Error | undefined {
+    return this.lifecycle.phase === "terminal" ? this.lifecycle.error : undefined;
+  }
+
+  get timedOut(): boolean {
+    return this.lifecycle.phase === "terminal" && this.lifecycle.reason === "timeout";
+  }
+
+  get aborted(): boolean {
+    return this.lifecycle.phase === "terminal" && ["abort", "interrupt"].includes(this.lifecycle.reason);
+  }
+
+  terminal(): Promise<void> { return this.terminalPromise; }
+
+  assertRunning(): void {
+    if (this.terminalError) throw this.terminalError;
+  }
+
+  completedTurn(threadId: string, turnId: string): Record<string, unknown> | undefined {
+    return this.completedTurns.get(`${threadId}:${turnId}`);
+  }
+
+  private latchTerminal(reason: CodexTerminalReason, error?: Error): void {
+    if (this.lifecycle.phase !== "running") return;
+    this.lifecycle = { phase: "terminal", reason, error: error ?? new Error(`Codex app-server terminal teardown: ${reason}.`) };
+    this.resolveTerminal();
+  }
+
+  private finishClose(close: BoundedProcessClose): void {
+    if (this.lifecycle.phase !== "terminal" || this.lifecycle.close) return;
+    this.lifecycle.close = close;
+    if (this.forceKillTimer) clearTimeout(this.forceKillTimer);
+    this.forceKillTimer = undefined;
+    this.rejectPending(this.lifecycle.error);
+    this.resolveClose(close);
   }
 
   /** True once the app-server reported a terminal status for this turn. */
@@ -519,7 +596,7 @@ class AppServerRpc {
     // failure; only unfinished waits settle with the latched error (#268).
     const completed = this.completedTurns.get(key);
     if (completed) return Promise.resolve(completed);
-    if (this.stdinFailure) return Promise.reject(this.stdinFailure);
+    if (this.terminalError) return Promise.reject(this.terminalError);
     return new Promise((resolvePromise, reject) => {
       const waiters = this.turnWaiters.get(key) ?? [];
       waiters.push({ resolve: resolvePromise, reject });
@@ -527,20 +604,35 @@ class AppServerRpc {
     });
   }
 
-  terminate(): void {
-    if (this.proc.exitCode !== null || this.proc.signalCode !== null || this.terminationRequested) return;
-    this.terminationRequested = true;
-    this.recordTerminationFailure(terminateProcessTree(this.proc, "SIGTERM"));
+  terminate(
+    reason: CodexTerminalReason,
+    interrupt?: { threadId: string; turnId: string },
+    error?: Error,
+  ): Promise<unknown> | undefined {
+    if (this.lifecycle.phase !== "running") return undefined;
+    // Latch intent first: even a synchronous failure of the best-effort
+    // interrupt must not turn cancellation into an ordinary transport failure.
+    this.latchTerminal(reason, error);
+    // This is the sole permitted write after terminal intent. Ordinary calls
+    // remain fenced; no reply is awaited before signaling the owned child.
+    const nativeReply = interrupt && this.proc.stdin?.writable ? this.sendRequest("turn/interrupt", interrupt) : undefined;
+    void nativeReply?.catch(() => undefined);
+    // Attach before signaling or destroying local pipes. The bounded observer
+    // latches uncertainty before local destruction can synthesize a close.
+    void waitForProcessCloseBounded(this.proc, CODEX_TERMINAL_DRAIN_MS, (close) => this.finishClose(close))
+      .then((close) => this.finishClose(close));
     this.forceKillTimer = setTimeout(() => {
       this.forceKillTimer = undefined;
-      if (this.proc.exitCode === null && this.proc.signalCode === null) {
-        this.recordTerminationFailure(terminateProcessTree(this.proc, "SIGKILL"));
-      }
-    }, 2_000);
+      // POSIX groups remain owned even after leader exit. Native Windows
+      // exited-root/undefined-PID safeguards remain in terminateProcessTree.
+      this.recordTerminationFailure(terminateProcessTree(this.proc, "SIGKILL"));
+    }, CODEX_TERMINATION_ESCALATION_MS);
     this.forceKillTimer.unref?.();
+    this.recordTerminationFailure(terminateProcessTree(this.proc, "SIGTERM"));
+    return nativeReply;
   }
 
-  closed(): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  closed(): Promise<BoundedProcessClose> {
     return this.exitPromise;
   }
 
@@ -617,7 +709,7 @@ class AppServerRpc {
       // dead; contain it through the same settlement path instead of letting
       // it escape the stdout callback as an uncaught exception (#268). No
       // further replies are attempted after the transport has failed.
-      if (!this.stdinFailure) {
+      if (!this.terminalError) {
         try {
           this.write({ jsonrpc: "2.0", id: value.id, error: { code: -32601, message: `Client does not support server request ${value.method}.` } });
         } catch (error) {

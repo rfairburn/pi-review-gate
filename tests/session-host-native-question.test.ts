@@ -708,13 +708,20 @@ class FrameWatch {
     this.signal.notify();
   }
 
+  /** Resolves with the exact fresh frame text that satisfied the predicate. */
   async waitFor(
     predicate: (text: string) => boolean,
     timeoutMs: number,
     description: string,
     afterRevision = this.revision,
-  ): Promise<void> {
-    await this.signal.waitFor(() => this.revision > afterRevision && predicate(this.text), timeoutMs, description);
+  ): Promise<string> {
+    let matched = "";
+    await this.signal.waitFor(() => {
+      if (this.revision <= afterRevision || !predicate(this.text)) return false;
+      matched = this.text;
+      return true;
+    }, timeoutMs, description);
+    return matched;
   }
 }
 
@@ -1521,6 +1528,15 @@ const WHEEL_DECLINE = "Decline (no answer will be sent)";
 const WHEEL_TRANSCRIPT_ROWS = 90;
 const WHEEL_TRANSCRIPT = Array.from({ length: WHEEL_TRANSCRIPT_ROWS }, (_, index) =>
   `- Transcript filler row ${String(index + 1).padStart(2, "0")}`).join("\n");
+/**
+ * The real gate's own agent_end notice for this profile (enabled, no active
+ * reviewer). It is the last transcript entry of the first run: Pi emits
+ * agent_settled only after that handler sent it, but renders it in a later
+ * frame, appending rows below the filler while the view follows the end.
+ */
+const WHEEL_SETTLED_GATE_NOTICE = "review gate: automatic review deferred because no configured reviewer";
+/** Pi's fullscreen indicator, drawn only while the primary view is scrolled away from its end. */
+const WHEEL_JUMP_TO_LATEST = "Jump to latest message";
 
 /** SGR wheel report at 0-based terminal cell (x, y); bit 3 adds Alt. */
 function sgrWheel(direction: "up" | "down", x: number, y: number, alt = false): string {
@@ -1589,6 +1605,19 @@ function transcriptOffset(frame: string): number | undefined {
     if (match) offsets.add(index - Number(match[1]));
   });
   return offsets.size === 1 ? [...offsets][0] : undefined;
+}
+
+/**
+ * The first run's transcript is completely rendered and Pi still follows its
+ * end: the last filler row is visible, the gate's settled notice sits below
+ * it, and no jump-to-latest indicator is drawn.
+ */
+function transcriptSettledAtEnd(frame: string): boolean {
+  const rows = frame.split("\n");
+  const lastFiller = rows.findIndex((row) => row.includes(`Transcript filler row ${WHEEL_TRANSCRIPT_ROWS}`));
+  return lastFiller >= 0 && transcriptOffset(frame) !== undefined
+    && rows.some((row, index) => index > lastFiller && row.includes(WHEEL_SETTLED_GATE_NOTICE))
+    && !frameContains(frame, WHEEL_JUMP_TO_LATEST);
 }
 
 function bodyContains(view: WheelPopupView | undefined, needle: string): boolean {
@@ -1713,14 +1742,13 @@ test("native Pi fullscreen: the wheel and scroll keys move only the shared popup
     if (typeof input === "function") input();
     else for (const chunk of typeof input === "string" ? [input] : input) live.pty!.write(chunk);
     try {
-      await live.frames.waitFor(predicate, EVENT_TIMEOUT_MS, description, before);
+      return await live.frames.waitFor(predicate, EVENT_TIMEOUT_MS, description, before);
     } catch (error) {
       // Bounded diagnostics from the owned synthetic frame: fixture text only.
       const rows = live.frames.text.split("\n").map((line, index) => `${String(index).padStart(2, "0")}|${line.trimEnd()}`);
       throw new Error(`${description}: no matching native frame (transcript rows ${transcriptFillerRows(live.frames.text).join(",")}).\n`
         + `Last native frame:\n${rows.join("\n")}`, { cause: error });
     }
-    return live.frames.text;
   };
 
   try {
@@ -1747,18 +1775,22 @@ test("native Pi fullscreen: the wheel and scroll keys move only the shared popup
         && record.toolName === toolName && record.isError === false), `${toolName} executed without error`);
     }
     const panelLine = process.platform === "darwin" ? "Pending input · Press Ctrl+Option+Up" : "Pending input · Press Ctrl+Alt+Up";
-    await live.frames.waitFor((frame) => frameContains(frame, panelLine) && transcriptFillerRows(frame).includes(WHEEL_TRANSCRIPT_ROWS),
-      EVENT_TIMEOUT_MS, "pending panel and the end of the long transcript are visible", beforePrompt);
+    // A frame showing the panel and filler row 90 can still predate the
+    // settled run: the gate's agent_end notice renders afterwards and, while
+    // Pi follows the end, moves the transcript up by the notice's rows. Take
+    // the baseline only from the frame proving that final entry is drawn.
+    const settledFrame = await live.frames.waitFor((frame) => frameContains(frame, panelLine) && transcriptSettledAtEnd(frame),
+      EVENT_TIMEOUT_MS, "pending panel and the settled end of the long transcript are visible", beforePrompt);
     const requestsBeforePopup = modelRequests();
     assert.equal(requestsBeforePopup, 3, "notice, question, and transcript replies are the only scripted requests so far");
 
     // Fullscreen evidence before the popup: Pi's own wheel routing scrolls the transcript.
-    const bottomOffset = transcriptOffset(live.frames.text);
+    const bottomOffset = transcriptOffset(settledFrame);
     assert.notEqual(bottomOffset, undefined, "the long transcript is visible before the popup opens");
     const transcriptRow = 10;
     let frame = await act([sgrWheel("up", 10, transcriptRow), sgrWheel("up", 10, transcriptRow), sgrWheel("up", 10, transcriptRow)],
-      (next) => transcriptOffset(next) === bottomOffset! + 3,
-      "three real wheel-up reports scroll Pi's fullscreen transcript by exactly three lines");
+      (next) => transcriptOffset(next) === bottomOffset! + 3 && frameContains(next, WHEEL_JUMP_TO_LATEST),
+      `three real wheel-up reports scroll Pi's fullscreen transcript by exactly three lines from its settled end (offset ${bottomOffset})`);
     const transcriptBeforePopup = transcriptOffset(frame)!;
 
     // --- Shared list: full-height opaque overlay over the transcript ---

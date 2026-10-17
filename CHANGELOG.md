@@ -15,6 +15,26 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.168]
+
+### Changed
+
+- Shared question/notice popup (#413): the keyboard hint stays visible in a fixed area
+  below the popup body, and the complete question or notice text, context, choices,
+  **Type something…**, **Decline**, and notice actions scroll together. Long questions
+  and notices open at their beginning instead of at the first choice. Up/Down still
+  move the selection and bring the selected choice or action into view, also at the
+  first or last row. Editing input brings the free-text cursor back into view, and
+  while editing the hint says to press Esc before using the scroll keys. Resizing keeps
+  the scroll position within the new bounds with the complete re-wrapped content
+  reachable. Small popups first shorten the hint and then drop their blank padding
+  rows; in three- or four-row terminals the frame rules give way too, so at least one
+  content row always stays visible and scrollable. The popup keeps its content-sized
+  height and position with the conversation visible around it. Scrolling stays
+  keyboard-only: the popup adds no mouse handling, so mouse wheel behavior is Pi's and
+  the terminal's own. The scroll shortcuts and their one-line step, choice, free-text,
+  Decline, notice-action, and Escape/review behavior are unchanged.
+
 ## [0.1.0-dev.167]
 
 ### Fixed

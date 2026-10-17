@@ -145,15 +145,13 @@ test("production load path: exposes the width helpers, key matching, and the liv
     paddingY: 0,
     theme: { marker: "application-markdown-theme" },
   }, "Markdown receives the application's getMarkdownTheme result");
-  assert.equal(typeof host?.createScrollView, "function", "the native ScrollView provider remains exposed to layout-owned components");
-  const scrollView = host!.createScrollView!({ render: () => ["one", "two"], invalidate() {} });
-  assert.equal(scrollView?.viewportHeight, 0, "without host layout the native ScrollView has no measured viewport");
-  assert.deepEqual(scrollView?.render(80), ["one", "two"], "an unlaid-out ScrollView leaves row sizing to the shared component fallback");
-  assert.equal(scrollView?.scrollBy(4), 4, "native scrolling cannot advance before layout assigns a viewport");
+  // The shared popup owns the single authoritative manual viewport (#413):
+  // no second, layout-dependent ScrollView scroller is exposed for it.
+  const hostRecord = host as unknown as Record<string, unknown>;
+  assert.equal(hostRecord["createScrollView"], undefined, "no parallel native ScrollView provider is exposed");
 
   // The loader no longer exposes a standalone editor surface for the
   // free-text row (that path now goes through the shared bridge).
-  const hostRecord = host as unknown as Record<string, unknown>;
   assert.equal(hostRecord["Editor"], undefined, "no Editor class is exposed");
   assert.equal(hostRecord["setKeybindings"], undefined, "no setKeybindings is exposed");
 });

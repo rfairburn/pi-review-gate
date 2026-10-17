@@ -91,10 +91,41 @@ and optional context appear before its **More details** and **Close** actions. I
 its theme is unavailable, the view visibly discloses the limitation and shows
 the complete question, notice body, and optional context as width-wrapped plain
 text; it does not silently truncate content or substitute a custom Markdown
-parser. Scroll the shared popup with
-**Shift+Alt+Up/Down** (the laptop-friendly shortcut) or **Ctrl+Alt+PageUp/PageDown**.
-Plain **PageUp/PageDown** remain available on hosts that deliver them to the
-popup. These popup-local shortcuts are not consumed while editing free text.
+parser.
+
+### Scrolling the shared popup
+
+Everything in the popup body scrolls together: the question or notice text, its
+context, the choices, **Type something…**, **Decline**, and the notice actions.
+Only the keyboard hint is fixed: it is laid out below the scrolled body and stays
+visible at every scroll position. Scroll with **Shift+Alt+Up/Down**
+(**Shift+Option+Up/Down** on macOS, the laptop-friendly shortcut) or
+**Ctrl+Alt+PageUp/PageDown**; plain **PageUp/PageDown** remain available on
+hosts that deliver them to the popup. Each key press moves the content one line,
+within the content's start and end.
+
+- A long question or notice opens at its beginning, not at the first choice.
+  **Up/Down** still change the selection and bring the selected choice or
+  action into view, also when pressed at the first or last row.
+- While you edit a free-text answer, every key belongs to the native text field,
+  so the popup scroll shortcuts are not consumed; the hint says to press Esc to
+  return to the options first. Editing input brings the field's cursor row back
+  into view.
+- Resizing keeps the current scroll position (clamped to the new size) and
+  re-wraps the complete content, which stays reachable. Small popups first
+  shorten the hint to its scroll keys and then drop the blank padding rows
+  inside the frame; in a terminal only three or four rows tall the frame's top
+  and bottom rules give way too, and when only a single content row fits, that
+  row shows content rather than the hint.
+- The popup is sized to its content: a short list, question, or notice uses
+  only the rows it needs, with nothing to scroll, and longer content grows up
+  to one row inside the top and bottom of the conversation viewport; any
+  further content scrolls within that cap. The conversation stays visible
+  around the popup.
+- Scrolling the popup is keyboard-only. The popup adds no mouse handling, so
+  the mouse wheel keeps Pi's and the terminal's native behavior and does not
+  scroll the popup content.
+
 Press **Escape** to return to the shared list; returning does not dismiss a
 notice. The only notice actions are **More details** and
 **Close**: **More details** closes the popup first and consumes only the selected

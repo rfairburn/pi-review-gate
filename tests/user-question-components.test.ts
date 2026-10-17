@@ -295,6 +295,7 @@ interface Fixture {
 function makeFixture(options: {
   field?: boolean;
   getViewportRows?: () => number;
+  isStale?: () => boolean;
   keybindings?: ReturnType<typeof makeKeybindings>;
   theme?: QuestionUiTheme;
 } = {}): Fixture {
@@ -320,6 +321,7 @@ function makeFixture(options: {
     shortcutLabel: "Ctrl+Alt+Up",
     nativeField: field,
     getViewportRows: options.getViewportRows,
+    isStale: options.isStale,
     onDone: (result) => done.push(result),
   });
   return { controller, identity, sent, done, component, field };
@@ -381,11 +383,12 @@ function register(fixture: Fixture, question: string, options: { choices?: strin
   return result.question.id;
 }
 
-function registerNotice(fixture: Fixture, body: string): string {
+function registerNotice(fixture: Fixture, body: string, context?: string): string {
   const result = fixture.controller.registerNotice({
     toolCallId: `notice${fixture.controller.listPending().length + 1}`,
     title: "Scroll regression notice",
     body,
+    ...(context === undefined ? {} : { context }),
   }, fixture.identity);
   assert.ok(result.ok);
   if (!result.ok) throw new Error("notice registration failed");
@@ -602,8 +605,12 @@ test("the bounded answer viewport follows selected rows and keeps the native edi
   fixture.component.handleInput(ENTER);
   let frame = fixture.component.render(48);
   assert.ok(frame.length <= viewportRows, "the long question uses the bounded shared viewport");
-  assert.match(frame.join("\n"), /> 1\. Keep the current release lane/,
-    "opening the answer view scrolls the selected choice into view");
+  // #413: a long question opens at its beginning instead of jumping to the
+  // first choice; the next Up/Down reveals the selected row.
+  assert.match(frame[2] ?? "", /^ q1:/,
+    "opening the answer view starts at the beginning of the long question");
+  assert.doesNotMatch(frame.join("\n"), /> 1\. Keep the current release lane/,
+    "opening does not auto-jump past the question to the first choice");
 
   fixture.component.handleInput(DOWN);
   frame = fixture.component.render(48);
@@ -1063,4 +1070,372 @@ test("rendering is width-aware and degrades without host helpers", () => {
   assert.match(lines.join("\n"), /Pending input \(1\)/);
   component.handleInput(ESCAPE);
   assert.deepEqual(done, [{ kind: "closed" }]);
+});
+
+// ---------------------------------------------------------------------------
+// Shared viewport: fixed hints, initial position, selection reveal (#413)
+// ---------------------------------------------------------------------------
+
+const NOTICE_KEY_HINT = "arrows select · Enter choose · Shift+Alt+Up/Down or Ctrl+Alt+PageUp/PageDown scroll · Esc back";
+const ANSWER_KEY_HINT = "arrows select · Enter confirm · Shift+Alt+Up/Down or Ctrl+Alt+PageUp/PageDown scroll · Esc back";
+const SCROLL_KEY_HINT = "Shift+Alt+Up/Down or Ctrl+Alt+PageUp/PageDown scroll";
+
+/** Rows between the frame's full-width rules, minus one side-padding cell, right-trimmed. */
+function frameInterior(frame: readonly string[]): string[] {
+  const top = frame.findIndex((line) => /^─+$/u.test(line));
+  const bottom = frame.length - 1 - [...frame].reverse().findIndex((line) => /^─+$/u.test(line));
+  assert.ok(top >= 0 && bottom > top, `the frame has top and bottom rules: ${frame.join("\n")}`);
+  return frame.slice(top + 1, bottom).map((line) => line.slice(1).replace(/ +$/u, ""));
+}
+
+/**
+ * Split interior rows into the scrolled body and the fixed trailing hint rows.
+ * Frames from viewports of at least six rows keep one blank padding row at the
+ * top and bottom; the blank separator appears only before the complete hint.
+ */
+function splitFixedHint(interior: readonly string[], hint: string, viewportRows: number): { body: string[]; hint: string[] } {
+  const padded = viewportRows >= 6;
+  const rows = padded ? interior.slice(1, -1) : [...interior];
+  let hintStart = rows.length;
+  while (hintStart > 0 && rows[hintStart - 1]!.trim().length > 0
+    && (hint.includes(rows[hintStart - 1]!.trim()) || rows[hintStart - 1]!.endsWith("…"))) hintStart -= 1;
+  const hintRows = rows.slice(hintStart);
+  const complete = hintRows.join(" ").replace(/\s+/gu, " ") === hint;
+  const bodyEnd = complete && hintStart > 0 && rows[hintStart - 1]!.trim().length === 0 ? hintStart - 1 : hintStart;
+  return { body: rows.slice(0, bodyEnd), hint: hintRows };
+}
+
+function longNoticeBody(rows: number): string {
+  return Array.from({ length: rows }, (_, index) => `Body row ${String(index + 1).padStart(2, "0")}`).join("\n");
+}
+
+test("the shared popup keeps its keyboard hint fixed while body, context, and actions scroll together", () => {
+  const rows = 12;
+  const fixture = makeFixture({ getViewportRows: () => rows });
+  registerNotice(fixture, longNoticeBody(24), "Context opening row\nCONTEXT-END");
+  fixture.component.handleInput(ENTER);
+
+  const frames: string[][] = [];
+  let frame = fixture.component.render(60);
+  const opening = splitFixedHint(frameInterior(frame), NOTICE_KEY_HINT, rows);
+  assert.equal(opening.body[0], "n1: Scroll regression notice", "a long notice opens at its beginning");
+  assert.ok(!opening.body.some((line) => line.includes("More details")), "actions are body content, not a fixed control area");
+  frames.push(frame);
+  const assertFixedHint = (lines: readonly string[], view: string): void => {
+    assert.equal(lines.length, rows, `${view} keeps the exact bounded frame height`);
+    const parts = splitFixedHint(frameInterior(lines), NOTICE_KEY_HINT, rows);
+    assert.equal(parts.hint.join(" ").replace(/\s+/gu, " "), NOTICE_KEY_HINT, `${view} shows the complete fixed hint`);
+    assert.equal(parts.body.length, opening.body.length, `${view} keeps a stable scrolled body height`);
+  };
+  assertFixedHint(frame, "beginning");
+
+  let middleSeen = false;
+  for (let page = 0; page < 80 && !frame.some((line) => line.includes("Close")); page += 1) {
+    fixture.component.handleInput(SHIFT_ALT_DOWN);
+    const next = fixture.component.render(60);
+    const before = splitFixedHint(frameInterior(frame), NOTICE_KEY_HINT, rows).body;
+    const after = splitFixedHint(frameInterior(next), NOTICE_KEY_HINT, rows).body;
+    assert.deepEqual(after.slice(0, -1), before.slice(1), "each keyboard step moves the scrolled body by exactly one line");
+    frame = next;
+    frames.push(frame);
+    assertFixedHint(frame, `page ${page + 1}`);
+    if (!frame.some((line) => line.includes("n1:")) && !frame.some((line) => line.includes("More details"))) middleSeen = true;
+  }
+  assert.ok(middleSeen, "a middle page shows neither the title nor the actions");
+  const reached = new Set(frames.flatMap((lines) => splitFixedHint(frameInterior(lines), NOTICE_KEY_HINT, rows).body));
+  for (let row = 1; row <= 24; row += 1) assert.ok(reached.has(`Body row ${String(row).padStart(2, "0")}`), `body row ${row} is reachable`);
+  assert.ok(reached.has("Context opening row") && reached.has("CONTEXT-END"), "the complete context is reachable");
+  assert.ok(reached.has("> More details") && reached.has("  Close"), "both actions scroll into view after the context");
+
+  const end = fixture.component.render(60).join("\n");
+  fixture.component.handleInput(CTRL_ALT_PAGE_DOWN);
+  assert.equal(fixture.component.render(60).join("\n"), end, "paging is bounded at the end");
+  for (let page = 0; page < 80; page += 1) fixture.component.handleInput(SHIFT_ALT_UP);
+  assert.deepEqual(fixture.component.render(60), frames[0], "paging back returns to the exact opening frame");
+  assert.equal(fixture.sent.length, 0);
+  assert.equal(fixture.controller.listPending().length, 1, "scrolling leaves the notice pending");
+});
+
+test("a long question opens at its beginning; Up/Down reveal the selection even at a boundary", async () => {
+  const rows = 10;
+  const fixture = makeFixture({ getViewportRows: () => rows });
+  register(fixture, Array.from({ length: 20 }, (_, index) => `Question paragraph ${index + 1}.`).join("\n\n"), {
+    choices: ["Alpha", "Beta", "Gamma"],
+  });
+  fixture.component.handleInput(ENTER);
+  let body = splitFixedHint(frameInterior(fixture.component.render(60)), ANSWER_KEY_HINT, rows).body;
+  assert.equal(body[0], "q1:", "the answer view opens at the beginning of the question");
+  assert.ok(!body.some((line) => line.startsWith("> ")), "opening does not jump to the selected choice");
+
+  fixture.component.handleInput(UP); // boundary: the selection cannot move up
+  body = splitFixedHint(frameInterior(fixture.component.render(60)), ANSWER_KEY_HINT, rows).body;
+  assert.ok(body.includes("> 1. Alpha"), "Up at the first choice still reveals it");
+  for (let page = 0; page < 100; page += 1) fixture.component.handleInput(SHIFT_ALT_UP);
+  body = splitFixedHint(frameInterior(fixture.component.render(60)), ANSWER_KEY_HINT, rows).body;
+  assert.equal(body[0], "q1:", "keyboard paging returns to the beginning without moving the selection");
+  fixture.component.handleInput(DOWN);
+  body = splitFixedHint(frameInterior(fixture.component.render(60)), ANSWER_KEY_HINT, rows).body;
+  assert.ok(body.includes("> 2. Beta"), "Down reveals the newly selected choice");
+  fixture.component.handleInput(DOWN);
+  fixture.component.handleInput(DOWN);
+  fixture.component.handleInput(DOWN);
+  fixture.component.handleInput(DOWN); // boundary: Decline is last
+  body = splitFixedHint(frameInterior(fixture.component.render(60)), ANSWER_KEY_HINT, rows).body;
+  assert.ok(body.includes("> Decline (no answer will be sent)"), "Down at the last row reveals Decline");
+  fixture.component.handleInput(UP);
+  fixture.component.handleInput(UP);
+  fixture.component.handleInput(ENTER); // choose Gamma
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.sent.length, 1, "choice semantics are unchanged");
+  assert.match(fixture.sent[0]!.message, /Gamma/);
+});
+
+test("notice actions are revealed by Up/Down and keep their semantics", () => {
+  const rows = 10;
+  const fixture = makeFixture({ getViewportRows: () => rows });
+  registerNotice(fixture, longNoticeBody(30));
+  register(fixture, "Still pending?");
+  fixture.component.handleInput(ENTER);
+  fixture.component.handleInput(DOWN); // select Close
+  let body = splitFixedHint(frameInterior(fixture.component.render(60)), NOTICE_KEY_HINT, rows).body;
+  assert.ok(body.includes("> Close"), "Down reveals the Close action from the beginning of a long notice");
+  for (let page = 0; page < 100; page += 1) fixture.component.handleInput(SHIFT_ALT_UP);
+  fixture.component.handleInput(UP); // More details
+  body = splitFixedHint(frameInterior(fixture.component.render(60)), NOTICE_KEY_HINT, rows).body;
+  assert.ok(body.includes("> More details"), "Up reveals More details");
+  fixture.component.handleInput(DOWN);
+  fixture.component.handleInput(ENTER); // Close only this notice
+  assert.deepEqual(fixture.controller.listPending().map((entry) => entry.id), ["q1"]);
+  assert.equal(fixture.sent.length, 0, "Close sends nothing");
+});
+
+test("the popup is keyboard-only: it exposes no mouse handler, so Pi keeps native wheel behavior", () => {
+  const fixture = makeFixture({ getViewportRows: () => 12 });
+  registerNotice(fixture, longNoticeBody(30));
+  // pi-tui routes mouse events only to components with a handleMouse method;
+  // without one, wheel input keeps Pi's (and the terminal's) own behavior.
+  assert.equal("handleMouse" in fixture.component, false, "the shared popup registers no mouse handling");
+  fixture.component.handleInput(ENTER);
+  const text = fixture.component.render(60).join("\n");
+  assert.doesNotMatch(text, /wheel|mouse/iu, "no view advertises mouse behavior");
+});
+
+test("keyboard scrolling while editing stays with the native field; the next editing input re-reveals the cursor", async () => {
+  const fixture = makeFixture({ getViewportRows: () => 12 });
+  register(fixture, Array.from({ length: 12 }, (_, index) => `Detail ${index + 1}.`).join("\n\n"), { choices: ["Canary"] });
+  fixture.component.handleInput(ENTER);
+  fixture.component.handleInput(DOWN); // Type something…
+  fixture.component.handleInput(ENTER); // editing
+  fixture.component.handleInput("draft");
+  let frame = fixture.component.render(60);
+  assert.ok(frame.length <= 12, "the editing popup stays within its bounded frame");
+  assert.ok(frame.some((line) => line.includes("[field:draft]") && line.includes("\x1b_pi:c\x07")), "the cursor row is visible");
+  assert.ok(frame.join(" ").replace(/\s+/gu, " ").includes("Enter submit · Esc back to options to scroll"),
+    "the editing hint names the Esc exception for the scroll keys");
+
+  // While editing, the popup scroll keys belong to the native field.
+  fixture.component.handleInput(SHIFT_ALT_UP);
+  frame = fixture.component.render(60);
+  assert.ok(fixture.field!.inputLog.includes(SHIFT_ALT_UP), "the scroll key reaches the native field while editing");
+  assert.ok(frame.some((line) => line.includes("[field:draft]")), "the viewport keeps the editing cursor in view");
+
+  // After Esc the scroll keys page the shared viewport without touching the draft.
+  fixture.component.handleInput(ESCAPE);
+  for (let page = 0; page < 100; page += 1) fixture.component.handleInput(SHIFT_ALT_UP);
+  frame = fixture.component.render(60);
+  assert.ok(frame.some((line) => line.trim() === "q1:"), "keyboard paging returns to the question beginning");
+  assert.ok(!frame.some((line) => line.includes("[field:")), "rendering does not snap back to the field");
+  assert.equal(fixture.field!.getText(), "draft", "paging never edits the draft");
+  assert.equal(fixture.sent.length, 0, "paging never submits");
+
+  fixture.component.handleInput(ENTER); // Type something… is still selected: edit again
+  fixture.component.handleInput("!");
+  frame = fixture.component.render(60);
+  assert.ok(frame.some((line) => line.includes("[field:draft!]") && line.includes("\x1b_pi:c\x07")),
+    "the next editing input brings the cursor row back into view");
+  fixture.component.handleInput(ENTER);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.sent.length, 1, "free-text submission semantics are unchanged");
+  assert.match(fixture.sent[0]!.message, /draft!/);
+});
+
+test("regular-mode editing hints explain that keyboard scrolling resumes after Esc", () => {
+  const fixture = makeFixture({ getViewportRows: () => 20 });
+  register(fixture, "Which lane?", { choices: ["Canary"] });
+  fixture.component.handleInput(ENTER);
+  fixture.component.handleInput(DOWN);
+  fixture.component.handleInput(ENTER);
+  const text = fixture.component.render(60).join("\n");
+  assert.match(text, /Enter submit · Esc back to options to scroll/);
+  assert.doesNotMatch(text, /wheel|mouse/iu, "the popup advertises no mouse behavior");
+});
+
+test("resize keeps the authoritative offset within its new bounds and all wrapped content reachable", () => {
+  let rows = 14;
+  let width = 60;
+  const fixture = makeFixture({ getViewportRows: () => rows });
+  const words = Array.from({ length: 60 }, (_, index) => `word${String(index + 1).padStart(2, "0")}`).join(" ");
+  registerNotice(fixture, `${longNoticeBody(20)}\n${words}\nWRAPPED-END`);
+  fixture.component.handleInput(ENTER);
+  const bodyOf = (lines: readonly string[]) => splitFixedHint(frameInterior(lines), NOTICE_KEY_HINT, rows).body;
+  const openingBody = bodyOf(fixture.component.render(width));
+  for (let step = 0; step < 6; step += 1) fixture.component.handleInput(SHIFT_ALT_DOWN);
+  const scrolledFirst = bodyOf(fixture.component.render(width))[0];
+  assert.equal(scrolledFirst, openingBody[6], "six keyboard steps moved six lines");
+
+  rows = 11;
+  assert.equal(bodyOf(fixture.component.render(width))[0], scrolledFirst, "a shorter viewport keeps the same offset");
+  rows = 200;
+  const tall = fixture.component.render(width);
+  assert.ok(tall.length < 200, "a viewport taller than the content shrinks to it");
+  assert.equal(bodyOf(tall)[0], "n1: Scroll regression notice", "the offset clamps to the new bounds");
+  rows = 9;
+  width = 24;
+  const reached = new Set<string>();
+  for (let index = 0; index < 120; index += 1) {
+    const frame = fixture.component.render(width);
+    for (const line of frame) assert.ok(line.length <= width, `every row fits the resized width: ${JSON.stringify(line)}`);
+    for (const line of splitFixedHint(frameInterior(frame), NOTICE_KEY_HINT, rows).body) reached.add(line);
+    fixture.component.handleInput(SHIFT_ALT_DOWN);
+  }
+  const joined = [...reached].join(" ");
+  for (let index = 1; index <= 60; index += 1) {
+    assert.ok(joined.includes(`word${String(index).padStart(2, "0")}`), `wrapped word ${index} is reachable after resize`);
+  }
+  assert.ok(reached.has("WRAPPED-END") && reached.has("  Close"));
+});
+
+test("short content renders a compact popup with its hint and nothing to scroll", () => {
+  const rows = 30;
+  const fixture = makeFixture({ getViewportRows: () => rows });
+  registerNotice(fixture, "One short row.");
+  fixture.component.handleInput(ENTER);
+  const frame = fixture.component.render(60);
+  assert.ok(frame.length < 30, "short content does not stretch to the viewport");
+  const parts = splitFixedHint(frameInterior(frame), NOTICE_KEY_HINT, rows);
+  assert.equal(parts.hint.join(" ").replace(/\s+/gu, " "), NOTICE_KEY_HINT);
+  assert.ok(parts.body.includes("One short row.") && parts.body.includes("  Close"));
+  fixture.component.handleInput(SHIFT_ALT_DOWN);
+  assert.deepEqual(fixture.component.render(60), frame, "nothing moves when everything fits");
+});
+
+test("tiny budgets keep a compact fixed hint before giving up padding, and never hide the body", () => {
+  let rows = 6;
+  const fixture = makeFixture({ getViewportRows: () => rows });
+  registerNotice(fixture, longNoticeBody(8));
+  fixture.component.handleInput(ENTER);
+
+  let interior = frameInterior(fixture.component.render(40));
+  assert.deepEqual(interior.map((line) => line.trim().length === 0), [true, false, false, true],
+    "a six-row frame keeps its blank padding with one body row and one hint row");
+  assert.equal(interior[1], "n1: Scroll regression notice");
+  assert.ok(interior[2]!.startsWith("Shift+Alt+Up/Down or") && interior[2]!.endsWith("…"),
+    `the compact scroll hint is truncated to its row: ${interior[2]}`);
+
+  rows = 5;
+  const frame = fixture.component.render(80);
+  interior = frameInterior(frame);
+  assert.equal(frame.length, 5);
+  assert.equal(interior.length, 3, "a five-row frame drops only its blank padding rows");
+  assert.equal(interior[0], "n1: Scroll regression notice", "one body row remains");
+  assert.ok(interior.slice(1).join(" ").replace(/\s+/gu, " ").includes(SCROLL_KEY_HINT), "the compact hint stays visible");
+
+  const reached = new Set<string>();
+  for (let index = 0; index < 30; index += 1) {
+    reached.add(frameInterior(fixture.component.render(80))[0]!);
+    fixture.component.handleInput(SHIFT_ALT_DOWN);
+  }
+  for (let row = 1; row <= 8; row += 1) assert.ok(reached.has(`Body row 0${row}`), `body row ${row} stays reachable`);
+
+  rows = 3;
+  interior = frameInterior(fixture.component.render(80));
+  assert.equal(interior.length, 1, "a one-row budget keeps only the body");
+  assert.ok(!interior[0]!.includes("Shift+Alt"), "the body row is never replaced by the hint");
+  rows = 8;
+  for (const line of fixture.component.render(4)) assert.ok(line.length <= 4, `tiny widths stay width-safe: ${JSON.stringify(line)}`);
+});
+
+test("one- and two-row budgets drop the rules so retained content stays visible and scrollable", () => {
+  for (const rows of [1, 2]) {
+    const fixture = makeFixture({ getViewportRows: () => rows });
+    registerNotice(fixture, longNoticeBody(6), "CONTEXT-END");
+    fixture.component.handleInput(ENTER);
+    const contentRow = (): string => {
+      const frame = fixture.component.render(40);
+      assert.equal(frame.length, rows, `a ${rows}-row budget renders exactly ${rows} rows`);
+      assert.ok(frame.every((line) => !/^─+$/u.test(line)), `a ${rows}-row budget spends no row on a rule`);
+      for (const line of frame) assert.ok(line.length <= 40, "rows stay width-safe");
+      if (rows === 2) {
+        assert.ok(frame[1]!.trim().startsWith("Shift+Alt+Up/Down or"), `the second row keeps a compact hint: ${frame[1]}`);
+      }
+      return frame[0]!.slice(1).trimEnd();
+    };
+    assert.equal(contentRow(), "n1: Scroll regression notice", `a ${rows}-row popup opens at its first content row`);
+    const reached = new Set<string>();
+    for (let index = 0; index < 40; index += 1) {
+      reached.add(contentRow());
+      fixture.component.handleInput(index % 2 === 0 ? SHIFT_ALT_DOWN : CTRL_ALT_PAGE_DOWN);
+    }
+    for (let row = 1; row <= 6; row += 1) assert.ok(reached.has(`Body row 0${row}`), `${rows}-row budget reaches body row ${row}`);
+    assert.ok(reached.has("CONTEXT-END") && reached.has("  Close"), `${rows}-row budget reaches the context and actions`);
+    for (let page = 0; page < 100; page += 1) fixture.component.handleInput(SHIFT_ALT_UP);
+    assert.equal(contentRow(), "n1: Scroll regression notice", "keyboard paging returns a tiny popup to its beginning");
+    fixture.component.handleInput(DOWN); // select Close
+    assert.equal(contentRow(), "> Close", "selection still reveals the chosen action in a one-row body");
+  }
+  const editing = makeFixture({ getViewportRows: () => 1 });
+  register(editing, "Which lane?", { choices: ["Canary"] });
+  editing.component.handleInput(ENTER);
+  editing.component.handleInput(DOWN);
+  editing.component.handleInput(ENTER);
+  editing.component.handleInput("draft");
+  const frame = editing.component.render(40);
+  assert.equal(frame.length, 1);
+  assert.match(frame[0]!, /\[field:draft\]/, "the active editor's cursor row remains visible in a one-row budget");
+});
+
+test("short popups keep their natural content height; long content grows only to the viewport cap", () => {
+  const rows = 38; // A 40-row terminal minus the overlay's one-row top and bottom margins.
+  const height = (setup: (fixture: Fixture) => void): number => {
+    const fixture = makeFixture({ getViewportRows: () => rows });
+    setup(fixture);
+    return fixture.component.render(160).length;
+  };
+  // Pre-#413 natural layout: two rules, two blank padding rows, the content
+  // lines, one blank separator, and the hint (one row at this wide width).
+  const natural = (contentLines: number): number => 2 + 2 + contentLines + 1 + 1;
+  // List: "Pending input (n)", a blank row, then one row per entry.
+  assert.equal(height((fixture) => register(fixture, "One?")), natural(2 + 1), "a one-item list is sized to its entry");
+  assert.equal(height((fixture) => { register(fixture, "One?"); register(fixture, "Two?"); }), natural(2 + 2),
+    "a two-item list grows by exactly one row");
+  // This fixture host has no native Markdown, so question and notice views
+  // add the visible plain-text disclosure line and its blank separator.
+  // A short question: "q1:", the disclosure and a blank row, its text, a
+  // blank row, Type something…, and Decline.
+  assert.equal(height((fixture) => { register(fixture, "Short question?"); fixture.component.handleInput(ENTER); }),
+    natural(7), "a short question uses only its natural rows");
+  // A notice: its title and a blank row, the disclosure and a blank row, its
+  // body rows, a blank row, More details, and Close.
+  const noticeLines = (bodyRows: number): number => 2 + 2 + bodyRows + 1 + 2;
+  assert.equal(height((fixture) => { registerNotice(fixture, "One short row."); fixture.component.handleInput(ENTER); }),
+    natural(noticeLines(1)), "a short notice uses only its natural rows");
+  const sizes = [4, 12, 24, 60].map((bodyRows) => height((fixture) => {
+    registerNotice(fixture, longNoticeBody(bodyRows));
+    fixture.component.handleInput(ENTER);
+  }));
+  assert.deepEqual(sizes.slice(0, 3), [natural(noticeLines(4)), natural(noticeLines(12)), natural(noticeLines(24))],
+    "growing content grows the popup row for row");
+  assert.equal(sizes[3], rows, "long content is capped at the overlay's row budget, never the full terminal");
+});
+
+test("stale popups close on scroll input instead of scrolling", () => {
+  let stale = false;
+  const fixture = makeFixture({ getViewportRows: () => 10, isStale: () => stale });
+  registerNotice(fixture, longNoticeBody(20));
+  fixture.component.handleInput(ENTER);
+  stale = true;
+  fixture.component.handleInput(SHIFT_ALT_DOWN);
+  assert.deepEqual(fixture.done, [{ kind: "closed" }], "the stale popup closes without acting");
+  assert.deepEqual(fixture.component.render(60), []);
+  assert.equal(fixture.sent.length, 0);
 });

@@ -105,9 +105,6 @@ function markdownHost(created: string[], widths: number[] = []) {
         invalidate() {},
       };
     },
-    createScrollView(content: { render(width: number): string[]; invalidate(): void }) {
-      return fakeScrollView(content);
-    },
   };
 }
 
@@ -145,16 +142,13 @@ function terminalColumns(text: string): number {
   return columns;
 }
 
-function fakeScrollView(content: { render(width: number): string[]; invalidate(): void }) {
-  // This fake custom host does not run ScrollView layout. Its zero viewport
-  // exercises the shared component's live terminal-row fallback and paging.
-  return {
-    viewportHeight: 0,
-    render(width: number) { return content.render(width); },
-    invalidate() { content.invalidate(); },
-    scrollBy(amount: number) { return amount; },
-    scrollToStart() {},
-  };
+const NOTICE_HINT = "arrows select · Enter choose · Shift+Alt+Up/Down or Ctrl+Alt+PageUp/PageDown scroll · Esc back";
+
+/** Drop the trailing fixed keyboard-hint rows (#413) from projected popup content lines. */
+function withoutFixedHint(lines: readonly string[], hint = NOTICE_HINT): string[] {
+  let end = lines.length;
+  while (end > 0 && (lines[end - 1]!.trim().length === 0 || hint.includes(lines[end - 1]!.trim()))) end -= 1;
+  return lines.slice(0, end);
 }
 
 afterEach(() => {
@@ -284,10 +278,14 @@ test("the ruled shared popup renders rich questions and notices; More details co
     getViewportRows: viewportRows,
     onDone(result) { outcomes.push(result); },
   });
+  // The fixed keyboard hint (#413) takes its rows from the 12-row body budget,
+  // so inspect the complete two-entry list at a taller height first.
+  terminalRows = 16;
   const list = component.render(48).join("\n");
   assert.match(list, /Pending input \(2\)/);
   assert.match(list, /q1: # Retention choices/);
   assert.match(list, /n1: Deployment status \[notice\]/);
+  terminalRows = 12;
 
   component.handleInput(ENTER); // open the question detail first
   component.handleInput(PAGE_UP); // return to the opening Markdown before navigating answer rows
@@ -307,6 +305,9 @@ test("the ruled shared popup renders rich questions and notices; More details co
   component.handleInput(DOWN); // select the notice
   component.handleInput(ENTER);
 
+  // The long notice opens at its beginning; a 16-row terminal leaves room for
+  // its heading beside the fixed wrapped hint.
+  terminalRows = 16;
   const firstNoticeFrame = component.render(48).join("\n");
   assert.ok(firstNoticeFrame.split("\n").length <= viewportRows(), "notice details respect their current bounded viewport");
   assert.match(firstNoticeFrame, /native:## Full notice/);
@@ -327,7 +328,8 @@ test("the ruled shared popup renders rich questions and notices; More details co
     frames.push(frame);
     if (frame === frames[frames.length - 2]) break;
   }
-  const completeView = frames.map(popupContentText).join("\n");
+  // Join only the scrolled body rows; the fixed hint follows every frame.
+  const completeView = frames.map((frame) => withoutFixedHint(popupContentLines(frame)).join("\n")).join("\n");
   const compactCompleteView = completeView.replace(/native:/gu, "").replace(/\s+/gu, "");
   const normalizedView = completeView.replace(/\s+/gu, " ");
   for (let index = 1; index <= 18; index += 1) {
@@ -341,10 +343,12 @@ test("the ruled shared popup renders rich questions and notices; More details co
   assert.match(completeView, /CONTEXT-END/);
   assert.match(completeView, /More details/);
   assert.match(completeView, /Close/);
-  assert.ok(
-    normalizedView.replace(/\s+/gu, "").includes("Shift+Alt+Up/DownorCtrl+Alt+PageUp/PageDownscroll"),
-    "the approved page and laptop scroll shortcuts appear in the reachable footer",
-  );
+  for (const frame of frames) {
+    assert.ok(
+      popupContentText(frame).replace(/\s+/gu, "").includes("Shift+Alt+Up/DownorCtrl+Alt+PageUp/PageDownscroll"),
+      "the approved page and laptop scroll shortcuts stay visible in every frame's fixed hint",
+    );
+  }
 
   component.setSourceProbe({ isIdle: () => false });
   component.handleInput(ENTER); // More details closes this custom surface first.
@@ -608,9 +612,20 @@ test("an unavailable native Markdown peer is disclosed and shows the complete wr
     if (next === previous) break;
   }
   const fullView = frames.map(popupContentText).join("\n");
+  const pagedLines = new Set(fullView.split("\n"));
+  for (const frame of frames) {
+    assert.match(popupContentText(frame), /Shift\+Alt\+/, "every paged frame keeps the fixed scroll hint visible");
+  }
   fallbackViewportRows = 10_000;
-  const normalizedView = popupContentText(component.render(fallbackWidth).join("\n")).replace(/\s+/gu, " ");
-  const flattened = fullView.replace(/\n/g, "");
+  const tallView = popupContentText(component.render(fallbackWidth).join("\n"));
+  const normalizedView = tallView.replace(/\s+/gu, " ");
+  // The fixed hint row separates successive paged bodies, so contiguity is
+  // checked on the complete tall render and reachability line by line.
+  const tallBody = withoutFixedHint(tallView.split("\n"));
+  const flattened = tallBody.join("");
+  for (const line of tallBody) {
+    assert.ok(pagedLines.has(line), `paging reaches every complete fallback row: ${JSON.stringify(line)}`);
+  }
   const visibleLines = fullView.split("\n");
   assert.match(normalizedView, /Native Markdown unavailable; showing the complete notice as plain text\./);
   assert.match(normalizedView, /# Full \*\*notice\*\*/);

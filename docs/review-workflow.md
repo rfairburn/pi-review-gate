@@ -162,6 +162,74 @@ evidence is preserved and the user is notified. Review starts fresh from the cur
 workspace as baseline rather than claiming that edits under the damaged checkpoint
 passed. A fresh baseline cannot retroactively certify those earlier edits.
 
+## Tool-derived file evidence: coverage and limits
+
+Tool observations supplement the workspace delta; they do not establish authorship.
+An observed edit to `SCRIPT.sh` can select that file without selecting independent
+`REPORT` files written in the same workspace. The default workspace comparison still
+includes those reports as changes since the baseline. Excluding them from that
+comparison is not the behavior of tool capture, and neither a matching pathname nor
+a capture-time window proves that the session authored every retained byte.
+
+| Execution path | File evidence delivered to review |
+| --- | --- |
+| Primary Pi session | The native `tool_call` hook pre-captures recognized mutation candidates; `tool_result` retains outcomes, including errors. Candidate baseline-to-later-state changes supplement the frozen workspace checkpoint. |
+| Isolated execution worker | Review uses the verified candidate-tree diff. Adapter transcripts remain available as executor artifacts, but the ordinary worker request does not connect structured tool observations to the review window's candidate collector. Transcript indexing is not equivalent to file capture. |
+| In-place worker | Review uses the launch-to-current workspace snapshot. Pi RPC, Claude Agent SDK, and Codex app-server observations contribute bounded events and recognized outside-root candidates with unverified pre-state and bounded after-turn observations—not exact diffs. In-root content comes from the workspace snapshot, not an author-filtered candidate diff. |
+
+The common producer is `src/evidence.ts`; primary hooks live in `src/index.ts`,
+isolated candidate review in `src/execution/wave-worker-lifecycle.ts`, and in-place
+observation/review wiring in `src/execution/inplace/`. Adapter observation contracts
+live in `src/execution/types.ts` and `src/execution/adapters/`. The
+[executor evidence index](subtask-evidence.md) is a separate read interface over
+retained artifacts, not an additional file-evidence producer.
+
+### Supported observations
+
+- Native `write` / `edit` path arguments and ApplyPatch envelope paths (including move
+  destinations) are mutation candidates. Literal shell output redirects and simple
+  `tee`, `touch`, `rm`, `mkdir`, `cp`, and `mv` spellings are best-effort candidates,
+  not execution receipts. Attached output redirects are recognized; command-like text
+  inside quoted data must not select files merely because it contains `touch` or `rm`.
+- Pi RPC observation records preserve UTF-8 path bytes across transport chunk
+  boundaries. Claude pairs results with recorded tool-use inputs; Codex forwards
+  supported command, file-change, and MCP items. Their available shapes and the common
+  extractor still limit which effects can become file candidates. Arbitrary MCP tool
+  arguments are not assumed to describe filesystem mutations.
+- An observed outside-root address that is changed by privacy redaction or retention
+  truncation must not be used to read a different file. The sanitized event remains
+  evidence and the unavailable path observation is disclosed; it is not a verified
+  missing file or a clean effect. Safely retained addresses can still receive bounded
+  after-turn content under the existing in-place policy. Generic adapter arguments
+  remain bounded and redacted evidence, not inferred filesystem targets. Omitted
+  fields, values, nested data, or unsupported reflection are explicitly incomplete
+  and require review. New incomplete observations advance the existing observation
+  revision so a prior pass or no-progress comparison cannot cover later unknown scope.
+- Failed calls remain evidence. ApplyPatch can successfully edit one file before a
+  later operation fails; the earlier file change must survive review capture. An
+  overall error is neither proof of no effects nor proof that every requested target
+  was touched.
+
+### Remaining uncertainty
+
+Shell candidates are lexical hints, not a shell interpreter: conditional branches,
+command substitutions, variables, cwd changes, recursive or multiple-operand commands,
+interpreter scripts, and PowerShell-specific syntax may be missed or over-selected.
+For example, `false && printf x > REPORT` names a target but does not write it;
+an independent later writer can still change that candidate. Relative targets after
+`cd` may resolve differently from the collector's original cwd. Neither situation
+licenses an authorship claim or a universal command-side-effect guarantee.
+
+Candidate comparisons and outside-root after-observations occur later than the tool
+operation. Another writer can replace the same path before collection, so retained
+current content need not equal the bytes written by the observed operation. Symlink
+snapshots retain link identity/target spelling rather than automatically following
+write-through mutations to target bytes. Binary/oversized/unreadable content,
+observation limits, unsupported tool contracts, missing events, and the opaque
+run-as-binary protocol remain limitations, not evidence of no changes. More accurate
+review evidence does not replace input/worktree capture, checkpoint verification,
+process settlement, recovery, or safe landing.
+
 ## Live browser during review
 
 Automatic reviews, `/review-now`, and `/ask-reviewer` settle model work without closing,

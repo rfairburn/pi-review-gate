@@ -1731,7 +1731,7 @@ test("Codex app-server forwards command, file-change, and MCP tool observations"
   }
 });
 
-test("Codex interrupt waits for the active turn terminal notification", async () => {
+test("Codex terminal interrupt requires native confirmation and actual child close for acknowledgement", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-codex-interrupt-"));
   try {
     const artifactDir = join(root, "artifacts");
@@ -1739,6 +1739,7 @@ test("Codex interrupt waits for the active turn terminal notification", async ()
     await mkdir(artifactDir);
     await writeFile(command, [
       "#!/usr/bin/env node",
+      "process.on('SIGTERM',()=>setTimeout(()=>process.exit(0),100));setTimeout(()=>process.exit(94),5000);",
       "let input='';process.stdin.setEncoding('utf8');",
       "process.stdin.on('data',chunk=>{input+=chunk;for(;;){const n=input.indexOf('\\n');if(n<0)break;const raw=input.slice(0,n);input=input.slice(n+1);if(!raw)continue;const c=JSON.parse(raw);if(!c.id)continue;",
       "if(c.method==='initialize')console.log(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{userAgent:'codex-test/1.0'}}));",
@@ -2064,9 +2065,9 @@ test("Codex executor settles from a real child close that lands while durable PI
       );
       assert.equal(result.code, 1, "a child that exits failing before any protocol traffic must settle as a failure");
       assert.equal(result.failure?.category, "protocol");
-      // With the close already observed, the initialize write finds the
-      // child's stdin closed: the deterministic fail-closed transport refusal.
-      assert.match(result.failure?.message ?? "", /stdin is not writable/);
+      // Close is now latched before persistence settles: no initialize write
+      // is attempted against the already-closed transport (#425).
+      assert.match(result.failure?.message ?? "", /exited before completing pending protocol work \(3\)/);
       assert.equal(exits.length, 1, "the real exit must be settled exactly once through onProcessExit");
       assert.equal(exits[0]!.code, 3, "onProcessExit must carry the child's real exit code");
       assert.equal(exits[0]!.signal, null);

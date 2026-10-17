@@ -8,13 +8,17 @@
  * retry backoff, never via sleeps or lucky reruns.
  */
 import assert from "node:assert/strict";
-import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
-import type { ExecutionRetryPolicy } from "../src/config";
+import { normalizeConfig, type ExecutionRetryPolicy } from "../src/config";
+import { CodexExecutorAdapter } from "../src/execution/adapters/codex-cli";
+import { setDurableWriteFaultInjectionForTesting } from "../src/execution/durable-write";
+import { runWaveWorkerLifecycle } from "../src/execution/wave-worker-lifecycle";
+import { terminateProcessTree } from "../src/adapters/process";
 import { runExecutorWithRecovery } from "../src/execution/executor-recovery";
 import {
   createOperationRecord,
@@ -282,23 +286,20 @@ test("recovery — zero-base retry skips jitter draws and retains retry numberin
   }
 });
 
-test("recovery fences a late prior-attempt exit from the newer durable child owner", async () => {
+test("recovery refuses retry and checkpoint while prior-attempt lifecycle persistence is unconfirmed", async () => {
   const scenario = await startRecoveryScenario("task-late-child-exit-fence");
   const { capture, worktree, operation, artifactDir } = scenario;
   const controller = new AbortController();
   let releaseFirstStart!: () => void;
   let announceFirstStart!: () => void;
-  let announceSecondStart!: () => void;
   let announceLateFirstExit!: () => void;
   const firstStartEntered = new Promise<void>((resolvePromise) => { announceFirstStart = resolvePromise; });
-  const secondStartEntered = new Promise<void>((resolvePromise) => { announceSecondStart = resolvePromise; });
   const lateFirstExitPublished = new Promise<void>((resolvePromise) => { announceLateFirstExit = resolvePromise; });
   const firstStartGate = new Promise<void>((resolvePromise) => { releaseFirstStart = resolvePromise; });
   const children: ChildProcess[] = [];
+  const childCloses: Promise<void>[] = [];
   let firstPid: number | undefined;
-  let secondPid: number | undefined;
   let firstLifecycleId: string | undefined;
-  let secondLifecycleId: string | undefined;
   let adapterCalls = 0;
   let running: ReturnType<typeof runExecutorWithRecovery> | undefined;
 
@@ -307,15 +308,14 @@ test("recovery fences a late prior-attempt exit from the newer durable child own
     model: "fake-model",
     run: async (request: ExecutorRequest) => {
       adapterCalls += 1;
-      const firstAttempt = adapterCalls === 1;
-      const child = spawn(process.execPath, ["-e", firstAttempt
-        ? "setTimeout(()=>process.exit(1),80)"
-        : "setInterval(()=>{},1000)"], {
+      const child = spawn(process.execPath, ["-e", "setTimeout(()=>process.exit(1),80)"], {
         cwd: worktree.effectiveCwd,
         detached: process.platform !== "win32",
         stdio: "ignore",
       });
       children.push(child);
+      const closePromise = new Promise<void>((resolve) => child.once("close", () => resolve()));
+      childCloses.push(closePromise);
       if (child.pid === undefined) throw new Error("recovery lifecycle fixture failed to spawn its child");
       const processIdentity = {
         pid: child.pid,
@@ -325,26 +325,11 @@ test("recovery fences a late prior-attempt exit from the newer durable child own
       const startPromise = Promise.resolve(request.onProcessStart?.(processIdentity));
       void startPromise.catch(() => undefined);
 
-      if (firstAttempt) {
-        const exit = await exitPromise;
-        await writeFile(join(worktree.worktreeRoot, "retry-draft.txt"), "checkpoint before retry\n", "utf8");
-        void startPromise.then(() => request.onProcessExit?.({ ...processIdentity, ...exit })).catch(() => undefined);
-        return failingTurn(artifactDir, "attempt-a");
-      }
-
-      await startPromise;
-      await new Promise<void>((resolvePromise) => {
-        if (request.signal?.aborted) resolvePromise();
-        else request.signal?.addEventListener("abort", () => resolvePromise(), { once: true });
-      });
-      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
       const exit = await exitPromise;
-      await request.onProcessExit?.({ ...processIdentity, ...exit });
-      return {
-        ...failingTurn(artifactDir, "attempt-b"),
-        code: 0,
-        aborted: true,
-      };
+      await closePromise;
+      await writeFile(join(worktree.worktreeRoot, "retry-draft.txt"), "unverified draft\n", "utf8");
+      void startPromise.then(() => request.onProcessExit?.({ ...processIdentity, ...exit })).catch(() => undefined);
+      return { ...failingTurn(artifactDir, "attempt-a"), timedOut: true };
     },
   };
 
@@ -357,22 +342,16 @@ test("recovery fences a late prior-attempt exit from the newer durable child own
         workspaceAccess: "workspace-write",
         signal: controller.signal,
         onProcessStart: async ({ pid }) => {
-          if (firstPid === undefined) {
-            firstPid = pid;
-            firstLifecycleId = operation.owner?.childLifecycleId;
-            announceFirstStart();
-            await firstStartGate;
-            return;
-          }
-          secondPid = pid;
-          secondLifecycleId = operation.owner?.childLifecycleId;
-          announceSecondStart();
+          firstPid = pid;
+          firstLifecycleId = operation.owner?.childLifecycleId;
+          announceFirstStart();
+          await firstStartGate;
         },
         onProcessExit: ({ pid }) => {
           if (pid === firstPid) announceLateFirstExit();
         },
       },
-      prompt: "Keep process ownership fenced across recovery attempts.",
+      prompt: "Keep process ownership until exit persistence is confirmed.",
       startingTurn: 1,
       capture,
       worktree,
@@ -390,26 +369,27 @@ test("recovery fences a late prior-attempt exit from the newer durable child own
     void running.catch(() => undefined);
 
     await within(firstStartEntered, "attempt A did not publish its durable start identity");
-    await within(secondStartEntered, "recovery did not start attempt B");
-    assert.ok(firstPid && secondPid);
-    assert.ok(firstLifecycleId && secondLifecycleId);
-    assert.notEqual(firstLifecycleId, secondLifecycleId);
-    assert.equal(operation.owner?.childPid, secondPid);
-    assert.equal(operation.owner?.childLifecycleId, secondLifecycleId);
+    const result = await within(running, "unconfirmed lifecycle did not settle critical");
+    assert.equal(result.status, "critical");
+    assert.equal(adapterCalls, 1, "unverified child must never be retried");
+    assert.equal(operation.state, "failed_critical");
+    assert.equal(operation.checkpoint, undefined, "no checkpoint is safe without verified child settlement");
+    assert.ok(firstPid && firstLifecycleId);
+    assert.equal(operation.owner?.childPid, firstPid);
+    assert.equal(operation.owner?.childLifecycleId, firstLifecycleId);
     assert.equal(operation.owner?.childExitedAt, undefined);
+    assert.equal(operation.owner?.status, "active");
+    const retained = await readOperationRecord(join(operation.artifactDir, "operation.json"));
+    assert.equal(retained.owner?.childPid, firstPid);
+    assert.equal(retained.owner?.childExitedAt, undefined);
+    assert.equal(retained.owner?.status, "active");
 
     releaseFirstStart();
     await within(lateFirstExitPublished, "attempt A's retained exit callback did not complete");
     const durable = await readOperationRecord(join(operation.artifactDir, "operation.json"));
-    assert.equal(durable.owner?.childPid, secondPid);
-    assert.equal(durable.owner?.childLifecycleId, secondLifecycleId);
-    assert.equal(durable.owner?.childExitedAt, undefined, "attempt A cannot mark B's owner slot exited");
-    assert.equal(operationOwnershipStatus(durable).childAlive, true, "attempt B remains durably live after A's late exit publication");
-
-    controller.abort(new Error("finish lifecycle owner fencing regression"));
-    const result = await within(running, "attempt B did not settle cancellation after the fencing assertion");
-    assert.equal(adapterCalls, 2);
-    assert.equal(result.status, "cancelled");
+    assert.equal(durable.owner?.childPid, firstPid);
+    assert.ok(durable.owner?.childExitedAt, "late exit persistence stays ordered and can still record real exit");
+    assert.equal(durable.state, "failed_critical", "a late callback never invents a retry or checkpoint");
   } finally {
     releaseFirstStart();
     controller.abort();
@@ -417,9 +397,232 @@ test("recovery fences a late prior-attempt exit from the newer durable child own
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     }
     await running?.catch(() => undefined);
+    await within(Promise.all(childCloses), "finite recovery fixture children did not close");
     await scenario.cleanup();
   }
 });
+
+test("supplemental simulated identity reuse: a held old exit callback cannot clear a newer lifecycle", async () => {
+  const scenario = await startRecoveryScenario("simulated-lifecycle-replacement");
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let entered!: () => void;
+  const callbackEntered = new Promise<void>(resolve => { entered = resolve; });
+  try {
+    const result = await runExecutorWithRecovery({
+      adapter: { kind: "simulated-lifecycle-only", run: async request => {
+        // No process is launched, adopted or signaled here. These are synthetic
+        // callback identities, not evidence of native PID reuse or child exit.
+        const identity = { pid: 987654321 };
+        await request.onProcessStart?.(identity);
+        const oldExit = request.onProcessExit?.({ ...identity, code: 0, signal: null });
+        await within(callbackEntered, "old callback did not enter");
+        await request.onProcessStart?.(identity);
+        release();
+        await oldExit;
+        return failingTurn(scenario.artifactDir, "simulated-lifecycle");
+      } },
+      request: { cwd: scenario.worktree.effectiveCwd, artifactDir: scenario.artifactDir, onProcessExit: async () => { entered(); await gate; } },
+      prompt: "Memory-only lifecycle identity fencing", startingTurn: 1,
+      capture: scenario.capture, worktree: scenario.worktree, operation: scenario.operation,
+      taskId: scenario.operation.taskId, title: "Simulated lifecycle identity fencing", retryPolicy: { ...LONG_BACKOFF, maxRetries: 0, maxSameIncidentRepeats: 0 },
+    });
+    assert.equal(result.status, "critical");
+    assert.equal(scenario.operation.owner?.status, "active");
+    assert.equal(scenario.operation.owner?.childExitedAt, undefined);
+    assert.equal(scenario.operation.checkpoint, undefined);
+  } finally {
+    release();
+    // Join this fixture's serialized publication before removing its files.
+    await within(writeOperationRecord(scenario.operation), "simulated lifecycle fixture publication remains pending");
+    await scenario.cleanup();
+  }
+});
+
+// These fixtures drive the actual Codex adapter, owned finite Node child,
+// operation write serialization, and (for wave-* cases) public worker lifecycle.
+// The durable-write hook holds a real publication after rename; it does not
+// replace writeOperationRecord or simulate process settlement. Scoped wrappers
+// only observe spawn, callback completion, and the actual write promises so
+// every held/queued publication can be joined before deleting our fixture.
+for (const mode of ["held-exit-callback", "rejected-exit-callback", "start-write", "exit-write", "rejected-start-write", "wave-start-write", "wave-exit-write"] as const) {
+  test(`Codex recovery bounded persistence: ${mode}`, { skip: process.platform === "win32" }, async t => {
+    const scenario = await startRecoveryScenario(`codex-${mode}`);
+    const { capture, worktree, artifactDir } = scenario;
+    const operationPath = operationRecordPath(scenario.operation.artifactDir);
+    const script = join(artifactDir, "finite-codex.cjs");
+    const home = join(artifactDir, "home");
+    const abort = new AbortController();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let announceHeld!: () => void;
+    const held = new Promise<void>(resolve => { announceHeld = resolve; });
+    let announceControl!: () => void;
+    const ready = new Promise<void>(resolve => { announceControl = resolve; });
+    let announceExitCallback!: () => void;
+    const exitCallbackDone = new Promise<void>(resolve => { announceExitCallback = resolve; });
+    let announceClose!: () => void;
+    const closed = new Promise<void>(resolve => { announceClose = resolve; });
+    let child: ChildProcess | undefined;
+    const children: Array<{ proc: ChildProcess; exited: boolean; closed: Promise<void> }> = [];
+    let exitAt = 0, closeAt = 0, attempts = 0, prompts = 0;
+    let injected = false;
+    let running: Promise<unknown> | undefined;
+    let operation = scenario.operation;
+    const writes = new Set<Promise<void>>();
+    const publicationStates: string[] = [];
+    const startWrite = mode.includes("start-write");
+    const wave = mode.startsWith("wave-");
+    const childProcessModule = require("node:child_process") as { spawn: (file: string, args?: readonly string[], options?: SpawnOptions) => ChildProcess };
+    const originalSpawn = childProcessModule.spawn;
+    const operationModule = require("../src/execution/operation-record") as { writeOperationRecord: typeof writeOperationRecord };
+    const originalWrite = operationModule.writeOperationRecord;
+    const originalRun = CodexExecutorAdapter.prototype.run;
+    try {
+      await mkdir(home);
+      await writeFile(script, [
+        "const readline=require('node:readline');const out=v=>console.log(JSON.stringify(v));",
+        "process.on('SIGTERM',()=>setTimeout(()=>process.exit(0),30));setTimeout(()=>process.exit(96),12000);",
+        "readline.createInterface({input:process.stdin}).on('line',line=>{const c=JSON.parse(line);if(!c.method||!c.id)return;",
+        "if(c.method==='initialize')out({id:c.id,result:{userAgent:'finite-recovery-fixture'}});",
+        "else if(c.method==='thread/start')out({id:c.id,result:{thread:{id:'recovery-thread'}}});",
+        "else if(c.method==='turn/start')out({id:c.id,result:{turn:{id:'recovery-turn'}}});",
+        "else if(c.method==='turn/interrupt'){out({id:c.id,result:{}});out({method:'turn/completed',params:{threadId:'recovery-thread',turn:{id:'recovery-turn',status:'interrupted'}}});}});",
+      ].join("\n"));
+      childProcessModule.spawn = (file, args, options) => {
+        if (!args?.includes(script)) return originalSpawn(file, args, options);
+        const spawned = originalSpawn(file, args, { ...options, env: { HOME: home, USERPROFILE: home, PATH: process.env.PATH } });
+        child ??= spawned;
+        let announceChildClose!: () => void;
+        const captured = { proc: spawned, exited: false, closed: new Promise<void>(resolve => { announceChildClose = resolve; }) };
+        children.push(captured);
+        spawned.once("exit", () => { captured.exited = true; if (child === spawned) exitAt = Date.now(); });
+        spawned.once("close", () => {
+          announceChildClose();
+          if (child === spawned) { closeAt = Date.now(); announceClose(); }
+        });
+        return spawned;
+      };
+      operationModule.writeOperationRecord = record => {
+        const write = originalWrite(record);
+        if (operationRecordPath(record.artifactDir) === operationPath) {
+          operation = record;
+          writes.add(write);
+          void write.then(() => writes.delete(write), () => writes.delete(write));
+        }
+        return write;
+      };
+      CodexExecutorAdapter.prototype.run = function(request) {
+        attempts += 1;
+        return originalRun.call(this, {
+          ...request,
+          onPromptDelivery: delivery => { prompts += 1; request.onPromptDelivery?.(delivery); },
+          onProcessExit: async identity => {
+            try { await request.onProcessExit?.(identity); }
+            finally { announceExitCallback(); }
+          },
+        });
+      };
+      if (mode.includes("write")) setDurableWriteFaultInjectionForTesting(async (stage, path) => {
+        if (path !== operationPath) return;
+        if (stage === "after_rename") {
+          const snapshot = await readOperationRecord(path);
+          publicationStates.push(snapshot.state);
+          const lifecycleWrite = startWrite
+            ? snapshot.owner?.childPid === child?.pid && snapshot.owner?.childExitedAt === undefined
+            : snapshot.owner?.childExitedAt !== undefined;
+          if (!injected && child?.pid !== undefined && lifecycleWrite) {
+            injected = true; announceHeld(); await gate;
+            if (mode === "rejected-start-write") throw new Error("held lifecycle publication rejected after release");
+          }
+        }
+      });
+      const config = { id: "fixture", adapter: "codex-cli" as const, command: process.execPath, args: [script], timeoutMs: startWrite ? 300 : 10_000 };
+      const began = Date.now();
+      if (wave) {
+        running = runWaveWorkerLifecycle({
+          taskId: scenario.operation.taskId, task: { title: "Bounded Codex persistence", instructions: "Synthetic task", acceptanceCriteria: ["bounded stop"] },
+          sourceRoot: capture.discovery.captureRoot, capture, worktree, artifactDir: scenario.operation.artifactDir,
+          config: normalizeConfig({
+            externalAgents: { fixture: { adapter: "codex-cli", command: process.execPath, execution: { args: [script], timeoutMs: config.timeoutMs } } },
+            execution: { workerResources: { fixture: { selection: { source: "external", id: "fixture" }, maxConcurrent: 1 } }, routes: { execute: [{ resourceId: "fixture" }], research: [] }, retryPolicy: { maxRetries: 1, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 1 } },
+          }),
+          signal: abort.signal, onLiveControl: control => { if (control) announceControl(); },
+        });
+      } else {
+        running = runExecutorWithRecovery({
+          adapter: new CodexExecutorAdapter(config),
+          request: {
+            cwd: worktree.effectiveCwd, artifactDir: scenario.operation.artifactDir, signal: abort.signal,
+            onLiveControl: control => { if (control) announceControl(); },
+            onProcessExit: async () => {
+              if (mode === "held-exit-callback") { announceHeld(); await gate; }
+              if (mode === "rejected-exit-callback") { announceHeld(); throw new Error("caller exit persistence rejected"); }
+            },
+          },
+          prompt: "Synthetic task", startingTurn: 1, capture, worktree, taskId: scenario.operation.taskId, title: "Bounded Codex persistence",
+          operation, retryPolicy: { maxRetries: 1, baseDelayMs: 0, maxDelayMs: 0, jitter: false, maxSameIncidentRepeats: 1 },
+        });
+      }
+      void running.catch(() => undefined);
+      if (!startWrite) { await within(ready, "real Codex control was not exposed", 3_000); abort.abort(); }
+      await within(held, "lifecycle persistence hold was not reached", 3_000);
+      const result = await within(running, "bounded recovery rejoined unconfirmed persistence", 7_000) as { status: string; error?: string; checkpoint?: unknown };
+      assert.equal(result.status, wave ? "executor_error" : "critical");
+      assert.match(result.error ?? "", /persistence is unconfirmed/);
+      assert.equal(attempts, 1, "unconfirmed callbacks must not cause a retry");
+      assert.equal(result.checkpoint, undefined);
+      assert.equal(operation.state, "failed_critical");
+      assert.equal(operation.owner?.status, "active");
+      assert.equal(operation.owner?.releasedAt, undefined);
+      assert.equal(operation.checkpoint, undefined);
+      assert.equal(prompts, startWrite ? 0 : 1);
+      await within(closed, "actual fixture child close was not observed");
+      assert.ok(exitAt > 0 && closeAt >= exitAt);
+      assert.ok(Date.now() - began < 8_000, "no additional persistence deadline may be added by recovery/callers");
+      if (mode !== "rejected-exit-callback") assert.ok(Date.now() - closeAt >= 4_900);
+      const prior = await readOperationRecord(operationPath);
+      assert.equal(prior.owner?.status, "active", "the previously durable lease must not be released while publication is held");
+      if (wave) {
+        const reported = JSON.parse(await readFile(join(scenario.operation.artifactDir, "result.json"), "utf8"));
+        assert.ok(reported.incidents.some((incident: { stage: string }) => incident.stage === "executor_shutdown"));
+        assert.match(reported.error, /persistence is unconfirmed/);
+      }
+      t.diagnostic(`actual child close ${closeAt-began}ms; bounded ${wave ? "public worker lifecycle" : "recovery"} result ${Date.now()-began}ms; ${mode === "rejected-exit-callback" ? "exit callback rejected; ownership retained" : "persistence hold unreleased"}`);
+      // Deliberately release only AFTER the bounded result and then join all
+      // actual callbacks/publications. Never remove a fixture with writes in flight.
+      release();
+      await within(exitCallbackDone, "late real exit callback did not finish");
+      while (writes.size > 0) await within(Promise.allSettled([...writes]), "ordered publication did not settle after release");
+      const durable = await readOperationRecord(operationPath);
+      assert.equal(durable.state, "failed_critical", "late publication must never downgrade terminal state");
+      assert.equal(durable.owner?.status, "active");
+      assert.equal(durable.checkpoint, undefined);
+      assert.equal(prompts, startWrite ? 0 : 1, "late persistence must never deliver a prompt");
+      assert.equal(attempts, 1, "late persistence must never retry the task");
+      const firstCritical = publicationStates.indexOf("failed_critical");
+      assert.ok(publicationStates.length === 0 || firstCritical >= 0);
+      if (firstCritical >= 0) assert.ok(publicationStates.slice(firstCritical).every(state => state === "failed_critical"), "no stale finalizer snapshot may downgrade late terminal publication");
+    } finally {
+      release(); abort.abort();
+      try {
+        for (const captured of children) if (!captured.exited) terminateProcessTree(captured.proc, "SIGKILL");
+        await within(Promise.all(children.map(captured => captured.closed)), "finite Codex fixture did not close");
+        await within(running?.catch(() => undefined) ?? Promise.resolve(), "recovery fixture did not settle after releasing persistence");
+        for (const captured of children) if (!captured.exited) terminateProcessTree(captured.proc, "SIGKILL");
+        await within(Promise.all(children.map(captured => captured.closed)), "late fixture invocation did not close");
+        if (child?.pid !== undefined) await within(exitCallbackDone, "late fixture callback was not joined");
+        while (writes.size > 0) await within(Promise.allSettled([...writes]), "owned fixture publications remain pending");
+      } finally {
+        setDurableWriteFaultInjectionForTesting(undefined);
+        operationModule.writeOperationRecord = originalWrite;
+        childProcessModule.spawn = originalSpawn;
+        CodexExecutorAdapter.prototype.run = originalRun;
+      }
+      await scenario.cleanup();
+    }
+  });
+}
 
 test("recovery — abort-first control: an abort during the turn still settles cancelled with no failure incident", async () => {
   const scenario = await startRecoveryScenario("task-turn-abort");
@@ -552,6 +755,17 @@ test("recovery — an explicit Claude interrupt with unverified owned shutdown s
   const blocked = new Set<number>();
   const restoreKill = denyProcessGroupSignals(blocked);
   let rootPid: number | undefined;
+  const operationModule = require("../src/execution/operation-record") as { writeOperationRecord: typeof writeOperationRecord };
+  const originalWrite = operationModule.writeOperationRecord;
+  let terminalPublication: Promise<void> | undefined;
+  operationModule.writeOperationRecord = record => {
+    const publication = originalWrite(record);
+    if (record === scenario.operation && record.state === "failed_critical") {
+      terminalPublication = publication;
+      void publication.catch(() => undefined);
+    }
+    return publication;
+  };
   try {
     const { capture, worktree, operation, artifactDir } = scenario;
     const cli = await writeMockClaudeCli(scratch);
@@ -597,7 +811,12 @@ test("recovery — an explicit Claude interrupt with unverified owned shutdown s
     const result = await within(recovery, "recovery did not settle");
     assert.equal(result.status, "critical");
     assert.match(result.error ?? "", /shutdown of its owned process was not verified/);
+    assert.match(result.error ?? "", /persistence is unconfirmed/);
     assert.equal(operation.checkpoint, undefined, "no cancellation checkpoint is taken over a possibly live writer");
+    // Returning critical no longer claims this publication settled. Join the
+    // actual observed source write for the following durability assertions.
+    assert.ok(terminalPublication);
+    await within(terminalPublication, "terminal shutdown record did not publish");
     const durable = await readOperationRecord(operationRecordPath(operation.artifactDir));
     assert.equal(durable.state, "failed_critical");
     assert.equal(durable.checkpoint, undefined);
@@ -617,6 +836,8 @@ test("recovery — an explicit Claude interrupt with unverified owned shutdown s
     assert.match(processResult.terminationError ?? "", /EPERM/);
   } finally {
     restoreKill();
+    try { await within(terminalPublication?.catch(() => undefined) ?? Promise.resolve(), "owned terminal record remains pending"); }
+    finally { operationModule.writeOperationRecord = originalWrite; }
     if (rootPid !== undefined) {
       try {
         process.kill(-rootPid, "SIGKILL");

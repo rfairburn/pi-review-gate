@@ -552,6 +552,7 @@ function fakeAppServerSource(): string {
     "#!/usr/bin/env node",
     "const fs=require('node:fs');const net=require('node:net');",
     "const mode=process.env.PRG_U8_MODE||'intact';",
+    "setTimeout(()=>process.exit(95),15000); // finite invocation-owned fixture lifetime",
     "const barrierEndpoint=process.env.PRG_U8_BARRIER||'';",
     "const capturePath=process.env.PRG_U8_CAPTURE||'';",
     `const splits=${JSON.stringify({ agent: AGENT_SPLIT, file: FILE_SPLIT, diagnostic: DIAGNOSTIC_SPLIT })};`,
@@ -569,7 +570,7 @@ function fakeAppServerSource(): string {
     "if(c.method==='initialize')process.stdout.write(Buffer.from(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{userAgent:'codex-u8-test/1.0'}}) +'\\n'));",
     "else if(c.method==='thread/start')process.stdout.write(Buffer.from(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{thread:{id:'thread-u8'}}})+'\\n'));",
     "else if(c.method==='turn/start')handleTurnStart(c).catch(()=>{process.exit(1);});",
-    "else if(c.method==='turn/interrupt')process.stdout.write(Buffer.from(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{}})+'\\n'));",
+    "else if(c.method==='turn/interrupt'&&mode!=='hold')process.stdout.write(Buffer.from(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{}})+'\\n'));",
     "}});",
     "async function emitSplit(stream,buffer,splitAt,name,base){stream.write(buffer.subarray(0,splitAt));await release(name,base);stream.write(buffer.subarray(splitAt));await release(name,base+1);}",
     "async function handleTurnStart(c){process.stdout.write(Buffer.from(JSON.stringify({jsonrpc:'2.0',id:c.id,result:{turn:{id:'turn-u8'}}})+'\\n'));",
@@ -969,10 +970,10 @@ test("Codex abort while holding a split multibyte tail settles with torn-tail de
     // last byte on the stream. Stderr carries no line protocol, so the torn
     // tail cannot swallow a following record the way an unterminated stdout
     // line would (pre-existing framing behavior, out of scope for #238). The
-    // turn/interrupt response precedes the SIGTERM by construction
-    // (terminate() runs only after the interrupt request settles).
+    // hold mode deliberately sends no interrupt reply: terminal teardown no
+    // longer waits for one (#425). Only the three startup replies are assured.
     const state: ObserverState = {
-      stdout: createObserver([initResponseLine, threadResponseLine, turnResponseLine, interruptResponseLine], true),
+      stdout: createObserver([initResponseLine, threadResponseLine, turnResponseLine], true),
       stderr: createObserver([diagnosticPart1], true),
     };
     const barrierServer = await startBarrierServer(state);
@@ -1035,9 +1036,9 @@ test("Codex abort while holding a split multibyte tail settles with torn-tail de
         readFile(join(turnDir, "raw-stream.txt"), "utf8"),
         readFile(join(turnDir, "stderr.txt"), "utf8"),
       ]);
-      // The protocol stream stays clean: the interrupt response parsed and
-      // routed normally through the unchanged line framing.
-      assert.equal(rawStream, Buffer.concat([initResponseLine, threadResponseLine, turnResponseLine, interruptResponseLine]).toString("utf8"));
+      // The protocol stream stays clean without requiring a native reply
+      // before terminal signaling; retained UTF-8 bytes remain exact.
+      assert.equal(rawStream, Buffer.concat([initResponseLine, threadResponseLine, turnResponseLine]).toString("utf8"));
       assert.ok(!rawStream.includes("\uFFFD"), "the intact protocol stream must not gain replacement characters");
       // The held torn tail decodes to a replacement character exactly as a
       // full-buffer decode of the bytes actually written does.

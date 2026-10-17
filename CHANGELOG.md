@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.175]
+## [0.1.0-dev.176]
 
 ### Fixed
 
@@ -27,6 +27,22 @@ dates.
   Cancellation authority, teardown deadlines, baseline preservation, and popup Escape
   ownership are unchanged. Production regressions cover uncertain and confirmed
   automatic and command cancellation on native Windows.
+
+## [0.1.0-dev.175]
+
+### Fixed
+
+- Codex executor terminal cancellation (#425) starts owned teardown without
+  waiting for an interrupt reply or ordinary turn timeout, fences late
+  replacement work, and preserves truthful concurrent steering acceptance and
+  completed output. The existing two-second SIGTERM-to-SIGKILL escalation now
+  has a seven-second close/drain bound and a separate five-second lifecycle
+  persistence bound. Unconfirmed cleanup or exit publication retains writer
+  ownership without checkpointing or retrying; native acknowledgement alone
+  never proves child quiescence. Recovery and result finalization do not rejoin
+  timed-out lifecycle publication tails, and a best-effort interrupt's input
+  failure does not discard late acceptance replies for previously sent steering.
+  Nonterminal interrupt-steering is unchanged.
 
 ## [0.1.0-dev.174]
 

@@ -569,27 +569,33 @@ async function persistReviewCycleRecord(artifactDir: string, record: ReviewCycle
 
 /** Write result.json to the worker artifact root. */
 async function writeResult(artifactDir: string, result: WaveWorkerLifecycleResult): Promise<void> {
-  try {
-    const operation = await readOperationRecord(join(artifactDir, "operation.json"));
-    // #310: an unverified executor shutdown (an unresolved executor_shutdown
-    // incident recorded by recordUnverifiedChildShutdown) may leave a live
-    // writer, so that failed_critical state is never downgraded. Other
-    // critical incidents, such as checkpoint staging failures, keep their
-    // established paused_recoverable finalization so explicit in-place
-    // continuation and salvage remain available.
-    const unverifiedShutdown = operation.state === "failed_critical"
-      && operation.incidents.some((incident) => incident.stage === "executor_shutdown" && !incident.resolvedAt);
-    if (!unverifiedShutdown) operation.state = lifecycleOperationState(result.status);
-    await writeOperationRecord(operation);
-    result.operationRecord = join(artifactDir, "operation.json");
-    result.bundle = createReattachmentBundle(operation, resolve(artifactDir, "..", ".."));
-    result.incidents = operation.incidents;
-    result.checkpoint = operation.checkpoint;
-    result.attempts = operation.attempts.length;
-    result.diagnostics = await buildOperationDiagnostics(operation, resolve(artifactDir, "..", ".."));
-  } catch {
-    // Preflight failures can occur before an operation record exists. The
-    // caller still receives the ordinary lifecycle result for those cases.
+  // Recovery already supplied authoritative incident/owner metadata for an
+  // unconfirmed shutdown. Its operation publication may still be blocked;
+  // rereading an older snapshot here would both lose that state and rejoin
+  // the timed-out write tail. Publish result.json independently instead.
+  if (!result.incidents?.some((incident) => incident.stage === "executor_shutdown" && !incident.resolvedAt)) {
+    try {
+      const operation = await readOperationRecord(join(artifactDir, "operation.json"));
+      // #310: an unverified executor shutdown (an unresolved executor_shutdown
+      // incident recorded by recordUnverifiedChildShutdown) may leave a live
+      // writer, so that failed_critical state is never downgraded. Other
+      // critical incidents, such as checkpoint staging failures, keep their
+      // established paused_recoverable finalization so explicit in-place
+      // continuation and salvage remain available.
+      const unverifiedShutdown = operation.state === "failed_critical"
+        && operation.incidents.some((incident) => incident.stage === "executor_shutdown" && !incident.resolvedAt);
+      if (!unverifiedShutdown) operation.state = lifecycleOperationState(result.status);
+      await writeOperationRecord(operation);
+      result.operationRecord = join(artifactDir, "operation.json");
+      result.bundle = createReattachmentBundle(operation, resolve(artifactDir, "..", ".."));
+      result.incidents = operation.incidents;
+      result.checkpoint = operation.checkpoint;
+      result.attempts = operation.attempts.length;
+      result.diagnostics = await buildOperationDiagnostics(operation, resolve(artifactDir, "..", ".."));
+    } catch {
+      // Preflight failures can occur before an operation record exists. The
+      // caller still receives the ordinary lifecycle result for those cases.
+    }
   }
   result.reviewReport ??= buildReviewReportFromOutputs({
     outputs: result.reviewCycles,

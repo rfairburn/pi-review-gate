@@ -3,7 +3,7 @@
  *
  * The question list is a plain structural Component (render/handleInput/
  * invalidate) so its logic is testable without any host module. This loader
- * supplies width-safe text helpers, native Markdown, ScrollView, and raw key
+ * supplies width-safe text helpers, native Markdown, and raw key
  * matching from the running Pi's own pi-tui, following the same two-step strategy as
  * src/settings/menu.ts:
  *
@@ -25,10 +25,9 @@
  * authorized full, width-wrapped plain-text fallback (no custom Markdown
  * parser). The shared question/notice component is a public overlay, whose
  * compositor clips lines to `maxHeight` but does not lay out a ScrollView.
- * Production therefore owns a manual viewport whose row budget matches the
- * overlay's explicit maxHeight and margins, recalculated on terminal resize.
- * The public ScrollView factory remains available only for components whose
- * host parent actually traverses its layout node. The
+ * The component therefore owns the single manual viewport (scroll offset,
+ * fixed keyboard-hint area, and fullscreen wheel handling) within a row
+ * budget recalculated from the live terminal on every render. The
  * free-text answer row embeds the host-wired native
  * editor acquired through the shared bridge (src/native-editor-bridge.ts);
  * this loader no longer exposes a standalone Editor for it — without the
@@ -48,13 +47,6 @@ export interface QuestionMarkdownComponent {
   invalidate(): void;
 }
 
-/** Native pi-tui ScrollView; its viewport is available when host layout traverses its node. */
-export interface QuestionScrollViewComponent extends QuestionMarkdownComponent {
-  readonly viewportHeight: number;
-  scrollBy(lines: number): number;
-  scrollToStart(): void;
-}
-
 /** The pi-tui surface the question UI uses; every member is optional. */
 export interface QuestionTuiHost {
   matchesKey?(data: string, keyId: string): boolean;
@@ -71,11 +63,6 @@ export interface QuestionTuiHost {
   getKeybindings?(): { matches?(data: string, keybinding: string): boolean } | undefined;
   /** Native pi-tui Markdown using the running application's Markdown theme. */
   createMarkdown?(markdown: string): QuestionMarkdownComponent | undefined;
-  /** Native ScrollView for component slots whose parent performs layout. */
-  createScrollView?(
-    content: QuestionMarkdownComponent,
-    fallbackViewportRows?: () => number,
-  ): QuestionScrollViewComponent | undefined;
 }
 
 let hostOverride: QuestionTuiHost | undefined;
@@ -170,29 +157,6 @@ async function doLoadQuestionTuiHost(): Promise<QuestionTuiHost | undefined> {
         }
       };
     }
-  }
-  const ScrollView = mod.ScrollView;
-  if (typeof ScrollView === "function") {
-    host.createScrollView = (content) => {
-      try {
-        const component = new (ScrollView as new (
-          child: QuestionMarkdownComponent,
-          options?: { axis?: "vertical"; overscroll?: "chain" | "contain"; scrollbar?: "hidden" | "auto" | "always" },
-        ) => QuestionScrollViewComponent)(content, {
-          axis: "vertical",
-          overscroll: "contain",
-          scrollbar: "hidden",
-        });
-        return typeof component.render === "function"
-          && typeof component.invalidate === "function"
-          && typeof component.scrollBy === "function"
-          && typeof component.scrollToStart === "function"
-          ? component
-          : undefined;
-      } catch {
-        return undefined;
-      }
-    };
   }
   return Object.keys(host).length > 0 ? host : undefined;
 }

@@ -15,6 +15,35 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.168]
+
+### Changed
+
+- Shared question/notice popup (#413): the keyboard hint stays visible in a fixed area
+  below the popup body, and the complete question or notice text, context, choices,
+  **Type something…**, **Decline**, and notice actions scroll together. Long questions
+  and notices open at their beginning instead of at the first choice. Up/Down still
+  move the selection and bring the selected choice or action into view, also at the
+  first or last row. Editing input brings the free-text cursor back into view, and
+  while editing the hint says to press Esc before using the scroll keys. Resizing keeps
+  the scroll position within the new bounds with the complete re-wrapped content
+  reachable. Small popups first shorten the hint and then drop their blank padding
+  rows; in three- or four-row terminals the frame rules give way too, so at least one
+  content row always stays visible and scrollable. The scroll shortcuts and their one-line
+  step, choice, free-text, Decline, notice-action, and Escape/review behavior are
+  unchanged.
+
+### Added
+
+- Fullscreen mode (#413): the mouse wheel scrolls the shared popup's content in both
+  directions, including while editing a free-text answer, without changing or submitting
+  the draft. Wheel input over any popup row, including at the bounds of its content,
+  no longer scrolls the transcript underneath. To cover every row, the fullscreen popup
+  fills the conversation viewport: the row above and below the unchanged frame, which
+  previously showed transcript edges, is now opaque surface. Other mouse input keeps
+  Pi's native behavior, and the wheel scrolls the transcript again once the popup
+  closes. Regular mode adds no mouse handling and keeps the frame's size and position.
+
 ## [0.1.0-dev.167]
 
 ### Fixed

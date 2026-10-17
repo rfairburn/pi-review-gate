@@ -36,6 +36,20 @@ dates.
   evidence before deletion. Native Windows refuses a sixth artifact without
   reclamation; native rolling cleanup remains unresolved.
 
+## [0.1.0-dev.173]
+
+### Fixed
+
+- Tool-derived file evidence (#302): preserve UTF-8 filenames across Pi RPC stdout
+  chunks; recognize attached literal shell output redirections without selecting
+  command-like text inside quoted data; and disclose unavailable outside-root
+  observations instead of reading a privacy-redacted or truncated pathname as a
+  different filesystem address. Focused regressions inspect retained review content,
+  including script edits alongside independently generated reports. Snapshot-default
+  review scope, failed/partial-operation evidence, reviewer requirements, and
+  checkpoint/landing behavior are unchanged. The review workflow documents producer
+  and adapter coverage, isolated-worker limits, and remaining attribution uncertainty.
+
 ## [0.1.0-dev.172]
 
 ### Fixed

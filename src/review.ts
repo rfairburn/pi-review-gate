@@ -26,13 +26,15 @@ import type { ModelAdapter, ReviewerSession } from "./adapters/types";
 import type { TokenUsage } from "./usage";
 import { completeActiveExchange, hasUnresolvedReview, isReviewBaseline, snapshotOfReviewBaseline, type GitCheckpointBaseline, type UnifiedReviewBaseline, type ReviewBaseline, type ReviewWindow } from "./state";
 import { aggregateReviewDisposition } from "./review-report";
-import { primaryEvidencePolicy, evidenceMethodNotice, retainedToolChanges, isEligibleReviewCaptureFailure, ReviewEvidenceCaptureFailure, TOOL_ONLY_HISTORY_NOTICE, type ReviewEvidencePolicy, type ReviewEvidenceMethod } from "./review-evidence";
+import { acquireReviewWorkspaceSnapshot, primaryEvidencePolicy, evidenceMethodNotice, retainedToolChanges, isEligibleReviewCaptureFailure, ReviewEvidenceCaptureFailure, TOOL_ONLY_HISTORY_NOTICE, type ReviewEvidencePolicy, type ReviewEvidenceMethod } from "./review-evidence";
 
 export interface ReviewRunInput {
   evidencePolicy?: ReviewEvidencePolicy;
   /** Trusted acquisition-only handoff when a worker captures review evidence before this call.
    * Never pass construction, checkpoint, integrity, cleanup, cancellation or reviewer failures. */
   evidenceCaptureFailure?: ReviewEvidenceCaptureFailure;
+  /** Internal trusted handoff: attribution and review consume this same acquired pair. */
+  preparedSnapshots?: { before: WorkspaceSnapshot; after: WorkspaceSnapshot; toolOnlyHistory?: boolean };
   cwd: string;
   request: string;
   /**
@@ -1160,12 +1162,22 @@ function createAdapter(decider: DeciderConfig): ModelAdapter {
 
 /** The policy is copied at invocation entry. It never follows a live settings toggle. */
 async function settleReviewEvidence(input: ReviewRunInput): Promise<SettledBaseline> {
+  input.signal?.throwIfAborted();
   const policy = { ...(input.evidencePolicy ?? primaryEvidencePolicy(input.config)) };
   const beforeKind = isReviewBaseline(input.before) ? input.before.kind : "snapshot";
   for (const baseline of [input.window?.baseline, input.window?.activeExchange?.baseline]) {
     if (!baseline) continue;
     if (baseline.kind !== beforeKind) throw new Error("review gate: mixed evidence baseline kinds");
     if (baseline.kind !== "snapshot" && baseline.cwd !== input.cwd) throw new Error("review gate: evidence baseline root mismatch");
+  }
+  if (input.preparedSnapshots) {
+    const pair = input.preparedSnapshots;
+    if (beforeKind !== "snapshot" || pair.before !== legacySnapshotOf(input.before) || pair.before === pair.after
+      || resolve(pair.before.cwd) !== resolve(input.cwd) || resolve(pair.after.cwd) !== resolve(input.cwd)
+      || !(pair.before.files instanceof Map) || !(pair.after.files instanceof Map)
+      || ![input.config.maxFileBytes, input.config.maxSnapshotBytes].every((n) => Number.isSafeInteger(n) && n >= 0)) {
+      throw new Error("review gate: invalid prepared snapshot roots or basis");
+    }
   }
   const toolBaseline = isReviewBaseline(input.before) && input.before.kind === "tool" ? input.before : undefined;
   if (toolBaseline && toolBaseline.cwd !== input.cwd) throw new Error("review gate: tool evidence basis root mismatch");
@@ -1564,15 +1576,16 @@ async function settleSnapshotReview(input: ReviewRunInput): Promise<SettledBasel
   const exchangeBefore = exchangeBaseline && isReviewBaseline(exchangeBaseline)
     ? (exchangeBaseline.kind === "snapshot" ? exchangeBaseline.snapshot : undefined)
     : undefined;
-  const after = await createWorkspaceSnapshot(input.cwd, {
-    maxFileBytes: input.config.maxFileBytes,
-    maxSnapshotBytes: input.config.maxSnapshotBytes,
-    reuseUnchangedFrom: exchangeBefore ?? before,
-  });
+  if (resolve(before.cwd) !== resolve(input.cwd)
+    || (exchangeBefore && resolve(exchangeBefore.cwd) !== resolve(input.cwd))) {
+    throw new Error("review gate: snapshot baseline root mismatch");
+  }
+  const after = input.preparedSnapshots?.after ?? await acquireReviewWorkspaceSnapshot(input.cwd, input.config, input.signal, exchangeBefore ?? before);
   const workspaceChanges = compareSnapshots(before, after);
   const exchangeWorkspaceChanges = exchangeBefore ? compareSnapshots(exchangeBefore, after) : workspaceChanges;
   return {
     evidenceMethod: "snapshot",
+    ...(input.preparedSnapshots?.toolOnlyHistory ? { evidenceCoverageNotice: TOOL_ONLY_HISTORY_NOTICE } : {}),
     workspaceChanges,
     exchangeWorkspaceChanges,
     snapshotOmissions: after.omissions,

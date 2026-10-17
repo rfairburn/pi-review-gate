@@ -43,6 +43,8 @@ import { formatScheduledOrchestratorTurnContent } from "../src/scheduling/orches
 import { formatWakePayload } from "../src/background-shell/jobs";
 import { isFullTextFallback } from "../src/presentation-expansion";
 import { setNativeExpansionHost, type NativeExpansionHost } from "../src/presentation-hints";
+import { evidenceMethodNotice } from "../src/review-evidence";
+import { isWorkerReviewEvidenceWarning } from "../src/execution/review-evidence-warning";
 
 // A minimal fake pi-tui: naive hard-wrap (content in these tests is short), no
 // MouseRegion so the core adapter degrades to keyboard-only rendering.
@@ -140,6 +142,59 @@ test("subtask-event collapsed: real completion fixture shows title + state + cou
   assert.ok(out.includes("Implement feature X"), "recorded title present");
   assert.ok(out.includes("LANDED"), "actual outcome state shown");
   assert.ok(out.includes("1/2"), "aggregate count from the execution line");
+});
+
+test("subtask-event collapsed: actual-use isolated fallback warnings stay prominent on success", () => {
+  const warning = "WARNING: Isolated worktree task t-fallback, assessment 1: tool-only-fallback; CURRENT tool evidence retained, NOT exact-snapshot certification.";
+  const task = makeTask("t-fallback", "Fallback worker", "landed", { summary: `Completed.\n\n${warning}` });
+  const group = makeGroup("execute", [task]);
+  const content = formatExecutionEvent(group as never, task as never, "completion", "Task landed independently.");
+  assert.ok(content.includes(warning), "full model outcome carries the durable warning");
+  const message = { content, details: { state: "landed", executionId: "exec-1" } };
+  const out = lines(renderSubtaskEventCollapsed(message, {}, THEME), 1000).join("\n");
+  assert.ok(out.includes(warning), "human collapsed success card cannot hide fallback");
+  assert.ok(lines(renderFullMessageContent(message, {}, THEME), 1000).join("\n").includes(warning));
+});
+
+for (const origin of ["WARNING: InPlace worker task t-inplace: ", "WARNING: In-place task t-inplace: ", "InPlace task t-inplace: "]) {
+  test(`shared worker warning delivery and collapsed rendering preserve InPlace origin: ${origin}`, () => {
+    const warning = `${origin}${evidenceMethodNotice("tool-only-fallback")}`;
+    const task = makeTask("t-inplace", "InPlace fallback", "reported", { summary: `Settled in place.\n\n${warning}` });
+    const group = makeGroup("inplace", [task]);
+    const content = formatExecutionEvent(group as never, task as never, "completion", "Task settled in place.");
+    assert.ok(content.includes(warning), "model completion retains the original warning and origin");
+    const alreadyDisclosed = formatExecutionEvent(group as never, task as never, "completion", `Task settled in place.\n${warning}`);
+    assert.equal(alreadyDisclosed.split(warning).length - 1, 1, "do not duplicate a warning already in completion prose");
+    const message = { content, details: { state: "reported", executionId: "exec-1" } };
+    assert.ok(lines(renderSubtaskEventCollapsed(message, {}, THEME), 2000).join("\n").includes(warning), "collapsed success must show the same unmodified warning");
+    assert.ok(lines(renderFullMessageContent(message, {}, THEME), 2000).join("\n").includes(warning));
+    const failed = makeTask("t-inplace", "InPlace fallback", "paused_recoverable", { summary: `${"verbose ".repeat(200)}\n\n${warning}`, error: "review failed after fallback" });
+    const failedGroup = makeGroup("inplace", [failed]);
+    const diagnostic = buildWakeFailureDiagnostic({ group: failedGroup as never, task: failed as never, content: "InPlace task needs recovery." });
+    const failedContent = `${formatWakeFailurePreamble(diagnostic)}\n\nFailure recovery diagnostic (curated and bounded; use SubtasksInspect for the full current snapshot):\n${formatWakeFailureDiagnostic(diagnostic)}`;
+    assert.ok(failedContent.includes(origin), "bounded failure diagnostic prioritizes evidence warning origin");
+    const failureCard = lines(renderSubtaskEventCollapsed({ content: failedContent, details: { state: "paused_recoverable", executionId: "exec-1", diagnostic } }, {}, THEME), 2000).join("\n");
+    assert.ok(failureCard.includes(origin));
+    assert.match(failureCard, /tool-only-fallback/);
+  });
+}
+
+test("worker evidence warning recognition does not promote unrelated notes or ordinary warnings", () => {
+  assert.equal(isWorkerReviewEvidenceWarning("Review evidence limitations: WARNING: InPlace worker used tool-only-fallback; CURRENT evidence retained."), true);
+  assert.equal(isWorkerReviewEvidenceWarning("ordinary note about tool-only-fallback"), false);
+  assert.equal(isWorkerReviewEvidenceWarning("WARNING: unrelated infrastructure issue"), false);
+  assert.equal(isWorkerReviewEvidenceWarning("a quoted Isolated worktree name is not a warning"), false);
+});
+
+test("subtask-event collapsed: fallback stays visible on failure even after an overlong worker summary", () => {
+  const warning = "WARNING: Isolated worktree task t-error: tool-only-fallback. CURRENT tool evidence retained; NOT exact-snapshot certification.";
+  const task = makeTask("t-error", "Fallback then reviewer failure", "paused_recoverable", { summary: `${"verbose ".repeat(200)}\n\n${warning}`, error: "reviewer failed" });
+  const group = makeGroup("execute", [task]);
+  const diagnostic = buildWakeFailureDiagnostic({ group: group as never, task: task as never, content: "Task failed." });
+  const content = `${formatWakeFailurePreamble(diagnostic)}\n\nFailure recovery diagnostic (curated and bounded; use SubtasksInspect for the full current snapshot):\n${formatWakeFailureDiagnostic(diagnostic)}`;
+  assert.ok(content.includes(warning));
+  const message = { content, details: { state: "paused_recoverable", executionId: "exec-1", diagnostic } };
+  assert.ok(lines(renderSubtaskEventCollapsed(message, {}, THEME), 1000).join("\n").includes(warning));
 });
 
 test("subtask-event collapsed: real conflict diagnostic shows error, notice, and EVERY recovery action", () => {

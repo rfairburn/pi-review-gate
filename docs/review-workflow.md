@@ -311,9 +311,9 @@ a capture-time window proves that the session authored every retained byte.
 
 | Execution path | File evidence delivered to review |
 | --- | --- |
-| Primary Pi session | The native `tool_call` hook pre-captures recognized mutation candidates; `tool_result` retains outcomes, including errors. Candidate baseline-to-later-state changes supplement the frozen workspace checkpoint. |
-| Isolated execution worker | Review uses the verified candidate-tree diff. Adapter transcripts remain available as executor artifacts, but the ordinary worker request does not connect structured tool observations to the review window's candidate collector. Transcript indexing is not equivalent to file capture. |
-| In-place worker | Review uses the launch-to-current workspace snapshot. Pi RPC, Claude Agent SDK, and Codex app-server observations contribute bounded events and recognized outside-root candidates with unverified pre-state and bounded after-turn observations—not exact diffs. In-root content comes from the workspace snapshot, not an author-filtered candidate diff. |
+| Primary Pi session | The native `tool_call` hook pre-captures recognized mutation candidates; `tool_result` retains outcomes, including errors, and bounded post-tool content for tool-only or fallback review. Snapshot mode also uses the frozen workspace checkpoint; tool-only uses retained observations instead of a whole-root comparison. |
+| Isolated execution worker | Construction, candidate checkpoints, and landing remain verified independently. Snapshot review uses the candidate-tree diff; tool-only review consumes supported structured observations and bounded candidate content. Adapter transcripts remain inspectable artifacts, not a substitute file-evidence producer. |
+| In-place worker | Snapshot review uses the launch-to-current workspace delta. Tool-only review uses supported Pi RPC, Claude Agent SDK, and Codex app-server observations, including bounded in-root and outside-root candidate content. Adapter pre-state is unverified: after-turn observations are not exact diffs or authorship proof. |
 
 The common producer is `src/evidence.ts`; primary hooks live in `src/index.ts`,
 isolated candidate review in `src/execution/wave-worker-lifecycle.ts`, and in-place

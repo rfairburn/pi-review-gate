@@ -143,7 +143,7 @@ test("recorded snapshot omissions and omission-list truncation stay short actual
     mode: "non_git" as const,
     capturedAt: "2024-01-01T00:00:00.000Z",
     snapshot: { cwd: "/workspace", capturedAt: "2024-01-01T00:00:00.000Z", files: new Map(), omissions: ["a", "b", "c"], omissionsTruncated: true },
-  } as unknown as InPlaceLifecycleResult["baseline"];
+  } as unknown as import("../src/execution/inplace/basis").InPlaceBaseline;
   const lines = buildInPlaceCompletionLines(settledResult({ status: "no_changes", changedSinceLaunch: [], baseline }));
   assert.equal(lines.at(-1), "Snapshot omissions recorded: 3 (omission list truncated)");
   // Zero omissions produce no limit line.

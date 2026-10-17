@@ -423,9 +423,10 @@ export function recordObservedToolEventEvidence(input: {
     const absolutePath = isAbsolute(expanded) ? resolve(expanded) : resolve(input.cwd, expanded);
     return isOutsidePath(absolutePath, root);
   });
-  // Omitted identities may be external. Every such observation must invalidate
-  // a prior pass/no-progress comparison, even after the event window fills.
-  if (observedExternal || boundedInput.identitiesUnavailable || boundedInput.incomplete) {
+  const eventWindowFull = input.state.events.filter((event) => event.adapter !== undefined).length >= MAX_OBSERVED_TOOL_EVENTS;
+  // Omitted identities or events may hide external scope. Every such observation
+  // must invalidate a prior pass/no-progress comparison, even without a named path.
+  if (observedExternal || boundedInput.identitiesUnavailable || boundedInput.incomplete || eventWindowFull) {
     const revision = input.state.externalObservationRevision ?? 0;
     if (revision < MAX_EXTERNAL_OBSERVATION_REVISION) input.state.externalObservationRevision = revision + 1;
     else input.state.toolObservationsTruncated = true;
@@ -435,7 +436,7 @@ export function recordObservedToolEventEvidence(input: {
     if (revision < MAX_TOOL_OBSERVATION_REVISION) input.state.toolObservationRevision = revision + 1;
     else input.state.toolObservationsTruncated = true;
   }
-  if (input.state.events.filter((event) => event.adapter !== undefined).length >= MAX_OBSERVED_TOOL_EVENTS) {
+  if (eventWindowFull) {
     input.state.toolObservationsTruncated = true;
     input.state.requiresReview = true;
     return;

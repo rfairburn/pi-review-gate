@@ -625,6 +625,29 @@ test("late incomplete generic observations advance revisions even with a full ev
   });
 });
 
+test("late path-free observations invalidate identity when the event ledger overflows", async () => {
+  await fixture(async (_root, workspace) => {
+    const evidence = createEvidenceState();
+    const observation = { state: evidence, cwd: workspace, selectedRoot: workspace, adapter: "pi-model", stage: "start" as const, toolName: "mcp__example__request" };
+    for (let index = 0; index < 200; index++) {
+      recordObservedToolEventEvidence({ ...observation, toolInput: { action: "retained request" } });
+    }
+    assert.equal(evidence.externalObservationRevision, 0);
+    assert.equal(evidence.toolObservationRevision, 0);
+    for (const [index, action] of ["first omitted request", "second omitted request"].entries()) {
+      recordObservedToolEventEvidence({ ...observation, toolInput: { action } });
+      assert.equal(evidence.events.length, 200);
+      assert.equal(evidence.candidates.size, 0, "generic requests do not invent filesystem candidates");
+      assert.equal(evidence.toolObservationRevision, 0, "no mutation path was observed");
+      assert.equal(evidence.requiresReview, true);
+      assert.equal(evidence.toolObservationsTruncated, true);
+      assert.equal(serializeEvidenceState(evidence).externalObservationRevision, index + 1,
+        "each omitted observation must invalidate a prior pass even without a named path");
+      assert.ok(!JSON.stringify(evidence.events).includes(action), "the event window remains bounded");
+    }
+  });
+});
+
 test("fully retained 20k raw commands and patches still supply exact safe addresses", async () => {
   await fixture(async (root, workspace) => {
     const before = await createWorkspaceSnapshot(workspace, snapshotOptions);

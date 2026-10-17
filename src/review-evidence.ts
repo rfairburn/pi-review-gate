@@ -1,5 +1,6 @@
 import { effectiveReviewEvidenceSettings, type ReviewGateConfig } from "./config";
-import { compareFileSnapshots, createPathSnapshot, type ChangedFile } from "./capture";
+import { compareFileSnapshots, createPathSnapshot, createWorkspaceSnapshot, type WorkspaceSnapshot, type ChangedFile } from "./capture";
+import { stat } from "node:fs/promises";
 import { extractCandidatePaths, type EvidenceState } from "./evidence";
 import { expandHomePath } from "./apply-patch/paths";
 import { resolve } from "node:path";
@@ -24,6 +25,26 @@ export function evidenceMethodNotice(method: ReviewEvidenceMethod): string {
 
 /** Raised only by acquisition stages, never baseline verification/comparison/cleanup. */
 export class ReviewEvidenceCaptureFailure extends Error {}
+
+/** Validate configuration/root before the acquisition-only failure boundary. */
+export async function acquireReviewWorkspaceSnapshot(
+  cwd: string, config: ReviewGateConfig, signal?: AbortSignal, reuseUnchangedFrom?: WorkspaceSnapshot,
+): Promise<WorkspaceSnapshot> {
+  signal?.throwIfAborted();
+  if (![config.maxFileBytes, config.maxSnapshotBytes].every((n) => Number.isSafeInteger(n) && n >= 0)) {
+    throw new Error("Invalid review snapshot limits.");
+  }
+  if (!(await stat(cwd)).isDirectory()) throw new Error("Review snapshot root is not a directory.");
+  if (reuseUnchangedFrom && resolve(reuseUnchangedFrom.cwd) !== resolve(cwd)) throw new Error("Review snapshot basis root mismatch.");
+  try {
+    return await createWorkspaceSnapshot(cwd, {
+      maxFileBytes: config.maxFileBytes, maxSnapshotBytes: config.maxSnapshotBytes, signal, reuseUnchangedFrom,
+    });
+  } catch (error) {
+    signal?.throwIfAborted();
+    throw new ReviewEvidenceCaptureFailure("Review-evidence workspace snapshot acquisition failed.", { cause: error });
+  }
+}
 
 /** Call only on an actual capture/arm outcome, never load/compare/cleanup. */
 export function isEligibleReviewCaptureFailure(result: { status: string; reason?: string; evidenceCaptureFailure?: unknown }): boolean {

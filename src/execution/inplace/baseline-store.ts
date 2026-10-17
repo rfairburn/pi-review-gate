@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { FileSnapshot, WorkspaceSnapshot } from "../../capture";
 import { atomicWriteExclusive } from "../durable-write";
-import type { InPlaceBaseline } from "./basis";
+import type { InPlaceBaseline, InPlaceBasis } from "./basis";
 
 // ── durable launch baseline (#220 review pass 1) ───────────────────────────
 
@@ -26,6 +26,7 @@ interface PersistedInPlaceBaselineDoc {
   capturedAt: string;
   gitHead?: string;
   gitRepositoryRoot?: string;
+  toolOnlyHistory?: boolean;
   omissions: Array<{ path: string; kind: string; reason: string }>;
   omissionsTruncated: boolean;
   files: Array<PersistedFileSnapshot>;
@@ -48,6 +49,37 @@ interface PersistedFileSnapshot {
 
 export const INPLACE_BASELINE_FILE = "baseline.json";
 
+/** Uses the same write-once publication and task/root integrity binding as snapshots. */
+export async function persistInPlaceBasis(basis: InPlaceBasis, taskId: string, artifactDir: string): Promise<string> {
+  if (basis.mode !== "tool") return persistInPlaceBaseline(basis, taskId, artifactDir);
+  const unsigned = { version: 2, taskId, workspaceRoot: basis.workspaceRoot, mode: "tool", capturedAt: basis.capturedAt,
+    ...(basis.fallback ? { fallback: true } : {}) };
+  const path = join(artifactDir, INPLACE_BASELINE_FILE);
+  await atomicWriteExclusive(path, JSON.stringify({ ...unsigned,
+    integritySha256: createHash("sha256").update(JSON.stringify(unsigned)).digest("hex"),
+  }, null, 2) + "\n");
+  return path;
+}
+
+export async function loadInPlaceBasis(taskId: string, artifactDir: string, workspaceRoot: string): Promise<InPlaceBasis> {
+  const path = join(artifactDir, INPLACE_BASELINE_FILE);
+  let value;
+  try { value = JSON.parse(await readFile(path, "utf8")); }
+  catch (error) {
+    throw new Error(`In-place continuation refused: the launch baseline document ${path} could not be read (${error instanceof Error ? error.message : String(error)}). The original launch state cannot be verified, so the task is not continued; inspect the workspace and its artifacts manually.`);
+  }
+  if (value?.version !== 2) return loadInPlaceBaseline(taskId, artifactDir, workspaceRoot);
+  const { integritySha256, ...unsigned } = value;
+  if (value.taskId !== taskId || value.workspaceRoot !== resolve(workspaceRoot) || value.mode !== "tool"
+    || typeof value.capturedAt !== "string" || Number.isNaN(Date.parse(value.capturedAt))
+    || (value.fallback !== undefined && value.fallback !== true)
+    || Object.keys(unsigned).some((key) => !["version", "taskId", "workspaceRoot", "mode", "capturedAt", "fallback"].includes(key))
+    || integritySha256 !== createHash("sha256").update(JSON.stringify(unsigned)).digest("hex")) {
+    throw new Error("In-place continuation refused: persisted tool basis is malformed, foreign, or tampered.");
+  }
+  return { workspaceRoot: value.workspaceRoot, mode: "tool", capturedAt: value.capturedAt, ...(value.fallback ? { fallback: true } : {}) };
+}
+
 /** Serialize the launch baseline for durable retention (exact, self-hashed doc). */
 function serializeInPlaceBaseline(baseline: InPlaceBaseline, taskId: string): PersistedInPlaceBaselineDoc {
   const unsigned = {
@@ -56,6 +88,7 @@ function serializeInPlaceBaseline(baseline: InPlaceBaseline, taskId: string): Pe
     workspaceRoot: baseline.workspaceRoot,
     mode: baseline.mode,
     capturedAt: baseline.capturedAt,
+    ...(baseline.toolOnlyHistory ? { toolOnlyHistory: true } : {}),
     ...(baseline.gitHead ? { gitHead: baseline.gitHead } : {}),
     ...(baseline.gitRepositoryRoot ? { gitRepositoryRoot: baseline.gitRepositoryRoot } : {}),
     omissions: baseline.snapshot.omissions.map((omission) => ({
@@ -163,6 +196,7 @@ export async function loadInPlaceBaseline(taskId: string, artifactDir: string, w
     workspaceRoot: resolve(doc.workspaceRoot),
     mode: doc.mode,
     capturedAt: doc.capturedAt,
+    ...(doc.toolOnlyHistory ? { toolOnlyHistory: true } : {}),
     ...(doc.gitHead ? { gitHead: doc.gitHead } : {}),
     ...(doc.gitRepositoryRoot ? { gitRepositoryRoot: doc.gitRepositoryRoot } : {}),
     snapshot,

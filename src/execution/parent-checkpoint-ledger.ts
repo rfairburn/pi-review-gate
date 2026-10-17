@@ -35,6 +35,7 @@ import { advanceRawReviewCheckpoint, changedRawCheckpointPaths, releaseReviewChe
 import { reviewCheckpointDescriptorIdentity, type ExecutionAssociationsSnapshot } from "../session-state";
 import type { BackgroundFaultContext, BackgroundFaultHooks } from "./background-controller";
 import type { LandedReviewStatus } from "./force-merge-salvage";
+import { recordReviewEvidenceNote } from "../evidence";
 
 /** A session-sidecar save that also retired every unreferenced checkpoint owner.
  * Bare `true` means durable save only: the controller must retire its own old owners. */
@@ -156,6 +157,27 @@ export class ParentCheckpointLedger {
     // A landing into an explicitly selected foreign target therefore never
     // checkpoints the parent; same-directory targets keep current behavior.
     if (await realpath(sourceRoot) !== await realpath(env.cwd())) return;
+    if (taskBaseline.kind === "tool") {
+      // Tool bases have no filesystem checkpoint to selectively advance. Keep
+      // this bookkeeping method-aware without creating a snapshot, fabricating
+      // a tool observation, or changing capture/landing authority. Unreviewed
+      // landings requested for primary review remain explicit supplied context.
+      if (await realpath(taskBaseline.cwd) !== await realpath(sourceRoot)) throw new Error("Parent tool basis belongs to a different workspace.");
+      const window = env.state().reviewWindow;
+      if (window?.id === reviewWindowId && this.reviewLandedChangesEnabled()
+        && !landedReview?.reviewed && window.baseline?.kind === "tool") {
+        recordReviewEvidenceNote(window.evidence, `Isolated task ${faultContext.taskId ?? "unknown"} landed without established successful subtask review. Landed paths (landing bookkeeping, not observed tool actions or exact-snapshot certification): ${landedPaths.join(", ")}. ${landedReview?.detail ?? "Review status not supplied."}`);
+        window.evidence.requiresReview = true;
+        // A required landing assessment is not an unchanged response to prior
+        // feedback, even when the bounded tool ledger cannot append events.
+        // Preserve baseline/offset/causal metadata; fabricate no observations.
+        const active = window.activeExchange;
+        if (active && (active.reviewResponseMode === "observation" || active.reviewResponseMode === "deferred")) {
+          delete active.reviewResponseMode;
+        }
+      }
+      return;
+    }
     // #175: with the landed-change review policy on (and automatic primary
     // review on), an UNREVIEWED same-workspace landing keeps its diff in the
     // primary review window's ordinary evidence for the model's normal idle

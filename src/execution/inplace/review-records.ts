@@ -21,7 +21,7 @@ export interface InPlaceReviewCycleRecord {
   attribution: {
     workspaceRoot: string;
     baseline: {
-      mode: "git" | "non_git";
+      mode: "git" | "non_git" | "tool";
       gitHead?: string;
       capturedAt: string;
     };
@@ -29,6 +29,8 @@ export interface InPlaceReviewCycleRecord {
     /** SHA-256 of the content-anchored delta identity that was under review. */
     deltaIdentitySha256: string;
   };
+  evidenceMethod?: import("../../review-evidence").ReviewEvidenceMethod;
+  evidenceCoverageNotice?: string;
   aggregate: import("../../review-report").ReviewAggregateDisposition;
   summary: string;
   reviewers: import("../../review-report").ReviewCycleRecord["reviewers"];
@@ -68,6 +70,8 @@ export function buildInPlaceReviewCycleRecord(input: {
     toolObservationRevision: input.toolObservationRevision,
     completedAt: new Date().toISOString(),
     inPlace: true,
+    evidenceMethod: input.reviewOutput.evidenceMethod ?? input.attribution.evidenceMethod ?? "snapshot",
+    evidenceCoverageNotice: input.reviewOutput.evidenceCoverageNotice ?? input.attribution.evidenceCoverageNotice,
     attribution: {
       workspaceRoot: input.attribution.baseline.workspaceRoot,
       baseline: {

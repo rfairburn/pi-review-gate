@@ -1,4 +1,5 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -33,6 +34,8 @@ import {
   pinReviewCycleCandidate,
   reviewCycleAliasRefName,
   verifyReviewCycleIdentity,
+  verifyCandidateCommitIdentity,
+  waveLineageOf,
   type CandidateCommit,
   type WaveIdentityCapture,
 } from "./wave-commits";
@@ -55,12 +58,15 @@ import {
   captureObservedToolPathAfterStates,
   createEvidenceState,
   rememberFinalAssistantSummaryText,
+  recordReviewEvidenceNote,
   type EvidenceState,
 } from "../evidence";
-import type { ReviewWindow } from "../state";
+import type { ReviewWindow, ReviewBaseline } from "../state";
+import { ReviewEvidenceCaptureFailure, evidenceMethodNotice } from "../review-evidence";
 import {
   createState,
   setReviewWindowBaseline,
+  setReviewWindowCheckpointBaseline,
   recordReviewerFeedback,
   armReviewResponseExchange,
   type ReviewGateState,
@@ -131,6 +137,9 @@ export interface ReviewCycle {
   reviewOutput: ReviewRunOutput;
   /** Observed mutation-path tool-event revision reviewed in this cycle. */
   toolObservationRevision?: number;
+  /** Derived from canonical retained observations, never a workspace tree. */
+  toolReviewIdentity?: string;
+  externalObservationRevision?: number;
 }
 
 /** Result of running a complete wave worker lifecycle. */
@@ -302,6 +311,8 @@ export async function buildReviewTransmission(
     reviewerResults: reviewOutput.reviewerResults ?? [result],
     bundleDir,
     action,
+    evidenceMethod: reviewOutput.evidenceMethod,
+    evidenceCoverageNotice: reviewOutput.evidenceCoverageNotice,
   });
 }
 
@@ -310,11 +321,12 @@ export async function buildReviewTransmission(
  * definition, workspace disclosure, and the hard candidate workspace-validity
  * criterion for the reviewer (subtask review only).
  */
-function buildReviewRequest(task: WaveWorkerTask): string {
+function buildReviewRequest(task: WaveWorkerTask, toolOnly: boolean): string {
   const lines = [
     "Review the candidate changes against the following bounded task:",
     "",
     `Subtask: ${task.title}`,
+    "Review origin: isolated worktree worker (not Primary).",
     "",
     "Task instructions:",
     task.instructions,
@@ -340,19 +352,24 @@ function buildReviewRequest(task: WaveWorkerTask): string {
     "Git-ignored files are not present in this snapshot.",
     "",
     "Candidate workspace validity (hard criterion):",
-    "Read-only inspect the exact candidate patch supplied with this request, plus any worktree evidence available to you, for concrete merge/readiness defects in the candidate itself, including:",
+    "Durability invariant: a task without a verified candidate cannot be reviewed or landed; this is separate from the review evidence method.",
+    toolOnly
+      ? "Assess the retained observed-tool content/results and supplied claims/context, plus read-only worktree inspection as needed, for concrete merge/readiness defects. No exact candidate patch is supplied under this evidence method. In particular inspect evidence of:"
+      : "When the disclosed method is snapshot, read-only inspect the supplied exact candidate patch plus available worktree evidence. If acquisition instead selects tool-only-fallback, assess retained tool observations and claims/context, not an unavailable exact patch. Look for concrete merge/readiness defects, including:",
     "- Unwanted task-generated files inside the candidate (build output, logs, scratch or diagnostic files, session/auth fixtures, editor droppings).",
     "- Gitlinks (submodule entries), which the landing process does not support.",
     "- Secrets, credentials, or unrelated files introduced by the task.",
     "- Any other task-created residue that makes the candidate unsafe or unlandable.",
     "A verified concrete defect of this kind MUST be returned as needs_changes with a path-specific actionable reason for each affected path; such a candidate must never pass or be reduced to a non-blocking note.",
     "Do not reject the candidate for a harmless temp-like name that is part of the requested deliverable, for pre-existing untracked files outside the candidate, or for the absence of a full test-suite run alone.",
-    "This review always operates on a verified candidate commit and its exact patch; a task without a verified candidate cannot be reviewed, so never promise or request otherwise.",
+    toolOnly
+      ? "The candidate commit is verified for durability/landing identity only. This assessment is NOT exact-snapshot certification of that candidate or any later candidate; missing observations are not proof of no effects."
+      : "The candidate commit is verified independently for durability/landing. When the selected method is snapshot, assess its exact patch. If the method disclosure says tool-only-fallback, assess retained observations/claims instead: no exact-snapshot certification is possible under fallback.",
   );
   return lines.join("\n");
 }
 
-/** Run review on a candidate with exact Git patch data. */
+/** Review a verified candidate under its admission-pinned evidence method. */
 async function runCandidateReview(
   frozenConfig: ReviewGateConfig,
   task: WaveWorkerTask,
@@ -363,11 +380,13 @@ async function runCandidateReview(
   window: ReviewWindow,
   evidence: EvidenceState,
   worktreeRoot: string,
-  baseSnapshot: WorkspaceSnapshot,
+  artifactDir: string,
+  baseSnapshot: WorkspaceSnapshot | ReviewBaseline,
   maxPatchBytes: number,
   correctionAttemptCount: number,
   signal?: AbortSignal,
   onUpdate?: (message: string) => void,
+  onEvidenceWarning?: (message: string) => void,
 ): Promise<ReviewRunOutput> {
   // Verify the immutable cycle alias still pins the exact candidate identity
   // before generating the patch the reviewers will see.
@@ -378,36 +397,64 @@ async function runCandidateReview(
     candidate,
   );
 
-  // Build the exact patch from Git.
-  const patch = await buildCandidateReviewPatch(
-    capture.repositoryPath,
-    capture.baseCommit,
-    candidate.commitSha,
-    maxPatchBytes,
-  );
+  const policy = normalizeWorkerReviewEvidencePolicy(task.reviewEvidencePolicy, "worktree");
+  let exactChange: ExactChangeInput | undefined;
+  let evidenceCaptureFailure: ReviewEvidenceCaptureFailure | undefined;
+  if (!policy.toolOnly) {
+    try {
+      const patch = await buildCandidateReviewPatch(
+        capture.repositoryPath, capture.baseCommit, candidate.commitSha, maxPatchBytes,
+      );
+      exactChange = { changedPaths: patch.changedPaths, patch: patch.patch, truncated: patch.truncated, omitted: patch.omitted };
+    } catch (error) {
+      // Only a typed acquisition-stage refusal can reach the shared fallback
+      // hook. Never catch verification, construction, or the reviewer here.
+      signal?.throwIfAborted();
+      if (!(error instanceof ReviewEvidenceCaptureFailure)) throw error;
+      evidenceCaptureFailure = error;
+    }
+  }
 
-  const exactChange: ExactChangeInput = {
-    changedPaths: patch.changedPaths,
-    patch: patch.patch,
-    truncated: patch.truncated,
-    omitted: patch.omitted,
+  let fallbackDisclosed = false;
+  const assessmentSequence = window.nextReviewSequence;
+  const disclose = async (method: "tool-only" | "tool-only-fallback", coverageNotice?: string): Promise<void> => {
+    const notice = `WARNING: Isolated worktree task ${taskId}, assessment ${assessmentSequence}${method === "tool-only-fallback" ? ` at ${new Date().toISOString()}` : ""}: ${evidenceMethodNotice(method)}${coverageNotice ? ` ${coverageNotice}` : ""}`;
+    recordReviewEvidenceNote(evidence, notice);
+    await persistObservedToolEvidence(evidence, artifactDir);
+    if (method === "tool-only-fallback" && onEvidenceWarning) onEvidenceWarning(notice);
+    else onUpdate?.(notice);
   };
-
-  return runReview({
+  const output = await runReview({
     cwd: worktreeRoot,
-    request: buildReviewRequest(task),
+    request: buildReviewRequest(task, policy.toolOnly || evidenceCaptureFailure !== undefined),
     before: baseSnapshot,
     config: frozenConfig,
     evidence,
-    evidencePolicy: normalizeWorkerReviewEvidencePolicy(task.reviewEvidencePolicy, "worktree"),
+    evidencePolicy: policy,
+    evidenceCaptureFailure,
     changeIdentity: { baseCommit: capture.baseCommit, candidateCommit: candidate.commitSha },
     exactChange,
     window,
     correctionAttemptCount,
     signal,
-    notify: onUpdate,
+    notify: async (message) => {
+      // The shared acquisition hook emits this fixed method disclosure BEFORE
+      // invoking reviewers. Retain and deliver actual fallback even if bundle
+      // creation or a later reviewer then fails. No exception-text eligibility.
+      const fallbackNotice = evidenceMethodNotice("tool-only-fallback");
+      if (message.startsWith(fallbackNotice)) {
+        fallbackDisclosed = true;
+        await disclose("tool-only-fallback", message.slice(fallbackNotice.length).trim());
+      } else onUpdate?.(message);
+    },
     onUpdate,
   });
+  if (output.evidenceMethod === "tool-only") await disclose("tool-only", output.evidenceCoverageNotice);
+  if (output.evidenceMethod === "tool-only-fallback" && !fallbackDisclosed) await disclose("tool-only-fallback", output.evidenceCoverageNotice);
+  if (output.evidenceMethod && output.evidenceMethod !== "snapshot") {
+    output.evidenceCoverageNotice = `Origin: isolated worktree worker. ${output.evidenceCoverageNotice ?? "No exact-snapshot certification."}`;
+  }
+  return output;
 }
 
 /**
@@ -572,6 +619,30 @@ async function persistReviewCycleRecord(artifactDir: string, record: ReviewCycle
   }
 }
 
+// The canonical observations are the sole tool-review identity source. Do not
+// bind to full-root filesystem differences or invent a second observation
+// counter. Include unknown-scope revisions even when no path was extractable.
+function workerToolReviewIdentity(evidence: EvidenceState): string {
+  return createHash("sha256").update(JSON.stringify({
+    revision: evidence.toolObservationRevision ?? 0,
+    unknownScopeRevision: evidence.externalObservationRevision ?? 0,
+    truncated: evidence.toolObservationsTruncated === true,
+    candidates: [...evidence.candidates.values()]
+      .filter((candidate) => candidate.toolObserved || candidate.externalSideEffect)
+      .sort((a, b) => a.absolutePath.localeCompare(b.absolutePath))
+      .map((candidate) => ({
+        path: candidate.absolutePath,
+        after: candidate.afterSnapshot && {
+          exists: candidate.afterSnapshot.exists, sha256: candidate.afterSnapshot.sha256,
+          content: candidate.afterSnapshot.content, mode: candidate.afterSnapshot.mode,
+          entryType: candidate.afterSnapshot.entryType, linkTarget: candidate.afterSnapshot.linkTarget,
+          omittedReason: candidate.afterSnapshot.omittedReason,
+        },
+        error: candidate.afterError, truncated: candidate.afterContentTruncated === true,
+      })),
+  })).digest("hex");
+}
+
 // ── result writing ───────────────────────────────────────────────────────────
 
 /** Write result.json to the worker artifact root. */
@@ -624,7 +695,12 @@ async function writeResult(artifactDir: string, result: WaveWorkerLifecycleResul
         candidateRef: c.candidateRef,
         verdict: c.verdict,
         toolObservationRevision: c.toolObservationRevision,
+        toolReviewIdentity: c.toolReviewIdentity,
+        externalObservationRevision: c.externalObservationRevision,
+        evidenceMethod: c.reviewOutput.evidenceMethod,
+        evidenceCoverageNotice: c.reviewOutput.evidenceCoverageNotice,
       })),
+      evidenceMethod: result.reviewCycles.at(-1)?.reviewOutput.evidenceMethod,
       reviewReport: result.reviewReport,
       operationRecord: result.operationRecord,
       bundle: result.bundle,
@@ -658,6 +734,12 @@ async function appendEvidenceDisclosure(artifactDir: string, result: WaveWorkerL
       disclosures.push("Earlier method/fallback notices were omitted at the evidence bound.");
     }
     if (disclosures.length === 0) return;
+    // Keep origin-correct method/fallback warnings as standalone prominent
+    // lines, including in final outcomes consumed with quiet notifications.
+    const methodWarnings = notes.filter((note) => note.startsWith("WARNING: Isolated worktree"));
+    for (const warning of methodWarnings) {
+      if (!result.summary.includes(warning)) result.summary = `${result.summary}\n\n${warning}`;
+    }
     const disclosure = `Review evidence limitations: ${disclosures.join("; ")}`;
     if (!result.summary.includes(disclosure)) result.summary = `${result.summary}\n\n${disclosure}`;
   } catch {
@@ -695,15 +777,16 @@ function executionMetadata(result: WaveWorkerResult): Pick<
  * This function:
  * 1. Freezes/validates the subtask reviewer selection (no-op, unreviewed,
  *    when the automatic subtask-review toggle is off — issue #175).
- * 2. Snapshots the worker worktree at the wave base.
+ * 2. Establishes the selected review evidence basis at the wave base.
  * 3. Runs the initial executor turn via runWaveWorker.
- * 4. For a changed candidate with review enabled, builds its exact patch and calls runReview.
+ * 4. For a changed candidate with review enabled, verifies its identity and
+ *    calls runReview with either its exact patch or retained tool evidence.
  * 5. On needs_changes, resumes the same executor session via resumeWaveWorker with correction feedback.
  * 6. Honors maxCorrectionCycles and no-progress detection.
- * 7. On pass, transmits the pass for observation and resumes once; if the resulting tree is
- *    unchanged from the passed candidate tree, pins the exact passed commit under the immutable
- *    workers/<task-id> ref and accepts it. If the tree changed, the old pass is invalid and the
- *    new candidate must be reviewed.
+ * 7. On pass, transmits the actual evidence method and resumes once. New
+ *    reviewable evidence re-enters review. Otherwise pins the independently
+ *    verified landing candidate under workers/<task-id>; a tool-method pass
+ *    never certifies the candidate's exact tree.
  * 8. If subtask review is off, the gate is disabled, or no subtask reviewers
  *    resolve, pins the changed candidate and returns
  *    completed_unreviewed.
@@ -776,14 +859,20 @@ export async function runWaveWorkerLifecycle(
   // Ensure artifact dir exists after validation.
   await mkdir(resolvedArtifactDir, { recursive: true });
 
-  // ── 2. Snapshot worktree at wave base ──
-  const baseSnapshot = await createWorkspaceSnapshot(worktree.worktreeRoot, {
-    maxFileBytes: config.maxFileBytes,
-    maxSnapshotBytes: config.maxSnapshotBytes,
-    signal,
-  });
+  // Evidence policy is already pinned at admission. Direct tool-only omits
+  // this review-only full-root snapshot, not runWaveWorker's mandatory input
+  // construction, normalization, durable checkpoint, or landing verification.
+  const evidencePolicy = normalizeWorkerReviewEvidencePolicy(task.reviewEvidencePolicy, "worktree");
+  const baseSnapshot: WorkspaceSnapshot | Extract<ReviewBaseline, { kind: "tool" }> = evidencePolicy.toolOnly
+    ? { kind: "tool", cwd: worktree.worktreeRoot, capturedAt: new Date().toISOString() }
+    : await createWorkspaceSnapshot(worktree.worktreeRoot, {
+      maxFileBytes: config.maxFileBytes,
+      maxSnapshotBytes: config.maxSnapshotBytes,
+      signal,
+    });
   const { state: reviewState, window } = createWorkerReviewState();
-  setReviewWindowBaseline(reviewState, baseSnapshot);
+  if ("kind" in baseSnapshot) setReviewWindowCheckpointBaseline(reviewState, baseSnapshot);
+  else setReviewWindowBaseline(reviewState, baseSnapshot);
   if (input.initialResult) {
     await restoreObservedToolEvidence(window.evidence, resolvedArtifactDir, worktree.worktreeRoot, {
       required: input.task.reviewEvidencePolicy?.toolOnly === true
@@ -996,7 +1085,8 @@ export async function runWaveWorkerLifecycle(
     }
     effectiveAssignment = steeredResult.effectiveAssignment ?? effectiveAssignment;
     nextExecutorTurn = (steeredResult.lastExecutorTurn ?? nextExecutorTurn) + 1;
-    if (["executor_error", "timeout", "cancelled", "no_changes"].includes(steeredResult.status)) {
+    if (["executor_error", "timeout", "cancelled"].includes(steeredResult.status)
+      || (steeredResult.status === "no_changes" && !(evidencePolicy.toolOnly && window.evidence.requiresReview))) {
       const status: WaveWorkerLifecycleStatus = steeredResult.status === "executor_error"
         ? "executor_error"
         : steeredResult.status === "timeout"
@@ -1056,6 +1146,7 @@ export async function runWaveWorkerLifecycle(
   // prior attempt's create-once alias.
   let nextReviewCycleNumber = 1;
   let lastCandidateTreeSha: string | undefined;
+  let lastObservedIdentity: string | undefined;
   // Monotonic executor turn counter was initialized after the first turn and
   // includes any deferred-steering handoff completed before review.
 
@@ -1186,6 +1277,7 @@ export async function runWaveWorkerLifecycle(
           window,
           window.evidence,
           worktree.worktreeRoot,
+          resolvedArtifactDir,
           baseSnapshot,
           config.maxPatchBytes,
           correctionCount,
@@ -1196,6 +1288,10 @@ export async function runWaveWorkerLifecycle(
             artifactDir: resolvedArtifactDir,
             reviewCycle,
             reviewers: reviewerLabels,
+          }),
+          (message) => reportProgress(input, {
+            phase: "reviewing", message, artifactDir: resolvedArtifactDir, reviewCycle,
+            reviewEvidenceWarning: { scope: "worktree", method: "tool-only-fallback", message },
           }),
         ),
         resolvedArtifactDir,
@@ -1280,7 +1376,8 @@ export async function runWaveWorkerLifecycle(
       }
       effectiveAssignment = steeredResult.effectiveAssignment ?? effectiveAssignment;
       nextExecutorTurn = (steeredResult.lastExecutorTurn ?? nextExecutorTurn) + 1;
-      if (["executor_error", "timeout", "cancelled", "no_changes"].includes(steeredResult.status)) {
+      if (["executor_error", "timeout", "cancelled"].includes(steeredResult.status)
+        || (steeredResult.status === "no_changes" && !(evidencePolicy.toolOnly && window.evidence.requiresReview))) {
         const status: WaveWorkerLifecycleStatus = steeredResult.status === "no_changes"
           ? "correction_cap"
           : steeredResult.status === "executor_error"
@@ -1362,6 +1459,8 @@ export async function runWaveWorkerLifecycle(
       verdict,
       reviewOutput,
       toolObservationRevision: window.evidence.toolObservationRevision ?? 0,
+      externalObservationRevision: window.evidence.externalObservationRevision ?? 0,
+      ...(["tool-only", "tool-only-fallback"].includes(reviewOutput.evidenceMethod ?? "") ? { toolReviewIdentity: workerToolReviewIdentity(window.evidence) } : {}),
     };
     reviewCycles.push(cycle);
 
@@ -1440,14 +1539,18 @@ export async function runWaveWorkerLifecycle(
         return result;
       }
 
-      // Check no-progress: if the candidate tree is identical to the last one,
-      // the executor is not making progress.
-      if (lastCandidateTreeSha === currentCandidate.treeSha) {
+      // No-progress follows the actual reviewed basis. REPORT-only candidate
+      // changes are not progress under a tool-method review.
+      const observedIdentity = workerToolReviewIdentity(window.evidence);
+      const toolReview = reviewOutput.evidenceMethod === "tool-only" || reviewOutput.evidenceMethod === "tool-only-fallback";
+      if (toolReview ? lastObservedIdentity === observedIdentity : lastCandidateTreeSha === currentCandidate.treeSha) {
         const result: WaveWorkerLifecycleResult = {
           status: "correction_cap",
           taskId,
           title: task.title,
-          summary: "No progress: candidate tree unchanged after correction.",
+          summary: toolReview
+            ? "No progress: retained observed-tool evidence unchanged after correction."
+            : "No progress: candidate tree unchanged after correction.",
           adapter: currentResult.adapter,
           model: currentResult.model,
           error: "No progress detected.",
@@ -1458,6 +1561,7 @@ export async function runWaveWorkerLifecycle(
         return result;
       }
       lastCandidateTreeSha = currentCandidate.treeSha;
+      lastObservedIdentity = observedIdentity;
 
       // Build complete correction transmission and resume executor.
       const invocationDir = reviewOutput.invocationDir ?? join(resolvedArtifactDir, "invocations");
@@ -1587,7 +1691,7 @@ export async function runWaveWorkerLifecycle(
         return result;
       }
 
-      if (correctionResult.status === "no_changes") {
+      if (correctionResult.status === "no_changes" && !toolReview) {
         // The correction produced no changes relative to base — treat as no progress.
         const result: WaveWorkerLifecycleResult = {
           status: "correction_cap",
@@ -1615,6 +1719,8 @@ export async function runWaveWorkerLifecycle(
     // ── 6. Pass: transmit for observation, resume once ──
     const passedCommitSha = currentCandidate.commitSha;
     const passedTreeSha = currentCandidate.treeSha;
+    const passedToolIdentity = cycle.toolReviewIdentity;
+    const toolMethod = reviewOutput.evidenceMethod === "tool-only" || reviewOutput.evidenceMethod === "tool-only-fallback";
 
     reportProgress(input, {
       phase: "confirming",
@@ -1745,7 +1851,7 @@ export async function runWaveWorkerLifecycle(
       return result;
     }
 
-    if (confirmResult.status === "no_changes") {
+    if (confirmResult.status === "no_changes" && !toolMethod) {
       // Confirmation reverted all changes — return no_changes without pinning.
       const result: WaveWorkerLifecycleResult = {
         status: "no_changes",
@@ -1764,8 +1870,11 @@ export async function runWaveWorkerLifecycle(
     rememberFinalAssistantSummaryText(window.evidence, confirmResult.summary);
     const confirmCandidate = confirmResult.candidate!;
 
-    // If the confirmation tree is unchanged from the passed candidate tree, accept.
-    if (confirmCandidate.treeSha === passedTreeSha) {
+    // Snapshot verdicts certify a tree. Tool-method verdicts certify only
+    // the retained observed identity, independently of the normalized landing
+    // candidate. REPORT-only changes must not cause repeated reviews; new
+    // same-path edits or unknown-scope observations must.
+    if (toolMethod ? workerToolReviewIdentity(window.evidence) === passedToolIdentity : confirmCandidate.treeSha === passedTreeSha) {
       // The pass is tied to the exact immutable cycle candidate/tree: the
       // cycle alias must still pin the passed commit before acceptance.
       const passedCycle = reviewCycles[reviewCycles.length - 1];
@@ -1804,22 +1913,51 @@ export async function runWaveWorkerLifecycle(
         await writeResult(resolvedArtifactDir, result);
         return result;
       }
-      // Restore the clean worker HEAD/index to the exact passed candidate before pinning.
-      await gitResetHard(worktree.worktreeRoot, passedCommitSha);
-      const workerRef = await pinCommit(capture, passedCommitSha, { type: "worker", taskId }, signal);
-      const acceptedWithWarnings = hasPartialReviewerFailure(reviewOutput.reviewerResults);
+      // A tool verdict is never promoted to exact-snapshot approval of a
+      // newer tree. Independently verify the actual normalized candidate and
+      // its durable ref before restoring/pinning the landing identity.
+      const acceptedCandidate = toolMethod ? confirmCandidate : currentCandidate;
+      let workerRef: string;
+      try {
+        await verifyCandidateCommitIdentity(capture.repositoryPath, {
+          commitSha: acceptedCandidate.commitSha, treeSha: acceptedCandidate.treeSha,
+          baseCommit: capture.baseCommit, lineage: waveLineageOf(capture), taskId,
+        });
+        const durableSha = (await execFileAsync("git", ["rev-parse", "--verify", acceptedCandidate.candidateRef], {
+          cwd: capture.repositoryPath, env: { ...process.env, ...GIT_ENV }, timeout: 30_000,
+        })).stdout.trim();
+        if (durableSha !== acceptedCandidate.commitSha) throw new Error("Confirmation candidate durable ref identity mismatch.");
+        signal?.throwIfAborted();
+        await gitResetHard(worktree.worktreeRoot, acceptedCandidate.commitSha);
+        workerRef = await pinCommit(capture, acceptedCandidate.commitSha, { type: "worker", taskId }, signal);
+      } catch (error) {
+        // Finalization failures never activate fallback or accept a candidate.
+        // Publish the blocking outcome with any earlier actual-use warnings.
+        const result: WaveWorkerLifecycleResult = {
+          status: signal?.aborted ? "cancelled" : "review_error", taskId, title: task.title,
+          summary: "Landing candidate identity/finalization refused.", adapter: confirmResult.adapter,
+          model: confirmResult.model, error: error instanceof Error ? error.message : "candidate finalization failed",
+          reviewCycles, artifactDir: resolvedArtifactDir,
+        };
+        await writeResult(resolvedArtifactDir, result);
+        return result;
+      }
+      const partialReviewerFailure = hasPartialReviewerFailure(reviewOutput.reviewerResults);
+      const acceptedWithWarnings = partialReviewerFailure || reviewOutput.evidenceMethod === "tool-only-fallback";
       const result: WaveWorkerLifecycleResult = {
         status: acceptedWithWarnings ? "accepted_with_warnings" : "accepted",
         taskId,
         title: task.title,
-        summary: acceptedWithWarnings
-          ? "Review passed and confirmed unchanged, with reviewer infrastructure warnings."
-          : "Review passed and confirmed unchanged.",
+        summary: toolMethod
+          ? `Review passed on retained observed-tool evidence and confirmed no new observed changes. The independently verified landing candidate is not exact-snapshot certified.${partialReviewerFailure ? " Reviewer infrastructure warnings remain in the full review report." : ""}`
+          : acceptedWithWarnings
+            ? "Review passed and confirmed unchanged, with reviewer infrastructure warnings."
+            : "Review passed and confirmed unchanged.",
         adapter: confirmResult.adapter,
         model: confirmResult.model,
         usage: confirmResult.usage,
         acceptedRef: workerRef,
-        acceptedCommitSha: passedCommitSha,
+        acceptedCommitSha: acceptedCandidate.commitSha,
         reviewCycles,
         artifactDir: resolvedArtifactDir,
       };
@@ -1827,7 +1965,17 @@ export async function runWaveWorkerLifecycle(
       return result;
     }
 
-    // Tree changed — the old pass is invalid. Review the new candidate.
+    // The selected review identity changed. A bounded ledger can retain no
+    // new exchange events even though canonical revisions prove new unknown
+    // scope. This is an actual new assessment, not an unchanged pass response.
+    // Keep its causal review metadata and all retained evidence; do not invent
+    // an event or change candidate verification to force the shared gate.
+    const activeExchange = window.activeExchange;
+    if (toolMethod && activeExchange
+      && (activeExchange.reviewResponseMode === "observation" || activeExchange.reviewResponseMode === "deferred")
+      && window.evidence.events.length === activeExchange.evidenceEventStart) {
+      delete activeExchange.reviewResponseMode;
+    }
     currentResult = confirmResult;
     currentCandidate = confirmCandidate;
     lastCandidateTreeSha = undefined; // reset no-progress tracking

@@ -45,19 +45,25 @@ const IDLE_EXECUTOR = (marker: string) => [
 
 /**
  * A research-eligible codex-cli app-server stand-in (no real Codex, provider,
- * or network): it accepts one turn, never completes it on its own, and
- * settles the turn as interrupted only when asked through turn/interrupt.
+ * or network): it accepts one turn and settles it only on turn/interrupt.
+ * Cooperate with immediate terminal teardown: exit only after observing
+ * SIGTERM AND flushing both native frames, regardless of their ordering.
+ * A finite watchdog also bounds partial setup / missing-interrupt failures.
  */
 const RESEARCH_APP_SERVER = [
   "#!/usr/bin/env node",
   "const readline=require('node:readline');let threadId='thread-'+process.pid,turn=0;",
-  "const send=value=>process.stdout.write(JSON.stringify(value)+'\\n');",
+  "let signaled=false,flushed=0;const finish=()=>{if(signaled&&flushed===2)process.exit(0);};",
+  "process.on('SIGTERM',()=>{signaled=true;finish();});",
+  "setTimeout(()=>process.exit(93),12000);",
+  "const send=(value,callback)=>process.stdout.write(JSON.stringify(value)+'\\n',callback);",
+  "const didFlush=error=>{if(error)throw error;flushed++;finish();};",
   "readline.createInterface({input:process.stdin}).on('line',line=>{const request=JSON.parse(line);",
   "if(request.method==='initialize')return send({jsonrpc:'2.0',id:request.id,result:{userAgent:'test-codex'}});",
   "if(request.id===undefined)return;",
   "if(request.method==='thread/start'||request.method==='thread/resume'){threadId=request.params.threadId||threadId;return send({jsonrpc:'2.0',id:request.id,result:{thread:{id:threadId}}});}",
   "if(request.method==='turn/start')return send({jsonrpc:'2.0',id:request.id,result:{turn:{id:'turn-'+(++turn)}}});",
-  "if(request.method==='turn/interrupt'){send({jsonrpc:'2.0',id:request.id,result:{}});return send({jsonrpc:'2.0',method:'turn/completed',params:{threadId,turn:{id:request.params.turnId,status:'interrupted',items:[]}}});}",
+  "if(request.method==='turn/interrupt'){send({jsonrpc:'2.0',id:request.id,result:{}},didFlush);return send({jsonrpc:'2.0',method:'turn/completed',params:{threadId,turn:{id:request.params.turnId,status:'interrupted',items:[]}}},didFlush);}",
   "send({jsonrpc:'2.0',id:request.id,result:{}});",
   "});",
 ];
@@ -505,7 +511,7 @@ test("#191 research /subtask-interrupt: rejected merges stop nothing, a queued f
   const settled = h.feedback().at(-1);
   const stopped = assertUserFeedback(settled, { taskId: active!, executionId, kind: "research", mode: "interrupt_as_failure" });
   assert.match(stopped, /Stop: acknowledged\./);
-  assert.match(stopped, /Recorded interrupt activity: .*Codex app-server acknowledged turn interruption\./, "the actual transport stop is reported");
+  assert.match(stopped, /Recorded interrupt activity: .*Codex app-server acknowledged turn interruption and its owned child closed\./, "the native acknowledgement and actual child closure are reported");
   assert.match(stopped, /Current task state: interrupted\. Authoritative outcome: Research worker was interrupted; its private workspace was not landed\./);
   assert.doesNotMatch(stopped, /Merge:/);
   assert.equal(settled!.message.details?.stop, "acknowledged");
@@ -530,7 +536,7 @@ test("#191 model SubtasksInterrupt on research keeps its model origin for a reje
   const text = stopped.content[0].text as string;
   assert.ok(text.includes(`origin: model SubtasksInterrupt call; task ${taskId}; mode interrupt_as_failure):`));
   assert.match(text, /Stop: acknowledged\./);
-  assert.match(text, /Codex app-server acknowledged turn interruption/);
+  assert.match(text, /Codex app-server acknowledged turn interruption and its owned child closed\./);
   for (const result of [rejectedText, text]) assert.doesNotMatch(result, /interrupted by user|User intent|human \/subtask-interrupt/);
   assert.equal(h.feedback().length, 0, "no human-command feedback for a model action");
   assert.equal(h.controller.inspect(executionId, taskId).tasks[0]?.state, "interrupted");

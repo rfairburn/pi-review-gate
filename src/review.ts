@@ -369,7 +369,7 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
     onUpdate: input.onUpdate,
   });
   if (invocation.aborted) {
-    return abortedReviewOutput(changes, bundle.dir);
+    return abortedReviewOutput(changes, bundle.dir, invocation.result);
   }
 
     // A completed pass owns the frozen after-baseline. Handoff invariant:
@@ -576,7 +576,7 @@ async function runAskReviewerSettled(input: AskReviewerInput, collected: Current
   if (invocation.aborted) {
     return {
       changes,
-      result: abortedResult(),
+      result: invocation.result,
       reviewerDisplayLabels: displayLabels,
       bundleDir: bundle.dir,
       bundleRetained: false,
@@ -620,7 +620,7 @@ async function executeReviewerInvocation(input: {
   notify?: (message: string) => void | Promise<void>;
   onUpdate?: (message: string) => void;
 }): Promise<
-  | { aborted: true; bundleRetained: false }
+  | { aborted: true; result: ReviewResult; bundleRetained: false }
   | { aborted: false; result: ReviewResult; reviewerResults: ReviewResult[]; bundleRetained: boolean }
 > {
   const verb = input.kind === "review" ? "reviewing changes with" : "asking reviewers";
@@ -659,6 +659,7 @@ async function executeReviewerInvocation(input: {
   }));
   const stagedResults = stagedReviewers.map((reviewer) => reviewer.result);
   if (reviewWasAborted(input.signal, stagedResults)) {
+    const result = abortedResult(stagedResults);
     await cleanupStagedReviewers(stagedReviewers);
     await recordCanceledInvocation(
       input.bundle.invocationDir,
@@ -667,8 +668,9 @@ async function executeReviewerInvocation(input: {
       input.reviewSequence,
       input.kind,
       input.signal,
+      result,
     );
-    return { aborted: true, bundleRetained: false };
+    return { aborted: true, result, bundleRetained: false };
   }
   // Unresolvable selections are aggregated with the staged results so every
   // configured reviewer has an explicit bounded outcome in the pass.
@@ -692,13 +694,16 @@ async function executeReviewerInvocation(input: {
       summary: "Reviewer results could not be published atomically.",
       findings: [],
       error: "artifact_publication_failed",
-      diagnostic: message,
+      diagnostic: [message, reviewerDiagnostics(stagedResults)].filter(Boolean).join("\n"),
+      processSettlement: aggregateProcessSettlement(stagedResults),
     };
     if (input.window) input.window.retainBundleAfterClose = true;
     return { aborted: false, result: publicationFailure, reviewerResults: [publicationFailure], bundleRetained: true };
   }
 
   const result = decideReviewResults(reviewerResults);
+  result.processSettlement = aggregateProcessSettlement(stagedResults);
+  if (reviewerResults.length > 1) result.diagnostic = reviewerDiagnostics(reviewerResults);
   const telemetryPublications = await Promise.allSettled([
     writeFile(join(input.bundle.invocationDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
     writeFile(join(input.bundle.invocationDir, "review-telemetry.json"), JSON.stringify({
@@ -776,6 +781,7 @@ async function runSingleReviewer(input: {
       summary: error instanceof Error ? error.message : "Reviewer failed.",
       findings: [],
       error: error instanceof Error ? error.message : "review_failed",
+      diagnostic: error instanceof Error ? error.message : "Reviewer failed before settlement could be confirmed.",
     };
   }
   const durationMs = Date.now() - startedAt;
@@ -790,10 +796,10 @@ async function runSingleReviewer(input: {
   if (result.rawOutputPath) {
     result.rawOutputPath = join(finalReviewerDir, basename(result.rawOutputPath));
   }
-  // Review passes are fresh, so runtime session history is neither needed for
-  // continuation nor valid evidence for this or later reviewers.
-  await rm(join(reviewerDir, "session"), { recursive: true, force: true });
   try {
+    // Review passes are fresh, so runtime session history is neither needed for
+    // continuation nor valid evidence for this or later reviewers.
+    await rm(join(reviewerDir, "session"), { recursive: true, force: true });
     await Promise.all([
       writeFile(join(reviewerDir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8"),
       writeFile(join(reviewerDir, "reviewer-usage.json"), JSON.stringify(result.usage ?? null, null, 2), "utf8"),
@@ -809,13 +815,15 @@ async function runSingleReviewer(input: {
       }, null, 2), "utf8"),
     ]);
   } catch (error) {
+    artifactError = error instanceof Error ? error.message : "artifact write failed";
     result = {
+      ...result,
       reviewerId: input.reviewer.id,
       verdict: "error",
       summary: "Reviewer artifacts could not be written completely.",
       findings: [],
       error: "artifact_write_failed",
-      diagnostic: artifactError,
+      diagnostic: [result.diagnostic, artifactError].filter(Boolean).join("\n"),
       telemetry: result.telemetry,
     };
     await writeFile(join(reviewerDir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8").catch(() => undefined);
@@ -957,6 +965,7 @@ async function recordCanceledInvocation(
   reviewSequence: number,
   kind: "review" | "reviewer question",
   signal: AbortSignal | undefined,
+  result: ReviewResult,
 ): Promise<void> {
   await rm(invocationDir, { recursive: true, force: true });
   await mkdir(invocationDir, { recursive: true });
@@ -973,6 +982,8 @@ async function recordCanceledInvocation(
       canceledAt,
       canceledBy,
       summary,
+      processSettlement: result.processSettlement,
+      diagnostic: result.diagnostic,
     }, null, 2), "utf8"),
   ]);
   if (window) {
@@ -983,21 +994,34 @@ async function recordCanceledInvocation(
   }
 }
 
-function abortedResult(): ReviewResult {
+function aggregateProcessSettlement(results: ReviewResult[]): ReviewResult["processSettlement"] {
+  // Missing evidence is not success; a confirmed sibling cannot mask an
+  // adapter that threw before reporting its process settlement.
+  return results.every((result) => result.processSettlement === "confirmed") ? "confirmed" : "unconfirmed";
+}
+
+function reviewerDiagnostics(results: ReviewResult[]): string | undefined {
+  return results.filter((result) => result.diagnostic)
+    .map((result) => `${result.reviewerId}: ${result.diagnostic}`).join("\n") || undefined;
+}
+
+function abortedResult(results: ReviewResult[]): ReviewResult {
   return {
     reviewerId: "gate",
     verdict: "error",
     summary: "Review aborted.",
     findings: [],
     error: "aborted",
+    processSettlement: aggregateProcessSettlement(results),
+    diagnostic: reviewerDiagnostics(results),
   };
 }
 
-function abortedReviewOutput(changes: ChangedFile[], bundleDir: string): ReviewRunOutput {
+function abortedReviewOutput(changes: ChangedFile[], bundleDir: string, result: ReviewResult): ReviewRunOutput {
   return {
     changed: true,
     changes,
-    result: abortedResult(),
+    result,
     bundleDir,
     bundleRetained: false,
   };

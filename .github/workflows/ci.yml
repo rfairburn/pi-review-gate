@@ -296,7 +296,9 @@ jobs:
         # orchestration through a mocked bounded query child. Same step on purpose:
         # this native evidence must still be collected when an earlier case in the
         # step fails. Every existing case and failure status is unchanged.
-        run: node --test dist-test/tests/pi-child-launch.test.js dist-test/tests/pi-child-teardown.test.js dist-test/tests/pi-settlement-lineage-diagnostics.test.js
+        # #397: exercise real reviewer cancellation settlement and unknown
+        # invocation exceptions through production review/command registrations.
+        run: node --test dist-test/tests/pi-child-launch.test.js dist-test/tests/pi-child-teardown.test.js dist-test/tests/pi-settlement-lineage-diagnostics.test.js dist-test/tests/review-cancellation-settlement.test.js dist-test/tests/review-cancellation-unknown.test.js
       # Issue #335 follow-up: fixed-size native compaction lineage sampling.
       # Manual dispatch ONLY — the step is inert for pull_request and push, so it
       # never changes what the required Windows launcher check proves. It exists

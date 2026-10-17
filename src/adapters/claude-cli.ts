@@ -81,12 +81,16 @@ export class ClaudeCliAdapter implements ModelAdapter {
       return {
         ...reviewerErrorResult(req.id, parsed.error, artifacts.rawOutput, "claude_error", usage),
         telemetry: processTelemetry(output),
+        processSettlement: output.processSettlement,
+        diagnostic: output.terminationError,
       };
     }
 
     const result = parseReviewResult(req.id, parsed.text, artifacts.rawOutput);
     result.usage = usage;
     result.telemetry = processTelemetry(output);
+    result.processSettlement = output.processSettlement;
+    result.diagnostic = output.terminationError;
     return result;
   }
 }

@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.173]
+
+### Fixed
+
+- Review cancellation (#397): automatic reviews, `/review-now`, and reviewer questions
+  now report stopped reviewer processes only with positive process-settlement evidence.
+  Bounded teardown without confirmed cleanup explicitly reports termination unconfirmed;
+  an uncertain reviewer cannot be masked by a settled sibling. Cancellation results and
+  tombstones retain termination diagnostics, but discard partial verdicts as before.
+  Cancellation authority, teardown deadlines, baseline preservation, and popup Escape
+  ownership are unchanged.
+
 ## [0.1.0-dev.172]
 
 ### Fixed

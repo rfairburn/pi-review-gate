@@ -31,6 +31,8 @@ export class GenericCliAdapter implements ModelAdapter {
     if (failure) return failure;
     const result = parseReviewResult(req.id, output.stdout, artifacts.rawOutput);
     result.telemetry = processTelemetry(output);
+    result.processSettlement = output.processSettlement;
+    result.diagnostic = output.terminationError;
     return result;
   }
 }

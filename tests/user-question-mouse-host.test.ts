@@ -868,11 +868,22 @@ test("native fullscreen dispatch: scrolled long notices run Close and More detai
   assertOthersUntouched(harness, before, [firstId], "Close");
   assert.ok(onScreen(harness, "Pending input (2)"), `the list returned:\n${harness.frame().join("\n")}`);
 
-  // Narrow and shorten the terminal, then scroll the second notice by keyboard.
+  // Narrow and shorten the terminal. The list keeps its (clamped) offset and
+  // reveals its selection, q1, so the second notice row starts below the
+  // shortened body: scroll the list by keyboard, then click that row.
   harness.terminal.resize(48, 12);
   await harness.draw();
+  assert.ok(onScreen(harness, "> q1: Keep me pending?") && !onScreen(harness, `${secondId}: Beta notice`),
+    `the shortened list body shows only its selection:\n${harness.frame().join("\n")}`);
+  await scrollPopupUntil(harness, SHIFT_ALT_DOWN, () => onScreen(harness, `${secondId}: Beta notice`));
+  assert.ok(onScreen(harness, "Shift+Alt+Up/Down"), "the fixed hint stays drawn below the scrolled list");
   await harness.click(harness.cell(`${secondId}: Beta notice`));
-  assert.ok(onScreen(harness, "Beta body line 01."), `the second notice opened after the resize:\n${harness.frame().join("\n")}`);
+  // The shortened notice opens at its beginning: the title row, with its body
+  // and actions below the two-row body area above the fixed hint.
+  assert.ok(onScreen(harness, `${secondId}: Beta notice`) && !onScreen(harness, "More details"),
+    `the second notice opened at its beginning after the resize:\n${harness.frame().join("\n")}`);
+  await scrollPopupUntil(harness, SHIFT_ALT_DOWN, () => onScreen(harness, "Beta body line 01."));
+  assert.ok(!onScreen(harness, `${secondId}: Beta notice`), "keyboard scrolling moved the title offscreen");
   await scrollPopupUntil(harness, SHIFT_ALT_DOWN, () => onScreen(harness, "More details"));
   const narrowRules = popupRules(harness);
   assert.ok(harness.frame().every((row) => row.length <= 48), "the frame fits the narrowed terminal");
@@ -914,13 +925,19 @@ test("native fullscreen dispatch: after a resize and re-scroll, the visible type
   assert.ok(onScreen(harness, "1. option-1") && !onScreen(harness, "Decline"), `the answer view overflows:\n${harness.frame().join("\n")}`);
   await scrollPopupUntil(harness, SHIFT_ALT_DOWN, () => onScreen(harness, "Decline"));
   const preResizeDecline = harness.cell("Decline");
+  const firstChoiceRow = (): string | undefined => /\d+\. option-\d+/.exec(harness.frame().find((row) => /\d+\. option-\d+/.test(row)) ?? "")?.[0];
+  const firstBeforeResize = firstChoiceRow();
+  assert.ok(firstBeforeResize && firstBeforeResize !== "1. option-1", "the scrolled body starts at a later choice");
 
-  // Narrow/shorten: the viewport refocuses on the keyboard selection, so the
-  // old Decline cell no longer draws Decline; a gesture there never declines.
+  // Narrow/shorten: the viewport keeps its scroll position (#413 clamps it to
+  // the new bounds and does not re-reveal the non-editing answer selection),
+  // so the shorter body ends above Decline and the old Decline cell no longer
+  // draws Decline; a gesture there never declines.
   harness.terminal.resize(56, 12);
   await harness.draw();
-  assert.ok(!onScreen(harness, "Decline") && onScreen(harness, "1. option-1"),
-    `the resized viewport refocused the first choice:\n${harness.frame().join("\n")}`);
+  assert.ok(!onScreen(harness, "Decline") && !onScreen(harness, "1. option-1"),
+    `the resized viewport kept its offset instead of revealing the selection:\n${harness.frame().join("\n")}`);
+  assert.equal(firstChoiceRow(), firstBeforeResize, "the first visible body row is unchanged by the resize");
   const resizedRules = popupRules(harness);
   assert.ok(preResizeDecline.y >= resizedRules.top && preResizeDecline.y <= resizedRules.bottom,
     "the old Decline cell is still inside the resized popup");
@@ -953,7 +970,10 @@ test("native fullscreen dispatch: after a resize and re-scroll, the visible type
   await settle();
   assert.deepEqual(harness.sent.map((entry) => entry.message), [`Answer to pending question "Which option?": ${visibleChoice[2]}`]);
   assertOthersUntouched(harness, before, [targetId], "choice while editing");
-  assert.ok(onScreen(harness, "Pending input (2)"), `the list returned:\n${harness.frame().join("\n")}`);
+  // The shortened list reveals its selection, the next question, below the
+  // offscreen header.
+  assert.ok(onScreen(harness, `> ${declineId}: Decline this one?`) && !onScreen(harness, "Which option?"),
+    `the list returned:\n${harness.frame().join("\n")}`);
 
   // The second question in the resized viewport: scrolled Decline declines it alone.
   await harness.click(harness.cell(`${declineId}: Decline this one?`));
@@ -970,6 +990,66 @@ test("native fullscreen dispatch: after a resize and re-scroll, the visible type
   harness.terminal.input(ESCAPE);
   await closed;
   assert.equal(harness.chatDraft.text, "chat draft", "the displaced chat draft is restored after close");
+  assert.deepEqual(harness.backgroundEvents, [], "no popup pointer event reached the background transcript");
+  assert.equal(harness.screen.hasActiveSelection(), false);
+  assert.equal(harness.extensionListenerInput.filter((data) => data.startsWith("\x1b[<")).length, 0);
+});
+
+test("native fullscreen dispatch: fixed hint rows stay inert, and tiny unpadded or unruled budgets click their body row", async (t) => {
+  const harness = await createHarness(t);
+  if (!harness) return;
+  harness.terminal.resize(80, 16);
+  const firstId = registerQuestion(harness, "Hint question?", ["alpha", "beta"]);
+  const secondId = registerQuestion(harness, "Tiny question?", ["gamma", "delta"]);
+  const thirdId = registerQuestion(harness, "Tinier question?", ["epsilon", "zeta"]);
+  const before = pendingSnapshot(harness);
+  const { closed } = await harness.open();
+  await harness.click(harness.cell(`${firstId}: Hint question?`));
+  assert.ok(onScreen(harness, "1. alpha"), `the answer view opened:\n${harness.frame().join("\n")}`);
+
+  // Every row of the fixed keyboard hint area below the body is inert.
+  const { top, bottom } = popupRules(harness);
+  const hintStart = harness.cell("arrows select").y;
+  const hintRows = harness.frame().flatMap((row, index) => (index >= hintStart - 1 && index < bottom ? [index] : []));
+  assert.ok(hintRows.length >= 2 && hintStart > top, `the fixed hint is drawn below the body:\n${harness.frame().join("\n")}`);
+  await assertInertClicks(harness, hintRows.map((y) => [`hint-area row ${y}`, { x: 4, y }] as [string, { x: number; y: number }]));
+  assertOthersUntouched(harness, before, [], "hint clicks");
+
+  // A 5-row terminal leaves a 3-row budget: rule, one body row, rule.
+  harness.terminal.input(ESCAPE);
+  await harness.draw();
+  harness.terminal.resize(80, 5);
+  await harness.draw();
+  await scrollPopupUntil(harness, SHIFT_ALT_DOWN, () => onScreen(harness, `${secondId}: Tiny question?`));
+  await harness.click(harness.cell(`${secondId}: Tiny question?`));
+  await scrollPopupUntil(harness, SHIFT_ALT_DOWN, () => onScreen(harness, "2. delta"));
+  const ruled = popupRules(harness);
+  assert.equal(ruled.bottom - ruled.top, 2, `one body row between the rules:\n${harness.frame().join("\n")}`);
+  await assertInertClicks(harness, [["top rule", { x: 4, y: ruled.top }], ["bottom rule", { x: 4, y: ruled.bottom }]]);
+  await harness.click(harness.cell("2. delta"));
+  await settle();
+  assert.deepEqual(harness.sent.map((entry) => entry.message), [`Answer to pending question "Tiny question?": delta`]);
+  assertOthersUntouched(harness, before, [secondId], "3-row budget");
+
+  // A 4-row terminal leaves a 2-row budget: the rules give way; one body row
+  // above the one-row compact hint.
+  harness.terminal.resize(80, 4);
+  await harness.draw();
+  await scrollPopupUntil(harness, SHIFT_ALT_DOWN, () => onScreen(harness, `${thirdId}: Tinier question?`));
+  await harness.click(harness.cell(`${thirdId}: Tinier question?`));
+  await scrollPopupUntil(harness, SHIFT_ALT_DOWN, () => onScreen(harness, "2. zeta"));
+  assert.ok(!harness.frame().some((row) => /^─+$/.test(row)), `no rules remain:\n${harness.frame().join("\n")}`);
+  const zeta = harness.cell("2. zeta");
+  const compactHint = harness.cell("Shift+Alt+Up/Down");
+  assert.equal(compactHint.y, zeta.y + 1, "the compact hint is fixed directly below the body row");
+  await assertInertClicks(harness, [["compact hint", compactHint]]);
+  await harness.click(zeta);
+  await settle();
+  assert.equal(harness.sent.at(-1)?.message, `Answer to pending question "Tinier question?": zeta`);
+  assertOthersUntouched(harness, before, [secondId, thirdId], "2-row budget");
+
+  harness.terminal.input(ESCAPE);
+  await closed;
   assert.deepEqual(harness.backgroundEvents, [], "no popup pointer event reached the background transcript");
   assert.equal(harness.screen.hasActiveSelection(), false);
   assert.equal(harness.extensionListenerInput.filter((data) => data.startsWith("\x1b[<")).length, 0);

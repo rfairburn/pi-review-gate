@@ -454,11 +454,21 @@ test("the shared custom overlay pages native Markdown within its responsive publ
       "resize keeps the manual viewport within the same public overlay maxHeight");
     const scrollFrames: string[][] = [resizedRows];
     for (let index = 0; index < 100; index += 1) {
-      noticeView.handleInput("\x1b[6~"); // PageDown advances one content row in the shared custom component.
+      noticeView.handleInput("\x1b[6~"); // PageDown advances one body row in the shared custom component.
       scrollFrames.push(noticeView.render(terminalColumns));
     }
+    // The keyboard hint is laid out in a fixed area below the scrolled body
+    // (#413); drop it from each frame so successive body rows join directly.
+    const noticeHint = "arrows select · Enter choose · Shift+Alt+Up/Down or Ctrl+Alt+PageUp/PageDown scroll · Esc back";
+    const scrolledBodyRows = (frame: readonly string[]): string[] => {
+      const rows = popupInteriorRows(frame, terminalColumns);
+      let end = rows.length;
+      while (end > 0 && noticeHint.includes(rows[end - 1]!.trim())) end -= 1;
+      assert.ok(end < rows.length, "every short-viewport frame keeps the fixed keyboard hint visible");
+      return rows.slice(0, end);
+    };
     const projectedText = scrollFrames
-      .flatMap((frame) => popupInteriorRows(frame, terminalColumns))
+      .flatMap(scrolledBodyRows)
       .map((row) => row.startsWith("native:") ? row.slice("native:".length) : row)
       .join(" "); // Join visual wrap continuations after removing only the fixture's native-render marker.
     const completeView = projectedText;

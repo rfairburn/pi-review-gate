@@ -13,6 +13,18 @@
  *   normal next turn whose model context actually contains the delivered answer →
  *   orderly Ctrl+C-twice host exit with a genuine session_shutdown.
  *
+ * A second scenario (#413) pins Pi's fullscreen renderer in the same owned
+ * session shape and drives the existing scroll keys through the PTY: the
+ * popup keeps its compact, content-sized frame over the live transcript
+ * (short lists and notices use only their natural rows, long content is
+ * capped one row inside the terminal, and new transcript output stays
+ * visible around an open popup); a long notice and a long question open at
+ * their beginning, body/context/choices/actions scroll together by exact
+ * line counts under a fixed hint, both bounds are contained, Up/Down select
+ * and reveal without submitting, the draft survives scrolling, resize keeps
+ * and clamps the offset, keyboard scrolling never moves the transcript, and
+ * after close/reopen the answer routing behaves normally.
+ *
  * No bypass, no fabricated events, no skip: every prerequisite that cannot
  * be satisfied hard-fails under PI_REVIEW_GATE_REQUIRE_PI_HOST=1 (skipOrFail),
  * and every wait is event-driven (PTY output, broker status, fs.watch on the
@@ -695,13 +707,20 @@ class FrameWatch {
     this.signal.notify();
   }
 
+  /** Resolves with the exact fresh frame text that satisfied the predicate. */
   async waitFor(
     predicate: (text: string) => boolean,
     timeoutMs: number,
     description: string,
     afterRevision = this.revision,
-  ): Promise<void> {
-    await this.signal.waitFor(() => this.revision > afterRevision && predicate(this.text), timeoutMs, description);
+  ): Promise<string> {
+    let matched = "";
+    await this.signal.waitFor(() => {
+      if (this.revision <= afterRevision || !predicate(this.text)) return false;
+      matched = this.text;
+      return true;
+    }, timeoutMs, description);
+    return matched;
   }
 }
 
@@ -772,19 +791,31 @@ const QUESTION_POPUP_BLANK_ROW = " ".repeat(QUESTION_POPUP_COLUMNS);
  * used as a substitute for the visible popup bounds.
  */
 function nativeQuestionPopupLines(frame: string): string[] {
+  return locateNativeQuestionPopup(frame)?.lines ?? [];
+}
+
+/**
+ * The located popup frame: terminal rows of its top and bottom rules plus the
+ * padded interior (one side-padding cell removed per side). The vertical
+ * inset is checked against the frame's actual terminal row count, so a
+ * resized owned PTY is matched by its live geometry.
+ */
+function locateNativeQuestionPopup(frame: string): { top: number; bottom: number; lines: string[] } | undefined {
   const terminalLines = frame.split("\n").map((line) =>
     line.slice(QUESTION_POPUP_START_COLUMN, QUESTION_POPUP_START_COLUMN + QUESTION_POPUP_COLUMNS));
+  const terminalRows = terminalLines.length;
+  const maxRows = Math.max(1, terminalRows - 2 * QUESTION_POPUP_VERTICAL_MARGIN);
   for (let top = QUESTION_POPUP_VERTICAL_MARGIN; top < terminalLines.length; top += 1) {
     if (terminalLines[top] !== QUESTION_POPUP_RULE || terminalLines[top + 1] !== QUESTION_POPUP_BLANK_ROW) continue;
     const bottom = terminalLines.findIndex((line, index) => index > top && line === QUESTION_POPUP_RULE);
-    if (bottom <= top || bottom - top + 1 > QUESTION_POPUP_MAX_ROWS
-      || bottom >= PTY_ROWS - QUESTION_POPUP_VERTICAL_MARGIN) continue;
+    if (bottom <= top || bottom - top + 1 > maxRows
+      || bottom >= terminalRows - QUESTION_POPUP_VERTICAL_MARGIN) continue;
     const contentRows = terminalLines.slice(top + 1, bottom);
     if (contentRows.length < 3 || contentRows.at(-1) !== QUESTION_POPUP_BLANK_ROW
       || !contentRows.every((line) => line.startsWith(" ") && line.endsWith(" "))) continue;
-    return contentRows.map((line) => line.slice(1, -1));
+    return { top, bottom, lines: contentRows.map((line) => line.slice(1, -1)) };
   }
-  return [];
+  return undefined;
 }
 
 function popupContains(frame: string, needle: string): boolean {
@@ -1443,3 +1474,562 @@ function createWorkspace(root: string, name: string): string {
   mkdirSync(path, { recursive: true, mode: 0o700 });
   return path;
 }
+
+// --- Fullscreen compact shared-popup keyboard scenario (#413) ---
+//
+// The same owned native Pi session shape as above, with Pi's alternate-screen
+// fullscreen renderer pinned through the synthetic profile's own Pi
+// settings.json (`tuiMode`). Every key below is written to the real PTY, so
+// Pi's own stdin parser, overlay compositing, and focus dispatch decide where
+// it goes — no synthetic ctx.ui or component callback is involved. Popup
+// scrolling is keyboard-only (the popup never handles wheel input; its
+// fullscreen item clicks are covered by user-question-mouse-host), so this
+// scenario sends no mouse reports.
+
+const KEY_UP = "\x1b[A";
+const KEY_ESCAPE = "\x1b";
+const KEY_SHIFT_ALT_UP = "\x1b[1;4A";
+const KEY_SHIFT_ALT_DOWN = "\x1b[1;4B";
+const POPUP_RESIZED_ROWS = 30;
+const POPUP_SCROLL_HINT = "Shift+Alt+Up/Down or Ctrl+Alt+PageUp/PageDown scroll";
+const POPUP_LIST_HINT = `arrows select · Enter open question/notice · ${POPUP_SCROLL_HINT} · Esc defer and close`;
+const POPUP_NOTICE_LIST_HINT = `arrows select · Enter open notice · ${POPUP_SCROLL_HINT} · Esc defer and close`;
+const POPUP_NOTICE_HINT = `arrows select · Enter choose · ${POPUP_SCROLL_HINT} · Esc back`;
+const POPUP_ANSWER_HINT = `arrows select · Enter confirm · ${POPUP_SCROLL_HINT} · Esc back`;
+const POPUP_EDITING_HINT = "Enter submit · Esc back to options to scroll";
+const POPUP_PROMPT = "Please register the fullscreen popup notices and question.";
+const POPUP_NOTICE_TITLE = "Fullscreen popup notice";
+const POPUP_NOTICE_HEADING = "Popup notice heading";
+const POPUP_NOTICE_BULLET = "The heading and this bullet render through native Markdown.";
+const POPUP_NOTICE_END = "POPUP_NOTICE_BODY_END_413";
+const POPUP_NOTICE_CONTEXT = "POPUP_NOTICE_CONTEXT_413: the context scrolls together with the body.";
+const POPUP_NOTICE_BODY = [
+  `# ${POPUP_NOTICE_HEADING}`,
+  "",
+  `- ${POPUP_NOTICE_BULLET}`,
+  "",
+  ...Array.from({ length: 56 }, (_, index) =>
+    `- Popup checkpoint ${String(index + 1).padStart(2, "0")}: the complete notice stays reachable.`),
+  "",
+  POPUP_NOTICE_END,
+].join("\n");
+const POPUP_SHORT_NOTICE_TITLE = "Short popup notice";
+const POPUP_SHORT_NOTICE_BODY = "One short popup notice row.";
+const POPUP_QUESTION_HEADING = "Popup question heading";
+const POPUP_QUESTION_LAST_STEP = "Step 30.";
+const POPUP_QUESTION_TEXT = [
+  `# ${POPUP_QUESTION_HEADING}`,
+  "",
+  Array.from({ length: 30 }, (_, index) => `Step ${String(index + 1).padStart(2, "0")}.`).join("\n\n"),
+].join("\n");
+const POPUP_CHOICE_A = "Alpha lane";
+const POPUP_CHOICE_B = "Beta lane";
+const POPUP_DECLINE = "Decline (no answer will be sent)";
+const POPUP_TRANSCRIPT_ROWS = 90;
+const POPUP_TRANSCRIPT = Array.from({ length: POPUP_TRANSCRIPT_ROWS }, (_, index) =>
+  `- Transcript filler row ${String(index + 1).padStart(2, "0")}`).join("\n");
+/**
+ * The real gate's own agent_end notice for this profile (enabled, no active
+ * reviewer). It is the last transcript entry of the first run: Pi emits
+ * agent_settled only after that handler sent it, but renders it in a later
+ * frame, appending rows below the filler while the view follows the end.
+ */
+const POPUP_SETTLED_GATE_NOTICE = "review gate: automatic review deferred because no configured reviewer";
+/** Pi's fullscreen indicator, drawn only while the primary view is scrolled away from its end. */
+const POPUP_JUMP_TO_LATEST = "Jump to latest message";
+
+interface FixedHintPopupView {
+  /** Terminal rows of the located top and bottom rules. */
+  top: number;
+  bottom: number;
+  /** Scrolled body rows between the top padding row and the hint separator. */
+  body: string[];
+  /** Terminal row of the fixed keyboard hint's first line. */
+  hintRow: number;
+}
+
+/**
+ * The located popup split into its scrolled body and its fixed hint area:
+ * [top padding, ...body, blank separator, hint, bottom padding]. Undefined
+ * unless that exact hint sits in the fixed area below the body.
+ */
+function fixedHintPopupView(frame: string, hint: string): FixedHintPopupView | undefined {
+  const popup = locateNativeQuestionPopup(frame);
+  if (!popup) return undefined;
+  const collapse = (text: string): string => text.replace(/\s+/gu, " ").trim();
+  // The hint may wrap over a few fixed rows; it ends above the bottom padding.
+  for (let hintRows = 1; hintRows <= 3; hintRows += 1) {
+    const hintIndex = popup.lines.length - 1 - hintRows;
+    if (hintIndex < 2) break;
+    if (collapse(popup.lines.slice(hintIndex, hintIndex + hintRows).join(" ")) !== hint) continue;
+    if (popup.lines[hintIndex - 1]!.trim() !== "") continue;
+    return { top: popup.top, bottom: popup.bottom, body: popup.lines.slice(1, hintIndex - 1), hintRow: popup.top + 1 + hintIndex };
+  }
+  return undefined;
+}
+
+/** Exact viewport movement: positive lines scrolled toward the end. */
+function bodyShiftedBy(before: readonly string[], after: readonly string[], lines: number): boolean {
+  const count = Math.abs(lines);
+  if (count === 0 || before.length !== after.length || count >= before.length) return false;
+  const kept = lines > 0 ? before.slice(count) : before.slice(0, before.length - count);
+  const moved = lines > 0 ? after.slice(0, after.length - count) : after.slice(count);
+  return kept.every((line, index) => line === moved[index]) && after.join("\n") !== before.join("\n");
+}
+
+/**
+ * The compact popup leaves Pi's own native rows visible around it: some
+ * non-blank row above its top rule and some below its bottom rule (the
+ * pre-#413 appearance), never an opaque blank surface filling the viewport.
+ */
+function nativeRowsAroundFrame(frame: string, view: { top: number; bottom: number }): boolean {
+  const rows = frame.split("\n");
+  return rows.slice(0, view.top).some((row) => row.trim() !== "")
+    && rows.slice(view.bottom + 1).some((row) => row.trim() !== "");
+}
+
+/** Natural compact height: rules, padding rows, body, separator, and a one-row hint. */
+function naturalPopupHeight(view: FixedHintPopupView, bodyRows: number): boolean {
+  return view.body.length === bodyRows && view.bottom - view.top + 1 === 2 + 2 + bodyRows + 1 + 1;
+}
+
+function transcriptFillerRows(frame: string): number[] {
+  return [...frame.matchAll(/Transcript filler row (\d\d)/gu)].map((match) => Number(match[1]));
+}
+
+/**
+ * Transcript scroll position: terminal row of a visible filler line minus its
+ * number. Every visible filler line must agree. Undefined when no filler row
+ * is visible.
+ */
+function transcriptOffset(frame: string): number | undefined {
+  const offsets = new Set<number>();
+  frame.split("\n").forEach((row, index) => {
+    const match = /Transcript filler row (\d\d)/u.exec(row);
+    if (match) offsets.add(index - Number(match[1]));
+  });
+  return offsets.size === 1 ? [...offsets][0] : undefined;
+}
+
+/**
+ * The first run's transcript is completely rendered and Pi still follows its
+ * end: the last filler row is visible, the gate's settled notice sits below
+ * it, and no jump-to-latest indicator is drawn.
+ */
+function transcriptSettledAtEnd(frame: string): boolean {
+  const rows = frame.split("\n");
+  const lastFiller = rows.findIndex((row) => row.includes(`Transcript filler row ${POPUP_TRANSCRIPT_ROWS}`));
+  return lastFiller >= 0 && transcriptOffset(frame) !== undefined
+    && rows.some((row, index) => index > lastFiller && row.includes(POPUP_SETTLED_GATE_NOTICE))
+    && !frameContains(frame, POPUP_JUMP_TO_LATEST);
+}
+
+function bodyContains(view: FixedHintPopupView | undefined, needle: string): boolean {
+  return view !== undefined && frameContains(view.body.join("\n"), needle);
+}
+
+function selectedBodyRow(view: FixedHintPopupView | undefined, needle: string): boolean {
+  return view !== undefined && view.body.some((line) => line.trimStart().startsWith("> ") && line.includes(needle));
+}
+
+test("native Pi fullscreen: the compact shared popup scrolls by keyboard over the live transcript through the real PTY, across resize, close, and reopen", { timeout: TEST_TIMEOUT_MS }, async (t) => {
+  const prerequisites = staticPrerequisites(t);
+  if (!prerequisites) return;
+  let ptyModule: NativePtyModule;
+  let surfaceModule: TerminalSurfaceModule;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
+    ptyModule = require("@lydell/node-pty") as NativePtyModule;
+    // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
+    surfaceModule = require("../src/session-host/terminal-surface") as TerminalSurfaceModule;
+  } catch {
+    skipOrFail(t, "the pinned real native PTY binding or production TerminalSurface could not be loaded");
+    return;
+  }
+
+  const root = makeSyntheticRoot();
+  let owner: QuestionOwner | undefined;
+  let profile: PreparedProfile | undefined;
+  let registration: StatusRegistration | undefined;
+  let broker: StatusBroker | undefined;
+  t.after(async () => disposeQuestionResources({ root, owner, profile, registration, broker }));
+
+  initializeSyntheticDirectories(root);
+  assertBrokerSocketPathBudget(root);
+  // Delivered answers quote the question bounded to 200 characters (the
+  // controller's existing DELIVERY_QUESTION_BOUND); the long question is cut.
+  assert.ok(POPUP_QUESTION_TEXT.length > 200, "the long question exceeds the delivered-answer quote bound");
+  const expectedAnswer = `Answer to pending question "${POPUP_QUESTION_TEXT.slice(0, 199)}…": ${POPUP_CHOICE_B}`;
+  assert.ok(expectedAnswer.length < 400, "the complete delivered answer fits the faux provider's exact request preview");
+  const pi = resolvePiExecutable(prerequisites, root, t);
+  if (!pi) return;
+  const candidate = stageCandidate(root, prerequisites);
+  const registry = new ProfileRegistry({ stateRoot: join(root, "profile-state") });
+  profile = registry.prepare({ workspace: createWorkspace(root, "popup-workspace") });
+  writeFileSync(join(profile.agentDir, "review-gate.json"), JSON.stringify({
+    enabled: true,
+    review: { activeReviewers: [] },
+    externalAgents: {},
+    execution: { deferredPiTools: false, workerResources: {}, routes: { execute: [], research: [] } },
+  }, undefined, 2), { mode: 0o600 });
+  // Pin Pi's own fullscreen renderer for this owned profile.
+  writeFileSync(join(profile.agentDir, "settings.json"), JSON.stringify({ tuiMode: "fullscreen" }, undefined, 2), { mode: 0o600 });
+
+  const observerDir = join(root, "observer");
+  const observerFile = join(observerDir, "popup.jsonl");
+  const observerExtension = join(observerDir, "popup-observer.cjs");
+  writeFileSync(observerExtension, observerExtensionSource(), { mode: 0o600 });
+  const stateDir = join(root, "fixture-state");
+  const providerJournalFile = join(stateDir, "provider-journal.jsonl");
+  writeFileSync(join(stateDir, "turn-script.json"), JSON.stringify({
+    steps: [
+      { toolCalls: [{
+        toolName: "YouShouldKnow",
+        arguments: { title: POPUP_NOTICE_TITLE, body: POPUP_NOTICE_BODY, context: POPUP_NOTICE_CONTEXT },
+      }] },
+      { toolCalls: [{
+        toolName: "AskUserQuestion",
+        arguments: { question: POPUP_QUESTION_TEXT, choices: [POPUP_CHOICE_A, POPUP_CHOICE_B], mode: "async" },
+      }] },
+      { toolCalls: [{
+        toolName: "YouShouldKnow",
+        arguments: { title: POPUP_SHORT_NOTICE_TITLE, body: POPUP_SHORT_NOTICE_BODY },
+      }] },
+      // A long reply fills the transcript underneath the popup.
+      { text: POPUP_TRANSCRIPT },
+      { echoLastUser: ECHO_PREFIX },
+    ],
+  }), { mode: 0o600 });
+
+  const descriptor = prepareNativeLaunch({
+    packageRoot: candidate.packageRoot,
+    agentDir: profile.agentDir,
+    workspace: profile.workspace,
+    piExecutable: pi.file,
+    args: makeArgs(observerExtension, providerFixturePath()),
+    env: {
+      ...makeSyntheticEnvironment(root, candidate.nodePath),
+      PRG_FIXTURE_AGENT_DIR: prerequisites.installedAgentDir,
+      PRG_FIXTURE_STATE_DIR: stateDir,
+      PRG_NATIVE_QUESTION_OBSERVER_FILE: observerFile,
+    },
+  });
+  assert.deepEqual(Object.keys(descriptor.env).filter((name) => /(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|PASSWORD)/iu.test(name)), [],
+    "the synthetic native environment carries no external credentials");
+  broker = await createStatusBroker({ socketRoot: join(root, "broker") });
+  const id = randomUUID();
+  const statuses = new StatusJournal();
+  registration = broker.register(id, { onStatus: (status) => statuses.push(status), onDisconnect: () => undefined });
+  const live = await createQuestionOwner(ptyModule, surfaceModule, (spawned) => { owner = spawned; }, {
+    id,
+    observerFile,
+    providerJournalFile,
+    descriptor,
+    registration,
+    statuses,
+  });
+  owner = live;
+
+  const observerSignal = new ChangeSignal();
+  const providerSignal = new ChangeSignal();
+  const closeObserverWatch = watchOwnedFile(observerDir, "popup.jsonl", observerSignal);
+  const closeProviderWatch = watchOwnedFile(stateDir, "provider-journal.jsonl", providerSignal);
+  const modelRequests = (): number => journalRecords(providerJournalFile).filter((record) => record.event === "model_request").length;
+  const agentStarts = (): number => countRecords(observerFile, "agent_start");
+
+  /** Bounded diagnostics from the owned synthetic frame: fixture text only. */
+  const frameDiagnostics = (description: string, error: unknown): Error => {
+    const rows = live.frames.text.split("\n").map((line, index) => `${String(index).padStart(2, "0")}|${line.trimEnd()}`);
+    return new Error(`${description}: no matching native frame (transcript rows ${transcriptFillerRows(live.frames.text).join(",")}).\n`
+      + `Last native frame:\n${rows.join("\n")}`, { cause: error });
+  };
+  /** Write real PTY input (or resize) and wait for the first fresh frame satisfying the predicate. */
+  const act = async (
+    input: string | readonly string[] | (() => void),
+    predicate: (frame: string) => boolean,
+    description: string,
+  ): Promise<string> => {
+    const before = live.frames.revision;
+    if (typeof input === "function") input();
+    else for (const chunk of typeof input === "string" ? [input] : input) live.pty!.write(chunk);
+    try {
+      return await live.frames.waitFor(predicate, EVENT_TIMEOUT_MS, description, before);
+    } catch (error) {
+      throw frameDiagnostics(description, error);
+    }
+  };
+  const repeat = (key: string, count: number): string[] => Array.from({ length: count }, () => key);
+
+  try {
+    await statuses.waitFor((status) => status.type === "status", EVENT_TIMEOUT_MS, "authenticated native status");
+    await observerSignal.waitFor(() => countRecords(observerFile, "session_start") > 0, EVENT_TIMEOUT_MS, "native session_start");
+    const sessionStart = journalRecords(observerFile).find((record) => record.type === "session_start");
+    assert.equal(sessionStart?.mode, "tui", "the scenario drives an actual interactive native TUI session");
+    const activeTools = sessionStart?.activeTools as string[] | undefined;
+    assert.ok(activeTools?.includes("AskUserQuestion") && activeTools.includes("YouShouldKnow"),
+      "the real gate admits both shared-popup tools");
+    await providerSignal.waitFor(
+      () => journalRecords(providerJournalFile).some((record) => record.event === "auto_model_selected"),
+      EVENT_TIMEOUT_MS,
+      "scripted faux model auto-selection",
+    );
+
+    const beforePrompt = live.frames.revision;
+    live.pty!.write(POPUP_PROMPT);
+    await live.frames.waitFor((frame) => frameContains(frame, POPUP_PROMPT), EVENT_TIMEOUT_MS, "prompt visible as an editor draft", beforePrompt);
+    live.pty!.write(KEY_ENTER);
+    await observerSignal.waitFor(() => countRecords(observerFile, "agent_settled") >= 1, EVENT_TIMEOUT_MS, "first native agent run settled");
+    for (const toolName of ["YouShouldKnow", "AskUserQuestion"]) {
+      assert.ok(journalRecords(observerFile).some((record) => record.type === "tool_execution_end"
+        && record.toolName === toolName && record.isError === false), `${toolName} executed without error`);
+    }
+    const panelLine = process.platform === "darwin" ? "Pending input · Press Ctrl+Option+Up" : "Pending input · Press Ctrl+Alt+Up";
+    const shortcutLabel = process.platform === "darwin" ? "Ctrl+Option+Up" : "Ctrl+Alt+Up";
+    // A frame showing the panel and filler row 90 can still predate the
+    // settled run: the gate's agent_end notice renders afterwards and, while
+    // Pi follows the end, moves the transcript up by the notice's rows. Take
+    // the baseline only from the frame proving that final entry is drawn.
+    let settledFrame: string;
+    try {
+      settledFrame = await live.frames.waitFor((frame) => frameContains(frame, panelLine) && transcriptSettledAtEnd(frame),
+        EVENT_TIMEOUT_MS, "pending panel and the settled end of the long transcript are visible", beforePrompt);
+    } catch (error) {
+      throw frameDiagnostics("pending panel and the settled end of the long transcript are visible", error);
+    }
+    const requestsBeforePopup = modelRequests();
+    assert.equal(requestsBeforePopup, 4, "two notices, the question, and the transcript reply are the only scripted requests so far");
+    const transcriptBeforePopup = transcriptOffset(settledFrame);
+    assert.notEqual(transcriptBeforePopup, undefined, "the long transcript is visible before the popup opens");
+
+    // --- Shared list over the visible native transcript ---
+    let frame = await act(KEY_CTRL_ALT_UP, (next) => {
+      const view = fixedHintPopupView(next, POPUP_LIST_HINT);
+      return view !== undefined && bodyContains(view, "Pending input (3)") && selectedBodyRow(view, `n1: ${POPUP_NOTICE_TITLE}`)
+        && bodyContains(view, "q1:") && nativeRowsAroundFrame(next, view);
+    }, "the shared list opens with native rows visible around it");
+    let view = fixedHintPopupView(frame, POPUP_LIST_HINT)!;
+    assert.ok(view.top >= QUESTION_POPUP_VERTICAL_MARGIN && view.bottom <= PTY_ROWS - 1 - QUESTION_POPUP_VERTICAL_MARGIN,
+      "the list stays within its one-row vertical margins");
+
+    // --- Notice: capped one row inside the terminal; opens at its beginning ---
+    frame = await act(KEY_ENTER, (next) => {
+      const nextView = fixedHintPopupView(next, POPUP_NOTICE_HINT);
+      return nextView !== undefined && nextView.top === QUESTION_POPUP_VERTICAL_MARGIN
+        && nextView.bottom === PTY_ROWS - 1 - QUESTION_POPUP_VERTICAL_MARGIN
+        && nextView.body[0]!.trim() === `n1: ${POPUP_NOTICE_TITLE}` && bodyContains(nextView, POPUP_NOTICE_BULLET)
+        && nativeRowsAroundFrame(next, nextView);
+    }, "the long notice opens at its beginning, capped inside the one-row margins with native rows around it");
+    view = fixedHintPopupView(frame, POPUP_NOTICE_HINT)!;
+    const noticeHintRow = view.hintRow;
+    assert.ok(view.body.some((line) => line.includes(POPUP_NOTICE_HEADING) && !line.trimStart().startsWith("#")),
+      "the notice heading renders through native Markdown, not as raw source");
+    assert.equal(bodyContains(view, "Native Markdown unavailable"), false, "the installed host renders native Markdown");
+    assert.equal(bodyContains(view, "More details") || bodyContains(view, POPUP_NOTICE_CONTEXT), false,
+      "context and actions are below the first page: they scroll with the body instead of being fixed");
+
+    let previous = view.body;
+    frame = await act(repeat(KEY_SHIFT_ALT_DOWN, 3), (next) => {
+      const nextView = fixedHintPopupView(next, POPUP_NOTICE_HINT);
+      return nextView !== undefined && nextView.hintRow === noticeHintRow && bodyShiftedBy(previous, nextView.body, 3);
+    }, "three Shift+Alt+Down presses move the notice exactly three lines with the hint fixed");
+    previous = fixedHintPopupView(frame, POPUP_NOTICE_HINT)!.body;
+    frame = await act(KEY_SHIFT_ALT_DOWN, (next) => {
+      const nextView = fixedHintPopupView(next, POPUP_NOTICE_HINT);
+      return nextView !== undefined && nextView.hintRow === noticeHintRow && bodyShiftedBy(previous, nextView.body, 1);
+    }, "Shift+Alt+Down moves the same viewport exactly one line (middle of the body)");
+
+    // Keyboard scrolling reaches the end: complete context and both actions.
+    frame = await act(repeat(KEY_SHIFT_ALT_DOWN, 200), (next) => {
+      const nextView = fixedHintPopupView(next, POPUP_NOTICE_HINT);
+      return nextView !== undefined && nextView.body.at(-1)!.includes("Close") && bodyContains(nextView, "More details")
+        && bodyContains(nextView, POPUP_NOTICE_CONTEXT) && bodyContains(nextView, POPUP_NOTICE_END);
+    }, "keyboard scrolling reaches the end of the notice: body end, context, and both actions");
+    view = fixedHintPopupView(frame, POPUP_NOTICE_HINT)!;
+    assert.ok(selectedBodyRow(view, "More details"), "scrolling leaves the default More details action selected");
+    assert.equal(view.hintRow, noticeHintRow, "the hint stays in its fixed row at the end");
+    const noticeEnd = view.body;
+    // Containment at the end: extra input must not overshoot.
+    frame = await act([KEY_SHIFT_ALT_DOWN, KEY_SHIFT_ALT_DOWN, KEY_SHIFT_ALT_UP], (next) => {
+      const nextView = fixedHintPopupView(next, POPUP_NOTICE_HINT);
+      return nextView !== undefined && bodyShiftedBy(noticeEnd, nextView.body, -1);
+    }, "input past the end bound is contained: one Shift+Alt+Up lands exactly one line above the end");
+
+    // Back to the beginning; the start bound is contained the same way.
+    frame = await act(repeat(KEY_SHIFT_ALT_UP, 200), (next) => {
+      const nextView = fixedHintPopupView(next, POPUP_NOTICE_HINT);
+      return nextView !== undefined && nextView.body[0]!.trim() === `n1: ${POPUP_NOTICE_TITLE}`;
+    }, "Shift+Alt+Up returns to the notice beginning");
+    const noticeStart = fixedHintPopupView(frame, POPUP_NOTICE_HINT)!.body;
+    frame = await act([KEY_SHIFT_ALT_UP, KEY_SHIFT_ALT_UP, KEY_SHIFT_ALT_DOWN], (next) => {
+      const nextView = fixedHintPopupView(next, POPUP_NOTICE_HINT);
+      return nextView !== undefined && bodyShiftedBy(noticeStart, nextView.body, 1);
+    }, "input past the start bound is contained: one Shift+Alt+Down lands exactly one line below the start");
+    // Up at the first action still reveals the selected action; Down moves and reveals.
+    frame = await act(KEY_UP, (next) => selectedBodyRow(fixedHintPopupView(next, POPUP_NOTICE_HINT), "More details"),
+      "Up at the first action brings the selected More details action into view");
+    frame = await act(KEY_DOWN, (next) => selectedBodyRow(fixedHintPopupView(next, POPUP_NOTICE_HINT), "Close"),
+      "Down selects and reveals Close");
+    assert.equal(modelRequests(), requestsBeforePopup, "notice scrolling and selection sent nothing to the model");
+
+    // --- Question: opens at its beginning; choices scroll with the question ---
+    frame = await act(KEY_ESCAPE, (next) => selectedBodyRow(fixedHintPopupView(next, POPUP_LIST_HINT), `n1: ${POPUP_NOTICE_TITLE}`),
+      "Escape returns to the list without dismissing the notice");
+    frame = await act(KEY_DOWN, (next) => selectedBodyRow(fixedHintPopupView(next, POPUP_LIST_HINT), "q1:"), "the list selects the question");
+    frame = await act(KEY_ENTER, (next) => {
+      const nextView = fixedHintPopupView(next, POPUP_ANSWER_HINT);
+      return nextView !== undefined && nextView.body[0]!.trim() === "q1:" && bodyContains(nextView, POPUP_QUESTION_HEADING)
+        && nativeRowsAroundFrame(next, nextView);
+    }, "the long question opens at its beginning");
+    view = fixedHintPopupView(frame, POPUP_ANSWER_HINT)!;
+    const answerHintRow = view.hintRow;
+    assert.equal(answerHintRow, noticeHintRow, "question and notice share the same fixed hint row");
+    assert.ok(view.body.some((line) => line.includes(POPUP_QUESTION_HEADING) && !line.trimStart().startsWith("#")),
+      "the question heading renders through native Markdown");
+    assert.equal(bodyContains(view, `1. ${POPUP_CHOICE_A}`) || bodyContains(view, POPUP_DECLINE), false,
+      "opening does not jump past the long question to the first choice");
+
+    previous = view.body;
+    frame = await act(repeat(KEY_SHIFT_ALT_DOWN, 2), (next) => {
+      const nextView = fixedHintPopupView(next, POPUP_ANSWER_HINT);
+      return nextView !== undefined && nextView.hintRow === answerHintRow && bodyShiftedBy(previous, nextView.body, 2);
+    }, "two Shift+Alt+Down presses scroll the question exactly two lines with the hint fixed");
+    frame = await act(repeat(KEY_SHIFT_ALT_DOWN, 200), (next) => {
+      const nextView = fixedHintPopupView(next, POPUP_ANSWER_HINT);
+      return nextView !== undefined && nextView.body.at(-1)!.includes(POPUP_DECLINE)
+        && bodyContains(nextView, POPUP_QUESTION_LAST_STEP) && selectedBodyRow(nextView, `1. ${POPUP_CHOICE_A}`)
+        && bodyContains(nextView, "Type something…");
+    }, "keyboard scrolling reaches the choices, Type something…, and Decline; the first choice stays selected");
+    const answerEnd = fixedHintPopupView(frame, POPUP_ANSWER_HINT)!.body;
+    frame = await act([KEY_SHIFT_ALT_DOWN, KEY_SHIFT_ALT_UP], (next) => {
+      const nextView = fixedHintPopupView(next, POPUP_ANSWER_HINT);
+      return nextView !== undefined && bodyShiftedBy(answerEnd, nextView.body, -1);
+    }, "the question's end bound is contained");
+    frame = await act(repeat(KEY_SHIFT_ALT_UP, 200), (next) =>
+      fixedHintPopupView(next, POPUP_ANSWER_HINT)?.body[0]!.trim() === "q1:", "Shift+Alt+Up returns to the question beginning");
+    frame = await act(KEY_DOWN, (next) => {
+      const nextView = fixedHintPopupView(next, POPUP_ANSWER_HINT);
+      return selectedBodyRow(nextView, `2. ${POPUP_CHOICE_B}`) && nextView!.hintRow === answerHintRow;
+    }, "Down from the beginning selects and reveals the second choice");
+    frame = await act(KEY_DOWN, (next) => selectedBodyRow(fixedHintPopupView(next, POPUP_ANSWER_HINT), "Type something…"),
+      "Down selects Type something…");
+
+    // --- Editing: the draft survives keyboard scrolling outside the field ---
+    frame = await act(KEY_ENTER, (next) => fixedHintPopupView(next, POPUP_EDITING_HINT) !== undefined,
+      "the native field edits with the hint naming the Esc exception for the scroll keys");
+    frame = await act("kbd draft", (next) => bodyContains(fixedHintPopupView(next, POPUP_EDITING_HINT), "kbd draft"),
+      "typed text reaches the real native field");
+    frame = await act(KEY_ESCAPE, (next) => selectedBodyRow(fixedHintPopupView(next, POPUP_ANSWER_HINT), "Type something…"),
+      "Escape leaves editing and restores the option hint");
+    frame = await act(repeat(KEY_SHIFT_ALT_UP, 200), (next) =>
+      fixedHintPopupView(next, POPUP_ANSWER_HINT)?.body[0]!.trim() === "q1:", "after Esc the scroll keys page back to the question");
+    frame = await act(KEY_ENTER, (next) => {
+      const nextView = fixedHintPopupView(next, POPUP_EDITING_HINT);
+      return nextView !== undefined && bodyContains(nextView, "kbd draft") && nextView.body[0]!.trim() !== "q1:";
+    }, "editing again brings the unchanged draft and cursor back into view");
+    frame = await act(KEY_ESCAPE, (next) => selectedBodyRow(fixedHintPopupView(next, POPUP_ANSWER_HINT), "Type something…"),
+      "Escape leaves editing again");
+    assert.equal(modelRequests(), requestsBeforePopup, "scrolling and editing submitted nothing");
+    assert.equal(agentStarts(), 1, "no scroll, selection, or editing input started an agent run");
+
+    // --- Resize: bounds follow the live terminal; content stays reachable ---
+    previous = fixedHintPopupView(frame, POPUP_ANSWER_HINT)!.body;
+    const firstBeforeResize = previous[0];
+    frame = await act(() => {
+      live.surface.resize(PTY_COLS, POPUP_RESIZED_ROWS);
+      live.pty!.resize(PTY_COLS, POPUP_RESIZED_ROWS);
+    }, (next) => {
+      const nextView = fixedHintPopupView(next, POPUP_ANSWER_HINT);
+      return next.split("\n").length === POPUP_RESIZED_ROWS && nextView !== undefined
+        && nextView.top === QUESTION_POPUP_VERTICAL_MARGIN && nextView.bottom === POPUP_RESIZED_ROWS - 1 - QUESTION_POPUP_VERTICAL_MARGIN
+        && nextView.body[0] === firstBeforeResize && nativeRowsAroundFrame(next, nextView);
+    }, "native Pi re-lays out the popup for the shorter PTY inside its margins, keeping its scroll position");
+    frame = await act(repeat(KEY_SHIFT_ALT_DOWN, 200), (next) => {
+      const nextView = fixedHintPopupView(next, POPUP_ANSWER_HINT);
+      return nextView !== undefined && nextView.body.at(-1)!.includes(POPUP_DECLINE) && selectedBodyRow(nextView, "Type something…");
+    }, "the re-wrapped content stays reachable to its end in the shorter PTY");
+    frame = await act(() => {
+      live.surface.resize(PTY_COLS, PTY_ROWS);
+      live.pty!.resize(PTY_COLS, PTY_ROWS);
+    }, (next) => {
+      const nextView = fixedHintPopupView(next, POPUP_ANSWER_HINT);
+      // The offset was at the shorter terminal's larger end bound; growing
+      // clamps it to the new end, the same first row as the earlier end view.
+      return next.split("\n").length === PTY_ROWS && nextView !== undefined && nextView.bottom === PTY_ROWS - 2
+        && nextView.hintRow === answerHintRow && nextView.body.length === answerEnd.length
+        && nextView.body[0] === answerEnd[0] && nextView.body.at(-1)!.includes(POPUP_DECLINE)
+        && nativeRowsAroundFrame(next, nextView);
+    }, "growing back clamps the offset to the new end bound with no blank overscroll");
+
+    // --- Close: the transcript underneath never moved ---
+    frame = await act(KEY_CTRL_ALT_UP, (next) => locateNativeQuestionPopup(next) === undefined
+      && frameContains(next, panelLine) && transcriptFillerRows(next).length > 0,
+    "the shortcut defers and closes the popup, revealing the transcript");
+    assert.equal(transcriptOffset(frame), transcriptBeforePopup,
+      "no popup scroll or selection input moved the transcript underneath");
+
+    // --- Reopen: normal answer routing; the live transcript stays visible around the compact list ---
+    frame = await act(KEY_CTRL_ALT_UP, (next) => selectedBodyRow(fixedHintPopupView(next, POPUP_LIST_HINT), `n1: ${POPUP_NOTICE_TITLE}`),
+      "reopening shows all three pending inputs; scrolling consumed none");
+    frame = await act(KEY_ENTER, (next) => fixedHintPopupView(next, POPUP_NOTICE_HINT)?.body[0]!.trim() === `n1: ${POPUP_NOTICE_TITLE}`,
+      "the reopened notice starts at its beginning");
+    frame = await act(KEY_ESCAPE, (next) => fixedHintPopupView(next, POPUP_LIST_HINT) !== undefined, "back to the reopened list");
+    frame = await act(KEY_DOWN, (next) => selectedBodyRow(fixedHintPopupView(next, POPUP_LIST_HINT), "q1:"), "select the question again");
+    frame = await act(KEY_ENTER, (next) => fixedHintPopupView(next, POPUP_ANSWER_HINT)?.body[0]!.trim() === "q1:",
+      "the reopened question starts at its beginning");
+    frame = await act(KEY_DOWN, (next) => selectedBodyRow(fixedHintPopupView(next, POPUP_ANSWER_HINT), `2. ${POPUP_CHOICE_B}`),
+      "Down selects and reveals the second choice");
+    assert.equal(modelRequests(), requestsBeforePopup, "close, reopen, and scrolling sent nothing to the model");
+    const listHeader = `Pending input (2) · ${shortcutLabel} to close`;
+    const beforeAnswer = live.frames.revision;
+    frame = await act(KEY_ENTER, (next) => {
+      const nextView = fixedHintPopupView(next, POPUP_NOTICE_LIST_HINT);
+      return nextView !== undefined && naturalPopupHeight(nextView, 4) && nextView.body[0]!.trim() === listHeader
+        && selectedBodyRow(nextView, `n1: ${POPUP_NOTICE_TITLE}`) && bodyContains(nextView, `n2: ${POPUP_SHORT_NOTICE_TITLE}`)
+        && !bodyContains(nextView, "q1:") && nativeRowsAroundFrame(next, nextView);
+    }, "confirming the choice answers only the question; the two-notice list is sized to its two entries");
+    await observerSignal.waitFor(() => countRecords(observerFile, "agent_settled") >= 2, EVENT_TIMEOUT_MS,
+      "the confirmed choice starts and settles one ordinary answer turn");
+    // The answer turn's echo renders in the LIVE native transcript outside the
+    // still-open compact list (Pi follows the transcript end).
+    try {
+      frame = await live.frames.waitFor((next) => {
+        const nextView = fixedHintPopupView(next, POPUP_NOTICE_LIST_HINT);
+        if (!nextView || !naturalPopupHeight(nextView, 4)) return false;
+        return next.split("\n").some((row, index) => (index < nextView.top || index > nextView.bottom)
+          && row.includes(`${ECHO_PREFIX}Answer to pending question`));
+      }, EVENT_TIMEOUT_MS, "the answer echo renders in the live transcript around the open list", beforeAnswer);
+    } catch (error) {
+      throw frameDiagnostics("the answer echo renders in the live transcript around the open list", error);
+    }
+
+    // --- Short notice: only its natural rows ---
+    frame = await act(KEY_DOWN, (next) => selectedBodyRow(fixedHintPopupView(next, POPUP_NOTICE_LIST_HINT), `n2: ${POPUP_SHORT_NOTICE_TITLE}`),
+      "the list selects the short notice");
+    frame = await act(KEY_ENTER, (next) => {
+      const nextView = fixedHintPopupView(next, POPUP_NOTICE_HINT);
+      return nextView !== undefined && naturalPopupHeight(nextView, 6)
+        && nextView.body[0]!.trim() === `n2: ${POPUP_SHORT_NOTICE_TITLE}` && nextView.body[2]!.trim() === POPUP_SHORT_NOTICE_BODY
+        && selectedBodyRow(nextView, "More details") && nextView.body[5]!.trim() === "Close"
+        && nativeRowsAroundFrame(next, nextView);
+    }, "the short notice uses only its natural rows with native rows visible around it");
+    frame = await act(KEY_CTRL_ALT_UP, (next) => locateNativeQuestionPopup(next) === undefined && frameContains(next, panelLine),
+      "the shortcut closes the popup, leaving both notices pending");
+    assert.ok(frameContains(frame, `${ECHO_PREFIX}Answer to pending question`) && frameContains(frame, `": ${POPUP_CHOICE_B}`),
+      "the delivered answer echo is visible at the transcript end");
+    await providerSignal.waitFor(() => modelRequests() >= 5, EVENT_TIMEOUT_MS, "the answer reaches the scripted model");
+    const requests = journalRecords(providerJournalFile).filter((record) => record.event === "model_request");
+    assert.equal(requests.length, 5, "exactly one model request followed the popup interaction");
+    assert.equal(requests[4]?.lastUserPreview, expectedAnswer, "the exact selected choice reached the model as an ordinary user message");
+    assert.equal(agentStarts(), 2, "only the confirmed answer started a second agent run");
+
+    live.pty!.write(KEY_CTRL_C + KEY_CTRL_C);
+    await waitForOwnerExit(live, CHILD_EXIT_TIMEOUT_MS);
+    assert.equal(live.exit?.exitCode, 0, "native Pi exits through the documented Ctrl+C-twice path");
+    assert.equal(processIsAlive(live.pty!.pid), false, "the owned native Pi child is no longer alive");
+    await observerSignal.waitFor(() => countRecords(observerFile, "session_shutdown") > 0, EVENT_TIMEOUT_MS, "genuine session_shutdown");
+    assert.equal(live.parseFailed, false, "the production TerminalSurface accepted every native fullscreen frame");
+  } finally {
+    closeObserverWatch();
+    closeProviderWatch();
+  }
+});

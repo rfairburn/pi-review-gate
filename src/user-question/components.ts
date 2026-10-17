@@ -27,6 +27,40 @@
  *   borders; the overlay's public maxHeight and vertical margins define the
  *   responsive viewport inside it.
  *
+ * Shared viewport (issue #413): one authoritative scroll offset per open
+ * mode. All body content — question/notice text, context, choices, Type,
+ * Decline, and actions — scrolls together; only the keyboard hint is laid out
+ * in a fixed area below it, so it stays visible (tight budgets fall back to
+ * a compact or truncated hint and drop the blank padding rows first; below
+ * three rows the rules give way to content, and a one-row content budget keeps
+ * only the body). Opening a
+ * question or notice starts at its beginning; Up/Down (even at a bound) and
+ * editing input bring the selected row or native cursor into view; keyboard
+ * paging moves only the offset. Resize clamps the offset to the new bounds
+ * and re-reveals only the list selection or an active editing cursor. The
+ * popup keeps its content-sized height up to the overlay's row budget.
+ * Scrolling is keyboard-only: wheel events are never handled here, so Pi and
+ * the terminal keep their native wheel behavior.
+ *
+ * Fullscreen pointer input (#431): the public custom overlay hands this
+ * component to pi-tui directly, so pointer events arrive in coordinates local
+ * to the last frame it returned. The same render pass that lays out that
+ * frame maps every drawn row of a list row, answer choice, Type something,
+ * Decline, or notice action back to the exact controller record it showed —
+ * through content wrapping, the authoritative scroll offset's body slice, the
+ * fixed hint area (never an item), and the padded/ruled or tiny unruled
+ * framing — covering only the row's drawn prefix and text. A left press
+ * highlights that item without moving the viewport or reflowing rows (while
+ * editing, or for notice actions narrower than three cells, a transient
+ * highlight leaves the selection untouched); the completed
+ * native click on the same live item, in a frame with unchanged bounds,
+ * viewport budget, and live terminal size, runs the item's existing confirm
+ * action, exactly as Enter on that selection would. A menu click while
+ * editing first leaves editing with the draft kept; the editor box is not a
+ * menu entry and never submits by pointer. Every non-wheel pointer event
+ * inside the popup is consumed, keyboard input cancels a pending gesture, and
+ * a closed popup intercepts nothing. Regular mode delivers no pointer input.
+ *
  * Navigation, confirm, cancel, cursor movement, and deletion resolve through
  * the host's live KeybindingsManager (`tui.select.*`, `tui.editor.*`), so
  * user keybindings.json overrides are honored. The extension's own shortcut
@@ -49,22 +83,6 @@
  * option rows with the draft kept; Ctrl+D on an empty editor returns to the
  * option rows instead of exiting Pi.
  *
- * Fullscreen pointer input (#431): the public custom overlay hands this
- * component to pi-tui directly, so pointer events arrive in coordinates local
- * to the last frame it returned. Each render maps every drawn row of a list
- * row, answer choice, Type something, Decline, or notice action back to the
- * exact controller record it showed — through content wrapping, framing, and
- * the manual viewport offset — covering only the row's drawn prefix and text.
- * A left press highlights that item (while editing, a transient highlight
- * leaves the native field untouched); the completed native click on the same
- * live item, in a frame with unchanged bounds and viewport budget, runs the
- * item's existing confirm action, exactly as Enter on that selection would.
- * A menu click while editing first leaves editing with the draft kept; the
- * editor box is not a menu entry and never submits by pointer. Every
- * non-wheel pointer event inside the popup is consumed (wheel stays the
- * host's), keyboard input cancels a pending gesture, and a closed popup
- * intercepts nothing. Regular mode delivers no pointer input at all.
- *
  * When the host's native seams are unavailable (no
  * setEditorComponent/getEditorComponent, or the agent module cannot be
  * loaded) the free-text row renders an unavailable line: the question stays
@@ -75,7 +93,7 @@
 import type { FieldEditorInstance } from "../native-editor-bridge";
 import { safeMarkdownDisplaySource } from "../markdown-safety";
 import { visibleTerminalText } from "../tool-result-text";
-import type { QuestionMarkdownComponent, QuestionScrollViewComponent, QuestionTuiHost } from "./pi-tui-host";
+import type { QuestionMarkdownComponent, QuestionTuiHost } from "./pi-tui-host";
 import type { PendingNotice, PendingQuestion, PendingUserInput, SubmitResult, UserQuestionController } from "./controller";
 
 /** The approved chord; the label shown to users is platform-specific. */
@@ -119,7 +137,10 @@ export interface QuestionListComponentOptions {
    * without submitting and never displays another session's questions.
    */
   isStale?: () => boolean;
-  /** Row budget matching the custom overlay's public maxHeight. */
+  /**
+   * Row budget matching the custom overlay's public maxHeight: the framed
+   * popup's rules, padding, scrolled body, and fixed hint area.
+   */
   getViewportRows?: () => number | undefined;
   /**
    * Live terminal dimensions. The host only schedules a redraw on resize, so
@@ -131,8 +152,6 @@ export interface QuestionListComponentOptions {
   getTerminalSize?: () => { columns: number; rows: number } | undefined;
   /** Invalidate the live TUI after component/controller state changes. */
   requestRender?: () => void;
-  /** Test seam for exercising native ScrollView outside the custom overlay. */
-  scrollable?: boolean;
   onDone: (result: QuestionListDone) => void;
 }
 
@@ -205,6 +224,22 @@ interface RenderedMarkdown {
   native: boolean;
 }
 
+interface ViewportFocus {
+  start: number;
+  end: number;
+  anchor: number;
+}
+
+/** Scrollable body lines plus the plain-text keyboard hint kept outside them. */
+interface PopupContent {
+  lines: string[];
+  /** The item that drew each body line (aligned with `lines`; absent means none). */
+  owners?: ReadonlyArray<PopupItemRef | undefined>;
+  hint?: string;
+  /** Shorter hint for tight budgets: the keys needed to reach hidden content. */
+  compactHint?: string;
+}
+
 const TYPE_ROW = Symbol("type-answer");
 const DECLINE_ROW = Symbol("decline-answer");
 const NOTICE_MORE_DETAILS = "__more_details__";
@@ -222,20 +257,22 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   let selectedId: string | undefined;
   let answerIndex = 0;
   let noticeActionIndex = 0;
-  let manualScrollOffset = 0;
-  let answerViewportFocus: { start: number; end: number; anchor: number } | undefined;
-  let answerFocusPending = false;
-  let listViewportFocus: { start: number; end: number; anchor: number } | undefined;
-  let listFocusPending = true;
+  // The single authoritative viewport: the first visible body line, the
+  // current mode's selected row (or native cursor) range, and whether the next
+  // layout should bring that range into view. Keyboard paging moves only the
+  // offset; selection/editing input requests a reveal.
+  let scrollOffset = 0;
+  let viewportFocus: ViewportFocus | undefined;
+  let focusPending = true;
   let lastViewportRows: number | undefined;
-  let lastListViewportRows: number | undefined;
   let lastRenderedWidth: number | undefined;
-  let lastNativeViewportHeight = 0;
+  let lastMaxScrollOffset: number | undefined;
   let editing = false;
   let closed = false;
-  let cachedContent: { width: number; lines: string[]; owners: Array<PopupItemRef | undefined> } | undefined;
+  let cachedContent: { width: number; content: PopupContent } | undefined;
   // Item ranges recorded by the active list/answer/notice renderer, in its
-  // raw line coordinates, before content wrapping and framing remap them.
+  // raw line coordinates, before content wrapping, scrolling, and framing
+  // remap them.
   let renderedItemRanges: Array<{ start: number; end: number; ref: PopupItemRef }> = [];
   // Mouse gesture state: the frame last returned to the compositor, the item a
   // left press resolved in it, the same press once released (consumed by the
@@ -245,8 +282,6 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   let pressedItem: { ref: PopupItemRef; frame: PopupFrame } | undefined;
   let releasedItem: { ref: PopupItemRef; frame: PopupFrame } | undefined;
   let pressHighlight: PopupItemRef | undefined;
-  let nativeScrollView: QuestionScrollViewComponent | undefined;
-  let invalidateNativeScrollView: (() => void) | undefined;
   const markdownComponents = new Map<string, QuestionMarkdownComponent | null>();
   // The shortcut handler installs a live idle probe before the component is
   // shown; if the session rebinds while open, the stale fence closes this UI
@@ -257,9 +292,8 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     cachedContent = undefined;
   };
 
+  /** Rebuild cached content; never moves the viewport by itself. */
   const invalidate = () => {
-    if (mode === "answer") answerFocusPending = true;
-    if (mode === "list") listFocusPending = true;
     invalidateContent();
     for (const component of markdownComponents.values()) {
       try {
@@ -269,12 +303,15 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       }
     }
     markdownComponents.clear();
-    invalidateNativeScrollView?.();
     options.requestRender?.();
   };
 
-  // Live questions (registered while the list is open) must refresh the view.
-  const unsubscribeState = controller.addStateListener(invalidate);
+  // Live questions (registered while the list is open) must refresh the view;
+  // the list keeps its live selection visible as entries come and go.
+  const unsubscribeState = controller.addStateListener(() => {
+    if (mode === "list") focusPending = true;
+    invalidate();
+  });
 
   const close = (result?: SubmitResult | { kind: "notice-details"; noticeId: string; expectedNotice: PendingNotice }) => {
     if (closed) return;
@@ -375,7 +412,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
 
   /** Enter/leave editing, keeping the native field's focus flag in step. */
   function setEditing(value: boolean): void {
-    if (editing !== value && mode === "answer") answerFocusPending = true;
+    if (editing !== value && mode === "answer") focusPending = true;
     editing = value;
     const field = options.nativeField;
     if (field) {
@@ -393,6 +430,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       const pending = pendingNow();
       const index = pending.findIndex((question) => question.id === currentListSelection());
       if (index > 0) selectedId = pending[index - 1]!.id;
+      focusPending = true;
       invalidate();
       return;
     }
@@ -400,6 +438,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       const pending = pendingNow();
       const index = pending.findIndex((question) => question.id === currentListSelection());
       if (index >= 0 && index < pending.length - 1) selectedId = pending[index + 1]!.id;
+      focusPending = true;
       invalidate();
       return;
     }
@@ -419,14 +458,16 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   /** The list confirm action: open the selected question's answer view or notice details. */
   function openPendingRecord(id: string, record: PendingUserInput): void {
     selectedId = id;
-    resetScroll();
     if (isNotice(record)) {
       mode = "notice";
       noticeActionIndex = 0;
+      resetScroll(); // A long notice opens at its beginning.
     } else {
       mode = "answer";
       answerIndex = 0;
-      answerFocusPending = true;
+      // A long question opens at its beginning; Up/Down later reveals the
+      // selected row instead of jumping past the question on open.
+      resetScroll();
       // A new answer-view session starts fresh — the shared instance's text
       // is cleared so a previous question's draft never shows or submits as
       // this one's (the host undo history has no public clear, so an earlier
@@ -496,19 +537,17 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       return;
     }
     const rows = answerRows();
+    // Selection movement always reveals the selected row, including a
+    // boundary press that cannot move further.
     if (keybindings.matches(data, "tui.select.up")) {
-      if (answerIndex > 0) {
-        answerIndex -= 1;
-        answerFocusPending = true;
-      }
+      if (answerIndex > 0) answerIndex -= 1;
+      focusPending = true;
       invalidate();
       return;
     }
     if (keybindings.matches(data, "tui.select.down")) {
-      if (answerIndex < rows.length - 1) {
-        answerIndex += 1;
-        answerFocusPending = true;
-      }
+      if (answerIndex < rows.length - 1) answerIndex += 1;
+      focusPending = true;
       invalidate();
       return;
     }
@@ -537,11 +576,13 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     const rows = noticeRows();
     if (keybindings.matches(data, "tui.select.up")) {
       if (noticeActionIndex > 0) noticeActionIndex -= 1;
+      focusPending = true;
       invalidate();
       return;
     }
     if (keybindings.matches(data, "tui.select.down")) {
       if (noticeActionIndex < rows.length - 1) noticeActionIndex += 1;
+      focusPending = true;
       invalidate();
       return;
     }
@@ -594,7 +635,8 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     // through the live KeybindingsManager, exactly as in the main chat.
     field.focused = true;
     field.handleInput(data);
-    if (editing && mode === "answer") answerFocusPending = true;
+    // Editing input keeps the native cursor row in view.
+    if (editing && mode === "answer") focusPending = true;
     invalidate();
   }
 
@@ -625,7 +667,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   const handleInput = (data: string) => {
     if (closed) return;
     // Keyboard input ends any pointer gesture: a later click can never act on
-    // a press resolved before the keyboard changed selection or mode.
+    // a press resolved before the keyboard changed selection, mode, or scroll.
     if (clearMouseGesture()) invalidateContent();
     if (isStale()) {
       close(); // A rebound session's UI never acts on input.
@@ -637,19 +679,15 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       close();
       return;
     }
+    // While editing, every key (including PageUp/PageDown) belongs to the
+    // native field; popup paging resumes after Esc returns to the options.
     if (!editing && matchesPopupScroll(data, "up")) {
-      if (nativeScrollView && nativeScrollView.viewportHeight > 0) scrollNativeBy(-pageStep());
-      else manualScrollOffset = Math.max(0, manualScrollOffset - pageStep());
-      if (mode === "answer") answerFocusPending = false;
-      if (mode === "list") listFocusPending = false;
+      scrollViewportBy(-pageStep());
       options.requestRender?.();
       return;
     }
     if (!editing && matchesPopupScroll(data, "down")) {
-      if (nativeScrollView && nativeScrollView.viewportHeight > 0) scrollNativeBy(pageStep());
-      else manualScrollOffset += pageStep();
-      if (mode === "answer") answerFocusPending = false;
-      if (mode === "list") listFocusPending = false;
+      scrollViewportBy(pageStep());
       options.requestRender?.();
       return;
     }
@@ -657,6 +695,15 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     else if (mode === "answer") handleAnswerInput(data);
     else handleNoticeInput(data);
   };
+
+  /** Move the viewport by whole lines within the last laid-out bounds. */
+  function scrollViewportBy(amount: number): void {
+    const maximum = lastMaxScrollOffset ?? Number.POSITIVE_INFINITY;
+    scrollOffset = Math.min(Math.max(0, scrollOffset + amount), maximum);
+    // Explicit scrolling wins over a pending reveal until the next selection
+    // or editing input asks for one again.
+    focusPending = false;
+  }
 
   // ------------------------------------------------------------------
   // Fullscreen pointer input (native-style single click)
@@ -707,7 +754,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     return row && x >= row.start && x < row.end ? row.ref : undefined;
   }
 
-  /** Same bounds and viewport budget: the compositor placed both frames at one origin. */
+  /** Same bounds, viewport budget, and terminal: the compositor placed both frames at one origin. */
   function sameGeometry(left: PopupFrame, right: PopupFrame): boolean {
     return left.width === right.width && left.height === right.height && left.viewportRows === right.viewportRows
       && left.terminal === right.terminal;
@@ -722,16 +769,24 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       invalidateContent();
       return;
     }
-    const keepListFocus = listFocusPending;
-    const keepAnswerFocus = answerFocusPending;
+    if (ref.kind === "notice" && lastRenderedWidth !== undefined && lastRenderedWidth < 3) {
+      // Below three content cells the selected notice action draws its marker
+      // on a row of its own, so moving the selection would reflow the wrapped
+      // actions under the pointer. The press shows a layout-neutral transient
+      // highlight instead; the completed click still selects and confirms.
+      pressHighlight = ref;
+      invalidateContent();
+      return;
+    }
+    // A press never scrolls or reveals: the item under the pointer must stay
+    // put until the click that completes it, so the single authoritative
+    // offset and any pending reveal are left exactly as they were.
+    const keepFocusPending = focusPending;
     if (ref.kind === "list") selectedId = ref.record.id;
     else if (ref.kind === "answer") answerIndex = ref.row;
     else noticeActionIndex = ref.action;
     invalidate();
-    // A press never scrolls: the item under the pointer must stay put until
-    // the click that completes it.
-    listFocusPending = keepListFocus;
-    answerFocusPending = keepAnswerFocus;
+    focusPending = keepFocusPending;
   }
 
   /** Run the item's existing confirm action, exactly as Enter on that selection. */
@@ -755,7 +810,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
   const handleMouse = (event: QuestionMouseEvent): QuestionMouseResult | undefined => {
     // A closed popup intercepts nothing: ordinary routing resumes at once.
     if (closed || typeof event !== "object" || event === null) return undefined;
-    // Wheel scrolling over the popup is outside this click contract.
+    // Scrolling is keyboard-only: the wheel keeps Pi's native behavior.
     if (event.type === "wheel") return undefined;
     if (event.type !== "press" && event.type !== "release" && event.type !== "click"
       && event.type !== "move" && event.type !== "drag") return undefined;
@@ -786,9 +841,9 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       const candidate = releasedItem;
       releasedItem = undefined;
       // Only a stationary left press-release on one live item activates; the
-      // click count is ignored like the native SelectList.
-      // The release/click carry press-time bounds; a resize since then (even
-      // one the host has not redrawn yet) leaves no trustworthy geometry.
+      // click count is ignored like the native SelectList. The release/click
+      // carry press-time bounds; a resize since then (even one the host has
+      // not redrawn yet) leaves no trustworthy geometry.
       if (event.button !== "left" || !candidate || !lastFrame || !sameGeometry(lastFrame, candidate.frame)
         || !frameIsCurrent(lastFrame)) {
         return { handled: true, render: false };
@@ -802,12 +857,9 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     return { handled: true, render: false };
   };
 
-  const renderContent = (width: number): string[] => {
-    if (lastRenderedWidth !== undefined && lastRenderedWidth !== width && mode === "answer") {
-      answerFocusPending = true;
-    }
-    if (lastRenderedWidth !== undefined && lastRenderedWidth !== width && mode === "list") {
-      listFocusPending = true;
+  const renderContent = (width: number): PopupContent => {
+    if (lastRenderedWidth !== undefined && lastRenderedWidth !== width && (mode === "list" || editing)) {
+      focusPending = true;
     }
     lastRenderedWidth = width;
     if (isStale()) {
@@ -817,46 +869,39 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       // a stale input or settle callback already closed this component (its
       // close cleared the cache, so the check must not depend on !closed).
       close();
-      return [theme.fg("dim", "Session changed; question list closed.")];
+      return { lines: [theme.fg("dim", "Session changed; question list closed.")] };
     }
-    if (closed) return []; // A closed component never renders live controller state.
-    if (cachedContent?.width === width) return cachedContent.lines;
+    if (closed) return { lines: [] }; // A closed component never renders live controller state.
+    if (cachedContent?.width === width) return cachedContent.content;
     renderedItemRanges = [];
-    const rawLines = mode === "list"
+    const raw = mode === "list"
       ? renderList(width)
       : mode === "answer"
         ? renderAnswer(width)
         : renderNotice(width);
-    const rawOwners: Array<PopupItemRef | undefined> = rawLines.map(() => undefined);
+    const rawOwners: Array<PopupItemRef | undefined> = raw.lines.map(() => undefined);
     for (const range of renderedItemRanges) {
       for (let line = range.start; line < range.end && line < rawOwners.length; line += 1) rawOwners[line] = range.ref;
     }
     renderedItemRanges = [];
     const lineCounts: number[] = [];
     const owners: Array<PopupItemRef | undefined> = [];
-    const lines = rawLines.flatMap((line, index) => {
+    const lines = raw.lines.flatMap((line, index) => {
       const fitted = visibleWidth(line) <= width ? [line] : wrapNoticeLine(line, width);
       lineCounts.push(fitted.length);
       for (let count = 0; count < fitted.length; count += 1) owners.push(rawOwners[index]);
       return fitted;
     });
-    if (lineCounts.some((count) => count !== 1)) {
-      listViewportFocus = remapViewportFocus(listViewportFocus, lineCounts);
-      answerViewportFocus = remapViewportFocus(answerViewportFocus, lineCounts);
-    }
-    cachedContent = { width, lines, owners };
-    return lines;
+    if (lineCounts.some((count) => count !== 1)) viewportFocus = remapViewportFocus(viewportFocus, lineCounts);
+    const content = { lines, owners, hint: raw.hint, compactHint: raw.compactHint };
+    cachedContent = { width, content };
+    return content;
   };
 
-  /** Item owners of the content lines most recently produced for this width. */
-  function contentOwners(width: number, lines: readonly string[]): ReadonlyArray<PopupItemRef | undefined> {
-    return cachedContent?.width === width && cachedContent.lines === lines ? cachedContent.owners : [];
-  }
-
   function remapViewportFocus(
-    focus: { start: number; end: number; anchor: number } | undefined,
+    focus: ViewportFocus | undefined,
     lineCounts: readonly number[],
-  ): { start: number; end: number; anchor: number } | undefined {
+  ): ViewportFocus | undefined {
     if (!focus) return undefined;
     const offset = (line: number): number => lineCounts.slice(0, Math.max(0, line)).reduce((sum, count) => sum + count, 0);
     const start = offset(focus.start);
@@ -876,23 +921,29 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     return Math.max(1, boundedWidth - paddingCells);
   }
 
-  function popupContentRows(height: number): number {
+  function popupContentRows(height: number, padded = true, ruled = true): number {
     const boundedHeight = Math.max(1, Math.floor(height));
-    const borderRows = boundedHeight >= 2 ? 2 : 1;
-    const paddingRows = boundedHeight >= 4 ? POPUP_VERTICAL_PADDING * 2 : 0;
+    const borderRows = !ruled ? 0 : boundedHeight >= 2 ? 2 : 1;
+    const paddingRows = padded && boundedHeight >= 4 ? POPUP_VERTICAL_PADDING * 2 : 0;
     return Math.max(0, boundedHeight - borderRows - paddingRows);
   }
 
   /**
    * Frame content rows and, in the same pass, map every drawn row back to the
    * item that rendered it. A row's hit cells are exactly its drawn prefix and
-   * text inside the side padding; rules, padding rows, side padding, and
-   * trailing blank cells belong to no item.
+   * text inside the side padding; rules, padding rows, side padding, trailing
+   * blank cells, and rows without an owner (the fixed hint area, headings,
+   * body text) belong to no item.
+   *
+   * `ruled: false` renders the padded content rows without the top and bottom
+   * rules: below three rows the decorative rules give way to content.
    */
   function framePopup(
     content: readonly string[],
     width: number,
     maxHeight?: number,
+    padded = true,
+    ruled = true,
     owners: ReadonlyArray<PopupItemRef | undefined> = [],
   ): { lines: string[]; rows: Array<PopupFrameRow | undefined> } {
     const boundedWidth = Math.max(1, Math.floor(width));
@@ -902,8 +953,8 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       (visibleWidth(line) <= innerWidth ? [line] : wrapNoticeLine(line, innerWidth))
         .map((fitted) => ({ line: fitted, owner: owners[index] })));
     const height = maxHeight === undefined ? undefined : Math.max(1, Math.floor(maxHeight));
-    const verticalPadding = height === undefined || height >= 4 ? POPUP_VERTICAL_PADDING : 0;
-    const contentLimit = height === undefined ? Number.POSITIVE_INFINITY : popupContentRows(height);
+    const verticalPadding = padded && (height === undefined || height >= 4) ? POPUP_VERTICAL_PADDING : 0;
+    const contentLimit = height === undefined ? Number.POSITIVE_INFINITY : popupContentRows(height, padded, ruled);
     const visible = framedContent.slice(0, contentLimit);
     const rule = opaquePopupLine(theme.fg("borderMuted", "─".repeat(boundedWidth)));
     const row = (line: string): string => {
@@ -916,6 +967,12 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       return drawn > 0 ? { ref: owner, start: padding, end: padding + drawn } : undefined;
     };
 
+    if (!ruled) {
+      return {
+        lines: visible.map(({ line }) => row(line)),
+        rows: visible.map(({ line, owner }) => itemCells(line, owner)),
+      };
+    }
     if (height === 1) return { lines: [rule], rows: [undefined] };
     if (height === 2) return { lines: [rule, rule], rows: [undefined, undefined] };
     const output = [rule];
@@ -1002,97 +1059,72 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     return output;
   }
 
-  const renderFallback = (width: number): string[] => {
+  /**
+   * Lay out the keyboard hint below the scrolled body, outside it, so it never
+   * scrolls away. At least one body row always remains. The complete wrapped
+   * hint (after a blank separator when it fits) is preferred; tighter budgets
+   * fall back to the compact hint, wrapped or finally truncated to one row; a
+   * one-row budget keeps only the body so a tiny terminal never loses access
+   * to content.
+   */
+  function fixedHintRows(content: PopupContent, width: number, contentRows: number): string[] {
+    if (content.hint === undefined || contentRows < 2) return [];
+    const budget = contentRows - 1;
+    const full = wrapNoticeLine(theme.fg("dim", content.hint), width);
+    if (full.length + 1 <= budget) return ["", ...full];
+    if (full.length <= budget) return full;
+    const compactHint = content.compactHint ?? content.hint;
+    const compact = wrapNoticeLine(theme.fg("dim", compactHint), width);
+    if (compact.length <= budget) return compact;
+    return [theme.fg("dim", truncatePlain(compactHint, width))];
+  }
+
+  const renderPopup = (width: number): string[] => {
     if (closed) {
       lastFrame = undefined;
       return [];
     }
     const height = options.getViewportRows ? viewportRows() : undefined;
     const contentWidth = popupContentWidth(width);
-    const lines = renderContent(contentWidth);
-    const owners = contentOwners(contentWidth, lines);
-    if (height === undefined) return publishFrame(framePopup(lines, width, undefined, owners), width, undefined);
-    const contentHeight = popupContentRows(height);
-    manualScrollOffset = Math.min(Math.max(0, manualScrollOffset), Math.max(0, lines.length - contentHeight));
-    if (contentHeight > 0
-      && ((mode === "answer" && (answerFocusPending || editing)) || (mode === "list" && listFocusPending))) {
-      manualScrollOffset = offsetForAnswerFocus(
-        manualScrollOffset,
-        contentHeight,
-        lines.length,
-        mode === "list" ? listViewportFocus : answerViewportFocus,
-      );
-      answerFocusPending = false;
-      listFocusPending = false;
+    const content = renderContent(contentWidth);
+    const owners = content.owners ?? [];
+    if (height === undefined) {
+      // Unbounded (no row budget): the complete content and hint, framed.
+      const hint = content.hint === undefined ? [] : ["", ...wrapNoticeLine(theme.fg("dim", content.hint), contentWidth)];
+      return publishFrame(framePopup([...content.lines, ...hint], width, undefined, true, true, owners), width, undefined);
     }
-    // The same offset slices the drawn lines and their item owners, so a
-    // scrolled row maps to exactly the item it shows.
-    return publishFrame(framePopup(
-      lines.slice(manualScrollOffset, manualScrollOffset + contentHeight),
+    // Tiny budgets give up the blank vertical padding rows before the fixed
+    // hint, and below three rows the rules too, so at least one content row
+    // always remains visible and scrollable.
+    const ruled = height >= 3;
+    const padded = ruled && popupContentRows(height) >= 2;
+    const contentRows = popupContentRows(height, padded, ruled);
+    const hint = fixedHintRows(content, contentWidth, contentRows);
+    const bodyRows = Math.max(0, contentRows - hint.length);
+    const maximum = Math.max(0, content.lines.length - bodyRows);
+    scrollOffset = Math.min(Math.max(0, scrollOffset), maximum);
+    if (bodyRows > 0 && focusPending) {
+      scrollOffset = offsetForFocus(scrollOffset, bodyRows, content.lines.length, viewportFocus);
+      focusPending = false;
+    }
+    lastMaxScrollOffset = maximum;
+    const body = content.lines.slice(scrollOffset, scrollOffset + bodyRows);
+    // The same authoritative offset slices the drawn body and its item owners,
+    // so a scrolled row maps to exactly the item it shows; the fixed hint rows
+    // below the body own no item.
+    const bodyOwners = owners.slice(scrollOffset, scrollOffset + bodyRows);
+    return publishFrame(
+      framePopup([...body, ...hint], width, height, padded, ruled, bodyOwners),
       width,
       height,
-      owners.slice(manualScrollOffset, manualScrollOffset + contentHeight),
-    ), width, height);
+    );
   };
 
-  const renderNativeScrollView = (width: number): string[] => {
-    if (closed) {
-      lastFrame = undefined;
-      return [];
-    }
-    const scrollView = nativeScrollView!;
-    const height = scrollView.viewportHeight;
-    if (height <= 0) {
-      lastNativeViewportHeight = 0;
-      return renderFallback(width);
-    }
-    const contentWidth = popupContentWidth(width);
-    const lines = renderContent(contentWidth);
-    const outerHeight = Math.max(1, Math.floor(height));
-    const contentHeight = popupContentRows(outerHeight);
-    if (lastNativeViewportHeight !== height && mode === "list") listFocusPending = true;
-    if (lastNativeViewportHeight <= 0) {
-      scrollView.scrollToStart();
-      manualScrollOffset = 0;
-      if (mode === "answer") answerFocusPending = true;
-    } else if (lastNativeViewportHeight !== height && mode === "answer") {
-      answerFocusPending = true;
-    }
-    lastNativeViewportHeight = height;
-    manualScrollOffset = Math.min(Math.max(0, manualScrollOffset), Math.max(0, lines.length - contentHeight));
-    if (contentHeight > 0
-      && ((mode === "answer" && (answerFocusPending || editing)) || (mode === "list" && listFocusPending))) {
-      const desiredOffset = offsetForAnswerFocus(
-        manualScrollOffset,
-        contentHeight,
-        lines.length,
-        mode === "list" ? listViewportFocus : answerViewportFocus,
-      );
-      const delta = desiredOffset - manualScrollOffset;
-      if (delta !== 0) scrollNativeBy(delta);
-      answerFocusPending = false;
-      listFocusPending = false;
-    }
-    // The ScrollView seam keeps its own scroll position, so its rows carry no
-    // item map: pointer input stays consumed but never activates an item.
-    return publishFrame(framePopup(scrollView.render(contentWidth).slice(0, contentHeight), width, outerHeight), width, outerHeight);
-  };
-
-  function scrollNativeBy(amount: number): void {
-    const scrollView = nativeScrollView;
-    if (!scrollView || scrollView.viewportHeight <= 0) return;
-    scrollView.scrollBy(amount);
-    const lineCount = cachedContent?.lines.length;
-    const height = popupContentRows(scrollView.viewportHeight);
-    const maximum = lineCount === undefined ? Number.POSITIVE_INFINITY : Math.max(0, lineCount - height);
-    manualScrollOffset = Math.min(Math.max(0, manualScrollOffset + amount), maximum);
-  }
-
-  function offsetForAnswerFocus(
+  function offsetForFocus(
     currentOffset: number,
     height: number,
     lineCount: number,
-    focus = answerViewportFocus,
+    focus: ViewportFocus | undefined,
   ): number {
     const maximum = Math.max(0, lineCount - height);
     let offset = Math.min(Math.max(0, currentOffset), maximum);
@@ -1154,13 +1186,13 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     }
   }
 
-  function renderList(width: number): string[] {
-    listViewportFocus = undefined;
+  function renderList(width: number): PopupContent {
+    viewportFocus = undefined;
     const pending = pendingNow();
     const lines: string[] = [];
     if (pending.length === 0) {
       lines.push(theme.fg("dim", "No pending input."));
-      return lines;
+      return { lines };
     }
     const selection = currentListSelection() ?? undefined;
     const hasNotice = pending.some(isNotice);
@@ -1184,23 +1216,22 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       }
       renderedItemRanges.push({ start: rowStart, end: lines.length, ref: { kind: "list", record } });
       if (record.id === selection) {
-        listViewportFocus = { start: rowStart, end: rowStart, anchor: rowStart };
+        viewportFocus = { start: rowStart, end: rowStart, anchor: rowStart };
       }
     }
-    lines.push("");
-    lines.push(theme.fg("dim", hasNotice
+    const hint = hasNotice
       ? `arrows select · Enter ${hasQuestion ? "open question/notice" : "open notice"} · ${POPUP_SCROLL_HINT} · Esc defer and close`
-      : `arrows select · Enter answer · ${POPUP_SCROLL_HINT} · Esc defer and close`));
-    return lines;
+      : `arrows select · Enter answer · ${POPUP_SCROLL_HINT} · Esc defer and close`;
+    return { lines, hint, compactHint: POPUP_SCROLL_HINT };
   }
 
-  function renderAnswer(width: number): string[] {
-    answerViewportFocus = undefined;
+  function renderAnswer(width: number): PopupContent {
+    viewportFocus = undefined;
     const record = selectedId ? controller.get(selectedId) : undefined;
     if (!record) {
       // Defensive: the question vanished (stale state); leave on next key.
-      answerViewportFocus = { start: 0, end: 0, anchor: 0 };
-      return [theme.fg("dim", "This question is no longer pending.")];
+      viewportFocus = { start: 0, end: 0, anchor: 0 };
+      return { lines: [theme.fg("dim", "This question is no longer pending.")] };
     }
     const rows = answerRows();
     const lines: string[] = [];
@@ -1227,7 +1258,7 @@ export function createQuestionListComponent(options: QuestionListComponentOption
         for (const rest of box.slice(1)) lines.push(`  ${rest}`);
         if (selected) {
           const cursorRow = rowStart + nativeFieldCursorBoxRow(options.nativeField, editorWidth, box.length);
-          answerViewportFocus = {
+          viewportFocus = {
             start: cursorRow,
             end: Math.max(cursorRow, rowStart + box.length - 1),
             anchor: cursorRow,
@@ -1259,19 +1290,21 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       }
       renderedItemRanges.push({ start: rowStart, end: lines.length, ref: { kind: "answer", record, row: index } });
       if (selected) {
-        answerViewportFocus = { start: rowStart, end: lines.length - 1, anchor: rowStart };
+        viewportFocus = { start: rowStart, end: lines.length - 1, anchor: rowStart };
       }
     });
-    lines.push("");
-    lines.push(theme.fg("dim", editing
-      ? "Enter submit · Esc back to options"
-      : `arrows select · Enter confirm · ${POPUP_SCROLL_HINT} · Esc back`));
-    return lines;
+    // The native field owns every key while editing, so keyboard scrolling is
+    // advertised only after Esc.
+    const hint = editing
+      ? "Enter submit · Esc back to options to scroll"
+      : `arrows select · Enter confirm · ${POPUP_SCROLL_HINT} · Esc back`;
+    return { lines, hint, compactHint: editing ? "Enter submit · Esc back to options" : POPUP_SCROLL_HINT };
   }
 
-  function renderNotice(width: number): string[] {
+  function renderNotice(width: number): PopupContent {
+    viewportFocus = undefined;
     const record = selectedId ? controller.getPending(selectedId) : undefined;
-    if (!record || !isNotice(record)) return [theme.fg("dim", "This notice is no longer pending.")];
+    if (!record || !isNotice(record)) return { lines: [theme.fg("dim", "This notice is no longer pending.")] };
     const body = renderMarkdown(record.body, width);
     const context = record.context === undefined ? undefined : renderMarkdown(record.context, width);
     const hasPlainFallback = !body.native || (context !== undefined && !context.native);
@@ -1292,13 +1325,18 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     }
     lines.push("");
     noticeRows().forEach((row, index) => {
-      const start = lines.length;
-      appendNoticeAction(lines, row === NOTICE_MORE_DETAILS ? "More details" : "Close", index === noticeActionIndex, width);
-      renderedItemRanges.push({ start, end: lines.length, ref: { kind: "notice", record, action: index } });
+      const rowStart = lines.length;
+      const selected = index === noticeActionIndex;
+      const pressed = pressHighlight?.kind === "notice" && pressHighlight.record === record && pressHighlight.action === index;
+      appendNoticeAction(lines, row === NOTICE_MORE_DETAILS ? "More details" : "Close", selected, width, pressed);
+      renderedItemRanges.push({ start: rowStart, end: lines.length, ref: { kind: "notice", record, action: index } });
+      if (selected) viewportFocus = { start: rowStart, end: lines.length - 1, anchor: rowStart };
     });
-    lines.push("");
-    lines.push(...wrapNoticeLine(theme.fg("dim", `arrows select · Enter choose · ${POPUP_SCROLL_HINT} · Esc back`), width));
-    return lines;
+    return {
+      lines,
+      hint: `arrows select · Enter choose · ${POPUP_SCROLL_HINT} · Esc back`,
+      compactHint: POPUP_SCROLL_HINT,
+    };
   }
 
   function viewportRows(): number {
@@ -1311,34 +1349,33 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     const resolved = typeof rows === "number" && Number.isFinite(rows) && rows > 0
       ? Math.max(1, Math.floor(rows))
       : 1;
-    if (lastViewportRows !== undefined && lastViewportRows !== resolved && mode === "answer") {
-      answerFocusPending = true;
+    if (lastViewportRows !== undefined && lastViewportRows !== resolved) {
       // The host editor sizes its own text viewport from terminal rows. Rebuild
-      // its rendered box before applying the resized popup's focus offset.
-      cachedContent = undefined;
+      // its rendered box before applying the resized popup's offset.
+      if (mode === "answer") cachedContent = undefined;
+      // Resize keeps the authoritative offset (clamped to the new bounds);
+      // only the list selection and an active editing cursor are re-revealed.
+      if (mode === "list" || editing) focusPending = true;
     }
     lastViewportRows = resolved;
-    if (mode === "list" && lastListViewportRows !== resolved) listFocusPending = true;
-    lastListViewportRows = resolved;
     return resolved;
   }
 
+  /**
+   * Keyboard scrolling keeps its existing one-line step, so successive views
+   * overlap and no unseen line is skipped; the offset is bounded by the body
+   * viewport that remains after the rules, padding, and fixed hint area.
+   */
   function pageStep(): number {
-    const nativeHeight = nativeScrollView?.viewportHeight;
-    // The custom overlay uses the owned manual viewport, so no measured
-    // ScrollView height is available. Advance one line rather than skipping
-    // unseen content with a terminal-sized page. A layout-backed view pages
-    // only its inner content area, excluding the popup rules and padding.
-    if (nativeHeight === undefined || nativeHeight <= 0) return 1;
-    return Math.max(1, popupContentRows(nativeHeight) - 1);
+    return 1;
   }
 
+  /** Start a mode's view at its beginning; only the list reveals its selection. */
   function resetScroll(): void {
-    manualScrollOffset = 0;
-    answerViewportFocus = undefined;
-    answerFocusPending = false;
-    listFocusPending = true;
-    nativeScrollView?.scrollToStart();
+    scrollOffset = 0;
+    viewportFocus = undefined;
+    lastMaxScrollOffset = undefined; // The new view's bounds come from its next layout.
+    focusPending = mode === "list";
   }
 
   function renderMarkdown(source: string, width: number): RenderedMarkdown {
@@ -1458,17 +1495,45 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     return wrapPlainTextLine(stripAnsi(text), bounded);
   }
 
-  function appendNoticeAction(lines: string[], label: string, selected: boolean, width: number): void {
+  /**
+   * `pressed` is the transient pointer-press highlight: it never adds or
+   * removes a row, so the drawn actions stay where the press landed.
+   */
+  function appendNoticeAction(lines: string[], label: string, selected: boolean, width: number, pressed = false): void {
     if (width < 3) {
       if (selected) lines.push(theme.fg("accent", ">"));
-      lines.push(...wrapNoticeLine(label, width));
+      const wrapped = wrapNoticeLine(label, width);
+      lines.push(...(pressed && !selected ? wrapped.map((line) => theme.fg("accent", line)) : wrapped));
       return;
     }
-    const prefix = selected ? theme.fg("accent", "> ") : "  ";
+    const prefix = selected || pressed ? theme.fg("accent", "> ") : "  ";
     const prefixWidth = visibleWidth(prefix);
     const wrapped = wrapNoticeLine(label, Math.max(1, width - prefixWidth));
     lines.push(prefix + wrapped[0]!);
     for (const rest of wrapped.slice(1)) lines.push(" ".repeat(prefixWidth) + rest);
+  }
+
+  /** Truncate plain text to a column budget with a trailing ellipsis. */
+  function truncatePlain(text: string, width: number): string {
+    const bounded = Math.max(1, Math.floor(width));
+    if (visibleWidth(text) <= bounded) return text;
+    if (typeof tuiHost?.truncateToWidth === "function") {
+      try {
+        const truncated = tuiHost.truncateToWidth(text, bounded, "…");
+        if (visibleWidth(truncated) <= bounded) return truncated;
+      } catch {
+        // Fall back to grapheme truncation below.
+      }
+    }
+    let output = "";
+    let used = 0;
+    for (const grapheme of graphemeSegments(text)) {
+      const graphemeWidth = visibleWidth(grapheme);
+      if (used + graphemeWidth > bounded - 1) break;
+      output += grapheme;
+      used += graphemeWidth;
+    }
+    return `${output}…`;
   }
 
   function graphemeSegments(text: string): string[] {
@@ -1525,29 +1590,8 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     activeSourceProbe = probe;
   };
 
-  const content: QuestionMarkdownComponent = {
-    render: renderContent,
-    invalidate: invalidateContent,
-  };
-  try {
-    nativeScrollView = options.scrollable
-      ? tuiHost?.createScrollView?.(content, viewportRows)
-      : undefined;
-  } catch {
-    nativeScrollView = undefined;
-  }
-  if (nativeScrollView) {
-    invalidateNativeScrollView = nativeScrollView.invalidate.bind(nativeScrollView);
-    return {
-      render: renderNativeScrollView,
-      handleInput,
-      handleMouse,
-      invalidate,
-      setSourceProbe,
-    };
-  }
   return {
-    render: renderFallback,
+    render: renderPopup,
     handleInput,
     handleMouse,
     invalidate,

@@ -15,6 +15,44 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.170]
+
+### Fixed
+
+- Native Pi tools (#421): top-level tool discovery now follows the tools Pi's registry
+  currently permits instead of the conversation's restored tool loadout. A resumed
+  (`--continue`), switched, or forked conversation previously advertised only the tools
+  its transcript had loaded, and a Plan/research conversation resumed in a write-capable
+  mode lost its baseline writes. Now every registered, non-hidden tool is a
+  `tool_search` discovery candidate, bounded by the operating mode and live feature
+  settings, and the role baseline (`read`, `bash`, `edit`, `write`, `grep`, `find`,
+  `ls`, `ApplyPatch`, `SubtasksStart`, and `powershell` where registered and
+  authorized) is rebuilt from the live registry. Nothing is persisted or restored as
+  authority. Entering Plan/research removes forbidden tools even when they were loaded
+  (loaded read-only tools stay loaded), and
+  leaving it rebuilds the tool set from the registry at that moment, so forbidden tools
+  loaded with `tool_search` before the switch need `tool_search` again. No launch
+  selection or restored declaration decides admission: a registered `codemode` is now a
+  candidate in manual launches too (the launchers' codemode marker no longer changes
+  authority). Shells keep their existing parity: `bash` and `powershell` both start
+  active wherever both are authorized. Pi registers its builtin `powershell` on every
+  platform but can run it only on Windows with `pwsh.exe` or `powershell.exe` on
+  PATH, so that builtin, identified by the provenance Pi reports, is now withheld from
+  discovery, the baseline, and new worker catalogs on other hosts. Extension or SDK
+  tools named `powershell` are unaffected. Explicit `--tools`/`--exclude-tools`/`--no-tools`
+  restrictions, hidden or withdrawn registrations, the YouShouldKnow notice setting,
+  native MCP enablement and exposure, and delegated workers' fixed captured catalogs are
+  unchanged.
+- Native Pi tools (#421): `tool_search` now confirms each activation from Pi's actual
+  active set and reports a match Pi declines as not activated and unavailable instead
+  of activated or already active. On Pi 1.3, a `--tools` allowlist that names no
+  `mcp__` entry keeps `direct`-exposure MCP tools registered (so they stay listed as
+  candidates; Pi has no public per-tool activatability query) but never declarable;
+  such a search previously claimed success. A selection Pi declines later is dropped
+  rather than kept as loaded, and direct calls now require Pi's actual active set
+  (nested codemode/deferred callability is unchanged). Pi's policy and `/mcp` exposure
+  are unchanged.
+
 ## [0.1.0-dev.169]
 
 ### Added

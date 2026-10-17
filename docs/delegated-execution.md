@@ -1020,7 +1020,14 @@ optional `powershell` tool on Windows; review-gate treats `powershell` like `bas
 wherever it handles shell commands — side-effect evidence and worker shell-tool
 authorization — subject to actual host availability and authorization: a host that has
 not registered or authorized `powershell` never exposes it, and neither name widens a
-tool catalog on its own.
+tool catalog on its own. Wherever both are authorized, both start active in the
+top-level baseline and in a new delegated worker's initial-active subset. Pi registers
+its builtin `powershell` on every platform but can run it only on Windows with
+`pwsh.exe` or `powershell.exe` on PATH, so review-gate authorizes that builtin only
+where this host contract holds; elsewhere it is withheld from discovery, the baseline,
+and new worker catalogs. See
+[Native Pi tools](native-pi-tools.md#top-level-authority-comes-from-the-live-registry)
+for how the builtin is identified and when host support is checked.
 
 Each Shell tool result carries structured display metadata (command, job lifecycle,
 log range and drop counts, stdin delivery state) in the result's render-only details,

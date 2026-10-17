@@ -239,8 +239,8 @@ command provides its own safe read-only behavior.
 For delegated workers and research subtasks:
 
 - Pi reviewers and Pi workers are always launched with an explicit `--tools` value;
-  worker values are captured from the orchestrator's authorized Pi tools (its reconciled
-  launch authorization — see
+  worker values are captured from the orchestrator's authorized Pi tools (its live
+  registry-derived authorization at task start — see
   [Native Pi tools](native-pi-tools.md#native-pi-tools-mcp-and-codemode)) and narrowed
   further for research. Research workers intersect the parent's authorization with a
   read-only allowlist that excludes `ApplyPatch`, the `codemode` transport, and every
@@ -257,9 +257,12 @@ For delegated workers and research subtasks:
   `--no-builtin-tools`, `defaultTools`, and SDK `noTools:'builtin'` only set initial
   activity; they do not exclude registered tools. Consequently, those settings alone
   do not keep `grep`, `find`, or `ls` inactive in review-gate. Use `--exclude-tools`
-  or an explicit `--tools` allowlist to withhold them. Other inactive tools are not
-  promoted except through an explicit `tool_search` activation by review-gate's own
-  loader. Pi's native MCP and codemode exposure remains reachable through its native
+  or an explicit `--tools` allowlist to withhold them. At the top level every other
+  registered, non-hidden tool is a discovery candidate within the operating mode and
+  live settings, whatever the restored loadout declared
+  ([Native Pi tools](native-pi-tools.md#top-level-authority-comes-from-the-live-registry));
+  inactive tools are not promoted except through an explicit `tool_search` activation
+  by review-gate's own loader. Pi's native MCP and codemode exposure remains reachable through its native
   channels while undeclared, is reconciled into the gate's discovery and activation
   view (see [Native Pi tools](native-pi-tools.md#reconciliation-during-a-running-session)),
   and never overrides an explicit restriction. Configured worker catalogs are never

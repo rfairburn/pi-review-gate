@@ -15,15 +15,20 @@ originate with [#224](https://github.com/rfairburn/pi-review-gate/issues/224).
 | Top-level Prefer execution / Prefer orchestrate; execute-kind Pi workers with codemode authorized | `codemode` is not initially active: discovered and loaded through review-gate's `tool_search`, then called on a later turn | ordinary permitted tools, including `codemode`, load without review-gate deferral; native MCP exposure still applies |
 | Plan/research sessions; research Pi workers | `codemode` and all MCP tool access are off, regardless of the toggle (the read-only role boundary: no reduced-transport exception, no `readOnlyHint` opt-in, no researcher override) | same |
 
-- **Wrapper default is availability only, and the toggle never widens a role.** Wrapper
-  sessions forward arguments unchanged and pass no `--tools` value, and the gate merely
-  admits `codemode` where Pi's registry carries it and no explicit restriction removed
-  it — even with no MCP server at all. A manual extension-only launch (`pi -e`) gets no
-  added default and codemode follows Pi's own settings there; admission is not
-  activation, and switching the toggle never produces a tool the role excludes.
+- **Codemode admission is availability only, and the toggle never widens a role.** At
+  the top level the gate admits `codemode` wherever Pi's registry carries it and no
+  explicit restriction removed it — even with no MCP server at all, and alike for
+  wrapper sessions (which forward arguments unchanged and pass no `--tools` value) and
+  manual extension-only launches (`pi -e`). Neither a launch selection nor a restored
+  declaration decides admission (#421). Admission is not activation, and switching the
+  toggle never produces a tool the role excludes.
 - **Explicit restrictions are authoritative.** `--tools`/`--exclude-tools`/`--no-tools`
   remove `codemode` and MCP tool names from Pi's registry and are never re-added, for
-  the session or any worker; `--no-builtin-tools` and Pi's `defaultTools` only set
+  the session or any worker. Pi's own `--tools` nuance applies: an allowlist that names
+  no `mcp__` entry keeps MCP tools registered for codemode and `tool_search`, and Pi
+  never declares the `direct`-exposure ones it does not name (see
+  [Top-level authority](#top-level-authority-comes-from-the-live-registry));
+  `--no-builtin-tools` and Pi's `defaultTools` only set
   initial activity, so they cannot withhold registered names by themselves
   ([Security model](security-model.md#read-only-enforcement)).
 
@@ -54,8 +59,8 @@ withdrawal or a hidden exposure prunes it.
 Review-gate registers its discovery/activation loader under Pi's replaceable
 builtin name `tool_search`, so there is exactly one model-facing discovery tool.
 Registration happens at session start — after every legitimately available
-top-level execution tool is registered and before the session's authorization
-capture — never at extension load time, so Pi's builtin collision pass sees no
+top-level execution tool is registered and before the session's first authorization
+reconciliation — never at extension load time, so Pi's builtin collision pass sees no
 competing definition whether the builtin tool search is enabled, disabled, or
 toggled across a reload. The descriptor reuses the host-native `tool_search`
 parameter schema by exact reference (borrowed from the live registry when the
@@ -63,7 +68,7 @@ builtin is loaded, otherwise captured from the running install's own bundled
 factory) for Pi 1.1 and older hosts' identity-based recognition. On Pi 1.2 and
 newer, the descriptor declares `reachesTools: () => "all"`, the public contract
 Pi uses to recognize a replacement and wait for native MCP server readiness.
-Neither mechanism grants tool access: the captured authorization ceiling and
+Neither mechanism grants tool access: the live authorization boundary and
 loading gates remain authoritative, and genuine diagnostics — including the
 warning for a truly missing discovery path — remain intact. When no running Pi host resolves (unit tests, non-Pi processes),
 the loader keeps its local fallback schema and startup proceeds unchanged; when
@@ -86,6 +91,56 @@ authorized/exposed registry at the top level, the captured catalog in a
 delegated Pi worker. Activation declares the matched schemas for the next model
 call; it never executes the matched operation, and codemode/deferred tools
 remain callable from scripts while inactive exactly as before.
+
+## Top-level authority comes from the live registry
+
+Pi restores a resumed (`--continue`), switched, or forked conversation's previous tool
+declarations before review-gate starts, so the active set is not evidence of permission.
+At the top level, review-gate derives authority afresh from Pi's current registry at
+session start and at every reconciliation seam below; it never persists, restores, or
+infers a tool list from the transcript.
+
+- Every registered, non-hidden tool Pi currently permits is a discovery candidate,
+  within the operating mode and live feature settings (for example the YouShouldKnow
+  notice setting); `codemode` is no exception. Candidates are listed by the
+  startup inventory and the `tool_search` description and are declared only after
+  `tool_search` loads them; tools already active report as already active.
+- Registered is not always declarable. Pi offers no public per-tool activatability
+  query, so the inventory lists registered candidates, and `tool_search` confirms each
+  activation from Pi's actual active set after loading. A name Pi declines is reported
+  as not activated and unavailable, never as activated or already active, and it is
+  not retained as loaded: a selection Pi declines at any later write is dropped too
+  (a later reappearance needs `tool_search` again), and direct calls require the tool
+  to be in Pi's actual active set. On Pi 1.3, for example, `--tools read,tool_search` keeps a
+  `direct`-exposure MCP tool registered but never declarable; naming it (or an
+  `mcp__` pattern matching it) in `--tools` makes it loadable, and permitted
+  `codemode`/`deferred`-exposure MCP tools load through `tool_search` whenever the
+  allowlist keeps `tool_search` itself.
+  review-gate does not change Pi's policy or `/mcp` exposure to work around a refusal.
+- The role baseline (`read`, `bash`, `powershell`, `edit`, `write`, `grep`, `find`,
+  `ls`, `ApplyPatch`, `SubtasksStart`) is active wherever Pi registers and review-gate
+  authorizes it, regardless of the restored loadout; both shells keep parity when both
+  are authorized. Activity never decides admission or auto-loading.
+- Pi registers its builtin `powershell` on every platform, but Pi can run it only on
+  Windows, using `pwsh.exe` or else `powershell.exe` from PATH. Review-gate identifies
+  the builtin from the public provenance Pi reports for each registered tool
+  (`builtin:powershell`) and authorizes it only on Windows when one of those
+  executables resolves; elsewhere it is withheld from the baseline, discovery,
+  `tool_search`, and new worker catalogs. Host support is checked at session start and
+  on operating-mode changes, never on every reconciliation, so an interpreter installed
+  or removed mid-session is noticed at the next of those points. The check proves that
+  the interpreter resolves, not that any particular command will succeed. Extension or
+  SDK tools named `powershell`, and entries whose provenance the host does not report,
+  are not gated. Existing worker catalogs are never re-derived. `--no-builtin-tools`
+  and `defaultTools` only set Pi's initial activity; withhold tools with
+  `--exclude-tools` or an explicit `--tools` allowlist.
+- Explicit `--tools`/`--exclude-tools`/`--no-tools` restrictions remove names from Pi's
+  registry (subject to the `--tools` MCP nuance above) and stay authoritative; hidden,
+  withdrawn, or natively disabled MCP tools are never reconstructed.
+- Operating-mode changes apply from the next turn. Entering Plan/research removes
+  forbidden tools, including loaded ones, while loaded read-only tools stay loaded;
+  leaving it rebuilds the loadout from the registry at that moment, so forbidden tools
+  loaded before the switch need `tool_search` again.
 
 ## Reconciliation during a running session
 

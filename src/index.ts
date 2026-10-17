@@ -48,7 +48,6 @@ import { boundPath, handleCwdMismatchRestore, safeRestoreFailureDiagnostic, send
 import { createSessionPersistence } from "./activation/persistence";
 import { deferredToolPromptInjection, executionPromptInjection, extractSystemPrompt } from "./activation/prompt-composition";
 import { buildCompletionGuidancePrompt, resolveCompletionSkillPath } from "./activation/completion-guidance";
-import { capturePrimaryCodemodeDefault } from "./activation/primary-codemode-default";
 import { recoverPendingModelDeliveries, releaseQueuedUserInputs } from "./activation/pending-delivery";
 import { createReviewTurnCoordinator, isToolError } from "./activation/review-turn";
 import { registerApplyPatchTool } from "./apply-patch/tool";
@@ -110,14 +109,12 @@ interface ActivationDependencies {
 
 export async function activate(pi: unknown, dependencies: ActivationDependencies = {}): Promise<void> {
   registerSafeMarkdownDisplayTransformer(pi);
-  // Capture wrapper intent and consume its one-shot environment marker before
-  // any await, tool registration, or model-spawned subprocess can inherit it.
   const executorRole = process.env.PI_REVIEW_GATE_RUNTIME_ROLE === "executor";
-  const wrapperCodemodeMarker = !executorRole && process.env.PI_REVIEW_GATE_CODEMODE_DEFAULT === "1";
+  // The launchers' one-shot codemode marker is consumed before any await, tool
+  // registration, or model-spawned subprocess can inherit it. #421: it no
+  // longer changes authority — top-level codemode admission follows Pi's live
+  // registry like every other tool — so its value is not retained.
   delete process.env.PI_REVIEW_GATE_CODEMODE_DEFAULT;
-  // Wrapper opt-in is process-local primary intent. Executor runtimes are
-  // governed only by their fixed catalog and neither read nor retain it.
-  const wrapperCodemodeDefault = !executorRole && capturePrimaryCodemodeDefault(wrapperCodemodeMarker);
 
   // Live session working directory. The top-level branch keeps it updated from
   // hook context; a Pi executor worker's cwd is its stable worktree root.
@@ -189,7 +186,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
 
   // Register GitRead (#73) in both the top-level orchestrator and Pi-native
   // executor runtimes, before any deferred-tool authorization capture. Role
-  // visibility is applied downstream, never here: the captured boundary pins
+  // visibility is applied downstream, never here: the deferred-tool boundary pins
   // it to the plan/research operating mode at the top level, while durable
   // child catalogs admit it for research workers and exclude it from
   // execute-kind workers. Like ApplyPatch it is active by default under Pi's
@@ -324,14 +321,14 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
 
   // The compact loader registers at session start — after executionTools.sync()
   // has registered and reconciled every legitimately available top-level
-  // execution tool and before the authorization capture that pins this
-  // session's boundary. Late registration keeps Pi's load-time replaceable-
+  // execution tool and before the session's first live authorization
+  // reconciliation (#421: top-level authority is derived from Pi's current
+  // registry, never from the restored loadout). Late registration keeps Pi's load-time replaceable-
   // builtin collision pass from seeing a competing tool_search definition, and
   // registerWithNativeSchema reuses the host-native parameter schema.
   const deferredTools = new DeferredToolManager(
     pi,
     () => config.operatingMode,
-    wrapperCodemodeDefault,
     (name) => name !== YOU_SHOULD_KNOW_TOOL_NAME || config.youShouldKnow?.enabled !== false,
   );
   registerDeferredToolLifecycleHooks(pi, deferredTools);
@@ -987,8 +984,8 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
 
   registerHook(pi, "tool_result", async (...args) => {
     // The next provider request can follow this hook immediately. Preserve
-    // loader additions while removing registrations that were never in the
-    // captured authorization boundary.
+    // loader additions while removing activations outside the live
+    // authorization boundary.
     deferredTools.reapply();
     const name = extractToolName(args);
     const toolArgs = extractToolArgs(args);
@@ -1140,14 +1137,20 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
    * running subtasks keep their captured instructions, disclosed counts-only.
    */
   const applyOperatingModeTransition = async (previous: OperatingMode, noticeTarget: unknown): Promise<void> => {
+    // #421/#94: a real mode transition is a documented refresh seam for the
+    // native powershell host-support answer (session start is the other); it
+    // is re-probed lazily by the reapply below only if Pi registers the builtin.
+    if (previous !== config.operatingMode) deferredTools.refreshNativeHostSupport();
     deferredTools.reapply();
     const next = config.operatingMode;
     if (previous === next) return;
     setStatus(noticeTarget, "review-gate-mode", operatingModeStatusText(next));
     const capturedWork = executionTools.reviewReadiness().length + reviewTurn.currentBackgroundReadiness().running.length;
     const detail = next === "plan-research"
-      ? "write-capable tools are hidden until you switch to a write-capable mode"
-      : "previously authorized tools are available again";
+      ? "write-capable tools, MCP tools, and codemode are removed until you switch to a write-capable mode"
+      : previous === "plan-research"
+        ? "the tool set is rebuilt from what Pi currently permits; forbidden tools loaded with tool_search before Plan/research need tool_search again"
+        : "tool availability follows what Pi currently permits";
     await sendNotice(
       noticeTarget,
       `review gate: operating mode is now ${OPERATING_MODE_LABELS[next]}; the mode prompt and tool set apply from the next turn. ${capturedWork > 0 ? `${capturedWork} running work item(s) keep their captured instructions until they finish. ` : ""}${detail}.`,

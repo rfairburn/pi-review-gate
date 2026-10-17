@@ -235,6 +235,57 @@ module.exports = async function (pi) {
 		return faux.fauxAssistantMessage(STOP_TEXT, { stopReason: 'stop' });
 	}
 
+	/**
+	 * The loadout one model request carries. Pi 1.3 sends the prompt and tool
+	 * declarations as transcript system messages (the first lists every
+	 * section and tool; later ones patch `sections` by name and list
+	 * `toolsAdded`/`toolsRemoved`), so replaying them in order yields exactly
+	 * what this request declares. Context-level `tools`/`systemPrompt` (older
+	 * hosts) are folded in when present.
+	 */
+	function declaredLoadout(context) {
+		const tools = new Map();
+		const sections = new Map();
+		// A before_agent_start systemPrompt is projected as a head system
+		// message whose `content` holds the forced prompt text.
+		let forced = '';
+		for (const message of Array.isArray(context.messages) ? context.messages : []) {
+			if (message?.role !== 'system') continue;
+			const content = typeof message.content === 'string'
+				? message.content
+				: Array.isArray(message.content)
+					? message.content.map((block) => (block?.type === 'text' && typeof block.text === 'string' ? block.text : '')).join('')
+					: '';
+			if (content) forced = content;
+			if (message.sections && typeof message.sections === 'object') {
+				for (const [name, value] of Object.entries(message.sections)) {
+					if (value === null) sections.delete(name);
+					else if (typeof value === 'string') sections.set(name, value);
+				}
+			}
+			for (const removed of Array.isArray(message.toolsRemoved) ? message.toolsRemoved : []) {
+				if (typeof removed?.name === 'string') tools.delete(removed.name);
+			}
+			for (const added of Array.isArray(message.toolsAdded) ? message.toolsAdded : []) {
+				if (typeof added?.name === 'string') tools.set(added.name, added);
+			}
+		}
+		for (const tool of Array.isArray(context.tools) ? context.tools : []) {
+			if (typeof tool?.name === 'string') tools.set(tool.name, tool);
+		}
+		const prompt = [
+			...(typeof context.systemPrompt === 'string' ? [context.systemPrompt] : []),
+			...(forced ? [forced] : []),
+			...sections.values(),
+		].join('\n\n');
+		const search = tools.get('tool_search');
+		return {
+			requestToolNames: [...tools.keys()],
+			toolSearchDescription: typeof search?.description === 'string' ? search.description : null,
+			systemPrompt: prompt.slice(0, 200_000),
+		};
+	}
+
 	// appendResponses queues a self-perpetuating factory: each stream call
 	// consumes one queued step and re-queues the factory, so every REQUEST is
 	// answered from the CURRENT turn script (sequenced by the transcript's
@@ -246,6 +297,10 @@ module.exports = async function (pi) {
 		journalProbe('model_request', {
 			requestIndex: index,
 			stepsAvailable: steps.length,
+			// The exact tool declarations (schemas) and system prompt this model
+			// request received, so consumers can assert what the model actually
+			// saw rather than a registry or active-set snapshot (#421).
+			...declaredLoadout(context),
 			lastUserPreview: (() => {
 				for (let i = context.messages.length - 1; i >= 0; i -= 1) {
 					if (context.messages[i].role === 'user') {
@@ -347,6 +402,10 @@ module.exports = async function (pi) {
 					description: typeof tool.description === 'string' ? tool.description.slice(0, 200) : tool.description,
 					// Pi 1.2+ reports a reaching tool's reachesTools (#388); record what an empty-input call reaches.
 					reachesTools: reachSummary(tool),
+					// Public provenance (#421): Pi's own builtins report `builtin:<name>`.
+					sourceInfo: tool.sourceInfo && typeof tool.sourceInfo === 'object'
+						? { path: tool.sourceInfo.path, source: tool.sourceInfo.source }
+						: undefined,
 				}));
 				const dump = {
 					ts: Date.now(),

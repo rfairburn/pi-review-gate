@@ -13,6 +13,8 @@ import {
   stateFromWaveProgress,
 } from "../src/execution/background-controller";
 import { ExecutionToolManager } from "../src/execution/tool";
+import { DeferredToolManager } from "../src/deferred-tools";
+import type { OperatingMode } from "../src/config";
 import { createExecutorToolCatalog, type ExecutorToolCatalog } from "../src/execution/tool-catalog";
 import { createState } from "../src/state";
 import { NativeToolCallPreflight } from "../src/tool-call-preflight";
@@ -46,6 +48,8 @@ function harness(options: {
   /** Durable-by-reference parent snapshot: tests may mutate the live list mid-run. */
   liveParentTools?: string[];
   omitActiveToolSnapshot?: boolean;
+  /** Production wiring: the parent's live deferred-tool authority (index.ts passes DeferredToolManager.authorizedToolNames). */
+  authorizedTools?: () => string[] | undefined;
   deferredPiTools?: boolean;
   submittedFingerprintFor?: (toolCallId: string, toolName: string) => string | undefined;
   onNativeToolError?: (toolCallId: string, toolName: string) => void;
@@ -113,6 +117,7 @@ function harness(options: {
     cwd: () => options.cwd ?? process.cwd(),
     submittedFingerprintFor: options.submittedFingerprintFor,
     onNativeToolError: options.onNativeToolError,
+    authorizedTools: options.authorizedTools,
     notify: (message) => { notices.push(message); },
     onExpandedViewChanged: (expanded) => { config.ui = { ...config.ui, subtasksViewExpanded: expanded }; },
   });
@@ -1508,3 +1513,64 @@ async function waitUntil<T>(condition: () => Promise<T | undefined | false>, tim
   }
   throw new Error(`condition was not satisfied within ${timeoutMs}ms`);
 }
+
+test("#421 delegated catalogs capture the parent's live registry authority once; later primary mode and registry changes never mutate them", async () => {
+  // A resumed parent whose restored loadout declared only `read`: every other
+  // registered tool is inactive, yet it is live top-level authority.
+  const registry = ["read", "bash", "edit", "write", "grep", "find", "ls", "powershell", "ApplyPatch", "WebSearch", "WebFetch", ...executionToolNames]
+    .map((name) => ({ name, description: `${name} tool.` }));
+  const active = ["read"];
+  const parentHost = {
+    registerTool(definition: { name: string }) {
+      const index = registry.findIndex((entry) => entry.name === definition.name);
+      if (index >= 0) registry.splice(index, 1, definition as { name: string; description: string });
+      else registry.push(definition as { name: string; description: string });
+    },
+    getActiveTools: () => [...active],
+    getAllTools: () => [...registry],
+    setActiveTools(names: string[]) { active.splice(0, active.length, ...names); },
+  };
+  let mode: OperatingMode = "execute";
+  const deferred = new DeferredToolManager(parentHost, () => mode);
+  deferred.register();
+  assert.equal(deferred.sessionStart({}), true);
+  const { tools, manager } = harness({
+    slowExecutor: true,
+    researchCapable: true,
+    authorizedTools: () => deferred.authorizedToolNames(),
+    // The same live parent host supplies the active snapshot.
+    liveParentTools: active,
+  });
+  try {
+    const execute = await startTransportFixtureTask(tools, "live-authority-execute", "execute");
+    const research = await startTransportFixtureTask(tools, "live-authority-research", "research");
+    const executeCatalog = structuredClone(execute.details.tasks[0].definition.executorToolCatalog);
+    const researchCatalog = structuredClone(research.details.tasks[0].definition.executorToolCatalog);
+    // Fresh registry-derived parent authority, not the restored loadout.
+    for (const name of ["bash", "write", "ApplyPatch", "WebSearch", "WebFetch"]) {
+      assert.ok(executeCatalog.allowedToolCatalog.includes(name), `execute ceiling carries ${name}`);
+    }
+    assert.deepEqual([...researchCatalog.allowedToolCatalog].sort(), ["WebFetch", "WebSearch", "find", "grep", "ls", "read"]);
+    // An authorized powershell (no native-builtin provenance here) keeps
+    // historical shell parity with bash in the new worker's initial subset.
+    assert.ok(executeCatalog.allowedToolCatalog.includes("powershell"));
+    assert.ok(executeCatalog.initialActiveTools.includes("powershell"));
+    assert.ok(executeCatalog.initialActiveTools.includes("bash"));
+    assert.ok(executeCatalog.initialActiveTools.includes("write"));
+
+    // The primary switches to Plan/research, a new tool registers, and an
+    // existing one is withdrawn: the parent's live authority changes...
+    mode = "plan-research";
+    parentHost.registerTool({ name: "late_registered", description: "Late tool." } as { name: string });
+    parentHost.registerTool({ name: "WebSearch", description: "Withdrawn.", exposure: "hidden" } as { name: string });
+    deferred.reapply();
+    assert.ok(deferred.authorizedToolNames()?.includes("late_registered"));
+    assert.equal(deferred.authorizedToolNames()?.includes("WebSearch"), false);
+    // ...but already-captured worker ceilings are durable and unchanged.
+    assert.deepEqual(execute.details.tasks[0].definition.executorToolCatalog, executeCatalog);
+    assert.deepEqual(research.details.tasks[0].definition.executorToolCatalog, researchCatalog);
+  } finally {
+    await manager.shutdown();
+    await manager.detach();
+  }
+});

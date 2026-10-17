@@ -1114,6 +1114,10 @@ export class ExecutionToolManager {
     // #220: inplace children additionally lose every Subtasks*-prefixed
     // delegation control — the parent's other authorized capabilities stay
     // intact, but an in-place worker cannot launch recursive subtasks.
+    // #421: the parent authority is the live registry, already narrowed to
+    // shells the host genuinely supports (an unsupported native `powershell`
+    // builtin never reaches it). Every authorized shell keeps historical
+    // parity in the child ceiling and the conservative initial subset.
     const childTools = (kind === "research"
       ? researchToolIntersection(allowedTools)
       : (kind === "inplace"

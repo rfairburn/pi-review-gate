@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { afterEach, beforeEach } from "node:test";
 import { activate } from "../src/index";
-import { resetPrimaryCodemodeDefaultForTests } from "../src/activation/primary-codemode-default";
 import { RESEARCH_ALLOWED_TOOLS } from "../src/execution/tool";
 import { EXECUTOR_TOOL_CATALOG_ENV, createExecutorToolCatalog } from "../src/execution/tool-catalog";
 import {
@@ -129,7 +128,6 @@ const environmentNames = [
 ];
 
 beforeEach(() => {
-  resetPrimaryCodemodeDefaultForTests();
   previousEnvironment.clear();
   for (const name of environmentNames) previousEnvironment.set(name, process.env[name]);
   delete process.env.PI_REVIEW_GATE_DISABLED;
@@ -148,7 +146,6 @@ beforeEach(() => {
 
 afterEach(() => {
   reapAll();
-  resetPrimaryCodemodeDefaultForTests();
   delete (globalThis as Record<PropertyKey, unknown>)[SESSION_HOST_SPAWN_CAPABILITY_KEY];
   startupRequestTest.clearProcessMetadata();
   for (const [name, value] of previousEnvironment) {
@@ -227,7 +224,6 @@ function loadFreshActivate(): typeof activate {
   // Clear both modules while leaving globalThis intact, as a real Pi process
   // does when it reloads extension code.
   delete require.cache[require.resolve("../src/index")];
-  delete require.cache[require.resolve("../src/activation/primary-codemode-default")];
   return (require("../src/index") as { activate: typeof activate }).activate;
 }
 
@@ -331,7 +327,7 @@ test("primary wrapper codemode intent survives module reload and a replaced sess
   }
 });
 
-test("a fresh manual primary activation does not inherit wrapper codemode default", async () => {
+test("#421 a manual primary activation admits a registered codemode as a deferred candidate from the live registry", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-review-native-tools-manual-"));
   try {
     await writeConfig(cwd);
@@ -339,9 +335,12 @@ test("a fresh manual primary activation does not inherit wrapper codemode defaul
     await activate(runtime.pi);
     await startSession(runtime);
 
-    assert.doesNotMatch(runtime.definitions.get("tool_search")?.description ?? "", /codemode/);
+    // No wrapper marker and no active declaration: registry presence alone
+    // makes codemode a candidate; it is never auto-declared.
+    assert.match(runtime.definitions.get("tool_search")?.description ?? "", /codemode/);
+    assert.equal(runtime.activeTools().includes("codemode"), false);
     const result = await searchTool(runtime)("manual-codemode", { query: "codemode" });
-    assert.deepEqual((result.details as { matched: string[] }).matched, []);
+    assert.deepEqual((result.details as { activated: string[] }).activated, ["codemode"]);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
@@ -468,7 +467,7 @@ test("the initial hosted request waits for review initialization and is persiste
   }
 });
 
-test("executor activation consumes but never captures primary wrapper codemode intent", async () => {
+test("executor activation consumes the launcher codemode marker and keeps its fixed catalog", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-review-native-tools-executor-default-"));
   const primaryCwd = join(cwd, "primary");
   try {
@@ -495,8 +494,10 @@ test("executor activation consumes but never captures primary wrapper codemode i
     const primary = new NativeToolRuntime(primaryCwd, nativeDefinitions(), ["read"]);
     await activate(primary.pi);
     await startSession(primary);
-    assert.doesNotMatch(primary.definitions.get("tool_search")?.description ?? "", /codemode/,
-      "an executor marker cannot seed primary-process wrapper intent");
+    // #421: the primary's codemode admission follows its own live registry,
+    // never a marker (consumed or not).
+    assert.match(primary.definitions.get("tool_search")?.description ?? "", /codemode/);
+    assert.equal(primary.activeTools().includes("codemode"), false);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

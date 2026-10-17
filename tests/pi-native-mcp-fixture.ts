@@ -48,6 +48,12 @@
  *   project `mcp.json` and starting a new session (Pi re-reads project config
  *   on every session start).
  *
+ * - process restart over the same scratch tree (`respawn(["--continue"])`)
+ *   and answers to native RPC extension-UI dialogs (`setUiResponder`), so an
+ *   extension's real selector-based command (e.g. `/review-settings`) can be
+ *   driven; the probe journals each model request's declared tools and
+ *   system prompt as Pi actually sent them.
+ *
  * Deliberately NOT covered (documented, not faked): the TUI-only parts of
  * `/mcp` (manager, enable/disable, exposure editing — RPC has no manager UI),
  * `pi.registerMcpServer`/`unregisterMcpServer` registration lifecycle, and
@@ -141,6 +147,15 @@ export interface FixtureTurnStep {
 	codemode?: string;
 }
 
+/**
+ * Answer for one native RPC extension-UI dialog (`extension_ui_request` with
+ * method select/confirm/input/editor), sent back as `extension_ui_response`.
+ * `undefined` cancels the dialog.
+ */
+export type FixtureUiAnswer = { value: string } | { confirmed: boolean } | { cancelled: true } | undefined;
+export type FixtureUiResponder = (request: FixtureEvent) => FixtureUiAnswer;
+const DIALOG_UI_METHODS = new Set(["select", "confirm", "input", "editor"]);
+
 /** Denial simulation: the probe's standalone `tool_call` blocking seam. */
 export interface FixtureDenialPolicy {
 	tools: string[];
@@ -159,6 +174,8 @@ export interface ProbeDump {
 		description?: string;
 		/** What reachesTools({}) returned when Pi reports the field (Pi 1.2+); absent otherwise. */
 		reachesTools?: "all" | string[] | string;
+		/** Public provenance path/source as Pi reports it (`builtin:<name>` for Pi's own builtins). */
+		sourceInfo?: { path?: string; source?: string };
 	}>;
 	commands?: string[];
 }
@@ -501,6 +518,8 @@ export class NativeMcpFixture {
 	private disposed = false;
 	private childDied: string | undefined;
 	private timeouts: Required<NonNullable<NativeMcpFixtureOptions["timeouts"]>>;
+	/** Optional native extension-UI dialog responder (RPC sub-protocol). */
+	private uiResponder: FixtureUiResponder | undefined;
 	/** Synthetic executor-role session id (executorToolCatalog options only). */
 	private executorSessionId: string | undefined;
 	/** Fresh parent-side settlement identity; the child captures and erases its env entries. */
@@ -676,6 +695,70 @@ export class NativeMcpFixture {
 	 */
 	async runCommand(message: string): Promise<unknown> {
 		return await this.rpc("prompt", { message });
+	}
+
+	/**
+	 * Answer native extension-UI dialogs (the documented RPC
+	 * `extension_ui_request`/`extension_ui_response` sub-protocol) — e.g. to
+	 * drive an extension's real selector-based settings command. Unset (the
+	 * default) leaves dialogs unanswered exactly as before.
+	 */
+	setUiResponder(responder: FixtureUiResponder | undefined): void {
+		this.uiResponder = responder;
+	}
+
+	/**
+	 * Restart the native pi PROCESS against the same scratch tree (project,
+	 * agent dir, session dir, MCP config, fixture state), appending
+	 * `extraArgs` for this launch only — e.g. `["--continue"]` resumes the
+	 * most recent session from disk exactly as a user restart would. Not
+	 * supported for executor-role launches (their settlement identity is
+	 * one-shot per child).
+	 */
+	async respawn(extraArgs: string[] = []): Promise<void> {
+		if (this.options.executorToolCatalog !== undefined) {
+			throw new Error("respawn() is not supported for executor-role launches (one-shot settlement identity)");
+		}
+		const previous = this.child;
+		this.child = undefined;
+		if (previous && previous.exitCode === null && previous.signalCode === null) {
+			const dead = firstExit(previous);
+			try {
+				previous.kill("SIGTERM");
+			} catch {
+				// Already gone.
+			}
+			const exited = await Promise.race([dead.then(() => true), delay(10_000).then(() => false)]);
+			if (!exited) {
+				try {
+					previous.kill("SIGKILL");
+				} catch {
+					// Gone.
+				}
+				await firstExit(previous);
+			}
+		}
+		this.rejectAllPending("pi child respawned");
+		this.childDied = undefined;
+		this.spawnPiChild(extraArgs);
+		await this.ensureScriptedModel();
+	}
+
+	/** Parsed probe journal entries (model requests carry the declared tool names and system prompt). */
+	readProbeJournal(): FixtureEvent[] {
+		if (!existsSync(this.paths.probeJournal)) return [];
+		return readFileSync(this.paths.probeJournal, "utf8")
+			.split("\n")
+			.map((line) => line.trim())
+			.filter(Boolean)
+			.flatMap((line) => {
+				try {
+					const parsed = JSON.parse(line) as unknown;
+					return isRecord(parsed) ? [parsed] : [];
+				} catch {
+					return [];
+				}
+			});
 	}
 
 	/** Script the provider responses for the next agent turn (per model REQUEST, in order). */
@@ -928,7 +1011,7 @@ export class NativeMcpFixture {
 		};
 	}
 
-	private spawnPiChild(): void {
+	private spawnPiChild(extraArgs: readonly string[] = []): void {
 		const executorLaunch = this.executorLaunchPlan();
 		const args = [
 			this.host.cliEntry,
@@ -950,6 +1033,8 @@ export class NativeMcpFixture {
 		// Consumer-owned arguments go through unchanged (wrapper-style explicit
 		// restriction flags; validated against a fixture-owned allowlist above).
 		if (this.options.piArgs && this.options.piArgs.length > 0) args.push(...this.options.piArgs);
+		// Per-launch arguments (respawn only), e.g. --continue.
+		if (extraArgs.length > 0) args.push(...extraArgs);
 		// Executor-role launch shape, byte-for-byte like the production adapter's
 		// childArgs: the synthetic session id is the settlement identity's
 		// session anchor, and ONE --tools allowlist carries the captured allowed
@@ -1005,6 +1090,7 @@ export class NativeMcpFixture {
 		let stdoutBuffer = "";
 		child.stdout?.setEncoding("utf8");
 		child.stdout?.on("data", (chunk: string) => {
+			if (this.child !== child) return;
 			stdoutBuffer += chunk;
 			for (;;) {
 				const newline = stdoutBuffer.indexOf("\n");
@@ -1019,11 +1105,13 @@ export class NativeMcpFixture {
 			this.stderrTail = `${this.stderrTail}${chunk}`.slice(-16_000);
 		});
 		child.on("error", (error) => {
+			if (this.child !== child) return;
 			this.childDied = `spawn error: ${String(error)}`;
 			this.rejectAllPending(this.childDied);
 		});
 		child.on("close", (code, signal) => {
-			if (this.disposed) return;
+			// A respawned (replaced) child's exit never reflects on the live one.
+			if (this.disposed || this.child !== child) return;
 			this.childDied = `exited with ${code === null ? `signal ${signal}` : `status ${code}`}`;
 			this.rejectAllPending(this.childDied);
 		});
@@ -1050,6 +1138,21 @@ export class NativeMcpFixture {
 			return;
 		}
 		this.sessionEvents.push(event);
+		if (event.type === "extension_ui_request" && typeof event.id === "string"
+			&& typeof event.method === "string" && DIALOG_UI_METHODS.has(event.method) && this.uiResponder) {
+			let answer: FixtureUiAnswer;
+			try {
+				answer = this.uiResponder(event);
+			} catch {
+				answer = undefined;
+			}
+			try {
+				this.child?.stdin?.write(`${JSON.stringify({ type: "extension_ui_response", id: event.id, ...(answer ?? { cancelled: true }) })}\n`);
+			} catch {
+				// A dead child cannot answer; pending RPCs reject on close.
+			}
+			return;
+		}
 		if (event.type === "response" && typeof event.id === "string") {
 			const pendingEntry = this.pending.get(event.id);
 			if (!pendingEntry) return;

@@ -185,8 +185,9 @@ and `YouShouldKnow` is in the current live, authorized discovery ceiling.
   hide or disable `YouShouldKnow` and does not forbid an otherwise-authorized call.
   When both settings are On, the extension supplies the prompt only if live authorized
   discovery currently exposes `YouShouldKnow`—including when it is deferred but has
-  not yet been activated. The prompt is absent when the current launch authorization
-  or operating mode excludes the tool. It points to the skill from the launcher's
+  not yet been activated. The prompt is absent when Pi's current registry (for example
+  an explicit `--tools`/`--exclude-tools` restriction) or the operating mode excludes the
+  tool. It points to the skill from the launcher's
   `~/.agents/skills/pi-review-gate-completion/SKILL.md` location, falling back to the
   skill bundled with the extension package. That package fallback supports the
   automatic pointer only; it does not install the skill in Pi's native skill-discovery

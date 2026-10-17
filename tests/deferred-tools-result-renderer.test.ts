@@ -187,3 +187,41 @@ function fixtureWithSearch() {
     sessionIdentity: object;
   };
 }
+test("#421 a host-declined match renders as not activated, never as activated or already active", () => {
+  const fixture = fixtureWithSearch();
+  const params = { query: "mcp__docs__direct" };
+  const refusedOnly = {
+    content: [{ type: "text", text: "Matched authorized tools: mcp__docs__direct.\nNot activated: mcp__docs__direct." }],
+    details: { matched: ["mcp__docs__direct"], activated: [], alreadyActive: [], refused: ["mcp__docs__direct"], omitted: 0, outcome: "refused" },
+    isError: true,
+  };
+  const collapsed = render(fixture.tool, refusedOnly, { expanded: false, isPartial: false }, params).join("\n");
+  assert.match(collapsed, /refused/);
+  assert.doesNotMatch(collapsed, /already active|activated mcp__docs__direct/);
+
+  // A refusal beside a usable result: the declined name is listed on its own.
+  const mixed = {
+    content: [{ type: "text", text: "Matched authorized tools: WebSearch, mcp__docs__direct." }],
+    details: { matched: ["WebSearch", "mcp__docs__direct"], activated: ["WebSearch"], alreadyActive: [], refused: ["mcp__docs__direct"], omitted: 0, outcome: "activated" },
+    isError: false,
+  };
+  const mixedCollapsed = render(fixture.tool, mixed, { expanded: false, isPartial: false }, params);
+  assert.equal(mixedCollapsed[0], 'tool_search · "mcp__docs__direct" · activated WebSearch');
+  assert.ok(mixedCollapsed.includes("Not activated by Pi (1): mcp__docs__direct."), mixedCollapsed.join("\n"));
+  const mixedExpanded = render(fixture.tool, mixed, { expanded: true, isPartial: false }, params);
+  const declinedAt = mixedExpanded.indexOf("Not activated (declined by Pi's tool policy):");
+  assert.ok(declinedAt >= 0 && mixedExpanded[declinedAt + 1] === "  mcp__docs__direct", mixedExpanded.join("\n"));
+  assert.ok(!mixedExpanded.includes("Already active:"), "the declined name is never relabeled already active");
+  assert.ok(mixedExpanded.includes("The declined tool is unavailable in this session."));
+
+  // Details with a refused list but no alreadyActive array (legacy fallback)
+  // still never relabel the declined match as already active.
+  const legacy = {
+    content: [{ type: "text", text: "Matched authorized tools: mcp__docs__direct." }],
+    details: { matched: ["mcp__docs__direct"], activated: [], refused: ["mcp__docs__direct"], outcome: "refused" },
+    isError: false,
+  };
+  const legacyCollapsed = render(fixture.tool, legacy, { expanded: false, isPartial: false }, params).join("\n");
+  assert.match(legacyCollapsed, /not activated mcp__docs__direct/);
+  assert.doesNotMatch(legacyCollapsed, /already active/);
+});

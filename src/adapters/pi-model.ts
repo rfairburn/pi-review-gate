@@ -90,7 +90,10 @@ export class PiModelAdapter implements ModelAdapter {
         ? providerFailureDiagnostic(extracted.terminalError, output)
         : missingFinalTextDiagnostic(output);
     await Promise.all([
-      writeFile(rawStreamPath, output.stdout, "utf8"),
+      writeFile(rawStreamPath, output.stdout, "utf8").catch((error: unknown) => {
+        throw new Error([error instanceof Error ? error.message : "Reviewer artifact write failed.", output.terminationError]
+          .filter(Boolean).join("\n"));
+      }),
       writeReviewerProcessArtifacts({
         paths: artifacts,
         output,
@@ -123,8 +126,9 @@ export class PiModelAdapter implements ModelAdapter {
           "provider_error",
           extracted.usage,
         ),
-        diagnostic: extracted.terminalError,
+        diagnostic: [extracted.terminalError, output.terminationError].filter(Boolean).join("\n"),
         telemetry: processTelemetry(output),
+        processSettlement: output.processSettlement,
       };
     }
     if (!extracted.text.trim()) {
@@ -140,12 +144,16 @@ export class PiModelAdapter implements ModelAdapter {
         extracted.usage,
         ),
         telemetry: processTelemetry(output),
+        processSettlement: output.processSettlement,
+        diagnostic: output.terminationError,
       };
     }
 
     const result = parseReviewResult(req.id, extracted.text, artifacts.rawOutput);
     result.usage = extracted.usage;
     result.telemetry = processTelemetry(output);
+    result.processSettlement = output.processSettlement;
+    result.diagnostic = output.terminationError;
     return result;
   }
 }

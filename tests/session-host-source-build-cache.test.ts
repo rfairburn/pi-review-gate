@@ -21,7 +21,7 @@ interface BuildResult {
   error?: Error;
   diagnostics?: string;
   stagingRoot?: string;
-  ownedStage?: { root: string; identity: { dev: bigint; ino: bigint }; chain?: Array<{ target: string; identity: { dev: bigint; ino: bigint } }> };
+  ownedStage?: { root: string; identity: { dev: bigint; ino: bigint }; chain?: Array<{ target: string; identity: { dev: bigint; ino: bigint } }>; generation?: { release(): boolean } };
   sourceFingerprint?: string;
   toolchainFingerprint?: string;
   cacheKey?: string;
@@ -181,7 +181,7 @@ function newCounters(): Counters {
 }
 
 async function build(fixture: Fixture, counters: Counters, env = fixture.env, hooks: BuildHooks = {}, forceFresh = false): Promise<BuildResult> {
-  return launcher.__test.buildSourceExtension({
+  const result = await launcher.__test.buildSourceExtension({
     packageRoot: fixture.packageRoot,
     agentDir: fixture.agentDir,
     env,
@@ -189,6 +189,10 @@ async function build(fixture: Fixture, counters: Counters, env = fixture.env, ho
     testHooks: hooks.testHooks,
     ...buildRunners(counters, hooks),
   });
+  // This helper inspects build output only; it never starts a consumer. Its
+  // synchronous fixture runners have settled when the producer returns.
+  if (result.status === 0) assert.equal(result.ownedStage?.generation?.release(), true);
+  return result;
 }
 
 async function launch(fixture: Fixture, counters: Counters, buildResults: BuildResult[] = [], hooks: BuildHooks = {}): Promise<{ status: number; loaded: string[]; diagnostics: string[] }> {
@@ -225,7 +229,12 @@ async function launch(fixture: Fixture, counters: Counters, buildResults: BuildR
       counters.load += 1;
       loaded.push(entry);
       assert.ok(existsSync(entry), "only an available compiled entry is handed to the module loader");
-      return { runSessionHost: () => 0 };
+      return { runSessionHost: (options: { onCacheConsumersSettled: () => void }) => {
+        // This fixture owns no real native child. Explicit settlement, not a
+        // bare numeric zero, models Main's positive lifecycle handoff.
+        options.onCacheConsumersSettled();
+        return 0;
+      } };
     },
     writeOut: () => undefined,
     writeError: (text: string) => diagnostics.push(text),

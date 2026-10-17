@@ -20,7 +20,7 @@ import { runAskReviewer, runReview } from "./review";
 import { primaryEvidencePolicy, evidenceMethodNotice, isEligibleReviewCaptureFailure, TOOL_ONLY_HISTORY_NOTICE } from "./review-evidence";
 import { sendPrimaryEvidenceWarning } from "./activation/primary-evidence";
 import { extractSignal, isEscapeTerminalInput, onTerminalInput, sendNotice, sendFollowUp, sendSteeringPrompt, createStatusTracker } from "./pi";
-import type { ActiveReviewCancellation, ReviewCancellationCoordinator } from "./review-cancellation";
+import { reviewCancellationMessage, type ActiveReviewCancellation, type ReviewCancellationCoordinator } from "./review-cancellation";
 import { formatTokenUsage } from "./usage";
 import type { ReviewFinding, ReviewResult } from "./schema";
 import { createReviewTransmissionMessage, deliverReviewTransmission, type ReviewTransmissionAction } from "./transmission";
@@ -134,7 +134,7 @@ export function registerCommands(input: RegisterCommandsInput): void {
   });
 
   registerCommand("review-cancel", {
-    description: "Cancel the active automatic or command-driven review and wait for reviewer processes to stop.",
+    description: "Cancel the active automatic or command-driven review and report process settlement.",
     handler: async (_args: string, ctx: unknown) => {
       if (!isSessionActive()) {
         return;
@@ -146,8 +146,8 @@ export function registerCommands(input: RegisterCommandsInput): void {
       }
       active.requestCancel("manual");
       await active.acknowledgeCancellation();
-      // Completion is reported only once the owning run has returned, which
-      // guarantees reviewer child processes are gone before quiescence is claimed.
+      // Return alone is not process-settlement evidence. The owner exposes its
+      // result before resolving settled, including when bounded cleanup is uncertain.
       await active.settled;
       await active.notifyCancellation();
     },
@@ -184,15 +184,16 @@ export function registerCommands(input: RegisterCommandsInput): void {
       const statusTracker = createStatusTracker(ctx, "review-gate", "reviewing changes");
       let settleCommandReview!: () => void;
       const commandReviewSettled = new Promise<void>((resolvePromise) => { settleCommandReview = resolvePromise; });
+      let output: Awaited<ReturnType<typeof runReview>> | undefined;
       const reviewAbort = createCommandReviewAbort(ctx, input.sessionSignal, {
         cancellation: input.cancellation,
         isSessionActive,
         settled: commandReviewSettled,
         describe: () => "the /review-now review",
-        completionMessage: "review gate: review cancelled; reviewer processes stopped",
+        kind: "review",
+        getResult: () => output?.result,
       });
       const reviewSignal = combineAbortSignals(extractSignal([ctx]), reviewAbort.signal);
-      let output;
       try {
         output = await runReview({
           evidencePolicy: primaryEvidencePolicy(input.config),
@@ -445,15 +446,16 @@ export function registerCommands(input: RegisterCommandsInput): void {
       const statusTracker = createStatusTracker(ctx, "review-gate", "asking reviewer");
       let settleCommandReview!: () => void;
       const commandReviewSettled = new Promise<void>((resolvePromise) => { settleCommandReview = resolvePromise; });
+      let output: Awaited<ReturnType<typeof runAskReviewer>> | undefined;
       const reviewAbort = createCommandReviewAbort(ctx, input.sessionSignal, {
         cancellation: input.cancellation,
         isSessionActive,
         settled: commandReviewSettled,
         describe: () => "the reviewer question",
-        completionMessage: "review gate: reviewer question cancelled; reviewer processes stopped",
+        kind: "reviewer question",
+        getResult: () => output?.result,
       });
       const reviewSignal = combineAbortSignals(extractSignal([ctx]), reviewAbort.signal);
-      let output;
       try {
         output = await runAskReviewer({
           evidencePolicy: primaryEvidencePolicy(input.config),
@@ -681,7 +683,8 @@ interface CommandReviewAbortOptions {
   isSessionActive: () => boolean;
   settled: Promise<void>;
   describe: () => string;
-  completionMessage: string;
+  kind: "review" | "reviewer question";
+  getResult: () => ReviewResult | undefined;
 }
 
 function createCommandReviewAbort(
@@ -709,7 +712,10 @@ function createCommandReviewAbort(
       return Promise.resolve();
     }
     if (!cancellationNotice) {
-      cancellationNotice = sendNotice(ctx, options.completionMessage).catch(() => undefined);
+      cancellationNotice = options.settled.then(async () => {
+        if (!options.isSessionActive()) return;
+        await sendNotice(ctx, reviewCancellationMessage(options.kind, options.getResult()));
+      }).catch(() => undefined);
     }
     return cancellationNotice;
   };

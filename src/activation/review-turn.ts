@@ -632,6 +632,9 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
       let settleReview!: () => void;
       const reviewSettled = new Promise<void>((resolvePromise) => { settleReview = resolvePromise; });
       activeReviewSettled = reviewSettled;
+      // Assigned before finally resolves settled: /review-cancel may resume
+      // immediately at that boundary, before the completion branch below.
+      let output: ReviewRunOutput | undefined;
       // The terminal-input listener must be installed before any await so Escape
       // (and /review-cancel) can abort while evidence drains or state persists;
       // the handler itself gates on reviewInProgress.
@@ -643,6 +646,7 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
         cancellation: deps.cancellation,
         settled: reviewSettled,
         describe: () => "the automatic review",
+        getResult: () => output?.result,
       });
       activeReviewAbort = reviewAbort;
       try {
@@ -675,7 +679,6 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
       // input, /review-cancel, and session shutdown.
       const statusTracker = createStatusTracker(noticeTarget, "review-gate", "reviewing changes");
       activeStatusTracker = statusTracker;
-      let output: ReviewRunOutput;
       try {
         output = await runReview({
           evidencePolicy: reviewEvidencePolicy,

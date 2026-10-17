@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.174]
+## [0.1.0-dev.177]
 
 ### Added
 
@@ -47,6 +47,56 @@ dates.
   review guide includes a disposable-candidate manual exercise and the supported
   `SCRIPT`/independent `REPORT` example, with adapter and attribution limits and
   InPlace's post-hoc/no-rollback boundary preserved.
+
+## [0.1.0-dev.176]
+
+### Fixed
+
+- Review cancellation (#397): automatic reviews, `/review-now`, and reviewer questions
+  now report stopped reviewer processes only with positive process-settlement evidence.
+  Bounded teardown without confirmed cleanup explicitly reports termination unconfirmed;
+  an uncertain reviewer cannot be masked by a settled sibling. Cancellation results and
+  tombstones retain termination diagnostics, but discard partial verdicts as before.
+  Cancellation authority, teardown deadlines, baseline preservation, and popup Escape
+  ownership are unchanged. Production regressions cover uncertain and confirmed
+  automatic and command cancellation on native Windows.
+
+## [0.1.0-dev.175]
+
+### Fixed
+
+- Codex executor terminal cancellation (#425) starts owned teardown without
+  waiting for an interrupt reply or ordinary turn timeout, fences late
+  replacement work, and preserves truthful concurrent steering acceptance and
+  completed output. The existing two-second SIGTERM-to-SIGKILL escalation now
+  has a seven-second close/drain bound and a separate five-second lifecycle
+  persistence bound. Unconfirmed cleanup or exit publication retains writer
+  ownership without checkpointing or retrying; native acknowledgement alone
+  never proves child quiescence. Recovery and result finalization do not rejoin
+  timed-out lifecycle publication tails, and a best-effort interrupt's input
+  failure does not discard late acceptance replies for previously sent steering.
+  Nonterminal interrupt-steering is unchanged.
+
+## [0.1.0-dev.174]
+
+### Fixed
+
+- Session-host development builds and isolated Pi provisioning (#385) now reserve capacity
+  before artifact creation, independently limiting each disposable cache to five
+  generations including setup residue. Settled unused generations can be reclaimed;
+  live, uncertain, legacy, or unsafe generations instead block admission. Validated
+  build reuse and installed build-free startup remain unchanged. Normal complete
+  POSIX host shutdown explicitly releases consumer pins; native Windows uncertainty
+  remains protected. Fallback Node wrappers now independently reserve one of five
+  artifacts before downloads/extraction. POSIX reclaims settled path-owned contents
+  and makes a runtime inactive only after explicit consumer quiescence plus exact
+  CJS process exit. The POSIX supervisor forwards PID-targeted termination signals to
+  its exact child and waits through signal-interrupted waits, preserving inherited
+  terminal streams and the child's eventual exit status. Fresh checksum-pinned
+  extraction and supported PATH-Node preference are unchanged. Cleanup refuses mounted
+  generations and descendants before traversal and rechecks bounded native mount
+  evidence before deletion. Native Windows refuses a sixth artifact without
+  reclamation; native rolling cleanup remains unresolved.
 
 ## [0.1.0-dev.173]
 

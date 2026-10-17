@@ -45,7 +45,11 @@ export interface ReviewFinding {
   recommendation: string;
 }
 
+/** Host-observed process settlement, never inferred from reviewer-authored output. */
+export type ProcessSettlement = "confirmed" | "unconfirmed";
+
 export interface ReviewResult {
+  processSettlement?: ProcessSettlement;
   reviewerId: string;
   verdict: ReviewVerdict;
   summary: string;

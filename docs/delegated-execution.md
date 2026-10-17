@@ -824,6 +824,38 @@ incident, keeps its writer ownership, takes no cancellation checkpoint, and the
 interrupt command fails without acknowledgement, so `interrupt_with_merge` does not
 merge.
 
+Codex terminal stop (#425), whether an explicit Interrupt or an abort signal,
+starts owned app-server teardown immediately. It sends at most one best-effort
+native `turn/interrupt` while the channel is usable, without waiting for its reply
+or a terminal notification before SIGTERM. SIGKILL still follows after two
+seconds if cleanup has not closed. Close/drain is bounded to seven seconds from
+terminal teardown; lifecycle callback settlement has a separate five-second
+bound. Missing close evidence or pending/rejected persistence is reported as
+unconfirmed, never as verified child exit. Recovery retains writer ownership and
+takes no checkpoint while a started child's exit publication is unconfirmed.
+The complete exit callback must fulfill before that lifecycle is released.
+If a lifecycle operation-record write remains pending, terminal publication
+stays ordered behind it but is not awaited again by recovery or result
+finalization; persistence is explicitly unconfirmed and ownership remains active.
+A later publication completion never silently releases that ownership or retries
+the task.
+A native acknowledgement alone is not quiescence: a successful Interrupt
+acknowledgement requires both native reply/terminal-turn evidence and observed
+owned-child close; a missing reply can therefore report failed acknowledgement
+even though teardown closed the child.
+
+Terminal cancellation and timeout fence new/replacement Codex work, including
+continuations of an in-flight interrupt-steer handoff. Steering already accepted
+by the server still reports that acceptance truthfully; completed turn results
+and retained output remain available.
+Even if the best-effort interrupt hits a closed input pipe, responses to
+previously sent requests remain routable until child close or the drain bound;
+ordinary nonterminal input-channel failures retain their existing failure behavior.
+Without terminal teardown,
+`SubtasksSteer` with `interrupt: true` keeps its same-task, same-thread/session
+replacement behavior. These bounds do not add retries, configuration, a framing
+limit, or any guarantee that local pipe destruction killed descendants.
+
 Stopped tasks retain verified checkpoints and reattachment bundles for
 `SubtasksContinue`; stopped tasks without a usable checkpoint remain salvageable
 through explicit `SubtasksForceMerge` from their retained worktree or surviving refs.

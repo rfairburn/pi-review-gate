@@ -178,6 +178,7 @@ test("POSIX kill exceptions are contained through SIGKILL escalation without rel
   assert.match(output.terminationError ?? "", /SIGTERM termination failed .*EINVAL/);
   assert.match(output.terminationError ?? "", /SIGKILL termination failed .*EINVAL/);
   assert.equal(processExited, true, "ownership exit is reported only after the child closes");
+  assert.equal(output.processSettlement, "unconfirmed", "later direct-child close cannot erase failed owned-group termination evidence");
   const failure = processFailureResult({
     reviewerId: "test",
     output,
@@ -185,6 +186,7 @@ test("POSIX kill exceptions are contained through SIGKILL escalation without rel
     timeoutMs: 10_000,
   });
   assert.equal(failure?.error, "aborted", "termination diagnostics must not change abort classification");
+  assert.equal(failure?.processSettlement, "unconfirmed");
   assert.match(failure?.diagnostic ?? "", /SIGKILL termination failed/);
 });
 
@@ -394,50 +396,89 @@ test("an ownership-publication failure quiesces the child and records exit befor
   }
 });
 
-test("runPromptProcess bounds a never-settling start callback without prompting or inventing exit persistence", { skip: process.platform === "win32" }, async () => {
+test("runPromptProcess bounds a never-settling start callback without prompting or inventing exit persistence", { skip: process.platform === "win32" }, async (t) => {
   const root = await mkdtemp(join(tmpdir(), "pi-process-owner-pending-"));
   const exitPath = join(root, "actual-exit-code");
   const promptPath = join(root, "prompt-received");
-  const readyPath = join(root, "child-ready");
   const script = [
-    "const fs=require('node:fs');const [exitPath,promptPath,readyPath]=process.argv.slice(1);",
-    "process.on('SIGTERM',()=>{fs.writeFileSync(exitPath,'23');process.exit(23)});",
-    "process.stdin.on('data',()=>fs.writeFileSync(promptPath,'yes'));process.stdin.resume();fs.writeFileSync(readyPath,'ready');setInterval(()=>{},1000);",
+    "const fs=require('node:fs');const [exitPath,promptPath]=process.argv.slice(1);",
+    "process.stdin.on('data',()=>fs.writeFileSync(promptPath,'yes'));process.stdin.resume();",
+    // Exit independently of startup persistence. A SIGTERM handler writing this
+    // marker could be interrupted by the test's 25ms SIGKILL escalation.
+    "fs.writeFileSync(exitPath,'23');process.exit(23);",
   ].join("");
+  type Status = { code: number | null; signal: NodeJS.Signals | null };
+  const cp = require("node:child_process") as typeof import("node:child_process");
+  const originalSpawn = cp.spawn;
+  let child: ChildProcess | undefined;
+  let actualExit: Status | undefined;
+  let announceClose!: (status: Status) => void;
+  const childClosed = new Promise<Status>((resolve) => { announceClose = resolve; });
+  const bounded = async <T>(promise: Promise<T>, label: string): Promise<T> => {
+    let guardTimer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<never>((_, reject) => {
+          guardTimer = setTimeout(() => reject(new Error(`${label} exceeded the bounded lifecycle test guard`)), 9_000);
+        }),
+      ]);
+    } finally {
+      if (guardTimer) clearTimeout(guardTimer);
+    }
+  };
   let exitCallbackCalled = false;
+  let promptDelivered = false;
+  let running: ReturnType<typeof runPromptProcess> | undefined;
   const startedAt = Date.now();
   try {
-    let guardTimer: NodeJS.Timeout | undefined;
-    const running = runPromptProcess({
+    cp.spawn = ((file, args, options) => {
+      if (options?.cwd !== root || !args?.includes(exitPath)) return originalSpawn(file, args ?? [], options ?? {});
+      child = originalSpawn(file, args, options);
+      child.once("exit", (code, signal) => { actualExit = { code, signal }; });
+      child.once("close", (code, signal) => { announceClose({ code, signal }); });
+      return child;
+    }) as typeof cp.spawn;
+    running = runPromptProcess({
       command: process.execPath,
-      args: ["-e", script, exitPath, promptPath, readyPath],
+      args: ["-e", script, exitPath, promptPath],
       cwd: root,
       prompt: "must not be delivered",
       timeoutMs: 2_000,
       terminationEscalationMs: 25,
-      onProcessStart: async () => {
-        const readyDeadline = Date.now() + 1_500;
-        while (!existsSync(readyPath)) {
-          if (Date.now() >= readyDeadline) throw new Error("owned process fixture did not become ready");
-          await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
-        }
-        await new Promise<void>(() => {});
-      },
+      onProcessStart: () => new Promise<void>(() => {}),
       onProcessExit: () => { exitCallbackCalled = true; },
+      onPromptDelivery: () => { promptDelivered = true; },
     });
-    await assert.rejects(Promise.race([
-      running,
-      new Promise<never>((_, rejectPromise) => {
-        guardTimer = setTimeout(() => rejectPromise(new Error("runPromptProcess exceeded the bounded lifecycle test guard")), 9_000);
-      }),
-    ]), /lifecycle callbacks did not settle.*persistence is unconfirmed/s);
-    if (guardTimer) clearTimeout(guardTimer);
+    void running.catch(() => undefined);
+    const close = await bounded(childClosed, "owned child close");
+    await assert.rejects(
+      bounded(running, "runPromptProcess"),
+      /lifecycle callbacks did not settle within 5000ms.*persistence is unconfirmed/s,
+    );
+    assert.deepEqual(actualExit, { code: 23, signal: null }, "the owned child really exited with status 23");
+    assert.deepEqual(close, { code: 23, signal: null }, "actual close agrees with the observed exit");
+    assert.ok(child);
+    assert.equal(child.exitCode, 23);
+    assert.equal(child.signalCode, null);
     assert.ok(Date.now() - startedAt < 9_000, "the never-settling callback must not defeat the process and lifecycle bounds");
     assert.equal(await readFile(exitPath, "utf8"), "23", "the child itself records the status observed before bounded return");
     assert.equal(exitCallbackCalled, false, "exit persistence must not run before the pending start callback settles");
+    assert.equal(promptDelivered, false, "even a promptly exiting child must not be sent a prompt before startup persistence");
     await assert.rejects(access(promptPath), { code: "ENOENT" });
+    t.diagnostic(`actual exit ${actualExit.code}/${actualExit.signal}; close ${close.code}/${close.signal}; bounded lifecycle rejection after ${Date.now() - startedAt}ms`);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    try {
+      if (child) {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        // Failure and partial setup still require actual close before cleanup.
+        await bounded(childClosed, "owned child cleanup");
+      }
+      if (running) await bounded(running.catch(() => undefined), "lifecycle cleanup");
+      await rm(root, { recursive: true, force: true });
+    } finally {
+      cp.spawn = originalSpawn;
+    }
   }
 });
 

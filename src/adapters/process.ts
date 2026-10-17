@@ -1,12 +1,14 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
-import type { ReviewerInvocationTelemetry, ReviewResult } from "../schema";
+import type { ReviewerInvocationTelemetry, ReviewResult, ProcessSettlement } from "../schema";
 import { BoundedJsonlDecoder, MEBIBYTE, utf8Prefix } from "../jsonl";
 import { DEFAULT_PI_COMMAND, resolvePiChildSpawn, translateDefaultPiSpawnError } from "../pi-invocation";
 import { isRecord } from "../record-guard";
 
 export interface ProcessRunResult {
+  /** Positive close/owned-cleanup evidence; absent evidence is unconfirmed. */
+  processSettlement?: ProcessSettlement;
   stdout: string;
   stderr: string;
   stdoutTruncated: boolean;
@@ -159,6 +161,7 @@ export async function writeReviewerProcessArtifacts(input: {
       aborted: input.output.aborted,
       stdinError: input.output.stdinError,
       terminationError: input.output.terminationError,
+      processSettlement: input.output.processSettlement,
       stdoutTruncated: input.output.stdoutTruncated,
       stderrTruncated: input.output.stderrTruncated,
       stdoutBytes: input.output.stdoutBytes,
@@ -169,7 +172,13 @@ export async function writeReviewerProcessArtifacts(input: {
       compactions: input.output.compactions,
       ...input.metadata,
     }, null, 2), "utf8"),
-  ]);
+  ]).catch((error: unknown) => {
+    // Artifact failure must not erase an already-observed teardown diagnostic.
+    throw new Error(joinDiagnostics(
+      error instanceof Error ? error.message : "Reviewer artifact write failed.",
+      input.output.terminationError,
+    ));
+  });
 }
 
 export function reviewerErrorResult(
@@ -194,6 +203,7 @@ export function processFailureResult(input: {
     return {
       ...reviewerErrorResult(input.reviewerId, "Reviewer was aborted.", input.rawOutputPath, "aborted", input.usage),
       telemetry,
+      processSettlement: input.output.processSettlement,
       diagnostic: input.output.terminationError,
     };
   }
@@ -204,7 +214,7 @@ export function processFailureResult(input: {
       input.rawOutputPath,
       "timeout",
       input.usage,
-    ), telemetry, diagnostic: input.output.terminationError };
+    ), telemetry, processSettlement: input.output.processSettlement, diagnostic: input.output.terminationError };
   }
   if (input.output.stdinError) {
     return {
@@ -216,6 +226,7 @@ export function processFailureResult(input: {
         input.usage,
       ),
       telemetry,
+      processSettlement: input.output.processSettlement,
       diagnostic: joinDiagnostics(input.output.stdinError, input.output.terminationError),
     };
   }
@@ -226,7 +237,7 @@ export function processFailureResult(input: {
       input.rawOutputPath,
       `exit_${input.output.code}`,
       input.usage,
-    ), telemetry, diagnostic: joinDiagnostics(stderrDiagnostic(input.output.stderr), input.output.terminationError) };
+    ), telemetry, processSettlement: input.output.processSettlement, diagnostic: joinDiagnostics(stderrDiagnostic(input.output.stderr), input.output.terminationError) };
   }
   return undefined;
 }
@@ -279,7 +290,7 @@ export async function runPromptProcess(input: {
     throw new RangeError("terminationEscalationMs must be a non-negative safe integer");
   }
   if (input.signal?.aborted) {
-    return emptyProcessResult({ aborted: true });
+    return emptyProcessResult({ aborted: true, processSettlement: "confirmed" });
   }
 
   return await new Promise((resolve, reject) => {
@@ -439,6 +450,7 @@ export async function runPromptProcess(input: {
           stderrBytes,
           ...streamMetrics.snapshot(),
           code: close.code,
+          processSettlement: "unconfirmed",
           timedOut,
           aborted,
           stdinError,
@@ -497,6 +509,7 @@ export async function runPromptProcess(input: {
         stderrBytes,
         ...streamMetrics.snapshot(),
         code,
+        processSettlement: terminationError ? "unconfirmed" : "confirmed",
         timedOut,
         aborted,
         stdinError,

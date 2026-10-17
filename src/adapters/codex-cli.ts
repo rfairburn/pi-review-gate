@@ -5,6 +5,7 @@ import { parseReviewResult, REVIEW_OUTPUT_JSON_SCHEMA, type ReviewResult } from 
 import { CodexJsonlReviewExtractor, extractCodexReviewFromJsonl } from "../usage";
 import {
   processFailureResult,
+  type ProcessRunResult,
   processTelemetry,
   MAX_RETAINED_OUTPUT_BYTES,
   reviewerArtifactPaths,
@@ -28,9 +29,10 @@ export class CodexCliAdapter implements ModelAdapter {
     const outputSchemaPath = join(req.bundleDir, "review-output-schema.json");
     await writeFile(outputSchemaPath, JSON.stringify(REVIEW_OUTPUT_JSON_SCHEMA, null, 2), "utf8");
     const command = this.config.command ?? "codex";
+    let preflight: ProcessRunResult | undefined;
     if (shouldPreflightSandbox(command, this.config.args)) {
       req.onUpdate?.("sandbox preflight started");
-      const preflight = await runPromptProcess({
+      preflight = await runPromptProcess({
         command,
         args: codexSandboxPreflightArgs(),
         cwd: req.cwd,
@@ -51,6 +53,8 @@ export class CodexCliAdapter implements ModelAdapter {
           undefined,
           ),
           telemetry: processTelemetry(preflight),
+          processSettlement: preflight.processSettlement,
+          diagnostic: preflight.terminationError,
         };
       }
       req.onUpdate?.("sandbox preflight completed");
@@ -101,6 +105,13 @@ export class CodexCliAdapter implements ModelAdapter {
         activityExtractor.push(chunk);
       },
     });
+    // Both owned launches contribute: a confirmed main child cannot conceal
+    // an uncertain preflight child.
+    if (preflight) {
+      output.processSettlement = preflight.processSettlement === "confirmed" && output.processSettlement === "confirmed"
+        ? "confirmed" : "unconfirmed";
+      output.terminationError = [preflight.terminationError, output.terminationError].filter(Boolean).join("\n") || undefined;
+    }
     activityExtractor.finish();
     const streamed = streamExtractor.finish();
     const extracted = streamed.text || streamed.sessionId || streamed.usage
@@ -127,12 +138,16 @@ export class CodexCliAdapter implements ModelAdapter {
       return {
         ...reviewerErrorResult(req.id, "Codex reviewer final output exceeded the 100 MiB limit.", artifacts.rawOutput, "output_truncated", usage),
         telemetry: processTelemetry(output),
+        processSettlement: output.processSettlement,
+        diagnostic: output.terminationError,
       };
     }
     const finalText = finalFile.text.trim() ? finalFile.text : extracted.text || output.stdout;
     const result = parseReviewResult(req.id, finalText, artifacts.rawOutput);
     result.usage = usage;
     result.telemetry = processTelemetry(output);
+    result.processSettlement = output.processSettlement;
+    result.diagnostic = output.terminationError;
     if (result.verdict === "error" && codexSandboxFailed(output.stderr)) {
       return {
         ...reviewerErrorResult(
@@ -143,6 +158,8 @@ export class CodexCliAdapter implements ModelAdapter {
         usage,
         ),
         telemetry: processTelemetry(output),
+        processSettlement: output.processSettlement,
+        diagnostic: output.terminationError,
       };
     }
     return result;

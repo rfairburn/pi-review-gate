@@ -20,6 +20,7 @@ interface HostOptions {
   toggleKey?: string;
   args: readonly string[];
   env: NodeJS.ProcessEnv;
+  onCacheConsumersSettled?: () => void;
 }
 
 interface PiRuntimeResult {
@@ -671,9 +672,9 @@ test("synthetic stage cleanup retains Windows Pi runtime provisioning stage with
     assert.equal(result.source, "isolated-cache");
     assert.equal(probes, 2, "both staged and published CLI identities are checked with the same bounded public Node probe seam");
     assert.ok(existsSync(publishedEntry));
-    assert.equal(existsSync(installStage), true, "the runtime stage is retained after publication without descendant receipts");
-    assert.equal(diagnostics.length, 2);
-    assert.match(diagnostics[1], /preserving a Pi runtime staging tree because per-entry descendant creation receipts are unavailable/);
+    assert.equal(existsSync(installStage), true, "setup residue remains inside the published generation");
+    assert.equal(diagnostics.length, 1);
+    assert.equal(installStage, join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`, ".setup"));
   } finally {
     Object.defineProperty(process, "platform", platform);
   }
@@ -869,7 +870,9 @@ test("source build, Pi runtime selection, and DDGS setup precede loading the syn
   assert.equal(captured.length, 1);
   // The explicit executable is honored by the stubbed resolver seam; the
   // resolved entry (not a bare name) always reaches the host.
-  assert.deepEqual(captured[0], {
+  assert.equal(typeof captured[0].onCacheConsumersSettled, "function");
+  const { onCacheConsumersSettled: _handoff, ...capturedOptions } = captured[0];
+  assert.deepEqual(capturedOptions, {
     packageRoot: fixture.packageRoot,
     piExecutable: "/synthetic/pi",
     stateRoot: "./state dir",
@@ -1009,10 +1012,9 @@ test("production source-build runs in an owned staging root and preserves the li
   const cacheRecord = join(agentDir, ".pi-review-gate", "build", `source-${cacheManifest.cacheKey}.json`);
   assert.equal(existsSync(cacheRecord), true, "the completed stage is discoverable through its exclusive content-key record");
   assert.equal(captured[0].env.NODE_ENV, "production", "the native host environment remains unchanged");
-  // Main can settle gracefully, but root identity does not authorize deleting
-  // npm/compile descendants without complete per-entry creation receipts.
+  // A stub's bare zero result is not Main's positive lifecycle handoff.
   assert.match(diagnostics[0], /^pi-review-sessions: pi runtime: \/synthetic\/pi \(v1\.0\.4, npm-global\)\n$/);
-  assert.match(diagnostics[1], /preserving the source stage because per-entry descendant creation receipts are unavailable/);
+  assert.match(diagnostics[1], /retaining cache lifetime pins: native consumer settlement is unconfirmed/);
   // The live checkout dist is preserved byte-for-byte.
   assert.equal(readFileSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"), "utf8"), "LIVE DIST SENTINEL — never rebuild in place\n");
   assert.equal(invocation.bootstrap, null);
@@ -1027,8 +1029,7 @@ test("production source-build runs in an owned staging root and preserves the li
   assert.equal(env.PI_REVIEW_GATE_SETTLEMENT_SECRET, "settlement-secret", "the injected caller environment is not mutated");
   assert.equal(env.PI_REVIEW_GATE_QUIESCENCE_CHILD, "quiescence-secret");
   const setupRoot = dirname(invocation.home);
-  assert.ok(setupRoot.startsWith(join(agentDir, ".pi-review-gate", "build", "pi-review-sessions-setup-")),
-    `npm setup resources must remain in a separate exclusive private root: ${setupRoot}`);
+  assert.equal(setupRoot, stagingRoot, "setup residue stays inside the same counted generation");
   for (const ownedPath of [invocation.home, invocation.cache, invocation.logs, invocation.temp]) {
     assert.ok(ownedPath.startsWith(`${setupRoot}/`), `npm resources must remain in the owned setup root: ${ownedPath}`);
   }
@@ -1080,13 +1081,13 @@ test("a failed staged build preserves the live dist and retains its stage", { sk
   // The live checkout dist is preserved byte-for-byte.
   assert.equal(readFileSync(join(fixture.packageRoot, "dist", "src", "session-host", "main.js"), "utf8"), "LIVE DIST SENTINEL — never rebuild in place\n");
   // The failed build stage is honestly reported and retained: npm/build
-  // descendants have no complete per-entry creation receipts.
+  // generation remains counted until a later capacity admission.
   const buildCacheRoot = join(fixture.root, ".pi", "agent", ".pi-review-gate", "build");
   const stages = existsSync(buildCacheRoot)
     ? readdirNames(buildCacheRoot).filter((entry) => /^pi-review-sessions-[a-f0-9]{32}$/u.test(entry))
     : [];
   assert.equal(stages.length, 1);
-  assert.match(stderr, /a source stage was retained because per-entry descendant creation receipts are unavailable/);
+  assert.match(stderr, /a counted source generation was retained/);
 });
 
 test("synthetic stage cleanup retains source build stage after unconfirmed setup cleanup", async (t) => {
@@ -1188,11 +1189,11 @@ test("synthetic stage cleanup retains source stages across setup and host outcom
       assert.equal(current.dev, owned.identity.dev);
       assert.equal(current.ino, owned.identity.ino);
       if (scenario.setupCleanupUnconfirmed) {
-        assert.match(stderr, /preserving the source stage because setup cleanup was not confirmed and per-entry descendant creation receipts are unavailable/);
-      } else if (scenario.preMainFailure || scenario.result === 0) {
-        assert.match(stderr, /preserving the source stage because per-entry descendant creation receipts are unavailable/);
+        assert.match(stderr, /retaining cache lifetime pins: setup cleanup was not confirmed/);
+      } else if (scenario.preMainFailure) {
+        assert.doesNotMatch(stderr, /retaining cache lifetime pins/);
       } else {
-        assert.match(stderr, /preserving the source stage because native shutdown was not confirmed and per-entry descendant creation receipts are unavailable/);
+        assert.match(stderr, /retaining cache lifetime pins: native consumer settlement is unconfirmed/);
       }
     }
     if (scenario.preMainFailure) assert.deepEqual(events, ["build", "pi"]);
@@ -1244,7 +1245,7 @@ test("stageSourcePackage copies build and runtime inputs without touching the ch
     unlinkSync(join(dir, "sentinel"));
     rmdirSync(dir);
   }
-  assert.equal(launcher.__test.removeOwnedStage(ownedStage), false, "the stage remains without per-entry descendant creation receipts");
+  assert.equal(launcher.__test.removeOwnedStage(ownedStage), false, "the legacy helper cannot establish a settled lifetime");
   assert.equal(existsSync(stagingRoot), true, "the staged source is retained after assertions");
 });
 
@@ -1374,7 +1375,7 @@ test("synthetic stage cleanup retains replaced roots and symlinks without enumer
   assert.equal(enumerations, 0, "cleanup does not enumerate descendants");
   assert.equal(readFileSync(replacement, "utf8"), "replacement survives\n");
   assert.equal(launcher.__test.removeOwnedStage({ ...owned, root: held }), false,
-    "a relocated stage remains untouched without per-entry descendant receipts");
+    "a relocated stage remains untouched without identity-matched lifetime evidence");
   assert.equal(readFileSync(join(held, "original.txt"), "utf8"), "original stage stays\n");
   const heldIdentity = lstatSync(held, { bigint: true });
   assert.equal(heldIdentity.dev, owned.identity.dev);
@@ -1419,7 +1420,7 @@ test("synthetic stage cleanup retains original, replaced, unknown, symlink, and 
 
   let enumerations = 0;
   const retained = withOpendirHook(() => { enumerations += 1; }, () => launcher.__test.removeOwnedStage(owned));
-  assert.equal(retained, false, "the stage is retained without per-entry creation receipts");
+  assert.equal(retained, false, "the stage is retained without settled lifetime evidence");
   assert.equal(enumerations, 0, "unknown descendants are not scanned");
   const currentRoot = lstatSync(stage, { bigint: true });
   assert.equal(currentRoot.dev, owned.identity.dev);
@@ -2484,7 +2485,7 @@ test("absent or unsupported Pi provisions the isolated cache with exact npm argu
   assert.ok(existsSync(result.file));
   assert.match(notice, /provisioning isolated Pi/);
   assert.match(notice, /installed isolated Pi/);
-  assert.match(notice, /preserving a Pi runtime staging tree because per-entry descendant creation receipts are unavailable/);
+  assert.doesNotMatch(notice, /retained counted Pi runtime generation/, "successful setup publishes the same reserved root");
 
   const invocations = readFileSync(fixture.npmLog, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { args: string[] });
   const installs = invocations.filter((invocation) => invocation.args[0] === "install");
@@ -2498,10 +2499,8 @@ test("absent or unsupported Pi provisions the isolated cache with exact npm argu
     "--registry", "https://registry.npmjs.org",
     `${launcher.PI_PACKAGE_NAME}@${launcher.PI_PROVISION_VERSION}`,
   ]);
-  assert.ok(installs[0].args[2].startsWith(join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `.staging-pi-${launcher.PI_PROVISION_VERSION}-`)));
-  // Publication remains successful, but the npm stage is retained without
-  // complete per-entry creation receipts.
-  assert.ok(existsSync(installs[0].args[2]), "the provisioning stage remains after publication");
+  assert.equal(installs[0].args[2], join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`, ".setup"));
+  assert.ok(existsSync(installs[0].args[2]), "the provisioning generation remains after publication");
 });
 
 test("version-probe and DDGS setup expose unconfirmed cleanup", async (t) => {
@@ -2551,9 +2550,9 @@ test("a staged Pi runtime is retained when its version probe cleanup is unconfir
     validatePiPackage: async () => { throw probeError; },
   }), /synthetic staged Pi probe cleanup unconfirmed/);
 
-  assert.ok(stagingRoot.includes(".staging-pi-"));
+  assert.equal(stagingRoot, join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`, ".setup"));
   assert.ok(existsSync(join(stagingRoot, "node_modules", "@earendil-works", "pi-coding-agent", "package.json")), "the staged runtime remains available");
-  assert.match(diagnostic, /preserving a Pi runtime staging tree/);
+  assert.match(diagnostic, /retained counted Pi runtime generation \(setup lifetime uncertain\)/);
 });
 
 test("Pi provisioning retains its stage when the install group cleanup is unconfirmed", async (t) => {
@@ -2587,9 +2586,9 @@ test("Pi provisioning retains its stage when the install group cleanup is unconf
   }), /cleanup was not confirmed/);
 
   assert.equal(validationAttempted, false, "an unconfirmed install is never validated or published");
-  assert.ok(stagingRoot.includes(".staging-pi-"));
+  assert.equal(stagingRoot, join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`, ".setup"));
   assert.ok(existsSync(join(stagingRoot, ".npm-cache")), "the owned staging root is preserved");
-  assert.match(diagnostic, /preserving a Pi runtime staging tree/);
+  assert.match(diagnostic, /retained counted Pi runtime generation \(setup lifetime uncertain\)/);
 });
 
 function readdirNames(dir: string): string[] {
@@ -2659,22 +2658,23 @@ test("preexisting empty and partial version destinations are preserved rather th
   }
 });
 
-test("a concurrent valid Pi cache publication is reused only after metadata and Node probe validation", async (t) => {
+test("a competing Pi publication inside the reserved generation is refused without replacing either tree", async (t) => {
   const fixture = makeRuntimeFixture(".session-host-pi-runtime-concurrent-publish-");
   cleanupFixture(t, fixture);
   writeFakeNpm(fixture, "install");
   const versionRoot = join(fixture.agentDir, ".pi-review-gate", "pi-runtime", `pi-${launcher.PI_PROVISION_VERSION}`);
-  const result = await launcher.__test.resolvePiRuntime({
+  await assert.rejects(launcher.__test.resolvePiRuntime({
     env: runtimeEnv(fixture, { PI_FAKE_PUBLISH_ROOT: versionRoot }),
     agentDir: fixture.agentDir,
     cwd: fixture.root,
     writeError: () => undefined,
-  });
+  }), /staging identity changed during validation/);
   const publishedEntry = join(versionRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
-  assert.equal(result.source, "isolated-cache");
-  assert.equal(result.file, publishedEntry);
+  const stagedEntry = join(versionRoot, ".setup", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
   assert.ok(existsSync(publishedEntry));
-  assert.equal(existsSync(join(versionRoot, "node_modules", "@earendil-works", "pi-coding-agent", ".staging")), false);
+  assert.ok(existsSync(stagedEntry), "refusal never renames over the competing publication");
+  assert.notEqual(lstatSync(stagedEntry, { bigint: true }).ino, lstatSync(publishedEntry, { bigint: true }).ino);
+  assert.equal(readFileSync(publishedEntry, "utf8"), readFileSync(stagedEntry, "utf8"));
 });
 
 test("a version-root symlink injected at publication cannot be reused as a concurrent cache", async (t) => {
@@ -2700,7 +2700,7 @@ test("a version-root symlink injected at publication cannot be reused as a concu
         symlinkSync(aliasRoot, versionRoot, "dir");
       },
     }),
-    /partial or unsafe/,
+    /could not reserve pi runtime generation/,
   );
   assert.equal(lstatSync(versionRoot).isSymbolicLink(), true, "the foreign alias is preserved");
   assert.ok(existsSync(aliasEntry), "the alias target remains untouched");
@@ -2729,9 +2729,9 @@ test("failed provisioning preserves foreign staging, unknown resources, and its 
   );
   assert.equal(readFileSync(marker, "utf8"), "preserve me\n", "unknown resources are preserved");
   assert.equal(readFileSync(join(foreignStage, "active-download"), "utf8"), "in progress\n", "foreign staging is preserved");
-  const ownStages = readdirNames(runtimeRoot).filter((entry) => entry.startsWith(`.staging-pi-${launcher.PI_PROVISION_VERSION}-`));
-  assert.equal(ownStages.length, 1, "this run's stage is retained without descendant receipts");
-  assert.match(diagnostic, /preserving a Pi runtime staging tree because per-entry descendant creation receipts are unavailable/);
+  const ownStages = readdirNames(runtimeRoot).filter((entry) => entry === `pi-${launcher.PI_PROVISION_VERSION}`);
+  assert.equal(ownStages.length, 1, "this run's failed generation remains counted");
+  assert.match(diagnostic, /retained counted Pi runtime generation/);
 });
 
 test("a concurrent launch's staging survives a successful provision", async (t) => {

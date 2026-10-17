@@ -502,11 +502,19 @@ reviewer sessions.
 
 If the terminal input interception cannot be installed in the current context, the
 extension says so once and points at the `/review-cancel` command instead of failing
-silently. `/review-cancel` is the guaranteed hard stop: it cancels whichever automatic
-or command-driven review is currently active, immediately confirms the cancellation
-request, and only reports the review cancelled once the review run has returned and all
-reviewer child processes have stopped. With no review running it reports that clearly
-instead of pretending to cancel.
+silently. `/review-cancel` explicitly cancels whichever automatic or command-driven
+review is currently active and immediately acknowledges the cancellation request.
+Completion waits for the review run to return after bounded teardown. It reports
+`reviewer processes stopped` only when the owned reviewer launches have positive
+process-settlement evidence; when cleanup cannot be confirmed, it instead reports
+`reviewer process termination unconfirmed; cleanup uncertain; owned processes may remain live`.
+The same distinction applies to Escape, `/review-now`, and reviewer-question
+cancellation. A sent signal, a returned teardown promise, or root exit alone is not
+confirmation. This does not strengthen process-tree termination guarantees or extend
+teardown deadlines. Termination diagnostics remain on the cancelled result and in
+`canceled.json`, without retaining partial reviewer verdicts or copying reviewer
+content or private paths into the completion notice. With no review running,
+`/review-cancel` reports that clearly instead of pretending to cancel.
 
 ## Commands
 
@@ -570,7 +578,8 @@ Retained review bundles include `REVIEW.md`, `manifest.json`, `request.md`, a
 `reviews/<sequence>/` and `questions/<sequence>/` invocations, `sessions.json`, per-pass
 `review-telemetry.json`, and captured before/after artifacts. Reviewer outputs remain
 isolated under each invocation's `reviewers/<id>/` directory. A canceled numbered
-invocation contains `CANCELED.md` and `canceled.json` rather than reviewer results.
+invocation contains `CANCELED.md` and `canceled.json` (including process settlement and
+any termination diagnostic) rather than reviewer results.
 
 Retention itself is governed by `retainBundles`; see
 [Configuration](configuration.md#top-level-fields). Shutdown behavior and what survives

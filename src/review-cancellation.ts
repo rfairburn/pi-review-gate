@@ -1,3 +1,13 @@
+import type { ReviewResult } from "./schema";
+
+/** Only host-observed settlement can select the stopped-process wording. */
+export function reviewCancellationMessage(kind: "review" | "reviewer question", result: ReviewResult | undefined): string {
+  const settlement = result?.processSettlement === "confirmed"
+    ? "reviewer processes stopped"
+    : "reviewer process termination unconfirmed; cleanup uncertain; owned processes may remain live";
+  return `review gate: ${kind} cancelled; ${settlement}`;
+}
+
 export type ReviewCancelReason = "escape" | "manual";
 
 /**
@@ -16,13 +26,14 @@ export interface ActiveReviewCancellation {
    * Immediate cancellation-request feedback ("cancelling … waiting for
    * reviewer processes to stop"). Deliberately does not claim that reviewer
    * processes have stopped; quiescence is claimed only by `notifyCancellation`
-   * after the owning run returned.
+   * after the owning run returned with positive process-settlement evidence.
    */
   acknowledgeCancellation: () => Promise<void>;
   /**
    * Resolves only after the owning runReview/runAskReviewer call has returned
-   * (reviewer child processes terminated or reaped) and the terminal-input
-   * listener was removed. Completion feedback must wait for this.
+   * (possibly after bounded, unconfirmed cleanup) and the terminal-input
+   * listener was removed. Completion feedback must wait for this, then consult
+   * the owning run's result; this promise alone is not settlement evidence.
    */
   settled: Promise<void>;
   /** Human-readable description, e.g. "automatic review" or "/review-now". */

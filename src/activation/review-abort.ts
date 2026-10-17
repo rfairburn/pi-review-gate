@@ -1,6 +1,7 @@
 import { isEscapeTerminalInput, onTerminalInput, sendNotice } from "../pi";
 import { routeForegroundEscape } from "../foreground-escape";
-import { type ActiveReviewCancellation, type ReviewCancelReason, type ReviewCancellationCoordinator } from "../review-cancellation";
+import type { ReviewResult } from "../schema";
+import { reviewCancellationMessage, type ActiveReviewCancellation, type ReviewCancelReason, type ReviewCancellationCoordinator } from "../review-cancellation";
 import { type ReviewGateState } from "../state";
 
 type ReviewAbortReason = "parent" | "escape" | "manual" | "session_shutdown";
@@ -21,6 +22,7 @@ export function createReviewAbortController(input: {
   cancellation: ReviewCancellationCoordinator;
   settled: Promise<void>;
   describe: () => string;
+  getResult?: () => ReviewResult | undefined;
 }): ReviewAbortHandle {
   const controller = new AbortController();
   let abortReason: ReviewAbortReason | undefined;
@@ -54,7 +56,10 @@ export function createReviewAbortController(input: {
       return Promise.resolve();
     }
     if (!cancellationNotice) {
-      cancellationNotice = sendNotice(input.noticeTarget, "review gate: review cancelled; reviewer processes stopped").catch(() => undefined);
+      cancellationNotice = input.settled.then(async () => {
+        if (!input.isSessionActive()) return;
+        await sendNotice(input.noticeTarget, reviewCancellationMessage("review", input.getResult?.()));
+      }).catch(() => undefined);
     }
     return cancellationNotice;
   };
@@ -72,7 +77,7 @@ export function createReviewAbortController(input: {
     if (routeForegroundEscape(input.noticeTarget, terminalInput)) return { consume: true };
     abortReview("escape");
     // Immediate acknowledgement only; the completion notice claims reviewer
-    // quiescence only after runReview has returned and cleanup ran.
+    // quiescence only when the returned result confirms process settlement.
     void acknowledgeCancellation();
     return { action: "handled", consume: true };
   });

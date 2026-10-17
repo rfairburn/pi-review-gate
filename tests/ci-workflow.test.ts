@@ -708,6 +708,22 @@ test("native Windows launcher job freshly installs and requires exact Pi 1.3.0 c
   }
 });
 
+test("native Windows child step includes production cancellation settlement and unknown-exception regressions", () => {
+  const job = blockOf(readWorkflow(), "windows-launcher", 2);
+  const child = withoutComments(stepOf(job, CHILD_LAUNCH_STEP));
+  const suites = [
+    "pi-child-launch",
+    "pi-child-teardown",
+    "pi-settlement-lineage-diagnostics",
+    "review-cancellation-settlement",
+    "review-cancellation-unknown",
+  ].map((name) => `dist-test/tests/${name}.test.js`);
+  assert.match(child, new RegExp(`^        run: ${escapeRegExp(`node --test ${suites.join(" ")}`)}\\s*$`, "m"),
+    "#397 regressions must run in the same native step with all previous child-process coverage and no changed test flags");
+  assert.doesNotMatch(child, /^        (?:if|continue-on-error|timeout-minutes):/m,
+    "the required child step must not gain a skip, tolerated failure, or new timeout policy");
+});
+
 // --- Manual-dispatch compaction lineage sampling (#335 follow-up) ----------
 // The exact-head diagnostic run of the settlement-lineage stage codes collected
 // no refusal, so the workflow carries one finite sampling step. These assertions

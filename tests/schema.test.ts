@@ -264,6 +264,14 @@ test("parseReviewResult rejects gate-owned identity keys from model output", () 
   }
 });
 
+test("reviewer output cannot supply process settlement evidence", () => {
+  const result = parseReviewResult("one", JSON.stringify({
+    verdict: "pass", summary: "ok", findings: [], processSettlement: "confirmed",
+  }));
+  assert.equal(result.error, "schema_error");
+  assert.equal(result.processSettlement, undefined);
+});
+
 test("parseReviewResult treats unsupported null properties as absent", () => {
   const topLevel = parseReviewResult(
     "reviewer",

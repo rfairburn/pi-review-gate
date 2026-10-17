@@ -178,6 +178,7 @@ test("POSIX kill exceptions are contained through SIGKILL escalation without rel
   assert.match(output.terminationError ?? "", /SIGTERM termination failed .*EINVAL/);
   assert.match(output.terminationError ?? "", /SIGKILL termination failed .*EINVAL/);
   assert.equal(processExited, true, "ownership exit is reported only after the child closes");
+  assert.equal(output.processSettlement, "unconfirmed", "later direct-child close cannot erase failed owned-group termination evidence");
   const failure = processFailureResult({
     reviewerId: "test",
     output,
@@ -185,6 +186,7 @@ test("POSIX kill exceptions are contained through SIGKILL escalation without rel
     timeoutMs: 10_000,
   });
   assert.equal(failure?.error, "aborted", "termination diagnostics must not change abort classification");
+  assert.equal(failure?.processSettlement, "unconfirmed");
   assert.match(failure?.diagnostic ?? "", /SIGKILL termination failed/);
 });
 

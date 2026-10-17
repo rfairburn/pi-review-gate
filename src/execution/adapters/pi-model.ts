@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import {
   PROCESS_TREE_CLEANUP_GRACE_MS,
   terminateProcessTree,
@@ -692,7 +693,11 @@ export class PiRpc {
     private readonly translateSpawnError?: (error: Error) => Error,
     private readonly onToolObservation?: ExecutorRequest["onToolObservation"],
   ) {
-    proc.stdout?.on("data", (value: Buffer) => this.consume(value.toString("utf8")));
+    // Pipe chunks need not end at UTF-8 character boundaries. Decode once,
+    // incrementally, before both retained output and LF-delimited protocol use.
+    const stdoutDecoder = new StringDecoder("utf8");
+    proc.stdout?.on("data", (value: Buffer) => this.consume(stdoutDecoder.write(value)));
+    proc.stdout?.once("end", () => this.consume(stdoutDecoder.end()));
     proc.stderr?.on("data", (value: Buffer) => { this.stderr.append(value.toString("utf8")); });
     // A child that dies (or closes its pipe read side) while the parent's side
     // of the stream still reports writable emits an asynchronous EPIPE (or
@@ -728,6 +733,10 @@ export class PiRpc {
     });
     this.exitPromise = new Promise((resolvePromise) => {
       proc.once("close", (code, signal) => {
+        // Also flush on abnormal close without 'end'. StringDecoder.end()
+        // resets its pending bytes, so a normal end is not flushed twice.
+        // No LF is invented: an incomplete JSONL record remains unaccepted.
+        this.consume(stdoutDecoder.end());
         if (this.forceKillTimer) clearTimeout(this.forceKillTimer);
         this.forceKillTimer = undefined;
         this.closeStatus = { code, signal };

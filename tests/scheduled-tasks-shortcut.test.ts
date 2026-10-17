@@ -59,13 +59,10 @@ const ROOT_SETTING_LABELS = [
   "Global concurrency",
   "Retry policy",
   "Subtask notifications",
-  "Deferred Pi tools",
-  "YouShouldKnow notices",
-  "Completion guidance",
+  "Tools",
   "Subtasks view",
   "Scheduled tasks",
   "Scheduler runtime",
-  "Web",
 ] as const;
 
 const SCHEDULED_EDITOR_LABELS = [
@@ -344,7 +341,7 @@ test("TUI: /scheduled-tasks lands in the scheduled list; Esc returns to root and
       [...downs(8), KEY_ENTER], // editor → Enabled (row 8)
       [KEY_ESCAPE], // editor → list
       [KEY_ESCAPE], // list → root (Scheduled tasks row highlighted)
-      [...downs(2), KEY_ENTER], // root → Save changes (row 19, two below the highlight)
+      [...downs(1), KEY_ENTER], // root → Save changes (row 16, one below the highlight)
     ]);
     setMenuTuiHost(harness.host);
     try {
@@ -515,7 +512,7 @@ test("installed Pi host: /scheduled-tasks lands in the scheduled list and saves 
       [...downs(8), KEY_ENTER], // editor → Enabled (row 8)
       [KEY_ESCAPE], // editor → list
       [KEY_ESCAPE], // list → root (Scheduled tasks row highlighted)
-      [...downs(2), KEY_ENTER], // root → Save changes (row 19, two below the highlight)
+      [...downs(1), KEY_ENTER], // root → Save changes (row 16, one below the highlight)
     ]);
     setMenuTuiHost(host);
     try {

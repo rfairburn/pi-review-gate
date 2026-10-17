@@ -188,7 +188,7 @@ test("live Pi TUI smoke: /review-settings workspace field drives the real native
   // clears are not observable as a step boundary through this driver's frame
   // heuristics — see the documented gap in docs/development.md), so in-place
   // clearing is not used as a step boundary.
-  const rootMenuDowns = 17; // "Scheduled tasks" is row 18 of the root menu
+  const rootMenuDowns = 15; // "Scheduled tasks" is row 16 of the root menu
   const taskMenuDowns = 5; // "Workspace" is row 6 after the Destination row
   const slowDowns = (count: number): string => KEYS.down.repeat(count);
   const steps: DriverStep[] = [
@@ -289,8 +289,8 @@ test("live Pi TUI smoke: /review-settings workspace field drives the real native
     // schedule fails validation, keeping the menu open with the previously
     // active row retained. Confirm the explicit Cancel row instead: from the
     // retained "Scheduled tasks" highlight the rows below are Scheduler
-    // runtime, Web, Save changes, then Cancel — four downs reach it.
-    { type: "send_slow", hex: slowDowns(4), delayMs: 120 },
+    // runtime, Save changes, then Cancel — three downs reach it.
+    { type: "send_slow", hex: slowDowns(3), delayMs: 120 },
     { type: "assert_latest", includes: ["→ Cancel"] },
     { type: "send", hex: KEYS.enter },
     // Apply the real VT cursor/erase stream since startup, then inspect the

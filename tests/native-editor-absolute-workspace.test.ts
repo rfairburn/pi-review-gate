@@ -598,7 +598,7 @@ test("real host: full flow stages a completed existing absolute directory throug
   const providerCtor = loaded.tui.CombinedAutocompleteProvider as HostProviderCtor;
 
   const harness = flowHarness([
-    keys(...Array(17).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 17)
+    keys(...Array(15).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 15)
     keys(KEY_ENTER), // list → task entry (row 0)
     keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 5)
     async (component) => {
@@ -616,7 +616,7 @@ test("real host: full flow stages a completed existing absolute directory throug
     },
     keys(...Array(7).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 12)
     keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
-    keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 17) → Save changes (row 19)
+    keys(KEY_DOWN, KEY_ENTER), // root re-show (index 15) → Save changes (row 16)
   ], { cwd: dir, keybindings: createRealKeybindingsManager(loaded.tui), theme: REAL_IDENTITY_THEME, provider: new providerCtor(HOST_COMMANDS, dir) });
 
   await run(harness.ctx);
@@ -650,7 +650,7 @@ for (const target of ["missing", "file"] as const) {
     const providerCtor = loaded.tui.CombinedAutocompleteProvider as HostProviderCtor;
 
     const harness = flowHarness([
-      keys(...Array(17).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 17)
+      keys(...Array(15).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 15)
       keys(KEY_ENTER), // list → task entry (row 0)
       keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → workspace (row 5)
       async (component) => {
@@ -672,7 +672,7 @@ for (const target of ["missing", "file"] as const) {
       },
       keys(...Array(7).fill(KEY_DOWN), KEY_ENTER), // entry re-show (workspace, row 5) → Back (row 12)
       keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // list re-show → Back (row 2)
-      keys(KEY_DOWN, KEY_DOWN, KEY_ENTER), // root re-show (index 17) → Save changes (row 19)
+      keys(KEY_DOWN, KEY_ENTER), // root re-show (index 15) → Save changes (row 16)
       keys(KEY_DOWN, KEY_ENTER), // failed save re-shows the root on Save (19); explicit Cancel (20) — issue #294: root Escape would retry the same failing apply
     ], { cwd: dir, keybindings: createRealKeybindingsManager(loaded.tui), theme: REAL_IDENTITY_THEME, provider: new providerCtor(HOST_COMMANDS, dir) });
 

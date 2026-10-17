@@ -77,13 +77,28 @@ const ROOT_SETTING_LABELS = [
   "Global concurrency",
   "Retry policy",
   "Subtask notifications",
+  "Tools",
+  "Subtasks view",
+  "Scheduled tasks",
+] as const;
+
+const TOOLS_SETTING_LABELS = [
+  "Top-level tools",
+  "Executor tools",
   "Deferred Pi tools",
   "YouShouldKnow notices",
   "Completion guidance",
-  "Subtasks view",
-  "Scheduled tasks",
   "Web",
 ] as const;
+
+function toolsSettingsRow(label: typeof TOOLS_SETTING_LABELS[number], value: string): string {
+  return alignedTestRow(label, value, TOOLS_SETTING_LABELS);
+}
+
+/** The root Tools row for the default deferred/web state these fixtures use. */
+function rootToolsRow(): string {
+  return rootSettingsRow("Tools", "0 top-level denied · 0 executor denied · deferred On · 50 MiB max download · headless browser");
+}
 
 const SCHEDULED_EDITOR_LABELS = [
   "Name",
@@ -186,16 +201,16 @@ test("YouShouldKnow controls apply on Escape, cancel transactionally, and persis
     youShouldKnow: { enabled: true, completionGuidance: true },
   });
 
-  await h.run([rootSettingsRow("YouShouldKnow notices", "On"), undefined]);
+  await h.run([rootToolsRow(), toolsSettingsRow("YouShouldKnow notices", "On"), undefined, undefined]);
   assert.equal(h.config.youShouldKnow?.enabled, false, "root Escape applies notice availability to this session");
   assert.equal(h.config.youShouldKnow?.completionGuidance, true, "the guidance setting is independent");
   assert.equal(await readFile(h.configPath, "utf8"), h.original, "session-only changes do not write the file");
 
-  await h.run([rootSettingsRow("YouShouldKnow notices", "Off"), "Cancel"]);
+  await h.run([rootToolsRow(), toolsSettingsRow("YouShouldKnow notices", "Off"), undefined, "Cancel"]);
   assert.equal(h.config.youShouldKnow?.enabled, false, "Cancel preserves the previously applied session state");
   assert.equal(await readFile(h.configPath, "utf8"), h.original, "Cancel writes nothing");
 
-  await h.run([rootSettingsRow("YouShouldKnow notices", "Off"), "Save changes"]);
+  await h.run([rootToolsRow(), toolsSettingsRow("YouShouldKnow notices", "Off"), undefined, "Save changes"]);
   assert.equal(h.config.youShouldKnow?.enabled, true);
   assert.equal(h.config.youShouldKnow?.completionGuidance, true);
   assert.deepEqual(JSON.parse(await readFile(h.configPath, "utf8")).youShouldKnow, {
@@ -203,7 +218,7 @@ test("YouShouldKnow controls apply on Escape, cancel transactionally, and persis
     completionGuidance: true,
   });
 
-  await h.run([rootSettingsRow("Completion guidance", "On"), "Save changes"]);
+  await h.run([rootToolsRow(), toolsSettingsRow("Completion guidance", "On"), undefined, "Save changes"]);
   assert.equal(h.config.youShouldKnow?.enabled, true, "guidance-off does not turn off notice availability");
   assert.equal(h.config.youShouldKnow?.completionGuidance, false);
   assert.deepEqual(JSON.parse(await readFile(h.configPath, "utf8")).youShouldKnow, {

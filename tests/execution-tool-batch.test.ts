@@ -51,6 +51,8 @@ function harness(options: {
   /** Production wiring: the parent's live deferred-tool authority (index.ts passes DeferredToolManager.authorizedToolNames). */
   authorizedTools?: () => string[] | undefined;
   deferredPiTools?: boolean;
+  /** Issue #434 canonical denial config installed on the manager's live config. */
+  toolsDeny?: { topLevelDeny?: string[]; executorDeny?: string[] };
   submittedFingerprintFor?: (toolCallId: string, toolName: string) => string | undefined;
   onNativeToolError?: (toolCallId: string, toolName: string) => void;
 } = {}) {
@@ -75,6 +77,7 @@ function harness(options: {
   const config = normalizeConfig({
     enabled: true,
     review: { activeReviewers: [] },
+    ...(options.toolsDeny !== undefined ? { tools: options.toolsDeny } : {}),
     externalAgents: {
       "fake": {
         adapter: options.researchCapable ? "codex-cli" : "run-as-binary",
@@ -1572,5 +1575,106 @@ test("#421 delegated catalogs capture the parent's live registry authority once;
   } finally {
     await manager.shutdown();
     await manager.detach();
+  }
+});
+
+test("executor denials filter new execute/in-place admissions from the pre-role-deny base, never research, never captured tasks (#434)", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-review-exec-deny-"));
+  const parentTools = ["read", "bash", "edit", "write", "ApplyPatch", "WebSearch", "GitRead"];
+  try {
+    // topLevelDeny must NOT cascade: bash is denied only for the primary and
+    // stays in the new executor's genuine authoritative base.
+    const { tools, config, manager, commandHandlers } = harness({
+      cwd,
+      slowExecutor: true,
+      researchCapable: true,
+      activeTools: [...parentTools],
+      authorizedTools: () => [...parentTools],
+      toolsDeny: { topLevelDeny: ["bash", "WebSearch"], executorDeny: ["WebSearch", "edit"] },
+    });
+    const start = executionTool(tools, "SubtasksStart").execute as ExecuteTool;
+    const add = executionTool(tools, "SubtasksAdd").execute as ExecuteTool;
+    const task = (titleValue: string) => ({
+      title: titleValue,
+      instructions: "Do bounded work",
+      acceptanceCriteria: ["Work is complete"],
+    });
+
+    const execute = await start("deny-execute", { tasks: [task("Execute work")] }, undefined, undefined, {});
+    assert.equal(execute.isError, false, JSON.stringify(execute));
+    const executeCatalog = execute.details.tasks[0].definition.executorToolCatalog as {
+      allowedToolCatalog: string[];
+      initialActiveTools: string[];
+    };
+    assert.ok(executeCatalog.allowedToolCatalog.includes("bash"), "a top-level-only denial does not cascade into the executor ceiling");
+    assert.ok(executeCatalog.allowedToolCatalog.includes("read"));
+    assert.equal(executeCatalog.allowedToolCatalog.includes("WebSearch"), false, "executor-denied WebSearch is omitted");
+    assert.equal(executeCatalog.allowedToolCatalog.includes("edit"), false, "executor-denied edit is omitted");
+    assert.deepEqual(executeCatalog, {
+      allowedToolCatalog: ["read", "bash", "write", "ApplyPatch"],
+      initialActiveTools: ["read", "bash", "write", "ApplyPatch"],
+    });
+
+    const research = await start("deny-research", {
+      kind: "research",
+      tasks: [task("Research work")],
+    }, undefined, undefined, {});
+    assert.equal(research.isError, false, JSON.stringify(research));
+    const researchCatalog = research.details.tasks[0].definition.executorToolCatalog as {
+      allowedToolCatalog: string[];
+    };
+    assert.ok(researchCatalog.allowedToolCatalog.includes("WebSearch"), "executor denials never filter research tasks");
+
+    const inplace = await manager.startScheduled(task("In-place work"), "inplace", cwd, { scheduledTaskId: "sched-inplace" });
+    const inplaceCatalog = inplace.tasks[0]!.definition.executorToolCatalog as {
+      allowedToolCatalog: string[];
+    };
+    assert.ok(inplaceCatalog.allowedToolCatalog.includes("bash"));
+    assert.equal(inplaceCatalog.allowedToolCatalog.includes("WebSearch"), false);
+    assert.equal(inplaceCatalog.allowedToolCatalog.includes("edit"), false);
+
+    // A new task added to an already-admitted execute group is itself a new
+    // admission and takes the executor deny list; the existing task's captured
+    // catalog is untouched.
+    const added = await add("deny-add", {
+      executionId: execute.details.executionId,
+      tasks: [task("Added work")],
+    }, undefined, undefined, {});
+    assert.equal(added.isError, false, JSON.stringify(added));
+    const addedCatalog = added.details.tasks[1].definition.executorToolCatalog as {
+      allowedToolCatalog: string[];
+    };
+    assert.equal(addedCatalog.allowedToolCatalog.includes("WebSearch"), false);
+    assert.deepEqual(added.details.tasks[0].definition.executorToolCatalog, executeCatalog, "the already-admitted task keeps its captured catalog");
+
+    // Scheduled dispatch goes through the same public admission boundary.
+    const scheduled = await manager.startScheduled(task("Scheduled work"), "execute", cwd, { scheduledTaskId: "sched-execute" });
+    const scheduledCatalog = scheduled.tasks[0]!.definition.executorToolCatalog as {
+      allowedToolCatalog: string[];
+    };
+    assert.equal(scheduledCatalog.allowedToolCatalog.includes("WebSearch"), false);
+
+    // Human /subtask-add shares the boundary.
+    const humanHandler = commandHandlers.get("subtask-add");
+    assert.ok(humanHandler);
+    await humanHandler!("Plain human task", { cwd, scopedModels: [], ui: { notify() {} } });
+    const humanInspection = manager.associations();
+    assert.ok((humanInspection.groupRoots ?? []).length >= 1);
+
+    // Applying a changed executor selection never rewrites an admitted task.
+    config.tools = { topLevelDeny: [], executorDeny: [] };
+    const reopened = await add("deny-add-after-change", {
+      executionId: execute.details.executionId,
+      tasks: [task("After change")],
+    }, undefined, undefined, {});
+    const reopenedCatalog = (reopened.details.tasks[2] ?? reopened.details.tasks[1]).definition.executorToolCatalog as {
+      allowedToolCatalog: string[];
+    };
+    assert.ok(reopenedCatalog.allowedToolCatalog.includes("WebSearch"), "a cleared executor deny list reaches the next NEW admission");
+    assert.deepEqual(added.details.tasks[0].definition.executorToolCatalog, executeCatalog, "the earlier admitted task keeps its captured catalog after the change");
+    await manager.shutdown();
+    await manager.detach();
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
   }
 });

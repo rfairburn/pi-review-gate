@@ -25,6 +25,7 @@ import {
   type OperatingMode,
   type RetainBundles,
   type ReviewGateConfig,
+  type ReviewGateToolsConfig,
   type SubtaskNotificationMode,
 } from "../config";
 import { isRecord } from "../record-guard";
@@ -99,6 +100,12 @@ export interface ReviewSettingsSelection {
   webBrowserPermissions?: WebBrowserPermissions;
   /** Independent YouShouldKnow availability and completion-guidance toggles. */
   youShouldKnow?: YouShouldKnowConfig;
+  /**
+   * Complete exact-name tool deny configuration (issue #434), persisted as a
+   * whole: top-level denials apply to the primary agent, executor denials apply
+   * to newly captured executors, and the two lists are independent.
+   */
+  tools?: ReviewGateToolsConfig;
 }
 
 const configUpdateTails = new Map<string, Promise<void>>();
@@ -156,6 +163,23 @@ function applyStagedSelectionFields(parsed: Record<string, unknown>, selection: 
   parsed.modeCycleShortcut = selection.modeCycleShortcut;
   if (selection.youShouldKnow !== undefined) {
     parsed.youShouldKnow = { ...selection.youShouldKnow };
+  }
+  if (selection.tools !== undefined) {
+    const rawTools = isRecord(parsed.tools) ? parsed.tools : undefined;
+    const topLevelDeny = [...(selection.tools.topLevelDeny ?? [])];
+    const executorDeny = [...(selection.tools.executorDeny ?? [])];
+    // Merge only the two owned fields into the existing raw object, so an
+    // unrelated key a user placed inside tools survives every Save (the raw
+    // record is what is written; normalization ignores unknown keys). A staged
+    // empty configuration over a record that never had a tools field stays
+    // absent: an unchanged empty deny set is never invented into the stored
+    // record. A pre-existing record or a non-empty staged list is written, so
+    // an explicit clearing persists as an empty list. A non-record raw value is
+    // replaced only by an explicit staged write; otherwise strict validation
+    // still fails the Save closed.
+    if (rawTools !== undefined || topLevelDeny.length > 0 || executorDeny.length > 0) {
+      parsed.tools = { ...(rawTools ?? {}), topLevelDeny, executorDeny };
+    }
   }
   parsed.reviewerTimeoutMs = selection.reviewerTimeoutMs;
   parsed.executorTimeoutMs = selection.executorTimeoutMs;

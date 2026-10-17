@@ -463,6 +463,13 @@ export interface NativeMcpFixtureOptions {
 	 */
 	agentSettings?: object;
 	/**
+	 * Issue #434 test fixture: register the probe's `prgNestedRelay` tool, a
+	 * permitted wrapper that forwards one nested `ctx.executeTool()` call for an
+	 * arbitrary named tool. Off by default so every existing fixture consumer's
+	 * registry inventory and tool-search results stay byte-identical.
+	 */
+	nestedRelay?: boolean;
+	/**
 	 * Launch the ACTUAL gate executor role exactly like the production Pi
 	 * executor adapter (`src/execution/adapters/pi-model.ts`): sets
 	 * `PI_REVIEW_GATE_RUNTIME_ROLE="executor"` and
@@ -1063,6 +1070,7 @@ export class NativeMcpFixture {
 		childEnv.PRG_FIXTURE_AGENT_DIR = this.host.agentDir;
 		childEnv.PRG_FIXTURE_STATE_DIR = dirname(this.paths.controlFile);
 		if (this.options.autoModel === false) childEnv.PRG_FIXTURE_NO_AUTO_MODEL = "1";
+		if (this.options.nestedRelay === true) childEnv.PRG_FIXTURE_NESTED_RELAY = "1";
 		if (this.options.wrapperDefault === true) childEnv.PI_REVIEW_GATE_CODEMODE_DEFAULT = "1";
 		if (executorLaunch) {
 			// Role + fixed catalog exactly like the production executorEnv (hermetic

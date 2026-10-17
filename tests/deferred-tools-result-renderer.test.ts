@@ -150,7 +150,7 @@ test("unavailable and native-partial search results keep actual text without fab
   assert.doesNotMatch(partialText.join("\n"), /Matched authorized tools/);
 });
 
-function fixtureWithSearch() {
+function fixtureWithSearch(options: { denied?: (name: string) => boolean } = {}) {
   const definitions: Definition[] = [
     { name: "read", description: "Read file contents." },
     { name: "InactiveRunner", description: "Run an inactive fixture operation." },
@@ -170,7 +170,7 @@ function fixtureWithSearch() {
       active = [...names];
     },
   };
-  const manager = new DeferredToolManager(pi);
+  const manager = new DeferredToolManager(pi, undefined, undefined, undefined, options.denied ?? (() => false));
   manager.register();
   assert.ok(tool?.execute);
   return {
@@ -187,6 +187,25 @@ function fixtureWithSearch() {
     sessionIdentity: object;
   };
 }
+test("#434 a role-denied exact-name search renders as denied by settings, never as a bare no-match", async () => {
+  const fixture = fixtureWithSearch({ denied: (name) => name === "InactiveRunner" });
+  fixture.manager.sessionStart(fixture.sessionIdentity);
+  const params = { query: "InactiveRunner" };
+  const result = await fixture.search("denied", params);
+  assert.equal(result.isError, true);
+  assert.deepEqual((result.details as { denied: string[] }).denied, ["InactiveRunner"]);
+  assert.deepEqual((result.details as { outcome: string }).outcome, "denied");
+  assert.deepEqual(fixture.active(), ["read", "tool_search"], "a denied search activates nothing");
+
+  const collapsed = render(fixture.tool, result, { expanded: false, isPartial: false }, params).join("\n");
+  assert.equal(collapsed.split("\n")[0], 'tool_search · "InactiveRunner" · denied by settings');
+  assert.match(collapsed, /Denied for the primary agent by review-gate settings/);
+  const expanded = render(fixture.tool, result, { expanded: true, isPartial: false }, params).join("\n");
+  assert.match(expanded, /Outcome: denied by settings/);
+  assert.match(expanded, /Denied for the primary agent by review-gate settings/);
+  assert.doesNotMatch(expanded, /no authorized tools matched/i);
+});
+
 test("#421 a host-declined match renders as not activated, never as activated or already active", () => {
   const fixture = fixtureWithSearch();
   const params = { query: "mcp__docs__direct" };

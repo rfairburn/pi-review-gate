@@ -281,15 +281,17 @@ workerResources: { "default": { selection: { source: "external", id: "fake" }, m
 
     const toggleDeferredTools = async () => {
       assert.ok(reviewSettingsHandler);
-      let selectedToggle = false;
+      let rootVisits = 0;
+      let toolsVisits = 0;
       await reviewSettingsHandler("", {
         ui: {
           select: async (title: string, options: string[]) => {
-            if (title !== "Review settings") return undefined;
-            if (!selectedToggle) {
-              selectedToggle = true;
-              return options.find((option) => option.startsWith("Deferred Pi tools"));
+            if (title === "Tools") {
+              if (toolsVisits++ === 0) return options.find((option) => option.startsWith("Deferred Pi tools"));
+              return "Back";
             }
+            if (title !== "Review settings") return undefined;
+            if (rootVisits++ === 0) return options.find((option) => option.startsWith("Tools"));
             return "Save changes";
           },
           notify() {},
@@ -700,18 +702,28 @@ test("completion guidance requires its setting and live authorized YouShouldKnow
     };
     const saveToggle = async (label: string) => {
       assert.ok(settingsHandler);
-      let selectedSetting = false;
+      let rootVisits = 0;
+      let toolsVisits = 0;
       await settingsHandler("", {
         ui: {
           select: async (title: string, options: string[]) => {
-            if (title !== "Review settings") throw new Error(`Unexpected menu: ${title}`);
-            if (!selectedSetting) {
-              selectedSetting = true;
-              const option = options.find((candidate) => candidate.startsWith(label));
-              assert.ok(option, `missing setting ${label}: ${options.join(" | ")}`);
-              return option;
+            if (title === "Review settings") {
+              if (rootVisits++ === 0) {
+                const option = options.find((candidate) => candidate.startsWith("Tools"));
+                assert.ok(option, `missing Tools row: ${options.join(" | ")}`);
+                return option;
+              }
+              return "Save changes";
             }
-            return "Save changes";
+            if (title === "Tools") {
+              if (toolsVisits++ === 0) {
+                const option = options.find((candidate) => candidate.startsWith(label));
+                assert.ok(option, `missing setting ${label}: ${options.join(" | ")}`);
+                return option;
+              }
+              return "Back";
+            }
+            throw new Error(`Unexpected menu: ${title}`);
           },
           input: async () => undefined,
           confirm: async () => false,
@@ -882,6 +894,206 @@ test("completion guidance is omitted when Pi's launch authorization excludes You
     assert.doesNotMatch(registeredTools.get("tool_search")?.description ?? "", /YouShouldKnow/);
   } finally {
     await reapAll();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("top-level settings deny applies end to end: declarations, block reasons, early not-found clarification, and the pre-deny picker (#434)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-deny-entry-"));
+  try {
+    const configPath = join(dir, "review-gate.json");
+    await writeFile(configPath, JSON.stringify({
+      ...indexTestConfig,
+      tools: { topLevelDeny: ["SyntheticNotice", "read"], executorDeny: [] },
+      review: { activeReviewers: [] },
+    }), "utf8");
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+
+    const hooks = new Map<string, Array<(...args: unknown[]) => unknown>>();
+    const selectCalls: Array<{ title: string; options: string[] }> = [];
+    let settingsHandler: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+    // A synthetic third-party tool, launch-active, that the settings deny covers.
+    const externalTools = [
+      { name: "read", description: "Read files." },
+      { name: "bash", description: "Run shell commands." },
+      { name: "edit", description: "Edit files." },
+      { name: "SyntheticNotice", description: "Send a synthetic notice." },
+    ];
+    const registeredTools: Array<{ name: string; description?: string }> = [];
+    let activeTools = ["read", "bash", "edit", "SyntheticNotice"];
+    let runtimeInitialized = false;
+    const assertRuntime = () => {
+      if (!runtimeInitialized) throw new Error("Extension runtime not initialized");
+    };
+    const pi = {
+      on(name: string, handler: (...args: unknown[]) => unknown) {
+        hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+      },
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> }) {
+        if (name === "review-settings") settingsHandler = options.handler;
+      },
+      registerTool(tool: { name: string; description?: string }) {
+        const existing = registeredTools.findIndex((candidate) => candidate.name === tool.name);
+        if (existing >= 0) registeredTools.splice(existing, 1, tool);
+        else registeredTools.push(tool);
+        if (!activeTools.includes(tool.name)) activeTools.push(tool.name);
+      },
+      getActiveTools() {
+        assertRuntime();
+        return activeTools;
+      },
+      getAllTools() {
+        assertRuntime();
+        return [...externalTools, ...registeredTools];
+      },
+      setActiveTools(next: string[]) {
+        assertRuntime();
+        activeTools = next;
+      },
+      notify() {},
+    };
+
+    await activate(pi, testActivation());
+    runtimeInitialized = true;
+    await trigger(hooks, "session_start", { cwd: dir }, { cwd: dir, ui: {}, sessionManager: {} });
+
+    // Declarations: the denied third-party tool is removed from the model set.
+    assert.equal(activeTools.includes("SyntheticNotice"), false, "a top-level denied tool is not declared");
+    assert.equal(activeTools.includes("read"), false, "a top-level denied baseline tool is not declared");
+    assert.ok(activeTools.includes("bash"), "ordinary authorized tools stay declared");
+
+    // Direct call: the real tool_call hook blocks with a role-specific reason.
+    const direct = await triggerResults(hooks, "tool_call", {
+      cwd: dir,
+      toolCallId: "deny-direct",
+      toolName: "SyntheticNotice",
+      input: { title: "x" },
+    });
+    const directBlock = direct.find((result) => (result as { block?: boolean } | undefined)?.block === true) as { reason?: string } | undefined;
+    assert.ok(directBlock, "the denied direct call is blocked");
+    assert.match(directBlock.reason ?? "", /"SyntheticNotice" was blocked/);
+    assert.match(directBlock.reason ?? "", /is denied for the primary agent/);
+    assert.match(directBlock.reason ?? "", /Top-level tools/);
+    assert.match(directBlock.reason ?? "", /no operation was performed/);
+    assert.match(directBlock.reason ?? "", /cannot bypass the denial/);
+
+    // Nested/scripted (wrapper) call: same denial on the nested path.
+    const nested = await triggerResults(hooks, "tool_call", {
+      cwd: dir,
+      toolCallId: "deny-nested",
+      toolName: "SyntheticNotice",
+      input: {},
+      parentToolCallId: "parent-1",
+    });
+    const nestedBlock = nested.find((result) => (result as { block?: boolean } | undefined)?.block === true) as { reason?: string } | undefined;
+    assert.ok(nestedBlock, "the denied nested call is blocked");
+    assert.match(nestedBlock.reason ?? "", /nested\/scripted call/);
+
+    // A non-denied tool is never blocked by the role deny (the duplicate-call
+    // preflight is a separate guard and may refuse an identity-less direct call).
+    const allowed = await triggerResults(hooks, "tool_call", {
+      cwd: dir,
+      toolCallId: "allow-bash",
+      toolName: "bash",
+      input: { command: "true" },
+    });
+    assert.ok(allowed.every((result) => !/settings deny/.test((result as { reason?: string } | undefined)?.reason ?? "")));
+
+    // Pi's early not-found result for the denied name is clarified honestly.
+    const replaced = await triggerResults(hooks, "message_end", {
+      message: {
+        role: "toolResult",
+        toolCallId: "deny-direct",
+        toolName: "SyntheticNotice",
+        isError: true,
+        content: [{ type: "text", text: "Tool SyntheticNotice not found" }],
+      },
+    });
+    const replacement = replaced.find((result) => {
+      const record = result as { message?: { content?: Array<{ text?: string }> } } | undefined;
+      return typeof record?.message?.content?.[0]?.text === "string";
+    }) as { message: { content: Array<{ text: string }> } } | undefined;
+    assert.ok(replacement, "the early not-found toolResult is replaced with the settings explanation");
+    assert.match(replacement.message.content[0]!.text, /Top-level tools/);
+    assert.match(replacement.message.content[0]!.text, /no operation was performed/);
+
+    // Picker inventory: the deny selector offers the pre-role-deny discoverable
+    // catalog (so a checked row is reversible) and opening it activates nothing.
+    const beforeMenu = [...activeTools];
+    let rootVisits = 0;
+    let toolsVisits = 0;
+    assert.ok(settingsHandler);
+    await settingsHandler("", {
+      scopedModels: [],
+      ui: {
+        async select(title: string, options: string[]) {
+          selectCalls.push({ title, options });
+          if (title === "Review settings") {
+            rootVisits += 1;
+            if (rootVisits === 1) return options.find((option) => /^Tools\s/.test(option));
+            return options.find((option) => option === "Cancel");
+          }
+          if (title === "Tools") {
+            toolsVisits += 1;
+            if (toolsVisits === 1) return options.find((option) => option.startsWith("Top-level tools"));
+            return options.find((option) => option === "Back");
+          }
+          if (title.startsWith("Top-level tools")) return options.find((option) => option === "Back");
+          throw new Error(`Unexpected menu: ${title} :: ${options.join(" | ")}`);
+        },
+        notify() {},
+      },
+    });
+    assert.deepEqual(activeTools, beforeMenu, "opening the deny picker activates nothing");
+    const picker = selectCalls.find((call) => call.title.startsWith("Top-level tools"));
+    assert.ok(picker, "the top-level deny picker opened");
+    assert.ok(
+      picker.options.some((option) => option.startsWith("SyntheticNotice")),
+      "the denied tool stays a reversible picker row while denied",
+    );
+    assert.ok(
+      picker.options.some((option) => option.startsWith("read")),
+      "the otherwise-discoverable pre-role-deny catalog is offered",
+    );
+
+    // Existing apply timing: root Escape applies the staged denial to the live
+    // config and the next managed write reflects it, with no refresh or reload.
+    // A denied baseline name comes back as a declaration once unchecked.
+    let rootVisits2 = 0;
+    let toolsVisits2 = 0;
+    let pickerVisits2 = 0;
+    await settingsHandler("", {
+      scopedModels: [],
+      ui: {
+        async select(title: string, options: string[]) {
+          if (title === "Review settings") {
+            rootVisits2 += 1;
+            if (rootVisits2 === 1) return options.find((option) => /^Tools\s/.test(option));
+            if (rootVisits2 === 2) return undefined; // root Escape = session-only apply
+            return options.find((option) => option === "Cancel");
+          }
+          if (title === "Tools") {
+            toolsVisits2 += 1;
+            if (toolsVisits2 === 1) return options.find((option) => option.startsWith("Top-level tools"));
+            return options.find((option) => option === "Back");
+          }
+          if (title.startsWith("Top-level tools")) {
+            pickerVisits2 += 1;
+            if (pickerVisits2 === 1) {
+              const row = options.find((option) => option.startsWith("read"));
+              assert.ok(row && /denied/.test(row), `the denied read row is offered checked: ${options.join(" | ")}`);
+              return row; // uncheck
+            }
+            return options.find((option) => option === "Back");
+          }
+          throw new Error(`Unexpected menu: ${title} :: ${options.join(" | ")}`);
+        },
+        notify() {},
+      },
+    });
+    assert.ok(activeTools.includes("read"), "root Escape applies the changed top-level deny to the next model-visible tool set");
+  } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });

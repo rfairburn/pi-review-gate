@@ -860,7 +860,14 @@ async function runWithPoolFailover(input: {
     }
     finishAssignment(assignmentRecord, "failed");
     if (recovered.status === "critical" || !recovered.checkpoint?.verified) {
-      await writeOperationRecord(input.operation);
+      const publication = writeOperationRecord(input.operation);
+      if (recovered.status === "critical" && input.operation.owner?.status === "active") {
+        // Recovery retained an uncertain child/persistence owner. Keep the
+        // assignment snapshot ordered without rejoining its blocked write tail.
+        void publication.catch(() => undefined);
+      } else {
+        await publication;
+      }
       return { adapter, recovered, effectiveAssignment: assignment };
     }
 

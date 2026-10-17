@@ -149,8 +149,9 @@ export async function runExecutorWithRecovery(input: {
           if (lifecycle && recordOperationChildExit(input.operation, lifecycle)) {
             await writeOperationRecord(input.operation);
           }
-          childLifecycles.delete(key);
           await input.request.onProcessExit?.(process);
+          // A callback held across a newer lifecycle must not clear its entry.
+          if (childLifecycles.get(key) === lifecycle) childLifecycles.delete(key);
         },
       });
     } catch (error) {
@@ -159,20 +160,26 @@ export async function runExecutorWithRecovery(input: {
       input.request.onLiveControl?.(undefined);
     }
 
+    if (childLifecycles.size > 0) {
+      // A started child never reported verified cleanup (including bounded
+      // timeout/drain or persistence failure), so the writer may still be
+      // live. Never checkpoint, retry, or release its ownership.
+      retainOwner = true;
+      attemptRecord.endedAt ??= new Date().toISOString();
+      attemptRecord.outcome = "failed";
+      const detail = turn?.failure?.message ?? (thrown === undefined ? undefined : thrown instanceof Error ? thrown.message : String(thrown));
+      const incident = recordUnverifiedChildShutdown(input.operation, attemptRecord.attempt, detail);
+      incidents.push(incident);
+      // The lifecycle callback may be stuck in this record's serialized write
+      // tail. Queue the terminal snapshot in order, but do not rejoin that
+      // timed-out publication here (or in finally). Neither a pending nor a
+      // rejected publication proves persistence or permits owner release.
+      const error = `${incident.message} Terminal operation-record persistence is unconfirmed; ordered publication remains best-effort.`;
+      void writeOperationRecord(input.operation).catch(() => undefined);
+      return { status: "critical", turn, error, lastTurnNumber: turnNumber, checkpoint, incidents };
+    }
+
     if (input.request.signal?.aborted) {
-      if (childLifecycles.size > 0) {
-        // #310: a started child never reported a verified exit, so the writer
-        // may still be live. Fail closed instead of checkpointing and
-        // releasing ownership as an ordinary cancellation.
-        retainOwner = true;
-        attemptRecord.endedAt ??= new Date().toISOString();
-        attemptRecord.outcome = "failed";
-        const detail = turn?.failure?.message ?? (thrown === undefined ? undefined : thrown instanceof Error ? thrown.message : String(thrown));
-        const incident = recordUnverifiedChildShutdown(input.operation, attemptRecord.attempt, detail);
-        incidents.push(incident);
-        await writeOperationRecord(input.operation);
-        return { status: "critical", turn, error: incident.message, lastTurnNumber: turnNumber, checkpoint, incidents };
-      }
       // #165: post-turn aborts settle through the shared cancellation path.
       return await settleCancellation(input, attemptRecord, turnNumber, priorCheckpointCandidate, checkpoint, incidents, "Executor was cancelled.");
     }
@@ -305,8 +312,10 @@ export async function runExecutorWithRecovery(input: {
     }
   } finally {
     clearInterval(ownerHeartbeat);
-    if (!retainOwner) releaseOperationOwner(input.operation);
-    await writeOperationRecord(input.operation);
+    if (!retainOwner) {
+      releaseOperationOwner(input.operation);
+      await writeOperationRecord(input.operation);
+    }
   }
 }
 

@@ -3493,6 +3493,32 @@ test("stdin end, output error, startup failure, forced termination, and incomple
   assert.equal(await closeWithSignal(writerFailure), 1, "an unconfirmed frame-writer cleanup is not reported as success");
 });
 
+test("cache lifetime handoff requires positive complete POSIX ownership/cleanup, not a numeric return", async () => {
+  let settled = 0;
+  const clean = createHarness({ onCacheConsumersSettled: () => { settled += 1; } });
+  await ready(clean);
+  assert.equal(await closeWithSignal(clean), 0);
+  assert.equal(settled, 1);
+
+  const uncertain = createHarness({ onCacheConsumersSettled: () => { settled += 1; } });
+  const manager = await ready(uncertain);
+  manager.views.push({ id: "remaining", label: "safe", workspace: "/workspace", agentDir: "/profile", lifecycle: "alive", hasLiveProcess: true,
+    busy: null, pendingInput: null, inputSurface: false, activity: [], nativeSession: null });
+  Object.assign(manager.shutdownResult, { forcedIds: [], remainingIds: ["remaining"] });
+  assert.equal(await closeWithSignal(uncertain), 1);
+  assert.equal(settled, 1, "uncertain consumer retains its pins");
+
+  const writerFailure = createHarness({ onCacheConsumersSettled: () => { settled += 1; } });
+  await ready(writerFailure); writerFailure.writer.closeResult = false;
+  assert.equal(await closeWithSignal(writerFailure), 1);
+  assert.equal(settled, 1, "partial cleanup retains pins");
+
+  const native = createHarness({ onCacheConsumersSettled: () => { settled += 1; } }, { platform: "win32" });
+  await ready(native);
+  assert.equal(await closeWithSignal(native), 0);
+  assert.equal(settled, 1, "native Windows closure does not prove descendants settled");
+});
+
 // --- Deliberate saved-conversation picker (issue 323). ---
 //
 // The synthetic listSavedCatalog override records exactly what Main passes

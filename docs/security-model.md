@@ -96,6 +96,30 @@ read can never erase or silently overwrite valid remembered state. This is not a
 sandbox: another process running with the user's authority can read or modify these
 files and the recorded workspaces exactly as it can the native conversations themselves.
 
+### Producer-owned disposable generation caches
+
+The session-host launcher's `.pi-review-gate/build/`, `.pi-review-gate/node/`, and
+`.pi-review-gate/pi-runtime/` subtrees under the native agent directory are disposable
+caches, including failed and legacy descendants regardless of who created individual
+files. Path ownership is not proof of inactivity: admission protects live or uncertain
+lifetime holders, unsafe/replaced roots, and legacy entries without lifetime evidence.
+It never kills a consumer or infers a build dependency merely from an old checkpoint.
+Only actual source-linked consumers/helpers and retained lifetime holders protect a
+generation. Each type refuses creation at five protected generations instead of
+silently exceeding capacity. No real user cache is purged as part of verification.
+
+Reclamation checks confinement, identities, links and entry types without following
+links outside a generation; hardlinked files and unsupported native cleanup remain
+protected. A partial failure leaves the generation counted. These are public path-API
+fences, not an atomic sandbox against malicious same-user replacement. See
+[Development](development.md#producer-owned-generation-admission) for the canonical
+lifetime record and positive settlement handoff. Native Windows direct-child closure
+is not descendant proof; its reclamation remains disabled. Pre-Node wrappers also
+refuse a sixth Node artifact before setup. POSIX fallback Node protection is removed
+only after a positive setup/native-consumer quiescence handoff AND exact CJS process
+exit; neither numeric zero nor a missing legacy record grants inactivity. Windows
+fallback outputs remain protected; no native rolling-reclamation claim is made.
+
 ## Web egress hardening
 
 Every native web path (`WebFetch`, `BrowserExtract`, and bounded semantic interactive

@@ -183,6 +183,49 @@ test("structured tool observations retain bounded current SCRIPT content and adv
   }
 });
 
+test("in-root observation restoration retains canonical evidence without forcing snapshot review or clearing prior requirements", () => {
+  const workspace = join(process.cwd(), "selected-root");
+  const state = createEvidenceState();
+  recordObservedToolEventEvidence({ state, cwd: workspace, selectedRoot: workspace,
+    adapter: "pi-model", stage: "start", toolName: "write", toolInput: { path: "SCRIPT", content: "retained" } });
+  assert.equal(state.requiresReview, false);
+  assert.equal(state.candidates.size, 1);
+  assert.equal(state.toolObservationRevision, 1);
+  const persisted = JSON.parse(JSON.stringify(serializeEvidenceState(state))) as ReturnType<typeof serializeEvidenceState>;
+  const restored = createEvidenceState();
+  restoreEvidenceState(restored, persisted, workspace);
+  assert.equal(restored.requiresReview, false);
+  assert.deepEqual(serializeEvidenceState(restored), persisted, "events, candidates and revisions survive without a parallel ledger");
+
+  for (const cause of ["live", "persisted"] as const) {
+    const required = createEvidenceState();
+    required.requiresReview = cause === "live";
+    restoreEvidenceState(required, { ...persisted, requiresReview: cause === "persisted" }, workspace);
+    assert.equal(required.requiresReview, true, `${cause} required-review state is never cleared`);
+    recordObservedToolEventEvidence({ state: required, cwd: workspace, selectedRoot: workspace,
+      adapter: "pi-model", stage: "end", toolName: "write", toolInput: { path: "SCRIPT" }, result: "written" });
+    assert.equal(required.requiresReview, true, "later known in-root observations cannot clear a true flag");
+  }
+
+  for (const cause of ["external", "unknown", "truncated"] as const) {
+    const required = createEvidenceState();
+    recordObservedToolEventEvidence({ state: required, cwd: workspace, selectedRoot: workspace,
+      adapter: "pi-model", stage: "start", toolName: "write",
+      toolInput: { path: cause === "external" ? join(workspace, "..", "external") : cause === "unknown" ? "x".repeat(100000) : "SCRIPT" } });
+    if (cause === "truncated") required.toolObservationsTruncated = true;
+    else assert.equal(required.requiresReview, true, `${cause} scope still forces review on collection`);
+    const saved = serializeEvidenceState(required);
+    // Verify derived external/truncation protection independently of the sticky persisted flag.
+    saved.requiresReview = false;
+    const continued = createEvidenceState();
+    restoreEvidenceState(continued, saved, workspace);
+    assert.equal(continued.requiresReview, true, `${cause} scope still forces review through restoration`);
+    assert.equal(continued.toolObservationRevision, required.toolObservationRevision);
+    assert.equal(continued.externalObservationRevision, required.externalObservationRevision);
+    assert.equal(continued.candidates.size, required.candidates.size);
+  }
+});
+
 test("an unavailable event stream is disclosed without inventing a tool observation", () => {
   const state = createEvidenceState();
   recordToolEventObservability(state, "run-as-binary", {

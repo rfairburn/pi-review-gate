@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import test, { mock } from "node:test";
 import { activate } from "../src/index";
 import { normalizeConfig } from "../src/config";
@@ -21,75 +23,232 @@ import { SessionStateStore } from "../src/session-state";
 import { agentCatalog } from "./helpers";
 import { countingPassReviewerWithPromptDump, createSessionRuntime, extractBundleDir, indexTestConfig, testAgentDir, trigger, triggerAgentEnd } from "./entrypoint-harness";
 
-async function fixture(evidence: Record<string, boolean> = {}, primaryEnabled = true, maxCorrectionCycles = indexTestConfig.maxCorrectionCycles as number) {
-  const root = await mkdtemp(join(__dirname, "primary-tool-evidence-"));
-  const cwd = join(root, "workspace");
-  const priorHome = process.env.HOME;
-  const home = join(root, "home");
-  await mkdir(home);
-  process.env.HOME = home;
-  await mkdir(cwd);
-  const priorCeiling = process.env.GIT_CEILING_DIRECTORIES;
-  process.env.GIT_CEILING_DIRECTORIES = root;
-  const configPath = join(root, "config.json");
-  const calls = join(root, "calls");
-  const prompt = join(root, "prompt");
-  const sessionFile = join(root, "conversation.jsonl");
-  await writeFile(sessionFile, "");
-  await writeFile(join(cwd, "SCRIPT"), "BEFORE_SCRIPT\n");
-  await writeFile(configPath, JSON.stringify({ ...indexTestConfig, maxCorrectionCycles, retainBundles: "always",
-    youShouldKnow: { enabled: false, completionGuidance: false },
-    externalAgents: agentCatalog(countingPassReviewerWithPromptDump("fake", calls, prompt)),
-    review: { primaryReviewers: [{ source: "external", id: "fake" }], primaryEnabled, evidence },
-  }));
-  process.env.PI_REVIEW_GATE_CONFIG = configPath;
-  delete process.env.PI_REVIEW_GATE_DISABLED;
-  const rt = createSessionRuntime("primary-evidence", sessionFile, cwd);
-  const commands = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
-  rt.pi.registerCommand = (name, options) => { commands.set(name, options.handler); };
-  const warnings: string[] = [];
-  Object.assign(rt.pi, { sendMessage(message: { content: string }) { warnings.push(message.content); } });
-  await activate(rt.pi);
-  await trigger(rt.hooks, "session_start", { type: "session_start", reason: "startup" }, rt.ctx);
-  const store = new SessionStateStore({ sessionId: "primary-evidence", sessionFile, cwd });
-  const restored = () => store.restore(cwd, { agentDir: testAgentDir, sessionId: "primary-evidence" });
-  const start = async (text = "change SCRIPT") => {
-    await trigger(rt.hooks, "input", { cwd, source: "user", text }, rt.ctx);
-    await trigger(rt.hooks, "before_agent_start", { cwd }, rt.ctx);
-  };
-  const writeScript = async (content: string) => {
-    const input = { path: "SCRIPT", content };
-    await trigger(rt.hooks, "tool_call", { toolName: "write", input }, rt.ctx);
-    await writeFile(join(cwd, "SCRIPT"), content);
-    await trigger(rt.hooks, "tool_result", { toolName: "write", input, result: { content: [{ type: "text", text: "written" }] } }, rt.ctx);
-  };
-  const end = () => triggerAgentEnd(rt.hooks, { cwd, messages: [{ role: "assistant", content: "done" }] }, rt.ctx);
-  const settings = async (steps: Array<string | undefined>) => {
-    let i = 0;
-    await commands.get("review-settings")!("", { ...rt.ctx, scopedModels: [], ui: {
-      select: async (_title: string, options: string[]) => {
-        assert.ok(i < steps.length, `unexpected menu: ${options.join(" | ")}`);
-        const prefix = steps[i++];
-        if (prefix === undefined) return undefined;
-        const match = options.find((option) => option.trimStart().startsWith(prefix));
-        assert.ok(match, `missing ${prefix}: ${options.join(" | ")}`);
-        return match;
-      },
-      notify: (message: string) => rt.notices.push(message),
-    } });
-    assert.equal(i, steps.length);
-  };
+const fixtureEnvKeys = ["HOME", "GIT_CEILING_DIRECTORIES", "PI_REVIEW_GATE_CONFIG", "PI_REVIEW_GATE_DISABLED"] as const;
+type FixtureRuntime = ReturnType<typeof createSessionRuntime>;
+type FixtureSetupProbe = (stage: "beforeActivation" | "afterStartup", owned: { root: string; rt: FixtureRuntime }) => Promise<void>;
+
+async function fixture(evidence: Record<string, boolean> = {}, primaryEnabled = true, maxCorrectionCycles = indexTestConfig.maxCorrectionCycles as number, setupProbe?: FixtureSetupProbe) {
+  const priorEnv = fixtureEnvKeys.map((key) => [key, process.env[key]] as const);
+  const root = await mkdtemp(join(await realpath(tmpdir()), "primary-tool-evidence-"));
+  let runtime: FixtureRuntime | undefined;
+  let activationStarted = false;
+  let activationCompleted = false;
+  // Own the allocation before the first setup await, not only after startup.
   const dispose = async () => {
-    mock.restoreAll();
-    await trigger(rt.hooks, "session_shutdown", { type: "session_shutdown", reason: "quit" }, rt.ctx);
-    if (priorCeiling === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
-    else process.env.GIT_CEILING_DIRECTORIES = priorCeiling;
-    if (priorHome === undefined) delete process.env.HOME;
-    else process.env.HOME = priorHome;
-    await rm(root, { recursive: true, force: true });
+    try {
+      mock.restoreAll();
+      const failures: unknown[] = [];
+      if (activationStarted) {
+        // One failed handler must not prevent other registered owners settling.
+        for (const shutdown of runtime?.hooks.get("session_shutdown") ?? []) {
+          try { await shutdown({ type: "session_shutdown", reason: "quit" }, runtime!.ctx); }
+          catch (error) { failures.push(error); }
+        }
+        if (!activationCompleted || !runtime?.hooks.get("session_shutdown")?.length) {
+          failures.push(new Error("activation incomplete; owned lifecycle settlement cannot be confirmed"));
+        }
+      }
+      if (failures.length) {
+        throw new AggregateError(failures, `Primary evidence fixture cleanup uncertain; preserved owned root: ${root}`);
+      }
+      // mkdtemp returned this exact root; never infer ownership from a prefix.
+      try { await rm(root, { recursive: true, force: true }); }
+      catch (error) { throw new Error(`Primary evidence fixture removal incomplete; remaining artifacts may be at: ${root}`, { cause: error }); }
+    } finally {
+      for (const [key, value] of priorEnv) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   };
-  return { root, cwd, configPath, calls, prompt, rt, commands, warnings, restored, start, writeScript, end, settings, dispose };
+  try {
+    const cwd = join(root, "workspace");
+    const home = join(root, "home");
+    await mkdir(home);
+    process.env.HOME = home;
+    await mkdir(cwd);
+    process.env.GIT_CEILING_DIRECTORIES = root;
+    const configPath = join(root, "config.json");
+    const calls = join(root, "calls");
+    const prompt = join(root, "prompt");
+    const sessionFile = join(root, "conversation.jsonl");
+    await writeFile(sessionFile, "");
+    await writeFile(join(cwd, "SCRIPT"), "BEFORE_SCRIPT\n");
+    await writeFile(configPath, JSON.stringify({ ...indexTestConfig, maxCorrectionCycles, retainBundles: "always",
+      youShouldKnow: { enabled: false, completionGuidance: false },
+      externalAgents: agentCatalog(countingPassReviewerWithPromptDump("fake", calls, prompt)),
+      review: { primaryReviewers: [{ source: "external", id: "fake" }], primaryEnabled, evidence },
+    }));
+    process.env.PI_REVIEW_GATE_CONFIG = configPath;
+    delete process.env.PI_REVIEW_GATE_DISABLED;
+    const rt = createSessionRuntime("primary-evidence", sessionFile, cwd);
+    runtime = rt;
+    const commands = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
+    rt.pi.registerCommand = (name, options) => { commands.set(name, options.handler); };
+    const warnings: string[] = [];
+    Object.assign(rt.pi, { sendMessage(message: { content: string }) { warnings.push(message.content); } });
+    await setupProbe?.("beforeActivation", { root, rt });
+    activationStarted = true;
+    await activate(rt.pi);
+    activationCompleted = true;
+    await trigger(rt.hooks, "session_start", { type: "session_start", reason: "startup" }, rt.ctx);
+    await setupProbe?.("afterStartup", { root, rt });
+    const store = new SessionStateStore({ sessionId: "primary-evidence", sessionFile, cwd });
+    const restored = () => store.restore(cwd, { agentDir: testAgentDir, sessionId: "primary-evidence" });
+    const start = async (text = "change SCRIPT") => {
+      await trigger(rt.hooks, "input", { cwd, source: "user", text }, rt.ctx);
+      await trigger(rt.hooks, "before_agent_start", { cwd }, rt.ctx);
+    };
+    const writeScript = async (content: string) => {
+      const input = { path: "SCRIPT", content };
+      await trigger(rt.hooks, "tool_call", { toolName: "write", input }, rt.ctx);
+      await writeFile(join(cwd, "SCRIPT"), content);
+      await trigger(rt.hooks, "tool_result", { toolName: "write", input, result: { content: [{ type: "text", text: "written" }] } }, rt.ctx);
+    };
+    const end = () => triggerAgentEnd(rt.hooks, { cwd, messages: [{ role: "assistant", content: "done" }] }, rt.ctx);
+    const settings = async (steps: Array<string | undefined>) => {
+      let i = 0;
+      await commands.get("review-settings")!("", { ...rt.ctx, scopedModels: [], ui: {
+        select: async (_title: string, options: string[]) => {
+          assert.ok(i < steps.length, `unexpected menu: ${options.join(" | ")}`);
+          const prefix = steps[i++];
+          if (prefix === undefined) return undefined;
+          const match = options.find((option) => option.trimStart().startsWith(prefix));
+          assert.ok(match, `missing ${prefix}: ${options.join(" | ")}`);
+          return match;
+        },
+        notify: (message: string) => rt.notices.push(message),
+      } });
+      assert.equal(i, steps.length);
+    };
+    return { root, cwd, configPath, calls, prompt, rt, commands, warnings, restored, start, writeScript, end, settings, dispose };
+  } catch (setupError) {
+    try { await dispose(); }
+    catch (cleanupError) {
+      // Keep the original failure (including identity); disclose why artifacts remain.
+      try { console.error("Primary evidence fixture setup cleanup failed:", cleanupError); }
+      finally { throw setupError; }
+    }
+    throw setupError;
+  }
 }
+
+for (const stage of ["beforeActivation", "afterStartup"] as const) {
+  for (const priorMode of ["set", "unset"] as const) {
+    test(`fixture ${stage} setup failure restores ${priorMode} environment and settles before owned root removal`, async () => {
+      const incoming = fixtureEnvKeys.map((key) => [key, process.env[key]] as const);
+      const sentinel = await mkdtemp(join(await realpath(tmpdir()), "primary-setup-sentinel-"));
+      const entered = gate(), release = gate();
+      const setupError = new Error(`injected ${stage} setup failure`);
+      let root: string | undefined;
+      let attempt: Promise<unknown> | undefined;
+      let shutdownSettled = false;
+      try {
+        // A synthetic caller's state, not the live user's home or config.
+        const home = join(sentinel, "home"), config = join(sentinel, "config.json");
+        await mkdir(home);
+        await writeFile(join(home, ".gitconfig"), "CALLER_GIT_CONFIG\n");
+        await writeFile(config, "CALLER_CONFIG_MUST_NOT_CHANGE\n");
+        const values = [home, sentinel, config, "1"];
+        fixtureEnvKeys.forEach((key, i) => {
+          if (priorMode === "unset") delete process.env[key];
+          else process.env[key] = values[i];
+        });
+        const expected = fixtureEnvKeys.map((key) => [key, process.env[key]]);
+        const agentDir = process.env.PI_CODING_AGENT_DIR;
+        attempt = fixture({}, true, 3, async (point, owned) => {
+          if (point !== stage) return;
+          root = owned.root;
+          assert.equal(process.env.HOME, join(root, "home"));
+          assert.equal(process.env.GIT_CEILING_DIRECTORIES, root);
+          assert.equal(process.env.PI_REVIEW_GATE_CONFIG, join(root, "config.json"));
+          assert.equal(process.env.PI_REVIEW_GATE_DISABLED, undefined);
+          if (stage === "beforeActivation") assert.equal(owned.rt.hooks.size, 0);
+          else {
+            assert.ok(owned.rt.hooks.get("session_shutdown")!.length > 0);
+            owned.rt.hooks.get("session_shutdown")!.push(async () => {
+              entered.resolve();
+              await release.promise;
+              assert.ok((await stat(owned.root)).isDirectory(), "owned files must survive until lifecycle settlement");
+              assert.equal(process.env.HOME, join(owned.root, "home"));
+              shutdownSettled = true;
+            });
+          }
+          throw setupError;
+        });
+        // Observe rejection immediately even if an earlier barrier assertion fails.
+        void attempt.catch(() => {});
+        if (stage === "afterStartup") {
+          await atBarrier(entered.promise, "partial-setup shutdown");
+          assert.ok(root);
+          assert.ok((await stat(root)).isDirectory());
+          assert.equal(shutdownSettled, false);
+          release.resolve();
+        }
+        await assert.rejects(attempt, (error) => error === setupError);
+        assert.ok(root);
+        assert.equal(shutdownSettled, stage === "afterStartup");
+        assert.deepEqual(fixtureEnvKeys.map((key) => [key, process.env[key]]), expected);
+        assert.equal(process.env.PI_CODING_AGENT_DIR, agentDir, "outer harness ownership is unchanged");
+        await assert.rejects(stat(root), { code: "ENOENT" });
+        assert.deepEqual((await readdir(sentinel)).sort(), ["config.json", "home"]);
+        assert.deepEqual(await readdir(home), [".gitconfig"]);
+        assert.equal(await readFile(join(home, ".gitconfig"), "utf8"), "CALLER_GIT_CONFIG\n");
+        assert.equal(await readFile(config, "utf8"), "CALLER_CONFIG_MUST_NOT_CHANGE\n");
+      } finally {
+        release.resolve();
+        await attempt?.catch(() => {});
+        for (const [key, value] of incoming) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        await rm(sentinel, { recursive: true, force: true });
+      }
+    });
+  }
+}
+
+test("fixture preserves the original setup error and owned artifacts when registered shutdown is uncertain", async (t) => {
+  const incoming = fixtureEnvKeys.map((key) => [key, process.env[key]]);
+  const setupError = new Error("injected post-startup setup failure");
+  const cleanupError = new Error("injected owned shutdown failure");
+  const diagnostics: unknown[][] = [];
+  t.mock.method(console, "error", (...args: unknown[]) => { diagnostics.push(args); });
+  let root: string | undefined;
+  let shutdownFailed = false, laterOwnerSettled = false, runtimeSettled = false;
+  let retryOwner: (() => Promise<void>) | undefined;
+  try {
+    await assert.rejects(fixture({}, true, 3, async (stage, owned) => {
+      if (stage !== "afterStartup") return;
+      root = owned.root;
+      // The real runtime shutdown handlers run first. This resource-free test
+      // owner then fails once; later owners must still be given their shutdown.
+      retryOwner = async () => {
+        if (!shutdownFailed) { shutdownFailed = true; throw cleanupError; }
+      };
+      owned.rt.hooks.get("session_shutdown")!.push(retryOwner, async () => { laterOwnerSettled = true; });
+      throw setupError;
+    }), (error) => error === setupError);
+    assert.ok(root);
+    assert.equal(shutdownFailed, true);
+    assert.equal(laterOwnerSettled, true);
+    assert.deepEqual(fixtureEnvKeys.map((key) => [key, process.env[key]]), incoming);
+    assert.ok((await stat(root)).isDirectory(), "uncertain cleanup must preserve the owned allocation");
+    assert.equal(await readFile(join(root, "workspace", "SCRIPT"), "utf8"), "BEFORE_SCRIPT\n");
+    assert.equal(diagnostics.length, 1);
+    const diagnostic = diagnostics[0]![1];
+    assert.ok(diagnostic instanceof AggregateError);
+    assert.match(diagnostic.message, /cleanup uncertain; preserved owned root:/);
+    assert.ok(diagnostic.message.includes(root));
+    assert.deepEqual(diagnostic.errors, [cleanupError]);
+    runtimeSettled = true;
+  } finally {
+    // Only the injected, resource-free owner remains unconfirmed. Confirm it
+    // separately before removing this test's positively identified allocation.
+    await retryOwner?.();
+    if (root && runtimeSettled) await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("production tool-only retains concrete SCRIPT before/after; post-pass external REPORT cannot churn review", async () => {
   const f = await fixture({ primaryToolOnly: true });
@@ -110,7 +269,7 @@ test("production tool-only retains concrete SCRIPT before/after; post-pass exter
     // Both an unrelated external addition and a later external edit to an
     // already-observed candidate are invisible to this retained evidence method.
     await trigger(f.rt.hooks, "before_agent_start", { cwd: f.cwd }, f.rt.ctx);
-    await writeFile(join(f.cwd, "REPORT"), "UNOBSERVED_REPORT\n");
+    execFileSync(process.execPath, ["-e", "require('node:fs').writeFileSync('REPORT','UNOBSERVED_REPORT\\n')"], { cwd: f.cwd, timeout: 5000 });
     await writeFile(join(f.cwd, "SCRIPT"), "UNOBSERVED_SCRIPT\n");
     await f.end();
     assert.equal(await readFile(f.calls, "utf8"), "1");

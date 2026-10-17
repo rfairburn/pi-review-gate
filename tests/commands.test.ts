@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createWorkspaceSnapshot } from "../src/capture";
 import { formatReviewerAnswer, registerCommands } from "../src/commands";
 import type { ReviewGateConfig } from "../src/config";
-import { createState, getReviewerQuestionWindow, recordReviewerFeedback, rememberUserRequest, snapshotReviewBaseline } from "../src/state";
+import { createState, getReviewerQuestionWindow, recordReviewerFeedback, recordReviewerFeedbackAndArmExchange, rememberUserRequest, snapshotReviewBaseline, type ReviewBaseline } from "../src/state";
+import { captureReviewCheckpoint, loadReviewCheckpoint } from "../src/review-checkpoint";
+import { testCheckpointScope } from "./checkpoint-scope-helpers";
 import { createReviewCancellationCoordinator } from "../src/review-cancellation";
 import { fakeNeedsChangesConfig } from "./helpers";
 
@@ -603,44 +605,76 @@ test("/ask-reviewer-interactive retains a passing review's patch and evidence", 
 });
 
 test("/review-continue sends capped feedback and resets the correction budget", async () => {
-  const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
-  const followUps: string[] = [];
-  const notices: string[] = [];
-  const state = createState();
-  rememberUserRequest(state, "change index");
-  state.reviewWindow!.correctionCycles = 3;
-  state.reviewWindow!.lastCappedFollowUp = "Review found blocking issues.\n\n1. index.ts - missing guard add it";
-  const pi = {
-    registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
-      commands.set(name, options.handler);
-    },
-    sendUserMessage(message: string) {
-      followUps.push(message);
-    },
-  };
-  const ctx = {
-    notify(message: string) {
-      notices.push(message);
-    },
-  };
+  const root = await mkdtemp(join(tmpdir(), "pi-review-continue-budget-"));
+  const previousCeiling = process.env.GIT_CEILING_DIRECTORIES;
+  try {
+    const cwd = join(root, "workspace");
+    await mkdir(cwd);
+    // Never discover the caller's repository, even when TMPDIR is in it.
+    process.env.GIT_CEILING_DIRECTORIES = root;
+    const checkpointScope = testCheckpointScope(join(root, "agent"), "continue-budget");
+    const capture = async (id: string): Promise<ReviewBaseline> => {
+      const captured = await captureReviewCheckpoint(cwd, id, { scope: checkpointScope });
+      assert.equal(captured.status, "ok", JSON.stringify(captured));
+      if (captured.status !== "ok") throw new Error("fixture checkpoint failed");
+      assert.equal(captured.value.kind, "raw");
+      return { kind: "checkpoint", descriptor: captured.value, cwd, capturedAt: new Date().toISOString() };
+    };
+    await writeFile(join(cwd, "index.ts"), "before\n");
+    const before = await capture("before");
+    await writeFile(join(cwd, "index.ts"), "after without guard\n");
+    const reviewed = await capture("reviewed");
+    const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+    const followUps: string[] = [];
+    const notices: string[] = [];
+    const state = Object.assign(createState(), { checkpointScope });
+    rememberUserRequest(state, "change index");
+    const window = state.reviewWindow!;
+    // A capped review retains the window's before-basis AND the reviewed
+    // after-basis on the response exchange, not just the follow-up string.
+    window.baseline = before;
+    recordReviewerFeedbackAndArmExchange(state, {
+      source: "automatic", disposition: "sent_at_cap", reviewedBaseline: reviewed,
+      result: { reviewerId: "fake", verdict: "needs_changes", summary: "Missing guard", findings: [] },
+    });
+    window.correctionCycles = 3;
+    window.lastCappedFollowUp = "Review found blocking issues.\n\n1. index.ts - missing guard add it";
+    registerCommands({
+      pi: {
+        registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => unknown }) {
+          commands.set(name, options.handler);
+        },
+        sendUserMessage(message: string) { followUps.push(message); },
+      },
+      cwd: () => cwd,
+      config: reviewConfig(),
+      state,
+    });
+    const ctx = { notify(message: string) { notices.push(message); } };
 
-  registerCommands({
-    pi,
-    cwd: () => process.cwd(),
-    config: reviewConfig(),
-    state,
-  });
+    await commands.get("review-continue")!("", ctx);
 
-  await commands.get("review-continue")?.("", ctx);
+    assert.equal(window.correctionCycles, 0);
+    assert.equal(window.lastCappedFollowUp, undefined);
+    assert.equal(window.reviewHistory.at(-1)?.disposition, "held_then_sent");
+    assert.equal(window.baseline, before);
+    const response = window.activeExchange!.baseline;
+    assert.equal(response?.kind, "checkpoint");
+    if (response?.kind !== "checkpoint") throw new Error("missing response checkpoint");
+    assert.notEqual(response, reviewed);
+    assert.equal((await loadReviewCheckpoint(cwd, response.descriptor, { scope: checkpointScope })).status, "ok");
+    assert.deepEqual(followUps, ["Review found blocking issues.\n\n1. index.ts - missing guard add it"]);
+    assert.match(notices.join("\n"), /correction budget reset to 3/);
 
-  assert.equal(state.reviewWindow!.correctionCycles, 0);
-  assert.equal(state.reviewWindow!.lastCappedFollowUp, undefined);
-  assert.deepEqual(followUps, ["Review found blocking issues.\n\n1. index.ts - missing guard add it"]);
-  assert.match(notices.join("\n"), /correction budget reset to 3/);
-
-  await commands.get("review-continue")?.("", ctx);
-  assert.equal(followUps.length, 1);
-  assert.match(notices.join("\n"), /no capped reviewer feedback available/);
+    await commands.get("review-continue")!("", ctx);
+    assert.equal(followUps.length, 1);
+    assert.equal(window.activeExchange!.baseline, response, "no second capture without capped feedback");
+    assert.match(notices.join("\n"), /no capped reviewer feedback available/);
+  } finally {
+    if (previousCeiling === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
+    else process.env.GIT_CEILING_DIRECTORIES = previousCeiling;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("/ask-reviewer-interactive at the correction cap receives the complete unresolved review window", async () => {

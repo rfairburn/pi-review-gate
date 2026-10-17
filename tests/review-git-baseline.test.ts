@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmod, lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -12,7 +12,7 @@ import { captureReviewCheckpoint, loadReviewCheckpoint, releaseReviewCheckpoint 
 import { createEvidenceState, recordToolCallEvidence } from "../src/evidence";
 import { armGitCheckpoint, type GitCheckpointDescriptor } from "../src/git-checkpoint";
 import { collectPausedReviewExchange, runAskReviewer, runReview } from "../src/review";
-import { beginAgentRun, createState, recordReviewerFeedbackAndArmExchange, type ReviewBaseline } from "../src/state";
+import { beginAgentRun, createState, recordReviewerFeedback, recordReviewerFeedbackAndArmExchange, type ReviewBaseline } from "../src/state";
 import { fakeNeedsChangesConfig } from "./helpers";
 import { disposableAgentDir, testCheckpointScope } from "./checkpoint-scope-helpers";
 
@@ -39,12 +39,17 @@ async function git(repo: string, ...args: string[]): Promise<string> {
 
 async function initRepo(): Promise<string> {
   const repo = await mkdtemp(join(tmpdir(), "pi-review-gate-git-baseline-"));
-  await git(repo, "init", "-q");
-  await writeFile(join(repo, "README.md"), "# test\n");
-  await writeFile(join(repo, "index.ts"), "before\n");
-  await git(repo, "add", ".");
-  await git(repo, "commit", "-q", "-m", "initial");
-  return repo;
+  try {
+    await git(repo, "init", "-q");
+    await writeFile(join(repo, "README.md"), "# test\n");
+    await writeFile(join(repo, "index.ts"), "before\n");
+    await git(repo, "add", ".");
+    await git(repo, "commit", "-q", "-m", "initial");
+    return repo;
+  } catch (error) {
+    await rm(repo, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 function baselineOf(descriptor: GitCheckpointDescriptor, cwd: string): ReviewBaseline {
@@ -147,8 +152,8 @@ test("nested Git-ignored evidence deletion reports a repository-root-relative pa
 test("/review-continue captures a repository-root checkpoint while preserving nested session cwd", async () => {
   const repo = await mkdtemp(join(process.cwd(), ".review-continue-nested-"));
   const cwd = join(repo, "nested");
-  await mkdir(cwd);
   try {
+    await mkdir(cwd);
     await git(repo, "init", "-q");
     await writeFile(join(repo, "baseline.txt"), "base\n");
     await git(repo, "add", "baseline.txt");
@@ -156,12 +161,29 @@ test("/review-continue captures a repository-root checkpoint while preserving ne
     const state = Object.assign(createState(), { checkpointScope });
     beginAgentRun(state);
     const window = state.reviewWindow!;
+    const before = await captureReviewCheckpoint(cwd, "nested-before", { scope: checkpointScope });
+    assert.equal(before.status, "ok", JSON.stringify(before));
+    if (before.status !== "ok") throw new Error("fixture baseline capture failed");
+    window.baseline = { kind: "checkpoint", descriptor: before.value, cwd, capturedAt: new Date().toISOString() };
+    await writeFile(join(repo, "baseline.txt"), "reviewed change\n");
+    const reviewed = await captureReviewCheckpoint(cwd, "nested-reviewed", { scope: checkpointScope });
+    assert.equal(reviewed.status, "ok", JSON.stringify(reviewed));
+    if (reviewed.status !== "ok") throw new Error("fixture reviewed capture failed");
+    recordReviewerFeedbackAndArmExchange(state, {
+      source: "automatic", disposition: "sent_at_cap",
+      reviewedBaseline: { kind: "checkpoint", descriptor: reviewed.value, cwd, capturedAt: new Date().toISOString() },
+      result: { reviewerId: "fake", verdict: "needs_changes", summary: "Correction needed", findings: [] },
+    });
+    const retainedBefore = window.baseline;
+    const retainedResponse = window.activeExchange!.baseline;
     window.lastCappedFollowUp = "capped feedback";
+    window.correctionCycles = config.maxCorrectionCycles;
+    const followUps: string[] = [];
     const commands = new Map<string, (args: string, ctx: unknown) => Promise<unknown>>();
     registerCommands({
       pi: {
         registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => Promise<unknown> }) { commands.set(name, options.handler); },
-        sendUserMessage: async () => undefined,
+        sendUserMessage: async (message: string) => { followUps.push(message); },
       },
       cwd: () => cwd, config, state,
       onStateChanged: async () => undefined,
@@ -172,31 +194,165 @@ test("/review-continue captures a repository-root checkpoint while preserving ne
     if (response?.kind !== "checkpoint") throw new Error("missing response checkpoint");
     assert.equal(response.cwd, cwd);
     assert.equal(response.descriptor.kind, "git");
-    assert.equal((await loadReviewCheckpoint(cwd, response.descriptor, { scope: checkpointScope })).status, "ok");
+    if (response.descriptor.kind !== "git") throw new Error("expected Git response checkpoint");
+    assert.equal(response.descriptor.checkpoint.gitDir, join(repo, ".git"));
+    assert.equal(window.baseline, retainedBefore);
+    assert.notEqual(response, retainedResponse);
+    assert.equal(window.correctionCycles, 0);
+    assert.equal(window.lastCappedFollowUp, undefined);
+    assert.equal(window.reviewHistory.at(-1)?.disposition, "held_then_sent");
+    assert.deepEqual(followUps, ["capped feedback"]);
+    for (const descriptor of [before.value, reviewed.value, response.descriptor]) {
+      assert.equal((await loadReviewCheckpoint(cwd, descriptor, { scope: checkpointScope })).status, "ok");
+    }
     assert.equal((await releaseReviewCheckpoint(cwd, response.descriptor, { scope: checkpointScope })).status, "ok");
   } finally { await rm(repo, { recursive: true, force: true }); }
 });
 
 test("/review-continue capture failure preserves capped authorization for retry", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-continue-capture-"));
+  const previousCeiling = process.env.GIT_CEILING_DIRECTORIES;
   try {
-    const state = Object.assign(createState(), { checkpointScope });
+    const cwd = join(root, "workspace");
+    await mkdir(cwd);
+    process.env.GIT_CEILING_DIRECTORIES = root;
+    const scope = testCheckpointScope(join(root, "agent"), "capture-retry");
+    await writeFile(join(cwd, "index.ts"), "before\n");
+    const before = await captureReviewCheckpoint(cwd, "retry-before", { scope });
+    assert.equal(before.status, "ok", JSON.stringify(before));
+    if (before.status !== "ok") throw new Error("fixture baseline capture failed");
+    assert.equal(before.value.kind, "raw");
+    const state = Object.assign(createState(), { checkpointScope: scope });
     beginAgentRun(state);
     const window = state.reviewWindow!;
+    window.baseline = { kind: "checkpoint", descriptor: before.value, cwd, capturedAt: new Date().toISOString() };
+    await recordToolCallEvidence({
+      state: window.evidence, cwd, toolName: "write", toolInput: { path: "index.ts", content: "reviewed change\n" },
+      snapshotOptions: { maxFileBytes: config.maxFileBytes, maxSnapshotBytes: config.maxSnapshotBytes },
+    });
+    await writeFile(join(cwd, "index.ts"), "reviewed change\n");
+    const reviewed = await captureReviewCheckpoint(cwd, "retry-reviewed", { scope });
+    assert.equal(reviewed.status, "ok", JSON.stringify(reviewed));
+    if (reviewed.status !== "ok") throw new Error("fixture reviewed capture failed");
+    recordReviewerFeedbackAndArmExchange(state, {
+      source: "automatic", disposition: "sent_at_cap",
+      reviewedBaseline: { kind: "checkpoint", descriptor: reviewed.value, cwd, capturedAt: new Date().toISOString() },
+      result: { reviewerId: "fake", verdict: "needs_changes", summary: "Correction needed", findings: [] },
+    });
     window.lastCappedFollowUp = "original capped feedback";
     window.correctionCycles = 2;
+    const retainedBefore = window.baseline;
+    const retainedExchange = window.activeExchange;
+    const retainedResponse = retainedExchange!.baseline;
+    const evidence = window.evidence;
+    const evidenceBefore = structuredClone(evidence);
+    const historyBefore = structuredClone(window.reviewHistory);
+    const followUps: string[] = [];
+    let saves = 0;
     const commands = new Map<string, (args: string, ctx: unknown) => Promise<unknown>>();
     registerCommands({
-      pi: { registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => Promise<unknown> }) { commands.set(name, options.handler); } },
-      cwd: () => join(root, "missing-root"), config, state,
-      onStateChanged: () => undefined,
+      pi: {
+        registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => Promise<unknown> }) { commands.set(name, options.handler); },
+        sendUserMessage: async (message: string) => { followUps.push(message); },
+      },
+      cwd: () => cwd, config, state,
+      onStateChanged: () => { saves++; },
     });
-    await assert.rejects(() => commands.get("review-continue")!("", {}), /response checkpoint failed/);
+    // A sparse file exceeds the raw acquisition cap before any content buffer
+    // is allocated. Historical records/root identities stay valid and loadable.
+    const oversizedPath = join(cwd, "too-large.bin");
+    const oversized = await open(oversizedPath, "w");
+    try { await oversized.truncate(512 * 1024 * 1024 + 1); }
+    finally { await oversized.close(); }
+    await assert.rejects(() => commands.get("review-continue")!("", {}), /response checkpoint failed.*raw review-evidence acquisition failed/);
     assert.equal(window.lastCappedFollowUp, "original capped feedback");
     assert.equal(window.correctionCycles, 2);
-    assert.equal(window.activeExchange?.baseline, undefined);
-  } finally { await rm(root, { recursive: true, force: true }); }
+    assert.equal(window.baseline, retainedBefore);
+    assert.equal(window.activeExchange, retainedExchange);
+    assert.equal(window.activeExchange!.baseline, retainedResponse);
+    assert.equal(window.evidence, evidence);
+    assert.deepEqual(window.evidence, evidenceBefore);
+    assert.deepEqual(window.reviewHistory, historyBefore);
+    assert.deepEqual(state.pendingModelDeliveries, []);
+    assert.deepEqual(followUps, []);
+    assert.equal(saves, 1, "the command wrapper persists the unchanged capped state even on failure");
+    for (const descriptor of [before.value, reviewed.value]) {
+      assert.equal((await loadReviewCheckpoint(cwd, descriptor, { scope })).status, "ok");
+    }
+
+    await rm(oversizedPath);
+    await commands.get("review-continue")!("", {});
+    assert.equal(window.baseline, retainedBefore);
+    assert.notEqual(window.activeExchange!.baseline, retainedResponse);
+    const response = window.activeExchange!.baseline;
+    if (response?.kind !== "checkpoint") throw new Error("missing retry response checkpoint");
+    assert.equal((await loadReviewCheckpoint(cwd, response.descriptor, { scope })).status, "ok");
+    assert.equal(window.lastCappedFollowUp, undefined);
+    assert.equal(window.correctionCycles, 0);
+    assert.equal(window.reviewHistory.at(-1)?.disposition, "held_then_sent");
+    assert.equal(window.evidence, evidence);
+    assert.deepEqual(window.evidence, evidenceBefore);
+    assert.deepEqual(followUps, ["original capped feedback"]);
+    assert.ok(saves > 1, "successful retry persists its newly authorized response");
+  } finally {
+    if (previousCeiling === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
+    else process.env.GIT_CEILING_DIRECTORIES = previousCeiling;
+    await rm(root, { recursive: true, force: true });
+  }
 });
+
+for (const snapshotFailureFallback of [false, true]) {
+  test(`/review-continue without a preserved basis stays capped (fallback=${snapshotFailureFallback})`, async () => {
+    const repo = await initRepo();
+    try {
+      const state = Object.assign(createState(), { checkpointScope });
+      beginAgentRun(state);
+      const window = state.reviewWindow!;
+      await recordToolCallEvidence({
+        state: window.evidence, cwd: repo, toolName: "write", toolInput: { path: "index.ts", content: "unresolved\n" },
+        snapshotOptions: { maxFileBytes: config.maxFileBytes, maxSnapshotBytes: config.maxSnapshotBytes },
+      });
+      recordReviewerFeedback(state, {
+        source: "automatic", disposition: "sent_at_cap",
+        result: { reviewerId: "fake", verdict: "needs_changes", summary: "Correction needed", findings: [] },
+      });
+      window.lastCappedFollowUp = "still capped";
+      window.correctionCycles = 2;
+      const exchange = window.activeExchange;
+      const evidence = window.evidence;
+      const evidenceBefore = structuredClone(evidence);
+      const history = structuredClone(window.reviewHistory);
+      const refs = await checkpointRefs(repo);
+      assert.deepEqual(refs, []);
+      const followUps: string[] = [];
+      let saves = 0;
+      const commands = new Map<string, (args: string, ctx: unknown) => Promise<unknown>>();
+      registerCommands({
+        pi: {
+          registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => Promise<unknown> }) { commands.set(name, options.handler); },
+          sendUserMessage: async (message: string) => { followUps.push(message); },
+        },
+        cwd: () => repo,
+        config: { ...config, review: { ...config.review, evidence: { snapshotFailureFallback } } },
+        state,
+        onStateChanged: () => { saves++; },
+      });
+      await assert.rejects(() => commands.get("review-continue")!("", {}), /no preserved response basis; continuation remains capped/);
+      assert.equal(window.baseline, undefined);
+      assert.equal(window.activeExchange, exchange);
+      assert.equal(window.activeExchange?.baseline, undefined);
+      assert.equal(window.lastCappedFollowUp, "still capped");
+      assert.equal(window.correctionCycles, 2);
+      assert.deepEqual(window.reviewHistory, history);
+      assert.equal(window.evidence, evidence);
+      assert.deepEqual(window.evidence, evidenceBefore);
+      assert.deepEqual(state.pendingModelDeliveries, []);
+      assert.deepEqual(followUps, []);
+      assert.equal(saves, 1, "the command wrapper persists the unchanged capped state even on failure");
+      assert.deepEqual(await checkpointRefs(repo), refs, "no fresh checkpoint may replace the missing historical basis");
+    } finally { await rm(repo, { recursive: true, force: true }); }
+  });
+}
 test("/review-now retains completed checkpoint when changes-requested notice fails", async () => {
   const repo = await initRepo();
   try {

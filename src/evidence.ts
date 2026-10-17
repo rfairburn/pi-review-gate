@@ -325,7 +325,9 @@ export function restoreEvidenceState(state: EvidenceState, value: unknown, selec
     state.reviewEvidenceNotes.push(...value.reviewEvidenceNotes.filter((item): item is string => typeof item === "string").slice(-MAX_REVIEW_EVIDENCE_NOTES));
   }
   state.reviewEvidenceNotesTruncated ||= value.reviewEvidenceNotesTruncated === true;
-  state.requiresReview ||= value.requiresReview === true || state.candidates.size > 0 || state.toolObservationsTruncated;
+  state.requiresReview ||= value.requiresReview === true
+    || [...state.candidates.values()].some((candidate) => candidate.externalSideEffect === true)
+    || state.toolObservationsTruncated;
 }
 
 export const MAX_OBSERVED_TOOL_EVENTS = 200;
@@ -505,7 +507,9 @@ export function recordObservedToolEventEvidence(input: {
     if (!evidence.sources.includes(source) && evidence.sources.length < MAX_CANDIDATE_SOURCES) evidence.sources.push(source);
     else if (!evidence.sources.includes(source)) input.state.toolObservationsTruncated = true;
     input.state.candidates.set(key, evidence);
-    input.state.requiresReview = true;
+    // Known in-root observations enrich evidence without changing snapshot
+    // no-op eligibility. Tool-method review consumes them independently.
+    input.state.requiresReview ||= isOutside || input.state.toolObservationsTruncated === true;
   }
 }
 

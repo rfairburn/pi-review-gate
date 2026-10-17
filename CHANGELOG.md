@@ -15,6 +15,27 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.174]
+
+### Fixed
+
+- Session-host development builds and isolated Pi provisioning (#385) now reserve capacity
+  before artifact creation, independently limiting each disposable cache to five
+  generations including setup residue. Settled unused generations can be reclaimed;
+  live, uncertain, legacy, or unsafe generations instead block admission. Validated
+  build reuse and installed build-free startup remain unchanged. Normal complete
+  POSIX host shutdown explicitly releases consumer pins; native Windows uncertainty
+  remains protected. Fallback Node wrappers now independently reserve one of five
+  artifacts before downloads/extraction. POSIX reclaims settled path-owned contents
+  and makes a runtime inactive only after explicit consumer quiescence plus exact
+  CJS process exit. The POSIX supervisor forwards PID-targeted termination signals to
+  its exact child and waits through signal-interrupted waits, preserving inherited
+  terminal streams and the child's eventual exit status. Fresh checksum-pinned
+  extraction and supported PATH-Node preference are unchanged. Cleanup refuses mounted
+  generations and descendants before traversal and rechecks bounded native mount
+  evidence before deletion. Native Windows refuses a sixth artifact without
+  reclamation; native rolling cleanup remains unresolved.
+
 ## [0.1.0-dev.172]
 
 ### Fixed

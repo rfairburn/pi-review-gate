@@ -454,6 +454,98 @@ boundary for plan/research. The launcher does not impose a separate orchestrator
 to limit the orchestrator, pass Pi's native allowlist through the wrapper, for example
 `./scripts/pi-review-gate.sh --tools read,bash,edit,write`.
 
+### Producer-owned generation admission
+
+`scripts/managed-generations.cjs` provides the CJS producer seam used by the optional
+session host's development build and isolated Pi installer. Each type's direct child
+entries are its capacity inventory (maximum five); no parallel lifetime index is kept.
+One `.generation.json` inside each generation stores only schema, BigInt directory
+identity serialized as decimal strings, and opaque lifetime holder tokens. Existing
+source-build freshness manifests/records remain the sole build-reuse authority and are
+not repurposed as lifetime evidence. The mutable lifetime file is excluded from that
+immutable build-artifact digest inventory.
+
+`admit(cacheRoot, create)` exclusively checks capacity, reclaims safely settled roots
+only when needed, creates one generation, and returns its `generation` handle. Its optional
+fourth `replacement` argument permits same-version retry of incomplete Pi setup: the
+observed root identity, zero holders, producer eligibility (no published `node_modules`),
+safe removal, and replacement reservation are all checked under that one lock. Active,
+uncertain, legacy, replaced, published, or unsafe roots are not replaced by this retry.
+`pin(cacheRoot, select)` fences reuse selection against the same eviction lock without
+a generation scan. `generation.release()` removes only that holder after explicit
+positive settlement. Missing legacy metadata never means inactive. A crash, failed
+metadata publication, uncertain setup/consumer, or abandoned admission lock fails closed;
+there is no stale-lock stealing or process discovery. The record does not duplicate
+package identity, freshness, checkpoint state, or a list of descendant creation receipts.
+All Pi selection routes (explicit, npm-global and PATH) pin a selected managed generation
+before executing its version probe, including canonical aliases and another agent directory's
+cache. The handle follows the selected runtime through launcher settlement; unconfirmed
+probe cleanup retains it. Ordinary unmanaged installations keep their existing validation
+and precedence without a generation inventory.
+
+Reclamation preflights a bounded no-follow tree, rejects external links, hardlinked
+regular files and special entries, prunes `.terraform` before traversal, and rechecks
+root/ancestor/entry identities before individual removal. Bounded native mount metadata
+excludes mounted roots/descendants, including same-device Linux bind mounts, before
+traversal; mount evidence is rechecked before directory descent and deletion. Different
+devices, unavailable/ambiguous evidence, or a changed mount inventory refuse cleanup. Internal npm symlinks are
+unlinked, never followed. Partial cleanup stays counted. Native Windows reclamation is
+disabled: public Node identities and direct-child close cannot establish all reparse
+and descendant-lifetime safeguards. These path APIs are not an atomic sandbox against
+a malicious same-user writer. No real user cache is used by the focused generation tests.
+
+Main's producer-only `onCacheConsumersSettled` callback is emitted only after its existing
+positive complete POSIX ownership/cleanup guards succeed. A numeric return, timeout,
+forced stop, or uncertain remaining child does not release cache pins. This is a narrow
+lifetime handoff, not process adoption or a new application manager.
+
+The fallback Node wrappers independently admit at most five direct-child artifacts
+under `.pi-review-gate/node/`, before download or extraction. The supported PATH-Node
+fast route is unchanged. POSIX uses `scripts/node-generations.sh`; native PowerShell
+uses an exclusive admission file and in-memory Reflection.Emit handle identity calls
+before creating a generation (no compiler scratch before admission). Existing entries,
+including failed setup and legacy entries, count. No mutable extracted Node is reused.
+
+Node has exactly one native-friendly canonical record, `.node-lifetime` inside its
+artifact, not a mirrored CJS `.generation.json` or registry. Its four newline-terminated
+UTF-8 lines are `pi-review-gate-node-v1`, root identity, opaque bootstrap basename, and
+`protected`, `quiescent`, or `inactive`. POSIX identities are lossless decimal
+`dev:ino`; Windows preserves the eight volume bytes and sixteen file-ID bytes from
+native `FILE_ID_INFO` as sixteen and thirty-two hex digits (no 64-bit file-ID truncation).
+Unavailable full native identities refuse admission.
+The same short `.admission.lock` coordinates creation and lifetime publication; an
+abandoned lock is never stolen. Missing/malformed/replaced lifetime evidence protects
+an entry. POSIX preflights a bounded no-follow tree before deleting ordinary path-owned
+contents, unlinks symlinks themselves without visiting their targets, refuses hardlinked
+files/special entries/other devices or mounted descendants (including same-device bind
+mounts), refuses unsupported/ambiguous or changing native mount inventories, and never
+descends into or removes an ancestor
+containing `.terraform`. Partial failures stay counted. These are path identity fences,
+not a malicious same-user race sandbox.
+
+`scripts/node-bootstrap-lifetime.cjs` consumes and immediately scrubs the one-shot
+`PI_REVIEW_GATE_NODE_GENERATION`/`PI_REVIEW_GATE_NODE_HOLDER` wrapper context. Only an
+explicit complete setup/native-consumer witness publishes **quiescent**, which is still
+protected. The foreground POSIX supervisor publishes **inactive** only after that exact
+CJS process exits and its identity/record/fence rechecks succeed. PID-targeted SIGTERM,
+SIGHUP and SIGINT are forwarded only to that exact owned child; interrupted waits are
+retried until its actual exit. The child keeps inherited stdin and the caller's terminal
+process group. Numeric zero alone,
+crashes, interrupted setup, failed handoff, or uncertain owned dependents retain protection;
+explicit settled synchronous bootstrap failures may become inactive. Original argv,
+working directory, TTY streams, trusted environment and exit status are preserved.
+
+Native Windows Node reclamation and quiescence publication remain disabled: five
+artifacts block a sixth before setup, even after direct-child exit. This is bounded
+fail-closed admission, **not** native rolling reclamation or full #385 resolution.
+`tests/session-host-entrypoints.test.ts` includes native Windows handle/admission tests
+selected by the Windows launcher CI job; POSIX mocks/source assertions are not Windows
+runtime evidence. For a manual native proof, use a new disposable `PI_CODING_AGENT_DIR`
+and a PATH without supported Node, launch the PowerShell wrapper five times with
+`--help`, then verify the sixth refuses without another bootstrap directory/download.
+Never run this against an existing user cache. Rolling native reclamation still needs
+positive descendant settlement and safe native reparse/deletion proof.
+
 ## Protocol and compatibility notes
 
 - Pi is independently installed and upgradeable; this project consumes its public

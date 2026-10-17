@@ -25,8 +25,8 @@ import { scopedModelChoices, type ScopedModelChoice } from "./models";
 import { assembleStagedSelectionConfig, captureScheduledAlreadyRun, persistReviewSettings, replaceConfig, type ReviewSettingsSelection } from "./persistence";
 import { clearPendingSessionDelta, getPendingSessionDelta, recordPendingSessionDelta } from "./session-delta";
 import { prepareScheduledImageAssets, rollbackScheduledImageAssets, rollbackScheduledImageAssetsUnlessPersisted, type PreparedScheduledImageAssets } from "./scheduled-image-assets";
-import { alignedSettingsRows, formatByteSize, formatDuration, notify, type UiContext } from "./ui";
-import { selectWebSettings } from "./web";
+import { alignedSettingsRows, formatDuration, notify, type UiContext } from "./ui";
+import { deniableToolNames, readToolChoices, selectToolSettings, toolsRootSummary, type RetainedToolDenials } from "./tools";
 import {
   expandScheduledTaskWorkspaces,
   scheduledSummary,
@@ -74,6 +74,14 @@ interface RegisterSettingsInput {
    * stop/start — no polling of the flag.
    */
   schedulerRuntime?: { enabled: boolean; setEnabled(next: boolean): void };
+  /**
+   * Authoritative pre-role-deny candidate tools for the Tools deny selectors
+   * (issue #434), supplied by the runtime from the host's otherwise-discoverable
+   * inventory. Reading it never activates or authorizes a tool; it only labels
+   * the choices. When absent or malformed the selectors still render every
+   * saved denied name, so no saved denial is lost or silently granted.
+   */
+  getToolChoices?: () => readonly { name: string; description?: string }[];
 }
 
 export function registerReviewSettings(input: RegisterSettingsInput): void {
@@ -102,7 +110,7 @@ export function registerReviewSettings(input: RegisterSettingsInput): void {
       await runSettingsMenu({ ...input, ui, scoped }, initialSection);
     };
   input.pi.registerCommand("review-settings", {
-    description: "Configure delegated execution, deferred Pi tools, YouShouldKnow notices and completion guidance, reviewers, review policy, scheduled tasks, web tools, and retention.",
+    description: "Configure delegated execution, tool denials and deferred Pi tools, YouShouldKnow notices and completion guidance, reviewers, review policy, scheduled tasks, web tools, and retention.",
     handler: openSettings("review-settings", "root"),
   });
   // Issue #190: landing shortcut into the same staged settings transaction.
@@ -190,6 +198,22 @@ async function runSettingsMenu(
   let retryPolicy = { ...(input.config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY) };
   let subtaskNotifications = input.config.execution?.subtaskNotifications ?? DEFAULT_SUBTASK_NOTIFICATION_MODE;
   let deferredPiTools = input.config.execution?.deferredPiTools ?? DEFAULT_DEFERRED_PI_TOOLS;
+  // Issue #434: the exact-name deny lists staged as one canonical draft. The
+  // required discovery loader is never a deniable candidate: canonical config
+  // validation rejects it and recovery drops it, and filtering here keeps a
+  // raw programmatic config from ever staging or persisting it.
+  let topLevelDeny = deniableToolNames(input.config.tools?.topLevelDeny ?? []);
+  let executorDeny = deniableToolNames(input.config.tools?.executorDeny ?? []);
+  // Issue #434 review pass 1: the transaction-opening deny names are UI-only
+  // row identities retained for this whole menu session, independent of the
+  // staged checkbox state, so a saved name the live inventory no longer offers
+  // stays visible and reversible (uncheck and recheck, across Back/re-entry).
+  // They are never persisted, never copied into the draft config, and never
+  // treated as authorization: the live canonical config is the only store.
+  const retainedToolDenials: RetainedToolDenials = {
+    topLevelDeny: deniableToolNames(input.config.tools?.topLevelDeny ?? []),
+    executorDeny: deniableToolNames(input.config.tools?.executorDeny ?? []),
+  };
   let youShouldKnow = { ...(input.config.youShouldKnow ?? DEFAULT_CONFIG.youShouldKnow!) };
   let subtasksViewExpanded = input.config.ui?.subtasksViewExpanded === true;
   let webMaxDownloadBytes = input.config.web!.fetch.maxDownloadBytes;
@@ -368,6 +392,7 @@ async function runSettingsMenu(
     subtaskNotifications,
     deferredPiTools,
     youShouldKnow,
+    tools: { topLevelDeny: [...topLevelDeny], executorDeny: [...executorDeny] },
     subtasksViewExpanded,
     scheduledTasks: catalogForApply,
     scheduledTasksStagedFrom,
@@ -422,15 +447,12 @@ async function runSettingsMenu(
       { key: "workers", label: "Global concurrency", value: String(maxWorkers) },
       { key: "retry", label: "Retry policy", value: `${retryPolicy.maxRetries} retries · ${formatDuration(retryPolicy.baseDelayMs)} base` },
       { key: "notifications", label: "Subtask notifications", value: subtaskNotifications === "quiet" ? "Quiet" : "Noisy" },
-      { key: "deferredTools", label: "Deferred Pi tools", value: `${deferredPiTools ? "On" : "Off"} · local now, new subtasks` },
-      { key: "youShouldKnow", label: "YouShouldKnow notices", value: youShouldKnow.enabled ? "On" : "Off" },
-      { key: "completionGuidance", label: "Completion guidance", value: youShouldKnow.completionGuidance ? "On" : "Off" },
+      { key: "tools", label: "Tools", value: toolsRootSummary({ topLevelDeny, executorDeny, deferredPiTools, web: { maxDownloadBytes: webMaxDownloadBytes, browserVisible, browserPermissions } }) },
       { key: "subtasksView", label: "Subtasks view", value: subtasksViewExpanded ? "Expanded" : "Collapsed" },
       { key: "scheduled", label: "Scheduled tasks", value: scheduledSummary(scheduledTasks) },
       ...(input.schedulerRuntime
         ? [{ key: "schedulerRuntime", label: "Scheduler runtime", value: input.schedulerRuntime.enabled ? "On" : "Off" }]
         : []),
-      { key: "web", label: "Web", value: `${formatByteSize(webMaxDownloadBytes)} max download · ${browserVisible ? "headed" : "headless"} browser${browserPermissions.yolo ? " · YOLO ON" : ""}` },
     ];
     const renderedRootRows = alignedSettingsRows(rootSections.map((section) => [section.label, section.value] as const));
     // Rows are keyed by stable section names: every label re-renders with the
@@ -573,16 +595,38 @@ async function runSettingsMenu(
       subtaskNotifications = await selectSubtaskNotifications(input.ui, subtaskNotifications);
       continue;
     }
-    if (choice === "deferredTools") {
-      deferredPiTools = !deferredPiTools;
-      continue;
-    }
-    if (choice === "youShouldKnow") {
-      youShouldKnow = { ...youShouldKnow, enabled: !youShouldKnow.enabled };
-      continue;
-    }
-    if (choice === "completionGuidance") {
-      youShouldKnow = { ...youShouldKnow, completionGuidance: !youShouldKnow.completionGuidance };
+    if (choice === "tools") {
+      // Issue #434: the root Tools subsection. The moved Deferred Pi tools,
+      // YouShouldKnow notices, Completion guidance, and Web/browser subtree are
+      // edited here through their existing controls and keep their previous
+      // selection keys; the two deny selectors are independent and checked
+      // means strictly denied. All values stay staged until the root
+      // Save/root-Escape/Cancel transaction decides. The candidate inventory is
+      // display-only: it is read here, never activated.
+      const tools = await selectToolSettings(input.ui, {
+        topLevelDeny,
+        executorDeny,
+        deferredPiTools,
+        youShouldKnow,
+        web: {
+          maxDownloadBytes: webMaxDownloadBytes,
+          browserInteractionApproval,
+          browserIdleExpiryMinutes,
+          browserDownloadRetention,
+          browserVisible,
+          browserPermissions,
+        },
+      }, readToolChoices(input.getToolChoices), retainedToolDenials);
+      topLevelDeny = tools.topLevelDeny;
+      executorDeny = tools.executorDeny;
+      deferredPiTools = tools.deferredPiTools;
+      youShouldKnow = tools.youShouldKnow;
+      webMaxDownloadBytes = tools.web.maxDownloadBytes;
+      browserInteractionApproval = tools.web.browserInteractionApproval;
+      browserIdleExpiryMinutes = tools.web.browserIdleExpiryMinutes;
+      browserDownloadRetention = tools.web.browserDownloadRetention;
+      browserVisible = tools.web.browserVisible;
+      browserPermissions = tools.web.browserPermissions;
       continue;
     }
     if (choice === "subtasksView") {
@@ -600,12 +644,6 @@ async function runSettingsMenu(
       // Real setter contract: the runtime reacts synchronously by stopping
       // or starting its timers; nothing polls the flag afterwards.
       if (input.schedulerRuntime) input.schedulerRuntime.setEnabled(!input.schedulerRuntime.enabled);
-      continue;
-    }
-    if (choice === "web") {
-      ({ maxDownloadBytes: webMaxDownloadBytes, browserInteractionApproval, browserIdleExpiryMinutes, browserDownloadRetention, browserVisible, browserPermissions } = await selectWebSettings(
-        input.ui, webMaxDownloadBytes, browserInteractionApproval, browserIdleExpiryMinutes, browserDownloadRetention, browserVisible, browserPermissions,
-      ));
       continue;
     }
     // choice === "save": the persistent save boundary (issue #294) — the same

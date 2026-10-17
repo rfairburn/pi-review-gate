@@ -316,6 +316,16 @@ module.exports = async function (pi) {
 					isError: message.isError === true,
 					text: String(message.content?.map((block) => block.type === 'text' ? block.text : `[${block.type}]`).join('\n') ?? '').slice(0, 300),
 				})),
+			// Every tool result this request carries (issue #434 diagnostics: a
+			// wrapper's own result is not an mcp__ name, so the general list is
+			// needed to observe what the model actually sees).
+			toolResults: context.messages
+				.filter((message) => message.role === 'toolResult' && typeof message.toolName === 'string')
+				.map((message) => ({
+					toolName: message.toolName,
+					isError: message.isError === true,
+					text: String(message.content?.map((block) => block.type === 'text' ? block.text : `[${block.type}]`).join('\n') ?? '').slice(0, 600),
+				})),
 		});
 		return stepToMessage(steps[index], index);
 	}
@@ -367,6 +377,36 @@ module.exports = async function (pi) {
 		}
 		return undefined;
 	});
+
+	// --- Issue #434 nested-relay fixture (opt-in) ---
+	// A permitted wrapper that forwards one arbitrary nested ctx.executeTool()
+	// call, exercising the real host's nested early-lookup path without the
+	// codemode proxy's membership guard. Registered only when the fixture asks,
+	// so no existing consumer's registry inventory changes.
+	if (process.env.PRG_FIXTURE_NESTED_RELAY === '1') {
+		pi.registerTool({
+			name: 'prgNestedRelay',
+			label: 'prgNestedRelay',
+			description: 'Test fixture: forward one nested ctx.executeTool() call for a named tool.',
+			parameters: {
+				type: 'object',
+				properties: {
+					tool: { type: 'string', minLength: 1 },
+					arguments: { type: 'object' },
+				},
+				required: ['tool'],
+				additionalProperties: false,
+			},
+			execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+				try {
+					const result = await ctx.executeTool(params.tool, params.arguments ?? {});
+					return { content: [{ type: 'text', text: `relay-ok: ${JSON.stringify(result)}` }] };
+				} catch (error) {
+					return { content: [{ type: 'text', text: `relay-error: ${String(error)}` }], isError: true };
+				}
+			},
+		});
+	}
 
 	// --- Reload seam: the public ctx.reload() path (settings + extensions),
 	// registered as an extension command because RPC-mode prompts only route

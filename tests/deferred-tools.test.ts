@@ -3247,3 +3247,436 @@ test("#421 with deferred tools off, a base name Pi declines is reported refused 
   manager.reapply();
   assert.equal(manager.toolCallAllowed(declinedName), false);
 });
+
+test("primary settings denials narrow the role everywhere and never cascade to the pre-role-deny executor authority (#434)", async () => {
+  const denied = new Set<string>();
+  const fixture = hostFixture();
+  fixture.pi.registerTool(tool("DeferredRunner", "Run a deferred helper.", { exposure: "deferred" }));
+  const manager = new DeferredToolManager(fixture.pi, () => "execute", () => true, undefined, (name) => denied.has(name));
+  manager.register();
+  assert.equal(manager.sessionStart(fixture.sessionIdentity), true);
+  const loaderDescription = () => (fixture.definitions.find((definition) => definition.name === "tool_search") as { description?: string }).description ?? "";
+
+  // Before any denial the discovery surfaces list the otherwise-discoverable names.
+  assert.match(manager.startupGuidance() ?? "", /"WebSearch"/);
+  assert.match(manager.startupGuidance() ?? "", /"DeferredRunner"/);
+  assert.match(loaderDescription(), /DeferredRunner.*WebSearch/);
+
+  denied.add("bash");
+  denied.add("DeferredRunner");
+  denied.add("WebSearch");
+  manager.reapply();
+
+  // Declarations: the baseline shell and the deferred-exposure name are removed
+  // while ordinary authorized baseline names stay declared.
+  assert.equal(fixture.active().includes("bash"), false);
+  assert.equal(fixture.active().includes("DeferredRunner"), false);
+  assert.ok(fixture.active().includes("read"));
+  assert.ok(fixture.active().includes("tool_search"));
+
+  // Startup inventory and the tool_search description omit every denied name
+  // while the remaining otherwise-discoverable candidates stay listed.
+  assert.doesNotMatch(manager.startupGuidance() ?? "", /bash|DeferredRunner|WebSearch/);
+  assert.match(manager.startupGuidance() ?? "", /SubtasksAdd|SubtasksInspect/);
+  assert.doesNotMatch(loaderDescription(), /bash|DeferredRunner|WebSearch/);
+
+  // Discovery eligibility and every actual invocation path: direct and nested.
+  for (const name of denied) {
+    assert.equal(manager.isToolDiscoveryEligible(name), false, name);
+    assert.equal(manager.toolCallAllowed(name), false, `${name} direct`);
+    assert.equal(manager.toolCallAllowed(name, true), false, `${name} nested`);
+    const reason = manager.primaryRoleDenialReason(name) ?? "";
+    assert.match(reason, /Top-level tools/, name);
+    assert.match(reason, /was blocked\./, name);
+    assert.equal((reason.match(/is denied for the primary agent/g) ?? []).length, 1, `${name} states the cause exactly once`);
+  }
+  assert.equal(manager.primaryRoleDenialReason("read"), undefined, "an unrelated name is never attributed to settings");
+
+  // Independence: the executor base is the genuine pre-role-deny authority.
+  for (const name of denied) assert.ok(manager.authorizedToolNames()?.includes(name), `${name} stays in the executor base`);
+
+  // Exact-name search reports the settings denial; capability search finds nothing.
+  const exact = await fixture.search()("deny-exact", { query: "WebSearch" });
+  assert.equal(exact.isError, true);
+  assert.equal((exact.details as { outcome?: string }).outcome, "denied");
+  assert.match((exact.content as Array<{ text: string }>)[0]!.text, /Denied for the primary agent by review-gate settings/);
+  assert.match((exact.content as Array<{ text: string }>)[0]!.text, /WebSearch/);
+  assert.equal(fixture.active().includes("WebSearch"), false, "a denied exact-name search activates nothing");
+  const capability = await fixture.search()("deny-capability", { query: "search the public web for sources" });
+  assert.equal(capability.isError, false);
+  assert.equal((capability.details as { outcome?: string }).outcome, "no-match");
+  assert.equal(fixture.active().includes("WebSearch"), false);
+
+  // Unchecking restores exactly the pre-deny state: baseline names are active
+  // again and the deferred name is discoverable and activatable by a real search.
+  denied.clear();
+  manager.reapply();
+  assert.ok(fixture.active().includes("bash"));
+  assert.equal(manager.isToolDiscoveryEligible("WebSearch"), true);
+  assert.ok((manager.startupGuidance() ?? "").includes("WebSearch"));
+  assert.equal(manager.toolCallAllowed("bash"), true);
+  const restored = await fixture.search()("deny-restored", { query: "WebSearch" });
+  assert.deepEqual((restored.details as { activated: string[] }).activated, ["WebSearch"]);
+  assert.ok(fixture.active().includes("WebSearch"));
+});
+
+test("the settings deny picker lists the pre-role-deny discoverable catalog and reading it activates nothing (#434)", () => {
+  const denied = new Set(["bash", "WebSearch"]);
+  const fixture = hostFixture();
+  const manager = new DeferredToolManager(fixture.pi, () => "execute", () => true, undefined, (name) => denied.has(name));
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity);
+  const activeBefore = fixture.active();
+  const choices = manager.toolDenyChoices();
+  const names = choices.map((choice) => choice.name);
+  // Checked rows stay reversible: every denied name is still offered.
+  assert.ok(names.includes("bash"));
+  assert.ok(names.includes("WebSearch"));
+  assert.ok(names.includes("read"));
+  assert.ok(choices.find((choice) => choice.name === "read")?.description, "canonical descriptions are carried for display");
+  // The loader is never a candidate, and a globally removed name is not enumerated.
+  assert.equal(names.includes("tool_search"), false);
+  assert.equal(names.includes("disabled_private"), false);
+  assert.deepEqual(fixture.active(), activeBefore, "reading the picker inventory activated nothing");
+
+  // A feature-disabled name is globally forbidden and is not enumerated either.
+  const featureOff = new DeferredToolManager(fixture.pi, () => "execute", (name) => name !== "WebSearch", undefined, () => false);
+  featureOff.register();
+  featureOff.sessionStart(fixture.sessionIdentity);
+  assert.equal(featureOff.toolDenyChoices().some((choice) => choice.name === "WebSearch"), false);
+
+  // GitRead is not a top-level candidate outside plan/research, but the primary
+  // deny selector must still offer it in plan/research so a checked row is
+  // reversible there.
+  const planFixture = hostFixture();
+  planFixture.pi.registerTool(tool(GIT_READ_TOOL_NAME, "Read structured git history."));
+  const plan = new DeferredToolManager(planFixture.pi, () => "plan-research", () => true, undefined, (name) => name === GIT_READ_TOOL_NAME);
+  plan.register();
+  plan.sessionStart(planFixture.sessionIdentity);
+  assert.ok(plan.toolDenyChoices().some((choice) => choice.name === GIT_READ_TOOL_NAME));
+  assert.equal(planFixture.active().includes(GIT_READ_TOOL_NAME), false, "a denied GitRead is removed from the plan/research declaration");
+  assert.equal(plan.toolCallAllowed(GIT_READ_TOOL_NAME), false);
+});
+
+test("only an attributable primary deny relabels Pi's early not-found result; a frozen worker never relabels (#434)", () => {
+  const denied = new Set(["bash"]);
+  const fixture = hostFixture();
+  const manager = new DeferredToolManager(fixture.pi, () => "execute", () => true, undefined, (name) => denied.has(name));
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity);
+  const early = (name: string) => ({
+    role: "toolResult",
+    toolCallId: "call-1",
+    toolName: name,
+    isError: true,
+    content: [{ type: "text", text: `Tool ${name} not found` }],
+  });
+
+  const replacement = manager.clarifyPrimaryDenialResult(early("bash"));
+  assert.ok(replacement, "the applied primary denial converts Pi's early not-found result");
+  const text = (replacement.content as Array<{ text: string }>)[0]!.text;
+  assert.match(text, /Tool bash not found/);
+  assert.match(text, /it is unavailable in the current tool set/);
+  assert.doesNotMatch(text, /never declares or loads it/);
+  assert.match(text, /Top-level tools/);
+  assert.match(text, /no operation was performed/);
+  assert.match(text, /cannot bypass the denial/);
+
+  // Never relabel an unrelated name, a different failure shape, or a wrapper's
+  // own text that merely mentions the name.
+  assert.equal(manager.clarifyPrimaryDenialResult(early("read")), undefined);
+  assert.equal(manager.clarifyPrimaryDenialResult({ ...early("bash"), content: [{ type: "text", text: "bash failed: permission denied" }] }), undefined);
+  assert.equal(manager.clarifyPrimaryDenialResult({ ...early("bash"), isError: false }), undefined);
+  assert.equal(
+    manager.clarifyPrimaryDenialResult({ ...early("bash"), toolName: "Wrapper", content: [{ type: "text", text: "Tool bash not found" }] }),
+    undefined,
+  );
+  // A denied name that is not a live registered discovery candidate is never
+  // attributed to the setting.
+  fixture.removeFromRegistry("bash");
+  assert.equal(manager.clarifyPrimaryDenialResult(early("bash")), undefined);
+
+  // A frozen captured worker ceiling ignores live deny preferences entirely.
+  fixture.pi.registerTool(tool("bash", "Execute a shell command."));
+  const workerIdentity = {};
+  const worker = new DeferredToolManager(fixture.pi, () => "execute", () => true, undefined, () => true);
+  worker.register();
+  assert.equal(worker.sessionStart(workerIdentity, createExecutorToolCatalog(["read", "bash"], ["read", "bash"]), true), true);
+  assert.equal(worker.clarifyPrimaryDenialResult(early("bash")), undefined, "a worker never relabels from live deny preferences");
+  assert.ok(worker.toolCallAllowed("bash"), "captured worker authority is not narrowed by live deny preferences");
+  assert.equal(worker.primaryRoleDenialReason("bash"), undefined);
+});
+
+test("a whole-query exact denied name takes precedence over overlapping allowed matches (#434)", async () => {
+  const fixture = hostFixture();
+  fixture.pi.registerTool(tool(GIT_READ_TOOL_NAME, "Read structured git history."));
+  const manager = new DeferredToolManager(
+    fixture.pi,
+    () => "plan-research",
+    () => true,
+    undefined,
+    (name) => name === "read",
+  );
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity);
+  // GitRead is visible and active here; "read" is denied and its exact name is also
+  // a name term of GitRead, which previously selected GitRead instead.
+  assert.ok(fixture.active().includes(GIT_READ_TOOL_NAME));
+  const exact = await fixture.search()("denied-whole", { query: "read" });
+  assert.equal(exact.isError, true);
+  assert.equal((exact.details as { outcome?: string }).outcome, "denied");
+  assert.deepEqual((exact.details as { denied: string[] }).denied, ["read"]);
+  assert.deepEqual((exact.details as { activated: string[] }).activated, []);
+  assert.deepEqual((exact.details as { matched: string[] }).matched, [], "an overlapping allowed name is never reported");
+  assert.deepEqual((exact.details as { alreadyActive: string[] }).alreadyActive, []);
+  assert.match((exact.content as Array<{ text: string }>)[0]!.text, /Denied for the primary agent by review-gate settings/);
+});
+
+test("a wrapper's recorded nested denied early-lookup is clarified while its own outcome is preserved (#434)", () => {
+  const denied = new Set(["read"]);
+  const fixture = hostFixture();
+  const manager = new DeferredToolManager(fixture.pi, () => "execute", () => true, undefined, (name) => denied.has(name));
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity);
+
+  const wrapper = {
+    role: "toolResult",
+    toolCallId: "wrap-1",
+    toolName: "codemode",
+    isError: true,
+    content: [{ type: "text", text: "Error: Tool read not found" }],
+    nestedCalls: { calls: [{ id: "wrap-1/1", name: "read", status: "error", error: "Tool read not found" }], complete: true },
+  };
+  const replacement = manager.clarifyPrimaryDenialResult(wrapper);
+  assert.ok(replacement, "a recorded nested denied early-lookup is clarified");
+  const blocks = replacement.content as Array<{ type: string; text: string }>;
+  assert.equal(blocks[0]!.text, "Error: Tool read not found", "the wrapper's own outcome text is preserved verbatim");
+  assert.equal(blocks.length, 2, "exactly one explanatory block is appended");
+  assert.match(blocks[1]!.text, /nested tool call/);
+  assert.match(blocks[1]!.text, /Top-level tools/);
+  assert.equal(manager.clarifyPrimaryDenialResult(replacement), undefined, "clarification is idempotent");
+
+  // Only a recorded nested call to a denied name counts: an allowed nested name
+  // or a bare text mention with no host record is never relabeled.
+  assert.equal(
+    manager.clarifyPrimaryDenialResult({ ...wrapper, nestedCalls: { calls: [{ name: "read", status: "ok", error: "" }] } }),
+    undefined,
+  );
+  assert.equal(
+    manager.clarifyPrimaryDenialResult({ ...wrapper, nestedCalls: { calls: [{ name: "bash", status: "error", error: "Tool bash not found" }] } }),
+    undefined,
+  );
+  assert.equal(
+    manager.clarifyPrimaryDenialResult({ role: "toolResult", toolName: "bash", isError: true, content: [{ type: "text", text: "Tool read not found" }] }),
+    undefined,
+  );
+});
+
+test("an executor's early unknown-tool result is explained from its captured catalog without deny attribution (#434)", () => {
+  const fixture = hostFixture();
+  const worker = new DeferredToolManager(fixture.pi, () => "execute", () => true, undefined, () => true);
+  worker.register();
+  assert.equal(worker.sessionStart({}, createExecutorToolCatalog(["read"], ["read"]), true), true);
+
+  const early = (name: string) => ({
+    role: "toolResult",
+    toolCallId: "worker-1",
+    toolName: name,
+    isError: true,
+    content: [{ type: "text", text: `Tool ${name} not found` }],
+  });
+  const replacement = worker.clarifyExecutorMissingToolResult(early("WebSearch"));
+  assert.ok(replacement, "a name outside the captured catalog is explained");
+  const text = (replacement.content as Array<{ text: string }>)[0]!.text;
+  assert.match(text, /captured tool permissions/);
+  assert.match(text, /nothing was executed/);
+  assert.doesNotMatch(text, /Top-level tools|settings deny|executor deny/i, "the worker never attributes the omission to a deny selector");
+
+  // A name inside the captured catalog is never relabeled, and the primary
+  // (dynamic) boundary never uses the executor explanation.
+  assert.equal(worker.clarifyExecutorMissingToolResult(early("read")), undefined);
+  const primary = new DeferredToolManager(fixture.pi, () => "execute", () => true, undefined, () => false);
+  primary.register();
+  primary.sessionStart({});
+  assert.equal(primary.clarifyExecutorMissingToolResult(early("WebSearch")), undefined);
+});
+
+test("an executor refusal claims a captured-ceiling omission only for a name the ceiling truly omits (#434)", () => {
+  const fixture = hostFixture();
+  fixture.pi.registerTool(tool("DeferredCallee", "A deferred native callee.", { exposure: "deferred" }));
+  const worker = new DeferredToolManager(fixture.pi, () => "execute", () => true, undefined, () => true);
+  worker.register();
+  assert.equal(
+    worker.sessionStart({}, createExecutorToolCatalog(["read", "DeferredCallee"], ["read"]), true),
+    true,
+    "an inactive native-callable ceiling name is a legitimate captured ceiling member",
+  );
+
+  // The ceiling genuinely omits this name: it gets the precise captured-permission
+  // reason, with no settings attribution and no claim that declarations (which
+  // tool_search can still change) are fixed.
+  const omitted = worker.executorToolAuthorizationReason("WebSearch");
+  assert.ok(omitted, "a name outside the captured catalog gets the precise reason");
+  assert.match(omitted, /captured tool permissions/);
+  assert.match(omitted, /nothing was executed/);
+  assert.doesNotMatch(omitted, /Top-level tools|settings deny|executor deny|declarations are fixed/i);
+  assert.match(worker.executorToolAuthorizationReason("WebSearch", true) ?? "", /nested tool call/);
+
+  // An in-catalog name that is merely inactive keeps the generic live-boundary
+  // wording: the frozen ceiling still contains it, so the refusal is never
+  // attributed to a catalog omission. Its nested (script) path stays callable.
+  assert.equal(worker.toolCallAllowed("DeferredCallee"), false, "an inactive ceiling name is not directly callable");
+  assert.equal(worker.executorToolAuthorizationReason("DeferredCallee"), undefined);
+  assert.equal(worker.toolCallAllowed("DeferredCallee", true), true);
+
+  // A withdrawn (removed) ceiling name is still captured authority: the reason
+  // stays generic rather than claiming the catalog omits it.
+  fixture.removeFromRegistry("DeferredCallee");
+  worker.reapply();
+  assert.equal(worker.toolCallAllowed("DeferredCallee"), false, "a withdrawn name is not callable live");
+  assert.equal(worker.executorToolAuthorizationReason("DeferredCallee"), undefined);
+
+  // The loader is never a captured-ceiling name, and a dynamic top-level
+  // boundary never uses this reason.
+  assert.equal(worker.executorToolAuthorizationReason(DEFERRED_TOOL_SEARCH_NAME), undefined);
+  const primary = new DeferredToolManager(fixture.pi, () => "execute", () => true, undefined, () => false);
+  primary.register();
+  primary.sessionStart({});
+  assert.equal(primary.executorToolAuthorizationReason("WebSearch"), undefined);
+
+  // The matching early not-found clarification keeps the distinction and no
+  // longer describes declarations as fixed.
+  const clarified = worker.clarifyExecutorMissingToolResult({
+    role: "toolResult",
+    toolCallId: "worker-ceiling",
+    toolName: "WebSearch",
+    isError: true,
+    content: [{ type: "text", text: "Tool WebSearch not found" }],
+  });
+  assert.ok(clarified, "a ceiling omission is still clarified from the captured catalog");
+  assert.doesNotMatch((clarified.content as Array<{ text: string }>)[0]!.text, /declarations are fixed/i);
+});
+
+test("an executor's recorded nested early-lookup is explained even when the outer wrapper result succeeded (#434)", () => {
+  const fixture = hostFixture();
+  const worker = new DeferredToolManager(fixture.pi, () => "execute", () => true, undefined, () => true);
+  worker.register();
+  assert.equal(worker.sessionStart({}, createExecutorToolCatalog(["read"], ["read"]), true), true);
+
+  const relay = {
+    role: "toolResult",
+    toolCallId: "relay-1",
+    toolName: "prgNestedRelay",
+    isError: false,
+    content: [{ type: "text", text: "relay-ok: {}" }],
+    nestedCalls: { calls: [{ id: "relay-1/1", name: "WebSearch", status: "error", error: "Tool WebSearch not found" }], complete: true },
+  };
+  const replacement = worker.clarifyExecutorMissingToolResult(relay);
+  assert.ok(replacement, "a successful wrapper result still explains its failed nested early-lookup");
+  const blocks = replacement.content as Array<{ type: string; text: string }>;
+  assert.equal(blocks[0]!.text, "relay-ok: {}", "the wrapper's own success result is preserved verbatim");
+  assert.match(blocks[1]!.text, /nested tool "WebSearch"/);
+  assert.match(blocks[1]!.text, /captured tool permissions/);
+  assert.doesNotMatch(blocks[1]!.text, /Top-level tools|settings deny|executor deny/i, "never attributes the omission to a deny selector");
+  assert.equal(worker.clarifyExecutorMissingToolResult(replacement), undefined, "clarification is idempotent");
+
+  // A nested name inside the captured catalog, a non-error nested status, and a
+  // missing/foreign record are all left alone.
+  assert.equal(
+    worker.clarifyExecutorMissingToolResult({ ...relay, nestedCalls: { calls: [{ name: "read", status: "error", error: "Tool read not found" }] } }),
+    undefined,
+  );
+  assert.equal(
+    worker.clarifyExecutorMissingToolResult({ ...relay, nestedCalls: { calls: [{ name: "WebSearch", status: "ok", error: "" }] } }),
+    undefined,
+  );
+  assert.equal(worker.clarifyExecutorMissingToolResult({ role: "toolResult", toolName: "X", isError: true, content: [{ type: "text", text: "Tool WebSearch not found" }] }), undefined);
+});
+
+test("role-denial reporting is restricted to the otherwise-discoverable pre-role-deny view (#434)", async () => {
+  // Feature-disabled AND primary-denied: the global feature exclusion keeps the
+  // capability absent, so no role-specific settings disclosure replaces its
+  // existing no-match behavior or its native not-found result.
+  const featureFixture = hostFixture();
+  const feature = new DeferredToolManager(
+    featureFixture.pi,
+    () => "execute",
+    (name) => name !== "WebSearch",
+    undefined,
+    (name) => name === "WebSearch",
+  );
+  feature.register();
+  feature.sessionStart(featureFixture.sessionIdentity);
+  assert.equal(feature.primaryRoleDenialReason("WebSearch"), undefined);
+  const featureSearch = await featureFixture.search()("feature-denied", { query: "WebSearch" });
+  assert.equal(featureSearch.isError, false);
+  assert.equal((featureSearch.details as { outcome?: string }).outcome, "no-match");
+  assert.equal(
+    feature.clarifyPrimaryDenialResult({ role: "toolResult", toolName: "WebSearch", isError: true, content: [{ type: "text", text: "Tool WebSearch not found" }] }),
+    undefined,
+  );
+
+  // Primary-denied write in plan/research: the mode ceiling already removes it, so
+  // an exact search stays no-match and no name is reported or activated.
+  const planFixture = hostFixture();
+  const plan = new DeferredToolManager(planFixture.pi, () => "plan-research", () => true, undefined, (name) => name === "write");
+  plan.register();
+  plan.sessionStart(planFixture.sessionIdentity);
+  assert.equal(plan.primaryRoleDenialReason("write"), undefined);
+  const planSearch = await planFixture.search()("plan-denied", { query: "write" });
+  assert.equal(planSearch.isError, false);
+  assert.equal((planSearch.details as { outcome?: string }).outcome, "no-match");
+  assert.deepEqual((planSearch.details as { matched: string[] }).matched, []);
+  assert.deepEqual((planSearch.details as { activated: string[] }).activated, []);
+  assert.equal(
+    plan.clarifyPrimaryDenialResult({ role: "toolResult", toolName: "write", isError: true, content: [{ type: "text", text: "Tool write not found" }] }),
+    undefined,
+  );
+});
+
+test("an ineligible nested denial never suppresses a later attributable one in the same wrapper result (#434)", () => {
+  const fixture = hostFixture();
+  // WebSearch is feature-disabled AND primary-denied (so it is not otherwise
+  // discoverable and must not be attributed to the settings selector); read is
+  // primary-denied and otherwise discoverable.
+  const manager = new DeferredToolManager(
+    fixture.pi,
+    () => "execute",
+    (name) => name !== "WebSearch",
+    undefined,
+    (name) => name === "WebSearch" || name === "read",
+  );
+  manager.register();
+  manager.sessionStart(fixture.sessionIdentity);
+  assert.equal(manager.primaryRoleDenialReason("WebSearch"), undefined);
+  assert.ok(manager.primaryRoleDenialReason("read"));
+
+  const wrapper = {
+    role: "toolResult",
+    toolCallId: "multi-1",
+    toolName: "prgNestedRelay",
+    isError: false,
+    content: [{ type: "text", text: "relay-ok: {}" }],
+    nestedCalls: {
+      calls: [
+        { id: "multi-1/1", name: "WebSearch", status: "error", error: "Tool WebSearch not found" },
+        { id: "multi-1/2", name: "read", status: "error", error: "Tool read not found" },
+      ],
+      complete: true,
+    },
+  };
+  const replacement = manager.clarifyPrimaryDenialResult(wrapper);
+  assert.ok(replacement, "the later attributable denial is still explained");
+  const blocks = replacement.content as Array<{ type: string; text: string }>;
+  assert.equal(blocks[0]!.text, "relay-ok: {}", "the wrapper's own outcome is preserved");
+  assert.match(blocks[1]!.text, /"read"/);
+  assert.match(blocks[1]!.text, /Top-level tools/);
+  assert.doesNotMatch(blocks[1]!.text, /WebSearch/, "a globally excluded name is never attributed to the settings selector");
+  assert.equal(manager.clarifyPrimaryDenialResult(replacement), undefined, "clarification stays idempotent");
+
+  // Only the ineligible name recorded: nothing is attributed.
+  assert.equal(
+    manager.clarifyPrimaryDenialResult({ ...wrapper, nestedCalls: { calls: [wrapper.nestedCalls.calls[0]], complete: true } }),
+    undefined,
+  );
+});

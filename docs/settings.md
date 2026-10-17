@@ -1,6 +1,6 @@
 # Settings menu
 
-This page owns the staged `/review-settings` settings menu: its nineteen ordinary rows,
+This page owns the staged `/review-settings` settings menu: its sixteen ordinary rows,
 the conditional **Scheduler runtime** row, Escape/Cancel/Save/Ctrl+S apply and
 persistence semantics, and the shared native text-field behavior. Raw field values and
 defaults are owned by the [Configuration](configuration.md) reference, and scheduled-task
@@ -8,12 +8,11 @@ semantics are documented on [Scheduled tasks](scheduled-tasks.md#scheduled-task-
 
 ## `/review-settings`
 
-`/review-settings` opens one staged settings transaction with nineteen ordinary rows —
+`/review-settings` opens one staged settings transaction with sixteen ordinary rows —
 Operating mode, Mode cycle hotkey, Worker resources, External workers, Execution
-priority, Research priority, Reviewers, Timeouts, Review policy, Bundle retention, Global concurrency,
-Retry policy, Subtask notifications, Deferred Pi tools, YouShouldKnow notices,
-Completion guidance, Subtasks view, Scheduled
-tasks, and Web — plus a conditional **Scheduler runtime** row when the host runtime
+priority, Research priority, Reviewers, Timeouts, Review policy, Bundle retention,
+Global concurrency, Retry policy, Subtask notifications, Tools, Subtasks view, and
+Scheduled tasks — plus a conditional **Scheduler runtime** row when the host runtime
 supplies the live switch (the ordinary extension entry point always does):
 
 - **Operating mode** stages the primary assistant posture; **Save changes** persists it
@@ -94,30 +93,12 @@ supplies the live switch (the ordinary extension entry point always does):
   exponential-backoff bounds, jitter, and the repeated-incident guard.
 - **Subtask notifications** defaults to **Quiet**. See
   [Delegated execution](delegated-execution.md#notifications-and-ui).
-- **YouShouldKnow notices** defaults to **On** and controls new notice availability
-  within the existing launch, role, mode, and call authorization limits. Turning it
-  off immediately removes the tool from the active/discovery surfaces but leaves any
-  pending notice and its More details/Close actions intact; `AskUserQuestion` is
-  unchanged.
-- **Completion guidance** defaults to **On** and allows an automatic prompt pointing
-  to the shipped completion skill only when notice availability is also On and the
-  current live authorized discovery ceiling includes `YouShouldKnow` (whether or not it
-  is currently activated). Turning guidance off removes that prompt only: it does not
-  disable notice availability or block otherwise-authorized calls. The skill opts out
-  of Pi's automatic model-invoked skill list but remains manually available as
-  `/skill:pi-review-gate-completion`; toggling this setting does not edit Pi's native
-  settings or uninstall the skill. See
-  [Availability and completion guidance](user-questions.md#availability-and-completion-guidance).
-- **Deferred Pi tools** defaults to **On**. Saving **Off** immediately exposes every
-  authorized tool in the current top-level Pi session; saving **On** immediately restores
-  the conservative active subset plus `tool_search`. For new mutation-authorized
-  sessions/tasks, `write` starts active alongside `edit` and `ApplyPatch`; planning
-  still hides it, explicit exclusions still apply, and previously captured worker
-  catalogs retain their recorded initial subsets. The conservative subset always
-  includes launch-authorized native read-only discovery (`grep`, `find`, `ls`), so
-  discovery needs no deferred activation in any mode, including delegated subtasks.
-  Newly launched Pi subtasks use the saved value, while already-running subtask
-  sessions keep their launch behavior.
+- **Tools** opens the **Tools** submenu: two independent exact-name deny
+  multi-selectors (**Top-level tools** and **Executor tools**, checked = denied) over
+  the runtime's pre-deny candidate inventory, plus the moved **Deferred Pi tools**,
+  **YouShouldKnow notices**, **Completion guidance**, and **Web** controls. Denials only
+  narrow existing authority, and the two lists never cascade to each other. See
+  [Tools subsection](#tools-subsection).
 - **Subtasks view** stores the expanded/collapsed live-panel preference globally.
 - **Scheduled tasks** opens the scheduled-task submenu (issue #26): one staged entry
   per independent scheduled task, keyed by its stable identity, with name,
@@ -144,33 +125,6 @@ supplies the live switch (the ordinary extension entry point always does):
   immediately, is never persisted in the config file, and stays outside the
   staged transaction — Escape, Save, and Cancel never set or revert it. See
   [Scheduled task fields](scheduled-tasks.md#settings-behavior-and-process-visibility).
-- **Web** includes maximum acquisition size and **Browser interaction approval**:
-  **Ask**, **Automatically Accept**, or **Automatically Deny**. Ask prompts when
-  approval is required and rejects without UI; Accept supplies automatic approval
-  without prompting; Deny rejects the approval-required branch. Already-permitted
-  observations and structurally proven local actions remain permitted in every mode.
-  Saves apply immediately to subsequent local approval decisions and acquisitions
-  without restarting. Newly launched Pi workers load the saved policy; running workers
-  keep the configuration loaded at launch. Research roles still cannot click or use
-  form-action tools. It also opens the **Browser permissions** submenu (#27) with
-  the independently selectable capability toggles — model credential entry and
-  submission, uploads, download saving, clipboard read/write, camera, microphone,
-  geolocation, service workers, popup restriction override, local networks (human
-  and model), and **YOLO / allow everything** — each staged like every other
-  section and persisted with **Save changes**. Enabling a capability presents its risk-appropriate
-  notice; enabling YOLO additionally requires an explicit interactive confirmation
-  after a prominent warning (cancellation or an unavailable dialog leaves it off),
-  shows the enabled state prominently on the Web row, and disables straightforwardly
-  with the saved individual values restored as effective. Every capability is
-  enforced: credential entry and submission, uploads, download saving, and
-  clipboard read/write by the interactive-browser tool actions; camera,
-  microphone, and geolocation as per-origin device permission grants issued on
-  navigation commits and cleared live on disable (an unconfirmable engine clear
-  fails the affected session closed); service workers at browser
-  launch, with a controlled replacement of the live browser when the saved
-  policy changes; the popup restriction override while enabled; and local
-  networks at the interactive egress broker. Saved changes apply to the live
-  session without a restart; see [Web fields](configuration.md#web-fields).
 
 The `/scheduled-tasks` command is a landing shortcut into this same
 transaction: it opens the **Scheduled tasks** submenu immediately, and Esc or
@@ -286,3 +240,130 @@ already-running tasks. Running capacity leases survive pool edits; removed entri
 receive no new work. A restarted task warns when its prior runtime configuration
 differs, and an executor-selection change starts a fresh native session from the durable
 checkpoint instead of attaching an incompatible conversation.
+
+## Tools subsection
+
+The **Tools** row opens one submenu that owns the scoped deny selectors and the four
+controls moved out of the root — **Deferred Pi tools**, **YouShouldKnow notices**,
+**Completion guidance**, and **Web** — plus each control's existing submenus. It
+introduces no second menu, state, or save path: everything here is staged into the same
+`/review-settings` transaction. **Save changes** and Ctrl+S persist the whole draft
+atomically, **Cancel** discards it, and root Escape applies it to the running session
+only, exactly as for every other row. In the TUI, Enter opens the highlighted row;
+Enter in a deny picker toggles the highlighted tool; **Back** and Escape return to the
+Tools root; Escape from the Tools root returns to the `/review-settings` root.
+
+### Scoped tool denial
+
+- **Top-level tools** and **Executor tools** are two independent multi-selectors over
+the same candidate inventory. Rows are the runtime's pre-deny, otherwise-discoverable
+tool names other than the reserved `tool_search` loader (see below) — rendering them
+neither activates nor authorizes anything. Enter toggles the selected row; a checked row
+means **denied**, the opposite of the reviewer picker's allowed marker.
+- The lists are independent. A top-level-only denial leaves the tool eligible for a
+newly captured executor; an executor-only denial leaves the primary eligible. With both
+checked the name is excluded from both; with neither it is unchanged.
+- A saved denial that the live inventory no longer offers stays a row marked
+`[not currently available]`, in whatever checked/unchecked state you last staged, for
+the whole menu session — including after Back and re-entry. Unchecking it does not
+delete the row, and a denied name is never silently converted into an allowed one just
+because the live catalog changed.
+- Denials are exact literal names, never patterns, prefixes, or globs. They are stored
+as `tools.topLevelDeny` and `tools.executorDeny`; each defaults to an empty list and
+denies nothing. See [Tool denial fields](configuration.md#tool-denial-fields) and
+[Scoped tool denial](native-pi-tools.md#scoped-tool-denial-top-level-and-executor).
+- **`tool_search` is reserved and never selectable.** Both pickers offer every
+otherwise-discoverable tool except `tool_search` itself: the loader is never a row, so
+retained rows, choices, and counts never present it as selectable. A raw `tool_search`
+entry in a staged or saved list is rejected — an explicit write fails strict validation,
+and startup recovery warns and omits the entry — so it can never be denied.
+- Denials only narrow. Pi's own `--tools`/`--exclude-tools`/`--no-tools`, the operating
+mode, the launch/role ceilings, and the existing feature settings stay authoritative;
+unchecking a denial restores only that tool's ordinary eligibility and never grants
+authority another control withheld. The lists disable no plugin, sandbox no effect, and
+add no wildcard policy.
+- **Top-level timing.** Applying the staged draft (Save, Ctrl+S, or root Escape) makes
+the new top-level denials effective at the next applicable model set write; an
+in-flight run is not interrupted and no `/reload` is required. Executor denials apply to
+new execute/inplace admissions through the shared `SubtasksStart`/`SubtasksAdd`,
+scheduled-task, and human paths. Research tasks are unaffected, and a research role
+never gains a denied name or loses one it already had. A catalog is captured at
+admission: already-admitted queued or running tasks, and their later continuation
+turns, retain the authority captured at launch.
+- **Metadata visibility is bounded, not eliminated.** Pi itself is unchanged: a denied
+name can remain part of Pi's own native callable metadata, so codemode and other
+wrapper scripts may still observe it through `ctx.tools`, and an active codemode
+description may list codemode-exposure tools. That metadata is not always in context —
+deferred tool metadata is generally returned only by explicit queries such as
+`ALL_TOOLS`, `searchTools`, or `describeTool`, and earlier transcript entries keep names
+recorded before a denial. Normal tool declarations, the startup inventory, and
+review-gate's `tool_search` omit denied names. The guarantee is that a denied call never
+executes — by direct, nested, codemode, or wrapper path. The scoped settings explanation
+is added where the host establishes the cause: a call refused at the `tool_call`
+admission check, a direct call clarified at Pi's `message_end` seam, or a nested call Pi
+recorded on the wrapper's tool result. A delegated executor omission is explained from
+that task's fixed captured catalog (plus Pi's record where the call failed before
+admission) instead, never by re-reading the current deny configuration. An early native
+rejection that leaves no recorded invocation — codemode's own proxy refusing a
+non-callable direct-exposure member before `ctx.executeTool` runs, for example — keeps
+Pi's own truthful error instead, with no settings attribution and still no executed side
+effect.
+
+### Moved controls
+
+The four moved rows keep their labels, stored keys, defaults, and behavior; only their
+location and the root **Tools** row summary change.
+
+- **Deferred Pi tools** defaults to **On**. Saving **Off** immediately exposes every
+  authorized tool in the current top-level Pi session; saving **On** immediately restores
+  the conservative active subset plus `tool_search`. For new mutation-authorized
+  sessions/tasks, `write` starts active alongside `edit` and `ApplyPatch`; planning
+  still hides it, explicit exclusions still apply, and previously captured worker
+  catalogs retain their recorded initial subsets. The conservative subset always
+  includes launch-authorized native read-only discovery (`grep`, `find`, `ls`), so
+  discovery needs no deferred activation in any mode, including delegated subtasks.
+  Newly launched Pi subtasks use the saved value, while already-running subtask
+  sessions keep their launch behavior.
+- **YouShouldKnow notices** defaults to **On** and controls new notice availability
+  within the existing launch, role, mode, and call authorization limits. Turning it
+  off immediately removes the tool from the active/discovery surfaces but leaves any
+  pending notice and its More details/Close actions intact; `AskUserQuestion` is
+  unchanged.
+- **Completion guidance** defaults to **On** and allows an automatic prompt pointing
+  to the shipped completion skill only when notice availability is also On and the
+  current live authorized discovery ceiling includes `YouShouldKnow` (whether or not it
+  is currently activated). Turning guidance off removes that prompt only: it does not
+  disable notice availability or block otherwise-authorized calls. The skill opts out
+  of Pi's automatic model-invoked skill list but remains manually available as
+  `/skill:pi-review-gate-completion`; toggling this setting does not edit Pi's native
+  settings or uninstall the skill. See
+  [Availability and completion guidance](user-questions.md#availability-and-completion-guidance).
+- **Web** includes maximum acquisition size and **Browser interaction approval**:
+  **Ask**, **Automatically Accept**, or **Automatically Deny**. Ask prompts when
+  approval is required and rejects without UI; Accept supplies automatic approval
+  without prompting; Deny rejects the approval-required branch. Already-permitted
+  observations and structurally proven local actions remain permitted in every mode.
+  Saves apply immediately to subsequent local approval decisions and acquisitions
+  without restarting. Newly launched Pi workers load the saved policy; running workers
+  keep the configuration loaded at launch. Research roles still cannot click or use
+  form-action tools. It also opens the **Browser permissions** submenu (#27) with
+  the independently selectable capability toggles — model credential entry and
+  submission, uploads, download saving, clipboard read/write, camera, microphone,
+  geolocation, service workers, popup restriction override, local networks (human
+  and model), and **YOLO / allow everything** — each staged like every other
+  section and persisted with **Save changes**. Enabling a capability presents its risk-appropriate
+  notice; enabling YOLO additionally requires an explicit interactive confirmation
+  after a prominent warning (cancellation or an unavailable dialog leaves it off),
+  shows the enabled state prominently on the Tools → Web row, and disables straightforwardly
+  with the saved individual values restored as effective. Every capability is
+  enforced: credential entry and submission, uploads, download saving, and
+  clipboard read/write by the interactive-browser tool actions; camera,
+  microphone, and geolocation as per-origin device permission grants issued on
+  navigation commits and cleared live on disable (an unconfirmable engine clear
+  fails the affected session closed); service workers at browser
+  launch, with a controlled replacement of the live browser when the saved
+  policy changes; the popup restriction override while enabled; and local
+  networks at the interactive egress broker. Saved changes apply to the live
+  session without a restart; see [Web fields](configuration.md#web-fields).
+  The row is reached through `/review-settings` → **Tools** → **Web**; its stored
+  `web.*` keys, defaults, and behavior are unchanged by the move.

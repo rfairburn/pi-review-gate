@@ -10,7 +10,7 @@ distinct layers on top of the interactive-browser session and tool limits owned 
 
 ## Browser interaction approval
 
-`/review-settings` → **Web** → **Browser interaction approval** controls only the
+`/review-settings` → **Tools** → **Web** → **Browser interaction approval** controls only the
 existing confirmation-required branch for authorized `BrowserClick`, `BrowserFill`,
 `BrowserType`, `BrowserSelect`, `BrowserPress`, `BrowserUpload`,
 `BrowserDownloadSave`, and `BrowserClipboard`:
@@ -42,7 +42,7 @@ Invalid config values fail strict validation; startup recovery warns and uses th
 
 ## Browser permissions (issue #27)
 
-`/review-settings` → **Web** → **Browser permissions** exposes the independently
+`/review-settings` → **Tools** → **Web** → **Browser permissions** exposes the independently
 selectable capability toggles from
 [#27](https://github.com/rfairburn/pi-review-gate/issues/27): model credential
 entry, credential submission, uploads, download saving, clipboard read/write,

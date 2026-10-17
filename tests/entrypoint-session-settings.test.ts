@@ -57,12 +57,9 @@ const ROOT_SETTING_LABELS = [
   "Global concurrency",
   "Retry policy",
   "Subtask notifications",
-  "Deferred Pi tools",
-  "YouShouldKnow notices",
-  "Completion guidance",
+  "Tools",
   "Subtasks view",
   "Scheduled tasks",
-  "Web",
 ] as const;
 
 function alignedTestRow(label: string, value: string, labels: readonly string[]): string {

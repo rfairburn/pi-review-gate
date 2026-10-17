@@ -319,7 +319,7 @@ broker boundary.
 
 ### Browser visibility
 
-`/review-settings` → **Web** → **Browser visibility** selects **Headless** (default,
+`/review-settings` → **Tools** → **Web** → **Browser visibility** selects **Headless** (default,
 no window) or **Headed** (a real browser window with a native address bar). The model's
 tool set and exposure are identical in both modes, and there is no model-facing
 visibility control.
@@ -419,7 +419,7 @@ beyond the action deadline. Unsettled work reports unknown effects, never rollba
 Ordinary invalid/stale capability validation and harmless screenshot mode/ref argument
 mistakes do not themselves retire a healthy session.
 Browser tool inactivity expires the session after `web.browserIdleExpiryMinutes`
-(default 15; configurable under `/review-settings` → Web, where 0 disables idle close
+(default 15; configurable under `/review-settings` → Tools → Web, where 0 disables idle close
 so only explicit close, shutdown, replacement, or unrecoverable failure ends the
 session). Detectable genuine human input in the live page — browser-trusted pointer
 presses, keyboard input, and wheel scrolling — also resets a nonzero timer, through

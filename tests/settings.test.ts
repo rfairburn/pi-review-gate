@@ -539,7 +539,9 @@ test("deferred Pi tools toggle is staged, persisted, and labeled for local/new-s
   });
 
   await registered.handler("", contextWithSelections([
-    rootSettingsRow("Deferred Pi tools", "On · local now, new subtasks"),
+    rootToolsRow("On", "50 MiB max download · headless browser"),
+    toolsSettingsRow("Deferred Pi tools", "On · local now, new subtasks"),
+    "Back",
     "Save changes",
   ]));
 
@@ -558,9 +560,10 @@ test("browser idle expiry validates, stages, cancels and reloads through Web set
   const registered = commandHarness();
   const reloaded: number[] = [];
   registerReviewSettings({ pi: registered.pi, config, configPath, onSaved: (next) => { reloaded.push(next.web!.browserIdleExpiryMinutes); } });
-  const webRow = rootSettingsRow("Web", "50 MiB max download · headless browser");
+  const webRow = rootToolsRow("On", "50 MiB max download · headless browser");
+  const toolsWebRow = toolsSettingsRow("Web", "50 MiB max download · headless browser");
   const idleRow = webSettingsRow("Browser idle expiry", "15 minutes");
-  await registered.handler("", contextWithSelections([webRow, idleRow, "Back", "Cancel"], [], ["30"]));
+  await registered.handler("", contextWithSelections([webRow, toolsWebRow, idleRow, "Back", "Back", "Cancel"], [], ["30"]));
   assert.equal(await readFile(configPath, "utf8"), original);
   assert.equal(config.web!.browserIdleExpiryMinutes, 15);
   assert.deepEqual(reloaded, []);
@@ -568,8 +571,8 @@ test("browser idle expiry validates, stages, cancels and reloads through Web set
   const invalid = ["-1", "1.5", "NaN", "Infinity", "9007199254740992", "", "abc"];
   const errors: string[] = [];
   const ctx = contextWithSelections([
-    webRow, ...invalid.map(() => idleRow), idleRow, idleRow,
-    webSettingsRow("Browser idle expiry", "30 minutes"), "Back", "Save changes",
+    webRow, toolsWebRow, ...invalid.map(() => idleRow), idleRow, idleRow,
+    webSettingsRow("Browser idle expiry", "30 minutes"), "Back", "Back", "Save changes",
   ], [], [...invalid, undefined, "30", undefined]) as { ui: { notify: (message: string, type?: string) => void } };
   ctx.ui.notify = (message, type) => { if (type === "error") errors.push(message); };
   await registered.handler("", ctx);
@@ -585,7 +588,7 @@ test("browser idle expiry validates, stages, cancels and reloads through Web set
 
   // Entering 0 stages the disabled display and persists it on save.
   const zeroRow = webSettingsRow("Browser idle expiry", "0 · idle close disabled");
-  await registered.handler("", contextWithSelections([webRow, webSettingsRow("Browser idle expiry", "30 minutes"), zeroRow, "Back", "Save changes"], [], ["0"]));
+  await registered.handler("", contextWithSelections([webRow, toolsWebRow, webSettingsRow("Browser idle expiry", "30 minutes"), zeroRow, "Back", "Back", "Save changes"], [], ["0"]));
   assert.equal(config.web!.browserIdleExpiryMinutes, 0);
   assert.deepEqual(reloaded, [30, 0]);
   saved = JSON.parse(await readFile(configPath, "utf8"));
@@ -602,11 +605,12 @@ test("download retention validates, stages, cancels and reloads through Web sett
   const registered = commandHarness();
   const reloaded: number[] = [];
   registerReviewSettings({ pi: registered.pi, config, configPath, onSaved: (next) => { reloaded.push(next.web!.browserDownloadRetention); } });
-  const webRow = rootSettingsRow("Web", "50 MiB max download · headless browser");
+  const webRow = rootToolsRow("On", "50 MiB max download · headless browser");
+  const toolsWebRow = toolsSettingsRow("Web", "50 MiB max download · headless browser");
   const retentionRow = webSettingsRow("Download retention", "8 unsaved per session");
 
   // Cancel: staging a value and backing out never persists it.
-  await registered.handler("", contextWithSelections([webRow, retentionRow, "Back", "Cancel"], [], ["3"]));
+  await registered.handler("", contextWithSelections([webRow, toolsWebRow, retentionRow, "Back", "Back", "Cancel"], [], ["3"]));
   assert.equal(await readFile(configPath, "utf8"), original);
   assert.equal(config.web!.browserDownloadRetention, 8);
   assert.deepEqual(reloaded, []);
@@ -615,8 +619,8 @@ test("download retention validates, stages, cancels and reloads through Web sett
   const invalid = ["-1", "1.5", "NaN", "Infinity", "9007199254740992", "", "abc"];
   const errors: string[] = [];
   const ctx = contextWithSelections([
-    webRow, ...invalid.map(() => retentionRow), retentionRow, retentionRow,
-    webSettingsRow("Download retention", "3 unsaved per session"), "Back", "Save changes",
+    webRow, toolsWebRow, ...invalid.map(() => retentionRow), retentionRow, retentionRow,
+    webSettingsRow("Download retention", "3 unsaved per session"), "Back", "Back", "Save changes",
   ], [], [...invalid, undefined, "3", undefined]) as { ui: { notify: (message: string, type?: string) => void } };
   ctx.ui.notify = (message, type) => { if (type === "error") errors.push(message); };
   await registered.handler("", ctx);
@@ -630,7 +634,7 @@ test("download retention validates, stages, cancels and reloads through Web sett
 
   // Entering 0 stages the unlimited display and persists it on save.
   const zeroRow = webSettingsRow("Download retention", "0 · unlimited unsaved downloads");
-  await registered.handler("", contextWithSelections([webRow, webSettingsRow("Download retention", "3 unsaved per session"), zeroRow, "Back", "Save changes"], [], ["0"]));
+  await registered.handler("", contextWithSelections([webRow, toolsWebRow, webSettingsRow("Download retention", "3 unsaved per session"), zeroRow, "Back", "Back", "Save changes"], [], ["0"]));
   assert.equal(config.web!.browserDownloadRetention, 0);
   assert.deepEqual(reloaded, [3, 0]);
   saved = JSON.parse(await readFile(configPath, "utf8"));
@@ -650,8 +654,9 @@ test("web settings stage and save the maximum download size in MiB", async () =>
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    rootSettingsRow("Web", "50 MiB max download · headless browser"),
+    ...webToolsRows("50 MiB max download · headless browser"),
     webSettingsRow("Maximum download", "50 MiB"),
+    "Back",
     "Back",
     "Save changes",
   ], [], ["96"]));
@@ -807,9 +812,9 @@ test("Web approval choices stage, cancel, persist, and immediately notify the lo
   let currentLabel = "Ask";
   for (const [label, policy] of [["Automatically Accept", "automatically-accept"], ["Automatically Deny", "automatically-deny"], ["Ask", "ask"]]) {
     const choices = [
-      rootSettingsRow("Web", "50 MiB max download · headless browser"),
+      ...webToolsRows("50 MiB max download · headless browser"),
       webSettingsRow("Browser interaction approval", currentLabel),
-      label, "Back",
+      label, "Back", "Back",
     ];
     const before = await readFile(configPath, "utf8");
     await registered.handler("", contextWithSelections([...choices, "Cancel"]));
@@ -831,13 +836,13 @@ test("browser visibility stages, cancels, persists, and applies immediately thro
   const registered = commandHarness();
   const savedValues: boolean[] = [];
   registerReviewSettings({ pi: registered.pi, config, configPath, onSaved: (next) => { savedValues.push(next.web!.browserVisible); } });
-  const headlessRow = rootSettingsRow("Web", "50 MiB max download · headless browser");
+  const headlessToolsRows = webToolsRows("50 MiB max download · headless browser");
   const visibilityRow = webSettingsRow("Browser visibility", "Headless · no window (default)");
 
   // Stage headed, then Cancel: nothing persists, nothing relaunches.
   const before = await readFile(configPath, "utf8");
   await registered.handler("", contextWithSelections([
-    headlessRow, visibilityRow, "Headed · visible browser window", "Back", "Cancel",
+    ...headlessToolsRows, visibilityRow, "Headed · visible browser window", "Back", "Back", "Cancel",
   ]));
   assert.equal(await readFile(configPath, "utf8"), before);
   assert.equal(config.web!.browserVisible, false);
@@ -846,7 +851,7 @@ test("browser visibility stages, cancels, persists, and applies immediately thro
   // Stage headed again and save: persisted and delivered to onSaved, where
   // the live-browser application happens.
   await registered.handler("", contextWithSelections([
-    headlessRow, visibilityRow, "Headed · visible browser window", "Back", "Save changes",
+    ...headlessToolsRows, visibilityRow, "Headed · visible browser window", "Back", "Back", "Save changes",
   ]));
   assert.equal(config.web!.browserVisible, true);
   const saved = JSON.parse(await readFile(configPath, "utf8"));
@@ -857,8 +862,8 @@ test("browser visibility stages, cancels, persists, and applies immediately thro
   // reverse value through the same staged menu.
   const headedRow = webSettingsRow("Browser visibility", "Headed · visible browser window");
   const headedContext = contextWithSelections([
-    rootSettingsRow("Web", "50 MiB max download · headed browser"),
-    headedRow, "Headless · no window (default)", "Back", "Save changes",
+    ...webToolsRows("50 MiB max download · headed browser"),
+    headedRow, "Headless · no window (default)", "Back", "Back", "Save changes",
   ]);
   await registered.handler("", headedContext);
   assert.equal(config.web!.browserVisible, false);
@@ -877,10 +882,11 @@ test("browser permissions submenu stages independent toggles and saves or cancel
   // Stage two toggles and cancel: nothing is persisted.
   const before = await readFile(configPath, "utf8");
   await registered.handler("", contextWithSelections([
-    rootSettingsRow("Web", "50 MiB max download · headless browser"),
+    ...webToolsRows("50 MiB max download · headless browser"),
     webSettingsRow("Browser permissions", "0 of 11 enabled"),
     browserPermissionsRow("Model uploads", "Off"),
     browserPermissionsRow("Local networks (human and model)", "Off"),
+    "Back",
     "Back",
     "Back",
     "Cancel",
@@ -889,9 +895,10 @@ test("browser permissions submenu stages independent toggles and saves or cancel
 
   // Stage one toggle and save: only that capability changes.
   await registered.handler("", contextWithSelections([
-    rootSettingsRow("Web", "50 MiB max download · headless browser"),
+    ...webToolsRows("50 MiB max download · headless browser"),
     webSettingsRow("Browser permissions", "0 of 11 enabled"),
     browserPermissionsRow("Model uploads", "Off"),
+    "Back",
     "Back",
     "Back",
     "Save changes",
@@ -913,12 +920,13 @@ test("enabling browser permissions presents risk-appropriate warnings; disabling
 
   const notices: Array<{ message: string; type?: string }> = [];
   const ctx = contextWithSelections([
-    rootSettingsRow("Web", "50 MiB max download · headless browser"),
+    ...webToolsRows("50 MiB max download · headless browser"),
     webSettingsRow("Browser permissions", "0 of 11 enabled"),
     browserPermissionsRow("Model credential entry", "Off"),
     browserPermissionsRow("Local networks (human and model)", "Off"),
     browserPermissionsRow("Model uploads", "Off"),
     browserPermissionsRow("Model uploads", "On"), // disabling: no warning
+    "Back",
     "Back",
     "Back",
     "Save changes",
@@ -957,9 +965,10 @@ test("YOLO stays Off without an interactive confirmation dialog or when the huma
   registerReviewSettings({ pi: registered.pi, config, configPath });
   const errors: string[] = [];
   const noConfirmCtx = contextWithSelections([
-    rootSettingsRow("Web", "50 MiB max download · headless browser"),
+    ...webToolsRows("50 MiB max download · headless browser"),
     webSettingsRow("Browser permissions", "0 of 11 enabled"),
     browserPermissionsRow("YOLO / allow everything", "Off"),
+    "Back",
     "Back",
     "Back",
     "Save changes",
@@ -979,9 +988,10 @@ test("YOLO stays Off without an interactive confirmation dialog or when the huma
   const before = await readFile(configPath, "utf8");
   const declinedNotices: string[] = [];
   const declinedCtx = contextWithSelections([
-    rootSettingsRow("Web", "50 MiB max download · headless browser"),
+    ...webToolsRows("50 MiB max download · headless browser"),
     webSettingsRow("Browser permissions", "0 of 11 enabled"),
     browserPermissionsRow("YOLO / allow everything", "Off"),
+    "Back",
     "Back",
     "Back",
     "Cancel",
@@ -1009,9 +1019,10 @@ test("YOLO requires confirmation to enable, persists with saved values beneath i
   const notices: Array<{ message: string; type?: string }> = [];
   let confirmTitle: string | undefined;
   const enableCtx = contextWithSelections([
-    rootSettingsRow("Web", "50 MiB max download · headless browser"),
+    ...webToolsRows("50 MiB max download · headless browser"),
     webSettingsRow("Browser permissions", "1 of 11 enabled"),
     browserPermissionsRow("YOLO / allow everything", "Off"),
+    "Back",
     "Back",
     "Back",
     "Save changes",
@@ -1038,9 +1049,10 @@ test("YOLO requires confirmation to enable, persists with saved values beneath i
   let confirmCalls = 0;
   const disableNotices: string[] = [];
   const disableCtx = contextWithSelections([
-    rootSettingsRow("Web", "50 MiB max download · headless browser · YOLO ON"),
+    ...webToolsRows("50 MiB max download · headless browser · YOLO ON"),
     webSettingsRow("Browser permissions", "YOLO on"),
     browserPermissionsRow("YOLO / allow everything", "On"),
+    "Back",
     "Back",
     "Back",
     "Save changes",
@@ -1068,6 +1080,7 @@ test("/review-settings aligns every settings value column from the full label se
   let retryRows: string[] = [];
   let webRows: string[] = [];
   let selection = 0;
+  let toolsVisits = 0;
 
   await registered.handler("", {
     scopedModels: [],
@@ -1079,8 +1092,11 @@ test("/review-settings aligns every settings value column from the full label se
             rootRows = options.slice(0, ROOT_SETTING_LABELS.length);
             return rootSettingsRow("Retry policy", "2 retries · 1s base");
           }
-          if (rootSelection === 1) return rootSettingsRow("Web", "50 MiB max download · headless browser");
+          if (rootSelection === 1) return rootToolsRow("On", "50 MiB max download · headless browser");
           return undefined;
+        }
+        if (title === "Tools") {
+          return toolsVisits++ === 0 ? toolsSettingsRow("Web", "50 MiB max download · headless browser") : undefined;
         }
         if (title === "Executor retry policy") {
           retryRows = options.slice(0, RETRY_SETTING_LABELS.length);
@@ -1905,13 +1921,32 @@ const ROOT_SETTING_LABELS = [
   "Global concurrency",
   "Retry policy",
   "Subtask notifications",
+  "Tools",
+  "Subtasks view",
+  "Scheduled tasks",
+] as const;
+
+const TOOLS_SETTING_LABELS = [
+  "Top-level tools",
+  "Executor tools",
   "Deferred Pi tools",
   "YouShouldKnow notices",
   "Completion guidance",
-  "Subtasks view",
-  "Scheduled tasks",
   "Web",
 ] as const;
+
+function toolsSettingsRow(label: typeof TOOLS_SETTING_LABELS[number], value: string): string {
+  return alignedTestRow(label, value, TOOLS_SETTING_LABELS);
+}
+
+function rootToolsRow(deferred: "On" | "Off", webValue: string): string {
+  return rootSettingsRow("Tools", `0 top-level denied · 0 executor denied · deferred ${deferred} · ${webValue}`);
+}
+
+/** Root Tools row plus the Tools submenu's Web row for one Web summary. */
+function webToolsRows(webValue: string): [string, string] {
+  return [rootToolsRow("On", webValue), toolsSettingsRow("Web", webValue)];
+}
 
 const RETRY_SETTING_LABELS = [
   "Retries after initial attempt",

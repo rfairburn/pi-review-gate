@@ -63,9 +63,11 @@ function tuiUi(harness: TuiSettingsHarness): RetainedUi {
   return { mode: "tui", select: ui.select as RetainedUi["select"], custom: ui.custom as RetainedUi["custom"] };
 }
 
-// Root menu row indices (19 sections; the optional Scheduler runtime row adds
+// Root menu row indices (16 sections; the optional Scheduler runtime row adds
 // one more row only when the host provides the switch, then Save + Cancel).
-const ROOT = { resources: 2, externalAgents: 3, routeExecute: 4, reviewers: 6, deferredTools: 13, web: 18, save: 19 } as const;
+const ROOT = { resources: 2, externalAgents: 3, routeExecute: 4, reviewers: 6, tools: 13, save: 16 } as const;
+// Tools submenu row indices.
+const TOOLS = { deferred: 2, web: 5 } as const;
 // Web settings row indices.
 const WEB = { permissions: 5 } as const;
 // Browser permissions row indices (field order, then yolo, then Back).
@@ -286,22 +288,25 @@ test("web permissions menu keeps the toggled row highlighted across repeated On/
   const registered = commandHarness();
   registerReviewSettings({ pi: registered.pi, config, configPath });
   const harness = createTuiSettingsContext([
-    [...downs(ROOT.web), KEY_ENTER],            // root → Web
-    [...downs(WEB.permissions), KEY_ENTER],     // web → Browser permissions
+    [...downs(ROOT.tools), KEY_ENTER],         // root → Tools
+    [...downs(TOOLS.web), KEY_ENTER],          // tools → Web
+    [...downs(WEB.permissions), KEY_ENTER],    // web → Browser permissions
     [...downs(PERM.camera), KEY_ENTER],         // toggle camera Off→On
     [KEY_ENTER],                                // re-show: preselected camera, On→Off
     [KEY_ENTER],                                // re-show: preselected camera, Off→On
     [KEY_ESCAPE],                               // back to web settings
+    [KEY_ESCAPE],                               // back to Tools
     [KEY_ESCAPE],                               // back to root
-    [...downs(ROOT.save - ROOT.web), KEY_ENTER], // root → Save
+    [...downs(ROOT.save - ROOT.tools), KEY_ENTER], // root → Save
   ]);
   setMenuTuiHost(harness.host);
   await registered.handler("", harness.context);
 
-  const [, , perm1, perm2, perm3, perm4, , root2] = harness.lists;
-  const [rootFirst, webFirst, permFirst, permSecond, permThird, permFourth, webSecond, rootSecond] = harness.initialIndexes;
+  const [, , , perm1, perm2, perm3, perm4, , , root2] = harness.lists;
+  const [rootFirst, toolsFirst, webFirst, permFirst, permSecond, permThird, permFourth, webSecond, toolsSecond, rootSecond] = harness.initialIndexes;
   // First visits open at the first row.
   assert.equal(rootFirst, 0);
+  assert.equal(toolsFirst, 0);
   assert.equal(webFirst, 0);
   assert.equal(permFirst, 0);
   assert.ok(perm1!.items[PERM.camera]!.label.includes("Off"));
@@ -314,11 +319,12 @@ test("web permissions menu keeps the toggled row highlighted across repeated On/
   assert.ok(perm3!.items[PERM.camera]!.label.includes("Off"));
   assert.equal(permFourth, PERM.camera);
   assert.ok(perm4!.items[PERM.camera]!.label.includes("On"));
-  // Returning to the web menu keeps the permissions row; returning to root
-  // keeps the web row.
+  // Returning to the web menu keeps the permissions row; returning to Tools
+  // keeps the Web row; returning to root keeps the Tools row.
   assert.equal(webSecond, WEB.permissions);
-  assert.equal(rootSecond, ROOT.web);
-  assert.equal(root2!.items[ROOT.web]!.value, "web");
+  assert.equal(toolsSecond, TOOLS.web);
+  assert.equal(rootSecond, ROOT.tools);
+  assert.equal(root2!.items[ROOT.tools]!.value, "tools");
   // Every retained menu used the custom surface; no one-shot picker was hit.
   assert.equal(harness.selectCalls.length, 0);
   assert.equal(harness.exhausted(), false);
@@ -335,10 +341,12 @@ test("YOLO enablement decline leaves it off, retains the row, and cancels withou
   registerReviewSettings({ pi: registered.pi, config, configPath });
   const harness = createTuiSettingsContext(
     [
-      [...downs(ROOT.web), KEY_ENTER],          // root → Web
+      [...downs(ROOT.tools), KEY_ENTER],       // root → Tools
+      [...downs(TOOLS.web), KEY_ENTER],        // tools → Web
       [...downs(WEB.permissions), KEY_ENTER],   // web → Browser permissions
       [...downs(PERM.yolo), KEY_ENTER],         // attempt YOLO enablement (confirm declines)
       [KEY_ESCAPE],                             // re-show: yolo retained; back to web
+      [KEY_ESCAPE],                             // back to Tools
       [KEY_ESCAPE],                             // back to root
       [KEY_ESCAPE],                             // cancel at root
     ],
@@ -352,11 +360,11 @@ test("YOLO enablement decline leaves it off, retains the row, and cancels withou
     harness.notifyCalls.some((call) => call.type === "warning" && call.message.includes("YOLO enables every browser permission")),
     "expected the prominent YOLO warning",
   );
-  const [, , perm1, perm2] = harness.lists;
+  const [, , , perm1, perm2] = harness.lists;
   assert.ok(perm1!.items[PERM.yolo]!.label.includes("YOLO / allow everything"));
   // First visit opens at the first row; the re-show preselects the yolo row.
-  assert.equal(harness.initialIndexes[2], 0);
-  assert.equal(harness.initialIndexes[3], PERM.yolo);
+  assert.equal(harness.initialIndexes[3], 0);
+  assert.equal(harness.initialIndexes[4], PERM.yolo);
   // Re-shown after the declined confirmation: same row retained, still Off.
   assert.ok(perm2!.items[PERM.yolo]!.label.includes("Off"));
   // Cancel at the root: nothing persisted.
@@ -550,19 +558,25 @@ test("escape at the root applies staged changes session-only without saving", as
     },
   });
   const harness = createTuiSettingsContext([
-    [...downs(ROOT.deferredTools), KEY_ENTER],  // toggle Deferred Pi tools Off
-    [KEY_ESCAPE],                               // session-only apply at root (issue #294)
+    [...downs(ROOT.tools), KEY_ENTER],       // root → Tools
+    [...downs(TOOLS.deferred), KEY_ENTER],   // Tools → toggle Deferred Pi tools Off
+    [KEY_ESCAPE],                            // Tools re-show: back to root
+    [KEY_ESCAPE],                            // root re-show: session-only apply (issue #294)
   ]);
   setMenuTuiHost(harness.host);
   await registered.handler("", harness.context);
 
-  const [root1, root2] = harness.lists;
+  const [root1, tools1, tools2, root2] = harness.lists;
   void root1;
-  // First visit opens at the first row; the re-show preselects the toggled
-  // deferred-tools row, and its label is flipped.
+  // First visits open at the first row; the root re-show retains Tools, the
+  // Tools re-show retains the toggled deferred-tools row with its flipped label.
   assert.equal(harness.initialIndexes[0], 0);
-  assert.equal(harness.initialIndexes[1], ROOT.deferredTools);
-  assert.ok(root2!.items[ROOT.deferredTools]!.label.includes("Off"));
+  assert.equal(harness.initialIndexes[1], 0);
+  assert.equal(harness.initialIndexes[2], TOOLS.deferred);
+  assert.equal(harness.initialIndexes[3], ROOT.tools);
+  assert.ok(tools1!.items[TOOLS.deferred]!.label.includes("On"));
+  assert.ok(tools2!.items[TOOLS.deferred]!.label.includes("Off"));
+  void root2;
   // Issue #294: root Escape applies the staged settings to the live config
   // (onSaved runs) without writing the config file.
   assert.equal(savedCallbackCalls, 1);
@@ -590,7 +604,7 @@ for (const withScheduler of [false, true]) test(`external workers stays directly
   assert.equal(rows.filter(row => row.startsWith("External workers")).length, 1);
   assert.equal(rows.findIndex(row => row.startsWith("External workers")), rows.findIndex(row => row.startsWith("Worker resources")) + 1);
   assert.equal(rows.filter(row => row.startsWith("Scheduler runtime")).length, withScheduler ? 1 : 0);
-  assert.equal(rows.length, withScheduler ? 22 : 21);
+  assert.equal(rows.length, withScheduler ? 19 : 18);
   assert.deepEqual(rows.slice(-2), ["Save changes", "Cancel"]);
   assert.equal(await readFile(configPath, "utf8"), before);
 });
@@ -609,7 +623,10 @@ test("plain-select hosts keep the legacy label flow for web permissions (fallbac
         menus.push({ title, options });
         counts[title] = (counts[title] ?? 0) + 1;
         if (title === "Review settings") {
-          return counts[title] === 1 ? options.find((option) => option.startsWith("Web"))! : "Save changes";
+          return counts[title] === 1 ? options.find((option) => option.startsWith("Tools"))! : "Save changes";
+        }
+        if (title === "Tools") {
+          return counts[title] === 1 ? options.find((option) => option.startsWith("Web"))! : "Back";
         }
         if (title === "Web settings") {
           return counts[title] === 1 ? options.find((option) => option.startsWith("Browser permissions"))! : "Back";
@@ -629,12 +646,12 @@ test("plain-select hosts keep the legacy label flow for web permissions (fallbac
   assert.equal(saved.web.browserPermissions.modelCamera, true);
   // The root menu includes external worker creation, ending with Save/Cancel.
   const rootOptions = menus[0]!.options;
-  assert.equal(rootOptions.length, 21);
+  assert.equal(rootOptions.length, 18);
   assert.ok(rootOptions[ROOT.externalAgents]!.startsWith("External workers"));
-  assert.ok(rootOptions[ROOT.web]!.startsWith("Web"));
-  assert.ok(rootOptions[ROOT.web]!.includes("50 MiB max download · headless browser"));
-  assert.equal(rootOptions[19], "Save changes");
-  assert.equal(rootOptions[20], "Cancel");
+  assert.ok(rootOptions[ROOT.tools]!.startsWith("Tools"));
+  assert.ok(rootOptions[ROOT.tools]!.includes("50 MiB max download · headless browser"));
+  assert.equal(rootOptions[16], "Save changes");
+  assert.equal(rootOptions[17], "Cancel");
   // The permissions menu kept the legacy 11 fields + YOLO + Back order.
   const permMenu = menus.find((menu) => menu.title === "Browser permissions")!;
   assert.equal(permMenu.options.length, 13);

@@ -274,6 +274,20 @@ async function saveSettings(fixture: NativeMcpFixture, steps: Array<{ row: strin
       if (!match) failure ??= `option ${wanted} missing from ${JSON.stringify(options)}`;
       return match ? { value: match } : undefined;
     }
+    // The Tools subsection is one nested menu inside the same transaction.
+    if (request.title === "Tools") {
+      if (failure) return undefined;
+      const back = options.find((option) => option.startsWith("Back"));
+      const step = queue.shift();
+      if (!step) return back === undefined ? undefined : { value: back };
+      const row = options.find((option) => option.startsWith(step.row));
+      if (!row) {
+        failure = `row ${step.row} missing from ${JSON.stringify(options)}`;
+        return back === undefined ? undefined : { value: back };
+      }
+      pendingOption = step.option;
+      return { value: row };
+    }
     if (request.title !== "Review settings") {
       failure ??= `unexpected selector ${String(request.title)}`;
       return undefined;
@@ -514,11 +528,11 @@ test("#421 in-process switch and fork re-derive discovery; CLI exclusions and no
 
   // The YouShouldKnow notice feature is a live feature control: Off removes
   // it from every surface; On restores it as a candidate.
-  await saveSettings(fixture, [{ row: "YouShouldKnow notices" }]);
+  await saveSettings(fixture, [{ row: "Tools" }, { row: "YouShouldKnow notices" }]);
   const noticesOff = await observe(fixture);
   assertAbsent(noticesOff, ["YouShouldKnow"], "notices off");
   assert.deepEqual((await search(fixture, "YouShouldKnow")).matched, [], "a disabled feature is not matchable");
-  await saveSettings(fixture, [{ row: "YouShouldKnow notices" }]);
+  await saveSettings(fixture, [{ row: "Tools" }, { row: "YouShouldKnow notices" }]);
   assertDiscoverable(await observe(fixture), ["YouShouldKnow"], "notices on");
 });
 

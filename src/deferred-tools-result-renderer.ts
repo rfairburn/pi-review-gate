@@ -262,6 +262,9 @@ function resultText(record: RecordValue | undefined): string {
 function outcomeLabel(outcome: SearchOutcome): string {
   if (outcome.outcome === "unavailable" || /unavailable until session startup/i.test(outcome.summary)) return "unavailable";
   if (outcome.outcome === "invalid" || /^Invalid tool_search request:/i.test(outcome.summary)) return "invalid request";
+  // Issue #434: an exact-name query for a role-denied tool reports the
+  // settings denial, not a generic failure.
+  if (outcome.outcome === "denied" || /^Denied for the primary agent by review-gate settings/i.test(outcome.summary)) return "denied by settings";
   return outcome.outcome ?? "failed";
 }
 

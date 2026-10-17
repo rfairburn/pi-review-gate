@@ -9,11 +9,12 @@
 import { GIT_READ_TOOL_NAME } from "../git-read/tool";
 export const EXECUTOR_TOOL_CATALOG_ENV = "PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG";
 /**
- * #279: the loader registers under Pi's replaceable builtin name, so the
- * native tool-search extension is not loaded and this single loader owns all
- * discovery/activation (including codemode/deferred-exposure and MCP tools).
+ * Re-exported canonical binding (#279). The definition lives in the pure
+ * `tool-inventory` module so config/settings validation can reference the
+ * required loader name without importing this catalog's Git dependency
+ * graph; established callers keep importing it from here unchanged.
  */
-export const DEFERRED_TOOL_SEARCH_NAME = "tool_search";
+export { DEFERRED_TOOL_SEARCH_NAME } from "../tool-inventory";
 /**
  * Canonical native discovery set (issues #71/#72). Pi supplies `grep`,
  * `find`, and `ls` as built-in read-only tools; Claude's adapter maps the

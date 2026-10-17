@@ -5,6 +5,7 @@ import type { ConfigPathResolution } from "./config-path";
 import { reviewGateConfigCandidates, resolveConfigPathResolution } from "./config-path";
 import { parseCronExpression } from "./scheduling/cron";
 import { isNativeReasoningEffort, nativeReasoningArgs, type NativeReasoningEffort } from "./external-agent-reasoning";
+import { DEFERRED_TOOL_SEARCH_NAME } from "./tool-inventory";
 import { isRecord } from "./record-guard";
 
 export type RetainBundles = "never" | "on-failure" | "always";
@@ -517,6 +518,20 @@ export interface ReviewGateUiConfig {
   subtasksViewExpanded?: boolean;
 }
 
+/**
+ * Exact-name tool denials (issue #434). Each entry is one literal tool name —
+ * never a pattern, prefix, or glob — checked before the corresponding role is
+ * authorized. The two lists are independent: a top-level denial does not
+ * cascade to executors, and an executor denial only applies to newly captured
+ * executors. Both default to empty and an empty list denies nothing.
+ */
+export interface ReviewGateToolsConfig {
+  /** Exact tool names denied for the primary/top-level agent. Defaults empty. */
+  topLevelDeny?: string[];
+  /** Exact tool names denied for newly captured/delegated executors. Defaults empty. */
+  executorDeny?: string[];
+}
+
 /** Independent user-notice availability and optional completion guidance (#295). */
 export interface YouShouldKnowConfig {
   /** Whether new YouShouldKnow notices are available through authorized tool discovery. Defaults on. */
@@ -549,6 +564,8 @@ export interface ReviewGateConfig {
   ui?: ReviewGateUiConfig;
   /** YouShouldKnow availability and completion-handoff prompt controls (#295). */
   youShouldKnow?: YouShouldKnowConfig;
+  /** Exact-name top-level and executor tool denials (#434). */
+  tools?: ReviewGateToolsConfig;
   web?: WebConfig;
 }
 
@@ -650,7 +667,7 @@ export function recoverConfig(value: unknown): Pick<LoadedConfig, "config" | "wa
   // Only these objects contain independently defaultable settings. Selections,
   // agent definitions and route/resource entries remain atomic: never invent
   // a model, reasoning pair, command or authorization reference to repair one.
-  const containers = new Set(["web", "web.search", "web.fetch", "web.browserPermissions", "ui", "review", "youShouldKnow",
+  const containers = new Set(["web", "web.search", "web.fetch", "web.browserPermissions", "ui", "review", "youShouldKnow", "tools",
     "execution", "execution.retryPolicy", "execution.routes",
     "execution.workerResources", "externalAgents", "scheduledTasks"]);
   const recover = (parent: Record<string, unknown>, key: string, input: unknown, path: string): void => {
@@ -761,6 +778,7 @@ export function normalizeConfig(value: unknown): ReviewGateConfig {
     scheduledTasks: value.scheduledTasks === undefined ? undefined : normalizeScheduledTasks(value.scheduledTasks),
     ui: value.ui === undefined ? undefined : normalizeUi(value.ui),
     youShouldKnow: normalizeYouShouldKnow(value.youShouldKnow),
+    tools: value.tools === undefined ? undefined : normalizeTools(value.tools),
     web: normalizeWeb(value.web),
   };
 
@@ -1017,6 +1035,49 @@ function normalizeBrowserPermissions(value: unknown): WebBrowserPermissions {
     permissions[field] = raw === true;
   }
   return permissions;
+}
+
+function normalizeTools(value: unknown): ReviewGateToolsConfig {
+  if (!isRecord(value)) throw new Error("tools must be an object");
+  return {
+    topLevelDeny: normalizeDeniedToolNames(value.topLevelDeny, "tools.topLevelDeny"),
+    executorDeny: normalizeDeniedToolNames(value.executorDeny, "tools.executorDeny"),
+  };
+}
+
+/**
+ * One exact-name deny list. Strict validation rejects anything that is not a
+ * literal tool name: a non-string, an empty name, or a whitespace-padded name
+ * (a name is matched exactly, never trimmed or pattern-expanded). Duplicates
+ * collapse to their first occurrence, so the canonical array is a set with a
+ * deterministic order. An absent list is empty.
+ *
+ * Issue #434 follow-up: the required discovery loader (`tool_search`) is
+ * infrastructure, never a selectable/deniable candidate — the runtime always
+ * supplies it, so a configured denial would validate but do nothing while the
+ * UI implied it was denied. Naming it exactly in either list is rejected with
+ * an actionable diagnostic; startup recovery drops it with a warning under the
+ * established per-field contract.
+ */
+function normalizeDeniedToolNames(value: unknown, field: string): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error(`${field} must be an array of exact tool names`);
+  const names: string[] = [];
+  const seen = new Set<string>();
+  value.forEach((item, index) => {
+    if (typeof item !== "string" || item.length === 0 || item.trim() !== item) {
+      throw new Error(`${field}[${index}] must be an exact non-empty tool name`);
+    }
+    if (item === DEFERRED_TOOL_SEARCH_NAME) {
+      throw new Error(
+        `${field}[${index}] names "${DEFERRED_TOOL_SEARCH_NAME}": the required discovery loader cannot be denied`,
+      );
+    }
+    if (seen.has(item)) return;
+    seen.add(item);
+    names.push(item);
+  });
+  return names;
 }
 
 function normalizeUi(value: unknown): ReviewGateUiConfig {

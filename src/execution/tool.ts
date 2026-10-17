@@ -1105,6 +1105,15 @@ export class ExecutionToolManager {
     if (!allowedTools) {
       throw new Error(`${kind === "research" ? "Research" : kind === "inplace" ? "In-place" : "Execution"} requires an authoritative parent active-tool snapshot; the current Pi host did not provide one.`);
     }
+    // Issue #434: the executor deny list governs NEW execute/in-place
+    // admissions only. It is read live at this single durable admission
+    // boundary — the shared path behind model Start/Add, /subtask-add and its
+    // staged form, and scheduled dispatch — so new tasks in an existing group
+    // are covered too, not merely newly created groups. Already-admitted,
+    // running, and continuing tasks keep their captured catalog untouched, and
+    // the worker never re-reads deny preferences. Research is deliberately not
+    // filtered: no executor-deny controls exist for that role.
+    const executorDenied = new Set(this.input.config.tools?.executorDeny ?? []);
     // #73: GitRead is a research-role capability. Research children inherit it
     // through the read-only intersection (and its conservative initial-active
     // subset) whenever the parent authorization carries it; execute children
@@ -1125,7 +1134,10 @@ export class ExecutionToolManager {
         : allowedTools.filter((tool) => tool !== GIT_READ_TOOL_NAME)))
       // The hosted parent may have SessionSpawn, but it is never part of any
       // delegated executor ceiling, including execute/in-place catalogs.
-      .filter((tool) => tool !== SESSION_SPAWN_TOOL_NAME);
+      .filter((tool) => tool !== SESSION_SPAWN_TOOL_NAME)
+      // Issue #434: executor-only denials apply to every NEW execute/in-place
+      // ceiling, after the role/ceiling filters and never to research.
+      .filter((tool) => kind === "research" || !executorDenied.has(tool));
     return tasks.map((task) => {
       // Validate any supplied contract, but preserve only an explicitly named
       // initial set. The authoritative parent snapshot always determines the

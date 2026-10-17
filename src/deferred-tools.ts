@@ -156,6 +156,21 @@ function planningToolVisible(name: string): boolean {
     || name === GIT_READ_TOOL_NAME;
 }
 
+/**
+ * Issue #434: the one concise policy explanation shared by every primary-agent
+ * settings-denial diagnostic, so direct-call blocks, early not-found
+ * clarifications, and nested wrapper clarifications stay consistent. It names
+ * the role and the exact settings location, states that no operation was
+ * performed, and states that the direct, discovery/activation, and wrapper
+ * invocation paths cannot bypass the restriction.
+ */
+const PRIMARY_DENIAL_POLICY = (name?: string): string =>
+  `${name === undefined ? "It" : `\"${name}\"`} is denied for the primary agent by the review-gate \"Top-level tools\" list (Settings > Tools), and no operation was performed. `
+  + "Calling it directly, discovering or activating it with tool_search, and reaching it through codemode or another wrapper cannot bypass the denial.";
+
+/** Stable idempotency marker inside the shared primary policy text. */
+const PRIMARY_DENIAL_MARKER = "by the review-gate \"Top-level tools\" list";
+
 // Pi recreates ExtensionAPI wrappers when extension modules reload, while the
 // sessionManager object remains stable for the AgentSession. Keep the registry
 // itself process-scoped so it survives module cache replacement, but key each
@@ -252,6 +267,16 @@ export class DeferredToolManager {
      * A throwing probe counts as unsupported.
      */
     private readonly probeNativePowerShellHost: () => boolean = probeNativePowerShellHostSupport,
+    /**
+     * Issue #434: the primary agent's own live deny list (config.tools.
+     * topLevelDeny). It narrows only the dynamic (top-level) role view —
+     * declarations, startup inventory, discovery, search, activation, and
+     * direct/nested calls — and is never consulted by a frozen captured worker
+     * ceiling: executor-only denials are applied once, at executor admission,
+     * and a worker never re-reads live preferences to shrink captured
+     * authority. A throwing provider denies (fail closed).
+     */
+    private readonly isToolDeniedForPrimaryRole: (name: string) => boolean = () => false,
   ) {}
 
   /** Cached probe answer; undefined until first needed after the latest refresh. */
@@ -265,6 +290,259 @@ export class DeferredToolManager {
    */
   refreshNativeHostSupport(): void {
     this.nativePowerShellSupported = undefined;
+  }
+
+  /**
+   * Issue #434: whether the primary agent's own settings deny list covers
+   * `name`. Only a dynamic (top-level) boundary consults it: a frozen worker
+   * boundary is captured authority and never re-reads live deny preferences,
+   * and executor-only denials are applied at executor admission instead. A
+   * thrown provider denies (fail closed).
+   */
+  private primaryRoleDeniesTool(name: string): boolean {
+    if (this.boundary && !this.boundary.dynamic) return false;
+    try {
+      return this.isToolDeniedForPrimaryRole(name) === true;
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * Issue #434: the exact role-specific settings denial covering one exact
+   * name, for the model-visible policy diagnostic. It returns undefined when
+   * the role's own deny list does not cover the name, so unrelated refusals
+   * keep the generic boundary wording and are never attributed to settings.
+   * The wording is the shared {@link PRIMARY_DENIAL_POLICY} explanation: role
+   * and settings location, no operation performed, and no direct, discovery/
+   * activation, or wrapper bypass.
+   */
+  primaryRoleDenialReason(name: string, nested = false): string | undefined {
+    const trimmed = typeof name === "string" ? name.trim() : "";
+    if (!trimmed || !this.primaryRoleDeniesTool(trimmed) || !this.registeredLiveCandidate(trimmed)) return undefined;
+    const subject = nested ? "This nested/scripted call to" : "This call to";
+    return `review gate: ${subject} "${trimmed}" was blocked. ${PRIMARY_DENIAL_POLICY()} `
+      + "The denial applies to the primary agent only; newly launched executor subtasks use their own independent deny list.";
+  }
+
+  /**
+   * Issue #434: honest clarification for Pi's own early unknown-tool result.
+   *
+   * A tool the primary role denies is removed from the model-visible
+   * declarations, so Pi's native tool lookup fails before the `tool_call`
+   * blocking hook can run and the model would otherwise see only
+   * `Tool <name> not found`. Pi's documented `message_end` seam can replace a
+   * finalized message while preserving its role, so the primary runtime appends
+   * the exact settings explanation there instead of leaving that generic text.
+   *
+   * The conversion is deliberately narrow: only a name this role denies, only
+   * Pi's exact not-found wording for that same toolResult name, and only while
+   * the name is still a registered, non-hidden discovery candidate. A name
+   * that is merely absent, or refused by a genuine global/role restriction, or
+   * denied for executors only, keeps Pi's own message and is never attributed
+   * to the primary deny selector. Frozen worker boundaries never reach this
+   * path (primaryRoleDeniesTool is false there), so a worker never re-reads
+   * live deny preferences.
+   */
+  clarifyPrimaryDenialResult(message: unknown): Record<string, unknown> | undefined {
+    const record = isRecord(message) ? message : undefined;
+    if (!record || record.role !== "toolResult") return undefined;
+    const name = typeof record.toolName === "string" ? record.toolName.trim() : "";
+    if (name && record.isError === true && this.primaryRoleDeniesTool(name)) {
+      const content = Array.isArray(record.content) ? record.content : undefined;
+      const text = content !== undefined && content.length === 1
+        && isRecord(content[0]) && content[0].type === "text" && typeof content[0].text === "string"
+        ? content[0].text
+        : undefined;
+      // Prove the absence is this role's applied denial for a real discovery
+      // candidate before naming the setting.
+      if (text === `Tool ${name} not found` && this.registeredLiveCandidate(name)) {
+        return {
+          ...record,
+          content: [{
+            type: "text",
+            text: `Tool ${name} not found — it is unavailable in the current tool set. ${PRIMARY_DENIAL_POLICY(name)}`,
+          }],
+        };
+      }
+    }
+    // A permitted wrapper (codemode or another tool) that issued ctx.executeTool()
+    // for a denied direct-exposure tool gets Pi's early lookup failure too: an
+    // inactive direct tool is outside the callable set, so the `tool_call` hook
+    // never ran. Pi records that nested call (name, status, error) on the outer
+    // tool result, so the wrapper's actual outcome can be preserved and the
+    // nested denial explained from that supported record.
+    return this.clarifyPrimaryNestedDenialResult(record);
+  }
+
+  /**
+   * Issue #434: append the primary settings explanation to a wrapper's tool
+   * result when Pi's own record proves the wrapper issued a nested call to a
+   * denied name and that nested call failed with the exact early unknown-tool
+   * error. The wrapper's returned content is preserved verbatim; only an
+   * additional explanatory block is appended, and only from the host's
+   * recorded nested-call evidence (never by text-matching arbitrary output).
+   */
+  private clarifyPrimaryNestedDenialResult(record: Record<string, unknown>): Record<string, unknown> | undefined {
+    const nested = isRecord(record.nestedCalls) ? record.nestedCalls : undefined;
+    const calls = nested !== undefined && Array.isArray(nested.calls) ? nested.calls : undefined;
+    if (calls === undefined) return undefined;
+    let deniedName: string | undefined;
+    for (const call of calls) {
+      if (!isRecord(call)) continue;
+      const name = typeof call.name === "string" ? call.name.trim() : "";
+      // Eligibility is checked per candidate: an unrelated global/mode exclusion
+      // for one nested name must never suppress an attributable denial for a
+      // later one in the same wrapper result.
+      if (!name || !this.primaryRoleDeniesTool(name) || !this.registeredLiveCandidate(name)) continue;
+      const error = typeof call.error === "string" ? call.error : "";
+      if (call.status === "error" && error.includes(`Tool ${name} not found`)) {
+        deniedName = name;
+        break;
+      }
+    }
+    if (deniedName === undefined) return undefined;
+    const blocks = Array.isArray(record.content) ? record.content : [];
+    if (blocks.some((block) => isRecord(block) && block.type === "text" && typeof block.text === "string"
+      && block.text.includes(PRIMARY_DENIAL_MARKER))) {
+      return undefined;
+    }
+    return {
+      ...record,
+      content: [...blocks, {
+        type: "text",
+        text: `review gate: the nested tool call above, "Tool ${deniedName} not found", did not execute. ${PRIMARY_DENIAL_POLICY(deniedName)}`,
+      }],
+    };
+  }
+
+  /**
+   * Issue #434: the model-visible policy reason for a delegated executor call
+   * whose frozen captured ceiling genuinely omits the exact name, or undefined
+   * for every other refusal.
+   *
+   * A worker's live gate refuses for unrelated reasons: a name the durable
+   * `allowedToolCatalog` ceiling never contained, but also a ceiling name that
+   * is currently inactive, withdrawn, hidden, or exposure-incompatible, an
+   * unreadable registry, or an empty name. Only the ceiling omission is a fixed
+   * captured fact, so only that refusal may state that the captured permissions
+   * omit the tool. Every other refusal returns undefined and keeps the caller's
+   * generic live-boundary wording, which never claims a fixed catalog omission
+   * nor the settings deny selector. The loader and dynamic (top-level)
+   * boundaries never use this reason, and live deny preferences are never
+   * consulted (a frozen boundary already ignores them).
+   */
+  executorToolAuthorizationReason(name: string, nested = false): string | undefined {
+    const trimmed = typeof name === "string" ? name.trim() : "";
+    const boundary = this.boundary;
+    if (!trimmed || !boundary || boundary.dynamic || this.registryUnreadable) return undefined;
+    if (trimmed === DEFERRED_TOOL_SEARCH_NAME) return undefined;
+    if (boundary.authorizedNames.has(trimmed)) return undefined;
+    return `review gate: this ${nested ? "nested " : ""}tool call to "${trimmed}" is not in this executor's captured tool permissions for this admitted task, `
+      + "so nothing was executed. That captured permission ceiling is fixed when the task is admitted and cannot be widened: retrying it, "
+      + "searching or activating it with tool_search, or reaching it through codemode or another wrapper cannot grant a tool the ceiling omits. "
+      + "If this capability is genuinely required, the primary agent must decide how to authorize it in a new task.";
+  }
+
+  /**
+   * Issue #434: honest clarification for Pi's own early unknown-tool result in a
+   * delegated executor. A worker's captured catalog is its sole authority, so
+   * this derives only from the frozen ceiling: when the requested exact name is
+   * outside that captured catalog and Pi answered with the native not-found
+   * result, the model learns why the call could not proceed. It never consults
+   * live deny preferences and never attributes the omission to the settings deny
+   * selector (the cause may be a genuine global/mode/role restriction, or a task
+   * admitted without the capability).
+   */
+  clarifyExecutorMissingToolResult(message: unknown): Record<string, unknown> | undefined {
+    const record = isRecord(message) ? message : undefined;
+    const boundary = this.boundary;
+    if (!record || record.role !== "toolResult") return undefined;
+    // Only a frozen captured worker ceiling has this honest, re-read-free context.
+    if (!boundary || boundary.dynamic || this.registryUnreadable) return undefined;
+    // Native nested early-lookup records come first: the outer result names the
+    // (allowed) wrapper and may even report success, so the outer error flag
+    // cannot gate this. Only the captured ceiling decides, and the wrapper's own
+    // outcome is preserved verbatim.
+    const nested = isRecord(record.nestedCalls) ? record.nestedCalls : undefined;
+    const calls = nested !== undefined && Array.isArray(nested.calls) ? nested.calls : [];
+    const omitted = new Set<string>();
+    for (const call of calls) {
+      if (!isRecord(call) || typeof call.name !== "string") continue;
+      const nestedName = call.name.trim();
+      if (nestedName && !boundary.authorizedNames.has(nestedName)
+        && call.status === "error" && call.error === `Tool ${nestedName} not found`) {
+        omitted.add(nestedName);
+      }
+    }
+    const content = Array.isArray(record.content) ? record.content : [];
+    const additions = [...omitted]
+      .map((nestedName) => this.executorOmittedNestedExplanation(nestedName))
+      .filter((text) => !content.some((block) => isRecord(block) && block.type === "text" && block.text === text));
+    if (additions.length > 0) {
+      return { ...record, content: [...content, ...additions.map((text) => ({ type: "text", text }))] };
+    }
+    if (record.isError !== true) return undefined;
+    const name = typeof record.toolName === "string" ? record.toolName.trim() : "";
+    if (!name || boundary.authorizedNames.has(name)) return undefined;
+    const text = content.length === 1
+      && isRecord(content[0]) && content[0].type === "text" && typeof content[0].text === "string"
+      ? content[0].text
+      : undefined;
+    if (text !== `Tool ${name} not found`) return undefined;
+    return {
+      ...record,
+      content: [{
+        type: "text",
+        text: `Tool ${name} not found — this executor's captured tool permissions for this admitted task do not include it, so nothing was executed `
+          + "and Pi did not run it. The captured permission ceiling is fixed when the task is admitted; retrying it, or searching or activating "
+          + "it with tool_search, cannot grant a tool the ceiling omits, and neither can codemode or another wrapper. If this capability is genuinely "
+          + "required, the primary agent must decide how to authorize it in a new task.",
+      }],
+    };
+  }
+
+  /** The appended executor explanation for one omitted nested name (idempotency key). */
+  private executorOmittedNestedExplanation(name: string): string {
+    return `review gate: nested tool "${name}" is absent from this executor's captured tool permissions for this admitted task. `
+      + "That nested tool did not execute; retrying, searching, activating, or using another wrapper cannot grant it. "
+      + "If required, the primary agent must decide how to authorize it in a new task.";
+  }
+
+  /**
+   * Whether `name` is an otherwise-discoverable pre-role-deny candidate: present
+   * in the live reconciled catalog at the current mode/feature ceiling. Role
+   * attribution is only honest for a name the primary could genuinely discover,
+   * so globally hidden/removed, feature-disabled, and mode-forbidden names never
+   * receive a role-specific settings disclosure.
+   */
+  private registeredLiveCandidate(name: string): boolean {
+    this.reconcile();
+    if (!this.boundary || !this.boundary.dynamic || this.registryUnreadable) return false;
+    return this.modeVisibleAuthorizedNames(true).has(name);
+  }
+
+  /**
+   * Issue #434: the authoritative pre-role-deny discovery inventory for the
+   * settings deny pickers. It lists every tool otherwise discoverable at the
+   * live mode/feature/registry ceiling — the same catalog the startup
+   * inventory and tool_search expose, including the conservative baseline and
+   * deferred names — and deliberately ignores this role's OWN deny list so a
+   * checked row stays reversible without activating anything. Display-only:
+   * reading it activates and authorizes nothing. Empty while the boundary is
+   * unavailable or the registry is unreadable; the settings menu then keeps
+   * every saved name as a reversible row. The loader itself is never a
+   * candidate, and globally hidden or feature-disabled names are not
+   * enumerated.
+   */
+  toolDenyChoices(): { name: string; description?: string }[] {
+    this.reconcile();
+    if (!this.boundary || this.registryUnreadable) return [];
+    const visible = this.modeVisibleAuthorizedNames(true);
+    return this.boundary.catalog
+      .filter((tool) => tool.name !== DEFERRED_TOOL_SEARCH_NAME && visible.has(tool.name))
+      .sort((left, right) => compareToolNames(left.name, right.name))
+      .map((tool) => (tool.description ? { name: tool.name, description: tool.description } : { name: tool.name }));
   }
 
   private nativePowerShellHostSupported(): boolean {
@@ -486,8 +764,11 @@ export class DeferredToolManager {
    * is already active, and while invisible it must not be disclosed or
    * activatable at all (no stale name leakage across mode switches).
    */
-  private gitReadVisible(): boolean {
+  private gitReadVisible(includeRoleDenied = false): boolean {
     if (!this.boundary) return false;
+    // Issue #434: a top-level denial of GitRead removes it from the primary
+    // role everywhere, exactly like any other denied name.
+    if (!includeRoleDenied && this.primaryRoleDeniesTool(GIT_READ_TOOL_NAME)) return false;
     // A withdrawn (removed/hidden) GitRead is not live anywhere.
     if (!this.boundary.catalog.some((tool) => tool.name === GIT_READ_TOOL_NAME)) return false;
     if (!this.boundary.authorizedNames.has(GIT_READ_TOOL_NAME)) return false;
@@ -640,7 +921,8 @@ export class DeferredToolManager {
       : undefined;
     return modeNames.filter((name) => available.has(name)
       && (!authorized || name === DEFERRED_TOOL_SEARCH_NAME || authorized.has(name))
-      && this.settingAllowsTool(name));
+      && this.settingAllowsTool(name)
+      && !this.primaryRoleDeniesTool(name));
   }
 
   private settingAllowsTool(name: string): boolean {
@@ -652,19 +934,23 @@ export class DeferredToolManager {
   }
 
   /** Names visible at the live mode ceiling (authority boundary, not activation). */
-  private modeVisibleAuthorizedNames(): ReadonlySet<string> {
+  private modeVisibleAuthorizedNames(includeRoleDenied = false): ReadonlySet<string> {
     if (!this.boundary) return new Set<string>();
     const planning = this.getOperatingMode() === "plan-research";
     // The captured catalog is the reconciled live-visible authorized set
     // (authority ∩ registry, hidden/withdrawn excluded), so live reconciliation
-    // applies on every surface derived from it.
+    // applies on every surface derived from it. Issue #434: the primary role's
+    // own deny list narrows every derived surface; the settings picker passes
+    // includeRoleDenied to compute the reversible, pre-role-deny inventory.
     let visible = this.boundary.catalog
       .map((tool) => tool.name)
-      .filter((name) => (planning ? planningToolVisible(name) : true) && this.settingAllowsTool(name));
+      .filter((name) => (includeRoleDenied || !this.primaryRoleDeniesTool(name))
+        && (planning ? planningToolVisible(name) : true)
+        && this.settingAllowsTool(name));
     // #73: an invisible GitRead is not part of the live ceiling at all — it
     // must not reach the startup inventory, the tool_search description,
     // or any match result outside the modes/roles that expose it.
-    if (!this.gitReadVisible()) {
+    if (!this.gitReadVisible(includeRoleDenied)) {
       return new Set(visible.filter((name) => name !== GIT_READ_TOOL_NAME));
     }
     visible = [...new Set(visible)];
@@ -782,6 +1068,11 @@ export class DeferredToolManager {
    * Authoritative session catalog, reconciled against the live registry.
    * Dynamic authority returns empty while unreadable; configured workers keep
    * returning their immutable ceiling for recovery, while calls stay blocked.
+   *
+   * Issue #434: this is the GENUINE pre-role-deny authority used as the base
+   * for delegated-executor catalogs, so the primary agent's own deny list does
+   * NOT narrow it. A top-level-only denial leaves a new eligible executor
+   * eligible; executor denials are applied once, at executor admission.
    */
   authorizedToolNames(): string[] | undefined {
     this.reconcile();
@@ -818,7 +1109,7 @@ export class DeferredToolManager {
   toolCallAllowed(name: string, nested = false): boolean {
     this.reconcile();
     const trimmed = typeof name === "string" ? name.trim() : "";
-    if (!trimmed || !this.settingAllowsTool(trimmed)) return false;
+    if (!trimmed || !this.settingAllowsTool(trimmed) || this.primaryRoleDeniesTool(trimmed)) return false;
     // tool_search is the loader itself: startup must have succeeded and the
     // loader must still answer every live rule below — registry-visible,
     // non-hidden, exposure-legal for the mode of the call, and currently part
@@ -867,7 +1158,7 @@ export class DeferredToolManager {
   /** Narrow fail-closed authority: the conservative retained set under the live mode policy. */
   private failClosedToolCallAllowed(name: string, nested: boolean): boolean {
     if (!this.failClosedAuthorized || !isDeferredToolHost(this.pi)) return false;
-    if (!this.failClosedAuthorized.has(name) || !this.settingAllowsTool(name)) return false;
+    if (!this.failClosedAuthorized.has(name) || !this.settingAllowsTool(name) || this.primaryRoleDeniesTool(name)) return false;
     // #review-0004: failed startup bypasses nothing — plan/research still
     // rejects every write-capable or execution-control name here.
     if (this.getOperatingMode() === "plan-research" && !planningToolVisible(name)) return false;
@@ -1019,6 +1310,43 @@ export class DeferredToolManager {
     authorizationBoundaryRegistry()?.set(this.sessionIdentity, next);
   }
 
+  /** Exact-name catalog entries denied for this role, matched case-insensitively against query terms. */
+  /** A denied exact-name search result: the settings denial, nothing activated. */
+  private deniedSearchResult(names: readonly string[]): Record<string, unknown> {
+    return textResult(
+      `Denied for the primary agent by review-gate settings (Settings > Tools > "Top-level tools"): ${names.join(", ")}. `
+      + "No operation was performed: a denied tool cannot be discovered, activated, or called, and tool_search, codemode, and every other wrapper cannot bypass the denial.",
+      true,
+      { activated: [], matched: [], alreadyActive: [], denied: [...names], outcome: "denied" },
+    );
+  }
+
+  /**
+   * Issue #434: a denied catalog name whose exact spelling is the entire
+   * normalized query. This is checked before any allowed match so a denied name
+   * that overlaps an allowed name's terms (for example a denied "read" beside a
+   * visible GitRead) can never activate or report an unrelated tool.
+   */
+  private deniedWholeQueryName(query: string): string | undefined {
+    if (!this.boundary) return undefined;
+    const visible = this.modeVisibleAuthorizedNames(true);
+    return this.boundary.catalog
+      .map((tool) => tool.name)
+      .find((name) => visible.has(name)
+        && name.toLocaleLowerCase("en-US") === query && this.primaryRoleDeniesTool(name));
+  }
+
+  private deniedExactQueryNames(terms: readonly string[]): string[] {
+    if (!this.boundary || terms.length === 0) return [];
+    const termSet = new Set(terms);
+    const visible = this.modeVisibleAuthorizedNames(true);
+    return this.boundary.catalog
+      .map((tool) => tool.name)
+      .filter((name) => visible.has(name)
+        && termSet.has(name.toLocaleLowerCase("en-US")) && this.primaryRoleDeniesTool(name))
+      .sort(compareToolNames);
+  }
+
   private search(params: unknown): Record<string, unknown> {
     this.reconcile();
     if (!this.boundary || !isDeferredToolHost(this.pi) || this.registryUnreadable) {
@@ -1054,6 +1382,12 @@ export class DeferredToolManager {
       });
     }
 
+    // Issue #434: a whole-query exact denied name is answered with the settings
+    // denial before any allowed candidate is matched, so it cannot select or
+    // activate an unrelated tool.
+    const wholeQueryDenied = this.deniedWholeQueryName(query);
+    if (wholeQueryDenied !== undefined) return this.deniedSearchResult([wholeQueryDenied]);
+
     // Planning mode makes forbidden tools absent from discovery as well: they
     // cannot be matched, reported, or activated while the mode is applied.
     // #73: GitRead follows its own visibility rule in every mode — searchable
@@ -1061,7 +1395,7 @@ export class DeferredToolManager {
     // search can never activate it outside plan/research or a research catalog.
     const planning = this.getOperatingMode() === "plan-research";
     const catalog = this.boundary.catalog.filter((tool) => {
-      if (!this.settingAllowsTool(tool.name)) return false;
+      if (!this.settingAllowsTool(tool.name) || this.primaryRoleDeniesTool(tool.name)) return false;
       if (tool.name === GIT_READ_TOOL_NAME) return this.gitReadVisible();
       return planning ? planningToolVisible(tool.name) : true;
     });
@@ -1083,6 +1417,12 @@ export class DeferredToolManager {
         match.tier === matches[0]!.tier && match.matchCount === matches[0]!.matchCount
       );
     if (selected.length === 0) {
+      // Issue #434: an exact-name query for a tool this role denies gets the
+      // precise policy answer instead of a bare no-match, so the model learns
+      // the denial is a settings decision on every invocation path rather than
+      // guessing that a retry or a different query might work.
+      const deniedExact = this.deniedExactQueryNames(terms);
+      if (deniedExact.length > 0) return this.deniedSearchResult(deniedExact);
       return textResult("No authorized tools matched. No tools were activated.", false, {
         activated: [],
         matched: [],

@@ -214,6 +214,17 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     }
     const deferredTools = new DeferredToolManager(pi);
     registerDeferredToolLifecycleHooks(pi, deferredTools);
+    // Issue #434: a tool outside this executor's captured catalog is absent from
+    // its declarations, so a direct attempt takes Pi's early unknown-tool path
+    // before the tool_call hook can run. This handler explains that outcome from
+    // the captured catalog alone (never live deny preferences, never the deny
+    // selector) while leaving Pi's own result otherwise intact.
+    registerHook(pi, "message_end", (...args) => {
+      const event = args[0];
+      const message = typeof event === "object" && event !== null ? (event as { message?: unknown }).message : undefined;
+      const replacement = deferredTools.clarifyExecutorMissingToolResult(message);
+      return replacement === undefined ? undefined : { message: replacement };
+    });
     let terminal = false;
     const acknowledgementFailure = () => executorSettlementBootstrapError
       ?? (!executorSettlementBootstrap || terminal ? new Error(
@@ -224,7 +235,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
       if (failure) return { block: true, reason: failure.message };
       const name = extractToolName(args);
       const nested = hasNestedToolCallParent(args);
-      if (!deferredTools.toolCallAllowed(name, nested)) return nativeToolAuthorizationBlock(name, nested);
+      if (!deferredTools.toolCallAllowed(name, nested)) return executorToolAuthorizationBlock(name, nested, deferredTools.executorToolAuthorizationReason(name, nested));
       return nativeToolPreflight.preflight(args);
     };
     if (!isDeferredToolHost(pi)) {
@@ -330,8 +341,32 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     pi,
     () => config.operatingMode,
     (name) => name !== YOU_SHOULD_KNOW_TOOL_NAME || config.youShouldKnow?.enabled !== false,
+    undefined,
+    // Issue #434: the primary agent's own live deny list. It narrows only this
+    // top-level role view (declarations, startup inventory, discovery, search,
+    // activation, and direct/nested calls); the authoritative pre-role-deny
+    // catalog stays intact for new executor admission, and executor-only
+    // denials are applied there instead. The live config object is mutated in
+    // place by the settings apply paths, so the next managed write after an
+    // apply sees the updated list with no reload or refresh.
+    (name) => config.tools?.topLevelDeny?.includes(name) === true,
   );
   registerDeferredToolLifecycleHooks(pi, deferredTools);
+  // Issue #434: a top-level denied tool is removed from the model-visible
+  // declarations, so Pi's own early tool lookup answers a direct attempt with
+  // `Tool <name> not found` before the tool_call blocking hook can run. Pi's
+  // documented message_end seam may replace a finalized message with the same
+  // role, so the primary runtime appends the exact settings explanation there;
+  // the conversion refuses to relabel any absence it cannot attribute to the
+  // applied primary deny list (see clarifyPrimaryDenialResult). Executor
+  // runtimes are not wired here: a worker's captured catalog is its sole
+  // authority and it never re-reads live deny preferences.
+  registerHook(pi, "message_end", (...args) => {
+    const event = args[0];
+    const message = typeof event === "object" && event !== null ? (event as { message?: unknown }).message : undefined;
+    const replacement = deferredTools.clarifyPrimaryDenialResult(message);
+    return replacement === undefined ? undefined : { message: replacement };
+  });
 
   // Pending questions and notices (issues #95/#295): both user-input tools
   // register before session_start so they enter the same deferred-tool
@@ -959,7 +994,7 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     const nested = hasNestedToolCallParent(args);
     const decision = deferredTools.toolCallAllowed(name, nested)
       ? nativeToolPreflight.preflight(args)
-      : nativeToolAuthorizationBlock(name, nested);
+      : nativeToolAuthorizationBlock(name, nested, deferredTools.primaryRoleDenialReason(name, nested));
     const toolArgs = extractToolArgs(args);
     const window = state.reviewWindow;
     if (window && shouldRecordToolCallEvidence(name)) {
@@ -1062,6 +1097,11 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     pi,
     config,
     configPath: loaded.path,
+    // Issue #434: the deny pickers list the authoritative pre-role-deny
+    // discovery inventory (display only; reading it activates nothing) so a
+    // checked row stays reversible and an executor-only denial never hides a
+    // row from the primary picker.
+    getToolChoices: () => deferredTools.toolDenyChoices(),
     // Issue #26: the live process-local switch; the menu flips it through
     // setEnabled, which stops or starts the timers immediately.
     schedulerRuntime: schedulerSwitch,
@@ -1249,11 +1289,40 @@ function hasNestedToolCallParent(args: unknown[]): boolean {
   });
 }
 
-function nativeToolAuthorizationBlock(name: string, nested: boolean): { block: true; reason: string } {
+function nativeToolAuthorizationBlock(name: string, nested: boolean, policyReason?: string): { block: true; reason: string } {
+  // Issue #434: a knowable role-specific settings denial is reported exactly
+  // (scope, no execution, no bypass); every other refusal keeps the generic
+  // boundary wording and never claims settings caused it.
+  if (policyReason) return { block: true, reason: policyReason };
   const target = name || "unknown tool";
   return {
     block: true,
     reason: `review gate: ${nested ? "nested " : ""}native tool call to ${target} is not permitted by the live session authorization boundary`,
+  };
+}
+
+/**
+ * Issue #434: the delegated executor's own refusal wording. A worker's
+ * captured catalog is its sole authority and it never re-reads live deny
+ * preferences, so only a name the frozen ceiling genuinely omits receives the
+ * precise captured-permission reason (passed in as `policyReason`). Every other
+ * refusal keeps the generic live-boundary wording: the name may be an
+ * in-catalog tool that is currently inactive, withdrawn, hidden, or
+ * exposure-incompatible, and declarations can still change through
+ * tool_search, so the refusal is never misattributed to a fixed catalog
+ * omission or to the settings deny selector. The wording never claims the
+ * captured permissions omit an in-catalog name, and it keeps the no-execution
+ * and no-bypass guarantees.
+ */
+function executorToolAuthorizationBlock(name: string, nested: boolean, policyReason?: string): { block: true; reason: string } {
+  if (policyReason) return { block: true, reason: policyReason };
+  const target = name || "unknown tool";
+  return {
+    block: true,
+    reason: `review gate: this ${nested ? "nested " : ""}tool call to ${target} is not permitted by this executor's live tool-call boundary, so nothing was executed. `
+      + "It may be inactive, withdrawn, hidden, or unavailable in this session; tool_search can still activate it only if this executor's captured permissions already include it. "
+      + "Retrying it, or reaching it through codemode or another wrapper, cannot bypass the boundary. If the capability is genuinely required and cannot "
+      + "be activated, the primary agent must decide how to authorize it in a new task.",
   };
 }
 

@@ -2,7 +2,8 @@
 
 This page owns the raw configuration reference: config discovery, kill switches, every
 JSON field with its default, operating modes and the mode-cycle hotkey, reviewer
-selections, catalogs, and imports, delegated-execution defaults, Web fields, and legacy
+selections, catalogs, and imports, scoped tool-denial lists, delegated-execution
+defaults, Web fields, and legacy
 compatibility. The staged `/review-settings` menu is documented on the
 [Settings menu](settings.md#review-settings) page, and the scheduled-task feature guide
 lives on [Scheduled tasks](scheduled-tasks.md#scheduled-task-fields). Runtime behavior
@@ -66,10 +67,61 @@ described only briefly here is owned by the linked page.
 | `maxSnapshotBytes` | `52428800` | Bounds cumulative non-ignored untracked file bytes in private task capture (50 MiB) and textual content retained for parent review diffs; it does not truncate durable checkpoint content (see [Review workflow](review-workflow.md#review-windows-and-evidence)). |
 | `waveArtifactTtlMs` | `2592000000` (30 days) | Age after which completed non-recovery wave artifact roots are garbage-collected; `0` disables collection. |
 | `retainBundles` | `"on-failure"` | Review-bundle retention policy: `never`, `on-failure`, or `always`. `always` disables age-based wave GC while the application is running. |
+| `tools` | `{ "topLevelDeny": [], "executorDeny": [] }` | Exact-name top-level and executor tool denials; see [Tool denial fields](#tool-denial-fields). |
+
+## Tool denial fields
+
+`tools` is a separate optional top-level object with two independent exact-name deny
+lists. Both default to empty arrays when missing, including when the object or config
+file predates these settings; an empty list denies nothing. Present lists must be
+arrays of literal tool names — a non-array, a non-string, an empty string, or a
+whitespace-padded name rejects that list with a startup warning and recovery to the
+empty default for that list only, while the other list and unrelated JSON keys are
+preserved. Names are matched exactly and are never trimmed, prefix-matched, or
+pattern-expanded; duplicates collapse to their first occurrence.
+
+`tool_search` is the reserved review-gate discovery loader and is never a candidate in
+either list. A raw `tool_search` entry is rejected instead of accepted: an explicit
+configuration write fails strict validation, and startup recovery reports an actionable
+warning and omits the entry while preserving the other entries and the other list, so
+the reserved loader is never denied. The candidate universe for both lists is every
+otherwise-discoverable tool except `tool_search` itself.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `tools.topLevelDeny` | `[]` | Exact tool names denied for the primary/top-level agent. A denied name is withheld before admission, so it is absent from the startup inventory and `tool_search` and is never declared or executed in the top-level session. It never removes a name from a newly captured executor, and unchecking it restores only that tool's ordinary eligibility. |
+| `tools.executorDeny` | `[]` | Exact tool names denied for newly captured/delegated executors. A denied name is withheld at catalog capture, so it is absent from a new execute/inplace worker's `--tools` catalog, startup inventory, `tool_search`, and direct/nested calls. Already-admitted queued or running tasks and their continuation turns keep their captured authority, and research tasks are unaffected. It never removes a name from the top-level session. |
+
+The two lists are independent: neither cascades to the other, and a denial in one never
+widens authority in the other. Both only narrow. Pi's own
+`--tools`/`--exclude-tools`/`--no-tools`, the operating mode, launch and role ceilings,
+and the existing feature settings (for example `youShouldKnow.enabled`) stay
+authoritative; unchecking a denial restores only that tool's ordinary eligibility and
+never grants authority another control withheld. The lists disable no plugin, sandbox no
+effect, and add no wildcard policy. For the staged **Top-level tools** and **Executor
+tools** selectors, apply/save/cancel timing, and the bounded metadata-visibility limit
+(Pi's own native callable metadata may still expose a denied name to `ctx.tools` and
+codemode wrappers, while no denied call executes and the scoped denial explanation is
+added only where the host establishes the cause — a call refused at the `tool_call`
+admission check, a direct call clarified at Pi's `message_end` seam, or a nested call Pi
+recorded on the wrapper's tool result; an early native rejection with no recorded
+invocation keeps Pi's own truthful error, and a delegated executor omission is explained
+from its fixed captured catalog rather than the current deny configuration), see
+[Scoped tool denial](native-pi-tools.md#scoped-tool-denial-top-level-and-executor) and
+the [Settings menu](settings.md#scoped-tool-denial).
+
+Both lists are staged under the [Tools subsection](settings.md#tools-subsection): root
+Escape applies them to the current session without writing the file, Cancel discards
+the staged edits, and Save persists them. Top-level denials take effect at the next
+applicable model set write, without interrupting an in-flight run or reloading;
+executor denials apply to new admissions only.
 
 ## YouShouldKnow settings
 
-`youShouldKnow` is a separate optional top-level object. Both fields default to `true`
+`youShouldKnow` is a separate optional top-level object; its two fields are staged as
+**YouShouldKnow notices** and **Completion guidance** under the
+[Tools subsection](settings.md#tools-subsection), and the stored `youShouldKnow` object
+is unchanged by the move. Both fields default to `true`
 when missing, including when the object or config file predates these settings. Present
 field values must be JSON booleans; invalid fields recover independently to `true` with
 startup warnings.
@@ -604,7 +656,9 @@ A complete end-to-end example is `examples/delegated-execution.json`.
 
 Defaults: `execution.maxWorkers` is `4` (allowed range 1–128) and
 `execution.subtaskNotifications` defaults to `quiet`. `execution.deferredPiTools`
-defaults to `true`. The default retry policy is
+defaults to `true`. A newly captured executor also applies the exact-name
+`tools.executorDeny` list at admission (see [Tool denial fields](#tool-denial-fields)).
+The default retry policy is
 `maxRetries: 2`, `baseDelayMs: 1000`, `maxDelayMs: 15000`, `jitter: true`,
 `maxSameIncidentRepeats: 2`.
 
@@ -632,6 +686,11 @@ them over. The concise rules:
   MCP tool names through the direct, script, or deferred channels, so there is no
   default MCP exposure or callable MCP tool there, no `readOnlyHint` opt-in, and no
   researcher override; the toggle never grants a research-forbidden tool.
+- The `tools.topLevelDeny` and `tools.executorDeny` exact-name lists are an additional,
+  independent narrowing layer over these native surfaces: a denied name is withheld from
+  the primary or from newly captured executors respectively — never from both by
+  cascade — and a denied call is refused on every script channel rather than re-added.
+  See [Tool denial fields](#tool-denial-fields).
 - Delegated Pi workers inherit `codemode` only through the parent's captured worker
   catalog; the captured worker ceiling never widens after capture, and withdrawn or
   hidden names become absent and unusable within it. Review-gate adds no MCP server
@@ -723,7 +782,7 @@ See [Runtime dispatch](scheduled-tasks.md#runtime-dispatch) on the Scheduled tas
 ```
 
 `web.browserIdleExpiryMinutes` is a non-negative safe integer number of minutes
-(default **15**). Edit it through `/review-settings` → **Web** → **Browser idle
+(default **15**). Edit it through `/review-settings` → **Tools** → **Web** → **Browser idle
 expiry**, then **Save changes**. **0 disables idle close**: the session never closes
 for inactivity and stays open until an explicit `BrowserClose`, shutdown, replacement,
 or unrecoverable failure. Fractions, negative, and nonfinite values are rejected.
@@ -738,7 +797,7 @@ settings updates apply this persisted value to the managed browser in both direc
 silently recreated.
 
 `web.browserDownloadRetention` is a non-negative safe integer (default
-**8**). Edit it through `/review-settings` → **Web** → **Download retention**,
+**8**). Edit it through `/review-settings` → **Tools** → **Web** → **Download retention**,
 then **Save changes**. It is the maximum number of unsaved downloads retained per
 interactive-browser session: while the cap is reached, a new download cancels and
 releases the oldest retained one (after a live lowering, the next arrival drains
@@ -754,7 +813,7 @@ both initial tool registration and live settings updates apply this persisted
 value to the managed browser.
 
 `web.browserVisible` is a boolean (default **false**). Edit it through
-`/review-settings` → **Web** → **Browser visibility**, then **Save changes**. **false**
+`/review-settings` → **Tools** → **Web** → **Browser visibility**, then **Save changes**. **false**
 keeps the default headless QA browser (no window); **true** launches the interactive
 browser headed — a real browser window with a native address bar the human can use
 directly. The model's tool set and exposure are identical in both modes; there is no

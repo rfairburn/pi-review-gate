@@ -175,8 +175,11 @@ question answer, free-text, sync/async, or decline behavior.
 ## Availability and completion guidance
 
 The strict-boolean settings `youShouldKnow.enabled` and
-`youShouldKnow.completionGuidance` both default to **On** and are available in
-`/review-settings` and the config file (see [Configuration](configuration.md#youshouldknow-settings)).
+`youShouldKnow.completionGuidance` both default to **On**. They are staged as
+**YouShouldKnow notices** and **Completion guidance** under
+`/review-settings` → **Tools** (see [Settings menu](settings.md#tools-subsection))
+and are read from the config file
+(see [Configuration](configuration.md#youshouldknow-settings)).
 They independently control notice availability and whether completion guidance is
 requested, but the extension supplies that prompt only when both settings are On
 and `YouShouldKnow` is in the current live, authorized discovery ceiling.

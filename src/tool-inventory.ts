@@ -1,3 +1,16 @@
+/**
+ * #279: the loader registers under Pi's replaceable builtin name, so the
+ * native tool-search extension is not loaded and this single loader owns all
+ * discovery/activation (including codemode/deferred-exposure and MCP tools).
+ *
+ * The canonical binding lives in this pure, dependency-free module so
+ * configuration and settings validation can reference the required loader
+ * name without pulling the executor tool catalog's Git implementation into
+ * their import graph. `execution/tool-catalog.ts` re-exports it for the
+ * established callers.
+ */
+export const DEFERRED_TOOL_SEARCH_NAME = "tool_search";
+
 export interface ToolInventoryEntry {
   name: string;
   /** Canonical host metadata description; only a compact purpose is rendered. */

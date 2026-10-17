@@ -630,7 +630,22 @@ test("explicit native registry exclusion and frozen research-worker catalogs can
       assert.equal(worker.activeTools().includes("LateWorkerTool"), false,
         "late registry additions never widen the frozen worker catalog");
       assert.doesNotMatch(worker.definitions.get("tool_search")?.description ?? "", /LateWorkerTool/);
-      assert.equal((await submitModelCall(worker, "LateWorkerTool", `worker-late-${deferredPiTools}`, {}))?.block, true);
+      const lateBlock = await submitModelCall(worker, "LateWorkerTool", `worker-late-${deferredPiTools}`, {});
+      assert.equal(lateBlock?.block, true);
+      assert.match(lateBlock?.reason ?? "", /captured tool permissions/,
+        "a name outside the frozen captured ceiling gets the precise reason");
+      assert.doesNotMatch(lateBlock?.reason ?? "", /Top-level tools|settings deny|executor deny/i);
+      if (deferredPiTools) {
+        // WebSearch is inside the frozen ceiling but left inactive: the refusal
+        // must keep the generic live-boundary reason and must never claim the
+        // captured catalog omits it.
+        const inactiveBlock = await submitModelCall(worker, "WebSearch", `worker-inactive-${deferredPiTools}`, {});
+        assert.equal(inactiveBlock?.block, true);
+        assert.match(inactiveBlock?.reason ?? "", /live tool-call boundary/,
+          "an in-catalog inactive tool keeps the generic live-boundary reason");
+        assert.doesNotMatch(inactiveBlock?.reason ?? "", /captured tool permissions/,
+          "an in-catalog inactive tool is never described as a catalog omission");
+      }
       assert.equal((await submitModelCall(worker, "codemode", `worker-code-${deferredPiTools}`, { code: "" }))?.block, true);
       assert.equal((await submitModelCall(worker, "mcp__docs__lookup", `worker-mcp-${deferredPiTools}`, {}))?.block, true,
         "the fixed research-worker ceiling is not widened by MCP annotations or wrapper intent");

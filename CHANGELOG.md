@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.171]
+## [0.1.0-dev.172]
 
 ### Fixed
 
@@ -53,6 +53,61 @@ dates.
   overlay dispatch, native selection, and recording clipboard seam, including a
   regression that selects transcript text before the popup opens and proves the popup
   neither inherits nor copies that hidden-scroll selection.
+
+## [0.1.0-dev.171]
+
+### Added
+
+- Settings tools (#434): `/review-settings` gains one **Tools** subsection that owns two
+  independent exact-name deny multi-selectors — **Top-level tools** and **Executor
+  tools** — where a checked row is denied. Enter toggles the highlighted row, **Back**
+  and Escape return to the Tools root, root Escape applies the draft to the running
+  session, Save/Ctrl+S persists it, and Cancel discards it. A saved name the live
+  inventory no longer offers stays a reversible `[not currently available]` row for the
+  whole menu session, including after Back and re-entry, and a denied name is never
+  converted into an allowed one by inventory drift. The lists are stored as
+  `tools.topLevelDeny` and `tools.executorDeny`: exact literal names (never patterns,
+  prefixes, or globs), each defaulting to an empty list that denies nothing, with a
+  malformed list recovering independently to its empty default and a startup warning.
+  `tool_search` is the reserved discovery loader: it is never a selectable candidate in
+  either list, and a raw `tool_search` entry is rejected by strict validation on write
+  and omitted by startup recovery rather than applied, so the loader is never denied.
+  A top-level denial is withheld from the primary's admission, startup inventory,
+  `tool_search`, and normal declarations without affecting executor eligibility; an
+  executor denial is withheld at catalog capture from newly admitted execute/inplace
+  workers without affecting the primary. Denials only narrow: Pi's
+  `--tools`/`--exclude-tools`/`--no-tools`, the operating mode, launch and role ceilings,
+  and the existing feature settings stay authoritative; unchecking a denial restores
+  only that tool's ordinary eligibility. Top-level denials apply at the next applicable
+  model set write, without interrupting an in-flight run or reloading; executor denials
+  apply to new admissions through the shared `SubtasksStart`/`SubtasksAdd`, scheduled, and
+  human paths, while research tasks are unaffected and already-admitted queued or running
+  tasks and their continuation turns keep their captured authority. A denied call fails
+  closed without executing on direct, nested, codemode, and wrapper paths. The scoped
+  settings explanation is added where the host establishes the cause — a call refused at
+  the `tool_call` admission check, a direct call clarified at Pi's `message_end` seam, or
+  a nested call Pi recorded on the wrapper's tool result. An early native rejection that
+  leaves no recorded invocation — codemode's own proxy refusing a non-callable
+  direct-exposure member before `ctx.executeTool` runs, for example — keeps Pi's own
+  truthful error rather than gaining a settings attribution, and still executes nothing.
+  A delegated executor omission is explained from that task's fixed captured catalog
+  instead of the current deny configuration. Pi itself is unchanged, so a denied
+  name can remain visible to Pi's native callable metadata (`ctx.tools`, an active
+  codemode description, or an earlier transcript entry); normal declarations, the startup
+  inventory, and review-gate's `tool_search` omit denied names, and no denied call
+  executes. No plugin is disabled, no effect is sandboxed, and no wildcard policy is
+  added. The checkout also ships `scripts/pi-review-gate-tool-denial-sandbox.cjs` and its
+  fixture, which stage a disposable isolated sandbox and print the supported command for
+  manually exercising both lists against a real Pi session and a new executor child.
+
+### Changed
+
+- Settings tools (#434): **Deferred Pi tools**, **YouShouldKnow notices**, **Completion
+  guidance**, and **Web** move from the `/review-settings` root into the new **Tools**
+  subsection. Their labels, stored keys (`execution.deferredPiTools`,
+  `youShouldKnow.enabled`, `youShouldKnow.completionGuidance`, and `web.*`), defaults, and
+  runtime behavior are unchanged; only their location and the root's consolidated
+  **Tools** row summary change.
 
 ## [0.1.0-dev.170]
 

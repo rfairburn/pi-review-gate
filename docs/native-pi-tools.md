@@ -102,9 +102,11 @@ infers a tool list from the transcript.
 
 - Every registered, non-hidden tool Pi currently permits is a discovery candidate,
   within the operating mode and live feature settings (for example the YouShouldKnow
-  notice setting); `codemode` is no exception. Candidates are listed by the
-  startup inventory and the `tool_search` description and are declared only after
-  `tool_search` loads them; tools already active report as already active.
+  notice setting and the `tools.topLevelDeny` list; see
+  [Scoped tool denial](#scoped-tool-denial-top-level-and-executor)); `codemode` is no
+  exception. Candidates are listed by the startup inventory and the `tool_search`
+  description and are declared only after `tool_search` loads them; tools already active
+  report as already active.
 - Registered is not always declarable. Pi offers no public per-tool activatability
   query, so the inventory lists registered candidates, and `tool_search` confirms each
   activation from Pi's actual active set after loading. A name Pi declines is reported
@@ -172,11 +174,111 @@ registrations, `/mcp` re-enablement, or reconfiguration apply only within it
   remain unavailable while withdrawn or hidden; Pi can restore them only within that
   same ceiling. Native MCP registrations may arrive asynchronously after bootstrap:
   pending names stay unavailable until Pi supplies permitted live metadata, without
-  forcing native declarations or weakening ordinary/control startup checks.
+  forcing native declarations or weakening ordinary/control startup checks. A newly
+  captured executor also applies the exact-name `tools.executorDeny` list at admission
+  (see [Scoped tool denial](#scoped-tool-denial-top-level-and-executor)).
 - Research workers never receive codemode or any MCP tool name, and a supplied
   catalog cannot add either back: it fails closed at subset validation. External
   harnesses are unchanged (Claude with settings, skills, plugins, and MCP disabled;
   Codex's sandbox; generic binaries ineligible for research).
+
+## Scoped tool denial (top-level and executor)
+
+Beyond the role, mode, and launch ceilings above, the configuration's
+`tools.topLevelDeny` and `tools.executorDeny` lists (staged as the **Top-level tools**
+and **Executor tools** selectors under `/review-settings` → **Tools**) are exact-name
+narrowing layers. A checked row is denied; the two lists are independent, never
+glob/pattern lists, and never grant: unchecking a denial restores only that tool's
+ordinary eligibility, and a denial removes no plugin, sandboxes no effect, and adds no
+wildcard policy. See [Tool denial fields](configuration.md#tool-denial-fields).
+
+- **What a denial removes.** A denied name is withheld from admission and
+discovery — the startup inventory, the `tool_search` description and results, and the
+normal declared tool set — and every call naming it fails without executing: a direct
+model call, a codemode or other wrapper script's `ctx.executeTool` (nested) call, and
+the same call reached through a second wrapper, because the denial is checked before the
+correlated `tool_call` admission rather than at a single surface.
+- **Denial diagnostics state only what the host establishes.** The scoped settings
+explanation is added where the host establishes the cause: a call refused at the
+`tool_call` admission check receives it directly, a direct call whose declaration was
+withheld is clarified at the documented `message_end` seam, and a nested call Pi recorded
+on the wrapper's tool result is explained from that record. A delegated executor omission
+is explained from that task's fixed captured catalog alone — plus Pi's record where the
+call failed before admission — a durable captured-permission fact, never a re-read of the
+current deny configuration and never an attribution to a global, mode, or native
+restriction. An early native rejection that leaves no recorded invocation keeps Pi's own
+truthful error instead: codemode's own proxy can refuse a non-callable direct-exposure
+member before `ctx.executeTool` runs, so there is no invocation for review-gate to
+attribute and it never infers a settings cause from error text. The no-execution guarantee
+above is unaffected.
+- **Independence.** A top-level-only denial leaves the tool eligible for a newly
+captured executor; an executor-only denial leaves the primary eligible. Denying both
+excludes both; denying neither changes nothing. A denial in one list never widens
+authority in the other, and neither widens a real global, native launch, feature, mode,
+or role ceiling: Pi's `--tools`/`--exclude-tools`/`--no-tools`, the operating mode, the
+YouShouldKnow notice setting, and research restrictions stay authoritative.
+- **The discovery loader is reserved.** `tool_search` itself is never a candidate in
+either list, so the lists can only narrow other tools; the candidate universe is every
+otherwise-discoverable tool except `tool_search`. A raw `tool_search` entry is rejected
+rather than applied — an explicit write fails strict validation, and startup recovery
+warns and omits the entry — and neither list can deny the loader.
+- **Timing and captured authority.** Applying the draft makes top-level denials
+effective at the next applicable model set write, without interrupting an in-flight run
+or reloading. Executor denials apply to new execute/inplace admissions through the
+shared `SubtasksStart`/`SubtasksAdd`, scheduled-task, and human paths; research tasks
+are unaffected. Authority is captured at admission, so already-admitted queued or
+running tasks — and their later continuation turns — keep the catalog captured at
+launch, exactly like every other member of the [fixed captured
+ceiling](#delegated-pi-workers-the-fixed-captured-ceiling).
+- **Bounded metadata visibility.** Pi itself is unchanged,
+so a denied name may remain visible to Pi's own native callable metadata: codemode and
+other wrapper scripts can still observe it through `ctx.tools`, and an active codemode
+description can list codemode-exposure tools. That metadata is not always in context —
+deferred tool metadata is generally returned only by explicit queries such as
+`ALL_TOOLS`, `searchTools`, or `describeTool` — and names recorded in earlier transcript
+entries persist after a denial. Normal declarations, the startup inventory, and
+review-gate's `tool_search` exclude denied names, and no denied call executes.
+
+### Manually verifying scoped tool denial
+
+The checkout ships one small helper that stages a disposable, isolated sandbox — its
+own `HOME`, `PI_CODING_AGENT_DIR`, `TMPDIR`, caches, synthetic workspace, probe
+fixture, and `review-gate.json` — and prints the exact `pi` command to run. It builds
+and launches nothing; it reads only the installed Pi runtime's install
+location/provenance to build that command, and never reads or writes live settings,
+auth, config, or cache:
+
+```sh
+node scripts/pi-review-gate-tool-denial-sandbox.cjs --candidate /path/to/owned/dist/src/index.js
+```
+
+The probe fixture is a synthetic third-party `SyntheticNotify` tool (its only effect is
+one local JSONL line) plus a scripted in-process model, so the deterministic path needs
+no credential and no network. The printed command changes into the sandbox workspace
+before launching Pi — so a dispatched task that omits an explicit workspace still
+targets the sandbox, never the checkout — and runs under an allowlisted `env -i`.
+Loading the candidate also means the command does not rely on ambient discovery; Pi's
+builtin extension set stays off (`--no-extensions`) except the explicitly loaded
+`builtin:codemode` needed for the nested-call probe. Because the sandbox agent directory
+holds the fixture and
+a new review-gate executor child inherits `PI_CODING_AGENT_DIR` without
+`--no-extensions`, the fixture reaches a freshly launched worker too. The printed guide
+covers the interactive Tools walkthrough, the deterministic prompts that exercise a
+direct call, a `SubtasksStart` executor dispatch, and a codemode script call, and the
+sandbox cleanup command. In that walkthrough, nested Back/Escape only navigate; only
+Escape at the `/review-settings` root applies the draft to the running session, while
+Save/Ctrl+S persists it (see [Settings menu](settings.md#review-settings)). Pass
+`--json` for a machine-readable command summary, and `--model <provider/model>` with
+`--pass-env <NAME>` if you need a real model; the helper copies no credentials, and it
+refuses `--pass-env` names that are sandbox-owned or review-gate-reserved so the
+isolation cannot be overridden. The printed guide references a `--pass-env` value from
+your own shell instead of echoing it, while the `--json` summary carries the full env
+map and so must be treated as sensitive when a credential is passed. A built candidate
+is required: build it into an owned scratch directory, never the live `dist/`.
+
+To probe whether tool metadata or a call surfaced, read the JSONL log the fixture writes
+(`PRG_TOOL_DENIAL_LOG`) and the `/tool-denial-dump` inventory dump; a denied call leaves
+no log line, and an allowed one leaves exactly one.
 
 ## Codemode calls inside the gate
 

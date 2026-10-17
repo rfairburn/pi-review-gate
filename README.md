@@ -56,7 +56,15 @@ receipts of exactly what the model was told.
   macOS); question and notice content use native Markdown when available, with a
   disclosed complete plain-text fallback. In fullscreen mode, press a visible menu
   item to highlight it and complete a single left click to invoke its Enter action;
-  keyboard controls remain available. **More details** closes the popup, asks for
+  pressing or dragging non-item popup content (body text, borders, padding, blank
+  cells) instead starts Pi's normal native text selection over the visible popup.
+  With copy-on-select on, Pi copies the finished selection on release; with it
+  off, Pi's configured application copy shortcut (Ctrl+X by default, remappable)
+  copies the visible selection through Pi's own fullscreen clipboard path while
+  the popup holds focus. Opening the popup clears any selection made before it
+  opened, so the popup never changes the copy setting and this path copies only a
+  selection made over the visible popup, never hidden conversation text.
+  Keyboard controls remain available. **More details** closes the popup, asks for
   elaboration in an ordinary reply to the originating session with the full body and
   context, and consumes only that notice. **Close** removes only that notice and
   sends nothing. The extension also uses Pi's optional native Markdown display hook

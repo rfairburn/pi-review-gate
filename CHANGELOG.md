@@ -15,6 +15,45 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.171]
+
+### Fixed
+
+- Shared pending-input popup (#436): in Pi fullscreen mode, the popup claimed every
+  non-wheel pointer event inside its bounds, which blocked Pi's own text selection
+  over the popup and, with it, native copy/paste. Only a left press that lands on a
+  currently drawn, live menu entry is claimed now; a press or drag on body text,
+  headings, the fixed hint, separator rules, padding, or blank cells is left to Pi's
+  native selection and copy-on-select, which read the visible popup rows — including
+  their current scroll position and wrapping — and nothing offscreen. Deliberate item
+  clicks, Enter/Escape, the native free-text field and paste, choice and Decline
+  actions, notice More details/Close, keyboard-only popup scrolling (the mouse
+  wheel keeps its unchanged native behavior), session
+  isolation, and the content-sized compact layout are unchanged. Non-primary presses
+  keep their previous foreground ownership. Headless regression coverage drives the
+  installed runtime's SGR parser, overlay dispatch, native selection, and clipboard
+  seam rather than calling the extension's handler directly.
+- Shared pending-input popup (#436): with Pi's copy-on-select setting off, Pi's
+  configured explicit copy shortcut (`app.message.copy`, **Ctrl+X** by default and
+  honored live from `keybindings.json`) now copies a selection made over the popup
+  while its overlay holds focus, using Pi's own public fullscreen-selection clipboard
+  path. Copying no longer requires enabling copy-on-select or closing the popup, and
+  the host's copy-on-select setting is never changed. Opening the popup clears a
+  fullscreen selection inherited from before it opened (the host's public
+  `resetTextSelection()` lifecycle call), because such a selection is anchored to the
+  transcript's scroll view and would otherwise let the key read hidden scroll content
+  instead of the visible popup. The key is consumed only when a
+  fullscreen selection is live and copy-on-select is off; with no selection,
+  copy-on-select on, or a host without that public surface it keeps its existing
+  editor/navigation/paste behavior, and it never falls back to the last assistant
+  message or other hidden conversation text. Exactly the currently visible popup rows
+  are copied, including their wrapping and scroll position. A rejected clipboard seam
+  is swallowed without closing the popup or claiming success. The explicit-copy path
+  is covered by configured-key bytes driven through the installed runtime's parser,
+  overlay dispatch, native selection, and recording clipboard seam, including a
+  regression that selects transcript text before the popup opens and proves the popup
+  neither inherits nor copies that hidden-scroll selection.
+
 ## [0.1.0-dev.170]
 
 ### Fixed

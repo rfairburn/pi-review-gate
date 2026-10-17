@@ -182,6 +182,49 @@ standalone example configs and the runnable JSON blocks in the documentation thr
 production strict validator and check intended reviewer selections/resolution and worker
 routes using hermetic fixtures, without invoking providers or reviewer/executor commands.
 
+### Fullscreen popup pointer-input verification (#431, #436)
+
+`tests/user-question-mouse-host.test.ts` drives the production shared-popup
+registration and factory through the installed Pi's real `TuiAltScreen` mouse
+dispatch: synthetic SGR (1006) cell-coordinate packets enter the terminal input
+callback, so Pi's own parser, overlay hit test, press capture, drag tracking,
+click synthesis, native selection, and clipboard seam decide what happens — the
+extension's own handler is never called directly. It asserts the text the host's
+public `copyActiveSelectionToClipboard()` actually resolves from its own visible
+screen, with `copyOnSelect` off and a recording `copySelection` seam, so no OS
+clipboard is touched. The same file sends the configured explicit-copy bytes
+through that same production path — `registerUserQuestions` → shortcut handler →
+real `TuiAltScreen` overlay dispatch — and asserts Pi's own `app.message.copy`
+binding (Ctrl+X by default, live-remappable through `keybindings.json`) copies
+the visible selection once and only while a fullscreen selection is live, that
+the release itself copies nothing with copy-on-select off, that no hidden
+transcript text is copied, that a transcript selection inherited from before the
+popup opened is dropped at popup entry and never copied (a fresh popup selection
+then still copies), that no selection leaves the key with the existing
+editor/navigation behavior, and that a rejected clipboard seam is swallowed
+without closing the popup. The boundary is headless: this proves the dispatch
+the installed runtime performs for given bytes, not which bytes a particular
+physical terminal emits, and it does not exercise `InteractiveMode`, the
+session-host pane-forwarding path, or an OS-level selection/paste.
+
+Manual check on a real terminal: open the popup with Ctrl+Alt+Up, drag with the
+left button across the question/notice body or context, and release. With Pi's
+`fullscreenCopyOnSelect` setting enabled (the default) Pi's own clipboard path
+copies the selection on release, and it can be pasted outside Pi; the selection
+is Pi-managed rather than terminal-owned, so the terminal's own copy gesture
+copies nothing on its own. With copy-on-select off nothing is copied on
+release; press Pi's configured copy shortcut (**Ctrl+X** by default, or your
+`keybindings.json` remap) to copy the visible selection through Pi's own
+fullscreen-selection path, without closing the popup or changing the setting.
+Opening the popup clears a selection made before it opened, so the shortcut only
+ever copies a selection made over the visible popup. Confirm that a press on a
+drawn menu entry highlights it
+and a completed click runs its action, while a body-originated drag that crosses
+or releases over an action never runs it. `tests/session-host-main.test.ts`
+separately covers the session-host authority this relies on: only an initial left
+press above a pane can activate a row, so stray drag or release packets outside
+the popup cannot switch sessions or trigger a deliberate action.
+
 ## Static checks and docs validation
 
 `npm run check:static` runs `tsc --noEmit`, `shellcheck scripts/*.sh`, and

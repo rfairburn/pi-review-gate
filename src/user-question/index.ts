@@ -46,6 +46,8 @@ import { UserQuestionController, type PendingNotice, type QuestionSubmitSource }
 import {
   createQuestionListComponent,
   QUESTION_LIST_SHORTCUT_KEY,
+  type QuestionNativeSelection,
+  type QuestionSelectionCopy,
   type QuestionUiTheme,
 } from "./components";
 import {
@@ -435,6 +437,10 @@ async function openQuestionList(
         tuiHost,
         shortcutLabel: questionShortcutLabel(),
         nativeField,
+        // The live TUI the factory owns: the same public fullscreen selection
+        // surface Pi's own explicit copy uses. Absent on non-fullscreen or
+        // older hosts, where the copy binding keeps its existing behavior.
+        selectionCopy: fenceSelectionCopy(nativeSelectionCopyOf(tui)),
         isStale: stale,
         requestRender,
         getViewportRows: () => questionPopupViewportRows(tui),
@@ -497,6 +503,72 @@ function requestRenderOf(tui: unknown): (() => void) | undefined {
       ? () => requestRender.call(tui)
       : undefined;
   } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The host's public fullscreen explicit-selection copy surface, narrowed to
+ * the members the popup needs (pi-tui `TuiAltScreen`
+ * getCopyOnSelect/hasActiveSelection/copyActiveSelectionToClipboard plus the
+ * popup-entry `resetTextSelection` lifecycle call). Every read is
+ * receiver-preserving and guarded: a host without the complete surface, or an
+ * invalidated one, yields undefined so the popup simply leaves the configured
+ * copy binding to the existing editor/navigation handling. The returned
+ * closures read the host live on each press; the popup never stores or
+ * overrides the host's copy-on-select setting.
+ *
+ * Exported for the production-wiring tests; the runtime entry point only
+ * uses it to build the popup component's selection-copy option.
+ */
+export function nativeSelectionCopyOf(tui: unknown): QuestionNativeSelection | undefined {
+  if (!isRecord(tui)) return undefined;
+  let getCopyOnSelect: unknown;
+  let hasActiveSelection: unknown;
+  let copyActiveSelectionToClipboard: unknown;
+  let resetTextSelection: unknown;
+  try {
+    getCopyOnSelect = tui.getCopyOnSelect;
+    hasActiveSelection = tui.hasActiveSelection;
+    copyActiveSelectionToClipboard = tui.copyActiveSelectionToClipboard;
+    resetTextSelection = tui.resetTextSelection;
+  } catch {
+    return undefined; // A throwing getter: no usable surface.
+  }
+  if (typeof getCopyOnSelect !== "function" || typeof hasActiveSelection !== "function"
+    || typeof copyActiveSelectionToClipboard !== "function" || typeof resetTextSelection !== "function") {
+    return undefined;
+  }
+  const get = getCopyOnSelect as () => unknown;
+  const has = hasActiveSelection as () => unknown;
+  const copy = copyActiveSelectionToClipboard as () => Promise<unknown>;
+  const reset = resetTextSelection as () => void;
+  return {
+    copyOnSelect: () => Boolean(get.call(tui)),
+    hasActiveSelection: () => Boolean(has.call(tui)),
+    copyActiveSelection: async () => Boolean(await copy.call(tui)),
+    resetInheritedSelection: () => { reset.call(tui); },
+  };
+}
+
+/**
+ * Popup-entry fence for the explicit-copy integration. Pi's `showOverlay`
+ * preserves a selection made before the overlay opened, and that selection is
+ * anchored to the transcript's scroll view, so Pi's own explicit copy would
+ * read the transcript's hidden scroll content instead of the composited popup.
+ * Clearing it here — through the host's public `resetTextSelection()` lifecycle
+ * call, synchronously before the overlay accepts input — makes the component's
+ * copy eligibility mean "a selection made over the visible popup". A host whose
+ * reset throws yields no explicit-copy integration at all, so the configured
+ * copy key keeps its previous behavior rather than risking hidden-text copy.
+ */
+function fenceSelectionCopy(selection: QuestionNativeSelection | undefined): QuestionSelectionCopy | undefined {
+  if (!selection) return undefined;
+  try {
+    selection.resetInheritedSelection();
+    return selection;
+  } catch {
+    // An invalidated host cannot fence the inherited selection: fail closed.
     return undefined;
   }
 }

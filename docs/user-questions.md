@@ -84,11 +84,19 @@ exposing the public `Theme.bg` formatter, every popup row, including the separat
 lines and blank padding cells, uses the theme's opaque surface background across
 the whole conversation viewport width. Mouse selection and copying follow the
 terminal's and Pi's existing native behavior; the popup adds no selection
-scoping or automatic clipboard copy of its own. In Pi's fullscreen mode, a
-mouse press or drag that starts inside the open popup belongs to the popup's
-item clicks, so it does not start a conversation text selection; selections
-starting outside the popup, and all mouse handling in regular mode, are
-unchanged.
+scoping, selection state, or automatic clipboard copy of its own, and it never
+changes Pi's copy-on-select setting. In Pi's
+fullscreen mode, only a left press that lands on a currently drawn menu entry is
+claimed as a popup click (see below). A press or drag on the popup's body text,
+headings, fixed hint, separator rules, padding, or blank cells is left to the
+host, so Pi's native text selection and copy-on-select read the visible popup
+rows exactly as drawn — their current scroll position and wrapping included —
+and your terminal's own copy and paste work normally. With copy-on-select off,
+Pi's configured application copy shortcut (Ctrl+X by default) copies the visible
+selection through Pi's own fullscreen clipboard path while the popup holds
+focus; opening the popup clears a selection made before it opened, so the copy
+key reads only selections made over the visible popup. Selections starting
+outside the popup, and all mouse handling in regular mode, are unchanged.
 A parent Main sidebar is outside the child conversation viewport and is not
 covered by this overlay. The complete notice body
 and optional context appear before its **More details** and **Close** actions. If native Markdown or
@@ -252,14 +260,40 @@ arrows select · Enter confirm · Esc back
   **Close**. Clicking a suggested choice sends that answer immediately; clicking
   **Decline** declines without a second confirmation. No double click is required.
   Wrapped item text targets the same item; borders, padding, blank space, headings,
-  and content that is not a menu entry do not activate an item. Mouse interaction
-  uses the visible layout after scrolling or resizing and does not pass the click
-  through to the conversation underneath. After the popup closes, normal native
-  mouse routing resumes. In regular mode the terminal retains mouse ownership;
-  use the existing keyboard controls. While the free-form editor is active,
-  clicking its box never submits the draft; still-visible choice and Decline
-  rows remain clickable. Clicking one leaves editing and invokes that menu
+  and content that is not a menu entry activate no item and instead start Pi's
+  native text selection over the visible popup (see above). A claimed item click
+  uses the layout that was actually drawn after scrolling or resizing, and never
+  passes through to the conversation underneath. After the popup closes, normal
+  native mouse routing resumes. In regular mode the terminal retains mouse
+  ownership; use the existing keyboard controls. While the free-form editor is
+  active, clicking its box never submits the draft; still-visible choice and
+  Decline rows remain clickable. Clicking one leaves editing and invokes that menu
   action. Merely leaving editing without resolving the question keeps the draft.
+- **Copying popup text in fullscreen mode.** Select the text you want with a
+  left-button drag — over the question/notice body, its context, or the
+  conversation around the popup. That fullscreen selection is Pi's own, drawn in
+  the viewport rather than owned by the terminal, so a terminal-level copy
+  gesture has nothing of its own to copy. Pi's fullscreen copy-on-select setting
+  (`fullscreenCopyOnSelect`, on by default) copies the finished selection to the
+  clipboard through Pi's clipboard path when you release the mouse button — not
+  continuously during the drag. With copy-on-select off, nothing is copied on
+  release; press Pi's configured application copy shortcut (**Ctrl+X** by
+  default, honoring your `keybindings.json` remap) to copy the visible selection
+  through Pi's own fullscreen-selection clipboard path while the popup holds
+  keyboard focus. If there is no live selection, or the host does not expose
+  that native surface, the key keeps its existing editor or navigation behavior.
+  The popup never changes Pi's copy-on-select setting and adds no clipboard or
+  selection path of its own; this explicit-copy path reads only the visible
+  selection and never falls back to hidden conversation text. Opening the popup
+  clears any text selection you had made before it opened (Pi's own fullscreen
+  selection reset), so the copy key only ever acts on a selection made over the
+  visible popup. To paste, use the
+  terminal's paste
+  gesture (**Cmd+V**, **Ctrl+Shift+V**, or **Ctrl+V**) into the popup's
+  free-text field; outside that field the popup consumes the keys it uses for
+  navigation and scrolling. What is copied is exactly the rows currently visible
+  inside the popup, including their wrapping, so text scrolled out of the popup
+  viewport is not part of the selection.
 - Selecting a choice or submitting typed text delivers your answer.
 - The free-text row uses one Pi-native text field inside the shared
   question/notice overlay; it does not duplicate the editor underneath. Its

@@ -29,6 +29,7 @@ export const APP_KEY_DEFAULTS: Record<string, string> = {
   "app.exit": "ctrl+d",
   "app.editor.external": "ctrl+g",
   "app.clipboard.pasteImage": "ctrl+v",
+  "app.message.copy": "ctrl+x",
 };
 
 export const ENTER = "\r";
@@ -470,12 +471,13 @@ export async function loadRealBridgeHost(): Promise<RealBridgeHost | undefined> 
  */
 export function createRealKeybindingsManager(
   tui: Record<string, unknown>,
+  userBindings: Record<string, string | string[]> = {},
 ): { matches(data: string, keybinding: string): boolean } {
   const definitions = {
     ...(tui.TUI_KEYBINDINGS as Record<string, unknown>),
     ...Object.fromEntries(Object.entries(APP_KEY_DEFAULTS).map(([id, keys]) => [id, { defaultKeys: keys, description: "" }])),
   };
-  const manager = new (tui.KeybindingsManager as new (definitions: unknown, userBindings: unknown) => { matches(data: string, keybinding: string): boolean })(definitions, {});
+  const manager = new (tui.KeybindingsManager as new (definitions: unknown, userBindings: unknown) => { matches(data: string, keybinding: string): boolean })(definitions, userBindings);
   (tui.setKeybindings as (keybindings: unknown) => void)(manager);
   return manager;
 }

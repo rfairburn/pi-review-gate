@@ -298,6 +298,8 @@ function makeFixture(options: {
   isStale?: () => boolean;
   keybindings?: ReturnType<typeof makeKeybindings>;
   theme?: QuestionUiTheme;
+  tuiHost?: ReturnType<typeof makeTuiHost>;
+  getTerminalSize?: () => { columns: number; rows: number } | undefined;
 } = {}): Fixture {
   const sent: Fixture["sent"] = [];
   const controller = new UserQuestionController({
@@ -317,11 +319,12 @@ function makeFixture(options: {
     controller,
     keybindings: options.keybindings ?? makeKeybindings(),
     theme: options.theme ?? THEME,
-    tuiHost: makeTuiHost(),
+    tuiHost: options.tuiHost ?? makeTuiHost(),
     shortcutLabel: "Ctrl+Alt+Up",
     nativeField: field,
     getViewportRows: options.getViewportRows,
     isStale: options.isStale,
+    getTerminalSize: options.getTerminalSize,
     onDone: (result) => done.push(result),
   });
   return { controller, identity, sent, done, component, field };
@@ -1209,15 +1212,24 @@ test("notice actions are revealed by Up/Down and keep their semantics", () => {
   assert.equal(fixture.sent.length, 0, "Close sends nothing");
 });
 
-test("the popup is keyboard-only: it exposes no mouse handler, so Pi keeps native wheel behavior", () => {
+test("popup scrolling is keyboard-only: wheel input is never handled, so Pi keeps native wheel behavior", () => {
   const fixture = makeFixture({ getViewportRows: () => 12 });
   registerNotice(fixture, longNoticeBody(30));
-  // pi-tui routes mouse events only to components with a handleMouse method;
-  // without one, wheel input keeps Pi's (and the terminal's) own behavior.
-  assert.equal("handleMouse" in fixture.component, false, "the shared popup registers no mouse handling");
   fixture.component.handleInput(ENTER);
-  const text = fixture.component.render(60).join("\n");
-  assert.doesNotMatch(text, /wheel|mouse/iu, "no view advertises mouse behavior");
+  fixture.component.handleInput(SHIFT_ALT_DOWN);
+  const before = fixture.component.render(60);
+  // Fullscreen item clicks (#431) add a mouse handler, but it declines every
+  // wheel event: pi-tui then applies its own unhandled-wheel behavior, and
+  // the popup's single scroll offset never moves by wheel.
+  assert.equal(typeof fixture.component.handleMouse, "function");
+  for (const [y] of before.entries()) {
+    for (const wheelDelta of [-3, -1, 1, 3]) {
+      const event = { type: "wheel", button: "none", x: 4, y, width: 60, height: before.length, wheelDelta } as Parameters<typeof fixture.component.handleMouse>[0];
+      assert.equal(fixture.component.handleMouse(event), undefined, `row ${y}: wheel ${wheelDelta} is left to the host`);
+    }
+  }
+  assert.deepEqual(fixture.component.render(60), before, "wheel input never scrolls or changes the popup");
+  assert.doesNotMatch(before.join("\n"), /wheel|mouse|click/iu, "no view advertises mouse behavior");
 });
 
 test("keyboard scrolling while editing stays with the native field; the next editing input re-reveals the cursor", async () => {
@@ -1438,4 +1450,788 @@ test("stale popups close on scroll input instead of scrolling", () => {
   assert.deepEqual(fixture.done, [{ kind: "closed" }], "the stale popup closes without acting");
   assert.deepEqual(fixture.component.render(60), []);
   assert.equal(fixture.sent.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Fullscreen pointer input (#431): native-style single click, layered on the
+// #413 single scroll offset, body slice, fixed hint area, and tiny layouts.
+// ---------------------------------------------------------------------------
+
+type PopupMouseEvent = Parameters<Fixture["component"]["handleMouse"]>[0];
+type PopupMouseType = PopupMouseEvent["type"];
+type PopupMouseButton = PopupMouseEvent["button"];
+
+const realTextHelpers = createRequire(__filename)("pi-session-host-tui/dist/utils.js") as {
+  visibleWidth(text: string): number;
+  wrapTextWithAnsi(text: string, width: number): string[];
+};
+
+/** The fake host with pi-tui's real cell-width and wrapping helpers. */
+function makeRealWidthTuiHost(): ReturnType<typeof makeTuiHost> {
+  return {
+    ...makeTuiHost(),
+    visibleWidth: (text: string) => realTextHelpers.visibleWidth(text),
+    wrapTextWithAnsi: (text: string, width: number) => realTextHelpers.wrapTextWithAnsi(text, width),
+  };
+}
+
+interface DrawnFrame {
+  lines: string[];
+  width: number;
+}
+
+function draw(fixture: Fixture, width = 80): DrawnFrame {
+  return { lines: fixture.component.render(width), width };
+}
+
+function plainRow(line: string): string {
+  return line.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+function plainFrame(frame: DrawnFrame): string {
+  return frame.lines.map(plainRow).join("\n");
+}
+
+/** The drawn cell where `text` starts (cell columns, measured with real widths). */
+function cellOf(frame: DrawnFrame, text: string, occurrence = 0): { x: number; y: number } {
+  let seen = 0;
+  for (const [y, line] of frame.lines.entries()) {
+    const row = plainRow(line);
+    const index = row.indexOf(text);
+    if (index < 0) continue;
+    if (seen++ < occurrence) continue;
+    return { x: realTextHelpers.visibleWidth(row.slice(0, index)), y };
+  }
+  throw new Error(`"${text}" is not drawn in:\n${plainFrame(frame)}`);
+}
+
+function pointer(
+  frame: DrawnFrame,
+  type: PopupMouseType,
+  x: number,
+  y: number,
+  button: PopupMouseButton = "left",
+  extra: Partial<PopupMouseEvent> = {},
+): PopupMouseEvent {
+  return {
+    type,
+    button: type === "wheel" ? "none" : button,
+    x,
+    y,
+    screenX: x,
+    screenY: y + 3,
+    width: frame.width,
+    height: frame.lines.length,
+    ...extra,
+  };
+}
+
+/**
+ * pi-tui's stationary gesture: press, then release and the synthesized click
+ * on the same cell, both retargeted with the press-time bounds. `between`
+ * runs after the press, where the host's requested render would happen.
+ */
+function clickCell(
+  fixture: Fixture,
+  frame: DrawnFrame,
+  cell: { x: number; y: number },
+  options: { between?: () => void; clickCount?: number } = {},
+): Array<ReturnType<Fixture["component"]["handleMouse"]>> {
+  const results = [fixture.component.handleMouse(pointer(frame, "press", cell.x, cell.y))];
+  options.between?.();
+  results.push(fixture.component.handleMouse(pointer(frame, "release", cell.x, cell.y)));
+  results.push(fixture.component.handleMouse(pointer(frame, "click", cell.x, cell.y, "left", {
+    clickCount: options.clickCount ?? 1,
+  })));
+  return results;
+}
+
+async function flushDelivery(): Promise<void> {
+  await new Promise((resolvePromise) => setImmediate(resolvePromise));
+}
+
+/** Keyboard-page the popup one line at a time until `done` holds for the drawn frame. */
+function pageUntil(fixture: Fixture, width: number, done: (frame: DrawnFrame) => boolean, key = CTRL_ALT_PAGE_DOWN): DrawnFrame {
+  for (let step = 0; step <= 80; step += 1) {
+    const frame = draw(fixture, width);
+    if (done(frame)) return frame;
+    fixture.component.handleInput(key);
+  }
+  throw new Error(`the paging target was not reached:\n${plainFrame(draw(fixture, width))}`);
+}
+
+test("mouse: a press highlights a list row without acting; the completed click matches Enter", () => {
+  const keyboard = makeFixture();
+  register(keyboard, "First question?", { choices: ["a"] });
+  register(keyboard, "Second question?", { choices: ["b"] });
+  keyboard.component.handleInput(DOWN);
+  keyboard.component.handleInput(ENTER);
+  const expected = keyboard.component.render(80);
+
+  const fixture = makeFixture();
+  register(fixture, "First question?", { choices: ["a"] });
+  register(fixture, "Second question?", { choices: ["b"] });
+  const frame = draw(fixture);
+  const cell = cellOf(frame, "q2: Second question?");
+  const press = fixture.component.handleMouse(pointer(frame, "press", cell.x, cell.y));
+  assert.deepEqual(press, { handled: true, render: true });
+  const highlighted = fixture.component.render(80).map(plainRow).join("\n");
+  assert.match(highlighted, /> q2: Second question\?/, "the press moves the highlight to the pressed row");
+  assert.match(highlighted, /Pending input \(2\)/, "a press alone never opens the item");
+
+  assert.deepEqual(fixture.component.handleMouse(pointer(frame, "release", cell.x, cell.y)), { handled: true, render: false });
+  assert.deepEqual(fixture.component.handleMouse(pointer(frame, "click", cell.x, cell.y, "left", { clickCount: 1 })),
+    { handled: true, render: true });
+  assert.deepEqual(fixture.component.render(80), expected, "the click runs exactly the keyboard Enter action");
+  assert.equal(fixture.controller.listPending().length, 2, "opening a question resolves nothing");
+  assert.equal(fixture.done.length, 0);
+});
+
+test("mouse: clicking a choice submits its raw stored label exactly like Enter", async () => {
+  const rawChoice = "**Canary** \u001b[2J lane\\label";
+  const fixture = makeFixture();
+  register(fixture, "Which release lane?", { choices: ["Other", rawChoice] });
+  fixture.component.handleInput(ENTER);
+  const frame = draw(fixture);
+  clickCell(fixture, frame, cellOf(frame, `2. ${visibleTerminalText(rawChoice)}`));
+  await flushDelivery();
+  assert.equal(fixture.sent.length, 1);
+  assert.equal(fixture.sent[0]!.message, `Answer to pending question "Which release lane?": ${rawChoice}`);
+  assert.deepEqual(fixture.done, [{ kind: "submitted", result: { status: "delivered", empty: true } }]);
+});
+
+test("mouse: Type something begins native editing and Decline declines a waiting question", async () => {
+  const fixture = makeFixture();
+  const id = register(fixture, "Which database?", { choices: ["SQLite"], mode: "sync" });
+  const wait = fixture.controller.waitForAnswer(id);
+  fixture.component.handleInput(ENTER);
+  let frame = draw(fixture);
+  clickCell(fixture, frame, cellOf(frame, "Type something…"));
+  assert.equal(fixture.field!.fieldActive, true, "the existing confirm action opened the editing episode");
+  assert.equal(fixture.field!.focused, true);
+  assert.equal(fixture.controller.listPending().length, 1, "starting to type resolves nothing");
+
+  fixture.component.handleInput(ESCAPE); // leave editing through the keyboard path
+  frame = draw(fixture);
+  clickCell(fixture, frame, cellOf(frame, "Decline (no answer will be sent)"));
+  assert.deepEqual(fixture.done, [{ kind: "submitted", result: { status: "declined", empty: true } }]);
+  assert.deepEqual(await wait, { outcome: "declined" });
+  assert.equal(fixture.sent.length, 0, "declining sends nothing to the model");
+});
+
+test("mouse: notice rows, More details, and Close run their existing notice actions", () => {
+  const fixture = makeFixture();
+  register(fixture, "Which database?", { choices: ["SQLite"] });
+  const noticeId = registerNotice(fixture, "A retained detail row.");
+  const notice = fixture.controller.getPending(noticeId);
+  let frame = draw(fixture);
+  clickCell(fixture, frame, cellOf(frame, `${noticeId}: Scroll regression notice`));
+  frame = draw(fixture);
+  assert.match(plainFrame(frame), /> More details/, "the notice view opened with its default action");
+  clickCell(fixture, frame, cellOf(frame, "Close"));
+  assert.equal(fixture.controller.getPending(noticeId), undefined, "Close removed only the notice");
+  assert.equal(fixture.controller.listPending().length, 1);
+  assert.equal(fixture.done.length, 0, "the list stays open while input remains");
+  assert.match(plainFrame(draw(fixture)), /Pending input \(1\)/);
+
+  const details = makeFixture();
+  const detailsId = registerNotice(details, "Body for details.");
+  const record = details.controller.getPending(detailsId);
+  details.component.handleInput(ENTER);
+  const detailFrame = draw(details);
+  clickCell(details, detailFrame, cellOf(detailFrame, "More details"));
+  assert.equal(details.done.length, 1);
+  const result = details.done[0] as { kind: string; noticeId: string; expectedNotice: unknown };
+  assert.equal(result.kind, "notice-details");
+  assert.equal(result.noticeId, detailsId);
+  assert.equal(result.expectedNotice, record, "the exact notice snapshot is reported for owner-session delivery");
+  assert.notEqual(notice, undefined);
+});
+
+test("mouse: non-left buttons, motion, releases, stray clicks, and wheel never activate", () => {
+  const fixture = makeFixture({ getViewportRows: () => 16 });
+  register(fixture, "Which database?", { choices: ["SQLite", "Postgres", "MySQL", "DuckDB"] });
+  fixture.component.handleInput(ENTER);
+  const frame = draw(fixture);
+  const cell = cellOf(frame, "1. SQLite");
+  const before = fixture.component.render(80);
+
+  for (const button of ["right", "middle"] as const) {
+    assert.deepEqual(fixture.component.handleMouse(pointer(frame, "press", cell.x, cell.y, button)),
+      { handled: true, render: false }, `${button} presses are consumed`);
+    fixture.component.handleMouse(pointer(frame, "release", cell.x, cell.y, button));
+    assert.deepEqual(fixture.component.handleMouse(pointer(frame, "click", cell.x, cell.y, button, { clickCount: 1 })),
+      { handled: true, render: false }, `${button} clicks never activate`);
+  }
+  for (const type of ["move", "drag", "release"] as const) {
+    assert.deepEqual(fixture.component.handleMouse(pointer(frame, type, cell.x, cell.y, type === "move" ? "none" : "left")),
+      { handled: true, render: false }, `${type} events inside the popup are consumed without effect`);
+  }
+  assert.deepEqual(fixture.component.handleMouse(pointer(frame, "click", cell.x, cell.y, "left", { clickCount: 1 })),
+    { handled: true, render: false }, "a click with no paired press in this popup never activates");
+  // Scrolling stays keyboard-only: wheel is never handled, so it neither
+  // activates nor scrolls the popup body.
+  for (const wheelDelta of [1, -1, 3]) {
+    assert.equal(fixture.component.handleMouse(pointer(frame, "wheel", cell.x, cell.y, "none", { wheelDelta } as Partial<PopupMouseEvent>)),
+      undefined, "wheel policy is left to the host");
+  }
+  assert.deepEqual(fixture.component.render(80), before, "nothing highlighted or scrolled");
+  assert.equal(fixture.controller.listPending().length, 1);
+  assert.equal(fixture.done.length, 0);
+});
+
+test("mouse: header, blank, rule, padding, hint, side-padding, and trailing blank cells are not items", () => {
+  const fixture = makeFixture({ getViewportRows: () => 20 });
+  register(fixture, "Which database?", { choices: ["SQLite"] });
+  fixture.component.handleInput(ENTER);
+  const frame = draw(fixture, 40);
+  const choice = cellOf(frame, "1. SQLite");
+  const hint = cellOf(frame, "arrows select");
+  const header = cellOf(frame, "q1:");
+  const blankRow = frame.lines.findIndex((line, index) => index > header.y && plainRow(line).trim() === "");
+  const drawnEnd = choice.x + "1. SQLite".length;
+  const hintRows = frame.lines.flatMap((line, index) => (index >= hint.y && index < frame.lines.length - 2 ? [index] : []));
+  assert.ok(hintRows.length > 1, `the fixed hint wraps onto several rows at width 40:\n${plainFrame(frame)}`);
+  const misses: Array<[string, number, number]> = [
+    ["top rule", 3, 0],
+    ["top padding row", 3, 1],
+    ["question header", header.x, header.y],
+    ["blank separator row", 3, blankRow],
+    ["blank row between body and fixed hint", 3, hint.y - 1],
+    ...hintRows.map((y): [string, number, number] => [`fixed hint row ${y}`, 3, y]),
+    ["bottom rule", 3, frame.lines.length - 1],
+    ["bottom padding row", 3, frame.lines.length - 2],
+    ["left side padding", 0, choice.y],
+    ["trailing blank after the label", drawnEnd, choice.y],
+    ["right side padding", 39, choice.y],
+    ["outside the frame", 3, frame.lines.length],
+  ];
+  for (const [name, x, y] of misses) {
+    const results = clickCell(fixture, frame, { x, y });
+    assert.deepEqual(results[0], { handled: true, render: false }, `${name}: the press is consumed without highlight`);
+    assert.deepEqual(results[2], { handled: true, render: false }, `${name}: the click does nothing`);
+  }
+  assert.equal(fixture.controller.listPending().length, 1);
+  assert.equal(fixture.sent.length, 0);
+  // The last drawn label cell is still the item.
+  clickCell(fixture, frame, { x: drawnEnd - 1, y: choice.y });
+  assert.equal(fixture.controller.listPending().length, 0);
+});
+
+test("mouse: every visible line of a wrapped choice maps to it, and a drag-off cancels", async () => {
+  const longChoice = "Use the managed Postgres cluster with read replicas in every region we deploy to";
+  const fixture = makeFixture();
+  register(fixture, "Which database?", { choices: ["SQLite", longChoice] });
+  fixture.component.handleInput(ENTER);
+  const frame = draw(fixture, 32);
+  const first = cellOf(frame, "2. Use");
+  const continuation = frame.lines.slice(first.y + 1).findIndex((line) => plainRow(line).startsWith("   ") && plainRow(line).trim().length > 0);
+  assert.ok(continuation >= 0, `the choice wraps: ${plainFrame(frame)}`);
+  const lastY = first.y + 1 + continuation;
+
+  // Press on the wrapped continuation, drag away, release elsewhere: no click.
+  fixture.component.handleMouse(pointer(frame, "press", 5, lastY));
+  assert.match(fixture.component.render(32).map(plainRow).join("\n"), /> 2\. Use/, "the continuation press highlights its choice");
+  fixture.component.handleMouse(pointer(frame, "drag", 5, lastY + 1));
+  fixture.component.handleMouse(pointer(frame, "release", 5, lastY + 1));
+  assert.equal(fixture.controller.listPending().length, 1, "a drag-off never activates");
+
+  clickCell(fixture, frame, { x: 5, y: lastY });
+  await flushDelivery();
+  assert.equal(fixture.sent[0]?.message, `Answer to pending question "Which database?": ${longChoice}`);
+});
+
+test("mouse: wide labels and sub-padding widths hit exactly their drawn cells", () => {
+  const fixture = makeFixture({ tuiHost: makeRealWidthTuiHost() });
+  register(fixture, "Which?", { choices: ["数据库选择"] });
+  fixture.component.handleInput(ENTER);
+  const frame = draw(fixture, 30);
+  const cell = cellOf(frame, "1. 数据库选择");
+  const lastCell = cell.x + realTextHelpers.visibleWidth("1. 数据库选择") - 1;
+  const results = clickCell(fixture, frame, { x: lastCell + 1, y: cell.y });
+  assert.deepEqual(results[2], { handled: true, render: false }, "the cell after the last wide glyph is blank");
+  assert.equal(fixture.controller.listPending().length, 1);
+  clickCell(fixture, frame, { x: lastCell, y: cell.y });
+  assert.equal(fixture.controller.listPending().length, 0, "the second cell of the last wide glyph is drawn label");
+
+  // Below three cells the frame has no side padding and notice actions draw
+  // their selection marker on its own row; the marker and every label row
+  // belong to that action.
+  const narrow = makeFixture({ tuiHost: makeRealWidthTuiHost() });
+  const noticeId = registerNotice(narrow, "Body.");
+  narrow.component.handleInput(ENTER);
+  const tiny = draw(narrow, 2);
+  assert.ok(tiny.lines.every((line) => realTextHelpers.visibleWidth(line) <= 2));
+  const rows = tiny.lines.map(plainRow);
+  const closeStart = rows.findIndex((row, index) => row === "Cl" && rows[index + 1] === "os");
+  assert.ok(closeStart > 0, `Close is wrapped at width 2: ${JSON.stringify(rows)}`);
+  const blankAfterE = clickCell(narrow, tiny, { x: 1, y: closeStart + 2 });
+  assert.deepEqual(blankAfterE[2], { handled: true, render: false }, "the blank cell after the final \"e\" is not Close");
+  assert.notEqual(narrow.controller.getPending(noticeId), undefined);
+  clickCell(narrow, tiny, { x: 0, y: closeStart + 2 }); // "e" of Close
+  assert.equal(narrow.controller.getPending(noticeId), undefined, "the last wrapped Close cell runs Close");
+});
+
+test("mouse: scrolled viewports map rows through the authoritative offset, not the keyboard selection", async () => {
+  const fixture = makeFixture({ getViewportRows: () => 7 });
+  register(fixture, "Pick one?", { choices: ["alpha", "beta", "gamma", "delta"] });
+  fixture.component.handleInput(ENTER);
+  // One body row remains above the two fixed hint rows: page until it draws
+  // the unselected second choice, with the selected first choice offscreen.
+  const frame = pageUntil(fixture, 80, (current) => plainFrame(current).includes("  2. beta"));
+  assert.doesNotMatch(plainFrame(frame), /1\. alpha/, "the keyboard selection is scrolled away");
+  const { body, hint } = splitFixedHint(frameInterior(frame.lines.map(plainRow)), ANSWER_KEY_HINT, 7);
+  assert.deepEqual(body, ["  2. beta"], "exactly one body row is visible");
+  assert.ok(hint.join(" ").includes("Esc back"), "the fixed hint stays below the body");
+  const beta = cellOf(frame, "2. beta");
+  fixture.component.handleMouse(pointer(frame, "press", beta.x, beta.y));
+  const pressed = draw(fixture);
+  assert.deepEqual(splitFixedHint(frameInterior(pressed.lines.map(plainRow)), ANSWER_KEY_HINT, 7).body, ["> 2. beta"],
+    "the press highlights the visible row and never reveals or scrolls");
+  fixture.component.handleMouse(pointer(frame, "release", beta.x, beta.y));
+  fixture.component.handleMouse(pointer(frame, "click", beta.x, beta.y, "left", { clickCount: 1 }));
+  await flushDelivery();
+  assert.equal(fixture.sent[0]?.message, `Answer to pending question "Pick one?": beta`);
+});
+
+test("mouse: fixed hint rows below a scrolled body stay inert while the body rows above them map exactly", async () => {
+  const fixture = makeFixture({ getViewportRows: () => 9 });
+  const choices = Array.from({ length: 8 }, (_, index) => `option-${index + 1}`);
+  register(fixture, "Which option?", { choices });
+  fixture.component.handleInput(ENTER);
+  const frame = pageUntil(fixture, 80, (current) => /  [56]\. option-[56]/.test(plainFrame(current)));
+  const interior = frameInterior(frame.lines.map(plainRow));
+  const { body, hint } = splitFixedHint(interior, ANSWER_KEY_HINT, 9);
+  assert.ok(hint.length > 0 && body.length > 0, `body and fixed hint are both drawn:\n${plainFrame(frame)}`);
+  // Content continues below the body, but the cells directly under it draw
+  // the fixed hint, which belongs to no item.
+  assert.ok(!body.some((row) => row.includes("Decline")), "later items are hidden below the body");
+  const firstHintY = frame.lines.findIndex((line) => plainRow(line).includes(hint.find((row) => row.trim().length > 0)!.trim()));
+  for (let y = firstHintY - 1; y < frame.lines.length; y += 1) {
+    const results = clickCell(fixture, frame, { x: 4, y });
+    assert.deepEqual(results[0], { handled: true, render: false }, `row ${y} below the body is inert`);
+    assert.deepEqual(results[2], { handled: true, render: false });
+  }
+  assert.equal(fixture.sent.length, 0);
+  const lastBodyRow = body[body.length - 1]!;
+  const label = /(\d+)\. (option-\d+)/.exec(lastBodyRow);
+  assert.ok(label, `the last body row is a choice: ${JSON.stringify(body)}`);
+  clickCell(fixture, frame, cellOf(frame, `${label[1]}. ${label[2]}`));
+  await flushDelivery();
+  assert.equal(fixture.sent[0]?.message, `Answer to pending question "Which option?": ${label[2]}`,
+    "the last visible body row answers with exactly the choice it draws");
+});
+
+test("mouse: tiny budgets without padding or rules map only their remaining body rows", async () => {
+  for (const rows of [4, 3, 2, 1]) {
+    const fixture = makeFixture({ getViewportRows: () => rows });
+    register(fixture, "Tiny?", { choices: ["alpha", "beta"] });
+    fixture.component.handleInput(ENTER);
+    const frame = pageUntil(fixture, 60, (current) => plainFrame(current).includes("2. beta"));
+    assert.equal(frame.lines.length, rows, `${rows} rows: the frame uses the whole tiny budget`);
+    const plain = frame.lines.map(plainRow);
+    const betaY = plain.findIndex((row) => row.includes("2. beta"));
+    for (const [y, row] of plain.entries()) {
+      if (y === betaY) continue;
+      const results = clickCell(fixture, frame, { x: Math.max(0, row.search(/\S/)), y });
+      assert.deepEqual(results[2], { handled: true, render: false }, `${rows} rows: row ${y} (${JSON.stringify(row)}) is inert`);
+    }
+    if (rows <= 2) {
+      assert.ok(!plain.some((row) => /^─+$/.test(row)), `${rows} rows: the rules gave way to content`);
+    }
+    assert.equal(fixture.sent.length, 0);
+    clickCell(fixture, frame, cellOf(frame, "2. beta"));
+    await flushDelivery();
+    assert.equal(fixture.sent[0]?.message, `Answer to pending question "Tiny?": beta`, `${rows} rows: the body row acts`);
+  }
+});
+
+test("mouse: a press keeps the scroll offset and reveal state; keyboard selection later reveals from the pressed row", () => {
+  const fixture = makeFixture({ getViewportRows: () => 10 });
+  for (let index = 1; index <= 9; index += 1) register(fixture, `Question ${index}?`, { choices: ["x"] });
+  // The list opens revealing q1; page down until q1 is offscreen.
+  const frame = pageUntil(fixture, 80, (current) => !plainFrame(current).includes("q1: Question 1?"));
+  const before = frame.lines.map(plainRow);
+  const target = /\s(q\d): Question \d\?/.exec(before.find((row) => /\s{3}q\d: /.test(row)) ?? "");
+  assert.ok(target, `an unselected row is visible:\n${before.join("\n")}`);
+  const cell = cellOf(frame, `${target[1]}:`);
+  fixture.component.handleMouse(pointer(frame, "press", cell.x, cell.y));
+  const after = draw(fixture).lines.map(plainRow);
+  assert.equal(after.length, before.length);
+  for (const [y, row] of after.entries()) {
+    if (y === cell.y) assert.equal(row, before[y]!.replace(`  ${target[1]}:`, `> ${target[1]}:`), "only the pressed row's marker changes");
+    else assert.equal(row, before[y], `row ${y} did not move: no reveal, reflow, or scroll`);
+  }
+  // A drag-off cancels the click but keeps the pressed selection, which the
+  // keyboard then moves and reveals as usual.
+  fixture.component.handleMouse(pointer(frame, "drag", cell.x, cell.y + 1));
+  fixture.component.handleMouse(pointer(frame, "release", cell.x, cell.y + 1));
+  assert.deepEqual(draw(fixture).lines.map(plainRow), after, "a drag-off release changes nothing visible");
+  fixture.component.handleInput(UP);
+  const next = `q${Number(target[1]!.slice(1)) - 1}:`;
+  assert.match(plainFrame(draw(fixture)), new RegExp(`> ${next}`), "Up moves from the pressed row and reveals it");
+  assert.equal(fixture.controller.listPending().length, 9);
+});
+
+test("mouse: resized, mismatched, or shifted frames between press and click never activate", () => {
+  let rows = 20;
+  const fixture = makeFixture({ getViewportRows: () => rows });
+  register(fixture, "First question?", { choices: ["a"] });
+  register(fixture, "Second question?", { choices: ["b"] });
+  let frame = draw(fixture);
+  let cell = cellOf(frame, "q2: Second question?");
+
+  // Bounds that do not match the last composited frame are rejected.
+  const mismatched = fixture.component.handleMouse({ ...pointer(frame, "press", cell.x, cell.y), width: 79 });
+  assert.deepEqual(mismatched, { handled: true, render: false });
+
+  // A resize render between press and click.
+  clickCell(fixture, frame, cell, { between: () => fixture.component.render(60) });
+  assert.match(plainFrame(draw(fixture)), /Pending input \(2\)/, "a width change cancels the click");
+
+  // A viewport-budget change between press and click (rows-only resize):
+  // the compact natural height is unchanged, but the budget differs.
+  frame = draw(fixture);
+  cell = cellOf(frame, "q2: Second question?");
+  clickCell(fixture, frame, cell, {
+    between: () => {
+      rows = 18;
+      assert.equal(fixture.component.render(80).length, frame.lines.length, "the compact popup keeps its natural height");
+    },
+  });
+  assert.match(plainFrame(draw(fixture)), /Pending input \(2\)/, "a viewport change cancels the click");
+
+  // The list shifts under the pointer between press and click.
+  frame = draw(fixture);
+  cell = cellOf(frame, "q2: Second question?");
+  clickCell(fixture, frame, cell, {
+    between: () => {
+      fixture.component.handleMouse(pointer(frame, "move", cell.x, cell.y, "none"));
+      fixture.controller.submitDecline("q1");
+      fixture.component.render(80);
+    },
+  });
+  assert.equal(fixture.controller.listPending().length, 1);
+  assert.match(plainFrame(draw(fixture)), /Pending input \(1\)/, "a shifted row under the pointer cancels the click");
+
+  // A press, render with the highlight, then click on the unchanged geometry acts.
+  frame = draw(fixture);
+  cell = cellOf(frame, "q2: Second question?");
+  clickCell(fixture, frame, cell, { between: () => fixture.component.render(80) });
+  const answered = plainFrame(draw(fixture));
+  assert.match(answered, /^ q2:/m, "the pressed question's answer view opened");
+  assert.doesNotMatch(answered, /Pending input/);
+});
+
+test("mouse: removed records and rebound sessions never answer another record", async () => {
+  const fixture = makeFixture();
+  register(fixture, "Old question?", { choices: ["old"] });
+  fixture.component.handleInput(ENTER);
+  const frame = draw(fixture);
+  const cell = cellOf(frame, "1. old");
+  fixture.component.handleMouse(pointer(frame, "press", cell.x, cell.y));
+  // Session reset reuses the per-session ID before any render happens.
+  fixture.controller.beginSession({ sessionManager: "replacement" });
+  const replacement = fixture.controller.register(
+    { toolCallId: "t-new", question: "Replacement question?", choices: ["old"], mode: "async" },
+    { sessionManager: "replacement" },
+  );
+  assert.ok(!replacement.ok, "a foreign identity cannot register into the replacement");
+  fixture.component.handleMouse(pointer(frame, "release", cell.x, cell.y));
+  fixture.component.handleMouse(pointer(frame, "click", cell.x, cell.y, "left", { clickCount: 1 }));
+  await flushDelivery();
+  assert.equal(fixture.sent.length, 0, "the stale frame never submits");
+
+  let stale = false;
+  const fenced = makeFixture({ isStale: () => stale });
+  register(fenced, "Fenced question?", { choices: ["yes"] });
+  fenced.component.handleInput(ENTER);
+  const fencedFrame = draw(fenced);
+  const fencedCell = cellOf(fencedFrame, "1. yes");
+  fenced.component.handleMouse(pointer(fencedFrame, "press", fencedCell.x, fencedCell.y));
+  stale = true;
+  fenced.component.handleMouse(pointer(fencedFrame, "release", fencedCell.x, fencedCell.y));
+  assert.deepEqual(fenced.done, [{ kind: "closed" }], "a rebound popup closes on pointer input without submitting");
+  assert.equal(fenced.component.handleMouse(pointer(fencedFrame, "click", fencedCell.x, fencedCell.y)), undefined,
+    "a closed popup intercepts nothing");
+  await flushDelivery();
+  assert.equal(fenced.sent.length, 0);
+  assert.equal(fenced.controller.listPending().length, 1);
+
+  // Same session, same ID, replaced record: the snapshot identity differs.
+  const reused = makeFixture();
+  register(reused, "First?", { choices: ["one"] });
+  const reusedFrame = draw(reused);
+  const reusedCell = cellOf(reusedFrame, "q1: First?");
+  reused.controller.beginSession(reused.identity);
+  register(reused, "Different?", { choices: ["two"] });
+  clickCell(reused, reusedFrame, reusedCell);
+  assert.match(plainFrame(draw(reused)), /Pending input \(1\)/,
+    "a reused ID never opens the replacement record from an old frame");
+});
+
+test("mouse: one gesture activates once; a quick second click on new content needs its own press", async () => {
+  const fixture = makeFixture();
+  register(fixture, "First?", { choices: ["one"] });
+  register(fixture, "Second?", { choices: ["two"] });
+  const frame = draw(fixture);
+  const cell = cellOf(frame, "q1: First?");
+  clickCell(fixture, frame, cell);
+  // A repeated click event with no new press, and a double click whose press
+  // lands before the answer view was drawn, both stay inert.
+  assert.deepEqual(fixture.component.handleMouse(pointer(frame, "click", cell.x, cell.y, "left", { clickCount: 2 })),
+    { handled: true, render: false });
+  clickCell(fixture, frame, cell, { clickCount: 2 });
+  await flushDelivery();
+  assert.equal(fixture.controller.listPending().length, 2, "no answer was chosen by the repeated click");
+  assert.equal(fixture.sent.length, 0);
+});
+
+test("mouse: keyboard input cancels a pending gesture and keyboard parity holds under remapped bindings", async () => {
+  const remapped = makeKeybindings({
+    "tui.select.confirm": [TAB],
+    "tui.select.down": ["j"],
+    "tui.select.up": ["k"],
+  });
+  const fixture = makeFixture({ keybindings: remapped });
+  register(fixture, "First?", { choices: ["one", "two"] });
+  let frame = draw(fixture);
+  const cell = cellOf(frame, "q1: First?");
+  fixture.component.handleMouse(pointer(frame, "press", cell.x, cell.y));
+  fixture.component.handleInput("j"); // keyboard during the gesture
+  fixture.component.handleMouse(pointer(frame, "release", cell.x, cell.y));
+  fixture.component.handleMouse(pointer(frame, "click", cell.x, cell.y));
+  assert.match(plainFrame(draw(fixture)), /Pending input \(1\)/, "the interrupted gesture is cancelled");
+
+  fixture.component.handleInput(ENTER);
+  assert.match(plainFrame(draw(fixture)), /Pending input \(1\)/, "a remapped-away Enter does not confirm");
+  clickCell(fixture, frame, cell);
+  frame = draw(fixture);
+  assert.match(plainFrame(frame), /> 1\. one/, "the click opens the answer view regardless of key remaps");
+  // A pointer press moves the selection the keyboard then confirms.
+  const two = cellOf(frame, "2. two");
+  fixture.component.handleMouse(pointer(frame, "press", two.x, two.y));
+  fixture.component.handleMouse(pointer(frame, "drag", two.x + 1, two.y));
+  fixture.component.handleMouse(pointer(frame, "release", two.x + 1, two.y));
+  fixture.component.handleInput(TAB);
+  await flushDelivery();
+  assert.equal(fixture.sent[0]?.message, `Answer to pending question "First?": two`);
+});
+
+test("mouse: while editing, the editor box is inert and a clicked menu row leaves editing then runs its action", async () => {
+  const fixture = makeFixture();
+  register(fixture, "Which database?", { choices: ["SQLite", "Postgres"] });
+  register(fixture, "Another?", { choices: ["x"] });
+  fixture.component.handleInput(ENTER);
+  fixture.component.handleInput(DOWN);
+  fixture.component.handleInput(DOWN); // Type something…
+  fixture.component.handleInput(ENTER); // start editing
+  for (const char of "my draft") fixture.component.handleInput(char);
+  let frame = draw(fixture);
+  const box = cellOf(frame, "[field:my draft]");
+
+  // Clicking inside the native editor box never submits or changes the draft.
+  clickCell(fixture, frame, { x: box.x + 2, y: box.y });
+  assert.equal(fixture.field!.fieldActive, true, "editing continues");
+  assert.equal(fixture.field!.getText(), "my draft");
+  assert.equal(fixture.controller.listPending().length, 2);
+  assert.equal(fixture.sent.length, 0);
+
+  // A press on a visible choice highlights it without touching the field.
+  frame = draw(fixture);
+  const postgres = cellOf(frame, "2. Postgres");
+  fixture.component.handleMouse(pointer(frame, "press", postgres.x, postgres.y));
+  const pressed = plainFrame(draw(fixture));
+  assert.match(pressed, /> 2\. Postgres/, "the pressed menu row is highlighted");
+  assert.match(pressed, /\[field:my draft\]/, "the native editor box stays in place");
+  assert.equal(fixture.field!.fieldActive, true);
+  assert.equal(fixture.field!.focused, true, "the native field keeps focus during the press");
+  assert.equal(fixture.field!.getText(), "my draft");
+
+  // Drag-off clears the highlight; native keyboard editing is unchanged.
+  fixture.component.handleMouse(pointer(frame, "drag", postgres.x, postgres.y + 1));
+  fixture.component.handleMouse(pointer(frame, "release", postgres.x, postgres.y + 1));
+  assert.doesNotMatch(plainFrame(draw(fixture)), /> 2\. Postgres/);
+  fixture.component.handleInput("!");
+  assert.equal(fixture.field!.getText(), "my draft!", "typing still reaches the native field");
+  assert.equal(fixture.field!.inputLog.filter((data) => data.startsWith("\x1b[<")).length, 0,
+    "no pointer bytes reached the native field");
+
+  // A completed click on the choice leaves editing (draft kept) and submits the choice.
+  frame = draw(fixture);
+  clickCell(fixture, frame, cellOf(frame, "2. Postgres"));
+  await flushDelivery();
+  assert.equal(fixture.sent.length, 1);
+  assert.equal(fixture.sent[0]!.message, `Answer to pending question "Which database?": Postgres`);
+  assert.equal(fixture.field!.fieldActive, false, "editing ended");
+  assert.equal(fixture.field!.getText(), "my draft!", "the draft was kept, never submitted");
+  assert.equal(fixture.controller.listPending().length, 1, "only the clicked question resolved");
+
+  // Decline is equally clickable while editing.
+  const declining = makeFixture();
+  register(declining, "Decline me?", { choices: ["a"] });
+  declining.component.handleInput(ENTER);
+  declining.component.handleInput(DOWN);
+  declining.component.handleInput(ENTER);
+  for (const char of "draft") declining.component.handleInput(char);
+  const declineFrame = draw(declining);
+  clickCell(declining, declineFrame, cellOf(declineFrame, "Decline (no answer will be sent)"));
+  assert.deepEqual(declining.done, [{ kind: "submitted", result: { status: "declined", empty: true } }]);
+  assert.equal(declining.field!.getText(), "draft");
+});
+
+test("mouse: while editing in a bounded popup, a press highlight keeps the cursor-revealed offset", () => {
+  const fixture = makeFixture({ getViewportRows: () => 12 });
+  const choices = Array.from({ length: 6 }, (_, index) => `option-${index + 1}`);
+  register(fixture, "Which option?", { choices });
+  fixture.component.handleInput(ENTER);
+  for (let step = 0; step < choices.length; step += 1) fixture.component.handleInput(DOWN); // Type something…
+  fixture.component.handleInput(ENTER);
+  for (const char of "draft") fixture.component.handleInput(char);
+  const frame = draw(fixture);
+  const before = frame.lines.map(plainRow);
+  assert.ok(before.some((row) => row.includes("[field:draft]")), `the editing cursor is revealed:\n${before.join("\n")}`);
+  const visible = /(\d+)\. (option-\d+)/.exec(before.find((row) => /\d+\. option-/.test(row)) ?? "");
+  assert.ok(visible, "a choice is visible above the editor");
+  const cell = cellOf(frame, `${visible[1]}. ${visible[2]}`);
+  fixture.component.handleMouse(pointer(frame, "press", cell.x, cell.y));
+  const after = draw(fixture).lines.map(plainRow);
+  for (const [y, row] of after.entries()) {
+    if (y === cell.y) assert.match(row, new RegExp(`> ${visible[1]}\\. ${visible[2]}`));
+    else assert.equal(row, before[y], `row ${y} is unchanged by the press`);
+  }
+  fixture.component.handleMouse(pointer(frame, "release", cell.x, cell.y + 5));
+  assert.deepEqual(draw(fixture).lines.map(plainRow), before, "the release restores the exact editing frame");
+  assert.equal(fixture.field!.fieldActive, true);
+});
+
+test("mouse: a terminal resize before the redraw invalidates the gesture; a fresh click after redraw acts", async () => {
+  for (const resize of [
+    { name: "width-only", columns: 72, rows: 30 },
+    { name: "height-only", columns: 80, rows: 26 },
+  ]) {
+    let size: { columns: number; rows: number } | undefined = { columns: 80, rows: 30 };
+    const fixture = makeFixture({ getTerminalSize: () => size, getViewportRows: () => 28 });
+    register(fixture, "Which database?", { choices: ["SQLite"] });
+    fixture.component.handleInput(ENTER);
+    let frame = draw(fixture);
+    let cell = cellOf(frame, "1. SQLite");
+    // Press, then the terminal resizes; the release and click arrive before
+    // any redraw with the press-time bounds the host retargets them to.
+    clickCell(fixture, frame, cell, { between: () => { size = { columns: resize.columns, rows: resize.rows }; } });
+    await flushDelivery();
+    assert.equal(fixture.sent.length, 0, `${resize.name}: no answer is submitted from stale geometry`);
+    assert.equal(fixture.controller.listPending().length, 1);
+    // A new press on the not-yet-redrawn frame is inert as well.
+    const stalePress = fixture.component.handleMouse(pointer(frame, "press", cell.x, cell.y));
+    assert.deepEqual(stalePress, { handled: true, render: false }, `${resize.name}: a press before redraw does not highlight`);
+    fixture.component.handleMouse(pointer(frame, "release", cell.x, cell.y));
+    fixture.component.handleMouse(pointer(frame, "click", cell.x, cell.y));
+    assert.equal(fixture.controller.listPending().length, 1);
+
+    // After the host redraws at the new size, a fresh click works.
+    frame = draw(fixture, resize.columns);
+    cell = cellOf(frame, "1. SQLite");
+    clickCell(fixture, frame, cell);
+    await flushDelivery();
+    assert.equal(fixture.sent[0]?.message, `Answer to pending question "Which database?": SQLite`, `${resize.name}: fresh click acts`);
+
+    // An unknown live size never matches a recorded one.
+    const unknown = makeFixture({ getTerminalSize: () => size, getViewportRows: () => 28 });
+    register(unknown, "Unknown size?", { choices: ["no"] });
+    unknown.component.handleInput(ENTER);
+    const unknownFrame = draw(unknown);
+    size = undefined;
+    clickCell(unknown, unknownFrame, cellOf(unknownFrame, "1. no"));
+    assert.equal(unknown.controller.listPending().length, 1, `${resize.name}: an unreadable terminal size fails closed`);
+  }
+});
+
+test("mouse: a resize keeps the clamped offset for the answer view and clicks map the re-wrapped rows", async () => {
+  let rows = 12;
+  const fixture = makeFixture({ getViewportRows: () => rows });
+  const choices = Array.from({ length: 8 }, (_, index) => `option-${index + 1}`);
+  register(fixture, "Which option?", { choices });
+  fixture.component.handleInput(ENTER);
+  const scrolled = pageUntil(fixture, 80, (current) => plainFrame(current).includes("Decline"));
+  assert.doesNotMatch(plainFrame(scrolled), /1\. option-1/, "the selected first choice is scrolled away");
+  // Narrow and shorten: the re-wrapped content keeps the clamped offset and
+  // the non-editing answer selection is not re-revealed, so the old Decline
+  // cell no longer draws Decline.
+  rows = 11;
+  const resized = draw(fixture, 64);
+  assert.doesNotMatch(plainFrame(resized), /1\. option-1/, "the non-editing answer selection is not re-revealed");
+  assert.doesNotMatch(plainFrame(resized), /Decline/, "the re-wrapped body moved Decline below the clamped offset");
+  const bodyRows = splitFixedHint(frameInterior(resized.lines.map(plainRow)), ANSWER_KEY_HINT, 11).body;
+  const label = /(\d+)\. (option-\d+)/.exec(bodyRows.find((row) => /\d+\. option-/.test(row)) ?? "");
+  assert.ok(label && label[1] !== "1", `a later choice is drawn after the resize:\n${plainFrame(resized)}`);
+  // A gesture recorded on the pre-resize frame never acts on the new one.
+  const stale = cellOf(scrolled, "Decline");
+  clickCell(fixture, { lines: scrolled.lines, width: 80 }, stale);
+  assert.equal(fixture.sent.length, 0);
+  clickCell(fixture, resized, cellOf(resized, `${label[1]}. ${label[2]}`));
+  await flushDelivery();
+  assert.equal(fixture.sent[0]?.message, `Answer to pending question "Which option?": ${label[2]}`);
+});
+
+test("mouse: a narrow notice press highlights without reflowing the wrapped actions; the click acts once", () => {
+  const accent = "\x1b[36m";
+  const theme: QuestionUiTheme = {
+    fg: (color, text) => (color === "accent" ? `${accent}${text}\x1b[39m` : text),
+    bold: (text) => text,
+  };
+  for (const width of [2, 3]) {
+    const fixture = makeFixture({ tuiHost: makeRealWidthTuiHost(), theme });
+    register(fixture, "Keep me?", { choices: ["keep"] });
+    const noticeId = registerNotice(fixture, "Body.");
+    fixture.component.handleInput(DOWN);
+    fixture.component.handleInput(ENTER);
+    const frame = draw(fixture, width);
+    const before = frame.lines.map(plainRow);
+    const markerY = before.findIndex((row) => row.trim() === ">");
+    assert.ok(markerY >= 0, `width ${width}: the selected More details draws its marker row: ${JSON.stringify(before)}`);
+    const closeStart = before.findIndex((_, index) => index > markerY
+      && before.slice(index).map((row) => row.trim()).join("").startsWith("Close"));
+    assert.ok(closeStart > markerY + 1, `width ${width}: Close is drawn below More details: ${JSON.stringify(before)}`);
+    const x = width >= 3 ? 1 : 0; // the drawn cell after any side padding
+    let closeRows = 0;
+    while (before.slice(closeStart, closeStart + closeRows).map((row) => row.trim()).join("") !== "Close") closeRows += 1;
+
+    // Press Close, then the host redraws before the release arrives.
+    const press = fixture.component.handleMouse(pointer(frame, "press", x, closeStart));
+    assert.deepEqual(press, { handled: true, render: true });
+    const pressedFrame = draw(fixture, width);
+    assert.deepEqual(pressedFrame.lines.map(plainRow), before,
+      `width ${width}: no row moved, appeared, or disappeared during press feedback`);
+    for (let row = closeStart; row < closeStart + closeRows; row += 1) {
+      assert.ok(pressedFrame.lines[row]!.includes(accent), `width ${width}: pressed Close row ${row} is highlighted`);
+    }
+    assert.ok(!frame.lines[closeStart]!.includes(accent), `width ${width}: Close was not highlighted before the press`);
+    assert.equal(pressedFrame.lines.length, frame.lines.length);
+
+    assert.deepEqual(fixture.component.handleMouse(pointer(pressedFrame, "release", x, closeStart)), { handled: true, render: true });
+    assert.deepEqual(draw(fixture, width).lines, frame.lines, `width ${width}: the release restores the exact frame`);
+    assert.deepEqual(fixture.component.handleMouse(pointer(pressedFrame, "click", x, closeStart, "left", { clickCount: 1 })),
+      { handled: true, render: true }, `width ${width}: the paired click activates`);
+    assert.equal(fixture.controller.getPending(noticeId), undefined, `width ${width}: Close removed the notice`);
+    assert.equal(fixture.controller.listPending().length, 1);
+    // A repeated click without its own press never acts again.
+    assert.deepEqual(fixture.component.handleMouse(pointer(pressedFrame, "click", x, closeStart, "left", { clickCount: 2 })),
+      { handled: true, render: false });
+    assert.equal(fixture.controller.listPending().length, 1, `width ${width}: exactly one activation`);
+    assert.equal(fixture.done.length, 0);
+    assert.equal(fixture.sent.length, 0);
+
+    // A drag-off from a narrow press leaves the keyboard selection where it was.
+    const other = makeFixture({ tuiHost: makeRealWidthTuiHost(), theme });
+    registerNotice(other, "Body.");
+    other.component.handleInput(ENTER);
+    const otherFrame = draw(other, width);
+    assert.deepEqual(otherFrame.lines.map(plainRow), before, `width ${width}: the same notice layout`);
+    assert.deepEqual(other.component.handleMouse(pointer(otherFrame, "press", x, closeStart)), { handled: true, render: true });
+    other.component.handleMouse(pointer(otherFrame, "drag", x, 0));
+    other.component.handleMouse(pointer(otherFrame, "release", x, 0));
+    other.component.handleMouse(pointer(otherFrame, "click", x, 0));
+    assert.deepEqual(draw(other, width).lines, otherFrame.lines, `width ${width}: a cancelled narrow press changes nothing`);
+  }
 });

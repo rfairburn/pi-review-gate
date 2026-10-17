@@ -13,7 +13,7 @@ import { redactBrowserToolInput, redactSensitiveText, redactSensitiveValue } fro
 
 export interface EvidenceState {
   nextSequence: number;
-  /** Bounded monotonic count of external-path observations; not a verified diff. */
+  /** Bounded monotonic count of external or identity-unavailable observations; not a verified diff. */
   externalObservationRevision?: number;
   /** Bounded monotonic count of structured observations naming a mutation candidate. */
   toolObservationRevision?: number;
@@ -392,7 +392,30 @@ export function recordObservedToolEventEvidence(input: {
   isError?: boolean;
 }): void {
   const boundedInput = boundObservedInput(input.toolInput);
-  const extracted = extractCandidatePaths(input.toolName, boundedInput);
+  const inputDetail = detailedToolInput(input.toolName, boundedInput.displayInput, boundedInput.hasGenericData);
+  // Generic fields can still overflow the serialized detail cap. Preserve the
+  // existing display caps for fully retained raw commands/patches: clipping
+  // their formatted display alone does not mean the exact identity was lost.
+  if (boundedInput.hasGenericData && inputDetail?.endsWith("\n[... truncated ...]")) boundedInput.incomplete = true;
+  if (boundedInput.incomplete) {
+    input.state.toolObservationsTruncated = true;
+    input.state.requiresReview = true;
+    recordToolEventObservability(input.state, input.adapter, {
+      mode: "structured",
+      description: "Observed tool input evidence is incomplete: bounded fields, values, or nested data were omitted, or unsupported data/reflection was unavailable. Retained arguments are not a complete account of external scope.",
+    });
+  }
+  // Parse only transient, bounded raw identities, never display-redacted text
+  // or a clipped command/patch whose last token could name a different file.
+  const extracted = extractCandidatePaths(input.toolName, boundedInput.input);
+  if (boundedInput.identitiesUnavailable) {
+    input.state.toolObservationsTruncated = true;
+    input.state.requiresReview = true;
+    recordToolEventObservability(input.state, input.adapter, {
+      mode: "structured",
+      description: "Observed path after-state unavailable: tool input exceeded bounded identity retention. Omitted command, patch, path, or collection entries cannot identify original files. No substitute address was read.",
+    });
+  }
   const root = resolve(input.selectedRoot);
   const observedExternal = extracted.paths.some(({ path }) => {
     if (path.length > MAX_OBSERVED_PATH_LENGTH) return false;
@@ -400,7 +423,9 @@ export function recordObservedToolEventEvidence(input: {
     const absolutePath = isAbsolute(expanded) ? resolve(expanded) : resolve(input.cwd, expanded);
     return isOutsidePath(absolutePath, root);
   });
-  if (observedExternal) {
+  // Omitted identities may be external. Every such observation must invalidate
+  // a prior pass/no-progress comparison, even after the event window fills.
+  if (observedExternal || boundedInput.identitiesUnavailable || boundedInput.incomplete) {
     const revision = input.state.externalObservationRevision ?? 0;
     if (revision < MAX_EXTERNAL_OBSERVATION_REVISION) input.state.externalObservationRevision = revision + 1;
     else input.state.toolObservationsTruncated = true;
@@ -431,10 +456,10 @@ export function recordObservedToolEventEvidence(input: {
     adapter: truncate(redactSensitiveText(input.adapter), 100),
     ...(input.observationId ? { observationId: truncate(redactSensitiveText(input.observationId), 200) } : {}),
     summary: input.stage === "start"
-      ? summarizeToolInput(input.toolName, boundedInput)
+      ? summarizeToolInput(input.toolName, boundedInput.displayInput, boundedInput.hasGenericData)
       : summarizeToolResult(boundedResult, input.isError),
     detail: input.stage === "start"
-      ? detailedToolInput(input.toolName, boundedInput)
+      ? inputDetail
       : detailedToolResult(boundedResult),
     candidatePaths,
     riskSignals: unique([...extracted.riskSignals, ...(input.isError && input.stage === "end" ? ["tool_result_error"] : [])]),
@@ -445,6 +470,15 @@ export function recordObservedToolEventEvidence(input: {
   for (const candidate of usableObservedPaths) {
     const expanded = expandHomePath(candidate.path);
     const absolutePath = isAbsolute(expanded) ? resolve(expanded) : resolve(input.cwd, expanded);
+    if (!isObservablePathAddress(candidate.path) || !isObservablePathAddress(absolutePath)) {
+      input.state.toolObservationsTruncated = true;
+      input.state.requiresReview = true;
+      recordToolEventObservability(input.state, input.adapter, {
+        mode: "structured",
+        description: "Observed path after-state unavailable: a redacted, truncated, or marker-bearing address cannot identify the original file. No substitute address was read.",
+      });
+      continue;
+    }
     const rootRelative = relative(root, absolutePath);
     const isOutside = !isWithinRoot(rootRelative) || rootRelative === "";
 
@@ -483,6 +517,16 @@ export async function captureObservedToolPathAfterStates(
   let remainingBytes = snapshotOptions.maxSnapshotBytes;
   for (const evidence of state.candidates.values()) {
     if (!evidence.toolObserved && !evidence.externalSideEffect) continue;
+    // Also fence restored observations: old retained marker strings are not
+    // filesystem identities, even when a same-named decoy happens to exist.
+    if (!isObservablePathAddress(evidence.path) || !isObservablePathAddress(evidence.absolutePath)) {
+      evidence.afterError = "Observed path after-state unavailable: original address was not retained unchanged.";
+      delete evidence.afterSnapshot;
+      delete evidence.afterContentTruncated;
+      state.toolObservationsTruncated = true;
+      state.requiresReview = true;
+      continue;
+    }
     try {
       const snapshot = await createPathSnapshot(selectedRoot, evidence.absolutePath, {
         ...snapshotOptions,
@@ -779,7 +823,8 @@ export function extractCandidatePaths(
 
   const command = commandText(input);
   if (command && SHELL_TOOLS.has(normalizedName)) {
-    const shellPaths = extractShellCandidatePaths(command);
+    const shellPaths = extractShellCandidatePaths(command, normalizedName === "powershell"
+      || (normalizedName === "shellstart" && process.platform === "win32"));
     paths.push(...shellPaths.paths.map((path) => ({ path, source: `${toolName}:command` })));
     riskSignals.push(...shellPaths.riskSignals);
   }
@@ -858,69 +903,164 @@ async function captureExchangeBaseline(
   }
 }
 
-function extractShellCandidatePaths(command: string): { paths: string[]; riskSignals: string[] } {
+function extractShellCandidatePaths(command: string, powershell: boolean): { paths: string[]; riskSignals: string[] } {
   const paths: string[] = [];
   const riskSignals: string[] = [];
+  const tokens = literalShellTokens(command, powershell);
 
-  const redirectionPattern = /(?:^|[\s;])(?:[0-9]?>|>>|&>)\s*(?:"([^"]+)"|'([^']+)'|([^\s|;&<>]+))/g;
-  for (const match of command.matchAll(redirectionPattern)) {
-    const path = match[1] ?? match[2] ?? match[3];
-    if (path) {
-      // Redirecting output at the null sink is an output drop, not a real
-      // write target; the redirection itself stays a recorded risk signal.
-      if (!isNullSinkCandidatePath(path)) paths.push(path);
+  // Operators are separate tokens even when attached to a word. Quoted and
+  // escaped data never supplies operators or additional executable words.
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index]!;
+    if (token.operator && [">", ">>", "&>", "&>>"].includes(token.text)) {
       riskSignals.push("shell_redirection");
+      const target = tokens[index + 1];
+      if (target?.literal && !target.operator && !isNullSinkCandidatePath(target.text)) paths.push(target.text);
     }
+    if (token.operator && ["<<", "<<-"].includes(token.text)) riskSignals.push("heredoc");
   }
 
-  const appendHerePattern = /(?:^|[\s;])tee\s+(?:-[a-zA-Z]+\s+)*(?:"([^"]+)"|'([^']+)'|([^\s|;&<>]+))/g;
-  for (const match of command.matchAll(appendHerePattern)) {
-    const path = match[1] ?? match[2] ?? match[3];
-    if (path && !path.startsWith("-")) {
-      // A tee into the null sink only drops its copy of the stream; the
-      // tee write itself stays a recorded risk signal.
-      if (!isNullSinkCandidatePath(path)) paths.push(path);
-      riskSignals.push("tee_write");
+  let commandStart = true;
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index]!;
+    if (token.operator) {
+      if ([";", "\n", "|", "||", "&&", "&", "(", ")"].includes(token.text)) commandStart = true;
+      else index++; // A redirection operand is data, not a command name.
+      continue;
     }
-  }
-
-  for (const tool of ["touch", "rm", "mkdir"]) {
-    const pattern = new RegExp(`(?:^|[\\s;])${tool}\\s+(?:-[a-zA-Z]+\\s+)*(?:"([^"]+)"|'([^']+)'|([^\\s|;&<>]+))`, "g");
-    for (const match of command.matchAll(pattern)) {
-      const path = match[1] ?? match[2] ?? match[3];
-      if (path) {
-        paths.push(path);
-        riskSignals.push(`shell_${tool}`);
+    if (!commandStart) continue;
+    // Literal POSIX assignments and reserved prefixes preserve command position;
+    // quoted/escaped executable names do not.
+    if (token.assignment || token.commandPrefix) continue;
+    commandStart = false;
+    if (!token.literal) continue;
+    const tool = token.text;
+    const args: ShellLiteralToken[] = [];
+    for (let next = index + 1; next < tokens.length && !tokens[next]!.operator; next++) args.push(tokens[next]!);
+    if (["sed", "perl"].includes(tool) && args.some((arg) => /^-[a-zA-Z]*i\b/.test(arg.text))) {
+      riskSignals.push("in_place_shell_edit");
+    }
+    while (args[0]?.literal && /^-[a-zA-Z]+$/.test(args[0].text)) args.shift();
+    const first = args[0];
+    const second = args[1];
+    if (["tee", "touch", "rm", "mkdir"].includes(tool) && first?.literal) {
+      if (tool !== "tee" || !first.text.startsWith("-")) {
+        if (tool !== "tee" || !isNullSinkCandidatePath(first.text)) paths.push(first.text);
+        riskSignals.push(tool === "tee" ? "tee_write" : `shell_${tool}`);
       }
     }
-  }
-
-  for (const tool of ["cp", "mv"]) {
-    const pattern = new RegExp(`(?:^|[\\s;])${tool}\\s+(?:-[a-zA-Z]+\\s+)*(?:"([^"]+)"|'([^']+)'|([^\\s|;&<>]+))\\s+(?:"([^"]+)"|'([^']+)'|([^\\s|;&<>]+))`, "g");
-    for (const match of command.matchAll(pattern)) {
-      const source = match[1] ?? match[2] ?? match[3];
-      const dest = match[4] ?? match[5] ?? match[6];
-      if (source && tool === "mv") {
-        paths.push(source);
-      }
-      if (dest) {
-        paths.push(dest);
-      }
+    if (["cp", "mv"].includes(tool) && first?.literal && second?.literal) {
+      if (tool === "mv") paths.push(first.text);
+      paths.push(second.text);
       riskSignals.push(`shell_${tool}`);
     }
   }
+  return { paths: unique(paths.filter(isUsefulPathToken)), riskSignals: unique(riskSignals) };
+}
 
-  if (/\b(?:sed|perl)\b[^|;&]*\s-(?:[a-zA-Z]*i|[a-zA-Z]*p[a-zA-Z]*i)\b/.test(command)) {
-    riskSignals.push("in_place_shell_edit");
-  }
-  if (/<<\s*['"]?[A-Za-z0-9_.-]+['"]?/.test(command)) {
-    riskSignals.push("heredoc");
-  }
+interface ShellLiteralToken {
+  text: string;
+  operator?: true;
+  literal?: boolean;
+  assignment?: true;
+  commandPrefix?: true;
+}
 
-  return {
-    paths: unique(paths.filter(isUsefulPathToken)),
-    riskSignals: unique(riskSignals),
-  };
+/** Local lexical handling for easy literal targets, not shell evaluation. No
+ * expansion, dynamic cwd tracking, conditional execution, or shell-wrapper
+ * interpretation is attempted. PowerShell keeps its literal path backslashes;
+ * this small token scan is not a general PowerShell parser either. */
+function literalShellTokens(command: string, powershell: boolean): ShellLiteralToken[] {
+  const tokens: ShellLiteralToken[] = [];
+  const escape = powershell ? "`" : "\\";
+  const heredocs: Array<{ delimiter: string; stripTabs: boolean }> = [];
+  let pendingHeredoc: string | undefined;
+  let index = 0;
+  while (index < command.length) {
+    const char = command[index]!;
+    if (char === "\n") {
+      tokens.push({ text: "\n", operator: true });
+      index++;
+      // A simple heredoc body is data, even when it contains command-shaped
+      // text. Do not run candidate matching over that body.
+      for (const { delimiter, stripTabs } of heredocs.splice(0)) {
+        while (index < command.length) {
+          const end = command.indexOf("\n", index);
+          const line = command.slice(index, end < 0 ? undefined : end);
+          index = end < 0 ? command.length : end + 1;
+          if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter) break;
+        }
+      }
+      continue;
+    }
+    if (/\s/.test(char)) { index++; continue; }
+    if (char === "#") {
+      const end = command.indexOf("\n", index);
+      index = end < 0 ? command.length : end;
+      continue;
+    }
+    // Unquoted digits adjoining a redirection identify its descriptor.
+    const descriptor = !powershell && /^[0-9]+(?=[<>])/.exec(command.slice(index))?.[0];
+    if (descriptor) {
+      index += descriptor.length;
+      continue;
+    }
+    const operator = /^(?:&>>|&>|>>|>&|<<<|<<-|<<|<&|&&|\|\||[<>;|&()])/.exec(command.slice(index))?.[0];
+    if (operator) {
+      tokens.push({ text: operator, operator: true });
+      index += operator.length;
+      pendingHeredoc = !powershell && ["<<", "<<-"].includes(operator) ? operator : undefined;
+      continue;
+    }
+    // Check syntax before quote removal so 'NAME=value' and NA\\ME=value
+    // cannot be mistaken for an unquoted assignment-name prefix.
+    const assignment = !powershell && /^[A-Za-z_][A-Za-z0-9_]*=/.test(command.slice(index));
+    // Only unquoted, standalone reserved prefixes preserve command position.
+    // The extractor checks this flag only while expecting a command name.
+    const commandPrefix = !powershell && /^(?:\{|!)(?=$|[\s<>;|&()])/.test(command.slice(index));
+    let text = "";
+    let literal = true;
+    while (index < command.length && !/[\s<>;|&()]/.test(command[index]!)) {
+      const next = command[index++]!;
+      if (next === "'" || next === '"') {
+        const quote = next;
+        let closed = false;
+        while (index < command.length) {
+          const quoted = command[index++]!;
+          if (quoted === quote) {
+            if (powershell && command[index] === quote) { text += quote; index++; continue; }
+            closed = true;
+            break;
+          }
+          if (quote === '"' && quoted === escape && index < command.length
+            && (powershell || /[$`"\\\n]/.test(command[index]!))) {
+            const escaped = command[index++]!;
+            if (escaped !== "\n") text += escaped;
+          } else {
+            text += quoted;
+            if (quote === '"' && (quoted === "$" || (!powershell && quoted === "`"))) literal = false;
+          }
+        }
+        if (!closed) literal = false;
+      } else if (next === escape && index < command.length) {
+        const escaped = command[index++]!;
+        if (escaped !== "\n") text += escaped;
+      } else {
+        text += next;
+        if (/[$*?\[]/.test(next) || (!powershell && next === "`")) literal = false;
+      }
+    }
+    tokens.push({
+      text, literal,
+      ...(assignment && literal ? { assignment: true as const } : {}),
+      ...(commandPrefix && literal ? { commandPrefix: true as const } : {}),
+    });
+    if (pendingHeredoc) {
+      if (literal) heredocs.push({ delimiter: text, stripTabs: pendingHeredoc === "<<-" });
+      pendingHeredoc = undefined;
+    }
+  }
+  return tokens;
 }
 
 /**
@@ -954,11 +1094,11 @@ function commandText(input: Record<string, unknown>): string {
   return "";
 }
 
-function summarizeToolInput(toolName: string, input?: Record<string, unknown>): string {
+function summarizeToolInput(toolName: string, input?: Record<string, unknown>, includeAllFields = false): string {
   if (!input) {
     return "(no input captured)";
   }
-  const command = commandText(input);
+  const command = includeAllFields ? "" : commandText(input);
   if (command) {
     return truncate(redactSensitiveText(command).replace(/\s+/g, " ").trim(), 1000);
   }
@@ -986,11 +1126,11 @@ function summarizeToolResult(result: unknown, isError: boolean | undefined): str
   return prefix + truncate(JSON.stringify(redactLargeValues(redactSensitiveValue(result))), 1000);
 }
 
-function detailedToolInput(toolName: string, input?: Record<string, unknown>): string | undefined {
+function detailedToolInput(toolName: string, input?: Record<string, unknown>, includeAllFields = false): string | undefined {
   if (!input) {
     return undefined;
   }
-  const command = commandText(input);
+  const command = includeAllFields ? "" : commandText(input);
   if (command) {
     return truncate(redactSensitiveText(command), 20_000);
   }
@@ -1189,25 +1329,168 @@ function redactLargeValues(value: unknown): unknown {
   return value;
 }
 
-function boundObservedInput(input: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
-  if (!input) return undefined;
-  const redacted = redactLargeValues(redactBrowserToolInput("executor", input)) as Record<string, unknown>;
+function boundObservedInput(input: Record<string, unknown> | undefined): {
+  input?: Record<string, unknown>;
+  displayInput?: Record<string, unknown>;
+  identitiesUnavailable: boolean;
+  incomplete: boolean;
+  hasGenericData: boolean;
+} {
+  if (!input) return { identitiesUnavailable: false, incomplete: false, hasGenericData: false };
+  // Both projections are transient. Only redacted event text and the existing
+  // candidate map persist; generic data never feeds filesystem extraction.
+  const bounded: Record<string, unknown> = Object.create(null);
+  const displayCollections: Record<string, unknown> = Object.create(null);
+  const budget: ObservedDisplayBudget = { remaining: 1000, incomplete: false };
+  let identitiesUnavailable = false;
+  let hasGenericData = false;
+  const readIdentity = (record: object, key: string): unknown => {
+    const field = observedOwnData(record, key);
+    if (field.unavailable) identitiesUnavailable = true;
+    return field.value;
+  };
+  const retainIdentity = (value: string, limit: number): string => {
+    if (value.length <= limit) return value;
+    identitiesUnavailable = true;
+    return ""; // Never turn a retained prefix into a filesystem address.
+  };
   for (const key of ["command", "cmd", "script", "chars", "patch"]) {
-    const value = input[key];
-    if (typeof value === "string") redacted[key] = truncate(redactSensitiveText(value), 20_000);
-  }
-  for (const key of ["path", "file_path", "filePath", "target", "dest", "destination"]) {
-    const value = input[key];
-    if (typeof value === "string") redacted[key] = truncate(redactSensitiveText(value), MAX_OBSERVED_PATH_LENGTH);
-  }
-  for (const key of ["paths", "files"]) {
-    const value = input[key];
-    if (Array.isArray(value)) {
-      redacted[key] = value.slice(0, MAX_OBSERVED_TOOL_EVENTS / 2).map((item) =>
-        typeof item === "string" ? truncate(redactSensitiveText(item), MAX_OBSERVED_PATH_LENGTH) : redactLargeValues(item));
+    const field = observedOwnData(input, key);
+    if (field.unavailable) {
+      identitiesUnavailable = true;
+      bounded[key] = ""; // Block fallthrough to an unselected command alias.
+    } else if (typeof field.value === "string") {
+      bounded[key] = retainIdentity(field.value, MAX_OBSERVED_CONTENT_CHARS);
     }
   }
-  return redacted;
+  for (const key of ["path", "file_path", "filePath", "target", "dest", "destination"]) {
+    const value = readIdentity(input, key);
+    if (typeof value === "string") bounded[key] = retainIdentity(value, MAX_OBSERVED_PATH_LENGTH);
+  }
+  for (const key of ["paths", "files"]) {
+    const value = readIdentity(input, key);
+    try {
+      if (!Array.isArray(value)) continue;
+      const length = readIdentity(value, "length");
+      if (typeof length !== "number" || !Number.isSafeInteger(length) || length < 0) {
+        identitiesUnavailable = true;
+        continue;
+      }
+      const limit = MAX_OBSERVED_TOOL_EVENTS / 2;
+      if (length > limit) identitiesUnavailable = true;
+      const retained: unknown[] = [];
+      const display: unknown[] = [];
+      for (let index = 0; index < Math.min(length, limit); index++) {
+        const item = readIdentity(value, String(index));
+        // Only exact strings can be identities, but ordinary nested JSON
+        // entries still belong in the separate event display projection.
+        if (item !== undefined && item !== null && typeof item !== "string") hasGenericData = true;
+        const identity = typeof item === "string" ? retainIdentity(item, MAX_OBSERVED_PATH_LENGTH) : null;
+        retained.push(identity);
+        const projected = item === undefined ? null : typeof item === "string"
+          ? identity : boundObservedDisplayValue(item, budget, 2);
+        display.push(projected === "[... truncated ...]" ? null : projected);
+      }
+      bounded[key] = retained;
+      displayCollections[key] = display;
+    } catch {
+      identitiesUnavailable = true; // e.g. a revoked array Proxy
+    }
+  }
+  const projected = boundObservedDisplayValue(input, budget, 0, bounded);
+  const displayInput: Record<string, unknown> = isRecord(projected) ? projected : Object.create(null);
+  if (!isRecord(projected)) {
+    // Reflection refusal must not lose the safely readable known fields (nor
+    // invent completeness). No getters or raw iterators are invoked here.
+    for (const key of ["content", "text", "edits", "oldText", "newText", "timeout", "timeoutMs", "cwd", "workdir", "label", "description", "metadata"]) {
+      const field = observedOwnData(input, key);
+      if (field.unavailable) displayInput[key] = omitObservedDisplay(budget);
+      else if (field.value !== undefined) displayInput[key] = boundObservedDisplayValue(field.value, budget);
+    }
+  }
+  hasGenericData ||= Object.keys(displayInput).some((key) => !Object.hasOwn(bounded, key));
+  Object.assign(displayInput, bounded, displayCollections);
+  return { input: bounded, displayInput, identitiesUnavailable, incomplete: budget.incomplete, hasGenericData };
+}
+
+interface ObservedDisplayBudget {
+  remaining: number;
+  incomplete: boolean;
+}
+
+/** Read own data only: accessors are unsupported, never executed. */
+function observedOwnData(record: object, key: string): { value?: unknown; unavailable?: true } {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(record, key);
+    if (!descriptor) return {};
+    return "value" in descriptor ? { value: descriptor.value } : { unavailable: true };
+  } catch {
+    return { unavailable: true };
+  }
+}
+
+function omitObservedDisplay(budget: ObservedDisplayBudget): string {
+  budget.incomplete = true;
+  return "[... truncated ...]";
+}
+
+/** Bound ordinary JSON data BEFORE recursive redaction, sharing a node budget
+ * across the entire input. Reflection may allocate the object's key inventory;
+ * JS has no streaming own-key API. Only the first 30 keys are inspected. */
+function boundObservedDisplayValue(
+  value: unknown,
+  budget: ObservedDisplayBudget,
+  depth = 0,
+  identities?: Record<string, unknown>,
+): unknown {
+  if (budget.remaining-- <= 0) return omitObservedDisplay(budget);
+  // Omit rather than expose a secret clipped mid-token.
+  if (typeof value === "string") return value.length <= 500 ? value : omitObservedDisplay(budget);
+  if (value === null || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) return value;
+  if (!isRecord(value) || depth >= 5) return omitObservedDisplay(budget);
+  try {
+    if (Array.isArray(value)) {
+      const length = observedOwnData(value, "length").value;
+      if (typeof length !== "number" || !Number.isSafeInteger(length) || length < 0) return omitObservedDisplay(budget);
+      if (length > 20) budget.incomplete = true;
+      const retained: unknown[] = [];
+      for (let index = 0; index < Math.min(length, 20); index++) {
+        if (budget.remaining <= 0) { retained.push(omitObservedDisplay(budget)); break; }
+        const field = observedOwnData(value, String(index));
+        retained.push(field.unavailable || field.value === undefined
+          ? omitObservedDisplay(budget)
+          : boundObservedDisplayValue(field.value, budget, depth + 1));
+      }
+      return retained;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return omitObservedDisplay(budget);
+    const keys = Reflect.ownKeys(value);
+    if (keys.length > 30) budget.incomplete = true;
+    const retained: Record<string, unknown> = Object.create(null);
+    for (const key of keys.slice(0, 30)) {
+      if (budget.remaining <= 0) { budget.incomplete = true; break; }
+      if (typeof key !== "string" || key.length > 500) { budget.incomplete = true; continue; }
+      // Identity fields have independent exact-string/collection limits. Do
+      // not clip them, mark valid 20k commands incomplete, or inspect twice.
+      if (identities && Object.hasOwn(identities, key)) continue;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor) { budget.incomplete = true; continue; }
+      if (!descriptor.enumerable) continue;
+      retained[key] = "value" in descriptor
+        ? boundObservedDisplayValue(descriptor.value, budget, depth + 1)
+        : omitObservedDisplay(budget);
+    }
+    return retained;
+  } catch {
+    return omitObservedDisplay(budget);
+  }
+}
+
+function isObservablePathAddress(path: string): boolean {
+  return path.length <= MAX_OBSERVED_PATH_LENGTH
+    && redactSensitiveText(path) === path
+    && !/\[(?:REDACTED|[^\]]*truncated[^\]]*)\]/i.test(path);
 }
 
 function isUsefulPathToken(path: string): boolean {

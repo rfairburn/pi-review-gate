@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 import test from "node:test";
 import { UserQuestionController } from "../src/user-question/controller";
 import { createQuestionListComponent, QUESTION_LIST_SHORTCUT_KEY } from "../src/user-question/components";
-import type { QuestionUiTheme } from "../src/user-question/components";
+import type { QuestionSelectionCopy, QuestionUiTheme } from "../src/user-question/components";
 import { visibleTerminalText } from "../src/tool-result-text";
 
 /** Raw sequence used by the fakes for the approved chord (Kitty-style). */
@@ -18,6 +18,7 @@ const RIGHT = "\x1b[C";
 const BACKSPACE = "\x7f";
 const CTRL_C = "\x03";
 const CTRL_D = "\x04";
+const CTRL_X = "\x18";
 const TAB = "\t";
 const PAGE_UP = "\x1b[5~";
 const PAGE_DOWN = "\x1b[6~";
@@ -300,6 +301,7 @@ function makeFixture(options: {
   theme?: QuestionUiTheme;
   tuiHost?: ReturnType<typeof makeTuiHost>;
   getTerminalSize?: () => { columns: number; rows: number } | undefined;
+  selectionCopy?: QuestionSelectionCopy;
 } = {}): Fixture {
   const sent: Fixture["sent"] = [];
   const controller = new UserQuestionController({
@@ -325,6 +327,7 @@ function makeFixture(options: {
     getViewportRows: options.getViewportRows,
     isStale: options.isStale,
     getTerminalSize: options.getTerminalSize,
+    selectionCopy: options.selectionCopy,
     onDone: (result) => done.push(result),
   });
   return { controller, identity, sent, done, component, field };
@@ -397,6 +400,80 @@ function registerNotice(fixture: Fixture, body: string, context?: string): strin
   if (!result.ok) throw new Error("notice registration failed");
   return result.notice.id;
 }
+
+test("explicit copy: the configured copy key consumes only a live host selection and mirrors Pi's own policy", async () => {
+  const copies: string[] = [];
+  let copyOnSelect = false;
+  let activeSelection = true;
+  let rejectSeam = false;
+  const selectionCopy: QuestionSelectionCopy = {
+    copyOnSelect: () => copyOnSelect,
+    hasActiveSelection: () => activeSelection,
+    async copyActiveSelection() {
+      copies.push("copy");
+      if (rejectSeam) throw new Error("clipboard unavailable");
+      return true;
+    },
+  };
+  const fixture = makeFixture({
+    keybindings: makeKeybindings({ "app.message.copy": [CTRL_X] }),
+    selectionCopy,
+  });
+  register(fixture, "Copy me?", { choices: ["yes"] });
+  fixture.component.handleInput(ENTER); // open the answer view
+  fixture.component.handleInput(DOWN); // select the Type row
+  fixture.component.handleInput(ENTER); // enter native editing
+  const field = fixture.field!;
+  assert.equal(field.focused, true, "editing began on the native field");
+
+  // A live selection with copy-on-select off: the popup consumes the key and
+  // copies once through the injected host surface; the field never sees it.
+  fixture.component.handleInput(CTRL_X);
+  assert.deepEqual(copies, ["copy"], "the configured copy key copied exactly once");
+  assert.ok(!field.inputLog.includes(CTRL_X), "a consumed copy key never reaches the native field");
+
+  // Any other key keeps its existing editing behavior.
+  field.inputLog.length = 0;
+  fixture.component.handleInput("a");
+  assert.deepEqual(copies, ["copy"], "an ordinary key is not a copy");
+  assert.ok(field.inputLog.includes("a"), "and still reaches the native field");
+
+  // No active selection: not ours to consume; the field keeps the key.
+  activeSelection = false;
+  field.inputLog.length = 0;
+  fixture.component.handleInput(CTRL_X);
+  assert.deepEqual(copies, ["copy"], "no selection: nothing copied");
+  assert.ok(field.inputLog.includes(CTRL_X), "with no selection the key keeps its existing editor behavior");
+
+  // Copy-on-select on: Pi already copied on release; the popup adds nothing.
+  copyOnSelect = true;
+  activeSelection = true;
+  field.inputLog.length = 0;
+  fixture.component.handleInput(CTRL_X);
+  assert.deepEqual(copies, ["copy"], "copy-on-select on: the popup adds no second copy");
+  assert.ok(field.inputLog.includes(CTRL_X), "and does not consume the key");
+
+  // A rejected host clipboard seam is swallowed (no unhandled rejection) while
+  // the live selection still owns the key.
+  copyOnSelect = false;
+  rejectSeam = true;
+  field.inputLog.length = 0;
+  fixture.component.handleInput(CTRL_X);
+  assert.deepEqual(copies, ["copy", "copy"], "the host seam was invoked once more for the live selection");
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.ok(!field.inputLog.includes(CTRL_X), "the live selection still consumes the key");
+
+  // Without the injected host surface the key is never consumed or copied.
+  const plain = makeFixture({ keybindings: makeKeybindings({ "app.message.copy": [CTRL_X] }) });
+  register(plain, "No host surface?", { choices: ["yes"] });
+  plain.component.handleInput(ENTER);
+  plain.component.handleInput(DOWN);
+  plain.component.handleInput(ENTER);
+  plain.field!.inputLog.length = 0;
+  plain.component.handleInput(CTRL_X);
+  assert.ok(plain.field!.inputLog.includes(CTRL_X), "without a host surface the key keeps its existing behavior");
+  assert.equal(plain.done.length, 0, "and never closes the popup");
+});
 
 test("the list renders pending questions with the shortcut hint and waiting tags", () => {
   const fixture = makeFixture();
@@ -1658,17 +1735,18 @@ test("mouse: non-left buttons, motion, releases, stray clicks, and wheel never a
 
   for (const button of ["right", "middle"] as const) {
     assert.deepEqual(fixture.component.handleMouse(pointer(frame, "press", cell.x, cell.y, button)),
-      { handled: true, render: false }, `${button} presses are consumed`);
-    fixture.component.handleMouse(pointer(frame, "release", cell.x, cell.y, button));
-    assert.deepEqual(fixture.component.handleMouse(pointer(frame, "click", cell.x, cell.y, button, { clickCount: 1 })),
-      { handled: true, render: false }, `${button} clicks never activate`);
+      { handled: true, render: false }, `${button} presses keep the popup's foreground ownership (right-click paste path)`);
+    assert.equal(fixture.component.handleMouse(pointer(frame, "release", cell.x, cell.y, button)), undefined,
+      `${button} releases complete no claimed item press and are left to the host`);
+    assert.equal(fixture.component.handleMouse(pointer(frame, "click", cell.x, cell.y, button, { clickCount: 1 })), undefined,
+      `${button} clicks never activate`);
   }
   for (const type of ["move", "drag", "release"] as const) {
-    assert.deepEqual(fixture.component.handleMouse(pointer(frame, type, cell.x, cell.y, type === "move" ? "none" : "left")),
-      { handled: true, render: false }, `${type} events inside the popup are consumed without effect`);
+    assert.equal(fixture.component.handleMouse(pointer(frame, type, cell.x, cell.y, type === "move" ? "none" : "left")),
+      undefined, `${type} without a claimed item press is left to the host's native selection`);
   }
-  assert.deepEqual(fixture.component.handleMouse(pointer(frame, "click", cell.x, cell.y, "left", { clickCount: 1 })),
-    { handled: true, render: false }, "a click with no paired press in this popup never activates");
+  assert.equal(fixture.component.handleMouse(pointer(frame, "click", cell.x, cell.y, "left", { clickCount: 1 })),
+    undefined, "a click with no paired press in this popup never activates");
   // Scrolling stays keyboard-only: wheel is never handled, so it neither
   // activates nor scrolls the popup body.
   for (const wheelDelta of [1, -1, 3]) {
@@ -1708,8 +1786,8 @@ test("mouse: header, blank, rule, padding, hint, side-padding, and trailing blan
   ];
   for (const [name, x, y] of misses) {
     const results = clickCell(fixture, frame, { x, y });
-    assert.deepEqual(results[0], { handled: true, render: false }, `${name}: the press is consumed without highlight`);
-    assert.deepEqual(results[2], { handled: true, render: false }, `${name}: the click does nothing`);
+    assert.deepEqual(results, [undefined, undefined, undefined],
+      `${name}: a non-item gesture is left to the host's native selection; nothing is claimed or activated`);
   }
   assert.equal(fixture.controller.listPending().length, 1);
   assert.equal(fixture.sent.length, 0);
@@ -1749,7 +1827,7 @@ test("mouse: wide labels and sub-padding widths hit exactly their drawn cells", 
   const cell = cellOf(frame, "1. 数据库选择");
   const lastCell = cell.x + realTextHelpers.visibleWidth("1. 数据库选择") - 1;
   const results = clickCell(fixture, frame, { x: lastCell + 1, y: cell.y });
-  assert.deepEqual(results[2], { handled: true, render: false }, "the cell after the last wide glyph is blank");
+  assert.equal(results[2], undefined, "the cell after the last wide glyph is blank and left to native selection");
   assert.equal(fixture.controller.listPending().length, 1);
   clickCell(fixture, frame, { x: lastCell, y: cell.y });
   assert.equal(fixture.controller.listPending().length, 0, "the second cell of the last wide glyph is drawn label");
@@ -1766,7 +1844,7 @@ test("mouse: wide labels and sub-padding widths hit exactly their drawn cells", 
   const closeStart = rows.findIndex((row, index) => row === "Cl" && rows[index + 1] === "os");
   assert.ok(closeStart > 0, `Close is wrapped at width 2: ${JSON.stringify(rows)}`);
   const blankAfterE = clickCell(narrow, tiny, { x: 1, y: closeStart + 2 });
-  assert.deepEqual(blankAfterE[2], { handled: true, render: false }, "the blank cell after the final \"e\" is not Close");
+  assert.equal(blankAfterE[2], undefined, "the blank cell after the final \"e\" is not Close and is left to native selection");
   assert.notEqual(narrow.controller.getPending(noticeId), undefined);
   clickCell(narrow, tiny, { x: 0, y: closeStart + 2 }); // "e" of Close
   assert.equal(narrow.controller.getPending(noticeId), undefined, "the last wrapped Close cell runs Close");
@@ -1809,8 +1887,8 @@ test("mouse: fixed hint rows below a scrolled body stay inert while the body row
   const firstHintY = frame.lines.findIndex((line) => plainRow(line).includes(hint.find((row) => row.trim().length > 0)!.trim()));
   for (let y = firstHintY - 1; y < frame.lines.length; y += 1) {
     const results = clickCell(fixture, frame, { x: 4, y });
-    assert.deepEqual(results[0], { handled: true, render: false }, `row ${y} below the body is inert`);
-    assert.deepEqual(results[2], { handled: true, render: false });
+    assert.equal(results[0], undefined, `row ${y} below the body is not an item and is left to native selection`);
+    assert.equal(results[2], undefined);
   }
   assert.equal(fixture.sent.length, 0);
   const lastBodyRow = body[body.length - 1]!;
@@ -1834,7 +1912,7 @@ test("mouse: tiny budgets without padding or rules map only their remaining body
     for (const [y, row] of plain.entries()) {
       if (y === betaY) continue;
       const results = clickCell(fixture, frame, { x: Math.max(0, row.search(/\S/)), y });
-      assert.deepEqual(results[2], { handled: true, render: false }, `${rows} rows: row ${y} (${JSON.stringify(row)}) is inert`);
+      assert.equal(results[2], undefined, `${rows} rows: row ${y} (${JSON.stringify(row)}) is inert and left to native selection`);
     }
     if (rows <= 2) {
       assert.ok(!plain.some((row) => /^─+$/.test(row)), `${rows} rows: the rules gave way to content`);
@@ -1883,7 +1961,7 @@ test("mouse: resized, mismatched, or shifted frames between press and click neve
 
   // Bounds that do not match the last composited frame are rejected.
   const mismatched = fixture.component.handleMouse({ ...pointer(frame, "press", cell.x, cell.y), width: 79 });
-  assert.deepEqual(mismatched, { handled: true, render: false });
+  assert.equal(mismatched, undefined, "a press whose bounds do not describe the drawn frame is left to the host's native selection");
 
   // A resize render between press and click.
   clickCell(fixture, frame, cell, { between: () => fixture.component.render(60) });
@@ -1979,8 +2057,8 @@ test("mouse: one gesture activates once; a quick second click on new content nee
   clickCell(fixture, frame, cell);
   // A repeated click event with no new press, and a double click whose press
   // lands before the answer view was drawn, both stay inert.
-  assert.deepEqual(fixture.component.handleMouse(pointer(frame, "click", cell.x, cell.y, "left", { clickCount: 2 })),
-    { handled: true, render: false });
+  assert.equal(fixture.component.handleMouse(pointer(frame, "click", cell.x, cell.y, "left", { clickCount: 2 })),
+    undefined, "a click with no paired press is left to the host");
   clickCell(fixture, frame, cell, { clickCount: 2 });
   await flushDelivery();
   assert.equal(fixture.controller.listPending().length, 2, "no answer was chosen by the repeated click");
@@ -2124,7 +2202,7 @@ test("mouse: a terminal resize before the redraw invalidates the gesture; a fres
     assert.equal(fixture.controller.listPending().length, 1);
     // A new press on the not-yet-redrawn frame is inert as well.
     const stalePress = fixture.component.handleMouse(pointer(frame, "press", cell.x, cell.y));
-    assert.deepEqual(stalePress, { handled: true, render: false }, `${resize.name}: a press before redraw does not highlight`);
+    assert.equal(stalePress, undefined, `${resize.name}: a press before redraw is left to native selection instead of highlighting a stale frame`);
     fixture.component.handleMouse(pointer(frame, "release", cell.x, cell.y));
     fixture.component.handleMouse(pointer(frame, "click", cell.x, cell.y));
     assert.equal(fixture.controller.listPending().length, 1);
@@ -2216,8 +2294,8 @@ test("mouse: a narrow notice press highlights without reflowing the wrapped acti
     assert.equal(fixture.controller.getPending(noticeId), undefined, `width ${width}: Close removed the notice`);
     assert.equal(fixture.controller.listPending().length, 1);
     // A repeated click without its own press never acts again.
-    assert.deepEqual(fixture.component.handleMouse(pointer(pressedFrame, "click", x, closeStart, "left", { clickCount: 2 })),
-      { handled: true, render: false });
+    assert.equal(fixture.component.handleMouse(pointer(pressedFrame, "click", x, closeStart, "left", { clickCount: 2 })),
+      undefined, `width ${width}: a click with no paired press is left to the host`);
     assert.equal(fixture.controller.listPending().length, 1, `width ${width}: exactly one activation`);
     assert.equal(fixture.done.length, 0);
     assert.equal(fixture.sent.length, 0);

@@ -16,6 +16,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  nativeSelectionCopyOf,
   registerUserQuestions,
   userQuestionsBeginSession,
   type UserQuestionSurface,
@@ -288,5 +289,69 @@ test("with no pending input the shortcut only notifies", async () => {
   assert.ok(
     fixture.notices.some((n) => /no pending input/i.test(n)),
     `an explicit notice is sent: ${JSON.stringify(fixture.notices)}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Issue #436 explicit copy: the factory narrows the live TUI to the host's
+// public fullscreen selection surface and injects it into the popup. These
+// tests pin that adapter's structural guards and receiver preservation, the
+// wiring the mouse-host test exercises positively against the real runtime.
+// ---------------------------------------------------------------------------
+
+test("the explicit-copy adapter reads the live host surface with preserved receivers", async () => {
+  const calls: string[] = [];
+  const host = {
+    receivers: [] as unknown[],
+    getCopyOnSelect(this: unknown): boolean {
+      host.receivers.push(this);
+      return false;
+    },
+    hasActiveSelection(this: unknown): boolean {
+      host.receivers.push(this);
+      return true;
+    },
+    async copyActiveSelectionToClipboard(this: unknown): Promise<boolean> {
+      host.receivers.push(this);
+      calls.push("copy");
+      return true;
+    },
+    resetTextSelection(this: unknown): void {
+      host.receivers.push(this);
+      calls.push("reset");
+    },
+  };
+  const adapter = nativeSelectionCopyOf(host);
+  assert.ok(adapter, "the complete public surface resolves an adapter");
+  assert.equal(adapter.copyOnSelect(), false);
+  assert.equal(adapter.hasActiveSelection(), true);
+  assert.equal(await adapter.copyActiveSelection(), true);
+  adapter.resetInheritedSelection();
+  assert.deepEqual(calls, ["copy", "reset"], "both host methods ran once");
+  assert.deepEqual(host.receivers, [host, host, host, host], "every host method kept the TUI object as its receiver");
+});
+
+test("the explicit-copy adapter fails closed for unsupported, incomplete, or throwing hosts", () => {
+  assert.equal(nativeSelectionCopyOf(undefined), undefined, "no host object");
+  assert.equal(nativeSelectionCopyOf("fullscreen"), undefined, "a non-object host");
+  assert.equal(nativeSelectionCopyOf({}), undefined, "a host without the surface");
+  const copySurface = { getCopyOnSelect: () => false, hasActiveSelection: () => true, copyActiveSelectionToClipboard: async () => true };
+  assert.equal(nativeSelectionCopyOf(copySurface), undefined, "a surface without the popup-entry reset");
+  assert.equal(
+    nativeSelectionCopyOf({ getCopyOnSelect: () => false, hasActiveSelection: () => true }),
+    undefined,
+    "a partially implemented surface",
+  );
+  assert.equal(
+    nativeSelectionCopyOf({
+      get getCopyOnSelect(): never {
+        throw new Error("invalidated host");
+      },
+      hasActiveSelection: () => true,
+      copyActiveSelectionToClipboard: async () => true,
+      resetTextSelection: () => {},
+    }),
+    undefined,
+    "an invalidated host whose getters throw",
   );
 });

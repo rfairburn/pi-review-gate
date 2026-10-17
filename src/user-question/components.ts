@@ -57,9 +57,30 @@
  * viewport budget, and live terminal size, runs the item's existing confirm
  * action, exactly as Enter on that selection would. A menu click while
  * editing first leaves editing with the draft kept; the editor box is not a
- * menu entry and never submits by pointer. Every non-wheel pointer event
- * inside the popup is consumed, keyboard input cancels a pending gesture, and
- * a closed popup intercepts nothing. Regular mode delivers no pointer input.
+ * menu entry and never submits by pointer. Only a left press that resolves a
+ * live drawn item is claimed (non-primary presses keep their previous
+ * foreground ownership); every other primary pointer event over the popup —
+ * body text, headings, the fixed hint, borders, padding, blank cells, and a
+ * frame the last render no longer describes — returns unhandled, so Pi's
+ * existing native text selection and clipboard paths read the visible
+ * composited popup (issue #436). Keyboard input cancels a pending gesture,
+ * and a closed popup intercepts nothing. Regular mode delivers no pointer
+ * input.
+ *
+ * Explicit selection copy (#436): while this overlay holds keyboard focus, the
+ * configured `app.message.copy` binding mirrors Pi's own policy for a live
+ * fullscreen selection. With the host's copy-on-select setting off and a
+ * non-empty active selection, that key copies exactly the visible selected
+ * popup rows through the host's own public clipboard path — never the hidden
+ * chat transcript and never a fallback message. With copy-on-select on (Pi
+ * already copied on release), no selection, or a host without that native
+ * surface, the key keeps its existing editor, navigation, and paste behavior.
+ * The host owns the setting: this component never changes it. At popup entry
+ * the factory also clears any selection inherited from before the overlay
+ * opened (the host's public `resetTextSelection()`), because such a selection
+ * is anchored to the transcript's scroll view and would otherwise let the copy
+ * key read hidden scroll content; a selection made while the overlay is open is
+ * always anchored to the composited visible popup.
  *
  * Navigation, confirm, cancel, cursor movement, and deletion resolve through
  * the host's live KeybindingsManager (`tui.select.*`, `tui.editor.*`), so
@@ -101,6 +122,41 @@ export const QUESTION_LIST_SHORTCUT_KEY = "ctrl+alt+up";
 
 export interface QuestionUiKeybindings {
   matches(data: string, keybinding: string): boolean;
+}
+
+/**
+ * The host's native fullscreen explicit-selection copy surface (pi-tui's
+ * `TuiAltScreen`), narrowed to the public members this overlay needs. Injected
+ * by the factory that owns the live TUI object; the component never reaches
+ * for a host or clipboard implementation of its own.
+ */
+export interface QuestionSelectionCopy {
+  /** Host copy-on-select setting; true means the host already copied on release. */
+  copyOnSelect(): boolean;
+  /** Whether the fullscreen viewport currently has a non-empty text selection. */
+  hasActiveSelection(): boolean;
+  /** Copy the active selection through the host's configured clipboard path. */
+  copyActiveSelection(): Promise<boolean>;
+}
+
+/**
+ * The full native selection surface the popup's factory owns: the component's
+ * read/copy contract plus the popup-entry lifecycle call. pi-tui's
+ * `showOverlay` preserves a selection made before the overlay opened, and such
+ * a selection is anchored to the transcript's scroll view, so Pi's explicit
+ * copy would read that scroll view's hidden content instead of the composited
+ * popup. The factory therefore calls {@link resetInheritedSelection} exactly
+ * once, before the overlay accepts input, so the component's copy eligibility
+ * means "a selection made over the visible popup".
+ */
+export interface QuestionNativeSelection extends QuestionSelectionCopy {
+  /**
+   * Drop the fullscreen text selection at popup entry (the host's public
+   * `TuiAltScreen.resetTextSelection()`). Not a selection store of ours: any
+   * selection the user makes over the visible popup or conversation after this
+   * point is the host's own, and is copied through the host's path.
+   */
+  resetInheritedSelection(): void;
 }
 
 export interface QuestionUiTheme {
@@ -152,6 +208,12 @@ export interface QuestionListComponentOptions {
   getTerminalSize?: () => { columns: number; rows: number } | undefined;
   /** Invalidate the live TUI after component/controller state changes. */
   requestRender?: () => void;
+  /**
+   * Host native explicit-selection copy (fullscreen `TuiAltScreen`), injected
+   * by the factory. Undefined on hosts without that public surface; the
+   * configured copy binding then keeps its existing behavior.
+   */
+  selectionCopy?: QuestionSelectionCopy;
   onDone: (result: QuestionListDone) => void;
 }
 
@@ -185,10 +247,12 @@ export interface QuestionListComponent {
   render(width: number): string[];
   handleInput(data: string): void;
   /**
-   * Fullscreen pointer input. A left press highlights a visible menu item; a
-   * completed left click on the same live item runs that item's existing
-   * confirm action. Non-wheel pointer events inside the popup are consumed so
-   * nothing reaches the background; wheel events are left to the host.
+   * Fullscreen pointer input. A left press that resolves a live drawn menu
+   * item is claimed and highlights it; a completed left click on the same live
+   * item runs that item's existing confirm action. Every other primary pointer
+   * event over the popup is left to the host, so native selection can read the
+   * visible popup rows; non-primary presses stay consumed as before, and wheel
+   * events are left to the host as well.
    */
   handleMouse(event: QuestionMouseEvent): QuestionMouseResult | undefined;
   invalidate(): void;
@@ -659,6 +723,32 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     return matchesHostKey(data, QUESTION_LIST_SHORTCUT_KEY);
   }
 
+  /**
+   * Pi's explicit-copy policy while this overlay owns the keyboard: with the
+   * host's copy-on-select setting off and a live fullscreen selection, the
+   * configured `app.message.copy` binding copies exactly that visible
+   * selection through the host's public clipboard path. The key is consumed
+   * only then; with copy-on-select on, no selection, an unreadable host, or no
+   * native copy surface it is left to the existing editor/navigation/paste
+   * handling — this component never falls back to hidden transcript text and
+   * never sets or overrides the host setting.
+   */
+  function copyExplicitSelection(data: string): boolean {
+    const copy = options.selectionCopy;
+    if (!copy || !keybindings.matches(data, "app.message.copy")) return false;
+    try {
+      if (copy.copyOnSelect() || !copy.hasActiveSelection()) return false;
+    } catch {
+      return false; // An unreadable host setting is no selection proof.
+    }
+    // The host's own path flashes its success/failure; this layer makes no
+    // claim of its own. A rejected clipboard seam is swallowed so no unhandled
+    // rejection escapes the popup's input dispatch (native Pi leaves it
+    // unhandled): nothing is consumed as "copied" beyond the host's own report.
+    void copy.copyActiveSelection().catch(() => {});
+    return true;
+  }
+
   /** Live idle probe for async delivery; the UI carries no session state of its own. */
   function sourceProbe(): { isIdle?: () => boolean } | undefined {
     return activeSourceProbe;
@@ -679,6 +769,11 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       close();
       return;
     }
+    // Explicit copy mirrors Pi's own `app.message.copy` policy in every mode,
+    // including while the native field is editing (a live selection over the
+    // popup is the host's). Without a selection the key falls through to the
+    // existing handling below.
+    if (copyExplicitSelection(data)) return;
     // While editing, every key (including PageUp/PageDown) belongs to the
     // native field; popup paging resumes after Esc returns to the options.
     if (!editing && matchesPopupScroll(data, "up")) {
@@ -821,31 +916,43 @@ export function createQuestionListComponent(options: QuestionListComponentOption
     if (event.type === "press") {
       const hadHighlight = clearMouseGesture();
       if (hadHighlight) invalidateContent();
+      // Non-primary presses stay consumed, exactly as before: the foreground
+      // popup keeps owning Pi's right-click-paste path. They never claim an
+      // item, so their paired release/click stay inert below.
+      if (event.button !== "left") return { handled: true, render: hadHighlight };
       // A resize that has not been redrawn yet invalidates every drawn cell.
       const frame = lastFrame && frameIsCurrent(lastFrame) ? lastFrame : undefined;
-      const ref = event.button === "left" ? itemAt(frame, event) : undefined;
-      if (!ref || !frame || !isLiveItem(ref)) return { handled: true, render: hadHighlight };
+      const ref = itemAt(frame, event);
+      // Not a live actionable entry (body text, hint, rules, padding, blank
+      // cells, or stale geometry): leave the press to the host so Pi's native
+      // text selection can anchor on the visible popup rows (#436).
+      if (!ref || !frame || !isLiveItem(ref)) return undefined;
       pressedItem = { ref, frame };
       highlightItem(ref);
       return { handled: true, render: true };
     }
     if (event.type === "release") {
-      releasedItem = event.button === "left" ? pressedItem : undefined;
+      const candidate = event.button === "left" ? pressedItem : undefined;
       pressedItem = undefined;
+      releasedItem = candidate;
       const hadHighlight = pressHighlight !== undefined;
       pressHighlight = undefined;
       if (hadHighlight) invalidateContent();
+      // Only a release that completes a claimed item press is ours; every
+      // other release belongs to the host's native selection.
+      if (!candidate) return undefined;
       return { handled: true, render: hadHighlight };
     }
     if (event.type === "click") {
       const candidate = releasedItem;
       releasedItem = undefined;
+      // A click with no claimed press is the host's own selection click.
+      if (event.button !== "left" || !candidate) return undefined;
       // Only a stationary left press-release on one live item activates; the
       // click count is ignored like the native SelectList. The release/click
       // carry press-time bounds; a resize since then (even one the host has
       // not redrawn yet) leaves no trustworthy geometry.
-      if (event.button !== "left" || !candidate || !lastFrame || !sameGeometry(lastFrame, candidate.frame)
-        || !frameIsCurrent(lastFrame)) {
+      if (!lastFrame || !sameGeometry(lastFrame, candidate.frame) || !frameIsCurrent(lastFrame)) {
         return { handled: true, render: false };
       }
       const ref = itemAt(lastFrame, event);
@@ -853,7 +960,9 @@ export function createQuestionListComponent(options: QuestionListComponentOption
       activateItem(ref);
       return { handled: true, render: true };
     }
-    // Pointer motion inside the popup never reaches the background.
+    // Motion without a claimed item press belongs to the host's native
+    // selection (and to whatever the surrounding layout does with it).
+    if (!pressedItem) return undefined;
     return { handled: true, render: false };
   };
 

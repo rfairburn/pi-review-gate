@@ -56,6 +56,9 @@ interface TuiScreen {
   showOverlay(component: unknown, options?: unknown): { hide(): void; isFocused(): boolean };
   hasOverlay(): boolean;
   hasActiveSelection(): boolean;
+  getCopyOnSelect(): boolean;
+  resetTextSelection(): void;
+  copyActiveSelectionToClipboard(): Promise<boolean>;
   getScreenLines(): string[];
   renderNow(force?: boolean): void;
   requestRender(force?: boolean): void;
@@ -70,6 +73,13 @@ interface InstalledRuntime {
 const UP = "\x1b[A";
 const ENTER = "\r";
 const ESCAPE = "\x1b";
+/** The shipped default for `app.message.copy` (Pi's explicit copy). */
+const CTRL_X = "\x18";
+/** The shipped default for `app.clear` in the native editor. */
+const CTRL_C = "\x03";
+const DOWN = "\x1b[B";
+/** A valid terminal key used to prove a live copy-binding remap. */
+const F6 = "\x1b[17~";
 
 async function resolveRuntime(): Promise<InstalledRuntime | undefined> {
   for (const agentDir of findInstalledAgentDirs()) {
@@ -182,6 +192,8 @@ interface Harness {
   sessionManager: object;
   sent: Array<{ message: string; options?: unknown }>;
   backgroundEvents: MouseEventLike[];
+  /** Text handed to the injected native clipboard seam (never the OS clipboard). */
+  copied: string[];
   /** Raw input observed by a later extension listener (the popup's Escape router position). */
   extensionListenerInput: string[];
   chatDraft: { text: string };
@@ -195,7 +207,26 @@ interface Harness {
   dispose(): void;
 }
 
-async function createHarness(t: { skip(message?: string): void; after(fn: () => void): void }): Promise<Harness | undefined> {
+interface HarnessOptions {
+  /** User keybindings.json overrides applied to the live KeybindingsManager. */
+  userBindings?: Record<string, string | string[]>;
+  /** Replacement native clipboard seam (defaults to a recording success). */
+  copySelection?: (text: string) => Promise<boolean | string>;
+  /** Host copy-on-select setting; defaults to off so an explicit copy is required. */
+  copyOnSelect?: boolean;
+  /**
+   * When false the transcript is a plain, unhandled component, so Pi's own
+   * native selection anchors on the transcript's scroll view (the inherited-
+   * selection regression). Defaults to true: a MouseRegion observes and claims
+   * background gestures, as the other dispatch tests need.
+   */
+  transcriptHandlesMouse?: boolean;
+}
+
+async function createHarness(
+  t: { skip(message?: string): void; after(fn: () => void): void },
+  options: HarnessOptions = {},
+): Promise<Harness | undefined> {
   const runtime = await runtimePromise;
   if (!runtime) {
     skipOrFail(t, SKIP_REASON);
@@ -212,21 +243,36 @@ async function createHarness(t: { skip(message?: string): void; after(fn: () => 
   // from the "running Pi" entry, here the installed agent's own CLI entry.
   setUserQuestionTuiHost(undefined);
   setUserQuestionTuiHostEntryProvider(() => join(runtime.agentDir, "dist", "cli.js"));
-  const keybindings = createRealKeybindingsManager(tui);
-
-  const terminal = new VirtualTerminal(80, 30);
-  const TuiAltScreen = tui.TuiAltScreen as new (terminal: unknown, showHardwareCursor?: boolean, logDirectory?: string, options?: unknown) => TuiScreen;
-  const screen = new TuiAltScreen(terminal, false, undefined, { mouse: true, copyOnSelect: false });
+  const keybindings = createRealKeybindingsManager(tui, options.userBindings);
 
   // Background transcript content under the popup, with its own pointer handler.
   const backgroundEvents: MouseEventLike[] = [];
+  // The public host clipboard seam: copyOnSelect stays off in this harness, so
+  // only an explicit copyActiveSelectionToClipboard() (the configured copy key,
+  // or a direct call) reaches it. The text the host actually resolved from its
+  // own visible screen is recorded verbatim.
+  const copied: string[] = [];
+  const terminal = new VirtualTerminal(80, 30);
+  const TuiAltScreen = tui.TuiAltScreen as new (terminal: unknown, showHardwareCursor?: boolean, logDirectory?: string, options?: unknown) => TuiScreen;
+  const screen = new TuiAltScreen(terminal, false, undefined, {
+    mouse: true,
+    copyOnSelect: options.copyOnSelect ?? false,
+    copySelection: options.copySelection ?? (async (text: string) => {
+      copied.push(text);
+      return true;
+    }),
+  });
+
   const Text = tui.Text as new (text: string, paddingX?: number, paddingY?: number) => unknown;
   const MouseRegion = tui.MouseRegion as new (child: unknown, onMouse: (event: MouseEventLike) => unknown) => unknown;
   const transcript = Array.from({ length: 40 }, (_, index) => `transcript line ${String(index + 1).padStart(2, "0")} ${"·".repeat(50)}`).join("\n");
-  screen.addChild(new MouseRegion(new Text(transcript, 0, 0), (event) => {
-    backgroundEvents.push({ type: event.type, button: event.button, x: event.x, y: event.y });
-    return { handled: true };
-  }));
+  const transcriptView = new Text(transcript, 0, 0);
+  screen.addChild(options.transcriptHandlesMouse === false
+    ? transcriptView
+    : new MouseRegion(transcriptView, (event) => {
+        backgroundEvents.push({ type: event.type, button: event.button, x: event.x, y: event.y });
+        return { handled: true };
+      }));
   screen.start();
 
   const extensionListenerInput: string[] = [];
@@ -327,6 +373,7 @@ async function createHarness(t: { skip(message?: string): void; after(fn: () => 
     sessionManager,
     sent,
     backgroundEvents,
+    copied,
     extensionListenerInput,
     chatDraft,
     async open() {
@@ -386,9 +433,9 @@ function registerQuestion(harness: Harness, question: string, choices?: string[]
   return result.question.id;
 }
 
-function registerNotice(harness: Harness, title: string, body: string): string {
+function registerNotice(harness: Harness, title: string, body: string, context?: string): string {
   const result = harness.surface.controller.registerNotice(
-    { toolCallId: `n${harness.surface.controller.listPending().length + 1}`, title, body },
+    { toolCallId: `n${harness.surface.controller.listPending().length + 1}`, title, body, context },
     harness.sessionManager,
   );
   assert.ok(result.ok);
@@ -479,22 +526,23 @@ test("native fullscreen dispatch: drag-off, a shifted centered origin, resize, a
   await harness.draw();
   assert.ok(listOpen(), "a drag-off never activates");
 
-  // A press on the popup's blank rule cells is consumed too, so the native
-  // press capture keeps the whole gesture: dragging out over the transcript
-  // and releasing there neither reaches the background nor selects text.
+  // A press on the popup's blank rule cells is not a menu item, so the popup
+  // leaves the whole gesture to the host: Pi's native selection anchors on the
+  // visible popup, and an in-popup drag extends it (issue #436). No item is
+  // claimed, highlighted, or activated, and nothing reaches the transcript.
   const rule = popupTop(harness) - 2;
   assert.match(harness.frame()[rule]!, /^─+$/, `the popup top rule is drawn above the padding:\n${harness.frame().join("\n")}`);
   assert.match(harness.frame()[0]!, /^transcript line/, "row 0 is transcript outside the popup");
   harness.terminal.input(sgr.press(70, rule));
-  harness.terminal.input(sgr.drag(30, 2));
-  harness.terminal.input(sgr.drag(10, 0));
+  harness.terminal.input(sgr.drag(30, rule + 4));
   await harness.draw();
-  assert.equal(harness.screen.hasActiveSelection(), false, "no selection starts from inside the popup");
-  harness.terminal.input(sgr.release(10, 0));
+  harness.terminal.input(sgr.release(30, rule + 4));
   await harness.draw();
-  assert.equal(harness.screen.hasActiveSelection(), false);
-  assert.equal(harness.backgroundEvents.length, 0, "the captured gesture never leaked to the transcript");
-  assert.ok(listOpen());
+  assert.equal(harness.screen.hasActiveSelection(), true,
+    "a non-item press starts Pi's native selection over the visible popup");
+  assert.equal(harness.backgroundEvents.length, 0, "an in-popup selection gesture never leaked to the transcript");
+  assert.ok(listOpen(), "and activates no popup item");
+  assert.equal(harness.sent.length, 0);
 
   // A re-render between press and release moves the centered popup: the
   // release lands on the same screen cell but over different popup content.
@@ -1053,4 +1101,467 @@ test("native fullscreen dispatch: fixed hint rows stay inert, and tiny unpadded 
   assert.deepEqual(harness.backgroundEvents, [], "no popup pointer event reached the background transcript");
   assert.equal(harness.screen.hasActiveSelection(), false);
   assert.equal(harness.extensionListenerInput.filter((data) => data.startsWith("\x1b[<")).length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Issue #436: a non-item press inside the popup belongs to Pi's native text
+// selection over the visible popup rows. The popup claims only a live drawn
+// menu item, so the host's own selection and clipboard paths (never a private
+// selection state) copy exactly what is visible. A gesture that starts on
+// non-item content cannot gain an action by crossing or releasing over one,
+// and a gesture that leaves the overlay falls back to the host's normal
+// routing: session-host's own coverage (tests/session-host-main.test.ts)
+// already proves that an initial left press above a pane is required, so
+// stray drag/release callbacks cannot activate a different session or review.
+// ---------------------------------------------------------------------------
+
+test("native fullscreen dispatch: a non-item press selects and copies the visible popup natively, never an action", async (t) => {
+  const harness = await createHarness(t);
+  if (!harness) return;
+  harness.terminal.resize(80, 26);
+
+  const question = "Keep this pending?";
+  const questionId = registerQuestion(harness, question, ["keep"]);
+  // A distinct wrapped body, an explicit context, and a distinct transcript
+  // underneath: the copy must read the visible popup, never the background.
+  const body = "noticebody alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima "
+    + "mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu";
+  const context = "noticecontext mike november oscar papa quebec romeo";
+  const shortId = registerNotice(harness, "Selection notice", body, context);
+  const longId = registerNotice(harness, "Long selection notice",
+    Array.from({ length: 40 }, (_, index) => `longbody line ${String(index + 1).padStart(2, "0")}`).join("\n\n"));
+  const before = pendingSnapshot(harness);
+  const { closed: opened } = await harness.open();
+
+  // Open the short notice; its body wraps over several visible rows.
+  await harness.click(harness.cell(`${shortId}: Selection notice`));
+  const bodyStart = harness.cell("noticebody alpha");
+  const bodyTail = harness.cell("zulu");
+  const contextCell = harness.cell("noticecontext mike");
+  assert.ok(bodyTail.y > bodyStart.y, `the notice body wraps over visible rows:\n${harness.frame().join("\n")}`);
+  assert.ok(contextCell.y > bodyStart.y, "the context is drawn below the body");
+
+  // Press on body text (no menu item) and drag through the context: the popup
+  // must leave the whole gesture to the host's native selection.
+  harness.terminal.input(sgr.press(bodyStart.x, bodyStart.y));
+  harness.terminal.input(sgr.drag(78, contextCell.y));
+  await harness.draw();
+  harness.terminal.input(sgr.release(78, contextCell.y));
+  await harness.draw();
+  assert.equal(harness.screen.hasActiveSelection(), true, "the popup left the non-item gesture to native text selection");
+  assert.equal(harness.backgroundEvents.length, 0, "an in-popup selection gesture never reached the transcript");
+  assert.equal(harness.sent.length, 0);
+  assertOthersUntouched(harness, before, [], "body selection");
+
+  // The host's public clipboard path copies exactly the visible popup text,
+  // including the wrapped body rows and the context, and never the background.
+  assert.equal(harness.copied.length, 0, "copyOnSelect is off; nothing copied implicitly");
+  assert.equal(await harness.screen.copyActiveSelectionToClipboard(), true);
+  assert.equal(harness.copied.length, 1, "the explicit public copy used the local clipboard seam once");
+  const copied = harness.copied[0]!;
+  const copiedLines = copied.split("\n").map((line) => line.trimEnd());
+  assert.ok(copiedLines.some((line) => line.includes("noticebody alpha")), `copied the visible body start:\n${copied}`);
+  assert.ok(copiedLines.some((line) => line.includes("zulu")), `copied the wrapped body tail:\n${copied}`);
+  assert.ok(copiedLines.some((line) => line.includes("noticecontext mike november")), `copied the visible context:\n${copied}`);
+  assert.ok(copiedLines.every((line) => !line.includes("transcript line")), `the background transcript was never copied:\n${copied}`);
+  assert.equal(harness.copied.length, 1, "one copy call copied once");
+  assert.equal(harness.sent.length, 0);
+  assertOthersUntouched(harness, before, [], "body copy");
+
+  // A body-originated drag that crosses and releases over the Close action
+  // cannot gain it: the notice stays pending and nothing is delivered.
+  const close = harness.cell("Close");
+  harness.terminal.input(sgr.press(bodyStart.x, bodyStart.y));
+  harness.terminal.input(sgr.drag(close.x, close.y));
+  await harness.draw();
+  harness.terminal.input(sgr.release(close.x, close.y));
+  await harness.draw();
+  assert.equal(harness.surface.controller.getPending(shortId), before.get(shortId), "the crossed Close action never ran");
+  assert.equal(harness.sent.length, 0);
+  assertOthersUntouched(harness, before, [], "cross-action release");
+
+  // Negative control for the narrowed ownership: a deliberate click on the
+  // real action still runs it once, with its own claimed press, and it neither
+  // starts a native selection nor copies anything.
+  await harness.click(harness.cell("Close"));
+  await settle();
+  assert.equal(harness.surface.controller.getPending(shortId), undefined, "the deliberate Close click ran exactly once");
+  assert.equal(harness.copied.length, 1, "a claimed item click never copies");
+  assert.equal(harness.screen.hasActiveSelection(), false, "a claimed item click owns the gesture, not native selection");
+  assert.equal(harness.sent.length, 0);
+  assertOthersUntouched(harness, before, [shortId], "deliberate Close");
+  assert.ok(onScreen(harness, "Pending input (2)"), `the list returns with the other records:\n${harness.frame().join("\n")}`);
+
+  // A scrolled notice copies only its currently visible rows: the first body
+  // line has left the viewport and must not appear in the selection source.
+  await harness.click(harness.cell(`${longId}: Long selection notice`));
+  assert.ok(onScreen(harness, "longbody line 01"), "the long notice opens at its beginning");
+  await scrollPopupUntil(harness, SHIFT_ALT_DOWN,
+    () => !onScreen(harness, "longbody line 01") && onScreen(harness, "longbody line 40"));
+  const visibleBody = harness.frame().flatMap((row, y) => {
+    const match = /longbody line \d+/.exec(row);
+    return match ? [{ y, text: match[0] }] : [];
+  });
+  assert.ok(visibleBody.length >= 2, `two body rows are visible after scrolling:\n${harness.frame().join("\n")}`);
+  const [firstVisible, secondVisible] = visibleBody;
+  assert.ok(!firstVisible!.text.includes("01"), "the first body line scrolled out of the viewport");
+  harness.terminal.input(sgr.press(harness.cell(firstVisible!.text).x, firstVisible!.y));
+  harness.terminal.input(sgr.drag(harness.cell(secondVisible!.text).x + 20, secondVisible!.y));
+  await harness.draw();
+  harness.terminal.input(sgr.release(harness.cell(secondVisible!.text).x + 20, secondVisible!.y));
+  await harness.draw();
+  assert.equal(await harness.screen.copyActiveSelectionToClipboard(), true, "the visible scrolled rows are selectable");
+  const scrolledCopy = harness.copied[1]!;
+  assert.ok(scrolledCopy.includes(firstVisible!.text) && scrolledCopy.includes(secondVisible!.text));
+  assert.ok(!scrolledCopy.includes("longbody line 01"), `offscreen popup content is not part of the visible selection source:\n${scrolledCopy}`);
+  assert.equal(harness.sent.length, 0);
+
+  // A gesture that starts on non-item content and leaves the overlay falls
+  // back to the host's ordinary routing: the synthetic transcript region may
+  // legitimately see the drag/release callbacks, but no new press or click,
+  // and no popup action, answer, or other session may be triggered.
+  harness.terminal.input(ESCAPE);
+  await harness.draw();
+  harness.terminal.input(ESCAPE);
+  await opened;
+  const reopened = await harness.open();
+  await harness.click(harness.cell(`${questionId}: ${question}`));
+  assert.ok(onScreen(harness, "1. keep"), `the reopened popup answers clicks:\n${harness.frame().join("\n")}`);
+  const backgroundBefore = harness.backgroundEvents.length;
+  const questionText = harness.cell(question);
+  harness.terminal.input(sgr.press(questionText.x, questionText.y));
+  harness.terminal.input(sgr.drag(10, 0));
+  await harness.draw();
+  harness.terminal.input(sgr.release(10, 0));
+  await harness.draw();
+  const outsideEvents = harness.backgroundEvents.slice(backgroundBefore);
+  assert.notEqual(outsideEvents.length, 0, "the outside drag/release reaches the host's ordinary layout routing");
+  for (const event of outsideEvents) {
+    assert.ok(event.type === "drag" || event.type === "release",
+      "no fresh press or click is fabricated while a selection leaves the popup");
+  }
+  assert.equal(harness.sent.length, 0, "leaving the popup never answers the question");
+  assert.ok(harness.surface.controller.getPending(questionId), "the question stays pending");
+  assert.ok(onScreen(harness, "1. keep"), "the popup and its visible choice are unchanged");
+  assert.equal(harness.screen.hasOverlay(), true);
+
+  harness.terminal.input(ESCAPE);
+  await harness.draw();
+  harness.terminal.input(ESCAPE);
+  await reopened.closed;
+  assert.equal(harness.sent.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Issue #436 explicit copy: with Pi's copy-on-select off, Pi's own configured
+// explicit copy shortcut (`app.message.copy`, Ctrl+X by default) must copy the
+// visible popup selection while the overlay owns keyboard focus. These tests
+// send the real configured key bytes through the installed runtime's parser,
+// overlay dispatch, native selection, and clipboard seam — they never call the
+// component's copy path or `copyActiveSelectionToClipboard` directly.
+// ---------------------------------------------------------------------------
+
+/** Drag a live native text selection from one drawn cell to another. */
+async function dragSelect(harness: Harness, from: { x: number; y: number }, to: { x: number; y: number }): Promise<void> {
+  harness.terminal.input(sgr.press(from.x, from.y));
+  harness.terminal.input(sgr.drag(to.x, to.y));
+  await harness.draw();
+  harness.terminal.input(sgr.release(to.x, to.y));
+  await harness.draw();
+}
+
+/** Send the configured copy key and return the exact text the host copied. */
+async function copyWithKey(harness: Harness, key: string): Promise<string> {
+  const before = harness.copied.length;
+  harness.terminal.input(key);
+  await until(() => harness.copied.length > before, 1000);
+  assert.equal(harness.copied.length, before + 1, "the configured copy key copied exactly once");
+  return harness.copied[before]!;
+}
+
+test("native fullscreen dispatch: the configured copy key copies the visible popup selection once, never hidden text", async (t) => {
+  const harness = await createHarness(t);
+  if (!harness) return;
+  harness.terminal.resize(80, 26);
+
+  const question = "Keep this pending?";
+  const questionId = registerQuestion(harness, question, ["keep"]);
+  // A distinct wrapped body, an explicit context, and a distinct transcript
+  // underneath: the explicit copy must read the visible popup, never the chat.
+  const body = "noticebody alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima "
+    + "mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu";
+  const context = "noticecontext mike november oscar papa quebec romeo";
+  const noticeId = registerNotice(harness, "Copyable notice", body, context);
+  const before = pendingSnapshot(harness);
+  const { closed: opened } = await harness.open();
+  assert.equal(harness.screen.getCopyOnSelect(), false, "the host's copy-on-select setting stays off");
+
+  // List mode: with no selection the configured copy key copies nothing and
+  // leaves the popup's own navigation untouched.
+  const q1Row = harness.cell(`q1: ${question}`);
+  harness.terminal.input(CTRL_X);
+  await harness.draw();
+  assert.equal(harness.copied.length, 0, "no selection: the copy key copies nothing");
+  harness.terminal.input(DOWN);
+  await harness.draw();
+  assert.doesNotMatch(harness.frame()[q1Row.y]!, /> q1: /, "arrow navigation still moves the list selection");
+  harness.terminal.input(UP);
+  await harness.draw();
+  assert.match(harness.frame()[q1Row.y]!, /> q1: /, "and back");
+  assert.equal(harness.screen.getCopyOnSelect(), false, "the copy key never changes the host setting");
+
+  // Notice view: select the visible wrapped body through its context. With
+  // copy-on-select off the release itself copies nothing.
+  await harness.click(harness.cell(`${noticeId}: Copyable notice`));
+  const bodyStart = harness.cell("noticebody alpha");
+  const contextCell = harness.cell("noticecontext mike");
+  assert.ok(contextCell.y > bodyStart.y, `the notice body wraps above its context:\n${harness.frame().join("\n")}`);
+  await dragSelect(harness, bodyStart, { x: 78, y: contextCell.y });
+  assert.equal(harness.screen.hasActiveSelection(), true,
+    "the popup left the non-item gesture to Pi's native selection");
+  assert.equal(harness.copied.length, 0, "copy-on-select is off: the release itself copies nothing");
+
+  const copied = await copyWithKey(harness, CTRL_X);
+  const copiedLines = copied.split("\n").map((line) => line.trimEnd());
+  assert.ok(copiedLines.some((line) => line.includes("noticebody alpha")), `copied the visible body start:\n${copied}`);
+  assert.ok(copiedLines.some((line) => line.includes("zulu")), `copied the wrapped body tail:\n${copied}`);
+  assert.ok(copiedLines.some((line) => line.includes("noticecontext mike november")), `copied the visible context:\n${copied}`);
+  assert.ok(copiedLines.every((line) => !line.includes("transcript line")), `no hidden transcript text was copied:\n${copied}`);
+  assert.equal(harness.sent.length, 0, "the copy key never answers, declines, or acts");
+  assertOthersUntouched(harness, before, [], "explicit copy key");
+  assert.equal(harness.screen.getCopyOnSelect(), false, "the host's copy-on-select setting is never overridden");
+
+  // A deliberate click on the real action still runs it exactly once: the copy
+  // key consumed none of the popup's existing pointer semantics.
+  await harness.click(harness.cell("Close"));
+  await settle();
+  assert.equal(harness.surface.controller.getPending(noticeId), undefined, "the deliberate Close click still ran exactly once");
+  assert.equal(harness.sent.length, 0);
+  assertOthersUntouched(harness, before, [noticeId], "deliberate Close");
+  assert.equal(harness.copied.length, 1, "a claimed item click never copies");
+
+  // Answer view: select the visible question text and copy it with the same
+  // configured key; the visible source is the question, not the notice or the
+  // transcript.
+  await harness.click(harness.cell(`q1: ${question}`));
+  assert.ok(onScreen(harness, "1. keep"), `the answer view opened:\n${harness.frame().join("\n")}`);
+  const questionCell = harness.cell(question);
+  await dragSelect(harness, questionCell, { x: questionCell.x + question.length - 1, y: questionCell.y });
+  const questionCopy = await copyWithKey(harness, CTRL_X);
+  assert.ok(questionCopy.includes(question), `copied the visible question text:\n${questionCopy}`);
+  assert.ok(!questionCopy.includes("noticebody"), `the closed notice is not the copy source:\n${questionCopy}`);
+  assert.ok(questionCopy.split("\n").every((line) => !line.includes("transcript line")));
+  assert.equal(harness.sent.length, 0, "copying the question text never answers it");
+  assertOthersUntouched(harness, before, [noticeId], "question copy");
+
+  // Shared native editing: the configured copy key with no selection leaves the
+  // native field's own keys untouched. Ctrl+C is app.clear, not the copy
+  // binding, so it never reaches the explicit-copy path: nothing is copied,
+  // submitted, cancelled, or closed. (The native clear itself is covered by
+  // tests/user-question-editor-parity.test.ts against the real host, which
+  // registers the host's app.clear handler exactly as InteractiveMode does.)
+  await harness.click(harness.cell("Type something…"));
+  for (const char of "draft answer") harness.terminal.input(char);
+  await harness.draw();
+  assert.ok(onScreen(harness, "draft answer"), `the native draft shows:\n${harness.frame().join("\n")}`);
+  harness.terminal.input(CTRL_C);
+  await harness.draw();
+  assert.equal(harness.copied.length, 2, "Ctrl+C is not the copy binding and copied nothing");
+  assert.equal(harness.sent.length, 0, "Ctrl+C never submits or cancels");
+  assert.equal(harness.screen.hasOverlay(), true, "Ctrl+C never closes the popup");
+  assert.ok(onScreen(harness, "Enter submit"), "the native field is still editing after Ctrl+C");
+  assertOthersUntouched(harness, before, [noticeId], "Ctrl+C");
+
+  // Close/reopen copy ownership: after the popup closes, background routing
+  // resumes; a reopened popup owns the copy key for its own new selection.
+  harness.terminal.input(ESCAPE);
+  await harness.draw();
+  harness.terminal.input(ESCAPE);
+  await harness.draw();
+  harness.terminal.input(ESCAPE);
+  await opened;
+  assert.equal(harness.screen.hasOverlay(), false);
+  const background = harness.cell("transcript line");
+  await harness.click({ x: 2, y: background.y });
+  assert.ok(harness.backgroundEvents.some((event) => event.type === "click"),
+    "background routing resumed after the popup closed");
+  harness.backgroundEvents.length = 0;
+  const reopened = await harness.open();
+  await harness.click(harness.cell(`q1: ${question}`));
+  const reopenedCell = harness.cell(question);
+  await dragSelect(harness, reopenedCell, { x: reopenedCell.x + question.length - 1, y: reopenedCell.y });
+  const reopenedCopy = await copyWithKey(harness, CTRL_X);
+  assert.ok(reopenedCopy.includes(question), `the reopened popup copied its own visible selection:\n${reopenedCopy}`);
+  assert.equal(harness.sent.length, 0);
+  assert.ok(harness.surface.controller.getPending(questionId), "the question stays pending");
+  harness.terminal.input(ESCAPE);
+  await harness.draw();
+  harness.terminal.input(ESCAPE);
+  await reopened.closed;
+  assert.deepEqual(harness.backgroundEvents, []);
+});
+
+test("native fullscreen dispatch: the configured copy key copies only the currently visible scrolled rows", async (t) => {
+  const harness = await createHarness(t);
+  if (!harness) return;
+  harness.terminal.resize(80, 16);
+  registerQuestion(harness, "Keep me pending?", ["keep"]);
+  const longId = registerNotice(harness, "Long copyable notice",
+    Array.from({ length: 40 }, (_, index) => `longbody line ${String(index + 1).padStart(2, "0")}`).join("\n\n"));
+  const { closed } = await harness.open();
+  await harness.click(harness.cell(`${longId}: Long copyable notice`));
+  assert.ok(onScreen(harness, "longbody line 01"), `the long notice opens at its beginning:\n${harness.frame().join("\n")}`);
+  await scrollPopupUntil(harness, SHIFT_ALT_DOWN,
+    () => !onScreen(harness, "longbody line 01") && onScreen(harness, "longbody line 40"));
+
+  // Narrow the terminal and scroll again: the popup re-wraps the complete body,
+  // and the copy source must be the rows currently drawn at the new width.
+  harness.terminal.resize(56, 14);
+  await harness.draw();
+  assert.ok(harness.frame().every((row) => row.length <= 56), "the frame fits the narrowed terminal");
+  await scrollPopupUntil(harness, SHIFT_ALT_DOWN, () => !onScreen(harness, "longbody line 01"));
+
+  // Two body rows are currently drawn; the first body line has left the viewport.
+  const visible = harness.frame().flatMap((row, y) => {
+    const match = /longbody line \d+/.exec(row);
+    return match ? [{ x: row.search(/\S/), y, text: match[0] }] : [];
+  });
+  assert.ok(visible.length >= 2, `two body rows are visible after scrolling:\n${harness.frame().join("\n")}`);
+  const first = visible[0]!;
+  const second = visible[1]!;
+  assert.ok(!first.text.includes("01"), "the first body line scrolled out of the viewport");
+
+  await dragSelect(harness, { x: first.x, y: first.y }, { x: second.x + second.text.length, y: second.y });
+  const copied = await copyWithKey(harness, CTRL_X);
+  assert.ok(copied.includes(first.text) && copied.includes(second.text),
+    `copied the currently visible scrolled rows:\n${copied}`);
+  assert.ok(!copied.includes("longbody line 01"),
+    `offscreen popup content is not part of the visible selection source:\n${copied}`);
+  assert.equal(harness.sent.length, 0);
+  harness.terminal.input(ESCAPE);
+  await harness.draw();
+  harness.terminal.input(ESCAPE);
+  await closed;
+});
+
+test("native fullscreen dispatch: a live remapped copy binding is honored while the popup owns focus", async (t) => {
+  const harness = await createHarness(t, { userBindings: { "app.message.copy": "f6" } });
+  if (!harness) return;
+  harness.terminal.resize(80, 24);
+  registerQuestion(harness, "Copy this question?", ["yes"]);
+  const { closed } = await harness.open();
+  await harness.click(harness.cell("q1: Copy this question?"));
+  const questionCell = harness.cell("Copy this question?");
+  await dragSelect(harness, questionCell, { x: questionCell.x + "Copy this question?".length - 1, y: questionCell.y });
+  assert.equal(harness.screen.hasActiveSelection(), true);
+  // The remapped-away default no longer copies; the live remapped key does.
+  harness.terminal.input(CTRL_X);
+  await harness.draw();
+  assert.equal(harness.copied.length, 0, "the remapped-away default key no longer copies");
+  const copied = await copyWithKey(harness, F6);
+  assert.ok(copied.includes("Copy this question?"), `the remapped binding copied the visible selection:\n${copied}`);
+  assert.equal(harness.sent.length, 0);
+  harness.terminal.input(ESCAPE);
+  await harness.draw();
+  harness.terminal.input(ESCAPE);
+  await closed;
+});
+
+test("native fullscreen dispatch: copy-on-select on is preserved and the copy key does not intercept", async (t) => {
+  const harness = await createHarness(t, { copyOnSelect: true });
+  if (!harness) return;
+  harness.terminal.resize(80, 24);
+  registerQuestion(harness, "Select over this question?", ["yes"]);
+  const { closed } = await harness.open();
+  await harness.click(harness.cell("q1: Select over this question?"));
+  const questionCell = harness.cell("Select over this question?");
+  await dragSelect(harness, questionCell, { x: questionCell.x + "Select over this question?".length - 1, y: questionCell.y });
+  assert.equal(harness.copied.length, 1, "copy-on-select copied the finished selection on release");
+  harness.terminal.input(CTRL_X);
+  await harness.draw();
+  assert.equal(harness.copied.length, 1, "with copy-on-select on the copy key adds no second copy");
+  assert.equal(harness.screen.getCopyOnSelect(), true, "the host's copy-on-select setting is never changed");
+  assert.equal(harness.sent.length, 0);
+  harness.terminal.input(ESCAPE);
+  await harness.draw();
+  harness.terminal.input(ESCAPE);
+  await closed;
+});
+
+test("native fullscreen dispatch: a failing native clipboard seam stays truthful and never leaks an unhandled rejection", async (t) => {
+  const seamCalls: string[] = [];
+  const harness = await createHarness(t, {
+    copySelection: async (text: string) => {
+      seamCalls.push(text);
+      throw new Error("clipboard unavailable");
+    },
+  });
+  if (!harness) return;
+  harness.terminal.resize(80, 24);
+  registerQuestion(harness, "Copy with a broken clipboard?", ["yes"]);
+  const { closed } = await harness.open();
+  await harness.click(harness.cell("q1: Copy with a broken clipboard?"));
+  const questionCell = harness.cell("Copy with a broken clipboard?");
+  await dragSelect(harness, questionCell, { x: questionCell.x + "Copy with a broken clipboard?".length - 1, y: questionCell.y });
+  harness.terminal.input(CTRL_X);
+  await settle(20);
+  assert.equal(seamCalls.length, 1, "the configured copy key still reached the host clipboard seam once");
+  assert.equal(harness.screen.hasOverlay(), true, "a rejected clipboard seam never closes the popup");
+  assert.equal(harness.sent.length, 0, "and never fabricates an answer or action");
+  // The popup remains fully usable afterwards.
+  assert.ok(onScreen(harness, "1. yes"), `the answer view is intact:\n${harness.frame().join("\n")}`);
+  harness.terminal.input(ESCAPE);
+  await harness.draw();
+  harness.terminal.input(ESCAPE);
+  await closed;
+});
+
+test("native fullscreen dispatch: a selection inherited from the transcript is fenced at popup entry and never copied", async (t) => {
+  // The transcript is left unhandled so Pi's own native selection anchors on its
+  // scroll view. That inherited anchor is exactly what would make the popup's
+  // explicit copy read hidden scroll content instead of the visible popup.
+  const harness = await createHarness(t, { transcriptHandlesMouse: false });
+  if (!harness) return;
+  harness.terminal.resize(80, 24);
+  const question = "Fresh popup question?";
+  registerQuestion(harness, question, ["yes"]);
+  await harness.draw();
+
+  // Select transcript text before the popup exists.
+  const transcriptCell = harness.cell("transcript line");
+  await dragSelect(harness, transcriptCell, { x: transcriptCell.x + 20, y: transcriptCell.y + 1 });
+  assert.equal(harness.screen.hasActiveSelection(), true, "the transcript selection is live before the popup opens");
+  assert.equal(harness.copied.length, 0, "copy-on-select is off: the release copied nothing");
+  // Control: Pi's own explicit copy of that inherited selection resolves the
+  // transcript's scroll source, which is the hidden-content hazard.
+  assert.equal(await harness.screen.copyActiveSelectionToClipboard(), true,
+    "the inherited transcript selection is directly copyable before the popup opens");
+  assert.ok(harness.copied[0]!.includes("transcript line"),
+    `the inherited selection copies transcript content:\n${harness.copied[0]}`);
+  const inheritedCopies = harness.copied.length;
+
+  // Open the popup with no new pointer gesture: the inherited selection is
+  // dropped at entry, so the configured copy key copies nothing.
+  const { closed } = await harness.open();
+  assert.equal(harness.screen.hasActiveSelection(), false,
+    "popup entry drops the inherited transcript selection");
+  harness.terminal.input(CTRL_X);
+  await harness.draw();
+  assert.equal(harness.copied.length, inheritedCopies, "the inherited transcript selection was never copied through the popup");
+  assert.equal(harness.sent.length, 0);
+  assert.ok(onScreen(harness, `${question}`), `the popup stays open:\n${harness.frame().join("\n")}`);
+
+  // A fresh selection over the visible popup still copies normally.
+  await harness.click(harness.cell(`q1: ${question}`));
+  const questionCell = harness.cell(question);
+  await dragSelect(harness, questionCell, { x: questionCell.x + question.length - 1, y: questionCell.y });
+  const copied = await copyWithKey(harness, CTRL_X);
+  assert.ok(copied.includes(question), `a fresh popup selection still copies:\n${copied}`);
+  assert.ok(copied.split("\n").every((line) => !line.includes("transcript line")),
+    `and never the transcript:\n${copied}`);
+  assert.equal(harness.sent.length, 0);
+  harness.terminal.input(ESCAPE);
+  await harness.draw();
+  harness.terminal.input(ESCAPE);
+  await closed;
 });
